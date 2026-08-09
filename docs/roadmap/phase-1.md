@@ -32,7 +32,8 @@
 - [x] 人工验证中文拼音、emoji 与 Escape cancel
 - [ ] 人工验证日文、dead key 与组合重音
 - [x] 将实验事件转换为 Rust `CompositionOverlay` 协议
-- [ ] VoiceOver/Accessibility text range 查询实验
+- [x] 系统 Accessibility text range 与 screen bounds 查询实验
+- [ ] VoiceOver 实际朗读质量验证
 - [ ] 多行 shaping、点击和 caret round-trip
 
 ## Phase 1 退出条件

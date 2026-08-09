@@ -37,3 +37,19 @@ Replacement 内部的 Anchor 会折叠到 replacement 的左边或右边，具�
 LS/PS 暂不增加 `LineIndex`。空源码仍有第 0 行，以 LF 结尾的源码包含一个末尾空行。
 
 UTF-16 与 byte 的反向查询必须拒绝 surrogate pair/UTF-8 scalar 中间位置，不能静默取整。
+
+## Native accessibility boundary
+
+AppKit Accessibility 的字符数和 `NSRange` 使用 UTF-16。进入 Rust 后必须转换为携带
+`Revision` 的 `AccessibilityTextPosition` 或 `AccessibilityTextRange`；来自旧 Revision 的查询
+直接拒绝，不自动映射。
+
+Accessibility range 与屏幕坐标不能混为一种位置：
+
+```text
+AX UTF-16 range ──► revision-bound text query ──► source byte range
+AX screen point  ──► platform coordinate map   ──► layout point
+```
+
+`AXBoundsForRange`、candidate rect 和 caret rect 均为屏幕几何查询，必须使用与所查询文本相同的
+Projection/Layout 状态。

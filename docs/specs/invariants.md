@@ -37,8 +37,14 @@
 2. 只有 commit 才生成永久 Transaction。
 3. OS 查询的 selection、surrounding text 和 caret rect 必须来自一致的编辑状态。
 
+## Accessibility
+
+1. 原生 Accessibility 文本 range 使用 UTF-16，并绑定一个明确的 Revision。
+2. 过期 range 与 surrogate pair 中间位置必须拒绝，不能静默取整或套用到新文本。
+3. 文本、selection、visible range 与 range bounds 必须来自同一次发布的编辑/布局状态。
+4. 查询局部文本不得要求物化整个 Piece Tree Snapshot。
+
 ## Degradation
 
 1. 每个昂贵功能都必须定义预算、取消和 fallback。
 2. 大文件可以关闭投影、图片、嵌入渲染和全文索引，但基本源码编辑必须保持可用。
-
