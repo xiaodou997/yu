@@ -8,7 +8,8 @@
 - UTF-16 selection range；
 - candidate window rect；
 - 基本 grapheme 删除和移动；
-- TextKit shaping 与点击位置查询。
+- TextKit shaping 与点击位置查询；
+- `NSAccessibility` text area、UTF-16 range 与 screen bounds 查询。
 
 构建：
 
@@ -38,6 +39,14 @@ swift run --package-path experiments/macos-text-input YuMacTextInputSpike
 4. Escape 取消后正文恢复正确；
 5. emoji 和组合字符退格时不会被拆成无效序列。
 
+启动后程序还会运行两级 Accessibility 检查：先直接校验 View 的文本、行范围和 caret frame，
+再通过系统 `AXUIElement` 查询 focused element 的 role、字符数、首行文本及 bounds。成功时终端
+应出现 `AX self-check` 和 `AX runtime probe trusted=true role=AXTextArea`。后者依赖当前终端或
+生成的 `.app` 已获 macOS Accessibility 权限。
+
 该实验暂时直接保存 UTF-16 selection，因为 AppKit 协议使用 `NSRange`。接入 Rust 时必须由
 平台适配层转换成带 Revision 的 `TextAnchor`，正式 composition 则进入临时 Overlay，不能在
 每次 `setMarkedText` 时提交 Undo Transaction。
+
+产品实现还必须把 Accessibility 文本查询绑定到 Rust `Revision`。屏幕 bounds 由当前 Layout
+回答；存在 composition 时，AX、`NSTextInputClient` 和绘制必须看到同一份 overlay 状态。

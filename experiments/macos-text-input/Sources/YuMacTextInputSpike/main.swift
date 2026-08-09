@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 
 private let notFoundRange = NSRange(location: NSNotFound, length: 0)
 
@@ -31,6 +32,10 @@ final class TextInputView: NSView, NSTextInputClient {
             )
         )
         selection = NSRange(location: textStorage.length, length: 0)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.textArea)
+        setAccessibilityLabel("Yu Editor document")
+        setAccessibilityIdentifier("yu-editor-document")
     }
 
     @available(*, unavailable)
@@ -80,6 +85,7 @@ final class TextInputView: NSView, NSTextInputClient {
         marked = notFoundRange
         inputContext?.discardMarkedText()
         needsDisplay = true
+        postSelectionChanged()
     }
 
     func insertText(_ value: Any, replacementRange: NSRange) {
@@ -92,6 +98,7 @@ final class TextInputView: NSView, NSTextInputClient {
         compositionOriginal = nil
         compositionSelectionBefore = nil
         needsDisplay = true
+        postTextChanged()
     }
 
     func setMarkedText(
@@ -119,6 +126,7 @@ final class TextInputView: NSView, NSTextInputClient {
             length: min(newSelection.length, maximumLength)
         )
         needsDisplay = true
+        postTextChanged()
     }
 
     func unmarkText() {
@@ -130,6 +138,7 @@ final class TextInputView: NSView, NSTextInputClient {
         compositionOriginal = nil
         compositionSelectionBefore = nil
         needsDisplay = true
+        postSelectionChanged()
     }
 
     func selectedRange() -> NSRange {
@@ -186,6 +195,117 @@ final class TextInputView: NSView, NSTextInputClient {
         updateContainerSize()
         let glyph = layoutManager.glyphIndex(for: local, in: textContainer)
         return min(layoutManager.characterIndexForGlyph(at: glyph), textStorage.length)
+    }
+
+    override func accessibilityValue() -> Any? {
+        textStorage.string
+    }
+
+    override func accessibilityNumberOfCharacters() -> Int {
+        textStorage.length
+    }
+
+    override func accessibilitySelectedText() -> String? {
+        let range = validatedAccessibilityRange(selection) ?? NSRange(location: 0, length: 0)
+        return (textStorage.string as NSString).substring(with: range)
+    }
+
+    override func accessibilitySelectedTextRange() -> NSRange {
+        selection
+    }
+
+    override func setAccessibilitySelectedTextRange(_ range: NSRange) {
+        guard let range = validatedAccessibilityRange(range) else { return }
+        inputContext?.discardMarkedText()
+        marked = notFoundRange
+        selection = range
+        needsDisplay = true
+        postSelectionChanged()
+    }
+
+    override func accessibilitySelectedTextRanges() -> [NSValue]? {
+        [NSValue(range: selection)]
+    }
+
+    override func accessibilityVisibleCharacterRange() -> NSRange {
+        updateContainerSize()
+        layoutManager.ensureLayout(for: textContainer)
+        guard layoutManager.numberOfGlyphs > 0 else {
+            return NSRange(location: 0, length: 0)
+        }
+        let visible = NSRect(
+            x: bounds.minX - textOrigin.x,
+            y: bounds.minY - textOrigin.y,
+            width: bounds.width,
+            height: bounds.height
+        )
+        let glyphs = layoutManager.glyphRange(forBoundingRect: visible, in: textContainer)
+        return layoutManager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+    }
+
+    override func accessibilityInsertionPointLineNumber() -> Int {
+        logicalLine(containing: selection.location)
+    }
+
+    override func accessibilityString(for range: NSRange) -> String? {
+        guard let range = validatedAccessibilityRange(range) else { return nil }
+        return (textStorage.string as NSString).substring(with: range)
+    }
+
+    override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
+        guard let range = validatedAccessibilityRange(range) else { return nil }
+        return textStorage.attributedSubstring(from: range)
+    }
+
+    override func accessibilityRange(forLine line: Int) -> NSRange {
+        logicalLineRange(line)
+    }
+
+    override func accessibilityLine(for index: Int) -> Int {
+        guard index >= 0, index <= textStorage.length else { return NSNotFound }
+        return logicalLine(containing: index)
+    }
+
+    override func accessibilityRange(for index: Int) -> NSRange {
+        guard index >= 0, index <= textStorage.length else { return notFoundRange }
+        guard index < textStorage.length else {
+            return NSRange(location: textStorage.length, length: 0)
+        }
+        return (textStorage.string as NSString).rangeOfComposedCharacterSequence(at: index)
+    }
+
+    override func accessibilityRange(for position: NSPoint) -> NSRange {
+        let windowPoint = window?.convertPoint(fromScreen: position) ?? position
+        let local = convert(windowPoint, from: nil)
+        return accessibilityRange(for: characterIndex(for: local))
+    }
+
+    override func accessibilityFrame(for range: NSRange) -> NSRect {
+        guard let range = validatedAccessibilityRange(range) else { return .zero }
+        return firstRect(forCharacterRange: range, actualRange: nil)
+    }
+
+    override func accessibilityStyleRange(for index: Int) -> NSRange {
+        guard index >= 0, index < textStorage.length else { return notFoundRange }
+        var effective = NSRange(location: 0, length: 0)
+        _ = textStorage.attributes(at: index, effectiveRange: &effective)
+        return effective
+    }
+
+    func runAccessibilitySelfCheck() {
+        let full = NSRange(location: 0, length: accessibilityNumberOfCharacters())
+        let firstLine = accessibilityRange(forLine: 0)
+        let firstText = accessibilityString(for: firstLine) ?? ""
+        let caretFrame = accessibilityFrame(for: accessibilitySelectedTextRange())
+        precondition(accessibilityString(for: full) == textStorage.string)
+        precondition(firstLine.location == 0 && firstLine.location != NSNotFound)
+        precondition(!firstText.isEmpty)
+        precondition(!caretFrame.isEmpty)
+        print(
+            "AX self-check characters=\(accessibilityNumberOfCharacters()) "
+                + "selection=\(accessibilitySelectedTextRange()) "
+                + "firstLine=\(firstLine) caretFrame=\(caretFrame)"
+        )
     }
 
     override func doCommand(by selector: Selector) {
@@ -246,6 +366,54 @@ final class TextInputView: NSView, NSTextInputClient {
         return NSRange(location: location, length: min(range.length, available))
     }
 
+    private func validatedAccessibilityRange(_ range: NSRange) -> NSRange? {
+        guard range.location != NSNotFound, range.location <= textStorage.length else {
+            return nil
+        }
+        let (end, overflow) = range.location.addingReportingOverflow(range.length)
+        guard !overflow, end <= textStorage.length else { return nil }
+        return range
+    }
+
+    private func logicalLine(containing index: Int) -> Int {
+        let clampedIndex = min(max(index, 0), textStorage.length)
+        let prefix = (textStorage.string as NSString).substring(to: clampedIndex)
+        return prefix.utf8.reduce(into: 0) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
+    }
+
+    private func logicalLineRange(_ requestedLine: Int) -> NSRange {
+        guard requestedLine >= 0 else { return notFoundRange }
+        let string = textStorage.string as NSString
+        var line = 0
+        var start = 0
+
+        while line < requestedLine {
+            guard start < string.length else { return notFoundRange }
+            let range = string.lineRange(for: NSRange(location: start, length: 0))
+            let next = NSMaxRange(range)
+            guard next > start else { return notFoundRange }
+            start = next
+            line += 1
+        }
+
+        if start == string.length {
+            let hasTrailingLine = string.length == 0 || string.character(at: string.length - 1) == 0x0A
+            return hasTrailingLine ? NSRange(location: start, length: 0) : notFoundRange
+        }
+        return string.lineRange(for: NSRange(location: start, length: 0))
+    }
+
+    private func postTextChanged() {
+        NSAccessibility.post(element: self, notification: .valueChanged)
+        postSelectionChanged()
+    }
+
+    private func postSelectionChanged() {
+        NSAccessibility.post(element: self, notification: .selectedTextChanged)
+    }
+
     private func replaceStorage(range: NSRange, with replacement: NSAttributedString) {
         textStorage.beginEditing()
         textStorage.replaceCharacters(in: range, with: replacement)
@@ -275,6 +443,7 @@ final class TextInputView: NSView, NSTextInputClient {
         compositionOriginal = nil
         compositionSelectionBefore = nil
         needsDisplay = true
+        postTextChanged()
     }
 
     private func moveLeft() {
@@ -283,6 +452,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let range = string.rangeOfComposedCharacterSequence(at: selection.location - 1)
         selection = NSRange(location: range.location, length: 0)
         needsDisplay = true
+        postSelectionChanged()
     }
 
     private func moveRight() {
@@ -291,6 +461,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let range = string.rangeOfComposedCharacterSequence(at: selection.location)
         selection = NSRange(location: NSMaxRange(range), length: 0)
         needsDisplay = true
+        postSelectionChanged()
     }
 
     private func updateContainerSize() {
@@ -350,13 +521,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = inputView
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(inputView)
+        inputView.runAccessibilitySelfCheck()
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.25) {
+            runAccessibilityRuntimeProbe()
+        }
         self.window = window
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
+}
+
+private func runAccessibilityRuntimeProbe() {
+    let application = AXUIElementCreateApplication(getpid())
+    var focusedValue: CFTypeRef?
+    let focusedError = AXUIElementCopyAttributeValue(
+        application,
+        kAXFocusedUIElementAttribute as CFString,
+        &focusedValue
+    )
+    guard focusedError == .success, let focused = focusedValue else {
+        print("AX runtime probe focused-element error=\(focusedError.rawValue)")
+        return
+    }
+    let element = focused as! AXUIElement
+
+    var roleValue: CFTypeRef?
+    let roleError = AXUIElementCopyAttributeValue(
+        element,
+        kAXRoleAttribute as CFString,
+        &roleValue
+    )
+    var countValue: CFTypeRef?
+    let countError = AXUIElementCopyAttributeValue(
+        element,
+        kAXNumberOfCharactersAttribute as CFString,
+        &countValue
+    )
+    let count = (countValue as? NSNumber)?.intValue ?? 0
+    var firstLine = CFRange(location: 0, length: min(count, 19))
+    guard let rangeValue = AXValueCreate(.cfRange, &firstLine) else {
+        print("AX runtime probe could not create range value")
+        return
+    }
+
+    var stringValue: CFTypeRef?
+    let stringError = AXUIElementCopyParameterizedAttributeValue(
+        element,
+        kAXStringForRangeParameterizedAttribute as CFString,
+        rangeValue,
+        &stringValue
+    )
+    var boundsValue: CFTypeRef?
+    let boundsError = AXUIElementCopyParameterizedAttributeValue(
+        element,
+        kAXBoundsForRangeParameterizedAttribute as CFString,
+        rangeValue,
+        &boundsValue
+    )
+
+    print(
+        "AX runtime probe trusted=\(AXIsProcessTrusted()) "
+            + "role=\(String(describing: roleValue)) roleError=\(roleError.rawValue) "
+            + "characters=\(count) countError=\(countError.rawValue) "
+            + "string=\(String(describing: stringValue)) stringError=\(stringError.rawValue) "
+            + "bounds=\(String(describing: boundsValue)) boundsError=\(boundsError.rawValue)"
+    )
 }
 
 let application = NSApplication.shared
