@@ -77,12 +77,14 @@ swift build --package-path experiments/macos-text-input
 
 - [架构总览](docs/architecture/overview.md)
 - [Text Buffer](docs/architecture/text-buffer.md)
+- [Markdown Parser](docs/architecture/markdown-parser.md)
 - [核心不变量](docs/specs/invariants.md)
 - [坐标与位置](docs/specs/coordinates.md)
 - [Architecture Decision Records](docs/adr/)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [文本存储候选对比](docs/experiments/storage-candidates-2026-08-09.md)
+- [增量 Markdown 实验](docs/experiments/incremental-markdown-2026-08-09.md)
 
 个人笔记、临时调研和未整理草稿请放在本地 `.notes/`，该目录不会提交。
 
