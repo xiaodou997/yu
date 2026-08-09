@@ -110,6 +110,6 @@ byte/UTF-16 往返。独立测试覆盖 CRLF、空末行、emoji surrogate split
 1. 平坦后端继续作为正确性 oracle，不参与产品选择。
 2. Piece Tree 成为产品默认后端：它在本 workload 中编辑更快，历史快照保留成本也更低。
 3. Persistent Rope 暂时保留为实验对照，不再阻塞后续 Piece Tree 元数据和 chunk cursor 工作。
-4. 行/UTF-16 摘要和 chunk cursor 已完成；下一轮让 Markdown parser 消费 chunk，并建立完整/
-   增量解析 differential harness。
-5. Snapshot 估算还需要用进程级 RSS/allocator instrumentation 交叉验证。
+4. 行/UTF-16 摘要、chunk-aware Markdown parser 和完整/增量 differential harness 已完成。
+5. 下一轮建立持久化 block sequence、状态/hash 收敛与 suffix reuse。
+6. Snapshot 估算还需要用进程级 RSS/allocator instrumentation 交叉验证。

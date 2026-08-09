@@ -57,9 +57,9 @@ Rope 的边界合并将随机编辑后的叶片数从 6,533 降到 2,583，但�
 
 ## 后果与复审条件
 
-接下来优先为 Piece Tree 节点加入行数和 UTF-16 长度摘要、定义 chunk cursor，并建立增量解析
-differential harness。若这些元数据使 Piece Tree 的节点成本或更新延迟明显恶化，或 Rope 在真实
-长时间编辑 trace 上扭转快照成本结论，可以通过新的 ADR 复审本决策。
+首个后续任务是为 Piece Tree 节点加入行数和 UTF-16 长度摘要、定义 chunk cursor，并建立增量
+解析 differential harness。若这些元数据使 Piece Tree 的节点成本或更新延迟明显恶化，或 Rope
+在真实长时间编辑 trace 上扭转快照成本结论，可以通过新的 ADR 复审本决策。
 
 摘要实现后的 10 MiB 复测中，Piece Tree 与 Rope 的 2,000 次随机编辑分别为 26.38 ms 和
 27.25 ms，8 个 Snapshot 保留估算分别为 11.22 MiB 和 18.57 MiB，未触发复审条件。坐标与

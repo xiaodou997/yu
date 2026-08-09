@@ -6,7 +6,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use yu_core::{ByteOffset, TextRange};
-use yu_markdown::parse;
+use yu_markdown::{parse, parse_incremental};
 use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
 
 const SECTION: &str = "# Yu\n\nA paragraph with **strong text**, 中文 and emoji 🙂.\n\n```rust\nfn main() {}\n```\n\n";
@@ -51,6 +51,7 @@ fn run_backend(
     let middle = nearest_char_boundary(source, source.len() / 2);
     let middle_offset =
         ByteOffset::try_from(middle).map_err(|_| io::Error::other("fixture is too large"))?;
+    let insert_range = TextRange::empty(middle_offset);
 
     let mut snapshot_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
@@ -84,24 +85,59 @@ fn run_backend(
         coordinate_samples.push(start.elapsed());
     }
 
-    let cold_snapshot = buffer.snapshot();
-    let materialize_start = Instant::now();
-    std::hint::black_box(cold_snapshot.as_str());
-    let materialize_time = materialize_start.elapsed();
-
-    let warmup = parse(&cold_snapshot);
+    let parse_snapshot = buffer.snapshot();
+    let materialized_before =
+        retained_snapshot_stats(std::slice::from_ref(&parse_snapshot)).materialized_buffers();
+    let warmup = parse(&parse_snapshot);
     if !warmup.has_lossless_coverage() {
         return Err(io::Error::other("warmup parse lost source coverage").into());
     }
     let mut parse_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
         let start = Instant::now();
-        let document = parse(&cold_snapshot);
+        let document = parse(&parse_snapshot);
         parse_samples.push(start.elapsed());
         std::hint::black_box(document);
     }
+    let materialized_after =
+        retained_snapshot_stats(std::slice::from_ref(&parse_snapshot)).materialized_buffers();
+    if materialized_after != materialized_before {
+        return Err(io::Error::other("block parser materialized a contiguous source copy").into());
+    }
 
-    let insert_range = TextRange::empty(middle_offset);
+    let cold_snapshot = buffer.snapshot();
+    let materialize_start = Instant::now();
+    std::hint::black_box(cold_snapshot.as_str());
+    let materialize_time = materialize_start.elapsed();
+
+    let mut incremental_buffer = TextBuffer::with_backend(source, backend);
+    let previous_snapshot = incremental_buffer.snapshot();
+    let previous_document = parse(&previous_snapshot);
+    let incremental_transaction = Transaction::new(
+        incremental_buffer.revision(),
+        [Edit::new(insert_range, "\n# incremental\n")],
+    );
+    let incremental_applied = incremental_buffer.apply(&incremental_transaction)?;
+    let expected_incremental = parse(incremental_applied.result_snapshot());
+    let mut incremental_samples = Vec::with_capacity(configuration.iterations);
+    let mut reparsed_bytes = 0_u64;
+    let mut reused_prefix_blocks = 0;
+    for _ in 0..configuration.iterations {
+        let start = Instant::now();
+        let result = parse_incremental(
+            &previous_document,
+            incremental_applied.result_snapshot(),
+            incremental_applied.change_set(),
+        )?;
+        incremental_samples.push(start.elapsed());
+        reparsed_bytes = result.reparsed_range().len();
+        reused_prefix_blocks = result.reused_prefix_blocks();
+        if result.document() != &expected_incremental {
+            return Err(io::Error::other("incremental parse diverged from full parse").into());
+        }
+        std::hint::black_box(result);
+    }
+
     let mut edit_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
         let transaction = Transaction::new(buffer.revision(), [Edit::new(insert_range, "羽")]);
@@ -166,6 +202,12 @@ fn run_backend(
     );
     println!("  first contiguous view: {materialize_time:?}");
     println!("  full block scan median: {:?}", median(&mut parse_samples));
+    println!(
+        "  incremental block scan median: {:?} (reparsed-bytes={} reused-prefix-blocks={})",
+        median(&mut incremental_samples),
+        reparsed_bytes,
+        reused_prefix_blocks
+    );
     println!(
         "  middle insert + inverse median: {:?}",
         median(&mut edit_samples)

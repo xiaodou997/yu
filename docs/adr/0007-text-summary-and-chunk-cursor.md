@@ -42,5 +42,6 @@ Grapheme、word boundary、BiDi 和 visual line 不进入 `TextSummary`。这些
 ## 后果
 
 Piece Tree 的创建和 split 增加 summary/checkpoint 成本，但坐标查询不再随文档长度线性增长。
-checkpoint 与节点字节计入 retained Snapshot benchmark。Markdown parser 下一步应直接消费
-Chunk Cursor，并用 full parse 对增量结果做 differential validation。
+checkpoint 与节点字节计入 retained Snapshot benchmark。Markdown parser 已按 ADR 0008 直接
+消费 Chunk Cursor，并用 full parse 对增量结果做 differential validation；当前下一步是持久化
+block sequence 与 suffix reuse。

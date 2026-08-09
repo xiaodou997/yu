@@ -2,11 +2,14 @@
 
 //! Lossless Markdown syntax experiments.
 //!
-//! Phase 1 provides a deliberately small block scanner. It preserves every
-//! source byte through ranges, but it is not yet a CommonMark implementation.
+//! Phase 1 provides a deliberately small, chunk-aware block scanner. It
+//! preserves every source byte through ranges, but it is not yet CommonMark.
 
-use yu_core::{ByteOffset, Revision, TextRange};
-use yu_text::TextSnapshot;
+use std::error::Error;
+use std::fmt;
+
+use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
+use yu_text::{AnchorMapError, ChangeSet, TextSnapshot};
 
 /// The block shapes recognized by the Phase 1 scanner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,11 +77,197 @@ impl MarkdownDocument {
     }
 }
 
+/// The observable result of one conservative incremental block parse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IncrementalParse {
+    document: MarkdownDocument,
+    reparsed_range: TextRange,
+    reused_prefix_blocks: usize,
+}
+
+impl IncrementalParse {
+    #[must_use]
+    pub fn document(&self) -> &MarkdownDocument {
+        &self.document
+    }
+
+    #[must_use]
+    pub fn into_document(self) -> MarkdownDocument {
+        self.document
+    }
+
+    #[must_use]
+    pub fn reparsed_range(&self) -> TextRange {
+        self.reparsed_range
+    }
+
+    #[must_use]
+    pub fn reused_prefix_blocks(&self) -> usize {
+        self.reused_prefix_blocks
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IncrementalParseError {
+    PreviousRevision {
+        document: Revision,
+        change_set: Revision,
+    },
+    SnapshotRevision {
+        snapshot: Revision,
+        change_set: Revision,
+    },
+    AnchorMap(AnchorMapError),
+}
+
+impl fmt::Display for IncrementalParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PreviousRevision {
+                document,
+                change_set,
+            } => write!(
+                formatter,
+                "previous document revision {document:?} does not match change set {change_set:?}"
+            ),
+            Self::SnapshotRevision {
+                snapshot,
+                change_set,
+            } => write!(
+                formatter,
+                "snapshot revision {snapshot:?} does not match change set {change_set:?}"
+            ),
+            Self::AnchorMap(error) => write!(formatter, "cannot map reparse boundary: {error}"),
+        }
+    }
+}
+
+impl Error for IncrementalParseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::AnchorMap(error) => Some(error),
+            Self::PreviousRevision { .. } | Self::SnapshotRevision { .. } => None,
+        }
+    }
+}
+
+impl From<AnchorMapError> for IncrementalParseError {
+    fn from(error: AnchorMapError) -> Self {
+        Self::AnchorMap(error)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
-struct Line<'a> {
+struct Line {
     start: usize,
     end: usize,
-    body: &'a str,
+    analysis: LineAnalysis,
+}
+
+impl Line {
+    fn is_blank(self) -> bool {
+        self.analysis.blank
+    }
+
+    fn opening_fence(self) -> Option<Fence> {
+        let analysis = self.analysis;
+        if !analysis.indent_valid || !matches!(analysis.prefix, Some('`' | '~')) {
+            return None;
+        }
+        Some(Fence {
+            marker: analysis.prefix.expect("validated fence must have a marker"),
+            count: analysis.prefix_count,
+        })
+        .filter(|fence| fence.count >= 3)
+    }
+
+    fn is_closing_fence(self, opening: Fence) -> bool {
+        let analysis = self.analysis;
+        analysis.indent_valid
+            && analysis.prefix == Some(opening.marker)
+            && analysis.prefix_count >= opening.count
+            && analysis.tail_whitespace
+    }
+
+    fn atx_heading_level(self) -> Option<u8> {
+        let analysis = self.analysis;
+        if !analysis.indent_valid
+            || analysis.prefix != Some('#')
+            || !(1..=6).contains(&analysis.prefix_count)
+            || !matches!(analysis.after_prefix, None | Some(' ' | '\t'))
+        {
+            return None;
+        }
+        u8::try_from(analysis.prefix_count).ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LineAnalysis {
+    blank: bool,
+    indent_valid: bool,
+    syntax_done: bool,
+    leading_spaces: usize,
+    prefix: Option<char>,
+    prefix_count: usize,
+    after_prefix: Option<char>,
+    tail_whitespace: bool,
+}
+
+impl Default for LineAnalysis {
+    fn default() -> Self {
+        Self {
+            blank: true,
+            indent_valid: true,
+            syntax_done: false,
+            leading_spaces: 0,
+            prefix: None,
+            prefix_count: 0,
+            after_prefix: None,
+            tail_whitespace: true,
+        }
+    }
+}
+
+impl LineAnalysis {
+    fn wants_input(self) -> bool {
+        self.blank || !self.syntax_done
+    }
+
+    fn push(&mut self, character: char) {
+        self.blank &= character.is_whitespace();
+        if !self.indent_valid || self.syntax_done {
+            return;
+        }
+
+        let Some(prefix) = self.prefix else {
+            if character == ' ' {
+                self.leading_spaces += 1;
+                if self.leading_spaces > 3 {
+                    self.indent_valid = false;
+                }
+            } else {
+                self.prefix = Some(character);
+                self.prefix_count = 1;
+                if !matches!(character, '#' | '`' | '~') {
+                    self.syntax_done = true;
+                }
+            }
+            return;
+        };
+
+        if self.after_prefix.is_none() && character == prefix {
+            self.prefix_count += 1;
+            return;
+        }
+        if self.after_prefix.is_none() {
+            self.after_prefix = Some(character);
+        }
+        self.tail_whitespace &= character.is_whitespace();
+        if prefix == '#' || !self.tail_whitespace {
+            self.syntax_done = true;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,31 +276,116 @@ struct Fence {
     count: usize,
 }
 
-/// Scans the snapshot into a lossless Phase 1 block structure.
+/// Scans an immutable Snapshot without materializing a contiguous source copy.
 #[must_use]
 pub fn parse(snapshot: &TextSnapshot) -> MarkdownDocument {
-    let source = snapshot.as_str();
-    let lines = lines(source);
+    MarkdownDocument {
+        revision: snapshot.revision(),
+        source_len: snapshot.len_bytes(),
+        blocks: parse_blocks(snapshot, 0),
+    }
+}
+
+/// Reuses a stable block prefix and reparses from the earliest affected block.
+///
+/// The Phase 1 algorithm intentionally reparses through EOF. This is safe for
+/// state that can propagate forward, such as an opened or deleted code fence.
+pub fn parse_incremental(
+    previous: &MarkdownDocument,
+    snapshot: &TextSnapshot,
+    changes: &ChangeSet,
+) -> Result<IncrementalParse, IncrementalParseError> {
+    if previous.revision != changes.before() {
+        return Err(IncrementalParseError::PreviousRevision {
+            document: previous.revision,
+            change_set: changes.before(),
+        });
+    }
+    if snapshot.revision() != changes.after() {
+        return Err(IncrementalParseError::SnapshotRevision {
+            snapshot: snapshot.revision(),
+            change_set: changes.after(),
+        });
+    }
+
+    if changes.changes().is_empty() {
+        let document = MarkdownDocument {
+            revision: snapshot.revision(),
+            source_len: snapshot.len_bytes(),
+            blocks: previous.blocks.clone(),
+        };
+        return Ok(IncrementalParse {
+            reparsed_range: TextRange::empty(snapshot.len_bytes()),
+            reused_prefix_blocks: document.blocks.len(),
+            document,
+        });
+    }
+
+    let earliest = changes
+        .changes()
+        .iter()
+        .map(|change| change.old_range().start())
+        .min()
+        .expect("non-empty changes must have an earliest offset");
+    let affected = previous
+        .blocks
+        .iter()
+        .position(|block| block.range.end() > earliest)
+        .unwrap_or(previous.blocks.len());
+    let reparse_index = affected.saturating_sub(1);
+    let old_start = previous
+        .blocks
+        .get(reparse_index)
+        .map_or(ByteOffset::ZERO, |block| block.range.start());
+    let mapped = changes.map_anchor(TextAnchor::new(
+        previous.revision,
+        old_start,
+        Affinity::Before,
+    ))?;
+    let new_start = mapped.offset();
+    let new_start_usize = usize::try_from(new_start)
+        .expect("a mapped document offset must fit the platform address space");
+
+    let mut blocks = Vec::with_capacity(previous.blocks.len());
+    blocks.extend_from_slice(&previous.blocks[..reparse_index]);
+    blocks.extend(parse_blocks(snapshot, new_start_usize));
+    let document = MarkdownDocument {
+        revision: snapshot.revision(),
+        source_len: snapshot.len_bytes(),
+        blocks,
+    };
+    let reparsed_range = TextRange::new(new_start, snapshot.len_bytes())
+        .expect("reparse start must not exceed the Snapshot length");
+
+    Ok(IncrementalParse {
+        document,
+        reparsed_range,
+        reused_prefix_blocks: reparse_index,
+    })
+}
+
+fn parse_blocks(snapshot: &TextSnapshot, start: usize) -> Vec<Block> {
+    let lines = lines(snapshot, start);
     let mut blocks = Vec::new();
     let mut index = 0;
 
     while index < lines.len() {
         let line = lines[index];
 
-        if line.body.trim().is_empty() {
+        if line.is_blank() {
             blocks.push(block(BlockKind::BlankLine, line.start, line.end));
             index += 1;
             continue;
         }
 
-        if let Some(fence) = opening_fence(line.body) {
-            let start = line.start;
+        if let Some(fence) = line.opening_fence() {
+            let block_start = line.start;
             index += 1;
             let mut closed = false;
             while index < lines.len() {
                 let candidate = lines[index];
                 index += 1;
-                if is_closing_fence(candidate.body, fence) {
+                if candidate.is_closing_fence(fence) {
                     closed = true;
                     break;
                 }
@@ -122,39 +396,35 @@ pub fn parse(snapshot: &TextSnapshot) -> MarkdownDocument {
                     marker: fence.marker,
                     closed,
                 },
-                start,
+                block_start,
                 end,
             ));
             continue;
         }
 
-        if let Some(level) = atx_heading_level(line.body) {
+        if let Some(level) = line.atx_heading_level() {
             blocks.push(block(BlockKind::AtxHeading { level }, line.start, line.end));
             index += 1;
             continue;
         }
 
-        let start = line.start;
+        let block_start = line.start;
         index += 1;
         while index < lines.len() {
             let candidate = lines[index];
-            if candidate.body.trim().is_empty()
-                || opening_fence(candidate.body).is_some()
-                || atx_heading_level(candidate.body).is_some()
+            if candidate.is_blank()
+                || candidate.opening_fence().is_some()
+                || candidate.atx_heading_level().is_some()
             {
                 break;
             }
             index += 1;
         }
         let end = lines[index - 1].end;
-        blocks.push(block(BlockKind::Paragraph, start, end));
+        blocks.push(block(BlockKind::Paragraph, block_start, end));
     }
 
-    MarkdownDocument {
-        revision: snapshot.revision(),
-        source_len: ByteOffset::try_from(source.len()).unwrap_or(ByteOffset::new(u64::MAX)),
-        blocks,
-    }
+    blocks
 }
 
 fn block(kind: BlockKind, start: usize, end: usize) -> Block {
@@ -164,85 +434,97 @@ fn block(kind: BlockKind, start: usize, end: usize) -> Block {
     Block { kind, range }
 }
 
-fn lines(source: &str) -> Vec<Line<'_>> {
-    let mut result = Vec::new();
-    let mut start = 0;
+fn lines(snapshot: &TextSnapshot, start: usize) -> Vec<Line> {
+    let source_len = usize::try_from(snapshot.len_bytes())
+        .expect("Snapshot length must fit the platform address space");
+    if start >= source_len {
+        return Vec::new();
+    }
 
-    while start < source.len() {
-        let relative_end = source[start..].find('\n');
-        let end = relative_end.map_or(source.len(), |offset| start + offset + 1);
-        let mut body_end = end;
-        if source.as_bytes().get(body_end.wrapping_sub(1)) == Some(&b'\n') {
-            body_end -= 1;
+    let start_offset = ByteOffset::try_from(start).expect("line start must fit u64");
+    let cursor = snapshot
+        .chunk_cursor(start_offset)
+        .expect("block boundary must be a valid UTF-8 offset");
+    let mut result = Vec::new();
+    let mut line_start = start;
+    let mut pending_cr = false;
+    let mut analysis = LineAnalysis::default();
+
+    for chunk in cursor {
+        let chunk_start = usize::try_from(chunk.start()).expect("chunk offset must fit usize");
+        let local_start = start.saturating_sub(chunk_start).min(chunk.text().len());
+        let text = &chunk.text()[local_start..];
+        let mut local = 0;
+        while local < text.len() {
+            if !analysis.wants_input() {
+                let Some(newline) = text.as_bytes()[local..]
+                    .iter()
+                    .position(|value| *value == b'\n')
+                else {
+                    break;
+                };
+                let absolute = chunk_start + local_start + local + newline;
+                result.push(Line {
+                    start: line_start,
+                    end: absolute + 1,
+                    analysis,
+                });
+                line_start = absolute + 1;
+                analysis = LineAnalysis::default();
+                pending_cr = false;
+                local += newline + 1;
+                continue;
+            }
+
+            let first = text.as_bytes()[local];
+            let character = if first.is_ascii() {
+                char::from(first)
+            } else {
+                text[local..]
+                    .chars()
+                    .next()
+                    .expect("non-empty UTF-8 tail must contain a character")
+            };
+            let absolute = chunk_start + local_start + local;
+            if character == '\n' {
+                result.push(Line {
+                    start: line_start,
+                    end: absolute + 1,
+                    analysis,
+                });
+                line_start = absolute + 1;
+                analysis = LineAnalysis::default();
+                pending_cr = false;
+            } else {
+                if pending_cr {
+                    analysis.push('\r');
+                    pending_cr = false;
+                }
+                if character == '\r' {
+                    pending_cr = true;
+                } else {
+                    analysis.push(character);
+                }
+            }
+            local += character.len_utf8();
         }
-        if source.as_bytes().get(body_end.wrapping_sub(1)) == Some(&b'\r') {
-            body_end -= 1;
-        }
+    }
+
+    if line_start < source_len {
         result.push(Line {
-            start,
-            end,
-            body: &source[start..body_end],
+            start: line_start,
+            end: source_len,
+            analysis,
         });
-        start = end;
     }
 
     result
 }
 
-fn content_after_indent(line: &str) -> Option<&str> {
-    let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
-    (spaces <= 3).then(|| &line[spaces..])
-}
-
-fn opening_fence(line: &str) -> Option<Fence> {
-    let content = content_after_indent(line)?;
-    let marker = content.chars().next()?;
-    if marker != '`' && marker != '~' {
-        return None;
-    }
-    let count = content
-        .chars()
-        .take_while(|candidate| *candidate == marker)
-        .count();
-    (count >= 3).then_some(Fence { marker, count })
-}
-
-fn is_closing_fence(line: &str, opening: Fence) -> bool {
-    let Some(content) = content_after_indent(line) else {
-        return false;
-    };
-    let count = content
-        .chars()
-        .take_while(|candidate| *candidate == opening.marker)
-        .count();
-    if count < opening.count {
-        return false;
-    }
-    content[count..].chars().all(char::is_whitespace)
-}
-
-fn atx_heading_level(line: &str) -> Option<u8> {
-    let content = content_after_indent(line)?;
-    let count = content
-        .chars()
-        .take_while(|candidate| *candidate == '#')
-        .count();
-    if !(1..=6).contains(&count) {
-        return None;
-    }
-
-    let tail = &content[count..];
-    if !tail.is_empty() && !tail.starts_with([' ', '\t']) {
-        return None;
-    }
-
-    u8::try_from(count).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_text::TextBuffer;
+    use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
     #[test]
     fn scanner_covers_source_without_gaps() {
@@ -265,6 +547,79 @@ mod tests {
                 marker: '`',
                 closed: true
             }
+        );
+    }
+
+    #[test]
+    fn scanner_preserves_phase_one_line_classification_rules() {
+        let cases = [
+            ("   # title\n", BlockKind::AtxHeading { level: 1 }),
+            ("    # title\n", BlockKind::Paragraph),
+            ("####### title\n", BlockKind::Paragraph),
+            ("\u{00a0}\n", BlockKind::BlankLine),
+            (
+                "```\r\nbody\r\n```\r\n",
+                BlockKind::FencedCodeBlock {
+                    marker: '`',
+                    closed: true,
+                },
+            ),
+            (
+                "```\nbody\n``` trailing\n",
+                BlockKind::FencedCodeBlock {
+                    marker: '`',
+                    closed: false,
+                },
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let document = parse(&TextBuffer::new(source).snapshot());
+            assert_eq!(document.blocks().len(), 1, "source {source:?}");
+            assert_eq!(document.blocks()[0].kind(), expected, "source {source:?}");
+            assert!(document.has_lossless_coverage());
+        }
+    }
+
+    #[test]
+    fn scanner_reads_syntax_across_piece_boundaries_without_materializing() {
+        let parts = [
+            "#", " 羽", "\r", "\n", "\r\n", "```", "rust\n", "body", "\n`", "``\n",
+        ];
+        let mut buffer = TextBuffer::new("");
+        for part in parts {
+            let at = buffer.snapshot().len_bytes();
+            let transaction =
+                Transaction::new(buffer.revision(), [Edit::new(TextRange::empty(at), part)]);
+            buffer
+                .apply(&transaction)
+                .expect("append transaction should apply");
+        }
+        let snapshot = buffer.snapshot();
+        assert_eq!(
+            retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers(),
+            0
+        );
+
+        let document = parse(&snapshot);
+
+        assert!(document.has_lossless_coverage());
+        assert_eq!(document.blocks().len(), 3);
+        assert_eq!(
+            document.blocks()[0].kind(),
+            BlockKind::AtxHeading { level: 1 }
+        );
+        assert_eq!(document.blocks()[1].kind(), BlockKind::BlankLine);
+        assert_eq!(
+            document.blocks()[2].kind(),
+            BlockKind::FencedCodeBlock {
+                marker: '`',
+                closed: true
+            }
+        );
+        assert_eq!(
+            retained_snapshot_stats(&[snapshot]).materialized_buffers(),
+            0
         );
     }
 
@@ -311,5 +666,51 @@ mod tests {
             .collect();
 
         assert_eq!(reconstructed, source);
+    }
+
+    #[test]
+    fn empty_change_set_reuses_the_entire_document() {
+        let mut buffer = TextBuffer::new("# title\n\nbody\n");
+        let previous = parse(&buffer.snapshot());
+        let transaction = Transaction::new(buffer.revision(), std::iter::empty::<Edit>());
+        let applied = buffer
+            .apply(&transaction)
+            .expect("empty transaction should still advance the revision");
+
+        let incremental =
+            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+                .expect("matching revisions should parse incrementally");
+
+        assert_eq!(incremental.document(), &parse(applied.result_snapshot()));
+        assert_eq!(incremental.reused_prefix_blocks(), previous.blocks().len());
+        assert!(incremental.reparsed_range().is_empty());
+    }
+
+    #[test]
+    fn incremental_parse_rejects_revision_mismatches() {
+        let mut buffer = TextBuffer::new("body\n");
+        let old_snapshot = buffer.snapshot();
+        let previous = parse(&old_snapshot);
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "# ")],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("valid transaction should apply");
+
+        assert!(matches!(
+            parse_incremental(&previous, &old_snapshot, applied.change_set()),
+            Err(IncrementalParseError::SnapshotRevision { .. })
+        ));
+        let wrong_previous = parse(applied.result_snapshot());
+        assert!(matches!(
+            parse_incremental(
+                &wrong_previous,
+                applied.result_snapshot(),
+                applied.change_set()
+            ),
+            Err(IncrementalParseError::PreviousRevision { .. })
+        ));
     }
 }
