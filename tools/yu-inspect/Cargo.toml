@@ -1,0 +1,16 @@
+[package]
+name = "yu-inspect"
+description = "Inspect Yu's Phase 1 lossless Markdown structure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-markdown = { path = "../../crates/yu-markdown" }
+yu-text = { path = "../../crates/yu-text" }
+
+[lints]
+workspace = true
