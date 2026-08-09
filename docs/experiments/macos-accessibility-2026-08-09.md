@@ -45,3 +45,16 @@ role、字符数、`AXStringForRange` 和 `AXBoundsForRange` 均返回成功状�
   Accessibility query 与 caret geometry 共享一次原子发布的编辑状态。
 - 本次验证覆盖系统 AX API 查询，没有覆盖 VoiceOver 的实际朗读质量和大型虚拟化文档的
   accessibility tree 策略。
+
+## AX tree / VoiceOver 状态复核
+
+通过 macOS Computer Use 读取运行中窗口的 AX tree，Yu View 显示为：
+
+```text
+text entry area Description: Yu Editor document
+ID: yu-editor-document
+Value: Yu macOS IME spike
+```
+
+系统设置中的 VoiceOver 开关当前为 `off`。本次没有修改该系统设置，因此实际 VoiceOver 朗读
+仍保持待人工验证；AX element、role、value 和参数化 range 查询已分别通过。

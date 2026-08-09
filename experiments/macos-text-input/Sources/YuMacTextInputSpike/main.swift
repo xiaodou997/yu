@@ -378,6 +378,69 @@ final class TextInputView: NSView, NSTextInputClient {
         )
     }
 
+    func runUnicodeCompositionSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let savedMarked = marked
+        let base = textStorage.string
+
+        selection = NSRange(location: textStorage.length, length: 0)
+        marked = notFoundRange
+        setMarkedText(
+            "にほんご",
+            selectedRange: NSRange(location: 4, length: 0),
+            replacementRange: notFoundRange
+        )
+        precondition(hasMarkedText() && marked.length == 4, "Japanese preedit should be marked")
+        setMarkedText(
+            "にほんご",
+            selectedRange: NSRange(location: 4, length: 0),
+            replacementRange: notFoundRange
+        )
+        insertText("日本語", replacementRange: notFoundRange)
+        precondition(!hasMarkedText() && textStorage.string == base + "日本語")
+
+        setMarkedText(
+            "\u{301}",
+            selectedRange: NSRange(location: 1, length: 0),
+            replacementRange: notFoundRange
+        )
+        setMarkedText(
+            "e\u{301}",
+            selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: notFoundRange
+        )
+        insertText("é", replacementRange: notFoundRange)
+        precondition(!hasMarkedText() && textStorage.string == base + "日本語é")
+
+        let cancelBase = textStorage.string
+        setMarkedText(
+            "にほん",
+            selectedRange: NSRange(location: 3, length: 0),
+            replacementRange: notFoundRange
+        )
+        precondition(hasMarkedText())
+        doCommand(by: #selector(NSResponder.cancelOperation(_:)))
+        precondition(!hasMarkedText() && textStorage.string == cancelBase)
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        marked = savedMarked
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
+        needsDisplay = true
+        print(
+            "Unicode composition self-check japanese=日本語 combining=é "
+                + "cancel=restored"
+        )
+    }
+
     override func doCommand(by selector: Selector) {
         let command = NSStringFromSelector(selector)
         if command == "cancel:" || command == "cancelOperation:" {
@@ -726,6 +789,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(inputView)
         inputView.runLayoutRoundTripSelfCheck()
+        inputView.runUnicodeCompositionSelfCheck()
         inputView.runAccessibilitySelfCheck()
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.25) {

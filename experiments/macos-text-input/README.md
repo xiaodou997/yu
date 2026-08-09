@@ -49,6 +49,9 @@ swift run --package-path experiments/macos-text-input YuMacTextInputSpike
 文本应至少产生 4 个视觉行、一个软换行 affinity split，并通过 local point 与 screen point 两条
 hit-test 路径。硬行末按 TextKit 语义规范化为 LF 后 offset + upstream affinity。
 
+启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
+和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
+
 该实验暂时直接保存 UTF-16 selection，因为 AppKit 协议使用 `NSRange`。接入 Rust 时必须由
 平台适配层转换成带 Revision 的 `SourceCaretPosition`；需要穿过编辑长期保存时再使用
 `TextAnchor`。正式 composition 则进入临时 Overlay，不能在每次 `setMarkedText` 时提交 Undo

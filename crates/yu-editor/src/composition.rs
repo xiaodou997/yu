@@ -254,6 +254,38 @@ mod tests {
     }
 
     #[test]
+    fn japanese_and_combining_preedit_sequences_commit_once() {
+        let mut buffer = TextBuffer::new("入力: ");
+        let insertion = source_range(8, 8);
+        let mut japanese =
+            CompositionOverlay::new(buffer.revision(), insertion, "にほんご", utf16_range(4, 4))
+                .expect("Japanese preedit should be valid");
+
+        japanese
+            .update("にほんご", utf16_range(4, 4))
+            .expect("Japanese preedit update should be valid");
+        let japanese_commit = japanese.commit("日本語");
+        buffer
+            .apply(&japanese_commit)
+            .expect("Japanese commit should apply");
+
+        let combining_start = buffer.snapshot().len_bytes();
+        let combining = CompositionOverlay::new(
+            buffer.revision(),
+            TextRange::empty(combining_start),
+            "e\u{301}",
+            utf16_range(2, 2),
+        )
+        .expect("combining-mark preedit should be valid");
+        buffer
+            .apply(&combining.commit("é"))
+            .expect("composed commit should apply");
+
+        assert_eq!(buffer.snapshot().as_str(), "入力: 日本語é");
+        assert_eq!(buffer.revision(), Revision::new(2));
+    }
+
+    #[test]
     fn commit_is_rejected_if_document_changed_during_composition() {
         let mut buffer = TextBuffer::new("hello");
         let overlay = CompositionOverlay::new(
