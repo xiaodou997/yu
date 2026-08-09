@@ -8,11 +8,14 @@ final class TextInputView: NSView, NSTextInputClient {
     private let layoutManager = NSLayoutManager()
     private let textContainer = NSTextContainer()
     private var selection = NSRange(location: 0, length: 0)
+    private var selectionAffinity: NSSelectionAffinity = .downstream
     private var marked = notFoundRange
     private var compositionOriginal: NSAttributedString?
     private var compositionSelectionBefore: NSRange?
+    private var compositionAffinityBefore: NSSelectionAffinity?
 
     private let textOrigin = NSPoint(x: 24, y: 24)
+    private let maximumTextWidth: CGFloat = 360
     private let defaultAttributes: [NSAttributedString.Key: Any] = [
         .font: NSFont.systemFont(ofSize: 22),
         .foregroundColor: NSColor.labelColor,
@@ -65,7 +68,7 @@ final class TextInputView: NSView, NSTextInputClient {
         layoutManager.drawGlyphs(forGlyphRange: glyphRange, at: textOrigin)
 
         if window?.firstResponder === self {
-            let caret = caretRect(at: selection.location)
+            let caret = caretRect(at: selection.location, affinity: selectionAffinity)
             NSColor.controlAccentColor.setFill()
             caret.fill()
         }
@@ -80,8 +83,9 @@ final class TextInputView: NSView, NSTextInputClient {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
-        let index = characterIndex(for: point)
-        selection = NSRange(location: index, length: 0)
+        let hit = caretHit(forLocalPoint: point)
+        selection = NSRange(location: hit.index, length: 0)
+        selectionAffinity = hit.affinity
         marked = notFoundRange
         inputContext?.discardMarkedText()
         needsDisplay = true
@@ -94,9 +98,11 @@ final class TextInputView: NSView, NSTextInputClient {
         print("insertText commit=\(inserted.string.debugDescription) replace=\(target)")
         replaceStorage(range: target, with: inserted)
         selection = NSRange(location: target.location + inserted.length, length: 0)
+        selectionAffinity = .downstream
         marked = notFoundRange
         compositionOriginal = nil
         compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
         needsDisplay = true
         postTextChanged()
     }
@@ -111,6 +117,7 @@ final class TextInputView: NSView, NSTextInputClient {
         if !hasMarkedText() {
             compositionOriginal = textStorage.attributedSubstring(from: target)
             compositionSelectionBefore = selection
+            compositionAffinityBefore = selectionAffinity
         }
         print(
             "setMarkedText preedit=\(inserted.string.debugDescription) "
@@ -125,6 +132,7 @@ final class TextInputView: NSView, NSTextInputClient {
             location: target.location + relativeLocation,
             length: min(newSelection.length, maximumLength)
         )
+        selectionAffinity = .downstream
         needsDisplay = true
         postTextChanged()
     }
@@ -137,6 +145,7 @@ final class TextInputView: NSView, NSTextInputClient {
         marked = notFoundRange
         compositionOriginal = nil
         compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
         needsDisplay = true
         postSelectionChanged()
     }
@@ -175,7 +184,8 @@ final class TextInputView: NSView, NSTextInputClient {
         actualRange?.pointee = range
         let localRect: NSRect
         if range.length == 0 {
-            localRect = caretRect(at: range.location)
+            let affinity = range == selection ? selectionAffinity : .downstream
+            localRect = caretRect(at: range.location, affinity: affinity)
         } else {
             let glyphRange = layoutManager.glyphRange(
                 forCharacterRange: range,
@@ -190,11 +200,19 @@ final class TextInputView: NSView, NSTextInputClient {
     }
 
     func characterIndex(for point: NSPoint) -> Int {
-        let local = NSPoint(x: point.x - textOrigin.x, y: point.y - textOrigin.y)
-        guard local.x >= 0, local.y >= 0 else { return 0 }
+        let windowPoint = window?.convertPoint(fromScreen: point) ?? point
+        return caretHit(forLocalPoint: convert(windowPoint, from: nil)).index
+    }
+
+    func fractionOfDistanceThroughGlyph(for point: NSPoint) -> CGFloat {
+        let windowPoint = window?.convertPoint(fromScreen: point) ?? point
+        let local = convert(windowPoint, from: nil)
+        let containerPoint = NSPoint(x: local.x - textOrigin.x, y: local.y - textOrigin.y)
         updateContainerSize()
-        let glyph = layoutManager.glyphIndex(for: local, in: textContainer)
-        return min(layoutManager.characterIndexForGlyph(at: glyph), textStorage.length)
+        return layoutManager.fractionOfDistanceThroughGlyph(
+            for: containerPoint,
+            in: textContainer
+        )
     }
 
     override func accessibilityValue() -> Any? {
@@ -219,6 +237,7 @@ final class TextInputView: NSView, NSTextInputClient {
         inputContext?.discardMarkedText()
         marked = notFoundRange
         selection = range
+        selectionAffinity = .downstream
         needsDisplay = true
         postSelectionChanged()
     }
@@ -275,9 +294,7 @@ final class TextInputView: NSView, NSTextInputClient {
     }
 
     override func accessibilityRange(for position: NSPoint) -> NSRange {
-        let windowPoint = window?.convertPoint(fromScreen: position) ?? position
-        let local = convert(windowPoint, from: nil)
-        return accessibilityRange(for: characterIndex(for: local))
+        accessibilityRange(for: characterIndex(for: position))
     }
 
     override func accessibilityFrame(for range: NSRange) -> NSRect {
@@ -305,6 +322,59 @@ final class TextInputView: NSView, NSTextInputClient {
             "AX self-check characters=\(accessibilityNumberOfCharacters()) "
                 + "selection=\(accessibilitySelectedTextRange()) "
                 + "firstLine=\(firstLine) caretFrame=\(caretFrame)"
+        )
+    }
+
+    func runLayoutRoundTripSelfCheck() {
+        updateContainerSize()
+        layoutManager.ensureLayout(for: textContainer)
+        let glyphRange = layoutManager.glyphRange(for: textContainer)
+        var lineFragments = 0
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) {
+            _, _, _, _, _ in
+            lineFragments += 1
+        }
+
+        let boundaries = canonicalCaretOffsets()
+        var affinitySplits = 0
+        var softWrapSplits = 0
+        for index in boundaries {
+            let downstream = caretRect(at: index, affinity: .downstream)
+            let downstreamPoint = probePoint(for: downstream)
+            let downstreamHit = caretHit(forLocalPoint: downstreamPoint)
+            precondition(
+                downstreamHit.index == index,
+                "downstream caret round-trip failed at \(index): \(downstreamHit)"
+            )
+            precondition(
+                characterIndex(for: screenPoint(forLocalPoint: downstreamPoint)) == index,
+                "screen-space downstream round-trip failed at \(index)"
+            )
+
+            let upstream = caretRect(at: index, affinity: .upstream)
+            guard !sameVisualLine(upstream, downstream) else { continue }
+            affinitySplits += 1
+            if index == 0 || (textStorage.string as NSString).character(at: index - 1) != 0x0A {
+                softWrapSplits += 1
+            }
+            let upstreamPoint = probePoint(for: upstream)
+            let upstreamHit = caretHit(forLocalPoint: upstreamPoint)
+            precondition(
+                upstreamHit.index == index && upstreamHit.affinity == .upstream,
+                "upstream caret round-trip failed at \(index): \(upstreamHit)"
+            )
+            precondition(
+                characterIndex(for: screenPoint(forLocalPoint: upstreamPoint)) == index,
+                "screen-space upstream round-trip failed at \(index)"
+            )
+        }
+
+        precondition(lineFragments >= 4, "test content must shape into multiple visual lines")
+        precondition(affinitySplits > 0, "test content must contain a split caret position")
+        precondition(softWrapSplits > 0, "test content must contain a soft-wrap caret split")
+        print(
+            "Layout self-check lines=\(lineFragments) boundaries=\(boundaries.count) "
+                + "affinitySplits=\(affinitySplits) softWrapSplits=\(softWrapSplits)"
         )
     }
 
@@ -375,6 +445,88 @@ final class TextInputView: NSView, NSTextInputClient {
         return range
     }
 
+    private struct CaretHit: CustomStringConvertible {
+        let index: Int
+        let affinity: NSSelectionAffinity
+
+        var description: String {
+            "CaretHit(index: \(index), affinity: \(affinity.rawValue))"
+        }
+    }
+
+    private func caretHit(forLocalPoint point: NSPoint) -> CaretHit {
+        let containerPoint = NSPoint(x: point.x - textOrigin.x, y: point.y - textOrigin.y)
+        guard containerPoint.x >= 0, containerPoint.y >= 0 else {
+            return CaretHit(index: 0, affinity: .downstream)
+        }
+
+        updateContainerSize()
+        layoutManager.ensureLayout(for: textContainer)
+        var fraction: CGFloat = 0
+        let character = min(
+            layoutManager.characterIndex(
+                for: containerPoint,
+                in: textContainer,
+                fractionOfDistanceBetweenInsertionPoints: &fraction
+            ),
+            textStorage.length
+        )
+        let index: Int
+        if character < textStorage.length {
+            let cluster = (textStorage.string as NSString)
+                .rangeOfComposedCharacterSequence(at: character)
+            index = fraction >= 0.5 ? NSMaxRange(cluster) : cluster.location
+        } else {
+            index = textStorage.length
+        }
+
+        let upstream = caretRect(at: index, affinity: .upstream)
+        let downstream = caretRect(at: index, affinity: .downstream)
+        let affinity: NSSelectionAffinity
+        if sameVisualLine(upstream, downstream) {
+            affinity = .downstream
+        } else {
+            affinity = squaredDistance(point, upstream) < squaredDistance(point, downstream)
+                ? .upstream : .downstream
+        }
+        return CaretHit(index: index, affinity: affinity)
+    }
+
+    private func canonicalCaretOffsets() -> [Int] {
+        let string = textStorage.string as NSString
+        var boundaries = [0]
+        var index = 0
+        while index < string.length {
+            index = NSMaxRange(string.rangeOfComposedCharacterSequence(at: index))
+            // TextKit canonicalizes a click at the end of a hard line to the
+            // position after LF with upstream affinity. The position directly
+            // before LF is therefore not an independent visual caret stop.
+            if index == string.length || string.character(at: index) != 0x0A {
+                boundaries.append(index)
+            }
+        }
+        return boundaries
+    }
+
+    private func probePoint(for caret: NSRect) -> NSPoint {
+        NSPoint(x: caret.minX + 0.25, y: caret.midY)
+    }
+
+    private func screenPoint(forLocalPoint point: NSPoint) -> NSPoint {
+        let windowPoint = convert(point, to: nil)
+        return window?.convertPoint(toScreen: windowPoint) ?? windowPoint
+    }
+
+    private func sameVisualLine(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+        abs(lhs.midY - rhs.midY) < 0.5
+    }
+
+    private func squaredDistance(_ point: NSPoint, _ caret: NSRect) -> CGFloat {
+        let dx = point.x - caret.minX
+        let dy = point.y - caret.midY
+        return dx * dx + dy * dy
+    }
+
     private func logicalLine(containing index: Int) -> Int {
         let clampedIndex = min(max(index, 0), textStorage.length)
         let prefix = (textStorage.string as NSString).substring(to: clampedIndex)
@@ -439,9 +591,11 @@ final class TextInputView: NSView, NSTextInputClient {
         }
         replaceStorage(range: marked, with: original)
         selection = compositionSelectionBefore ?? NSRange(location: marked.location, length: 0)
+        selectionAffinity = compositionAffinityBefore ?? .downstream
         marked = notFoundRange
         compositionOriginal = nil
         compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
         needsDisplay = true
         postTextChanged()
     }
@@ -451,6 +605,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let string = textStorage.string as NSString
         let range = string.rangeOfComposedCharacterSequence(at: selection.location - 1)
         selection = NSRange(location: range.location, length: 0)
+        selectionAffinity = .downstream
         needsDisplay = true
         postSelectionChanged()
     }
@@ -460,18 +615,54 @@ final class TextInputView: NSView, NSTextInputClient {
         let string = textStorage.string as NSString
         let range = string.rangeOfComposedCharacterSequence(at: selection.location)
         selection = NSRange(location: NSMaxRange(range), length: 0)
+        selectionAffinity = .downstream
         needsDisplay = true
         postSelectionChanged()
     }
 
     private func updateContainerSize() {
         textContainer.containerSize = NSSize(
-            width: max(bounds.width - textOrigin.x * 2, 1),
+            width: min(max(bounds.width - textOrigin.x * 2, 1), maximumTextWidth),
             height: .greatestFiniteMagnitude
         )
     }
 
-    private func caretRect(at characterIndex: Int) -> NSRect {
+    private func caretRect(
+        at characterIndex: Int,
+        affinity: NSSelectionAffinity
+    ) -> NSRect {
+        let downstream = downstreamCaretRect(at: characterIndex)
+        guard affinity == .upstream, characterIndex > 0 else { return downstream }
+
+        let previousCharacter = (textStorage.string as NSString)
+            .rangeOfComposedCharacterSequence(at: min(characterIndex, textStorage.length) - 1)
+        let previousGlyphs = layoutManager.glyphRange(
+            forCharacterRange: previousCharacter,
+            actualCharacterRange: nil
+        )
+        guard previousGlyphs.length > 0 else { return downstream }
+
+        let lastGlyph = NSMaxRange(previousGlyphs) - 1
+        let previousLine = layoutManager.lineFragmentUsedRect(
+            forGlyphAt: lastGlyph,
+            effectiveRange: nil
+        )
+        guard abs(textOrigin.y + previousLine.midY - downstream.midY) >= 0.5 else {
+            return downstream
+        }
+        let previousBounds = layoutManager.boundingRect(
+            forGlyphRange: previousGlyphs,
+            in: textContainer
+        )
+        return NSRect(
+            x: textOrigin.x + previousBounds.maxX,
+            y: textOrigin.y + previousLine.minY,
+            width: 1.5,
+            height: max(previousLine.height, 26)
+        )
+    }
+
+    private func downstreamCaretRect(at characterIndex: Int) -> NSRect {
         updateContainerSize()
         layoutManager.ensureLayout(for: textContainer)
 
@@ -479,7 +670,20 @@ final class TextInputView: NSView, NSTextInputClient {
             return NSRect(x: textOrigin.x, y: textOrigin.y, width: 1.5, height: 26)
         }
 
-        let clampedIndex = min(characterIndex, textStorage.length)
+        let clampedIndex = min(max(characterIndex, 0), textStorage.length)
+        if clampedIndex == textStorage.length,
+            (textStorage.string as NSString).hasSuffix("\n"),
+            !layoutManager.extraLineFragmentUsedRect.isEmpty
+        {
+            let extra = layoutManager.extraLineFragmentUsedRect
+            return NSRect(
+                x: textOrigin.x + extra.minX,
+                y: textOrigin.y + extra.minY,
+                width: 1.5,
+                height: max(extra.height, 26)
+            )
+        }
+
         let glyphIndex: Int
         if clampedIndex == textStorage.length {
             glyphIndex = max(layoutManager.numberOfGlyphs - 1, 0)
@@ -521,6 +725,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = inputView
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(inputView)
+        inputView.runLayoutRoundTripSelfCheck()
         inputView.runAccessibilitySelfCheck()
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.25) {
