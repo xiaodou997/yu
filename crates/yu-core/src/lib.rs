@@ -5,5 +5,5 @@
 mod position;
 
 pub use position::{
-    Affinity, ByteOffset, Revision, TextAnchor, TextRange, Utf16Offset, Utf16Range,
+    Affinity, ByteOffset, LineIndex, Revision, TextAnchor, TextRange, Utf16Offset, Utf16Range,
 };

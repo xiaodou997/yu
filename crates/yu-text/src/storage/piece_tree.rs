@@ -2,22 +2,124 @@ use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{AllocationCollector, StorageBackend, StorageStats};
+use super::{AllocationCollector, StorageBackend, StorageChunk, StorageStats};
+use crate::TextSummary;
+use crate::summary::{
+    byte_after_line_break, byte_offset_for_utf16 as byte_offset_for_utf16_in_text,
+};
 
+const SUMMARY_CHECKPOINT_BYTES: usize = 4 * 1024;
 type Link = Option<Arc<Node>>;
+
+#[derive(Clone, Copy, Debug)]
+struct SummaryCheckpoint {
+    byte: usize,
+    summary: TextSummary,
+}
+
+#[derive(Debug)]
+struct PieceBuffer {
+    text: Arc<str>,
+    checkpoints: Box<[SummaryCheckpoint]>,
+    summary: TextSummary,
+}
+
+impl PieceBuffer {
+    fn new(text: Arc<str>) -> Arc<Self> {
+        let mut checkpoints = vec![SummaryCheckpoint {
+            byte: 0,
+            summary: TextSummary::EMPTY,
+        }];
+        let mut summary = TextSummary::EMPTY;
+        let mut checkpoint_after = SUMMARY_CHECKPOINT_BYTES;
+
+        for (byte, character) in text.char_indices() {
+            if byte >= checkpoint_after {
+                checkpoints.push(SummaryCheckpoint { byte, summary });
+                checkpoint_after = byte.saturating_add(SUMMARY_CHECKPOINT_BYTES);
+            }
+            summary = summary.plus(TextSummary::from_char(character));
+        }
+
+        Arc::new(Self {
+            text,
+            checkpoints: checkpoints.into_boxed_slice(),
+            summary,
+        })
+    }
+
+    fn prefix_summary(&self, offset: usize) -> TextSummary {
+        debug_assert!(offset <= self.text.len());
+        debug_assert!(self.text.is_char_boundary(offset));
+        if offset == self.text.len() {
+            return self.summary;
+        }
+        let index = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.byte <= offset)
+            .saturating_sub(1);
+        let checkpoint = self.checkpoints[index];
+        checkpoint
+            .summary
+            .plus(TextSummary::from_text(&self.text[checkpoint.byte..offset]))
+    }
+
+    fn summary(&self, range: Range<usize>) -> TextSummary {
+        self.prefix_summary(range.end)
+            .minus(self.prefix_summary(range.start))
+    }
+
+    fn byte_offset_for_utf16(&self, range: Range<usize>, target: u64) -> Option<usize> {
+        let range_start = self.prefix_summary(range.start).utf16_u64();
+        let absolute_target = range_start + target;
+        let checkpoint_index = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.summary.utf16_u64() <= absolute_target)
+            .saturating_sub(1);
+        let checkpoint = self.checkpoints[checkpoint_index];
+        let relative = byte_offset_for_utf16_in_text(
+            &self.text[checkpoint.byte..range.end],
+            absolute_target - checkpoint.summary.utf16_u64(),
+        )?;
+        let absolute = checkpoint.byte + relative;
+        (absolute >= range.start).then_some(absolute - range.start)
+    }
+
+    fn byte_offset_for_line(&self, range: Range<usize>, target: u64) -> Option<usize> {
+        if target == 0 {
+            return Some(0);
+        }
+        let range_start = self.prefix_summary(range.start).line_breaks();
+        let absolute_target = range_start + target;
+        let checkpoint_index = self
+            .checkpoints
+            .partition_point(|checkpoint| checkpoint.summary.line_breaks() < absolute_target)
+            .saturating_sub(1);
+        let checkpoint = self.checkpoints[checkpoint_index];
+        let relative = byte_after_line_break(
+            &self.text[checkpoint.byte..range.end],
+            absolute_target - checkpoint.summary.line_breaks(),
+        )?;
+        let absolute = checkpoint.byte + relative;
+        (absolute >= range.start).then_some(absolute - range.start)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Piece {
-    buffer: Arc<str>,
+    buffer: Arc<PieceBuffer>,
     start: usize,
     end: usize,
+    summary: TextSummary,
 }
 
 impl Piece {
-    fn whole(buffer: Arc<str>) -> Self {
+    fn whole(text: Arc<str>) -> Self {
+        let buffer = PieceBuffer::new(text);
         Self {
             start: 0,
-            end: buffer.len(),
+            end: buffer.text.len(),
+            summary: buffer.summary,
             buffer,
         }
     }
@@ -27,14 +129,18 @@ impl Piece {
     }
 
     fn text(&self) -> &str {
-        &self.buffer[self.start..self.end]
+        &self.buffer.text[self.start..self.end]
     }
 
     fn subpiece(&self, start: usize, end: usize) -> Option<Self> {
-        (start < end).then(|| Self {
-            buffer: Arc::clone(&self.buffer),
-            start: self.start + start,
-            end: self.start + end,
+        (start < end).then(|| {
+            let absolute = self.start + start..self.start + end;
+            Self {
+                buffer: Arc::clone(&self.buffer),
+                start: absolute.start,
+                end: absolute.end,
+                summary: self.buffer.summary(absolute),
+            }
         })
     }
 }
@@ -45,14 +151,16 @@ struct Node {
     piece: Piece,
     right: Link,
     priority: u64,
-    bytes: usize,
+    summary: TextSummary,
     pieces: usize,
     height: usize,
 }
 
 fn make_node(left: Link, piece: Piece, right: Link, priority: u64) -> Arc<Node> {
     Arc::new(Node {
-        bytes: link_bytes(&left) + piece.len() + link_bytes(&right),
+        summary: link_summary(&left)
+            .plus(piece.summary)
+            .plus(link_summary(&right)),
         pieces: link_pieces(&left) + 1 + link_pieces(&right),
         height: 1 + link_height(&left).max(link_height(&right)),
         left,
@@ -63,7 +171,12 @@ fn make_node(left: Link, piece: Piece, right: Link, priority: u64) -> Arc<Node> 
 }
 
 fn link_bytes(link: &Link) -> usize {
-    link.as_ref().map_or(0, |node| node.bytes)
+    link_summary(link).bytes_usize()
+}
+
+fn link_summary(link: &Link) -> TextSummary {
+    link.as_ref()
+        .map_or(TextSummary::EMPTY, |node| node.summary)
 }
 
 fn link_pieces(link: &Link) -> usize {
@@ -164,6 +277,7 @@ fn concat_coalescing(left: Link, right: Link, sequence: &mut u64) -> Link {
         buffer: left_piece.buffer,
         start: left_piece.start,
         end: right_piece.end,
+        summary: left_piece.summary.plus(right_piece.summary),
     };
     let merged = Some(make_node(None, merged_piece, None, next_priority(sequence)));
     merge(merge(left_remainder, merged), right_remainder)
@@ -253,7 +367,7 @@ fn write_all(root: &Link, output: &mut String) {
 
 fn is_char_boundary(root: &Link, offset: usize) -> bool {
     let Some(node) = root else { return offset == 0 };
-    if offset == 0 || offset == node.bytes {
+    if offset == 0 || offset == node.summary.bytes_usize() {
         return true;
     }
     let left_bytes = link_bytes(&node.left);
@@ -268,9 +382,77 @@ fn is_char_boundary(root: &Link, offset: usize) -> bool {
         return node
             .piece
             .buffer
+            .text
             .is_char_boundary(node.piece.start + offset - left_bytes);
     }
     is_char_boundary(&node.right, offset - piece_end)
+}
+
+fn prefix_summary(root: &Link, offset: usize) -> TextSummary {
+    let Some(node) = root else {
+        return TextSummary::EMPTY;
+    };
+    let left_bytes = link_bytes(&node.left);
+    if offset <= left_bytes {
+        return prefix_summary(&node.left, offset);
+    }
+
+    let before_piece = link_summary(&node.left);
+    let local = offset - left_bytes;
+    if local <= node.piece.len() {
+        return before_piece.plus(
+            node.piece
+                .buffer
+                .summary(node.piece.start..node.piece.start + local),
+        );
+    }
+
+    before_piece
+        .plus(node.piece.summary)
+        .plus(prefix_summary(&node.right, local - node.piece.len()))
+}
+
+fn byte_offset_for_utf16(root: &Link, target: u64) -> Option<usize> {
+    let node = root.as_ref()?;
+    let left_summary = link_summary(&node.left);
+    if target <= left_summary.utf16_u64() {
+        return byte_offset_for_utf16(&node.left, target);
+    }
+
+    let after_left = target - left_summary.utf16_u64();
+    if after_left <= node.piece.summary.utf16_u64() {
+        let local = node
+            .piece
+            .buffer
+            .byte_offset_for_utf16(node.piece.start..node.piece.end, after_left)?;
+        return Some(link_bytes(&node.left) + local);
+    }
+
+    byte_offset_for_utf16(&node.right, after_left - node.piece.summary.utf16_u64())
+        .map(|offset| link_bytes(&node.left) + node.piece.len() + offset)
+}
+
+fn byte_offset_for_line(root: &Link, target: u64) -> Option<usize> {
+    if target == 0 {
+        return Some(0);
+    }
+    let node = root.as_ref()?;
+    let left_summary = link_summary(&node.left);
+    if target <= left_summary.line_breaks() {
+        return byte_offset_for_line(&node.left, target);
+    }
+
+    let after_left = target - left_summary.line_breaks();
+    if after_left <= node.piece.summary.line_breaks() {
+        let local = node
+            .piece
+            .buffer
+            .byte_offset_for_line(node.piece.start..node.piece.end, after_left)?;
+        return Some(link_bytes(&node.left) + local);
+    }
+
+    byte_offset_for_line(&node.right, after_left - node.piece.summary.line_breaks())
+        .map(|offset| link_bytes(&node.left) + node.piece.len() + offset)
 }
 
 fn collect_allocations(root: &Link, collector: &mut AllocationCollector) {
@@ -278,7 +460,11 @@ fn collect_allocations(root: &Link, collector: &mut AllocationCollector) {
     if !collector.add_node(node, mem::size_of::<Node>()) {
         return;
     }
-    collector.add_text(&node.piece.buffer);
+    let buffer = &node.piece.buffer;
+    let auxiliary_bytes = mem::size_of::<PieceBuffer>()
+        + buffer.checkpoints.len() * mem::size_of::<SummaryCheckpoint>();
+    collector.add_auxiliary(buffer, auxiliary_bytes);
+    collector.add_text(&buffer.text);
     collect_allocations(&node.left, collector);
     collect_allocations(&node.right, collector);
 }
@@ -364,7 +550,85 @@ impl PieceTreeSnapshot {
         )
     }
 
+    pub(super) fn summary(&self) -> TextSummary {
+        link_summary(&self.root)
+    }
+
+    pub(super) fn is_char_boundary(&self, offset: usize) -> bool {
+        offset <= link_bytes(&self.root) && is_char_boundary(&self.root, offset)
+    }
+
+    pub(super) fn prefix_summary(&self, offset: usize) -> TextSummary {
+        prefix_summary(&self.root, offset)
+    }
+
+    pub(super) fn byte_offset_for_utf16(&self, offset: u64) -> Option<usize> {
+        if offset == 0 {
+            return Some(0);
+        }
+        byte_offset_for_utf16(&self.root, offset)
+    }
+
+    pub(super) fn byte_offset_for_line(&self, line: u64) -> Option<usize> {
+        byte_offset_for_line(&self.root, line)
+    }
+
     pub(super) fn collect_allocations(&self, collector: &mut AllocationCollector) {
         collect_allocations(&self.root, collector);
+    }
+
+    pub(super) fn chunks_from(&self, offset: usize) -> PieceTreeChunkCursor<'_> {
+        PieceTreeChunkCursor::new(&self.root, offset)
+    }
+}
+
+pub(super) struct PieceTreeChunkCursor<'a> {
+    stack: Vec<(&'a Node, usize)>,
+}
+
+impl<'a> PieceTreeChunkCursor<'a> {
+    fn new(root: &'a Link, offset: usize) -> Self {
+        let mut cursor = Self { stack: Vec::new() };
+        let mut node = root.as_deref();
+        let mut base = 0;
+
+        while let Some(current) = node {
+            let piece_start = base + link_bytes(&current.left);
+            let piece_end = piece_start + current.piece.len();
+            if offset < piece_end {
+                cursor.stack.push((current, base));
+                if offset < piece_start {
+                    node = current.left.as_deref();
+                } else {
+                    break;
+                }
+            } else {
+                base = piece_end;
+                node = current.right.as_deref();
+            }
+        }
+
+        cursor
+    }
+
+    fn push_left(&mut self, mut node: Option<&'a Node>, base: usize) {
+        while let Some(current) = node {
+            self.stack.push((current, base));
+            node = current.left.as_deref();
+        }
+    }
+}
+
+impl<'a> Iterator for PieceTreeChunkCursor<'a> {
+    type Item = StorageChunk<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (node, base) = self.stack.pop()?;
+        let start = base + link_bytes(&node.left);
+        self.push_left(node.right.as_deref(), start + node.piece.len());
+        Some(StorageChunk {
+            start,
+            text: node.piece.text(),
+        })
     }
 }

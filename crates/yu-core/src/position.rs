@@ -56,6 +56,30 @@ impl TryFrom<ByteOffset> for usize {
     }
 }
 
+/// A zero-based logical line index. Lines are separated by LF source bytes.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LineIndex(u64);
+
+impl LineIndex {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Debug for LineIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "LineIndex({})", self.0)
+    }
+}
+
 /// An offset measured in UTF-16 code units for native text-system bridges.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Utf16Offset(u64);
@@ -289,5 +313,11 @@ mod tests {
         assert!(range.contains(ByteOffset::new(2)));
         assert!(range.contains(ByteOffset::new(3)));
         assert!(!range.contains(ByteOffset::new(4)));
+    }
+
+    #[test]
+    fn line_indexes_are_zero_based() {
+        assert_eq!(LineIndex::ZERO.get(), 0);
+        assert!(LineIndex::new(2) > LineIndex::new(1));
     }
 }

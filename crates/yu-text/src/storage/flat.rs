@@ -1,7 +1,9 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{AllocationCollector, StorageBackend, StorageStats};
+use super::{AllocationCollector, StorageBackend, StorageChunk, StorageStats};
+use crate::TextSummary;
+use crate::summary::{byte_after_line_break, byte_offset_for_utf16};
 
 #[derive(Debug)]
 pub(crate) struct FlatStore {
@@ -72,7 +74,54 @@ impl FlatSnapshot {
         )
     }
 
+    pub(super) fn summary(&self) -> TextSummary {
+        TextSummary::from_text(&self.text)
+    }
+
+    pub(super) fn is_char_boundary(&self, offset: usize) -> bool {
+        self.text.is_char_boundary(offset)
+    }
+
+    pub(super) fn prefix_summary(&self, offset: usize) -> TextSummary {
+        TextSummary::from_text(&self.text[..offset])
+    }
+
+    pub(super) fn byte_offset_for_utf16(&self, offset: u64) -> Option<usize> {
+        byte_offset_for_utf16(&self.text, offset)
+    }
+
+    pub(super) fn byte_offset_for_line(&self, line: u64) -> Option<usize> {
+        byte_after_line_break(&self.text, line)
+    }
+
     pub(super) fn collect_allocations(&self, collector: &mut AllocationCollector) {
         collector.add_text(&self.text);
+    }
+
+    pub(super) fn chunks_from(&self, offset: usize) -> FlatChunkCursor<'_> {
+        FlatChunkCursor {
+            snapshot: self,
+            yielded: offset >= self.text.len(),
+        }
+    }
+}
+
+pub(super) struct FlatChunkCursor<'a> {
+    snapshot: &'a FlatSnapshot,
+    yielded: bool,
+}
+
+impl<'a> Iterator for FlatChunkCursor<'a> {
+    type Item = StorageChunk<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.yielded {
+            return None;
+        }
+        self.yielded = true;
+        Some(StorageChunk {
+            start: 0,
+            text: &self.snapshot.text,
+        })
     }
 }

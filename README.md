@@ -76,6 +76,7 @@ swift build --package-path experiments/macos-text-input
 正式架构文档和代码一起进行版本管理，因为这些规范定义了模块边界和测试不变量：
 
 - [架构总览](docs/architecture/overview.md)
+- [Text Buffer](docs/architecture/text-buffer.md)
 - [核心不变量](docs/specs/invariants.md)
 - [坐标与位置](docs/specs/coordinates.md)
 - [Architecture Decision Records](docs/adr/)

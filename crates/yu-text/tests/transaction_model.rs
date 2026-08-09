@@ -1,5 +1,5 @@
-use yu_core::{ByteOffset, TextRange};
-use yu_text::{Edit, StorageBackend, TextBuffer, Transaction};
+use yu_core::{ByteOffset, TextRange, Utf16Offset};
+use yu_text::{Edit, StorageBackend, TextBuffer, TextSummary, Transaction};
 
 const INSERTIONS: [&str; 7] = ["羽", "Yu", "🙂", "e\u{301}", "\n", "**", ""];
 
@@ -47,23 +47,46 @@ fn run_model(backend: StorageBackend) {
         let applied = buffer
             .apply(&transaction)
             .expect("model-generated transaction should apply");
-        assert_eq!(
-            buffer.snapshot().as_str(),
-            model,
-            "backend {backend} failed at step {step}"
-        );
+        assert_snapshot_matches_model(&buffer, &model, backend, step);
 
         if step % 5 == 0 {
             buffer
                 .apply(applied.inverse())
                 .expect("generated inverse should apply");
             model = before;
-            assert_eq!(
-                buffer.snapshot().as_str(),
-                model,
-                "backend {backend} inverse failed at step {step}"
-            );
+            assert_snapshot_matches_model(&buffer, &model, backend, step);
         }
+    }
+}
+
+fn assert_snapshot_matches_model(
+    buffer: &TextBuffer,
+    model: &str,
+    backend: StorageBackend,
+    step: usize,
+) {
+    let snapshot = buffer.snapshot();
+    assert_eq!(
+        snapshot.as_str(),
+        model,
+        "backend {backend} content failed at step {step}"
+    );
+    assert_eq!(
+        snapshot.summary(),
+        TextSummary::from_text(model),
+        "backend {backend} summary failed at step {step}"
+    );
+
+    if step.is_multiple_of(31) {
+        let probe = model
+            .char_indices()
+            .nth(model.chars().count() / 2)
+            .map_or(model.len(), |(byte, _)| byte);
+        let expected_utf16 = model[..probe].encode_utf16().count() as u64;
+        let byte = ByteOffset::try_from(probe).expect("test offset should fit u64");
+        let utf16 = Utf16Offset::new(expected_utf16);
+        assert_eq!(snapshot.utf16_offset(byte), Ok(utf16));
+        assert_eq!(snapshot.byte_offset_for_utf16(utf16), Ok(byte));
     }
 }
 

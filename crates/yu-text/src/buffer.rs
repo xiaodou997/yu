@@ -1,11 +1,11 @@
 use std::sync::{Arc, OnceLock};
 
-use yu_core::{ByteOffset, Revision};
+use yu_core::{ByteOffset, LineIndex, Revision, Utf16Offset};
 
 use crate::storage::{Storage, StorageSnapshot};
 use crate::{
-    AppliedTransaction, EditError, SnapshotRetentionStats, StorageBackend, StorageStats,
-    Transaction, transaction::PreparedTransaction,
+    AppliedTransaction, ChunkCursor, EditError, SnapshotRetentionStats, StorageBackend,
+    StorageStats, TextPositionError, Transaction, transaction::PreparedTransaction,
 };
 
 /// An immutable, cheaply cloneable view of one document revision.
@@ -89,6 +89,76 @@ impl TextSnapshot {
     pub fn storage_stats(&self) -> StorageStats {
         self.inner.storage.stats()
     }
+
+    #[must_use]
+    pub fn summary(&self) -> crate::TextSummary {
+        self.inner.storage.summary()
+    }
+
+    #[must_use]
+    pub fn chunks(&self) -> ChunkCursor<'_> {
+        self.inner.storage.chunks_from(0)
+    }
+
+    pub fn chunk_cursor(&self, offset: ByteOffset) -> Result<ChunkCursor<'_>, TextPositionError> {
+        let offset_usize = self.validate_byte_offset(offset)?;
+        Ok(self.inner.storage.chunks_from(offset_usize))
+    }
+
+    pub fn utf16_offset(&self, offset: ByteOffset) -> Result<Utf16Offset, TextPositionError> {
+        let offset = self.validate_byte_offset(offset)?;
+        Ok(self.inner.storage.prefix_summary(offset).utf16_units())
+    }
+
+    pub fn byte_offset_for_utf16(
+        &self,
+        offset: Utf16Offset,
+    ) -> Result<ByteOffset, TextPositionError> {
+        let len = self.summary().utf16_units();
+        if offset > len {
+            return Err(TextPositionError::Utf16OutOfBounds { offset, len });
+        }
+        let byte = self
+            .inner
+            .storage
+            .byte_offset_for_utf16(offset.get())
+            .ok_or(TextPositionError::Utf16InsideScalar(offset))?;
+        ByteOffset::try_from(byte).map_err(|_| TextPositionError::Utf16OutOfBounds { offset, len })
+    }
+
+    pub fn line_index(&self, offset: ByteOffset) -> Result<LineIndex, TextPositionError> {
+        let offset = self.validate_byte_offset(offset)?;
+        Ok(LineIndex::new(
+            self.inner.storage.prefix_summary(offset).line_breaks(),
+        ))
+    }
+
+    pub fn line_start(&self, line: LineIndex) -> Result<ByteOffset, TextPositionError> {
+        let line_count = self.summary().line_count();
+        if line.get() >= line_count {
+            return Err(TextPositionError::LineOutOfBounds { line, line_count });
+        }
+        let byte = self
+            .inner
+            .storage
+            .byte_offset_for_line(line.get())
+            .expect("a validated line index must have a source offset");
+        ByteOffset::try_from(byte)
+            .map_err(|_| TextPositionError::LineOutOfBounds { line, line_count })
+    }
+
+    fn validate_byte_offset(&self, offset: ByteOffset) -> Result<usize, TextPositionError> {
+        let len = self.len_bytes();
+        if offset > len {
+            return Err(TextPositionError::ByteOutOfBounds { offset, len });
+        }
+        let offset_usize = usize::try_from(offset)
+            .map_err(|_| TextPositionError::ByteOutOfBounds { offset, len })?;
+        if !self.inner.storage.is_char_boundary(offset_usize) {
+            return Err(TextPositionError::NotUtf8Boundary(offset));
+        }
+        Ok(offset_usize)
+    }
 }
 
 /// A mutable text facade with selectable storage backends.
@@ -158,7 +228,7 @@ impl TextBuffer {
 
 #[cfg(test)]
 mod tests {
-    use yu_core::{ByteOffset, TextRange};
+    use yu_core::{ByteOffset, LineIndex, TextRange, Utf16Offset};
 
     use super::*;
     use crate::Edit;
@@ -255,5 +325,171 @@ mod tests {
                 "backend {backend} accumulated fragments"
             );
         }
+    }
+
+    #[test]
+    fn summaries_match_the_flat_text_after_edits() {
+        for backend in StorageBackend::ALL {
+            let mut model = String::from("first\r\n羽🙂\nlast");
+            let mut buffer = TextBuffer::with_backend(model.clone(), backend);
+            let range = TextRange::new(ByteOffset::new(7), ByteOffset::new(10))
+                .expect("ordered offsets should form a range");
+            let transaction = Transaction::new(buffer.revision(), [Edit::new(range, "two\nlines")]);
+            model.replace_range(7..10, "two\nlines");
+            buffer
+                .apply(&transaction)
+                .expect("valid transaction should apply");
+
+            assert_eq!(
+                buffer.snapshot().summary(),
+                crate::TextSummary::from_text(&model),
+                "backend {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_cursor_reconstructs_source_and_seeks_to_containing_chunk() {
+        let source = "a羽🙂\n".repeat(2_000);
+        for backend in StorageBackend::ALL {
+            let mut buffer = TextBuffer::with_backend(source.clone(), backend);
+            let insertion = TextRange::empty(ByteOffset::new(1));
+            let transaction =
+                Transaction::new(buffer.revision(), [Edit::new(insertion, "inserted")]);
+            buffer
+                .apply(&transaction)
+                .expect("valid transaction should apply");
+            let snapshot = buffer.snapshot();
+            let expected = snapshot.as_str().to_owned();
+
+            let reconstructed: String = snapshot.chunks().map(|chunk| chunk.text()).collect();
+            assert_eq!(reconstructed, expected, "backend {backend}");
+
+            let seek = ByteOffset::new(3);
+            let mut cursor = snapshot
+                .chunk_cursor(seek)
+                .expect("seek offset is a UTF-8 boundary");
+            let first = cursor.next().expect("seek before EOF should find a chunk");
+            assert!(first.start() <= seek, "backend {backend}");
+            assert!(seek < first.end(), "backend {backend}");
+            let suffix: String = std::iter::once(first)
+                .chain(cursor)
+                .map(|chunk| chunk.text())
+                .collect();
+            let first_start = usize::try_from(first.start()).expect("offset should fit usize");
+            assert_eq!(suffix, expected[first_start..], "backend {backend}");
+
+            assert!(
+                snapshot
+                    .chunk_cursor(snapshot.len_bytes())
+                    .expect("EOF is a valid cursor boundary")
+                    .next()
+                    .is_none()
+            );
+            let invalid = ByteOffset::new(10);
+            assert!(
+                matches!(
+                    snapshot.chunk_cursor(invalid),
+                    Err(TextPositionError::NotUtf8Boundary(offset)) if offset == invalid
+                ),
+                "backend {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_utf16_and_line_queries_match_string_model() {
+        for backend in StorageBackend::ALL {
+            let mut model = String::from("# title\r\n羽🙂\nlast");
+            let mut buffer = TextBuffer::with_backend(model.clone(), backend);
+            apply_model_edit(&mut buffer, &mut model, 0..0, "前\n");
+            let middle = model.find('羽').expect("fixture contains 羽");
+            apply_model_edit(&mut buffer, &mut model, middle..middle, "mid🙂\n");
+            let last = model.find("last").expect("fixture contains last");
+            apply_model_edit(&mut buffer, &mut model, last..last + 4, "尾");
+
+            let snapshot = buffer.snapshot();
+            let boundaries = model
+                .char_indices()
+                .map(|(byte, _)| byte)
+                .chain(std::iter::once(model.len()));
+            for byte in boundaries {
+                let byte_offset =
+                    ByteOffset::try_from(byte).expect("test byte offset should fit u64");
+                let expected_utf16 = u64::try_from(model[..byte].encode_utf16().count())
+                    .expect("test UTF-16 offset should fit u64");
+                let expected_line = u64::try_from(
+                    model[..byte]
+                        .bytes()
+                        .filter(|value| *value == b'\n')
+                        .count(),
+                )
+                .expect("test line index should fit u64");
+
+                assert_eq!(
+                    snapshot.utf16_offset(byte_offset),
+                    Ok(Utf16Offset::new(expected_utf16)),
+                    "backend {backend}, byte {byte}"
+                );
+                assert_eq!(
+                    snapshot.byte_offset_for_utf16(Utf16Offset::new(expected_utf16)),
+                    Ok(byte_offset),
+                    "backend {backend}, UTF-16 {expected_utf16}"
+                );
+                assert_eq!(
+                    snapshot.line_index(byte_offset),
+                    Ok(LineIndex::new(expected_line)),
+                    "backend {backend}, byte {byte}"
+                );
+            }
+
+            let line_starts = std::iter::once(0)
+                .chain(
+                    model
+                        .bytes()
+                        .enumerate()
+                        .filter_map(|(byte, value)| (value == b'\n').then_some(byte + 1)),
+                )
+                .collect::<Vec<_>>();
+            assert_eq!(
+                snapshot.summary().line_count(),
+                line_starts.len() as u64,
+                "backend {backend}"
+            );
+            for (line, expected_start) in line_starts.into_iter().enumerate() {
+                assert_eq!(
+                    snapshot.line_start(LineIndex::new(line as u64)),
+                    Ok(ByteOffset::try_from(expected_start).expect("offset should fit u64")),
+                    "backend {backend}, line {line}"
+                );
+            }
+
+            let emoji_byte = model.find('🙂').expect("fixture contains emoji");
+            let emoji_utf16 = model[..emoji_byte].encode_utf16().count() as u64;
+            let split = Utf16Offset::new(emoji_utf16 + 1);
+            assert_eq!(
+                snapshot.byte_offset_for_utf16(split),
+                Err(TextPositionError::Utf16InsideScalar(split)),
+                "backend {backend}"
+            );
+        }
+    }
+
+    fn apply_model_edit(
+        buffer: &mut TextBuffer,
+        model: &mut String,
+        range: std::ops::Range<usize>,
+        inserted: &str,
+    ) {
+        let text_range = TextRange::new(
+            ByteOffset::try_from(range.start).expect("test offset should fit u64"),
+            ByteOffset::try_from(range.end).expect("test offset should fit u64"),
+        )
+        .expect("ordered model offsets should form a range");
+        let transaction = Transaction::new(buffer.revision(), [Edit::new(text_range, inserted)]);
+        buffer
+            .apply(&transaction)
+            .expect("model transaction should apply");
+        model.replace_range(range, inserted);
     }
 }

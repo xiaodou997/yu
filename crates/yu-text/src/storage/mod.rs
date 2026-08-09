@@ -7,9 +7,74 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
-use flat::{FlatSnapshot, FlatStore};
-use piece_tree::{PieceTreeSnapshot, PieceTreeStore};
-use rope::{RopeSnapshot, RopeStore};
+use crate::TextSummary;
+use flat::{FlatChunkCursor, FlatSnapshot, FlatStore};
+use piece_tree::{PieceTreeChunkCursor, PieceTreeSnapshot, PieceTreeStore};
+use rope::{RopeChunkCursor, RopeSnapshot, RopeStore};
+use yu_core::ByteOffset;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextChunk<'a> {
+    start: ByteOffset,
+    text: &'a str,
+}
+
+impl<'a> TextChunk<'a> {
+    #[must_use]
+    pub const fn start(self) -> ByteOffset {
+        self.start
+    }
+
+    #[must_use]
+    pub fn end(self) -> ByteOffset {
+        self.start
+            .checked_add(u64::try_from(self.text.len()).unwrap_or(u64::MAX))
+            .unwrap_or(ByteOffset::new(u64::MAX))
+    }
+
+    #[must_use]
+    pub const fn text(self) -> &'a str {
+        self.text
+    }
+}
+
+pub struct ChunkCursor<'a> {
+    inner: StorageChunkCursor<'a>,
+}
+
+impl<'a> Iterator for ChunkCursor<'a> {
+    type Item = TextChunk<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|chunk| TextChunk {
+            start: ByteOffset::try_from(chunk.start).unwrap_or(ByteOffset::new(u64::MAX)),
+            text: chunk.text,
+        })
+    }
+}
+
+pub(crate) struct StorageChunk<'a> {
+    start: usize,
+    text: &'a str,
+}
+
+enum StorageChunkCursor<'a> {
+    Flat(FlatChunkCursor<'a>),
+    PieceTree(PieceTreeChunkCursor<'a>),
+    Rope(RopeChunkCursor<'a>),
+}
+
+impl<'a> Iterator for StorageChunkCursor<'a> {
+    type Item = StorageChunk<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Flat(cursor) => cursor.next(),
+            Self::PieceTree(cursor) => cursor.next(),
+            Self::Rope(cursor) => cursor.next(),
+        }
+    }
+}
 
 /// Selects a text storage implementation without changing editor semantics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -54,6 +119,8 @@ pub struct SnapshotRetentionStats {
     snapshot_bytes: usize,
     nodes: usize,
     node_bytes: usize,
+    auxiliary_allocations: usize,
+    auxiliary_bytes: usize,
     text_buffers: usize,
     text_bytes: usize,
     materialized_buffers: usize,
@@ -82,6 +149,16 @@ impl SnapshotRetentionStats {
     }
 
     #[must_use]
+    pub const fn auxiliary_allocations(self) -> usize {
+        self.auxiliary_allocations
+    }
+
+    #[must_use]
+    pub const fn auxiliary_bytes(self) -> usize {
+        self.auxiliary_bytes
+    }
+
+    #[must_use]
     pub const fn text_buffers(self) -> usize {
         self.text_buffers
     }
@@ -103,7 +180,7 @@ impl SnapshotRetentionStats {
 
     #[must_use]
     pub const fn estimated_bytes(self) -> usize {
-        self.snapshot_bytes + self.node_bytes + self.text_bytes
+        self.snapshot_bytes + self.node_bytes + self.auxiliary_bytes + self.text_bytes
     }
 }
 
@@ -113,6 +190,8 @@ pub(crate) struct AllocationCollector {
     snapshot_bytes: usize,
     node_ids: HashSet<usize>,
     node_bytes: usize,
+    auxiliary_ids: HashSet<usize>,
+    auxiliary_bytes: usize,
     text_ids: HashSet<usize>,
     text_bytes: usize,
     materialized_ids: HashSet<usize>,
@@ -140,6 +219,16 @@ impl AllocationCollector {
         }
     }
 
+    pub(crate) fn add_auxiliary<T>(&mut self, allocation: &Arc<T>, bytes: usize) -> bool {
+        let id = Arc::as_ptr(allocation) as usize;
+        if self.auxiliary_ids.insert(id) {
+            self.auxiliary_bytes += bytes;
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn add_text(&mut self, text: &Arc<str>) {
         let id = Arc::as_ptr(text) as *const () as usize;
         if self.text_ids.insert(id) {
@@ -161,6 +250,8 @@ impl AllocationCollector {
             snapshot_bytes: self.snapshot_bytes,
             nodes: self.node_ids.len(),
             node_bytes: self.node_bytes,
+            auxiliary_allocations: self.auxiliary_ids.len(),
+            auxiliary_bytes: self.auxiliary_bytes,
             text_buffers: self.text_ids.len(),
             text_bytes: self.text_bytes,
             materialized_buffers: self.materialized_ids.len(),
@@ -313,6 +404,57 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.stats(),
             Self::PieceTree(snapshot) => snapshot.stats(),
             Self::Rope(snapshot) => snapshot.stats(),
+        }
+    }
+
+    pub(crate) fn summary(&self) -> TextSummary {
+        match self {
+            Self::Flat(snapshot) => snapshot.summary(),
+            Self::PieceTree(snapshot) => snapshot.summary(),
+            Self::Rope(snapshot) => snapshot.summary(),
+        }
+    }
+
+    pub(crate) fn chunks_from(&self, offset: usize) -> ChunkCursor<'_> {
+        let inner = match self {
+            Self::Flat(snapshot) => StorageChunkCursor::Flat(snapshot.chunks_from(offset)),
+            Self::PieceTree(snapshot) => {
+                StorageChunkCursor::PieceTree(snapshot.chunks_from(offset))
+            }
+            Self::Rope(snapshot) => StorageChunkCursor::Rope(snapshot.chunks_from(offset)),
+        };
+        ChunkCursor { inner }
+    }
+
+    pub(crate) fn is_char_boundary(&self, offset: usize) -> bool {
+        match self {
+            Self::Flat(snapshot) => snapshot.is_char_boundary(offset),
+            Self::PieceTree(snapshot) => snapshot.is_char_boundary(offset),
+            Self::Rope(snapshot) => snapshot.is_char_boundary(offset),
+        }
+    }
+
+    pub(crate) fn prefix_summary(&self, offset: usize) -> TextSummary {
+        match self {
+            Self::Flat(snapshot) => snapshot.prefix_summary(offset),
+            Self::PieceTree(snapshot) => snapshot.prefix_summary(offset),
+            Self::Rope(snapshot) => snapshot.prefix_summary(offset),
+        }
+    }
+
+    pub(crate) fn byte_offset_for_utf16(&self, offset: u64) -> Option<usize> {
+        match self {
+            Self::Flat(snapshot) => snapshot.byte_offset_for_utf16(offset),
+            Self::PieceTree(snapshot) => snapshot.byte_offset_for_utf16(offset),
+            Self::Rope(snapshot) => snapshot.byte_offset_for_utf16(offset),
+        }
+    }
+
+    pub(crate) fn byte_offset_for_line(&self, line: u64) -> Option<usize> {
+        match self {
+            Self::Flat(snapshot) => snapshot.byte_offset_for_line(line),
+            Self::PieceTree(snapshot) => snapshot.byte_offset_for_line(line),
+            Self::Rope(snapshot) => snapshot.byte_offset_for_line(line),
         }
     }
 

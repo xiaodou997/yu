@@ -48,6 +48,9 @@ fn run_backend(
     let mut buffer = TextBuffer::with_backend(source, backend);
     let construct_time = construct_start.elapsed();
     let initial_stats = buffer.storage_stats();
+    let middle = nearest_char_boundary(source, source.len() / 2);
+    let middle_offset =
+        ByteOffset::try_from(middle).map_err(|_| io::Error::other("fixture is too large"))?;
 
     let mut snapshot_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
@@ -55,6 +58,30 @@ fn run_backend(
         let snapshot = buffer.snapshot();
         snapshot_samples.push(start.elapsed());
         std::hint::black_box(snapshot.storage_stats());
+    }
+
+    let structured_snapshot = buffer.snapshot();
+    let mut chunk_scan_samples = Vec::with_capacity(configuration.iterations);
+    for _ in 0..configuration.iterations {
+        let start = Instant::now();
+        let bytes = structured_snapshot
+            .chunks()
+            .map(|chunk| chunk.text().len())
+            .sum::<usize>();
+        chunk_scan_samples.push(start.elapsed());
+        if bytes != source.len() {
+            return Err(io::Error::other("chunk cursor lost source bytes").into());
+        }
+    }
+
+    let mut coordinate_samples = Vec::with_capacity(configuration.iterations);
+    for _ in 0..configuration.iterations {
+        let start = Instant::now();
+        let utf16 = structured_snapshot.utf16_offset(middle_offset)?;
+        let line = structured_snapshot.line_index(middle_offset)?;
+        std::hint::black_box(structured_snapshot.byte_offset_for_utf16(utf16)?);
+        std::hint::black_box(structured_snapshot.line_start(line)?);
+        coordinate_samples.push(start.elapsed());
     }
 
     let cold_snapshot = buffer.snapshot();
@@ -74,10 +101,7 @@ fn run_backend(
         std::hint::black_box(document);
     }
 
-    let middle = nearest_char_boundary(source, source.len() / 2);
-    let insert_range = TextRange::empty(
-        ByteOffset::try_from(middle).map_err(|_| io::Error::other("fixture is too large"))?,
-    );
+    let insert_range = TextRange::empty(middle_offset);
     let mut edit_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
         let transaction = Transaction::new(buffer.revision(), [Edit::new(insert_range, "羽")]);
@@ -108,8 +132,21 @@ fn run_backend(
         }
     }
     let random_time = random_start.elapsed();
-    if random_buffer.snapshot().as_str() != expected_random_result {
+    let random_snapshot = random_buffer.snapshot();
+    if random_snapshot.as_str() != expected_random_result {
         return Err(io::Error::other(format!("{backend} random edit result mismatch")).into());
+    }
+    let mut fragmented_chunk_samples = Vec::with_capacity(configuration.iterations);
+    for _ in 0..configuration.iterations {
+        let start = Instant::now();
+        let bytes = random_snapshot
+            .chunks()
+            .map(|chunk| chunk.text().len())
+            .sum::<usize>();
+        fragmented_chunk_samples.push(start.elapsed());
+        if bytes != expected_random_result.len() {
+            return Err(io::Error::other("fragmented chunk cursor lost source bytes").into());
+        }
     }
 
     let round_trip_stats = buffer.storage_stats();
@@ -119,6 +156,14 @@ fn run_backend(
     println!("backend: {backend}");
     println!("  construct: {construct_time:?}");
     println!("  snapshot median: {:?}", median(&mut snapshot_samples));
+    println!(
+        "  chunk cursor scan median: {:?}",
+        median(&mut chunk_scan_samples)
+    );
+    println!(
+        "  coordinate round-trip median: {:?}",
+        median(&mut coordinate_samples)
+    );
     println!("  first contiguous view: {materialize_time:?}");
     println!("  full block scan median: {:?}", median(&mut parse_samples));
     println!(
@@ -129,6 +174,10 @@ fn run_backend(
     println!(
         "  random edit mean: {:?}",
         random_time / u32::try_from(random_script.len()).unwrap_or(u32::MAX)
+    );
+    println!(
+        "  fragmented chunk scan median: {:?}",
+        median(&mut fragmented_chunk_samples)
     );
     println!(
         "  initial structure: chunks={} nodes={} height={}",
@@ -149,12 +198,14 @@ fn run_backend(
         random_stats.height()
     );
     println!(
-        "  retained allocation estimate: {} (snapshots={} snapshot-bytes={} nodes={} node-bytes={} text-buffers={} text-bytes={} materialized-buffers={} materialized-bytes={})",
+        "  retained allocation estimate: {} (snapshots={} snapshot-bytes={} nodes={} node-bytes={} auxiliary={} auxiliary-bytes={} text-buffers={} text-bytes={} materialized-buffers={} materialized-bytes={})",
         human_bytes(retention.estimated_bytes()),
         retention.snapshots(),
         retention.snapshot_bytes(),
         retention.nodes(),
         retention.node_bytes(),
+        retention.auxiliary_allocations(),
+        retention.auxiliary_bytes(),
         retention.text_buffers(),
         retention.text_bytes(),
         retention.materialized_buffers(),
