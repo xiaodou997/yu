@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/yu-core",
+    "crates/yu-text",
+    "crates/yu-markdown",
+    "tools/yu-bench",
+    "tools/yu-inspect",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+authors = ["Yu Editor contributors"]
+repository = "https://github.com/xiaodou997/yu"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

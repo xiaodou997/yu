@@ -1,0 +1,6 @@
+/target/
+/.DS_Store
+**/.build/
+**/DerivedData/
+*.xcuserstate
+/.notes/
