@@ -20,7 +20,7 @@
 - [x] 确定性随机 Transaction model test（2,000 次 Unicode edit/inverse）
 - [x] Piece/leaf 局部合并与 insert/inverse 结构稳定性测试
 - [x] 多版本 Snapshot 共享分配测量并选择 Piece Tree 主后端
-- [ ] Piece Tree 行数与 UTF-16 长度摘要、chunk cursor
+- [x] Piece Tree 行数与 UTF-16 长度摘要、chunk cursor
 - [ ] 完整解析与增量解析 differential harness
 
 ## Track B：macOS risk spike

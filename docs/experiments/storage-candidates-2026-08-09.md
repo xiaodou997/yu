@@ -81,10 +81,35 @@ HashSet 自身或容器预留容量，因此是候选之间的相对指标，不
 
 1 MiB workload 也保持同样排序：Flat 7.78 MiB、Piece Tree 1.69 MiB、Rope 5.92 MiB。
 
+## 第三轮结果：节点摘要与 Chunk Cursor
+
+两个树候选加入 UTF-16/LF 摘要；Piece buffer 每约 4 KiB 增加稀疏 prefix checkpoint。benchmark
+同时测量 byte/UTF-16/line 往返、初始 chunk 遍历和 2,000 次编辑后的碎片化 chunk 遍历。
+
+| 指标 | Flat reference | Piece Tree | Persistent Rope |
+| --- | ---: | ---: | ---: |
+| 构造 10 MiB | 2.60 ms | 14.45 ms | 8.80 ms |
+| 初始 chunk scan | 41 ns | 83 ns | 15.96 us |
+| 坐标 round-trip | 25.97 ms | 10.13 us | 3.63 us |
+| 中部 insert + inverse | 5.22 ms | 12.96 us | 14.38 us |
+| 2,000 random edits | 1.470 s | 26.38 ms | 27.25 ms |
+| 碎片化后 chunk scan | 41 ns | 48.75 us | 31.75 us |
+| 8 snapshots 保留分配估算 | 79.78 MiB | 11.22 MiB | 18.57 MiB |
+
+Flat 坐标转换仍需扫描源码。Rope 因固定小叶在坐标查询和碎片化遍历上更快；Piece Tree 初始
+文档通常只有一个 Piece，历史快照保留成本更低，中部编辑与随机 workload 仍略快。Piece 的
+checkpoint 和增大的节点使其 8-Snapshot 估算从 10.70 MiB 增至 11.22 MiB，未改变 ADR 0006
+的主后端结论。
+
+新增 model test 在每次随机 Unicode edit/inverse 后比较完整内容和 `TextSummary`，并周期性验证
+byte/UTF-16 往返。独立测试覆盖 CRLF、空末行、emoji surrogate split、跨 Piece 行定位和从
+任意 UTF-8 边界 seek 的 cursor 重建。
+
 ## 决策
 
 1. 平坦后端继续作为正确性 oracle，不参与产品选择。
 2. Piece Tree 成为产品默认后端：它在本 workload 中编辑更快，历史快照保留成本也更低。
 3. Persistent Rope 暂时保留为实验对照，不再阻塞后续 Piece Tree 元数据和 chunk cursor 工作。
-4. 下一轮加入行/UTF-16 摘要与 chunk-aware parser；Snapshot 估算还需要用进程级 RSS/allocator
-   instrumentation 交叉验证。
+4. 行/UTF-16 摘要和 chunk cursor 已完成；下一轮让 Markdown parser 消费 chunk，并建立完整/
+   增量解析 differential harness。
+5. Snapshot 估算还需要用进程级 RSS/allocator instrumentation 交叉验证。

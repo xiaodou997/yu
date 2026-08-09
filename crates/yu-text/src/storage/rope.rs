@@ -2,7 +2,11 @@ use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{AllocationCollector, StorageBackend, StorageStats};
+use super::{AllocationCollector, StorageBackend, StorageChunk, StorageStats};
+use crate::TextSummary;
+use crate::summary::{
+    byte_after_line_break, byte_offset_for_utf16 as byte_offset_for_utf16_in_text,
+};
 
 const LEAF_BYTES: usize = 4 * 1024;
 type Link = Option<Arc<Node>>;
@@ -10,6 +14,7 @@ type Link = Option<Arc<Node>>;
 #[derive(Debug)]
 struct Node {
     kind: NodeKind,
+    summary: TextSummary,
     bytes: usize,
     leaves: usize,
     height: usize,
@@ -23,6 +28,7 @@ enum NodeKind {
 
 fn leaf(text: Arc<str>) -> Arc<Node> {
     Arc::new(Node {
+        summary: TextSummary::from_text(&text),
         bytes: text.len(),
         leaves: 1,
         height: 1,
@@ -32,6 +38,7 @@ fn leaf(text: Arc<str>) -> Arc<Node> {
 
 fn branch(left: Arc<Node>, right: Arc<Node>) -> Arc<Node> {
     Arc::new(Node {
+        summary: left.summary.plus(right.summary),
         bytes: left.bytes + right.bytes,
         leaves: left.leaves + right.leaves,
         height: 1 + left.height.max(right.height),
@@ -289,6 +296,54 @@ fn is_char_boundary(root: &Link, offset: usize) -> bool {
     }
 }
 
+fn prefix_summary(root: &Link, offset: usize) -> TextSummary {
+    let Some(node) = root else {
+        return TextSummary::EMPTY;
+    };
+    match &node.kind {
+        NodeKind::Leaf(text) => TextSummary::from_text(&text[..offset]),
+        NodeKind::Branch { left, right } if offset <= left.bytes => {
+            prefix_summary(&Some(Arc::clone(left)), offset)
+        }
+        NodeKind::Branch { left, right } => left.summary.plus(prefix_summary(
+            &Some(Arc::clone(right)),
+            offset - left.bytes,
+        )),
+    }
+}
+
+fn byte_offset_for_utf16(root: &Link, target: u64) -> Option<usize> {
+    let node = root.as_ref()?;
+    match &node.kind {
+        NodeKind::Leaf(text) => byte_offset_for_utf16_in_text(text, target),
+        NodeKind::Branch { left, right } if target <= left.summary.utf16_u64() => {
+            byte_offset_for_utf16(&Some(Arc::clone(left)), target)
+        }
+        NodeKind::Branch { left, right } => {
+            byte_offset_for_utf16(&Some(Arc::clone(right)), target - left.summary.utf16_u64())
+                .map(|offset| left.bytes + offset)
+        }
+    }
+}
+
+fn byte_offset_for_line(root: &Link, target: u64) -> Option<usize> {
+    if target == 0 {
+        return Some(0);
+    }
+    let node = root.as_ref()?;
+    match &node.kind {
+        NodeKind::Leaf(text) => byte_after_line_break(text, target),
+        NodeKind::Branch { left, right } if target <= left.summary.line_breaks() => {
+            byte_offset_for_line(&Some(Arc::clone(left)), target)
+        }
+        NodeKind::Branch { left, right } => byte_offset_for_line(
+            &Some(Arc::clone(right)),
+            target - left.summary.line_breaks(),
+        )
+        .map(|offset| left.bytes + offset),
+    }
+}
+
 fn collect_allocations(root: &Link, collector: &mut AllocationCollector) {
     let Some(node) = root else { return };
     if !collector.add_node(node, mem::size_of::<Node>()) {
@@ -367,7 +422,89 @@ impl RopeSnapshot {
         StorageStats::new(StorageBackend::PersistentRope, bytes, leaves, nodes, height)
     }
 
+    pub(super) fn summary(&self) -> TextSummary {
+        self.root
+            .as_ref()
+            .map_or(TextSummary::EMPTY, |node| node.summary)
+    }
+
+    pub(super) fn is_char_boundary(&self, offset: usize) -> bool {
+        offset <= self.root.as_ref().map_or(0, |node| node.bytes)
+            && is_char_boundary(&self.root, offset)
+    }
+
+    pub(super) fn prefix_summary(&self, offset: usize) -> TextSummary {
+        prefix_summary(&self.root, offset)
+    }
+
+    pub(super) fn byte_offset_for_utf16(&self, offset: u64) -> Option<usize> {
+        if offset == 0 {
+            return Some(0);
+        }
+        byte_offset_for_utf16(&self.root, offset)
+    }
+
+    pub(super) fn byte_offset_for_line(&self, line: u64) -> Option<usize> {
+        byte_offset_for_line(&self.root, line)
+    }
+
     pub(super) fn collect_allocations(&self, collector: &mut AllocationCollector) {
         collect_allocations(&self.root, collector);
+    }
+
+    pub(super) fn chunks_from(&self, offset: usize) -> RopeChunkCursor<'_> {
+        RopeChunkCursor::new(&self.root, offset)
+    }
+}
+
+pub(super) struct RopeChunkCursor<'a> {
+    stack: Vec<(&'a Node, usize)>,
+}
+
+impl<'a> RopeChunkCursor<'a> {
+    fn new(root: &'a Link, offset: usize) -> Self {
+        let mut cursor = Self { stack: Vec::new() };
+        let Some(mut node) = root.as_deref() else {
+            return cursor;
+        };
+        let mut base = 0;
+
+        loop {
+            match &node.kind {
+                NodeKind::Leaf(text) => {
+                    if offset < base + text.len() {
+                        cursor.stack.push((node, base));
+                    }
+                    break;
+                }
+                NodeKind::Branch { left, right } if offset < base + left.bytes => {
+                    cursor.stack.push((right, base + left.bytes));
+                    node = left;
+                }
+                NodeKind::Branch { left, right } => {
+                    base += left.bytes;
+                    node = right;
+                }
+            }
+        }
+
+        cursor
+    }
+}
+
+impl<'a> Iterator for RopeChunkCursor<'a> {
+    type Item = StorageChunk<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((node, base)) = self.stack.pop() {
+            match &node.kind {
+                NodeKind::Leaf(text) => return Some(StorageChunk { start: base, text }),
+                NodeKind::Branch { left, right } => {
+                    self.stack.push((right, base + left.bytes));
+                    self.stack.push((left, base));
+                }
+            }
+        }
+        None
     }
 }
