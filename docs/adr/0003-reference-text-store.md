@@ -1,6 +1,6 @@
 # ADR 0003：先用参考存储固定编辑契约
 
-- 状态：Accepted, temporary implementation
+- 状态：Superseded by ADR 0006
 - 日期：2026-08-09
 
 ## 背景
@@ -22,4 +22,3 @@ ChangeSet、inverse 和 Anchor 行为。它不作为性能实现，也不得用�
 3. 支持行、UTF-16 与边界摘要扩展；
 4. 在固定编辑 workload 上提供可重复 benchmark；
 5. 不改变上层 Transaction API。
-

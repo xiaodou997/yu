@@ -2,13 +2,15 @@
 
 //! Immutable text snapshots and transactional editing contracts.
 //!
-//! The current flat UTF-8 storage is a Phase 1 reference backend. Public APIs
-//! intentionally avoid exposing it so a persistent tree can replace it.
+//! Piece Tree is the selected product backend. Flat UTF-8 and Persistent Rope
+//! remain available as explicit correctness and performance comparison stores.
 
 mod buffer;
+mod storage;
 mod transaction;
 
-pub use buffer::{TextBuffer, TextSnapshot};
+pub use buffer::{TextBuffer, TextSnapshot, retained_snapshot_stats};
+pub use storage::{SnapshotRetentionStats, StorageBackend, StorageStats};
 pub use transaction::{
     AnchorMapError, AppliedTransaction, ChangeSet, Edit, EditError, TextChange, Transaction,
 };

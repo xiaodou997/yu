@@ -1,13 +1,19 @@
 use yu_core::{ByteOffset, TextRange};
-use yu_text::{Edit, TextBuffer, Transaction};
+use yu_text::{Edit, StorageBackend, TextBuffer, Transaction};
 
 const INSERTIONS: [&str; 7] = ["羽", "Yu", "🙂", "e\u{301}", "\n", "**", ""];
 
 #[test]
 fn deterministic_random_edits_match_string_model_and_inverse() {
+    for backend in StorageBackend::ALL {
+        run_model(backend);
+    }
+}
+
+fn run_model(backend: StorageBackend) {
     let mut seed = 0x5955_4544_4954_4f52_u64;
     let mut model = String::from("# 羽\n\nHello, 世界🙂\n");
-    let mut buffer = TextBuffer::new(model.clone());
+    let mut buffer = TextBuffer::with_backend(model.clone(), backend);
 
     for step in 0..2_000 {
         let boundaries = char_boundaries(&model);
@@ -41,7 +47,11 @@ fn deterministic_random_edits_match_string_model_and_inverse() {
         let applied = buffer
             .apply(&transaction)
             .expect("model-generated transaction should apply");
-        assert_eq!(buffer.snapshot().as_str(), model, "failed at step {step}");
+        assert_eq!(
+            buffer.snapshot().as_str(),
+            model,
+            "backend {backend} failed at step {step}"
+        );
 
         if step % 5 == 0 {
             buffer
@@ -51,7 +61,7 @@ fn deterministic_random_edits_match_string_model_and_inverse() {
             assert_eq!(
                 buffer.snapshot().as_str(),
                 model,
-                "inverse failed at step {step}"
+                "backend {backend} inverse failed at step {step}"
             );
         }
     }

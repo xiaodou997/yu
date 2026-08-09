@@ -24,8 +24,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 
 ## 当前阶段
 
-项目正在进行 **Phase 1：Contracts & Risk Spikes**。这一阶段不承诺完整 CommonMark、
-Piece Tree 或产品 UI；它先固定最容易影响长期架构的契约：
+项目正在进行 **Phase 1：Contracts & Risk Spikes**。这一阶段不承诺完整 CommonMark 或
+产品 UI；它先固定最容易影响长期架构的契约：
 
 - 强类型源码坐标、Revision 与稳定 Anchor；
 - Snapshot、Transaction、ChangeSet 与可逆编辑；
@@ -39,7 +39,8 @@ Piece Tree 或产品 UI；它先固定最容易影响长期架构的契约：
 
 ```text
 crates/yu-core          坐标、范围、Revision、Anchor
-crates/yu-text          Snapshot、Transaction 和参考文本存储
+crates/yu-editor        CompositionOverlay 和平台无关编辑状态
+crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
 crates/yu-markdown      第一阶段 lossless block scanner
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的第一阶段参考 workload
@@ -47,9 +48,8 @@ experiments/            可丢弃的平台风险实验
 docs/                   架构规范、ADR 和阶段计划
 ```
 
-`yu-text` 当前故意使用平坦 UTF-8 字符串作为**参考后端**，用于验证编辑语义。它不是对最终
-Piece Tree/B-tree Rope 的选择；后续存储实现必须在不改变外部 Transaction/Snapshot 契约的
-情况下替换它。
+`yu-text` 已选择持久化 Piece Tree 作为产品默认后端。平坦 UTF-8 后端继续作为正确性 oracle，
+Persistent Rope 保留为实验对照；三者运行相同的 Transaction model tests。
 
 ## 获取源码
 
@@ -67,7 +67,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p yu-inspect -- README.md
-cargo run --release -p yu-bench -- --size-mib 1 --iterations 20
+cargo run --release -p yu-bench -- --size-mib 1 --iterations 20 --random-edits 2000 --retained-snapshots 8
 swift build --package-path experiments/macos-text-input
 ```
 
@@ -80,6 +80,8 @@ swift build --package-path experiments/macos-text-input
 - [坐标与位置](docs/specs/coordinates.md)
 - [Architecture Decision Records](docs/adr/)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
+- [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
+- [文本存储候选对比](docs/experiments/storage-candidates-2026-08-09.md)
 
 个人笔记、临时调研和未整理草稿请放在本地 `.notes/`，该目录不会提交。
 
@@ -92,4 +94,3 @@ Yu 尚处在协议和基础数据结构快速演进期。提交实现前，请�
 
 Yu Editor 使用 [Apache License 2.0](LICENSE) 发布。该许可证允许使用、修改、分发和商业
 集成，并包含明确的专利授权；分发时需要保留许可证及适用的版权和归属声明。
-

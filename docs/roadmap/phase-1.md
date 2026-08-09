@@ -16,16 +16,20 @@
 - [x] lossless Markdown block scanner
 - [x] `yu-inspect` CLI
 - [x] 可重复运行的 parse/edit 参考 benchmark harness
-- [ ] 持久化 Piece Tree/B-tree Rope 原型与 workload benchmark
+- [x] 持久化 Piece Tree 与 Persistent Rope 初代候选及共同 workload benchmark
 - [x] 确定性随机 Transaction model test（2,000 次 Unicode edit/inverse）
+- [x] Piece/leaf 局部合并与 insert/inverse 结构稳定性测试
+- [x] 多版本 Snapshot 共享分配测量并选择 Piece Tree 主后端
+- [ ] Piece Tree 行数与 UTF-16 长度摘要、chunk cursor
 - [ ] 完整解析与增量解析 differential harness
 
 ## Track B：macOS risk spike
 
 - [x] 可编译的 AppKit 实验程序
 - [x] `NSTextInputClient` 的 marked text/commit/candidate rect 最小链路
-- [ ] 人工验证中文拼音、日文、emoji、dead key
-- [ ] 将实验事件转换为 Rust `CompositionOverlay` 协议
+- [x] 人工验证中文拼音、emoji 与 Escape cancel
+- [ ] 人工验证日文、dead key 与组合重音
+- [x] 将实验事件转换为 Rust `CompositionOverlay` 协议
 - [ ] VoiceOver/Accessibility text range 查询实验
 - [ ] 多行 shaping、点击和 caret round-trip
 
