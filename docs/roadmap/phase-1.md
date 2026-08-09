@@ -22,7 +22,7 @@
 - [x] 多版本 Snapshot 共享分配测量并选择 Piece Tree 主后端
 - [x] Piece Tree 行数与 UTF-16 长度摘要、chunk cursor
 - [x] Chunk-aware 完整解析与保守增量解析 differential harness
-- [ ] 带 start/end state、hash 与 suffix reuse 的持久化 block sequence
+- [x] 带 start/end state、hash 与 suffix reuse 的持久化 block sequence
 
 ## Track B：macOS risk spike
 

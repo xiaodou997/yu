@@ -110,33 +110,23 @@ fn run_backend(
     std::hint::black_box(cold_snapshot.as_str());
     let materialize_time = materialize_start.elapsed();
 
-    let mut incremental_buffer = TextBuffer::with_backend(source, backend);
-    let previous_snapshot = incremental_buffer.snapshot();
-    let previous_document = parse(&previous_snapshot);
-    let incremental_transaction = Transaction::new(
-        incremental_buffer.revision(),
-        [Edit::new(insert_range, "\n# incremental\n")],
-    );
-    let incremental_applied = incremental_buffer.apply(&incremental_transaction)?;
-    let expected_incremental = parse(incremental_applied.result_snapshot());
-    let mut incremental_samples = Vec::with_capacity(configuration.iterations);
-    let mut reparsed_bytes = 0_u64;
-    let mut reused_prefix_blocks = 0;
-    for _ in 0..configuration.iterations {
-        let start = Instant::now();
-        let result = parse_incremental(
-            &previous_document,
-            incremental_applied.result_snapshot(),
-            incremental_applied.change_set(),
-        )?;
-        incremental_samples.push(start.elapsed());
-        reparsed_bytes = result.reparsed_range().len();
-        reused_prefix_blocks = result.reused_prefix_blocks();
-        if result.document() != &expected_incremental {
-            return Err(io::Error::other("incremental parse diverged from full parse").into());
-        }
-        std::hint::black_box(result);
-    }
+    let incremental_measurements = [
+        benchmark_incremental(
+            backend,
+            source,
+            "near-start",
+            nearest_char_boundary(source, source.len() / 100),
+            configuration.iterations,
+        )?,
+        benchmark_incremental(backend, source, "middle", middle, configuration.iterations)?,
+        benchmark_incremental(
+            backend,
+            source,
+            "near-end",
+            nearest_char_boundary(source, source.len() * 99 / 100),
+            configuration.iterations,
+        )?,
+    ];
 
     let mut edit_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
@@ -202,12 +192,18 @@ fn run_backend(
     );
     println!("  first contiguous view: {materialize_time:?}");
     println!("  full block scan median: {:?}", median(&mut parse_samples));
-    println!(
-        "  incremental block scan median: {:?} (reparsed-bytes={} reused-prefix-blocks={})",
-        median(&mut incremental_samples),
-        reparsed_bytes,
-        reused_prefix_blocks
-    );
+    for measurement in incremental_measurements {
+        println!(
+            "  incremental {} median: {:?} (reparsed-bytes={} reused-prefix={} reused-suffix={} shared-blocks={} segments={})",
+            measurement.label,
+            measurement.median,
+            measurement.reparsed_bytes,
+            measurement.reused_prefix_blocks,
+            measurement.reused_suffix_blocks,
+            measurement.shared_blocks,
+            measurement.segments,
+        );
+    }
     println!(
         "  middle insert + inverse median: {:?}",
         median(&mut edit_samples)
@@ -255,6 +251,64 @@ fn run_backend(
     );
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IncrementalMeasurement {
+    label: &'static str,
+    median: Duration,
+    reparsed_bytes: u64,
+    reused_prefix_blocks: usize,
+    reused_suffix_blocks: usize,
+    shared_blocks: usize,
+    segments: usize,
+}
+
+fn benchmark_incremental(
+    backend: StorageBackend,
+    source: &str,
+    label: &'static str,
+    offset: usize,
+    iterations: usize,
+) -> Result<IncrementalMeasurement, Box<dyn Error>> {
+    let mut buffer = TextBuffer::with_backend(source, backend);
+    let previous = parse(&buffer.snapshot());
+    let range = TextRange::empty(
+        ByteOffset::try_from(offset).map_err(|_| io::Error::other("fixture is too large"))?,
+    );
+    let transaction = Transaction::new(buffer.revision(), [Edit::new(range, "\n# incremental\n")]);
+    let applied = buffer.apply(&transaction)?;
+    let expected = parse(applied.result_snapshot());
+    let mut samples = Vec::with_capacity(iterations);
+    let mut measurement = IncrementalMeasurement {
+        label,
+        median: Duration::ZERO,
+        reparsed_bytes: 0,
+        reused_prefix_blocks: 0,
+        reused_suffix_blocks: 0,
+        shared_blocks: 0,
+        segments: 0,
+    };
+
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let result = parse_incremental(&previous, applied.result_snapshot(), applied.change_set())?;
+        samples.push(start.elapsed());
+        if result.document() != &expected {
+            return Err(io::Error::other("incremental parse diverged from full parse").into());
+        }
+        measurement.reparsed_bytes = result.reparsed_range().len();
+        measurement.reused_prefix_blocks = result.reused_prefix_blocks();
+        measurement.reused_suffix_blocks = result.reused_suffix_blocks();
+        measurement.shared_blocks = result
+            .document()
+            .blocks()
+            .shared_blocks_with(previous.blocks());
+        measurement.segments = result.document().block_storage_stats().segments();
+        std::hint::black_box(result);
+    }
+    measurement.median = median(&mut samples);
+    Ok(measurement)
 }
 
 #[derive(Clone, Copy, Debug)]

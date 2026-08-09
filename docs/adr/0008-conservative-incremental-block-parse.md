@@ -1,6 +1,6 @@
 # ADR 0008：保守的增量 Markdown Block Parse
 
-- 状态：Accepted
+- 状态：Superseded by ADR 0009
 - 日期：2026-08-09
 
 ## 背景
@@ -51,5 +51,5 @@ opening/closing fence 后向 EOF 传播。
 2. `MarkdownDocument` 使用连续 `Vec<Block>`，创建新文档时需要复制复用前缀。
 3. 当前只验证 Phase 1 block grammar，不代表完整 CommonMark/GFM。
 
-下一步引入带 start/end state 与 hash 的持久化 block sequence。只有当新状态与旧状态收敛时，
-才可以停止向后重解析并复用 suffix。
+ADR 0009 已引入带 start/end state、hash 与 suffix reuse 的持久化 block sequence。本 ADR 保留
+为先建立正确性 oracle、再优化传播范围的历史依据。

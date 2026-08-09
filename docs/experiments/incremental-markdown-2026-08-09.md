@@ -36,6 +36,9 @@ release build；结果只用于同机相对比较。
 下一轮 benchmark 应分别测 near-start、middle、near-end edit，并在持久化 block sequence 完成后
 记录 prefix/suffix 的共享节点数，而不只看 reparse range。
 
+该下一轮工作已由 ADR 0009 和 `persistent-block-sequence-2026-08-09.md` 完成；本文件保留为
+保守算法的性能基线。
+
 ## 正确性
 
 - 三个存储后端各运行 1,000 次随机 Unicode/Markdown edit differential test；

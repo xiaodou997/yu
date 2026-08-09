@@ -7,44 +7,23 @@
 
 use std::error::Error;
 use std::fmt;
+use std::iter::Peekable;
 
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
-use yu_text::{AnchorMapError, ChangeSet, TextSnapshot};
+use yu_text::{AnchorMapError, ChangeSet, ChunkCursor, TextSnapshot};
 
-/// The block shapes recognized by the Phase 1 scanner.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockKind {
-    BlankLine,
-    Paragraph,
-    AtxHeading { level: u8 },
-    FencedCodeBlock { marker: char, closed: bool },
-}
+mod block_sequence;
 
-/// A block that refers to source without owning or normalizing its text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Block {
-    kind: BlockKind,
-    range: TextRange,
-}
-
-impl Block {
-    #[must_use]
-    pub fn kind(self) -> BlockKind {
-        self.kind
-    }
-
-    #[must_use]
-    pub fn range(self) -> TextRange {
-        self.range
-    }
-}
+pub use block_sequence::{Block, BlockKind, BlockSequence, BlockState, BlockStorageStats};
+use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash};
 
 /// A lossless block view of one immutable text revision.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct MarkdownDocument {
     revision: Revision,
     source_len: ByteOffset,
-    blocks: Vec<Block>,
+    source: TextSnapshot,
+    blocks: BlockSequence,
 }
 
 impl MarkdownDocument {
@@ -59,8 +38,13 @@ impl MarkdownDocument {
     }
 
     #[must_use]
-    pub fn blocks(&self) -> &[Block] {
+    pub fn blocks(&self) -> &BlockSequence {
         &self.blocks
+    }
+
+    #[must_use]
+    pub fn block_storage_stats(&self) -> BlockStorageStats {
+        self.blocks.storage_stats()
     }
 
     /// Confirms that ordered block ranges cover the source exactly once.
@@ -77,12 +61,23 @@ impl MarkdownDocument {
     }
 }
 
+impl PartialEq for MarkdownDocument {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision
+            && self.source_len == other.source_len
+            && self.blocks == other.blocks
+    }
+}
+
+impl Eq for MarkdownDocument {}
+
 /// The observable result of one conservative incremental block parse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IncrementalParse {
     document: MarkdownDocument,
     reparsed_range: TextRange,
     reused_prefix_blocks: usize,
+    reused_suffix_blocks: usize,
 }
 
 impl IncrementalParse {
@@ -104,6 +99,11 @@ impl IncrementalParse {
     #[must_use]
     pub fn reused_prefix_blocks(&self) -> usize {
         self.reused_prefix_blocks
+    }
+
+    #[must_use]
+    pub fn reused_suffix_blocks(&self) -> usize {
+        self.reused_suffix_blocks
     }
 }
 
@@ -162,6 +162,7 @@ struct Line {
     start: usize,
     end: usize,
     analysis: LineAnalysis,
+    source_hash: SourceHash,
 }
 
 impl Line {
@@ -282,14 +283,13 @@ pub fn parse(snapshot: &TextSnapshot) -> MarkdownDocument {
     MarkdownDocument {
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
-        blocks: parse_blocks(snapshot, 0),
+        source: snapshot.clone(),
+        blocks: BlockSequence::from_records(BlockParser::new(snapshot, 0).collect()),
     }
 }
 
-/// Reuses a stable block prefix and reparses from the earliest affected block.
-///
-/// The Phase 1 algorithm intentionally reparses through EOF. This is safe for
-/// state that can propagate forward, such as an opened or deleted code fence.
+/// Reparses from a conservative boundary until source, state, and block shape
+/// converge with an unaffected old block, then shares the remaining suffix.
 pub fn parse_incremental(
     previous: &MarkdownDocument,
     snapshot: &TextSnapshot,
@@ -312,11 +312,13 @@ pub fn parse_incremental(
         let document = MarkdownDocument {
             revision: snapshot.revision(),
             source_len: snapshot.len_bytes(),
+            source: snapshot.clone(),
             blocks: previous.blocks.clone(),
         };
         return Ok(IncrementalParse {
             reparsed_range: TextRange::empty(snapshot.len_bytes()),
             reused_prefix_blocks: document.blocks.len(),
+            reused_suffix_blocks: 0,
             document,
         });
     }
@@ -327,16 +329,12 @@ pub fn parse_incremental(
         .map(|change| change.old_range().start())
         .min()
         .expect("non-empty changes must have an earliest offset");
-    let affected = previous
-        .blocks
-        .iter()
-        .position(|block| block.range.end() > earliest)
-        .unwrap_or(previous.blocks.len());
+    let affected = previous.blocks.first_ending_after(earliest);
     let reparse_index = affected.saturating_sub(1);
     let old_start = previous
         .blocks
         .get(reparse_index)
-        .map_or(ByteOffset::ZERO, |block| block.range.start());
+        .map_or(ByteOffset::ZERO, |block| block.range().start());
     let mapped = changes.map_anchor(TextAnchor::new(
         previous.revision,
         old_start,
@@ -346,85 +344,202 @@ pub fn parse_incremental(
     let new_start_usize = usize::try_from(new_start)
         .expect("a mapped document offset must fit the platform address space");
 
-    let mut blocks = Vec::with_capacity(previous.blocks.len());
-    blocks.extend_from_slice(&previous.blocks[..reparse_index]);
-    blocks.extend(parse_blocks(snapshot, new_start_usize));
+    let latest_changed_end = changes
+        .changes()
+        .iter()
+        .map(|change| change.old_range().end())
+        .max()
+        .expect("non-empty changes must have a latest offset");
+    let mut candidate_index = previous
+        .blocks
+        .first_starting_at_or_after(latest_changed_end)
+        .max(reparse_index);
+
+    let mut parser = BlockParser::new(snapshot, new_start_usize);
+    let mut middle = Vec::new();
+    let mut scanned_end = new_start;
+    let mut reused_suffix_start = previous.blocks.len();
+    let mut suffix_delta = 0_i128;
+
+    for new_record in &mut parser {
+        scanned_end = new_record.block.range.end();
+
+        let mut candidate = None;
+        while candidate_index < previous.blocks.len() {
+            let old_record = previous
+                .blocks
+                .resolved_record(candidate_index)
+                .expect("candidate index must identify an old block");
+            let mapped_range =
+                map_unchanged_range(previous.revision, old_record.block.range, changes)?;
+            if mapped_range.start() < new_record.block.range.start() {
+                candidate_index += 1;
+                continue;
+            }
+            candidate = Some((old_record, mapped_range));
+            break;
+        }
+
+        if let Some((old_record, mapped_range)) = candidate
+            && records_converge(
+                old_record,
+                mapped_range,
+                &new_record,
+                &previous.source,
+                snapshot,
+            )
+        {
+            reused_suffix_start = candidate_index;
+            suffix_delta = i128::from(new_record.block.range.start().get())
+                - i128::from(old_record.block.range.start().get());
+            break;
+        }
+
+        middle.push(new_record);
+    }
+
+    let blocks = BlockSequence::assemble(
+        (&previous.blocks, 0..reparse_index),
+        middle,
+        (
+            &previous.blocks,
+            reused_suffix_start..previous.blocks.len(),
+            suffix_delta,
+        ),
+    );
     let document = MarkdownDocument {
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
+        source: snapshot.clone(),
         blocks,
     };
-    let reparsed_range = TextRange::new(new_start, snapshot.len_bytes())
-        .expect("reparse start must not exceed the Snapshot length");
+    let reparsed_range = TextRange::new(new_start, scanned_end)
+        .expect("the scanner cannot finish before its reparse boundary");
 
     Ok(IncrementalParse {
         document,
         reparsed_range,
         reused_prefix_blocks: reparse_index,
+        reused_suffix_blocks: previous.blocks.len() - reused_suffix_start,
     })
 }
 
-fn parse_blocks(snapshot: &TextSnapshot, start: usize) -> Vec<Block> {
-    let lines = lines(snapshot, start);
-    let mut blocks = Vec::new();
-    let mut index = 0;
+struct BlockParser<'a> {
+    lines: Peekable<LineCursor<'a>>,
+}
 
-    while index < lines.len() {
-        let line = lines[index];
+impl<'a> BlockParser<'a> {
+    fn new(snapshot: &'a TextSnapshot, start: usize) -> Self {
+        Self {
+            lines: LineCursor::new(snapshot, start).peekable(),
+        }
+    }
 
+    fn record(
+        &self,
+        kind: BlockKind,
+        start: usize,
+        end: usize,
+        end_state: BlockState,
+        source_hash: SourceHash,
+    ) -> BlockRecord {
+        let block = block(kind, start, end);
+        BlockRecord {
+            block,
+            start_state: BlockState::Normal,
+            end_state,
+            source_hash,
+        }
+    }
+}
+
+impl Iterator for BlockParser<'_> {
+    type Item = BlockRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let line = self.lines.next()?;
         if line.is_blank() {
-            blocks.push(block(BlockKind::BlankLine, line.start, line.end));
-            index += 1;
-            continue;
+            return Some(self.record(
+                BlockKind::BlankLine,
+                line.start,
+                line.end,
+                BlockState::Normal,
+                line.source_hash,
+            ));
         }
 
         if let Some(fence) = line.opening_fence() {
             let block_start = line.start;
-            index += 1;
             let mut closed = false;
-            while index < lines.len() {
-                let candidate = lines[index];
-                index += 1;
+            let mut end = line.end;
+            let mut source_hash = line.source_hash;
+            for candidate in self.lines.by_ref() {
+                end = candidate.end;
+                source_hash = concatenate_hash(
+                    source_hash,
+                    candidate.source_hash,
+                    candidate.end - candidate.start,
+                );
                 if candidate.is_closing_fence(fence) {
                     closed = true;
                     break;
                 }
             }
-            let end = lines[index - 1].end;
-            blocks.push(block(
+            let end_state = if closed {
+                BlockState::Normal
+            } else {
+                BlockState::Fenced {
+                    marker: fence.marker,
+                    minimum: fence.count,
+                }
+            };
+            return Some(self.record(
                 BlockKind::FencedCodeBlock {
                     marker: fence.marker,
                     closed,
                 },
                 block_start,
                 end,
+                end_state,
+                source_hash,
             ));
-            continue;
         }
 
         if let Some(level) = line.atx_heading_level() {
-            blocks.push(block(BlockKind::AtxHeading { level }, line.start, line.end));
-            index += 1;
-            continue;
+            return Some(self.record(
+                BlockKind::AtxHeading { level },
+                line.start,
+                line.end,
+                BlockState::Normal,
+                line.source_hash,
+            ));
         }
 
         let block_start = line.start;
-        index += 1;
-        while index < lines.len() {
-            let candidate = lines[index];
+        let mut end = line.end;
+        let mut source_hash = line.source_hash;
+        while let Some(candidate) = self.lines.peek().copied() {
             if candidate.is_blank()
                 || candidate.opening_fence().is_some()
                 || candidate.atx_heading_level().is_some()
             {
                 break;
             }
-            index += 1;
+            let line = self
+                .lines
+                .next()
+                .expect("a peeked paragraph line must remain available");
+            end = line.end;
+            source_hash = concatenate_hash(source_hash, line.source_hash, line.end - line.start);
         }
-        let end = lines[index - 1].end;
-        blocks.push(block(BlockKind::Paragraph, block_start, end));
+        Some(self.record(
+            BlockKind::Paragraph,
+            block_start,
+            end,
+            BlockState::Normal,
+            source_hash,
+        ))
     }
-
-    blocks
 }
 
 fn block(kind: BlockKind, start: usize, end: usize) -> Block {
@@ -434,91 +549,258 @@ fn block(kind: BlockKind, start: usize, end: usize) -> Block {
     Block { kind, range }
 }
 
-fn lines(snapshot: &TextSnapshot, start: usize) -> Vec<Line> {
-    let source_len = usize::try_from(snapshot.len_bytes())
-        .expect("Snapshot length must fit the platform address space");
-    if start >= source_len {
-        return Vec::new();
-    }
+struct LineCursor<'a> {
+    chunks: ChunkCursor<'a>,
+    source_len: usize,
+    requested_start: usize,
+    current_text: Option<&'a str>,
+    current_start: usize,
+    current_local: usize,
+    line_start: usize,
+    pending_cr: bool,
+    analysis: LineAnalysis,
+    source_hash: SourceHash,
+    finished: bool,
+}
 
-    let start_offset = ByteOffset::try_from(start).expect("line start must fit u64");
-    let cursor = snapshot
-        .chunk_cursor(start_offset)
-        .expect("block boundary must be a valid UTF-8 offset");
-    let mut result = Vec::new();
-    let mut line_start = start;
-    let mut pending_cr = false;
-    let mut analysis = LineAnalysis::default();
-
-    for chunk in cursor {
-        let chunk_start = usize::try_from(chunk.start()).expect("chunk offset must fit usize");
-        let local_start = start.saturating_sub(chunk_start).min(chunk.text().len());
-        let text = &chunk.text()[local_start..];
-        let mut local = 0;
-        while local < text.len() {
-            if !analysis.wants_input() {
-                let Some(newline) = text.as_bytes()[local..]
-                    .iter()
-                    .position(|value| *value == b'\n')
-                else {
-                    break;
-                };
-                let absolute = chunk_start + local_start + local + newline;
-                result.push(Line {
-                    start: line_start,
-                    end: absolute + 1,
-                    analysis,
-                });
-                line_start = absolute + 1;
-                analysis = LineAnalysis::default();
-                pending_cr = false;
-                local += newline + 1;
-                continue;
-            }
-
-            let first = text.as_bytes()[local];
-            let character = if first.is_ascii() {
-                char::from(first)
-            } else {
-                text[local..]
-                    .chars()
-                    .next()
-                    .expect("non-empty UTF-8 tail must contain a character")
-            };
-            let absolute = chunk_start + local_start + local;
-            if character == '\n' {
-                result.push(Line {
-                    start: line_start,
-                    end: absolute + 1,
-                    analysis,
-                });
-                line_start = absolute + 1;
-                analysis = LineAnalysis::default();
-                pending_cr = false;
-            } else {
-                if pending_cr {
-                    analysis.push('\r');
-                    pending_cr = false;
-                }
-                if character == '\r' {
-                    pending_cr = true;
-                } else {
-                    analysis.push(character);
-                }
-            }
-            local += character.len_utf8();
+impl<'a> LineCursor<'a> {
+    fn new(snapshot: &'a TextSnapshot, start: usize) -> Self {
+        let source_len = usize::try_from(snapshot.len_bytes())
+            .expect("Snapshot length must fit the platform address space");
+        let start_offset = ByteOffset::try_from(start).expect("line start must fit u64");
+        let chunks = snapshot
+            .chunk_cursor(start_offset)
+            .expect("block boundary must be a valid UTF-8 offset");
+        Self {
+            chunks,
+            source_len,
+            requested_start: start,
+            current_text: None,
+            current_start: 0,
+            current_local: 0,
+            line_start: start,
+            pending_cr: false,
+            analysis: LineAnalysis::default(),
+            source_hash: SourceHash(0),
+            finished: start >= source_len,
         }
     }
+}
 
-    if line_start < source_len {
-        result.push(Line {
-            start: line_start,
-            end: source_len,
-            analysis,
-        });
+impl Iterator for LineCursor<'_> {
+    type Item = Line;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            if self.current_text.is_none() {
+                let Some(chunk) = self.chunks.next() else {
+                    self.finished = true;
+                    return (self.line_start < self.source_len).then_some(Line {
+                        start: self.line_start,
+                        end: self.source_len,
+                        analysis: self.analysis,
+                        source_hash: self.source_hash,
+                    });
+                };
+                self.current_start =
+                    usize::try_from(chunk.start()).expect("chunk offset must fit usize");
+                self.current_local = self
+                    .requested_start
+                    .saturating_sub(self.current_start)
+                    .min(chunk.text().len());
+                self.current_text = Some(chunk.text());
+            }
+
+            let text = self.current_text.expect("current chunk was initialized");
+            while self.current_local < text.len() {
+                if !self.analysis.wants_input() {
+                    let Some(newline) = text.as_bytes()[self.current_local..]
+                        .iter()
+                        .position(|value| *value == b'\n')
+                    else {
+                        self.source_hash =
+                            extend_hash(self.source_hash, &text.as_bytes()[self.current_local..]);
+                        self.current_local = text.len();
+                        break;
+                    };
+                    let consumed_end = self.current_local + newline + 1;
+                    self.source_hash = extend_hash(
+                        self.source_hash,
+                        &text.as_bytes()[self.current_local..consumed_end],
+                    );
+                    let absolute = self.current_start + self.current_local + newline;
+                    let line = Line {
+                        start: self.line_start,
+                        end: absolute + 1,
+                        analysis: self.analysis,
+                        source_hash: self.source_hash,
+                    };
+                    self.line_start = absolute + 1;
+                    self.analysis = LineAnalysis::default();
+                    self.source_hash = SourceHash(0);
+                    self.pending_cr = false;
+                    self.current_local = consumed_end;
+                    return Some(line);
+                }
+
+                let character_start = self.current_local;
+                let first = text.as_bytes()[character_start];
+                let character = if first.is_ascii() {
+                    char::from(first)
+                } else {
+                    text[self.current_local..]
+                        .chars()
+                        .next()
+                        .expect("non-empty UTF-8 tail must contain a character")
+                };
+                let absolute = self.current_start + self.current_local;
+                self.current_local += character.len_utf8();
+                self.source_hash = extend_hash(
+                    self.source_hash,
+                    &text.as_bytes()[character_start..self.current_local],
+                );
+                if character == '\n' {
+                    let line = Line {
+                        start: self.line_start,
+                        end: absolute + 1,
+                        analysis: self.analysis,
+                        source_hash: self.source_hash,
+                    };
+                    self.line_start = absolute + 1;
+                    self.analysis = LineAnalysis::default();
+                    self.source_hash = SourceHash(0);
+                    self.pending_cr = false;
+                    return Some(line);
+                }
+
+                if self.pending_cr {
+                    self.analysis.push('\r');
+                    self.pending_cr = false;
+                }
+                if character == '\r' {
+                    self.pending_cr = true;
+                } else {
+                    self.analysis.push(character);
+                }
+            }
+            self.current_text = None;
+        }
     }
+}
 
+const HASH_BASE: u64 = 0x0000_0100_0000_01b3;
+
+fn extend_hash(mut hash: SourceHash, bytes: &[u8]) -> SourceHash {
+    for byte in bytes {
+        hash.0 = hash
+            .0
+            .wrapping_mul(HASH_BASE)
+            .wrapping_add(u64::from(*byte) + 1);
+    }
+    hash
+}
+
+fn concatenate_hash(left: SourceHash, right: SourceHash, right_len: usize) -> SourceHash {
+    SourceHash(
+        left.0
+            .wrapping_mul(wrapping_power(HASH_BASE, right_len))
+            .wrapping_add(right.0),
+    )
+}
+
+fn wrapping_power(mut base: u64, mut exponent: usize) -> u64 {
+    let mut result = 1_u64;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            result = result.wrapping_mul(base);
+        }
+        base = base.wrapping_mul(base);
+        exponent >>= 1;
+    }
     result
+}
+
+fn map_unchanged_range(
+    revision: Revision,
+    range: TextRange,
+    changes: &ChangeSet,
+) -> Result<TextRange, AnchorMapError> {
+    let start = changes
+        .map_anchor(TextAnchor::new(revision, range.start(), Affinity::After))?
+        .offset();
+    let end = changes
+        .map_anchor(TextAnchor::new(revision, range.end(), Affinity::Before))?
+        .offset();
+    Ok(TextRange::new(start, end).expect("an unaffected mapped block must remain ordered"))
+}
+
+fn records_converge(
+    old: ResolvedBlockRecord,
+    mapped_old_range: TextRange,
+    new: &BlockRecord,
+    old_source: &TextSnapshot,
+    new_source: &TextSnapshot,
+) -> bool {
+    mapped_old_range == new.block.range
+        && old.block.kind == new.block.kind
+        && old.start_state == new.start_state
+        && old.end_state == new.end_state
+        && old.source_hash == new.source_hash
+        && ranges_equal(old_source, old.block.range, new_source, new.block.range)
+}
+
+fn ranges_equal(
+    left_source: &TextSnapshot,
+    left_range: TextRange,
+    right_source: &TextSnapshot,
+    right_range: TextRange,
+) -> bool {
+    left_range.len() == right_range.len()
+        && RangeSlices::new(left_source, left_range)
+            .flat_map(|slice| slice.iter().copied())
+            .eq(RangeSlices::new(right_source, right_range).flat_map(|slice| slice.iter().copied()))
+}
+
+struct RangeSlices<'a> {
+    chunks: ChunkCursor<'a>,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> RangeSlices<'a> {
+    fn new(snapshot: &'a TextSnapshot, range: TextRange) -> Self {
+        Self {
+            chunks: snapshot
+                .chunk_cursor(range.start())
+                .expect("block ranges must start at valid UTF-8 boundaries"),
+            start: usize::try_from(range.start()).expect("block offset must fit usize"),
+            end: usize::try_from(range.end()).expect("block offset must fit usize"),
+        }
+    }
+}
+
+impl<'a> Iterator for RangeSlices<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for chunk in self.chunks.by_ref() {
+            let chunk_start = usize::try_from(chunk.start()).expect("chunk offset must fit usize");
+            if chunk_start >= self.end {
+                return None;
+            }
+            let chunk_end = chunk_start + chunk.text().len();
+            let start = self.start.max(chunk_start) - chunk_start;
+            let end = self.end.min(chunk_end) - chunk_start;
+            if start < end {
+                return Some(&chunk.text().as_bytes()[start..end]);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -535,14 +817,11 @@ mod tests {
         assert!(document.has_lossless_coverage());
         assert_eq!(document.source_len().get(), source.len() as u64);
         assert_eq!(document.blocks().len(), 5);
+        assert_eq!(kind_at(&document, 0), BlockKind::AtxHeading { level: 1 });
+        assert_eq!(kind_at(&document, 1), BlockKind::BlankLine);
+        assert_eq!(kind_at(&document, 2), BlockKind::Paragraph);
         assert_eq!(
-            document.blocks()[0].kind(),
-            BlockKind::AtxHeading { level: 1 }
-        );
-        assert_eq!(document.blocks()[1].kind(), BlockKind::BlankLine);
-        assert_eq!(document.blocks()[2].kind(), BlockKind::Paragraph);
-        assert_eq!(
-            document.blocks()[4].kind(),
+            kind_at(&document, 4),
             BlockKind::FencedCodeBlock {
                 marker: '`',
                 closed: true
@@ -576,7 +855,7 @@ mod tests {
         for (source, expected) in cases {
             let document = parse(&TextBuffer::new(source).snapshot());
             assert_eq!(document.blocks().len(), 1, "source {source:?}");
-            assert_eq!(document.blocks()[0].kind(), expected, "source {source:?}");
+            assert_eq!(kind_at(&document, 0), expected, "source {source:?}");
             assert!(document.has_lossless_coverage());
         }
     }
@@ -605,13 +884,10 @@ mod tests {
 
         assert!(document.has_lossless_coverage());
         assert_eq!(document.blocks().len(), 3);
+        assert_eq!(kind_at(&document, 0), BlockKind::AtxHeading { level: 1 });
+        assert_eq!(kind_at(&document, 1), BlockKind::BlankLine);
         assert_eq!(
-            document.blocks()[0].kind(),
-            BlockKind::AtxHeading { level: 1 }
-        );
-        assert_eq!(document.blocks()[1].kind(), BlockKind::BlankLine);
-        assert_eq!(
-            document.blocks()[2].kind(),
+            kind_at(&document, 2),
             BlockKind::FencedCodeBlock {
                 marker: '`',
                 closed: true
@@ -630,7 +906,7 @@ mod tests {
 
         assert!(document.has_lossless_coverage());
         assert_eq!(
-            document.blocks()[2].kind(),
+            kind_at(&document, 2),
             BlockKind::FencedCodeBlock {
                 marker: '~',
                 closed: false
@@ -712,5 +988,13 @@ mod tests {
             ),
             Err(IncrementalParseError::PreviousRevision { .. })
         ));
+    }
+
+    fn kind_at(document: &MarkdownDocument, index: usize) -> BlockKind {
+        document
+            .blocks()
+            .get(index)
+            .expect("test block must exist")
+            .kind()
     }
 }
