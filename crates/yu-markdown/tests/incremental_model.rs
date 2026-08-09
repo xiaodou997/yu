@@ -1,6 +1,6 @@
 use yu_core::{ByteOffset, TextRange};
 use yu_markdown::{MarkdownDocument, parse, parse_incremental};
-use yu_text::{Edit, StorageBackend, TextBuffer, Transaction};
+use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
 
 const INSERTIONS: [&str; 10] = [
     "羽",
@@ -119,5 +119,93 @@ fn deleting_fence_delimiters_propagates_to_eof() {
         assert_eq!(incremental.document(), &full);
         assert!(incremental.document().has_lossless_coverage());
         assert!(incremental.reparsed_range().end() == applied.result_snapshot().len_bytes());
+    }
+}
+
+#[test]
+fn local_edit_shares_persistent_prefix_and_shifted_suffix() {
+    for backend in StorageBackend::ALL {
+        let source = "# one\n\nalpha\n\n# two\n\nomega\n";
+        let mut buffer = TextBuffer::with_backend(source, backend);
+        let previous_snapshot = buffer.snapshot();
+        let previous = parse(&previous_snapshot);
+        let insert_at = source.find("alpha").expect("fixture contains alpha") + 2;
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(
+                TextRange::empty(ByteOffset::try_from(insert_at).expect("offset fits u64")),
+                "羽",
+            )],
+        );
+        let applied = buffer.apply(&transaction).expect("edit should apply");
+        let materialized_before = retained_snapshot_stats(&[
+            previous_snapshot.clone(),
+            applied.result_snapshot().clone(),
+        ])
+        .materialized_buffers();
+
+        let incremental =
+            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+                .expect("matching revisions should parse incrementally");
+        let full = parse(applied.result_snapshot());
+        let shared = incremental
+            .document()
+            .blocks()
+            .shared_blocks_with(previous.blocks());
+
+        assert_eq!(incremental.document(), &full, "backend {backend}");
+        assert_eq!(
+            retained_snapshot_stats(&[previous_snapshot, applied.result_snapshot().clone()])
+                .materialized_buffers(),
+            materialized_before,
+            "backend {backend} materialized source during convergence"
+        );
+        assert_eq!(incremental.reused_prefix_blocks(), 1, "backend {backend}");
+        assert_eq!(incremental.reused_suffix_blocks(), 4, "backend {backend}");
+        assert_eq!(shared, 5, "backend {backend}");
+        assert!(
+            incremental.reparsed_range().end() < applied.result_snapshot().len_bytes(),
+            "backend {backend} scanned through EOF"
+        );
+        assert_eq!(
+            incremental.document().block_storage_stats().segments(),
+            3,
+            "backend {backend}"
+        );
+        assert_eq!(
+            incremental.document().block_storage_stats().allocations(),
+            2,
+            "backend {backend}"
+        );
+    }
+}
+
+#[test]
+fn inserted_fence_prevents_false_hash_convergence() {
+    for backend in StorageBackend::ALL {
+        let source = "before\n\ninside\n\n# repeated\n\ninside\n";
+        let mut buffer = TextBuffer::with_backend(source, backend);
+        let previous = parse(&buffer.snapshot());
+        let fence_at = source.find("inside").expect("fixture contains paragraph");
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(
+                TextRange::empty(ByteOffset::try_from(fence_at).expect("offset fits u64")),
+                "```\n",
+            )],
+        );
+        let applied = buffer.apply(&transaction).expect("edit should apply");
+        let incremental =
+            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+                .expect("matching revisions should parse incrementally");
+        let full = parse(applied.result_snapshot());
+
+        assert_eq!(incremental.document(), &full, "backend {backend}");
+        assert_eq!(incremental.reused_suffix_blocks(), 0, "backend {backend}");
+        assert_eq!(
+            incremental.reparsed_range().end(),
+            applied.result_snapshot().len_bytes(),
+            "backend {backend}"
+        );
     }
 }
