@@ -10,12 +10,18 @@ use std::fmt;
 use std::iter::Peekable;
 
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
-use yu_text::{AnchorMapError, ChangeSet, ChunkCursor, TextSnapshot};
+use yu_text::{
+    AnchorMapError, ChangeSet, ChunkCursor, SnapshotRetentionStats, TextSnapshot,
+    retained_snapshot_stats,
+};
 
 mod block_sequence;
 
-pub use block_sequence::{Block, BlockKind, BlockSequence, BlockState, BlockStorageStats};
-use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash};
+pub use block_sequence::{
+    Block, BlockCompactionPolicy, BlockKind, BlockSequence, BlockState, BlockStorageStats,
+    RetainedBlockStats,
+};
+use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
 
 /// A lossless block view of one immutable text revision.
 #[derive(Clone, Debug)]
@@ -47,6 +53,31 @@ impl MarkdownDocument {
         self.blocks.storage_stats()
     }
 
+    #[must_use]
+    pub fn needs_block_compaction(&self, policy: BlockCompactionPolicy) -> bool {
+        policy.should_compact(self.block_storage_stats())
+    }
+
+    /// Packs all active block records into one allocation.
+    ///
+    /// This is intentionally explicit because its cost is linear in the number
+    /// of blocks. Product code should call it from an idle/background task.
+    pub fn compact_blocks(&mut self) -> bool {
+        let stats = self.block_storage_stats();
+        if stats.blocks() == 0 || (stats.segments() == 1 && stats.reclaimable_records() == 0) {
+            return false;
+        }
+        self.blocks = self.blocks.compacted();
+        true
+    }
+
+    pub fn compact_blocks_if_needed(&mut self, policy: BlockCompactionPolicy) -> bool {
+        if !self.needs_block_compaction(policy) {
+            return false;
+        }
+        self.compact_blocks()
+    }
+
     /// Confirms that ordered block ranges cover the source exactly once.
     #[must_use]
     pub fn has_lossless_coverage(&self) -> bool {
@@ -70,6 +101,60 @@ impl PartialEq for MarkdownDocument {
 }
 
 impl Eq for MarkdownDocument {}
+
+/// De-duplicated storage retained by a set of immutable Markdown revisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkdownRetentionStats {
+    documents: usize,
+    document_bytes: usize,
+    text: SnapshotRetentionStats,
+    blocks: RetainedBlockStats,
+}
+
+impl MarkdownRetentionStats {
+    #[must_use]
+    pub const fn documents(self) -> usize {
+        self.documents
+    }
+
+    #[must_use]
+    pub const fn document_bytes(self) -> usize {
+        self.document_bytes
+    }
+
+    #[must_use]
+    pub const fn text(self) -> SnapshotRetentionStats {
+        self.text
+    }
+
+    #[must_use]
+    pub const fn blocks(self) -> RetainedBlockStats {
+        self.blocks
+    }
+
+    #[must_use]
+    pub const fn estimated_bytes(self) -> usize {
+        self.document_bytes
+            .saturating_add(self.text.estimated_bytes())
+            .saturating_add(self.blocks.estimated_bytes())
+    }
+}
+
+#[must_use]
+pub fn retained_markdown_stats(documents: &[MarkdownDocument]) -> MarkdownRetentionStats {
+    let snapshots = documents
+        .iter()
+        .map(|document| document.source.clone())
+        .collect::<Vec<_>>();
+    MarkdownRetentionStats {
+        documents: documents.len(),
+        document_bytes: documents
+            .len()
+            .saturating_mul(std::mem::size_of::<MarkdownDocument>()),
+        text: retained_snapshot_stats(&snapshots),
+        blocks: retained_block_stats(documents.iter().map(|document| &document.blocks)),
+    }
+}
 
 /// The observable result of one conservative incremental block parse.
 #[derive(Clone, Debug, PartialEq, Eq)]

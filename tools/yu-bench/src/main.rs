@@ -6,7 +6,10 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use yu_core::{ByteOffset, TextRange};
-use yu_markdown::{parse, parse_incremental};
+use yu_markdown::{
+    BlockCompactionPolicy, MarkdownRetentionStats, parse, parse_incremental,
+    retained_markdown_stats,
+};
 use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
 
 const SECTION: &str = "# Yu\n\nA paragraph with **strong text**, 中文 and emoji 🙂.\n\n```rust\nfn main() {}\n```\n\n";
@@ -127,6 +130,13 @@ fn run_backend(
             configuration.iterations,
         )?,
     ];
+    let session = benchmark_incremental_session(
+        backend,
+        source,
+        random_script,
+        expected_random_result,
+        configuration.retained_snapshots,
+    )?;
 
     let mut edit_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
@@ -204,6 +214,34 @@ fn run_backend(
             measurement.segments,
         );
     }
+    println!(
+        "  incremental session parse: {:?} total / {:?} mean (reparsed-bytes={} max-segments={} final-segments={})",
+        session.parse_time,
+        session.parse_time / u32::try_from(random_script.len()).unwrap_or(u32::MAX),
+        session.reparsed_bytes,
+        session.max_segments,
+        session.final_segments,
+    );
+    println!(
+        "  idle block compaction: {:?} total / {:?} max (runs={} rewritten-blocks={} segment-threshold={})",
+        session.compaction_time,
+        session.max_compaction_time,
+        session.compactions,
+        session.rewritten_blocks,
+        BlockCompactionPolicy::default().max_segments(),
+    );
+    let retained_blocks = session.retention.blocks();
+    println!(
+        "  retained markdown estimate: {} (documents={} block-allocations={} block-records={} block-bytes={} segment-tables={} segments={} segment-bytes={})",
+        human_bytes(session.retention.estimated_bytes()),
+        session.retention.documents(),
+        retained_blocks.block_allocations(),
+        retained_blocks.block_records(),
+        retained_blocks.block_record_bytes(),
+        retained_blocks.segment_tables(),
+        retained_blocks.segments(),
+        retained_blocks.segment_bytes(),
+    );
     println!(
         "  middle insert + inverse median: {:?}",
         median(&mut edit_samples)
@@ -309,6 +347,103 @@ fn benchmark_incremental(
     }
     measurement.median = median(&mut samples);
     Ok(measurement)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IncrementalSessionMeasurement {
+    parse_time: Duration,
+    compaction_time: Duration,
+    max_compaction_time: Duration,
+    compactions: usize,
+    rewritten_blocks: usize,
+    reparsed_bytes: u64,
+    max_segments: usize,
+    final_segments: usize,
+    retention: MarkdownRetentionStats,
+}
+
+fn benchmark_incremental_session(
+    backend: StorageBackend,
+    source: &str,
+    script: &[ScriptEdit],
+    expected_result: &str,
+    retained_documents: usize,
+) -> Result<IncrementalSessionMeasurement, Box<dyn Error>> {
+    let mut buffer = TextBuffer::with_backend(source, backend);
+    let mut document = parse(&buffer.snapshot());
+    let policy = BlockCompactionPolicy::default();
+    let mut history = Vec::with_capacity(retained_documents);
+    history.push(document.clone());
+    let retention_stride = script
+        .len()
+        .div_ceil(retained_documents.saturating_sub(1).max(1));
+    let mut parse_time = Duration::ZERO;
+    let mut compaction_time = Duration::ZERO;
+    let mut max_compaction_time = Duration::ZERO;
+    let mut compactions = 0;
+    let mut rewritten_blocks = 0_usize;
+    let mut reparsed_bytes = 0_u64;
+    let mut max_segments = document.block_storage_stats().segments();
+
+    for (index, edit) in script.iter().enumerate() {
+        let transaction =
+            Transaction::new(buffer.revision(), [Edit::new(edit.range, edit.inserted)]);
+        let applied = buffer.apply(&transaction)?;
+
+        let parse_start = Instant::now();
+        let incremental =
+            parse_incremental(&document, applied.result_snapshot(), applied.change_set())?;
+        parse_time += parse_start.elapsed();
+        reparsed_bytes = reparsed_bytes.saturating_add(incremental.reparsed_range().len());
+        document = incremental.into_document();
+        let block_stats = document.block_storage_stats();
+        max_segments = max_segments.max(block_stats.segments());
+
+        if policy.should_compact(block_stats) {
+            rewritten_blocks = rewritten_blocks.saturating_add(document.blocks().len());
+            let compact_start = Instant::now();
+            if document.compact_blocks_if_needed(policy) {
+                let elapsed = compact_start.elapsed();
+                compaction_time += elapsed;
+                max_compaction_time = max_compaction_time.max(elapsed);
+                compactions += 1;
+            }
+        }
+
+        let completed = index + 1;
+        if history.len() < retained_documents
+            && (completed.is_multiple_of(retention_stride) || completed == script.len())
+        {
+            history.push(document.clone());
+        }
+    }
+
+    if buffer.snapshot().as_str() != expected_result {
+        return Err(
+            io::Error::other(format!("{backend} incremental session text mismatch")).into(),
+        );
+    }
+    if document != parse(&buffer.snapshot()) {
+        return Err(
+            io::Error::other(format!("{backend} incremental session parse mismatch")).into(),
+        );
+    }
+    if retained_documents == 1 {
+        history.clear();
+        history.push(document.clone());
+    }
+
+    Ok(IncrementalSessionMeasurement {
+        parse_time,
+        compaction_time,
+        max_compaction_time,
+        compactions,
+        rewritten_blocks,
+        reparsed_bytes,
+        max_segments,
+        final_segments: document.block_storage_stats().segments(),
+        retention: retained_markdown_stats(&history),
+    })
 }
 
 #[derive(Clone, Copy, Debug)]

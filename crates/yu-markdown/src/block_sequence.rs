@@ -95,11 +95,17 @@ impl BlockSegment {
 }
 
 /// Structural metrics for the immutable block sequence.
+///
+/// Byte estimates include record and segment payloads, but not allocator or
+/// `Arc` headers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlockStorageStats {
     blocks: usize,
     segments: usize,
     allocations: usize,
+    retained_records: usize,
+    segment_bytes: usize,
+    record_bytes: usize,
 }
 
 impl BlockStorageStats {
@@ -116,6 +122,157 @@ impl BlockStorageStats {
     #[must_use]
     pub const fn allocations(self) -> usize {
         self.allocations
+    }
+
+    #[must_use]
+    pub const fn retained_records(self) -> usize {
+        self.retained_records
+    }
+
+    #[must_use]
+    pub const fn reclaimable_records(self) -> usize {
+        self.retained_records.saturating_sub(self.blocks)
+    }
+
+    #[must_use]
+    pub const fn segment_bytes(self) -> usize {
+        self.segment_bytes
+    }
+
+    #[must_use]
+    pub const fn record_bytes(self) -> usize {
+        self.record_bytes
+    }
+
+    #[must_use]
+    pub const fn estimated_bytes(self) -> usize {
+        self.segment_bytes.saturating_add(self.record_bytes)
+    }
+}
+
+/// De-duplicated allocations retained by one or more block sequences.
+///
+/// Byte estimates include allocation payloads, but not allocator or `Arc`
+/// headers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetainedBlockStats {
+    sequences: usize,
+    block_references: usize,
+    segment_tables: usize,
+    segments: usize,
+    segment_bytes: usize,
+    block_allocations: usize,
+    block_records: usize,
+    block_record_bytes: usize,
+}
+
+impl RetainedBlockStats {
+    #[must_use]
+    pub const fn sequences(self) -> usize {
+        self.sequences
+    }
+
+    #[must_use]
+    pub const fn block_references(self) -> usize {
+        self.block_references
+    }
+
+    #[must_use]
+    pub const fn segment_tables(self) -> usize {
+        self.segment_tables
+    }
+
+    #[must_use]
+    pub const fn segments(self) -> usize {
+        self.segments
+    }
+
+    #[must_use]
+    pub const fn segment_bytes(self) -> usize {
+        self.segment_bytes
+    }
+
+    #[must_use]
+    pub const fn block_allocations(self) -> usize {
+        self.block_allocations
+    }
+
+    #[must_use]
+    pub const fn block_records(self) -> usize {
+        self.block_records
+    }
+
+    #[must_use]
+    pub const fn block_record_bytes(self) -> usize {
+        self.block_record_bytes
+    }
+
+    #[must_use]
+    pub const fn estimated_bytes(self) -> usize {
+        self.segment_bytes.saturating_add(self.block_record_bytes)
+    }
+}
+
+/// Policy used by an idle task to decide when block records should be packed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockCompactionPolicy {
+    max_segments: usize,
+    max_retained_ratio: usize,
+    min_reclaimable_records: usize,
+}
+
+impl BlockCompactionPolicy {
+    #[must_use]
+    pub const fn new(
+        max_segments: usize,
+        max_retained_ratio: usize,
+        min_reclaimable_records: usize,
+    ) -> Option<Self> {
+        if max_segments == 0 || max_retained_ratio == 0 {
+            return None;
+        }
+        Some(Self {
+            max_segments,
+            max_retained_ratio,
+            min_reclaimable_records,
+        })
+    }
+
+    #[must_use]
+    pub const fn max_segments(self) -> usize {
+        self.max_segments
+    }
+
+    #[must_use]
+    pub const fn max_retained_ratio(self) -> usize {
+        self.max_retained_ratio
+    }
+
+    #[must_use]
+    pub const fn min_reclaimable_records(self) -> usize {
+        self.min_reclaimable_records
+    }
+
+    #[must_use]
+    pub const fn should_compact(self, stats: BlockStorageStats) -> bool {
+        if stats.blocks == 0 {
+            return false;
+        }
+        if stats.segments > self.max_segments {
+            return true;
+        }
+        stats.reclaimable_records() >= self.min_reclaimable_records
+            && stats.retained_records > stats.blocks.saturating_mul(self.max_retained_ratio)
+    }
+}
+
+impl Default for BlockCompactionPolicy {
+    fn default() -> Self {
+        Self {
+            max_segments: 4_096,
+            max_retained_ratio: 4,
+            min_reclaimable_records: 8_192,
+        }
     }
 }
 
@@ -232,16 +389,26 @@ impl BlockSequence {
 
     #[must_use]
     pub fn storage_stats(&self) -> BlockStorageStats {
-        let allocations = self
+        let mut allocation_ids = HashSet::new();
+        let mut retained_records = 0_usize;
+        for segment in self.segments.iter() {
+            let allocation_id = Arc::as_ptr(&segment.allocation) as *const () as usize;
+            if allocation_ids.insert(allocation_id) {
+                retained_records = retained_records.saturating_add(segment.allocation.len());
+            }
+        }
+        let segment_bytes = self
             .segments
-            .iter()
-            .map(|segment| Arc::as_ptr(&segment.allocation) as *const () as usize)
-            .collect::<HashSet<_>>()
-            .len();
+            .len()
+            .saturating_mul(std::mem::size_of::<BlockSegment>());
+        let record_bytes = retained_records.saturating_mul(std::mem::size_of::<BlockRecord>());
         BlockStorageStats {
             blocks: self.len,
             segments: self.segments.len(),
-            allocations,
+            allocations: allocation_ids.len(),
+            retained_records,
+            segment_bytes,
+            record_bytes,
         }
     }
 
@@ -330,6 +497,62 @@ impl BlockSequence {
             local_index,
         }
     }
+
+    pub(crate) fn compacted(&self) -> Self {
+        let records = self
+            .resolved_records_from(0)
+            .map(|record| BlockRecord {
+                block: record.block,
+                start_state: record.start_state,
+                end_state: record.end_state,
+                source_hash: record.source_hash,
+            })
+            .collect();
+        Self::from_records(records)
+    }
+}
+
+pub(crate) fn retained_block_stats<'a>(
+    sequences: impl IntoIterator<Item = &'a BlockSequence>,
+) -> RetainedBlockStats {
+    let mut stats = RetainedBlockStats::default();
+    let mut segment_table_ids = HashSet::new();
+    let mut block_allocation_ids = HashSet::new();
+
+    for sequence in sequences {
+        stats.sequences += 1;
+        stats.block_references = stats.block_references.saturating_add(sequence.len);
+
+        if !sequence.segments.is_empty() {
+            let table_id = Arc::as_ptr(&sequence.segments) as *const () as usize;
+            if segment_table_ids.insert(table_id) {
+                stats.segment_tables += 1;
+                stats.segments = stats.segments.saturating_add(sequence.segments.len());
+                stats.segment_bytes = stats.segment_bytes.saturating_add(
+                    sequence
+                        .segments
+                        .len()
+                        .saturating_mul(std::mem::size_of::<BlockSegment>()),
+                );
+            }
+        }
+
+        for segment in sequence.segments.iter() {
+            let allocation_id = Arc::as_ptr(&segment.allocation) as *const () as usize;
+            if block_allocation_ids.insert(allocation_id) {
+                stats.block_allocations += 1;
+                stats.block_records = stats.block_records.saturating_add(segment.allocation.len());
+                stats.block_record_bytes = stats.block_record_bytes.saturating_add(
+                    segment
+                        .allocation
+                        .len()
+                        .saturating_mul(std::mem::size_of::<BlockRecord>()),
+                );
+            }
+        }
+    }
+
+    stats
 }
 
 impl PartialEq for BlockSequence {
