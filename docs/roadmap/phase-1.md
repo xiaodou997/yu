@@ -23,6 +23,7 @@
 - [x] Piece Tree 行数与 UTF-16 长度摘要、chunk cursor
 - [x] Chunk-aware 完整解析与保守增量解析 differential harness
 - [x] 带 start/end state、hash 与 suffix reuse 的持久化 block sequence
+- [x] 长期增量 session、block retention 统计与 idle compaction 策略
 
 ## Track B：macOS risk spike
 

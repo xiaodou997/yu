@@ -29,6 +29,24 @@ old suffix allocation  (delta = edit byte delta)
 suffix 的绝对 source range 通过 segment delta 延迟映射，因此文本长度变化不会迫使复制所有旧
 block。相邻且来自同一 allocation 的连续 segment 自动合并。
 
+## Block Lifetime
+
+`retained_markdown_stats()` 对多个 `MarkdownDocument` 的 text Snapshot、segment table 和 block
+allocation 按指针去重，统计 allocation 的完整长度，而不是仅统计被 segment 引用的 slice。这样
+可以识别“大 allocation 被小 suffix 钉住”的保留放大。
+
+同步增量 parser 不执行 block compaction。`BlockCompactionPolicy` 只给 idle task 提供建议：
+
+```text
+segments > 4096
+    OR
+reclaimable records >= 8192 AND retained records > active blocks * 4
+```
+
+`compact_blocks()` 将当前活动 record 复制到一个新 allocation，成本为 O(blocks)。调用方应在
+输入空闲且可以释放旧 checkpoint 时执行；Undo/history 仍保留旧文档时频繁压实会同时保留新旧
+完整 allocation，反而显著增加内存。
+
 ## Incremental Parse
 
 输入契约：

@@ -60,5 +60,4 @@ source bytes equal
 完整扫描因同步 hash 从上一轮约 18 ms 增至约 25–26 ms。该成本换取稳定的微秒级局部重解析，
 后续可通过更快的 rolling hash 或向量化扫描继续优化，但不能移除 byte equality 的正确性确认。
 
-当前 segment table 在长期随机编辑下可能增长；进入真实编辑 session benchmark 前，需要定义
-coalescing/compaction 阈值并统计 block allocation 的 retained bytes。
+ADR 0010 已补充长期 session benchmark、去重 retained bytes 统计与显式 idle compaction 策略。
