@@ -41,7 +41,7 @@ Parser equivalence              native event loop
 yu-core
    ▲
    │
-yu-text
+yu-text ◄──── yu-editor
    ▲
    │
 yu-markdown ◄── yu-inspect
@@ -50,7 +50,6 @@ yu-markdown ◄── yu-inspect
 后续预计增加：
 
 ```text
-yu-editor
 yu-markdown-edit
 yu-projection
 yu-font
@@ -79,4 +78,3 @@ Current revision == 41? ── yes ── publish  │
 ```
 
 任何后台任务都不能持有可变文档引用。
-

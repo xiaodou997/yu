@@ -34,7 +34,7 @@
 - [x] 将实验事件转换为 Rust `CompositionOverlay` 协议
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [ ] VoiceOver 实际朗读质量验证
-- [ ] 多行 shaping、点击和 caret round-trip
+- [x] 多行 shaping、点击和 caret round-trip
 
 ## Phase 1 退出条件
 
@@ -44,7 +44,8 @@
 2. 新文本存储后端通过同一套行为测试。
 3. Markdown 增量结果与完整解析结果可自动比较。
 4. macOS 拼音 composition 不把 preedit 写入 Undo。
-5. `SourceOffset → VisualPosition → Point → SourceOffset` 有最小可验证闭环。
+5. `SourceCaret → NativeCaret → Point → NativeCaret → SourceCaret` 有 identity projection
+   下的最小可验证闭环。
 6. 形成第一份真实性能基线，而不是仅有目标数字。
 
 ## 非目标

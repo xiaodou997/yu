@@ -9,7 +9,8 @@
 - candidate window rect；
 - 基本 grapheme 删除和移动；
 - TextKit shaping 与点击位置查询；
-- `NSAccessibility` text area、UTF-16 range 与 screen bounds 查询。
+- `NSAccessibility` text area、UTF-16 range 与 screen bounds 查询；
+- 多行 caret 的 local/screen point round-trip 与 upstream/downstream affinity。
 
 构建：
 
@@ -44,9 +45,14 @@ swift run --package-path experiments/macos-text-input YuMacTextInputSpike
 应出现 `AX self-check` 和 `AX runtime probe trusted=true role=AXTextArea`。后者依赖当前终端或
 生成的 `.app` 已获 macOS Accessibility 权限。
 
+`Layout self-check` 会将文本容器限制为 360 pt，并遍历 TextKit 的 canonical caret stops。当前固定
+文本应至少产生 4 个视觉行、一个软换行 affinity split，并通过 local point 与 screen point 两条
+hit-test 路径。硬行末按 TextKit 语义规范化为 LF 后 offset + upstream affinity。
+
 该实验暂时直接保存 UTF-16 selection，因为 AppKit 协议使用 `NSRange`。接入 Rust 时必须由
-平台适配层转换成带 Revision 的 `TextAnchor`，正式 composition 则进入临时 Overlay，不能在
-每次 `setMarkedText` 时提交 Undo Transaction。
+平台适配层转换成带 Revision 的 `SourceCaretPosition`；需要穿过编辑长期保存时再使用
+`TextAnchor`。正式 composition 则进入临时 Overlay，不能在每次 `setMarkedText` 时提交 Undo
+Transaction。
 
 产品实现还必须把 Accessibility 文本查询绑定到 Rust `Revision`。屏幕 bounds 由当前 Layout
 回答；存在 composition 时，AX、`NSTextInputClient` 和绘制必须看到同一份 overlay 状态。

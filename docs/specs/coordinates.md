@@ -9,6 +9,8 @@ Yu 不使用同一个 `usize` 表示所有位置。
 | `LineIndex` | 零基源码逻辑行，按 LF 分隔 | 否 |
 | `GraphemeOffset` | 用户感知的字符移动与删除 | 否 |
 | `TextAnchor` | selection、异步结果、批注 | 是，需要映射 |
+| `SourceCaretPosition` | source caret 与视觉行 affinity | 否 |
+| `NativeCaretPosition` | AppKit UTF-16 caret 与视觉行 affinity | 否 |
 | `VisualPosition` | 投影后的逻辑位置 | 否 |
 | `Point` | 布局坐标 | 否 |
 
@@ -25,6 +27,19 @@ After affinity  -> abXY|cd
 ```
 
 Replacement 内部的 Anchor 会折叠到 replacement 的左边或右边，具体由 affinity 决定。
+
+## Caret affinity
+
+`TextAnchor::Affinity` 决定 source edit 后 Anchor 跟随哪一侧；`CaretAffinity` 决定换行边界的
+caret 显示在前一视觉行还是后一视觉行。这两个概念禁止复用：
+
+```text
+CaretAffinity::Upstream    → preceding visual line end
+CaretAffinity::Downstream  → following visual line start
+```
+
+macOS TextKit 会把硬行末规范化为 LF 后 offset + upstream affinity。因此 point hit test 返回的是
+canonical caret position，不保证恢复一个具有相同几何但非独立可导航的 LF 前 offset。
 
 ## Snapshot boundary
 
@@ -53,3 +68,7 @@ AX screen point  ──► platform coordinate map   ──► layout point
 
 `AXBoundsForRange`、candidate rect 和 caret rect 均为屏幕几何查询，必须使用与所查询文本相同的
 Projection/Layout 状态。
+
+`NSTextInputClient.characterIndex(for:)` 和 Accessibility point query 接收 screen coordinate；
+mouse event 则先进入 view-local coordinate。平台适配层必须显式转换，不能让一个 `Point` 同时
+隐含两种坐标空间。

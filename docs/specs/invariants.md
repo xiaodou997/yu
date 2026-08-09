@@ -36,6 +36,8 @@
 1. IME marked/preedit text 是临时 Overlay，不自动进入 Undo 历史。
 2. 只有 commit 才生成永久 Transaction。
 3. OS 查询的 selection、surrounding text 和 caret rect 必须来自一致的编辑状态。
+4. Source Anchor affinity 与 visual caret affinity 是两个独立语义。
+5. 软换行处的 hit test 必须保留 upstream/downstream，不能只返回裸文本 offset。
 
 ## Accessibility
 
