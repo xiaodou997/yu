@@ -8,6 +8,8 @@ final class TextInputView: NSView, NSTextInputClient {
     private let textContainer = NSTextContainer()
     private var selection = NSRange(location: 0, length: 0)
     private var marked = notFoundRange
+    private var compositionOriginal: NSAttributedString?
+    private var compositionSelectionBefore: NSRange?
 
     private let textOrigin = NSPoint(x: 24, y: 24)
     private let defaultAttributes: [NSAttributedString.Key: Any] = [
@@ -87,6 +89,8 @@ final class TextInputView: NSView, NSTextInputClient {
         replaceStorage(range: target, with: inserted)
         selection = NSRange(location: target.location + inserted.length, length: 0)
         marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
         needsDisplay = true
     }
 
@@ -97,6 +101,10 @@ final class TextInputView: NSView, NSTextInputClient {
     ) {
         let inserted = attributedString(from: value, marked: true)
         let target = targetRange(replacementRange)
+        if !hasMarkedText() {
+            compositionOriginal = textStorage.attributedSubstring(from: target)
+            compositionSelectionBefore = selection
+        }
         print(
             "setMarkedText preedit=\(inserted.string.debugDescription) "
                 + "selection=\(newSelection) replace=\(target)"
@@ -119,6 +127,8 @@ final class TextInputView: NSView, NSTextInputClient {
             textStorage.removeAttribute(.underlineStyle, range: marked)
         }
         marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
         needsDisplay = true
     }
 
@@ -179,6 +189,11 @@ final class TextInputView: NSView, NSTextInputClient {
     }
 
     override func doCommand(by selector: Selector) {
+        let command = NSStringFromSelector(selector)
+        if command == "cancel:" || command == "cancelOperation:" {
+            cancelComposition()
+            return
+        }
         switch selector {
         case #selector(NSResponder.deleteBackward(_:)):
             deleteBackward()
@@ -189,7 +204,7 @@ final class TextInputView: NSView, NSTextInputClient {
         case #selector(NSResponder.insertNewline(_:)):
             insertText("\n", replacementRange: notFoundRange)
         default:
-            print("unhandled command: \(NSStringFromSelector(selector))")
+            print("unhandled command: \(command)")
         }
     }
 
@@ -246,6 +261,20 @@ final class TextInputView: NSView, NSTextInputClient {
         let string = textStorage.string as NSString
         let range = string.rangeOfComposedCharacterSequence(at: selection.location - 1)
         insertText("", replacementRange: range)
+    }
+
+    private func cancelComposition() {
+        print("cancelComposition range=\(marked)")
+        guard hasMarkedText(), let original = compositionOriginal else {
+            marked = notFoundRange
+            return
+        }
+        replaceStorage(range: marked, with: original)
+        selection = compositionSelectionBefore ?? NSRange(location: marked.location, length: 0)
+        marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
+        needsDisplay = true
     }
 
     private func moveLeft() {

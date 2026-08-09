@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 
+use crate::TextSnapshot;
+use crate::storage::Storage;
+
 /// One replacement expressed in the coordinates of a transaction's base revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edit {
@@ -28,6 +31,10 @@ impl Edit {
     #[must_use]
     pub fn inserted_text(&self) -> &str {
         &self.insert
+    }
+
+    pub(crate) fn inserted_arc(&self) -> Arc<str> {
+        Arc::clone(&self.insert)
     }
 }
 
@@ -57,11 +64,11 @@ impl Transaction {
         &self.edits
     }
 
-    pub(crate) fn apply_to(
+    pub(crate) fn prepare(
         &self,
         current_revision: Revision,
-        source: &str,
-    ) -> Result<AppliedTransaction, EditError> {
+        source: &Storage,
+    ) -> Result<PreparedTransaction, EditError> {
         if self.base_revision != current_revision {
             return Err(EditError::StaleRevision {
                 expected: current_revision,
@@ -82,7 +89,7 @@ impl Transaction {
             let start =
                 usize::try_from(edit.range.start()).map_err(|_| EditError::OffsetOverflow)?;
             let end = usize::try_from(edit.range.end()).map_err(|_| EditError::OffsetOverflow)?;
-            let deleted: Arc<str> = Arc::from(&source[start..end]);
+            let deleted: Arc<str> = Arc::from(source.slice(start..end));
 
             let new_start_value = i128::from(edit.range.start().get()) + delta;
             let new_end_value = new_start_value
@@ -103,16 +110,8 @@ impl Transaction {
             delta += inserted_len - old_len;
         }
 
-        let mut result = source.to_owned();
-        for edit in edits.iter().rev() {
-            let start =
-                usize::try_from(edit.range.start()).map_err(|_| EditError::OffsetOverflow)?;
-            let end = usize::try_from(edit.range.end()).map_err(|_| EditError::OffsetOverflow)?;
-            result.replace_range(start..end, &edit.insert);
-        }
-
-        Ok(AppliedTransaction {
-            result_text: Arc::from(result),
+        Ok(PreparedTransaction {
+            edits,
             change_set: ChangeSet {
                 before: current_revision,
                 after: next_revision,
@@ -123,17 +122,23 @@ impl Transaction {
     }
 }
 
-fn validate_edits(edits: &[Edit], source: &str) -> Result<(), EditError> {
+pub(crate) struct PreparedTransaction {
+    pub(crate) edits: Vec<Edit>,
+    pub(crate) change_set: ChangeSet,
+    pub(crate) inverse: Transaction,
+}
+
+fn validate_edits(edits: &[Edit], source: &Storage) -> Result<(), EditError> {
     let mut previous: Option<TextRange> = None;
 
     for edit in edits {
         let start = usize::try_from(edit.range.start()).map_err(|_| EditError::OffsetOverflow)?;
         let end = usize::try_from(edit.range.end()).map_err(|_| EditError::OffsetOverflow)?;
 
-        if end > source.len() {
+        if end > source.len_bytes() {
             return Err(EditError::OutOfBounds {
                 range: edit.range,
-                source_len: source.len(),
+                source_len: source.len_bytes(),
             });
         }
         if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
@@ -270,15 +275,27 @@ impl ChangeSet {
 /// Result of a successful atomic edit.
 #[derive(Clone, Debug)]
 pub struct AppliedTransaction {
-    result_text: Arc<str>,
+    result_snapshot: TextSnapshot,
     change_set: ChangeSet,
     inverse: Transaction,
 }
 
 impl AppliedTransaction {
+    pub(crate) fn new(
+        result_snapshot: TextSnapshot,
+        change_set: ChangeSet,
+        inverse: Transaction,
+    ) -> Self {
+        Self {
+            result_snapshot,
+            change_set,
+            inverse,
+        }
+    }
+
     #[must_use]
-    pub fn result_text(&self) -> &Arc<str> {
-        &self.result_text
+    pub fn result_snapshot(&self) -> &TextSnapshot {
+        &self.result_snapshot
     }
 
     #[must_use]
@@ -373,34 +390,38 @@ mod tests {
 
     #[test]
     fn multi_edit_transaction_is_atomic_and_invertible() {
-        let mut buffer = TextBuffer::new("hello world");
-        let transaction = Transaction::new(
-            buffer.revision(),
-            [Edit::new(range(0, 5), "hi"), Edit::new(range(11, 11), "!")],
-        );
+        for backend in crate::StorageBackend::ALL {
+            let mut buffer = TextBuffer::with_backend("hello world", backend);
+            let transaction = Transaction::new(
+                buffer.revision(),
+                [Edit::new(range(0, 5), "hi"), Edit::new(range(11, 11), "!")],
+            );
 
-        let applied = buffer
-            .apply(&transaction)
-            .expect("valid transaction should apply");
-        assert_eq!(buffer.snapshot().as_str(), "hi world!");
+            let applied = buffer
+                .apply(&transaction)
+                .expect("valid transaction should apply");
+            assert_eq!(buffer.snapshot().as_str(), "hi world!", "{backend}");
 
-        buffer
-            .apply(applied.inverse())
-            .expect("inverse transaction should apply");
-        assert_eq!(buffer.snapshot().as_str(), "hello world");
+            buffer
+                .apply(applied.inverse())
+                .expect("inverse transaction should apply");
+            assert_eq!(buffer.snapshot().as_str(), "hello world", "{backend}");
+        }
     }
 
     #[test]
     fn failed_transaction_does_not_mutate_buffer() {
-        let mut buffer = TextBuffer::new("羽");
-        let transaction = Transaction::new(buffer.revision(), [Edit::new(range(1, 2), "x")]);
+        for backend in crate::StorageBackend::ALL {
+            let mut buffer = TextBuffer::with_backend("羽", backend);
+            let transaction = Transaction::new(buffer.revision(), [Edit::new(range(1, 2), "x")]);
 
-        assert!(matches!(
-            buffer.apply(&transaction),
-            Err(EditError::NotUtf8Boundary(_))
-        ));
-        assert_eq!(buffer.snapshot().as_str(), "羽");
-        assert_eq!(buffer.revision(), Revision::INITIAL);
+            assert!(matches!(
+                buffer.apply(&transaction),
+                Err(EditError::NotUtf8Boundary(_))
+            ));
+            assert_eq!(buffer.snapshot().as_str(), "羽", "{backend}");
+            assert_eq!(buffer.revision(), Revision::INITIAL);
+        }
     }
 
     #[test]

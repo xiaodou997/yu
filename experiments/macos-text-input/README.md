@@ -16,6 +16,13 @@
 swift build --package-path experiments/macos-text-input
 ```
 
+生成可由 LaunchServices 和 Accessibility 识别的临时 `.app`：
+
+```bash
+experiments/macos-text-input/build-app.sh
+open experiments/macos-text-input/.build/YuMacTextInputSpike.app
+```
+
 手工运行：
 
 ```bash
@@ -34,4 +41,3 @@ swift run --package-path experiments/macos-text-input YuMacTextInputSpike
 该实验暂时直接保存 UTF-16 selection，因为 AppKit 协议使用 `NSRange`。接入 Rust 时必须由
 平台适配层转换成带 Revision 的 `TextAnchor`，正式 composition 则进入临时 Overlay，不能在
 每次 `setMarkedText` 时提交 Undo Transaction。
-

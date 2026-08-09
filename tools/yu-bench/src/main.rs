@@ -7,30 +7,74 @@ use std::time::{Duration, Instant};
 
 use yu_core::{ByteOffset, TextRange};
 use yu_markdown::parse;
-use yu_text::{Edit, TextBuffer, Transaction};
+use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
 
 const SECTION: &str = "# Yu\n\nA paragraph with **strong text**, 中文 and emoji 🙂.\n\n```rust\nfn main() {}\n```\n\n";
+const INSERTIONS: [&str; 6] = ["羽", "Yu", "🙂", "e\u{301}", "\n", "**"];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let configuration = Configuration::from_arguments()?;
     let source = fixture(configuration.size_mib);
-    let mut buffer = TextBuffer::new(source);
-    let snapshot = buffer.snapshot();
+    let (random_script, expected_random_result) =
+        random_edit_script(&source, configuration.random_edits);
 
-    let warmup = parse(&snapshot);
+    println!("Yu Phase 1 storage comparison");
+    println!("document bytes: {}", source.len());
+    println!("timing iterations: {}", configuration.iterations);
+    println!("random edits: {}", configuration.random_edits);
+    println!("retained snapshots: {}", configuration.retained_snapshots);
+
+    for backend in StorageBackend::ALL {
+        run_backend(
+            backend,
+            &source,
+            &random_script,
+            &expected_random_result,
+            configuration,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn run_backend(
+    backend: StorageBackend,
+    source: &str,
+    random_script: &[ScriptEdit],
+    expected_random_result: &str,
+    configuration: Configuration,
+) -> Result<(), Box<dyn Error>> {
+    let construct_start = Instant::now();
+    let mut buffer = TextBuffer::with_backend(source, backend);
+    let construct_time = construct_start.elapsed();
+    let initial_stats = buffer.storage_stats();
+
+    let mut snapshot_samples = Vec::with_capacity(configuration.iterations);
+    for _ in 0..configuration.iterations {
+        let start = Instant::now();
+        let snapshot = buffer.snapshot();
+        snapshot_samples.push(start.elapsed());
+        std::hint::black_box(snapshot.storage_stats());
+    }
+
+    let cold_snapshot = buffer.snapshot();
+    let materialize_start = Instant::now();
+    std::hint::black_box(cold_snapshot.as_str());
+    let materialize_time = materialize_start.elapsed();
+
+    let warmup = parse(&cold_snapshot);
     if !warmup.has_lossless_coverage() {
         return Err(io::Error::other("warmup parse lost source coverage").into());
     }
-
     let mut parse_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
         let start = Instant::now();
-        let document = parse(&snapshot);
+        let document = parse(&cold_snapshot);
         parse_samples.push(start.elapsed());
         std::hint::black_box(document);
     }
 
-    let middle = nearest_char_boundary(snapshot.as_str(), snapshot.as_str().len() / 2);
+    let middle = nearest_char_boundary(source, source.len() / 2);
     let insert_range = TextRange::empty(
         ByteOffset::try_from(middle).map_err(|_| io::Error::other("fixture is too large"))?,
     );
@@ -43,15 +87,78 @@ fn main() -> Result<(), Box<dyn Error>> {
         edit_samples.push(start.elapsed());
     }
 
-    println!("Yu Phase 1 reference workload");
-    println!("backend: flat Arc<str> reference (not production)");
-    println!("document bytes: {}", snapshot.as_str().len());
-    println!("blocks: {}", warmup.blocks().len());
-    println!("iterations: {}", configuration.iterations);
-    println!("full block scan median: {:?}", median(&mut parse_samples));
+    let mut random_buffer = TextBuffer::with_backend(source, backend);
+    let mut retained_snapshots = Vec::with_capacity(configuration.retained_snapshots);
+    retained_snapshots.push(random_buffer.snapshot());
+    let retention_stride = configuration
+        .random_edits
+        .div_ceil(configuration.retained_snapshots.saturating_sub(1).max(1));
+    let random_start = Instant::now();
+    for (index, edit) in random_script.iter().enumerate() {
+        let transaction = Transaction::new(
+            random_buffer.revision(),
+            [Edit::new(edit.range, edit.inserted)],
+        );
+        let applied = random_buffer.apply(&transaction)?;
+        let completed = index + 1;
+        if retained_snapshots.len() < configuration.retained_snapshots
+            && (completed.is_multiple_of(retention_stride) || completed == random_script.len())
+        {
+            retained_snapshots.push(applied.result_snapshot().clone());
+        }
+    }
+    let random_time = random_start.elapsed();
+    if random_buffer.snapshot().as_str() != expected_random_result {
+        return Err(io::Error::other(format!("{backend} random edit result mismatch")).into());
+    }
+
+    let round_trip_stats = buffer.storage_stats();
+    let random_stats = random_buffer.storage_stats();
+    let retention = retained_snapshot_stats(&retained_snapshots);
+    println!();
+    println!("backend: {backend}");
+    println!("  construct: {construct_time:?}");
+    println!("  snapshot median: {:?}", median(&mut snapshot_samples));
+    println!("  first contiguous view: {materialize_time:?}");
+    println!("  full block scan median: {:?}", median(&mut parse_samples));
     println!(
-        "middle insert + inverse median: {:?}",
+        "  middle insert + inverse median: {:?}",
         median(&mut edit_samples)
+    );
+    println!("  random edit total: {random_time:?}");
+    println!(
+        "  random edit mean: {:?}",
+        random_time / u32::try_from(random_script.len()).unwrap_or(u32::MAX)
+    );
+    println!(
+        "  initial structure: chunks={} nodes={} height={}",
+        initial_stats.chunks(),
+        initial_stats.nodes(),
+        initial_stats.height()
+    );
+    println!(
+        "  after repeated insert/inverse: chunks={} nodes={} height={}",
+        round_trip_stats.chunks(),
+        round_trip_stats.nodes(),
+        round_trip_stats.height()
+    );
+    println!(
+        "  after random edits: chunks={} nodes={} height={}",
+        random_stats.chunks(),
+        random_stats.nodes(),
+        random_stats.height()
+    );
+    println!(
+        "  retained allocation estimate: {} (snapshots={} snapshot-bytes={} nodes={} node-bytes={} text-buffers={} text-bytes={} materialized-buffers={} materialized-bytes={})",
+        human_bytes(retention.estimated_bytes()),
+        retention.snapshots(),
+        retention.snapshot_bytes(),
+        retention.nodes(),
+        retention.node_bytes(),
+        retention.text_buffers(),
+        retention.text_bytes(),
+        retention.materialized_buffers(),
+        retention.materialized_bytes(),
     );
 
     Ok(())
@@ -61,6 +168,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 struct Configuration {
     size_mib: usize,
     iterations: usize,
+    random_edits: usize,
+    retained_snapshots: usize,
 }
 
 impl Configuration {
@@ -68,6 +177,8 @@ impl Configuration {
         let mut configuration = Self {
             size_mib: 1,
             iterations: 20,
+            random_edits: 2_000,
+            retained_snapshots: 8,
         };
         let mut arguments = env::args().skip(1);
 
@@ -83,6 +194,12 @@ impl Configuration {
                 "--iterations" => {
                     configuration.iterations = positive_number(&value, &argument)?;
                 }
+                "--random-edits" => {
+                    configuration.random_edits = positive_number(&value, &argument)?;
+                }
+                "--retained-snapshots" => {
+                    configuration.retained_snapshots = positive_number(&value, &argument)?;
+                }
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -95,6 +212,36 @@ impl Configuration {
 
         Ok(configuration)
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScriptEdit {
+    range: TextRange,
+    inserted: &'static str,
+}
+
+fn random_edit_script(source: &str, count: usize) -> (Vec<ScriptEdit>, String) {
+    let mut seed = 0x5955_4245_4e43_4821_u64;
+    let mut model = source.to_owned();
+    let mut script = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let mut start = random_index(&mut seed, model.len() + 1);
+        start = nearest_char_boundary(&model, start);
+        let requested_end = start + random_index(&mut seed, 65);
+        let mut end = requested_end.min(model.len());
+        end = nearest_char_boundary(&model, end);
+        let inserted = INSERTIONS[random_index(&mut seed, INSERTIONS.len())];
+        let range = TextRange::new(
+            ByteOffset::try_from(start).expect("benchmark offset should fit u64"),
+            ByteOffset::try_from(end).expect("benchmark offset should fit u64"),
+        )
+        .expect("benchmark boundaries should be ordered");
+        script.push(ScriptEdit { range, inserted });
+        model.replace_range(start..end, inserted);
+    }
+
+    (script, model)
 }
 
 fn positive_number(value: &str, argument: &str) -> Result<usize, Box<dyn Error>> {
@@ -122,7 +269,17 @@ fn nearest_char_boundary(text: &str, mut candidate: usize) -> usize {
     candidate
 }
 
+fn random_index(seed: &mut u64, upper_bound: usize) -> usize {
+    *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+    ((*seed >> 32) as usize) % upper_bound
+}
+
 fn median(samples: &mut [Duration]) -> Duration {
     samples.sort_unstable();
     samples[samples.len() / 2]
+}
+
+fn human_bytes(bytes: usize) -> String {
+    const MEBIBYTE: f64 = (1024 * 1024) as f64;
+    format!("{:.2} MiB", bytes as f64 / MEBIBYTE)
 }

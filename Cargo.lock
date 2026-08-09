@@ -16,6 +16,14 @@ name = "yu-core"
 version = "0.1.0"
 
 [[package]]
+name = "yu-editor"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
+ "yu-text",
+]
+
+[[package]]
 name = "yu-inspect"
 version = "0.1.0"
 dependencies = [

@@ -4,4 +4,6 @@
 
 mod position;
 
-pub use position::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
+pub use position::{
+    Affinity, ByteOffset, Revision, TextAnchor, TextRange, Utf16Offset, Utf16Range,
+};

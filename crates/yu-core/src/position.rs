@@ -56,6 +56,84 @@ impl TryFrom<ByteOffset> for usize {
     }
 }
 
+/// An offset measured in UTF-16 code units for native text-system bridges.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Utf16Offset(u64);
+
+impl Utf16Offset {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Debug for Utf16Offset {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Utf16Offset({})", self.0)
+    }
+}
+
+/// A half-open range measured in UTF-16 code units.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Utf16Range {
+    start: Utf16Offset,
+    end: Utf16Offset,
+}
+
+impl Utf16Range {
+    #[must_use]
+    pub const fn new(start: Utf16Offset, end: Utf16Offset) -> Option<Self> {
+        if start.get() <= end.get() {
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn empty(at: Utf16Offset) -> Self {
+        Self { start: at, end: at }
+    }
+
+    #[must_use]
+    pub const fn start(self) -> Utf16Offset {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(self) -> Utf16Offset {
+        self.end
+    }
+
+    #[must_use]
+    pub const fn len(self) -> u64 {
+        self.end.get() - self.start.get()
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.start.get() == self.end.get()
+    }
+}
+
+impl fmt::Debug for Utf16Range {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Utf16Range({}..{})",
+            self.start.get(),
+            self.end.get()
+        )
+    }
+}
+
 /// A half-open UTF-8 byte range belonging to one source revision.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextRange {
