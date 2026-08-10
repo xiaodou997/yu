@@ -86,8 +86,11 @@ fn status_from_document_error(error: EditorDocumentError) -> i32 {
         EditorDocumentError::Composition(_) => YU_FFI_INVALID_SELECTION,
         EditorDocumentError::Edit(EditError::StaleRevision { .. }) => YU_FFI_STALE_REVISION,
         EditorDocumentError::Edit(_) | EditorDocumentError::CompositionActive => YU_FFI_EDIT_FAILED,
+        EditorDocumentError::Markdown(_) => YU_FFI_EDIT_FAILED,
         EditorDocumentError::Position(_) => YU_FFI_INVALID_RANGE,
         EditorDocumentError::Projection(_) => YU_FFI_INVALID_RANGE,
+        EditorDocumentError::BlockOutOfBounds { .. }
+        | EditorDocumentError::BlockNotProjectable { .. } => YU_FFI_INVALID_RANGE,
         EditorDocumentError::Selection(SelectionError::StaleRevision { .. }) => {
             YU_FFI_STALE_REVISION
         }

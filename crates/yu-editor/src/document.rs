@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use yu_core::{Revision, TextRange, Utf16Range};
+use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
 };
@@ -21,6 +22,7 @@ use crate::{
 #[derive(Debug)]
 pub struct EditorDocument {
     buffer: TextBuffer,
+    markdown: MarkdownDocument,
     composition: Option<CompositionOverlay>,
     selection: EditorSelection,
     projections: ProjectionCache,
@@ -32,6 +34,7 @@ impl EditorDocument {
     pub fn new(source: impl Into<String>) -> Self {
         let buffer = TextBuffer::new(source);
         let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
         let selection = EditorSelection::cursor(
             &snapshot,
             snapshot.len_bytes(),
@@ -40,6 +43,7 @@ impl EditorDocument {
         .expect("the end of a newly created source is a valid caret");
         Self {
             buffer,
+            markdown,
             composition: None,
             selection,
             projections: ProjectionCache::default(),
@@ -56,6 +60,13 @@ impl EditorDocument {
     #[must_use]
     pub fn snapshot(&self) -> TextSnapshot {
         self.buffer.snapshot()
+    }
+
+    /// Returns the incremental Markdown block document for the current
+    /// source revision.
+    #[must_use]
+    pub fn markdown(&self) -> &MarkdownDocument {
+        &self.markdown
     }
 
     /// Returns the active composition without exposing mutable editor state.
@@ -84,6 +95,28 @@ impl EditorDocument {
         self.projections.stats()
     }
 
+    /// Returns the projection for one parser-owned Markdown block.
+    pub fn block_projection(&mut self, index: usize) -> Result<&Projection, EditorDocumentError> {
+        let block =
+            self.markdown
+                .blocks()
+                .get(index)
+                .ok_or(EditorDocumentError::BlockOutOfBounds {
+                    index,
+                    blocks: self.markdown.blocks().len(),
+                })?;
+        if matches!(block.kind(), BlockKind::FencedCodeBlock { .. }) {
+            return Err(EditorDocumentError::BlockNotProjectable {
+                index,
+                kind: block.kind(),
+            });
+        }
+        let snapshot = self.snapshot();
+        self.projections
+            .get_or_build_block(&snapshot, block)
+            .map_err(EditorDocumentError::Projection)
+    }
+
     /// Replaces the selection after checking that it belongs to this revision.
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), SelectionError> {
         selection.utf16_range(&self.snapshot())?;
@@ -101,12 +134,19 @@ impl EditorDocument {
         transaction: &Transaction,
     ) -> Result<AppliedTransaction, EditorDocumentError> {
         let applied = self.buffer.apply(transaction)?;
+        let incremental = yu_markdown::parse_incremental(
+            &self.markdown,
+            applied.result_snapshot(),
+            applied.change_set(),
+        )?;
         self.selection = self
             .selection
             .map_through(applied.change_set(), applied.result_snapshot())?;
         self.projections
             .map_through(applied.change_set(), applied.result_snapshot())
             .map_err(EditorDocumentError::Projection)?;
+        self.projections.retain_blocks(incremental.document());
+        self.markdown = incremental.into_document();
         Ok(applied)
     }
 
@@ -193,6 +233,7 @@ impl EditorDocument {
             return Err(EditorDocumentError::CompositionActive);
         }
         self.buffer = TextBuffer::new(source);
+        self.markdown = yu_markdown::parse(&self.buffer.snapshot());
         self.projections.clear();
         let snapshot = self.snapshot();
         self.selection = EditorSelection::cursor(
@@ -314,9 +355,12 @@ impl EditorDocument {
 pub enum EditorDocumentError {
     Composition(CompositionError),
     Edit(EditError),
+    Markdown(IncrementalParseError),
     Position(TextPositionError),
     Projection(ProjectionError),
     Selection(SelectionError),
+    BlockOutOfBounds { index: usize, blocks: usize },
+    BlockNotProjectable { index: usize, kind: BlockKind },
     CompositionNotActive,
     CompositionActive,
 }
@@ -326,9 +370,22 @@ impl fmt::Display for EditorDocumentError {
         match self {
             Self::Composition(error) => error.fmt(formatter),
             Self::Edit(error) => error.fmt(formatter),
+            Self::Markdown(error) => error.fmt(formatter),
             Self::Position(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
             Self::Selection(error) => error.fmt(formatter),
+            Self::BlockOutOfBounds { index, blocks } => {
+                write!(
+                    formatter,
+                    "Markdown block index {index} is outside {blocks} blocks"
+                )
+            }
+            Self::BlockNotProjectable { index, kind } => {
+                write!(
+                    formatter,
+                    "Markdown block {index} with kind {kind:?} is not projectable"
+                )
+            }
             Self::CompositionNotActive => formatter.write_str("no active composition"),
             Self::CompositionActive => formatter.write_str("composition is already active"),
         }
@@ -340,10 +397,14 @@ impl Error for EditorDocumentError {
         match self {
             Self::Composition(error) => Some(error),
             Self::Edit(error) => Some(error),
+            Self::Markdown(error) => Some(error),
             Self::Position(error) => Some(error),
             Self::Projection(error) => Some(error),
             Self::Selection(error) => Some(error),
-            Self::CompositionNotActive | Self::CompositionActive => None,
+            Self::BlockOutOfBounds { .. }
+            | Self::BlockNotProjectable { .. }
+            | Self::CompositionNotActive
+            | Self::CompositionActive => None,
         }
     }
 }
@@ -357,6 +418,12 @@ impl From<CompositionError> for EditorDocumentError {
 impl From<EditError> for EditorDocumentError {
     fn from(error: EditError) -> Self {
         Self::Edit(error)
+    }
+}
+
+impl From<IncrementalParseError> for EditorDocumentError {
+    fn from(error: IncrementalParseError) -> Self {
+        Self::Markdown(error)
     }
 }
 
@@ -381,6 +448,7 @@ impl From<SelectionError> for EditorDocumentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VisualRunKind;
     use yu_core::{ByteOffset, Utf16Offset};
     use yu_text::Edit;
 
@@ -563,6 +631,109 @@ mod tests {
             ))
         ));
         assert_eq!(document.projection_cache_stats().entries(), 0);
+    }
+
+    #[test]
+    fn block_projection_uses_incremental_markdown_ranges_and_remaps_prefix_edits() {
+        let source = "intro\n\nparagraph **羽🙂**\n\n```rust\ncode\n```\n";
+        let mut document = EditorDocument::new(source);
+        let paragraph_index = document
+            .markdown()
+            .blocks()
+            .iter()
+            .position(|block| block.kind() == BlockKind::Paragraph && block.range().len() > 10)
+            .expect("paragraph block should exist");
+        let old_range = document
+            .markdown()
+            .blocks()
+            .get(paragraph_index)
+            .expect("paragraph block should be present")
+            .range();
+
+        {
+            let projection = document
+                .block_projection(paragraph_index)
+                .expect("paragraph projection should build");
+            assert_eq!(projection.source_range(), old_range);
+            assert_eq!(
+                projection
+                    .runs()
+                    .iter()
+                    .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                    .count(),
+                2
+            );
+        }
+        assert_eq!(document.markdown().revision(), document.revision());
+        assert_eq!(document.projection_cache_stats().builds(), 1);
+
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("prefix edit should apply");
+        let new_block = document
+            .markdown()
+            .blocks()
+            .get(paragraph_index)
+            .expect("paragraph block should remain at the same index");
+        let new_range = new_block.range();
+        assert_eq!(new_range.start().get(), old_range.start().get() + 3);
+        assert_eq!(new_range.end().get(), old_range.end().get() + 3);
+        let projection = document
+            .block_projection(paragraph_index)
+            .expect("remapped paragraph projection should be reusable");
+        assert_eq!(projection.source_range(), new_range);
+        assert_eq!(document.projection_cache_stats().remapped(), 1);
+        assert_eq!(document.projection_cache_stats().builds(), 1);
+    }
+
+    #[test]
+    fn fenced_code_blocks_are_not_sent_through_inline_projection() {
+        let mut document = EditorDocument::new("```rust\n**code**\n```\n");
+        assert!(matches!(
+            document.block_projection(0),
+            Err(EditorDocumentError::BlockNotProjectable {
+                index: 0,
+                kind: BlockKind::FencedCodeBlock { .. }
+            })
+        ));
+        assert!(matches!(
+            document.block_projection(1),
+            Err(EditorDocumentError::BlockOutOfBounds { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn block_projection_is_dropped_when_block_kind_changes() {
+        let mut document = EditorDocument::new("paragraph **羽**\n");
+        document
+            .block_projection(0)
+            .expect("paragraph projection should build");
+
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "# ")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("heading edit should apply");
+        assert_eq!(
+            document
+                .markdown()
+                .blocks()
+                .get(0)
+                .expect("block exists")
+                .kind(),
+            BlockKind::AtxHeading { level: 1 }
+        );
+        assert_eq!(document.projection_cache_stats().entries(), 0);
+        document
+            .block_projection(0)
+            .expect("heading projection should build independently");
+        assert_eq!(document.projection_cache_stats().builds(), 2);
     }
 
     #[test]

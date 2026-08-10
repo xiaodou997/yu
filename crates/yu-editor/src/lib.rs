@@ -22,6 +22,7 @@ pub use composition::{CompositionError, CompositionOverlay};
 pub use document::{EditorDocument, EditorDocumentError};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
+pub use yu_markdown::{Block, BlockKind, MarkdownDocument};
 pub use yu_projection::{
     Projection, ProjectionBias, ProjectionError, VisualOffset, VisualRange, VisualRun,
     VisualRunKind,
