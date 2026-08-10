@@ -11,8 +11,8 @@ use yu_text::{
 
 use crate::{
     BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
-    EditorSelection, Projection, ProjectionCache, ProjectionCacheStats, ProjectionError,
-    SelectionError,
+    EditorSelection, LayoutCache, LayoutCacheStats, Projection, ProjectionCache,
+    ProjectionCacheStats, ProjectionError, SelectionError,
     command::{next_grapheme_boundary, previous_grapheme_boundary},
 };
 
@@ -28,6 +28,7 @@ pub struct EditorDocument {
     composition: Option<CompositionOverlay>,
     selection: EditorSelection,
     projections: ProjectionCache,
+    layouts: LayoutCache,
 }
 
 impl EditorDocument {
@@ -49,6 +50,7 @@ impl EditorDocument {
             composition: None,
             selection,
             projections: ProjectionCache::default(),
+            layouts: LayoutCache::default(),
         }
     }
 
@@ -116,17 +118,36 @@ impl EditorDocument {
             .map_err(EditorDocumentError::Projection)
     }
 
-    /// Builds a revision-bound block layout snapshot from the current
-    /// projection. Layout is intentionally returned by value until a later
-    /// phase introduces a layout cache and viewport virtualization.
+    /// Returns a revision-bound block layout snapshot from the current
+    /// projection. The snapshot is owned by a cache keyed by block range,
+    /// block kind and layout configuration; source edits remap unaffected
+    /// entries and invalidate entries whose projection was touched.
     pub fn block_layout(
         &mut self,
         index: usize,
         config: LayoutConfig,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
-        let projection = self.block_projection(index)?;
-        LayoutSnapshot::from_block_projection(projection, config)
+    ) -> Result<&LayoutSnapshot, EditorDocumentError> {
+        let block =
+            self.markdown
+                .blocks()
+                .get(index)
+                .ok_or(EditorDocumentError::BlockOutOfBounds {
+                    index,
+                    blocks: self.markdown.blocks().len(),
+                })?;
+        let snapshot = self.snapshot();
+        let projection = self
+            .projections
+            .get_or_build_block(&snapshot, block)
+            .map_err(EditorDocumentError::Projection)?;
+        self.layouts
+            .get_or_build_block(&snapshot, block, config, projection)
             .map_err(EditorDocumentError::Layout)
+    }
+
+    #[must_use]
+    pub fn layout_cache_stats(&self) -> LayoutCacheStats {
+        self.layouts.stats()
     }
 
     /// Replaces the selection after checking that it belongs to this revision.
@@ -157,7 +178,11 @@ impl EditorDocument {
         self.projections
             .map_through(applied.change_set(), applied.result_snapshot())
             .map_err(EditorDocumentError::Projection)?;
+        self.layouts
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .map_err(EditorDocumentError::Layout)?;
         self.projections.retain_blocks(incremental.document());
+        self.layouts.retain_blocks(incremental.document());
         self.markdown = incremental.into_document();
         Ok(applied)
     }
@@ -247,6 +272,7 @@ impl EditorDocument {
         self.buffer = TextBuffer::new(source);
         self.markdown = yu_markdown::parse(&self.buffer.snapshot());
         self.projections.clear();
+        self.layouts.clear();
         let snapshot = self.snapshot();
         self.selection = EditorSelection::cursor(
             &snapshot,
@@ -770,14 +796,67 @@ mod tests {
     #[test]
     fn block_layout_uses_the_current_projection_revision() {
         let mut document = EditorDocument::new("**羽🙂**");
+        let revision = document.revision();
         let layout = document
             .block_layout(0, LayoutConfig::new(2.0, 1.25))
             .expect("block layout should build");
 
-        assert_eq!(layout.revision(), document.revision());
+        assert_eq!(layout.revision(), revision);
         assert_eq!(layout.lines().len(), 1);
         assert_eq!(layout.lines()[0].width(), 2.0);
         assert_eq!(layout.clusters().len(), 2);
+        assert_eq!(document.layout_cache_stats().builds(), 1);
+        document
+            .block_layout(0, LayoutConfig::new(2.0, 1.25))
+            .expect("same layout should hit cache");
+        assert_eq!(document.layout_cache_stats().hits(), 1);
+    }
+
+    #[test]
+    fn layout_cache_remaps_unaffected_blocks_and_keys_config() {
+        let mut document = EditorDocument::new("intro\n\n**羽🙂**");
+        let config = LayoutConfig::new(2.0, 1.25);
+        let old_range = document
+            .block_layout(2, config)
+            .expect("block layout should build")
+            .source_range();
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("prefix edit should apply");
+
+        let mapped_range = document
+            .block_layout(2, config)
+            .expect("unaffected block layout should remap")
+            .source_range();
+        assert_eq!(mapped_range.start().get(), old_range.start().get() + 3);
+        assert_eq!(document.layout_cache_stats().builds(), 1);
+        assert_eq!(document.layout_cache_stats().remapped(), 1);
+
+        document
+            .block_layout(2, LayoutConfig::new(4.0, 1.25))
+            .expect("different width should build a separate layout");
+        assert_eq!(document.layout_cache_stats().builds(), 2);
+        assert_eq!(document.layout_cache_stats().entries(), 2);
+    }
+
+    #[test]
+    fn layout_cache_is_dropped_when_block_kind_changes() {
+        let mut document = EditorDocument::new("paragraph **羽**");
+        document
+            .block_layout(0, LayoutConfig::default())
+            .expect("paragraph layout should build");
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "# ")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("heading edit should apply");
+        assert_eq!(document.layout_cache_stats().entries(), 0);
     }
 
     #[test]
