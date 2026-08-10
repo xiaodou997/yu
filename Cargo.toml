@@ -9,6 +9,7 @@ members = [
     "crates/yu-markdown",
     "crates/yu-projection",
     "crates/yu-layout",
+    "platform/macos/yu-font-macos",
     "tools/yu-bench",
     "tools/yu-inspect",
 ]
