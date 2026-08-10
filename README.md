@@ -17,6 +17,7 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - Markdown source 是唯一持久化真源，不通过富文本模型往返序列化；
 - Lossless CST 保留 delimiter、空白、换行和未完成语法；
 - Transaction、Snapshot、Anchor 与 Revision 构成统一编辑协议；
+- selection/caret、Unicode grapheme command 与 Accessibility 查询共享同一个 Revision；
 - 解析、投影、布局、绘制和资源加载都只处理受影响部分；
 - 中文、日文、RTL、emoji、组合字符与原生 IME 是一等公民；
 - 不依赖 Chromium、DOM 或常驻 JavaScript runtime；

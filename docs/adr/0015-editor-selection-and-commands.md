@@ -52,6 +52,6 @@ commit 后用该结果更新 AppKit selection，并验证它与 Rust canonical s
 
 ## 限制
 
-当前 grapheme command helper 会在命令路径使用 `TextSnapshot::as_str()`；它先保证 Unicode
-正确性，后续大文件优化阶段再引入 chunk-aware `GraphemeCursor`。当前 macOS spike 仍保留
-AppKit text storage 作为视图投影，正式编辑器不会把它作为 canonical source。
+当前 macOS spike 仍保留 AppKit text storage 作为视图投影，正式编辑器不会把它作为
+canonical source。grapheme command 已通过 chunk-aware `GraphemeCursor` 执行，不因一次
+左右移动或删除物化整个 Piece Tree Snapshot。

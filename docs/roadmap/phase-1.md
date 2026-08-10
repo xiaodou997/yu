@@ -37,6 +37,8 @@
 - [x] `EditorDocument` 统一拥有 canonical source、Revision 与 composition overlay
 - [x] FFI revision-bound 局部 UTF-8 source query（不物化完整 Snapshot）
 - [x] `EditorSelection`、caret affinity 与基础 Unicode command 模型
+- [x] chunk-aware Unicode grapheme command 查询（不物化完整 Snapshot）
+- [x] `AccessibilityTextSnapshot::from_document` 绑定 canonical selection/Revision
 - [x] FFI selection revision/UTF-16 查询并接入 macOS composition commit 自检
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询

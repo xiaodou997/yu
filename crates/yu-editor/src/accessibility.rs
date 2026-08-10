@@ -4,6 +4,8 @@ use std::fmt;
 use yu_core::{LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_text::{TextPositionError, TextSnapshot};
 
+use crate::{EditorDocument, EditorSelection};
+
 /// A native UTF-16 position bound to one immutable document revision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessibilityTextPosition {
@@ -55,6 +57,34 @@ pub struct AccessibilityTextSnapshot {
 }
 
 impl AccessibilityTextSnapshot {
+    /// Creates an accessibility snapshot from the document's canonical source
+    /// and revision-bound selection.
+    pub fn from_document(document: &EditorDocument) -> Result<Self, AccessibilityTextError> {
+        let source = document.snapshot();
+        let selection = document.selection();
+        if selection.revision() != source.revision() {
+            return Err(AccessibilityTextError::StaleRevision {
+                expected: source.revision(),
+                actual: selection.revision(),
+            });
+        }
+        Self::new(source, selection.ordered_range())
+    }
+
+    /// Creates an accessibility snapshot from a typed source selection.
+    pub fn from_selection(
+        source: TextSnapshot,
+        selection: EditorSelection,
+    ) -> Result<Self, AccessibilityTextError> {
+        if selection.revision() != source.revision() {
+            return Err(AccessibilityTextError::StaleRevision {
+                expected: source.revision(),
+                actual: selection.revision(),
+            });
+        }
+        Self::new(source, selection.ordered_range())
+    }
+
     pub fn new(source: TextSnapshot, selection: TextRange) -> Result<Self, AccessibilityTextError> {
         let selection_utf16 = source_range_to_utf16(&source, selection)?;
         Ok(Self {
@@ -272,6 +302,7 @@ impl From<TextPositionError> for AccessibilityTextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CaretAffinity, EditorCommand};
     use yu_core::ByteOffset;
     use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
@@ -305,6 +336,56 @@ mod tests {
                 .expect("selected source range should resolve"),
             source_range(1, 5)
         );
+    }
+
+    #[test]
+    fn document_accessibility_snapshot_uses_the_canonical_selection_revision() {
+        let mut document = EditorDocument::new("a😊b");
+        let selection = EditorSelection::range(
+            &document.snapshot(),
+            ByteOffset::new(1),
+            ByteOffset::new(5),
+            CaretAffinity::Downstream,
+        )
+        .expect("emoji selection should be valid");
+        document
+            .set_selection(selection)
+            .expect("selection should belong to document");
+
+        let accessibility = AccessibilityTextSnapshot::from_document(&document)
+            .expect("document selection should be exposed");
+        assert_eq!(accessibility.revision(), document.revision());
+        assert_eq!(accessibility.selected_range().range(), utf16_range(1, 3));
+        assert_eq!(
+            accessibility
+                .text_for_range(accessibility.selected_range())
+                .expect("selected text query should succeed"),
+            "😊"
+        );
+
+        document
+            .execute(EditorCommand::insert_text("羽"))
+            .expect("command should advance the document");
+        assert_eq!(accessibility.revision().get(), 0);
+    }
+
+    #[test]
+    fn typed_selection_from_an_old_revision_is_rejected() {
+        let source = TextBuffer::new("old").snapshot();
+        let selection =
+            EditorSelection::cursor(&source, ByteOffset::new(3), CaretAffinity::Downstream)
+                .expect("caret should be valid");
+        let mut next = TextBuffer::new("old");
+        next.apply(&Transaction::new(
+            next.revision(),
+            [Edit::new(source_range(0, 3), "new")],
+        ))
+        .expect("replacement should advance the revision");
+
+        assert!(matches!(
+            AccessibilityTextSnapshot::from_selection(next.snapshot(), selection),
+            Err(AccessibilityTextError::StaleRevision { .. })
+        ));
     }
 
     #[test]

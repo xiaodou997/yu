@@ -44,6 +44,8 @@
    穿过 ABI；commit 成功后最多推进一次 Revision，cancel 不推进 Revision。
 8. FFI source query 必须携带 expected Revision；局部查询只能复制请求范围，不能因平台查询
    而物化完整 Snapshot。
+9. Unicode grapheme command 查询不得为了单次移动或删除调用完整 Snapshot 物化；跨 chunk 的
+   边界必须与连续 UTF-8 文本的 extended grapheme 结果一致。
 
 ## Accessibility
 
@@ -51,6 +53,8 @@
 2. 过期 range 与 surrogate pair 中间位置必须拒绝，不能静默取整或套用到新文本。
 3. 文本、selection、visible range 与 range bounds 必须来自同一次发布的编辑/布局状态。
 4. 查询局部文本不得要求物化整个 Piece Tree Snapshot。
+5. `AccessibilityTextSnapshot::from_document` 产生的 source、selected range 与 Revision 必须
+   来自同一个 `EditorDocument` 状态。
 
 ## Degradation
 

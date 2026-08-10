@@ -82,3 +82,7 @@ Current revision == 41? ── yes ── publish  │
 `yu-editor::EditorDocument` 是编辑阶段的状态边界：它同时保存 canonical `TextBuffer`、
 revision-bound `EditorSelection` 和 transient composition。平台 view 可以保留 AppKit 的
 渲染/输入投影，但永久命令必须回到该边界并通过 Transaction 提交。
+
+左右移动和删除通过 `yu-text::TextSnapshot` 的 chunk cursor 与 Unicode grapheme cursor 查询
+相邻边界；Accessibility 使用 `AccessibilityTextSnapshot::from_document` 一次性绑定 source、
+selection 和 Revision，不从平台 view 复制一份 canonical selection。

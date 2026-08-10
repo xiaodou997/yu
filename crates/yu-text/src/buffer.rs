@@ -5,7 +5,7 @@ use yu_core::{ByteOffset, LineIndex, Revision, Utf16Offset};
 use crate::storage::{Storage, StorageSnapshot};
 use crate::{
     AppliedTransaction, ChunkCursor, EditError, SnapshotRetentionStats, StorageBackend,
-    StorageStats, TextPositionError, Transaction, transaction::PreparedTransaction,
+    StorageStats, TextChunk, TextPositionError, Transaction, transaction::PreparedTransaction,
 };
 
 /// An immutable, cheaply cloneable view of one document revision.
@@ -103,6 +103,27 @@ impl TextSnapshot {
     pub fn chunk_cursor(&self, offset: ByteOffset) -> Result<ChunkCursor<'_>, TextPositionError> {
         let offset_usize = self.validate_byte_offset(offset)?;
         Ok(self.inner.storage.chunks_from(offset_usize))
+    }
+
+    /// Returns the storage chunk ending at or before a validated source offset.
+    ///
+    /// This is primarily used by streaming Unicode boundary queries that need
+    /// to move across a piece boundary without materializing the snapshot.
+    pub fn chunk_before(
+        &self,
+        offset: ByteOffset,
+    ) -> Result<Option<TextChunk<'_>>, TextPositionError> {
+        let offset_usize = self.validate_byte_offset(offset)?;
+        Ok(self
+            .inner
+            .storage
+            .chunk_before(offset_usize)
+            .map(|(start, text)| {
+                TextChunk::new(
+                    ByteOffset::try_from(start).unwrap_or(ByteOffset::new(u64::MAX)),
+                    text,
+                )
+            }))
     }
 
     pub fn utf16_offset(&self, offset: ByteOffset) -> Result<Utf16Offset, TextPositionError> {
@@ -392,6 +413,36 @@ mod tests {
                     snapshot.chunk_cursor(invalid),
                     Err(TextPositionError::NotUtf8Boundary(offset)) if offset == invalid
                 ),
+                "backend {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_before_returns_the_preceding_piece_without_materializing() {
+        for backend in StorageBackend::ALL {
+            let mut buffer = TextBuffer::with_backend("alpha beta", backend);
+            buffer
+                .apply(&Transaction::new(
+                    buffer.revision(),
+                    [Edit::new(TextRange::empty(ByteOffset::new(5)), "羽")],
+                ))
+                .expect("edit should apply");
+            let snapshot = buffer.snapshot();
+            let chunks: Vec<_> = snapshot.chunks().collect();
+            if chunks.len() < 2 {
+                continue;
+            }
+
+            let before = snapshot
+                .chunk_before(chunks[1].start())
+                .expect("preceding chunk lookup should validate")
+                .expect("a second chunk must have a predecessor");
+            assert_eq!(before.start(), chunks[0].start(), "backend {backend}");
+            assert_eq!(before.text(), chunks[0].text(), "backend {backend}");
+            assert_eq!(
+                retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers(),
+                0,
                 "backend {backend}"
             );
         }
