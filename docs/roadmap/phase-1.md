@@ -42,6 +42,7 @@
 - [x] FFI selection revision/UTF-16 查询并接入 macOS composition commit 自检
 - [x] revision-bound FFI selection mutation，并同步 macOS hit-test/Accessibility selection
 - [x] FFI selection mutation/query 保留 upstream/downstream CaretAffinity
+- [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -61,6 +62,8 @@
 7. selection、composition commit 和永久 Transaction 使用同一个结果 Revision。
 8. macOS 原生 hit-test/Accessibility selection 写回 Rust 时，stale Revision 与无效 UTF-16
    range 都能被拒绝，且不会改变旧 selection。
+9. identity projection 下，hidden Markdown delimiter 不占据 visual width，且 source/visual
+   caret mapping 在 Before/After bias 下可重复。
 
 ## 非目标
 

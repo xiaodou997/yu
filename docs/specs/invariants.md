@@ -49,6 +49,8 @@
 10. 原生 selection mutation 必须携带 expected Revision 和合法 CaretAffinity；Revision 过期、
     UTF-16 越界、surrogate 中间位置或未知 affinity 必须拒绝，并保持 EditorDocument selection
     不变。
+11. Projection 只能引用同一 Revision 的 source range；Visible run 必须保持 source/visual
+    长度一致，HiddenSyntax run 的 visual width 必须为零。
 
 ## Accessibility
 
@@ -65,3 +67,10 @@
 
 1. 每个昂贵功能都必须定义预算、取消和 fallback。
 2. 大文件可以关闭投影、图片、嵌入渲染和全文索引，但基本源码编辑必须保持可用。
+
+## Projection
+
+1. Projection 不拥有可编辑的第二份 Markdown 文本。
+2. source/visual 映射必须拒绝 projection range 外的 source offset 和 visual offset。
+3. hidden syntax 两侧的 caret 必须通过显式 Before/After bias 解析，不能依赖遍历顺序的
+   隐式取整。

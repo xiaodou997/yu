@@ -45,13 +45,15 @@ yu-text ◄──── yu-editor ◄──── yu-editor-ffi
    ▲             ▲                  ▲
    │             │                  │
 yu-markdown ◄── yu-inspect     macOS/Swift shell
+      │
+      ▼
+yu-projection
 ```
 
 后续预计增加：
 
 ```text
 yu-markdown-edit
-yu-projection
 yu-font
 yu-layout
 yu-scene
@@ -105,3 +107,8 @@ EditorDocument::set_selection
 该路径只更新 selection，不生成 Transaction；Rust FFI 会拒绝 stale Revision 和无效
 UTF-16 boundary/affinity。这样 AppKit 的原生 selection 与 caret affinity 仍是
 `EditorDocument` 状态的投影，而不是第二个 canonical selection。
+
+`yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
+`TextSnapshot`、source range、visible/hidden runs 和双向 mapping，不生成第二份可编辑文本。
+当前 delimiter scanner 是保守风险验证，正式 `yu-markdown` inline CST 接入后继续复用同一个
+source/visual mapping 边界。

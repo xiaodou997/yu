@@ -11,6 +11,7 @@ Yu 不使用同一个 `usize` 表示所有位置。
 | `TextAnchor` | selection、异步结果、批注 | 是，需要映射 |
 | `SourceCaretPosition` | source caret 与视觉行 affinity | 否 |
 | `NativeCaretPosition` | AppKit UTF-16 caret 与视觉行 affinity | 否 |
+| VisualOffset | projection 后的 UTF-8 visual byte offset | 否 |
 | `VisualPosition` | 投影后的逻辑位置 | 否 |
 | `Point` | 布局坐标 | 否 |
 
