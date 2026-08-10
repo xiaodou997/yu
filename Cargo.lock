@@ -43,6 +43,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-font"
+version = "0.1.0"
+dependencies = [
+ "unicode-segmentation",
+ "yu-core",
+ "yu-layout",
+ "yu-projection",
+ "yu-text",
+]
+
+[[package]]
 name = "yu-inspect"
 version = "0.1.0"
 dependencies = [

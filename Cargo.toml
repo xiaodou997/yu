@@ -4,6 +4,7 @@ members = [
     "crates/yu-core",
     "crates/yu-editor",
     "crates/yu-editor-ffi",
+    "crates/yu-font",
     "crates/yu-text",
     "crates/yu-markdown",
     "crates/yu-projection",
