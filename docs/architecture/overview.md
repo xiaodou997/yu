@@ -96,12 +96,12 @@ AppKit NSRange
 cancel active composition
     │
     ▼
-yu_composition_session_set_selection(expected Revision, UTF-16 range)
+yu_composition_session_set_selection(expected Revision, UTF-16 range, CaretAffinity)
     │
     ▼
 EditorDocument::set_selection
 ```
 
 该路径只更新 selection，不生成 Transaction；Rust FFI 会拒绝 stale Revision 和无效
-UTF-16 boundary。这样 AppKit 的原生 selection 仍是 View 投影，而不是第二个 canonical
-selection。
+UTF-16 boundary/affinity。这样 AppKit 的原生 selection 与 caret affinity 仍是
+`EditorDocument` 状态的投影，而不是第二个 canonical selection。

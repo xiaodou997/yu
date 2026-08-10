@@ -46,8 +46,9 @@
    而物化完整 Snapshot。
 9. Unicode grapheme command 查询不得为了单次移动或删除调用完整 Snapshot 物化；跨 chunk 的
    边界必须与连续 UTF-8 文本的 extended grapheme 结果一致。
-10. 原生 selection mutation 必须携带 expected Revision；Revision 过期、UTF-16 越界或
-    surrogate 中间位置必须拒绝，并保持 EditorDocument selection 不变。
+10. 原生 selection mutation 必须携带 expected Revision 和合法 CaretAffinity；Revision 过期、
+    UTF-16 越界、surrogate 中间位置或未知 affinity 必须拒绝，并保持 EditorDocument selection
+    不变。
 
 ## Accessibility
 

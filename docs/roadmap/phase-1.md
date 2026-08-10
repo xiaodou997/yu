@@ -41,6 +41,7 @@
 - [x] `AccessibilityTextSnapshot::from_document` 绑定 canonical selection/Revision
 - [x] FFI selection revision/UTF-16 查询并接入 macOS composition commit 自检
 - [x] revision-bound FFI selection mutation，并同步 macOS hit-test/Accessibility selection
+- [x] FFI selection mutation/query 保留 upstream/downstream CaretAffinity
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证

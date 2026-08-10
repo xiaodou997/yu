@@ -61,3 +61,8 @@ overlay，然后以当前 Rust Revision 调用该函数；键盘左右移动和 
 当前 macOS spike 在主线程内执行“读取 Revision → 写回 selection”；ABI 尚未承诺跨线程并发
 调用。正式 editor 需要把平台事件、布局发布和 selection mutation 放入统一的 UI state
 发布协议，并继续覆盖 VoiceOver 与真实输入源。
+
+## 后续修订
+
+ADR 0018 将本 ADR 的 range-only ABI 扩展为同时传递和查询
+`CaretAffinity`；本 ADR 中示意的 `Downstream` 仅代表扩展前的默认行为。

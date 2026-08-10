@@ -4,6 +4,11 @@ import YuEditorFFI
 
 private let notFoundRange = NSRange(location: NSNotFound, length: 0)
 
+private enum RustCaretAffinity: UInt8 {
+    case upstream = 0
+    case downstream = 1
+}
+
 private final class RustCompositionBridge {
     private var session: OpaquePointer?
     private(set) var hasOverlay = false
@@ -97,29 +102,55 @@ private final class RustCompositionBridge {
         return value
     }
 
-    func selection() -> (revision: UInt64, range: NSRange) {
+    func selection() -> (
+        revision: UInt64,
+        range: NSRange,
+        affinity: NSSelectionAffinity
+    ) {
         guard let session else { preconditionFailure("Rust composition session is missing") }
         var revision: UInt64 = 0
         var start: UInt64 = 0
         var end: UInt64 = 0
-        let status = yu_composition_session_selection(session, &revision, &start, &end)
+        var affinity = RustCaretAffinity.downstream.rawValue
+        let status = yu_composition_session_selection(
+            session,
+            &revision,
+            &start,
+            &end,
+            &affinity
+        )
         precondition(status == 0, "Rust composition selection query failed: \(status)")
         precondition(end >= start, "Rust composition selection range must be ordered")
+        let nativeAffinity: NSSelectionAffinity
+        switch RustCaretAffinity(rawValue: affinity) {
+        case .upstream:
+            nativeAffinity = .upstream
+        case .downstream:
+            nativeAffinity = .downstream
+        case nil:
+            preconditionFailure("Rust composition selection affinity is invalid: \(affinity)")
+        }
         return (
             revision,
-            NSRange(location: Int(start), length: Int(end - start))
+            NSRange(location: Int(start), length: Int(end - start)),
+            nativeAffinity
         )
     }
 
-    func setSelection(_ range: NSRange) {
+    func setSelection(
+        _ range: NSRange,
+        affinity: NSSelectionAffinity = .downstream
+    ) {
         guard let session else { preconditionFailure("Rust composition session is missing") }
         precondition(range.location >= 0 && range.length >= 0, "Rust selection must be non-negative")
         let expectedRevision = revision()
+        let rustAffinity: RustCaretAffinity = affinity == .upstream ? .upstream : .downstream
         let status = yu_composition_session_set_selection(
             session,
             expectedRevision,
             UInt64(range.location),
-            UInt64(NSMaxRange(range))
+            UInt64(NSMaxRange(range)),
+            rustAffinity.rawValue
         )
         precondition(status == 0, "Rust composition selection update failed: \(status)")
     }
@@ -275,7 +306,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let hit = caretHit(forLocalPoint: point)
         selection = NSRange(location: hit.index, length: 0)
         selectionAffinity = hit.affinity
-        rustComposition.setSelection(selection)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
         needsDisplay = true
         postSelectionChanged()
     }
@@ -568,17 +599,26 @@ final class TextInputView: NSView, NSTextInputClient {
                 && rustSelection.range == probe,
             "native selection mutation must update Rust"
         )
+        selectionAffinity = .upstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        let upstreamSelection = rustComposition.selection()
+        precondition(
+            upstreamSelection.range == probe && upstreamSelection.affinity == .upstream,
+            "native selection affinity must round-trip through Rust"
+        )
 
         selection = savedSelection
         selectionAffinity = savedAffinity
-        rustComposition.setSelection(selection)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
         needsDisplay = true
         postSelectionChanged()
         let restored = rustComposition.selection()
         precondition(restored.range == savedSelection, "native selection self-check must restore")
+        let affinityName = upstreamSelection.affinity == .upstream ? "upstream" : "downstream"
         print(
             "Native selection self-check probe=\(probe) "
-                + "revision=\(rustSelection.revision) restored=\(restored.range)"
+                + "revision=\(rustSelection.revision) affinity=\(affinityName) "
+                + "restored=\(restored.range)"
         )
     }
 
@@ -711,7 +751,7 @@ final class TextInputView: NSView, NSTextInputClient {
         compositionSelectionBefore = nil
         compositionAffinityBefore = nil
         rustComposition.resetSource(textStorage.string)
-        rustComposition.setSelection(selection)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
         needsDisplay = true
         print(
             "Unicode composition self-check japanese=日本語 combining=é "

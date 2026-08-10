@@ -30,6 +30,7 @@ Swift 侧只保存 `OpaquePointer`，不读取 Rust struct 字段。Rust 侧负�
 - commit 后通过 FFI 读取 Rust `EditorSelection` 的 revision-bound UTF-16 range；
 - native selection mutation 通过 expected Revision 将 AppKit `NSRange` 写回
   `EditorDocument::set_selection`；
+- selection mutation/query 同时传递和校验 `NSSelectionAffinity` ↔ `CaretAffinity`；
 - cancel 时清除 overlay 并保持 Revision；
 - source 校验/读取携带 expected Revision；局部查询逐 chunk 复制 UTF-8 bytes。
 
@@ -61,7 +62,7 @@ cancelComposition range={51, 3}
 Unicode composition self-check japanese=日本語 combining=é cancel=restored
 setMarkedText preedit="にほん" selection={3, 0} replace={47, 0}
 cancelComposition range={47, 3}
-Native selection self-check probe={20, 3} revision=0 restored={47, 0}
+Native selection self-check probe={20, 3} revision=0 affinity=upstream restored={47, 0}
 AX self-check characters=47 selection={47, 0} firstLine={0, 19} ...
 AX runtime probe trusted=true role=Optional(AXTextArea) ...
 ```

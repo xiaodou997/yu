@@ -85,5 +85,6 @@ mouse/AX range ──► UTF-16 + expected Revision
                  EditorDocument selection
 ```
 
-写回不是文本编辑，不推进 source Revision；过期 Revision、越界或 surrogate 中间位置直接
-拒绝，平台层必须重新查询当前 selection。
+写回不是文本编辑，不推进 source Revision；过期 Revision、越界、surrogate 中间位置或未知
+affinity 直接拒绝，平台层必须重新查询当前 selection。`NSSelectionAffinity` 与
+`CaretAffinity` 在 ABI 中使用显式 upstream/downstream 映射，不能依赖枚举的原始整数值。
