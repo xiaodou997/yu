@@ -6,6 +6,7 @@ members = [
     "crates/yu-editor-ffi",
     "crates/yu-text",
     "crates/yu-markdown",
+    "crates/yu-projection",
     "tools/yu-bench",
     "tools/yu-inspect",
 ]
