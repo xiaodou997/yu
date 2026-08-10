@@ -6,6 +6,8 @@ use yu_layout::{HeightIndex, HeightIndexError, LayoutConfig};
 use yu_markdown::{BlockKind, MarkdownDocument};
 use yu_text::{AnchorMapError, ChangeSet, TextSnapshot};
 
+use crate::LayoutBackend;
+
 /// Configuration shared by block layout measurement and viewport estimation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewportConfig {
@@ -259,6 +261,7 @@ impl ViewportStats {
 #[derive(Debug, Default)]
 pub struct ViewportLayout {
     config: ViewportConfig,
+    backend: LayoutBackend,
     entries: Vec<ViewportEntry>,
     heights: HeightIndex,
     revision: Option<Revision>,
@@ -284,6 +287,7 @@ impl ViewportLayout {
         config.validate()?;
         Ok(Self {
             config,
+            backend: LayoutBackend::Metrics,
             entries: Vec::new(),
             heights: HeightIndex::default(),
             revision: None,
@@ -295,6 +299,27 @@ impl ViewportLayout {
     #[must_use]
     pub const fn config(&self) -> ViewportConfig {
         self.config
+    }
+
+    #[must_use]
+    pub const fn backend(&self) -> LayoutBackend {
+        self.backend
+    }
+
+    /// Switches the measurement backend and resets measured heights to the
+    /// configured estimate. Metrics and shaped glyph runs can have different
+    /// line wrapping, so retaining old measured heights would make viewport
+    /// range selection stale.
+    pub(crate) fn set_backend(&mut self, backend: LayoutBackend) -> Result<(), ViewportError> {
+        if self.backend == backend {
+            return Ok(());
+        }
+        self.backend = backend;
+        for entry in &mut self.entries {
+            entry.height = self.config.estimated_block_height();
+            entry.measured = false;
+        }
+        self.rebuild_index()
     }
 
     #[must_use]

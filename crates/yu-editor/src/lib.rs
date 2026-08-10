@@ -22,7 +22,7 @@ pub use caret::{
 pub use command::{CommandResult, EditorCommand};
 pub use composition::{CompositionError, CompositionOverlay};
 pub use document::{EditorDocument, EditorDocumentError};
-pub use layout::{LayoutCache, LayoutCacheStats};
+pub use layout::{LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
 pub use viewport::{
@@ -31,7 +31,8 @@ pub use viewport::{
 };
 pub use yu_layout::{
     ClusterMetrics, HeightIndex, HeightIndexError, LayoutCaret, LayoutConfig, LayoutError,
-    LayoutHit, LayoutPoint, LayoutSnapshot, MonospaceMetrics, VisualCluster, VisualLine,
+    LayoutHit, LayoutPoint, LayoutSnapshot, MonospaceMetrics, ShapedText, ShapingProvider,
+    VisualCluster, VisualLine,
 };
 pub use yu_markdown::{Block, BlockKind, MarkdownDocument};
 pub use yu_projection::{
