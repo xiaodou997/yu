@@ -17,6 +17,8 @@ pub const YU_FFI_NO_OVERLAY: i32 = 5;
 pub const YU_FFI_BUFFER_TOO_SMALL: i32 = 6;
 pub const YU_FFI_EDIT_FAILED: i32 = 7;
 pub const YU_FFI_STALE_REVISION: i32 = 8;
+pub const YU_CARET_AFFINITY_UPSTREAM: u8 = 0;
+pub const YU_CARET_AFFINITY_DOWNSTREAM: u8 = 1;
 
 /// Opaque state owned by the Rust side of the native composition bridge.
 #[repr(C)]
@@ -167,12 +169,22 @@ fn selection_from_utf16(start: u64, end: u64) -> Result<Utf16Range, i32> {
     Utf16Range::new(Utf16Offset::new(start), Utf16Offset::new(end)).ok_or(YU_FFI_INVALID_SELECTION)
 }
 
+fn caret_affinity_from_ffi(value: u8) -> Result<CaretAffinity, i32> {
+    match value {
+        YU_CARET_AFFINITY_UPSTREAM => Ok(CaretAffinity::Upstream),
+        YU_CARET_AFFINITY_DOWNSTREAM => Ok(CaretAffinity::Downstream),
+        _ => Err(YU_FFI_INVALID_SELECTION),
+    }
+}
+
 fn editor_selection_from_utf16(
     session: &YuCompositionSession,
     start: u64,
     end: u64,
+    affinity: u8,
 ) -> Result<EditorSelection, i32> {
     let range = selection_from_utf16(start, end)?;
+    let affinity = caret_affinity_from_ffi(affinity)?;
     let snapshot = session.document.snapshot();
     let source_start = snapshot
         .byte_offset_for_utf16(range.start())
@@ -180,13 +192,8 @@ fn editor_selection_from_utf16(
     let source_end = snapshot
         .byte_offset_for_utf16(range.end())
         .map_err(|_| YU_FFI_INVALID_SELECTION)?;
-    EditorSelection::range(
-        &snapshot,
-        source_start,
-        source_end,
-        CaretAffinity::Downstream,
-    )
-    .map_err(|_| YU_FFI_INVALID_SELECTION)
+    EditorSelection::range(&snapshot, source_start, source_end, affinity)
+        .map_err(|_| YU_FFI_INVALID_SELECTION)
 }
 
 /// Creates an opaque composition session for a UTF-8 source buffer.
@@ -386,26 +393,34 @@ pub unsafe extern "C" fn yu_composition_session_revision(
 ///
 /// The returned revision is the revision that owns both endpoints. Native
 /// adapters should compare it with their last source revision before using the
-/// range for a follow-up edit.
+/// range for a follow-up edit. The affinity output uses the
+/// `YU_CARET_AFFINITY_*` constants.
 ///
 /// # Safety
-/// `session` must be null or a live handle. All output pointers must point to
-/// writable storage for one `u64`.
+/// `session` must be null or a live handle. The revision/start/end output
+/// pointers must point to writable storage for one `u64`; affinity output must
+/// point to writable storage for one `u8`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yu_composition_session_selection(
     session: *const YuCompositionSession,
     revision_output: *mut u64,
     start_output: *mut u64,
     end_output: *mut u64,
+    affinity_output: *mut u8,
 ) -> i32 {
     let Some(session) = (unsafe { session.as_ref() }) else {
         return YU_FFI_NULL_POINTER;
     };
-    if revision_output.is_null() || start_output.is_null() || end_output.is_null() {
+    if revision_output.is_null()
+        || start_output.is_null()
+        || end_output.is_null()
+        || affinity_output.is_null()
+    {
         return YU_FFI_NULL_POINTER;
     }
     let snapshot = session.document.snapshot();
-    let range = match session.document.selection().utf16_range(&snapshot) {
+    let selection = session.document.selection();
+    let range = match selection.utf16_range(&snapshot) {
         Ok(range) => range,
         Err(error) => return status_from_selection_error(error),
     };
@@ -414,6 +429,10 @@ pub unsafe extern "C" fn yu_composition_session_selection(
         *revision_output = snapshot.revision().get();
         *start_output = range.start().get();
         *end_output = range.end().get();
+        *affinity_output = match selection.affinity() {
+            CaretAffinity::Upstream => YU_CARET_AFFINITY_UPSTREAM,
+            CaretAffinity::Downstream => YU_CARET_AFFINITY_DOWNSTREAM,
+        };
     }
     YU_FFI_OK
 }
@@ -421,7 +440,8 @@ pub unsafe extern "C" fn yu_composition_session_selection(
 /// Sets the canonical source selection from a revision-bound UTF-16 range.
 ///
 /// The native adapter must provide the revision it used to calculate the
-/// range. A stale revision leaves the current selection unchanged.
+/// range and one of the `YU_CARET_AFFINITY_*` constants. A stale revision or
+/// unknown affinity leaves the current selection unchanged.
 ///
 /// # Safety
 /// `session` must be null or a live handle.
@@ -431,6 +451,7 @@ pub unsafe extern "C" fn yu_composition_session_set_selection(
     expected_revision: u64,
     start_utf16: u64,
     end_utf16: u64,
+    affinity: u8,
 ) -> i32 {
     let Some(session) = (unsafe { session.as_mut() }) else {
         return YU_FFI_NULL_POINTER;
@@ -438,7 +459,7 @@ pub unsafe extern "C" fn yu_composition_session_set_selection(
     if let Err(status) = validate_revision(session, expected_revision) {
         return status;
     }
-    let selection = match editor_selection_from_utf16(session, start_utf16, end_utf16) {
+    let selection = match editor_selection_from_utf16(session, start_utf16, end_utf16, affinity) {
         Ok(selection) => selection,
         Err(status) => return status,
     };
@@ -691,6 +712,7 @@ mod tests {
         let mut selection_revision = 0;
         let mut selection_start = 0;
         let mut selection_end = 0;
+        let mut selection_affinity = 0;
         assert_eq!(
             unsafe {
                 yu_composition_session_selection(
@@ -698,6 +720,7 @@ mod tests {
                     &mut selection_revision,
                     &mut selection_start,
                     &mut selection_end,
+                    &mut selection_affinity,
                 )
             },
             YU_FFI_OK
@@ -705,6 +728,7 @@ mod tests {
         assert_eq!(selection_revision, 1);
         assert_eq!(selection_start, 7);
         assert_eq!(selection_end, 7);
+        assert_eq!(selection_affinity, YU_CARET_AFFINITY_DOWNSTREAM);
 
         unsafe { yu_composition_session_destroy(handle) };
     }
@@ -713,36 +737,61 @@ mod tests {
     fn ffi_set_selection_is_revision_bound_and_rejects_surrogate_splits() {
         let handle = session("a😊羽");
         assert_eq!(
-            unsafe { yu_composition_session_set_selection(handle, 0, 1, 3) },
+            unsafe {
+                yu_composition_session_set_selection(handle, 0, 1, 3, YU_CARET_AFFINITY_UPSTREAM)
+            },
             YU_FFI_OK
         );
 
         let mut revision = 0;
         let mut start = 0;
         let mut end = 0;
+        let mut affinity = YU_CARET_AFFINITY_DOWNSTREAM;
         assert_eq!(
             unsafe {
-                yu_composition_session_selection(handle, &mut revision, &mut start, &mut end)
+                yu_composition_session_selection(
+                    handle,
+                    &mut revision,
+                    &mut start,
+                    &mut end,
+                    &mut affinity,
+                )
             },
             YU_FFI_OK
         );
         assert_eq!((revision, start, end), (0, 1, 3));
+        assert_eq!(affinity, YU_CARET_AFFINITY_UPSTREAM);
 
         assert_eq!(
-            unsafe { yu_composition_session_set_selection(handle, 1, 0, 0) },
+            unsafe {
+                yu_composition_session_set_selection(handle, 1, 0, 0, YU_CARET_AFFINITY_DOWNSTREAM)
+            },
             YU_FFI_STALE_REVISION
         );
         assert_eq!(
-            unsafe { yu_composition_session_set_selection(handle, 0, 2, 2) },
+            unsafe {
+                yu_composition_session_set_selection(handle, 0, 2, 2, YU_CARET_AFFINITY_DOWNSTREAM)
+            },
+            YU_FFI_INVALID_SELECTION
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_set_selection(handle, 0, 1, 3, 99,) },
             YU_FFI_INVALID_SELECTION
         );
         assert_eq!(
             unsafe {
-                yu_composition_session_selection(handle, &mut revision, &mut start, &mut end)
+                yu_composition_session_selection(
+                    handle,
+                    &mut revision,
+                    &mut start,
+                    &mut end,
+                    &mut affinity,
+                )
             },
             YU_FFI_OK
         );
         assert_eq!((revision, start, end), (0, 1, 3));
+        assert_eq!(affinity, YU_CARET_AFFINITY_UPSTREAM);
 
         unsafe { yu_composition_session_destroy(handle) };
     }

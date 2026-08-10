@@ -18,6 +18,11 @@ enum {
     YU_FFI_STALE_REVISION = 8,
 };
 
+enum {
+    YU_CARET_AFFINITY_UPSTREAM = 0,
+    YU_CARET_AFFINITY_DOWNSTREAM = 1,
+};
+
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,
                                    YuCompositionSession **output);
 void yu_composition_session_destroy(YuCompositionSession *session);
@@ -45,11 +50,13 @@ int32_t yu_composition_session_revision(const YuCompositionSession *session,
 int32_t yu_composition_session_selection(const YuCompositionSession *session,
                                          uint64_t *revision_output,
                                          uint64_t *start_output,
-                                         uint64_t *end_output);
+                                         uint64_t *end_output,
+                                         uint8_t *affinity_output);
 int32_t yu_composition_session_set_selection(YuCompositionSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,
-                                             uint64_t end_utf16);
+                                             uint64_t end_utf16,
+                                             uint8_t affinity);
 int32_t yu_composition_session_source_length(const YuCompositionSession *session,
                                              size_t *output);
 int32_t yu_composition_session_copy_source(const YuCompositionSession *session,
