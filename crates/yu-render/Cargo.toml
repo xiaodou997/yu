@@ -1,0 +1,17 @@
+[package]
+name = "yu-render"
+description = "Backend-neutral render plans and glyph atlas upload boundary for Yu Editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-core = { path = "../yu-core" }
+yu-font = { path = "../yu-font" }
+yu-scene = { path = "../yu-scene" }
+
+[lints]
+workspace = true
