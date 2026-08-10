@@ -129,3 +129,7 @@ composition overlay 不推进 source Revision，因此不会触发 projection ca
 会通过 layout/projection mapping 保留严格位于 changed range 外的布局，并在 block range 或
 kind 改变时删除 entry。`LayoutSnapshot::height_index` 暴露 Fenwick prefix index，支持后续
 viewport virtualization 的 O(log n) 高度查询与点更新；当前仍未连接窗口、GPU 或真实字体。
+`yu-editor::ViewportLayout` 在此之上维护每个 Markdown block 的估计/实测高度：viewport 查询
+只测量窗口及 overscan 内的 block，更新 `HeightIndex` 后重新计算可见范围，并返回带 source
+range、kind、y/height 的 `ViewportSnapshot`。前缀 edit 会映射未触碰 block 的估计和实测状态，
+block 结构变化则保守失效；它仍是纯 Rust 的测量/索引层，不是渲染器。

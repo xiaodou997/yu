@@ -12,7 +12,8 @@ use yu_text::{
 use crate::{
     BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
     EditorSelection, LayoutCache, LayoutCacheStats, Projection, ProjectionCache,
-    ProjectionCacheStats, ProjectionError, SelectionError,
+    ProjectionCacheStats, ProjectionError, SelectionError, ViewportConfig, ViewportError,
+    ViewportLayout, ViewportRect, ViewportSnapshot, ViewportStats,
     command::{next_grapheme_boundary, previous_grapheme_boundary},
 };
 
@@ -29,6 +30,7 @@ pub struct EditorDocument {
     selection: EditorSelection,
     projections: ProjectionCache,
     layouts: LayoutCache,
+    viewport: ViewportLayout,
 }
 
 impl EditorDocument {
@@ -51,6 +53,7 @@ impl EditorDocument {
             selection,
             projections: ProjectionCache::default(),
             layouts: LayoutCache::default(),
+            viewport: ViewportLayout::default(),
         }
     }
 
@@ -150,6 +153,65 @@ impl EditorDocument {
         self.layouts.stats()
     }
 
+    /// Replaces the pure Rust viewport policy and drops its block estimates.
+    pub fn set_viewport_config(&mut self, config: ViewportConfig) -> Result<(), ViewportError> {
+        self.viewport = ViewportLayout::new(config)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn viewport_config(&self) -> ViewportConfig {
+        self.viewport.config()
+    }
+
+    #[must_use]
+    pub fn viewport_stats(&self) -> ViewportStats {
+        self.viewport.stats()
+    }
+
+    /// Measures only the estimated/visible block window and returns block
+    /// metadata for a future scene or renderer.
+    pub fn visible_blocks(
+        &mut self,
+        viewport: ViewportRect,
+    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        let mut layout = std::mem::take(&mut self.viewport);
+        let result = self.measure_visible_blocks(&mut layout, viewport);
+        self.viewport = layout;
+        result
+    }
+
+    fn measure_visible_blocks(
+        &mut self,
+        layout: &mut ViewportLayout,
+        viewport: ViewportRect,
+    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        let mut range = layout
+            .visible_range(&self.markdown, viewport)
+            .map_err(EditorDocumentError::Viewport)?;
+        let config = layout.config().layout();
+        for _ in 0..8 {
+            let mut changed = false;
+            for index in range.start()..range.end() {
+                let line_count = self.block_layout(index, config)?.lines().len();
+                let height = config.line_height() * (line_count as f32);
+                changed |= layout
+                    .set_block_height(index, height)
+                    .map_err(EditorDocumentError::Viewport)?;
+            }
+            let next = layout
+                .visible_range(&self.markdown, viewport)
+                .map_err(EditorDocumentError::Viewport)?;
+            if next == range || !changed {
+                break;
+            }
+            range = next;
+        }
+        layout
+            .snapshot(&self.markdown, range)
+            .map_err(EditorDocumentError::Viewport)
+    }
+
     /// Replaces the selection after checking that it belongs to this revision.
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), SelectionError> {
         selection.utf16_range(&self.snapshot())?;
@@ -181,6 +243,13 @@ impl EditorDocument {
         self.layouts
             .map_through(applied.change_set(), applied.result_snapshot())
             .map_err(EditorDocumentError::Layout)?;
+        self.viewport
+            .map_through(
+                applied.change_set(),
+                applied.result_snapshot(),
+                incremental.document(),
+            )
+            .map_err(EditorDocumentError::Viewport)?;
         self.projections.retain_blocks(incremental.document());
         self.layouts.retain_blocks(incremental.document());
         self.markdown = incremental.into_document();
@@ -273,6 +342,7 @@ impl EditorDocument {
         self.markdown = yu_markdown::parse(&self.buffer.snapshot());
         self.projections.clear();
         self.layouts.clear();
+        self.viewport.clear();
         let snapshot = self.snapshot();
         self.selection = EditorSelection::cursor(
             &snapshot,
@@ -398,6 +468,7 @@ pub enum EditorDocumentError {
     Position(TextPositionError),
     Projection(ProjectionError),
     Selection(SelectionError),
+    Viewport(ViewportError),
     BlockOutOfBounds { index: usize, blocks: usize },
     CompositionNotActive,
     CompositionActive,
@@ -413,6 +484,7 @@ impl fmt::Display for EditorDocumentError {
             Self::Position(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
             Self::Selection(error) => error.fmt(formatter),
+            Self::Viewport(error) => error.fmt(formatter),
             Self::BlockOutOfBounds { index, blocks } => {
                 write!(
                     formatter,
@@ -435,6 +507,7 @@ impl Error for EditorDocumentError {
             Self::Position(error) => Some(error),
             Self::Projection(error) => Some(error),
             Self::Selection(error) => Some(error),
+            Self::Viewport(error) => Some(error),
             Self::BlockOutOfBounds { .. }
             | Self::CompositionNotActive
             | Self::CompositionActive => None,
@@ -463,6 +536,12 @@ impl From<IncrementalParseError> for EditorDocumentError {
 impl From<LayoutError> for EditorDocumentError {
     fn from(error: LayoutError) -> Self {
         Self::Layout(error)
+    }
+}
+
+impl From<ViewportError> for EditorDocumentError {
+    fn from(error: ViewportError) -> Self {
+        Self::Viewport(error)
     }
 }
 
@@ -857,6 +936,86 @@ mod tests {
             .apply_transaction(&transaction)
             .expect("heading edit should apply");
         assert_eq!(document.layout_cache_stats().entries(), 0);
+    }
+
+    #[test]
+    fn viewport_measures_only_the_requested_window_and_reuses_layouts() {
+        let mut document = EditorDocument::new("a\n\nb\n\nc\n\nd\n\ne\n\nf\n\ng");
+        document
+            .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
+            .expect("viewport config should be valid");
+        let first = document
+            .visible_blocks(ViewportRect::new(0.0, 0.5))
+            .expect("first viewport should measure");
+        assert_eq!(first.revision(), document.revision());
+        assert_eq!(first.blocks().len(), 1);
+        assert_eq!(first.blocks()[0].index(), 0);
+        assert!(first.blocks()[0].is_measured());
+        assert!(document.viewport_stats().measured() < document.markdown().blocks().len());
+        assert_eq!(document.layout_cache_stats().builds(), 1);
+
+        document
+            .visible_blocks(ViewportRect::new(0.0, 0.5))
+            .expect("repeated viewport should hit layout cache");
+        assert_eq!(document.layout_cache_stats().builds(), 1);
+        assert!(document.layout_cache_stats().hits() >= 1);
+
+        let last = document
+            .visible_blocks(ViewportRect::new(100.0, 0.5))
+            .expect("far viewport should measure only its block");
+        assert!(last.blocks().iter().all(|block| block.index() > 0));
+        assert!(document.layout_cache_stats().builds() < document.markdown().blocks().len() as u64);
+    }
+
+    #[test]
+    fn viewport_preserves_unaffected_measurements_through_prefix_edits() {
+        let mut document = EditorDocument::new("a\n\nb\n\nc\n\nd");
+        document
+            .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
+            .expect("viewport config should be valid");
+        document
+            .visible_blocks(ViewportRect::new(100.0, 0.5))
+            .expect("last block should be measured");
+        let measured_before = document.viewport_stats().measured();
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("prefix edit should apply");
+
+        assert!(document.viewport_stats().remapped() >= 1);
+        assert_eq!(document.viewport_stats().measured(), measured_before);
+        let visible = document
+            .visible_blocks(ViewportRect::new(100.0, 0.5))
+            .expect("mapped viewport should remain queryable");
+        assert_eq!(visible.revision(), document.revision());
+        assert!(visible.blocks().iter().all(|block| block.index() > 0));
+    }
+
+    #[test]
+    fn viewport_invalidates_a_block_when_its_kind_changes() {
+        let mut document = EditorDocument::new("paragraph\n\nother");
+        document
+            .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
+            .expect("viewport config should be valid");
+        document
+            .visible_blocks(ViewportRect::new(0.0, 0.5))
+            .expect("first block should be measured");
+        let invalidated_before = document.viewport_stats().invalidated();
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "# ")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("heading edit should apply");
+        assert!(document.viewport_stats().invalidated() > invalidated_before);
+        let visible = document
+            .visible_blocks(ViewportRect::new(0.0, 0.5))
+            .expect("new heading block should be queryable");
+        assert_eq!(visible.revision(), document.revision());
     }
 
     #[test]

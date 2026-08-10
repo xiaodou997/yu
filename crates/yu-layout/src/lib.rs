@@ -146,6 +146,15 @@ pub struct HeightIndex {
     tree: Vec<f32>,
 }
 
+impl Default for HeightIndex {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            tree: vec![0.0],
+        }
+    }
+}
+
 impl HeightIndex {
     pub fn new(heights: impl IntoIterator<Item = f32>) -> Result<Self, HeightIndexError> {
         let values = heights.into_iter().collect::<Vec<_>>();

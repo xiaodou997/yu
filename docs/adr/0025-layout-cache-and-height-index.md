@@ -43,4 +43,5 @@ virtualization 的索引基础，不负责布局、窗口或 GPU。
 
 当前 cache 的 retention 是 block 数量上的线性扫描，layout snapshot 仍是 block-local，
 `HeightIndex` 默认由 snapshot 的统一 line height 构建；真实字体 shaping、变量行高、跨 block
-虚拟化和 GPU scene 仍属于后续阶段。
+虚拟化和 GPU scene 仍属于后续阶段。跨 block 的估计/实测状态和 viewport 迭代规则由 ADR 0026
+定义。

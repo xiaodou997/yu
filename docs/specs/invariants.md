@@ -97,3 +97,6 @@
    `BlockKind` 和 `LayoutConfig`；strictly-outside edit 可映射，交集或 block 结构变化必须失效。
 6. `HeightIndex` 只索引已经产生的视觉行高，不得隐式触发全文 layout；prefix、point update 和
    viewport line lookup 必须保持与原始 height values 一致。
+7. `ViewportLayout` 的未测量 block 必须使用显式 estimate；一次 viewport 查询不得为了定位
+   可见窗口而隐式 layout 全部 block，返回的 block y/height 和 source range 必须来自同一
+   Revision。

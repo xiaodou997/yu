@@ -51,6 +51,7 @@
 - [x] fenced code 独立 source-backed projection 协议与缓存映射
 - [x] block-local `yu-layout` snapshot、grapheme cluster wrapping 与 hit-test contract
 - [x] `EditorDocument::block_layout` revision-bound integration
+- [x] 纯 Rust `ViewportLayout` 的 block 高度估计、可见窗口测量与增量失效
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -86,6 +87,8 @@
 15. `LayoutCache` 对同一 revision/config 命中；strictly-outside edit 能映射 source ranges，
     block range/kind 改变会失效；`HeightIndex` 提供可测试的 O(log n) prefix/update/lookup，
     但不引入窗口或 GPU。
+16. `ViewportLayout` 只能测量 viewport/overscan 选择的 block；未测量 block 使用显式估计，
+    block source range/kind 变化必须失效，返回的 `ViewportSnapshot` 必须绑定当前 Revision。
 
 ## 非目标
 
