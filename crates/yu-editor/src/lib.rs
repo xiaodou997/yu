@@ -10,6 +10,7 @@ mod document;
 mod layout;
 mod projection;
 mod selection;
+mod viewport;
 
 pub use accessibility::{
     AccessibilityTextError, AccessibilityTextPosition, AccessibilityTextRange,
@@ -24,6 +25,10 @@ pub use document::{EditorDocument, EditorDocumentError};
 pub use layout::{LayoutCache, LayoutCacheStats};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
+pub use viewport::{
+    ViewportBlock, ViewportConfig, ViewportError, ViewportLayout, ViewportRange, ViewportRect,
+    ViewportSnapshot, ViewportStats,
+};
 pub use yu_layout::{
     ClusterMetrics, HeightIndex, HeightIndexError, LayoutCaret, LayoutConfig, LayoutError,
     LayoutHit, LayoutPoint, LayoutSnapshot, MonospaceMetrics, VisualCluster, VisualLine,
