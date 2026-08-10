@@ -24,6 +24,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-editor-ffi"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
+ "yu-editor",
+ "yu-text",
+]
+
+[[package]]
 name = "yu-inspect"
 version = "0.1.0"
 dependencies = [

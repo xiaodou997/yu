@@ -40,6 +40,7 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 ```text
 crates/yu-core          坐标、范围、Revision、Anchor
 crates/yu-editor        CompositionOverlay 和平台无关编辑状态
+crates/yu-editor-ffi    原生平台调用的 CompositionOverlay C ABI static library
 crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
 crates/yu-markdown      第一阶段 lossless block scanner
 tools/yu-inspect        Markdown 结构检查 CLI
@@ -68,8 +69,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p yu-inspect -- README.md
 cargo run --release -p yu-bench -- --size-mib 1 --iterations 20 --random-edits 2000 --retained-snapshots 8
+experiments/macos-text-input/build-rust-ffi.sh
 swift build --package-path experiments/macos-text-input
 ```
+
+macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust static library；因此必须
+先运行 `build-rust-ffi.sh`，或直接使用会自动执行它的 `build-app.sh`。构建产物位于被忽略的
+`experiments/macos-text-input/.rust/`，不会提交到仓库。
 
 ## 文档
 
@@ -83,6 +89,7 @@ swift build --package-path experiments/macos-text-input
 - [Architecture Decision Records](docs/adr/)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
+- [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
 - [文本存储候选对比](docs/experiments/storage-candidates-2026-08-09.md)
 - [增量 Markdown 实验](docs/experiments/incremental-markdown-2026-08-09.md)
 

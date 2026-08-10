@@ -38,6 +38,10 @@
 3. OS 查询的 selection、surrounding text 和 caret rect 必须来自一致的编辑状态。
 4. Source Anchor affinity 与 visual caret affinity 是两个独立语义。
 5. 软换行处的 hit test 必须保留 upstream/downstream，不能只返回裸文本 offset。
+6. 原生平台与 Rust composition core 的 FFI 只传递 pointer+length 的 UTF-8 buffer 和 UTF-16
+   range；Rust-owned buffer、overlay 或 Snapshot 指针不得逃逸到平台层。
+7. FFI 函数必须返回明确 status code，不能让 panic、未对齐的 UTF-8 或 surrogate 中间位置
+   穿过 ABI；commit 成功后最多推进一次 Revision，cancel 不推进 Revision。
 
 ## Accessibility
 

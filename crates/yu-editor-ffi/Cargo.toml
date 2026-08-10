@@ -1,0 +1,20 @@
+[package]
+name = "yu-editor-ffi"
+description = "C ABI bridge from native platform shells to Yu editor composition state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+yu-editor = { path = "../yu-editor" }
+yu-core = { path = "../yu-core" }
+yu-text = { path = "../yu-text" }
+
+[lints]
+workspace = true

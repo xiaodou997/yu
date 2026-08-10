@@ -15,6 +15,7 @@
 构建：
 
 ```bash
+experiments/macos-text-input/build-rust-ffi.sh
 swift build --package-path experiments/macos-text-input
 ```
 
@@ -24,6 +25,9 @@ swift build --package-path experiments/macos-text-input
 experiments/macos-text-input/build-app.sh
 open experiments/macos-text-input/.build/YuMacTextInputSpike.app
 ```
+
+`build-rust-ffi.sh` 会先构建 `yu-editor-ffi` static library；Swift target 通过 C header 调用
+Rust composition session。直接使用 `swift build` 前需要先运行该脚本，`build-app.sh` 会自动执行。
 
 手工运行：
 

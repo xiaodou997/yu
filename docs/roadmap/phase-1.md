@@ -33,6 +33,7 @@
 - [ ] 人工验证日文、dead key 与组合重音
 - [x] 日文、组合重音与 cancel 的 NSTextInputClient 协议回放
 - [x] 将实验事件转换为 Rust `CompositionOverlay` 协议
+- [x] 通过 C ABI static library 完成 Swift ↔ Rust `CompositionOverlay` smoke test
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
