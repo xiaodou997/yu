@@ -41,13 +41,10 @@ Parser equivalence              native event loop
 yu-core
    ▲
    │
-yu-text ◄──── yu-editor ◄──── yu-editor-ffi
-   ▲             ▲                  ▲
-   │             │                  │
-yu-markdown ◄── yu-inspect     macOS/Swift shell
-      │
-      ▼
-yu-projection
+yu-text ◄── yu-markdown ◄── yu-projection ◄── yu-editor ◄── yu-editor-ffi
+   ▲             ▲                                 ▲              ▲
+   │             │                                 │              │
+yu-core      yu-inspect                      ProjectionCache   macOS/Swift shell
 ```
 
 后续预计增加：
@@ -113,3 +110,7 @@ UTF-16 boundary/affinity。这样 AppKit 的原生 selection 与 caret affinity 
 它通过 `yu-markdown::parse_inline` 获取 parser-owned `InlineDocument`，不再在 projection 内
 维护另一套 delimiter scanner；当前 token layer 和 pairing 仍是保守风险验证，正式 inline CST
 扩展后继续复用同一个 source/visual mapping 边界。
+
+`yu-editor::EditorDocument` 拥有 revision-bound `ProjectionCache`：同一 Revision/range 查询命中
+缓存，永久 edit 会映射严格位于 changed range 外的 projection，并保守地使相交或边界 projection
+失效。composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。

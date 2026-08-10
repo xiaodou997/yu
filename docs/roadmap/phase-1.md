@@ -44,6 +44,7 @@
 - [x] FFI selection mutation/query 保留 upstream/downstream CaretAffinity
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
+- [x] `yu-editor` revision-bound `ProjectionCache` 的命中、映射与失效规则
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -67,6 +68,8 @@
    caret mapping 在 Before/After bias 下可重复。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
+11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可
+    映射并复用，intersecting/boundary edit 会失效，reset 会清空。
 
 ## 非目标
 

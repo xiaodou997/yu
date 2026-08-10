@@ -76,3 +76,5 @@
    隐式取整。
 4. Projection 的 hidden ranges 必须来自 parser-owned inline nodes；projection 不得重新扫描
    同一 source revision 来产生另一份语法边界。
+5. `ProjectionCache` entry 必须绑定当前 source Revision；严格位于 entry range 外的 edit 可以
+   通过 ChangeSet 映射，触及 range 或边界的 edit 必须失效，source reset 必须清空 cache。

@@ -10,11 +10,11 @@
 
 use std::error::Error;
 use std::fmt;
-use yu_core::{ByteOffset, TextRange};
+use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 use yu_markdown::{
     InlineDelimiter, InlineDocument, InlineNodeKind, InlineParseError, parse_inline,
 };
-use yu_text::{TextPositionError, TextSnapshot};
+use yu_text::{AnchorMapError, ChangeSet, TextChange, TextPositionError, TextSnapshot};
 
 /// An offset in the projected UTF-8 visual stream.
 ///
@@ -151,6 +151,15 @@ pub enum ProjectionBias {
 pub enum ProjectionError {
     SourcePosition(TextPositionError),
     InlineParse(InlineParseError),
+    AnchorMap(AnchorMapError),
+    BeforeRevisionMismatch {
+        expected: Revision,
+        actual: Revision,
+    },
+    AfterRevisionMismatch {
+        expected: Revision,
+        actual: Revision,
+    },
     SourceOutsideRange {
         offset: ByteOffset,
         range: TextRange,
@@ -167,6 +176,15 @@ impl fmt::Display for ProjectionError {
         match self {
             Self::SourcePosition(error) => error.fmt(formatter),
             Self::InlineParse(error) => error.fmt(formatter),
+            Self::AnchorMap(error) => error.fmt(formatter),
+            Self::BeforeRevisionMismatch { expected, actual } => write!(
+                formatter,
+                "projection revision {actual:?} does not match change-set input {expected:?}"
+            ),
+            Self::AfterRevisionMismatch { expected, actual } => write!(
+                formatter,
+                "projection target revision {expected:?} does not match snapshot {actual:?}"
+            ),
             Self::SourceOutsideRange { offset, range } => {
                 write!(
                     formatter,
@@ -189,7 +207,10 @@ impl Error for ProjectionError {
         match self {
             Self::SourcePosition(error) => Some(error),
             Self::InlineParse(error) => Some(error),
+            Self::AnchorMap(error) => Some(error),
             Self::SourceOutsideRange { .. }
+            | Self::BeforeRevisionMismatch { .. }
+            | Self::AfterRevisionMismatch { .. }
             | Self::VisualOutOfBounds { .. }
             | Self::OffsetOverflow => None,
         }
@@ -205,6 +226,12 @@ impl From<TextPositionError> for ProjectionError {
 impl From<InlineParseError> for ProjectionError {
     fn from(error: InlineParseError) -> Self {
         Self::InlineParse(error)
+    }
+}
+
+impl From<AnchorMapError> for ProjectionError {
+    fn from(error: AnchorMapError) -> Self {
+        Self::AnchorMap(error)
     }
 }
 
@@ -249,6 +276,57 @@ impl Projection {
             runs,
             visual_len,
         })
+    }
+
+    /// Carries an unchanged projection through an edit that is strictly
+    /// outside its source range.
+    ///
+    /// `None` means that an edit touched the range or one of its boundaries;
+    /// the caller must parse a fresh inline token stream in that case. Runs
+    /// retain their visual offsets while source ranges are mapped through the
+    /// change set, so a prefix insertion does not force a reparse.
+    pub fn map_through(
+        &self,
+        changes: &ChangeSet,
+        snapshot: &TextSnapshot,
+    ) -> Result<Option<Self>, ProjectionError> {
+        if self.revision() != changes.before() {
+            return Err(ProjectionError::BeforeRevisionMismatch {
+                expected: changes.before(),
+                actual: self.revision(),
+            });
+        }
+        if snapshot.revision() != changes.after() {
+            return Err(ProjectionError::AfterRevisionMismatch {
+                expected: changes.after(),
+                actual: snapshot.revision(),
+            });
+        }
+        if changes
+            .changes()
+            .iter()
+            .any(|change| change_affects_range(*change, self.source_range))
+        {
+            return Ok(None);
+        }
+
+        let source_range = map_range(self.source_range, changes)?;
+        let mut runs = Vec::with_capacity(self.runs.len());
+        for run in &self.runs {
+            runs.push(VisualRun {
+                source: map_range(run.source, changes)?,
+                visual: run.visual,
+                kind: run.kind,
+            });
+        }
+        snapshot.utf16_offset(source_range.start())?;
+        snapshot.utf16_offset(source_range.end())?;
+        Ok(Some(Self {
+            source: snapshot.clone(),
+            source_range,
+            runs,
+            visual_len: self.visual_len,
+        }))
     }
 
     #[must_use]
@@ -382,6 +460,29 @@ impl Projection {
         }
         Ok(())
     }
+}
+
+fn change_affects_range(change: TextChange, range: TextRange) -> bool {
+    let old = change.old_range();
+    old.start() <= range.end() && old.end() >= range.start()
+}
+
+fn map_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, ProjectionError> {
+    let start = changes
+        .map_anchor(TextAnchor::new(
+            changes.before(),
+            range.start(),
+            Affinity::Before,
+        ))?
+        .offset();
+    let end = changes
+        .map_anchor(TextAnchor::new(
+            changes.before(),
+            range.end(),
+            Affinity::After,
+        ))?
+        .offset();
+    TextRange::new(start, end).ok_or(ProjectionError::OffsetOverflow)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -546,7 +647,7 @@ fn byte_range(start: usize, end: usize) -> Result<TextRange, ProjectionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_text::{StorageBackend, TextBuffer, retained_snapshot_stats};
+    use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
 
     fn projection(source: &str) -> Projection {
         let buffer = TextBuffer::new(source);
@@ -670,6 +771,93 @@ mod tests {
         assert_eq!(
             retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers(),
             0
+        );
+    }
+
+    #[test]
+    fn projection_maps_through_prefix_edit_without_reparsing() {
+        let source = "prefix **羽🙂** suffix";
+        let mut buffer = TextBuffer::with_backend(source, StorageBackend::PieceTree);
+        let snapshot = buffer.snapshot();
+        let start = source.find("**").expect("strong delimiter should exist");
+        let end = start + "**羽🙂**".len();
+        let range = TextRange::new(ByteOffset::new(start as u64), ByteOffset::new(end as u64))
+            .expect("projection range should be ordered");
+        let projection = Projection::inline(&snapshot, range).expect("projection should build");
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("prefix edit should apply");
+
+        let mapped = projection
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .expect("unchanged projection should map")
+            .expect("prefix edit must not invalidate the range");
+        let shifted = TextRange::new(
+            ByteOffset::new((start + "前".len()) as u64),
+            ByteOffset::new((end + "前".len()) as u64),
+        )
+        .expect("shifted range should be ordered");
+        assert_eq!(mapped.source_range(), shifted);
+        assert_eq!(mapped.visual_len(), projection.visual_len());
+        assert_eq!(mapped.revision(), applied.result_snapshot().revision());
+        assert_eq!(
+            mapped
+                .visual_to_source(VisualOffset::new(0), ProjectionBias::After)
+                .expect("mapped visual boundary should resolve"),
+            ByteOffset::new((start + "前".len() + 2) as u64)
+        );
+    }
+
+    #[test]
+    fn projection_is_invalidated_by_inside_or_boundary_edits() {
+        let source = "prefix **羽🙂** suffix";
+        let mut buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let start = source.find("**").expect("strong delimiter should exist");
+        let end = start + "**羽🙂**".len();
+        let range = TextRange::new(ByteOffset::new(start as u64), ByteOffset::new(end as u64))
+            .expect("projection range should be ordered");
+        let projection = Projection::inline(&snapshot, range).expect("projection should build");
+
+        let inside = Transaction::new(
+            buffer.revision(),
+            [Edit::new(
+                TextRange::empty(ByteOffset::new((start + 2) as u64)),
+                "x",
+            )],
+        );
+        let applied = buffer.apply(&inside).expect("inside edit should apply");
+        assert!(
+            projection
+                .map_through(applied.change_set(), applied.result_snapshot())
+                .expect("revision-bound map should succeed")
+                .is_none()
+        );
+
+        let shifted_range = TextRange::new(
+            ByteOffset::new(start as u64),
+            ByteOffset::new((end + 1) as u64),
+        )
+        .expect("shifted projection range should be ordered");
+        let boundary_projection = Projection::inline(applied.result_snapshot(), shifted_range)
+            .expect("shifted projection should build");
+        let boundary = Transaction::new(
+            buffer.revision(),
+            [Edit::new(
+                TextRange::empty(ByteOffset::new((end + 1) as u64)),
+                "x",
+            )],
+        );
+        let applied = buffer.apply(&boundary).expect("boundary edit should apply");
+        assert!(
+            boundary_projection
+                .map_through(applied.change_set(), applied.result_snapshot())
+                .expect("revision-bound map should succeed")
+                .is_none()
         );
     }
 

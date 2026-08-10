@@ -7,6 +7,7 @@ mod caret;
 mod command;
 mod composition;
 mod document;
+mod projection;
 mod selection;
 
 pub use accessibility::{
@@ -19,4 +20,9 @@ pub use caret::{
 pub use command::{CommandResult, EditorCommand};
 pub use composition::{CompositionError, CompositionOverlay};
 pub use document::{EditorDocument, EditorDocumentError};
+pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
+pub use yu_projection::{
+    Projection, ProjectionBias, ProjectionError, VisualOffset, VisualRange, VisualRun,
+    VisualRunKind,
+};

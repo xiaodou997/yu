@@ -9,7 +9,7 @@ use yu_text::{
 
 use crate::{
     CommandResult, CompositionError, CompositionOverlay, EditorCommand, EditorSelection,
-    SelectionError,
+    Projection, ProjectionCache, ProjectionCacheStats, ProjectionError, SelectionError,
     command::{next_grapheme_boundary, previous_grapheme_boundary},
 };
 
@@ -23,6 +23,7 @@ pub struct EditorDocument {
     buffer: TextBuffer,
     composition: Option<CompositionOverlay>,
     selection: EditorSelection,
+    projections: ProjectionCache,
 }
 
 impl EditorDocument {
@@ -41,6 +42,7 @@ impl EditorDocument {
             buffer,
             composition: None,
             selection,
+            projections: ProjectionCache::default(),
         }
     }
 
@@ -68,6 +70,20 @@ impl EditorDocument {
         self.selection
     }
 
+    /// Returns the source-backed projection for a range in the current
+    /// revision, building it on first use and reusing it on later queries.
+    pub fn projection(&mut self, range: TextRange) -> Result<&Projection, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        self.projections
+            .get_or_build(&snapshot, range)
+            .map_err(EditorDocumentError::Projection)
+    }
+
+    #[must_use]
+    pub fn projection_cache_stats(&self) -> ProjectionCacheStats {
+        self.projections.stats()
+    }
+
     /// Replaces the selection after checking that it belongs to this revision.
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), SelectionError> {
         selection.utf16_range(&self.snapshot())?;
@@ -88,6 +104,9 @@ impl EditorDocument {
         self.selection = self
             .selection
             .map_through(applied.change_set(), applied.result_snapshot())?;
+        self.projections
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .map_err(EditorDocumentError::Projection)?;
         Ok(applied)
     }
 
@@ -174,6 +193,7 @@ impl EditorDocument {
             return Err(EditorDocumentError::CompositionActive);
         }
         self.buffer = TextBuffer::new(source);
+        self.projections.clear();
         let snapshot = self.snapshot();
         self.selection = EditorSelection::cursor(
             &snapshot,
@@ -295,6 +315,7 @@ pub enum EditorDocumentError {
     Composition(CompositionError),
     Edit(EditError),
     Position(TextPositionError),
+    Projection(ProjectionError),
     Selection(SelectionError),
     CompositionNotActive,
     CompositionActive,
@@ -306,6 +327,7 @@ impl fmt::Display for EditorDocumentError {
             Self::Composition(error) => error.fmt(formatter),
             Self::Edit(error) => error.fmt(formatter),
             Self::Position(error) => error.fmt(formatter),
+            Self::Projection(error) => error.fmt(formatter),
             Self::Selection(error) => error.fmt(formatter),
             Self::CompositionNotActive => formatter.write_str("no active composition"),
             Self::CompositionActive => formatter.write_str("composition is already active"),
@@ -319,6 +341,7 @@ impl Error for EditorDocumentError {
             Self::Composition(error) => Some(error),
             Self::Edit(error) => Some(error),
             Self::Position(error) => Some(error),
+            Self::Projection(error) => Some(error),
             Self::Selection(error) => Some(error),
             Self::CompositionNotActive | Self::CompositionActive => None,
         }
@@ -340,6 +363,12 @@ impl From<EditError> for EditorDocumentError {
 impl From<TextPositionError> for EditorDocumentError {
     fn from(error: TextPositionError) -> Self {
         Self::Position(error)
+    }
+}
+
+impl From<ProjectionError> for EditorDocumentError {
+    fn from(error: ProjectionError) -> Self {
+        Self::Projection(error)
     }
 }
 
@@ -451,6 +480,89 @@ mod tests {
             .expect("external transaction should apply");
         assert_eq!(document.revision(), Revision::new(1));
         assert_eq!(document.selection().focus().get(), "羽a".len() as u64);
+    }
+
+    #[test]
+    fn projection_cache_reuses_and_remaps_unaffected_ranges() {
+        let source = "prefix **羽🙂** suffix";
+        let mut document = EditorDocument::new(source);
+        let start = source.find("**").expect("strong delimiter should exist");
+        let end = start + "**羽🙂**".len();
+        let range = source_range(start as u64, end as u64);
+
+        {
+            let projection = document.projection(range).expect("projection should build");
+            assert_eq!(projection.visual_len().get(), "羽🙂".len() as u64);
+        }
+        {
+            let projection = document
+                .projection(range)
+                .expect("projection should be cached");
+            assert_eq!(projection.revision(), document.revision());
+        }
+        let stats = document.projection_cache_stats();
+        assert_eq!(stats.entries(), 1);
+        assert_eq!(stats.builds(), 1);
+        assert_eq!(stats.hits(), 1);
+
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("prefix edit should apply");
+        let shifted = source_range((start + "前".len()) as u64, (end + "前".len()) as u64);
+        let projection = document
+            .projection(shifted)
+            .expect("unaffected projection should be remapped");
+        assert_eq!(projection.visual_len().get(), "羽🙂".len() as u64);
+        let stats = document.projection_cache_stats();
+        assert_eq!(stats.remapped(), 1);
+        assert_eq!(stats.builds(), 1);
+        assert_eq!(stats.entries(), 1);
+    }
+
+    #[test]
+    fn projection_cache_invalidates_intersecting_ranges() {
+        let source = "prefix **羽🙂** suffix";
+        let mut document = EditorDocument::new(source);
+        let start = source.find("**").expect("strong delimiter should exist");
+        let end = start + "**羽🙂**".len();
+        let range = source_range(start as u64, end as u64);
+        document.projection(range).expect("projection should build");
+
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(
+                TextRange::empty(ByteOffset::new((start + 2) as u64)),
+                "x",
+            )],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("inside edit should apply");
+        let stats = document.projection_cache_stats();
+        assert_eq!(stats.entries(), 0);
+        assert_eq!(stats.invalidated(), 1);
+
+        document
+            .projection(range)
+            .expect("projection should rebuild for the new revision");
+        assert_eq!(document.projection_cache_stats().builds(), 2);
+    }
+
+    #[test]
+    fn projection_query_rejects_non_utf8_source_boundaries() {
+        let mut document = EditorDocument::new("羽");
+        let invalid = source_range(1, 3);
+        assert!(matches!(
+            document.projection(invalid),
+            Err(EditorDocumentError::Projection(
+                ProjectionError::InlineParse(_)
+            ))
+        ));
+        assert_eq!(document.projection_cache_stats().entries(), 0);
     }
 
     #[test]
