@@ -35,6 +35,55 @@ pub enum InlineNodeKind {
     Delimiter { marker: InlineDelimiter },
 }
 
+/// A semantic inline span recognized from a matched delimiter pair.
+///
+/// The span keeps every source range needed by projection and editing. It does
+/// not own or normalize the text, and unmatched delimiters intentionally do
+/// not produce a span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InlineSpanKind {
+    Emphasis,
+    Strong,
+    CodeSpan,
+}
+
+/// Source ranges for one parser-owned semantic inline span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InlineSpan {
+    kind: InlineSpanKind,
+    source_range: TextRange,
+    opening: TextRange,
+    content: TextRange,
+    closing: TextRange,
+}
+
+impl InlineSpan {
+    #[must_use]
+    pub const fn kind(self) -> InlineSpanKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn source_range(self) -> TextRange {
+        self.source_range
+    }
+
+    #[must_use]
+    pub const fn opening(self) -> TextRange {
+        self.opening
+    }
+
+    #[must_use]
+    pub const fn content(self) -> TextRange {
+        self.content
+    }
+
+    #[must_use]
+    pub const fn closing(self) -> TextRange {
+        self.closing
+    }
+}
+
 /// A source-backed inline token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InlineNode {
@@ -91,6 +140,7 @@ pub struct InlineDocument {
     source: TextSnapshot,
     source_range: TextRange,
     nodes: Vec<InlineNode>,
+    spans: Vec<InlineSpan>,
 }
 
 impl InlineDocument {
@@ -112,6 +162,12 @@ impl InlineDocument {
     #[must_use]
     pub fn nodes(&self) -> &[InlineNode] {
         &self.nodes
+    }
+
+    /// Returns parser-owned semantic spans in source order.
+    #[must_use]
+    pub fn spans(&self) -> &[InlineSpan] {
+        &self.spans
     }
 
     /// Confirms that the ordered token ranges cover this source range exactly.
@@ -183,10 +239,13 @@ pub fn parse_inline(
         usize::try_from(source_range.end()).map_err(|_| InlineParseError::OffsetOverflow)?,
     )?;
 
+    let spans = build_spans(&nodes)?;
+
     Ok(InlineDocument {
         source: source.clone(),
         source_range,
         nodes,
+        spans,
     })
 }
 
@@ -243,6 +302,113 @@ fn byte_range(start: usize, end: usize) -> Result<TextRange, InlineParseError> {
     let start = ByteOffset::try_from(start).map_err(|_| InlineParseError::OffsetOverflow)?;
     let end = ByteOffset::try_from(end).map_err(|_| InlineParseError::OffsetOverflow)?;
     TextRange::new(start, end).ok_or(InlineParseError::OffsetOverflow)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Delimiter {
+    marker: InlineDelimiter,
+    len: usize,
+    range: TextRange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DelimiterPair {
+    opening: Delimiter,
+    closing: Delimiter,
+}
+
+fn build_spans(nodes: &[InlineNode]) -> Result<Vec<InlineSpan>, InlineParseError> {
+    let delimiters = nodes
+        .iter()
+        .filter_map(|node| match node.kind() {
+            InlineNodeKind::Delimiter { marker } => Some((marker, node.range())),
+            InlineNodeKind::Text | InlineNodeKind::Escaped => None,
+        })
+        .map(|(marker, range)| {
+            Ok(Delimiter {
+                marker,
+                len: usize::try_from(range.len()).map_err(|_| InlineParseError::OffsetOverflow)?,
+                range,
+            })
+        })
+        .collect::<Result<Vec<_>, InlineParseError>>()?;
+
+    let code_pairs = pair_delimiters(&delimiters, InlineDelimiter::Code);
+    let mut spans = code_pairs
+        .iter()
+        .map(|pair| make_span(*pair, InlineSpanKind::CodeSpan))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let inline_delimiters = delimiters
+        .iter()
+        .copied()
+        .filter(|delimiter| delimiter.marker != InlineDelimiter::Code)
+        .filter(|delimiter| {
+            !code_pairs.iter().any(|code| {
+                code.opening.range.start() < delimiter.range.start()
+                    && delimiter.range.end() < code.closing.range.end()
+            })
+        })
+        .collect::<Vec<_>>();
+    for marker in [InlineDelimiter::Star, InlineDelimiter::Underscore] {
+        for pair in pair_delimiters(&inline_delimiters, marker) {
+            let kind = match pair.opening.len {
+                1 => InlineSpanKind::Emphasis,
+                2 => InlineSpanKind::Strong,
+                _ => continue,
+            };
+            spans.push(make_span(pair, kind)?);
+        }
+    }
+
+    spans.sort_by_key(|span| {
+        (
+            span.source_range.start(),
+            span.source_range.end(),
+            span.kind as u8,
+        )
+    });
+    Ok(spans)
+}
+
+fn make_span(pair: DelimiterPair, kind: InlineSpanKind) -> Result<InlineSpan, InlineParseError> {
+    let source_range = TextRange::new(pair.opening.range.start(), pair.closing.range.end())
+        .ok_or(InlineParseError::OffsetOverflow)?;
+    let content = TextRange::new(pair.opening.range.end(), pair.closing.range.start())
+        .ok_or(InlineParseError::OffsetOverflow)?;
+    Ok(InlineSpan {
+        kind,
+        source_range,
+        opening: pair.opening.range,
+        content,
+        closing: pair.closing.range,
+    })
+}
+
+fn pair_delimiters(delimiters: &[Delimiter], marker: InlineDelimiter) -> Vec<DelimiterPair> {
+    let mut openings = Vec::new();
+    let mut pairs = Vec::new();
+    for delimiter in delimiters
+        .iter()
+        .copied()
+        .filter(|item| item.marker == marker)
+    {
+        if let Some(opening_index) = openings
+            .iter()
+            .rposition(|opening: &Delimiter| opening.len == delimiter.len)
+        {
+            let opening = openings.remove(opening_index);
+            if opening.range.end() < delimiter.range.start() {
+                pairs.push(DelimiterPair {
+                    opening,
+                    closing: delimiter,
+                });
+                continue;
+            }
+        }
+        openings.push(delimiter);
+    }
+    pairs
 }
 
 struct InlineByteCursor<'a> {
@@ -365,5 +531,54 @@ mod tests {
                 TextPositionError::NotUtf8Boundary(_)
             ))
         ));
+    }
+
+    #[test]
+    fn semantic_spans_are_parser_owned_and_preserve_ranges() {
+        let source = "**strong** _emphasis_ `code *` *unmatched";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = parse_inline(&snapshot, range).expect("inline parse should succeed");
+
+        assert_eq!(inline.spans().len(), 3);
+        assert_eq!(inline.spans()[0].kind(), InlineSpanKind::Strong);
+        assert_eq!(inline.spans()[1].kind(), InlineSpanKind::Emphasis);
+        assert_eq!(inline.spans()[2].kind(), InlineSpanKind::CodeSpan);
+        for span in inline.spans() {
+            assert_eq!(
+                span.source_range(),
+                TextRange::new(span.opening().start(), span.closing().end())
+                    .expect("span range should be ordered")
+            );
+            assert!(span.content().start() >= span.opening().end());
+            assert!(span.content().end() <= span.closing().start());
+        }
+    }
+
+    #[test]
+    fn semantic_spans_do_not_pair_delimiters_inside_code() {
+        let source = "`code **not strong**` **yes**";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = parse_inline(&snapshot, range).expect("inline parse should succeed");
+
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::CodeSpan)
+                .count(),
+            1
+        );
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::Strong)
+                .count(),
+            1
+        );
     }
 }

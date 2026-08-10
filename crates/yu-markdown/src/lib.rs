@@ -25,7 +25,8 @@ pub use block_sequence::{
 };
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
 pub use inline::{
-    InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError, parse_inline,
+    InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError, InlineSpan,
+    InlineSpanKind, parse_inline,
 };
 
 /// A lossless block view of one immutable text revision.
