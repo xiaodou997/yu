@@ -72,3 +72,18 @@ Projection/Layout 状态。
 `NSTextInputClient.characterIndex(for:)` 和 Accessibility point query 接收 screen coordinate；
 mouse event 则先进入 view-local coordinate。平台适配层必须显式转换，不能让一个 `Point` 同时
 隐含两种坐标空间。
+
+原生 selection 写回使用反向路径，但仍保留 Revision 边界：
+
+```text
+mouse/AX range ──► UTF-16 + expected Revision
+                         │
+                         ▼
+                EditorSelection(source bytes)
+                         │
+                         ▼
+                 EditorDocument selection
+```
+
+写回不是文本编辑，不推进 source Revision；过期 Revision、越界或 surrogate 中间位置直接
+拒绝，平台层必须重新查询当前 selection。

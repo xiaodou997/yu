@@ -86,3 +86,22 @@ revision-bound `EditorSelection` 和 transient composition。平台 view 可以�
 左右移动和删除通过 `yu-text::TextSnapshot` 的 chunk cursor 与 Unicode grapheme cursor 查询
 相邻边界；Accessibility 使用 `AccessibilityTextSnapshot::from_document` 一次性绑定 source、
 selection 和 Revision，不从平台 view 复制一份 canonical selection。
+
+macOS mouse hit-test 和 Accessibility selection 的反向同步路径是：
+
+```text
+AppKit NSRange
+    │
+    ▼
+cancel active composition
+    │
+    ▼
+yu_composition_session_set_selection(expected Revision, UTF-16 range)
+    │
+    ▼
+EditorDocument::set_selection
+```
+
+该路径只更新 selection，不生成 Transaction；Rust FFI 会拒绝 stale Revision 和无效
+UTF-16 boundary。这样 AppKit 的原生 selection 仍是 View 投影，而不是第二个 canonical
+selection。

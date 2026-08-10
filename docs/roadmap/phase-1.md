@@ -40,6 +40,7 @@
 - [x] chunk-aware Unicode grapheme command 查询（不物化完整 Snapshot）
 - [x] `AccessibilityTextSnapshot::from_document` 绑定 canonical selection/Revision
 - [x] FFI selection revision/UTF-16 查询并接入 macOS composition commit 自检
+- [x] revision-bound FFI selection mutation，并同步 macOS hit-test/Accessibility selection
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -57,6 +58,8 @@
    下的最小可验证闭环。
 6. 形成第一份真实性能基线，而不是仅有目标数字。
 7. selection、composition commit 和永久 Transaction 使用同一个结果 Revision。
+8. macOS 原生 hit-test/Accessibility selection 写回 Rust 时，stale Revision 与无效 UTF-16
+   range 都能被拒绝，且不会改变旧 selection。
 
 ## 非目标
 

@@ -46,6 +46,8 @@
    而物化完整 Snapshot。
 9. Unicode grapheme command 查询不得为了单次移动或删除调用完整 Snapshot 物化；跨 chunk 的
    边界必须与连续 UTF-8 文本的 extended grapheme 结果一致。
+10. 原生 selection mutation 必须携带 expected Revision；Revision 过期、UTF-16 越界或
+    surrogate 中间位置必须拒绝，并保持 EditorDocument selection 不变。
 
 ## Accessibility
 
@@ -55,6 +57,8 @@
 4. 查询局部文本不得要求物化整个 Piece Tree Snapshot。
 5. `AccessibilityTextSnapshot::from_document` 产生的 source、selected range 与 Revision 必须
    来自同一个 `EditorDocument` 状态。
+6. AppKit 命中测试与 Accessibility selection 写回必须先结束活动 composition，再通过
+   revision-bound FFI 更新 `EditorDocument`；平台 selection 只能作为该状态的投影。
 
 ## Degradation
 

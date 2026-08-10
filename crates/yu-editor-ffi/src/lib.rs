@@ -3,7 +3,9 @@
 use std::ptr;
 
 use yu_core::{TextRange, Utf16Offset, Utf16Range};
-use yu_editor::{EditorDocument, EditorDocumentError, SelectionError};
+use yu_editor::{
+    CaretAffinity, EditorDocument, EditorDocumentError, EditorSelection, SelectionError,
+};
 use yu_text::{EditError, TextSnapshot};
 
 pub const YU_FFI_OK: i32 = 0;
@@ -163,6 +165,28 @@ fn write_snapshot_range(
 
 fn selection_from_utf16(start: u64, end: u64) -> Result<Utf16Range, i32> {
     Utf16Range::new(Utf16Offset::new(start), Utf16Offset::new(end)).ok_or(YU_FFI_INVALID_SELECTION)
+}
+
+fn editor_selection_from_utf16(
+    session: &YuCompositionSession,
+    start: u64,
+    end: u64,
+) -> Result<EditorSelection, i32> {
+    let range = selection_from_utf16(start, end)?;
+    let snapshot = session.document.snapshot();
+    let source_start = snapshot
+        .byte_offset_for_utf16(range.start())
+        .map_err(|_| YU_FFI_INVALID_SELECTION)?;
+    let source_end = snapshot
+        .byte_offset_for_utf16(range.end())
+        .map_err(|_| YU_FFI_INVALID_SELECTION)?;
+    EditorSelection::range(
+        &snapshot,
+        source_start,
+        source_end,
+        CaretAffinity::Downstream,
+    )
+    .map_err(|_| YU_FFI_INVALID_SELECTION)
 }
 
 /// Creates an opaque composition session for a UTF-8 source buffer.
@@ -392,6 +416,36 @@ pub unsafe extern "C" fn yu_composition_session_selection(
         *end_output = range.end().get();
     }
     YU_FFI_OK
+}
+
+/// Sets the canonical source selection from a revision-bound UTF-16 range.
+///
+/// The native adapter must provide the revision it used to calculate the
+/// range. A stale revision leaves the current selection unchanged.
+///
+/// # Safety
+/// `session` must be null or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_set_selection(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    start_utf16: u64,
+    end_utf16: u64,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(session, expected_revision) {
+        return status;
+    }
+    let selection = match editor_selection_from_utf16(session, start_utf16, end_utf16) {
+        Ok(selection) => selection,
+        Err(status) => return status,
+    };
+    session
+        .document
+        .set_selection(selection)
+        .map_or_else(status_from_selection_error, |_| YU_FFI_OK)
 }
 
 /// Reads the canonical source byte length.
@@ -651,6 +705,44 @@ mod tests {
         assert_eq!(selection_revision, 1);
         assert_eq!(selection_start, 7);
         assert_eq!(selection_end, 7);
+
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_set_selection_is_revision_bound_and_rejects_surrogate_splits() {
+        let handle = session("a😊羽");
+        assert_eq!(
+            unsafe { yu_composition_session_set_selection(handle, 0, 1, 3) },
+            YU_FFI_OK
+        );
+
+        let mut revision = 0;
+        let mut start = 0;
+        let mut end = 0;
+        assert_eq!(
+            unsafe {
+                yu_composition_session_selection(handle, &mut revision, &mut start, &mut end)
+            },
+            YU_FFI_OK
+        );
+        assert_eq!((revision, start, end), (0, 1, 3));
+
+        assert_eq!(
+            unsafe { yu_composition_session_set_selection(handle, 1, 0, 0) },
+            YU_FFI_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_set_selection(handle, 0, 2, 2) },
+            YU_FFI_INVALID_SELECTION
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_selection(handle, &mut revision, &mut start, &mut end)
+            },
+            YU_FFI_OK
+        );
+        assert_eq!((revision, start, end), (0, 1, 3));
 
         unsafe { yu_composition_session_destroy(handle) };
     }
