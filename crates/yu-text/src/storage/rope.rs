@@ -455,6 +455,27 @@ impl RopeSnapshot {
     pub(super) fn chunks_from(&self, offset: usize) -> RopeChunkCursor<'_> {
         RopeChunkCursor::new(&self.root, offset)
     }
+
+    pub(super) fn chunk_before(&self, offset: usize) -> Option<StorageChunk<'_>> {
+        previous_leaf(self.root.as_deref(), offset, 0)
+    }
+}
+
+fn previous_leaf<'a>(
+    node: Option<&'a Node>,
+    offset: usize,
+    base: usize,
+) -> Option<StorageChunk<'a>> {
+    let node = node?;
+    match &node.kind {
+        NodeKind::Leaf(text) => {
+            (base + text.len() <= offset).then_some(StorageChunk { start: base, text })
+        }
+        NodeKind::Branch { left, right } => {
+            previous_leaf(Some(right.as_ref()), offset, base + left.bytes)
+                .or_else(|| previous_leaf(Some(left.as_ref()), offset, base))
+        }
+    }
 }
 
 pub(super) struct RopeChunkCursor<'a> {

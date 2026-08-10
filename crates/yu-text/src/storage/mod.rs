@@ -20,6 +20,10 @@ pub struct TextChunk<'a> {
 }
 
 impl<'a> TextChunk<'a> {
+    pub(crate) const fn new(start: ByteOffset, text: &'a str) -> Self {
+        Self { start, text }
+    }
+
     #[must_use]
     pub const fn start(self) -> ByteOffset {
         self.start
@@ -46,9 +50,11 @@ impl<'a> Iterator for ChunkCursor<'a> {
     type Item = TextChunk<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|chunk| TextChunk {
-            start: ByteOffset::try_from(chunk.start).unwrap_or(ByteOffset::new(u64::MAX)),
-            text: chunk.text,
+        self.inner.next().map(|chunk| {
+            TextChunk::new(
+                ByteOffset::try_from(chunk.start).unwrap_or(ByteOffset::new(u64::MAX)),
+                chunk.text,
+            )
         })
     }
 }
@@ -424,6 +430,15 @@ impl StorageSnapshot {
             Self::Rope(snapshot) => StorageChunkCursor::Rope(snapshot.chunks_from(offset)),
         };
         ChunkCursor { inner }
+    }
+
+    pub(crate) fn chunk_before(&self, offset: usize) -> Option<(usize, &str)> {
+        let chunk = match self {
+            Self::Flat(snapshot) => snapshot.chunk_before(offset),
+            Self::PieceTree(snapshot) => snapshot.chunk_before(offset),
+            Self::Rope(snapshot) => snapshot.chunk_before(offset),
+        }?;
+        Some((chunk.start, chunk.text))
     }
 
     pub(crate) fn is_char_boundary(&self, offset: usize) -> bool {

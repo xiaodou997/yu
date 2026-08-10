@@ -580,6 +580,30 @@ impl PieceTreeSnapshot {
     pub(super) fn chunks_from(&self, offset: usize) -> PieceTreeChunkCursor<'_> {
         PieceTreeChunkCursor::new(&self.root, offset)
     }
+
+    pub(super) fn chunk_before(&self, offset: usize) -> Option<StorageChunk<'_>> {
+        previous_chunk(&self.root, offset, 0)
+    }
+}
+
+fn previous_chunk<'a>(node: &'a Link, offset: usize, base: usize) -> Option<StorageChunk<'a>> {
+    let node = node.as_deref()?;
+    let start = base + link_bytes(&node.left);
+    let end = start + node.piece.len();
+
+    if offset <= start {
+        return previous_chunk(&node.left, offset, base);
+    }
+    if offset < end {
+        return previous_chunk(&node.left, offset, base);
+    }
+
+    previous_chunk(&node.right, offset, end).or_else(|| {
+        Some(StorageChunk {
+            start,
+            text: node.piece.text(),
+        })
+    })
 }
 
 pub(super) struct PieceTreeChunkCursor<'a> {

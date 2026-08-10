@@ -104,6 +104,13 @@ impl FlatSnapshot {
             yielded: offset >= self.text.len(),
         }
     }
+
+    pub(super) fn chunk_before(&self, offset: usize) -> Option<StorageChunk<'_>> {
+        (offset >= self.text.len() && !self.text.is_empty()).then_some(StorageChunk {
+            start: 0,
+            text: &self.text,
+        })
+    }
 }
 
 pub(super) struct FlatChunkCursor<'a> {

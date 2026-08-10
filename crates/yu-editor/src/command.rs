@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 use yu_core::ByteOffset;
 use yu_text::TextSnapshot;
 
@@ -65,45 +65,128 @@ pub(crate) fn previous_grapheme_boundary(
     snapshot: &TextSnapshot,
     offset: ByteOffset,
 ) -> Result<ByteOffset, SelectionError> {
-    let offset = usize::try_from(offset).map_err(|_| SelectionError::InvalidRange)?;
-    let offset = ByteOffset::try_from(offset).map_err(|_| SelectionError::InvalidRange)?;
-    snapshot.utf16_offset(offset)?;
-    if offset == ByteOffset::ZERO {
+    let (offset, total) = validated_offsets(snapshot, offset)?;
+    if offset == 0 {
         return Ok(ByteOffset::ZERO);
     }
 
-    let source = snapshot.as_str();
-    let mut previous = 0_usize;
-    for (boundary, _) in source.grapheme_indices(true) {
-        if boundary >= offset.get() as usize {
-            break;
+    let mut cursor = GraphemeCursor::new(offset, total, true);
+    let mut chunk = if offset == total {
+        snapshot
+            .chunk_before(byte_offset(total)?)?
+            .ok_or(SelectionError::InvalidRange)?
+    } else {
+        let mut chunk_cursor = snapshot.chunk_cursor(byte_offset(offset)?)?;
+        chunk_cursor.next().ok_or(SelectionError::InvalidRange)?
+    };
+
+    loop {
+        let chunk_start =
+            usize::try_from(chunk.start()).map_err(|_| SelectionError::InvalidRange)?;
+        match cursor.prev_boundary(chunk.text(), chunk_start) {
+            Ok(Some(boundary)) => return byte_offset(boundary),
+            Ok(None) => return Ok(ByteOffset::ZERO),
+            Err(error @ (GraphemeIncomplete::PrevChunk | GraphemeIncomplete::PreContext(_))) => {
+                if let GraphemeIncomplete::PreContext(context_end) = error {
+                    provide_pre_context(snapshot, context_end, &mut cursor)?;
+                    continue;
+                }
+                if chunk_start == 0 {
+                    return Ok(ByteOffset::ZERO);
+                }
+                chunk = snapshot
+                    .chunk_before(byte_offset(chunk_start)?)?
+                    .ok_or(SelectionError::InvalidRange)?;
+            }
+            Err(GraphemeIncomplete::NextChunk | GraphemeIncomplete::InvalidOffset) => {
+                return Err(SelectionError::InvalidRange);
+            }
         }
-        previous = boundary;
     }
-    ByteOffset::try_from(previous).map_err(|_| SelectionError::InvalidRange)
 }
 
 pub(crate) fn next_grapheme_boundary(
     snapshot: &TextSnapshot,
     offset: ByteOffset,
 ) -> Result<ByteOffset, SelectionError> {
-    let offset = usize::try_from(offset).map_err(|_| SelectionError::InvalidRange)?;
-    let offset = ByteOffset::try_from(offset).map_err(|_| SelectionError::InvalidRange)?;
-    snapshot.utf16_offset(offset)?;
-    let source = snapshot.as_str();
-    for (boundary, _) in source.grapheme_indices(true) {
-        if boundary > offset.get() as usize {
-            return ByteOffset::try_from(boundary).map_err(|_| SelectionError::InvalidRange);
+    let (offset, total) = validated_offsets(snapshot, offset)?;
+    if offset == total {
+        return ByteOffset::try_from(total).map_err(|_| SelectionError::InvalidRange);
+    }
+
+    let mut cursor = GraphemeCursor::new(offset, total, true);
+    let mut chunks = snapshot.chunk_cursor(byte_offset(offset)?)?;
+    let mut chunk = chunks.next().ok_or(SelectionError::InvalidRange)?;
+
+    loop {
+        let chunk_start =
+            usize::try_from(chunk.start()).map_err(|_| SelectionError::InvalidRange)?;
+        match cursor.next_boundary(chunk.text(), chunk_start) {
+            Ok(Some(boundary)) => return byte_offset(boundary),
+            Ok(None) => return byte_offset(total),
+            Err(GraphemeIncomplete::NextChunk) => {
+                chunk = chunks.next().ok_or(SelectionError::InvalidRange)?;
+            }
+            Err(GraphemeIncomplete::PreContext(context_end)) => {
+                provide_pre_context(snapshot, context_end, &mut cursor)?;
+            }
+            Err(GraphemeIncomplete::PrevChunk | GraphemeIncomplete::InvalidOffset) => {
+                return Err(SelectionError::InvalidRange);
+            }
         }
     }
-    ByteOffset::try_from(source.len()).map_err(|_| SelectionError::InvalidRange)
+}
+
+fn validated_offsets(
+    snapshot: &TextSnapshot,
+    offset: ByteOffset,
+) -> Result<(usize, usize), SelectionError> {
+    snapshot.utf16_offset(offset)?;
+    let offset = usize::try_from(offset).map_err(|_| SelectionError::InvalidRange)?;
+    let total = usize::try_from(snapshot.len_bytes()).map_err(|_| SelectionError::InvalidRange)?;
+    Ok((offset, total))
+}
+
+fn byte_offset(offset: usize) -> Result<ByteOffset, SelectionError> {
+    ByteOffset::try_from(offset).map_err(|_| SelectionError::InvalidRange)
+}
+
+fn provide_pre_context(
+    snapshot: &TextSnapshot,
+    context_end: usize,
+    cursor: &mut GraphemeCursor,
+) -> Result<(), SelectionError> {
+    if context_end == 0 {
+        return Err(SelectionError::InvalidRange);
+    }
+    let context_offset = byte_offset(context_end)?;
+    let chunk = if let Some(chunk) = snapshot.chunk_before(context_offset)? {
+        if usize::try_from(chunk.end()).map_err(|_| SelectionError::InvalidRange)? == context_end {
+            chunk
+        } else {
+            let mut chunks = snapshot.chunk_cursor(context_offset)?;
+            chunks.next().ok_or(SelectionError::InvalidRange)?
+        }
+    } else {
+        let mut chunks = snapshot.chunk_cursor(context_offset)?;
+        chunks.next().ok_or(SelectionError::InvalidRange)?
+    };
+    let chunk_start = usize::try_from(chunk.start()).map_err(|_| SelectionError::InvalidRange)?;
+    let local_end = context_end
+        .checked_sub(chunk_start)
+        .ok_or(SelectionError::InvalidRange)?;
+    if local_end == 0 || local_end > chunk.text().len() {
+        return Err(SelectionError::InvalidRange);
+    }
+    cursor.provide_context(&chunk.text()[..local_end], chunk_start);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use yu_core::Revision;
-    use yu_text::TextBuffer;
+    use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
     #[test]
     fn grapheme_boundaries_keep_combining_marks_and_zwj_emoji_together() {
@@ -139,5 +222,71 @@ mod tests {
         assert_eq!(result.revision(), Revision::INITIAL);
         assert_eq!(result.selection(), selection);
         assert!(!result.changed());
+    }
+
+    #[test]
+    fn chunk_boundaries_keep_combining_marks_and_zwj_emoji_together() {
+        for backend in yu_text::StorageBackend::ALL {
+            let mut buffer = TextBuffer::with_backend("e\u{301} 👩‍🔬x", backend);
+            buffer
+                .apply(&Transaction::new(
+                    buffer.revision(),
+                    [
+                        Edit::new(
+                            yu_core::TextRange::new(ByteOffset::new(0), ByteOffset::new(1))
+                                .expect("range"),
+                            "e",
+                        ),
+                        Edit::new(
+                            yu_core::TextRange::new(ByteOffset::new(4), ByteOffset::new(8))
+                                .expect("range"),
+                            "👩",
+                        ),
+                    ],
+                ))
+                .expect("edit should split the source into chunks");
+            let snapshot = buffer.snapshot();
+            let combining_end = ByteOffset::new("e\u{301}".len() as u64);
+            let emoji_start = ByteOffset::new("e\u{301} ".len() as u64);
+            let emoji_end = ByteOffset::new("e\u{301} 👩‍🔬".len() as u64);
+
+            assert_eq!(
+                next_grapheme_boundary(&snapshot, ByteOffset::ZERO).expect("boundary"),
+                combining_end,
+                "backend {backend}"
+            );
+            assert_eq!(
+                next_grapheme_boundary(&snapshot, emoji_start).expect("boundary"),
+                emoji_end,
+                "backend {backend}"
+            );
+            assert_eq!(
+                previous_grapheme_boundary(&snapshot, emoji_end).expect("boundary"),
+                emoji_start,
+                "backend {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_queries_do_not_materialize_a_piece_tree_snapshot() {
+        let mut buffer = TextBuffer::new("prefix ".repeat(128) + "e\u{301} 👩‍🔬x");
+        buffer
+            .apply(&Transaction::new(
+                buffer.revision(),
+                [Edit::new(
+                    yu_core::TextRange::empty(ByteOffset::new(0)),
+                    "羽",
+                )],
+            ))
+            .expect("edit should apply");
+        let snapshot = buffer.snapshot();
+        let before =
+            retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers();
+        let end = snapshot.len_bytes();
+
+        let _ = previous_grapheme_boundary(&snapshot, end).expect("boundary");
+        let after = retained_snapshot_stats(&[snapshot]).materialized_buffers();
+        assert_eq!(after, before);
     }
 }
