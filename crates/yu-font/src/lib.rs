@@ -4,10 +4,11 @@
 //!
 //! This crate intentionally does not open font files or call CoreText,
 //! DirectWrite, or Fontconfig. It defines the data that those platform
-//! backends must eventually produce, and ships a deterministic shaper for
-//! contract tests. [`FontMetrics`] implements `yu-layout::ClusterMetrics`, while
-//! [`FontShaper`] implements `yu-layout::ShapingProvider`, so the layout engine
-//! can consume the same fallback policy before a native glyph backend exists.
+//! backends must produce, including owned font metrics, glyph bitmaps and CPU
+//! atlas placements, and ships a deterministic shaper for contract tests.
+//! [`FontMetrics`] implements `yu-layout::ClusterMetrics`, while [`FontShaper`]
+//! implements `yu-layout::ShapingProvider`, so the layout engine can consume
+//! the same fallback policy before a native glyph backend exists.
 
 use std::error::Error;
 use std::fmt;
@@ -18,6 +19,13 @@ use yu_core::{ByteOffset, TextRange};
 use yu_layout::ClusterMetrics;
 use yu_projection::VisualRunStyle;
 
+mod raster;
+
+pub use raster::{
+    AtlasEntry, AtlasError, AtlasRect, FontMetricKey, FontMetricsCache, FontMetricsSnapshot,
+    GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphMetrics, GlyphRasterKey, GlyphRasterizer,
+    RasterDataError, RasterizedGlyph,
+};
 pub use yu_layout::{
     FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
 };

@@ -8,13 +8,23 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+#[cfg(target_os = "macos")]
+use std::ptr::NonNull;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
 
 use yu_core::TextRange;
+use yu_font::FontFaceId;
+use yu_font::{
+    AtlasEntry, FontMetricKey, FontMetricsSnapshot, GlyphRasterKey, GlyphRasterizer,
+    RasterizedGlyph,
+};
 #[cfg(target_os = "macos")]
-use yu_font::{FontFaceId, FontSlant, FontWeight, Glyph, GlyphId, GlyphRun};
+use yu_font::{
+    AtlasError, FontMetricsCache, FontSlant, FontWeight, Glyph, GlyphAtlas, GlyphAtlasConfig,
+    GlyphBitmap, GlyphId, GlyphMetrics, GlyphRun,
+};
 use yu_font::{
     FontRequest, ShapeError, ShapeRequest, ShapedText, ShapingProvider, TextDirection, TextShaper,
 };
@@ -22,14 +32,18 @@ use yu_projection::VisualRunStyle;
 
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{
-    CFArray, CFAttributedString, CFDictionary, CFRange, CFRetained, CFString, CGPoint, CGSize,
+    CFArray, CFAttributedString, CFDictionary, CFRange, CFRetained, CFString, CGPoint, CGRect,
+    CGSize,
 };
 #[cfg(target_os = "macos")]
-use objc2_core_graphics::CGGlyph;
+use objc2_core_graphics::{
+    CGBitmapContextCreate, CGBitmapContextGetBytesPerRow, CGBitmapContextGetData, CGContext,
+    CGGlyph, CGImageAlphaInfo,
+};
 #[cfg(target_os = "macos")]
 use objc2_core_text::{
-    CTFont, CTFontManagerCopyAvailableFontFamilyNames, CTFontSymbolicTraits, CTLine, CTRun,
-    CTRunStatus, kCTFontAttributeName,
+    CTFont, CTFontManagerCopyAvailableFontFamilyNames, CTFontOrientation, CTFontSymbolicTraits,
+    CTLine, CTRun, CTRunStatus, kCTFontAttributeName,
 };
 
 /// Errors raised by the CoreText adapter.
@@ -97,6 +111,57 @@ impl fmt::Display for CoreTextShapeError {
 }
 
 impl Error for CoreTextShapeError {}
+
+/// Errors raised while copying CoreText metrics and glyph pixels into owned
+/// Yu data. Native CoreText/CoreGraphics objects never cross this boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoreTextRasterError {
+    UnsupportedPlatform,
+    UnknownFace(FontFaceId),
+    InvalidGlyphId(u32),
+    FaceTablePoisoned,
+    MetricsCachePoisoned,
+    AtlasPoisoned,
+    BitmapUnavailable,
+    InvalidNativeMetrics,
+    InvalidNativeBitmap,
+    InvalidRasterData(Arc<str>),
+    Atlas(Arc<str>),
+}
+
+impl fmt::Display for CoreTextRasterError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPlatform => formatter.write_str("CoreText is only available on macOS"),
+            Self::UnknownFace(face) => {
+                write!(formatter, "CoreText face id {} is unknown", face.get())
+            }
+            Self::InvalidGlyphId(glyph) => {
+                write!(formatter, "glyph id {glyph} does not fit CGGlyph")
+            }
+            Self::FaceTablePoisoned => formatter.write_str("CoreText face id table was poisoned"),
+            Self::MetricsCachePoisoned => {
+                formatter.write_str("CoreText metrics cache was poisoned")
+            }
+            Self::AtlasPoisoned => formatter.write_str("CoreText glyph atlas was poisoned"),
+            Self::BitmapUnavailable => {
+                formatter.write_str("CoreGraphics could not create a bitmap context")
+            }
+            Self::InvalidNativeMetrics => {
+                formatter.write_str("CoreText returned invalid glyph metrics")
+            }
+            Self::InvalidNativeBitmap => {
+                formatter.write_str("CoreGraphics returned invalid bitmap data")
+            }
+            Self::InvalidRasterData(message) => write!(formatter, "invalid raster data: {message}"),
+            Self::Atlas(message) => {
+                write!(formatter, "glyph atlas rejected raster data: {message}")
+            }
+        }
+    }
+}
+
+impl Error for CoreTextRasterError {}
 
 /// A retained, sorted snapshot of the font family names visible to CoreText.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -282,6 +347,7 @@ impl CoreTextFontResolver {
 struct FaceTable {
     next: u32,
     ids: BTreeMap<String, FontFaceId>,
+    names: Vec<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -295,8 +361,15 @@ impl FaceTable {
             .next
             .checked_add(1)
             .ok_or(CoreTextShapeError::FaceIdOverflow)?;
+        self.names.push(postscript_name.to_owned());
         self.ids.insert(postscript_name.to_owned(), face);
         Ok(face)
+    }
+
+    fn name_for(&self, face: FontFaceId) -> Option<&str> {
+        self.names
+            .get(usize::try_from(face.get()).ok()?)
+            .map(String::as_str)
     }
 }
 
@@ -349,6 +422,23 @@ impl CoreTextShaper {
         &self.request
     }
 
+    /// Creates a glyph rasterizer that shares this shaper's stable face table.
+    /// The returned object owns only caches and can be used by layout/render
+    /// preparation without exposing any CoreText handle.
+    #[must_use]
+    pub fn rasterizer(&self) -> CoreTextGlyphRasterizer {
+        #[cfg(target_os = "macos")]
+        {
+            CoreTextGlyphRasterizer::with_faces(Arc::clone(&self.faces))
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = self;
+            CoreTextGlyphRasterizer::unsupported()
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn face_id(&self, postscript_name: &str) -> Result<FontFaceId, CoreTextShapeError> {
         self.faces
@@ -369,6 +459,328 @@ impl CoreTextShaper {
             Err(CoreTextShapeError::UnsupportedPlatform)
         }
     }
+}
+
+/// CoreText-backed metrics and CPU glyph rasterization.
+///
+/// This is deliberately a preparation-layer object: it returns owned
+/// single-channel pixels and atlas placements, not a platform texture or a
+/// `CTFontRef`. The future renderer can upload atlas pages without changing
+/// the editor/source model.
+#[derive(Debug)]
+pub struct CoreTextGlyphRasterizer {
+    #[cfg(target_os = "macos")]
+    faces: Arc<Mutex<FaceTable>>,
+    #[cfg(target_os = "macos")]
+    metrics: Arc<Mutex<FontMetricsCache>>,
+    #[cfg(target_os = "macos")]
+    atlas: Arc<Mutex<GlyphAtlas>>,
+}
+
+impl Clone for CoreTextGlyphRasterizer {
+    fn clone(&self) -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            faces: Arc::clone(&self.faces),
+            #[cfg(target_os = "macos")]
+            metrics: Arc::clone(&self.metrics),
+            #[cfg(target_os = "macos")]
+            atlas: Arc::clone(&self.atlas),
+        }
+    }
+}
+
+impl CoreTextGlyphRasterizer {
+    #[cfg(target_os = "macos")]
+    fn with_faces(faces: Arc<Mutex<FaceTable>>) -> Self {
+        Self {
+            faces,
+            metrics: Arc::new(Mutex::new(FontMetricsCache::new())),
+            atlas: Arc::new(Mutex::new(GlyphAtlas::new(GlyphAtlasConfig::default()))),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    const fn unsupported() -> Self {
+        Self {}
+    }
+
+    /// Returns the cached atlas placement, if this glyph has already been
+    /// rasterized by this provider.
+    #[cfg(target_os = "macos")]
+    pub fn atlas_entry(
+        &self,
+        key: GlyphRasterKey,
+    ) -> Result<Option<AtlasEntry>, CoreTextRasterError> {
+        self.atlas
+            .lock()
+            .map_err(|_| CoreTextRasterError::AtlasPoisoned)
+            .map(|atlas| atlas.entry(key))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn atlas_entry(
+        &self,
+        _key: GlyphRasterKey,
+    ) -> Result<Option<AtlasEntry>, CoreTextRasterError> {
+        Err(CoreTextRasterError::UnsupportedPlatform)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn metrics_cache_len(&self) -> Result<usize, CoreTextRasterError> {
+        self.metrics
+            .lock()
+            .map_err(|_| CoreTextRasterError::MetricsCachePoisoned)
+            .map(|cache| cache.len())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn metrics_cache_len(&self) -> Result<usize, CoreTextRasterError> {
+        Err(CoreTextRasterError::UnsupportedPlatform)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn atlas_page_count(&self) -> Result<usize, CoreTextRasterError> {
+        self.atlas
+            .lock()
+            .map_err(|_| CoreTextRasterError::AtlasPoisoned)
+            .map(|atlas| atlas.page_count())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn atlas_page_count(&self) -> Result<usize, CoreTextRasterError> {
+        Err(CoreTextRasterError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl GlyphRasterizer for CoreTextGlyphRasterizer {
+    type Error = CoreTextRasterError;
+
+    fn font_metrics(&self, key: FontMetricKey) -> Result<FontMetricsSnapshot, Self::Error> {
+        if let Some(metrics) = self
+            .metrics
+            .lock()
+            .map_err(|_| CoreTextRasterError::MetricsCachePoisoned)?
+            .get(key)
+        {
+            return Ok(metrics);
+        }
+
+        let font = self.font_for_face(key.face(), key.size())?;
+        let metrics = FontMetricsSnapshot::new(
+            unsafe { font.ascent() } as f32,
+            unsafe { font.descent() } as f32,
+            unsafe { font.leading() } as f32,
+            unsafe { font.units_per_em() },
+        )
+        .map_err(|_| CoreTextRasterError::InvalidNativeMetrics)?;
+        self.metrics
+            .lock()
+            .map_err(|_| CoreTextRasterError::MetricsCachePoisoned)?
+            .insert(key, metrics);
+        Ok(metrics)
+    }
+
+    fn rasterize(&self, key: GlyphRasterKey) -> Result<RasterizedGlyph, Self::Error> {
+        if let Some(glyph) = self
+            .atlas
+            .lock()
+            .map_err(|_| CoreTextRasterError::AtlasPoisoned)?
+            .get(key)
+        {
+            return Ok(glyph.as_ref().clone());
+        }
+
+        let glyph = u16::try_from(key.glyph().get())
+            .map_err(|_| CoreTextRasterError::InvalidGlyphId(key.glyph().get()))?;
+        let font = self.font_for_face(key.face(), key.size())?;
+        let (bounds, advance) = native_glyph_geometry(&font, glyph)?;
+        let (bitmap, bearing_x, bearing_y) = rasterize_glyph(&font, glyph, bounds)?;
+        let metrics = GlyphMetrics::new(bearing_x, bearing_y, advance)
+            .map_err(|_| CoreTextRasterError::InvalidNativeMetrics)?;
+        let rasterized = RasterizedGlyph::new(key, metrics, bitmap);
+        self.atlas
+            .lock()
+            .map_err(|_| CoreTextRasterError::AtlasPoisoned)?
+            .insert(rasterized.clone())
+            .map_err(|error| match error {
+                AtlasError::InvalidBitmap(error) => {
+                    CoreTextRasterError::InvalidRasterData(Arc::from(error.to_string()))
+                }
+                other => CoreTextRasterError::Atlas(Arc::from(other.to_string())),
+            })?;
+        Ok(rasterized)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl GlyphRasterizer for CoreTextGlyphRasterizer {
+    type Error = CoreTextRasterError;
+
+    fn font_metrics(&self, _key: FontMetricKey) -> Result<FontMetricsSnapshot, Self::Error> {
+        Err(CoreTextRasterError::UnsupportedPlatform)
+    }
+
+    fn rasterize(&self, _key: GlyphRasterKey) -> Result<RasterizedGlyph, Self::Error> {
+        Err(CoreTextRasterError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl CoreTextGlyphRasterizer {
+    fn font_for_face(
+        &self,
+        face: FontFaceId,
+        size: f32,
+    ) -> Result<CFRetained<CTFont>, CoreTextRasterError> {
+        let postscript_name = self
+            .faces
+            .lock()
+            .map_err(|_| CoreTextRasterError::FaceTablePoisoned)?
+            .name_for(face)
+            .map(str::to_owned)
+            .ok_or(CoreTextRasterError::UnknownFace(face))?;
+        let name = CFString::from_str(&postscript_name);
+        Ok(unsafe { CTFont::with_name(&name, size as _, std::ptr::null()) })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_glyph_geometry(
+    font: &CTFont,
+    glyph: CGGlyph,
+) -> Result<(CGRect, f32), CoreTextRasterError> {
+    let mut glyph = glyph;
+    let pointer = NonNull::from(&mut glyph);
+    let bounds = unsafe {
+        font.bounding_rects_for_glyphs(
+            CTFontOrientation::Horizontal,
+            pointer,
+            std::ptr::null_mut(),
+            1,
+        )
+    };
+    let mut advance = CGSize::ZERO;
+    unsafe {
+        font.advances_for_glyphs(
+            CTFontOrientation::Horizontal,
+            pointer,
+            std::ptr::addr_of_mut!(advance),
+            1,
+        );
+    }
+    let values = [
+        bounds.origin.x as f64,
+        bounds.origin.y as f64,
+        bounds.size.width as f64,
+        bounds.size.height as f64,
+        advance.width,
+    ];
+    if values.iter().any(|value| !value.is_finite())
+        || bounds.size.width < 0.0
+        || bounds.size.height < 0.0
+        || advance.width < 0.0
+    {
+        return Err(CoreTextRasterError::InvalidNativeMetrics);
+    }
+    Ok((bounds, advance.width as f32))
+}
+
+#[cfg(target_os = "macos")]
+fn rasterize_glyph(
+    font: &CTFont,
+    glyph: CGGlyph,
+    bounds: CGRect,
+) -> Result<(GlyphBitmap, f32, f32), CoreTextRasterError> {
+    let min_x = bounds.origin.x;
+    let min_y = bounds.origin.y;
+    let max_x = min_x + bounds.size.width;
+    let max_y = min_y + bounds.size.height;
+    if bounds.size.width == 0.0 || bounds.size.height == 0.0 {
+        let bitmap = GlyphBitmap::new(0, 0, 0, Vec::<u8>::new()).map_err(|error| {
+            CoreTextRasterError::InvalidRasterData(Arc::from(error.to_string()))
+        })?;
+        return Ok((bitmap, min_x.floor() as f32, max_y.ceil() as f32));
+    }
+
+    let left = min_x.floor() - 1.0;
+    let bottom = min_y.floor() - 1.0;
+    let right = max_x.ceil() + 1.0;
+    let top = max_y.ceil() + 1.0;
+    let width = raster_dimension(right - left)?;
+    let height = raster_dimension(top - bottom)?;
+    let width_usize =
+        usize::try_from(width).map_err(|_| CoreTextRasterError::InvalidNativeBitmap)?;
+    let height_usize =
+        usize::try_from(height).map_err(|_| CoreTextRasterError::InvalidNativeBitmap)?;
+    let context = unsafe {
+        CGBitmapContextCreate(
+            std::ptr::null_mut(),
+            width_usize,
+            height_usize,
+            8,
+            width_usize,
+            None,
+            CGImageAlphaInfo::Only.0,
+        )
+    }
+    .ok_or(CoreTextRasterError::BitmapUnavailable)?;
+    CGContext::set_gray_fill_color(Some(context.as_ref()), 0.0, 1.0);
+
+    let mut glyph = glyph;
+    let mut position = CGPoint {
+        x: (-left) as _,
+        y: (-bottom) as _,
+    };
+    unsafe {
+        font.draw_glyphs(
+            NonNull::from(&mut glyph),
+            NonNull::from(&mut position),
+            1,
+            context.as_ref(),
+        );
+    }
+    let stride = CGBitmapContextGetBytesPerRow(Some(context.as_ref()));
+    let data = CGBitmapContextGetData(Some(context.as_ref()));
+    if data.is_null() || stride < width_usize {
+        return Err(CoreTextRasterError::InvalidNativeBitmap);
+    }
+    let source_len = stride
+        .checked_mul(height_usize)
+        .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
+    let source = unsafe { std::slice::from_raw_parts(data.cast_const().cast::<u8>(), source_len) };
+    let pixel_len = width_usize
+        .checked_mul(height_usize)
+        .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
+    let mut pixels = vec![0_u8; pixel_len];
+    for row in 0..height_usize {
+        let source_start = row
+            .checked_mul(stride)
+            .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
+        let target_row = height_usize - 1 - row;
+        let target_start = target_row
+            .checked_mul(width_usize)
+            .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
+        let source_row = source
+            .get(source_start..source_start + width_usize)
+            .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
+        let target_row = pixels
+            .get_mut(target_start..target_start + width_usize)
+            .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
+        target_row.copy_from_slice(source_row);
+    }
+    let bitmap = GlyphBitmap::new(width, height, width, pixels)
+        .map_err(|error| CoreTextRasterError::InvalidRasterData(Arc::from(error.to_string())))?;
+    Ok((bitmap, left as f32, top as f32))
+}
+
+#[cfg(target_os = "macos")]
+fn raster_dimension(value: f64) -> Result<u32, CoreTextRasterError> {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+        return Err(CoreTextRasterError::InvalidNativeBitmap);
+    }
+    Ok(value.ceil() as u32)
 }
 
 impl TextShaper for CoreTextShaper {
@@ -760,6 +1172,51 @@ mod tests {
         assert!(layout.clusters().iter().all(|cluster| {
             cluster.source().start() >= source.start() && cluster.source().end() <= source.end()
         }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_text_rasterizer_returns_owned_pixels_and_reuses_caches() {
+        let catalog = CoreTextFontCatalog::system().expect("CoreText should expose families");
+        let family = catalog.families()[0].clone();
+        let request = FontRequest::new(family.as_ref(), 18.0).expect("request should be valid");
+        let shaper = CoreTextShaper::new(catalog, request.clone());
+        let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1))
+            .expect("source range should be valid");
+        let shape_request =
+            ShapeRequest::new("A", source, VisualRunStyle::Plain, request).expect("request");
+        let shaped = TextShaper::shape(&shaper, &shape_request).expect("CoreText should shape");
+        let run = shaped.runs().first().expect("shaped run");
+        let glyph = run.glyphs().first().expect("shaped glyph");
+        let rasterizer = shaper.rasterizer();
+        let metric_key = yu_font::FontMetricKey::new(run.face(), 18.0).expect("metric key");
+        let metrics = rasterizer
+            .font_metrics(metric_key)
+            .expect("CoreText metrics should be available");
+        assert!(metrics.ascent() > 0.0);
+        assert!(metrics.descent() >= 0.0);
+        assert_eq!(rasterizer.metrics_cache_len().expect("metrics cache"), 1);
+
+        let key = yu_font::GlyphRasterKey::new(run.face(), glyph.id(), 18.0)
+            .expect("glyph key should be valid");
+        let first = rasterizer
+            .rasterize(key)
+            .expect("CoreText should rasterize a visible glyph");
+        assert!(first.bitmap().width() > 0);
+        assert!(first.bitmap().height() > 0);
+        assert!(first.bitmap().pixels().iter().any(|pixel| *pixel > 0));
+        assert!(first.metrics().advance_x() > 0.0);
+        let second = rasterizer
+            .rasterize(key)
+            .expect("cached glyph should rasterize");
+        assert_eq!(first, second);
+        let entry = rasterizer
+            .atlas_entry(key)
+            .expect("atlas query")
+            .expect("glyph should have an atlas entry");
+        assert!(entry.page().is_some());
+        assert_eq!(entry.rect().width(), first.bitmap().width());
+        assert_eq!(rasterizer.atlas_page_count().expect("atlas"), 1);
     }
 
     #[cfg(not(target_os = "macos"))]

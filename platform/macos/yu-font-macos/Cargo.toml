@@ -25,7 +25,15 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
     "CFDictionary",
     "CFString",
 ] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGFont"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "CGAffineTransform",
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGContext",
+    "CGFont",
+    "CGGeometry",
+    "CGImage",
+] }
 objc2-core-text = { version = "0.3.2", default-features = false, features = [
     "std",
     "CTDefines",

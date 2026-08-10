@@ -46,8 +46,8 @@ crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存�
 crates/yu-markdown      第一阶段 lossless block scanner
 crates/yu-projection    Source → Visual Markdown 投影
 crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
-crates/yu-font          font fallback、GlyphRun 和可替换 shaping 契约
-platform/macos/yu-font-macos  macOS-only CoreText 字体目录、fallback 与 shaping 适配
+crates/yu-font          font fallback、GlyphRun、metrics/rasterization 契约与 CPU glyph atlas
+platform/macos/yu-font-macos  macOS-only CoreText 字体目录、fallback、shaping 与 glyph rasterization 适配
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的第一阶段参考 workload
 experiments/            可丢弃的平台风险实验
