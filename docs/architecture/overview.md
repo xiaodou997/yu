@@ -151,7 +151,9 @@ backend 可以替换它而不改变 layout 的 source/visual 坐标。
 
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的 family 名称，`CoreTextFontResolver::resolve` 负责根据
-`FontRequest` 和文本请求 CoreText 的 family/fallback 选择；适配层只把自有的 family、PostScript
-name、size 和 fallback 标志返回给共享层，不让 `CTFontRef` 或其他平台句柄进入
-`yu-font`、`yu-layout` 或 `EditorDocument`。这一阶段尚未实现 glyph shaping/rasterization；下一步
-会在同一边界上增加真实的 `GlyphRun` provider。
+`FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过
+`CFAttributedString → CTLine → CTRun` 取得真实 glyph id、advance、position 和 UTF-16 string
+index，并转换为 `yu-font` 的 `GlyphRun`/UTF-8 source cluster。适配层只把自有的 family、
+PostScript name、size、glyph 数据和 fallback 标志返回给共享层，不让 `CTFontRef` 或其他平台
+句柄进入 `yu-font`、`yu-layout` 或 `EditorDocument`。当前布局契约对 RTL/non-monotonic run
+仍会显式报错；glyph rasterization/atlas 尚未开始。

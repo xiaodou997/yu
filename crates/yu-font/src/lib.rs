@@ -421,6 +421,7 @@ impl<'a> ShapeRequest<'a> {
 pub enum ShapeError {
     EmptyFontDatabase,
     MissingGlyph(Arc<str>),
+    Backend(Arc<str>),
     OffsetOverflow,
     SourceLengthMismatch { source: u64, text: usize },
 }
@@ -430,6 +431,7 @@ impl fmt::Display for ShapeError {
         match self {
             Self::EmptyFontDatabase => formatter.write_str("font database is empty"),
             Self::MissingGlyph(cluster) => write!(formatter, "no fallback face covers {cluster:?}"),
+            Self::Backend(message) => write!(formatter, "native shaping backend failed: {message}"),
             Self::OffsetOverflow => formatter.write_str("shaping source offset overflowed"),
             Self::SourceLengthMismatch { source, text } => {
                 write!(

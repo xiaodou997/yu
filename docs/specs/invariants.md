@@ -119,3 +119,6 @@
 5. 平台字体适配器可以在自身边界内持有 `CTFontRef` 等原生句柄，但跨边界结果必须是自有、可
    发送的元数据或 `GlyphRun`；字体 catalog/fallback 查询不得修改 source Revision，也不得把
    平台对象放入 `yu-font`、`yu-layout` 或 `EditorDocument` 的 canonical state。
+6. CoreText 的 UTF-16 glyph string index 只能在合法 UTF-8 scalar boundary 上转换为 source
+   `TextRange`；glyph cluster range 必须有序、位于请求范围内，RTL/non-monotonic 输出在布局尚未
+   支持时必须返回明确错误而不是调整索引伪装成 LTR。
