@@ -22,6 +22,10 @@ pub use composition::{CompositionError, CompositionOverlay};
 pub use document::{EditorDocument, EditorDocumentError};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
+pub use yu_layout::{
+    ClusterMetrics, LayoutCaret, LayoutConfig, LayoutError, LayoutHit, LayoutPoint, LayoutSnapshot,
+    MonospaceMetrics, VisualCluster, VisualLine,
+};
 pub use yu_markdown::{Block, BlockKind, MarkdownDocument};
 pub use yu_projection::{
     BlockProjection, BlockProjectionKind, CodeProjection, Projection, ProjectionBias,

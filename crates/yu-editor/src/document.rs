@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use yu_core::{Revision, TextRange, Utf16Range};
+use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot};
 use yu_markdown::{IncrementalParseError, MarkdownDocument};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
@@ -113,6 +114,19 @@ impl EditorDocument {
         self.projections
             .get_or_build_block(&snapshot, block)
             .map_err(EditorDocumentError::Projection)
+    }
+
+    /// Builds a revision-bound block layout snapshot from the current
+    /// projection. Layout is intentionally returned by value until a later
+    /// phase introduces a layout cache and viewport virtualization.
+    pub fn block_layout(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        let projection = self.block_projection(index)?;
+        LayoutSnapshot::from_block_projection(projection, config)
+            .map_err(EditorDocumentError::Layout)
     }
 
     /// Replaces the selection after checking that it belongs to this revision.
@@ -353,6 +367,7 @@ impl EditorDocument {
 pub enum EditorDocumentError {
     Composition(CompositionError),
     Edit(EditError),
+    Layout(LayoutError),
     Markdown(IncrementalParseError),
     Position(TextPositionError),
     Projection(ProjectionError),
@@ -367,6 +382,7 @@ impl fmt::Display for EditorDocumentError {
         match self {
             Self::Composition(error) => error.fmt(formatter),
             Self::Edit(error) => error.fmt(formatter),
+            Self::Layout(error) => error.fmt(formatter),
             Self::Markdown(error) => error.fmt(formatter),
             Self::Position(error) => error.fmt(formatter),
             Self::Projection(error) => error.fmt(formatter),
@@ -388,6 +404,7 @@ impl Error for EditorDocumentError {
         match self {
             Self::Composition(error) => Some(error),
             Self::Edit(error) => Some(error),
+            Self::Layout(error) => Some(error),
             Self::Markdown(error) => Some(error),
             Self::Position(error) => Some(error),
             Self::Projection(error) => Some(error),
@@ -414,6 +431,12 @@ impl From<EditError> for EditorDocumentError {
 impl From<IncrementalParseError> for EditorDocumentError {
     fn from(error: IncrementalParseError) -> Self {
         Self::Markdown(error)
+    }
+}
+
+impl From<LayoutError> for EditorDocumentError {
+    fn from(error: LayoutError) -> Self {
+        Self::Layout(error)
     }
 }
 
@@ -742,6 +765,19 @@ mod tests {
         assert_eq!(new_content.end().get(), old_content.end().get() + 3);
         assert_eq!(document.projection_cache_stats().builds(), 1);
         assert_eq!(document.projection_cache_stats().remapped(), 1);
+    }
+
+    #[test]
+    fn block_layout_uses_the_current_projection_revision() {
+        let mut document = EditorDocument::new("**羽🙂**");
+        let layout = document
+            .block_layout(0, LayoutConfig::new(2.0, 1.25))
+            .expect("block layout should build");
+
+        assert_eq!(layout.revision(), document.revision());
+        assert_eq!(layout.lines().len(), 1);
+        assert_eq!(layout.lines()[0].width(), 2.0);
+        assert_eq!(layout.clusters().len(), 2);
     }
 
     #[test]
