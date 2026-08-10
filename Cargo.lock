@@ -139,6 +139,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-render"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
+ "yu-font",
+ "yu-scene",
+]
+
+[[package]]
+name = "yu-scene"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
+ "yu-font",
+]
+
+[[package]]
 name = "yu-text"
 version = "0.1.0"
 dependencies = [

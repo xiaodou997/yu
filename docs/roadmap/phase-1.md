@@ -58,6 +58,8 @@
 - [x] macOS-only CoreText family catalog 与 fallback resolver（只返回安全字体元数据）
 - [x] macOS CoreText CTLine/CTRun shaping、UTF-16→UTF-8 cluster mapping 与 `yu-layout` smoke test
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
+- [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
+- [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -112,6 +114,9 @@
    `FontMetricsCache`/`GlyphAtlas` 的命中只能影响渲染准备，不能改变 source Revision、
    projection mapping 或 layout source ranges。CPU atlas page 可以被 renderer 上传，但本阶段
    不引入 GPU texture 生命周期。
+22. `yu-scene` 必须绑定 source Revision 并只保存 owned geometry/color/atlas placement；`yu-render`
+   必须复制 scene 的 Revision/viewport，校验 stale atlas entry，并按 page fingerprint 去重 owned
+   alpha upload。此阶段不得创建 window、GPU device 或 texture handle。
 
 ## 非目标
 

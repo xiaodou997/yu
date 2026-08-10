@@ -47,6 +47,8 @@ crates/yu-markdown      第一阶段 lossless block scanner
 crates/yu-projection    Source → Visual Markdown 投影
 crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
 crates/yu-font          font fallback、GlyphRun、metrics/rasterization 契约与 CPU glyph atlas
+crates/yu-scene         revision-bound retained primitives、viewport 与 damage tracking
+crates/yu-render        backend-neutral render plan 与 atlas page upload boundary
 platform/macos/yu-font-macos  macOS-only CoreText 字体目录、fallback、shaping 与 glyph rasterization 适配
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的第一阶段参考 workload

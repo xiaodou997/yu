@@ -126,3 +126,18 @@
    `GlyphBitmap` 或 `RasterizedGlyph`；CoreText/CoreGraphics 句柄、context、纹理和 atlas page
    生命周期不得进入 `TextSnapshot`、projection、layout 或 `EditorDocument` canonical state。
    atlas placement 必须绑定 `GlyphRasterKey`，空 bitmap glyph 可以没有 page 但必须保留 advance。
+
+## Scene and render
+
+1. `yu-scene::Scene` 必须绑定一个 source `Revision`，primitive 顺序必须保持 painter order；
+   scene 不得持有 source text、layout cache、native window object、bitmap ownership 或 GPU handle。
+2. scene 的 `Point`/`Rect` 必须是有限值，宽高不能为负；glyph bounds 必须由 atlas metrics 和
+   baseline origin 推导，不能在 renderer 中重新计算 source/layout 坐标。
+3. `DamageSet` 只能包含非空、有限矩形；相交/相邻区域必须可合并，超过预算时必须显式退化为
+   总 bounds，不能无限增长每帧 dirty list。
+4. `RenderPlan` 必须复制 scene 的 Revision 和 viewport；`RenderPlanBuilder` 对 scene 引用的
+   atlas entry 必须验证 key、page、rect 和 metrics 与当前 atlas 一致，missing/stale entry
+   必须失败而不是绘制错误 glyph。
+5. atlas page upload 必须是 owned alpha bytes，page fingerprint 未变化时不得重复产生 upload；
+   `RenderUploader` 返回的 texture/device handle 只能由 backend 持有，不能写回 scene、layout 或
+   editor canonical state。
