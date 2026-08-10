@@ -27,6 +27,7 @@ version = "0.1.0"
 dependencies = [
  "unicode-segmentation",
  "yu-core",
+ "yu-layout",
  "yu-markdown",
  "yu-projection",
  "yu-text",
@@ -46,6 +47,16 @@ name = "yu-inspect"
 version = "0.1.0"
 dependencies = [
  "yu-markdown",
+ "yu-text",
+]
+
+[[package]]
+name = "yu-layout"
+version = "0.1.0"
+dependencies = [
+ "unicode-segmentation",
+ "yu-core",
+ "yu-projection",
  "yu-text",
 ]
 

@@ -48,6 +48,8 @@
 - [x] `EditorDocument` 持有增量 `MarkdownDocument` 并提供 block-scoped projection
 - [x] parser-owned semantic inline spans 与 styled visual runs
 - [x] fenced code 独立 source-backed projection 协议与缓存映射
+- [x] block-local `yu-layout` snapshot、grapheme cluster wrapping 与 hit-test contract
+- [x] `EditorDocument::block_layout` revision-bound integration
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -78,6 +80,8 @@
     inline delimiter pairing。
 13. matched inline spans 由 `yu-markdown` 产生，`yu-projection` 只消费 span ranges；可见 runs
     能区分 Plain/Emphasis/Strong/Code，且 fenced body 中的 `**` 等字面量保持可见。
+14. `LayoutSnapshot` 必须绑定 Projection Revision；换行只能发生在 grapheme cluster 边界，
+    source caret、visual caret 和 hit-test 在 Unicode/hidden delimiter 场景下保持可重复。
 
 ## 非目标
 

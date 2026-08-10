@@ -41,10 +41,10 @@ Parser equivalence              native event loop
 yu-core
    ▲
    │
-yu-text ◄── yu-markdown ◄── yu-projection ◄── yu-editor ◄── yu-editor-ffi
-   ▲             ▲                                 ▲              ▲
-   │             │                                 │              │
-yu-core      yu-inspect                      ProjectionCache   macOS/Swift shell
+yu-text ◄── yu-markdown ◄── yu-projection ◄── yu-layout ◄── yu-editor ◄── yu-editor-ffi
+   ▲             ▲                                 ▲              ▲              ▲
+   │             │                                 │              │              │
+yu-core      yu-inspect                    block layout     ProjectionCache   macOS/Swift shell
 ```
 
 后续预计增加：
@@ -52,7 +52,6 @@ yu-core      yu-inspect                      ProjectionCache   macOS/Swift shell
 ```text
 yu-markdown-edit
 yu-font
-yu-layout
 yu-scene
 yu-render
 yu-platform
@@ -120,3 +119,10 @@ CommonMark inline AST。
 独立的 `CodeProjection`，只隐藏 fence 行并把 body 当作字面量 code run，不会把 body 中的
 Markdown delimiter 当成 emphasis。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
+
+`yu-layout::LayoutSnapshot` 是 block-local、revision-bound 的纯 Rust 布局契约：它消费
+`Projection` 的 visible runs，按 grapheme cluster 生成 `VisualLine`/`VisualCluster`，并提供
+`LayoutCaret` 与 `LayoutHit` 的 source/visual 双向查询。当前默认只使用确定性的
+`MonospaceMetrics`；真实字体 shaping 通过 `ClusterMetrics` 注入，布局层不依赖窗口或 GPU。
+`EditorDocument::block_layout` 目前每次返回一个新 snapshot，缓存和 viewport virtualization
+留到后续阶段。

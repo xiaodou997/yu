@@ -82,3 +82,14 @@
 6. `EditorDocument::markdown().revision()` 必须等于 canonical TextBuffer Revision；block-keyed
    projection 必须同时匹配当前 block 的 source range 和 BlockKind，fenced code 必须返回
    `BlockProjection::FencedCode`。
+
+## Layout
+
+1. `LayoutSnapshot::revision()` 必须等于其 Projection Revision；layout 不得持有另一份可编辑
+   source。
+2. `VisualCluster` 的 source range 必须位于一个 visible run 内，并且只能在 Unicode grapheme
+   boundary 拆分；hidden syntax 不产生可见宽度。
+3. Layout hit-test 返回的 source offset 必须通过 Projection 的 source/visual mapping，不能自行
+   计算第二套 delimiter 或 Unicode offset。
+4. `ClusterMetrics` 只能提供 advance，不得改变 source/visual ranges；无效或非有限 advance
+   必须拒绝构建 layout。

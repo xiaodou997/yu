@@ -384,6 +384,12 @@ impl Projection {
         self.source.revision()
     }
 
+    /// Returns the immutable source snapshot used by this projection.
+    #[must_use]
+    pub fn source(&self) -> &TextSnapshot {
+        &self.source
+    }
+
     #[must_use]
     pub const fn source_range(&self) -> TextRange {
         self.source_range
