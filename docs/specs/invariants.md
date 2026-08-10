@@ -116,3 +116,6 @@
    advance 必须报告错误或走明确 fallback，不能静默伪造平台字体状态。
 4. `MockShaper` 只用于确定性测试；CoreText、DirectWrite、Fontconfig 等平台实现必须通过
    同一 `TextShaper` 边界接入，不能进入 `EditorDocument` canonical state。
+5. 平台字体适配器可以在自身边界内持有 `CTFontRef` 等原生句柄，但跨边界结果必须是自有、可
+   发送的元数据或 `GlyphRun`；字体 catalog/fallback 查询不得修改 source Revision，也不得把
+   平台对象放入 `yu-font`、`yu-layout` 或 `EditorDocument` 的 canonical state。

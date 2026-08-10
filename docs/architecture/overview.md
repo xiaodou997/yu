@@ -148,3 +148,10 @@ block 结构变化则保守失效；切换 metrics/shaped backend 会把已测�
 不会冒充 CoreText/DirectWrite 的真实 shaping；`FontShaper` 将它桥接为 layout 的
 `ShapingProvider`，glyph advance 参与 line breaking，但不改变 source/visual 坐标。未来原生
 backend 可以替换它而不改变 layout 的 source/visual 坐标。
+
+`platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
+负责读取 CoreText 当前可见的 family 名称，`CoreTextFontResolver::resolve` 负责根据
+`FontRequest` 和文本请求 CoreText 的 family/fallback 选择；适配层只把自有的 family、PostScript
+name、size 和 fallback 标志返回给共享层，不让 `CTFontRef` 或其他平台句柄进入
+`yu-font`、`yu-layout` 或 `EditorDocument`。这一阶段尚未实现 glyph shaping/rasterization；下一步
+会在同一边界上增加真实的 `GlyphRun` provider。

@@ -55,6 +55,7 @@
 - [x] `yu-font` 字体 coverage/fallback、GlyphRun 与可替换 TextShaper 契约
 - [x] shaped glyph advance 接入 `yu-layout` 换行，并保持 source cluster hit-test 映射
 - [x] `yu-editor` LayoutCache/ViewportLayout 区分 metrics 与 shaped backend
+- [x] macOS-only CoreText family catalog 与 fallback resolver（只返回安全字体元数据）
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -98,6 +99,9 @@
     非有限 advance/offset 必须拒绝。
 18. `yu-editor` 的 metrics/shaped layout 必须使用不同 cache backend key；Viewport 切换 backend
     时必须清除旧的 measured height，且 provider 不得进入 `EditorDocument` 的 canonical state。
+19. macOS CoreText 调用必须隔离在 `platform/macos/yu-font-macos`；共享层只能接收自有的 family、
+   PostScript name、size 与 fallback 元数据，系统 family catalog 与 live resolver 必须有 macOS
+   实测测试；真实 glyph shaping/rasterization 仍属于下一阶段。
 
 ## 非目标
 

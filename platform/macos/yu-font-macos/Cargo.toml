@@ -1,0 +1,29 @@
+[package]
+name = "yu-font-macos"
+description = "macOS CoreText font catalog and fallback adapter for Yu Editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-font = { path = "../../../crates/yu-font" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFString",
+] }
+objc2-core-text = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CTDefines",
+    "CTFont",
+    "CTFontDescriptor",
+    "CTFontManager",
+] }
+
+[lints]
+workspace = true
