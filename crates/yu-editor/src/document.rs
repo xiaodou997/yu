@@ -7,7 +7,11 @@ use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
 };
 
-use crate::{CompositionError, CompositionOverlay};
+use crate::{
+    CommandResult, CompositionError, CompositionOverlay, EditorCommand, EditorSelection,
+    SelectionError,
+    command::{next_grapheme_boundary, previous_grapheme_boundary},
+};
 
 /// The canonical source and transient composition state owned by one editor.
 ///
@@ -18,15 +22,25 @@ use crate::{CompositionError, CompositionOverlay};
 pub struct EditorDocument {
     buffer: TextBuffer,
     composition: Option<CompositionOverlay>,
+    selection: EditorSelection,
 }
 
 impl EditorDocument {
     /// Creates a document at the initial revision.
     #[must_use]
     pub fn new(source: impl Into<String>) -> Self {
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let selection = EditorSelection::cursor(
+            &snapshot,
+            snapshot.len_bytes(),
+            crate::CaretAffinity::Downstream,
+        )
+        .expect("the end of a newly created source is a valid caret");
         Self {
-            buffer: TextBuffer::new(source),
+            buffer,
             composition: None,
+            selection,
         }
     }
 
@@ -48,6 +62,19 @@ impl EditorDocument {
         self.composition.as_ref()
     }
 
+    /// Returns the current source selection and caret endpoints.
+    #[must_use]
+    pub const fn selection(&self) -> EditorSelection {
+        self.selection
+    }
+
+    /// Replaces the selection after checking that it belongs to this revision.
+    pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), SelectionError> {
+        selection.utf16_range(&self.snapshot())?;
+        self.selection = selection;
+        Ok(())
+    }
+
     /// Applies a permanent transaction to the canonical source.
     ///
     /// An active composition is not implicitly rewritten or committed. If the
@@ -56,8 +83,12 @@ impl EditorDocument {
     pub fn apply_transaction(
         &mut self,
         transaction: &Transaction,
-    ) -> Result<AppliedTransaction, EditError> {
-        self.buffer.apply(transaction)
+    ) -> Result<AppliedTransaction, EditorDocumentError> {
+        let applied = self.buffer.apply(transaction)?;
+        self.selection = self
+            .selection
+            .map_through(applied.change_set(), applied.result_snapshot())?;
+        Ok(applied)
     }
 
     /// Starts or replaces the transient composition overlay.
@@ -111,8 +142,22 @@ impl EditorDocument {
             .composition
             .as_ref()
             .ok_or(EditorDocumentError::CompositionNotActive)?;
-        let transaction = composition.clone().commit(committed_text);
-        let applied = self.buffer.apply(&transaction)?;
+        let replacement_range = composition.replacement_range();
+        let committed_text: Arc<str> = committed_text.into();
+        let transaction = composition.clone().commit(Arc::clone(&committed_text));
+        let applied = self.apply_transaction(&transaction)?;
+        let cursor_offset = replacement_range
+            .start()
+            .checked_add(
+                u64::try_from(committed_text.len())
+                    .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
+            )
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        self.selection = EditorSelection::cursor(
+            applied.result_snapshot(),
+            cursor_offset,
+            crate::CaretAffinity::Downstream,
+        )?;
         self.composition = None;
         Ok(applied)
     }
@@ -129,7 +174,118 @@ impl EditorDocument {
             return Err(EditorDocumentError::CompositionActive);
         }
         self.buffer = TextBuffer::new(source);
+        let snapshot = self.snapshot();
+        self.selection = EditorSelection::cursor(
+            &snapshot,
+            snapshot.len_bytes(),
+            crate::CaretAffinity::Downstream,
+        )
+        .expect("the end of a reset source is a valid caret");
         Ok(())
+    }
+
+    /// Executes a small revision-bound editing command set.
+    pub fn execute(
+        &mut self,
+        command: EditorCommand,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        match command {
+            EditorCommand::InsertText(text) => self.insert_text(text),
+            EditorCommand::DeleteBackward => self.delete_backward(),
+            EditorCommand::DeleteForward => self.delete_forward(),
+            EditorCommand::MoveLeft => self.move_left(),
+            EditorCommand::MoveRight => self.move_right(),
+        }
+    }
+
+    fn insert_text(&mut self, text: Arc<str>) -> Result<CommandResult, EditorDocumentError> {
+        if text.is_empty() {
+            return Ok(self.command_result(false));
+        }
+        let range = self.selection.ordered_range();
+        let offset = range
+            .start()
+            .checked_add(
+                u64::try_from(text.len())
+                    .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
+            )
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        let transaction = Transaction::new(
+            self.revision(),
+            [yu_text::Edit::new(range, Arc::clone(&text))],
+        );
+        let applied = self.apply_transaction(&transaction)?;
+        self.selection = EditorSelection::cursor(
+            applied.result_snapshot(),
+            offset,
+            crate::CaretAffinity::Downstream,
+        )?;
+        Ok(self.command_result(true))
+    }
+
+    fn delete_backward(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let range = if self.selection.is_empty() {
+            let start = previous_grapheme_boundary(&self.snapshot(), self.selection.focus())?;
+            TextRange::new(start, self.selection.focus())
+                .expect("previous grapheme boundary must precede caret")
+        } else {
+            self.selection.ordered_range()
+        };
+        self.delete_range(range)
+    }
+
+    fn delete_forward(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let range = if self.selection.is_empty() {
+            let end = next_grapheme_boundary(&self.snapshot(), self.selection.focus())?;
+            TextRange::new(self.selection.focus(), end)
+                .expect("next grapheme boundary must follow caret")
+        } else {
+            self.selection.ordered_range()
+        };
+        self.delete_range(range)
+    }
+
+    fn delete_range(&mut self, range: TextRange) -> Result<CommandResult, EditorDocumentError> {
+        if range.is_empty() {
+            return Ok(self.command_result(false));
+        }
+        let transaction = Transaction::new(
+            self.revision(),
+            [yu_text::Edit::new(range, Arc::<str>::from(""))],
+        );
+        let applied = self.apply_transaction(&transaction)?;
+        self.selection = EditorSelection::cursor(
+            applied.result_snapshot(),
+            range.start(),
+            crate::CaretAffinity::Downstream,
+        )?;
+        Ok(self.command_result(true))
+    }
+
+    fn move_left(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let target = if self.selection.is_empty() {
+            previous_grapheme_boundary(&self.snapshot(), self.selection.focus())?
+        } else {
+            self.selection.ordered_range().start()
+        };
+        self.selection =
+            EditorSelection::cursor(&self.snapshot(), target, crate::CaretAffinity::Downstream)?;
+        Ok(self.command_result(false))
+    }
+
+    fn move_right(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let target = if self.selection.is_empty() {
+            next_grapheme_boundary(&self.snapshot(), self.selection.focus())?
+        } else {
+            self.selection.ordered_range().end()
+        };
+        self.selection =
+            EditorSelection::cursor(&self.snapshot(), target, crate::CaretAffinity::Downstream)?;
+        Ok(self.command_result(false))
+    }
+
+    fn command_result(&self, changed: bool) -> CommandResult {
+        CommandResult::new(self.revision(), self.selection, changed)
     }
 }
 
@@ -139,6 +295,7 @@ pub enum EditorDocumentError {
     Composition(CompositionError),
     Edit(EditError),
     Position(TextPositionError),
+    Selection(SelectionError),
     CompositionNotActive,
     CompositionActive,
 }
@@ -149,6 +306,7 @@ impl fmt::Display for EditorDocumentError {
             Self::Composition(error) => error.fmt(formatter),
             Self::Edit(error) => error.fmt(formatter),
             Self::Position(error) => error.fmt(formatter),
+            Self::Selection(error) => error.fmt(formatter),
             Self::CompositionNotActive => formatter.write_str("no active composition"),
             Self::CompositionActive => formatter.write_str("composition is already active"),
         }
@@ -161,6 +319,7 @@ impl Error for EditorDocumentError {
             Self::Composition(error) => Some(error),
             Self::Edit(error) => Some(error),
             Self::Position(error) => Some(error),
+            Self::Selection(error) => Some(error),
             Self::CompositionNotActive | Self::CompositionActive => None,
         }
     }
@@ -181,6 +340,12 @@ impl From<EditError> for EditorDocumentError {
 impl From<TextPositionError> for EditorDocumentError {
     fn from(error: TextPositionError) -> Self {
         Self::Position(error)
+    }
+}
+
+impl From<SelectionError> for EditorDocumentError {
+    fn from(error: SelectionError) -> Self {
+        Self::Selection(error)
     }
 }
 
@@ -222,7 +387,84 @@ mod tests {
             .expect("Japanese composition should commit");
         assert_eq!(document.snapshot().as_str(), "输入: 日本語");
         assert_eq!(document.revision(), Revision::new(1));
+        assert_eq!(
+            document.selection().focus().get(),
+            "输入: 日本語".len() as u64
+        );
         assert!(document.composition().is_none());
+    }
+
+    #[test]
+    fn commands_edit_unicode_graphemes_and_share_document_revision() {
+        let mut document = EditorDocument::new("e\u{301}x");
+        let start = EditorSelection::cursor(
+            &document.snapshot(),
+            yu_core::ByteOffset::ZERO,
+            crate::CaretAffinity::Downstream,
+        )
+        .expect("start caret should be valid");
+        document
+            .set_selection(start)
+            .expect("selection should belong to document");
+
+        let inserted = document
+            .execute(EditorCommand::insert_text("羽"))
+            .expect("insert should succeed");
+        assert!(inserted.changed());
+        assert_eq!(inserted.revision(), Revision::new(1));
+        assert_eq!(document.snapshot().as_str(), "羽e\u{301}x");
+        assert_eq!(document.selection().focus().get(), "羽".len() as u64);
+
+        document
+            .execute(EditorCommand::DeleteBackward)
+            .expect("backspace should remove one grapheme");
+        assert_eq!(document.snapshot().as_str(), "e\u{301}x");
+        assert_eq!(document.revision(), Revision::new(2));
+
+        document
+            .execute(EditorCommand::MoveRight)
+            .expect("right should move over one grapheme");
+        document
+            .execute(EditorCommand::DeleteForward)
+            .expect("forward delete should remove x");
+        assert_eq!(document.snapshot().as_str(), "e\u{301}");
+        assert_eq!(document.revision(), Revision::new(3));
+    }
+
+    #[test]
+    fn external_transaction_maps_selection_to_the_new_revision() {
+        let mut document = EditorDocument::new("abc");
+        let selection = EditorSelection::cursor(
+            &document.snapshot(),
+            yu_core::ByteOffset::new(1),
+            crate::CaretAffinity::Downstream,
+        )
+        .expect("caret should be valid");
+        document
+            .set_selection(selection)
+            .expect("selection should belong to document");
+        let transaction =
+            Transaction::new(document.revision(), [Edit::new(source_range(0, 0), "羽")]);
+
+        document
+            .apply_transaction(&transaction)
+            .expect("external transaction should apply");
+        assert_eq!(document.revision(), Revision::new(1));
+        assert_eq!(document.selection().focus().get(), "羽a".len() as u64);
+    }
+
+    #[test]
+    fn selection_from_an_old_revision_cannot_be_set() {
+        let mut document = EditorDocument::new("old");
+        let old_selection = document.selection();
+        document
+            .execute(EditorCommand::insert_text("new"))
+            .expect("insert should succeed");
+
+        assert!(matches!(
+            document.set_selection(old_selection),
+            Err(SelectionError::StaleRevision { .. })
+        ));
     }
 
     #[test]

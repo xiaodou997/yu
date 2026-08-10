@@ -97,6 +97,20 @@ private final class RustCompositionBridge {
         return value
     }
 
+    func selection() -> (revision: UInt64, range: NSRange) {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var revision: UInt64 = 0
+        var start: UInt64 = 0
+        var end: UInt64 = 0
+        let status = yu_composition_session_selection(session, &revision, &start, &end)
+        precondition(status == 0, "Rust composition selection query failed: \(status)")
+        precondition(end >= start, "Rust composition selection range must be ordered")
+        return (
+            revision,
+            NSRange(location: Int(start), length: Int(end - start))
+        )
+    }
+
     func sourceString(utf16Length: Int) -> String {
         guard let session else { preconditionFailure("Rust composition session is missing") }
         precondition(utf16Length >= 0, "Rust composition UTF-16 length must be non-negative")
@@ -260,7 +274,14 @@ final class TextInputView: NSView, NSTextInputClient {
         }
         rustComposition.commit(inserted.string)
         replaceStorage(range: target, with: inserted)
-        selection = NSRange(location: target.location + inserted.length, length: 0)
+        let rustSelection = rustComposition.selection()
+        let expectedSelection = NSRange(location: target.location + inserted.length, length: 0)
+        precondition(
+            rustSelection.revision == rustComposition.revision()
+                && rustSelection.range == expectedSelection,
+            "Rust selection must follow committed source"
+        )
+        selection = rustSelection.range
         selectionAffinity = .downstream
         marked = notFoundRange
         compositionOriginal = nil

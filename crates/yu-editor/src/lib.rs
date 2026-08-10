@@ -4,8 +4,10 @@
 
 mod accessibility;
 mod caret;
+mod command;
 mod composition;
 mod document;
+mod selection;
 
 pub use accessibility::{
     AccessibilityTextError, AccessibilityTextPosition, AccessibilityTextRange,
@@ -14,5 +16,7 @@ pub use accessibility::{
 pub use caret::{
     CaretAffinity, CaretPositionError, CaretPositionMap, NativeCaretPosition, SourceCaretPosition,
 };
+pub use command::{CommandResult, EditorCommand};
 pub use composition::{CompositionError, CompositionOverlay};
 pub use document::{EditorDocument, EditorDocumentError};
+pub use selection::{EditorSelection, SelectionError};
