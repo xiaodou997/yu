@@ -3,14 +3,15 @@ use std::fmt;
 use std::sync::Arc;
 
 use yu_core::{Revision, TextRange, Utf16Range};
-use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument};
+use yu_markdown::{IncrementalParseError, MarkdownDocument};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
 };
 
 use crate::{
-    CommandResult, CompositionError, CompositionOverlay, EditorCommand, EditorSelection,
-    Projection, ProjectionCache, ProjectionCacheStats, ProjectionError, SelectionError,
+    BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
+    EditorSelection, Projection, ProjectionCache, ProjectionCacheStats, ProjectionError,
+    SelectionError,
     command::{next_grapheme_boundary, previous_grapheme_boundary},
 };
 
@@ -96,7 +97,10 @@ impl EditorDocument {
     }
 
     /// Returns the projection for one parser-owned Markdown block.
-    pub fn block_projection(&mut self, index: usize) -> Result<&Projection, EditorDocumentError> {
+    pub fn block_projection(
+        &mut self,
+        index: usize,
+    ) -> Result<&BlockProjection, EditorDocumentError> {
         let block =
             self.markdown
                 .blocks()
@@ -105,12 +109,6 @@ impl EditorDocument {
                     index,
                     blocks: self.markdown.blocks().len(),
                 })?;
-        if matches!(block.kind(), BlockKind::FencedCodeBlock { .. }) {
-            return Err(EditorDocumentError::BlockNotProjectable {
-                index,
-                kind: block.kind(),
-            });
-        }
         let snapshot = self.snapshot();
         self.projections
             .get_or_build_block(&snapshot, block)
@@ -360,7 +358,6 @@ pub enum EditorDocumentError {
     Projection(ProjectionError),
     Selection(SelectionError),
     BlockOutOfBounds { index: usize, blocks: usize },
-    BlockNotProjectable { index: usize, kind: BlockKind },
     CompositionNotActive,
     CompositionActive,
 }
@@ -380,12 +377,6 @@ impl fmt::Display for EditorDocumentError {
                     "Markdown block index {index} is outside {blocks} blocks"
                 )
             }
-            Self::BlockNotProjectable { index, kind } => {
-                write!(
-                    formatter,
-                    "Markdown block {index} with kind {kind:?} is not projectable"
-                )
-            }
             Self::CompositionNotActive => formatter.write_str("no active composition"),
             Self::CompositionActive => formatter.write_str("composition is already active"),
         }
@@ -402,7 +393,6 @@ impl Error for EditorDocumentError {
             Self::Projection(error) => Some(error),
             Self::Selection(error) => Some(error),
             Self::BlockOutOfBounds { .. }
-            | Self::BlockNotProjectable { .. }
             | Self::CompositionNotActive
             | Self::CompositionActive => None,
         }
@@ -450,6 +440,7 @@ mod tests {
     use super::*;
     use crate::VisualRunKind;
     use yu_core::{ByteOffset, Utf16Offset};
+    use yu_markdown::BlockKind;
     use yu_text::Edit;
 
     fn source_range(start: u64, end: u64) -> TextRange {
@@ -657,6 +648,7 @@ mod tests {
             assert_eq!(projection.source_range(), old_range);
             assert_eq!(
                 projection
+                    .visual()
                     .runs()
                     .iter()
                     .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
@@ -691,19 +683,65 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_blocks_are_not_sent_through_inline_projection() {
+    fn fenced_code_blocks_use_the_independent_code_projection() {
         let mut document = EditorDocument::new("```rust\n**code**\n```\n");
-        assert!(matches!(
-            document.block_projection(0),
-            Err(EditorDocumentError::BlockNotProjectable {
-                index: 0,
-                kind: BlockKind::FencedCodeBlock { .. }
-            })
-        ));
+        {
+            let projection = document
+                .block_projection(0)
+                .expect("fenced code projection should build");
+            match projection {
+                BlockProjection::FencedCode(code) => {
+                    assert_eq!(code.marker(), '`');
+                    assert!(code.closed());
+                    assert_eq!(code.visual().visual_len().get(), code.content().len());
+                    assert!(code.visual().runs().iter().any(|run| {
+                        run.kind() == VisualRunKind::Visible
+                            && run.style() == crate::VisualRunStyle::Code
+                    }));
+                }
+                BlockProjection::Inline(_) => panic!("fenced code must not use inline projection"),
+            }
+        }
+        assert_eq!(
+            document.projection_cache_stats().entries(),
+            1,
+            "code projection should be cached by block key"
+        );
         assert!(matches!(
             document.block_projection(1),
             Err(EditorDocumentError::BlockOutOfBounds { index: 1, .. })
         ));
+    }
+
+    #[test]
+    fn cached_code_projection_remaps_when_a_prefix_edit_shifts_the_block() {
+        let mut document = EditorDocument::new("intro\n\n```rust\n**code**\n```\n");
+        let old_content = match document
+            .block_projection(2)
+            .expect("fenced code projection should build")
+        {
+            BlockProjection::FencedCode(code) => code.content(),
+            BlockProjection::Inline(_) => panic!("fenced code must use code projection"),
+        };
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("prefix edit should apply");
+
+        let projection = document
+            .block_projection(2)
+            .expect("shifted code projection should be reusable");
+        let new_content = match projection {
+            BlockProjection::FencedCode(code) => code.content(),
+            BlockProjection::Inline(_) => panic!("fenced code must use code projection"),
+        };
+        assert_eq!(new_content.start().get(), old_content.start().get() + 3);
+        assert_eq!(new_content.end().get(), old_content.end().get() + 3);
+        assert_eq!(document.projection_cache_stats().builds(), 1);
+        assert_eq!(document.projection_cache_stats().remapped(), 1);
     }
 
     #[test]

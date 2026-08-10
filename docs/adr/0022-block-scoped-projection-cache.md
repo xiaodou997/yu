@@ -21,7 +21,7 @@ ProjectionCache 的 range remap，并按新的 block range/kind 保留 entry。
 - 同一 block range/kind 在当前 Revision 命中 cache；
 - prefix/suffix edit 先通过 ChangeSet 映射 range，再由新 block sequence 验证仍匹配；
 - block 内容、边界或 kind 变化会失效；
-- fenced code block 暂不通过 inline Projection，避免把代码 fence 当作 Markdown emphasis；
+- fenced code block 不通过 inline Projection，后续由独立的 CodeProjection 负责；
 - 原有裸 `projection(range)` 保留为底层实验入口，后续产品调用优先使用 block API。
 
 ## 结果
@@ -32,5 +32,6 @@ ProjectionCache 的 range remap，并按新的 block range/kind 保留 entry。
 
 ## 限制
 
-当前 block projection 仍使用 flat inline token layer，尚未建立 block 内的 semantic inline tree、
-layout 或 viewport virtualization。fenced code 的专用 code projection 留到后续阶段。
+当前 block projection 已能区分 parser-owned semantic inline spans 与 fenced code projection，
+但尚未建立完整的 inline tree、layout 或 viewport virtualization。CodeProjection 也尚未包含
+语法高亮或代码编辑 overlay。

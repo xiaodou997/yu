@@ -1,6 +1,6 @@
 use yu_core::{Revision, TextRange};
 use yu_markdown::{Block, BlockKind, MarkdownDocument};
-use yu_projection::{Projection, ProjectionError};
+use yu_projection::{BlockProjection, Projection, ProjectionError};
 use yu_text::{ChangeSet, TextSnapshot};
 
 /// Cumulative counters for one editor's source-backed projection cache.
@@ -60,12 +60,6 @@ enum ProjectionKey {
 }
 
 impl ProjectionKey {
-    fn range(self) -> TextRange {
-        match self {
-            Self::Range(range) | Self::Block { range, .. } => range,
-        }
-    }
-
     fn remapped(self, range: TextRange) -> Self {
         match self {
             Self::Range(_) => Self::Range(range),
@@ -77,7 +71,7 @@ impl ProjectionKey {
 #[derive(Debug)]
 struct ProjectionEntry {
     key: ProjectionKey,
-    projection: Projection,
+    projection: BlockProjection,
 }
 
 impl ProjectionCache {
@@ -87,7 +81,13 @@ impl ProjectionCache {
         snapshot: &TextSnapshot,
         range: TextRange,
     ) -> Result<&Projection, ProjectionError> {
-        self.get_or_build_key(snapshot, ProjectionKey::Range(range))
+        let index = self.get_or_build_key(snapshot, ProjectionKey::Range(range), || {
+            Projection::inline(snapshot, range).map(BlockProjection::Inline)
+        })?;
+        match &self.entries[index].projection {
+            BlockProjection::Inline(projection) => Ok(projection),
+            BlockProjection::FencedCode(_) => unreachable!("range projections are inline"),
+        }
     }
 
     /// Returns a projection keyed by one Markdown block's range and kind.
@@ -95,21 +95,27 @@ impl ProjectionCache {
         &mut self,
         snapshot: &TextSnapshot,
         block: Block,
-    ) -> Result<&Projection, ProjectionError> {
-        self.get_or_build_key(
+    ) -> Result<&BlockProjection, ProjectionError> {
+        let index = self.get_or_build_key(
             snapshot,
             ProjectionKey::Block {
                 range: block.range(),
                 kind: block.kind(),
             },
-        )
+            || BlockProjection::from_block(snapshot, block),
+        )?;
+        Ok(&self.entries[index].projection)
     }
 
-    fn get_or_build_key(
+    fn get_or_build_key<F>(
         &mut self,
         snapshot: &TextSnapshot,
         key: ProjectionKey,
-    ) -> Result<&Projection, ProjectionError> {
+        build: F,
+    ) -> Result<usize, ProjectionError>
+    where
+        F: FnOnce() -> Result<BlockProjection, ProjectionError>,
+    {
         let current_revision = snapshot.revision();
         let stale = self
             .entries
@@ -124,14 +130,13 @@ impl ProjectionCache {
 
         if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
             self.stats.hits = self.stats.hits.saturating_add(1);
-            return Ok(&self.entries[index].projection);
+            return Ok(index);
         }
 
-        let projection = Projection::inline(snapshot, key.range())?;
+        let projection = build()?;
         self.entries.push(ProjectionEntry { key, projection });
         self.stats.builds = self.stats.builds.saturating_add(1);
-        let index = self.entries.len().saturating_sub(1);
-        Ok(&self.entries[index].projection)
+        Ok(self.entries.len().saturating_sub(1))
     }
 
     /// Applies a successful source change to every cached projection.

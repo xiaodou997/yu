@@ -108,12 +108,15 @@ UTF-16 boundary/affinity。这样 AppKit 的原生 selection 与 caret affinity 
 
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/hidden runs 和双向 mapping，不生成第二份可编辑文本。
-它通过 `yu-markdown::parse_inline` 获取 parser-owned `InlineDocument`，不再在 projection 内
-维护另一套 delimiter scanner；当前 token layer 和 pairing 仍是保守风险验证，正式 inline CST
-扩展后继续复用同一个 source/visual mapping 边界。
+它通过 `yu-markdown::parse_inline` 获取 parser-owned `InlineDocument` 和 matched
+`InlineSpan`，不再在 projection 内维护 delimiter pairing；visible run 同时携带 Plain、Emphasis、
+Strong 或 Code style，供后续 layout 使用。当前 span 仍是保守的 Phase 1 语义层，不宣称完整
+CommonMark inline AST。
 
 `yu-editor::EditorDocument` 拥有 revision-bound `ProjectionCache`：同一 Revision/range 查询命中
 缓存，永久 edit 会映射严格位于 changed range 外的 projection，并保守地使相交或边界 projection
 失效。`block_projection(index)` 以当前 `MarkdownDocument` 的 `(range, kind)` 为 key，并在
-增量 block sequence 更新后再次验证 entry；fenced code block 暂不进入 inline projection。
+增量 block sequence 更新后再次验证 entry；普通 block 返回 inline projection，fenced code 返回
+独立的 `CodeProjection`，只隐藏 fence 行并把 body 当作字面量 code run，不会把 body 中的
+Markdown delimiter 当成 emphasis。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。

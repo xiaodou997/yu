@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 use yu_markdown::{
-    InlineDelimiter, InlineDocument, InlineNodeKind, InlineParseError, parse_inline,
+    Block, BlockKind, InlineDocument, InlineParseError, InlineSpan, InlineSpanKind, parse_inline,
 };
 use yu_text::{AnchorMapError, ChangeSet, TextChange, TextPositionError, TextSnapshot};
 
@@ -111,12 +111,22 @@ pub enum VisualRunKind {
     HiddenSyntax,
 }
 
+/// Semantic style carried by a visible visual run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VisualRunStyle {
+    Plain,
+    Emphasis,
+    Strong,
+    Code,
+}
+
 /// A source-backed visual run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VisualRun {
     source: TextRange,
     visual: VisualRange,
     kind: VisualRunKind,
+    style: VisualRunStyle,
 }
 
 impl VisualRun {
@@ -133,6 +143,11 @@ impl VisualRun {
     #[must_use]
     pub const fn kind(self) -> VisualRunKind {
         self.kind
+    }
+
+    #[must_use]
+    pub const fn style(self) -> VisualRunStyle {
+        self.style
     }
 }
 
@@ -168,6 +183,12 @@ pub enum ProjectionError {
         offset: VisualOffset,
         len: VisualOffset,
     },
+    NotFencedCodeBlock {
+        kind: BlockKind,
+    },
+    InvalidCodeBlock {
+        range: TextRange,
+    },
     OffsetOverflow,
 }
 
@@ -197,6 +218,12 @@ impl fmt::Display for ProjectionError {
                     "visual offset {offset:?} is outside length {len:?}"
                 )
             }
+            Self::NotFencedCodeBlock { kind } => {
+                write!(formatter, "block kind {kind:?} is not a fenced code block")
+            }
+            Self::InvalidCodeBlock { range } => {
+                write!(formatter, "invalid fenced code block range {range:?}")
+            }
             Self::OffsetOverflow => formatter.write_str("projection offset overflow"),
         }
     }
@@ -212,6 +239,8 @@ impl Error for ProjectionError {
             | Self::BeforeRevisionMismatch { .. }
             | Self::AfterRevisionMismatch { .. }
             | Self::VisualOutOfBounds { .. }
+            | Self::NotFencedCodeBlock { .. }
+            | Self::InvalidCodeBlock { .. }
             | Self::OffsetOverflow => None,
         }
     }
@@ -263,10 +292,30 @@ impl Projection {
     pub fn from_inline(inline: &InlineDocument) -> Result<Self, ProjectionError> {
         let source = inline.source();
         let source_range = inline.source_range();
+        let hidden = inline
+            .spans()
+            .iter()
+            .flat_map(|span| [span.opening(), span.closing()])
+            .collect::<Vec<_>>();
+        Self::from_source_parts(
+            source,
+            source_range,
+            &hidden,
+            inline.spans(),
+            VisualRunStyle::Plain,
+        )
+    }
+
+    fn from_source_parts(
+        source: &TextSnapshot,
+        source_range: TextRange,
+        hidden: &[TextRange],
+        spans: &[InlineSpan],
+        default_style: VisualRunStyle,
+    ) -> Result<Self, ProjectionError> {
         source.utf16_offset(source_range.start())?;
         source.utf16_offset(source_range.end())?;
-        let hidden = find_hidden_ranges(inline)?;
-        let runs = build_runs(source_range, &hidden)?;
+        let runs = build_runs(source_range, hidden, spans, default_style)?;
         let visual_len = runs
             .last()
             .map_or(VisualOffset::ZERO, |run| run.visual.end());
@@ -317,6 +366,7 @@ impl Projection {
                 source: map_range(run.source, changes)?,
                 visual: run.visual,
                 kind: run.kind,
+                style: run.style,
             });
         }
         snapshot.utf16_offset(source_range.start())?;
@@ -485,146 +535,83 @@ fn map_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, Project
     TextRange::new(start, end).ok_or(ProjectionError::OffsetOverflow)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Delimiter {
-    marker: InlineDelimiter,
-    len: usize,
-    range: TextRange,
-}
-
-fn find_hidden_ranges(inline: &InlineDocument) -> Result<Vec<TextRange>, ProjectionError> {
-    let delimiters = inline
-        .nodes()
-        .iter()
-        .filter_map(|node| match node.kind() {
-            InlineNodeKind::Delimiter { marker } => Some((marker, node.range())),
-            InlineNodeKind::Text | InlineNodeKind::Escaped => None,
-        })
-        .map(|(marker, range)| {
-            Ok(Delimiter {
-                marker,
-                len: usize::try_from(range.len()).map_err(|_| ProjectionError::OffsetOverflow)?,
-                range,
-            })
-        })
-        .collect::<Result<Vec<_>, ProjectionError>>()?;
-    let code_pairs = pair_delimiters(&delimiters, InlineDelimiter::Code);
-    let mut hidden = code_pairs
-        .iter()
-        .flat_map(|pair| [pair.start(), pair.end()])
-        .collect::<Vec<_>>();
-
-    let inline_delimiters = delimiters
-        .iter()
-        .copied()
-        .filter(|delimiter| delimiter.marker != InlineDelimiter::Code)
-        .filter(|delimiter| {
-            !code_pairs.iter().any(|pair| {
-                pair.start().end() < delimiter.range.start()
-                    && delimiter.range.end() < pair.end().start()
-            })
-        })
-        .collect::<Vec<_>>();
-    for pair in pair_delimiters(&inline_delimiters, InlineDelimiter::Star) {
-        hidden.extend([pair.start(), pair.end()]);
-    }
-    for pair in pair_delimiters(&inline_delimiters, InlineDelimiter::Underscore) {
-        hidden.extend([pair.start(), pair.end()]);
-    }
-    hidden.sort_by_key(|range| (range.start(), range.end()));
-    Ok(hidden)
-}
-
-fn pair_delimiters(delimiters: &[Delimiter], marker: InlineDelimiter) -> Vec<TextRangePair> {
-    let mut openings = Vec::new();
-    let mut pairs = Vec::new();
-    for delimiter in delimiters
-        .iter()
-        .copied()
-        .filter(|item| item.marker == marker)
-    {
-        if let Some(opening_index) = openings
-            .iter()
-            .rposition(|opening: &Delimiter| opening.len == delimiter.len)
-        {
-            let opening = openings.remove(opening_index);
-            if opening.range.end() < delimiter.range.start() {
-                pairs.push(TextRangePair {
-                    start: opening.range,
-                    end: delimiter.range,
-                });
-                continue;
-            }
-        }
-        openings.push(delimiter);
-    }
-    pairs
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TextRangePair {
-    start: TextRange,
-    end: TextRange,
-}
-
-impl TextRangePair {
-    #[must_use]
-    const fn start(self) -> TextRange {
-        self.start
-    }
-
-    #[must_use]
-    const fn end(self) -> TextRange {
-        self.end
-    }
-}
-
 fn build_runs(
     source_range: TextRange,
     hidden: &[TextRange],
+    spans: &[InlineSpan],
+    default_style: VisualRunStyle,
 ) -> Result<Vec<VisualRun>, ProjectionError> {
     let mut runs = Vec::new();
-    let mut source_cursor =
-        usize::try_from(source_range.start()).map_err(|_| ProjectionError::OffsetOverflow)?;
-    let source_end =
-        usize::try_from(source_range.end()).map_err(|_| ProjectionError::OffsetOverflow)?;
+    let mut source_cursor = source_range.start();
     let mut visual_cursor = VisualOffset::ZERO;
-    for hidden_range in hidden {
+    let mut hidden = hidden.to_vec();
+    hidden.sort_by_key(|range| (range.start(), range.end()));
+    for hidden_range in &hidden {
         if hidden_range.start() < source_range.start() || hidden_range.end() > source_range.end() {
             return Err(ProjectionError::SourceOutsideRange {
                 offset: hidden_range.start(),
                 range: source_range,
             });
         }
-        let hidden_start =
-            usize::try_from(hidden_range.start()).map_err(|_| ProjectionError::OffsetOverflow)?;
-        let hidden_end =
-            usize::try_from(hidden_range.end()).map_err(|_| ProjectionError::OffsetOverflow)?;
-        if source_cursor < hidden_start {
-            let visible = byte_range(source_cursor, hidden_start)?;
-            let visual_end = visual_cursor
-                .checked_add(visible.len())
-                .ok_or(ProjectionError::OffsetOverflow)?;
-            runs.push(VisualRun {
-                source: visible,
-                visual: VisualRange::new(visual_cursor, visual_end)
-                    .ok_or(ProjectionError::OffsetOverflow)?,
-                kind: VisualRunKind::Visible,
-            });
-            visual_cursor = visual_end;
+        if hidden_range.start() > source_cursor {
+            visual_cursor = append_visible_runs(
+                &mut runs,
+                source_cursor,
+                hidden_range.start(),
+                visual_cursor,
+                spans,
+                default_style,
+            )?;
         }
-        if hidden_start < source_cursor {
+        if hidden_range.end() <= source_cursor {
             continue;
         }
         runs.push(VisualRun {
             source: *hidden_range,
             visual: VisualRange::empty(visual_cursor),
             kind: VisualRunKind::HiddenSyntax,
+            style: VisualRunStyle::Plain,
         });
-        source_cursor = hidden_end;
+        source_cursor = hidden_range.end();
     }
-    if source_cursor < source_end {
-        let visible = byte_range(source_cursor, source_end)?;
+    if source_cursor < source_range.end() {
+        append_visible_runs(
+            &mut runs,
+            source_cursor,
+            source_range.end(),
+            visual_cursor,
+            spans,
+            default_style,
+        )?;
+    }
+    Ok(runs)
+}
+
+fn append_visible_runs(
+    runs: &mut Vec<VisualRun>,
+    start: ByteOffset,
+    end: ByteOffset,
+    mut visual_cursor: VisualOffset,
+    spans: &[InlineSpan],
+    default_style: VisualRunStyle,
+) -> Result<VisualOffset, ProjectionError> {
+    let mut boundaries = vec![start, end];
+    for span in spans {
+        let content = span.content();
+        if content.start() > start && content.start() < end {
+            boundaries.push(content.start());
+        }
+        if content.end() > start && content.end() < end {
+            boundaries.push(content.end());
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    for pair in boundaries.windows(2) {
+        let visible = TextRange::new(pair[0], pair[1]).ok_or(ProjectionError::OffsetOverflow)?;
+        if visible.is_empty() {
+            continue;
+        }
         let visual_end = visual_cursor
             .checked_add(visible.len())
             .ok_or(ProjectionError::OffsetOverflow)?;
@@ -633,9 +620,336 @@ fn build_runs(
             visual: VisualRange::new(visual_cursor, visual_end)
                 .ok_or(ProjectionError::OffsetOverflow)?,
             kind: VisualRunKind::Visible,
+            style: style_for(visible, spans, default_style),
         });
+        visual_cursor = visual_end;
     }
-    Ok(runs)
+    Ok(visual_cursor)
+}
+
+fn style_for(
+    range: TextRange,
+    spans: &[InlineSpan],
+    default_style: VisualRunStyle,
+) -> VisualRunStyle {
+    spans
+        .iter()
+        .filter(|span| {
+            span.content().start() <= range.start() && range.end() <= span.content().end()
+        })
+        .min_by_key(|span| {
+            (
+                span.content().len(),
+                match span.kind() {
+                    InlineSpanKind::CodeSpan => 0_u8,
+                    InlineSpanKind::Strong => 1,
+                    InlineSpanKind::Emphasis => 2,
+                },
+            )
+        })
+        .map_or(default_style, |span| match span.kind() {
+            InlineSpanKind::Emphasis => VisualRunStyle::Emphasis,
+            InlineSpanKind::Strong => VisualRunStyle::Strong,
+            InlineSpanKind::CodeSpan => VisualRunStyle::Code,
+        })
+}
+
+/// The kind of visual block projection produced by the editor pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlockProjectionKind {
+    Inline,
+    FencedCode,
+}
+
+/// A source-backed fenced-code projection.
+///
+/// Fence lines are hidden from the visual stream, while the body is kept as a
+/// code-styled visible run. Markdown inline delimiters inside the body are
+/// never parsed or paired by this projection.
+#[derive(Clone, Debug)]
+pub struct CodeProjection {
+    visual: Projection,
+    opening_fence: TextRange,
+    info_string: TextRange,
+    content: TextRange,
+    closing_fence: Option<TextRange>,
+    marker: char,
+    closed: bool,
+}
+
+impl CodeProjection {
+    pub fn from_block(source: &TextSnapshot, block: Block) -> Result<Self, ProjectionError> {
+        let BlockKind::FencedCodeBlock { marker, closed } = block.kind() else {
+            return Err(ProjectionError::NotFencedCodeBlock { kind: block.kind() });
+        };
+        source.utf16_offset(block.range().start())?;
+        source.utf16_offset(block.range().end())?;
+        let lines = line_ranges(source, block.range())?;
+        let opening_fence = lines
+            .first()
+            .copied()
+            .ok_or(ProjectionError::InvalidCodeBlock {
+                range: block.range(),
+            })?;
+        let closing_fence = if closed {
+            lines.last().copied().filter(|line| *line != opening_fence)
+        } else {
+            None
+        };
+        let content_start = opening_fence.end();
+        let content_end = closing_fence.map_or(block.range().end(), TextRange::start);
+        let content = TextRange::new(content_start, content_end).ok_or(
+            ProjectionError::InvalidCodeBlock {
+                range: block.range(),
+            },
+        )?;
+        let info_string = code_info_range(source, opening_fence, marker)?;
+        let mut hidden = vec![opening_fence];
+        if let Some(closing) = closing_fence {
+            hidden.push(closing);
+        }
+        let visual = Projection::from_source_parts(
+            source,
+            block.range(),
+            &hidden,
+            &[],
+            VisualRunStyle::Code,
+        )?;
+        Ok(Self {
+            visual,
+            opening_fence,
+            info_string,
+            content,
+            closing_fence,
+            marker,
+            closed,
+        })
+    }
+
+    #[must_use]
+    pub fn visual(&self) -> &Projection {
+        &self.visual
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.visual.revision()
+    }
+
+    #[must_use]
+    pub fn source_range(&self) -> TextRange {
+        self.visual.source_range()
+    }
+
+    #[must_use]
+    pub const fn opening_fence(&self) -> TextRange {
+        self.opening_fence
+    }
+
+    #[must_use]
+    pub const fn info_string(&self) -> TextRange {
+        self.info_string
+    }
+
+    #[must_use]
+    pub const fn content(&self) -> TextRange {
+        self.content
+    }
+
+    #[must_use]
+    pub const fn closing_fence(&self) -> Option<TextRange> {
+        self.closing_fence
+    }
+
+    #[must_use]
+    pub const fn marker(&self) -> char {
+        self.marker
+    }
+
+    #[must_use]
+    pub const fn closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn map_through(
+        &self,
+        changes: &ChangeSet,
+        snapshot: &TextSnapshot,
+    ) -> Result<Option<Self>, ProjectionError> {
+        let Some(visual) = self.visual.map_through(changes, snapshot)? else {
+            return Ok(None);
+        };
+        let opening_fence = map_range(self.opening_fence, changes)?;
+        let info_string = map_range(self.info_string, changes)?;
+        let content = map_range(self.content, changes)?;
+        let closing_fence = self
+            .closing_fence
+            .map(|range| map_range(range, changes))
+            .transpose()?;
+        Ok(Some(Self {
+            visual,
+            opening_fence,
+            info_string,
+            content,
+            closing_fence,
+            marker: self.marker,
+            closed: self.closed,
+        }))
+    }
+}
+
+/// A block projection selected from the Markdown block sequence.
+#[derive(Clone, Debug)]
+pub enum BlockProjection {
+    Inline(Projection),
+    FencedCode(CodeProjection),
+}
+
+impl BlockProjection {
+    pub fn from_block(source: &TextSnapshot, block: Block) -> Result<Self, ProjectionError> {
+        match block.kind() {
+            BlockKind::FencedCodeBlock { .. } => {
+                CodeProjection::from_block(source, block).map(Self::FencedCode)
+            }
+            _ => Projection::inline(source, block.range()).map(Self::Inline),
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> BlockProjectionKind {
+        match self {
+            Self::Inline(_) => BlockProjectionKind::Inline,
+            Self::FencedCode(_) => BlockProjectionKind::FencedCode,
+        }
+    }
+
+    #[must_use]
+    pub fn visual(&self) -> &Projection {
+        match self {
+            Self::Inline(projection) => projection,
+            Self::FencedCode(projection) => projection.visual(),
+        }
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.visual().revision()
+    }
+
+    #[must_use]
+    pub fn source_range(&self) -> TextRange {
+        self.visual().source_range()
+    }
+
+    /// Carries a block projection through an edit outside its source range.
+    pub fn map_through(
+        &self,
+        changes: &ChangeSet,
+        snapshot: &TextSnapshot,
+    ) -> Result<Option<Self>, ProjectionError> {
+        match self {
+            Self::Inline(projection) => {
+                Ok(projection.map_through(changes, snapshot)?.map(Self::Inline))
+            }
+            Self::FencedCode(projection) => Ok(projection
+                .map_through(changes, snapshot)?
+                .map(Self::FencedCode)),
+        }
+    }
+}
+
+fn line_ranges(source: &TextSnapshot, range: TextRange) -> Result<Vec<TextRange>, ProjectionError> {
+    let start = usize::try_from(range.start()).map_err(|_| ProjectionError::OffsetOverflow)?;
+    let end = usize::try_from(range.end()).map_err(|_| ProjectionError::OffsetOverflow)?;
+    let mut cursor = source.chunk_cursor(range.start())?;
+    let mut line_start = start;
+    let mut lines = Vec::new();
+    for chunk in &mut cursor {
+        let chunk_start =
+            usize::try_from(chunk.start()).map_err(|_| ProjectionError::OffsetOverflow)?;
+        let chunk_end = chunk_start
+            .checked_add(chunk.text().len())
+            .ok_or(ProjectionError::OffsetOverflow)?;
+        let local_start = start.max(chunk_start).saturating_sub(chunk_start);
+        let local_end = end.min(chunk_end).saturating_sub(chunk_start);
+        for (index, byte) in chunk.text().as_bytes()[local_start..local_end]
+            .iter()
+            .enumerate()
+        {
+            if *byte != b'\n' {
+                continue;
+            }
+            let absolute = chunk_start
+                .checked_add(local_start)
+                .and_then(|offset| offset.checked_add(index + 1))
+                .ok_or(ProjectionError::OffsetOverflow)?;
+            lines.push(byte_range(line_start, absolute)?);
+            line_start = absolute;
+        }
+    }
+    if line_start < end {
+        lines.push(byte_range(line_start, end)?);
+    }
+    Ok(lines)
+}
+
+fn code_info_range(
+    source: &TextSnapshot,
+    opening: TextRange,
+    marker: char,
+) -> Result<TextRange, ProjectionError> {
+    let bytes = read_range(source, opening)?;
+    let mut line_end = bytes.len();
+    while line_end > 0 && matches!(bytes[line_end - 1], b'\n' | b'\r') {
+        line_end -= 1;
+    }
+    let marker = u8::try_from(marker as u32).map_err(|_| ProjectionError::OffsetOverflow)?;
+    let mut info_start = 0_usize;
+    while info_start < line_end && bytes[info_start] == b' ' {
+        info_start += 1;
+    }
+    while info_start < line_end && bytes[info_start] == marker {
+        info_start += 1;
+    }
+    while info_start < line_end && matches!(bytes[info_start], b' ' | b'\t') {
+        info_start += 1;
+    }
+    let mut info_end = line_end;
+    while info_end > info_start && matches!(bytes[info_end - 1], b' ' | b'\t') {
+        info_end -= 1;
+    }
+    let start = usize::try_from(opening.start())
+        .map_err(|_| ProjectionError::OffsetOverflow)?
+        .checked_add(info_start)
+        .ok_or(ProjectionError::OffsetOverflow)?;
+    let end = usize::try_from(opening.start())
+        .map_err(|_| ProjectionError::OffsetOverflow)?
+        .checked_add(info_end)
+        .ok_or(ProjectionError::OffsetOverflow)?;
+    byte_range(start, end)
+}
+
+fn read_range(source: &TextSnapshot, range: TextRange) -> Result<Vec<u8>, ProjectionError> {
+    let start = usize::try_from(range.start()).map_err(|_| ProjectionError::OffsetOverflow)?;
+    let end = usize::try_from(range.end()).map_err(|_| ProjectionError::OffsetOverflow)?;
+    let mut bytes = Vec::with_capacity(end.saturating_sub(start));
+    let mut cursor = source.chunk_cursor(range.start())?;
+    for chunk in &mut cursor {
+        let chunk_start =
+            usize::try_from(chunk.start()).map_err(|_| ProjectionError::OffsetOverflow)?;
+        let chunk_end = chunk_start
+            .checked_add(chunk.text().len())
+            .ok_or(ProjectionError::OffsetOverflow)?;
+        if chunk_start >= end {
+            break;
+        }
+        let local_start = start.max(chunk_start).saturating_sub(chunk_start);
+        let local_end = end.min(chunk_end).saturating_sub(chunk_start);
+        if local_start < local_end {
+            bytes.extend_from_slice(&chunk.text().as_bytes()[local_start..local_end]);
+        }
+    }
+    Ok(bytes)
 }
 
 fn byte_range(start: usize, end: usize) -> Result<TextRange, ProjectionError> {
@@ -924,5 +1238,95 @@ mod tests {
                 .expect("empty visual boundary should map"),
             at
         );
+    }
+
+    #[test]
+    fn projection_consumes_semantic_spans_and_carries_visible_styles() {
+        let projection = projection("**strong** _emphasis_ `code` plain");
+        let visible_styles = projection
+            .runs()
+            .iter()
+            .filter(|run| run.kind() == VisualRunKind::Visible)
+            .map(|run| run.style())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible_styles,
+            vec![
+                VisualRunStyle::Strong,
+                VisualRunStyle::Plain,
+                VisualRunStyle::Emphasis,
+                VisualRunStyle::Plain,
+                VisualRunStyle::Code,
+                VisualRunStyle::Plain,
+            ]
+        );
+        assert_eq!(
+            projection
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn fenced_code_projection_hides_fences_and_keeps_body_literal() {
+        let source_text = "```rust\n**code**\nvalue\n```\n";
+        let buffer = TextBuffer::with_backend(source_text, StorageBackend::PieceTree);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("code block should exist");
+        let code = CodeProjection::from_block(&snapshot, block).expect("code projection builds");
+
+        assert_eq!(code.marker(), '`');
+        assert!(code.closed());
+        assert_eq!(code.source_range(), block.range());
+        assert_eq!(
+            &snapshot.as_str()[usize::try_from(code.info_string().start())
+                .expect("info start should fit")
+                ..usize::try_from(code.info_string().end()).expect("info end should fit")],
+            "rust"
+        );
+        assert_eq!(
+            &snapshot.as_str()[usize::try_from(code.content().start())
+                .expect("content start should fit")
+                ..usize::try_from(code.content().end()).expect("content end should fit")],
+            "**code**\nvalue\n"
+        );
+        assert_eq!(code.visual().visual_len().get(), code.content().len());
+        assert_eq!(
+            code.visual()
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .count(),
+            2
+        );
+        assert!(code.visual().runs().iter().any(|run| {
+            run.kind() == VisualRunKind::Visible && run.style() == VisualRunStyle::Code
+        }));
+        assert_eq!(
+            code.visual()
+                .source_to_visual(code.content().start(), ProjectionBias::After)
+                .expect("content start should map after opening fence"),
+            VisualOffset::ZERO
+        );
+    }
+
+    #[test]
+    fn unclosed_fenced_code_projection_owns_body_until_eof() {
+        let source_text = "~~~python\nprint('羽')\n";
+        let buffer = TextBuffer::new(source_text);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("code block should exist");
+        let code = CodeProjection::from_block(&snapshot, block).expect("code projection builds");
+
+        assert!(!code.closed());
+        assert_eq!(code.closing_fence(), None);
+        assert_eq!(code.content().end(), block.range().end());
+        assert_eq!(code.visual().visual_len().get(), code.content().len());
     }
 }

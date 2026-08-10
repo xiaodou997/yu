@@ -74,10 +74,11 @@
 2. source/visual 映射必须拒绝 projection range 外的 source offset 和 visual offset。
 3. hidden syntax 两侧的 caret 必须通过显式 Before/After bias 解析，不能依赖遍历顺序的
    隐式取整。
-4. Projection 的 hidden ranges 必须来自 parser-owned inline nodes；projection 不得重新扫描
-   同一 source revision 来产生另一份语法边界。
+4. Inline Projection 的 hidden ranges 和 visible style 必须来自 parser-owned `InlineSpan`；
+   projection 不得重新配对同一 source revision 的 delimiter。fenced code 必须走独立
+   `CodeProjection`，其 body 不得经过 inline parser。
 5. `ProjectionCache` entry 必须绑定当前 source Revision；严格位于 entry range 外的 edit 可以
    通过 ChangeSet 映射，触及 range 或边界的 edit 必须失效，source reset 必须清空 cache。
 6. `EditorDocument::markdown().revision()` 必须等于 canonical TextBuffer Revision；block-keyed
-   projection 必须同时匹配当前 block 的 source range 和 BlockKind，fenced code 不得误走 inline
-   projection。
+   projection 必须同时匹配当前 block 的 source range 和 BlockKind，fenced code 必须返回
+   `BlockProjection::FencedCode`。

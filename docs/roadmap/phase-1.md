@@ -46,6 +46,8 @@
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] `yu-editor` revision-bound `ProjectionCache` 的命中、映射与失效规则
 - [x] `EditorDocument` 持有增量 `MarkdownDocument` 并提供 block-scoped projection
+- [x] parser-owned semantic inline spans 与 styled visual runs
+- [x] fenced code 独立 source-backed projection 协议与缓存映射
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -72,7 +74,10 @@
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可
     映射并复用，intersecting/boundary edit 会失效，reset 会清空。
 12. `block_projection(index)` 只能使用当前 `MarkdownDocument` 的 block range/kind；增量 block
-    结构改变后旧 entry 不得复用，fenced code block 有明确的非 projectable 结果。
+    结构改变后旧 entry 不得复用；fenced code block 必须返回独立 code projection，不能误走
+    inline delimiter pairing。
+13. matched inline spans 由 `yu-markdown` 产生，`yu-projection` 只消费 span ranges；可见 runs
+    能区分 Plain/Emphasis/Strong/Code，且 fenced body 中的 `**` 等字面量保持可见。
 
 ## 非目标
 
