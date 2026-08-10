@@ -68,8 +68,9 @@ impl Default for LayoutConfig {
 
 /// Supplies an advance for one Unicode grapheme cluster.
 ///
-/// A future `yu-font` implementation can provide shaping-aware metrics without
-/// changing the layout tree or hit-test contracts.
+/// `yu-font::FontMetrics` is the current contract adapter; a native shaping
+/// backend can provide the same trait without changing the layout tree or
+/// hit-test contracts.
 pub trait ClusterMetrics {
     fn advance(&self, cluster: &str, style: VisualRunStyle) -> f32;
 }

@@ -44,6 +44,9 @@ crates/yu-editor        EditorDocument、selection、commands、CompositionOverl
 crates/yu-editor-ffi    原生平台调用的 CompositionOverlay C ABI static library
 crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
 crates/yu-markdown      第一阶段 lossless block scanner
+crates/yu-projection    Source → Visual Markdown 投影
+crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
+crates/yu-font          font fallback、GlyphRun 和可替换 shaping 契约
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的第一阶段参考 workload
 experiments/            可丢弃的平台风险实验

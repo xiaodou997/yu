@@ -100,3 +100,13 @@
 7. `ViewportLayout` 的未测量 block 必须使用显式 estimate；一次 viewport 查询不得为了定位
    可见窗口而隐式 layout 全部 block，返回的 block y/height 和 source range 必须来自同一
    Revision。
+
+## Font and shaping
+
+1. Font selection、fallback 和 shaping 都是 source/layout 的输入，不得生成第二份可编辑文本。
+2. 每个 `Glyph` 或 glyph cluster 必须保留 source `TextRange`；fallback 切换只能拆分
+   `GlyphRun`，不能改变 source/visual mapping 的语义。
+3. shaping backend 必须显式携带方向、script、style 和 font request；缺失 face/glyph 或无效
+   advance 必须报告错误或走明确 fallback，不能静默伪造平台字体状态。
+4. `MockShaper` 只用于确定性测试；CoreText、DirectWrite、Fontconfig 等平台实现必须通过
+   同一 `TextShaper` 边界接入，不能进入 `EditorDocument` canonical state。

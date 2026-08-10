@@ -52,6 +52,7 @@
 - [x] block-local `yu-layout` snapshot、grapheme cluster wrapping 与 hit-test contract
 - [x] `EditorDocument::block_layout` revision-bound integration
 - [x] 纯 Rust `ViewportLayout` 的 block 高度估计、可见窗口测量与增量失效
+- [x] `yu-font` 字体 coverage/fallback、GlyphRun 与可替换 TextShaper 契约
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -89,6 +90,8 @@
     但不引入窗口或 GPU。
 16. `ViewportLayout` 只能测量 viewport/overscan 选择的 block；未测量 block 使用显式估计，
     block source range/kind 变化必须失效，返回的 `ViewportSnapshot` 必须绑定当前 Revision。
+17. Font fallback 和 shaping 结果必须携带 source cluster ranges；`yu-layout` 只能消费
+    `ClusterMetrics`/glyph contract，不能把平台字体对象或 glyph cache 变成 canonical source。
 
 ## 非目标
 

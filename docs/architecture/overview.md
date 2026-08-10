@@ -45,13 +45,15 @@ yu-text ◄── yu-markdown ◄── yu-projection ◄── yu-layout ◄─
    ▲             ▲                                 ▲              ▲              ▲
    │             │                                 │              │              │
 yu-core      yu-inspect                    block layout     ProjectionCache   macOS/Swift shell
+                                                     ▲
+                                                     │
+                                                  yu-font
 ```
 
 后续预计增加：
 
 ```text
 yu-markdown-edit
-yu-font
 yu-scene
 yu-render
 yu-platform
@@ -123,7 +125,8 @@ composition overlay 不推进 source Revision，因此不会触发 projection ca
 `yu-layout::LayoutSnapshot` 是 block-local、revision-bound 的纯 Rust 布局契约：它消费
 `Projection` 的 visible runs，按 grapheme cluster 生成 `VisualLine`/`VisualCluster`，并提供
 `LayoutCaret` 与 `LayoutHit` 的 source/visual 双向查询。当前默认只使用确定性的
-`MonospaceMetrics`；真实字体 shaping 通过 `ClusterMetrics` 注入，布局层不依赖窗口或 GPU。
+`MonospaceMetrics`；`yu-font::FontMetrics` 已提供同一接口的 fallback-aware adapter，真实字体
+shaping 仍通过 `ClusterMetrics` 注入，布局层不依赖窗口或 GPU。
 `EditorDocument` 现在拥有独立的 `LayoutCache`：entry 以 block 的 `(range, kind)` 和
 `LayoutConfig` 为 key，同一 revision/config 查询命中同一个 cache-owned snapshot。永久 edit
 会通过 layout/projection mapping 保留严格位于 changed range 外的布局，并在 block range 或
@@ -133,3 +136,8 @@ viewport virtualization 的 O(log n) 高度查询与点更新；当前仍未连�
 只测量窗口及 overscan 内的 block，更新 `HeightIndex` 后重新计算可见范围，并返回带 source
 range、kind、y/height 的 `ViewportSnapshot`。前缀 edit 会映射未触碰 block 的估计和实测状态，
 block 结构变化则保守失效；它仍是纯 Rust 的测量/索引层，不是渲染器。
+
+`yu-font` 定义了平台无关的 `FontDatabase`、coverage/fallback、`FontRequest`、方向/script
+提示、`TextShaper` 和可分 fallback face 的 `ShapedText/GlyphRun`。`MockShaper` 只用于契约测试，
+不会冒充 CoreText/DirectWrite 的真实 shaping；未来原生 backend 可以替换它而不改变 layout
+的 source/visual 坐标。
