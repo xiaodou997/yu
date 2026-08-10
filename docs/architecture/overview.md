@@ -78,9 +78,10 @@ Current revision == 41? ── yes ── publish  │
 
 任何后台任务都不能持有可变文档引用。
 
-`yu-editor::EditorDocument` 是编辑阶段的状态边界：它同时保存 canonical `TextBuffer`、
-revision-bound `EditorSelection` 和 transient composition。平台 view 可以保留 AppKit 的
-渲染/输入投影，但永久命令必须回到该边界并通过 Transaction 提交。
+`yu-editor::EditorDocument` 是编辑阶段的状态边界：它同时保存 canonical `TextBuffer`、当前
+Revision 对齐的 `MarkdownDocument`、revision-bound `EditorSelection`、transient composition
+和 `ProjectionCache`。平台 view 可以保留 AppKit 的渲染/输入投影，但永久命令必须回到该边界
+并通过 Transaction 提交。
 
 左右移动和删除通过 `yu-text::TextSnapshot` 的 chunk cursor 与 Unicode grapheme cursor 查询
 相邻边界；Accessibility 使用 `AccessibilityTextSnapshot::from_document` 一次性绑定 source、
@@ -113,4 +114,6 @@ UTF-16 boundary/affinity。这样 AppKit 的原生 selection 与 caret affinity 
 
 `yu-editor::EditorDocument` 拥有 revision-bound `ProjectionCache`：同一 Revision/range 查询命中
 缓存，永久 edit 会映射严格位于 changed range 外的 projection，并保守地使相交或边界 projection
-失效。composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
+失效。`block_projection(index)` 以当前 `MarkdownDocument` 的 `(range, kind)` 为 key，并在
+增量 block sequence 更新后再次验证 entry；fenced code block 暂不进入 inline projection。
+composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。

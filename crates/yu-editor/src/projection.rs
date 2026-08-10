@@ -1,4 +1,5 @@
 use yu_core::{Revision, TextRange};
+use yu_markdown::{Block, BlockKind, MarkdownDocument};
 use yu_projection::{Projection, ProjectionError};
 use yu_text::{ChangeSet, TextSnapshot};
 
@@ -48,8 +49,35 @@ impl ProjectionCacheStats {
 /// context.
 #[derive(Debug, Default)]
 pub struct ProjectionCache {
-    entries: Vec<Projection>,
+    entries: Vec<ProjectionEntry>,
     stats: ProjectionCacheStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionKey {
+    Range(TextRange),
+    Block { range: TextRange, kind: BlockKind },
+}
+
+impl ProjectionKey {
+    fn range(self) -> TextRange {
+        match self {
+            Self::Range(range) | Self::Block { range, .. } => range,
+        }
+    }
+
+    fn remapped(self, range: TextRange) -> Self {
+        match self {
+            Self::Range(_) => Self::Range(range),
+            Self::Block { kind, .. } => Self::Block { range, kind },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProjectionEntry {
+    key: ProjectionKey,
+    projection: Projection,
 }
 
 impl ProjectionCache {
@@ -59,32 +87,51 @@ impl ProjectionCache {
         snapshot: &TextSnapshot,
         range: TextRange,
     ) -> Result<&Projection, ProjectionError> {
+        self.get_or_build_key(snapshot, ProjectionKey::Range(range))
+    }
+
+    /// Returns a projection keyed by one Markdown block's range and kind.
+    pub fn get_or_build_block(
+        &mut self,
+        snapshot: &TextSnapshot,
+        block: Block,
+    ) -> Result<&Projection, ProjectionError> {
+        self.get_or_build_key(
+            snapshot,
+            ProjectionKey::Block {
+                range: block.range(),
+                kind: block.kind(),
+            },
+        )
+    }
+
+    fn get_or_build_key(
+        &mut self,
+        snapshot: &TextSnapshot,
+        key: ProjectionKey,
+    ) -> Result<&Projection, ProjectionError> {
         let current_revision = snapshot.revision();
         let stale = self
             .entries
             .iter()
-            .filter(|entry| entry.revision() != current_revision)
+            .filter(|entry| entry.projection.revision() != current_revision)
             .count();
         if stale > 0 {
             self.stats.invalidated = self.stats.invalidated.saturating_add(stale as u64);
             self.entries
-                .retain(|entry| entry.revision() == current_revision);
+                .retain(|entry| entry.projection.revision() == current_revision);
         }
 
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.source_range() == range)
-        {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
             self.stats.hits = self.stats.hits.saturating_add(1);
-            return Ok(&self.entries[index]);
+            return Ok(&self.entries[index].projection);
         }
 
-        let projection = Projection::inline(snapshot, range)?;
-        self.entries.push(projection);
+        let projection = Projection::inline(snapshot, key.range())?;
+        self.entries.push(ProjectionEntry { key, projection });
         self.stats.builds = self.stats.builds.saturating_add(1);
         let index = self.entries.len().saturating_sub(1);
-        Ok(&self.entries[index])
+        Ok(&self.entries[index].projection)
     }
 
     /// Applies a successful source change to every cached projection.
@@ -97,9 +144,12 @@ impl ProjectionCache {
         let mut remapped = 0_u64;
         let mut invalidated = 0_u64;
         for entry in &self.entries {
-            match entry.map_through(changes, snapshot)? {
-                Some(entry) => {
-                    mapped.push(entry);
+            match entry.projection.map_through(changes, snapshot)? {
+                Some(projection) => {
+                    mapped.push(ProjectionEntry {
+                        key: entry.key.remapped(projection.source_range()),
+                        projection,
+                    });
                     remapped = remapped.saturating_add(1);
                 }
                 None => {
@@ -111,6 +161,20 @@ impl ProjectionCache {
         self.stats.remapped = self.stats.remapped.saturating_add(remapped);
         self.stats.invalidated = self.stats.invalidated.saturating_add(invalidated);
         Ok(())
+    }
+
+    /// Retains block-keyed entries that still match a parsed Markdown block.
+    pub fn retain_blocks(&mut self, markdown: &MarkdownDocument) {
+        let before = self.entries.len();
+        self.entries.retain(|entry| match entry.key {
+            ProjectionKey::Range(_) => true,
+            ProjectionKey::Block { range, kind } => markdown
+                .blocks()
+                .iter()
+                .any(|block| block.range() == range && block.kind() == kind),
+        });
+        let dropped = before.saturating_sub(self.entries.len());
+        self.stats.invalidated = self.stats.invalidated.saturating_add(dropped as u64);
     }
 
     /// Drops every cached projection, for example when a document is reset.
@@ -130,6 +194,8 @@ impl ProjectionCache {
 
     #[must_use]
     pub fn revision(&self) -> Option<Revision> {
-        self.entries.first().map(Projection::revision)
+        self.entries
+            .first()
+            .map(|entry| entry.projection.revision())
     }
 }

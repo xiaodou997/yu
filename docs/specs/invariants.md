@@ -78,3 +78,6 @@
    同一 source revision 来产生另一份语法边界。
 5. `ProjectionCache` entry 必须绑定当前 source Revision；严格位于 entry range 外的 edit 可以
    通过 ChangeSet 映射，触及 range 或边界的 edit 必须失效，source reset 必须清空 cache。
+6. `EditorDocument::markdown().revision()` 必须等于 canonical TextBuffer Revision；block-keyed
+   projection 必须同时匹配当前 block 的 source range 和 BlockKind，fenced code 不得误走 inline
+   projection。
