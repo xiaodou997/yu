@@ -3,7 +3,7 @@
 use std::ptr;
 
 use yu_core::{TextRange, Utf16Offset, Utf16Range};
-use yu_editor::{EditorDocument, EditorDocumentError};
+use yu_editor::{EditorDocument, EditorDocumentError, SelectionError};
 use yu_text::{EditError, TextSnapshot};
 
 pub const YU_FFI_OK: i32 = 0;
@@ -83,8 +83,18 @@ fn status_from_document_error(error: EditorDocumentError) -> i32 {
         EditorDocumentError::Edit(EditError::StaleRevision { .. }) => YU_FFI_STALE_REVISION,
         EditorDocumentError::Edit(_) | EditorDocumentError::CompositionActive => YU_FFI_EDIT_FAILED,
         EditorDocumentError::Position(_) => YU_FFI_INVALID_RANGE,
+        EditorDocumentError::Selection(SelectionError::StaleRevision { .. }) => {
+            YU_FFI_STALE_REVISION
+        }
+        EditorDocumentError::Selection(SelectionError::Position(_)) => YU_FFI_INVALID_RANGE,
+        EditorDocumentError::Selection(SelectionError::AnchorMap(_))
+        | EditorDocumentError::Selection(SelectionError::InvalidRange) => YU_FFI_EDIT_FAILED,
         EditorDocumentError::CompositionNotActive => YU_FFI_NO_OVERLAY,
     }
+}
+
+fn status_from_selection_error(error: SelectionError) -> i32 {
+    status_from_document_error(EditorDocumentError::Selection(error))
 }
 
 fn write_snapshot_range(
@@ -348,6 +358,42 @@ pub unsafe extern "C" fn yu_composition_session_revision(
     YU_FFI_OK
 }
 
+/// Reads the canonical source selection in UTF-16 coordinates.
+///
+/// The returned revision is the revision that owns both endpoints. Native
+/// adapters should compare it with their last source revision before using the
+/// range for a follow-up edit.
+///
+/// # Safety
+/// `session` must be null or a live handle. All output pointers must point to
+/// writable storage for one `u64`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_selection(
+    session: *const YuCompositionSession,
+    revision_output: *mut u64,
+    start_output: *mut u64,
+    end_output: *mut u64,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if revision_output.is_null() || start_output.is_null() || end_output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    let snapshot = session.document.snapshot();
+    let range = match session.document.selection().utf16_range(&snapshot) {
+        Ok(range) => range,
+        Err(error) => return status_from_selection_error(error),
+    };
+    // SAFETY: all output pointers were checked for null and belong to caller.
+    unsafe {
+        *revision_output = snapshot.revision().get();
+        *start_output = range.start().get();
+        *end_output = range.end().get();
+    }
+    YU_FFI_OK
+}
+
 /// Reads the canonical source byte length.
 ///
 /// # Safety
@@ -587,6 +633,24 @@ mod tests {
             std::str::from_utf8(&bytes).expect("source should stay UTF-8"),
             "输入: 日本語"
         );
+
+        let mut selection_revision = 0;
+        let mut selection_start = 0;
+        let mut selection_end = 0;
+        assert_eq!(
+            unsafe {
+                yu_composition_session_selection(
+                    handle,
+                    &mut selection_revision,
+                    &mut selection_start,
+                    &mut selection_end,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(selection_revision, 1);
+        assert_eq!(selection_start, 7);
+        assert_eq!(selection_end, 7);
 
         unsafe { yu_composition_session_destroy(handle) };
     }

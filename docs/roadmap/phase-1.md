@@ -36,6 +36,8 @@
 - [x] 通过 C ABI static library 完成 Swift ↔ Rust `CompositionOverlay` smoke test
 - [x] `EditorDocument` 统一拥有 canonical source、Revision 与 composition overlay
 - [x] FFI revision-bound 局部 UTF-8 source query（不物化完整 Snapshot）
+- [x] `EditorSelection`、caret affinity 与基础 Unicode command 模型
+- [x] FFI selection revision/UTF-16 查询并接入 macOS composition commit 自检
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -52,6 +54,7 @@
 5. `SourceCaret → NativeCaret → Point → NativeCaret → SourceCaret` 有 identity projection
    下的最小可验证闭环。
 6. 形成第一份真实性能基线，而不是仅有目标数字。
+7. selection、composition commit 和永久 Transaction 使用同一个结果 Revision。
 
 ## 非目标
 

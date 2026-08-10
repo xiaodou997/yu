@@ -12,7 +12,7 @@ File bytes
 Text Snapshot ──► Lossless Markdown ──► Projection ──► Layout ──► Scene
     ▲                                                                  │
     │                                                                  ▼
-Transaction ◄── Command ◄── Source Anchor ◄── Hit Test ◄──────────── GPU
+Transaction ◄── EditorCommand ◄── EditorSelection ◄── Hit Test ◄──── GPU
 ```
 
 ## 两条验证线
@@ -78,3 +78,7 @@ Current revision == 41? ── yes ── publish  │
 ```
 
 任何后台任务都不能持有可变文档引用。
+
+`yu-editor::EditorDocument` 是编辑阶段的状态边界：它同时保存 canonical `TextBuffer`、
+revision-bound `EditorSelection` 和 transient composition。平台 view 可以保留 AppKit 的
+渲染/输入投影，但永久命令必须回到该边界并通过 Transaction 提交。

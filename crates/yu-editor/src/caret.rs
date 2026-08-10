@@ -25,6 +25,18 @@ pub struct SourceCaretPosition {
 }
 
 impl SourceCaretPosition {
+    pub(crate) const fn new(
+        revision: Revision,
+        offset: ByteOffset,
+        affinity: CaretAffinity,
+    ) -> Self {
+        Self {
+            revision,
+            offset,
+            affinity,
+        }
+    }
+
     #[must_use]
     pub const fn revision(self) -> Revision {
         self.revision
@@ -93,11 +105,7 @@ impl CaretPositionMap {
         affinity: CaretAffinity,
     ) -> Result<SourceCaretPosition, CaretPositionError> {
         self.source.utf16_offset(offset)?;
-        Ok(SourceCaretPosition {
-            revision: self.revision(),
-            offset,
-            affinity,
-        })
+        Ok(SourceCaretPosition::new(self.revision(), offset, affinity))
     }
 
     pub fn bind_native(
@@ -130,11 +138,11 @@ impl CaretPositionMap {
         position: NativeCaretPosition,
     ) -> Result<SourceCaretPosition, CaretPositionError> {
         self.validate_revision(position.revision)?;
-        Ok(SourceCaretPosition {
-            revision: self.revision(),
-            offset: self.source.byte_offset_for_utf16(position.offset)?,
-            affinity: position.affinity,
-        })
+        Ok(SourceCaretPosition::new(
+            self.revision(),
+            self.source.byte_offset_for_utf16(position.offset)?,
+            position.affinity,
+        ))
     }
 
     fn validate_revision(&self, actual: Revision) -> Result<(), CaretPositionError> {

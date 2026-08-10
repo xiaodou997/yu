@@ -42,6 +42,10 @@ int32_t yu_composition_session_commit(YuCompositionSession *session,
 int32_t yu_composition_session_cancel(YuCompositionSession *session);
 int32_t yu_composition_session_revision(const YuCompositionSession *session,
                                         uint64_t *output);
+int32_t yu_composition_session_selection(const YuCompositionSession *session,
+                                         uint64_t *revision_output,
+                                         uint64_t *start_output,
+                                         uint64_t *end_output);
 int32_t yu_composition_session_source_length(const YuCompositionSession *session,
                                              size_t *output);
 int32_t yu_composition_session_copy_source(const YuCompositionSession *session,
