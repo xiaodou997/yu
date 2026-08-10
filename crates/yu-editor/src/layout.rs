@@ -1,5 +1,5 @@
 use yu_core::{Revision, TextRange};
-use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot};
+use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
 use yu_markdown::{Block, BlockKind, MarkdownDocument};
 use yu_projection::BlockProjection;
 use yu_text::{ChangeSet, TextSnapshot};
@@ -12,6 +12,18 @@ pub struct LayoutCacheStats {
     hits: u64,
     remapped: u64,
     invalidated: u64,
+}
+
+/// The source of advances used by one cached layout.
+///
+/// Metrics and shaped layouts deliberately occupy different cache keys. This
+/// prevents a fast fallback measurement from being returned after a caller
+/// switches to a glyph-level shaping provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LayoutBackend {
+    #[default]
+    Metrics,
+    Shaped,
 }
 
 impl LayoutCacheStats {
@@ -41,7 +53,8 @@ impl LayoutCacheStats {
     }
 }
 
-/// Revision-bound layout snapshots keyed by block identity and layout config.
+/// Revision-bound layout snapshots keyed by block identity, layout config and
+/// advance backend.
 #[derive(Debug, Default)]
 pub struct LayoutCache {
     entries: Vec<LayoutEntry>,
@@ -54,15 +67,17 @@ struct LayoutKey {
     kind: BlockKind,
     max_width: u32,
     line_height: u32,
+    backend: LayoutBackend,
 }
 
 impl LayoutKey {
-    fn new(block: Block, config: LayoutConfig) -> Self {
+    fn new(block: Block, config: LayoutConfig, backend: LayoutBackend) -> Self {
         Self {
             range: block.range(),
             kind: block.kind(),
             max_width: config.max_width().to_bits(),
             line_height: config.line_height().to_bits(),
+            backend,
         }
     }
 
@@ -86,7 +101,38 @@ impl LayoutCache {
         config: LayoutConfig,
         projection: &BlockProjection,
     ) -> Result<&LayoutSnapshot, LayoutError> {
-        let key = LayoutKey::new(block, config);
+        let key = LayoutKey::new(block, config, LayoutBackend::Metrics);
+        self.prepare(snapshot);
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            self.stats.hits = self.stats.hits.saturating_add(1);
+            return Ok(&self.entries[index].layout);
+        }
+
+        let layout = LayoutSnapshot::from_block_projection(projection, config)?;
+        Ok(self.insert(key, layout))
+    }
+
+    /// Returns a cached block layout built from shaped glyph runs.
+    pub fn get_or_build_block_with_shaper<S: ShapingProvider>(
+        &mut self,
+        snapshot: &TextSnapshot,
+        block: Block,
+        config: LayoutConfig,
+        projection: &BlockProjection,
+        shaper: &S,
+    ) -> Result<&LayoutSnapshot, LayoutError> {
+        let key = LayoutKey::new(block, config, LayoutBackend::Shaped);
+        self.prepare(snapshot);
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            self.stats.hits = self.stats.hits.saturating_add(1);
+            return Ok(&self.entries[index].layout);
+        }
+
+        let layout = LayoutSnapshot::from_block_projection_with_shaper(projection, config, shaper)?;
+        Ok(self.insert(key, layout))
+    }
+
+    fn prepare(&mut self, snapshot: &TextSnapshot) {
         let current_revision = snapshot.revision();
         let stale = self
             .entries
@@ -98,16 +144,13 @@ impl LayoutCache {
             self.entries
                 .retain(|entry| entry.layout.revision() == current_revision);
         }
-        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
-            self.stats.hits = self.stats.hits.saturating_add(1);
-            return Ok(&self.entries[index].layout);
-        }
+    }
 
-        let layout = LayoutSnapshot::from_block_projection(projection, config)?;
+    fn insert(&mut self, key: LayoutKey, layout: LayoutSnapshot) -> &LayoutSnapshot {
         self.entries.push(LayoutEntry { key, layout });
         self.stats.builds = self.stats.builds.saturating_add(1);
         let index = self.entries.len().saturating_sub(1);
-        Ok(&self.entries[index].layout)
+        &self.entries[index].layout
     }
 
     /// Maps layouts through a successful source edit, retaining only layouts

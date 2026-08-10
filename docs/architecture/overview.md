@@ -130,14 +130,18 @@ shaping 可通过 `LayoutSnapshot::from_projection_with_shaper` 注入；该入�
 `ShapedText/GlyphRun` 的 glyph advance 和 source cluster range，布局层仍不依赖窗口或 GPU。
 `ClusterMetrics` 保留为不需要 glyph 级数据的兼容入口。
 `EditorDocument` 现在拥有独立的 `LayoutCache`：entry 以 block 的 `(range, kind)` 和
-`LayoutConfig` 为 key，同一 revision/config 查询命中同一个 cache-owned snapshot。永久 edit
-会通过 layout/projection mapping 保留严格位于 changed range 外的布局，并在 block range 或
-kind 改变时删除 entry。`LayoutSnapshot::height_index` 暴露 Fenwick prefix index，支持后续
-viewport virtualization 的 O(log n) 高度查询与点更新；当前仍未连接窗口、GPU 或真实字体。
+`LayoutConfig` 和 `LayoutBackend` 为 key，同一 revision/config/backend 查询命中同一个
+cache-owned snapshot。`EditorDocument::block_layout_with_shaper` 可以在不把 provider 存进
+canonical document 的情况下构建 shaped entry；metrics 与 shaped entry 不会互相命中。永久
+edit 会通过 layout/projection mapping 保留严格位于 changed range 外的布局，并在 block range
+或 kind 改变时删除 entry。`LayoutSnapshot::height_index` 暴露 Fenwick prefix index，支持
+后续 viewport virtualization 的 O(log n) 高度查询与点更新；当前仍未连接窗口、GPU 或真实
+字体。
 `yu-editor::ViewportLayout` 在此之上维护每个 Markdown block 的估计/实测高度：viewport 查询
 只测量窗口及 overscan 内的 block，更新 `HeightIndex` 后重新计算可见范围，并返回带 source
 range、kind、y/height 的 `ViewportSnapshot`。前缀 edit 会映射未触碰 block 的估计和实测状态，
-block 结构变化则保守失效；它仍是纯 Rust 的测量/索引层，不是渲染器。
+block 结构变化则保守失效；切换 metrics/shaped backend 会把已测量高度退回 estimate，避免
+使用错误的换行结果；它仍是纯 Rust 的测量/索引层，不是渲染器。
 
 `yu-font` 定义了平台无关的 `FontDatabase`、coverage/fallback、`FontRequest`、方向/script
 提示、`TextShaper` 和可分 fallback face 的 `ShapedText/GlyphRun`。`MockShaper` 只用于契约测试，

@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use yu_core::{Revision, TextRange, Utf16Range};
-use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot};
+use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
 use yu_markdown::{IncrementalParseError, MarkdownDocument};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
@@ -11,7 +11,7 @@ use yu_text::{
 
 use crate::{
     BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
-    EditorSelection, LayoutCache, LayoutCacheStats, Projection, ProjectionCache,
+    EditorSelection, LayoutBackend, LayoutCache, LayoutCacheStats, Projection, ProjectionCache,
     ProjectionCacheStats, ProjectionError, SelectionError, ViewportConfig, ViewportError,
     ViewportLayout, ViewportRect, ViewportSnapshot, ViewportStats,
     command::{next_grapheme_boundary, previous_grapheme_boundary},
@@ -148,9 +148,48 @@ impl EditorDocument {
             .map_err(EditorDocumentError::Layout)
     }
 
+    /// Returns a revision-bound block layout using a caller-provided shaper.
+    ///
+    /// Shaped and metrics layouts use separate cache keys. The provider itself
+    /// is not stored in the document, so callers can keep platform font state
+    /// outside the canonical editor model.
+    pub fn block_layout_with_shaper<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<&LayoutSnapshot, EditorDocumentError> {
+        let block =
+            self.markdown
+                .blocks()
+                .get(index)
+                .ok_or(EditorDocumentError::BlockOutOfBounds {
+                    index,
+                    blocks: self.markdown.blocks().len(),
+                })?;
+        let snapshot = self.snapshot();
+        let projection = self
+            .projections
+            .get_or_build_block(&snapshot, block)
+            .map_err(EditorDocumentError::Projection)?;
+        self.layouts
+            .get_or_build_block_with_shaper(&snapshot, block, config, projection, shaper)
+            .map_err(EditorDocumentError::Layout)
+    }
+
     #[must_use]
     pub fn layout_cache_stats(&self) -> LayoutCacheStats {
         self.layouts.stats()
+    }
+
+    /// Drops all revision-bound layouts and viewport measurements.
+    ///
+    /// Callers should use this when replacing the font/shaping configuration
+    /// behind an existing `LayoutBackend::Shaped` provider. The canonical
+    /// source, Markdown document, projections and selection remain intact.
+    pub fn clear_layout_state(&mut self) {
+        self.layouts.clear();
+        self.viewport.clear();
     }
 
     /// Replaces the pure Rust viewport policy and drops its block estimates.
@@ -181,11 +220,28 @@ impl EditorDocument {
         result
     }
 
+    /// Measures the visible block window with a caller-provided shaping
+    /// provider. The viewport resets previously measured metrics heights when
+    /// switching backend, while estimates for off-screen blocks remain cheap.
+    pub fn visible_blocks_with_shaper<S: ShapingProvider>(
+        &mut self,
+        viewport: ViewportRect,
+        shaper: &S,
+    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        let mut layout = std::mem::take(&mut self.viewport);
+        let result = self.measure_visible_blocks_with_shaper(&mut layout, viewport, shaper);
+        self.viewport = layout;
+        result
+    }
+
     fn measure_visible_blocks(
         &mut self,
         layout: &mut ViewportLayout,
         viewport: ViewportRect,
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        layout
+            .set_backend(LayoutBackend::Metrics)
+            .map_err(EditorDocumentError::Viewport)?;
         let mut range = layout
             .visible_range(&self.markdown, viewport)
             .map_err(EditorDocumentError::Viewport)?;
@@ -194,6 +250,44 @@ impl EditorDocument {
             let mut changed = false;
             for index in range.start()..range.end() {
                 let line_count = self.block_layout(index, config)?.lines().len();
+                let height = config.line_height() * (line_count as f32);
+                changed |= layout
+                    .set_block_height(index, height)
+                    .map_err(EditorDocumentError::Viewport)?;
+            }
+            let next = layout
+                .visible_range(&self.markdown, viewport)
+                .map_err(EditorDocumentError::Viewport)?;
+            if next == range || !changed {
+                break;
+            }
+            range = next;
+        }
+        layout
+            .snapshot(&self.markdown, range)
+            .map_err(EditorDocumentError::Viewport)
+    }
+
+    fn measure_visible_blocks_with_shaper<S: ShapingProvider>(
+        &mut self,
+        layout: &mut ViewportLayout,
+        viewport: ViewportRect,
+        shaper: &S,
+    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        layout
+            .set_backend(LayoutBackend::Shaped)
+            .map_err(EditorDocumentError::Viewport)?;
+        let mut range = layout
+            .visible_range(&self.markdown, viewport)
+            .map_err(EditorDocumentError::Viewport)?;
+        let config = layout.config().layout();
+        for _ in 0..8 {
+            let mut changed = false;
+            for index in range.start()..range.end() {
+                let line_count = self
+                    .block_layout_with_shaper(index, config, shaper)?
+                    .lines()
+                    .len();
                 let height = config.line_height() * (line_count as f32);
                 changed |= layout
                     .set_block_height(index, height)
@@ -567,8 +661,13 @@ impl From<SelectionError> for EditorDocumentError {
 mod tests {
     use super::*;
     use crate::VisualRunKind;
+    use unicode_segmentation::UnicodeSegmentation;
     use yu_core::{ByteOffset, Utf16Offset};
+    use yu_layout::{
+        FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
+    };
     use yu_markdown::BlockKind;
+    use yu_projection::VisualRunStyle;
     use yu_text::Edit;
 
     fn source_range(start: u64, end: u64) -> TextRange {
@@ -579,6 +678,49 @@ mod tests {
     fn utf16_range(start: u64, end: u64) -> Utf16Range {
         Utf16Range::new(Utf16Offset::new(start), Utf16Offset::new(end))
             .expect("test UTF-16 range should be ordered")
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct WideShaper;
+
+    impl ShapingProvider for WideShaper {
+        type Error = &'static str;
+
+        fn shape(
+            &self,
+            text: &str,
+            source: TextRange,
+            style: VisualRunStyle,
+        ) -> Result<ShapedText, Self::Error> {
+            let glyphs = text
+                .grapheme_indices(true)
+                .map(|(start, cluster)| {
+                    let end = start + cluster.len();
+                    let source_start = source
+                        .start()
+                        .checked_add(u64::try_from(start).expect("test offset fits"))
+                        .expect("source offset fits");
+                    let source_end = source
+                        .start()
+                        .checked_add(u64::try_from(end).expect("test offset fits"))
+                        .expect("source offset fits");
+                    let glyph_source = TextRange::new(source_start, source_end)
+                        .expect("glyph source range should be ordered");
+                    Glyph::new(GlyphId::from_raw(1), glyph_source, 2.0, 0.0, 0.0)
+                })
+                .collect();
+            Ok(ShapedText::new(
+                source,
+                vec![GlyphRun::new(
+                    FontFaceId::from_raw(1),
+                    source,
+                    style,
+                    TextDirection::Ltr,
+                    Script::Latin,
+                    glyphs,
+                )],
+            ))
+        }
     }
 
     #[test]
@@ -892,6 +1034,37 @@ mod tests {
     }
 
     #[test]
+    fn block_layout_cache_separates_metrics_and_shaped_backends() {
+        let mut document = EditorDocument::new("ab");
+        let config = LayoutConfig::new(3.0, 1.0);
+        let metrics = document
+            .block_layout(0, config)
+            .expect("metrics layout should build");
+        assert_eq!(metrics.lines().len(), 1);
+        assert_eq!(metrics.lines()[0].width(), 2.0);
+
+        let shaper = WideShaper;
+        let shaped = document
+            .block_layout_with_shaper(0, config, &shaper)
+            .expect("shaped layout should build");
+        assert_eq!(shaped.lines().len(), 2);
+        assert_eq!(shaped.lines()[0].width(), 2.0);
+        assert_eq!(document.layout_cache_stats().entries(), 2);
+
+        document
+            .block_layout_with_shaper(0, config, &shaper)
+            .expect("same shaped layout should hit cache");
+        document
+            .block_layout(0, config)
+            .expect("metrics layout should remain independently cached");
+        assert!(document.layout_cache_stats().hits() >= 2);
+
+        document.clear_layout_state();
+        assert_eq!(document.layout_cache_stats().entries(), 0);
+        assert_eq!(document.viewport_stats().entries(), 0);
+    }
+
+    #[test]
     fn layout_cache_remaps_unaffected_blocks_and_keys_config() {
         let mut document = EditorDocument::new("intro\n\n**羽🙂**");
         let config = LayoutConfig::new(2.0, 1.25);
@@ -965,6 +1138,30 @@ mod tests {
             .expect("far viewport should measure only its block");
         assert!(last.blocks().iter().all(|block| block.index() > 0));
         assert!(document.layout_cache_stats().builds() < document.markdown().blocks().len() as u64);
+    }
+
+    #[test]
+    fn viewport_remeasures_when_switching_to_shaped_backend() {
+        let mut document = EditorDocument::new("ab");
+        document
+            .set_viewport_config(ViewportConfig::new(LayoutConfig::new(3.0, 1.0), 1.0, 0.0))
+            .expect("viewport config should be valid");
+
+        let metrics = document
+            .visible_blocks(ViewportRect::new(0.0, 2.0))
+            .expect("metrics viewport should measure");
+        assert_eq!(metrics.blocks()[0].height(), 1.0);
+
+        let shaped = document
+            .visible_blocks_with_shaper(ViewportRect::new(0.0, 2.0), &WideShaper)
+            .expect("shaped viewport should measure");
+        assert_eq!(shaped.blocks()[0].height(), 2.0);
+        assert_eq!(shaped.content_height(), 2.0);
+
+        let metrics_again = document
+            .visible_blocks(ViewportRect::new(0.0, 2.0))
+            .expect("metrics viewport should remeasure after backend switch");
+        assert_eq!(metrics_again.blocks()[0].height(), 1.0);
     }
 
     #[test]

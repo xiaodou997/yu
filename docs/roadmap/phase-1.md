@@ -54,6 +54,7 @@
 - [x] 纯 Rust `ViewportLayout` 的 block 高度估计、可见窗口测量与增量失效
 - [x] `yu-font` 字体 coverage/fallback、GlyphRun 与可替换 TextShaper 契约
 - [x] shaped glyph advance 接入 `yu-layout` 换行，并保持 source cluster hit-test 映射
+- [x] `yu-editor` LayoutCache/ViewportLayout 区分 metrics 与 shaped backend
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -95,6 +96,8 @@
     `ClusterMetrics`/glyph contract，不能把平台字体对象或 glyph cache 变成 canonical source；
     `from_projection_with_shaper` 的 glyph advance 必须影响 wrapping，且非法 source range、
     非有限 advance/offset 必须拒绝。
+18. `yu-editor` 的 metrics/shaped layout 必须使用不同 cache backend key；Viewport 切换 backend
+    时必须清除旧的 measured height，且 provider 不得进入 `EditorDocument` 的 canonical state。
 
 ## 非目标
 

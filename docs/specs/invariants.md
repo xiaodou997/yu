@@ -94,7 +94,8 @@
 4. `ClusterMetrics` 只能提供 advance，不得改变 source/visual ranges；无效或非有限 advance
    必须拒绝构建 layout。
 5. `LayoutCache` entry 必须绑定当前 source Revision，并同时匹配 block 的 source range、
-   `BlockKind` 和 `LayoutConfig`；strictly-outside edit 可映射，交集或 block 结构变化必须失效。
+   `BlockKind`、`LayoutConfig` 和 `LayoutBackend`；strictly-outside edit 可映射，交集或 block
+   结构变化必须失效，metrics 与 shaped entry 不能互相命中。
 6. `HeightIndex` 只索引已经产生的视觉行高，不得隐式触发全文 layout；prefix、point update 和
    viewport line lookup 必须保持与原始 height values 一致。
 7. `ViewportLayout` 的未测量 block 必须使用显式 estimate；一次 viewport 查询不得为了定位
@@ -103,6 +104,8 @@
 8. `LayoutSnapshot::from_projection_with_shaper` 必须验证 shaped output 的 source range 属于
    请求的 visible run；glyph cluster range 必须有序且可映射回 Projection，advance 和 offset
    必须有限。合法 glyph advance 决定 wrapping，但不得改写 source buffer。
+9. `ViewportLayout` 的 measured height 必须绑定当前 `LayoutBackend`；切换 metrics/shaped
+   backend 必须先将旧 measured entry 恢复为 estimate，不能用旧 backend 的高度定位 viewport。
 
 ## Font and shaping
 
