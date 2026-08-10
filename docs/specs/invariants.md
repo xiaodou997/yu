@@ -74,3 +74,5 @@
 2. source/visual 映射必须拒绝 projection range 外的 source offset 和 visual offset。
 3. hidden syntax 两侧的 caret 必须通过显式 Before/After bias 解析，不能依赖遍历顺序的
    隐式取整。
+4. Projection 的 hidden ranges 必须来自 parser-owned inline nodes；projection 不得重新扫描
+   同一 source revision 来产生另一份语法边界。

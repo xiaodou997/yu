@@ -11,20 +11,24 @@
 TextSnapshot(Revision)
         │
         ▼
-Projection::inline(source range)
+yu-markdown::parse_inline(source range)
+        │
+        ▼
+Projection::from_inline
         │
         ├── Visible(source range → visual range)
         └── HiddenSyntax(source range → zero width)
 ```
 
-当前覆盖双星号、双下划线、单星号、单下划线和等长度 code delimiter 的保守配对；
-unmatched、escaped delimiter 保持可见。ProjectionBias Before/After 用于 hidden syntax 两侧
-的 source caret。
+parser-owned token stream 覆盖双星号、双下划线、单星号、单下划线和等长度 code delimiter；
+unmatched、escaped delimiter 保持可见。ProjectionBias Before/After 用于 hidden syntax 两侧的
+source caret。
 
 ## 验证
 
 ```text
-6 projection tests passed
+7 projection tests passed
+3 inline token tests passed
 strong delimiter: 4 source bytes → zero visual width
 source/visual mapping: Before/After boundary round-trip
 subrange scan: does not include delimiters before requested range
@@ -34,5 +38,6 @@ Piece Tree: materialized_buffers = 0
 
 ## 限制
 
-VisualOffset 仍是 projected UTF-8 byte offset；尚未处理完整 CommonMark inline 语义、style、
-layout、glyph、links/images 或 projection 后的 IME surrounding text。
+VisualOffset 仍是 projected UTF-8 byte offset；InlineDocument 仍是 flat token layer，尚未处理
+完整 CommonMark inline 语义、style、layout、glyph、links/images 或 projection 后的 IME
+surrounding text。

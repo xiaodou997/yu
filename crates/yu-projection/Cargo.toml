@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 yu-core = { path = "../yu-core" }
+yu-markdown = { path = "../yu-markdown" }
 yu-text = { path = "../yu-text" }
 
 [lints]

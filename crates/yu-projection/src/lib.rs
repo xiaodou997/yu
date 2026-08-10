@@ -4,13 +4,17 @@
 //!
 //! This phase intentionally implements only a small, lossless inline
 //! projection. Matched Markdown emphasis, strong-emphasis, and code-span
-//! delimiters become zero-width visual runs; all other source bytes remain
-//! visible and continue to point into the canonical TextSnapshot.
+//! delimiters from `yu-markdown::InlineDocument` become zero-width visual
+//! runs; all other source bytes remain visible and continue to point into the
+//! canonical TextSnapshot.
 
 use std::error::Error;
 use std::fmt;
 use yu_core::{ByteOffset, TextRange};
-use yu_text::{ChunkCursor, TextPositionError, TextSnapshot};
+use yu_markdown::{
+    InlineDelimiter, InlineDocument, InlineNodeKind, InlineParseError, parse_inline,
+};
+use yu_text::{TextPositionError, TextSnapshot};
 
 /// An offset in the projected UTF-8 visual stream.
 ///
@@ -146,6 +150,7 @@ pub enum ProjectionBias {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectionError {
     SourcePosition(TextPositionError),
+    InlineParse(InlineParseError),
     SourceOutsideRange {
         offset: ByteOffset,
         range: TextRange,
@@ -161,6 +166,7 @@ impl fmt::Display for ProjectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SourcePosition(error) => error.fmt(formatter),
+            Self::InlineParse(error) => error.fmt(formatter),
             Self::SourceOutsideRange { offset, range } => {
                 write!(
                     formatter,
@@ -182,6 +188,7 @@ impl Error for ProjectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SourcePosition(error) => Some(error),
+            Self::InlineParse(error) => Some(error),
             Self::SourceOutsideRange { .. }
             | Self::VisualOutOfBounds { .. }
             | Self::OffsetOverflow => None,
@@ -192,6 +199,12 @@ impl Error for ProjectionError {
 impl From<TextPositionError> for ProjectionError {
     fn from(error: TextPositionError) -> Self {
         Self::SourcePosition(error)
+    }
+}
+
+impl From<InlineParseError> for ProjectionError {
+    fn from(error: InlineParseError) -> Self {
+        Self::InlineParse(error)
     }
 }
 
@@ -211,9 +224,21 @@ impl Projection {
     /// The parser is deliberately conservative: unmatched or escaped
     /// delimiters remain visible, and source bytes are never rewritten.
     pub fn inline(source: &TextSnapshot, source_range: TextRange) -> Result<Self, ProjectionError> {
+        let inline = parse_inline(source, source_range)?;
+        Self::from_inline(&inline)
+    }
+
+    /// Builds a projection from the parser-owned lossless inline token stream.
+    ///
+    /// Keeping this constructor separate makes the source of delimiter ranges
+    /// explicit: the projection never rescans or owns a second inline syntax
+    /// representation.
+    pub fn from_inline(inline: &InlineDocument) -> Result<Self, ProjectionError> {
+        let source = inline.source();
+        let source_range = inline.source_range();
         source.utf16_offset(source_range.start())?;
         source.utf16_offset(source_range.end())?;
-        let hidden = find_hidden_ranges(source, source_range)?;
+        let hidden = find_hidden_ranges(inline)?;
         let runs = build_runs(source_range, &hidden)?;
         let visual_len = runs
             .last()
@@ -359,21 +384,30 @@ impl Projection {
     }
 }
 
-const CODE_MARKER: u8 = 0x60;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Delimiter {
-    marker: u8,
+    marker: InlineDelimiter,
     len: usize,
     range: TextRange,
 }
 
-fn find_hidden_ranges(
-    source: &TextSnapshot,
-    source_range: TextRange,
-) -> Result<Vec<TextRange>, ProjectionError> {
-    let delimiters = scan_delimiters(source, source_range)?;
-    let code_pairs = pair_delimiters(&delimiters, CODE_MARKER);
+fn find_hidden_ranges(inline: &InlineDocument) -> Result<Vec<TextRange>, ProjectionError> {
+    let delimiters = inline
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            InlineNodeKind::Delimiter { marker } => Some((marker, node.range())),
+            InlineNodeKind::Text | InlineNodeKind::Escaped => None,
+        })
+        .map(|(marker, range)| {
+            Ok(Delimiter {
+                marker,
+                len: usize::try_from(range.len()).map_err(|_| ProjectionError::OffsetOverflow)?,
+                range,
+            })
+        })
+        .collect::<Result<Vec<_>, ProjectionError>>()?;
+    let code_pairs = pair_delimiters(&delimiters, InlineDelimiter::Code);
     let mut hidden = code_pairs
         .iter()
         .flat_map(|pair| [pair.start(), pair.end()])
@@ -382,7 +416,7 @@ fn find_hidden_ranges(
     let inline_delimiters = delimiters
         .iter()
         .copied()
-        .filter(|delimiter| delimiter.marker != CODE_MARKER)
+        .filter(|delimiter| delimiter.marker != InlineDelimiter::Code)
         .filter(|delimiter| {
             !code_pairs.iter().any(|pair| {
                 pair.start().end() < delimiter.range.start()
@@ -390,51 +424,17 @@ fn find_hidden_ranges(
             })
         })
         .collect::<Vec<_>>();
-    for pair in pair_delimiters(&inline_delimiters, b'*') {
+    for pair in pair_delimiters(&inline_delimiters, InlineDelimiter::Star) {
         hidden.extend([pair.start(), pair.end()]);
     }
-    for pair in pair_delimiters(&inline_delimiters, b'_') {
+    for pair in pair_delimiters(&inline_delimiters, InlineDelimiter::Underscore) {
         hidden.extend([pair.start(), pair.end()]);
     }
     hidden.sort_by_key(|range| (range.start(), range.end()));
     Ok(hidden)
 }
 
-fn scan_delimiters(
-    source: &TextSnapshot,
-    source_range: TextRange,
-) -> Result<Vec<Delimiter>, ProjectionError> {
-    let cursor = ByteCursor::new(source, source_range)?;
-    let mut cursor = cursor.peekable();
-    let mut delimiters = Vec::new();
-    while let Some((start, byte)) = cursor.next() {
-        if byte == b'\\' {
-            let _ = cursor.next();
-            continue;
-        }
-        if !matches!(byte, b'*' | b'_' | CODE_MARKER) {
-            continue;
-        }
-        let mut end = start
-            .checked_add(1)
-            .ok_or(ProjectionError::OffsetOverflow)?;
-        while cursor.peek().is_some_and(|(_, next)| *next == byte) {
-            let (next_start, _) = cursor.next().expect("peeked delimiter must be available");
-            end = next_start
-                .checked_add(1)
-                .ok_or(ProjectionError::OffsetOverflow)?;
-        }
-        let range = byte_range(start, end)?;
-        delimiters.push(Delimiter {
-            marker: byte,
-            len: end - start,
-            range,
-        });
-    }
-    Ok(delimiters)
-}
-
-fn pair_delimiters(delimiters: &[Delimiter], marker: u8) -> Vec<TextRangePair> {
+fn pair_delimiters(delimiters: &[Delimiter], marker: InlineDelimiter) -> Vec<TextRangePair> {
     let mut openings = Vec::new();
     let mut pairs = Vec::new();
     for delimiter in delimiters
@@ -543,60 +543,6 @@ fn byte_range(start: usize, end: usize) -> Result<TextRange, ProjectionError> {
     TextRange::new(start, end).ok_or(ProjectionError::OffsetOverflow)
 }
 
-struct ByteCursor<'a> {
-    chunks: ChunkCursor<'a>,
-    requested_start: usize,
-    end: usize,
-    current: Option<&'a [u8]>,
-    current_start: usize,
-    current_index: usize,
-}
-
-impl<'a> ByteCursor<'a> {
-    fn new(source: &'a TextSnapshot, range: TextRange) -> Result<Self, ProjectionError> {
-        let start = usize::try_from(range.start()).map_err(|_| ProjectionError::OffsetOverflow)?;
-        let end = usize::try_from(range.end()).map_err(|_| ProjectionError::OffsetOverflow)?;
-        Ok(Self {
-            chunks: source.chunk_cursor(range.start())?,
-            requested_start: start,
-            end,
-            current: None,
-            current_start: start,
-            current_index: start,
-        })
-    }
-}
-
-impl Iterator for ByteCursor<'_> {
-    type Item = (usize, u8);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(current) = self.current {
-                if self.current_index < self.current_start + current.len()
-                    && self.current_index < self.end
-                {
-                    let local = self.current_index - self.current_start;
-                    let value = current[local];
-                    let position = self.current_index;
-                    self.current_index += 1;
-                    return Some((position, value));
-                }
-                self.current = None;
-            }
-
-            let chunk = self.chunks.next()?;
-            self.current_start = usize::try_from(chunk.start()).ok()?;
-            self.current_index = self.current_start.max(self.requested_start);
-            self.current = Some(chunk.text().as_bytes());
-            if self.current_index < self.end {
-                continue;
-            }
-            return None;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +646,27 @@ mod tests {
         let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
             .expect("source range should be ordered");
         let _projection = Projection::inline(&snapshot, range).expect("projection should build");
+        assert_eq!(
+            retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers(),
+            0
+        );
+    }
+
+    #[test]
+    fn projection_consumes_parser_owned_inline_tokens() {
+        let source = "before **羽🙂** after";
+        let buffer = TextBuffer::with_backend(source, StorageBackend::PieceTree);
+        let snapshot = buffer.snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline =
+            yu_markdown::parse_inline(&snapshot, range).expect("inline parse should build");
+        let from_cst = Projection::from_inline(&inline).expect("projection should build");
+        let direct = Projection::inline(&snapshot, range).expect("direct projection should build");
+
+        assert_eq!(from_cst.runs(), direct.runs());
+        assert_eq!(from_cst.revision(), inline.revision());
+        assert_eq!(from_cst.source_range(), inline.source_range());
         assert_eq!(
             retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers(),
             0

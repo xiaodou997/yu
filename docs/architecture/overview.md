@@ -110,5 +110,6 @@ UTF-16 boundary/affinity。这样 AppKit 的原生 selection 与 caret affinity 
 
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/hidden runs 和双向 mapping，不生成第二份可编辑文本。
-当前 delimiter scanner 是保守风险验证，正式 `yu-markdown` inline CST 接入后继续复用同一个
-source/visual mapping 边界。
+它通过 `yu-markdown::parse_inline` 获取 parser-owned `InlineDocument`，不再在 projection 内
+维护另一套 delimiter scanner；当前 token layer 和 pairing 仍是保守风险验证，正式 inline CST
+扩展后继续复用同一个 source/visual mapping 边界。

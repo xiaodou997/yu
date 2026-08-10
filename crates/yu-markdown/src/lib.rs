@@ -2,8 +2,9 @@
 
 //! Lossless Markdown syntax experiments.
 //!
-//! Phase 1 provides a deliberately small, chunk-aware block scanner. It
-//! preserves every source byte through ranges, but it is not yet CommonMark.
+//! Phase 1 provides deliberately small, chunk-aware block and inline token
+//! scanners. They preserve every source byte through ranges, but are not yet
+//! CommonMark semantic parsers.
 
 use std::error::Error;
 use std::fmt;
@@ -16,12 +17,16 @@ use yu_text::{
 };
 
 mod block_sequence;
+mod inline;
 
 pub use block_sequence::{
     Block, BlockCompactionPolicy, BlockKind, BlockSequence, BlockState, BlockStorageStats,
     RetainedBlockStats,
 };
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
+pub use inline::{
+    InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError, parse_inline,
+};
 
 /// A lossless block view of one immutable text revision.
 #[derive(Clone, Debug)]
