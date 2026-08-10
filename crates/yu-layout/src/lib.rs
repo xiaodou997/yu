@@ -19,6 +19,12 @@ use yu_projection::{
 };
 use yu_text::{ChangeSet, TextSnapshot};
 
+mod shaping;
+
+pub use shaping::{
+    FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
+};
+
 /// Layout dimensions and wrapping policy independent of any font backend.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutConfig {
@@ -111,6 +117,7 @@ pub enum LayoutError {
     Projection(ProjectionError),
     InvalidConfig(&'static str),
     InvalidMetrics(u32),
+    Shaping(String),
     InvalidPoint,
     OffsetOverflow,
 }
@@ -291,6 +298,7 @@ impl fmt::Display for LayoutError {
                 "invalid cluster advance {}",
                 f32::from_bits(*advance)
             ),
+            Self::Shaping(message) => write!(formatter, "shaping failed: {message}"),
             Self::InvalidPoint => {
                 formatter.write_str("layout point must contain finite coordinates")
             }
@@ -305,6 +313,7 @@ impl Error for LayoutError {
             Self::Projection(error) => Some(error),
             Self::InvalidConfig(_)
             | Self::InvalidMetrics(_)
+            | Self::Shaping(_)
             | Self::InvalidPoint
             | Self::OffsetOverflow => None,
         }
@@ -561,6 +570,20 @@ impl LayoutSnapshot {
         Self::from_projection_with_metrics(projection.visual(), config, metrics)
     }
 
+    /// Builds a block layout from shaped glyph runs.
+    ///
+    /// The shaper owns font fallback and glyph selection while the layout
+    /// snapshot remains source-backed. Glyph cluster ranges are mapped back
+    /// through the projection, so ligatures and combining marks remain
+    /// addressable by source selection and hit testing.
+    pub fn from_block_projection_with_shaper<S: ShapingProvider>(
+        projection: &BlockProjection,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<Self, LayoutError> {
+        Self::from_projection_with_shaper(projection.visual(), config, shaper)
+    }
+
     /// Builds layout with a caller-provided grapheme advance provider.
     pub fn from_projection_with_metrics<M: ClusterMetrics>(
         projection: &Projection,
@@ -575,6 +598,23 @@ impl LayoutSnapshot {
             clusters: Vec::new(),
         };
         layout.build(metrics)?;
+        Ok(layout)
+    }
+
+    /// Builds layout from a source-backed shaping provider.
+    pub fn from_projection_with_shaper<S: ShapingProvider>(
+        projection: &Projection,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<Self, LayoutError> {
+        config.validate()?;
+        let mut layout = Self {
+            projection: projection.clone(),
+            config,
+            lines: Vec::new(),
+            clusters: Vec::new(),
+        };
+        layout.build_shaped(shaper)?;
         Ok(layout)
     }
 
@@ -847,6 +887,157 @@ impl LayoutSnapshot {
         Ok(())
     }
 
+    fn build_shaped<S: ShapingProvider>(&mut self, shaper: &S) -> Result<(), LayoutError> {
+        let source_range = self.projection.source_range();
+        let source = self.projection.source().clone();
+        let runs = self.projection.runs().to_vec();
+        let mut line_source_start = source_range.start();
+        let mut line_source_end = line_source_start;
+        let mut line_visual_start = VisualOffset::ZERO;
+        let mut line_width = 0.0_f32;
+        let mut line_cluster_start = 0_usize;
+        let mut line_index = 0_usize;
+        let mut last_was_break = false;
+
+        for run in runs {
+            line_source_end = line_source_end.max(run.source().end());
+            if run.kind() != VisualRunKind::Visible {
+                continue;
+            }
+            let text = read_source_range(&source, run.source())?;
+            let shaped = shaper
+                .shape(&text, run.source(), run.style())
+                .map_err(|error| LayoutError::Shaping(error.to_string()))?;
+            if shaped.source() != run.source() {
+                return Err(LayoutError::Shaping(
+                    "shaper returned a source range different from the requested run".into(),
+                ));
+            }
+
+            for glyph_run in shaped.runs() {
+                if glyph_run.source().start() < run.source().start()
+                    || glyph_run.source().end() > run.source().end()
+                {
+                    return Err(LayoutError::Shaping(
+                        "glyph run source range is outside the requested visual run".into(),
+                    ));
+                }
+                let mut previous_source_end = glyph_run.source().start();
+                for glyph in glyph_run.glyphs() {
+                    let glyph_source = glyph.source();
+                    if glyph_source.start() < glyph_run.source().start()
+                        || glyph_source.end() > glyph_run.source().end()
+                        || glyph_source.start() < previous_source_end
+                    {
+                        return Err(LayoutError::Shaping(
+                            "glyph source ranges must be ordered within their run".into(),
+                        ));
+                    }
+                    previous_source_end = glyph_source.end();
+                    let visual_start = self
+                        .projection
+                        .source_to_visual(glyph_source.start(), ProjectionBias::Before)?;
+                    let visual_end = self
+                        .projection
+                        .source_to_visual(glyph_source.end(), ProjectionBias::After)?;
+                    let cluster_visual = VisualRange::new(visual_start, visual_end)
+                        .ok_or(LayoutError::OffsetOverflow)?;
+                    let cluster_text = read_source_range(&source, glyph_source)?;
+                    let is_line_break = cluster_text.contains('\n');
+                    let advance = if is_line_break { 0.0 } else { glyph.advance() };
+                    if !advance.is_finite() || advance < 0.0 {
+                        return Err(LayoutError::InvalidMetrics(advance.to_bits()));
+                    }
+                    if !glyph.x_offset().is_finite() || !glyph.y_offset().is_finite() {
+                        return Err(LayoutError::Shaping("glyph offsets must be finite".into()));
+                    }
+                    line_source_end = line_source_end.max(glyph_source.end());
+
+                    if is_line_break {
+                        self.clusters.push(VisualCluster {
+                            source: glyph_source,
+                            visual: cluster_visual,
+                            line: line_index,
+                            x: line_width,
+                            width: 0.0,
+                            style: glyph_run.style(),
+                            line_break: true,
+                        });
+                        self.push_line(LineDraft {
+                            index: line_index,
+                            source_start: line_source_start,
+                            source_end: line_source_end,
+                            visual_start: line_visual_start,
+                            visual_end: cluster_visual.end(),
+                            width: line_width,
+                            cluster_start: line_cluster_start,
+                        })?;
+                        line_index = line_index.saturating_add(1);
+                        line_cluster_start = self.clusters.len();
+                        line_source_start = glyph_source.end();
+                        line_source_end = glyph_source.end();
+                        line_visual_start = cluster_visual.end();
+                        line_width = 0.0;
+                        last_was_break = true;
+                        continue;
+                    }
+
+                    if line_width > 0.0 && line_width + advance > self.config.max_width {
+                        self.push_line(LineDraft {
+                            index: line_index,
+                            source_start: line_source_start,
+                            source_end: line_source_end,
+                            visual_start: line_visual_start,
+                            visual_end: cluster_visual.start(),
+                            width: line_width,
+                            cluster_start: line_cluster_start,
+                        })?;
+                        line_index = line_index.saturating_add(1);
+                        line_cluster_start = self.clusters.len();
+                        line_source_start = glyph_source.start();
+                        line_source_end = glyph_source.start();
+                        line_visual_start = cluster_visual.start();
+                        line_width = 0.0;
+                    }
+                    self.clusters.push(VisualCluster {
+                        source: glyph_source,
+                        visual: cluster_visual,
+                        line: line_index,
+                        x: line_width,
+                        width: advance,
+                        style: glyph_run.style(),
+                        line_break: false,
+                    });
+                    line_width += advance;
+                    last_was_break = false;
+                }
+            }
+        }
+
+        if self.lines.is_empty() || !last_was_break {
+            self.push_line(LineDraft {
+                index: line_index,
+                source_start: line_source_start,
+                source_end: line_source_end,
+                visual_start: line_visual_start,
+                visual_end: self.projection.visual_len(),
+                width: line_width,
+                cluster_start: line_cluster_start,
+            })?;
+        } else {
+            self.push_line(LineDraft {
+                index: line_index,
+                source_start: line_source_start,
+                source_end: line_source_end,
+                visual_start: line_visual_start,
+                visual_end: line_visual_start,
+                width: 0.0,
+                cluster_start: line_cluster_start,
+            })?;
+        }
+        Ok(())
+    }
+
     fn push_line(&mut self, draft: LineDraft) -> Result<(), LayoutError> {
         let source = TextRange::new(draft.source_start, draft.source_end)
             .ok_or(LayoutError::OffsetOverflow)?;
@@ -994,6 +1185,7 @@ fn read_source_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_segmentation::UnicodeSegmentation;
     use yu_core::{ByteOffset, TextRange};
     use yu_projection::Projection;
     use yu_text::TextBuffer;
@@ -1003,6 +1195,71 @@ mod tests {
         let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
             .expect("source range should be ordered");
         Projection::inline(&snapshot, range).expect("projection should build")
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestShape {
+        FixedGrapheme(f32),
+        Ligature(f32),
+        InvalidAdvance,
+        Error,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestShaper {
+        shape: TestShape,
+    }
+
+    impl ShapingProvider for TestShaper {
+        type Error = &'static str;
+
+        fn shape(
+            &self,
+            text: &str,
+            source: TextRange,
+            style: VisualRunStyle,
+        ) -> Result<ShapedText, Self::Error> {
+            if matches!(self.shape, TestShape::Error) {
+                return Err("boom");
+            }
+            let glyphs = match self.shape {
+                TestShape::FixedGrapheme(advance) => text
+                    .grapheme_indices(true)
+                    .map(|(start, cluster)| {
+                        let end = start + cluster.len();
+                        let source_start = source
+                            .start()
+                            .checked_add(u64::try_from(start).expect("test offset fits"))
+                            .expect("source offset fits");
+                        let source_end = source
+                            .start()
+                            .checked_add(u64::try_from(end).expect("test offset fits"))
+                            .expect("source offset fits");
+                        let source = TextRange::new(source_start, source_end)
+                            .expect("glyph range should be ordered");
+                        Glyph::new(GlyphId::from_raw(1), source, advance, 0.0, 0.0)
+                    })
+                    .collect(),
+                TestShape::Ligature(advance) => {
+                    vec![Glyph::new(GlyphId::from_raw(2), source, advance, 0.0, 0.0)]
+                }
+                TestShape::InvalidAdvance => {
+                    vec![Glyph::new(GlyphId::from_raw(3), source, f32::NAN, 0.0, 0.0)]
+                }
+                TestShape::Error => unreachable!(),
+            };
+            Ok(ShapedText::new(
+                source,
+                vec![GlyphRun::new(
+                    FontFaceId::from_raw(1),
+                    source,
+                    style,
+                    TextDirection::Ltr,
+                    Script::Unknown,
+                    glyphs,
+                )],
+            ))
+        }
     }
 
     #[test]
@@ -1093,6 +1350,71 @@ mod tests {
         assert_eq!(layout.lines().len(), 2);
         assert_eq!(layout.clusters().len(), 4);
         assert_eq!(layout.lines()[0].width(), 4.0);
+    }
+
+    #[test]
+    fn shaped_glyph_advances_control_wrapping_and_preserve_source_clusters() {
+        let layout = LayoutSnapshot::from_projection_with_shaper(
+            &projection("abcd"),
+            LayoutConfig::new(4.0, 1.0),
+            &TestShaper {
+                shape: TestShape::FixedGrapheme(2.0),
+            },
+        )
+        .expect("shaped layout should build");
+
+        assert_eq!(layout.lines().len(), 2);
+        assert_eq!(layout.lines()[0].width(), 4.0);
+        assert_eq!(layout.clusters().len(), 4);
+        assert_eq!(layout.clusters()[0].source().len(), 1);
+        assert_eq!(layout.clusters()[3].source().start().get(), 3);
+    }
+
+    #[test]
+    fn shaped_ligature_cluster_is_not_split() {
+        let layout = LayoutSnapshot::from_projection_with_shaper(
+            &projection("fi"),
+            LayoutConfig::new(0.5, 1.0),
+            &TestShaper {
+                shape: TestShape::Ligature(1.0),
+            },
+        )
+        .expect("ligature layout should build");
+
+        assert_eq!(layout.lines().len(), 1);
+        assert_eq!(layout.lines()[0].width(), 1.0);
+        assert_eq!(layout.clusters().len(), 1);
+        assert_eq!(layout.clusters()[0].source().len(), 2);
+    }
+
+    #[test]
+    fn shaping_errors_are_reported_by_layout() {
+        let result = LayoutSnapshot::from_projection_with_shaper(
+            &projection("text"),
+            LayoutConfig::default(),
+            &TestShaper {
+                shape: TestShape::Error,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LayoutError::Shaping(message)) if message == "boom"
+        ));
+    }
+
+    #[test]
+    fn invalid_shaped_advance_is_rejected() {
+        let result = LayoutSnapshot::from_projection_with_shaper(
+            &projection("text"),
+            LayoutConfig::default(),
+            &TestShaper {
+                shape: TestShape::InvalidAdvance,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(LayoutError::InvalidMetrics(bits)) if f32::from_bits(bits).is_nan()
+        ));
     }
 
     #[test]

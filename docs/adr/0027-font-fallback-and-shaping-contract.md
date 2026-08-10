@@ -21,6 +21,8 @@ fallback、script/direction 提示、glyph id、cluster source range 和 glyph a
 - `ShapeRequest` 显式携带 source `TextRange`、style、direction、script 和 font request；
 - `TextShaper` 返回 `ShapedText`，其中可有多个 `GlyphRun`，每个 run 绑定一个 fallback face，
   每个 `Glyph` 保存 glyph id、source cluster range 和 advance；
+- `yu-layout::LayoutSnapshot::from_projection_with_shaper` 直接消费这些 runs：glyph advance
+  决定换行宽度，glyph source cluster range 决定 visual cluster 和 hit-test 映射；
 - `MockShaper` 采用一 grapheme 一 glyph 的确定性实现，专门用于测试；
 - `FontMetrics` 实现现有 `yu-layout::ClusterMetrics`，让 layout 在没有平台字体 API 时也能
   使用同一套 fallback/size 规则。
@@ -31,11 +33,12 @@ fallback、script/direction 提示、glyph id、cluster source range 和 glyph a
 - fallback 切换的边界和 source cluster 映射可以在纯 Rust 中测试；
 - 真实 backend 可以只实现 `TextShaper`/font database adapter，不改变 Markdown source、
   Projection 或 LayoutSnapshot 的 canonical state；
-- 现有 layout 的 wrapping/hit-test contract 在接入 `FontMetrics` 后保持不变。
+- shaped glyph 的 advance 可以控制 layout wrapping，同时 source/visual caret 与 hit-test
+  contract 保持不变；`ClusterMetrics` 仍可作为兼容的简化入口。
 
 ## 限制
 
 `MockShaper` 不实现 ligature、BiDi、OpenType feature、真实 font metrics 或 rasterization；当前
-`ClusterMetrics` 仍按 grapheme 提供 advance，glyph run 尚未直接参与 line breaking。下一阶段需
-在不破坏 source mapping 的前提下引入 shaping-aware line runs，再分别接入 macOS 原生字体和
-glyph atlas。
+shaping-aware layout 只验证 glyph cluster 的范围、顺序、advance 和有限性，不执行真实的
+BiDi 重排或 glyph positioning。下一阶段再分别接入 macOS 原生字体、真实 shaping 和 glyph
+atlas；这些 backend 仍必须通过同一 `ShapingProvider`/`ShapedText` 边界。

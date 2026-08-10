@@ -126,7 +126,9 @@ composition overlay 不推进 source Revision，因此不会触发 projection ca
 `Projection` 的 visible runs，按 grapheme cluster 生成 `VisualLine`/`VisualCluster`，并提供
 `LayoutCaret` 与 `LayoutHit` 的 source/visual 双向查询。当前默认只使用确定性的
 `MonospaceMetrics`；`yu-font::FontMetrics` 已提供同一接口的 fallback-aware adapter，真实字体
-shaping 仍通过 `ClusterMetrics` 注入，布局层不依赖窗口或 GPU。
+shaping 可通过 `LayoutSnapshot::from_projection_with_shaper` 注入；该入口消费
+`ShapedText/GlyphRun` 的 glyph advance 和 source cluster range，布局层仍不依赖窗口或 GPU。
+`ClusterMetrics` 保留为不需要 glyph 级数据的兼容入口。
 `EditorDocument` 现在拥有独立的 `LayoutCache`：entry 以 block 的 `(range, kind)` 和
 `LayoutConfig` 为 key，同一 revision/config 查询命中同一个 cache-owned snapshot。永久 edit
 会通过 layout/projection mapping 保留严格位于 changed range 外的布局，并在 block range 或
@@ -139,5 +141,6 @@ block 结构变化则保守失效；它仍是纯 Rust 的测量/索引层，不�
 
 `yu-font` 定义了平台无关的 `FontDatabase`、coverage/fallback、`FontRequest`、方向/script
 提示、`TextShaper` 和可分 fallback face 的 `ShapedText/GlyphRun`。`MockShaper` 只用于契约测试，
-不会冒充 CoreText/DirectWrite 的真实 shaping；未来原生 backend 可以替换它而不改变 layout
-的 source/visual 坐标。
+不会冒充 CoreText/DirectWrite 的真实 shaping；`FontShaper` 将它桥接为 layout 的
+`ShapingProvider`，glyph advance 参与 line breaking，但不改变 source/visual 坐标。未来原生
+backend 可以替换它而不改变 layout 的 source/visual 坐标。

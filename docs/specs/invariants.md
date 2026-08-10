@@ -100,6 +100,9 @@
 7. `ViewportLayout` 的未测量 block 必须使用显式 estimate；一次 viewport 查询不得为了定位
    可见窗口而隐式 layout 全部 block，返回的 block y/height 和 source range 必须来自同一
    Revision。
+8. `LayoutSnapshot::from_projection_with_shaper` 必须验证 shaped output 的 source range 属于
+   请求的 visible run；glyph cluster range 必须有序且可映射回 Projection，advance 和 offset
+   必须有限。合法 glyph advance 决定 wrapping，但不得改写 source buffer。
 
 ## Font and shaping
 
