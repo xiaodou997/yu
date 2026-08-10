@@ -156,4 +156,7 @@ backend 可以替换它而不改变 layout 的 source/visual 坐标。
 index，并转换为 `yu-font` 的 `GlyphRun`/UTF-8 source cluster。适配层只把自有的 family、
 PostScript name、size、glyph 数据和 fallback 标志返回给共享层，不让 `CTFontRef` 或其他平台
 句柄进入 `yu-font`、`yu-layout` 或 `EditorDocument`。当前布局契约对 RTL/non-monotonic run
-仍会显式报错；glyph rasterization/atlas 尚未开始。
+仍会显式报错。`CoreTextGlyphRasterizer` 在同一平台边界内复制 font metrics、glyph bounds、
+advance 和 alpha-only owned bitmap；`yu-font::GlyphAtlas` 只保存 CPU page、placement 和自有
+像素，供后续 renderer 上传 GPU，绝不进入 canonical source 或 document state。当前尚未绑定
+wgpu/Metal texture，也不处理彩色 glyph、subpixel LCD 或完整 BiDi。

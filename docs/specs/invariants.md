@@ -122,3 +122,7 @@
 6. CoreText 的 UTF-16 glyph string index 只能在合法 UTF-8 scalar boundary 上转换为 source
    `TextRange`；glyph cluster range 必须有序、位于请求范围内，RTL/non-monotonic 输出在布局尚未
    支持时必须返回明确错误而不是调整索引伪装成 LTR。
+7. glyph rasterizer 的跨边界结果必须是自有 `FontMetricsSnapshot`、`GlyphMetrics`、
+   `GlyphBitmap` 或 `RasterizedGlyph`；CoreText/CoreGraphics 句柄、context、纹理和 atlas page
+   生命周期不得进入 `TextSnapshot`、projection、layout 或 `EditorDocument` canonical state。
+   atlas placement 必须绑定 `GlyphRasterKey`，空 bitmap glyph 可以没有 page 但必须保留 advance。

@@ -57,6 +57,7 @@
 - [x] `yu-editor` LayoutCache/ViewportLayout 区分 metrics 与 shaped backend
 - [x] macOS-only CoreText family catalog 与 fallback resolver（只返回安全字体元数据）
 - [x] macOS CoreText CTLine/CTRun shaping、UTF-16→UTF-8 cluster mapping 与 `yu-layout` smoke test
+- [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -102,11 +103,15 @@
     时必须清除旧的 measured height，且 provider 不得进入 `EditorDocument` 的 canonical state。
 19. macOS CoreText 调用必须隔离在 `platform/macos/yu-font-macos`；共享层只能接收自有的 family、
    PostScript name、size 与 fallback 元数据，系统 family catalog 与 live resolver 必须有 macOS
-   实测测试；CoreText 对象与 rasterization 仍属于平台适配器边界，rasterization 仍属于下一阶段。
+   实测测试；CoreText 对象与 rasterization 仍属于平台适配器边界。
 20. CoreText shaper 必须通过 `CFAttributedString → CTLine → CTRun` 返回真实 glyph id/advance，
    将合法 UTF-16 string index 转换为 UTF-8 source cluster range，并让 `yu-layout` 的 shaped
    layout 消费这些 advance；RTL 或 non-monotonic 输出在当前布局契约下必须显式拒绝，不能静默
    重排 source range。
+21. CoreText rasterizer 必须通过真实 font metrics、glyph bounds/advance 和 alpha bitmap 测试；
+   `FontMetricsCache`/`GlyphAtlas` 的命中只能影响渲染准备，不能改变 source Revision、
+   projection mapping 或 layout source ranges。CPU atlas page 可以被 renderer 上传，但本阶段
+   不引入 GPU texture 生命周期。
 
 ## 非目标
 
