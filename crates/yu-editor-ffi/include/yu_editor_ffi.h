@@ -46,6 +46,10 @@ int32_t yu_composition_session_selection(const YuCompositionSession *session,
                                          uint64_t *revision_output,
                                          uint64_t *start_output,
                                          uint64_t *end_output);
+int32_t yu_composition_session_set_selection(YuCompositionSession *session,
+                                             uint64_t expected_revision,
+                                             uint64_t start_utf16,
+                                             uint64_t end_utf16);
 int32_t yu_composition_session_source_length(const YuCompositionSession *session,
                                              size_t *output);
 int32_t yu_composition_session_copy_source(const YuCompositionSession *session,

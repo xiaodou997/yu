@@ -111,6 +111,19 @@ private final class RustCompositionBridge {
         )
     }
 
+    func setSelection(_ range: NSRange) {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(range.location >= 0 && range.length >= 0, "Rust selection must be non-negative")
+        let expectedRevision = revision()
+        let status = yu_composition_session_set_selection(
+            session,
+            expectedRevision,
+            UInt64(range.location),
+            UInt64(NSMaxRange(range))
+        )
+        precondition(status == 0, "Rust composition selection update failed: \(status)")
+    }
+
     func sourceString(utf16Length: Int) -> String {
         guard let session else { preconditionFailure("Rust composition session is missing") }
         precondition(utf16Length >= 0, "Rust composition UTF-16 length must be non-negative")
@@ -251,12 +264,18 @@ final class TextInputView: NSView, NSTextInputClient {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        if hasMarkedText() {
+            cancelComposition()
+        } else {
+            inputContext?.discardMarkedText()
+            marked = notFoundRange
+            rustComposition.cancel()
+        }
         let point = convert(event.locationInWindow, from: nil)
         let hit = caretHit(forLocalPoint: point)
         selection = NSRange(location: hit.index, length: 0)
         selectionAffinity = hit.affinity
-        marked = notFoundRange
-        inputContext?.discardMarkedText()
+        rustComposition.setSelection(selection)
         needsDisplay = true
         postSelectionChanged()
     }
@@ -426,11 +445,17 @@ final class TextInputView: NSView, NSTextInputClient {
     }
 
     override func setAccessibilitySelectedTextRange(_ range: NSRange) {
+        if hasMarkedText() {
+            cancelComposition()
+        } else {
+            inputContext?.discardMarkedText()
+            marked = notFoundRange
+            rustComposition.cancel()
+        }
         guard let range = validatedAccessibilityRange(range) else { return }
-        inputContext?.discardMarkedText()
-        marked = notFoundRange
         selection = range
         selectionAffinity = .downstream
+        rustComposition.setSelection(selection)
         needsDisplay = true
         postSelectionChanged()
     }
@@ -515,6 +540,45 @@ final class TextInputView: NSView, NSTextInputClient {
             "AX self-check characters=\(accessibilityNumberOfCharacters()) "
                 + "selection=\(accessibilitySelectedTextRange()) "
                 + "firstLine=\(firstLine) caretFrame=\(caretFrame)"
+        )
+    }
+
+    func runNativeSelectionSelfCheck() {
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let source = textStorage.string as NSString
+        let probe = source.range(of: "请点击")
+        precondition(probe.location != NSNotFound, "selection probe text must exist")
+
+        let base = textStorage.string
+        setMarkedText(
+            "にほん",
+            selectedRange: NSRange(location: 3, length: 0),
+            replacementRange: notFoundRange
+        )
+        precondition(hasMarkedText(), "selection mutation should start from a marked overlay")
+        setAccessibilitySelectedTextRange(probe)
+        precondition(
+            !hasMarkedText() && textStorage.string == base,
+            "native selection mutation must cancel the temporary overlay"
+        )
+        let rustSelection = rustComposition.selection()
+        precondition(
+            rustSelection.revision == rustComposition.revision()
+                && rustSelection.range == probe,
+            "native selection mutation must update Rust"
+        )
+
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        rustComposition.setSelection(selection)
+        needsDisplay = true
+        postSelectionChanged()
+        let restored = rustComposition.selection()
+        precondition(restored.range == savedSelection, "native selection self-check must restore")
+        print(
+            "Native selection self-check probe=\(probe) "
+                + "revision=\(rustSelection.revision) restored=\(restored.range)"
         )
     }
 
@@ -647,6 +711,7 @@ final class TextInputView: NSView, NSTextInputClient {
         compositionSelectionBefore = nil
         compositionAffinityBefore = nil
         rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection)
         needsDisplay = true
         print(
             "Unicode composition self-check japanese=日本語 combining=é "
@@ -884,6 +949,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let range = string.rangeOfComposedCharacterSequence(at: selection.location - 1)
         selection = NSRange(location: range.location, length: 0)
         selectionAffinity = .downstream
+        rustComposition.setSelection(selection)
         needsDisplay = true
         postSelectionChanged()
     }
@@ -894,6 +960,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let range = string.rangeOfComposedCharacterSequence(at: selection.location)
         selection = NSRange(location: NSMaxRange(range), length: 0)
         selectionAffinity = .downstream
+        rustComposition.setSelection(selection)
         needsDisplay = true
         postSelectionChanged()
     }
@@ -1005,6 +1072,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeFirstResponder(inputView)
         inputView.runLayoutRoundTripSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
+        inputView.runNativeSelectionSelfCheck()
         inputView.runAccessibilitySelfCheck()
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.25) {
