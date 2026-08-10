@@ -5,9 +5,9 @@
 //! This crate intentionally does not open font files or call CoreText,
 //! DirectWrite, or Fontconfig. It defines the data that those platform
 //! backends must eventually produce, and ships a deterministic shaper for
-//! contract tests. [`FontMetrics`] implements `yu-layout::ClusterMetrics` so
-//! the current layout engine can consume the same fallback policy before a
-//! native glyph backend exists.
+//! contract tests. [`FontMetrics`] implements `yu-layout::ClusterMetrics`, while
+//! [`FontShaper`] implements `yu-layout::ShapingProvider`, so the layout engine
+//! can consume the same fallback policy before a native glyph backend exists.
 
 use std::error::Error;
 use std::fmt;
@@ -18,16 +18,9 @@ use yu_core::{ByteOffset, TextRange};
 use yu_layout::ClusterMetrics;
 use yu_projection::VisualRunStyle;
 
-/// Stable identity of a registered font face.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FontFaceId(u32);
-
-impl FontFaceId {
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
+pub use yu_layout::{
+    FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
+};
 
 /// Coarse weight requests used by fallback selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -237,8 +230,9 @@ impl FontDatabase {
         if !spec.nominal_advance.is_finite() || spec.nominal_advance <= 0.0 {
             return Err(FontError::InvalidAdvance(spec.nominal_advance.to_bits()));
         }
-        let id =
-            FontFaceId(u32::try_from(self.faces.len()).map_err(|_| FontError::FaceIdOverflow)?);
+        let id = FontFaceId::from_raw(
+            u32::try_from(self.faces.len()).map_err(|_| FontError::FaceIdOverflow)?,
+        );
         self.faces.push(FontFace { id, spec });
         Ok(id)
     }
@@ -255,7 +249,7 @@ impl FontDatabase {
 
     #[must_use]
     pub fn face(&self, id: FontFaceId) -> Option<&FontFace> {
-        self.faces.get(usize::try_from(id.0).ok()?)
+        self.faces.get(usize::try_from(id.get()).ok()?)
     }
 
     /// Selects the closest family/weight/slant face that covers `text`.
@@ -345,25 +339,6 @@ impl FontRequest {
     }
 }
 
-/// Direction passed to a shaper. BiDi resolution remains a later layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TextDirection {
-    Ltr,
-    Rtl,
-}
-
-/// Script hint passed to a shaper.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Script {
-    Common,
-    Latin,
-    Han,
-    Japanese,
-    Arabic,
-    Devanagari,
-    Unknown,
-}
-
 /// Input to a shaping backend.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShapeRequest<'a> {
@@ -438,116 +413,6 @@ impl<'a> ShapeRequest<'a> {
     pub const fn with_script(mut self, script: Script) -> Self {
         self.script = script;
         self
-    }
-}
-
-/// One positioned glyph with a source cluster range.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Glyph {
-    id: GlyphId,
-    source: TextRange,
-    advance: f32,
-}
-
-impl Glyph {
-    #[must_use]
-    pub const fn id(self) -> GlyphId {
-        self.id
-    }
-
-    #[must_use]
-    pub const fn source(self) -> TextRange {
-        self.source
-    }
-
-    #[must_use]
-    pub const fn advance(self) -> f32 {
-        self.advance
-    }
-}
-
-/// Stable identifier for one glyph in a face.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct GlyphId(u32);
-
-impl GlyphId {
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-/// A same-face shaped run.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GlyphRun {
-    face: FontFaceId,
-    source: TextRange,
-    style: VisualRunStyle,
-    direction: TextDirection,
-    script: Script,
-    glyphs: Vec<Glyph>,
-    advance: f32,
-}
-
-impl GlyphRun {
-    #[must_use]
-    pub const fn face(&self) -> FontFaceId {
-        self.face
-    }
-
-    #[must_use]
-    pub const fn source(&self) -> TextRange {
-        self.source
-    }
-
-    #[must_use]
-    pub const fn style(&self) -> VisualRunStyle {
-        self.style
-    }
-
-    #[must_use]
-    pub const fn direction(&self) -> TextDirection {
-        self.direction
-    }
-
-    #[must_use]
-    pub const fn script(&self) -> Script {
-        self.script
-    }
-
-    #[must_use]
-    pub fn glyphs(&self) -> &[Glyph] {
-        &self.glyphs
-    }
-
-    #[must_use]
-    pub const fn advance(&self) -> f32 {
-        self.advance
-    }
-}
-
-/// Shaped output potentially split into fallback-face runs.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ShapedText {
-    source: TextRange,
-    runs: Vec<GlyphRun>,
-    advance: f32,
-}
-
-impl ShapedText {
-    #[must_use]
-    pub const fn source(&self) -> TextRange {
-        self.source
-    }
-
-    #[must_use]
-    pub fn runs(&self) -> &[GlyphRun] {
-        &self.runs
-    }
-
-    #[must_use]
-    pub const fn advance(&self) -> f32 {
-        self.advance
     }
 }
 
@@ -637,11 +502,7 @@ impl MockShaper {
 impl TextShaper for MockShaper {
     fn shape(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, ShapeError> {
         if request.text.is_empty() {
-            return Ok(ShapedText {
-                source: request.source,
-                runs: Vec::new(),
-                advance: 0.0,
-            });
+            return Ok(ShapedText::new(request.source, Vec::new()));
         }
         let styled_font = request.font.for_style(request.style);
         let mut runs = Vec::new();
@@ -667,16 +528,16 @@ impl TextShaper for MockShaper {
                 .face(face_id)
                 .ok_or(ShapeError::MissingGlyph(Arc::from(cluster)))?;
             if current_face != Some(face_id) && !current_glyphs.is_empty() {
-                runs.push(GlyphRun {
-                    face: current_face.expect("a non-empty run has a face"),
-                    source: TextRange::new(current_source_start, current_source_end)
+                let face = current_face.ok_or(ShapeError::OffsetOverflow)?;
+                runs.push(GlyphRun::new(
+                    face,
+                    TextRange::new(current_source_start, current_source_end)
                         .ok_or(ShapeError::OffsetOverflow)?,
-                    style: request.style,
-                    direction: request.direction,
-                    script: request.script,
-                    glyphs: std::mem::take(&mut current_glyphs),
-                    advance: current_advance,
-                });
+                    request.style,
+                    request.direction,
+                    request.script,
+                    std::mem::take(&mut current_glyphs),
+                ));
                 total_advance += current_advance;
                 current_advance = 0.0;
                 current_source_start = source_start;
@@ -686,35 +547,82 @@ impl TextShaper for MockShaper {
             }
             current_face = Some(face_id);
             let advance = face.nominal_advance() * styled_font.size();
-            current_glyphs.push(Glyph {
-                id: GlyphId(hash_cluster(cluster)),
-                source: TextRange::new(source_start, source_end)
-                    .ok_or(ShapeError::OffsetOverflow)?,
+            current_glyphs.push(Glyph::new(
+                GlyphId::from_raw(hash_cluster(cluster)),
+                TextRange::new(source_start, source_end).ok_or(ShapeError::OffsetOverflow)?,
                 advance,
-            });
+                0.0,
+                0.0,
+            ));
             current_source_end = source_end;
             current_advance += advance;
         }
 
         if !current_glyphs.is_empty() {
-            runs.push(GlyphRun {
-                face: current_face.expect("a non-empty run has a face"),
-                source: TextRange::new(current_source_start, current_source_end)
+            let face = current_face.ok_or(ShapeError::OffsetOverflow)?;
+            runs.push(GlyphRun::new(
+                face,
+                TextRange::new(current_source_start, current_source_end)
                     .ok_or(ShapeError::OffsetOverflow)?,
-                style: request.style,
-                direction: request.direction,
-                script: request.script,
-                glyphs: current_glyphs,
-                advance: current_advance,
-            });
+                request.style,
+                request.direction,
+                request.script,
+                current_glyphs,
+            ));
             total_advance += current_advance;
         }
 
-        Ok(ShapedText {
-            source: request.source,
-            runs,
-            advance: total_advance,
+        debug_assert_eq!(
+            total_advance,
+            runs.iter().map(GlyphRun::advance).sum::<f32>()
+        );
+        Ok(ShapedText::new(request.source, runs))
+    }
+}
+
+/// A layout-facing adapter that turns a font request into shaped glyph runs.
+#[derive(Clone, Debug)]
+pub struct FontShaper {
+    backend: MockShaper,
+    request: FontRequest,
+}
+
+impl FontShaper {
+    pub fn new(database: Arc<FontDatabase>, request: FontRequest) -> Result<Self, ShapeError> {
+        Ok(Self {
+            backend: MockShaper::new(database)?,
+            request,
         })
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> &MockShaper {
+        &self.backend
+    }
+
+    #[must_use]
+    pub fn request(&self) -> &FontRequest {
+        &self.request
+    }
+}
+
+impl TextShaper for FontShaper {
+    fn shape(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, ShapeError> {
+        self.backend.shape(request)
+    }
+}
+
+impl ShapingProvider for FontShaper {
+    type Error = ShapeError;
+
+    fn shape(
+        &self,
+        text: &str,
+        source: TextRange,
+        style: VisualRunStyle,
+    ) -> Result<ShapedText, Self::Error> {
+        let request = ShapeRequest::new(text, source, style, self.request.clone())?;
+        self.backend.shape(&request)
     }
 }
 
@@ -844,6 +752,33 @@ mod tests {
             &metrics,
         )
         .expect("layout should consume font metrics");
+        assert_eq!(layout.lines().len(), 1);
+        assert_eq!(layout.lines()[0].width(), 2.0);
+        assert_eq!(layout.clusters().len(), 2);
+    }
+
+    #[test]
+    fn font_shaper_feeds_shaping_aware_layout() {
+        let source = "ab";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let projection = Projection::inline(
+            &snapshot,
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("range should be valid"),
+        )
+        .expect("projection should build");
+        let shaper = FontShaper::new(
+            database(),
+            FontRequest::new("Latin", 2.0).expect("request should be valid"),
+        )
+        .expect("shaper should build");
+        let layout = LayoutSnapshot::from_projection_with_shaper(
+            &projection,
+            LayoutConfig::new(2.0, 1.0),
+            &shaper,
+        )
+        .expect("layout should consume shaped runs");
+
         assert_eq!(layout.lines().len(), 1);
         assert_eq!(layout.lines()[0].width(), 2.0);
         assert_eq!(layout.clusters().len(), 2);
