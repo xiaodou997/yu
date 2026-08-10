@@ -41,10 +41,10 @@ Parser equivalence              native event loop
 yu-core
    ▲
    │
-yu-text ◄──── yu-editor
-   ▲
-   │
-yu-markdown ◄── yu-inspect
+yu-text ◄──── yu-editor ◄──── yu-editor-ffi
+   ▲             ▲                  ▲
+   │             │                  │
+yu-markdown ◄── yu-inspect     macOS/Swift shell
 ```
 
 后续预计增加：

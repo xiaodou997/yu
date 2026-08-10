@@ -42,6 +42,8 @@
    range；Rust-owned buffer、overlay 或 Snapshot 指针不得逃逸到平台层。
 7. FFI 函数必须返回明确 status code，不能让 panic、未对齐的 UTF-8 或 surrogate 中间位置
    穿过 ABI；commit 成功后最多推进一次 Revision，cancel 不推进 Revision。
+8. FFI source query 必须携带 expected Revision；局部查询只能复制请求范围，不能因平台查询
+   而物化完整 Snapshot。
 
 ## Accessibility
 

@@ -87,18 +87,45 @@ private final class RustCompositionBridge {
         hasOverlay = false
     }
 
-    func sourceString() -> String {
+    func revision() -> UInt64 {
         guard let session else { preconditionFailure("Rust composition session is missing") }
+        var value: UInt64 = 0
+        precondition(
+            yu_composition_session_revision(session, &value) == 0,
+            "Rust composition revision query failed"
+        )
+        return value
+    }
+
+    func sourceString(utf16Length: Int) -> String {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(utf16Length >= 0, "Rust composition UTF-16 length must be non-negative")
+        let expectedRevision = revision()
         var length = 0
         precondition(
-            yu_composition_session_source_length(session, &length) == 0,
-            "Rust composition source length failed"
+            yu_composition_session_source_range_length(
+                session,
+                expectedRevision,
+                0,
+                UInt64(utf16Length),
+                &length
+            ) == 0,
+            "Rust composition source range length failed"
         )
         var bytes = [UInt8](repeating: 0, count: length)
+        var written = 0
         let status = bytes.withUnsafeMutableBufferPointer { buffer in
-            yu_composition_session_copy_source(session, buffer.baseAddress, buffer.count)
+            yu_composition_session_copy_source_range(
+                session,
+                expectedRevision,
+                0,
+                UInt64(utf16Length),
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
         }
-        precondition(status == 0, "Rust composition source copy failed: \(status)")
+        precondition(status == 0 && written == length, "Rust composition source range copy failed: \(status)")
         return String(decoding: bytes, as: UTF8.self)
     }
 
@@ -540,7 +567,7 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(hasMarkedText() && marked.length == 4, "Japanese preedit should be marked")
         precondition(rustComposition.overlayString() == "にほんご")
         precondition(rustComposition.overlaySelection() == NSRange(location: 4, length: 0))
-        precondition(rustComposition.sourceString() == base)
+        precondition(rustComposition.sourceString(utf16Length: base.utf16.count) == base)
         setMarkedText(
             "にほんご",
             selectedRange: NSRange(location: 4, length: 0),
@@ -549,7 +576,11 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(rustComposition.overlayString() == "にほんご")
         insertText("日本語", replacementRange: notFoundRange)
         precondition(!hasMarkedText() && textStorage.string == base + "日本語")
-        precondition(!rustComposition.hasOverlay && rustComposition.sourceString() == base + "日本語")
+        precondition(
+            !rustComposition.hasOverlay
+                && rustComposition.sourceString(utf16Length: (base + "日本語").utf16.count)
+                    == base + "日本語"
+        )
 
         setMarkedText(
             "\u{301}",
@@ -564,7 +595,11 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(rustComposition.overlayString() == "e\u{301}")
         insertText("é", replacementRange: notFoundRange)
         precondition(!hasMarkedText() && textStorage.string == base + "日本語é")
-        precondition(!rustComposition.hasOverlay && rustComposition.sourceString() == base + "日本語é")
+        precondition(
+            !rustComposition.hasOverlay
+                && rustComposition.sourceString(utf16Length: (base + "日本語é").utf16.count)
+                    == base + "日本語é"
+        )
 
         let cancelBase = textStorage.string
         setMarkedText(
@@ -575,7 +610,10 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(hasMarkedText())
         doCommand(by: #selector(NSResponder.cancelOperation(_:)))
         precondition(!hasMarkedText() && textStorage.string == cancelBase)
-        precondition(!rustComposition.hasOverlay && rustComposition.sourceString() == cancelBase)
+        precondition(
+            !rustComposition.hasOverlay
+                && rustComposition.sourceString(utf16Length: cancelBase.utf16.count) == cancelBase
+        )
 
         replaceStorage(
             range: NSRange(location: 0, length: textStorage.length),

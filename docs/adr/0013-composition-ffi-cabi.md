@@ -13,7 +13,9 @@ macOS 的 `NSTextInputClient` 使用 Swift/Objective-C 对象、`NSRange` 和 UT
 ## 决策
 
 新增独立的 `yu-editor-ffi` crate，构建为 Rust `staticlib`，仅暴露一个 opaque
-`YuCompositionSession` 句柄和状态码。C ABI 的输入输出约束如下：
+`YuCompositionSession` 句柄和状态码。句柄内部包装 `yu-editor::EditorDocument`；canonical
+source 与 CompositionOverlay 因此属于同一个 editor state，而不是 FFI 自己维护一份 shadow
+buffer。C ABI 的输入输出约束如下：
 
 ```text
 UTF-8 text  ── pointer + byte length ──► Rust
@@ -21,14 +23,16 @@ NSRange     ── UTF-16 start/end       ──► Rust conversion
 Rust state  ── opaque session          ──► platform owns handle only
 ```
 
-session 内部拥有 `TextBuffer` 和可选的 `CompositionOverlay`，公开操作只有：
+`EditorDocument` 内部拥有 `TextBuffer` 和可选的 `CompositionOverlay`，公开操作只有：
 
 - `new/reset_source`：创建或替换 canonical source；有 active overlay 时拒绝 reset；
 - `begin/update`：创建或更新 preedit overlay，替换范围从当前 source UTF-16 映射到 UTF-8
   byte range；
 - `commit`：把 overlay 转为一个 Transaction 并应用到 Rust buffer；成功后清除 overlay；
 - `cancel`：丢弃 overlay，不修改 source 或 Revision；
-- `revision/source/copy` 查询：通过 caller-owned buffer 复制结果，不返回 Rust-owned pointer。
+- `revision/source/copy` 查询：通过 caller-owned buffer 复制结果，不返回 Rust-owned pointer；
+- `source_range_length/copy_source_range`：调用方提供 expected Revision 和 UTF-16 range，Rust
+  逐 chunk 返回局部 UTF-8 bytes，不物化完整 source。
 
 除只释放 opaque handle 的 `destroy` 外，所有函数都返回显式 `int32_t` status。非法 UTF-8、
 空句柄、UTF-16 越界、surrogate/scalar 中间位置、没有 overlay 或输出 buffer 太小，都必须
@@ -41,8 +45,8 @@ session 内部拥有 `TextBuffer` 和可选的 `CompositionOverlay`，公开操�
 - Rust 静态库不依赖 Swift runtime，其他平台可以复用同一窄 ABI；
 - opaque handle 限制了 ABI 的长期承诺，后续可以替换内部 Piece Tree、Snapshot 或 overlay
   实现，而不改平台调用方；
-- 当前 `copy_source` 是用于 spike 和 AX 自检的显式复制接口，正式大文档路径应改成带
-  Revision 的局部查询，避免物化整个 source。
+- `copy_source` 仍只为兼容 spike/诊断保留；正式大文档路径必须使用带 expected Revision 的
+  局部查询，避免物化整个 source。
 
 ## 非目标
 
