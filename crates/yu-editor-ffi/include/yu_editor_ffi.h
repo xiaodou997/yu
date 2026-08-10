@@ -15,6 +15,7 @@ enum {
     YU_FFI_NO_OVERLAY = 5,
     YU_FFI_BUFFER_TOO_SMALL = 6,
     YU_FFI_EDIT_FAILED = 7,
+    YU_FFI_STALE_REVISION = 8,
 };
 
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,
@@ -45,6 +46,17 @@ int32_t yu_composition_session_source_length(const YuCompositionSession *session
                                              size_t *output);
 int32_t yu_composition_session_copy_source(const YuCompositionSession *session,
                                            uint8_t *output, size_t capacity);
+int32_t yu_composition_session_source_range_length(const YuCompositionSession *session,
+                                                    uint64_t expected_revision,
+                                                    uint64_t start_utf16,
+                                                    uint64_t end_utf16,
+                                                    size_t *output);
+int32_t yu_composition_session_copy_source_range(const YuCompositionSession *session,
+                                                 uint64_t expected_revision,
+                                                 uint64_t start_utf16,
+                                                 uint64_t end_utf16,
+                                                 uint8_t *output, size_t capacity,
+                                                 size_t *written);
 int32_t yu_composition_session_overlay_length(const YuCompositionSession *session,
                                               size_t *output);
 int32_t yu_composition_session_copy_overlay(const YuCompositionSession *session,

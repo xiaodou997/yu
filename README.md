@@ -39,7 +39,7 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 
 ```text
 crates/yu-core          坐标、范围、Revision、Anchor
-crates/yu-editor        CompositionOverlay 和平台无关编辑状态
+crates/yu-editor        EditorDocument、CompositionOverlay 和平台无关编辑状态
 crates/yu-editor-ffi    原生平台调用的 CompositionOverlay C ABI static library
 crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
 crates/yu-markdown      第一阶段 lossless block scanner

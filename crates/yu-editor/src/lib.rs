@@ -5,6 +5,7 @@
 mod accessibility;
 mod caret;
 mod composition;
+mod document;
 
 pub use accessibility::{
     AccessibilityTextError, AccessibilityTextPosition, AccessibilityTextRange,
@@ -14,3 +15,4 @@ pub use caret::{
     CaretAffinity, CaretPositionError, CaretPositionMap, NativeCaretPosition, SourceCaretPosition,
 };
 pub use composition::{CompositionError, CompositionOverlay};
+pub use document::{EditorDocument, EditorDocumentError};
