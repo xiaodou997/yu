@@ -22,8 +22,8 @@ Projection 已经定义 source ranges、hidden syntax、style 和 visual offsets
 - `ClusterMetrics` 只负责提供 advance，默认 `MonospaceMetrics` 用于没有字体 shaping 的阶段；
 - `BlockProjection` 可直接进入 layout，fenced code 的 body 仍由 CodeProjection 保持 Code style。
 
-`EditorDocument::block_layout` 暂时返回新建 snapshot，不引入 layout cache、viewport virtualization
-或 GPU 状态；这些生命周期问题在 layout contract 通过后单独处理。
+layout snapshot 本身不持有 cache 或 GPU 状态。`EditorDocument` 的 cache 生命周期和可复用
+规则由 ADR 0025 单独定义；`HeightIndex` 只提供纯 Rust 的行高索引，不负责 viewport 渲染。
 
 ## 结果
 
@@ -35,4 +35,5 @@ Projection 已经定义 source ranges、hidden syntax、style 和 visual offsets
 ## 限制
 
 当前 layout 会为 block-local source range 构造临时字符串以进行 grapheme segmentation；尚未
-提供字体 fallback、BiDi、真实 glyph metrics、跨 block viewport virtualization 或 layout cache。
+提供字体 fallback、BiDi、真实 glyph metrics 或跨 block viewport layout。`HeightIndex` 已为
+后续虚拟化提供行高索引，但还没有窗口级 viewport。

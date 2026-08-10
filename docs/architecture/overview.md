@@ -124,5 +124,8 @@ composition overlay 不推进 source Revision，因此不会触发 projection ca
 `Projection` 的 visible runs，按 grapheme cluster 生成 `VisualLine`/`VisualCluster`，并提供
 `LayoutCaret` 与 `LayoutHit` 的 source/visual 双向查询。当前默认只使用确定性的
 `MonospaceMetrics`；真实字体 shaping 通过 `ClusterMetrics` 注入，布局层不依赖窗口或 GPU。
-`EditorDocument::block_layout` 目前每次返回一个新 snapshot，缓存和 viewport virtualization
-留到后续阶段。
+`EditorDocument` 现在拥有独立的 `LayoutCache`：entry 以 block 的 `(range, kind)` 和
+`LayoutConfig` 为 key，同一 revision/config 查询命中同一个 cache-owned snapshot。永久 edit
+会通过 layout/projection mapping 保留严格位于 changed range 外的布局，并在 block range 或
+kind 改变时删除 entry。`LayoutSnapshot::height_index` 暴露 Fenwick prefix index，支持后续
+viewport virtualization 的 O(log n) 高度查询与点更新；当前仍未连接窗口、GPU 或真实字体。

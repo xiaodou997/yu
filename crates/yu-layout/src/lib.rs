@@ -12,11 +12,12 @@ use std::fmt;
 use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
-use yu_core::{ByteOffset, TextRange};
+use yu_core::{Affinity, ByteOffset, TextAnchor, TextRange};
 use yu_projection::{
     BlockProjection, Projection, ProjectionBias, ProjectionError, VisualOffset, VisualRange,
     VisualRunKind, VisualRunStyle,
 };
+use yu_text::{ChangeSet, TextSnapshot};
 
 /// Layout dimensions and wrapping policy independent of any font backend.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,6 +112,163 @@ pub enum LayoutError {
     InvalidMetrics(u32),
     InvalidPoint,
     OffsetOverflow,
+}
+
+/// Errors raised by the viewport height index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeightIndexError {
+    InvalidHeight(u32),
+    OutOfBounds { index: usize, len: usize },
+}
+
+impl fmt::Display for HeightIndexError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidHeight(height) => {
+                write!(formatter, "invalid line height {}", f32::from_bits(*height))
+            }
+            Self::OutOfBounds { index, len } => {
+                write!(formatter, "height index {index} is outside {len} entries")
+            }
+        }
+    }
+}
+
+impl Error for HeightIndexError {}
+
+/// A Fenwick-tree index over variable visual line heights.
+///
+/// Prefix queries and point updates are O(log n); `find_line` locates the line
+/// containing a viewport y coordinate without laying out off-screen blocks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeightIndex {
+    values: Vec<f32>,
+    tree: Vec<f32>,
+}
+
+impl HeightIndex {
+    pub fn new(heights: impl IntoIterator<Item = f32>) -> Result<Self, HeightIndexError> {
+        let values = heights.into_iter().collect::<Vec<_>>();
+        for height in &values {
+            validate_height(*height)?;
+        }
+        let mut index = Self {
+            tree: vec![0.0; values.len().saturating_add(1)],
+            values,
+        };
+        let values = index.values.clone();
+        for (position, height) in values.into_iter().enumerate() {
+            index.add(position, height);
+        }
+        Ok(index)
+    }
+
+    pub fn uniform(count: usize, height: f32) -> Result<Self, HeightIndexError> {
+        Self::new(std::iter::repeat_n(height, count))
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    #[must_use]
+    pub fn height(&self, index: usize) -> Option<f32> {
+        self.values.get(index).copied()
+    }
+
+    #[must_use]
+    pub fn total_height(&self) -> f32 {
+        self.prefix_height(self.values.len())
+    }
+
+    #[must_use]
+    pub fn prefix_height(&self, end: usize) -> f32 {
+        let mut position = end.min(self.values.len());
+        let mut total = 0.0;
+        while position > 0 {
+            total += self.tree[position];
+            position &= position - 1;
+        }
+        total
+    }
+
+    pub fn set(&mut self, index: usize, height: f32) -> Result<(), HeightIndexError> {
+        let Some(previous) = self.values.get_mut(index) else {
+            return Err(HeightIndexError::OutOfBounds {
+                index,
+                len: self.values.len(),
+            });
+        };
+        validate_height(height)?;
+        let delta = height - *previous;
+        *previous = height;
+        self.add(index, delta);
+        Ok(())
+    }
+
+    pub fn push(&mut self, height: f32) -> Result<(), HeightIndexError> {
+        validate_height(height)?;
+        let index = self.values.len();
+        let position = index.saturating_add(1);
+        let low_bit = position & position.wrapping_neg();
+        let existing =
+            self.prefix_height(index) - self.prefix_height(position.saturating_sub(low_bit));
+        self.values.push(height);
+        self.tree.push(existing + height);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn find_line(&self, y: f32) -> Option<usize> {
+        if self.values.is_empty() || !y.is_finite() {
+            return None;
+        }
+        if y <= 0.0 {
+            return Some(0);
+        }
+        let total = self.total_height();
+        if y >= total {
+            return Some(self.values.len().saturating_sub(1));
+        }
+
+        let mut position = 0_usize;
+        let mut accumulated = 0.0_f32;
+        let mut step = 1_usize;
+        while step < self.values.len() {
+            step <<= 1;
+        }
+        while step > 0 {
+            let candidate = position.saturating_add(step);
+            if candidate <= self.values.len() && accumulated + self.tree[candidate] <= y {
+                accumulated += self.tree[candidate];
+                position = candidate;
+            }
+            step >>= 1;
+        }
+        Some(position.min(self.values.len().saturating_sub(1)))
+    }
+
+    fn add(&mut self, index: usize, delta: f32) {
+        let mut position = index.saturating_add(1);
+        while position < self.tree.len() {
+            self.tree[position] += delta;
+            position = position.saturating_add(position & position.wrapping_neg());
+        }
+    }
+}
+
+fn validate_height(height: f32) -> Result<(), HeightIndexError> {
+    if height.is_finite() && height >= 0.0 {
+        Ok(())
+    } else {
+        Err(HeightIndexError::InvalidHeight(height.to_bits()))
+    }
 }
 
 impl fmt::Display for LayoutError {
@@ -445,6 +603,59 @@ impl LayoutSnapshot {
         &self.projection
     }
 
+    /// Builds a height index for this snapshot's lines.
+    pub fn height_index(&self) -> Result<HeightIndex, HeightIndexError> {
+        HeightIndex::uniform(self.lines.len(), self.config.line_height)
+    }
+
+    /// Carries an unchanged layout through an edit strictly outside its
+    /// source range. Visual coordinates remain stable while source ranges are
+    /// remapped to the new revision.
+    pub fn map_through(
+        &self,
+        changes: &ChangeSet,
+        snapshot: &TextSnapshot,
+    ) -> Result<Option<Self>, LayoutError> {
+        let Some(projection) = self.projection.map_through(changes, snapshot)? else {
+            return Ok(None);
+        };
+        let lines = self
+            .lines
+            .iter()
+            .map(|line| {
+                Ok(VisualLine {
+                    index: line.index,
+                    source: map_source_range(line.source, changes)?,
+                    visual: line.visual,
+                    y: line.y,
+                    width: line.width,
+                    clusters: line.clusters.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
+        let clusters = self
+            .clusters
+            .iter()
+            .map(|cluster| {
+                Ok(VisualCluster {
+                    source: map_source_range(cluster.source, changes)?,
+                    visual: cluster.visual,
+                    line: cluster.line,
+                    x: cluster.x,
+                    width: cluster.width,
+                    style: cluster.style,
+                    line_break: cluster.line_break,
+                })
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
+        Ok(Some(Self {
+            projection,
+            config: self.config,
+            lines,
+            clusters,
+        }))
+    }
+
     /// Resolves a source boundary to a line, visual boundary and point.
     pub fn caret_for_source(
         &self,
@@ -722,6 +933,26 @@ fn add_visual(start: VisualOffset, local: usize) -> Result<VisualOffset, LayoutE
         .ok_or(LayoutError::OffsetOverflow)
 }
 
+fn map_source_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, LayoutError> {
+    let start = changes
+        .map_anchor(TextAnchor::new(
+            changes.before(),
+            range.start(),
+            Affinity::Before,
+        ))
+        .map_err(|error| LayoutError::Projection(ProjectionError::AnchorMap(error)))?
+        .offset();
+    let end = changes
+        .map_anchor(TextAnchor::new(
+            changes.before(),
+            range.end(),
+            Affinity::After,
+        ))
+        .map_err(|error| LayoutError::Projection(ProjectionError::AnchorMap(error)))?
+        .offset();
+    TextRange::new(start, end).ok_or(LayoutError::OffsetOverflow)
+}
+
 fn read_source_range(
     source: &yu_text::TextSnapshot,
     range: TextRange,
@@ -859,6 +1090,53 @@ mod tests {
         let result =
             LayoutSnapshot::from_projection(&projection("text"), LayoutConfig::new(0.0, 1.0));
         assert!(matches!(result, Err(LayoutError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn height_index_supports_prefix_updates_and_viewport_lookup() {
+        let mut index = HeightIndex::new([10.0, 20.0, 15.0]).expect("heights should be valid");
+        assert_eq!(index.total_height(), 45.0);
+        assert_eq!(index.prefix_height(2), 30.0);
+        assert_eq!(index.find_line(0.0), Some(0));
+        assert_eq!(index.find_line(10.0), Some(1));
+        assert_eq!(index.find_line(30.0), Some(2));
+        index.set(1, 25.0).expect("point update should succeed");
+        assert_eq!(index.total_height(), 50.0);
+        index.push(5.0).expect("append should succeed");
+        assert_eq!(index.len(), 4);
+        assert_eq!(index.find_line(49.0), Some(2));
+    }
+
+    #[test]
+    fn layout_map_through_prefix_edit_preserves_visual_coordinates() {
+        let source_text = "prefix **羽**";
+        let mut buffer = TextBuffer::new(source_text);
+        let snapshot = buffer.snapshot();
+        let start = source_text.find("**").expect("strong span exists");
+        let range = TextRange::new(ByteOffset::new(usize_to_u64(start)), snapshot.len_bytes())
+            .expect("projection range should be ordered");
+        let projection = Projection::inline(&snapshot, range).expect("projection should build");
+        let layout = LayoutSnapshot::from_projection(&projection, LayoutConfig::default())
+            .expect("layout should build");
+        let transaction = yu_text::Transaction::new(
+            buffer.revision(),
+            [yu_text::Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("prefix edit should apply");
+
+        let mapped = layout
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .expect("layout should map")
+            .expect("outside edit should preserve layout");
+        assert_eq!(mapped.visual_len(), layout.visual_len());
+        assert_eq!(mapped.source_range().start().get(), range.start().get() + 3);
+        assert_eq!(
+            mapped.clusters()[0].source().start().get(),
+            layout.clusters()[0].source().start().get() + 3
+        );
+        assert_eq!(mapped.revision(), applied.result_snapshot().revision());
     }
 
     fn usize_to_u64(value: usize) -> u64 {

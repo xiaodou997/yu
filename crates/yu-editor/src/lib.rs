@@ -7,6 +7,7 @@ mod caret;
 mod command;
 mod composition;
 mod document;
+mod layout;
 mod projection;
 mod selection;
 
@@ -20,11 +21,12 @@ pub use caret::{
 pub use command::{CommandResult, EditorCommand};
 pub use composition::{CompositionError, CompositionOverlay};
 pub use document::{EditorDocument, EditorDocumentError};
+pub use layout::{LayoutCache, LayoutCacheStats};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
 pub use yu_layout::{
-    ClusterMetrics, LayoutCaret, LayoutConfig, LayoutError, LayoutHit, LayoutPoint, LayoutSnapshot,
-    MonospaceMetrics, VisualCluster, VisualLine,
+    ClusterMetrics, HeightIndex, HeightIndexError, LayoutCaret, LayoutConfig, LayoutError,
+    LayoutHit, LayoutPoint, LayoutSnapshot, MonospaceMetrics, VisualCluster, VisualLine,
 };
 pub use yu_markdown::{Block, BlockKind, MarkdownDocument};
 pub use yu_projection::{

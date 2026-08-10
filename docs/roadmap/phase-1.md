@@ -45,6 +45,7 @@
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] `yu-editor` revision-bound `ProjectionCache` 的命中、映射与失效规则
+- [x] `yu-editor` revision-bound `LayoutCache` 的 config key、映射与 block 结构失效规则
 - [x] `EditorDocument` 持有增量 `MarkdownDocument` 并提供 block-scoped projection
 - [x] parser-owned semantic inline spans 与 styled visual runs
 - [x] fenced code 独立 source-backed projection 协议与缓存映射
@@ -82,6 +83,9 @@
     能区分 Plain/Emphasis/Strong/Code，且 fenced body 中的 `**` 等字面量保持可见。
 14. `LayoutSnapshot` 必须绑定 Projection Revision；换行只能发生在 grapheme cluster 边界，
     source caret、visual caret 和 hit-test 在 Unicode/hidden delimiter 场景下保持可重复。
+15. `LayoutCache` 对同一 revision/config 命中；strictly-outside edit 能映射 source ranges，
+    block range/kind 改变会失效；`HeightIndex` 提供可测试的 O(log n) prefix/update/lookup，
+    但不引入窗口或 GPU。
 
 ## 非目标
 

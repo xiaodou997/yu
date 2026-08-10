@@ -93,3 +93,7 @@
    计算第二套 delimiter 或 Unicode offset。
 4. `ClusterMetrics` 只能提供 advance，不得改变 source/visual ranges；无效或非有限 advance
    必须拒绝构建 layout。
+5. `LayoutCache` entry 必须绑定当前 source Revision，并同时匹配 block 的 source range、
+   `BlockKind` 和 `LayoutConfig`；strictly-outside edit 可映射，交集或 block 结构变化必须失效。
+6. `HeightIndex` 只索引已经产生的视觉行高，不得隐式触发全文 layout；prefix、point update 和
+   viewport line lookup 必须保持与原始 height values 一致。
