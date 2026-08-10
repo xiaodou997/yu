@@ -1,7 +1,133 @@
 import AppKit
 import ApplicationServices
+import YuEditorFFI
 
 private let notFoundRange = NSRange(location: NSNotFound, length: 0)
+
+private final class RustCompositionBridge {
+    private var session: OpaquePointer?
+    private(set) var hasOverlay = false
+
+    init(source: String) {
+        var created: OpaquePointer?
+        let bytes = Array(source.utf8)
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            yu_composition_session_new(buffer.baseAddress, buffer.count, &created)
+        }
+        precondition(status == 0 && created != nil, "Rust composition session creation failed")
+        session = created
+    }
+
+    deinit {
+        if let session {
+            yu_composition_session_destroy(session)
+        }
+    }
+
+    func resetSource(_ source: String) {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        let bytes = Array(source.utf8)
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            yu_composition_session_reset_source(session, buffer.baseAddress, buffer.count)
+        }
+        precondition(status == 0, "Rust composition source reset failed: \(status)")
+        hasOverlay = false
+    }
+
+    func begin(replacement: NSRange, preedit: String, selection: NSRange) {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        let bytes = Array(preedit.utf8)
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            yu_composition_session_begin(
+                session,
+                UInt64(replacement.location),
+                UInt64(NSMaxRange(replacement)),
+                buffer.baseAddress,
+                buffer.count,
+                UInt64(selection.location),
+                UInt64(NSMaxRange(selection))
+            )
+        }
+        precondition(status == 0, "Rust composition begin failed: \(status)")
+        hasOverlay = true
+    }
+
+    func update(preedit: String, selection: NSRange) {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(hasOverlay, "Rust composition update requires an active overlay")
+        let bytes = Array(preedit.utf8)
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            yu_composition_session_update(
+                session,
+                buffer.baseAddress,
+                buffer.count,
+                UInt64(selection.location),
+                UInt64(NSMaxRange(selection))
+            )
+        }
+        precondition(status == 0, "Rust composition update failed: \(status)")
+    }
+
+    func commit(_ text: String) {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(hasOverlay, "Rust composition commit requires an active overlay")
+        let bytes = Array(text.utf8)
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            yu_composition_session_commit(session, buffer.baseAddress, buffer.count)
+        }
+        precondition(status == 0, "Rust composition commit failed: \(status)")
+        hasOverlay = false
+    }
+
+    func cancel() {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        guard hasOverlay else { return }
+        let status = yu_composition_session_cancel(session)
+        precondition(status == 0, "Rust composition cancel failed: \(status)")
+        hasOverlay = false
+    }
+
+    func sourceString() -> String {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var length = 0
+        precondition(
+            yu_composition_session_source_length(session, &length) == 0,
+            "Rust composition source length failed"
+        )
+        var bytes = [UInt8](repeating: 0, count: length)
+        let status = bytes.withUnsafeMutableBufferPointer { buffer in
+            yu_composition_session_copy_source(session, buffer.baseAddress, buffer.count)
+        }
+        precondition(status == 0, "Rust composition source copy failed: \(status)")
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    func overlayString() -> String {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(hasOverlay, "Rust composition overlay is not active")
+        var length = 0
+        precondition(
+            yu_composition_session_overlay_length(session, &length) == 0,
+            "Rust composition overlay length failed"
+        )
+        var bytes = [UInt8](repeating: 0, count: length)
+        let status = bytes.withUnsafeMutableBufferPointer { buffer in
+            yu_composition_session_copy_overlay(session, buffer.baseAddress, buffer.count)
+        }
+        precondition(status == 0, "Rust composition overlay copy failed: \(status)")
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    func overlaySelection() -> NSRange {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(hasOverlay, "Rust composition overlay is not active")
+        var start: UInt64 = 0
+        var end: UInt64 = 0
+        let status = yu_composition_session_overlay_selection(session, &start, &end)
+        precondition(status == 0, "Rust composition selection query failed: \(status)")
+        return NSRange(location: Int(start), length: Int(end - start))
+    }
+}
 
 final class TextInputView: NSView, NSTextInputClient {
     private let textStorage = NSTextStorage()
@@ -13,6 +139,7 @@ final class TextInputView: NSView, NSTextInputClient {
     private var compositionOriginal: NSAttributedString?
     private var compositionSelectionBefore: NSRange?
     private var compositionAffinityBefore: NSSelectionAffinity?
+    private var rustComposition: RustCompositionBridge!
 
     private let textOrigin = NSPoint(x: 24, y: 24)
     private let maximumTextWidth: CGFloat = 360
@@ -35,6 +162,7 @@ final class TextInputView: NSView, NSTextInputClient {
             )
         )
         selection = NSRange(location: textStorage.length, length: 0)
+        rustComposition = RustCompositionBridge(source: textStorage.string)
         setAccessibilityElement(true)
         setAccessibilityRole(.textArea)
         setAccessibilityLabel("Yu Editor document")
@@ -96,6 +224,14 @@ final class TextInputView: NSView, NSTextInputClient {
         let inserted = attributedString(from: value, marked: false)
         let target = targetRange(replacementRange)
         print("insertText commit=\(inserted.string.debugDescription) replace=\(target)")
+        if !rustComposition.hasOverlay {
+            rustComposition.begin(
+                replacement: target,
+                preedit: "",
+                selection: NSRange(location: 0, length: 0)
+            )
+        }
+        rustComposition.commit(inserted.string)
         replaceStorage(range: target, with: inserted)
         selection = NSRange(location: target.location + inserted.length, length: 0)
         selectionAffinity = .downstream
@@ -118,6 +254,15 @@ final class TextInputView: NSView, NSTextInputClient {
             compositionOriginal = textStorage.attributedSubstring(from: target)
             compositionSelectionBefore = selection
             compositionAffinityBefore = selectionAffinity
+        }
+        if rustComposition.hasOverlay {
+            rustComposition.update(preedit: inserted.string, selection: newSelection)
+        } else {
+            rustComposition.begin(
+                replacement: target,
+                preedit: inserted.string,
+                selection: newSelection
+            )
         }
         print(
             "setMarkedText preedit=\(inserted.string.debugDescription) "
@@ -393,13 +538,18 @@ final class TextInputView: NSView, NSTextInputClient {
             replacementRange: notFoundRange
         )
         precondition(hasMarkedText() && marked.length == 4, "Japanese preedit should be marked")
+        precondition(rustComposition.overlayString() == "にほんご")
+        precondition(rustComposition.overlaySelection() == NSRange(location: 4, length: 0))
+        precondition(rustComposition.sourceString() == base)
         setMarkedText(
             "にほんご",
             selectedRange: NSRange(location: 4, length: 0),
             replacementRange: notFoundRange
         )
+        precondition(rustComposition.overlayString() == "にほんご")
         insertText("日本語", replacementRange: notFoundRange)
         precondition(!hasMarkedText() && textStorage.string == base + "日本語")
+        precondition(!rustComposition.hasOverlay && rustComposition.sourceString() == base + "日本語")
 
         setMarkedText(
             "\u{301}",
@@ -411,8 +561,10 @@ final class TextInputView: NSView, NSTextInputClient {
             selectedRange: NSRange(location: 2, length: 0),
             replacementRange: notFoundRange
         )
+        precondition(rustComposition.overlayString() == "e\u{301}")
         insertText("é", replacementRange: notFoundRange)
         precondition(!hasMarkedText() && textStorage.string == base + "日本語é")
+        precondition(!rustComposition.hasOverlay && rustComposition.sourceString() == base + "日本語é")
 
         let cancelBase = textStorage.string
         setMarkedText(
@@ -423,6 +575,7 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(hasMarkedText())
         doCommand(by: #selector(NSResponder.cancelOperation(_:)))
         precondition(!hasMarkedText() && textStorage.string == cancelBase)
+        precondition(!rustComposition.hasOverlay && rustComposition.sourceString() == cancelBase)
 
         replaceStorage(
             range: NSRange(location: 0, length: textStorage.length),
@@ -434,6 +587,7 @@ final class TextInputView: NSView, NSTextInputClient {
         compositionOriginal = nil
         compositionSelectionBefore = nil
         compositionAffinityBefore = nil
+        rustComposition.resetSource(textStorage.string)
         needsDisplay = true
         print(
             "Unicode composition self-check japanese=日本語 combining=é "
@@ -650,6 +804,7 @@ final class TextInputView: NSView, NSTextInputClient {
         print("cancelComposition range=\(marked)")
         guard hasMarkedText(), let original = compositionOriginal else {
             marked = notFoundRange
+            rustComposition.cancel()
             return
         }
         replaceStorage(range: marked, with: original)
@@ -659,6 +814,7 @@ final class TextInputView: NSView, NSTextInputClient {
         compositionOriginal = nil
         compositionSelectionBefore = nil
         compositionAffinityBefore = nil
+        rustComposition.cancel()
         needsDisplay = true
         postTextChanged()
     }

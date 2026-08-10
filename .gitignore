@@ -1,6 +1,7 @@
 /target/
 /.DS_Store
 **/.build/
+**/.rust/
 **/DerivedData/
 *.xcuserstate
 /.notes/

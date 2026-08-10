@@ -3,6 +3,7 @@
 set -euo pipefail
 
 experiment_dir="${0:A:h}"
+"$experiment_dir/build-rust-ffi.sh"
 swift build --package-path "$experiment_dir"
 
 binary_dir="$(swift build --package-path "$experiment_dir" --show-bin-path)"
@@ -15,4 +16,3 @@ cp "$experiment_dir/AppBundle/Info.plist" "$contents_dir/Info.plist"
 codesign --force --sign - "$app_dir"
 
 print -r -- "$app_dir"
-
