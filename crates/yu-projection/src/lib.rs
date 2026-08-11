@@ -789,7 +789,11 @@ fn style_for(
                     InlineSpanKind::CodeSpan => 0_u8,
                     InlineSpanKind::Strong => 1,
                     InlineSpanKind::Emphasis => 2,
-                    InlineSpanKind::Link | InlineSpanKind::Image => 3,
+                    InlineSpanKind::Link
+                    | InlineSpanKind::Image
+                    | InlineSpanKind::ReferenceLink
+                    | InlineSpanKind::ReferenceImage
+                    | InlineSpanKind::Autolink => 3,
                 },
             )
         })
@@ -797,7 +801,11 @@ fn style_for(
             InlineSpanKind::Emphasis => VisualRunStyle::Emphasis,
             InlineSpanKind::Strong => VisualRunStyle::Strong,
             InlineSpanKind::CodeSpan => VisualRunStyle::Code,
-            InlineSpanKind::Link | InlineSpanKind::Image => default_style,
+            InlineSpanKind::Link
+            | InlineSpanKind::Image
+            | InlineSpanKind::ReferenceLink
+            | InlineSpanKind::ReferenceImage
+            | InlineSpanKind::Autolink => default_style,
         })
 }
 
@@ -1230,6 +1238,31 @@ mod tests {
                 .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn projection_hides_reference_and_autolink_angles_but_keeps_content() {
+        let source = "[Yu][project] <https://example.com> <dev@example.com>";
+        let projection = projection(source);
+        let hidden = projection
+            .runs()
+            .iter()
+            .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+            .count();
+        assert_eq!(hidden, 6);
+        assert_eq!(projection.visual_len(), VisualOffset::new(38));
+        assert_eq!(
+            projection
+                .source_to_visual(ByteOffset::new(1), ProjectionBias::After)
+                .expect("reference label should map"),
+            VisualOffset::new(0)
+        );
+        assert_eq!(
+            projection
+                .visual_to_source(VisualOffset::new(2), ProjectionBias::After)
+                .expect("after reference label should map to the next source"),
+            ByteOffset::new(13)
         );
     }
 

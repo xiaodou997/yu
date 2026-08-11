@@ -115,10 +115,10 @@ UTF-16 boundary/affinity。这样 AppKit 的原生 selection 与 caret affinity 
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。
 它通过 `yu-markdown::parse_inline` 获取 parser-owned `InlineDocument` 和 matched
 `InlineSpan`，不再在 projection 内维护 delimiter pairing；visible run 同时携带 Plain、Emphasis、
-Strong 或 Code style，Link/Image 的 syntax range 由 parser-owned span 隐藏但目前仍使用 Plain
-label/alt style；LineBreak run 携带 soft/hard 标记，hard marker bytes 作为 hidden syntax，供
-layout 直接建立 visual line。当前 span 仍是保守的 Phase 1 语义层，不宣称完整 CommonMark
-inline AST。
+Strong 或 Code style，Link/Image/ReferenceLink/ReferenceImage/Autolink 的 syntax range 由
+parser-owned span 隐藏但目前仍使用 Plain label/alt/text style；LineBreak run 携带 soft/hard 标记，
+hard marker bytes 作为 hidden syntax，供 layout 直接建立 visual line。当前 span 仍是保守的
+Phase 1 语义层，不宣称完整 CommonMark inline AST。
 
 `yu-editor::EditorDocument` 拥有 revision-bound `ProjectionCache`：同一 Revision/range 查询命中
 缓存，永久 edit 会映射严格位于 changed range 外的 projection，并保守地使相交或边界 projection

@@ -120,9 +120,11 @@ LineBreak { hard }
 ```
 
 parser-owned `InlineSpan` 在 delimiter flanking 校验后产生 `Emphasis`、`Strong`、`CodeSpan`、
-`Link` 和 `Image`。链接/图片 span 的 `opening`、`content`、`closing` 和 `destination` 都是源码
-范围；projection 可以隐藏 `[]()`/`![]()` 语法而保留 label/alt 文本。未闭合链接、未匹配
-delimiter 和转义 punctuation 保持为普通可编辑源码。
+`Link`、`Image`、`ReferenceLink`、`ReferenceImage` 和 `Autolink`。链接/图片 span 的 `opening`、
+`content`、`closing`、`destination`/`reference` 都是源码范围；projection 可以隐藏 `[]()`、
+`![]()`、reference tail 和 autolink angle brackets 而保留 label/alt/text。当前 reference 只
+接受显式或 collapsed 形式 `[label][id]`/`[label][]`，不猜测 shortcut definition；未闭合链接、
+未匹配 delimiter、HTML-like angle text 和转义 punctuation 保持为普通可编辑源码。
 
 硬换行的 `LineBreak` range 包含两个尾随空格或反斜杠与 CRLF/LF，软换行只包含 line ending。
 `yu-projection` 将 line ending 变成显式 `VisualRunKind::LineBreak { hard }`；硬换行的 marker
