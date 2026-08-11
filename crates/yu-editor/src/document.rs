@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use yu_core::{LineIndex, Revision, TextRange, Utf16Range};
+use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Range};
 use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
 use yu_text::{
@@ -11,11 +11,13 @@ use yu_text::{
 
 use crate::{
     BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
-    EditorSelection, LayoutBackend, LayoutCache, LayoutCacheStats, Projection, ProjectionCache,
-    ProjectionCacheStats, ProjectionError, SelectionError, ViewportConfig, ViewportError,
-    ViewportLayout, ViewportRect, ViewportSnapshot, ViewportStats,
+    EditorSelection, KeyEvent, KeyRouteResult, LayoutBackend, LayoutCache, LayoutCacheStats,
+    Projection, ProjectionCache, ProjectionCacheStats, ProjectionError, SelectionError,
+    SourceChange, ViewportConfig, ViewportError, ViewportLayout, ViewportRect, ViewportSnapshot,
+    ViewportStats,
     command::{next_grapheme_boundary, previous_grapheme_boundary},
     history::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats},
+    keymap::command_for_key,
     list::ListLinePrefix,
 };
 
@@ -30,6 +32,7 @@ pub struct EditorDocument {
     markdown: MarkdownDocument,
     composition: Option<CompositionOverlay>,
     selection: EditorSelection,
+    last_source_change: Option<SourceChange>,
     history: EditorHistory,
     projections: ProjectionCache,
     layouts: LayoutCache,
@@ -54,6 +57,7 @@ impl EditorDocument {
             markdown,
             composition: None,
             selection,
+            last_source_change: None,
             history: EditorHistory::default(),
             projections: ProjectionCache::default(),
             layouts: LayoutCache::default(),
@@ -362,6 +366,7 @@ impl EditorDocument {
         &mut self,
         transaction: &Transaction,
     ) -> Result<AppliedTransaction, EditorDocumentError> {
+        let before_snapshot = self.snapshot();
         let applied = self.buffer.apply(transaction)?;
         let incremental = yu_markdown::parse_incremental(
             &self.markdown,
@@ -395,6 +400,7 @@ impl EditorDocument {
         self.projections.retain_blocks(incremental.document());
         self.layouts.retain_blocks(incremental.document());
         self.markdown = incremental.into_document();
+        self.last_source_change = source_change_from_applied(&before_snapshot, &applied)?;
         Ok(applied)
     }
 
@@ -467,6 +473,7 @@ impl EditorDocument {
             crate::CaretAffinity::Downstream,
         )?;
         self.composition = None;
+        self.last_source_change = None;
         self.history.break_group();
         Ok(applied)
     }
@@ -492,6 +499,7 @@ impl EditorDocument {
         self.layouts.clear();
         self.viewport.clear();
         self.history.clear();
+        self.last_source_change = None;
         let snapshot = self.snapshot();
         self.selection = EditorSelection::cursor(
             &snapshot,
@@ -507,6 +515,7 @@ impl EditorDocument {
         &mut self,
         command: EditorCommand,
     ) -> Result<CommandResult, EditorDocumentError> {
+        self.last_source_change = None;
         match command {
             EditorCommand::InsertText(text) => self.insert_text(text),
             EditorCommand::DeleteBackward => self.delete_backward(),
@@ -520,6 +529,28 @@ impl EditorDocument {
             EditorCommand::Redo => self.redo(),
             EditorCommand::ToggleTask { block } => self.toggle_task(block),
         }
+    }
+
+    /// Resolves and executes a native key command against the current document
+    /// context. Tab and Shift-Tab are only consumed when they actually edit a
+    /// list item; in a paragraph they remain available for native focus or
+    /// text-input policy.
+    pub fn route_key(&mut self, event: KeyEvent) -> Result<KeyRouteResult, EditorDocumentError> {
+        let Some(command) = command_for_key(event) else {
+            return Ok(KeyRouteResult::Unhandled);
+        };
+        if self.composition.is_some() {
+            return Err(EditorDocumentError::CompositionActive);
+        }
+        let list_command = matches!(
+            command,
+            EditorCommand::IndentList | EditorCommand::OutdentList
+        );
+        let result = self.execute(command)?;
+        if list_command && !result.changed() {
+            return Ok(KeyRouteResult::Unhandled);
+        }
+        Ok(KeyRouteResult::Executed(result))
     }
 
     /// Toggles the source-backed `[ ]`/`[x]` marker of one task-list block.
@@ -591,7 +622,7 @@ impl EditorDocument {
             }
         }
         self.history.push_redo_group(redo);
-        Ok(self.command_result(true))
+        Ok(self.command_result(true).requiring_full_source_sync())
     }
 
     /// Replays one grouped set of forward transactions without recording the
@@ -621,7 +652,7 @@ impl EditorDocument {
             }
         }
         self.history.push_undo_group(undo);
-        Ok(self.command_result(true))
+        Ok(self.command_result(true).requiring_full_source_sync())
     }
 
     /// Inserts a line ending and, when the caret is in a list item, continues
@@ -878,7 +909,12 @@ impl EditorDocument {
     }
 
     fn command_result(&self, changed: bool) -> CommandResult {
-        CommandResult::new(self.revision(), self.selection, changed)
+        CommandResult::with_source_change(
+            self.revision(),
+            self.selection,
+            changed,
+            self.last_source_change,
+        )
     }
 
     fn list_prefix(&self, line: &SourceLine) -> Option<ListLinePrefix> {
@@ -906,6 +942,35 @@ impl EditorDocument {
         }
         ListLinePrefix::parse(&line.content)
     }
+}
+
+fn source_change_from_applied(
+    before: &TextSnapshot,
+    applied: &AppliedTransaction,
+) -> Result<Option<SourceChange>, EditorDocumentError> {
+    let changes = applied.change_set().changes();
+    let Some(first) = changes.first() else {
+        return Ok(None);
+    };
+    let mut old_start = first.old_range().start();
+    let mut old_end = first.old_range().end();
+    let mut new_start = first.new_range().start();
+    let mut new_end = first.new_range().end();
+    for change in &changes[1..] {
+        old_start = ByteOffset::new(old_start.get().min(change.old_range().start().get()));
+        old_end = ByteOffset::new(old_end.get().max(change.old_range().end().get()));
+        new_start = ByteOffset::new(new_start.get().min(change.new_range().start().get()));
+        new_end = ByteOffset::new(new_end.get().max(change.new_range().end().get()));
+    }
+    let after = applied.result_snapshot();
+    let old_range = Utf16Range::new(
+        before.utf16_offset(old_start)?,
+        before.utf16_offset(old_end)?,
+    )
+    .expect("change set old UTF-16 range must be ordered");
+    let new_range = Utf16Range::new(after.utf16_offset(new_start)?, after.utf16_offset(new_end)?)
+        .expect("change set new UTF-16 range must be ordered");
+    Ok(Some(SourceChange::new(old_range, new_range)))
 }
 
 struct SourceLine {
@@ -1126,7 +1191,7 @@ impl From<SelectionError> for EditorDocumentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::VisualRunKind;
+    use crate::{EditorKey, KeyModifiers, SourceSync, VisualRunKind};
     use unicode_segmentation::UnicodeSegmentation;
     use yu_core::{ByteOffset, Utf16Offset};
     use yu_layout::{
@@ -1248,23 +1313,64 @@ mod tests {
             .expect("insert should succeed");
         assert!(inserted.changed());
         assert_eq!(inserted.revision(), Revision::new(1));
+        assert_eq!(
+            inserted.source_sync(),
+            SourceSync::Range(SourceChange::new(utf16_range(0, 0), utf16_range(0, 1)))
+        );
         assert_eq!(document.snapshot().as_str(), "羽e\u{301}x");
         assert_eq!(document.selection().focus().get(), "羽".len() as u64);
 
-        document
+        let deleted = document
             .execute(EditorCommand::DeleteBackward)
             .expect("backspace should remove one grapheme");
+        assert_eq!(
+            deleted.source_sync(),
+            SourceSync::Range(SourceChange::new(utf16_range(0, 1), utf16_range(0, 0)))
+        );
         assert_eq!(document.snapshot().as_str(), "e\u{301}x");
         assert_eq!(document.revision(), Revision::new(2));
 
-        document
+        let moved = document
             .execute(EditorCommand::MoveRight)
             .expect("right should move over one grapheme");
-        document
+        assert_eq!(moved.source_sync(), SourceSync::None);
+        let deleted = document
             .execute(EditorCommand::DeleteForward)
             .expect("forward delete should remove x");
+        assert_eq!(
+            deleted.source_sync(),
+            SourceSync::Range(SourceChange::new(utf16_range(2, 3), utf16_range(2, 2)))
+        );
         assert_eq!(document.snapshot().as_str(), "e\u{301}");
         assert_eq!(document.revision(), Revision::new(3));
+    }
+
+    #[test]
+    fn key_route_only_consumes_tab_for_list_contexts() {
+        let mut plain = EditorDocument::new("paragraph");
+        assert_eq!(
+            plain
+                .route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE))
+                .expect("plain tab route should succeed"),
+            KeyRouteResult::Unhandled
+        );
+        assert_eq!(plain.snapshot().as_str(), "paragraph");
+        assert_eq!(plain.revision(), Revision::INITIAL);
+
+        let mut list = EditorDocument::new("- item");
+        let KeyRouteResult::Executed(result) = list
+            .route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE))
+            .expect("list tab route should succeed")
+        else {
+            panic!("list tab should be consumed");
+        };
+        assert!(result.changed());
+        let source_change = result
+            .source_change()
+            .expect("list tab should expose a source change");
+        assert_eq!(source_change.old_range(), utf16_range(0, 0));
+        assert_eq!(source_change.new_range(), utf16_range(0, 2));
+        assert_eq!(list.snapshot().as_str(), "  - item");
     }
 
     #[test]

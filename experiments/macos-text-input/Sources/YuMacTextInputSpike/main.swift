@@ -9,11 +9,20 @@ private enum RustCaretAffinity: UInt8 {
     case downstream = 1
 }
 
+private enum RustSourceSync: UInt8 {
+    case none = 0
+    case range = 1
+    case full = 2
+}
+
 private struct RustCommandResult {
     let revision: UInt64
     let range: NSRange
     let affinity: NSSelectionAffinity
     let changed: Bool
+    let sourceSync: RustSourceSync
+    let oldSourceRange: NSRange?
+    let newSourceRange: NSRange?
 }
 
 private enum YuNativeKeyKind {
@@ -217,16 +226,24 @@ private final class RustCompositionBridge {
     }
 
     func sourceString(utf16Length: Int) -> String {
-        guard let session else { preconditionFailure("Rust composition session is missing") }
         precondition(utf16Length >= 0, "Rust composition UTF-16 length must be non-negative")
+        return sourceString(utf16Range: NSRange(location: 0, length: utf16Length))
+    }
+
+    func sourceString(utf16Range: NSRange) -> String {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(
+            utf16Range.location >= 0 && utf16Range.length >= 0,
+            "Rust composition UTF-16 range must be non-negative"
+        )
         let expectedRevision = revision()
         var length = 0
         precondition(
             yu_composition_session_source_range_length(
                 session,
                 expectedRevision,
-                0,
-                UInt64(utf16Length),
+                UInt64(utf16Range.location),
+                UInt64(NSMaxRange(utf16Range)),
                 &length
             ) == 0,
             "Rust composition source range length failed"
@@ -237,8 +254,8 @@ private final class RustCompositionBridge {
             yu_composition_session_copy_source_range(
                 session,
                 expectedRevision,
-                0,
-                UInt64(utf16Length),
+                UInt64(utf16Range.location),
+                UInt64(NSMaxRange(utf16Range)),
                 buffer.baseAddress,
                 buffer.count,
                 &written
@@ -303,6 +320,29 @@ private final class RustCompositionBridge {
         case nil:
             preconditionFailure("Rust command selection affinity is invalid: \(result.affinity)")
         }
+        guard let sourceSync = RustSourceSync(rawValue: result.source_sync) else {
+            preconditionFailure("Rust command source sync kind is invalid: \(result.source_sync)")
+        }
+        let oldSourceRange: NSRange?
+        let newSourceRange: NSRange?
+        if sourceSync == .range {
+            precondition(
+                result.source_old_end_utf16 >= result.source_start_utf16
+                    && result.source_new_end_utf16 >= result.source_new_start_utf16,
+                "Rust command source range must be ordered"
+            )
+            oldSourceRange = NSRange(
+                location: Int(result.source_start_utf16),
+                length: Int(result.source_old_end_utf16 - result.source_start_utf16)
+            )
+            newSourceRange = NSRange(
+                location: Int(result.source_new_start_utf16),
+                length: Int(result.source_new_end_utf16 - result.source_new_start_utf16)
+            )
+        } else {
+            oldSourceRange = nil
+            newSourceRange = nil
+        }
         return RustCommandResult(
             revision: result.revision,
             range: NSRange(
@@ -310,7 +350,10 @@ private final class RustCompositionBridge {
                 length: Int(result.selection_end_utf16 - result.selection_start_utf16)
             ),
             affinity: nativeAffinity,
-            changed: result.changed != 0
+            changed: result.changed != 0,
+            sourceSync: sourceSync,
+            oldSourceRange: oldSourceRange,
+            newSourceRange: newSourceRange
         )
     }
 }
@@ -737,6 +780,18 @@ final class TextInputView: NSView, NSTextInputClient {
         selectionAffinity = .downstream
         rustComposition.setSelection(selection)
         insertText("z", replacementRange: notFoundRange)
+        guard
+            let backspace = rustComposition.routeKey(
+                kind: YuNativeKeyKind.backspace
+            )
+        else {
+            preconditionFailure("Backspace must be consumed by the Rust command route")
+        }
+        precondition(backspace.sourceSync == .range, "Backspace should return a local source range")
+        applyRustCommandResult(backspace)
+        precondition(textStorage.string == base, "Backspace must restore the source")
+
+        insertText("z", replacementRange: notFoundRange)
         let afterInsert = textStorage.string
 
         guard
@@ -748,6 +803,7 @@ final class TextInputView: NSView, NSTextInputClient {
         else {
             preconditionFailure("Cmd-Z must be consumed by the Rust command route")
         }
+        precondition(undo.sourceSync == .full, "grouped Undo should request full source sync")
         applyRustCommandResult(undo)
         precondition(textStorage.string == base, "Cmd-Z must restore the source")
 
@@ -760,6 +816,7 @@ final class TextInputView: NSView, NSTextInputClient {
         else {
             preconditionFailure("Cmd-Shift-Z must be consumed by the Rust command route")
         }
+        precondition(redo.sourceSync == .full, "grouped Redo should request full source sync")
         applyRustCommandResult(redo)
         precondition(textStorage.string == afterInsert, "Cmd-Shift-Z must restore the edit")
 
@@ -777,8 +834,8 @@ final class TextInputView: NSView, NSTextInputClient {
         rustComposition.setSelection(selection, affinity: selectionAffinity)
         needsDisplay = true
         print(
-            "Native command self-check undo=Cmd-Z redo=Cmd-Shift-Z "
-                + "source=restored changed=\(undo.changed)/\(redo.changed)"
+            "Native command self-check local=Backspace undo=Cmd-Z redo=Cmd-Shift-Z "
+                + "source=restored changed=\(backspace.changed)/\(undo.changed)/\(redo.changed)"
         )
     }
 
@@ -1007,11 +1064,32 @@ final class TextInputView: NSView, NSTextInputClient {
             rustComposition.revision() == result.revision,
             "Rust command result must belong to the current revision"
         )
-        let source = rustComposition.sourceString()
-        replaceStorage(
-            range: NSRange(location: 0, length: textStorage.length),
-            with: attributedString(from: source, marked: false)
-        )
+        switch result.sourceSync {
+        case .none:
+            precondition(
+                !result.changed,
+                "a changed command must provide a source synchronization scope"
+            )
+        case .range:
+            guard let oldRange = result.oldSourceRange, let newRange = result.newSourceRange else {
+                preconditionFailure("range source synchronization requires both ranges")
+            }
+            precondition(
+                oldRange.location >= 0 && NSMaxRange(oldRange) <= textStorage.length,
+                "Rust command old source range is outside the native mirror"
+            )
+            let source = rustComposition.sourceString(utf16Range: newRange)
+            replaceStorage(
+                range: oldRange,
+                with: attributedString(from: source, marked: false)
+            )
+        case .full:
+            let source = rustComposition.sourceString()
+            replaceStorage(
+                range: NSRange(location: 0, length: textStorage.length),
+                with: attributedString(from: source, marked: false)
+            )
+        }
         guard let selection = validatedAccessibilityRange(result.range) else {
             preconditionFailure("Rust command returned an invalid native selection")
         }

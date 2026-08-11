@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
-use yu_core::ByteOffset;
+use yu_core::{ByteOffset, Utf16Range};
 use yu_text::TextSnapshot;
 
 use crate::{EditorSelection, SelectionError};
@@ -21,6 +21,54 @@ pub enum EditorCommand {
     Undo,
     Redo,
     ToggleTask { block: usize },
+}
+
+/// A source replacement range in native UTF-16 coordinates.
+///
+/// The old range belongs to the command's input revision and the new range
+/// belongs to its result revision. Native mirrors can use this pair to update
+/// only the changed source span; commands whose history replay spans multiple
+/// edits may intentionally request a full-source fallback at the ABI layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceChange {
+    old_range: Utf16Range,
+    new_range: Utf16Range,
+}
+
+/// The source synchronization scope required by a completed command.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceSync {
+    #[default]
+    None,
+    Range(SourceChange),
+    Full,
+}
+
+impl SourceChange {
+    #[must_use]
+    pub const fn new(old_range: Utf16Range, new_range: Utf16Range) -> Self {
+        Self {
+            old_range,
+            new_range,
+        }
+    }
+
+    #[must_use]
+    pub const fn old_range(self) -> Utf16Range {
+        self.old_range
+    }
+
+    #[must_use]
+    pub const fn new_range(self) -> Utf16Range {
+        self.new_range
+    }
+}
+
+/// The result of resolving a native key before a platform text-input path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRouteResult {
+    Unhandled,
+    Executed(CommandResult),
 }
 
 impl EditorCommand {
@@ -66,6 +114,7 @@ pub struct CommandResult {
     revision: yu_core::Revision,
     selection: EditorSelection,
     changed: bool,
+    source_sync: SourceSync,
 }
 
 impl CommandResult {
@@ -84,16 +133,49 @@ impl CommandResult {
         self.changed
     }
 
-    pub(crate) const fn new(
+    /// Returns the changed source span when the command has a local range
+    /// suitable for native mirror synchronization.
+    #[must_use]
+    pub const fn source_change(self) -> Option<SourceChange> {
+        match self.source_sync {
+            SourceSync::Range(change) => Some(change),
+            SourceSync::None | SourceSync::Full => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn source_sync(self) -> SourceSync {
+        self.source_sync
+    }
+
+    pub(crate) const fn with_source_change(
         revision: yu_core::Revision,
         selection: EditorSelection,
         changed: bool,
+        source_change: Option<SourceChange>,
     ) -> Self {
         Self {
             revision,
             selection,
             changed,
+            source_sync: if changed {
+                match source_change {
+                    Some(change) => SourceSync::Range(change),
+                    None => SourceSync::None,
+                }
+            } else {
+                SourceSync::None
+            },
         }
+    }
+
+    pub(crate) const fn requiring_full_source_sync(mut self) -> Self {
+        self.source_sync = if self.changed {
+            SourceSync::Full
+        } else {
+            SourceSync::None
+        };
+        self
     }
 }
 
@@ -254,10 +336,21 @@ mod tests {
             crate::CaretAffinity::Downstream,
         )
         .expect("empty caret should be valid");
-        let result = CommandResult::new(Revision::INITIAL, selection, false);
+        let result = CommandResult::with_source_change(Revision::INITIAL, selection, false, None);
         assert_eq!(result.revision(), Revision::INITIAL);
         assert_eq!(result.selection(), selection);
         assert!(!result.changed());
+        assert_eq!(result.source_sync(), SourceSync::None);
+
+        let zero = Utf16Range::empty(yu_core::Utf16Offset::ZERO);
+        let stale_change = SourceChange::new(zero, zero);
+        let unchanged = CommandResult::with_source_change(
+            Revision::INITIAL,
+            selection,
+            false,
+            Some(stale_change),
+        );
+        assert_eq!(unchanged.source_sync(), SourceSync::None);
     }
 
     #[test]

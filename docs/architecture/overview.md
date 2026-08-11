@@ -132,7 +132,8 @@ yu_composition_session_route_key
    │
    └── YuEditorCommandResult
            │
-           ├── canonical source query
+           ├── SourceSync(None / Range / Full)
+           ├── revision-bound canonical source query
            ├── UTF-16 selection + CaretAffinity
            └── TextKit mirror / Accessibility notification
 ```
@@ -142,6 +143,12 @@ keyCode、charactersIgnoringModifiers 和 modifierFlags 转换成 ABI 值。Cmd-
 Enter、Tab/Shift-Tab、删除和左右移动通过同一 `EditorCommand` 执行；普通字符不经过该映射，
 继续由 `NSTextInputClient` 处理。command result 绑定当前 Revision，活动 composition 则必须
 先 commit/cancel，不能被永久命令绕过。
+
+本地 source command 在结果中携带输入 Revision 的旧 UTF-16 range 与结果 Revision 的新 range；
+AppKit 只查询新 range 并替换 mirror 的旧 range。成组 Undo/Redo 可能回放多个不连续 Transaction，
+因此显式请求 Full fallback。同步范围由 `CommandResult` 决定，FFI、快捷键和未来菜单入口不按
+command 名称重复推断。没有 source 变化的移动命令使用 None；非列表 Tab/Shift-Tab 返回
+unhandled。
 
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。

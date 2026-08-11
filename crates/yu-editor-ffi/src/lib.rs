@@ -5,7 +5,7 @@ use std::ptr;
 use yu_core::{TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     CaretAffinity, CommandResult, EditorCommand, EditorDocument, EditorDocumentError, EditorKey,
-    EditorSelection, KeyEvent, KeyModifiers, SelectionError, command_for_key,
+    EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult, SelectionError, SourceSync,
 };
 use yu_text::{EditError, TextSnapshot};
 
@@ -21,6 +21,9 @@ pub const YU_FFI_STALE_REVISION: i32 = 8;
 pub const YU_FFI_KEY_UNHANDLED: i32 = 9;
 pub const YU_FFI_INVALID_COMMAND: i32 = 10;
 pub const YU_FFI_INVALID_KEY: i32 = 11;
+pub const YU_SOURCE_SYNC_NONE: u8 = 0;
+pub const YU_SOURCE_SYNC_RANGE: u8 = 1;
+pub const YU_SOURCE_SYNC_FULL: u8 = 2;
 pub const YU_CARET_AFFINITY_UPSTREAM: u8 = 0;
 pub const YU_CARET_AFFINITY_DOWNSTREAM: u8 = 1;
 pub const YU_KEY_CHARACTER: u8 = 0;
@@ -57,6 +60,11 @@ pub struct YuEditorCommandResult {
     pub selection_end_utf16: u64,
     pub affinity: u8,
     pub changed: u8,
+    pub source_sync: u8,
+    pub source_start_utf16: u64,
+    pub source_old_end_utf16: u64,
+    pub source_new_start_utf16: u64,
+    pub source_new_end_utf16: u64,
 }
 
 /// Opaque state owned by the Rust side of the native composition bridge.
@@ -160,6 +168,28 @@ fn write_command_result(
         Err(error) => return status_from_selection_error(error),
     };
     // SAFETY: output was checked for null and belongs to the caller.
+    let (
+        source_sync,
+        source_start_utf16,
+        source_old_end_utf16,
+        source_new_start_utf16,
+        source_new_end_utf16,
+    ) = match result.source_sync() {
+        SourceSync::Full if result.changed() => (YU_SOURCE_SYNC_FULL, 0, 0, 0, 0),
+        SourceSync::Range(change) => {
+            let old_range = change.old_range();
+            let new_range = change.new_range();
+            (
+                YU_SOURCE_SYNC_RANGE,
+                old_range.start().get(),
+                old_range.end().get(),
+                new_range.start().get(),
+                new_range.end().get(),
+            )
+        }
+        SourceSync::None | SourceSync::Full => (YU_SOURCE_SYNC_NONE, 0, 0, 0, 0),
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
     unsafe {
         *output = YuEditorCommandResult {
             revision: result.revision().get(),
@@ -170,6 +200,11 @@ fn write_command_result(
                 CaretAffinity::Downstream => YU_CARET_AFFINITY_DOWNSTREAM,
             },
             changed: u8::from(result.changed()),
+            source_sync,
+            source_start_utf16,
+            source_old_end_utf16,
+            source_new_start_utf16,
+            source_new_end_utf16,
         };
     }
     YU_FFI_OK
@@ -437,15 +472,12 @@ pub unsafe extern "C" fn yu_composition_session_route_key(
         Err(status) => return status,
     };
     let event = KeyEvent::new(key, KeyModifiers::from_bits(modifiers));
-    let Some(command) = command_for_key(event) else {
-        return YU_FFI_KEY_UNHANDLED;
-    };
-    if session.document.composition().is_some() {
-        return YU_FFI_EDIT_FAILED;
-    }
-    let result = match session.document.execute(command) {
-        Ok(result) => result,
+    let route = match session.document.route_key(event) {
+        Ok(route) => route,
         Err(error) => return status_from_document_error(error),
+    };
+    let KeyRouteResult::Executed(result) = route else {
+        return YU_FFI_KEY_UNHANDLED;
     };
     write_command_result(session, result, output)
 }
@@ -950,8 +982,9 @@ mod tests {
                 result.selection_start_utf16,
                 result.selection_end_utf16,
                 result.changed,
+                result.source_sync,
             ),
-            (2, 1, 1, 1)
+            (2, 1, 1, 1, YU_SOURCE_SYNC_FULL)
         );
         let mut source_length = 0;
         assert_eq!(
@@ -979,7 +1012,14 @@ mod tests {
             },
             YU_FFI_OK
         );
-        assert_eq!((result.revision, result.selection_start_utf16), (3, 2));
+        assert_eq!(
+            (
+                result.revision,
+                result.selection_start_utf16,
+                result.source_sync
+            ),
+            (3, 2, YU_SOURCE_SYNC_FULL)
+        );
         assert_eq!(
             unsafe {
                 yu_composition_session_route_key(
@@ -994,6 +1034,82 @@ mod tests {
         );
 
         unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_key_route_returns_local_ranges_and_does_not_consume_plain_tab() {
+        let plain = session("paragraph");
+        let mut result = YuEditorCommandResult::default();
+        assert_eq!(
+            unsafe { yu_composition_session_route_key(plain, YU_KEY_TAB, 0, 0, &mut result) },
+            YU_FFI_KEY_UNHANDLED
+        );
+        unsafe { yu_composition_session_destroy(plain) };
+
+        let list = session("- item");
+        assert_eq!(
+            unsafe { yu_composition_session_route_key(list, YU_KEY_TAB, 0, 0, &mut result) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (
+                result.source_sync,
+                result.source_start_utf16,
+                result.source_old_end_utf16,
+                result.source_new_start_utf16,
+                result.source_new_end_utf16,
+            ),
+            (YU_SOURCE_SYNC_RANGE, 0, 0, 0, 2)
+        );
+        let mut length = 0;
+        assert_eq!(
+            unsafe { yu_composition_session_source_length(list, &mut length) },
+            YU_FFI_OK
+        );
+        let mut bytes = vec![0_u8; length];
+        assert_eq!(
+            unsafe { yu_composition_session_copy_source(list, bytes.as_mut_ptr(), bytes.len()) },
+            YU_FFI_OK
+        );
+        assert_eq!(bytes, b"  - item");
+
+        assert_eq!(
+            unsafe {
+                yu_composition_session_route_key(
+                    list,
+                    YU_KEY_TAB,
+                    0,
+                    YU_KEY_MODIFIER_SHIFT,
+                    &mut result,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(result.source_sync, YU_SOURCE_SYNC_RANGE);
+        unsafe { yu_composition_session_destroy(list) };
+
+        let local = session("ab");
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_selection(local, 0, 2, 2, YU_CARET_AFFINITY_DOWNSTREAM)
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_route_key(local, YU_KEY_BACKSPACE, 0, 0, &mut result) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (
+                result.source_sync,
+                result.source_start_utf16,
+                result.source_old_end_utf16,
+                result.source_new_start_utf16,
+                result.source_new_end_utf16,
+            ),
+            (YU_SOURCE_SYNC_RANGE, 1, 2, 1, 1)
+        );
+        unsafe { yu_composition_session_destroy(local) };
     }
 
     #[test]

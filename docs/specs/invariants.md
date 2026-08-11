@@ -75,6 +75,11 @@
     status，不得写入半成品 output。
 14. 原生 TextKit/AppKit mirror 在 command 成功后必须从 Rust canonical source 和 result selection
     同步；mirror 不是第二个 source/history，command route 不得把平台文本副本作为正确性边界。
+15. 每个 `CommandResult` 必须显式声明 `SourceSync::None`、`Range` 或 `Full`；发生本地 source edit
+    时 Range 的旧区间绑定输入 Revision、新区间绑定结果 Revision，平台只能用结果 Revision 查询
+    新区间。`changed=false` 不得携带遗留 range。
+16. 成组 Undo/Redo 在不能表示为单个安全 replacement 时必须请求 Full 同步；FFI 和平台不得根据
+    command 名称重新猜测同步范围。Tab/Shift-Tab 在非列表上下文必须返回 unhandled。
 
 ## Accessibility
 

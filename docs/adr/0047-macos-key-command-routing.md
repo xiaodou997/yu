@@ -23,8 +23,8 @@
   Revision、UTF-16 selection、CaretAffinity 和 `changed`；无映射 key 返回
   `YU_FFI_KEY_UNHANDLED`，活动 composition 拒绝永久命令。
 - macOS `TextInputView.keyDown` 在没有 marked text 时先调用 Rust route；处理成功后用 Rust
-  canonical source 和 command result 更新 TextKit mirror。当前 spike 为降低协议风险复制完整
-  source；未来有增量 view model 后再改为 source range delta，不改变 ABI 语义。
+  canonical source 和 command result 更新 TextKit mirror。局部范围与完整同步的后续 ABI
+  契约见 ADR 0048。
 - 原生 `NSTextInputClient` 仍是普通字符、中文/日文 preedit、emoji 和组合字符的入口；快捷键
   路由不是第二个文本编辑器，也不创建 GUI 产品层。
 
@@ -38,6 +38,6 @@
 
 ## 限制
 
-本阶段没有实现完整菜单/Selector registry、Option/Control 文本导航、上下移动、macOS
-Accessibility action routing 或增量 TextKit diff。Tab 在非列表上下文的策略仍由后续 editor/UI
-产品层决定；当前命令可以安全 no-op，但不会创建 source edit。
+本阶段没有实现完整菜单/Selector registry、Option/Control 文本导航、上下移动或 macOS
+Accessibility action routing。Tab/Shift-Tab 仅在 list command
+实际修改 source 时由 Rust 消费；普通段落返回 unhandled，继续交给平台 focus/text-input 策略。
