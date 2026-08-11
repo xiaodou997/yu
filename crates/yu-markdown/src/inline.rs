@@ -33,6 +33,21 @@ pub enum InlineNodeKind {
     Escaped,
     /// A contiguous run of one delimiter family.
     Delimiter { marker: InlineDelimiter },
+    /// Bracket/parenthesis punctuation used by links and images.
+    Punctuation { kind: InlinePunctuation },
+    /// A source line ending. Hard breaks include the two trailing spaces or
+    /// the backslash that makes the break explicit.
+    LineBreak { hard: bool },
+}
+
+/// Punctuation retained as individual source-backed nodes for link parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InlinePunctuation {
+    Bang,
+    OpenBracket,
+    CloseBracket,
+    OpenParen,
+    CloseParen,
 }
 
 /// A semantic inline span recognized from a matched delimiter pair.
@@ -45,6 +60,8 @@ pub enum InlineSpanKind {
     Emphasis,
     Strong,
     CodeSpan,
+    Link,
+    Image,
 }
 
 /// Source ranges for one parser-owned semantic inline span.
@@ -55,6 +72,7 @@ pub struct InlineSpan {
     opening: TextRange,
     content: TextRange,
     closing: TextRange,
+    destination: Option<TextRange>,
 }
 
 impl InlineSpan {
@@ -82,6 +100,13 @@ impl InlineSpan {
     pub const fn closing(self) -> TextRange {
         self.closing
     }
+
+    /// Returns the inline link destination, excluding surrounding angle
+    /// brackets and optional whitespace/title syntax.
+    #[must_use]
+    pub const fn destination(self) -> Option<TextRange> {
+        self.destination
+    }
 }
 
 /// A source-backed inline token.
@@ -89,6 +114,8 @@ impl InlineSpan {
 pub struct InlineNode {
     kind: InlineNodeKind,
     range: TextRange,
+    can_open: bool,
+    can_close: bool,
 }
 
 impl InlineNode {
@@ -100,6 +127,16 @@ impl InlineNode {
     #[must_use]
     pub const fn range(self) -> TextRange {
         self.range
+    }
+
+    #[must_use]
+    const fn can_open(self) -> bool {
+        self.can_open
+    }
+
+    #[must_use]
+    const fn can_close(self) -> bool {
+        self.can_close
     }
 }
 
@@ -200,24 +237,94 @@ pub fn parse_inline(
     let mut cursor = InlineByteCursor::new(source, source_range)?.peekable();
     let mut nodes = Vec::new();
     let mut text_start = None;
+    let mut trailing_space_start = None;
+    let mut trailing_space_count = 0_usize;
+    let mut previous_byte = None;
 
     while let Some((start, byte)) = cursor.next() {
         if byte == b'\\' {
             flush_text(&mut nodes, &mut text_start, start)?;
-            let end = consume_escaped_scalar(&mut cursor, start)?;
+            trailing_space_start = None;
+            trailing_space_count = 0;
+            if cursor.peek().is_some_and(|(_, next)| is_line_ending(*next)) {
+                let end = consume_backslash_line_break(&mut cursor, start)?;
+                nodes.push(InlineNode {
+                    kind: InlineNodeKind::LineBreak { hard: true },
+                    range: byte_range(start, end)?,
+                    can_open: false,
+                    can_close: false,
+                });
+                previous_byte = None;
+                continue;
+            }
+            let (end, last_byte) = consume_escaped_scalar(&mut cursor, start)?;
             nodes.push(InlineNode {
                 kind: InlineNodeKind::Escaped,
                 range: byte_range(start, end)?,
+                can_open: false,
+                can_close: false,
             });
+            previous_byte = Some(last_byte);
+            continue;
+        }
+
+        if is_line_ending(byte) {
+            let end = consume_line_ending(&mut cursor, start, byte)?;
+            let break_start = if trailing_space_count >= 2 {
+                trailing_space_start.unwrap_or(start)
+            } else {
+                start
+            };
+            flush_text(&mut nodes, &mut text_start, break_start)?;
+            nodes.push(InlineNode {
+                kind: InlineNodeKind::LineBreak {
+                    hard: trailing_space_count >= 2,
+                },
+                range: byte_range(break_start, end)?,
+                can_open: false,
+                can_close: false,
+            });
+            trailing_space_start = None;
+            trailing_space_count = 0;
+            previous_byte = None;
+            continue;
+        }
+
+        if let Some(kind) = punctuation_for(byte) {
+            flush_text(&mut nodes, &mut text_start, start)?;
+            nodes.push(InlineNode {
+                kind: InlineNodeKind::Punctuation { kind },
+                range: byte_range(
+                    start,
+                    start
+                        .checked_add(1)
+                        .ok_or(InlineParseError::OffsetOverflow)?,
+                )?,
+                can_open: false,
+                can_close: false,
+            });
+            trailing_space_start = None;
+            trailing_space_count = 0;
+            previous_byte = Some(byte);
             continue;
         }
 
         let Some(marker) = delimiter_for(byte) else {
             text_start.get_or_insert(start);
+            if byte == b' ' {
+                trailing_space_start.get_or_insert(start);
+                trailing_space_count = trailing_space_count.saturating_add(1);
+            } else {
+                trailing_space_start = None;
+                trailing_space_count = 0;
+            }
+            previous_byte = Some(byte);
             continue;
         };
 
         flush_text(&mut nodes, &mut text_start, start)?;
+        trailing_space_start = None;
+        trailing_space_count = 0;
         let mut end = start
             .checked_add(1)
             .ok_or(InlineParseError::OffsetOverflow)?;
@@ -227,10 +334,15 @@ pub fn parse_inline(
                 .checked_add(1)
                 .ok_or(InlineParseError::OffsetOverflow)?;
         }
+        let next_byte = cursor.peek().map(|(_, next)| *next);
+        let (can_open, can_close) = delimiter_flanking(marker, previous_byte, next_byte);
         nodes.push(InlineNode {
             kind: InlineNodeKind::Delimiter { marker },
             range: byte_range(start, end)?,
+            can_open,
+            can_close,
         });
+        previous_byte = Some(byte);
     }
 
     flush_text(
@@ -239,7 +351,7 @@ pub fn parse_inline(
         usize::try_from(source_range.end()).map_err(|_| InlineParseError::OffsetOverflow)?,
     )?;
 
-    let spans = build_spans(&nodes)?;
+    let spans = build_spans(source, &nodes)?;
 
     Ok(InlineDocument {
         source: source.clone(),
@@ -258,6 +370,56 @@ fn delimiter_for(byte: u8) -> Option<InlineDelimiter> {
     }
 }
 
+fn punctuation_for(byte: u8) -> Option<InlinePunctuation> {
+    match byte {
+        b'!' => Some(InlinePunctuation::Bang),
+        b'[' => Some(InlinePunctuation::OpenBracket),
+        b']' => Some(InlinePunctuation::CloseBracket),
+        b'(' => Some(InlinePunctuation::OpenParen),
+        b')' => Some(InlinePunctuation::CloseParen),
+        _ => None,
+    }
+}
+
+fn is_line_ending(byte: u8) -> bool {
+    matches!(byte, b'\r' | b'\n')
+}
+
+fn delimiter_flanking(
+    marker: InlineDelimiter,
+    previous: Option<u8>,
+    next: Option<u8>,
+) -> (bool, bool) {
+    if marker == InlineDelimiter::Code {
+        return (true, true);
+    }
+    let previous_whitespace = previous.is_none_or(is_ascii_whitespace);
+    let next_whitespace = next.is_none_or(is_ascii_whitespace);
+    let previous_punctuation = previous.is_some_and(is_ascii_punctuation);
+    let next_punctuation = next.is_some_and(is_ascii_punctuation);
+    let left_flanking =
+        !next_whitespace && (!next_punctuation || previous_whitespace || previous_punctuation);
+    let right_flanking =
+        !previous_whitespace && (!previous_punctuation || next_whitespace || next_punctuation);
+    if marker == InlineDelimiter::Underscore
+        && !previous_whitespace
+        && !next_whitespace
+        && !previous_punctuation
+        && !next_punctuation
+    {
+        return (false, false);
+    }
+    (left_flanking, right_flanking)
+}
+
+fn is_ascii_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn is_ascii_punctuation(byte: u8) -> bool {
+    byte.is_ascii_punctuation()
+}
+
 fn flush_text(
     nodes: &mut Vec<InlineNode>,
     text_start: &mut Option<usize>,
@@ -270,6 +432,8 @@ fn flush_text(
         nodes.push(InlineNode {
             kind: InlineNodeKind::Text,
             range: byte_range(start, end)?,
+            can_open: false,
+            can_close: false,
         });
     }
     Ok(())
@@ -278,22 +442,72 @@ fn flush_text(
 fn consume_escaped_scalar(
     cursor: &mut Peekable<InlineByteCursor<'_>>,
     start: usize,
-) -> Result<usize, InlineParseError> {
+) -> Result<(usize, u8), InlineParseError> {
     let Some((next_start, next_byte)) = cursor.next() else {
-        return start.checked_add(1).ok_or(InlineParseError::OffsetOverflow);
+        return Ok((
+            start
+                .checked_add(1)
+                .ok_or(InlineParseError::OffsetOverflow)?,
+            b'\\',
+        ));
     };
     let mut end = next_start
         .checked_add(1)
         .ok_or(InlineParseError::OffsetOverflow)?;
+    let mut last_byte = next_byte;
     if next_byte >= 0x80 {
         while cursor.peek().is_some_and(|(_, byte)| (byte & 0xc0) == 0x80) {
-            let (continuation_start, _) = cursor
+            let (continuation_start, continuation_byte) = cursor
                 .next()
                 .expect("peeked UTF-8 continuation must be available");
             end = continuation_start
                 .checked_add(1)
                 .ok_or(InlineParseError::OffsetOverflow)?;
+            last_byte = continuation_byte;
         }
+    }
+    Ok((end, last_byte))
+}
+
+fn consume_backslash_line_break(
+    cursor: &mut Peekable<InlineByteCursor<'_>>,
+    start: usize,
+) -> Result<usize, InlineParseError> {
+    let (newline_start, newline) = cursor
+        .next()
+        .expect("peeked line ending must remain available");
+    let mut end = newline_start
+        .checked_add(1)
+        .ok_or(InlineParseError::OffsetOverflow)?;
+    if newline == b'\r' && cursor.peek().is_some_and(|(_, next)| *next == b'\n') {
+        let (lf_start, _) = cursor
+            .next()
+            .expect("peeked CRLF line ending must remain available");
+        end = lf_start
+            .checked_add(1)
+            .ok_or(InlineParseError::OffsetOverflow)?;
+    }
+    if end <= start {
+        return Err(InlineParseError::OffsetOverflow);
+    }
+    Ok(end)
+}
+
+fn consume_line_ending(
+    cursor: &mut Peekable<InlineByteCursor<'_>>,
+    start: usize,
+    first: u8,
+) -> Result<usize, InlineParseError> {
+    let mut end = start
+        .checked_add(1)
+        .ok_or(InlineParseError::OffsetOverflow)?;
+    if first == b'\r' && cursor.peek().is_some_and(|(_, next)| *next == b'\n') {
+        let (lf_start, _) = cursor
+            .next()
+            .expect("peeked CRLF line ending must remain available");
+        end = lf_start
+            .checked_add(1)
+            .ok_or(InlineParseError::OffsetOverflow)?;
     }
     Ok(end)
 }
@@ -309,6 +523,8 @@ struct Delimiter {
     marker: InlineDelimiter,
     len: usize,
     range: TextRange,
+    can_open: bool,
+    can_close: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,18 +533,28 @@ struct DelimiterPair {
     closing: Delimiter,
 }
 
-fn build_spans(nodes: &[InlineNode]) -> Result<Vec<InlineSpan>, InlineParseError> {
+fn build_spans(
+    source: &TextSnapshot,
+    nodes: &[InlineNode],
+) -> Result<Vec<InlineSpan>, InlineParseError> {
     let delimiters = nodes
         .iter()
         .filter_map(|node| match node.kind() {
-            InlineNodeKind::Delimiter { marker } => Some((marker, node.range())),
-            InlineNodeKind::Text | InlineNodeKind::Escaped => None,
+            InlineNodeKind::Delimiter { marker } => {
+                Some((marker, node.range(), node.can_open(), node.can_close()))
+            }
+            InlineNodeKind::Text
+            | InlineNodeKind::Escaped
+            | InlineNodeKind::Punctuation { .. }
+            | InlineNodeKind::LineBreak { .. } => None,
         })
-        .map(|(marker, range)| {
+        .map(|(marker, range, can_open, can_close)| {
             Ok(Delimiter {
                 marker,
                 len: usize::try_from(range.len()).map_err(|_| InlineParseError::OffsetOverflow)?,
                 range,
+                can_open,
+                can_close,
             })
         })
         .collect::<Result<Vec<_>, InlineParseError>>()?;
@@ -360,6 +586,7 @@ fn build_spans(nodes: &[InlineNode]) -> Result<Vec<InlineSpan>, InlineParseError
             spans.push(make_span(pair, kind)?);
         }
     }
+    spans.extend(build_link_spans(source, nodes, &code_pairs)?);
 
     spans.sort_by_key(|span| {
         (
@@ -382,6 +609,7 @@ fn make_span(pair: DelimiterPair, kind: InlineSpanKind) -> Result<InlineSpan, In
         opening: pair.opening.range,
         content,
         closing: pair.closing.range,
+        destination: None,
     })
 }
 
@@ -392,10 +620,12 @@ fn pair_delimiters(delimiters: &[Delimiter], marker: InlineDelimiter) -> Vec<Del
         .iter()
         .copied()
         .filter(|item| item.marker == marker)
+        .filter(|item| marker == InlineDelimiter::Code || item.can_open || item.can_close)
     {
-        if let Some(opening_index) = openings
-            .iter()
-            .rposition(|opening: &Delimiter| opening.len == delimiter.len)
+        if delimiter.can_close
+            && let Some(opening_index) = openings
+                .iter()
+                .rposition(|opening: &Delimiter| opening.len == delimiter.len && opening.can_open)
         {
             let opening = openings.remove(opening_index);
             if opening.range.end() < delimiter.range.start() {
@@ -409,6 +639,170 @@ fn pair_delimiters(delimiters: &[Delimiter], marker: InlineDelimiter) -> Vec<Del
         openings.push(delimiter);
     }
     pairs
+}
+
+fn build_link_spans(
+    source: &TextSnapshot,
+    nodes: &[InlineNode],
+    code_pairs: &[DelimiterPair],
+) -> Result<Vec<InlineSpan>, InlineParseError> {
+    let mut spans = Vec::new();
+    for (open_index, open_node) in nodes.iter().enumerate() {
+        if !matches!(
+            open_node.kind(),
+            InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::OpenBracket
+            }
+        ) || inside_code(open_node.range(), code_pairs)
+        {
+            continue;
+        }
+        let Some(close_index) = matching_bracket(nodes, open_index) else {
+            continue;
+        };
+        let Some(open_paren_index) = close_index.checked_add(1) else {
+            continue;
+        };
+        if !matches!(
+            nodes.get(open_paren_index).map(|node| node.kind()),
+            Some(InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::OpenParen
+            })
+        ) {
+            continue;
+        }
+        let Some(close_paren_index) = matching_parenthesis(nodes, open_paren_index) else {
+            continue;
+        };
+        let close_node = nodes[close_index];
+        let open_paren = nodes[open_paren_index];
+        let close_paren = nodes[close_paren_index];
+        let image = open_index > 0
+            && matches!(
+                nodes[open_index - 1].kind(),
+                InlineNodeKind::Punctuation {
+                    kind: InlinePunctuation::Bang
+                }
+            )
+            && nodes[open_index - 1].range().end() == open_node.range().start();
+        let opening_start = if image {
+            nodes[open_index - 1].range().start()
+        } else {
+            open_node.range().start()
+        };
+        let source_range = TextRange::new(opening_start, close_paren.range().end())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        let content = TextRange::new(open_node.range().end(), close_node.range().start())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        let closing = TextRange::new(close_node.range().start(), close_paren.range().end())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        let destination_range =
+            TextRange::new(open_paren.range().end(), close_paren.range().start())
+                .ok_or(InlineParseError::OffsetOverflow)?;
+        let destination = trim_destination(source, destination_range)?;
+        spans.push(InlineSpan {
+            kind: if image {
+                InlineSpanKind::Image
+            } else {
+                InlineSpanKind::Link
+            },
+            source_range,
+            opening: TextRange::new(opening_start, open_node.range().end())
+                .ok_or(InlineParseError::OffsetOverflow)?,
+            content,
+            closing,
+            destination: Some(destination),
+        });
+    }
+    Ok(spans)
+}
+
+fn matching_bracket(nodes: &[InlineNode], open_index: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (index, node) in nodes.iter().enumerate().skip(open_index) {
+        match node.kind() {
+            InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::OpenBracket,
+            } => depth = depth.saturating_add(1),
+            InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::CloseBracket,
+            } => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn matching_parenthesis(nodes: &[InlineNode], open_index: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (index, node) in nodes.iter().enumerate().skip(open_index) {
+        match node.kind() {
+            InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::OpenParen,
+            } => depth = depth.saturating_add(1),
+            InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::CloseParen,
+            } => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn inside_code(range: TextRange, code_pairs: &[DelimiterPair]) -> bool {
+    code_pairs.iter().any(|pair| {
+        pair.opening.range.start() < range.start() && range.end() < pair.closing.range.end()
+    })
+}
+
+fn trim_destination(
+    source: &TextSnapshot,
+    range: TextRange,
+) -> Result<TextRange, InlineParseError> {
+    let cursor = InlineByteCursor::new(source, range)?;
+    let mut first = None;
+    let mut end = usize::try_from(range.end()).map_err(|_| InlineParseError::OffsetOverflow)?;
+    let mut angle_wrapped = false;
+    for (position, byte) in cursor {
+        if first.is_none() {
+            if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                continue;
+            }
+            if byte == b'<' {
+                angle_wrapped = true;
+                first = Some(
+                    position
+                        .checked_add(1)
+                        .ok_or(InlineParseError::OffsetOverflow)?,
+                );
+                continue;
+            }
+            first = Some(position);
+            continue;
+        }
+        if angle_wrapped {
+            if byte == b'>' {
+                end = position;
+                break;
+            }
+        } else if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+            end = position;
+            break;
+        }
+    }
+    let start = first
+        .unwrap_or(usize::try_from(range.start()).map_err(|_| InlineParseError::OffsetOverflow)?);
+    byte_range(start, end)
 }
 
 struct InlineByteCursor<'a> {
@@ -580,5 +974,111 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn links_and_images_keep_label_and_destination_ranges() {
+        let source = r#"[Yu](https://example.com "title") ![logo](img.png)"#;
+        let snapshot = TextBuffer::new(source).snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = parse_inline(&snapshot, range).expect("inline parse should succeed");
+
+        let links = inline
+            .spans()
+            .iter()
+            .filter(|span| span.kind() == InlineSpanKind::Link)
+            .collect::<Vec<_>>();
+        let images = inline
+            .spans()
+            .iter()
+            .filter(|span| span.kind() == InlineSpanKind::Image)
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 1);
+        assert_eq!(images.len(), 1);
+
+        let link = links[0];
+        assert_eq!(slice(source, link.content()), "Yu");
+        assert_eq!(
+            slice(source, link.destination().expect("link destination")),
+            "https://example.com"
+        );
+        assert_eq!(slice(source, link.opening()), "[");
+        assert_eq!(
+            slice(source, link.closing()),
+            "](https://example.com \"title\")"
+        );
+
+        let image = images[0];
+        assert_eq!(slice(source, image.opening()), "![");
+        assert_eq!(slice(source, image.content()), "logo");
+        assert_eq!(
+            slice(source, image.destination().expect("image destination")),
+            "img.png"
+        );
+        assert!(inline.has_lossless_coverage());
+    }
+
+    #[test]
+    fn line_break_nodes_distinguish_soft_and_hard_breaks() {
+        let source = "soft\nspaces  \nslash\\\nend\r\nlast";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = parse_inline(&snapshot, range).expect("inline parse should succeed");
+        let breaks = inline
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                InlineNodeKind::LineBreak { hard } => Some((hard, node.range())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(breaks.len(), 4);
+        assert!(!breaks[0].0);
+        assert!(breaks[1].0);
+        assert_eq!(slice(source, breaks[1].1), "  \n");
+        assert!(breaks[2].0);
+        assert_eq!(slice(source, breaks[2].1), "\\\n");
+        assert!(!breaks[3].0);
+        assert_eq!(slice(source, breaks[3].1), "\r\n");
+        assert!(inline.has_lossless_coverage());
+    }
+
+    #[test]
+    fn emphasis_flanking_rejects_intraword_underscores() {
+        let source = "foo_bar_baz **strong** *emphasis*";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = parse_inline(&snapshot, range).expect("inline parse should succeed");
+
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::Emphasis)
+                .count(),
+            1
+        );
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::Strong)
+                .count(),
+            1
+        );
+        assert!(
+            inline
+                .spans()
+                .iter()
+                .all(|span| slice(source, span.content()) != "bar")
+        );
+    }
+
+    fn slice(source: &str, range: TextRange) -> &str {
+        &source[usize::try_from(range.start()).expect("offset fits usize")
+            ..usize::try_from(range.end()).expect("offset fits usize")]
     }
 }
