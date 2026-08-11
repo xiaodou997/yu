@@ -31,5 +31,5 @@ source affinity 会再次出现两套状态。
   result；长行/短行跨行扩展不会丢失 anchor。
 - 普通 Up/Down 仍会在非扩展模式下折叠非空 selection；Shift+上下只改变 focus，允许用户连续
   扩展或收缩同一 selection。
-- 当前只覆盖垂直 Shift selection；左右/word/page 的 modify-selection、viewport 自动滚动和
-  完整菜单验证留给后续阶段。
+- 当前只覆盖垂直 Shift selection；左右/word/page 的 modify-selection、真实 scroll container
+  接入和完整菜单验证留给后续阶段。caret reveal 的 Rust/FFI 查询协议见 ADR 0053。

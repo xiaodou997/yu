@@ -52,6 +52,7 @@
 - [x] Unicode `MoveWordLeft/Right`、macOS Option-←/→ key route 与 Selector bridge
 - [x] block-aware `MoveUp/Down`、相邻 block hit-test 与 preferred-X caret state
 - [x] Shift+Up/Down selection extension、macOS modify-selection Selector 与 FFI route
+- [x] revision-bound caret scroll request、FFI geometry query 与 macOS spike self-check
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -200,10 +201,14 @@
 41. Up/Down 必须通过当前或相邻 block 的 `LayoutSnapshot` 往返 source caret，长行/短行/长行连续
     移动时保持 preferred-X；横向/word movement、edit、显式 selection 和 composition/reset 必须
     清除 preferred-X，macOS key route 与 `moveUp:`/`moveDown:` Selector 必须共用该 command，
-    viewport scroll-to-caret 明确留在后续阶段。
+    caret reveal 必须由 Rust 提供 revision-bound scroll request，真实 scroll container 仍留在
+    GUI 阶段。
 42. `MoveUpExtend/MoveDownExtend` 必须保留 selection anchor、只更新 focus，并在 focus 回到 anchor
     时折叠；Shift key route 与 macOS modify-selection Selector 必须共用 FFI command id，命令不得
     生成 Transaction、Revision、history 或 SourceSync。
+43. `CaretScrollRequest` 必须包含当前 Revision、focus source/geometry、current/target scroll 和
+    `needs_scroll`；Rust 必须使用 focus block 的 layout 与 HeightIndex 计算并 clamp target，FFI
+    必须拒绝 stale Revision，macOS spike 必须覆盖 reveal、visible no-op 和 top reveal。
 
 ## 非目标
 

@@ -31,8 +31,8 @@ pub use layout::{LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
 pub use viewport::{
-    ViewportBlock, ViewportConfig, ViewportError, ViewportLayout, ViewportRange, ViewportRect,
-    ViewportSnapshot, ViewportStats,
+    CaretScrollRequest, ViewportBlock, ViewportCaret, ViewportConfig, ViewportError,
+    ViewportLayout, ViewportRange, ViewportRect, ViewportSnapshot, ViewportStats,
 };
 pub use yu_layout::{
     ClusterMetrics, HeightIndex, HeightIndexError, LayoutCaret, LayoutConfig, LayoutError,

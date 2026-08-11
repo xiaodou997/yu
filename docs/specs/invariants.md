@@ -89,10 +89,15 @@
 19. `MoveUp/Down` 必须通过当前或相邻 block 的 `LayoutSnapshot` 做 visual-line caret/hit-test
     映射；preferred-X 必须在连续上下移动中保持，且横向/word movement、edit、显式 selection、
     composition/reset 时清除。平台层不得在 Rust command 之外自行修改跨 block source selection；
-    viewport scroll-to-caret 属于后续 GUI 契约。
+    caret reveal 必须通过 revision-bound `CaretScrollRequest` 查询，真实 scroll container 仍属于
+    后续 GUI 契约。
 20. `MoveUpExtend/MoveDownExtend` 必须保留 `EditorSelection::anchor()`，只更新 focus，并与普通
     Up/Down 共用 layout/preferred-X/source affinity；回到 anchor 时必须产生 collapsed selection。
     Shift 垂直移动不得推进 Revision、history 或 SourceSync，marked text 期间不得执行。
+21. `CaretScrollRequest` 必须绑定当前 source Revision，并由 Rust 根据 focus block 的 layout、
+    高度索引和显式 block estimate 计算 document-space caret 与绝对 target scroll。caret 已在
+    viewport 内时必须返回 no-op；target 必须限制在合法 content scroll 范围。FFI 查询必须携带
+    expected Revision，过期请求不得被平台应用。
 
 ## Accessibility
 

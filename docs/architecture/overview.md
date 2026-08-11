@@ -165,13 +165,19 @@ segment 跳过空白、保留标点/符号/emoji 的独立边界；该命令只�
 `PreferredCaretX` 保留第一次命中的 X，再以目标行 y 调用 `LayoutSnapshot::hit_test` 反向得到 source
 boundary。横向/word movement、edit、显式 selection 和 composition/reset 会清除 preferred-X；
 非空 selection 的 Up/Down 先折叠到 ordered start/end。当前可在相邻 Markdown block 的首/末视觉行
-间穿越，但不把前一 block 的合成 trailing empty caret line 重复暴露；viewport scroll-to-caret
-仍留在 GUI 阶段。
+间穿越，但不把前一 block 的合成 trailing empty caret line 重复暴露。`EditorDocument` 另提供
+revision-bound `CaretScrollRequest`：它消费当前 viewport、focus block 的 layout 和高度索引，
+返回 document-space caret geometry 与绝对 target scroll；平台只应用仍属于当前 Revision 的目标，
+真实 `NSScrollView` 接入留在 GUI 阶段。
 
 Shift+上下使用独立的 `MoveUpExtend`/`MoveDownExtend` command：`EditorSelection::anchor()` 保持不动，
 只把 hit-test 得到的 visual caret 写入 focus。macOS `moveUpAndModifySelection:`/
 `moveDownAndModifySelection:` 与 `EditorKey` 的 `SHIFT` modifier 共用该命令；focus 回到 anchor
 时 selection 自然折叠，命令仍不推进 Revision 或 source sync。
+
+Caret reveal 不从 `CommandResult` 猜测：macOS FFI 通过 expected Revision、viewport scroll/height
+和 margin 查询 `YuEditorCaretScrollRequest`。Rust 负责 focus block 的 layout、前缀高度和 target
+clamp；caret 已可见时返回 no-op。查询不会推进 source Revision，过期请求必须被平台丢弃。
 
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。

@@ -89,6 +89,20 @@ typedef struct YuEditorCommandResult {
     uint64_t source_new_end_utf16;
 } YuEditorCommandResult;
 
+typedef struct YuEditorCaretScrollRequest {
+    uint64_t revision;
+    uint64_t source_utf16;
+    uint64_t block_index;
+    float caret_x;
+    float caret_y;
+    float caret_width;
+    float caret_height;
+    float current_scroll_y;
+    float target_scroll_y;
+    float margin;
+    uint8_t needs_scroll;
+} YuEditorCaretScrollRequest;
+
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,
                                    YuCompositionSession **output);
 void yu_composition_session_destroy(YuCompositionSession *session);
@@ -136,6 +150,12 @@ int32_t yu_composition_session_set_selection(YuCompositionSession *session,
                                              uint64_t start_utf16,
                                              uint64_t end_utf16,
                                              uint8_t affinity);
+int32_t yu_composition_session_caret_scroll_request(YuCompositionSession *session,
+                                                    uint64_t expected_revision,
+                                                    float scroll_y,
+                                                    float viewport_height,
+                                                    float margin,
+                                                    YuEditorCaretScrollRequest *output);
 int32_t yu_composition_session_source_length(const YuCompositionSession *session,
                                              size_t *output);
 int32_t yu_composition_session_copy_source(const YuCompositionSession *session,

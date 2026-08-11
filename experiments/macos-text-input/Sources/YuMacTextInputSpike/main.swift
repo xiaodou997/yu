@@ -25,6 +25,20 @@ private struct RustCommandResult {
     let newSourceRange: NSRange?
 }
 
+private struct RustCaretScrollResult {
+    let revision: UInt64
+    let source: Int
+    let block: Int
+    let caretX: CGFloat
+    let caretY: CGFloat
+    let caretWidth: CGFloat
+    let caretHeight: CGFloat
+    let currentScrollY: CGFloat
+    let targetScrollY: CGFloat
+    let margin: CGFloat
+    let needsScroll: Bool
+}
+
 private enum YuNativeKeyKind {
     static let character = UInt8(YU_KEY_CHARACTER)
     static let enter = UInt8(YU_KEY_ENTER)
@@ -254,6 +268,37 @@ private final class RustCompositionBridge {
         }
         precondition(status == 0, "Rust native key route failed: \(status)")
         return commandResult(result)
+    }
+
+    func caretScrollRequest(
+        scrollY: CGFloat,
+        viewportHeight: CGFloat,
+        margin: CGFloat
+    ) -> RustCaretScrollResult {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var result = YuEditorCaretScrollRequest()
+        let status = yu_composition_session_caret_scroll_request(
+            session,
+            revision(),
+            Float(scrollY),
+            Float(viewportHeight),
+            Float(margin),
+            &result
+        )
+        precondition(status == 0, "Rust caret scroll request failed: \(status)")
+        return RustCaretScrollResult(
+            revision: result.revision,
+            source: Int(result.source_utf16),
+            block: Int(result.block_index),
+            caretX: CGFloat(result.caret_x),
+            caretY: CGFloat(result.caret_y),
+            caretWidth: CGFloat(result.caret_width),
+            caretHeight: CGFloat(result.caret_height),
+            currentScrollY: CGFloat(result.current_scroll_y),
+            targetScrollY: CGFloat(result.target_scroll_y),
+            margin: CGFloat(result.margin),
+            needsScroll: result.needs_scroll != 0
+        )
     }
 
     func sourceString(utf16Length: Int) -> String {
@@ -947,6 +992,69 @@ final class TextInputView: NSView, NSTextInputClient {
         )
     }
 
+    func runViewportScrollSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let source = "one\n\ntwo\n\nthree"
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: source, marked: false)
+        )
+        rustComposition.resetSource(source)
+        selection = NSRange(location: source.utf16.count, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+
+        let reveal = rustComposition.caretScrollRequest(
+            scrollY: 0,
+            viewportHeight: 1,
+            margin: 0
+        )
+        precondition(
+            reveal.revision == rustComposition.revision()
+                && reveal.source == source.utf16.count
+                && reveal.block == 4
+                && reveal.caretY == 4
+                && reveal.targetScrollY == 4
+                && reveal.needsScroll,
+            "Rust caret scroll request must reveal the focus"
+        )
+        let visible = rustComposition.caretScrollRequest(
+            scrollY: reveal.targetScrollY,
+            viewportHeight: 1,
+            margin: 0
+        )
+        precondition(
+            !visible.needsScroll && visible.targetScrollY == reveal.targetScrollY,
+            "visible caret must produce a no-op scroll request"
+        )
+
+        selection = NSRange(location: 0, length: 0)
+        rustComposition.setSelection(selection)
+        let top = rustComposition.caretScrollRequest(
+            scrollY: reveal.targetScrollY,
+            viewportHeight: 1,
+            margin: 0
+        )
+        precondition(top.needsScroll && top.targetScrollY == 0, "top caret must scroll back")
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        needsDisplay = true
+        print(
+            "Viewport self-check caret-source=\(reveal.source) block=\(reveal.block) "
+                + "target=\(reveal.targetScrollY) noop=\(!visible.needsScroll)"
+        )
+    }
+
     func runLayoutRoundTripSelfCheck() {
         updateContainerSize()
         layoutManager.ensureLayout(for: textContainer)
@@ -1535,6 +1643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runLayoutRoundTripSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
         inputView.runNativeCommandRoutingSelfCheck()
+        inputView.runViewportScrollSelfCheck()
         inputView.runNativeSelectionSelfCheck()
         inputView.runAccessibilitySelfCheck()
         NSApp.activate(ignoringOtherApps: true)

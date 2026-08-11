@@ -67,6 +67,14 @@ AX UTF-16 range ──► revision-bound text query ──► source byte range
 AX screen point  ──► platform coordinate map   ──► layout point
 ```
 
+## Viewport reveal
+
+Caret reveal 查询使用 `ViewportRect(scroll_y, height)` 作为平台输入，Rust 返回绑定当前
+Revision 的 `CaretScrollRequest`。其中 caret 的 `y` 是 document-space 行顶，`target_scroll_y`
+也是 document-space 的绝对滚动位置；平台不得把它当成 view-local delta，也不得在请求返回后
+重新按 UTF-16 selection 推导 block 高度。平台应用前必须确认请求 Revision 仍然是当前 source
+Revision；`needs_scroll=false` 表示 caret 已在 margin 内，target 与 current 相同。
+
 `AXBoundsForRange`、candidate rect 和 caret rect 均为屏幕几何查询，必须使用与所查询文本相同的
 Projection/Layout 状态。
 
