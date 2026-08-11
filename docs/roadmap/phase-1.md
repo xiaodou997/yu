@@ -15,6 +15,7 @@
 - [x] 参考 UTF-8 文本后端
 - [x] lossless Markdown block scanner
 - [x] blockquote/list item container-aware block CST v1（源码范围、深度和 marker metadata）
+- [x] task-list marker 的 source-backed block state、projection 隐藏与 toggle transaction
 - [x] `yu-inspect` CLI
 - [x] 可重复运行的 parse/edit 参考 benchmark harness
 - [x] 持久化 Piece Tree 与 Persistent Rope 初代候选及共同 workload benchmark
@@ -165,6 +166,10 @@
 33. Reference definition block 必须保留整行/label/destination source ranges；shortcut 只有在同
     revision definition index 命中时才隐藏，definition fingerprint 变化必须使非局部 projection、
     layout 和 viewport cache 失效。
+34. task-list marker 必须在 full/incremental block parse 中保持 `[ ]`/`[x]`/`[X]` 状态和三字节
+    source range；attached marker 不得误判。`BlockProjection::TaskList` 只能隐藏 marker，
+    `toggle_task` 必须通过普通 Transaction 修改状态，并让 projection cache 在 Revision 变化后
+    失效。
 
 ## 非目标
 

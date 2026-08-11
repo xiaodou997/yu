@@ -24,6 +24,7 @@ parser 前后 retained Snapshot 的 materialized buffer 数必须不变。
 BlankLine | Paragraph | AtxHeading | FencedCodeBlock
 BlockQuote { depth }
 ListItem { ordered, depth, marker, start }
+TaskListItem { ordered, depth, marker, start, state }
 ReferenceDefinition
 ```
 
@@ -31,6 +32,12 @@ blockquote 和 list item 的源码范围包含其连续/lazy continuation 行；
 `depth` 记录为独立 source range。这样 block sequence、projection cache 和 layout cache 可以
 先消费稳定的 `(range, kind)`，真正的 child arena 和稳定 node identity 留到有第二个消费者后再
 抽取为通用 syntax crate。
+
+`TaskListItem` 是 `ListItem` 的 source-backed 语义细分。根级 block parser 只在列表首行的内容
+以保守的 `[ ]`、`[x]` 或 `[X]` 开始，且右方紧跟空白或行尾时识别它；marker 的三字节
+`TextRange` 由 `yu_markdown::task_marker` 暴露，`TaskState` 只保存 Todo/Done。`[x]attached`
+不会被识别为 task marker，仍然是普通 `ListItem`。该判断复用列表 marker 的最多三格缩进规则，
+并在完整解析与增量解析中通过 block kind/hash/source range 一起收敛。
 
 `BlockSequence` 由不可变 `Arc<[BlockRecord]>` 分段组成。增量结果通常包含：
 
@@ -135,6 +142,11 @@ destination 和整行 range 均只引用 source。`MarkdownDocument` 为每个 r
 `ReferenceDefinitionIndex`；lookup 使用 ASCII case-fold 与空白折叠，并拒绝来自其他 revision
 的 Snapshot。definition block 的 projection 是零宽 source-backed block，不会把定义行显示为
 正文。
+
+Task-list block 的 projection 继续消费同一 block range 和 inline CST，只额外隐藏 parser 返回的
+`TaskMarker` range；列表 bullet、任务文本和其余 inline syntax 仍保持 source-backed。checkbox 的
+绘制/鼠标 overlay 尚未进入本阶段，`EditorCommand::toggle_task` 目前通过一个普通 Transaction
+只替换 marker 的状态字节，因此 Undo、Revision 和 projection cache 失效遵循统一编辑路径。
 
 definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
 offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地

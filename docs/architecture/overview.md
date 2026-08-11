@@ -131,6 +131,11 @@ cache，避免远处 shortcut reference 继续使用旧语义。`block_projectio
 普通 block 返回 inline projection，reference definition 返回零宽 source-backed projection，
 fenced code 返回独立的 `CodeProjection`，只隐藏 fence 行并把 body 当作字面量 code run，不会把
 body 中的 Markdown delimiter 当作 emphasis。
+task-list block 返回 `BlockProjection::TaskList`，只隐藏 parser-owned `TaskMarker` 的 `[ ]`/
+`[x]`/`[X]` source range，列表 bullet 和任务文本仍可通过 source/visual mapping 定位。当前
+`EditorCommand::toggle_task` 将状态字节替换为普通 Transaction；因此 source Revision、Undo 和
+projection/layout cache 失效与其他永久编辑一致，checkbox 的原生绘制和鼠标 overlay 留到 GUI
+阶段。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
 `yu-layout::LayoutSnapshot` 是 block-local、revision-bound 的纯 Rust 布局契约：它消费

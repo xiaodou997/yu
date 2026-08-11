@@ -4,6 +4,13 @@ use std::sync::Arc;
 
 use yu_core::{ByteOffset, TextRange};
 
+/// The two task-list marker states recognized by the Phase 1 Markdown parser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TaskState {
+    Todo,
+    Done,
+}
+
 /// The block shapes recognized by the lossless block parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
@@ -31,6 +38,14 @@ pub enum BlockKind {
         depth: u8,
         marker: char,
         start: u32,
+    },
+    /// A list item whose first-line content starts with a task marker.
+    TaskListItem {
+        ordered: bool,
+        depth: u8,
+        marker: char,
+        start: u32,
+        state: TaskState,
     },
 }
 

@@ -15,12 +15,18 @@ pub enum EditorCommand {
     DeleteForward,
     MoveLeft,
     MoveRight,
+    ToggleTask { block: usize },
 }
 
 impl EditorCommand {
     #[must_use]
     pub fn insert_text(text: impl Into<Arc<str>>) -> Self {
         Self::InsertText(text.into())
+    }
+
+    #[must_use]
+    pub const fn toggle_task(block: usize) -> Self {
+        Self::ToggleTask { block }
     }
 }
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use yu_core::{Revision, TextRange, Utf16Range};
 use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
-use yu_markdown::{IncrementalParseError, MarkdownDocument};
+use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
 };
@@ -478,7 +478,50 @@ impl EditorDocument {
             EditorCommand::DeleteForward => self.delete_forward(),
             EditorCommand::MoveLeft => self.move_left(),
             EditorCommand::MoveRight => self.move_right(),
+            EditorCommand::ToggleTask { block } => self.toggle_task(block),
         }
+    }
+
+    /// Toggles the source-backed `[ ]`/`[x]` marker of one task-list block.
+    /// The edit is a normal transaction, so undo/history and projection cache
+    /// invalidation follow the same path as keyboard input.
+    pub fn toggle_task(&mut self, index: usize) -> Result<CommandResult, EditorDocumentError> {
+        let block =
+            self.markdown
+                .blocks()
+                .get(index)
+                .ok_or(EditorDocumentError::BlockOutOfBounds {
+                    index,
+                    blocks: self.markdown.blocks().len(),
+                })?;
+        let state = match block.kind() {
+            BlockKind::TaskListItem { state, .. } => state,
+            _ => return Err(EditorDocumentError::BlockNotTaskList { index }),
+        };
+        let marker = yu_markdown::task_marker(&self.snapshot(), block)
+            .ok_or(EditorDocumentError::BlockNotTaskList { index })?;
+        let state_start = marker
+            .range()
+            .start()
+            .checked_add(1)
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        let state_end = state_start
+            .checked_add(1)
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        let replacement = match state {
+            TaskState::Todo => "x",
+            TaskState::Done => " ",
+        };
+        let transaction = Transaction::new(
+            self.revision(),
+            [yu_text::Edit::new(
+                TextRange::new(state_start, state_end)
+                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?,
+                replacement,
+            )],
+        );
+        self.apply_transaction(&transaction)?;
+        Ok(self.command_result(true))
     }
 
     fn insert_text(&mut self, text: Arc<str>) -> Result<CommandResult, EditorDocumentError> {
@@ -584,6 +627,7 @@ pub enum EditorDocumentError {
     Selection(SelectionError),
     Viewport(ViewportError),
     BlockOutOfBounds { index: usize, blocks: usize },
+    BlockNotTaskList { index: usize },
     CompositionNotActive,
     CompositionActive,
 }
@@ -605,6 +649,12 @@ impl fmt::Display for EditorDocumentError {
                     "Markdown block index {index} is outside {blocks} blocks"
                 )
             }
+            Self::BlockNotTaskList { index } => {
+                write!(
+                    formatter,
+                    "Markdown block index {index} is not a task-list item"
+                )
+            }
             Self::CompositionNotActive => formatter.write_str("no active composition"),
             Self::CompositionActive => formatter.write_str("composition is already active"),
         }
@@ -623,6 +673,7 @@ impl Error for EditorDocumentError {
             Self::Selection(error) => Some(error),
             Self::Viewport(error) => Some(error),
             Self::BlockOutOfBounds { .. }
+            | Self::BlockNotTaskList { .. }
             | Self::CompositionNotActive
             | Self::CompositionActive => None,
         }
@@ -989,6 +1040,49 @@ mod tests {
     }
 
     #[test]
+    fn toggle_task_is_a_source_transaction_and_rebuilds_task_projection() {
+        let mut document = EditorDocument::new("- [ ] todo\n");
+        let projection = document
+            .block_projection(0)
+            .expect("task projection should build");
+        assert_eq!(projection.kind(), crate::BlockProjectionKind::TaskList);
+        assert_eq!(document.projection_cache_stats().builds(), 1);
+
+        let result = document
+            .execute(EditorCommand::toggle_task(0))
+            .expect("task toggle should apply");
+        assert!(result.changed());
+        assert_eq!(document.snapshot().as_str(), "- [x] todo\n");
+        assert!(matches!(
+            document
+                .markdown()
+                .blocks()
+                .get(0)
+                .expect("task block")
+                .kind(),
+            BlockKind::TaskListItem {
+                state: yu_markdown::TaskState::Done,
+                ..
+            }
+        ));
+        assert_eq!(document.projection_cache_stats().entries(), 0);
+
+        document
+            .toggle_task(0)
+            .expect("second task toggle should apply");
+        assert_eq!(document.snapshot().as_str(), "- [ ] todo\n");
+    }
+
+    #[test]
+    fn toggle_task_rejects_non_task_blocks() {
+        let mut document = EditorDocument::new("- ordinary\n");
+        assert!(matches!(
+            document.toggle_task(0),
+            Err(EditorDocumentError::BlockNotTaskList { index: 0 })
+        ));
+    }
+
+    #[test]
     fn projection_query_rejects_non_utf8_source_boundaries() {
         let mut document = EditorDocument::new("羽");
         let invalid = source_range(1, 3);
@@ -1076,7 +1170,9 @@ mod tests {
                             && run.style() == crate::VisualRunStyle::Code
                     }));
                 }
-                BlockProjection::Inline(_) | BlockProjection::ReferenceDefinition(_) => {
+                BlockProjection::Inline(_)
+                | BlockProjection::ReferenceDefinition(_)
+                | BlockProjection::TaskList(_) => {
                     panic!("fenced code must not use inline projection")
                 }
             }
@@ -1100,7 +1196,9 @@ mod tests {
             .expect("fenced code projection should build")
         {
             BlockProjection::FencedCode(code) => code.content(),
-            BlockProjection::Inline(_) | BlockProjection::ReferenceDefinition(_) => {
+            BlockProjection::Inline(_)
+            | BlockProjection::ReferenceDefinition(_)
+            | BlockProjection::TaskList(_) => {
                 panic!("fenced code must use code projection")
             }
         };
@@ -1117,7 +1215,9 @@ mod tests {
             .expect("shifted code projection should be reusable");
         let new_content = match projection {
             BlockProjection::FencedCode(code) => code.content(),
-            BlockProjection::Inline(_) | BlockProjection::ReferenceDefinition(_) => {
+            BlockProjection::Inline(_)
+            | BlockProjection::ReferenceDefinition(_)
+            | BlockProjection::TaskList(_) => {
                 panic!("fenced code must use code projection")
             }
         };

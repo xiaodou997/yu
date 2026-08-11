@@ -210,6 +210,9 @@ pub enum ProjectionError {
     InvalidCodeBlock {
         range: TextRange,
     },
+    InvalidTaskListBlock {
+        range: TextRange,
+    },
     OffsetOverflow,
 }
 
@@ -245,6 +248,9 @@ impl fmt::Display for ProjectionError {
             Self::InvalidCodeBlock { range } => {
                 write!(formatter, "invalid fenced code block range {range:?}")
             }
+            Self::InvalidTaskListBlock { range } => {
+                write!(formatter, "invalid task-list block range {range:?}")
+            }
             Self::OffsetOverflow => formatter.write_str("projection offset overflow"),
         }
     }
@@ -262,6 +268,7 @@ impl Error for ProjectionError {
             | Self::VisualOutOfBounds { .. }
             | Self::NotFencedCodeBlock { .. }
             | Self::InvalidCodeBlock { .. }
+            | Self::InvalidTaskListBlock { .. }
             | Self::OffsetOverflow => None,
         }
     }
@@ -338,13 +345,24 @@ impl Projection {
     /// explicit: the projection never rescans or owns a second inline syntax
     /// representation.
     pub fn from_inline(inline: &InlineDocument) -> Result<Self, ProjectionError> {
+        Self::from_inline_with_hidden(inline, &[])
+    }
+
+    /// Builds a projection from parser-owned inline tokens and additional
+    /// source ranges supplied by a block-level parser (for example `[ ]` in a
+    /// task-list item).
+    pub fn from_inline_with_hidden(
+        inline: &InlineDocument,
+        extra_hidden: &[TextRange],
+    ) -> Result<Self, ProjectionError> {
         let source = inline.source();
         let source_range = inline.source_range();
-        let hidden = inline
+        let mut hidden = inline
             .spans()
             .iter()
             .flat_map(|span| [span.opening(), span.closing()])
             .collect::<Vec<_>>();
+        hidden.extend_from_slice(extra_hidden);
         let line_breaks = inline
             .nodes()
             .iter()
@@ -840,6 +858,7 @@ pub enum BlockProjectionKind {
     Inline,
     FencedCode,
     ReferenceDefinition,
+    TaskList,
 }
 
 /// A source-backed fenced-code projection.
@@ -986,6 +1005,7 @@ pub enum BlockProjection {
     Inline(Projection),
     FencedCode(CodeProjection),
     ReferenceDefinition(Projection),
+    TaskList(Projection),
 }
 
 impl BlockProjection {
@@ -994,6 +1014,7 @@ impl BlockProjection {
             BlockKind::ReferenceDefinition => {
                 Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
             }
+            BlockKind::TaskListItem { .. } => Self::task_list(source, block, None),
             _ => Self::from_block_without_definitions(source, block),
         }
     }
@@ -1010,12 +1031,32 @@ impl BlockProjection {
             BlockKind::ReferenceDefinition => {
                 Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
             }
+            BlockKind::TaskListItem { .. } => Self::task_list(source, block, Some(definitions)),
             BlockKind::FencedCodeBlock { .. } => {
                 CodeProjection::from_block(source, block).map(Self::FencedCode)
             }
             _ => Projection::inline_with_definitions(source, block.range(), definitions)
                 .map(Self::Inline),
         }
+    }
+
+    fn task_list(
+        source: &TextSnapshot,
+        block: Block,
+        definitions: Option<&ReferenceDefinitionIndex>,
+    ) -> Result<Self, ProjectionError> {
+        let marker = yu_markdown::task_marker(source, block).ok_or(
+            ProjectionError::InvalidTaskListBlock {
+                range: block.range(),
+            },
+        )?;
+        let inline = match definitions {
+            Some(definitions) => {
+                parse_inline_with_definitions(source, block.range(), Some(definitions))?
+            }
+            None => parse_inline(source, block.range())?,
+        };
+        Projection::from_inline_with_hidden(&inline, &[marker.range()]).map(Self::TaskList)
     }
 
     fn from_block_without_definitions(
@@ -1036,6 +1077,7 @@ impl BlockProjection {
             Self::Inline(_) => BlockProjectionKind::Inline,
             Self::FencedCode(_) => BlockProjectionKind::FencedCode,
             Self::ReferenceDefinition(_) => BlockProjectionKind::ReferenceDefinition,
+            Self::TaskList(_) => BlockProjectionKind::TaskList,
         }
     }
 
@@ -1045,6 +1087,7 @@ impl BlockProjection {
             Self::Inline(projection) => projection,
             Self::FencedCode(projection) => projection.visual(),
             Self::ReferenceDefinition(projection) => projection,
+            Self::TaskList(projection) => projection,
         }
     }
 
@@ -1074,6 +1117,9 @@ impl BlockProjection {
             Self::ReferenceDefinition(projection) => Ok(projection
                 .map_through(changes, snapshot)?
                 .map(Self::ReferenceDefinition)),
+            Self::TaskList(projection) => Ok(projection
+                .map_through(changes, snapshot)?
+                .map(Self::TaskList)),
         }
     }
 }
@@ -1364,6 +1410,42 @@ mod tests {
         assert_eq!(hidden.kind(), BlockProjectionKind::ReferenceDefinition);
         assert_eq!(hidden.visual().visual_len(), VisualOffset::ZERO);
         assert_eq!(hidden.visual().source_range(), definition.range());
+    }
+
+    #[test]
+    fn task_list_projection_hides_marker_but_keeps_item_text() {
+        let source = "- [ ] task **text**\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("task block should exist");
+        assert!(matches!(
+            block.kind(),
+            BlockKind::TaskListItem {
+                state: yu_markdown::TaskState::Todo,
+                ..
+            }
+        ));
+        let projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+        )
+        .expect("task projection should build");
+        assert_eq!(projection.kind(), BlockProjectionKind::TaskList);
+        assert_eq!(
+            projection.visual().visual_len().get(),
+            source.len() as u64 - 3 - 4
+        );
+        assert!(projection.visual().runs().iter().any(|run| {
+            run.kind() == VisualRunKind::HiddenSyntax
+                && run.source()
+                    == yu_markdown::task_marker(&snapshot, block)
+                        .expect("marker")
+                        .range()
+        }));
+        assert!(projection.visual().runs().iter().any(|run| {
+            run.kind() == VisualRunKind::Visible && run.style() == VisualRunStyle::Strong
+        }));
     }
 
     #[test]

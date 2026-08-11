@@ -86,7 +86,9 @@ impl ProjectionCache {
         })?;
         match &self.entries[index].projection {
             BlockProjection::Inline(projection) => Ok(projection),
-            BlockProjection::FencedCode(_) | BlockProjection::ReferenceDefinition(_) => {
+            BlockProjection::FencedCode(_)
+            | BlockProjection::ReferenceDefinition(_)
+            | BlockProjection::TaskList(_) => {
                 unreachable!("range projections are inline")
             }
         }
@@ -106,7 +108,9 @@ impl ProjectionCache {
         })?;
         match &self.entries[index].projection {
             BlockProjection::Inline(projection) => Ok(projection),
-            BlockProjection::FencedCode(_) | BlockProjection::ReferenceDefinition(_) => {
+            BlockProjection::FencedCode(_)
+            | BlockProjection::ReferenceDefinition(_)
+            | BlockProjection::TaskList(_) => {
                 unreachable!("range projections are inline")
             }
         }

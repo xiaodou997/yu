@@ -30,6 +30,9 @@
 6. `ReferenceDefinition` 的整行、label 与 destination range 必须 source-backed；definition index
    lookup 只能消费同一 Snapshot revision，且 incremental/full parse 产生的定义顺序和 fingerprint
    必须一致。
+7. `TaskListItem` 只能由列表首行中保守的 `[ ]`、`[x]` 或 `[X]` marker 产生；marker 必须有合法
+   source range，右侧非空白的 attached marker 不得被识别为 task marker。`TaskState` 的改变必须
+   在 full/incremental parse 中与 block kind 一致。
 
 ## Async work
 
@@ -91,6 +94,9 @@
    `BlockProjection::FencedCode`，reference definition 必须返回零宽 projection。definition index
    fingerprint 变化时，projection/layout/viewport cache 必须整体失效；否则 strictly-outside edit
    才允许映射复用。
+7. task-list block 必须返回 `BlockProjection::TaskList`；projection 只能隐藏 parser-owned
+   `TaskMarker` source range，不能删除 bullet 或任务文本。`EditorCommand::toggle_task` 必须只用
+   普通 Transaction 替换 marker 状态字节，非 task block 必须拒绝且不改变文档。
 
 ## Layout
 
