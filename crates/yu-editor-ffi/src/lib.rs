@@ -1355,6 +1355,36 @@ mod tests {
     }
 
     #[test]
+    fn ffi_key_route_crosses_adjacent_markdown_blocks() {
+        let handle = session("# title\ntext");
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_selection(handle, 0, 8, 8, YU_CARET_AFFINITY_DOWNSTREAM)
+            },
+            YU_FFI_OK
+        );
+
+        let mut result = YuEditorCommandResult::default();
+        assert_eq!(
+            unsafe { yu_composition_session_route_key(handle, YU_KEY_UP, 0, 0, &mut result) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (result.selection_start_utf16, result.selection_end_utf16),
+            (0, 0)
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_route_key(handle, YU_KEY_DOWN, 0, 0, &mut result) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (result.selection_start_utf16, result.selection_end_utf16),
+            (8, 8)
+        );
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
     fn ffi_execute_command_rejects_active_composition_and_unknown_commands() {
         let handle = session("a");
         let mut result = YuEditorCommandResult::default();

@@ -50,7 +50,7 @@
 - [x] command result 的 None/Range/Full source sync 与 macOS TextKit 局部 mirror 更新
 - [x] macOS `doCommand(by:)` Selector allowlist、Rust execute bridge 与 command availability 查询
 - [x] Unicode `MoveWordLeft/Right`、macOS Option-←/→ key route 与 Selector bridge
-- [x] block-local `MoveUp/Down`、LayoutSnapshot hit-test 与 preferred-X caret state
+- [x] block-aware `MoveUp/Down`、相邻 block hit-test 与 preferred-X caret state
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -196,10 +196,10 @@
 40. Word movement 必须在 Unicode word-boundary segment 上保持稳定 selection 映射，Option/Control
     key route 与 Selector 必须共用 `MoveWordLeft/Right`；命令不得生成 Transaction，也不得为一次
     移动物化整个 Piece Tree/Rope Snapshot。
-41. Up/Down 必须通过 block-local `LayoutSnapshot` 往返 source caret，长行/短行/长行连续移动时
-    保持 preferred-X；横向/word movement、edit、显式 selection 和 composition/reset 必须清除
-    preferred-X，macOS key route 与 `moveUp:`/`moveDown:` Selector 必须共用该 command，跨 block
-    与 viewport scroll-to-caret 明确留在后续阶段。
+41. Up/Down 必须通过当前或相邻 block 的 `LayoutSnapshot` 往返 source caret，长行/短行/长行连续
+    移动时保持 preferred-X；横向/word movement、edit、显式 selection 和 composition/reset 必须
+    清除 preferred-X，macOS key route 与 `moveUp:`/`moveDown:` Selector 必须共用该 command，
+    viewport scroll-to-caret 明确留在后续阶段。
 
 ## 非目标
 

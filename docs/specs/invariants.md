@@ -86,9 +86,10 @@
 18. `MoveWordLeft/Right` 必须使用 Unicode word-boundary segment，并保持 UTF-8 source boundary；
     空白可被跨越，标点/符号/emoji 不得静默并入相邻字母词。word movement 只能改变 selection，
     不得推进 Revision 或写入 history；非连续 Snapshot 不得因单次移动被 `as_str()` 全量物化。
-19. `MoveUp/Down` 必须通过同一 block 的 `LayoutSnapshot` 做 visual-line caret/hit-test 映射；
-    preferred-X 必须在连续上下移动中保持，且横向/word movement、edit、显式 selection、
-    composition/reset 时清除。跨 block/viewport 导航未实现前不得由平台层自行修改 source selection。
+19. `MoveUp/Down` 必须通过当前或相邻 block 的 `LayoutSnapshot` 做 visual-line caret/hit-test
+    映射；preferred-X 必须在连续上下移动中保持，且横向/word movement、edit、显式 selection、
+    composition/reset 时清除。平台层不得在 Rust command 之外自行修改跨 block source selection；
+    viewport scroll-to-caret 属于后续 GUI 契约。
 
 ## Accessibility
 

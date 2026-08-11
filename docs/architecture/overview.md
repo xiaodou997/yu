@@ -164,8 +164,9 @@ segment 跳过空白、保留标点/符号/emoji 的独立边界；该命令只�
 `LayoutSnapshot::caret_for_source` 把当前 source caret 定位到 block-local visual line，使用私有
 `PreferredCaretX` 保留第一次命中的 X，再以目标行 y 调用 `LayoutSnapshot::hit_test` 反向得到 source
 boundary。横向/word movement、edit、显式 selection 和 composition/reset 会清除 preferred-X；
-非空 selection 的 Up/Down 先折叠到 ordered start/end。当前只在同一 Markdown block 内导航，跨
-block 与 viewport scroll-to-caret 仍留在 GUI 阶段。
+非空 selection 的 Up/Down 先折叠到 ordered start/end。当前可在相邻 Markdown block 的首/末视觉行
+间穿越，但不把前一 block 的合成 trailing empty caret line 重复暴露；viewport scroll-to-caret
+仍留在 GUI 阶段。
 
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。
