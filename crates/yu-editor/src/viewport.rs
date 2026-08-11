@@ -52,6 +52,11 @@ impl ViewportConfig {
                 "layout line_height must be finite and positive",
             ));
         }
+        if !self.layout.default_advance().is_finite() || self.layout.default_advance() <= 0.0 {
+            return Err(ViewportError::InvalidConfig(
+                "layout default_advance must be finite and positive",
+            ));
+        }
         if !self.estimated_block_height.is_finite() || self.estimated_block_height <= 0.0 {
             return Err(ViewportError::InvalidConfig(
                 "estimated_block_height must be finite and positive",

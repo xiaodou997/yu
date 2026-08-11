@@ -30,6 +30,7 @@ pub use shaping::{
 pub struct LayoutConfig {
     max_width: f32,
     line_height: f32,
+    default_advance: f32,
 }
 
 impl LayoutConfig {
@@ -38,7 +39,19 @@ impl LayoutConfig {
         Self {
             max_width,
             line_height,
+            default_advance: 1.0,
         }
+    }
+
+    /// Returns a copy using the fallback advance for metrics-only layout.
+    ///
+    /// Shaped layout providers can replace this value per glyph run; the
+    /// fallback is used by the deterministic metrics backend and by the FFI
+    /// viewport contract before a native shaper is attached.
+    #[must_use]
+    pub const fn with_default_advance(mut self, default_advance: f32) -> Self {
+        self.default_advance = default_advance;
+        self
     }
 
     #[must_use]
@@ -51,6 +64,11 @@ impl LayoutConfig {
         self.line_height
     }
 
+    #[must_use]
+    pub const fn default_advance(self) -> f32 {
+        self.default_advance
+    }
+
     fn validate(self) -> Result<(), LayoutError> {
         if !self.max_width.is_finite() || self.max_width <= 0.0 {
             return Err(LayoutError::InvalidConfig(
@@ -60,6 +78,11 @@ impl LayoutConfig {
         if !self.line_height.is_finite() || self.line_height <= 0.0 {
             return Err(LayoutError::InvalidConfig(
                 "line_height must be finite and positive",
+            ));
+        }
+        if !self.default_advance.is_finite() || self.default_advance <= 0.0 {
+            return Err(LayoutError::InvalidConfig(
+                "default_advance must be finite and positive",
             ));
         }
         Ok(())
@@ -611,7 +634,7 @@ impl LayoutSnapshot {
         projection: &Projection,
         config: LayoutConfig,
     ) -> Result<Self, LayoutError> {
-        let metrics = MonospaceMetrics::default();
+        let metrics = MonospaceMetrics::new(config.default_advance());
         Self::from_projection_with_metrics(projection, config, &metrics)
     }
 
@@ -1677,6 +1700,25 @@ mod tests {
     fn invalid_layout_config_is_rejected_before_scanning_source() {
         let result =
             LayoutSnapshot::from_projection(&projection("text"), LayoutConfig::new(0.0, 1.0));
+        assert!(matches!(result, Err(LayoutError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn metrics_layout_uses_configured_default_advance() {
+        let layout = LayoutSnapshot::from_projection(
+            &projection("ab"),
+            LayoutConfig::new(10.0, 1.0).with_default_advance(2.5),
+        )
+        .expect("configured metrics should build");
+        assert_eq!(layout.lines()[0].width(), 5.0);
+    }
+
+    #[test]
+    fn invalid_default_advance_is_rejected() {
+        let result = LayoutSnapshot::from_projection(
+            &projection("text"),
+            LayoutConfig::new(10.0, 1.0).with_default_advance(0.0),
+        );
         assert!(matches!(result, Err(LayoutError::InvalidConfig(_))));
     }
 

@@ -6,7 +6,7 @@ use yu_core::{TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     CaretAffinity, CaretScrollRequest, CommandResult, EditorCommand, EditorDocument,
     EditorDocumentError, EditorKey, EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult,
-    SelectionError, SourceSync, ViewportRect,
+    LayoutConfig, SelectionError, SourceSync, ViewportConfig, ViewportRect,
 };
 use yu_text::{EditError, TextSnapshot};
 
@@ -22,6 +22,7 @@ pub const YU_FFI_STALE_REVISION: i32 = 8;
 pub const YU_FFI_KEY_UNHANDLED: i32 = 9;
 pub const YU_FFI_INVALID_COMMAND: i32 = 10;
 pub const YU_FFI_INVALID_KEY: i32 = 11;
+pub const YU_FFI_INVALID_VIEWPORT_CONFIG: i32 = 12;
 pub const YU_COMMAND_UNAVAILABLE: u8 = 0;
 pub const YU_COMMAND_AVAILABLE: u8 = 1;
 pub const YU_SOURCE_SYNC_NONE: u8 = 0;
@@ -795,6 +796,42 @@ pub unsafe extern "C" fn yu_composition_session_set_selection(
         .map_or_else(status_from_selection_error, |_| YU_FFI_OK)
 }
 
+/// Applies native viewport metrics to the revision-bound Rust layout policy.
+///
+/// The metrics-only backend uses `default_advance` for grapheme clusters that
+/// do not yet have a platform shaper. This call does not change source or
+/// selection revision; callers still provide the revision they used to derive
+/// the metrics so a stale host cannot reconfigure a newer document.
+///
+/// # Safety
+/// `session` must be null or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_set_viewport_config(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    max_width: f32,
+    line_height: f32,
+    default_advance: f32,
+    estimated_block_height: f32,
+    overscan: f32,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(session, expected_revision) {
+        return status;
+    }
+    let config = ViewportConfig::new(
+        LayoutConfig::new(max_width, line_height).with_default_advance(default_advance),
+        estimated_block_height,
+        overscan,
+    );
+    session
+        .document
+        .set_viewport_config(config)
+        .map_or(YU_FFI_INVALID_VIEWPORT_CONFIG, |_| YU_FFI_OK)
+}
+
 /// Resolves the current focus caret and returns an absolute document-space
 /// scroll target for a native viewport. The query is bound to
 /// `expected_revision`; stale UI geometry must be discarded by the caller.
@@ -1519,6 +1556,42 @@ mod tests {
         assert_eq!(
             (result.selection_start_utf16, result.selection_end_utf16),
             (0, 8)
+        );
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_viewport_config_is_revision_bound_and_controls_metrics_layout() {
+        let handle = session("abcdefgh");
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_viewport_config(handle, 0, 6.0, 2.0, 2.0, 2.0, 0.0)
+            },
+            YU_FFI_OK
+        );
+
+        let mut request = YuEditorCaretScrollRequest::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_caret_scroll_request(handle, 0, 0.0, 2.0, 0.0, &mut request)
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(request.caret_height, 2.0);
+        assert_eq!(request.target_scroll_y, 4.0);
+        assert_eq!(request.needs_scroll, 1);
+
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_viewport_config(handle, 1, 6.0, 2.0, 2.0, 2.0, 0.0)
+            },
+            YU_FFI_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_viewport_config(handle, 0, 0.0, 2.0, 2.0, 2.0, 0.0)
+            },
+            YU_FFI_INVALID_VIEWPORT_CONFIG
         );
         unsafe { yu_composition_session_destroy(handle) };
     }

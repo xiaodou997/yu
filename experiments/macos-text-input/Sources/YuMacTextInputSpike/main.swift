@@ -39,6 +39,14 @@ private struct RustCaretScrollResult {
     let needsScroll: Bool
 }
 
+private struct RustViewportMetrics: Equatable {
+    let maxWidth: CGFloat
+    let lineHeight: CGFloat
+    let defaultAdvance: CGFloat
+    let estimatedBlockHeight: CGFloat
+    let overscan: CGFloat
+}
+
 private enum YuViewportApplyResult: Equatable {
     case stale
     case noOp
@@ -143,6 +151,7 @@ private enum YuNativeCommand {
 private final class RustCompositionBridge {
     private var session: OpaquePointer?
     private(set) var hasOverlay = false
+    private var viewportMetrics: RustViewportMetrics?
 
     init(source: String) {
         var created: OpaquePointer?
@@ -168,6 +177,7 @@ private final class RustCompositionBridge {
         }
         precondition(status == 0, "Rust composition source reset failed: \(status)")
         hasOverlay = false
+        viewportMetrics = nil
     }
 
     func begin(replacement: NSRange, preedit: String, selection: NSRange) {
@@ -333,21 +343,35 @@ private final class RustCompositionBridge {
         return commandResult(result)
     }
 
+    func setViewportMetrics(_ metrics: RustViewportMetrics) {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        guard viewportMetrics != metrics else { return }
+        let status = yu_composition_session_set_viewport_config(
+            session,
+            revision(),
+            Float(metrics.maxWidth),
+            Float(metrics.lineHeight),
+            Float(metrics.defaultAdvance),
+            Float(metrics.estimatedBlockHeight),
+            Float(metrics.overscan)
+        )
+        precondition(status == 0, "Rust viewport metrics update failed: \(status)")
+        viewportMetrics = metrics
+    }
+
     func caretScrollRequest(
         scrollY: CGFloat,
         viewportHeight: CGFloat,
-        margin: CGFloat,
-        scale: CGFloat = 1
+        margin: CGFloat
     ) -> RustCaretScrollResult {
         guard let session else { preconditionFailure("Rust composition session is missing") }
-        precondition(scale.isFinite && scale > 0, "caret scroll scale must be positive")
         var result = YuEditorCaretScrollRequest()
         let status = yu_composition_session_caret_scroll_request(
             session,
             revision(),
-            Float(scrollY / scale),
-            Float(viewportHeight / scale),
-            Float(margin / scale),
+            Float(scrollY),
+            Float(viewportHeight),
+            Float(margin),
             &result
         )
         precondition(status == 0, "Rust caret scroll request failed: \(status)")
@@ -355,13 +379,13 @@ private final class RustCompositionBridge {
             revision: result.revision,
             source: Int(result.source_utf16),
             block: Int(result.block_index),
-            caretX: CGFloat(result.caret_x) * scale,
-            caretY: CGFloat(result.caret_y) * scale,
-            caretWidth: CGFloat(result.caret_width) * scale,
-            caretHeight: CGFloat(result.caret_height) * scale,
-            currentScrollY: CGFloat(result.current_scroll_y) * scale,
-            targetScrollY: CGFloat(result.target_scroll_y) * scale,
-            margin: CGFloat(result.margin) * scale,
+            caretX: CGFloat(result.caret_x),
+            caretY: CGFloat(result.caret_y),
+            caretWidth: CGFloat(result.caret_width),
+            caretHeight: CGFloat(result.caret_height),
+            currentScrollY: CGFloat(result.current_scroll_y),
+            targetScrollY: CGFloat(result.target_scroll_y),
+            margin: CGFloat(result.margin),
             needsScroll: result.needs_scroll != 0
         )
     }
@@ -1079,6 +1103,15 @@ final class TextInputView: NSView, NSTextInputClient {
             with: attributedString(from: source, marked: false)
         )
         rustComposition.resetSource(source)
+        rustComposition.setViewportMetrics(
+            RustViewportMetrics(
+                maxWidth: 80,
+                lineHeight: 1,
+                defaultAdvance: 1,
+                estimatedBlockHeight: 1,
+                overscan: 0
+            )
+        )
         selection = NSRange(location: source.utf16.count, length: 0)
         selectionAffinity = .downstream
         rustComposition.setSelection(selection, affinity: selectionAffinity)
@@ -1706,9 +1739,8 @@ final class TextInputView: NSView, NSTextInputClient {
         )
     }
 
-    /// Bridges native TextKit points to the logical units used by Rust layout.
-    /// The spike uses one Rust line-height unit; the real engine will replace
-    /// this scale with shared shaped-layout metrics.
+    /// Publishes the native TextKit metrics used by the metrics-only Rust
+    /// viewport backend, keeping both sides in the same point-based units.
     private func synchronizeViewport() {
         guard let viewportAdapter, !synchronizingViewport, !hasMarkedText() else { return }
         synchronizingViewport = true
@@ -1716,6 +1748,7 @@ final class TextInputView: NSView, NSTextInputClient {
 
         updateContainerSize()
         layoutManager.ensureLayout(for: textContainer)
+        rustComposition.setViewportMetrics(nativeViewportMetrics())
         let usedRect = layoutManager.usedRect(for: textContainer)
         let extraLineRect = layoutManager.extraLineFragmentUsedRect
         let usedBottom = max(usedRect.maxY, extraLineRect.maxY)
@@ -1725,14 +1758,34 @@ final class TextInputView: NSView, NSTextInputClient {
         viewportAdapter.configure(revision: revision, contentHeight: contentHeight)
 
         let metrics = viewportAdapter.viewportMetrics()
-        let scale = nativeLineHeight()
         let request = rustComposition.caretScrollRequest(
             scrollY: metrics.scrollY,
             viewportHeight: metrics.height,
-            margin: 8,
-            scale: scale
+            margin: 8
         )
         _ = viewportAdapter.apply(request, currentRevision: revision)
+    }
+
+    private func nativeViewportMetrics() -> RustViewportMetrics {
+        let lineHeight = nativeLineHeight()
+        let defaultAdvance = nativeFallbackAdvance()
+        return RustViewportMetrics(
+            maxWidth: quantized(max(textContainer.containerSize.width, 1)),
+            lineHeight: quantized(lineHeight),
+            defaultAdvance: quantized(defaultAdvance),
+            estimatedBlockHeight: quantized(lineHeight),
+            overscan: quantized(lineHeight * 2)
+        )
+    }
+
+    private func nativeFallbackAdvance() -> CGFloat {
+        let sample = "M中🙂"
+        let width = (sample as NSString).size(withAttributes: defaultAttributes).width
+        return max(width / CGFloat(sample.count), 1)
+    }
+
+    private func quantized(_ value: CGFloat) -> CGFloat {
+        (value * 100).rounded() / 100
     }
 
     private func nativeLineHeight() -> CGFloat {
