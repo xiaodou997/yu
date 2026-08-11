@@ -40,6 +40,7 @@
 
 ## 限制
 
-当前 allowlist 仍不包含 Option/Control word navigation、上下移动、page movement 或完整
-`validateMenuItem`/菜单 registry；这些命令必须先在 Rust editor model 中定义，再扩展同一桥接。
+当前 allowlist 仍不包含上下移动、page movement 或完整 `validateMenuItem`/菜单 registry；
+Option/Control word navigation 已由 ADR 0050 定义。其他命令必须先在 Rust editor model 中定义，
+再扩展同一桥接。
 未知 Selector 仍依赖 AppKit 默认路径，产品窗口和菜单 UI 不属于本阶段。

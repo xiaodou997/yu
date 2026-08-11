@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete, UnicodeSegmentation};
 use yu_core::{ByteOffset, Utf16Range};
 use yu_text::TextSnapshot;
 
@@ -15,6 +15,8 @@ pub enum EditorCommand {
     DeleteForward,
     MoveLeft,
     MoveRight,
+    MoveWordLeft,
+    MoveWordRight,
     InsertNewline,
     IndentList,
     OutdentList,
@@ -105,6 +107,16 @@ impl EditorCommand {
     #[must_use]
     pub const fn redo() -> Self {
         Self::Redo
+    }
+
+    #[must_use]
+    pub const fn move_word_left() -> Self {
+        Self::MoveWordLeft
+    }
+
+    #[must_use]
+    pub const fn move_word_right() -> Self {
+        Self::MoveWordRight
     }
 }
 
@@ -255,6 +267,35 @@ pub(crate) fn next_grapheme_boundary(
     }
 }
 
+/// Moves to the start of the preceding UAX word-boundary segment.
+///
+/// Whitespace segments are skipped; punctuation, symbols and emoji remain
+/// individually navigable segments instead of being silently merged into a
+/// neighboring alphanumeric word.
+pub(crate) fn previous_word_boundary(text: &str, offset: usize) -> usize {
+    let prefix = &text[..offset];
+    for (start, segment) in prefix.split_word_bound_indices().rev() {
+        if !segment.chars().all(char::is_whitespace) {
+            return start;
+        }
+    }
+    0
+}
+
+/// Moves to the end of the next UAX word-boundary segment.
+///
+/// Leading whitespace is skipped so Option/Control-right behaves like a word
+/// command rather than stopping once on every space run.
+pub(crate) fn next_word_boundary(text: &str, offset: usize) -> usize {
+    let suffix = &text[offset..];
+    for (start, segment) in suffix.split_word_bound_indices() {
+        if !segment.chars().all(char::is_whitespace) {
+            return offset + start + segment.len();
+        }
+    }
+    text.len()
+}
+
 fn validated_offsets(
     snapshot: &TextSnapshot,
     offset: ByteOffset,
@@ -395,6 +436,30 @@ mod tests {
                 "backend {backend}"
             );
         }
+    }
+
+    #[test]
+    fn word_boundaries_skip_whitespace_but_keep_symbols_as_segments() {
+        let text = "hello  世界🙂!";
+        assert_eq!(
+            previous_word_boundary(text, text.len()),
+            "hello  世界🙂".len()
+        );
+        assert_eq!(
+            previous_word_boundary(text, "hello  世界🙂".len()),
+            "hello  世界".len()
+        );
+        assert_eq!(
+            previous_word_boundary(text, "hello  世界".len()),
+            "hello  世".len()
+        );
+        assert_eq!(previous_word_boundary(text, "hello  ".len()), 0);
+        assert_eq!(next_word_boundary(text, 0), "hello".len());
+        assert_eq!(next_word_boundary(text, "hello".len()), "hello  世".len());
+        assert_eq!(
+            next_word_boundary(text, "hello  世界".len()),
+            "hello  世界🙂".len()
+        );
     }
 
     #[test]

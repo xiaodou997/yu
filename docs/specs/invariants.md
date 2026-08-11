@@ -83,6 +83,9 @@
 17. macOS `doCommand(by:)` 只能将明确 allowlist 的 Selector 映射到共享 `EditorCommand`；只读
     availability 查询不得推进 Revision 或改变 selection/history，活动 composition 时永久
     command 必须不可用。未知 Selector 必须回退平台默认路径，不能直接改 TextKit mirror。
+18. `MoveWordLeft/Right` 必须使用 Unicode word-boundary segment，并保持 UTF-8 source boundary；
+    空白可被跨越，标点/符号/emoji 不得静默并入相邻字母词。word movement 只能改变 selection，
+    不得推进 Revision 或写入 history；非连续 Snapshot 不得因单次移动被 `as_str()` 全量物化。
 
 ## Accessibility
 

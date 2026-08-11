@@ -49,6 +49,7 @@
 - [x] 平台无关 key command map、FFI command result 与 macOS Cmd-Z/Cmd-Shift-Z/native keyDown 路由
 - [x] command result 的 None/Range/Full source sync 与 macOS TextKit 局部 mirror 更新
 - [x] macOS `doCommand(by:)` Selector allowlist、Rust execute bridge 与 command availability 查询
+- [x] Unicode `MoveWordLeft/Right`、macOS Option-←/→ key route 与 Selector bridge
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -191,6 +192,9 @@
 39. macOS 已允许的 `doCommand(by:)` Selector 必须先通过 Rust availability 查询，再消费同一
     `YuEditorCommandResult`；未知 Selector 回退平台默认路径，marked text 期间永久 Selector 不得
     修改 canonical source，availability 查询本身不得修改 Revision、selection 或 history。
+40. Word movement 必须在 Unicode word-boundary segment 上保持稳定 selection 映射，Option/Control
+    key route 与 Selector 必须共用 `MoveWordLeft/Right`；命令不得生成 Transaction，也不得为一次
+    移动物化整个 Piece Tree/Rope Snapshot。
 
 ## 非目标
 

@@ -46,6 +46,8 @@ pub const YU_EDITOR_COMMAND_DELETE_BACKWARD: u8 = 1;
 pub const YU_EDITOR_COMMAND_DELETE_FORWARD: u8 = 2;
 pub const YU_EDITOR_COMMAND_MOVE_LEFT: u8 = 3;
 pub const YU_EDITOR_COMMAND_MOVE_RIGHT: u8 = 4;
+pub const YU_EDITOR_COMMAND_MOVE_WORD_LEFT: u8 = 11;
+pub const YU_EDITOR_COMMAND_MOVE_WORD_RIGHT: u8 = 12;
 pub const YU_EDITOR_COMMAND_INSERT_NEWLINE: u8 = 5;
 pub const YU_EDITOR_COMMAND_INDENT_LIST: u8 = 6;
 pub const YU_EDITOR_COMMAND_OUTDENT_LIST: u8 = 7;
@@ -218,6 +220,8 @@ fn editor_command_from_ffi(command: u8, block: u64) -> Result<EditorCommand, i32
         YU_EDITOR_COMMAND_DELETE_FORWARD => Ok(EditorCommand::DeleteForward),
         YU_EDITOR_COMMAND_MOVE_LEFT => Ok(EditorCommand::MoveLeft),
         YU_EDITOR_COMMAND_MOVE_RIGHT => Ok(EditorCommand::MoveRight),
+        YU_EDITOR_COMMAND_MOVE_WORD_LEFT => Ok(EditorCommand::move_word_left()),
+        YU_EDITOR_COMMAND_MOVE_WORD_RIGHT => Ok(EditorCommand::move_word_right()),
         YU_EDITOR_COMMAND_INSERT_NEWLINE => Ok(EditorCommand::insert_newline()),
         YU_EDITOR_COMMAND_INDENT_LIST => Ok(EditorCommand::indent_list()),
         YU_EDITOR_COMMAND_OUTDENT_LIST => Ok(EditorCommand::outdent_list()),
@@ -1258,6 +1262,49 @@ mod tests {
         assert_eq!(
             unsafe { yu_composition_session_command_available(handle, 255, 0, &mut available) },
             YU_FFI_INVALID_COMMAND
+        );
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_key_route_maps_macos_option_word_movement() {
+        let handle = session("hello world");
+        let mut result = YuEditorCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_route_key(
+                    handle,
+                    YU_KEY_LEFT,
+                    0,
+                    YU_KEY_MODIFIER_OPTION,
+                    &mut result,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (
+                result.selection_start_utf16,
+                result.selection_end_utf16,
+                result.changed
+            ),
+            (6, 6, 0)
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_route_key(
+                    handle,
+                    YU_KEY_RIGHT,
+                    0,
+                    YU_KEY_MODIFIER_OPTION,
+                    &mut result,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (result.selection_start_utf16, result.selection_end_utf16),
+            (11, 11)
         );
         unsafe { yu_composition_session_destroy(handle) };
     }

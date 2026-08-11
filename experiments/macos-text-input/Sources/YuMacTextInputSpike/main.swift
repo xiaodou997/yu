@@ -50,6 +50,8 @@ private enum YuNativeCommand {
     static let deleteForward = UInt8(YU_EDITOR_COMMAND_DELETE_FORWARD)
     static let moveLeft = UInt8(YU_EDITOR_COMMAND_MOVE_LEFT)
     static let moveRight = UInt8(YU_EDITOR_COMMAND_MOVE_RIGHT)
+    static let moveWordLeft = UInt8(YU_EDITOR_COMMAND_MOVE_WORD_LEFT)
+    static let moveWordRight = UInt8(YU_EDITOR_COMMAND_MOVE_WORD_RIGHT)
     static let insertNewline = UInt8(YU_EDITOR_COMMAND_INSERT_NEWLINE)
     static let indentList = UInt8(YU_EDITOR_COMMAND_INDENT_LIST)
     static let outdentList = UInt8(YU_EDITOR_COMMAND_OUTDENT_LIST)
@@ -825,6 +827,19 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(textStorage.string == base, "doCommand delete must restore the source")
 
         insertText("z", replacementRange: notFoundRange)
+        let insertedSelection = selection
+        precondition(
+            rustComposition.commandAvailable(command: YuNativeCommand.moveWordLeft),
+            "Selector word-left should be reported as available"
+        )
+        doCommand(by: #selector(NSResponder.moveWordLeft(_:)))
+        precondition(selection.location < insertedSelection.location, "word-left must move the caret")
+        doCommand(by: #selector(NSResponder.moveWordRight(_:)))
+        precondition(selection == insertedSelection, "word-right must restore the caret")
+        doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+        precondition(textStorage.string == base, "word Selector commands must preserve the source")
+
+        insertText("z", replacementRange: notFoundRange)
         let afterInsert = textStorage.string
 
         guard
@@ -1025,6 +1040,10 @@ final class TextInputView: NSView, NSTextInputClient {
             nativeCommand = YuNativeCommand.moveLeft
         case #selector(NSResponder.moveRight(_:)):
             nativeCommand = YuNativeCommand.moveRight
+        case #selector(NSResponder.moveWordLeft(_:)):
+            nativeCommand = YuNativeCommand.moveWordLeft
+        case #selector(NSResponder.moveWordRight(_:)):
+            nativeCommand = YuNativeCommand.moveWordRight
         case #selector(NSResponder.insertNewline(_:)):
             nativeCommand = YuNativeCommand.insertNewline
         default:

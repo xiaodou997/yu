@@ -155,6 +155,11 @@ AppKit 的 `doCommand(by:)` 也走同一边界：实验只允许删除、前后�
 查询上下文，再按同一个 `YuEditorCommandResult` 更新 mirror。取消 composition 是唯一不经过
 永久 command 的 Selector；未知 Selector 交还 `super`，活动 marked text 时不执行永久命令。
 
+左右 word movement 使用同一 `EditorKey` 加 Option/Control modifier 映射到
+`MoveWordLeft/MoveWordRight`。Rust 只读取 caret 所在行和必要的相邻行，通过 Unicode word-boundary
+segment 跳过空白、保留标点/符号/emoji 的独立边界；该命令只改变 revision-bound selection，不
+生成 Transaction，也不调用 `TextSnapshot::as_str()` 物化整份非连续 source。
+
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。
 它通过 `yu-markdown::parse_inline` 或 definition-aware 的
