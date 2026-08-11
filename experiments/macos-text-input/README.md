@@ -53,6 +53,12 @@ swift run --package-path experiments/macos-text-input YuMacTextInputSpike
 文本应至少产生 4 个视觉行、一个软换行 affinity split，并通过 local point 与 screen point 两条
 hit-test 路径。硬行末按 TextKit 语义规范化为 LF 后 offset + upstream affinity。
 
+随后运行 `Shaped layout self-check`：Rust 通过 CoreText system UI shaper 和共享 `yu-layout`
+返回 source-backed UTF-16 line ranges，Swift 将行数与范围逐条和 TextKit line fragments 比较。
+共享布局额外保留的 zero-width trailing caret line 会单独校验为零宽，不计入 TextKit
+source-consuming line fragment 数量。这是 plain-source 的诊断 probe，不改变 source/Revision，
+也不代表 Markdown hidden syntax 或最终 shaped viewport 已经接入。
+
 启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
 和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
 

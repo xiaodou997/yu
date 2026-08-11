@@ -105,6 +105,10 @@
     `max_width`/`line_height`/`default_advance`/estimate/overscan 必须拒绝且保留旧配置，成功
     配置不得推进 source、selection 或 history。metrics-only layout 的 `default_advance` 必须
     进入 `LayoutConfig`/`LayoutCache` identity，shaped backend 可独立替换它。
+24. shaped layout 的每个 visual line 必须拥有有序、非重叠且 source-backed 的 source range；
+    触发 wrap 的 glyph 不能扩展上一行。CoreText shaped-line diagnostic FFI 返回的 UTF-16
+    range/width 必须是 owned 值，count/fill 容量不足必须返回明确 status，且诊断查询不得
+    修改 canonical source、selection、history 或 Revision。
 
 ## Accessibility
 

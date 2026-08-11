@@ -407,6 +407,47 @@ private final class RustCompositionBridge {
         )
     }
 
+    func coreTextSystemUiShapedLines(
+        size: CGFloat,
+        maxWidth: CGFloat,
+        source: String
+    ) -> [YuCoreTextShapedLine] {
+        let sourceBytes = Array(source.utf8)
+        var required = 0
+        let countStatus = sourceBytes.withUnsafeBufferPointer { sourceBuffer in
+            yu_macos_core_text_shaped_lines(
+                Float(size),
+                Float(maxWidth),
+                sourceBuffer.baseAddress,
+                sourceBuffer.count,
+                nil,
+                0,
+                &required
+            )
+        }
+        precondition(countStatus == 0, "CoreText shaped line count failed: \(countStatus)")
+        guard required > 0 else { return [] }
+
+        var lines = [YuCoreTextShapedLine](repeating: YuCoreTextShapedLine(), count: required)
+        var written = 0
+        let fillStatus = sourceBytes.withUnsafeBufferPointer { sourceBuffer in
+            lines.withUnsafeMutableBufferPointer { lineBuffer in
+                yu_macos_core_text_shaped_lines(
+                    Float(size),
+                    Float(maxWidth),
+                    sourceBuffer.baseAddress,
+                    sourceBuffer.count,
+                    lineBuffer.baseAddress,
+                    lineBuffer.count,
+                    &written
+                )
+            }
+        }
+        precondition(fillStatus == 0, "CoreText shaped line fill failed: \(fillStatus)")
+        precondition(written == required, "CoreText shaped line count changed during fill")
+        return lines
+    }
+
     func caretScrollRequest(
         scrollY: CGFloat,
         viewportHeight: CGFloat,
@@ -1351,6 +1392,76 @@ final class TextInputView: NSView, NSTextInputClient {
         )
     }
 
+    func runShapedLayoutComparisonSelfCheck() {
+        updateContainerSize()
+        layoutManager.ensureLayout(for: textContainer)
+        let glyphRange = layoutManager.glyphRange(for: textContainer)
+        var nativeRanges = [NSRange]()
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) {
+            _, _, _, lineGlyphRange, _ in
+            nativeRanges.append(
+                self.layoutManager.characterRange(
+                    forGlyphRange: lineGlyphRange,
+                    actualGlyphRange: nil
+                )
+            )
+        }
+
+        let font = defaultAttributes[.font] as? NSFont ?? NSFont.systemFont(ofSize: 22)
+        let rustLines = rustComposition.coreTextSystemUiShapedLines(
+            size: font.pointSize,
+            maxWidth: textContainer.containerSize.width,
+            source: textStorage.string
+        )
+        let rustRanges = rustLines
+            .map { "\($0.source_start_utf16)..\($0.source_end_utf16)" }
+            .joined(separator: ",")
+        let nativeRangeDescription = nativeRanges
+            .map { "\($0.location)..\(NSMaxRange($0))" }
+            .joined(separator: ",")
+        let rustSourceLines = rustLines.filter {
+            $0.source_start_utf16 != $0.source_end_utf16
+        }
+        precondition(
+            rustLines.allSatisfy {
+                $0.source_start_utf16 <= $0.source_end_utf16
+                    && $0.width.isFinite
+                    && $0.width >= 0
+            },
+            "Rust shaped lines must have ordered ranges and finite nonnegative widths"
+        )
+        precondition(
+            rustLines.filter { $0.source_start_utf16 == $0.source_end_utf16 }
+                .allSatisfy { $0.width == 0 },
+            "Rust trailing caret lines must be zero width"
+        )
+        let rustSourceRangeDescription = rustSourceLines
+            .map { "\($0.source_start_utf16)..\($0.source_end_utf16)" }
+            .joined(separator: ",")
+        precondition(
+            rustSourceLines.count == nativeRanges.count,
+            "Rust/TextKit shaped source line count mismatch: rust=\(rustSourceLines.count) "
+                + "native=\(nativeRanges.count) rustRanges=\(rustSourceRangeDescription) "
+                + "nativeRanges=\(nativeRangeDescription)"
+        )
+        for (index, line) in rustSourceLines.enumerated() {
+            let rustRange = NSRange(
+                location: Int(line.source_start_utf16),
+                length: Int(line.source_end_utf16 - line.source_start_utf16)
+            )
+            precondition(
+                rustRange == nativeRanges[index],
+                "Rust/TextKit shaped line range mismatch at \(index): rust=\(rustRange) native=\(nativeRanges[index])"
+            )
+            precondition(line.width.isFinite && line.width >= 0, "Rust shaped line width is invalid")
+        }
+        print(
+            "Shaped layout self-check sourceLines=\(rustSourceLines.count) "
+                + "trailingCaretLines=\(rustLines.count - rustSourceLines.count) "
+                + "ranges=\(rustRanges)"
+        )
+    }
+
     func runUnicodeCompositionSelfCheck() {
         let savedStorage = NSAttributedString(attributedString: textStorage)
         let savedSelection = selection
@@ -1949,6 +2060,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeFirstResponder(inputView)
         inputView.attachViewportAdapter(YuNativeViewportAdapter(scrollView: scrollView))
         inputView.runLayoutRoundTripSelfCheck()
+        inputView.runShapedLayoutComparisonSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
         inputView.runNativeCommandRoutingSelfCheck()
         inputView.runViewportScrollSelfCheck()

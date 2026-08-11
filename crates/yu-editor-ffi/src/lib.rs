@@ -29,6 +29,7 @@ pub const YU_FFI_INVALID_COMMAND: i32 = 10;
 pub const YU_FFI_INVALID_KEY: i32 = 11;
 pub const YU_FFI_INVALID_VIEWPORT_CONFIG: i32 = 12;
 pub const YU_FFI_CORE_TEXT_UNAVAILABLE: i32 = 13;
+pub const YU_FFI_LAYOUT_FAILED: i32 = 14;
 pub const YU_COMMAND_UNAVAILABLE: u8 = 0;
 pub const YU_COMMAND_AVAILABLE: u8 = 1;
 pub const YU_SOURCE_SYNC_NONE: u8 = 0;
@@ -107,6 +108,17 @@ pub struct YuEditorCaretScrollRequest {
 pub struct YuCoreTextViewportMetrics {
     pub line_height: f32,
     pub default_advance: f32,
+}
+
+/// One source-backed line returned by the macOS CoreText shaped-layout probe.
+/// Ranges use UTF-16 units so AppKit/TextKit can compare them without a second
+/// native coordinate conversion.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuCoreTextShapedLine {
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub width: f32,
 }
 
 /// Opaque state owned by the Rust side of the native composition bridge.
@@ -955,6 +967,72 @@ pub unsafe extern "C" fn yu_macos_core_text_system_ui_viewport_metrics(
     }
 }
 
+/// Builds a diagnostic shaped layout with the macOS system UI font and copies
+/// its source-backed line ranges/widths into caller-owned storage. This does
+/// not mutate an editor session and is intended for comparing the shared Rust
+/// layout contract with TextKit before a shaped viewport becomes canonical.
+///
+/// A zero-capacity call with a non-null `written` pointer returns the required
+/// line count. If `capacity` is too small, the function writes the required
+/// count and returns [`YU_FFI_BUFFER_TOO_SMALL`].
+///
+/// # Safety
+/// `source` must point to readable UTF-8 bytes for its length (unless the
+/// length is zero), `output` must point to `capacity` writable line values when
+/// `capacity > 0`, and `written` must point to writable storage for one count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_macos_core_text_shaped_lines(
+    size: f32,
+    max_width: f32,
+    source: *const u8,
+    source_length: usize,
+    output: *mut YuCoreTextShapedLine,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    if written.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    if capacity > 0 && output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: written was checked for null and belongs to the caller.
+    unsafe { *written = 0 };
+
+    #[cfg(target_os = "macos")]
+    {
+        let source = match read_utf8(source, source_length) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let lines = match query_core_text_shaped_lines(source, size, max_width) {
+            Ok(lines) => lines,
+            Err(status) => return status,
+        };
+        // SAFETY: written was checked for null and belongs to the caller.
+        unsafe { *written = lines.len() };
+        if capacity == 0 {
+            return YU_FFI_OK;
+        }
+        if lines.len() > capacity {
+            return YU_FFI_BUFFER_TOO_SMALL;
+        }
+        if lines.is_empty() {
+            return YU_FFI_OK;
+        }
+        // SAFETY: capacity was checked against the number of values and output
+        // was checked for null when capacity was non-zero.
+        unsafe { ptr::copy_nonoverlapping(lines.as_ptr(), output, lines.len()) };
+        YU_FFI_OK
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (size, max_width, source, source_length, output, capacity);
+        YU_FFI_CORE_TEXT_UNAVAILABLE
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn query_core_text_viewport_metrics(
     request: FontRequest,
@@ -970,6 +1048,48 @@ fn query_core_text_viewport_metrics(
     shaper
         .viewport_metrics(sample)
         .map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)
+}
+
+#[cfg(target_os = "macos")]
+fn query_core_text_shaped_lines(
+    source: &str,
+    size: f32,
+    max_width: f32,
+) -> Result<Vec<YuCoreTextShapedLine>, i32> {
+    let request = FontRequest::new("System UI", size).map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    let shaper =
+        CoreTextShaper::from_system_ui(request).map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    let metrics = shaper
+        .viewport_metrics("M中🙂e\u{301}")
+        .map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    if !max_width.is_finite() || max_width <= 0.0 {
+        return Err(YU_FFI_LAYOUT_FAILED);
+    }
+    let config = LayoutConfig::new(max_width, metrics.line_height())
+        .with_default_advance(metrics.default_advance());
+    let mut document = EditorDocument::new(source.to_owned());
+    let snapshot = document.snapshot();
+    let block_count = document.markdown().blocks().len();
+    let mut lines = Vec::new();
+    for index in 0..block_count {
+        let layout = document
+            .block_layout_with_shaper(index, config, &shaper)
+            .map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+        for line in layout.lines() {
+            let start = snapshot
+                .utf16_offset(line.source().start())
+                .map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+            let end = snapshot
+                .utf16_offset(line.source().end())
+                .map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+            lines.push(YuCoreTextShapedLine {
+                source_start_utf16: start.get(),
+                source_end_utf16: end.get(),
+                width: line.width(),
+            });
+        }
+    }
+    Ok(lines)
 }
 
 /// Resolves the current focus caret and returns an absolute document-space
@@ -1247,6 +1367,75 @@ mod tests {
         );
         assert!(metrics.line_height.is_finite() && metrics.line_height > 0.0);
         assert!(metrics.default_advance.is_finite() && metrics.default_advance > 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_core_text_shaped_lines_round_trip_utf16_ranges() {
+        let source = "Yu 中文🙂 line that wraps\nsecond line";
+        let mut required = 0_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_shaped_lines(
+                    22.0,
+                    120.0,
+                    source.as_bytes().as_ptr(),
+                    source.len(),
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert!(required >= 2);
+
+        let mut short = vec![YuCoreTextShapedLine::default(); required - 1];
+        let mut short_written = 0_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_shaped_lines(
+                    22.0,
+                    120.0,
+                    source.as_bytes().as_ptr(),
+                    source.len(),
+                    short.as_mut_ptr(),
+                    short.len(),
+                    &mut short_written,
+                )
+            },
+            YU_FFI_BUFFER_TOO_SMALL
+        );
+        assert_eq!(short_written, required);
+
+        let mut lines = vec![YuCoreTextShapedLine::default(); required];
+        let mut written = 0_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_shaped_lines(
+                    22.0,
+                    120.0,
+                    source.as_bytes().as_ptr(),
+                    source.len(),
+                    lines.as_mut_ptr(),
+                    lines.len(),
+                    &mut written,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(written, required);
+        assert!(lines.windows(2).all(|pair| {
+            pair[0].source_start_utf16 <= pair[0].source_end_utf16
+                && pair[0].source_end_utf16 <= pair[1].source_start_utf16
+                && pair[0].width.is_finite()
+                && pair[1].width.is_finite()
+        }));
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.source_end_utf16 == source.encode_utf16().count() as u64)
+        );
     }
 
     #[test]

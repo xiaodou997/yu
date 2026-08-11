@@ -250,6 +250,16 @@ block 结构变化则保守失效；切换 metrics/shaped backend 会把已测�
 `ShapingProvider`，glyph advance 参与 line breaking，但不改变 source/visual 坐标。未来原生
 backend 可以替换它而不改变 layout 的 source/visual 坐标。
 
+在正式 GUI 之前，macOS spike 还提供一个只读的 shaped-line comparison probe：
+`yu-editor-ffi::yu_macos_core_text_shaped_lines` 使用同一份 UTF-8 source、System UI
+CoreText shaper 和 native point width，返回 owned 的 UTF-16 source line ranges 与宽度。
+Swift 侧把这些范围与 TextKit line fragments 逐行比较；count/fill ABI 不携带任何
+CoreText 对象，也不推进 `EditorDocument` Revision。比较时会过滤共享 editor layout 保留的
+zero-width trailing caret line；这些行必须仍然有序、宽度为零，但不属于 TextKit 的 source-
+consuming line fragments。该 probe 同时约束 `yu-layout` 的 source range 不重叠规则，但目前
+只覆盖 plain source，Markdown hidden syntax、复杂 fallback 和最终 shaped viewport 仍需后续
+projection/layout 契约。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

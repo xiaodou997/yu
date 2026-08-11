@@ -894,8 +894,8 @@ impl LayoutSnapshot {
         let mut last_was_break = false;
 
         for run in runs {
-            line_source_end = line_source_end.max(run.source().end());
             if let VisualRunKind::LineBreak { .. } = run.kind() {
+                line_source_end = line_source_end.max(run.source().end());
                 let visual_end = run.visual().end();
                 self.clusters.push(VisualCluster {
                     source: run.source(),
@@ -925,6 +925,7 @@ impl LayoutSnapshot {
                 continue;
             }
             if run.kind() != VisualRunKind::Visible {
+                line_source_end = line_source_end.max(run.source().end());
                 continue;
             }
             let text = read_source_range(&source, run.source())?;
@@ -940,9 +941,9 @@ impl LayoutSnapshot {
                     TextRange::new(source_start, source_end).ok_or(LayoutError::OffsetOverflow)?;
                 let cluster_visual = VisualRange::new(visual_start, visual_end)
                     .ok_or(LayoutError::OffsetOverflow)?;
-                line_source_end = line_source_end.max(source_end);
 
                 if cluster_text.contains('\n') {
+                    line_source_end = line_source_end.max(source_end);
                     self.clusters.push(VisualCluster {
                         source: cluster_source,
                         visual: cluster_visual,
@@ -992,6 +993,7 @@ impl LayoutSnapshot {
                     line_visual_start = visual_start;
                     line_width = 0.0;
                 }
+                line_source_end = line_source_end.max(source_end);
                 self.clusters.push(VisualCluster {
                     source: cluster_source,
                     visual: cluster_visual,
@@ -1043,8 +1045,8 @@ impl LayoutSnapshot {
         let mut last_was_break = false;
 
         for run in runs {
-            line_source_end = line_source_end.max(run.source().end());
             if let VisualRunKind::LineBreak { .. } = run.kind() {
+                line_source_end = line_source_end.max(run.source().end());
                 let visual_end = run.visual().end();
                 self.clusters.push(VisualCluster {
                     source: run.source(),
@@ -1074,6 +1076,7 @@ impl LayoutSnapshot {
                 continue;
             }
             if run.kind() != VisualRunKind::Visible {
+                line_source_end = line_source_end.max(run.source().end());
                 continue;
             }
             let text = read_source_range(&source, run.source())?;
@@ -1123,9 +1126,8 @@ impl LayoutSnapshot {
                     if !glyph.x_offset().is_finite() || !glyph.y_offset().is_finite() {
                         return Err(LayoutError::Shaping("glyph offsets must be finite".into()));
                     }
-                    line_source_end = line_source_end.max(glyph_source.end());
-
                     if is_line_break {
+                        line_source_end = line_source_end.max(glyph_source.end());
                         self.clusters.push(VisualCluster {
                             source: glyph_source,
                             visual: cluster_visual,
@@ -1171,6 +1173,7 @@ impl LayoutSnapshot {
                         line_visual_start = cluster_visual.start();
                         line_width = 0.0;
                     }
+                    line_source_end = line_source_end.max(glyph_source.end());
                     let glyph_x = line_width + glyph.x_offset();
                     let glyph_y = self.baseline_for_line(line_index)? + glyph.y_offset();
                     if !glyph_x.is_finite() || !glyph_y.is_finite() {
@@ -1607,6 +1610,14 @@ mod tests {
         assert_eq!(layout.lines().len(), 2);
         assert_eq!(layout.clusters().len(), 4);
         assert_eq!(layout.lines()[0].width(), 4.0);
+        assert_eq!(
+            layout.lines()[0].source(),
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("line range")
+        );
+        assert_eq!(
+            layout.lines()[1].source(),
+            TextRange::new(ByteOffset::new(2), ByteOffset::new(4)).expect("line range")
+        );
     }
 
     #[test]
@@ -1622,6 +1633,14 @@ mod tests {
 
         assert_eq!(layout.lines().len(), 2);
         assert_eq!(layout.lines()[0].width(), 4.0);
+        assert_eq!(
+            layout.lines()[0].source(),
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("line range")
+        );
+        assert_eq!(
+            layout.lines()[1].source(),
+            TextRange::new(ByteOffset::new(2), ByteOffset::new(4)).expect("line range")
+        );
         assert_eq!(layout.clusters().len(), 4);
         assert_eq!(layout.clusters()[0].source().len(), 1);
         assert_eq!(layout.clusters()[3].source().start().get(), 3);

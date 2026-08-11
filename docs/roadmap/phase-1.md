@@ -77,6 +77,7 @@
 - [x] `yu-editor` LayoutCache/ViewportLayout 区分 metrics 与 shaped backend
 - [x] macOS-only CoreText family catalog 与 fallback resolver（只返回安全字体元数据）
 - [x] macOS CoreText CTLine/CTRun shaping、UTF-16→UTF-8 cluster mapping 与 `yu-layout` smoke test
+- [x] macOS CoreText shaped-line FFI probe 与 TextKit UTF-16 line-range comparison
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -141,88 +142,93 @@
    将合法 UTF-16 string index 转换为 UTF-8 source cluster range，并让 `yu-layout` 的 shaped
    layout 消费这些 advance；RTL 或 non-monotonic 输出在当前布局契约下必须显式拒绝，不能静默
    重排 source range。
-21. CoreText rasterizer 必须通过真实 font metrics、glyph bounds/advance 和 alpha bitmap 测试；
+21. shaped line 的 source range 必须有序、非重叠并覆盖真实 line-break 所消费的 source；触发
+    wrap 的 glyph 只能归入新行。macOS shaped-line FFI 以 UTF-16 units 返回 owned range/width，
+    count/fill 两次调用必须处理容量不足和空结果，且 probe 不得改变 canonical source、
+    selection、history 或 Revision。当前 TextKit 比较仅是 plain-source 诊断，不是最终 shaped
+    viewport 等价性承诺。
+22. CoreText rasterizer 必须通过真实 font metrics、glyph bounds/advance 和 alpha bitmap 测试；
    `FontMetricsCache`/`GlyphAtlas` 的命中只能影响渲染准备，不能改变 source Revision、
    projection mapping 或 layout source ranges。CPU atlas page 可以被 renderer 上传，但本阶段
    不引入 GPU texture 生命周期。
-22. `yu-scene` 必须绑定 source Revision 并只保存 owned geometry/color/atlas placement；`yu-render`
+23. `yu-scene` 必须绑定 source Revision 并只保存 owned geometry/color/atlas placement；`yu-render`
    必须复制 scene 的 Revision/viewport，校验 stale atlas entry，并按 page fingerprint 去重 owned
    alpha upload。此阶段不得创建 window、GPU device 或 texture handle。
-23. shaped layout 的 glyph placement、scene append 和 render plan 必须存在无 GUI 的端到端测试：
+24. shaped layout 的 glyph placement、scene append 和 render plan 必须存在无 GUI 的端到端测试：
    placement 的 origin 与 render command 一致，同页 atlas 只 upload 一次；missing atlas、stale
    revision 或预算失败不得留下部分 scene。
-24. macOS backend 必须能在无窗口状态下验证 surface config/resize contract；native Metal device
+25. macOS backend 必须能在无窗口状态下验证 surface config/resize contract；native Metal device
    和 alpha texture upload 测试必须显式标记硬件前置条件，不能让无 Metal device 的默认 CI 失败。
-25. macOS clear-only frame 必须保持 queue/device 绑定，并对 drawable、command buffer、encoder
+26. macOS clear-only frame 必须保持 queue/device 绑定，并对 drawable、command buffer、encoder
    失败返回明确错误；完整 glyph/rect pipeline 不能隐式消费未验证的 RenderPlan commands。
-26. macOS `MetalFrameRenderer::render_plan` 必须在无窗口单元测试中验证 painter order、glyph
+27. macOS `MetalFrameRenderer::render_plan` 必须在无窗口单元测试中验证 painter order、glyph
    bounds、atlas UV 和缺页拒绝；在有 Metal device 的 session 中显式覆盖 pipeline creation、
    drawable acquisition、alpha sampling command encoding 和 present/commit。GPU 句柄只能存在
    `MetalAtlas`/backend，不能进入 shared render plan。
-27. AppKit attachment 必须只托管外部 `NSView` 的 backing layer，并在 scoped attachment drop 时
+28. AppKit attachment 必须只托管外部 `NSView` 的 backing layer，并在 scoped attachment drop 时
     有条件地恢复旧 layer；首次 frame/resize/target rebuild 后 full clear，稳定 revision 的后续
     frame 只在 backend-owned retained target 上清除并重绘裁剪后的 damage 区域，再 blit 到 drawable。
     无窗口单元测试必须验证 damage clipping 和 generation 状态转换。
-28. 有图形 session 时，ignored AppKit host probe 必须在 main thread 创建临时 host，完成至少一次
+29. 有图形 session 时，ignored AppKit host probe 必须在 main thread 创建临时 host，完成至少一次
     attach/render、resize/render 和 scoped detach；probe 失败不能被默认无窗口 workspace 测试误判为
     产品逻辑失败。
-29. block CST v1 的 block range 必须覆盖源码且不重叠；blockquote/list item 的 marker、depth 和
+30. block CST v1 的 block range 必须覆盖源码且不重叠；blockquote/list item 的 marker、depth 和
     lazy continuation 必须在 full parse 与 incremental parse 中一致，attached marker 不能误判为
     list item。
-30. inline CST 必须保留 punctuation、link/image label/destination 和 soft/hard line-break source
+31. inline CST 必须保留 punctuation、link/image label/destination 和 soft/hard line-break source
     ranges；flanking 失败的 delimiter、未闭合 link 和 escaped punctuation 不得生成错误 semantic
     span，full/incremental projection 输入必须保持同一源码覆盖。
-31. Projection 的 LineBreak run 必须保留 LF/CRLF source/visual range；hard-break 的尾随空格或
+32. Projection 的 LineBreak run 必须保留 LF/CRLF source/visual range；hard-break 的尾随空格或
     反斜杠只能作为零宽 hidden syntax，metrics 与 shaped layout 必须产生同样的 line/caret 映射。
-32. ReferenceLink/ReferenceImage/Autolink 必须由 parser-owned span 提供完整 opening/content/
+33. ReferenceLink/ReferenceImage/Autolink 必须由 parser-owned span 提供完整 opening/content/
     closing 与 reference/destination range；Projection 只能隐藏对应 syntax，不能把 `<div>` 或
     未闭合/shortcut 未解析结构误判为 semantic link。
-33. Reference definition block 必须保留整行/label/destination source ranges；shortcut 只有在同
+34. Reference definition block 必须保留整行/label/destination source ranges；shortcut 只有在同
     revision definition index 命中时才隐藏，definition fingerprint 变化必须使非局部 projection、
     layout 和 viewport cache 失效。
-34. task-list marker 必须在 full/incremental block parse 中保持 `[ ]`/`[x]`/`[X]` 状态和三字节
+35. task-list marker 必须在 full/incremental block parse 中保持 `[ ]`/`[x]`/`[X]` 状态和三字节
     source range；attached marker 不得误判。`BlockProjection::TaskList` 只能隐藏 marker，
     `toggle_task` 必须通过普通 Transaction 修改状态，并让 projection cache 在 Revision 变化后
     失效。
-35. list editing command 必须只读取当前 source line；非空 task Enter 生成 unchecked prefix，
+36. list editing command 必须只读取当前 source line；非空 task Enter 生成 unchecked prefix，
     ordered marker 在安全范围内递增，空项 Enter/Backspace 删除 prefix 并保留 line ending，
     Indent/Outdent 最多改动两个 ASCII 空格，所有结果都通过普通 Transaction 与 selection mapping
     验证。
-36. EditorHistory 必须只保留有界 inverse Transaction；连续输入/删除/列表操作按 group 聚合，
+37. EditorHistory 必须只保留有界 inverse Transaction；连续输入/删除/列表操作按 group 聚合，
     Undo 逆序、Redo 正序回放且不重复记录 history；移动 selection、composition 边界和新 edit
     必须正确断组或清空 redo。
-37. 原生 key route 必须在有 marked text 时让位于 NSTextInputClient；无映射 key 不得修改 source，
+38. 原生 key route 必须在有 marked text 时让位于 NSTextInputClient；无映射 key 不得修改 source，
     已映射 command 必须通过 `EditorDocument::execute` 返回同 Revision 的 UTF-16 selection 和
     CaretAffinity，Swift mirror 只能按该结果同步。
-38. 局部 command 必须返回输入/结果 Revision 各自的 UTF-16 source replacement range，Swift
+39. 局部 command 必须返回输入/结果 Revision 各自的 UTF-16 source replacement range，Swift
     只能复制新范围并替换旧范围；成组 Undo/Redo 使用 Full fallback。无变化 command 不得要求
     source copy，普通段落的 Tab/Shift-Tab 不得被 key route 吞掉。
-39. macOS 已允许的 `doCommand(by:)` Selector 必须先通过 Rust availability 查询，再消费同一
+40. macOS 已允许的 `doCommand(by:)` Selector 必须先通过 Rust availability 查询，再消费同一
     `YuEditorCommandResult`；未知 Selector 回退平台默认路径，marked text 期间永久 Selector 不得
     修改 canonical source，availability 查询本身不得修改 Revision、selection 或 history。
-40. Word movement 必须在 Unicode word-boundary segment 上保持稳定 selection 映射，Option/Control
+41. Word movement 必须在 Unicode word-boundary segment 上保持稳定 selection 映射，Option/Control
     key route 与 Selector 必须共用 `MoveWordLeft/Right`；命令不得生成 Transaction，也不得为一次
     移动物化整个 Piece Tree/Rope Snapshot。
-41. Up/Down 必须通过当前或相邻 block 的 `LayoutSnapshot` 往返 source caret，长行/短行/长行连续
+42. Up/Down 必须通过当前或相邻 block 的 `LayoutSnapshot` 往返 source caret，长行/短行/长行连续
     移动时保持 preferred-X；横向/word movement、edit、显式 selection 和 composition/reset 必须
     清除 preferred-X，macOS key route 与 `moveUp:`/`moveDown:` Selector 必须共用该 command，
     caret reveal 必须由 Rust 提供 revision-bound scroll request；macOS spike 的真实 `NSScrollView`
     host 只能通过 adapter 消费请求，native/Rust 单位换算必须集中在平台 bridge。
-42. `MoveUpExtend/MoveDownExtend` 必须保留 selection anchor、只更新 focus，并在 focus 回到 anchor
+43. `MoveUpExtend/MoveDownExtend` 必须保留 selection anchor、只更新 focus，并在 focus 回到 anchor
     时折叠；Shift key route 与 macOS modify-selection Selector 必须共用 FFI command id，命令不得
     生成 Transaction、Revision、history 或 SourceSync。
-43. `CaretScrollRequest` 必须包含当前 Revision、focus source/geometry、current/target scroll 和
+44. `CaretScrollRequest` 必须包含当前 Revision、focus source/geometry、current/target scroll 和
     `needs_scroll`；Rust 必须使用 focus block 的 layout 与 HeightIndex 计算并 clamp target，FFI
     必须拒绝 stale Revision，macOS spike 必须覆盖 reveal、visible no-op 和 top reveal。
-44. macOS native viewport consumer 必须只消费匹配 current Revision 的请求，将 absolute target 转成
+45. macOS native viewport consumer 必须只消费匹配 current Revision 的请求，将 absolute target 转成
     `NSClipView` bounds 并做最后 clamp；stale、no-op 和实际滚动都必须有无窗口 AppKit self-check，
     且 AppKit 对象不能进入 Rust ABI。
-45. macOS spike 的 `TextInputView` 必须作为真实 `NSScrollView.documentView` 运行；TextKit content
+46. macOS spike 的 `TextInputView` 必须作为真实 `NSScrollView.documentView` 运行；TextKit content
     height、当前 clip viewport 和 Rust request 必须按同一 Revision 同步，命令、selection 写回和
     IME commit 后都要触发 reveal。viewport width、CoreText system UI line height、shaped sample
     advance、estimated block height 和 overscan 必须通过 revision-bound FFI metrics 配置传递，
     request 不得再依赖 bridge scale。
-46. `yu_composition_session_set_viewport_config` 必须拒绝 stale Revision 和非法 metrics，成功时
+47. `yu_composition_session_set_viewport_config` 必须拒绝 stale Revision 和非法 metrics，成功时
     不得推进 source/selection/history；`LayoutConfig::default_advance` 必须进入 metrics layout
     cache key。FFI 与 macOS attached self-check 必须证明配置确实影响 wrapping/scroll target，
     但 fallback advance 不能冒充最终 shaped typography。
