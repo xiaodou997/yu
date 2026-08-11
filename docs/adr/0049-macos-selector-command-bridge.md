@@ -17,7 +17,8 @@
 ## 决策
 
 - Swift 维护一个很小的 Selector allowlist：`deleteBackward:`、`deleteForward:`、`moveLeft:`、
-  `moveRight:` 和 `insertNewline:` 映射到已有的 `YU_EDITOR_COMMAND_*` wire id。取消与
+  `moveRight:`、`moveWordLeft:`、`moveWordRight:`、`moveUp:`、`moveDown:` 和 `insertNewline:`
+  映射到已有的 `YU_EDITOR_COMMAND_*` wire id。取消与
   composition 状态相关的 `cancel:`/`cancelOperation:` 仍由 overlay cancel 路径处理。
 - allowlist Selector 在执行前调用 `yu_composition_session_command_available`。Rust 查询只读
   当前 `EditorDocument`：检查 composition、selection 边界、history 深度、list prefix、task
@@ -32,7 +33,7 @@
 ## 结果
 
 - AppKit 默认 command、未来菜单入口和物理 key route 共享同一 Rust command 语义。
-- 换行不再绕过 Markdown list continuation，删除和移动不再绕过 Unicode grapheme/selection
+- 换行不再绕过 Markdown list continuation，删除和移动不再绕过 Unicode grapheme/word/visual-line selection
   mapping，所有 source mutation 都有统一的局部或完整同步范围。
 - availability 可以被未来菜单/Selector registry 重用，而不会引入一份可变的 UI 文档状态。
 - Rust document test、C ABI test 和 Swift 编译/self-check 覆盖边界、列表、history 和 Selector
@@ -40,7 +41,7 @@
 
 ## 限制
 
-当前 allowlist 仍不包含上下移动、page movement 或完整 `validateMenuItem`/菜单 registry；
-Option/Control word navigation 已由 ADR 0050 定义。其他命令必须先在 Rust editor model 中定义，
-再扩展同一桥接。
+当前 allowlist 仍不包含 page movement 或完整 `validateMenuItem`/菜单 registry；Option/Control
+word navigation 见 ADR 0050，block-local visual-line/preferred-X 见 ADR 0051。其他命令必须先在
+Rust editor model 中定义，再扩展同一桥接。
 未知 Selector 仍依赖 AppKit 默认路径，产品窗口和菜单 UI 不属于本阶段。

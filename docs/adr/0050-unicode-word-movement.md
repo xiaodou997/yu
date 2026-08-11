@@ -33,4 +33,5 @@ macOS Option-←/→、Windows/Linux 常见 Control-←/→ 需要跨词移动�
 ## 限制
 
 当前实现按 UAX word-boundary segment 工作，不实现系统级语言词典或编辑器自定义 camelCase/subword
-规则；上下移动、preferred x、Option/Control page movement 和完整菜单 registry 留给后续阶段。
+规则；Option/Control page movement 和完整菜单 registry 留给后续阶段。上下移动与 preferred-X
+的 block-local 契约见 [ADR 0051](0051-vertical-caret-preferred-x.md)。

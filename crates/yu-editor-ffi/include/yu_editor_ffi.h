@@ -70,6 +70,8 @@ enum {
     YU_EDITOR_COMMAND_UNDO = 8,
     YU_EDITOR_COMMAND_REDO = 9,
     YU_EDITOR_COMMAND_TOGGLE_TASK = 10,
+    YU_EDITOR_COMMAND_MOVE_UP = 13,
+    YU_EDITOR_COMMAND_MOVE_DOWN = 14,
 };
 
 typedef struct YuEditorCommandResult {

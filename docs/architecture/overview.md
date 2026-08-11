@@ -150,7 +150,7 @@ AppKit 只查询新 range 并替换 mirror 的旧 range。成组 Undo/Redo 可�
 command 名称重复推断。没有 source 变化的移动命令使用 None；非列表 Tab/Shift-Tab 返回
 unhandled。
 
-AppKit 的 `doCommand(by:)` 也走同一边界：实验只允许删除、前后移动和换行 Selector 映射到
+AppKit 的 `doCommand(by:)` 也走同一边界：实验只允许删除、前后/word/上下移动和换行 Selector 映射到
 `yu_composition_session_execute_command`，先通过只读 `yu_composition_session_command_available`
 查询上下文，再按同一个 `YuEditorCommandResult` 更新 mirror。取消 composition 是唯一不经过
 永久 command 的 Selector；未知 Selector 交还 `super`，活动 marked text 时不执行永久命令。
@@ -159,6 +159,13 @@ AppKit 的 `doCommand(by:)` 也走同一边界：实验只允许删除、前后�
 `MoveWordLeft/MoveWordRight`。Rust 只读取 caret 所在行和必要的相邻行，通过 Unicode word-boundary
 segment 跳过空白、保留标点/符号/emoji 的独立边界；该命令只改变 revision-bound selection，不
 生成 Transaction，也不调用 `TextSnapshot::as_str()` 物化整份非连续 source。
+
+上下移动同样不把 AppKit selection 当成第二个真源：`MoveUp/MoveDown` 先由
+`LayoutSnapshot::caret_for_source` 把当前 source caret 定位到 block-local visual line，使用私有
+`PreferredCaretX` 保留第一次命中的 X，再以目标行 y 调用 `LayoutSnapshot::hit_test` 反向得到 source
+boundary。横向/word movement、edit、显式 selection 和 composition/reset 会清除 preferred-X；
+非空 selection 的 Up/Down 先折叠到 ordered start/end。当前只在同一 Markdown block 内导航，跨
+block 与 viewport scroll-to-caret 仍留在 GUI 阶段。
 
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。

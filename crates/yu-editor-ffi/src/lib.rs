@@ -54,6 +54,8 @@ pub const YU_EDITOR_COMMAND_OUTDENT_LIST: u8 = 7;
 pub const YU_EDITOR_COMMAND_UNDO: u8 = 8;
 pub const YU_EDITOR_COMMAND_REDO: u8 = 9;
 pub const YU_EDITOR_COMMAND_TOGGLE_TASK: u8 = 10;
+pub const YU_EDITOR_COMMAND_MOVE_UP: u8 = 13;
+pub const YU_EDITOR_COMMAND_MOVE_DOWN: u8 = 14;
 
 /// Revision and UTF-16 selection returned after one native command.
 #[repr(C)]
@@ -222,6 +224,8 @@ fn editor_command_from_ffi(command: u8, block: u64) -> Result<EditorCommand, i32
         YU_EDITOR_COMMAND_MOVE_RIGHT => Ok(EditorCommand::MoveRight),
         YU_EDITOR_COMMAND_MOVE_WORD_LEFT => Ok(EditorCommand::move_word_left()),
         YU_EDITOR_COMMAND_MOVE_WORD_RIGHT => Ok(EditorCommand::move_word_right()),
+        YU_EDITOR_COMMAND_MOVE_UP => Ok(EditorCommand::move_up()),
+        YU_EDITOR_COMMAND_MOVE_DOWN => Ok(EditorCommand::move_down()),
         YU_EDITOR_COMMAND_INSERT_NEWLINE => Ok(EditorCommand::insert_newline()),
         YU_EDITOR_COMMAND_INDENT_LIST => Ok(EditorCommand::indent_list()),
         YU_EDITOR_COMMAND_OUTDENT_LIST => Ok(EditorCommand::outdent_list()),
@@ -1305,6 +1309,47 @@ mod tests {
         assert_eq!(
             (result.selection_start_utf16, result.selection_end_utf16),
             (11, 11)
+        );
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_key_route_moves_vertically_with_layout_preferred_x() {
+        let handle = session("abcdefghij\nxy\n1234567890");
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_selection(
+                    handle,
+                    0,
+                    10,
+                    10,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_FFI_OK
+        );
+
+        let mut result = YuEditorCommandResult::default();
+        assert_eq!(
+            unsafe { yu_composition_session_route_key(handle, YU_KEY_DOWN, 0, 0, &mut result) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (
+                result.selection_start_utf16,
+                result.selection_end_utf16,
+                result.changed,
+                result.source_sync,
+            ),
+            (13, 13, 0, YU_SOURCE_SYNC_NONE)
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_route_key(handle, YU_KEY_DOWN, 0, 0, &mut result) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (result.selection_start_utf16, result.selection_end_utf16),
+            (24, 24)
         );
         unsafe { yu_composition_session_destroy(handle) };
     }
