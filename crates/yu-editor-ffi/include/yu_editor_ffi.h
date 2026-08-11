@@ -47,6 +47,12 @@ enum {
 };
 
 enum {
+    YU_SOURCE_SYNC_NONE = 0,
+    YU_SOURCE_SYNC_RANGE = 1,
+    YU_SOURCE_SYNC_FULL = 2,
+};
+
+enum {
     YU_EDITOR_COMMAND_DELETE_BACKWARD = 1,
     YU_EDITOR_COMMAND_DELETE_FORWARD = 2,
     YU_EDITOR_COMMAND_MOVE_LEFT = 3,
@@ -65,6 +71,11 @@ typedef struct YuEditorCommandResult {
     uint64_t selection_end_utf16;
     uint8_t affinity;
     uint8_t changed;
+    uint8_t source_sync;
+    uint64_t source_start_utf16;
+    uint64_t source_old_end_utf16;
+    uint64_t source_new_start_utf16;
+    uint64_t source_new_end_utf16;
 } YuEditorCommandResult;
 
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,

@@ -22,7 +22,7 @@ pub use accessibility::{
 pub use caret::{
     CaretAffinity, CaretPositionError, CaretPositionMap, NativeCaretPosition, SourceCaretPosition,
 };
-pub use command::{CommandResult, EditorCommand};
+pub use command::{CommandResult, EditorCommand, KeyRouteResult, SourceChange, SourceSync};
 pub use composition::{CompositionError, CompositionOverlay};
 pub use document::{EditorDocument, EditorDocumentError};
 pub use history::HistoryStats;
