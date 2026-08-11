@@ -13,8 +13,6 @@ build = "build.rs"
 yu-core = { path = "../../../crates/yu-core" }
 yu-font = { path = "../../../crates/yu-font" }
 yu-render = { path = "../../../crates/yu-render" }
-
-[dev-dependencies]
 yu-scene = { path = "../../../crates/yu-scene" }
 
 [lints]

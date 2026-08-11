@@ -35,8 +35,9 @@
 - `MTLTextureDescriptor(R8Unorm)` 创建和 `replaceRegion` alpha upload；
 - retained native object 的 release。
 
-当前不创建 NSWindow/NSView，不获取 drawable，不编码 command buffer，也不 present。这样真实
-窗口和 renderer command encoding 仍可独立演进。
+当前不创建 NSWindow/NSView；clear-only drawable acquisition 和 present/commit 由 ADR 0035
+单独定义，glyph/rect command encoding 仍不属于本阶段。这样真实窗口和完整 renderer pipeline
+仍可独立演进。
 
 ## 测试策略
 
@@ -54,11 +55,11 @@ cargo test -p yu-render-macos -- --ignored
 - shared render crate 没有新增 wgpu/Metal 依赖；
 - Metal texture/device/layer 生命周期被隔离在 macOS crate；
 - atlas upload 的真实硬件路径可以在不启动完整 GUI 的情况下验证；
-- 后续接窗口时只需把已配置 layer 附着到平台 view，并增加 drawable/command encoder 边界。
+- 后续接窗口时只需把已配置 layer 附着到平台 view，再扩展 glyph/rect pipeline。
 
 ## 限制
 
-- 当前 bridge 使用小型 Objective-C C ABI，尚未接入 drawable acquisition、pipeline、shader、
-  clipping、damage scissor 或 present；
+- 当前 bridge 使用小型 Objective-C C ABI，尚未接入 glyph pipeline、shader、clipping 或 damage
+  scissor；clear-only frame 仍受 drawable/window 上下文限制；
 - Metal device unavailable 时默认测试不会失败，必须显式执行 ignored test 才能完成硬件验证；
 - 纹理上传目前是 shared `R8Unorm`，彩色 emoji、图片和 private-storage staging 属于后续阶段。

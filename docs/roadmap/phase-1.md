@@ -64,6 +64,7 @@
 - [x] `LayoutSnapshot → SceneBuilder → RenderPlan` revision-bound vertical slice 与 fake uploader
 - [x] macOS Metal device、未附着 `CAMetalLayer` 与 surface generation contract
 - [x] macOS `MetalUploader` 的 owned alpha page → `R8Unorm MTLTexture` bridge
+- [x] macOS command queue 与 clear-only drawable/present/commit frame lifecycle
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -126,6 +127,8 @@
    revision 或预算失败不得留下部分 scene。
 24. macOS backend 必须能在无窗口状态下验证 surface config/resize contract；native Metal device
    和 alpha texture upload 测试必须显式标记硬件前置条件，不能让无 Metal device 的默认 CI 失败。
+25. macOS clear-only frame 必须保持 queue/device 绑定，并对 drawable、command buffer、encoder
+   失败返回明确错误；完整 glyph/rect pipeline 进入前不得隐式消费 RenderPlan commands。
 
 ## 非目标
 

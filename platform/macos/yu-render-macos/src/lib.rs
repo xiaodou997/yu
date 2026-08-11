@@ -8,8 +8,8 @@
 //! The Objective-C bridge in `native/metal_bridge.m` owns only the calls that
 //! require Apple framework types. Rust owns device/surface/texture lifetime,
 //! validates all dimensions, and exposes no native pointer to shared editor
-//! state. This crate deliberately stops before drawable acquisition,
-//! command encoding, presentation, or window creation.
+//! state. It can submit a clear-only frame to an attached layer, but stops
+//! before glyph pipelines, command batching, and window creation.
 
 use std::error::Error;
 use std::fmt;
@@ -17,6 +17,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use yu_render::{AtlasPageUpload, RenderUploader};
+use yu_scene::Rgba8;
 
 #[cfg(target_os = "macos")]
 mod native {
@@ -48,6 +49,18 @@ mod native {
             pixel_length: usize,
             out_texture: *mut *mut c_void,
         ) -> i32;
+        pub fn yu_metal_create_command_queue(
+            device: *mut c_void,
+            out_queue: *mut *mut c_void,
+        ) -> i32;
+        pub fn yu_metal_clear_and_present(
+            queue: *mut c_void,
+            layer: *mut c_void,
+            red: f32,
+            green: f32,
+            blue: f32,
+            alpha: f32,
+        ) -> i32;
         pub fn yu_metal_release(object: *mut c_void);
     }
 }
@@ -57,6 +70,11 @@ mod native {
 pub enum MetalRenderError {
     UnsupportedPlatform,
     DeviceUnavailable,
+    CommandQueueUnavailable,
+    DrawableUnavailable,
+    CommandBufferUnavailable,
+    RenderEncoderUnavailable,
+    DeviceMismatch,
     InvalidSurfaceConfig(&'static str),
     InvalidPixelBuffer { expected: usize, actual: usize },
     NativeFailure(&'static str),
@@ -70,6 +88,21 @@ impl fmt::Display for MetalRenderError {
                 formatter.write_str("Metal surface is only available on macOS")
             }
             Self::DeviceUnavailable => formatter.write_str("Metal did not provide a system device"),
+            Self::CommandQueueUnavailable => {
+                formatter.write_str("Metal command queue creation failed")
+            }
+            Self::DrawableUnavailable => {
+                formatter.write_str("CAMetalLayer did not provide a drawable")
+            }
+            Self::CommandBufferUnavailable => {
+                formatter.write_str("Metal command buffer creation failed")
+            }
+            Self::RenderEncoderUnavailable => {
+                formatter.write_str("Metal render encoder creation failed")
+            }
+            Self::DeviceMismatch => {
+                formatter.write_str("surface and command queue use different Metal devices")
+            }
             Self::InvalidSurfaceConfig(message) => formatter.write_str(message),
             Self::InvalidPixelBuffer { expected, actual } => {
                 write!(
@@ -336,6 +369,11 @@ impl MetalSurface {
     pub const fn generation(&self) -> u64 {
         self.generation
     }
+
+    #[cfg(target_os = "macos")]
+    fn raw_layer(&self) -> *mut std::ffi::c_void {
+        self.raw_layer.as_ptr()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -459,6 +497,134 @@ impl RenderUploader for MetalUploader {
     }
 }
 
+#[cfg(target_os = "macos")]
+struct CommandQueueInner {
+    raw: NonNull<std::ffi::c_void>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CommandQueueInner {
+    fn drop(&mut self) {
+        unsafe { native::yu_metal_release(self.raw.as_ptr()) };
+    }
+}
+
+/// A command queue bound to one `MetalDevice`.
+pub struct MetalCommandQueue {
+    device: MetalDevice,
+    #[cfg(target_os = "macos")]
+    inner: Rc<CommandQueueInner>,
+}
+
+impl fmt::Debug for MetalCommandQueue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetalCommandQueue")
+            .field("device_registry_id", &self.device.registry_id())
+            .finish()
+    }
+}
+
+impl MetalCommandQueue {
+    pub fn new(device: MetalDevice) -> Result<Self, MetalRenderError> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut raw = std::ptr::null_mut();
+            let created = unsafe { native::yu_metal_create_command_queue(device.raw(), &mut raw) };
+            let raw = NonNull::new(raw).ok_or(MetalRenderError::CommandQueueUnavailable)?;
+            if created == 0 {
+                unsafe { native::yu_metal_release(raw.as_ptr()) };
+                return Err(MetalRenderError::CommandQueueUnavailable);
+            }
+            return Ok(Self {
+                device,
+                inner: Rc::new(CommandQueueInner { raw }),
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = device;
+            Err(MetalRenderError::UnsupportedPlatform)
+        }
+    }
+
+    #[must_use]
+    pub const fn device(&self) -> &MetalDevice {
+        &self.device
+    }
+}
+
+/// Clear-only frame submission used to validate drawable acquisition and
+/// present/commit ordering before glyph pipelines are introduced.
+pub struct MetalFrameRenderer {
+    queue: MetalCommandQueue,
+}
+
+impl fmt::Debug for MetalFrameRenderer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetalFrameRenderer")
+            .field("queue", &self.queue)
+            .finish()
+    }
+}
+
+impl MetalFrameRenderer {
+    pub fn new(device: MetalDevice) -> Result<Self, MetalRenderError> {
+        Ok(Self {
+            queue: MetalCommandQueue::new(device)?,
+        })
+    }
+
+    /// Acquires one drawable, records a clear render pass, presents it and
+    /// commits the command buffer. The surface must already be attached to a
+    /// live platform view for `nextDrawable` to succeed.
+    pub fn present_clear(
+        &mut self,
+        surface: &MetalSurface,
+        color: Rgba8,
+    ) -> Result<(), MetalRenderError> {
+        if self.queue.device().registry_id() != surface.device().registry_id() {
+            return Err(MetalRenderError::DeviceMismatch);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let status = unsafe {
+                native::yu_metal_clear_and_present(
+                    self.queue.inner.raw.as_ptr(),
+                    surface.raw_layer(),
+                    f32::from(color.red()) / 255.0,
+                    f32::from(color.green()) / 255.0,
+                    f32::from(color.blue()) / 255.0,
+                    f32::from(color.alpha()) / 255.0,
+                )
+            };
+            return match status {
+                1 => Ok(()),
+                2 => Err(MetalRenderError::DrawableUnavailable),
+                3 => Err(MetalRenderError::CommandBufferUnavailable),
+                4 => Err(MetalRenderError::RenderEncoderUnavailable),
+                _ => Err(MetalRenderError::NativeFailure(
+                    "Metal clear/present bridge failed",
+                )),
+            };
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (surface, color);
+            Err(MetalRenderError::UnsupportedPlatform)
+        }
+    }
+
+    #[must_use]
+    pub const fn queue(&self) -> &MetalCommandQueue {
+        &self.queue
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,11 +696,18 @@ mod tests {
         let plan = yu_render::RenderPlanBuilder::new()
             .build(&scene_builder.finish(), &atlas)
             .expect("render plan");
-        let mut uploader = MetalUploader::new(device);
+        let mut uploader = MetalUploader::new(device.clone());
         let texture = uploader
             .upload_alpha_page(&plan.uploads()[0])
             .expect("alpha texture");
         assert_eq!(texture.width(), 8);
         assert_eq!(texture.height(), 8);
+
+        let mut frame_renderer = MetalFrameRenderer::new(device).expect("command queue");
+        let result = frame_renderer.present_clear(&surface, Rgba8::new(12, 24, 48, 255));
+        assert!(matches!(
+            result,
+            Ok(()) | Err(MetalRenderError::DrawableUnavailable)
+        ));
     }
 }

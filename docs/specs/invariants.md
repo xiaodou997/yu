@@ -157,4 +157,7 @@
 3. `MetalUploader` 只能接受长度与 page width×height 一致的 owned alpha bytes；texture handle
    的释放由 macOS backend 负责，不能写回 `GlyphAtlas` 或 `RenderPlan`。
 4. drawable acquisition、command encoding、present 与 window attachment 必须在明确的后续
-   platform stage 中加入，不能由当前 atlas upload bridge 隐式完成。
+   platform stage 中加入；当前仅允许 clear-only frame 显式执行 acquisition/present，不能隐式
+   消费 `RenderPlan::commands`。
+5. `MetalCommandQueue` 必须绑定创建它的 `MetalDevice`；`present_clear` 在 native 调用前必须
+   拒绝 device mismatch，并将 drawable、command buffer、encoder 的失败状态转换为明确错误。

@@ -185,5 +185,7 @@ Scene → RenderPlan` 端到端 revision、atlas upload 去重和 command origin
 `platform/macos/yu-render-macos` 是共享 render boundary 之外的第一层真实 backend：Rust 侧拥有
 `MetalDevice`、未附着窗口的 `CAMetalLayer`、surface generation 和 `MetalTexture`，Objective-C
 bridge 只负责 Apple framework 调用。它可以把 `AtlasPageUpload` 上传成 `R8Unorm` texture，
-但当前不创建窗口、不获取 drawable、不编码 command buffer、不 present；无 Metal device 的会话
-默认跳过硬件测试，需显式运行 ignored test。
+并通过 `MetalCommandQueue`/`MetalFrameRenderer::present_clear` 验证 clear-only 的
+drawable → command buffer → render pass → present/commit 顺序；它仍不创建窗口，也不编码
+glyph/rect pipeline。无 Metal device 或有效 drawable 的会话默认跳过硬件测试，需显式运行
+ignored test。
