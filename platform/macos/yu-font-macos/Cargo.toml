@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+unicode-segmentation = "1.13"
 yu-core = { path = "../../../crates/yu-core" }
 yu-font = { path = "../../../crates/yu-font" }
 yu-projection = { path = "../../../crates/yu-projection" }

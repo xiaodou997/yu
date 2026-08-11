@@ -66,10 +66,11 @@ Cmd-Z/Cmd-Shift-Z 使用完整 source fallback。两类结果都必须按 Rust �
 
 运行窗口现在也使用同一个 adapter：`TextInputView` 是 `NSScrollView.documentView`，TextKit
 used rect 会更新 native content height；命令、选择写回、IME commit 和窗口布局变化会按当前
-Revision 自动请求 caret reveal。TextKit container width、line height 和 fallback grapheme
-advance 会通过 revision-bound FFI metrics 配置发送到 Rust，caret request 直接使用 native
-point，不再依赖 Swift scale。fallback advance 只服务 metrics-only backend，正式布局仍需接入
-共享 shaped-layout metrics。
+Revision 自动请求 caret reveal。TextKit container width、CoreText system UI line height 和混合
+grapheme sample 的 shaped advance 会通过 revision-bound FFI metrics 配置发送到 Rust，caret
+request 直接使用 native point，不再依赖 Swift scale。system UI 私有 `.SFNS-*` 名称不会穿过
+普通 family lookup；FFI 只返回 owned scalar。该 advance 仍只服务 metrics-only backend，正式
+布局仍需接入共享 shaped-layout metrics。
 
 `doCommand(by:)` 的删除、前后移动和换行 Selector 也会先查询 Rust command availability，再调用
 同一个 command execution FFI；取消 composition 保留为独立的 AppKit Selector，未知 Selector 不

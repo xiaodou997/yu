@@ -10,6 +10,11 @@ use yu_editor::{
 };
 use yu_text::{EditError, TextSnapshot};
 
+#[cfg(target_os = "macos")]
+use yu_font::FontRequest;
+#[cfg(target_os = "macos")]
+use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
+
 pub const YU_FFI_OK: i32 = 0;
 pub const YU_FFI_NULL_POINTER: i32 = 1;
 pub const YU_FFI_INVALID_UTF8: i32 = 2;
@@ -23,6 +28,7 @@ pub const YU_FFI_KEY_UNHANDLED: i32 = 9;
 pub const YU_FFI_INVALID_COMMAND: i32 = 10;
 pub const YU_FFI_INVALID_KEY: i32 = 11;
 pub const YU_FFI_INVALID_VIEWPORT_CONFIG: i32 = 12;
+pub const YU_FFI_CORE_TEXT_UNAVAILABLE: i32 = 13;
 pub const YU_COMMAND_UNAVAILABLE: u8 = 0;
 pub const YU_COMMAND_AVAILABLE: u8 = 1;
 pub const YU_SOURCE_SYNC_NONE: u8 = 0;
@@ -93,6 +99,14 @@ pub struct YuEditorCaretScrollRequest {
     pub target_scroll_y: f32,
     pub margin: f32,
     pub needs_scroll: u8,
+}
+
+/// Owned CoreText metrics copied across the macOS FFI boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuCoreTextViewportMetrics {
+    pub line_height: f32,
+    pub default_advance: f32,
 }
 
 /// Opaque state owned by the Rust side of the native composition bridge.
@@ -832,6 +846,132 @@ pub unsafe extern "C" fn yu_composition_session_set_viewport_config(
         .map_or(YU_FFI_INVALID_VIEWPORT_CONFIG, |_| YU_FFI_OK)
 }
 
+/// Measures a UTF-8 sample with the macOS CoreText shaper and returns owned
+/// point-based metrics. This helper is independent of an editor session;
+/// callers can publish the result through `yu_composition_session_set_viewport_config`.
+///
+/// # Safety
+/// `family` and `sample` must point to readable UTF-8 buffers for their
+/// respective lengths (unless a length is zero), and `output` must point to
+/// writable storage for one [`YuCoreTextViewportMetrics`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_macos_core_text_viewport_metrics(
+    family: *const u8,
+    family_length: usize,
+    size: f32,
+    sample: *const u8,
+    sample_length: usize,
+    output: *mut YuCoreTextViewportMetrics,
+) -> i32 {
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuCoreTextViewportMetrics::default() };
+
+    #[cfg(target_os = "macos")]
+    {
+        let family = match read_utf8(family, family_length) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let sample = match read_utf8(sample, sample_length) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let request = match FontRequest::new(family, size) {
+            Ok(request) => request,
+            Err(_) => return YU_FFI_CORE_TEXT_UNAVAILABLE,
+        };
+        let metrics = match query_core_text_viewport_metrics(request, sample, false) {
+            Ok(metrics) => metrics,
+            Err(status) => return status,
+        };
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuCoreTextViewportMetrics {
+                line_height: metrics.line_height(),
+                default_advance: metrics.default_advance(),
+            };
+        }
+        YU_FFI_OK
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (family, family_length, size, sample, sample_length);
+        YU_FFI_CORE_TEXT_UNAVAILABLE
+    }
+}
+
+/// Measures the AppKit/CoreText system UI font without passing its private
+/// internal family name through `CTFontCreateWithName`.
+///
+/// # Safety
+/// `sample` must point to readable UTF-8 bytes for its length (unless the
+/// length is zero), and `output` must point to writable storage for one
+/// [`YuCoreTextViewportMetrics`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_macos_core_text_system_ui_viewport_metrics(
+    size: f32,
+    sample: *const u8,
+    sample_length: usize,
+    output: *mut YuCoreTextViewportMetrics,
+) -> i32 {
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuCoreTextViewportMetrics::default() };
+
+    #[cfg(target_os = "macos")]
+    {
+        let sample = match read_utf8(sample, sample_length) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let request = match FontRequest::new("System UI", size) {
+            Ok(request) => request,
+            Err(_) => return YU_FFI_CORE_TEXT_UNAVAILABLE,
+        };
+        let metrics = match query_core_text_viewport_metrics(request, sample, true) {
+            Ok(metrics) => metrics,
+            Err(status) => return status,
+        };
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuCoreTextViewportMetrics {
+                line_height: metrics.line_height(),
+                default_advance: metrics.default_advance(),
+            };
+        }
+        YU_FFI_OK
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (size, sample, sample_length);
+        YU_FFI_CORE_TEXT_UNAVAILABLE
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn query_core_text_viewport_metrics(
+    request: FontRequest,
+    sample: &str,
+    system_ui: bool,
+) -> Result<CoreTextViewportMetrics, i32> {
+    let shaper = if system_ui {
+        CoreTextShaper::from_system_ui(request)
+    } else {
+        CoreTextShaper::from_system(request)
+    }
+    .map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    shaper
+        .viewport_metrics(sample)
+        .map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)
+}
+
 /// Resolves the current focus caret and returns an absolute document-space
 /// scroll target for a native viewport. The query is bound to
 /// `expected_revision`; stale UI geometry must be discarded by the caller.
@@ -1052,12 +1192,61 @@ pub unsafe extern "C" fn yu_composition_session_overlay_selection(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    use yu_font_macos::CoreTextFontCatalog;
+
     fn session(source: &str) -> *mut YuCompositionSession {
         let mut output = ptr::null_mut();
         let status =
             unsafe { yu_composition_session_new(source.as_ptr(), source.len(), &mut output) };
         assert_eq!(status, YU_FFI_OK);
         output
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_core_text_viewport_metrics_returns_owned_native_values() {
+        let family = CoreTextFontCatalog::system()
+            .expect("CoreText should expose families")
+            .families()[0]
+            .clone();
+        let sample = "M中🙂e\u{301}";
+        let mut metrics = YuCoreTextViewportMetrics::default();
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_viewport_metrics(
+                    family.as_bytes().as_ptr(),
+                    family.len(),
+                    22.0,
+                    sample.as_bytes().as_ptr(),
+                    sample.len(),
+                    &mut metrics,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert!(metrics.line_height.is_finite() && metrics.line_height > 0.0);
+        assert!(metrics.default_advance.is_finite() && metrics.default_advance > 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_core_text_system_ui_metrics_use_owned_native_values() {
+        let sample = "M中🙂e\u{301}";
+        let mut metrics = YuCoreTextViewportMetrics::default();
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_system_ui_viewport_metrics(
+                    22.0,
+                    sample.as_bytes().as_ptr(),
+                    sample.len(),
+                    &mut metrics,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert!(metrics.line_height.is_finite() && metrics.line_height > 0.0);
+        assert!(metrics.default_advance.is_finite() && metrics.default_advance > 0.0);
     }
 
     #[test]
