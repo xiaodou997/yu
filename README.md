@@ -43,7 +43,7 @@ crates/yu-core          坐标、范围、Revision、Anchor
 crates/yu-editor        EditorDocument、selection、commands、CompositionOverlay 和平台无关编辑状态
 crates/yu-editor-ffi    原生平台调用的 CompositionOverlay C ABI static library
 crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
-crates/yu-markdown      第一阶段 lossless block scanner
+crates/yu-markdown      lossless block scanner/CST 与增量 Markdown parser
 crates/yu-projection    Source → Visual Markdown 投影
 crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
 crates/yu-font          font fallback、GlyphRun、metrics/rasterization 契约与 CPU glyph atlas
@@ -101,6 +101,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS retained Metal plan pipeline](docs/adr/0036-macos-retained-metal-plan-pipeline.md)
 - [macOS AppKit attachment and damage frame](docs/adr/0037-macos-appkit-attachment-damage-frame.md)
 - [macOS AppKit host probe](docs/adr/0038-macos-appkit-host-probe.md)
+- [Markdown block CST v1](docs/adr/0039-markdown-block-cst-v1.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

@@ -2,12 +2,16 @@ use yu_core::{ByteOffset, TextRange};
 use yu_markdown::{MarkdownDocument, parse, parse_incremental};
 use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
 
-const INSERTIONS: [&str; 10] = [
+const INSERTIONS: [&str; 14] = [
     "羽",
     "🙂",
     "#",
     "```",
     "~~~\n",
+    "> ",
+    "- ",
+    "1. ",
+    "  - ",
     "\n",
     "\n# title\n",
     " ",
@@ -206,6 +210,41 @@ fn inserted_fence_prevents_false_hash_convergence() {
             incremental.reparsed_range().end(),
             applied.result_snapshot().len_bytes(),
             "backend {backend}"
+        );
+    }
+}
+
+#[test]
+fn container_marker_edit_matches_full_parse() {
+    for backend in StorageBackend::ALL {
+        let source = "> quote\n\n- one\n  continuation\n  - nested\n- two\n\nafter\n";
+        let mut buffer = TextBuffer::with_backend(source, backend);
+        let previous = parse(&buffer.snapshot());
+        let marker_at = source.find("- one").expect("fixture contains list marker");
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(
+                TextRange::new(
+                    ByteOffset::try_from(marker_at).expect("offset fits u64"),
+                    ByteOffset::try_from(marker_at + 2).expect("offset fits u64"),
+                )
+                .expect("ordered marker range"),
+                "1. ",
+            )],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("container marker edit should apply");
+        let incremental =
+            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+                .expect("matching revisions should parse incrementally");
+        let full = parse(applied.result_snapshot());
+
+        assert_eq!(incremental.document(), &full, "backend {backend}");
+        assert!(incremental.document().has_lossless_coverage());
+        assert_eq!(
+            applied.result_snapshot().as_str(),
+            source.replacen("- ", "1. ", 1)
         );
     }
 }
