@@ -12,9 +12,9 @@ use yu_text::{
 use crate::{
     BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
     EditorSelection, KeyEvent, KeyRouteResult, LayoutBackend, LayoutCache, LayoutCacheStats,
-    Projection, ProjectionCache, ProjectionCacheStats, ProjectionError, SelectionError,
-    SourceChange, ViewportConfig, ViewportError, ViewportLayout, ViewportRect, ViewportSnapshot,
-    ViewportStats,
+    LayoutPoint, Projection, ProjectionCache, ProjectionCacheStats, ProjectionError,
+    SelectionError, SourceChange, ViewportConfig, ViewportError, ViewportLayout, ViewportRect,
+    ViewportSnapshot, ViewportStats,
     command::{
         next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
         previous_word_boundary,
@@ -23,6 +23,7 @@ use crate::{
     keymap::command_for_key,
     list::ListLinePrefix,
 };
+use yu_projection::ProjectionBias;
 
 /// The canonical source and transient composition state owned by one editor.
 ///
@@ -35,6 +36,7 @@ pub struct EditorDocument {
     markdown: MarkdownDocument,
     composition: Option<CompositionOverlay>,
     selection: EditorSelection,
+    preferred_x: Option<PreferredCaretX>,
     last_source_change: Option<SourceChange>,
     history: EditorHistory,
     projections: ProjectionCache,
@@ -60,6 +62,7 @@ impl EditorDocument {
             markdown,
             composition: None,
             selection,
+            preferred_x: None,
             last_source_change: None,
             history: EditorHistory::default(),
             projections: ProjectionCache::default(),
@@ -339,6 +342,7 @@ impl EditorDocument {
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), SelectionError> {
         selection.utf16_range(&self.snapshot())?;
         self.selection = selection;
+        self.preferred_x = None;
         self.history.break_group();
         Ok(())
     }
@@ -369,6 +373,7 @@ impl EditorDocument {
         &mut self,
         transaction: &Transaction,
     ) -> Result<AppliedTransaction, EditorDocumentError> {
+        self.preferred_x = None;
         let before_snapshot = self.snapshot();
         let applied = self.buffer.apply(transaction)?;
         let incremental = yu_markdown::parse_incremental(
@@ -416,6 +421,7 @@ impl EditorDocument {
     ) -> Result<(), EditorDocumentError> {
         self.validate_source_range(replacement_range)?;
         self.history.break_group();
+        self.preferred_x = None;
         self.composition = Some(CompositionOverlay::new(
             self.revision(),
             replacement_range,
@@ -476,6 +482,7 @@ impl EditorDocument {
             crate::CaretAffinity::Downstream,
         )?;
         self.composition = None;
+        self.preferred_x = None;
         self.last_source_change = None;
         self.history.break_group();
         Ok(applied)
@@ -486,6 +493,7 @@ impl EditorDocument {
     pub fn cancel_composition(&mut self) -> bool {
         let cancelled = self.composition.take().is_some();
         if cancelled {
+            self.preferred_x = None;
             self.history.break_group();
         }
         cancelled
@@ -502,6 +510,7 @@ impl EditorDocument {
         self.layouts.clear();
         self.viewport.clear();
         self.history.clear();
+        self.preferred_x = None;
         self.last_source_change = None;
         let snapshot = self.snapshot();
         self.selection = EditorSelection::cursor(
@@ -519,6 +528,9 @@ impl EditorDocument {
         command: EditorCommand,
     ) -> Result<CommandResult, EditorDocumentError> {
         self.last_source_change = None;
+        if !matches!(command, EditorCommand::MoveUp | EditorCommand::MoveDown) {
+            self.preferred_x = None;
+        }
         match command {
             EditorCommand::InsertText(text) => self.insert_text(text),
             EditorCommand::DeleteBackward => self.delete_backward(),
@@ -527,6 +539,8 @@ impl EditorDocument {
             EditorCommand::MoveRight => self.move_right(),
             EditorCommand::MoveWordLeft => self.move_word_left(),
             EditorCommand::MoveWordRight => self.move_word_right(),
+            EditorCommand::MoveUp => self.move_up(),
+            EditorCommand::MoveDown => self.move_down(),
             EditorCommand::InsertNewline => self.insert_newline(),
             EditorCommand::IndentList => self.indent_list(),
             EditorCommand::OutdentList => self.outdent_list(),
@@ -558,6 +572,18 @@ impl EditorDocument {
             }
             EditorCommand::MoveWordRight => {
                 !self.selection.is_empty() || self.selection.focus() < snapshot.len_bytes()
+            }
+            EditorCommand::MoveUp => {
+                !self.selection.is_empty()
+                    || self
+                        .current_block_range()
+                        .is_some_and(|range| self.selection.focus() > range.start())
+            }
+            EditorCommand::MoveDown => {
+                !self.selection.is_empty()
+                    || self
+                        .current_block_range()
+                        .is_some_and(|range| self.selection.focus() < range.end())
             }
             EditorCommand::InsertNewline => true,
             EditorCommand::IndentList => self
@@ -1060,6 +1086,94 @@ impl EditorDocument {
         Ok(self.command_result(false))
     }
 
+    fn move_up(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        self.move_vertical(VerticalDirection::Up)
+    }
+
+    fn move_down(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        self.move_vertical(VerticalDirection::Down)
+    }
+
+    fn move_vertical(
+        &mut self,
+        direction: VerticalDirection,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        self.history.break_group();
+
+        if !self.selection.is_empty() {
+            let target = match direction {
+                VerticalDirection::Up => self.selection.ordered_range().start(),
+                VerticalDirection::Down => self.selection.ordered_range().end(),
+            };
+            self.selection = EditorSelection::cursor(
+                &self.snapshot(),
+                target,
+                crate::CaretAffinity::Downstream,
+            )?;
+            self.preferred_x = None;
+            return Ok(self.command_result(false));
+        }
+
+        let source = self.snapshot();
+        let focus = self.selection.focus();
+        let Some(block_index) = self.block_index_for_offset(focus) else {
+            self.preferred_x = None;
+            return Ok(self.command_result(false));
+        };
+        let projection_bias = match self.selection.affinity() {
+            crate::CaretAffinity::Upstream => ProjectionBias::Before,
+            crate::CaretAffinity::Downstream => ProjectionBias::After,
+        };
+        let preferred_x = self.preferred_x.map(PreferredCaretX::value);
+        let (target, target_x, target_width) = {
+            let layout = self.block_layout(block_index, LayoutConfig::default())?;
+            let caret = layout.caret_for_source(focus, projection_bias)?;
+            let target_line_index = match direction {
+                VerticalDirection::Up => caret.line().checked_sub(1),
+                VerticalDirection::Down => caret.line().checked_add(1),
+            };
+            let Some(target_line_index) = target_line_index else {
+                return Ok(self.command_result(false));
+            };
+            let Some(target_line) = layout.lines().get(target_line_index) else {
+                return Ok(self.command_result(false));
+            };
+            let desired_x = preferred_x.unwrap_or(caret.point().x());
+            let hit = layout.hit_test(LayoutPoint::new(desired_x, target_line.y()))?;
+            (hit.source(), desired_x, target_line.width())
+        };
+
+        self.selection = EditorSelection::cursor(
+            &source,
+            target,
+            vertical_hit_affinity(target_x, target_width),
+        )?;
+        self.preferred_x = Some(PreferredCaretX::new(target_x));
+        Ok(self.command_result(false))
+    }
+
+    fn block_index_for_offset(&self, offset: ByteOffset) -> Option<usize> {
+        let mut ending_at_offset = None;
+        for (index, block) in self.markdown.blocks().iter().enumerate() {
+            let range = block.range();
+            if range.contains(offset) {
+                return Some(index);
+            }
+            if range.end() == offset {
+                ending_at_offset = Some(index);
+            }
+            if range.is_empty() && range.start() == offset {
+                return Some(index);
+            }
+        }
+        ending_at_offset
+    }
+
+    fn current_block_range(&self) -> Option<TextRange> {
+        self.block_index_for_offset(self.selection.focus())
+            .and_then(|index| self.markdown.blocks().get(index).map(|block| block.range()))
+    }
+
     fn command_result(&self, changed: bool) -> CommandResult {
         CommandResult::with_source_change(
             self.revision(),
@@ -1134,6 +1248,34 @@ struct SourceLine {
     content_end: yu_core::ByteOffset,
     content: String,
     terminator: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerticalDirection {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PreferredCaretX(f32);
+
+impl PreferredCaretX {
+    fn new(value: f32) -> Self {
+        debug_assert!(value.is_finite() && value >= 0.0);
+        Self(value.max(0.0))
+    }
+
+    fn value(self) -> f32 {
+        self.0
+    }
+}
+
+fn vertical_hit_affinity(x: f32, line_width: f32) -> crate::CaretAffinity {
+    if line_width > 0.0 && x >= line_width {
+        crate::CaretAffinity::Upstream
+    } else {
+        crate::CaretAffinity::Downstream
+    }
 }
 
 impl SourceLine {
@@ -1614,6 +1756,70 @@ mod tests {
 
         assert_eq!(document.revision(), revision);
         assert_eq!(document.snapshot().as_str(), source);
+    }
+
+    #[test]
+    fn vertical_commands_use_layout_lines_and_retain_preferred_x() {
+        let source = "abcdefghij\nxy\n1234567890";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, "abcdefghij".len());
+        let revision = document.revision();
+
+        document
+            .execute(EditorCommand::move_down())
+            .expect("first vertical move should succeed");
+        assert_eq!(document.selection().focus().get(), 13);
+        assert_eq!(document.preferred_x, Some(PreferredCaretX::new(10.0)));
+
+        document
+            .execute(EditorCommand::move_down())
+            .expect("second vertical move should preserve preferred x");
+        assert_eq!(document.selection().focus().get(), 24);
+        assert_eq!(document.preferred_x, Some(PreferredCaretX::new(10.0)));
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.snapshot().as_str(), source);
+
+        document
+            .execute(EditorCommand::move_up())
+            .expect("up should return to the short line");
+        assert_eq!(document.selection().focus().get(), 13);
+        document
+            .execute(EditorCommand::MoveLeft)
+            .expect("horizontal movement should clear preferred x");
+        assert_eq!(document.preferred_x, None);
+    }
+
+    #[test]
+    fn vertical_command_collapses_selection_and_stops_at_block_boundary() {
+        let source = "one\ntwo";
+        let mut document = EditorDocument::new(source);
+        let selection = EditorSelection::range(
+            &document.snapshot(),
+            ByteOffset::new(0),
+            ByteOffset::new(7),
+            crate::CaretAffinity::Downstream,
+        )
+        .expect("selection should be valid");
+        document
+            .set_selection(selection)
+            .expect("selection should belong to the document");
+        assert!(document.command_available(&EditorCommand::move_up()));
+        assert!(document.command_available(&EditorCommand::move_down()));
+
+        document
+            .execute(EditorCommand::move_up())
+            .expect("up should collapse to the ordered start");
+        assert_eq!(document.selection().focus(), ByteOffset::ZERO);
+        assert!(document.selection().is_empty());
+
+        document
+            .execute(EditorCommand::move_down())
+            .expect("down should move within the block");
+        assert_eq!(document.selection().focus().get(), 4);
+        document
+            .execute(EditorCommand::move_down())
+            .expect("down at the block boundary should be a no-op");
+        assert_eq!(document.selection().focus().get(), 4);
     }
 
     #[test]

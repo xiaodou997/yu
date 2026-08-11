@@ -119,6 +119,8 @@ pub fn command_for_key(event: KeyEvent) -> Option<EditorCommand> {
         (EditorKey::Delete, KeyModifiers::NONE) => Some(EditorCommand::DeleteForward),
         (EditorKey::Left, KeyModifiers::NONE) => Some(EditorCommand::MoveLeft),
         (EditorKey::Right, KeyModifiers::NONE) => Some(EditorCommand::MoveRight),
+        (EditorKey::Up, KeyModifiers::NONE) => Some(EditorCommand::move_up()),
+        (EditorKey::Down, KeyModifiers::NONE) => Some(EditorCommand::move_down()),
         (EditorKey::Left, KeyModifiers::OPTION | KeyModifiers::CONTROL) => {
             Some(EditorCommand::move_word_left())
         }
@@ -192,6 +194,14 @@ mod tests {
         assert_eq!(
             command_for_key(event(EditorKey::Right, KeyModifiers::NONE)),
             Some(EditorCommand::MoveRight)
+        );
+        assert_eq!(
+            command_for_key(event(EditorKey::Up, KeyModifiers::NONE)),
+            Some(EditorCommand::move_up())
+        );
+        assert_eq!(
+            command_for_key(event(EditorKey::Down, KeyModifiers::NONE)),
+            Some(EditorCommand::move_down())
         );
         assert_eq!(
             command_for_key(event(EditorKey::Left, KeyModifiers::OPTION)),
