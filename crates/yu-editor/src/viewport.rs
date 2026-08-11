@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_core::{Affinity, Revision, TextAnchor, TextRange};
+use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 use yu_layout::{HeightIndex, HeightIndexError, LayoutConfig};
 use yu_markdown::{BlockKind, MarkdownDocument};
 use yu_text::{AnchorMapError, ChangeSet, TextSnapshot};
@@ -95,7 +95,7 @@ impl ViewportRect {
         self.height
     }
 
-    fn validate(self) -> Result<(), ViewportError> {
+    pub(crate) fn validate(self) -> Result<(), ViewportError> {
         if !self.scroll_y.is_finite() || self.scroll_y < 0.0 {
             return Err(ViewportError::InvalidViewport(
                 "scroll_y must be finite and non-negative",
@@ -107,6 +107,139 @@ impl ViewportRect {
             ));
         }
         Ok(())
+    }
+}
+
+/// The document-space caret geometry used by the platform scroll protocol.
+///
+/// `y` is the top of the caret line relative to the document content, not the
+/// current viewport. The source offset and revision make the geometry safe to
+/// discard when a newer edit has already been published.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewportCaret {
+    source: ByteOffset,
+    block: usize,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl ViewportCaret {
+    pub(crate) const fn new(
+        source: ByteOffset,
+        block: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Self {
+        Self {
+            source,
+            block,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(self) -> ByteOffset {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn block(self) -> usize {
+        self.block
+    }
+
+    #[must_use]
+    pub const fn x(self) -> f32 {
+        self.x
+    }
+
+    #[must_use]
+    pub const fn y(self) -> f32 {
+        self.y
+    }
+
+    #[must_use]
+    pub const fn width(self) -> f32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(self) -> f32 {
+        self.height
+    }
+}
+
+/// A revision-bound request for the platform viewport to reveal the focus
+/// caret. The target is absolute document scroll, so the platform does not
+/// need to reconstruct block heights or line geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CaretScrollRequest {
+    revision: Revision,
+    caret: ViewportCaret,
+    current_scroll_y: f32,
+    target_scroll_y: f32,
+    margin: f32,
+    needs_scroll: bool,
+}
+
+impl CaretScrollRequest {
+    pub(crate) const fn new(
+        revision: Revision,
+        caret: ViewportCaret,
+        current_scroll_y: f32,
+        target_scroll_y: f32,
+        margin: f32,
+        needs_scroll: bool,
+    ) -> Self {
+        Self {
+            revision,
+            caret,
+            current_scroll_y,
+            target_scroll_y,
+            margin,
+            needs_scroll,
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn caret(self) -> ViewportCaret {
+        self.caret
+    }
+
+    #[must_use]
+    pub const fn current_scroll_y(self) -> f32 {
+        self.current_scroll_y
+    }
+
+    #[must_use]
+    pub const fn target_scroll_y(self) -> f32 {
+        self.target_scroll_y
+    }
+
+    #[must_use]
+    pub fn delta_y(self) -> f32 {
+        self.target_scroll_y - self.current_scroll_y
+    }
+
+    #[must_use]
+    pub const fn margin(self) -> f32 {
+        self.margin
+    }
+
+    #[must_use]
+    pub const fn needs_scroll(self) -> bool {
+        self.needs_scroll
     }
 }
 
@@ -556,6 +689,7 @@ pub enum ViewportError {
     HeightIndex(HeightIndexError),
     InvalidConfig(&'static str),
     InvalidRange,
+    InvalidMargin,
     InvalidViewport(&'static str),
     RevisionMismatch {
         expected: Revision,
@@ -572,6 +706,9 @@ impl fmt::Display for ViewportError {
                 formatter.write_str(message)
             }
             Self::InvalidRange => formatter.write_str("viewport source range mapping overflowed"),
+            Self::InvalidMargin => {
+                formatter.write_str("caret reveal margin must be finite and non-negative")
+            }
             Self::RevisionMismatch { expected, actual } => write!(
                 formatter,
                 "viewport revision mismatch: expected {expected:?}, got {actual:?}"
@@ -587,6 +724,7 @@ impl Error for ViewportError {
             Self::HeightIndex(error) => Some(error),
             Self::InvalidConfig(_)
             | Self::InvalidRange
+            | Self::InvalidMargin
             | Self::InvalidViewport(_)
             | Self::RevisionMismatch { .. } => None,
         }

@@ -4,8 +4,9 @@ use std::ptr;
 
 use yu_core::{TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
-    CaretAffinity, CommandResult, EditorCommand, EditorDocument, EditorDocumentError, EditorKey,
-    EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult, SelectionError, SourceSync,
+    CaretAffinity, CaretScrollRequest, CommandResult, EditorCommand, EditorDocument,
+    EditorDocumentError, EditorKey, EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult,
+    SelectionError, SourceSync, ViewportRect,
 };
 use yu_text::{EditError, TextSnapshot};
 
@@ -73,6 +74,24 @@ pub struct YuEditorCommandResult {
     pub source_old_end_utf16: u64,
     pub source_new_start_utf16: u64,
     pub source_new_end_utf16: u64,
+}
+
+/// Revision-bound caret geometry and the absolute scroll target required to
+/// reveal it in a native viewport.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuEditorCaretScrollRequest {
+    pub revision: u64,
+    pub source_utf16: u64,
+    pub block_index: u64,
+    pub caret_x: f32,
+    pub caret_y: f32,
+    pub caret_width: f32,
+    pub caret_height: f32,
+    pub current_scroll_y: f32,
+    pub target_scroll_y: f32,
+    pub margin: f32,
+    pub needs_scroll: u8,
 }
 
 /// Opaque state owned by the Rust side of the native composition bridge.
@@ -213,6 +232,43 @@ fn write_command_result(
             source_old_end_utf16,
             source_new_start_utf16,
             source_new_end_utf16,
+        };
+    }
+    YU_FFI_OK
+}
+
+fn write_caret_scroll_request(
+    session: &YuCompositionSession,
+    request: CaretScrollRequest,
+    output: *mut YuEditorCaretScrollRequest,
+) -> i32 {
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    let snapshot = session.document.snapshot();
+    let source_utf16 = match snapshot.utf16_offset(request.caret().source()) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    let caret = request.caret();
+    let block_index = match u64::try_from(caret.block()) {
+        Ok(index) => index,
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuEditorCaretScrollRequest {
+            revision: request.revision().get(),
+            source_utf16,
+            block_index,
+            caret_x: caret.x(),
+            caret_y: caret.y(),
+            caret_width: caret.width(),
+            caret_height: caret.height(),
+            current_scroll_y: request.current_scroll_y(),
+            target_scroll_y: request.target_scroll_y(),
+            margin: request.margin(),
+            needs_scroll: u8::from(request.needs_scroll()),
         };
     }
     YU_FFI_OK
@@ -737,6 +793,39 @@ pub unsafe extern "C" fn yu_composition_session_set_selection(
         .document
         .set_selection(selection)
         .map_or_else(status_from_selection_error, |_| YU_FFI_OK)
+}
+
+/// Resolves the current focus caret and returns an absolute document-space
+/// scroll target for a native viewport. The query is bound to
+/// `expected_revision`; stale UI geometry must be discarded by the caller.
+/// `margin` is clamped to half the viewport height by the Rust policy.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuEditorCaretScrollRequest`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_caret_scroll_request(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    scroll_y: f32,
+    viewport_height: f32,
+    margin: f32,
+    output: *mut YuEditorCaretScrollRequest,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(session, expected_revision) {
+        return status;
+    }
+    let request = match session
+        .document
+        .caret_scroll_request(ViewportRect::new(scroll_y, viewport_height), margin)
+    {
+        Ok(request) => request,
+        Err(error) => return status_from_document_error(error),
+    };
+    write_caret_scroll_request(session, request, output)
 }
 
 /// Reads the canonical source byte length.
@@ -1430,6 +1519,82 @@ mod tests {
         assert_eq!(
             (result.selection_start_utf16, result.selection_end_utf16),
             (0, 8)
+        );
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_caret_scroll_request_returns_revision_bound_absolute_target() {
+        let handle = session("one\n\ntwo\n\nthree");
+        let mut request = YuEditorCaretScrollRequest::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_caret_scroll_request(handle, 0, 0.0, 1.0, 0.0, &mut request)
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(request.revision, 0);
+        assert_eq!(request.source_utf16, 15);
+        assert_eq!(request.block_index, 4);
+        assert_eq!(request.caret_y, 4.0);
+        assert_eq!(request.target_scroll_y, 4.0);
+        assert_eq!(request.needs_scroll, 1);
+
+        let target = request.target_scroll_y;
+        assert_eq!(
+            unsafe {
+                yu_composition_session_caret_scroll_request(
+                    handle,
+                    request.revision,
+                    target,
+                    1.0,
+                    0.0,
+                    &mut request,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(request.needs_scroll, 0);
+        assert_eq!(request.target_scroll_y, target);
+
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_selection(
+                    handle,
+                    request.revision,
+                    0,
+                    0,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_caret_scroll_request(
+                    handle,
+                    0,
+                    target,
+                    1.0,
+                    0.0,
+                    &mut request,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(request.target_scroll_y, 0.0);
+        assert_eq!(request.needs_scroll, 1);
+        assert_eq!(
+            unsafe {
+                yu_composition_session_caret_scroll_request(handle, 1, 0.0, 1.0, 0.0, &mut request)
+            },
+            YU_FFI_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_caret_scroll_request(handle, 0, 0.0, 1.0, -1.0, &mut request)
+            },
+            YU_FFI_INVALID_RANGE
         );
         unsafe { yu_composition_session_destroy(handle) };
     }

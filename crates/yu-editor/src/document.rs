@@ -10,11 +10,11 @@ use yu_text::{
 };
 
 use crate::{
-    BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
-    EditorSelection, KeyEvent, KeyRouteResult, LayoutBackend, LayoutCache, LayoutCacheStats,
-    LayoutPoint, Projection, ProjectionCache, ProjectionCacheStats, ProjectionError,
-    SelectionError, SourceChange, ViewportConfig, ViewportError, ViewportLayout, ViewportRect,
-    ViewportSnapshot, ViewportStats,
+    BlockProjection, CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay,
+    EditorCommand, EditorSelection, KeyEvent, KeyRouteResult, LayoutBackend, LayoutCache,
+    LayoutCacheStats, LayoutPoint, Projection, ProjectionCache, ProjectionCacheStats,
+    ProjectionError, SelectionError, SourceChange, ViewportCaret, ViewportConfig, ViewportError,
+    ViewportLayout, ViewportRect, ViewportSnapshot, ViewportStats,
     command::{
         next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
         previous_word_boundary,
@@ -266,6 +266,38 @@ impl EditorDocument {
         result
     }
 
+    /// Resolves the current focus caret into a revision-bound scroll request.
+    ///
+    /// The returned target is document-space `scroll_y`; the platform only
+    /// needs to apply it to its native viewport when `needs_scroll()` is true.
+    /// Unmeasured blocks keep their configured estimate, while the caret's
+    /// block is measured before its document-space y is calculated.
+    pub fn caret_scroll_request(
+        &mut self,
+        viewport: ViewportRect,
+        margin: f32,
+    ) -> Result<CaretScrollRequest, EditorDocumentError> {
+        let mut layout = std::mem::take(&mut self.viewport);
+        let result = self.measure_caret_scroll_request_metrics(&mut layout, viewport, margin);
+        self.viewport = layout;
+        result
+    }
+
+    /// Shaping-aware variant of [`Self::caret_scroll_request`]. Its measured
+    /// block height uses the same provider as the caller's visible viewport.
+    pub fn caret_scroll_request_with_shaper<S: ShapingProvider>(
+        &mut self,
+        viewport: ViewportRect,
+        margin: f32,
+        shaper: &S,
+    ) -> Result<CaretScrollRequest, EditorDocumentError> {
+        let mut layout = std::mem::take(&mut self.viewport);
+        let result =
+            self.measure_caret_scroll_request_shaped(&mut layout, viewport, margin, shaper);
+        self.viewport = layout;
+        result
+    }
+
     fn measure_visible_blocks(
         &mut self,
         layout: &mut ViewportLayout,
@@ -336,6 +368,159 @@ impl EditorDocument {
         layout
             .snapshot(&self.markdown, range)
             .map_err(EditorDocumentError::Viewport)
+    }
+
+    fn measure_caret_scroll_request_metrics(
+        &mut self,
+        layout: &mut ViewportLayout,
+        viewport: ViewportRect,
+        margin: f32,
+    ) -> Result<CaretScrollRequest, EditorDocumentError> {
+        viewport.validate().map_err(EditorDocumentError::Viewport)?;
+        validate_caret_margin(margin).map_err(EditorDocumentError::Viewport)?;
+        layout
+            .set_backend(LayoutBackend::Metrics)
+            .map_err(EditorDocumentError::Viewport)?;
+        layout
+            .sync(&self.markdown)
+            .map_err(EditorDocumentError::Viewport)?;
+        let focus = self.selection.focus();
+        let Some(block_index) = self.block_index_for_offset(focus) else {
+            return Ok(self.empty_caret_scroll_request(viewport, margin));
+        };
+        let config = layout.config().layout();
+        let projection_bias = self.selection_projection_bias();
+        let (caret_x, caret_y, line_count) = {
+            let block_layout = self.block_layout(block_index, config)?;
+            let caret = block_layout.caret_for_source(focus, projection_bias)?;
+            (
+                caret.point().x(),
+                caret.point().y(),
+                block_layout.lines().len(),
+            )
+        };
+        let height = config.line_height() * line_count.max(1) as f32;
+        layout
+            .set_block_height(block_index, height)
+            .map_err(EditorDocumentError::Viewport)?;
+        self.finish_caret_scroll_request(
+            layout,
+            viewport,
+            margin,
+            CaretLayoutPosition {
+                source: focus,
+                block: block_index,
+                x: caret_x,
+                y: caret_y,
+                height: config.line_height(),
+            },
+        )
+    }
+
+    fn measure_caret_scroll_request_shaped<S: ShapingProvider>(
+        &mut self,
+        layout: &mut ViewportLayout,
+        viewport: ViewportRect,
+        margin: f32,
+        shaper: &S,
+    ) -> Result<CaretScrollRequest, EditorDocumentError> {
+        viewport.validate().map_err(EditorDocumentError::Viewport)?;
+        validate_caret_margin(margin).map_err(EditorDocumentError::Viewport)?;
+        layout
+            .set_backend(LayoutBackend::Shaped)
+            .map_err(EditorDocumentError::Viewport)?;
+        layout
+            .sync(&self.markdown)
+            .map_err(EditorDocumentError::Viewport)?;
+        let focus = self.selection.focus();
+        let Some(block_index) = self.block_index_for_offset(focus) else {
+            return Ok(self.empty_caret_scroll_request(viewport, margin));
+        };
+        let config = layout.config().layout();
+        let projection_bias = self.selection_projection_bias();
+        let (caret_x, caret_y, line_count) = {
+            let block_layout = self.block_layout_with_shaper(block_index, config, shaper)?;
+            let caret = block_layout.caret_for_source(focus, projection_bias)?;
+            (
+                caret.point().x(),
+                caret.point().y(),
+                block_layout.lines().len(),
+            )
+        };
+        let height = config.line_height() * line_count.max(1) as f32;
+        layout
+            .set_block_height(block_index, height)
+            .map_err(EditorDocumentError::Viewport)?;
+        self.finish_caret_scroll_request(
+            layout,
+            viewport,
+            margin,
+            CaretLayoutPosition {
+                source: focus,
+                block: block_index,
+                x: caret_x,
+                y: caret_y,
+                height: config.line_height(),
+            },
+        )
+    }
+
+    fn finish_caret_scroll_request(
+        &self,
+        layout: &ViewportLayout,
+        viewport: ViewportRect,
+        margin: f32,
+        position: CaretLayoutPosition,
+    ) -> Result<CaretScrollRequest, EditorDocumentError> {
+        let effective_margin = margin.min(viewport.height() / 2.0);
+        let document_y = layout.height_index().prefix_height(position.block) + position.y;
+        let caret_bottom = document_y + position.height;
+        let visible_top = viewport.scroll_y() + effective_margin;
+        let visible_bottom = viewport.scroll_y() + viewport.height() - effective_margin;
+        let mut target = viewport.scroll_y();
+        if document_y < visible_top {
+            target = document_y - effective_margin;
+        } else if caret_bottom > visible_bottom {
+            target = caret_bottom + effective_margin - viewport.height();
+        }
+        let max_scroll = (layout.height_index().total_height() - viewport.height()).max(0.0);
+        target = target.clamp(0.0, max_scroll);
+        let needs_scroll = (target - viewport.scroll_y()).abs() > f32::EPSILON;
+        let caret = ViewportCaret::new(
+            position.source,
+            position.block,
+            position.x,
+            document_y,
+            0.0,
+            position.height,
+        );
+        Ok(CaretScrollRequest::new(
+            self.revision(),
+            caret,
+            viewport.scroll_y(),
+            if needs_scroll {
+                target
+            } else {
+                viewport.scroll_y()
+            },
+            effective_margin,
+            needs_scroll,
+        ))
+    }
+
+    fn empty_caret_scroll_request(
+        &self,
+        viewport: ViewportRect,
+        margin: f32,
+    ) -> CaretScrollRequest {
+        CaretScrollRequest::new(
+            self.revision(),
+            ViewportCaret::new(ByteOffset::ZERO, 0, 0.0, 0.0, 0.0, 0.0),
+            viewport.scroll_y(),
+            viewport.scroll_y(),
+            margin.min(viewport.height() / 2.0),
+            false,
+        )
     }
 
     /// Replaces the selection after checking that it belongs to this revision.
@@ -1194,6 +1379,13 @@ impl EditorDocument {
         ending_at_offset
     }
 
+    fn selection_projection_bias(&self) -> ProjectionBias {
+        match self.selection.affinity() {
+            crate::CaretAffinity::Upstream => ProjectionBias::Before,
+            crate::CaretAffinity::Downstream => ProjectionBias::After,
+        }
+    }
+
     fn vertical_command_available(&self, direction: VerticalDirection) -> bool {
         if !self.selection.is_empty() {
             return true;
@@ -1300,6 +1492,15 @@ enum VerticalDirection {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PreferredCaretX(f32);
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CaretLayoutPosition {
+    source: ByteOffset,
+    block: usize,
+    x: f32,
+    y: f32,
+    height: f32,
+}
+
 impl PreferredCaretX {
     fn new(value: f32) -> Self {
         debug_assert!(value.is_finite() && value >= 0.0);
@@ -1316,6 +1517,14 @@ fn vertical_hit_affinity(x: f32, line_width: f32) -> crate::CaretAffinity {
         crate::CaretAffinity::Upstream
     } else {
         crate::CaretAffinity::Downstream
+    }
+}
+
+fn validate_caret_margin(margin: f32) -> Result<(), ViewportError> {
+    if margin.is_finite() && margin >= 0.0 {
+        Ok(())
+    } else {
+        Err(ViewportError::InvalidMargin)
     }
 }
 
@@ -2662,6 +2871,52 @@ mod tests {
             .visible_blocks(ViewportRect::new(0.0, 2.0))
             .expect("metrics viewport should remeasure after backend switch");
         assert_eq!(metrics_again.blocks()[0].height(), 1.0);
+    }
+
+    #[test]
+    fn caret_scroll_request_reveals_focus_and_is_noop_when_visible() {
+        let source = "one\n\ntwo\n\nthree";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
+            .expect("viewport config should be valid");
+        set_caret(&mut document, source.len());
+
+        let request = document
+            .caret_scroll_request(ViewportRect::new(0.0, 1.0), 0.0)
+            .expect("caret scroll request should resolve");
+        assert_eq!(request.revision(), document.revision());
+        assert_eq!(request.caret().source().get(), source.len() as u64);
+        assert_eq!(request.caret().block(), 4);
+        assert_eq!(request.caret().y(), 4.0);
+        assert!(request.needs_scroll());
+        assert_eq!(request.target_scroll_y(), 4.0);
+
+        let visible = document
+            .caret_scroll_request(ViewportRect::new(request.target_scroll_y(), 1.0), 0.0)
+            .expect("visible caret request should resolve");
+        assert!(!visible.needs_scroll());
+        assert_eq!(visible.target_scroll_y(), request.target_scroll_y());
+
+        set_caret(&mut document, 0);
+        let reveal_top = document
+            .caret_scroll_request(ViewportRect::new(request.target_scroll_y(), 1.0), 0.0)
+            .expect("top caret request should resolve");
+        assert!(reveal_top.needs_scroll());
+        assert_eq!(reveal_top.target_scroll_y(), 0.0);
+    }
+
+    #[test]
+    fn caret_scroll_request_rejects_invalid_margin() {
+        let mut document = EditorDocument::new("text");
+        assert_eq!(
+            document.caret_scroll_request(ViewportRect::new(0.0, 1.0), -1.0),
+            Err(EditorDocumentError::Viewport(ViewportError::InvalidMargin))
+        );
+        assert!(matches!(
+            document.caret_scroll_request(ViewportRect::new(0.0, 1.0), f32::NAN),
+            Err(EditorDocumentError::Viewport(ViewportError::InvalidMargin))
+        ));
     }
 
     #[test]
