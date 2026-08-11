@@ -22,10 +22,12 @@ ADR 0053 定义了 Rust 计算的 absolute document-space scroll target。macOS 
 - `needs_scroll=false` 或目标已经等于 native 当前 y 时返回 no-op；它不生成新的 Rust 查询或
   source 变化。
 - 当前实现位于 macOS IME spike，并用无窗口 `NSScrollView` self-check 覆盖 scrolled、stale 和
-  no-op。正式产品 host 接入时复用同一边界，不把 AppKit 对象穿过 Rust FFI。
+  no-op。真实 `TextInputView` host 的 attachment、TextKit content height 和 native/Rust 单位
+  换算见 ADR 0055；正式产品 host 仍复用同一边界，不把 AppKit 对象穿过 Rust FFI。
 
 ## 结果
 
 - macOS scroll container 的坐标转换只有一处，Rust 与 AppKit 不会各自推导 caret y。
 - stale source/layout 请求会在 native side 被丢弃，避免旧命令在新文档上滚动。
-- 真实 document view 的 content height、inset、scrollbar 和动画策略仍由后续产品 GUI 决定。
+- 真实产品的 document inset、scrollbar 和动画策略仍由后续 GUI 决定；spike 只证明 TextKit
+  document view 的 content height 可以在同一 adapter 边界内同步。

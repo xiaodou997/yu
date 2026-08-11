@@ -54,6 +54,7 @@
 - [x] Shift+Up/Down selection extension、macOS modify-selection Selector 与 FFI route
 - [x] revision-bound caret scroll request、FFI geometry query 与 macOS spike self-check
 - [x] macOS `NSScrollView` caret request consumer、stale/no-op/native scroll self-check
+- [x] macOS spike 将 `TextInputView` 接入真实 `NSScrollView`，按 Revision/IME commit 自动 reveal
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -202,8 +203,8 @@
 41. Up/Down 必须通过当前或相邻 block 的 `LayoutSnapshot` 往返 source caret，长行/短行/长行连续
     移动时保持 preferred-X；横向/word movement、edit、显式 selection 和 composition/reset 必须
     清除 preferred-X，macOS key route 与 `moveUp:`/`moveDown:` Selector 必须共用该 command，
-    caret reveal 必须由 Rust 提供 revision-bound scroll request，真实 scroll container 仍留在
-    GUI 阶段。
+    caret reveal 必须由 Rust 提供 revision-bound scroll request；macOS spike 的真实 `NSScrollView`
+    host 只能通过 adapter 消费请求，native/Rust 单位换算必须集中在平台 bridge。
 42. `MoveUpExtend/MoveDownExtend` 必须保留 selection anchor、只更新 focus，并在 focus 回到 anchor
     时折叠；Shift key route 与 macOS modify-selection Selector 必须共用 FFI command id，命令不得
     生成 Transaction、Revision、history 或 SourceSync。
@@ -213,6 +214,10 @@
 44. macOS native viewport consumer 必须只消费匹配 current Revision 的请求，将 absolute target 转成
     `NSClipView` bounds 并做最后 clamp；stale、no-op 和实际滚动都必须有无窗口 AppKit self-check，
     且 AppKit 对象不能进入 Rust ABI。
+45. macOS spike 的 `TextInputView` 必须作为真实 `NSScrollView.documentView` 运行；TextKit content
+    height、当前 clip viewport 和 Rust request 必须按同一 Revision 同步，命令、selection 写回和
+    IME commit 后都要触发 reveal。native point 与 Rust 逻辑单位的临时 scale 只能留在 bridge，
+    并记录替换为共享 shaped-layout metrics 的边界。
 
 ## 非目标
 

@@ -64,6 +64,12 @@ Cmd-Z/Cmd-Shift-Z 使用完整 source fallback。两类结果都必须按 Rust �
 `CaretScrollRequest`，验证 absolute target、stale Revision rejection、visible no-op 和返回文档
 原点的 top reveal。adapter 只拥有 AppKit viewport 状态，不把 scroll view 或 document view 传入 Rust。
 
+运行窗口现在也使用同一个 adapter：`TextInputView` 是 `NSScrollView.documentView`，TextKit
+used rect 会更新 native content height；命令、选择写回、IME commit 和窗口布局变化会按当前
+Revision 自动请求 caret reveal。Rust spike 以 line-height 1 的逻辑单位计算，bridge 临时按
+TextKit default line height 在 native point 与 Rust viewport 之间换算。这个 scale 只验证 host
+连接和消费时序，正式布局必须改为共享 shaped-layout metrics。
+
 `doCommand(by:)` 的删除、前后移动和换行 Selector 也会先查询 Rust command availability，再调用
 同一个 command execution FFI；取消 composition 保留为独立的 AppKit Selector，未知 Selector 不
 进入编辑器命令层。
