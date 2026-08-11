@@ -91,7 +91,8 @@ fn status_from_document_error(error: EditorDocumentError) -> i32 {
         EditorDocumentError::Position(_) => YU_FFI_INVALID_RANGE,
         EditorDocumentError::Projection(_) => YU_FFI_INVALID_RANGE,
         EditorDocumentError::Viewport(_) => YU_FFI_INVALID_RANGE,
-        EditorDocumentError::BlockOutOfBounds { .. } => YU_FFI_INVALID_RANGE,
+        EditorDocumentError::BlockOutOfBounds { .. }
+        | EditorDocumentError::BlockNotTaskList { .. } => YU_FFI_INVALID_RANGE,
         EditorDocumentError::Selection(SelectionError::StaleRevision { .. }) => {
             YU_FFI_STALE_REVISION
         }

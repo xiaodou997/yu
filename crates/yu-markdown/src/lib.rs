@@ -19,10 +19,11 @@ use yu_text::{
 mod block_sequence;
 mod inline;
 mod reference;
+mod task;
 
 pub use block_sequence::{
     Block, BlockCompactionPolicy, BlockKind, BlockSequence, BlockState, BlockStorageStats,
-    RetainedBlockStats,
+    RetainedBlockStats, TaskState,
 };
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
 pub use inline::{
@@ -30,6 +31,7 @@ pub use inline::{
     InlinePunctuation, InlineSpan, InlineSpanKind, parse_inline, parse_inline_with_definitions,
 };
 pub use reference::{ReferenceDefinition, ReferenceDefinitionIndex};
+pub use task::TaskMarker;
 
 /// A lossless block view of one immutable text revision.
 #[derive(Clone, Debug)]
@@ -797,11 +799,20 @@ impl BlockParser<'_> {
                 depth,
                 marker,
                 start,
-            } => BlockKind::ListItem {
-                ordered,
-                depth,
-                marker,
-                start,
+            } => match task::parse_task_marker(self.snapshot, line_range(first), ordered) {
+                Some(task) => BlockKind::TaskListItem {
+                    ordered,
+                    depth,
+                    marker,
+                    start,
+                    state: task.state(),
+                },
+                None => BlockKind::ListItem {
+                    ordered,
+                    depth,
+                    marker,
+                    start,
+                },
             },
         };
         self.record(kind, block_start, end, BlockState::Normal, source_hash)
@@ -815,6 +826,23 @@ impl BlockParser<'_> {
         *end = line.end;
         *source_hash = concatenate_hash(*source_hash, line.source_hash, line.end - line.start);
     }
+}
+
+fn line_range(line: Line) -> TextRange {
+    TextRange::new(
+        ByteOffset::try_from(line.start).expect("line start must fit u64"),
+        ByteOffset::try_from(line.end).expect("line end must fit u64"),
+    )
+    .expect("line range must be ordered")
+}
+
+/// Returns the parser-owned task marker range for a task-list block.
+#[must_use]
+pub fn task_marker(source: &TextSnapshot, block: Block) -> Option<TaskMarker> {
+    let BlockKind::TaskListItem { ordered, .. } = block.kind() else {
+        return None;
+    };
+    task::parse_task_marker(source, block.range(), ordered)
 }
 
 fn block(kind: BlockKind, start: usize, end: usize) -> Block {
@@ -1206,6 +1234,67 @@ mod tests {
     }
 
     #[test]
+    fn scanner_classifies_task_list_items_and_exposes_marker_ranges() {
+        let source = "- [ ] todo\n1. [x] done\n- [X] done\n- [x]attached\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let document = parse(&snapshot);
+
+        assert_eq!(document.blocks().len(), 4);
+        assert_eq!(
+            kind_at(&document, 0),
+            BlockKind::TaskListItem {
+                ordered: false,
+                depth: 0,
+                marker: '-',
+                start: 1,
+                state: TaskState::Todo,
+            }
+        );
+        assert_eq!(
+            kind_at(&document, 1),
+            BlockKind::TaskListItem {
+                ordered: true,
+                depth: 0,
+                marker: '.',
+                start: 1,
+                state: TaskState::Done,
+            }
+        );
+        assert_eq!(
+            kind_at(&document, 2),
+            BlockKind::TaskListItem {
+                ordered: false,
+                depth: 0,
+                marker: '-',
+                start: 1,
+                state: TaskState::Done,
+            }
+        );
+        assert_eq!(
+            kind_at(&document, 3),
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+                marker: '-',
+                start: 1,
+            }
+        );
+
+        let marker = task_marker(
+            &snapshot,
+            document.blocks().get(0).expect("task block should exist"),
+        )
+        .expect("task marker should be source-backed");
+        assert_eq!(marker.state(), TaskState::Todo);
+        assert_eq!(
+            &snapshot.as_str()[usize::try_from(marker.range().start()).expect("offset")
+                ..usize::try_from(marker.range().end()).expect("offset")],
+            "[ ]"
+        );
+        assert!(document.has_lossless_coverage());
+    }
+
+    #[test]
     fn scanner_does_not_treat_attached_markers_as_list_items() {
         let source = "-attached\n1.attached\n*attached\n";
         let document = parse(&TextBuffer::new(source).snapshot());
@@ -1418,6 +1507,53 @@ mod tests {
             full.reference_definitions().fingerprint()
         );
         assert_eq!(full.reference_definitions().definitions().len(), 1);
+    }
+
+    #[test]
+    fn incremental_parse_reclassifies_task_state_like_full_parse() {
+        let source = "- [ ] todo\n\n- [x] done\n";
+        let mut buffer = TextBuffer::new(source);
+        let previous = parse(&buffer.snapshot());
+        let state_offset = source.find("[ ]").expect("todo marker should exist") + 1;
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(
+                TextRange::new(
+                    ByteOffset::new(state_offset as u64),
+                    ByteOffset::new((state_offset + 1) as u64),
+                )
+                .expect("task state range should be ordered"),
+                "x",
+            )],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("task state edit should apply");
+        let incremental =
+            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+                .expect("task state edit should parse incrementally");
+        let full = parse(applied.result_snapshot());
+
+        assert_eq!(incremental.document(), &full);
+        assert!(matches!(
+            kind_at(&full, 0),
+            BlockKind::TaskListItem {
+                state: TaskState::Done,
+                ..
+            }
+        ));
+        assert!(matches!(
+            kind_at(&full, 2),
+            BlockKind::TaskListItem {
+                state: TaskState::Done,
+                ..
+            }
+        ));
+        assert!(
+            incremental
+                .reparsed_range()
+                .contains(ByteOffset::new(state_offset as u64))
+        );
     }
 
     #[test]
