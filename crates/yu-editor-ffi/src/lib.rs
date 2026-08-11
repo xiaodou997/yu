@@ -4,7 +4,8 @@ use std::ptr;
 
 use yu_core::{TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
-    CaretAffinity, EditorDocument, EditorDocumentError, EditorSelection, SelectionError,
+    CaretAffinity, CommandResult, EditorCommand, EditorDocument, EditorDocumentError, EditorKey,
+    EditorSelection, KeyEvent, KeyModifiers, SelectionError, command_for_key,
 };
 use yu_text::{EditError, TextSnapshot};
 
@@ -17,8 +18,46 @@ pub const YU_FFI_NO_OVERLAY: i32 = 5;
 pub const YU_FFI_BUFFER_TOO_SMALL: i32 = 6;
 pub const YU_FFI_EDIT_FAILED: i32 = 7;
 pub const YU_FFI_STALE_REVISION: i32 = 8;
+pub const YU_FFI_KEY_UNHANDLED: i32 = 9;
+pub const YU_FFI_INVALID_COMMAND: i32 = 10;
+pub const YU_FFI_INVALID_KEY: i32 = 11;
 pub const YU_CARET_AFFINITY_UPSTREAM: u8 = 0;
 pub const YU_CARET_AFFINITY_DOWNSTREAM: u8 = 1;
+pub const YU_KEY_CHARACTER: u8 = 0;
+pub const YU_KEY_ENTER: u8 = 1;
+pub const YU_KEY_TAB: u8 = 2;
+pub const YU_KEY_BACKSPACE: u8 = 3;
+pub const YU_KEY_DELETE: u8 = 4;
+pub const YU_KEY_LEFT: u8 = 5;
+pub const YU_KEY_RIGHT: u8 = 6;
+pub const YU_KEY_UP: u8 = 7;
+pub const YU_KEY_DOWN: u8 = 8;
+pub const YU_KEY_ESCAPE: u8 = 9;
+pub const YU_KEY_MODIFIER_COMMAND: u8 = 1 << 0;
+pub const YU_KEY_MODIFIER_SHIFT: u8 = 1 << 1;
+pub const YU_KEY_MODIFIER_CONTROL: u8 = 1 << 2;
+pub const YU_KEY_MODIFIER_OPTION: u8 = 1 << 3;
+pub const YU_EDITOR_COMMAND_DELETE_BACKWARD: u8 = 1;
+pub const YU_EDITOR_COMMAND_DELETE_FORWARD: u8 = 2;
+pub const YU_EDITOR_COMMAND_MOVE_LEFT: u8 = 3;
+pub const YU_EDITOR_COMMAND_MOVE_RIGHT: u8 = 4;
+pub const YU_EDITOR_COMMAND_INSERT_NEWLINE: u8 = 5;
+pub const YU_EDITOR_COMMAND_INDENT_LIST: u8 = 6;
+pub const YU_EDITOR_COMMAND_OUTDENT_LIST: u8 = 7;
+pub const YU_EDITOR_COMMAND_UNDO: u8 = 8;
+pub const YU_EDITOR_COMMAND_REDO: u8 = 9;
+pub const YU_EDITOR_COMMAND_TOGGLE_TASK: u8 = 10;
+
+/// Revision and UTF-16 selection returned after one native command.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuEditorCommandResult {
+    pub revision: u64,
+    pub selection_start_utf16: u64,
+    pub selection_end_utf16: u64,
+    pub affinity: u8,
+    pub changed: u8,
+}
 
 /// Opaque state owned by the Rust side of the native composition bridge.
 #[repr(C)]
@@ -105,6 +144,71 @@ fn status_from_document_error(error: EditorDocumentError) -> i32 {
 
 fn status_from_selection_error(error: SelectionError) -> i32 {
     status_from_document_error(EditorDocumentError::Selection(error))
+}
+
+fn write_command_result(
+    session: &YuCompositionSession,
+    result: CommandResult,
+    output: *mut YuEditorCommandResult,
+) -> i32 {
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    let snapshot = session.document.snapshot();
+    let range = match result.selection().utf16_range(&snapshot) {
+        Ok(range) => range,
+        Err(error) => return status_from_selection_error(error),
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuEditorCommandResult {
+            revision: result.revision().get(),
+            selection_start_utf16: range.start().get(),
+            selection_end_utf16: range.end().get(),
+            affinity: match result.selection().affinity() {
+                CaretAffinity::Upstream => YU_CARET_AFFINITY_UPSTREAM,
+                CaretAffinity::Downstream => YU_CARET_AFFINITY_DOWNSTREAM,
+            },
+            changed: u8::from(result.changed()),
+        };
+    }
+    YU_FFI_OK
+}
+
+fn editor_command_from_ffi(command: u8, block: u64) -> Result<EditorCommand, i32> {
+    match command {
+        YU_EDITOR_COMMAND_DELETE_BACKWARD => Ok(EditorCommand::DeleteBackward),
+        YU_EDITOR_COMMAND_DELETE_FORWARD => Ok(EditorCommand::DeleteForward),
+        YU_EDITOR_COMMAND_MOVE_LEFT => Ok(EditorCommand::MoveLeft),
+        YU_EDITOR_COMMAND_MOVE_RIGHT => Ok(EditorCommand::MoveRight),
+        YU_EDITOR_COMMAND_INSERT_NEWLINE => Ok(EditorCommand::insert_newline()),
+        YU_EDITOR_COMMAND_INDENT_LIST => Ok(EditorCommand::indent_list()),
+        YU_EDITOR_COMMAND_OUTDENT_LIST => Ok(EditorCommand::outdent_list()),
+        YU_EDITOR_COMMAND_UNDO => Ok(EditorCommand::undo()),
+        YU_EDITOR_COMMAND_REDO => Ok(EditorCommand::redo()),
+        YU_EDITOR_COMMAND_TOGGLE_TASK => usize::try_from(block)
+            .map(EditorCommand::toggle_task)
+            .map_err(|_| YU_FFI_INVALID_RANGE),
+        _ => Err(YU_FFI_INVALID_COMMAND),
+    }
+}
+
+fn editor_key_from_ffi(kind: u8, value: u32) -> Result<EditorKey, i32> {
+    match kind {
+        YU_KEY_CHARACTER => char::from_u32(value)
+            .map(EditorKey::Character)
+            .ok_or(YU_FFI_INVALID_KEY),
+        YU_KEY_ENTER => Ok(EditorKey::Enter),
+        YU_KEY_TAB => Ok(EditorKey::Tab),
+        YU_KEY_BACKSPACE => Ok(EditorKey::Backspace),
+        YU_KEY_DELETE => Ok(EditorKey::Delete),
+        YU_KEY_LEFT => Ok(EditorKey::Left),
+        YU_KEY_RIGHT => Ok(EditorKey::Right),
+        YU_KEY_UP => Ok(EditorKey::Up),
+        YU_KEY_DOWN => Ok(EditorKey::Down),
+        YU_KEY_ESCAPE => Ok(EditorKey::Escape),
+        _ => Err(YU_FFI_INVALID_KEY),
+    }
 }
 
 fn write_snapshot_range(
@@ -268,6 +372,82 @@ pub unsafe extern "C" fn yu_composition_session_reset_source(
         .document
         .reset_source(source)
         .map_or_else(status_from_document_error, |_| YU_FFI_OK)
+}
+
+/// Executes one revision-independent editor command and returns the resulting
+/// UTF-16 selection. The command is applied to canonical source; an active
+/// composition must be committed or cancelled by the native text-input layer
+/// before calling this entry point.
+///
+/// `block` is only read for `YU_EDITOR_COMMAND_TOGGLE_TASK` and is otherwise
+/// ignored.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuEditorCommandResult`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_execute_command(
+    session: *mut YuCompositionSession,
+    command: u8,
+    block: u64,
+    output: *mut YuEditorCommandResult,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if session.document.composition().is_some() {
+        return YU_FFI_EDIT_FAILED;
+    }
+    let command = match editor_command_from_ffi(command, block) {
+        Ok(command) => command,
+        Err(status) => return status,
+    };
+    let result = match session.document.execute(command) {
+        Ok(result) => result,
+        Err(error) => return status_from_document_error(error),
+    };
+    write_command_result(session, result, output)
+}
+
+/// Resolves one native logical key and, when it is a Yu command shortcut,
+/// executes it against canonical source. A return value of
+/// [`YU_FFI_KEY_UNHANDLED`] means the caller should pass the event to its
+/// native text-input/default command path; source and selection are unchanged.
+///
+/// `key_kind` uses the `YU_KEY_*` constants. For `YU_KEY_CHARACTER`, `key`
+/// contains one Unicode scalar value; for special keys it is ignored.
+/// `modifiers` uses the `YU_KEY_MODIFIER_*` bits.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuEditorCommandResult`] when the key is handled.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_route_key(
+    session: *mut YuCompositionSession,
+    key_kind: u8,
+    key: u32,
+    modifiers: u8,
+    output: *mut YuEditorCommandResult,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    let key = match editor_key_from_ffi(key_kind, key) {
+        Ok(key) => key,
+        Err(status) => return status,
+    };
+    let event = KeyEvent::new(key, KeyModifiers::from_bits(modifiers));
+    let Some(command) = command_for_key(event) else {
+        return YU_FFI_KEY_UNHANDLED;
+    };
+    if session.document.composition().is_some() {
+        return YU_FFI_EDIT_FAILED;
+    }
+    let result = match session.document.execute(command) {
+        Ok(result) => result,
+        Err(error) => return status_from_document_error(error),
+    };
+    write_command_result(session, result, output)
 }
 
 /// Starts a composition overlay using UTF-16 source and selection ranges.
@@ -736,6 +916,120 @@ mod tests {
         assert_eq!(selection_end, 7);
         assert_eq!(selection_affinity, YU_CARET_AFFINITY_DOWNSTREAM);
 
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_key_route_executes_macos_undo_redo_and_leaves_text_keys_unhandled() {
+        let handle = session("a");
+        assert_eq!(
+            unsafe { yu_composition_session_begin(handle, 1, 1, ptr::null(), 0, 0, 0) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_commit(handle, b"b".as_ptr(), 1) },
+            YU_FFI_OK
+        );
+
+        let mut result = YuEditorCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_route_key(
+                    handle,
+                    YU_KEY_CHARACTER,
+                    u32::from(b'z'),
+                    YU_KEY_MODIFIER_COMMAND,
+                    &mut result,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            (
+                result.revision,
+                result.selection_start_utf16,
+                result.selection_end_utf16,
+                result.changed,
+            ),
+            (2, 1, 1, 1)
+        );
+        let mut source_length = 0;
+        assert_eq!(
+            unsafe { yu_composition_session_source_length(handle, &mut source_length) },
+            YU_FFI_OK
+        );
+        let mut source = vec![0_u8; source_length];
+        assert_eq!(
+            unsafe {
+                yu_composition_session_copy_source(handle, source.as_mut_ptr(), source.len())
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(source, b"a");
+
+        assert_eq!(
+            unsafe {
+                yu_composition_session_route_key(
+                    handle,
+                    YU_KEY_CHARACTER,
+                    u32::from(b'z'),
+                    YU_KEY_MODIFIER_COMMAND | YU_KEY_MODIFIER_SHIFT,
+                    &mut result,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!((result.revision, result.selection_start_utf16), (3, 2));
+        assert_eq!(
+            unsafe {
+                yu_composition_session_route_key(
+                    handle,
+                    YU_KEY_CHARACTER,
+                    u32::from(b'x'),
+                    0,
+                    &mut result,
+                )
+            },
+            YU_FFI_KEY_UNHANDLED
+        );
+
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_execute_command_rejects_active_composition_and_unknown_commands() {
+        let handle = session("a");
+        let mut result = YuEditorCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_execute_command(
+                    handle,
+                    YU_EDITOR_COMMAND_UNDO,
+                    0,
+                    &mut result,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_execute_command(handle, 255, 0, &mut result) },
+            YU_FFI_INVALID_COMMAND
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_begin(handle, 1, 1, b"x".as_ptr(), 1, 1, 1) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_execute_command(
+                    handle,
+                    YU_EDITOR_COMMAND_DELETE_BACKWARD,
+                    0,
+                    &mut result,
+                )
+            },
+            YU_FFI_EDIT_FAILED
+        );
         unsafe { yu_composition_session_destroy(handle) };
     }
 

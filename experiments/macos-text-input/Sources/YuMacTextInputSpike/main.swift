@@ -9,6 +9,33 @@ private enum RustCaretAffinity: UInt8 {
     case downstream = 1
 }
 
+private struct RustCommandResult {
+    let revision: UInt64
+    let range: NSRange
+    let affinity: NSSelectionAffinity
+    let changed: Bool
+}
+
+private enum YuNativeKeyKind {
+    static let character = UInt8(YU_KEY_CHARACTER)
+    static let enter = UInt8(YU_KEY_ENTER)
+    static let tab = UInt8(YU_KEY_TAB)
+    static let backspace = UInt8(YU_KEY_BACKSPACE)
+    static let delete = UInt8(YU_KEY_DELETE)
+    static let left = UInt8(YU_KEY_LEFT)
+    static let right = UInt8(YU_KEY_RIGHT)
+    static let up = UInt8(YU_KEY_UP)
+    static let down = UInt8(YU_KEY_DOWN)
+    static let escape = UInt8(YU_KEY_ESCAPE)
+}
+
+private enum YuNativeModifier {
+    static let command = UInt8(YU_KEY_MODIFIER_COMMAND)
+    static let shift = UInt8(YU_KEY_MODIFIER_SHIFT)
+    static let control = UInt8(YU_KEY_MODIFIER_CONTROL)
+    static let option = UInt8(YU_KEY_MODIFIER_OPTION)
+}
+
 private final class RustCompositionBridge {
     private var session: OpaquePointer?
     private(set) var hasOverlay = false
@@ -155,6 +182,40 @@ private final class RustCompositionBridge {
         precondition(status == 0, "Rust composition selection update failed: \(status)")
     }
 
+    func executeCommand(command: UInt8, block: UInt64 = 0) -> RustCommandResult {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var result = YuEditorCommandResult()
+        let status = yu_composition_session_execute_command(
+            session,
+            command,
+            block,
+            &result
+        )
+        precondition(status == 0, "Rust editor command failed: \(status)")
+        return commandResult(result)
+    }
+
+    func routeKey(
+        kind: UInt8,
+        value: UInt32 = 0,
+        modifiers: UInt8 = 0
+    ) -> RustCommandResult? {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var result = YuEditorCommandResult()
+        let status = yu_composition_session_route_key(
+            session,
+            kind,
+            value,
+            modifiers,
+            &result
+        )
+        if status == Int32(YU_FFI_KEY_UNHANDLED) {
+            return nil
+        }
+        precondition(status == 0, "Rust native key route failed: \(status)")
+        return commandResult(result)
+    }
+
     func sourceString(utf16Length: Int) -> String {
         guard let session else { preconditionFailure("Rust composition session is missing") }
         precondition(utf16Length >= 0, "Rust composition UTF-16 length must be non-negative")
@@ -187,6 +248,21 @@ private final class RustCompositionBridge {
         return String(decoding: bytes, as: UTF8.self)
     }
 
+    func sourceString() -> String {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var length = 0
+        precondition(
+            yu_composition_session_source_length(session, &length) == 0,
+            "Rust composition source length failed"
+        )
+        var bytes = [UInt8](repeating: 0, count: length)
+        let status = bytes.withUnsafeMutableBufferPointer { buffer in
+            yu_composition_session_copy_source(session, buffer.baseAddress, buffer.count)
+        }
+        precondition(status == 0, "Rust composition source copy failed: \(status)")
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
     func overlayString() -> String {
         guard let session else { preconditionFailure("Rust composition session is missing") }
         precondition(hasOverlay, "Rust composition overlay is not active")
@@ -211,6 +287,31 @@ private final class RustCompositionBridge {
         let status = yu_composition_session_overlay_selection(session, &start, &end)
         precondition(status == 0, "Rust composition selection query failed: \(status)")
         return NSRange(location: Int(start), length: Int(end - start))
+    }
+
+    private func commandResult(_ result: YuEditorCommandResult) -> RustCommandResult {
+        precondition(
+            result.selection_end_utf16 >= result.selection_start_utf16,
+            "Rust command selection range must be ordered"
+        )
+        let nativeAffinity: NSSelectionAffinity
+        switch RustCaretAffinity(rawValue: result.affinity) {
+        case .upstream:
+            nativeAffinity = .upstream
+        case .downstream:
+            nativeAffinity = .downstream
+        case nil:
+            preconditionFailure("Rust command selection affinity is invalid: \(result.affinity)")
+        }
+        return RustCommandResult(
+            revision: result.revision,
+            range: NSRange(
+                location: Int(result.selection_start_utf16),
+                length: Int(result.selection_end_utf16 - result.selection_start_utf16)
+            ),
+            affinity: nativeAffinity,
+            changed: result.changed != 0
+        )
     }
 }
 
@@ -288,6 +389,9 @@ final class TextInputView: NSView, NSTextInputClient {
     }
 
     override func keyDown(with event: NSEvent) {
+        if routeNativeKey(event) {
+            return
+        }
         if inputContext?.handleEvent(event) != true {
             super.keyDown(with: event)
         }
@@ -622,6 +726,62 @@ final class TextInputView: NSView, NSTextInputClient {
         )
     }
 
+    func runNativeCommandRoutingSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let base = textStorage.string
+
+        marked = notFoundRange
+        selection = NSRange(location: textStorage.length, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection)
+        insertText("z", replacementRange: notFoundRange)
+        let afterInsert = textStorage.string
+
+        guard
+            let undo = rustComposition.routeKey(
+                kind: YuNativeKeyKind.character,
+                value: 0x7a,
+                modifiers: YuNativeModifier.command
+            )
+        else {
+            preconditionFailure("Cmd-Z must be consumed by the Rust command route")
+        }
+        applyRustCommandResult(undo)
+        precondition(textStorage.string == base, "Cmd-Z must restore the source")
+
+        guard
+            let redo = rustComposition.routeKey(
+                kind: YuNativeKeyKind.character,
+                value: 0x7a,
+                modifiers: YuNativeModifier.command | YuNativeModifier.shift
+            )
+        else {
+            preconditionFailure("Cmd-Shift-Z must be consumed by the Rust command route")
+        }
+        applyRustCommandResult(redo)
+        precondition(textStorage.string == afterInsert, "Cmd-Shift-Z must restore the edit")
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        needsDisplay = true
+        print(
+            "Native command self-check undo=Cmd-Z redo=Cmd-Shift-Z "
+                + "source=restored changed=\(undo.changed)/\(redo.changed)"
+        )
+    }
+
     func runLayoutRoundTripSelfCheck() {
         updateContainerSize()
         layoutManager.ensureLayout(for: textContainer)
@@ -776,6 +936,96 @@ final class TextInputView: NSView, NSTextInputClient {
             insertText("\n", replacementRange: notFoundRange)
         default:
             print("unhandled command: \(command)")
+        }
+    }
+
+    private func routeNativeKey(_ event: NSEvent) -> Bool {
+        // NSTextInputClient owns marked text. Let the input context consume
+        // every key while a preedit is visible; otherwise Cmd-Z could mutate
+        // canonical source while the native overlay is still active.
+        guard !hasMarkedText() else { return false }
+
+        let key: (kind: UInt8, value: UInt32)
+        switch event.keyCode {
+        case 36, 76:
+            key = (YuNativeKeyKind.enter, 0)
+        case 48:
+            key = (YuNativeKeyKind.tab, 0)
+        case 51:
+            key = (YuNativeKeyKind.backspace, 0)
+        case 117:
+            key = (YuNativeKeyKind.delete, 0)
+        case 123:
+            key = (YuNativeKeyKind.left, 0)
+        case 124:
+            key = (YuNativeKeyKind.right, 0)
+        case 125:
+            key = (YuNativeKeyKind.down, 0)
+        case 126:
+            key = (YuNativeKeyKind.up, 0)
+        case 53:
+            key = (YuNativeKeyKind.escape, 0)
+        default:
+            guard
+                let characters = event.charactersIgnoringModifiers,
+                characters.unicodeScalars.count == 1,
+                let scalar = characters.unicodeScalars.first
+            else {
+                return false
+            }
+            key = (YuNativeKeyKind.character, scalar.value)
+        }
+
+        var modifiers: UInt8 = 0
+        if event.modifierFlags.contains(.command) {
+            modifiers |= YuNativeModifier.command
+        }
+        if event.modifierFlags.contains(.shift) {
+            modifiers |= YuNativeModifier.shift
+        }
+        if event.modifierFlags.contains(.control) {
+            modifiers |= YuNativeModifier.control
+        }
+        if event.modifierFlags.contains(.option) {
+            modifiers |= YuNativeModifier.option
+        }
+
+        guard let result = rustComposition.routeKey(
+            kind: key.kind,
+            value: key.value,
+            modifiers: modifiers
+        ) else {
+            return false
+        }
+        applyRustCommandResult(result)
+        return true
+    }
+
+    private func applyRustCommandResult(_ result: RustCommandResult) {
+        precondition(!hasMarkedText() && !rustComposition.hasOverlay)
+        precondition(
+            rustComposition.revision() == result.revision,
+            "Rust command result must belong to the current revision"
+        )
+        let source = rustComposition.sourceString()
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: source, marked: false)
+        )
+        guard let selection = validatedAccessibilityRange(result.range) else {
+            preconditionFailure("Rust command returned an invalid native selection")
+        }
+        self.selection = selection
+        selectionAffinity = result.affinity
+        marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
+        needsDisplay = true
+        if result.changed {
+            postTextChanged()
+        } else {
+            postSelectionChanged()
         }
     }
 
@@ -1112,6 +1362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeFirstResponder(inputView)
         inputView.runLayoutRoundTripSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
+        inputView.runNativeCommandRoutingSelfCheck()
         inputView.runNativeSelectionSelfCheck()
         inputView.runAccessibilitySelfCheck()
         NSApp.activate(ignoringOtherApps: true)
