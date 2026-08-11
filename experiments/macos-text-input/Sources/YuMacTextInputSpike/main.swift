@@ -62,10 +62,22 @@ private final class YuNativeViewportAdapter {
         self.contentHeight = contentHeight
         if let documentView = scrollView.documentView {
             var frame = documentView.frame
+            let viewportWidth = scrollView.contentView.bounds.width
+            if viewportWidth > 0 {
+                frame.size.width = viewportWidth
+            }
             frame.size.height = contentHeight
             documentView.frame = frame
         }
-        scrollView.layoutSubtreeIfNeeded()
+        scrollView.contentView.needsLayout = true
+    }
+
+    func viewportMetrics() -> (scrollY: CGFloat, height: CGFloat) {
+        let bounds = scrollView.contentView.bounds
+        return (
+            max(bounds.origin.y, 0),
+            max(bounds.height, 1)
+        )
     }
 
     func apply(
@@ -324,16 +336,18 @@ private final class RustCompositionBridge {
     func caretScrollRequest(
         scrollY: CGFloat,
         viewportHeight: CGFloat,
-        margin: CGFloat
+        margin: CGFloat,
+        scale: CGFloat = 1
     ) -> RustCaretScrollResult {
         guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(scale.isFinite && scale > 0, "caret scroll scale must be positive")
         var result = YuEditorCaretScrollRequest()
         let status = yu_composition_session_caret_scroll_request(
             session,
             revision(),
-            Float(scrollY),
-            Float(viewportHeight),
-            Float(margin),
+            Float(scrollY / scale),
+            Float(viewportHeight / scale),
+            Float(margin / scale),
             &result
         )
         precondition(status == 0, "Rust caret scroll request failed: \(status)")
@@ -341,13 +355,13 @@ private final class RustCompositionBridge {
             revision: result.revision,
             source: Int(result.source_utf16),
             block: Int(result.block_index),
-            caretX: CGFloat(result.caret_x),
-            caretY: CGFloat(result.caret_y),
-            caretWidth: CGFloat(result.caret_width),
-            caretHeight: CGFloat(result.caret_height),
-            currentScrollY: CGFloat(result.current_scroll_y),
-            targetScrollY: CGFloat(result.target_scroll_y),
-            margin: CGFloat(result.margin),
+            caretX: CGFloat(result.caret_x) * scale,
+            caretY: CGFloat(result.caret_y) * scale,
+            caretWidth: CGFloat(result.caret_width) * scale,
+            caretHeight: CGFloat(result.caret_height) * scale,
+            currentScrollY: CGFloat(result.current_scroll_y) * scale,
+            targetScrollY: CGFloat(result.target_scroll_y) * scale,
+            margin: CGFloat(result.margin) * scale,
             needsScroll: result.needs_scroll != 0
         )
     }
@@ -496,6 +510,8 @@ final class TextInputView: NSView, NSTextInputClient {
     private var compositionSelectionBefore: NSRange?
     private var compositionAffinityBefore: NSSelectionAffinity?
     private var rustComposition: RustCompositionBridge!
+    private var viewportAdapter: YuNativeViewportAdapter?
+    private var synchronizingViewport = false
 
     private let textOrigin = NSPoint(x: 24, y: 24)
     private let maximumTextWidth: CGFloat = 360
@@ -533,6 +549,11 @@ final class TextInputView: NSView, NSTextInputClient {
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
 
+    fileprivate func attachViewportAdapter(_ adapter: YuNativeViewportAdapter) {
+        viewportAdapter = adapter
+        synchronizeViewport()
+    }
+
     override func updateLayer() {
         layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
     }
@@ -540,6 +561,7 @@ final class TextInputView: NSView, NSTextInputClient {
     override func layout() {
         super.layout()
         updateContainerSize()
+        synchronizeViewport()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -583,6 +605,7 @@ final class TextInputView: NSView, NSTextInputClient {
         rustComposition.setSelection(selection, affinity: selectionAffinity)
         needsDisplay = true
         postSelectionChanged()
+        synchronizeViewport()
     }
 
     func insertText(_ value: Any, replacementRange: NSRange) {
@@ -613,6 +636,7 @@ final class TextInputView: NSView, NSTextInputClient {
         compositionAffinityBefore = nil
         needsDisplay = true
         postTextChanged()
+        synchronizeViewport()
     }
 
     func setMarkedText(
@@ -763,6 +787,7 @@ final class TextInputView: NSView, NSTextInputClient {
         rustComposition.setSelection(selection)
         needsDisplay = true
         postSelectionChanged()
+        synchronizeViewport()
     }
 
     override func accessibilitySelectedTextRanges() -> [NSValue]? {
@@ -1141,10 +1166,54 @@ final class TextInputView: NSView, NSTextInputClient {
         rustComposition.resetSource(textStorage.string)
         rustComposition.setSelection(selection, affinity: selectionAffinity)
         needsDisplay = true
+        synchronizeViewport()
         print(
             "Viewport self-check caret-source=\(reveal.source) block=\(reveal.block) "
                 + "target=\(reveal.targetScrollY) native=\(nativeTarget) "
                 + "stale=rejected noop=\(!visible.needsScroll)"
+        )
+    }
+
+    func runAttachedViewportSelfCheck() {
+        guard let viewportAdapter else {
+            preconditionFailure("attached viewport self-check requires an NSScrollView host")
+        }
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let source = (0..<40).map { "line-\($0)" }.joined(separator: "\n") + "\n"
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: source, marked: false)
+        )
+        rustComposition.resetSource(source)
+        selection = NSRange(location: source.utf16.count, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        synchronizeViewport()
+
+        let metrics = viewportAdapter.viewportMetrics()
+        let longContentHeight = viewportAdapter.contentHeight
+        precondition(viewportAdapter.revision == rustComposition.revision())
+        precondition(longContentHeight >= metrics.height)
+        if longContentHeight > metrics.height {
+            precondition(metrics.scrollY > 0, "attached viewport must reveal the long document caret")
+        }
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        synchronizeViewport()
+        needsDisplay = true
+        print(
+            "Attached viewport self-check content=\(longContentHeight) "
+                + "viewport=\(metrics.height) scroll=\(metrics.scrollY)"
         )
     }
 
@@ -1433,6 +1502,7 @@ final class TextInputView: NSView, NSTextInputClient {
         } else {
             postSelectionChanged()
         }
+        synchronizeViewport()
     }
 
     private func attributedString(from value: Any, marked: Bool) -> NSAttributedString {
@@ -1626,6 +1696,7 @@ final class TextInputView: NSView, NSTextInputClient {
         rustComposition.cancel()
         needsDisplay = true
         postTextChanged()
+        synchronizeViewport()
     }
 
     private func updateContainerSize() {
@@ -1633,6 +1704,40 @@ final class TextInputView: NSView, NSTextInputClient {
             width: min(max(bounds.width - textOrigin.x * 2, 1), maximumTextWidth),
             height: .greatestFiniteMagnitude
         )
+    }
+
+    /// Bridges native TextKit points to the logical units used by Rust layout.
+    /// The spike uses one Rust line-height unit; the real engine will replace
+    /// this scale with shared shaped-layout metrics.
+    private func synchronizeViewport() {
+        guard let viewportAdapter, !synchronizingViewport, !hasMarkedText() else { return }
+        synchronizingViewport = true
+        defer { synchronizingViewport = false }
+
+        updateContainerSize()
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        let extraLineRect = layoutManager.extraLineFragmentUsedRect
+        let usedBottom = max(usedRect.maxY, extraLineRect.maxY)
+        let viewportHeight = viewportAdapter.viewportMetrics().height
+        let contentHeight = max(viewportHeight, textOrigin.y * 2 + usedBottom)
+        let revision = rustComposition.revision()
+        viewportAdapter.configure(revision: revision, contentHeight: contentHeight)
+
+        let metrics = viewportAdapter.viewportMetrics()
+        let scale = nativeLineHeight()
+        let request = rustComposition.caretScrollRequest(
+            scrollY: metrics.scrollY,
+            viewportHeight: metrics.height,
+            margin: 8,
+            scale: scale
+        )
+        _ = viewportAdapter.apply(request, currentRevision: revision)
+    }
+
+    private func nativeLineHeight() -> CGFloat {
+        let font = defaultAttributes[.font] as? NSFont ?? NSFont.systemFont(ofSize: 22)
+        return max(layoutManager.defaultLineHeight(for: font), 1)
     }
 
     private func caretRect(
@@ -1728,15 +1833,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "Yu — macOS Text Input Spike"
         window.center()
 
-        let inputView = TextInputView(frame: frame)
-        inputView.autoresizingMask = [.width, .height]
-        window.contentView = inputView
+        let scrollView = NSScrollView(frame: frame)
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = true
+
+        let inputView = TextInputView(
+            frame: NSRect(origin: .zero, size: scrollView.contentSize)
+        )
+        inputView.autoresizingMask = [.width]
+        scrollView.documentView = inputView
+        window.contentView = scrollView
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(inputView)
+        inputView.attachViewportAdapter(YuNativeViewportAdapter(scrollView: scrollView))
         inputView.runLayoutRoundTripSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
         inputView.runNativeCommandRoutingSelfCheck()
         inputView.runViewportScrollSelfCheck()
+        inputView.runAttachedViewportSelfCheck()
         inputView.runNativeSelectionSelfCheck()
         inputView.runAccessibilitySelfCheck()
         NSApp.activate(ignoringOtherApps: true)
