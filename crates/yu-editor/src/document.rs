@@ -573,18 +573,8 @@ impl EditorDocument {
             EditorCommand::MoveWordRight => {
                 !self.selection.is_empty() || self.selection.focus() < snapshot.len_bytes()
             }
-            EditorCommand::MoveUp => {
-                !self.selection.is_empty()
-                    || self
-                        .current_block_range()
-                        .is_some_and(|range| self.selection.focus() > range.start())
-            }
-            EditorCommand::MoveDown => {
-                !self.selection.is_empty()
-                    || self
-                        .current_block_range()
-                        .is_some_and(|range| self.selection.focus() < range.end())
-            }
+            EditorCommand::MoveUp => self.vertical_command_available(VerticalDirection::Up),
+            EditorCommand::MoveDown => self.vertical_command_available(VerticalDirection::Down),
             EditorCommand::InsertNewline => true,
             EditorCommand::IndentList => self
                 .current_list_line()
@@ -1125,30 +1115,50 @@ impl EditorDocument {
             crate::CaretAffinity::Downstream => ProjectionBias::After,
         };
         let preferred_x = self.preferred_x.map(PreferredCaretX::value);
-        let (target, target_x, target_width) = {
+        let block_count = self.markdown.blocks().len();
+        let (current_x, target_block) = {
             let layout = self.block_layout(block_index, LayoutConfig::default())?;
             let caret = layout.caret_for_source(focus, projection_bias)?;
-            let target_line_index = match direction {
-                VerticalDirection::Up => caret.line().checked_sub(1),
-                VerticalDirection::Down => caret.line().checked_add(1),
+            let line_count = navigable_line_count(layout, block_index + 1 < block_count);
+            let next_line = caret.line().checked_add(1);
+            let target_block = match direction {
+                VerticalDirection::Up if caret.line() > 0 && caret.line() < line_count => {
+                    Some((block_index, Some(caret.line() - 1)))
+                }
+                VerticalDirection::Up => block_index.checked_sub(1).map(|index| (index, None)),
+                VerticalDirection::Down => {
+                    if let Some(next_line) = next_line.filter(|line| *line < line_count) {
+                        Some((block_index, Some(next_line)))
+                    } else {
+                        let next = block_index.saturating_add(1);
+                        (next < block_count).then_some((next, Some(0)))
+                    }
+                }
             };
-            let Some(target_line_index) = target_line_index else {
-                return Ok(self.command_result(false));
-            };
+            (caret.point().x(), target_block)
+        };
+        let Some((target_block, target_line)) = target_block else {
+            return Ok(self.command_result(false));
+        };
+        let desired_x = preferred_x.unwrap_or(current_x);
+        let (target, target_width) = {
+            let layout = self.block_layout(target_block, LayoutConfig::default())?;
+            let target_line_index = target_line.unwrap_or_else(|| {
+                navigable_line_count(layout, target_block + 1 < block_count).saturating_sub(1)
+            });
             let Some(target_line) = layout.lines().get(target_line_index) else {
                 return Ok(self.command_result(false));
             };
-            let desired_x = preferred_x.unwrap_or(caret.point().x());
             let hit = layout.hit_test(LayoutPoint::new(desired_x, target_line.y()))?;
-            (hit.source(), desired_x, target_line.width())
+            (hit.source(), target_line.width())
         };
 
         self.selection = EditorSelection::cursor(
             &source,
             target,
-            vertical_hit_affinity(target_x, target_width),
+            vertical_hit_affinity(desired_x, target_width),
         )?;
-        self.preferred_x = Some(PreferredCaretX::new(target_x));
+        self.preferred_x = Some(PreferredCaretX::new(desired_x));
         Ok(self.command_result(false))
     }
 
@@ -1169,9 +1179,25 @@ impl EditorDocument {
         ending_at_offset
     }
 
-    fn current_block_range(&self) -> Option<TextRange> {
-        self.block_index_for_offset(self.selection.focus())
-            .and_then(|index| self.markdown.blocks().get(index).map(|block| block.range()))
+    fn vertical_command_available(&self, direction: VerticalDirection) -> bool {
+        if !self.selection.is_empty() {
+            return true;
+        }
+        let Some(block_index) = self.block_index_for_offset(self.selection.focus()) else {
+            return false;
+        };
+        let Some(block) = self.markdown.blocks().get(block_index) else {
+            return false;
+        };
+        match direction {
+            VerticalDirection::Up => {
+                block_index > 0 || self.selection.focus() > block.range().start()
+            }
+            VerticalDirection::Down => {
+                block_index.saturating_add(1) < self.markdown.blocks().len()
+                    || self.selection.focus() < block.range().end()
+            }
+        }
     }
 
     fn command_result(&self, changed: bool) -> CommandResult {
@@ -1275,6 +1301,18 @@ fn vertical_hit_affinity(x: f32, line_width: f32) -> crate::CaretAffinity {
         crate::CaretAffinity::Upstream
     } else {
         crate::CaretAffinity::Downstream
+    }
+}
+
+fn navigable_line_count(layout: &LayoutSnapshot, has_following_block: bool) -> usize {
+    let line_count = layout.lines().len();
+    let has_synthetic_trailing_line = layout.lines().last().is_some_and(|line| {
+        line.source().is_empty() && line.source().start() == layout.source_range().end()
+    });
+    if has_following_block && line_count > 1 && has_synthetic_trailing_line {
+        line_count - 1
+    } else {
+        line_count
     }
 }
 
@@ -1820,6 +1858,28 @@ mod tests {
             .execute(EditorCommand::move_down())
             .expect("down at the block boundary should be a no-op");
         assert_eq!(document.selection().focus().get(), 4);
+    }
+
+    #[test]
+    fn vertical_commands_cross_adjacent_markdown_blocks() {
+        let source = "# title\ntext";
+        let mut document = EditorDocument::new(source);
+        set_caret(
+            &mut document,
+            source.find("text").expect("paragraph should exist"),
+        );
+        assert!(document.command_available(&EditorCommand::move_up()));
+
+        document
+            .execute(EditorCommand::move_up())
+            .expect("up should enter the preceding heading block");
+        assert_eq!(document.selection().focus().get(), 0);
+
+        document
+            .execute(EditorCommand::move_down())
+            .expect("down should return to the following paragraph block");
+        assert_eq!(document.selection().focus().get(), 8);
+        assert_eq!(document.snapshot().as_str(), source);
     }
 
     #[test]

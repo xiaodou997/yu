@@ -887,6 +887,20 @@ final class TextInputView: NSView, NSTextInputClient {
             "repeated Selector moveDown must retain Rust preferred X"
         )
 
+        let crossBlockSource = "# title\ntext"
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: crossBlockSource, marked: false)
+        )
+        rustComposition.resetSource(crossBlockSource)
+        selection = NSRange(location: 8, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        doCommand(by: #selector(NSResponder.moveUp(_:)))
+        precondition(selection.location == 0, "Selector moveUp must cross a Markdown block")
+        doCommand(by: #selector(NSResponder.moveDown(_:)))
+        precondition(selection.location == 8, "Selector moveDown must return to the next block")
+
         replaceStorage(
             range: NSRange(location: 0, length: textStorage.length),
             with: savedStorage
