@@ -370,6 +370,67 @@ pub struct VisualCluster {
     line_break: bool,
 }
 
+/// One shaped glyph retained as a draw placement for the scene layer.
+///
+/// The placement is still source-backed: it identifies the source and visual
+/// cluster that produced the glyph, while `x`/`y` are layout coordinates. `y`
+/// is a baseline coordinate, so a scene can pass it directly to an atlas
+/// primitive without inventing a second text coordinate system.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphPlacement {
+    face: FontFaceId,
+    glyph: GlyphId,
+    source: TextRange,
+    visual: VisualRange,
+    line: usize,
+    x: f32,
+    y: f32,
+    style: VisualRunStyle,
+}
+
+impl GlyphPlacement {
+    #[must_use]
+    pub const fn face(self) -> FontFaceId {
+        self.face
+    }
+
+    #[must_use]
+    pub const fn glyph(self) -> GlyphId {
+        self.glyph
+    }
+
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualRange {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn line(self) -> usize {
+        self.line
+    }
+
+    #[must_use]
+    pub const fn x(self) -> f32 {
+        self.x
+    }
+
+    /// Returns the baseline y coordinate for this glyph.
+    #[must_use]
+    pub const fn y(self) -> f32 {
+        self.y
+    }
+
+    #[must_use]
+    pub const fn style(self) -> VisualRunStyle {
+        self.style
+    }
+}
+
 impl VisualCluster {
     #[must_use]
     pub const fn source(self) -> TextRange {
@@ -541,6 +602,7 @@ pub struct LayoutSnapshot {
     config: LayoutConfig,
     lines: Vec<VisualLine>,
     clusters: Vec<VisualCluster>,
+    glyphs: Vec<GlyphPlacement>,
 }
 
 impl LayoutSnapshot {
@@ -596,6 +658,7 @@ impl LayoutSnapshot {
             config,
             lines: Vec::new(),
             clusters: Vec::new(),
+            glyphs: Vec::new(),
         };
         layout.build(metrics)?;
         Ok(layout)
@@ -613,6 +676,7 @@ impl LayoutSnapshot {
             config,
             lines: Vec::new(),
             clusters: Vec::new(),
+            glyphs: Vec::new(),
         };
         layout.build_shaped(shaper)?;
         Ok(layout)
@@ -646,6 +710,16 @@ impl LayoutSnapshot {
     #[must_use]
     pub fn clusters(&self) -> &[VisualCluster] {
         &self.clusters
+    }
+
+    /// Returns shaped glyph placements in painter order.
+    ///
+    /// Metrics-only layouts intentionally return an empty slice. The scene
+    /// layer can therefore distinguish deterministic layout from a layout
+    /// that has real glyph identities available for atlas lookup.
+    #[must_use]
+    pub fn glyphs(&self) -> &[GlyphPlacement] {
+        &self.glyphs
     }
 
     #[must_use]
@@ -698,11 +772,28 @@ impl LayoutSnapshot {
                 })
             })
             .collect::<Result<Vec<_>, LayoutError>>()?;
+        let glyphs = self
+            .glyphs
+            .iter()
+            .map(|glyph| {
+                Ok(GlyphPlacement {
+                    face: glyph.face,
+                    glyph: glyph.glyph,
+                    source: map_source_range(glyph.source, changes)?,
+                    visual: glyph.visual,
+                    line: glyph.line,
+                    x: glyph.x,
+                    y: glyph.y,
+                    style: glyph.style,
+                })
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
         Ok(Some(Self {
             projection,
             config: self.config,
             lines,
             clusters,
+            glyphs,
         }))
     }
 
@@ -999,6 +1090,21 @@ impl LayoutSnapshot {
                         line_visual_start = cluster_visual.start();
                         line_width = 0.0;
                     }
+                    let glyph_x = line_width + glyph.x_offset();
+                    let glyph_y = self.baseline_for_line(line_index)? + glyph.y_offset();
+                    if !glyph_x.is_finite() || !glyph_y.is_finite() {
+                        return Err(LayoutError::InvalidPoint);
+                    }
+                    self.glyphs.push(GlyphPlacement {
+                        face: glyph_run.face(),
+                        glyph: glyph.id(),
+                        source: glyph_source,
+                        visual: cluster_visual,
+                        line: line_index,
+                        x: glyph_x,
+                        y: glyph_y,
+                        style: glyph_run.style(),
+                    });
                     self.clusters.push(VisualCluster {
                         source: glyph_source,
                         visual: cluster_visual,
@@ -1052,6 +1158,16 @@ impl LayoutSnapshot {
             clusters: draft.cluster_start..self.clusters.len(),
         });
         Ok(())
+    }
+
+    fn baseline_for_line(&self, index: usize) -> Result<f32, LayoutError> {
+        let line_y = index as f32 * self.config.line_height;
+        let baseline = line_y + self.config.line_height;
+        if baseline.is_finite() {
+            Ok(baseline)
+        } else {
+            Err(LayoutError::InvalidPoint)
+        }
     }
 
     fn line_for_y(&self, y: f32) -> usize {
@@ -1371,6 +1487,28 @@ mod tests {
     }
 
     #[test]
+    fn shaped_layout_retains_baseline_glyph_placements() {
+        let layout = LayoutSnapshot::from_projection_with_shaper(
+            &projection("abcd"),
+            LayoutConfig::new(4.0, 2.0),
+            &TestShaper {
+                shape: TestShape::FixedGrapheme(2.0),
+            },
+        )
+        .expect("shaped layout should build");
+
+        assert_eq!(layout.glyphs().len(), 4);
+        assert_eq!(layout.glyphs()[0].face(), FontFaceId::from_raw(1));
+        assert_eq!(layout.glyphs()[0].glyph(), GlyphId::from_raw(1));
+        assert_eq!(layout.glyphs()[0].source().start().get(), 0);
+        assert_eq!(layout.glyphs()[0].x(), 0.0);
+        assert_eq!(layout.glyphs()[0].y(), 2.0);
+        assert_eq!(layout.glyphs()[2].line(), 1);
+        assert_eq!(layout.glyphs()[2].x(), 0.0);
+        assert_eq!(layout.glyphs()[2].y(), 4.0);
+    }
+
+    #[test]
     fn shaped_ligature_cluster_is_not_split() {
         let layout = LayoutSnapshot::from_projection_with_shaper(
             &projection("fi"),
@@ -1469,6 +1607,41 @@ mod tests {
             layout.clusters()[0].source().start().get() + 3
         );
         assert_eq!(mapped.revision(), applied.result_snapshot().revision());
+    }
+
+    #[test]
+    fn shaped_glyph_sources_map_through_prefix_edit() {
+        let source_text = "prefix ab";
+        let mut buffer = TextBuffer::new(source_text);
+        let snapshot = buffer.snapshot();
+        let start = source_text.find("ab").expect("text exists");
+        let range = TextRange::new(ByteOffset::new(usize_to_u64(start)), snapshot.len_bytes())
+            .expect("projection range should be ordered");
+        let projection = Projection::inline(&snapshot, range).expect("projection should build");
+        let layout = LayoutSnapshot::from_projection_with_shaper(
+            &projection,
+            LayoutConfig::new(4.0, 1.0),
+            &TestShaper {
+                shape: TestShape::FixedGrapheme(1.0),
+            },
+        )
+        .expect("layout should build");
+        let transaction = yu_text::Transaction::new(
+            buffer.revision(),
+            [yu_text::Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("prefix edit should apply");
+
+        let mapped = layout
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .expect("layout should map")
+            .expect("outside edit should preserve layout");
+        assert_eq!(mapped.glyphs().len(), layout.glyphs().len());
+        assert_eq!(mapped.glyphs()[0].x(), layout.glyphs()[0].x());
+        assert_eq!(mapped.glyphs()[0].y(), layout.glyphs()[0].y());
+        assert_eq!(mapped.glyphs()[0].source().start().get(), 10);
     }
 
     fn usize_to_u64(value: usize) -> u64 {

@@ -144,7 +144,10 @@ version = "0.1.0"
 dependencies = [
  "yu-core",
  "yu-font",
+ "yu-layout",
+ "yu-projection",
  "yu-scene",
+ "yu-text",
 ]
 
 [[package]]
@@ -153,6 +156,7 @@ version = "0.1.0"
 dependencies = [
  "yu-core",
  "yu-font",
+ "yu-layout",
 ]
 
 [[package]]
