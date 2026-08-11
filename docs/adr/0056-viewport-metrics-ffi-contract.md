@@ -22,17 +22,17 @@
   cache key。shaped backend 仍可完全替换 fallback advance。
 - 配置成功不推进 source Revision、selection 或 history；expected Revision 不匹配返回 stale，
   非法值返回专用 `YU_FFI_INVALID_VIEWPORT_CONFIG`，且不改变旧配置。
-- macOS spike 将 TextKit container width、font line height 和混合字符样本的平均 grapheme
-  advance 量化到 0.01 pt 后提交配置。caret request 的输入和输出都直接使用 native point，
-  bridge 不再做 scale 换算。
+- macOS spike 将 TextKit container width、CoreText system UI line height 和混合字符样本的
+  shaped grapheme advance 量化到 0.01 pt 后提交配置。caret request 的输入和输出都直接使用
+  native point，bridge 不再做 scale 换算。system UI 私有 family 名必须走专用 CoreText
+  creation path，见 ADR 0057。
 - 无窗口 Rust/FFI 测试必须覆盖配置实际影响 wrapping/scroll target、stale rejection 和非法
   config；macOS attached host self-check 必须覆盖长文档 content height 与自动滚动。
 
 ## 结果
 
-- 平台 host、Rust viewport 和 adapter 的坐标协议现在是显式的；后续接入 CoreText/GlyphRun
-  只需替换 advance provider，不需修改 command 或 caret reveal ABI。
+- 平台 host、Rust viewport 和 adapter 的坐标协议现在是显式的；CoreText metrics provider
+  已通过 owned FFI 接入，不需修改 command 或 caret reveal ABI。
 - metrics-only fallback 仍然不能代表最终比例字体 shaping，尤其是 CJK、emoji、ligature 和
   Markdown hidden syntax 的视觉宽度；产品 GUI 前必须接入 shaped layout 并比较 native/Rust
   line break 结果。
-

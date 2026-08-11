@@ -171,12 +171,15 @@ revision-bound `CaretScrollRequest`：它消费当前 viewport、focus block 的
 macOS `YuNativeViewportAdapter` 再把 target 转换为 `NSClipView.bounds.origin.y`。当前 spike 已将
 `TextInputView` 作为真实 `NSScrollView.documentView`，从 TextKit used rect 同步 native content
 height，并在 Rust command、selection 写回和 IME commit 后消费 reveal。它通过 revision-bound
-viewport metrics FFI 发布 native container width、line height、fallback advance、estimated block
-height 和 overscan，Rust 随后直接以 native point 计算 request，不再在 bridge 中乘除临时 scale。
+viewport metrics FFI 发布 native container width、CoreText system UI line height、混合 grapheme
+sample 的 shaped advance、estimated block height 和 overscan，Rust 随后直接以 native point
+计算 request，不再在 bridge 中乘除临时 scale。`.SFNS-*` 这类私有系统 UI alias 通过
+`CTFontCreateUIFontForLanguage` 创建，不能走普通 family lookup；FFI 只返回 owned scalar。
 fallback advance 只属于 metrics-only backend，正式产品必须由共享 shaped-layout metrics 替换。
 
 该 host attachment 不改变 Rust source/selection/layout 的所有权：adapter 只保存 NSScrollView
-viewport、Revision 和 content height，stale request 仍被丢弃。见 ADR 0054、ADR 0055 与 ADR 0056。
+viewport、Revision 和 content height，stale request 仍被丢弃。见 ADR 0054、ADR 0055、ADR 0056
+与 ADR 0057。
 
 Shift+上下使用独立的 `MoveUpExtend`/`MoveDownExtend` command：`EditorSelection::anchor()` 保持不动，
 只把 hit-test 得到的 visual caret 写入 focus。macOS `moveUpAndModifySelection:`/
@@ -248,7 +251,7 @@ block 结构变化则保守失效；切换 metrics/shaped backend 会把已测�
 backend 可以替换它而不改变 layout 的 source/visual 坐标。
 
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
-负责读取 CoreText 当前可见的 family 名称，`CoreTextFontResolver::resolve` 负责根据
+负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过
 `CFAttributedString → CTLine → CTRun` 取得真实 glyph id、advance、position 和 UTF-16 string
 index，并转换为 `yu-font` 的 `GlyphRun`/UTF-8 source cluster。适配层只把自有的 family、

@@ -20,6 +20,7 @@ enum {
     YU_FFI_INVALID_COMMAND = 10,
     YU_FFI_INVALID_KEY = 11,
     YU_FFI_INVALID_VIEWPORT_CONFIG = 12,
+    YU_FFI_CORE_TEXT_UNAVAILABLE = 13,
 };
 
 enum {
@@ -104,6 +105,11 @@ typedef struct YuEditorCaretScrollRequest {
     uint8_t needs_scroll;
 } YuEditorCaretScrollRequest;
 
+typedef struct YuCoreTextViewportMetrics {
+    float line_height;
+    float default_advance;
+} YuCoreTextViewportMetrics;
+
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,
                                    YuCompositionSession **output);
 void yu_composition_session_destroy(YuCompositionSession *session);
@@ -158,6 +164,15 @@ int32_t yu_composition_session_set_viewport_config(YuCompositionSession *session
                                                    float default_advance,
                                                    float estimated_block_height,
                                                    float overscan);
+int32_t yu_macos_core_text_viewport_metrics(const uint8_t *family,
+                                            size_t family_length,
+                                            float size,
+                                            const uint8_t *sample,
+                                            size_t sample_length,
+                                            YuCoreTextViewportMetrics *output);
+int32_t yu_macos_core_text_system_ui_viewport_metrics(
+    float size, const uint8_t *sample, size_t sample_length,
+    YuCoreTextViewportMetrics *output);
 int32_t yu_composition_session_caret_scroll_request(YuCompositionSession *session,
                                                     uint64_t expected_revision,
                                                     float scroll_y,

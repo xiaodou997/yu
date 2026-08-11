@@ -359,6 +359,54 @@ private final class RustCompositionBridge {
         viewportMetrics = metrics
     }
 
+    func coreTextViewportMetrics(
+        family: String,
+        size: CGFloat,
+        sample: String
+    ) -> (lineHeight: CGFloat, defaultAdvance: CGFloat) {
+        let familyBytes = Array(family.utf8)
+        let sampleBytes = Array(sample.utf8)
+        var result = YuCoreTextViewportMetrics()
+        let status = familyBytes.withUnsafeBufferPointer { familyBuffer in
+            sampleBytes.withUnsafeBufferPointer { sampleBuffer in
+                yu_macos_core_text_viewport_metrics(
+                    familyBuffer.baseAddress,
+                    familyBuffer.count,
+                    Float(size),
+                    sampleBuffer.baseAddress,
+                    sampleBuffer.count,
+                    &result
+                )
+            }
+        }
+        precondition(status == 0, "CoreText viewport metrics query failed: \(status)")
+        return (
+            lineHeight: CGFloat(result.line_height),
+            defaultAdvance: CGFloat(result.default_advance)
+        )
+    }
+
+    func coreTextSystemUiViewportMetrics(
+        size: CGFloat,
+        sample: String
+    ) -> (lineHeight: CGFloat, defaultAdvance: CGFloat) {
+        let sampleBytes = Array(sample.utf8)
+        var result = YuCoreTextViewportMetrics()
+        let status = sampleBytes.withUnsafeBufferPointer { sampleBuffer in
+            yu_macos_core_text_system_ui_viewport_metrics(
+                Float(size),
+                sampleBuffer.baseAddress,
+                sampleBuffer.count,
+                &result
+            )
+        }
+        precondition(status == 0, "CoreText system UI viewport metrics query failed: \(status)")
+        return (
+            lineHeight: CGFloat(result.line_height),
+            defaultAdvance: CGFloat(result.default_advance)
+        )
+    }
+
     func caretScrollRequest(
         scrollY: CGFloat,
         viewportHeight: CGFloat,
@@ -1767,21 +1815,19 @@ final class TextInputView: NSView, NSTextInputClient {
     }
 
     private func nativeViewportMetrics() -> RustViewportMetrics {
-        let lineHeight = nativeLineHeight()
-        let defaultAdvance = nativeFallbackAdvance()
+        let font = defaultAttributes[.font] as? NSFont ?? NSFont.systemFont(ofSize: 22)
+        let sample = "M中🙂e\u{301}"
+        let coreTextMetrics = rustComposition.coreTextSystemUiViewportMetrics(
+            size: font.pointSize,
+            sample: sample
+        )
         return RustViewportMetrics(
             maxWidth: quantized(max(textContainer.containerSize.width, 1)),
-            lineHeight: quantized(lineHeight),
-            defaultAdvance: quantized(defaultAdvance),
-            estimatedBlockHeight: quantized(lineHeight),
-            overscan: quantized(lineHeight * 2)
+            lineHeight: quantized(coreTextMetrics.lineHeight),
+            defaultAdvance: quantized(coreTextMetrics.defaultAdvance),
+            estimatedBlockHeight: quantized(coreTextMetrics.lineHeight),
+            overscan: quantized(coreTextMetrics.lineHeight * 2)
         )
-    }
-
-    private func nativeFallbackAdvance() -> CGFloat {
-        let sample = "M中🙂"
-        let width = (sample as NSString).size(withAttributes: defaultAttributes).width
-        return max(width / CGFloat(sample.count), 1)
     }
 
     private func quantized(_ value: CGFloat) -> CGFloat {

@@ -56,6 +56,7 @@
 - [x] macOS `NSScrollView` caret request consumer、stale/no-op/native scroll self-check
 - [x] macOS spike 将 `TextInputView` 接入真实 `NSScrollView`，按 Revision/IME commit 自动 reveal
 - [x] revision-bound viewport metrics FFI；macOS native point 直接驱动 Rust metrics-only layout
+- [x] macOS CoreText system UI metrics provider；私有 `.SFNS-*` alias 不再走 family lookup
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -134,7 +135,8 @@
     时必须清除旧的 measured height，且 provider 不得进入 `EditorDocument` 的 canonical state。
 19. macOS CoreText 调用必须隔离在 `platform/macos/yu-font-macos`；共享层只能接收自有的 family、
    PostScript name、size 与 fallback 元数据，系统 family catalog 与 live resolver 必须有 macOS
-   实测测试；CoreText 对象与 rasterization 仍属于平台适配器边界。
+   实测测试；CoreText 对象与 rasterization 仍属于平台适配器边界。私有 `.SFNS-*` system UI
+   alias 必须走 `CTFontCreateUIFontForLanguage`，不能走普通 family lookup。
 20. CoreText shaper 必须通过 `CFAttributedString → CTLine → CTRun` 返回真实 glyph id/advance，
    将合法 UTF-16 string index 转换为 UTF-8 source cluster range，并让 `yu-layout` 的 shaped
    layout 消费这些 advance；RTL 或 non-monotonic 输出在当前布局契约下必须显式拒绝，不能静默
@@ -217,9 +219,9 @@
     且 AppKit 对象不能进入 Rust ABI。
 45. macOS spike 的 `TextInputView` 必须作为真实 `NSScrollView.documentView` 运行；TextKit content
     height、当前 clip viewport 和 Rust request 必须按同一 Revision 同步，命令、selection 写回和
-    IME commit 后都要触发 reveal。viewport width、line height、fallback advance、estimated block
-    height 和 overscan 必须通过 revision-bound FFI metrics 配置传递，request 不得再依赖 bridge
-    scale。
+    IME commit 后都要触发 reveal。viewport width、CoreText system UI line height、shaped sample
+    advance、estimated block height 和 overscan 必须通过 revision-bound FFI metrics 配置传递，
+    request 不得再依赖 bridge scale。
 46. `yu_composition_session_set_viewport_config` 必须拒绝 stale Revision 和非法 metrics，成功时
     不得推进 source/selection/history；`LayoutConfig::default_advance` 必须进入 metrics layout
     cache key。FFI 与 macOS attached self-check 必须证明配置确实影响 wrapping/scroll target，

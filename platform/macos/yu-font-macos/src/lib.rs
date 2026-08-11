@@ -14,6 +14,10 @@ use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
 
+#[cfg(target_os = "macos")]
+use unicode_segmentation::UnicodeSegmentation;
+#[cfg(target_os = "macos")]
+use yu_core::ByteOffset;
 use yu_core::TextRange;
 use yu_font::FontFaceId;
 use yu_font::{
@@ -43,7 +47,7 @@ use objc2_core_graphics::{
 #[cfg(target_os = "macos")]
 use objc2_core_text::{
     CTFont, CTFontManagerCopyAvailableFontFamilyNames, CTFontOrientation, CTFontSymbolicTraits,
-    CTLine, CTRun, CTRunStatus, kCTFontAttributeName,
+    CTFontUIFontType, CTLine, CTRun, CTRunStatus, kCTFontAttributeName,
 };
 
 /// Errors raised by the CoreText adapter.
@@ -77,10 +81,12 @@ pub enum CoreTextShapeError {
     AttributedStringUnavailable,
     InvalidCoreTextRange,
     InvalidGlyphRun,
+    FontUnavailable,
     MissingRunFont,
     NonMonotonicGlyphIndices,
     FaceIdOverflow,
     FaceTablePoisoned,
+    InvalidViewportMetrics,
 }
 
 impl fmt::Display for CoreTextShapeError {
@@ -100,12 +106,18 @@ impl fmt::Display for CoreTextShapeError {
                 formatter.write_str("CoreText returned an invalid UTF-16 range")
             }
             Self::InvalidGlyphRun => formatter.write_str("CoreText returned an invalid glyph run"),
+            Self::FontUnavailable => {
+                formatter.write_str("CoreText could not create the requested font")
+            }
             Self::MissingRunFont => formatter.write_str("CoreText glyph run did not expose a font"),
             Self::NonMonotonicGlyphIndices => {
                 formatter.write_str("CoreText returned non-monotonic glyph string indices")
             }
             Self::FaceIdOverflow => formatter.write_str("CoreText face id table overflowed"),
             Self::FaceTablePoisoned => formatter.write_str("CoreText face id table was poisoned"),
+            Self::InvalidViewportMetrics => {
+                formatter.write_str("CoreText returned invalid viewport metrics")
+            }
         }
     }
 }
@@ -120,6 +132,7 @@ pub enum CoreTextRasterError {
     UnknownFace(FontFaceId),
     InvalidGlyphId(u32),
     FaceTablePoisoned,
+    FontUnavailable,
     MetricsCachePoisoned,
     AtlasPoisoned,
     BitmapUnavailable,
@@ -140,6 +153,9 @@ impl fmt::Display for CoreTextRasterError {
                 write!(formatter, "glyph id {glyph} does not fit CGGlyph")
             }
             Self::FaceTablePoisoned => formatter.write_str("CoreText face id table was poisoned"),
+            Self::FontUnavailable => {
+                formatter.write_str("CoreText could not recreate a glyph font")
+            }
             Self::MetricsCachePoisoned => {
                 formatter.write_str("CoreText metrics cache was poisoned")
             }
@@ -183,7 +199,10 @@ impl CoreTextFontCatalog {
             let mut names = families
                 .iter()
                 .map(|family| Arc::<str>::from(family.to_string()))
-                .filter(|family| !family.trim().is_empty())
+                // Names beginning with `.` are private system UI aliases.
+                // They must be created through CTFontCreateUIFontForLanguage,
+                // not passed back to CTFontCreateWithName as user families.
+                .filter(|family| !family.trim().is_empty() && !family.trim_start().starts_with('.'))
                 .collect::<Vec<_>>();
             names.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
             names.dedup_by(|left, right| left.as_ref() == right.as_ref());
@@ -382,8 +401,35 @@ impl FaceTable {
 pub struct CoreTextShaper {
     catalog: CoreTextFontCatalog,
     request: FontRequest,
+    font_source: CoreTextFontSource,
     #[cfg(target_os = "macos")]
     faces: Arc<Mutex<FaceTable>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreTextFontSource {
+    RequestedFamily,
+    SystemUi,
+}
+
+/// Owned font metrics used to configure the native viewport before a full
+/// shaped layout is attached to the editor document.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoreTextViewportMetrics {
+    line_height: f32,
+    default_advance: f32,
+}
+
+impl CoreTextViewportMetrics {
+    #[must_use]
+    pub const fn line_height(self) -> f32 {
+        self.line_height
+    }
+
+    #[must_use]
+    pub const fn default_advance(self) -> f32 {
+        self.default_advance
+    }
 }
 
 impl Clone for CoreTextShaper {
@@ -391,6 +437,7 @@ impl Clone for CoreTextShaper {
         Self {
             catalog: self.catalog.clone(),
             request: self.request.clone(),
+            font_source: self.font_source,
             #[cfg(target_os = "macos")]
             faces: Arc::clone(&self.faces),
         }
@@ -403,6 +450,7 @@ impl CoreTextShaper {
         Self {
             catalog,
             request,
+            font_source: CoreTextFontSource::RequestedFamily,
             #[cfg(target_os = "macos")]
             faces: Arc::new(Mutex::new(FaceTable::default())),
         }
@@ -410,6 +458,16 @@ impl CoreTextShaper {
 
     pub fn from_system(request: FontRequest) -> Result<Self, CoreTextFontError> {
         Ok(Self::new(CoreTextFontCatalog::system()?, request))
+    }
+
+    /// Creates a shaper backed by the AppKit/CoreText system UI font. The
+    /// request's family is retained as metadata, but is not passed to
+    /// `CTFontCreateWithName`; private names such as `.SFNS-Regular` must be
+    /// created through `CTFontCreateUIFontForLanguage` instead.
+    pub fn from_system_ui(request: FontRequest) -> Result<Self, CoreTextFontError> {
+        let mut shaper = Self::new(CoreTextFontCatalog::system()?, request);
+        shaper.font_source = CoreTextFontSource::SystemUi;
+        Ok(shaper)
     }
 
     #[must_use]
@@ -422,6 +480,66 @@ impl CoreTextShaper {
         &self.request
     }
 
+    /// Measures a mixed grapheme sample with CoreText and returns owned
+    /// point-based metrics for the metrics-only viewport backend. The sample
+    /// is shaped rather than measured with a guessed single-character width,
+    /// so fallback faces and combining/emoji clusters contribute naturally.
+    pub fn viewport_metrics(
+        &self,
+        sample: &str,
+    ) -> Result<CoreTextViewportMetrics, CoreTextShapeError> {
+        #[cfg(target_os = "macos")]
+        {
+            if sample.is_empty() {
+                return Err(CoreTextShapeError::InvalidViewportMetrics);
+            }
+            let source = TextRange::new(
+                ByteOffset::ZERO,
+                ByteOffset::new(
+                    u64::try_from(sample.len())
+                        .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?,
+                ),
+            )
+            .ok_or(CoreTextShapeError::InvalidViewportMetrics)?;
+            let request =
+                ShapeRequest::new(sample, source, VisualRunStyle::Plain, self.request.clone())
+                    .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
+            let shaped = self.shape_request(&request)?;
+            let grapheme_count = sample.graphemes(true).count();
+            let Some(run) = shaped.runs().first() else {
+                return Err(CoreTextShapeError::InvalidViewportMetrics);
+            };
+            if grapheme_count == 0 {
+                return Err(CoreTextShapeError::InvalidViewportMetrics);
+            }
+            let rasterizer = self.rasterizer();
+            let key = FontMetricKey::new(run.face(), self.request.size())
+                .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
+            let font_metrics = rasterizer
+                .font_metrics(key)
+                .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
+            let line_height = font_metrics.line_height();
+            let default_advance = shaped.advance() / grapheme_count as f32;
+            if !line_height.is_finite()
+                || line_height <= 0.0
+                || !default_advance.is_finite()
+                || default_advance <= 0.0
+            {
+                return Err(CoreTextShapeError::InvalidViewportMetrics);
+            }
+            Ok(CoreTextViewportMetrics {
+                line_height,
+                default_advance,
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = sample;
+            Err(CoreTextShapeError::UnsupportedPlatform)
+        }
+    }
+
     /// Creates a glyph rasterizer that shares this shaper's stable face table.
     /// The returned object owns only caches and can be used by layout/render
     /// preparation without exposing any CoreText handle.
@@ -429,7 +547,7 @@ impl CoreTextShaper {
     pub fn rasterizer(&self) -> CoreTextGlyphRasterizer {
         #[cfg(target_os = "macos")]
         {
-            CoreTextGlyphRasterizer::with_faces(Arc::clone(&self.faces))
+            CoreTextGlyphRasterizer::with_faces(Arc::clone(&self.faces), self.font_source)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -471,6 +589,7 @@ impl CoreTextShaper {
 pub struct CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
     faces: Arc<Mutex<FaceTable>>,
+    font_source: CoreTextFontSource,
     #[cfg(target_os = "macos")]
     metrics: Arc<Mutex<FontMetricsCache>>,
     #[cfg(target_os = "macos")]
@@ -482,6 +601,7 @@ impl Clone for CoreTextGlyphRasterizer {
         Self {
             #[cfg(target_os = "macos")]
             faces: Arc::clone(&self.faces),
+            font_source: self.font_source,
             #[cfg(target_os = "macos")]
             metrics: Arc::clone(&self.metrics),
             #[cfg(target_os = "macos")]
@@ -492,9 +612,10 @@ impl Clone for CoreTextGlyphRasterizer {
 
 impl CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
-    fn with_faces(faces: Arc<Mutex<FaceTable>>) -> Self {
+    fn with_faces(faces: Arc<Mutex<FaceTable>>, font_source: CoreTextFontSource) -> Self {
         Self {
             faces,
+            font_source,
             metrics: Arc::new(Mutex::new(FontMetricsCache::new())),
             atlas: Arc::new(Mutex::new(GlyphAtlas::new(GlyphAtlasConfig::default()))),
         }
@@ -502,7 +623,9 @@ impl CoreTextGlyphRasterizer {
 
     #[cfg(not(target_os = "macos"))]
     const fn unsupported() -> Self {
-        Self {}
+        Self {
+            font_source: CoreTextFontSource::RequestedFamily,
+        }
     }
 
     /// Returns the cached atlas placement, if this glyph has already been
@@ -641,6 +764,14 @@ impl CoreTextGlyphRasterizer {
             .name_for(face)
             .map(str::to_owned)
             .ok_or(CoreTextRasterError::UnknownFace(face))?;
+        if self.font_source == CoreTextFontSource::SystemUi
+            && postscript_name.trim_start().starts_with('.')
+        {
+            return unsafe {
+                CTFont::new_ui_font_for_language(CTFontUIFontType::System, size as _, None)
+            }
+            .ok_or(CoreTextRasterError::FontUnavailable);
+        }
         let name = CFString::from_str(&postscript_name);
         Ok(unsafe { CTFont::with_name(&name, size as _, std::ptr::null()) })
     }
@@ -814,9 +945,20 @@ fn style_font_request(request: &FontRequest, style: VisualRunStyle) -> FontReque
 }
 
 #[cfg(target_os = "macos")]
-fn create_core_text_font(request: &FontRequest) -> CFRetained<CTFont> {
-    let family = CFString::from_str(request.family());
-    let base = unsafe { CTFont::with_name(&family, request.size() as _, std::ptr::null()) };
+fn create_core_text_font(
+    request: &FontRequest,
+    source: CoreTextFontSource,
+) -> Result<CFRetained<CTFont>, CoreTextShapeError> {
+    let base = match source {
+        CoreTextFontSource::RequestedFamily => {
+            let family = CFString::from_str(request.family());
+            unsafe { CTFont::with_name(&family, request.size() as _, std::ptr::null()) }
+        }
+        CoreTextFontSource::SystemUi => unsafe {
+            CTFont::new_ui_font_for_language(CTFontUIFontType::System, request.size() as _, None)
+        }
+        .ok_or(CoreTextShapeError::FontUnavailable)?,
+    };
     let mut value = CTFontSymbolicTraits::empty();
     let mask = CTFontSymbolicTraits::TraitBold | CTFontSymbolicTraits::TraitItalic;
     if request.weight() == FontWeight::Bold {
@@ -825,8 +967,10 @@ fn create_core_text_font(request: &FontRequest) -> CFRetained<CTFont> {
     if request.slant() != FontSlant::Upright {
         value.insert(CTFontSymbolicTraits::TraitItalic);
     }
-    unsafe { base.copy_with_symbolic_traits(request.size() as _, std::ptr::null(), value, mask) }
-        .unwrap_or(base)
+    Ok(unsafe {
+        base.copy_with_symbolic_traits(request.size() as _, std::ptr::null(), value, mask)
+            .unwrap_or(base)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -844,7 +988,7 @@ fn shape_with_core_text(
     }
 
     let font_request = style_font_request(request.font(), request.style());
-    let font = create_core_text_font(&font_request);
+    let font = create_core_text_font(&font_request, shaper.font_source)?;
     let string = CFString::from_str(request.text());
     let font_attribute_name = unsafe { kCTFontAttributeName };
     let keys: [&CFString; 1] = [font_attribute_name];
@@ -1079,6 +1223,7 @@ mod tests {
         let catalog = CoreTextFontCatalog::system().expect("CoreText should expose families");
         assert!(!catalog.is_empty());
         let family = catalog.families()[0].clone();
+        assert!(!family.trim_start().starts_with('.'));
         let request = FontRequest::new(family.as_ref(), 13.0).expect("request should be valid");
         let resolved = catalog
             .resolver()
@@ -1121,6 +1266,42 @@ mod tests {
                         && glyph.advance() >= 0.0
                 })
         }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_text_viewport_metrics_use_shaped_grapheme_advance() {
+        let catalog = CoreTextFontCatalog::system().expect("CoreText should expose families");
+        let family = catalog.families()[0].clone();
+        let request = FontRequest::new(family.as_ref(), 16.0).expect("request should be valid");
+        let shaper = CoreTextShaper::new(catalog, request.clone());
+        let sample = "M中🙂e\u{301}";
+        let metrics = shaper
+            .viewport_metrics(sample)
+            .expect("CoreText viewport metrics should be available");
+        let source = TextRange::new(
+            ByteOffset::ZERO,
+            ByteOffset::new(u64::try_from(sample.len()).expect("sample should fit")),
+        )
+        .expect("source range should be valid");
+        let request = ShapeRequest::new(sample, source, VisualRunStyle::Plain, request)
+            .expect("request should be valid");
+        let shaped = TextShaper::shape(&shaper, &request).expect("CoreText should shape");
+        let expected = shaped.advance() / sample.graphemes(true).count() as f32;
+        assert!((metrics.default_advance() - expected).abs() < 0.001);
+        assert!(metrics.line_height() > 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_text_system_ui_font_uses_ui_creation_path() {
+        let request = FontRequest::new(".SFNS-Regular", 16.0).expect("request should be valid");
+        let shaper = CoreTextShaper::from_system_ui(request).expect("CoreText should initialize");
+        let metrics = shaper
+            .viewport_metrics("M中🙂e\u{301}")
+            .expect("system UI metrics should be available");
+        assert!(metrics.line_height().is_finite() && metrics.line_height() > 0.0);
+        assert!(metrics.default_advance().is_finite() && metrics.default_advance() > 0.0);
     }
 
     #[cfg(target_os = "macos")]

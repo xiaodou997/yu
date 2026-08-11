@@ -75,6 +75,8 @@ version = "0.1.0"
 dependencies = [
  "yu-core",
  "yu-editor",
+ "yu-font",
+ "yu-font-macos",
  "yu-text",
 ]
 
@@ -96,6 +98,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-text",
+ "unicode-segmentation",
  "yu-core",
  "yu-font",
  "yu-layout",

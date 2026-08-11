@@ -25,9 +25,10 @@ macOS spike 的 TextKit 使用 native point 作为绘制和 `NSClipView` 坐标�
   `overscan`。Rust 随后直接在 native point 单位计算 caret geometry 和 absolute target，不再
   在 Swift 中对请求乘除临时 scale。该 FFI 配置不推进 source/selection Revision，且拒绝 stale
   Revision 或非法 metrics。
-- `TextInputView` 从当前 TextKit container 和 font 计算这些值；`default_advance` 是尚未接入
-  native shaper 时的保守 fallback，不代表最终字体 shaping。共享 shaped layout 接入后应由
-  `GlyphRun`/`TextShaper` 提供真实 advance，并继续使用同一 viewport coordinate contract。
+- `TextInputView` 从当前 TextKit container 和 font 计算这些值；当前 line height 与
+  `default_advance` 由 CoreText system UI provider 对混合 grapheme sample 测量，仍只服务
+  metrics-only backend，不代表最终 block shaping。共享 shaped layout 接入后应由
+  `GlyphRun`/`TextShaper` 提供完整 advance，并继续使用同一 viewport coordinate contract。
 - adapter 只在请求仍匹配当前 Revision 时应用 absolute target，最后按 native content height
   与 clip height clamp，并通过 `reflectScrolledClipView` 提交 bounds。stale、no-op 和实际
   scroll 仍由无窗口 self-check 覆盖。
