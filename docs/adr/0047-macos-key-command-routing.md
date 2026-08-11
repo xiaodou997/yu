@@ -39,5 +39,6 @@
 ## 限制
 
 本阶段没有实现完整菜单/Selector registry、Option/Control 文本导航、上下移动或 macOS
-Accessibility action routing。Tab/Shift-Tab 仅在 list command
-实际修改 source 时由 Rust 消费；普通段落返回 unhandled，继续交给平台 focus/text-input 策略。
+Accessibility action routing。基础 Selector allowlist 与只读 availability 查询已在 ADR 0049
+补充；Tab/Shift-Tab 仅在 list command 实际修改 source 时由 Rust 消费，普通段落返回 unhandled，
+继续交给平台 focus/text-input 策略。

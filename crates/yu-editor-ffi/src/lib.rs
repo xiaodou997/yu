@@ -21,6 +21,8 @@ pub const YU_FFI_STALE_REVISION: i32 = 8;
 pub const YU_FFI_KEY_UNHANDLED: i32 = 9;
 pub const YU_FFI_INVALID_COMMAND: i32 = 10;
 pub const YU_FFI_INVALID_KEY: i32 = 11;
+pub const YU_COMMAND_UNAVAILABLE: u8 = 0;
+pub const YU_COMMAND_AVAILABLE: u8 = 1;
 pub const YU_SOURCE_SYNC_NONE: u8 = 0;
 pub const YU_SOURCE_SYNC_RANGE: u8 = 1;
 pub const YU_SOURCE_SYNC_FULL: u8 = 2;
@@ -442,6 +444,44 @@ pub unsafe extern "C" fn yu_composition_session_execute_command(
         Err(error) => return status_from_document_error(error),
     };
     write_command_result(session, result, output)
+}
+
+/// Reports whether a command is currently enabled for native menu or
+/// selector validation. The query does not mutate source, selection, history,
+/// or composition state.
+///
+/// `block` is only read for `YU_EDITOR_COMMAND_TOGGLE_TASK` and is otherwise
+/// ignored.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one command availability byte.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_command_available(
+    session: *mut YuCompositionSession,
+    command: u8,
+    block: u64,
+    output: *mut u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    let command = match editor_command_from_ffi(command, block) {
+        Ok(command) => command,
+        Err(status) => return status,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = if session.document.command_available(&command) {
+            YU_COMMAND_AVAILABLE
+        } else {
+            YU_COMMAND_UNAVAILABLE
+        };
+    }
+    YU_FFI_OK
 }
 
 /// Resolves one native logical key and, when it is a Yu command shortcut,
@@ -1110,6 +1150,116 @@ mod tests {
             (YU_SOURCE_SYNC_RANGE, 1, 2, 1, 1)
         );
         unsafe { yu_composition_session_destroy(local) };
+    }
+
+    #[test]
+    fn ffi_command_availability_is_context_bound_and_read_only() {
+        let handle = session("");
+        let mut available = 255;
+        assert_eq!(
+            unsafe {
+                yu_composition_session_command_available(
+                    handle,
+                    YU_EDITOR_COMMAND_UNDO,
+                    0,
+                    &mut available,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(available, YU_COMMAND_UNAVAILABLE);
+        assert_eq!(
+            unsafe {
+                yu_composition_session_command_available(
+                    handle,
+                    YU_EDITOR_COMMAND_INSERT_NEWLINE,
+                    0,
+                    &mut available,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(available, YU_COMMAND_AVAILABLE);
+
+        assert_eq!(
+            unsafe { yu_composition_session_begin(handle, 0, 0, ptr::null(), 0, 0, 0) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_commit(handle, "羽".as_bytes().as_ptr(), "羽".len())
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_command_available(
+                    handle,
+                    YU_EDITOR_COMMAND_UNDO,
+                    0,
+                    &mut available,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(available, YU_COMMAND_AVAILABLE);
+        assert_eq!(
+            unsafe {
+                yu_composition_session_command_available(
+                    handle,
+                    YU_EDITOR_COMMAND_MOVE_LEFT,
+                    0,
+                    &mut available,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(available, YU_COMMAND_AVAILABLE);
+
+        assert_eq!(
+            unsafe { yu_composition_session_reset_source(handle, b"- item".as_ptr(), 6) },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_command_available(
+                    handle,
+                    YU_EDITOR_COMMAND_INDENT_LIST,
+                    0,
+                    &mut available,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(available, YU_COMMAND_AVAILABLE);
+        assert_eq!(
+            unsafe {
+                yu_composition_session_command_available(
+                    handle,
+                    YU_EDITOR_COMMAND_OUTDENT_LIST,
+                    0,
+                    &mut available,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(available, YU_COMMAND_UNAVAILABLE);
+        assert_eq!(
+            unsafe {
+                yu_composition_session_command_available(
+                    handle,
+                    YU_EDITOR_COMMAND_OUTDENT_LIST,
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            YU_FFI_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { yu_composition_session_command_available(handle, 255, 0, &mut available) },
+            YU_FFI_INVALID_COMMAND
+        );
+        unsafe { yu_composition_session_destroy(handle) };
     }
 
     #[test]

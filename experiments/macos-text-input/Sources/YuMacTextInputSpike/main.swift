@@ -45,6 +45,18 @@ private enum YuNativeModifier {
     static let option = UInt8(YU_KEY_MODIFIER_OPTION)
 }
 
+private enum YuNativeCommand {
+    static let deleteBackward = UInt8(YU_EDITOR_COMMAND_DELETE_BACKWARD)
+    static let deleteForward = UInt8(YU_EDITOR_COMMAND_DELETE_FORWARD)
+    static let moveLeft = UInt8(YU_EDITOR_COMMAND_MOVE_LEFT)
+    static let moveRight = UInt8(YU_EDITOR_COMMAND_MOVE_RIGHT)
+    static let insertNewline = UInt8(YU_EDITOR_COMMAND_INSERT_NEWLINE)
+    static let indentList = UInt8(YU_EDITOR_COMMAND_INDENT_LIST)
+    static let outdentList = UInt8(YU_EDITOR_COMMAND_OUTDENT_LIST)
+    static let undo = UInt8(YU_EDITOR_COMMAND_UNDO)
+    static let redo = UInt8(YU_EDITOR_COMMAND_REDO)
+}
+
 private final class RustCompositionBridge {
     private var session: OpaquePointer?
     private(set) var hasOverlay = false
@@ -202,6 +214,19 @@ private final class RustCompositionBridge {
         )
         precondition(status == 0, "Rust editor command failed: \(status)")
         return commandResult(result)
+    }
+
+    func commandAvailable(command: UInt8, block: UInt64 = 0) -> Bool {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var available: UInt8 = UInt8(YU_COMMAND_UNAVAILABLE)
+        let status = yu_composition_session_command_available(
+            session,
+            command,
+            block,
+            &available
+        )
+        precondition(status == 0, "Rust command availability query failed: \(status)")
+        return available == UInt8(YU_COMMAND_AVAILABLE)
     }
 
     func routeKey(
@@ -792,6 +817,14 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(textStorage.string == base, "Backspace must restore the source")
 
         insertText("z", replacementRange: notFoundRange)
+        precondition(
+            rustComposition.commandAvailable(command: YuNativeCommand.deleteBackward),
+            "Selector delete should be reported as available"
+        )
+        doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+        precondition(textStorage.string == base, "doCommand delete must restore the source")
+
+        insertText("z", replacementRange: notFoundRange)
         let afterInsert = textStorage.string
 
         guard
@@ -982,18 +1015,25 @@ final class TextInputView: NSView, NSTextInputClient {
             cancelComposition()
             return
         }
+        let nativeCommand: UInt8
         switch selector {
         case #selector(NSResponder.deleteBackward(_:)):
-            deleteBackward()
+            nativeCommand = YuNativeCommand.deleteBackward
+        case #selector(NSResponder.deleteForward(_:)):
+            nativeCommand = YuNativeCommand.deleteForward
         case #selector(NSResponder.moveLeft(_:)):
-            moveLeft()
+            nativeCommand = YuNativeCommand.moveLeft
         case #selector(NSResponder.moveRight(_:)):
-            moveRight()
+            nativeCommand = YuNativeCommand.moveRight
         case #selector(NSResponder.insertNewline(_:)):
-            insertText("\n", replacementRange: notFoundRange)
+            nativeCommand = YuNativeCommand.insertNewline
         default:
-            print("unhandled command: \(command)")
+            super.doCommand(by: selector)
+            return
         }
+        guard !hasMarkedText() && !rustComposition.hasOverlay else { return }
+        guard rustComposition.commandAvailable(command: nativeCommand) else { return }
+        applyRustCommandResult(rustComposition.executeCommand(command: nativeCommand))
     }
 
     private func routeNativeKey(_ event: NSEvent) -> Bool {
@@ -1281,17 +1321,6 @@ final class TextInputView: NSView, NSTextInputClient {
         textStorage.endEditing()
     }
 
-    private func deleteBackward() {
-        if selection.length > 0 {
-            insertText("", replacementRange: selection)
-            return
-        }
-        guard selection.location > 0 else { return }
-        let string = textStorage.string as NSString
-        let range = string.rangeOfComposedCharacterSequence(at: selection.location - 1)
-        insertText("", replacementRange: range)
-    }
-
     private func cancelComposition() {
         print("cancelComposition range=\(marked)")
         guard hasMarkedText(), let original = compositionOriginal else {
@@ -1309,28 +1338,6 @@ final class TextInputView: NSView, NSTextInputClient {
         rustComposition.cancel()
         needsDisplay = true
         postTextChanged()
-    }
-
-    private func moveLeft() {
-        guard selection.location > 0 else { return }
-        let string = textStorage.string as NSString
-        let range = string.rangeOfComposedCharacterSequence(at: selection.location - 1)
-        selection = NSRange(location: range.location, length: 0)
-        selectionAffinity = .downstream
-        rustComposition.setSelection(selection)
-        needsDisplay = true
-        postSelectionChanged()
-    }
-
-    private func moveRight() {
-        guard selection.location < textStorage.length else { return }
-        let string = textStorage.string as NSString
-        let range = string.rangeOfComposedCharacterSequence(at: selection.location)
-        selection = NSRange(location: NSMaxRange(range), length: 0)
-        selectionAffinity = .downstream
-        rustComposition.setSelection(selection)
-        needsDisplay = true
-        postSelectionChanged()
     }
 
     private func updateContainerSize() {

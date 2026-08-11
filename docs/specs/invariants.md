@@ -80,6 +80,9 @@
     新区间。`changed=false` 不得携带遗留 range。
 16. 成组 Undo/Redo 在不能表示为单个安全 replacement 时必须请求 Full 同步；FFI 和平台不得根据
     command 名称重新猜测同步范围。Tab/Shift-Tab 在非列表上下文必须返回 unhandled。
+17. macOS `doCommand(by:)` 只能将明确 allowlist 的 Selector 映射到共享 `EditorCommand`；只读
+    availability 查询不得推进 Revision 或改变 selection/history，活动 composition 时永久
+    command 必须不可用。未知 Selector 必须回退平台默认路径，不能直接改 TextKit mirror。
 
 ## Accessibility
 

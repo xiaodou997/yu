@@ -531,6 +531,47 @@ impl EditorDocument {
         }
     }
 
+    /// Reports whether a command can currently make a meaningful editor
+    /// transition. This is a read-only query for native menu/selector
+    /// validation; executing a command remains the authoritative operation.
+    #[must_use]
+    pub fn command_available(&self, command: &EditorCommand) -> bool {
+        if self.composition.is_some() {
+            return false;
+        }
+        let snapshot = self.snapshot();
+        match command {
+            EditorCommand::InsertText(text) => !text.is_empty(),
+            EditorCommand::DeleteBackward | EditorCommand::MoveLeft => {
+                !self.selection.is_empty() || self.selection.focus() > ByteOffset::ZERO
+            }
+            EditorCommand::DeleteForward | EditorCommand::MoveRight => {
+                !self.selection.is_empty() || self.selection.focus() < snapshot.len_bytes()
+            }
+            EditorCommand::InsertNewline => true,
+            EditorCommand::IndentList => self
+                .current_list_line()
+                .is_some_and(|line| self.list_prefix(&line).is_some()),
+            EditorCommand::OutdentList => self.current_list_line().is_some_and(|line| {
+                self.list_prefix(&line).is_some_and(|_| {
+                    line.content
+                        .as_bytes()
+                        .iter()
+                        .take_while(|byte| **byte == b' ')
+                        .next()
+                        .is_some()
+                })
+            }),
+            EditorCommand::Undo => self.history.stats().undo_entries() > 0,
+            EditorCommand::Redo => self.history.stats().redo_entries() > 0,
+            EditorCommand::ToggleTask { block } => self
+                .markdown
+                .blocks()
+                .get(*block)
+                .is_some_and(|block| matches!(block.kind(), BlockKind::TaskListItem { .. })),
+        }
+    }
+
     /// Resolves and executes a native key command against the current document
     /// context. Tab and Shift-Tab are only consumed when they actually edit a
     /// list item; in a paragraph they remain available for native focus or
@@ -941,6 +982,10 @@ impl EditorDocument {
             return None;
         }
         ListLinePrefix::parse(&line.content)
+    }
+
+    fn current_list_line(&self) -> Option<SourceLine> {
+        source_line(&self.snapshot(), self.selection.focus()).ok()
     }
 }
 
@@ -1371,6 +1416,47 @@ mod tests {
         assert_eq!(source_change.old_range(), utf16_range(0, 0));
         assert_eq!(source_change.new_range(), utf16_range(0, 2));
         assert_eq!(list.snapshot().as_str(), "  - item");
+    }
+
+    #[test]
+    fn command_availability_tracks_context_without_mutating_document() {
+        let mut document = EditorDocument::new("");
+        assert!(!document.command_available(&EditorCommand::undo()));
+        assert!(!document.command_available(&EditorCommand::redo()));
+        assert!(!document.command_available(&EditorCommand::MoveLeft));
+        assert!(!document.command_available(&EditorCommand::DeleteBackward));
+        assert!(document.command_available(&EditorCommand::insert_newline()));
+
+        let revision = document.revision();
+        document
+            .execute(EditorCommand::insert_text("羽"))
+            .expect("insert should succeed");
+        assert_eq!(
+            document.revision(),
+            revision.next().expect("revision should advance")
+        );
+        assert!(document.command_available(&EditorCommand::undo()));
+        assert!(document.command_available(&EditorCommand::MoveLeft));
+        assert!(!document.command_available(&EditorCommand::MoveRight));
+        assert!(document.command_available(&EditorCommand::DeleteBackward));
+
+        let mut list = EditorDocument::new("- item");
+        assert!(list.command_available(&EditorCommand::indent_list()));
+        assert!(!list.command_available(&EditorCommand::outdent_list()));
+        list.execute(EditorCommand::indent_list())
+            .expect("indent should succeed");
+        assert!(list.command_available(&EditorCommand::outdent_list()));
+
+        let task = EditorDocument::new("- [ ] item");
+        assert!(task.command_available(&EditorCommand::toggle_task(0)));
+        assert!(!task.command_available(&EditorCommand::toggle_task(1)));
+
+        let mut composing = EditorDocument::new("text");
+        composing
+            .begin_composition(source_range(4, 4), "x", utf16_range(0, 0))
+            .expect("composition should begin");
+        assert!(!composing.command_available(&EditorCommand::DeleteBackward));
+        assert!(!composing.command_available(&EditorCommand::insert_newline()));
     }
 
     #[test]

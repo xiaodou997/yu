@@ -150,6 +150,11 @@ AppKit 只查询新 range 并替换 mirror 的旧 range。成组 Undo/Redo 可�
 command 名称重复推断。没有 source 变化的移动命令使用 None；非列表 Tab/Shift-Tab 返回
 unhandled。
 
+AppKit 的 `doCommand(by:)` 也走同一边界：实验只允许删除、前后移动和换行 Selector 映射到
+`yu_composition_session_execute_command`，先通过只读 `yu_composition_session_command_available`
+查询上下文，再按同一个 `YuEditorCommandResult` 更新 mirror。取消 composition 是唯一不经过
+永久 command 的 Selector；未知 Selector 交还 `super`，活动 marked text 时不执行永久命令。
+
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。
 它通过 `yu-markdown::parse_inline` 或 definition-aware 的

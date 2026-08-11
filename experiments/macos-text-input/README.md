@@ -60,6 +60,10 @@ hit-test 路径。硬行末按 TextKit 语义规范化为 LF 后 offset + upstre
 Cmd-Z/Cmd-Shift-Z 使用完整 source fallback。两类结果都必须按 Rust 返回的 Revision 和 selection
 更新 TextKit mirror；普通段落 Tab 不由共享 key route 消费。
 
+`doCommand(by:)` 的删除、前后移动和换行 Selector 也会先查询 Rust command availability，再调用
+同一个 command execution FFI；取消 composition 保留为独立的 AppKit Selector，未知 Selector 不
+进入编辑器命令层。
+
 该实验暂时直接保存 UTF-16 selection，因为 AppKit 协议使用 `NSRange`。接入 Rust 时必须由
 平台适配层转换成带 Revision 的 `SourceCaretPosition`；需要穿过编辑长期保存时再使用
 `TextAnchor`。正式 composition 则进入临时 Overlay，不能在每次 `setMarkedText` 时提交 Undo

@@ -48,6 +48,7 @@
 - [x] FFI selection mutation/query 保留 upstream/downstream CaretAffinity
 - [x] 平台无关 key command map、FFI command result 与 macOS Cmd-Z/Cmd-Shift-Z/native keyDown 路由
 - [x] command result 的 None/Range/Full source sync 与 macOS TextKit 局部 mirror 更新
+- [x] macOS `doCommand(by:)` Selector allowlist、Rust execute bridge 与 command availability 查询
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -187,6 +188,9 @@
 38. 局部 command 必须返回输入/结果 Revision 各自的 UTF-16 source replacement range，Swift
     只能复制新范围并替换旧范围；成组 Undo/Redo 使用 Full fallback。无变化 command 不得要求
     source copy，普通段落的 Tab/Shift-Tab 不得被 key route 吞掉。
+39. macOS 已允许的 `doCommand(by:)` Selector 必须先通过 Rust availability 查询，再消费同一
+    `YuEditorCommandResult`；未知 Selector 回退平台默认路径，marked text 期间永久 Selector 不得
+    修改 canonical source，availability 查询本身不得修改 Revision、selection 或 history。
 
 ## 非目标
 
