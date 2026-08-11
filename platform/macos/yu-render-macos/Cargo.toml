@@ -1,6 +1,6 @@
 [package]
 name = "yu-render-macos"
-description = "macOS Metal device, surface and atlas upload boundary for Yu Editor"
+description = "macOS Metal device, retained render pipeline and atlas boundary for Yu Editor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

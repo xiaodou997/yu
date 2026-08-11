@@ -50,7 +50,7 @@ crates/yu-font          font fallback、GlyphRun、metrics/rasterization 契约�
 crates/yu-scene         revision-bound retained primitives、viewport 与 damage tracking
 crates/yu-render        backend-neutral render plan 与 atlas page upload boundary
 platform/macos/yu-font-macos  macOS-only CoreText 字体目录、fallback、shaping 与 glyph rasterization 适配
-platform/macos/yu-render-macos macOS-only Metal device、CAMetalLayer、clear frame 与 alpha atlas upload 适配
+platform/macos/yu-render-macos macOS-only Metal device、CAMetalLayer、clear/render plan frame、pipeline 与 alpha atlas upload 适配
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的第一阶段参考 workload
 experiments/            可丢弃的平台风险实验
@@ -98,6 +98,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Architecture Decision Records](docs/adr/)
 - [macOS Metal surface boundary](docs/adr/0034-macos-metal-surface-boundary.md)
 - [macOS clear frame lifecycle](docs/adr/0035-macos-clear-present-frame.md)
+- [macOS retained Metal plan pipeline](docs/adr/0036-macos-retained-metal-plan-pipeline.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
