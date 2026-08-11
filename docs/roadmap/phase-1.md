@@ -66,6 +66,9 @@
 - [x] macOS `MetalUploader` 的 owned alpha page → `R8Unorm MTLTexture` bridge
 - [x] macOS command queue 与 clear-only drawable/present/commit frame lifecycle
 - [x] macOS solid rectangle + alpha glyph Metal pipeline、UV atlas sampling 与 retained plan ABI
+- [x] macOS `NSView` ↔ `CAMetalLayer` scoped attachment 与 backing layer 恢复契约
+- [x] Metal surface generation-aware full clear、damage clipping 与 scissor redraw
+- [x] Metal backend-owned retained color target 与 drawable blit 生命周期
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -134,6 +137,10 @@
    bounds、atlas UV 和缺页拒绝；在有 Metal device 的 session 中显式覆盖 pipeline creation、
    drawable acquisition、alpha sampling command encoding 和 present/commit。GPU 句柄只能存在
    `MetalAtlas`/backend，不能进入 shared render plan。
+27. AppKit attachment 必须只托管外部 `NSView` 的 backing layer，并在 scoped attachment drop 时
+    有条件地恢复旧 layer；首次 frame/resize/target rebuild 后 full clear，稳定 revision 的后续
+    frame 只在 backend-owned retained target 上清除并重绘裁剪后的 damage 区域，再 blit 到 drawable。
+    无窗口单元测试必须验证 damage clipping 和 generation 状态转换。
 
 ## 非目标
 

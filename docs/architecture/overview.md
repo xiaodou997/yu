@@ -180,15 +180,19 @@ painter order，atlas page 通过尺寸/bytes fingerprint 去重 `AtlasPageUploa
 entry 会被拒绝。共享 `yu-render` 当前没有 `wgpu`/Metal device 或窗口依赖；`RenderUploader` 只定义未来 backend
 上传 alpha page 的最小边界。`yu-render` 已用 fake uploader 覆盖 `FontShaper → LayoutSnapshot →
 Scene → RenderPlan` 端到端 revision、atlas upload 去重和 command origin；实际 texture 生命周期
-和 command encoding 仍属于后续阶段。
+和 command encoding 由 macOS backend 承担，不回写 shared plan。
 
 `platform/macos/yu-render-macos` 是共享 render boundary 之外的第一层真实 backend：Rust 侧拥有
-`MetalDevice`、未附着窗口的 `CAMetalLayer`、surface generation、`MetalTexture`、`MetalAtlas`
-和 `MetalPipeline`，Objective-C bridge 只负责 Apple framework 调用。它可以把
+`MetalDevice`、`CAMetalLayer`、surface generation、`MetalTexture`、`MetalAtlas`、
+`MetalPipeline` 和 backend-owned retained color target，Objective-C bridge 只负责 Apple
+framework 调用。它可以把
 `AtlasPageUpload` 上传成 `R8Unorm` texture，并通过 `MetalCommandQueue`/`MetalFrameRenderer`
 验证两条 frame 路径：`present_clear` 的 drawable → command buffer → clear → present/commit，
 以及 `render_plan` 的 solid rectangle 与 alpha glyph quad。后者使用内嵌的最小 Metal shader
-source，在创建 renderer 时生成两个 pipeline state；`RenderPlan` 仍只携带 owned geometry、
-颜色和 page id，GPU texture 只存在 `MetalAtlas`。它仍不创建窗口，CAMetalLayer 仍需由后续
-AppKit shell 附着到 view。无 Metal device 或有效 drawable 的会话默认跳过硬件测试，需显式
-运行 ignored test。
+source，在创建 renderer 时生成 clear/solid/glyph pipeline state；首次 frame 或 surface
+generation 变化时 full clear，后续 frame 在 retained color target 上使用
+`RenderPlan::damage()` 局部清除并设置 scissor，再按 painter order 重绘完整 retained command
+list，最后把完整 target blit 到当前 drawable。`RenderPlan` 仍只携带 owned geometry、
+颜色和 page id，GPU texture 只存在 `MetalAtlas`。`MetalSurface::attach_to_view` 只托管外部
+AppKit `NSView` 的 backing layer，并用 scoped attachment 恢复原 layer；它不创建窗口。无
+Metal device 或有效 drawable 的会话默认跳过硬件测试，需显式运行 ignored test。

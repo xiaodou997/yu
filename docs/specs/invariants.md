@@ -154,17 +154,26 @@
    这些 native pointers 不得出现在 shared scene、layout、render plan 或 editor canonical state。
 2. `MetalSurfaceConfig` 必须验证 logical size/scale 并显式计算 drawable pixel size；只有 native
    resize 成功后才能更新 config 和 generation。
-3. `MetalUploader` 只能接受长度与 page width×height 一致的 owned alpha bytes；texture handle
+3. `MetalViewAttachment` 必须以 scoped lifetime 持有 native attachment；drop 时只有在 view 仍
+   指向 Yu layer 的情况下才能恢复之前的 backing layer，不能覆盖 AppKit 或其他组件后来安装的
+   layer。传入的 `NSView` 指针只能在 AppKit main thread 使用。
+4. `MetalUploader` 只能接受长度与 page width×height 一致的 owned alpha bytes；texture handle
    的释放由 macOS backend 负责，不能写回 `GlyphAtlas` 或 `RenderPlan`。
-4. `MetalCommandQueue`、`MetalPipeline` 和 `MetalSurface` 必须绑定同一个 `MetalDevice`；任何
+5. `MetalCommandQueue`、`MetalPipeline` 和 `MetalSurface` 必须绑定同一个 `MetalDevice`；任何
    device mismatch 都必须在 native 调用前拒绝。
-5. `MetalAtlas` 可以拥有 page texture，但 `RenderPlan` 只能通过 page id 引用它们；计划中的
+6. `MetalAtlas` 可以拥有 page texture，但 `RenderPlan` 只能通过 page id 引用它们；计划中的
    glyph 必须在提交前找到对应 page，empty glyph（`page: None`）只能被跳过，不能伪造纹理。
-6. `MetalFrameRenderer::render_plan` 必须保持 `RenderPlan::commands` 的 painter order，solid
+7. `MetalRenderTarget` 是 backend-owned 的持久颜色存储；CAMetalLayer drawable 不能被假定为
+   跨帧内容真源。每次成功 render plan 必须把 retained target blit 到当前 drawable，target
+   尺寸与 drawable 不一致时必须拒绝提交。
+8. `MetalFrameRenderer::render_plan` 第一次提交、target 重建或 surface generation 变化后必须
+   full clear；后续提交只能清除 `RenderPlan::damage()` 经过 viewport 裁剪后的区域，并在这些
+   区域设置 scissor。没有 damage 的稳定 revision 不得被误当成全屏 dirty。
+9. `MetalFrameRenderer::render_plan` 必须保持 `RenderPlan::commands` 的 painter order，solid
    rectangle 使用 solid pipeline，glyph 使用对应 page 的 alpha sampling pipeline；source/layout
    坐标只能在 Rust command conversion 边界按 viewport/scale 转换一次。
-7. native command ABI 的 geometry、UV、颜色和 page id 必须是有限、已验证的 owned 数组；atlas
+10. native command ABI 的 geometry、UV、颜色、damage 和 page id 必须是有限、已验证的 owned 数组；atlas
    rectangle 越界、未知 command kind、缺页或无效 viewport 必须返回错误，不得提交半成品 frame。
-8. `present_clear` 与 `render_plan` 的 drawable、command buffer、encoder 失败都必须转换为明确
-   `MetalRenderError`；window attachment 仍属于后续 AppKit shell，未附着 layer 的硬件测试可以
-   返回 `DrawableUnavailable`。
+11. `present_clear` 与 `render_plan` 的 drawable、command buffer、blit encoder 失败都必须转换为明确
+    `MetalRenderError`；没有有效 drawable 的硬件测试可以返回 `DrawableUnavailable`，但不能改变
+    full-clear/generation 状态。

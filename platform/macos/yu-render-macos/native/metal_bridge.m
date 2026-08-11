@@ -1,9 +1,11 @@
 #import <Metal/Metal.h>
+#import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <math.h>
 
 typedef struct {
     uint32_t kind;
@@ -28,10 +30,51 @@ typedef struct {
 } YuMetalTextureBinding;
 
 typedef struct {
+    float x;
+    float y;
+    float width;
+    float height;
+} YuMetalDamageRect;
+
+typedef struct {
+    NSView *view;
+    CALayer *previous_layer;
+    CAMetalLayer *metal_layer;
+} YuMetalViewAttachment;
+
+typedef struct {
+    id<MTLRenderPipelineState> clear_pipeline;
     id<MTLRenderPipelineState> solid_pipeline;
     id<MTLRenderPipelineState> glyph_pipeline;
     id<MTLSamplerState> sampler;
 } YuMetalPipeline;
+
+typedef struct {
+    id<MTLTexture> texture;
+    NSUInteger width;
+    NSUInteger height;
+} YuMetalRenderTarget;
+
+typedef struct {
+    float x;
+    float y;
+    float u;
+    float v;
+} YuMetalVertex;
+
+typedef struct {
+    float viewport_width;
+    float viewport_height;
+    float scale;
+    float padding;
+} YuMetalFrameUniforms;
+
+typedef struct {
+    float red;
+    float green;
+    float blue;
+    float alpha;
+} YuMetalPrimitiveUniforms;
 
 int yu_metal_create_device(void **out_device, uint64_t *out_registry_id) {
     if (out_device == NULL || out_registry_id == NULL) {
@@ -68,6 +111,49 @@ int yu_metal_create_layer(
     layer.drawableSize = CGSizeMake(pixel_width, pixel_height);
     *out_layer = (void *)layer;
     return 1;
+}
+
+int yu_metal_attach_layer_to_view(
+    void *layer_ptr,
+    void *view_ptr,
+    void **out_attachment
+) {
+    if (layer_ptr == NULL || view_ptr == NULL || out_attachment == NULL) {
+        return 0;
+    }
+    YuMetalViewAttachment *attachment = calloc(1, sizeof(YuMetalViewAttachment));
+    if (attachment == NULL) {
+        return 0;
+    }
+
+    NSView *view = (NSView *)view_ptr;
+    CAMetalLayer *metal_layer = (CAMetalLayer *)layer_ptr;
+    CALayer *previous_layer = view.layer;
+    [view retain];
+    [previous_layer retain];
+    [metal_layer retain];
+    [view setWantsLayer:YES];
+    [view setLayer:metal_layer];
+
+    attachment->view = view;
+    attachment->previous_layer = previous_layer;
+    attachment->metal_layer = metal_layer;
+    *out_attachment = (void *)attachment;
+    return 1;
+}
+
+void yu_metal_detach_layer_from_view(void *attachment_ptr) {
+    if (attachment_ptr == NULL) {
+        return;
+    }
+    YuMetalViewAttachment *attachment = (YuMetalViewAttachment *)attachment_ptr;
+    if (attachment->view.layer == attachment->metal_layer) {
+        [attachment->view setLayer:attachment->previous_layer];
+    }
+    [attachment->view release];
+    [attachment->previous_layer release];
+    [attachment->metal_layer release];
+    free(attachment);
 }
 
 int yu_metal_resize_layer(
@@ -119,6 +205,50 @@ int yu_metal_upload_alpha_texture(
     [texture replaceRegion:region mipmapLevel:0 withBytes:pixels bytesPerRow:width];
     *out_texture = (void *)texture;
     return 1;
+}
+
+int yu_metal_create_render_target(
+    void *device_ptr,
+    uint32_t width,
+    uint32_t height,
+    void **out_target
+) {
+    if (device_ptr == NULL || out_target == NULL || width == 0 || height == 0) {
+        return 0;
+    }
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                      width:width
+                                     height:height
+                                  mipmapped:NO];
+    if (descriptor == nil) {
+        return 0;
+    }
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [(id<MTLDevice>)device_ptr newTextureWithDescriptor:descriptor];
+    if (texture == nil) {
+        return 0;
+    }
+    YuMetalRenderTarget *target = calloc(1, sizeof(YuMetalRenderTarget));
+    if (target == NULL) {
+        [texture release];
+        return 0;
+    }
+    target->texture = texture;
+    target->width = width;
+    target->height = height;
+    *out_target = (void *)target;
+    return 1;
+}
+
+void yu_metal_release_render_target(void *target_ptr) {
+    if (target_ptr == NULL) {
+        return;
+    }
+    YuMetalRenderTarget *target = (YuMetalRenderTarget *)target_ptr;
+    [target->texture release];
+    free(target);
 }
 
 int yu_metal_create_command_queue(void *device_ptr, void **out_queue) {
@@ -234,8 +364,12 @@ int yu_metal_create_pipeline(
 
     MTLRenderPipelineDescriptor *glyph_descriptor = [solid_descriptor copy];
     glyph_descriptor.fragmentFunction = glyph;
+    MTLRenderPipelineDescriptor *clear_descriptor = [solid_descriptor copy];
+    clear_descriptor.colorAttachments[0].blendingEnabled = NO;
 
     NSError *pipeline_error = nil;
+    id<MTLRenderPipelineState> clear_pipeline =
+        [device newRenderPipelineStateWithDescriptor:clear_descriptor error:&pipeline_error];
     id<MTLRenderPipelineState> solid_pipeline =
         [device newRenderPipelineStateWithDescriptor:solid_descriptor error:&pipeline_error];
     id<MTLRenderPipelineState> glyph_pipeline =
@@ -249,6 +383,7 @@ int yu_metal_create_pipeline(
     id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sampler_descriptor];
 
     [sampler_descriptor release];
+    [clear_descriptor release];
     [glyph_descriptor release];
     [solid_descriptor release];
     [vertex_descriptor release];
@@ -257,7 +392,8 @@ int yu_metal_create_pipeline(
     [glyph release];
     [library release];
 
-    if (solid_pipeline == nil || glyph_pipeline == nil || sampler == nil) {
+    if (clear_pipeline == nil || solid_pipeline == nil || glyph_pipeline == nil || sampler == nil) {
+        [clear_pipeline release];
         [solid_pipeline release];
         [glyph_pipeline release];
         [sampler release];
@@ -266,11 +402,13 @@ int yu_metal_create_pipeline(
 
     YuMetalPipeline *pipeline = calloc(1, sizeof(YuMetalPipeline));
     if (pipeline == NULL) {
+        [clear_pipeline release];
         [solid_pipeline release];
         [glyph_pipeline release];
         [sampler release];
         return 0;
     }
+    pipeline->clear_pipeline = clear_pipeline;
     pipeline->solid_pipeline = solid_pipeline;
     pipeline->glyph_pipeline = glyph_pipeline;
     pipeline->sampler = sampler;
@@ -278,29 +416,141 @@ int yu_metal_create_pipeline(
     return 1;
 }
 
+static int yu_metal_damage_scissor(
+    YuMetalDamageRect damage,
+    float scale,
+    NSUInteger drawable_width,
+    NSUInteger drawable_height,
+    MTLScissorRect *out_scissor
+) {
+    float left = fmaxf(0.0f, damage.x * scale);
+    float top = fmaxf(0.0f, damage.y * scale);
+    float right = fminf((float)drawable_width, (damage.x + damage.width) * scale);
+    float bottom = fminf((float)drawable_height, (damage.y + damage.height) * scale);
+    if (!isfinite(left) || !isfinite(top) || !isfinite(right) || !isfinite(bottom)
+        || right <= left || bottom <= top) {
+        return 0;
+    }
+    NSUInteger x = (NSUInteger)floorf(left);
+    NSUInteger y = (NSUInteger)floorf(top);
+    NSUInteger max_right = (NSUInteger)ceilf(right);
+    NSUInteger max_bottom = (NSUInteger)ceilf(bottom);
+    if (max_right > drawable_width) {
+        max_right = drawable_width;
+    }
+    if (max_bottom > drawable_height) {
+        max_bottom = drawable_height;
+    }
+    if (max_right <= x || max_bottom <= y) {
+        return 0;
+    }
+    out_scissor->x = x;
+    out_scissor->y = y;
+    out_scissor->width = max_right - x;
+    out_scissor->height = max_bottom - y;
+    return 1;
+}
+
+static int yu_metal_encode_command(
+    id<MTLRenderCommandEncoder> encoder,
+    YuMetalPipeline *pipeline,
+    YuMetalDrawCommand command,
+    const YuMetalTextureBinding *textures,
+    size_t texture_count
+) {
+    YuMetalVertex vertices[6] = {
+        {command.x, command.y, command.u0, command.v0},
+        {command.x + command.width, command.y, command.u1, command.v0},
+        {command.x, command.y + command.height, command.u0, command.v1},
+        {command.x + command.width, command.y, command.u1, command.v0},
+        {command.x + command.width, command.y + command.height, command.u1, command.v1},
+        {command.x, command.y + command.height, command.u0, command.v1},
+    };
+    YuMetalPrimitiveUniforms primitive = {
+        command.red,
+        command.green,
+        command.blue,
+        command.alpha,
+    };
+
+    if (command.kind == 0) {
+        [encoder setRenderPipelineState:pipeline->solid_pipeline];
+    } else if (command.kind == 1) {
+        void *texture_ptr = NULL;
+        for (size_t texture_index = 0; texture_index < texture_count; texture_index += 1) {
+            if (textures[texture_index].page == command.page) {
+                texture_ptr = textures[texture_index].texture;
+                break;
+            }
+        }
+        if (texture_ptr == NULL) {
+            return 0;
+        }
+        [encoder setRenderPipelineState:pipeline->glyph_pipeline];
+        [encoder setFragmentTexture:(id<MTLTexture>)texture_ptr atIndex:0];
+        [encoder setFragmentSamplerState:pipeline->sampler atIndex:0];
+    } else {
+        return 0;
+    }
+
+    [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
+    [encoder setFragmentBytes:&primitive length:sizeof(primitive) atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+    return 1;
+}
+
+static void yu_metal_encode_clear_rect(
+    id<MTLRenderCommandEncoder> encoder,
+    YuMetalPipeline *pipeline,
+    YuMetalDamageRect damage
+) {
+    YuMetalVertex vertices[6] = {
+        {damage.x, damage.y, 0.0f, 0.0f},
+        {damage.x + damage.width, damage.y, 0.0f, 0.0f},
+        {damage.x, damage.y + damage.height, 0.0f, 0.0f},
+        {damage.x + damage.width, damage.y, 0.0f, 0.0f},
+        {damage.x + damage.width, damage.y + damage.height, 0.0f, 0.0f},
+        {damage.x, damage.y + damage.height, 0.0f, 0.0f},
+    };
+    YuMetalPrimitiveUniforms primitive = {0.0f, 0.0f, 0.0f, 0.0f};
+    [encoder setRenderPipelineState:pipeline->clear_pipeline];
+    [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
+    [encoder setFragmentBytes:&primitive length:sizeof(primitive) atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+}
+
 int yu_metal_render_plan(
     void *queue_ptr,
     void *layer_ptr,
     void *pipeline_ptr,
+    void *target_ptr,
     float viewport_width,
     float viewport_height,
     float scale,
+    int full_clear,
     const YuMetalDrawCommand *commands,
     size_t command_count,
+    const YuMetalDamageRect *damage,
+    size_t damage_count,
     const YuMetalTextureBinding *textures,
     size_t texture_count
 ) {
-    if (queue_ptr == NULL || layer_ptr == NULL || pipeline_ptr == NULL
+    if (queue_ptr == NULL || layer_ptr == NULL || pipeline_ptr == NULL || target_ptr == NULL
         || viewport_width <= 0.0f || viewport_height <= 0.0f || scale <= 0.0f
         || (command_count > 0 && commands == NULL)
+        || (damage_count > 0 && damage == NULL)
         || (texture_count > 0 && textures == NULL)) {
         return 0;
     }
 
     YuMetalPipeline *pipeline = (YuMetalPipeline *)pipeline_ptr;
+    YuMetalRenderTarget *target = (YuMetalRenderTarget *)target_ptr;
     id<CAMetalDrawable> drawable = [(CAMetalLayer *)layer_ptr nextDrawable];
     if (drawable == nil) {
         return 2;
+    }
+    if (drawable.texture.width != target->width || drawable.texture.height != target->height) {
+        return 6;
     }
     id<MTLCommandBuffer> command_buffer = [(id<MTLCommandQueue>)queue_ptr commandBuffer];
     if (command_buffer == nil) {
@@ -312,8 +562,8 @@ int yu_metal_render_plan(
         return 4;
     }
     MTLRenderPassColorAttachmentDescriptor *color = pass.colorAttachments[0];
-    color.texture = drawable.texture;
-    color.loadAction = MTLLoadActionClear;
+    color.texture = target->texture;
+    color.loadAction = full_clear ? MTLLoadActionClear : MTLLoadActionLoad;
     color.storeAction = MTLStoreActionStore;
     color.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
     id<MTLRenderCommandEncoder> encoder =
@@ -321,25 +571,6 @@ int yu_metal_render_plan(
     if (encoder == nil) {
         return 4;
     }
-
-    typedef struct {
-        float x;
-        float y;
-        float u;
-        float v;
-    } YuMetalVertex;
-    typedef struct {
-        float viewport_width;
-        float viewport_height;
-        float scale;
-        float padding;
-    } YuMetalFrameUniforms;
-    typedef struct {
-        float red;
-        float green;
-        float blue;
-        float alpha;
-    } YuMetalPrimitiveUniforms;
 
     YuMetalFrameUniforms frame = {
         viewport_width,
@@ -349,51 +580,59 @@ int yu_metal_render_plan(
     };
     [encoder setVertexBytes:&frame length:sizeof(frame) atIndex:1];
 
-    for (size_t index = 0; index < command_count; index += 1) {
-        YuMetalDrawCommand command = commands[index];
-        YuMetalVertex vertices[6] = {
-            {command.x, command.y, command.u0, command.v0},
-            {command.x + command.width, command.y, command.u1, command.v0},
-            {command.x, command.y + command.height, command.u0, command.v1},
-            {command.x + command.width, command.y, command.u1, command.v0},
-            {command.x + command.width, command.y + command.height, command.u1, command.v1},
-            {command.x, command.y + command.height, command.u0, command.v1},
+    if (full_clear) {
+        MTLScissorRect full_scissor = {
+            0,
+            0,
+            drawable.texture.width,
+            drawable.texture.height,
         };
-        YuMetalPrimitiveUniforms primitive = {
-            command.red,
-            command.green,
-            command.blue,
-            command.alpha,
-        };
-
-        if (command.kind == 0) {
-            [encoder setRenderPipelineState:pipeline->solid_pipeline];
-        } else if (command.kind == 1) {
-            void *texture_ptr = NULL;
-            for (size_t texture_index = 0; texture_index < texture_count; texture_index += 1) {
-                if (textures[texture_index].page == command.page) {
-                    texture_ptr = textures[texture_index].texture;
-                    break;
-                }
-            }
-            if (texture_ptr == NULL) {
+        [encoder setScissorRect:full_scissor];
+        for (size_t index = 0; index < command_count; index += 1) {
+            if (!yu_metal_encode_command(encoder, pipeline, commands[index], textures, texture_count)) {
                 [encoder endEncoding];
                 return 5;
             }
-            [encoder setRenderPipelineState:pipeline->glyph_pipeline];
-            [encoder setFragmentTexture:(id<MTLTexture>)texture_ptr atIndex:0];
-            [encoder setFragmentSamplerState:pipeline->sampler atIndex:0];
-        } else {
-            [encoder endEncoding];
-            return 5;
         }
-
-        [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
-        [encoder setFragmentBytes:&primitive length:sizeof(primitive) atIndex:0];
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+    } else {
+        for (size_t damage_index = 0; damage_index < damage_count; damage_index += 1) {
+            YuMetalDamageRect damage_rect = damage[damage_index];
+            MTLScissorRect scissor;
+            if (!yu_metal_damage_scissor(
+                    damage_rect,
+                    scale,
+                    drawable.texture.width,
+                    drawable.texture.height,
+                    &scissor)) {
+                continue;
+            }
+            [encoder setScissorRect:scissor];
+            yu_metal_encode_clear_rect(encoder, pipeline, damage_rect);
+            for (size_t index = 0; index < command_count; index += 1) {
+                if (!yu_metal_encode_command(encoder, pipeline, commands[index], textures, texture_count)) {
+                    [encoder endEncoding];
+                    return 5;
+                }
+            }
+        }
     }
 
     [encoder endEncoding];
+    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    if (blit == nil) {
+        return 7;
+    }
+    MTLSize copy_size = MTLSizeMake(target->width, target->height, 1);
+    [blit copyFromTexture:target->texture
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:copy_size
+                toTexture:drawable.texture
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
     [command_buffer presentDrawable:drawable];
     [command_buffer commit];
     return 1;
@@ -404,6 +643,7 @@ void yu_metal_release_pipeline(void *pipeline_ptr) {
         return;
     }
     YuMetalPipeline *pipeline = (YuMetalPipeline *)pipeline_ptr;
+    [pipeline->clear_pipeline release];
     [pipeline->solid_pipeline release];
     [pipeline->glyph_pipeline release];
     [pipeline->sampler release];

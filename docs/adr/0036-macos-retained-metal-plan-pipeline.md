@@ -35,7 +35,8 @@ GPU 句柄、窗口或 AppKit 状态倒灌到 shared crates。当前开发机没
 - 无窗口单元测试可以验证 command conversion、painter order、atlas UV 和缺页错误；有 Metal
   device 的 ignored test 覆盖 pipeline creation、atlas upload 和实际 drawable 提交。
 - 当前实现每个 `MetalFrameRenderer` 只创建一次 pipeline，避免每帧重新编译 shader；完整窗口、
-  damage scissor、drawable resize synchronization 和 batch/indirect draw 仍留给后续阶段。
+  command-level damage culling、drawable resize synchronization 的产品 shell 和 batch/indirect
+  draw 仍留给后续阶段。AppKit attachment、retained target 与 damage scissor 的边界见 ADR 0037。
 
 ## 限制
 
