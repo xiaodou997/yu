@@ -64,6 +64,9 @@ Cmd-Z/Cmd-Shift-Z 使用完整 source fallback。两类结果都必须按 Rust �
 同一个 command execution FFI；取消 composition 保留为独立的 AppKit Selector，未知 Selector 不
 进入编辑器命令层。
 
+Option-←/→ 和对应的 word Selector 由 Rust Unicode word-boundary command 处理；自检会在插入、
+按词移动、返回原 caret 后删除临时字符，确认这条路径没有产生额外 source revision。
+
 该实验暂时直接保存 UTF-16 selection，因为 AppKit 协议使用 `NSRange`。接入 Rust 时必须由
 平台适配层转换成带 Revision 的 `SourceCaretPosition`；需要穿过编辑长期保存时再使用
 `TextAnchor`。正式 composition 则进入临时 Overlay，不能在每次 `setMarkedText` 时提交 Undo

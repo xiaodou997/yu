@@ -15,7 +15,10 @@ use crate::{
     Projection, ProjectionCache, ProjectionCacheStats, ProjectionError, SelectionError,
     SourceChange, ViewportConfig, ViewportError, ViewportLayout, ViewportRect, ViewportSnapshot,
     ViewportStats,
-    command::{next_grapheme_boundary, previous_grapheme_boundary},
+    command::{
+        next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
+        previous_word_boundary,
+    },
     history::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats},
     keymap::command_for_key,
     list::ListLinePrefix,
@@ -522,6 +525,8 @@ impl EditorDocument {
             EditorCommand::DeleteForward => self.delete_forward(),
             EditorCommand::MoveLeft => self.move_left(),
             EditorCommand::MoveRight => self.move_right(),
+            EditorCommand::MoveWordLeft => self.move_word_left(),
+            EditorCommand::MoveWordRight => self.move_word_right(),
             EditorCommand::InsertNewline => self.insert_newline(),
             EditorCommand::IndentList => self.indent_list(),
             EditorCommand::OutdentList => self.outdent_list(),
@@ -545,7 +550,13 @@ impl EditorDocument {
             EditorCommand::DeleteBackward | EditorCommand::MoveLeft => {
                 !self.selection.is_empty() || self.selection.focus() > ByteOffset::ZERO
             }
+            EditorCommand::MoveWordLeft => {
+                !self.selection.is_empty() || self.selection.focus() > ByteOffset::ZERO
+            }
             EditorCommand::DeleteForward | EditorCommand::MoveRight => {
+                !self.selection.is_empty() || self.selection.focus() < snapshot.len_bytes()
+            }
+            EditorCommand::MoveWordRight => {
                 !self.selection.is_empty() || self.selection.focus() < snapshot.len_bytes()
             }
             EditorCommand::InsertNewline => true,
@@ -946,6 +957,106 @@ impl EditorDocument {
         };
         self.selection =
             EditorSelection::cursor(&self.snapshot(), target, crate::CaretAffinity::Downstream)?;
+        Ok(self.command_result(false))
+    }
+
+    fn move_word_left(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        self.history.break_group();
+        if !self.selection.is_empty() {
+            let target = self.selection.ordered_range().start();
+            self.selection = EditorSelection::cursor(
+                &self.snapshot(),
+                target,
+                crate::CaretAffinity::Downstream,
+            )?;
+            return Ok(self.command_result(false));
+        }
+
+        let snapshot = self.snapshot();
+        let line_index = snapshot.line_index(self.selection.focus())?;
+        let line = source_line(&snapshot, self.selection.focus())?;
+        let relative = byte_distance(line.start, self.selection.focus())?.min(line.content.len());
+        let local_target = previous_word_boundary(&line.content, relative);
+        if local_target < relative {
+            let target =
+                line.start
+                    .checked_add(u64::try_from(local_target).map_err(|_| {
+                        EditorDocumentError::Selection(SelectionError::InvalidRange)
+                    })?)
+                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+            self.selection =
+                EditorSelection::cursor(&snapshot, target, crate::CaretAffinity::Downstream)?;
+            return Ok(self.command_result(false));
+        }
+
+        let target =
+            if line_index.get() == 0 {
+                line.start
+            } else {
+                let previous_line = source_line(
+                    &snapshot,
+                    snapshot.line_start(LineIndex::new(line_index.get() - 1))?,
+                )?;
+                let local_target =
+                    previous_word_boundary(&previous_line.content, previous_line.content.len());
+                previous_line
+                    .start
+                    .checked_add(u64::try_from(local_target).map_err(|_| {
+                        EditorDocumentError::Selection(SelectionError::InvalidRange)
+                    })?)
+                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?
+            };
+        self.selection =
+            EditorSelection::cursor(&snapshot, target, crate::CaretAffinity::Downstream)?;
+        Ok(self.command_result(false))
+    }
+
+    fn move_word_right(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        self.history.break_group();
+        if !self.selection.is_empty() {
+            let target = self.selection.ordered_range().end();
+            self.selection = EditorSelection::cursor(
+                &self.snapshot(),
+                target,
+                crate::CaretAffinity::Downstream,
+            )?;
+            return Ok(self.command_result(false));
+        }
+
+        let snapshot = self.snapshot();
+        let line_index = snapshot.line_index(self.selection.focus())?;
+        let line = source_line(&snapshot, self.selection.focus())?;
+        let relative = byte_distance(line.start, self.selection.focus())?.min(line.content.len());
+        let local_target = next_word_boundary(&line.content, relative);
+        if local_target > relative {
+            let target =
+                line.start
+                    .checked_add(u64::try_from(local_target).map_err(|_| {
+                        EditorDocumentError::Selection(SelectionError::InvalidRange)
+                    })?)
+                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+            self.selection =
+                EditorSelection::cursor(&snapshot, target, crate::CaretAffinity::Downstream)?;
+            return Ok(self.command_result(false));
+        }
+
+        let next_index = line_index.get().saturating_add(1);
+        let target =
+            if next_index < snapshot.summary().line_count() {
+                let next_line =
+                    source_line(&snapshot, snapshot.line_start(LineIndex::new(next_index))?)?;
+                let local_target = next_word_boundary(&next_line.content, 0);
+                next_line
+                    .start
+                    .checked_add(u64::try_from(local_target).map_err(|_| {
+                        EditorDocumentError::Selection(SelectionError::InvalidRange)
+                    })?)
+                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?
+            } else {
+                snapshot.len_bytes()
+            };
+        self.selection =
+            EditorSelection::cursor(&snapshot, target, crate::CaretAffinity::Downstream)?;
         Ok(self.command_result(false))
     }
 
@@ -1457,6 +1568,52 @@ mod tests {
             .expect("composition should begin");
         assert!(!composing.command_available(&EditorCommand::DeleteBackward));
         assert!(!composing.command_available(&EditorCommand::insert_newline()));
+    }
+
+    #[test]
+    fn word_commands_move_by_unicode_segments_without_editing_source() {
+        let source = "hello  世界🙂!\nnext";
+        let mut document = EditorDocument::new(source);
+        let first_line_end = source.find('\n').expect("line ending");
+        set_caret(&mut document, first_line_end);
+        let revision = document.revision();
+
+        document
+            .execute(EditorCommand::move_word_left())
+            .expect("word left should succeed");
+        assert_eq!(
+            document.selection().focus().get() as usize,
+            "hello  世界🙂".len()
+        );
+        document
+            .execute(EditorCommand::move_word_left())
+            .expect("word left should reach emoji");
+        assert_eq!(
+            document.selection().focus().get() as usize,
+            "hello  世界".len()
+        );
+
+        document
+            .execute(EditorCommand::move_word_right())
+            .expect("word right should reach emoji end");
+        assert_eq!(
+            document.selection().focus().get() as usize,
+            "hello  世界🙂".len()
+        );
+        document
+            .execute(EditorCommand::move_word_right())
+            .expect("word right should reach line ending");
+        assert_eq!(document.selection().focus().get() as usize, first_line_end);
+        document
+            .execute(EditorCommand::move_word_right())
+            .expect("word right should cross the line");
+        assert_eq!(
+            document.selection().focus().get() as usize,
+            first_line_end + 1 + "next".len()
+        );
+
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.snapshot().as_str(), source);
     }
 
     #[test]

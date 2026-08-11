@@ -24,6 +24,7 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - macOS 原生快捷键先经过共享 Rust command route，普通字符仍交给 `NSTextInputClient`；
 - 原生命令结果显式声明 `None/Range/Full` source sync，局部编辑只复制变化的 UTF-16 范围；
 - macOS `doCommand(by:)` 只允许 allowlist 内的 Selector 进入同一 Rust command/availability 入口；
+- macOS Option/Control word movement 使用 Unicode word-boundary segment，不物化整份文档；
 - 解析、投影、布局、绘制和资源加载都只处理受影响部分；
 - 中文、日文、RTL、emoji、组合字符与原生 IME 是一等公民；
 - 不依赖 Chromium、DOM 或常驻 JavaScript runtime；
@@ -118,6 +119,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS key command routing](docs/adr/0047-macos-key-command-routing.md)
 - [Native command source synchronization](docs/adr/0048-native-command-source-sync.md)
 - [macOS Selector command bridge](docs/adr/0049-macos-selector-command-bridge.md)
+- [Unicode word movement](docs/adr/0050-unicode-word-movement.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
