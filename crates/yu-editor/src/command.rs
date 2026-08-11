@@ -19,6 +19,8 @@ pub enum EditorCommand {
     MoveWordRight,
     MoveUp,
     MoveDown,
+    MoveUpExtend,
+    MoveDownExtend,
     InsertNewline,
     IndentList,
     OutdentList,
@@ -129,6 +131,16 @@ impl EditorCommand {
     #[must_use]
     pub const fn move_down() -> Self {
         Self::MoveDown
+    }
+
+    #[must_use]
+    pub const fn move_up_extend() -> Self {
+        Self::MoveUpExtend
+    }
+
+    #[must_use]
+    pub const fn move_down_extend() -> Self {
+        Self::MoveDownExtend
     }
 }
 
