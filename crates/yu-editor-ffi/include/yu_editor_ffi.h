@@ -22,6 +22,11 @@ enum {
 };
 
 enum {
+    YU_COMMAND_UNAVAILABLE = 0,
+    YU_COMMAND_AVAILABLE = 1,
+};
+
+enum {
     YU_CARET_AFFINITY_UPSTREAM = 0,
     YU_CARET_AFFINITY_DOWNSTREAM = 1,
 };
@@ -88,6 +93,10 @@ int32_t yu_composition_session_execute_command(YuCompositionSession *session,
                                                uint8_t command,
                                                uint64_t block,
                                                YuEditorCommandResult *output);
+int32_t yu_composition_session_command_available(YuCompositionSession *session,
+                                                 uint8_t command,
+                                                 uint64_t block,
+                                                 uint8_t *output);
 int32_t yu_composition_session_route_key(YuCompositionSession *session,
                                          uint8_t key_kind,
                                          uint32_t key,
