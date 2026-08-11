@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use yu_core::{Revision, TextRange, Utf16Range};
+use yu_core::{LineIndex, Revision, TextRange, Utf16Range};
 use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
 use yu_text::{
@@ -15,6 +15,7 @@ use crate::{
     ProjectionCacheStats, ProjectionError, SelectionError, ViewportConfig, ViewportError,
     ViewportLayout, ViewportRect, ViewportSnapshot, ViewportStats,
     command::{next_grapheme_boundary, previous_grapheme_boundary},
+    list::ListLinePrefix,
 };
 
 /// The canonical source and transient composition state owned by one editor.
@@ -478,6 +479,9 @@ impl EditorDocument {
             EditorCommand::DeleteForward => self.delete_forward(),
             EditorCommand::MoveLeft => self.move_left(),
             EditorCommand::MoveRight => self.move_right(),
+            EditorCommand::InsertNewline => self.insert_newline(),
+            EditorCommand::IndentList => self.indent_list(),
+            EditorCommand::OutdentList => self.outdent_list(),
             EditorCommand::ToggleTask { block } => self.toggle_task(block),
         }
     }
@@ -524,6 +528,131 @@ impl EditorDocument {
         Ok(self.command_result(true))
     }
 
+    /// Inserts a line ending and, when the caret is in a list item, continues
+    /// its source prefix. A completed task always starts the next item as
+    /// unchecked. Pressing Enter on an empty list item exits the list by
+    /// removing that line's prefix while preserving its line ending.
+    pub fn insert_newline(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let selection_range = self.selection.ordered_range();
+        let line = source_line(&snapshot, selection_range.start())?;
+        if self.selection.is_empty() {
+            let caret = self.selection.focus();
+            let relative = byte_distance(line.start, caret)?;
+            if relative <= line.content.len()
+                && let Some(prefix) = self.list_prefix(&line)
+            {
+                if relative >= prefix.content_start
+                    && prefix.is_empty_item(&line.content)
+                    && line
+                        .content
+                        .get(relative..)
+                        .is_some_and(|tail| tail.trim().is_empty())
+                {
+                    let transaction = Transaction::new(
+                        self.revision(),
+                        [yu_text::Edit::new(line.content_range(), "")],
+                    );
+                    let applied = self.apply_transaction(&transaction)?;
+                    self.selection = EditorSelection::cursor(
+                        applied.result_snapshot(),
+                        line.start,
+                        crate::CaretAffinity::Downstream,
+                    )?;
+                    return Ok(self.command_result(true));
+                }
+
+                let mut insertion = String::from(line.insertion_terminator());
+                insertion.push_str(&prefix.continuation(&line.content));
+                let offset = caret
+                    .checked_add(u64::try_from(insertion.len()).map_err(|_| {
+                        EditorDocumentError::Selection(SelectionError::InvalidRange)
+                    })?)
+                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+                let transaction = Transaction::new(
+                    self.revision(),
+                    [yu_text::Edit::new(
+                        TextRange::empty(caret),
+                        insertion.as_str(),
+                    )],
+                );
+                let applied = self.apply_transaction(&transaction)?;
+                self.selection = EditorSelection::cursor(
+                    applied.result_snapshot(),
+                    offset,
+                    crate::CaretAffinity::Downstream,
+                )?;
+                return Ok(self.command_result(true));
+            }
+        }
+
+        let insertion = String::from(line.insertion_terminator());
+        let offset = selection_range
+            .start()
+            .checked_add(
+                u64::try_from(insertion.len())
+                    .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
+            )
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        let transaction = Transaction::new(
+            self.revision(),
+            [yu_text::Edit::new(selection_range, insertion.as_str())],
+        );
+        let applied = self.apply_transaction(&transaction)?;
+        self.selection = EditorSelection::cursor(
+            applied.result_snapshot(),
+            offset,
+            crate::CaretAffinity::Downstream,
+        )?;
+        Ok(self.command_result(true))
+    }
+
+    /// Indents the current list item by two source spaces.
+    pub fn indent_list(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let line = source_line(&snapshot, self.selection.focus())?;
+        if self.list_prefix(&line).is_none() {
+            return Ok(self.command_result(false));
+        }
+        let transaction = Transaction::new(
+            self.revision(),
+            [yu_text::Edit::new(TextRange::empty(line.start), "  ")],
+        );
+        self.apply_transaction(&transaction)?;
+        Ok(self.command_result(true))
+    }
+
+    /// Removes up to two leading source spaces from the current list item.
+    pub fn outdent_list(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let line = source_line(&snapshot, self.selection.focus())?;
+        if self.list_prefix(&line).is_none() {
+            return Ok(self.command_result(false));
+        }
+        let leading = line
+            .content
+            .as_bytes()
+            .iter()
+            .take_while(|byte| **byte == b' ')
+            .count();
+        if leading == 0 {
+            return Ok(self.command_result(false));
+        }
+        let remove = leading.min(2);
+        let end = line
+            .start
+            .checked_add(
+                u64::try_from(remove)
+                    .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
+            )
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        let range = TextRange::new(line.start, end)
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        let transaction = Transaction::new(self.revision(), [yu_text::Edit::new(range, "")]);
+        self.apply_transaction(&transaction)?;
+        Ok(self.command_result(true))
+    }
+
     fn insert_text(&mut self, text: Arc<str>) -> Result<CommandResult, EditorDocumentError> {
         if text.is_empty() {
             return Ok(self.command_result(false));
@@ -550,6 +679,11 @@ impl EditorDocument {
     }
 
     fn delete_backward(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        if self.selection.is_empty()
+            && let Some(result) = self.delete_empty_list_prefix()?
+        {
+            return Ok(result);
+        }
         let range = if self.selection.is_empty() {
             let start = previous_grapheme_boundary(&self.snapshot(), self.selection.focus())?;
             TextRange::new(start, self.selection.focus())
@@ -558,6 +692,35 @@ impl EditorDocument {
             self.selection.ordered_range()
         };
         self.delete_range(range)
+    }
+
+    fn delete_empty_list_prefix(&mut self) -> Result<Option<CommandResult>, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let line = source_line(&snapshot, self.selection.focus())?;
+        let Some(prefix) = self.list_prefix(&line) else {
+            return Ok(None);
+        };
+        let relative = byte_distance(line.start, self.selection.focus())?;
+        if relative < prefix.content_start
+            || !prefix.is_empty_item(&line.content)
+            || !line
+                .content
+                .get(relative..)
+                .is_some_and(|tail| tail.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        let transaction = Transaction::new(
+            self.revision(),
+            [yu_text::Edit::new(line.content_range(), "")],
+        );
+        let applied = self.apply_transaction(&transaction)?;
+        self.selection = EditorSelection::cursor(
+            applied.result_snapshot(),
+            line.start,
+            crate::CaretAffinity::Downstream,
+        )?;
+        Ok(Some(self.command_result(true)))
     }
 
     fn delete_forward(&mut self) -> Result<CommandResult, EditorDocumentError> {
@@ -613,6 +776,134 @@ impl EditorDocument {
     fn command_result(&self, changed: bool) -> CommandResult {
         CommandResult::new(self.revision(), self.selection, changed)
     }
+
+    fn list_prefix(&self, line: &SourceLine) -> Option<ListLinePrefix> {
+        let blocks = self.markdown.blocks();
+        let mut low = 0_usize;
+        let mut high = blocks.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let block = blocks.get(middle)?;
+            if block.range().end() <= line.start {
+                low = middle.saturating_add(1);
+            } else {
+                high = middle;
+            }
+        }
+        let block = blocks.get(low)?;
+        if block.range().start() > line.start {
+            return None;
+        }
+        if !matches!(
+            block.kind(),
+            BlockKind::ListItem { .. } | BlockKind::TaskListItem { .. }
+        ) {
+            return None;
+        }
+        ListLinePrefix::parse(&line.content)
+    }
+}
+
+struct SourceLine {
+    start: yu_core::ByteOffset,
+    content_end: yu_core::ByteOffset,
+    content: String,
+    terminator: String,
+}
+
+impl SourceLine {
+    fn content_range(&self) -> TextRange {
+        TextRange::new(self.start, self.content_end)
+            .expect("source line content range must be ordered")
+    }
+
+    fn insertion_terminator(&self) -> &str {
+        if self.terminator.is_empty() {
+            "\n"
+        } else {
+            &self.terminator
+        }
+    }
+}
+
+fn source_line(
+    snapshot: &TextSnapshot,
+    offset: yu_core::ByteOffset,
+) -> Result<SourceLine, EditorDocumentError> {
+    let line = snapshot.line_index(offset)?;
+    let line_count = snapshot.summary().line_count();
+    let start = snapshot.line_start(line)?;
+    let next_line = line
+        .get()
+        .checked_add(1)
+        .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+    let end = if next_line < line_count {
+        snapshot.line_start(LineIndex::new(next_line))?
+    } else {
+        snapshot.len_bytes()
+    };
+    let range = TextRange::new(start, end)
+        .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+    let text = read_source_range(snapshot, range)?;
+    let terminator_len = if text.ends_with("\r\n") {
+        2
+    } else if text.ends_with('\n') {
+        1
+    } else {
+        0
+    };
+    let content_len = text.len().saturating_sub(terminator_len);
+    let content_end = start
+        .checked_add(
+            u64::try_from(content_len)
+                .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
+        )
+        .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+    Ok(SourceLine {
+        start,
+        content_end,
+        content: text[..content_len].to_owned(),
+        terminator: text[content_len..].to_owned(),
+    })
+}
+
+fn read_source_range(
+    snapshot: &TextSnapshot,
+    range: TextRange,
+) -> Result<String, EditorDocumentError> {
+    let start = usize::try_from(range.start())
+        .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+    let end = usize::try_from(range.end())
+        .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+    let mut text = String::with_capacity(end.saturating_sub(start));
+    for chunk in snapshot.chunk_cursor(range.start())? {
+        let chunk_start = usize::try_from(chunk.start())
+            .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        let chunk_end = chunk_start
+            .checked_add(chunk.text().len())
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+        if chunk_start >= end {
+            break;
+        }
+        let local_start = start.saturating_sub(chunk_start);
+        let local_end = end.min(chunk_end).saturating_sub(chunk_start);
+        if local_start < local_end {
+            text.push_str(&chunk.text()[local_start..local_end]);
+        }
+    }
+    Ok(text)
+}
+
+fn byte_distance(
+    start: yu_core::ByteOffset,
+    end: yu_core::ByteOffset,
+) -> Result<usize, EditorDocumentError> {
+    usize::try_from(
+        end.get()
+            .checked_sub(start.get())
+            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?,
+    )
+    .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))
 }
 
 /// Errors raised while coordinating canonical edits and composition state.
@@ -751,6 +1042,18 @@ mod tests {
             .expect("test UTF-16 range should be ordered")
     }
 
+    fn set_caret(document: &mut EditorDocument, offset: usize) {
+        let selection = EditorSelection::cursor(
+            &document.snapshot(),
+            ByteOffset::try_from(offset).expect("test offset fits"),
+            crate::CaretAffinity::Downstream,
+        )
+        .expect("test caret should be valid");
+        document
+            .set_selection(selection)
+            .expect("test caret should belong to document");
+    }
+
     #[derive(Clone, Copy, Debug)]
     struct WideShaper;
 
@@ -858,6 +1161,111 @@ mod tests {
             .expect("forward delete should remove x");
         assert_eq!(document.snapshot().as_str(), "e\u{301}");
         assert_eq!(document.revision(), Revision::new(3));
+    }
+
+    #[test]
+    fn newline_continues_task_as_unchecked_and_increments_ordered_lists() {
+        let source = "- [x] done\n";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find('\n').expect("line ending"));
+        document
+            .execute(EditorCommand::InsertNewline)
+            .expect("task newline should apply");
+        assert_eq!(document.snapshot().as_str(), "- [x] done\n- [ ] \n");
+        assert_eq!(
+            document.selection().focus().get() as usize,
+            "- [x] done\n- [ ] ".len()
+        );
+
+        let source = "9. item\n";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find('\n').expect("line ending"));
+        document
+            .execute(EditorCommand::insert_newline())
+            .expect("ordered newline should apply");
+        assert_eq!(document.snapshot().as_str(), "9. item\n10. \n");
+    }
+
+    #[test]
+    fn empty_list_enter_and_backspace_exit_without_losing_line_ending() {
+        let source = "- [ ] \n";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find('\n').expect("line ending"));
+        document
+            .execute(EditorCommand::insert_newline())
+            .expect("empty task newline should apply");
+        assert_eq!(document.snapshot().as_str(), "\n");
+        assert_eq!(document.selection().focus(), ByteOffset::ZERO);
+
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find('\n').expect("line ending"));
+        document
+            .execute(EditorCommand::DeleteBackward)
+            .expect("empty task backspace should apply");
+        assert_eq!(document.snapshot().as_str(), "\n");
+        assert_eq!(document.selection().focus(), ByteOffset::ZERO);
+    }
+
+    #[test]
+    fn list_indent_and_outdent_are_source_transactions() {
+        let source = "- [ ] item\n";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find('\n').expect("line ending"));
+        document
+            .execute(EditorCommand::indent_list())
+            .expect("list indent should apply");
+        assert_eq!(document.snapshot().as_str(), "  - [ ] item\n");
+        assert_eq!(
+            document.selection().focus().get(),
+            (source.find('\n').expect("line ending") + 2) as u64
+        );
+
+        document
+            .execute(EditorCommand::outdent_list())
+            .expect("list outdent should apply");
+        assert_eq!(document.snapshot().as_str(), source);
+        assert_eq!(
+            document.selection().focus().get(),
+            source.find('\n').expect("line ending") as u64
+        );
+    }
+
+    #[test]
+    fn newline_on_plain_text_does_not_invent_a_list_prefix() {
+        let source = "plain\n";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find('\n').expect("line ending"));
+        document
+            .execute(EditorCommand::insert_newline())
+            .expect("plain newline should apply");
+        assert_eq!(document.snapshot().as_str(), "plain\n\n");
+
+        let source = "plain";
+        let mut document = EditorDocument::new(source);
+        document
+            .execute(EditorCommand::insert_newline())
+            .expect("unterminated newline should apply");
+        assert_eq!(document.snapshot().as_str(), "plain\n");
+    }
+
+    #[test]
+    fn list_commands_preserve_crlf_and_ignore_fenced_code_lines() {
+        let source = "- [ ] item\r\n";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find("\r\n").expect("line ending"));
+        document
+            .execute(EditorCommand::insert_newline())
+            .expect("CRLF list newline should apply");
+        assert_eq!(document.snapshot().as_str(), "- [ ] item\r\n- [ ] \r\n");
+
+        let source = "```\n- [ ] code\n```\n";
+        let mut document = EditorDocument::new(source);
+        let code_line = source.find("code").expect("code line");
+        set_caret(&mut document, code_line + "code".len());
+        document
+            .execute(EditorCommand::insert_newline())
+            .expect("fenced code newline should apply");
+        assert_eq!(document.snapshot().as_str(), "```\n- [ ] code\n\n```\n");
     }
 
     #[test]

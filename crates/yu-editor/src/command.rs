@@ -15,6 +15,9 @@ pub enum EditorCommand {
     DeleteForward,
     MoveLeft,
     MoveRight,
+    InsertNewline,
+    IndentList,
+    OutdentList,
     ToggleTask { block: usize },
 }
 
@@ -27,6 +30,21 @@ impl EditorCommand {
     #[must_use]
     pub const fn toggle_task(block: usize) -> Self {
         Self::ToggleTask { block }
+    }
+
+    #[must_use]
+    pub const fn insert_newline() -> Self {
+        Self::InsertNewline
+    }
+
+    #[must_use]
+    pub const fn indent_list() -> Self {
+        Self::IndentList
+    }
+
+    #[must_use]
+    pub const fn outdent_list() -> Self {
+        Self::OutdentList
     }
 }
 
