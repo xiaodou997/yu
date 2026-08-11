@@ -13,7 +13,7 @@ use std::fmt;
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 use yu_markdown::{
     Block, BlockKind, InlineDocument, InlineNodeKind, InlineParseError, InlineSpan, InlineSpanKind,
-    parse_inline,
+    ReferenceDefinitionIndex, parse_inline, parse_inline_with_definitions,
 };
 use yu_text::{AnchorMapError, ChangeSet, TextChange, TextPositionError, TextSnapshot};
 
@@ -305,6 +305,31 @@ impl Projection {
     pub fn inline(source: &TextSnapshot, source_range: TextRange) -> Result<Self, ProjectionError> {
         let inline = parse_inline(source, source_range)?;
         Self::from_inline(&inline)
+    }
+
+    /// Builds an inline projection with the current document's definition
+    /// index, enabling resolved shortcut references such as `[project]`.
+    pub fn inline_with_definitions(
+        source: &TextSnapshot,
+        source_range: TextRange,
+        definitions: &ReferenceDefinitionIndex,
+    ) -> Result<Self, ProjectionError> {
+        let inline = parse_inline_with_definitions(source, source_range, Some(definitions))?;
+        Self::from_inline(&inline)
+    }
+
+    /// Builds a zero-width projection for source-only blocks such as link
+    /// definitions. The source remains canonical and addressable, but it does
+    /// not contribute visual bytes.
+    pub fn hidden(source: &TextSnapshot, source_range: TextRange) -> Result<Self, ProjectionError> {
+        Self::from_source_parts(
+            source,
+            source_range,
+            &[source_range],
+            &[],
+            &[],
+            VisualRunStyle::Plain,
+        )
     }
 
     /// Builds a projection from the parser-owned lossless inline token stream.
@@ -814,6 +839,7 @@ fn style_for(
 pub enum BlockProjectionKind {
     Inline,
     FencedCode,
+    ReferenceDefinition,
 }
 
 /// A source-backed fenced-code projection.
@@ -959,10 +985,43 @@ impl CodeProjection {
 pub enum BlockProjection {
     Inline(Projection),
     FencedCode(CodeProjection),
+    ReferenceDefinition(Projection),
 }
 
 impl BlockProjection {
     pub fn from_block(source: &TextSnapshot, block: Block) -> Result<Self, ProjectionError> {
+        match block.kind() {
+            BlockKind::ReferenceDefinition => {
+                Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
+            }
+            _ => Self::from_block_without_definitions(source, block),
+        }
+    }
+
+    /// Builds a block projection using a revision-bound reference definition
+    /// index. Definition blocks stay hidden; ordinary inline blocks resolve
+    /// shortcut references against the same source revision.
+    pub fn from_block_with_definitions(
+        source: &TextSnapshot,
+        block: Block,
+        definitions: &ReferenceDefinitionIndex,
+    ) -> Result<Self, ProjectionError> {
+        match block.kind() {
+            BlockKind::ReferenceDefinition => {
+                Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
+            }
+            BlockKind::FencedCodeBlock { .. } => {
+                CodeProjection::from_block(source, block).map(Self::FencedCode)
+            }
+            _ => Projection::inline_with_definitions(source, block.range(), definitions)
+                .map(Self::Inline),
+        }
+    }
+
+    fn from_block_without_definitions(
+        source: &TextSnapshot,
+        block: Block,
+    ) -> Result<Self, ProjectionError> {
         match block.kind() {
             BlockKind::FencedCodeBlock { .. } => {
                 CodeProjection::from_block(source, block).map(Self::FencedCode)
@@ -976,6 +1035,7 @@ impl BlockProjection {
         match self {
             Self::Inline(_) => BlockProjectionKind::Inline,
             Self::FencedCode(_) => BlockProjectionKind::FencedCode,
+            Self::ReferenceDefinition(_) => BlockProjectionKind::ReferenceDefinition,
         }
     }
 
@@ -984,6 +1044,7 @@ impl BlockProjection {
         match self {
             Self::Inline(projection) => projection,
             Self::FencedCode(projection) => projection.visual(),
+            Self::ReferenceDefinition(projection) => projection,
         }
     }
 
@@ -1010,6 +1071,9 @@ impl BlockProjection {
             Self::FencedCode(projection) => Ok(projection
                 .map_through(changes, snapshot)?
                 .map(Self::FencedCode)),
+            Self::ReferenceDefinition(projection) => Ok(projection
+                .map_through(changes, snapshot)?
+                .map(Self::ReferenceDefinition)),
         }
     }
 }
@@ -1264,6 +1328,42 @@ mod tests {
                 .expect("after reference label should map to the next source"),
             ByteOffset::new(13)
         );
+    }
+
+    #[test]
+    fn definition_aware_projection_hides_shortcut_syntax() {
+        let source = "[id]: /docs\n\n[id] ![id]\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let paragraph = markdown.blocks().get(2).expect("paragraph should exist");
+        let projection = Projection::inline_with_definitions(
+            &snapshot,
+            paragraph.range(),
+            markdown.reference_definitions(),
+        )
+        .expect("definition-aware projection should build");
+
+        assert_eq!(projection.visual_len(), VisualOffset::new(6));
+        assert_eq!(
+            projection
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .count(),
+            4
+        );
+
+        let definition = markdown.blocks().get(0).expect("definition should exist");
+        let hidden = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            definition,
+            markdown.reference_definitions(),
+        )
+        .expect("definition block projection should build");
+        assert_eq!(hidden.kind(), BlockProjectionKind::ReferenceDefinition);
+        assert_eq!(hidden.visual().visual_len(), VisualOffset::ZERO);
+        assert_eq!(hidden.visual().source_range(), definition.range());
     }
 
     #[test]

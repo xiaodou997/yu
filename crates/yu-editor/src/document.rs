@@ -93,7 +93,7 @@ impl EditorDocument {
     pub fn projection(&mut self, range: TextRange) -> Result<&Projection, EditorDocumentError> {
         let snapshot = self.snapshot();
         self.projections
-            .get_or_build(&snapshot, range)
+            .get_or_build_with_definitions(&snapshot, range, self.markdown.reference_definitions())
             .map_err(EditorDocumentError::Projection)
     }
 
@@ -117,7 +117,11 @@ impl EditorDocument {
                 })?;
         let snapshot = self.snapshot();
         self.projections
-            .get_or_build_block(&snapshot, block)
+            .get_or_build_block_with_definitions(
+                &snapshot,
+                block,
+                self.markdown.reference_definitions(),
+            )
             .map_err(EditorDocumentError::Projection)
     }
 
@@ -141,7 +145,11 @@ impl EditorDocument {
         let snapshot = self.snapshot();
         let projection = self
             .projections
-            .get_or_build_block(&snapshot, block)
+            .get_or_build_block_with_definitions(
+                &snapshot,
+                block,
+                self.markdown.reference_definitions(),
+            )
             .map_err(EditorDocumentError::Projection)?;
         self.layouts
             .get_or_build_block(&snapshot, block, config, projection)
@@ -170,7 +178,11 @@ impl EditorDocument {
         let snapshot = self.snapshot();
         let projection = self
             .projections
-            .get_or_build_block(&snapshot, block)
+            .get_or_build_block_with_definitions(
+                &snapshot,
+                block,
+                self.markdown.reference_definitions(),
+            )
             .map_err(EditorDocumentError::Projection)?;
         self.layouts
             .get_or_build_block_with_shaper(&snapshot, block, config, projection, shaper)
@@ -328,22 +340,30 @@ impl EditorDocument {
             applied.result_snapshot(),
             applied.change_set(),
         )?;
+        let definitions_changed = self.markdown.reference_definitions().fingerprint()
+            != incremental.document().reference_definitions().fingerprint();
         self.selection = self
             .selection
             .map_through(applied.change_set(), applied.result_snapshot())?;
-        self.projections
-            .map_through(applied.change_set(), applied.result_snapshot())
-            .map_err(EditorDocumentError::Projection)?;
-        self.layouts
-            .map_through(applied.change_set(), applied.result_snapshot())
-            .map_err(EditorDocumentError::Layout)?;
-        self.viewport
-            .map_through(
-                applied.change_set(),
-                applied.result_snapshot(),
-                incremental.document(),
-            )
-            .map_err(EditorDocumentError::Viewport)?;
+        if definitions_changed {
+            self.projections.clear();
+            self.layouts.clear();
+            self.viewport.clear();
+        } else {
+            self.projections
+                .map_through(applied.change_set(), applied.result_snapshot())
+                .map_err(EditorDocumentError::Projection)?;
+            self.layouts
+                .map_through(applied.change_set(), applied.result_snapshot())
+                .map_err(EditorDocumentError::Layout)?;
+            self.viewport
+                .map_through(
+                    applied.change_set(),
+                    applied.result_snapshot(),
+                    incremental.document(),
+                )
+                .map_err(EditorDocumentError::Viewport)?;
+        }
         self.projections.retain_blocks(incremental.document());
         self.layouts.retain_blocks(incremental.document());
         self.markdown = incremental.into_document();
@@ -882,6 +902,93 @@ mod tests {
     }
 
     #[test]
+    fn definition_index_changes_invalidate_nonlocal_projections() {
+        let source = "[id]: /docs\n\n[id]\n";
+        let mut document = EditorDocument::new(source);
+        let paragraph = document
+            .markdown()
+            .blocks()
+            .get(2)
+            .expect("paragraph should exist")
+            .range();
+        document
+            .block_projection(2)
+            .expect("shortcut projection should build");
+        assert_eq!(document.projection_cache_stats().entries(), 1);
+
+        let label_start = source.find("id").expect("definition label should exist");
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(
+                source_range(label_start as u64, (label_start + 2) as u64),
+                "new",
+            )],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("definition edit should apply");
+
+        assert_eq!(
+            document
+                .markdown()
+                .reference_definitions()
+                .definitions()
+                .len(),
+            1
+        );
+        assert_eq!(document.projection_cache_stats().entries(), 0);
+        let new_paragraph = document
+            .markdown()
+            .blocks()
+            .get(2)
+            .expect("paragraph should remain")
+            .range();
+        assert_eq!(
+            new_paragraph,
+            source_range(paragraph.start().get() + 1, paragraph.end().get() + 1)
+        );
+        document
+            .block_projection(2)
+            .expect("unresolved shortcut should rebuild as literal inline text");
+        assert_eq!(document.projection_cache_stats().builds(), 2);
+    }
+
+    #[test]
+    fn definition_index_fingerprint_allows_prefix_remapping() {
+        let source = "intro\n\n[id]: /docs\n\n[id]\n";
+        let mut document = EditorDocument::new(source);
+        let old_range = document
+            .markdown()
+            .blocks()
+            .get(4)
+            .expect("paragraph should exist")
+            .range();
+        document
+            .block_projection(4)
+            .expect("shortcut projection should build");
+
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("prefix edit should apply");
+        let shifted_range = document
+            .markdown()
+            .blocks()
+            .get(4)
+            .expect("shifted paragraph should exist")
+            .range();
+        assert_eq!(shifted_range.start().get(), old_range.start().get() + 3);
+        document
+            .block_projection(4)
+            .expect("prefix shift should reuse shortcut projection");
+        assert_eq!(document.projection_cache_stats().builds(), 1);
+        assert_eq!(document.projection_cache_stats().remapped(), 1);
+    }
+
+    #[test]
     fn projection_query_rejects_non_utf8_source_boundaries() {
         let mut document = EditorDocument::new("羽");
         let invalid = source_range(1, 3);
@@ -969,7 +1076,9 @@ mod tests {
                             && run.style() == crate::VisualRunStyle::Code
                     }));
                 }
-                BlockProjection::Inline(_) => panic!("fenced code must not use inline projection"),
+                BlockProjection::Inline(_) | BlockProjection::ReferenceDefinition(_) => {
+                    panic!("fenced code must not use inline projection")
+                }
             }
         }
         assert_eq!(
@@ -991,7 +1100,9 @@ mod tests {
             .expect("fenced code projection should build")
         {
             BlockProjection::FencedCode(code) => code.content(),
-            BlockProjection::Inline(_) => panic!("fenced code must use code projection"),
+            BlockProjection::Inline(_) | BlockProjection::ReferenceDefinition(_) => {
+                panic!("fenced code must use code projection")
+            }
         };
         let transaction = Transaction::new(
             document.revision(),
@@ -1006,7 +1117,9 @@ mod tests {
             .expect("shifted code projection should be reusable");
         let new_content = match projection {
             BlockProjection::FencedCode(code) => code.content(),
-            BlockProjection::Inline(_) => panic!("fenced code must use code projection"),
+            BlockProjection::Inline(_) | BlockProjection::ReferenceDefinition(_) => {
+                panic!("fenced code must use code projection")
+            }
         };
         assert_eq!(new_content.start().get(), old_content.start().get() + 3);
         assert_eq!(new_content.end().get(), old_content.end().get() + 3);
