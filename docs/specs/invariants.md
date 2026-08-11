@@ -98,6 +98,9 @@
     高度索引和显式 block estimate 计算 document-space caret 与绝对 target scroll。caret 已在
     viewport 内时必须返回 no-op；target 必须限制在合法 content scroll 范围。FFI 查询必须携带
     expected Revision，过期请求不得被平台应用。
+22. macOS native viewport consumer 只能消费仍匹配 current Revision 的 `CaretScrollRequest`；
+    stale 请求不得触碰 `NSClipView`，absolute target 只能在平台边界按 content/clip height 做最后
+    clamp。`NSScrollView`、`NSClipView` 和 document view 不得穿过 Rust FFI。
 
 ## Accessibility
 

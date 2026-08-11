@@ -53,6 +53,7 @@
 - [x] block-aware `MoveUp/Down`、相邻 block hit-test 与 preferred-X caret state
 - [x] Shift+Up/Down selection extension、macOS modify-selection Selector 与 FFI route
 - [x] revision-bound caret scroll request、FFI geometry query 与 macOS spike self-check
+- [x] macOS `NSScrollView` caret request consumer、stale/no-op/native scroll self-check
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -209,6 +210,9 @@
 43. `CaretScrollRequest` 必须包含当前 Revision、focus source/geometry、current/target scroll 和
     `needs_scroll`；Rust 必须使用 focus block 的 layout 与 HeightIndex 计算并 clamp target，FFI
     必须拒绝 stale Revision，macOS spike 必须覆盖 reveal、visible no-op 和 top reveal。
+44. macOS native viewport consumer 必须只消费匹配 current Revision 的请求，将 absolute target 转成
+    `NSClipView` bounds 并做最后 clamp；stale、no-op 和实际滚动都必须有无窗口 AppKit self-check，
+    且 AppKit 对象不能进入 Rust ABI。
 
 ## 非目标
 

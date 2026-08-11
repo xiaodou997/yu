@@ -75,6 +75,10 @@ Revision 的 `CaretScrollRequest`。其中 caret 的 `y` 是 document-space 行�
 重新按 UTF-16 selection 推导 block 高度。平台应用前必须确认请求 Revision 仍然是当前 source
 Revision；`needs_scroll=false` 表示 caret 已在 margin 内，target 与 current 相同。
 
+macOS `YuNativeViewportAdapter` 是唯一的 native consumer：它接收已通过 Revision 校验的绝对
+target，将其转换为 `NSClipView.bounds.origin.y`，并按 native content/clip height 做最后 clamp。
+`NSScrollView` 的对象和坐标不能穿过 Rust FFI。
+
 `AXBoundsForRange`、candidate rect 和 caret rect 均为屏幕几何查询，必须使用与所查询文本相同的
 Projection/Layout 状态。
 

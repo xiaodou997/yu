@@ -168,7 +168,8 @@ boundary。横向/word movement、edit、显式 selection 和 composition/reset 
 间穿越，但不把前一 block 的合成 trailing empty caret line 重复暴露。`EditorDocument` 另提供
 revision-bound `CaretScrollRequest`：它消费当前 viewport、focus block 的 layout 和高度索引，
 返回 document-space caret geometry 与绝对 target scroll；平台只应用仍属于当前 Revision 的目标，
-真实 `NSScrollView` 接入留在 GUI 阶段。
+macOS `YuNativeViewportAdapter` 再把 target 转换为 `NSClipView.bounds.origin.y`；正式产品 host
+接入留在 GUI 阶段。
 
 Shift+上下使用独立的 `MoveUpExtend`/`MoveDownExtend` command：`EditorSelection::anchor()` 保持不动，
 只把 hit-test 得到的 visual caret 写入 focus。macOS `moveUpAndModifySelection:`/

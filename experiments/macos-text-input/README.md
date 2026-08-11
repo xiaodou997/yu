@@ -60,6 +60,10 @@ hit-test 路径。硬行末按 TextKit 语义规范化为 LF 后 offset + upstre
 Cmd-Z/Cmd-Shift-Z 使用完整 source fallback。两类结果都必须按 Rust 返回的 Revision 和 selection
 更新 TextKit mirror；普通段落 Tab 不由共享 key route 消费。
 
+`Viewport self-check` 会在无窗口的 `NSScrollView`/`NSClipView` 上消费 Rust
+`CaretScrollRequest`，验证 absolute target、stale Revision rejection、visible no-op 和返回文档
+原点的 top reveal。adapter 只拥有 AppKit viewport 状态，不把 scroll view 或 document view 传入 Rust。
+
 `doCommand(by:)` 的删除、前后移动和换行 Selector 也会先查询 Rust command availability，再调用
 同一个 command execution FFI；取消 composition 保留为独立的 AppKit Selector，未知 Selector 不
 进入编辑器命令层。

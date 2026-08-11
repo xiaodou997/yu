@@ -23,8 +23,9 @@ Markdown/layout 状态，并且在 source Revision 改变后可能应用过期�
   会限制到 viewport 高度的一半。
 - FFI 查询必须提供 expected Revision。平台只在请求 Revision 仍是当前 Revision 时应用
   `target_scroll_y`，不能从 command 名称或 UTF-16 range 自行猜测滚动目标。
-- 该协议只计算请求，不直接修改 viewport。真实 `NSScrollView`/GPU viewport 的滚动和
-  composition overlay 几何留在后续产品 GUI 阶段。
+- 该协议只计算请求，不直接修改 viewport。macOS spike 的 `YuNativeViewportAdapter` 负责将
+  请求消费为 `NSClipView` bounds；真实产品 host、GPU viewport 的 attachment 和 composition
+  overlay 几何仍留在后续产品 GUI 阶段。
 
 ## 结果
 
