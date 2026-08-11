@@ -147,3 +147,14 @@
 6. `SceneBuilder::append_layout` 必须先校验 layout/scene Revision、font size 和所有 atlas
    entry，再追加 glyph primitive；任一失败不得发布部分 layout scene。glyph primitive 的 origin
    必须直接来自 placement 的 layout 坐标，不能在 renderer 中重新推导 source position。
+
+## macOS Metal boundary
+
+1. `platform/macos/yu-render-macos` 可以拥有 `MTLDevice`、`CAMetalLayer` 和 `MTLTexture`，但
+   这些 native pointers 不得出现在 shared scene、layout、render plan 或 editor canonical state。
+2. `MetalSurfaceConfig` 必须验证 logical size/scale 并显式计算 drawable pixel size；只有 native
+   resize 成功后才能更新 config 和 generation。
+3. `MetalUploader` 只能接受长度与 page width×height 一致的 owned alpha bytes；texture handle
+   的释放由 macOS backend 负责，不能写回 `GlyphAtlas` 或 `RenderPlan`。
+4. drawable acquisition、command encoding、present 与 window attachment 必须在明确的后续
+   platform stage 中加入，不能由当前 atlas upload bridge 隐式完成。

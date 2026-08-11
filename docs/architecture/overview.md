@@ -177,7 +177,13 @@ primitive；失败不会留下部分 scene。
 
 `yu-render` 将 scene 与对应的 CPU `GlyphAtlas` 转换为 backend-neutral `RenderPlan`：命令保持
 painter order，atlas page 通过尺寸/bytes fingerprint 去重 `AtlasPageUpload`，stale/missing
-entry 会被拒绝。当前没有 `wgpu`/Metal device 或窗口依赖；`RenderUploader` 只定义未来 backend
+entry 会被拒绝。共享 `yu-render` 当前没有 `wgpu`/Metal device 或窗口依赖；`RenderUploader` 只定义未来 backend
 上传 alpha page 的最小边界。`yu-render` 已用 fake uploader 覆盖 `FontShaper → LayoutSnapshot →
 Scene → RenderPlan` 端到端 revision、atlas upload 去重和 command origin；实际 texture 生命周期
 和 command encoding 仍属于后续阶段。
+
+`platform/macos/yu-render-macos` 是共享 render boundary 之外的第一层真实 backend：Rust 侧拥有
+`MetalDevice`、未附着窗口的 `CAMetalLayer`、surface generation 和 `MetalTexture`，Objective-C
+bridge 只负责 Apple framework 调用。它可以把 `AtlasPageUpload` 上传成 `R8Unorm` texture，
+但当前不创建窗口、不获取 drawable、不编码 command buffer、不 present；无 Metal device 的会话
+默认跳过硬件测试，需显式运行 ignored test。

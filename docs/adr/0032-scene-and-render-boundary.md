@@ -34,8 +34,9 @@ GPU。若 layout 直接调用 Metal/wgpu，窗口线程、device loss、texture 
 - `RenderUploader` 只定义未来 backend 所需的 alpha-page upload 操作，返回的 texture handle
   由 backend 自己拥有。
 
-当前不引入 `wgpu`、Metal 或 Vello 依赖。真实 GPU backend 需要先确定 macOS surface/device
-生命周期和 device-loss 策略，再实现 `RenderUploader` 和实际 command encoding。
+共享层仍不引入 `wgpu` 或 Metal 依赖。macOS 的最小 native device/layer/alpha upload bridge
+由 `platform/macos/yu-render-macos` 通过 ADR 0034 单独实现；真实 drawable/device-loss 策略和
+command encoding 仍未进入共享 renderer。
 
 ## 结果
 

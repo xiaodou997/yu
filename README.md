@@ -50,6 +50,7 @@ crates/yu-font          font fallback、GlyphRun、metrics/rasterization 契约�
 crates/yu-scene         revision-bound retained primitives、viewport 与 damage tracking
 crates/yu-render        backend-neutral render plan 与 atlas page upload boundary
 platform/macos/yu-font-macos  macOS-only CoreText 字体目录、fallback、shaping 与 glyph rasterization 适配
+platform/macos/yu-render-macos macOS-only Metal device、CAMetalLayer 与 alpha atlas upload 适配
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的第一阶段参考 workload
 experiments/            可丢弃的平台风险实验
@@ -74,6 +75,7 @@ cd yu
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test -p yu-render-macos -- --ignored  # 需要有 Metal device 的 macOS session
 cargo run -p yu-inspect -- README.md
 cargo run --release -p yu-bench -- --size-mib 1 --iterations 20 --random-edits 2000 --retained-snapshots 8
 experiments/macos-text-input/build-rust-ffi.sh
@@ -94,6 +96,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [核心不变量](docs/specs/invariants.md)
 - [坐标与位置](docs/specs/coordinates.md)
 - [Architecture Decision Records](docs/adr/)
+- [macOS Metal surface boundary](docs/adr/0034-macos-metal-surface-boundary.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

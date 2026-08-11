@@ -1,0 +1,21 @@
+[package]
+name = "yu-render-macos"
+description = "macOS Metal device, surface and atlas upload boundary for Yu Editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+yu-core = { path = "../../../crates/yu-core" }
+yu-font = { path = "../../../crates/yu-font" }
+yu-render = { path = "../../../crates/yu-render" }
+
+[dev-dependencies]
+yu-scene = { path = "../../../crates/yu-scene" }
+
+[lints]
+workspace = true

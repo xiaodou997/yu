@@ -151,6 +151,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-render-macos"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
+ "yu-font",
+ "yu-render",
+ "yu-scene",
+]
+
+[[package]]
 name = "yu-scene"
 version = "0.1.0"
 dependencies = [
