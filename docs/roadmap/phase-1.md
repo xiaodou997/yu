@@ -45,6 +45,8 @@
 - [x] FFI selection mutation/query 保留 upstream/downstream CaretAffinity
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
+- [x] inline link/image destination ranges、soft/hard line-break tokens
+- [x] delimiter flanking 校验与 intraword underscore 拒绝规则
 - [x] `yu-editor` revision-bound `ProjectionCache` 的命中、映射与失效规则
 - [x] `yu-editor` revision-bound `LayoutCache` 的 config key、映射与 block 结构失效规则
 - [x] `EditorDocument` 持有增量 `MarkdownDocument` 并提供 block-scoped projection
@@ -149,6 +151,9 @@
 29. block CST v1 的 block range 必须覆盖源码且不重叠；blockquote/list item 的 marker、depth 和
     lazy continuation 必须在 full parse 与 incremental parse 中一致，attached marker 不能误判为
     list item。
+30. inline CST 必须保留 punctuation、link/image label/destination 和 soft/hard line-break source
+    ranges；flanking 失败的 delimiter、未闭合 link 和 escaped punctuation 不得生成错误 semantic
+    span，full/incremental projection 输入必须保持同一源码覆盖。
 
 ## 非目标
 

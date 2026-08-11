@@ -650,6 +650,7 @@ fn style_for(
                     InlineSpanKind::CodeSpan => 0_u8,
                     InlineSpanKind::Strong => 1,
                     InlineSpanKind::Emphasis => 2,
+                    InlineSpanKind::Link | InlineSpanKind::Image => 3,
                 },
             )
         })
@@ -657,6 +658,7 @@ fn style_for(
             InlineSpanKind::Emphasis => VisualRunStyle::Emphasis,
             InlineSpanKind::Strong => VisualRunStyle::Strong,
             InlineSpanKind::CodeSpan => VisualRunStyle::Code,
+            InlineSpanKind::Link | InlineSpanKind::Image => default_style,
         })
 }
 
@@ -1048,6 +1050,24 @@ mod tests {
         assert_eq!(
             projection.visual_len().get(),
             u64::try_from(r"\*literal * unmatched ok".len()).expect("test length should fit")
+        );
+    }
+
+    #[test]
+    fn projection_hides_link_syntax_but_keeps_label_visible() {
+        let projection = projection("[Yu](https://example.com)");
+        let hidden = projection
+            .runs()
+            .iter()
+            .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+            .count();
+        assert_eq!(hidden, 2);
+        assert_eq!(projection.visual_len().get(), 2);
+        assert_eq!(
+            projection
+                .visual_to_source(VisualOffset::new(0), ProjectionBias::After)
+                .expect("label start should map after hidden syntax"),
+            ByteOffset::new(1)
         );
     }
 

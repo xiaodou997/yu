@@ -23,6 +23,9 @@
 2. `incremental_parse(edit(old))` 必须与 `full_parse(new)` 等价。
 3. parser 不得复制普通正文；节点通过源码范围引用 Snapshot。
 4. malformed Markdown 必须保留为可编辑源码，不能导致文档内容丢失。
+5. inline parser 产生的 Link/Image destination、soft/hard LineBreak 和 delimiter span 必须只引用
+   当前 Snapshot 的合法 source range；flanking 失败、未闭合结构和 escaped punctuation 必须保持
+   可见/可编辑，不得凭空制造 semantic node。
 
 ## Async work
 

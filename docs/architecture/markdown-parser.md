@@ -107,3 +107,23 @@ document revision == snapshot revision
 当前 block state 覆盖 normal/fenced EOF 状态，container marker 已参与 block 边界和收敛比较；
 完整 CommonMark 容器栈、inline 增量状态和稳定 syntax node identity 仍待后续阶段定义。每种新
 状态都必须继续通过随机 differential test 和围栏/列表类病理 edit。
+
+## Inline Parse
+
+block-local inline parsing 继续以 `TextSnapshot + TextRange` 为输入，不生成 HTML 或可编辑文本
+副本。lossless `InlineDocument` 现在保留：
+
+```text
+Text | Escaped | Delimiter
+Punctuation(! [] ())
+LineBreak { hard }
+```
+
+parser-owned `InlineSpan` 在 delimiter flanking 校验后产生 `Emphasis`、`Strong`、`CodeSpan`、
+`Link` 和 `Image`。链接/图片 span 的 `opening`、`content`、`closing` 和 `destination` 都是源码
+范围；projection 可以隐藏 `[]()`/`![]()` 语法而保留 label/alt 文本。未闭合链接、未匹配
+delimiter 和转义 punctuation 保持为普通可编辑源码。
+
+硬换行的 `LineBreak` range 包含两个尾随空格或反斜杠与 CRLF/LF，软换行只包含 line ending。
+这些节点目前由 layout/projection 作为下一阶段的 line-break 输入；parser 已先固定 source range
+和 full/incremental 可重复性。
