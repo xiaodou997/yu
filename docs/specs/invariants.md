@@ -109,6 +109,10 @@
     触发 wrap 的 glyph 不能扩展上一行。CoreText shaped-line diagnostic FFI 返回的 UTF-16
     range/width 必须是 owned 值，count/fill 容量不足必须返回明确 status，且诊断查询不得
     修改 canonical source、selection、history 或 Revision。
+25. projection-aware shaped diagnostic 返回的 projected UTF-8 必须由 Rust parser/projection
+    唯一生成；每条 line 同时携带合法且有序的 source/visual UTF-16 range，hidden syntax 可以
+    让 visual range 变短但不能改写 source。Swift 临时 TextKit mirror 只能消费返回文本，
+    zero-width trailing caret line 必须保持零宽并从 source-consuming line comparison 中排除。
 
 ## Accessibility
 

@@ -128,6 +128,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Viewport metrics FFI contract](docs/adr/0056-viewport-metrics-ffi-contract.md)
 - [CoreText system UI viewport metrics](docs/adr/0057-coretext-system-ui-viewport-metrics.md)
 - [macOS CoreText shaped line comparison](docs/adr/0058-macos-coretext-shaped-line-comparison.md)
+- [Projection-aware shaped layout](docs/adr/0059-projection-aware-shaped-layout.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

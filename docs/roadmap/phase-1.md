@@ -78,6 +78,7 @@
 - [x] macOS-only CoreText family catalog 与 fallback resolver（只返回安全字体元数据）
 - [x] macOS CoreText CTLine/CTRun shaping、UTF-16→UTF-8 cluster mapping 与 `yu-layout` smoke test
 - [x] macOS CoreText shaped-line FFI probe 与 TextKit UTF-16 line-range comparison
+- [x] projection-aware shaped-line FFI、projected UTF-8 mirror 与 source/visual UTF-16 comparison
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -232,6 +233,11 @@
     不得推进 source/selection/history；`LayoutConfig::default_advance` 必须进入 metrics layout
     cache key。FFI 与 macOS attached self-check 必须证明配置确实影响 wrapping/scroll target，
     但 fallback advance 不能冒充最终 shaped typography。
+48. projection-aware shaped diagnostic 必须由 Rust 返回 projected UTF-8 与 source/visual UTF-16
+    line ranges，Swift 只能用返回文本建立临时 TextKit mirror，不得复制 Markdown parser；
+    hidden syntax 必须减少 visual range 而不改变 canonical source range。zero-width caret line
+    可由 editor layout 保留，但不得被误报为 TextKit source-consuming line。当前 probe 使用
+    宽容器/显式换行隔离 projection mapping，不能替代自然语言 word-break 等价性测试。
 
 ## 非目标
 

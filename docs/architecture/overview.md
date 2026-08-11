@@ -260,6 +260,13 @@ consuming line fragments。该 probe 同时约束 `yu-layout` 的 source range �
 只覆盖 plain source，Markdown hidden syntax、复杂 fallback 和最终 shaped viewport 仍需后续
 projection/layout 契约。
 
+projection-aware probe 在此之上调用 `Projection::inline`，通过同一个 FFI count/fill 返回
+projected UTF-8 和 source/visual UTF-16 line ranges。Swift 只把 projected 文本装入临时
+TextKit storage，再比较 visual ranges；因此 `**strong**`、link destination 等 hidden
+syntax 的宽度由 Rust projection 决定，平台层不会复制 Markdown parser。当前 self-check
+用宽容器和显式换行隔离 source/visual 映射；shared grapheme wrapping 与 TextKit 自然语言
+word-break 的差异仍是后续独立议题。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

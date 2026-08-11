@@ -117,6 +117,14 @@ typedef struct YuCoreTextShapedLine {
     float width;
 } YuCoreTextShapedLine;
 
+typedef struct YuCoreTextProjectedLine {
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t visual_start_utf16;
+    uint64_t visual_end_utf16;
+    float width;
+} YuCoreTextProjectedLine;
+
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,
                                    YuCompositionSession **output);
 void yu_composition_session_destroy(YuCompositionSession *session);
@@ -183,6 +191,10 @@ int32_t yu_macos_core_text_system_ui_viewport_metrics(
 int32_t yu_macos_core_text_shaped_lines(
     float size, float max_width, const uint8_t *source, size_t source_length,
     YuCoreTextShapedLine *output, size_t capacity, size_t *written);
+int32_t yu_macos_core_text_projected_layout(
+    float size, float max_width, const uint8_t *source, size_t source_length,
+    YuCoreTextProjectedLine *lines, size_t line_capacity, size_t *line_written,
+    uint8_t *visual_output, size_t visual_capacity, size_t *visual_written);
 int32_t yu_composition_session_caret_scroll_request(YuCompositionSession *session,
                                                     uint64_t expected_revision,
                                                     float scroll_y,
