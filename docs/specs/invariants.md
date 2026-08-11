@@ -106,6 +106,9 @@
    必须有限。合法 glyph advance 决定 wrapping，但不得改写 source buffer。
 9. `ViewportLayout` 的 measured height 必须绑定当前 `LayoutBackend`；切换 metrics/shaped
    backend 必须先将旧 measured entry 恢复为 estimate，不能用旧 backend 的高度定位 viewport。
+10. shaped layout 的 `GlyphPlacement` 必须保留 face/glyph identity、source/visual cluster range
+    和 painter-order 的 x/baseline 坐标；metrics-only layout 必须返回空 placement 列表，不能
+    从 cluster metrics 推导伪造 glyph identity。
 
 ## Font and shaping
 
@@ -141,3 +144,6 @@
 5. atlas page upload 必须是 owned alpha bytes，page fingerprint 未变化时不得重复产生 upload；
    `RenderUploader` 返回的 texture/device handle 只能由 backend 持有，不能写回 scene、layout 或
    editor canonical state。
+6. `SceneBuilder::append_layout` 必须先校验 layout/scene Revision、font size 和所有 atlas
+   entry，再追加 glyph primitive；任一失败不得发布部分 layout scene。glyph primitive 的 origin
+   必须直接来自 placement 的 layout 坐标，不能在 renderer 中重新推导 source position。

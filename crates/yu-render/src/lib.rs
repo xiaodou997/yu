@@ -267,11 +267,80 @@ fn hash_page(page: u32, width: u32, height: u32, pixels: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use yu_core::{ByteOffset, TextRange};
     use yu_font::{
-        AtlasEntry, FontFaceId, GlyphAtlasConfig, GlyphBitmap, GlyphId, GlyphMetrics,
-        GlyphRasterKey, RasterizedGlyph,
+        AtlasEntry, FontDatabase, FontFaceId, FontFaceSpec, FontRequest, FontShaper,
+        GlyphAtlasConfig, GlyphBitmap, GlyphId, GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
     };
+    use yu_layout::{LayoutConfig, LayoutSnapshot};
+    use yu_projection::Projection;
     use yu_scene::{GlyphPrimitive, SceneBuilder, SceneError};
+    use yu_text::TextBuffer;
+
+    #[derive(Debug)]
+    struct FakeUploadError;
+
+    impl fmt::Display for FakeUploadError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("fake upload failed")
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeUploader {
+        pages: Vec<(u32, u64)>,
+    }
+
+    impl RenderUploader for FakeUploader {
+        type Texture = u32;
+        type Error = FakeUploadError;
+
+        fn upload_alpha_page(
+            &mut self,
+            page: &AtlasPageUpload,
+        ) -> Result<Self::Texture, Self::Error> {
+            self.pages.push((page.page(), page.fingerprint()));
+            Ok(page.page())
+        }
+    }
+
+    fn shaped_layout(font_size: f32) -> LayoutSnapshot {
+        let buffer = TextBuffer::new("ab");
+        let snapshot = buffer.snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).expect("range");
+        let projection = Projection::inline(&snapshot, range).expect("projection");
+        let mut database = FontDatabase::new();
+        database
+            .register(FontFaceSpec::new("Test", 0.5))
+            .expect("face");
+        let shaper = FontShaper::new(
+            Arc::new(database),
+            FontRequest::new("Test", font_size).expect("font request"),
+        )
+        .expect("shaper");
+        LayoutSnapshot::from_projection_with_shaper(
+            &projection,
+            LayoutConfig::new(200.0, 20.0),
+            &shaper,
+        )
+        .expect("layout")
+    }
+
+    fn atlas_for_layout(layout: &LayoutSnapshot, font_size: f32) -> GlyphAtlas {
+        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("config"));
+        for (index, placement) in layout.glyphs().iter().enumerate() {
+            let key =
+                GlyphRasterKey::new(placement.face(), placement.glyph(), font_size).expect("key");
+            let value = u8::try_from(index + 1).expect("test glyph value");
+            let bitmap = GlyphBitmap::new(2, 3, 2, vec![value; 6]).expect("bitmap");
+            let metrics = GlyphMetrics::new(0.0, 10.0, 7.0).expect("metrics");
+            atlas
+                .insert(RasterizedGlyph::new(key, metrics, bitmap))
+                .expect("atlas entry");
+        }
+        atlas
+    }
 
     fn make_glyph(atlas: &mut GlyphAtlas, glyph: u32, width: u32, height: u32) -> AtlasEntry {
         let key = GlyphRasterKey::new(FontFaceId::from_raw(2), GlyphId::from_raw(glyph), 14.0)
@@ -408,5 +477,74 @@ mod tests {
             .expect_err("invalid budget"),
             SceneError::InvalidDamageBudget
         );
+    }
+
+    #[test]
+    fn layout_scene_render_plan_and_fake_uploader_are_revision_bound() {
+        let font_size = 14.0;
+        let layout = shaped_layout(font_size);
+        assert_eq!(layout.glyphs().len(), 2);
+        let atlas = atlas_for_layout(&layout, font_size);
+        let viewport = Rect::new(0.0, 0.0, 200.0, 80.0).expect("viewport");
+        let mut scene_builder = SceneBuilder::new(layout.revision(), viewport).expect("scene");
+        assert_eq!(
+            scene_builder
+                .append_layout(&layout, &atlas, font_size, Rgba8::black())
+                .expect("append layout"),
+            2
+        );
+        let scene = scene_builder.finish();
+        assert_eq!(scene.primitives().len(), 2);
+
+        let mut plans = RenderPlanBuilder::new();
+        let first = plans.build(&scene, &atlas).expect("first plan");
+        assert_eq!(first.revision(), layout.revision());
+        assert_eq!(first.uploads().len(), 1);
+        assert_eq!(first.commands().len(), 2);
+        let mut uploader = FakeUploader::default();
+        for upload in first.uploads() {
+            uploader
+                .upload_alpha_page(upload)
+                .expect("fake page upload");
+        }
+        assert_eq!(uploader.pages.len(), 1);
+        assert_eq!(uploader.pages[0].0, 0);
+
+        let second = plans.build(&scene, &atlas).expect("second plan");
+        assert!(second.uploads().is_empty());
+        assert_eq!(second.commands().len(), 2);
+        match first.commands()[0] {
+            RenderCommand::Glyph { origin, .. } => {
+                assert_eq!(origin.x(), layout.glyphs()[0].x());
+                assert_eq!(origin.y(), layout.glyphs()[0].y());
+            }
+            RenderCommand::FillRect { .. } => panic!("expected glyph command"),
+        }
+    }
+
+    #[test]
+    fn missing_layout_atlas_is_atomic_and_revision_mismatch_is_rejected() {
+        let font_size = 14.0;
+        let layout = shaped_layout(font_size);
+        let viewport = Rect::new(0.0, 0.0, 200.0, 80.0).expect("viewport");
+        let empty_atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("config"));
+        let mut missing_builder =
+            SceneBuilder::new(layout.revision(), viewport).expect("scene builder");
+        let error = missing_builder
+            .append_layout(&layout, &empty_atlas, font_size, Rgba8::black())
+            .expect_err("missing atlas entry");
+        assert!(matches!(error, SceneError::MissingGlyphAtlas(_)));
+        assert!(missing_builder.finish().primitives().is_empty());
+
+        let mut stale_builder = SceneBuilder::new(
+            Revision::new(layout.revision().get().saturating_add(1)),
+            viewport,
+        )
+        .expect("stale scene builder");
+        let atlas = atlas_for_layout(&layout, font_size);
+        assert!(matches!(
+            stale_builder.append_layout(&layout, &atlas, font_size, Rgba8::black()),
+            Err(SceneError::RevisionMismatch { .. })
+        ));
     }
 }

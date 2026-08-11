@@ -169,7 +169,15 @@ wgpu/Metal texture，也不处理彩色 glyph、subpixel LCD 或完整 BiDi。
 retained scene。它只保存 primitive、viewport、颜色和 damage rectangles，不保存 source text、
 bitmap 或 GPU handle。`DamageSet` 会合并相交/相邻区域，并在超出预算时收敛到总 bounds。
 
+shaped `yu-layout::LayoutSnapshot` 保留 painter-order 的 `GlyphPlacement`：face/glyph identity、
+source/visual cluster range、line index、x 和 baseline y。metrics-only layout 的 glyph list 为空，
+因此不会伪造 atlas identity。`SceneBuilder::append_layout` 在追加前检查 layout/scene
+Revision、font size 和 CPU `GlyphAtlas` entry，并在全部 placement 解析成功后按顺序生成 glyph
+primitive；失败不会留下部分 scene。
+
 `yu-render` 将 scene 与对应的 CPU `GlyphAtlas` 转换为 backend-neutral `RenderPlan`：命令保持
 painter order，atlas page 通过尺寸/bytes fingerprint 去重 `AtlasPageUpload`，stale/missing
 entry 会被拒绝。当前没有 `wgpu`/Metal device 或窗口依赖；`RenderUploader` 只定义未来 backend
-上传 alpha page 的最小边界，实际 texture 生命周期和 command encoding 仍属于后续阶段。
+上传 alpha page 的最小边界。`yu-render` 已用 fake uploader 覆盖 `FontShaper → LayoutSnapshot →
+Scene → RenderPlan` 端到端 revision、atlas upload 去重和 command origin；实际 texture 生命周期
+和 command encoding 仍属于后续阶段。

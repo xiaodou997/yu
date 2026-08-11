@@ -13,5 +13,10 @@ yu-core = { path = "../yu-core" }
 yu-font = { path = "../yu-font" }
 yu-scene = { path = "../yu-scene" }
 
+[dev-dependencies]
+yu-layout = { path = "../yu-layout" }
+yu-projection = { path = "../yu-projection" }
+yu-text = { path = "../yu-text" }
+
 [lints]
 workspace = true

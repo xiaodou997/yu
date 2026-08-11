@@ -12,6 +12,7 @@ use std::fmt;
 
 use yu_core::Revision;
 use yu_font::{AtlasEntry, GlyphRasterKey};
+use yu_layout::LayoutSnapshot;
 
 /// A finite point in scene coordinates. The coordinate system is chosen by
 /// the platform shell; Yu's current layout convention is x-right/y-down.
@@ -337,6 +338,9 @@ pub enum SceneError {
     InvalidGeometry(&'static str),
     InvalidDamageBudget,
     PrimitiveLimitExceeded,
+    RevisionMismatch { scene: Revision, layout: Revision },
+    InvalidFontSize(u32),
+    MissingGlyphAtlas(GlyphRasterKey),
 }
 
 impl fmt::Display for SceneError {
@@ -345,6 +349,22 @@ impl fmt::Display for SceneError {
             Self::InvalidGeometry(message) => formatter.write_str(message),
             Self::InvalidDamageBudget => formatter.write_str("damage budget must be positive"),
             Self::PrimitiveLimitExceeded => formatter.write_str("scene primitive limit exceeded"),
+            Self::RevisionMismatch { scene, layout } => write!(
+                formatter,
+                "scene revision {scene:?} does not match layout revision {layout:?}"
+            ),
+            Self::InvalidFontSize(size) => {
+                write!(
+                    formatter,
+                    "invalid scene font size {}",
+                    f32::from_bits(*size)
+                )
+            }
+            Self::MissingGlyphAtlas(key) => write!(
+                formatter,
+                "layout references missing atlas glyph {}",
+                key.glyph().get()
+            ),
         }
     }
 }
@@ -441,6 +461,48 @@ impl SceneBuilder {
 
     pub fn glyph(&mut self, glyph: GlyphPrimitive) -> Result<u32, SceneError> {
         self.push(Primitive::Glyph(glyph))
+    }
+
+    /// Appends all shaped glyphs from a layout using entries already present
+    /// in the CPU atlas. The operation is revision-bound and resolves every
+    /// atlas entry before mutating the scene, so a failed lookup cannot leave
+    /// a partially appended layout.
+    pub fn append_layout(
+        &mut self,
+        layout: &LayoutSnapshot,
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+    ) -> Result<usize, SceneError> {
+        if self.revision != layout.revision() {
+            return Err(SceneError::RevisionMismatch {
+                scene: self.revision,
+                layout: layout.revision(),
+            });
+        }
+        if !font_size.is_finite() || font_size <= 0.0 {
+            return Err(SceneError::InvalidFontSize(font_size.to_bits()));
+        }
+
+        let mut primitives = Vec::with_capacity(layout.glyphs().len());
+        for placement in layout.glyphs() {
+            let key = GlyphRasterKey::new(placement.face(), placement.glyph(), font_size)
+                .map_err(|_| SceneError::InvalidFontSize(font_size.to_bits()))?;
+            let entry = atlas.entry(key).ok_or(SceneError::MissingGlyphAtlas(key))?;
+            primitives.push(GlyphPrimitive::new(
+                entry,
+                Point::new(placement.x(), placement.y()),
+                color,
+            ));
+        }
+        if primitives.len() > self.max_primitives.saturating_sub(self.primitives.len()) {
+            return Err(SceneError::PrimitiveLimitExceeded);
+        }
+        let count = primitives.len();
+        for glyph in primitives {
+            self.glyph(glyph)?;
+        }
+        Ok(count)
     }
 
     #[must_use]

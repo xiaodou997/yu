@@ -60,6 +60,8 @@
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
+- [x] shaped `GlyphPlacement` 保留 source/visual cluster 与 baseline 坐标
+- [x] `LayoutSnapshot → SceneBuilder → RenderPlan` revision-bound vertical slice 与 fake uploader
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -117,6 +119,9 @@
 22. `yu-scene` 必须绑定 source Revision 并只保存 owned geometry/color/atlas placement；`yu-render`
    必须复制 scene 的 Revision/viewport，校验 stale atlas entry，并按 page fingerprint 去重 owned
    alpha upload。此阶段不得创建 window、GPU device 或 texture handle。
+23. shaped layout 的 glyph placement、scene append 和 render plan 必须存在无 GUI 的端到端测试：
+   placement 的 origin 与 render command 一致，同页 atlas 只 upload 一次；missing atlas、stale
+   revision 或预算失败不得留下部分 scene。
 
 ## 非目标
 
