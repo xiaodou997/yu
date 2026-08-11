@@ -88,6 +88,12 @@ Revision 对齐的 `MarkdownDocument`、revision-bound `EditorSelection`、trans
 和 `ProjectionCache`。平台 view 可以保留 AppKit 的渲染/输入投影，但永久命令必须回到该边界
 并通过 Transaction 提交。
 
+`EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
+按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
+Revision。光标移动、显式 selection、composition 边界和 reset 会断开 group；新的永久 edit 会清空
+redo。回放绕过 history recording，但仍完整经过 Markdown 增量解析、selection 映射和 projection/
+layout/viewport cache 失效。
+
 左右移动和删除通过 `yu-text::TextSnapshot` 的 chunk cursor 与 Unicode grapheme cursor 查询
 相邻边界；Accessibility 使用 `AccessibilityTextSnapshot::from_document` 一次性绑定 source、
 selection 和 Revision，不从平台 view 复制一份 canonical selection。

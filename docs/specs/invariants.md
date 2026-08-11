@@ -19,6 +19,9 @@
 6. `InsertNewline`、空 list item 的 `DeleteBackward`、`IndentList` 和 `OutdentList` 必须通过普通
    Transaction 修改 source；task continuation 必须重置为 `[ ]`，ordered marker 只能在安全范围内
    递增，不能创建富文本第二真源。
+7. `EditorHistory` 只能保存有界 inverse Transaction；Undo/Redo 回放不得再次写入 history，
+   entry 的 source edits 必须在回放时重绑定到当前 Revision。新的永久 edit 必须清空 redo，光标/
+   selection/composition 边界必须断开当前 group。
 
 ## Parsing
 

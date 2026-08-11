@@ -17,6 +17,7 @@
 - [x] blockquote/list item container-aware block CST v1（源码范围、深度和 marker metadata）
 - [x] task-list marker 的 source-backed block state、projection 隐藏与 toggle transaction
 - [x] list Enter continuation、空项退出、Indent/Outdent source command
+- [x] bounded EditorHistory、inverse Transaction、Undo/Redo group replay
 - [x] `yu-inspect` CLI
 - [x] 可重复运行的 parse/edit 参考 benchmark harness
 - [x] 持久化 Piece Tree 与 Persistent Rope 初代候选及共同 workload benchmark
@@ -175,6 +176,9 @@
     ordered marker 在安全范围内递增，空项 Enter/Backspace 删除 prefix 并保留 line ending，
     Indent/Outdent 最多改动两个 ASCII 空格，所有结果都通过普通 Transaction 与 selection mapping
     验证。
+36. EditorHistory 必须只保留有界 inverse Transaction；连续输入/删除/列表操作按 group 聚合，
+    Undo 逆序、Redo 正序回放且不重复记录 history；移动 selection、composition 边界和新 edit
+    必须正确断组或清空 redo。
 
 ## 非目标
 
