@@ -448,6 +448,67 @@ private final class RustCompositionBridge {
         return lines
     }
 
+    func coreTextSystemUiProjectedLayout(
+        size: CGFloat,
+        maxWidth: CGFloat,
+        source: String
+    ) -> (lines: [YuCoreTextProjectedLine], projected: String) {
+        let sourceBytes = Array(source.utf8)
+        var requiredLines = 0
+        var requiredVisualBytes = 0
+        let countStatus = sourceBytes.withUnsafeBufferPointer { sourceBuffer in
+            yu_macos_core_text_projected_layout(
+                Float(size),
+                Float(maxWidth),
+                sourceBuffer.baseAddress,
+                sourceBuffer.count,
+                nil,
+                0,
+                &requiredLines,
+                nil,
+                0,
+                &requiredVisualBytes
+            )
+        }
+        precondition(countStatus == 0, "CoreText projected layout count failed: \(countStatus)")
+
+        var lines = [YuCoreTextProjectedLine](
+            repeating: YuCoreTextProjectedLine(),
+            count: requiredLines
+        )
+        var visualBytes = [UInt8](repeating: 0, count: requiredVisualBytes)
+        var writtenLines = 0
+        var writtenVisualBytes = 0
+        let fillStatus = sourceBytes.withUnsafeBufferPointer { sourceBuffer in
+            lines.withUnsafeMutableBufferPointer { lineBuffer in
+                visualBytes.withUnsafeMutableBufferPointer { visualBuffer in
+                    yu_macos_core_text_projected_layout(
+                        Float(size),
+                        Float(maxWidth),
+                        sourceBuffer.baseAddress,
+                        sourceBuffer.count,
+                        lineBuffer.baseAddress,
+                        lineBuffer.count,
+                        &writtenLines,
+                        visualBuffer.baseAddress,
+                        visualBuffer.count,
+                        &writtenVisualBytes
+                    )
+                }
+            }
+        }
+        precondition(fillStatus == 0, "CoreText projected layout fill failed: \(fillStatus)")
+        precondition(writtenLines == requiredLines, "Projected line count changed during fill")
+        precondition(
+            writtenVisualBytes == requiredVisualBytes,
+            "Projected visual byte count changed during fill"
+        )
+        return (
+            lines,
+            String(decoding: visualBytes, as: UTF8.self)
+        )
+    }
+
     func caretScrollRequest(
         scrollY: CGFloat,
         viewportHeight: CGFloat,
@@ -1392,6 +1453,31 @@ final class TextInputView: NSView, NSTextInputClient {
         )
     }
 
+    private func textKitLineRanges(for string: String, width: CGFloat) -> [NSRange] {
+        let storage = NSTextStorage()
+        storage.append(NSAttributedString(string: string, attributes: defaultAttributes))
+        let manager = NSLayoutManager()
+        let container = NSTextContainer(
+            size: NSSize(width: width, height: .greatestFiniteMagnitude)
+        )
+        container.lineFragmentPadding = 0
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+        let glyphRange = manager.glyphRange(for: container)
+        var ranges = [NSRange]()
+        manager.enumerateLineFragments(forGlyphRange: glyphRange) {
+            _, _, _, lineGlyphRange, _ in
+            ranges.append(
+                manager.characterRange(
+                    forGlyphRange: lineGlyphRange,
+                    actualGlyphRange: nil
+                )
+            )
+        }
+        return ranges
+    }
+
     func runShapedLayoutComparisonSelfCheck() {
         updateContainerSize()
         layoutManager.ensureLayout(for: textContainer)
@@ -1459,6 +1545,90 @@ final class TextInputView: NSView, NSTextInputClient {
             "Shaped layout self-check sourceLines=\(rustSourceLines.count) "
                 + "trailingCaretLines=\(rustLines.count - rustSourceLines.count) "
                 + "ranges=\(rustRanges)"
+        )
+    }
+
+    func runProjectionShapedLayoutSelfCheck() {
+        let source = "This is **Yu** and [Rust](https://example.com) with 中文🙂.\nSecond **line**.\n"
+        let width: CGFloat = 600
+        let font = defaultAttributes[.font] as? NSFont ?? NSFont.systemFont(ofSize: 22)
+        let result = rustComposition.coreTextSystemUiProjectedLayout(
+            size: font.pointSize,
+            maxWidth: width,
+            source: source
+        )
+        let projected = result.projected
+        precondition(
+            projected == "This is Yu and Rust with 中文🙂.\nSecond line.\n",
+            "Markdown projection must hide syntax without rewriting visible source"
+        )
+        precondition(!projected.contains("**") && !projected.contains("https://"))
+
+        let sourceLength = source.utf16.count
+        let visualLength = projected.utf16.count
+        precondition(
+            result.lines.allSatisfy {
+                $0.source_start_utf16 <= $0.source_end_utf16
+                    && Int($0.source_end_utf16) <= sourceLength
+                    && $0.visual_start_utf16 <= $0.visual_end_utf16
+                    && Int($0.visual_end_utf16) <= visualLength
+                    && $0.width.isFinite
+                    && $0.width >= 0
+            },
+            "Projected line ranges must stay inside source and visual UTF-16 bounds"
+        )
+        precondition(
+            result.lines.filter {
+                $0.visual_start_utf16 == $0.visual_end_utf16
+            }.allSatisfy { $0.width == 0 },
+            "Projected trailing caret lines must remain zero width"
+        )
+        precondition(zip(result.lines, result.lines.dropFirst()).allSatisfy { previous, next in
+            previous.source_end_utf16 <= next.source_start_utf16
+                && previous.visual_end_utf16 <= next.visual_start_utf16
+        })
+        precondition(
+            result.lines.contains {
+                $0.source_end_utf16 - $0.source_start_utf16
+                    > $0.visual_end_utf16 - $0.visual_start_utf16
+            },
+            "At least one line must demonstrate hidden Markdown syntax"
+        )
+
+        let sourceLines = result.lines.filter {
+            $0.visual_start_utf16 != $0.visual_end_utf16
+        }
+        let nativeRanges = textKitLineRanges(for: projected, width: width)
+        precondition(
+            sourceLines.count == nativeRanges.count,
+            "Projected Rust/TextKit line count mismatch: rust=\(sourceLines.count) native=\(nativeRanges.count)"
+        )
+        let rustRangeDescription = sourceLines
+            .map {
+                "\($0.visual_start_utf16)..\($0.visual_end_utf16)(w=\($0.width))"
+            }
+            .joined(separator: ",")
+        let nativeRangeDescription = nativeRanges
+            .map { "\($0.location)..\(NSMaxRange($0))" }
+            .joined(separator: ",")
+        for (index, line) in sourceLines.enumerated() {
+            let rustRange = NSRange(
+                location: Int(line.visual_start_utf16),
+                length: Int(line.visual_end_utf16 - line.visual_start_utf16)
+            )
+            precondition(
+                rustRange == nativeRanges[index],
+                "Projected Rust/TextKit range mismatch at \(index): rust=\(rustRange) native=\(nativeRanges[index]) "
+                    + "rustRanges=\(rustRangeDescription) nativeRanges=\(nativeRangeDescription) "
+                    + "projected=\(projected.debugDescription)"
+            )
+        }
+        let ranges = sourceLines
+            .map { "\($0.source_start_utf16)..\($0.source_end_utf16)/\($0.visual_start_utf16)..\($0.visual_end_utf16)" }
+            .joined(separator: ",")
+        print(
+            "Projection shaped self-check sourceLines=\(sourceLines.count) "
+                + "trailingCaretLines=\(result.lines.count - sourceLines.count) ranges=\(ranges)"
         )
     }
 
@@ -2061,6 +2231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.attachViewportAdapter(YuNativeViewportAdapter(scrollView: scrollView))
         inputView.runLayoutRoundTripSelfCheck()
         inputView.runShapedLayoutComparisonSelfCheck()
+        inputView.runProjectionShapedLayoutSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
         inputView.runNativeCommandRoutingSelfCheck()
         inputView.runViewportScrollSelfCheck()

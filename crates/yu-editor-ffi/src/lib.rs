@@ -2,11 +2,12 @@
 
 use std::ptr;
 
-use yu_core::{TextRange, Utf16Offset, Utf16Range};
+use yu_core::{ByteOffset, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     CaretAffinity, CaretScrollRequest, CommandResult, EditorCommand, EditorDocument,
     EditorDocumentError, EditorKey, EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult,
-    LayoutConfig, SelectionError, SourceSync, ViewportConfig, ViewportRect,
+    LayoutConfig, LayoutSnapshot, Projection, SelectionError, SourceSync, ViewportConfig,
+    ViewportRect, VisualRunKind,
 };
 use yu_text::{EditError, TextSnapshot};
 
@@ -118,6 +119,19 @@ pub struct YuCoreTextViewportMetrics {
 pub struct YuCoreTextShapedLine {
     pub source_start_utf16: u64,
     pub source_end_utf16: u64,
+    pub width: f32,
+}
+
+/// One source-backed line returned by the projection-aware macOS shaped-layout
+/// probe. Source and visual ranges use UTF-16 units for direct TextKit
+/// comparison; the visual text itself is returned by the same count/fill call.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuCoreTextProjectedLine {
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub visual_start_utf16: u64,
+    pub visual_end_utf16: u64,
     pub width: f32,
 }
 
@@ -1033,6 +1047,112 @@ pub unsafe extern "C" fn yu_macos_core_text_shaped_lines(
     }
 }
 
+/// Builds a diagnostic shaped layout after applying the shared Markdown
+/// projection. The call returns both source-backed line ranges and the
+/// projected UTF-8 text that a native TextKit mirror can lay out directly.
+/// This does not mutate an editor session or canonical source state.
+///
+/// `line_written` and `visual_written` are both required. A zero-capacity call
+/// returns the required line count and projected UTF-8 byte count. If either
+/// caller-owned capacity is too small, the function returns
+/// [`YU_FFI_BUFFER_TOO_SMALL`] without partially writing either output.
+///
+/// # Safety
+/// `source` must point to readable UTF-8 bytes for its length (unless the
+/// length is zero). `lines` must point to `line_capacity` writable line values
+/// when that capacity is non-zero; `visual_output` must point to
+/// `visual_capacity` writable bytes when that capacity is non-zero. Both
+/// written pointers must point to writable storage for one count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_macos_core_text_projected_layout(
+    size: f32,
+    max_width: f32,
+    source: *const u8,
+    source_length: usize,
+    lines: *mut YuCoreTextProjectedLine,
+    line_capacity: usize,
+    line_written: *mut usize,
+    visual_output: *mut u8,
+    visual_capacity: usize,
+    visual_written: *mut usize,
+) -> i32 {
+    if line_written.is_null() || visual_written.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    if line_capacity > 0 && lines.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    if visual_capacity > 0 && visual_output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: both written pointers were checked for null and belong to the
+    // caller.
+    unsafe {
+        *line_written = 0;
+        *visual_written = 0;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let source = match read_utf8(source, source_length) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        let (projected_lines, projected) =
+            match query_core_text_projected_layout(source, size, max_width) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+        let projected_bytes = projected.as_bytes();
+        // SAFETY: both written pointers were checked for null and belong to
+        // the caller.
+        unsafe {
+            *line_written = projected_lines.len();
+            *visual_written = projected_bytes.len();
+        }
+        if line_capacity == 0 && visual_capacity == 0 {
+            return YU_FFI_OK;
+        }
+        if projected_lines.len() > line_capacity || projected_bytes.len() > visual_capacity {
+            return YU_FFI_BUFFER_TOO_SMALL;
+        }
+        if !projected_lines.is_empty() {
+            // SAFETY: line capacity was checked against the number of values
+            // and the output pointer was checked when capacity was non-zero.
+            unsafe {
+                ptr::copy_nonoverlapping(projected_lines.as_ptr(), lines, projected_lines.len())
+            };
+        }
+        if !projected_bytes.is_empty() {
+            // SAFETY: visual capacity was checked against the byte length and
+            // the output pointer was checked when capacity was non-zero.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    projected_bytes.as_ptr(),
+                    visual_output,
+                    projected_bytes.len(),
+                )
+            };
+        }
+        YU_FFI_OK
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            size,
+            max_width,
+            source,
+            source_length,
+            lines,
+            line_capacity,
+            visual_output,
+            visual_capacity,
+        );
+        YU_FFI_CORE_TEXT_UNAVAILABLE
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn query_core_text_viewport_metrics(
     request: FontRequest,
@@ -1090,6 +1210,98 @@ fn query_core_text_shaped_lines(
         }
     }
     Ok(lines)
+}
+
+#[cfg(target_os = "macos")]
+fn query_core_text_projected_layout(
+    source: &str,
+    size: f32,
+    max_width: f32,
+) -> Result<(Vec<YuCoreTextProjectedLine>, String), i32> {
+    let request = FontRequest::new("System UI", size).map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    let shaper =
+        CoreTextShaper::from_system_ui(request).map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    let metrics = shaper
+        .viewport_metrics("M中🙂e\u{301}")
+        .map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    if !max_width.is_finite() || max_width <= 0.0 {
+        return Err(YU_FFI_LAYOUT_FAILED);
+    }
+    let document = EditorDocument::new(source.to_owned());
+    let snapshot = document.snapshot();
+    let source_range =
+        TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).ok_or(YU_FFI_LAYOUT_FAILED)?;
+    let projection =
+        Projection::inline(&snapshot, source_range).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+    let projected = projected_utf8(&projection)?;
+    let config = LayoutConfig::new(max_width, metrics.line_height())
+        .with_default_advance(metrics.default_advance());
+    let layout = LayoutSnapshot::from_projection_with_shaper(&projection, config, &shaper)
+        .map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+    let mut lines = Vec::with_capacity(layout.lines().len());
+    for line in layout.lines() {
+        let source_start = snapshot
+            .utf16_offset(line.source().start())
+            .map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+        let source_end = snapshot
+            .utf16_offset(line.source().end())
+            .map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+        let visual_start = utf16_offset_in_utf8(&projected, line.visual().start().get())?;
+        let visual_end = utf16_offset_in_utf8(&projected, line.visual().end().get())?;
+        lines.push(YuCoreTextProjectedLine {
+            source_start_utf16: source_start.get(),
+            source_end_utf16: source_end.get(),
+            visual_start_utf16: visual_start,
+            visual_end_utf16: visual_end,
+            width: line.width(),
+        });
+    }
+    Ok((lines, projected))
+}
+
+#[cfg(target_os = "macos")]
+fn projected_utf8(projection: &Projection) -> Result<String, i32> {
+    let mut bytes = Vec::new();
+    for run in projection.runs() {
+        if !matches!(
+            run.kind(),
+            VisualRunKind::Visible | VisualRunKind::LineBreak { .. }
+        ) {
+            continue;
+        }
+        let start = usize::try_from(run.source().start()).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+        let end = usize::try_from(run.source().end()).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+        let mut cursor = projection
+            .source()
+            .chunk_cursor(run.source().start())
+            .map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+        for chunk in &mut cursor {
+            let chunk_start = usize::try_from(chunk.start()).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+            let chunk_end = chunk_start
+                .checked_add(chunk.text().len())
+                .ok_or(YU_FFI_LAYOUT_FAILED)?;
+            if chunk_start >= end {
+                break;
+            }
+            let local_start = start.max(chunk_start).saturating_sub(chunk_start);
+            let local_end = end.min(chunk_end).saturating_sub(chunk_start);
+            if local_start < local_end {
+                bytes.extend_from_slice(&chunk.text().as_bytes()[local_start..local_end]);
+            }
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| YU_FFI_LAYOUT_FAILED)
+}
+
+#[cfg(target_os = "macos")]
+fn utf16_offset_in_utf8(source: &str, byte_offset: u64) -> Result<u64, i32> {
+    let byte_offset = usize::try_from(byte_offset).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+    let prefix = source
+        .as_bytes()
+        .get(..byte_offset)
+        .ok_or(YU_FFI_LAYOUT_FAILED)?;
+    let prefix = std::str::from_utf8(prefix).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+    u64::try_from(prefix.encode_utf16().count()).map_err(|_| YU_FFI_LAYOUT_FAILED)
 }
 
 /// Resolves the current focus caret and returns an absolute document-space
@@ -1436,6 +1648,100 @@ mod tests {
                 .last()
                 .is_some_and(|line| line.source_end_utf16 == source.encode_utf16().count() as u64)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_core_text_projected_layout_returns_visual_utf16_ranges() {
+        let source = "This is **Yu** and [Rust](https://example.com) with 中文🙂 words.\n";
+        let mut required_lines = 0_usize;
+        let mut required_visual_bytes = 0_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_projected_layout(
+                    22.0,
+                    240.0,
+                    source.as_bytes().as_ptr(),
+                    source.len(),
+                    ptr::null_mut(),
+                    0,
+                    &mut required_lines,
+                    ptr::null_mut(),
+                    0,
+                    &mut required_visual_bytes,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert!(required_lines > 0);
+        assert!(required_visual_bytes > 0);
+
+        let mut short_visual = vec![0_u8; required_visual_bytes - 1];
+        let mut short_lines = vec![YuCoreTextProjectedLine::default(); required_lines];
+        let mut short_line_written = 0_usize;
+        let mut short_visual_written = 0_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_projected_layout(
+                    22.0,
+                    240.0,
+                    source.as_bytes().as_ptr(),
+                    source.len(),
+                    short_lines.as_mut_ptr(),
+                    short_lines.len(),
+                    &mut short_line_written,
+                    short_visual.as_mut_ptr(),
+                    short_visual.len(),
+                    &mut short_visual_written,
+                )
+            },
+            YU_FFI_BUFFER_TOO_SMALL
+        );
+        assert_eq!(short_line_written, required_lines);
+        assert_eq!(short_visual_written, required_visual_bytes);
+
+        let mut lines = vec![YuCoreTextProjectedLine::default(); required_lines];
+        let mut visual = vec![0_u8; required_visual_bytes];
+        let mut written_lines = 0_usize;
+        let mut written_visual_bytes = 0_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_projected_layout(
+                    22.0,
+                    240.0,
+                    source.as_bytes().as_ptr(),
+                    source.len(),
+                    lines.as_mut_ptr(),
+                    lines.len(),
+                    &mut written_lines,
+                    visual.as_mut_ptr(),
+                    visual.len(),
+                    &mut written_visual_bytes,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(written_lines, required_lines);
+        assert_eq!(written_visual_bytes, required_visual_bytes);
+        let projected = String::from_utf8(visual).expect("projection must remain UTF-8");
+        assert_eq!(projected, "This is Yu and Rust with 中文🙂 words.\n");
+        let source_len = source.encode_utf16().count() as u64;
+        let visual_len = projected.encode_utf16().count() as u64;
+        assert!(lines.iter().all(|line| {
+            line.source_start_utf16 <= line.source_end_utf16
+                && line.source_end_utf16 <= source_len
+                && line.visual_start_utf16 <= line.visual_end_utf16
+                && line.visual_end_utf16 <= visual_len
+                && line.width.is_finite()
+        }));
+        assert!(lines.windows(2).all(|pair| {
+            pair[0].source_end_utf16 <= pair[1].source_start_utf16
+                && pair[0].visual_end_utf16 <= pair[1].visual_start_utf16
+        }));
+        assert!(lines.iter().any(|line| {
+            line.source_end_utf16 - line.source_start_utf16
+                > line.visual_end_utf16 - line.visual_start_utf16
+        }));
     }
 
     #[test]

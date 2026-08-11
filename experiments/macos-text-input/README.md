@@ -59,6 +59,11 @@ hit-test 路径。硬行末按 TextKit 语义规范化为 LF 后 offset + upstre
 source-consuming line fragment 数量。这是 plain-source 的诊断 probe，不改变 source/Revision，
 也不代表 Markdown hidden syntax 或最终 shaped viewport 已经接入。
 
+随后运行 `Projection shaped self-check`：Rust 返回 parser 生成的 projected UTF-8，以及每条
+line 的 source/visual UTF-16 range；Swift 用返回文本建立临时 TextKit mirror，验证 `**` 和
+link destination 不占 visual width，同时 source range 仍覆盖 canonical Markdown。该检查使用
+宽容器和显式换行，专门隔离 projection mapping，不宣称自然语言 word-break 已与 TextKit 等价。
+
 启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
 和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
 
