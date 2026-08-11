@@ -51,6 +51,7 @@
 - [x] macOS `doCommand(by:)` Selector allowlist、Rust execute bridge 与 command availability 查询
 - [x] Unicode `MoveWordLeft/Right`、macOS Option-←/→ key route 与 Selector bridge
 - [x] block-aware `MoveUp/Down`、相邻 block hit-test 与 preferred-X caret state
+- [x] Shift+Up/Down selection extension、macOS modify-selection Selector 与 FFI route
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -200,6 +201,9 @@
     移动时保持 preferred-X；横向/word movement、edit、显式 selection 和 composition/reset 必须
     清除 preferred-X，macOS key route 与 `moveUp:`/`moveDown:` Selector 必须共用该 command，
     viewport scroll-to-caret 明确留在后续阶段。
+42. `MoveUpExtend/MoveDownExtend` 必须保留 selection anchor、只更新 focus，并在 focus 回到 anchor
+    时折叠；Shift key route 与 macOS modify-selection Selector 必须共用 FFI command id，命令不得
+    生成 Transaction、Revision、history 或 SourceSync。
 
 ## 非目标
 

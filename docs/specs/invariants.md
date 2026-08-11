@@ -90,6 +90,9 @@
     映射；preferred-X 必须在连续上下移动中保持，且横向/word movement、edit、显式 selection、
     composition/reset 时清除。平台层不得在 Rust command 之外自行修改跨 block source selection；
     viewport scroll-to-caret 属于后续 GUI 契约。
+20. `MoveUpExtend/MoveDownExtend` 必须保留 `EditorSelection::anchor()`，只更新 focus，并与普通
+    Up/Down 共用 layout/preferred-X/source affinity；回到 anchor 时必须产生 collapsed selection。
+    Shift 垂直移动不得推进 Revision、history 或 SourceSync，marked text 期间不得执行。
 
 ## Accessibility
 

@@ -168,6 +168,11 @@ boundary。横向/word movement、edit、显式 selection 和 composition/reset 
 间穿越，但不把前一 block 的合成 trailing empty caret line 重复暴露；viewport scroll-to-caret
 仍留在 GUI 阶段。
 
+Shift+上下使用独立的 `MoveUpExtend`/`MoveDownExtend` command：`EditorSelection::anchor()` 保持不动，
+只把 hit-test 得到的 visual caret 写入 focus。macOS `moveUpAndModifySelection:`/
+`moveDownAndModifySelection:` 与 `EditorKey` 的 `SHIFT` modifier 共用该命令；focus 回到 anchor
+时 selection 自然折叠，命令仍不推进 Revision 或 source sync。
+
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。
 它通过 `yu-markdown::parse_inline` 或 definition-aware 的

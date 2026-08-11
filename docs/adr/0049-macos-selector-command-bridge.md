@@ -17,8 +17,9 @@
 ## 决策
 
 - Swift 维护一个很小的 Selector allowlist：`deleteBackward:`、`deleteForward:`、`moveLeft:`、
-  `moveRight:`、`moveWordLeft:`、`moveWordRight:`、`moveUp:`、`moveDown:` 和 `insertNewline:`
-  映射到已有的 `YU_EDITOR_COMMAND_*` wire id。取消与
+  `moveRight:`、`moveWordLeft:`、`moveWordRight:`、`moveUp:`、`moveDown:`、
+  `moveUpAndModifySelection:`、`moveDownAndModifySelection:` 和 `insertNewline:` 映射到已有的
+  `YU_EDITOR_COMMAND_*` wire id。取消与
   composition 状态相关的 `cancel:`/`cancelOperation:` 仍由 overlay cancel 路径处理。
 - allowlist Selector 在执行前调用 `yu_composition_session_command_available`。Rust 查询只读
   当前 `EditorDocument`：检查 composition、selection 边界、history 深度、list prefix、task
@@ -42,6 +43,6 @@
 ## 限制
 
 当前 allowlist 仍不包含 page movement 或完整 `validateMenuItem`/菜单 registry；Option/Control
-word navigation 见 ADR 0050，block-local visual-line/preferred-X 见 ADR 0051。其他命令必须先在
-Rust editor model 中定义，再扩展同一桥接。
+word navigation 见 ADR 0050，visual-line/preferred-X 见 ADR 0051，垂直 modify-selection 见
+ADR 0052。其他命令必须先在 Rust editor model 中定义，再扩展同一桥接。
 未知 Selector 仍依赖 AppKit 默认路径，产品窗口和菜单 UI 不属于本阶段。

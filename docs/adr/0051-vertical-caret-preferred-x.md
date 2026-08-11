@@ -42,5 +42,6 @@ AppKit 自己决定 source offset，隐藏 Markdown delimiter、软/硬换行和
 ## 限制
 
 当前使用 `LayoutConfig::default()` 的确定性 metrics layout。完整 GUI 必须在接入真实字体后为
-同一 block 提供一致的 shaping/layout backend，并另外定义 viewport 自动滚动、Shift 扩展 selection、
-Page Up/Down 和 RTL 视觉行策略。
+同一 block 提供一致的 shaping/layout backend，并另外定义 viewport 自动滚动、左右/word/page
+扩展 selection、Page Up/Down 和 RTL 视觉行策略。垂直 Shift selection 见
+[ADR 0052](0052-shift-vertical-selection.md)。

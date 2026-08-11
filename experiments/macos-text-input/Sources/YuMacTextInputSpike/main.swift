@@ -54,6 +54,8 @@ private enum YuNativeCommand {
     static let moveWordRight = UInt8(YU_EDITOR_COMMAND_MOVE_WORD_RIGHT)
     static let moveUp = UInt8(YU_EDITOR_COMMAND_MOVE_UP)
     static let moveDown = UInt8(YU_EDITOR_COMMAND_MOVE_DOWN)
+    static let moveUpExtend = UInt8(YU_EDITOR_COMMAND_MOVE_UP_EXTEND)
+    static let moveDownExtend = UInt8(YU_EDITOR_COMMAND_MOVE_DOWN_EXTEND)
     static let insertNewline = UInt8(YU_EDITOR_COMMAND_INSERT_NEWLINE)
     static let indentList = UInt8(YU_EDITOR_COMMAND_INDENT_LIST)
     static let outdentList = UInt8(YU_EDITOR_COMMAND_OUTDENT_LIST)
@@ -901,6 +903,31 @@ final class TextInputView: NSView, NSTextInputClient {
         doCommand(by: #selector(NSResponder.moveDown(_:)))
         precondition(selection.location == 8, "Selector moveDown must return to the next block")
 
+        let extendSource = "one\ntwo\nthree"
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: extendSource, marked: false)
+        )
+        rustComposition.resetSource(extendSource)
+        selection = NSRange(location: 0, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        doCommand(by: #selector(NSResponder.moveDownAndModifySelection(_:)))
+        precondition(
+            selection == NSRange(location: 0, length: 4),
+            "Selector shift-down must extend the Rust selection"
+        )
+        doCommand(by: #selector(NSResponder.moveDownAndModifySelection(_:)))
+        precondition(
+            selection == NSRange(location: 0, length: 8),
+            "repeated Selector shift-down must preserve the anchor"
+        )
+        doCommand(by: #selector(NSResponder.moveUpAndModifySelection(_:)))
+        precondition(
+            selection == NSRange(location: 0, length: 4),
+            "Selector shift-up must contract toward the anchor"
+        )
+
         replaceStorage(
             range: NSRange(location: 0, length: textStorage.length),
             with: savedStorage
@@ -1053,7 +1080,7 @@ final class TextInputView: NSView, NSTextInputClient {
         needsDisplay = true
         print(
             "Unicode composition self-check japanese=日本語 combining=é "
-                + "cancel=restored vertical=preferred-x"
+                + "cancel=restored vertical=preferred-x shift-selection"
         )
     }
 
@@ -1081,6 +1108,10 @@ final class TextInputView: NSView, NSTextInputClient {
             nativeCommand = YuNativeCommand.moveUp
         case #selector(NSResponder.moveDown(_:)):
             nativeCommand = YuNativeCommand.moveDown
+        case #selector(NSResponder.moveUpAndModifySelection(_:)):
+            nativeCommand = YuNativeCommand.moveUpExtend
+        case #selector(NSResponder.moveDownAndModifySelection(_:)):
+            nativeCommand = YuNativeCommand.moveDownExtend
         case #selector(NSResponder.insertNewline(_:)):
             nativeCommand = YuNativeCommand.insertNewline
         default:

@@ -528,7 +528,13 @@ impl EditorDocument {
         command: EditorCommand,
     ) -> Result<CommandResult, EditorDocumentError> {
         self.last_source_change = None;
-        if !matches!(command, EditorCommand::MoveUp | EditorCommand::MoveDown) {
+        if !matches!(
+            command,
+            EditorCommand::MoveUp
+                | EditorCommand::MoveDown
+                | EditorCommand::MoveUpExtend
+                | EditorCommand::MoveDownExtend
+        ) {
             self.preferred_x = None;
         }
         match command {
@@ -539,8 +545,10 @@ impl EditorDocument {
             EditorCommand::MoveRight => self.move_right(),
             EditorCommand::MoveWordLeft => self.move_word_left(),
             EditorCommand::MoveWordRight => self.move_word_right(),
-            EditorCommand::MoveUp => self.move_up(),
-            EditorCommand::MoveDown => self.move_down(),
+            EditorCommand::MoveUp => self.move_up(false),
+            EditorCommand::MoveDown => self.move_down(false),
+            EditorCommand::MoveUpExtend => self.move_up(true),
+            EditorCommand::MoveDownExtend => self.move_down(true),
             EditorCommand::InsertNewline => self.insert_newline(),
             EditorCommand::IndentList => self.indent_list(),
             EditorCommand::OutdentList => self.outdent_list(),
@@ -573,8 +581,12 @@ impl EditorDocument {
             EditorCommand::MoveWordRight => {
                 !self.selection.is_empty() || self.selection.focus() < snapshot.len_bytes()
             }
-            EditorCommand::MoveUp => self.vertical_command_available(VerticalDirection::Up),
-            EditorCommand::MoveDown => self.vertical_command_available(VerticalDirection::Down),
+            EditorCommand::MoveUp | EditorCommand::MoveUpExtend => {
+                self.vertical_command_available(VerticalDirection::Up)
+            }
+            EditorCommand::MoveDown | EditorCommand::MoveDownExtend => {
+                self.vertical_command_available(VerticalDirection::Down)
+            }
             EditorCommand::InsertNewline => true,
             EditorCommand::IndentList => self
                 .current_list_line()
@@ -1076,21 +1088,22 @@ impl EditorDocument {
         Ok(self.command_result(false))
     }
 
-    fn move_up(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        self.move_vertical(VerticalDirection::Up)
+    fn move_up(&mut self, extend: bool) -> Result<CommandResult, EditorDocumentError> {
+        self.move_vertical(VerticalDirection::Up, extend)
     }
 
-    fn move_down(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        self.move_vertical(VerticalDirection::Down)
+    fn move_down(&mut self, extend: bool) -> Result<CommandResult, EditorDocumentError> {
+        self.move_vertical(VerticalDirection::Down, extend)
     }
 
     fn move_vertical(
         &mut self,
         direction: VerticalDirection,
+        extend: bool,
     ) -> Result<CommandResult, EditorDocumentError> {
         self.history.break_group();
 
-        if !self.selection.is_empty() {
+        if !extend && !self.selection.is_empty() {
             let target = match direction {
                 VerticalDirection::Up => self.selection.ordered_range().start(),
                 VerticalDirection::Down => self.selection.ordered_range().end(),
@@ -1106,6 +1119,7 @@ impl EditorDocument {
 
         let source = self.snapshot();
         let focus = self.selection.focus();
+        let anchor = self.selection.anchor();
         let Some(block_index) = self.block_index_for_offset(focus) else {
             self.preferred_x = None;
             return Ok(self.command_result(false));
@@ -1153,11 +1167,12 @@ impl EditorDocument {
             (hit.source(), target_line.width())
         };
 
-        self.selection = EditorSelection::cursor(
-            &source,
-            target,
-            vertical_hit_affinity(desired_x, target_width),
-        )?;
+        let affinity = vertical_hit_affinity(desired_x, target_width);
+        self.selection = if extend {
+            EditorSelection::range(&source, anchor, target, affinity)?
+        } else {
+            EditorSelection::cursor(&source, target, affinity)?
+        };
         self.preferred_x = Some(PreferredCaretX::new(desired_x));
         Ok(self.command_result(false))
     }
@@ -1880,6 +1895,38 @@ mod tests {
             .expect("down should return to the following paragraph block");
         assert_eq!(document.selection().focus().get(), 8);
         assert_eq!(document.snapshot().as_str(), source);
+    }
+
+    #[test]
+    fn vertical_extend_commands_preserve_anchor_and_preferred_x() {
+        let source = "one\ntwo\nthree";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, 0);
+
+        document
+            .execute(EditorCommand::move_down_extend())
+            .expect("shift-down should extend to the second line");
+        assert_eq!(document.selection().anchor().get(), 0);
+        assert_eq!(document.selection().focus().get(), 4);
+        assert!(!document.selection().is_empty());
+
+        document
+            .execute(EditorCommand::move_down_extend())
+            .expect("repeated shift-down should preserve the anchor");
+        assert_eq!(document.selection().anchor().get(), 0);
+        assert_eq!(document.selection().focus().get(), 8);
+
+        document
+            .execute(EditorCommand::move_up_extend())
+            .expect("shift-up should contract toward the anchor");
+        assert_eq!(document.selection().anchor().get(), 0);
+        assert_eq!(document.selection().focus().get(), 4);
+
+        document
+            .execute(EditorCommand::move_up_extend())
+            .expect("shift-up should collapse at the anchor");
+        assert!(document.selection().is_empty());
+        assert_eq!(document.selection().focus().get(), 0);
     }
 
     #[test]
