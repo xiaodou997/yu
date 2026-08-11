@@ -39,6 +39,57 @@ private struct RustCaretScrollResult {
     let needsScroll: Bool
 }
 
+private enum YuViewportApplyResult: Equatable {
+    case stale
+    case noOp
+    case scrolled(CGFloat)
+}
+
+/// Native consumer for Rust's absolute document-space caret scroll request.
+/// The adapter owns only AppKit viewport state; source/layout remain in Rust.
+private final class YuNativeViewportAdapter {
+    private let scrollView: NSScrollView
+    private(set) var revision: UInt64?
+    private(set) var contentHeight: CGFloat = 0
+
+    init(scrollView: NSScrollView) {
+        self.scrollView = scrollView
+    }
+
+    func configure(revision: UInt64, contentHeight: CGFloat) {
+        precondition(contentHeight.isFinite && contentHeight >= 0, "content height must be valid")
+        self.revision = revision
+        self.contentHeight = contentHeight
+        if let documentView = scrollView.documentView {
+            var frame = documentView.frame
+            frame.size.height = contentHeight
+            documentView.frame = frame
+        }
+        scrollView.layoutSubtreeIfNeeded()
+    }
+
+    func apply(
+        _ request: RustCaretScrollResult,
+        currentRevision: UInt64
+    ) -> YuViewportApplyResult {
+        guard let revision, revision == currentRevision, request.revision == revision else {
+            return .stale
+        }
+        guard request.needsScroll else { return .noOp }
+
+        let clipView = scrollView.contentView
+        let maxScrollY = max(0, contentHeight - clipView.bounds.height)
+        let target = min(max(request.targetScrollY, 0), maxScrollY)
+        let current = clipView.bounds.origin.y
+        guard abs(target - current) > 0.001 else { return .noOp }
+        var origin = clipView.bounds.origin
+        origin.y = target
+        clipView.scroll(to: origin)
+        scrollView.reflectScrolledClipView(clipView)
+        return .scrolled(target)
+    }
+}
+
 private enum YuNativeKeyKind {
     static let character = UInt8(YU_KEY_CHARACTER)
     static let enter = UInt8(YU_KEY_ENTER)
@@ -1021,6 +1072,32 @@ final class TextInputView: NSView, NSTextInputClient {
                 && reveal.needsScroll,
             "Rust caret scroll request must reveal the focus"
         )
+
+        let nativeScrollView = NSScrollView(
+            frame: NSRect(x: 0, y: 0, width: 10, height: 1)
+        )
+        nativeScrollView.hasVerticalScroller = false
+        nativeScrollView.documentView = NSView(
+            frame: NSRect(x: 0, y: 0, width: 10, height: 5)
+        )
+        let viewportAdapter = YuNativeViewportAdapter(scrollView: nativeScrollView)
+        viewportAdapter.configure(revision: reveal.revision, contentHeight: 5)
+        guard case .scrolled(let nativeTarget) = viewportAdapter.apply(
+            reveal,
+            currentRevision: reveal.revision
+        ) else {
+            preconditionFailure("native viewport must consume a visible caret request")
+        }
+        precondition(
+            abs(nativeTarget - reveal.targetScrollY) < 0.001
+                && abs(nativeScrollView.contentView.bounds.origin.y - nativeTarget) < 0.001,
+            "native viewport must apply the absolute Rust target"
+        )
+        precondition(
+            viewportAdapter.apply(reveal, currentRevision: reveal.revision + 1) == .stale,
+            "native viewport must reject stale caret geometry"
+        )
+
         let visible = rustComposition.caretScrollRequest(
             scrollY: reveal.targetScrollY,
             viewportHeight: 1,
@@ -1029,6 +1106,10 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(
             !visible.needsScroll && visible.targetScrollY == reveal.targetScrollY,
             "visible caret must produce a no-op scroll request"
+        )
+        precondition(
+            viewportAdapter.apply(visible, currentRevision: visible.revision) == .noOp,
+            "native viewport must preserve a visible caret without movement"
         )
 
         selection = NSRange(location: 0, length: 0)
@@ -1039,6 +1120,17 @@ final class TextInputView: NSView, NSTextInputClient {
             margin: 0
         )
         precondition(top.needsScroll && top.targetScrollY == 0, "top caret must scroll back")
+        guard case .scrolled(let topTarget) = viewportAdapter.apply(
+            top,
+            currentRevision: top.revision
+        ) else {
+            preconditionFailure("native viewport must consume the top reveal request")
+        }
+        precondition(
+            abs(topTarget) < 0.001
+                && abs(nativeScrollView.contentView.bounds.origin.y) < 0.001,
+            "native viewport must scroll back to the document origin"
+        )
 
         replaceStorage(
             range: NSRange(location: 0, length: textStorage.length),
@@ -1051,7 +1143,8 @@ final class TextInputView: NSView, NSTextInputClient {
         needsDisplay = true
         print(
             "Viewport self-check caret-source=\(reveal.source) block=\(reveal.block) "
-                + "target=\(reveal.targetScrollY) noop=\(!visible.needsScroll)"
+                + "target=\(reveal.targetScrollY) native=\(nativeTarget) "
+                + "stale=rejected noop=\(!visible.needsScroll)"
         )
     }
 

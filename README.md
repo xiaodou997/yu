@@ -123,6 +123,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Vertical caret and preferred-X](docs/adr/0051-vertical-caret-preferred-x.md)
 - [Shift vertical selection](docs/adr/0052-shift-vertical-selection.md)
 - [Revision-bound caret scroll request](docs/adr/0053-caret-scroll-request.md)
+- [macOS NSScrollView consumer](docs/adr/0054-macos-scrollview-consumer.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
