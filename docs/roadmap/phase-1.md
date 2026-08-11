@@ -65,6 +65,7 @@
 - [x] macOS Metal device、未附着 `CAMetalLayer` 与 surface generation contract
 - [x] macOS `MetalUploader` 的 owned alpha page → `R8Unorm MTLTexture` bridge
 - [x] macOS command queue 与 clear-only drawable/present/commit frame lifecycle
+- [x] macOS solid rectangle + alpha glyph Metal pipeline、UV atlas sampling 与 retained plan ABI
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -128,7 +129,11 @@
 24. macOS backend 必须能在无窗口状态下验证 surface config/resize contract；native Metal device
    和 alpha texture upload 测试必须显式标记硬件前置条件，不能让无 Metal device 的默认 CI 失败。
 25. macOS clear-only frame 必须保持 queue/device 绑定，并对 drawable、command buffer、encoder
-   失败返回明确错误；完整 glyph/rect pipeline 进入前不得隐式消费 RenderPlan commands。
+   失败返回明确错误；完整 glyph/rect pipeline 不能隐式消费未验证的 RenderPlan commands。
+26. macOS `MetalFrameRenderer::render_plan` 必须在无窗口单元测试中验证 painter order、glyph
+   bounds、atlas UV 和缺页拒绝；在有 Metal device 的 session 中显式覆盖 pipeline creation、
+   drawable acquisition、alpha sampling command encoding 和 present/commit。GPU 句柄只能存在
+   `MetalAtlas`/backend，不能进入 shared render plan。
 
 ## 非目标
 

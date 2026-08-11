@@ -4,6 +4,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=native/metal_bridge.m");
+    println!("cargo:rerun-if-changed=native/yu_shaders.metal");
 
     let target = env::var("TARGET").expect("Cargo must provide TARGET");
     if !target.ends_with("-apple-darwin") {

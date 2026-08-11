@@ -183,9 +183,12 @@ Scene → RenderPlan` 端到端 revision、atlas upload 去重和 command origin
 和 command encoding 仍属于后续阶段。
 
 `platform/macos/yu-render-macos` 是共享 render boundary 之外的第一层真实 backend：Rust 侧拥有
-`MetalDevice`、未附着窗口的 `CAMetalLayer`、surface generation 和 `MetalTexture`，Objective-C
-bridge 只负责 Apple framework 调用。它可以把 `AtlasPageUpload` 上传成 `R8Unorm` texture，
-并通过 `MetalCommandQueue`/`MetalFrameRenderer::present_clear` 验证 clear-only 的
-drawable → command buffer → render pass → present/commit 顺序；它仍不创建窗口，也不编码
-glyph/rect pipeline。无 Metal device 或有效 drawable 的会话默认跳过硬件测试，需显式运行
-ignored test。
+`MetalDevice`、未附着窗口的 `CAMetalLayer`、surface generation、`MetalTexture`、`MetalAtlas`
+和 `MetalPipeline`，Objective-C bridge 只负责 Apple framework 调用。它可以把
+`AtlasPageUpload` 上传成 `R8Unorm` texture，并通过 `MetalCommandQueue`/`MetalFrameRenderer`
+验证两条 frame 路径：`present_clear` 的 drawable → command buffer → clear → present/commit，
+以及 `render_plan` 的 solid rectangle 与 alpha glyph quad。后者使用内嵌的最小 Metal shader
+source，在创建 renderer 时生成两个 pipeline state；`RenderPlan` 仍只携带 owned geometry、
+颜色和 page id，GPU texture 只存在 `MetalAtlas`。它仍不创建窗口，CAMetalLayer 仍需由后续
+AppKit shell 附着到 view。无 Metal device 或有效 drawable 的会话默认跳过硬件测试，需显式
+运行 ignored test。

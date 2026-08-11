@@ -8,20 +8,23 @@
 //! The Objective-C bridge in `native/metal_bridge.m` owns only the calls that
 //! require Apple framework types. Rust owns device/surface/texture lifetime,
 //! validates all dimensions, and exposes no native pointer to shared editor
-//! state. It can submit a clear-only frame to an attached layer, but stops
-//! before glyph pipelines, command batching, and window creation.
+//! state. It can submit a clear-only frame or a small retained render plan to
+//! an attached layer, but does not create a window or own editor state.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use yu_render::{AtlasPageUpload, RenderUploader};
+use yu_render::{AtlasPageUpload, RenderCommand, RenderPlan, RenderUploader};
 use yu_scene::Rgba8;
 
 #[cfg(target_os = "macos")]
 mod native {
     use std::ffi::c_void;
+
+    use super::{NativeDrawCommand, NativeTextureBinding};
 
     unsafe extern "C" {
         pub fn yu_metal_create_device(
@@ -61,8 +64,59 @@ mod native {
             blue: f32,
             alpha: f32,
         ) -> i32;
+        pub fn yu_metal_create_pipeline(
+            device: *mut c_void,
+            source: *const std::ffi::c_char,
+            source_length: usize,
+            out_pipeline: *mut *mut c_void,
+        ) -> i32;
+        pub fn yu_metal_render_plan(
+            queue: *mut c_void,
+            layer: *mut c_void,
+            pipeline: *mut c_void,
+            viewport_width: f32,
+            viewport_height: f32,
+            scale: f32,
+            commands: *const NativeDrawCommand,
+            command_count: usize,
+            textures: *const NativeTextureBinding,
+            texture_count: usize,
+        ) -> i32;
+        pub fn yu_metal_release_pipeline(pipeline: *mut c_void);
         pub fn yu_metal_release(object: *mut c_void);
     }
+}
+
+const METAL_SHADER_SOURCE: &str = include_str!("../native/yu_shaders.metal");
+
+const DRAW_FILL_RECT: u32 = 0;
+const DRAW_GLYPH: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeDrawCommand {
+    kind: u32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+    red: f32,
+    green: f32,
+    blue: f32,
+    alpha: f32,
+    page: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct NativeTextureBinding {
+    page: u32,
+    texture: *mut std::ffi::c_void,
 }
 
 /// Errors raised by the macOS Metal boundary.
@@ -74,6 +128,9 @@ pub enum MetalRenderError {
     DrawableUnavailable,
     CommandBufferUnavailable,
     RenderEncoderUnavailable,
+    PipelineUnavailable,
+    MissingAtlasPage(u32),
+    InvalidRenderCommand(&'static str),
     DeviceMismatch,
     InvalidSurfaceConfig(&'static str),
     InvalidPixelBuffer { expected: usize, actual: usize },
@@ -100,6 +157,16 @@ impl fmt::Display for MetalRenderError {
             Self::RenderEncoderUnavailable => {
                 formatter.write_str("Metal render encoder creation failed")
             }
+            Self::PipelineUnavailable => {
+                formatter.write_str("Metal render pipeline creation failed")
+            }
+            Self::MissingAtlasPage(page) => {
+                write!(
+                    formatter,
+                    "render plan references missing Metal atlas page {page}"
+                )
+            }
+            Self::InvalidRenderCommand(message) => formatter.write_str(message),
             Self::DeviceMismatch => {
                 formatter.write_str("surface and command queue use different Metal devices")
             }
@@ -411,6 +478,11 @@ impl MetalTexture {
     pub const fn height(&self) -> u32 {
         self.height
     }
+
+    #[cfg(target_os = "macos")]
+    fn raw(&self) -> *mut std::ffi::c_void {
+        self.raw.as_ptr()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -497,6 +569,64 @@ impl RenderUploader for MetalUploader {
     }
 }
 
+/// GPU-resident atlas pages owned by the macOS backend.
+///
+/// The atlas is deliberately separate from [`RenderPlan`]. A device reset can
+/// discard it and force the shared plan builder to emit page uploads again,
+/// while scene/layout/editor state remains unchanged.
+#[derive(Debug, Default)]
+pub struct MetalAtlas {
+    pages: BTreeMap<u32, MetalTexture>,
+}
+
+impl MetalAtlas {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Uploads the page payloads emitted by one render plan.
+    pub fn sync_plan(
+        &mut self,
+        uploader: &mut MetalUploader,
+        plan: &RenderPlan,
+    ) -> Result<usize, MetalRenderError> {
+        let mut staged = Vec::with_capacity(plan.uploads().len());
+        for page in plan.uploads() {
+            let texture = uploader.upload_alpha_page(page)?;
+            staged.push((page.page(), texture));
+        }
+        let uploaded = staged.len();
+        for (page, texture) in staged {
+            self.pages.insert(page, texture);
+        }
+        Ok(uploaded)
+    }
+
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn page_sizes(&self) -> BTreeMap<u32, (u32, u32)> {
+        self.pages
+            .iter()
+            .map(|(page, texture)| (*page, (texture.width(), texture.height())))
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_bindings(&self) -> Vec<NativeTextureBinding> {
+        self.pages
+            .iter()
+            .map(|(page, texture)| NativeTextureBinding {
+                page: *page,
+                texture: texture.raw(),
+            })
+            .collect()
+    }
+}
+
 #[cfg(target_os = "macos")]
 struct CommandQueueInner {
     raw: NonNull<std::ffi::c_void>,
@@ -555,10 +685,83 @@ impl MetalCommandQueue {
     }
 }
 
-/// Clear-only frame submission used to validate drawable acquisition and
-/// present/commit ordering before glyph pipelines are introduced.
+#[cfg(target_os = "macos")]
+struct PipelineInner {
+    raw: NonNull<std::ffi::c_void>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PipelineInner {
+    fn drop(&mut self) {
+        unsafe { native::yu_metal_release_pipeline(self.raw.as_ptr()) };
+    }
+}
+
+/// Two small Metal render pipeline states: one for solid rectangles and one
+/// for alpha-sampled glyph quads. Pipeline creation is isolated here so the
+/// native shader compiler and Objective-C objects never enter shared crates.
+pub struct MetalPipeline {
+    device: MetalDevice,
+    #[cfg(target_os = "macos")]
+    inner: Rc<PipelineInner>,
+}
+
+impl fmt::Debug for MetalPipeline {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetalPipeline")
+            .field("device_registry_id", &self.device.registry_id())
+            .finish()
+    }
+}
+
+impl MetalPipeline {
+    pub fn new(device: MetalDevice) -> Result<Self, MetalRenderError> {
+        #[cfg(target_os = "macos")]
+        {
+            let source = METAL_SHADER_SOURCE.as_bytes();
+            let source = std::ffi::CString::new(source).map_err(|_| {
+                MetalRenderError::InvalidRenderCommand("Metal shader source contains NUL")
+            })?;
+            let mut raw = std::ptr::null_mut();
+            let created = unsafe {
+                native::yu_metal_create_pipeline(
+                    device.raw(),
+                    source.as_ptr(),
+                    METAL_SHADER_SOURCE.len(),
+                    &mut raw,
+                )
+            };
+            let raw = NonNull::new(raw).ok_or(MetalRenderError::PipelineUnavailable)?;
+            if created == 0 {
+                unsafe { native::yu_metal_release_pipeline(raw.as_ptr()) };
+                return Err(MetalRenderError::PipelineUnavailable);
+            }
+            return Ok(Self {
+                device,
+                inner: Rc::new(PipelineInner { raw }),
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = device;
+            Err(MetalRenderError::UnsupportedPlatform)
+        }
+    }
+
+    #[must_use]
+    pub const fn device(&self) -> &MetalDevice {
+        &self.device
+    }
+}
+
+/// Frame submission for clear-only validation and the first retained
+/// rectangle/glyph command path. It still expects an already attached layer;
+/// window creation and AppKit ownership remain outside this crate.
 pub struct MetalFrameRenderer {
     queue: MetalCommandQueue,
+    pipeline: MetalPipeline,
 }
 
 impl fmt::Debug for MetalFrameRenderer {
@@ -566,14 +769,17 @@ impl fmt::Debug for MetalFrameRenderer {
         formatter
             .debug_struct("MetalFrameRenderer")
             .field("queue", &self.queue)
+            .field("pipeline", &self.pipeline)
             .finish()
     }
 }
 
 impl MetalFrameRenderer {
     pub fn new(device: MetalDevice) -> Result<Self, MetalRenderError> {
+        let pipeline = MetalPipeline::new(device.clone())?;
         Ok(Self {
             queue: MetalCommandQueue::new(device)?,
+            pipeline,
         })
     }
 
@@ -619,10 +825,202 @@ impl MetalFrameRenderer {
         }
     }
 
+    /// Upload-independent retained rendering entry point. The caller first
+    /// synchronizes `plan.uploads()` into a [`MetalAtlas`], then this method
+    /// converts the backend-neutral commands into a short native ABI array.
+    /// The shared `RenderPlan` itself never contains a Metal pointer.
+    pub fn render_plan(
+        &mut self,
+        surface: &MetalSurface,
+        plan: &RenderPlan,
+        atlas: &MetalAtlas,
+    ) -> Result<(), MetalRenderError> {
+        if self.queue.device().registry_id() != surface.device().registry_id()
+            || self.pipeline.device().registry_id() != surface.device().registry_id()
+        {
+            return Err(MetalRenderError::DeviceMismatch);
+        }
+
+        let viewport = plan.viewport();
+        let commands = build_native_commands(plan, &atlas.page_sizes())?;
+        let scale = surface.config().scale() as f32;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(MetalRenderError::InvalidRenderCommand(
+                "Metal surface scale is not representable as f32",
+            ));
+        }
+        let viewport_width = viewport.width();
+        let viewport_height = viewport.height();
+        if !viewport_width.is_finite()
+            || !viewport_height.is_finite()
+            || viewport_width <= 0.0
+            || viewport_height <= 0.0
+        {
+            return Err(MetalRenderError::InvalidRenderCommand(
+                "render plan viewport must be finite and positive",
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let bindings = atlas.native_bindings();
+            let status = unsafe {
+                native::yu_metal_render_plan(
+                    self.queue.inner.as_ref().raw.as_ptr(),
+                    surface.raw_layer(),
+                    self.pipeline.inner.raw.as_ptr(),
+                    viewport_width,
+                    viewport_height,
+                    scale,
+                    commands.as_ptr(),
+                    commands.len(),
+                    bindings.as_ptr(),
+                    bindings.len(),
+                )
+            };
+            return match status {
+                1 => Ok(()),
+                2 => Err(MetalRenderError::DrawableUnavailable),
+                3 => Err(MetalRenderError::CommandBufferUnavailable),
+                4 => Err(MetalRenderError::RenderEncoderUnavailable),
+                5 => Err(MetalRenderError::NativeFailure(
+                    "Metal command references an unavailable texture or kind",
+                )),
+                _ => Err(MetalRenderError::NativeFailure(
+                    "Metal render plan bridge failed",
+                )),
+            };
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (
+                surface,
+                plan,
+                atlas,
+                viewport_width,
+                viewport_height,
+                scale,
+                commands,
+            );
+            Err(MetalRenderError::UnsupportedPlatform)
+        }
+    }
+
     #[must_use]
     pub const fn queue(&self) -> &MetalCommandQueue {
         &self.queue
     }
+}
+
+fn normalized_channel(channel: u8) -> f32 {
+    f32::from(channel) / 255.0
+}
+
+fn build_native_commands(
+    plan: &RenderPlan,
+    page_sizes: &BTreeMap<u32, (u32, u32)>,
+) -> Result<Vec<NativeDrawCommand>, MetalRenderError> {
+    let viewport = plan.viewport();
+    let mut commands = Vec::with_capacity(plan.commands().len());
+    for command in plan.commands() {
+        match *command {
+            RenderCommand::FillRect { bounds, color } => {
+                if !bounds.x().is_finite()
+                    || !bounds.y().is_finite()
+                    || !bounds.width().is_finite()
+                    || !bounds.height().is_finite()
+                {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "fill rectangle geometry is not finite",
+                    ));
+                }
+                if bounds.width() == 0.0 || bounds.height() == 0.0 {
+                    continue;
+                }
+                let x = bounds.x() - viewport.x();
+                let y = bounds.y() - viewport.y();
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "fill rectangle position is not finite",
+                    ));
+                }
+                commands.push(NativeDrawCommand {
+                    kind: DRAW_FILL_RECT,
+                    x,
+                    y,
+                    width: bounds.width(),
+                    height: bounds.height(),
+                    u0: 0.0,
+                    v0: 0.0,
+                    u1: 0.0,
+                    v1: 0.0,
+                    red: normalized_channel(color.red()),
+                    green: normalized_channel(color.green()),
+                    blue: normalized_channel(color.blue()),
+                    alpha: normalized_channel(color.alpha()),
+                    page: u32::MAX,
+                });
+            }
+            RenderCommand::Glyph {
+                page,
+                rect,
+                origin,
+                metrics,
+                color,
+            } => {
+                let Some(page) = page else {
+                    // Empty glyphs keep their advance in layout but have no
+                    // coverage pixels to submit to Metal.
+                    continue;
+                };
+                let Some(&(page_width, page_height)) = page_sizes.get(&page) else {
+                    return Err(MetalRenderError::MissingAtlasPage(page));
+                };
+                if page_width == 0 || page_height == 0 {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "atlas page dimensions must be positive",
+                    ));
+                }
+                let rect_right = u64::from(rect.x()) + u64::from(rect.width());
+                let rect_bottom = u64::from(rect.y()) + u64::from(rect.height());
+                if rect_right > u64::from(page_width) || rect_bottom > u64::from(page_height) {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "glyph atlas rectangle exceeds its page",
+                    ));
+                }
+                if rect.width() == 0 || rect.height() == 0 {
+                    continue;
+                }
+                let x = origin.x() + metrics.bearing_x() - viewport.x();
+                let y = origin.y() - metrics.bearing_y() - viewport.y();
+                let width = rect.width() as f32;
+                let height = rect.height() as f32;
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "glyph origin is not finite",
+                    ));
+                }
+                commands.push(NativeDrawCommand {
+                    kind: DRAW_GLYPH,
+                    x,
+                    y,
+                    width,
+                    height,
+                    u0: rect.x() as f32 / page_width as f32,
+                    v0: rect.y() as f32 / page_height as f32,
+                    u1: rect_right as f32 / page_width as f32,
+                    v1: rect_bottom as f32 / page_height as f32,
+                    red: normalized_channel(color.red()),
+                    green: normalized_channel(color.green()),
+                    blue: normalized_channel(color.blue()),
+                    alpha: normalized_channel(color.alpha()),
+                    page,
+                });
+            }
+        }
+    }
+    Ok(commands)
 }
 
 #[cfg(test)]
@@ -641,6 +1039,100 @@ mod tests {
         assert!(MetalSurfaceConfig::new(0.0, 10.0, 2.0).is_err());
         assert!(MetalSurfaceConfig::new(10.0, f64::NAN, 2.0).is_err());
         assert!(MetalSurfaceConfig::new(10.0, 10.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn native_command_conversion_keeps_painter_order_and_atlas_uvs() {
+        use std::collections::BTreeMap;
+
+        use yu_core::Revision;
+        use yu_font::{
+            FontFaceId, GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphId, GlyphMetrics,
+            GlyphRasterKey, RasterizedGlyph,
+        };
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{GlyphPrimitive, Point, Rect, SceneBuilder};
+
+        let key =
+            GlyphRasterKey::new(FontFaceId::from_raw(3), GlyphId::from_raw(11), 14.0).expect("key");
+        let bitmap = GlyphBitmap::new(4, 6, 4, vec![255; 24]).expect("bitmap");
+        let metrics = GlyphMetrics::new(1.0, 7.0, 5.0).expect("metrics");
+        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(16, 16, 1).expect("config"));
+        let entry = atlas
+            .insert(RasterizedGlyph::new(key, metrics, bitmap))
+            .expect("entry");
+        let viewport = Rect::new(10.0, 20.0, 80.0, 40.0).expect("viewport");
+        let mut scene = SceneBuilder::new(Revision::INITIAL, viewport).expect("scene");
+        scene
+            .fill_rect(
+                Rect::new(10.0, 20.0, 20.0, 5.0).expect("rect"),
+                Rgba8::new(10, 20, 30, 255),
+            )
+            .expect("fill");
+        scene
+            .glyph(GlyphPrimitive::new(
+                entry,
+                Point::new(14.0, 32.0),
+                Rgba8::white(),
+            ))
+            .expect("glyph");
+        let plan = RenderPlanBuilder::new()
+            .build(&scene.finish(), &atlas)
+            .expect("plan");
+        let mut page_sizes = BTreeMap::new();
+        page_sizes.insert(0, (16, 16));
+
+        let commands = build_native_commands(&plan, &page_sizes).expect("native commands");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].kind, DRAW_FILL_RECT);
+        assert_eq!(commands[0].x, 0.0);
+        assert_eq!(commands[0].y, 0.0);
+        assert_eq!(commands[1].kind, DRAW_GLYPH);
+        assert_eq!(commands[1].x, 5.0);
+        assert_eq!(commands[1].y, 5.0);
+        assert_eq!(commands[1].width, 4.0);
+        assert_eq!(commands[1].height, 6.0);
+        assert_eq!(commands[1].u0, entry.rect().x() as f32 / 16.0);
+        assert_eq!(commands[1].v0, entry.rect().y() as f32 / 16.0);
+    }
+
+    #[test]
+    fn native_command_conversion_rejects_missing_atlas_page() {
+        use std::collections::BTreeMap;
+
+        use yu_core::Revision;
+        use yu_font::{
+            FontFaceId, GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphId, GlyphMetrics,
+            GlyphRasterKey, RasterizedGlyph,
+        };
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{GlyphPrimitive, Point, Rect, SceneBuilder};
+
+        let key =
+            GlyphRasterKey::new(FontFaceId::from_raw(3), GlyphId::from_raw(11), 14.0).expect("key");
+        let bitmap = GlyphBitmap::new(2, 2, 2, vec![255; 4]).expect("bitmap");
+        let metrics = GlyphMetrics::new(0.0, 2.0, 2.0).expect("metrics");
+        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(8, 8, 1).expect("config"));
+        let entry = atlas
+            .insert(RasterizedGlyph::new(key, metrics, bitmap))
+            .expect("entry");
+        let viewport = Rect::new(0.0, 0.0, 20.0, 20.0).expect("viewport");
+        let mut scene = SceneBuilder::new(Revision::INITIAL, viewport).expect("scene");
+        scene
+            .glyph(GlyphPrimitive::new(
+                entry,
+                Point::new(2.0, 4.0),
+                Rgba8::white(),
+            ))
+            .expect("glyph");
+        let plan = RenderPlanBuilder::new()
+            .build(&scene.finish(), &atlas)
+            .expect("plan");
+
+        assert_eq!(
+            build_native_commands(&plan, &BTreeMap::new()).expect_err("missing page"),
+            MetalRenderError::MissingAtlasPage(0)
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -697,13 +1189,21 @@ mod tests {
             .build(&scene_builder.finish(), &atlas)
             .expect("render plan");
         let mut uploader = MetalUploader::new(device.clone());
-        let texture = uploader
-            .upload_alpha_page(&plan.uploads()[0])
-            .expect("alpha texture");
-        assert_eq!(texture.width(), 8);
-        assert_eq!(texture.height(), 8);
+        let mut gpu_atlas = MetalAtlas::new();
+        assert_eq!(
+            gpu_atlas
+                .sync_plan(&mut uploader, &plan)
+                .expect("alpha texture"),
+            1
+        );
+        assert_eq!(gpu_atlas.page_count(), 1);
 
-        let mut frame_renderer = MetalFrameRenderer::new(device).expect("command queue");
+        let mut frame_renderer = MetalFrameRenderer::new(device).expect("command queue/pipeline");
+        let result = frame_renderer.render_plan(&surface, &plan, &gpu_atlas);
+        assert!(matches!(
+            result,
+            Ok(()) | Err(MetalRenderError::DrawableUnavailable)
+        ));
         let result = frame_renderer.present_clear(&surface, Rgba8::new(12, 24, 48, 255));
         assert!(matches!(
             result,

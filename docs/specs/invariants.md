@@ -156,8 +156,15 @@
    resize 成功后才能更新 config 和 generation。
 3. `MetalUploader` 只能接受长度与 page width×height 一致的 owned alpha bytes；texture handle
    的释放由 macOS backend 负责，不能写回 `GlyphAtlas` 或 `RenderPlan`。
-4. drawable acquisition、command encoding、present 与 window attachment 必须在明确的后续
-   platform stage 中加入；当前仅允许 clear-only frame 显式执行 acquisition/present，不能隐式
-   消费 `RenderPlan::commands`。
-5. `MetalCommandQueue` 必须绑定创建它的 `MetalDevice`；`present_clear` 在 native 调用前必须
-   拒绝 device mismatch，并将 drawable、command buffer、encoder 的失败状态转换为明确错误。
+4. `MetalCommandQueue`、`MetalPipeline` 和 `MetalSurface` 必须绑定同一个 `MetalDevice`；任何
+   device mismatch 都必须在 native 调用前拒绝。
+5. `MetalAtlas` 可以拥有 page texture，但 `RenderPlan` 只能通过 page id 引用它们；计划中的
+   glyph 必须在提交前找到对应 page，empty glyph（`page: None`）只能被跳过，不能伪造纹理。
+6. `MetalFrameRenderer::render_plan` 必须保持 `RenderPlan::commands` 的 painter order，solid
+   rectangle 使用 solid pipeline，glyph 使用对应 page 的 alpha sampling pipeline；source/layout
+   坐标只能在 Rust command conversion 边界按 viewport/scale 转换一次。
+7. native command ABI 的 geometry、UV、颜色和 page id 必须是有限、已验证的 owned 数组；atlas
+   rectangle 越界、未知 command kind、缺页或无效 viewport 必须返回错误，不得提交半成品 frame。
+8. `present_clear` 与 `render_plan` 的 drawable、command buffer、encoder 失败都必须转换为明确
+   `MetalRenderError`；window attachment 仍属于后续 AppKit shell，未附着 layer 的硬件测试可以
+   返回 `DrawableUnavailable`。
