@@ -8,6 +8,7 @@ mod command;
 mod composition;
 mod document;
 mod layout;
+mod list;
 mod projection;
 mod selection;
 mod viewport;

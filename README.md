@@ -17,6 +17,7 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - Markdown source 是唯一持久化真源，不通过富文本模型往返序列化；
 - Lossless CST 保留 delimiter、空白、换行和未完成语法；
 - task-list marker 保留 source range，视觉层只投影隐藏 `[ ]`/`[x]`，状态切换仍是普通 Transaction；
+- 列表 Enter、空项 Backspace、缩进和反缩进都只通过 source Transaction 改写当前行；
 - Transaction、Snapshot、Anchor 与 Revision 构成统一编辑协议；
 - selection/caret、Unicode grapheme command 与 Accessibility 查询共享同一个 Revision；
 - 解析、投影、布局、绘制和资源加载都只处理受影响部分；
@@ -108,6 +109,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Markdown reference links and autolinks](docs/adr/0042-markdown-reference-links-autolinks.md)
 - [Markdown reference definitions and shortcuts](docs/adr/0043-reference-definitions-shortcuts.md)
 - [Markdown task-list projection](docs/adr/0044-task-list-projection.md)
+- [Markdown list editing commands](docs/adr/0045-list-editing-commands.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

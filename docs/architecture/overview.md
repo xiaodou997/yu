@@ -138,6 +138,12 @@ projection/layout cache 失效与其他永久编辑一致，checkbox 的原生�
 阶段。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
+列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和
+marker（task 新项重置为 `[ ]`，ordered marker 在可表示范围内递增）；空 list/task item 的
+Enter 或 `DeleteBackward` 删除 prefix 以退出列表。`IndentList`/`OutdentList` 只对 parser 识别的
+list block 插入/删除两个 ASCII 空格，selection 仍由同一 ChangeSet 映射。当前行扫描只构造小的
+line-local 字符串，不物化完整 Snapshot。
+
 `yu-layout::LayoutSnapshot` 是 block-local、revision-bound 的纯 Rust 布局契约：它消费
 `Projection` 的 visible 与显式 LineBreak runs，按 grapheme cluster 生成 `VisualLine`/`VisualCluster`，并提供
 `LayoutCaret` 与 `LayoutHit` 的 source/visual 双向查询。当前默认只使用确定性的

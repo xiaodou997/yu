@@ -16,6 +16,9 @@
 3. Transaction 必须原子提交；任一 edit 非法时文档保持不变。
 4. 成功提交产生严格递增的新 Revision 和可应用的 inverse Transaction。
 5. 跨编辑长期存在的位置使用 Anchor，不使用裸 ByteOffset。
+6. `InsertNewline`、空 list item 的 `DeleteBackward`、`IndentList` 和 `OutdentList` 必须通过普通
+   Transaction 修改 source；task continuation 必须重置为 `[ ]`，ordered marker 只能在安全范围内
+   递增，不能创建富文本第二真源。
 
 ## Parsing
 
@@ -97,6 +100,8 @@
 7. task-list block 必须返回 `BlockProjection::TaskList`；projection 只能隐藏 parser-owned
    `TaskMarker` source range，不能删除 bullet 或任务文本。`EditorCommand::toggle_task` 必须只用
    普通 Transaction 替换 marker 状态字节，非 task block 必须拒绝且不改变文档。
+8. 列表编辑命令只能对当前 parser 识别的 `ListItem`/`TaskListItem` 行生效；空项退出必须保留
+   原有 line ending，Indent/Outdent 最多改动两个 ASCII 空格，selection 必须通过 ChangeSet 映射。
 
 ## Layout
 

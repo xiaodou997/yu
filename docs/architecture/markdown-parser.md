@@ -39,6 +39,13 @@ blockquote 和 list item 的源码范围包含其连续/lazy continuation 行；
 不会被识别为 task marker，仍然是普通 `ListItem`。该判断复用列表 marker 的最多三格缩进规则，
 并在完整解析与增量解析中通过 block kind/hash/source range 一起收敛。
 
+`yu-editor` 的列表命令不重新解析或序列化整个文档：它读取 caret 所在的 source line，并先确认
+该行属于 `ListItem`/`TaskListItem` block。非空项的 Enter 只插入同风格 line ending 和下一项
+prefix；task prefix 重置为 `[ ]`，ordered number 在安全范围内递增。空项 Enter/Backspace 删除
+整段 prefix 以退出列表，Indent/Outdent 则通过两个 ASCII 空格的普通 Transaction 修改行首。
+这些行为都经过 `MarkdownDocument` 增量重建，因而 block kind、projection 和 selection mapping
+仍然绑定同一个 Revision。
+
 `BlockSequence` 由不可变 `Arc<[BlockRecord]>` 分段组成。增量结果通常包含：
 
 ```text

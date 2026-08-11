@@ -16,6 +16,7 @@
 - [x] lossless Markdown block scanner
 - [x] blockquote/list item container-aware block CST v1（源码范围、深度和 marker metadata）
 - [x] task-list marker 的 source-backed block state、projection 隐藏与 toggle transaction
+- [x] list Enter continuation、空项退出、Indent/Outdent source command
 - [x] `yu-inspect` CLI
 - [x] 可重复运行的 parse/edit 参考 benchmark harness
 - [x] 持久化 Piece Tree 与 Persistent Rope 初代候选及共同 workload benchmark
@@ -170,6 +171,10 @@
     source range；attached marker 不得误判。`BlockProjection::TaskList` 只能隐藏 marker，
     `toggle_task` 必须通过普通 Transaction 修改状态，并让 projection cache 在 Revision 变化后
     失效。
+35. list editing command 必须只读取当前 source line；非空 task Enter 生成 unchecked prefix，
+    ordered marker 在安全范围内递增，空项 Enter/Backspace 删除 prefix 并保留 line ending，
+    Indent/Outdent 最多改动两个 ASCII 空格，所有结果都通过普通 Transaction 与 selection mapping
+    验证。
 
 ## 非目标
 
