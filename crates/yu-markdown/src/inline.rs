@@ -40,7 +40,8 @@ pub enum InlineNodeKind {
     LineBreak { hard: bool },
 }
 
-/// Punctuation retained as individual source-backed nodes for link parsing.
+/// Punctuation retained as individual source-backed nodes for link and
+/// autolink parsing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InlinePunctuation {
     Bang,
@@ -48,9 +49,11 @@ pub enum InlinePunctuation {
     CloseBracket,
     OpenParen,
     CloseParen,
+    AngleOpen,
+    AngleClose,
 }
 
-/// A semantic inline span recognized from a matched delimiter pair.
+/// A semantic inline span recognized by the lossless inline parser.
 ///
 /// The span keeps every source range needed by projection and editing. It does
 /// not own or normalize the text, and unmatched delimiters intentionally do
@@ -62,6 +65,9 @@ pub enum InlineSpanKind {
     CodeSpan,
     Link,
     Image,
+    ReferenceLink,
+    ReferenceImage,
+    Autolink,
 }
 
 /// Source ranges for one parser-owned semantic inline span.
@@ -73,6 +79,7 @@ pub struct InlineSpan {
     content: TextRange,
     closing: TextRange,
     destination: Option<TextRange>,
+    reference: Option<TextRange>,
 }
 
 impl InlineSpan {
@@ -101,11 +108,18 @@ impl InlineSpan {
         self.closing
     }
 
-    /// Returns the inline link destination, excluding surrounding angle
-    /// brackets and optional whitespace/title syntax.
+    /// Returns an inline link or autolink destination, excluding surrounding
+    /// angle brackets and optional whitespace/title syntax.
     #[must_use]
     pub const fn destination(self) -> Option<TextRange> {
         self.destination
+    }
+
+    /// Returns the source range inside the brackets of a reference link.
+    /// Empty ranges represent collapsed references such as `[label][]`.
+    #[must_use]
+    pub const fn reference(self) -> Option<TextRange> {
+        self.reference
     }
 }
 
@@ -377,6 +391,8 @@ fn punctuation_for(byte: u8) -> Option<InlinePunctuation> {
         b']' => Some(InlinePunctuation::CloseBracket),
         b'(' => Some(InlinePunctuation::OpenParen),
         b')' => Some(InlinePunctuation::CloseParen),
+        b'<' => Some(InlinePunctuation::AngleOpen),
+        b'>' => Some(InlinePunctuation::AngleClose),
         _ => None,
     }
 }
@@ -587,6 +603,8 @@ fn build_spans(
         }
     }
     spans.extend(build_link_spans(source, nodes, &code_pairs)?);
+    spans.extend(build_reference_link_spans(nodes, &code_pairs)?);
+    spans.extend(build_autolink_spans(source, nodes, &code_pairs)?);
 
     spans.sort_by_key(|span| {
         (
@@ -610,6 +628,7 @@ fn make_span(pair: DelimiterPair, kind: InlineSpanKind) -> Result<InlineSpan, In
         content,
         closing: pair.closing.range,
         destination: None,
+        reference: None,
     })
 }
 
@@ -712,9 +731,215 @@ fn build_link_spans(
             content,
             closing,
             destination: Some(destination),
+            reference: None,
         });
     }
     Ok(spans)
+}
+
+fn build_reference_link_spans(
+    nodes: &[InlineNode],
+    code_pairs: &[DelimiterPair],
+) -> Result<Vec<InlineSpan>, InlineParseError> {
+    let mut spans = Vec::new();
+    for (open_index, open_node) in nodes.iter().enumerate() {
+        if !matches!(
+            open_node.kind(),
+            InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::OpenBracket
+            }
+        ) || inside_code(open_node.range(), code_pairs)
+        {
+            continue;
+        }
+        let Some(close_index) = matching_bracket(nodes, open_index) else {
+            continue;
+        };
+        let Some(reference_open_index) = close_index.checked_add(1) else {
+            continue;
+        };
+        if !matches!(
+            nodes.get(reference_open_index).map(|node| node.kind()),
+            Some(InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::OpenBracket
+            })
+        ) {
+            continue;
+        }
+        let reference_open = nodes[reference_open_index];
+        if inside_code(reference_open.range(), code_pairs) {
+            continue;
+        }
+        let Some(reference_close_index) = matching_bracket(nodes, reference_open_index) else {
+            continue;
+        };
+        let reference_close = nodes[reference_close_index];
+        if inside_code(reference_close.range(), code_pairs) {
+            continue;
+        }
+        let close_node = nodes[close_index];
+        let image = open_index > 0
+            && matches!(
+                nodes[open_index - 1].kind(),
+                InlineNodeKind::Punctuation {
+                    kind: InlinePunctuation::Bang
+                }
+            )
+            && nodes[open_index - 1].range().end() == open_node.range().start();
+        let opening_start = if image {
+            nodes[open_index - 1].range().start()
+        } else {
+            open_node.range().start()
+        };
+        let source_range = TextRange::new(opening_start, reference_close.range().end())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        let content = TextRange::new(open_node.range().end(), close_node.range().start())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        let closing = TextRange::new(close_node.range().start(), reference_close.range().end())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        let reference = TextRange::new(
+            reference_open.range().end(),
+            reference_close.range().start(),
+        )
+        .ok_or(InlineParseError::OffsetOverflow)?;
+        spans.push(InlineSpan {
+            kind: if image {
+                InlineSpanKind::ReferenceImage
+            } else {
+                InlineSpanKind::ReferenceLink
+            },
+            source_range,
+            opening: TextRange::new(opening_start, open_node.range().end())
+                .ok_or(InlineParseError::OffsetOverflow)?,
+            content,
+            closing,
+            destination: None,
+            reference: Some(reference),
+        });
+    }
+    Ok(spans)
+}
+
+fn build_autolink_spans(
+    source: &TextSnapshot,
+    nodes: &[InlineNode],
+    code_pairs: &[DelimiterPair],
+) -> Result<Vec<InlineSpan>, InlineParseError> {
+    let mut spans = Vec::new();
+    for (open_index, open_node) in nodes.iter().enumerate() {
+        if !matches!(
+            open_node.kind(),
+            InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::AngleOpen
+            }
+        ) || inside_code(open_node.range(), code_pairs)
+        {
+            continue;
+        }
+        let mut close_index = None;
+        for (index, node) in nodes.iter().enumerate().skip(open_index + 1) {
+            match node.kind() {
+                InlineNodeKind::Punctuation {
+                    kind: InlinePunctuation::AngleClose,
+                } => {
+                    close_index = Some(index);
+                    break;
+                }
+                InlineNodeKind::Punctuation {
+                    kind: InlinePunctuation::AngleOpen,
+                }
+                | InlineNodeKind::LineBreak { .. } => break,
+                _ => {}
+            }
+        }
+        let Some(close_index) = close_index else {
+            continue;
+        };
+        let close_node = nodes[close_index];
+        if inside_code(close_node.range(), code_pairs) {
+            continue;
+        }
+        let content = TextRange::new(open_node.range().end(), close_node.range().start())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        if content.is_empty() || !is_valid_autolink(source, content)? {
+            continue;
+        }
+        let source_range = TextRange::new(open_node.range().start(), close_node.range().end())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        spans.push(InlineSpan {
+            kind: InlineSpanKind::Autolink,
+            source_range,
+            opening: open_node.range(),
+            content,
+            closing: close_node.range(),
+            destination: Some(content),
+            reference: None,
+        });
+    }
+    Ok(spans)
+}
+
+fn is_valid_autolink(source: &TextSnapshot, range: TextRange) -> Result<bool, InlineParseError> {
+    let cursor = InlineByteCursor::new(source, range)?;
+    let mut bytes = Vec::new();
+    for (_, byte) in cursor {
+        bytes.push(byte);
+    }
+    if bytes
+        .iter()
+        .any(|byte| byte.is_ascii_whitespace() || matches!(*byte, b'<' | b'>') || *byte >= 0x80)
+    {
+        return Ok(false);
+    }
+    if let Some(colon) = bytes.iter().position(|byte| *byte == b':') {
+        let scheme = &bytes[..colon];
+        if (2..=32).contains(&scheme.len())
+            && scheme[0].is_ascii_alphabetic()
+            && scheme[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'.' | b'-'))
+            && colon + 1 < bytes.len()
+        {
+            return Ok(true);
+        }
+    }
+    let Some(at) = bytes.iter().position(|byte| *byte == b'@') else {
+        return Ok(false);
+    };
+    if at == 0 || at + 1 >= bytes.len() || bytes[at + 1..].contains(&b'@') {
+        return Ok(false);
+    }
+    let local = &bytes[..at];
+    let domain = &bytes[at + 1..];
+    Ok(local.iter().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                *byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'/'
+                    | b'='
+                    | b'?'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'{'
+                    | b'|'
+                    | b'}'
+                    | b'~'
+                    | b'.'
+            ) && domain
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-'))
+                && !domain.starts_with(b".")
+                && !domain.ends_with(b".")
+    }))
 }
 
 fn matching_bracket(nodes: &[InlineNode], open_index: usize) -> Option<usize> {
@@ -1017,6 +1242,98 @@ mod tests {
             "img.png"
         );
         assert!(inline.has_lossless_coverage());
+    }
+
+    #[test]
+    fn reference_links_and_autolinks_keep_parser_owned_ranges() {
+        let source = "[Yu][project] ![logo][] <https://example.com> <dev@example.com> <div>";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = parse_inline(&snapshot, range).expect("inline parse should succeed");
+
+        let references = inline
+            .spans()
+            .iter()
+            .filter(|span| {
+                matches!(
+                    span.kind(),
+                    InlineSpanKind::ReferenceLink | InlineSpanKind::ReferenceImage
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0].kind(), InlineSpanKind::ReferenceLink);
+        assert_eq!(slice(source, references[0].content()), "Yu");
+        assert_eq!(
+            slice(source, references[0].reference().expect("reference label")),
+            "project"
+        );
+        assert_eq!(slice(source, references[0].opening()), "[");
+        assert_eq!(slice(source, references[0].closing()), "][project]");
+        assert_eq!(references[1].kind(), InlineSpanKind::ReferenceImage);
+        assert_eq!(slice(source, references[1].content()), "logo");
+        assert_eq!(
+            references[1]
+                .reference()
+                .expect("collapsed reference")
+                .len(),
+            0
+        );
+
+        let autolinks = inline
+            .spans()
+            .iter()
+            .filter(|span| span.kind() == InlineSpanKind::Autolink)
+            .collect::<Vec<_>>();
+        assert_eq!(autolinks.len(), 2);
+        assert_eq!(slice(source, autolinks[0].content()), "https://example.com");
+        assert_eq!(
+            slice(source, autolinks[0].destination().expect("URL destination")),
+            "https://example.com"
+        );
+        assert_eq!(slice(source, autolinks[1].content()), "dev@example.com");
+        assert!(
+            inline
+                .spans()
+                .iter()
+                .all(|span| { slice(source, span.source_range()) != "<div>" })
+        );
+        assert!(inline.has_lossless_coverage());
+    }
+
+    #[test]
+    fn reference_and_autolink_syntax_stays_literal_inside_code() {
+        let source = "`[Yu][id] <https://example.com>` [Yu][id]";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = parse_inline(&snapshot, range).expect("inline parse should succeed");
+
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::CodeSpan)
+                .count(),
+            1
+        );
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::ReferenceLink)
+                .count(),
+            1
+        );
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::Autolink)
+                .count(),
+            0
+        );
     }
 
     #[test]
