@@ -45,6 +45,22 @@ mod native {
             out_attachment: *mut *mut c_void,
         ) -> i32;
         pub fn yu_metal_detach_layer_from_view(attachment: *mut c_void);
+        // Probe-only AppKit host entry points are referenced by the ignored
+        // lifecycle test, not by the production backend path.
+        #[allow(dead_code)]
+        pub fn yu_metal_create_appkit_probe_host(
+            width: f64,
+            height: f64,
+            out_host: *mut *mut c_void,
+            out_view: *mut *mut c_void,
+        ) -> i32;
+        #[allow(dead_code)]
+        pub fn yu_metal_destroy_appkit_probe_host(host: *mut c_void);
+        #[allow(dead_code)]
+        pub fn yu_metal_run_appkit_on_main(
+            callback: Option<extern "C" fn(*mut c_void)>,
+            context: *mut c_void,
+        );
         pub fn yu_metal_resize_layer(
             layer: *mut c_void,
             pixel_width: f64,
@@ -1537,6 +1553,139 @@ mod tests {
         assert!(matches!(
             result,
             Ok(()) | Err(MetalRenderError::DrawableUnavailable)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    struct AppKitProbeState {
+        surface: MetalSurface,
+        renderer: MetalFrameRenderer,
+        plan: RenderPlan,
+        atlas: MetalAtlas,
+        first: Option<Result<(), MetalRenderError>>,
+        second: Option<Result<(), MetalRenderError>>,
+        attachment_error: Option<MetalRenderError>,
+        host_created: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    extern "C" fn run_appkit_probe(context: *mut std::ffi::c_void) {
+        use std::ptr::NonNull;
+
+        let state = unsafe { &mut *(context.cast::<AppKitProbeState>()) };
+        let mut host = std::ptr::null_mut();
+        let mut view = std::ptr::null_mut();
+        let created = unsafe {
+            native::yu_metal_create_appkit_probe_host(320.0, 180.0, &mut host, &mut view)
+        };
+        let Some(view) = NonNull::new(view) else {
+            return;
+        };
+        if created == 0 || host.is_null() {
+            return;
+        }
+        state.host_created = true;
+
+        match unsafe { state.surface.attach_to_view(view) } {
+            Ok(attachment) => {
+                state.first = Some(state.renderer.render_plan(
+                    &state.surface,
+                    &state.plan,
+                    &state.atlas,
+                ));
+                drop(attachment);
+            }
+            Err(error) => {
+                state.attachment_error = Some(error);
+            }
+        }
+
+        if state.attachment_error.is_none() {
+            let resize = MetalSurfaceConfig::new(300.0, 160.0, 2.0)
+                .and_then(|config| state.surface.resize(config).map(|()| config));
+            if resize.is_ok() {
+                match unsafe { state.surface.attach_to_view(view) } {
+                    Ok(attachment) => {
+                        state.second = Some(state.renderer.render_plan(
+                            &state.surface,
+                            &state.plan,
+                            &state.atlas,
+                        ));
+                        drop(attachment);
+                    }
+                    Err(error) => {
+                        state.attachment_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        unsafe { native::yu_metal_destroy_appkit_probe_host(host) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[ignore = "requires a macOS AppKit session with a Metal-capable device"]
+    #[test]
+    fn macos_appkit_attachment_resize_and_drawable_probe_are_live() {
+        use yu_core::Revision;
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{Rect, SceneBuilder};
+
+        let device = MetalDevice::system_default().expect("Metal device");
+        let surface = MetalSurface::new(
+            device.clone(),
+            MetalSurfaceConfig::new(320.0, 180.0, 2.0).expect("surface config"),
+        )
+        .expect("surface");
+        let mut scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 320.0, 180.0).expect("viewport"),
+        )
+        .expect("scene");
+        scene
+            .fill_rect(
+                Rect::new(0.0, 0.0, 320.0, 180.0).expect("background"),
+                Rgba8::new(24, 28, 36, 255),
+            )
+            .expect("background primitive");
+        scene
+            .fill_rect(
+                Rect::new(24.0, 24.0, 120.0, 48.0).expect("accent"),
+                Rgba8::new(220, 230, 240, 255),
+            )
+            .expect("accent primitive");
+        let atlas = yu_font::GlyphAtlas::new(
+            yu_font::GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"),
+        );
+        let plan = RenderPlanBuilder::new()
+            .build(&scene.finish(), &atlas)
+            .expect("render plan");
+        let state = AppKitProbeState {
+            surface,
+            renderer: MetalFrameRenderer::new(device).expect("renderer"),
+            plan,
+            atlas: MetalAtlas::new(),
+            first: None,
+            second: None,
+            attachment_error: None,
+            host_created: false,
+        };
+        let mut state = state;
+        unsafe {
+            native::yu_metal_run_appkit_on_main(
+                Some(run_appkit_probe),
+                (&mut state as *mut AppKitProbeState).cast::<std::ffi::c_void>(),
+            );
+        }
+        assert!(state.host_created, "AppKit probe host was not created");
+        assert!(state.attachment_error.is_none());
+        assert!(matches!(
+            state.first,
+            Some(Ok(())) | Some(Err(MetalRenderError::DrawableUnavailable))
+        ));
+        assert!(matches!(
+            state.second,
+            Some(Ok(())) | Some(Err(MetalRenderError::DrawableUnavailable))
         ));
     }
 }
