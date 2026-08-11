@@ -2,6 +2,7 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <dispatch/dispatch.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -41,6 +42,13 @@ typedef struct {
     CALayer *previous_layer;
     CAMetalLayer *metal_layer;
 } YuMetalViewAttachment;
+
+typedef struct {
+    NSWindow *window;
+    NSView *view;
+} YuMetalAppKitProbeHost;
+
+typedef void (*YuMetalAppKitCallback)(void *context);
 
 typedef struct {
     id<MTLRenderPipelineState> clear_pipeline;
@@ -154,6 +162,83 @@ void yu_metal_detach_layer_from_view(void *attachment_ptr) {
     [attachment->previous_layer release];
     [attachment->metal_layer release];
     free(attachment);
+}
+
+int yu_metal_create_appkit_probe_host(
+    double width,
+    double height,
+    void **out_host,
+    void **out_view
+) {
+    if (width <= 0.0 || height <= 0.0 || out_host == NULL || out_view == NULL) {
+        return 0;
+    }
+    YuMetalAppKitProbeHost *host = calloc(1, sizeof(YuMetalAppKitProbeHost));
+    if (host == NULL) {
+        return 0;
+    }
+
+    NSApplication *application = [NSApplication sharedApplication];
+    [application setActivationPolicy:NSApplicationActivationPolicyRegular];
+    NSRect frame = NSMakeRect(0.0, 0.0, width, height);
+    NSWindow *window = [[NSWindow alloc]
+        initWithContentRect:frame
+                  styleMask:(NSWindowStyleMaskTitled
+                             | NSWindowStyleMaskClosable
+                             | NSWindowStyleMaskResizable)
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    if (window == nil) {
+        free(host);
+        return 0;
+    }
+    NSView *view = [[NSView alloc] initWithFrame:frame];
+    if (view == nil) {
+        [window release];
+        free(host);
+        return 0;
+    }
+    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [window setContentView:view];
+    [window center];
+    [window makeKeyAndOrderFront:nil];
+    [application activateIgnoringOtherApps:YES];
+    [window displayIfNeeded];
+
+    host->window = window;
+    host->view = view;
+    *out_host = (void *)host;
+    *out_view = (void *)view;
+    return 1;
+}
+
+void yu_metal_destroy_appkit_probe_host(void *host_ptr) {
+    if (host_ptr == NULL) {
+        return;
+    }
+    YuMetalAppKitProbeHost *host = (YuMetalAppKitProbeHost *)host_ptr;
+    [host->window orderOut:nil];
+    [host->window close];
+    [host->view release];
+    [host->window release];
+    free(host);
+}
+
+void yu_metal_run_appkit_on_main(YuMetalAppKitCallback callback, void *context) {
+    if (callback == NULL) {
+        return;
+    }
+    if ([NSThread isMainThread]) {
+        @autoreleasepool {
+            callback(context);
+        }
+        return;
+    }
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            callback(context);
+        }
+    });
 }
 
 int yu_metal_resize_layer(

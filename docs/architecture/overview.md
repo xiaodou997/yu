@@ -195,4 +195,7 @@ generation 变化时 full clear，后续 frame 在 retained color target 上使�
 list，最后把完整 target blit 到当前 drawable。`RenderPlan` 仍只携带 owned geometry、
 颜色和 page id，GPU texture 只存在 `MetalAtlas`。`MetalSurface::attach_to_view` 只托管外部
 AppKit `NSView` 的 backing layer，并用 scoped attachment 恢复原 layer；它不创建窗口。无
-Metal device 或有效 drawable 的会话默认跳过硬件测试，需显式运行 ignored test。
+Metal device 或有效 drawable 的会话默认跳过硬件测试，需显式运行 ignored test。当前还有一个
+probe-only AppKit host ignored test：它在主线程创建临时 `NSWindow`/`NSView`，实测 attachment、resize、
+drawable acquisition 和 scoped detach，然后立即销毁 host；该 host 不属于产品 UI，也不改变 backend
+不创建窗口的所有权边界。

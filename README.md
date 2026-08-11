@@ -100,6 +100,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS clear frame lifecycle](docs/adr/0035-macos-clear-present-frame.md)
 - [macOS retained Metal plan pipeline](docs/adr/0036-macos-retained-metal-plan-pipeline.md)
 - [macOS AppKit attachment and damage frame](docs/adr/0037-macos-appkit-attachment-damage-frame.md)
+- [macOS AppKit host probe](docs/adr/0038-macos-appkit-host-probe.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

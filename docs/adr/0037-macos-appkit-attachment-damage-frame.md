@@ -33,8 +33,9 @@ damage rectangles 影响 GPU 工作量；这一步仍不应创建窗口、菜单
 - 稳定 revision 的渲染工作限制在 damage 区域，glyph/rect command 顺序和 atlas ownership 保持
   0036 的契约。
 - drawable 每帧只承担最终 present；target 尺寸不匹配时拒绝提交，而不是在错误尺寸上截断内容。
-- 无窗口测试可以验证 damage clipping；真实 view attachment、drawable 和 scissor 仍需有图形
-  session 的 ignored test 或后续 AppKit shell 验证。
+- 无窗口测试可以验证 damage clipping；当前通过独立的 probe-only AppKit host ignored test 在主线程
+  创建临时 `NSWindow`/`NSView`，覆盖真实 view attachment、resize、drawable 和 scoped detach，而不
+  把窗口创建职责移入产品 backend。
 
 ## 限制
 

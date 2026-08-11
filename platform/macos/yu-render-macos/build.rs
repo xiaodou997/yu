@@ -18,7 +18,7 @@ fn main() {
 
     run(
         Command::new("clang")
-            .args(["-fno-objc-arc", "-fmodules", "-c"])
+            .args(["-fno-objc-arc", "-fblocks", "-fmodules", "-c"])
             .arg(format!(
                 "-fmodules-cache-path={}",
                 out_dir.join("module-cache").display()

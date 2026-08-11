@@ -69,6 +69,7 @@
 - [x] macOS `NSView` ↔ `CAMetalLayer` scoped attachment 与 backing layer 恢复契约
 - [x] Metal surface generation-aware full clear、damage clipping 与 scissor redraw
 - [x] Metal backend-owned retained color target 与 drawable blit 生命周期
+- [x] probe-only AppKit main-thread host lifecycle test harness（真实 Metal session 按条件运行）
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
 - [ ] VoiceOver 实际朗读质量验证
@@ -141,6 +142,9 @@
     有条件地恢复旧 layer；首次 frame/resize/target rebuild 后 full clear，稳定 revision 的后续
     frame 只在 backend-owned retained target 上清除并重绘裁剪后的 damage 区域，再 blit 到 drawable。
     无窗口单元测试必须验证 damage clipping 和 generation 状态转换。
+28. 有图形 session 时，ignored AppKit host probe 必须在 main thread 创建临时 host，完成至少一次
+    attach/render、resize/render 和 scoped detach；probe 失败不能被默认无窗口 workspace 测试误判为
+    产品逻辑失败。
 
 ## 非目标
 
