@@ -92,6 +92,57 @@ int yu_metal_upload_alpha_texture(
     return 1;
 }
 
+int yu_metal_create_command_queue(void *device_ptr, void **out_queue) {
+    if (device_ptr == NULL || out_queue == NULL) {
+        return 0;
+    }
+    id<MTLCommandQueue> queue = [(id<MTLDevice>)device_ptr newCommandQueue];
+    if (queue == nil) {
+        return 0;
+    }
+    *out_queue = (void *)queue;
+    return 1;
+}
+
+int yu_metal_clear_and_present(
+    void *queue_ptr,
+    void *layer_ptr,
+    float red,
+    float green,
+    float blue,
+    float alpha
+) {
+    if (queue_ptr == NULL || layer_ptr == NULL) {
+        return 0;
+    }
+    id<CAMetalDrawable> drawable = [(CAMetalLayer *)layer_ptr nextDrawable];
+    if (drawable == nil) {
+        return 2;
+    }
+    id<MTLCommandBuffer> command_buffer = [(id<MTLCommandQueue>)queue_ptr commandBuffer];
+    if (command_buffer == nil) {
+        return 3;
+    }
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (pass == nil) {
+        return 4;
+    }
+    MTLRenderPassColorAttachmentDescriptor *color = pass.colorAttachments[0];
+    color.texture = drawable.texture;
+    color.loadAction = MTLLoadActionClear;
+    color.storeAction = MTLStoreActionStore;
+    color.clearColor = MTLClearColorMake(red, green, blue, alpha);
+    id<MTLRenderCommandEncoder> encoder =
+        [command_buffer renderCommandEncoderWithDescriptor:pass];
+    if (encoder == nil) {
+        return 4;
+    }
+    [encoder endEncoding];
+    [command_buffer presentDrawable:drawable];
+    [command_buffer commit];
+    return 1;
+}
+
 void yu_metal_release(void *object) {
     if (object != NULL) {
         [(id)object release];
