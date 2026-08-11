@@ -14,6 +14,7 @@
 - [x] ChangeSet、Anchor 映射和 inverse Transaction
 - [x] 参考 UTF-8 文本后端
 - [x] lossless Markdown block scanner
+- [x] blockquote/list item container-aware block CST v1（源码范围、深度和 marker metadata）
 - [x] `yu-inspect` CLI
 - [x] 可重复运行的 parse/edit 参考 benchmark harness
 - [x] 持久化 Piece Tree 与 Persistent Rope 初代候选及共同 workload benchmark
@@ -145,6 +146,9 @@
 28. 有图形 session 时，ignored AppKit host probe 必须在 main thread 创建临时 host，完成至少一次
     attach/render、resize/render 和 scoped detach；probe 失败不能被默认无窗口 workspace 测试误判为
     产品逻辑失败。
+29. block CST v1 的 block range 必须覆盖源码且不重叠；blockquote/list item 的 marker、depth 和
+    lazy continuation 必须在 full parse 与 incremental parse 中一致，attached marker 不能误判为
+    list item。
 
 ## 非目标
 

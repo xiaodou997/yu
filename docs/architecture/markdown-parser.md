@@ -9,14 +9,27 @@ TextSnapshot
     ↓ ChunkCursor
 single-pass line scan
     ↓
-LineAnalysis + composable source hash
+LineAnalysis + container marker + composable source hash
     ↓
-persistent lossless BlockSequence
+persistent lossless BlockSequence / flat block CST v1
 ```
 
 行扫描跨 Piece/rope leaf 保留 CRLF 原始 byte range。`LineAnalysis` 只缓存 block 分类需要的有限
 状态，不复制普通正文。每行在同一次扫描中计算可组合 hash，block 不需要再次查找源码。
 parser 前后 retained Snapshot 的 materialized buffer 数必须不变。
+
+当前 block CST v1 的节点仍是 source-backed root-level `Block`，不会复制源码或生成 HTML：
+
+```text
+BlankLine | Paragraph | AtxHeading | FencedCodeBlock
+BlockQuote { depth }
+ListItem { ordered, depth, marker, start }
+```
+
+blockquote 和 list item 的源码范围包含其连续/lazy continuation 行；嵌套 list 先以更大的
+`depth` 记录为独立 source range。这样 block sequence、projection cache 和 layout cache 可以
+先消费稳定的 `(range, kind)`，真正的 child arena 和稳定 node identity 留到有第二个消费者后再
+抽取为通用 syntax crate。
 
 `BlockSequence` 由不可变 `Arc<[BlockRecord]>` 分段组成。增量结果通常包含：
 
@@ -91,6 +104,6 @@ lossless coverage == true
 document revision == snapshot revision
 ```
 
-当前 Phase 1 block state 覆盖 normal/fenced EOF 状态；完整 CommonMark 容器栈、inline 增量状态
-和稳定 syntax node identity 仍待后续阶段定义。每种新状态都必须继续通过随机 differential test
-和围栏类病理 edit。
+当前 block state 覆盖 normal/fenced EOF 状态，container marker 已参与 block 边界和收敛比较；
+完整 CommonMark 容器栈、inline 增量状态和稳定 syntax node identity 仍待后续阶段定义。每种新
+状态都必须继续通过随机 differential test 和围栏/列表类病理 edit。

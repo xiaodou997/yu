@@ -4,21 +4,40 @@ use std::sync::Arc;
 
 use yu_core::{ByteOffset, TextRange};
 
-/// The block shapes recognized by the Phase 1 scanner.
+/// The block shapes recognized by the lossless block parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     BlankLine,
     Paragraph,
-    AtxHeading { level: u8 },
-    FencedCodeBlock { marker: char, closed: bool },
+    AtxHeading {
+        level: u8,
+    },
+    FencedCodeBlock {
+        marker: char,
+        closed: bool,
+    },
+    /// A contiguous blockquote segment. `depth` is the number of leading
+    /// quote markers recognized at the block boundary.
+    BlockQuote {
+        depth: u8,
+    },
+    /// One list item, including any indented continuation lines that belong to
+    /// it. Nested items are represented as separate records with a larger
+    /// `depth`; source ranges remain the canonical structure for now.
+    ListItem {
+        ordered: bool,
+        depth: u8,
+        marker: char,
+        start: u32,
+    },
 }
 
 /// Parser state at a reusable block boundary.
 ///
-/// Phase 1 materializes a complete fenced block as one block, so reusable
-/// boundaries are normally `Normal`. The fenced state records an unterminated
-/// block at EOF and keeps the synchronization contract explicit for future
-/// container and inline states.
+/// A parser state at a reusable block boundary. Phase 1 materializes complete
+/// fenced/container segments as blocks, so reusable boundaries are normally
+/// `Normal`. Non-normal states remain explicit so incremental convergence can
+/// grow to nested containers without changing the record contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockState {
     #[default]
@@ -29,7 +48,10 @@ pub enum BlockState {
     },
 }
 
-/// A block that refers to source without owning or normalizing its text.
+/// A root-level lossless CST node that refers to source without owning or
+/// normalizing its text. Container nodes currently use `BlockKind` metadata
+/// and source ranges; a nested child arena is intentionally deferred until a
+/// second consumer needs stable node identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Block {
     pub(crate) kind: BlockKind,

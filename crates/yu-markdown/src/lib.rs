@@ -292,6 +292,41 @@ impl Line {
         }
         u8::try_from(analysis.prefix_count).ok()
     }
+
+    fn block_marker(self) -> Option<LineMarker> {
+        if !self.analysis.indent_valid {
+            return None;
+        }
+        let depth = u8::try_from(self.analysis.leading_spaces / 2).ok()?;
+        match self.analysis.prefix {
+            Some('>') => Some(LineMarker::BlockQuote { depth: 1 }),
+            Some(marker @ ('-' | '+' | '*'))
+                if self.analysis.prefix_count == 1
+                    && self.analysis.after_prefix.is_none_or(is_markdown_space) =>
+            {
+                Some(LineMarker::List {
+                    ordered: false,
+                    depth,
+                    marker,
+                    start: 1,
+                })
+            }
+            Some('0'..='9')
+                if self.analysis.ordered_digits > 0
+                    && self.analysis.ordered_digits <= 9
+                    && matches!(self.analysis.after_prefix, Some('.' | ')'))
+                    && self.analysis.marker_following.is_none_or(is_markdown_space) =>
+            {
+                Some(LineMarker::List {
+                    ordered: true,
+                    depth,
+                    marker: self.analysis.after_prefix.unwrap_or('.'),
+                    start: self.analysis.ordered_value.unwrap_or(1),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -303,6 +338,9 @@ struct LineAnalysis {
     prefix: Option<char>,
     prefix_count: usize,
     after_prefix: Option<char>,
+    marker_following: Option<char>,
+    ordered_value: Option<u32>,
+    ordered_digits: usize,
     tail_whitespace: bool,
 }
 
@@ -316,6 +354,9 @@ impl Default for LineAnalysis {
             prefix: None,
             prefix_count: 0,
             after_prefix: None,
+            marker_following: None,
+            ordered_value: None,
+            ordered_digits: 0,
             tail_whitespace: true,
         }
     }
@@ -341,22 +382,46 @@ impl LineAnalysis {
             } else {
                 self.prefix = Some(character);
                 self.prefix_count = 1;
-                if !matches!(character, '#' | '`' | '~') {
+                if !matches!(character, '#' | '`' | '~' | '>' | '-' | '+' | '*')
+                    && !character.is_ascii_digit()
+                {
                     self.syntax_done = true;
+                }
+                if character.is_ascii_digit() {
+                    self.ordered_value = character.to_digit(10);
+                    self.ordered_digits = 1;
                 }
             }
             return;
         };
 
-        if self.after_prefix.is_none() && character == prefix {
+        if self.after_prefix.is_none() && character == prefix && matches!(prefix, '#' | '`' | '~') {
             self.prefix_count += 1;
+            return;
+        }
+        if self.after_prefix.is_none()
+            && prefix.is_ascii_digit()
+            && character.is_ascii_digit()
+            && self.ordered_digits < 9
+        {
+            self.ordered_value = self.ordered_value.and_then(|value| {
+                value
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(character.to_digit(10)?))
+            });
+            self.ordered_digits += 1;
             return;
         }
         if self.after_prefix.is_none() {
             self.after_prefix = Some(character);
+        } else if prefix.is_ascii_digit() && self.marker_following.is_none() {
+            self.marker_following = Some(character);
         }
         self.tail_whitespace &= character.is_whitespace();
-        if prefix == '#' || !self.tail_whitespace {
+        let ordered_delimiter_pending = prefix.is_ascii_digit()
+            && matches!(self.after_prefix, Some('.' | ')'))
+            && self.marker_following.is_none();
+        if prefix == '#' || (!self.tail_whitespace && !ordered_delimiter_pending) {
             self.syntax_done = true;
         }
     }
@@ -366,6 +431,23 @@ impl LineAnalysis {
 struct Fence {
     marker: char,
     count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineMarker {
+    BlockQuote {
+        depth: u8,
+    },
+    List {
+        ordered: bool,
+        depth: u8,
+        marker: char,
+        start: u32,
+    },
+}
+
+fn is_markdown_space(character: char) -> bool {
+    matches!(character, ' ' | '\t')
 }
 
 /// Scans an immutable Snapshot without materializing a contiguous source copy.
@@ -606,6 +688,10 @@ impl Iterator for BlockParser<'_> {
             ));
         }
 
+        if let Some(marker) = line.block_marker() {
+            return Some(self.parse_container(line, marker));
+        }
+
         let block_start = line.start;
         let mut end = line.end;
         let mut source_hash = line.source_hash;
@@ -613,6 +699,7 @@ impl Iterator for BlockParser<'_> {
             if candidate.is_blank()
                 || candidate.opening_fence().is_some()
                 || candidate.atx_heading_level().is_some()
+                || candidate.block_marker().is_some()
             {
                 break;
             }
@@ -630,6 +717,66 @@ impl Iterator for BlockParser<'_> {
             BlockState::Normal,
             source_hash,
         ))
+    }
+}
+
+impl BlockParser<'_> {
+    fn parse_container(&mut self, first: Line, marker: LineMarker) -> BlockRecord {
+        let block_start = first.start;
+        let mut end = first.end;
+        let mut source_hash = first.source_hash;
+
+        while let Some(candidate) = self.lines.peek().copied() {
+            if candidate.is_blank()
+                || candidate.opening_fence().is_some()
+                || candidate.atx_heading_level().is_some()
+            {
+                break;
+            }
+
+            match (marker, candidate.block_marker()) {
+                (
+                    LineMarker::BlockQuote { depth },
+                    Some(LineMarker::BlockQuote { depth: next }),
+                ) if depth == next => {
+                    self.consume_line(&mut end, &mut source_hash);
+                }
+                (LineMarker::BlockQuote { .. }, Some(_)) | (LineMarker::List { .. }, Some(_)) => {
+                    break;
+                }
+                (_, None) => {
+                    // A non-marked line is a lazy continuation of the current
+                    // container. Keeping it in the same source range avoids
+                    // inventing a second canonical text representation.
+                    self.consume_line(&mut end, &mut source_hash);
+                }
+            }
+        }
+
+        let kind = match marker {
+            LineMarker::BlockQuote { depth } => BlockKind::BlockQuote { depth },
+            LineMarker::List {
+                ordered,
+                depth,
+                marker,
+                start,
+            } => BlockKind::ListItem {
+                ordered,
+                depth,
+                marker,
+                start,
+            },
+        };
+        self.record(kind, block_start, end, BlockState::Normal, source_hash)
+    }
+
+    fn consume_line(&mut self, end: &mut usize, source_hash: &mut SourceHash) {
+        let line = self
+            .lines
+            .next()
+            .expect("a peeked container continuation must remain available");
+        *end = line.end;
+        *source_hash = concatenate_hash(*source_hash, line.source_hash, line.end - line.start);
     }
 }
 
@@ -949,6 +1096,86 @@ mod tests {
             assert_eq!(kind_at(&document, 0), expected, "source {source:?}");
             assert!(document.has_lossless_coverage());
         }
+    }
+
+    #[test]
+    fn scanner_classifies_blockquotes_and_list_items_without_losing_ranges() {
+        let source = "> quoted\n> continued\n\n- one\n  continuation\n  - nested\n- two\n\n1. first\n2) second\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let document = parse(&snapshot);
+
+        assert!(document.has_lossless_coverage());
+        assert_eq!(document.blocks().len(), 8);
+        assert_eq!(kind_at(&document, 0), BlockKind::BlockQuote { depth: 1 });
+        assert_eq!(kind_at(&document, 1), BlockKind::BlankLine);
+        assert_eq!(
+            kind_at(&document, 2),
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+                marker: '-',
+                start: 1,
+            }
+        );
+        assert_eq!(
+            kind_at(&document, 3),
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 1,
+                marker: '-',
+                start: 1,
+            }
+        );
+        assert_eq!(
+            kind_at(&document, 4),
+            BlockKind::ListItem {
+                ordered: false,
+                depth: 0,
+                marker: '-',
+                start: 1,
+            }
+        );
+        assert_eq!(kind_at(&document, 5), BlockKind::BlankLine);
+        assert_eq!(
+            kind_at(&document, 6),
+            BlockKind::ListItem {
+                ordered: true,
+                depth: 0,
+                marker: '.',
+                start: 1,
+            }
+        );
+        assert_eq!(
+            kind_at(&document, 7),
+            BlockKind::ListItem {
+                ordered: true,
+                depth: 0,
+                marker: ')',
+                start: 2,
+            }
+        );
+
+        let reconstructed: String = document
+            .blocks()
+            .iter()
+            .map(|block| {
+                let start = usize::try_from(block.range().start()).expect("offset fits usize");
+                let end = usize::try_from(block.range().end()).expect("offset fits usize");
+                &snapshot.as_str()[start..end]
+            })
+            .collect();
+        assert_eq!(reconstructed, source);
+    }
+
+    #[test]
+    fn scanner_does_not_treat_attached_markers_as_list_items() {
+        let source = "-attached\n1.attached\n*attached\n";
+        let document = parse(&TextBuffer::new(source).snapshot());
+
+        assert_eq!(document.blocks().len(), 1);
+        assert_eq!(kind_at(&document, 0), BlockKind::Paragraph);
+        assert!(document.has_lossless_coverage());
     }
 
     #[test]
