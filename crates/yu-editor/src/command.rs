@@ -18,6 +18,8 @@ pub enum EditorCommand {
     InsertNewline,
     IndentList,
     OutdentList,
+    Undo,
+    Redo,
     ToggleTask { block: usize },
 }
 
@@ -45,6 +47,16 @@ impl EditorCommand {
     #[must_use]
     pub const fn outdent_list() -> Self {
         Self::OutdentList
+    }
+
+    #[must_use]
+    pub const fn undo() -> Self {
+        Self::Undo
+    }
+
+    #[must_use]
+    pub const fn redo() -> Self {
+        Self::Redo
     }
 }
 

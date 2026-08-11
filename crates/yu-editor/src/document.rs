@@ -15,6 +15,7 @@ use crate::{
     ProjectionCacheStats, ProjectionError, SelectionError, ViewportConfig, ViewportError,
     ViewportLayout, ViewportRect, ViewportSnapshot, ViewportStats,
     command::{next_grapheme_boundary, previous_grapheme_boundary},
+    history::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats},
     list::ListLinePrefix,
 };
 
@@ -29,6 +30,7 @@ pub struct EditorDocument {
     markdown: MarkdownDocument,
     composition: Option<CompositionOverlay>,
     selection: EditorSelection,
+    history: EditorHistory,
     projections: ProjectionCache,
     layouts: LayoutCache,
     viewport: ViewportLayout,
@@ -52,6 +54,7 @@ impl EditorDocument {
             markdown,
             composition: None,
             selection,
+            history: EditorHistory::default(),
             projections: ProjectionCache::default(),
             layouts: LayoutCache::default(),
             viewport: ViewportLayout::default(),
@@ -87,6 +90,12 @@ impl EditorDocument {
     #[must_use]
     pub const fn selection(&self) -> EditorSelection {
         self.selection
+    }
+
+    /// Returns the bounded undo/redo depth for the current editor session.
+    #[must_use]
+    pub fn history_stats(&self) -> HistoryStats {
+        self.history.stats()
     }
 
     /// Returns the source-backed projection for a range in the current
@@ -323,6 +332,7 @@ impl EditorDocument {
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), SelectionError> {
         selection.utf16_range(&self.snapshot())?;
         self.selection = selection;
+        self.history.break_group();
         Ok(())
     }
 
@@ -332,6 +342,23 @@ impl EditorDocument {
     /// transaction advances the revision, a later composition commit will
     /// return a stale-revision error and the platform can cancel/restart it.
     pub fn apply_transaction(
+        &mut self,
+        transaction: &Transaction,
+    ) -> Result<AppliedTransaction, EditorDocumentError> {
+        self.apply_transaction_with_group(transaction, HistoryGroup::External)
+    }
+
+    fn apply_transaction_with_group(
+        &mut self,
+        transaction: &Transaction,
+        group: HistoryGroup,
+    ) -> Result<AppliedTransaction, EditorDocumentError> {
+        let applied = self.apply_transaction_core(transaction)?;
+        self.history.record(&applied, group);
+        Ok(applied)
+    }
+
+    fn apply_transaction_core(
         &mut self,
         transaction: &Transaction,
     ) -> Result<AppliedTransaction, EditorDocumentError> {
@@ -379,6 +406,7 @@ impl EditorDocument {
         selection_utf16: Utf16Range,
     ) -> Result<(), EditorDocumentError> {
         self.validate_source_range(replacement_range)?;
+        self.history.break_group();
         self.composition = Some(CompositionOverlay::new(
             self.revision(),
             replacement_range,
@@ -425,7 +453,7 @@ impl EditorDocument {
         let replacement_range = composition.replacement_range();
         let committed_text: Arc<str> = committed_text.into();
         let transaction = composition.clone().commit(Arc::clone(&committed_text));
-        let applied = self.apply_transaction(&transaction)?;
+        let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::Composition)?;
         let cursor_offset = replacement_range
             .start()
             .checked_add(
@@ -439,13 +467,18 @@ impl EditorDocument {
             crate::CaretAffinity::Downstream,
         )?;
         self.composition = None;
+        self.history.break_group();
         Ok(applied)
     }
 
     /// Drops the active overlay without changing source or revision.
     #[must_use]
     pub fn cancel_composition(&mut self) -> bool {
-        self.composition.take().is_some()
+        let cancelled = self.composition.take().is_some();
+        if cancelled {
+            self.history.break_group();
+        }
+        cancelled
     }
 
     /// Replaces the source for a newly opened document and resets its revision.
@@ -458,6 +491,7 @@ impl EditorDocument {
         self.projections.clear();
         self.layouts.clear();
         self.viewport.clear();
+        self.history.clear();
         let snapshot = self.snapshot();
         self.selection = EditorSelection::cursor(
             &snapshot,
@@ -482,6 +516,8 @@ impl EditorDocument {
             EditorCommand::InsertNewline => self.insert_newline(),
             EditorCommand::IndentList => self.indent_list(),
             EditorCommand::OutdentList => self.outdent_list(),
+            EditorCommand::Undo => self.undo(),
+            EditorCommand::Redo => self.redo(),
             EditorCommand::ToggleTask { block } => self.toggle_task(block),
         }
     }
@@ -524,7 +560,67 @@ impl EditorDocument {
                 replacement,
             )],
         );
-        self.apply_transaction(&transaction)?;
+        self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
+        Ok(self.command_result(true))
+    }
+
+    /// Replays one grouped set of inverse transactions without recording the
+    /// replay itself as a new edit. The inverse of each replay becomes the
+    /// corresponding redo transaction.
+    pub fn undo(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let Some(entries) = self.history.pop_undo_group() else {
+            self.history.break_group();
+            return Ok(self.command_result(false));
+        };
+        let mut redo = Vec::with_capacity(entries.len());
+        let mut rollback = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let transaction = entry.transaction_for(self.revision());
+            match self.apply_transaction_core(&transaction) {
+                Ok(applied) => {
+                    rollback.push(applied.inverse().clone());
+                    redo.push(HistoryEntry::new(applied.inverse().clone(), entry.group()));
+                }
+                Err(error) => {
+                    for transaction in rollback.iter().rev() {
+                        let _ = self.apply_transaction_core(transaction);
+                    }
+                    self.history.restore_undo_group(&entries);
+                    return Err(error);
+                }
+            }
+        }
+        self.history.push_redo_group(redo);
+        Ok(self.command_result(true))
+    }
+
+    /// Replays one grouped set of forward transactions without recording the
+    /// replay itself as a new edit. The inverse of each replay is restored to
+    /// the undo stack in the original stack order.
+    pub fn redo(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let Some(entries) = self.history.pop_redo_group() else {
+            self.history.break_group();
+            return Ok(self.command_result(false));
+        };
+        let mut undo = Vec::with_capacity(entries.len());
+        let mut rollback = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let transaction = entry.transaction_for(self.revision());
+            match self.apply_transaction_core(&transaction) {
+                Ok(applied) => {
+                    rollback.push(applied.inverse().clone());
+                    undo.push(HistoryEntry::new(applied.inverse().clone(), entry.group()));
+                }
+                Err(error) => {
+                    for transaction in rollback.iter().rev() {
+                        let _ = self.apply_transaction_core(transaction);
+                    }
+                    self.history.restore_redo_group(&entries);
+                    return Err(error);
+                }
+            }
+        }
+        self.history.push_undo_group(undo);
         Ok(self.command_result(true))
     }
 
@@ -553,7 +649,8 @@ impl EditorDocument {
                         self.revision(),
                         [yu_text::Edit::new(line.content_range(), "")],
                     );
-                    let applied = self.apply_transaction(&transaction)?;
+                    let applied =
+                        self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
                     self.selection = EditorSelection::cursor(
                         applied.result_snapshot(),
                         line.start,
@@ -576,7 +673,8 @@ impl EditorDocument {
                         insertion.as_str(),
                     )],
                 );
-                let applied = self.apply_transaction(&transaction)?;
+                let applied =
+                    self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
                 self.selection = EditorSelection::cursor(
                     applied.result_snapshot(),
                     offset,
@@ -598,7 +696,7 @@ impl EditorDocument {
             self.revision(),
             [yu_text::Edit::new(selection_range, insertion.as_str())],
         );
-        let applied = self.apply_transaction(&transaction)?;
+        let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
         self.selection = EditorSelection::cursor(
             applied.result_snapshot(),
             offset,
@@ -618,7 +716,7 @@ impl EditorDocument {
             self.revision(),
             [yu_text::Edit::new(TextRange::empty(line.start), "  ")],
         );
-        self.apply_transaction(&transaction)?;
+        self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
         Ok(self.command_result(true))
     }
 
@@ -649,7 +747,7 @@ impl EditorDocument {
         let range = TextRange::new(line.start, end)
             .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
         let transaction = Transaction::new(self.revision(), [yu_text::Edit::new(range, "")]);
-        self.apply_transaction(&transaction)?;
+        self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
         Ok(self.command_result(true))
     }
 
@@ -669,7 +767,7 @@ impl EditorDocument {
             self.revision(),
             [yu_text::Edit::new(range, Arc::clone(&text))],
         );
-        let applied = self.apply_transaction(&transaction)?;
+        let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::Typing)?;
         self.selection = EditorSelection::cursor(
             applied.result_snapshot(),
             offset,
@@ -691,7 +789,7 @@ impl EditorDocument {
         } else {
             self.selection.ordered_range()
         };
-        self.delete_range(range)
+        self.delete_range(range, HistoryGroup::Deletion)
     }
 
     fn delete_empty_list_prefix(&mut self) -> Result<Option<CommandResult>, EditorDocumentError> {
@@ -714,7 +812,7 @@ impl EditorDocument {
             self.revision(),
             [yu_text::Edit::new(line.content_range(), "")],
         );
-        let applied = self.apply_transaction(&transaction)?;
+        let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
         self.selection = EditorSelection::cursor(
             applied.result_snapshot(),
             line.start,
@@ -731,10 +829,14 @@ impl EditorDocument {
         } else {
             self.selection.ordered_range()
         };
-        self.delete_range(range)
+        self.delete_range(range, HistoryGroup::Deletion)
     }
 
-    fn delete_range(&mut self, range: TextRange) -> Result<CommandResult, EditorDocumentError> {
+    fn delete_range(
+        &mut self,
+        range: TextRange,
+        group: HistoryGroup,
+    ) -> Result<CommandResult, EditorDocumentError> {
         if range.is_empty() {
             return Ok(self.command_result(false));
         }
@@ -742,7 +844,7 @@ impl EditorDocument {
             self.revision(),
             [yu_text::Edit::new(range, Arc::<str>::from(""))],
         );
-        let applied = self.apply_transaction(&transaction)?;
+        let applied = self.apply_transaction_with_group(&transaction, group)?;
         self.selection = EditorSelection::cursor(
             applied.result_snapshot(),
             range.start(),
@@ -752,6 +854,7 @@ impl EditorDocument {
     }
 
     fn move_left(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        self.history.break_group();
         let target = if self.selection.is_empty() {
             previous_grapheme_boundary(&self.snapshot(), self.selection.focus())?
         } else {
@@ -763,6 +866,7 @@ impl EditorDocument {
     }
 
     fn move_right(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        self.history.break_group();
         let target = if self.selection.is_empty() {
             next_grapheme_boundary(&self.snapshot(), self.selection.focus())?
         } else {
@@ -1266,6 +1370,119 @@ mod tests {
             .execute(EditorCommand::insert_newline())
             .expect("fenced code newline should apply");
         assert_eq!(document.snapshot().as_str(), "```\n- [ ] code\n\n```\n");
+    }
+
+    #[test]
+    fn undo_groups_typing_and_redoes_in_forward_order() {
+        let mut document = EditorDocument::new("");
+        document
+            .execute(EditorCommand::insert_text("a"))
+            .expect("first insert should apply");
+        document
+            .execute(EditorCommand::insert_text("b"))
+            .expect("second insert should apply");
+        assert_eq!(document.history_stats().undo_entries(), 2);
+
+        document
+            .execute(EditorCommand::undo())
+            .expect("grouped undo should apply");
+        assert_eq!(document.snapshot().as_str(), "");
+        assert_eq!(document.history_stats().undo_entries(), 0);
+        assert_eq!(document.history_stats().redo_entries(), 2);
+
+        document
+            .execute(EditorCommand::redo())
+            .expect("grouped redo should apply");
+        assert_eq!(document.snapshot().as_str(), "ab");
+        assert_eq!(document.history_stats().undo_entries(), 2);
+        assert_eq!(document.history_stats().redo_entries(), 0);
+    }
+
+    #[test]
+    fn cursor_motion_breaks_typing_group_and_new_edit_clears_redo() {
+        let mut document = EditorDocument::new("");
+        document
+            .execute(EditorCommand::insert_text("ab"))
+            .expect("insert should apply");
+        document
+            .execute(EditorCommand::MoveLeft)
+            .expect("cursor move should apply");
+        document
+            .execute(EditorCommand::insert_text("x"))
+            .expect("second insert should apply");
+
+        document.execute(EditorCommand::undo()).expect("undo x");
+        assert_eq!(document.snapshot().as_str(), "ab");
+        document.execute(EditorCommand::undo()).expect("undo ab");
+        assert_eq!(document.snapshot().as_str(), "");
+        assert_eq!(document.history_stats().redo_entries(), 2);
+
+        document
+            .execute(EditorCommand::insert_text("new"))
+            .expect("new edit should apply");
+        assert_eq!(document.history_stats().redo_entries(), 0);
+    }
+
+    #[test]
+    fn list_and_task_commands_are_undoable_through_the_same_history() {
+        let mut document = EditorDocument::new("- [x] item\n");
+        set_caret(&mut document, "- [x] item".len());
+        document
+            .execute(EditorCommand::insert_newline())
+            .expect("list continuation should apply");
+        assert_eq!(document.snapshot().as_str(), "- [x] item\n- [ ] \n");
+        document
+            .execute(EditorCommand::undo())
+            .expect("undo list continuation");
+        assert_eq!(document.snapshot().as_str(), "- [x] item\n");
+        document
+            .execute(EditorCommand::redo())
+            .expect("redo list continuation");
+        assert_eq!(document.snapshot().as_str(), "- [x] item\n- [ ] \n");
+
+        let mut document = EditorDocument::new("- [ ] item\n");
+        document
+            .execute(EditorCommand::toggle_task(0))
+            .expect("task toggle should apply");
+        document
+            .execute(EditorCommand::undo())
+            .expect("undo task toggle");
+        assert_eq!(document.snapshot().as_str(), "- [ ] item\n");
+        document
+            .execute(EditorCommand::redo())
+            .expect("redo task toggle");
+        assert_eq!(document.snapshot().as_str(), "- [x] item\n");
+
+        set_caret(&mut document, "- [x] item".len());
+        document
+            .execute(EditorCommand::indent_list())
+            .expect("indent should apply");
+        document
+            .execute(EditorCommand::undo())
+            .expect("undo indent");
+        assert_eq!(document.snapshot().as_str(), "- [x] item\n");
+    }
+
+    #[test]
+    fn composition_preedit_is_not_history_but_commit_is_undoable() {
+        let mut document = EditorDocument::new("before");
+        document
+            .begin_composition(source_range(6, 6), "にほんご", utf16_range(0, 0))
+            .expect("composition should begin");
+        document
+            .update_composition("日本語", utf16_range(0, 0))
+            .expect("composition should update");
+        assert_eq!(document.history_stats().undo_entries(), 0);
+
+        document
+            .commit_composition("日本語")
+            .expect("composition should commit");
+        assert_eq!(document.snapshot().as_str(), "before日本語");
+        assert_eq!(document.history_stats().undo_entries(), 1);
+        document
+            .execute(EditorCommand::undo())
+            .expect("undo commit");
+        assert_eq!(document.snapshot().as_str(), "before");
     }
 
     #[test]

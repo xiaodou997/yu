@@ -7,6 +7,7 @@ mod caret;
 mod command;
 mod composition;
 mod document;
+mod history;
 mod layout;
 mod list;
 mod projection;
@@ -23,6 +24,7 @@ pub use caret::{
 pub use command::{CommandResult, EditorCommand};
 pub use composition::{CompositionError, CompositionOverlay};
 pub use document::{EditorDocument, EditorDocumentError};
+pub use history::HistoryStats;
 pub use layout::{LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
