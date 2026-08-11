@@ -117,6 +117,32 @@ EditorDocument::set_selection
 UTF-16 boundary/affinity。这样 AppKit 的原生 selection 与 caret affinity 仍是
 `EditorDocument` 状态的投影，而不是第二个 canonical selection。
 
+macOS keyDown 的命令路由也以 Rust 为唯一解释器：
+
+```text
+NSEvent
+   │
+   ▼
+无 marked text？ ── no ──► NSTextInputClient / inputContext
+   │ yes
+   ▼
+yu_composition_session_route_key
+   │
+   ├── YU_FFI_KEY_UNHANDLED ──► native text-input/default command
+   │
+   └── YuEditorCommandResult
+           │
+           ├── canonical source query
+           ├── UTF-16 selection + CaretAffinity
+           └── TextKit mirror / Accessibility notification
+```
+
+`EditorKey`/`KeyModifiers` 与 `command_for_key` 位于 `yu-editor`，因此 Swift 只负责把 AppKit
+keyCode、charactersIgnoringModifiers 和 modifierFlags 转换成 ABI 值。Cmd-Z、Cmd-Shift-Z、
+Enter、Tab/Shift-Tab、删除和左右移动通过同一 `EditorCommand` 执行；普通字符不经过该映射，
+继续由 `NSTextInputClient` 处理。command result 绑定当前 Revision，活动 composition 则必须
+先 commit/cancel，不能被永久命令绕过。
+
 `yu-projection::Projection` 现在提供一个 source-backed inline 试验层：它只保存
 `TextSnapshot`、source range、visible/line-break/hidden runs 和双向 mapping，不生成第二份可编辑文本。
 它通过 `yu-markdown::parse_inline` 或 definition-aware 的

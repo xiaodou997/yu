@@ -16,6 +16,9 @@ enum {
     YU_FFI_BUFFER_TOO_SMALL = 6,
     YU_FFI_EDIT_FAILED = 7,
     YU_FFI_STALE_REVISION = 8,
+    YU_FFI_KEY_UNHANDLED = 9,
+    YU_FFI_INVALID_COMMAND = 10,
+    YU_FFI_INVALID_KEY = 11,
 };
 
 enum {
@@ -23,12 +26,62 @@ enum {
     YU_CARET_AFFINITY_DOWNSTREAM = 1,
 };
 
+enum {
+    YU_KEY_CHARACTER = 0,
+    YU_KEY_ENTER = 1,
+    YU_KEY_TAB = 2,
+    YU_KEY_BACKSPACE = 3,
+    YU_KEY_DELETE = 4,
+    YU_KEY_LEFT = 5,
+    YU_KEY_RIGHT = 6,
+    YU_KEY_UP = 7,
+    YU_KEY_DOWN = 8,
+    YU_KEY_ESCAPE = 9,
+};
+
+enum {
+    YU_KEY_MODIFIER_COMMAND = 1 << 0,
+    YU_KEY_MODIFIER_SHIFT = 1 << 1,
+    YU_KEY_MODIFIER_CONTROL = 1 << 2,
+    YU_KEY_MODIFIER_OPTION = 1 << 3,
+};
+
+enum {
+    YU_EDITOR_COMMAND_DELETE_BACKWARD = 1,
+    YU_EDITOR_COMMAND_DELETE_FORWARD = 2,
+    YU_EDITOR_COMMAND_MOVE_LEFT = 3,
+    YU_EDITOR_COMMAND_MOVE_RIGHT = 4,
+    YU_EDITOR_COMMAND_INSERT_NEWLINE = 5,
+    YU_EDITOR_COMMAND_INDENT_LIST = 6,
+    YU_EDITOR_COMMAND_OUTDENT_LIST = 7,
+    YU_EDITOR_COMMAND_UNDO = 8,
+    YU_EDITOR_COMMAND_REDO = 9,
+    YU_EDITOR_COMMAND_TOGGLE_TASK = 10,
+};
+
+typedef struct YuEditorCommandResult {
+    uint64_t revision;
+    uint64_t selection_start_utf16;
+    uint64_t selection_end_utf16;
+    uint8_t affinity;
+    uint8_t changed;
+} YuEditorCommandResult;
+
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,
                                    YuCompositionSession **output);
 void yu_composition_session_destroy(YuCompositionSession *session);
 int32_t yu_composition_session_reset_source(YuCompositionSession *session,
                                              const uint8_t *source,
                                              size_t source_length);
+int32_t yu_composition_session_execute_command(YuCompositionSession *session,
+                                               uint8_t command,
+                                               uint64_t block,
+                                               YuEditorCommandResult *output);
+int32_t yu_composition_session_route_key(YuCompositionSession *session,
+                                         uint8_t key_kind,
+                                         uint32_t key,
+                                         uint8_t modifiers,
+                                         YuEditorCommandResult *output);
 int32_t yu_composition_session_begin(YuCompositionSession *session,
                                      uint64_t replacement_start_utf16,
                                      uint64_t replacement_end_utf16,

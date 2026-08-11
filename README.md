@@ -21,6 +21,7 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - Undo/Redo 只保存有界 inverse Transaction，连续输入、删除和列表操作按 group 回放；
 - Transaction、Snapshot、Anchor 与 Revision 构成统一编辑协议；
 - selection/caret、Unicode grapheme command 与 Accessibility 查询共享同一个 Revision；
+- macOS 原生快捷键先经过共享 Rust command route，普通字符仍交给 `NSTextInputClient`；
 - 解析、投影、布局、绘制和资源加载都只处理受影响部分；
 - 中文、日文、RTL、emoji、组合字符与原生 IME 是一等公民；
 - 不依赖 Chromium、DOM 或常驻 JavaScript runtime；
@@ -44,7 +45,7 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 ```text
 crates/yu-core          坐标、范围、Revision、Anchor
 crates/yu-editor        EditorDocument、selection、commands、CompositionOverlay 和平台无关编辑状态
-crates/yu-editor-ffi    原生平台调用的 CompositionOverlay C ABI static library
+crates/yu-editor-ffi    原生平台调用的 CompositionOverlay 与 command C ABI static library
 crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
 crates/yu-markdown      lossless block/inline CST 与增量 Markdown parser
 crates/yu-projection    Source → Visual Markdown 投影
@@ -112,6 +113,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Markdown task-list projection](docs/adr/0044-task-list-projection.md)
 - [Markdown list editing commands](docs/adr/0045-list-editing-commands.md)
 - [Editor history and undo groups](docs/adr/0046-editor-history-and-undo-groups.md)
+- [macOS key command routing](docs/adr/0047-macos-key-command-routing.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

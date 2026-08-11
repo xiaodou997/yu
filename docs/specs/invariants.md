@@ -67,6 +67,14 @@
     不变。
 11. Projection 只能引用同一 Revision 的 source range；Visible 与 LineBreak run 必须保持
     source/visual 长度一致，HiddenSyntax run 的 visual width 必须为零。
+12. 原生 key route 必须先解析共享 `EditorKey`/`KeyModifiers`；普通字符或未拥有的 shortcut
+    必须返回 unhandled 且不得修改 source，已拥有的 command 才能进入 `EditorDocument::execute`。
+    活动 composition 时不得通过 shortcut 直接修改 canonical source。
+13. `YuEditorCommandResult` 的 Revision、UTF-16 selection、CaretAffinity 和 `changed` 必须来自
+    同一次 command 结果；ABI 的空指针、未知 command、未知 key 和无效 affinity 必须返回明确
+    status，不得写入半成品 output。
+14. 原生 TextKit/AppKit mirror 在 command 成功后必须从 Rust canonical source 和 result selection
+    同步；mirror 不是第二个 source/history，command route 不得把平台文本副本作为正确性边界。
 
 ## Accessibility
 

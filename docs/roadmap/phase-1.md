@@ -46,6 +46,7 @@
 - [x] FFI selection revision/UTF-16 查询并接入 macOS composition commit 自检
 - [x] revision-bound FFI selection mutation，并同步 macOS hit-test/Accessibility selection
 - [x] FFI selection mutation/query 保留 upstream/downstream CaretAffinity
+- [x] 平台无关 key command map、FFI command result 与 macOS Cmd-Z/Cmd-Shift-Z/native keyDown 路由
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -179,6 +180,9 @@
 36. EditorHistory 必须只保留有界 inverse Transaction；连续输入/删除/列表操作按 group 聚合，
     Undo 逆序、Redo 正序回放且不重复记录 history；移动 selection、composition 边界和新 edit
     必须正确断组或清空 redo。
+37. 原生 key route 必须在有 marked text 时让位于 NSTextInputClient；无映射 key 不得修改 source，
+    已映射 command 必须通过 `EditorDocument::execute` 返回同 Revision 的 UTF-16 selection 和
+    CaretAffinity，Swift mirror 只能按该结果同步。
 
 ## 非目标
 
