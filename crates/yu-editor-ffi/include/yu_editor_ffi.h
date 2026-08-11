@@ -19,6 +19,7 @@ enum {
     YU_FFI_KEY_UNHANDLED = 9,
     YU_FFI_INVALID_COMMAND = 10,
     YU_FFI_INVALID_KEY = 11,
+    YU_FFI_INVALID_VIEWPORT_CONFIG = 12,
 };
 
 enum {
@@ -150,6 +151,13 @@ int32_t yu_composition_session_set_selection(YuCompositionSession *session,
                                              uint64_t start_utf16,
                                              uint64_t end_utf16,
                                              uint8_t affinity);
+int32_t yu_composition_session_set_viewport_config(YuCompositionSession *session,
+                                                   uint64_t expected_revision,
+                                                   float max_width,
+                                                   float line_height,
+                                                   float default_advance,
+                                                   float estimated_block_height,
+                                                   float overscan);
 int32_t yu_composition_session_caret_scroll_request(YuCompositionSession *session,
                                                     uint64_t expected_revision,
                                                     float scroll_y,

@@ -170,11 +170,13 @@ revision-bound `CaretScrollRequest`：它消费当前 viewport、focus block 的
 返回 document-space caret geometry 与绝对 target scroll；平台只应用仍属于当前 Revision 的目标，
 macOS `YuNativeViewportAdapter` 再把 target 转换为 `NSClipView.bounds.origin.y`。当前 spike 已将
 `TextInputView` 作为真实 `NSScrollView.documentView`，从 TextKit used rect 同步 native content
-height，并在 Rust command、selection 写回和 IME commit 后消费 reveal；native point 与 Rust
-line-height 单位的临时 scale 集中在 bridge，正式产品必须改由共享 shaped-layout metrics 提供。
+height，并在 Rust command、selection 写回和 IME commit 后消费 reveal。它通过 revision-bound
+viewport metrics FFI 发布 native container width、line height、fallback advance、estimated block
+height 和 overscan，Rust 随后直接以 native point 计算 request，不再在 bridge 中乘除临时 scale。
+fallback advance 只属于 metrics-only backend，正式产品必须由共享 shaped-layout metrics 替换。
 
 该 host attachment 不改变 Rust source/selection/layout 的所有权：adapter 只保存 NSScrollView
-viewport、Revision 和 content height，stale request 仍被丢弃。见 ADR 0054 与 ADR 0055。
+viewport、Revision 和 content height，stale request 仍被丢弃。见 ADR 0054、ADR 0055 与 ADR 0056。
 
 Shift+上下使用独立的 `MoveUpExtend`/`MoveDownExtend` command：`EditorSelection::anchor()` 保持不动，
 只把 hit-test 得到的 visual caret 写入 focus。macOS `moveUpAndModifySelection:`/

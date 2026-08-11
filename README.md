@@ -125,6 +125,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Revision-bound caret scroll request](docs/adr/0053-caret-scroll-request.md)
 - [macOS NSScrollView consumer](docs/adr/0054-macos-scrollview-consumer.md)
 - [macOS NSScrollView host attachment](docs/adr/0055-macos-scrollview-host-attachment.md)
+- [Viewport metrics FFI contract](docs/adr/0056-viewport-metrics-ffi-contract.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

@@ -55,6 +55,7 @@
 - [x] revision-bound caret scroll request、FFI geometry query 与 macOS spike self-check
 - [x] macOS `NSScrollView` caret request consumer、stale/no-op/native scroll self-check
 - [x] macOS spike 将 `TextInputView` 接入真实 `NSScrollView`，按 Revision/IME commit 自动 reveal
+- [x] revision-bound viewport metrics FFI；macOS native point 直接驱动 Rust metrics-only layout
 - [x] source-backed identity/inline projection 与 hidden delimiter 双向 mapping
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
@@ -216,8 +217,13 @@
     且 AppKit 对象不能进入 Rust ABI。
 45. macOS spike 的 `TextInputView` 必须作为真实 `NSScrollView.documentView` 运行；TextKit content
     height、当前 clip viewport 和 Rust request 必须按同一 Revision 同步，命令、selection 写回和
-    IME commit 后都要触发 reveal。native point 与 Rust 逻辑单位的临时 scale 只能留在 bridge，
-    并记录替换为共享 shaped-layout metrics 的边界。
+    IME commit 后都要触发 reveal。viewport width、line height、fallback advance、estimated block
+    height 和 overscan 必须通过 revision-bound FFI metrics 配置传递，request 不得再依赖 bridge
+    scale。
+46. `yu_composition_session_set_viewport_config` 必须拒绝 stale Revision 和非法 metrics，成功时
+    不得推进 source/selection/history；`LayoutConfig::default_advance` 必须进入 metrics layout
+    cache key。FFI 与 macOS attached self-check 必须证明配置确实影响 wrapping/scroll target，
+    但 fallback advance 不能冒充最终 shaped typography。
 
 ## 非目标
 

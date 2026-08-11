@@ -67,6 +67,7 @@ struct LayoutKey {
     kind: BlockKind,
     max_width: u32,
     line_height: u32,
+    default_advance: u32,
     backend: LayoutBackend,
 }
 
@@ -77,6 +78,7 @@ impl LayoutKey {
             kind: block.kind(),
             max_width: config.max_width().to_bits(),
             line_height: config.line_height().to_bits(),
+            default_advance: config.default_advance().to_bits(),
             backend,
         }
     }

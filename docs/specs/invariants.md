@@ -101,6 +101,10 @@
 22. macOS native viewport consumer 只能消费仍匹配 current Revision 的 `CaretScrollRequest`；
     stale 请求不得触碰 `NSClipView`，absolute target 只能在平台边界按 content/clip height 做最后
     clamp。`NSScrollView`、`NSClipView` 和 document view 不得穿过 Rust FFI。
+23. `yu_composition_session_set_viewport_config` 必须绑定 expected Revision；非法
+    `max_width`/`line_height`/`default_advance`/estimate/overscan 必须拒绝且保留旧配置，成功
+    配置不得推进 source、selection 或 history。metrics-only layout 的 `default_advance` 必须
+    进入 `LayoutConfig`/`LayoutCache` identity，shaped backend 可独立替换它。
 
 ## Accessibility
 
