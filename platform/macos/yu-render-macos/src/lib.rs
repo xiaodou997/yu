@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -24,7 +25,7 @@ use yu_scene::Rgba8;
 mod native {
     use std::ffi::c_void;
 
-    use super::{NativeDrawCommand, NativeTextureBinding};
+    use super::{NativeDamageRect, NativeDrawCommand, NativeTextureBinding};
 
     unsafe extern "C" {
         pub fn yu_metal_create_device(
@@ -38,6 +39,12 @@ mod native {
             scale: f64,
             out_layer: *mut *mut c_void,
         ) -> i32;
+        pub fn yu_metal_attach_layer_to_view(
+            layer: *mut c_void,
+            view: *mut c_void,
+            out_attachment: *mut *mut c_void,
+        ) -> i32;
+        pub fn yu_metal_detach_layer_from_view(attachment: *mut c_void);
         pub fn yu_metal_resize_layer(
             layer: *mut c_void,
             pixel_width: f64,
@@ -52,6 +59,13 @@ mod native {
             pixel_length: usize,
             out_texture: *mut *mut c_void,
         ) -> i32;
+        pub fn yu_metal_create_render_target(
+            device: *mut c_void,
+            width: u32,
+            height: u32,
+            out_target: *mut *mut c_void,
+        ) -> i32;
+        pub fn yu_metal_release_render_target(target: *mut c_void);
         pub fn yu_metal_create_command_queue(
             device: *mut c_void,
             out_queue: *mut *mut c_void,
@@ -74,11 +88,15 @@ mod native {
             queue: *mut c_void,
             layer: *mut c_void,
             pipeline: *mut c_void,
+            target: *mut c_void,
             viewport_width: f32,
             viewport_height: f32,
             scale: f32,
+            full_clear: i32,
             commands: *const NativeDrawCommand,
             command_count: usize,
+            damage: *const NativeDamageRect,
+            damage_count: usize,
             textures: *const NativeTextureBinding,
             texture_count: usize,
         ) -> i32;
@@ -111,6 +129,15 @@ struct NativeDrawCommand {
     page: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NativeDamageRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
 #[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -129,8 +156,13 @@ pub enum MetalRenderError {
     CommandBufferUnavailable,
     RenderEncoderUnavailable,
     PipelineUnavailable,
+    RenderTargetUnavailable,
+    DrawableSizeMismatch,
+    BlitEncoderUnavailable,
     MissingAtlasPage(u32),
     InvalidRenderCommand(&'static str),
+    ViewAttachmentUnavailable,
+    InvalidDamageRect(&'static str),
     DeviceMismatch,
     InvalidSurfaceConfig(&'static str),
     InvalidPixelBuffer { expected: usize, actual: usize },
@@ -160,6 +192,15 @@ impl fmt::Display for MetalRenderError {
             Self::PipelineUnavailable => {
                 formatter.write_str("Metal render pipeline creation failed")
             }
+            Self::RenderTargetUnavailable => {
+                formatter.write_str("Metal retained render target creation failed")
+            }
+            Self::DrawableSizeMismatch => {
+                formatter.write_str("Metal drawable size does not match the retained render target")
+            }
+            Self::BlitEncoderUnavailable => {
+                formatter.write_str("Metal blit encoder creation failed")
+            }
             Self::MissingAtlasPage(page) => {
                 write!(
                     formatter,
@@ -167,6 +208,10 @@ impl fmt::Display for MetalRenderError {
                 )
             }
             Self::InvalidRenderCommand(message) => formatter.write_str(message),
+            Self::ViewAttachmentUnavailable => {
+                formatter.write_str("CAMetalLayer could not be attached to the NSView")
+            }
+            Self::InvalidDamageRect(message) => formatter.write_str(message),
             Self::DeviceMismatch => {
                 formatter.write_str("surface and command queue use different Metal devices")
             }
@@ -334,13 +379,38 @@ fn pixels(value: f64, scale: f64) -> Result<u32, MetalRenderError> {
     Ok(value as u32)
 }
 
-/// A configured CAMetalLayer that is not attached to an NSView yet.
+/// A configured CAMetalLayer that can be attached to an AppKit NSView by a
+/// scoped [`MetalViewAttachment`]. The surface itself does not own a window.
 pub struct MetalSurface {
     device: MetalDevice,
     #[cfg(target_os = "macos")]
     raw_layer: NonNull<std::ffi::c_void>,
     config: MetalSurfaceConfig,
     generation: u64,
+}
+
+/// An AppKit-owned `NSView` temporarily backed by a `MetalSurface` layer.
+///
+/// The lifetime ties the attachment to its surface so a caller cannot drop
+/// the layer owner while AppKit still points at it. Dropping the attachment
+/// restores the view's previous backing layer when it is still installed.
+pub struct MetalViewAttachment<'surface> {
+    #[cfg(target_os = "macos")]
+    raw: NonNull<std::ffi::c_void>,
+    _surface: PhantomData<&'surface MetalSurface>,
+}
+
+impl fmt::Debug for MetalViewAttachment<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MetalViewAttachment")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MetalViewAttachment<'_> {
+    fn drop(&mut self) {
+        unsafe { native::yu_metal_detach_layer_from_view(self.raw.as_ptr()) };
+    }
 }
 
 impl fmt::Debug for MetalSurface {
@@ -387,6 +457,47 @@ impl MetalSurface {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (device, config);
+            Err(MetalRenderError::UnsupportedPlatform)
+        }
+    }
+
+    /// Attaches this surface's layer to an existing AppKit `NSView`.
+    ///
+    /// # Safety
+    ///
+    /// `view` must be a valid, main-thread-owned `NSView` pointer for the
+    /// entire call, and the call must run on AppKit's main thread. The view
+    /// remains owned by AppKit; the returned attachment only restores its
+    /// previous layer when dropped.
+    pub unsafe fn attach_to_view(
+        &self,
+        view: NonNull<std::ffi::c_void>,
+    ) -> Result<MetalViewAttachment<'_>, MetalRenderError> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut raw_attachment = std::ptr::null_mut();
+            let attached = unsafe {
+                native::yu_metal_attach_layer_to_view(
+                    self.raw_layer(),
+                    view.as_ptr(),
+                    &mut raw_attachment,
+                )
+            };
+            let raw_attachment =
+                NonNull::new(raw_attachment).ok_or(MetalRenderError::ViewAttachmentUnavailable)?;
+            if attached == 0 {
+                unsafe { native::yu_metal_detach_layer_from_view(raw_attachment.as_ptr()) };
+                return Err(MetalRenderError::ViewAttachmentUnavailable);
+            }
+            return Ok(MetalViewAttachment {
+                raw: raw_attachment,
+                _surface: PhantomData,
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = view;
             Err(MetalRenderError::UnsupportedPlatform)
         }
     }
@@ -756,12 +867,95 @@ impl MetalPipeline {
     }
 }
 
-/// Frame submission for clear-only validation and the first retained
-/// rectangle/glyph command path. It still expects an already attached layer;
-/// window creation and AppKit ownership remain outside this crate.
+#[cfg(target_os = "macos")]
+struct MetalRenderTargetInner {
+    raw: NonNull<std::ffi::c_void>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MetalRenderTargetInner {
+    fn drop(&mut self) {
+        unsafe { native::yu_metal_release_render_target(self.raw.as_ptr()) };
+    }
+}
+
+/// Backend-owned color storage that keeps frame contents valid while
+/// `CAMetalLayer` rotates drawable textures. It is never exposed to shared
+/// scene or render-plan state.
+pub struct MetalRenderTarget {
+    device: MetalDevice,
+    width: u32,
+    height: u32,
+    #[cfg(target_os = "macos")]
+    inner: Rc<MetalRenderTargetInner>,
+}
+
+impl fmt::Debug for MetalRenderTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetalRenderTarget")
+            .field("device_registry_id", &self.device.registry_id())
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
+impl MetalRenderTarget {
+    fn new(device: MetalDevice, config: MetalSurfaceConfig) -> Result<Self, MetalRenderError> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut raw = std::ptr::null_mut();
+            let created = unsafe {
+                native::yu_metal_create_render_target(
+                    device.raw(),
+                    config.pixel_width(),
+                    config.pixel_height(),
+                    &mut raw,
+                )
+            };
+            let raw = NonNull::new(raw).ok_or(MetalRenderError::RenderTargetUnavailable)?;
+            if created == 0 {
+                unsafe { native::yu_metal_release_render_target(raw.as_ptr()) };
+                return Err(MetalRenderError::RenderTargetUnavailable);
+            }
+            return Ok(Self {
+                device,
+                width: config.pixel_width(),
+                height: config.pixel_height(),
+                inner: Rc::new(MetalRenderTargetInner { raw }),
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (device, config);
+            Err(MetalRenderError::UnsupportedPlatform)
+        }
+    }
+
+    #[must_use]
+    const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    const fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+/// Frame submission for clear-only validation and retained rectangle/glyph
+/// commands. The first frame after creation or resize clears the retained
+/// target; later frames clear and redraw only the plan's damage regions before
+/// blitting to a drawable. Window creation and AppKit ownership remain outside
+/// this crate.
 pub struct MetalFrameRenderer {
     queue: MetalCommandQueue,
     pipeline: MetalPipeline,
+    target: Option<MetalRenderTarget>,
+    needs_full_clear: bool,
+    last_surface_generation: Option<u64>,
 }
 
 impl fmt::Debug for MetalFrameRenderer {
@@ -770,6 +964,9 @@ impl fmt::Debug for MetalFrameRenderer {
             .debug_struct("MetalFrameRenderer")
             .field("queue", &self.queue)
             .field("pipeline", &self.pipeline)
+            .field("target", &self.target)
+            .field("needs_full_clear", &self.needs_full_clear)
+            .field("last_surface_generation", &self.last_surface_generation)
             .finish()
     }
 }
@@ -780,7 +977,24 @@ impl MetalFrameRenderer {
         Ok(Self {
             queue: MetalCommandQueue::new(device)?,
             pipeline,
+            target: None,
+            needs_full_clear: true,
+            last_surface_generation: None,
         })
+    }
+
+    fn ensure_target(&mut self, surface: &MetalSurface) -> Result<bool, MetalRenderError> {
+        let config = surface.config();
+        let recreate = self.target.as_ref().is_none_or(|target| {
+            target.width() != config.pixel_width() || target.height() != config.pixel_height()
+        });
+        if recreate {
+            self.target = Some(MetalRenderTarget::new(
+                self.pipeline.device().clone(),
+                config,
+            )?);
+        }
+        Ok(recreate)
     }
 
     /// Acquires one drawable, records a clear render pass, presents it and
@@ -808,7 +1022,14 @@ impl MetalFrameRenderer {
                 )
             };
             return match status {
-                1 => Ok(()),
+                1 => {
+                    // This path clears only the layer drawable. The retained
+                    // target is intentionally left dirty so the next plan
+                    // submission performs a full clear into its own storage.
+                    self.needs_full_clear = true;
+                    self.last_surface_generation = None;
+                    Ok(())
+                }
                 2 => Err(MetalRenderError::DrawableUnavailable),
                 3 => Err(MetalRenderError::CommandBufferUnavailable),
                 4 => Err(MetalRenderError::RenderEncoderUnavailable),
@@ -827,8 +1048,8 @@ impl MetalFrameRenderer {
 
     /// Upload-independent retained rendering entry point. The caller first
     /// synchronizes `plan.uploads()` into a [`MetalAtlas`], then this method
-    /// converts the backend-neutral commands into a short native ABI array.
-    /// The shared `RenderPlan` itself never contains a Metal pointer.
+    /// converts commands and damage into short native ABI arrays. The shared
+    /// `RenderPlan` itself never contains a Metal pointer.
     pub fn render_plan(
         &mut self,
         surface: &MetalSurface,
@@ -841,8 +1062,13 @@ impl MetalFrameRenderer {
             return Err(MetalRenderError::DeviceMismatch);
         }
 
+        let recreated_target = self.ensure_target(surface)?;
         let viewport = plan.viewport();
         let commands = build_native_commands(plan, &atlas.page_sizes())?;
+        let damage = build_native_damage(plan)?;
+        let full_clear = recreated_target
+            || self.needs_full_clear
+            || self.last_surface_generation != Some(surface.generation());
         let scale = surface.config().scale() as f32;
         if !scale.is_finite() || scale <= 0.0 {
             return Err(MetalRenderError::InvalidRenderCommand(
@@ -860,32 +1086,49 @@ impl MetalFrameRenderer {
                 "render plan viewport must be finite and positive",
             ));
         }
+        if !full_clear && damage.is_empty() {
+            return Ok(());
+        }
 
         #[cfg(target_os = "macos")]
         {
             let bindings = atlas.native_bindings();
+            let target = self
+                .target
+                .as_ref()
+                .ok_or(MetalRenderError::RenderTargetUnavailable)?;
             let status = unsafe {
                 native::yu_metal_render_plan(
                     self.queue.inner.as_ref().raw.as_ptr(),
                     surface.raw_layer(),
                     self.pipeline.inner.raw.as_ptr(),
+                    target.inner.raw.as_ptr(),
                     viewport_width,
                     viewport_height,
                     scale,
+                    i32::from(full_clear),
                     commands.as_ptr(),
                     commands.len(),
+                    damage.as_ptr(),
+                    damage.len(),
                     bindings.as_ptr(),
                     bindings.len(),
                 )
             };
             return match status {
-                1 => Ok(()),
+                1 => {
+                    self.needs_full_clear = false;
+                    self.last_surface_generation = Some(surface.generation());
+                    Ok(())
+                }
                 2 => Err(MetalRenderError::DrawableUnavailable),
                 3 => Err(MetalRenderError::CommandBufferUnavailable),
                 4 => Err(MetalRenderError::RenderEncoderUnavailable),
                 5 => Err(MetalRenderError::NativeFailure(
                     "Metal command references an unavailable texture or kind",
                 )),
+                6 => Err(MetalRenderError::DrawableSizeMismatch),
+                7 => Err(MetalRenderError::BlitEncoderUnavailable),
                 _ => Err(MetalRenderError::NativeFailure(
                     "Metal render plan bridge failed",
                 )),
@@ -901,7 +1144,9 @@ impl MetalFrameRenderer {
                 viewport_width,
                 viewport_height,
                 scale,
+                full_clear,
                 commands,
+                damage,
             );
             Err(MetalRenderError::UnsupportedPlatform)
         }
@@ -1023,6 +1268,59 @@ fn build_native_commands(
     Ok(commands)
 }
 
+fn build_native_damage(plan: &RenderPlan) -> Result<Vec<NativeDamageRect>, MetalRenderError> {
+    let viewport = plan.viewport();
+    if !viewport.x().is_finite()
+        || !viewport.y().is_finite()
+        || !viewport.width().is_finite()
+        || !viewport.height().is_finite()
+        || viewport.width() <= 0.0
+        || viewport.height() <= 0.0
+    {
+        return Err(MetalRenderError::InvalidDamageRect(
+            "render plan viewport is not finite and positive",
+        ));
+    }
+
+    let mut damage = Vec::with_capacity(plan.damage().len());
+    for rect in plan.damage() {
+        if !rect.x().is_finite()
+            || !rect.y().is_finite()
+            || !rect.width().is_finite()
+            || !rect.height().is_finite()
+            || rect.width() < 0.0
+            || rect.height() < 0.0
+        {
+            return Err(MetalRenderError::InvalidDamageRect(
+                "damage rectangle must be finite and non-negative",
+            ));
+        }
+        let x = rect.x() - viewport.x();
+        let y = rect.y() - viewport.y();
+        let right = x + rect.width();
+        let bottom = y + rect.height();
+        if !x.is_finite() || !y.is_finite() || !right.is_finite() || !bottom.is_finite() {
+            return Err(MetalRenderError::InvalidDamageRect(
+                "damage rectangle overflowed viewport coordinates",
+            ));
+        }
+        let left = x.max(0.0);
+        let top = y.max(0.0);
+        let right = right.min(viewport.width());
+        let bottom = bottom.min(viewport.height());
+        if right <= left || bottom <= top {
+            continue;
+        }
+        damage.push(NativeDamageRect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        });
+    }
+    Ok(damage)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1431,37 @@ mod tests {
             build_native_commands(&plan, &BTreeMap::new()).expect_err("missing page"),
             MetalRenderError::MissingAtlasPage(0)
         );
+    }
+
+    #[test]
+    fn native_damage_conversion_clips_to_the_plan_viewport() {
+        use yu_core::Revision;
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{Rect, SceneBuilder};
+
+        let viewport = Rect::new(10.0, 20.0, 40.0, 30.0).expect("viewport");
+        let mut scene = SceneBuilder::new(Revision::INITIAL, viewport).expect("scene");
+        scene
+            .fill_rect(
+                Rect::new(5.0, 10.0, 20.0, 20.0).expect("partially visible rect"),
+                Rgba8::white(),
+            )
+            .expect("fill");
+        let plan = RenderPlanBuilder::new()
+            .build(
+                &scene.finish(),
+                &yu_font::GlyphAtlas::new(
+                    yu_font::GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"),
+                ),
+            )
+            .expect("plan");
+
+        let damage = build_native_damage(&plan).expect("damage");
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].x, 0.0);
+        assert_eq!(damage[0].y, 0.0);
+        assert_eq!(damage[0].width, 15.0);
+        assert_eq!(damage[0].height, 10.0);
     }
 
     #[cfg(not(target_os = "macos"))]
