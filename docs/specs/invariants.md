@@ -52,8 +52,8 @@
 10. 原生 selection mutation 必须携带 expected Revision 和合法 CaretAffinity；Revision 过期、
     UTF-16 越界、surrogate 中间位置或未知 affinity 必须拒绝，并保持 EditorDocument selection
     不变。
-11. Projection 只能引用同一 Revision 的 source range；Visible run 必须保持 source/visual
-    长度一致，HiddenSyntax run 的 visual width 必须为零。
+11. Projection 只能引用同一 Revision 的 source range；Visible 与 LineBreak run 必须保持
+    source/visual 长度一致，HiddenSyntax run 的 visual width 必须为零。
 
 ## Accessibility
 
@@ -77,9 +77,9 @@
 2. source/visual 映射必须拒绝 projection range 外的 source offset 和 visual offset。
 3. hidden syntax 两侧的 caret 必须通过显式 Before/After bias 解析，不能依赖遍历顺序的
    隐式取整。
-4. Inline Projection 的 hidden ranges 和 visible style 必须来自 parser-owned `InlineSpan`；
-   projection 不得重新配对同一 source revision 的 delimiter。fenced code 必须走独立
-   `CodeProjection`，其 body 不得经过 inline parser。
+4. Inline Projection 的 hidden ranges、LineBreak runs 和 visible style 必须来自 parser-owned
+   `InlineSpan`/`InlineNode`；projection 不得重新配对同一 source revision 的 delimiter。fenced
+   code 必须走独立 `CodeProjection`，其 body 不得经过 inline parser。
 5. `ProjectionCache` entry 必须绑定当前 source Revision；严格位于 entry range 外的 edit 可以
    通过 ChangeSet 映射，触及 range 或边界的 edit 必须失效，source reset 必须清空 cache。
 6. `EditorDocument::markdown().revision()` 必须等于 canonical TextBuffer Revision；block-keyed
@@ -90,8 +90,9 @@
 
 1. `LayoutSnapshot::revision()` 必须等于其 Projection Revision；layout 不得持有另一份可编辑
    source。
-2. `VisualCluster` 的 source range 必须位于一个 visible run 内，并且只能在 Unicode grapheme
-   boundary 拆分；hidden syntax 不产生可见宽度。
+2. 普通 `VisualCluster` 的 source range 必须位于一个 visible run 内，并且只能在 Unicode
+   grapheme boundary 拆分；LineBreak cluster 只能来自显式 LineBreak run；hidden syntax 不产生
+   可见宽度。
 3. Layout hit-test 返回的 source offset 必须通过 Projection 的 source/visual mapping，不能自行
    计算第二套 delimiter 或 Unicode offset。
 4. `ClusterMetrics` 只能提供 advance，不得改变 source/visual ranges；无效或非有限 advance

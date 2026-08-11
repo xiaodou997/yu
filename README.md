@@ -103,6 +103,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS AppKit host probe](docs/adr/0038-macos-appkit-host-probe.md)
 - [Markdown block CST v1](docs/adr/0039-markdown-block-cst-v1.md)
 - [Markdown inline links and breaks](docs/adr/0040-markdown-inline-links-breaks.md)
+- [Markdown line-break projection and layout](docs/adr/0041-markdown-line-break-projection-layout.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

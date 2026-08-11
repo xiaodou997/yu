@@ -125,5 +125,6 @@ parser-owned `InlineSpan` 在 delimiter flanking 校验后产生 `Emphasis`、`S
 delimiter 和转义 punctuation 保持为普通可编辑源码。
 
 硬换行的 `LineBreak` range 包含两个尾随空格或反斜杠与 CRLF/LF，软换行只包含 line ending。
-这些节点目前由 layout/projection 作为下一阶段的 line-break 输入；parser 已先固定 source range
-和 full/incremental 可重复性。
+`yu-projection` 将 line ending 变成显式 `VisualRunKind::LineBreak { hard }`；硬换行的 marker
+前缀变成零宽 `HiddenSyntax`，因此 layout 不需要再次扫描尾随空格、反斜杠或 CRLF。line-break
+run 保留 line-ending 的 source/visual range，供 metrics 与 shaped layout 统一创建下一行。

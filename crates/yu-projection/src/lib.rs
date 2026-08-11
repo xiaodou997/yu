@@ -5,14 +5,15 @@
 //! This phase intentionally implements only a small, lossless inline
 //! projection. Matched Markdown emphasis, strong-emphasis, and code-span
 //! delimiters from `yu-markdown::InlineDocument` become zero-width visual
-//! runs; all other source bytes remain visible and continue to point into the
-//! canonical TextSnapshot.
+//! runs; parser-owned line endings become explicit line-break runs, while all
+//! other source bytes continue to point into the canonical TextSnapshot.
 
 use std::error::Error;
 use std::fmt;
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 use yu_markdown::{
-    Block, BlockKind, InlineDocument, InlineParseError, InlineSpan, InlineSpanKind, parse_inline,
+    Block, BlockKind, InlineDocument, InlineNodeKind, InlineParseError, InlineSpan, InlineSpanKind,
+    parse_inline,
 };
 use yu_text::{AnchorMapError, ChangeSet, TextChange, TextPositionError, TextSnapshot};
 
@@ -107,6 +108,10 @@ impl VisualRange {
 pub enum VisualRunKind {
     /// Source bytes remain visible and map linearly to visual bytes.
     Visible,
+    /// A parser-owned soft or hard source line ending. The line ending has
+    /// visual width in the byte projection so layout can create the next
+    /// visual line without rescanning source text.
+    LineBreak { hard: bool },
     /// Source syntax remains in the canonical source but occupies no visual bytes.
     HiddenSyntax,
 }
@@ -129,6 +134,12 @@ pub struct VisualRun {
     style: VisualRunStyle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineBreakSpec {
+    source: TextRange,
+    hard: bool,
+}
+
 impl VisualRun {
     #[must_use]
     pub const fn source(self) -> TextRange {
@@ -148,6 +159,16 @@ impl VisualRun {
     #[must_use]
     pub const fn style(self) -> VisualRunStyle {
         self.style
+    }
+
+    #[must_use]
+    pub const fn is_line_break(self) -> bool {
+        matches!(self.kind, VisualRunKind::LineBreak { .. })
+    }
+
+    #[must_use]
+    pub const fn is_hard_line_break(self) -> bool {
+        matches!(self.kind, VisualRunKind::LineBreak { hard: true })
     }
 }
 
@@ -277,8 +298,10 @@ impl Projection {
     /// Builds a minimal Markdown inline projection.
     ///
     /// Matched emphasis, strong-emphasis, and backtick delimiters are hidden.
-    /// The parser is deliberately conservative: unmatched or escaped
-    /// delimiters remain visible, and source bytes are never rewritten.
+    /// Parser-owned line endings become explicit line-break runs; hard-break
+    /// marker bytes remain zero-width hidden syntax. The parser is deliberately
+    /// conservative: unmatched or escaped delimiters remain visible, and
+    /// source bytes are never rewritten.
     pub fn inline(source: &TextSnapshot, source_range: TextRange) -> Result<Self, ProjectionError> {
         let inline = parse_inline(source, source_range)?;
         Self::from_inline(&inline)
@@ -297,10 +320,25 @@ impl Projection {
             .iter()
             .flat_map(|span| [span.opening(), span.closing()])
             .collect::<Vec<_>>();
+        let line_breaks = inline
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                InlineNodeKind::LineBreak { hard } => Some(LineBreakSpec {
+                    source: node.range(),
+                    hard,
+                }),
+                InlineNodeKind::Text
+                | InlineNodeKind::Escaped
+                | InlineNodeKind::Delimiter { .. }
+                | InlineNodeKind::Punctuation { .. } => None,
+            })
+            .collect::<Vec<_>>();
         Self::from_source_parts(
             source,
             source_range,
             &hidden,
+            &line_breaks,
             inline.spans(),
             VisualRunStyle::Plain,
         )
@@ -310,12 +348,20 @@ impl Projection {
         source: &TextSnapshot,
         source_range: TextRange,
         hidden: &[TextRange],
+        line_breaks: &[LineBreakSpec],
         spans: &[InlineSpan],
         default_style: VisualRunStyle,
     ) -> Result<Self, ProjectionError> {
         source.utf16_offset(source_range.start())?;
         source.utf16_offset(source_range.end())?;
-        let runs = build_runs(source_range, hidden, spans, default_style)?;
+        let runs = build_runs(
+            source,
+            source_range,
+            hidden,
+            line_breaks,
+            spans,
+            default_style,
+        )?;
         let visual_len = runs
             .last()
             .map_or(VisualOffset::ZERO, |run| run.visual.end());
@@ -475,7 +521,7 @@ impl Projection {
                 return Ok(candidate);
             }
 
-            if run.kind == VisualRunKind::Visible
+            if run.kind != VisualRunKind::HiddenSyntax
                 && run.visual.start() <= visual
                 && visual <= run.visual.end()
             {
@@ -542,46 +588,92 @@ fn map_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, Project
 }
 
 fn build_runs(
+    source: &TextSnapshot,
     source_range: TextRange,
     hidden: &[TextRange],
+    line_breaks: &[LineBreakSpec],
     spans: &[InlineSpan],
     default_style: VisualRunStyle,
 ) -> Result<Vec<VisualRun>, ProjectionError> {
     let mut runs = Vec::new();
     let mut source_cursor = source_range.start();
     let mut visual_cursor = VisualOffset::ZERO;
-    let mut hidden = hidden.to_vec();
-    hidden.sort_by_key(|range| (range.start(), range.end()));
-    for hidden_range in &hidden {
-        if hidden_range.start() < source_range.start() || hidden_range.end() > source_range.end() {
+    let mut events = hidden
+        .iter()
+        .copied()
+        .map(ProjectionEvent::Hidden)
+        .collect::<Vec<_>>();
+    for line_break in line_breaks {
+        if hidden.iter().any(|range| {
+            range.start() <= line_break.source.start() && line_break.source.end() <= range.end()
+        }) {
+            continue;
+        }
+        let (prefix, ending) = line_break_parts(source, *line_break)?;
+        if let Some(prefix) = prefix {
+            events.push(ProjectionEvent::Hidden(prefix));
+        }
+        events.push(ProjectionEvent::LineBreak {
+            source: ending,
+            hard: line_break.hard,
+        });
+    }
+    events.sort_by_key(|event| {
+        let range = event.source();
+        (range.start(), range.end())
+    });
+    for event in events {
+        let event_range = event.source();
+        if event_range.start() < source_range.start() || event_range.end() > source_range.end() {
             return Err(ProjectionError::SourceOutsideRange {
-                offset: hidden_range.start(),
+                offset: event_range.start(),
                 range: source_range,
             });
         }
-        if hidden_range.start() > source_cursor {
+        if event_range.start() < source_cursor {
+            if event_range.end() <= source_cursor {
+                continue;
+            }
+            return Err(ProjectionError::OffsetOverflow);
+        }
+        if event_range.start() > source_cursor {
             visual_cursor = append_visible_runs(
                 &mut runs,
                 source_cursor,
-                hidden_range.start(),
+                event_range.start(),
                 visual_cursor,
                 spans,
                 default_style,
             )?;
         }
-        if hidden_range.end() <= source_cursor {
-            continue;
+        match event {
+            ProjectionEvent::Hidden(range) => {
+                runs.push(VisualRun {
+                    source: range,
+                    visual: VisualRange::empty(visual_cursor),
+                    kind: VisualRunKind::HiddenSyntax,
+                    style: VisualRunStyle::Plain,
+                });
+                source_cursor = range.end();
+            }
+            ProjectionEvent::LineBreak { source, hard } => {
+                let visual_end = visual_cursor
+                    .checked_add(source.len())
+                    .ok_or(ProjectionError::OffsetOverflow)?;
+                runs.push(VisualRun {
+                    source,
+                    visual: VisualRange::new(visual_cursor, visual_end)
+                        .ok_or(ProjectionError::OffsetOverflow)?,
+                    kind: VisualRunKind::LineBreak { hard },
+                    style: VisualRunStyle::Plain,
+                });
+                visual_cursor = visual_end;
+                source_cursor = event_range.end();
+            }
         }
-        runs.push(VisualRun {
-            source: *hidden_range,
-            visual: VisualRange::empty(visual_cursor),
-            kind: VisualRunKind::HiddenSyntax,
-            style: VisualRunStyle::Plain,
-        });
-        source_cursor = hidden_range.end();
     }
     if source_cursor < source_range.end() {
-        append_visible_runs(
+        let _ = append_visible_runs(
             &mut runs,
             source_cursor,
             source_range.end(),
@@ -591,6 +683,53 @@ fn build_runs(
         )?;
     }
     Ok(runs)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionEvent {
+    Hidden(TextRange),
+    LineBreak { source: TextRange, hard: bool },
+}
+
+impl ProjectionEvent {
+    fn source(self) -> TextRange {
+        match self {
+            Self::Hidden(source) | Self::LineBreak { source, .. } => source,
+        }
+    }
+}
+
+fn line_break_parts(
+    source: &TextSnapshot,
+    line_break: LineBreakSpec,
+) -> Result<(Option<TextRange>, TextRange), ProjectionError> {
+    let end = line_break.source.end();
+    let tail_start = ByteOffset::new(
+        end.get()
+            .checked_sub(2)
+            .filter(|candidate| *candidate >= line_break.source.start().get())
+            .or_else(|| end.get().checked_sub(1))
+            .ok_or(ProjectionError::OffsetOverflow)?,
+    );
+    let tail = TextRange::new(tail_start, end).ok_or(ProjectionError::OffsetOverflow)?;
+    let bytes = read_range(source, tail)?;
+    let ending_len = if bytes.as_slice() == b"\r\n" {
+        2_u64
+    } else {
+        1_u64
+    };
+    let ending_start = ByteOffset::new(
+        end.get()
+            .checked_sub(ending_len)
+            .ok_or(ProjectionError::OffsetOverflow)?,
+    );
+    if ending_start < line_break.source.start() {
+        return Err(ProjectionError::OffsetOverflow);
+    }
+    let ending = TextRange::new(ending_start, end).ok_or(ProjectionError::OffsetOverflow)?;
+    let prefix = TextRange::new(line_break.source.start(), ending_start)
+        .ok_or(ProjectionError::OffsetOverflow)?;
+    Ok(((!prefix.is_empty()).then_some(prefix), ending))
 }
 
 fn append_visible_runs(
@@ -720,6 +859,7 @@ impl CodeProjection {
             source,
             block.range(),
             &hidden,
+            &[],
             &[],
             VisualRunStyle::Code,
         )?;
@@ -1072,6 +1212,28 @@ mod tests {
     }
 
     #[test]
+    fn line_breaks_inside_hidden_link_tail_do_not_escape_as_visual_breaks() {
+        let projection = projection("[label](url\nnext)");
+        assert_eq!(
+            projection
+                .runs()
+                .iter()
+                .filter(|run| run.is_line_break())
+                .count(),
+            0
+        );
+        assert_eq!(projection.visual_len(), VisualOffset::new(5));
+        assert_eq!(
+            projection
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn projection_scans_piece_tree_chunks_without_materializing_snapshot() {
         let parts = ["before ", "**", "羽🙂", "**", " after"];
         let mut buffer = TextBuffer::with_backend("", StorageBackend::PieceTree);
@@ -1205,8 +1367,13 @@ mod tests {
     fn identity_projection_maps_all_character_boundaries() {
         let source = "羽🙂\ntext";
         let projection = projection(source);
-        assert_eq!(projection.runs().len(), 1);
+        assert_eq!(projection.runs().len(), 3);
         assert_eq!(projection.runs()[0].kind(), VisualRunKind::Visible);
+        assert_eq!(
+            projection.runs()[1].kind(),
+            VisualRunKind::LineBreak { hard: false }
+        );
+        assert_eq!(projection.runs()[2].kind(), VisualRunKind::Visible);
         for (offset, _) in source
             .char_indices()
             .chain(std::iter::once((source.len(), ' ')))
@@ -1222,6 +1389,81 @@ mod tests {
                 source_offset
             );
         }
+    }
+
+    #[test]
+    fn projection_materializes_soft_and_hard_line_break_runs() {
+        let source = "a\nb  \nc\\\r\nd";
+        let projection = projection(source);
+        let line_breaks = projection
+            .runs()
+            .iter()
+            .filter(|run| run.is_line_break())
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(line_breaks.len(), 3);
+        assert_eq!(
+            line_breaks[0].kind(),
+            VisualRunKind::LineBreak { hard: false }
+        );
+        assert_eq!(
+            line_breaks[0].source(),
+            TextRange::new(ByteOffset::new(1), ByteOffset::new(2)).expect("range")
+        );
+        assert_eq!(
+            line_breaks[1].kind(),
+            VisualRunKind::LineBreak { hard: true }
+        );
+        assert_eq!(
+            line_breaks[1].source(),
+            TextRange::new(ByteOffset::new(5), ByteOffset::new(6)).expect("range")
+        );
+        assert_eq!(
+            line_breaks[2].kind(),
+            VisualRunKind::LineBreak { hard: true }
+        );
+        assert_eq!(
+            line_breaks[2].source(),
+            TextRange::new(ByteOffset::new(8), ByteOffset::new(10)).expect("range")
+        );
+        assert_eq!(
+            projection
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .map(|run| run.source())
+                .collect::<Vec<_>>(),
+            vec![
+                TextRange::new(ByteOffset::new(3), ByteOffset::new(5)).expect("range"),
+                TextRange::new(ByteOffset::new(7), ByteOffset::new(8)).expect("range"),
+            ]
+        );
+        assert_eq!(projection.visual_len(), VisualOffset::new(8));
+        assert_eq!(
+            projection
+                .source_to_visual(ByteOffset::new(3), ProjectionBias::After)
+                .expect("hard-break marker should map"),
+            VisualOffset::new(3)
+        );
+        assert_eq!(
+            projection
+                .source_to_visual(ByteOffset::new(6), ProjectionBias::After)
+                .expect("after hard break should map"),
+            VisualOffset::new(4)
+        );
+        assert_eq!(
+            projection
+                .visual_to_source(VisualOffset::new(3), ProjectionBias::Before)
+                .expect("before hidden hard-break syntax should map"),
+            ByteOffset::new(3)
+        );
+        assert_eq!(
+            projection
+                .visual_to_source(VisualOffset::new(3), ProjectionBias::After)
+                .expect("after hidden hard-break syntax should map"),
+            ByteOffset::new(5)
+        );
     }
 
     #[test]

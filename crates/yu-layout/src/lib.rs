@@ -872,6 +872,35 @@ impl LayoutSnapshot {
 
         for run in runs {
             line_source_end = line_source_end.max(run.source().end());
+            if let VisualRunKind::LineBreak { .. } = run.kind() {
+                let visual_end = run.visual().end();
+                self.clusters.push(VisualCluster {
+                    source: run.source(),
+                    visual: run.visual(),
+                    line: line_index,
+                    x: line_width,
+                    width: 0.0,
+                    style: run.style(),
+                    line_break: true,
+                });
+                self.push_line(LineDraft {
+                    index: line_index,
+                    source_start: line_source_start,
+                    source_end: line_source_end,
+                    visual_start: line_visual_start,
+                    visual_end,
+                    width: line_width,
+                    cluster_start: line_cluster_start,
+                })?;
+                line_index = line_index.saturating_add(1);
+                line_cluster_start = self.clusters.len();
+                line_source_start = run.source().end();
+                line_source_end = run.source().end();
+                line_visual_start = visual_end;
+                line_width = 0.0;
+                last_was_break = true;
+                continue;
+            }
             if run.kind() != VisualRunKind::Visible {
                 continue;
             }
@@ -992,6 +1021,35 @@ impl LayoutSnapshot {
 
         for run in runs {
             line_source_end = line_source_end.max(run.source().end());
+            if let VisualRunKind::LineBreak { .. } = run.kind() {
+                let visual_end = run.visual().end();
+                self.clusters.push(VisualCluster {
+                    source: run.source(),
+                    visual: run.visual(),
+                    line: line_index,
+                    x: line_width,
+                    width: 0.0,
+                    style: run.style(),
+                    line_break: true,
+                });
+                self.push_line(LineDraft {
+                    index: line_index,
+                    source_start: line_source_start,
+                    source_end: line_source_end,
+                    visual_start: line_visual_start,
+                    visual_end,
+                    width: line_width,
+                    cluster_start: line_cluster_start,
+                })?;
+                line_index = line_index.saturating_add(1);
+                line_cluster_start = self.clusters.len();
+                line_source_start = run.source().end();
+                line_source_end = run.source().end();
+                line_visual_start = visual_end;
+                line_width = 0.0;
+                last_was_break = true;
+                continue;
+            }
             if run.kind() != VisualRunKind::Visible {
                 continue;
             }
@@ -1436,6 +1494,66 @@ mod tests {
             .hit_test(LayoutPoint::new(10.0, 0.0))
             .expect("line-end hit-test should resolve");
         assert_eq!(end_of_first_line.source(), ByteOffset::new(1));
+    }
+
+    #[test]
+    fn layout_consumes_explicit_soft_and_hard_break_runs() {
+        let source = "a  \nb\r\nc";
+        let layout = LayoutSnapshot::from_projection(&projection(source), LayoutConfig::default())
+            .expect("layout should build");
+
+        assert_eq!(layout.lines().len(), 3);
+        assert_eq!(layout.lines()[0].width(), 1.0);
+        assert_eq!(layout.lines()[1].width(), 1.0);
+        assert_eq!(layout.lines()[2].width(), 1.0);
+        assert_eq!(
+            layout
+                .clusters()
+                .iter()
+                .filter(|cluster| cluster.is_line_break())
+                .count(),
+            2
+        );
+        assert_eq!(layout.lines()[0].source().end().get(), 4);
+        assert_eq!(layout.lines()[0].visual().end().get(), 2);
+        assert_eq!(layout.lines()[1].source().start().get(), 4);
+        assert_eq!(layout.lines()[1].source().end().get(), 7);
+        assert_eq!(layout.lines()[1].visual().start().get(), 2);
+        assert_eq!(layout.lines()[1].visual().end().get(), 5);
+
+        let after_first_break = layout
+            .caret_for_source(ByteOffset::new(4), ProjectionBias::After)
+            .expect("caret after hard break should resolve");
+        assert_eq!(after_first_break.line(), 1);
+        assert_eq!(after_first_break.point().x(), 0.0);
+        let after_second_break = layout
+            .caret_for_source(ByteOffset::new(7), ProjectionBias::After)
+            .expect("caret after CRLF should resolve");
+        assert_eq!(after_second_break.line(), 2);
+        assert_eq!(after_second_break.point().x(), 0.0);
+    }
+
+    #[test]
+    fn shaped_layout_consumes_explicit_line_break_runs_without_shaping_markers() {
+        let layout = LayoutSnapshot::from_projection_with_shaper(
+            &projection("a  \nb\r\nc"),
+            LayoutConfig::default(),
+            &TestShaper {
+                shape: TestShape::FixedGrapheme(1.0),
+            },
+        )
+        .expect("shaped layout should build");
+
+        assert_eq!(layout.lines().len(), 3);
+        assert_eq!(layout.glyphs().len(), 3);
+        assert_eq!(layout.clusters().len(), 5);
+        assert!(
+            layout
+                .clusters()
+                .iter()
+                .filter(|cluster| cluster.is_line_break())
+                .all(|cluster| cluster.width() == 0.0)
+        );
     }
 
     #[test]

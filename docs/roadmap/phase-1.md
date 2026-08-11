@@ -47,6 +47,7 @@
 - [x] `yu-markdown` lossless inline token CST 被 `yu-projection` 消费
 - [x] inline link/image destination ranges、soft/hard line-break tokens
 - [x] delimiter flanking 校验与 intraword underscore 拒绝规则
+- [x] Projection/Layout 消费显式 soft/hard LineBreak run，并隐藏 hard-break marker
 - [x] `yu-editor` revision-bound `ProjectionCache` 的命中、映射与失效规则
 - [x] `yu-editor` revision-bound `LayoutCache` 的 config key、映射与 block 结构失效规则
 - [x] `EditorDocument` 持有增量 `MarkdownDocument` 并提供 block-scoped projection
@@ -154,6 +155,8 @@
 30. inline CST 必须保留 punctuation、link/image label/destination 和 soft/hard line-break source
     ranges；flanking 失败的 delimiter、未闭合 link 和 escaped punctuation 不得生成错误 semantic
     span，full/incremental projection 输入必须保持同一源码覆盖。
+31. Projection 的 LineBreak run 必须保留 LF/CRLF source/visual range；hard-break 的尾随空格或
+    反斜杠只能作为零宽 hidden syntax，metrics 与 shaped layout 必须产生同样的 line/caret 映射。
 
 ## 非目标
 
