@@ -12,6 +12,7 @@ members = [
     "crates/yu-scene",
     "crates/yu-render",
     "platform/macos/yu-font-macos",
+    "platform/macos/yu-render-macos",
     "tools/yu-bench",
     "tools/yu-inspect",
 ]
