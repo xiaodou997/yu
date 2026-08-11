@@ -5,6 +5,8 @@ use std::iter::Peekable;
 use yu_core::{ByteOffset, Revision, TextRange};
 use yu_text::{ChunkCursor, TextPositionError, TextSnapshot};
 
+use crate::reference::ReferenceDefinitionIndex;
+
 /// A delimiter family recognized by the phase-one inline token scanner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InlineDelimiter {
@@ -245,6 +247,16 @@ pub fn parse_inline(
     source: &TextSnapshot,
     source_range: TextRange,
 ) -> Result<InlineDocument, InlineParseError> {
+    parse_inline_with_definitions(source, source_range, None)
+}
+
+/// Builds a lossless inline token stream with an optional revision-bound
+/// definition index for shortcut references such as `[project]`.
+pub fn parse_inline_with_definitions(
+    source: &TextSnapshot,
+    source_range: TextRange,
+    definitions: Option<&ReferenceDefinitionIndex>,
+) -> Result<InlineDocument, InlineParseError> {
     source.utf16_offset(source_range.start())?;
     source.utf16_offset(source_range.end())?;
 
@@ -365,7 +377,7 @@ pub fn parse_inline(
         usize::try_from(source_range.end()).map_err(|_| InlineParseError::OffsetOverflow)?,
     )?;
 
-    let spans = build_spans(source, &nodes)?;
+    let spans = build_spans(source, &nodes, definitions)?;
 
     Ok(InlineDocument {
         source: source.clone(),
@@ -552,6 +564,7 @@ struct DelimiterPair {
 fn build_spans(
     source: &TextSnapshot,
     nodes: &[InlineNode],
+    definitions: Option<&ReferenceDefinitionIndex>,
 ) -> Result<Vec<InlineSpan>, InlineParseError> {
     let delimiters = nodes
         .iter()
@@ -603,7 +616,12 @@ fn build_spans(
         }
     }
     spans.extend(build_link_spans(source, nodes, &code_pairs)?);
-    spans.extend(build_reference_link_spans(nodes, &code_pairs)?);
+    spans.extend(build_reference_link_spans(
+        source,
+        nodes,
+        &code_pairs,
+        definitions,
+    )?);
     spans.extend(build_autolink_spans(source, nodes, &code_pairs)?);
 
     spans.sort_by_key(|span| {
@@ -738,8 +756,10 @@ fn build_link_spans(
 }
 
 fn build_reference_link_spans(
+    source: &TextSnapshot,
     nodes: &[InlineNode],
     code_pairs: &[DelimiterPair],
+    definitions: Option<&ReferenceDefinitionIndex>,
 ) -> Result<Vec<InlineSpan>, InlineParseError> {
     let mut spans = Vec::new();
     for (open_index, open_node) in nodes.iter().enumerate() {
@@ -815,6 +835,87 @@ fn build_reference_link_spans(
             closing,
             destination: None,
             reference: Some(reference),
+        });
+    }
+
+    let Some(definitions) = definitions else {
+        return Ok(spans);
+    };
+
+    for (open_index, open_node) in nodes.iter().enumerate() {
+        if !matches!(
+            open_node.kind(),
+            InlineNodeKind::Punctuation {
+                kind: InlinePunctuation::OpenBracket
+            }
+        ) || inside_code(open_node.range(), code_pairs)
+        {
+            continue;
+        }
+        let Some(close_index) = matching_bracket(nodes, open_index) else {
+            continue;
+        };
+        let close_node = nodes[close_index];
+        let Some(content) = TextRange::new(open_node.range().end(), close_node.range().start())
+            .filter(|range| !range.is_empty())
+        else {
+            continue;
+        };
+        let candidate_range = TextRange::new(open_node.range().start(), close_node.range().end())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        if spans.iter().any(|span| {
+            matches!(
+                span.kind(),
+                InlineSpanKind::Link
+                    | InlineSpanKind::Image
+                    | InlineSpanKind::ReferenceLink
+                    | InlineSpanKind::ReferenceImage
+            ) && span.source_range().start() <= candidate_range.start()
+                && candidate_range.end() <= span.source_range().end()
+        }) {
+            continue;
+        }
+        if nodes.get(close_index + 1).is_some_and(|node| {
+            matches!(
+                node.kind(),
+                InlineNodeKind::Punctuation {
+                    kind: InlinePunctuation::OpenBracket | InlinePunctuation::OpenParen
+                }
+            )
+        }) {
+            continue;
+        }
+        if definitions.lookup(source, content).is_none() {
+            continue;
+        }
+        let image = open_index > 0
+            && matches!(
+                nodes[open_index - 1].kind(),
+                InlineNodeKind::Punctuation {
+                    kind: InlinePunctuation::Bang
+                }
+            )
+            && nodes[open_index - 1].range().end() == open_node.range().start();
+        let opening_start = if image {
+            nodes[open_index - 1].range().start()
+        } else {
+            open_node.range().start()
+        };
+        let source_range = TextRange::new(opening_start, close_node.range().end())
+            .ok_or(InlineParseError::OffsetOverflow)?;
+        spans.push(InlineSpan {
+            kind: if image {
+                InlineSpanKind::ReferenceImage
+            } else {
+                InlineSpanKind::ReferenceLink
+            },
+            source_range,
+            opening: TextRange::new(opening_start, open_node.range().end())
+                .ok_or(InlineParseError::OffsetOverflow)?,
+            content,
+            closing: close_node.range(),
+            destination: None,
+            reference: Some(content),
         });
     }
     Ok(spans)
@@ -1300,6 +1401,113 @@ mod tests {
                 .all(|span| { slice(source, span.source_range()) != "<div>" })
         );
         assert!(inline.has_lossless_coverage());
+    }
+
+    #[test]
+    fn definition_index_resolves_shortcut_links_and_images() {
+        let source = "[Project]: /docs\n\n[project] ![PROJECT]\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = crate::parse(&snapshot);
+        let paragraph = markdown.blocks().get(2).expect("paragraph should exist");
+        let inline = parse_inline_with_definitions(
+            &snapshot,
+            paragraph.range(),
+            Some(markdown.reference_definitions()),
+        )
+        .expect("definition-aware inline parse should succeed");
+
+        let references = inline
+            .spans()
+            .iter()
+            .filter(|span| {
+                matches!(
+                    span.kind(),
+                    InlineSpanKind::ReferenceLink | InlineSpanKind::ReferenceImage
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 2);
+        assert_eq!(slice(source, references[0].content()), "project");
+        assert_eq!(slice(source, references[1].content()), "PROJECT");
+        assert_eq!(slice(source, references[0].closing()), "]");
+        assert_eq!(references[0].reference(), Some(references[0].content()));
+        assert_eq!(
+            references[1].kind(),
+            InlineSpanKind::ReferenceImage,
+            "a shortcut image keeps its source-backed image kind"
+        );
+        assert!(
+            parse_inline(&snapshot, paragraph.range())
+                .expect("definition-free parse should succeed")
+                .spans()
+                .iter()
+                .all(|span| !matches!(
+                    span.kind(),
+                    InlineSpanKind::ReferenceLink | InlineSpanKind::ReferenceImage
+                ))
+        );
+    }
+
+    #[test]
+    fn shortcut_references_do_not_shadow_explicit_links_or_code() {
+        let source = "[id]: /docs\n\n[id](url) `[id]` [id]\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = crate::parse(&snapshot);
+        let paragraph = markdown.blocks().get(2).expect("paragraph should exist");
+        let inline = parse_inline_with_definitions(
+            &snapshot,
+            paragraph.range(),
+            Some(markdown.reference_definitions()),
+        )
+        .expect("definition-aware inline parse should succeed");
+
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::Link)
+                .count(),
+            1
+        );
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::ReferenceLink)
+                .count(),
+            1
+        );
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::CodeSpan)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn shortcut_parser_does_not_reparse_an_explicit_reference_tail() {
+        let source = "[id]: /docs\n[other]: /other\n\n[id][other]\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = crate::parse(&snapshot);
+        let paragraph = markdown.blocks().get(3).expect("paragraph should exist");
+        let inline = parse_inline_with_definitions(
+            &snapshot,
+            paragraph.range(),
+            Some(markdown.reference_definitions()),
+        )
+        .expect("definition-aware inline parse should succeed");
+
+        assert_eq!(
+            inline
+                .spans()
+                .iter()
+                .filter(|span| span.kind() == InlineSpanKind::ReferenceLink)
+                .count(),
+            1
+        );
     }
 
     #[test]

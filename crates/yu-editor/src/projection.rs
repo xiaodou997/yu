@@ -1,5 +1,5 @@
 use yu_core::{Revision, TextRange};
-use yu_markdown::{Block, BlockKind, MarkdownDocument};
+use yu_markdown::{Block, BlockKind, MarkdownDocument, ReferenceDefinitionIndex};
 use yu_projection::{BlockProjection, Projection, ProjectionError};
 use yu_text::{ChangeSet, TextSnapshot};
 
@@ -86,7 +86,29 @@ impl ProjectionCache {
         })?;
         match &self.entries[index].projection {
             BlockProjection::Inline(projection) => Ok(projection),
-            BlockProjection::FencedCode(_) => unreachable!("range projections are inline"),
+            BlockProjection::FencedCode(_) | BlockProjection::ReferenceDefinition(_) => {
+                unreachable!("range projections are inline")
+            }
+        }
+    }
+
+    /// Returns a cached inline projection resolved against the document's
+    /// revision-bound definition index.
+    pub fn get_or_build_with_definitions(
+        &mut self,
+        snapshot: &TextSnapshot,
+        range: TextRange,
+        definitions: &ReferenceDefinitionIndex,
+    ) -> Result<&Projection, ProjectionError> {
+        let index = self.get_or_build_key(snapshot, ProjectionKey::Range(range), || {
+            Projection::inline_with_definitions(snapshot, range, definitions)
+                .map(BlockProjection::Inline)
+        })?;
+        match &self.entries[index].projection {
+            BlockProjection::Inline(projection) => Ok(projection),
+            BlockProjection::FencedCode(_) | BlockProjection::ReferenceDefinition(_) => {
+                unreachable!("range projections are inline")
+            }
         }
     }
 
@@ -103,6 +125,25 @@ impl ProjectionCache {
                 kind: block.kind(),
             },
             || BlockProjection::from_block(snapshot, block),
+        )?;
+        Ok(&self.entries[index].projection)
+    }
+
+    /// Returns a block projection resolved against the document's current
+    /// reference definition index.
+    pub fn get_or_build_block_with_definitions(
+        &mut self,
+        snapshot: &TextSnapshot,
+        block: Block,
+        definitions: &ReferenceDefinitionIndex,
+    ) -> Result<&BlockProjection, ProjectionError> {
+        let index = self.get_or_build_key(
+            snapshot,
+            ProjectionKey::Block {
+                range: block.range(),
+                kind: block.kind(),
+            },
+            || BlockProjection::from_block_with_definitions(snapshot, block, definitions),
         )?;
         Ok(&self.entries[index].projection)
     }

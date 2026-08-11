@@ -25,7 +25,11 @@
 4. malformed Markdown 必须保留为可编辑源码，不能导致文档内容丢失。
 5. inline parser 产生的 Link/Image/Reference/Autolink destination/reference、soft/hard LineBreak
    和 delimiter span 必须只引用当前 Snapshot 的合法 source range；flanking 失败、未闭合结构、
-   HTML-like angle text 和 escaped punctuation 必须保持可见/可编辑，不得凭空制造 semantic node。
+   未命中同 revision definition index 的 shortcut、HTML-like angle text 和 escaped punctuation
+   必须保持可见/可编辑，不得凭空制造 semantic node。
+6. `ReferenceDefinition` 的整行、label 与 destination range 必须 source-backed；definition index
+   lookup 只能消费同一 Snapshot revision，且 incremental/full parse 产生的定义顺序和 fingerprint
+   必须一致。
 
 ## Async work
 
@@ -84,7 +88,9 @@
    通过 ChangeSet 映射，触及 range 或边界的 edit 必须失效，source reset 必须清空 cache。
 6. `EditorDocument::markdown().revision()` 必须等于 canonical TextBuffer Revision；block-keyed
    projection 必须同时匹配当前 block 的 source range 和 BlockKind，fenced code 必须返回
-   `BlockProjection::FencedCode`。
+   `BlockProjection::FencedCode`，reference definition 必须返回零宽 projection。definition index
+   fingerprint 变化时，projection/layout/viewport cache 必须整体失效；否则 strictly-outside edit
+   才允许映射复用。
 
 ## Layout
 

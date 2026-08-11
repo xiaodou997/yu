@@ -49,6 +49,7 @@
 - [x] delimiter flanking 校验与 intraword underscore 拒绝规则
 - [x] Projection/Layout 消费显式 soft/hard LineBreak run，并隐藏 hard-break marker
 - [x] explicit/collapsed reference link 与 URL/email autolink source ranges
+- [x] block-level reference definition index、shortcut reference 与非局部 cache 失效
 - [x] `yu-editor` revision-bound `ProjectionCache` 的命中、映射与失效规则
 - [x] `yu-editor` revision-bound `LayoutCache` 的 config key、映射与 block 结构失效规则
 - [x] `EditorDocument` 持有增量 `MarkdownDocument` 并提供 block-scoped projection
@@ -161,6 +162,9 @@
 32. ReferenceLink/ReferenceImage/Autolink 必须由 parser-owned span 提供完整 opening/content/
     closing 与 reference/destination range；Projection 只能隐藏对应 syntax，不能把 `<div>` 或
     未闭合/shortcut 未解析结构误判为 semantic link。
+33. Reference definition block 必须保留整行/label/destination source ranges；shortcut 只有在同
+    revision definition index 命中时才隐藏，definition fingerprint 变化必须使非局部 projection、
+    layout 和 viewport cache 失效。
 
 ## 非目标
 

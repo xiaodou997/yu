@@ -8,6 +8,8 @@ use yu_core::{ByteOffset, TextRange};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     BlankLine,
+    /// A source-backed link definition such as `[project]: /docs`.
+    ReferenceDefinition,
     Paragraph,
     AtxHeading {
         level: u8,

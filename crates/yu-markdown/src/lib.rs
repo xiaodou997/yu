@@ -18,6 +18,7 @@ use yu_text::{
 
 mod block_sequence;
 mod inline;
+mod reference;
 
 pub use block_sequence::{
     Block, BlockCompactionPolicy, BlockKind, BlockSequence, BlockState, BlockStorageStats,
@@ -26,8 +27,9 @@ pub use block_sequence::{
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
 pub use inline::{
     InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError,
-    InlinePunctuation, InlineSpan, InlineSpanKind, parse_inline,
+    InlinePunctuation, InlineSpan, InlineSpanKind, parse_inline, parse_inline_with_definitions,
 };
+pub use reference::{ReferenceDefinition, ReferenceDefinitionIndex};
 
 /// A lossless block view of one immutable text revision.
 #[derive(Clone, Debug)]
@@ -36,6 +38,7 @@ pub struct MarkdownDocument {
     source_len: ByteOffset,
     source: TextSnapshot,
     blocks: BlockSequence,
+    references: ReferenceDefinitionIndex,
 }
 
 impl MarkdownDocument {
@@ -52,6 +55,12 @@ impl MarkdownDocument {
     #[must_use]
     pub fn blocks(&self) -> &BlockSequence {
         &self.blocks
+    }
+
+    /// Returns the source-backed link definitions for this document revision.
+    #[must_use]
+    pub fn reference_definitions(&self) -> &ReferenceDefinitionIndex {
+        &self.references
     }
 
     #[must_use]
@@ -103,6 +112,7 @@ impl PartialEq for MarkdownDocument {
         self.revision == other.revision
             && self.source_len == other.source_len
             && self.blocks == other.blocks
+            && self.references == other.references
     }
 }
 
@@ -453,11 +463,13 @@ fn is_markdown_space(character: char) -> bool {
 /// Scans an immutable Snapshot without materializing a contiguous source copy.
 #[must_use]
 pub fn parse(snapshot: &TextSnapshot) -> MarkdownDocument {
+    let blocks = BlockSequence::from_records(BlockParser::new(snapshot, 0).collect());
     MarkdownDocument {
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
         source: snapshot.clone(),
-        blocks: BlockSequence::from_records(BlockParser::new(snapshot, 0).collect()),
+        references: ReferenceDefinitionIndex::from_blocks(snapshot, &blocks),
+        blocks,
     }
 }
 
@@ -487,6 +499,7 @@ pub fn parse_incremental(
             source_len: snapshot.len_bytes(),
             source: snapshot.clone(),
             blocks: previous.blocks.clone(),
+            references: ReferenceDefinitionIndex::from_blocks(snapshot, &previous.blocks),
         };
         return Ok(IncrementalParse {
             reparsed_range: TextRange::empty(snapshot.len_bytes()),
@@ -584,6 +597,7 @@ pub fn parse_incremental(
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
         source: snapshot.clone(),
+        references: ReferenceDefinitionIndex::from_blocks(snapshot, &blocks),
         blocks,
     };
     let reparsed_range = TextRange::new(new_start, scanned_end)
@@ -598,14 +612,26 @@ pub fn parse_incremental(
 }
 
 struct BlockParser<'a> {
+    snapshot: &'a TextSnapshot,
     lines: Peekable<LineCursor<'a>>,
 }
 
 impl<'a> BlockParser<'a> {
     fn new(snapshot: &'a TextSnapshot, start: usize) -> Self {
         Self {
+            snapshot,
             lines: LineCursor::new(snapshot, start).peekable(),
         }
+    }
+
+    fn is_reference_definition(&self, line: Line) -> bool {
+        let Some(range) = TextRange::new(
+            ByteOffset::try_from(line.start).expect("line start must fit u64"),
+            ByteOffset::try_from(line.end).expect("line end must fit u64"),
+        ) else {
+            return false;
+        };
+        reference::is_reference_definition_line(self.snapshot, range)
     }
 
     fn record(
@@ -692,6 +718,16 @@ impl Iterator for BlockParser<'_> {
             return Some(self.parse_container(line, marker));
         }
 
+        if self.is_reference_definition(line) {
+            return Some(self.record(
+                BlockKind::ReferenceDefinition,
+                line.start,
+                line.end,
+                BlockState::Normal,
+                line.source_hash,
+            ));
+        }
+
         let block_start = line.start;
         let mut end = line.end;
         let mut source_hash = line.source_hash;
@@ -700,6 +736,7 @@ impl Iterator for BlockParser<'_> {
                 || candidate.opening_fence().is_some()
                 || candidate.atx_heading_level().is_some()
                 || candidate.block_marker().is_some()
+                || self.is_reference_definition(candidate)
             {
                 break;
             }
@@ -1044,7 +1081,7 @@ impl<'a> Iterator for RangeSlices<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
+    use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
 
     #[test]
     fn scanner_covers_source_without_gaps() {
@@ -1179,6 +1216,48 @@ mod tests {
     }
 
     #[test]
+    fn scanner_extracts_source_backed_reference_definitions() {
+        let source = "[Project Link]: <https://example.com> \"title\"\n[other]: /docs\n\n[Project Link]\n![other]\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let document = parse(&snapshot);
+
+        assert!(document.has_lossless_coverage());
+        assert_eq!(kind_at(&document, 0), BlockKind::ReferenceDefinition);
+        assert_eq!(kind_at(&document, 1), BlockKind::ReferenceDefinition);
+        assert_eq!(kind_at(&document, 2), BlockKind::BlankLine);
+        assert_eq!(kind_at(&document, 3), BlockKind::Paragraph);
+        assert_eq!(document.reference_definitions().definitions().len(), 2);
+
+        let paragraph = document.blocks().get(3).expect("paragraph should exist");
+        let label_start = source[paragraph.range().start().get() as usize..]
+            .find("Project Link")
+            .expect("shortcut label should exist") as u64
+            + paragraph.range().start().get();
+        let label = TextRange::new(
+            ByteOffset::new(label_start),
+            ByteOffset::new(label_start + "Project Link".len() as u64),
+        )
+        .expect("label range should be ordered");
+        let definition = document
+            .reference_definitions()
+            .lookup(&snapshot, label)
+            .expect("definition should resolve case-insensitively");
+        assert_eq!(
+            &source[definition.destination().start().get() as usize
+                ..definition.destination().end().get() as usize],
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn four_space_indented_definition_remains_literal_paragraph_text() {
+        let document = parse(&TextBuffer::new("    [id]: /docs\n").snapshot());
+        assert_eq!(document.blocks().len(), 1);
+        assert_eq!(kind_at(&document, 0), BlockKind::Paragraph);
+        assert!(document.reference_definitions().definitions().is_empty());
+    }
+
+    #[test]
     fn scanner_reads_syntax_across_piece_boundaries_without_materializing() {
         let parts = [
             "#", " 羽", "\r", "\n", "\r\n", "```", "rust\n", "body", "\n`", "``\n",
@@ -1213,6 +1292,34 @@ mod tests {
         );
         assert_eq!(
             retained_snapshot_stats(&[snapshot]).materialized_buffers(),
+            0
+        );
+    }
+
+    #[test]
+    fn reference_definition_scan_stays_chunk_aware() {
+        let parts = [
+            "prefix\n\n[",
+            "project",
+            "]: <",
+            "https://example.com",
+            ">\n\n[project]\n",
+        ];
+        let mut buffer = TextBuffer::with_backend("", StorageBackend::PieceTree);
+        for part in parts {
+            let at = buffer.snapshot().len_bytes();
+            let transaction =
+                Transaction::new(buffer.revision(), [Edit::new(TextRange::empty(at), part)]);
+            buffer
+                .apply(&transaction)
+                .expect("append transaction should apply");
+        }
+        let snapshot = buffer.snapshot();
+        let document = parse(&snapshot);
+
+        assert_eq!(document.reference_definitions().definitions().len(), 1);
+        assert_eq!(
+            retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers(),
             0
         );
     }
@@ -1278,6 +1385,65 @@ mod tests {
         assert_eq!(incremental.document(), &parse(applied.result_snapshot()));
         assert_eq!(incremental.reused_prefix_blocks(), previous.blocks().len());
         assert!(incremental.reparsed_range().is_empty());
+    }
+
+    #[test]
+    fn incremental_parse_rebuilds_reference_definition_index() {
+        let source = "[id]: /docs\n\n[id]\n";
+        let mut buffer = TextBuffer::new(source);
+        let previous = parse(&buffer.snapshot());
+        let label_start = source.find("id").expect("definition label should exist");
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(
+                TextRange::new(
+                    ByteOffset::new(label_start as u64),
+                    ByteOffset::new((label_start + 2) as u64),
+                )
+                .expect("label range should be ordered"),
+                "new",
+            )],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("definition edit should apply");
+        let incremental =
+            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+                .expect("definition edit should parse incrementally");
+        let full = parse(applied.result_snapshot());
+
+        assert_eq!(incremental.document(), &full);
+        assert_ne!(
+            previous.reference_definitions().fingerprint(),
+            full.reference_definitions().fingerprint()
+        );
+        assert_eq!(full.reference_definitions().definitions().len(), 1);
+    }
+
+    #[test]
+    fn empty_incremental_parse_rebinds_definition_index_revision() {
+        let mut buffer = TextBuffer::new("[id]: /docs\n\n[id]\n");
+        let previous = parse(&buffer.snapshot());
+        let transaction = Transaction::new(buffer.revision(), std::iter::empty::<Edit>());
+        let applied = buffer
+            .apply(&transaction)
+            .expect("empty transaction should apply");
+        let incremental =
+            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+                .expect("empty edit should parse incrementally");
+
+        assert_eq!(
+            incremental.document().reference_definitions().revision(),
+            applied.result_snapshot().revision()
+        );
+        assert_eq!(
+            incremental
+                .document()
+                .reference_definitions()
+                .definitions()
+                .len(),
+            1
+        );
     }
 
     #[test]

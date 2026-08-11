@@ -24,6 +24,7 @@ parser 前后 retained Snapshot 的 materialized buffer 数必须不变。
 BlankLine | Paragraph | AtxHeading | FencedCodeBlock
 BlockQuote { depth }
 ListItem { ordered, depth, marker, start }
+ReferenceDefinition
 ```
 
 blockquote 和 list item 的源码范围包含其连续/lazy continuation 行；嵌套 list 先以更大的
@@ -122,9 +123,23 @@ LineBreak { hard }
 parser-owned `InlineSpan` 在 delimiter flanking 校验后产生 `Emphasis`、`Strong`、`CodeSpan`、
 `Link`、`Image`、`ReferenceLink`、`ReferenceImage` 和 `Autolink`。链接/图片 span 的 `opening`、
 `content`、`closing`、`destination`/`reference` 都是源码范围；projection 可以隐藏 `[]()`、
-`![]()`、reference tail 和 autolink angle brackets 而保留 label/alt/text。当前 reference 只
-接受显式或 collapsed 形式 `[label][id]`/`[label][]`，不猜测 shortcut definition；未闭合链接、
-未匹配 delimiter、HTML-like angle text 和转义 punctuation 保持为普通可编辑源码。
+`![]()`、reference tail 和 autolink angle brackets 而保留 label/alt/text。显式或 collapsed 形式
+`[label][id]`/`[label][]` 始终保留 reference source range；只有同一 `TextSnapshot` 的
+`ReferenceDefinitionIndex` 命中时，`[label]`/`![label]` 才产生 shortcut reference span。未闭合
+链接、未解析 shortcut、HTML-like angle text 和转义 punctuation 保持为普通可编辑源码。
+
+## Reference Definition Index
+
+根级 block scanner 将保守的 `[label]: destination` 行记录为 `ReferenceDefinition`，其 label、
+destination 和整行 range 均只引用 source。`MarkdownDocument` 为每个 revision 持有一个
+`ReferenceDefinitionIndex`；lookup 使用 ASCII case-fold 与空白折叠，并拒绝来自其他 revision
+的 Snapshot。definition block 的 projection 是零宽 source-backed block，不会把定义行显示为
+正文。
+
+definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
+offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地
+清空 projection/layout/viewport cache，因为一个 definition 的变化可能影响远处的 shortcut
+reference。
 
 硬换行的 `LineBreak` range 包含两个尾随空格或反斜杠与 CRLF/LF，软换行只包含 line ending。
 `yu-projection` 将 line ending 变成显式 `VisualRunKind::LineBreak { hard }`；硬换行的 marker

@@ -33,6 +33,7 @@
 
 ## 限制
 
-本阶段不解析 reference definition block、shortcut reference、完整 CommonMark URI/email Unicode
-规则、HTML 标签或 destination 规范化；这些语义必须由后续 Markdown definition/extension 层明确
-提供，不能由 projection 猜测。
+本 ADR 当时不解析 reference definition block 与 shortcut reference；后续实现见
+[ADR 0043](0043-reference-definitions-shortcuts.md)。完整 CommonMark URI/email Unicode 规则、
+HTML 标签和 destination 规范化仍未实现；这些语义必须由明确的 Markdown definition/extension
+层提供，不能由 projection 猜测。
