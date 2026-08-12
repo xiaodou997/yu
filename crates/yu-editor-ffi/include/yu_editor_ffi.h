@@ -142,6 +142,20 @@ typedef struct YuBlockProjectionCaret {
     uint8_t affinity;
 } YuBlockProjectionCaret;
 
+typedef struct YuBlockShapedCaret {
+    uint64_t revision;
+    uint64_t source_utf16;
+    uint64_t block_index;
+    uint64_t visual_utf16;
+    uint64_t round_trip_source_utf16;
+    uint64_t line_index;
+    float caret_x;
+    float caret_y;
+    float caret_width;
+    float caret_height;
+    uint8_t affinity;
+} YuBlockShapedCaret;
+
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,
                                    YuCompositionSession **output);
 void yu_composition_session_destroy(YuCompositionSession *session);
@@ -199,6 +213,13 @@ int32_t yu_composition_session_block_projection_caret(YuCompositionSession *sess
                                                       uint64_t source_utf16,
                                                       uint8_t affinity,
                                                       YuBlockProjectionCaret *output);
+int32_t yu_macos_composition_session_block_shaped_caret(YuCompositionSession *session,
+                                                        uint64_t expected_revision,
+                                                        uint64_t source_utf16,
+                                                        uint8_t affinity,
+                                                        float size,
+                                                        float max_width,
+                                                        YuBlockShapedCaret *output);
 int32_t yu_composition_session_set_viewport_config(YuCompositionSession *session,
                                                    uint64_t expected_revision,
                                                    float max_width,

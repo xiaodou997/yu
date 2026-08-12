@@ -123,6 +123,13 @@
     visual UTF-16 必须是该 block-local projection 的坐标并携带 block index。stale Revision、无
     matching block、surrogate split、未知 affinity 或映射错误必须清空 output 并拒绝，查询不得
     物化整份文档 projection，也不得修改 source、selection、composition、history 或 Revision。
+28. `yu_macos_composition_session_block_shaped_caret` 必须在同一 Revision 的 block-local
+    `LayoutSnapshot` 上使用真实 CoreText shaper，返回有序 source/visual UTF-16、line index、
+    有限的 block-local x/y 和正的 line height；hidden delimiter 的 Before/After affinity 可以
+    改变 round-trip source，但不得改变 visual point。stale Revision、surrogate split、未知
+    affinity、非法 size/max width、CoreText/layout 失败必须清空 output；非 macOS 必须返回明确的
+    `YU_FFI_CORE_TEXT_UNAVAILABLE`，查询不得修改 source、selection、composition、history 或
+    Revision，也不得把平台句柄暴露到 ABI。
 
 ## Accessibility
 

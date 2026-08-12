@@ -280,6 +280,13 @@ Markdown block：`EditorDocument::block_index_for_source` 负责 boundary 选择
 并携带 block index；因此 native layout/reveal 可以只准备当前 block，不需要为一次 caret 查询
 物化整份文档 projection。它与 ADR 0060 的全局诊断 ABI 并存，仍不携带 line/point 或平台句柄。
 
+在该局部映射之上，`yu_macos_composition_session_block_shaped_caret` 使用同一
+`EditorDocument` 的 `block_layout_with_shaper` 和 CoreText System UI shaper，返回 block-local
+visual UTF-16、round-trip source、line index、x/y 和 line height。结果是 revision-bound 的
+owned scalar；Swift 只负责将 block origin、viewport 和 AppKit caret view 组合起来。隐藏
+delimiter 的 upstream/downstream 仍共享 shaped point，但 round-trip source 保留 affinity。
+非 macOS 保留 ABI 并返回 unavailable；这一步仍是 geometry/IME 风险验证，不是完整 GUI。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过
