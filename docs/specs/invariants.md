@@ -269,6 +269,9 @@
 6. `SceneBuilder::append_layout` 必须先校验 layout/scene Revision、font size 和所有 atlas
    entry，再追加 glyph primitive；任一失败不得发布部分 layout scene。glyph primitive 的 origin
    必须直接来自 placement 的 layout 坐标，不能在 renderer 中重新推导 source position。
+7. macOS partial-damage frame 的 backend command culling 必须只按已验证 native command bounds
+   与 damage region 做严格相交过滤，保留原 painter order、跨 region command 只保留一次；full
+   clear 必须保留完整 command list，culling 不得修改 shared `RenderPlan`、scene 或 Revision。
 
 ## macOS Metal boundary
 

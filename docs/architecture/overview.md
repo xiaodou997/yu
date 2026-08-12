@@ -398,3 +398,8 @@ Metal device 或有效 drawable 的会话默认跳过硬件测试，需显式运
 probe-only AppKit host ignored test：它在主线程创建临时 `NSWindow`/`NSView`，实测 attachment、resize、
 drawable acquisition 和 scoped detach，然后立即销毁 host；该 host 不属于产品 UI，也不改变 backend
 不创建窗口的所有权边界。
+
+partial-damage frame 在进入 Objective-C bridge 前由 macOS backend 按 native command bounds
+过滤不与 dirty region 相交的命令；full-clear frame 仍发送完整 painter-order list。过滤只影响
+backend-owned 临时 ABI 数组，不能修改 shared `RenderPlan` 或 scene，因此不会引入第二套 source
+geometry。见 ADR 0073。

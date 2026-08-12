@@ -1472,7 +1472,7 @@ impl MetalFrameRenderer {
 
         let recreated_target = self.ensure_target(surface)?;
         let viewport = plan.viewport();
-        let commands = build_native_commands(plan, &atlas.page_sizes())?;
+        let all_commands = build_native_commands(plan, &atlas.page_sizes())?;
         let damage = build_native_damage(plan)?;
         let full_clear = recreated_target
             || self.needs_full_clear
@@ -1497,6 +1497,11 @@ impl MetalFrameRenderer {
         if !full_clear && damage.is_empty() {
             return Ok(());
         }
+        let commands = if full_clear {
+            all_commands
+        } else {
+            cull_native_commands(all_commands, &damage)
+        };
 
         #[cfg(target_os = "macos")]
         {
@@ -1846,6 +1851,37 @@ fn build_native_damage(plan: &RenderPlan) -> Result<Vec<NativeDamageRect>, Metal
     Ok(damage)
 }
 
+/// Keeps only commands whose covered bounds intersect at least one dirty
+/// region. Coordinates are already relative to the render-plan viewport, the
+/// same coordinate space used by `build_native_damage` and the native scissor
+/// ABI. Painter order is preserved, and a command is kept once even when it
+/// intersects multiple damage regions.
+fn cull_native_commands(
+    commands: Vec<NativeDrawCommand>,
+    damage: &[NativeDamageRect],
+) -> Vec<NativeDrawCommand> {
+    commands
+        .into_iter()
+        .filter(|command| {
+            damage
+                .iter()
+                .copied()
+                .any(|region| native_command_intersects_damage(*command, region))
+        })
+        .collect()
+}
+
+fn native_command_intersects_damage(command: NativeDrawCommand, damage: NativeDamageRect) -> bool {
+    let command_right = command.x + command.width;
+    let command_bottom = command.y + command.height;
+    let damage_right = damage.x + damage.width;
+    let damage_bottom = damage.y + damage.height;
+    command.x < damage_right
+        && damage.x < command_right
+        && command.y < damage_bottom
+        && damage.y < command_bottom
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2098,6 +2134,108 @@ mod tests {
         assert_eq!(damage[0].y, 0.0);
         assert_eq!(damage[0].width, 15.0);
         assert_eq!(damage[0].height, 10.0);
+    }
+
+    #[test]
+    fn native_damage_culling_preserves_order_and_drops_disjoint_commands() {
+        let commands = vec![
+            NativeDrawCommand {
+                kind: DRAW_FILL_RECT,
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                u0: 0.0,
+                v0: 0.0,
+                u1: 0.0,
+                v1: 0.0,
+                red: 1.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+                page: u32::MAX,
+            },
+            NativeDrawCommand {
+                kind: DRAW_GLYPH,
+                x: 30.0,
+                y: 4.0,
+                width: 6.0,
+                height: 8.0,
+                u0: 0.0,
+                v0: 0.0,
+                u1: 0.5,
+                v1: 0.5,
+                red: 1.0,
+                green: 1.0,
+                blue: 1.0,
+                alpha: 1.0,
+                page: 2,
+            },
+            NativeDrawCommand {
+                kind: DRAW_FILL_RECT,
+                x: 70.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                u0: 0.0,
+                v0: 0.0,
+                u1: 0.0,
+                v1: 0.0,
+                red: 0.0,
+                green: 1.0,
+                blue: 0.0,
+                alpha: 1.0,
+                page: u32::MAX,
+            },
+        ];
+        let damage = [NativeDamageRect {
+            x: 24.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        }];
+
+        let culled = cull_native_commands(commands, &damage);
+        assert_eq!(culled.len(), 1);
+        assert_eq!(culled[0].kind, DRAW_GLYPH);
+        assert_eq!(culled[0].x, 30.0);
+    }
+
+    #[test]
+    fn native_damage_culling_keeps_commands_touching_overlapping_dirty_regions_once() {
+        let command = NativeDrawCommand {
+            kind: DRAW_FILL_RECT,
+            x: 8.0,
+            y: 8.0,
+            width: 12.0,
+            height: 12.0,
+            u0: 0.0,
+            v0: 0.0,
+            u1: 0.0,
+            v1: 0.0,
+            red: 1.0,
+            green: 1.0,
+            blue: 1.0,
+            alpha: 1.0,
+            page: u32::MAX,
+        };
+        let damage = [
+            NativeDamageRect {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NativeDamageRect {
+                x: 15.0,
+                y: 15.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ];
+
+        let culled = cull_native_commands(vec![command], &damage);
+        assert_eq!(culled, vec![command]);
     }
 
     #[cfg(not(target_os = "macos"))]

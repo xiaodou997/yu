@@ -170,6 +170,9 @@
     发布边界，返回绑定 Revision、serial 与 owned frame 的 publication；macOS host 必须通过
     `accept_publication` 拒绝旧/重复/乱序 publication，且无窗口测试必须覆盖接收一次、重复拒绝
     与 Revision 推进后的 cache 清理。
+9n. macOS retained partial-damage frame 必须在 native bridge 前按 command bounds 做 backend-owned
+    culling，保留 painter order、完整 frame 不裁剪、跨多个 damage region 的 command 不重复；无
+    窗口测试必须覆盖相交保留与不相交剔除。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

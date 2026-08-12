@@ -39,6 +39,7 @@ damage rectangles 影响 GPU 工作量；这一步仍不应创建窗口、菜单
 
 ## 限制
 
-当前 damage path 仍对每个 damage region 重放完整 retained command list，尚未做 command-level
-damage culling、批处理或 indirect draw；完整 target 到 drawable 的 blit 也尚未按 damage 做带宽
-优化。surface generation 或 target 重建会先 full clear，避免跨尺寸保留未定义像素。
+当前 damage path 已在 Rust backend 侧按 command bounds 做 command-level culling，但仍对每个
+damage region 重放筛选后的完整 painter-order command list，尚未做批处理或 indirect draw；完整
+target 到 drawable 的 blit 也尚未按 damage 做带宽优化。surface generation 或 target 重建会先
+full clear，避免跨尺寸保留未定义像素。culling 的独立协议见 ADR 0073。
