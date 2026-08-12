@@ -302,3 +302,7 @@
 12. AppKit host probe 只能存在于 macOS ignored lifecycle test：它必须在 AppKit main thread 创建并
     销毁临时 `NSWindow`/`NSView`，只验证 attachment、resize、drawable 和 detach 边界，不得进入产品
     backend API 的窗口所有权，也不得把 probe state 写入 shared editor state。
+13. `MetalFrameRenderer::submit_viewport_frame` 必须按 `current Revision gate → atlas staging →
+    render_plan → consumer commit` 顺序消费 `ViewportRenderFrame`；stale frame 不得上传 atlas 或
+    进入 native command path，atlas staging/native/backend 失败不得推进 consumer Revision。相同
+    page fingerprint 只能在同一 Metal device 上复用，submission result 只能返回 owned scalar。

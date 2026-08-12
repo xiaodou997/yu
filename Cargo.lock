@@ -158,6 +158,7 @@ name = "yu-render-macos"
 version = "0.1.0"
 dependencies = [
  "yu-core",
+ "yu-editor",
  "yu-font",
  "yu-render",
  "yu-scene",

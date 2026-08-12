@@ -331,6 +331,13 @@ macOS backend 在这个 cache 之后再设一层 `MetalFrameConsumer`：`MetalFr
 drawable 或 native encoder 失败都不会推进 consumer。consumer 不持有 editor/source/layout 或 GPU
 对象，并可通过 revision-only 单元测试覆盖 stale 与回退，而无需创建窗口。
 
+macOS host 的推荐提交入口是 `MetalFrameRenderer::submit_viewport_frame`。它把顺序固定为
+`Revision gate → MetalAtlas::sync_plan → render_plan → consumer commit`，并返回只含 Revision 与
+上传页数的 `MetalFrameSubmission`。`MetalAtlas` 对同一 device 的相同 page fingerprint 去重，
+staging 失败不会替换已有 texture；device mismatch 在 native 调用前拒绝。现有 AppKit ignored
+probe 已使用真实 workspace frame 覆盖 stale、匹配提交、resize 后再次提交和 atlas 复用，但仍不
+拥有产品窗口。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过
