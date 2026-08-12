@@ -16,5 +16,8 @@ yu-render = { path = "../../../crates/yu-render" }
 yu-scene = { path = "../../../crates/yu-scene" }
 yu-workspace = { path = "../../../crates/yu-workspace" }
 
+[dev-dependencies]
+yu-editor = { path = "../../../crates/yu-editor" }
+
 [lints]
 workspace = true

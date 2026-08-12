@@ -717,6 +717,15 @@ impl RenderUploader for MetalUploader {
 #[derive(Debug, Default)]
 pub struct MetalAtlas {
     pages: BTreeMap<u32, MetalTexture>,
+    fingerprints: BTreeMap<u32, AtlasPageIdentity>,
+    device_registry_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AtlasPageIdentity {
+    width: u32,
+    height: u32,
+    fingerprint: u64,
 }
 
 impl MetalAtlas {
@@ -731,15 +740,33 @@ impl MetalAtlas {
         uploader: &mut MetalUploader,
         plan: &RenderPlan,
     ) -> Result<usize, MetalRenderError> {
+        let device_registry_id = uploader.device().registry_id();
+        if let Some(existing) = self.device_registry_id
+            && existing != device_registry_id
+        {
+            return Err(MetalRenderError::DeviceMismatch);
+        }
         let mut staged = Vec::with_capacity(plan.uploads().len());
         for page in plan.uploads() {
+            let identity = AtlasPageIdentity {
+                width: page.width(),
+                height: page.height(),
+                fingerprint: page.fingerprint(),
+            };
+            if self.pages.contains_key(&page.page())
+                && self.fingerprints.get(&page.page()) == Some(&identity)
+            {
+                continue;
+            }
             let texture = uploader.upload_alpha_page(page)?;
-            staged.push((page.page(), texture));
+            staged.push((page.page(), identity, texture));
         }
         let uploaded = staged.len();
-        for (page, texture) in staged {
+        for (page, identity, texture) in staged {
             self.pages.insert(page, texture);
+            self.fingerprints.insert(page, identity);
         }
+        self.device_registry_id = Some(device_registry_id);
         Ok(uploaded)
     }
 
@@ -988,6 +1015,25 @@ pub struct MetalFrameRenderer {
     frame_consumer: MetalFrameConsumer,
 }
 
+/// Owned scalar result from one host-level frame submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetalFrameSubmission {
+    revision: Revision,
+    uploaded_pages: usize,
+}
+
+impl MetalFrameSubmission {
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn uploaded_pages(self) -> usize {
+        self.uploaded_pages
+    }
+}
+
 impl fmt::Debug for MetalFrameRenderer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1200,9 +1246,38 @@ impl MetalFrameRenderer {
         self.frame_consumer.commit(current_revision, frame)
     }
 
+    /// Host-level submission for one workspace frame.
+    ///
+    /// The order is intentional: stale frames are rejected before any atlas
+    /// upload or native command conversion; atlas uploads are staged before
+    /// they become visible; successful render submission is the only point at
+    /// which the consumer advances its accepted Revision.
+    pub fn submit_viewport_frame(
+        &mut self,
+        surface: &MetalSurface,
+        current_revision: Revision,
+        frame: &ViewportRenderFrame,
+        uploader: &mut MetalUploader,
+        atlas: &mut MetalAtlas,
+    ) -> Result<MetalFrameSubmission, MetalRenderError> {
+        self.frame_consumer.validate(current_revision, frame)?;
+        let uploaded_pages = atlas.sync_plan(uploader, frame.plan())?;
+        self.render_plan(surface, frame.plan(), atlas)?;
+        self.frame_consumer.commit(current_revision, frame)?;
+        Ok(MetalFrameSubmission {
+            revision: frame.revision(),
+            uploaded_pages,
+        })
+    }
+
     #[must_use]
     pub const fn queue(&self) -> &MetalCommandQueue {
         &self.queue
+    }
+
+    #[must_use]
+    pub fn last_consumed_revision(&self) -> Option<Revision> {
+        self.frame_consumer.last_revision()
     }
 }
 
@@ -1702,12 +1777,86 @@ mod tests {
     struct AppKitProbeState {
         surface: MetalSurface,
         renderer: MetalFrameRenderer,
-        plan: RenderPlan,
+        frame: ViewportRenderFrame,
+        uploader: MetalUploader,
         atlas: MetalAtlas,
-        first: Option<Result<(), MetalRenderError>>,
-        second: Option<Result<(), MetalRenderError>>,
+        stale: Option<Result<MetalFrameSubmission, MetalRenderError>>,
+        first: Option<Result<MetalFrameSubmission, MetalRenderError>>,
+        second: Option<Result<MetalFrameSubmission, MetalRenderError>>,
         attachment_error: Option<MetalRenderError>,
         host_created: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn appkit_probe_frame() -> ViewportRenderFrame {
+        use std::sync::Arc;
+
+        use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportRect};
+        use yu_font::{
+            FontDatabase, FontFaceSpec, FontRequest, FontShaper, GlyphAtlas, GlyphAtlasConfig,
+            GlyphBitmap, GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
+        };
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{Rect, Rgba8};
+        use yu_workspace::{ViewportRenderConfig, assemble_viewport_render_frame};
+
+        let font_size = 14.0;
+        let mut database = FontDatabase::new();
+        database
+            .register(FontFaceSpec::new("Probe", 0.5))
+            .expect("probe font");
+        let shaper = FontShaper::new(
+            Arc::new(database),
+            FontRequest::new("Probe", font_size).expect("probe font request"),
+        )
+        .expect("probe shaper");
+        let viewport = ViewportRect::new(0.0, 160.0);
+        let mut document = EditorDocument::new("# Yu Metal\n\nhello **viewport**");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(280.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("probe viewport config");
+
+        let snapshot = document
+            .visible_blocks_with_shaper(viewport, &shaper)
+            .expect("probe viewport");
+        let config = document.viewport_config().layout();
+        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(64, 64, 1).expect("atlas config"));
+        for block in snapshot.blocks() {
+            let layout = document
+                .block_layout_with_shaper(block.index(), config, &shaper)
+                .expect("probe layout");
+            for placement in layout.glyphs() {
+                let key = GlyphRasterKey::new(placement.face(), placement.glyph(), font_size)
+                    .expect("probe glyph key");
+                if atlas.entry(key).is_none() {
+                    atlas
+                        .insert(RasterizedGlyph::new(
+                            key,
+                            GlyphMetrics::new(0.0, 10.0, 7.0).expect("probe glyph metrics"),
+                            GlyphBitmap::new(2, 3, 2, vec![255; 6]).expect("probe glyph bitmap"),
+                        ))
+                        .expect("probe atlas insert");
+                }
+            }
+        }
+
+        assemble_viewport_render_frame(
+            &mut document,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 320.0, 180.0).expect("probe scene viewport"),
+                Rgba8::new(24, 28, 36, 255),
+            ),
+            &shaper,
+            &atlas,
+            &mut RenderPlanBuilder::new(),
+        )
+        .expect("probe workspace frame")
     }
 
     #[cfg(target_os = "macos")]
@@ -1730,10 +1879,24 @@ mod tests {
 
         match unsafe { state.surface.attach_to_view(view) } {
             Ok(attachment) => {
-                state.first = Some(state.renderer.render_plan(
+                let stale_revision = state
+                    .frame
+                    .revision()
+                    .next()
+                    .expect("probe revision successor");
+                state.stale = Some(state.renderer.submit_viewport_frame(
                     &state.surface,
-                    &state.plan,
-                    &state.atlas,
+                    stale_revision,
+                    &state.frame,
+                    &mut state.uploader,
+                    &mut state.atlas,
+                ));
+                state.first = Some(state.renderer.submit_viewport_frame(
+                    &state.surface,
+                    state.frame.revision(),
+                    &state.frame,
+                    &mut state.uploader,
+                    &mut state.atlas,
                 ));
                 drop(attachment);
             }
@@ -1748,10 +1911,12 @@ mod tests {
             if resize.is_ok() {
                 match unsafe { state.surface.attach_to_view(view) } {
                     Ok(attachment) => {
-                        state.second = Some(state.renderer.render_plan(
+                        state.second = Some(state.renderer.submit_viewport_frame(
                             &state.surface,
-                            &state.plan,
-                            &state.atlas,
+                            state.frame.revision(),
+                            &state.frame,
+                            &mut state.uploader,
+                            &mut state.atlas,
                         ));
                         drop(attachment);
                     }
@@ -1769,44 +1934,21 @@ mod tests {
     #[ignore = "requires a macOS AppKit session with a Metal-capable device"]
     #[test]
     fn macos_appkit_attachment_resize_and_drawable_probe_are_live() {
-        use yu_core::Revision;
-        use yu_render::RenderPlanBuilder;
-        use yu_scene::{Rect, SceneBuilder};
-
         let device = MetalDevice::system_default().expect("Metal device");
         let surface = MetalSurface::new(
             device.clone(),
             MetalSurfaceConfig::new(320.0, 180.0, 2.0).expect("surface config"),
         )
         .expect("surface");
-        let mut scene = SceneBuilder::new(
-            Revision::INITIAL,
-            Rect::new(0.0, 0.0, 320.0, 180.0).expect("viewport"),
-        )
-        .expect("scene");
-        scene
-            .fill_rect(
-                Rect::new(0.0, 0.0, 320.0, 180.0).expect("background"),
-                Rgba8::new(24, 28, 36, 255),
-            )
-            .expect("background primitive");
-        scene
-            .fill_rect(
-                Rect::new(24.0, 24.0, 120.0, 48.0).expect("accent"),
-                Rgba8::new(220, 230, 240, 255),
-            )
-            .expect("accent primitive");
-        let atlas = yu_font::GlyphAtlas::new(
-            yu_font::GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"),
-        );
-        let plan = RenderPlanBuilder::new()
-            .build(&scene.finish(), &atlas)
-            .expect("render plan");
+        let frame = appkit_probe_frame();
+        let revision = frame.revision();
         let state = AppKitProbeState {
             surface,
-            renderer: MetalFrameRenderer::new(device).expect("renderer"),
-            plan,
+            renderer: MetalFrameRenderer::new(device.clone()).expect("renderer"),
+            frame,
+            uploader: MetalUploader::new(device),
             atlas: MetalAtlas::new(),
+            stale: None,
             first: None,
             second: None,
             attachment_error: None,
@@ -1821,13 +1963,30 @@ mod tests {
         }
         assert!(state.host_created, "AppKit probe host was not created");
         assert!(state.attachment_error.is_none());
-        assert!(matches!(
-            state.first,
-            Some(Ok(())) | Some(Err(MetalRenderError::DrawableUnavailable))
-        ));
-        assert!(matches!(
-            state.second,
-            Some(Ok(())) | Some(Err(MetalRenderError::DrawableUnavailable))
-        ));
+        assert_eq!(
+            state.stale,
+            Some(Err(MetalRenderError::StaleRevision {
+                expected: revision.next().expect("probe revision successor"),
+                actual: revision,
+            }))
+        );
+        assert!(
+            matches!(state.first, Some(Ok(MetalFrameSubmission { revision: submitted, .. })) if submitted == revision)
+                || matches!(
+                    state.first,
+                    Some(Err(MetalRenderError::DrawableUnavailable))
+                )
+        );
+        assert!(
+            matches!(state.second, Some(Ok(MetalFrameSubmission { revision: submitted, .. })) if submitted == revision)
+                || matches!(
+                    state.second,
+                    Some(Err(MetalRenderError::DrawableUnavailable))
+                )
+        );
+        assert_eq!(state.atlas.page_count(), 1);
+        if matches!(state.first, Some(Ok(_))) || matches!(state.second, Some(Ok(_))) {
+            assert_eq!(state.renderer.last_consumed_revision(), Some(revision));
+        }
     }
 }
