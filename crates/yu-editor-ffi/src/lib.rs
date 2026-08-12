@@ -7,7 +7,7 @@ use yu_editor::{
     CaretAffinity, CaretScrollRequest, CommandResult, EditorCommand, EditorDocument,
     EditorDocumentError, EditorKey, EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult,
     LayoutConfig, LayoutSnapshot, Projection, ProjectionBias, SelectionError, SourceSync,
-    ViewportConfig, ViewportRect, VisualRunKind,
+    ViewportConfig, ViewportRect, VisualOffset, VisualRunKind,
 };
 use yu_text::{EditError, TextSnapshot};
 
@@ -33,6 +33,7 @@ pub const YU_FFI_INVALID_KEY: i32 = 11;
 pub const YU_FFI_INVALID_VIEWPORT_CONFIG: i32 = 12;
 pub const YU_FFI_CORE_TEXT_UNAVAILABLE: i32 = 13;
 pub const YU_FFI_LAYOUT_FAILED: i32 = 14;
+pub const YU_FFI_STALE_COMPOSITION: i32 = 15;
 pub const YU_VIEWPORT_BLOCK_BLANK: u8 = 0;
 pub const YU_VIEWPORT_BLOCK_REFERENCE_DEFINITION: u8 = 1;
 pub const YU_VIEWPORT_BLOCK_PARAGRAPH: u8 = 2;
@@ -160,6 +161,40 @@ pub struct YuProjectionCaret {
     pub affinity: u8,
 }
 
+/// Revision- and composition-generation-bound transient projection metadata.
+/// Source ranges use canonical UTF-16 coordinates; visual ranges and lengths
+/// use the projected UTF-16 stream consumed by a native text/layout mirror.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuCompositionProjection {
+    pub revision: u64,
+    pub generation: u64,
+    pub replacement_start_utf16: u64,
+    pub replacement_end_utf16: u64,
+    pub preedit_selection_start_utf16: u64,
+    pub preedit_selection_end_utf16: u64,
+    pub visual_selection_start_utf16: u64,
+    pub visual_selection_end_utf16: u64,
+    pub projected_utf16_length: u64,
+    pub projected_utf8_length: u64,
+}
+
+/// Revision- and composition-generation-bound source/visual caret mapping.
+/// The visual selection is the active marked-text range in projected UTF-16
+/// coordinates, while `visual_utf16` is the requested source caret boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuCompositionCaret {
+    pub revision: u64,
+    pub generation: u64,
+    pub source_utf16: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub visual_selection_start_utf16: u64,
+    pub visual_selection_end_utf16: u64,
+    pub affinity: u8,
+}
+
 /// Revision-bound source/visual caret mapping scoped to one Markdown block.
 /// `visual_utf16` is local to the returned `block_index`, so a native layout
 /// adapter can resolve geometry without materializing a document-wide
@@ -195,6 +230,27 @@ pub struct YuBlockShapedCaret {
     pub affinity: u8,
 }
 
+/// Revision- and composition-generation-bound shaped caret geometry. The
+/// geometry is block-local and is built from the transient composition layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuCompositionBlockShapedCaret {
+    pub revision: u64,
+    pub generation: u64,
+    pub source_utf16: u64,
+    pub block_index: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub line_index: u64,
+    pub caret_x: f32,
+    pub caret_y: f32,
+    pub caret_width: f32,
+    pub caret_height: f32,
+    pub visual_selection_start_utf16: u64,
+    pub visual_selection_end_utf16: u64,
+    pub affinity: u8,
+}
+
 /// Revision-bound metadata for one block selected by a shaped viewport query.
 /// Source ranges are UTF-16 units and `y`/`height` are document-space native
 /// point coordinates; no parser or layout object crosses the ABI.
@@ -226,6 +282,7 @@ pub struct YuShapedViewportSnapshot {
 #[repr(C)]
 pub struct YuCompositionSession {
     document: EditorDocument,
+    composition_generation: u64,
 }
 
 fn read_utf8<'a>(pointer: *const u8, length: usize) -> Result<&'a str, i32> {
@@ -279,6 +336,21 @@ fn source_range_from_utf16(
 fn validate_revision(session: &YuCompositionSession, expected: u64) -> Result<(), i32> {
     if session.document.revision().get() != expected {
         return Err(YU_FFI_STALE_REVISION);
+    }
+    Ok(())
+}
+
+fn validate_composition_generation(
+    session: &YuCompositionSession,
+    expected_revision: u64,
+    expected_generation: u64,
+) -> Result<(), i32> {
+    validate_revision(session, expected_revision)?;
+    if session.document.composition().is_none() {
+        return Err(YU_FFI_NO_OVERLAY);
+    }
+    if session.composition_generation != expected_generation {
+        return Err(YU_FFI_STALE_COMPOSITION);
     }
     Ok(())
 }
@@ -539,6 +611,113 @@ fn editor_selection_from_utf16(
         .map_err(|_| YU_FFI_INVALID_SELECTION)
 }
 
+fn composition_projection(session: &mut YuCompositionSession) -> Result<Projection, i32> {
+    let overlay = session
+        .document
+        .composition()
+        .cloned()
+        .ok_or(YU_FFI_NO_OVERLAY)?;
+    let snapshot = session.document.snapshot();
+    let source_range =
+        TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).ok_or(YU_FFI_LAYOUT_FAILED)?;
+    let base = session
+        .document
+        .projection(source_range)
+        .map_err(status_from_document_error)?
+        .clone();
+    base.with_composition(
+        overlay.replacement_range(),
+        overlay.text().to_owned(),
+        overlay.selection_bytes(),
+    )
+    .map_err(|_| YU_FFI_LAYOUT_FAILED)
+}
+
+fn composition_projection_metadata(
+    session: &mut YuCompositionSession,
+) -> Result<(YuCompositionProjection, String), i32> {
+    let projection = composition_projection(session)?;
+    let snapshot = session.document.snapshot();
+    let overlay = session.document.composition().ok_or(YU_FFI_NO_OVERLAY)?;
+    let projected = projected_utf8(&projection)?;
+    let replacement_start_utf16 = snapshot
+        .utf16_offset(overlay.replacement_range().start())
+        .map_err(|_| YU_FFI_INVALID_RANGE)?
+        .get();
+    let replacement_end_utf16 = snapshot
+        .utf16_offset(overlay.replacement_range().end())
+        .map_err(|_| YU_FFI_INVALID_RANGE)?
+        .get();
+    let (visual_selection_start_utf16, visual_selection_end_utf16) =
+        composition_visual_selection_utf16(&projection, &projected)?;
+    let projected_utf16_length =
+        u64::try_from(projected.encode_utf16().count()).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+    let projected_utf8_length = u64::try_from(projected.len()).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
+    let metadata = YuCompositionProjection {
+        revision: snapshot.revision().get(),
+        generation: session.composition_generation,
+        replacement_start_utf16,
+        replacement_end_utf16,
+        preedit_selection_start_utf16: overlay.selection_utf16().start().get(),
+        preedit_selection_end_utf16: overlay.selection_utf16().end().get(),
+        visual_selection_start_utf16,
+        visual_selection_end_utf16,
+        projected_utf16_length,
+        projected_utf8_length,
+    };
+    Ok((metadata, projected))
+}
+
+fn composition_active_visual_caret(
+    projection: &Projection,
+    overlay_selection_start_utf16: u64,
+    overlay_selection_end_utf16: u64,
+) -> Result<(u64, ProjectionBias), i32> {
+    let selection = if overlay_selection_start_utf16 <= overlay_selection_end_utf16 {
+        Utf16Range::new(
+            Utf16Offset::new(overlay_selection_start_utf16),
+            Utf16Offset::new(overlay_selection_end_utf16),
+        )
+        .ok_or(YU_FFI_INVALID_SELECTION)?
+    } else {
+        return Err(YU_FFI_INVALID_SELECTION);
+    };
+    let text = projection.composition_text().ok_or(YU_FFI_NO_OVERLAY)?;
+    let selection_start = utf16_byte_offset(text, selection.start().get())?;
+    let selection_end = utf16_byte_offset(text, selection.end().get())?;
+    let visual_base = projection
+        .runs()
+        .iter()
+        .find(|run| run.kind() == VisualRunKind::Composition)
+        .map(|run| run.visual().start().get())
+        .ok_or(YU_FFI_NO_OVERLAY)?;
+    let visual_selection_start = visual_base
+        .checked_add(selection_start)
+        .ok_or(YU_FFI_INVALID_RANGE)?;
+    let visual_selection_end = visual_base
+        .checked_add(selection_end)
+        .ok_or(YU_FFI_INVALID_RANGE)?;
+    let active = if selection.start() == selection.end() {
+        visual_selection_start
+    } else {
+        visual_selection_end
+    };
+    Ok((active, ProjectionBias::After))
+}
+
+fn composition_visual_selection_utf16(
+    projection: &Projection,
+    projected: &str,
+) -> Result<(u64, u64), i32> {
+    let visual_selection = projection
+        .composition_selection_visual()
+        .ok_or(YU_FFI_NO_OVERLAY)?;
+    Ok((
+        utf16_offset_in_utf8(projected, visual_selection.start().get())?,
+        utf16_offset_in_utf8(projected, visual_selection.end().get())?,
+    ))
+}
+
 /// Creates an opaque composition session for a UTF-8 source buffer.
 ///
 /// # Safety
@@ -561,6 +740,7 @@ pub unsafe extern "C" fn yu_composition_session_new(
     };
     let session = Box::new(YuCompositionSession {
         document: EditorDocument::new(source),
+        composition_generation: 0,
     });
 
     // SAFETY: output was checked for null and points to caller-owned storage
@@ -604,7 +784,10 @@ pub unsafe extern "C" fn yu_composition_session_reset_source(
     session
         .document
         .reset_source(source)
-        .map_or_else(status_from_document_error, |_| YU_FFI_OK)
+        .map_or_else(status_from_document_error, |_| {
+            session.composition_generation = session.composition_generation.wrapping_add(1);
+            YU_FFI_OK
+        })
 }
 
 /// Executes one revision-independent editor command and returns the resulting
@@ -752,7 +935,10 @@ pub unsafe extern "C" fn yu_composition_session_begin(
     session
         .document
         .begin_composition(replacement, preedit, selection)
-        .map_or_else(status_from_document_error, |_| YU_FFI_OK)
+        .map_or_else(status_from_document_error, |_| {
+            session.composition_generation = session.composition_generation.wrapping_add(1);
+            YU_FFI_OK
+        })
 }
 
 /// Updates the preedit text and its UTF-16 selection.
@@ -782,7 +968,10 @@ pub unsafe extern "C" fn yu_composition_session_update(
     session
         .document
         .update_composition(preedit, selection)
-        .map_or_else(status_from_document_error, |_| YU_FFI_OK)
+        .map_or_else(status_from_document_error, |_| {
+            session.composition_generation = session.composition_generation.wrapping_add(1);
+            YU_FFI_OK
+        })
 }
 
 /// Commits the active composition as one permanent text transaction.
@@ -806,7 +995,10 @@ pub unsafe extern "C" fn yu_composition_session_commit(
     session
         .document
         .commit_composition(committed_text)
-        .map_or_else(status_from_document_error, |_| YU_FFI_OK)
+        .map_or_else(status_from_document_error, |_| {
+            session.composition_generation = session.composition_generation.wrapping_add(1);
+            YU_FFI_OK
+        })
 }
 
 /// Cancels and drops the active composition overlay.
@@ -818,7 +1010,9 @@ pub unsafe extern "C" fn yu_composition_session_cancel(session: *mut YuCompositi
     let Some(session) = (unsafe { session.as_mut() }) else {
         return YU_FFI_NULL_POINTER;
     };
-    let _ = session.document.cancel_composition();
+    if session.document.cancel_composition() {
+        session.composition_generation = session.composition_generation.wrapping_add(1);
+    }
     YU_FFI_OK
 }
 
@@ -965,12 +1159,19 @@ pub unsafe extern "C" fn yu_composition_session_projection_caret(
         Some(range) => range,
         None => return YU_FFI_INVALID_RANGE,
     };
-    let projection = match session.document.projection(source_range) {
-        Ok(projection) => projection,
-        Err(error) => return status_from_document_error(error),
+    let projection = if session.document.composition().is_some() {
+        match composition_projection(session) {
+            Ok(projection) => projection,
+            Err(status) => return status,
+        }
+    } else {
+        match session.document.projection(source_range) {
+            Ok(projection) => projection.clone(),
+            Err(error) => return status_from_document_error(error),
+        }
     };
     let (visual_utf16, round_trip_source_utf16) =
-        match projection_caret_mapping(&snapshot, projection, source, affinity) {
+        match projection_caret_mapping(&snapshot, &projection, source, affinity) {
             Ok(mapping) => mapping,
             Err(status) => return status,
         };
@@ -1188,6 +1389,171 @@ pub unsafe extern "C" fn yu_macos_composition_session_block_shaped_caret(
                 caret_y: point.y(),
                 caret_width: 0.0,
                 caret_height: line_height,
+                affinity,
+            };
+        }
+        YU_FFI_OK
+    }
+}
+
+/// Resolves a source caret against the transient composition layout for its
+/// Markdown block. This is the composition-aware counterpart to
+/// `yu_macos_composition_session_block_shaped_caret`; both canonical revision
+/// and preedit generation are required to accept the result.
+///
+/// On non-macOS targets this symbol clears `output` and returns
+/// [`YU_FFI_CORE_TEXT_UNAVAILABLE`].
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuCompositionBlockShapedCaret`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_macos_composition_session_block_composition_shaped_caret(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    source_utf16: u64,
+    affinity: u8,
+    size: f32,
+    max_width: f32,
+    output: *mut YuCompositionBlockShapedCaret,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuCompositionBlockShapedCaret::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            expected_generation,
+            source_utf16,
+            affinity,
+            size,
+            max_width,
+        );
+        return YU_FFI_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) =
+            validate_composition_generation(session, expected_revision, expected_generation)
+        {
+            return status;
+        }
+        if !matches!(
+            affinity,
+            YU_CARET_AFFINITY_UPSTREAM | YU_CARET_AFFINITY_DOWNSTREAM
+        ) {
+            return YU_FFI_INVALID_SELECTION;
+        }
+        if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
+            return YU_FFI_LAYOUT_FAILED;
+        }
+        let snapshot = session.document.snapshot();
+        let _source = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) {
+            Ok(offset) => offset,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let replacement = match session.document.composition() {
+            Some(composition) => composition.replacement_range(),
+            None => return YU_FFI_NO_OVERLAY,
+        };
+        let Some(block_index) = session.document.block_index_for_source(replacement.start()) else {
+            return YU_FFI_INVALID_RANGE;
+        };
+        let (shaper, metrics, config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        let layout = match session.document.block_layout_with_composition_and_shaper(
+            block_index,
+            config,
+            &shaper,
+        ) {
+            Ok(layout) => layout,
+            Err(_) => return YU_FFI_LAYOUT_FAILED,
+        };
+        let composition = match session.document.composition() {
+            Some(composition) => composition,
+            None => return YU_FFI_NO_OVERLAY,
+        };
+        let (active_visual, active_bias) = match composition_active_visual_caret(
+            layout.projection(),
+            composition.selection_utf16().start().get(),
+            composition.selection_utf16().end().get(),
+        ) {
+            Ok(caret) => caret,
+            Err(status) => return status,
+        };
+        let caret = match layout.caret_for_visual(VisualOffset::new(active_visual), active_bias) {
+            Ok(caret) => caret,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let projected = match projected_utf8(layout.projection()) {
+            Ok(projected) => projected,
+            Err(status) => return status,
+        };
+        let visual_utf16 = match utf16_offset_in_utf8(&projected, caret.visual().get()) {
+            Ok(offset) => offset,
+            Err(status) => return status,
+        };
+        let round_trip = match layout
+            .projection()
+            .visual_to_source(caret.visual(), active_bias)
+        {
+            Ok(offset) => offset,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let (visual_selection_start_utf16, visual_selection_end_utf16) =
+            match composition_visual_selection_utf16(layout.projection(), &projected) {
+                Ok(selection) => selection,
+                Err(status) => return status,
+            };
+        let block_index = match u64::try_from(block_index) {
+            Ok(index) => index,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let line_index = match u64::try_from(caret.line()) {
+            Ok(index) => index,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let point = caret.point();
+        let line_height = metrics.line_height();
+        if !point.x().is_finite()
+            || !point.y().is_finite()
+            || !line_height.is_finite()
+            || line_height <= 0.0
+        {
+            return YU_FFI_LAYOUT_FAILED;
+        }
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuCompositionBlockShapedCaret {
+                revision: snapshot.revision().get(),
+                generation: session.composition_generation,
+                source_utf16,
+                block_index,
+                visual_utf16,
+                round_trip_source_utf16,
+                line_index,
+                caret_x: point.x(),
+                caret_y: point.y(),
+                caret_width: 0.0,
+                caret_height: line_height,
+                visual_selection_start_utf16,
+                visual_selection_end_utf16,
                 affinity,
             };
         }
@@ -1862,30 +2228,14 @@ fn projected_utf8(projection: &Projection) -> Result<String, i32> {
     for run in projection.runs() {
         if !matches!(
             run.kind(),
-            VisualRunKind::Visible | VisualRunKind::LineBreak { .. }
+            VisualRunKind::Visible | VisualRunKind::LineBreak { .. } | VisualRunKind::Composition
         ) {
             continue;
         }
-        let start = usize::try_from(run.source().start()).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
-        let end = usize::try_from(run.source().end()).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
-        let mut cursor = projection
-            .source()
-            .chunk_cursor(run.source().start())
+        let text = projection
+            .text_for_run(*run)
             .map_err(|_| YU_FFI_LAYOUT_FAILED)?;
-        for chunk in &mut cursor {
-            let chunk_start = usize::try_from(chunk.start()).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
-            let chunk_end = chunk_start
-                .checked_add(chunk.text().len())
-                .ok_or(YU_FFI_LAYOUT_FAILED)?;
-            if chunk_start >= end {
-                break;
-            }
-            let local_start = start.max(chunk_start).saturating_sub(chunk_start);
-            let local_end = end.min(chunk_end).saturating_sub(chunk_start);
-            if local_start < local_end {
-                bytes.extend_from_slice(&chunk.text().as_bytes()[local_start..local_end]);
-            }
-        }
+        bytes.extend_from_slice(text.as_bytes());
     }
     String::from_utf8(bytes).map_err(|_| YU_FFI_LAYOUT_FAILED)
 }
@@ -1917,6 +2267,25 @@ fn utf16_offset_in_utf8(source: &str, byte_offset: u64) -> Result<u64, i32> {
     u64::try_from(prefix.encode_utf16().count()).map_err(|_| YU_FFI_LAYOUT_FAILED)
 }
 
+fn utf16_byte_offset(source: &str, offset: u64) -> Result<u64, i32> {
+    let mut utf16 = 0_u64;
+    for (byte, character) in source.char_indices() {
+        if utf16 == offset {
+            return u64::try_from(byte).map_err(|_| YU_FFI_INVALID_RANGE);
+        }
+        utf16 = utf16
+            .checked_add(u64::try_from(character.len_utf16()).map_err(|_| YU_FFI_INVALID_RANGE)?)
+            .ok_or(YU_FFI_INVALID_RANGE)?;
+        if utf16 > offset {
+            return Err(YU_FFI_INVALID_RANGE);
+        }
+    }
+    if utf16 == offset {
+        return u64::try_from(source.len()).map_err(|_| YU_FFI_INVALID_RANGE);
+    }
+    Err(YU_FFI_INVALID_RANGE)
+}
+
 fn projection_caret_mapping(
     snapshot: &TextSnapshot,
     projection: &Projection,
@@ -1942,9 +2311,9 @@ fn projection_caret_mapping(
     Ok((visual_utf16, round_trip_source_utf16))
 }
 
-/// Converts a projection visual byte boundary to UTF-16 without materializing
-/// the complete projected text. Visible and line-break runs preserve their
-/// source byte ranges; hidden runs contribute no visual or UTF-16 units.
+/// Converts a projection visual byte boundary to UTF-16. Composition runs use
+/// their transient text; ordinary runs read canonical source ranges. Hidden
+/// runs contribute no visual or UTF-16 units.
 fn visual_utf16_offset(projection: &Projection, visual: u64) -> Result<u64, i32> {
     if visual > projection.visual_len().get() {
         return Err(YU_FFI_INVALID_RANGE);
@@ -1968,6 +2337,16 @@ fn visual_utf16_offset(projection: &Projection, visual: u64) -> Result<u64, i32>
             let local_bytes = visual
                 .checked_sub(visual_range.start().get())
                 .ok_or(YU_FFI_INVALID_RANGE)?;
+            if run.kind() == VisualRunKind::Composition {
+                let text = projection
+                    .text_for_run_slice(*run, 0, local_bytes)
+                    .map_err(|_| YU_FFI_INVALID_RANGE)?;
+                let local_units =
+                    u64::try_from(text.encode_utf16().count()).map_err(|_| YU_FFI_INVALID_RANGE)?;
+                return visual_units
+                    .checked_add(local_units)
+                    .ok_or(YU_FFI_INVALID_RANGE);
+            }
             let source_end = source_start
                 .checked_add(local_bytes)
                 .ok_or(YU_FFI_INVALID_RANGE)?;
@@ -1989,9 +2368,16 @@ fn visual_utf16_offset(projection: &Projection, visual: u64) -> Result<u64, i32>
             .utf16_offset(run.source().end())
             .map_err(|_| YU_FFI_INVALID_RANGE)?
             .get();
-        let run_units = source_end_utf16
-            .checked_sub(source_start_utf16)
-            .ok_or(YU_FFI_INVALID_RANGE)?;
+        let run_units = if run.kind() == VisualRunKind::Composition {
+            let text = projection
+                .text_for_run(*run)
+                .map_err(|_| YU_FFI_INVALID_RANGE)?;
+            u64::try_from(text.encode_utf16().count()).map_err(|_| YU_FFI_INVALID_RANGE)?
+        } else {
+            source_end_utf16
+                .checked_sub(source_start_utf16)
+                .ok_or(YU_FFI_INVALID_RANGE)?
+        };
         visual_units = visual_units
             .checked_add(run_units)
             .ok_or(YU_FFI_INVALID_RANGE)?;
@@ -2211,6 +2597,180 @@ pub unsafe extern "C" fn yu_composition_session_overlay_selection(
     unsafe {
         *start_output = selection.start().get();
         *end_output = selection.end().get();
+    }
+    YU_FFI_OK
+}
+
+/// Returns the current transient source/visual projection metadata. The
+/// `expected_revision` guards the canonical source; the returned generation
+/// guards later preedit text/selection copies, because composition updates do
+/// not advance the canonical revision.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuCompositionProjection`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_projection(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    output: *mut YuCompositionProjection,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuCompositionProjection::default() };
+    if let Err(status) = validate_revision(session, expected_revision) {
+        return status;
+    }
+    let (metadata, _) = match composition_projection_metadata(session) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_FFI_OK
+}
+
+/// Copies the current projected UTF-8 stream. `written` receives the required
+/// byte count before capacity is checked, so callers can use a zero-capacity
+/// call to allocate a native mirror. The query is bound to both canonical
+/// `expected_revision` and transient `expected_generation`.
+///
+/// # Safety
+/// `session` must be null or a live handle. `written` must point to writable
+/// storage for one `size_t`; `output` must point to `capacity` writable bytes
+/// when `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_copy_projection(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    if let Err(status) =
+        validate_composition_generation(session, expected_revision, expected_generation)
+    {
+        return status;
+    }
+    let (_, projected) = match composition_projection_metadata(session) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let bytes = projected.as_bytes();
+    // SAFETY: written was checked for null and belongs to the caller.
+    unsafe { *written = bytes.len() };
+    if capacity == 0 {
+        return YU_FFI_OK;
+    }
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    if capacity < bytes.len() {
+        return YU_FFI_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: capacity was checked against the source length and output is
+    // required to point to writable storage owned by the caller.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len()) };
+    YU_FFI_OK
+}
+
+/// Resolves a canonical source caret through the active transient projection.
+/// The query returns the projected UTF-16 caret and the marked-text selection;
+/// it is rejected when either the canonical revision or the composition
+/// generation is stale.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuCompositionCaret`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_composition_caret(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    source_utf16: u64,
+    affinity: u8,
+    output: *mut YuCompositionCaret,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuCompositionCaret::default() };
+    if let Err(status) =
+        validate_composition_generation(session, expected_revision, expected_generation)
+    {
+        return status;
+    }
+    let snapshot = session.document.snapshot();
+    let _source = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) {
+        Ok(offset) => offset,
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    let projection = match composition_projection(session) {
+        Ok(projection) => projection,
+        Err(status) => return status,
+    };
+    let overlay = match session.document.composition() {
+        Some(overlay) => overlay,
+        None => return YU_FFI_NO_OVERLAY,
+    };
+    let (active_visual, active_bias) = match composition_active_visual_caret(
+        &projection,
+        overlay.selection_utf16().start().get(),
+        overlay.selection_utf16().end().get(),
+    ) {
+        Ok(caret) => caret,
+        Err(status) => return status,
+    };
+    let visual_utf16 = match visual_utf16_offset(&projection, active_visual) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
+    let round_trip =
+        match projection.visual_to_source(VisualOffset::new(active_visual), active_bias) {
+            Ok(offset) => offset,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+    let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    let projected = match projected_utf8(&projection) {
+        Ok(projected) => projected,
+        Err(status) => return status,
+    };
+    let (visual_selection_start_utf16, visual_selection_end_utf16) =
+        match composition_visual_selection_utf16(&projection, &projected) {
+            Ok(selection) => selection,
+            Err(status) => return status,
+        };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuCompositionCaret {
+            revision: snapshot.revision().get(),
+            generation: session.composition_generation,
+            source_utf16,
+            visual_utf16,
+            round_trip_source_utf16,
+            visual_selection_start_utf16,
+            visual_selection_end_utf16,
+            affinity,
+        };
     }
     YU_FFI_OK
 }
@@ -2552,6 +3112,151 @@ mod tests {
     }
 
     #[test]
+    fn ffi_composition_projection_is_generation_bound_and_preserves_source() {
+        let source = "before **x** after";
+        let handle = session(source);
+        assert_eq!(
+            unsafe {
+                yu_composition_session_begin(handle, 9, 10, "日本🙂".as_ptr(), "日本🙂".len(), 2, 4)
+            },
+            YU_FFI_OK
+        );
+
+        let mut projection = YuCompositionProjection::default();
+        assert_eq!(
+            unsafe { yu_composition_session_projection(handle, 0, &mut projection) },
+            YU_FFI_OK
+        );
+        assert_eq!(projection.revision, 0);
+        assert_eq!(projection.generation, 1);
+        assert_eq!(projection.replacement_start_utf16, 9);
+        assert_eq!(projection.replacement_end_utf16, 10);
+        assert_eq!(projection.preedit_selection_start_utf16, 2);
+        assert_eq!(projection.preedit_selection_end_utf16, 4);
+        assert_eq!(projection.visual_selection_start_utf16, 9);
+        assert_eq!(projection.visual_selection_end_utf16, 11);
+        assert_eq!(projection.projected_utf16_length, 17);
+        assert_eq!(
+            projection.projected_utf8_length,
+            "before 日本🙂 after".len() as u64
+        );
+
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_composition_session_copy_projection(
+                    handle,
+                    projection.revision,
+                    projection.generation,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(required, projection.projected_utf8_length as usize);
+        let mut small = vec![0_u8; required.saturating_sub(1)];
+        assert_eq!(
+            unsafe {
+                yu_composition_session_copy_projection(
+                    handle,
+                    projection.revision,
+                    projection.generation,
+                    small.as_mut_ptr(),
+                    small.len(),
+                    &mut required,
+                )
+            },
+            YU_FFI_BUFFER_TOO_SMALL
+        );
+        let mut projected = vec![0_u8; required];
+        assert_eq!(
+            unsafe {
+                yu_composition_session_copy_projection(
+                    handle,
+                    projection.revision,
+                    projection.generation,
+                    projected.as_mut_ptr(),
+                    projected.len(),
+                    &mut required,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            std::str::from_utf8(&projected).expect("projected text stays UTF-8"),
+            "before 日本🙂 after"
+        );
+
+        let mut caret = YuCompositionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_composition_caret(
+                    handle,
+                    projection.revision,
+                    projection.generation,
+                    9,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    &mut caret,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(caret.revision, 0);
+        assert_eq!(caret.generation, 1);
+        assert_eq!(caret.source_utf16, 9);
+        assert_eq!(caret.visual_utf16, 11);
+        assert_eq!(caret.visual_selection_start_utf16, 9);
+        assert_eq!(caret.visual_selection_end_utf16, 11);
+
+        assert_eq!(
+            unsafe {
+                yu_composition_session_update(handle, "日本語".as_ptr(), "日本語".len(), 3, 3)
+            },
+            YU_FFI_OK
+        );
+        let mut stale = projection;
+        assert_eq!(
+            unsafe { yu_composition_session_projection(handle, 0, &mut stale) },
+            YU_FFI_OK
+        );
+        assert_eq!(stale.generation, 2);
+        assert_eq!(stale.projected_utf16_length, 16);
+        assert_eq!(
+            unsafe {
+                yu_composition_session_copy_projection(
+                    handle,
+                    0,
+                    projection.generation,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_FFI_STALE_COMPOSITION
+        );
+
+        let mut source_length = 0;
+        assert_eq!(
+            unsafe { yu_composition_session_source_length(handle, &mut source_length) },
+            YU_FFI_OK
+        );
+        let mut canonical = vec![0_u8; source_length];
+        assert_eq!(
+            unsafe {
+                yu_composition_session_copy_source(handle, canonical.as_mut_ptr(), canonical.len())
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            std::str::from_utf8(&canonical).expect("canonical source stays UTF-8"),
+            source
+        );
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
     fn ffi_block_projection_caret_is_local_to_the_matching_markdown_block() {
         let source = "before **羽🙂** after\n\nsecond **block**\n";
         let handle = session(source);
@@ -2703,6 +3408,84 @@ mod tests {
         );
         assert_eq!(stale, YuBlockShapedCaret::default());
 
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_composition_shaped_caret_uses_transient_visual_selection_and_generation() {
+        let source = "before **x** after";
+        let handle = session(source);
+        assert_eq!(
+            unsafe {
+                yu_composition_session_begin(handle, 9, 10, "日本🙂".as_ptr(), "日本🙂".len(), 2, 4)
+            },
+            YU_FFI_OK
+        );
+        let mut output = YuCompositionBlockShapedCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_block_composition_shaped_caret(
+                    handle,
+                    0,
+                    1,
+                    9,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    22.0,
+                    600.0,
+                    &mut output,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(output.revision, 0);
+        assert_eq!(output.generation, 1);
+        assert_eq!(output.source_utf16, 9);
+        assert_eq!(output.block_index, 0);
+        assert_eq!(output.visual_utf16, 11);
+        assert_eq!(output.visual_selection_start_utf16, 9);
+        assert_eq!(output.visual_selection_end_utf16, 11);
+        assert!(output.caret_x.is_finite() && output.caret_y.is_finite());
+        assert!(output.caret_height.is_finite() && output.caret_height > 0.0);
+
+        assert_eq!(
+            unsafe {
+                yu_composition_session_update(handle, "日本語".as_ptr(), "日本語".len(), 3, 3)
+            },
+            YU_FFI_OK
+        );
+        let mut stale = YuCompositionBlockShapedCaret {
+            revision: 99,
+            generation: 99,
+            source_utf16: 99,
+            block_index: 99,
+            visual_utf16: 99,
+            round_trip_source_utf16: 99,
+            line_index: 99,
+            caret_x: 99.0,
+            caret_y: 99.0,
+            caret_width: 99.0,
+            caret_height: 99.0,
+            visual_selection_start_utf16: 99,
+            visual_selection_end_utf16: 99,
+            affinity: 99,
+        };
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_block_composition_shaped_caret(
+                    handle,
+                    0,
+                    1,
+                    9,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    22.0,
+                    600.0,
+                    &mut stale,
+                )
+            },
+            YU_FFI_STALE_COMPOSITION
+        );
+        assert_eq!(stale, YuCompositionBlockShapedCaret::default());
         unsafe { yu_composition_session_destroy(handle) };
     }
 

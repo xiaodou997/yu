@@ -92,6 +92,11 @@ source UTF-16 range、kind tag、measured 标记和 content height 都属于同�
 启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
 和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
 
+随后运行 `Composition projection self-check`：Rust 在不改写 TextKit canonical mirror 的前提下
+返回 projected UTF-8、replacement/preedit/visual UTF-16 ranges 和 generation-bound caret。自检
+会更新同一 Revision 下的 preedit，确认旧 generation 不能复用；这验证 native bridge 不需要
+复制 Markdown parser 或维护第二套 transient document。
+
 `Native command self-check` 还会验证 Backspace 只查询并替换局部 UTF-16 source range，而成组
 Cmd-Z/Cmd-Shift-Z 使用完整 source fallback。两类结果都必须按 Rust 返回的 Revision 和 selection
 更新 TextKit mirror；普通段落 Tab 不由共享 key route 消费。
