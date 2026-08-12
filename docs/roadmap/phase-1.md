@@ -90,6 +90,7 @@
 - [x] revision-aware `ViewportRenderFrame` cache、stale discard 与 publish gate
 - [x] macOS Metal `ViewportRenderFrame` revision-aware consumer（native command path 前 gate、成功后 commit）
 - [x] macOS host viewport frame submission（Revision gate、atlas staging、render、commit 顺序）
+- [x] macOS viewport host session（current Revision、frame cache、surface generation 与提交状态机）
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -160,6 +161,11 @@
     commit 顺序消费 workspace frame；同 device/同 fingerprint 的 atlas page 不得重复上传，
     staging/device/backend 失败不得推进 consumer，AppKit ignored probe 必须使用真实 workspace frame
     覆盖 stale、匹配提交和 resize 后重复提交。
+9l. macOS `MetalViewportHostSession` 必须只保存 current Revision、revision-bound frame cache、
+    surface generation、host-local frame serial 和 owned last submission；Revision/generation 只能
+    单调推进，变化时清除不匹配 frame/last submission，`submit` 必须先检查 generation 并只消费
+    current frame。无窗口状态测试和 AppKit ignored probe 必须覆盖 stale publish、generation
+    mismatch/resize、重复提交和失败不写入 last submission。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

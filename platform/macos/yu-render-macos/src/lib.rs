@@ -21,7 +21,7 @@ use std::rc::Rc;
 use yu_core::Revision;
 use yu_render::{AtlasPageUpload, RenderCommand, RenderPlan, RenderUploader};
 use yu_scene::Rgba8;
-use yu_workspace::ViewportRenderFrame;
+use yu_workspace::{ViewportFrameCache, ViewportFrameError, ViewportRenderFrame};
 
 #[cfg(target_os = "macos")]
 mod native {
@@ -1034,6 +1034,263 @@ impl MetalFrameSubmission {
     }
 }
 
+/// Errors raised by the macOS viewport host session before or during frame
+/// submission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetalViewportHostError {
+    Frame(ViewportFrameError),
+    RevisionRegression { current: Revision, actual: Revision },
+    NoCurrentFrame { revision: Revision },
+    SurfaceGenerationRegression { current: u64, actual: u64 },
+    SurfaceGenerationMismatch { expected: u64, actual: u64 },
+    FrameSerialOverflow,
+    Render(MetalRenderError),
+}
+
+impl fmt::Display for MetalViewportHostError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Frame(error) => error.fmt(formatter),
+            Self::RevisionRegression { current, actual } => write!(
+                formatter,
+                "viewport host revision moved backwards from {current:?} to {actual:?}"
+            ),
+            Self::NoCurrentFrame { revision } => {
+                write!(formatter, "no viewport frame is available for {revision:?}")
+            }
+            Self::SurfaceGenerationRegression { current, actual } => write!(
+                formatter,
+                "Metal surface generation moved backwards from {current} to {actual}"
+            ),
+            Self::SurfaceGenerationMismatch { expected, actual } => write!(
+                formatter,
+                "Metal surface generation {actual} is not synchronized with host generation {expected}"
+            ),
+            Self::FrameSerialOverflow => formatter.write_str("viewport frame serial overflowed"),
+            Self::Render(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for MetalViewportHostError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Frame(error) => Some(error),
+            Self::Render(error) => Some(error),
+            Self::RevisionRegression { .. }
+            | Self::NoCurrentFrame { .. }
+            | Self::SurfaceGenerationRegression { .. }
+            | Self::SurfaceGenerationMismatch { .. }
+            | Self::FrameSerialOverflow => None,
+        }
+    }
+}
+
+impl From<ViewportFrameError> for MetalViewportHostError {
+    fn from(error: ViewportFrameError) -> Self {
+        Self::Frame(error)
+    }
+}
+
+impl From<MetalRenderError> for MetalViewportHostError {
+    fn from(error: MetalRenderError) -> Self {
+        Self::Render(error)
+    }
+}
+
+/// Owned scalar state returned after a host session submits a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetalViewportHostSubmission {
+    revision: Revision,
+    surface_generation: u64,
+    frame_serial: u64,
+    uploaded_pages: usize,
+}
+
+impl MetalViewportHostSubmission {
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn surface_generation(self) -> u64 {
+        self.surface_generation
+    }
+
+    #[must_use]
+    pub const fn frame_serial(self) -> u64 {
+        self.frame_serial
+    }
+
+    #[must_use]
+    pub const fn uploaded_pages(self) -> usize {
+        self.uploaded_pages
+    }
+}
+
+/// A platform-host state machine for one document viewport.
+///
+/// The session deliberately owns only a revision-bound frame cache and owned
+/// scalar lifecycle state. It does not own an `EditorDocument`, source text,
+/// layout cache, AppKit object or Metal handle. A real host can therefore
+/// advance the current Revision after an edit, acknowledge a surface resize,
+/// publish a complete workspace frame, and submit it through one ordered API.
+#[derive(Clone, Debug)]
+pub struct MetalViewportHostSession {
+    current_revision: Revision,
+    surface_generation: u64,
+    next_frame_serial: u64,
+    frame_serial: Option<u64>,
+    frame_cache: ViewportFrameCache,
+    last_submission: Option<MetalViewportHostSubmission>,
+}
+
+impl MetalViewportHostSession {
+    #[must_use]
+    pub fn new(current_revision: Revision, surface_generation: u64) -> Self {
+        Self {
+            current_revision,
+            surface_generation,
+            next_frame_serial: 0,
+            frame_serial: None,
+            frame_cache: ViewportFrameCache::new(),
+            last_submission: None,
+        }
+    }
+
+    #[must_use]
+    pub fn current_revision(&self) -> Revision {
+        self.current_revision
+    }
+
+    #[must_use]
+    pub const fn surface_generation(&self) -> u64 {
+        self.surface_generation
+    }
+
+    #[must_use]
+    pub fn frame_revision(&self) -> Option<Revision> {
+        self.frame_cache.current_revision()
+    }
+
+    #[must_use]
+    pub const fn frame_serial(&self) -> Option<u64> {
+        self.frame_serial
+    }
+
+    #[must_use]
+    pub const fn last_submission(&self) -> Option<MetalViewportHostSubmission> {
+        self.last_submission
+    }
+
+    /// Advances the host's canonical current Revision after an edit or reset.
+    /// Any cached frame from another Revision is discarded before returning.
+    pub fn advance_revision(&mut self, revision: Revision) -> Result<bool, MetalViewportHostError> {
+        if revision < self.current_revision {
+            return Err(MetalViewportHostError::RevisionRegression {
+                current: self.current_revision,
+                actual: revision,
+            });
+        }
+        let changed = self.current_revision != revision;
+        self.current_revision = revision;
+        if changed {
+            self.frame_cache.invalidate_stale(revision);
+            self.frame_serial = None;
+            self.last_submission = None;
+        }
+        Ok(changed)
+    }
+
+    /// Acknowledges a successful native surface resize. The frame remains
+    /// reusable, but the next submit must target the new surface generation.
+    pub fn sync_surface_generation(
+        &mut self,
+        generation: u64,
+    ) -> Result<bool, MetalViewportHostError> {
+        if generation < self.surface_generation {
+            return Err(MetalViewportHostError::SurfaceGenerationRegression {
+                current: self.surface_generation,
+                actual: generation,
+            });
+        }
+        let changed = self.surface_generation != generation;
+        self.surface_generation = generation;
+        if changed {
+            self.last_submission = None;
+        }
+        Ok(changed)
+    }
+
+    /// Publishes a complete frame and assigns it a monotonic host-local serial.
+    pub fn publish_frame(
+        &mut self,
+        frame: ViewportRenderFrame,
+    ) -> Result<u64, MetalViewportHostError> {
+        self.frame_cache
+            .publish_if_current(self.current_revision, frame)
+            .map_err(MetalViewportHostError::Frame)?;
+        self.next_frame_serial = self
+            .next_frame_serial
+            .checked_add(1)
+            .ok_or(MetalViewportHostError::FrameSerialOverflow)?;
+        self.frame_serial = Some(self.next_frame_serial);
+        self.last_submission = None;
+        Ok(self.next_frame_serial)
+    }
+
+    /// Submits the currently published frame through the ordered Metal host
+    /// path. Failed render/upload work never updates `last_submission`.
+    pub fn submit(
+        &mut self,
+        renderer: &mut MetalFrameRenderer,
+        surface: &MetalSurface,
+        uploader: &mut MetalUploader,
+        atlas: &mut MetalAtlas,
+    ) -> Result<MetalViewportHostSubmission, MetalViewportHostError> {
+        self.validate_surface_generation(surface.generation())?;
+        let frame = self.frame_cache.get(self.current_revision).ok_or(
+            MetalViewportHostError::NoCurrentFrame {
+                revision: self.current_revision,
+            },
+        )?;
+        let frame_serial = self
+            .frame_serial
+            .ok_or(MetalViewportHostError::NoCurrentFrame {
+                revision: self.current_revision,
+            })?;
+        let result = renderer.submit_viewport_frame(
+            surface,
+            self.current_revision,
+            frame,
+            uploader,
+            atlas,
+        )?;
+        let submission = MetalViewportHostSubmission {
+            revision: result.revision(),
+            surface_generation: self.surface_generation,
+            frame_serial,
+            uploaded_pages: result.uploaded_pages(),
+        };
+        self.last_submission = Some(submission);
+        Ok(submission)
+    }
+
+    pub fn validate_surface_generation(
+        &self,
+        actual_generation: u64,
+    ) -> Result<(), MetalViewportHostError> {
+        if actual_generation != self.surface_generation {
+            return Err(MetalViewportHostError::SurfaceGenerationMismatch {
+                expected: self.surface_generation,
+                actual: actual_generation,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Debug for MetalFrameRenderer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1573,6 +1830,51 @@ mod tests {
     }
 
     #[test]
+    fn viewport_host_session_tracks_revision_generation_and_frame_serial() {
+        let revision_one = Revision::new(1);
+        let revision_two = Revision::new(2);
+        let mut session = MetalViewportHostSession::new(revision_one, 7);
+
+        assert_eq!(session.current_revision(), revision_one);
+        assert_eq!(session.surface_generation(), 7);
+        assert_eq!(session.frame_revision(), None);
+        assert_eq!(session.frame_serial(), None);
+        assert_eq!(session.last_submission(), None);
+        assert_eq!(session.validate_surface_generation(7), Ok(()));
+        assert_eq!(
+            session.validate_surface_generation(8),
+            Err(MetalViewportHostError::SurfaceGenerationMismatch {
+                expected: 7,
+                actual: 8,
+            })
+        );
+
+        assert_eq!(session.advance_revision(revision_two), Ok(true));
+        assert_eq!(session.current_revision(), revision_two);
+        assert_eq!(session.frame_revision(), None);
+        assert_eq!(session.frame_serial(), None);
+        assert_eq!(session.last_submission(), None);
+        assert_eq!(session.advance_revision(revision_two), Ok(false));
+        assert_eq!(session.sync_surface_generation(8), Ok(true));
+        assert_eq!(session.surface_generation(), 8);
+        assert_eq!(session.sync_surface_generation(8), Ok(false));
+        assert_eq!(
+            session.advance_revision(revision_one),
+            Err(MetalViewportHostError::RevisionRegression {
+                current: revision_two,
+                actual: revision_one,
+            })
+        );
+        assert_eq!(
+            session.sync_surface_generation(7),
+            Err(MetalViewportHostError::SurfaceGenerationRegression {
+                current: 8,
+                actual: 7,
+            })
+        );
+    }
+
+    #[test]
     fn native_command_conversion_keeps_painter_order_and_atlas_uvs() {
         use std::collections::BTreeMap;
 
@@ -1778,11 +2080,12 @@ mod tests {
         surface: MetalSurface,
         renderer: MetalFrameRenderer,
         frame: ViewportRenderFrame,
+        session: MetalViewportHostSession,
         uploader: MetalUploader,
         atlas: MetalAtlas,
-        stale: Option<Result<MetalFrameSubmission, MetalRenderError>>,
-        first: Option<Result<MetalFrameSubmission, MetalRenderError>>,
-        second: Option<Result<MetalFrameSubmission, MetalRenderError>>,
+        stale: Option<Result<u64, MetalViewportHostError>>,
+        first: Option<Result<MetalViewportHostSubmission, MetalViewportHostError>>,
+        second: Option<Result<MetalViewportHostSubmission, MetalViewportHostError>>,
         attachment_error: Option<MetalRenderError>,
         host_created: bool,
     }
@@ -1884,17 +2187,12 @@ mod tests {
                     .revision()
                     .next()
                     .expect("probe revision successor");
-                state.stale = Some(state.renderer.submit_viewport_frame(
+                let mut stale_session =
+                    MetalViewportHostSession::new(stale_revision, state.surface.generation());
+                state.stale = Some(stale_session.publish_frame(state.frame.clone()));
+                state.first = Some(state.session.submit(
+                    &mut state.renderer,
                     &state.surface,
-                    stale_revision,
-                    &state.frame,
-                    &mut state.uploader,
-                    &mut state.atlas,
-                ));
-                state.first = Some(state.renderer.submit_viewport_frame(
-                    &state.surface,
-                    state.frame.revision(),
-                    &state.frame,
                     &mut state.uploader,
                     &mut state.atlas,
                 ));
@@ -1909,12 +2207,13 @@ mod tests {
             let resize = MetalSurfaceConfig::new(300.0, 160.0, 2.0)
                 .and_then(|config| state.surface.resize(config).map(|()| config));
             if resize.is_ok() {
+                let generation = state.surface.generation();
+                let _ = state.session.sync_surface_generation(generation);
                 match unsafe { state.surface.attach_to_view(view) } {
                     Ok(attachment) => {
-                        state.second = Some(state.renderer.submit_viewport_frame(
+                        state.second = Some(state.session.submit(
+                            &mut state.renderer,
                             &state.surface,
-                            state.frame.revision(),
-                            &state.frame,
                             &mut state.uploader,
                             &mut state.atlas,
                         ));
@@ -1942,10 +2241,15 @@ mod tests {
         .expect("surface");
         let frame = appkit_probe_frame();
         let revision = frame.revision();
+        let mut session = MetalViewportHostSession::new(revision, 0);
+        session
+            .publish_frame(frame.clone())
+            .expect("probe frame publish");
         let state = AppKitProbeState {
             surface,
             renderer: MetalFrameRenderer::new(device.clone()).expect("renderer"),
             frame,
+            session,
             uploader: MetalUploader::new(device),
             atlas: MetalAtlas::new(),
             stale: None,
@@ -1965,23 +2269,29 @@ mod tests {
         assert!(state.attachment_error.is_none());
         assert_eq!(
             state.stale,
-            Some(Err(MetalRenderError::StaleRevision {
-                expected: revision.next().expect("probe revision successor"),
-                actual: revision,
-            }))
+            Some(Err(MetalViewportHostError::Frame(
+                yu_workspace::ViewportFrameError::Stale {
+                    expected: revision.next().expect("probe revision successor"),
+                    actual: revision,
+                },
+            )))
         );
         assert!(
-            matches!(state.first, Some(Ok(MetalFrameSubmission { revision: submitted, .. })) if submitted == revision)
+            matches!(state.first, Some(Ok(MetalViewportHostSubmission { revision: submitted, .. })) if submitted == revision)
                 || matches!(
                     state.first,
-                    Some(Err(MetalRenderError::DrawableUnavailable))
+                    Some(Err(MetalViewportHostError::Render(
+                        MetalRenderError::DrawableUnavailable
+                    )))
                 )
         );
         assert!(
-            matches!(state.second, Some(Ok(MetalFrameSubmission { revision: submitted, .. })) if submitted == revision)
+            matches!(state.second, Some(Ok(MetalViewportHostSubmission { revision: submitted, .. })) if submitted == revision)
                 || matches!(
                     state.second,
-                    Some(Err(MetalRenderError::DrawableUnavailable))
+                    Some(Err(MetalViewportHostError::Render(
+                        MetalRenderError::DrawableUnavailable
+                    )))
                 )
         );
         assert_eq!(state.atlas.page_count(), 1);

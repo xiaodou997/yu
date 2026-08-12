@@ -306,3 +306,8 @@
     render_plan → consumer commit` 顺序消费 `ViewportRenderFrame`；stale frame 不得上传 atlas 或
     进入 native command path，atlas staging/native/backend 失败不得推进 consumer Revision。相同
     page fingerprint 只能在同一 Metal device 上复用，submission result 只能返回 owned scalar。
+14. `MetalViewportHostSession` 只能持有 revision-bound `ViewportFrameCache`、current Revision、
+    surface generation、host-local frame serial 和 owned scalar submission；`advance_revision` 与
+    `sync_surface_generation` 必须拒绝回退，Revision/generation 变化必须清理不匹配的 frame 或
+    last submission。`submit` 必须先验证 surface generation，再消费 current frame，且失败不得
+    写入 last submission；session 不得持有 EditorDocument、source、layout、AppKit 或 GPU handle。

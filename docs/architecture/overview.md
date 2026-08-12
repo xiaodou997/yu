@@ -338,6 +338,13 @@ staging 失败不会替换已有 texture；device mismatch 在 native 调用前�
 probe 已使用真实 workspace frame 覆盖 stale、匹配提交、resize 后再次提交和 atlas 复用，但仍不
 拥有产品窗口。
 
+`MetalViewportHostSession` 是这一 backend 边界上的 host 状态机。它只保存 current Revision、
+surface generation、frame cache、host-local frame serial 和最后一次成功 submission 的 owned
+scalar；`advance_revision`/`sync_surface_generation` 都拒绝回退，`publish_frame` 只接受当前
+Revision，`submit` 只消费匹配 generation 的 cached frame。这样真实 AppKit view 后续只需把编辑、
+resize 和 frame publish 事件翻译成 session 调用，不需要在 Swift/ObjC 中复制 stale 或 viewport
+generation 规则。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过
