@@ -287,6 +287,13 @@ owned scalar；Swift 只负责将 block origin、viewport 和 AppKit caret view 
 delimiter 的 upstream/downstream 仍共享 shaped point，但 round-trip source 保留 affinity。
 非 macOS 保留 ABI 并返回 unavailable；这一步仍是 geometry/IME 风险验证，不是完整 GUI。
 
+macOS host 在该 geometry 之后可以调用 `yu_macos_composition_session_shaped_caret_scroll_request`。
+它复用当前 `ViewportConfig` 的 estimate/overscan 和 `ViewportLayout` HeightIndex，但将当前
+block 的真实 line count/height 交给 CoreText-backed `caret_scroll_request_with_shaper`；返回值
+仍是 revision-bound absolute document-space caret/scroll scalar。host 必须先发布相同的
+CoreText width/line metrics，Rust 不会在一次 scroll query 中静默重置既有 viewport measurements。
+`YuNativeViewportAdapter` 的职责仍限于 stale 检查与最后的 AppKit clip clamp。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

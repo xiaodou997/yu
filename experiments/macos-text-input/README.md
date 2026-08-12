@@ -79,6 +79,12 @@ System UI shaped geometry。Rust 返回 revision-bound 的 block-local line、x/
 source round-trip 保留 affinity，以及所有 geometry 为有限值。字体 size/max width 是诊断参数，
 不进入 canonical document state。
 
+`Viewport self-check` 之外，`Shaped viewport self-check` 会先发布 CoreText System UI 的
+line height/default advance，再调用 `yu_macos_composition_session_shaped_caret_scroll_request`。
+Rust 使用 shaped `ViewportLayout`/HeightIndex 返回 absolute target；Swift 只验证 revision、
+block、有限 caret geometry 和 target clamp，不复制 Markdown block 高度计算。metrics-only
+请求仍保留作为 fallback 对照。
+
 启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
 和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
 

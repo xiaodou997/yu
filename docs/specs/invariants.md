@@ -130,6 +130,12 @@
     affinity、非法 size/max width、CoreText/layout 失败必须清空 output；非 macOS 必须返回明确的
     `YU_FFI_CORE_TEXT_UNAVAILABLE`，查询不得修改 source、selection、composition、history 或
     Revision，也不得把平台句柄暴露到 ABI。
+29. `yu_macos_composition_session_shaped_caret_scroll_request` 必须使用当前 Revision 的
+    CoreText-backed `ViewportLayout`/HeightIndex，返回与 `CaretScrollRequest` 相同语义的绝对
+    document-space caret/target；host 必须先发布匹配的 width、line height 和 default advance，
+    不匹配时拒绝而不能隐式重置 viewport measurements。stale Revision、非法尺寸/viewport、
+    unavailable backend 或布局失败必须清空 output，查询不得修改 source、selection、composition、
+    history 或 Revision，AppKit 对象只能留在 native adapter。
 
 ## Accessibility
 

@@ -82,6 +82,7 @@
 - [x] revision-bound projection caret FFI、Before/After hidden delimiter round-trip 与 macOS self-check
 - [x] block-local revision-bound projection caret、block index 与局部 visual UTF-16 self-check
 - [x] block-local CoreText shaped caret geometry、line/point/height ABI 与 macOS self-check
+- [x] CoreText shaped caret scroll request、HeightIndex absolute target 与 macOS host self-check
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -126,6 +127,10 @@
     stable line、point、line height、block-local visual UTF-16 和 hidden delimiter affinity 的
     source round-trip；非法尺寸、stale Revision 与非 macOS unavailable 必须有明确 FFI 结果，且
     self-check 不得修改 canonical source、selection 或 history。
+9d. shaped caret scroll request 必须复用当前 `ViewportConfig`/HeightIndex，返回 CoreText
+    line-height 下的 absolute document target；width/metrics 不匹配、stale Revision 和非 macOS
+    unavailable 必须有明确结果，macOS self-check 必须证明 native adapter 仍只消费 revision-bound
+    scalar，而不维护 block height 第二真源。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

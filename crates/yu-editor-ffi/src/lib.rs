@@ -1088,20 +1088,10 @@ pub unsafe extern "C" fn yu_macos_composition_session_block_shaped_caret(
         let Some(block_index) = session.document.block_index_for_source(source) else {
             return YU_FFI_INVALID_RANGE;
         };
-        let request = match FontRequest::new("System UI", size) {
-            Ok(request) => request,
-            Err(_) => return YU_FFI_CORE_TEXT_UNAVAILABLE,
+        let (shaper, metrics, config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
         };
-        let shaper = match CoreTextShaper::from_system_ui(request) {
-            Ok(shaper) => shaper,
-            Err(_) => return YU_FFI_CORE_TEXT_UNAVAILABLE,
-        };
-        let metrics = match shaper.viewport_metrics("M中🙂e\u{301}") {
-            Ok(metrics) => metrics,
-            Err(_) => return YU_FFI_CORE_TEXT_UNAVAILABLE,
-        };
-        let config = LayoutConfig::new(max_width, metrics.line_height())
-            .with_default_advance(metrics.default_advance());
         let layout = match session
             .document
             .block_layout_with_shaper(block_index, config, &shaper)
@@ -1165,6 +1155,87 @@ pub unsafe extern "C" fn yu_macos_composition_session_block_shaped_caret(
             };
         }
         YU_FFI_OK
+    }
+}
+
+/// Resolves the current focus caret through the CoreText-shaped viewport
+/// pipeline and returns an absolute document-space scroll request. The
+/// current viewport estimate/overscan policy is retained, while width and
+/// line metrics are derived from the requested System UI size.
+///
+/// This is deliberately separate from the metrics-only
+/// `yu_composition_session_caret_scroll_request`: native hosts can compare or
+/// fall back between the two without changing the canonical editor state.
+///
+/// On non-macOS targets this symbol clears `output` and returns
+/// [`YU_FFI_CORE_TEXT_UNAVAILABLE`].
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuEditorCaretScrollRequest`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_macos_composition_session_shaped_caret_scroll_request(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    margin: f32,
+    output: *mut YuEditorCaretScrollRequest,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuEditorCaretScrollRequest::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            margin,
+        );
+        return YU_FFI_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(session, expected_revision) {
+            return status;
+        }
+        if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
+            return YU_FFI_LAYOUT_FAILED;
+        }
+        let (shaper, metrics, _layout_config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        let viewport_config = session.document.viewport_config();
+        let layout_config = viewport_config.layout();
+        if (layout_config.max_width() - max_width).abs() > 0.05
+            || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
+            || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
+        {
+            return YU_FFI_INVALID_VIEWPORT_CONFIG;
+        }
+        let request = match session.document.caret_scroll_request_with_shaper(
+            ViewportRect::new(scroll_y, viewport_height),
+            margin,
+            &shaper,
+        ) {
+            Ok(request) => request,
+            Err(error) => return status_from_document_error(error),
+        };
+        write_caret_scroll_request(session, request, output)
     }
 }
 
@@ -1483,6 +1554,25 @@ pub unsafe extern "C" fn yu_macos_core_text_projected_layout(
         );
         YU_FFI_CORE_TEXT_UNAVAILABLE
     }
+}
+
+#[cfg(target_os = "macos")]
+fn core_text_system_ui_layout(
+    size: f32,
+    max_width: f32,
+) -> Result<(CoreTextShaper, CoreTextViewportMetrics, LayoutConfig), i32> {
+    if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
+        return Err(YU_FFI_LAYOUT_FAILED);
+    }
+    let request = FontRequest::new("System UI", size).map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    let shaper =
+        CoreTextShaper::from_system_ui(request).map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    let metrics = shaper
+        .viewport_metrics("M中🙂e\u{301}")
+        .map_err(|_| YU_FFI_CORE_TEXT_UNAVAILABLE)?;
+    let config = LayoutConfig::new(max_width, metrics.line_height())
+        .with_default_advance(metrics.default_advance());
+    Ok((shaper, metrics, config))
 }
 
 #[cfg(target_os = "macos")]
@@ -2419,6 +2509,127 @@ mod tests {
             YU_FFI_STALE_REVISION
         );
         assert_eq!(stale, YuBlockShapedCaret::default());
+
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_shaped_caret_scroll_request_uses_core_text_layout_and_viewport_state() {
+        let source = "one\n\ntwo **羽🙂**\n\nthree\n";
+        let handle = session(source);
+        let mut metrics = YuCoreTextViewportMetrics::default();
+        let sample = "M中🙂e\u{301}";
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_system_ui_viewport_metrics(
+                    22.0,
+                    sample.as_bytes().as_ptr(),
+                    sample.len(),
+                    &mut metrics,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_viewport_config(
+                    handle,
+                    0,
+                    600.0,
+                    metrics.line_height,
+                    metrics.default_advance,
+                    metrics.line_height,
+                    0.0,
+                )
+            },
+            YU_FFI_OK
+        );
+
+        let mut mismatched = YuEditorCaretScrollRequest {
+            revision: 99,
+            source_utf16: 99,
+            block_index: 99,
+            caret_x: 99.0,
+            caret_y: 99.0,
+            caret_width: 99.0,
+            caret_height: 99.0,
+            current_scroll_y: 99.0,
+            target_scroll_y: 99.0,
+            margin: 99.0,
+            needs_scroll: 99,
+        };
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_shaped_caret_scroll_request(
+                    handle,
+                    0,
+                    22.0,
+                    300.0,
+                    0.0,
+                    metrics.line_height,
+                    0.0,
+                    &mut mismatched,
+                )
+            },
+            YU_FFI_INVALID_VIEWPORT_CONFIG
+        );
+        assert_eq!(mismatched, YuEditorCaretScrollRequest::default());
+
+        let mut request = YuEditorCaretScrollRequest::default();
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_shaped_caret_scroll_request(
+                    handle,
+                    0,
+                    22.0,
+                    600.0,
+                    0.0,
+                    metrics.line_height,
+                    0.0,
+                    &mut request,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(request.revision, 0);
+        assert_eq!(request.source_utf16, source.encode_utf16().count() as u64);
+        assert_eq!(request.block_index, 4);
+        assert!(request.caret_x.is_finite());
+        assert!(request.caret_y.is_finite() && request.caret_y > 0.0);
+        assert!(request.caret_height.is_finite() && request.caret_height > 0.0);
+        assert!(request.target_scroll_y.is_finite() && request.target_scroll_y >= 0.0);
+        assert!(request.target_scroll_y <= request.caret_y);
+
+        let mut stale = YuEditorCaretScrollRequest {
+            revision: 99,
+            source_utf16: 99,
+            block_index: 99,
+            caret_x: 99.0,
+            caret_y: 99.0,
+            caret_width: 99.0,
+            caret_height: 99.0,
+            current_scroll_y: 99.0,
+            target_scroll_y: 99.0,
+            margin: 99.0,
+            needs_scroll: 99,
+        };
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_shaped_caret_scroll_request(
+                    handle,
+                    1,
+                    22.0,
+                    600.0,
+                    0.0,
+                    metrics.line_height,
+                    0.0,
+                    &mut stale,
+                )
+            },
+            YU_FFI_STALE_REVISION
+        );
+        assert_eq!(stale, YuEditorCaretScrollRequest::default());
 
         unsafe { yu_composition_session_destroy(handle) };
     }

@@ -220,6 +220,10 @@ int32_t yu_macos_composition_session_block_shaped_caret(YuCompositionSession *se
                                                         float size,
                                                         float max_width,
                                                         YuBlockShapedCaret *output);
+int32_t yu_macos_composition_session_shaped_caret_scroll_request(
+    YuCompositionSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height, float margin,
+    YuEditorCaretScrollRequest *output);
 int32_t yu_composition_session_set_viewport_config(YuCompositionSession *session,
                                                    uint64_t expected_revision,
                                                    float max_width,
