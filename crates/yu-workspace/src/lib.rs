@@ -13,6 +13,7 @@ use std::fmt;
 use yu_core::Revision;
 use yu_editor::{EditorDocument, EditorDocumentError, ShapingProvider, ViewportRect};
 use yu_font::GlyphAtlas;
+use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
     Rect, Rgba8, Scene, SceneBuilder, SceneError, ViewportBlockGeometry, ViewportSceneInput,
 };
@@ -46,11 +47,210 @@ impl ViewportSceneFrame {
     }
 }
 
+/// A scene and its backend-neutral render plan published as one revision-bound
+/// frame. Keeping them together prevents a new scene from being paired with an
+/// older command list (or vice versa) at a platform boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewportRenderFrame {
+    scene: ViewportSceneFrame,
+    plan: RenderPlan,
+}
+
+impl ViewportRenderFrame {
+    pub fn new(scene: ViewportSceneFrame, plan: RenderPlan) -> Result<Self, ViewportFrameError> {
+        if scene.revision() != plan.revision() {
+            return Err(ViewportFrameError::RevisionMismatch {
+                scene: scene.revision(),
+                plan: plan.revision(),
+            });
+        }
+        Ok(Self { scene, plan })
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.scene.revision()
+    }
+
+    #[must_use]
+    pub fn scene(&self) -> &ViewportSceneFrame {
+        &self.scene
+    }
+
+    #[must_use]
+    pub fn plan(&self) -> &RenderPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ViewportSceneFrame, RenderPlan) {
+        (self.scene, self.plan)
+    }
+}
+
+/// Immutable inputs shared by one scene/render frame build.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewportRenderConfig {
+    viewport: ViewportRect,
+    font_size: f32,
+    scene_viewport: Rect,
+    color: Rgba8,
+}
+
+impl ViewportRenderConfig {
+    #[must_use]
+    pub const fn new(
+        viewport: ViewportRect,
+        font_size: f32,
+        scene_viewport: Rect,
+        color: Rgba8,
+    ) -> Self {
+        Self {
+            viewport,
+            font_size,
+            scene_viewport,
+            color,
+        }
+    }
+
+    #[must_use]
+    pub const fn viewport(self) -> ViewportRect {
+        self.viewport
+    }
+
+    #[must_use]
+    pub const fn font_size(self) -> f32 {
+        self.font_size
+    }
+
+    #[must_use]
+    pub const fn scene_viewport(self) -> Rect {
+        self.scene_viewport
+    }
+
+    #[must_use]
+    pub const fn color(self) -> Rgba8 {
+        self.color
+    }
+}
+
+/// Errors raised when a scene and render plan are combined or published.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewportFrameError {
+    RevisionMismatch {
+        scene: Revision,
+        plan: Revision,
+    },
+    Stale {
+        expected: Revision,
+        actual: Revision,
+    },
+}
+
+impl fmt::Display for ViewportFrameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RevisionMismatch { scene, plan } => {
+                write!(
+                    formatter,
+                    "viewport scene revision {scene:?} does not match plan {plan:?}"
+                )
+            }
+            Self::Stale { expected, actual } => {
+                write!(
+                    formatter,
+                    "viewport frame {actual:?} is stale for {expected:?}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ViewportFrameError {}
+
+/// Single-entry cache for the latest publishable viewport frame.
+///
+/// A lookup is revision-aware and never returns a frame for another source
+/// revision. Hosts can call `invalidate_stale` after an edit to eagerly drop
+/// the old scene and plan, while a stale publish is rejected even if the host
+/// forgot to clear first.
+#[derive(Clone, Debug, Default)]
+pub struct ViewportFrameCache {
+    current: Option<ViewportRenderFrame>,
+}
+
+impl ViewportFrameCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn current_revision(&self) -> Option<Revision> {
+        self.current.as_ref().map(ViewportRenderFrame::revision)
+    }
+
+    #[must_use]
+    pub fn get(&self, revision: Revision) -> Option<&ViewportRenderFrame> {
+        self.current
+            .as_ref()
+            .filter(|frame| frame.revision() == revision)
+    }
+
+    /// Drops the cached frame unless it belongs to `revision`.
+    ///
+    /// Returns `true` when an old frame was removed. An empty cache is already
+    /// synchronized and returns `false`.
+    pub fn invalidate_stale(&mut self, revision: Revision) -> bool {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|frame| frame.revision() != revision)
+        {
+            self.current = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.current = None;
+    }
+
+    /// Publishes a complete frame only if it still belongs to the caller's
+    /// current document revision. Replacement is atomic at the cache level.
+    pub fn publish_if_current(
+        &mut self,
+        current_revision: Revision,
+        frame: ViewportRenderFrame,
+    ) -> Result<(), ViewportFrameError> {
+        if frame.revision() != current_revision {
+            return Err(ViewportFrameError::Stale {
+                expected: current_revision,
+                actual: frame.revision(),
+            });
+        }
+        if let Some(existing) = self.current.as_ref()
+            && existing.revision() > frame.revision()
+        {
+            return Err(ViewportFrameError::Stale {
+                expected: existing.revision(),
+                actual: frame.revision(),
+            });
+        }
+        self.current = Some(frame);
+        Ok(())
+    }
+}
+
 /// Errors raised while assembling an editor viewport into a retained scene.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ViewportSceneError {
     Document(EditorDocumentError),
     Scene(SceneError),
+    Render(RenderError),
+    Frame(ViewportFrameError),
 }
 
 impl fmt::Display for ViewportSceneError {
@@ -58,6 +258,8 @@ impl fmt::Display for ViewportSceneError {
         match self {
             Self::Document(error) => error.fmt(formatter),
             Self::Scene(error) => error.fmt(formatter),
+            Self::Render(error) => error.fmt(formatter),
+            Self::Frame(error) => error.fmt(formatter),
         }
     }
 }
@@ -67,6 +269,8 @@ impl Error for ViewportSceneError {
         match self {
             Self::Document(error) => Some(error),
             Self::Scene(error) => Some(error),
+            Self::Render(error) => Some(error),
+            Self::Frame(error) => Some(error),
         }
     }
 }
@@ -80,6 +284,18 @@ impl From<EditorDocumentError> for ViewportSceneError {
 impl From<SceneError> for ViewportSceneError {
     fn from(error: SceneError) -> Self {
         Self::Scene(error)
+    }
+}
+
+impl From<RenderError> for ViewportSceneError {
+    fn from(error: RenderError) -> Self {
+        Self::Render(error)
+    }
+}
+
+impl From<ViewportFrameError> for ViewportSceneError {
+    fn from(error: ViewportFrameError) -> Self {
+        Self::Frame(error)
     }
 }
 
@@ -138,11 +354,42 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
     })
 }
 
+/// Builds a scene and its backend-neutral render plan from one editor viewport
+/// measurement. The render-plan builder is updated only after scene assembly
+/// succeeds; callers can then publish the returned pair through
+/// `ViewportFrameCache::publish_if_current`.
+pub fn assemble_viewport_render_frame<S: ShapingProvider>(
+    document: &mut EditorDocument,
+    config: ViewportRenderConfig,
+    shaper: &S,
+    atlas: &GlyphAtlas,
+    render_plans: &mut RenderPlanBuilder,
+) -> Result<ViewportRenderFrame, ViewportSceneError> {
+    let scene = assemble_viewport_scene(
+        document,
+        config.viewport(),
+        shaper,
+        config.font_size(),
+        config.scene_viewport(),
+        atlas,
+        config.color(),
+    )?;
+    if scene.revision() != document.revision() {
+        return Err(ViewportFrameError::Stale {
+            expected: document.revision(),
+            actual: scene.revision(),
+        }
+        .into());
+    }
+    let plan = render_plans.build(scene.scene(), atlas)?;
+    ViewportRenderFrame::new(scene, plan).map_err(ViewportSceneError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use yu_editor::{LayoutConfig, ViewportConfig};
+    use yu_editor::{EditorCommand, LayoutConfig, ViewportConfig};
     use yu_font::{
         FontDatabase, FontFaceSpec, FontRequest, FontShaper, GlyphAtlasConfig, GlyphBitmap,
         GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
@@ -270,5 +517,89 @@ mod tests {
             error,
             ViewportSceneError::Scene(SceneError::MissingGlyphAtlas(_))
         ));
+    }
+
+    #[test]
+    fn frame_cache_rejects_stale_publish_and_replaces_after_edit() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 80.0);
+        let mut document = EditorDocument::new("paragraph");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let mut plans = RenderPlanBuilder::new();
+        let old_frame = assemble_viewport_render_frame(
+            &mut document,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 240.0, 80.0).expect("scene viewport"),
+                Rgba8::black(),
+            ),
+            &shaper,
+            &atlas,
+            &mut plans,
+        )
+        .expect("old frame");
+        let old_revision = document.revision();
+        let mut cache = ViewportFrameCache::new();
+        cache
+            .publish_if_current(old_revision, old_frame.clone())
+            .expect("initial publish");
+        assert_eq!(cache.current_revision(), Some(old_revision));
+        assert!(cache.get(old_revision).is_some());
+
+        document
+            .execute(EditorCommand::insert_text("!"))
+            .expect("edit");
+        let new_revision = document.revision();
+        assert_ne!(new_revision, old_revision);
+        assert_eq!(
+            cache.publish_if_current(new_revision, old_frame.clone()),
+            Err(ViewportFrameError::Stale {
+                expected: new_revision,
+                actual: old_revision,
+            })
+        );
+        assert_eq!(cache.current_revision(), Some(old_revision));
+        assert!(cache.invalidate_stale(new_revision));
+        assert!(cache.get(old_revision).is_none());
+        assert!(!cache.invalidate_stale(new_revision));
+
+        let new_atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let new_frame = assemble_viewport_render_frame(
+            &mut document,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 240.0, 80.0).expect("scene viewport"),
+                Rgba8::black(),
+            ),
+            &shaper,
+            &new_atlas,
+            &mut plans,
+        )
+        .expect("new frame");
+        cache
+            .publish_if_current(new_revision, new_frame)
+            .expect("new publish");
+        assert_eq!(cache.current_revision(), Some(new_revision));
+        assert_eq!(
+            cache.get(new_revision).expect("new frame").revision(),
+            new_revision
+        );
+        assert_eq!(
+            cache.publish_if_current(old_revision, old_frame),
+            Err(ViewportFrameError::Stale {
+                expected: new_revision,
+                actual: old_revision,
+            })
+        );
     }
 }
