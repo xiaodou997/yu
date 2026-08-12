@@ -523,6 +523,75 @@ mod tests {
     }
 
     #[test]
+    fn viewport_block_layout_is_translated_to_document_space_atomically() {
+        let font_size = 14.0;
+        let layout = shaped_layout(font_size);
+        let atlas = atlas_for_layout(&layout, font_size);
+        let geometry = yu_scene::ViewportBlockGeometry::new(
+            layout.revision(),
+            3,
+            layout.source_range(),
+            40.0,
+            20.0,
+            true,
+            2,
+        )
+        .expect("geometry");
+        let viewport = Rect::new(0.0, 0.0, 200.0, 80.0).expect("viewport");
+        let mut builder = SceneBuilder::new(layout.revision(), viewport).expect("scene");
+        assert_eq!(
+            builder
+                .append_layout_at_block(geometry, &layout, &atlas, font_size, Rgba8::black())
+                .expect("append block layout"),
+            2
+        );
+        match builder.finish().primitives()[0] {
+            Primitive::Glyph(glyph) => {
+                assert_eq!(glyph.origin().x(), layout.glyphs()[0].x());
+                assert_eq!(glyph.origin().y(), layout.glyphs()[0].y() + 40.0);
+            }
+            Primitive::FillRect { .. } => panic!("expected glyph primitive"),
+        }
+
+        let mut stale_builder = SceneBuilder::new(Revision::new(9), viewport).expect("scene");
+        assert!(matches!(
+            stale_builder.append_layout_at_block(
+                geometry,
+                &layout,
+                &atlas,
+                font_size,
+                Rgba8::black()
+            ),
+            Err(SceneError::ViewportRevisionMismatch { .. })
+        ));
+        assert!(stale_builder.finish().primitives().is_empty());
+
+        let mismatched = yu_scene::ViewportBlockGeometry::new(
+            layout.revision(),
+            3,
+            yu_core::TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(1))
+                .expect("range"),
+            40.0,
+            20.0,
+            true,
+            2,
+        )
+        .expect("geometry");
+        let mut mismatch_builder = SceneBuilder::new(layout.revision(), viewport).expect("scene");
+        assert_eq!(
+            mismatch_builder.append_layout_at_block(
+                mismatched,
+                &layout,
+                &atlas,
+                font_size,
+                Rgba8::black()
+            ),
+            Err(SceneError::ViewportSourceMismatch)
+        );
+        assert!(mismatch_builder.finish().primitives().is_empty());
+    }
+
+    #[test]
     fn missing_layout_atlas_is_atomic_and_revision_mismatch_is_rejected() {
         let font_size = 14.0;
         let layout = shaped_layout(font_size);

@@ -14,6 +14,10 @@ use yu_core::Revision;
 use yu_font::{AtlasEntry, GlyphRasterKey};
 use yu_layout::LayoutSnapshot;
 
+mod viewport;
+
+pub use viewport::{ViewportBlockGeometry, ViewportSceneInput};
+
 /// A finite point in scene coordinates. The coordinate system is chosen by
 /// the platform shell; Yu's current layout convention is x-right/y-down.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -336,9 +340,18 @@ impl Default for DamageSet {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneError {
     InvalidGeometry(&'static str),
+    InvalidViewportInput(&'static str),
     InvalidDamageBudget,
     PrimitiveLimitExceeded,
-    RevisionMismatch { scene: Revision, layout: Revision },
+    RevisionMismatch {
+        scene: Revision,
+        layout: Revision,
+    },
+    ViewportRevisionMismatch {
+        expected: Revision,
+        actual: Revision,
+    },
+    ViewportSourceMismatch,
     InvalidFontSize(u32),
     MissingGlyphAtlas(GlyphRasterKey),
 }
@@ -347,12 +360,20 @@ impl fmt::Display for SceneError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidGeometry(message) => formatter.write_str(message),
+            Self::InvalidViewportInput(message) => formatter.write_str(message),
             Self::InvalidDamageBudget => formatter.write_str("damage budget must be positive"),
             Self::PrimitiveLimitExceeded => formatter.write_str("scene primitive limit exceeded"),
             Self::RevisionMismatch { scene, layout } => write!(
                 formatter,
                 "scene revision {scene:?} does not match layout revision {layout:?}"
             ),
+            Self::ViewportRevisionMismatch { expected, actual } => write!(
+                formatter,
+                "viewport revision {actual:?} does not match expected {expected:?}"
+            ),
+            Self::ViewportSourceMismatch => {
+                formatter.write_str("viewport block source range does not match layout")
+            }
             Self::InvalidFontSize(size) => {
                 write!(
                     formatter,
@@ -474,12 +495,28 @@ impl SceneBuilder {
         font_size: f32,
         color: Rgba8,
     ) -> Result<usize, SceneError> {
+        self.append_layout_at(layout, atlas, font_size, color, Point::new(0.0, 0.0))
+    }
+
+    /// Appends all shaped glyphs from a block layout at a document-space
+    /// origin. Layout coordinates remain block-local; only the scene origin
+    /// translates them, so the viewport height index remains the sole source
+    /// of block positioning.
+    pub fn append_layout_at(
+        &mut self,
+        layout: &LayoutSnapshot,
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+        origin: Point,
+    ) -> Result<usize, SceneError> {
         if self.revision != layout.revision() {
             return Err(SceneError::RevisionMismatch {
                 scene: self.revision,
                 layout: layout.revision(),
             });
         }
+        origin.validate()?;
         if !font_size.is_finite() || font_size <= 0.0 {
             return Err(SceneError::InvalidFontSize(font_size.to_bits()));
         }
@@ -489,11 +526,14 @@ impl SceneBuilder {
             let key = GlyphRasterKey::new(placement.face(), placement.glyph(), font_size)
                 .map_err(|_| SceneError::InvalidFontSize(font_size.to_bits()))?;
             let entry = atlas.entry(key).ok_or(SceneError::MissingGlyphAtlas(key))?;
-            primitives.push(GlyphPrimitive::new(
+            let glyph = GlyphPrimitive::new(
                 entry,
-                Point::new(placement.x(), placement.y()),
+                Point::new(origin.x() + placement.x(), origin.y() + placement.y()),
                 color,
-            ));
+            );
+            glyph.origin.validate()?;
+            glyph.bounds().validate()?;
+            primitives.push(glyph);
         }
         if primitives.len() > self.max_primitives.saturating_sub(self.primitives.len()) {
             return Err(SceneError::PrimitiveLimitExceeded);
@@ -503,6 +543,41 @@ impl SceneBuilder {
             self.glyph(glyph)?;
         }
         Ok(count)
+    }
+
+    /// Appends one visible block layout using the document-space origin from
+    /// a validated viewport input. The source range and revision checks keep
+    /// a stale/local layout from being painted at another block's origin.
+    pub fn append_layout_at_block(
+        &mut self,
+        geometry: ViewportBlockGeometry,
+        layout: &LayoutSnapshot,
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+    ) -> Result<usize, SceneError> {
+        if geometry.revision() != self.revision {
+            return Err(SceneError::ViewportRevisionMismatch {
+                expected: self.revision,
+                actual: geometry.revision(),
+            });
+        }
+        if layout.revision() != geometry.revision() {
+            return Err(SceneError::RevisionMismatch {
+                scene: geometry.revision(),
+                layout: layout.revision(),
+            });
+        }
+        if layout.source_range() != geometry.source() {
+            return Err(SceneError::ViewportSourceMismatch);
+        }
+        self.append_layout_at(
+            layout,
+            atlas,
+            font_size,
+            color,
+            Point::new(0.0, geometry.y()),
+        )
     }
 
     #[must_use]
