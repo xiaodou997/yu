@@ -155,6 +155,10 @@
     结果建立 `ViewportSceneInput`，再按相同 block index/config 取得 shaped layout；它不得复制或
     修改 HeightIndex、source、selection、composition 或 history。返回的 `ViewportSceneFrame`、
     `Scene` 与 `RenderPlan` 必须共享该结果的 Revision，任何 layout/atlas 失败都不得发布部分 scene。
+34. `ViewportRenderFrame` 的 scene 与 render plan 必须拥有同一 Revision；`ViewportFrameCache` 只
+    能发布等于调用方当前 Revision 的 frame，必须拒绝 stale frame 和较旧 Revision 回退，并在
+    `invalidate_stale`/替换时保持 scene+plan 原子。cache 不得持有 source、EditorDocument、
+    HeightIndex、native object 或 GPU handle。
 
 ## Accessibility
 

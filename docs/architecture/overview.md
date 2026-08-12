@@ -320,6 +320,11 @@ origin，绝不根据 kind 或 source 重新布局。这样 FFI/native host、ed
 因此 macOS host 不需要复制 Markdown block traversal、HeightIndex 或 layout cache，后续窗口/Metal
 层只消费 `ViewportSceneFrame`/`RenderPlan`。
 
+`ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
+文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
+编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、
+HeightIndex、native object 或 GPU handle，只保存最近一次可提交的 owned frame。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

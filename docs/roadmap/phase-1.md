@@ -87,6 +87,7 @@
 - [x] `ViewportSceneInput` metadata validation 与 block-local layout document-origin append
 - [x] 多 block viewport scene batch preflight、document-space assembly 与失败原子性
 - [x] `yu-workspace` editor viewport → scene → render-plan 无窗口集成 vertical slice
+- [x] revision-aware `ViewportRenderFrame` cache、stale discard 与 publish gate
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -147,6 +148,9 @@
 9h. `EditorDocument::visible_blocks_with_shaper` 到 `ViewportSceneInput`、`Scene` 和 `RenderPlan`
     必须有真实跨 crate 测试；组装层不得引入第二套 block traversal/HeightIndex，且 missing atlas
     或 layout failure 必须保持 scene 未发布。
+9i. scene 与 render plan 必须以同一 Revision 组成 `ViewportRenderFrame`；cache 发布必须拒绝
+    stale/回退结果，编辑后旧 frame 可整体丢弃，新 Revision frame 才能替换，且不得引入窗口或
+    GPU ownership。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可
