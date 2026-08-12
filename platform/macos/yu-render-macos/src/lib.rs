@@ -21,7 +21,9 @@ use std::rc::Rc;
 use yu_core::Revision;
 use yu_render::{AtlasPageUpload, RenderCommand, RenderPlan, RenderUploader};
 use yu_scene::Rgba8;
-use yu_workspace::{ViewportFrameCache, ViewportFrameError, ViewportRenderFrame};
+use yu_workspace::{
+    ViewportFrameCache, ViewportFrameError, ViewportFramePublication, ViewportRenderFrame,
+};
 
 #[cfg(target_os = "macos")]
 mod native {
@@ -1039,10 +1041,29 @@ impl MetalFrameSubmission {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetalViewportHostError {
     Frame(ViewportFrameError),
-    RevisionRegression { current: Revision, actual: Revision },
-    NoCurrentFrame { revision: Revision },
-    SurfaceGenerationRegression { current: u64, actual: u64 },
-    SurfaceGenerationMismatch { expected: u64, actual: u64 },
+    PublicationRevisionMismatch {
+        publication: Revision,
+        frame: Revision,
+    },
+    PublicationSerialRegression {
+        current: u64,
+        actual: u64,
+    },
+    RevisionRegression {
+        current: Revision,
+        actual: Revision,
+    },
+    NoCurrentFrame {
+        revision: Revision,
+    },
+    SurfaceGenerationRegression {
+        current: u64,
+        actual: u64,
+    },
+    SurfaceGenerationMismatch {
+        expected: u64,
+        actual: u64,
+    },
     FrameSerialOverflow,
     Render(MetalRenderError),
 }
@@ -1051,6 +1072,14 @@ impl fmt::Display for MetalViewportHostError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Frame(error) => error.fmt(formatter),
+            Self::PublicationRevisionMismatch { publication, frame } => write!(
+                formatter,
+                "viewport publication {publication:?} contains frame {frame:?}"
+            ),
+            Self::PublicationSerialRegression { current, actual } => write!(
+                formatter,
+                "viewport publication serial moved backwards from {current} to {actual}"
+            ),
             Self::RevisionRegression { current, actual } => write!(
                 formatter,
                 "viewport host revision moved backwards from {current:?} to {actual:?}"
@@ -1077,7 +1106,9 @@ impl Error for MetalViewportHostError {
         match self {
             Self::Frame(error) => Some(error),
             Self::Render(error) => Some(error),
-            Self::RevisionRegression { .. }
+            Self::PublicationRevisionMismatch { .. }
+            | Self::PublicationSerialRegression { .. }
+            | Self::RevisionRegression { .. }
             | Self::NoCurrentFrame { .. }
             | Self::SurfaceGenerationRegression { .. }
             | Self::SurfaceGenerationMismatch { .. }
@@ -1228,16 +1259,58 @@ impl MetalViewportHostSession {
         &mut self,
         frame: ViewportRenderFrame,
     ) -> Result<u64, MetalViewportHostError> {
-        self.frame_cache
-            .publish_if_current(self.current_revision, frame)
-            .map_err(MetalViewportHostError::Frame)?;
-        self.next_frame_serial = self
+        let serial = self
             .next_frame_serial
             .checked_add(1)
             .ok_or(MetalViewportHostError::FrameSerialOverflow)?;
-        self.frame_serial = Some(self.next_frame_serial);
+        self.frame_cache
+            .publish_if_current(self.current_revision, frame)
+            .map_err(MetalViewportHostError::Frame)?;
+        self.next_frame_serial = serial;
+        self.frame_serial = Some(serial);
         self.last_submission = None;
         Ok(self.next_frame_serial)
+    }
+
+    /// Accepts an owned publication produced by `yu_workspace`.
+    ///
+    /// The publication's Revision and serial become the host-visible frame
+    /// identity. The frame is copied into the host's revision-aware cache only
+    /// after both identities have passed validation, so a stale or reordered
+    /// publication cannot disturb a currently submit-able frame.
+    pub fn accept_publication(
+        &mut self,
+        publication: ViewportFramePublication,
+    ) -> Result<u64, MetalViewportHostError> {
+        if publication.revision() != self.current_revision {
+            return Err(MetalViewportHostError::Frame(ViewportFrameError::Stale {
+                expected: self.current_revision,
+                actual: publication.revision(),
+            }));
+        }
+        if publication.frame().revision() != publication.revision() {
+            return Err(MetalViewportHostError::PublicationRevisionMismatch {
+                publication: publication.revision(),
+                frame: publication.frame().revision(),
+            });
+        }
+        if let Some(current) = self.frame_serial
+            && publication.serial() <= current
+        {
+            return Err(MetalViewportHostError::PublicationSerialRegression {
+                current,
+                actual: publication.serial(),
+            });
+        }
+
+        let serial = publication.serial();
+        self.frame_cache
+            .publish_if_current(self.current_revision, publication.frame().clone())
+            .map_err(MetalViewportHostError::Frame)?;
+        self.next_frame_serial = self.next_frame_serial.max(serial);
+        self.frame_serial = Some(serial);
+        self.last_submission = None;
+        Ok(serial)
     }
 
     /// Submits the currently published frame through the ordered Metal host
@@ -1874,6 +1947,34 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn viewport_host_session_accepts_workspace_publication_once_in_order() {
+        let publication = appkit_probe_publication();
+        let revision = publication.revision();
+        let serial = publication.serial();
+        let mut session = MetalViewportHostSession::new(revision, 0);
+
+        assert_eq!(session.accept_publication(publication.clone()), Ok(serial));
+        assert_eq!(session.current_revision(), revision);
+        assert_eq!(session.frame_revision(), Some(revision));
+        assert_eq!(session.frame_serial(), Some(serial));
+        assert_eq!(
+            session.accept_publication(publication),
+            Err(MetalViewportHostError::PublicationSerialRegression {
+                current: serial,
+                actual: serial,
+            })
+        );
+
+        let next_revision = revision.next().expect("publication revision successor");
+        session
+            .advance_revision(next_revision)
+            .expect("advance host revision");
+        assert_eq!(session.frame_revision(), None);
+        assert_eq!(session.frame_serial(), None);
+    }
+
     #[test]
     fn native_command_conversion_keeps_painter_order_and_atlas_uvs() {
         use std::collections::BTreeMap;
@@ -2079,7 +2180,7 @@ mod tests {
     struct AppKitProbeState {
         surface: MetalSurface,
         renderer: MetalFrameRenderer,
-        frame: ViewportRenderFrame,
+        publication: ViewportFramePublication,
         session: MetalViewportHostSession,
         uploader: MetalUploader,
         atlas: MetalAtlas,
@@ -2091,7 +2192,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn appkit_probe_frame() -> ViewportRenderFrame {
+    fn appkit_probe_publication() -> ViewportFramePublication {
         use std::sync::Arc;
 
         use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportRect};
@@ -2099,9 +2200,8 @@ mod tests {
             FontDatabase, FontFaceSpec, FontRequest, FontShaper, GlyphAtlas, GlyphAtlasConfig,
             GlyphBitmap, GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
         };
-        use yu_render::RenderPlanBuilder;
         use yu_scene::{Rect, Rgba8};
-        use yu_workspace::{ViewportRenderConfig, assemble_viewport_render_frame};
+        use yu_workspace::{ViewportFramePublisher, ViewportRenderConfig};
 
         let font_size = 14.0;
         let mut database = FontDatabase::new();
@@ -2147,19 +2247,21 @@ mod tests {
             }
         }
 
-        assemble_viewport_render_frame(
-            &mut document,
-            ViewportRenderConfig::new(
-                viewport,
-                font_size,
-                Rect::new(0.0, 0.0, 320.0, 180.0).expect("probe scene viewport"),
-                Rgba8::new(24, 28, 36, 255),
-            ),
-            &shaper,
-            &atlas,
-            &mut RenderPlanBuilder::new(),
-        )
-        .expect("probe workspace frame")
+        let mut publisher = ViewportFramePublisher::new();
+        publisher
+            .publish(
+                &mut document,
+                ViewportRenderConfig::new(
+                    viewport,
+                    font_size,
+                    Rect::new(0.0, 0.0, 320.0, 180.0).expect("probe scene viewport"),
+                    Rgba8::new(24, 28, 36, 255),
+                ),
+                &shaper,
+                &atlas,
+                &mut yu_render::RenderPlanBuilder::new(),
+            )
+            .expect("probe workspace frame")
     }
 
     #[cfg(target_os = "macos")]
@@ -2183,13 +2285,13 @@ mod tests {
         match unsafe { state.surface.attach_to_view(view) } {
             Ok(attachment) => {
                 let stale_revision = state
-                    .frame
+                    .publication
                     .revision()
                     .next()
                     .expect("probe revision successor");
                 let mut stale_session =
                     MetalViewportHostSession::new(stale_revision, state.surface.generation());
-                state.stale = Some(stale_session.publish_frame(state.frame.clone()));
+                state.stale = Some(stale_session.accept_publication(state.publication.clone()));
                 state.first = Some(state.session.submit(
                     &mut state.renderer,
                     &state.surface,
@@ -2239,16 +2341,16 @@ mod tests {
             MetalSurfaceConfig::new(320.0, 180.0, 2.0).expect("surface config"),
         )
         .expect("surface");
-        let frame = appkit_probe_frame();
-        let revision = frame.revision();
+        let publication = appkit_probe_publication();
+        let revision = publication.revision();
         let mut session = MetalViewportHostSession::new(revision, 0);
         session
-            .publish_frame(frame.clone())
+            .accept_publication(publication.clone())
             .expect("probe frame publish");
         let state = AppKitProbeState {
             surface,
             renderer: MetalFrameRenderer::new(device.clone()).expect("renderer"),
-            frame,
+            publication,
             session,
             uploader: MetalUploader::new(device),
             atlas: MetalAtlas::new(),
