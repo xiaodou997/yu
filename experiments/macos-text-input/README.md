@@ -85,6 +85,10 @@ Rust 使用 shaped `ViewportLayout`/HeightIndex 返回 absolute target；Swift �
 block、有限 caret geometry 和 target clamp，不复制 Markdown block 高度计算。metrics-only
 请求仍保留作为 fallback 对照。
 
+随后以 shaped target 作为新的 `scrollY` 请求 block snapshot，检查可见 range、block origin、
+source UTF-16 range、kind tag、measured 标记和 content height 都属于同一 Revision；这一步
+只验证 viewport metadata，不绘制 UI。
+
 启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
 和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
 

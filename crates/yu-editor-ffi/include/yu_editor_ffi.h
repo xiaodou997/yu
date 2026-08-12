@@ -25,6 +25,17 @@ enum {
 };
 
 enum {
+    YU_VIEWPORT_BLOCK_BLANK = 0,
+    YU_VIEWPORT_BLOCK_REFERENCE_DEFINITION = 1,
+    YU_VIEWPORT_BLOCK_PARAGRAPH = 2,
+    YU_VIEWPORT_BLOCK_HEADING = 3,
+    YU_VIEWPORT_BLOCK_FENCED_CODE = 4,
+    YU_VIEWPORT_BLOCK_QUOTE = 5,
+    YU_VIEWPORT_BLOCK_LIST = 6,
+    YU_VIEWPORT_BLOCK_TASK_LIST = 7,
+};
+
+enum {
     YU_COMMAND_UNAVAILABLE = 0,
     YU_COMMAND_AVAILABLE = 1,
 };
@@ -156,6 +167,24 @@ typedef struct YuBlockShapedCaret {
     uint8_t affinity;
 } YuBlockShapedCaret;
 
+typedef struct YuShapedViewportBlock {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    float y;
+    float height;
+    uint8_t measured;
+    uint8_t kind;
+} YuShapedViewportBlock;
+
+typedef struct YuShapedViewportSnapshot {
+    uint64_t revision;
+    uint64_t block_start;
+    uint64_t block_end;
+    float content_height;
+} YuShapedViewportSnapshot;
+
 int32_t yu_composition_session_new(const uint8_t *source, size_t source_length,
                                    YuCompositionSession **output);
 void yu_composition_session_destroy(YuCompositionSession *session);
@@ -224,6 +253,11 @@ int32_t yu_macos_composition_session_shaped_caret_scroll_request(
     YuCompositionSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height, float margin,
     YuEditorCaretScrollRequest *output);
+int32_t yu_macos_composition_session_shaped_viewport_blocks(
+    YuCompositionSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height,
+    YuShapedViewportSnapshot *snapshot, YuShapedViewportBlock *blocks,
+    size_t capacity, size_t *written);
 int32_t yu_composition_session_set_viewport_config(YuCompositionSession *session,
                                                    uint64_t expected_revision,
                                                    float max_width,

@@ -294,6 +294,12 @@ block 的真实 line count/height 交给 CoreText-backed `caret_scroll_request_w
 CoreText width/line metrics，Rust 不会在一次 scroll query 中静默重置既有 viewport measurements。
 `YuNativeViewportAdapter` 的职责仍限于 stale 检查与最后的 AppKit clip clamp。
 
+随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
+`ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16
+range、document-space block origin/height、measured 和稳定 kind tag。它只复制 owned scalar，
+不暴露 `ViewportSnapshot`、Markdown block 或 layout 对象；因此 scene/document view 可以直接
+消费 block geometry，同时保持 Rust 为唯一的 block height/source 边界。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

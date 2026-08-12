@@ -136,6 +136,12 @@
     不匹配时拒绝而不能隐式重置 viewport measurements。stale Revision、非法尺寸/viewport、
     unavailable backend 或布局失败必须清空 output，查询不得修改 source、selection、composition、
     history 或 Revision，AppKit 对象只能留在 native adapter。
+30. `yu_macos_composition_session_shaped_viewport_blocks` 必须从同一 Revision 的 shaped
+    `ViewportSnapshot` 返回有序 block index/source UTF-16 range、有限且单调的 document-space
+    `y`、正 height、measured 标志和稳定 kind tag；header 与 block values 必须共享 Revision。
+    `capacity == 0 && blocks == NULL` 只能执行 count，不足容量不得写入部分 block 数组；stale
+    Revision、非法参数、layout/unavailable 失败必须清空 header/count，查询不得修改 source、
+    selection、composition、history 或把 Rust layout/Markdown/AppKit 对象暴露到 ABI。
 
 ## Accessibility
 

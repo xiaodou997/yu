@@ -12,6 +12,8 @@ use yu_editor::{
 use yu_text::{EditError, TextSnapshot};
 
 #[cfg(target_os = "macos")]
+use yu_editor::BlockKind;
+#[cfg(target_os = "macos")]
 use yu_font::FontRequest;
 #[cfg(target_os = "macos")]
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
@@ -31,6 +33,14 @@ pub const YU_FFI_INVALID_KEY: i32 = 11;
 pub const YU_FFI_INVALID_VIEWPORT_CONFIG: i32 = 12;
 pub const YU_FFI_CORE_TEXT_UNAVAILABLE: i32 = 13;
 pub const YU_FFI_LAYOUT_FAILED: i32 = 14;
+pub const YU_VIEWPORT_BLOCK_BLANK: u8 = 0;
+pub const YU_VIEWPORT_BLOCK_REFERENCE_DEFINITION: u8 = 1;
+pub const YU_VIEWPORT_BLOCK_PARAGRAPH: u8 = 2;
+pub const YU_VIEWPORT_BLOCK_HEADING: u8 = 3;
+pub const YU_VIEWPORT_BLOCK_FENCED_CODE: u8 = 4;
+pub const YU_VIEWPORT_BLOCK_QUOTE: u8 = 5;
+pub const YU_VIEWPORT_BLOCK_LIST: u8 = 6;
+pub const YU_VIEWPORT_BLOCK_TASK_LIST: u8 = 7;
 pub const YU_COMMAND_UNAVAILABLE: u8 = 0;
 pub const YU_COMMAND_AVAILABLE: u8 = 1;
 pub const YU_SOURCE_SYNC_NONE: u8 = 0;
@@ -183,6 +193,33 @@ pub struct YuBlockShapedCaret {
     pub caret_width: f32,
     pub caret_height: f32,
     pub affinity: u8,
+}
+
+/// Revision-bound metadata for one block selected by a shaped viewport query.
+/// Source ranges are UTF-16 units and `y`/`height` are document-space native
+/// point coordinates; no parser or layout object crosses the ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuShapedViewportBlock {
+    pub revision: u64,
+    pub block_index: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub y: f32,
+    pub height: f32,
+    pub measured: u8,
+    pub kind: u8,
+}
+
+/// Owned metadata for one shaped viewport snapshot. Block values are returned
+/// separately through the count/fill ABI below.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuShapedViewportSnapshot {
+    pub revision: u64,
+    pub block_start: u64,
+    pub block_end: u64,
+    pub content_height: f32,
 }
 
 /// Opaque state owned by the Rust side of the native composition bridge.
@@ -1239,6 +1276,145 @@ pub unsafe extern "C" fn yu_macos_composition_session_shaped_caret_scroll_reques
     }
 }
 
+/// Returns the current shaped viewport block metadata using a count/fill ABI.
+/// The first call may pass `capacity = 0` and a null `blocks` pointer to learn
+/// the required count. The snapshot header is written on both count and fill
+/// calls; block output is never partially written when capacity is too small.
+///
+/// # Safety
+/// `session` must be null or a live handle. `snapshot` and `written` must
+/// point to writable values. `blocks` must point to `capacity` writable values
+/// when `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_macos_composition_session_shaped_viewport_blocks(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    snapshot: *mut YuShapedViewportSnapshot,
+    blocks: *mut YuShapedViewportBlock,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if snapshot.is_null() || written.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    if capacity > 0 && blocks.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output pointers were checked for null and belong to the caller.
+    unsafe {
+        *snapshot = YuShapedViewportSnapshot::default();
+        *written = 0;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            blocks,
+            capacity,
+        );
+        return YU_FFI_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(session, expected_revision) {
+            return status;
+        }
+        if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
+            return YU_FFI_LAYOUT_FAILED;
+        }
+        let (shaper, metrics, _layout_config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        let viewport_config = session.document.viewport_config();
+        let layout_config = viewport_config.layout();
+        if (layout_config.max_width() - max_width).abs() > 0.05
+            || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
+            || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
+        {
+            return YU_FFI_INVALID_VIEWPORT_CONFIG;
+        }
+        let viewport = ViewportRect::new(scroll_y, viewport_height);
+        let viewport_snapshot = match session
+            .document
+            .visible_blocks_with_shaper(viewport, &shaper)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return status_from_document_error(error),
+        };
+        let source = session.document.snapshot();
+        let mut encoded = Vec::with_capacity(viewport_snapshot.blocks().len());
+        for block in viewport_snapshot.blocks() {
+            let source_start_utf16 = match source.utf16_offset(block.source().start()) {
+                Ok(offset) => offset.get(),
+                Err(_) => return YU_FFI_INVALID_RANGE,
+            };
+            let source_end_utf16 = match source.utf16_offset(block.source().end()) {
+                Ok(offset) => offset.get(),
+                Err(_) => return YU_FFI_INVALID_RANGE,
+            };
+            let block_index = match u64::try_from(block.index()) {
+                Ok(index) => index,
+                Err(_) => return YU_FFI_INVALID_RANGE,
+            };
+            encoded.push(YuShapedViewportBlock {
+                revision: viewport_snapshot.revision().get(),
+                block_index,
+                source_start_utf16,
+                source_end_utf16,
+                y: block.y(),
+                height: block.height(),
+                measured: u8::from(block.is_measured()),
+                kind: viewport_block_kind(block.kind()),
+            });
+        }
+        let block_start = match u64::try_from(viewport_snapshot.range().start()) {
+            Ok(index) => index,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let block_end = match u64::try_from(viewport_snapshot.range().end()) {
+            Ok(index) => index,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let header = YuShapedViewportSnapshot {
+            revision: viewport_snapshot.revision().get(),
+            block_start,
+            block_end,
+            content_height: viewport_snapshot.content_height(),
+        };
+        // SAFETY: pointers were checked above and belong to the caller.
+        unsafe {
+            *snapshot = header;
+            *written = encoded.len();
+        }
+        if capacity == 0 && blocks.is_null() {
+            return YU_FFI_OK;
+        }
+        if encoded.len() > capacity {
+            return YU_FFI_BUFFER_TOO_SMALL;
+        }
+        if !encoded.is_empty() {
+            // SAFETY: capacity was checked against the encoded block count.
+            unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), blocks, encoded.len()) };
+        }
+        YU_FFI_OK
+    }
+}
+
 /// Applies native viewport metrics to the revision-bound Rust layout policy.
 ///
 /// The metrics-only backend uses `default_advance` for grapheme clusters that
@@ -1712,6 +1888,20 @@ fn projected_utf8(projection: &Projection) -> Result<String, i32> {
         }
     }
     String::from_utf8(bytes).map_err(|_| YU_FFI_LAYOUT_FAILED)
+}
+
+#[cfg(target_os = "macos")]
+fn viewport_block_kind(kind: BlockKind) -> u8 {
+    match kind {
+        BlockKind::BlankLine => YU_VIEWPORT_BLOCK_BLANK,
+        BlockKind::ReferenceDefinition => YU_VIEWPORT_BLOCK_REFERENCE_DEFINITION,
+        BlockKind::Paragraph => YU_VIEWPORT_BLOCK_PARAGRAPH,
+        BlockKind::AtxHeading { .. } => YU_VIEWPORT_BLOCK_HEADING,
+        BlockKind::FencedCodeBlock { .. } => YU_VIEWPORT_BLOCK_FENCED_CODE,
+        BlockKind::BlockQuote { .. } => YU_VIEWPORT_BLOCK_QUOTE,
+        BlockKind::ListItem { .. } => YU_VIEWPORT_BLOCK_LIST,
+        BlockKind::TaskListItem { .. } => YU_VIEWPORT_BLOCK_TASK_LIST,
+    }
 }
 
 fn utf16_offset_in_utf8(source: &str, byte_offset: u64) -> Result<u64, i32> {
@@ -2630,6 +2820,153 @@ mod tests {
             YU_FFI_STALE_REVISION
         );
         assert_eq!(stale, YuEditorCaretScrollRequest::default());
+
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_shaped_viewport_blocks_are_revision_bound_and_count_fill_safe() {
+        let source = "# one\n\ntwo **羽🙂**\n\nthree\n";
+        let handle = session(source);
+        let mut metrics = YuCoreTextViewportMetrics::default();
+        let sample = "M中🙂e\u{301}";
+        assert_eq!(
+            unsafe {
+                yu_macos_core_text_system_ui_viewport_metrics(
+                    22.0,
+                    sample.as_bytes().as_ptr(),
+                    sample.len(),
+                    &mut metrics,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_composition_session_set_viewport_config(
+                    handle,
+                    0,
+                    600.0,
+                    metrics.line_height,
+                    metrics.default_advance,
+                    metrics.line_height,
+                    0.0,
+                )
+            },
+            YU_FFI_OK
+        );
+
+        let mut header = YuShapedViewportSnapshot::default();
+        let mut required = 0_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_shaped_viewport_blocks(
+                    handle,
+                    0,
+                    22.0,
+                    600.0,
+                    0.0,
+                    metrics.line_height,
+                    &mut header,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert!(required > 0);
+        assert_eq!(header.revision, 0);
+        assert!(header.block_start < header.block_end);
+
+        let mut short_header = YuShapedViewportSnapshot::default();
+        let mut short_written = 0_usize;
+        let mut short = vec![YuShapedViewportBlock::default(); required - 1];
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_shaped_viewport_blocks(
+                    handle,
+                    0,
+                    22.0,
+                    600.0,
+                    0.0,
+                    metrics.line_height,
+                    &mut short_header,
+                    short.as_mut_ptr(),
+                    short.len(),
+                    &mut short_written,
+                )
+            },
+            YU_FFI_BUFFER_TOO_SMALL
+        );
+        assert_eq!(short_written, required);
+        assert_eq!(short_header.revision, 0);
+        assert!(
+            short
+                .iter()
+                .all(|block| *block == YuShapedViewportBlock::default())
+        );
+
+        let mut blocks = vec![YuShapedViewportBlock::default(); required];
+        let mut written = 0_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_shaped_viewport_blocks(
+                    handle,
+                    0,
+                    22.0,
+                    600.0,
+                    0.0,
+                    metrics.line_height,
+                    &mut header,
+                    blocks.as_mut_ptr(),
+                    blocks.len(),
+                    &mut written,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(written, required);
+        assert!(blocks.windows(2).all(|pair| {
+            pair[0].block_index < pair[1].block_index
+                && pair[0].y <= pair[1].y
+                && pair[0].source_end_utf16 <= pair[1].source_start_utf16
+        }));
+        assert!(blocks.iter().all(|block| {
+            block.revision == header.revision
+                && block.source_start_utf16 <= block.source_end_utf16
+                && block.y.is_finite()
+                && block.height.is_finite()
+                && block.height > 0.0
+        }));
+
+        let mut stale = YuShapedViewportSnapshot {
+            revision: 99,
+            block_start: 99,
+            block_end: 99,
+            content_height: 99.0,
+        };
+        let mut stale_written = 99_usize;
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_shaped_viewport_blocks(
+                    handle,
+                    1,
+                    22.0,
+                    600.0,
+                    0.0,
+                    metrics.line_height,
+                    &mut stale,
+                    ptr::null_mut(),
+                    0,
+                    &mut stale_written,
+                )
+            },
+            YU_FFI_STALE_REVISION
+        );
+        assert_eq!(stale, YuShapedViewportSnapshot::default());
+        assert_eq!(stale_written, 0);
 
         unsafe { yu_composition_session_destroy(handle) };
     }
