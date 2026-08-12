@@ -131,6 +131,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Projection-aware shaped layout](docs/adr/0059-projection-aware-shaped-layout.md)
 - [Revision-bound projection caret query](docs/adr/0060-revision-bound-projection-caret.md)
 - [Block-local projection caret query](docs/adr/0061-block-local-projection-caret.md)
+- [Block-local shaped caret geometry](docs/adr/0062-block-local-shaped-caret-geometry.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

@@ -165,6 +165,26 @@ pub struct YuBlockProjectionCaret {
     pub affinity: u8,
 }
 
+/// Revision-bound shaped caret geometry scoped to one Markdown block.
+/// `caret_x`/`caret_y` are block-local layout coordinates and the caret
+/// rectangle uses the native shaper's line height. All values are owned
+/// scalars; no CoreText or Rust layout object crosses the ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuBlockShapedCaret {
+    pub revision: u64,
+    pub source_utf16: u64,
+    pub block_index: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub line_index: u64,
+    pub caret_x: f32,
+    pub caret_y: f32,
+    pub caret_width: f32,
+    pub caret_height: f32,
+    pub affinity: u8,
+}
+
 /// Opaque state owned by the Rust side of the native composition bridge.
 #[repr(C)]
 pub struct YuCompositionSession {
@@ -999,6 +1019,153 @@ pub unsafe extern "C" fn yu_composition_session_block_projection_caret(
         };
     }
     YU_FFI_OK
+}
+
+/// Resolves a source caret against the revision-bound shaped layout for its
+/// Markdown block. The returned point and rectangle are local to the block;
+/// callers can combine them with their own viewport/block origin without
+/// materializing a document-wide layout.
+///
+/// On non-macOS targets this symbol returns [`YU_FFI_CORE_TEXT_UNAVAILABLE`]
+/// after clearing `output`, so the cross-platform header remains stable while
+/// the first native implementation stays explicitly macOS-only.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuBlockShapedCaret`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_macos_composition_session_block_shaped_caret(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    affinity: u8,
+    size: f32,
+    max_width: f32,
+    output: *mut YuBlockShapedCaret,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuBlockShapedCaret::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            source_utf16,
+            affinity,
+            size,
+            max_width,
+        );
+        return YU_FFI_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(session, expected_revision) {
+            return status;
+        }
+        if !matches!(
+            affinity,
+            YU_CARET_AFFINITY_UPSTREAM | YU_CARET_AFFINITY_DOWNSTREAM
+        ) {
+            return YU_FFI_INVALID_SELECTION;
+        }
+        if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
+            return YU_FFI_LAYOUT_FAILED;
+        }
+
+        let snapshot = session.document.snapshot();
+        let source = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) {
+            Ok(offset) => offset,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let Some(block_index) = session.document.block_index_for_source(source) else {
+            return YU_FFI_INVALID_RANGE;
+        };
+        let request = match FontRequest::new("System UI", size) {
+            Ok(request) => request,
+            Err(_) => return YU_FFI_CORE_TEXT_UNAVAILABLE,
+        };
+        let shaper = match CoreTextShaper::from_system_ui(request) {
+            Ok(shaper) => shaper,
+            Err(_) => return YU_FFI_CORE_TEXT_UNAVAILABLE,
+        };
+        let metrics = match shaper.viewport_metrics("M中🙂e\u{301}") {
+            Ok(metrics) => metrics,
+            Err(_) => return YU_FFI_CORE_TEXT_UNAVAILABLE,
+        };
+        let config = LayoutConfig::new(max_width, metrics.line_height())
+            .with_default_advance(metrics.default_advance());
+        let layout = match session
+            .document
+            .block_layout_with_shaper(block_index, config, &shaper)
+        {
+            Ok(layout) => layout,
+            Err(_) => return YU_FFI_LAYOUT_FAILED,
+        };
+        let bias = match affinity {
+            YU_CARET_AFFINITY_UPSTREAM => ProjectionBias::Before,
+            YU_CARET_AFFINITY_DOWNSTREAM => ProjectionBias::After,
+            _ => return YU_FFI_INVALID_SELECTION,
+        };
+        let caret = match layout.caret_for_source(source, bias) {
+            Ok(caret) => caret,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let visual_utf16 = match visual_utf16_offset(layout.projection(), caret.visual().get()) {
+            Ok(offset) => offset,
+            Err(status) => return status,
+        };
+        let round_trip = match layout.projection().visual_to_source(caret.visual(), bias) {
+            Ok(offset) => offset,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let block_index = match u64::try_from(block_index) {
+            Ok(index) => index,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let line_index = match u64::try_from(caret.line()) {
+            Ok(index) => index,
+            Err(_) => return YU_FFI_INVALID_RANGE,
+        };
+        let point = caret.point();
+        let line_height = metrics.line_height();
+        if !point.x().is_finite()
+            || !point.y().is_finite()
+            || !line_height.is_finite()
+            || line_height <= 0.0
+        {
+            return YU_FFI_LAYOUT_FAILED;
+        }
+
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuBlockShapedCaret {
+                revision: snapshot.revision().get(),
+                source_utf16,
+                block_index,
+                visual_utf16,
+                round_trip_source_utf16,
+                line_index,
+                caret_x: point.x(),
+                caret_y: point.y(),
+                caret_width: 0.0,
+                caret_height: line_height,
+                affinity,
+            };
+        }
+        YU_FFI_OK
+    }
 }
 
 /// Applies native viewport metrics to the revision-bound Rust layout policy.
@@ -2168,6 +2335,90 @@ mod tests {
             YU_FFI_STALE_REVISION
         );
         assert_eq!(stale, YuBlockProjectionCaret::default());
+
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_block_shaped_caret_returns_core_text_geometry_and_rejects_stale_revision() {
+        let source = "before **羽🙂** after\n\nsecond **block**\n";
+        let handle = session(source);
+        let mut upstream = YuBlockShapedCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_block_shaped_caret(
+                    handle,
+                    0,
+                    29,
+                    YU_CARET_AFFINITY_UPSTREAM,
+                    22.0,
+                    600.0,
+                    &mut upstream,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(upstream.revision, 0);
+        assert_eq!(upstream.source_utf16, 29);
+        assert_eq!(upstream.block_index, 2);
+        assert_eq!(upstream.visual_utf16, 7);
+        assert_eq!(upstream.round_trip_source_utf16, 29);
+        assert_eq!(upstream.line_index, 0);
+        assert!(upstream.caret_x.is_finite() && upstream.caret_x > 0.0);
+        assert!(upstream.caret_y.is_finite() && upstream.caret_y >= 0.0);
+        assert_eq!(upstream.caret_width, 0.0);
+        assert!(upstream.caret_height.is_finite() && upstream.caret_height > 0.0);
+
+        let mut downstream = YuBlockShapedCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_block_shaped_caret(
+                    handle,
+                    0,
+                    29,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    22.0,
+                    600.0,
+                    &mut downstream,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(downstream.block_index, upstream.block_index);
+        assert_eq!(downstream.visual_utf16, upstream.visual_utf16);
+        assert_eq!(downstream.round_trip_source_utf16, 31);
+        assert!((downstream.caret_x - upstream.caret_x).abs() < 0.001);
+        assert_eq!(downstream.caret_y, upstream.caret_y);
+
+        let mut stale = YuBlockShapedCaret {
+            revision: 99,
+            source_utf16: 99,
+            block_index: 99,
+            visual_utf16: 99,
+            round_trip_source_utf16: 99,
+            line_index: 99,
+            caret_x: 99.0,
+            caret_y: 99.0,
+            caret_width: 99.0,
+            caret_height: 99.0,
+            affinity: 99,
+        };
+        assert_eq!(
+            unsafe {
+                yu_macos_composition_session_block_shaped_caret(
+                    handle,
+                    1,
+                    29,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    22.0,
+                    600.0,
+                    &mut stale,
+                )
+            },
+            YU_FFI_STALE_REVISION
+        );
+        assert_eq!(stale, YuBlockShapedCaret::default());
 
         unsafe { yu_composition_session_destroy(handle) };
     }

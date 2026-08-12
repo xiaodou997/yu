@@ -73,6 +73,12 @@ surrogate split 由 Rust 单测覆盖。self-check 会恢复原始窗口文本�
 和从 block 起点计算的 visual UTF-16，Swift 不累加前一个 block 的 visual 长度；这验证了
 block projection cache 可以直接作为后续 caret geometry/reveal 的输入边界。
 
+随后同一 block 会通过 `yu_macos_composition_session_block_shaped_caret` 查询 CoreText
+System UI shaped geometry。Rust 返回 revision-bound 的 block-local line、x/y、零宽 caret
+和 line height；Swift 只验证 hidden delimiter 的 upstream/downstream 共享 visual point、
+source round-trip 保留 affinity，以及所有 geometry 为有限值。字体 size/max width 是诊断参数，
+不进入 canonical document state。
+
 启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
 和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
 

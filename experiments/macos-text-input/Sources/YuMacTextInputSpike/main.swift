@@ -56,6 +56,20 @@ private struct RustBlockProjectionCaret {
     let affinity: NSSelectionAffinity
 }
 
+private struct RustBlockShapedCaret {
+    let revision: UInt64
+    let source: Int
+    let block: Int
+    let visual: Int
+    let roundTripSource: Int
+    let line: Int
+    let x: CGFloat
+    let y: CGFloat
+    let width: CGFloat
+    let height: CGFloat
+    let affinity: NSSelectionAffinity
+}
+
 private struct RustViewportMetrics: Equatable {
     let maxWidth: CGFloat
     let lineHeight: CGFloat
@@ -364,6 +378,43 @@ private final class RustCompositionBridge {
             block: Int(result.block_index),
             visual: Int(result.visual_utf16),
             roundTripSource: Int(result.round_trip_source_utf16),
+            affinity: nativeAffinity
+        )
+    }
+
+    func blockShapedCaret(
+        sourceUTF16: Int,
+        affinity: NSSelectionAffinity,
+        size: CGFloat,
+        maxWidth: CGFloat
+    ) -> RustBlockShapedCaret {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(sourceUTF16 >= 0, "Rust block shaped caret must be non-negative")
+        var result = YuBlockShapedCaret()
+        let rustAffinity: RustCaretAffinity = affinity == .upstream ? .upstream : .downstream
+        let status = yu_macos_composition_session_block_shaped_caret(
+            session,
+            revision(),
+            UInt64(sourceUTF16),
+            rustAffinity.rawValue,
+            Float(size),
+            Float(maxWidth),
+            &result
+        )
+        precondition(status == 0, "Rust block shaped caret query failed: \(status)")
+        let nativeAffinity: NSSelectionAffinity =
+            result.affinity == UInt8(YU_CARET_AFFINITY_UPSTREAM) ? .upstream : .downstream
+        return RustBlockShapedCaret(
+            revision: result.revision,
+            source: Int(result.source_utf16),
+            block: Int(result.block_index),
+            visual: Int(result.visual_utf16),
+            roundTripSource: Int(result.round_trip_source_utf16),
+            line: Int(result.line_index),
+            x: CGFloat(result.caret_x),
+            y: CGFloat(result.caret_y),
+            width: CGFloat(result.caret_width),
+            height: CGFloat(result.caret_height),
             affinity: nativeAffinity
         )
     }
@@ -1764,6 +1815,32 @@ final class TextInputView: NSView, NSTextInputClient {
             "block downstream must cross hidden syntax"
         )
 
+        let shapedUpstream = rustComposition.blockShapedCaret(
+            sourceUTF16: blockProbe,
+            affinity: .upstream,
+            size: 22,
+            maxWidth: 600
+        )
+        let shapedDownstream = rustComposition.blockShapedCaret(
+            sourceUTF16: blockProbe,
+            affinity: .downstream,
+            size: 22,
+            maxWidth: 600
+        )
+        precondition(shapedUpstream.revision == upstream.revision)
+        precondition(shapedDownstream.revision == shapedUpstream.revision)
+        precondition(shapedUpstream.source == blockProbe && shapedDownstream.source == blockProbe)
+        precondition(shapedUpstream.block == blockUpstream.block)
+        precondition(shapedDownstream.block == shapedUpstream.block)
+        precondition(shapedUpstream.visual == 7 && shapedDownstream.visual == 7)
+        precondition(shapedUpstream.line == 0 && shapedDownstream.line == 0)
+        precondition(shapedUpstream.roundTripSource == blockProbe)
+        precondition(shapedDownstream.roundTripSource == blockProbe + 2)
+        precondition(shapedUpstream.x.isFinite && shapedUpstream.y.isFinite)
+        precondition(shapedUpstream.height.isFinite && shapedUpstream.height > 0)
+        precondition(shapedUpstream.width == 0 && shapedDownstream.width == 0)
+        precondition(abs(shapedUpstream.x - shapedDownstream.x) < 0.001)
+
         replaceStorage(
             range: NSRange(location: 0, length: textStorage.length),
             with: savedStorage
@@ -1781,7 +1858,10 @@ final class TextInputView: NSView, NSTextInputClient {
         print(
             "Projection caret self-check source=\(probe) visual=\(upstream.visual) "
                 + "upstream=\(upstream.roundTripSource) downstream=\(downstream.roundTripSource) "
-                + "block=\(blockUpstream.block) blockVisual=\(blockUpstream.visual)"
+                + "block=\(blockUpstream.block) blockVisual=\(blockUpstream.visual) "
+                + "shaped=(x:\(String(format: "%.2f", shapedUpstream.x)), "
+                + "y:\(String(format: "%.2f", shapedUpstream.y)), "
+                + "lineHeight:\(String(format: "%.2f", shapedUpstream.height)))"
         )
     }
 
