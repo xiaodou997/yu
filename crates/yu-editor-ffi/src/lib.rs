@@ -685,12 +685,14 @@ fn composition_active_visual_caret(
     let text = projection.composition_text().ok_or(YU_FFI_NO_OVERLAY)?;
     let selection_start = utf16_byte_offset(text, selection.start().get())?;
     let selection_end = utf16_byte_offset(text, selection.end().get())?;
+    // An empty preedit has no Composition visual run. Derive the base from
+    // the canonical replacement start so a non-empty marked selection is not
+    // accidentally added twice.
+    let replacement = projection.composition_range().ok_or(YU_FFI_NO_OVERLAY)?;
     let visual_base = projection
-        .runs()
-        .iter()
-        .find(|run| run.kind() == VisualRunKind::Composition)
-        .map(|run| run.visual().start().get())
-        .ok_or(YU_FFI_NO_OVERLAY)?;
+        .source_to_visual(replacement.start(), ProjectionBias::Before)
+        .map_err(|_| YU_FFI_INVALID_RANGE)?
+        .get();
     let visual_selection_start = visual_base
         .checked_add(selection_start)
         .ok_or(YU_FFI_INVALID_RANGE)?;
@@ -3253,6 +3255,45 @@ mod tests {
             std::str::from_utf8(&canonical).expect("canonical source stays UTF-8"),
             source
         );
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_empty_preedit_keeps_a_generation_bound_visual_boundary() {
+        let source = "before **x** after";
+        let handle = session(source);
+        assert_eq!(
+            unsafe { yu_composition_session_begin(handle, 9, 10, ptr::null(), 0, 0, 0) },
+            YU_FFI_OK
+        );
+
+        let mut projection = YuCompositionProjection::default();
+        assert_eq!(
+            unsafe { yu_composition_session_projection(handle, 0, &mut projection) },
+            YU_FFI_OK
+        );
+        assert_eq!(projection.generation, 1);
+        assert_eq!(projection.visual_selection_start_utf16, 7);
+        assert_eq!(projection.visual_selection_end_utf16, 7);
+        assert_eq!(projection.projected_utf16_length, 13);
+
+        let mut caret = YuCompositionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_composition_caret(
+                    handle,
+                    projection.revision,
+                    projection.generation,
+                    9,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    &mut caret,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(caret.visual_utf16, 7);
+        assert_eq!(caret.visual_selection_start_utf16, 7);
+        assert_eq!(caret.visual_selection_end_utf16, 7);
         unsafe { yu_composition_session_destroy(handle) };
     }
 

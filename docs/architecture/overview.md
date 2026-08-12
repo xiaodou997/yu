@@ -108,6 +108,11 @@ Revision 与 generation，避免同一 source Revision 下旧的 marked text 结
 layout 返回 point/line/height。native 层只保存 owned scalar 和版本标识，不复制 Markdown parser
 或 composition layout。见 ADR 0077。
 
+`NSTextInputClient` 生命周期在 native 层再区分 canonical replacement range、当前 TextKit
+ preedit range 和 marked presentation range。`unmarkText` 只改变 presentation，不会隐式取消
+ Rust overlay；后续 commit/cancel 使用保存的 native range 恢复 mirror，并要求最近一次
+ projection/caret snapshot 仍属于同一 Revision + generation。见 ADR 0078。
+
 `EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
 按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
 Revision。光标移动、显式 selection、composition 边界和 reset 会断开 group；新的永久 edit 会清空

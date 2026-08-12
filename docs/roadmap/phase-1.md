@@ -84,6 +84,8 @@
 - [x] block-local revision-bound projection caret、block index 与局部 visual UTF-16 self-check
 - [x] block-local CoreText shaped caret geometry、line/point/height ABI 与 macOS self-check
 - [x] generation-bound composition projection/caret FFI、projected UTF-8 count/fill 与 macOS protocol self-check
+- [x] macOS `NSTextInputClient` composition lifecycle：unmark 保留 overlay、固定 canonical replacement
+      range、commit/cancel generation snapshot 与 native mirror 恢复 self-check
 - [x] CoreText shaped caret scroll request、HeightIndex absolute target 与 macOS host self-check
 - [x] CoreText shaped viewport block snapshot、count/fill ABI 与 block origin self-check
 - [x] `ViewportSceneInput` metadata validation 与 block-local layout document-origin append
@@ -190,6 +192,10 @@
     preedit/visual UTF-16 selection 和 active composition caret 必须由 Rust count/fill/owned-scalar
     ABI 返回，旧 generation 必须拒绝。macOS shaped composition caret 必须消费未缓存 transient
     block layout，native self-check 不得维护第二份 Markdown projection。
+9s. macOS `NSTextInputClient` 必须区分 canonical replacement range、当前 native preedit range 和
+    marked presentation range；`unmarkText` 不得隐式 cancel，后续 commit/cancel 必须消费同一
+    Revision + generation 的 projection/caret snapshot，并通过 lifecycle self-check 证明只提交一次
+    或完整恢复 canonical mirror。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

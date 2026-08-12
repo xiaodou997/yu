@@ -33,6 +33,9 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   canonical source、Revision、缓存或 Undo；
 - composition FFI 以 canonical Revision + transient generation 绑定 projected UTF-8、visual
   selection 和 caret，native mirror 不复制 Markdown parser；
+- macOS `NSTextInputClient` lifecycle 将 canonical replacement、当前 native marked range 和
+  marked presentation 分开管理；`unmarkText` 不会误取消 Rust overlay，commit/cancel 均消费
+  同一 generation-bound composition snapshot；
 - macOS retained Metal 的 partial-damage frame 会在 native bridge 前按 command bounds 做
   backend-owned culling，保持 painter order 而减少无关命令编码；
 - macOS `doCommand(by:)` 只允许 allowlist 内的 Selector 进入同一 Rust command/availability 入口；
@@ -160,6 +163,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Atomic viewport publication](docs/adr/0075-atomic-viewport-publication.md)
 - [Composition-aware projection/layout](docs/adr/0076-composition-aware-projection-layout.md)
 - [Composition projection FFI](docs/adr/0077-composition-projection-ffi.md)
+- [macOS NSTextInputClient composition lifecycle](docs/adr/0078-macos-nstextinputclient-composition-lifecycle.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
