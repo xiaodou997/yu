@@ -135,6 +135,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS shaped caret scroll request](docs/adr/0063-shaped-caret-scroll-request.md)
 - [Shaped viewport block snapshot](docs/adr/0064-shaped-viewport-block-snapshot.md)
 - [Viewport scene input](docs/adr/0065-viewport-scene-input.md)
+- [Batched viewport scene assembly](docs/adr/0066-batched-viewport-scene-assembly.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

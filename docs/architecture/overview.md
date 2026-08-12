@@ -306,6 +306,11 @@ range、document-space block origin/height、measured 和稳定 kind tag。它�
 origin，绝不根据 kind 或 source 重新布局。这样 FFI/native host、editor layout cache 和 scene
 都共享同一 block origin，而不会各自维护 HeightIndex 的副本。
 
+完整可见窗口使用 `SceneBuilder::append_viewport` 批量组装：它按 `ViewportSceneInput` 的 block
+顺序预检所有 layout、source range、Revision、atlas entry、glyph bounds 和 primitive budget，
+然后一次性发布 glyph primitives 与 damage。任何一个 block 失败都不会留下 viewport 前缀；这
+使 stale frame 可以整体丢弃并在新的 Revision 重试，而不会让 renderer 接收到部分窗口。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

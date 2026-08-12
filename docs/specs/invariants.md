@@ -148,6 +148,9 @@
     `SceneBuilder::append_layout_at_block` 必须再验证 layout Revision/source range，并在解析
     全部 atlas entry 前保持 scene 原子。scene 只能平移 block-local layout 到已验证 origin，不能
     根据 Markdown kind、source text 或自己的 HeightIndex 重新计算 block 几何。
+32. `SceneBuilder::append_viewport` 必须按 `ViewportSceneInput` 顺序预检全部 block layout；所有
+    Revision/source/atlas/geometry/budget 检查成功前不得追加任何 primitive。批量提交必须同时更新
+    primitive 与 damage，失败不得发布 viewport 前缀；layout 只能按 geometry origin 平移。
 
 ## Accessibility
 

@@ -510,6 +510,74 @@ impl SceneBuilder {
         color: Rgba8,
         origin: Point,
     ) -> Result<usize, SceneError> {
+        let primitives =
+            self.collect_layout_primitives_at(layout, atlas, font_size, color, origin)?;
+        self.commit_glyphs(primitives)
+    }
+
+    /// Appends every visible block in one preflighted scene transaction.
+    ///
+    /// The layouts are block-local and must be in the same order as
+    /// `input.blocks()`. Every revision, source range, atlas lookup, geometry
+    /// and primitive-budget check completes before the scene is mutated, so a
+    /// stale or partially materialized viewport cannot publish a prefix of its
+    /// primitives.
+    pub fn append_viewport(
+        &mut self,
+        input: &ViewportSceneInput,
+        layouts: &[&LayoutSnapshot],
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+    ) -> Result<usize, SceneError> {
+        if input.revision() != self.revision {
+            return Err(SceneError::ViewportRevisionMismatch {
+                expected: self.revision,
+                actual: input.revision(),
+            });
+        }
+        if layouts.len() != input.blocks().len() {
+            return Err(SceneError::InvalidViewportInput(
+                "viewport layout count must match input blocks",
+            ));
+        }
+
+        let mut primitives = Vec::new();
+        for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter().copied()) {
+            if geometry.revision() != self.revision {
+                return Err(SceneError::ViewportRevisionMismatch {
+                    expected: self.revision,
+                    actual: geometry.revision(),
+                });
+            }
+            if layout.revision() != geometry.revision() {
+                return Err(SceneError::RevisionMismatch {
+                    scene: geometry.revision(),
+                    layout: layout.revision(),
+                });
+            }
+            if layout.source_range() != geometry.source() {
+                return Err(SceneError::ViewportSourceMismatch);
+            }
+            primitives.extend(self.collect_layout_primitives_at(
+                layout,
+                atlas,
+                font_size,
+                color,
+                Point::new(0.0, geometry.y()),
+            )?);
+        }
+        self.commit_glyphs(primitives)
+    }
+
+    fn collect_layout_primitives_at(
+        &self,
+        layout: &LayoutSnapshot,
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+        origin: Point,
+    ) -> Result<Vec<GlyphPrimitive>, SceneError> {
         if self.revision != layout.revision() {
             return Err(SceneError::RevisionMismatch {
                 scene: self.revision,
@@ -535,13 +603,34 @@ impl SceneBuilder {
             glyph.bounds().validate()?;
             primitives.push(glyph);
         }
-        if primitives.len() > self.max_primitives.saturating_sub(self.primitives.len()) {
+
+        Ok(primitives)
+    }
+
+    fn commit_glyphs(&mut self, glyphs: Vec<GlyphPrimitive>) -> Result<usize, SceneError> {
+        if glyphs.len() > self.max_primitives.saturating_sub(self.primitives.len()) {
             return Err(SceneError::PrimitiveLimitExceeded);
         }
-        let count = primitives.len();
-        for glyph in primitives {
-            self.glyph(glyph)?;
+        let new_len = self
+            .primitives
+            .len()
+            .checked_add(glyphs.len())
+            .ok_or(SceneError::PrimitiveLimitExceeded)?;
+        if !glyphs.is_empty() && u32::try_from(new_len.saturating_sub(1)).is_err() {
+            return Err(SceneError::PrimitiveLimitExceeded);
         }
+
+        let mut damage = self.damage.clone();
+        for glyph in &glyphs {
+            glyph.origin.validate()?;
+            let bounds = glyph.bounds();
+            bounds.validate()?;
+            damage.add(bounds)?;
+        }
+        let count = glyphs.len();
+        self.primitives
+            .extend(glyphs.into_iter().map(Primitive::Glyph));
+        self.damage = damage;
         Ok(count)
     }
 
