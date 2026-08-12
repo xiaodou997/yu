@@ -319,3 +319,7 @@
     `ViewportFramePublication`；发布失败或 serial overflow 不得替换已有 publication。macOS
     `MetalViewportHostSession::accept_publication` 必须拒绝旧 Revision、内部 Revision 不匹配、
     重复或回退 serial，验证完成前不得写入 host cache。
+16. `ViewportFrameCache`、`ViewportFramePublication` 和 macOS host 接收路径必须通过不可变
+    `Arc<ViewportRenderFrame>` 共享 frame allocation；handle clone 不得深拷贝 scene/render plan，
+    `frame()` 借用与 `current_frame_handle()` owned handoff 必须保持同一 Revision，且 Arc 不得
+    携带 EditorDocument、source、layout cache、surface 或 GPU handle。

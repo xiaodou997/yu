@@ -352,6 +352,11 @@ generation 规则。
 Revision、frame 内部 Revision 与 serial 顺序，再把 frame 放入 host cache。这样平台层只负责
 surface lifecycle 和 Metal submission，不再自己组装 viewport 或猜测 frame 更新状态。
 
+`ViewportFrameCache`、`ViewportFramePublication` 和 macOS host cache 现在通过不可变
+`Arc<ViewportRenderFrame>` 共享同一个 frame allocation。借用查询仍返回普通 frame reference，
+只有跨边界 handoff 才 clone handle；因此发布/接收不会复制 scene 或 render plan。Arc 只覆盖
+backend-neutral render preparation，不改变 `EditorDocument`、GPU texture 或 surface 的所有权。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

@@ -9,6 +9,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use yu_core::Revision;
 use yu_editor::{EditorDocument, EditorDocumentError, ShapingProvider, ViewportRect};
@@ -176,7 +177,7 @@ impl Error for ViewportFrameError {}
 /// forgot to clear first.
 #[derive(Clone, Debug, Default)]
 pub struct ViewportFrameCache {
-    current: Option<ViewportRenderFrame>,
+    current: Option<Arc<ViewportRenderFrame>>,
 }
 
 impl ViewportFrameCache {
@@ -187,7 +188,7 @@ impl ViewportFrameCache {
 
     #[must_use]
     pub fn current_revision(&self) -> Option<Revision> {
-        self.current.as_ref().map(ViewportRenderFrame::revision)
+        self.current.as_ref().map(|frame| frame.revision())
     }
 
     #[must_use]
@@ -195,6 +196,15 @@ impl ViewportFrameCache {
         self.current
             .as_ref()
             .filter(|frame| frame.revision() == revision)
+            .map(Arc::as_ref)
+    }
+
+    #[must_use]
+    pub fn current_frame_handle(&self, revision: Revision) -> Option<Arc<ViewportRenderFrame>> {
+        self.current
+            .as_ref()
+            .filter(|frame| frame.revision() == revision)
+            .map(Arc::clone)
     }
 
     /// Drops the cached frame unless it belongs to `revision`.
@@ -224,6 +234,17 @@ impl ViewportFrameCache {
         &mut self,
         current_revision: Revision,
         frame: ViewportRenderFrame,
+    ) -> Result<(), ViewportFrameError> {
+        self.publish_shared_if_current(current_revision, Arc::new(frame))
+    }
+
+    /// Publishes a shared immutable frame handle without cloning the scene or
+    /// render plan. The caller may retain another handle for a platform
+    /// handoff; all handles still refer to the same revision-bound frame.
+    pub fn publish_shared_if_current(
+        &mut self,
+        current_revision: Revision,
+        frame: Arc<ViewportRenderFrame>,
     ) -> Result<(), ViewportFrameError> {
         if frame.revision() != current_revision {
             return Err(ViewportFrameError::Stale {
@@ -307,7 +328,7 @@ impl From<ViewportFrameError> for ViewportSceneError {
 pub struct ViewportFramePublication {
     revision: Revision,
     serial: u64,
-    frame: ViewportRenderFrame,
+    frame: Arc<ViewportRenderFrame>,
 }
 
 impl ViewportFramePublication {
@@ -323,11 +344,16 @@ impl ViewportFramePublication {
 
     #[must_use]
     pub fn frame(&self) -> &ViewportRenderFrame {
-        &self.frame
+        self.frame.as_ref()
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (Revision, u64, ViewportRenderFrame) {
+    pub fn frame_handle(&self) -> Arc<ViewportRenderFrame> {
+        Arc::clone(&self.frame)
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Revision, u64, Arc<ViewportRenderFrame>) {
         (self.revision, self.serial, self.frame)
     }
 }
@@ -394,6 +420,11 @@ impl ViewportFramePublisher {
     }
 
     #[must_use]
+    pub fn current_frame_handle(&self, revision: Revision) -> Option<Arc<ViewportRenderFrame>> {
+        self.cache.current_frame_handle(revision)
+    }
+
+    #[must_use]
     pub fn last_publication(&self) -> Option<&ViewportFramePublication> {
         self.last_publication.as_ref()
     }
@@ -436,8 +467,9 @@ impl ViewportFramePublisher {
             .next_serial
             .checked_add(1)
             .ok_or(ViewportPublishError::SerialOverflow)?;
+        let frame = Arc::new(frame);
         self.cache
-            .publish_if_current(revision, frame.clone())
+            .publish_shared_if_current(revision, Arc::clone(&frame))
             .map_err(|error| ViewportPublishError::Scene(ViewportSceneError::Frame(error)))?;
 
         let publication = ViewportFramePublication {
@@ -757,6 +789,8 @@ mod tests {
 
     #[test]
     fn frame_publisher_returns_owned_revision_bound_publications() {
+        use std::sync::Arc;
+
         let font_size = 14.0;
         let shaper = shaper(font_size);
         let viewport = ViewportRect::new(0.0, 80.0);
@@ -788,6 +822,10 @@ mod tests {
         assert_eq!(publisher.current_revision(), Some(first_revision));
         assert_eq!(publisher.last_publication(), Some(&first));
         assert_eq!(publisher.current_frame(first_revision), Some(first.frame()));
+        let cached_handle = publisher
+            .current_frame_handle(first_revision)
+            .expect("cached frame handle");
+        assert!(Arc::ptr_eq(&cached_handle, &first.frame_handle()));
 
         document
             .execute(EditorCommand::insert_text("!"))

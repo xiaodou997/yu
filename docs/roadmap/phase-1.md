@@ -173,6 +173,9 @@
 9n. macOS retained partial-damage frame 必须在 native bridge 前按 command bounds 做 backend-owned
     culling，保留 painter order、完整 frame 不裁剪、跨多个 damage region 的 command 不重复；无
     窗口测试必须覆盖相交保留与不相交剔除。
+9o. viewport frame 必须以不可变共享 handle 在 `ViewportFramePublisher`、cache、publication 和
+    macOS host 之间传递；无窗口测试必须用 pointer identity 证明接收路径不深拷贝 scene/render
+    plan，同时 stale/revision replacement 仍保持原子。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可
