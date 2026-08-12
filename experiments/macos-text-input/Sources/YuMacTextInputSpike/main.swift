@@ -47,6 +47,15 @@ private struct RustProjectionCaret {
     let affinity: NSSelectionAffinity
 }
 
+private struct RustBlockProjectionCaret {
+    let revision: UInt64
+    let source: Int
+    let block: Int
+    let visual: Int
+    let roundTripSource: Int
+    let affinity: NSSelectionAffinity
+}
+
 private struct RustViewportMetrics: Equatable {
     let maxWidth: CGFloat
     let lineHeight: CGFloat
@@ -325,6 +334,34 @@ private final class RustCompositionBridge {
         return RustProjectionCaret(
             revision: result.revision,
             source: Int(result.source_utf16),
+            visual: Int(result.visual_utf16),
+            roundTripSource: Int(result.round_trip_source_utf16),
+            affinity: nativeAffinity
+        )
+    }
+
+    func blockProjectionCaret(
+        sourceUTF16: Int,
+        affinity: NSSelectionAffinity
+    ) -> RustBlockProjectionCaret {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(sourceUTF16 >= 0, "Rust block projection caret must be non-negative")
+        var result = YuBlockProjectionCaret()
+        let rustAffinity: RustCaretAffinity = affinity == .upstream ? .upstream : .downstream
+        let status = yu_composition_session_block_projection_caret(
+            session,
+            revision(),
+            UInt64(sourceUTF16),
+            rustAffinity.rawValue,
+            &result
+        )
+        precondition(status == 0, "Rust block projection caret query failed: \(status)")
+        let nativeAffinity: NSSelectionAffinity =
+            result.affinity == UInt8(YU_CARET_AFFINITY_UPSTREAM) ? .upstream : .downstream
+        return RustBlockProjectionCaret(
+            revision: result.revision,
+            source: Int(result.source_utf16),
+            block: Int(result.block_index),
             visual: Int(result.visual_utf16),
             roundTripSource: Int(result.round_trip_source_utf16),
             affinity: nativeAffinity
@@ -1671,7 +1708,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let savedStorage = NSAttributedString(attributedString: textStorage)
         let savedSelection = selection
         let savedAffinity = selectionAffinity
-        let source = "before **羽🙂** after\n"
+        let source = "before **羽🙂** after\n\nsecond **block**\n"
         let probe = 7
 
         replaceStorage(
@@ -1703,6 +1740,30 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(downstream.roundTripSource == 9, "downstream must cross hidden syntax")
         precondition(upstream.affinity == .upstream && downstream.affinity == .downstream)
 
+        let secondStart = (source as NSString).range(of: "second").location
+        precondition(secondStart != NSNotFound, "block projection probe text must exist")
+        let blockProbe = secondStart + 7
+        let blockUpstream = rustComposition.blockProjectionCaret(
+            sourceUTF16: blockProbe,
+            affinity: .upstream
+        )
+        let blockDownstream = rustComposition.blockProjectionCaret(
+            sourceUTF16: blockProbe,
+            affinity: .downstream
+        )
+        precondition(blockUpstream.revision == upstream.revision)
+        precondition(blockUpstream.block > 0 && blockDownstream.block == blockUpstream.block)
+        precondition(blockUpstream.source == blockProbe && blockDownstream.source == blockProbe)
+        precondition(blockUpstream.visual == 7 && blockDownstream.visual == 7)
+        precondition(
+            blockUpstream.roundTripSource == blockProbe,
+            "block upstream must stay before hidden syntax"
+        )
+        precondition(
+            blockDownstream.roundTripSource == blockProbe + 2,
+            "block downstream must cross hidden syntax"
+        )
+
         replaceStorage(
             range: NSRange(location: 0, length: textStorage.length),
             with: savedStorage
@@ -1719,7 +1780,8 @@ final class TextInputView: NSView, NSTextInputClient {
         needsDisplay = true
         print(
             "Projection caret self-check source=\(probe) visual=\(upstream.visual) "
-                + "upstream=\(upstream.roundTripSource) downstream=\(downstream.roundTripSource)"
+                + "upstream=\(upstream.roundTripSource) downstream=\(downstream.roundTripSource) "
+                + "block=\(blockUpstream.block) blockVisual=\(blockUpstream.visual)"
         )
     }
 

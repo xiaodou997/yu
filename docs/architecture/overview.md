@@ -274,6 +274,12 @@ round-trip source。Swift 只传 `NSSelectionAffinity`、expected Revision 和 s
 Revision、surrogate split 或未知 affinity 都在 FFI 边界拒绝。该查询不改变 source、selection、
 composition、history 或 Revision，且暂不携带 line/point/CoreText 对象。
 
+在产品路径上，`yu_composition_session_block_projection_caret` 进一步把同一契约限制在当前
+Markdown block：`EditorDocument::block_index_for_source` 负责 boundary 选择，随后通过
+`block_projection` 命中 parser-owned projection cache。返回的 visual UTF-16 是 block-local，
+并携带 block index；因此 native layout/reveal 可以只准备当前 block，不需要为一次 caret 查询
+物化整份文档 projection。它与 ADR 0060 的全局诊断 ABI 并存，仍不携带 line/point 或平台句柄。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

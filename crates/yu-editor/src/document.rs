@@ -145,6 +145,17 @@ impl EditorDocument {
             .map_err(EditorDocumentError::Projection)
     }
 
+    /// Returns the parser-owned block containing a canonical source offset.
+    ///
+    /// The boundary rule matches vertical caret movement: an offset at the
+    /// end of a block stays with that block unless a later block contains the
+    /// same offset. Native adapters can use this to select a block-local
+    /// projection without duplicating Markdown range traversal.
+    #[must_use]
+    pub fn block_index_for_source(&self, offset: ByteOffset) -> Option<usize> {
+        self.markdown.blocks().block_index_for_offset(offset)
+    }
+
     /// Returns a revision-bound block layout snapshot from the current
     /// projection. The snapshot is owned by a cache keyed by block range,
     /// block kind and layout configuration; source edits remap unaffected

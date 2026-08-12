@@ -514,6 +514,36 @@ impl BlockSequence {
         self.len
     }
 
+    /// Finds the block that owns a source caret boundary without scanning all
+    /// records. The sequence is source-ordered, so the segment-local binary
+    /// searches preserve the same boundary rule used by editor vertical
+    /// movement: a boundary shared by adjacent blocks belongs to the block
+    /// starting there; the document end belongs to the final block.
+    pub fn block_index_for_offset(&self, offset: ByteOffset) -> Option<usize> {
+        let starting = self.first_starting_at_or_after(offset);
+        if starting < self.len
+            && self
+                .get(starting)
+                .is_some_and(|block| block.range().start() == offset)
+        {
+            return Some(starting);
+        }
+
+        let ending_after = self.first_ending_after(offset);
+        if ending_after < self.len
+            && self
+                .get(ending_after)
+                .is_some_and(|block| block.range().contains(offset))
+        {
+            return Some(ending_after);
+        }
+
+        ending_after.checked_sub(1).filter(|index| {
+            self.get(*index)
+                .is_some_and(|block| block.range().end() == offset)
+        })
+    }
+
     pub(crate) fn resolved_records_from(&self, index: usize) -> ResolvedBlockIter<'_> {
         assert!(index <= self.len);
         let mut remaining = index;

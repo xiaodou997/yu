@@ -118,6 +118,11 @@
     Revision、surrogate split、未知 affinity 或 projection range 错误必须拒绝且不写入半成品
     output。查询不得修改 source、selection、composition、history 或 Revision，平台只能消费
     owned scalar，不得取得 Projection/TextSnapshot 指针。
+27. `yu_composition_session_block_projection_caret` 必须通过 `EditorDocument` 的
+    `block_index_for_source` 和 `block_projection` 选择当前 Revision 的 parser-owned block；返回的
+    visual UTF-16 必须是该 block-local projection 的坐标并携带 block index。stale Revision、无
+    matching block、surrogate split、未知 affinity 或映射错误必须清空 output 并拒绝，查询不得
+    物化整份文档 projection，也不得修改 source、selection、composition、history 或 Revision。
 
 ## Accessibility
 

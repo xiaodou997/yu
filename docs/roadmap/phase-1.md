@@ -80,6 +80,7 @@
 - [x] macOS CoreText shaped-line FFI probe 与 TextKit UTF-16 line-range comparison
 - [x] projection-aware shaped-line FFI、projected UTF-8 mirror 与 source/visual UTF-16 comparison
 - [x] revision-bound projection caret FFI、Before/After hidden delimiter round-trip 与 macOS self-check
+- [x] block-local revision-bound projection caret、block index 与局部 visual UTF-16 self-check
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -117,6 +118,9 @@
 9a. revision-bound projection caret 查询必须拒绝 stale Revision 与 surrogate split，并在不修改
     canonical source/selection/history 的前提下返回 stable source/visual UTF-16 round-trip；macOS
     spike 必须覆盖 hidden delimiter 的 upstream/downstream 差异。
+9b. block-local projection caret 必须复用 `EditorDocument` 的 block selection/cache，返回当前
+    block index 与局部 visual UTF-16；跨 block source 不得误用前一 block 的 visual offset，且
+    native self-check 必须保持 stale Revision 拒绝。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

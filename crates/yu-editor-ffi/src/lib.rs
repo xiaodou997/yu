@@ -150,6 +150,21 @@ pub struct YuProjectionCaret {
     pub affinity: u8,
 }
 
+/// Revision-bound source/visual caret mapping scoped to one Markdown block.
+/// `visual_utf16` is local to the returned `block_index`, so a native layout
+/// adapter can resolve geometry without materializing a document-wide
+/// projection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuBlockProjectionCaret {
+    pub revision: u64,
+    pub source_utf16: u64,
+    pub block_index: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub affinity: u8,
+}
+
 /// Opaque state owned by the Rust side of the native composition bridge.
 #[repr(C)]
 pub struct YuCompositionSession {
@@ -884,12 +899,6 @@ pub unsafe extern "C" fn yu_composition_session_projection_caret(
     if let Err(status) = validate_revision(session, expected_revision) {
         return status;
     }
-    let bias = match affinity {
-        YU_CARET_AFFINITY_UPSTREAM => ProjectionBias::Before,
-        YU_CARET_AFFINITY_DOWNSTREAM => ProjectionBias::After,
-        _ => return YU_FFI_INVALID_SELECTION,
-    };
-
     let snapshot = session.document.snapshot();
     let source = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) {
         Ok(offset) => offset,
@@ -903,28 +912,87 @@ pub unsafe extern "C" fn yu_composition_session_projection_caret(
         Ok(projection) => projection,
         Err(error) => return status_from_document_error(error),
     };
-    let visual = match projection.source_to_visual(source, bias) {
-        Ok(visual) => visual,
-        Err(_) => return YU_FFI_INVALID_RANGE,
-    };
-    let visual_utf16 = match visual_utf16_offset(projection, visual.get()) {
-        Ok(offset) => offset,
-        Err(_) => return YU_FFI_INVALID_RANGE,
-    };
-    let round_trip = match projection.visual_to_source(visual, bias) {
-        Ok(source) => source,
-        Err(_) => return YU_FFI_INVALID_RANGE,
-    };
-    let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_FFI_INVALID_RANGE,
-    };
+    let (visual_utf16, round_trip_source_utf16) =
+        match projection_caret_mapping(&snapshot, projection, source, affinity) {
+            Ok(mapping) => mapping,
+            Err(status) => return status,
+        };
 
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe {
         *output = YuProjectionCaret {
             revision: snapshot.revision().get(),
             source_utf16,
+            visual_utf16,
+            round_trip_source_utf16,
+            affinity,
+        };
+    }
+    YU_FFI_OK
+}
+
+/// Resolves a source caret against the cached projection for its Markdown
+/// block. Unlike `yu_composition_session_projection_caret`, the visual offset
+/// is intentionally block-local and the result identifies that block.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuBlockProjectionCaret`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_block_projection_caret(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    affinity: u8,
+    output: *mut YuBlockProjectionCaret,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuBlockProjectionCaret::default() };
+
+    if let Err(status) = validate_revision(session, expected_revision) {
+        return status;
+    }
+    if !matches!(
+        affinity,
+        YU_CARET_AFFINITY_UPSTREAM | YU_CARET_AFFINITY_DOWNSTREAM
+    ) {
+        return YU_FFI_INVALID_SELECTION;
+    }
+
+    let snapshot = session.document.snapshot();
+    let source = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) {
+        Ok(offset) => offset,
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    let Some(block_index) = session.document.block_index_for_source(source) else {
+        return YU_FFI_INVALID_RANGE;
+    };
+    let projection = match session.document.block_projection(block_index) {
+        Ok(projection) => projection.visual(),
+        Err(error) => return status_from_document_error(error),
+    };
+    let (visual_utf16, round_trip_source_utf16) =
+        match projection_caret_mapping(&snapshot, projection, source, affinity) {
+            Ok(mapping) => mapping,
+            Err(status) => return status,
+        };
+    let block_index = match u64::try_from(block_index) {
+        Ok(index) => index,
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuBlockProjectionCaret {
+            revision: snapshot.revision().get(),
+            source_utf16,
+            block_index,
             visual_utf16,
             round_trip_source_utf16,
             affinity,
@@ -1397,6 +1465,31 @@ fn utf16_offset_in_utf8(source: &str, byte_offset: u64) -> Result<u64, i32> {
         .ok_or(YU_FFI_LAYOUT_FAILED)?;
     let prefix = std::str::from_utf8(prefix).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
     u64::try_from(prefix.encode_utf16().count()).map_err(|_| YU_FFI_LAYOUT_FAILED)
+}
+
+fn projection_caret_mapping(
+    snapshot: &TextSnapshot,
+    projection: &Projection,
+    source: ByteOffset,
+    affinity: u8,
+) -> Result<(u64, u64), i32> {
+    let bias = match affinity {
+        YU_CARET_AFFINITY_UPSTREAM => ProjectionBias::Before,
+        YU_CARET_AFFINITY_DOWNSTREAM => ProjectionBias::After,
+        _ => return Err(YU_FFI_INVALID_SELECTION),
+    };
+    let visual = projection
+        .source_to_visual(source, bias)
+        .map_err(|_| YU_FFI_INVALID_RANGE)?;
+    let visual_utf16 = visual_utf16_offset(projection, visual.get())?;
+    let round_trip = projection
+        .visual_to_source(visual, bias)
+        .map_err(|_| YU_FFI_INVALID_RANGE)?;
+    let round_trip_source_utf16 = snapshot
+        .utf16_offset(round_trip)
+        .map_err(|_| YU_FFI_INVALID_RANGE)?
+        .get();
+    Ok((visual_utf16, round_trip_source_utf16))
 }
 
 /// Converts a projection visual byte boundary to UTF-16 without materializing
@@ -2005,6 +2098,77 @@ mod tests {
             YU_FFI_OK
         );
         assert_eq!(revision, 0);
+        unsafe { yu_composition_session_destroy(handle) };
+    }
+
+    #[test]
+    fn ffi_block_projection_caret_is_local_to_the_matching_markdown_block() {
+        let source = "before **羽🙂** after\n\nsecond **block**\n";
+        let handle = session(source);
+        let mut upstream = YuBlockProjectionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_block_projection_caret(
+                    handle,
+                    0,
+                    29,
+                    YU_CARET_AFFINITY_UPSTREAM,
+                    &mut upstream,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            upstream,
+            YuBlockProjectionCaret {
+                revision: 0,
+                source_utf16: 29,
+                block_index: 2,
+                visual_utf16: 7,
+                round_trip_source_utf16: 29,
+                affinity: YU_CARET_AFFINITY_UPSTREAM,
+            }
+        );
+
+        let mut downstream = YuBlockProjectionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_block_projection_caret(
+                    handle,
+                    0,
+                    29,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    &mut downstream,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(downstream.block_index, upstream.block_index);
+        assert_eq!(downstream.visual_utf16, upstream.visual_utf16);
+        assert_eq!(downstream.round_trip_source_utf16, 31);
+
+        let mut stale = YuBlockProjectionCaret {
+            revision: 99,
+            source_utf16: 99,
+            block_index: 99,
+            visual_utf16: 99,
+            round_trip_source_utf16: 99,
+            affinity: 99,
+        };
+        assert_eq!(
+            unsafe {
+                yu_composition_session_block_projection_caret(
+                    handle,
+                    1,
+                    29,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    &mut stale,
+                )
+            },
+            YU_FFI_STALE_REVISION
+        );
+        assert_eq!(stale, YuBlockProjectionCaret::default());
+
         unsafe { yu_composition_session_destroy(handle) };
     }
 
