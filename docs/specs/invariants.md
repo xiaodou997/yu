@@ -323,3 +323,7 @@
     `Arc<ViewportRenderFrame>` 共享 frame allocation；handle clone 不得深拷贝 scene/render plan，
     `frame()` 借用与 `current_frame_handle()` owned handoff 必须保持同一 Revision，且 Arc 不得
     携带 EditorDocument、source、layout cache、surface 或 GPU handle。
+17. `ViewportFramePublisher::publish` 必须使用 staged `RenderPlanBuilder`；只有 frame Revision、
+    serial 和 cache handoff 全部成功后才提交 atlas page fingerprint。组装失败、stale/cache 拒绝或
+    serial overflow 不得改变调用方 builder、已有 cache、last publication 或 next serial，随后用同一
+    builder retry 必须重新产生与直接成功等价的 upload plan。

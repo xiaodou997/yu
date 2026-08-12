@@ -357,6 +357,11 @@ surface lifecycle 和 Metal submission，不再自己组装 viewport 或猜测 f
 只有跨边界 handoff 才 clone handle；因此发布/接收不会复制 scene 或 render plan。Arc 只覆盖
 backend-neutral render preparation，不改变 `EditorDocument`、GPU texture 或 surface 的所有权。
 
+发布器对 `RenderPlanBuilder` 使用 staged clone：组装过程中产生的 atlas page fingerprint 先留在
+临时 builder，只有 frame Revision、serial 和 cache handoff 全部成功后才 move 回调用方。这样
+serial overflow、stale cache 或组装失败不会推进上传去重状态，失败后可用同一个 builder 重新发布；
+staged state 只复制轻量 fingerprint map，不复制 scene、source、layout 或 GPU 资源。见 ADR 0075。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

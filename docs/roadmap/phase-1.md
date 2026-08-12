@@ -176,6 +176,10 @@
 9o. viewport frame 必须以不可变共享 handle 在 `ViewportFramePublisher`、cache、publication 和
     macOS host 之间传递；无窗口测试必须用 pointer identity 证明接收路径不深拷贝 scene/render
     plan，同时 stale/revision replacement 仍保持原子。
+9p. `ViewportFramePublisher::publish` 必须以 staged `RenderPlanBuilder` 组装 atlas upload plan，
+    仅在 frame、serial 与 cache 全部成功后提交 fingerprint state；serial overflow 或其他失败不
+    得污染调用方 builder、已有 cache/publication/serial，且无窗口测试必须覆盖失败后同一 builder
+    retry 成功。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

@@ -453,7 +453,16 @@ impl ViewportFramePublisher {
         atlas: &GlyphAtlas,
         render_plans: &mut RenderPlanBuilder,
     ) -> Result<ViewportFramePublication, ViewportPublishError> {
-        let frame = assemble_viewport_render_frame(document, config, shaper, atlas, render_plans)?;
+        // RenderPlanBuilder carries page-fingerprint state across frames. Build against a
+        // staged copy so a later publication failure cannot advance caller-owned state.
+        let mut staged_render_plans = render_plans.clone();
+        let frame = assemble_viewport_render_frame(
+            document,
+            config,
+            shaper,
+            atlas,
+            &mut staged_render_plans,
+        )?;
         let revision = document.revision();
         if frame.revision() != revision {
             return Err(ViewportPublishError::Scene(ViewportSceneError::Frame(
@@ -472,6 +481,7 @@ impl ViewportFramePublisher {
             .publish_shared_if_current(revision, Arc::clone(&frame))
             .map_err(|error| ViewportPublishError::Scene(ViewportSceneError::Frame(error)))?;
 
+        *render_plans = staged_render_plans;
         let publication = ViewportFramePublication {
             revision,
             serial,
@@ -843,5 +853,57 @@ mod tests {
         assert_eq!(second.revision(), second_revision);
         assert_eq!(second.serial(), 2);
         assert_eq!(publisher.last_publication(), Some(&second));
+    }
+
+    #[test]
+    fn frame_publisher_failure_does_not_commit_builder_or_cache() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 80.0);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 80.0).expect("scene viewport"),
+            Rgba8::black(),
+        );
+        let mut document = EditorDocument::new("paragraph");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let mut initial_plans = RenderPlanBuilder::new();
+        let mut publisher = ViewportFramePublisher::new();
+        let first = publisher
+            .publish(&mut document, config, &shaper, &atlas, &mut initial_plans)
+            .expect("initial publication");
+        let first_revision = first.revision();
+
+        document
+            .execute(EditorCommand::insert_text("!"))
+            .expect("edit");
+        let new_atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let mut retry_plans = RenderPlanBuilder::new();
+        publisher.next_serial = u64::MAX;
+
+        let error = publisher
+            .publish(&mut document, config, &shaper, &new_atlas, &mut retry_plans)
+            .expect_err("serial overflow must reject publication");
+        assert_eq!(error, ViewportPublishError::SerialOverflow);
+        assert_eq!(retry_plans.uploaded_page_count(), 0);
+        assert_eq!(publisher.current_revision(), Some(first_revision));
+        assert_eq!(publisher.last_publication(), Some(&first));
+        assert_eq!(publisher.next_serial, u64::MAX);
+
+        publisher.next_serial = first.serial();
+        let retry = publisher
+            .publish(&mut document, config, &shaper, &new_atlas, &mut retry_plans)
+            .expect("retry after overflow");
+        assert_eq!(retry.serial(), 2);
+        assert_eq!(retry.revision(), document.revision());
+        assert!(retry_plans.uploaded_page_count() > 0);
     }
 }
