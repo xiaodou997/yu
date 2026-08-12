@@ -300,6 +300,12 @@ range、document-space block origin/height、measured 和稳定 kind tag。它�
 不暴露 `ViewportSnapshot`、Markdown block 或 layout 对象；因此 scene/document view 可以直接
 消费 block geometry，同时保持 Rust 为唯一的 block height/source 边界。
 
+`yu-scene::ViewportSceneInput` 是 metadata 进入 retained scene 的下一层边界。它再次验证 block
+顺序、source range、document-space y/height、content height 和 Revision；`SceneBuilder` 的
+`append_layout_at_block` 只把已经验证的 block-local shaped layout 平移到 geometry 的 document
+origin，绝不根据 kind 或 source 重新布局。这样 FFI/native host、editor layout cache 和 scene
+都共享同一 block origin，而不会各自维护 HeightIndex 的副本。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

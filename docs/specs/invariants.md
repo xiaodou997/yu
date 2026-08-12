@@ -143,6 +143,12 @@
     Revision、非法参数、layout/unavailable 失败必须清空 header/count，查询不得修改 source、
     selection、composition、history 或把 Rust layout/Markdown/AppKit 对象暴露到 ABI。
 
+31. `ViewportSceneInput` 进入 `yu-scene` 前必须验证同一 Revision、连续 block index、source
+    range 顺序、单调 document-space origin、正 height 和 content-height 上界；
+    `SceneBuilder::append_layout_at_block` 必须再验证 layout Revision/source range，并在解析
+    全部 atlas entry 前保持 scene 原子。scene 只能平移 block-local layout 到已验证 origin，不能
+    根据 Markdown kind、source text 或自己的 HeightIndex 重新计算 block 几何。
+
 ## Accessibility
 
 1. 原生 Accessibility 文本 range 使用 UTF-16，并绑定一个明确的 Revision。

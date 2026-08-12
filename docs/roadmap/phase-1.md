@@ -84,6 +84,7 @@
 - [x] block-local CoreText shaped caret geometry、line/point/height ABI 与 macOS self-check
 - [x] CoreText shaped caret scroll request、HeightIndex absolute target 与 macOS host self-check
 - [x] CoreText shaped viewport block snapshot、count/fill ABI 与 block origin self-check
+- [x] `ViewportSceneInput` metadata validation 与 block-local layout document-origin append
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -135,6 +136,9 @@
 9e. shaped viewport block snapshot 必须以 count/fill 返回当前 Revision 的可见 block range、
     source UTF-16 range、document-space origin/height、measured 和 kind tag；容量不足、stale
     Revision 与非 macOS unavailable 必须明确失败，native self-check 不得维护第二套 block layout。
+9f. viewport metadata 进入 scene 前必须再次验证 Revision、连续 block/source ranges、document
+    origin/height 与 content height；scene 只能平移 block-local layout，不得复制 HeightIndex 或
+    根据 Markdown kind 重新布局，且 stale/source mismatch/atlas failure 不得发布部分 primitive。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可
