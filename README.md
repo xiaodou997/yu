@@ -139,6 +139,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Batched viewport scene assembly](docs/adr/0066-batched-viewport-scene-assembly.md)
 - [Editor viewport scene integration](docs/adr/0067-editor-viewport-scene-integration.md)
 - [Revision-aware viewport frame publication](docs/adr/0068-revision-aware-viewport-frame-publication.md)
+- [macOS revision-aware Metal frame consumer](docs/adr/0069-macos-revision-aware-metal-frame-consumer.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
