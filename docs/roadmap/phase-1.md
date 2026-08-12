@@ -39,6 +39,7 @@
 - [x] 将实验事件转换为 Rust `CompositionOverlay` 协议
 - [x] 通过 C ABI static library 完成 Swift ↔ Rust `CompositionOverlay` smoke test
 - [x] `EditorDocument` 统一拥有 canonical source、Revision 与 composition overlay
+- [x] composition overlay 的 transient projection/layout（metrics 与 shaped）不污染 source/cache/history
 - [x] FFI revision-bound 局部 UTF-8 source query（不物化完整 Snapshot）
 - [x] `EditorSelection`、caret affinity 与基础 Unicode command 模型
 - [x] chunk-aware Unicode grapheme command 查询（不物化完整 Snapshot）
@@ -180,6 +181,10 @@
     仅在 frame、serial 与 cache 全部成功后提交 fingerprint state；serial overflow 或其他失败不
     得污染调用方 builder、已有 cache/publication/serial，且无窗口测试必须覆盖失败后同一 builder
     retry 成功。
+9q. composition preedit 必须通过 transient projection/layout 参与 visual wrapping、shaping 与
+    selection mapping；composition run 使用临时 shaping 坐标并回映射 canonical replacement
+    range，查询不得写入 LayoutCache、source、Revision 或 history，且测试必须覆盖 metrics/shaped
+    两条路径与 commit/cancel 后的 canonical 回归。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

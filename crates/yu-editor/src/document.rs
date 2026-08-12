@@ -220,6 +220,67 @@ impl EditorDocument {
             .map_err(EditorDocumentError::Layout)
     }
 
+    /// Builds a transient metrics layout with the active IME preedit
+    /// projected over this block. The result is intentionally not inserted in
+    /// `LayoutCache`: composition updates do not advance the canonical
+    /// Revision, so caching them would make stale preedit geometry observable.
+    pub fn block_layout_with_composition(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        let projection = self.block_projection_for_composition(index)?;
+        LayoutSnapshot::from_block_projection(&projection, config)
+            .map_err(EditorDocumentError::Layout)
+    }
+
+    /// Builds a transient shaped layout with the active IME preedit projected
+    /// over this block. Font/shaping state remains owned by the caller.
+    pub fn block_layout_with_composition_and_shaper<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        let projection = self.block_projection_for_composition(index)?;
+        LayoutSnapshot::from_block_projection_with_shaper(&projection, config, shaper)
+            .map_err(EditorDocumentError::Layout)
+    }
+
+    fn block_projection_for_composition(
+        &mut self,
+        index: usize,
+    ) -> Result<BlockProjection, EditorDocumentError> {
+        let composition = self
+            .composition
+            .as_ref()
+            .ok_or(EditorDocumentError::CompositionNotActive)?;
+        let block =
+            self.markdown
+                .blocks()
+                .get(index)
+                .ok_or(EditorDocumentError::BlockOutOfBounds {
+                    index,
+                    blocks: self.markdown.blocks().len(),
+                })?;
+        let snapshot = self.snapshot();
+        let projection = self
+            .projections
+            .get_or_build_block_with_definitions(
+                &snapshot,
+                block,
+                self.markdown.reference_definitions(),
+            )?
+            .clone();
+        projection
+            .with_composition(
+                composition.replacement_range(),
+                Arc::from(composition.text()),
+                composition.selection_bytes(),
+            )
+            .map_err(EditorDocumentError::Projection)
+    }
+
     #[must_use]
     pub fn layout_cache_stats(&self) -> LayoutCacheStats {
         self.layouts.stats()
@@ -2365,6 +2426,72 @@ mod tests {
             .execute(EditorCommand::undo())
             .expect("undo commit");
         assert_eq!(document.snapshot().as_str(), "before");
+    }
+
+    #[test]
+    fn composition_layout_is_transient_and_uses_preedit_text() {
+        let mut document = EditorDocument::new("hello");
+        let revision = document.revision();
+        assert_eq!(document.layout_cache_stats().entries(), 0);
+        document
+            .begin_composition(source_range(5, 5), "日本", utf16_range(1, 1))
+            .expect("composition should begin");
+        let layout = document
+            .block_layout_with_composition(0, LayoutConfig::new(80.0, 1.0))
+            .expect("composition metrics layout");
+        assert_eq!(layout.revision(), revision);
+        assert_eq!(layout.projection().composition_text(), Some("日本"));
+        assert_eq!(
+            layout
+                .projection()
+                .composition_selection_visual()
+                .map(|range| range.start().get()),
+            Some(8)
+        );
+        assert_eq!(document.snapshot().as_str(), "hello");
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.history_stats().undo_entries(), 0);
+        assert_eq!(document.layout_cache_stats().entries(), 0);
+
+        document
+            .update_composition("日本語", utf16_range(3, 3))
+            .expect("composition update");
+        let updated = document
+            .block_layout_with_composition(0, LayoutConfig::new(80.0, 1.0))
+            .expect("updated composition metrics layout");
+        assert_eq!(updated.projection().composition_text(), Some("日本語"));
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.layout_cache_stats().entries(), 0);
+
+        assert!(document.cancel_composition());
+        let canonical = document
+            .block_layout(0, LayoutConfig::new(80.0, 1.0))
+            .expect("canonical layout after cancel");
+        assert_eq!(canonical.projection().composition_text(), None);
+        assert_eq!(document.revision(), revision);
+    }
+
+    #[test]
+    fn composition_shaped_layout_uses_temporary_shape_coordinates() {
+        let mut document = EditorDocument::new("hello");
+        document
+            .begin_composition(source_range(5, 5), "日本", utf16_range(0, 0))
+            .expect("composition should begin");
+        let layout = document
+            .block_layout_with_composition_and_shaper(0, LayoutConfig::new(80.0, 1.0), &WideShaper)
+            .expect("composition shaped layout");
+        assert_eq!(layout.projection().composition_text(), Some("日本"));
+        assert!(layout.glyphs().len() >= 2);
+        assert!(
+            layout
+                .glyphs()
+                .iter()
+                .filter(|glyph| glyph.visual().start().get() >= 5)
+                .filter(|glyph| glyph.source() == source_range(5, 5))
+                .count()
+                >= 2
+        );
+        assert_eq!(document.snapshot().as_str(), "hello");
     }
 
     #[test]

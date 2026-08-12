@@ -883,7 +883,6 @@ impl LayoutSnapshot {
 
     fn build<M: ClusterMetrics>(&mut self, metrics: &M) -> Result<(), LayoutError> {
         let source_range = self.projection.source_range();
-        let source = self.projection.source().clone();
         let runs = self.projection.runs().to_vec();
         let mut line_source_start = source_range.start();
         let mut line_source_end = line_source_start;
@@ -924,26 +923,33 @@ impl LayoutSnapshot {
                 last_was_break = true;
                 continue;
             }
-            if run.kind() != VisualRunKind::Visible {
+            if run.kind() == VisualRunKind::HiddenSyntax {
                 line_source_end = line_source_end.max(run.source().end());
                 continue;
             }
-            let text = read_source_range(&source, run.source())?;
+            let text = self
+                .projection
+                .text_for_run(run)
+                .map_err(LayoutError::Projection)?;
             for (local_start, cluster_text) in text.grapheme_indices(true) {
                 let local_end = local_start
                     .checked_add(cluster_text.len())
                     .ok_or(LayoutError::OffsetOverflow)?;
-                let source_start = add_offset(run.source().start(), local_start)?;
-                let source_end = add_offset(run.source().start(), local_end)?;
-                let visual_start = add_visual(run.visual().start(), local_start)?;
-                let visual_end = add_visual(run.visual().start(), local_end)?;
-                let cluster_source =
-                    TextRange::new(source_start, source_end).ok_or(LayoutError::OffsetOverflow)?;
-                let cluster_visual = VisualRange::new(visual_start, visual_end)
-                    .ok_or(LayoutError::OffsetOverflow)?;
+                let local_start =
+                    u64::try_from(local_start).map_err(|_| LayoutError::OffsetOverflow)?;
+                let local_end =
+                    u64::try_from(local_end).map_err(|_| LayoutError::OffsetOverflow)?;
+                let cluster_source = self
+                    .projection
+                    .source_range_for_run_slice(run, local_start, local_end)
+                    .map_err(LayoutError::Projection)?;
+                let cluster_visual = self
+                    .projection
+                    .visual_range_for_run_slice(run, local_start, local_end)
+                    .map_err(LayoutError::Projection)?;
 
                 if cluster_text.contains('\n') {
-                    line_source_end = line_source_end.max(source_end);
+                    line_source_end = line_source_end.max(cluster_source.end());
                     self.clusters.push(VisualCluster {
                         source: cluster_source,
                         visual: cluster_visual,
@@ -958,15 +964,15 @@ impl LayoutSnapshot {
                         source_start: line_source_start,
                         source_end: line_source_end,
                         visual_start: line_visual_start,
-                        visual_end,
+                        visual_end: cluster_visual.end(),
                         width: line_width,
                         cluster_start: line_cluster_start,
                     })?;
                     line_index = line_index.saturating_add(1);
                     line_cluster_start = self.clusters.len();
-                    line_source_start = source_end;
-                    line_source_end = source_end;
-                    line_visual_start = visual_end;
+                    line_source_start = cluster_source.end();
+                    line_source_end = cluster_source.end();
+                    line_visual_start = cluster_visual.end();
                     line_width = 0.0;
                     last_was_break = true;
                     continue;
@@ -982,7 +988,7 @@ impl LayoutSnapshot {
                         source_start: line_source_start,
                         source_end: line_source_end,
                         visual_start: line_visual_start,
-                        visual_end: visual_start,
+                        visual_end: cluster_visual.start(),
                         width: line_width,
                         cluster_start: line_cluster_start,
                     })?;
@@ -990,10 +996,10 @@ impl LayoutSnapshot {
                     line_cluster_start = self.clusters.len();
                     line_source_start = cluster_source.start();
                     line_source_end = cluster_source.start();
-                    line_visual_start = visual_start;
+                    line_visual_start = cluster_visual.start();
                     line_width = 0.0;
                 }
-                line_source_end = line_source_end.max(source_end);
+                line_source_end = line_source_end.max(cluster_source.end());
                 self.clusters.push(VisualCluster {
                     source: cluster_source,
                     visual: cluster_visual,
@@ -1034,7 +1040,6 @@ impl LayoutSnapshot {
 
     fn build_shaped<S: ShapingProvider>(&mut self, shaper: &S) -> Result<(), LayoutError> {
         let source_range = self.projection.source_range();
-        let source = self.projection.source().clone();
         let runs = self.projection.runs().to_vec();
         let mut line_source_start = source_range.start();
         let mut line_source_end = line_source_start;
@@ -1075,23 +1080,27 @@ impl LayoutSnapshot {
                 last_was_break = true;
                 continue;
             }
-            if run.kind() != VisualRunKind::Visible {
+            if run.kind() == VisualRunKind::HiddenSyntax {
                 line_source_end = line_source_end.max(run.source().end());
                 continue;
             }
-            let text = read_source_range(&source, run.source())?;
+            let text = self
+                .projection
+                .text_for_run(run)
+                .map_err(LayoutError::Projection)?;
+            let shape_source = self.projection.shape_source_range_for_run(run);
             let shaped = shaper
-                .shape(&text, run.source(), run.style())
+                .shape(&text, shape_source, run.style())
                 .map_err(|error| LayoutError::Shaping(error.to_string()))?;
-            if shaped.source() != run.source() {
+            if shaped.source() != shape_source {
                 return Err(LayoutError::Shaping(
                     "shaper returned a source range different from the requested run".into(),
                 ));
             }
 
             for glyph_run in shaped.runs() {
-                if glyph_run.source().start() < run.source().start()
-                    || glyph_run.source().end() > run.source().end()
+                if glyph_run.source().start() < shape_source.start()
+                    || glyph_run.source().end() > shape_source.end()
                 {
                     return Err(LayoutError::Shaping(
                         "glyph run source range is outside the requested visual run".into(),
@@ -1109,15 +1118,28 @@ impl LayoutSnapshot {
                         ));
                     }
                     previous_source_end = glyph_source.end();
-                    let visual_start = self
-                        .projection
-                        .source_to_visual(glyph_source.start(), ProjectionBias::Before)?;
-                    let visual_end = self
-                        .projection
-                        .source_to_visual(glyph_source.end(), ProjectionBias::After)?;
-                    let cluster_visual = VisualRange::new(visual_start, visual_end)
+                    let local_start = glyph_source
+                        .start()
+                        .get()
+                        .checked_sub(shape_source.start().get())
                         .ok_or(LayoutError::OffsetOverflow)?;
-                    let cluster_text = read_source_range(&source, glyph_source)?;
+                    let local_end = glyph_source
+                        .end()
+                        .get()
+                        .checked_sub(shape_source.start().get())
+                        .ok_or(LayoutError::OffsetOverflow)?;
+                    let canonical_source = self
+                        .projection
+                        .source_range_for_run_slice(run, local_start, local_end)
+                        .map_err(LayoutError::Projection)?;
+                    let cluster_visual = self
+                        .projection
+                        .visual_range_for_run_slice(run, local_start, local_end)
+                        .map_err(LayoutError::Projection)?;
+                    let cluster_text = self
+                        .projection
+                        .text_for_run_slice(run, local_start, local_end)
+                        .map_err(LayoutError::Projection)?;
                     let is_line_break = cluster_text.contains('\n');
                     let advance = if is_line_break { 0.0 } else { glyph.advance() };
                     if !advance.is_finite() || advance < 0.0 {
@@ -1127,9 +1149,9 @@ impl LayoutSnapshot {
                         return Err(LayoutError::Shaping("glyph offsets must be finite".into()));
                     }
                     if is_line_break {
-                        line_source_end = line_source_end.max(glyph_source.end());
+                        line_source_end = line_source_end.max(canonical_source.end());
                         self.clusters.push(VisualCluster {
-                            source: glyph_source,
+                            source: canonical_source,
                             visual: cluster_visual,
                             line: line_index,
                             x: line_width,
@@ -1148,8 +1170,8 @@ impl LayoutSnapshot {
                         })?;
                         line_index = line_index.saturating_add(1);
                         line_cluster_start = self.clusters.len();
-                        line_source_start = glyph_source.end();
-                        line_source_end = glyph_source.end();
+                        line_source_start = canonical_source.end();
+                        line_source_end = canonical_source.end();
                         line_visual_start = cluster_visual.end();
                         line_width = 0.0;
                         last_was_break = true;
@@ -1168,12 +1190,12 @@ impl LayoutSnapshot {
                         })?;
                         line_index = line_index.saturating_add(1);
                         line_cluster_start = self.clusters.len();
-                        line_source_start = glyph_source.start();
-                        line_source_end = glyph_source.start();
+                        line_source_start = canonical_source.start();
+                        line_source_end = canonical_source.start();
                         line_visual_start = cluster_visual.start();
                         line_width = 0.0;
                     }
-                    line_source_end = line_source_end.max(glyph_source.end());
+                    line_source_end = line_source_end.max(canonical_source.end());
                     let glyph_x = line_width + glyph.x_offset();
                     let glyph_y = self.baseline_for_line(line_index)? + glyph.y_offset();
                     if !glyph_x.is_finite() || !glyph_y.is_finite() {
@@ -1182,7 +1204,7 @@ impl LayoutSnapshot {
                     self.glyphs.push(GlyphPlacement {
                         face: glyph_run.face(),
                         glyph: glyph.id(),
-                        source: glyph_source,
+                        source: canonical_source,
                         visual: cluster_visual,
                         line: line_index,
                         x: glyph_x,
@@ -1190,7 +1212,7 @@ impl LayoutSnapshot {
                         style: glyph_run.style(),
                     });
                     self.clusters.push(VisualCluster {
-                        source: glyph_source,
+                        source: canonical_source,
                         visual: cluster_visual,
                         line: line_index,
                         x: line_width,
@@ -1322,18 +1344,6 @@ impl LayoutSnapshot {
     }
 }
 
-fn add_offset(start: ByteOffset, local: usize) -> Result<ByteOffset, LayoutError> {
-    start
-        .checked_add(u64::try_from(local).map_err(|_| LayoutError::OffsetOverflow)?)
-        .ok_or(LayoutError::OffsetOverflow)
-}
-
-fn add_visual(start: VisualOffset, local: usize) -> Result<VisualOffset, LayoutError> {
-    start
-        .checked_add(u64::try_from(local).map_err(|_| LayoutError::OffsetOverflow)?)
-        .ok_or(LayoutError::OffsetOverflow)
-}
-
 fn map_source_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, LayoutError> {
     let start = changes
         .map_anchor(TextAnchor::new(
@@ -1352,34 +1362,6 @@ fn map_source_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, 
         .map_err(|error| LayoutError::Projection(ProjectionError::AnchorMap(error)))?
         .offset();
     TextRange::new(start, end).ok_or(LayoutError::OffsetOverflow)
-}
-
-fn read_source_range(
-    source: &yu_text::TextSnapshot,
-    range: TextRange,
-) -> Result<String, LayoutError> {
-    let start = usize::try_from(range.start()).map_err(|_| LayoutError::OffsetOverflow)?;
-    let end = usize::try_from(range.end()).map_err(|_| LayoutError::OffsetOverflow)?;
-    let mut text = String::with_capacity(end.saturating_sub(start));
-    let mut cursor = source
-        .chunk_cursor(range.start())
-        .map_err(|error| LayoutError::Projection(ProjectionError::SourcePosition(error)))?;
-    for chunk in &mut cursor {
-        let chunk_start =
-            usize::try_from(chunk.start()).map_err(|_| LayoutError::OffsetOverflow)?;
-        let chunk_end = chunk_start
-            .checked_add(chunk.text().len())
-            .ok_or(LayoutError::OffsetOverflow)?;
-        if chunk_start >= end {
-            break;
-        }
-        let local_start = start.max(chunk_start).saturating_sub(chunk_start);
-        let local_end = end.min(chunk_end).saturating_sub(chunk_start);
-        if local_start < local_end {
-            text.push_str(&chunk.text()[local_start..local_end]);
-        }
-    }
-    Ok(text)
 }
 
 #[cfg(test)]

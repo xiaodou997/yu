@@ -91,6 +91,14 @@ Revision 对齐的 `MarkdownDocument`、revision-bound `EditorSelection`、trans
 和 `ProjectionCache`。平台 view 可以保留 AppKit 的渲染/输入投影，但永久命令必须回到该边界
 并通过 Transaction 提交。
 
+composition 需要参与视觉布局时，`Projection::with_composition` 在 canonical projection 上建立
+一个不入缓存的临时视图：替换范围外仍使用 parser-owned runs，preedit 是 plain
+`VisualRunKind::Composition`。layout/shaping 通过 projection 读取临时文本和零基 shaping range，
+再把 glyph/cluster 映射回 canonical replacement range；因此 preedit 可以改变换行、宽度和 caret
+visual range，但不会改变 source bytes 或 Markdown 语义。`EditorDocument` 只提供
+`block_layout_with_composition*` 这类 transient 查询，commit/cancel 后普通 cache 仍是唯一可复用
+的 canonical layout。见 ADR 0076。
+
 `EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
 按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
 Revision。光标移动、显式 selection、composition 边界和 reset 会断开 group；新的永久 edit 会清空

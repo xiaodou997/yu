@@ -10,6 +10,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 use yu_markdown::{
     Block, BlockKind, InlineDocument, InlineNodeKind, InlineParseError, InlineSpan, InlineSpanKind,
@@ -114,6 +115,8 @@ pub enum VisualRunKind {
     LineBreak { hard: bool },
     /// Source syntax remains in the canonical source but occupies no visual bytes.
     HiddenSyntax,
+    /// Transient IME preedit text projected over a canonical source range.
+    Composition,
 }
 
 /// Semantic style carried by a visible visual run.
@@ -213,6 +216,17 @@ pub enum ProjectionError {
     InvalidTaskListBlock {
         range: TextRange,
     },
+    CompositionRangeOutsideProjection {
+        range: TextRange,
+        projection: TextRange,
+    },
+    CompositionSelectionOutOfBounds {
+        range: TextRange,
+        text_len: ByteOffset,
+    },
+    CompositionSelectionNotUtf8Boundary {
+        offset: ByteOffset,
+    },
     OffsetOverflow,
 }
 
@@ -251,6 +265,20 @@ impl fmt::Display for ProjectionError {
             Self::InvalidTaskListBlock { range } => {
                 write!(formatter, "invalid task-list block range {range:?}")
             }
+            Self::CompositionRangeOutsideProjection { range, projection } => write!(
+                formatter,
+                "composition range {range:?} is outside projection {projection:?}"
+            ),
+            Self::CompositionSelectionOutOfBounds { range, text_len } => write!(
+                formatter,
+                "composition selection {range:?} exceeds preedit length {text_len:?}"
+            ),
+            Self::CompositionSelectionNotUtf8Boundary { offset } => {
+                write!(
+                    formatter,
+                    "composition selection {offset:?} is not a UTF-8 boundary"
+                )
+            }
             Self::OffsetOverflow => formatter.write_str("projection offset overflow"),
         }
     }
@@ -269,6 +297,9 @@ impl Error for ProjectionError {
             | Self::NotFencedCodeBlock { .. }
             | Self::InvalidCodeBlock { .. }
             | Self::InvalidTaskListBlock { .. }
+            | Self::CompositionRangeOutsideProjection { .. }
+            | Self::CompositionSelectionOutOfBounds { .. }
+            | Self::CompositionSelectionNotUtf8Boundary { .. }
             | Self::OffsetOverflow => None,
         }
     }
@@ -299,6 +330,15 @@ pub struct Projection {
     source_range: TextRange,
     runs: Vec<VisualRun>,
     visual_len: VisualOffset,
+    composition: Option<CompositionState>,
+}
+
+#[derive(Clone, Debug)]
+struct CompositionState {
+    replacement_range: TextRange,
+    text: Arc<str>,
+    selection_bytes: TextRange,
+    visual: VisualRange,
 }
 
 impl Projection {
@@ -413,6 +453,81 @@ impl Projection {
             source_range,
             runs,
             visual_len,
+            composition: None,
+        })
+    }
+
+    /// Projects transient IME preedit text over a canonical source range.
+    ///
+    /// The source snapshot and its Revision remain unchanged. Markdown runs
+    /// outside the replacement range retain their parser-owned source ranges;
+    /// the preedit is a plain composition run and is never parsed as Markdown.
+    pub fn with_composition(
+        &self,
+        replacement_range: TextRange,
+        text: impl Into<Arc<str>>,
+        selection_bytes: TextRange,
+    ) -> Result<Self, ProjectionError> {
+        if replacement_range.start() < self.source_range.start()
+            || replacement_range.end() > self.source_range.end()
+        {
+            return Err(ProjectionError::CompositionRangeOutsideProjection {
+                range: replacement_range,
+                projection: self.source_range,
+            });
+        }
+        self.source.utf16_offset(replacement_range.start())?;
+        self.source.utf16_offset(replacement_range.end())?;
+        let text = text.into();
+        validate_composition_selection(text.as_ref(), selection_bytes)?;
+        let visual_start =
+            self.source_to_visual(replacement_range.start(), ProjectionBias::Before)?;
+        let visual_end = self.source_to_visual(replacement_range.end(), ProjectionBias::After)?;
+        let old_visual_len = visual_end
+            .get()
+            .checked_sub(visual_start.get())
+            .ok_or(ProjectionError::OffsetOverflow)?;
+        let new_visual_len =
+            u64::try_from(text.len()).map_err(|_| ProjectionError::OffsetOverflow)?;
+        let visual_end = visual_start
+            .checked_add(new_visual_len)
+            .ok_or(ProjectionError::OffsetOverflow)?;
+        let visual_delta = i128::from(new_visual_len) - i128::from(old_visual_len);
+
+        let mut runs = Vec::with_capacity(self.runs.len().saturating_add(1));
+        for run in &self.runs {
+            append_composition_run_part(&mut runs, *run, replacement_range, visual_delta)?;
+        }
+        if !text.is_empty() {
+            let composition_run = VisualRun {
+                source: replacement_range,
+                visual: VisualRange::new(visual_start, visual_end)
+                    .ok_or(ProjectionError::OffsetOverflow)?,
+                kind: VisualRunKind::Composition,
+                style: VisualRunStyle::Plain,
+            };
+            let insertion = runs
+                .iter()
+                .position(|run| {
+                    run.kind() != VisualRunKind::Composition
+                        && run.source().start() >= replacement_range.end()
+                })
+                .unwrap_or(runs.len());
+            runs.insert(insertion, composition_run);
+        }
+
+        Ok(Self {
+            source: self.source.clone(),
+            source_range: self.source_range,
+            runs,
+            visual_len: shift_visual(self.visual_len, visual_delta)?,
+            composition: Some(CompositionState {
+                replacement_range,
+                text,
+                selection_bytes,
+                visual: VisualRange::new(visual_start, visual_end)
+                    .ok_or(ProjectionError::OffsetOverflow)?,
+            }),
         })
     }
 
@@ -440,6 +555,9 @@ impl Projection {
                 actual: snapshot.revision(),
             });
         }
+        if self.composition.is_some() {
+            return Ok(None);
+        }
         if changes
             .changes()
             .iter()
@@ -465,6 +583,7 @@ impl Projection {
             source_range,
             runs,
             visual_len: self.visual_len,
+            composition: None,
         }))
     }
 
@@ -501,13 +620,57 @@ impl Projection {
     pub fn source_to_visual(
         &self,
         source: ByteOffset,
-        _bias: ProjectionBias,
+        bias: ProjectionBias,
     ) -> Result<VisualOffset, ProjectionError> {
         self.validate_source(source)?;
+        if let Some(composition) = &self.composition {
+            let range = composition.replacement_range;
+            if range.is_empty() {
+                if source < range.start() {
+                    return self.source_to_visual_runs(source, bias);
+                }
+                if source == range.start() {
+                    return Ok(match bias {
+                        ProjectionBias::Before => self.source_to_visual_runs(source, bias)?,
+                        ProjectionBias::After => composition.visual.end(),
+                    });
+                }
+                return self.source_to_visual_runs(source, bias);
+            }
+            if source < range.start() {
+                return self.source_to_visual_runs(source, bias);
+            }
+            if source == range.start() {
+                return Ok(composition.visual.start());
+            }
+            if source < range.end() {
+                return Ok(match bias {
+                    ProjectionBias::Before => composition.visual.start(),
+                    ProjectionBias::After => composition.visual.end(),
+                });
+            }
+            if source == range.end() {
+                return Ok(composition.visual.end());
+            }
+            if source > range.end() {
+                return self.source_to_visual_runs(source, bias);
+            }
+        }
+        self.source_to_visual_runs(source, bias)
+    }
+
+    fn source_to_visual_runs(
+        &self,
+        source: ByteOffset,
+        _bias: ProjectionBias,
+    ) -> Result<VisualOffset, ProjectionError> {
         if self.runs.is_empty() {
             return Ok(VisualOffset::ZERO);
         }
         for run in &self.runs {
+            if run.kind() == VisualRunKind::Composition {
+                continue;
+            }
             if run.source.start() <= source && source <= run.source.end() {
                 if run.kind == VisualRunKind::HiddenSyntax {
                     return Ok(run.visual.start());
@@ -541,11 +704,37 @@ impl Projection {
                 len: self.visual_len,
             });
         }
+        if let Some(composition) = &self.composition {
+            let range = composition.visual;
+            if visual >= range.start() && visual <= range.end() {
+                if visual == range.start() {
+                    return Ok(composition.replacement_range.start());
+                }
+                if visual == range.end() {
+                    return Ok(composition.replacement_range.end());
+                }
+                return Ok(match bias {
+                    ProjectionBias::Before => composition.replacement_range.start(),
+                    ProjectionBias::After => composition.replacement_range.end(),
+                });
+            }
+        }
+        self.visual_to_source_runs(visual, bias)
+    }
+
+    fn visual_to_source_runs(
+        &self,
+        visual: VisualOffset,
+        bias: ProjectionBias,
+    ) -> Result<ByteOffset, ProjectionError> {
         if self.runs.is_empty() {
             return Ok(self.source_range.start());
         }
 
         for (index, run) in self.runs.iter().enumerate() {
+            if run.kind() == VisualRunKind::Composition {
+                continue;
+            }
             if run.kind == VisualRunKind::HiddenSyntax && run.visual.start() == visual {
                 let mut candidate = match bias {
                     ProjectionBias::Before => run.source.start(),
@@ -604,6 +793,291 @@ impl Projection {
             });
         }
         Ok(())
+    }
+
+    /// Returns the transient preedit text, if this projection has one.
+    #[must_use]
+    pub fn composition_text(&self) -> Option<&str> {
+        self.composition
+            .as_ref()
+            .map(|composition| composition.text.as_ref())
+    }
+
+    /// Returns the canonical range replaced by the transient preedit.
+    #[must_use]
+    pub fn composition_range(&self) -> Option<TextRange> {
+        self.composition
+            .as_ref()
+            .map(|composition| composition.replacement_range)
+    }
+
+    /// Returns the preedit selection in temporary-text byte coordinates.
+    #[must_use]
+    pub fn composition_selection_bytes(&self) -> Option<TextRange> {
+        self.composition
+            .as_ref()
+            .map(|composition| composition.selection_bytes)
+    }
+
+    /// Returns the preedit selection in the projected visual byte stream.
+    pub fn composition_selection_visual(&self) -> Option<VisualRange> {
+        let composition = self.composition.as_ref()?;
+        let start = composition
+            .visual
+            .start()
+            .checked_add(composition.selection_bytes.start().get())?;
+        let end = composition
+            .visual
+            .start()
+            .checked_add(composition.selection_bytes.end().get())?;
+        VisualRange::new(start, end)
+    }
+
+    /// Returns a synthetic range suitable for passing the preedit text to a
+    /// shaping provider. It is local to the temporary text, not canonical source.
+    pub fn composition_shape_source_range(&self) -> Option<TextRange> {
+        let text_len = u64::try_from(self.composition_text()?.len()).ok()?;
+        TextRange::new(ByteOffset::ZERO, ByteOffset::new(text_len))
+    }
+
+    /// Returns the source coordinate space consumed by a shaping provider for
+    /// one run. Composition text uses a temporary zero-based range because its
+    /// byte length need not equal the replaced canonical range.
+    pub fn shape_source_range_for_run(&self, run: VisualRun) -> TextRange {
+        if run.kind() == VisualRunKind::Composition {
+            self.composition_shape_source_range()
+                .expect("composition run always has composition text")
+        } else {
+            run.source()
+        }
+    }
+
+    /// Maps a byte slice in a run's shaping coordinate space back to canonical
+    /// source. Every composition slice maps to the replacement range because
+    /// preedit bytes are not canonical source bytes.
+    pub fn source_range_for_run_slice(
+        &self,
+        run: VisualRun,
+        local_start: u64,
+        local_end: u64,
+    ) -> Result<TextRange, ProjectionError> {
+        if local_start > local_end {
+            return Err(ProjectionError::OffsetOverflow);
+        }
+        if run.kind() == VisualRunKind::Composition {
+            let text_len = u64::try_from(
+                self.composition_text()
+                    .expect("composition run always has composition text")
+                    .len(),
+            )
+            .map_err(|_| ProjectionError::OffsetOverflow)?;
+            if local_end > text_len {
+                return Err(ProjectionError::OffsetOverflow);
+            }
+            return Ok(self
+                .composition_range()
+                .expect("composition run always has a replacement range"));
+        }
+        let start = run
+            .source()
+            .start()
+            .checked_add(local_start)
+            .ok_or(ProjectionError::OffsetOverflow)?;
+        let end = run
+            .source()
+            .start()
+            .checked_add(local_end)
+            .ok_or(ProjectionError::OffsetOverflow)?;
+        TextRange::new(start, end).ok_or(ProjectionError::OffsetOverflow)
+    }
+
+    /// Maps a byte slice in a run's shaping coordinate space to visual bytes.
+    pub fn visual_range_for_run_slice(
+        &self,
+        run: VisualRun,
+        local_start: u64,
+        local_end: u64,
+    ) -> Result<VisualRange, ProjectionError> {
+        let start = run
+            .visual()
+            .start()
+            .checked_add(local_start)
+            .ok_or(ProjectionError::OffsetOverflow)?;
+        let end = run
+            .visual()
+            .start()
+            .checked_add(local_end)
+            .ok_or(ProjectionError::OffsetOverflow)?;
+        VisualRange::new(start, end).ok_or(ProjectionError::OffsetOverflow)
+    }
+
+    /// Reads the text consumed by a layout/shaping pass for one visual run.
+    /// Composition runs read their transient text; all other runs read the
+    /// canonical snapshot range.
+    pub fn text_for_run(&self, run: VisualRun) -> Result<String, ProjectionError> {
+        if run.kind() == VisualRunKind::Composition {
+            return Ok(self
+                .composition_text()
+                .expect("composition run always has composition text")
+                .to_owned());
+        }
+        String::from_utf8(read_range(&self.source, run.source())?)
+            .map_err(|_| ProjectionError::OffsetOverflow)
+    }
+
+    /// Reads a local byte slice from the temporary text used by a run.
+    pub fn text_for_run_slice(
+        &self,
+        run: VisualRun,
+        local_start: u64,
+        local_end: u64,
+    ) -> Result<String, ProjectionError> {
+        if local_start > local_end {
+            return Err(ProjectionError::OffsetOverflow);
+        }
+        if run.kind() == VisualRunKind::Composition {
+            let text = self
+                .composition_text()
+                .expect("composition run always has composition text");
+            let start =
+                usize::try_from(local_start).map_err(|_| ProjectionError::OffsetOverflow)?;
+            let end = usize::try_from(local_end).map_err(|_| ProjectionError::OffsetOverflow)?;
+            if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                return Err(ProjectionError::OffsetOverflow);
+            }
+            return Ok(text[start..end].to_owned());
+        }
+        let range = self.source_range_for_run_slice(run, local_start, local_end)?;
+        String::from_utf8(read_range(&self.source, range)?)
+            .map_err(|_| ProjectionError::OffsetOverflow)
+    }
+}
+
+fn validate_composition_selection(text: &str, selection: TextRange) -> Result<(), ProjectionError> {
+    let text_len = ByteOffset::try_from(text.len()).map_err(|_| ProjectionError::OffsetOverflow)?;
+    if selection.end() > text_len {
+        return Err(ProjectionError::CompositionSelectionOutOfBounds {
+            range: selection,
+            text_len,
+        });
+    }
+    for offset in [selection.start(), selection.end()] {
+        let offset = usize::try_from(offset).map_err(|_| ProjectionError::OffsetOverflow)?;
+        if !text.is_char_boundary(offset) {
+            return Err(ProjectionError::CompositionSelectionNotUtf8Boundary {
+                offset: ByteOffset::try_from(offset)
+                    .map_err(|_| ProjectionError::OffsetOverflow)?,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn append_composition_run_part(
+    runs: &mut Vec<VisualRun>,
+    run: VisualRun,
+    replacement: TextRange,
+    visual_delta: i128,
+) -> Result<(), ProjectionError> {
+    if run.kind() == VisualRunKind::Composition {
+        return Ok(());
+    }
+    let source_start = run.source().start();
+    let source_end = run.source().end();
+    if source_end <= replacement.start() {
+        runs.push(run);
+        return Ok(());
+    }
+    if source_start >= replacement.end() && !replacement.is_empty() {
+        runs.push(shift_run(run, visual_delta)?);
+        return Ok(());
+    }
+    if replacement.is_empty() && source_start >= replacement.start() {
+        runs.push(shift_run(run, visual_delta)?);
+        return Ok(());
+    }
+    if source_start < replacement.start() && run.kind() == VisualRunKind::Visible {
+        runs.push(clip_visible_run(
+            run,
+            source_start,
+            replacement.start().min(source_end),
+            0,
+        )?);
+    }
+    if source_end > replacement.end() && run.kind() == VisualRunKind::Visible {
+        runs.push(clip_visible_run(
+            run,
+            replacement.end().max(source_start),
+            source_end,
+            visual_delta,
+        )?);
+    }
+    Ok(())
+}
+
+fn clip_visible_run(
+    run: VisualRun,
+    source_start: ByteOffset,
+    source_end: ByteOffset,
+    visual_delta: i128,
+) -> Result<VisualRun, ProjectionError> {
+    let start_delta = source_start
+        .get()
+        .checked_sub(run.source().start().get())
+        .ok_or(ProjectionError::OffsetOverflow)?;
+    let end_delta = source_end
+        .get()
+        .checked_sub(run.source().start().get())
+        .ok_or(ProjectionError::OffsetOverflow)?;
+    let visual_start = shift_visual(
+        run.visual()
+            .start()
+            .checked_add(start_delta)
+            .ok_or(ProjectionError::OffsetOverflow)?,
+        visual_delta,
+    )?;
+    let visual_end = shift_visual(
+        run.visual()
+            .start()
+            .checked_add(end_delta)
+            .ok_or(ProjectionError::OffsetOverflow)?,
+        visual_delta,
+    )?;
+    Ok(VisualRun {
+        source: TextRange::new(source_start, source_end).ok_or(ProjectionError::OffsetOverflow)?,
+        visual: VisualRange::new(visual_start, visual_end)
+            .ok_or(ProjectionError::OffsetOverflow)?,
+        kind: run.kind(),
+        style: run.style(),
+    })
+}
+
+fn shift_run(run: VisualRun, visual_delta: i128) -> Result<VisualRun, ProjectionError> {
+    Ok(VisualRun {
+        source: run.source(),
+        visual: VisualRange::new(
+            shift_visual(run.visual().start(), visual_delta)?,
+            shift_visual(run.visual().end(), visual_delta)?,
+        )
+        .ok_or(ProjectionError::OffsetOverflow)?,
+        kind: run.kind(),
+        style: run.style(),
+    })
+}
+
+fn shift_visual(value: VisualOffset, delta: i128) -> Result<VisualOffset, ProjectionError> {
+    if delta >= 0 {
+        let delta = u64::try_from(delta).map_err(|_| ProjectionError::OffsetOverflow)?;
+        value
+            .checked_add(delta)
+            .ok_or(ProjectionError::OffsetOverflow)
+    } else {
+        let delta = u64::try_from(-delta).map_err(|_| ProjectionError::OffsetOverflow)?;
+        value
+            .get()
+            .checked_sub(delta)
+            .map(VisualOffset::new)
+            .ok_or(ProjectionError::OffsetOverflow)
     }
 }
 
@@ -997,6 +1471,27 @@ impl CodeProjection {
             closed: self.closed,
         }))
     }
+
+    /// Projects transient IME text over the code block without changing the
+    /// canonical source or the fenced-code metadata.
+    pub fn with_composition(
+        &self,
+        replacement_range: TextRange,
+        text: impl Into<Arc<str>>,
+        selection_bytes: TextRange,
+    ) -> Result<Self, ProjectionError> {
+        Ok(Self {
+            visual: self
+                .visual
+                .with_composition(replacement_range, text, selection_bytes)?,
+            opening_fence: self.opening_fence,
+            info_string: self.info_string,
+            content: self.content,
+            closing_fence: self.closing_fence,
+            marker: self.marker,
+            closed: self.closed,
+        })
+    }
 }
 
 /// A block projection selected from the Markdown block sequence.
@@ -1037,6 +1532,31 @@ impl BlockProjection {
             }
             _ => Projection::inline_with_definitions(source, block.range(), definitions)
                 .map(Self::Inline),
+        }
+    }
+
+    /// Projects transient IME text over this block's visual projection. The
+    /// block metadata remains source-backed; only the visual projection is
+    /// replaced for the duration of the composition.
+    pub fn with_composition(
+        &self,
+        replacement_range: TextRange,
+        text: impl Into<Arc<str>>,
+        selection_bytes: TextRange,
+    ) -> Result<Self, ProjectionError> {
+        match self {
+            Self::Inline(projection) => projection
+                .with_composition(replacement_range, text, selection_bytes)
+                .map(Self::Inline),
+            Self::FencedCode(projection) => projection
+                .with_composition(replacement_range, text, selection_bytes)
+                .map(Self::FencedCode),
+            Self::ReferenceDefinition(projection) => projection
+                .with_composition(replacement_range, text, selection_bytes)
+                .map(Self::ReferenceDefinition),
+            Self::TaskList(projection) => projection
+                .with_composition(replacement_range, text, selection_bytes)
+                .map(Self::TaskList),
         }
     }
 
@@ -1238,6 +1758,102 @@ mod tests {
                 .expect("source range should be ordered"),
         )
         .expect("projection should build")
+    }
+
+    #[test]
+    fn composition_projects_preedit_without_mutating_source_coordinates() {
+        let source = "hello world";
+        let projection = projection(source);
+        let replacement =
+            TextRange::new(ByteOffset::new(6), ByteOffset::new(11)).expect("replacement range");
+        let selection =
+            TextRange::new(ByteOffset::new(3), ByteOffset::new(3)).expect("selection range");
+        let composed = projection
+            .with_composition(replacement, "日本", selection)
+            .expect("composition projection");
+
+        assert_eq!(composed.revision(), projection.revision());
+        assert_eq!(composed.source().as_str(), source);
+        assert_eq!(composed.composition_text(), Some("日本"));
+        assert_eq!(composed.composition_range(), Some(replacement));
+        assert_eq!(composed.visual_len().get(), 11 - 5 + "日本".len() as u64);
+        assert_eq!(
+            composed
+                .text_for_run(
+                    *composed
+                        .runs()
+                        .iter()
+                        .find(|run| run.kind() == VisualRunKind::Composition)
+                        .expect("composition run")
+                )
+                .expect("preedit text"),
+            "日本"
+        );
+        assert_eq!(
+            composed
+                .source_to_visual(ByteOffset::new(6), ProjectionBias::Before)
+                .expect("source boundary"),
+            VisualOffset::new(6)
+        );
+        assert_eq!(
+            composed
+                .source_to_visual(ByteOffset::new(6), ProjectionBias::After)
+                .expect("source boundary"),
+            VisualOffset::new(6)
+        );
+        assert_eq!(
+            composed
+                .visual_to_source(VisualOffset::new(7), ProjectionBias::Before)
+                .expect("visual boundary"),
+            ByteOffset::new(6)
+        );
+        assert_eq!(
+            composed.composition_selection_visual(),
+            Some(VisualRange::empty(VisualOffset::new(9)))
+        );
+    }
+
+    #[test]
+    fn composition_rejects_non_boundary_selection() {
+        let projection = projection("hello");
+        let replacement = TextRange::empty(ByteOffset::new(5));
+        let selection =
+            TextRange::new(ByteOffset::new(1), ByteOffset::new(2)).expect("selection range");
+        assert!(matches!(
+            projection.with_composition(replacement, "羽", selection),
+            Err(ProjectionError::CompositionSelectionNotUtf8Boundary { .. })
+        ));
+    }
+
+    #[test]
+    fn composition_shifts_suffix_visual_ranges_without_changing_source_ranges() {
+        let projection = projection("hello world again");
+        let replacement =
+            TextRange::new(ByteOffset::new(6), ByteOffset::new(11)).expect("replacement range");
+        let selection = TextRange::empty(ByteOffset::ZERO);
+        let composed = projection
+            .with_composition(replacement, "x", selection)
+            .expect("composition projection");
+
+        assert_eq!(composed.visual_len(), VisualOffset::new(13));
+        assert_eq!(
+            composed
+                .source_to_visual(ByteOffset::new(12), ProjectionBias::After)
+                .expect("suffix source mapping"),
+            VisualOffset::new(8)
+        );
+        assert_eq!(
+            composed
+                .visual_to_source(VisualOffset::new(8), ProjectionBias::After)
+                .expect("suffix visual mapping"),
+            ByteOffset::new(12)
+        );
+        assert!(composed.runs().iter().any(|run| {
+            run.kind() == VisualRunKind::Composition
+                && run.visual()
+                    == VisualRange::new(VisualOffset::new(6), VisualOffset::new(7))
+                        .expect("composition visual range")
+        }));
     }
 
     #[test]

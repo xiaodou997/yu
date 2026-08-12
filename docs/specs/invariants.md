@@ -327,3 +327,8 @@
     serial 和 cache handoff 全部成功后才提交 atlas page fingerprint。组装失败、stale/cache 拒绝或
     serial overflow 不得改变调用方 builder、已有 cache、last publication 或 next serial，随后用同一
     builder retry 必须重新产生与直接成功等价的 upload plan。
+18. `Projection::with_composition` 只能生成 transient `VisualRunKind::Composition`，不得修改
+    `TextSnapshot`、Markdown CST、source Revision 或 parser-owned delimiter runs；composition run
+    的 shaping 坐标必须是临时零基 range，layout 产生的 glyph/cluster 必须映射回 canonical
+    replacement range。`EditorDocument::block_layout_with_composition*` 不得写入 LayoutCache，
+    composition 更新、cancel 和 stale commit 不得增加 history 或推进 Revision。
