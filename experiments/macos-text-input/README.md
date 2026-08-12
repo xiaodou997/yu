@@ -69,6 +69,10 @@ UTF-16 caret，分别以 upstream/downstream affinity 调用 revision-bound Rust
 visual UTF-16 相同，但 round-trip source 分别停在 delimiter 前后；stale Revision 与
 surrogate split 由 Rust 单测覆盖。self-check 会恢复原始窗口文本，不改变产品 UI。
 
+同一检查还会查询第二个 Markdown block 的 `**block**` delimiter。Rust 返回该 block 的 index
+和从 block 起点计算的 visual UTF-16，Swift 不累加前一个 block 的 visual 长度；这验证了
+block projection cache 可以直接作为后续 caret geometry/reveal 的输入边界。
+
 启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
 和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
 

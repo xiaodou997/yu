@@ -1133,6 +1133,26 @@ mod tests {
     }
 
     #[test]
+    fn block_sequence_resolves_source_caret_boundaries_without_linear_scan() {
+        let source = "# title\n\nparagraph\n";
+        let buffer = TextBuffer::new(source);
+        let document = parse(&buffer.snapshot());
+        let blocks = document.blocks();
+
+        assert_eq!(blocks.block_index_for_offset(ByteOffset::new(0)), Some(0));
+        assert_eq!(blocks.block_index_for_offset(ByteOffset::new(8)), Some(1));
+        assert_eq!(blocks.block_index_for_offset(ByteOffset::new(9)), Some(2));
+        assert_eq!(
+            blocks.block_index_for_offset(ByteOffset::new(source.len() as u64)),
+            Some(2)
+        );
+        assert_eq!(
+            blocks.block_index_for_offset(ByteOffset::new(source.len() as u64 + 1)),
+            None
+        );
+    }
+
+    #[test]
     fn scanner_preserves_phase_one_line_classification_rules() {
         let cases = [
             ("   # title\n", BlockKind::AtxHeading { level: 1 }),
