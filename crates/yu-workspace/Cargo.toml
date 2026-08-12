@@ -1,0 +1,19 @@
+[package]
+name = "yu-workspace"
+description = "Editor-to-scene integration boundary for Yu workspace surfaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-core = { path = "../yu-core" }
+yu-editor = { path = "../yu-editor" }
+yu-font = { path = "../yu-font" }
+yu-render = { path = "../yu-render" }
+yu-scene = { path = "../yu-scene" }
+
+[lints]
+workspace = true
