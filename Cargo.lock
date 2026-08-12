@@ -178,3 +178,14 @@ version = "0.1.0"
 dependencies = [
  "yu-core",
 ]
+
+[[package]]
+name = "yu-workspace"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
+ "yu-editor",
+ "yu-font",
+ "yu-render",
+ "yu-scene",
+]

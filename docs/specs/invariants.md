@@ -151,6 +151,10 @@
 32. `SceneBuilder::append_viewport` 必须按 `ViewportSceneInput` 顺序预检全部 block layout；所有
     Revision/source/atlas/geometry/budget 检查成功前不得追加任何 primitive。批量提交必须同时更新
     primitive 与 damage，失败不得发布 viewport 前缀；layout 只能按 geometry origin 平移。
+33. `yu-workspace::assemble_viewport_scene` 必须从同一次 `EditorDocument::visible_blocks_with_shaper`
+    结果建立 `ViewportSceneInput`，再按相同 block index/config 取得 shaped layout；它不得复制或
+    修改 HeightIndex、source、selection、composition 或 history。返回的 `ViewportSceneFrame`、
+    `Scene` 与 `RenderPlan` 必须共享该结果的 Revision，任何 layout/atlas 失败都不得发布部分 scene。
 
 ## Accessibility
 

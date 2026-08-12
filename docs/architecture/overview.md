@@ -51,9 +51,12 @@ yu-core      yu-inspect                    block layout     ProjectionCache   ma
                                                    │
                                                    ▼
                                                yu-render
-                                                     ▲
-                                                     │
-                                                  yu-font
+                                                    ▲
+                                                    │
+                                           yu-workspace
+                                           ▲     ▲     ▲
+                                           │     │     │
+                                      yu-editor yu-scene yu-font
 ```
 
 后续预计增加：
@@ -310,6 +313,12 @@ origin，绝不根据 kind 或 source 重新布局。这样 FFI/native host、ed
 顺序预检所有 layout、source range、Revision、atlas entry、glyph bounds 和 primitive budget，
 然后一次性发布 glyph primitives 与 damage。任何一个 block 失败都不会留下 viewport 前缀；这
 使 stale frame 可以整体丢弃并在新的 Revision 重试，而不会让 renderer 接收到部分窗口。
+
+`yu-workspace::assemble_viewport_scene` 是 editor 到 retained scene 的组合边界。它只消费
+`EditorDocument::visible_blocks_with_shaper` 返回的当前 Revision metadata，并按同一 block index
+取得 shaped `LayoutSnapshot`；随后交给 `ViewportSceneInput` 和 `SceneBuilder::append_viewport`。
+因此 macOS host 不需要复制 Markdown block traversal、HeightIndex 或 layout cache，后续窗口/Metal
+层只消费 `ViewportSceneFrame`/`RenderPlan`。
 
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据

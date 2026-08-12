@@ -56,6 +56,7 @@ crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
 crates/yu-font          font fallback、GlyphRun、metrics/rasterization 契约与 CPU glyph atlas
 crates/yu-scene         revision-bound retained primitives、viewport 与 damage tracking
 crates/yu-render        backend-neutral render plan 与 atlas page upload boundary
+crates/yu-workspace     EditorDocument → ViewportSceneInput → Scene → RenderPlan 集成层
 platform/macos/yu-font-macos  macOS-only CoreText 字体目录、fallback、shaping 与 glyph rasterization 适配
 platform/macos/yu-render-macos macOS-only Metal device、NSView layer attachment、clear/render plan frame、damage/scissor、pipeline 与 alpha atlas upload 适配
 tools/yu-inspect        Markdown 结构检查 CLI
@@ -136,6 +137,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Shaped viewport block snapshot](docs/adr/0064-shaped-viewport-block-snapshot.md)
 - [Viewport scene input](docs/adr/0065-viewport-scene-input.md)
 - [Batched viewport scene assembly](docs/adr/0066-batched-viewport-scene-assembly.md)
+- [Editor viewport scene integration](docs/adr/0067-editor-viewport-scene-integration.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

@@ -49,6 +49,24 @@ pub enum BlockKind {
     },
 }
 
+impl BlockKind {
+    /// Stable scalar used when block metadata crosses the editor/scene/native
+    /// boundary. The values are intentionally independent of Rust enum layout.
+    #[must_use]
+    pub const fn viewport_tag(self) -> u8 {
+        match self {
+            Self::BlankLine => 0,
+            Self::ReferenceDefinition => 1,
+            Self::Paragraph => 2,
+            Self::AtxHeading { .. } => 3,
+            Self::FencedCodeBlock { .. } => 4,
+            Self::BlockQuote { .. } => 5,
+            Self::ListItem { .. } => 6,
+            Self::TaskListItem { .. } => 7,
+        }
+    }
+}
+
 /// Parser state at a reusable block boundary.
 ///
 /// A parser state at a reusable block boundary. Phase 1 materializes complete

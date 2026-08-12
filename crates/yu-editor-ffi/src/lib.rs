@@ -1892,16 +1892,19 @@ fn projected_utf8(projection: &Projection) -> Result<String, i32> {
 
 #[cfg(target_os = "macos")]
 fn viewport_block_kind(kind: BlockKind) -> u8 {
-    match kind {
-        BlockKind::BlankLine => YU_VIEWPORT_BLOCK_BLANK,
-        BlockKind::ReferenceDefinition => YU_VIEWPORT_BLOCK_REFERENCE_DEFINITION,
-        BlockKind::Paragraph => YU_VIEWPORT_BLOCK_PARAGRAPH,
-        BlockKind::AtxHeading { .. } => YU_VIEWPORT_BLOCK_HEADING,
-        BlockKind::FencedCodeBlock { .. } => YU_VIEWPORT_BLOCK_FENCED_CODE,
-        BlockKind::BlockQuote { .. } => YU_VIEWPORT_BLOCK_QUOTE,
-        BlockKind::ListItem { .. } => YU_VIEWPORT_BLOCK_LIST,
-        BlockKind::TaskListItem { .. } => YU_VIEWPORT_BLOCK_TASK_LIST,
-    }
+    let tag = kind.viewport_tag();
+    debug_assert!(matches!(
+        tag,
+        YU_VIEWPORT_BLOCK_BLANK
+            | YU_VIEWPORT_BLOCK_REFERENCE_DEFINITION
+            | YU_VIEWPORT_BLOCK_PARAGRAPH
+            | YU_VIEWPORT_BLOCK_HEADING
+            | YU_VIEWPORT_BLOCK_FENCED_CODE
+            | YU_VIEWPORT_BLOCK_QUOTE
+            | YU_VIEWPORT_BLOCK_LIST
+            | YU_VIEWPORT_BLOCK_TASK_LIST
+    ));
+    tag
 }
 
 fn utf16_offset_in_utf8(source: &str, byte_offset: u64) -> Result<u64, i32> {

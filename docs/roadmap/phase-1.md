@@ -86,6 +86,7 @@
 - [x] CoreText shaped viewport block snapshot、count/fill ABI 与 block origin self-check
 - [x] `ViewportSceneInput` metadata validation 与 block-local layout document-origin append
 - [x] 多 block viewport scene batch preflight、document-space assembly 与失败原子性
+- [x] `yu-workspace` editor viewport → scene → render-plan 无窗口集成 vertical slice
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -143,6 +144,9 @@
 9g. 多 block viewport scene 必须先完成全量 layout/atlas/budget 预检，再一次性发布 primitives 与
     damage；任一 block 失败不得留下 viewport 前缀，且 block 顺序与 document-space origin 必须
     可由测试稳定复现。
+9h. `EditorDocument::visible_blocks_with_shaper` 到 `ViewportSceneInput`、`Scene` 和 `RenderPlan`
+    必须有真实跨 crate 测试；组装层不得引入第二套 block traversal/HeightIndex，且 missing atlas
+    或 layout failure 必须保持 scene 未发布。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可
