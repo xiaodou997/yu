@@ -39,6 +39,23 @@ private struct RustCaretScrollResult {
     let needsScroll: Bool
 }
 
+private struct RustShapedViewportBlock {
+    let revision: UInt64
+    let index: Int
+    let sourceRange: NSRange
+    let y: CGFloat
+    let height: CGFloat
+    let measured: Bool
+    let kind: UInt8
+}
+
+private struct RustShapedViewportSnapshot {
+    let revision: UInt64
+    let range: Range<Int>
+    let contentHeight: CGFloat
+    let blocks: [RustShapedViewportBlock]
+}
+
 private struct RustProjectionCaret {
     let revision: UInt64
     let source: Int
@@ -695,6 +712,72 @@ private final class RustCompositionBridge {
             targetScrollY: CGFloat(result.target_scroll_y),
             margin: CGFloat(result.margin),
             needsScroll: result.needs_scroll != 0
+        )
+    }
+
+    func shapedViewportBlocks(
+        size: CGFloat,
+        maxWidth: CGFloat,
+        scrollY: CGFloat,
+        viewportHeight: CGFloat
+    ) -> RustShapedViewportSnapshot {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        let expectedRevision = revision()
+        var header = YuShapedViewportSnapshot()
+        var required = 0
+        let countStatus = yu_macos_composition_session_shaped_viewport_blocks(
+            session,
+            expectedRevision,
+            Float(size),
+            Float(maxWidth),
+            Float(scrollY),
+            Float(viewportHeight),
+            &header,
+            nil,
+            0,
+            &required
+        )
+        precondition(countStatus == 0, "Rust shaped viewport block count failed: \(countStatus)")
+        var values = [YuShapedViewportBlock](
+            repeating: YuShapedViewportBlock(),
+            count: required
+        )
+        var written = 0
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_macos_composition_session_shaped_viewport_blocks(
+                session,
+                expectedRevision,
+                Float(size),
+                Float(maxWidth),
+                Float(scrollY),
+                Float(viewportHeight),
+                &header,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        precondition(fillStatus == 0, "Rust shaped viewport block fill failed: \(fillStatus)")
+        precondition(written == required, "Rust shaped viewport block count changed during fill")
+        let blocks = values.map { value in
+            RustShapedViewportBlock(
+                revision: value.revision,
+                index: Int(value.block_index),
+                sourceRange: NSRange(
+                    location: Int(value.source_start_utf16),
+                    length: Int(value.source_end_utf16 - value.source_start_utf16)
+                ),
+                y: CGFloat(value.y),
+                height: CGFloat(value.height),
+                measured: value.measured != 0,
+                kind: value.kind
+            )
+        }
+        return RustShapedViewportSnapshot(
+            revision: header.revision,
+            range: Int(header.block_start)..<Int(header.block_end),
+            contentHeight: CGFloat(header.content_height),
+            blocks: blocks
         )
     }
 
@@ -1558,6 +1641,27 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(request.targetScrollY.isFinite && request.targetScrollY >= 0)
         precondition(request.targetScrollY <= request.caretY + 0.001)
         precondition(request.needsScroll)
+
+        let viewport = rustComposition.shapedViewportBlocks(
+            size: font.pointSize,
+            maxWidth: 600,
+            scrollY: request.targetScrollY,
+            viewportHeight: nativeMetrics.lineHeight
+        )
+        precondition(viewport.revision == request.revision)
+        precondition(viewport.range.lowerBound <= request.block)
+        precondition(viewport.range.upperBound > request.block)
+        precondition(viewport.contentHeight.isFinite && viewport.contentHeight > 0)
+        precondition(viewport.blocks.allSatisfy { block in
+            block.revision == viewport.revision
+                && block.sourceRange.location >= 0
+                && block.sourceRange.length >= 0
+                && block.y.isFinite
+                && block.height.isFinite
+                && block.height > 0
+        })
+        precondition(viewport.blocks.contains { $0.index == request.block && $0.measured })
+        precondition(viewport.blocks.map(\.y).isStrictlyIncreasingOrEqual)
 
         replaceStorage(
             range: NSRange(location: 0, length: textStorage.length),
@@ -2530,6 +2634,12 @@ final class TextInputView: NSView, NSTextInputClient {
             width: 1.5,
             height: max(line.height, 26)
         )
+    }
+}
+
+private extension Array where Element == CGFloat {
+    var isStrictlyIncreasingOrEqual: Bool {
+        zip(self, dropFirst()).allSatisfy { $0 <= $1 }
     }
 }
 
