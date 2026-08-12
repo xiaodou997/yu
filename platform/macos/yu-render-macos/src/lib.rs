@@ -1206,6 +1206,11 @@ impl MetalViewportHostSession {
     }
 
     #[must_use]
+    pub fn frame_handle(&self) -> Option<std::sync::Arc<ViewportRenderFrame>> {
+        self.frame_cache.current_frame_handle(self.current_revision)
+    }
+
+    #[must_use]
     pub const fn frame_serial(&self) -> Option<u64> {
         self.frame_serial
     }
@@ -1275,9 +1280,10 @@ impl MetalViewportHostSession {
     /// Accepts an owned publication produced by `yu_workspace`.
     ///
     /// The publication's Revision and serial become the host-visible frame
-    /// identity. The frame is copied into the host's revision-aware cache only
-    /// after both identities have passed validation, so a stale or reordered
-    /// publication cannot disturb a currently submit-able frame.
+    /// identity. The immutable frame handle is shared with the host's
+    /// revision-aware cache only after both identities have passed validation,
+    /// so a stale or reordered publication cannot disturb a currently
+    /// submit-able frame or trigger a scene/plan deep copy.
     pub fn accept_publication(
         &mut self,
         publication: ViewportFramePublication,
@@ -1304,8 +1310,9 @@ impl MetalViewportHostSession {
         }
 
         let serial = publication.serial();
+        let frame = publication.frame_handle();
         self.frame_cache
-            .publish_if_current(self.current_revision, publication.frame().clone())
+            .publish_shared_if_current(self.current_revision, frame)
             .map_err(MetalViewportHostError::Frame)?;
         self.next_frame_serial = self.next_frame_serial.max(serial);
         self.frame_serial = Some(serial);
@@ -1986,15 +1993,22 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn viewport_host_session_accepts_workspace_publication_once_in_order() {
+        use std::sync::Arc;
+
         let publication = appkit_probe_publication();
         let revision = publication.revision();
         let serial = publication.serial();
+        let publication_handle = publication.frame_handle();
         let mut session = MetalViewportHostSession::new(revision, 0);
 
         assert_eq!(session.accept_publication(publication.clone()), Ok(serial));
         assert_eq!(session.current_revision(), revision);
         assert_eq!(session.frame_revision(), Some(revision));
         assert_eq!(session.frame_serial(), Some(serial));
+        assert!(Arc::ptr_eq(
+            &session.frame_handle().expect("host frame handle"),
+            &publication_handle
+        ));
         assert_eq!(
             session.accept_publication(publication),
             Err(MetalViewportHostError::PublicationSerialRegression {
