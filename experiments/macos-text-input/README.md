@@ -64,6 +64,11 @@ line 的 source/visual UTF-16 range；Swift 用返回文本建立临时 TextKit 
 link destination 不占 visual width，同时 source range 仍覆盖 canonical Markdown。该检查使用
 宽容器和显式换行，专门隔离 projection mapping，不宣称自然语言 word-break 已与 TextKit 等价。
 
+随后运行 `Projection caret self-check`：Swift 将一个隐藏 `**` delimiter 边界作为 source
+UTF-16 caret，分别以 upstream/downstream affinity 调用 revision-bound Rust FFI。两次查询的
+visual UTF-16 相同，但 round-trip source 分别停在 delimiter 前后；stale Revision 与
+surrogate split 由 Rust 单测覆盖。self-check 会恢复原始窗口文本，不改变产品 UI。
+
 启动时还会运行 `Unicode composition self-check`：回放日文 preedit、组合重音 preedit、commit
 和 cancel，并在结束时恢复窗口原文。这是协议级回放，不替代切换真实日文输入源后的人工验证。
 
