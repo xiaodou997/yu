@@ -88,6 +88,7 @@
 - [x] 多 block viewport scene batch preflight、document-space assembly 与失败原子性
 - [x] `yu-workspace` editor viewport → scene → render-plan 无窗口集成 vertical slice
 - [x] revision-aware `ViewportRenderFrame` cache、stale discard 与 publish gate
+- [x] macOS Metal `ViewportRenderFrame` revision-aware consumer（native command path 前 gate、成功后 commit）
 - [x] macOS CoreText glyph metrics/alpha rasterization、owned CPU glyph atlas 与 metrics cache
 - [x] revision-bound `yu-scene` retained primitives、viewport 与 damage coalescing
 - [x] backend-neutral `yu-render` render plan、atlas page fingerprint upload 与 stale-entry 检查
@@ -151,6 +152,9 @@
 9i. scene 与 render plan 必须以同一 Revision 组成 `ViewportRenderFrame`；cache 发布必须拒绝
     stale/回退结果，编辑后旧 frame 可整体丢弃，新 Revision frame 才能替换，且不得引入窗口或
     GPU ownership。
+9j. macOS `MetalFrameConsumer` 必须在 native command conversion 前拒绝 current Revision 不匹配或
+    较旧回退的 `ViewportRenderFrame`，只有 `render_plan` 成功后才能记录新 Revision；无窗口测试
+    必须覆盖 stale/reorder 且 backend failure 不得改变已接受 Revision。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

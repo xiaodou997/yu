@@ -325,6 +325,12 @@ origin，绝不根据 kind 或 source 重新布局。这样 FFI/native host、ed
 编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、
 HeightIndex、native object 或 GPU handle，只保存最近一次可提交的 owned frame。
 
+macOS backend 在这个 cache 之后再设一层 `MetalFrameConsumer`：`MetalFrameRenderer::render_viewport_frame`
+只有在 workspace frame 与 host current Revision 相同、且不早于已接受 Revision 时才进入
+`render_plan` 的 command conversion 和 native Metal path。成功返回后才记录 Revision；缺页、target、
+drawable 或 native encoder 失败都不会推进 consumer。consumer 不持有 editor/source/layout 或 GPU
+对象，并可通过 revision-only 单元测试覆盖 stale 与回退，而无需创建窗口。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

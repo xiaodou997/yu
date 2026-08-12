@@ -159,6 +159,10 @@
     能发布等于调用方当前 Revision 的 frame，必须拒绝 stale frame 和较旧 Revision 回退，并在
     `invalidate_stale`/替换时保持 scene+plan 原子。cache 不得持有 source、EditorDocument、
     HeightIndex、native object 或 GPU handle。
+35. `MetalFrameConsumer` 只能接受等于 macOS host current Revision 且不早于其最后接受 Revision 的
+    `ViewportRenderFrame`；检查必须发生在 native command conversion 之前，只有 `render_plan` 成功
+    后才能推进 consumer Revision。stale、回退或 backend 失败不得改变已接受 Revision，consumer
+    不得持有 source、layout、native object 或 GPU handle。
 
 ## Accessibility
 

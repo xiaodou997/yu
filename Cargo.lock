@@ -161,6 +161,7 @@ dependencies = [
  "yu-font",
  "yu-render",
  "yu-scene",
+ "yu-workspace",
 ]
 
 [[package]]

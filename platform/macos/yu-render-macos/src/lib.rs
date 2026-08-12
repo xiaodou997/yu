@@ -18,8 +18,10 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
+use yu_core::Revision;
 use yu_render::{AtlasPageUpload, RenderCommand, RenderPlan, RenderUploader};
 use yu_scene::Rgba8;
+use yu_workspace::ViewportRenderFrame;
 
 #[cfg(target_os = "macos")]
 mod native {
@@ -181,9 +183,16 @@ pub enum MetalRenderError {
     InvalidDamageRect(&'static str),
     DeviceMismatch,
     InvalidSurfaceConfig(&'static str),
-    InvalidPixelBuffer { expected: usize, actual: usize },
+    InvalidPixelBuffer {
+        expected: usize,
+        actual: usize,
+    },
     NativeFailure(&'static str),
     GenerationOverflow,
+    StaleRevision {
+        expected: Revision,
+        actual: Revision,
+    },
 }
 
 impl fmt::Display for MetalRenderError {
@@ -240,6 +249,10 @@ impl fmt::Display for MetalRenderError {
             }
             Self::NativeFailure(message) => formatter.write_str(message),
             Self::GenerationOverflow => formatter.write_str("Metal surface generation overflowed"),
+            Self::StaleRevision { expected, actual } => write!(
+                formatter,
+                "Metal frame revision {actual:?} is stale for current {expected:?}"
+            ),
         }
     }
 }
@@ -972,6 +985,7 @@ pub struct MetalFrameRenderer {
     target: Option<MetalRenderTarget>,
     needs_full_clear: bool,
     last_surface_generation: Option<u64>,
+    frame_consumer: MetalFrameConsumer,
 }
 
 impl fmt::Debug for MetalFrameRenderer {
@@ -983,6 +997,7 @@ impl fmt::Debug for MetalFrameRenderer {
             .field("target", &self.target)
             .field("needs_full_clear", &self.needs_full_clear)
             .field("last_surface_generation", &self.last_surface_generation)
+            .field("frame_consumer", &self.frame_consumer)
             .finish()
     }
 }
@@ -996,6 +1011,7 @@ impl MetalFrameRenderer {
             target: None,
             needs_full_clear: true,
             last_surface_generation: None,
+            frame_consumer: MetalFrameConsumer::new(),
         })
     }
 
@@ -1168,9 +1184,97 @@ impl MetalFrameRenderer {
         }
     }
 
+    /// Consumes a workspace frame only when it still belongs to the native
+    /// host's current source Revision. The revision gate runs before command
+    /// conversion; successful Metal submission records the accepted Revision
+    /// only after `render_plan` succeeds.
+    pub fn render_viewport_frame(
+        &mut self,
+        surface: &MetalSurface,
+        current_revision: Revision,
+        frame: &ViewportRenderFrame,
+        atlas: &MetalAtlas,
+    ) -> Result<(), MetalRenderError> {
+        self.frame_consumer.validate(current_revision, frame)?;
+        self.render_plan(surface, frame.plan(), atlas)?;
+        self.frame_consumer.commit(current_revision, frame)
+    }
+
     #[must_use]
     pub const fn queue(&self) -> &MetalCommandQueue {
         &self.queue
+    }
+}
+
+/// Revision gate between `yu-workspace` frames and the Metal renderer.
+///
+/// It has no native pointers and can be exercised without a Metal device or
+/// window. The renderer owns one instance so a successful backend submission
+/// cannot be followed by an older frame silently replacing it.
+#[derive(Clone, Debug, Default)]
+pub struct MetalFrameConsumer {
+    last_revision: Option<Revision>,
+}
+
+impl MetalFrameConsumer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn last_revision(&self) -> Option<Revision> {
+        self.last_revision
+    }
+
+    pub fn validate(
+        &self,
+        current_revision: Revision,
+        frame: &ViewportRenderFrame,
+    ) -> Result<(), MetalRenderError> {
+        self.validate_revision(current_revision, frame.revision())
+    }
+
+    pub fn validate_revision(
+        &self,
+        current_revision: Revision,
+        frame_revision: Revision,
+    ) -> Result<(), MetalRenderError> {
+        if frame_revision != current_revision {
+            return Err(MetalRenderError::StaleRevision {
+                expected: current_revision,
+                actual: frame_revision,
+            });
+        }
+        if let Some(last_revision) = self.last_revision
+            && last_revision > frame_revision
+        {
+            return Err(MetalRenderError::StaleRevision {
+                expected: last_revision,
+                actual: frame_revision,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn commit(
+        &mut self,
+        current_revision: Revision,
+        frame: &ViewportRenderFrame,
+    ) -> Result<(), MetalRenderError> {
+        self.validate(current_revision, frame)?;
+        self.last_revision = Some(frame.revision());
+        Ok(())
+    }
+
+    pub fn commit_revision(
+        &mut self,
+        current_revision: Revision,
+        frame_revision: Revision,
+    ) -> Result<(), MetalRenderError> {
+        self.validate_revision(current_revision, frame_revision)?;
+        self.last_revision = Some(frame_revision);
+        Ok(())
     }
 }
 
@@ -1353,6 +1457,44 @@ mod tests {
         assert!(MetalSurfaceConfig::new(0.0, 10.0, 2.0).is_err());
         assert!(MetalSurfaceConfig::new(10.0, f64::NAN, 2.0).is_err());
         assert!(MetalSurfaceConfig::new(10.0, 10.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn metal_frame_consumer_rejects_stale_frames_and_revision_rollback() {
+        use yu_core::Revision;
+
+        let revision_one = Revision::new(1);
+        let revision_two = Revision::new(2);
+        let mut consumer = MetalFrameConsumer::new();
+
+        assert_eq!(consumer.last_revision(), None);
+        consumer
+            .commit_revision(revision_one, revision_one)
+            .expect("first frame");
+        assert_eq!(consumer.last_revision(), Some(revision_one));
+
+        assert_eq!(
+            consumer.validate_revision(revision_two, revision_one),
+            Err(MetalRenderError::StaleRevision {
+                expected: revision_two,
+                actual: revision_one,
+            })
+        );
+        assert_eq!(consumer.last_revision(), Some(revision_one));
+
+        consumer
+            .commit_revision(revision_two, revision_two)
+            .expect("new frame");
+        assert_eq!(consumer.last_revision(), Some(revision_two));
+
+        assert_eq!(
+            consumer.validate_revision(revision_one, revision_one),
+            Err(MetalRenderError::StaleRevision {
+                expected: revision_two,
+                actual: revision_one,
+            })
+        );
+        assert_eq!(consumer.last_revision(), Some(revision_two));
     }
 
     #[test]
