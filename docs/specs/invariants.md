@@ -113,6 +113,11 @@
     唯一生成；每条 line 同时携带合法且有序的 source/visual UTF-16 range，hidden syntax 可以
     让 visual range 变短但不能改写 source。Swift 临时 TextKit mirror 只能消费返回文本，
     zero-width trailing caret line 必须保持零宽并从 source-consuming line comparison 中排除。
+26. `yu_composition_session_projection_caret` 必须携带 expected Revision，并在 Projection
+    `Before/After` bias 下返回合法的 source/visual UTF-16 boundary 与 round-trip source；stale
+    Revision、surrogate split、未知 affinity 或 projection range 错误必须拒绝且不写入半成品
+    output。查询不得修改 source、selection、composition、history 或 Revision，平台只能消费
+    owned scalar，不得取得 Projection/TextSnapshot 指针。
 
 ## Accessibility
 

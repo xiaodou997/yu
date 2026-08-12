@@ -267,6 +267,13 @@ syntax 的宽度由 Rust projection 决定，平台层不会复制 Markdown pars
 用宽容器和显式换行隔离 source/visual 映射；shared grapheme wrapping 与 TextKit 自然语言
 word-break 的差异仍是后续独立议题。
 
+在该 probe 之后，`yu_composition_session_projection_caret` 提供更窄的 revision-bound source
+caret 查询：Rust 以当前 `EditorDocument` 的 parser-owned projection 将 source UTF-16 boundary
+映射为 visual UTF-16，并按 `ProjectionBias::Before/After` 返回同一 visual boundary 的
+round-trip source。Swift 只传 `NSSelectionAffinity`、expected Revision 和 scalar 结果；stale
+Revision、surrogate split 或未知 affinity 都在 FFI 边界拒绝。该查询不改变 source、selection、
+composition、history 或 Revision，且暂不携带 line/point/CoreText 对象。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

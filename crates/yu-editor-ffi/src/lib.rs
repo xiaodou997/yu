@@ -6,8 +6,8 @@ use yu_core::{ByteOffset, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     CaretAffinity, CaretScrollRequest, CommandResult, EditorCommand, EditorDocument,
     EditorDocumentError, EditorKey, EditorSelection, KeyEvent, KeyModifiers, KeyRouteResult,
-    LayoutConfig, LayoutSnapshot, Projection, SelectionError, SourceSync, ViewportConfig,
-    ViewportRect, VisualRunKind,
+    LayoutConfig, LayoutSnapshot, Projection, ProjectionBias, SelectionError, SourceSync,
+    ViewportConfig, ViewportRect, VisualRunKind,
 };
 use yu_text::{EditError, TextSnapshot};
 
@@ -133,6 +133,21 @@ pub struct YuCoreTextProjectedLine {
     pub visual_start_utf16: u64,
     pub visual_end_utf16: u64,
     pub width: f32,
+}
+
+/// Revision-bound source/visual caret mapping returned by the projection
+/// diagnostic. `source_utf16` is the validated input boundary; the visual
+/// position is in the projected UTF-16 stream. `round_trip_source_utf16`
+/// makes the hidden-syntax affinity decision observable without exposing the
+/// projection object across FFI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuProjectionCaret {
+    pub revision: u64,
+    pub source_utf16: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub affinity: u8,
 }
 
 /// Opaque state owned by the Rust side of the native composition bridge.
@@ -836,6 +851,88 @@ pub unsafe extern "C" fn yu_composition_session_set_selection(
         .map_or_else(status_from_selection_error, |_| YU_FFI_OK)
 }
 
+/// Resolves one canonical source caret through the current Markdown
+/// projection. The query is bound to `expected_revision`; a stale native
+/// position is rejected before any projection work is performed. Upstream
+/// maps to [`ProjectionBias::Before`] and downstream maps to
+/// [`ProjectionBias::After`], so a caret at hidden delimiters can preserve
+/// which side of the syntax it belongs to.
+///
+/// The query is read-only: it does not change source, selection, history,
+/// composition state, or revision.
+///
+/// # Safety
+/// `session` must be null or a live handle. `output` must point to writable
+/// storage for one [`YuProjectionCaret`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_composition_session_projection_caret(
+    session: *mut YuCompositionSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    affinity: u8,
+    output: *mut YuProjectionCaret,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_FFI_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_FFI_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuProjectionCaret::default() };
+
+    if let Err(status) = validate_revision(session, expected_revision) {
+        return status;
+    }
+    let bias = match affinity {
+        YU_CARET_AFFINITY_UPSTREAM => ProjectionBias::Before,
+        YU_CARET_AFFINITY_DOWNSTREAM => ProjectionBias::After,
+        _ => return YU_FFI_INVALID_SELECTION,
+    };
+
+    let snapshot = session.document.snapshot();
+    let source = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) {
+        Ok(offset) => offset,
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    let source_range = match TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()) {
+        Some(range) => range,
+        None => return YU_FFI_INVALID_RANGE,
+    };
+    let projection = match session.document.projection(source_range) {
+        Ok(projection) => projection,
+        Err(error) => return status_from_document_error(error),
+    };
+    let visual = match projection.source_to_visual(source, bias) {
+        Ok(visual) => visual,
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    let visual_utf16 = match visual_utf16_offset(projection, visual.get()) {
+        Ok(offset) => offset,
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    let round_trip = match projection.visual_to_source(visual, bias) {
+        Ok(source) => source,
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+    let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_FFI_INVALID_RANGE,
+    };
+
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuProjectionCaret {
+            revision: snapshot.revision().get(),
+            source_utf16,
+            visual_utf16,
+            round_trip_source_utf16,
+            affinity,
+        };
+    }
+    YU_FFI_OK
+}
+
 /// Applies native viewport metrics to the revision-bound Rust layout policy.
 ///
 /// The metrics-only backend uses `default_advance` for grapheme clusters that
@@ -1259,7 +1356,6 @@ fn query_core_text_projected_layout(
     Ok((lines, projected))
 }
 
-#[cfg(target_os = "macos")]
 fn projected_utf8(projection: &Projection) -> Result<String, i32> {
     let mut bytes = Vec::new();
     for run in projection.runs() {
@@ -1293,7 +1389,6 @@ fn projected_utf8(projection: &Projection) -> Result<String, i32> {
     String::from_utf8(bytes).map_err(|_| YU_FFI_LAYOUT_FAILED)
 }
 
-#[cfg(target_os = "macos")]
 fn utf16_offset_in_utf8(source: &str, byte_offset: u64) -> Result<u64, i32> {
     let byte_offset = usize::try_from(byte_offset).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
     let prefix = source
@@ -1302,6 +1397,63 @@ fn utf16_offset_in_utf8(source: &str, byte_offset: u64) -> Result<u64, i32> {
         .ok_or(YU_FFI_LAYOUT_FAILED)?;
     let prefix = std::str::from_utf8(prefix).map_err(|_| YU_FFI_LAYOUT_FAILED)?;
     u64::try_from(prefix.encode_utf16().count()).map_err(|_| YU_FFI_LAYOUT_FAILED)
+}
+
+/// Converts a projection visual byte boundary to UTF-16 without materializing
+/// the complete projected text. Visible and line-break runs preserve their
+/// source byte ranges; hidden runs contribute no visual or UTF-16 units.
+fn visual_utf16_offset(projection: &Projection, visual: u64) -> Result<u64, i32> {
+    if visual > projection.visual_len().get() {
+        return Err(YU_FFI_INVALID_RANGE);
+    }
+    let snapshot = projection.source();
+    let mut visual_units = 0_u64;
+    for run in projection.runs() {
+        if run.kind() == VisualRunKind::HiddenSyntax {
+            continue;
+        }
+        let visual_range = run.visual();
+        if visual < visual_range.start().get() {
+            return Err(YU_FFI_INVALID_RANGE);
+        }
+        let source_start = run.source().start();
+        let source_start_utf16 = snapshot
+            .utf16_offset(source_start)
+            .map_err(|_| YU_FFI_INVALID_RANGE)?
+            .get();
+        if visual <= visual_range.end().get() {
+            let local_bytes = visual
+                .checked_sub(visual_range.start().get())
+                .ok_or(YU_FFI_INVALID_RANGE)?;
+            let source_end = source_start
+                .checked_add(local_bytes)
+                .ok_or(YU_FFI_INVALID_RANGE)?;
+            if source_end > run.source().end() {
+                return Err(YU_FFI_INVALID_RANGE);
+            }
+            let source_end_utf16 = snapshot
+                .utf16_offset(source_end)
+                .map_err(|_| YU_FFI_INVALID_RANGE)?
+                .get();
+            let local_units = source_end_utf16
+                .checked_sub(source_start_utf16)
+                .ok_or(YU_FFI_INVALID_RANGE)?;
+            return visual_units
+                .checked_add(local_units)
+                .ok_or(YU_FFI_INVALID_RANGE);
+        }
+        let source_end_utf16 = snapshot
+            .utf16_offset(run.source().end())
+            .map_err(|_| YU_FFI_INVALID_RANGE)?
+            .get();
+        let run_units = source_end_utf16
+            .checked_sub(source_start_utf16)
+            .ok_or(YU_FFI_INVALID_RANGE)?;
+        visual_units = visual_units
+            .checked_add(run_units)
+            .ok_or(YU_FFI_INVALID_RANGE)?;
+    }
+    Ok(visual_units)
 }
 
 /// Resolves the current focus caret and returns an absolute document-space
@@ -1742,6 +1894,118 @@ mod tests {
             line.source_end_utf16 - line.source_start_utf16
                 > line.visual_end_utf16 - line.visual_start_utf16
         }));
+    }
+
+    #[test]
+    fn ffi_projection_caret_is_revision_bound_and_preserves_hidden_affinity() {
+        let handle = session("before **羽🙂** after");
+        let mut upstream = YuProjectionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_projection_caret(
+                    handle,
+                    0,
+                    7,
+                    YU_CARET_AFFINITY_UPSTREAM,
+                    &mut upstream,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            upstream,
+            YuProjectionCaret {
+                revision: 0,
+                source_utf16: 7,
+                visual_utf16: 7,
+                round_trip_source_utf16: 7,
+                affinity: YU_CARET_AFFINITY_UPSTREAM,
+            }
+        );
+
+        let mut downstream = YuProjectionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_projection_caret(
+                    handle,
+                    0,
+                    7,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    &mut downstream,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(
+            downstream,
+            YuProjectionCaret {
+                revision: 0,
+                source_utf16: 7,
+                visual_utf16: 7,
+                round_trip_source_utf16: 9,
+                affinity: YU_CARET_AFFINITY_DOWNSTREAM,
+            }
+        );
+
+        let mut emoji_boundary = YuProjectionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_projection_caret(
+                    handle,
+                    0,
+                    12,
+                    YU_CARET_AFFINITY_UPSTREAM,
+                    &mut emoji_boundary,
+                )
+            },
+            YU_FFI_OK
+        );
+        assert_eq!(emoji_boundary.visual_utf16, 10);
+        assert_eq!(emoji_boundary.round_trip_source_utf16, 12);
+
+        let mut stale = YuProjectionCaret {
+            revision: 99,
+            source_utf16: 99,
+            visual_utf16: 99,
+            round_trip_source_utf16: 99,
+            affinity: 99,
+        };
+        assert_eq!(
+            unsafe {
+                yu_composition_session_projection_caret(
+                    handle,
+                    1,
+                    7,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    &mut stale,
+                )
+            },
+            YU_FFI_STALE_REVISION
+        );
+        assert_eq!(stale, YuProjectionCaret::default());
+
+        let mut split_surrogate = YuProjectionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_composition_session_projection_caret(
+                    handle,
+                    0,
+                    11,
+                    YU_CARET_AFFINITY_DOWNSTREAM,
+                    &mut split_surrogate,
+                )
+            },
+            YU_FFI_INVALID_RANGE
+        );
+        assert_eq!(split_surrogate, YuProjectionCaret::default());
+
+        let mut revision = 99;
+        assert_eq!(
+            unsafe { yu_composition_session_revision(handle, &mut revision) },
+            YU_FFI_OK
+        );
+        assert_eq!(revision, 0);
+        unsafe { yu_composition_session_destroy(handle) };
     }
 
     #[test]

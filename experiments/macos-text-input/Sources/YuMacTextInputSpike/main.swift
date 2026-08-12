@@ -39,6 +39,14 @@ private struct RustCaretScrollResult {
     let needsScroll: Bool
 }
 
+private struct RustProjectionCaret {
+    let revision: UInt64
+    let source: Int
+    let visual: Int
+    let roundTripSource: Int
+    let affinity: NSSelectionAffinity
+}
+
 private struct RustViewportMetrics: Equatable {
     let maxWidth: CGFloat
     let lineHeight: CGFloat
@@ -294,6 +302,33 @@ private final class RustCompositionBridge {
             rustAffinity.rawValue
         )
         precondition(status == 0, "Rust composition selection update failed: \(status)")
+    }
+
+    func projectionCaret(
+        sourceUTF16: Int,
+        affinity: NSSelectionAffinity
+    ) -> RustProjectionCaret {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(sourceUTF16 >= 0, "Rust projection caret must be non-negative")
+        var result = YuProjectionCaret()
+        let rustAffinity: RustCaretAffinity = affinity == .upstream ? .upstream : .downstream
+        let status = yu_composition_session_projection_caret(
+            session,
+            revision(),
+            UInt64(sourceUTF16),
+            rustAffinity.rawValue,
+            &result
+        )
+        precondition(status == 0, "Rust projection caret query failed: \(status)")
+        let nativeAffinity: NSSelectionAffinity =
+            result.affinity == UInt8(YU_CARET_AFFINITY_UPSTREAM) ? .upstream : .downstream
+        return RustProjectionCaret(
+            revision: result.revision,
+            source: Int(result.source_utf16),
+            visual: Int(result.visual_utf16),
+            roundTripSource: Int(result.round_trip_source_utf16),
+            affinity: nativeAffinity
+        )
     }
 
     func executeCommand(command: UInt8, block: UInt64 = 0) -> RustCommandResult {
@@ -1632,6 +1667,62 @@ final class TextInputView: NSView, NSTextInputClient {
         )
     }
 
+    func runProjectionCaretSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let source = "before **羽🙂** after\n"
+        let probe = 7
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: source, marked: false)
+        )
+        marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
+        rustComposition.resetSource(source)
+        selection = NSRange(location: probe, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+
+        let upstream = rustComposition.projectionCaret(
+            sourceUTF16: probe,
+            affinity: .upstream
+        )
+        let downstream = rustComposition.projectionCaret(
+            sourceUTF16: probe,
+            affinity: .downstream
+        )
+        precondition(upstream.revision == rustComposition.revision())
+        precondition(downstream.revision == upstream.revision)
+        precondition(upstream.source == probe && downstream.source == probe)
+        precondition(upstream.visual == 7 && downstream.visual == 7)
+        precondition(upstream.roundTripSource == 7, "upstream must stay before hidden syntax")
+        precondition(downstream.roundTripSource == 9, "downstream must cross hidden syntax")
+        precondition(upstream.affinity == .upstream && downstream.affinity == .downstream)
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        synchronizeViewport()
+        needsDisplay = true
+        print(
+            "Projection caret self-check source=\(probe) visual=\(upstream.visual) "
+                + "upstream=\(upstream.roundTripSource) downstream=\(downstream.roundTripSource)"
+        )
+    }
+
     func runUnicodeCompositionSelfCheck() {
         let savedStorage = NSAttributedString(attributedString: textStorage)
         let savedSelection = selection
@@ -2232,6 +2323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runLayoutRoundTripSelfCheck()
         inputView.runShapedLayoutComparisonSelfCheck()
         inputView.runProjectionShapedLayoutSelfCheck()
+        inputView.runProjectionCaretSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
         inputView.runNativeCommandRoutingSelfCheck()
         inputView.runViewportScrollSelfCheck()
