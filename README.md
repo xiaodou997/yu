@@ -23,6 +23,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - selection/caret、Unicode grapheme command 与 Accessibility 查询共享同一个 Revision；
 - macOS 原生快捷键先经过共享 Rust command route，普通字符仍交给 `NSTextInputClient`；
 - 原生命令结果显式声明 `None/Range/Full` source sync，局部编辑只复制变化的 UTF-16 范围；
+- `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
+  owned publication，macOS host 只消费已验证的 publication；
 - macOS `doCommand(by:)` 只允许 allowlist 内的 Selector 进入同一 Rust command/availability 入口；
 - macOS Option/Control word movement 使用 Unicode word-boundary segment，不物化整份文档；
 - 解析、投影、布局、绘制和资源加载都只处理受影响部分；
@@ -142,6 +144,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS revision-aware Metal frame consumer](docs/adr/0069-macos-revision-aware-metal-frame-consumer.md)
 - [macOS viewport frame submission](docs/adr/0070-macos-viewport-frame-submission.md)
 - [macOS viewport host session](docs/adr/0071-macos-viewport-host-session.md)
+- [Yu workspace viewport frame publisher](docs/adr/0072-yu-workspace-viewport-frame-publisher.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

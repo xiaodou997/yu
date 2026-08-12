@@ -345,6 +345,13 @@ Revision，`submit` 只消费匹配 generation 的 cached frame。这样真实 A
 resize 和 frame publish 事件翻译成 session 调用，不需要在 Swift/ObjC 中复制 stale 或 viewport
 generation 规则。
 
+`yu-workspace::ViewportFramePublisher` 是平台 host 之前的共享发布边界。它读取
+`EditorDocument` 当前 Revision，组装 `ViewportRenderFrame`，并返回同时拥有 frame、Revision
+和 monotonic serial 的 `ViewportFramePublication`；发布器自身不拥有 source、native object
+或 GPU handle。macOS `MetalViewportHostSession::accept_publication` 会再次验证 publication
+Revision、frame 内部 Revision 与 serial 顺序，再把 frame 放入 host cache。这样平台层只负责
+surface lifecycle 和 Metal submission，不再自己组装 viewport 或猜测 frame 更新状态。
+
 `platform/macos/yu-font-macos` 是 macOS-only 的 CoreText 适配层。`CoreTextFontCatalog::system`
 负责读取 CoreText 当前可见的非私有 family 名称，`CoreTextFontResolver::resolve` 负责根据
 `FontRequest` 和文本请求 CoreText 的 family/fallback 选择；`CoreTextShaper` 再通过

@@ -311,3 +311,8 @@
     `sync_surface_generation` 必须拒绝回退，Revision/generation 变化必须清理不匹配的 frame 或
     last submission。`submit` 必须先验证 surface generation，再消费 current frame，且失败不得
     写入 last submission；session 不得持有 EditorDocument、source、layout、AppKit 或 GPU handle。
+15. `yu-workspace::ViewportFramePublisher` 必须从 `EditorDocument` 当前 Revision 组装
+    `ViewportRenderFrame`，返回把 frame、Revision 与 monotonic serial 绑定在一起的 owned
+    `ViewportFramePublication`；发布失败或 serial overflow 不得替换已有 publication。macOS
+    `MetalViewportHostSession::accept_publication` 必须拒绝旧 Revision、内部 Revision 不匹配、
+    重复或回退 serial，验证完成前不得写入 host cache。

@@ -166,6 +166,10 @@
     单调推进，变化时清除不匹配 frame/last submission，`submit` 必须先检查 generation 并只消费
     current frame。无窗口状态测试和 AppKit ignored probe 必须覆盖 stale publish、generation
     mismatch/resize、重复提交和失败不写入 last submission。
+9m. `yu-workspace::ViewportFramePublisher` 必须成为 EditorDocument 到平台 host 的共享 viewport
+    发布边界，返回绑定 Revision、serial 与 owned frame 的 publication；macOS host 必须通过
+    `accept_publication` 拒绝旧/重复/乱序 publication，且无窗口测试必须覆盖接收一次、重复拒绝
+    与 Revision 推进后的 cache 清理。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

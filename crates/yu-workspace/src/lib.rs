@@ -299,6 +299,158 @@ impl From<ViewportFrameError> for ViewportSceneError {
     }
 }
 
+/// An owned viewport frame handed from the shared workspace publisher to a
+/// platform host. The frame keeps the scene, render plan, source Revision and
+/// publication serial together so a host cannot accidentally pair a frame
+/// with metadata from another build.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewportFramePublication {
+    revision: Revision,
+    serial: u64,
+    frame: ViewportRenderFrame,
+}
+
+impl ViewportFramePublication {
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    #[must_use]
+    pub fn frame(&self) -> &ViewportRenderFrame {
+        &self.frame
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Revision, u64, ViewportRenderFrame) {
+        (self.revision, self.serial, self.frame)
+    }
+}
+
+/// Errors raised while assembling and publishing a workspace viewport frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewportPublishError {
+    Scene(ViewportSceneError),
+    SerialOverflow,
+}
+
+impl fmt::Display for ViewportPublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scene(error) => error.fmt(formatter),
+            Self::SerialOverflow => formatter.write_str("viewport publication serial overflowed"),
+        }
+    }
+}
+
+impl Error for ViewportPublishError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Scene(error) => Some(error),
+            Self::SerialOverflow => None,
+        }
+    }
+}
+
+impl From<ViewportSceneError> for ViewportPublishError {
+    fn from(error: ViewportSceneError) -> Self {
+        Self::Scene(error)
+    }
+}
+
+/// Shared, platform-free owner of the latest assembled viewport frame.
+///
+/// The publisher reads the current `EditorDocument` Revision, assembles the
+/// revision-bound scene and render plan, and returns an owned publication with
+/// a monotonic serial. It does not own source text, an editor document, a
+/// native surface or a GPU object. A host may retain the returned publication
+/// while the publisher keeps a revision-aware cache for the latest frame.
+#[derive(Clone, Debug, Default)]
+pub struct ViewportFramePublisher {
+    cache: ViewportFrameCache,
+    next_serial: u64,
+    last_publication: Option<ViewportFramePublication>,
+}
+
+impl ViewportFramePublisher {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn current_revision(&self) -> Option<Revision> {
+        self.cache.current_revision()
+    }
+
+    #[must_use]
+    pub fn current_frame(&self, revision: Revision) -> Option<&ViewportRenderFrame> {
+        self.cache.get(revision)
+    }
+
+    #[must_use]
+    pub fn last_publication(&self) -> Option<&ViewportFramePublication> {
+        self.last_publication.as_ref()
+    }
+
+    /// Drops the cached frame and publication unless they belong to `revision`.
+    pub fn invalidate_stale(&mut self, revision: Revision) -> bool {
+        let cache_dropped = self.cache.invalidate_stale(revision);
+        let publication_dropped = self
+            .last_publication
+            .as_ref()
+            .is_some_and(|publication| publication.revision() != revision);
+        if publication_dropped {
+            self.last_publication = None;
+        }
+        cache_dropped || publication_dropped
+    }
+
+    /// Assembles and publishes the editor's current viewport as one owned
+    /// publication. All mutable state is updated only after assembly and the
+    /// next serial have both been validated.
+    pub fn publish<S: ShapingProvider>(
+        &mut self,
+        document: &mut EditorDocument,
+        config: ViewportRenderConfig,
+        shaper: &S,
+        atlas: &GlyphAtlas,
+        render_plans: &mut RenderPlanBuilder,
+    ) -> Result<ViewportFramePublication, ViewportPublishError> {
+        let frame = assemble_viewport_render_frame(document, config, shaper, atlas, render_plans)?;
+        let revision = document.revision();
+        if frame.revision() != revision {
+            return Err(ViewportPublishError::Scene(ViewportSceneError::Frame(
+                ViewportFrameError::Stale {
+                    expected: revision,
+                    actual: frame.revision(),
+                },
+            )));
+        }
+        let serial = self
+            .next_serial
+            .checked_add(1)
+            .ok_or(ViewportPublishError::SerialOverflow)?;
+        self.cache
+            .publish_if_current(revision, frame.clone())
+            .map_err(|error| ViewportPublishError::Scene(ViewportSceneError::Frame(error)))?;
+
+        let publication = ViewportFramePublication {
+            revision,
+            serial,
+            frame,
+        };
+        self.next_serial = serial;
+        self.last_publication = Some(publication.clone());
+        Ok(publication)
+    }
+}
+
 /// Measures the current editor viewport, converts its block metadata into the
 /// scene boundary, materializes matching shaped block layouts, and appends
 /// them atomically through `SceneBuilder::append_viewport`.
@@ -601,5 +753,57 @@ mod tests {
                 actual: old_revision,
             })
         );
+    }
+
+    #[test]
+    fn frame_publisher_returns_owned_revision_bound_publications() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 80.0);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 80.0).expect("scene viewport"),
+            Rgba8::black(),
+        );
+        let mut document = EditorDocument::new("paragraph");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let mut plans = RenderPlanBuilder::new();
+        let mut publisher = ViewportFramePublisher::new();
+
+        let first = publisher
+            .publish(&mut document, config, &shaper, &atlas, &mut plans)
+            .expect("first publication");
+        let first_revision = document.revision();
+        assert_eq!(first.revision(), first_revision);
+        assert_eq!(first.frame().revision(), first_revision);
+        assert_eq!(first.serial(), 1);
+        assert_eq!(publisher.current_revision(), Some(first_revision));
+        assert_eq!(publisher.last_publication(), Some(&first));
+        assert_eq!(publisher.current_frame(first_revision), Some(first.frame()));
+
+        document
+            .execute(EditorCommand::insert_text("!"))
+            .expect("edit");
+        let second_revision = document.revision();
+        assert!(publisher.invalidate_stale(second_revision));
+        assert_eq!(publisher.current_revision(), None);
+        assert_eq!(publisher.last_publication(), None);
+        assert_eq!(first.frame().revision(), first_revision);
+
+        let new_atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let second = publisher
+            .publish(&mut document, config, &shaper, &new_atlas, &mut plans)
+            .expect("second publication");
+        assert_eq!(second.revision(), second_revision);
+        assert_eq!(second.serial(), 2);
+        assert_eq!(publisher.last_publication(), Some(&second));
     }
 }
