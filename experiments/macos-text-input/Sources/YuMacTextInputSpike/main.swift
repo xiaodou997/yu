@@ -107,6 +107,11 @@ private struct RustCompositionCaret {
     let affinity: NSSelectionAffinity
 }
 
+private struct RustCompositionState {
+    let projection: RustCompositionProjection
+    let caret: RustCompositionCaret
+}
+
 private struct RustViewportMetrics: Equatable {
     let maxWidth: CGFloat
     let lineHeight: CGFloat
@@ -965,6 +970,23 @@ private final class RustCompositionBridge {
         )
     }
 
+    func compositionState(
+        sourceUTF16: Int,
+        preeditSelection: NSRange
+    ) -> RustCompositionState {
+        let projection = projection()
+        precondition(
+            projection.preeditSelection == preeditSelection,
+            "Rust composition selection must match the native marked selection"
+        )
+        let caret = compositionCaret(sourceUTF16: sourceUTF16, projection: projection)
+        precondition(
+            caret.revision == projection.revision && caret.generation == projection.generation,
+            "Rust composition caret must belong to the current projection"
+        )
+        return RustCompositionState(projection: projection, caret: caret)
+    }
+
     private func commandResult(_ result: YuEditorCommandResult) -> RustCommandResult {
         precondition(
             result.selection_end_utf16 >= result.selection_start_utf16,
@@ -1025,8 +1047,11 @@ final class TextInputView: NSView, NSTextInputClient {
     private var selectionAffinity: NSSelectionAffinity = .downstream
     private var marked = notFoundRange
     private var compositionOriginal: NSAttributedString?
+    private var compositionReplacementRange: NSRange?
+    private var compositionNativeRange: NSRange?
     private var compositionSelectionBefore: NSRange?
     private var compositionAffinityBefore: NSSelectionAffinity?
+    private var compositionSnapshot: RustCompositionState?
     private var rustComposition: RustCompositionBridge!
     private var viewportAdapter: YuNativeViewportAdapter?
     private var synchronizingViewport = false
@@ -1109,12 +1134,12 @@ final class TextInputView: NSView, NSTextInputClient {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        if hasMarkedText() {
+        if hasMarkedText() || rustComposition.hasOverlay {
             cancelComposition()
         } else {
             inputContext?.discardMarkedText()
-            marked = notFoundRange
             rustComposition.cancel()
+            clearCompositionState()
         }
         let point = convert(event.locationInWindow, from: nil)
         let hit = caretHit(forLocalPoint: point)
@@ -1130,6 +1155,20 @@ final class TextInputView: NSView, NSTextInputClient {
         let inserted = attributedString(from: value, marked: false)
         let target = targetRange(replacementRange)
         print("insertText commit=\(inserted.string.debugDescription) replace=\(target)")
+        if rustComposition.hasOverlay {
+            precondition(
+                compositionNativeRange != nil,
+                "active Rust composition must have a native replacement range"
+            )
+            if let snapshot = compositionSnapshot {
+                let current = rustComposition.projection()
+                precondition(
+                    current.revision == snapshot.projection.revision
+                        && current.generation == snapshot.projection.generation,
+                    "commit must consume the latest generation-bound composition snapshot"
+                )
+            }
+        }
         if !rustComposition.hasOverlay {
             rustComposition.begin(
                 replacement: target,
@@ -1148,10 +1187,7 @@ final class TextInputView: NSView, NSTextInputClient {
         )
         selection = rustSelection.range
         selectionAffinity = .downstream
-        marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        clearCompositionState()
         needsDisplay = true
         postTextChanged()
         synchronizeViewport()
@@ -1165,11 +1201,18 @@ final class TextInputView: NSView, NSTextInputClient {
         let inserted = attributedString(from: value, marked: true)
         let target = targetRange(replacementRange)
         if !hasMarkedText() {
-            compositionOriginal = textStorage.attributedSubstring(from: target)
-            compositionSelectionBefore = selection
-            compositionAffinityBefore = selectionAffinity
+            if !rustComposition.hasOverlay {
+                compositionOriginal = textStorage.attributedSubstring(from: target)
+                compositionReplacementRange = target
+                compositionSelectionBefore = selection
+                compositionAffinityBefore = selectionAffinity
+            }
         }
         if rustComposition.hasOverlay {
+            precondition(
+                compositionReplacementRange?.location == target.location,
+                "NSTextInputClient must keep one Rust composition replacement start"
+            )
             rustComposition.update(preedit: inserted.string, selection: newSelection)
         } else {
             rustComposition.begin(
@@ -1178,12 +1221,23 @@ final class TextInputView: NSView, NSTextInputClient {
                 selection: newSelection
             )
         }
+        let replacementStart = compositionReplacementRange?.location ?? target.location
+        let snapshot = rustComposition.compositionState(
+            sourceUTF16: replacementStart,
+            preeditSelection: newSelection
+        )
+        precondition(
+            snapshot.projection.replacementRange.location == replacementStart,
+            "Rust projection replacement must match the native composition start"
+        )
         print(
             "setMarkedText preedit=\(inserted.string.debugDescription) "
                 + "selection=\(newSelection) replace=\(target)"
         )
         replaceStorage(range: target, with: inserted)
-        marked = NSRange(location: target.location, length: inserted.length)
+        compositionNativeRange = NSRange(location: target.location, length: inserted.length)
+        marked = compositionNativeRange ?? notFoundRange
+        compositionSnapshot = snapshot
 
         let relativeLocation = min(newSelection.location, inserted.length)
         let maximumLength = inserted.length - relativeLocation
@@ -1202,9 +1256,9 @@ final class TextInputView: NSView, NSTextInputClient {
             textStorage.removeAttribute(.underlineStyle, range: marked)
         }
         marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        // AppKit may unmark before delivering insertText. Keep the Rust
+        // overlay and the native replacement range alive until commit/cancel.
+        // This makes unmark a presentation transition, not a source edit.
         needsDisplay = true
         postSelectionChanged()
     }
@@ -1292,12 +1346,12 @@ final class TextInputView: NSView, NSTextInputClient {
     }
 
     override func setAccessibilitySelectedTextRange(_ range: NSRange) {
-        if hasMarkedText() {
+        if hasMarkedText() || rustComposition.hasOverlay {
             cancelComposition()
         } else {
             inputContext?.discardMarkedText()
-            marked = notFoundRange
             rustComposition.cancel()
+            clearCompositionState()
         }
         guard let range = validatedAccessibilityRange(range) else { return }
         selection = range
@@ -1445,7 +1499,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let savedAffinity = selectionAffinity
         let base = textStorage.string
 
-        marked = notFoundRange
+        clearCompositionState()
         selection = NSRange(location: textStorage.length, length: 0)
         selectionAffinity = .downstream
         rustComposition.setSelection(selection)
@@ -1573,10 +1627,7 @@ final class TextInputView: NSView, NSTextInputClient {
         )
         selection = savedSelection
         selectionAffinity = savedAffinity
-        marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        clearCompositionState()
         rustComposition.resetSource(textStorage.string)
         rustComposition.setSelection(selection, affinity: selectionAffinity)
         needsDisplay = true
@@ -2070,10 +2121,7 @@ final class TextInputView: NSView, NSTextInputClient {
             range: NSRange(location: 0, length: textStorage.length),
             with: attributedString(from: source, marked: false)
         )
-        marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        clearCompositionState()
         rustComposition.resetSource(source)
         selection = NSRange(location: probe, length: 0)
         selectionAffinity = .downstream
@@ -2151,10 +2199,7 @@ final class TextInputView: NSView, NSTextInputClient {
         )
         selection = savedSelection
         selectionAffinity = savedAffinity
-        marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        clearCompositionState()
         rustComposition.resetSource(textStorage.string)
         rustComposition.setSelection(selection, affinity: selectionAffinity)
         synchronizeViewport()
@@ -2178,10 +2223,7 @@ final class TextInputView: NSView, NSTextInputClient {
             range: NSRange(location: 0, length: textStorage.length),
             with: attributedString(from: source, marked: false)
         )
-        marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        clearCompositionState()
         rustComposition.resetSource(source)
         selection = NSRange(location: 9, length: 0)
         selectionAffinity = .downstream
@@ -2217,10 +2259,7 @@ final class TextInputView: NSView, NSTextInputClient {
         )
         selection = savedSelection
         selectionAffinity = savedAffinity
-        marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        clearCompositionState()
         rustComposition.resetSource(textStorage.string)
         rustComposition.setSelection(selection, affinity: selectionAffinity)
         synchronizeViewport()
@@ -2229,6 +2268,77 @@ final class TextInputView: NSView, NSTextInputClient {
             "Composition projection self-check revision=\(projection.revision) "
                 + "generation=\(projection.generation) projected=\(projected.debugDescription) "
                 + "visualSelection=\(projection.visualSelection)"
+        )
+    }
+
+    func runCompositionLifecycleSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let base = textStorage.string
+        let replacement = NSRange(location: 0, length: 3)
+
+        selection = replacement
+        selectionAffinity = .downstream
+        clearCompositionState()
+        rustComposition.resetSource(base)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+
+        setMarkedText(
+            "にほんご",
+            selectedRange: NSRange(location: 4, length: 0),
+            replacementRange: replacement
+        )
+        let firstMarkedRange = marked
+        precondition(rustComposition.hasOverlay && hasMarkedText())
+        unmarkText()
+        precondition(!hasMarkedText() && rustComposition.hasOverlay)
+
+        // AppKit can deliver a second marked update after unmarking. It must
+        // replace the transient native range, not start a second Rust overlay.
+        setMarkedText(
+            "にほんご",
+            selectedRange: NSRange(location: 4, length: 0),
+            replacementRange: notFoundRange
+        )
+        precondition(marked == firstMarkedRange)
+        unmarkText()
+        insertText("日本語", replacementRange: notFoundRange)
+        precondition(
+            !rustComposition.hasOverlay
+                && textStorage.string == "日本語" + String(base.dropFirst(3)),
+            "unmarked commit must replace the original Rust range exactly once"
+        )
+
+        let cancelBase = textStorage.string
+        selection = NSRange(location: 0, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        setMarkedText(
+            "仮入力",
+            selectedRange: NSRange(location: 3, length: 0),
+            replacementRange: notFoundRange
+        )
+        unmarkText()
+        precondition(!hasMarkedText() && rustComposition.hasOverlay)
+        cancelComposition()
+        precondition(
+            !rustComposition.hasOverlay && textStorage.string == cancelBase,
+            "unmarked cancel must restore the canonical mirror"
+        )
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        clearCompositionState()
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        needsDisplay = true
+        print(
+            "Composition lifecycle self-check unmark=preserved commit=once cancel=restored"
         )
     }
 
@@ -2303,10 +2413,8 @@ final class TextInputView: NSView, NSTextInputClient {
         )
         selection = savedSelection
         selectionAffinity = savedAffinity
+        clearCompositionState()
         marked = savedMarked
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
         rustComposition.resetSource(textStorage.string)
         rustComposition.setSelection(selection, affinity: selectionAffinity)
         needsDisplay = true
@@ -2359,7 +2467,7 @@ final class TextInputView: NSView, NSTextInputClient {
         // NSTextInputClient owns marked text. Let the input context consume
         // every key while a preedit is visible; otherwise Cmd-Z could mutate
         // canonical source while the native overlay is still active.
-        guard !hasMarkedText() else { return false }
+        guard !hasMarkedText() && !rustComposition.hasOverlay else { return false }
 
         let key: (kind: UInt8, value: UInt32)
         switch event.keyCode {
@@ -2454,10 +2562,7 @@ final class TextInputView: NSView, NSTextInputClient {
         }
         self.selection = selection
         selectionAffinity = result.affinity
-        marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        clearCompositionState()
         needsDisplay = true
         if result.changed {
             postTextChanged()
@@ -2489,6 +2594,12 @@ final class TextInputView: NSView, NSTextInputClient {
     }
 
     private func targetRange(_ replacementRange: NSRange) -> NSRange {
+        if rustComposition.hasOverlay, let compositionNativeRange {
+            return clamped(compositionNativeRange)
+        }
+        if rustComposition.hasOverlay {
+            preconditionFailure("active Rust composition has no native replacement range")
+        }
         if replacementRange.location != NSNotFound {
             return clamped(replacementRange)
         }
@@ -2496,6 +2607,16 @@ final class TextInputView: NSView, NSTextInputClient {
             return clamped(marked)
         }
         return clamped(selection)
+    }
+
+    private func clearCompositionState() {
+        marked = notFoundRange
+        compositionOriginal = nil
+        compositionReplacementRange = nil
+        compositionNativeRange = nil
+        compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
+        compositionSnapshot = nil
     }
 
     private func clamped(_ range: NSRange) -> NSRange {
@@ -2643,19 +2764,29 @@ final class TextInputView: NSView, NSTextInputClient {
 
     private func cancelComposition() {
         print("cancelComposition range=\(marked)")
-        guard hasMarkedText(), let original = compositionOriginal else {
-            marked = notFoundRange
-            rustComposition.cancel()
+        guard rustComposition.hasOverlay else {
+            clearCompositionState()
             return
         }
-        replaceStorage(range: marked, with: original)
-        selection = compositionSelectionBefore ?? NSRange(location: marked.location, length: 0)
-        selectionAffinity = compositionAffinityBefore ?? .downstream
-        marked = notFoundRange
-        compositionOriginal = nil
-        compositionSelectionBefore = nil
-        compositionAffinityBefore = nil
+        if let original = compositionOriginal, let nativeRange = compositionNativeRange {
+            if let snapshot = compositionSnapshot,
+               rustComposition.hasOverlay {
+                let current = rustComposition.projection()
+                precondition(
+                    current.revision == snapshot.projection.revision
+                        && current.generation == snapshot.projection.generation,
+                    "cancel must consume the latest generation-bound composition snapshot"
+                )
+            }
+            replaceStorage(range: nativeRange, with: original)
+            selection = compositionSelectionBefore ?? NSRange(location: nativeRange.location, length: 0)
+            selectionAffinity = compositionAffinityBefore ?? .downstream
+        } else {
+            selection = compositionSelectionBefore ?? selection
+            selectionAffinity = compositionAffinityBefore ?? selectionAffinity
+        }
         rustComposition.cancel()
+        clearCompositionState()
         needsDisplay = true
         postTextChanged()
         synchronizeViewport()
@@ -2671,7 +2802,12 @@ final class TextInputView: NSView, NSTextInputClient {
     /// Publishes the native TextKit metrics used by the metrics-only Rust
     /// viewport backend, keeping both sides in the same point-based units.
     private func synchronizeViewport() {
-        guard let viewportAdapter, !synchronizingViewport, !hasMarkedText() else { return }
+        guard
+            let viewportAdapter,
+            !synchronizingViewport,
+            !hasMarkedText(),
+            !rustComposition.hasOverlay
+        else { return }
         synchronizingViewport = true
         defer { synchronizingViewport = false }
 
@@ -2844,6 +2980,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runProjectionShapedLayoutSelfCheck()
         inputView.runProjectionCaretSelfCheck()
         inputView.runCompositionProjectionSelfCheck()
+        inputView.runCompositionLifecycleSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
         inputView.runNativeCommandRoutingSelfCheck()
         inputView.runViewportScrollSelfCheck()

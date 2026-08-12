@@ -97,6 +97,12 @@ source UTF-16 range、kind tag、measured 标记和 content height 都属于同�
 会更新同一 Revision 下的 preedit，确认旧 generation 不能复用；这验证 native bridge 不需要
 复制 Markdown parser 或维护第二套 transient document。
 
+随后运行 `Composition lifecycle self-check`：回放 `setMarkedText → unmarkText → setMarkedText`、
+`unmarkText → insertText` 和 `unmarkText → cancel`。`unmarkText` 只移除 native marked 展示，
+不会取消 Rust overlay；bridge 分开保存 canonical replacement range、当前 native preedit range
+和 presentation marked range，确保 commit 只替换一次、cancel 始终恢复原文，并验证操作期间
+消费的是同一 Revision + composition generation。
+
 `Native command self-check` 还会验证 Backspace 只查询并替换局部 UTF-16 source range，而成组
 Cmd-Z/Cmd-Shift-Z 使用完整 source fallback。两类结果都必须按 Rust 返回的 Revision 和 selection
 更新 TextKit mirror；普通段落 Tab 不由共享 key route 消费。
