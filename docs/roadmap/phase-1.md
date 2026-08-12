@@ -83,6 +83,7 @@
 - [x] revision-bound projection caret FFI、Before/After hidden delimiter round-trip 与 macOS self-check
 - [x] block-local revision-bound projection caret、block index 与局部 visual UTF-16 self-check
 - [x] block-local CoreText shaped caret geometry、line/point/height ABI 与 macOS self-check
+- [x] generation-bound composition projection/caret FFI、projected UTF-8 count/fill 与 macOS protocol self-check
 - [x] CoreText shaped caret scroll request、HeightIndex absolute target 与 macOS host self-check
 - [x] CoreText shaped viewport block snapshot、count/fill ABI 与 block origin self-check
 - [x] `ViewportSceneInput` metadata validation 与 block-local layout document-origin append
@@ -185,6 +186,10 @@
     selection mapping；composition run 使用临时 shaping 坐标并回映射 canonical replacement
     range，查询不得写入 LayoutCache、source、Revision 或 history，且测试必须覆盖 metrics/shaped
     两条路径与 commit/cancel 后的 canonical 回归。
+9r. composition FFI 必须同时绑定 canonical Revision 与 transient generation；projected UTF-8、
+    preedit/visual UTF-16 selection 和 active composition caret 必须由 Rust count/fill/owned-scalar
+    ABI 返回，旧 generation 必须拒绝。macOS shaped composition caret 必须消费未缓存 transient
+    block layout，native self-check 不得维护第二份 Markdown projection。
 10. projection 使用 parser-owned inline source ranges；projection 内不再维护第二套 delimiter
     scanner，且 inline token coverage 与 Piece Tree chunk 解析均有测试。
 11. `EditorDocument` 的 projection cache 对同一 Revision/range 命中；strictly-outside edit 可

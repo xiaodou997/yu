@@ -87,6 +87,26 @@ private struct RustBlockShapedCaret {
     let affinity: NSSelectionAffinity
 }
 
+private struct RustCompositionProjection {
+    let revision: UInt64
+    let generation: UInt64
+    let replacementRange: NSRange
+    let preeditSelection: NSRange
+    let visualSelection: NSRange
+    let projectedUTF16Length: Int
+    let projectedUTF8Length: Int
+}
+
+private struct RustCompositionCaret {
+    let revision: UInt64
+    let generation: UInt64
+    let source: Int
+    let visual: Int
+    let roundTripSource: Int
+    let visualSelection: NSRange
+    let affinity: NSSelectionAffinity
+}
+
 private struct RustViewportMetrics: Equatable {
     let maxWidth: CGFloat
     let lineHeight: CGFloat
@@ -860,6 +880,89 @@ private final class RustCompositionBridge {
         let status = yu_composition_session_overlay_selection(session, &start, &end)
         precondition(status == 0, "Rust composition selection query failed: \(status)")
         return NSRange(location: Int(start), length: Int(end - start))
+    }
+
+    func projection() -> RustCompositionProjection {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        precondition(hasOverlay, "Rust composition overlay is not active")
+        var result = YuCompositionProjection()
+        let status = yu_composition_session_projection(session, revision(), &result)
+        precondition(status == 0, "Rust composition projection query failed: \(status)")
+        precondition(result.revision == revision(), "Rust projection revision must be current")
+        return RustCompositionProjection(
+            revision: result.revision,
+            generation: result.generation,
+            replacementRange: NSRange(
+                location: Int(result.replacement_start_utf16),
+                length: Int(result.replacement_end_utf16 - result.replacement_start_utf16)
+            ),
+            preeditSelection: NSRange(
+                location: Int(result.preedit_selection_start_utf16),
+                length: Int(result.preedit_selection_end_utf16 - result.preedit_selection_start_utf16)
+            ),
+            visualSelection: NSRange(
+                location: Int(result.visual_selection_start_utf16),
+                length: Int(result.visual_selection_end_utf16 - result.visual_selection_start_utf16)
+            ),
+            projectedUTF16Length: Int(result.projected_utf16_length),
+            projectedUTF8Length: Int(result.projected_utf8_length)
+        )
+    }
+
+    func projectedString(_ projection: RustCompositionProjection) -> String {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var required = 0
+        let countStatus = yu_composition_session_copy_projection(
+            session,
+            projection.revision,
+            projection.generation,
+            nil,
+            0,
+            &required
+        )
+        precondition(countStatus == 0 && required == projection.projectedUTF8Length)
+        var bytes = [UInt8](repeating: 0, count: required)
+        let fillStatus = bytes.withUnsafeMutableBufferPointer { buffer in
+            yu_composition_session_copy_projection(
+                session,
+                projection.revision,
+                projection.generation,
+                buffer.baseAddress,
+                buffer.count,
+                &required
+            )
+        }
+        precondition(fillStatus == 0 && required == projection.projectedUTF8Length)
+        let value = String(decoding: bytes, as: UTF8.self)
+        precondition(value.utf16.count == projection.projectedUTF16Length)
+        return value
+    }
+
+    func compositionCaret(sourceUTF16: Int, projection: RustCompositionProjection) -> RustCompositionCaret {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var result = YuCompositionCaret()
+        let rustAffinity = RustCaretAffinity.downstream.rawValue
+        let status = yu_composition_session_composition_caret(
+            session,
+            projection.revision,
+            projection.generation,
+            UInt64(sourceUTF16),
+            rustAffinity,
+            &result
+        )
+        precondition(status == 0, "Rust composition caret query failed: \(status)")
+        return RustCompositionCaret(
+            revision: result.revision,
+            generation: result.generation,
+            source: Int(result.source_utf16),
+            visual: Int(result.visual_utf16),
+            roundTripSource: Int(result.round_trip_source_utf16),
+            visualSelection: NSRange(
+                location: Int(result.visual_selection_start_utf16),
+                length: Int(result.visual_selection_end_utf16 - result.visual_selection_start_utf16)
+            ),
+            affinity: .downstream
+        )
     }
 
     private func commandResult(_ result: YuEditorCommandResult) -> RustCommandResult {
@@ -2066,6 +2169,69 @@ final class TextInputView: NSView, NSTextInputClient {
         )
     }
 
+    func runCompositionProjectionSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let source = "before **x** after"
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: source, marked: false)
+        )
+        marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
+        rustComposition.resetSource(source)
+        selection = NSRange(location: 9, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+
+        rustComposition.begin(
+            replacement: NSRange(location: 9, length: 1),
+            preedit: "日本🙂",
+            selection: NSRange(location: 2, length: 2)
+        )
+        let projection = rustComposition.projection()
+        let projected = rustComposition.projectedString(projection)
+        precondition(projected == "before 日本🙂 after")
+        precondition(projection.replacementRange == NSRange(location: 9, length: 1))
+        precondition(projection.visualSelection == NSRange(location: 9, length: 2))
+        precondition(projection.generation == 1)
+        let caret = rustComposition.compositionCaret(sourceUTF16: 9, projection: projection)
+        precondition(caret.revision == projection.revision)
+        precondition(caret.generation == projection.generation)
+        precondition(caret.visualSelection == projection.visualSelection)
+        precondition(caret.visual == 11)
+
+        rustComposition.update(preedit: "日本語", selection: NSRange(location: 3, length: 0))
+        let updated = rustComposition.projection()
+        precondition(updated.generation == projection.generation + 1)
+        precondition(rustComposition.projectedString(updated) == "before 日本語 after")
+        precondition(updated.visualSelection == NSRange(location: 9, length: 0))
+        rustComposition.cancel()
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        marked = notFoundRange
+        compositionOriginal = nil
+        compositionSelectionBefore = nil
+        compositionAffinityBefore = nil
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        synchronizeViewport()
+        needsDisplay = true
+        print(
+            "Composition projection self-check revision=\(projection.revision) "
+                + "generation=\(projection.generation) projected=\(projected.debugDescription) "
+                + "visualSelection=\(projection.visualSelection)"
+        )
+    }
+
     func runUnicodeCompositionSelfCheck() {
         let savedStorage = NSAttributedString(attributedString: textStorage)
         let savedSelection = selection
@@ -2677,6 +2843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runShapedLayoutComparisonSelfCheck()
         inputView.runProjectionShapedLayoutSelfCheck()
         inputView.runProjectionCaretSelfCheck()
+        inputView.runCompositionProjectionSelfCheck()
         inputView.runUnicodeCompositionSelfCheck()
         inputView.runNativeCommandRoutingSelfCheck()
         inputView.runViewportScrollSelfCheck()

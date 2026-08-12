@@ -22,6 +22,7 @@ enum {
     YU_FFI_INVALID_VIEWPORT_CONFIG = 12,
     YU_FFI_CORE_TEXT_UNAVAILABLE = 13,
     YU_FFI_LAYOUT_FAILED = 14,
+    YU_FFI_STALE_COMPOSITION = 15,
 };
 
 enum {
@@ -144,6 +145,30 @@ typedef struct YuProjectionCaret {
     uint8_t affinity;
 } YuProjectionCaret;
 
+typedef struct YuCompositionProjection {
+    uint64_t revision;
+    uint64_t generation;
+    uint64_t replacement_start_utf16;
+    uint64_t replacement_end_utf16;
+    uint64_t preedit_selection_start_utf16;
+    uint64_t preedit_selection_end_utf16;
+    uint64_t visual_selection_start_utf16;
+    uint64_t visual_selection_end_utf16;
+    uint64_t projected_utf16_length;
+    uint64_t projected_utf8_length;
+} YuCompositionProjection;
+
+typedef struct YuCompositionCaret {
+    uint64_t revision;
+    uint64_t generation;
+    uint64_t source_utf16;
+    uint64_t visual_utf16;
+    uint64_t round_trip_source_utf16;
+    uint64_t visual_selection_start_utf16;
+    uint64_t visual_selection_end_utf16;
+    uint8_t affinity;
+} YuCompositionCaret;
+
 typedef struct YuBlockProjectionCaret {
     uint64_t revision;
     uint64_t source_utf16;
@@ -166,6 +191,23 @@ typedef struct YuBlockShapedCaret {
     float caret_height;
     uint8_t affinity;
 } YuBlockShapedCaret;
+
+typedef struct YuCompositionBlockShapedCaret {
+    uint64_t revision;
+    uint64_t generation;
+    uint64_t source_utf16;
+    uint64_t block_index;
+    uint64_t visual_utf16;
+    uint64_t round_trip_source_utf16;
+    uint64_t line_index;
+    float caret_x;
+    float caret_y;
+    float caret_width;
+    float caret_height;
+    uint64_t visual_selection_start_utf16;
+    uint64_t visual_selection_end_utf16;
+    uint8_t affinity;
+} YuCompositionBlockShapedCaret;
 
 typedef struct YuShapedViewportBlock {
     uint64_t revision;
@@ -242,6 +284,21 @@ int32_t yu_composition_session_block_projection_caret(YuCompositionSession *sess
                                                       uint64_t source_utf16,
                                                       uint8_t affinity,
                                                       YuBlockProjectionCaret *output);
+int32_t yu_composition_session_projection(YuCompositionSession *session,
+                                           uint64_t expected_revision,
+                                           YuCompositionProjection *output);
+int32_t yu_composition_session_copy_projection(YuCompositionSession *session,
+                                                uint64_t expected_revision,
+                                                uint64_t expected_generation,
+                                                uint8_t *output,
+                                                size_t capacity,
+                                                size_t *written);
+int32_t yu_composition_session_composition_caret(YuCompositionSession *session,
+                                                  uint64_t expected_revision,
+                                                  uint64_t expected_generation,
+                                                  uint64_t source_utf16,
+                                                  uint8_t affinity,
+                                                  YuCompositionCaret *output);
 int32_t yu_macos_composition_session_block_shaped_caret(YuCompositionSession *session,
                                                         uint64_t expected_revision,
                                                         uint64_t source_utf16,
@@ -249,6 +306,10 @@ int32_t yu_macos_composition_session_block_shaped_caret(YuCompositionSession *se
                                                         float size,
                                                         float max_width,
                                                         YuBlockShapedCaret *output);
+int32_t yu_macos_composition_session_block_composition_shaped_caret(
+    YuCompositionSession *session, uint64_t expected_revision,
+    uint64_t expected_generation, uint64_t source_utf16, uint8_t affinity,
+    float size, float max_width, YuCompositionBlockShapedCaret *output);
 int32_t yu_macos_composition_session_shaped_caret_scroll_request(
     YuCompositionSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height, float margin,

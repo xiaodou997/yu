@@ -827,6 +827,19 @@ impl LayoutSnapshot {
         bias: ProjectionBias,
     ) -> Result<LayoutCaret, LayoutError> {
         let visual = self.projection.source_to_visual(source, bias)?;
+        self.caret_for_visual(visual, bias)
+    }
+
+    /// Resolves a projected visual boundary to layout coordinates. This is
+    /// especially important for transient composition text: multiple visual
+    /// preedit boundaries intentionally map to one canonical replacement
+    /// range, so source-first lookup cannot recover an interior preedit caret.
+    pub fn caret_for_visual(
+        &self,
+        visual: VisualOffset,
+        bias: ProjectionBias,
+    ) -> Result<LayoutCaret, LayoutError> {
+        let source = self.projection.visual_to_source(visual, bias)?;
         let (line, point) = self.point_for_visual(visual, bias)?;
         Ok(LayoutCaret {
             source,
