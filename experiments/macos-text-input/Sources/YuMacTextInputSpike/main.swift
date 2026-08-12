@@ -663,6 +663,41 @@ private final class RustCompositionBridge {
         )
     }
 
+    func shapedCaretScrollRequest(
+        size: CGFloat,
+        maxWidth: CGFloat,
+        scrollY: CGFloat,
+        viewportHeight: CGFloat,
+        margin: CGFloat
+    ) -> RustCaretScrollResult {
+        guard let session else { preconditionFailure("Rust composition session is missing") }
+        var result = YuEditorCaretScrollRequest()
+        let status = yu_macos_composition_session_shaped_caret_scroll_request(
+            session,
+            revision(),
+            Float(size),
+            Float(maxWidth),
+            Float(scrollY),
+            Float(viewportHeight),
+            Float(margin),
+            &result
+        )
+        precondition(status == 0, "Rust shaped caret scroll request failed: \(status)")
+        return RustCaretScrollResult(
+            revision: result.revision,
+            source: Int(result.source_utf16),
+            block: Int(result.block_index),
+            caretX: CGFloat(result.caret_x),
+            caretY: CGFloat(result.caret_y),
+            caretWidth: CGFloat(result.caret_width),
+            caretHeight: CGFloat(result.caret_height),
+            currentScrollY: CGFloat(result.current_scroll_y),
+            targetScrollY: CGFloat(result.target_scroll_y),
+            margin: CGFloat(result.margin),
+            needsScroll: result.needs_scroll != 0
+        )
+    }
+
     func sourceString(utf16Length: Int) -> String {
         precondition(utf16Length >= 0, "Rust composition UTF-16 length must be non-negative")
         return sourceString(utf16Range: NSRange(location: 0, length: utf16Length))
@@ -1477,6 +1512,68 @@ final class TextInputView: NSView, NSTextInputClient {
             "Viewport self-check caret-source=\(reveal.source) block=\(reveal.block) "
                 + "target=\(reveal.targetScrollY) native=\(nativeTarget) "
                 + "stale=rejected noop=\(!visible.needsScroll)"
+        )
+    }
+
+    func runShapedViewportScrollSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let source = "one\n\ntwo **羽🙂**\n\nthree\n"
+        let font = defaultAttributes[.font] as? NSFont ?? NSFont.systemFont(ofSize: 22)
+        let nativeMetrics = rustComposition.coreTextSystemUiViewportMetrics(
+            size: font.pointSize,
+            sample: "M中🙂e\u{301}"
+        )
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: source, marked: false)
+        )
+        rustComposition.resetSource(source)
+        rustComposition.setViewportMetrics(
+            RustViewportMetrics(
+                maxWidth: 600,
+                lineHeight: nativeMetrics.lineHeight,
+                defaultAdvance: nativeMetrics.defaultAdvance,
+                estimatedBlockHeight: nativeMetrics.lineHeight,
+                overscan: 0
+            )
+        )
+        selection = NSRange(location: source.utf16.count, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+
+        let request = rustComposition.shapedCaretScrollRequest(
+            size: font.pointSize,
+            maxWidth: 600,
+            scrollY: 0,
+            viewportHeight: nativeMetrics.lineHeight,
+            margin: 0
+        )
+        precondition(request.revision == rustComposition.revision())
+        precondition(request.source == source.utf16.count && request.block == 4)
+        precondition(request.caretX.isFinite && request.caretY.isFinite)
+        precondition(request.caretHeight.isFinite && request.caretHeight > 0)
+        precondition(request.targetScrollY.isFinite && request.targetScrollY >= 0)
+        precondition(request.targetScrollY <= request.caretY + 0.001)
+        precondition(request.needsScroll)
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        needsDisplay = true
+        synchronizeViewport()
+        print(
+            "Shaped viewport self-check block=\(request.block) "
+                + "caret=(\(String(format: "%.2f", request.caretX)),"
+                + "\(String(format: "%.2f", request.caretY))) "
+                + "target=\(String(format: "%.2f", request.targetScrollY))"
         )
     }
 
@@ -2320,7 +2417,11 @@ final class TextInputView: NSView, NSTextInputClient {
         viewportAdapter.configure(revision: revision, contentHeight: contentHeight)
 
         let metrics = viewportAdapter.viewportMetrics()
-        let request = rustComposition.caretScrollRequest(
+        let font = defaultAttributes[.font] as? NSFont ?? NSFont.systemFont(ofSize: 22)
+        let nativeMetrics = nativeViewportMetrics()
+        let request = rustComposition.shapedCaretScrollRequest(
+            size: font.pointSize,
+            maxWidth: nativeMetrics.maxWidth,
             scrollY: metrics.scrollY,
             viewportHeight: metrics.height,
             margin: 8
@@ -2469,6 +2570,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runUnicodeCompositionSelfCheck()
         inputView.runNativeCommandRoutingSelfCheck()
         inputView.runViewportScrollSelfCheck()
+        inputView.runShapedViewportScrollSelfCheck()
         inputView.runAttachedViewportSelfCheck()
         inputView.runNativeSelectionSelfCheck()
         inputView.runAccessibilitySelfCheck()
