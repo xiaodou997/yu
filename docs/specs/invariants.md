@@ -7,7 +7,8 @@
 1. Markdown 源码是唯一持久化真源。
 2. 投影视图不拥有源码副本，只引用 Source Range 或明确声明临时替代物。
 3. 未被编辑的源码不得因解析、布局或投影而被重新序列化。
-4. 第一阶段只接受有效 UTF-8；编码与 BOM 策略由 `yu-storage` 阶段补充。
+4. `yu-storage::DocumentSession` 只接受有效 UTF-8；UTF-8 BOM 属于文件元数据，必须在加载/保存时
+   保留，但不得进入 canonical Markdown source 坐标或 parser ranges。
 
 ## Editing
 
@@ -22,6 +23,9 @@
 7. `EditorHistory` 只能保存有界 inverse Transaction；Undo/Redo 回放不得再次写入 history，
    entry 的 source edits 必须在回放时重绑定到当前 Revision。新的永久 edit 必须清空 redo，光标/
    selection/composition 边界必须断开当前 group。
+8. 文件 session 的 dirty 是当前 `EditorDocument` Revision 与 `saved_revision` 的比较；Undo 回到
+   相同字节也不能绕过显式保存边界。外部文件指纹变化或目标消失时，storage save 必须拒绝覆盖，
+   reload 只能在 clean session 执行。
 
 ## Parsing
 

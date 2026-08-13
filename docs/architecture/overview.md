@@ -9,7 +9,7 @@ Markdown 源码是唯一持久化真源。投影视图、完整源码视图和�
 File bytes
     │
     ▼
-Text Snapshot ──► Lossless Markdown ──► Projection ──► Layout ──► Scene
+yu-storage::DocumentSession ──► Text Snapshot ──► Lossless Markdown ──► Projection ──► Layout ──► Scene
     ▲                                                                  │
     │                                                                  ▼
 Transaction ◄── EditorCommand ◄── EditorSelection ◄── Hit Test ◄──── GPU
@@ -59,12 +59,20 @@ yu-core      yu-inspect                    block layout     ProjectionCache   ma
                                       yu-editor yu-scene yu-font
 ```
 
+当前已增加：
+
+```text
+yu-storage
+```
+
+它只负责 UTF-8 Markdown 文件的 `open`/原子 `save`/clean `reload`、BOM 元数据、磁盘指纹和 Revision-bound
+dirty/conflict 状态；它不拥有第二份 source，也不进入窗口/GPU 层。
+
 后续预计增加：
 
 ```text
 yu-markdown-edit
 yu-platform
-yu-storage
 yu-export
 yu-extension-host
 ```
