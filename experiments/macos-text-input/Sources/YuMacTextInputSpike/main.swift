@@ -113,6 +113,85 @@ private struct RustCompositionState {
     let caret: RustCompositionCaret
 }
 
+private struct InputEventRange: Codable {
+    let location: Int
+    let length: Int
+
+    init?(_ range: NSRange) {
+        guard range.location != NSNotFound else { return nil }
+        location = range.location
+        length = range.length
+    }
+}
+
+private struct InputEventRect: Codable {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+
+    init(_ rect: NSRect) {
+        x = Double(rect.origin.x)
+        y = Double(rect.origin.y)
+        width = Double(rect.size.width)
+        height = Double(rect.size.height)
+    }
+}
+
+private struct InputEventRecord: Codable {
+    let sequence: Int
+    let context: String
+    let kind: String
+    let text: String?
+    let replacementRange: InputEventRange?
+    let selectedRange: InputEventRange?
+    let markedRange: InputEventRange?
+    let revision: UInt64
+    let generation: UInt64?
+    let screenRect: InputEventRect?
+}
+
+private final class InputEventRecorder {
+    private var sequence = 0
+    private(set) var context = "startup-self-check"
+
+    func beginInteractiveCapture() {
+        context = "interactive"
+    }
+
+    func record(
+        kind: String,
+        text: String?,
+        replacementRange: NSRange?,
+        selectedRange: NSRange?,
+        markedRange: NSRange?,
+        revision: UInt64,
+        generation: UInt64?,
+        screenRect: NSRect?
+    ) {
+        sequence += 1
+        let record = InputEventRecord(
+            sequence: sequence,
+            context: context,
+            kind: kind,
+            text: text,
+            replacementRange: replacementRange.flatMap(InputEventRange.init),
+            selectedRange: selectedRange.flatMap(InputEventRange.init),
+            markedRange: markedRange.flatMap(InputEventRange.init),
+            revision: revision,
+            generation: generation,
+            screenRect: screenRect.map(InputEventRect.init)
+        )
+        guard
+            let data = try? JSONEncoder().encode(record),
+            let line = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+        print("IME_EVENT \(line)")
+    }
+}
+
 private struct RustViewportMetrics: Equatable {
     let maxWidth: CGFloat
     let lineHeight: CGFloat
@@ -1044,6 +1123,7 @@ final class TextInputView: NSView, NSTextInputClient {
     private let textStorage = NSTextStorage()
     private let layoutManager = NSLayoutManager()
     private let textContainer = NSTextContainer()
+    private let inputEvents = InputEventRecorder()
     private var selection = NSRange(location: 0, length: 0)
     private var selectionAffinity: NSSelectionAffinity = .downstream
     private var marked = notFoundRange
@@ -1156,6 +1236,8 @@ final class TextInputView: NSView, NSTextInputClient {
         let inserted = attributedString(from: value, marked: false)
         let target = targetRange(replacementRange)
         print("insertText commit=\(inserted.string.debugDescription) replace=\(target)")
+        let eventRevision = rustComposition.revision()
+        let eventGeneration = compositionSnapshot?.projection.generation
         if rustComposition.hasOverlay {
             precondition(
                 compositionNativeRange != nil,
@@ -1189,6 +1271,16 @@ final class TextInputView: NSView, NSTextInputClient {
         selection = rustSelection.range
         selectionAffinity = .downstream
         clearCompositionState()
+        inputEvents.record(
+            kind: "insertText",
+            text: inserted.string,
+            replacementRange: target,
+            selectedRange: selection,
+            markedRange: nil,
+            revision: eventRevision,
+            generation: eventGeneration,
+            screenRect: nil
+        )
         needsDisplay = true
         postTextChanged()
         synchronizeViewport()
@@ -1247,12 +1339,32 @@ final class TextInputView: NSView, NSTextInputClient {
             length: min(newSelection.length, maximumLength)
         )
         selectionAffinity = .downstream
+        inputEvents.record(
+            kind: "setMarkedText",
+            text: inserted.string,
+            replacementRange: target,
+            selectedRange: selection,
+            markedRange: marked,
+            revision: snapshot.projection.revision,
+            generation: snapshot.projection.generation,
+            screenRect: firstRect(forCharacterRange: marked, actualRange: nil)
+        )
         needsDisplay = true
         postTextChanged()
     }
 
     func unmarkText() {
         print("unmarkText range=\(marked)")
+        inputEvents.record(
+            kind: "unmarkText",
+            text: nil,
+            replacementRange: compositionNativeRange,
+            selectedRange: selection,
+            markedRange: marked,
+            revision: rustComposition.revision(),
+            generation: compositionSnapshot?.projection.generation,
+            screenRect: hasMarkedText() ? firstRect(forCharacterRange: marked, actualRange: nil) : nil
+        )
         if hasMarkedText() {
             textStorage.removeAttribute(.underlineStyle, range: marked)
         }
@@ -1294,6 +1406,13 @@ final class TextInputView: NSView, NSTextInputClient {
         forCharacterRange characterRange: NSRange,
         actualRange: NSRangePointer?
     ) -> NSRect {
+        candidateRect(forCharacterRange: characterRange, actualRange: actualRange)
+    }
+
+    private func rangeFrame(
+        forCharacterRange characterRange: NSRange,
+        actualRange: NSRangePointer?
+    ) -> NSRect {
         let range = clamped(characterRange)
         actualRange?.pointee = range
         let localRect: NSRect
@@ -1311,6 +1430,42 @@ final class TextInputView: NSView, NSTextInputClient {
 
         let windowRect = convert(localRect, to: nil)
         return window?.convertToScreen(windowRect) ?? windowRect
+    }
+
+    /// Candidate windows should anchor to the first visual fragment of the
+    /// requested range. Using the union of every glyph in a multi-line preedit
+    /// makes the candidate panel jump or become unnecessarily tall.
+    private func candidateRect(
+        forCharacterRange characterRange: NSRange,
+        actualRange: NSRangePointer?
+    ) -> NSRect {
+        let range = clamped(characterRange)
+        actualRange?.pointee = range
+        let localRect: NSRect
+        if range.length == 0 {
+            let affinity = range == selection ? selectionAffinity : .downstream
+            localRect = caretRect(at: range.location, affinity: affinity)
+        } else {
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: range,
+                actualCharacterRange: nil
+            )
+            guard glyphRange.length > 0 else {
+                localRect = caretRect(at: range.location, affinity: .downstream)
+                let windowRect = convert(localRect, to: nil)
+                return window?.convertToScreen(windowRect) ?? windowRect
+            }
+            let firstGlyph = NSRange(location: glyphRange.location, length: 1)
+            let bounds = layoutManager.boundingRect(forGlyphRange: firstGlyph, in: textContainer)
+            localRect = bounds.offsetBy(dx: textOrigin.x, dy: textOrigin.y)
+        }
+
+        let windowRect = convert(localRect, to: nil)
+        return window?.convertToScreen(windowRect) ?? windowRect
+    }
+
+    func beginInteractiveInputCapture() {
+        inputEvents.beginInteractiveCapture()
     }
 
     func characterIndex(for point: NSPoint) -> Int {
@@ -1420,7 +1575,7 @@ final class TextInputView: NSView, NSTextInputClient {
 
     override func accessibilityFrame(for range: NSRange) -> NSRect {
         guard let range = validatedAccessibilityRange(range) else { return .zero }
-        return firstRect(forCharacterRange: range, actualRange: nil)
+        return rangeFrame(forCharacterRange: range, actualRange: nil)
     }
 
     override func accessibilityStyleRange(for index: Int) -> NSRange {
@@ -1524,6 +1679,54 @@ final class TextInputView: NSView, NSTextInputClient {
         print(
             "AX composition self-check marked-range=stable unmark=visible "
                 + "commit=once cancel=restored"
+        )
+    }
+
+    func runCandidateWindowSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let base = textStorage.string
+
+        selection = NSRange(location: textStorage.length, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        setMarkedText(
+            "にほん\nご🙂",
+            selectedRange: NSRange(location: "にほん\nご🙂".utf16.count, length: 0),
+            replacementRange: notFoundRange
+        )
+
+        var actualRange = notFoundRange
+        let range = marked
+        let candidate = candidateRect(forCharacterRange: range, actualRange: &actualRange)
+        let full = rangeFrame(forCharacterRange: range, actualRange: nil)
+        precondition(actualRange == range)
+        precondition(candidate.origin.x.isFinite && candidate.origin.y.isFinite)
+        precondition(candidate.width.isFinite && candidate.height.isFinite)
+        precondition(!candidate.isEmpty && !full.isEmpty)
+        precondition(candidate.minY == full.minY, "candidate must anchor to the first visual line")
+        precondition(candidate.maxY <= full.maxY, "candidate must not span later preedit lines")
+        precondition(
+            candidate.width <= full.width,
+            "candidate width must be bounded by the complete marked range"
+        )
+
+        cancelComposition()
+        precondition(textStorage.string == base && !rustComposition.hasOverlay)
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        clearCompositionState()
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        needsDisplay = true
+        print(
+            "Candidate window self-check multiline=stable first-line=anchored "
+                + "screen-space=finite"
         )
     }
 
@@ -2850,6 +3053,16 @@ final class TextInputView: NSView, NSTextInputClient {
             clearCompositionState()
             return
         }
+        inputEvents.record(
+            kind: "cancelComposition",
+            text: nil,
+            replacementRange: compositionNativeRange,
+            selectedRange: selection,
+            markedRange: marked,
+            revision: rustComposition.revision(),
+            generation: compositionSnapshot?.projection.generation,
+            screenRect: hasMarkedText() ? firstRect(forCharacterRange: marked, actualRange: nil) : nil
+        )
         if let original = compositionOriginal, let nativeRange = compositionNativeRange {
             if let snapshot = compositionSnapshot,
                rustComposition.hasOverlay {
@@ -3111,7 +3324,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runNativeSelectionSelfCheck()
         inputView.runAccessibilitySelfCheck()
         inputView.runAccessibilityCompositionSelfCheck()
+        inputView.runCandidateWindowSelfCheck()
         runKeyboardInputSourceProbe()
+        inputView.beginInteractiveInputCapture()
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.25) {
             runAccessibilityRuntimeProbe()
