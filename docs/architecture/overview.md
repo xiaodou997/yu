@@ -71,6 +71,12 @@ dirty/conflict 状态；它不拥有第二份 source，也不进入窗口/GPU �
 `platform/macos/yu-storage-macos` 只负责把 FSEvents/DispatchSource vnode 通知转换成共享
 `FileWatchDebouncer` 可消费的事件；native watcher 生命周期和 AppKit 对象留在产品壳。
 
+`yu-storage-ffi` 是 macOS 文档壳的窄 C ABI。它把 `DocumentSession` 放在 Rust-owned
+`YuStorageSession` 中，向 Swift 只暴露 owned path/source snapshot、Revision-bound 状态和
+save/reload/close 结果。`experiments/macos-document-host` 是当前最小 AppKit host：它用只读
+`NSTextView` 验证打开、标题/dirty 状态、保存、重载和关闭提示；该镜像不拥有 source，也不替代
+现有 `yu-editor-ffi` 的编辑/IME 边界。
+
 后续预计增加：
 
 ```text

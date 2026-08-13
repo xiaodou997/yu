@@ -178,6 +178,9 @@
    来自同一个 `EditorDocument` 状态。
 6. AppKit 命中测试与 Accessibility selection 写回必须先结束活动 composition，再通过
    revision-bound FFI 更新 `EditorDocument`；平台 selection 只能作为该状态的投影。
+7. macOS document host 的 `NSTextView` source mirror 只能消费 Rust-owned
+   `DocumentSession` snapshot；在 storage session 与 editor session 合并前，镜像必须只读，
+   不得形成第二份可变 source、dirty 或 history。
 
 ## Degradation
 

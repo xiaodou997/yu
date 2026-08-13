@@ -26,7 +26,8 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 
 - [ ] workspace/tab/session 生命周期，不复制 source
 - [x] 无窗口 close-before-discard 状态机：save、discard、cancel 与 external conflict
-- [ ] macOS 文档窗口 host：打开、保存、冲突提示、关闭前 dirty 询问
+- [x] macOS 最小文档窗口 host：打开、源码镜像、标题/dirty 状态、保存/重载和关闭提示
+- [ ] macOS 可编辑文档 host：把 `DocumentSession` 与现有 `EditorDocument`/IME FFI 合并为单一可变会话
 - [ ] 平台剪贴板格式与 source-backed Markdown/纯文本导出
 - [ ] 文件路径、标题、dirty 和 Revision 的 Accessibility/菜单状态投影
 - [ ] 以 `DocumentSession` 为输入的 headless vertical slice benchmark
@@ -45,8 +46,13 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 最终 `disk_state`，`CloseStateMachine` 负责 close prompt 状态，二者都不复制 source 或持有 AppKit
 对象。
 
+`yu-storage-ffi` 是当前 macOS 产品壳的窄 ABI：Rust `YuStorageSession` 独占可变
+`DocumentSession`，Swift 只能取得 owned path/source snapshot、状态和 close/save/reload 结果。
+`experiments/macos-document-host` 用 AppKit 验证窗口生命周期，但故意把 `NSTextView` 设为只读；
+它不是第二个 source，也不承担 Markdown projection、IME 或最终渲染。
+
 ## 下一步
 
-下一阶段建议接最小 AppKit 文档窗口 host：打开一个 `DocumentSession`、消费 close prompt、展示
-dirty/external 状态，并复用现有 `NSTextInputClient` spike 与 `yu-editor-ffi`。窗口只负责生命周期和
-状态展示，不重新实现文本编辑。
+下一阶段应定义一个同时持有 `DocumentSession` 与 `EditorDocument` 的单一 Rust 可变会话，复用
+现有 `yu-editor-ffi`/`NSTextInputClient` 的 composition 协议；在此之前不要让 AppKit 文本控件可写，
+也不要把 storage FFI 和 editor FFI 各自升级成两份 source。

@@ -29,6 +29,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   dirty 和外部文件冲突检测；保存使用同目录临时文件加原子 rename，不覆盖外部修改；
 - `yu-storage::FileWatchDebouncer` 与 `CloseStateMachine` 固定文件通知去抖、dirty close、取消/丢弃和
   外部冲突提示；macOS flag 适配不把 watcher 线程或 AppKit 对象带入共享核心；
+- `yu-storage-ffi` 让 macOS 文档壳只消费 Rust-owned source snapshot、Revision/dirty 状态和 close
+  结果；当前最小 AppKit host 的 `NSTextView` 明确保持只读，避免在编辑器会话合并前出现第二份 source；
 - `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
   owned publication，macOS host 只消费已验证的 publication；
 - viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host
@@ -74,6 +76,7 @@ crates/yu-editor        EditorDocument、selection、commands、CompositionOverl
 crates/yu-editor-ffi    原生平台调用的 CompositionOverlay 与 command C ABI static library
 crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
 crates/yu-storage       UTF-8 Markdown 文档会话、BOM、原子保存和外部变更检测
+crates/yu-storage-ffi   macOS 文档壳消费 DocumentSession 的窄 C ABI
 platform/macos/yu-storage-macos macOS FSEvents/DispatchSource flag 适配与文件通知 debounce
 crates/yu-markdown      lossless block/inline CST 与增量 Markdown parser
 crates/yu-projection    Source → Visual Markdown 投影
@@ -114,11 +117,16 @@ cargo run -p yu-inspect -- README.md
 cargo run --release -p yu-bench -- --size-mib 1 --iterations 20 --random-edits 2000 --retained-snapshots 8
 experiments/macos-text-input/build-rust-ffi.sh
 swift build --package-path experiments/macos-text-input
+experiments/macos-document-host/build-app.sh
 ```
 
 macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust static library；因此必须
 先运行 `build-rust-ffi.sh`，或直接使用会自动执行它的 `build-app.sh`。构建产物位于被忽略的
 `experiments/macos-text-input/.rust/`，不会提交到仓库。
+
+最小 macOS 文档 host 同样先构建 `yu-storage-ffi` static library，再由 Swift Package 链接；
+它只验证产品壳生命周期，暂不提供可编辑文本或完整 Markdown 投影。构建产物位于被忽略的
+`experiments/macos-document-host/.rust/` 和 `.build/`，不会提交到仓库。
 
 ## 文档
 
@@ -178,6 +186,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)
+- [macOS minimal document host](docs/adr/0088-macos-document-host.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [Phase 2 路线](docs/roadmap/phase-2.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
