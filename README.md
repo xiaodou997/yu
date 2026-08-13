@@ -23,6 +23,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - selection/caret、Unicode grapheme command 与 Accessibility 查询共享同一个 Revision；
 - macOS 原生快捷键先经过共享 Rust command route，普通字符仍交给 `NSTextInputClient`；
 - 原生命令结果显式声明 `None/Range/Full` source sync，局部编辑只复制变化的 UTF-16 范围；
+- `yu-editor` integration tests 使用 `EditorScenario` 标记 DSL 同时断言 source、caret/selection、
+  Revision 和 composition overlay，新增编辑行为先固定可复现的行为契约；
 - `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
   owned publication，macOS host 只消费已验证的 publication；
 - viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host
@@ -98,6 +100,7 @@ cd yu
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test -p yu-editor --test editor_behavior
 cargo test -p yu-render-macos -- --ignored  # 需要有 Metal device 的 macOS session
 cargo run -p yu-inspect -- README.md
 cargo run --release -p yu-bench -- --size-mib 1 --iterations 20 --random-edits 2000 --retained-snapshots 8
@@ -164,8 +167,10 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Composition-aware projection/layout](docs/adr/0076-composition-aware-projection-layout.md)
 - [Composition projection FFI](docs/adr/0077-composition-projection-ffi.md)
 - [macOS NSTextInputClient composition lifecycle](docs/adr/0078-macos-nstextinputclient-composition-lifecycle.md)
+- [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
+- [macOS IME 人工验收模板](docs/experiments/macos-ime-manual-acceptance-2026-08-13.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
 - [文本存储候选对比](docs/experiments/storage-candidates-2026-08-09.md)
 - [增量 Markdown 实验](docs/experiments/incremental-markdown-2026-08-09.md)
