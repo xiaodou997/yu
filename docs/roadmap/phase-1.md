@@ -335,6 +335,9 @@
 51. macOS IME 事件日志必须可在无窗口模式下回放审计：序号连续、replacement start 在一次
     composition 内稳定、generation 单调、preedit/unmark/commit/cancel 的 canonical Revision
     关系明确；实时 Ctrl-C 产生的末尾半行只能标记为 truncated tail，中间 malformed event 必须失败。
+52. 交互 IME 日志必须以 `IME_SESSION` 建立 session 边界，并让每个 `IME_EVENT` 携带一致的
+    session ID、场景标签和输入源快照；默认审计兼容旧日志，严格审计必须拒绝截断尾部、未收敛的
+    composition 或缺失/不一致的 session 元数据。真实日文、dead key 与 VoiceOver 仍需人工验收。
 
 ## 非目标
 

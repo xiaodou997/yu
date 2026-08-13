@@ -154,14 +154,49 @@ private struct InputEventRecord: Codable {
     let revision: UInt64
     let generation: UInt64?
     let screenRect: InputEventRect?
+    let sessionID: String?
+    let scenario: String?
+}
+
+private struct InputSessionRecord: Codable {
+    let sessionID: String
+    let scenario: String
+    let inputSourceIdentifier: String?
+    let inputSourceName: String?
+    let inputSourceType: String?
+    let sequenceStart: Int
 }
 
 private final class InputEventRecorder {
     private var sequence = 0
     private(set) var context = "startup-self-check"
+    private(set) var sessionID: String?
+    private(set) var scenario: String?
 
-    func beginInteractiveCapture() {
+    func beginInteractiveCapture(
+        scenario: String,
+        inputSourceIdentifier: String?,
+        inputSourceName: String?,
+        inputSourceType: String?
+    ) {
         context = "interactive"
+        self.sessionID = UUID().uuidString
+        self.scenario = scenario
+        let session = InputSessionRecord(
+            sessionID: self.sessionID ?? "",
+            scenario: scenario,
+            inputSourceIdentifier: inputSourceIdentifier,
+            inputSourceName: inputSourceName,
+            inputSourceType: inputSourceType,
+            sequenceStart: sequence + 1
+        )
+        guard
+            let data = try? JSONEncoder().encode(session),
+            let line = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+        print("IME_SESSION \(line)")
     }
 
     func record(
@@ -185,7 +220,9 @@ private final class InputEventRecorder {
             markedRange: markedRange.flatMap(InputEventRange.init),
             revision: revision,
             generation: generation,
-            screenRect: screenRect.map(InputEventRect.init)
+            screenRect: screenRect.map(InputEventRect.init),
+            sessionID: sessionID,
+            scenario: scenario
         )
         guard
             let data = try? JSONEncoder().encode(record),
@@ -217,6 +254,8 @@ private struct InputEventAuditSummary {
     let maxGeneration: UInt64
     let openComposition: Bool
     let truncatedTail: Bool
+    let sessionScenario: String?
+    let sessionID: String?
 }
 
 private struct AuditedComposition {
@@ -226,7 +265,7 @@ private struct AuditedComposition {
     var revision: UInt64
 }
 
-private func auditInputEventLog(at path: String) throws -> InputEventAuditSummary {
+private func auditInputEventLog(at path: String, strict: Bool) throws -> InputEventAuditSummary {
     let contents: String
     do {
         contents = try String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)
@@ -236,15 +275,38 @@ private func auditInputEventLog(at path: String) throws -> InputEventAuditSummar
 
     let decoder = JSONDecoder()
     var records: [InputEventRecord] = []
+    var session: InputSessionRecord?
     let rawLines = contents.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
     var truncatedTail = false
     for (offset, rawLine) in rawLines.enumerated() {
+        if let sessionMarker = rawLine.range(of: "IME_SESSION ") {
+            if session != nil {
+                throw InputEventAuditFailure(
+                    line: offset + 1,
+                    message: "multiple IME_SESSION records are not supported in one log"
+                )
+            }
+            let payload = String(rawLine[sessionMarker.upperBound...])
+            do {
+                session = try decoder.decode(InputSessionRecord.self, from: Data(payload.utf8))
+            } catch {
+                if offset == rawLines.count - 1 && !strict {
+                    truncatedTail = true
+                    continue
+                }
+                throw InputEventAuditFailure(
+                    line: offset + 1,
+                    message: "invalid IME_SESSION JSON: \(error)"
+                )
+            }
+            continue
+        }
         guard let marker = rawLine.range(of: "IME_EVENT ") else { continue }
         let payload = String(rawLine[marker.upperBound...])
         do {
             records.append(try decoder.decode(InputEventRecord.self, from: Data(payload.utf8)))
         } catch {
-            if offset == rawLines.count - 1 {
+            if offset == rawLines.count - 1 && !strict {
                 truncatedTail = true
                 continue
             }
@@ -256,6 +318,9 @@ private func auditInputEventLog(at path: String) throws -> InputEventAuditSummar
     }
     guard !records.isEmpty else {
         throw InputEventAuditFailure(line: nil, message: "no IME_EVENT records found")
+    }
+    if strict && truncatedTail {
+        throw InputEventAuditFailure(line: nil, message: "strict audit rejects a truncated log tail")
     }
 
     var previousSequence = 0
@@ -277,7 +342,20 @@ private func auditInputEventLog(at path: String) throws -> InputEventAuditSummar
         }
         previousSequence = record.sequence
         contexts.insert(record.context)
+        if let session {
+            if record.sessionID != session.sessionID || record.scenario != session.scenario {
+                try fail(record, "event session metadata does not match IME_SESSION")
+            }
+        } else if strict && record.context == "interactive" {
+            try fail(record, "strict interactive audit requires IME_SESSION metadata")
+        }
         if record.context == "interactive" {
+            if !sawInteractive, let session, record.sequence != session.sequenceStart {
+                try fail(
+                    record,
+                    "first interactive event sequence \(record.sequence) does not match session start \(session.sequenceStart)"
+                )
+            }
             sawInteractive = true
         } else if sawInteractive {
             try fail(record, "startup-self-check event appears after interactive capture")
@@ -387,6 +465,13 @@ private func auditInputEventLog(at path: String) throws -> InputEventAuditSummar
         }
     }
 
+    if strict && active != nil {
+        throw InputEventAuditFailure(
+            line: nil,
+            message: "strict audit requires composition to be settled at end of log"
+        )
+    }
+
     return InputEventAuditSummary(
         records: records.count,
         contexts: contexts.sorted(),
@@ -394,7 +479,9 @@ private func auditInputEventLog(at path: String) throws -> InputEventAuditSummar
         cancels: cancels,
         maxGeneration: maxGeneration,
         openComposition: active != nil,
-        truncatedTail: truncatedTail
+        truncatedTail: truncatedTail,
+        sessionScenario: session?.scenario,
+        sessionID: session?.sessionID
     )
 }
 
@@ -1673,8 +1760,16 @@ final class TextInputView: NSView, NSTextInputClient {
         return window?.convertToScreen(windowRect) ?? windowRect
     }
 
-    func beginInteractiveInputCapture() {
-        inputEvents.beginInteractiveCapture()
+    fileprivate func beginInteractiveInputCapture(
+        scenario: String,
+        inputSource: KeyboardInputSourceSnapshot?
+    ) {
+        inputEvents.beginInteractiveCapture(
+            scenario: scenario,
+            inputSourceIdentifier: inputSource?.identifier,
+            inputSourceName: inputSource?.localizedName,
+            inputSourceType: inputSource?.type
+        )
     }
 
     func characterIndex(for point: NSPoint) -> Int {
@@ -3494,16 +3589,17 @@ private func currentKeyboardInputSourceSnapshot() -> KeyboardInputSourceSnapshot
     )
 }
 
-private func runKeyboardInputSourceProbe() {
+private func runKeyboardInputSourceProbe() -> KeyboardInputSourceSnapshot? {
     guard let source = currentKeyboardInputSourceSnapshot() else {
         print("Keyboard input source probe unavailable")
-        return
+        return nil
     }
     print(
         "Keyboard input source probe id=\(source.identifier) "
             + "name=\(source.localizedName ?? "<unknown>") "
             + "type=\(source.type ?? "<unknown>")"
     )
+    return source
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -3551,8 +3647,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runAccessibilitySelfCheck()
         inputView.runAccessibilityCompositionSelfCheck()
         inputView.runCandidateWindowSelfCheck()
-        runKeyboardInputSourceProbe()
-        inputView.beginInteractiveInputCapture()
+        let inputSource = runKeyboardInputSourceProbe()
+        let scenario = ProcessInfo.processInfo.environment["YU_IME_SCENARIO"] ?? "manual-ime"
+        inputView.beginInteractiveInputCapture(scenario: scenario, inputSource: inputSource)
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.25) {
             runAccessibilityRuntimeProbe()
@@ -3632,17 +3729,23 @@ private func runApplication() {
 
 let commandLine = CommandLine.arguments
 if commandLine.dropFirst().first == "--audit-ime-log" {
-    guard commandLine.count == 3 else {
-        fputs("usage: YuMacTextInputSpike --audit-ime-log PATH\n", stderr)
+    guard (commandLine.count == 3 || commandLine.count == 4),
+          commandLine[1] == "--audit-ime-log",
+          !commandLine[2].isEmpty,
+          commandLine.dropFirst(3).allSatisfy({ $0 == "--strict" })
+    else {
+        fputs("usage: YuMacTextInputSpike --audit-ime-log PATH [--strict]\n", stderr)
         exit(64)
     }
     do {
-        let summary = try auditInputEventLog(at: commandLine[2])
+        let strict = commandLine.contains("--strict")
+        let summary = try auditInputEventLog(at: commandLine[2], strict: strict)
         print(
             "IME audit passed records=\(summary.records) contexts=\(summary.contexts.joined(separator: ",")) "
                 + "commits=\(summary.commits) cancels=\(summary.cancels) "
                 + "maxGeneration=\(summary.maxGeneration) openComposition=\(summary.openComposition) "
-                + "truncatedTail=\(summary.truncatedTail)"
+                + "truncatedTail=\(summary.truncatedTail) strict=\(strict) "
+                + "scenario=\(summary.sessionScenario ?? "<legacy>")"
         )
     } catch {
         fputs("IME audit failed: \(error)\n", stderr)

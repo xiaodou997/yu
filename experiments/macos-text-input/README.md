@@ -71,10 +71,22 @@ swift run --package-path experiments/macos-text-input YuMacTextInputSpike \
   --audit-ime-log /tmp/yu-ime.log
 ```
 
-审计器检查事件序号、composition replacement range、generation 单调性、canonical Revision
-稳定性和 commit/cancel 收敛。用 Ctrl-C 结束实时窗口时，最后一行可能是不完整 JSON；审计器会将
-它报告为 `truncatedTail=true`，但仍严格校验此前所有完整事件。日文、组合重音的最小 fixture 位于
-`experiments/macos-text-input/fixtures/japanese-combining-ime.log`。
+交互捕获开始时会先输出一条 `IME_SESSION {json}`，包含 session ID、场景标签
+（`YU_IME_SCENARIO`，默认 `manual-ime`）和当前键盘输入源快照；后续每条 `IME_EVENT` 都携带相同
+的 session/scenario。审计器检查事件序号、composition replacement range、generation 单调性、
+canonical Revision 稳定性和 commit/cancel 收敛。默认模式兼容旧日志，也允许 Ctrl-C 造成的最后半行
+不完整 JSON，并将其报告为 `truncatedTail=true`；中间 malformed event 仍会失败。
+
+fixture 或完整人工日志可使用严格模式：
+
+```bash
+swift run --package-path experiments/macos-text-input YuMacTextInputSpike \
+  --audit-ime-log experiments/macos-text-input/fixtures/japanese-combining-ime.log --strict
+```
+
+严格模式要求 session 元数据存在且一致、日志没有截断尾部，并且文件结束时没有未完成的 composition。
+日文、组合重音的最小 fixture 位于 `experiments/macos-text-input/fixtures/japanese-combining-ime.log`；
+它只验证协议事件，不代表已经完成真实日文输入源、dead key 或 VoiceOver 的人工验收。
 
 `Layout self-check` 会将文本容器限制为 360 pt，并遍历 TextKit 的 canonical caret stops。当前固定
 文本应至少产生 4 个视觉行、一个软换行 affinity split，并通过 local point 与 screen point 两条
