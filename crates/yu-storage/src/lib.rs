@@ -23,6 +23,14 @@ use yu_text::{AppliedTransaction, Transaction};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+mod close;
+mod watch;
+
+pub use close::{
+    ClosePrompt, CloseRequest, CloseState, CloseStateError, CloseStateMachine, CloseTransition,
+};
+pub use watch::{FileWatchCheck, FileWatchDebouncer, FileWatchEvent, FileWatchReason};
+
 /// Whether a loaded UTF-8 file contained the standard UTF-8 BOM.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Utf8Bom {
@@ -192,6 +200,35 @@ impl DocumentSession {
             (Some(expected), Some(current)) if expected == &current => DiskState::Unchanged,
             (Some(_), Some(_)) => DiskState::Changed,
         })
+    }
+
+    /// Returns an external-change reason suitable for product-shell prompts.
+    ///
+    /// A new session starts with an intentionally absent expected fingerprint:
+    /// a missing path is still the expected state, while a path that appears
+    /// before the first save is treated as a conflict. A clean opened session
+    /// may close without prompting because it has no local source to lose;
+    /// callers that need to refresh it can use [`Self::reload`].
+    pub fn external_file_state(&self) -> Result<Option<ExternalFileState>, StorageError> {
+        Ok(match (self.expected_file.is_some(), self.disk_state()?) {
+            (_, DiskState::Unchanged) | (false, DiskState::Missing) => None,
+            (_, DiskState::Changed) => Some(ExternalFileState::Changed),
+            (true, DiskState::Missing) => Some(ExternalFileState::Missing),
+        })
+    }
+
+    /// Evaluates a close request without dropping or mutating the document.
+    ///
+    /// The state machine owns only close intent; the caller remains responsible
+    /// for invoking [`Self::save`] after a save prompt and dropping the session
+    /// only after [`CloseStateMachine::save_succeeded`] or
+    /// [`CloseStateMachine::discard`].
+    pub fn close_request(
+        &self,
+        state: &mut CloseStateMachine,
+    ) -> Result<CloseRequest, StorageError> {
+        let external_change = self.external_file_state()?;
+        Ok(state.request_close(self.is_dirty(), external_change))
     }
 
     /// Executes a permanent editor command through the canonical source.

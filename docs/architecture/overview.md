@@ -68,6 +68,9 @@ yu-storage
 它只负责 UTF-8 Markdown 文件的 `open`/原子 `save`/clean `reload`、BOM 元数据、磁盘指纹和 Revision-bound
 dirty/conflict 状态；它不拥有第二份 source，也不进入窗口/GPU 层。
 
+`platform/macos/yu-storage-macos` 只负责把 FSEvents/DispatchSource vnode 通知转换成共享
+`FileWatchDebouncer` 可消费的事件；native watcher 生命周期和 AppKit 对象留在产品壳。
+
 后续预计增加：
 
 ```text

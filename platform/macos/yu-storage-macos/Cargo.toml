@@ -1,0 +1,15 @@
+[package]
+name = "yu-storage-macos"
+description = "macOS file-watch event adapter for Yu document sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-storage = { path = "../../../crates/yu-storage" }
+
+[lints]
+workspace = true

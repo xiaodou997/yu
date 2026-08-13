@@ -17,7 +17,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] 同目录临时文件、写入/sync、原子 rename 保存路径
 - [x] clean reload 通过 `EditorDocument::reset_source` 重建 parser/selection/cache
 - [x] headless 集成测试覆盖 invalid UTF-8、BOM、composition、save、reload 和冲突
-- [ ] macOS 文件监听与 debounce，不在后台线程持有可变 `EditorDocument`
+- [x] macOS 文件通知 flag 适配与共享 debounce，不在后台线程持有可变 `EditorDocument`
 - [ ] autosave/recovery 文件格式和崩溃恢复策略
 - [ ] 文件权限、软链接、Windows replace semantics 与跨平台原子保存适配
 - [ ] 编码/换行策略（当前只接受 UTF-8，不自动规范化 CRLF）
@@ -25,6 +25,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 ## Track B：进入产品窗口前的共享模型
 
 - [ ] workspace/tab/session 生命周期，不复制 source
+- [x] 无窗口 close-before-discard 状态机：save、discard、cancel 与 external conflict
 - [ ] macOS 文档窗口 host：打开、保存、冲突提示、关闭前 dirty 询问
 - [ ] 平台剪贴板格式与 source-backed Markdown/纯文本导出
 - [ ] 文件路径、标题、dirty 和 Revision 的 Accessibility/菜单状态投影
@@ -37,7 +38,15 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 3. dirty 不是简单的字符串比较；它绑定当前 Revision 与最近保存 Revision。
 4. 平台文件监听只产生“需要检查”的提示，最终指纹比较和 reload/save 决策由 session 完成。
 
+## 已落地的边界
+
+`yu-storage::FileWatchDebouncer` 只合并通知并返回指纹复核请求；`platform/macos/yu-storage-macos`
+只转换 FSEvents/DispatchSource vnode flags，不拥有 native watcher 生命周期。`DocumentSession` 负责
+最终 `disk_state`，`CloseStateMachine` 负责 close prompt 状态，二者都不复制 source 或持有 AppKit
+对象。
+
 ## 下一步
 
-下一阶段建议先实现 macOS 文件监听/关闭前 dirty 流程的无窗口状态机，再接最小 AppKit 文档窗口；窗口
-只负责生命周期和状态展示，文本输入仍复用现有 `NSTextInputClient` spike 与 `yu-editor-ffi`。
+下一阶段建议接最小 AppKit 文档窗口 host：打开一个 `DocumentSession`、消费 close prompt、展示
+dirty/external 状态，并复用现有 `NSTextInputClient` spike 与 `yu-editor-ffi`。窗口只负责生命周期和
+状态展示，不重新实现文本编辑。
