@@ -1,0 +1,18 @@
+[package]
+name = "yu-storage-ffi"
+description = "C ABI bridge from native document shells to Yu storage sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+yu-storage = { path = "../yu-storage" }
+
+[lints]
+workspace = true
