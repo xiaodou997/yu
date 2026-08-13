@@ -304,7 +304,11 @@ private struct AuditedComposition {
     var revision: UInt64
 }
 
-private func auditInputEventLog(at path: String, strict: Bool) throws -> InputEventAuditSummary {
+private func auditInputEventLog(
+    at path: String,
+    strict: Bool,
+    expectedScenario: String? = nil
+) throws -> InputEventAuditSummary {
     let contents: String
     do {
         contents = try String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)
@@ -360,6 +364,23 @@ private func auditInputEventLog(at path: String, strict: Bool) throws -> InputEv
     }
     if strict && truncatedTail {
         throw InputEventAuditFailure(line: nil, message: "strict audit rejects a truncated log tail")
+    }
+    if let expectedScenario {
+        guard !expectedScenario.isEmpty else {
+            throw InputEventAuditFailure(line: nil, message: "expected scenario must not be empty")
+        }
+        guard let session else {
+            throw InputEventAuditFailure(
+                line: nil,
+                message: "expected scenario \(expectedScenario.debugDescription) requires IME_SESSION metadata"
+            )
+        }
+        guard session.scenario == expectedScenario else {
+            throw InputEventAuditFailure(
+                line: nil,
+                message: "expected scenario \(expectedScenario.debugDescription), got \(session.scenario.debugDescription)"
+            )
+        }
     }
 
     var previousSequence = 0
@@ -3870,23 +3891,64 @@ private func runApplication() {
 
 let commandLine = CommandLine.arguments
 if commandLine.dropFirst().first == "--audit-ime-log" {
-    guard (commandLine.count == 3 || commandLine.count == 4),
-          commandLine[1] == "--audit-ime-log",
-          !commandLine[2].isEmpty,
-          commandLine.dropFirst(3).allSatisfy({ $0 == "--strict" })
-    else {
-        fputs("usage: YuMacTextInputSpike --audit-ime-log PATH [--strict]\n", stderr)
+    var auditPath: String?
+    var strict = false
+    var expectedScenario: String?
+    var argumentIndex = 1
+    var usageError = false
+
+    while argumentIndex < commandLine.count {
+        switch commandLine[argumentIndex] {
+        case "--audit-ime-log":
+            guard auditPath == nil, argumentIndex + 1 < commandLine.count else {
+                usageError = true
+                argumentIndex = commandLine.count
+                continue
+            }
+            auditPath = commandLine[argumentIndex + 1]
+            argumentIndex += 2
+        case "--strict":
+            guard !strict else {
+                usageError = true
+                argumentIndex = commandLine.count
+                continue
+            }
+            strict = true
+            argumentIndex += 1
+        case "--expect-scenario":
+            guard expectedScenario == nil, argumentIndex + 1 < commandLine.count else {
+                usageError = true
+                argumentIndex = commandLine.count
+                continue
+            }
+            expectedScenario = commandLine[argumentIndex + 1]
+            argumentIndex += 2
+        default:
+            usageError = true
+            argumentIndex = commandLine.count
+        }
+    }
+
+    guard !usageError, let auditPath, !auditPath.isEmpty else {
+        fputs(
+            "usage: YuMacTextInputSpike --audit-ime-log PATH [--strict] [--expect-scenario NAME]\n",
+            stderr
+        )
         exit(64)
     }
     do {
-        let strict = commandLine.contains("--strict")
-        let summary = try auditInputEventLog(at: commandLine[2], strict: strict)
+        let summary = try auditInputEventLog(
+            at: auditPath,
+            strict: strict,
+            expectedScenario: expectedScenario
+        )
         print(
             "IME audit passed records=\(summary.records) contexts=\(summary.contexts.joined(separator: ",")) "
                 + "commits=\(summary.commits) cancels=\(summary.cancels) "
                 + "maxGeneration=\(summary.maxGeneration) openComposition=\(summary.openComposition) "
                 + "truncatedTail=\(summary.truncatedTail) strict=\(strict) "
                 + "scenario=\(summary.sessionScenario ?? "<legacy>")"
+                + (expectedScenario.map { " expectedScenario=\($0)" } ?? "")
         )
     } catch {
         fputs("IME audit failed: \(error)\n", stderr)

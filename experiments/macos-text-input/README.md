@@ -92,10 +92,25 @@ fixture 或完整人工日志可使用严格模式：
 
 ```bash
 swift run --package-path experiments/macos-text-input YuMacTextInputSpike \
-  --audit-ime-log experiments/macos-text-input/fixtures/japanese-combining-ime.log --strict
+  --audit-ime-log experiments/macos-text-input/fixtures/japanese-combining-ime.log \
+  --strict --expect-scenario japanese-combining
 ```
 
 严格模式要求 session 元数据存在且一致、日志没有截断尾部，并且文件结束时没有未完成的 composition。
+`--expect-scenario NAME` 还会要求 `IME_SESSION.scenario` 与本次人工验收标签完全一致，避免把另一种输入源
+的日志误当成当前结果。为避免重复输入命令，可以使用两个只负责捕获/审计的脚本：
+
+```bash
+experiments/macos-text-input/run-manual-acceptance.sh \
+  japanese-romaji /tmp/yu-ime-japanese-romaji.log
+
+experiments/macos-text-input/audit-manual-acceptance.sh \
+  japanese-romaji /tmp/yu-ime-japanese-romaji.log
+```
+
+捕获脚本不会切换 macOS 输入源，也不会修改 VoiceOver；它只设置 `YU_IME_SCENARIO`、保存终端输出并在
+退出时保留原始日志。推荐的场景标签和人工步骤见
+[`docs/experiments/macos-ime-manual-acceptance-2026-08-13.md`](../../docs/experiments/macos-ime-manual-acceptance-2026-08-13.md)。
 日文、组合重音的最小 fixture 位于 `experiments/macos-text-input/fixtures/japanese-combining-ime.log`；
 它只验证协议事件，不代表已经完成真实日文输入源、dead key 或 VoiceOver 的人工验收。
 

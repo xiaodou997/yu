@@ -342,6 +342,11 @@
     典型输出、emoji、符号和 RTL 文本；启动自检验证片段存在、UTF-16 AX 长度正确，窗口 AX value
     可读。静态样本只证明显示/shaping/AX 路径，不得替代真实日文输入法、dead key 事件或 VoiceOver
     朗读验收；复杂样本与简单 LTR layout probe 必须分离，避免诊断假设阻止窗口打开。
+54. 真实 IME 验收提供场景标签、原始日志捕获脚本和 `--expect-scenario` 严格审计；输入源与 VoiceOver
+    仍由用户手动选择/启停，工具不得修改系统设置。
+55. 在目标 macOS 机器上完成 `japanese-romaji`、`japanese-kana`（若启用）、`dead-key`、
+    `combining-mark` 和 `voiceover` 的人工记录；模板见
+    `docs/experiments/macos-ime-manual-acceptance-2026-08-13.md`。
 
 ## 非目标
 
