@@ -17,9 +17,10 @@ use std::time::SystemTime;
 
 use yu_core::{Revision, TextRange, Utf16Range};
 use yu_editor::{
-    CommandResult, CompositionError, EditorCommand, EditorDocument, EditorDocumentError,
+    CommandResult, CompositionError, CompositionOverlay, EditorCommand, EditorDocument,
+    EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult,
 };
-use yu_text::{AppliedTransaction, Transaction};
+use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -164,6 +165,37 @@ impl DocumentSession {
     #[must_use]
     pub fn editor(&self) -> &EditorDocument {
         &self.editor
+    }
+
+    /// Returns the canonical source selection owned by the editor.
+    #[must_use]
+    pub fn selection(&self) -> EditorSelection {
+        self.editor.selection()
+    }
+
+    /// Returns the active transient IME overlay, if any.
+    #[must_use]
+    pub fn composition(&self) -> Option<&CompositionOverlay> {
+        self.editor.composition()
+    }
+
+    /// Replaces the canonical source selection after the editor validates its
+    /// revision and UTF-8 boundaries.
+    pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), StorageError> {
+        self.editor
+            .set_selection(selection)
+            .map_err(|error| StorageError::Editor(EditorDocumentError::Selection(error)))
+    }
+
+    /// Resolves a native key through the canonical editor command route.
+    pub fn route_key(&mut self, event: KeyEvent) -> Result<KeyRouteResult, StorageError> {
+        self.editor.route_key(event).map_err(StorageError::Editor)
+    }
+
+    /// Reports whether a command is available without mutating editor state.
+    #[must_use]
+    pub fn command_available(&self, command: &EditorCommand) -> bool {
+        self.editor.command_available(command)
     }
 
     #[must_use]
@@ -342,6 +374,186 @@ impl DocumentSession {
     }
 }
 
+/// The single Rust-owned product session for a file-backed editor.
+///
+/// `DocumentSession` owns the canonical `EditorDocument`, file fingerprint,
+/// BOM and save boundary. This facade adds close lifecycle and makes command,
+/// selection and composition operations available through one object so a
+/// native host never needs separate storage and editor handles.
+#[derive(Debug)]
+pub struct DocumentEditorSession {
+    document: DocumentSession,
+    close: CloseStateMachine,
+}
+
+impl DocumentEditorSession {
+    /// Opens an existing UTF-8 Markdown file as one unified session.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        Ok(Self {
+            document: DocumentSession::open(path)?,
+            close: CloseStateMachine::new(),
+        })
+    }
+
+    /// Creates a new unsaved unified editor session.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
+        Self {
+            document: DocumentSession::new(path, source),
+            close: CloseStateMachine::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn document(&self) -> &DocumentSession {
+        &self.document
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.document.path()
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> TextSnapshot {
+        self.document.editor().snapshot()
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.document.revision()
+    }
+
+    #[must_use]
+    pub fn saved_revision(&self) -> Revision {
+        self.document.saved_revision()
+    }
+
+    #[must_use]
+    pub fn bom(&self) -> Utf8Bom {
+        self.document.bom()
+    }
+
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.document.is_dirty()
+    }
+
+    pub fn disk_state(&self) -> Result<DiskState, StorageError> {
+        self.document.disk_state()
+    }
+
+    pub fn external_file_state(&self) -> Result<Option<ExternalFileState>, StorageError> {
+        self.document.external_file_state()
+    }
+
+    #[must_use]
+    pub fn close_state(&self) -> CloseState {
+        self.close.state()
+    }
+
+    #[must_use]
+    pub fn selection(&self) -> EditorSelection {
+        self.document.selection()
+    }
+
+    #[must_use]
+    pub fn composition(&self) -> Option<&CompositionOverlay> {
+        self.document.composition()
+    }
+
+    pub fn execute(&mut self, command: EditorCommand) -> Result<CommandResult, StorageError> {
+        self.document.execute(command)
+    }
+
+    pub fn route_key(&mut self, event: KeyEvent) -> Result<KeyRouteResult, StorageError> {
+        self.document.route_key(event)
+    }
+
+    #[must_use]
+    pub fn command_available(&self, command: &EditorCommand) -> bool {
+        self.document.command_available(command)
+    }
+
+    pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), StorageError> {
+        self.document.set_selection(selection)
+    }
+
+    pub fn begin_composition(
+        &mut self,
+        replacement_range: TextRange,
+        text: impl Into<std::sync::Arc<str>>,
+        selection_utf16: Utf16Range,
+    ) -> Result<(), StorageError> {
+        self.document
+            .begin_composition(replacement_range, text, selection_utf16)
+    }
+
+    pub fn update_composition(
+        &mut self,
+        text: impl Into<std::sync::Arc<str>>,
+        selection_utf16: Utf16Range,
+    ) -> Result<(), StorageError> {
+        self.document.update_composition(text, selection_utf16)
+    }
+
+    pub fn commit_composition(
+        &mut self,
+        committed_text: impl Into<std::sync::Arc<str>>,
+    ) -> Result<AppliedTransaction, StorageError> {
+        self.document.commit_composition(committed_text)
+    }
+
+    #[must_use]
+    pub fn cancel_composition(&mut self) -> bool {
+        self.document.cancel_composition()
+    }
+
+    pub fn save(&mut self) -> Result<SaveOutcome, StorageError> {
+        self.document.save()
+    }
+
+    pub fn reload(&mut self) -> Result<ReloadOutcome, StorageError> {
+        self.document.reload()
+    }
+
+    pub fn close_request(&mut self) -> Result<CloseRequest, StorageError> {
+        self.document.close_request(&mut self.close)
+    }
+
+    pub fn cancel_close(&mut self) -> Result<CloseTransition, CloseStateError> {
+        self.close.cancel()
+    }
+
+    pub fn save_close(&mut self) -> Result<CloseTransition, StorageError> {
+        if !matches!(self.close.state(), CloseState::Prompting(_)) {
+            return Err(StorageError::CloseState(CloseStateError::NotPrompting));
+        }
+        match self.document.save() {
+            Ok(_) => self
+                .close
+                .save_succeeded()
+                .map_err(StorageError::CloseState),
+            Err(error @ StorageError::ExternalChange { state, .. }) => {
+                let _ = self.close.save_failed_external(state);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn discard_close(&mut self) -> Result<CloseTransition, CloseStateError> {
+        self.close.discard()
+    }
+
+    pub fn save_failed_external(
+        &mut self,
+        state: ExternalFileState,
+    ) -> Result<CloseTransition, CloseStateError> {
+        self.close.save_failed_external(state)
+    }
+}
+
 fn read_document(path: &Path) -> Result<(String, Utf8Bom, FileFingerprint), StorageError> {
     let bytes = fs::read(path).map_err(|source| StorageError::io("read", path, source))?;
     let metadata = fs::metadata(path).map_err(|source| StorageError::io("stat", path, source))?;
@@ -462,6 +674,7 @@ pub enum StorageError {
     UnsavedChanges {
         path: PathBuf,
     },
+    CloseState(CloseStateError),
     Editor(EditorDocumentError),
 }
 
@@ -501,6 +714,7 @@ impl fmt::Display for StorageError {
                     path.display()
                 )
             }
+            Self::CloseState(error) => write!(formatter, "invalid close transition: {error:?}"),
             Self::Editor(error) => error.fmt(formatter),
         }
     }
@@ -512,10 +726,17 @@ impl Error for StorageError {
             Self::Io { source, .. } => Some(source),
             Self::InvalidUtf8 { source, .. } => Some(source),
             Self::Editor(error) => Some(error),
-            Self::InvalidPath(_) | Self::ExternalChange { .. } | Self::UnsavedChanges { .. } => {
-                None
-            }
+            Self::InvalidPath(_)
+            | Self::ExternalChange { .. }
+            | Self::UnsavedChanges { .. }
+            | Self::CloseState(_) => None,
         }
+    }
+}
+
+impl From<CloseStateError> for StorageError {
+    fn from(error: CloseStateError) -> Self {
+        Self::CloseState(error)
     }
 }
 
