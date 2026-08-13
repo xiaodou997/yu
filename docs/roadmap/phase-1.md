@@ -33,6 +33,7 @@
 
 - [x] 可编译的 AppKit 实验程序
 - [x] `NSTextInputClient` 的 marked text/commit/candidate rect 最小链路
+- [x] 多行 preedit 的首个视觉 fragment candidate rect 与完整 AX range frame 分离
 - [x] 人工验证中文拼音、emoji 与 Escape cancel
 - [ ] 人工验证日文、dead key 与组合重音
 - [x] 日文、组合重音与 cancel 的 NSTextInputClient 协议回放
@@ -327,6 +328,10 @@
     之间保持 AX value、UTF-16 selection、marked styling、screen geometry 与 canonical mirror
     一致；启动日志必须只读记录当前键盘输入源。真实日文/dead key 与 VoiceOver 朗读仍属于人工
     验收，不得由协议回放伪造完成。
+50. `NSTextInputClient` 的 `firstRect` 必须返回请求范围首个视觉 fragment 的 screen-space rect，
+    多行 preedit 不得使用完整 range union；AX `accessibilityFrame` 可以返回完整 range geometry。
+    交互事件必须以结构化日志绑定事件序号、UTF-16 ranges、Revision/generation 与 candidate rect，
+    且不得修改 canonical source。
 
 ## 非目标
 

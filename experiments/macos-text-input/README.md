@@ -35,12 +35,14 @@ Rust composition session。直接使用 `swift build` 前需要先运行该脚�
 swift run --package-path experiments/macos-text-input YuMacTextInputSpike
 ```
 
-运行后切换中文拼音、日文或其他输入法。终端会记录 `setMarkedText`、`insertText` 和
-`unmarkText` 事件。需要确认：
+运行后切换中文拼音、日文或其他输入法。启动自检完成后，终端会记录一行一个 JSON 的
+`IME_EVENT` 事件；每条包含事件类型、UTF-16 replacement/selection/marked range、Revision、
+composition generation，以及可用时的屏幕矩形。`context=interactive` 的记录就是实际手工输入
+产生的事件，可以直接保存终端输出供复盘。需要确认：
 
 1. 拼音更新只改变 marked range；
 2. 选词后只产生一次 commit；
-3. candidate window 跟随 caret；
+3. candidate window 跟随 caret，并以多行 preedit 的首个视觉 fragment 为锚点；
 4. Escape 取消后正文恢复正确；
 5. emoji 和组合字符退格时不会被拆成无效序列。
 
@@ -56,6 +58,11 @@ mirror 恢复。它验证的是自绘 text entry 的 AX 协议一致性，不等
 启动时还会输出 `Keyboard input source probe`，记录当前 macOS 键盘输入源的 identifier、名称和
 类型。探针只读且必须在主线程调用，不会自动切换输入法；切换真实日文输入源、dead key 或其他
 输入源后的事件验证仍由人工完成。
+
+`Candidate window self-check` 会回放包含硬换行和 emoji 的多行 preedit。`firstRect` 只返回
+请求范围第一条视觉 fragment 的屏幕矩形，避免 candidate panel 使用整个 marked range 的 union
+而跳到后续行；AX `accessibilityFrame` 则继续提供完整范围几何。该检查验证坐标协议，不替代
+真实输入法 candidate panel 的人工跟随验收。
 
 `Layout self-check` 会将文本容器限制为 360 pt，并遍历 TextKit 的 canonical caret stops。当前固定
 文本应至少产生 4 个视觉行、一个软换行 affinity split，并通过 local point 与 screen point 两条
