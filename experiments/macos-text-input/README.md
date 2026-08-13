@@ -64,6 +64,18 @@ mirror 恢复。它验证的是自绘 text entry 的 AX 协议一致性，不等
 而跳到后续行；AX `accessibilityFrame` 则继续提供完整范围几何。该检查验证坐标协议，不替代
 真实输入法 candidate panel 的人工跟随验收。
 
+可对已保存日志运行无窗口审计：
+
+```bash
+swift run --package-path experiments/macos-text-input YuMacTextInputSpike \
+  --audit-ime-log /tmp/yu-ime.log
+```
+
+审计器检查事件序号、composition replacement range、generation 单调性、canonical Revision
+稳定性和 commit/cancel 收敛。用 Ctrl-C 结束实时窗口时，最后一行可能是不完整 JSON；审计器会将
+它报告为 `truncatedTail=true`，但仍严格校验此前所有完整事件。日文、组合重音的最小 fixture 位于
+`experiments/macos-text-input/fixtures/japanese-combining-ime.log`。
+
 `Layout self-check` 会将文本容器限制为 360 pt，并遍历 TextKit 的 canonical caret stops。当前固定
 文本应至少产生 4 个视觉行、一个软换行 affinity split，并通过 local point 与 screen point 两条
 hit-test 路径。硬行末按 TextKit 语义规范化为 LF 后 offset + upstream affinity。
