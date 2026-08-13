@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use yu_core::{Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::EditorCommand;
 use yu_storage::{
-    DiskState, DocumentSession, ExternalFileState, SaveOutcome, StorageError, Utf8Bom,
+    ClosePrompt, CloseRequest, CloseState, CloseStateMachine, CloseTransition, DiskState,
+    DocumentSession, ExternalFileState, SaveOutcome, StorageError, Utf8Bom,
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -242,4 +243,44 @@ fn invalid_utf8_is_rejected_before_editor_creation() {
         DocumentSession::open(path.as_path()).expect_err("invalid UTF-8 must fail"),
         StorageError::InvalidUtf8 { .. }
     ));
+}
+
+#[test]
+fn close_request_uses_session_dirty_and_external_conflict_state() {
+    let path = TestPath::new("close");
+    fs::write(path.as_path(), b"source").expect("write fixture");
+    let session = DocumentSession::open(path.as_path()).expect("open fixture");
+    let mut close = CloseStateMachine::new();
+
+    assert_eq!(
+        session
+            .close_request(&mut close)
+            .expect("clean close request"),
+        CloseRequest::CloseNow
+    );
+    assert_eq!(close.state(), CloseState::Closed);
+
+    let mut session = DocumentSession::open(path.as_path()).expect("reopen fixture");
+    session
+        .execute(EditorCommand::insert_text(" local"))
+        .expect("local edit should succeed");
+    let mut close = CloseStateMachine::new();
+    assert_eq!(
+        session
+            .close_request(&mut close)
+            .expect("dirty close request"),
+        CloseRequest::Prompt(ClosePrompt::SaveChanges)
+    );
+    assert_eq!(close.cancel(), Ok(CloseTransition::Cancelled));
+
+    fs::write(path.as_path(), b"external").expect("simulate external replacement");
+    assert_eq!(
+        session
+            .close_request(&mut close)
+            .expect("conflict close request"),
+        CloseRequest::Prompt(ClosePrompt::ExternalChange {
+            state: ExternalFileState::Changed,
+        })
+    );
+    assert_eq!(close.discard(), Ok(CloseTransition::Closed));
 }

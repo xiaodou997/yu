@@ -184,6 +184,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-storage-macos"
+version = "0.1.0"
+dependencies = [
+ "yu-storage",
+]
+
+[[package]]
 name = "yu-text"
 version = "0.1.0"
 dependencies = [

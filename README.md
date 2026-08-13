@@ -27,6 +27,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   Revision 和 composition overlay，新增编辑行为先固定可复现的行为契约；
 - `yu-storage::DocumentSession` 统一 UTF-8 Markdown open/save/reload、BOM 元数据、Revision-bound
   dirty 和外部文件冲突检测；保存使用同目录临时文件加原子 rename，不覆盖外部修改；
+- `yu-storage::FileWatchDebouncer` 与 `CloseStateMachine` 固定文件通知去抖、dirty close、取消/丢弃和
+  外部冲突提示；macOS flag 适配不把 watcher 线程或 AppKit 对象带入共享核心；
 - `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
   owned publication，macOS host 只消费已验证的 publication；
 - viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host
@@ -72,6 +74,7 @@ crates/yu-editor        EditorDocument、selection、commands、CompositionOverl
 crates/yu-editor-ffi    原生平台调用的 CompositionOverlay 与 command C ABI static library
 crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
 crates/yu-storage       UTF-8 Markdown 文档会话、BOM、原子保存和外部变更检测
+platform/macos/yu-storage-macos macOS FSEvents/DispatchSource flag 适配与文件通知 debounce
 crates/yu-markdown      lossless block/inline CST 与增量 Markdown parser
 crates/yu-projection    Source → Visual Markdown 投影
 crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
@@ -174,6 +177,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS NSTextInputClient composition lifecycle](docs/adr/0078-macos-nstextinputclient-composition-lifecycle.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
+- [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [Phase 2 路线](docs/roadmap/phase-2.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
