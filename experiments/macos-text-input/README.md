@@ -35,7 +35,13 @@ Rust composition session。直接使用 `swift build` 前需要先运行该脚�
 swift run --package-path experiments/macos-text-input YuMacTextInputSpike
 ```
 
-运行后切换中文拼音、日文或其他输入法。启动自检完成后，终端会记录一行一个 JSON 的
+窗口打开后默认显示一份固定 Unicode 样本文档，覆盖中文、日文平假名/片假名/汉字、组合重音、
+dead-key 的典型输出、emoji、常用符号、阿拉伯文和希伯来文。启动时会先检查这些片段确实存在，
+并通过 AX 字符数校验；这是“字体 fallback、shaping、换行、Unicode 显示和 AX 暴露是否正常”的
+快速可见入口。样本中的 `´ + e = é` 等是预期显示结果，不是程序自动发送 dead key；VoiceOver
+是否实际朗读、日文输入法是否产生正确 preedit，以及 dead key 是否产生正确事件，仍需人工操作。
+
+启动自检完成后，终端会记录一行一个 JSON 的
 `IME_EVENT` 事件；每条包含事件类型、UTF-16 replacement/selection/marked range、Revision、
 composition generation，以及可用时的屏幕矩形。`context=interactive` 的记录就是实际手工输入
 产生的事件，可以直接保存终端输出供复盘。需要确认：
@@ -45,6 +51,11 @@ composition generation，以及可用时的屏幕矩形。`context=interactive` 
 3. candidate window 跟随 caret，并以多行 preedit 的首个视觉 fragment 为锚点；
 4. Escape 取消后正文恢复正确；
 5. emoji 和组合字符退格时不会被拆成无效序列。
+
+启动日志中的 `Default display sample self-check fragments=10` 表示默认样本检查通过；窗口的
+Accessibility 树应将完整文本作为一个 `AXTextArea`/text entry value 暴露。启动过程中的 layout
+probe 使用较简单的 LTR 文本，以免把旧的 caret round-trip 诊断误当成完整 BiDi/emoji 布局验证；
+自检结束后会恢复上述 Unicode 样本供用户查看和输入。
 
 启动后程序还会运行两级 Accessibility 检查：先直接校验 View 的文本、行范围和 caret frame，
 再通过系统 `AXUIElement` 查询 focused element 的 role、字符数、首行文本及 bounds。成功时终端

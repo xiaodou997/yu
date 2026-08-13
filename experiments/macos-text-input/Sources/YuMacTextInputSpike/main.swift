@@ -6,6 +6,45 @@ import YuEditorFFI
 
 private let notFoundRange = NSRange(location: NSNotFound, length: 0)
 
+/// The document shown by the spike is intentionally a fixed Unicode/rendering
+/// sample. It tests shaping and Accessibility visibility as soon as the
+/// window opens; it is not a substitute for sending real IME events.
+private enum DefaultSampleDocument {
+    static let source = [
+        "Yu macOS IME spike",
+        "",
+        "请点击这里输入中文、日文、emoji 或组合字符。",
+        "日本語: ひらがな カタカナ 漢字 — 日本語入力",
+        "Combining: e\u{301} = é · A\u{30A} = Å · n\u{303} = ñ",
+        "Dead-key output: ´ + e = é · ` + a = à · ^ + o = ô · ~ + n = ñ",
+        "Emoji: 🙂 🚀 👨‍👩‍👧‍👦 🧑🏽‍💻 🏳️‍🌈",
+        "Symbols: ← → ⇧ ⌘ ⌥ ⌃ ⌫ • ± ≈ ≤ ≥ ∑ ∞ § © ™ ✓",
+        "RTL: العربية — עברית",
+        "",
+        "VoiceOver / AX: this text should expose one coherent text area.",
+    ].joined(separator: "\n") + "\n"
+
+    static let requiredFragments = [
+        "请点击",
+        "日本語",
+        "e\u{301}",
+        "é",
+        "´",
+        "🙂",
+        "👨‍👩‍👧‍👦",
+        "←",
+        "العربية",
+        "עברית",
+    ]
+
+    // The legacy TextKit/Rust line-equivalence probes intentionally use a
+    // simple LTR document. The startup sample remains richer so it can test
+    // display, shaping and AX coverage without making those probes claim to
+    // be a full BiDi/emoji layout oracle.
+    static let layoutProbeSource =
+        "Yu macOS IME spike\n\n请点击这里并输入中文、日文、emoji 或组合字符。\n"
+}
+
 private enum RustCaretAffinity: UInt8 {
     case upstream = 0
     case downstream = 1
@@ -1083,7 +1122,8 @@ private final class RustCompositionBridge {
         maxWidth: CGFloat,
         scrollY: CGFloat,
         viewportHeight: CGFloat,
-        margin: CGFloat
+        margin: CGFloat,
+        fallbackToMetrics: Bool = false
     ) -> RustCaretScrollResult {
         guard let session else { preconditionFailure("Rust composition session is missing") }
         var result = YuEditorCaretScrollRequest()
@@ -1097,6 +1137,17 @@ private final class RustCompositionBridge {
             Float(margin),
             &result
         )
+        if status != 0, fallbackToMetrics {
+            print(
+                "Rust shaped caret scroll request unavailable status=\(status); "
+                    + "falling back to metrics viewport"
+            )
+            return caretScrollRequest(
+                scrollY: scrollY,
+                viewportHeight: viewportHeight,
+                margin: margin
+            )
+        }
         precondition(status == 0, "Rust shaped caret scroll request failed: \(status)")
         return RustCaretScrollResult(
             revision: result.revision,
@@ -1446,7 +1497,7 @@ final class TextInputView: NSView, NSTextInputClient {
         replaceStorage(
             range: NSRange(location: 0, length: 0),
             with: NSAttributedString(
-                string: "Yu macOS IME spike\n\n请点击这里并输入中文、日文、emoji 或组合字符。\n",
+                string: DefaultSampleDocument.source,
                 attributes: defaultAttributes
             )
         )
@@ -1456,6 +1507,76 @@ final class TextInputView: NSView, NSTextInputClient {
         setAccessibilityRole(.textArea)
         setAccessibilityLabel("Yu Editor document")
         setAccessibilityIdentifier("yu-editor-document")
+    }
+
+    /// Verifies that the default window content itself contains the scripts
+    /// and grapheme classes that manual display/AX checks are meant to cover.
+    /// This intentionally does not synthesize IME composition events.
+    func runDefaultSampleSelfCheck() {
+        let source = textStorage.string
+        for fragment in DefaultSampleDocument.requiredFragments {
+            precondition(
+                source.range(of: fragment) != nil,
+                "default sample is missing \(fragment.debugDescription)"
+            )
+        }
+        precondition(
+            source == DefaultSampleDocument.source,
+            "default sample must remain the canonical startup document"
+        )
+        precondition(
+            accessibilityNumberOfCharacters() == source.utf16.count,
+            "default sample AX length must use UTF-16 units"
+        )
+        print(
+            "Default display sample self-check fragments=\(DefaultSampleDocument.requiredFragments.count) "
+                + "utf16=\(source.utf16.count)"
+        )
+    }
+
+    /// Runs the legacy protocol/layout probes against their intentionally
+    /// simple source. This keeps those probes deterministic while the window
+    /// still opens on the richer Unicode display sample.
+    fileprivate func prepareLayoutProbeDocument() {
+        clearCompositionState()
+        let replacement = attributedString(
+            from: DefaultSampleDocument.layoutProbeSource,
+            marked: false
+        )
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: replacement
+        )
+        rustComposition.resetSource(DefaultSampleDocument.layoutProbeSource)
+        selection = NSRange(
+            location: DefaultSampleDocument.layoutProbeSource.utf16.count,
+            length: 0
+        )
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        precondition(
+            textStorage.string == DefaultSampleDocument.layoutProbeSource,
+            "layout probe must install its own source before self-checks"
+        )
+        print("Layout probe prepared utf16=\(textStorage.string.utf16.count)")
+        needsDisplay = true
+    }
+
+    /// Restores the user-facing sample after self-checks have finished.
+    fileprivate func restoreDefaultSampleDocument() {
+        clearCompositionState()
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: attributedString(from: DefaultSampleDocument.source, marked: false)
+        )
+        rustComposition.resetSource(DefaultSampleDocument.source)
+        selection = NSRange(location: textStorage.length, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        updateContainerSize()
+        layoutManager.ensureLayout(for: textContainer)
+        synchronizeViewport()
+        needsDisplay = true
     }
 
     @available(*, unavailable)
@@ -2559,13 +2680,28 @@ final class TextInputView: NSView, NSTextInputClient {
 
     func runShapedLayoutComparisonSelfCheck() {
         updateContainerSize()
-        layoutManager.ensureLayout(for: textContainer)
-        let glyphRange = layoutManager.glyphRange(for: textContainer)
+        let probeSource = DefaultSampleDocument.layoutProbeSource
+        let probeStorage = NSTextStorage()
+        probeStorage.append(
+            NSAttributedString(string: probeSource, attributes: defaultAttributes)
+        )
+        let probeManager = NSLayoutManager()
+        let probeContainer = NSTextContainer(
+            size: NSSize(
+                width: textContainer.containerSize.width,
+                height: .greatestFiniteMagnitude
+            )
+        )
+        probeContainer.lineFragmentPadding = 0
+        probeManager.addTextContainer(probeContainer)
+        probeStorage.addLayoutManager(probeManager)
+        probeManager.ensureLayout(for: probeContainer)
+        let glyphRange = probeManager.glyphRange(for: probeContainer)
         var nativeRanges = [NSRange]()
-        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) {
+        probeManager.enumerateLineFragments(forGlyphRange: glyphRange) {
             _, _, _, lineGlyphRange, _ in
             nativeRanges.append(
-                self.layoutManager.characterRange(
+                probeManager.characterRange(
                     forGlyphRange: lineGlyphRange,
                     actualGlyphRange: nil
                 )
@@ -2576,7 +2712,7 @@ final class TextInputView: NSView, NSTextInputClient {
         let rustLines = rustComposition.coreTextSystemUiShapedLines(
             size: font.pointSize,
             maxWidth: textContainer.containerSize.width,
-            source: textStorage.string
+            source: probeSource
         )
         let rustRanges = rustLines
             .map { "\($0.source_start_utf16)..\($0.source_end_utf16)" }
@@ -2623,7 +2759,7 @@ final class TextInputView: NSView, NSTextInputClient {
         print(
             "Shaped layout self-check sourceLines=\(rustSourceLines.count) "
                 + "trailingCaretLines=\(rustLines.count - rustSourceLines.count) "
-                + "ranges=\(rustRanges)"
+                + "ranges=\(rustRanges) probe=default-ltr"
         )
     }
 
@@ -3446,7 +3582,8 @@ final class TextInputView: NSView, NSTextInputClient {
             maxWidth: nativeMetrics.maxWidth,
             scrollY: metrics.scrollY,
             viewportHeight: metrics.height,
-            margin: 8
+            margin: 8,
+            fallbackToMetrics: true
         )
         _ = viewportAdapter.apply(request, currentRevision: revision)
     }
@@ -3632,6 +3769,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(inputView)
         inputView.attachViewportAdapter(YuNativeViewportAdapter(scrollView: scrollView))
+        inputView.runDefaultSampleSelfCheck()
+        inputView.prepareLayoutProbeDocument()
         inputView.runLayoutRoundTripSelfCheck()
         inputView.runShapedLayoutComparisonSelfCheck()
         inputView.runProjectionShapedLayoutSelfCheck()
@@ -3647,6 +3786,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runAccessibilitySelfCheck()
         inputView.runAccessibilityCompositionSelfCheck()
         inputView.runCandidateWindowSelfCheck()
+        inputView.restoreDefaultSampleDocument()
+        inputView.runDefaultSampleSelfCheck()
         let inputSource = runKeyboardInputSourceProbe()
         let scenario = ProcessInfo.processInfo.environment["YU_IME_SCENARIO"] ?? "manual-ime"
         inputView.beginInteractiveInputCapture(scenario: scenario, inputSource: inputSource)
