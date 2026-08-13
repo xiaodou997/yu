@@ -25,6 +25,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - 原生命令结果显式声明 `None/Range/Full` source sync，局部编辑只复制变化的 UTF-16 范围；
 - `yu-editor` integration tests 使用 `EditorScenario` 标记 DSL 同时断言 source、caret/selection、
   Revision 和 composition overlay，新增编辑行为先固定可复现的行为契约；
+- `yu-storage::DocumentSession` 统一 UTF-8 Markdown open/save/reload、BOM 元数据、Revision-bound
+  dirty 和外部文件冲突检测；保存使用同目录临时文件加原子 rename，不覆盖外部修改；
 - `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
   owned publication，macOS host 只消费已验证的 publication；
 - viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host
@@ -49,7 +51,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 
 ## 当前阶段
 
-项目正在进行 **Phase 1：Contracts & Risk Spikes**。这一阶段不承诺完整 CommonMark 或
+项目已完成 Phase 1 的主要 Contracts & Risk Spikes，当前进入 **Phase 2：Document Sessions & Product
+Shell Contracts**。这两个阶段都不承诺完整 CommonMark 或
 产品 UI；它先固定最容易影响长期架构的契约：
 
 - 强类型源码坐标、Revision 与稳定 Anchor；
@@ -59,6 +62,7 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - 增量实现必须满足的等价性和源码保真不变量。
 
 详细进度见 [Phase 1 路线](docs/roadmap/phase-1.md)。
+当前存储/文档会话进度见 [Phase 2 路线](docs/roadmap/phase-2.md)。
 
 ## 仓库结构
 
@@ -67,6 +71,7 @@ crates/yu-core          坐标、范围、Revision、Anchor
 crates/yu-editor        EditorDocument、selection、commands、CompositionOverlay 和平台无关编辑状态
 crates/yu-editor-ffi    原生平台调用的 CompositionOverlay 与 command C ABI static library
 crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
+crates/yu-storage       UTF-8 Markdown 文档会话、BOM、原子保存和外部变更检测
 crates/yu-markdown      lossless block/inline CST 与增量 Markdown parser
 crates/yu-projection    Source → Visual Markdown 投影
 crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
@@ -168,7 +173,9 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Composition projection FFI](docs/adr/0077-composition-projection-ffi.md)
 - [macOS NSTextInputClient composition lifecycle](docs/adr/0078-macos-nstextinputclient-composition-lifecycle.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
+- [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
+- [Phase 2 路线](docs/roadmap/phase-2.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS IME 人工验收模板](docs/experiments/macos-ime-manual-acceptance-2026-08-13.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)

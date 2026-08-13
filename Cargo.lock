@@ -175,6 +175,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-storage"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
+ "yu-editor",
+ "yu-text",
+]
+
+[[package]]
 name = "yu-text"
 version = "0.1.0"
 dependencies = [
