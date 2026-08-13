@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import YuEditorFFI
 
 private let notFoundRange = NSRange(location: NSNotFound, length: 0)
@@ -1442,6 +1443,87 @@ final class TextInputView: NSView, NSTextInputClient {
             "AX self-check characters=\(accessibilityNumberOfCharacters()) "
                 + "selection=\(accessibilitySelectedTextRange()) "
                 + "firstLine=\(firstLine) caretFrame=\(caretFrame)"
+        )
+    }
+
+    /// Verifies that the native AX mirror remains coherent while a Rust
+    /// composition overlay is visible, including the unmark presentation
+    /// transition and the eventual commit/cancel paths.
+    func runAccessibilityCompositionSelfCheck() {
+        let savedStorage = NSAttributedString(attributedString: textStorage)
+        let savedSelection = selection
+        let savedAffinity = selectionAffinity
+        let savedMarked = marked
+        let base = textStorage.string
+
+        selection = NSRange(location: textStorage.length, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        setMarkedText(
+            "にほん🙂",
+            selectedRange: NSRange(location: "にほん🙂".utf16.count, length: 0),
+            replacementRange: notFoundRange
+        )
+
+        let markedRange = marked
+        let markedText = "にほん🙂"
+        let markedFrame = accessibilityFrame(for: markedRange)
+        precondition(hasMarkedText() && rustComposition.hasOverlay)
+        precondition((accessibilityValue() as? String) == textStorage.string)
+        precondition(accessibilityNumberOfCharacters() == textStorage.length)
+        precondition(accessibilitySelectedTextRange() == selection)
+        precondition(accessibilityString(for: markedRange) == markedText)
+        precondition(
+            accessibilityAttributedString(for: markedRange)?.attribute(
+                .underlineStyle,
+                at: 0,
+                effectiveRange: nil
+            ) != nil,
+            "AX marked range must retain native preedit styling"
+        )
+        precondition(!markedFrame.isEmpty, "AX marked range must have screen geometry")
+
+        unmarkText()
+        precondition(!hasMarkedText() && rustComposition.hasOverlay)
+        precondition((accessibilityValue() as? String) == textStorage.string)
+        precondition(accessibilitySelectedTextRange() == selection)
+
+        insertText("日本語", replacementRange: notFoundRange)
+        precondition(!hasMarkedText() && !rustComposition.hasOverlay)
+        precondition(textStorage.string == base + "日本語")
+        precondition((accessibilityValue() as? String) == textStorage.string)
+
+        let cancelBase = textStorage.string
+        selection = NSRange(location: textStorage.length, length: 0)
+        selectionAffinity = .downstream
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        setMarkedText(
+            "e\u{301}",
+            selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: notFoundRange
+        )
+        let cancelRange = marked
+        precondition(accessibilityString(for: cancelRange) == "e\u{301}")
+        unmarkText()
+        cancelComposition()
+        precondition(!hasMarkedText() && !rustComposition.hasOverlay)
+        precondition(textStorage.string == cancelBase)
+        precondition((accessibilityValue() as? String) == textStorage.string)
+
+        replaceStorage(
+            range: NSRange(location: 0, length: textStorage.length),
+            with: savedStorage
+        )
+        selection = savedSelection
+        selectionAffinity = savedAffinity
+        clearCompositionState()
+        marked = savedMarked
+        rustComposition.resetSource(textStorage.string)
+        rustComposition.setSelection(selection, affinity: selectionAffinity)
+        needsDisplay = true
+        print(
+            "AX composition self-check marked-range=stable unmark=visible "
+                + "commit=once cancel=restored"
         )
     }
 
@@ -2945,6 +3027,46 @@ private extension Array where Element == CGFloat {
     }
 }
 
+private struct KeyboardInputSourceSnapshot {
+    let identifier: String
+    let localizedName: String?
+    let type: String?
+}
+
+/// Reads the selected keyboard source for the manual IME run. HIToolbox's
+/// TextInputSources API is main-thread-only for UI applications, so this is
+/// intentionally called from applicationDidFinishLaunching.
+private func currentKeyboardInputSourceSnapshot() -> KeyboardInputSourceSnapshot? {
+    guard let unmanagedSource = TISCopyCurrentKeyboardInputSource() else { return nil }
+    let source = unmanagedSource.takeRetainedValue()
+
+    func stringProperty(_ key: CFString) -> String? {
+        guard let pointer = TISGetInputSourceProperty(source, key) else { return nil }
+        return Unmanaged<CFString>.fromOpaque(pointer).takeUnretainedValue() as String
+    }
+
+    guard let identifier = stringProperty(kTISPropertyInputSourceID), !identifier.isEmpty else {
+        return nil
+    }
+    return KeyboardInputSourceSnapshot(
+        identifier: identifier,
+        localizedName: stringProperty(kTISPropertyLocalizedName),
+        type: stringProperty(kTISPropertyInputSourceType)
+    )
+}
+
+private func runKeyboardInputSourceProbe() {
+    guard let source = currentKeyboardInputSourceSnapshot() else {
+        print("Keyboard input source probe unavailable")
+        return
+    }
+    print(
+        "Keyboard input source probe id=\(source.identifier) "
+            + "name=\(source.localizedName ?? "<unknown>") "
+            + "type=\(source.type ?? "<unknown>")"
+    )
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
 
@@ -2988,6 +3110,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         inputView.runAttachedViewportSelfCheck()
         inputView.runNativeSelectionSelfCheck()
         inputView.runAccessibilitySelfCheck()
+        inputView.runAccessibilityCompositionSelfCheck()
+        runKeyboardInputSourceProbe()
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.25) {
             runAccessibilityRuntimeProbe()
