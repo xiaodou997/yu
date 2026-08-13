@@ -1455,8 +1455,11 @@ final class TextInputView: NSView, NSTextInputClient {
                 let windowRect = convert(localRect, to: nil)
                 return window?.convertToScreen(windowRect) ?? windowRect
             }
-            let firstGlyph = NSRange(location: glyphRange.location, length: 1)
-            let bounds = layoutManager.boundingRect(forGlyphRange: firstGlyph, in: textContainer)
+            let firstGlyph = glyphRange.location
+            let bounds = layoutManager.boundingRect(
+                forGlyphRange: NSRange(location: firstGlyph, length: 1),
+                in: textContainer
+            )
             localRect = bounds.offsetBy(dx: textOrigin.x, dy: textOrigin.y)
         }
 
@@ -1701,11 +1704,23 @@ final class TextInputView: NSView, NSTextInputClient {
         let range = marked
         let candidate = candidateRect(forCharacterRange: range, actualRange: &actualRange)
         let full = rangeFrame(forCharacterRange: range, actualRange: nil)
+        let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        var effectiveLineRange = NSRange(location: NSNotFound, length: 0)
+        let line = layoutManager.lineFragmentRect(
+            forGlyphAt: glyphRange.location,
+            effectiveRange: &effectiveLineRange
+        )
+        let lineFrame = line.offsetBy(dx: textOrigin.x, dy: textOrigin.y)
+        let lineWindowRect = convert(lineFrame, to: nil)
+        let lineScreenRect = window?.convertToScreen(lineWindowRect) ?? lineWindowRect
         precondition(actualRange == range)
         precondition(candidate.origin.x.isFinite && candidate.origin.y.isFinite)
         precondition(candidate.width.isFinite && candidate.height.isFinite)
         precondition(!candidate.isEmpty && !full.isEmpty)
-        precondition(candidate.minY == full.minY, "candidate must anchor to the first visual line")
+        precondition(
+            abs(candidate.minY - lineScreenRect.minY) < 0.5,
+            "candidate must anchor to the first visual line"
+        )
         precondition(candidate.maxY <= full.maxY, "candidate must not span later preedit lines")
         precondition(
             candidate.width <= full.width,
@@ -2524,7 +2539,10 @@ final class TextInputView: NSView, NSTextInputClient {
         precondition(projected == "before 日本🙂 after")
         precondition(projection.replacementRange == NSRange(location: 9, length: 1))
         precondition(projection.visualSelection == NSRange(location: 9, length: 2))
-        precondition(projection.generation == 1)
+        // Earlier startup self-checks may reset the canonical source before
+        // this probe. The generation is session-global, so only its monotonic
+        // relationship to the subsequent update is stable here.
+        precondition(projection.generation > 0)
         let caret = rustComposition.compositionCaret(sourceUTF16: 9, projection: projection)
         precondition(caret.revision == projection.revision)
         precondition(caret.generation == projection.generation)
@@ -2535,7 +2553,9 @@ final class TextInputView: NSView, NSTextInputClient {
         let updated = rustComposition.projection()
         precondition(updated.generation == projection.generation + 1)
         precondition(rustComposition.projectedString(updated) == "before 日本語 after")
-        precondition(updated.visualSelection == NSRange(location: 9, length: 0))
+        // The replacement begins at visual offset 7 (after "before "), so
+        // the three-UTF-16-unit Japanese preedit caret lands at visual 10.
+        precondition(updated.visualSelection == NSRange(location: 10, length: 0))
         rustComposition.cancel()
 
         replaceStorage(
