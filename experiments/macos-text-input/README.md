@@ -49,6 +49,14 @@ swift run --package-path experiments/macos-text-input YuMacTextInputSpike
 应出现 `AX self-check` 和 `AX runtime probe trusted=true role=AXTextArea`。后者依赖当前终端或
 生成的 `.app` 已获 macOS Accessibility 权限。
 
+随后运行 `AX composition self-check`：在 marked preedit、`unmarkText`、commit 和 cancel 之间
+检查 AX value、UTF-16 selected range、marked range 的 underline、screen geometry 以及 canonical
+mirror 恢复。它验证的是自绘 text entry 的 AX 协议一致性，不等同于 VoiceOver 实际朗读验收。
+
+启动时还会输出 `Keyboard input source probe`，记录当前 macOS 键盘输入源的 identifier、名称和
+类型。探针只读且必须在主线程调用，不会自动切换输入法；切换真实日文输入源、dead key 或其他
+输入源后的事件验证仍由人工完成。
+
 `Layout self-check` 会将文本容器限制为 360 pt，并遍历 TextKit 的 canonical caret stops。当前固定
 文本应至少产生 4 个视觉行、一个软换行 affinity split，并通过 local point 与 screen point 两条
 hit-test 路径。硬行末按 TextKit 语义规范化为 LF 后 offset + upstream affinity。

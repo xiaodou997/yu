@@ -110,6 +110,8 @@
 - [x] probe-only AppKit main-thread host lifecycle test harness（真实 Metal session 按条件运行）
 - [x] 系统 Accessibility text range 与 screen bounds 查询实验
 - [x] Yu View AX text entry tree 运行时查询
+- [x] composition 期间 AX mirror 的 value、selection、marked range、geometry、commit/cancel
+      协议自检与当前键盘输入源只读诊断
 - [ ] VoiceOver 实际朗读质量验证
 - [x] 多行 shaping、点击和 caret round-trip
 
@@ -321,6 +323,10 @@
     hidden syntax 必须减少 visual range 而不改变 canonical source range。zero-width caret line
     可由 editor layout 保留，但不得被误报为 TextKit source-consuming line。当前 probe 使用
     宽容器/显式换行隔离 projection mapping，不能替代自然语言 word-break 等价性测试。
+49. macOS composition-aware Accessibility self-check 必须在 marked、unmark、commit 和 cancel
+    之间保持 AX value、UTF-16 selection、marked styling、screen geometry 与 canonical mirror
+    一致；启动日志必须只读记录当前键盘输入源。真实日文/dead key 与 VoiceOver 朗读仍属于人工
+    验收，不得由协议回放伪造完成。
 
 ## 非目标
 
