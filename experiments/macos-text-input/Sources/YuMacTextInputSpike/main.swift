@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
+import Darwin
 import YuEditorFFI
 
 private let notFoundRange = NSRange(location: NSNotFound, length: 0)
@@ -113,7 +114,7 @@ private struct RustCompositionState {
     let caret: RustCompositionCaret
 }
 
-private struct InputEventRange: Codable {
+private struct InputEventRange: Codable, Equatable {
     let location: Int
     let length: Int
 
@@ -121,6 +122,10 @@ private struct InputEventRange: Codable {
         guard range.location != NSNotFound else { return nil }
         location = range.location
         length = range.length
+    }
+
+    var nsRange: NSRange {
+        NSRange(location: location, length: length)
     }
 }
 
@@ -190,6 +195,207 @@ private final class InputEventRecorder {
         }
         print("IME_EVENT \(line)")
     }
+}
+
+private struct InputEventAuditFailure: Error, CustomStringConvertible {
+    let line: Int?
+    let message: String
+
+    var description: String {
+        if let line {
+            return "line \(line): \(message)"
+        }
+        return message
+    }
+}
+
+private struct InputEventAuditSummary {
+    let records: Int
+    let contexts: [String]
+    let commits: Int
+    let cancels: Int
+    let maxGeneration: UInt64
+    let openComposition: Bool
+    let truncatedTail: Bool
+}
+
+private struct AuditedComposition {
+    let replacementLocation: Int
+    var nativeRange: NSRange
+    var generation: UInt64
+    var revision: UInt64
+}
+
+private func auditInputEventLog(at path: String) throws -> InputEventAuditSummary {
+    let contents: String
+    do {
+        contents = try String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)
+    } catch {
+        throw InputEventAuditFailure(line: nil, message: "cannot read \(path): \(error)")
+    }
+
+    let decoder = JSONDecoder()
+    var records: [InputEventRecord] = []
+    let rawLines = contents.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+    var truncatedTail = false
+    for (offset, rawLine) in rawLines.enumerated() {
+        guard let marker = rawLine.range(of: "IME_EVENT ") else { continue }
+        let payload = String(rawLine[marker.upperBound...])
+        do {
+            records.append(try decoder.decode(InputEventRecord.self, from: Data(payload.utf8)))
+        } catch {
+            if offset == rawLines.count - 1 {
+                truncatedTail = true
+                continue
+            }
+            throw InputEventAuditFailure(
+                line: offset + 1,
+                message: "invalid IME_EVENT JSON: \(error)"
+            )
+        }
+    }
+    guard !records.isEmpty else {
+        throw InputEventAuditFailure(line: nil, message: "no IME_EVENT records found")
+    }
+
+    var previousSequence = 0
+    var lastGeneration: UInt64?
+    var active: AuditedComposition?
+    var contexts = Set<String>()
+    var sawInteractive = false
+    var commits = 0
+    var cancels = 0
+    var maxGeneration: UInt64 = 0
+
+    func fail(_ record: InputEventRecord, _ message: String) throws -> Never {
+        throw InputEventAuditFailure(line: record.sequence, message: message)
+    }
+
+    for record in records {
+        if record.sequence != previousSequence + 1 {
+            try fail(record, "sequence must be contiguous after \(previousSequence)")
+        }
+        previousSequence = record.sequence
+        contexts.insert(record.context)
+        if record.context == "interactive" {
+            sawInteractive = true
+        } else if sawInteractive {
+            try fail(record, "startup-self-check event appears after interactive capture")
+        }
+        if let generation = record.generation {
+            if let lastGeneration, generation < lastGeneration {
+                try fail(record, "generation regressed from \(lastGeneration) to \(generation)")
+            }
+            lastGeneration = generation
+            maxGeneration = max(maxGeneration, generation)
+        }
+
+        switch record.kind {
+        case "setMarkedText":
+            guard let text = record.text else { try fail(record, "setMarkedText requires text") }
+            guard let replacement = record.replacementRange,
+                  let selected = record.selectedRange,
+                  let marked = record.markedRange,
+                  let generation = record.generation
+            else { try fail(record, "setMarkedText requires replacement/selection/marked/generation") }
+            let textLength = (text as NSString).length
+            if marked.length != textLength || marked.location != replacement.location {
+                try fail(record, "marked range must cover text at replacement start")
+            }
+            if selected.location < replacement.location
+                || selected.location + selected.length > NSMaxRange(marked.nsRange)
+            {
+                try fail(record, "selected range must be inside the marked range")
+            }
+            if let active {
+                if replacement.location != active.replacementLocation {
+                    try fail(record, "composition replacement start changed while active")
+                }
+                if generation <= active.generation {
+                    try fail(record, "marked update must advance composition generation")
+                }
+                if record.revision != active.revision {
+                    try fail(record, "preedit update must not advance canonical revision")
+                }
+            }
+            active = AuditedComposition(
+                replacementLocation: replacement.location,
+                nativeRange: marked.nsRange,
+                generation: generation,
+                revision: record.revision
+            )
+
+        case "unmarkText":
+            guard record.text == nil else { try fail(record, "unmarkText must not carry text") }
+            if let active {
+                guard let replacement = record.replacementRange,
+                      let generation = record.generation
+                else { try fail(record, "active unmarkText requires ranges and generation") }
+                if replacement.nsRange != active.nativeRange {
+                    try fail(record, "unmarkText range differs from active native range")
+                }
+                if let marked = record.markedRange, marked.nsRange != active.nativeRange {
+                    try fail(record, "unmarkText marked range differs from active native range")
+                }
+                if generation != active.generation {
+                    try fail(record, "unmarkText must use the active composition generation")
+                }
+                if record.revision != active.revision {
+                    try fail(record, "unmarkText must not advance canonical revision")
+                }
+            } else if record.markedRange != nil {
+                try fail(record, "unmarked no-op must not report a marked range")
+            }
+
+        case "insertText":
+            guard record.text != nil,
+                  let replacement = record.replacementRange,
+                  record.selectedRange != nil
+            else { try fail(record, "insertText requires text, replacement and selection") }
+            if let current = active {
+                guard let generation = record.generation else {
+                    try fail(record, "composition commit requires generation")
+                }
+                if replacement.nsRange != current.nativeRange || generation != current.generation {
+                    try fail(record, "commit must consume the active native range and generation")
+                }
+                if record.revision != current.revision {
+                    try fail(record, "commit event must be recorded against the pre-commit revision")
+                }
+                commits += 1
+                active = nil
+            } else if record.generation != nil {
+                try fail(record, "direct insertText must not carry a composition generation")
+            }
+
+        case "cancelComposition":
+            guard let current = active else { try fail(record, "cancel requires an active composition") }
+            guard let replacement = record.replacementRange,
+                  let generation = record.generation
+            else { try fail(record, "cancel requires replacement range and generation") }
+            if replacement.nsRange != current.nativeRange || generation != current.generation {
+                try fail(record, "cancel must consume the active native range and generation")
+            }
+            if record.revision != current.revision {
+                try fail(record, "cancel must not advance canonical revision")
+            }
+            cancels += 1
+            active = nil
+
+        default:
+            try fail(record, "unknown event kind \(record.kind)")
+        }
+    }
+
+    return InputEventAuditSummary(
+        records: records.count,
+        contexts: contexts.sorted(),
+        commits: commits,
+        cancels: cancels,
+        maxGeneration: maxGeneration,
+        openComposition: active != nil,
+        truncatedTail: truncatedTail
+    )
 }
 
 private struct RustViewportMetrics: Equatable {
@@ -3416,8 +3622,32 @@ private func runAccessibilityRuntimeProbe() {
     )
 }
 
-let application = NSApplication.shared
-let delegate = AppDelegate()
-application.setActivationPolicy(.regular)
-application.delegate = delegate
-application.run()
+private func runApplication() {
+    let application = NSApplication.shared
+    let delegate = AppDelegate()
+    application.setActivationPolicy(.regular)
+    application.delegate = delegate
+    application.run()
+}
+
+let commandLine = CommandLine.arguments
+if commandLine.dropFirst().first == "--audit-ime-log" {
+    guard commandLine.count == 3 else {
+        fputs("usage: YuMacTextInputSpike --audit-ime-log PATH\n", stderr)
+        exit(64)
+    }
+    do {
+        let summary = try auditInputEventLog(at: commandLine[2])
+        print(
+            "IME audit passed records=\(summary.records) contexts=\(summary.contexts.joined(separator: ",")) "
+                + "commits=\(summary.commits) cancels=\(summary.cancels) "
+                + "maxGeneration=\(summary.maxGeneration) openComposition=\(summary.openComposition) "
+                + "truncatedTail=\(summary.truncatedTail)"
+        )
+    } catch {
+        fputs("IME audit failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+} else {
+    runApplication()
+}

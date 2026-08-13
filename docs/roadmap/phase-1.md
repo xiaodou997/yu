@@ -332,6 +332,9 @@
     多行 preedit 不得使用完整 range union；AX `accessibilityFrame` 可以返回完整 range geometry。
     交互事件必须以结构化日志绑定事件序号、UTF-16 ranges、Revision/generation 与 candidate rect，
     且不得修改 canonical source。
+51. macOS IME 事件日志必须可在无窗口模式下回放审计：序号连续、replacement start 在一次
+    composition 内稳定、generation 单调、preedit/unmark/commit/cancel 的 canonical Revision
+    关系明确；实时 Ctrl-C 产生的末尾半行只能标记为 truncated tail，中间 malformed event 必须失败。
 
 ## 非目标
 
