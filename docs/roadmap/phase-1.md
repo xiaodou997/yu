@@ -347,6 +347,10 @@
 55. 在目标 macOS 机器上完成 `japanese-romaji`、`japanese-kana`（若启用）、`dead-key`、
     `combining-mark` 和 `voiceover` 的人工记录；模板见
     `docs/experiments/macos-ime-manual-acceptance-2026-08-13.md`。
+56. `yu-editor` integration tests 必须提供 source/caret/selection 标记 DSL，并用真实
+    `EditorDocument` command/composition API 覆盖 Unicode 删除、selection replacement、IME
+    commit/cancel、列表续行、task toggle、Undo/Redo 和垂直 selection；DSL 只属于测试，不得成为
+    第二套编辑状态。
 
 ## 非目标
 
