@@ -12,7 +12,10 @@ repository.workspace = true
 crate-type = ["staticlib"]
 
 [dependencies]
+yu-core = { path = "../yu-core" }
+yu-editor = { path = "../yu-editor" }
 yu-storage = { path = "../yu-storage" }
+yu-text = { path = "../yu-text" }
 
 [lints]
 workspace = true

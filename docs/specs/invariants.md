@@ -181,6 +181,9 @@
 7. macOS document host 的 `NSTextView` source mirror 只能消费 Rust-owned
    `DocumentSession` snapshot；在 storage session 与 editor session 合并前，镜像必须只读，
    不得形成第二份可变 source、dirty 或 history。
+8. 可写 native host 必须只持有一个 `DocumentEditorSession` handle；command、selection、key
+   route、composition、save 和 close 的 Revision/dirty 结果必须来自同一 `EditorDocument`，不得
+   通过并列 storage/editor handles 复制 source 或猜测 state。
 
 ## Degradation
 

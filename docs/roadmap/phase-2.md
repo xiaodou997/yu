@@ -27,7 +27,9 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [ ] workspace/tab/session 生命周期，不复制 source
 - [x] 无窗口 close-before-discard 状态机：save、discard、cancel 与 external conflict
 - [x] macOS 最小文档窗口 host：打开、源码镜像、标题/dirty 状态、保存/重载和关闭提示
-- [ ] macOS 可编辑文档 host：把 `DocumentSession` 与现有 `EditorDocument`/IME FFI 合并为单一可变会话
+- [x] Rust `DocumentEditorSession`：把 `DocumentSession`、`EditorDocument`、composition 和 close 绑定到一个可变会话
+- [x] 统一 session FFI：command、selection、native key route 和 composition 通过同一 handle
+- [ ] macOS 可编辑文档 host：将 `NSTextInputClient` 的 marked range/source sync 接入统一 session FFI
 - [ ] 平台剪贴板格式与 source-backed Markdown/纯文本导出
 - [ ] 文件路径、标题、dirty 和 Revision 的 Accessibility/菜单状态投影
 - [ ] 以 `DocumentSession` 为输入的 headless vertical slice benchmark
@@ -53,6 +55,6 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 
 ## 下一步
 
-下一阶段应定义一个同时持有 `DocumentSession` 与 `EditorDocument` 的单一 Rust 可变会话，复用
-现有 `yu-editor-ffi`/`NSTextInputClient` 的 composition 协议；在此之前不要让 AppKit 文本控件可写，
-也不要把 storage FFI 和 editor FFI 各自升级成两份 source。
+下一阶段应做 macOS `NSTextInputClient` 的可写 host 接线：以统一 session FFI 的 Revision-bound
+selection/command/composition 结果驱动 native mirror 的局部或全量 source sync；在此之前不要让
+AppKit 文本控件自行拥有可变 source，也不要恢复 storage/editor 两个独立 handle。

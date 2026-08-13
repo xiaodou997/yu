@@ -6,7 +6,7 @@ use yu_core::{Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::EditorCommand;
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, CloseStateMachine, CloseTransition, DiskState,
-    DocumentSession, ExternalFileState, SaveOutcome, StorageError, Utf8Bom,
+    DocumentEditorSession, DocumentSession, ExternalFileState, SaveOutcome, StorageError, Utf8Bom,
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -283,4 +283,80 @@ fn close_request_uses_session_dirty_and_external_conflict_state() {
         })
     );
     assert_eq!(close.discard(), Ok(CloseTransition::Closed));
+}
+
+#[test]
+fn unified_session_routes_edit_and_ime_through_one_source_revision() {
+    let path = TestPath::new("unified");
+    fs::write(path.as_path(), "输入: ").expect("write fixture");
+    let mut session = DocumentEditorSession::open(path.as_path()).expect("open fixture");
+    assert_eq!(session.revision(), Revision::INITIAL);
+    assert_eq!(session.snapshot().as_str(), "输入: ");
+
+    session
+        .execute(EditorCommand::insert_text("🙂"))
+        .expect("command should use canonical editor");
+    assert_eq!(session.revision(), Revision::new(1));
+    assert_eq!(session.snapshot().as_str(), "输入: 🙂");
+    assert!(session.is_dirty());
+
+    let end = session.snapshot().len_bytes();
+    session
+        .begin_composition(
+            TextRange::empty(end),
+            "にほんご",
+            Utf16Range::empty(Utf16Offset::new(4)),
+        )
+        .expect("composition should share the editor");
+    assert_eq!(session.revision(), Revision::new(1));
+    assert!(session.composition().is_some());
+    session
+        .update_composition("日本語", Utf16Range::empty(Utf16Offset::new(3)))
+        .expect("preedit update should remain transient");
+    assert_eq!(session.snapshot().as_str(), "输入: 🙂");
+    session
+        .commit_composition("日本語")
+        .expect("commit should create one transaction");
+    assert_eq!(session.revision(), Revision::new(2));
+    assert_eq!(session.snapshot().as_str(), "输入: 🙂日本語");
+    assert!(session.is_dirty());
+}
+
+#[test]
+fn unified_session_close_uses_same_dirty_and_external_state() {
+    let path = TestPath::new("unified-close");
+    fs::write(path.as_path(), "source").expect("write fixture");
+    let mut session = DocumentEditorSession::open(path.as_path()).expect("open fixture");
+    session
+        .execute(EditorCommand::insert_text(" local"))
+        .expect("edit should succeed");
+    assert_eq!(
+        session.close_request().expect("close request"),
+        CloseRequest::Prompt(ClosePrompt::SaveChanges)
+    );
+    assert_eq!(
+        session.cancel_close().expect("cancel close"),
+        CloseTransition::Cancelled
+    );
+    fs::write(path.as_path(), "external").expect("simulate external replacement");
+    assert_eq!(
+        session.close_request().expect("conflict close request"),
+        CloseRequest::Prompt(ClosePrompt::ExternalChange {
+            state: ExternalFileState::Changed,
+        })
+    );
+    assert!(matches!(
+        session.save_close().expect_err("external save must fail"),
+        StorageError::ExternalChange { .. }
+    ));
+    assert!(matches!(
+        session.close_state(),
+        yu_storage::CloseState::Prompting(ClosePrompt::ExternalChange { .. })
+    ));
+    assert_eq!(
+        session
+            .discard_close()
+            .expect("discard should close the unified session"),
+        CloseTransition::Closed
+    );
 }

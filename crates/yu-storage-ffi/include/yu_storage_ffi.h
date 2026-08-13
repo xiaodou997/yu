@@ -15,6 +15,59 @@ enum {
     YU_STORAGE_EDITOR_ERROR = 7,
     YU_STORAGE_BUFFER_TOO_SMALL = 8,
     YU_STORAGE_INVALID_STATE = 9,
+    YU_STORAGE_KEY_UNHANDLED = 10,
+    YU_STORAGE_INVALID_COMMAND = 11,
+    YU_STORAGE_INVALID_KEY = 12,
+    YU_STORAGE_STALE_REVISION = 13,
+    YU_STORAGE_INVALID_SELECTION = 14,
+    YU_STORAGE_NO_OVERLAY = 15,
+};
+
+enum {
+    YU_STORAGE_KEY_CHARACTER = 0,
+    YU_STORAGE_KEY_ENTER = 1,
+    YU_STORAGE_KEY_TAB = 2,
+    YU_STORAGE_KEY_BACKSPACE = 3,
+    YU_STORAGE_KEY_DELETE = 4,
+    YU_STORAGE_KEY_LEFT = 5,
+    YU_STORAGE_KEY_RIGHT = 6,
+    YU_STORAGE_KEY_UP = 7,
+    YU_STORAGE_KEY_DOWN = 8,
+    YU_STORAGE_KEY_ESCAPE = 9,
+};
+
+enum {
+    YU_STORAGE_KEY_MODIFIER_COMMAND = 1 << 0,
+    YU_STORAGE_KEY_MODIFIER_SHIFT = 1 << 1,
+    YU_STORAGE_KEY_MODIFIER_CONTROL = 1 << 2,
+    YU_STORAGE_KEY_MODIFIER_OPTION = 1 << 3,
+};
+
+enum {
+    YU_STORAGE_COMMAND_DELETE_BACKWARD = 1,
+    YU_STORAGE_COMMAND_DELETE_FORWARD = 2,
+    YU_STORAGE_COMMAND_MOVE_LEFT = 3,
+    YU_STORAGE_COMMAND_MOVE_RIGHT = 4,
+    YU_STORAGE_COMMAND_INSERT_NEWLINE = 5,
+    YU_STORAGE_COMMAND_INDENT_LIST = 6,
+    YU_STORAGE_COMMAND_OUTDENT_LIST = 7,
+    YU_STORAGE_COMMAND_UNDO = 8,
+    YU_STORAGE_COMMAND_REDO = 9,
+    YU_STORAGE_COMMAND_TOGGLE_TASK = 10,
+    YU_STORAGE_COMMAND_MOVE_WORD_LEFT = 11,
+    YU_STORAGE_COMMAND_MOVE_WORD_RIGHT = 12,
+    YU_STORAGE_COMMAND_MOVE_UP = 13,
+    YU_STORAGE_COMMAND_MOVE_DOWN = 14,
+    YU_STORAGE_COMMAND_MOVE_UP_EXTEND = 15,
+    YU_STORAGE_COMMAND_MOVE_DOWN_EXTEND = 16,
+};
+
+enum {
+    YU_STORAGE_SOURCE_SYNC_NONE = 0,
+    YU_STORAGE_SOURCE_SYNC_RANGE = 1,
+    YU_STORAGE_SOURCE_SYNC_FULL = 2,
+    YU_STORAGE_CARET_AFFINITY_UPSTREAM = 0,
+    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM = 1,
 };
 
 enum {
@@ -58,6 +111,26 @@ typedef struct YuStorageCloseRequest {
     uint8_t close_state;
 } YuStorageCloseRequest;
 
+typedef struct YuStorageSelection {
+    uint64_t revision;
+    uint64_t start_utf16;
+    uint64_t end_utf16;
+    uint8_t affinity;
+} YuStorageSelection;
+
+typedef struct YuStorageCommandResult {
+    uint64_t revision;
+    uint64_t selection_start_utf16;
+    uint64_t selection_end_utf16;
+    uint8_t affinity;
+    uint8_t changed;
+    uint8_t source_sync;
+    uint64_t source_start_utf16;
+    uint64_t source_old_end_utf16;
+    uint64_t source_new_start_utf16;
+    uint64_t source_new_end_utf16;
+} YuStorageCommandResult;
+
 int32_t yu_storage_session_open(const uint8_t *path, size_t path_length,
                                 YuStorageSession **output);
 void yu_storage_session_destroy(YuStorageSession *session);
@@ -72,6 +145,35 @@ int32_t yu_storage_session_source_length(const YuStorageSession *session,
 int32_t yu_storage_session_copy_source(const YuStorageSession *session,
                                        uint8_t *output, size_t capacity,
                                        size_t *written);
+
+int32_t yu_storage_session_selection(const YuStorageSession *session,
+                                     YuStorageSelection *output);
+int32_t yu_storage_session_set_selection(YuStorageSession *session,
+                                         uint64_t expected_revision,
+                                         uint64_t start_utf16,
+                                         uint64_t end_utf16,
+                                         uint8_t affinity);
+int32_t yu_storage_session_execute_command(YuStorageSession *session,
+                                            uint8_t command, uint64_t block,
+                                            YuStorageCommandResult *output);
+int32_t yu_storage_session_command_available(const YuStorageSession *session,
+                                             uint8_t command, uint64_t block,
+                                             uint8_t *output);
+int32_t yu_storage_session_route_key(YuStorageSession *session, uint8_t key_kind,
+                                     uint32_t key, uint8_t modifiers,
+                                     YuStorageCommandResult *output);
+int32_t yu_storage_session_begin_composition(
+    YuStorageSession *session, uint64_t replacement_start_utf16,
+    uint64_t replacement_end_utf16, const uint8_t *preedit,
+    size_t preedit_length, uint64_t selection_start_utf16,
+    uint64_t selection_end_utf16);
+int32_t yu_storage_session_update_composition(
+    YuStorageSession *session, const uint8_t *preedit, size_t preedit_length,
+    uint64_t selection_start_utf16, uint64_t selection_end_utf16);
+int32_t yu_storage_session_commit_composition(YuStorageSession *session,
+                                              const uint8_t *committed_text,
+                                              size_t committed_length);
+int32_t yu_storage_session_cancel_composition(YuStorageSession *session);
 
 int32_t yu_storage_session_state(const YuStorageSession *session,
                                  YuStorageState *output);

@@ -187,7 +187,10 @@ dependencies = [
 name = "yu-storage-ffi"
 version = "0.1.0"
 dependencies = [
+ "yu-core",
+ "yu-editor",
  "yu-storage",
+ "yu-text",
 ]
 
 [[package]]
