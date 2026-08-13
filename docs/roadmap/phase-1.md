@@ -338,6 +338,10 @@
 52. 交互 IME 日志必须以 `IME_SESSION` 建立 session 边界，并让每个 `IME_EVENT` 携带一致的
     session ID、场景标签和输入源快照；默认审计兼容旧日志，严格审计必须拒绝截断尾部、未收敛的
     composition 或缺失/不一致的 session 元数据。真实日文、dead key 与 VoiceOver 仍需人工验收。
+53. macOS spike 启动时必须展示固定 Unicode 验收样本，至少覆盖中文、日文脚本、组合重音、dead-key
+    典型输出、emoji、符号和 RTL 文本；启动自检验证片段存在、UTF-16 AX 长度正确，窗口 AX value
+    可读。静态样本只证明显示/shaping/AX 路径，不得替代真实日文输入法、dead key 事件或 VoiceOver
+    朗读验收；复杂样本与简单 LTR layout probe 必须分离，避免诊断假设阻止窗口打开。
 
 ## 非目标
 
