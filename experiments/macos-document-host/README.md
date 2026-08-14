@@ -18,7 +18,8 @@
   canonical source；
 - Accessibility 文本查询与 Markdown semantic node count/fill 都从同一 Revision-bound Rust
   session 读取；Swift 只保存 owned 节点元数据，`DocumentTextView` 作为可编辑 AX root，并将
-  block/inline 节点映射为 `NSAccessibilityElement` children；真实 VoiceOver 朗读仍需人工验收；
+  block/inline 节点映射为实现 `NSAccessibilityElementProtocol` 的 children；Heading/Link custom
+  rotor 只查询当前 child tree；真实 VoiceOver 朗读仍需人工验收；
 - 不包含 Markdown visual projection、最终渲染或 workspace/tab。
 
 构建并运行：
@@ -41,8 +42,9 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
   --accessibility-self-check /path/to/file.md
 ```
 
-该自检会创建真实 `NSAccessibilityElement` 子节点，验证节点文本来自当前 Revision，并在一次
-Rust 编辑后确认旧节点不能继续读取新 source；它不能替代 VoiceOver 开启后的人工朗读验收。
+该自检会创建真实 AppKit Accessibility 子节点，验证节点文本来自当前 Revision、task checkbox 状态、
+Heading/Link rotor 目标，并在一次 Rust 编辑后确认旧节点不能继续读取新 source；它不能替代 VoiceOver
+开启后的人工朗读验收。
 
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立
