@@ -85,3 +85,20 @@ Observed:
 Unexpected output / recording:
 Conclusion: PASS / FAIL / NEEDS FOLLOW-UP
 ```
+
+## 2026-08-14 窗口级检查
+
+通过绝对路径启动签名的 `YuMacDocumentHost.app` 并加载
+`experiments/macos-document-host/Fixtures/sample.md` 后，先发现 AX value 能读到完整源码，
+但深色外观下 native mirror 视觉区域为空白。原因是 `NSTextView` 使用 `.labelColor` 时，在该
+AppKit/TextKit 初始化路径上解析成了不可见文本色；同时 document view 需要显式初始 frame 和
+TextKit container width。改为 `NSColor.textColor`/`NSColor.textBackgroundColor`，显式建立
+`NSTextStorage → NSLayoutManager → NSTextContainer`，并绑定 scroll view 的初始 document frame
+后，窗口可见：标题、中文、`日本語`、emoji、组合字符、task marker 和链接源码均正常绘制。
+
+AX 树检查通过：窗口暴露 `Yu Markdown 文档` text area，source value 包含上述 Unicode 内容，
+并可通过 AX 选中 `日本語`。Rust/Swift self-check 同时通过 link URL、Heading/Link rotor、task
+checkbox press、Revision 推进和旧 child 失效检查。
+
+本次未自动修改 VoiceOver 设置；真实 VoiceOver 朗读、Rotor 手势和 checkbox press 的语音焦点反馈
+仍需在用户手动开启 VoiceOver 后完成，因此结论为 `NEEDS FOLLOW-UP`，不是完整 VoiceOver PASS。
