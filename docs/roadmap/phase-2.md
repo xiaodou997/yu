@@ -85,7 +85,7 @@ label、角色、task 状态/press、URL 属性、Rotor 返回目标和编辑后
 
 ## 下一步
 
-下一阶段应为 HTML fragment 增加更完整的 Markdown semantic coverage，并固定 URL 打开策略、
+下一阶段应为 HTML fragment 增加表格等更完整的 Markdown semantic coverage，并固定 URL 打开策略、
 图片/表格 action 和跨平台 action adapter 的产品边界；Rotor/语义 action 的真实导航回归仍需
 补一轮。完整 Markdown visual projection 仍放在这些边界稳定之后。在
 进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
