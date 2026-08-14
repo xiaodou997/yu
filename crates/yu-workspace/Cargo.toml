@@ -14,6 +14,8 @@ yu-editor = { path = "../yu-editor" }
 yu-font = { path = "../yu-font" }
 yu-render = { path = "../yu-render" }
 yu-scene = { path = "../yu-scene" }
+yu-storage = { path = "../yu-storage" }
+yu-text = { path = "../yu-text" }
 
 [lints]
 workspace = true

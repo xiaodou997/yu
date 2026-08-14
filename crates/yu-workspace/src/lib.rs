@@ -19,6 +19,13 @@ use yu_scene::{
     Rect, Rgba8, Scene, SceneBuilder, SceneError, ViewportBlockGeometry, ViewportSceneInput,
 };
 
+mod workspace;
+
+pub use workspace::{
+    CloseAction, CloseResult, OpenTabResult, TabId, Workspace, WorkspaceCloseRequest,
+    WorkspaceError, WorkspaceTab,
+};
+
 /// A validated scene together with the viewport metadata that produced it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewportSceneFrame {

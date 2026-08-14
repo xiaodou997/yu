@@ -218,4 +218,6 @@ dependencies = [
  "yu-font",
  "yu-render",
  "yu-scene",
+ "yu-storage",
+ "yu-text",
 ]

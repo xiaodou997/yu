@@ -24,7 +24,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 
 ## Track B：进入产品窗口前的共享模型
 
-- [ ] workspace/tab/session 生命周期，不复制 source
+- [x] workspace/tab/session 生命周期，不复制 source（headless `Workspace`/`WorkspaceTab`）
 - [x] 无窗口 close-before-discard 状态机：save、discard、cancel 与 external conflict
 - [x] macOS 最小文档窗口 host：打开、源码镜像、标题/dirty 状态、保存/重载和关闭提示
 - [x] Rust `DocumentEditorSession`：把 `DocumentSession`、`EditorDocument`、composition 和 close 绑定到一个可变会话
