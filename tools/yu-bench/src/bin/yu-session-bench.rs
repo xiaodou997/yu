@@ -24,21 +24,77 @@ const INSERTIONS: [&str; 6] = ["羽", "Yu", "🙂", "e\u{301}", "\n", "**"];
 fn main() -> Result<(), Box<dyn Error>> {
     let configuration = Configuration::from_arguments()?;
     let source = fixture(configuration.size_mib);
-    let (script, expected_source) = random_edit_script(&source, configuration.random_edits);
-    let document = TemporaryDocument::create(&source)?;
+    let (random_script, random_expected) = random_edit_script(&source, configuration.random_edits);
+    let (local_script, local_expected) = local_edit_script(&source, configuration.random_edits);
+    let propagation_source = propagation_fixture(configuration.size_mib);
+    let (propagation_script, propagation_expected) = propagation_edit_script(&propagation_source);
 
     println!("Yu DocumentSession vertical slice");
-    println!("fixture: {}", document.path.display());
-    println!("document bytes: {}", source.len());
     println!("open iterations: {}", configuration.iterations);
-    println!("random edits: {}", script.len());
+    println!("scenario edits: {}", configuration.random_edits);
 
-    let mut open_samples = Vec::with_capacity(configuration.iterations);
-    for _ in 0..configuration.iterations {
+    let workloads = [
+        WorkloadSpec {
+            label: "local",
+            source: &source,
+            script: &local_script,
+            expected_source: &local_expected,
+        },
+        WorkloadSpec {
+            label: "random",
+            source: &source,
+            script: &random_script,
+            expected_source: &random_expected,
+        },
+        WorkloadSpec {
+            label: "fence-propagation",
+            source: &propagation_source,
+            script: &propagation_script,
+            expected_source: &propagation_expected,
+        },
+    ];
+    for workload in workloads {
+        let measurement = run_workload(workload, configuration.iterations)?;
+        print_measurement(&measurement);
+    }
+
+    Ok(())
+}
+
+struct WorkloadSpec<'a> {
+    label: &'static str,
+    source: &'a str,
+    script: &'a [ScriptEdit],
+    expected_source: &'a str,
+}
+
+struct WorkloadMeasurement {
+    label: &'static str,
+    source_bytes: usize,
+    edits: usize,
+    open_median: Duration,
+    edit_total: Duration,
+    selection_median: Duration,
+    command_median: Duration,
+    edit_median: Duration,
+    save_time: Duration,
+    reload_time: Duration,
+    saved_bytes: usize,
+    final_revision: yu_core::Revision,
+    final_bytes: usize,
+}
+
+fn run_workload(
+    workload: WorkloadSpec<'_>,
+    iterations: usize,
+) -> Result<WorkloadMeasurement, Box<dyn Error>> {
+    let document = TemporaryDocument::create(workload.source)?;
+    let mut open_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
         let start = Instant::now();
         let session = DocumentEditorSession::open(&document.path)?;
         open_samples.push(start.elapsed());
-        if session.snapshot().as_str() != source {
+        if session.snapshot().as_str() != workload.source {
             return Err(io::Error::other("open snapshot differs from fixture").into());
         }
         std::hint::black_box(session.revision());
@@ -49,11 +105,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("fresh session unexpectedly dirty").into());
     }
 
-    let mut edit_samples = Vec::with_capacity(script.len());
-    let mut selection_samples = Vec::with_capacity(script.len());
-    let mut command_samples = Vec::with_capacity(script.len());
+    let mut edit_samples = Vec::with_capacity(workload.script.len());
+    let mut selection_samples = Vec::with_capacity(workload.script.len());
+    let mut command_samples = Vec::with_capacity(workload.script.len());
     let edit_start = Instant::now();
-    for edit in &script {
+    for edit in workload.script {
         let snapshot = session.snapshot();
         let anchor = ByteOffset::try_from(edit.start)
             .map_err(|_| io::Error::other("edit start exceeds ByteOffset"))?;
@@ -79,7 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let edit_total = edit_start.elapsed();
 
     let actual_snapshot = session.snapshot();
-    if actual_snapshot.as_str() != expected_source {
+    if actual_snapshot.as_str() != workload.expected_source {
         return Err(io::Error::other("session edit result differs from model").into());
     }
     if !session.is_dirty() {
@@ -102,30 +158,52 @@ fn main() -> Result<(), Box<dyn Error>> {
     let reload_start = Instant::now();
     session.reload()?;
     let reload_time = reload_start.elapsed();
-    if session.snapshot().as_str() != expected_source {
+    if session.snapshot().as_str() != workload.expected_source {
         return Err(io::Error::other("reload snapshot differs from saved source").into());
     }
 
-    println!();
-    println!("open median: {:?}", median(&mut open_samples));
-    println!("edit total: {:?}", edit_total);
-    println!(
-        "edit mean: {:?}",
-        edit_total / u32::try_from(script.len()).unwrap_or(u32::MAX)
-    );
-    println!("selection median: {:?}", median(&mut selection_samples));
-    println!("command median: {:?}", median(&mut command_samples));
-    println!(
-        "selection + command median: {:?}",
-        median(&mut edit_samples)
-    );
-    println!("save: {:?} ({saved_bytes} bytes)", save_time);
-    println!("reload: {:?}", reload_time);
-    println!("final revision: {:?}", session.revision());
-    println!("final bytes: {}", expected_source.len());
-    println!("result: ok");
+    Ok(WorkloadMeasurement {
+        label: workload.label,
+        source_bytes: workload.source.len(),
+        edits: workload.script.len(),
+        open_median: median(&mut open_samples),
+        edit_total,
+        selection_median: median(&mut selection_samples),
+        command_median: median(&mut command_samples),
+        edit_median: median(&mut edit_samples),
+        save_time,
+        reload_time,
+        saved_bytes,
+        final_revision: session.revision(),
+        final_bytes: workload.expected_source.len(),
+    })
+}
 
-    Ok(())
+fn print_measurement(measurement: &WorkloadMeasurement) {
+    println!();
+    println!("workload: {}", measurement.label);
+    println!("  source bytes: {}", measurement.source_bytes);
+    println!("  edits: {}", measurement.edits);
+    println!("  open median: {:?}", measurement.open_median);
+    println!("  edit total: {:?}", measurement.edit_total);
+    println!(
+        "  edit mean: {:?}",
+        measurement.edit_total / u32::try_from(measurement.edits).unwrap_or(u32::MAX)
+    );
+    println!("  selection median: {:?}", measurement.selection_median);
+    println!("  command median: {:?}", measurement.command_median);
+    println!(
+        "  selection + command median: {:?}",
+        measurement.edit_median
+    );
+    println!(
+        "  save: {:?} ({} bytes)",
+        measurement.save_time, measurement.saved_bytes
+    );
+    println!("  reload: {:?}", measurement.reload_time);
+    println!("  final revision: {:?}", measurement.final_revision);
+    println!("  final bytes: {}", measurement.final_bytes);
+    println!("  result: ok");
 }
 
 struct TemporaryDocument {
@@ -223,6 +301,47 @@ fn random_edit_script(source: &str, count: usize) -> (Vec<ScriptEdit>, String) {
         model.replace_range(start..end, inserted);
     }
     (script, model)
+}
+
+fn local_edit_script(source: &str, count: usize) -> (Vec<ScriptEdit>, String) {
+    let mut model = source.to_owned();
+    let mut cursor = source
+        .find("A paragraph with")
+        .map(|offset| offset + 2)
+        .expect("fixture should contain a plain paragraph");
+    let local_insertions = ["羽", "Yu", "🙂", "e\u{301}"];
+    let mut script = Vec::with_capacity(count);
+    for index in 0..count {
+        let inserted = local_insertions[index % local_insertions.len()];
+        script.push(ScriptEdit {
+            start: cursor,
+            end: cursor,
+            inserted,
+        });
+        model.insert_str(cursor, inserted);
+        cursor += inserted.len();
+    }
+    (script, model)
+}
+
+fn propagation_fixture(size_mib: usize) -> String {
+    let requested_bytes = size_mib.saturating_mul(1024 * 1024);
+    let mut source = String::from("```rust\n");
+    while source.len() < requested_bytes {
+        source.push_str("a paragraph that remains inside the open fence.\n\n");
+    }
+    source
+}
+
+fn propagation_edit_script(source: &str) -> (Vec<ScriptEdit>, String) {
+    let mut model = source.to_owned();
+    let edit = ScriptEdit {
+        start: 0,
+        end: 3,
+        inserted: "plain",
+    };
+    model.replace_range(edit.start..edit.end, edit.inserted);
+    (vec![edit], model)
 }
 
 fn positive_number(value: &str, argument: &str) -> Result<usize, Box<dyn Error>> {

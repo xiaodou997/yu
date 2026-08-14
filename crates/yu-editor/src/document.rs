@@ -2988,6 +2988,33 @@ mod tests {
     }
 
     #[test]
+    fn viewport_state_stays_lazy_until_first_query() {
+        let source = "paragraph\n\n".repeat(128);
+        let mut document = EditorDocument::new(source);
+        assert_eq!(document.viewport_stats().entries(), 0);
+
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "prefix ")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("edit should not materialize viewport state");
+
+        assert_eq!(document.viewport_stats().entries(), 0);
+        assert_eq!(document.viewport_stats().remapped(), 0);
+
+        let snapshot = document
+            .visible_blocks(ViewportRect::new(0.0, 1.0))
+            .expect("first viewport query should materialize block state");
+        assert!(!snapshot.blocks().is_empty());
+        assert_eq!(
+            document.viewport_stats().entries(),
+            document.markdown().blocks().len()
+        );
+    }
+
+    #[test]
     fn viewport_remeasures_when_switching_to_shaped_backend() {
         let mut document = EditorDocument::new("ab");
         document

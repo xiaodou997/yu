@@ -538,7 +538,12 @@ impl ViewportLayout {
         snapshot: &TextSnapshot,
         markdown: &MarkdownDocument,
     ) -> Result<(), ViewportError> {
-        let had_state = self.revision.is_some() || !self.entries.is_empty();
+        // A revision by itself is not materialized viewport state.  Edits can
+        // advance the document while no renderer has queried a visible range
+        // yet; eagerly rebuilding every block here would turn a text-only
+        // edit into an O(number-of-blocks) operation.  Keep the state lazy
+        // until the first viewport query calls `sync`.
+        let had_state = !self.entries.is_empty();
         if let Some(revision) = self.revision
             && revision != changes.before()
         {
