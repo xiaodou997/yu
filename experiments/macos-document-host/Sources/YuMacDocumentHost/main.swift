@@ -877,10 +877,18 @@ private final class DocumentTextView: NSTextView {
         canonicalRevision = bridge.state.revision
         // NSTextView's frame-only convenience initializer dynamically
         // dispatches to `init(frame:textContainer:)` on subclasses. Because
-        // this view owns its bridge and is not storyboard-decoded, call the
-        // designated initializer explicitly so AppKit does not reach an
-        // unimplemented subclass initializer at runtime.
-        super.init(frame: .zero, textContainer: nil)
+        // this view owns its bridge and is not storyboard-decoded, construct
+        // the TextKit chain explicitly and call the designated initializer.
+        // A nil text container can leave a source-backed mirror readable via
+        // AX while providing no drawable storage/layout for the native view.
+        let textStorage = NSTextStorage()
+        let layoutManager = NSLayoutManager()
+        let textContainer = NSTextContainer(
+            size: NSSize(width: 900, height: CGFloat.greatestFiniteMagnitude)
+        )
+        layoutManager.addTextContainer(textContainer)
+        textStorage.addLayoutManager(layoutManager)
+        super.init(frame: .zero, textContainer: textContainer)
         isEditable = true
         isSelectable = true
         isRichText = false
@@ -888,8 +896,8 @@ private final class DocumentTextView: NSTextView {
         allowsUndo = false
         usesFindBar = true
         font = NSFont.systemFont(ofSize: 16)
-        textColor = .labelColor
-        backgroundColor = .textBackgroundColor
+        textColor = NSColor.textColor
+        backgroundColor = NSColor.textBackgroundColor
         setAccessibilityElement(true)
         setAccessibilityRole(.textArea)
         setAccessibilityLabel("Yu Markdown 文档")
@@ -1616,6 +1624,18 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         }
         textView.onError = { [weak self] error in self?.show(error) }
         scrollView.documentView = textView
+        // `DocumentTextView` is created before the window has a laid-out
+        // content size. Give the scroll view a real initial document frame
+        // and let its text container track the viewport width; otherwise an
+        // NSTextView created with the designated initializer can retain a
+        // zero-sized document view while AX still exposes its source value.
+        textView.frame = NSRect(x: 0, y: 0, width: 900, height: 620)
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(
+            width: scrollView.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = true
 
         statusLabel.setAccessibilityElement(true)
         statusLabel.setAccessibilityLabel("文档状态")
