@@ -44,8 +44,9 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - `yu-export` 固定 Revision-bound source selection 的 Markdown/纯文本/HTML clipboard payload，
   HTML 只消费当前 parser 已识别的语义，未识别语法按转义文本回退，不读取 TextKit mirror；
 - macOS Accessibility 在现有文本快照之外提供 Revision-bound、source-backed Markdown semantic
-  node count/fill 查询；Swift 将 owned 节点映射为 AppKit `NSAccessibilityElement` child，文本和
-  几何仍按节点 Revision 回查，不保存第二份文档；真实 VoiceOver 朗读仍需人工验收；
+  node count/fill 查询；Swift 将 owned 节点映射为实现 AppKit `NSAccessibilityElementProtocol` 的
+  child，并提供 Heading/Link custom rotor；文本和几何仍按节点 Revision 回查，不保存第二份文档；
+  真实 VoiceOver 朗读仍需人工验收；
 - `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
   owned publication，macOS host 只消费已验证的 publication；
 - viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host
@@ -205,6 +206,9 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS minimal document host](docs/adr/0088-macos-document-host.md)
 - [unified document editor session](docs/adr/0089-unified-document-editor-session.md)
 - [macOS writable native mirror](docs/adr/0090-macos-writable-native-mirror.md)
+- [source-backed Markdown Accessibility semantic tree](docs/adr/0101-source-backed-accessibility-semantic-tree.md)
+- [macOS Accessibility semantic children](docs/adr/0102-macos-accessibility-semantic-children.md)
+- [macOS Accessibility custom rotors](docs/adr/0103-macos-accessibility-custom-rotors.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [Phase 2 路线](docs/roadmap/phase-2.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)

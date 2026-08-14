@@ -23,9 +23,9 @@ TextKit 镜像重新解析 Markdown，就会重新产生第二套 parser、sourc
   或 layout 可以在不改变 ABI 的情况下细化 label policy。
 - `yu-storage-ffi` 提供 count/fill 两个查询。调用方必须传入 expected Revision；stale Revision、
   无效 parser range 和输出容量错误都返回已有状态码，不能返回跨 Revision 的半旧树。
-- Swift host 只把 C struct 转成 owned scalar 节点；`DocumentTextView` 可以把这些节点映射为
-  `NSAccessibilityElement` children，但不把节点文本缓存为第二份 Markdown。child role/geometry
-  和 VoiceOver 验收见 ADR-0102。
+- Swift host 只把 C struct 转成 owned scalar 节点；`DocumentTextView` 可以把这些节点映射为实现
+  `NSAccessibilityElementProtocol` 的 children，但不把节点文本缓存为第二份 Markdown。child
+  role/geometry 和 VoiceOver 验收见 ADR-0102。
 
 ## 验证
 

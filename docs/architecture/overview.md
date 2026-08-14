@@ -87,9 +87,11 @@ source `TextRange`，一次生成 canonical Markdown、纯文本回退和 semant
 Accessibility 也只从 canonical source 构建语义快照。`AccessibilitySemanticSnapshot` 为当前
 Revision 生成一个 document-root、block 和已识别 inline span 的 source-backed 节点序列；节点只
 携带稳定 role、父节点、列表/task flags 以及 source/label UTF-16 ranges。`yu-storage-ffi` 用
-count/fill ABI 将 owned 节点交给 macOS host，Swift 将它们映射为 `NSAccessibilityElement` child，
-文本按节点 Revision 回查，几何由 TextKit 当前布局提供。无窗口 self-check 会验证树的父子关系和
-编辑后的 stale node；VoiceOver 实际朗读仍属于人工验收，不等同于自动化通过。
+count/fill ABI 将 owned 节点交给 macOS host，Swift 将它们映射为实现
+`NSAccessibilityElementProtocol` 的 child，文本按节点 Revision 回查，几何由 TextKit 当前布局提供。
+`DocumentTextView` 另提供 Heading/Link custom rotor，查询仍只基于当前 child tree；刷新旧树前发布
+`uiElementDestroyed`。无窗口 self-check 会验证树的父子关系、task value、Rotor 目标和编辑后的 stale
+node；VoiceOver 实际朗读仍属于人工验收，不等同于自动化通过。
 
 后续预计增加：
 

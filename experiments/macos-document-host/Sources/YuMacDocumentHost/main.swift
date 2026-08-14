@@ -154,7 +154,9 @@ private enum SemanticAccessibilityFlag {
 /// A lightweight AppKit AX element backed by one Rust semantic node. It owns
 /// no Markdown text: labels and range queries always use the node's Revision
 /// and ask `StorageBridge` for the current source bytes.
-private final class YuAccessibilitySemanticElement: NSAccessibilityElement {
+private final class YuAccessibilitySemanticElement: NSObject,
+    NSAccessibilityElementProtocol
+{
     let node: NativeAccessibilitySemanticNode
     private let bridge: StorageBridge
     weak var parentObject: AnyObject?
@@ -172,13 +174,13 @@ private final class YuAccessibilitySemanticElement: NSAccessibilityElement {
         super.init()
     }
 
-    var accessibilityFrame: NSRect {
+    @objc func accessibilityFrame() -> NSRect {
         frameOwner?.accessibilityFrameForSemanticRange(node.sourceRange) ?? .zero
     }
 
-    var accessibilityParent: Any? { parentObject }
+    @objc func accessibilityParent() -> Any? { parentObject }
 
-    var accessibilityRole: NSAccessibility.Role {
+    @objc var accessibilityRole: NSAccessibility.Role {
         switch SemanticAccessibilityKind(rawValue: node.kind) {
         case .taskListItem:
             return .checkBox
@@ -193,7 +195,7 @@ private final class YuAccessibilitySemanticElement: NSAccessibilityElement {
         }
     }
 
-    var accessibilityRoleDescription: String? {
+    @objc var accessibilityRoleDescription: String? {
         switch SemanticAccessibilityKind(rawValue: node.kind) {
         case .heading:
             return "标题（级别 \(node.level)）"
@@ -218,30 +220,31 @@ private final class YuAccessibilitySemanticElement: NSAccessibilityElement {
         }
     }
 
-    var accessibilityLabel: String? {
+    @objc var accessibilityLabel: String? {
         bridge.copySourceRangeIfAvailable(node.labelRange, revision: node.revision)
     }
 
-    var accessibilityTitle: String? { accessibilityLabel }
+    @objc var accessibilityTitle: String? { accessibilityLabel }
 
-    var accessibilityValue: Any? {
+    @objc var accessibilityValue: Any? {
         guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem else {
             return accessibilityLabel
         }
         return NSNumber(value: node.flags & SemanticAccessibilityFlag.taskDone != 0)
     }
 
-    var accessibilityIdentifier: String? {
+    @objc func accessibilityIdentifier() -> String {
         "yu-document-semantic-\(node.revision)-\(node.index)"
     }
 
-    var accessibilityChildren: [Any]? { semanticChildren }
+    @objc var accessibilityChildren: [Any]? { semanticChildren }
 
-    var accessibilityChildrenInNavigationOrder: [NSAccessibilityElement]? {
-        semanticChildren.compactMap { $0 as? NSAccessibilityElement }
+    @objc var accessibilityChildrenInNavigationOrder: [Any]? {
+        semanticChildren
     }
 
-    override func accessibilityString(for range: NSRange) -> String? {
+    @objc(accessibilityStringForRange:)
+    func accessibilityString(for range: NSRange) -> String? {
         guard range.location >= 0,
               range.length >= 0,
               NSMaxRange(range) <= node.sourceRange.length else {
@@ -254,9 +257,33 @@ private final class YuAccessibilitySemanticElement: NSAccessibilityElement {
         return bridge.copySourceRangeIfAvailable(absolute, revision: node.revision)
     }
 
-    override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
+    @objc(accessibilityAttributedStringForRange:)
+    func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
         guard let text = accessibilityString(for: range) else { return nil }
         return NSAttributedString(string: text)
+    }
+}
+
+/// VoiceOver asks custom rotors for the next source-backed semantic element.
+/// The delegate is intentionally tiny: it never stores text or a second tree,
+/// and asks the current DocumentTextView for the live element order.
+private final class YuAccessibilityRotorDelegate: NSObject,
+    NSAccessibilityCustomRotorItemSearchDelegate
+{
+    weak var owner: DocumentTextView?
+    let kind: SemanticAccessibilityKind
+
+    init(owner: DocumentTextView, kind: SemanticAccessibilityKind) {
+        self.owner = owner
+        self.kind = kind
+        super.init()
+    }
+
+    func rotor(
+        _ rotor: NSAccessibilityCustomRotor,
+        resultFor searchParameters: NSAccessibilityCustomRotor.SearchParameters
+    ) -> NSAccessibilityCustomRotor.ItemResult? {
+        owner?.accessibilityRotorResult(for: kind, parameters: searchParameters)
     }
 }
 
@@ -792,6 +819,8 @@ private final class DocumentTextView: NSTextView {
     private var canonicalRevision: UInt64
     private var semanticNodes: [NativeAccessibilitySemanticNode] = []
     private var semanticElements: [YuAccessibilitySemanticElement] = []
+    private var headingRotorDelegate: YuAccessibilityRotorDelegate!
+    private var linkRotorDelegate: YuAccessibilityRotorDelegate!
     private var nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
     private var synchronizingSelection = false
     var onDocumentChange: (() -> Void)?
@@ -820,6 +849,8 @@ private final class DocumentTextView: NSTextView {
         setAccessibilityRole(.textArea)
         setAccessibilityLabel("Yu Markdown 文档")
         setAccessibilityIdentifier("yu-document-text")
+        headingRotorDelegate = YuAccessibilityRotorDelegate(owner: self, kind: .heading)
+        linkRotorDelegate = YuAccessibilityRotorDelegate(owner: self, kind: .link)
         minSize = NSSize(width: 0, height: 0)
         maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         isVerticallyResizable = true
@@ -837,7 +868,6 @@ private final class DocumentTextView: NSTextView {
         canonicalSource = bridge.source
         canonicalRevision = bridge.state.revision
         semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
-        rebuildSemanticAccessibilityTree()
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
         synchronizeProjection()
         postAccessibilityRefresh()
@@ -894,8 +924,72 @@ private final class DocumentTextView: NSTextView {
     /// navigation and never become a second text model.
     @objc var accessibilityChildren: [Any]? { semanticElements }
 
-    @objc var accessibilityChildrenInNavigationOrder: [NSAccessibilityElement]? {
+    @objc var accessibilityChildrenInNavigationOrder: [Any]? {
         semanticElements
+    }
+
+    /// Heading and Link rotors make the semantic tree discoverable without
+    /// requiring VoiceOver to walk every paragraph and inline child. The
+    /// delegates remain owned by the document view because AppKit retains
+    /// rotor delegates weakly.
+    @objc var accessibilityCustomRotors: [NSAccessibilityCustomRotor]? {
+        [
+            NSAccessibilityCustomRotor(
+                rotorType: .heading,
+                itemSearchDelegate: headingRotorDelegate
+            ),
+            NSAccessibilityCustomRotor(
+                rotorType: .link,
+                itemSearchDelegate: linkRotorDelegate
+            ),
+        ]
+    }
+
+    func accessibilityRotorResult(
+        for kind: SemanticAccessibilityKind,
+        parameters: NSAccessibilityCustomRotor.SearchParameters
+    ) -> NSAccessibilityCustomRotor.ItemResult? {
+        let candidates = flattenSemanticElements(semanticElements).filter { element in
+            guard let elementKind = SemanticAccessibilityKind(rawValue: element.node.kind) else {
+                return false
+            }
+            switch kind {
+            case .heading:
+                return elementKind == .heading
+            case .link:
+                return elementKind == .link
+                    || elementKind == .autolink
+                    || elementKind == .referenceLink
+            default:
+                return false
+            }
+        }.filter { element in
+            let filter = parameters.filterString
+            guard !filter.isEmpty else { return true }
+            return element.accessibilityLabel?.localizedCaseInsensitiveContains(filter) == true
+        }
+        guard !candidates.isEmpty else { return nil }
+
+        let current = parameters.currentItem?.targetElement as AnyObject?
+        let currentIndex = current.flatMap { currentObject in
+            candidates.firstIndex { $0 === currentObject }
+        }
+        let index: Int?
+        switch parameters.searchDirection {
+        case .next:
+            index = currentIndex.map { $0 + 1 } ?? 0
+        case .previous:
+            index = currentIndex.map { $0 - 1 } ?? (candidates.count - 1)
+        @unknown default:
+            index = nil
+        }
+        guard let index, candidates.indices.contains(index) else { return nil }
+
+        let element = candidates[index]
+        let result = NSAccessibilityCustomRotor.ItemResult(targetElement: element)
+        result.targetRange = element.node.sourceRange
+        result.customLabel = element.accessibilityLabel
+        return result
     }
 
     override func accessibilityString(for range: NSRange) -> String? {
@@ -1306,6 +1400,7 @@ private final class DocumentTextView: NSTextView {
     }
 
     private func rebuildSemanticAccessibilityTree() {
+        postDestroyedSemanticElements()
         let nodes = semanticNodes.filter {
             SemanticAccessibilityKind(rawValue: $0.kind) != .document
         }
@@ -1334,6 +1429,28 @@ private final class DocumentTextView: NSTextView {
             parent.semanticChildren.append(element)
         }
         semanticElements = topLevel
+    }
+
+    private func postDestroyedSemanticElements() {
+        guard !semanticElements.isEmpty else { return }
+        for element in flattenSemanticElements(semanticElements) {
+            NSAccessibility.post(element: element, notification: .uiElementDestroyed)
+        }
+    }
+
+    private func flattenSemanticElements(
+        _ elements: [YuAccessibilitySemanticElement]
+    ) -> [YuAccessibilitySemanticElement] {
+        var result: [YuAccessibilitySemanticElement] = []
+        result.reserveCapacity(elements.count)
+        for element in elements {
+            result.append(element)
+            let children = element.semanticChildren.compactMap {
+                $0 as? YuAccessibilitySemanticElement
+            }
+            result.append(contentsOf: flattenSemanticElements(children))
+        }
+        return result
     }
 
     func postAccessibilityRefresh() {
@@ -1809,7 +1926,72 @@ private func runAccessibilitySelfCheck(path: String) -> Never {
             return count
         }
 
+        func flatten(_ elements: [YuAccessibilitySemanticElement]) -> [YuAccessibilitySemanticElement] {
+            var result: [YuAccessibilitySemanticElement] = []
+            for element in elements {
+                result.append(element)
+                result.append(contentsOf: flatten(element.semanticChildren.compactMap {
+                    $0 as? YuAccessibilitySemanticElement
+                }))
+            }
+            return result
+        }
+
         let initialCount = validate(initialChildren, parent: textView)
+        let allInitial = flatten(initialChildren)
+        let headings = allInitial.filter { $0.node.kind == SemanticAccessibilityKind.heading.rawValue }
+        let links = allInitial.filter {
+            $0.node.kind == SemanticAccessibilityKind.link.rawValue
+                || $0.node.kind == SemanticAccessibilityKind.autolink.rawValue
+                || $0.node.kind == SemanticAccessibilityKind.referenceLink.rawValue
+        }
+        let tasks = allInitial.filter {
+            $0.node.kind == SemanticAccessibilityKind.taskListItem.rawValue
+        }
+        if !headings.isEmpty {
+            precondition(headings.allSatisfy { $0.accessibilityRole == .staticText })
+        }
+        if !links.isEmpty {
+            precondition(links.allSatisfy { $0.accessibilityRole == .link })
+        }
+        if !tasks.isEmpty {
+            precondition(tasks.allSatisfy { $0.accessibilityRole == .checkBox })
+            precondition(tasks.allSatisfy { $0.accessibilityValue is NSNumber })
+        }
+
+        let rotors = textView.accessibilityCustomRotors ?? []
+        precondition(rotors.count == 2)
+        for (index, rotor) in rotors.enumerated() {
+            let parameters = NSAccessibilityCustomRotor.SearchParameters()
+            parameters.searchDirection = .next
+            parameters.filterString = ""
+            guard let delegate = rotor.itemSearchDelegate else {
+                preconditionFailure("rotor delegate is not retained")
+            }
+            let result = delegate.rotor(rotor, resultFor: parameters)
+            let hasCandidate = index == 0 ? !headings.isEmpty : !links.isEmpty
+            if hasCandidate {
+                guard let result,
+                      let target = result.targetElement as? YuAccessibilitySemanticElement else {
+                    preconditionFailure("rotor did not return a semantic target")
+                }
+                precondition(target.node.revision == initialRevision)
+                if index == 0 {
+                    precondition(target.node.kind == SemanticAccessibilityKind.heading.rawValue)
+                } else {
+                    precondition(
+                        target.node.kind == SemanticAccessibilityKind.link.rawValue
+                            || target.node.kind == SemanticAccessibilityKind.autolink.rawValue
+                            || target.node.kind == SemanticAccessibilityKind.referenceLink.rawValue
+                    )
+                }
+                let targetLabel = target.accessibilityLabel ?? ""
+                print("  rotor=\(index) target=\(targetLabel)")
+            } else {
+                precondition(result == nil)
+                print("  rotor=\(index) target=<none>")
+            }
+        }
         print("Yu Accessibility self-check: revision=\(initialRevision) nodes=\(initialCount)")
         for element in initialChildren {
             let label = element.accessibilityLabel ?? ""

@@ -38,7 +38,7 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 | 日文 Kana | `Japanese - Kana`（若启用） | 输入一个假名词并提交，再输入一次后按 Escape | cancel 后 source、AX value、selection 回到提交前 |
 | dead key | 当前系统可用的 dead-key 键盘源 | 生成 `é`、`à` 或 `ñ`，再用 Backspace 删除 | 组合字符作为稳定文本；退格不拆 grapheme |
 | combining mark | `ABC` 或可直接输入 Unicode 的源 | 输入 `e` + `U+0301`，或粘贴 `e\u{301}` | AX UTF-16 range 不落在 surrogate/scalar 中，删除行为可预测 |
-| VoiceOver | 任意稳定键盘源 | 开启 VoiceOver，聚焦文本区，使用标题/列表导航，朗读中文/日文/emoji 和一段 preedit | 文本区及 semantic children 角色、label、父子导航正确；canonical value 和选区可朗读；关闭 VoiceOver 后不改变 source |
+| VoiceOver | 任意稳定键盘源 | 开启 VoiceOver，聚焦文本区，使用 Heading/Link Rotor、标题/列表导航，朗读中文/日文/emoji 和一段 preedit | 文本区及 semantic children 角色、label、父子导航正确；Rotor 能定位标题/链接；task 状态可读；canonical value 和选区可朗读；关闭 VoiceOver 后不改变 source |
 
 输入源名称和 identifier 会因 macOS 版本、地区和用户配置变化，记录实际值，不写死示例名称。
 
@@ -52,7 +52,8 @@ Rust FFI 回归覆盖：
 
 Swift host 的 `--accessibility-self-check` 另外覆盖：
 
-- 真实 `NSAccessibilityElement` child 的 role、parent/children 和 source-backed label；
+- 真实 AppKit Accessibility child 的 role、parent/children 和 source-backed label；
+- Heading/Link custom rotor 返回当前 Revision 的标题/链接目标；task checkbox value 同时覆盖 todo/done；
 - 编辑后旧 child 的 Revision-bound label 失效，新树使用新 Revision；
 - 中文、日文、emoji、combining mark 和 task-list fixture 的无窗口构造。
 
