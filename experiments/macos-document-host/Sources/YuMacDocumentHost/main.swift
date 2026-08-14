@@ -186,6 +186,17 @@ private final class StorageBridge {
         }
     }
 
+    var copySourceIfAvailable: String? {
+        copyBytesIfAvailable { output, capacity, written in
+            yu_storage_session_copy_source(
+                handle,
+                output,
+                capacity,
+                written
+            )
+        }
+    }
+
     var state: NativeStorageState {
         var value = YuStorageState()
         let status = yu_storage_session_state(
@@ -207,6 +218,16 @@ private final class StorageBridge {
         var value = YuStorageAccessibilitySnapshot()
         let status = yu_storage_session_accessibility_snapshot(handle, &value)
         precondition(status == StorageStatus.ok, "Rust accessibility snapshot failed: \(status)")
+        return NativeAccessibilitySnapshot(value)
+    }
+
+    /// Accessibility callbacks can arrive while a document is being closed,
+    /// reloaded, or replaced by an external edit. Those callbacks must not
+    /// turn a transient Revision-bound error into a process abort.
+    var accessibilitySnapshotIfAvailable: NativeAccessibilitySnapshot? {
+        var value = YuStorageAccessibilitySnapshot()
+        let status = yu_storage_session_accessibility_snapshot(handle, &value)
+        guard status == StorageStatus.ok else { return nil }
         return NativeAccessibilitySnapshot(value)
     }
 
@@ -243,6 +264,13 @@ private final class StorageBridge {
         var value = YuStorageCompositionState()
         let status = yu_storage_session_composition(handle, &value)
         precondition(status == StorageStatus.ok, "Rust composition query failed: \(status)")
+        return NativeComposition(value)
+    }
+
+    var compositionIfAvailable: NativeComposition? {
+        var value = YuStorageCompositionState()
+        let status = yu_storage_session_composition(handle, &value)
+        guard status == StorageStatus.ok else { return nil }
         return NativeComposition(value)
     }
 
@@ -385,6 +413,20 @@ private final class StorageBridge {
         }
     }
 
+    func copySourceRangeIfAvailable(_ range: NSRange, revision: UInt64) -> String? {
+        copyBytesIfAvailable { output, capacity, written in
+            yu_storage_session_copy_source_range(
+                handle,
+                revision,
+                UInt64(range.location),
+                UInt64(range.location + range.length),
+                output,
+                capacity,
+                written
+            )
+        }
+    }
+
     func copySelection() -> String {
         let current = state.revision
         return copyBytes { output, capacity, written in
@@ -466,6 +508,26 @@ private final class StorageBridge {
         precondition(copyStatus == StorageStatus.ok, "Rust storage copy failed: \(copyStatus)")
         return String(decoding: bytes, as: UTF8.self)
     }
+
+    private func copyBytesIfAvailable(
+        _ operation: (
+            UnsafeMutablePointer<UInt8>?, Int, UnsafeMutablePointer<Int>?
+        ) -> Int32
+    ) -> String? {
+        var required = 0
+        guard operation(nil, 0, &required) == StorageStatus.ok, required >= 0 else {
+            return nil
+        }
+        var bytes = Array(repeating: UInt8(0), count: required)
+        var written = required
+        let status = bytes.withUnsafeMutableBufferPointer { buffer in
+            operation(buffer.baseAddress, buffer.count, &written)
+        }
+        guard status == StorageStatus.ok, written >= 0, written <= bytes.count else {
+            return nil
+        }
+        return String(decoding: bytes.prefix(written), as: UTF8.self)
+    }
 }
 
 /// The native source mirror is deliberately a view cache, never a second
@@ -546,29 +608,33 @@ private final class DocumentTextView: NSTextView {
     // for drawing and hit testing; source text, UTF-16 length, selection and
     // logical line ranges remain Revision-bound Rust data.
     override func accessibilityValue() -> String? {
-        bridge.source
+        bridge.copySourceIfAvailable ?? canonicalSource
     }
 
     override func accessibilityNumberOfCharacters() -> Int {
-        bridge.accessibilitySnapshot.numberOfCharacters
+        bridge.accessibilitySnapshotIfAvailable?.numberOfCharacters
+            ?? (canonicalSource as NSString).length
     }
 
     override func accessibilitySelectedText() -> String? {
-        let snapshot = bridge.accessibilitySnapshot
-        return bridge.copySourceRange(snapshot.selectedRange, revision: snapshot.revision)
+        guard let snapshot = bridge.accessibilitySnapshotIfAvailable else { return nil }
+        return bridge.copySourceRangeIfAvailable(
+            snapshot.selectedRange,
+            revision: snapshot.revision
+        )
     }
 
     override func accessibilitySelectedTextRange() -> NSRange {
-        bridge.accessibilitySnapshot.selectedRange
+        bridge.accessibilitySnapshotIfAvailable?.selectedRange ?? selectedRange()
     }
 
     override func setAccessibilitySelectedTextRange(_ range: NSRange) {
         do {
-            if bridge.composition.active {
+            if bridge.compositionIfAvailable?.active == true {
                 try bridge.cancelComposition()
                 nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
             }
-            let snapshot = bridge.accessibilitySnapshot
+            guard let snapshot = bridge.accessibilitySnapshotIfAvailable else { return }
             guard let valid = accessibilitySourceRange(range, snapshot: snapshot) else { return }
             try bridge.setSelection(valid, affinity: snapshot.affinity)
             synchronizeProjection()
@@ -579,13 +645,13 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func accessibilitySelectedTextRanges() -> [NSValue]? {
-        [NSValue(range: bridge.accessibilitySnapshot.selectedRange)]
+        [NSValue(range: accessibilitySelectedTextRange())]
     }
 
     override func accessibilityString(for range: NSRange) -> String? {
-        let snapshot = bridge.accessibilitySnapshot
+        guard let snapshot = bridge.accessibilitySnapshotIfAvailable else { return nil }
         guard let valid = accessibilitySourceRange(range, snapshot: snapshot) else { return nil }
-        return bridge.copySourceRange(valid, revision: snapshot.revision)
+        return bridge.copySourceRangeIfAvailable(valid, revision: snapshot.revision)
     }
 
     override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
@@ -594,7 +660,9 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func accessibilityRange(forLine line: Int) -> NSRange {
-        let snapshot = bridge.accessibilitySnapshot
+        guard let snapshot = bridge.accessibilitySnapshotIfAvailable else {
+            return NSRange(location: NSNotFound, length: 0)
+        }
         guard line >= 0, line < snapshot.lineCount else {
             return NSRange(location: NSNotFound, length: 0)
         }
@@ -603,24 +671,26 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func accessibilityLine(for index: Int) -> Int {
-        let snapshot = bridge.accessibilitySnapshot
+        guard let snapshot = bridge.accessibilitySnapshotIfAvailable else { return NSNotFound }
         guard index >= 0, index <= snapshot.numberOfCharacters else { return NSNotFound }
         return bridge.accessibilityLine(for: index, revision: snapshot.revision) ?? NSNotFound
     }
 
     override func accessibilityInsertionPointLineNumber() -> Int {
-        accessibilityLine(for: bridge.accessibilitySnapshot.selectedRange.location)
+        accessibilityLine(for: accessibilitySelectedTextRange().location)
     }
 
     override func accessibilityRange(for index: Int) -> NSRange {
-        let snapshot = bridge.accessibilitySnapshot
+        guard let snapshot = bridge.accessibilitySnapshotIfAvailable else {
+            return NSRange(location: NSNotFound, length: 0)
+        }
         guard index >= 0, index <= snapshot.numberOfCharacters else {
             return NSRange(location: NSNotFound, length: 0)
         }
         guard index < snapshot.numberOfCharacters else {
             return NSRange(location: index, length: 0)
         }
-        let source = bridge.source as NSString
+        let source = (bridge.copySourceIfAvailable ?? canonicalSource) as NSString
         return source.rangeOfComposedCharacterSequence(at: index)
     }
 
@@ -933,7 +1003,7 @@ private final class DocumentTextView: NSTextView {
               NSMaxRange(range) <= snapshot.numberOfCharacters else {
             return nil
         }
-        let source = bridge.source as NSString
+        let source = (bridge.copySourceIfAvailable ?? canonicalSource) as NSString
         if range.location < source.length,
            source.rangeOfComposedCharacterSequence(at: range.location).location != range.location {
             return nil

@@ -48,3 +48,8 @@ Accessibility。line query 直接复用 `AccessibilityTextSnapshot` 的 UTF-8/UT
 - `cargo test -p yu-storage-ffi`
 - `swift build --package-path experiments/macos-document-host`
 - `docs/experiments/macos-document-host-accessibility-2026-08-14.md` 人工验收清单
+
+Accessibility 查询还必须满足“平台回调不崩溃”约束：VoiceOver/AppKit 可能在 close、reload 或
+外部文件替换的 Revision 边界上再次查询对象。Swift bridge 为快照和 source-range copy 提供
+可选的失败路径，查询失败时返回最近的 native mirror 或 `NSNotFound`，不能使用
+`precondition` 终止宿主进程。Rust 的 Revision-bound 错误仍保留给显式编辑操作处理。

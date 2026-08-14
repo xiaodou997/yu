@@ -35,6 +35,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [ ] 跨平台剪贴板格式与 source-backed Markdown/HTML/纯文本导出
 - [x] macOS 基础文件路径/标题、dirty、Revision、磁盘状态的状态栏、菜单和 TextKit Accessibility 投影
 - [x] macOS source-backed Accessibility 快照 FFI：UTF-16 字符数、选区、逻辑行范围和位置查询均绑定 Revision
+- [x] macOS Accessibility 回调在 close/reload/外部替换边界上失败可恢复，不因快照失效触发宿主崩溃
 - [ ] 完整 VoiceOver 语义树、跨平台 Accessibility 适配与 source-backed Markdown/HTML 剪贴板格式
 - [ ] 以 `DocumentSession` 为输入的 headless vertical slice benchmark
 
