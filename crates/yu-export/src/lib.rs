@@ -167,9 +167,22 @@ fn render_blocks(
     blocks: impl IntoIterator<Item = Block>,
     output: &mut String,
 ) -> Result<(), ExportError> {
+    let mut blocks = blocks.into_iter().peekable();
     let mut first = true;
-    for block in blocks {
-        let fragment = render_block(snapshot, definitions, block)?;
+    while let Some(block) = blocks.next() {
+        let fragment = if let Some((ordered, depth)) = list_signature(block.kind()) {
+            let mut group = vec![block];
+            while let Some(next) = blocks.peek().copied() {
+                if list_signature(next.kind()) == Some((ordered, depth)) {
+                    group.push(blocks.next().expect("peeked list block must be available"));
+                } else {
+                    break;
+                }
+            }
+            render_list_group(snapshot, &group, ordered)?
+        } else {
+            render_block(snapshot, definitions, block)?
+        };
         if fragment.is_empty() {
             continue;
         }
@@ -180,6 +193,14 @@ fn render_blocks(
         output.push_str(&fragment);
     }
     Ok(())
+}
+
+fn list_signature(kind: BlockKind) -> Option<(bool, u8)> {
+    match kind {
+        BlockKind::ListItem { ordered, depth, .. }
+        | BlockKind::TaskListItem { ordered, depth, .. } => Some((ordered, depth)),
+        _ => None,
+    }
 }
 
 fn render_block(
@@ -212,7 +233,7 @@ fn render_block(
             Ok(format!("<blockquote>{inner}</blockquote>"))
         }
         BlockKind::ListItem { ordered, .. } | BlockKind::TaskListItem { ordered, .. } => {
-            render_list_item(source, block, ordered)
+            render_list_group(snapshot, &[block], ordered)
         }
     }
 }
@@ -448,11 +469,58 @@ fn strip_blockquote(source: &str) -> String {
         .join("\n")
 }
 
-fn render_list_item(source: &str, block: Block, ordered: bool) -> Result<String, ExportError> {
-    let mut text = source.to_owned();
-    let first_line_end = text.find('\n').unwrap_or(text.len());
-    let prefix_end = list_prefix_end(&text[..first_line_end]);
-    text.replace_range(..prefix_end, "");
+fn render_list_group(
+    snapshot: &TextSnapshot,
+    blocks: &[Block],
+    ordered: bool,
+) -> Result<String, ExportError> {
+    let start = list_start(blocks.first().expect("list group cannot be empty").kind());
+    let mut html = if ordered {
+        if start > 1 {
+            format!("<ol start=\"{start}\">")
+        } else {
+            String::from("<ol>")
+        }
+    } else {
+        String::from("<ul>")
+    };
+
+    for block in blocks {
+        let source = slice(snapshot, block.range())?;
+        let (text, task) = list_item_content(source, *block);
+        html.push_str("<li>");
+        if let Some(state) = task {
+            html.push_str("<input type=\"checkbox\" disabled");
+            if state == TaskState::Done {
+                html.push_str(" checked");
+            }
+            html.push_str("> ");
+        }
+        let inner = export_html_fragment(&text)?;
+        append_tight_list_content(&inner, &mut html);
+        html.push_str("</li>");
+    }
+
+    html.push_str(if ordered { "</ol>" } else { "</ul>" });
+    Ok(html)
+}
+
+fn list_start(kind: BlockKind) -> u32 {
+    match kind {
+        BlockKind::ListItem { start, .. } | BlockKind::TaskListItem { start, .. } => start,
+        _ => 1,
+    }
+}
+
+fn list_item_content(source: &str, block: Block) -> (String, Option<TaskState>) {
+    let first_line_end = source.find('\n').unwrap_or(source.len());
+    let prefix_end = list_prefix_end(&source[..first_line_end]);
+    let mut text = source[prefix_end..].to_owned();
+    if text.ends_with("\r\n") {
+        text.truncate(text.len().saturating_sub(2));
+    } else if text.ends_with(['\n', '\r']) {
+        text.truncate(text.len().saturating_sub(1));
+    }
     let mut task = None;
     if let BlockKind::TaskListItem { state, .. } = block.kind() {
         task = Some(state);
@@ -467,21 +535,18 @@ fn render_list_item(source: &str, block: Block, ordered: bool) -> Result<String,
             }
         }
     }
-    let mut html = if ordered {
-        String::from("<ol><li>")
+    (text, task)
+}
+
+fn append_tight_list_content(inner: &str, output: &mut String) {
+    if let Some(content) = inner
+        .strip_prefix("<p>")
+        .and_then(|value| value.strip_suffix("</p>"))
+    {
+        output.push_str(content);
     } else {
-        String::from("<ul><li>")
-    };
-    if let Some(state) = task {
-        html.push_str("<input type=\"checkbox\" disabled");
-        if state == TaskState::Done {
-            html.push_str(" checked");
-        }
-        html.push_str("> ");
+        output.push_str(inner);
     }
-    html.push_str(&export_html_fragment(&text)?);
-    html.push_str(if ordered { "</li></ol>" } else { "</li></ul>" });
-    Ok(html)
 }
 
 fn list_prefix_end(line: &str) -> usize {
@@ -562,6 +627,17 @@ mod tests {
                 .contains("<input type=\"checkbox\" disabled checked>")
         );
         assert!(payload.html().contains("&lt;&amp;&gt;"));
+    }
+
+    #[test]
+    fn consecutive_lists_share_containers_and_preserve_ordered_start() {
+        let source = "- one\n- **two**\n\n3. three\n4. four\n";
+        let html = export_html_fragment(source).expect("export list fragment");
+
+        assert_eq!(
+            html,
+            "<ul><li>one</li><li><strong>two</strong></li></ul>\n<ol start=\"3\"><li>three</li><li>four</li></ol>"
+        );
     }
 
     #[test]
