@@ -25,11 +25,13 @@ use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 mod close;
+mod recovery;
 mod watch;
 
 pub use close::{
     ClosePrompt, CloseRequest, CloseState, CloseStateError, CloseStateMachine, CloseTransition,
 };
+pub use recovery::{RecoveryError, RecoveryOutcome, RecoveryRecord, RecoveryStore};
 pub use watch::{FileWatchCheck, FileWatchDebouncer, FileWatchEvent, FileWatchReason};
 
 /// Whether a loaded UTF-8 file contained the standard UTF-8 BOM.
@@ -196,6 +198,12 @@ impl DocumentSession {
         self.editor
             .visible_blocks(viewport)
             .map_err(StorageError::Editor)
+    }
+
+    /// Writes or clears a caller-scheduled crash-recovery snapshot without
+    /// changing the canonical source, Revision or dirty boundary.
+    pub fn write_recovery(&self, store: &RecoveryStore) -> Result<RecoveryOutcome, RecoveryError> {
+        store.write(self)
     }
 
     /// Resolves a native key through the canonical editor command route.
@@ -508,6 +516,12 @@ impl DocumentEditorSession {
         viewport: ViewportRect,
     ) -> Result<ViewportSnapshot, StorageError> {
         self.document.visible_blocks(viewport)
+    }
+
+    /// Writes or clears a recovery snapshot through the unified product
+    /// session; no second storage/editor handle is created.
+    pub fn write_recovery(&self, store: &RecoveryStore) -> Result<RecoveryOutcome, RecoveryError> {
+        self.document.write_recovery(store)
     }
 
     pub fn begin_composition(

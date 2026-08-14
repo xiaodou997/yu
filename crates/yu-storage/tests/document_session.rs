@@ -6,7 +6,8 @@ use yu_core::{Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{EditorCommand, ViewportRect};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, CloseStateMachine, CloseTransition, DiskState,
-    DocumentEditorSession, DocumentSession, ExternalFileState, SaveOutcome, StorageError, Utf8Bom,
+    DocumentEditorSession, DocumentSession, ExternalFileState, RecoveryError, RecoveryOutcome,
+    RecoveryStore, SaveOutcome, StorageError, Utf8Bom,
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -30,6 +31,29 @@ impl TestPath {
 impl Drop for TestPath {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+struct TestDirectory(PathBuf);
+
+impl TestDirectory {
+    fn new(label: &str) -> Self {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yu-storage-{label}-{}-{id}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create test directory");
+        Self(path)
+    }
+
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -89,6 +113,108 @@ fn unified_session_exposes_viewport_without_a_second_editor_handle() {
         entry_count
     );
     assert!(session.document().editor().viewport_stats().remapped() > 0);
+}
+
+#[test]
+fn recovery_round_trip_preserves_source_revision_and_bom() {
+    let target = TestPath::new("recovery-round-trip");
+    fs::write(target.as_path(), bom_bytes("source")).expect("write fixture");
+    let root = TestDirectory::new("recovery-root");
+    let store = RecoveryStore::new(root.as_path());
+    let mut session = DocumentEditorSession::open(target.as_path()).expect("open fixture");
+    session
+        .execute(EditorCommand::insert_text(" + 羽🙂"))
+        .expect("edit should succeed");
+    let revision = session.revision();
+
+    let outcome = session
+        .write_recovery(&store)
+        .expect("recovery write should succeed");
+    let recovery_path = match outcome {
+        RecoveryOutcome::Written {
+            path,
+            revision: written_revision,
+            bytes_written,
+        } => {
+            assert_eq!(written_revision, revision);
+            assert!(bytes_written > session.snapshot().len_bytes().get() as usize);
+            path
+        }
+        RecoveryOutcome::Cleared { .. } => panic!("dirty session must write recovery"),
+    };
+    assert!(recovery_path.is_file());
+    assert_eq!(
+        fs::read(target.as_path()).expect("read target"),
+        bom_bytes("source")
+    );
+
+    let record = store
+        .read(target.as_path())
+        .expect("read recovery")
+        .expect("record should exist");
+    assert_eq!(record.target_path(), target.as_path());
+    assert_eq!(record.source(), "source + 羽🙂");
+    assert_eq!(record.revision(), revision);
+    assert_eq!(record.saved_revision(), Revision::INITIAL);
+    assert_eq!(record.bom(), Utf8Bom::Present);
+    assert!(
+        root.as_path()
+            .read_dir()
+            .expect("read recovery root")
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-"))
+    );
+
+    store.clear(target.as_path()).expect("clear recovery");
+    assert!(
+        store
+            .read(target.as_path())
+            .expect("read cleared recovery")
+            .is_none()
+    );
+}
+
+#[test]
+fn clean_recovery_clears_stale_record_and_corruption_is_rejected() {
+    let target = TestPath::new("recovery-corrupt");
+    fs::write(target.as_path(), b"source").expect("write fixture");
+    let root = TestDirectory::new("recovery-corrupt-root");
+    let store = RecoveryStore::new(root.as_path());
+    let mut dirty = DocumentSession::open(target.as_path()).expect("open fixture");
+    dirty
+        .execute(EditorCommand::insert_text(" edit"))
+        .expect("edit should succeed");
+    store.write(&dirty).expect("write recovery");
+
+    let recovery_path = store.path_for(target.as_path()).expect("recovery path");
+    let mut bytes = fs::read(&recovery_path).expect("read recovery bytes");
+    let checksum_byte = bytes.len().checked_sub(1).expect("checksum exists");
+    bytes[checksum_byte] ^= 1;
+    fs::write(&recovery_path, bytes).expect("corrupt recovery");
+    assert!(matches!(
+        store.read(target.as_path()),
+        Err(RecoveryError::InvalidFormat {
+            reason: "checksum mismatch",
+            ..
+        })
+    ));
+
+    store.write(&dirty).expect("rewrite recovery");
+    let clean = DocumentSession::open(target.as_path()).expect("open clean session");
+    assert_eq!(
+        clean
+            .write_recovery(&store)
+            .expect("clean session should clear recovery"),
+        RecoveryOutcome::Cleared {
+            path: recovery_path
+        }
+    );
+    assert!(
+        store
+            .read(target.as_path())
+            .expect("read cleared recovery")
+            .is_none()
+    );
 }
 
 #[test]
