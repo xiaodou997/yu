@@ -19,8 +19,9 @@ TextKit 字符串拼接，会把 Markdown delimiter、暂态 composition 和 sou
   source，保证纯文本应用不会静默丢失 Markdown 语法。
 - `html()` 从同一 source range 建立临时 parser fragment，输出保守 semantic HTML：heading、
   paragraph、emphasis/strong/code、link/image/autolink、reference link、fenced code、
-  blockquote 和 task list 使用 parser-owned source ranges；未解析的 reference 不生成 broken
-  `href`，而是保留可见 label。
+  blockquote 和 task list 使用 parser-owned source ranges；连续且同层级的列表项共享一个
+  `<ul>`/`<ol>` 容器，有序列表的起始编号保留；未解析的 reference 不生成 broken `href`，而是
+  保留可见 label。
 - HTML exporter 不读取 TextKit、projection 或 transient composition，也不修改 session、Revision、
   selection、history 或 dirty。
 - `yu-storage-ffi` 暴露 `yu_storage_session_copy_selection_html` 的两次查询 ABI；macOS host
