@@ -497,6 +497,66 @@ impl ViewportLayout {
         }
         let old_entries = std::mem::take(&mut self.entries);
         let old_entry_count = old_entries.len();
+        if old_entries
+            .windows(2)
+            .all(|entries| range_precedes_or_equal(entries[0].key.range, entries[1].key.range))
+        {
+            return self.sync_ordered(markdown, old_entries, old_entry_count);
+        }
+
+        self.sync_hashed(markdown, old_entries, old_entry_count)
+    }
+
+    fn sync_ordered(
+        &mut self,
+        markdown: &MarkdownDocument,
+        old_entries: Vec<ViewportEntry>,
+        old_entry_count: usize,
+    ) -> Result<(), ViewportError> {
+        let mut old_index = 0_usize;
+        let mut reused = 0_usize;
+        let mut entries = Vec::with_capacity(markdown.blocks().len());
+        for block in markdown.blocks() {
+            let key = ViewportKey {
+                range: block.range(),
+                kind: block.kind(),
+            };
+
+            let mut matched = None;
+            while let Some(old_entry) = old_entries.get(old_index).copied() {
+                if old_entry.key == key {
+                    matched = Some(old_entry);
+                    old_index = old_index.saturating_add(1);
+                    break;
+                }
+                if old_entry.key.range == key.range
+                    || range_precedes(old_entry.key.range, key.range)
+                {
+                    old_index = old_index.saturating_add(1);
+                    continue;
+                }
+                break;
+            }
+            if let Some(entry) = matched {
+                reused = reused.saturating_add(1);
+                entries.push(entry);
+            } else {
+                entries.push(ViewportEntry {
+                    key,
+                    height: self.config.estimated_block_height(),
+                    measured: false,
+                });
+            }
+        }
+        self.finish_sync(markdown, old_entry_count, reused, entries)
+    }
+
+    fn sync_hashed(
+        &mut self,
+        markdown: &MarkdownDocument,
+        old_entries: Vec<ViewportEntry>,
+        old_entry_count: usize,
+    ) -> Result<(), ViewportError> {
         let mut old_by_key: HashMap<ViewportKey, Vec<ViewportEntry>> =
             HashMap::with_capacity(old_entries.len());
         for entry in old_entries {
@@ -522,6 +582,16 @@ impl ViewportLayout {
                 });
             }
         }
+        self.finish_sync(markdown, old_entry_count, reused, entries)
+    }
+
+    fn finish_sync(
+        &mut self,
+        markdown: &MarkdownDocument,
+        old_entry_count: usize,
+        reused: usize,
+        entries: Vec<ViewportEntry>,
+    ) -> Result<(), ViewportError> {
         self.invalidated = self
             .invalidated
             .saturating_add(old_entry_count.saturating_sub(reused) as u64);
@@ -761,6 +831,14 @@ impl From<HeightIndexError> for ViewportError {
 fn change_affects_range(change: yu_text::TextChange, range: TextRange) -> bool {
     let old = change.old_range();
     old.start() <= range.end() && old.end() >= range.start()
+}
+
+fn range_precedes(left: TextRange, right: TextRange) -> bool {
+    left.start() < right.start() || (left.start() == right.start() && left.end() < right.end())
+}
+
+fn range_precedes_or_equal(left: TextRange, right: TextRange) -> bool {
+    range_precedes(left, right) || left == right
 }
 
 fn map_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, ViewportError> {
