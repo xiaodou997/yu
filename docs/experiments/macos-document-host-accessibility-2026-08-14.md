@@ -102,3 +102,20 @@ checkbox press、Revision 推进和旧 child 失效检查。
 
 本次未自动修改 VoiceOver 设置；真实 VoiceOver 朗读、Rotor 手势和 checkbox press 的语音焦点反馈
 仍需在用户手动开启 VoiceOver 后完成，因此结论为 `NEEDS FOLLOW-UP`，不是完整 VoiceOver PASS。
+
+## 2026-08-14 VoiceOver 开启后 AX 验收
+
+用户已在系统设置中开启 VoiceOver。系统设置的 Accessibility 状态为 `AX_VOICEOVER_ENABLED = on`，
+VoiceOver Utility 的修饰键配置显示为 `⌃⌥ 或 ⇪`，未修改系统偏好。
+
+在干净的 Rev 0 文档上检查 `sample.md`：
+
+- text area 暴露为 `Yu Markdown 文档`，角色为可设置字符串的文本输入区，AX value 包含中文、日文、
+  emoji、组合字符、task marker 和链接源码；
+- AX 选择 `日本語: こんにちは` 成功，复制后 macOS `pbpaste` 返回完全一致的文本；
+- 文档状态保持 `已保存 · Rev 0 · 磁盘一致 · UTF-8`，fixture 文件无 diff；
+- 未使用应用级按键接口模拟 VoiceOver 全局快捷键，因为该接口不能触发系统级 VO modifier，
+  因此没有把普通按键误当作 VoiceOver 朗读证据。
+
+结论：`AX/Unicode/selection/clipboard PASS`；`VoiceOver 真实朗读、Rotor 和语音焦点反馈 NEEDS
+FOLLOW-UP`，需要用户在机器上用已配置的 `⌃⌥` 或 `⇪` modifier 手动执行一次朗读/转子流程。
