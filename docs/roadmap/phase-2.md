@@ -31,6 +31,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] 统一 session FFI：command、selection、native key route 和 composition 通过同一 handle
 - [x] macOS 可编辑文档 host：将 `NSTextInputClient` 的 marked range/source sync 接入统一 session FFI
 - [x] macOS 基础纯文本剪贴板：copy/paste/cut/selectAll 全部回到统一 session
+- [x] macOS source-backed Markdown/纯文本剪贴板：copy/cut 发布 Markdown UTI，paste 优先保留源码
 - [x] macOS 文档目录 vnode watcher：事件合并后由 Rust session 复核磁盘指纹；clean 文档可重载，dirty 文档只提示冲突
 - [ ] 跨平台剪贴板格式与 source-backed Markdown/HTML/纯文本导出
 - [x] macOS 基础文件路径/标题、dirty、Revision、磁盘状态的状态栏、菜单和 TextKit Accessibility 投影
