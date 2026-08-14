@@ -8,6 +8,8 @@ private extension NSPasteboard.PasteboardType {
     /// The payload is always the canonical source selected in Rust, never the
     /// TextKit projection (which may contain a transient IME overlay).
     static let yuMarkdown = NSPasteboard.PasteboardType("net.daringfireball.markdown")
+    /// Semantic HTML generated from the same Rust-owned source selection.
+    static let yuHTML = NSPasteboard.PasteboardType(UTType.html.identifier)
 }
 
 private enum StorageStatus {
@@ -447,6 +449,18 @@ private final class StorageBridge {
         }
     }
 
+    func copySelectionHTML(revision: UInt64) throws -> String {
+        try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_selection_html(
+                handle,
+                revision,
+                output,
+                capacity,
+                written
+            )
+        }
+    }
+
     func save() throws {
         var revision: UInt64 = 0
         var bytes: Int = 0
@@ -514,6 +528,27 @@ private final class StorageBridge {
         }
         precondition(copyStatus == StorageStatus.ok, "Rust storage copy failed: \(copyStatus)")
         return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private func copyBytesThrowing(
+        _ operation: (
+            UnsafeMutablePointer<UInt8>?, Int, UnsafeMutablePointer<Int>?
+        ) -> Int32
+    ) throws -> String {
+        var required = 0
+        let sizeStatus = operation(nil, 0, &required)
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var bytes = Array(repeating: UInt8(0), count: required)
+        var written = required
+        let copyStatus = bytes.withUnsafeMutableBufferPointer { buffer in
+            operation(buffer.baseAddress, buffer.count, &written)
+        }
+        guard copyStatus == StorageStatus.ok, written >= 0, written <= bytes.count else {
+            throw BridgeError.operation(copyStatus)
+        }
+        return String(decoding: bytes.prefix(written), as: UTF8.self)
     }
 
     private func copyBytesIfAvailable(
@@ -747,9 +782,11 @@ private final class DocumentTextView: NSTextView {
     override func copy(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
+            let revision = bridge.state.revision
             let text = bridge.copySelection()
             guard !text.isEmpty else { return }
-            try publishSourceToPasteboard(text)
+            let html = try bridge.copySelectionHTML(revision: revision)
+            try publishSourceToPasteboard(text, html: html)
         } catch {
             onError?(error)
         }
@@ -758,9 +795,11 @@ private final class DocumentTextView: NSTextView {
     override func cut(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
+            let revision = bridge.state.revision
             let selected = bridge.copySelection()
             guard !selected.isEmpty else { return }
-            try publishSourceToPasteboard(selected)
+            let html = try bridge.copySelectionHTML(revision: revision)
+            try publishSourceToPasteboard(selected, html: html)
             guard bridge.commandAvailable(Command.deleteBackward) else { return }
             apply(try bridge.executeCommand(Command.deleteBackward))
             synchronizeProjection()
@@ -926,11 +965,12 @@ private final class DocumentTextView: NSTextView {
         synchronizeProjection()
     }
 
-    private func publishSourceToPasteboard(_ source: String) throws {
+    private func publishSourceToPasteboard(_ source: String, html: String) throws {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         guard pasteboard.setString(source, forType: .string),
-              pasteboard.setString(source, forType: .yuMarkdown) else {
+              pasteboard.setString(source, forType: .yuMarkdown),
+              pasteboard.setString(html, forType: .yuHTML) else {
             throw BridgeError.clipboard
         }
     }

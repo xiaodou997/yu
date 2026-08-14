@@ -18,6 +18,7 @@ use yu_editor::{
     EditorDocumentError, EditorKey, KeyEvent, KeyModifiers, KeyRouteResult, SelectionError,
     SourceSync,
 };
+use yu_export::{ExportError, export_clipboard};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, DiskState, DocumentEditorSession, ExternalFileState,
     SaveOutcome, StorageError, Utf8Bom,
@@ -41,6 +42,7 @@ pub const YU_STORAGE_STALE_REVISION: i32 = 13;
 pub const YU_STORAGE_INVALID_SELECTION: i32 = 14;
 pub const YU_STORAGE_NO_OVERLAY: i32 = 15;
 pub const YU_STORAGE_STALE_COMPOSITION: i32 = 16;
+pub const YU_STORAGE_EXPORT_ERROR: i32 = 17;
 
 pub const YU_STORAGE_KEY_CHARACTER: u8 = 0;
 pub const YU_STORAGE_KEY_ENTER: u8 = 1;
@@ -226,6 +228,14 @@ fn status_from_error(error: StorageError) -> i32 {
         StorageError::UnsavedChanges { .. } => YU_STORAGE_UNSAVED_CHANGES,
         StorageError::CloseState(_) => YU_STORAGE_INVALID_STATE,
         StorageError::Editor(_) => YU_STORAGE_EDITOR_ERROR,
+    }
+}
+
+fn status_from_export_error(error: ExportError) -> i32 {
+    match error {
+        ExportError::RevisionMismatch { .. } => YU_STORAGE_STALE_REVISION,
+        ExportError::SourcePosition(_) => YU_STORAGE_INVALID_SELECTION,
+        ExportError::InlineParse(_) => YU_STORAGE_EXPORT_ERROR,
     }
 }
 
@@ -1183,6 +1193,36 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
     write_snapshot_range(&snapshot, range, output, capacity, written)
 }
 
+/// Copies the current Rust-owned selection as a semantic HTML fragment. The
+/// expected revision protects a queued native clipboard callback from reading
+/// a newer selection/source revision.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_selection_html(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let range = session.session.selection().ordered_range();
+    let snapshot = session.session.snapshot();
+    let payload = match export_clipboard(&snapshot, session.session.revision(), range) {
+        Ok(payload) => payload,
+        Err(error) => return status_from_export_error(error),
+    };
+    write_bytes(payload.html().as_bytes(), output, capacity, written)
+}
+
 /// Returns a compact source-backed Accessibility snapshot. Every coordinate
 /// in the result is valid only for `revision`; native queries must use the
 /// revision-bound range/copy functions below rather than retaining Rust text.
@@ -1842,6 +1882,59 @@ mod tests {
         );
         assert_eq!(
             unsafe { yu_storage_session_copy_selection(raw, 1, ptr::null_mut(), 0, &mut required) },
+            YU_STORAGE_STALE_REVISION
+        );
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn unified_ffi_html_selection_is_source_revision_bound() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-html-{id}.md"));
+        fs::write(&path, "**羽**").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection(raw, 0, 0, 5, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_selection_html(raw, 0, ptr::null_mut(), 0, &mut required)
+            },
+            YU_STORAGE_OK
+        );
+        let mut html = vec![0_u8; required];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_selection_html(
+                    raw,
+                    0,
+                    html.as_mut_ptr(),
+                    html.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            String::from_utf8(html).expect("HTML UTF-8"),
+            "<p><strong>羽</strong></p>"
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_selection_html(raw, 1, ptr::null_mut(), 0, &mut required)
+            },
             YU_STORAGE_STALE_REVISION
         );
         unsafe { yu_storage_session_destroy(raw) };

@@ -13,8 +13,9 @@
 - 普通字符、allowlist 命令和 marked text 都通过同一个 Rust session；`unmarkText` 只改变 native
   presentation，commit/cancel 用 Revision + composition generation 防止迟到回调污染新状态；
 - copy/paste/cut/selectAll 都通过 Rust selection/source/command，copy/cut 同时发布
-  `net.daringfireball.markdown` 与纯文本 payload，paste 优先读取 Markdown source；TextKit 不提供
-  独立 undo 或 canonical source，HTML payload 尚未接入；
+  `net.daringfireball.markdown`、纯文本和 `public.html` payload，三者都来自同一
+  Revision-bound source range；paste 优先读取 Markdown source；TextKit 不提供独立 undo 或
+  canonical source；
 - 不包含 Markdown visual projection、最终渲染或 workspace/tab。
 
 构建并运行：

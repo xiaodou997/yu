@@ -22,6 +22,7 @@ enum {
     YU_STORAGE_INVALID_SELECTION = 14,
     YU_STORAGE_NO_OVERLAY = 15,
     YU_STORAGE_STALE_COMPOSITION = 16,
+    YU_STORAGE_EXPORT_ERROR = 17,
 };
 
 enum {
@@ -182,6 +183,10 @@ int32_t yu_storage_session_copy_selection(const YuStorageSession *session,
                                           uint64_t expected_revision,
                                           uint8_t *output, size_t capacity,
                                           size_t *written);
+int32_t yu_storage_session_copy_selection_html(const YuStorageSession *session,
+                                               uint64_t expected_revision,
+                                               uint8_t *output, size_t capacity,
+                                               size_t *written);
 int32_t yu_storage_session_accessibility_snapshot(
     const YuStorageSession *session, YuStorageAccessibilitySnapshot *output);
 int32_t yu_storage_session_accessibility_line_range(
