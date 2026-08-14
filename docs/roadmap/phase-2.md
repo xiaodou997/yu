@@ -41,6 +41,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] 以 `DocumentEditorSession` 为输入的 headless vertical slice benchmark，并记录局部/传播编辑基线
 - [x] viewport block sync 使用 key 索引，避免大文档编辑后的 O(blocks²) cache remap
 - [x] 未发生 viewport 查询时保持 block entries 惰性，避免纯编辑路径物化全文索引
+- [x] 已 materialize viewport 时优先用有序 merge 保留 block entry，异常顺序再回退 key 索引
 
 ## 约束
 

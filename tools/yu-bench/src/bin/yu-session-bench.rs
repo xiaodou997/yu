@@ -2,10 +2,11 @@
 
 //! Headless Phase 2 vertical slice benchmark.
 //!
-//! The workload intentionally goes through the same `DocumentEditorSession`
-//! boundary used by the native host: open a UTF-8 Markdown file, select a
-//! source range, execute an insert command (which updates the editor and
-//! incremental Markdown state), save atomically, and reload the clean file.
+//! Every scenario intentionally goes through the same `DocumentEditorSession`
+//! boundary used by the native host: open a UTF-8 Markdown file, optionally
+//! materialize its viewport, select a source range, execute insert commands
+//! (which update the editor and incremental Markdown state), save atomically,
+//! and reload the clean file.
 
 use std::env;
 use std::error::Error;
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use yu_core::ByteOffset;
-use yu_editor::{CaretAffinity, EditorCommand, EditorSelection};
+use yu_editor::{CaretAffinity, EditorCommand, EditorSelection, ViewportRect};
 use yu_storage::{DocumentEditorSession, SaveOutcome};
 
 const SECTION: &str = "# Yu\n\nA paragraph with **strong text**, 中文 and emoji 🙂.\n\n```rust\nfn main() {}\n```\n\n";
@@ -39,18 +40,35 @@ fn main() -> Result<(), Box<dyn Error>> {
             source: &source,
             script: &local_script,
             expected_source: &local_expected,
+            materialize_viewport: false,
         },
         WorkloadSpec {
             label: "random",
             source: &source,
             script: &random_script,
             expected_source: &random_expected,
+            materialize_viewport: false,
+        },
+        WorkloadSpec {
+            label: "materialized-local",
+            source: &source,
+            script: &local_script,
+            expected_source: &local_expected,
+            materialize_viewport: true,
+        },
+        WorkloadSpec {
+            label: "materialized-random",
+            source: &source,
+            script: &random_script,
+            expected_source: &random_expected,
+            materialize_viewport: true,
         },
         WorkloadSpec {
             label: "fence-propagation",
             source: &propagation_source,
             script: &propagation_script,
             expected_source: &propagation_expected,
+            materialize_viewport: false,
         },
     ];
     for workload in workloads {
@@ -66,12 +84,14 @@ struct WorkloadSpec<'a> {
     source: &'a str,
     script: &'a [ScriptEdit],
     expected_source: &'a str,
+    materialize_viewport: bool,
 }
 
 struct WorkloadMeasurement {
     label: &'static str,
     source_bytes: usize,
     edits: usize,
+    viewport_warmup: Option<Duration>,
     open_median: Duration,
     edit_total: Duration,
     selection_median: Duration,
@@ -104,6 +124,17 @@ fn run_workload(
     if session.is_dirty() {
         return Err(io::Error::other("fresh session unexpectedly dirty").into());
     }
+
+    let viewport_warmup = if workload.materialize_viewport {
+        let start = Instant::now();
+        let snapshot = session.visible_blocks(ViewportRect::new(0.0, 1.0))?;
+        if snapshot.blocks().is_empty() {
+            return Err(io::Error::other("viewport warmup returned no blocks").into());
+        }
+        Some(start.elapsed())
+    } else {
+        None
+    };
 
     let mut edit_samples = Vec::with_capacity(workload.script.len());
     let mut selection_samples = Vec::with_capacity(workload.script.len());
@@ -141,6 +172,12 @@ fn run_workload(
     if !session.is_dirty() {
         return Err(io::Error::other("edited session unexpectedly clean").into());
     }
+    if workload.materialize_viewport {
+        let snapshot = session.visible_blocks(ViewportRect::new(0.0, 1.0))?;
+        if snapshot.revision() != session.revision() {
+            return Err(io::Error::other("materialized viewport revision is stale").into());
+        }
+    }
 
     let save_start = Instant::now();
     let save = session.save()?;
@@ -166,6 +203,7 @@ fn run_workload(
         label: workload.label,
         source_bytes: workload.source.len(),
         edits: workload.script.len(),
+        viewport_warmup,
         open_median: median(&mut open_samples),
         edit_total,
         selection_median: median(&mut selection_samples),
@@ -184,6 +222,9 @@ fn print_measurement(measurement: &WorkloadMeasurement) {
     println!("workload: {}", measurement.label);
     println!("  source bytes: {}", measurement.source_bytes);
     println!("  edits: {}", measurement.edits);
+    if let Some(viewport_warmup) = measurement.viewport_warmup {
+        println!("  viewport warmup: {:?}", viewport_warmup);
+    }
     println!("  open median: {:?}", measurement.open_median);
     println!("  edit total: {:?}", measurement.edit_total);
     println!(

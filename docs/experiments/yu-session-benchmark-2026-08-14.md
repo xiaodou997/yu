@@ -31,10 +31,14 @@ cargo run -p yu-bench --bin yu-session-bench -- \
   --size-mib 10 --iterations 8 --random-edits 64
 ```
 
-输出现在拆成三个 workload：
+输出现在拆成五个 workload：
 
 - `local`：在普通段落内部连续插入中英文、emoji 和组合字符，不改变 block 边界。
 - `random`：固定种子的随机范围替换，覆盖一般编辑和可能的 Markdown 结构变化。
+- `materialized-local`：先建立完整 viewport block entries，再执行局部编辑，验证已测量状态
+  的有序 remap。
+- `materialized-random`：先建立完整 viewport block entries，再执行随机编辑，验证结构变化时
+  的失效与恢复。
 - `fence-propagation`：在 1 MiB 未闭合 code fence 的开头删除 fence 标记，验证状态向 EOF
   传播的路径。
 
@@ -87,6 +91,22 @@ fence-propagation     40.863 ms      25.636 ms   25.636 ms      25.630 ms
 `local`/`random` 从约 55 ms/次降到约 5 ms/次；`fence-propagation` 仍保留约 25 ms 的向 EOF
 状态传播成本。save/reload 仍分别约 18 ms/60 ms，属于当前 session 文件 I/O 与 clean reload
 路径，不应与编辑 parser 成本混为一谈。以上数字是本机诊断基线，不是最终产品性能承诺。
+
+### 已 materialize viewport 的有序同步
+
+同一 fixture 在先建立 viewport entries 后，原先的哈希重建还会为每次局部编辑分配并扫描一份
+完整索引。现在 `ViewportLayout::sync` 优先使用保持 source 顺序的线性 merge，只有检测到旧
+entries 顺序异常时才回退到 key hash index。2 次 open 的诊断结果如下：
+
+```text
+workload            viewport warmup   edit total   edit mean
+materialized-local       24.824 ms      150.813 ms   37.703 ms
+materialized-random      25.197 ms      146.896 ms   36.724 ms
+```
+
+这里的约 37 ms/次包含已 materialize viewport 的 block range remap 与 height-index 重建；它与
+未查询 viewport 的约 5 ms/次路径不同，符合“可视状态已建立后才承担其维护成本”的设计。
+`materialized-*` 末尾还会重新查询 viewport，确认新 Revision 的 block snapshot 可用。
 
 ## 正确性不变量
 

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use yu_core::{Revision, TextRange, Utf16Offset, Utf16Range};
-use yu_editor::EditorCommand;
+use yu_editor::{EditorCommand, ViewportRect};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, CloseStateMachine, CloseTransition, DiskState,
     DocumentEditorSession, DocumentSession, ExternalFileState, SaveOutcome, StorageError, Utf8Bom,
@@ -59,6 +59,36 @@ fn open_preserves_bom_metadata_without_polluting_source_coordinates() {
         session.disk_state().expect("disk state"),
         DiskState::Unchanged
     );
+}
+
+#[test]
+fn unified_session_exposes_viewport_without_a_second_editor_handle() {
+    let path = TestPath::new("viewport");
+    fs::write(path.as_path(), b"one\n\ntwo\n\nthree\n\nfour").expect("write fixture");
+    let mut session = DocumentEditorSession::open(path.as_path()).expect("open fixture");
+
+    let first = session
+        .visible_blocks(ViewportRect::new(0.0, 1.0))
+        .expect("first viewport query should succeed");
+    assert!(!first.blocks().is_empty());
+    let entry_count = session.document().editor().viewport_stats().entries();
+    assert_eq!(
+        entry_count,
+        session.document().editor().markdown().blocks().len()
+    );
+
+    session
+        .execute(EditorCommand::insert_text("!"))
+        .expect("edit should succeed");
+    let second = session
+        .visible_blocks(ViewportRect::new(0.0, 1.0))
+        .expect("mapped viewport query should succeed");
+    assert_eq!(second.revision(), session.revision());
+    assert_eq!(
+        session.document().editor().viewport_stats().entries(),
+        entry_count
+    );
+    assert!(session.document().editor().viewport_stats().remapped() > 0);
 }
 
 #[test]

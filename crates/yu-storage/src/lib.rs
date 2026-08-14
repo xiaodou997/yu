@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use yu_core::{Revision, TextRange, Utf16Range};
 use yu_editor::{
     CommandResult, CompositionError, CompositionOverlay, EditorCommand, EditorDocument,
-    EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult,
+    EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, ViewportRect, ViewportSnapshot,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -185,6 +185,17 @@ impl DocumentSession {
         self.editor
             .set_selection(selection)
             .map_err(|error| StorageError::Editor(EditorDocumentError::Selection(error)))
+    }
+
+    /// Measures the current visible block window through the same document
+    /// session that owns source, dirty state and file conflicts.
+    pub fn visible_blocks(
+        &mut self,
+        viewport: ViewportRect,
+    ) -> Result<ViewportSnapshot, StorageError> {
+        self.editor
+            .visible_blocks(viewport)
+            .map_err(StorageError::Editor)
     }
 
     /// Resolves a native key through the canonical editor command route.
@@ -488,6 +499,15 @@ impl DocumentEditorSession {
 
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), StorageError> {
         self.document.set_selection(selection)
+    }
+
+    /// Measures the current visible block window without creating a second
+    /// editor handle outside the unified product session.
+    pub fn visible_blocks(
+        &mut self,
+        viewport: ViewportRect,
+    ) -> Result<ViewportSnapshot, StorageError> {
+        self.document.visible_blocks(viewport)
     }
 
     pub fn begin_composition(
