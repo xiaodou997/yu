@@ -110,8 +110,10 @@ private struct NativeAccessibilitySemanticNode {
     let level: UInt8
     let sourceRange: NSRange
     let labelRange: NSRange
+    let destinationRange: NSRange?
+    let actionBlock: UInt64?
 
-    init(_ value: YuStorageAccessibilityNode) {
+    init(_ value: YuStorageAccessibilityNodeV2) {
         revision = value.revision
         index = value.index
         parent = value.parent
@@ -126,6 +128,16 @@ private struct NativeAccessibilitySemanticNode {
             location: Int(value.label_start_utf16),
             length: Int(value.label_end_utf16 - value.label_start_utf16)
         )
+        if value.destination_start_utf16 == UInt64.max
+            || value.destination_end_utf16 < value.destination_start_utf16 {
+            destinationRange = nil
+        } else {
+            destinationRange = NSRange(
+                location: Int(value.destination_start_utf16),
+                length: Int(value.destination_end_utf16 - value.destination_start_utf16)
+            )
+        }
+        actionBlock = value.action_block == UInt64.max ? nil : value.action_block
     }
 }
 
@@ -231,6 +243,38 @@ private final class YuAccessibilitySemanticElement: NSObject,
             return accessibilityLabel
         }
         return NSNumber(value: node.flags & SemanticAccessibilityFlag.taskDone != 0)
+    }
+
+    /// Link destinations are parser-resolved source ranges. The native child
+    /// exposes only a Foundation URL value; it never reparses Markdown or
+    /// retains a destination string outside the current Revision.
+    @objc var accessibilityURL: URL? {
+        guard let kind = SemanticAccessibilityKind(rawValue: node.kind),
+              kind == .link || kind == .autolink || kind == .referenceLink,
+              let destinationRange = node.destinationRange,
+              let destination = bridge.copySourceRangeIfAvailable(
+                  destinationRange,
+                  revision: node.revision
+              ),
+              !destination.isEmpty else {
+            return nil
+        }
+        if kind == .autolink,
+           destination.contains("@"),
+           !destination.contains(":") {
+            return URL(string: "mailto:\(destination)")
+        }
+        return URL(string: destination)
+    }
+
+    /// VoiceOver can press a task checkbox, but the operation remains a
+    /// Revision-bound Rust command. Links deliberately have no press action
+    /// yet; opening external content needs a separate product policy.
+    @objc func accessibilityPerformPress() -> Bool {
+        guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem else {
+            return false
+        }
+        return frameOwner?.toggleTaskAccessibilityNode(node) ?? false
     }
 
     @objc func accessibilityIdentifier() -> String {
@@ -444,10 +488,10 @@ private final class StorageBridge {
         )
         guard countStatus == StorageStatus.ok else { return nil }
 
-        var values = Array(repeating: YuStorageAccessibilityNode(), count: count)
+        var values = Array(repeating: YuStorageAccessibilityNodeV2(), count: count)
         var written = 0
         let status = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_accessibility_semantic_nodes(
+            yu_storage_session_accessibility_semantic_nodes_v2(
                 handle,
                 revision,
                 buffer.baseAddress,
@@ -806,6 +850,7 @@ private final class DocumentTextView: NSTextView {
         static let outdentList: UInt8 = 7
         static let undo: UInt8 = 8
         static let redo: UInt8 = 9
+        static let toggleTask: UInt8 = 10
         static let moveWordLeft: UInt8 = 11
         static let moveWordRight: UInt8 = 12
         static let moveUp: UInt8 = 13
@@ -990,6 +1035,28 @@ private final class DocumentTextView: NSTextView {
         result.targetRange = element.node.sourceRange
         result.customLabel = element.accessibilityLabel
         return result
+    }
+
+    func toggleTaskAccessibilityNode(_ node: NativeAccessibilitySemanticNode) -> Bool {
+        guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem,
+              node.revision == bridge.state.revision,
+              let block = node.actionBlock,
+              !bridge.composition.active,
+              bridge.commandAvailable(Command.toggleTask, block: block) else {
+            return false
+        }
+        do {
+            let result = try bridge.executeCommand(Command.toggleTask, block: block)
+            guard result.changed else { return false }
+            apply(result)
+            synchronizeProjection()
+            postAccessibilityRefresh()
+            onDocumentChange?()
+            return true
+        } catch {
+            onError?(error)
+            return false
+        }
     }
 
     override func accessibilityString(for range: NSRange) -> String? {
@@ -1912,16 +1979,20 @@ private func runAccessibilitySelfCheck(path: String) -> Never {
         let initialChildren = (textView.accessibilityChildren ?? [])
             .compactMap { $0 as? YuAccessibilitySemanticElement }
 
-        func validate(_ elements: [YuAccessibilitySemanticElement], parent: AnyObject) -> Int {
+        func validate(
+            _ elements: [YuAccessibilitySemanticElement],
+            parent: AnyObject,
+            revision: UInt64
+        ) -> Int {
             var count = 0
             for element in elements {
-                precondition(element.node.revision == initialRevision)
+                precondition(element.node.revision == revision)
                 precondition(element.parentObject === parent)
                 precondition(element.accessibilityLabel != nil)
                 count += 1
                 let children = element.semanticChildren
                     .compactMap { $0 as? YuAccessibilitySemanticElement }
-                count += validate(children, parent: element)
+                count += validate(children, parent: element, revision: revision)
             }
             return count
         }
@@ -1937,7 +2008,7 @@ private func runAccessibilitySelfCheck(path: String) -> Never {
             return result
         }
 
-        let initialCount = validate(initialChildren, parent: textView)
+        let initialCount = validate(initialChildren, parent: textView, revision: initialRevision)
         let allInitial = flatten(initialChildren)
         let headings = allInitial.filter { $0.node.kind == SemanticAccessibilityKind.heading.rawValue }
         let links = allInitial.filter {
@@ -1953,11 +2024,21 @@ private func runAccessibilitySelfCheck(path: String) -> Never {
         }
         if !links.isEmpty {
             precondition(links.allSatisfy { $0.accessibilityRole == .link })
+            precondition(
+                links
+                    .filter { $0.node.destinationRange != nil }
+                    .allSatisfy { $0.accessibilityURL != nil }
+            )
         }
         if !tasks.isEmpty {
             precondition(tasks.allSatisfy { $0.accessibilityRole == .checkBox })
             precondition(tasks.allSatisfy { $0.accessibilityValue is NSNumber })
         }
+        precondition(
+            allInitial
+                .filter { $0.node.kind != SemanticAccessibilityKind.taskListItem.rawValue }
+                .allSatisfy { !$0.accessibilityPerformPress() }
+        )
 
         let rotors = textView.accessibilityCustomRotors ?? []
         precondition(rotors.count == 2)
@@ -1998,14 +2079,43 @@ private func runAccessibilitySelfCheck(path: String) -> Never {
             print("  kind=\(element.node.kind) role=\(element.accessibilityRole.rawValue) label=\(label)")
         }
 
+        let actionRevision: UInt64
+        let actionChildren: [YuAccessibilitySemanticElement]
+        if let task = tasks.first,
+           let beforeValue = task.accessibilityValue as? NSNumber,
+           let actionBlock = task.node.actionBlock {
+            let beforeDone = beforeValue.boolValue
+            precondition(task.accessibilityPerformPress())
+            actionRevision = bridge.state.revision
+            precondition(actionRevision != initialRevision)
+            precondition(task.accessibilityLabel == nil)
+            textView.refreshFromRust()
+            actionChildren = (textView.accessibilityChildren ?? [])
+                .compactMap { $0 as? YuAccessibilitySemanticElement }
+            _ = validate(actionChildren, parent: textView, revision: actionRevision)
+            let toggledTask = flatten(actionChildren).first {
+                $0.node.actionBlock == actionBlock
+            }
+            guard let toggledTask,
+                  let afterValue = toggledTask.accessibilityValue as? NSNumber else {
+                preconditionFailure("toggled task child is missing")
+            }
+            precondition(afterValue.boolValue != beforeDone)
+            print("Yu Accessibility self-check: task press revision=\(actionRevision)")
+        } else {
+            actionRevision = initialRevision
+            actionChildren = initialChildren
+        }
+
         _ = try bridge.insertText("\n")
-        let staleLabel = initialChildren.first?.accessibilityLabel
-        precondition(staleLabel == nil)
+        if let staleCandidate = actionChildren.first {
+            precondition(staleCandidate.accessibilityLabel == nil)
+        }
         textView.refreshFromRust()
         let nextRevision = bridge.state.revision
         let nextChildren = (textView.accessibilityChildren ?? [])
             .compactMap { $0 as? YuAccessibilitySemanticElement }
-        precondition(nextRevision != initialRevision)
+        precondition(nextRevision != actionRevision)
         precondition(nextChildren.allSatisfy { $0.node.revision == nextRevision })
         print("Yu Accessibility self-check: refreshed revision=\(nextRevision)")
         exit(EXIT_SUCCESS)

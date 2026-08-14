@@ -97,6 +97,8 @@ pub const YU_STORAGE_CLOSE_ALREADY_CLOSED: u8 = 2;
 pub const YU_STORAGE_EXTERNAL_CHANGED: u8 = YU_STORAGE_DISK_CHANGED;
 pub const YU_STORAGE_EXTERNAL_MISSING: u8 = YU_STORAGE_DISK_MISSING;
 pub const YU_STORAGE_ACCESSIBILITY_PARENT_NONE: u32 = u32::MAX;
+pub const YU_STORAGE_ACCESSIBILITY_NO_RANGE: u64 = u64::MAX;
+pub const YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK: u64 = u64::MAX;
 pub const YU_STORAGE_ACCESSIBILITY_FLAG_ORDERED: u8 = ACCESSIBILITY_SEMANTIC_FLAG_ORDERED;
 pub const YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE: u8 = ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE;
 pub const YU_STORAGE_ACCESSIBILITY_KIND_DOCUMENT: u8 = 1;
@@ -181,6 +183,33 @@ pub struct YuStorageAccessibilityNode {
     pub source_end_utf16: u64,
     pub label_start_utf16: u64,
     pub label_end_utf16: u64,
+}
+
+/// Extended semantic node payload. The original
+/// `YuStorageAccessibilityNode` ABI remains unchanged; native clients that
+/// need URL/action metadata opt into the V2 fill function below.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageAccessibilityNodeV2 {
+    pub revision: u64,
+    pub index: u32,
+    pub parent: u32,
+    pub kind: u8,
+    pub flags: u8,
+    pub level: u8,
+    pub reserved: u8,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub label_start_utf16: u64,
+    pub label_end_utf16: u64,
+    /// Source-backed destination range for link/image nodes. Both values are
+    /// `YU_STORAGE_ACCESSIBILITY_NO_RANGE` when the node has no
+    /// destination in the current Revision.
+    pub destination_start_utf16: u64,
+    pub destination_end_utf16: u64,
+    /// Markdown block index accepted by `YU_STORAGE_COMMAND_TOGGLE_TASK`, or
+    /// `YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK` for non-actionable nodes.
+    pub action_block: u64,
 }
 
 #[repr(C)]
@@ -493,6 +522,46 @@ fn accessibility_semantic_node_output(
     }
 }
 
+fn accessibility_semantic_node_v2_output(
+    node: AccessibilitySemanticNode,
+) -> YuStorageAccessibilityNodeV2 {
+    let source = node.source_range().range();
+    let label = node.label_range().range();
+    let (destination_start_utf16, destination_end_utf16) = node
+        .destination_range()
+        .map(|destination| {
+            (
+                destination.range().start().get(),
+                destination.range().end().get(),
+            )
+        })
+        .unwrap_or((
+            YU_STORAGE_ACCESSIBILITY_NO_RANGE,
+            YU_STORAGE_ACCESSIBILITY_NO_RANGE,
+        ));
+    YuStorageAccessibilityNodeV2 {
+        revision: node.source_range().revision().get(),
+        index: node.index(),
+        parent: node
+            .parent()
+            .unwrap_or(YU_STORAGE_ACCESSIBILITY_PARENT_NONE),
+        kind: node.kind().tag(),
+        flags: node.flags(),
+        level: node.level(),
+        reserved: 0,
+        source_start_utf16: source.start().get(),
+        source_end_utf16: source.end().get(),
+        label_start_utf16: label.start().get(),
+        label_end_utf16: label.end().get(),
+        destination_start_utf16,
+        destination_end_utf16,
+        action_block: node
+            .action_block()
+            .and_then(|block| u64::try_from(block).ok())
+            .unwrap_or(YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK),
+    }
+}
+
 fn write_accessibility_nodes(
     nodes: &[AccessibilitySemanticNode],
     output: *mut YuStorageAccessibilityNode,
@@ -521,6 +590,43 @@ fn write_accessibility_nodes(
         .iter()
         .copied()
         .map(accessibility_semantic_node_output)
+        .collect::<Vec<_>>();
+    // SAFETY: capacity was checked against the number of converted nodes, and
+    // the native caller supplied writable storage for that many values.
+    unsafe {
+        ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
+    }
+    YU_STORAGE_OK
+}
+
+fn write_accessibility_nodes_v2(
+    nodes: &[AccessibilitySemanticNode],
+    output: *mut YuStorageAccessibilityNodeV2,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` is a caller-owned output pointer checked above.
+    unsafe { *written = nodes.len() };
+    if nodes.is_empty() {
+        return YU_STORAGE_OK;
+    }
+    if output.is_null() {
+        return if capacity == 0 {
+            YU_STORAGE_OK
+        } else {
+            YU_STORAGE_NULL_POINTER
+        };
+    }
+    if capacity < nodes.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    let converted = nodes
+        .iter()
+        .copied()
+        .map(accessibility_semantic_node_v2_output)
         .collect::<Vec<_>>();
     // SAFETY: capacity was checked against the number of converted nodes, and
     // the native caller supplied writable storage for that many values.
@@ -1401,6 +1507,34 @@ pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_nodes(
     write_accessibility_nodes(snapshot.nodes(), output, capacity, written)
 }
 
+/// Copies the extended Revision-bound semantic tree. This V2 function keeps
+/// the original `yu_storage_session_accessibility_semantic_nodes` struct ABI
+/// intact while adding parser-resolved destination and task action metadata.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable V2 nodes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_nodes_v2(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut YuStorageAccessibilityNodeV2,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let snapshot = match accessibility_semantic_snapshot(&session.session) {
+        Ok(snapshot) => snapshot,
+        Err(status) => return status,
+    };
+    write_accessibility_nodes_v2(snapshot.nodes(), output, capacity, written)
+}
+
 /// Returns one logical LF-delimited line range from a source-backed
 /// Accessibility snapshot. The line index is zero based and the terminating
 /// LF belongs to the preceding line, matching `AccessibilityTextSnapshot`.
@@ -1812,7 +1946,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-semantic-ax-{id}.md"));
         fs::write(
             &path,
-            "# 标题\n\n段落 **粗体** [链接](https://example.com)\n\n- [x] 完成\n",
+            "# 标题\n\n段落 **粗体** [链接](https://example.com) [参考][rust]\n\n- [x] 完成\n\n[rust]: https://www.rust-lang.org/\n",
         )
         .expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -1868,11 +2002,37 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_LINK)
         );
-        let task = nodes
+        let mut extended_nodes = vec![YuStorageAccessibilityNodeV2::default(); count];
+        let mut extended_written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_accessibility_semantic_nodes_v2(
+                    raw,
+                    0,
+                    extended_nodes.as_mut_ptr(),
+                    extended_nodes.len(),
+                    &mut extended_written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(extended_written, count);
+        let link = extended_nodes
+            .iter()
+            .find(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_LINK)
+            .expect("link semantic node");
+        assert!(link.destination_end_utf16 > link.destination_start_utf16);
+        let reference_link = extended_nodes
+            .iter()
+            .find(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_LINK)
+            .expect("reference link semantic node");
+        assert!(reference_link.destination_end_utf16 > reference_link.destination_start_utf16);
+        let task = extended_nodes
             .iter()
             .find(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_TASK_LIST_ITEM)
             .expect("task semantic node");
         assert_ne!(task.flags & YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE, 0);
+        assert_ne!(task.action_block, YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK);
 
         let mut stale_count = 0;
         assert_eq!(
