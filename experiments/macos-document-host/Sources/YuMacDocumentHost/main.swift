@@ -129,6 +129,137 @@ private struct NativeAccessibilitySemanticNode {
     }
 }
 
+private enum SemanticAccessibilityKind: UInt8 {
+    case document = 1
+    case heading = 2
+    case paragraph = 3
+    case codeBlock = 4
+    case blockQuote = 5
+    case listItem = 6
+    case taskListItem = 7
+    case emphasis = 8
+    case strong = 9
+    case codeSpan = 10
+    case link = 11
+    case image = 12
+    case autolink = 13
+    case referenceLink = 14
+    case referenceImage = 15
+}
+
+private enum SemanticAccessibilityFlag {
+    static let taskDone: UInt8 = 1 << 1
+}
+
+/// A lightweight AppKit AX element backed by one Rust semantic node. It owns
+/// no Markdown text: labels and range queries always use the node's Revision
+/// and ask `StorageBridge` for the current source bytes.
+private final class YuAccessibilitySemanticElement: NSAccessibilityElement {
+    let node: NativeAccessibilitySemanticNode
+    private let bridge: StorageBridge
+    weak var parentObject: AnyObject?
+    var semanticChildren: [Any] = []
+    weak var frameOwner: DocumentTextView?
+
+    init(
+        node: NativeAccessibilitySemanticNode,
+        bridge: StorageBridge,
+        parent: AnyObject?
+    ) {
+        self.node = node
+        self.bridge = bridge
+        parentObject = parent
+        super.init()
+    }
+
+    var accessibilityFrame: NSRect {
+        frameOwner?.accessibilityFrameForSemanticRange(node.sourceRange) ?? .zero
+    }
+
+    var accessibilityParent: Any? { parentObject }
+
+    var accessibilityRole: NSAccessibility.Role {
+        switch SemanticAccessibilityKind(rawValue: node.kind) {
+        case .taskListItem:
+            return .checkBox
+        case .link, .autolink, .referenceLink:
+            return .link
+        case .image, .referenceImage:
+            return .image
+        case .blockQuote, .listItem:
+            return .group
+        case .document, .heading, .paragraph, .codeBlock, .emphasis, .strong, .codeSpan, .none:
+            return .staticText
+        }
+    }
+
+    var accessibilityRoleDescription: String? {
+        switch SemanticAccessibilityKind(rawValue: node.kind) {
+        case .heading:
+            return "标题（级别 \(node.level)）"
+        case .codeBlock, .codeSpan:
+            return "代码"
+        case .blockQuote:
+            return "引用"
+        case .listItem:
+            return "列表项"
+        case .taskListItem:
+            return "任务列表项"
+        case .emphasis:
+            return "强调文本"
+        case .strong:
+            return "粗体文本"
+        case .link, .autolink, .referenceLink:
+            return "链接"
+        case .image, .referenceImage:
+            return "图像"
+        case .document, .paragraph, .none:
+            return nil
+        }
+    }
+
+    var accessibilityLabel: String? {
+        bridge.copySourceRangeIfAvailable(node.labelRange, revision: node.revision)
+    }
+
+    var accessibilityTitle: String? { accessibilityLabel }
+
+    var accessibilityValue: Any? {
+        guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem else {
+            return accessibilityLabel
+        }
+        return NSNumber(value: node.flags & SemanticAccessibilityFlag.taskDone != 0)
+    }
+
+    var accessibilityIdentifier: String? {
+        "yu-document-semantic-\(node.revision)-\(node.index)"
+    }
+
+    var accessibilityChildren: [Any]? { semanticChildren }
+
+    var accessibilityChildrenInNavigationOrder: [NSAccessibilityElement]? {
+        semanticChildren.compactMap { $0 as? NSAccessibilityElement }
+    }
+
+    override func accessibilityString(for range: NSRange) -> String? {
+        guard range.location >= 0,
+              range.length >= 0,
+              NSMaxRange(range) <= node.sourceRange.length else {
+            return nil
+        }
+        let absolute = NSRange(
+            location: node.sourceRange.location + range.location,
+            length: range.length
+        )
+        return bridge.copySourceRangeIfAvailable(absolute, revision: node.revision)
+    }
+
+    override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
+        guard let text = accessibilityString(for: range) else { return nil }
+        return NSAttributedString(string: text)
+    }
+}
+
 private struct NativeComposition {
     let revision: UInt64
     let generation: UInt64
@@ -660,6 +791,7 @@ private final class DocumentTextView: NSTextView {
     private var canonicalSource: String
     private var canonicalRevision: UInt64
     private var semanticNodes: [NativeAccessibilitySemanticNode] = []
+    private var semanticElements: [YuAccessibilitySemanticElement] = []
     private var nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
     private var synchronizingSelection = false
     var onDocumentChange: (() -> Void)?
@@ -694,6 +826,7 @@ private final class DocumentTextView: NSTextView {
         isHorizontallyResizable = false
         autoresizingMask = [.width]
         semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
+        rebuildSemanticAccessibilityTree()
         synchronizeProjection()
     }
 
@@ -704,6 +837,7 @@ private final class DocumentTextView: NSTextView {
         canonicalSource = bridge.source
         canonicalRevision = bridge.state.revision
         semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
+        rebuildSemanticAccessibilityTree()
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
         synchronizeProjection()
         postAccessibilityRefresh()
@@ -752,6 +886,16 @@ private final class DocumentTextView: NSTextView {
 
     override func accessibilitySelectedTextRanges() -> [NSValue]? {
         [NSValue(range: accessibilitySelectedTextRange())]
+    }
+
+    /// AppKit asks for these children through Objective-C Accessibility
+    /// dispatch. The document TextKit element remains the editable source
+    /// surface; semantic children are stable owned nodes for VoiceOver
+    /// navigation and never become a second text model.
+    @objc var accessibilityChildren: [Any]? { semanticElements }
+
+    @objc var accessibilityChildrenInNavigationOrder: [NSAccessibilityElement]? {
+        semanticElements
     }
 
     override func accessibilityString(for range: NSRange) -> String? {
@@ -1139,9 +1283,64 @@ private final class DocumentTextView: NSTextView {
         return range
     }
 
+    func accessibilityFrameForSemanticRange(_ range: NSRange) -> NSRect {
+        guard canonicalRevision == bridge.state.revision,
+              !bridge.composition.active,
+              range.location >= 0,
+              range.length >= 0,
+              NSMaxRange(range) <= (string as NSString).length,
+              let container = textContainer,
+              let layoutManager,
+              let window else {
+            return .zero
+        }
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: range,
+            actualCharacterRange: nil
+        )
+        guard glyphRange.location != NSNotFound else { return .zero }
+        let local = layoutManager
+            .boundingRect(forGlyphRange: glyphRange, in: container)
+            .offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
+        return window.convertToScreen(convert(local, to: nil))
+    }
+
+    private func rebuildSemanticAccessibilityTree() {
+        let nodes = semanticNodes.filter {
+            SemanticAccessibilityKind(rawValue: $0.kind) != .document
+        }
+        var elementsByIndex: [UInt32: YuAccessibilitySemanticElement] = [:]
+        for node in nodes {
+            let element = YuAccessibilitySemanticElement(
+                node: node,
+                bridge: bridge,
+                parent: self
+            )
+            element.frameOwner = self
+            elementsByIndex[node.index] = element
+        }
+
+        var topLevel: [YuAccessibilitySemanticElement] = []
+        for node in nodes {
+            guard let element = elementsByIndex[node.index] else { continue }
+            guard node.parent != UInt32.max,
+                  node.parent != 0,
+                  let parent = elementsByIndex[node.parent] else {
+                element.parentObject = self
+                topLevel.append(element)
+                continue
+            }
+            element.parentObject = parent
+            parent.semanticChildren.append(element)
+        }
+        semanticElements = topLevel
+    }
+
     func postAccessibilityRefresh() {
         semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
+        rebuildSemanticAccessibilityTree()
         NSAccessibility.post(element: self, notification: .valueChanged)
+        NSAccessibility.post(element: self, notification: .layoutChanged)
         postSelectionChanged()
     }
 
@@ -1588,7 +1787,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 }
 
+private func runAccessibilitySelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let textView = DocumentTextView(bridge: bridge)
+        let initialRevision = bridge.state.revision
+        let initialChildren = (textView.accessibilityChildren ?? [])
+            .compactMap { $0 as? YuAccessibilitySemanticElement }
+
+        func validate(_ elements: [YuAccessibilitySemanticElement], parent: AnyObject) -> Int {
+            var count = 0
+            for element in elements {
+                precondition(element.node.revision == initialRevision)
+                precondition(element.parentObject === parent)
+                precondition(element.accessibilityLabel != nil)
+                count += 1
+                let children = element.semanticChildren
+                    .compactMap { $0 as? YuAccessibilitySemanticElement }
+                count += validate(children, parent: element)
+            }
+            return count
+        }
+
+        let initialCount = validate(initialChildren, parent: textView)
+        print("Yu Accessibility self-check: revision=\(initialRevision) nodes=\(initialCount)")
+        for element in initialChildren {
+            let label = element.accessibilityLabel ?? ""
+            print("  kind=\(element.node.kind) role=\(element.accessibilityRole.rawValue) label=\(label)")
+        }
+
+        _ = try bridge.insertText("\n")
+        let staleLabel = initialChildren.first?.accessibilityLabel
+        precondition(staleLabel == nil)
+        textView.refreshFromRust()
+        let nextRevision = bridge.state.revision
+        let nextChildren = (textView.accessibilityChildren ?? [])
+            .compactMap { $0 as? YuAccessibilitySemanticElement }
+        precondition(nextRevision != initialRevision)
+        precondition(nextChildren.allSatisfy { $0.node.revision == nextRevision })
+        print("Yu Accessibility self-check: refreshed revision=\(nextRevision)")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Accessibility self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 let app = NSApplication.shared
+if let flag = CommandLine.arguments.firstIndex(of: "--accessibility-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runAccessibilitySelfCheck(path: CommandLine.arguments[flag + 1])
+}
 let delegate = AppDelegate()
 app.setActivationPolicy(.regular)
 app.delegate = delegate

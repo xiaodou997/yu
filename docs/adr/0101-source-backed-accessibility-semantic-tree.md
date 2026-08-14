@@ -2,8 +2,8 @@
 
 ## 状态
 
-已接受（Phase 2，Rust headless + macOS FFI）。AppKit child element 和跨平台 Accessibility
-适配仍待后续阶段。
+已接受（Phase 2，Rust headless + macOS FFI）。AppKit child element 的 macOS 映射见 ADR-0102；
+跨平台 Accessibility 适配仍待后续阶段。
 
 ## 背景
 
@@ -23,8 +23,9 @@ TextKit 镜像重新解析 Markdown，就会重新产生第二套 parser、sourc
   或 layout 可以在不改变 ABI 的情况下细化 label policy。
 - `yu-storage-ffi` 提供 count/fill 两个查询。调用方必须传入 expected Revision；stale Revision、
   无效 parser range 和输出容量错误都返回已有状态码，不能返回跨 Revision 的半旧树。
-- Swift host 只把 C struct 转成 owned scalar 节点；本阶段不实现完整 `NSAccessibilityElement`
-  child tree，也不把节点文本缓存为第二份 Markdown。
+- Swift host 只把 C struct 转成 owned scalar 节点；`DocumentTextView` 可以把这些节点映射为
+  `NSAccessibilityElement` children，但不把节点文本缓存为第二份 Markdown。child role/geometry
+  和 VoiceOver 验收见 ADR-0102。
 
 ## 验证
 
@@ -36,5 +37,6 @@ TextKit 镜像重新解析 Markdown，就会重新产生第二套 parser、sourc
 
 ## 后续
 
-下一阶段将把该节点序列映射为 AppKit VoiceOver child elements，并明确 geometry、actions、hit-test
-和跨平台 role mapping；在此之前不得让 Swift 或 TextKit 自己推导 Markdown 语义。
+ADR-0102 已将该节点序列映射为 AppKit VoiceOver child elements，并固定 geometry 的保守回退和
+stale Revision 行为。后续仍需在真实 macOS 会话中验收 VoiceOver 朗读、actions、hit-test 和
+跨平台 role mapping；不得让 Swift 或 TextKit 自己推导 Markdown 语义。

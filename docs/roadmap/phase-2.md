@@ -41,7 +41,8 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] macOS source-backed Accessibility 快照 FFI：UTF-16 字符数、选区、逻辑行范围和位置查询均绑定 Revision
 - [x] macOS Accessibility 回调在 close/reload/外部替换边界上失败可恢复，不因快照失效触发宿主崩溃
 - [x] Revision-bound source-backed Markdown semantic Accessibility node count/fill 与稳定 C ABI
-- [ ] AppKit VoiceOver child elements、真实朗读验收与跨平台 Accessibility 适配
+- [x] macOS host 将 semantic nodes 映射为 Revision-bound `NSAccessibilityElement` children，并提供无窗口 self-check
+- [ ] 真实 VoiceOver 朗读/导航验收与跨平台 Accessibility 适配
 - [x] 以 `DocumentEditorSession` 为输入的 headless vertical slice benchmark，并记录局部/传播编辑基线
 - [x] viewport block sync 使用 key 索引，避免大文档编辑后的 O(blocks²) cache remap
 - [x] 未发生 viewport 查询时保持 block entries 惰性，避免纯编辑路径物化全文索引
@@ -69,13 +70,15 @@ text、commit/cancel 接回同一个 Rust session；TextKit 字符串仍只是�
 或 history。目录级 DispatchSource watcher 只触发带 debounce 的状态复核，原子替换也由目录监听覆盖；
 Rust `disk_state` 仍是 reload/save/close 的唯一权威。Accessibility 查询另通过
 `YuStorageAccessibilitySnapshot`、Revision-bound line/range ABI 和 semantic node count/fill ABI
-读取 canonical source；每个 semantic node 只有 role、父子关系和 source/label UTF-16 ranges，TextKit
-只保留几何和绘制投影。当前 host 仍是单个 TextKit Accessibility element，完整 child element 和
-VoiceOver 真实朗读验收留到下一阶段；它仍不承担 Markdown visual projection 或最终渲染。
+读取 canonical source；每个 semantic node 只有 role、父子关系和 source/label UTF-16 ranges，Swift
+将其映射为由 `DocumentTextView` 持有的 `NSAccessibilityElement` children，几何按当前 TextKit
+布局计算但仍绑定节点 Revision。无窗口 `--accessibility-self-check` 会验证父子关系、label、角色和
+编辑后的 stale node；真实 VoiceOver 朗读验收仍待人工完成。它仍不承担 Markdown visual projection
+或最终渲染。
 
 ## 下一步
 
-下一阶段应完成可写 host 的手工 macOS 输入源、VoiceOver child element 和真实朗读验收，并为 HTML
-fragment 增加更完整的 Markdown semantic coverage；完整 Markdown visual projection 仍放在这些边界稳定之后。在
+下一阶段应完成可写 host 的手工 macOS 输入源、真实 VoiceOver 朗读/导航验收，并为 HTML fragment
+增加更完整的 Markdown semantic coverage；完整 Markdown visual projection 仍放在这些边界稳定之后。在
 进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
 storage/editor 两个独立 handle。
