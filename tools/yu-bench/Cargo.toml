@@ -1,5 +1,6 @@
 [package]
 name = "yu-bench"
+default-run = "yu-bench"
 description = "Repeatable Phase 1 workloads for Yu Editor"
 version.workspace = true
 edition.workspace = true
@@ -10,7 +11,9 @@ repository.workspace = true
 
 [dependencies]
 yu-core = { path = "../../crates/yu-core" }
+yu-editor = { path = "../../crates/yu-editor" }
 yu-markdown = { path = "../../crates/yu-markdown" }
+yu-storage = { path = "../../crates/yu-storage" }
 yu-text = { path = "../../crates/yu-text" }
 
 [lints]

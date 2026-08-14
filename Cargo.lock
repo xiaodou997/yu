@@ -49,7 +49,9 @@ name = "yu-bench"
 version = "0.1.0"
 dependencies = [
  "yu-core",
+ "yu-editor",
  "yu-markdown",
+ "yu-storage",
  "yu-text",
 ]
 

@@ -196,6 +196,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Phase 2 路线](docs/roadmap/phase-2.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
 - [macOS IME 人工验收模板](docs/experiments/macos-ime-manual-acceptance-2026-08-13.md)
+- [DocumentEditorSession headless benchmark](docs/experiments/yu-session-benchmark-2026-08-14.md)
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
 - [文本存储候选对比](docs/experiments/storage-candidates-2026-08-09.md)
 - [增量 Markdown 实验](docs/experiments/incremental-markdown-2026-08-09.md)
