@@ -84,6 +84,12 @@ source `TextRange`，一次生成 canonical Markdown、纯文本回退和 semant
 只使用 parser 已识别的 source ranges，不读取 TextKit projection 或 transient composition。FFI
 只提供 count/fill 查询，macOS pasteboard 仍由产品壳发布，Rust session 不拥有系统剪贴板。
 
+Accessibility 也只从 canonical source 构建语义快照。`AccessibilitySemanticSnapshot` 为当前
+Revision 生成一个 document-root、block 和已识别 inline span 的 source-backed 节点序列；节点只
+携带稳定 role、父节点、列表/task flags 以及 source/label UTF-16 ranges。`yu-storage-ffi` 用
+count/fill ABI 将 owned 节点交给 macOS host，Swift 不复制 Markdown 文本或 parser 状态。当前
+host 仍把这些节点当作后续 AppKit VoiceOver child element 的输入契约，尚未宣称完整 AX tree。
+
 后续预计增加：
 
 ```text

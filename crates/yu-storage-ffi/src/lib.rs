@@ -14,9 +14,10 @@ use std::ptr;
 
 use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
-    AccessibilityTextError, AccessibilityTextSnapshot, CaretAffinity, CommandResult, EditorCommand,
-    EditorDocumentError, EditorKey, KeyEvent, KeyModifiers, KeyRouteResult, SelectionError,
-    SourceSync,
+    ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
+    AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
+    AccessibilityTextSnapshot, CaretAffinity, CommandResult, EditorCommand, EditorDocumentError,
+    EditorKey, KeyEvent, KeyModifiers, KeyRouteResult, SelectionError, SourceSync,
 };
 use yu_export::{ExportError, export_clipboard};
 use yu_storage::{
@@ -95,6 +96,24 @@ pub const YU_STORAGE_CLOSE_PROMPT: u8 = 1;
 pub const YU_STORAGE_CLOSE_ALREADY_CLOSED: u8 = 2;
 pub const YU_STORAGE_EXTERNAL_CHANGED: u8 = YU_STORAGE_DISK_CHANGED;
 pub const YU_STORAGE_EXTERNAL_MISSING: u8 = YU_STORAGE_DISK_MISSING;
+pub const YU_STORAGE_ACCESSIBILITY_PARENT_NONE: u32 = u32::MAX;
+pub const YU_STORAGE_ACCESSIBILITY_FLAG_ORDERED: u8 = ACCESSIBILITY_SEMANTIC_FLAG_ORDERED;
+pub const YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE: u8 = ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_DOCUMENT: u8 = 1;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_HEADING: u8 = 2;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_PARAGRAPH: u8 = 3;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_CODE_BLOCK: u8 = 4;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_BLOCK_QUOTE: u8 = 5;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_LIST_ITEM: u8 = 6;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_TASK_LIST_ITEM: u8 = 7;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_EMPHASIS: u8 = 8;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_STRONG: u8 = 9;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_CODE_SPAN: u8 = 10;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_LINK: u8 = 11;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_IMAGE: u8 = 12;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_AUTOLINK: u8 = 13;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_LINK: u8 = 14;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_IMAGE: u8 = 15;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -144,6 +163,24 @@ pub struct YuStorageAccessibilityRange {
     pub revision: u64,
     pub start_utf16: u64,
     pub end_utf16: u64,
+}
+
+/// One source-backed semantic node for a VoiceOver/native accessibility tree.
+/// `index` and `parent` are valid only for the same `revision`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageAccessibilityNode {
+    pub revision: u64,
+    pub index: u32,
+    pub parent: u32,
+    pub kind: u8,
+    pub flags: u8,
+    pub level: u8,
+    pub reserved: u8,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub label_start_utf16: u64,
+    pub label_end_utf16: u64,
 }
 
 #[repr(C)]
@@ -289,7 +326,9 @@ fn status_from_accessibility_error(error: AccessibilityTextError) -> i32 {
         AccessibilityTextError::InvalidSourceRange(_)
         | AccessibilityTextError::InvalidUtf16Range(_)
         | AccessibilityTextError::Position(_)
-        | AccessibilityTextError::OffsetOverflow => YU_STORAGE_INVALID_SELECTION,
+        | AccessibilityTextError::OffsetOverflow
+        | AccessibilityTextError::SemanticNodeOverflow
+        | AccessibilityTextError::SemanticParse(_) => YU_STORAGE_INVALID_SELECTION,
     }
 }
 
@@ -421,6 +460,72 @@ fn accessibility_snapshot_output(
                 CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
             },
         };
+    }
+    YU_STORAGE_OK
+}
+
+fn accessibility_semantic_snapshot(
+    session: &DocumentEditorSession,
+) -> Result<AccessibilitySemanticSnapshot, i32> {
+    AccessibilitySemanticSnapshot::from_document(session.document().editor())
+        .map_err(status_from_accessibility_error)
+}
+
+fn accessibility_semantic_node_output(
+    node: AccessibilitySemanticNode,
+) -> YuStorageAccessibilityNode {
+    let source = node.source_range().range();
+    let label = node.label_range().range();
+    YuStorageAccessibilityNode {
+        revision: node.source_range().revision().get(),
+        index: node.index(),
+        parent: node
+            .parent()
+            .unwrap_or(YU_STORAGE_ACCESSIBILITY_PARENT_NONE),
+        kind: node.kind().tag(),
+        flags: node.flags(),
+        level: node.level(),
+        reserved: 0,
+        source_start_utf16: source.start().get(),
+        source_end_utf16: source.end().get(),
+        label_start_utf16: label.start().get(),
+        label_end_utf16: label.end().get(),
+    }
+}
+
+fn write_accessibility_nodes(
+    nodes: &[AccessibilitySemanticNode],
+    output: *mut YuStorageAccessibilityNode,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` is a caller-owned output pointer checked above.
+    unsafe { *written = nodes.len() };
+    if nodes.is_empty() {
+        return YU_STORAGE_OK;
+    }
+    if output.is_null() {
+        return if capacity == 0 {
+            YU_STORAGE_OK
+        } else {
+            YU_STORAGE_NULL_POINTER
+        };
+    }
+    if capacity < nodes.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    let converted = nodes
+        .iter()
+        .copied()
+        .map(accessibility_semantic_node_output)
+        .collect::<Vec<_>>();
+    // SAFETY: capacity was checked against the number of converted nodes, and
+    // the native caller supplied writable storage for that many values.
+    unsafe {
+        ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
     }
     YU_STORAGE_OK
 }
@@ -1240,6 +1345,62 @@ pub unsafe extern "C" fn yu_storage_session_accessibility_snapshot(
     accessibility_snapshot_output(&session.session, output)
 }
 
+/// Returns the number of Revision-bound semantic Accessibility nodes.
+///
+/// # Safety
+/// `session` must be null or a live handle; `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_node_count(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let snapshot = match accessibility_semantic_snapshot(&session.session) {
+        Ok(snapshot) => snapshot,
+        Err(status) => return status,
+    };
+    // SAFETY: output is checked above and belongs to the caller.
+    unsafe { *output = snapshot.nodes().len() };
+    YU_STORAGE_OK
+}
+
+/// Copies the Revision-bound semantic Accessibility tree in document order.
+/// The count/fill convention matches other native owned queries: a null output
+/// with zero capacity returns the required node count.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable nodes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_nodes(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut YuStorageAccessibilityNode,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let snapshot = match accessibility_semantic_snapshot(&session.session) {
+        Ok(snapshot) => snapshot,
+        Err(status) => return status,
+    };
+    write_accessibility_nodes(snapshot.nodes(), output, capacity, written)
+}
+
 /// Returns one logical LF-delimited line range from a source-backed
 /// Accessibility snapshot. The line index is zero based and the terminating
 /// LF belongs to the preceding line, matching `AccessibilityTextSnapshot`.
@@ -1637,6 +1798,86 @@ mod tests {
                     0,
                     &mut first_line,
                 )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_accessibility_semantic_nodes_are_revision_bound_and_source_backed() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-semantic-ax-{id}.md"));
+        fs::write(
+            &path,
+            "# 标题\n\n段落 **粗体** [链接](https://example.com)\n\n- [x] 完成\n",
+        )
+        .expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut count = 0;
+        assert_eq!(
+            unsafe { yu_storage_session_accessibility_semantic_node_count(raw, 0, &mut count) },
+            YU_STORAGE_OK
+        );
+        assert!(
+            count >= 6,
+            "root, blocks, and inline semantic nodes (count={count})"
+        );
+
+        let mut nodes = vec![YuStorageAccessibilityNode::default(); count];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_accessibility_semantic_nodes(
+                    raw,
+                    0,
+                    nodes.as_mut_ptr(),
+                    nodes.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, count);
+        assert_eq!(nodes[0].revision, 0);
+        assert_eq!(nodes[0].index, 0);
+        assert_eq!(nodes[0].parent, YU_STORAGE_ACCESSIBILITY_PARENT_NONE);
+        assert_eq!(nodes[0].kind, YU_STORAGE_ACCESSIBILITY_KIND_DOCUMENT);
+
+        let heading = nodes
+            .iter()
+            .find(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_HEADING)
+            .expect("heading semantic node");
+        assert_eq!(heading.parent, 0);
+        assert!(heading.label_end_utf16 > heading.label_start_utf16);
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_STRONG)
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_LINK)
+        );
+        let task = nodes
+            .iter()
+            .find(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_TASK_LIST_ITEM)
+            .expect("task semantic node");
+        assert_ne!(task.flags & YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE, 0);
+
+        let mut stale_count = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_accessibility_semantic_node_count(raw, 1, &mut stale_count)
             },
             YU_STORAGE_STALE_REVISION
         );

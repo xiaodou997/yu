@@ -16,6 +16,8 @@ mod selection;
 mod viewport;
 
 pub use accessibility::{
+    ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
+    AccessibilitySemanticKind, AccessibilitySemanticNode, AccessibilitySemanticSnapshot,
     AccessibilityTextError, AccessibilityTextPosition, AccessibilityTextRange,
     AccessibilityTextSnapshot,
 };
