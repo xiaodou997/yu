@@ -30,7 +30,8 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] Rust `DocumentEditorSession`：把 `DocumentSession`、`EditorDocument`、composition 和 close 绑定到一个可变会话
 - [x] 统一 session FFI：command、selection、native key route 和 composition 通过同一 handle
 - [x] macOS 可编辑文档 host：将 `NSTextInputClient` 的 marked range/source sync 接入统一 session FFI
-- [ ] 平台剪贴板格式与 source-backed Markdown/纯文本导出
+- [x] macOS 基础纯文本剪贴板：copy/paste/cut/selectAll 全部回到统一 session
+- [ ] 跨平台剪贴板格式与 source-backed Markdown/HTML/纯文本导出
 - [ ] 文件路径、标题、dirty 和 Revision 的 Accessibility/菜单状态投影
 - [ ] 以 `DocumentSession` 为输入的 headless vertical slice benchmark
 
@@ -57,6 +58,7 @@ text、commit/cancel 接回同一个 Rust session；TextKit 字符串仍只是�
 
 ## 下一步
 
-下一阶段应补齐可写 host 的手工 macOS 输入源/VoiceOver 验收，并把剪贴板、文件 watcher 刷新和
-Accessibility/菜单状态投影绑定到同一 native mirror；在进入完整 Markdown visual projection 前，
-继续保持一个 `DocumentEditorSession` handle，不要恢复 storage/editor 两个独立 handle。
+下一阶段应补齐可写 host 的手工 macOS 输入源/VoiceOver/剪贴板验收，并把文件 watcher 刷新和
+Accessibility/菜单状态投影绑定到同一 native mirror；富文本/Markdown 剪贴板格式仍待设计。在
+进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
+storage/editor 两个独立 handle。

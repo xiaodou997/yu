@@ -32,6 +32,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - `yu-storage-ffi` 让 macOS 文档壳只消费 Rust-owned source snapshot、Revision/dirty 状态和 close
   结果；现在同一 handle 也承载 command、selection、key route、普通文本和 IME composition，
   `DocumentTextView` 只是可丢弃 native mirror，避免形成第二份 source；
+- macOS 文档 host 的基础纯文本 copy/paste/cut/selectAll 已回到统一 session；富文本/Markdown
+  clipboard formats 仍是后续契约；
 - `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
   owned publication，macOS host 只消费已验证的 publication；
 - viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host

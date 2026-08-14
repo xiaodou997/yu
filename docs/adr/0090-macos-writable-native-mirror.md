@@ -27,6 +27,8 @@ DocumentTextView ── Revision + generation ──► YuStorageSession
 ABI 约束如下：
 
 - 普通字符使用 `insert_text(expected_revision, UTF-8)`，永久修改只由 Rust `Transaction` 提交；
+- 基础纯文本 copy 从 Revision-bound Rust selection 读取，paste 使用 `insert_text`，cut 使用
+  selection-aware delete command，selectAll 使用 Revision-bound selection mutation；
 - 命令结果携带 `None/Range/Full` source sync，`Range` 使用结果 Revision 查询局部 UTF-16 区间；
 - `selection` mutation 携带 expected Revision 和 affinity；
 - composition 的 begin 绑定 Revision，update/commit/cancel 同时绑定 Revision 和 generation；
@@ -37,8 +39,8 @@ ABI 约束如下：
 ## 取舍
 
 当前 mirror 仍使用 TextKit 负责临时显示和 AppKit 的 `NSTextInputClient` 回调，尚未接入 Markdown
-visual projection、最终 GPU renderer、剪贴板格式或 VoiceOver 的完整产品语义。局部 source ABI 已
-固定，后续可以替换 TextKit 而不改变 Rust 文档模型。
+visual projection、最终 GPU renderer、富文本/Markdown 剪贴板格式或 VoiceOver 的完整产品语义。
+局部 source ABI 已固定，后续可以替换 TextKit 而不改变 Rust 文档模型。
 
 ## 验证
 
@@ -48,3 +50,5 @@ visual projection、最终 GPU renderer、剪贴板格式或 VoiceOver 的完整
 - `experiments/macos-document-host/build-app.sh`
 - `codesign --verify --deep --strict --verbose=1 .../YuMacDocumentHost.app`
 
+基础纯文本剪贴板动作也有 FFI 回归覆盖：Unicode selection 的两次 length/copy 查询、过期
+Revision 拒绝，以及 command 后 source mirror 的结果同步。
