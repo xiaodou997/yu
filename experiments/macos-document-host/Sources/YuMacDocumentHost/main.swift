@@ -503,7 +503,12 @@ private final class DocumentTextView: NSTextView {
         self.bridge = bridge
         canonicalSource = bridge.source
         canonicalRevision = bridge.state.revision
-        super.init(frame: .zero)
+        // NSTextView's frame-only convenience initializer dynamically
+        // dispatches to `init(frame:textContainer:)` on subclasses. Because
+        // this view owns its bridge and is not storyboard-decoded, call the
+        // designated initializer explicitly so AppKit does not reach an
+        // unimplemented subclass initializer at runtime.
+        super.init(frame: .zero, textContainer: nil)
         isEditable = true
         isSelectable = true
         isRichText = false
