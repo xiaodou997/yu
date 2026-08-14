@@ -106,6 +106,7 @@ impl FileFingerprint {
 /// A file-backed editor session with revision-bound dirty and conflict state.
 pub struct DocumentSession {
     path: PathBuf,
+    storage_path: PathBuf,
     editor: EditorDocument,
     bom: Utf8Bom,
     saved_revision: Revision,
@@ -117,6 +118,7 @@ impl fmt::Debug for DocumentSession {
         formatter
             .debug_struct("DocumentSession")
             .field("path", &self.path)
+            .field("storage_path", &self.storage_path)
             .field("revision", &self.editor.revision())
             .field("saved_revision", &self.saved_revision)
             .field("bom", &self.bom)
@@ -131,11 +133,19 @@ impl DocumentSession {
     /// source coordinates.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let path = path.into();
-        let (source, bom, fingerprint) = read_document(&path)?;
+        let storage_path = canonical_storage_path(&path)?.ok_or_else(|| {
+            StorageError::io(
+                "canonicalize",
+                &path,
+                io::Error::from(io::ErrorKind::NotFound),
+            )
+        })?;
+        let (source, bom, fingerprint) = read_document(&storage_path)?;
         let editor = EditorDocument::new(source);
         let saved_revision = editor.revision();
         Ok(Self {
             path,
+            storage_path,
             editor,
             bom,
             saved_revision,
@@ -148,10 +158,12 @@ impl DocumentSession {
     /// conflict instead of overwriting it.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
+        let path = path.into();
         let editor = EditorDocument::new(source);
         let saved_revision = editor.revision();
         Self {
-            path: path.into(),
+            storage_path: path.clone(),
+            path,
             editor,
             bom: Utf8Bom::Absent,
             saved_revision,
@@ -162,6 +174,15 @@ impl DocumentSession {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the canonical target used for reads, fingerprints and atomic
+    /// replacement. For a normal file this is its absolute canonical path;
+    /// for a symlink it is the link target, while [`Self::path`] remains the
+    /// user-facing path.
+    #[must_use]
+    pub fn storage_path(&self) -> &Path {
+        &self.storage_path
     }
 
     #[must_use]
@@ -243,7 +264,14 @@ impl DocumentSession {
     /// Compares the current path with the fingerprint captured on open/save.
     /// This is read-only and does not refresh the expected fingerprint.
     pub fn disk_state(&self) -> Result<DiskState, StorageError> {
-        let current = current_fingerprint(&self.path)?;
+        let current_path = canonical_storage_path(&self.path)?;
+        let current = match current_path {
+            None => None,
+            Some(current_path) if current_path != self.storage_path => {
+                return Ok(DiskState::Changed);
+            }
+            Some(current_path) => current_fingerprint(&current_path)?,
+        };
         Ok(match (&self.expected_file, current) {
             (None, None) => DiskState::Missing,
             (None, Some(_)) => DiskState::Changed,
@@ -361,9 +389,9 @@ impl DocumentSession {
         }
 
         let bytes = serialize_source(self.editor.snapshot().as_str(), self.bom);
-        atomic_replace(&self.path, &bytes)?;
-        let metadata = fs::metadata(&self.path)
-            .map_err(|source| StorageError::io("stat", &self.path, source))?;
+        atomic_replace(&self.storage_path, &bytes)?;
+        let metadata = fs::metadata(&self.storage_path)
+            .map_err(|source| StorageError::io("stat", &self.storage_path, source))?;
         self.expected_file = Some(FileFingerprint::from_bytes(&bytes, &metadata));
         self.saved_revision = self.revision();
         Ok(SaveOutcome::Saved {
@@ -379,10 +407,18 @@ impl DocumentSession {
                 path: self.path.clone(),
             });
         }
-        let (source, bom, fingerprint) = read_document(&self.path)?;
+        let storage_path = canonical_storage_path(&self.path)?.ok_or_else(|| {
+            StorageError::io(
+                "canonicalize",
+                &self.path,
+                io::Error::from(io::ErrorKind::NotFound),
+            )
+        })?;
+        let (source, bom, fingerprint) = read_document(&storage_path)?;
         self.editor
             .reset_source(source)
             .map_err(StorageError::Editor)?;
+        self.storage_path = storage_path;
         self.bom = bom;
         self.saved_revision = self.editor.revision();
         self.expected_file = Some(fingerprint);
@@ -632,6 +668,14 @@ fn read_document(path: &Path) -> Result<(String, Utf8Bom, FileFingerprint), Stor
             source,
         })?;
     Ok((source, bom, FileFingerprint::from_bytes(&bytes, &metadata)))
+}
+
+fn canonical_storage_path(path: &Path) -> Result<Option<PathBuf>, StorageError> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(StorageError::io("canonicalize", path, source)),
+    }
 }
 
 fn current_fingerprint(path: &Path) -> Result<Option<FileFingerprint>, StorageError> {

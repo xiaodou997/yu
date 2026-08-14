@@ -2,6 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
+
 use yu_core::{Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{EditorCommand, ViewportRect};
 use yu_storage::{
@@ -264,6 +267,85 @@ fn save_is_atomic_and_reuses_bom_without_changing_editor_revision() {
     assert_eq!(
         session.save().expect("clean save should be a no-op"),
         SaveOutcome::Unchanged { revision }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_save_updates_target_and_preserves_link_and_permissions() {
+    let target = TestPath::new("symlink-target");
+    let link = TestPath::new("symlink-link");
+    fs::write(target.as_path(), b"source").expect("write symlink target");
+    fs::set_permissions(target.as_path(), fs::Permissions::from_mode(0o640))
+        .expect("set target permissions");
+    symlink(target.as_path(), link.as_path()).expect("create symlink");
+
+    let mut session = DocumentSession::open(link.as_path()).expect("open symlink");
+    assert_eq!(session.path(), link.as_path());
+    assert_eq!(
+        session.storage_path(),
+        fs::canonicalize(target.as_path()).expect("canonical target")
+    );
+    session
+        .execute(EditorCommand::insert_text(" edit"))
+        .expect("edit symlink target");
+    session.save().expect("save through symlink");
+
+    let link_metadata = fs::symlink_metadata(link.as_path()).expect("stat symlink");
+    assert!(link_metadata.file_type().is_symlink());
+    assert_eq!(
+        fs::read_link(link.as_path()).expect("read symlink"),
+        target.as_path()
+    );
+    assert_eq!(
+        fs::read(target.as_path()).expect("read target"),
+        b"source edit"
+    );
+    assert_eq!(
+        fs::metadata(target.as_path())
+            .expect("stat target")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_retarget_is_an_external_change() {
+    let first_target = TestPath::new("symlink-retarget-first");
+    let second_target = TestPath::new("symlink-retarget-second");
+    let link = TestPath::new("symlink-retarget-link");
+    fs::write(first_target.as_path(), b"first").expect("write first target");
+    fs::write(second_target.as_path(), b"second").expect("write second target");
+    symlink(first_target.as_path(), link.as_path()).expect("create symlink");
+
+    let mut session = DocumentSession::open(link.as_path()).expect("open symlink");
+    session
+        .execute(EditorCommand::insert_text(" local"))
+        .expect("edit symlink target");
+    fs::remove_file(link.as_path()).expect("remove old symlink");
+    symlink(second_target.as_path(), link.as_path()).expect("retarget symlink");
+
+    assert_eq!(
+        session.disk_state().expect("disk state"),
+        DiskState::Changed
+    );
+    assert!(matches!(
+        session.save().expect_err("retarget must block save"),
+        StorageError::ExternalChange {
+            state: ExternalFileState::Changed,
+            ..
+        }
+    ));
+    assert_eq!(
+        fs::read(first_target.as_path()).expect("read first target"),
+        b"first"
+    );
+    assert_eq!(
+        fs::read(second_target.as_path()).expect("read second target"),
+        b"second"
     );
 }
 
