@@ -308,18 +308,42 @@ fn unified_session_routes_edit_and_ime_through_one_source_revision() {
             Utf16Range::empty(Utf16Offset::new(4)),
         )
         .expect("composition should share the editor");
+    assert_eq!(session.composition_generation(), 1);
     assert_eq!(session.revision(), Revision::new(1));
     assert!(session.composition().is_some());
     session
         .update_composition("日本語", Utf16Range::empty(Utf16Offset::new(3)))
         .expect("preedit update should remain transient");
+    assert_eq!(session.composition_generation(), 2);
     assert_eq!(session.snapshot().as_str(), "输入: 🙂");
     session
         .commit_composition("日本語")
         .expect("commit should create one transaction");
+    assert_eq!(session.composition_generation(), 3);
     assert_eq!(session.revision(), Revision::new(2));
     assert_eq!(session.snapshot().as_str(), "输入: 🙂日本語");
     assert!(session.is_dirty());
+}
+
+#[test]
+fn unified_session_composition_generation_rejects_late_native_state() {
+    let path = TestPath::new("unified-generation");
+    fs::write(path.as_path(), "source").expect("write fixture");
+    let mut session = DocumentEditorSession::open(path.as_path()).expect("open fixture");
+    let snapshot = session.snapshot();
+    session
+        .begin_composition(
+            TextRange::empty(snapshot.len_bytes()),
+            "にほん",
+            Utf16Range::empty(Utf16Offset::new(3)),
+        )
+        .expect("begin composition");
+    let first_generation = session.composition_generation();
+    session
+        .update_composition("日本", Utf16Range::empty(Utf16Offset::new(2)))
+        .expect("update composition");
+    assert_ne!(session.composition_generation(), first_generation);
+    assert!(session.composition().is_some());
 }
 
 #[test]

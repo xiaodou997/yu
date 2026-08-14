@@ -75,8 +75,9 @@ dirty/conflict 状态；它不拥有第二份 source，也不进入窗口/GPU �
 Rust-owned `YuStorageSession` 中：同一个 handle 同时拥有 `DocumentSession`、唯一
 `EditorDocument`、composition 和 close state，并向 Swift 暴露 owned path/source snapshot、
 Revision-bound 状态、command/selection/key route、IME composition 和 save/reload/close 结果。
-`experiments/macos-document-host` 目前仍用只读 `NSTextView` 验证窗口生命周期；该镜像不拥有
-source，后续可写 host 必须消费统一 FFI，不能再并列持有 storage/editor 两个 session。
+`experiments/macos-document-host` 使用可写的 `DocumentTextView` 作为 AppKit 输入镜像；该镜像
+只消费统一 FFI 返回的 owned source、selection、command result 和 composition generation，不拥有
+source、history 或 dirty，不能再并列持有 storage/editor 两个 session。
 
 后续预计增加：
 

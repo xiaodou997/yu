@@ -64,106 +64,109 @@
    穿过 ABI；commit 成功后最多推进一次 Revision，cancel 不推进 Revision。
 8. FFI source query 必须携带 expected Revision；局部查询只能复制请求范围，不能因平台查询
    而物化完整 Snapshot。
-9. Unicode grapheme command 查询不得为了单次移动或删除调用完整 Snapshot 物化；跨 chunk 的
+9. Native composition update/commit/cancel 除 expected Revision 外还必须携带当前 composition
+   generation；generation 失配必须返回 stale status，不能触碰 canonical source 或替换新的
+   marked text。
+10. Unicode grapheme command 查询不得为了单次移动或删除调用完整 Snapshot 物化；跨 chunk 的
    边界必须与连续 UTF-8 文本的 extended grapheme 结果一致。
-10. 原生 selection mutation 必须携带 expected Revision 和合法 CaretAffinity；Revision 过期、
+11. 原生 selection mutation 必须携带 expected Revision 和合法 CaretAffinity；Revision 过期、
     UTF-16 越界、surrogate 中间位置或未知 affinity 必须拒绝，并保持 EditorDocument selection
     不变。
-11. Projection 只能引用同一 Revision 的 source range；Visible 与 LineBreak run 必须保持
+12. Projection 只能引用同一 Revision 的 source range；Visible 与 LineBreak run 必须保持
     source/visual 长度一致，HiddenSyntax run 的 visual width 必须为零。
-12. 原生 key route 必须先解析共享 `EditorKey`/`KeyModifiers`；普通字符或未拥有的 shortcut
+13. 原生 key route 必须先解析共享 `EditorKey`/`KeyModifiers`；普通字符或未拥有的 shortcut
     必须返回 unhandled 且不得修改 source，已拥有的 command 才能进入 `EditorDocument::execute`。
     活动 composition 时不得通过 shortcut 直接修改 canonical source。
-13. `YuEditorCommandResult` 的 Revision、UTF-16 selection、CaretAffinity 和 `changed` 必须来自
+14. `YuEditorCommandResult` 的 Revision、UTF-16 selection、CaretAffinity 和 `changed` 必须来自
     同一次 command 结果；ABI 的空指针、未知 command、未知 key 和无效 affinity 必须返回明确
     status，不得写入半成品 output。
-14. 原生 TextKit/AppKit mirror 在 command 成功后必须从 Rust canonical source 和 result selection
+15. 原生 TextKit/AppKit mirror 在 command 成功后必须从 Rust canonical source 和 result selection
     同步；mirror 不是第二个 source/history，command route 不得把平台文本副本作为正确性边界。
-15. 每个 `CommandResult` 必须显式声明 `SourceSync::None`、`Range` 或 `Full`；发生本地 source edit
+16. 每个 `CommandResult` 必须显式声明 `SourceSync::None`、`Range` 或 `Full`；发生本地 source edit
     时 Range 的旧区间绑定输入 Revision、新区间绑定结果 Revision，平台只能用结果 Revision 查询
     新区间。`changed=false` 不得携带遗留 range。
-16. 成组 Undo/Redo 在不能表示为单个安全 replacement 时必须请求 Full 同步；FFI 和平台不得根据
+17. 成组 Undo/Redo 在不能表示为单个安全 replacement 时必须请求 Full 同步；FFI 和平台不得根据
     command 名称重新猜测同步范围。Tab/Shift-Tab 在非列表上下文必须返回 unhandled。
-17. macOS `doCommand(by:)` 只能将明确 allowlist 的 Selector 映射到共享 `EditorCommand`；只读
+18. macOS `doCommand(by:)` 只能将明确 allowlist 的 Selector 映射到共享 `EditorCommand`；只读
     availability 查询不得推进 Revision 或改变 selection/history，活动 composition 时永久
     command 必须不可用。未知 Selector 必须回退平台默认路径，不能直接改 TextKit mirror。
-18. `MoveWordLeft/Right` 必须使用 Unicode word-boundary segment，并保持 UTF-8 source boundary；
+19. `MoveWordLeft/Right` 必须使用 Unicode word-boundary segment，并保持 UTF-8 source boundary；
     空白可被跨越，标点/符号/emoji 不得静默并入相邻字母词。word movement 只能改变 selection，
     不得推进 Revision 或写入 history；非连续 Snapshot 不得因单次移动被 `as_str()` 全量物化。
-19. `MoveUp/Down` 必须通过当前或相邻 block 的 `LayoutSnapshot` 做 visual-line caret/hit-test
+20. `MoveUp/Down` 必须通过当前或相邻 block 的 `LayoutSnapshot` 做 visual-line caret/hit-test
     映射；preferred-X 必须在连续上下移动中保持，且横向/word movement、edit、显式 selection、
     composition/reset 时清除。平台层不得在 Rust command 之外自行修改跨 block source selection；
     caret reveal 必须通过 revision-bound `CaretScrollRequest` 查询，真实 scroll container 仍属于
     后续 GUI 契约。
-20. `MoveUpExtend/MoveDownExtend` 必须保留 `EditorSelection::anchor()`，只更新 focus，并与普通
+21. `MoveUpExtend/MoveDownExtend` 必须保留 `EditorSelection::anchor()`，只更新 focus，并与普通
     Up/Down 共用 layout/preferred-X/source affinity；回到 anchor 时必须产生 collapsed selection。
     Shift 垂直移动不得推进 Revision、history 或 SourceSync，marked text 期间不得执行。
-21. `CaretScrollRequest` 必须绑定当前 source Revision，并由 Rust 根据 focus block 的 layout、
+22. `CaretScrollRequest` 必须绑定当前 source Revision，并由 Rust 根据 focus block 的 layout、
     高度索引和显式 block estimate 计算 document-space caret 与绝对 target scroll。caret 已在
     viewport 内时必须返回 no-op；target 必须限制在合法 content scroll 范围。FFI 查询必须携带
     expected Revision，过期请求不得被平台应用。
-22. macOS native viewport consumer 只能消费仍匹配 current Revision 的 `CaretScrollRequest`；
+23. macOS native viewport consumer 只能消费仍匹配 current Revision 的 `CaretScrollRequest`；
     stale 请求不得触碰 `NSClipView`，absolute target 只能在平台边界按 content/clip height 做最后
     clamp。`NSScrollView`、`NSClipView` 和 document view 不得穿过 Rust FFI。
-23. `yu_composition_session_set_viewport_config` 必须绑定 expected Revision；非法
+24. `yu_composition_session_set_viewport_config` 必须绑定 expected Revision；非法
     `max_width`/`line_height`/`default_advance`/estimate/overscan 必须拒绝且保留旧配置，成功
     配置不得推进 source、selection 或 history。metrics-only layout 的 `default_advance` 必须
     进入 `LayoutConfig`/`LayoutCache` identity，shaped backend 可独立替换它。
-24. shaped layout 的每个 visual line 必须拥有有序、非重叠且 source-backed 的 source range；
+25. shaped layout 的每个 visual line 必须拥有有序、非重叠且 source-backed 的 source range；
     触发 wrap 的 glyph 不能扩展上一行。CoreText shaped-line diagnostic FFI 返回的 UTF-16
     range/width 必须是 owned 值，count/fill 容量不足必须返回明确 status，且诊断查询不得
     修改 canonical source、selection、history 或 Revision。
-25. projection-aware shaped diagnostic 返回的 projected UTF-8 必须由 Rust parser/projection
+26. projection-aware shaped diagnostic 返回的 projected UTF-8 必须由 Rust parser/projection
     唯一生成；每条 line 同时携带合法且有序的 source/visual UTF-16 range，hidden syntax 可以
     让 visual range 变短但不能改写 source。Swift 临时 TextKit mirror 只能消费返回文本，
     zero-width trailing caret line 必须保持零宽并从 source-consuming line comparison 中排除。
-26. `yu_composition_session_projection_caret` 必须携带 expected Revision，并在 Projection
+27. `yu_composition_session_projection_caret` 必须携带 expected Revision，并在 Projection
     `Before/After` bias 下返回合法的 source/visual UTF-16 boundary 与 round-trip source；stale
     Revision、surrogate split、未知 affinity 或 projection range 错误必须拒绝且不写入半成品
     output。查询不得修改 source、selection、composition、history 或 Revision，平台只能消费
     owned scalar，不得取得 Projection/TextSnapshot 指针。
-27. `yu_composition_session_block_projection_caret` 必须通过 `EditorDocument` 的
+28. `yu_composition_session_block_projection_caret` 必须通过 `EditorDocument` 的
     `block_index_for_source` 和 `block_projection` 选择当前 Revision 的 parser-owned block；返回的
     visual UTF-16 必须是该 block-local projection 的坐标并携带 block index。stale Revision、无
     matching block、surrogate split、未知 affinity 或映射错误必须清空 output 并拒绝，查询不得
     物化整份文档 projection，也不得修改 source、selection、composition、history 或 Revision。
-28. `yu_macos_composition_session_block_shaped_caret` 必须在同一 Revision 的 block-local
+29. `yu_macos_composition_session_block_shaped_caret` 必须在同一 Revision 的 block-local
     `LayoutSnapshot` 上使用真实 CoreText shaper，返回有序 source/visual UTF-16、line index、
     有限的 block-local x/y 和正的 line height；hidden delimiter 的 Before/After affinity 可以
     改变 round-trip source，但不得改变 visual point。stale Revision、surrogate split、未知
     affinity、非法 size/max width、CoreText/layout 失败必须清空 output；非 macOS 必须返回明确的
     `YU_FFI_CORE_TEXT_UNAVAILABLE`，查询不得修改 source、selection、composition、history 或
     Revision，也不得把平台句柄暴露到 ABI。
-29. `yu_macos_composition_session_shaped_caret_scroll_request` 必须使用当前 Revision 的
+30. `yu_macos_composition_session_shaped_caret_scroll_request` 必须使用当前 Revision 的
     CoreText-backed `ViewportLayout`/HeightIndex，返回与 `CaretScrollRequest` 相同语义的绝对
     document-space caret/target；host 必须先发布匹配的 width、line height 和 default advance，
     不匹配时拒绝而不能隐式重置 viewport measurements。stale Revision、非法尺寸/viewport、
     unavailable backend 或布局失败必须清空 output，查询不得修改 source、selection、composition、
     history 或 Revision，AppKit 对象只能留在 native adapter。
-30. `yu_macos_composition_session_shaped_viewport_blocks` 必须从同一 Revision 的 shaped
+31. `yu_macos_composition_session_shaped_viewport_blocks` 必须从同一 Revision 的 shaped
     `ViewportSnapshot` 返回有序 block index/source UTF-16 range、有限且单调的 document-space
     `y`、正 height、measured 标志和稳定 kind tag；header 与 block values 必须共享 Revision。
     `capacity == 0 && blocks == NULL` 只能执行 count，不足容量不得写入部分 block 数组；stale
     Revision、非法参数、layout/unavailable 失败必须清空 header/count，查询不得修改 source、
     selection、composition、history 或把 Rust layout/Markdown/AppKit 对象暴露到 ABI。
 
-31. `ViewportSceneInput` 进入 `yu-scene` 前必须验证同一 Revision、连续 block index、source
+32. `ViewportSceneInput` 进入 `yu-scene` 前必须验证同一 Revision、连续 block index、source
     range 顺序、单调 document-space origin、正 height 和 content-height 上界；
     `SceneBuilder::append_layout_at_block` 必须再验证 layout Revision/source range，并在解析
     全部 atlas entry 前保持 scene 原子。scene 只能平移 block-local layout 到已验证 origin，不能
     根据 Markdown kind、source text 或自己的 HeightIndex 重新计算 block 几何。
-32. `SceneBuilder::append_viewport` 必须按 `ViewportSceneInput` 顺序预检全部 block layout；所有
+33. `SceneBuilder::append_viewport` 必须按 `ViewportSceneInput` 顺序预检全部 block layout；所有
     Revision/source/atlas/geometry/budget 检查成功前不得追加任何 primitive。批量提交必须同时更新
     primitive 与 damage，失败不得发布 viewport 前缀；layout 只能按 geometry origin 平移。
-33. `yu-workspace::assemble_viewport_scene` 必须从同一次 `EditorDocument::visible_blocks_with_shaper`
+34. `yu-workspace::assemble_viewport_scene` 必须从同一次 `EditorDocument::visible_blocks_with_shaper`
     结果建立 `ViewportSceneInput`，再按相同 block index/config 取得 shaped layout；它不得复制或
     修改 HeightIndex、source、selection、composition 或 history。返回的 `ViewportSceneFrame`、
     `Scene` 与 `RenderPlan` 必须共享该结果的 Revision，任何 layout/atlas 失败都不得发布部分 scene。
-34. `ViewportRenderFrame` 的 scene 与 render plan 必须拥有同一 Revision；`ViewportFrameCache` 只
+35. `ViewportRenderFrame` 的 scene 与 render plan 必须拥有同一 Revision；`ViewportFrameCache` 只
     能发布等于调用方当前 Revision 的 frame，必须拒绝 stale frame 和较旧 Revision 回退，并在
     `invalidate_stale`/替换时保持 scene+plan 原子。cache 不得持有 source、EditorDocument、
     HeightIndex、native object 或 GPU handle。
-35. `MetalFrameConsumer` 只能接受等于 macOS host current Revision 且不早于其最后接受 Revision 的
+36. `MetalFrameConsumer` 只能接受等于 macOS host current Revision 且不早于其最后接受 Revision 的
     `ViewportRenderFrame`；检查必须发生在 native command conversion 之前，只有 `render_plan` 成功
     后才能推进 consumer Revision。stale、回退或 backend 失败不得改变已接受 Revision，consumer
     不得持有 source、layout、native object 或 GPU handle。
@@ -178,9 +181,9 @@
    来自同一个 `EditorDocument` 状态。
 6. AppKit 命中测试与 Accessibility selection 写回必须先结束活动 composition，再通过
    revision-bound FFI 更新 `EditorDocument`；平台 selection 只能作为该状态的投影。
-7. macOS document host 的 `NSTextView` source mirror 只能消费 Rust-owned
-   `DocumentSession` snapshot；在 storage session 与 editor session 合并前，镜像必须只读，
-   不得形成第二份可变 source、dirty 或 history。
+7. macOS document host 的 `NSTextView` source mirror 只能消费统一
+   `DocumentEditorSession` 的 Rust-owned snapshot；它可以接收 native 输入，但不得形成第二份
+   可变 source、dirty 或 history。
 8. 可写 native host 必须只持有一个 `DocumentEditorSession` handle；command、selection、key
    route、composition、save 和 close 的 Revision/dirty 结果必须来自同一 `EditorDocument`，不得
    通过并列 storage/editor handles 复制 source 或猜测 state。

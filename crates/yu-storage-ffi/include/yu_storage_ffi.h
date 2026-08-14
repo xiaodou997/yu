@@ -21,6 +21,7 @@ enum {
     YU_STORAGE_STALE_REVISION = 13,
     YU_STORAGE_INVALID_SELECTION = 14,
     YU_STORAGE_NO_OVERLAY = 15,
+    YU_STORAGE_STALE_COMPOSITION = 16,
 };
 
 enum {
@@ -131,6 +132,17 @@ typedef struct YuStorageCommandResult {
     uint64_t source_new_end_utf16;
 } YuStorageCommandResult;
 
+typedef struct YuStorageCompositionState {
+    uint64_t revision;
+    uint64_t generation;
+    uint64_t replacement_start_utf16;
+    uint64_t replacement_end_utf16;
+    uint64_t selection_start_utf16;
+    uint64_t selection_end_utf16;
+    uint64_t preedit_utf8_length;
+    uint8_t active;
+} YuStorageCompositionState;
+
 int32_t yu_storage_session_open(const uint8_t *path, size_t path_length,
                                 YuStorageSession **output);
 void yu_storage_session_destroy(YuStorageSession *session);
@@ -145,6 +157,12 @@ int32_t yu_storage_session_source_length(const YuStorageSession *session,
 int32_t yu_storage_session_copy_source(const YuStorageSession *session,
                                        uint8_t *output, size_t capacity,
                                        size_t *written);
+int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
+                                             uint64_t expected_revision,
+                                             uint64_t start_utf16,
+                                             uint64_t end_utf16,
+                                             uint8_t *output, size_t capacity,
+                                             size_t *written);
 
 int32_t yu_storage_session_selection(const YuStorageSession *session,
                                      YuStorageSelection *output);
@@ -162,18 +180,34 @@ int32_t yu_storage_session_command_available(const YuStorageSession *session,
 int32_t yu_storage_session_route_key(YuStorageSession *session, uint8_t key_kind,
                                      uint32_t key, uint8_t modifiers,
                                      YuStorageCommandResult *output);
+int32_t yu_storage_session_insert_text(YuStorageSession *session,
+                                        uint64_t expected_revision,
+                                        const uint8_t *text, size_t text_length,
+                                        YuStorageCommandResult *output);
+int32_t yu_storage_session_composition(
+    const YuStorageSession *session, YuStorageCompositionState *output);
+int32_t yu_storage_session_copy_composition(
+    const YuStorageSession *session, uint64_t expected_revision,
+    uint64_t expected_generation, uint8_t *output, size_t capacity,
+    size_t *written);
 int32_t yu_storage_session_begin_composition(
-    YuStorageSession *session, uint64_t replacement_start_utf16,
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t replacement_start_utf16,
     uint64_t replacement_end_utf16, const uint8_t *preedit,
     size_t preedit_length, uint64_t selection_start_utf16,
     uint64_t selection_end_utf16);
 int32_t yu_storage_session_update_composition(
-    YuStorageSession *session, const uint8_t *preedit, size_t preedit_length,
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t expected_generation, const uint8_t *preedit, size_t preedit_length,
     uint64_t selection_start_utf16, uint64_t selection_end_utf16);
 int32_t yu_storage_session_commit_composition(YuStorageSession *session,
+                                              uint64_t expected_revision,
+                                              uint64_t expected_generation,
                                               const uint8_t *committed_text,
                                               size_t committed_length);
-int32_t yu_storage_session_cancel_composition(YuStorageSession *session);
+int32_t yu_storage_session_cancel_composition(YuStorageSession *session,
+                                              uint64_t expected_revision,
+                                              uint64_t expected_generation);
 
 int32_t yu_storage_session_state(const YuStorageSession *session,
                                  YuStorageState *output);

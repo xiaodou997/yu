@@ -29,7 +29,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] macOS 最小文档窗口 host：打开、源码镜像、标题/dirty 状态、保存/重载和关闭提示
 - [x] Rust `DocumentEditorSession`：把 `DocumentSession`、`EditorDocument`、composition 和 close 绑定到一个可变会话
 - [x] 统一 session FFI：command、selection、native key route 和 composition 通过同一 handle
-- [ ] macOS 可编辑文档 host：将 `NSTextInputClient` 的 marked range/source sync 接入统一 session FFI
+- [x] macOS 可编辑文档 host：将 `NSTextInputClient` 的 marked range/source sync 接入统一 session FFI
 - [ ] 平台剪贴板格式与 source-backed Markdown/纯文本导出
 - [ ] 文件路径、标题、dirty 和 Revision 的 Accessibility/菜单状态投影
 - [ ] 以 `DocumentSession` 为输入的 headless vertical slice benchmark
@@ -49,12 +49,14 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 对象。
 
 `yu-storage-ffi` 是当前 macOS 产品壳的窄 ABI：Rust `YuStorageSession` 独占可变
-`DocumentSession`，Swift 只能取得 owned path/source snapshot、状态和 close/save/reload 结果。
-`experiments/macos-document-host` 用 AppKit 验证窗口生命周期，但故意把 `NSTextView` 设为只读；
-它不是第二个 source，也不承担 Markdown projection、IME 或最终渲染。
+`DocumentEditorSession`，Swift 只能取得 owned path/source snapshot、状态和 close/save/reload 结果，
+并以 Revision-bound command、selection、source-range copy 与 composition generation 驱动 native
+mirror。`experiments/macos-document-host` 的 `DocumentTextView` 现在可以把普通字符、命令、marked
+text、commit/cancel 接回同一个 Rust session；TextKit 字符串仍只是可丢弃的投影，不拥有 source、dirty
+或 history。它仍不承担 Markdown visual projection 或最终渲染。
 
 ## 下一步
 
-下一阶段应做 macOS `NSTextInputClient` 的可写 host 接线：以统一 session FFI 的 Revision-bound
-selection/command/composition 结果驱动 native mirror 的局部或全量 source sync；在此之前不要让
-AppKit 文本控件自行拥有可变 source，也不要恢复 storage/editor 两个独立 handle。
+下一阶段应补齐可写 host 的手工 macOS 输入源/VoiceOver 验收，并把剪贴板、文件 watcher 刷新和
+Accessibility/菜单状态投影绑定到同一 native mirror；在进入完整 Markdown visual projection 前，
+继续保持一个 `DocumentEditorSession` handle，不要恢复 storage/editor 两个独立 handle。

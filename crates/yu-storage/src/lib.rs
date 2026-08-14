@@ -384,6 +384,7 @@ impl DocumentSession {
 pub struct DocumentEditorSession {
     document: DocumentSession,
     close: CloseStateMachine,
+    composition_generation: u64,
 }
 
 impl DocumentEditorSession {
@@ -392,6 +393,7 @@ impl DocumentEditorSession {
         Ok(Self {
             document: DocumentSession::open(path)?,
             close: CloseStateMachine::new(),
+            composition_generation: 0,
         })
     }
 
@@ -401,6 +403,7 @@ impl DocumentEditorSession {
         Self {
             document: DocumentSession::new(path, source),
             close: CloseStateMachine::new(),
+            composition_generation: 0,
         }
     }
 
@@ -462,6 +465,14 @@ impl DocumentEditorSession {
         self.document.composition()
     }
 
+    /// Monotonically identifies the transient composition state owned by this
+    /// session. Native text-input mirrors must include it with every marked
+    /// text update so a late callback cannot mutate a newer composition.
+    #[must_use]
+    pub fn composition_generation(&self) -> u64 {
+        self.composition_generation
+    }
+
     pub fn execute(&mut self, command: EditorCommand) -> Result<CommandResult, StorageError> {
         self.document.execute(command)
     }
@@ -485,8 +496,13 @@ impl DocumentEditorSession {
         text: impl Into<std::sync::Arc<str>>,
         selection_utf16: Utf16Range,
     ) -> Result<(), StorageError> {
-        self.document
-            .begin_composition(replacement_range, text, selection_utf16)
+        let result = self
+            .document
+            .begin_composition(replacement_range, text, selection_utf16);
+        if result.is_ok() {
+            self.composition_generation = self.composition_generation.wrapping_add(1);
+        }
+        result
     }
 
     pub fn update_composition(
@@ -494,19 +510,31 @@ impl DocumentEditorSession {
         text: impl Into<std::sync::Arc<str>>,
         selection_utf16: Utf16Range,
     ) -> Result<(), StorageError> {
-        self.document.update_composition(text, selection_utf16)
+        let result = self.document.update_composition(text, selection_utf16);
+        if result.is_ok() {
+            self.composition_generation = self.composition_generation.wrapping_add(1);
+        }
+        result
     }
 
     pub fn commit_composition(
         &mut self,
         committed_text: impl Into<std::sync::Arc<str>>,
     ) -> Result<AppliedTransaction, StorageError> {
-        self.document.commit_composition(committed_text)
+        let result = self.document.commit_composition(committed_text);
+        if result.is_ok() {
+            self.composition_generation = self.composition_generation.wrapping_add(1);
+        }
+        result
     }
 
     #[must_use]
     pub fn cancel_composition(&mut self) -> bool {
-        self.document.cancel_composition()
+        let cancelled = self.document.cancel_composition();
+        if cancelled {
+            self.composition_generation = self.composition_generation.wrapping_add(1);
+        }
+        cancelled
     }
 
     pub fn save(&mut self) -> Result<SaveOutcome, StorageError> {
@@ -514,7 +542,9 @@ impl DocumentEditorSession {
     }
 
     pub fn reload(&mut self) -> Result<ReloadOutcome, StorageError> {
-        self.document.reload()
+        let outcome = self.document.reload()?;
+        self.composition_generation = self.composition_generation.wrapping_add(1);
+        Ok(outcome)
     }
 
     pub fn close_request(&mut self) -> Result<CloseRequest, StorageError> {
