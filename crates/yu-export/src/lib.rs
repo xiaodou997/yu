@@ -218,16 +218,16 @@ fn render_blocks(
     let mut blocks = blocks.into_iter().peekable();
     let mut first = true;
     while let Some(block) = blocks.next() {
-        let fragment = if let Some((ordered, depth)) = list_signature(block.kind()) {
-            let mut group = vec![block];
+        let fragment = if list_signature(block.kind()).is_some() {
+            let mut run = vec![block];
             while let Some(next) = blocks.peek().copied() {
-                if list_signature(next.kind()) == Some((ordered, depth)) {
-                    group.push(blocks.next().expect("peeked list block must be available"));
+                if list_signature(next.kind()).is_some() {
+                    run.push(blocks.next().expect("peeked list block must be available"));
                 } else {
                     break;
                 }
             }
-            render_list_group(snapshot, &group, ordered)?
+            render_list_run(snapshot, &run)?
         } else {
             render_block(snapshot, definitions, block)?
         };
@@ -280,8 +280,8 @@ fn render_block(
             let inner = export_html_fragment(&stripped)?;
             Ok(format!("<blockquote>{inner}</blockquote>"))
         }
-        BlockKind::ListItem { ordered, .. } | BlockKind::TaskListItem { ordered, .. } => {
-            render_list_group(snapshot, &[block], ordered)
+        BlockKind::ListItem { .. } | BlockKind::TaskListItem { .. } => {
+            render_list_run(snapshot, &[block])
         }
     }
 }
@@ -517,12 +517,34 @@ fn strip_blockquote(source: &str) -> String {
         .join("\n")
 }
 
-fn render_list_group(
+fn render_list_run(snapshot: &TextSnapshot, blocks: &[Block]) -> Result<String, ExportError> {
+    let mut cursor = 0;
+    let mut output = String::new();
+    while cursor < blocks.len() {
+        let (ordered, depth) =
+            list_signature(blocks[cursor].kind()).expect("list run contains only list blocks");
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&render_list_level(
+            snapshot,
+            blocks,
+            &mut cursor,
+            depth,
+            ordered,
+        )?);
+    }
+    Ok(output)
+}
+
+fn render_list_level(
     snapshot: &TextSnapshot,
     blocks: &[Block],
+    cursor: &mut usize,
+    depth: u8,
     ordered: bool,
 ) -> Result<String, ExportError> {
-    let start = list_start(blocks.first().expect("list group cannot be empty").kind());
+    let start = list_start(blocks[*cursor].kind());
     let mut html = if ordered {
         if start > 1 {
             format!("<ol start=\"{start}\">")
@@ -533,10 +555,18 @@ fn render_list_group(
         String::from("<ul>")
     };
 
-    for block in blocks {
-        let source = slice(snapshot, block.range())?;
-        let (text, task) = list_item_content(source, *block);
+    while *cursor < blocks.len() {
+        let Some((item_ordered, item_depth)) = list_signature(blocks[*cursor].kind()) else {
+            break;
+        };
+        if item_depth != depth || item_ordered != ordered {
+            break;
+        }
+        let block = blocks[*cursor];
+        *cursor += 1;
         html.push_str("<li>");
+        let source = slice(snapshot, block.range())?;
+        let (text, task) = list_item_content(source, block);
         if let Some(state) = task {
             html.push_str("<input type=\"checkbox\" disabled");
             if state == TaskState::Done {
@@ -546,6 +576,23 @@ fn render_list_group(
         }
         let inner = export_html_fragment(&text)?;
         append_tight_list_content(&inner, &mut html);
+
+        while *cursor < blocks.len() {
+            let Some((child_ordered, child_depth)) = list_signature(blocks[*cursor].kind()) else {
+                break;
+            };
+            if child_depth <= depth {
+                break;
+            }
+            html.push('\n');
+            html.push_str(&render_list_level(
+                snapshot,
+                blocks,
+                cursor,
+                child_depth,
+                child_ordered,
+            )?);
+        }
         html.push_str("</li>");
     }
 
@@ -711,6 +758,17 @@ mod tests {
         assert_eq!(
             html,
             "<ul><li>one</li><li><strong>two</strong></li></ul>\n<ol start=\"3\"><li>three</li><li>four</li></ol>"
+        );
+    }
+
+    #[test]
+    fn nested_lists_follow_source_depth_inside_the_parent_item() {
+        let source = "- parent\n  - child\n  - **second**\n- sibling\n";
+        let html = export_html_fragment(source).expect("export nested list fragment");
+
+        assert_eq!(
+            html,
+            "<ul><li>parent\n<ul><li>child</li><li><strong>second</strong></li></ul></li><li>sibling</li></ul>"
         );
     }
 
