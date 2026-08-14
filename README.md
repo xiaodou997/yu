@@ -30,8 +30,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - `yu-storage::FileWatchDebouncer` 与 `CloseStateMachine` 固定文件通知去抖、dirty close、取消/丢弃和
   外部冲突提示；macOS flag 适配不把 watcher 线程或 AppKit 对象带入共享核心；
 - `yu-storage-ffi` 让 macOS 文档壳只消费 Rust-owned source snapshot、Revision/dirty 状态和 close
-  结果；现在同一 handle 也承载 command、selection、key route 和 IME composition，当前最小
-  AppKit host 的 `NSTextView` 仍明确保持只读，避免 native mirror 形成第二份 source；
+  结果；现在同一 handle 也承载 command、selection、key route、普通文本和 IME composition，
+  `DocumentTextView` 只是可丢弃 native mirror，避免形成第二份 source；
 - `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
   owned publication，macOS host 只消费已验证的 publication；
 - viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host
@@ -189,6 +189,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)
 - [macOS minimal document host](docs/adr/0088-macos-document-host.md)
 - [unified document editor session](docs/adr/0089-unified-document-editor-session.md)
+- [macOS writable native mirror](docs/adr/0090-macos-writable-native-mirror.md)
 - [Phase 1 路线](docs/roadmap/phase-1.md)
 - [Phase 2 路线](docs/roadmap/phase-2.md)
 - [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
