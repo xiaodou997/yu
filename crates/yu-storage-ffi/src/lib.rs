@@ -1023,6 +1023,32 @@ pub unsafe extern "C" fn yu_storage_session_copy_source_range(
     write_snapshot_range(&snapshot, range, output, capacity, written)
 }
 
+/// Copies the current Rust-owned selection as UTF-8. The expected revision
+/// makes the operation safe for a native clipboard callback that was queued
+/// before a source edit.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_selection(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let range = session.session.selection().ordered_range();
+    let snapshot = session.session.snapshot();
+    write_snapshot_range(&snapshot, range, output, capacity, written)
+}
+
 /// # Safety
 ///
 /// `session` must be null or a live handle and `output` must be writable when
@@ -1482,6 +1508,54 @@ mod tests {
             YU_STORAGE_OK
         );
         assert_eq!(String::from_utf8(source).expect("source"), "a日本語");
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn unified_ffi_copy_selection_is_revision_bound_and_utf8_owned() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-copy-{id}.md"));
+        fs::write(&path, "A🙂日本語Z").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection(raw, 0, 1, 6, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+            },
+            YU_STORAGE_OK
+        );
+        let mut required = 0;
+        assert_eq!(
+            unsafe { yu_storage_session_copy_selection(raw, 0, ptr::null_mut(), 0, &mut required) },
+            YU_STORAGE_OK
+        );
+        let mut selected = vec![0_u8; required];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_selection(
+                    raw,
+                    0,
+                    selected.as_mut_ptr(),
+                    selected.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            String::from_utf8(selected).expect("selected UTF-8"),
+            "🙂日本語"
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_copy_selection(raw, 1, ptr::null_mut(), 0, &mut required) },
+            YU_STORAGE_STALE_REVISION
+        );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }

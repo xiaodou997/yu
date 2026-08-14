@@ -316,6 +316,19 @@ private final class StorageBridge {
         }
     }
 
+    func copySelection() -> String {
+        let current = state.revision
+        return copyBytes { output, capacity, written in
+            yu_storage_session_copy_selection(
+                handle,
+                current,
+                output,
+                capacity,
+                written
+            )
+        }
+    }
+
     func save() throws {
         var revision: UInt64 = 0
         var bytes: Int = 0
@@ -490,6 +503,65 @@ private final class DocumentTextView: NSTextView {
         }
     }
 
+    override func copy(_ sender: Any?) {
+        do {
+            try finishCompositionForClipboard()
+            let text = bridge.copySelection()
+            guard !text.isEmpty else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard pasteboard.setString(text, forType: .string) else {
+                throw BridgeError.clipboard
+            }
+        } catch {
+            onError?(error)
+        }
+    }
+
+    override func cut(_ sender: Any?) {
+        do {
+            try finishCompositionForClipboard()
+            let selected = bridge.copySelection()
+            guard !selected.isEmpty else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard pasteboard.setString(selected, forType: .string) else {
+                throw BridgeError.clipboard
+            }
+            guard bridge.commandAvailable(Command.deleteBackward) else { return }
+            apply(try bridge.executeCommand(Command.deleteBackward))
+            synchronizeProjection()
+            onDocumentChange?()
+        } catch {
+            onError?(error)
+        }
+    }
+
+    override func paste(_ sender: Any?) {
+        do {
+            try finishCompositionForClipboard()
+            guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
+                return
+            }
+            apply(try bridge.insertText(text))
+            synchronizeProjection()
+            onDocumentChange?()
+        } catch {
+            onError?(error)
+        }
+    }
+
+    override func selectAll(_ sender: Any?) {
+        do {
+            try finishCompositionForClipboard()
+            let length = canonicalSource.utf16.count
+            try bridge.setSelection(NSRange(location: 0, length: length))
+            synchronizeProjection()
+        } catch {
+            onError?(error)
+        }
+    }
+
     override func setMarkedText(
         _ markedText: Any,
         selectedRange: NSRange,
@@ -604,6 +676,13 @@ private final class DocumentTextView: NSTextView {
         } catch { onError?(error) }
     }
 
+    private func finishCompositionForClipboard() throws {
+        guard bridge.composition.active else { return }
+        try bridge.cancelComposition()
+        nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
+        synchronizeProjection()
+    }
+
     private func apply(_ result: NativeCommandResult) {
         switch result.sourceSync {
         case 0:
@@ -678,11 +757,13 @@ private final class DocumentTextView: NSTextView {
 private enum BridgeError: LocalizedError {
     case open(Int32)
     case operation(Int32)
+    case clipboard
 
     var errorDescription: String? {
         switch self {
         case .open(let status): return "无法打开 Markdown 文件（Rust status \(status)）"
         case .operation(let status): return "文档操作失败（Rust status \(status)）"
+        case .clipboard: return "无法访问 macOS 剪贴板"
         }
     }
 }

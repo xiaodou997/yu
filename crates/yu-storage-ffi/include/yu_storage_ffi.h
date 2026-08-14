@@ -163,6 +163,10 @@ int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t end_utf16,
                                              uint8_t *output, size_t capacity,
                                              size_t *written);
+int32_t yu_storage_session_copy_selection(const YuStorageSession *session,
+                                          uint64_t expected_revision,
+                                          uint8_t *output, size_t capacity,
+                                          size_t *written);
 
 int32_t yu_storage_session_selection(const YuStorageSession *session,
                                      YuStorageSelection *output);
