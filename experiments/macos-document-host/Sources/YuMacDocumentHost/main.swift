@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import UniformTypeIdentifiers
 import YuStorageFFI
 
@@ -444,6 +445,10 @@ private final class DocumentTextView: NSTextView {
         font = NSFont.systemFont(ofSize: 16)
         textColor = .labelColor
         backgroundColor = .textBackgroundColor
+        setAccessibilityElement(true)
+        setAccessibilityRole(.textArea)
+        setAccessibilityLabel("Yu Markdown 文档")
+        setAccessibilityIdentifier("yu-document-text")
         minSize = NSSize(width: 0, height: 0)
         maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         isVerticallyResizable = true
@@ -460,6 +465,7 @@ private final class DocumentTextView: NSTextView {
         canonicalRevision = bridge.state.revision
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
         synchronizeProjection()
+        postAccessibilityRefresh()
     }
 
     override func setSelectedRange(_ charRange: NSRange) {
@@ -472,6 +478,7 @@ private final class DocumentTextView: NSTextView {
         do {
             try bridge.setSelection(range)
             canonicalRevision = bridge.state.revision
+            postSelectionChanged()
         } catch {
             onError?(error)
         }
@@ -497,6 +504,7 @@ private final class DocumentTextView: NSTextView {
             }
             nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
             synchronizeProjection()
+            postAccessibilityRefresh()
             onDocumentChange?()
         } catch {
             onError?(error)
@@ -531,6 +539,7 @@ private final class DocumentTextView: NSTextView {
             guard bridge.commandAvailable(Command.deleteBackward) else { return }
             apply(try bridge.executeCommand(Command.deleteBackward))
             synchronizeProjection()
+            postAccessibilityRefresh()
             onDocumentChange?()
         } catch {
             onError?(error)
@@ -545,6 +554,7 @@ private final class DocumentTextView: NSTextView {
             }
             apply(try bridge.insertText(text))
             synchronizeProjection()
+            postAccessibilityRefresh()
             onDocumentChange?()
         } catch {
             onError?(error)
@@ -557,6 +567,7 @@ private final class DocumentTextView: NSTextView {
             let length = canonicalSource.utf16.count
             try bridge.setSelection(NSRange(location: 0, length: length))
             synchronizeProjection()
+            postSelectionChanged()
         } catch {
             onError?(error)
         }
@@ -588,6 +599,7 @@ private final class DocumentTextView: NSTextView {
                 length: text.utf16.count
             )
             synchronizeProjection()
+            postAccessibilityRefresh()
             onDocumentChange?()
         } catch {
             onError?(error)
@@ -631,6 +643,7 @@ private final class DocumentTextView: NSTextView {
                     try bridge.cancelComposition()
                     nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
                     synchronizeProjection()
+                    postAccessibilityRefresh()
                     onDocumentChange?()
                 }
             } catch { onError?(error) }
@@ -672,6 +685,7 @@ private final class DocumentTextView: NSTextView {
         do {
             apply(try bridge.executeCommand(command))
             synchronizeProjection()
+            postAccessibilityRefresh()
             onDocumentChange?()
         } catch { onError?(error) }
     }
@@ -752,27 +766,72 @@ private final class DocumentTextView: NSTextView {
         let maximum = max(0, length - location)
         return NSRange(location: location, length: min(max(range.length, 0), maximum))
     }
+
+    func postAccessibilityRefresh() {
+        NSAccessibility.post(element: self, notification: .valueChanged)
+        postSelectionChanged()
+    }
+
+    private func postSelectionChanged() {
+        NSAccessibility.post(element: self, notification: .selectedTextChanged)
+    }
 }
 
 private enum BridgeError: LocalizedError {
     case open(Int32)
     case operation(Int32)
     case clipboard
+    case watcher(Int32)
 
     var errorDescription: String? {
         switch self {
         case .open(let status): return "无法打开 Markdown 文件（Rust status \(status)）"
         case .operation(let status): return "文档操作失败（Rust status \(status)）"
         case .clipboard: return "无法访问 macOS 剪贴板"
+        case .watcher(let status):
+            let reason = String(cString: strerror(status))
+            return "无法监听文档所在目录（\(reason)）"
         }
     }
 }
 
-private final class DocumentViewController: NSViewController {
+/// Watches the containing directory rather than the file inode. Rust still
+/// owns the file fingerprint and all reload/conflict decisions; this object
+/// only turns native vnode notifications into a main-thread callback. Watching
+/// the directory keeps atomic-save rename replacement observable.
+private final class NativeFileWatcher {
+    private let descriptor: Int32
+    private let source: DispatchSourceFileSystemObject
+
+    init(directory: URL, handler: @escaping () -> Void) throws {
+        let descriptor = open(directory.path, O_EVTONLY)
+        guard descriptor >= 0 else { throw BridgeError.watcher(errno) }
+        self.descriptor = descriptor
+        source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .extend, .attrib, .delete, .rename],
+            queue: .main
+        )
+        source.setEventHandler(handler: handler)
+        source.setCancelHandler { close(descriptor) }
+        source.resume()
+    }
+
+    deinit {
+        source.cancel()
+    }
+}
+
+private final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private let bridge: StorageBridge
     private lazy var textView = DocumentTextView(bridge: bridge)
     private let statusLabel = NSTextField(labelWithString: "")
+    private var saveButton: NSButton?
+    private var reloadButton: NSButton?
     private var initialState: NativeStorageState
+    private var fileWatcher: NativeFileWatcher?
+    private var externalCheckWorkItem: DispatchWorkItem?
+    private var promptedExternalDisk: DiskState?
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
@@ -802,6 +861,9 @@ private final class DocumentViewController: NSViewController {
         textView.onError = { [weak self] error in self?.show(error) }
         scrollView.documentView = textView
 
+        statusLabel.setAccessibilityElement(true)
+        statusLabel.setAccessibilityLabel("文档状态")
+
         let toolbar = NSStackView()
         toolbar.orientation = .horizontal
         toolbar.alignment = .centerY
@@ -810,6 +872,8 @@ private final class DocumentViewController: NSViewController {
 
         let saveButton = NSButton(title: "保存", target: self, action: #selector(save))
         let reloadButton = NSButton(title: "重新加载", target: self, action: #selector(reload))
+        self.saveButton = saveButton
+        self.reloadButton = reloadButton
         toolbar.addArrangedSubview(saveButton)
         toolbar.addArrangedSubview(reloadButton)
         toolbar.addArrangedSubview(statusLabel)
@@ -826,12 +890,16 @@ private final class DocumentViewController: NSViewController {
             scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
         view = root
+        startFileWatcher()
         updateStatus()
     }
 
     func refreshFromRust() {
         textView.refreshFromRust()
         initialState = bridge.state
+        if initialState.disk == .unchanged {
+            promptedExternalDisk = nil
+        }
         updateStatus()
     }
 
@@ -847,6 +915,59 @@ private final class DocumentViewController: NSViewController {
             try bridge.reload()
             refreshFromRust()
         } catch { show(error) }
+    }
+
+    @objc fileprivate func saveFromMenu(_ sender: Any?) {
+        save()
+    }
+
+    @objc fileprivate func reloadFromMenu(_ sender: Any?) {
+        reload()
+    }
+
+    @objc fileprivate func closeFromMenu(_ sender: Any?) {
+        view.window?.performClose(sender)
+    }
+
+    @objc fileprivate func copyFromMenu(_ sender: Any?) {
+        textView.copy(sender)
+    }
+
+    @objc fileprivate func cutFromMenu(_ sender: Any?) {
+        textView.cut(sender)
+    }
+
+    @objc fileprivate func pasteFromMenu(_ sender: Any?) {
+        textView.paste(sender)
+    }
+
+    @objc fileprivate func selectAllFromMenu(_ sender: Any?) {
+        textView.selectAll(sender)
+    }
+
+    func focusDocument() {
+        _ = view.window?.makeFirstResponder(textView)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        let state = bridge.state
+        if menuItem.action == #selector(saveFromMenu(_:)) {
+            return state.dirty
+        }
+        if menuItem.action == #selector(reloadFromMenu(_:)) {
+            return !state.dirty && state.disk != .unchanged
+        }
+        if menuItem.action == #selector(copyFromMenu(_:)) ||
+            menuItem.action == #selector(cutFromMenu(_:)) {
+            return textView.selectedRange().length > 0
+        }
+        if menuItem.action == #selector(pasteFromMenu(_:)) {
+            return NSPasteboard.general.string(forType: .string) != nil
+        }
+        if menuItem.action == #selector(selectAllFromMenu(_:)) {
+            return textView.string.utf16.count > 0
+        }
+        return true
     }
 
     func requestClose() -> Bool {
@@ -893,11 +1014,75 @@ private final class DocumentViewController: NSViewController {
         }
     }
 
+    private func startFileWatcher() {
+        guard fileWatcher == nil else { return }
+        let directory = URL(fileURLWithPath: bridge.path).deletingLastPathComponent()
+        do {
+            fileWatcher = try NativeFileWatcher(directory: directory) { [weak self] in
+                self?.scheduleExternalStateCheck()
+            }
+        } catch {
+            // The session remains correct without a native notification source;
+            // the status/menu state can still be refreshed by explicit actions.
+            statusLabel.toolTip = error.localizedDescription
+        }
+    }
+
+    private func scheduleExternalStateCheck() {
+        externalCheckWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.checkExternalState()
+        }
+        externalCheckWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(150),
+            execute: workItem
+        )
+    }
+
+    private func checkExternalState() {
+        let state = bridge.state
+        initialState = state
+        updateStatus()
+        guard state.disk != .unchanged else {
+            promptedExternalDisk = nil
+            return
+        }
+        guard promptedExternalDisk != state.disk else { return }
+        promptedExternalDisk = state.disk
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = state.disk == .missing ? "文件已被删除或移动" : "文件已被外部修改"
+        if state.dirty {
+            alert.informativeText =
+                "Rust session 已确认磁盘版本变化。本地有未保存修改，Yu 不会自动覆盖或重载。请保存或关闭窗口处理冲突。"
+            alert.addButton(withTitle: "知道了")
+        } else {
+            alert.informativeText =
+                "当前没有本地未保存修改，可以重新加载磁盘上的版本。"
+            alert.addButton(withTitle: "重新加载")
+            alert.addButton(withTitle: "稍后")
+        }
+        let response = alert.runModal()
+        guard !state.dirty, response == .alertFirstButtonReturn else { return }
+        do {
+            try bridge.reload()
+            refreshFromRust()
+        } catch {
+            show(error)
+        }
+    }
+
     private func updateStatus() {
         let state = bridge.state
         let dirty = state.dirty ? "● 未保存" : "已保存"
         let bom = state.bom ? "UTF-8 BOM" : "UTF-8"
-        statusLabel.stringValue = "\(dirty) · Rev \(state.revision) · \(state.disk.label) · \(bom)"
+        let status = "\(dirty) · Rev \(state.revision) · \(state.disk.label) · \(bom)"
+        statusLabel.stringValue = status
+        statusLabel.setAccessibilityValue(status)
+        saveButton?.isEnabled = state.dirty
+        reloadButton?.isEnabled = !state.dirty && state.disk != .unchanged
     }
 
     private func show(_ error: Error) {
@@ -941,6 +1126,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.activate(ignoringOtherApps: true)
             self.controller = controller
             self.window = window
+            installMainMenu(for: controller)
+            controller.focusDocument()
             print("Yu document host opened path=\(bridge.path) revision=\(bridge.state.revision)")
         } catch {
             let alert = NSAlert(error: error)
@@ -959,6 +1146,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    private func installMainMenu(for controller: DocumentViewController) {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Yu")
+        appMenu.addItem(
+            withTitle: "关于 Yu",
+            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+            keyEquivalent: ""
+        )
+        appMenu.addItem(.separator())
+        let quit = NSMenuItem(
+            title: "退出 Yu",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quit.target = NSApp
+        appMenu.addItem(quit)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let fileMenuItem = NSMenuItem()
+        let fileMenu = NSMenu(title: "文件")
+        let save = NSMenuItem(
+            title: "保存",
+            action: #selector(DocumentViewController.saveFromMenu(_:)),
+            keyEquivalent: "s"
+        )
+        save.target = controller
+        fileMenu.addItem(save)
+        let reload = NSMenuItem(
+            title: "重新加载",
+            action: #selector(DocumentViewController.reloadFromMenu(_:)),
+            keyEquivalent: "r"
+        )
+        reload.target = controller
+        fileMenu.addItem(reload)
+        fileMenu.addItem(.separator())
+        let close = NSMenuItem(
+            title: "关闭窗口",
+            action: #selector(DocumentViewController.closeFromMenu(_:)),
+            keyEquivalent: "w"
+        )
+        close.target = controller
+        fileMenu.addItem(close)
+        fileMenuItem.submenu = fileMenu
+        mainMenu.addItem(fileMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        let editItems: [(String, Selector, String)] = [
+            ("剪切", #selector(DocumentViewController.cutFromMenu(_:)), "x"),
+            ("复制", #selector(DocumentViewController.copyFromMenu(_:)), "c"),
+            ("粘贴", #selector(DocumentViewController.pasteFromMenu(_:)), "v"),
+            ("全选", #selector(DocumentViewController.selectAllFromMenu(_:)), "a"),
+        ]
+        for (title, action, keyEquivalent) in editItems {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+            item.target = controller
+            editMenu.addItem(item)
+        }
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApp.mainMenu = mainMenu
+    }
 }
 
 let app = NSApplication.shared
