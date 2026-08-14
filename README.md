@@ -40,7 +40,9 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   结果；现在同一 handle 也承载 command、selection、key route、普通文本和 IME composition，
   `DocumentTextView` 只是可丢弃 native mirror，避免形成第二份 source；
 - macOS 文档 host 的 copy/paste/cut/selectAll 已回到统一 session；copy/cut 同时发布 canonical
-  Markdown UTI 与纯文本，paste 优先保留 Markdown source，HTML exporter 仍是后续契约；
+  Markdown UTI、纯文本和同一 source range 生成的语义 HTML，paste 优先保留 Markdown source；
+- `yu-export` 固定 Revision-bound source selection 的 Markdown/纯文本/HTML clipboard payload，
+  HTML 只消费当前 parser 已识别的语义，未识别语法按转义文本回退，不读取 TextKit mirror；
 - `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
   owned publication，macOS host 只消费已验证的 publication；
 - viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host
@@ -89,6 +91,7 @@ crates/yu-storage       UTF-8 Markdown 文档会话、BOM、原子保存和外�
 crates/yu-storage-ffi   macOS 文档壳消费 DocumentSession 的窄 C ABI
 platform/macos/yu-storage-macos macOS FSEvents/DispatchSource flag 适配与文件通知 debounce
 crates/yu-markdown      lossless block/inline CST 与增量 Markdown parser
+crates/yu-export        Revision-bound Markdown/纯文本/HTML clipboard payload exporter
 crates/yu-projection    Source → Visual Markdown 投影
 crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
 crates/yu-font          font fallback、GlyphRun、metrics/rasterization 契约与 CPU glyph atlas

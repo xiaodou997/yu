@@ -83,6 +83,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-export"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
+ "yu-markdown",
+ "yu-text",
+]
+
+[[package]]
 name = "yu-font"
 version = "0.1.0"
 dependencies = [
@@ -191,6 +200,7 @@ version = "0.1.0"
 dependencies = [
  "yu-core",
  "yu-editor",
+ "yu-export",
  "yu-storage",
  "yu-text",
 ]

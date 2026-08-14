@@ -1,6 +1,6 @@
 [package]
-name = "yu-storage-ffi"
-description = "C ABI bridge from native document shells to Yu storage sessions"
+name = "yu-export"
+description = "Source-backed Markdown clipboard payloads and conservative HTML export"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,14 +8,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-[lib]
-crate-type = ["staticlib"]
-
 [dependencies]
 yu-core = { path = "../yu-core" }
-yu-editor = { path = "../yu-editor" }
-yu-export = { path = "../yu-export" }
-yu-storage = { path = "../yu-storage" }
+yu-markdown = { path = "../yu-markdown" }
 yu-text = { path = "../yu-text" }
 
 [lints]

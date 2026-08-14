@@ -79,12 +79,16 @@ Revision-bound 状态、command/selection/key route、IME composition 和 save/r
 只消费统一 FFI 返回的 owned source、selection、command result 和 composition generation，不拥有
 source、history 或 dirty，不能再并列持有 storage/editor 两个 session。
 
+`yu-export` 位于 Markdown parser 与 native clipboard 之间。它接收一个 expected `Revision` 和
+source `TextRange`，一次生成 canonical Markdown、纯文本回退和 semantic HTML fragment；HTML
+只使用 parser 已识别的 source ranges，不读取 TextKit projection 或 transient composition。FFI
+只提供 count/fill 查询，macOS pasteboard 仍由产品壳发布，Rust session 不拥有系统剪贴板。
+
 后续预计增加：
 
 ```text
 yu-markdown-edit
 yu-platform
-yu-export
 yu-extension-host
 ```
 

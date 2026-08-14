@@ -33,12 +33,14 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] macOS 可编辑文档 host：将 `NSTextInputClient` 的 marked range/source sync 接入统一 session FFI
 - [x] macOS 基础纯文本剪贴板：copy/paste/cut/selectAll 全部回到统一 session
 - [x] macOS source-backed Markdown/纯文本剪贴板：copy/cut 发布 Markdown UTI，paste 优先保留源码
+- [x] `yu-export` Revision-bound source selection：Markdown/纯文本回退与保守语义 HTML payload
+- [x] macOS copy/cut 同时发布 canonical Markdown、纯文本和 HTML pasteboard 类型
 - [x] macOS 文档目录 vnode watcher：事件合并后由 Rust session 复核磁盘指纹；clean 文档可重载，dirty 文档只提示冲突
-- [ ] 跨平台剪贴板格式与 source-backed Markdown/HTML/纯文本导出
+- [ ] 跨平台剪贴板格式常量、HTML fragment policy 与其他平台 native adapter
 - [x] macOS 基础文件路径/标题、dirty、Revision、磁盘状态的状态栏、菜单和 TextKit Accessibility 投影
 - [x] macOS source-backed Accessibility 快照 FFI：UTF-16 字符数、选区、逻辑行范围和位置查询均绑定 Revision
 - [x] macOS Accessibility 回调在 close/reload/外部替换边界上失败可恢复，不因快照失效触发宿主崩溃
-- [ ] 完整 VoiceOver 语义树、跨平台 Accessibility 适配与 source-backed Markdown/HTML 剪贴板格式
+- [ ] 完整 VoiceOver 语义树与跨平台 Accessibility 适配
 - [x] 以 `DocumentEditorSession` 为输入的 headless vertical slice benchmark，并记录局部/传播编辑基线
 - [x] viewport block sync 使用 key 索引，避免大文档编辑后的 O(blocks²) cache remap
 - [x] 未发生 viewport 查询时保持 block entries 惰性，避免纯编辑路径物化全文索引
@@ -70,7 +72,7 @@ Rust `disk_state` 仍是 reload/save/close 的唯一权威。Accessibility 查�
 
 ## 下一步
 
-下一阶段应完成可写 host 的手工 macOS 输入源/VoiceOver 验收，并开始设计 source-backed Markdown/HTML
-剪贴板格式；完整 Markdown visual projection 仍放在这些边界稳定之后。在
+下一阶段应完成可写 host 的手工 macOS 输入源/VoiceOver 验收，并为 HTML fragment 增加更完整的
+Markdown semantic coverage；完整 Markdown visual projection 仍放在这些边界稳定之后。在
 进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
 storage/editor 两个独立 handle。
