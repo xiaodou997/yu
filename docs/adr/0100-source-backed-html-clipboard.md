@@ -2,7 +2,8 @@
 
 ## 状态
 
-已接受（Phase 2，Rust headless + macOS host）。跨平台 pasteboard 常量和完整语义覆盖仍待定义。
+已接受（Phase 2，Rust headless + macOS host）。Rust 跨平台格式契约已固定；其他平台 native
+clipboard adapter 和完整语义覆盖仍待定义。
 
 ## 背景
 
@@ -27,6 +28,8 @@ TextKit 字符串拼接，会把 Markdown delimiter、暂态 composition 和 sou
 - `yu-storage-ffi` 暴露 `yu_storage_session_copy_selection_html` 的两次查询 ABI；macOS host
   copy/cut 在同一个 selection Revision 下发布 `net.daringfireball.markdown`、纯文本和
   `public.html`。
+- `yu-export::ClipboardFormat` 固定三种跨平台 payload 的顺序、MIME、macOS UTI 和取值映射；
+  native adapter 不应重新定义格式字符串或改变 Markdown/纯文本/HTML 的优先语义。
 - paste 继续优先 Markdown UTI，再回退到纯文本；本阶段不把 HTML 作为 Yu 内部粘贴输入，避免
   HTML→Markdown 逆向解析在 parser semantic coverage 尚未完整时制造第二套真源。
 

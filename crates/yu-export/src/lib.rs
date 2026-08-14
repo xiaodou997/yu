@@ -21,7 +21,45 @@ use yu_text::{TextBuffer, TextPositionError, TextSnapshot};
 pub const MARKDOWN_MIME: &str = "text/markdown";
 pub const MARKDOWN_UTI: &str = "net.daringfireball.markdown";
 pub const PLAIN_TEXT_MIME: &str = "text/plain;charset=utf-8";
+pub const PLAIN_TEXT_UTI: &str = "public.utf8-plain-text";
 pub const HTML_MIME: &str = "text/html";
+pub const HTML_UTI: &str = "public.html";
+
+/// Stable source formats that every native clipboard adapter must understand.
+///
+/// The MIME name is used by Windows/Linux/web-facing adapters; `uti()` is the
+/// corresponding macOS pasteboard identifier. The payload order is deliberate:
+/// Markdown is canonical, plain text is the lossless fallback, and HTML is a
+/// derived semantic fragment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClipboardFormat {
+    Markdown,
+    PlainText,
+    Html,
+}
+
+impl ClipboardFormat {
+    /// Formats published for every canonical source selection.
+    pub const ALL: [Self; 3] = [Self::Markdown, Self::PlainText, Self::Html];
+
+    #[must_use]
+    pub const fn mime(self) -> &'static str {
+        match self {
+            Self::Markdown => MARKDOWN_MIME,
+            Self::PlainText => PLAIN_TEXT_MIME,
+            Self::Html => HTML_MIME,
+        }
+    }
+
+    #[must_use]
+    pub const fn uti(self) -> &'static str {
+        match self {
+            Self::Markdown => MARKDOWN_UTI,
+            Self::PlainText => PLAIN_TEXT_UTI,
+            Self::Html => HTML_UTI,
+        }
+    }
+}
 
 /// The three payloads published for one canonical source selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +100,16 @@ impl ClipboardPayload {
     #[must_use]
     pub fn html(&self) -> &str {
         &self.html
+    }
+
+    /// Returns the payload value for a stable native clipboard format.
+    #[must_use]
+    pub fn value(&self, format: ClipboardFormat) -> &str {
+        match format {
+            ClipboardFormat::Markdown => self.markdown(),
+            ClipboardFormat::PlainText => self.plain_text(),
+            ClipboardFormat::Html => self.html(),
+        }
     }
 }
 
@@ -627,6 +675,32 @@ mod tests {
                 .contains("<input type=\"checkbox\" disabled checked>")
         );
         assert!(payload.html().contains("&lt;&amp;&gt;"));
+    }
+
+    #[test]
+    fn clipboard_format_contract_maps_mime_uti_and_payloads() {
+        assert_eq!(
+            ClipboardFormat::ALL,
+            [
+                ClipboardFormat::Markdown,
+                ClipboardFormat::PlainText,
+                ClipboardFormat::Html
+            ]
+        );
+        assert_eq!(ClipboardFormat::Markdown.mime(), MARKDOWN_MIME);
+        assert_eq!(ClipboardFormat::Markdown.uti(), MARKDOWN_UTI);
+        assert_eq!(ClipboardFormat::PlainText.mime(), PLAIN_TEXT_MIME);
+        assert_eq!(ClipboardFormat::PlainText.uti(), PLAIN_TEXT_UTI);
+        assert_eq!(ClipboardFormat::Html.mime(), HTML_MIME);
+        assert_eq!(ClipboardFormat::Html.uti(), HTML_UTI);
+
+        let buffer = TextBuffer::new("# Yu");
+        let snapshot = buffer.snapshot();
+        let payload = export_clipboard(&snapshot, snapshot.revision(), whole_range(&snapshot))
+            .expect("clipboard export");
+        assert_eq!(payload.value(ClipboardFormat::Markdown), "# Yu");
+        assert_eq!(payload.value(ClipboardFormat::PlainText), "# Yu");
+        assert_eq!(payload.value(ClipboardFormat::Html), "<h1>Yu</h1>");
     }
 
     #[test]

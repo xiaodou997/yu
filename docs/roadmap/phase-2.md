@@ -36,7 +36,8 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] `yu-export` Revision-bound source selection：Markdown/纯文本回退与保守语义 HTML payload
 - [x] macOS copy/cut 同时发布 canonical Markdown、纯文本和 HTML pasteboard 类型
 - [x] macOS 文档目录 vnode watcher：事件合并后由 Rust session 复核磁盘指纹；clean 文档可重载，dirty 文档只提示冲突
-- [ ] 跨平台剪贴板格式常量、HTML fragment policy 与其他平台 native adapter
+- [x] Rust 跨平台剪贴板格式契约：Markdown/纯文本/HTML 的 MIME、macOS UTI 和 payload 映射
+- [ ] HTML fragment policy 与 Windows/Linux native clipboard adapter
 - [x] macOS 基础文件路径/标题、dirty、Revision、磁盘状态的状态栏、菜单和 TextKit Accessibility 投影
 - [x] macOS source-backed Accessibility 快照 FFI：UTF-16 字符数、选区、逻辑行范围和位置查询均绑定 Revision
 - [x] macOS Accessibility 回调在 close/reload/外部替换边界上失败可恢复，不因快照失效触发宿主崩溃
@@ -78,7 +79,8 @@ Rust `disk_state` 仍是 reload/save/close 的唯一权威。Accessibility 查�
 `NSAccessibilityElementProtocol` 的 children，几何按
 当前 TextKit 布局计算但仍绑定节点 Revision。Heading/Link custom rotor 只查询这棵当前 child tree，
 旧 child 在 refresh 前收到 `uiElementDestroyed`。无窗口 `--accessibility-self-check` 会验证父子关系、
-label、角色、task 状态/press、URL 属性、Rotor 返回目标和编辑后的 stale node；真实 VoiceOver 朗读验收仍待人工完成。
+label、角色、task 状态/press、URL 属性、Rotor 返回目标和编辑后的 stale node；macOS 真实 VoiceOver
+朗读已由用户人工确认，Rotor/语义 action 的跨平台回归仍待后续完成。
 它仍不承担 Markdown visual projection 或最终渲染。
 
 ## 下一步
