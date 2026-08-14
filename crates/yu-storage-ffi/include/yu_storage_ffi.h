@@ -119,6 +119,21 @@ typedef struct YuStorageSelection {
     uint8_t affinity;
 } YuStorageSelection;
 
+typedef struct YuStorageAccessibilitySnapshot {
+    uint64_t revision;
+    uint64_t number_of_characters_utf16;
+    uint64_t selection_start_utf16;
+    uint64_t selection_end_utf16;
+    uint64_t line_count;
+    uint8_t selection_affinity;
+} YuStorageAccessibilitySnapshot;
+
+typedef struct YuStorageAccessibilityRange {
+    uint64_t revision;
+    uint64_t start_utf16;
+    uint64_t end_utf16;
+} YuStorageAccessibilityRange;
+
 typedef struct YuStorageCommandResult {
     uint64_t revision;
     uint64_t selection_start_utf16;
@@ -167,6 +182,14 @@ int32_t yu_storage_session_copy_selection(const YuStorageSession *session,
                                           uint64_t expected_revision,
                                           uint8_t *output, size_t capacity,
                                           size_t *written);
+int32_t yu_storage_session_accessibility_snapshot(
+    const YuStorageSession *session, YuStorageAccessibilitySnapshot *output);
+int32_t yu_storage_session_accessibility_line_range(
+    const YuStorageSession *session, uint64_t expected_revision, uint64_t line,
+    YuStorageAccessibilityRange *output);
+int32_t yu_storage_session_accessibility_line_for_position(
+    const YuStorageSession *session, uint64_t expected_revision,
+    uint64_t offset_utf16, uint64_t *output);
 
 int32_t yu_storage_session_selection(const YuStorageSession *session,
                                      YuStorageSelection *output);
