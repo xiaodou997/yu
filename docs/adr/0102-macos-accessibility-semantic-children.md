@@ -3,7 +3,7 @@
 ## 状态
 
 已接受（Phase 2，macOS host）。真实 VoiceOver 朗读和导航仍需人工验收；Rotor 的自动契约见
-ADR-0103；跨平台 Accessibility role mapping 不在本 ADR 范围内。
+ADR-0103，semantic actions 见 ADR-0104；跨平台 Accessibility role mapping 不在本 ADR 范围内。
 
 ## 背景
 
@@ -31,8 +31,12 @@ Markdown 会产生第二套语义，也会在编辑后留下跨 Revision 的旧 
 - `DocumentTextView` 提供 Heading 和 Link 两个 AppKit custom rotor。Rotor 只按当前 child 顺序过滤
   节点并返回 source range，不维护另一份索引；delegate 由 root 强引用，避免 AppKit 的 weak delegate
   在查询时失效。
+- link child 的 `accessibilityURL` 由 Rust parser 提供的 destination range 回查得到；Swift 不解析
+  Markdown destination，也不在本 ADR 中决定是否打开外部内容。
+- task child 的 `accessibilityPerformPress` 只允许当前 Revision、非 composition 状态且 Rust
+  `toggle_task` command 可用时执行；成功后以普通 source Transaction 推进 Revision 并重建 child tree。
 - 增加 `--accessibility-self-check <file>` 无窗口命令，创建真实 AppKit elements，验证 parent/label/
-  role、task checkbox value、Heading/Link rotor、编辑后的 stale node 和新 Revision tree。它只能
+  role、task checkbox value/press、Heading/Link rotor、URL 属性、编辑后的 stale node 和新 Revision tree。它只能
   验证 AX 数据契约，不能代替 VoiceOver 实际朗读、转子导航和日文/emoji 朗读验收。
 
 ## 验证
@@ -47,4 +51,4 @@ Markdown 会产生第二套语义，也会在编辑后留下跨 Revision 的旧 
 
 在真实 macOS 会话中打开 VoiceOver，依次验证标题/链接 Rotor、列表/task 状态、链接/图片、中文/日文/
 emoji 以及编辑后焦点和 stale element 行为；记录结果后再决定是否需要 URL action、表格 child role
-或跨平台 role abstraction。
+或跨平台 role abstraction；URL 打开策略和其它动作遵循 ADR-0104。

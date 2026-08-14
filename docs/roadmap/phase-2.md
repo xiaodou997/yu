@@ -43,6 +43,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] Revision-bound source-backed Markdown semantic Accessibility node count/fill 与稳定 C ABI
 - [x] macOS host 将 semantic nodes 映射为 Revision-bound AppKit Accessibility children，并提供无窗口 self-check
 - [x] macOS Heading/Link custom rotor、旧 child `uiElementDestroyed` 通知与 task checkbox value self-check
+- [x] semantic link destination URL 与 task checkbox press 的 Revision-bound action contract/self-check
 - [ ] 真实 VoiceOver 朗读/导航验收与跨平台 Accessibility 适配
 - [x] 以 `DocumentEditorSession` 为输入的 headless vertical slice benchmark，并记录局部/传播编辑基线
 - [x] viewport block sync 使用 key 索引，避免大文档编辑后的 O(blocks²) cache remap
@@ -72,15 +73,17 @@ text、commit/cancel 接回同一个 Rust session；TextKit 字符串仍只是�
 Rust `disk_state` 仍是 reload/save/close 的唯一权威。Accessibility 查询另通过
 `YuStorageAccessibilitySnapshot`、Revision-bound line/range ABI 和 semantic node count/fill ABI
 读取 canonical source；每个 semantic node 只有 role、父子关系和 source/label UTF-16 ranges，Swift
-将其映射为由 `DocumentTextView` 持有、实现 `NSAccessibilityElementProtocol` 的 children，几何按
+以及可选 destination/action block metadata；Swift 将其映射为由 `DocumentTextView` 持有、实现
+`NSAccessibilityElementProtocol` 的 children，几何按
 当前 TextKit 布局计算但仍绑定节点 Revision。Heading/Link custom rotor 只查询这棵当前 child tree，
 旧 child 在 refresh 前收到 `uiElementDestroyed`。无窗口 `--accessibility-self-check` 会验证父子关系、
-label、角色、task 状态、Rotor 返回目标和编辑后的 stale node；真实 VoiceOver 朗读验收仍待人工完成。
+label、角色、task 状态/press、URL 属性、Rotor 返回目标和编辑后的 stale node；真实 VoiceOver 朗读验收仍待人工完成。
 它仍不承担 Markdown visual projection 或最终渲染。
 
 ## 下一步
 
 下一阶段应完成可写 host 的手工 macOS 输入源、真实 VoiceOver 朗读/导航验收，并为 HTML fragment
-增加更完整的 Markdown semantic coverage；完整 Markdown visual projection 仍放在这些边界稳定之后。在
+增加更完整的 Markdown semantic coverage；URL 打开策略、图片/表格 action 和跨平台 action adapter
+仍需产品层决策；完整 Markdown visual projection 仍放在这些边界稳定之后。在
 进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
 storage/editor 两个独立 handle。

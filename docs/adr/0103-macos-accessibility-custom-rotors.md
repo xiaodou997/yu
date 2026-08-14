@@ -42,5 +42,6 @@ experiments/macos-document-host/.build/arm64-apple-macosx/debug/YuMacDocumentHos
 
 ## 后续
 
-URL/图片 action、task checkbox press、表格 cell child role、焦点恢复策略和跨平台 rotor abstraction
-暂不进入本阶段；它们必须先定义 source Transaction 与 Revision 语义再实现。
+URL/图片 action、表格 cell child role、焦点恢复策略和跨平台 rotor abstraction 暂不进入本阶段；
+URL 属性与 task checkbox press 的 source/action 边界见 ADR-0104。其它动作必须先定义 source
+Transaction 与 Revision 语义再实现。

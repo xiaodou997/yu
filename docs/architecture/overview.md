@@ -90,8 +90,10 @@ Revision 生成一个 document-root、block 和已识别 inline span 的 source-
 count/fill ABI 将 owned 节点交给 macOS host，Swift 将它们映射为实现
 `NSAccessibilityElementProtocol` 的 child，文本按节点 Revision 回查，几何由 TextKit 当前布局提供。
 `DocumentTextView` 另提供 Heading/Link custom rotor，查询仍只基于当前 child tree；刷新旧树前发布
-`uiElementDestroyed`。无窗口 self-check 会验证树的父子关系、task value、Rotor 目标和编辑后的 stale
-node；VoiceOver 实际朗读仍属于人工验收，不等同于自动化通过。
+`uiElementDestroyed`。link destination 和 task action block 也由 Rust parser/command contract 提供；
+Swift 只暴露 `accessibilityURL`，以及成功时回到同一 `toggle_task` Transaction 的 checkbox press。
+无窗口 self-check 会验证树的父子关系、task value/press、URL、Rotor 目标和编辑后的 stale node；
+VoiceOver 实际朗读仍属于人工验收，不等同于自动化通过。
 
 后续预计增加：
 

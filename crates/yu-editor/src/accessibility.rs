@@ -109,6 +109,8 @@ pub struct AccessibilitySemanticNode {
     level: u8,
     source_range: AccessibilityTextRange,
     label_range: AccessibilityTextRange,
+    destination_range: Option<AccessibilityTextRange>,
+    action_block: Option<usize>,
 }
 
 impl AccessibilitySemanticNode {
@@ -146,6 +148,21 @@ impl AccessibilitySemanticNode {
     pub const fn label_range(self) -> AccessibilityTextRange {
         self.label_range
     }
+
+    /// Returns the source-backed URL destination for links/images whose
+    /// destination was resolved by the Markdown parser. Reference links use
+    /// the resolved definition range in the same Revision.
+    #[must_use]
+    pub const fn destination_range(self) -> Option<AccessibilityTextRange> {
+        self.destination_range
+    }
+
+    /// Returns the Markdown block index accepted by the editor's
+    /// `toggle_task` command, when this node is an actionable task item.
+    #[must_use]
+    pub const fn action_block(self) -> Option<usize> {
+        self.action_block
+    }
 }
 
 /// Revision-bound semantic tree metadata for VoiceOver/native adapters.
@@ -174,17 +191,19 @@ impl AccessibilitySemanticSnapshot {
                 level: 0,
                 source_range: full_source,
                 label_range: full_source,
+                destination_range: None,
+                action_block: None,
             },
         )?;
 
-        for block in document.markdown().blocks() {
+        for (block_index, block) in document.markdown().blocks().into_iter().enumerate() {
             let Some((kind, flags, level)) = semantic_block_kind(block.kind()) else {
                 continue;
             };
             let source_range = block.range();
             let label_range = semantic_block_label_range(&source, block)?;
             let parent = Some(0);
-            let block_index = u32::try_from(nodes.len())
+            let semantic_block_node_index = u32::try_from(nodes.len())
                 .map_err(|_| AccessibilityTextError::SemanticNodeOverflow)?;
             push_semantic_node(
                 &source,
@@ -196,6 +215,9 @@ impl AccessibilitySemanticSnapshot {
                     level,
                     source_range,
                     label_range,
+                    destination_range: None,
+                    action_block: (kind == AccessibilitySemanticKind::TaskListItem)
+                        .then_some(block_index),
                 },
             )?;
 
@@ -213,16 +235,27 @@ impl AccessibilitySemanticSnapshot {
                     continue;
                 };
                 let label_range = span.content();
+                let destination_range = span.destination().or_else(|| {
+                    span.reference().and_then(|reference| {
+                        document
+                            .markdown()
+                            .reference_definitions()
+                            .lookup(&source, reference)
+                            .map(|definition| definition.destination())
+                    })
+                });
                 push_semantic_node(
                     &source,
                     &mut nodes,
                     SemanticNodeSpec {
-                        parent: Some(block_index),
+                        parent: Some(semantic_block_node_index),
                         kind: span_kind,
                         flags: 0,
                         level: 0,
                         source_range: span.source_range(),
                         label_range,
+                        destination_range,
+                        action_block: None,
                     },
                 )?;
             }
@@ -469,6 +502,8 @@ struct SemanticNodeSpec {
     level: u8,
     source_range: TextRange,
     label_range: TextRange,
+    destination_range: Option<TextRange>,
+    action_block: Option<usize>,
 }
 
 fn push_semantic_node(
@@ -492,6 +527,16 @@ fn push_semantic_node(
             revision: source.revision(),
             range: source_range_to_utf16(source, spec.label_range)?,
         },
+        destination_range: spec
+            .destination_range
+            .map(|range| {
+                source_range_to_utf16(source, range).map(|range| AccessibilityTextRange {
+                    revision: source.revision(),
+                    range,
+                })
+            })
+            .transpose()?,
+        action_block: spec.action_block,
     });
     Ok(())
 }
@@ -818,7 +863,7 @@ mod tests {
     #[test]
     fn semantic_snapshot_exposes_revision_bound_block_and_inline_nodes() {
         let mut document = EditorDocument::new(
-            "# 标题\n\n段落 **粗体** [链接](https://example.com)\n\n- [x] 完成\n\n```rust\n<&>\n```\n",
+            "# 标题\n\n段落 **粗体** [链接](https://example.com) [参考][rust]\n\n- [x] 完成\n\n[rust]: https://www.rust-lang.org/\n\n```rust\n<&>\n```\n",
         );
         let semantic = AccessibilitySemanticSnapshot::from_document(&document)
             .expect("semantic tree should build");
@@ -854,6 +899,32 @@ mod tests {
                 .iter()
                 .any(|node| node.kind() == AccessibilitySemanticKind::Link)
         );
+        let link = semantic
+            .nodes()
+            .iter()
+            .find(|node| node.kind() == AccessibilitySemanticKind::Link)
+            .copied()
+            .expect("link node");
+        assert_eq!(
+            text.text_for_range(link.destination_range().expect("link destination range"))
+                .expect("link destination text"),
+            "https://example.com"
+        );
+        let reference_link = semantic
+            .nodes()
+            .iter()
+            .find(|node| node.kind() == AccessibilitySemanticKind::ReferenceLink)
+            .copied()
+            .expect("reference link node");
+        assert_eq!(
+            text.text_for_range(
+                reference_link
+                    .destination_range()
+                    .expect("reference destination range")
+            )
+            .expect("reference destination text"),
+            "https://www.rust-lang.org/"
+        );
         let task = semantic
             .nodes()
             .iter()
@@ -862,6 +933,8 @@ mod tests {
             .expect("task node");
         assert_ne!(task.flags() & ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE, 0);
         assert_eq!(task.parent(), Some(0));
+        let task_block = task.action_block().expect("task action block");
+        assert!(document.command_available(&EditorCommand::toggle_task(task_block)));
         assert!(
             semantic
                 .nodes()

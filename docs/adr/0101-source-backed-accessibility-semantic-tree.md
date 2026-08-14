@@ -16,9 +16,9 @@ TextKit 镜像重新解析 Markdown，就会重新产生第二套 parser、sourc
 - `yu-editor::AccessibilitySemanticSnapshot` 从当前 `EditorDocument` 的 canonical source 和
   parser-owned block/inline spans 构建节点序列；节点 0 永远是 document root，block 节点挂在 root
   下，inline semantic span 挂在所属 block 下。
-- 每个节点只拥有稳定 kind、parent/index、level/flags 和 source/label UTF-16 ranges；文本仍由
-  已有的 Revision-bound source range query 按需读取。快照创建不会改变 selection、Revision、
-  history 或 source。
+- 每个节点只拥有稳定 kind、parent/index、level/flags、source/label UTF-16 ranges，以及可选的
+  parser-resolved destination range 和 task action block index；文本/URL 仍由已有的 Revision-bound
+  source range query 按需读取。快照创建不会改变 selection、Revision、history 或 source。
 - heading label 去掉 ATX marker；其它当前支持的 block 默认使用完整 source range，后续 projection
   或 layout 可以在不改变 ABI 的情况下细化 label policy。
 - `yu-storage-ffi` 提供 count/fill 两个查询。调用方必须传入 expected Revision；stale Revision、
@@ -38,5 +38,6 @@ TextKit 镜像重新解析 Markdown，就会重新产生第二套 parser、sourc
 ## 后续
 
 ADR-0102 已将该节点序列映射为 AppKit VoiceOver child elements，并固定 geometry 的保守回退和
-stale Revision 行为。后续仍需在真实 macOS 会话中验收 VoiceOver 朗读、actions、hit-test 和
-跨平台 role mapping；不得让 Swift 或 TextKit 自己推导 Markdown 语义。
+stale Revision 行为；ADR-0104 固定 URL 属性与 task press 的动作边界。后续仍需在真实 macOS 会话中
+验收 VoiceOver 朗读、URL 打开策略、hit-test 和跨平台 role mapping；不得让 Swift 或 TextKit 自己
+推导 Markdown 语义。
