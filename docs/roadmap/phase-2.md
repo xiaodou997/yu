@@ -31,8 +31,10 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] 统一 session FFI：command、selection、native key route 和 composition 通过同一 handle
 - [x] macOS 可编辑文档 host：将 `NSTextInputClient` 的 marked range/source sync 接入统一 session FFI
 - [x] macOS 基础纯文本剪贴板：copy/paste/cut/selectAll 全部回到统一 session
+- [x] macOS 文档目录 vnode watcher：事件合并后由 Rust session 复核磁盘指纹；clean 文档可重载，dirty 文档只提示冲突
 - [ ] 跨平台剪贴板格式与 source-backed Markdown/HTML/纯文本导出
-- [ ] 文件路径、标题、dirty 和 Revision 的 Accessibility/菜单状态投影
+- [x] macOS 基础文件路径/标题、dirty、Revision、磁盘状态的状态栏、菜单和 TextKit Accessibility 投影
+- [ ] 完整 VoiceOver 语义树、跨平台 Accessibility 适配与 source-backed Markdown/HTML 剪贴板格式
 - [ ] 以 `DocumentSession` 为输入的 headless vertical slice benchmark
 
 ## 约束
@@ -54,11 +56,12 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 并以 Revision-bound command、selection、source-range copy 与 composition generation 驱动 native
 mirror。`experiments/macos-document-host` 的 `DocumentTextView` 现在可以把普通字符、命令、marked
 text、commit/cancel 接回同一个 Rust session；TextKit 字符串仍只是可丢弃的投影，不拥有 source、dirty
-或 history。它仍不承担 Markdown visual projection 或最终渲染。
+或 history。目录级 DispatchSource watcher 只触发带 debounce 的状态复核，原子替换也由目录监听覆盖；
+Rust `disk_state` 仍是 reload/save/close 的唯一权威。它仍不承担 Markdown visual projection 或最终渲染。
 
 ## 下一步
 
-下一阶段应补齐可写 host 的手工 macOS 输入源/VoiceOver/剪贴板验收，并把文件 watcher 刷新和
-Accessibility/菜单状态投影绑定到同一 native mirror；富文本/Markdown 剪贴板格式仍待设计。在
+下一阶段应补齐可写 host 的手工 macOS 输入源/VoiceOver 验收，并把 Accessibility 从 TextKit 基础
+通知扩展到 source-backed 语义树；富文本/Markdown 剪贴板格式仍待设计。在
 进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
 storage/editor 两个独立 handle。
