@@ -44,7 +44,8 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] macOS host 将 semantic nodes 映射为 Revision-bound AppKit Accessibility children，并提供无窗口 self-check
 - [x] macOS Heading/Link custom rotor、旧 child `uiElementDestroyed` 通知与 task checkbox value self-check
 - [x] semantic link destination URL 与 task checkbox press 的 Revision-bound action contract/self-check
-- [ ] 真实 VoiceOver 朗读/导航验收与跨平台 Accessibility 适配
+- [x] macOS 真实 VoiceOver 朗读验收
+- [ ] Rotor/语义 action 的真实导航回归与跨平台 Accessibility 适配
 - [x] 以 `DocumentEditorSession` 为输入的 headless vertical slice benchmark，并记录局部/传播编辑基线
 - [x] viewport block sync 使用 key 索引，避免大文档编辑后的 O(blocks²) cache remap
 - [x] 未发生 viewport 查询时保持 block entries 惰性，避免纯编辑路径物化全文索引
@@ -82,8 +83,8 @@ label、角色、task 状态/press、URL 属性、Rotor 返回目标和编辑后
 
 ## 下一步
 
-下一阶段应完成可写 host 的手工 macOS 输入源、真实 VoiceOver 朗读/导航验收，并为 HTML fragment
-增加更完整的 Markdown semantic coverage；URL 打开策略、图片/表格 action 和跨平台 action adapter
-仍需产品层决策；完整 Markdown visual projection 仍放在这些边界稳定之后。在
+下一阶段应为 HTML fragment 增加更完整的 Markdown semantic coverage，并固定 URL 打开策略、
+图片/表格 action 和跨平台 action adapter 的产品边界；Rotor/语义 action 的真实导航回归仍需
+补一轮。完整 Markdown visual projection 仍放在这些边界稳定之后。在
 进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
 storage/editor 两个独立 handle。

@@ -117,5 +117,6 @@ VoiceOver Utility 的修饰键配置显示为 `⌃⌥ 或 ⇪`，未修改系统
 - 未使用应用级按键接口模拟 VoiceOver 全局快捷键，因为该接口不能触发系统级 VO modifier，
   因此没有把普通按键误当作 VoiceOver 朗读证据。
 
-结论：`AX/Unicode/selection/clipboard PASS`；`VoiceOver 真实朗读、Rotor 和语音焦点反馈 NEEDS
-FOLLOW-UP`，需要用户在机器上用已配置的 `⌃⌥` 或 `⇪` modifier 手动执行一次朗读/转子流程。
+结论：`AX/Unicode/selection/clipboard/VoiceOver 真实朗读 PASS`。用户确认实际朗读中文、日文、
+emoji 和 canonical source 没有问题。Rotor 目标定位、task checkbox 的语义 action 和跨平台
+Accessibility adapter 仍属于后续工程覆盖项，不阻塞当前 macOS host 验收。
