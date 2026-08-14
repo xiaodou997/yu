@@ -12,10 +12,11 @@
 use std::path::PathBuf;
 use std::ptr;
 
-use yu_core::{TextRange, Utf16Offset, Utf16Range};
+use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
-    CaretAffinity, CommandResult, EditorCommand, EditorDocumentError, EditorKey, KeyEvent,
-    KeyModifiers, KeyRouteResult, SelectionError, SourceSync,
+    AccessibilityTextError, AccessibilityTextSnapshot, CaretAffinity, CommandResult, EditorCommand,
+    EditorDocumentError, EditorKey, KeyEvent, KeyModifiers, KeyRouteResult, SelectionError,
+    SourceSync,
 };
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, DiskState, DocumentEditorSession, ExternalFileState,
@@ -118,6 +119,29 @@ pub struct YuStorageSelection {
     pub start_utf16: u64,
     pub end_utf16: u64,
     pub affinity: u8,
+}
+
+/// Revision-bound source coordinates used by the native Accessibility adapter.
+/// The snapshot is intentionally compact: text and line contents are queried
+/// separately through the existing expected-revision source-range API.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageAccessibilitySnapshot {
+    pub revision: u64,
+    pub number_of_characters_utf16: u64,
+    pub selection_start_utf16: u64,
+    pub selection_end_utf16: u64,
+    pub line_count: u64,
+    pub selection_affinity: u8,
+}
+
+/// A logical line range bound to one Accessibility snapshot revision.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageAccessibilityRange {
+    pub revision: u64,
+    pub start_utf16: u64,
+    pub end_utf16: u64,
 }
 
 #[repr(C)]
@@ -249,6 +273,16 @@ fn status_from_editor_error(error: EditorDocumentError) -> i32 {
     }
 }
 
+fn status_from_accessibility_error(error: AccessibilityTextError) -> i32 {
+    match error {
+        AccessibilityTextError::StaleRevision { .. } => YU_STORAGE_STALE_REVISION,
+        AccessibilityTextError::InvalidSourceRange(_)
+        | AccessibilityTextError::InvalidUtf16Range(_)
+        | AccessibilityTextError::Position(_)
+        | AccessibilityTextError::OffsetOverflow => YU_STORAGE_INVALID_SELECTION,
+    }
+}
+
 fn storage_status(error: StorageError) -> i32 {
     match error {
         StorageError::Editor(error) => status_from_editor_error(error),
@@ -338,6 +372,106 @@ fn selection_output(session: &DocumentEditorSession, output: *mut YuStorageSelec
             },
         };
     }
+    YU_STORAGE_OK
+}
+
+fn accessibility_snapshot(
+    session: &DocumentEditorSession,
+) -> Result<AccessibilityTextSnapshot, i32> {
+    let source = session.snapshot();
+    let selection = session.selection();
+    AccessibilityTextSnapshot::from_selection(source, selection)
+        .map_err(status_from_accessibility_error)
+}
+
+fn accessibility_snapshot_output(
+    session: &DocumentEditorSession,
+    output: *mut YuStorageAccessibilitySnapshot,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let source = session.snapshot();
+    let line_count = source.summary().line_count();
+    let snapshot = match AccessibilityTextSnapshot::from_selection(source, session.selection()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return status_from_accessibility_error(error),
+    };
+    let selected = snapshot.selected_range().range();
+    // SAFETY: `output` is checked above and belongs to the caller.
+    unsafe {
+        *output = YuStorageAccessibilitySnapshot {
+            revision: snapshot.revision().get(),
+            number_of_characters_utf16: snapshot.number_of_characters().get(),
+            selection_start_utf16: selected.start().get(),
+            selection_end_utf16: selected.end().get(),
+            line_count,
+            selection_affinity: match session.selection().affinity() {
+                CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+            },
+        };
+    }
+    YU_STORAGE_OK
+}
+
+fn accessibility_line_range_output(
+    session: &DocumentEditorSession,
+    expected_revision: u64,
+    line: u64,
+    output: *mut YuStorageAccessibilityRange,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(session, expected_revision) {
+        return status;
+    }
+    let snapshot = match accessibility_snapshot(session) {
+        Ok(snapshot) => snapshot,
+        Err(status) => return status,
+    };
+    let range = match snapshot.range_for_line(LineIndex::new(line)) {
+        Ok(range) => range.range(),
+        Err(error) => return status_from_accessibility_error(error),
+    };
+    // SAFETY: `output` is checked above and belongs to the caller.
+    unsafe {
+        *output = YuStorageAccessibilityRange {
+            revision: snapshot.revision().get(),
+            start_utf16: range.start().get(),
+            end_utf16: range.end().get(),
+        };
+    }
+    YU_STORAGE_OK
+}
+
+fn accessibility_line_for_position_output(
+    session: &DocumentEditorSession,
+    expected_revision: u64,
+    offset_utf16: u64,
+    output: *mut u64,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(session, expected_revision) {
+        return status;
+    }
+    let snapshot = match accessibility_snapshot(session) {
+        Ok(snapshot) => snapshot,
+        Err(status) => return status,
+    };
+    let position = match snapshot.bind_position(Utf16Offset::new(offset_utf16)) {
+        Ok(position) => position,
+        Err(error) => return status_from_accessibility_error(error),
+    };
+    let line = match snapshot.line_for_position(position) {
+        Ok(line) => line,
+        Err(error) => return status_from_accessibility_error(error),
+    };
+    // SAFETY: `output` is checked above and belongs to the caller.
+    unsafe { *output = line.get() };
     YU_STORAGE_OK
 }
 
@@ -1049,6 +1183,65 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
     write_snapshot_range(&snapshot, range, output, capacity, written)
 }
 
+/// Returns a compact source-backed Accessibility snapshot. Every coordinate
+/// in the result is valid only for `revision`; native queries must use the
+/// revision-bound range/copy functions below rather than retaining Rust text.
+///
+/// # Safety
+/// `session` must be null or a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_accessibility_snapshot(
+    session: *const YuStorageSession,
+    output: *mut YuStorageAccessibilitySnapshot,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    accessibility_snapshot_output(&session.session, output)
+}
+
+/// Returns one logical LF-delimited line range from a source-backed
+/// Accessibility snapshot. The line index is zero based and the terminating
+/// LF belongs to the preceding line, matching `AccessibilityTextSnapshot`.
+///
+/// # Safety
+/// `session` must be null or a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_accessibility_line_range(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    line: u64,
+    output: *mut YuStorageAccessibilityRange,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    accessibility_line_range_output(&session.session, expected_revision, line, output)
+}
+
+/// Resolves a UTF-16 position to its zero-based logical LF-delimited line in
+/// the same source-backed Accessibility snapshot.
+///
+/// # Safety
+/// `session` must be null or a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_accessibility_line_for_position(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    offset_utf16: u64,
+    output: *mut u64,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    accessibility_line_for_position_output(
+        &session.session,
+        expected_revision,
+        offset_utf16,
+        output,
+    )
+}
+
 /// # Safety
 ///
 /// `session` must be null or a live handle and `output` must be writable when
@@ -1311,6 +1504,101 @@ mod tests {
         assert_eq!(
             String::from_utf8(source).expect("UTF-8 source"),
             "# 羽\n日本語 🙂\n"
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_accessibility_snapshot_and_line_ranges_are_revision_bound() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-ax-{id}.md"));
+        fs::write(&path, "# 羽\n日本語 🙂\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut snapshot = YuStorageAccessibilitySnapshot::default();
+        assert_eq!(
+            unsafe { yu_storage_session_accessibility_snapshot(raw, &mut snapshot) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.number_of_characters_utf16, 11);
+        assert_eq!(snapshot.selection_start_utf16, 11);
+        assert_eq!(snapshot.selection_end_utf16, 11);
+        assert_eq!(snapshot.line_count, 3);
+        assert_eq!(
+            snapshot.selection_affinity,
+            YU_STORAGE_CARET_AFFINITY_DOWNSTREAM
+        );
+
+        let mut first_line = YuStorageAccessibilityRange::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_accessibility_line_range(
+                    raw,
+                    snapshot.revision,
+                    0,
+                    &mut first_line,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(first_line.revision, snapshot.revision);
+        assert_eq!(first_line.start_utf16, 0);
+        assert_eq!(first_line.end_utf16, 4);
+
+        let mut third_line = YuStorageAccessibilityRange::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_accessibility_line_range(
+                    raw,
+                    snapshot.revision,
+                    2,
+                    &mut third_line,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(third_line.start_utf16, 11);
+        assert_eq!(third_line.end_utf16, 11);
+
+        let mut line = u64::MAX;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_accessibility_line_for_position(
+                    raw,
+                    snapshot.revision,
+                    5,
+                    &mut line,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(line, 1);
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_insert_text(raw, snapshot.revision, "x".as_ptr(), 1, &mut result)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_accessibility_line_range(
+                    raw,
+                    snapshot.revision,
+                    0,
+                    &mut first_line,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
         );
 
         unsafe { yu_storage_session_destroy(raw) };
