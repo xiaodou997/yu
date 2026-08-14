@@ -29,6 +29,9 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   dirty 和外部文件冲突检测；保存使用同目录临时文件加原子 rename，不覆盖外部修改；
 - `yu-storage::RecoveryStore` 提供调用方驱动的 autosave/recovery envelope；它只保存独立恢复候选，
   不自动覆盖目标文件，也不在共享核心内启动定时器；
+- `yu-workspace::Workspace` 管理多个 `WorkspaceTab` 和唯一 active tab；每个 tab 只拥有一个
+  `DocumentEditorSession`，重复打开、dirty close、save/discard/cancel 和外部冲突都在无窗口
+  生命周期契约中处理；
 - `yu-storage::FileWatchDebouncer` 与 `CloseStateMachine` 固定文件通知去抖、dirty close、取消/丢弃和
   外部冲突提示；macOS flag 适配不把 watcher 线程或 AppKit 对象带入共享核心；
 - `yu-storage-ffi` 让 macOS 文档壳只消费 Rust-owned source snapshot、Revision/dirty 状态和 close
