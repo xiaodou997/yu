@@ -1,7 +1,10 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_core::{LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
+use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
+use yu_markdown::{
+    Block, BlockKind, InlineParseError, InlineSpanKind, TaskState, parse_inline_with_definitions,
+};
 use yu_text::{TextPositionError, TextSnapshot};
 
 use crate::{EditorDocument, EditorSelection};
@@ -41,6 +44,206 @@ impl AccessibilityTextRange {
     #[must_use]
     pub const fn range(self) -> Utf16Range {
         self.range
+    }
+}
+
+/// Semantic roles that can be exposed to a native accessibility tree.
+///
+/// Node source and label ranges are always bound to the snapshot Revision;
+/// native adapters must query their text through the existing range ABI rather
+/// than retaining a second Markdown string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccessibilitySemanticKind {
+    Document,
+    Heading,
+    Paragraph,
+    CodeBlock,
+    BlockQuote,
+    ListItem,
+    TaskListItem,
+    Emphasis,
+    Strong,
+    CodeSpan,
+    Link,
+    Image,
+    Autolink,
+    ReferenceLink,
+    ReferenceImage,
+}
+
+impl AccessibilitySemanticKind {
+    /// Stable scalar for native Accessibility adapters.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Document => 1,
+            Self::Heading => 2,
+            Self::Paragraph => 3,
+            Self::CodeBlock => 4,
+            Self::BlockQuote => 5,
+            Self::ListItem => 6,
+            Self::TaskListItem => 7,
+            Self::Emphasis => 8,
+            Self::Strong => 9,
+            Self::CodeSpan => 10,
+            Self::Link => 11,
+            Self::Image => 12,
+            Self::Autolink => 13,
+            Self::ReferenceLink => 14,
+            Self::ReferenceImage => 15,
+        }
+    }
+}
+
+/// Flags carried by [`AccessibilitySemanticNode`].
+pub const ACCESSIBILITY_SEMANTIC_FLAG_ORDERED: u8 = 1 << 0;
+pub const ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE: u8 = 1 << 1;
+
+/// One source-backed semantic node in document order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccessibilitySemanticNode {
+    index: u32,
+    parent: Option<u32>,
+    kind: AccessibilitySemanticKind,
+    flags: u8,
+    level: u8,
+    source_range: AccessibilityTextRange,
+    label_range: AccessibilityTextRange,
+}
+
+impl AccessibilitySemanticNode {
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self.index
+    }
+
+    #[must_use]
+    pub const fn parent(self) -> Option<u32> {
+        self.parent
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> AccessibilitySemanticKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn flags(self) -> u8 {
+        self.flags
+    }
+
+    #[must_use]
+    pub const fn level(self) -> u8 {
+        self.level
+    }
+
+    #[must_use]
+    pub const fn source_range(self) -> AccessibilityTextRange {
+        self.source_range
+    }
+
+    #[must_use]
+    pub const fn label_range(self) -> AccessibilityTextRange {
+        self.label_range
+    }
+}
+
+/// Revision-bound semantic tree metadata for VoiceOver/native adapters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessibilitySemanticSnapshot {
+    revision: Revision,
+    nodes: Vec<AccessibilitySemanticNode>,
+}
+
+impl AccessibilitySemanticSnapshot {
+    /// Builds a fresh tree from the canonical Markdown blocks and inline spans.
+    /// The tree owns only compact node metadata and source ranges.
+    pub fn from_document(document: &EditorDocument) -> Result<Self, AccessibilityTextError> {
+        let source = document.snapshot();
+        let revision = source.revision();
+        let full_source = TextRange::new(ByteOffset::ZERO, source.len_bytes())
+            .expect("snapshot bounds must form a range");
+        let mut nodes = Vec::new();
+        push_semantic_node(
+            &source,
+            &mut nodes,
+            SemanticNodeSpec {
+                parent: None,
+                kind: AccessibilitySemanticKind::Document,
+                flags: 0,
+                level: 0,
+                source_range: full_source,
+                label_range: full_source,
+            },
+        )?;
+
+        for block in document.markdown().blocks() {
+            let Some((kind, flags, level)) = semantic_block_kind(block.kind()) else {
+                continue;
+            };
+            let source_range = block.range();
+            let label_range = semantic_block_label_range(&source, block)?;
+            let parent = Some(0);
+            let block_index = u32::try_from(nodes.len())
+                .map_err(|_| AccessibilityTextError::SemanticNodeOverflow)?;
+            push_semantic_node(
+                &source,
+                &mut nodes,
+                SemanticNodeSpec {
+                    parent,
+                    kind,
+                    flags,
+                    level,
+                    source_range,
+                    label_range,
+                },
+            )?;
+
+            if matches!(kind, AccessibilitySemanticKind::CodeBlock) {
+                continue;
+            }
+            let inline = parse_inline_with_definitions(
+                &source,
+                source_range,
+                Some(document.markdown().reference_definitions()),
+            )
+            .map_err(AccessibilityTextError::SemanticParse)?;
+            for span in inline.spans() {
+                let Some(span_kind) = semantic_inline_kind(span.kind()) else {
+                    continue;
+                };
+                let label_range = span.content();
+                push_semantic_node(
+                    &source,
+                    &mut nodes,
+                    SemanticNodeSpec {
+                        parent: Some(block_index),
+                        kind: span_kind,
+                        flags: 0,
+                        level: 0,
+                        source_range: span.source_range(),
+                        label_range,
+                    },
+                )?;
+            }
+        }
+
+        Ok(Self { revision, nodes })
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn nodes(&self) -> &[AccessibilitySemanticNode] {
+        &self.nodes
+    }
+
+    #[must_use]
+    pub fn node(&self, index: u32) -> Option<AccessibilitySemanticNode> {
+        self.nodes.get(usize::try_from(index).ok()?).copied()
     }
 }
 
@@ -209,6 +412,120 @@ impl AccessibilityTextSnapshot {
     }
 }
 
+fn semantic_block_kind(kind: BlockKind) -> Option<(AccessibilitySemanticKind, u8, u8)> {
+    Some(match kind {
+        BlockKind::BlankLine | BlockKind::ReferenceDefinition => return None,
+        BlockKind::Paragraph => (AccessibilitySemanticKind::Paragraph, 0, 0),
+        BlockKind::AtxHeading { level } => (AccessibilitySemanticKind::Heading, 0, level),
+        BlockKind::FencedCodeBlock { .. } => (AccessibilitySemanticKind::CodeBlock, 0, 0),
+        BlockKind::BlockQuote { depth } => (AccessibilitySemanticKind::BlockQuote, 0, depth),
+        BlockKind::ListItem { ordered, depth, .. } => (
+            AccessibilitySemanticKind::ListItem,
+            if ordered {
+                ACCESSIBILITY_SEMANTIC_FLAG_ORDERED
+            } else {
+                0
+            },
+            depth,
+        ),
+        BlockKind::TaskListItem {
+            ordered,
+            depth,
+            state,
+            ..
+        } => (
+            AccessibilitySemanticKind::TaskListItem,
+            (if ordered {
+                ACCESSIBILITY_SEMANTIC_FLAG_ORDERED
+            } else {
+                0
+            }) | if state == TaskState::Done {
+                ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE
+            } else {
+                0
+            },
+            depth,
+        ),
+    })
+}
+
+fn semantic_inline_kind(kind: InlineSpanKind) -> Option<AccessibilitySemanticKind> {
+    Some(match kind {
+        InlineSpanKind::Emphasis => AccessibilitySemanticKind::Emphasis,
+        InlineSpanKind::Strong => AccessibilitySemanticKind::Strong,
+        InlineSpanKind::CodeSpan => AccessibilitySemanticKind::CodeSpan,
+        InlineSpanKind::Link => AccessibilitySemanticKind::Link,
+        InlineSpanKind::Image => AccessibilitySemanticKind::Image,
+        InlineSpanKind::ReferenceLink => AccessibilitySemanticKind::ReferenceLink,
+        InlineSpanKind::ReferenceImage => AccessibilitySemanticKind::ReferenceImage,
+        InlineSpanKind::Autolink => AccessibilitySemanticKind::Autolink,
+    })
+}
+
+struct SemanticNodeSpec {
+    parent: Option<u32>,
+    kind: AccessibilitySemanticKind,
+    flags: u8,
+    level: u8,
+    source_range: TextRange,
+    label_range: TextRange,
+}
+
+fn push_semantic_node(
+    source: &TextSnapshot,
+    nodes: &mut Vec<AccessibilitySemanticNode>,
+    spec: SemanticNodeSpec,
+) -> Result<(), AccessibilityTextError> {
+    let index =
+        u32::try_from(nodes.len()).map_err(|_| AccessibilityTextError::SemanticNodeOverflow)?;
+    nodes.push(AccessibilitySemanticNode {
+        index,
+        parent: spec.parent,
+        kind: spec.kind,
+        flags: spec.flags,
+        level: spec.level,
+        source_range: AccessibilityTextRange {
+            revision: source.revision(),
+            range: source_range_to_utf16(source, spec.source_range)?,
+        },
+        label_range: AccessibilityTextRange {
+            revision: source.revision(),
+            range: source_range_to_utf16(source, spec.label_range)?,
+        },
+    });
+    Ok(())
+}
+
+fn semantic_block_label_range(
+    source: &TextSnapshot,
+    block: Block,
+) -> Result<TextRange, AccessibilityTextError> {
+    let BlockKind::AtxHeading { .. } = block.kind() else {
+        return Ok(block.range());
+    };
+    let text = collect_text(source, block.range())?;
+    let line_end = text.trim_end_matches(['\r', '\n']).len();
+    let bytes = text.as_bytes();
+    let mut index = 0_usize;
+    while index < line_end && bytes[index] == b' ' {
+        index += 1;
+    }
+    while index < line_end && bytes[index] == b'#' {
+        index += 1;
+    }
+    if index < line_end && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+        while index < line_end && matches!(bytes[index], b' ' | b'\t') {
+            index += 1;
+        }
+    }
+    TextRange::new(
+        ByteOffset::new(block.range().start().get().saturating_add(index as u64)),
+        ByteOffset::new(block.range().start().get().saturating_add(line_end as u64)),
+    )
+    .ok_or(AccessibilityTextError::InvalidSourceRange(block.range()))
+}
+
 fn source_range_to_utf16(
     source: &TextSnapshot,
     range: TextRange,
@@ -260,6 +577,8 @@ pub enum AccessibilityTextError {
     InvalidUtf16Range(Utf16Range),
     Position(TextPositionError),
     OffsetOverflow,
+    SemanticNodeOverflow,
+    SemanticParse(InlineParseError),
 }
 
 impl fmt::Display for AccessibilityTextError {
@@ -277,6 +596,12 @@ impl fmt::Display for AccessibilityTextError {
             }
             Self::Position(error) => error.fmt(formatter),
             Self::OffsetOverflow => formatter.write_str("accessibility offset overflow"),
+            Self::SemanticNodeOverflow => {
+                formatter.write_str("accessibility semantic node overflow")
+            }
+            Self::SemanticParse(error) => {
+                write!(formatter, "accessibility semantic parse failed: {error}")
+            }
         }
     }
 }
@@ -285,10 +610,12 @@ impl Error for AccessibilityTextError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Position(error) => Some(error),
+            Self::SemanticParse(error) => Some(error),
             Self::StaleRevision { .. }
             | Self::InvalidSourceRange(_)
             | Self::InvalidUtf16Range(_)
-            | Self::OffsetOverflow => None,
+            | Self::OffsetOverflow
+            | Self::SemanticNodeOverflow => None,
         }
     }
 }
@@ -296,6 +623,12 @@ impl Error for AccessibilityTextError {
 impl From<TextPositionError> for AccessibilityTextError {
     fn from(error: TextPositionError) -> Self {
         Self::Position(error)
+    }
+}
+
+impl From<InlineParseError> for AccessibilityTextError {
+    fn from(error: InlineParseError) -> Self {
+        Self::SemanticParse(error)
     }
 }
 
@@ -479,6 +812,85 @@ mod tests {
         assert_eq!(
             retained_snapshot_stats(&[snapshot]).materialized_buffers(),
             materialized_before
+        );
+    }
+
+    #[test]
+    fn semantic_snapshot_exposes_revision_bound_block_and_inline_nodes() {
+        let mut document = EditorDocument::new(
+            "# 标题\n\n段落 **粗体** [链接](https://example.com)\n\n- [x] 完成\n\n```rust\n<&>\n```\n",
+        );
+        let semantic = AccessibilitySemanticSnapshot::from_document(&document)
+            .expect("semantic tree should build");
+        assert_eq!(semantic.revision(), document.revision());
+        assert_eq!(
+            semantic.node(0).expect("document root").kind(),
+            AccessibilitySemanticKind::Document
+        );
+        assert_eq!(semantic.node(0).expect("document root").parent(), None);
+
+        let text = AccessibilityTextSnapshot::from_document(&document)
+            .expect("text accessibility snapshot should build");
+        let heading = semantic
+            .nodes()
+            .iter()
+            .find(|node| node.kind() == AccessibilitySemanticKind::Heading)
+            .copied()
+            .expect("heading node");
+        assert_eq!(
+            text.text_for_range(heading.label_range())
+                .expect("heading label text"),
+            "标题"
+        );
+        assert!(
+            semantic
+                .nodes()
+                .iter()
+                .any(|node| node.kind() == AccessibilitySemanticKind::Strong)
+        );
+        assert!(
+            semantic
+                .nodes()
+                .iter()
+                .any(|node| node.kind() == AccessibilitySemanticKind::Link)
+        );
+        let task = semantic
+            .nodes()
+            .iter()
+            .find(|node| node.kind() == AccessibilitySemanticKind::TaskListItem)
+            .copied()
+            .expect("task node");
+        assert_ne!(task.flags() & ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE, 0);
+        assert_eq!(task.parent(), Some(0));
+        assert!(
+            semantic
+                .nodes()
+                .iter()
+                .any(|node| node.kind() == AccessibilitySemanticKind::CodeBlock)
+        );
+
+        document
+            .execute(EditorCommand::insert_text("!"))
+            .expect("edit should advance the revision");
+        let next = AccessibilitySemanticSnapshot::from_document(&document)
+            .expect("new semantic tree should build");
+        assert_ne!(semantic.revision(), next.revision());
+        assert_eq!(
+            semantic
+                .node(0)
+                .expect("old root")
+                .source_range()
+                .revision()
+                .get(),
+            0
+        );
+        assert_eq!(
+            next.node(0)
+                .expect("new root")
+                .source_range()
+                .revision()
+                .get(),
+            1
         );
     }
 }

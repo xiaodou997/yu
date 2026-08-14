@@ -97,6 +97,38 @@ private struct NativeAccessibilityRange {
     }
 }
 
+/// Owned semantic metadata returned by Rust for one Accessibility revision.
+/// The host keeps ranges and scalar roles only; node text is fetched through
+/// the revision-bound source query when a native Accessibility element needs
+/// to speak it.
+private struct NativeAccessibilitySemanticNode {
+    let revision: UInt64
+    let index: UInt32
+    let parent: UInt32
+    let kind: UInt8
+    let flags: UInt8
+    let level: UInt8
+    let sourceRange: NSRange
+    let labelRange: NSRange
+
+    init(_ value: YuStorageAccessibilityNode) {
+        revision = value.revision
+        index = value.index
+        parent = value.parent
+        kind = value.kind
+        flags = value.flags
+        level = value.level
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        labelRange = NSRange(
+            location: Int(value.label_start_utf16),
+            length: Int(value.label_end_utf16 - value.label_start_utf16)
+        )
+    }
+}
+
 private struct NativeComposition {
     let revision: UInt64
     let generation: UInt64
@@ -238,6 +270,35 @@ private final class StorageBridge {
         let status = yu_storage_session_accessibility_snapshot(handle, &value)
         guard status == StorageStatus.ok else { return nil }
         return NativeAccessibilitySnapshot(value)
+    }
+
+    /// Returns an owned semantic tree for the current Rust revision. The
+    /// current host still exposes one NSTextView Accessibility element; this
+    /// query establishes the source-backed child-element contract without
+    /// retaining a second document model in AppKit.
+    var accessibilitySemanticNodesIfAvailable: [NativeAccessibilitySemanticNode]? {
+        let revision = state.revision
+        var count = 0
+        let countStatus = yu_storage_session_accessibility_semantic_node_count(
+            handle,
+            revision,
+            &count
+        )
+        guard countStatus == StorageStatus.ok else { return nil }
+
+        var values = Array(repeating: YuStorageAccessibilityNode(), count: count)
+        var written = 0
+        let status = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_accessibility_semantic_nodes(
+                handle,
+                revision,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard status == StorageStatus.ok, written == count else { return nil }
+        return values.map(NativeAccessibilitySemanticNode.init)
     }
 
     func accessibilityLineRange(
@@ -598,6 +659,7 @@ private final class DocumentTextView: NSTextView {
     private let bridge: StorageBridge
     private var canonicalSource: String
     private var canonicalRevision: UInt64
+    private var semanticNodes: [NativeAccessibilitySemanticNode] = []
     private var nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
     private var synchronizingSelection = false
     var onDocumentChange: (() -> Void)?
@@ -631,6 +693,7 @@ private final class DocumentTextView: NSTextView {
         isVerticallyResizable = true
         isHorizontallyResizable = false
         autoresizingMask = [.width]
+        semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
         synchronizeProjection()
     }
 
@@ -640,6 +703,7 @@ private final class DocumentTextView: NSTextView {
     func refreshFromRust() {
         canonicalSource = bridge.source
         canonicalRevision = bridge.state.revision
+        semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
         synchronizeProjection()
         postAccessibilityRefresh()
@@ -1076,6 +1140,7 @@ private final class DocumentTextView: NSTextView {
     }
 
     func postAccessibilityRefresh() {
+        semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
         NSAccessibility.post(element: self, notification: .valueChanged)
         postSelectionChanged()
     }

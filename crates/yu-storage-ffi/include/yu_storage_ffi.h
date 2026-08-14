@@ -97,6 +97,27 @@ enum {
     YU_STORAGE_CLOSE_ALREADY_CLOSED = 2,
 };
 
+enum {
+    YU_STORAGE_ACCESSIBILITY_PARENT_NONE = UINT32_MAX,
+    YU_STORAGE_ACCESSIBILITY_FLAG_ORDERED = 1 << 0,
+    YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE = 1 << 1,
+    YU_STORAGE_ACCESSIBILITY_KIND_DOCUMENT = 1,
+    YU_STORAGE_ACCESSIBILITY_KIND_HEADING = 2,
+    YU_STORAGE_ACCESSIBILITY_KIND_PARAGRAPH = 3,
+    YU_STORAGE_ACCESSIBILITY_KIND_CODE_BLOCK = 4,
+    YU_STORAGE_ACCESSIBILITY_KIND_BLOCK_QUOTE = 5,
+    YU_STORAGE_ACCESSIBILITY_KIND_LIST_ITEM = 6,
+    YU_STORAGE_ACCESSIBILITY_KIND_TASK_LIST_ITEM = 7,
+    YU_STORAGE_ACCESSIBILITY_KIND_EMPHASIS = 8,
+    YU_STORAGE_ACCESSIBILITY_KIND_STRONG = 9,
+    YU_STORAGE_ACCESSIBILITY_KIND_CODE_SPAN = 10,
+    YU_STORAGE_ACCESSIBILITY_KIND_LINK = 11,
+    YU_STORAGE_ACCESSIBILITY_KIND_IMAGE = 12,
+    YU_STORAGE_ACCESSIBILITY_KIND_AUTOLINK = 13,
+    YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_LINK = 14,
+    YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_IMAGE = 15,
+};
+
 typedef struct YuStorageSession YuStorageSession;
 
 typedef struct YuStorageState {
@@ -134,6 +155,20 @@ typedef struct YuStorageAccessibilityRange {
     uint64_t start_utf16;
     uint64_t end_utf16;
 } YuStorageAccessibilityRange;
+
+typedef struct YuStorageAccessibilityNode {
+    uint64_t revision;
+    uint32_t index;
+    uint32_t parent;
+    uint8_t kind;
+    uint8_t flags;
+    uint8_t level;
+    uint8_t reserved;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t label_start_utf16;
+    uint64_t label_end_utf16;
+} YuStorageAccessibilityNode;
 
 typedef struct YuStorageCommandResult {
     uint64_t revision;
@@ -189,6 +224,11 @@ int32_t yu_storage_session_copy_selection_html(const YuStorageSession *session,
                                                size_t *written);
 int32_t yu_storage_session_accessibility_snapshot(
     const YuStorageSession *session, YuStorageAccessibilitySnapshot *output);
+int32_t yu_storage_session_accessibility_semantic_node_count(
+    const YuStorageSession *session, uint64_t expected_revision, size_t *output);
+int32_t yu_storage_session_accessibility_semantic_nodes(
+    const YuStorageSession *session, uint64_t expected_revision,
+    YuStorageAccessibilityNode *output, size_t capacity, size_t *written);
 int32_t yu_storage_session_accessibility_line_range(
     const YuStorageSession *session, uint64_t expected_revision, uint64_t line,
     YuStorageAccessibilityRange *output);

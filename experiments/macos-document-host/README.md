@@ -16,6 +16,9 @@
   `net.daringfireball.markdown`、纯文本和 `public.html` payload，三者都来自同一
   Revision-bound source range；paste 优先读取 Markdown source；TextKit 不提供独立 undo 或
   canonical source；
+- Accessibility 文本查询与 Markdown semantic node count/fill 都从同一 Revision-bound Rust
+  session 读取；Swift 只保存 owned 节点元数据，当前仍由一个 `NSTextView` 对外提供 AX text
+  element，完整 VoiceOver child elements 留到后续阶段；
 - 不包含 Markdown visual projection、最终渲染或 workspace/tab。
 
 构建并运行：
