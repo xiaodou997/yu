@@ -19,7 +19,8 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] headless 集成测试覆盖 invalid UTF-8、BOM、composition、save、reload 和冲突
 - [x] macOS 文件通知 flag 适配与共享 debounce，不在后台线程持有可变 `EditorDocument`
 - [x] autosave/recovery 文件格式和崩溃恢复策略（调用方驱动的 `RecoveryStore` envelope）
-- [ ] 文件权限、软链接、Windows replace semantics 与跨平台原子保存适配
+- [x] macOS/Unix 软链接保存跟随 canonical target，并保留目标文件权限
+- [ ] Windows replace semantics 与其余跨平台原子保存适配
 - [ ] 编码/换行策略（当前只接受 UTF-8，不自动规范化 CRLF）
 
 ## Track B：进入产品窗口前的共享模型

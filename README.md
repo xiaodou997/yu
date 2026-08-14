@@ -27,6 +27,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   Revision 和 composition overlay，新增编辑行为先固定可复现的行为契约；
 - `yu-storage::DocumentSession` 统一 UTF-8 Markdown open/save/reload、BOM 元数据、Revision-bound
   dirty 和外部文件冲突检测；保存使用同目录临时文件加原子 rename，不覆盖外部修改；
+- 打开软链接时保留用户可见路径，但读写、指纹和原子替换都指向 canonical target；macOS/Unix
+  回归测试验证软链接本身不被替换且目标权限被保留；Windows replace semantics 仍待定义；
 - `yu-storage::RecoveryStore` 提供调用方驱动的 autosave/recovery envelope；它只保存独立恢复候选，
   不自动覆盖目标文件，也不在共享核心内启动定时器；
 - `yu-workspace::Workspace` 管理多个 `WorkspaceTab` 和唯一 active tab；每个 tab 只拥有一个
