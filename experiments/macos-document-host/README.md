@@ -12,8 +12,9 @@
 - 外部修改不会被静默覆盖，冲突关闭只提供丢弃本地修改或取消；
 - 普通字符、allowlist 命令和 marked text 都通过同一个 Rust session；`unmarkText` 只改变 native
   presentation，commit/cancel 用 Revision + composition generation 防止迟到回调污染新状态；
-- 基础纯文本 copy/paste/cut/selectAll 都通过 Rust selection/source/command，TextKit 不提供独立
-  undo 或 canonical source；富文本/Markdown 剪贴板格式尚未接入；
+- copy/paste/cut/selectAll 都通过 Rust selection/source/command，copy/cut 同时发布
+  `net.daringfireball.markdown` 与纯文本 payload，paste 优先读取 Markdown source；TextKit 不提供
+  独立 undo 或 canonical source，HTML payload 尚未接入；
 - 不包含 Markdown visual projection、最终渲染或 workspace/tab。
 
 构建并运行：

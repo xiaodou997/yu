@@ -3,6 +3,13 @@ import Darwin
 import UniformTypeIdentifiers
 import YuStorageFFI
 
+private extension NSPasteboard.PasteboardType {
+    /// The de-facto Markdown pasteboard UTI used by macOS Markdown editors.
+    /// The payload is always the canonical source selected in Rust, never the
+    /// TextKit projection (which may contain a transient IME overlay).
+    static let yuMarkdown = NSPasteboard.PasteboardType("net.daringfireball.markdown")
+}
+
 private enum StorageStatus {
     static let ok: Int32 = 0
     static let externalChange: Int32 = 4
@@ -742,11 +749,7 @@ private final class DocumentTextView: NSTextView {
             try finishCompositionForClipboard()
             let text = bridge.copySelection()
             guard !text.isEmpty else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            guard pasteboard.setString(text, forType: .string) else {
-                throw BridgeError.clipboard
-            }
+            try publishSourceToPasteboard(text)
         } catch {
             onError?(error)
         }
@@ -757,11 +760,7 @@ private final class DocumentTextView: NSTextView {
             try finishCompositionForClipboard()
             let selected = bridge.copySelection()
             guard !selected.isEmpty else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            guard pasteboard.setString(selected, forType: .string) else {
-                throw BridgeError.clipboard
-            }
+            try publishSourceToPasteboard(selected)
             guard bridge.commandAvailable(Command.deleteBackward) else { return }
             apply(try bridge.executeCommand(Command.deleteBackward))
             synchronizeProjection()
@@ -775,7 +774,7 @@ private final class DocumentTextView: NSTextView {
     override func paste(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
-            guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
+            guard let text = sourceFromPasteboard(), !text.isEmpty else {
                 return
             }
             apply(try bridge.insertText(text))
@@ -785,6 +784,10 @@ private final class DocumentTextView: NSTextView {
         } catch {
             onError?(error)
         }
+    }
+
+    var hasSourceOnPasteboard: Bool {
+        sourceFromPasteboard() != nil
     }
 
     override func selectAll(_ sender: Any?) {
@@ -921,6 +924,21 @@ private final class DocumentTextView: NSTextView {
         try bridge.cancelComposition()
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
         synchronizeProjection()
+    }
+
+    private func publishSourceToPasteboard(_ source: String) throws {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(source, forType: .string),
+              pasteboard.setString(source, forType: .yuMarkdown) else {
+            throw BridgeError.clipboard
+        }
+    }
+
+    private func sourceFromPasteboard() -> String? {
+        let pasteboard = NSPasteboard.general
+        return pasteboard.string(forType: .yuMarkdown)
+            ?? pasteboard.string(forType: .string)
     }
 
     private func apply(_ result: NativeCommandResult) {
@@ -1212,7 +1230,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             return textView.selectedRange().length > 0
         }
         if menuItem.action == #selector(pasteFromMenu(_:)) {
-            return NSPasteboard.general.string(forType: .string) != nil
+            return textView.hasSourceOnPasteboard
         }
         if menuItem.action == #selector(selectAllFromMenu(_:)) {
             return textView.string.utf16.count > 0
