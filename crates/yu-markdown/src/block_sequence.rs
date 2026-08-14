@@ -12,7 +12,7 @@ pub enum TaskState {
 }
 
 /// The block shapes recognized by the lossless block parser.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlockKind {
     BlankLine,
     /// A source-backed link definition such as `[project]: /docs`.

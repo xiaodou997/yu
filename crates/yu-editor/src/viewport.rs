@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
@@ -407,7 +408,7 @@ pub struct ViewportLayout {
     invalidated: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ViewportKey {
     range: TextRange,
     kind: BlockKind,
@@ -495,20 +496,24 @@ impl ViewportLayout {
             return Ok(());
         }
         let old_entries = std::mem::take(&mut self.entries);
-        let mut used = vec![false; old_entries.len()];
+        let old_entry_count = old_entries.len();
+        let mut old_by_key: HashMap<ViewportKey, Vec<ViewportEntry>> =
+            HashMap::with_capacity(old_entries.len());
+        for entry in old_entries {
+            old_by_key.entry(entry.key).or_default().push(entry);
+        }
+        let mut reused = 0_usize;
         let mut entries = Vec::with_capacity(markdown.blocks().len());
         for block in markdown.blocks() {
             let key = ViewportKey {
                 range: block.range(),
                 kind: block.kind(),
             };
-            if let Some((index, entry)) = old_entries
-                .iter()
-                .enumerate()
-                .find(|(index, entry)| !used[*index] && entry.key == key)
+            if let Some(candidates) = old_by_key.get_mut(&key)
+                && let Some(entry) = candidates.pop()
             {
-                used[index] = true;
-                entries.push(*entry);
+                reused = reused.saturating_add(1);
+                entries.push(entry);
             } else {
                 entries.push(ViewportEntry {
                     key,
@@ -519,7 +524,7 @@ impl ViewportLayout {
         }
         self.invalidated = self
             .invalidated
-            .saturating_add(used.iter().filter(|used| !**used).count() as u64);
+            .saturating_add(old_entry_count.saturating_sub(reused) as u64);
         self.entries = entries;
         self.revision = Some(markdown.revision());
         self.rebuild_index()

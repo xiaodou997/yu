@@ -50,6 +50,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mut edit_samples = Vec::with_capacity(script.len());
+    let mut selection_samples = Vec::with_capacity(script.len());
+    let mut command_samples = Vec::with_capacity(script.len());
     let edit_start = Instant::now();
     for edit in &script {
         let snapshot = session.snapshot();
@@ -60,10 +62,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         let selection =
             EditorSelection::range(&snapshot, anchor, focus, CaretAffinity::Downstream)?;
 
-        let command_start = Instant::now();
+        let selection_start = Instant::now();
         session.set_selection(selection)?;
+        let selection_time = selection_start.elapsed();
+        selection_samples.push(selection_time);
+
+        let command_start = Instant::now();
         let result = session.execute(EditorCommand::insert_text(edit.inserted))?;
-        edit_samples.push(command_start.elapsed());
+        let command_time = command_start.elapsed();
+        command_samples.push(command_time);
+        edit_samples.push(selection_time + command_time);
         if !result.changed() {
             return Err(io::Error::other("insert command unexpectedly made no change").into());
         }
@@ -105,7 +113,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         "edit mean: {:?}",
         edit_total / u32::try_from(script.len()).unwrap_or(u32::MAX)
     );
-    println!("edit command median: {:?}", median(&mut edit_samples));
+    println!("selection median: {:?}", median(&mut selection_samples));
+    println!("command median: {:?}", median(&mut command_samples));
+    println!(
+        "selection + command median: {:?}",
+        median(&mut edit_samples)
+    );
     println!("save: {:?} ({saved_bytes} bytes)", save_time);
     println!("reload: {:?}", reload_time);
     println!("final revision: {:?}", session.revision());

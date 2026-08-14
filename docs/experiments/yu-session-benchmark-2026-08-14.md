@@ -36,20 +36,33 @@ cargo run -p yu-bench --bin yu-session-bench -- \
 
 ## 当前基线
 
-在本机对 1 MiB fixture（1,048,590 bytes）运行 2 次 open、4 次随机编辑得到：
+原始实现对 1 MiB fixture（1,048,590 bytes）运行 2 次 open、4 次随机编辑时得到：
 
 ```text
 open median:       79.148 ms
 edit total:        54.269 s
 edit mean:         13.567 s
-edit command median: 26.939 s
 save:              19.306 ms
 reload:            62.115 ms
 ```
 
-单次随机编辑的 1 MiB smoke（`--iterations 1 --random-edits 1`）约 5 ms；多次随机编辑进入
-长时间传播，说明后续性能阶段必须把“普通局部编辑”和“fence/state 向 EOF 传播”拆开测量，不能
-只看一个平均值。这是当前实现的诊断基线，不是最终产品性能承诺。
+瓶颈来自 `ViewportLayout::sync` 通过旧 entries 对每个新 block 做线性查找，多个编辑后变成
+O(blocks²)。改为 `ViewportKey → entry` 哈希索引后，同一 workload 得到：
+
+```text
+open median:              88.469 ms
+edit total:              222.654 ms
+edit mean:                55.664 ms
+selection median:        243.333 µs
+command median:           98.683 ms
+selection + command:      99.064 ms
+save:                      26.380 ms
+reload:                    60.595 ms
+```
+
+单次随机编辑的 1 MiB smoke（`--iterations 1 --random-edits 1`）仍约 5 ms。后续性能阶段仍需
+把“普通局部编辑”和“fence/state 向 EOF 传播”拆开测量，不能只看一个平均值；以上数字是本机
+诊断基线，不是最终产品性能承诺。
 
 ## 正确性不变量
 
@@ -58,4 +71,3 @@ reload:            62.115 ms
 - 所有随机编辑完成后，session source 必须等于独立字符串模型。
 - 编辑后 session 必须 dirty，save 后必须 clean。
 - reload 后 source 必须等于已保存 source。
-

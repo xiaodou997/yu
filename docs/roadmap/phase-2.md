@@ -39,6 +39,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] macOS Accessibility 回调在 close/reload/外部替换边界上失败可恢复，不因快照失效触发宿主崩溃
 - [ ] 完整 VoiceOver 语义树、跨平台 Accessibility 适配与 source-backed Markdown/HTML 剪贴板格式
 - [x] 以 `DocumentEditorSession` 为输入的 headless vertical slice benchmark，并记录局部/传播编辑基线
+- [x] viewport block sync 使用 key 索引，避免大文档编辑后的 O(blocks²) cache remap
 
 ## 约束
 
