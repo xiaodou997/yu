@@ -363,6 +363,44 @@ private struct NativeVisualRenderPlanSnapshot {
     }
 }
 
+private struct NativeMacosRenderHostSnapshot {
+    let revision: UInt64
+    let frameRevision: UInt64
+    let surfaceGeneration: UInt64
+    let frameSerial: UInt64
+    let commandCount: Int
+    let uploadCount: Int
+    let damageCount: Int
+    let atlasPageCount: Int
+    let atlasGlyphCount: Int
+    let atlasBytes: Int
+    let contentHeight: CGFloat
+    let scrollY: CGFloat
+    let viewportHeight: CGFloat
+    let maxScrollY: CGFloat
+    let viewportWidth: CGFloat
+    let published: Bool
+
+    init(_ value: YuStorageMacosRenderHostSnapshot) {
+        revision = value.revision
+        frameRevision = value.frame_revision
+        surfaceGeneration = value.surface_generation
+        frameSerial = value.frame_serial
+        commandCount = Int(value.command_count)
+        uploadCount = Int(value.upload_count)
+        damageCount = Int(value.damage_count)
+        atlasPageCount = Int(value.atlas_page_count)
+        atlasGlyphCount = Int(value.atlas_glyph_count)
+        atlasBytes = Int(value.atlas_bytes)
+        contentHeight = CGFloat(value.content_height)
+        scrollY = CGFloat(value.scroll_y)
+        viewportHeight = CGFloat(value.viewport_height)
+        maxScrollY = CGFloat(value.max_scroll_y)
+        viewportWidth = CGFloat(value.viewport_width)
+        published = value.published != 0
+    }
+}
+
 private struct NativeVisualRenderCommand {
     let revision: UInt64
     let blockIndex: UInt64
@@ -1380,6 +1418,31 @@ private final class StorageBridge {
             pageValues.map(NativeVisualRenderPage.init),
             damageValues.map(NativeVisualRenderDamage.init)
         )
+    }
+
+    func macosRenderHostFrame(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float,
+        surfaceGeneration: UInt64
+    ) throws -> NativeMacosRenderHostSnapshot {
+        var value = YuStorageMacosRenderHostSnapshot()
+        let status = yu_storage_session_macos_render_host_frame(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            surfaceGeneration,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeMacosRenderHostSnapshot(value)
     }
 
     func macosShapedCaretScrollRequest(
@@ -4431,6 +4494,111 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
     }
 }
 
+private func runMacosRenderHostSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let shaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: 2,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(shaped.lineHeight),
+            defaultAdvance: Float(shaped.defaultAdvance),
+            estimatedBlockHeight: Float(shaped.lineHeight),
+            overscan: 0.0
+        )
+
+        let first = try bridge.macosRenderHostFrame(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 240.0,
+            surfaceGeneration: 0
+        )
+        precondition(first.revision == revision)
+        precondition(first.frameRevision == revision)
+        precondition(first.surfaceGeneration == 0)
+        precondition(first.frameSerial == 1)
+        precondition(first.published)
+        precondition(first.commandCount > 0)
+        precondition(first.uploadCount > 0)
+        precondition(first.damageCount > 0)
+        precondition(first.atlasPageCount > 0)
+        precondition(first.atlasGlyphCount > 0)
+        precondition(first.atlasBytes > 0)
+
+        let repeated = try bridge.macosRenderHostFrame(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 240.0,
+            surfaceGeneration: 0
+        )
+        precondition(repeated.frameSerial > first.frameSerial)
+        precondition(repeated.atlasPageCount == first.atlasPageCount)
+        precondition(repeated.atlasGlyphCount == first.atlasGlyphCount)
+        precondition(repeated.uploadCount == 0)
+
+        let resized = try bridge.macosRenderHostFrame(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 12.0,
+            viewportHeight: 180.0,
+            surfaceGeneration: 1
+        )
+        precondition(resized.surfaceGeneration == 1)
+        precondition(abs(resized.scrollY - 12.0) < 0.01)
+        precondition(abs(resized.viewportHeight - 180.0) < 0.01)
+        precondition(resized.frameSerial > repeated.frameSerial)
+
+        _ = try bridge.insertText("!")
+        do {
+            _ = try bridge.macosRenderHostFrame(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 240.0,
+                surfaceGeneration: 1
+            )
+            preconditionFailure("stale render host frame unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+
+        let next = try bridge.macosRenderHostFrame(
+            revision: bridge.state.revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 240.0,
+            surfaceGeneration: 1
+        )
+        precondition(next.revision == bridge.state.revision)
+        precondition(next.frameRevision == bridge.state.revision)
+        precondition(next.surfaceGeneration == 1)
+        precondition(next.frameSerial > resized.frameSerial)
+        print(
+            "Yu macOS Render Host self-check: persistent CoreText/atlas publication, "
+                + "viewport resize, surface generation and stale Revision rejection are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu macOS Render Host self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func unwrapSelfCheck<T>(_ value: T?) throws -> T {
     guard let value else {
         throw BridgeError.operation(14)
@@ -4727,6 +4895,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-render-plan-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualRenderPlanSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runMacosRenderHostSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

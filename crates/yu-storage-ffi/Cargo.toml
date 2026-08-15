@@ -23,6 +23,7 @@ yu-text = { path = "../yu-text" }
 yu-font = { path = "../yu-font" }
 yu-font-macos = { path = "../../platform/macos/yu-font-macos" }
 yu-render = { path = "../yu-render" }
+yu-render-macos = { path = "../../platform/macos/yu-render-macos" }
 yu-workspace = { path = "../yu-workspace" }
 
 [lints]
