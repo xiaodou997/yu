@@ -18,8 +18,8 @@ use std::time::SystemTime;
 use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
 use yu_editor::{
     BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
-    EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, Projection,
-    ViewportRect, ViewportSnapshot,
+    EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, LayoutConfig,
+    LayoutSnapshot, Projection, ViewportRect, ViewportSnapshot,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -209,6 +209,18 @@ impl DocumentSession {
             .projection(source_range)
             .cloned()
             .map_err(StorageError::Editor)
+    }
+
+    /// Builds an owned metrics layout for the current full-source projection.
+    ///
+    /// This is intentionally a diagnostic/native bridge operation rather than
+    /// a second layout cache. The editor remains the owner of projections and
+    /// source; callers receive a revision-bound snapshot that can answer
+    /// source↔visual↔point queries without retaining a borrow into the editor.
+    pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<LayoutSnapshot, StorageError> {
+        let projection = self.inline_projection()?;
+        LayoutSnapshot::from_projection(&projection, config)
+            .map_err(|error| StorageError::Editor(EditorDocumentError::Layout(error)))
     }
 
     /// Builds the current transient composition over the same full-source
@@ -592,6 +604,10 @@ impl DocumentEditorSession {
     /// that owns source, revision, selection and history.
     pub fn inline_projection(&mut self) -> Result<Projection, StorageError> {
         self.document.inline_projection()
+    }
+
+    pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<LayoutSnapshot, StorageError> {
+        self.document.inline_layout(config)
     }
 
     pub fn composition_projection(&mut self) -> Result<Projection, StorageError> {

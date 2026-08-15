@@ -18,7 +18,7 @@ retained scene/GPU 绘制。
 - [x] macOS storage FFI 暴露 generation-bound composition projection、visual selection 与 marked caret
 - [x] Swift composition projection self-check 覆盖 Unicode preedit、update stale generation、cancel/source 保持
 - [ ] 完善 heading/list/task/fence/table 的 visual delimiter 语义，并统一 block projection kind
-- [ ] visual selection range、hit-testing 和 point↔source mapping
+- [x] visual selection range、metrics hit-testing 和 point↔source mapping 的 Revision-bound 诊断契约
 - [ ] stale Revision/generation 在 native projection callbacks 上的全路径回归
 
 ## Track B：Native layout

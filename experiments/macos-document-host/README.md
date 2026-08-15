@@ -90,6 +90,16 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 语法会从 visual 文本移除，但 source UTF-16 caret 必须在当前 Revision 内 round-trip。完整 block
 projection、IME 映射和 GPU scene 接入会在该边界稳定后进行。
 
+验证 visual selection 与 metrics-layout point hit-test 的 source↔visual round-trip（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --projection-hit-test-self-check experiments/macos-document-host/Fixtures/projection.md
+```
+
+该自检使用 Rust 返回的 visual selection 和 projection-local point，不在 Swift 重建 Markdown delimiter
+或布局；stale Revision 会被拒绝，命中结果只携带 layout-local 坐标，尚未接入生产 TextKit mirror。
+
 验证 parser-owned block projection 的 count/fill、source range、kind、visual 长度以及 stale/
 越界拒绝（不启动窗口）：
 

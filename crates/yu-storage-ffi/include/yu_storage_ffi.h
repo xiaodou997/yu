@@ -174,6 +174,33 @@ typedef struct YuStorageProjectionCaret {
     uint8_t affinity;
 } YuStorageProjectionCaret;
 
+/* Revision-bound source selection projected into visual UTF-16 coordinates.
+ * Non-collapsed source boundaries use the outer projection edges, so hidden
+ * Markdown delimiters are not reintroduced into the visual selection. */
+typedef struct YuStorageProjectionSelection {
+    uint64_t revision;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t visual_start_utf16;
+    uint64_t visual_end_utf16;
+    uint64_t round_trip_source_start_utf16;
+    uint64_t round_trip_source_end_utf16;
+    uint8_t affinity;
+} YuStorageProjectionSelection;
+
+/* Revision-bound metrics-layout hit-test result. x/y are projection-local
+ * layout coordinates, not screen coordinates. */
+typedef struct YuStorageProjectionHit {
+    uint64_t revision;
+    uint64_t source_utf16;
+    uint64_t visual_utf16;
+    uint64_t round_trip_source_utf16;
+    uint64_t line;
+    float x;
+    float y;
+    uint8_t affinity;
+} YuStorageProjectionHit;
+
 /* Revision/generation-bound transient source/visual projection metadata.
  * Canonical source remains unchanged while a composition is active. */
 typedef struct YuStorageCompositionProjection {
@@ -308,6 +335,14 @@ int32_t yu_storage_session_projection_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     YuStorageProjectionCaret *output);
+int32_t yu_storage_session_projection_selection(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t source_start_utf16, uint64_t source_end_utf16,
+    uint8_t affinity, YuStorageProjectionSelection *output);
+int32_t yu_storage_session_projection_hit_test(
+    YuStorageSession *session, uint64_t expected_revision,
+    float point_x, float point_y, float max_width, float line_height,
+    float default_advance, YuStorageProjectionHit *output);
 int32_t yu_storage_session_composition_projection(
     YuStorageSession *session, uint64_t expected_revision,
     YuStorageCompositionProjection *output);

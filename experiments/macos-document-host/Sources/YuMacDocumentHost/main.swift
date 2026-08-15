@@ -82,6 +82,51 @@ private struct NativeProjectionCaret {
     }
 }
 
+private struct NativeProjectionSelection {
+    let revision: UInt64
+    let sourceRange: NSRange
+    let visualRange: NSRange
+    let roundTripSourceRange: NSRange
+    let affinity: UInt8
+
+    init(_ value: YuStorageProjectionSelection) {
+        revision = value.revision
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        visualRange = NSRange(
+            location: Int(value.visual_start_utf16),
+            length: Int(value.visual_end_utf16 - value.visual_start_utf16)
+        )
+        roundTripSourceRange = NSRange(
+            location: Int(value.round_trip_source_start_utf16),
+            length: Int(value.round_trip_source_end_utf16 - value.round_trip_source_start_utf16)
+        )
+        affinity = value.affinity
+    }
+}
+
+private struct NativeProjectionHit {
+    let revision: UInt64
+    let sourceUTF16: UInt64
+    let visualUTF16: UInt64
+    let roundTripSourceUTF16: UInt64
+    let line: UInt64
+    let point: CGPoint
+    let affinity: UInt8
+
+    init(_ value: YuStorageProjectionHit) {
+        revision = value.revision
+        sourceUTF16 = value.source_utf16
+        visualUTF16 = value.visual_utf16
+        roundTripSourceUTF16 = value.round_trip_source_utf16
+        line = value.line
+        point = CGPoint(x: CGFloat(value.x), y: CGFloat(value.y))
+        affinity = value.affinity
+    }
+}
+
 private struct NativeProjectionBlock {
     let revision: UInt64
     let blockIndex: UInt64
@@ -561,6 +606,50 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeProjectionCaret(value)
+    }
+
+    func projectionSelection(
+        revision: UInt64,
+        sourceRange: NSRange,
+        affinity: UInt8
+    ) throws -> NativeProjectionSelection {
+        var value = YuStorageProjectionSelection()
+        let status = yu_storage_session_projection_selection(
+            handle,
+            revision,
+            UInt64(sourceRange.location),
+            UInt64(sourceRange.location + sourceRange.length),
+            affinity,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeProjectionSelection(value)
+    }
+
+    func projectionHitTest(
+        revision: UInt64,
+        point: CGPoint,
+        maxWidth: Float = 80.0,
+        lineHeight: Float = 1.0,
+        defaultAdvance: Float = 1.0
+    ) throws -> NativeProjectionHit {
+        var value = YuStorageProjectionHit()
+        let status = yu_storage_session_projection_hit_test(
+            handle,
+            revision,
+            Float(point.x),
+            Float(point.y),
+            maxWidth,
+            lineHeight,
+            defaultAdvance,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeProjectionHit(value)
     }
 
     func projectionBlockCount(revision: UInt64) throws -> Int {
@@ -2548,6 +2637,60 @@ private func runProjectionSelfCheck(path: String) -> Never {
     }
 }
 
+private func runProjectionHitTestSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let source = bridge.source
+        let projected = try bridge.projectedSource(revision: revision)
+        let sourceStrong = (source as NSString).range(of: "**粗体**")
+        let visualStrong = (projected as NSString).range(of: "粗体")
+        precondition(sourceStrong.location != NSNotFound)
+        precondition(visualStrong.location != NSNotFound)
+
+        let selection = try bridge.projectionSelection(
+            revision: revision,
+            sourceRange: sourceStrong,
+            affinity: 1
+        )
+        precondition(selection.revision == revision)
+        precondition(selection.sourceRange == sourceStrong)
+        precondition(selection.visualRange == visualStrong)
+        precondition(selection.roundTripSourceRange == sourceStrong)
+
+        let visualPrefix = (projected as NSString).substring(to: visualStrong.location)
+        let line = UInt64(visualPrefix.components(separatedBy: "\n").count - 1)
+        let linePrefix = (visualPrefix as NSString).substring(
+            from: (visualPrefix as NSString).range(of: "\n", options: .backwards).location + 1
+        )
+        let point = CGPoint(x: CGFloat(linePrefix.utf16.count) + 0.1, y: CGFloat(line))
+        let hit = try bridge.projectionHitTest(revision: revision, point: point)
+        precondition(hit.revision == revision)
+        precondition(hit.line == line)
+        precondition(hit.sourceUTF16 == UInt64(sourceStrong.location))
+        precondition(hit.visualUTF16 == UInt64(visualStrong.location))
+        precondition(hit.roundTripSourceUTF16 == UInt64(sourceStrong.location))
+        precondition(abs(hit.point.x - CGFloat(linePrefix.utf16.count)) < 0.001)
+        precondition(abs(hit.point.y - CGFloat(line)) < 0.001)
+
+        var staleRejected = false
+        do {
+            _ = try bridge.projectionHitTest(revision: revision + 1, point: point)
+        } catch {
+            staleRejected = true
+        }
+        precondition(staleRejected)
+        print(
+            "Yu Projection hit-test self-check: visual selection and "
+                + "point↔source round-trip are Revision-bound"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Projection hit-test self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runBlockProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -2865,6 +3008,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--undo-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--projection-hit-test-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runProjectionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

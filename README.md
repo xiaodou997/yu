@@ -71,9 +71,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 
 ## 当前阶段
 
-项目已完成 Phase 1 的主要 Contracts & Risk Spikes，当前进入 **Phase 2：Document Sessions & Product
-Shell Contracts**。这两个阶段都不承诺完整 CommonMark 或
-产品 UI；它先固定最容易影响长期架构的契约：
+项目已完成 Phase 1、Phase 2 的主要 Contracts & Risk Spikes，当前进入 **Phase 3：Source Projection
+& Native Layout**。这些阶段都不承诺完整 CommonMark 或产品 UI；它先固定最容易影响长期架构的契约：
 
 - 强类型源码坐标、Revision 与稳定 Anchor；
 - Snapshot、Transaction、ChangeSet 与可逆编辑；
@@ -83,6 +82,7 @@ Shell Contracts**。这两个阶段都不承诺完整 CommonMark 或
 
 详细进度见 [Phase 1 路线](docs/roadmap/phase-1.md)。
 当前存储/文档会话进度见 [Phase 2 路线](docs/roadmap/phase-2.md)。
+当前 source projection/native layout 进度见 [Phase 3 路线](docs/roadmap/phase-3.md)。
 
 ## 仓库结构
 

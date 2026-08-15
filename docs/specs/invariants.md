@@ -191,6 +191,12 @@
     active marked caret 和 round-trip source 必须由 Rust `Projection::with_composition` 生成；
     begin/update/cancel 期间 source、Markdown CST、selection/history 和 Revision 不得改变，Swift
     只能消费 owned bytes/scalars，不能自行拼接 preedit 或推导 hidden delimiter range。
+41. `yu_storage_session_projection_selection` 与 `yu_storage_session_projection_hit_test` 必须
+    同时携带 expected Revision；selection 的 visual range、source round-trip 和 hit-test 的
+    source/visual/line/point/affinity 必须来自同一 Rust projection/layout snapshot。stale Revision、
+    surrogate split、未知 affinity、无效 layout config 或非有限 point 必须拒绝且不得写入半成品
+    output；point 结果是 layout-local owned scalar，平台必须自行完成 screen/view 坐标转换，不能
+    在 Swift 复制 Markdown projection、delimiter 语义或 layout。
 
 ## Accessibility
 

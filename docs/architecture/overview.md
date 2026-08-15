@@ -374,6 +374,14 @@ Revision 与 composition generation，旧 generation 的 copy/caret 会被拒绝
 只改变 transient overlay，canonical source、Markdown CST、history 和 Revision 保持不变；真实
 TextKit mirror 仍沿用现有生命周期，尚未切换为最终 visual selection/hit-testing。
 
+在同一 projection bridge 上，`yu_storage_session_projection_selection` 现在把 source UTF-16
+selection 映射为 visual UTF-16 range，并返回 source round-trip range；非折叠 selection 的两端
+使用 projection 外缘，hidden delimiter 不会出现在 native visual selection。另一个
+`yu_storage_session_projection_hit_test` 查询显式接收 metrics layout 配置和 projection-local point，
+内部构造 revision-bound `yu-layout::LayoutSnapshot`，返回 snapped source/visual caret、line、
+point 和 affinity。Swift 只消费这些 owned scalar；point 仍是 projection-local，不是 screen 坐标，
+当前只用于诊断/self-check，生产 TextKit mirror 尚未切换。
+
 随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
 `ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16
 range、document-space block origin/height、measured 和稳定 kind tag。它只复制 owned scalar，
