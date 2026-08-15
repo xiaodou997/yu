@@ -204,6 +204,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Composition projection FFI](docs/adr/0077-composition-projection-ffi.md)
 - [macOS NSTextInputClient composition lifecycle](docs/adr/0078-macos-nstextinputclient-composition-lifecycle.md)
 - [Visual viewport scroll coordinate contract](docs/adr/0116-visual-viewport-scroll-coordinate.md)
+- [Revision-bound visual scene snapshot bridge](docs/adr/0117-visual-scene-snapshot.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)

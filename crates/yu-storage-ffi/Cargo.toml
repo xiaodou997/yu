@@ -15,6 +15,7 @@ crate-type = ["staticlib"]
 yu-core = { path = "../yu-core" }
 yu-editor = { path = "../yu-editor" }
 yu-export = { path = "../yu-export" }
+yu-scene = { path = "../yu-scene" }
 yu-storage = { path = "../yu-storage" }
 yu-text = { path = "../yu-text" }
 

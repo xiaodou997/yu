@@ -29,6 +29,11 @@ enum {
 };
 
 enum {
+    YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND = 0,
+    YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS = 1,
+};
+
+enum {
     YU_STORAGE_KEY_CHARACTER = 0,
     YU_STORAGE_KEY_ENTER = 1,
     YU_STORAGE_KEY_TAB = 2,
@@ -340,6 +345,32 @@ typedef struct YuStorageCaretScrollRequest {
     uint8_t needs_scroll;
 } YuStorageCaretScrollRequest;
 
+/* Revision-bound owned scene metadata assembled by Rust's retained scene
+ * boundary. Primitive payloads are currently validated rectangle scalars. */
+typedef struct YuStorageVisualSceneSnapshot {
+    uint64_t revision;
+    uint64_t block_start;
+    uint64_t block_end;
+    uint64_t primitive_count;
+    float content_height;
+    float scroll_y;
+    float viewport_height;
+    float max_scroll_y;
+    float viewport_width;
+} YuStorageVisualSceneSnapshot;
+
+typedef struct YuStorageVisualScenePrimitive {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    float x;
+    float y;
+    float width;
+    float height;
+    uint8_t kind;
+} YuStorageVisualScenePrimitive;
+
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
     uint64_t number_of_characters_utf16;
@@ -498,6 +529,11 @@ int32_t yu_storage_session_macos_shaped_caret_scroll_request(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height, float margin,
     YuStorageCaretScrollRequest *output);
+int32_t yu_storage_session_macos_visual_scene(
+    YuStorageSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height,
+    YuStorageVisualSceneSnapshot *snapshot,
+    YuStorageVisualScenePrimitive *primitives, size_t capacity, size_t *written);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,

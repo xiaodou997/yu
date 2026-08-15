@@ -144,6 +144,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检先将 CoreText 的 line height/default advance 发布到 Rust viewport policy，再请求一个完整
 可见窗口；Swift 只消费 owned block 元数据，不创建第二套 Markdown parser、layout 或渲染树。
 
+验证 Rust `ViewportSceneInput`/`SceneBuilder` 生成的最小 owned scene primitive count/fill、背景/文本
+顺序、source range、document-space 矩形和 stale Revision 拒绝（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --visual-scene-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+该自检目前只验证矩形 scene 协议，不连接生产 TextKit、glyph atlas 或 Metal surface；Swift 不推导
+block 高度或 Markdown 语义。
+
 验证 marked-text composition 的 transient projection、visual selection、active caret 与
 Revision/generation 生命周期（不启动窗口）：
 
