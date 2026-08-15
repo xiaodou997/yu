@@ -30,10 +30,16 @@ use yu_storage::{
 use yu_text::{EditError, TextSnapshot};
 
 #[cfg(target_os = "macos")]
+use yu_render::{RenderCommand, RenderPlanBuilder};
+#[cfg(target_os = "macos")]
 use yu_scene::{Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput};
+#[cfg(target_os = "macos")]
+use yu_workspace::{ViewportRenderConfig, assemble_viewport_render_frame};
 
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
+#[cfg(target_os = "macos")]
+use yu_font::{GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer};
 #[cfg(target_os = "macos")]
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
 
@@ -429,6 +435,82 @@ pub struct YuStorageVisualScenePrimitive {
     pub width: f32,
     pub height: f32,
     pub kind: u8,
+}
+
+pub const YU_STORAGE_RENDER_COMMAND_FILL_RECT: u8 = 0;
+pub const YU_STORAGE_RENDER_COMMAND_GLYPH: u8 = 1;
+pub const YU_STORAGE_RENDER_PAGE_NONE: u32 = u32::MAX;
+
+/// Owned metadata for one backend-neutral render-plan publication. Atlas
+/// pixels remain an owned Rust-side upload payload; this ABI exposes their
+/// page identity/fingerprint so native diagnostics can validate publication
+/// without retaining Rust allocations.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageVisualRenderPlanSnapshot {
+    pub revision: u64,
+    pub block_start: u64,
+    pub block_end: u64,
+    pub command_count: u64,
+    pub upload_count: u64,
+    pub damage_count: u64,
+    pub content_height: f32,
+    pub scroll_y: f32,
+    pub viewport_height: f32,
+    pub max_scroll_y: f32,
+    pub viewport_width: f32,
+}
+
+/// One owned render command. Glyph atlas placement, baseline origin, metrics,
+/// source block range and command bounds are copied from the Rust
+/// `RenderPlan`; no scene or atlas reference crosses the ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageVisualRenderCommand {
+    pub revision: u64,
+    pub block_index: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub kind: u8,
+    pub page: u32,
+    pub atlas_x: u32,
+    pub atlas_y: u32,
+    pub atlas_width: u32,
+    pub atlas_height: u32,
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub bearing_x: f32,
+    pub bearing_y: f32,
+    pub advance_x: f32,
+    pub bounds_x: f32,
+    pub bounds_y: f32,
+    pub bounds_width: f32,
+    pub bounds_height: f32,
+    pub color_rgba: u32,
+}
+
+/// One owned atlas-page publication record. The corresponding alpha bytes are
+/// retained only by Rust's `RenderPlan`/renderer pipeline for this diagnostic
+/// call; the fingerprint makes page deduplication observable at the boundary.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageVisualRenderPage {
+    pub revision: u64,
+    pub page: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fingerprint: u64,
+}
+
+/// One owned damage rectangle from the same render plan publication.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageVisualRenderDamage {
+    pub revision: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// Revision-bound source coordinates used by the native Accessibility adapter.
@@ -3308,6 +3390,329 @@ fn macos_visual_scene(
     Ok((snapshot, primitives))
 }
 
+#[cfg(target_os = "macos")]
+type MacosVisualRenderPlan = (
+    YuStorageVisualRenderPlanSnapshot,
+    Vec<YuStorageVisualRenderCommand>,
+    Vec<YuStorageVisualRenderPage>,
+    Vec<YuStorageVisualRenderDamage>,
+);
+
+#[cfg(target_os = "macos")]
+fn macos_visual_render_plan(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+) -> Result<MacosVisualRenderPlan, i32> {
+    validate_revision(&session.session, expected_revision)?;
+    if !size.is_finite()
+        || size <= 0.0
+        || !max_width.is_finite()
+        || max_width <= 0.0
+        || !scroll_y.is_finite()
+        || scroll_y < 0.0
+        || !viewport_height.is_finite()
+        || viewport_height <= 0.0
+    {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let (shaper, metrics, _layout_config) = core_text_system_ui_layout(size, max_width)?;
+    let viewport_config = session.session.viewport_config();
+    let layout_config = viewport_config.layout();
+    if (layout_config.max_width() - max_width).abs() > 0.05
+        || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
+        || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
+    {
+        return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
+    }
+
+    let viewport = ViewportRect::new(scroll_y, viewport_height);
+    let document = session.session.document_mut().editor_mut();
+    let viewport_snapshot = document
+        .visible_blocks_with_shaper(viewport, &shaper)
+        .map_err(|error| storage_status(error.into()))?;
+    let source = document.snapshot();
+    let config = document.viewport_config().layout();
+    let rasterizer = shaper.rasterizer();
+    let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::default());
+    let mut block_glyphs = Vec::with_capacity(viewport_snapshot.blocks().len());
+
+    for block in viewport_snapshot.blocks() {
+        let layout = document
+            .block_layout_with_shaper(block.index(), config, &shaper)
+            .map_err(status_from_editor_error)?
+            .clone();
+        for placement in layout.glyphs() {
+            let key = GlyphRasterKey::new(placement.face(), placement.glyph(), size)
+                .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+            if atlas.entry(key).is_none() {
+                let glyph = rasterizer
+                    .rasterize(key)
+                    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+                atlas.insert(glyph).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+            }
+        }
+        block_glyphs.push((block.index(), block.source(), layout.glyphs().len()));
+    }
+
+    let scene_height = viewport_snapshot
+        .content_height()
+        .max(viewport_height)
+        .max(1.0);
+    let scene_viewport =
+        Rect::new(0.0, 0.0, max_width, scene_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let mut render_plans = RenderPlanBuilder::new();
+    let frame = assemble_viewport_render_frame(
+        document,
+        ViewportRenderConfig::new(viewport, size, scene_viewport, Rgba8::black()),
+        &shaper,
+        &atlas,
+        &mut render_plans,
+    )
+    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let plan = frame.plan();
+    if plan.revision().get() != expected_revision {
+        return Err(YU_STORAGE_STALE_REVISION);
+    }
+
+    let mut block_metadata = Vec::new();
+    for (block_index, source_range, glyph_count) in block_glyphs {
+        let source_start_utf16 = source
+            .utf16_offset(source_range.start())
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+            .get();
+        let source_end_utf16 = source
+            .utf16_offset(source_range.end())
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+            .get();
+        block_metadata.extend(std::iter::repeat_n(
+            (block_index, source_start_utf16, source_end_utf16),
+            glyph_count,
+        ));
+    }
+    if block_metadata.len() != plan.commands().len() {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+
+    let mut commands = Vec::with_capacity(plan.commands().len());
+    for (command, metadata) in plan.commands().iter().copied().zip(block_metadata) {
+        let (block_index, source_start_utf16, source_end_utf16) = metadata;
+        let RenderCommand::Glyph {
+            page,
+            rect,
+            origin,
+            metrics,
+            color,
+        } = command
+        else {
+            return Err(YU_STORAGE_EDITOR_ERROR);
+        };
+        let page = page.unwrap_or(YU_STORAGE_RENDER_PAGE_NONE);
+        let bounds_width = rect.width() as f32;
+        let bounds_height = rect.height() as f32;
+        commands.push(YuStorageVisualRenderCommand {
+            revision: plan.revision().get(),
+            block_index: u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+            source_start_utf16,
+            source_end_utf16,
+            kind: YU_STORAGE_RENDER_COMMAND_GLYPH,
+            page,
+            atlas_x: rect.x(),
+            atlas_y: rect.y(),
+            atlas_width: rect.width(),
+            atlas_height: rect.height(),
+            origin_x: origin.x(),
+            origin_y: origin.y(),
+            bearing_x: metrics.bearing_x(),
+            bearing_y: metrics.bearing_y(),
+            advance_x: metrics.advance_x(),
+            bounds_x: origin.x() + metrics.bearing_x(),
+            bounds_y: origin.y() - metrics.bearing_y(),
+            bounds_width,
+            bounds_height,
+            color_rgba: color.packed(),
+        });
+    }
+
+    let pages = plan
+        .uploads()
+        .iter()
+        .map(|upload| YuStorageVisualRenderPage {
+            revision: plan.revision().get(),
+            page: upload.page(),
+            width: upload.width(),
+            height: upload.height(),
+            fingerprint: upload.fingerprint(),
+        })
+        .collect::<Vec<_>>();
+    let damage = plan
+        .damage()
+        .iter()
+        .copied()
+        .map(|rect| YuStorageVisualRenderDamage {
+            revision: plan.revision().get(),
+            x: rect.x(),
+            y: rect.y(),
+            width: rect.width(),
+            height: rect.height(),
+        })
+        .collect::<Vec<_>>();
+    let block_start = u64::try_from(viewport_snapshot.range().start())
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let block_end =
+        u64::try_from(viewport_snapshot.range().end()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let snapshot = YuStorageVisualRenderPlanSnapshot {
+        revision: plan.revision().get(),
+        block_start,
+        block_end,
+        command_count: u64::try_from(commands.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        upload_count: u64::try_from(pages.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        damage_count: u64::try_from(damage.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        content_height: viewport_snapshot.content_height(),
+        scroll_y,
+        viewport_height,
+        max_scroll_y: (viewport_snapshot.content_height() - viewport_height).max(0.0),
+        viewport_width: max_width,
+    };
+    Ok((snapshot, commands, pages, damage))
+}
+
+/// Returns an owned, count/fill render-plan publication assembled from
+/// CoreText-shaped layouts, a CPU glyph atlas and `yu-workspace`'s existing
+/// scene/render pipeline. The native side receives command/page/damage scalars
+/// only; production TextKit and Metal submission remain separate.
+///
+/// # Safety
+/// All output pointers must be writable when non-null. A non-zero capacity
+/// requires the corresponding array pointer to be non-null. On capacity
+/// failure no output array is partially written.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_visual_render_plan(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    snapshot: *mut YuStorageVisualRenderPlanSnapshot,
+    commands: *mut YuStorageVisualRenderCommand,
+    command_capacity: usize,
+    pages: *mut YuStorageVisualRenderPage,
+    page_capacity: usize,
+    damage: *mut YuStorageVisualRenderDamage,
+    damage_capacity: usize,
+    written_commands: *mut usize,
+    written_pages: *mut usize,
+    written_damage: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if snapshot.is_null()
+        || written_commands.is_null()
+        || written_pages.is_null()
+        || written_damage.is_null()
+    {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if (command_capacity > 0 && commands.is_null())
+        || (page_capacity > 0 && pages.is_null())
+        || (damage_capacity > 0 && damage.is_null())
+    {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output pointers were checked for null and belong to the caller.
+    unsafe {
+        *snapshot = YuStorageVisualRenderPlanSnapshot::default();
+        *written_commands = 0;
+        *written_pages = 0;
+        *written_damage = 0;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            commands,
+            command_capacity,
+            pages,
+            page_capacity,
+            damage,
+            damage_capacity,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let (header, encoded_commands, encoded_pages, encoded_damage) =
+            match macos_visual_render_plan(
+                session,
+                expected_revision,
+                size,
+                max_width,
+                scroll_y,
+                viewport_height,
+            ) {
+                Ok(plan) => plan,
+                Err(status) => return status,
+            };
+        // SAFETY: output pointers were checked above and belong to the caller.
+        unsafe {
+            *snapshot = header;
+            *written_commands = encoded_commands.len();
+            *written_pages = encoded_pages.len();
+            *written_damage = encoded_damage.len();
+        }
+        if command_capacity == 0
+            && commands.is_null()
+            && page_capacity == 0
+            && pages.is_null()
+            && damage_capacity == 0
+            && damage.is_null()
+        {
+            return YU_STORAGE_OK;
+        }
+        if encoded_commands.len() > command_capacity
+            || encoded_pages.len() > page_capacity
+            || encoded_damage.len() > damage_capacity
+        {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+        if !encoded_commands.is_empty() {
+            // SAFETY: capacity was checked against the command count.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    encoded_commands.as_ptr(),
+                    commands,
+                    encoded_commands.len(),
+                );
+            }
+        }
+        if !encoded_pages.is_empty() {
+            // SAFETY: capacity was checked against the page count.
+            unsafe {
+                ptr::copy_nonoverlapping(encoded_pages.as_ptr(), pages, encoded_pages.len());
+            }
+        }
+        if !encoded_damage.is_empty() {
+            // SAFETY: capacity was checked against the damage count.
+            unsafe {
+                ptr::copy_nonoverlapping(encoded_damage.as_ptr(), damage, encoded_damage.len());
+            }
+        }
+        YU_STORAGE_OK
+    }
+}
+
 /// Returns a count/fill owned scene snapshot assembled by Rust's retained
 /// scene boundary. This is intentionally a diagnostic bridge: Swift receives
 /// validated rectangle scalars and source ranges, while glyph/image payloads
@@ -4936,6 +5341,214 @@ mod tests {
         );
         assert_eq!(snapshot, YuStorageVisualSceneSnapshot::default());
         assert_eq!(required, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_visual_render_plan_is_glyph_atlas_bound_and_atomic() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-render-plan-{id}.md"));
+        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n\n- [ ] 任务\n\n```rust\nfn main() {}\n```\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut snapshot = YuStorageVisualRenderPlanSnapshot::default();
+        let mut command_required = 0;
+        let mut page_required = 0;
+        let mut damage_required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut command_required,
+                    &mut page_required,
+                    &mut damage_required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(command_required > 0);
+        assert!(page_required > 0);
+        assert!(damage_required > 0);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.command_count, command_required as u64);
+        assert_eq!(snapshot.upload_count, page_required as u64);
+        assert_eq!(snapshot.damage_count, damage_required as u64);
+        assert_eq!(snapshot.viewport_width, 500.0);
+
+        let mut too_small_commands =
+            vec![YuStorageVisualRenderCommand::default(); command_required - 1];
+        let mut pages = vec![YuStorageVisualRenderPage::default(); page_required];
+        let mut damage = vec![YuStorageVisualRenderDamage::default(); damage_required];
+        let mut written_commands = 0;
+        let mut written_pages = 0;
+        let mut written_damage = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    too_small_commands.as_mut_ptr(),
+                    too_small_commands.len(),
+                    pages.as_mut_ptr(),
+                    pages.len(),
+                    damage.as_mut_ptr(),
+                    damage.len(),
+                    &mut written_commands,
+                    &mut written_pages,
+                    &mut written_damage,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+        assert_eq!(written_commands, command_required);
+        assert_eq!(written_pages, page_required);
+        assert_eq!(written_damage, damage_required);
+        assert!(
+            too_small_commands
+                .iter()
+                .all(|command| *command == YuStorageVisualRenderCommand::default())
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|page| *page == YuStorageVisualRenderPage::default())
+        );
+        assert!(
+            damage
+                .iter()
+                .all(|rect| *rect == YuStorageVisualRenderDamage::default())
+        );
+
+        let mut commands = vec![YuStorageVisualRenderCommand::default(); command_required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    commands.as_mut_ptr(),
+                    commands.len(),
+                    pages.as_mut_ptr(),
+                    pages.len(),
+                    damage.as_mut_ptr(),
+                    damage.len(),
+                    &mut written_commands,
+                    &mut written_pages,
+                    &mut written_damage,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written_commands, command_required);
+        assert_eq!(written_pages, page_required);
+        assert_eq!(written_damage, damage_required);
+        assert!(commands.iter().all(|command| {
+            command.revision == 0
+                && command.kind == YU_STORAGE_RENDER_COMMAND_GLYPH
+                && command.bounds_width.is_finite()
+                && command.bounds_height.is_finite()
+                && command.bounds_width >= 0.0
+                && command.bounds_height >= 0.0
+                && command.origin_x.is_finite()
+                && command.origin_y.is_finite()
+                && command.advance_x.is_finite()
+        }));
+        assert!(commands.windows(2).all(|pair| {
+            pair[0].block_index <= pair[1].block_index
+                && pair[0].source_end_utf16 <= pair[1].source_end_utf16
+        }));
+        assert!(pages.windows(2).all(|pair| pair[0].page < pair[1].page));
+        assert!(pages.iter().all(|page| {
+            page.revision == 0 && page.width > 0 && page.height > 0 && page.fingerprint != 0
+        }));
+        assert!(damage.iter().all(|rect| {
+            rect.revision == 0
+                && rect.x.is_finite()
+                && rect.y.is_finite()
+                && rect.width.is_finite()
+                && rect.height.is_finite()
+                && rect.width >= 0.0
+                && rect.height >= 0.0
+        }));
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut written_commands,
+                    &mut written_pages,
+                    &mut written_damage,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(snapshot, YuStorageVisualRenderPlanSnapshot::default());
+        assert_eq!(written_commands, 0);
+        assert_eq!(written_pages, 0);
+        assert_eq!(written_damage, 0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

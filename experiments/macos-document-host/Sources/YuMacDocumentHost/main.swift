@@ -337,6 +337,106 @@ private struct NativeVisualScenePrimitive {
     }
 }
 
+private struct NativeVisualRenderPlanSnapshot {
+    let revision: UInt64
+    let blockRange: Range<UInt64>
+    let commandCount: Int
+    let uploadCount: Int
+    let damageCount: Int
+    let contentHeight: CGFloat
+    let scrollY: CGFloat
+    let viewportHeight: CGFloat
+    let maxScrollY: CGFloat
+    let viewportWidth: CGFloat
+
+    init(_ value: YuStorageVisualRenderPlanSnapshot) {
+        revision = value.revision
+        blockRange = value.block_start..<value.block_end
+        commandCount = Int(value.command_count)
+        uploadCount = Int(value.upload_count)
+        damageCount = Int(value.damage_count)
+        contentHeight = CGFloat(value.content_height)
+        scrollY = CGFloat(value.scroll_y)
+        viewportHeight = CGFloat(value.viewport_height)
+        maxScrollY = CGFloat(value.max_scroll_y)
+        viewportWidth = CGFloat(value.viewport_width)
+    }
+}
+
+private struct NativeVisualRenderCommand {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let sourceRange: NSRange
+    let kind: UInt8
+    let page: UInt32
+    let atlasRect: CGRect
+    let origin: CGPoint
+    let bearingX: CGFloat
+    let bearingY: CGFloat
+    let advanceX: CGFloat
+    let bounds: CGRect
+    let colorRGBA: UInt32
+
+    init(_ value: YuStorageVisualRenderCommand) {
+        revision = value.revision
+        blockIndex = value.block_index
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        kind = value.kind
+        page = value.page
+        atlasRect = CGRect(
+            x: CGFloat(value.atlas_x),
+            y: CGFloat(value.atlas_y),
+            width: CGFloat(value.atlas_width),
+            height: CGFloat(value.atlas_height)
+        )
+        origin = CGPoint(x: CGFloat(value.origin_x), y: CGFloat(value.origin_y))
+        bearingX = CGFloat(value.bearing_x)
+        bearingY = CGFloat(value.bearing_y)
+        advanceX = CGFloat(value.advance_x)
+        bounds = CGRect(
+            x: CGFloat(value.bounds_x),
+            y: CGFloat(value.bounds_y),
+            width: CGFloat(value.bounds_width),
+            height: CGFloat(value.bounds_height)
+        )
+        colorRGBA = value.color_rgba
+    }
+}
+
+private struct NativeVisualRenderPage {
+    let revision: UInt64
+    let page: UInt32
+    let width: Int
+    let height: Int
+    let fingerprint: UInt64
+
+    init(_ value: YuStorageVisualRenderPage) {
+        revision = value.revision
+        page = value.page
+        width = Int(value.width)
+        height = Int(value.height)
+        fingerprint = value.fingerprint
+    }
+}
+
+private struct NativeVisualRenderDamage {
+    let revision: UInt64
+    let rect: CGRect
+
+    init(_ value: YuStorageVisualRenderDamage) {
+        revision = value.revision
+        rect = CGRect(
+            x: CGFloat(value.x),
+            y: CGFloat(value.y),
+            width: CGFloat(value.width),
+            height: CGFloat(value.height)
+        )
+    }
+}
+
 private struct NativeVisualViewport {
     let revision: UInt64
     let blockRange: Range<UInt64>
@@ -1186,6 +1286,99 @@ private final class StorageBridge {
         return (
             NativeVisualSceneSnapshot(snapshot),
             values.map(NativeVisualScenePrimitive.init)
+        )
+    }
+
+    func macosVisualRenderPlan(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float
+    ) throws -> (
+        NativeVisualRenderPlanSnapshot,
+        [NativeVisualRenderCommand],
+        [NativeVisualRenderPage],
+        [NativeVisualRenderDamage]
+    ) {
+        var snapshot = YuStorageVisualRenderPlanSnapshot()
+        var commandRequired = 0
+        var pageRequired = 0
+        var damageRequired = 0
+        let sizeStatus = yu_storage_session_macos_visual_render_plan(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            &snapshot,
+            nil,
+            0,
+            nil,
+            0,
+            nil,
+            0,
+            &commandRequired,
+            &pageRequired,
+            &damageRequired
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        precondition(snapshot.command_count == UInt64(commandRequired))
+        precondition(snapshot.upload_count == UInt64(pageRequired))
+        precondition(snapshot.damage_count == UInt64(damageRequired))
+        var commandValues = Array(
+            repeating: YuStorageVisualRenderCommand(),
+            count: commandRequired
+        )
+        var pageValues = Array(
+            repeating: YuStorageVisualRenderPage(),
+            count: pageRequired
+        )
+        var damageValues = Array(
+            repeating: YuStorageVisualRenderDamage(),
+            count: damageRequired
+        )
+        var writtenCommands = commandRequired
+        var writtenPages = pageRequired
+        var writtenDamage = damageRequired
+        let fillStatus = commandValues.withUnsafeMutableBufferPointer { commandBuffer in
+            pageValues.withUnsafeMutableBufferPointer { pageBuffer in
+                damageValues.withUnsafeMutableBufferPointer { damageBuffer in
+                    yu_storage_session_macos_visual_render_plan(
+                        handle,
+                        revision,
+                        size,
+                        maxWidth,
+                        scrollY,
+                        viewportHeight,
+                        &snapshot,
+                        commandBuffer.baseAddress,
+                        commandBuffer.count,
+                        pageBuffer.baseAddress,
+                        pageBuffer.count,
+                        damageBuffer.baseAddress,
+                        damageBuffer.count,
+                        &writtenCommands,
+                        &writtenPages,
+                        &writtenDamage
+                    )
+                }
+            }
+        }
+        guard fillStatus == StorageStatus.ok,
+              writtenCommands == commandRequired,
+              writtenPages == pageRequired,
+              writtenDamage == damageRequired else {
+            throw BridgeError.operation(fillStatus)
+        }
+        return (
+            NativeVisualRenderPlanSnapshot(snapshot),
+            commandValues.map(NativeVisualRenderCommand.init),
+            pageValues.map(NativeVisualRenderPage.init),
+            damageValues.map(NativeVisualRenderDamage.init)
         )
     }
 
@@ -4131,6 +4324,113 @@ private func runVisualSceneSelfCheck(path: String) -> Never {
     }
 }
 
+private func runVisualRenderPlanSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let shaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: 2,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(shaped.lineHeight),
+            defaultAdvance: Float(shaped.defaultAdvance),
+            estimatedBlockHeight: Float(shaped.lineHeight),
+            overscan: 0.0
+        )
+
+        let (snapshot, commands, pages, damage) = try bridge.macosVisualRenderPlan(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0
+        )
+        precondition(snapshot.revision == revision)
+        precondition(snapshot.commandCount == commands.count)
+        precondition(snapshot.uploadCount == pages.count)
+        precondition(snapshot.damageCount == damage.count)
+        precondition(snapshot.commandCount > 0)
+        precondition(snapshot.uploadCount > 0)
+        precondition(snapshot.damageCount > 0)
+        precondition(snapshot.blockRange.count > 0)
+        precondition(abs(snapshot.viewportWidth - CGFloat(maxWidth)) < 0.01)
+
+        var previousBlock: UInt64?
+        var previousSourceEnd: Int = 0
+        for command in commands {
+            precondition(command.revision == revision)
+            precondition(command.kind == YU_STORAGE_RENDER_COMMAND_GLYPH)
+            precondition(command.bounds.origin.x.isFinite)
+            precondition(command.bounds.origin.y.isFinite)
+            precondition(command.bounds.width.isFinite && command.bounds.height.isFinite)
+            precondition(command.bounds.width >= 0.0 && command.bounds.height >= 0.0)
+            precondition(command.origin.x.isFinite && command.origin.y.isFinite)
+            precondition(command.advanceX.isFinite && command.advanceX >= 0.0)
+            precondition(command.atlasRect.width >= 0.0 && command.atlasRect.height >= 0.0)
+            if let previousBlock, command.blockIndex != previousBlock {
+                precondition(command.sourceRange.location >= previousSourceEnd)
+            }
+            previousSourceEnd = max(previousSourceEnd, NSMaxRange(command.sourceRange))
+            if let previousBlock {
+                precondition(command.blockIndex >= previousBlock)
+            }
+            previousBlock = command.blockIndex
+            if command.page != YU_STORAGE_RENDER_PAGE_NONE {
+                precondition(Int(command.page) < pages.count)
+            }
+        }
+
+        precondition(pages.dropFirst().enumerated().allSatisfy { offset, page in
+            page.page > pages[offset].page
+        })
+        precondition(Set(pages.map(\.page)).count == pages.count)
+        precondition(pages.allSatisfy { page in
+            page.revision == revision
+                && page.width > 0
+                && page.height > 0
+                && page.fingerprint != 0
+        })
+        precondition(damage.allSatisfy { item in
+            item.revision == revision
+                && item.rect.origin.x.isFinite
+                && item.rect.origin.y.isFinite
+                && item.rect.width.isFinite
+                && item.rect.height.isFinite
+                && item.rect.width >= 0.0
+                && item.rect.height >= 0.0
+        })
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.macosVisualRenderPlan(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 1_000.0
+            )
+            preconditionFailure("stale visual render plan unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        print(
+            "Yu Visual Render Plan self-check: shaped glyph commands, atlas page fingerprints, "
+                + "damage and stale Revision rejection are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual Render Plan self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func unwrapSelfCheck<T>(_ value: T?) throws -> T {
     guard let value else {
         throw BridgeError.operation(14)
@@ -4423,6 +4723,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-viewport-self-check
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualSceneSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-render-plan-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualRenderPlanSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

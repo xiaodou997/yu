@@ -203,9 +203,11 @@ dependencies = [
  "yu-export",
  "yu-font",
  "yu-font-macos",
+ "yu-render",
  "yu-scene",
  "yu-storage",
  "yu-text",
+ "yu-workspace",
 ]
 
 [[package]]

@@ -13,6 +13,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
 #[cfg(target_os = "macos")]
 use unicode_segmentation::UnicodeSegmentation;
@@ -392,6 +394,13 @@ impl FaceTable {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn shared_face_table() -> Arc<Mutex<FaceTable>> {
+    static TABLE: OnceLock<Arc<Mutex<FaceTable>>> = OnceLock::new();
+
+    Arc::clone(TABLE.get_or_init(|| Arc::new(Mutex::new(FaceTable::default()))))
+}
+
 /// A CoreText-backed implementation of both the platform-independent shaping
 /// contract and the layout-facing `ShapingProvider` adapter.
 ///
@@ -452,7 +461,7 @@ impl CoreTextShaper {
             request,
             font_source: CoreTextFontSource::RequestedFamily,
             #[cfg(target_os = "macos")]
-            faces: Arc::new(Mutex::new(FaceTable::default())),
+            faces: shared_face_table(),
         }
     }
 
@@ -1398,6 +1407,33 @@ mod tests {
         assert!(entry.page().is_some());
         assert_eq!(entry.rect().width(), first.bitmap().width());
         assert_eq!(rasterizer.atlas_page_count().expect("atlas"), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_text_face_ids_survive_shaper_recreation() {
+        let catalog = CoreTextFontCatalog::system().expect("CoreText should expose families");
+        let family = catalog.families()[0].clone();
+        let request = FontRequest::new(family.as_ref(), 18.0).expect("request should be valid");
+        let first_shaper = CoreTextShaper::new(catalog.clone(), request.clone());
+        let second_shaper = CoreTextShaper::new(catalog, request.clone());
+        let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1))
+            .expect("source range should be valid");
+        let shape_request =
+            ShapeRequest::new("A", source, VisualRunStyle::Plain, request).expect("request");
+        let shaped =
+            TextShaper::shape(&first_shaper, &shape_request).expect("CoreText should shape");
+        let glyph = shaped
+            .runs()
+            .first()
+            .and_then(|run| run.glyphs().first().map(|glyph| (run.face(), glyph.id())))
+            .expect("shaped glyph");
+        let key = GlyphRasterKey::new(glyph.0, glyph.1, 18.0).expect("glyph key should be valid");
+
+        second_shaper
+            .rasterizer()
+            .rasterize(key)
+            .expect("a recreated shaper must resolve the shared face id");
     }
 
     #[cfg(not(target_os = "macos"))]

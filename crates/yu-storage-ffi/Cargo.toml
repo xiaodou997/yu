@@ -22,6 +22,8 @@ yu-text = { path = "../yu-text" }
 [target.'cfg(target_os = "macos")'.dependencies]
 yu-font = { path = "../yu-font" }
 yu-font-macos = { path = "../../platform/macos/yu-font-macos" }
+yu-render = { path = "../yu-render" }
+yu-workspace = { path = "../yu-workspace" }
 
 [lints]
 workspace = true

@@ -155,6 +155,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检目前只验证矩形 scene 协议，不连接生产 TextKit、glyph atlas 或 Metal surface；Swift 不推导
 block 高度或 Markdown 语义。
 
+验证 CoreText-shaped glyph、CPU atlas page metadata、backend-neutral RenderPlan damage，以及同一
+Revision 的 count/fill/stale 协议（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --visual-render-plan-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+该自检只接收 Rust 返回的 glyph command、page fingerprint 和 damage owned scalars；atlas 像素、
+CoreText 对象、layout cache 与 Metal texture 不穿过 FFI，生产窗口仍使用 source TextKit mirror。
+
 验证 marked-text composition 的 transient projection、visual selection、active caret 与
 Revision/generation 生命周期（不启动窗口）：
 

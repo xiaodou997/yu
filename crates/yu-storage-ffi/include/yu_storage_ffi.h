@@ -371,6 +371,65 @@ typedef struct YuStorageVisualScenePrimitive {
     uint8_t kind;
 } YuStorageVisualScenePrimitive;
 
+enum {
+    YU_STORAGE_RENDER_COMMAND_FILL_RECT = 0,
+    YU_STORAGE_RENDER_COMMAND_GLYPH = 1,
+    YU_STORAGE_RENDER_PAGE_NONE = UINT32_MAX,
+};
+
+typedef struct YuStorageVisualRenderPlanSnapshot {
+    uint64_t revision;
+    uint64_t block_start;
+    uint64_t block_end;
+    uint64_t command_count;
+    uint64_t upload_count;
+    uint64_t damage_count;
+    float content_height;
+    float scroll_y;
+    float viewport_height;
+    float max_scroll_y;
+    float viewport_width;
+} YuStorageVisualRenderPlanSnapshot;
+
+typedef struct YuStorageVisualRenderCommand {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint8_t kind;
+    uint32_t page;
+    uint32_t atlas_x;
+    uint32_t atlas_y;
+    uint32_t atlas_width;
+    uint32_t atlas_height;
+    float origin_x;
+    float origin_y;
+    float bearing_x;
+    float bearing_y;
+    float advance_x;
+    float bounds_x;
+    float bounds_y;
+    float bounds_width;
+    float bounds_height;
+    uint32_t color_rgba;
+} YuStorageVisualRenderCommand;
+
+typedef struct YuStorageVisualRenderPage {
+    uint64_t revision;
+    uint32_t page;
+    uint32_t width;
+    uint32_t height;
+    uint64_t fingerprint;
+} YuStorageVisualRenderPage;
+
+typedef struct YuStorageVisualRenderDamage {
+    uint64_t revision;
+    float x;
+    float y;
+    float width;
+    float height;
+} YuStorageVisualRenderDamage;
+
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
     uint64_t number_of_characters_utf16;
@@ -534,6 +593,14 @@ int32_t yu_storage_session_macos_visual_scene(
     float max_width, float scroll_y, float viewport_height,
     YuStorageVisualSceneSnapshot *snapshot,
     YuStorageVisualScenePrimitive *primitives, size_t capacity, size_t *written);
+int32_t yu_storage_session_macos_visual_render_plan(
+    YuStorageSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height,
+    YuStorageVisualRenderPlanSnapshot *snapshot,
+    YuStorageVisualRenderCommand *commands, size_t command_capacity,
+    YuStorageVisualRenderPage *pages, size_t page_capacity,
+    YuStorageVisualRenderDamage *damage, size_t damage_capacity,
+    size_t *written_commands, size_t *written_pages, size_t *written_damage);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,
