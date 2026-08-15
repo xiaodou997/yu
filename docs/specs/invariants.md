@@ -408,3 +408,7 @@
     的 shaping 坐标必须是临时零基 range，layout 产生的 glyph/cluster 必须映射回 canonical
     replacement range。`EditorDocument::block_layout_with_composition*` 不得写入 LayoutCache，
     composition 更新、cancel 和 stale commit 不得增加 history 或推进 Revision。
+19. `yu_storage_session_macos_visual_scene` 返回的每个 primitive 必须携带同一 Revision、parser-owned
+    block index 和 source UTF-16 range；Rust 必须先通过 `ViewportSceneInput`/`SceneBuilder` 验证
+    顺序、有限矩形和 content bounds，再执行 count/fill。容量不足或 stale Revision 不得发布部分
+    primitive，Swift 不得根据 block kind、source text 或数组位置重新推导 scene geometry。

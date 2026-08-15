@@ -36,6 +36,7 @@ retained scene/GPU 绘制。
 
 ## Track C：Scene and rendering
 
+- [x] Rust `ViewportSceneInput`/`SceneBuilder` 生成 Revision-bound 最小 owned scene snapshot，macOS host 以 count/fill 自检 primitive 顺序、来源范围、坐标和 stale 丢弃（诊断桥，尚未替换生产 renderer）
 - [ ] Visual tree → retained scene primitive
 - [ ] damage/viewport cache 与 Rust revision 发布协议
 - [ ] macOS native GPU surface 只消费 owned scene snapshot

@@ -291,6 +291,52 @@ private struct NativeShapedViewportSnapshot {
     }
 }
 
+private struct NativeVisualSceneSnapshot {
+    let revision: UInt64
+    let blockRange: Range<UInt64>
+    let primitiveCount: Int
+    let contentHeight: CGFloat
+    let scrollY: CGFloat
+    let viewportHeight: CGFloat
+    let maxScrollY: CGFloat
+    let viewportWidth: CGFloat
+
+    init(_ value: YuStorageVisualSceneSnapshot) {
+        revision = value.revision
+        blockRange = value.block_start..<value.block_end
+        primitiveCount = Int(value.primitive_count)
+        contentHeight = CGFloat(value.content_height)
+        scrollY = CGFloat(value.scroll_y)
+        viewportHeight = CGFloat(value.viewport_height)
+        maxScrollY = CGFloat(value.max_scroll_y)
+        viewportWidth = CGFloat(value.viewport_width)
+    }
+}
+
+private struct NativeVisualScenePrimitive {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let sourceRange: NSRange
+    let rect: CGRect
+    let kind: UInt8
+
+    init(_ value: YuStorageVisualScenePrimitive) {
+        revision = value.revision
+        blockIndex = value.block_index
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        rect = CGRect(
+            x: CGFloat(value.x),
+            y: CGFloat(value.y),
+            width: CGFloat(value.width),
+            height: CGFloat(value.height)
+        )
+        kind = value.kind
+    }
+}
+
 private struct NativeVisualViewport {
     let revision: UInt64
     let blockRange: Range<UInt64>
@@ -1090,6 +1136,56 @@ private final class StorageBridge {
         return (
             NativeShapedViewportSnapshot(snapshot),
             values.map(NativeShapedViewportBlock.init)
+        )
+    }
+
+    func macosVisualScene(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float
+    ) throws -> (NativeVisualSceneSnapshot, [NativeVisualScenePrimitive]) {
+        var snapshot = YuStorageVisualSceneSnapshot()
+        var required = 0
+        let sizeStatus = yu_storage_session_macos_visual_scene(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            &snapshot,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        precondition(snapshot.primitive_count == UInt64(required))
+        var values = Array(repeating: YuStorageVisualScenePrimitive(), count: required)
+        var written = required
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_macos_visual_scene(
+                handle,
+                revision,
+                size,
+                maxWidth,
+                scrollY,
+                viewportHeight,
+                &snapshot,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard fillStatus == StorageStatus.ok, written == required else {
+            throw BridgeError.operation(fillStatus)
+        }
+        return (
+            NativeVisualSceneSnapshot(snapshot),
+            values.map(NativeVisualScenePrimitive.init)
         )
     }
 
@@ -3946,6 +4042,95 @@ private func runVisualViewportSelfCheck(path: String) -> Never {
     }
 }
 
+private func runVisualSceneSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let shaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: 2,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(shaped.lineHeight),
+            defaultAdvance: Float(shaped.defaultAdvance),
+            estimatedBlockHeight: Float(shaped.lineHeight),
+            overscan: 0.0
+        )
+
+        let viewportHeight = max(shaped.lineHeight * 2.0, 1.0)
+        let (snapshot, primitives) = try bridge.macosVisualScene(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: Float(viewportHeight)
+        )
+        precondition(snapshot.revision == revision)
+        precondition(snapshot.blockRange.count > 0)
+        precondition(snapshot.primitiveCount == primitives.count)
+        precondition(primitives.count == snapshot.blockRange.count * 2)
+        precondition(abs(snapshot.viewportWidth - CGFloat(maxWidth)) < 0.01)
+        precondition(snapshot.contentHeight >= viewportHeight)
+
+        var previousBlock: UInt64?
+        var previousY: CGFloat?
+        for pair in stride(from: 0, to: primitives.count, by: 2).map({ primitives[$0..<$0 + 2] }) {
+            let background = pair[pair.startIndex]
+            let text = pair[pair.startIndex + 1]
+            precondition(background.kind == YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND)
+            precondition(text.kind == YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS)
+            precondition(background.revision == revision && text.revision == revision)
+            precondition(background.blockIndex == text.blockIndex)
+            precondition(background.sourceRange == text.sourceRange)
+            precondition(background.rect.origin.x >= 0.0)
+            precondition(background.rect.origin.y >= 0.0)
+            precondition(background.rect.width > 0.0)
+            precondition(background.rect.height > 0.0)
+            precondition(text.rect.origin.y >= background.rect.origin.y)
+            precondition(text.rect.maxY <= background.rect.maxY + 0.01)
+            precondition(text.rect.width >= 0.0)
+            precondition(text.rect.width <= background.rect.width + 0.01)
+            precondition(background.rect.maxY <= snapshot.contentHeight + 0.01)
+            if let previousBlock {
+                precondition(background.blockIndex > previousBlock)
+            }
+            if let previousY {
+                precondition(background.rect.origin.y >= previousY)
+            }
+            previousBlock = background.blockIndex
+            previousY = background.rect.origin.y
+        }
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.macosVisualScene(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: Float(viewportHeight)
+            )
+            preconditionFailure("stale visual scene unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        print(
+            "Yu Visual Scene self-check: Rust-owned primitive order, geometry, source ranges "
+                + "and stale Revision rejection are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual Scene self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func unwrapSelfCheck<T>(_ value: T?) throws -> T {
     guard let value else {
         throw BridgeError.operation(14)
@@ -4234,6 +4419,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--shaped-viewport-self-check
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-viewport-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualViewportSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualSceneSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

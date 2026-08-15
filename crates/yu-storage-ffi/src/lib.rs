@@ -30,6 +30,9 @@ use yu_storage::{
 use yu_text::{EditError, TextSnapshot};
 
 #[cfg(target_os = "macos")]
+use yu_scene::{Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput};
+
+#[cfg(target_os = "macos")]
 use yu_font::FontRequest;
 #[cfg(target_os = "macos")]
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
@@ -55,6 +58,9 @@ pub const YU_STORAGE_EXPORT_ERROR: i32 = 17;
 pub const YU_STORAGE_HTML_IMPORT_REJECTED: i32 = 18;
 pub const YU_STORAGE_CORE_TEXT_UNAVAILABLE: i32 = 19;
 pub const YU_STORAGE_INVALID_VIEWPORT_CONFIG: i32 = 20;
+
+pub const YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND: u8 = 0;
+pub const YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS: u8 = 1;
 
 pub const YU_STORAGE_KEY_CHARACTER: u8 = 0;
 pub const YU_STORAGE_KEY_ENTER: u8 = 1;
@@ -388,6 +394,41 @@ pub struct YuStorageCaretScrollRequest {
     pub target_scroll_y: f32,
     pub margin: f32,
     pub needs_scroll: u8,
+}
+
+/// A revision-bound, owned scene snapshot for the native visual-rendering
+/// diagnostic bridge. The scene is assembled by Rust's `ViewportSceneInput`
+/// and `SceneBuilder`; no parser, layout or native object crosses the ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageVisualSceneSnapshot {
+    pub revision: u64,
+    pub block_start: u64,
+    pub block_end: u64,
+    pub primitive_count: u64,
+    pub content_height: f32,
+    pub scroll_y: f32,
+    pub viewport_height: f32,
+    pub max_scroll_y: f32,
+    pub viewport_width: f32,
+}
+
+/// One owned, revision-bound scene primitive. The first implementation uses
+/// rectangle primitives for block backgrounds and text ink bounds; glyph and
+/// image payloads will be added only after this native ownership boundary is
+/// proven. Source ranges remain UTF-16 for direct AppKit validation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageVisualScenePrimitive {
+    pub revision: u64,
+    pub block_index: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub kind: u8,
 }
 
 /// Revision-bound source coordinates used by the native Accessibility adapter.
@@ -3102,6 +3143,257 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_viewport_blocks(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_visual_scene(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+) -> Result<
+    (
+        YuStorageVisualSceneSnapshot,
+        Vec<YuStorageVisualScenePrimitive>,
+    ),
+    i32,
+> {
+    validate_revision(&session.session, expected_revision)?;
+    if !size.is_finite()
+        || size <= 0.0
+        || !max_width.is_finite()
+        || max_width <= 0.0
+        || !scroll_y.is_finite()
+        || scroll_y < 0.0
+        || !viewport_height.is_finite()
+        || viewport_height <= 0.0
+    {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let (shaper, metrics, _layout_config) = core_text_system_ui_layout(size, max_width)?;
+    let viewport_config = session.session.viewport_config();
+    let layout_config = viewport_config.layout();
+    if (layout_config.max_width() - max_width).abs() > 0.05
+        || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
+        || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
+    {
+        return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
+    }
+
+    let viewport = ViewportRect::new(scroll_y, viewport_height);
+    let viewport_snapshot = session
+        .session
+        .visible_blocks_with_shaper(viewport, &shaper)
+        .map_err(storage_status)?;
+    let revision = viewport_snapshot.revision();
+    let source = session.session.snapshot();
+    let geometries = viewport_snapshot
+        .blocks()
+        .iter()
+        .copied()
+        .map(|block| {
+            ViewportBlockGeometry::new(
+                revision,
+                block.index(),
+                block.source(),
+                block.y(),
+                block.height(),
+                block.is_measured(),
+                viewport_block_kind(block.kind()),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let input = ViewportSceneInput::new(
+        revision,
+        viewport_snapshot.range().start()..viewport_snapshot.range().end(),
+        viewport_snapshot.content_height(),
+        geometries,
+    )
+    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let scene_height = viewport_snapshot
+        .content_height()
+        .max(viewport_height)
+        .max(1.0);
+    let scene_viewport =
+        Rect::new(0.0, 0.0, max_width, scene_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let mut builder =
+        SceneBuilder::new(revision, scene_viewport).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let mut metadata = Vec::with_capacity(input.blocks().len().saturating_mul(2));
+
+    for geometry in input.blocks().iter().copied() {
+        let source_start_utf16 = source
+            .utf16_offset(geometry.source().start())
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+            .get();
+        let source_end_utf16 = source
+            .utf16_offset(geometry.source().end())
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+            .get();
+
+        let background = Rect::new(0.0, geometry.y(), max_width, geometry.height())
+            .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+        builder
+            .fill_rect(background, Rgba8::new(246, 247, 249, 255))
+            .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+        metadata.push((
+            YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND,
+            geometry.index(),
+            source_start_utf16,
+            source_end_utf16,
+        ));
+
+        let source_len = source_end_utf16.saturating_sub(source_start_utf16);
+        let source_len = u32::try_from(source_len.min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        let text_width = if source_len == 0 {
+            0.0
+        } else {
+            (source_len as f32 * metrics.default_advance())
+                .min(max_width)
+                .max(metrics.default_advance().min(max_width))
+        };
+        let text_height = geometry.height().min(metrics.line_height());
+        let text_y = geometry.y() + (geometry.height() - text_height) * 0.5;
+        let text_bounds =
+            Rect::new(0.0, text_y, text_width, text_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+        builder
+            .fill_rect(text_bounds, Rgba8::new(32, 35, 40, 255))
+            .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+        metadata.push((
+            YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS,
+            geometry.index(),
+            source_start_utf16,
+            source_end_utf16,
+        ));
+    }
+
+    let scene = builder.finish();
+    if scene.primitives().len() != metadata.len() {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let mut primitives = Vec::with_capacity(scene.primitives().len());
+    for (primitive, (kind, block_index, source_start_utf16, source_end_utf16)) in
+        scene.primitives().iter().copied().zip(metadata)
+    {
+        let bounds = primitive.bounds();
+        primitives.push(YuStorageVisualScenePrimitive {
+            revision: scene.revision().get(),
+            block_index: u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+            source_start_utf16,
+            source_end_utf16,
+            x: bounds.x(),
+            y: bounds.y(),
+            width: bounds.width(),
+            height: bounds.height(),
+            kind,
+        });
+    }
+    let block_start = u64::try_from(viewport_snapshot.range().start())
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let block_end =
+        u64::try_from(viewport_snapshot.range().end()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let primitive_count =
+        u64::try_from(primitives.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let snapshot = YuStorageVisualSceneSnapshot {
+        revision: scene.revision().get(),
+        block_start,
+        block_end,
+        primitive_count,
+        content_height: viewport_snapshot.content_height(),
+        scroll_y,
+        viewport_height,
+        max_scroll_y: (viewport_snapshot.content_height() - viewport_height).max(0.0),
+        viewport_width: max_width,
+    };
+    Ok((snapshot, primitives))
+}
+
+/// Returns a count/fill owned scene snapshot assembled by Rust's retained
+/// scene boundary. This is intentionally a diagnostic bridge: Swift receives
+/// validated rectangle scalars and source ranges, while glyph/image payloads
+/// remain in the Rust scene/renderer pipeline until a later phase.
+///
+/// # Safety
+/// `session` must be null or a live handle. `snapshot` and `written` must
+/// point to writable values. `primitives` must point to `capacity` writable
+/// values when `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_visual_scene(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    snapshot: *mut YuStorageVisualSceneSnapshot,
+    primitives: *mut YuStorageVisualScenePrimitive,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if snapshot.is_null() || written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && primitives.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output pointers were checked for null and belong to the caller.
+    unsafe {
+        *snapshot = YuStorageVisualSceneSnapshot::default();
+        *written = 0;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            primitives,
+            capacity,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let (header, encoded) = match macos_visual_scene(
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+        ) {
+            Ok(scene) => scene,
+            Err(status) => return status,
+        };
+        // SAFETY: output pointers were checked above and belong to the caller.
+        unsafe {
+            *snapshot = header;
+            *written = encoded.len();
+        }
+        if capacity == 0 && primitives.is_null() {
+            return YU_STORAGE_OK;
+        }
+        if encoded.len() > capacity {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+        if !encoded.is_empty() {
+            // SAFETY: capacity was checked against the encoded primitive count.
+            unsafe {
+                ptr::copy_nonoverlapping(encoded.as_ptr(), primitives, encoded.len());
+            }
+        }
+        YU_STORAGE_OK
+    }
+}
+
 /// Resolves the current focus caret through the macOS CoreText-shaped
 /// viewport policy. `caret_y` is document-space, while `current_scroll_y` and
 /// `target_scroll_y` are absolute document scroll offsets. The native host
@@ -4493,6 +4785,157 @@ mod tests {
             YU_STORAGE_STALE_REVISION
         );
         assert_eq!(snapshot, YuStorageShapedViewportSnapshot::default());
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_visual_scene_is_owned_count_fill_and_revision_bound() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-scene-{id}.md"));
+        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n\n- [ ] 任务\n\n```rust\nfn main() {}\n```\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut snapshot = YuStorageVisualSceneSnapshot::default();
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(required >= 2);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.primitive_count, required as u64);
+        assert_eq!(snapshot.viewport_width, 500.0);
+        assert_eq!(
+            snapshot.block_end - snapshot.block_start,
+            (required / 2) as u64
+        );
+
+        let mut too_small = vec![YuStorageVisualScenePrimitive::default(); required - 1];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    too_small.as_mut_ptr(),
+                    too_small.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+        assert_eq!(written, required);
+        assert!(
+            too_small
+                .iter()
+                .all(|primitive| *primitive == YuStorageVisualScenePrimitive::default())
+        );
+
+        let mut primitives = vec![YuStorageVisualScenePrimitive::default(); required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    primitives.as_mut_ptr(),
+                    primitives.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, required);
+        assert!(primitives.windows(2).step_by(2).all(|pair| {
+            pair[0].kind == YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND
+                && pair[1].kind == YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS
+                && pair[0].revision == 0
+                && pair[1].revision == 0
+                && pair[0].block_index == pair[1].block_index
+                && pair[0].source_start_utf16 == pair[1].source_start_utf16
+                && pair[0].source_end_utf16 == pair[1].source_end_utf16
+                && pair[0].width == 500.0
+                && pair[0].height > 0.0
+                && pair[1].y >= pair[0].y
+                && pair[1].width <= pair[0].width
+        }));
+        assert!(
+            primitives.windows(2).all(|pair| {
+                pair[0].y <= pair[1].y || pair[0].block_index == pair[1].block_index
+            })
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(snapshot, YuStorageVisualSceneSnapshot::default());
+        assert_eq!(required, 0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

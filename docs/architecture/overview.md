@@ -412,6 +412,14 @@ scalar，过期 viewport 与容量不足均不能污染 native 数组。
 target，不保存 Rust 高度索引。visual mirror self-check 已验证 document↔viewport round-trip、
 caret reveal 和 stale Revision 拒绝，生产 source TextKit mirror 仍不切换该路径。
 
+在此坐标契约之上，`yu_storage_session_macos_visual_scene` 做一次更窄的 retained-scene handoff：
+Rust 将同一 shaped viewport 转为 `ViewportBlockGeometry`，交给 `yu-scene::ViewportSceneInput` 和
+`SceneBuilder`，为每个可见 block 生成背景与文本 ink bounds 两个最小 rectangle primitive。FFI
+只返回 owned Revision、block/source range、kind、矩形和 primitive count；Swift 的
+`--visual-scene-self-check` 验证 painter order、同一 block 的来源范围、document-space bounds、
+count/fill 容量保护和 stale Revision 丢弃。它是 Track C 的协议探针，不是生产 TextKit/Metal 路径，
+也不跨边界暴露 glyph atlas、layout 或 GPU handle。见 ADR 0117。
+
 随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
 `ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16
 range、document-space block origin/height、measured 和稳定 kind tag。它只复制 owned scalar，
