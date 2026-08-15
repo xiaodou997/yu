@@ -166,6 +166,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检只接收 Rust 返回的 glyph command、page fingerprint 和 damage owned scalars；atlas 像素、
 CoreText 对象、layout cache 与 Metal texture 不穿过 FFI，生产窗口仍使用 source TextKit mirror。
 
+验证 macOS document host 复用 Rust-owned CoreText/CPU atlas/publication state，并覆盖重复 frame、
+scroll、resize、surface generation 与编辑后的 stale Revision（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --macos-render-host-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+这个 self-check 只返回 lifecycle scalar；它不启动可视化演示模式，也不替换生产 TextKit source
+mirror。完整 native visual view/Metal submit 会在后续阶段接入。
+
 验证 marked-text composition 的 transient projection、visual selection、active caret 与
 Revision/generation 生命周期（不启动窗口）：
 

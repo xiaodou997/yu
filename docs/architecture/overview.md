@@ -443,6 +443,14 @@ origin，绝不根据 kind 或 source 重新布局。这样 FFI/native host、ed
 因此 macOS host 不需要复制 Markdown block traversal、HeightIndex 或 layout cache，后续窗口/Metal
 层只消费 `ViewportSceneFrame`/`RenderPlan`。
 
+当前 document-host 诊断桥还提供 `yu_storage_session_macos_render_host_frame`。`YuStorageSession`
+在 macOS 上懒持有 `CoreTextViewportFrameBuilder` 与 `MetalViewportHostSession`，因此同一个 handle
+可以跨首次绘制、重复绘制、scroll、resize 和编辑保留 CPU atlas、RenderPlan fingerprint、publication
+serial、Revision 与 surface generation。Swift 只收到 frame/viewport/atlas 统计等 owned scalar，旧
+Revision、回退 generation 或失败 publication 不会污染 host state；这个入口目前只由无窗口
+`--macos-render-host-self-check` 使用，生产 TextKit source mirror 和窗口 renderer 尚未切换。见
+ADR 0120。
+
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
 文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
 编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、

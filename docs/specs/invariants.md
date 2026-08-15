@@ -434,3 +434,8 @@
 3. `publish_and_submit` 必须保持 `CoreText preparation → publication/revision gate → MetalAtlas
    sync → MetalFrameRenderer::render_plan → consumer commit` 顺序；任何 preparation、stale、atlas、
    native 或 drawable 失败都不得推进 host 的 last submission 或 consumer Revision。
+4. macOS document-host FFI 的 persistent render state 可以持有
+   `CoreTextViewportFrameBuilder` 与 `MetalViewportHostSession`，但不得持有 `EditorDocument`、
+   source、selection、history 或 AppKit/GPU handle；每次 host frame 都必须先验证 expected
+   Revision，再同步 surface generation、发布当前 document frame，最后只返回 owned scalar
+   metadata。surface generation 与 frame serial 不得回退，stale Revision 不得污染 snapshot。

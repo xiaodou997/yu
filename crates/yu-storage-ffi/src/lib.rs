@@ -42,6 +42,10 @@ use yu_font::FontRequest;
 use yu_font::{GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer};
 #[cfg(target_os = "macos")]
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
+#[cfg(target_os = "macos")]
+use yu_render_macos::{
+    CoreTextViewportFrameBuilder, CoreTextViewportFrameError, MetalViewportHostSession,
+};
 
 pub const YU_STORAGE_OK: i32 = 0;
 pub const YU_STORAGE_NULL_POINTER: i32 = 1;
@@ -64,6 +68,7 @@ pub const YU_STORAGE_EXPORT_ERROR: i32 = 17;
 pub const YU_STORAGE_HTML_IMPORT_REJECTED: i32 = 18;
 pub const YU_STORAGE_CORE_TEXT_UNAVAILABLE: i32 = 19;
 pub const YU_STORAGE_INVALID_VIEWPORT_CONFIG: i32 = 20;
+pub const YU_STORAGE_RENDER_HOST_UNAVAILABLE: i32 = 21;
 
 pub const YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND: u8 = 0;
 pub const YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS: u8 = 1;
@@ -513,6 +518,31 @@ pub struct YuStorageVisualRenderDamage {
     pub height: f32,
 }
 
+/// Revision-bound state published by the persistent macOS render host. This
+/// is a scalar lifecycle contract: command/page bytes remain owned by Rust's
+/// frame and atlas caches, while the native host can observe whether an edit,
+/// scroll, resize or atlas miss produced a new frame.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageMacosRenderHostSnapshot {
+    pub revision: u64,
+    pub frame_revision: u64,
+    pub surface_generation: u64,
+    pub frame_serial: u64,
+    pub command_count: u64,
+    pub upload_count: u64,
+    pub damage_count: u64,
+    pub atlas_page_count: u64,
+    pub atlas_glyph_count: u64,
+    pub atlas_bytes: u64,
+    pub content_height: f32,
+    pub scroll_y: f32,
+    pub viewport_height: f32,
+    pub max_scroll_y: f32,
+    pub viewport_width: f32,
+    pub published: u8,
+}
+
 /// Revision-bound source coordinates used by the native Accessibility adapter.
 /// The snapshot is intentionally compact: text and line contents are queried
 /// separately through the existing expected-revision source-range API.
@@ -609,9 +639,18 @@ pub struct YuStorageCompositionState {
     pub active: u8,
 }
 
+#[cfg(target_os = "macos")]
+struct MacosRenderHostState {
+    builder: CoreTextViewportFrameBuilder,
+    host: MetalViewportHostSession,
+    size: f32,
+}
+
 #[repr(C)]
 pub struct YuStorageSession {
     session: DocumentEditorSession,
+    #[cfg(target_os = "macos")]
+    macos_render_host: Option<MacosRenderHostState>,
 }
 
 fn read_utf8<'a>(pointer: *const u8, length: usize) -> Result<&'a str, i32> {
@@ -1989,7 +2028,11 @@ pub unsafe extern "C" fn yu_storage_session_open(
         Ok(session) => session,
         Err(error) => return status_from_error(error),
     };
-    let session = Box::new(YuStorageSession { session });
+    let session = Box::new(YuStorageSession {
+        session,
+        #[cfg(target_os = "macos")]
+        macos_render_host: None,
+    });
     // SAFETY: the pointer is transferred to the native caller as an opaque
     // handle and is reclaimed only by `yu_storage_session_destroy`.
     unsafe { *output = Box::into_raw(session) };
@@ -3399,6 +3442,185 @@ type MacosVisualRenderPlan = (
 );
 
 #[cfg(target_os = "macos")]
+fn macos_render_host_error_status(error: &CoreTextViewportFrameError) -> i32 {
+    match error {
+        CoreTextViewportFrameError::InvalidConfig(_) => YU_STORAGE_INVALID_VIEWPORT_CONFIG,
+        CoreTextViewportFrameError::Font(_) | CoreTextViewportFrameError::Raster(_) => {
+            YU_STORAGE_CORE_TEXT_UNAVAILABLE
+        }
+        CoreTextViewportFrameError::Document(error) => status_from_editor_error(error.clone()),
+        CoreTextViewportFrameError::Atlas(_)
+        | CoreTextViewportFrameError::Publish(_)
+        | CoreTextViewportFrameError::Host(_) => YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_render_host_config(
+    viewport: ViewportRect,
+    size: f32,
+    max_width: f32,
+    viewport_height: f32,
+) -> Result<ViewportRenderConfig, i32> {
+    let scene_height = viewport_height.max(1.0);
+    let scene_viewport =
+        Rect::new(0.0, 0.0, max_width, scene_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    Ok(ViewportRenderConfig::new(
+        viewport,
+        size,
+        scene_viewport,
+        Rgba8::black(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_render_host_snapshot(
+    state: &MacosRenderHostState,
+) -> Result<YuStorageMacosRenderHostSnapshot, i32> {
+    let publication = state
+        .builder
+        .last_publication()
+        .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    let frame = publication.frame();
+    let plan = frame.plan();
+    let config = state.builder.config();
+    let input = frame.scene().input();
+    let frame_revision = state
+        .host
+        .frame_revision()
+        .map_or(u64::MAX, |revision| revision.get());
+    let frame_serial = state.host.frame_serial().unwrap_or(u64::MAX);
+    Ok(YuStorageMacosRenderHostSnapshot {
+        revision: publication.revision().get(),
+        frame_revision,
+        surface_generation: state.host.surface_generation(),
+        frame_serial,
+        command_count: u64::try_from(plan.commands().len())
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+        upload_count: u64::try_from(plan.uploads().len())
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+        damage_count: u64::try_from(plan.damage().len())
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+        atlas_page_count: u64::try_from(state.builder.atlas_page_count())
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+        atlas_glyph_count: u64::try_from(state.builder.atlas_glyph_count())
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+        atlas_bytes: u64::try_from(state.builder.atlas_bytes())
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+        content_height: input.content_height(),
+        scroll_y: config.viewport().scroll_y(),
+        viewport_height: config.viewport().height(),
+        max_scroll_y: (input.content_height() - config.viewport().height()).max(0.0),
+        viewport_width: config.scene_viewport().width(),
+        published: 1,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_render_host_frame(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    surface_generation: u64,
+) -> Result<YuStorageMacosRenderHostSnapshot, i32> {
+    validate_revision(&session.session, expected_revision)?;
+    if !size.is_finite()
+        || size <= 0.0
+        || !max_width.is_finite()
+        || max_width <= 0.0
+        || !scroll_y.is_finite()
+        || scroll_y < 0.0
+        || !viewport_height.is_finite()
+        || viewport_height <= 0.0
+    {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let rebuild = session
+        .macos_render_host
+        .as_ref()
+        .is_none_or(|state| (state.size - size).abs() > 0.001);
+    let (metrics, shaper) = if rebuild {
+        let (shaper, metrics, _layout_config) = core_text_system_ui_layout(size, max_width)?;
+        (metrics, Some(shaper))
+    } else {
+        let state = session
+            .macos_render_host
+            .as_ref()
+            .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+        let metrics = state
+            .builder
+            .shaper()
+            .viewport_metrics("M中🙂e\u{301}")
+            .map_err(|_| YU_STORAGE_CORE_TEXT_UNAVAILABLE)?;
+        (metrics, None)
+    };
+    let viewport_config = session.session.viewport_config();
+    let layout_config = viewport_config.layout();
+    if (layout_config.max_width() - max_width).abs() > 0.05
+        || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
+        || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
+    {
+        return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
+    }
+
+    let viewport = ViewportRect::new(scroll_y, viewport_height);
+    let config = macos_render_host_config(viewport, size, max_width, viewport_height)?;
+    let revision = session.session.revision();
+    if session
+        .macos_render_host
+        .as_ref()
+        .is_some_and(|state| surface_generation < state.host.surface_generation())
+    {
+        return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+    }
+    if rebuild {
+        let builder = CoreTextViewportFrameBuilder::with_shaper(
+            shaper.ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+            config,
+            GlyphAtlasConfig::default(),
+        )
+        .map_err(|error| macos_render_host_error_status(&error))?;
+        session.macos_render_host = Some(MacosRenderHostState {
+            builder,
+            host: MetalViewportHostSession::new(revision, surface_generation),
+            size,
+        });
+    }
+
+    let state = session
+        .macos_render_host
+        .as_mut()
+        .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    state
+        .host
+        .advance_revision(revision)
+        .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    state
+        .host
+        .sync_surface_generation(surface_generation)
+        .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    state
+        .builder
+        .update_config(config)
+        .map_err(|error| macos_render_host_error_status(&error))?;
+    let publication = {
+        let document = session.session.document_mut().editor_mut();
+        state
+            .builder
+            .publish(document)
+            .map_err(|error| macos_render_host_error_status(&error))?
+    };
+    state
+        .host
+        .accept_publication(publication)
+        .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    macos_render_host_snapshot(state)
+}
+
+#[cfg(target_os = "macos")]
 fn macos_visual_render_plan(
     session: &mut YuStorageSession,
     expected_revision: u64,
@@ -3709,6 +3931,69 @@ pub unsafe extern "C" fn yu_storage_session_macos_visual_render_plan(
                 ptr::copy_nonoverlapping(encoded_damage.as_ptr(), damage, encoded_damage.len());
             }
         }
+        YU_STORAGE_OK
+    }
+}
+
+/// Advances the persistent Rust-owned macOS render host through one viewport
+/// event. The host retains CoreText shaping, CPU atlas, render-plan
+/// fingerprints and revision/surface-generation state across calls. Native
+/// code receives only scalar publication metadata; it does not own a second
+/// document, atlas or frame cache.
+///
+/// # Safety
+/// `session` must be a live handle and `snapshot` must point to writable
+/// storage for one value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    surface_generation: u64,
+    snapshot: *mut YuStorageMacosRenderHostSnapshot,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if snapshot.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `snapshot` is a caller-owned output pointer checked above.
+    unsafe { *snapshot = YuStorageMacosRenderHostSnapshot::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            surface_generation,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let value = match macos_render_host_frame(
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            surface_generation,
+        ) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        // SAFETY: `snapshot` is a caller-owned output pointer checked above.
+        unsafe { *snapshot = value };
         YU_STORAGE_OK
     }
 }
@@ -4350,6 +4635,8 @@ mod tests {
         let editor_session = DocumentEditorSession::open(&path).expect("open");
         let session = YuStorageSession {
             session: editor_session,
+            #[cfg(target_os = "macos")]
+            macos_render_host: None,
         };
         assert_eq!(
             close_state(session.session.close_state()),
@@ -5549,6 +5836,152 @@ mod tests {
         assert_eq!(written_commands, 0);
         assert_eq!(written_pages, 0);
         assert_eq!(written_damage, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_render_host_reuses_state_across_viewport_events() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-host-{id}.md"));
+        fs::write(&path, "# 羽🙂\n\nparagraph 日本語 **bold**\n\n- [ ] task\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut first = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw, 0, 14.0, 500.0, 0.0, 240.0, 0, &mut first,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(first.revision, 0);
+        assert_eq!(first.frame_revision, 0);
+        assert_eq!(first.surface_generation, 0);
+        assert_eq!(first.frame_serial, 1);
+        assert!(first.command_count > 0);
+        assert!(first.upload_count > 0);
+        assert!(first.damage_count > 0);
+        assert!(first.atlas_page_count > 0);
+        assert!(first.atlas_glyph_count > 0);
+        assert!(first.published != 0);
+
+        let mut repeated = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    &mut repeated,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(repeated.frame_serial > first.frame_serial);
+        assert_eq!(repeated.atlas_page_count, first.atlas_page_count);
+        assert_eq!(repeated.atlas_glyph_count, first.atlas_glyph_count);
+        assert_eq!(repeated.upload_count, 0);
+
+        let mut resized = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    12.0,
+                    180.0,
+                    1,
+                    &mut resized,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(resized.surface_generation, 1);
+        assert_eq!(resized.scroll_y, 12.0);
+        assert_eq!(resized.viewport_height, 180.0);
+        assert!(resized.frame_serial > repeated.frame_serial);
+
+        let mut regressed_generation = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    &mut regressed_generation,
+                )
+            },
+            YU_STORAGE_RENDER_HOST_UNAVAILABLE
+        );
+        assert_eq!(
+            regressed_generation,
+            YuStorageMacosRenderHostSnapshot::default()
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        let mut stale = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw, 0, 14.0, 500.0, 0.0, 240.0, 1, &mut stale,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(stale, YuStorageMacosRenderHostSnapshot::default());
+
+        let mut next = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw, 1, 14.0, 500.0, 0.0, 240.0, 1, &mut next,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(next.revision, 1);
+        assert_eq!(next.frame_revision, 1);
+        assert_eq!(next.surface_generation, 1);
+        assert!(next.frame_serial > resized.frame_serial);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

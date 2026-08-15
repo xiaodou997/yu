@@ -167,6 +167,30 @@ impl CoreTextViewportFrameBuilder {
             .map_err(CoreTextViewportFrameError::Publish)
     }
 
+    /// Updates the viewport/scene inputs while retaining the CoreText shaper,
+    /// CPU atlas, page-fingerprint cache and publication serial. The font
+    /// size is part of a glyph raster key, so callers must recreate the
+    /// builder when it changes rather than mixing sizes in one host state.
+    pub fn update_config(
+        &mut self,
+        config: ViewportRenderConfig,
+    ) -> Result<bool, CoreTextViewportFrameError> {
+        let font_size = config.font_size();
+        if !font_size.is_finite() || font_size <= 0.0 {
+            return Err(CoreTextViewportFrameError::InvalidConfig(
+                "CoreText viewport font size must be finite and positive",
+            ));
+        }
+        if (self.shaper.request().size() - font_size).abs() > 0.001 {
+            return Err(CoreTextViewportFrameError::InvalidConfig(
+                "CoreText shaper size must match viewport font size",
+            ));
+        }
+        let changed = self.config != config;
+        self.config = config;
+        Ok(changed)
+    }
+
     /// Prepares, accepts and submits one current document frame through the
     /// existing revision-aware Metal host state machine.
     pub fn publish_and_submit(
@@ -187,6 +211,14 @@ impl CoreTextViewportFrameBuilder {
     #[must_use]
     pub const fn config(&self) -> ViewportRenderConfig {
         self.config
+    }
+
+    /// Borrows the persistent CoreText shaper for host-side metrics checks.
+    /// The shaper remains owned by this builder; callers cannot replace it or
+    /// move native CoreText state across the boundary.
+    #[must_use]
+    pub const fn shaper(&self) -> &CoreTextShaper {
+        &self.shaper
     }
 
     #[must_use]

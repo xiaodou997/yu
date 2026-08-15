@@ -26,6 +26,7 @@ enum {
     YU_STORAGE_HTML_IMPORT_REJECTED = 18,
     YU_STORAGE_CORE_TEXT_UNAVAILABLE = 19,
     YU_STORAGE_INVALID_VIEWPORT_CONFIG = 20,
+    YU_STORAGE_RENDER_HOST_UNAVAILABLE = 21,
 };
 
 enum {
@@ -430,6 +431,29 @@ typedef struct YuStorageVisualRenderDamage {
     float height;
 } YuStorageVisualRenderDamage;
 
+/* Scalar lifecycle state owned by the persistent Rust macOS render host.
+ * UINT64_MAX in frame_revision/frame_serial means that no frame has been
+ * accepted for the current Revision yet. Render commands and atlas bytes
+ * remain Rust-owned; this snapshot is for native lifecycle coordination. */
+typedef struct YuStorageMacosRenderHostSnapshot {
+    uint64_t revision;
+    uint64_t frame_revision;
+    uint64_t surface_generation;
+    uint64_t frame_serial;
+    uint64_t command_count;
+    uint64_t upload_count;
+    uint64_t damage_count;
+    uint64_t atlas_page_count;
+    uint64_t atlas_glyph_count;
+    uint64_t atlas_bytes;
+    float content_height;
+    float scroll_y;
+    float viewport_height;
+    float max_scroll_y;
+    float viewport_width;
+    uint8_t published;
+} YuStorageMacosRenderHostSnapshot;
+
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
     uint64_t number_of_characters_utf16;
@@ -601,6 +625,10 @@ int32_t yu_storage_session_macos_visual_render_plan(
     YuStorageVisualRenderPage *pages, size_t page_capacity,
     YuStorageVisualRenderDamage *damage, size_t damage_capacity,
     size_t *written_commands, size_t *written_pages, size_t *written_damage);
+int32_t yu_storage_session_macos_render_host_frame(
+    YuStorageSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height,
+    uint64_t surface_generation, YuStorageMacosRenderHostSnapshot *snapshot);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,
