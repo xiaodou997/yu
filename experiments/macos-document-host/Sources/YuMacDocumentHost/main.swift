@@ -107,6 +107,47 @@ private struct NativeProjectionSelection {
     }
 }
 
+private struct NativeProjectionSourceCaret {
+    let revision: UInt64
+    let visualUTF16: UInt64
+    let sourceUTF16: UInt64
+    let roundTripVisualUTF16: UInt64
+    let affinity: UInt8
+
+    init(_ value: YuStorageProjectionSourceCaret) {
+        revision = value.revision
+        visualUTF16 = value.visual_utf16
+        sourceUTF16 = value.source_utf16
+        roundTripVisualUTF16 = value.round_trip_visual_utf16
+        affinity = value.affinity
+    }
+}
+
+private struct NativeProjectionSourceSelection {
+    let revision: UInt64
+    let visualRange: NSRange
+    let sourceRange: NSRange
+    let roundTripVisualRange: NSRange
+    let affinity: UInt8
+
+    init(_ value: YuStorageProjectionSourceSelection) {
+        revision = value.revision
+        visualRange = NSRange(
+            location: Int(value.visual_start_utf16),
+            length: Int(value.visual_end_utf16 - value.visual_start_utf16)
+        )
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        roundTripVisualRange = NSRange(
+            location: Int(value.round_trip_visual_start_utf16),
+            length: Int(value.round_trip_visual_end_utf16 - value.round_trip_visual_start_utf16)
+        )
+        affinity = value.affinity
+    }
+}
+
 private struct NativeProjectionHit {
     let revision: UInt64
     let sourceUTF16: UInt64
@@ -720,6 +761,45 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeProjectionSelection(value)
+    }
+
+    func projectionSourceCaret(
+        revision: UInt64,
+        visualUTF16: UInt64,
+        affinity: UInt8
+    ) throws -> NativeProjectionSourceCaret {
+        var value = YuStorageProjectionSourceCaret()
+        let status = yu_storage_session_projection_source_caret(
+            handle,
+            revision,
+            visualUTF16,
+            affinity,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeProjectionSourceCaret(value)
+    }
+
+    func projectionSourceSelection(
+        revision: UInt64,
+        visualRange: NSRange,
+        affinity: UInt8
+    ) throws -> NativeProjectionSourceSelection {
+        var value = YuStorageProjectionSourceSelection()
+        let status = yu_storage_session_projection_source_selection(
+            handle,
+            revision,
+            UInt64(visualRange.location),
+            UInt64(visualRange.location + visualRange.length),
+            affinity,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeProjectionSourceSelection(value)
     }
 
     func projectionHitTest(
@@ -2925,6 +3005,81 @@ private func runProjectionHitTestSelfCheck(path: String) -> Never {
     }
 }
 
+private func runVisualMirrorSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let projected = try bridge.projectedSource(revision: revision)
+        let mirrorStorage = NSTextStorage(string: projected)
+        let mirrorLayout = NSLayoutManager()
+        let mirrorContainer = NSTextContainer(
+            size: NSSize(width: 500.0, height: CGFloat.greatestFiniteMagnitude)
+        )
+        mirrorContainer.lineFragmentPadding = 0.0
+        mirrorLayout.addTextContainer(mirrorContainer)
+        mirrorStorage.addLayoutManager(mirrorLayout)
+        precondition(mirrorStorage.string == projected)
+
+        let sourceStrong = (bridge.source as NSString).range(of: "**粗体**")
+        let visualStrong = (projected as NSString).range(of: "粗体")
+        precondition(sourceStrong.location != NSNotFound)
+        precondition(visualStrong.location != NSNotFound)
+        let glyphRange = mirrorLayout.glyphRange(
+            forCharacterRange: visualStrong,
+            actualCharacterRange: nil
+        )
+        precondition(glyphRange.length > 0)
+
+        let forward = try bridge.projectionSelection(
+            revision: revision,
+            sourceRange: sourceStrong,
+            affinity: 1
+        )
+        precondition(forward.visualRange == visualStrong)
+        let reverse = try bridge.projectionSourceSelection(
+            revision: revision,
+            visualRange: visualStrong,
+            affinity: 1
+        )
+        precondition(reverse.revision == revision)
+        precondition(reverse.visualRange == visualStrong)
+        precondition(reverse.sourceRange == sourceStrong)
+        precondition(reverse.roundTripVisualRange == visualStrong)
+
+        let visualCaret = try bridge.projectionSourceCaret(
+            revision: revision,
+            visualUTF16: UInt64(visualStrong.location),
+            affinity: 0
+        )
+        precondition(visualCaret.revision == revision)
+        precondition(visualCaret.sourceUTF16 == UInt64(sourceStrong.location))
+        precondition(visualCaret.roundTripVisualUTF16 == UInt64(visualStrong.location))
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.projectionSourceSelection(
+                revision: revision,
+                visualRange: visualStrong,
+                affinity: 1
+            )
+            preconditionFailure("stale visual mirror mapping unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        // The native mirror remains a disposable old-revision snapshot; it is
+        // not silently patched after Rust source changes.
+        precondition(mirrorStorage.string == projected)
+        print(
+            "Yu Visual Mirror self-check: TextKit visual UTF-16 range "
+                + "\(visualStrong) ↔ source range \(sourceStrong); stale mirror rejected"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual Mirror self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runBlockProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -3402,6 +3557,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--projection-hit-test-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runProjectionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-mirror-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualMirrorSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

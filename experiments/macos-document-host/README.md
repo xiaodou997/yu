@@ -100,6 +100,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检使用 Rust 返回的 visual selection 和 projection-local point，不在 Swift 重建 Markdown delimiter
 或布局；stale Revision 会被拒绝，命中结果只携带 layout-local 坐标，尚未接入生产 TextKit mirror。
 
+验证 TextKit 过渡镜像接收 Rust projected UTF-8，并通过 Rust reverse mapping 完成 visual/source
+selection、caret 双向 round-trip 与 stale Revision 拒绝（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --visual-mirror-self-check experiments/macos-document-host/Fixtures/projection.md
+```
+
+该自检中的 `NSTextStorage`/`NSLayoutManager` 只是一份可丢弃的 visual view cache；生产窗口仍使用
+canonical source mirror，尚未改变 IME、复制粘贴或 Accessibility 路径。
+
 验证 parser-owned block 的 metrics layout、macOS CoreText shaped layout 与 block-local caret（不启动窗口）：
 
 ```bash

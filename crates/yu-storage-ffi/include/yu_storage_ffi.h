@@ -190,6 +190,28 @@ typedef struct YuStorageProjectionSelection {
     uint8_t affinity;
 } YuStorageProjectionSelection;
 
+/* Reverse caret mapping for a native visual mirror. All offsets are UTF-16. */
+typedef struct YuStorageProjectionSourceCaret {
+    uint64_t revision;
+    uint64_t visual_utf16;
+    uint64_t source_utf16;
+    uint64_t round_trip_visual_utf16;
+    uint8_t affinity;
+} YuStorageProjectionSourceCaret;
+
+/* Reverse selection mapping for a native visual mirror. Non-collapsed visual
+ * edges map to the outer source range, retaining hidden Markdown syntax. */
+typedef struct YuStorageProjectionSourceSelection {
+    uint64_t revision;
+    uint64_t visual_start_utf16;
+    uint64_t visual_end_utf16;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t round_trip_visual_start_utf16;
+    uint64_t round_trip_visual_end_utf16;
+    uint8_t affinity;
+} YuStorageProjectionSourceSelection;
+
 /* Revision-bound metrics-layout hit-test result. x/y are projection-local
  * layout coordinates, not screen coordinates. */
 typedef struct YuStorageProjectionHit {
@@ -395,6 +417,14 @@ int32_t yu_storage_session_projection_selection(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_start_utf16, uint64_t source_end_utf16,
     uint8_t affinity, YuStorageProjectionSelection *output);
+int32_t yu_storage_session_projection_source_caret(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t visual_utf16, uint8_t affinity,
+    YuStorageProjectionSourceCaret *output);
+int32_t yu_storage_session_projection_source_selection(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t visual_start_utf16, uint64_t visual_end_utf16,
+    uint8_t affinity, YuStorageProjectionSourceSelection *output);
 int32_t yu_storage_session_projection_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     float point_x, float point_y, float max_width, float line_height,
