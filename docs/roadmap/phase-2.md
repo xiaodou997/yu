@@ -42,6 +42,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] macOS HTML fallback native adapter：Markdown > 纯文本 > 受控 HTML、拒绝回退与无窗口 self-check
 - [x] macOS 跨应用 HTML fixture corpus：semantic mail、GFM table、browser wrapper 与 unsafe HTML
 - [x] macOS AppKit `setSelectedRanges` selection 回写 Rust，避免鼠标移动后编辑跳回旧行
+- [x] macOS `⌘Z`/`⇧⌘Z` 与编辑菜单显式回写 Rust history，避免 TextKit disabled undo manager 吞掉快捷键
 - [ ] Windows/Linux native clipboard adapter 与跨应用粘贴回归
 - [x] macOS 基础文件路径/标题、dirty、Revision、磁盘状态的状态栏、菜单和 TextKit Accessibility 投影
 - [x] macOS source-backed Accessibility 快照 FFI：UTF-16 字符数、选区、逻辑行范围和位置查询均绑定 Revision

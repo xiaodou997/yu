@@ -1411,15 +1411,56 @@ private final class DocumentTextView: NSTextView {
         routeCommand(command)
     }
 
-    private func routeCommand(_ command: UInt8) {
-        guard !bridge.composition.active else { return }
-        guard bridge.commandAvailable(command) else { return }
+    /// AppKit normally turns Command-Z into an `undo:` selector, but that
+    /// path is not guaranteed when TextKit's own undo manager is disabled.
+    /// Catch the native key equivalent as a second, explicit bridge to the
+    /// Rust history. The menu actions below call the same method, so there
+    /// is still only one undo/redo implementation.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let isCommandZ = modifiers.contains(.command)
+            && !modifiers.contains(.option)
+            && !modifiers.contains(.control)
+            && event.charactersIgnoringModifiers?.lowercased() == "z"
+        guard isCommandZ else {
+            return super.performKeyEquivalent(with: event)
+        }
+        let command = modifiers.contains(.shift) ? Command.redo : Command.undo
+        return routeCommand(command)
+    }
+
+    @discardableResult
+    private func routeCommand(_ command: UInt8) -> Bool {
+        guard !bridge.composition.active else { return false }
+        guard bridge.commandAvailable(command) else { return false }
         do {
             apply(try bridge.executeCommand(command))
             synchronizeProjection()
             postAccessibilityRefresh()
             onDocumentChange?()
-        } catch { onError?(error) }
+            return true
+        } catch {
+            onError?(error)
+            return false
+        }
+    }
+
+    /// Menu actions use these explicit entry points instead of NSTextView's
+    /// undo manager. Rust remains the sole owner of history and revision.
+    func performUndo() {
+        _ = routeCommand(Command.undo)
+    }
+
+    func performRedo() {
+        _ = routeCommand(Command.redo)
+    }
+
+    func canUndo() -> Bool {
+        !bridge.composition.active && bridge.commandAvailable(Command.undo)
+    }
+
+    func canRedo() -> Bool {
+        !bridge.composition.active && bridge.commandAvailable(Command.redo)
     }
 
     private func finishCompositionForClipboard() throws {
@@ -1807,6 +1848,14 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         textView.cut(sender)
     }
 
+    @objc fileprivate func undoFromMenu(_ sender: Any?) {
+        textView.performUndo()
+    }
+
+    @objc fileprivate func redoFromMenu(_ sender: Any?) {
+        textView.performRedo()
+    }
+
     @objc fileprivate func pasteFromMenu(_ sender: Any?) {
         textView.paste(sender)
     }
@@ -1826,6 +1875,12 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         }
         if menuItem.action == #selector(reloadFromMenu(_:)) {
             return !state.dirty && state.disk != .unchanged
+        }
+        if menuItem.action == #selector(undoFromMenu(_:)) {
+            return textView.canUndo()
+        }
+        if menuItem.action == #selector(redoFromMenu(_:)) {
+            return textView.canRedo()
         }
         if menuItem.action == #selector(copyFromMenu(_:)) ||
             menuItem.action == #selector(cutFromMenu(_:)) {
@@ -2068,12 +2123,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let editMenuItem = NSMenuItem()
         let editMenu = NSMenu(title: "编辑")
         let editItems: [(String, Selector, String)] = [
+            ("撤销", #selector(DocumentViewController.undoFromMenu(_:)), "z"),
+            ("重做", #selector(DocumentViewController.redoFromMenu(_:)), "Z"),
             ("剪切", #selector(DocumentViewController.cutFromMenu(_:)), "x"),
             ("复制", #selector(DocumentViewController.copyFromMenu(_:)), "c"),
             ("粘贴", #selector(DocumentViewController.pasteFromMenu(_:)), "v"),
             ("全选", #selector(DocumentViewController.selectAllFromMenu(_:)), "a"),
         ]
-        for (title, action, keyEquivalent) in editItems {
+        for (title, action, keyEquivalent) in editItems.prefix(2) {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+            item.target = controller
+            editMenu.addItem(item)
+        }
+        editMenu.addItem(.separator())
+        for (title, action, keyEquivalent) in editItems.dropFirst(2) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
             item.target = controller
             editMenu.addItem(item)
@@ -2195,6 +2258,32 @@ private func runSelectionSelfCheck(path: String) -> Never {
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Yu Selection self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+private func runUndoSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let textView = DocumentTextView(bridge: bridge)
+        let original = bridge.source
+        let end = NSRange(location: original.utf16.count, length: 0)
+        try bridge.setSelection(end)
+
+        textView.insertText("x", replacementRange: end)
+        precondition(bridge.source == original + "x")
+        precondition(textView.canUndo())
+
+        textView.performUndo()
+        precondition(bridge.source == original)
+        precondition(textView.canRedo())
+
+        textView.performRedo()
+        precondition(bridge.source == original + "x")
+        print("Yu Undo self-check: Rust history routes undo and redo through the native host")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Undo self-check failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
 }
@@ -2357,6 +2446,10 @@ let app = NSApplication.shared
 if let flag = CommandLine.arguments.firstIndex(of: "--selection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runSelectionSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--undo-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runUndoSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--clipboard-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

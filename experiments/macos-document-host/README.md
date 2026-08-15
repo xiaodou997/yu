@@ -16,7 +16,8 @@
   `net.daringfireball.markdown`、纯文本和 `public.html` payload，三者都来自同一
   Revision-bound source range；paste 优先读取 Markdown source，再读取纯文本，最后才调用 Rust
   strict HTML→Markdown policy；策略拒绝时不注入 HTML，而是回退纯文本；TextKit 不提供独立 undo 或
-  canonical source；
+  canonical source；`⌘Z`、`⇧⌘Z` 以及编辑菜单的撤销/重做都显式路由到 Rust history，避免
+  TextKit 的禁用 undo manager 吞掉快捷键；
 - Accessibility 文本查询与 Markdown semantic node count/fill 都从同一 Revision-bound Rust
   session 读取；Swift 只保存 owned 节点元数据，`DocumentTextView` 作为可编辑 AX root，并将
   block/inline 节点映射为实现 `NSAccessibilityElementProtocol` 的 children；Heading/Link custom
@@ -66,6 +67,16 @@ table、browser wrapper 和 unsafe HTML fixture，覆盖接受与拒绝路径。
 swift run --package-path experiments/macos-document-host YuMacDocumentHost \
   --selection-self-check experiments/macos-document-host/Fixtures/sample.md
 ```
+
+验证 native undo/redo 菜单与 Rust history 的桥接（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --undo-self-check experiments/macos-document-host/Fixtures/sample.md
+```
+
+该自检通过同一个 `DocumentTextView` 执行一次插入、撤销和重做，确认 TextKit 不建立第二套
+history，Rust source、revision 和 redo 状态保持一致。
 
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立
