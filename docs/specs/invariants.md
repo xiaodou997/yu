@@ -197,6 +197,12 @@
     surrogate split、未知 affinity、无效 layout config 或非有限 point 必须拒绝且不得写入半成品
     output；point 结果是 layout-local owned scalar，平台必须自行完成 screen/view 坐标转换，不能
     在 Swift 复制 Markdown projection、delimiter 语义或 layout。
+42. `yu_storage_session_block_layout`、`yu_storage_session_macos_block_layout` 与
+    `yu_storage_session_macos_block_caret` 必须以 expected Revision 和 parser-owned block index
+    绑定同一 `DocumentEditorSession`。metrics/CoreText layout 只能返回 owned source range、
+    block-local visual length、line/size/caret scalar；stale Revision、越界 block、surrogate split、
+    非法尺寸或 CoreText/layout 失败必须清空 output 并拒绝，不能让 Swift 保存 LayoutSnapshot、
+    Projection、CoreText 句柄或第二份 Markdown source。
 
 ## Accessibility
 

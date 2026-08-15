@@ -24,6 +24,7 @@ enum {
     YU_STORAGE_STALE_COMPOSITION = 16,
     YU_STORAGE_EXPORT_ERROR = 17,
     YU_STORAGE_HTML_IMPORT_REJECTED = 18,
+    YU_STORAGE_CORE_TEXT_UNAVAILABLE = 19,
 };
 
 enum {
@@ -240,6 +241,40 @@ typedef struct YuStorageProjectionBlock {
     uint8_t projection_kind;
 } YuStorageProjectionBlock;
 
+/* Revision-bound layout metadata for one parser-owned block. width/height
+ * are block-local layout points; shaped is non-zero for CoreText output. */
+typedef struct YuStorageBlockLayout {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t visual_utf16_length;
+    uint64_t line_count;
+    float width;
+    float height;
+    float line_height;
+    float default_advance;
+    uint8_t kind;
+    uint8_t projection_kind;
+    uint8_t shaped;
+} YuStorageBlockLayout;
+
+/* Revision-bound source caret resolved through one block-local layout. */
+typedef struct YuStorageBlockCaret {
+    uint64_t revision;
+    uint64_t source_utf16;
+    uint64_t block_index;
+    uint64_t visual_utf16;
+    uint64_t round_trip_source_utf16;
+    uint64_t line_index;
+    float caret_x;
+    float caret_y;
+    float caret_width;
+    float caret_height;
+    uint8_t affinity;
+    uint8_t shaped;
+} YuStorageBlockCaret;
+
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
     uint64_t number_of_characters_utf16;
@@ -365,6 +400,18 @@ int32_t yu_storage_session_projected_block(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, YuStorageProjectionBlock *metadata,
     uint8_t *output, size_t capacity, size_t *written);
+int32_t yu_storage_session_block_layout(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, float max_width, float line_height,
+    float default_advance, YuStorageBlockLayout *output);
+int32_t yu_storage_session_macos_block_layout(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, float size, float max_width,
+    YuStorageBlockLayout *output);
+int32_t yu_storage_session_macos_block_caret(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, uint64_t source_utf16, uint8_t affinity,
+    float size, float max_width, YuStorageBlockCaret *output);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,

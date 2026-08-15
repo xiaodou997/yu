@@ -19,7 +19,7 @@ use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
 use yu_editor::{
     BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
     EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, LayoutConfig,
-    LayoutSnapshot, Projection, ViewportRect, ViewportSnapshot,
+    LayoutSnapshot, Projection, ShapingProvider, ViewportRect, ViewportSnapshot,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -277,6 +277,34 @@ impl DocumentSession {
     pub fn block_projection(&mut self, index: usize) -> Result<BlockProjection, StorageError> {
         self.editor
             .block_projection(index)
+            .cloned()
+            .map_err(StorageError::Editor)
+    }
+
+    /// Builds an owned metrics layout for one parser-owned block. The block
+    /// index and returned snapshot are tied to the current source Revision;
+    /// no layout object is retained by the file session.
+    pub fn block_layout(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+    ) -> Result<LayoutSnapshot, StorageError> {
+        self.editor
+            .block_layout(index, config)
+            .cloned()
+            .map_err(StorageError::Editor)
+    }
+
+    /// Builds an owned shaped layout for one parser-owned block. The shaper is
+    /// platform-owned and never becomes part of the canonical document state.
+    pub fn block_layout_with_shaper<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<LayoutSnapshot, StorageError> {
+        self.editor
+            .block_layout_with_shaper(index, config, shaper)
             .cloned()
             .map_err(StorageError::Editor)
     }
@@ -626,6 +654,24 @@ impl DocumentEditorSession {
 
     pub fn block_projection(&mut self, index: usize) -> Result<BlockProjection, StorageError> {
         self.document.block_projection(index)
+    }
+
+    pub fn block_layout(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+    ) -> Result<LayoutSnapshot, StorageError> {
+        self.document.block_layout(index, config)
+    }
+
+    pub fn block_layout_with_shaper<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<LayoutSnapshot, StorageError> {
+        self.document
+            .block_layout_with_shaper(index, config, shaper)
     }
 
     #[must_use]

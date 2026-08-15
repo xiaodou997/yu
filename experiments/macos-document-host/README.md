@@ -100,6 +100,16 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检使用 Rust 返回的 visual selection 和 projection-local point，不在 Swift 重建 Markdown delimiter
 或布局；stale Revision 会被拒绝，命中结果只携带 layout-local 坐标，尚未接入生产 TextKit mirror。
 
+验证 parser-owned block 的 metrics layout、macOS CoreText shaped layout 与 block-local caret（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --block-layout-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+该自检同时比较 metrics/CoreText 的 block visual 长度，检查 CoreText line height/caret point，并确认
+旧 Revision 的 block layout 查询会被拒绝；LayoutSnapshot 和 CoreText 对象不会穿过 FFI。
+
 验证 parser-owned block projection 的 count/fill、source range、kind、visual 长度以及 stale/
 越界拒绝（不启动窗口）：
 

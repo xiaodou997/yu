@@ -382,6 +382,14 @@ selection 映射为 visual UTF-16 range，并返回 source round-trip range；�
 point 和 affinity。Swift 只消费这些 owned scalar；point 仍是 projection-local，不是 screen 坐标，
 当前只用于诊断/self-check，生产 TextKit mirror 尚未切换。
 
+storage FFI 现在还提供 parser-owned block 的 `yu_storage_session_block_layout`，以及 macOS
+`yu_storage_session_macos_block_layout`/`yu_storage_session_macos_block_caret`。前者使用显式
+metrics 配置构造单 block `LayoutSnapshot`，后者使用 `CoreTextShaper::from_system_ui` 和同一
+`yu-layout` line/caret contract；返回值只包含 Revision、source range、block-local visual
+length、line count、width/height、CoreText line metrics 和 caret point。Swift 不持有 layout 或
+CoreText 对象，过期 block metadata/caret 会被拒绝；可见 viewport 的 block origin/height
+count/fill 仍待 Track B 的下一步。
+
 随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
 `ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16
 range、document-space block origin/height、measured 和稳定 kind tag。它只复制 owned scalar，

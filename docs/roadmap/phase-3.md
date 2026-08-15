@@ -23,8 +23,9 @@ retained scene/GPU 绘制。
 
 ## Track B：Native layout
 
-- [ ] block-scoped viewport projection snapshot 与惰性 layout（当前仅完成 projection metadata/UTF-8 诊断）
-- [ ] CoreText shaping metrics 与 `yu-layout` line/caret contract 对齐
+- [x] parser-owned block-scoped projection snapshot、惰性 layout metadata 与 block-local caret
+- [x] macOS CoreText shaping metrics 与 `yu-layout` line/caret contract 对齐
+- [ ] shaped viewport snapshot、block origin/height 与可见窗口 count/fill
 - [ ] TextKit mirror 仅作为过渡适配器，支持 visual/source 双向映射
 - [ ] macOS 鼠标点击、拖选、上下移动和 IME 在 visual projection 下回归
 
