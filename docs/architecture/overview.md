@@ -459,6 +459,15 @@ scene，只导出 glyph primitive 的 owned metadata：atlas page/矩形、origi
 不拥有 atlas 像素、layout、scene 或 GPU handle。该入口目前是 `--visual-scene-glyph-self-check` 的
 诊断/opt-in 协议，仍不切换生产 TextKit source mirror，也不提交真实 Metal surface。见 ADR 0121。
 
+在 glyph publication 稳定后，`yu_storage_session_macos_render_host_surface_submit` 增加一个更窄的
+真实 surface 验证入口：Swift 在 AppKit main thread 提供临时 `NSView`，Rust 同步创建
+`MetalSurface`、附着 `CAMetalLayer`，复用同一 persistent CoreText publication，按
+`Revision gate → atlas sync → render_plan → consumer commit` 提交到真实 drawable。返回值只包含
+Revision、surface generation、frame serial、upload/command/damage/atlas 计数和 submitted 标志；
+view attachment、Metal device、renderer、atlas、target 和 command queue 都在 Rust/backend 的同步
+调用内释放。该入口由 `--macos-render-host-surface-self-check` 显式触发，不是可视化演示模式，也不
+改变生产 TextKit source mirror。见 ADR 0122。
+
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
 文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
 编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、

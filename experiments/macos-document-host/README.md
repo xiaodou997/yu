@@ -177,6 +177,18 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 这个 self-check 只返回 lifecycle scalar；它不启动可视化演示模式，也不替换生产 TextKit source
 mirror。完整 native visual view/Metal submit 会在后续阶段接入。
 
+验证真实 AppKit `NSView` → `CAMetalLayer` attachment、drawable acquisition、atlas upload、
+retained target blit/present 和 stale Revision 拒绝（显式测试命令，会短暂创建并关闭临时窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --macos-render-host-surface-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+该 self-check 只返回 Rust-owned lifecycle scalar，surface、renderer、atlas、Metal target 和
+attachment 在同步调用结束时释放；它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
+后续真实窗口 adapter 才会持久拥有 surface 并处理 resize/generation。
+
 验证 persistent host 从 retained scene 导出的 glyph primitive count/fill、atlas placement、
 source block range、block 顺序、几何有限性以及编辑后的 stale Revision 拒绝（不启动窗口）：
 
