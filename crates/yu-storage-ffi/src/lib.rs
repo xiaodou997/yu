@@ -32,7 +32,7 @@ use yu_text::{EditError, TextSnapshot};
 #[cfg(target_os = "macos")]
 use yu_render::{RenderCommand, RenderPlanBuilder};
 #[cfg(target_os = "macos")]
-use yu_scene::{Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput};
+use yu_scene::{Primitive, Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput};
 #[cfg(target_os = "macos")]
 use yu_workspace::{ViewportRenderConfig, assemble_viewport_render_frame};
 
@@ -541,6 +541,53 @@ pub struct YuStorageMacosRenderHostSnapshot {
     pub max_scroll_y: f32,
     pub viewport_width: f32,
     pub published: u8,
+}
+
+/// One glyph primitive copied from the retained scene produced by the
+/// persistent macOS render host. Atlas pixels stay in Rust; this ABI exposes
+/// only the validated placement and source-backed block metadata needed by an
+/// opt-in native scene consumer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageVisualSceneGlyph {
+    pub revision: u64,
+    pub block_index: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub page: u32,
+    pub atlas_x: u32,
+    pub atlas_y: u32,
+    pub atlas_width: u32,
+    pub atlas_height: u32,
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub bearing_x: f32,
+    pub bearing_y: f32,
+    pub advance_x: f32,
+    pub bounds_x: f32,
+    pub bounds_y: f32,
+    pub bounds_width: f32,
+    pub bounds_height: f32,
+    pub color_rgba: u32,
+}
+
+/// Header for a retained-scene glyph publication. It shares the same host
+/// Revision/frame/surface identity as `YuStorageMacosRenderHostSnapshot`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageVisualSceneGlyphSnapshot {
+    pub revision: u64,
+    pub frame_revision: u64,
+    pub surface_generation: u64,
+    pub frame_serial: u64,
+    pub block_start: u64,
+    pub block_end: u64,
+    pub glyph_count: u64,
+    pub content_height: f32,
+    pub scroll_y: f32,
+    pub viewport_height: f32,
+    pub max_scroll_y: f32,
+    pub viewport_width: f32,
 }
 
 /// Revision-bound source coordinates used by the native Accessibility adapter.
@@ -3621,6 +3668,135 @@ fn macos_render_host_frame(
 }
 
 #[cfg(target_os = "macos")]
+fn macos_visual_scene_glyphs(
+    session: &mut YuStorageSession,
+    host_snapshot: YuStorageMacosRenderHostSnapshot,
+) -> Result<
+    (
+        YuStorageVisualSceneGlyphSnapshot,
+        Vec<YuStorageVisualSceneGlyph>,
+    ),
+    i32,
+> {
+    let state = session
+        .macos_render_host
+        .as_ref()
+        .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    let publication = state
+        .builder
+        .last_publication()
+        .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    if publication.revision().get() != host_snapshot.revision {
+        return Err(YU_STORAGE_STALE_REVISION);
+    }
+    let frame = publication.frame();
+    let input = frame.scene().input();
+    let scene = frame.scene().scene();
+    let config = state.builder.config();
+    let source = session.session.snapshot();
+    let layout_config = session.session.viewport_config().layout();
+    let mut block_metadata = Vec::with_capacity(input.blocks().len());
+    {
+        let document = session.session.document_mut().editor_mut();
+        for block in input.blocks() {
+            let layout = document
+                .block_layout_with_shaper(block.index(), layout_config, state.builder.shaper())
+                .map_err(status_from_editor_error)?;
+            let source_start_utf16 = source
+                .utf16_offset(block.source().start())
+                .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+                .get();
+            let source_end_utf16 = source
+                .utf16_offset(block.source().end())
+                .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+                .get();
+            block_metadata.push((
+                block.index(),
+                source_start_utf16,
+                source_end_utf16,
+                layout.glyphs().len(),
+            ));
+        }
+    }
+
+    let mut metadata = block_metadata.into_iter();
+    let mut current = metadata.next();
+    let mut glyphs = Vec::with_capacity(scene.primitives().len());
+    for primitive in scene.primitives().iter().copied() {
+        loop {
+            match current {
+                Some((_, _, _, 0)) => current = metadata.next(),
+                Some(_) => break,
+                None => return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE),
+            }
+        }
+        let Some((block_index, source_start_utf16, source_end_utf16, glyph_count)) = current else {
+            return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+        };
+        let Primitive::Glyph(glyph) = primitive else {
+            return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+        };
+        let entry = glyph.atlas();
+        let rect = entry.rect();
+        let metrics = entry.metrics();
+        let bounds = glyph.bounds();
+        glyphs.push(YuStorageVisualSceneGlyph {
+            revision: host_snapshot.revision,
+            block_index: u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+            source_start_utf16,
+            source_end_utf16,
+            page: entry.page().unwrap_or(YU_STORAGE_RENDER_PAGE_NONE),
+            atlas_x: rect.x(),
+            atlas_y: rect.y(),
+            atlas_width: rect.width(),
+            atlas_height: rect.height(),
+            origin_x: glyph.origin().x(),
+            origin_y: glyph.origin().y(),
+            bearing_x: metrics.bearing_x(),
+            bearing_y: metrics.bearing_y(),
+            advance_x: metrics.advance_x(),
+            bounds_x: bounds.x(),
+            bounds_y: bounds.y(),
+            bounds_width: bounds.width(),
+            bounds_height: bounds.height(),
+            color_rgba: glyph.color().packed(),
+        });
+        current = Some((
+            block_index,
+            source_start_utf16,
+            source_end_utf16,
+            glyph_count.saturating_sub(1),
+        ));
+    }
+    while let Some((_, _, _, count)) = current {
+        if count != 0 {
+            return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+        }
+        current = metadata.next();
+    }
+
+    let block_range = input.block_range();
+    let block_start = u64::try_from(block_range.start).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let block_end = u64::try_from(block_range.end).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let glyph_count = u64::try_from(glyphs.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let snapshot = YuStorageVisualSceneGlyphSnapshot {
+        revision: host_snapshot.revision,
+        frame_revision: host_snapshot.frame_revision,
+        surface_generation: host_snapshot.surface_generation,
+        frame_serial: host_snapshot.frame_serial,
+        block_start,
+        block_end,
+        glyph_count,
+        content_height: input.content_height(),
+        scroll_y: config.viewport().scroll_y(),
+        viewport_height: config.viewport().height(),
+        max_scroll_y: (input.content_height() - config.viewport().height()).max(0.0),
+        viewport_width: config.scene_viewport().width(),
+    };
+    Ok((snapshot, glyphs))
+}
+
+#[cfg(target_os = "macos")]
 fn macos_visual_render_plan(
     session: &mut YuStorageSession,
     expected_revision: u64,
@@ -3994,6 +4170,96 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
         };
         // SAFETY: `snapshot` is a caller-owned output pointer checked above.
         unsafe { *snapshot = value };
+        YU_STORAGE_OK
+    }
+}
+
+/// Returns the actual glyph primitives from the persistent Rust retained
+/// scene. This is an opt-in diagnostic/native-scene bridge: atlas pixels and
+/// document/layout objects remain Rust-owned, while the count/fill values are
+/// an atomic, Revision-bound snapshot.
+///
+/// # Safety
+/// `session` must be a live handle. `snapshot` and `written` must be writable;
+/// `glyphs` must point to `capacity` writable entries when `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_visual_scene_glyphs(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    surface_generation: u64,
+    snapshot: *mut YuStorageVisualSceneGlyphSnapshot,
+    glyphs: *mut YuStorageVisualSceneGlyph,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if snapshot.is_null() || written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && glyphs.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output pointers were checked above and belong to the caller.
+    unsafe {
+        *snapshot = YuStorageVisualSceneGlyphSnapshot::default();
+        *written = 0;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            surface_generation,
+            glyphs,
+            capacity,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let host_snapshot = match macos_render_host_frame(
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            surface_generation,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(status) => return status,
+        };
+        let (header, encoded) = match macos_visual_scene_glyphs(session, host_snapshot) {
+            Ok(values) => values,
+            Err(status) => return status,
+        };
+        // SAFETY: output pointers were checked above and belong to the caller.
+        unsafe {
+            *snapshot = header;
+            *written = encoded.len();
+        }
+        if capacity == 0 && glyphs.is_null() {
+            return YU_STORAGE_OK;
+        }
+        if encoded.len() > capacity {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+        if !encoded.is_empty() {
+            // SAFETY: capacity was checked against the encoded glyph count.
+            unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), glyphs, encoded.len()) };
+        }
         YU_STORAGE_OK
     }
 }
@@ -5982,6 +6248,161 @@ mod tests {
         assert_eq!(next.frame_revision, 1);
         assert_eq!(next.surface_generation, 1);
         assert!(next.frame_serial > resized.frame_serial);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_visual_scene_glyphs_are_retained_and_source_backed() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-glyph-scene-{id}.md"));
+        let source = "# 羽🙂\n\nParagraph **粗体** and 日本語\n\n```rust\nfn main() {}\n```\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut snapshot = YuStorageVisualSceneGlyphSnapshot::default();
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene_glyphs(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    0,
+                    &mut snapshot,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(required > 0);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.frame_revision, 0);
+        assert_eq!(snapshot.frame_serial, 1);
+        assert_eq!(snapshot.glyph_count, required as u64);
+        assert!(snapshot.block_end > snapshot.block_start);
+
+        let mut too_small = vec![YuStorageVisualSceneGlyph::default(); required - 1];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene_glyphs(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    0,
+                    &mut snapshot,
+                    too_small.as_mut_ptr(),
+                    too_small.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+        assert_eq!(written, required);
+        assert!(
+            too_small
+                .iter()
+                .all(|glyph| *glyph == YuStorageVisualSceneGlyph::default())
+        );
+
+        let mut glyphs = vec![YuStorageVisualSceneGlyph::default(); required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene_glyphs(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    0,
+                    &mut snapshot,
+                    glyphs.as_mut_ptr(),
+                    glyphs.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, required);
+        assert!(glyphs.windows(2).all(|pair| {
+            pair[0].revision == 0
+                && pair[1].revision == 0
+                && pair[0].block_index <= pair[1].block_index
+                && pair[0].source_start_utf16 <= pair[1].source_start_utf16
+        }));
+        assert!(glyphs.iter().all(|glyph| {
+            glyph.bounds_width.is_finite()
+                && glyph.bounds_height.is_finite()
+                && glyph.bounds_width >= 0.0
+                && glyph.bounds_height >= 0.0
+                && glyph.origin_x.is_finite()
+                && glyph.origin_y.is_finite()
+                && glyph.advance_x.is_finite()
+        }));
+        assert!(
+            glyphs
+                .iter()
+                .any(|glyph| glyph.page != YU_STORAGE_RENDER_PAGE_NONE)
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene_glyphs(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    0,
+                    &mut snapshot,
+                    ptr::null_mut(),
+                    0,
+                    &mut written,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(snapshot, YuStorageVisualSceneGlyphSnapshot::default());
+        assert_eq!(written, 0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

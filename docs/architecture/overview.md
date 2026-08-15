@@ -451,6 +451,14 @@ Revision、回退 generation 或失败 publication 不会污染 host state；这
 `--macos-render-host-self-check` 使用，生产 TextKit source mirror 和窗口 renderer 尚未切换。见
 ADR 0120。
 
+在该 persistent host 之上，`yu_storage_session_macos_visual_scene_glyphs` 提供一个更窄的
+Revision-bound retained scene handoff。Rust 从同一次 persistent CoreText publication 读取 retained
+scene，只导出 glyph primitive 的 owned metadata：atlas page/矩形、origin、bearing、advance、bounds、
+颜色以及对应 block 的 source UTF-16 range。count/fill 两阶段 ABI 在容量不足时不会写入部分数组，
+并且 header、glyph 数组和 host publication 必须属于同一 Revision/frame/surface generation；Swift
+不拥有 atlas 像素、layout、scene 或 GPU handle。该入口目前是 `--visual-scene-glyph-self-check` 的
+诊断/opt-in 协议，仍不切换生产 TextKit source mirror，也不提交真实 Metal surface。见 ADR 0121。
+
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
 文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
 编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、

@@ -363,6 +363,75 @@ private struct NativeVisualRenderPlanSnapshot {
     }
 }
 
+private struct NativeVisualSceneGlyphSnapshot {
+    let revision: UInt64
+    let frameRevision: UInt64
+    let surfaceGeneration: UInt64
+    let frameSerial: UInt64
+    let blockRange: Range<UInt64>
+    let glyphCount: Int
+    let contentHeight: CGFloat
+    let scrollY: CGFloat
+    let viewportHeight: CGFloat
+    let maxScrollY: CGFloat
+    let viewportWidth: CGFloat
+
+    init(_ value: YuStorageVisualSceneGlyphSnapshot) {
+        revision = value.revision
+        frameRevision = value.frame_revision
+        surfaceGeneration = value.surface_generation
+        frameSerial = value.frame_serial
+        blockRange = value.block_start..<value.block_end
+        glyphCount = Int(value.glyph_count)
+        contentHeight = CGFloat(value.content_height)
+        scrollY = CGFloat(value.scroll_y)
+        viewportHeight = CGFloat(value.viewport_height)
+        maxScrollY = CGFloat(value.max_scroll_y)
+        viewportWidth = CGFloat(value.viewport_width)
+    }
+}
+
+private struct NativeVisualSceneGlyph {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let sourceRange: NSRange
+    let page: UInt32
+    let atlasRect: CGRect
+    let origin: CGPoint
+    let bearingX: CGFloat
+    let bearingY: CGFloat
+    let advanceX: CGFloat
+    let bounds: CGRect
+    let colorRGBA: UInt32
+
+    init(_ value: YuStorageVisualSceneGlyph) {
+        revision = value.revision
+        blockIndex = value.block_index
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        page = value.page
+        atlasRect = CGRect(
+            x: CGFloat(value.atlas_x),
+            y: CGFloat(value.atlas_y),
+            width: CGFloat(value.atlas_width),
+            height: CGFloat(value.atlas_height)
+        )
+        origin = CGPoint(x: CGFloat(value.origin_x), y: CGFloat(value.origin_y))
+        bearingX = CGFloat(value.bearing_x)
+        bearingY = CGFloat(value.bearing_y)
+        advanceX = CGFloat(value.advance_x)
+        bounds = CGRect(
+            x: CGFloat(value.bounds_x),
+            y: CGFloat(value.bounds_y),
+            width: CGFloat(value.bounds_width),
+            height: CGFloat(value.bounds_height)
+        )
+        colorRGBA = value.color_rgba
+    }
+}
+
 private struct NativeMacosRenderHostSnapshot {
     let revision: UInt64
     let frameRevision: UInt64
@@ -1324,6 +1393,62 @@ private final class StorageBridge {
         return (
             NativeVisualSceneSnapshot(snapshot),
             values.map(NativeVisualScenePrimitive.init)
+        )
+    }
+
+    func macosVisualSceneGlyphs(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float,
+        surfaceGeneration: UInt64
+    ) throws -> (NativeVisualSceneGlyphSnapshot, [NativeVisualSceneGlyph]) {
+        var snapshot = YuStorageVisualSceneGlyphSnapshot()
+        var required = 0
+        let sizeStatus = yu_storage_session_macos_visual_scene_glyphs(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            surfaceGeneration,
+            &snapshot,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        precondition(snapshot.glyph_count == UInt64(required))
+        var values = Array(
+            repeating: YuStorageVisualSceneGlyph(),
+            count: required
+        )
+        var written = required
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_macos_visual_scene_glyphs(
+                handle,
+                revision,
+                size,
+                maxWidth,
+                scrollY,
+                viewportHeight,
+                surfaceGeneration,
+                &snapshot,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard fillStatus == StorageStatus.ok, written == required else {
+            throw BridgeError.operation(fillStatus)
+        }
+        return (
+            NativeVisualSceneGlyphSnapshot(snapshot),
+            values.map(NativeVisualSceneGlyph.init)
         )
     }
 
@@ -4387,6 +4512,85 @@ private func runVisualSceneSelfCheck(path: String) -> Never {
     }
 }
 
+private func runVisualSceneGlyphSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let shaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: 2,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(shaped.lineHeight),
+            defaultAdvance: Float(shaped.defaultAdvance),
+            estimatedBlockHeight: Float(shaped.lineHeight),
+            overscan: 0.0
+        )
+
+        let (snapshot, glyphs) = try bridge.macosVisualSceneGlyphs(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0,
+            surfaceGeneration: 0
+        )
+        precondition(snapshot.revision == revision)
+        precondition(snapshot.frameRevision == revision)
+        precondition(snapshot.glyphCount == glyphs.count)
+        precondition(snapshot.glyphCount > 0)
+        precondition(snapshot.blockRange.count > 0)
+        precondition(abs(snapshot.viewportWidth - CGFloat(maxWidth)) < 0.01)
+
+        var previousBlock: UInt64?
+        for glyph in glyphs {
+            precondition(glyph.revision == revision)
+            precondition(glyph.sourceRange.location >= 0)
+            precondition(NSMaxRange(glyph.sourceRange) <= (bridge.source as NSString).length)
+            precondition(glyph.origin.x.isFinite && glyph.origin.y.isFinite)
+            precondition(glyph.advanceX.isFinite && glyph.advanceX >= 0.0)
+            precondition(glyph.bounds.origin.x.isFinite && glyph.bounds.origin.y.isFinite)
+            precondition(glyph.bounds.width.isFinite && glyph.bounds.height.isFinite)
+            precondition(glyph.bounds.width >= 0.0 && glyph.bounds.height >= 0.0)
+            precondition(glyph.atlasRect.width >= 0.0 && glyph.atlasRect.height >= 0.0)
+            if let previousBlock {
+                precondition(glyph.blockIndex >= previousBlock)
+            }
+            previousBlock = glyph.blockIndex
+        }
+        precondition(glyphs.contains { $0.page != YU_STORAGE_RENDER_PAGE_NONE })
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.macosVisualSceneGlyphs(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 1_000.0,
+                surfaceGeneration: 0
+            )
+            preconditionFailure("stale retained scene glyphs unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        print(
+            "Yu Visual Scene Glyph self-check: retained glyph primitives, atlas placement, "
+                + "source block ranges and stale Revision rejection are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual Scene Glyph self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runVisualRenderPlanSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -4891,6 +5095,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-viewport-self-check
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualSceneSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-glyph-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualSceneGlyphSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-render-plan-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

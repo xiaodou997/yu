@@ -454,6 +454,43 @@ typedef struct YuStorageMacosRenderHostSnapshot {
     uint8_t published;
 } YuStorageMacosRenderHostSnapshot;
 
+typedef struct YuStorageVisualSceneGlyph {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint32_t page;
+    uint32_t atlas_x;
+    uint32_t atlas_y;
+    uint32_t atlas_width;
+    uint32_t atlas_height;
+    float origin_x;
+    float origin_y;
+    float bearing_x;
+    float bearing_y;
+    float advance_x;
+    float bounds_x;
+    float bounds_y;
+    float bounds_width;
+    float bounds_height;
+    uint32_t color_rgba;
+} YuStorageVisualSceneGlyph;
+
+typedef struct YuStorageVisualSceneGlyphSnapshot {
+    uint64_t revision;
+    uint64_t frame_revision;
+    uint64_t surface_generation;
+    uint64_t frame_serial;
+    uint64_t block_start;
+    uint64_t block_end;
+    uint64_t glyph_count;
+    float content_height;
+    float scroll_y;
+    float viewport_height;
+    float max_scroll_y;
+    float viewport_width;
+} YuStorageVisualSceneGlyphSnapshot;
+
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
     uint64_t number_of_characters_utf16;
@@ -629,6 +666,11 @@ int32_t yu_storage_session_macos_render_host_frame(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
     uint64_t surface_generation, YuStorageMacosRenderHostSnapshot *snapshot);
+int32_t yu_storage_session_macos_visual_scene_glyphs(
+    YuStorageSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height,
+    uint64_t surface_generation, YuStorageVisualSceneGlyphSnapshot *snapshot,
+    YuStorageVisualSceneGlyph *glyphs, size_t capacity, size_t *written);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,

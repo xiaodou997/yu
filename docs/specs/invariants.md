@@ -439,3 +439,8 @@
    source、selection、history 或 AppKit/GPU handle；每次 host frame 都必须先验证 expected
    Revision，再同步 surface generation、发布当前 document frame，最后只返回 owned scalar
    metadata。surface generation 与 frame serial 不得回退，stale Revision 不得污染 snapshot。
+5. `yu_storage_session_macos_visual_scene_glyphs` 的 header、glyph 数组和 persistent host publication
+   必须绑定同一 Revision、frame serial 与 surface generation；count/fill 的容量不足路径不得写入
+   部分 glyph。每个 glyph 只能携带 Rust-owned atlas placement、几何、颜色和所属 block 的 source
+   UTF-16 range，不得跨 ABI 暴露 atlas 像素、CoreText/scene/layout 指针或 GPU handle；当前 glyph-only
+   bridge 遇到非 glyph primitive 必须整体拒绝，而不能静默丢弃。

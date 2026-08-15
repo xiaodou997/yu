@@ -177,6 +177,18 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 这个 self-check 只返回 lifecycle scalar；它不启动可视化演示模式，也不替换生产 TextKit source
 mirror。完整 native visual view/Metal submit 会在后续阶段接入。
 
+验证 persistent host 从 retained scene 导出的 glyph primitive count/fill、atlas placement、
+source block range、block 顺序、几何有限性以及编辑后的 stale Revision 拒绝（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --visual-scene-glyph-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+该自检只缓存 Rust 返回的 owned glyph metadata；atlas 像素、CoreText/layout/scene 对象和 Metal
+handle 不穿过 FFI。当前 source range 是所属 block 的 UTF-16 范围，因此同一 block 的多个 glyph
+可以共享该范围；生产窗口仍使用 source TextKit mirror，真实 Metal surface submit 属于后续阶段。
+
 验证 marked-text composition 的 transient projection、visual selection、active caret 与
 Revision/generation 生命周期（不启动窗口）：
 
