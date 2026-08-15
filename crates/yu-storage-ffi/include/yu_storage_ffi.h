@@ -25,6 +25,7 @@ enum {
     YU_STORAGE_EXPORT_ERROR = 17,
     YU_STORAGE_HTML_IMPORT_REJECTED = 18,
     YU_STORAGE_CORE_TEXT_UNAVAILABLE = 19,
+    YU_STORAGE_INVALID_VIEWPORT_CONFIG = 20,
 };
 
 enum {
@@ -275,6 +276,26 @@ typedef struct YuStorageBlockCaret {
     uint8_t shaped;
 } YuStorageBlockCaret;
 
+/* Revision-bound block metadata returned by a CoreText-shaped viewport query.
+ * y/height are document-space point coordinates; source ranges are UTF-16. */
+typedef struct YuStorageShapedViewportBlock {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    float y;
+    float height;
+    uint8_t measured;
+    uint8_t kind;
+} YuStorageShapedViewportBlock;
+
+typedef struct YuStorageShapedViewportSnapshot {
+    uint64_t revision;
+    uint64_t block_start;
+    uint64_t block_end;
+    float content_height;
+} YuStorageShapedViewportSnapshot;
+
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
     uint64_t number_of_characters_utf16;
@@ -412,6 +433,15 @@ int32_t yu_storage_session_macos_block_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageBlockCaret *output);
+int32_t yu_storage_session_set_viewport_config(
+    YuStorageSession *session, uint64_t expected_revision,
+    float max_width, float line_height, float default_advance,
+    float estimated_block_height, float overscan);
+int32_t yu_storage_session_macos_shaped_viewport_blocks(
+    YuStorageSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height,
+    YuStorageShapedViewportSnapshot *snapshot,
+    YuStorageShapedViewportBlock *blocks, size_t capacity, size_t *written);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,

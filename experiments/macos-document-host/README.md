@@ -121,6 +121,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检逐 block 消费 Rust 返回的 owned UTF-8，不在 Swift 重建 Markdown block；当前只建立
 block-local projection 诊断边界，生产 TextKit mirror 和完整 visual delimiter 语义保持不变。
 
+验证 macOS CoreText shaped viewport 的 count/fill、可见 block 文档坐标、source range、kind、
+measured 标记和 stale Revision 拒绝（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --shaped-viewport-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+该自检先将 CoreText 的 line height/default advance 发布到 Rust viewport policy，再请求一个完整
+可见窗口；Swift 只消费 owned block 元数据，不创建第二套 Markdown parser、layout 或渲染树。
+
 验证 marked-text composition 的 transient projection、visual selection、active caret 与
 Revision/generation 生命周期（不启动窗口）：
 
