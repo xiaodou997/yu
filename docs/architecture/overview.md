@@ -387,8 +387,11 @@ storage FFI 现在还提供 parser-owned block 的 `yu_storage_session_block_lay
 metrics 配置构造单 block `LayoutSnapshot`，后者使用 `CoreTextShaper::from_system_ui` 和同一
 `yu-layout` line/caret contract；返回值只包含 Revision、source range、block-local visual
 length、line count、width/height、CoreText line metrics 和 caret point。Swift 不持有 layout 或
-CoreText 对象，过期 block metadata/caret 会被拒绝；可见 viewport 的 block origin/height
-count/fill 仍待 Track B 的下一步。
+CoreText 对象，过期 block metadata/caret 会被拒绝。随后同一 storage handle 通过
+`yu_storage_session_set_viewport_config` 发布 CoreText line metrics，并由
+`yu_storage_session_macos_shaped_viewport_blocks` 以 count/fill 返回可见 block range、source
+UTF-16 range、document-space block origin/height、measured 和稳定 kind tag；Swift 只消费 owned
+scalar，过期 viewport 与容量不足均不能污染 native 数组。
 
 随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
 `ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16

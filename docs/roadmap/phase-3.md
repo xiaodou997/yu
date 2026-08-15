@@ -25,7 +25,7 @@ retained scene/GPU 绘制。
 
 - [x] parser-owned block-scoped projection snapshot、惰性 layout metadata 与 block-local caret
 - [x] macOS CoreText shaping metrics 与 `yu-layout` line/caret contract 对齐
-- [ ] shaped viewport snapshot、block origin/height 与可见窗口 count/fill
+- [x] shaped viewport snapshot、block origin/height 与可见窗口 count/fill
 - [ ] TextKit mirror 仅作为过渡适配器，支持 visual/source 双向映射
 - [ ] macOS 鼠标点击、拖选、上下移动和 IME 在 visual projection 下回归
 

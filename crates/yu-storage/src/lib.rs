@@ -19,7 +19,7 @@ use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
 use yu_editor::{
     BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
     EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, LayoutConfig,
-    LayoutSnapshot, Projection, ShapingProvider, ViewportRect, ViewportSnapshot,
+    LayoutSnapshot, Projection, ShapingProvider, ViewportConfig, ViewportRect, ViewportSnapshot,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -332,6 +332,30 @@ impl DocumentSession {
         self.editor
             .visible_blocks(viewport)
             .map_err(StorageError::Editor)
+    }
+
+    /// Measures the current visible block window with an explicit shaping
+    /// provider. The editor owns viewport estimates and measurements.
+    pub fn visible_blocks_with_shaper<S: ShapingProvider>(
+        &mut self,
+        viewport: ViewportRect,
+        shaper: &S,
+    ) -> Result<ViewportSnapshot, StorageError> {
+        self.editor
+            .visible_blocks_with_shaper(viewport, shaper)
+            .map_err(StorageError::Editor)
+    }
+
+    /// Replaces the viewport policy without changing the canonical source.
+    pub fn set_viewport_config(&mut self, config: ViewportConfig) -> Result<(), StorageError> {
+        self.editor
+            .set_viewport_config(config)
+            .map_err(|error| StorageError::Editor(EditorDocumentError::Viewport(error)))
+    }
+
+    #[must_use]
+    pub fn viewport_config(&self) -> ViewportConfig {
+        self.editor.viewport_config()
     }
 
     /// Writes or clears a caller-scheduled crash-recovery snapshot without
@@ -711,6 +735,23 @@ impl DocumentEditorSession {
         viewport: ViewportRect,
     ) -> Result<ViewportSnapshot, StorageError> {
         self.document.visible_blocks(viewport)
+    }
+
+    pub fn visible_blocks_with_shaper<S: ShapingProvider>(
+        &mut self,
+        viewport: ViewportRect,
+        shaper: &S,
+    ) -> Result<ViewportSnapshot, StorageError> {
+        self.document.visible_blocks_with_shaper(viewport, shaper)
+    }
+
+    pub fn set_viewport_config(&mut self, config: ViewportConfig) -> Result<(), StorageError> {
+        self.document.set_viewport_config(config)
+    }
+
+    #[must_use]
+    pub fn viewport_config(&self) -> ViewportConfig {
+        self.document.viewport_config()
     }
 
     /// Writes or clears a recovery snapshot through the unified product

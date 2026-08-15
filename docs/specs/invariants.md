@@ -203,6 +203,13 @@
     block-local visual length、line/size/caret scalar；stale Revision、越界 block、surrogate split、
     非法尺寸或 CoreText/layout 失败必须清空 output 并拒绝，不能让 Swift 保存 LayoutSnapshot、
     Projection、CoreText 句柄或第二份 Markdown source。
+43. `yu_storage_session_set_viewport_config` 与
+    `yu_storage_session_macos_shaped_viewport_blocks` 必须共享同一 expected Revision 和
+    CoreText width/line-height/default-advance contract；shaped viewport header 与每个 block 必须
+    共享 Revision，block index/source UTF-16 range 必须有序，document-space `y` 必须单调、height
+    必须为正且 content height 有限。count/fill 的容量不足不得写入部分 block，stale、非法 viewport、
+    metrics 不匹配、layout/CoreText 失败和非 macOS unavailable 必须清空 header/count 并拒绝；Swift
+    只能消费 owned scalar，不得复制 HeightIndex、Markdown block 或 layout 对象。
 
 ## Accessibility
 

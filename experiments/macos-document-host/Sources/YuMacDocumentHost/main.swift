@@ -209,6 +209,41 @@ private struct NativeBlockCaret {
     }
 }
 
+private struct NativeShapedViewportBlock {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let sourceRange: NSRange
+    let y: CGFloat
+    let height: CGFloat
+    let measured: Bool
+    let kind: UInt8
+
+    init(_ value: YuStorageShapedViewportBlock) {
+        revision = value.revision
+        blockIndex = value.block_index
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        y = CGFloat(value.y)
+        height = CGFloat(value.height)
+        measured = value.measured != 0
+        kind = value.kind
+    }
+}
+
+private struct NativeShapedViewportSnapshot {
+    let revision: UInt64
+    let blockRange: Range<UInt64>
+    let contentHeight: CGFloat
+
+    init(_ value: YuStorageShapedViewportSnapshot) {
+        revision = value.revision
+        blockRange = value.block_start..<value.block_end
+        contentHeight = CGFloat(value.content_height)
+    }
+}
+
 private struct NativeAccessibilitySnapshot {
     let revision: UInt64
     let numberOfCharacters: Int
@@ -827,6 +862,77 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeBlockCaret(value)
+    }
+
+    func setViewportConfig(
+        revision: UInt64,
+        maxWidth: Float,
+        lineHeight: Float,
+        defaultAdvance: Float,
+        estimatedBlockHeight: Float,
+        overscan: Float
+    ) throws {
+        let status = yu_storage_session_set_viewport_config(
+            handle,
+            revision,
+            maxWidth,
+            lineHeight,
+            defaultAdvance,
+            estimatedBlockHeight,
+            overscan
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+    }
+
+    func macosShapedViewportBlocks(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float
+    ) throws -> (NativeShapedViewportSnapshot, [NativeShapedViewportBlock]) {
+        var snapshot = YuStorageShapedViewportSnapshot()
+        var required = 0
+        let sizeStatus = yu_storage_session_macos_shaped_viewport_blocks(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            &snapshot,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var values = Array(repeating: YuStorageShapedViewportBlock(), count: required)
+        var written = required
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_macos_shaped_viewport_blocks(
+                handle,
+                revision,
+                size,
+                maxWidth,
+                scrollY,
+                viewportHeight,
+                &snapshot,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard fillStatus == StorageStatus.ok, written == required else {
+            throw BridgeError.operation(fillStatus)
+        }
+        return (
+            NativeShapedViewportSnapshot(snapshot),
+            values.map(NativeShapedViewportBlock.init)
+        )
     }
 
     var state: NativeStorageState {
@@ -2964,6 +3070,81 @@ private func runBlockLayoutSelfCheck(path: String) -> Never {
     }
 }
 
+private func runShapedViewportSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let shaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: 2,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(shaped.lineHeight),
+            defaultAdvance: Float(shaped.defaultAdvance),
+            estimatedBlockHeight: Float(shaped.lineHeight),
+            overscan: 0.0
+        )
+
+        let (snapshot, blocks) = try bridge.macosShapedViewportBlocks(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0
+        )
+        precondition(snapshot.revision == revision)
+        precondition(snapshot.blockRange.count == blocks.count)
+        precondition(!blocks.isEmpty)
+        precondition(snapshot.contentHeight >= shaped.lineHeight)
+        precondition(blocks.allSatisfy { block in
+            block.revision == revision
+                && block.height > 0.0
+                && block.y.isFinite
+                && block.height.isFinite
+                && block.sourceRange.location >= 0
+        })
+        let ordered = zip(blocks, blocks.dropFirst()).allSatisfy { first, second -> Bool in
+            let sourceOrdered = NSMaxRange(first.sourceRange) <= second.sourceRange.location
+            return first.blockIndex < second.blockIndex
+                && sourceOrdered
+                && first.y < second.y
+        }
+        precondition(ordered)
+        precondition(blocks.contains { $0.kind == 3 }, "heading block missing")
+        precondition(blocks.contains { $0.kind == 7 }, "task-list block missing")
+        precondition(blocks.contains { $0.kind == 4 }, "fenced-code block missing")
+        precondition(blocks.allSatisfy { $0.measured })
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.macosShapedViewportBlocks(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 1_000.0
+            )
+            preconditionFailure("stale shaped viewport unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        print(
+            "Yu Shaped Viewport self-check: revision=\(revision) blocks=\(blocks.count) "
+                + "document-space origins/heights and source ranges are revision-bound"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Shaped Viewport self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runCompositionProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -3229,6 +3410,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-chec
 if let flag = CommandLine.arguments.firstIndex(of: "--block-layout-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runBlockLayoutSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--shaped-viewport-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runShapedViewportSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
