@@ -19,6 +19,7 @@ use yu_text::{
 mod block_sequence;
 mod inline;
 mod reference;
+mod table;
 mod task;
 
 pub use block_sequence::{
@@ -31,6 +32,7 @@ pub use inline::{
     InlinePunctuation, InlineSpan, InlineSpanKind, parse_inline, parse_inline_with_definitions,
 };
 pub use reference::{ReferenceDefinition, ReferenceDefinitionIndex};
+pub use table::{TableAlignment, TableBlock, TableCellRange, parse_table};
 pub use task::TaskMarker;
 
 /// A lossless block view of one immutable text revision.

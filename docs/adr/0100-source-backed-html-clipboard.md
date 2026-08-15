@@ -22,7 +22,9 @@ TextKit 字符串拼接，会把 Markdown delimiter、暂态 composition 和 sou
   paragraph、emphasis/strong/code、link/image/autolink、reference link、fenced code、
   blockquote 和 task list 使用 parser-owned source ranges；连续且同层级的列表项共享一个
   `<ul>`/`<ol>` 容器，source depth 会生成嵌套列表，有序列表的起始编号保留；未解析的 reference
-  不生成 broken `href`，而是保留可见 label。
+  不生成 broken `href`，而是保留可见 label。GFM table 由 `yu-markdown::parse_table` 提供
+  source-relative cell ranges，导出为带 `<thead>/<tbody>`、inline cell 内容和对齐样式的 `<table>`；
+  table 暂时仍是普通 paragraph block，避免在 editor/projection 尚未准备好时引入新的 block kind。
 - HTML exporter 不读取 TextKit、projection 或 transient composition，也不修改 session、Revision、
   selection、history 或 dirty。
 - `yu-storage-ffi` 暴露 `yu_storage_session_copy_selection_html` 的两次查询 ABI；macOS host
