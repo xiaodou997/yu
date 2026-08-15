@@ -238,6 +238,9 @@ typedef struct YuStorageCompositionProjection {
     uint64_t visual_selection_end_utf16;
     uint64_t projected_utf16_length;
     uint64_t projected_utf8_length;
+    /* UTF-16 range occupied by transient preedit in the visual projection. */
+    uint64_t visual_replacement_start_utf16;
+    uint64_t visual_replacement_end_utf16;
 } YuStorageCompositionProjection;
 
 /* Active marked-text caret in the transient projected stream. The visual

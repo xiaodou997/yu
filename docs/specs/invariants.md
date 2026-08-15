@@ -223,6 +223,12 @@
     source、composition 或 history。默认产品窗口必须关闭该 adapter，直到 visual renderer、scroll
     origin 和 IME 坐标共享同一 visual layout。
 
+46. visual IME overlay 只能使用同一 expected Revision + composition generation 返回的 Rust
+    projected UTF-8、visual replacement range 和 marked selection；`DocumentTextView` 在 metadata、
+    mirror 或 `markedRange` 任一版本不匹配时不得发布 visual callback，应回退 canonical source
+    mirror。visual preedit、marked range 和 attributed substring 都不得改变 source、selection、
+    history 或 Revision；cancel/commit 仍必须经由 generation-bound Rust composition API。
+
 ## Accessibility
 
 1. 原生 Accessibility 文本 range 使用 UTF-16，并绑定一个明确的 Revision。

@@ -259,6 +259,11 @@ pub struct YuStorageCompositionProjection {
     pub visual_selection_end_utf16: u64,
     pub projected_utf16_length: u64,
     pub projected_utf8_length: u64,
+    /// The visual UTF-16 range occupied by the transient preedit. This is
+    /// distinct from the canonical source replacement range because Markdown
+    /// delimiters may be hidden by the projection.
+    pub visual_replacement_start_utf16: u64,
+    pub visual_replacement_end_utf16: u64,
 }
 
 /// Revision- and composition-generation-bound caret mapping for the active
@@ -1316,6 +1321,32 @@ fn composition_visual_selection_utf16(
     ))
 }
 
+fn composition_visual_replacement_utf16(
+    projection: &Projection,
+    projected: &str,
+) -> Result<(u64, u64), i32> {
+    let replacement = projection
+        .composition_range()
+        .ok_or(YU_STORAGE_NO_OVERLAY)?;
+    let visual_start = projection
+        .source_to_visual(replacement.start(), ProjectionBias::Before)
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let text_len = u64::try_from(
+        projection
+            .composition_text()
+            .ok_or(YU_STORAGE_NO_OVERLAY)?
+            .len(),
+    )
+    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let visual_end = visual_start
+        .checked_add(text_len)
+        .ok_or(YU_STORAGE_INVALID_SELECTION)?;
+    Ok((
+        utf16_offset_in_utf8(projected, visual_start.get())?,
+        utf16_offset_in_utf8(projected, visual_end.get())?,
+    ))
+}
+
 fn composition_projection_metadata(
     session: &mut DocumentEditorSession,
 ) -> Result<(YuStorageCompositionProjection, String), i32> {
@@ -1333,6 +1364,8 @@ fn composition_projection_metadata(
         .get();
     let (visual_selection_start_utf16, visual_selection_end_utf16) =
         composition_visual_selection_utf16(&projection, &projected)?;
+    let (visual_replacement_start_utf16, visual_replacement_end_utf16) =
+        composition_visual_replacement_utf16(&projection, &projected)?;
     let projected_utf16_length =
         u64::try_from(projected.encode_utf16().count()).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
     let projected_utf8_length =
@@ -1348,6 +1381,8 @@ fn composition_projection_metadata(
         visual_selection_end_utf16,
         projected_utf16_length,
         projected_utf8_length,
+        visual_replacement_start_utf16,
+        visual_replacement_end_utf16,
     };
     Ok((metadata, projected))
 }
@@ -4346,6 +4381,8 @@ mod tests {
         assert_eq!(projection.preedit_selection_end_utf16, 4);
         assert_eq!(projection.visual_selection_start_utf16, 9);
         assert_eq!(projection.visual_selection_end_utf16, 11);
+        assert_eq!(projection.visual_replacement_start_utf16, 7);
+        assert_eq!(projection.visual_replacement_end_utf16, 11);
         assert_eq!(projection.projected_utf16_length, 17);
         assert_eq!(
             projection.projected_utf8_length,

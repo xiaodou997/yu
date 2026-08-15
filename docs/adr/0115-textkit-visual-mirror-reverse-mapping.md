@@ -22,14 +22,18 @@ Rust 已能把 canonical source selection/caret 投影为 visual UTF-16，但 Te
 - Swift 只在 self-check 或显式 opt-in pointer adapter 中创建临时 `NSTextStorage`/`NSLayoutManager`
   验证/命中 visual UTF-8；成功的 reverse mapping 才会把 source selection 同步到现有 source
   mirror。生产 `DocumentTextView` 默认仍保持 source mirror，visual editing 尚未切换。
+- composition metadata 追加 projected visual replacement UTF-16 range。opt-in visual mirror 在
+  marked text active 时只接受与 mirror 相同 Revision + generation 的 projected preedit，并从该
+  range 实现 `markedRange`/`attributedSubstring`；source mirror 仍是过期或失败时的回退。
 
 ## 结果
 
 - visual/source 双向坐标协议已经可以独立测试，native 后续可以把鼠标/拖选结果提交给 Rust
   selection，而不在 Swift 维护第二份 Markdown 语义。
 - Rust source Revision 变化后旧 visual mirror 查询会立即失败，避免 late callback 覆盖新 source。
-- `DocumentTextView` 已有 opt-in 点击/拖选 adapter 和安全 source fallback；下一步仍需在真实 visual
-  view 中接入上下移动、滚动 origin 和 IME 坐标，再决定是否替换 source TextKit mirror。
+- `DocumentTextView` 已有 opt-in 点击/拖选 adapter、visual composition marked-range adapter 和安全
+  source fallback；下一步仍需在真实 visual view 中接入上下移动、滚动 origin 和完整 IME 坐标，再决定
+  是否替换 source TextKit mirror。
 
 ## 验证
 
@@ -37,4 +41,6 @@ Rust 已能把 canonical source selection/caret 投影为 visual UTF-16，但 Te
 cargo test -p yu-storage-ffi ffi_projection_visual_mirror_maps_caret_and_selection_back_to_source
 swift run --package-path experiments/macos-document-host YuMacDocumentHost \
   --visual-mirror-self-check experiments/macos-document-host/Fixtures/projection.md
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --visual-ime-self-check experiments/macos-document-host/Fixtures/projection.md
 ```

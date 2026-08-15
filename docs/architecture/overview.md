@@ -390,6 +390,10 @@ Rust reverse mapping 校验 hidden delimiter 和 Unicode；Rust source 发生编
 拒绝。`DocumentTextView` 已增加 opt-in 的 visual pointer adapter：它可以用临时 visual TextKit
 layout 将点击/拖选结果交给 Rust reverse mapping，再把 canonical source range 同步回现有 source
 mirror；默认仍关闭该路径，生产窗口在 visual renderer 完成前继续走 AppKit source selection。
+同一 opt-in mirror 在 composition active 时还可以消费 storage FFI 返回的 visual replacement range
+和 generation-bound projected preedit，并让 `markedRange`/`attributedSubstring` 读取 visual
+坐标；metadata、文本和 callback 必须匹配同一 Revision + generation，过期时清空 visual mirror
+并保留 source mirror 回退。该路径只用于协议 self-check，尚未替换生产 IME renderer。
 
 storage FFI 现在还提供 parser-owned block 的 `yu_storage_session_block_layout`，以及 macOS
 `yu_storage_session_macos_block_layout`/`yu_storage_session_macos_block_caret`。前者使用显式
