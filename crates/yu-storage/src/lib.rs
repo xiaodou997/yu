@@ -17,9 +17,9 @@ use std::time::SystemTime;
 
 use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
 use yu_editor::{
-    CommandResult, CompositionError, CompositionOverlay, EditorCommand, EditorDocument,
-    EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, Projection, ViewportRect,
-    ViewportSnapshot,
+    BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
+    EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, Projection,
+    ViewportRect, ViewportSnapshot,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -207,6 +207,36 @@ impl DocumentSession {
             .expect("a snapshot's full range is always ordered");
         self.editor
             .projection(source_range)
+            .cloned()
+            .map_err(StorageError::Editor)
+    }
+
+    /// Returns the number of parser-owned blocks in the current source
+    /// revision. Block indices are stable only for this revision and must be
+    /// paired with the revision returned by the session.
+    #[must_use]
+    pub fn block_count(&self) -> usize {
+        self.editor.markdown().blocks().len()
+    }
+
+    /// Returns source-backed metadata for one parser-owned block. The scalar
+    /// kind is the stable Markdown block tag used by the native boundary; the
+    /// Rust enum itself never crosses the FFI.
+    #[must_use]
+    pub fn block_metadata(&self, index: usize) -> Option<(TextRange, u8)> {
+        self.editor
+            .markdown()
+            .blocks()
+            .get(index)
+            .map(|block| (block.range(), block.kind().viewport_tag()))
+    }
+
+    /// Builds an owned projection for one parser-owned block. The projection
+    /// remains tied to the current editor revision and is safe to hand to a
+    /// synchronous native snapshot query.
+    pub fn block_projection(&mut self, index: usize) -> Result<BlockProjection, StorageError> {
+        self.editor
+            .block_projection(index)
             .cloned()
             .map_err(StorageError::Editor)
     }
@@ -534,6 +564,20 @@ impl DocumentEditorSession {
     /// that owns source, revision, selection and history.
     pub fn inline_projection(&mut self) -> Result<Projection, StorageError> {
         self.document.inline_projection()
+    }
+
+    #[must_use]
+    pub fn block_count(&self) -> usize {
+        self.document.block_count()
+    }
+
+    #[must_use]
+    pub fn block_metadata(&self, index: usize) -> Option<(TextRange, u8)> {
+        self.document.block_metadata(index)
+    }
+
+    pub fn block_projection(&mut self, index: usize) -> Result<BlockProjection, StorageError> {
+        self.document.block_projection(index)
     }
 
     #[must_use]

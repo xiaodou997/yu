@@ -16,9 +16,9 @@ use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
-    AccessibilityTextSnapshot, CaretAffinity, CommandResult, EditorCommand, EditorDocumentError,
-    EditorKey, KeyEvent, KeyModifiers, KeyRouteResult, Projection, ProjectionBias, SelectionError,
-    SourceSync, VisualOffset, VisualRunKind,
+    AccessibilityTextSnapshot, BlockProjection, BlockProjectionKind, CaretAffinity, CommandResult,
+    EditorCommand, EditorDocumentError, EditorKey, KeyEvent, KeyModifiers, KeyRouteResult,
+    Projection, ProjectionBias, SelectionError, SourceSync, VisualOffset, VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
@@ -82,6 +82,18 @@ pub const YU_STORAGE_SOURCE_SYNC_RANGE: u8 = 1;
 pub const YU_STORAGE_SOURCE_SYNC_FULL: u8 = 2;
 pub const YU_STORAGE_CARET_AFFINITY_UPSTREAM: u8 = 0;
 pub const YU_STORAGE_CARET_AFFINITY_DOWNSTREAM: u8 = 1;
+pub const YU_STORAGE_PROJECTION_BLOCK_BLANK_LINE: u8 = 0;
+pub const YU_STORAGE_PROJECTION_BLOCK_REFERENCE_DEFINITION: u8 = 1;
+pub const YU_STORAGE_PROJECTION_BLOCK_PARAGRAPH: u8 = 2;
+pub const YU_STORAGE_PROJECTION_BLOCK_HEADING: u8 = 3;
+pub const YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE: u8 = 4;
+pub const YU_STORAGE_PROJECTION_BLOCK_BLOCK_QUOTE: u8 = 5;
+pub const YU_STORAGE_PROJECTION_BLOCK_LIST_ITEM: u8 = 6;
+pub const YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM: u8 = 7;
+pub const YU_STORAGE_PROJECTION_INLINE: u8 = 0;
+pub const YU_STORAGE_PROJECTION_FENCED_CODE: u8 = 1;
+pub const YU_STORAGE_PROJECTION_REFERENCE_DEFINITION: u8 = 2;
+pub const YU_STORAGE_PROJECTION_TASK_LIST: u8 = 3;
 
 pub const YU_STORAGE_DISK_UNCHANGED: u8 = 0;
 pub const YU_STORAGE_DISK_CHANGED: u8 = 1;
@@ -157,6 +169,23 @@ pub struct YuStorageProjectionCaret {
     pub visual_utf16: u64,
     pub round_trip_source_utf16: u64,
     pub affinity: u8,
+}
+
+/// Revision-bound metadata for one parser-owned block projection. The visual
+/// bytes are returned by the companion query; lengths are included here so a
+/// native host can validate its allocation and its UTF-16 layout without
+/// reparsing Markdown.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageProjectionBlock {
+    pub revision: u64,
+    pub block_index: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub visual_utf8_length: u64,
+    pub visual_utf16_length: u64,
+    pub kind: u8,
+    pub projection_kind: u8,
 }
 
 /// Revision-bound source coordinates used by the native Accessibility adapter.
@@ -903,6 +932,15 @@ fn projection_bias_from_affinity(affinity: CaretAffinity) -> ProjectionBias {
     }
 }
 
+fn projection_kind_tag(projection: &BlockProjection) -> u8 {
+    match projection.kind() {
+        BlockProjectionKind::Inline => YU_STORAGE_PROJECTION_INLINE,
+        BlockProjectionKind::FencedCode => YU_STORAGE_PROJECTION_FENCED_CODE,
+        BlockProjectionKind::ReferenceDefinition => YU_STORAGE_PROJECTION_REFERENCE_DEFINITION,
+        BlockProjectionKind::TaskList => YU_STORAGE_PROJECTION_TASK_LIST,
+    }
+}
+
 fn validate_revision(session: &DocumentEditorSession, expected: u64) -> Result<(), i32> {
     if session.revision().get() != expected {
         return Err(YU_STORAGE_STALE_REVISION);
@@ -1508,6 +1546,112 @@ pub unsafe extern "C" fn yu_storage_session_projection_caret(
     YU_STORAGE_OK
 }
 
+/// Returns the number of parser-owned blocks in the expected source revision.
+/// Block indices are revision-bound and must be queried again after an edit.
+///
+/// # Safety
+/// `session` and `output` must be valid pointers for the duration of this
+/// synchronous call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_projection_block_count(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    // SAFETY: `output` was checked above and belongs to the caller.
+    unsafe { *output = session.session.block_count() };
+    YU_STORAGE_OK
+}
+
+/// Returns one parser-owned block projection as owned UTF-8 plus revision,
+/// source-range, kind and visual-length metadata. The null/zero-capacity
+/// output form is a safe length query and still fills `metadata`.
+///
+/// # Safety
+/// `session` must be a live handle. `metadata` and `written` must be writable;
+/// `output` must provide `capacity` writable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_projected_block(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block_index: u64,
+    metadata: *mut YuStorageProjectionBlock,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if metadata.is_null() || written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let block_index = match usize::try_from(block_index) {
+        Ok(index) => index,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let Some((source_range, kind)) = session.session.block_metadata(block_index) else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let projection = match session.session.block_projection(block_index) {
+        Ok(projection) => projection,
+        Err(error) => return storage_status(error),
+    };
+    let projected = match projected_utf8(projection.visual()) {
+        Ok(projected) => projected,
+        Err(status) => return status,
+    };
+    let snapshot = session.session.snapshot();
+    let source_start_utf16 = match snapshot.utf16_offset(source_range.start()) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let source_end_utf16 = match snapshot.utf16_offset(source_range.end()) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let block_index = match u64::try_from(block_index) {
+        Ok(index) => index,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let visual_utf8_length = match u64::try_from(projected.len()) {
+        Ok(length) => length,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let visual_utf16_length = match u64::try_from(projected.encode_utf16().count()) {
+        Ok(length) => length,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    // SAFETY: `metadata` was checked above and belongs to the caller. No
+    // metadata is written until every revision/range/projection conversion
+    // has succeeded.
+    unsafe {
+        *metadata = YuStorageProjectionBlock {
+            revision: session.session.revision().get(),
+            block_index,
+            source_start_utf16,
+            source_end_utf16,
+            visual_utf8_length,
+            visual_utf16_length,
+            kind,
+            projection_kind: projection_kind_tag(&projection),
+        };
+    }
+    write_bytes(projected.as_bytes(), output, capacity, written)
+}
+
 /// Copies a UTF-16-addressed source range without exposing Rust storage to the
 /// native host. The range belongs to `expected_revision` and is suitable for a
 /// local native mirror update after a command result reports `SOURCE_SYNC_RANGE`.
@@ -2110,6 +2254,138 @@ mod tests {
                     2,
                     YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
                     &mut caret,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_block_projection_is_revision_bound_and_parser_owned() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-block-projection-{id}.md"));
+        let source = "# 标题\n\n段落 **粗体** 和 [链接](https://example.com)。\n\n- [ ] 任务\n\n```rust\nfn main() {}\n```\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut count = 0;
+        assert_eq!(
+            unsafe { yu_storage_session_projection_block_count(raw, 0, &mut count) },
+            YU_STORAGE_OK
+        );
+        assert!(count >= 7);
+        let mut previous_end = 0_u64;
+        let mut seen_kinds = Vec::new();
+        let mut projected_blocks = Vec::new();
+        for index in 0..count {
+            let mut metadata = YuStorageProjectionBlock::default();
+            let mut required = 0;
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_projected_block(
+                        raw,
+                        0,
+                        index as u64,
+                        &mut metadata,
+                        ptr::null_mut(),
+                        0,
+                        &mut required,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            assert_eq!(metadata.revision, 0);
+            assert_eq!(metadata.block_index, index as u64);
+            assert!(metadata.source_start_utf16 <= metadata.source_end_utf16);
+            assert!(metadata.source_start_utf16 >= previous_end);
+            previous_end = metadata.source_end_utf16;
+            assert_eq!(required, metadata.visual_utf8_length as usize);
+            let mut projected = vec![0_u8; required];
+            let mut written = 0;
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_projected_block(
+                        raw,
+                        0,
+                        index as u64,
+                        &mut metadata,
+                        projected.as_mut_ptr(),
+                        projected.len(),
+                        &mut written,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            assert_eq!(written, required);
+            assert_eq!(metadata.visual_utf8_length as usize, projected.len());
+            assert_eq!(
+                metadata.visual_utf16_length as usize,
+                String::from_utf8_lossy(&projected).encode_utf16().count()
+            );
+            seen_kinds.push(metadata.kind);
+            projected_blocks.push(String::from_utf8(projected).expect("projected UTF-8"));
+        }
+        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_HEADING));
+        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM));
+        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE));
+        assert!(projected_blocks.iter().any(|text| text.contains("粗体")));
+        assert!(projected_blocks.iter().any(|text| text.contains("链接")));
+        assert!(projected_blocks.iter().any(|text| text.contains("任务")));
+        assert!(projected_blocks.iter().any(|text| text.contains("fn main")));
+        assert!(
+            projected_blocks
+                .iter()
+                .all(|text| !text.contains("**粗体**"))
+        );
+        assert!(
+            projected_blocks
+                .iter()
+                .all(|text| !text.contains("[链接](https://example.com)"))
+        );
+
+        let mut metadata = YuStorageProjectionBlock::default();
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projected_block(
+                    raw,
+                    0,
+                    count as u64,
+                    &mut metadata,
+                    ptr::null_mut(),
+                    0,
+                    &mut written,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"x".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_projection_block_count(raw, 0, &mut count) },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projected_block(
+                    raw,
+                    0,
+                    0,
+                    &mut metadata,
+                    ptr::null_mut(),
+                    0,
+                    &mut written,
                 )
             },
             YU_STORAGE_STALE_REVISION
