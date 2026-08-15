@@ -454,6 +454,17 @@ typedef struct YuStorageMacosRenderHostSnapshot {
     uint8_t published;
 } YuStorageMacosRenderHostSnapshot;
 
+typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
+    uint64_t revision;
+    uint64_t surface_generation;
+    uint64_t frame_serial;
+    uint64_t uploaded_pages;
+    uint64_t command_count;
+    uint64_t damage_count;
+    uint64_t atlas_page_count;
+    uint8_t submitted;
+} YuStorageMacosRenderHostSurfaceSnapshot;
+
 typedef struct YuStorageVisualSceneGlyph {
     uint64_t revision;
     uint64_t block_index;
@@ -666,6 +677,11 @@ int32_t yu_storage_session_macos_render_host_frame(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
     uint64_t surface_generation, YuStorageMacosRenderHostSnapshot *snapshot);
+int32_t yu_storage_session_macos_render_host_surface_submit(
+    YuStorageSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height,
+    double surface_width, double surface_height, double scale, void *view,
+    YuStorageMacosRenderHostSurfaceSnapshot *snapshot);
 int32_t yu_storage_session_macos_visual_scene_glyphs(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,

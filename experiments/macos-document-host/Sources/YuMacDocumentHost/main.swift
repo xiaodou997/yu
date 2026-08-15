@@ -470,6 +470,28 @@ private struct NativeMacosRenderHostSnapshot {
     }
 }
 
+private struct NativeMacosRenderHostSurfaceSnapshot {
+    let revision: UInt64
+    let surfaceGeneration: UInt64
+    let frameSerial: UInt64
+    let uploadedPages: Int
+    let commandCount: Int
+    let damageCount: Int
+    let atlasPageCount: Int
+    let submitted: Bool
+
+    init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
+        revision = value.revision
+        surfaceGeneration = value.surface_generation
+        frameSerial = value.frame_serial
+        uploadedPages = Int(value.uploaded_pages)
+        commandCount = Int(value.command_count)
+        damageCount = Int(value.damage_count)
+        atlasPageCount = Int(value.atlas_page_count)
+        submitted = value.submitted != 0
+    }
+}
+
 private struct NativeVisualRenderCommand {
     let revision: UInt64
     let blockIndex: UInt64
@@ -1568,6 +1590,37 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeMacosRenderHostSnapshot(value)
+    }
+
+    func macosRenderHostSurfaceSubmit(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float,
+        surfaceWidth: Double,
+        surfaceHeight: Double,
+        scale: Double,
+        view: UnsafeMutableRawPointer
+    ) throws -> NativeMacosRenderHostSurfaceSnapshot {
+        var value = YuStorageMacosRenderHostSurfaceSnapshot()
+        let status = yu_storage_session_macos_render_host_surface_submit(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            surfaceWidth,
+            surfaceHeight,
+            scale,
+            view,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeMacosRenderHostSurfaceSnapshot(value)
     }
 
     func macosShapedCaretScrollRequest(
@@ -4803,6 +4856,117 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
     }
 }
 
+private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let viewportHeight: Float = 240.0
+        let shaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: 2,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(shaped.lineHeight),
+            defaultAdvance: Float(shaped.defaultAdvance),
+            estimatedBlockHeight: Float(shaped.lineHeight),
+            overscan: 0.0
+        )
+
+        let application = NSApplication.shared
+        application.setActivationPolicy(.regular)
+        let frame = NSRect(
+            x: 0.0,
+            y: 0.0,
+            width: CGFloat(maxWidth),
+            height: CGFloat(viewportHeight)
+        )
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        let view = NSView(frame: frame)
+        window.contentView = view
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        application.activate(ignoringOtherApps: true)
+        window.displayIfNeeded()
+        defer {
+            window.orderOut(nil)
+            window.close()
+        }
+
+        let rawView = Unmanaged.passUnretained(view).toOpaque()
+        let first = try bridge.macosRenderHostSurfaceSubmit(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: viewportHeight,
+            surfaceWidth: Double(maxWidth),
+            surfaceHeight: Double(viewportHeight),
+            scale: 2.0,
+            view: rawView
+        )
+        precondition(first.revision == revision)
+        precondition(first.surfaceGeneration == 0)
+        precondition(first.frameSerial > 0)
+        precondition(first.uploadedPages > 0)
+        precondition(first.commandCount > 0)
+        precondition(first.damageCount > 0)
+        precondition(first.atlasPageCount > 0)
+        precondition(first.submitted)
+
+        _ = try bridge.insertText("!")
+        do {
+            _ = try bridge.macosRenderHostSurfaceSubmit(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: viewportHeight,
+                surfaceWidth: Double(maxWidth),
+                surfaceHeight: Double(viewportHeight),
+                scale: 2.0,
+                view: rawView
+            )
+            preconditionFailure("stale Metal surface submission unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+
+        let next = try bridge.macosRenderHostSurfaceSubmit(
+            revision: bridge.state.revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: viewportHeight,
+            surfaceWidth: Double(maxWidth),
+            surfaceHeight: Double(viewportHeight),
+            scale: 2.0,
+            view: rawView
+        )
+        precondition(next.revision == bridge.state.revision)
+        precondition(next.frameSerial > first.frameSerial)
+        precondition(next.submitted)
+        print(
+            "Yu macOS Metal surface self-check: CAMetalLayer attachment, real drawable submit, "
+                + "atlas upload and stale Revision rejection are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu macOS Metal surface self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func unwrapSelfCheck<T>(_ value: T?) throws -> T {
     guard let value else {
         throw BridgeError.operation(14)
@@ -5107,6 +5271,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-render-plan-self-ch
 if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runMacosRenderHostSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-surface-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runMacosRenderHostSurfaceSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
