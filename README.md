@@ -206,6 +206,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [Visual viewport scroll coordinate contract](docs/adr/0116-visual-viewport-scroll-coordinate.md)
 - [Revision-bound visual scene snapshot bridge](docs/adr/0117-visual-scene-snapshot.md)
 - [Shaped glyph RenderPlan publication](docs/adr/0118-visual-render-plan-publication.md)
+- [CoreText to Metal frame preparation](docs/adr/0119-coretext-metal-frame-preparation.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)

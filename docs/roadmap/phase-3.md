@@ -38,9 +38,10 @@ retained scene/GPU 绘制。
 
 - [x] Rust `ViewportSceneInput`/`SceneBuilder` 生成 Revision-bound 最小 owned scene snapshot，macOS host 以 count/fill 自检 primitive 顺序、来源范围、坐标和 stale 丢弃（诊断桥，尚未替换生产 renderer）
 - [x] Rust 使用 CoreText glyph rasterization、CPU `GlyphAtlas` 与 `yu_workspace::assemble_viewport_render_frame` 生成 Revision-bound RenderPlan；macOS host 以 count/fill 自检 glyph command、atlas page fingerprint、damage 和 stale 丢弃（诊断桥，尚未接入 Metal）
+- [x] `yu-render-macos` 新增持久 `CoreTextViewportFrameBuilder`，重复 Revision 重用 CPU atlas/RenderPlan fingerprint；ignored AppKit probe 使用真实 CoreText publication 进入 `MetalAtlas`/retained target（生产窗口仍未切换）
 - [ ] Visual tree → retained scene primitive
 - [ ] damage/viewport cache 与 Rust revision 发布协议
-- [ ] macOS native GPU surface 只消费 owned scene snapshot
+- [x] macOS native GPU surface 在 ignored AppKit probe 中消费 Rust-owned CoreText workspace publication（生产窗口仍保留 source mirror）
 - [ ] heading、emphasis、code、link 的最小真实 visual render
 
 ## 约束

@@ -26,6 +26,12 @@ use yu_workspace::{
 };
 
 #[cfg(target_os = "macos")]
+mod core_text;
+
+#[cfg(target_os = "macos")]
+pub use core_text::{CoreTextViewportFrameBuilder, CoreTextViewportFrameError};
+
+#[cfg(target_os = "macos")]
 mod native {
     use std::ffi::c_void;
 
@@ -2265,12 +2271,10 @@ mod tests {
     #[ignore = "requires a macOS session with a Metal-capable device"]
     #[test]
     fn macos_device_surface_and_atlas_upload_are_live() {
-        use yu_core::Revision;
-        use yu_font::{
-            FontFaceId, GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphId, GlyphMetrics,
-            GlyphRasterKey, RasterizedGlyph,
-        };
-        use yu_scene::{GlyphPrimitive, Point, Rect, Rgba8, SceneBuilder};
+        use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportRect};
+        use yu_font::{FontRequest, GlyphAtlasConfig};
+        use yu_scene::{Rect, Rgba8};
+        use yu_workspace::ViewportRenderConfig;
 
         let device = MetalDevice::system_default().expect("Metal device");
         assert_ne!(device.registry_id(), 0);
@@ -2282,41 +2286,49 @@ mod tests {
             .expect("surface resize");
         assert_eq!(surface.generation(), 1);
 
-        let key =
-            GlyphRasterKey::new(FontFaceId::from_raw(1), GlyphId::from_raw(7), 14.0).expect("key");
-        let bitmap = GlyphBitmap::new(2, 2, 2, vec![255; 4]).expect("bitmap");
-        let metrics = GlyphMetrics::new(0.0, 2.0, 2.0).expect("metrics");
-        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"));
-        let entry = atlas
-            .insert(RasterizedGlyph::new(key, metrics, bitmap))
-            .expect("atlas entry");
-        let mut scene_builder = SceneBuilder::new(
-            Revision::INITIAL,
-            Rect::new(0.0, 0.0, 32.0, 32.0).expect("viewport"),
+        let font_size = 14.0;
+        let shaper = yu_font_macos::CoreTextShaper::from_system_ui(
+            FontRequest::new(".SFNS-Regular", font_size).expect("font request"),
         )
-        .expect("scene builder");
-        scene_builder
-            .glyph(GlyphPrimitive::new(
-                entry,
-                Point::new(4.0, 12.0),
-                Rgba8::white(),
+        .expect("CoreText shaper");
+        let metrics = shaper.viewport_metrics("A羽🙂").expect("CoreText metrics");
+        let mut document = EditorDocument::new("# Yu Metal\n\nhello **viewport**");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(280.0, metrics.line_height()),
+                metrics.line_height(),
+                0.0,
             ))
-            .expect("glyph");
-        let plan = yu_render::RenderPlanBuilder::new()
-            .build(&scene_builder.finish(), &atlas)
-            .expect("render plan");
+            .expect("viewport config");
+        let mut builder = CoreTextViewportFrameBuilder::with_shaper(
+            shaper,
+            ViewportRenderConfig::new(
+                ViewportRect::new(0.0, 160.0),
+                font_size,
+                Rect::new(0.0, 0.0, 320.0, 180.0).expect("scene viewport"),
+                Rgba8::white(),
+            ),
+            GlyphAtlasConfig::new(1024, 1024, 2).expect("atlas config"),
+        )
+        .expect("CoreText viewport builder");
+        let publication = builder
+            .publish(&mut document)
+            .expect("CoreText render plan");
+        let plan = publication.frame().plan();
+        assert!(!plan.commands().is_empty());
+        assert!(!plan.uploads().is_empty());
         let mut uploader = MetalUploader::new(device.clone());
         let mut gpu_atlas = MetalAtlas::new();
         assert_eq!(
             gpu_atlas
-                .sync_plan(&mut uploader, &plan)
+                .sync_plan(&mut uploader, plan)
                 .expect("alpha texture"),
             1
         );
         assert_eq!(gpu_atlas.page_count(), 1);
 
         let mut frame_renderer = MetalFrameRenderer::new(device).expect("command queue/pipeline");
-        let result = frame_renderer.render_plan(&surface, &plan, &gpu_atlas);
+        let result = frame_renderer.render_plan(&surface, plan, &gpu_atlas);
         assert!(matches!(
             result,
             Ok(()) | Err(MetalRenderError::DrawableUnavailable)
@@ -2345,75 +2357,42 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn appkit_probe_publication() -> ViewportFramePublication {
-        use std::sync::Arc;
-
         use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportRect};
-        use yu_font::{
-            FontDatabase, FontFaceSpec, FontRequest, FontShaper, GlyphAtlas, GlyphAtlasConfig,
-            GlyphBitmap, GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
-        };
+        use yu_font::{FontRequest, GlyphAtlasConfig};
         use yu_scene::{Rect, Rgba8};
-        use yu_workspace::{ViewportFramePublisher, ViewportRenderConfig};
+        use yu_workspace::ViewportRenderConfig;
 
         let font_size = 14.0;
-        let mut database = FontDatabase::new();
-        database
-            .register(FontFaceSpec::new("Probe", 0.5))
-            .expect("probe font");
-        let shaper = FontShaper::new(
-            Arc::new(database),
-            FontRequest::new("Probe", font_size).expect("probe font request"),
+        let shaper = yu_font_macos::CoreTextShaper::from_system_ui(
+            FontRequest::new(".SFNS-Regular", font_size).expect("probe font request"),
         )
-        .expect("probe shaper");
+        .expect("CoreText probe shaper");
+        let metrics = shaper
+            .viewport_metrics("A羽🙂")
+            .expect("CoreText probe metrics");
         let viewport = ViewportRect::new(0.0, 160.0);
         let mut document = EditorDocument::new("# Yu Metal\n\nhello **viewport**");
         document
             .set_viewport_config(ViewportConfig::new(
-                LayoutConfig::new(280.0, 20.0),
-                20.0,
+                LayoutConfig::new(280.0, metrics.line_height()),
+                metrics.line_height(),
                 0.0,
             ))
             .expect("probe viewport config");
-
-        let snapshot = document
-            .visible_blocks_with_shaper(viewport, &shaper)
-            .expect("probe viewport");
-        let config = document.viewport_config().layout();
-        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(64, 64, 1).expect("atlas config"));
-        for block in snapshot.blocks() {
-            let layout = document
-                .block_layout_with_shaper(block.index(), config, &shaper)
-                .expect("probe layout");
-            for placement in layout.glyphs() {
-                let key = GlyphRasterKey::new(placement.face(), placement.glyph(), font_size)
-                    .expect("probe glyph key");
-                if atlas.entry(key).is_none() {
-                    atlas
-                        .insert(RasterizedGlyph::new(
-                            key,
-                            GlyphMetrics::new(0.0, 10.0, 7.0).expect("probe glyph metrics"),
-                            GlyphBitmap::new(2, 3, 2, vec![255; 6]).expect("probe glyph bitmap"),
-                        ))
-                        .expect("probe atlas insert");
-                }
-            }
-        }
-
-        let mut publisher = ViewportFramePublisher::new();
-        publisher
-            .publish(
-                &mut document,
-                ViewportRenderConfig::new(
-                    viewport,
-                    font_size,
-                    Rect::new(0.0, 0.0, 320.0, 180.0).expect("probe scene viewport"),
-                    Rgba8::new(24, 28, 36, 255),
-                ),
-                &shaper,
-                &atlas,
-                &mut yu_render::RenderPlanBuilder::new(),
-            )
-            .expect("probe workspace frame")
+        let mut builder = CoreTextViewportFrameBuilder::with_shaper(
+            shaper,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 320.0, 180.0).expect("probe scene viewport"),
+                Rgba8::new(24, 28, 36, 255),
+            ),
+            GlyphAtlasConfig::new(1024, 1024, 2).expect("atlas config"),
+        )
+        .expect("CoreText viewport builder");
+        builder
+            .publish(&mut document)
+            .expect("CoreText workspace frame")
     }
 
     #[cfg(target_os = "macos")]

@@ -522,6 +522,14 @@ Revision 不会发布部分窗口；atlas 像素、CoreText object、layout/cach
 CoreText numeric face id 由进程内共享 catalog 保持稳定，因此反复建立 shaper 不需要清空 layout cache。
 `--visual-render-plan-self-check` 只验证此边界，生产 TextKit mirror 和 Metal surface 仍未切换。
 
+`platform/macos/yu-render-macos::CoreTextViewportFrameBuilder` 是诊断 FFI 与 backend 之间的 Rust
+准备层：它持有稳定 `CoreTextShaper`、CPU `GlyphAtlas`、`RenderPlanBuilder` 和
+`ViewportFramePublisher`，按可见 shaped layout 按需 rasterize glyph，并让同一 page fingerprint
+跨 Revision 进入 `MetalAtlas`。`publish_and_submit` 严格复用
+`publication → revision gate → atlas sync → render_plan → consumer commit` 顺序；它不持有
+`EditorDocument`、surface 或 GPU handle。ignored AppKit probe 现在使用真实 CoreText publication
+验证 attachment/resize/drawable/retained target，生产窗口仍未调用该入口。
+
 `platform/macos/yu-render-macos` 是共享 render boundary 之外的第一层真实 backend：Rust 侧拥有
 `MetalDevice`、`CAMetalLayer`、surface generation、`MetalTexture`、`MetalAtlas`、
 `MetalPipeline` 和 backend-owned retained color target，Objective-C bridge 只负责 Apple

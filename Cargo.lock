@@ -171,6 +171,7 @@ dependencies = [
  "yu-core",
  "yu-editor",
  "yu-font",
+ "yu-font-macos",
  "yu-render",
  "yu-scene",
  "yu-workspace",

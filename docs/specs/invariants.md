@@ -421,3 +421,16 @@
     实例之间保持稳定；layout cache 可以把 face id 交给后续新建的 rasterizer，不能依赖清空 layout
     state 来修复 shaper identity。Face catalog 只保存 Rust-owned PostScript name metadata，不得
     把 `CTFontRef` 或 native pointer 写入 shared editor/layout state。
+
+## CoreText viewport preparation
+
+1. `CoreTextViewportFrameBuilder` 可以持有 shaper、CPU `GlyphAtlas`、`RenderPlanBuilder` 和
+   `ViewportFramePublisher`，但不得持有 `EditorDocument`、canonical source、selection、history、
+   `MetalSurface`、`MTLTexture` 或其他 native pointer；`publish` 只能从调用方传入的当前 document
+   Revision 读取并发布 frame。
+2. builder 的可见 glyph rasterization 必须先确保所有 layout placement 都有同一 font size 的 atlas
+   entry，再调用 staged `ViewportFramePublisher`；同一 Revision 的重复 publish 不得重复产生未变化
+   page upload，新增 glyph 导致 page fingerprint 变化时才允许产生增量 upload。
+3. `publish_and_submit` 必须保持 `CoreText preparation → publication/revision gate → MetalAtlas
+   sync → MetalFrameRenderer::render_plan → consumer commit` 顺序；任何 preparation、stale、atlas、
+   native 或 drawable 失败都不得推进 host 的 last submission 或 consumer Revision。
