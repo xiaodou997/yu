@@ -13,7 +13,8 @@ use std::fmt;
 use yu_core::{ByteOffset, Revision, TextRange};
 use yu_markdown::{
     Block, BlockKind, InlineDocument, InlineNodeKind, InlineSpan, InlineSpanKind,
-    ReferenceDefinitionIndex, TaskState, parse, parse_inline_with_definitions,
+    ReferenceDefinitionIndex, TableAlignment, TableBlock, TaskState, parse,
+    parse_inline_with_definitions, parse_table,
 };
 use yu_text::{TextBuffer, TextPositionError, TextSnapshot};
 
@@ -260,6 +261,9 @@ fn render_block(
     match block.kind() {
         BlockKind::BlankLine | BlockKind::ReferenceDefinition => Ok(String::new()),
         BlockKind::Paragraph => {
+            if let Some(table) = parse_table(source) {
+                return render_table(source, &table);
+            }
             let mut html = String::from("<p>");
             render_inline(snapshot, definitions, block.range(), &mut html)?;
             html.push_str("</p>");
@@ -283,6 +287,55 @@ fn render_block(
         BlockKind::ListItem { .. } | BlockKind::TaskListItem { .. } => {
             render_list_run(snapshot, &[block])
         }
+    }
+}
+
+fn render_table(source: &str, table: &TableBlock) -> Result<String, ExportError> {
+    let mut html = String::from("<table><thead><tr>");
+    for (cell, alignment) in table.header().iter().zip(table.alignments()) {
+        html.push_str("<th");
+        html.push_str(table_alignment_attribute(*alignment));
+        html.push('>');
+        render_table_cell(source, *cell, &mut html)?;
+        html.push_str("</th>");
+    }
+    html.push_str("</tr></thead>");
+    if !table.rows().is_empty() {
+        html.push_str("<tbody>");
+        for row in table.rows() {
+            html.push_str("<tr>");
+            for (cell, alignment) in row.iter().zip(table.alignments()) {
+                html.push_str("<td");
+                html.push_str(table_alignment_attribute(*alignment));
+                html.push('>');
+                render_table_cell(source, *cell, &mut html)?;
+                html.push_str("</td>");
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</tbody>");
+    }
+    html.push_str("</table>");
+    Ok(html)
+}
+
+fn render_table_cell(
+    source: &str,
+    cell: yu_markdown::TableCellRange,
+    output: &mut String,
+) -> Result<(), ExportError> {
+    let value = &source[cell.start()..cell.end()];
+    let inner = export_html_fragment(value)?;
+    append_tight_fragment_content(&inner, output);
+    Ok(())
+}
+
+fn table_alignment_attribute(alignment: TableAlignment) -> &'static str {
+    match alignment {
+        TableAlignment::Default => "",
+        TableAlignment::Left => " style=\"text-align: left\"",
+        TableAlignment::Center => " style=\"text-align: center\"",
+        TableAlignment::Right => " style=\"text-align: right\"",
     }
 }
 
@@ -575,7 +628,7 @@ fn render_list_level(
             html.push_str("> ");
         }
         let inner = export_html_fragment(&text)?;
-        append_tight_list_content(&inner, &mut html);
+        append_tight_fragment_content(&inner, &mut html);
 
         while *cursor < blocks.len() {
             let Some((child_ordered, child_depth)) = list_signature(blocks[*cursor].kind()) else {
@@ -633,7 +686,7 @@ fn list_item_content(source: &str, block: Block) -> (String, Option<TaskState>) 
     (text, task)
 }
 
-fn append_tight_list_content(inner: &str, output: &mut String) {
+fn append_tight_fragment_content(inner: &str, output: &mut String) {
     if let Some(content) = inner
         .strip_prefix("<p>")
         .and_then(|value| value.strip_suffix("</p>"))
@@ -770,6 +823,23 @@ mod tests {
             html,
             "<ul><li>parent\n<ul><li>child</li><li><strong>second</strong></li></ul></li><li>sibling</li></ul>"
         );
+    }
+
+    #[test]
+    fn gfm_tables_export_header_body_and_alignment_semantics() {
+        let source = "| Name | Count | Note |\n| :--- | ---: | :---: |\n| **Yu** | 2 | `a|b` |\n";
+        let html = export_html_fragment(source).expect("export table fragment");
+
+        assert_eq!(
+            html,
+            "<table><thead><tr><th style=\"text-align: left\">Name</th><th style=\"text-align: right\">Count</th><th style=\"text-align: center\">Note</th></tr></thead><tbody><tr><td style=\"text-align: left\"><strong>Yu</strong></td><td style=\"text-align: right\">2</td><td style=\"text-align: center\"><code>a|b</code></td></tr></tbody></table>"
+        );
+    }
+
+    #[test]
+    fn pipe_text_without_a_valid_delimiter_remains_a_paragraph() {
+        let html = export_html_fragment("a | b\nc | d\n").expect("export paragraph fragment");
+        assert_eq!(html, "<p>a | b\nc | d\n</p>");
     }
 
     #[test]
