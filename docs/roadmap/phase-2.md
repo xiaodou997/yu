@@ -39,7 +39,8 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] Rust 跨平台剪贴板格式契约：Markdown/纯文本/HTML 的 MIME、macOS UTI 和 payload 映射
 - [x] 保守 GFM table range parser 与 semantic HTML `<table>` 导出
 - [x] 受控 HTML fragment→Markdown policy：allowlist、危险 URL/属性拒绝、Markdown fallback 和 headless round trip
-- [ ] macOS HTML fallback 接线与 Windows/Linux native clipboard adapter
+- [x] macOS HTML fallback native adapter：Markdown > 纯文本 > 受控 HTML、拒绝回退与无窗口 self-check
+- [ ] Windows/Linux native clipboard adapter 与跨应用粘贴回归
 - [x] macOS 基础文件路径/标题、dirty、Revision、磁盘状态的状态栏、菜单和 TextKit Accessibility 投影
 - [x] macOS source-backed Accessibility 快照 FFI：UTF-16 字符数、选区、逻辑行范围和位置查询均绑定 Revision
 - [x] macOS Accessibility 回调在 close/reload/外部替换边界上失败可恢复，不因快照失效触发宿主崩溃
@@ -87,8 +88,8 @@ label、角色、task 状态/press、URL 属性、Rotor 返回目标和编辑后
 
 ## 下一步
 
-下一阶段应把受控 HTML→Markdown policy 接入 macOS paste fallback，并固定 URL 打开策略、图片/表格
-action 和跨平台 action adapter 的产品边界；Rotor/语义 action 的真实导航回归仍需补一轮。完整
-Markdown visual projection 仍放在这些边界稳定之后。在
+下一阶段应完成 macOS 跨应用 HTML paste 回归，并固定 URL 打开策略、图片/表格 action 和
+Windows/Linux clipboard/action adapter 的产品边界；Rotor/语义 action 的真实导航回归仍需补一轮。
+完整 Markdown visual projection 仍放在这些边界稳定之后。在
 进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
 storage/editor 两个独立 handle。

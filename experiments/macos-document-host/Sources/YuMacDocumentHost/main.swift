@@ -16,6 +16,7 @@ private enum StorageStatus {
     static let ok: Int32 = 0
     static let externalChange: Int32 = 4
     static let unsavedChanges: Int32 = 5
+    static let htmlImportRejected: Int32 = 18
 }
 
 private enum DiskState: UInt8 {
@@ -724,6 +725,53 @@ private final class StorageBridge {
         }
     }
 
+    /// Runs the stateless, allowlisted Rust HTML importer. A policy rejection
+    /// is deliberately represented as `nil`, allowing the native paste path
+    /// to use its plain-text fallback without exposing parser internals to
+    /// Swift.
+    func importHTML(_ html: String) throws -> String? {
+        let input = Array(html.utf8)
+        var required = 0
+        let queryStatus = input.withUnsafeBufferPointer { buffer in
+            yu_storage_import_html_fragment(
+                buffer.baseAddress,
+                buffer.count,
+                nil,
+                0,
+                &required
+            )
+        }
+        if queryStatus == StorageStatus.htmlImportRejected {
+            return nil
+        }
+        guard queryStatus == StorageStatus.ok else {
+            throw BridgeError.operation(queryStatus)
+        }
+
+        var bytes = Array(repeating: UInt8(0), count: required)
+        var written = 0
+        let copyStatus = bytes.withUnsafeMutableBufferPointer { buffer in
+            input.withUnsafeBufferPointer { inputBuffer in
+                yu_storage_import_html_fragment(
+                    inputBuffer.baseAddress,
+                    inputBuffer.count,
+                    buffer.baseAddress,
+                    buffer.count,
+                    &written
+                )
+            }
+        }
+        if copyStatus == StorageStatus.htmlImportRejected {
+            return nil
+        }
+        guard copyStatus == StorageStatus.ok,
+              written >= 0,
+              written <= bytes.count else {
+            throw BridgeError.operation(copyStatus)
+        }
+        return String(decoding: bytes.prefix(written), as: UTF8.self)
+    }
+
     func save() throws {
         var revision: UInt64 = 0
         var bytes: Int = 0
@@ -1190,7 +1238,7 @@ private final class DocumentTextView: NSTextView {
     override func paste(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
-            guard let text = sourceFromPasteboard(), !text.isEmpty else {
+            guard let text = try sourceFromPasteboard(), !text.isEmpty else {
                 return
             }
             apply(try bridge.insertText(text))
@@ -1203,7 +1251,18 @@ private final class DocumentTextView: NSTextView {
     }
 
     var hasSourceOnPasteboard: Bool {
-        sourceFromPasteboard() != nil
+        let pasteboard = NSPasteboard.general
+        return pasteboard.string(forType: .yuMarkdown) != nil
+            || pasteboard.string(forType: .string) != nil
+            || pasteboard.string(forType: .yuHTML) != nil
+    }
+
+    /// Headless self-check hook for the native pasteboard adapter. Production
+    /// paste still uses `NSPasteboard.general`; this overload only lets the
+    /// command-line check exercise the same priority/fallback logic on a
+    /// private pasteboard.
+    func sourceFromPasteboardForSelfCheck(_ pasteboard: NSPasteboard) throws -> String? {
+        try sourceFromPasteboard(pasteboard)
     }
 
     override func selectAll(_ sender: Any?) {
@@ -1352,10 +1411,17 @@ private final class DocumentTextView: NSTextView {
         }
     }
 
-    private func sourceFromPasteboard() -> String? {
-        let pasteboard = NSPasteboard.general
-        return pasteboard.string(forType: .yuMarkdown)
-            ?? pasteboard.string(forType: .string)
+    private func sourceFromPasteboard(_ pasteboard: NSPasteboard = .general) throws -> String? {
+        if let markdown = pasteboard.string(forType: .yuMarkdown) {
+            return markdown
+        }
+        if let plain = pasteboard.string(forType: .string) {
+            return plain
+        }
+        guard let html = pasteboard.string(forType: .yuHTML) else {
+            return nil
+        }
+        return try bridge.importHTML(html)
     }
 
     private func apply(_ result: NativeCommandResult) {
@@ -1991,6 +2057,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 }
 
+private func runClipboardSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let textView = DocumentTextView(bridge: bridge)
+        let pasteboard = NSPasteboard.withUniqueName()
+
+        pasteboard.clearContents()
+        precondition(
+            pasteboard.setString(
+                "<h2>Yu</h2><p><strong>羽</strong></p>",
+                forType: .yuHTML
+            )
+        )
+        let imported = try textView.sourceFromPasteboardForSelfCheck(pasteboard)
+        precondition(imported == "## Yu\n\n**羽**")
+
+        pasteboard.clearContents()
+        precondition(
+            pasteboard.setString(
+                "<script>alert(1)</script>",
+                forType: .yuHTML
+            )
+        )
+        let rejected = try textView.sourceFromPasteboardForSelfCheck(pasteboard)
+        precondition(rejected == nil)
+
+        pasteboard.clearContents()
+        precondition(pasteboard.setString("plain fallback", forType: .string))
+        precondition(
+            pasteboard.setString(
+                "<script>alert(1)</script>",
+                forType: .yuHTML
+            )
+        )
+        let plainFallback = try textView.sourceFromPasteboardForSelfCheck(pasteboard)
+        precondition(plainFallback == "plain fallback")
+
+        pasteboard.clearContents()
+        precondition(pasteboard.setString("**canonical**", forType: .yuMarkdown))
+        precondition(pasteboard.setString("<p>derived</p>", forType: .yuHTML))
+        let canonical = try textView.sourceFromPasteboardForSelfCheck(pasteboard)
+        precondition(canonical == "**canonical**")
+
+        print("Yu Clipboard self-check: Markdown > plain text > strict HTML fallback")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Clipboard self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runAccessibilitySelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -2146,6 +2263,10 @@ private func runAccessibilitySelfCheck(path: String) -> Never {
 }
 
 let app = NSApplication.shared
+if let flag = CommandLine.arguments.firstIndex(of: "--clipboard-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runClipboardSelfCheck(path: CommandLine.arguments[flag + 1])
+}
 if let flag = CommandLine.arguments.firstIndex(of: "--accessibility-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runAccessibilitySelfCheck(path: CommandLine.arguments[flag + 1])

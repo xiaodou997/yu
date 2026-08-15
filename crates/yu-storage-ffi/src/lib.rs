@@ -19,7 +19,7 @@ use yu_editor::{
     AccessibilityTextSnapshot, CaretAffinity, CommandResult, EditorCommand, EditorDocumentError,
     EditorKey, KeyEvent, KeyModifiers, KeyRouteResult, SelectionError, SourceSync,
 };
-use yu_export::{ExportError, export_clipboard};
+use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, DiskState, DocumentEditorSession, ExternalFileState,
     SaveOutcome, StorageError, Utf8Bom,
@@ -44,6 +44,7 @@ pub const YU_STORAGE_INVALID_SELECTION: i32 = 14;
 pub const YU_STORAGE_NO_OVERLAY: i32 = 15;
 pub const YU_STORAGE_STALE_COMPOSITION: i32 = 16;
 pub const YU_STORAGE_EXPORT_ERROR: i32 = 17;
+pub const YU_STORAGE_HTML_IMPORT_REJECTED: i32 = 18;
 
 pub const YU_STORAGE_KEY_CHARACTER: u8 = 0;
 pub const YU_STORAGE_KEY_ENTER: u8 = 1;
@@ -303,6 +304,14 @@ fn status_from_export_error(error: ExportError) -> i32 {
         ExportError::SourcePosition(_) => YU_STORAGE_INVALID_SELECTION,
         ExportError::InlineParse(_) => YU_STORAGE_EXPORT_ERROR,
     }
+}
+
+/// HTML import is intentionally a single, coarse native status. The native
+/// adapter must treat every policy rejection as a signal to use plain text;
+/// exposing parser internals here would make the C ABI depend on Markdown
+/// implementation details.
+fn status_from_html_import_error(_error: yu_export::HtmlImportError) -> i32 {
+    YU_STORAGE_HTML_IMPORT_REJECTED
 }
 
 fn disk_state(session: &DocumentEditorSession) -> Result<u8, StorageError> {
@@ -1434,6 +1443,38 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection_html(
     write_bytes(payload.html().as_bytes(), output, capacity, written)
 }
 
+/// Converts a trusted-size native `text/html` fragment to Markdown using Yu's
+/// strict allowlisted import policy. This function is stateless: it does not
+/// read or mutate a document session, and the caller must insert the returned
+/// source through the normal revision-bound command API.
+///
+/// A policy rejection returns `YU_STORAGE_HTML_IMPORT_REJECTED`; native code
+/// must then fall back to its `text/plain` payload. The output uses the same
+/// two-call owned UTF-8 convention as source queries.
+///
+/// # Safety
+/// `html` must point to a readable UTF-8 buffer of `html_length` bytes (or be
+/// null when the length is zero). `written` must be writable; `output` must
+/// provide `capacity` writable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_import_html_fragment(
+    html: *const u8,
+    html_length: usize,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let html = match read_utf8(html, html_length) {
+        Ok(html) => html,
+        Err(status) => return status,
+    };
+    let markdown = match import_html_fragment(html) {
+        Ok(markdown) => markdown,
+        Err(error) => return status_from_html_import_error(error),
+    };
+    write_bytes(markdown.as_bytes(), output, capacity, written)
+}
+
 /// Returns a compact source-backed Accessibility snapshot. Every coordinate
 /// in the result is valid only for `revision`; native queries must use the
 /// revision-bound range/copy functions below rather than retaining Rust text.
@@ -2340,5 +2381,68 @@ mod tests {
         );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn html_import_ffi_is_stateless_two_call_and_rejects_unsafe_markup() {
+        let html = "<h2>Yu</h2><p><strong>羽</strong></p>";
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_import_html_fragment(
+                    html.as_ptr(),
+                    html.len(),
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut markdown = vec![0_u8; required];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_import_html_fragment(
+                    html.as_ptr(),
+                    html.len(),
+                    markdown.as_mut_ptr(),
+                    markdown.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            String::from_utf8(markdown).expect("Markdown UTF-8"),
+            "## Yu\n\n**羽**"
+        );
+
+        let unsafe_html = "<img src=\"javascript:alert(1)\">";
+        assert_eq!(
+            unsafe {
+                yu_storage_import_html_fragment(
+                    unsafe_html.as_ptr(),
+                    unsafe_html.len(),
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_HTML_IMPORT_REJECTED
+        );
+        let invalid_utf8 = [0xff_u8];
+        assert_eq!(
+            unsafe {
+                yu_storage_import_html_fragment(
+                    invalid_utf8.as_ptr(),
+                    invalid_utf8.len(),
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_INVALID_UTF8
+        );
     }
 }

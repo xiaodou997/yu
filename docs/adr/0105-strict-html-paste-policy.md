@@ -2,8 +2,8 @@
 
 ## 状态
 
-已接受（Phase 2，Rust headless）。策略已经实现并有单元测试；macOS native paste 仍只按
-Markdown UTI、纯文本顺序消费，尚未把 HTML fallback 接入产品壳。
+已接受（Phase 2，Rust headless + macOS host）。策略已经实现并有单元测试；macOS adapter 已经
+消费这个策略，Windows/Linux native adapter 仍待定义。
 
 ## 背景
 
@@ -28,9 +28,10 @@ Yu 的 Markdown source 是唯一真源。剪贴板 HTML 只是由 source range �
   值；checkbox 只接受 disabled checkbox input。
 - 导入结果始终是 Markdown source 字符串。文本中的 Markdown punctuation 会被转义，代码块会根据
   内容选择足够长的 backtick fence，表格对齐从 cell style 映射到 GFM delimiter。
-- 该模块不改变 `TextBuffer`、Revision、selection、history 或 session。native adapter 在接线时必须
-  先尝试 Markdown payload，再尝试本策略；任何 `HtmlImportError` 都是可观测的拒绝并转为纯文本，
-  不能猜测或拼接另一套 rich-text model。
+- 该模块不改变 `TextBuffer`、Revision、selection、history 或 session。native adapter 先尝试
+  Markdown payload，再尝试纯文本，最后才调用本策略；这样已有 lossless source 不会被 HTML 重新
+ 解释。没有纯文本时，任何 `HtmlImportError` 都是可观测的拒绝并放弃粘贴，不能猜测或拼接另一套
+  rich-text model。
 
 ## 验证
 
@@ -44,5 +45,6 @@ export→import round trip，以及未知标签、属性、危险 URL、错配�
 
 ## 后续
 
-下一步定义 macOS/Windows/Linux native clipboard adapter 的格式优先级、错误/回退遥测和平台 API
-映射；在 macOS adapter 接入前，`public.html` 仍不会被 Yu 内部粘贴路径消费。
+下一步定义 Windows/Linux native clipboard adapter 的格式优先级、错误/回退遥测和平台 API 映射；
+macOS 的 HTML fallback 已通过独立 C ABI、私有 pasteboard self-check 接入，但真实跨应用 paste
+仍需人工回归。
