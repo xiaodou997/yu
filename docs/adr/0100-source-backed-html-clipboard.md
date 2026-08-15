@@ -2,8 +2,8 @@
 
 ## 状态
 
-已接受（Phase 2，Rust headless + macOS host）。Rust 跨平台格式契约已固定；其他平台 native
-clipboard adapter 和完整语义覆盖仍待定义。
+已接受（Phase 2，Rust headless + macOS host）。Rust 跨平台格式契约和受控 HTML→Markdown
+import policy 已固定；native HTML fallback、其他平台 clipboard adapter 和完整语义覆盖仍待定义。
 
 ## 背景
 
@@ -32,8 +32,9 @@ TextKit 字符串拼接，会把 Markdown delimiter、暂态 composition 和 sou
   `public.html`。
 - `yu-export::ClipboardFormat` 固定三种跨平台 payload 的顺序、MIME、macOS UTI 和取值映射；
   native adapter 不应重新定义格式字符串或改变 Markdown/纯文本/HTML 的优先语义。
-- paste 继续优先 Markdown UTI，再回退到纯文本；本阶段不把 HTML 作为 Yu 内部粘贴输入，避免
-  HTML→Markdown 逆向解析在 parser semantic coverage 尚未完整时制造第二套真源。
+- paste 继续优先 Markdown UTI，再回退到纯文本；受控 HTML→Markdown policy 现在作为独立的
+  headless `import_html_fragment` 存在，但本阶段仍不把 HTML 接到 macOS 内部粘贴输入，避免 native
+  adapter 在错误/回退语义尚未固定前制造第二套 rich-text model。
 
 ## 验证
 
@@ -46,5 +47,5 @@ TextKit 字符串拼接，会把 Markdown delimiter、暂态 composition 和 sou
 
 ## 后续
 
-继续扩展 HTML fragment 的 Markdown 语义覆盖，并定义 Windows/Linux native clipboard format
-映射；HTML paste 只有在独立安全的 HTML→Markdown policy 确定后才开放。
+继续扩展受控 HTML fragment 的 Markdown 语义覆盖，并定义 macOS/Windows/Linux native clipboard
+format 映射；HTML paste 只有在 native adapter 的优先级、拒绝回退和遥测边界确定后才开放。
