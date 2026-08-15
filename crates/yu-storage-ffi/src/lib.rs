@@ -18,7 +18,8 @@ use yu_editor::{
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
     AccessibilityTextSnapshot, BlockProjection, BlockProjectionKind, CaretAffinity, CommandResult,
     EditorCommand, EditorDocumentError, EditorKey, KeyEvent, KeyModifiers, KeyRouteResult,
-    Projection, ProjectionBias, SelectionError, SourceSync, VisualOffset, VisualRunKind,
+    LayoutConfig, LayoutPoint, Projection, ProjectionBias, SelectionError, SourceSync,
+    VisualOffset, VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
@@ -168,6 +169,40 @@ pub struct YuStorageProjectionCaret {
     pub source_utf16: u64,
     pub visual_utf16: u64,
     pub round_trip_source_utf16: u64,
+    pub affinity: u8,
+}
+
+/// Revision-bound source selection projected into visual UTF-16 coordinates.
+/// Non-collapsed selections map their source start/end with the outer
+/// projection boundaries, so hidden Markdown delimiters are not accidentally
+/// reintroduced into the visual range. Collapsed selections retain the caller
+/// affinity and should be handled as a caret by native hosts.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageProjectionSelection {
+    pub revision: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub visual_start_utf16: u64,
+    pub visual_end_utf16: u64,
+    pub round_trip_source_start_utf16: u64,
+    pub round_trip_source_end_utf16: u64,
+    pub affinity: u8,
+}
+
+/// Revision-bound metrics-layout hit-test result. `x`/`y` are the snapped
+/// projection-local caret point returned by `yu-layout`; they are not screen
+/// coordinates and must be transformed by the native platform shell.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageProjectionHit {
+    pub revision: u64,
+    pub source_utf16: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub line: u64,
+    pub x: f32,
+    pub y: f32,
     pub affinity: u8,
 }
 
@@ -966,6 +1001,13 @@ fn projection_bias_from_affinity(affinity: CaretAffinity) -> ProjectionBias {
     }
 }
 
+fn affinity_to_ffi(affinity: CaretAffinity) -> u8 {
+    match affinity {
+        CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+        CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+    }
+}
+
 fn projection_kind_tag(projection: &BlockProjection) -> u8 {
     match projection.kind() {
         BlockProjectionKind::Inline => YU_STORAGE_PROJECTION_INLINE,
@@ -1691,6 +1733,192 @@ pub unsafe extern "C" fn yu_storage_session_projection_caret(
                 CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
                 CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
             },
+        };
+    }
+    YU_STORAGE_OK
+}
+
+/// Maps a canonical source selection through the current inline projection.
+/// Non-collapsed ranges use `Before` for the start and `After` for the end so
+/// hidden Markdown delimiters do not become visual selection content. A
+/// collapsed range is a caret and keeps the requested affinity.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_projection_selection(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    source_start_utf16: u64,
+    source_end_utf16: u64,
+    affinity: u8,
+    output: *mut YuStorageProjectionSelection,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageProjectionSelection::default() };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let affinity = match caret_affinity_from_ffi(affinity) {
+        Ok(affinity) => affinity,
+        Err(status) => return status,
+    };
+    if source_start_utf16 > source_end_utf16 {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    let snapshot = session.session.snapshot();
+    let source_start = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_start_utf16)) {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let source_end = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_end_utf16)) {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let projection = match session.session.inline_projection() {
+        Ok(projection) => projection,
+        Err(error) => return storage_status(error),
+    };
+    let (start_bias, end_bias) = if source_start_utf16 == source_end_utf16 {
+        let bias = projection_bias_from_affinity(affinity);
+        (bias, bias)
+    } else {
+        (ProjectionBias::Before, ProjectionBias::After)
+    };
+    let visual_start = match projection.source_to_visual(source_start, start_bias) {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let visual_end = match projection.source_to_visual(source_end, end_bias) {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let round_trip_start = match projection.visual_to_source(visual_start, start_bias) {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let round_trip_end = match projection.visual_to_source(visual_end, end_bias) {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let projected = match projected_utf8(&projection) {
+        Ok(projected) => projected,
+        Err(status) => return status,
+    };
+    let visual_start_utf16 = match visual_utf16_offset(&projected, visual_start) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
+    let visual_end_utf16 = match visual_utf16_offset(&projected, visual_end) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
+    let round_trip_source_start_utf16 = match snapshot.utf16_offset(round_trip_start) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let round_trip_source_end_utf16 = match snapshot.utf16_offset(round_trip_end) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuStorageProjectionSelection {
+            revision: session.session.revision().get(),
+            source_start_utf16,
+            source_end_utf16,
+            visual_start_utf16,
+            visual_end_utf16,
+            round_trip_source_start_utf16,
+            round_trip_source_end_utf16,
+            affinity: affinity_to_ffi(affinity),
+        };
+    }
+    YU_STORAGE_OK
+}
+
+/// Resolves a projection-local point through the current full-source metrics
+/// projection. The layout configuration is explicit in the ABI so the native
+/// host cannot silently apply a second wrapping/line-height policy. Returned
+/// coordinates are snapped caret coordinates in the same layout space.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    point_x: f32,
+    point_y: f32,
+    max_width: f32,
+    line_height: f32,
+    default_advance: f32,
+    output: *mut YuStorageProjectionHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageProjectionHit::default() };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
+    let layout = match session.session.inline_layout(config) {
+        Ok(layout) => layout,
+        Err(error) => return storage_status(error),
+    };
+    let hit = match layout.hit_test(LayoutPoint::new(point_x, point_y)) {
+        Ok(hit) => hit,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let snapshot = session.session.snapshot();
+    let projected = match projected_utf8(layout.projection()) {
+        Ok(projected) => projected,
+        Err(status) => return status,
+    };
+    let visual_utf16 = match visual_utf16_offset(&projected, hit.visual()) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
+    let round_trip_source = match layout
+        .projection()
+        .visual_to_source(hit.visual(), hit.bias())
+    {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let source_utf16 = match snapshot.utf16_offset(hit.source()) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip_source) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuStorageProjectionHit {
+            revision: session.session.revision().get(),
+            source_utf16,
+            visual_utf16,
+            round_trip_source_utf16,
+            line: hit.line() as u64,
+            x: hit.point().x(),
+            y: hit.point().y(),
+            affinity: affinity_to_ffi(match hit.bias() {
+                ProjectionBias::Before => CaretAffinity::Upstream,
+                ProjectionBias::After => CaretAffinity::Downstream,
+            }),
         };
     }
     YU_STORAGE_OK
@@ -2697,6 +2925,122 @@ mod tests {
                     0,
                     &mut written,
                 )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_projection_selection_and_hit_test_round_trip_visual_coordinates() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-projection-hit-test-{id}.md"));
+        let source = "before **粗体** after\nnext";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let marker_start = source.find("**粗体**").expect("strong range");
+        let marker_end = marker_start + "**粗体**".len();
+        let source_start_utf16 = source[..marker_start].encode_utf16().count() as u64;
+        let source_end_utf16 = source[..marker_end].encode_utf16().count() as u64;
+        let mut selection = YuStorageProjectionSelection::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_selection(
+                    raw,
+                    0,
+                    source_start_utf16,
+                    source_end_utf16,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    &mut selection,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(selection.revision, 0);
+        assert_eq!(selection.source_start_utf16, source_start_utf16);
+        assert_eq!(selection.source_end_utf16, source_end_utf16);
+        assert_eq!(selection.visual_start_utf16, 7);
+        assert_eq!(selection.visual_end_utf16, 9);
+        assert_eq!(selection.round_trip_source_start_utf16, source_start_utf16);
+        assert_eq!(selection.round_trip_source_end_utf16, source_end_utf16);
+
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_selection(
+                    raw,
+                    0,
+                    source_end_utf16,
+                    source_start_utf16,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    &mut selection,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(selection.visual_end_utf16, 0);
+
+        let mut hit = YuStorageProjectionHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_hit_test(raw, 0, 7.1, 0.0, 80.0, 1.0, 1.0, &mut hit)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(hit.revision, 0);
+        assert_eq!(hit.source_utf16, source_start_utf16);
+        assert_eq!(hit.visual_utf16, 7);
+        assert_eq!(hit.round_trip_source_utf16, source_start_utf16);
+        assert_eq!(hit.line, 0);
+        assert_eq!(hit.x, 7.0);
+        assert_eq!(hit.y, 0.0);
+        assert_eq!(hit.affinity, YU_STORAGE_CARET_AFFINITY_UPSTREAM);
+
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_hit_test(
+                    raw,
+                    0,
+                    f32::NAN,
+                    0.0,
+                    80.0,
+                    1.0,
+                    1.0,
+                    &mut hit,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(hit.visual_utf16, 0);
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_selection(
+                    raw,
+                    0,
+                    source_start_utf16,
+                    source_end_utf16,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    &mut selection,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_hit_test(raw, 0, 7.1, 0.0, 80.0, 1.0, 1.0, &mut hit)
             },
             YU_STORAGE_STALE_REVISION
         );
