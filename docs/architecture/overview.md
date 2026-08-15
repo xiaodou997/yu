@@ -382,6 +382,13 @@ selection 映射为 visual UTF-16 range，并返回 source round-trip range；�
 point 和 affinity。Swift 只消费这些 owned scalar；point 仍是 projection-local，不是 screen 坐标，
 当前只用于诊断/self-check，生产 TextKit mirror 尚未切换。
 
+TextKit 过渡镜像现在还可以通过 `yu_storage_session_projection_source_caret` 与
+`yu_storage_session_projection_source_selection` 将 visual UTF-16 caret/selection 反向映射到
+canonical source，并返回 visual round-trip 边界。Swift 的 visual-mirror self-check 只创建临时
+`NSTextStorage`/`NSLayoutManager` 验证 projected UTF-8 可被 TextKit 接收，再用同一 Revision 的
+Rust reverse mapping 校验 hidden delimiter 和 Unicode；Rust source 发生编辑后旧镜像查询立即被
+拒绝，生产 `DocumentTextView` 仍保持 source mirror，尚未切换 visual editing。
+
 storage FFI 现在还提供 parser-owned block 的 `yu_storage_session_block_layout`，以及 macOS
 `yu_storage_session_macos_block_layout`/`yu_storage_session_macos_block_caret`。前者使用显式
 metrics 配置构造单 block `LayoutSnapshot`，后者使用 `CoreTextShaper::from_system_ui` 和同一

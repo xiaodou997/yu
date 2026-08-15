@@ -210,6 +210,13 @@
     必须为正且 content height 有限。count/fill 的容量不足不得写入部分 block，stale、非法 viewport、
     metrics 不匹配、layout/CoreText 失败和非 macOS unavailable 必须清空 header/count 并拒绝；Swift
     只能消费 owned scalar，不得复制 HeightIndex、Markdown block 或 layout 对象。
+44. `yu_storage_session_projection_source_caret` 与
+    `yu_storage_session_projection_source_selection` 必须从同一 expected Revision 的 Rust
+    projection 将 visual UTF-16 边界映射回 source UTF-16，并返回 visual round-trip 边界；非折叠
+    visual selection 必须使用 Before/After 外缘保留 hidden Markdown syntax。stale Revision、未知
+    affinity、visual UTF-16 surrogate split、逆序/越界 range 或 projection 错误必须先清空 output
+    再拒绝；TextKit 只可持有 owned projected text/selection，不能解析 Markdown、缓存 source range
+    或在 Rust source 变更后继续使用旧 Revision。
 
 ## Accessibility
 
