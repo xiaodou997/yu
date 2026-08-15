@@ -11,13 +11,12 @@ build = "build.rs"
 
 [dependencies]
 yu-core = { path = "../../../crates/yu-core" }
+yu-editor = { path = "../../../crates/yu-editor" }
 yu-font = { path = "../../../crates/yu-font" }
 yu-render = { path = "../../../crates/yu-render" }
 yu-scene = { path = "../../../crates/yu-scene" }
 yu-workspace = { path = "../../../crates/yu-workspace" }
-
-[dev-dependencies]
-yu-editor = { path = "../../../crates/yu-editor" }
+yu-font-macos = { path = "../yu-font-macos" }
 
 [lints]
 workspace = true
