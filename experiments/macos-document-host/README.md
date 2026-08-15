@@ -57,7 +57,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 ```
 
 该自检使用私有 pasteboard，验证 Markdown > 纯文本 > 受控 HTML 的顺序，以及 HTML policy 拒绝时
-不会把脚本等内容写入 Markdown source。
+不会把脚本等内容写入 Markdown source；同时读取 `Fixtures/clipboard` 中的 semantic mail、GFM
+table、browser wrapper 和 unsafe HTML fixture，覆盖接受与拒绝路径。
 
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立

@@ -2100,7 +2100,37 @@ private func runClipboardSelfCheck(path: String) -> Never {
         let canonical = try textView.sourceFromPasteboardForSelfCheck(pasteboard)
         precondition(canonical == "**canonical**")
 
-        print("Yu Clipboard self-check: Markdown > plain text > strict HTML fallback")
+        let fixtureDirectory = URL(fileURLWithPath: path)
+            .deletingLastPathComponent()
+            .appendingPathComponent("clipboard", isDirectory: true)
+        let fixtureCases: [(name: String, accepted: Bool)] = [
+            ("semantic-mail", true),
+            ("rich-table", true),
+            ("browser-wrapper", false),
+            ("unsafe", false),
+        ]
+        for fixture in fixtureCases {
+            let htmlURL = fixtureDirectory.appendingPathComponent("\(fixture.name).html")
+            let html = try String(contentsOf: htmlURL, encoding: .utf8)
+            pasteboard.clearContents()
+            precondition(pasteboard.setString(html, forType: .yuHTML))
+            let result = try textView.sourceFromPasteboardForSelfCheck(pasteboard)
+            if fixture.accepted {
+                let expectedURL = fixtureDirectory
+                    .appendingPathComponent("\(fixture.name).expected.md")
+                let expected = try String(contentsOf: expectedURL, encoding: .utf8)
+                    .replacingOccurrences(of: "␠␠", with: "  ")
+                    .trimmingCharacters(in: .newlines)
+                precondition(result == expected, "fixture \(fixture.name) mismatch")
+            } else {
+                precondition(result == nil, "fixture \(fixture.name) should be rejected")
+            }
+        }
+
+        print(
+            "Yu Clipboard self-check: Markdown > plain text > strict HTML fallback; "
+                + "fixtures=\(fixtureCases.count)"
+        )
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Yu Clipboard self-check failed: \(error)\n", stderr)
