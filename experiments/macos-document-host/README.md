@@ -60,6 +60,13 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 不会把脚本等内容写入 Markdown source；同时读取 `Fixtures/clipboard` 中的 semantic mail、GFM
 table、browser wrapper 和 unsafe HTML fixture，覆盖接受与拒绝路径。
 
+验证鼠标/拖选使用的 AppKit `setSelectedRanges` 是否同步到 Rust selection（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --selection-self-check experiments/macos-document-host/Fixtures/sample.md
+```
+
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立
 source、dirty 或 history。
