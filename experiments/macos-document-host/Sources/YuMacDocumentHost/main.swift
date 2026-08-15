@@ -1503,10 +1503,68 @@ private final class StorageBridge {
     }
 }
 
+/// A disposable TextKit layout for the Rust-owned visual projection. It is
+/// created only when the visual pointer adapter is enabled; it never owns a
+/// source revision or Markdown semantics.
+private final class ProjectionTextKitMirror {
+    let revision: UInt64
+    let textStorage: NSTextStorage
+    let layoutManager: NSLayoutManager
+    let textContainer: NSTextContainer
+
+    init(text: String, revision: UInt64, width: CGFloat) {
+        self.revision = revision
+        textStorage = NSTextStorage(string: text)
+        layoutManager = NSLayoutManager()
+        textContainer = NSTextContainer(
+            size: NSSize(
+                width: max(width, 1.0),
+                height: CGFloat.greatestFiniteMagnitude
+            )
+        )
+        textContainer.lineFragmentPadding = 0.0
+        layoutManager.addTextContainer(textContainer)
+        textStorage.addLayoutManager(layoutManager)
+    }
+
+    var string: String { textStorage.string }
+
+    var utf16Length: Int { textStorage.length }
+
+    func visualUTF16(at point: NSPoint) -> Int {
+        guard textStorage.length > 0 else { return 0 }
+        var fraction: CGFloat = 0.0
+        let glyph = layoutManager.glyphIndex(
+            for: point,
+            in: textContainer,
+            fractionOfDistanceThroughGlyph: &fraction
+        )
+        let character = layoutManager.characterIndexForGlyph(at: glyph)
+        return min(max(character, 0), textStorage.length)
+    }
+
+    func point(forVisualUTF16 offset: Int) -> NSPoint {
+        guard textStorage.length > 0 else { return .zero }
+        let clamped = min(max(offset, 0), textStorage.length)
+        let glyph = layoutManager.glyphIndexForCharacter(at: min(clamped, textStorage.length - 1))
+        var point = layoutManager.location(forGlyphAt: glyph)
+        if clamped >= textStorage.length {
+            let rect = layoutManager.boundingRect(
+                forGlyphRange: NSRange(location: glyph, length: 1),
+                in: textContainer
+            )
+            point.x = rect.maxX
+        }
+        return point
+    }
+}
+
 /// The native source mirror is deliberately a view cache, never a second
 /// document model. Rust owns canonical source, revision, selection and
 /// composition generation; this TextKit object only projects those values for
-/// AppKit's NSTextInputClient callbacks.
+/// AppKit's NSTextInputClient callbacks. The optional visual pointer adapter
+/// uses a separate disposable TextKit layout and remains disabled in the
+/// production source view until visual rendering is ready.
 private final class DocumentTextView: NSTextView {
     private enum Command {
         static let deleteBackward: UInt8 = 1
@@ -1536,6 +1594,9 @@ private final class DocumentTextView: NSTextView {
     private var linkRotorDelegate: YuAccessibilityRotorDelegate!
     private var nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
     private var synchronizingSelection = false
+    private var visualMirror: ProjectionTextKitMirror?
+    private var visualMirrorEnabled = false
+    private var visualSelectionAnchor: Int?
     var onDocumentChange: (() -> Void)?
     var onError: ((Error) -> Void)?
 
@@ -1592,6 +1653,112 @@ private final class DocumentTextView: NSTextView {
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
         synchronizeProjection()
         postAccessibilityRefresh()
+    }
+
+    /// Enables the not-yet-production visual pointer adapter for a focused
+    /// self-check. The visible NSTextView remains the canonical source mirror;
+    /// this only builds a disposable TextKit layout from Rust projected text.
+    func setVisualMirrorEnabledForSelfCheck(_ enabled: Bool) throws {
+        visualMirrorEnabled = enabled
+        visualSelectionAnchor = nil
+        if enabled {
+            try refreshVisualMirror()
+        } else {
+            visualMirror = nil
+        }
+    }
+
+    func visualMirrorPointForSelfCheck(visualUTF16: Int) -> NSPoint? {
+        guard visualMirrorEnabled,
+              let visualMirror,
+              visualMirror.revision == bridge.state.revision,
+              visualUTF16 >= 0,
+              visualUTF16 <= visualMirror.utf16Length else {
+            return nil
+        }
+        return visualMirror.point(forVisualUTF16: visualUTF16)
+    }
+
+    @discardableResult
+    func applyVisualSelectionForSelfCheck(_ visualRange: NSRange) -> Bool {
+        applyVisualSelection(visualRange)
+    }
+
+    private func refreshVisualMirror() throws {
+        guard visualMirrorEnabled, !bridge.composition.active else {
+            visualMirror = nil
+            return
+        }
+        let revision = bridge.state.revision
+        let projected = try bridge.projectedSource(revision: revision)
+        let width = max(bounds.width - 2.0 * textContainerOrigin.x, 1.0)
+        visualMirror = ProjectionTextKitMirror(
+            text: projected,
+            revision: revision,
+            width: width
+        )
+    }
+
+    private func visualPoint(for event: NSEvent) -> NSPoint {
+        let local = convert(event.locationInWindow, from: nil)
+        return NSPoint(
+            x: local.x - textContainerOrigin.x,
+            y: local.y - textContainerOrigin.y
+        )
+    }
+
+    @discardableResult
+    private func applyVisualPointerSelection(
+        at point: NSPoint,
+        extending: Bool
+    ) -> Bool {
+        guard visualMirrorEnabled,
+              !bridge.composition.active,
+              let visualMirror,
+              visualMirror.revision == bridge.state.revision else {
+            return false
+        }
+        let visualOffset = visualMirror.visualUTF16(at: point)
+        if !extending || visualSelectionAnchor == nil {
+            visualSelectionAnchor = visualOffset
+        }
+        guard let anchor = visualSelectionAnchor else { return false }
+        let visualRange = NSRange(
+            location: min(anchor, visualOffset),
+            length: abs(visualOffset - anchor)
+        )
+        return applyVisualSelection(visualRange)
+    }
+
+    @discardableResult
+    private func applyVisualSelection(_ visualRange: NSRange) -> Bool {
+        guard visualMirrorEnabled,
+              !bridge.composition.active,
+              let visualMirror,
+              visualMirror.revision == bridge.state.revision,
+              visualRange.location >= 0,
+              visualRange.length >= 0,
+              NSMaxRange(visualRange) <= visualMirror.utf16Length else {
+            return false
+        }
+        do {
+            let source = try bridge.projectionSourceSelection(
+                revision: visualMirror.revision,
+                visualRange: visualRange,
+                affinity: 1
+            )
+            try bridge.setSelection(source.sourceRange, affinity: source.affinity)
+            canonicalRevision = bridge.state.revision
+            synchronizingSelection = true
+            super.setSelectedRange(source.sourceRange)
+            synchronizingSelection = false
+            postSelectionChanged()
+            return true
+        } catch {
+            synchronizingSelection = false
+            onError?(error)
+            return false
+        }
     }
 
     // These queries deliberately read a fresh Rust snapshot instead of
@@ -1812,6 +1979,41 @@ private final class DocumentTextView: NSTextView {
         guard shouldSync else { return }
         let range = clampedRange(selectedRange(), length: (string as NSString).length)
         syncNativeSelectionToRust(range)
+    }
+
+    /// The visual pointer adapter is intentionally opt-in until the window
+    /// draws the projected TextKit layout. When enabled by a future visual
+    /// document view, Rust resolves the visual point/selection and the source
+    /// mirror receives only the resulting canonical source range.
+    override func mouseDown(with event: NSEvent) {
+        if visualMirrorEnabled,
+           applyVisualPointerSelection(
+               at: visualPoint(for: event),
+               extending: event.modifierFlags.contains(.shift)
+           ) {
+            return
+        }
+        visualSelectionAnchor = nil
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        if visualSelectionAnchor != nil,
+           applyVisualPointerSelection(
+               at: visualPoint(for: event),
+               extending: true
+           ) {
+            return
+        }
+        super.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if visualSelectionAnchor != nil {
+            visualSelectionAnchor = nil
+            return
+        }
+        super.mouseUp(with: event)
     }
 
     private func syncNativeSelectionToRust(_ range: NSRange) {
@@ -2168,6 +2370,14 @@ private final class DocumentTextView: NSTextView {
         selectedRange = clampedRange(selection, length: (string as NSString).length)
         synchronizingSelection = false
         needsDisplay = true
+        if visualMirrorEnabled {
+            do {
+                try refreshVisualMirror()
+            } catch {
+                visualMirror = nil
+                onError?(error)
+            }
+        }
     }
 
     private func stringValue(_ value: Any) -> String {
@@ -3008,6 +3218,8 @@ private func runProjectionHitTestSelfCheck(path: String) -> Never {
 private func runVisualMirrorSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
+        let textView = DocumentTextView(bridge: bridge)
+        try textView.setVisualMirrorEnabledForSelfCheck(true)
         let revision = bridge.state.revision
         let projected = try bridge.projectedSource(revision: revision)
         let mirrorStorage = NSTextStorage(string: projected)
@@ -3024,6 +3236,11 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
         let visualStrong = (projected as NSString).range(of: "粗体")
         precondition(sourceStrong.location != NSNotFound)
         precondition(visualStrong.location != NSNotFound)
+        precondition(
+            textView.visualMirrorPointForSelfCheck(visualUTF16: visualStrong.location) != nil
+        )
+        precondition(textView.applyVisualSelectionForSelfCheck(visualStrong))
+        precondition(bridge.selection.range == sourceStrong)
         let glyphRange = mirrorLayout.glyphRange(
             forCharacterRange: visualStrong,
             actualCharacterRange: nil

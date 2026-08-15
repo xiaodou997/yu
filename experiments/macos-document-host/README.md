@@ -108,8 +108,9 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
   --visual-mirror-self-check experiments/macos-document-host/Fixtures/projection.md
 ```
 
-该自检中的 `NSTextStorage`/`NSLayoutManager` 只是一份可丢弃的 visual view cache；生产窗口仍使用
-canonical source mirror，尚未改变 IME、复制粘贴或 Accessibility 路径。
+该自检中的 `NSTextStorage`/`NSLayoutManager` 只是一份可丢弃的 visual view cache，并会经过
+`DocumentTextView` 的 opt-in pointer adapter 验证点击/拖选结果回到 Rust source selection；生产窗口
+默认仍使用 canonical source mirror，尚未改变 IME、复制粘贴或 Accessibility 路径。
 
 验证 parser-owned block 的 metrics layout、macOS CoreText shaped layout 与 block-local caret（不启动窗口）：
 
