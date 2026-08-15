@@ -201,6 +201,8 @@ dependencies = [
  "yu-core",
  "yu-editor",
  "yu-export",
+ "yu-font",
+ "yu-font-macos",
  "yu-storage",
  "yu-text",
 ]

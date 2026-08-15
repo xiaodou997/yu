@@ -150,6 +150,65 @@ private struct NativeProjectionBlock {
     }
 }
 
+private struct NativeBlockLayout {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let sourceRange: NSRange
+    let visualUTF16Length: Int
+    let lineCount: UInt64
+    let width: CGFloat
+    let height: CGFloat
+    let lineHeight: CGFloat
+    let defaultAdvance: CGFloat
+    let kind: UInt8
+    let projectionKind: UInt8
+    let shaped: Bool
+
+    init(_ value: YuStorageBlockLayout) {
+        revision = value.revision
+        blockIndex = value.block_index
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        visualUTF16Length = Int(value.visual_utf16_length)
+        lineCount = value.line_count
+        width = CGFloat(value.width)
+        height = CGFloat(value.height)
+        lineHeight = CGFloat(value.line_height)
+        defaultAdvance = CGFloat(value.default_advance)
+        kind = value.kind
+        projectionKind = value.projection_kind
+        shaped = value.shaped != 0
+    }
+}
+
+private struct NativeBlockCaret {
+    let revision: UInt64
+    let sourceUTF16: UInt64
+    let blockIndex: UInt64
+    let visualUTF16: UInt64
+    let roundTripSourceUTF16: UInt64
+    let lineIndex: UInt64
+    let point: CGPoint
+    let height: CGFloat
+    let affinity: UInt8
+    let shaped: Bool
+
+    init(_ value: YuStorageBlockCaret) {
+        revision = value.revision
+        sourceUTF16 = value.source_utf16
+        blockIndex = value.block_index
+        visualUTF16 = value.visual_utf16
+        roundTripSourceUTF16 = value.round_trip_source_utf16
+        lineIndex = value.line_index
+        point = CGPoint(x: CGFloat(value.caret_x), y: CGFloat(value.caret_y))
+        height = CGFloat(value.caret_height)
+        affinity = value.affinity
+        shaped = value.shaped != 0
+    }
+}
+
 private struct NativeAccessibilitySnapshot {
     let revision: UInt64
     let numberOfCharacters: Int
@@ -699,6 +758,75 @@ private final class StorageBridge {
             NativeProjectionBlock(metadata),
             String(decoding: bytes.prefix(written), as: UTF8.self)
         )
+    }
+
+    func blockLayout(
+        revision: UInt64,
+        blockIndex: UInt64,
+        maxWidth: Float,
+        lineHeight: Float,
+        defaultAdvance: Float
+    ) throws -> NativeBlockLayout {
+        var value = YuStorageBlockLayout()
+        let status = yu_storage_session_block_layout(
+            handle,
+            revision,
+            blockIndex,
+            maxWidth,
+            lineHeight,
+            defaultAdvance,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeBlockLayout(value)
+    }
+
+    func macosBlockLayout(
+        revision: UInt64,
+        blockIndex: UInt64,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NativeBlockLayout {
+        var value = YuStorageBlockLayout()
+        let status = yu_storage_session_macos_block_layout(
+            handle,
+            revision,
+            blockIndex,
+            size,
+            maxWidth,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeBlockLayout(value)
+    }
+
+    func macosBlockCaret(
+        revision: UInt64,
+        blockIndex: UInt64,
+        sourceUTF16: UInt64,
+        affinity: UInt8,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NativeBlockCaret {
+        var value = YuStorageBlockCaret()
+        let status = yu_storage_session_macos_block_caret(
+            handle,
+            revision,
+            blockIndex,
+            sourceUTF16,
+            affinity,
+            size,
+            maxWidth,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeBlockCaret(value)
     }
 
     var state: NativeStorageState {
@@ -2755,6 +2883,87 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
     }
 }
 
+private func runBlockLayoutSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let blockIndex: UInt64 = 2
+        let (block, _) = try bridge.projectedBlock(
+            revision: revision,
+            blockIndex: blockIndex
+        )
+        precondition(block.kind == 2, "paragraph block missing")
+
+        let metrics = try bridge.blockLayout(
+            revision: revision,
+            blockIndex: blockIndex,
+            maxWidth: 80.0,
+            lineHeight: 1.0,
+            defaultAdvance: 1.0
+        )
+        precondition(metrics.revision == revision)
+        precondition(metrics.blockIndex == blockIndex)
+        precondition(!metrics.shaped)
+        precondition(metrics.lineCount > 0)
+        precondition(metrics.height > 0.0)
+        precondition(metrics.visualUTF16Length == block.visualUTF16Length)
+
+        let shaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: blockIndex,
+            size: 14.0,
+            maxWidth: 500.0
+        )
+        precondition(shaped.revision == revision)
+        precondition(shaped.blockIndex == blockIndex)
+        precondition(shaped.shaped)
+        precondition(shaped.lineCount > 0)
+        precondition(shaped.height > 0.0)
+        precondition(shaped.lineHeight > 0.0)
+        precondition(shaped.defaultAdvance > 0.0)
+        precondition(shaped.visualUTF16Length == block.visualUTF16Length)
+
+        let source = bridge.source
+        let marker = (source as NSString).range(of: "**粗体**")
+        precondition(marker.location != NSNotFound)
+        let caret = try bridge.macosBlockCaret(
+            revision: revision,
+            blockIndex: blockIndex,
+            sourceUTF16: UInt64(marker.location),
+            affinity: 0,
+            size: 14.0,
+            maxWidth: 500.0
+        )
+        precondition(caret.revision == revision)
+        precondition(caret.blockIndex == blockIndex)
+        precondition(caret.sourceUTF16 == UInt64(marker.location))
+        precondition(caret.shaped)
+        precondition(caret.height == shaped.lineHeight)
+        precondition(caret.point.x.isFinite && caret.point.y.isFinite)
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.macosBlockLayout(
+                revision: revision,
+                blockIndex: blockIndex,
+                size: 14.0,
+                maxWidth: 500.0
+            )
+            preconditionFailure("stale block layout unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        print(
+            "Yu Block Layout self-check: metrics/CoreText block geometry and caret "
+                + "are Revision-bound"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Block Layout self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runCompositionProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -3016,6 +3225,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--projection-hit-test-self-c
 if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runBlockProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--block-layout-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runBlockLayoutSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
