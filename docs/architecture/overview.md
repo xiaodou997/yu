@@ -405,6 +405,12 @@ CoreText 对象，过期 block metadata/caret 会被拒绝。随后同一 storag
 `yu_storage_session_macos_shaped_viewport_blocks` 以 count/fill 返回可见 block range、source
 UTF-16 range、document-space block origin/height、measured 和稳定 kind tag；Swift 只消费 owned
 scalar，过期 viewport 与容量不足均不能污染 native 数组。
+该 storage snapshot 的 header 还携带请求的 `scroll_y`、`viewport_height` 和由 Rust content height
+推导的 `max_scroll_y`，明确 document-space block y 到 viewport-local point 的唯一平移入口。
+同一 handle 的 `yu_storage_session_macos_shaped_caret_scroll_request` 复用 CoreText shaped
+`ViewportLayout` 返回 document-space caret 和绝对 target scroll；Swift 只在 Revision 仍匹配时应用
+target，不保存 Rust 高度索引。visual mirror self-check 已验证 document↔viewport round-trip、
+caret reveal 和 stale Revision 拒绝，生产 source TextKit mirror 仍不切换该路径。
 
 随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
 `ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16

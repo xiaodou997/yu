@@ -27,6 +27,8 @@ retained scene/GPU 绘制。
 - [x] parser-owned block-scoped projection snapshot、惰性 layout metadata 与 block-local caret
 - [x] macOS CoreText shaping metrics 与 `yu-layout` line/caret contract 对齐
 - [x] shaped viewport snapshot、block origin/height 与可见窗口 count/fill
+- [x] storage FFI shaped viewport header 暴露 scroll/viewport/max-scroll 坐标协议
+- [x] storage FFI shaped caret scroll target 与 visual viewport transform self-check
 - [x] TextKit 过渡镜像自检支持 visual/source 双向映射（生产 view 尚未切换）
 - [x] `DocumentTextView` opt-in visual pointer adapter 与 source-mirror fallback self-check
 - [x] `DocumentTextView` opt-in visual IME composition mirror、marked range 与 attributed substring self-check
@@ -49,3 +51,5 @@ retained scene/GPU 绘制。
    Accessibility 有安全回退路径。
 5. visual IME overlay 只能消费同一 Revision + composition generation 的 Rust projected text 和
    visual replacement range；generation 失效时必须回到 canonical source mirror。
+6. visual viewport 的 block `y`、caret `y` 和 scroll target 都是同一 Revision 的 document-space
+   坐标；Swift 只能使用 header 提供的 scroll transform，不能复制 HeightIndex 或自行推导高度。

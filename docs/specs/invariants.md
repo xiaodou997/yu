@@ -228,6 +228,11 @@
     mirror 或 `markedRange` 任一版本不匹配时不得发布 visual callback，应回退 canonical source
     mirror。visual preedit、marked range 和 attributed substring 都不得改变 source、selection、
     history 或 Revision；cancel/commit 仍必须经由 generation-bound Rust composition API。
+47. `yu_storage_session_macos_shaped_viewport_blocks` 的 header 与 block 必须共享同一 Revision；
+    `scroll_y`、`viewport_height`、`max_scroll_y`、block document-space `y/height` 和
+    `yu_storage_session_macos_shaped_caret_scroll_request` 的 caret/target scroll 必须来自同一
+    CoreText metrics 与 Rust `ViewportLayout`。Swift 只能做显式 document↔viewport 平移并在 Revision
+    不匹配时丢弃 snapshot；不得复制 HeightIndex、重算 block origin，或把 stale target 应用到新文本。
 
 ## Accessibility
 

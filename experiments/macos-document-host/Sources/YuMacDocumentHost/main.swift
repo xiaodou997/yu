@@ -277,11 +277,84 @@ private struct NativeShapedViewportSnapshot {
     let revision: UInt64
     let blockRange: Range<UInt64>
     let contentHeight: CGFloat
+    let scrollY: CGFloat
+    let viewportHeight: CGFloat
+    let maxScrollY: CGFloat
 
     init(_ value: YuStorageShapedViewportSnapshot) {
         revision = value.revision
         blockRange = value.block_start..<value.block_end
         contentHeight = CGFloat(value.content_height)
+        scrollY = CGFloat(value.scroll_y)
+        viewportHeight = CGFloat(value.viewport_height)
+        maxScrollY = CGFloat(value.max_scroll_y)
+    }
+}
+
+private struct NativeVisualViewport {
+    let revision: UInt64
+    let blockRange: Range<UInt64>
+    let contentHeight: CGFloat
+    let contentOriginY: CGFloat
+    let requestedScrollY: CGFloat
+    let viewportHeight: CGFloat
+    let maxScrollY: CGFloat
+
+    init(_ snapshot: NativeShapedViewportSnapshot, contentOriginY: CGFloat = 0.0) {
+        revision = snapshot.revision
+        blockRange = snapshot.blockRange
+        contentHeight = snapshot.contentHeight
+        self.contentOriginY = contentOriginY
+        requestedScrollY = snapshot.scrollY
+        viewportHeight = snapshot.viewportHeight
+        maxScrollY = snapshot.maxScrollY
+    }
+
+    /// Native scroll views clamp their content offset. Keeping the clamp in
+    /// this adapter makes document↔viewport conversion deterministic even if
+    /// a platform callback briefly reports an out-of-range offset.
+    var effectiveScrollY: CGFloat {
+        min(max(requestedScrollY, 0.0), maxScrollY)
+    }
+
+    func viewportPoint(forDocumentPoint point: NSPoint) -> NSPoint {
+        NSPoint(
+            x: point.x,
+            y: point.y - contentOriginY - effectiveScrollY
+        )
+    }
+
+    func documentPoint(forViewportPoint point: NSPoint) -> NSPoint {
+        NSPoint(
+            x: point.x,
+            y: point.y + contentOriginY + effectiveScrollY
+        )
+    }
+}
+
+private struct NativeCaretScrollRequest {
+    let revision: UInt64
+    let sourceUTF16: UInt64
+    let blockIndex: UInt64
+    let caretPoint: NSPoint
+    let caretWidth: CGFloat
+    let caretHeight: CGFloat
+    let currentScrollY: CGFloat
+    let targetScrollY: CGFloat
+    let margin: CGFloat
+    let needsScroll: Bool
+
+    init(_ value: YuStorageCaretScrollRequest) {
+        revision = value.revision
+        sourceUTF16 = value.source_utf16
+        blockIndex = value.block_index
+        caretPoint = NSPoint(x: CGFloat(value.caret_x), y: CGFloat(value.caret_y))
+        caretWidth = CGFloat(value.caret_width)
+        caretHeight = CGFloat(value.caret_height)
+        currentScrollY = CGFloat(value.current_scroll_y)
+        targetScrollY = CGFloat(value.target_scroll_y)
+        margin = CGFloat(value.margin)
+        needsScroll = value.needs_scroll != 0
     }
 }
 
@@ -1020,6 +1093,31 @@ private final class StorageBridge {
         )
     }
 
+    func macosShapedCaretScrollRequest(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float,
+        margin: Float
+    ) throws -> NativeCaretScrollRequest {
+        var value = YuStorageCaretScrollRequest()
+        let status = yu_storage_session_macos_shaped_caret_scroll_request(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            margin,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeCaretScrollRequest(value)
+    }
+
     var state: NativeStorageState {
         var value = YuStorageState()
         let status = yu_storage_session_state(
@@ -1602,6 +1700,7 @@ private final class DocumentTextView: NSTextView {
     private var visualMirror: ProjectionTextKitMirror?
     private var visualMirrorEnabled = false
     private var visualCompositionGeneration: UInt64?
+    private var visualViewport: NativeVisualViewport?
     private var visualSelectionAnchor: Int?
     var onDocumentChange: (() -> Void)?
     var onError: ((Error) -> Void)?
@@ -1672,6 +1771,7 @@ private final class DocumentTextView: NSTextView {
         } else {
             visualMirror = nil
             visualCompositionGeneration = nil
+            visualViewport = nil
         }
     }
 
@@ -1684,6 +1784,34 @@ private final class DocumentTextView: NSTextView {
             return nil
         }
         return visualMirror.point(forVisualUTF16: visualUTF16)
+    }
+
+    func setVisualViewportForSelfCheck(_ viewport: NativeVisualViewport) {
+        guard visualMirrorEnabled,
+              viewport.revision == bridge.state.revision else {
+            visualViewport = nil
+            return
+        }
+        visualViewport = viewport
+    }
+
+    func visualViewportPointForSelfCheck(visualUTF16: Int) -> NSPoint? {
+        guard let documentPoint = visualMirrorPointForSelfCheck(visualUTF16: visualUTF16),
+              let visualViewport,
+              visualViewport.revision == bridge.state.revision else {
+            return nil
+        }
+        return visualViewport.viewportPoint(forDocumentPoint: documentPoint)
+    }
+
+    func visualViewportRoundTripForSelfCheck(_ point: NSPoint) -> NSPoint? {
+        guard let visualViewport,
+              visualViewport.revision == bridge.state.revision else {
+            return nil
+        }
+        return visualViewport.documentPoint(
+            forViewportPoint: visualViewport.viewportPoint(forDocumentPoint: point)
+        )
     }
 
     func visualMirrorStringForSelfCheck() -> String? {
@@ -2412,6 +2540,9 @@ private final class DocumentTextView: NSTextView {
 
     private func synchronizeProjection() {
         let active = bridge.composition
+        if let visualViewport, visualViewport.revision != bridge.state.revision {
+            self.visualViewport = nil
+        }
         let projected: String
         let selection: NSRange
         if active.active {
@@ -2447,6 +2578,7 @@ private final class DocumentTextView: NSTextView {
             } catch {
                 visualMirror = nil
                 visualCompositionGeneration = nil
+                visualViewport = nil
                 onError?(error)
             }
         }
@@ -3678,6 +3810,149 @@ private func runShapedViewportSelfCheck(path: String) -> Never {
     }
 }
 
+private func runVisualViewportSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let shaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: 2,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(shaped.lineHeight),
+            defaultAdvance: Float(shaped.defaultAdvance),
+            estimatedBlockHeight: Float(shaped.lineHeight),
+            overscan: 0.0
+        )
+
+        let viewportHeight = max(shaped.lineHeight * 2.0, 1.0)
+        let (fullSnapshot, _) = try bridge.macosShapedViewportBlocks(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0
+        )
+        let expectedMaxScroll = max(fullSnapshot.contentHeight - viewportHeight, 0.0)
+        precondition(expectedMaxScroll > 0.0)
+        let scrollY = min(shaped.lineHeight, expectedMaxScroll)
+        let (snapshot, blocks) = try bridge.macosShapedViewportBlocks(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: Float(scrollY),
+            viewportHeight: Float(viewportHeight)
+        )
+        let viewport = NativeVisualViewport(snapshot)
+        precondition(viewport.revision == revision)
+        precondition(abs(viewport.requestedScrollY - scrollY) < 0.01)
+        precondition(abs(viewport.viewportHeight - viewportHeight) < 0.01)
+        precondition(abs(viewport.maxScrollY - expectedMaxScroll) < 0.01)
+        precondition(snapshot.blockRange.count == blocks.count)
+        precondition(!blocks.isEmpty)
+        precondition(blocks.allSatisfy { $0.revision == revision && $0.y.isFinite })
+
+        let firstDocumentPoint = NSPoint(
+            x: 12.0,
+            y: blocks[0].y + min(1.0, blocks[0].height / 2.0)
+        )
+        let firstViewportPoint = viewport.viewportPoint(forDocumentPoint: firstDocumentPoint)
+        let firstRoundTrip = viewport.documentPoint(forViewportPoint: firstViewportPoint)
+        precondition(abs(firstRoundTrip.x - firstDocumentPoint.x) < 0.001)
+        precondition(abs(firstRoundTrip.y - firstDocumentPoint.y) < 0.001)
+        precondition(
+            abs(firstViewportPoint.y - (firstDocumentPoint.y - viewport.effectiveScrollY)) < 0.001
+        )
+
+        let textView = DocumentTextView(bridge: bridge)
+        try textView.setVisualMirrorEnabledForSelfCheck(true)
+        textView.setVisualViewportForSelfCheck(viewport)
+        let visualDocumentPoint = try unwrapSelfCheck(
+            textView.visualMirrorPointForSelfCheck(visualUTF16: 0)
+        )
+        let visualViewportPoint = try unwrapSelfCheck(
+            textView.visualViewportPointForSelfCheck(visualUTF16: 0)
+        )
+        precondition(
+            abs(
+                viewport.documentPoint(forViewportPoint: visualViewportPoint).y
+                    - visualDocumentPoint.y
+            ) < 0.001
+        )
+        let textViewRoundTrip = try unwrapSelfCheck(
+            textView.visualViewportRoundTripForSelfCheck(visualDocumentPoint)
+        )
+        precondition(abs(textViewRoundTrip.y - visualDocumentPoint.y) < 0.001)
+
+        let sourceEnd = (bridge.source as NSString).length
+        try bridge.setSelection(NSRange(location: sourceEnd, length: 0))
+        let request = try bridge.macosShapedCaretScrollRequest(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: Float(scrollY),
+            viewportHeight: Float(viewportHeight),
+            margin: 0.0
+        )
+        precondition(request.revision == revision)
+        precondition(request.sourceUTF16 == UInt64(sourceEnd))
+        precondition(request.caretPoint.y >= 0.0)
+        precondition(request.currentScrollY == scrollY)
+        precondition(request.targetScrollY >= request.currentScrollY)
+        precondition(request.targetScrollY <= viewport.maxScrollY + 0.01)
+        precondition(request.needsScroll)
+
+        _ = try bridge.insertText("x")
+        precondition(textView.visualViewportPointForSelfCheck(visualUTF16: 0) == nil)
+        do {
+            _ = try bridge.macosShapedViewportBlocks(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: Float(scrollY),
+                viewportHeight: Float(viewportHeight)
+            )
+            preconditionFailure("stale visual viewport unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        do {
+            _ = try bridge.macosShapedCaretScrollRequest(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: Float(scrollY),
+                viewportHeight: Float(viewportHeight),
+                margin: 0.0
+            )
+            preconditionFailure("stale caret scroll request unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        print(
+            "Yu Visual Viewport self-check: document↔viewport scroll transform and "
+                + "shaped caret reveal are Revision-bound"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual Viewport self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+private func unwrapSelfCheck<T>(_ value: T?) throws -> T {
+    guard let value else {
+        throw BridgeError.operation(14)
+    }
+    return value
+}
+
 private func runCompositionProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -3955,6 +4230,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--block-layout-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--shaped-viewport-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runShapedViewportSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-viewport-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualViewportSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

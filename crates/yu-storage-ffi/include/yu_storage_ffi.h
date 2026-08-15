@@ -319,7 +319,26 @@ typedef struct YuStorageShapedViewportSnapshot {
     uint64_t block_start;
     uint64_t block_end;
     float content_height;
+    /* Native viewport inputs used to interpret document-space block y. */
+    float scroll_y;
+    float viewport_height;
+    float max_scroll_y;
 } YuStorageShapedViewportSnapshot;
+
+/* Revision-bound shaped caret geometry and absolute document scroll target. */
+typedef struct YuStorageCaretScrollRequest {
+    uint64_t revision;
+    uint64_t source_utf16;
+    uint64_t block_index;
+    float caret_x;
+    float caret_y;
+    float caret_width;
+    float caret_height;
+    float current_scroll_y;
+    float target_scroll_y;
+    float margin;
+    uint8_t needs_scroll;
+} YuStorageCaretScrollRequest;
 
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
@@ -475,6 +494,10 @@ int32_t yu_storage_session_macos_shaped_viewport_blocks(
     float max_width, float scroll_y, float viewport_height,
     YuStorageShapedViewportSnapshot *snapshot,
     YuStorageShapedViewportBlock *blocks, size_t capacity, size_t *written);
+int32_t yu_storage_session_macos_shaped_caret_scroll_request(
+    YuStorageSession *session, uint64_t expected_revision, float size,
+    float max_width, float scroll_y, float viewport_height, float margin,
+    YuStorageCaretScrollRequest *output);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,
