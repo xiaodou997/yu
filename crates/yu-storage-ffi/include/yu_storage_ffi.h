@@ -23,6 +23,7 @@ enum {
     YU_STORAGE_NO_OVERLAY = 15,
     YU_STORAGE_STALE_COMPOSITION = 16,
     YU_STORAGE_EXPORT_ERROR = 17,
+    YU_STORAGE_HTML_IMPORT_REJECTED = 18,
 };
 
 enum {
@@ -242,6 +243,11 @@ int32_t yu_storage_session_copy_selection_html(const YuStorageSession *session,
                                                uint64_t expected_revision,
                                                uint8_t *output, size_t capacity,
                                                size_t *written);
+/* Converts allowlisted HTML to Markdown; policy rejection must fall back to
+ * the caller's text/plain payload. This function does not access a session. */
+int32_t yu_storage_import_html_fragment(const uint8_t *html, size_t html_length,
+                                        uint8_t *output, size_t capacity,
+                                        size_t *written);
 int32_t yu_storage_session_accessibility_snapshot(
     const YuStorageSession *session, YuStorageAccessibilitySnapshot *output);
 int32_t yu_storage_session_accessibility_semantic_node_count(

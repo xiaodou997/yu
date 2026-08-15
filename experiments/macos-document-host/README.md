@@ -14,7 +14,8 @@
   presentation，commit/cancel 用 Revision + composition generation 防止迟到回调污染新状态；
 - copy/paste/cut/selectAll 都通过 Rust selection/source/command，copy/cut 同时发布
   `net.daringfireball.markdown`、纯文本和 `public.html` payload，三者都来自同一
-  Revision-bound source range；paste 优先读取 Markdown source；TextKit 不提供独立 undo 或
+  Revision-bound source range；paste 优先读取 Markdown source，再读取纯文本，最后才调用 Rust
+  strict HTML→Markdown policy；策略拒绝时不注入 HTML，而是回退纯文本；TextKit 不提供独立 undo 或
   canonical source；
 - Accessibility 文本查询与 Markdown semantic node count/fill 都从同一 Revision-bound Rust
   session 读取；Swift 只保存 owned 节点元数据，`DocumentTextView` 作为可编辑 AX root，并将
@@ -47,6 +48,16 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检会创建真实 AppKit Accessibility 子节点，验证节点文本和 URL 来自当前 Revision、task checkbox
 状态/press、Heading/Link rotor 目标，并在一次 Rust 编辑后确认旧节点不能继续读取新 source；真实
 VoiceOver 朗读已由人工确认，Rotor/语义 action 的真实导航仍应在后续版本回归。
+
+验证 native clipboard priority/fallback（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --clipboard-self-check /path/to/file.md
+```
+
+该自检使用私有 pasteboard，验证 Markdown > 纯文本 > 受控 HTML 的顺序，以及 HTML policy 拒绝时
+不会把脚本等内容写入 Markdown source。
 
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立
