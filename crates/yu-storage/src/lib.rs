@@ -17,9 +17,10 @@ use std::time::SystemTime;
 
 use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
 use yu_editor::{
-    BlockProjection, CommandResult, CompositionError, CompositionOverlay, EditorCommand,
-    EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, LayoutConfig,
-    LayoutSnapshot, Projection, ShapingProvider, ViewportConfig, ViewportRect, ViewportSnapshot,
+    BlockProjection, CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay,
+    EditorCommand, EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult,
+    LayoutConfig, LayoutSnapshot, Projection, ShapingProvider, ViewportConfig, ViewportRect,
+    ViewportSnapshot,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -343,6 +344,20 @@ impl DocumentSession {
     ) -> Result<ViewportSnapshot, StorageError> {
         self.editor
             .visible_blocks_with_shaper(viewport, shaper)
+            .map_err(StorageError::Editor)
+    }
+
+    /// Resolves the focus caret through the same shaped viewport policy used
+    /// by `visible_blocks_with_shaper`, returning an absolute document-space
+    /// scroll target without changing canonical source state.
+    pub fn caret_scroll_request_with_shaper<S: ShapingProvider>(
+        &mut self,
+        viewport: ViewportRect,
+        margin: f32,
+        shaper: &S,
+    ) -> Result<CaretScrollRequest, StorageError> {
+        self.editor
+            .caret_scroll_request_with_shaper(viewport, margin, shaper)
             .map_err(StorageError::Editor)
     }
 
@@ -743,6 +758,19 @@ impl DocumentEditorSession {
         shaper: &S,
     ) -> Result<ViewportSnapshot, StorageError> {
         self.document.visible_blocks_with_shaper(viewport, shaper)
+    }
+
+    /// Resolves the focus caret through the file-backed session's shaped
+    /// viewport state. The returned target is document-space and revision
+    /// bound; it never mutates source or selection.
+    pub fn caret_scroll_request_with_shaper<S: ShapingProvider>(
+        &mut self,
+        viewport: ViewportRect,
+        margin: f32,
+        shaper: &S,
+    ) -> Result<CaretScrollRequest, StorageError> {
+        self.document
+            .caret_scroll_request_with_shaper(viewport, margin, shaper)
     }
 
     pub fn set_viewport_config(&mut self, config: ViewportConfig) -> Result<(), StorageError> {
