@@ -18,6 +18,10 @@ use yu_markdown::{
 };
 use yu_text::{TextBuffer, TextPositionError, TextSnapshot};
 
+mod html_import;
+
+pub use html_import::{HtmlImportError, import_html_fragment};
+
 /// Pasteboard MIME/UTI names shared by native adapters.
 pub const MARKDOWN_MIME: &str = "text/markdown";
 pub const MARKDOWN_UTI: &str = "net.daringfireball.markdown";
@@ -833,6 +837,17 @@ mod tests {
         assert_eq!(
             html,
             "<table><thead><tr><th style=\"text-align: left\">Name</th><th style=\"text-align: right\">Count</th><th style=\"text-align: center\">Note</th></tr></thead><tbody><tr><td style=\"text-align: left\"><strong>Yu</strong></td><td style=\"text-align: right\">2</td><td style=\"text-align: center\"><code>a|b</code></td></tr></tbody></table>"
+        );
+    }
+
+    #[test]
+    fn exported_html_round_trips_through_strict_import_policy() {
+        let source = "# Yu\n\n- [x] done\n\n| A | B |\n| :--- | ---: |\n| 1 | 2 |";
+        let html = export_html_fragment(source).expect("export source fragment");
+
+        assert_eq!(
+            import_html_fragment(&html).expect("Yu HTML should be accepted by its importer"),
+            source
         );
     }
 
