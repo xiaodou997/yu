@@ -26,7 +26,8 @@ adapter、真实跨应用回归和粘贴失败遥测仍待后续。
 - `hasSourceOnPasteboard` 只检查类型存在，不在菜单验证期间解析 HTML；解析只发生在用户真正执行
   paste 时，避免主线程菜单查询重复做工作。
 - `--clipboard-self-check` 使用私有 pasteboard 验证 Markdown、纯文本、HTML fallback 和拒绝路径，
-  不启动窗口、不改写系统剪贴板。
+  并读取 `experiments/macos-document-host/Fixtures/clipboard` 的 semantic mail、GFM table、
+  browser wrapper、unsafe HTML fixture；它不启动窗口、不改写系统剪贴板。
 
 ## 验证
 
@@ -37,7 +38,12 @@ experiments/macos-document-host/.build/YuMacDocumentHost.app/Contents/MacOS/YuMa
   --clipboard-self-check experiments/macos-document-host/Fixtures/sample.md
 ```
 
+fixture self-check 已覆盖四类来源：只提供受控 semantic HTML 的邮件样式片段、带对齐的 table、带
+`html/body/div`/fragment marker 的浏览器包装片段，以及脚本片段。后两类按策略拒绝；如果 pasteboard
+同时带纯文本，native adapter 使用纯文本，不把拒绝原因暴露为崩溃或 HTML 注入。
+
 ## 后续
 
-在 macOS 真实跨应用粘贴中覆盖浏览器、邮件和只提供 HTML 的来源，记录策略拒绝与纯文本回退；随后
+在 macOS 真实跨应用粘贴中覆盖浏览器、邮件和只提供 HTML 的来源，记录 fixture 之外的策略拒绝与
+纯文本回退；随后
 把相同格式契约映射到 Windows TSF/clipboard 和 Linux Wayland/X11 clipboard adapter。
