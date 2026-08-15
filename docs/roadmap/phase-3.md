@@ -15,8 +15,9 @@ retained scene/GPU 绘制。
 - [x] Swift/AppKit projection self-check 覆盖 strong/emphasis/link delimiter 与 Unicode caret
 - [x] macOS storage FFI 按 parser-owned block index 暴露 source range/kind/visual lengths 与 UTF-8 snapshot
 - [x] Swift block projection self-check 覆盖 heading/task/fenced-code、Unicode 和 stale/out-of-bounds
+- [x] macOS storage FFI 暴露 generation-bound composition projection、visual selection 与 marked caret
+- [x] Swift composition projection self-check 覆盖 Unicode preedit、update stale generation、cancel/source 保持
 - [ ] 完善 heading/list/task/fence/table 的 visual delimiter 语义，并统一 block projection kind
-- [ ] composition overlay 投影与 source/visual selection adapter
 - [ ] visual selection range、hit-testing 和 point↔source mapping
 - [ ] stale Revision/generation 在 native projection callbacks 上的全路径回归
 

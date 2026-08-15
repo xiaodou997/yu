@@ -101,6 +101,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检逐 block 消费 Rust 返回的 owned UTF-8，不在 Swift 重建 Markdown block；当前只建立
 block-local projection 诊断边界，生产 TextKit mirror 和完整 visual delimiter 语义保持不变。
 
+验证 marked-text composition 的 transient projection、visual selection、active caret 与
+Revision/generation 生命周期（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --composition-projection-self-check experiments/macos-document-host/Fixtures/projection.md
+```
+
+该自检使用 Unicode/emoji preedit，确认 update 后旧 generation 被拒绝，cancel 不推进 source
+Revision 且恢复原文；Rust `CompositionOverlay` 是唯一 transient source/visual 映射来源。
+
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立
 source、dirty 或 history。

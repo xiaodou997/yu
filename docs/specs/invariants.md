@@ -184,6 +184,13 @@
     UTF-8/UTF-16 转换失败或 projection 错误必须拒绝，且不得写入半成品 metadata；count/fill
     查询只能返回 owned bytes/scalars，不得让 Swift 解析 Markdown、取得 Block/Projection 指针，
     或修改 source、selection、composition、history、Revision。
+40. `yu_storage_session_composition_projection`、`yu_storage_session_copy_composition_projection`
+    与 `yu_storage_session_composition_caret` 必须同时遵守 canonical Revision 与 transient
+    composition generation：metadata 先清空再写入，copy/caret 的 stale generation、无 overlay、
+    UTF-16 surrogate split 或投影转换失败必须拒绝。projected UTF-8、preedit/visual selection、
+    active marked caret 和 round-trip source 必须由 Rust `Projection::with_composition` 生成；
+    begin/update/cancel 期间 source、Markdown CST、selection/history 和 Revision 不得改变，Swift
+    只能消费 owned bytes/scalars，不能自行拼接 preedit 或推导 hidden delimiter range。
 
 ## Accessibility
 

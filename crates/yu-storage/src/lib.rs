@@ -211,6 +211,34 @@ impl DocumentSession {
             .map_err(StorageError::Editor)
     }
 
+    /// Builds the current transient composition over the same full-source
+    /// projection used by native layout diagnostics. The preedit is visual
+    /// only: the canonical buffer, Markdown CST and source Revision remain
+    /// unchanged until `commit_composition` succeeds.
+    pub fn composition_projection(&mut self) -> Result<Projection, StorageError> {
+        let overlay = self
+            .editor
+            .composition()
+            .cloned()
+            .ok_or(StorageError::Editor(
+                EditorDocumentError::CompositionNotActive,
+            ))?;
+        let snapshot = self.editor.snapshot();
+        let source_range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("a snapshot's full range is always ordered");
+        let base = self
+            .editor
+            .projection(source_range)
+            .map_err(StorageError::Editor)?
+            .clone();
+        base.with_composition(
+            overlay.replacement_range(),
+            overlay.text().to_owned(),
+            overlay.selection_bytes(),
+        )
+        .map_err(|error| StorageError::Editor(error.into()))
+    }
+
     /// Returns the number of parser-owned blocks in the current source
     /// revision. Block indices are stable only for this revision and must be
     /// paired with the revision returned by the session.
@@ -564,6 +592,10 @@ impl DocumentEditorSession {
     /// that owns source, revision, selection and history.
     pub fn inline_projection(&mut self) -> Result<Projection, StorageError> {
         self.document.inline_projection()
+    }
+
+    pub fn composition_projection(&mut self) -> Result<Projection, StorageError> {
+        self.document.composition_projection()
     }
 
     #[must_use]

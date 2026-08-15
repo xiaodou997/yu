@@ -366,6 +366,14 @@ Revision，越界或过期结果不会写入 metadata；Swift 只校验快照和
 Markdown 语义。该接口是后续 block-local composition、layout 和 visual hit-testing 的输入，
 当前仍不替换生产 TextKit source mirror。
 
+composition 现在也通过同一 storage handle 暴露 generation-bound 的
+`yu_storage_session_composition_projection`、`yu_storage_session_copy_composition_projection` 和
+`yu_storage_session_composition_caret`。Rust 用 `Projection::with_composition` 生成临时
+projected UTF-8、preedit/visual selection 和 active marked caret；Swift 必须同时保存 source
+Revision 与 composition generation，旧 generation 的 copy/caret 会被拒绝。begin/update/cancel
+只改变 transient overlay，canonical source、Markdown CST、history 和 Revision 保持不变；真实
+TextKit mirror 仍沿用现有生命周期，尚未切换为最终 visual selection/hit-testing。
+
 随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
 `ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16
 range、document-space block origin/height、measured 和稳定 kind tag。它只复制 owned scalar，

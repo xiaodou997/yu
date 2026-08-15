@@ -395,6 +395,58 @@ private struct NativeComposition {
     }
 }
 
+private struct NativeCompositionProjection {
+    let revision: UInt64
+    let generation: UInt64
+    let replacementRange: NSRange
+    let preeditSelection: NSRange
+    let visualSelection: NSRange
+    let projectedUTF16Length: Int
+    let projectedUTF8Length: Int
+
+    init(_ value: YuStorageCompositionProjection) {
+        revision = value.revision
+        generation = value.generation
+        replacementRange = NSRange(
+            location: Int(value.replacement_start_utf16),
+            length: Int(value.replacement_end_utf16 - value.replacement_start_utf16)
+        )
+        preeditSelection = NSRange(
+            location: Int(value.preedit_selection_start_utf16),
+            length: Int(value.preedit_selection_end_utf16 - value.preedit_selection_start_utf16)
+        )
+        visualSelection = NSRange(
+            location: Int(value.visual_selection_start_utf16),
+            length: Int(value.visual_selection_end_utf16 - value.visual_selection_start_utf16)
+        )
+        projectedUTF16Length = Int(value.projected_utf16_length)
+        projectedUTF8Length = Int(value.projected_utf8_length)
+    }
+}
+
+private struct NativeCompositionCaret {
+    let revision: UInt64
+    let generation: UInt64
+    let sourceUTF16: UInt64
+    let visualUTF16: UInt64
+    let roundTripSourceUTF16: UInt64
+    let visualSelection: NSRange
+    let affinity: UInt8
+
+    init(_ value: YuStorageCompositionCaret) {
+        revision = value.revision
+        generation = value.generation
+        sourceUTF16 = value.source_utf16
+        visualUTF16 = value.visual_utf16
+        roundTripSourceUTF16 = value.round_trip_source_utf16
+        visualSelection = NSRange(
+            location: Int(value.visual_selection_start_utf16),
+            length: Int(value.visual_selection_end_utf16 - value.visual_selection_start_utf16)
+        )
+        affinity = value.affinity
+    }
+}
+
 private struct NativeCommandResult {
     let revision: UInt64
     let selection: NSRange
@@ -789,6 +841,52 @@ private final class StorageBridge {
                 written
             )
         }
+    }
+
+    func compositionProjection(revision: UInt64) throws -> NativeCompositionProjection {
+        var value = YuStorageCompositionProjection()
+        let status = yu_storage_session_composition_projection(handle, revision, &value)
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeCompositionProjection(value)
+    }
+
+    func copyCompositionProjection(
+        revision: UInt64,
+        generation: UInt64
+    ) throws -> String {
+        try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_composition_projection(
+                handle,
+                revision,
+                generation,
+                output,
+                capacity,
+                written
+            )
+        }
+    }
+
+    func compositionCaret(
+        revision: UInt64,
+        generation: UInt64,
+        sourceUTF16: UInt64,
+        affinity: UInt8
+    ) throws -> NativeCompositionCaret {
+        var value = YuStorageCompositionCaret()
+        let status = yu_storage_session_composition_caret(
+            handle,
+            revision,
+            generation,
+            sourceUTF16,
+            affinity,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeCompositionCaret(value)
     }
 
     func copySourceRange(_ range: NSRange, revision: UInt64) -> String {
@@ -2514,6 +2612,93 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
     }
 }
 
+private func runCompositionProjectionSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let sourceBefore = bridge.source
+        let revision = bridge.state.revision
+        let strong = (sourceBefore as NSString).range(of: "**粗体**")
+        precondition(strong.location != NSNotFound)
+        let replacement = NSRange(location: strong.location + 2, length: 2)
+        try bridge.beginComposition(
+            replacementRange: replacement,
+            preedit: "日本🙂",
+            selection: NSRange(location: 2, length: 2)
+        )
+
+        let initial = try bridge.compositionProjection(revision: revision)
+        precondition(initial.revision == revision)
+        precondition(initial.generation == bridge.composition.generation)
+        precondition(initial.replacementRange == replacement)
+        precondition(initial.preeditSelection == NSRange(location: 2, length: 2))
+        let projected = try bridge.copyCompositionProjection(
+            revision: initial.revision,
+            generation: initial.generation
+        )
+        precondition(projected.contains("日本🙂"))
+        precondition(!projected.contains("**粗体**"))
+        precondition(initial.projectedUTF8Length == projected.utf8.count)
+        precondition(initial.projectedUTF16Length == projected.utf16.count)
+        precondition(initial.visualSelection.length == 2)
+
+        let caret = try bridge.compositionCaret(
+            revision: initial.revision,
+            generation: initial.generation,
+            sourceUTF16: UInt64(replacement.location),
+            affinity: 1
+        )
+        precondition(caret.revision == revision)
+        precondition(caret.generation == initial.generation)
+        precondition(caret.sourceUTF16 == UInt64(replacement.location))
+        precondition(caret.visualSelection == initial.visualSelection)
+        precondition(caret.visualUTF16 == UInt64(initial.visualSelection.location + initial.visualSelection.length))
+
+        try bridge.updateComposition(
+            preedit: "日本語",
+            selection: NSRange(location: 3, length: 0)
+        )
+        let updated = try bridge.compositionProjection(revision: revision)
+        precondition(updated.generation != initial.generation)
+        precondition(updated.preeditSelection == NSRange(location: 3, length: 0))
+        do {
+            _ = try bridge.copyCompositionProjection(
+                revision: revision,
+                generation: initial.generation
+            )
+            preconditionFailure("stale composition projection unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 16)
+        }
+        let updatedCaret = try bridge.compositionCaret(
+            revision: revision,
+            generation: updated.generation,
+            sourceUTF16: UInt64(replacement.location),
+            affinity: 1
+        )
+        precondition(updatedCaret.visualSelection.length == 0)
+        precondition(updatedCaret.visualUTF16 == UInt64(updated.visualSelection.location))
+
+        try bridge.cancelComposition()
+        precondition(!bridge.composition.active)
+        precondition(bridge.state.revision == revision)
+        precondition(bridge.source == sourceBefore)
+        do {
+            _ = try bridge.compositionProjection(revision: revision)
+            preconditionFailure("cancelled composition unexpectedly projected")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 15)
+        }
+        print(
+            "Yu Composition Projection self-check: revision=\(revision) "
+                + "generation \(initial.generation)->\(updated.generation); source preserved"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Composition Projection self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runAccessibilitySelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -2684,6 +2869,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runBlockProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runCompositionProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--clipboard-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
