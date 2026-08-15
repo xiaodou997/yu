@@ -78,6 +78,18 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检通过同一个 `DocumentTextView` 执行一次插入、撤销和重做，确认 TextKit 不建立第二套
 history，Rust source、revision 和 redo 状态保持一致。
 
+验证同一个 `DocumentEditorSession` 提供 source-backed Markdown projection 和 source↔visual
+caret 映射（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --projection-self-check experiments/macos-document-host/Fixtures/projection.md
+```
+
+该自检只验证 projection FFI 契约，不改变生产窗口的 TextKit source mirror；隐藏的 emphasis/link
+语法会从 visual 文本移除，但 source UTF-16 caret 必须在当前 Revision 内 round-trip。完整 block
+projection、IME 映射和 GPU scene 接入会在该边界稳定后进行。
+
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立
 source、dirty 或 history。

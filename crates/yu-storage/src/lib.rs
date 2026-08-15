@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use yu_core::{Revision, TextRange, Utf16Range};
+use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
 use yu_editor::{
     CommandResult, CompositionError, CompositionOverlay, EditorCommand, EditorDocument,
-    EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, ViewportRect, ViewportSnapshot,
+    EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult, Projection, ViewportRect,
+    ViewportSnapshot,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -194,6 +195,20 @@ impl DocumentSession {
     #[must_use]
     pub fn selection(&self) -> EditorSelection {
         self.editor.selection()
+    }
+
+    /// Builds the current revision's source-backed inline projection through
+    /// the editor-owned projection cache. The returned value is an owned
+    /// snapshot so a native FFI caller cannot retain a Rust borrow across
+    /// another session operation.
+    pub fn inline_projection(&mut self) -> Result<Projection, StorageError> {
+        let snapshot = self.editor.snapshot();
+        let source_range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("a snapshot's full range is always ordered");
+        self.editor
+            .projection(source_range)
+            .cloned()
+            .map_err(StorageError::Editor)
     }
 
     /// Returns the active transient IME overlay, if any.
@@ -513,6 +528,12 @@ impl DocumentEditorSession {
     #[must_use]
     pub fn selection(&self) -> EditorSelection {
         self.document.selection()
+    }
+
+    /// Returns an owned source-backed projection from the same editor session
+    /// that owns source, revision, selection and history.
+    pub fn inline_projection(&mut self) -> Result<Projection, StorageError> {
+        self.document.inline_projection()
     }
 
     #[must_use]
