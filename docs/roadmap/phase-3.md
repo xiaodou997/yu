@@ -27,7 +27,8 @@ retained scene/GPU 绘制。
 - [x] macOS CoreText shaping metrics 与 `yu-layout` line/caret contract 对齐
 - [x] shaped viewport snapshot、block origin/height 与可见窗口 count/fill
 - [x] TextKit 过渡镜像自检支持 visual/source 双向映射（生产 view 尚未切换）
-- [ ] macOS 鼠标点击、拖选、上下移动和 IME 在 visual projection 下回归
+- [x] `DocumentTextView` opt-in visual pointer adapter 与 source-mirror fallback self-check
+- [ ] 生产 visual view 的鼠标点击、拖选、上下移动和 IME 回归
 
 ## Track C：Scene and rendering
 

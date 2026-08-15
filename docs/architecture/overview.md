@@ -387,7 +387,9 @@ TextKit 过渡镜像现在还可以通过 `yu_storage_session_projection_source_
 canonical source，并返回 visual round-trip 边界。Swift 的 visual-mirror self-check 只创建临时
 `NSTextStorage`/`NSLayoutManager` 验证 projected UTF-8 可被 TextKit 接收，再用同一 Revision 的
 Rust reverse mapping 校验 hidden delimiter 和 Unicode；Rust source 发生编辑后旧镜像查询立即被
-拒绝，生产 `DocumentTextView` 仍保持 source mirror，尚未切换 visual editing。
+拒绝。`DocumentTextView` 已增加 opt-in 的 visual pointer adapter：它可以用临时 visual TextKit
+layout 将点击/拖选结果交给 Rust reverse mapping，再把 canonical source range 同步回现有 source
+mirror；默认仍关闭该路径，生产窗口在 visual renderer 完成前继续走 AppKit source selection。
 
 storage FFI 现在还提供 parser-owned block 的 `yu_storage_session_block_layout`，以及 macOS
 `yu_storage_session_macos_block_layout`/`yu_storage_session_macos_block_caret`。前者使用显式

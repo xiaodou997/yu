@@ -19,16 +19,17 @@ Rust 已能把 canonical source selection/caret 投影为 visual UTF-16，但 Te
   保留在 canonical source selection；collapsed caret 遵循 caller affinity。
 - FFI output 在 Revision、affinity、UTF-16 boundary 和 range 校验前清空；不返回 Projection、
   LayoutSnapshot、TextKit 或 AppKit 对象。
-- Swift 只在 self-check 中创建临时 `NSTextStorage`/`NSLayoutManager` 验证 visual UTF-8 可以被
-  TextKit 接收；生产 `DocumentTextView` 仍保持 source mirror，visual editing 尚未切换。
+- Swift 只在 self-check 或显式 opt-in pointer adapter 中创建临时 `NSTextStorage`/`NSLayoutManager`
+  验证/命中 visual UTF-8；成功的 reverse mapping 才会把 source selection 同步到现有 source
+  mirror。生产 `DocumentTextView` 默认仍保持 source mirror，visual editing 尚未切换。
 
 ## 结果
 
 - visual/source 双向坐标协议已经可以独立测试，native 后续可以把鼠标/拖选结果提交给 Rust
   selection，而不在 Swift 维护第二份 Markdown 语义。
 - Rust source Revision 变化后旧 visual mirror 查询会立即失败，避免 late callback 覆盖新 source。
-- 下一步仍需在真实 `DocumentTextView` 中接入鼠标点击、拖选、上下移动和 IME 的 visual fallback，
-  再决定是否替换 source TextKit mirror。
+- `DocumentTextView` 已有 opt-in 点击/拖选 adapter 和安全 source fallback；下一步仍需在真实 visual
+  view 中接入上下移动、滚动 origin 和 IME 坐标，再决定是否替换 source TextKit mirror。
 
 ## 验证
 

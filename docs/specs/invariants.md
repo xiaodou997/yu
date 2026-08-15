@@ -217,6 +217,11 @@
     affinity、visual UTF-16 surrogate split、逆序/越界 range 或 projection 错误必须先清空 output
     再拒绝；TextKit 只可持有 owned projected text/selection，不能解析 Markdown、缓存 source range
     或在 Rust source 变更后继续使用旧 Revision。
+45. `DocumentTextView` 的 visual pointer adapter 只能在拥有同一 Revision 的 disposable visual
+    TextKit mirror 时处理点击/拖选；Rust reverse mapping 成功后才能提交 source selection 并更新
+    native source mirror，任何 stale/范围/映射失败都必须回退 AppKit source selection，不能修改
+    source、composition 或 history。默认产品窗口必须关闭该 adapter，直到 visual renderer、scroll
+    origin 和 IME 坐标共享同一 visual layout。
 
 ## Accessibility
 
