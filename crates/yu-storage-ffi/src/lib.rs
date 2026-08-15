@@ -171,6 +171,40 @@ pub struct YuStorageProjectionCaret {
     pub affinity: u8,
 }
 
+/// Revision- and composition-generation-bound transient projection metadata.
+/// Canonical source stays unchanged while the marked-text overlay is active;
+/// visual selection ranges are measured in the projected UTF-16 stream.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageCompositionProjection {
+    pub revision: u64,
+    pub generation: u64,
+    pub replacement_start_utf16: u64,
+    pub replacement_end_utf16: u64,
+    pub preedit_selection_start_utf16: u64,
+    pub preedit_selection_end_utf16: u64,
+    pub visual_selection_start_utf16: u64,
+    pub visual_selection_end_utf16: u64,
+    pub projected_utf16_length: u64,
+    pub projected_utf8_length: u64,
+}
+
+/// Revision- and composition-generation-bound caret mapping for the active
+/// marked-text projection. `visual_utf16` and the visual selection are owned
+/// projected-stream coordinates; source remains canonical UTF-16.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageCompositionCaret {
+    pub revision: u64,
+    pub generation: u64,
+    pub source_utf16: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub visual_selection_start_utf16: u64,
+    pub visual_selection_end_utf16: u64,
+    pub affinity: u8,
+}
+
 /// Revision-bound metadata for one parser-owned block projection. The visual
 /// bytes are returned by the companion query; lengths are included here so a
 /// native host can validate its allocation and its UTF-16 layout without
@@ -941,6 +975,122 @@ fn projection_kind_tag(projection: &BlockProjection) -> u8 {
     }
 }
 
+fn composition_projection(session: &mut DocumentEditorSession) -> Result<Projection, i32> {
+    session.composition_projection().map_err(storage_status)
+}
+
+fn utf16_byte_offset(text: &str, target: u64) -> Result<usize, i32> {
+    let target = usize::try_from(target).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    if target == 0 {
+        return Ok(0);
+    }
+    let mut units = 0_usize;
+    for (byte, character) in text.char_indices() {
+        if units == target {
+            return Ok(byte);
+        }
+        units = units.saturating_add(character.len_utf16());
+        if units == target {
+            return Ok(byte + character.len_utf8());
+        }
+        if units > target {
+            return Err(YU_STORAGE_INVALID_SELECTION);
+        }
+    }
+    if units == target {
+        Ok(text.len())
+    } else {
+        Err(YU_STORAGE_INVALID_SELECTION)
+    }
+}
+
+fn utf16_offset_in_utf8(text: &str, byte_offset: u64) -> Result<u64, i32> {
+    let byte_offset = usize::try_from(byte_offset).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let prefix = text
+        .get(..byte_offset)
+        .ok_or(YU_STORAGE_INVALID_SELECTION)?;
+    u64::try_from(prefix.encode_utf16().count()).map_err(|_| YU_STORAGE_INVALID_SELECTION)
+}
+
+fn composition_visual_selection_utf16(
+    projection: &Projection,
+    projected: &str,
+) -> Result<(u64, u64), i32> {
+    let visual_selection = projection
+        .composition_selection_visual()
+        .ok_or(YU_STORAGE_NO_OVERLAY)?;
+    Ok((
+        utf16_offset_in_utf8(projected, visual_selection.start().get())?,
+        utf16_offset_in_utf8(projected, visual_selection.end().get())?,
+    ))
+}
+
+fn composition_projection_metadata(
+    session: &mut DocumentEditorSession,
+) -> Result<(YuStorageCompositionProjection, String), i32> {
+    let projection = composition_projection(session)?;
+    let snapshot = session.snapshot();
+    let overlay = session.composition().ok_or(YU_STORAGE_NO_OVERLAY)?;
+    let projected = projected_utf8(&projection)?;
+    let replacement_start_utf16 = snapshot
+        .utf16_offset(overlay.replacement_range().start())
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    let replacement_end_utf16 = snapshot
+        .utf16_offset(overlay.replacement_range().end())
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    let (visual_selection_start_utf16, visual_selection_end_utf16) =
+        composition_visual_selection_utf16(&projection, &projected)?;
+    let projected_utf16_length =
+        u64::try_from(projected.encode_utf16().count()).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let projected_utf8_length =
+        u64::try_from(projected.len()).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let metadata = YuStorageCompositionProjection {
+        revision: snapshot.revision().get(),
+        generation: session.composition_generation(),
+        replacement_start_utf16,
+        replacement_end_utf16,
+        preedit_selection_start_utf16: overlay.selection_utf16().start().get(),
+        preedit_selection_end_utf16: overlay.selection_utf16().end().get(),
+        visual_selection_start_utf16,
+        visual_selection_end_utf16,
+        projected_utf16_length,
+        projected_utf8_length,
+    };
+    Ok((metadata, projected))
+}
+
+fn composition_active_visual_caret(
+    projection: &Projection,
+    selection_start_utf16: u64,
+    selection_end_utf16: u64,
+) -> Result<(VisualOffset, ProjectionBias), i32> {
+    if selection_start_utf16 > selection_end_utf16 {
+        return Err(YU_STORAGE_INVALID_SELECTION);
+    }
+    let text = projection.composition_text().ok_or(YU_STORAGE_NO_OVERLAY)?;
+    let selection_start = utf16_byte_offset(text, selection_start_utf16)?;
+    let selection_end = utf16_byte_offset(text, selection_end_utf16)?;
+    let replacement = projection
+        .composition_range()
+        .ok_or(YU_STORAGE_NO_OVERLAY)?;
+    let visual_base = projection
+        .source_to_visual(replacement.start(), ProjectionBias::Before)
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    let active = if selection_start == selection_end {
+        visual_base
+            .checked_add(u64::try_from(selection_start).map_err(|_| YU_STORAGE_INVALID_SELECTION)?)
+            .ok_or(YU_STORAGE_INVALID_SELECTION)?
+    } else {
+        visual_base
+            .checked_add(u64::try_from(selection_end).map_err(|_| YU_STORAGE_INVALID_SELECTION)?)
+            .ok_or(YU_STORAGE_INVALID_SELECTION)?
+    };
+    Ok((VisualOffset::new(active), ProjectionBias::After))
+}
+
 fn validate_revision(session: &DocumentEditorSession, expected: u64) -> Result<(), i32> {
     if session.revision().get() != expected {
         return Err(YU_STORAGE_STALE_REVISION);
@@ -1537,6 +1687,166 @@ pub unsafe extern "C" fn yu_storage_session_projection_caret(
             source_utf16,
             visual_utf16,
             round_trip_source_utf16,
+            affinity: match affinity {
+                CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+            },
+        };
+    }
+    YU_STORAGE_OK
+}
+
+/// Returns metadata for the active transient composition projection. The
+/// canonical source Revision is guarded by `expected_revision`; the returned
+/// generation must be supplied to later count/fill and caret queries.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_composition_projection(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    output: *mut YuStorageCompositionProjection,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageCompositionProjection::default() };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let (metadata, _) = match composition_projection_metadata(&mut session.session) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
+/// Copies the current transient projected UTF-8 stream using the same
+/// two-call count/fill contract as source snapshots. Both canonical Revision
+/// and transient composition generation are validated before projection work.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_composition_projection(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) =
+        validate_composition(&session.session, expected_revision, expected_generation)
+    {
+        return status;
+    }
+    let (_, projected) = match composition_projection_metadata(&mut session.session) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    write_bytes(projected.as_bytes(), output, capacity, written)
+}
+
+/// Resolves the active marked-text caret through the transient projection.
+/// The input source boundary is validated against canonical source; the
+/// visual caret is the active end of the preedit selection, matching AppKit's
+/// marked-text insertion point. Both visual selection and round-trip source
+/// are returned in owned UTF-16/scalar form.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_composition_caret(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    source_utf16: u64,
+    affinity: u8,
+    output: *mut YuStorageCompositionCaret,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageCompositionCaret::default() };
+    if let Err(status) =
+        validate_composition(&session.session, expected_revision, expected_generation)
+    {
+        return status;
+    }
+    let affinity = match caret_affinity_from_ffi(affinity) {
+        Ok(affinity) => affinity,
+        Err(status) => return status,
+    };
+    let snapshot = session.session.snapshot();
+    if snapshot
+        .byte_offset_for_utf16(Utf16Offset::new(source_utf16))
+        .is_err()
+    {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    let projection = match composition_projection(&mut session.session) {
+        Ok(projection) => projection,
+        Err(status) => return status,
+    };
+    let overlay = match session.session.composition() {
+        Some(overlay) => overlay,
+        None => return YU_STORAGE_NO_OVERLAY,
+    };
+    let (active_visual, active_bias) = match composition_active_visual_caret(
+        &projection,
+        overlay.selection_utf16().start().get(),
+        overlay.selection_utf16().end().get(),
+    ) {
+        Ok(caret) => caret,
+        Err(status) => return status,
+    };
+    let projected = match projected_utf8(&projection) {
+        Ok(projected) => projected,
+        Err(status) => return status,
+    };
+    let visual_utf16 = match visual_utf16_offset(&projected, active_visual) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
+    let round_trip = match projection.visual_to_source(active_visual, active_bias) {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let (visual_selection_start_utf16, visual_selection_end_utf16) =
+        match composition_visual_selection_utf16(&projection, &projected) {
+            Ok(selection) => selection,
+            Err(status) => return status,
+        };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuStorageCompositionCaret {
+            revision: snapshot.revision().get(),
+            generation: session.session.composition_generation(),
+            source_utf16,
+            visual_utf16,
+            round_trip_source_utf16,
+            visual_selection_start_utf16,
+            visual_selection_end_utf16,
             affinity: match affinity {
                 CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
                 CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
@@ -2391,6 +2701,210 @@ mod tests {
             YU_STORAGE_STALE_REVISION
         );
 
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_composition_projection_is_generation_bound_and_preserves_source() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yu-storage-ffi-composition-projection-{id}.md"));
+        let source = "before **x** after";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_begin_composition(
+                    raw,
+                    0,
+                    9,
+                    10,
+                    "日本🙂".as_ptr(),
+                    "日本🙂".len(),
+                    2,
+                    4,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut projection = YuStorageCompositionProjection::default();
+        assert_eq!(
+            unsafe { yu_storage_session_composition_projection(raw, 0, &mut projection) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(projection.revision, 0);
+        assert_eq!(projection.generation, 1);
+        assert_eq!(projection.replacement_start_utf16, 9);
+        assert_eq!(projection.replacement_end_utf16, 10);
+        assert_eq!(projection.preedit_selection_start_utf16, 2);
+        assert_eq!(projection.preedit_selection_end_utf16, 4);
+        assert_eq!(projection.visual_selection_start_utf16, 9);
+        assert_eq!(projection.visual_selection_end_utf16, 11);
+        assert_eq!(projection.projected_utf16_length, 17);
+        assert_eq!(
+            projection.projected_utf8_length,
+            "before 日本🙂 after".len() as u64
+        );
+
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_composition_projection(
+                    raw,
+                    projection.revision,
+                    projection.generation,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(required, projection.projected_utf8_length as usize);
+        let mut small = vec![0_u8; required.saturating_sub(1)];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_composition_projection(
+                    raw,
+                    projection.revision,
+                    projection.generation,
+                    small.as_mut_ptr(),
+                    small.len(),
+                    &mut required,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+        let mut projected = vec![0_u8; required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_composition_projection(
+                    raw,
+                    projection.revision,
+                    projection.generation,
+                    projected.as_mut_ptr(),
+                    projected.len(),
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            std::str::from_utf8(&projected).expect("projected text stays UTF-8"),
+            "before 日本🙂 after"
+        );
+
+        let mut caret = YuStorageCompositionCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_composition_caret(
+                    raw,
+                    projection.revision,
+                    projection.generation,
+                    9,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    &mut caret,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(caret.revision, 0);
+        assert_eq!(caret.generation, 1);
+        assert_eq!(caret.source_utf16, 9);
+        assert_eq!(caret.visual_utf16, 11);
+        assert_eq!(caret.visual_selection_start_utf16, 9);
+        assert_eq!(caret.visual_selection_end_utf16, 11);
+        let mut invalid_caret = YuStorageCompositionCaret {
+            revision: 99,
+            ..YuStorageCompositionCaret::default()
+        };
+        assert_eq!(
+            unsafe {
+                yu_storage_session_composition_caret(
+                    raw,
+                    projection.revision,
+                    projection.generation,
+                    9,
+                    99,
+                    &mut invalid_caret,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(invalid_caret, YuStorageCompositionCaret::default());
+
+        assert_eq!(
+            unsafe {
+                yu_storage_session_update_composition(
+                    raw,
+                    0,
+                    projection.generation,
+                    "日本語".as_ptr(),
+                    "日本語".len(),
+                    3,
+                    3,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut updated = projection;
+        assert_eq!(
+            unsafe { yu_storage_session_composition_projection(raw, 0, &mut updated) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(updated.generation, 2);
+        assert_eq!(updated.projected_utf16_length, 16);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_composition_projection(
+                    raw,
+                    0,
+                    projection.generation,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+
+        let mut canonical_required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_source(raw, ptr::null_mut(), 0, &mut canonical_required)
+            },
+            YU_STORAGE_OK
+        );
+        let mut canonical = vec![0_u8; canonical_required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_source(
+                    raw,
+                    canonical.as_mut_ptr(),
+                    canonical.len(),
+                    &mut canonical_required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            std::str::from_utf8(&canonical).expect("canonical UTF-8"),
+            source
+        );
+
+        let state = unsafe { yu_storage_session_cancel_composition(raw, 0, updated.generation) };
+        assert_eq!(state, YU_STORAGE_OK);
+        assert_eq!(
+            unsafe { yu_storage_session_composition_projection(raw, 0, &mut updated) },
+            YU_STORAGE_NO_OVERLAY
+        );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }

@@ -174,6 +174,34 @@ typedef struct YuStorageProjectionCaret {
     uint8_t affinity;
 } YuStorageProjectionCaret;
 
+/* Revision/generation-bound transient source/visual projection metadata.
+ * Canonical source remains unchanged while a composition is active. */
+typedef struct YuStorageCompositionProjection {
+    uint64_t revision;
+    uint64_t generation;
+    uint64_t replacement_start_utf16;
+    uint64_t replacement_end_utf16;
+    uint64_t preedit_selection_start_utf16;
+    uint64_t preedit_selection_end_utf16;
+    uint64_t visual_selection_start_utf16;
+    uint64_t visual_selection_end_utf16;
+    uint64_t projected_utf16_length;
+    uint64_t projected_utf8_length;
+} YuStorageCompositionProjection;
+
+/* Active marked-text caret in the transient projected stream. The visual
+ * selection is returned in projected UTF-16 coordinates. */
+typedef struct YuStorageCompositionCaret {
+    uint64_t revision;
+    uint64_t generation;
+    uint64_t source_utf16;
+    uint64_t visual_utf16;
+    uint64_t round_trip_source_utf16;
+    uint64_t visual_selection_start_utf16;
+    uint64_t visual_selection_end_utf16;
+    uint8_t affinity;
+} YuStorageCompositionCaret;
+
 typedef struct YuStorageProjectionBlock {
     uint64_t revision;
     uint64_t block_index;
@@ -280,6 +308,17 @@ int32_t yu_storage_session_projection_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     YuStorageProjectionCaret *output);
+int32_t yu_storage_session_composition_projection(
+    YuStorageSession *session, uint64_t expected_revision,
+    YuStorageCompositionProjection *output);
+int32_t yu_storage_session_copy_composition_projection(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t expected_generation, uint8_t *output, size_t capacity,
+    size_t *written);
+int32_t yu_storage_session_composition_caret(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t expected_generation, uint64_t source_utf16, uint8_t affinity,
+    YuStorageCompositionCaret *output);
 int32_t yu_storage_session_projection_block_count(
     const YuStorageSession *session, uint64_t expected_revision,
     size_t *output);
