@@ -57,6 +57,9 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   canonical source、Revision、缓存或 Undo；
 - composition FFI 以 canonical Revision + transient generation 绑定 projected UTF-8、visual
   selection 和 caret，native mirror 不复制 Markdown parser；
+- opt-in visual mirror 额外消费 Rust generation-bound visual replacement range，让 marked-text
+  preedit、`markedRange` 和 `attributedSubstring` 使用同一 visual 坐标；默认生产 view 仍走 source
+  mirror，过期 generation 自动回退；
 - macOS `NSTextInputClient` lifecycle 将 canonical replacement、当前 native marked range 和
   marked presentation 分开管理；`unmarkText` 不会误取消 Rust overlay，commit/cancel 均消费
   同一 generation-bound composition snapshot；

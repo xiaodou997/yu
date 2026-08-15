@@ -581,6 +581,7 @@ private struct NativeCompositionProjection {
     let replacementRange: NSRange
     let preeditSelection: NSRange
     let visualSelection: NSRange
+    let visualReplacementRange: NSRange
     let projectedUTF16Length: Int
     let projectedUTF8Length: Int
 
@@ -598,6 +599,10 @@ private struct NativeCompositionProjection {
         visualSelection = NSRange(
             location: Int(value.visual_selection_start_utf16),
             length: Int(value.visual_selection_end_utf16 - value.visual_selection_start_utf16)
+        )
+        visualReplacementRange = NSRange(
+            location: Int(value.visual_replacement_start_utf16),
+            length: Int(value.visual_replacement_end_utf16 - value.visual_replacement_start_utf16)
         )
         projectedUTF16Length = Int(value.projected_utf16_length)
         projectedUTF8Length = Int(value.projected_utf8_length)
@@ -1596,6 +1601,7 @@ private final class DocumentTextView: NSTextView {
     private var synchronizingSelection = false
     private var visualMirror: ProjectionTextKitMirror?
     private var visualMirrorEnabled = false
+    private var visualCompositionGeneration: UInt64?
     private var visualSelectionAnchor: Int?
     var onDocumentChange: (() -> Void)?
     var onError: ((Error) -> Void)?
@@ -1665,6 +1671,7 @@ private final class DocumentTextView: NSTextView {
             try refreshVisualMirror()
         } else {
             visualMirror = nil
+            visualCompositionGeneration = nil
         }
     }
 
@@ -1679,24 +1686,76 @@ private final class DocumentTextView: NSTextView {
         return visualMirror.point(forVisualUTF16: visualUTF16)
     }
 
+    func visualMirrorStringForSelfCheck() -> String? {
+        guard visualMirrorEnabled,
+              let visualMirror,
+              visualMirror.revision == bridge.state.revision,
+              visualCompositionGeneration == currentCompositionGeneration() else {
+            return nil
+        }
+        return visualMirror.string
+    }
+
+    func visualMarkedRangeForSelfCheck() -> NSRange? {
+        guard visualMirrorEnabled,
+              bridge.composition.active,
+              let visualMirror,
+              visualMirror.revision == bridge.state.revision,
+              let generation = visualCompositionGeneration,
+              let projection = try? bridge.compositionProjection(revision: bridge.state.revision),
+              projection.generation == generation,
+              projection.visualReplacementRange.location >= 0,
+              NSMaxRange(projection.visualReplacementRange) <= visualMirror.utf16Length else {
+            return nil
+        }
+        return projection.visualReplacementRange
+    }
+
     @discardableResult
     func applyVisualSelectionForSelfCheck(_ visualRange: NSRange) -> Bool {
         applyVisualSelection(visualRange)
     }
 
     private func refreshVisualMirror() throws {
-        guard visualMirrorEnabled, !bridge.composition.active else {
+        guard visualMirrorEnabled else {
             visualMirror = nil
+            visualCompositionGeneration = nil
             return
         }
         let revision = bridge.state.revision
-        let projected = try bridge.projectedSource(revision: revision)
+        let projected: String
+        let generation: UInt64?
+        if bridge.composition.active {
+            let metadata = try bridge.compositionProjection(revision: revision)
+            let value = try bridge.copyCompositionProjection(
+                revision: metadata.revision,
+                generation: metadata.generation
+            )
+            // A marked-text callback may race a composition update. Do not
+            // publish a mirror unless both metadata and copied text belong to
+            // the same generation-bound snapshot.
+            let current = try bridge.compositionProjection(revision: revision)
+            guard current.generation == metadata.generation else {
+                throw BridgeError.operation(16)
+            }
+            projected = value
+            generation = metadata.generation
+        } else {
+            projected = try bridge.projectedSource(revision: revision)
+            generation = nil
+        }
         let width = max(bounds.width - 2.0 * textContainerOrigin.x, 1.0)
         visualMirror = ProjectionTextKitMirror(
             text: projected,
             revision: revision,
             width: width
         )
+        visualCompositionGeneration = generation
+    }
+
+    private func currentCompositionGeneration() -> UInt64? {
+        guard bridge.composition.active else { return nil }
+        return try? bridge.compositionProjection(revision: bridge.state.revision).generation
     }
 
     private func visualPoint(for event: NSEvent) -> NSPoint {
@@ -2172,13 +2231,25 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func markedRange() -> NSRange {
-        nativeMarkedRange
+        if let visualRange = visualMarkedRangeForSelfCheck() {
+            return visualRange
+        }
+        return nativeMarkedRange
     }
 
     override func attributedSubstring(
         forProposedRange proposedRange: NSRange,
         actualRange: NSRangePointer?
     ) -> NSAttributedString? {
+        if let visualString = visualMirrorStringForSelfCheck() {
+            let length = (visualString as NSString).length
+            let range = clampedRange(proposedRange, length: length)
+            actualRange?.pointee = range
+            guard range.location != NSNotFound else { return nil }
+            return NSAttributedString(
+                string: (visualString as NSString).substring(with: range)
+            )
+        }
         let range = clampedRange(proposedRange, length: (string as NSString).length)
         actualRange?.pointee = range
         guard range.location != NSNotFound else { return nil }
@@ -2375,6 +2446,7 @@ private final class DocumentTextView: NSTextView {
                 try refreshVisualMirror()
             } catch {
                 visualMirror = nil
+                visualCompositionGeneration = nil
                 onError?(error)
             }
         }
@@ -3297,6 +3369,95 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
     }
 }
 
+private func runVisualIMESelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let sourceBefore = bridge.source
+        let revision = bridge.state.revision
+        let textView = DocumentTextView(bridge: bridge)
+        try textView.setVisualMirrorEnabledForSelfCheck(true)
+
+        let sourceStrong = (sourceBefore as NSString).range(of: "**粗体**")
+        precondition(sourceStrong.location != NSNotFound)
+        let replacement = NSRange(location: sourceStrong.location + 2, length: 2)
+        let visualStrong = try bridge.projectedSource(revision: revision)
+        let visualReplacementStart = (visualStrong as NSString).range(of: "粗体").location
+        precondition(visualReplacementStart != NSNotFound)
+
+        textView.setMarkedText(
+            "日本🙂",
+            selectedRange: NSRange(location: 2, length: 2),
+            replacementRange: replacement
+        )
+        let initial = try bridge.compositionProjection(revision: revision)
+        let initialProjected = try bridge.copyCompositionProjection(
+            revision: initial.revision,
+            generation: initial.generation
+        )
+        precondition(textView.visualMirrorStringForSelfCheck() == initialProjected)
+        precondition(initialProjected.contains("日本🙂"))
+        precondition(!initialProjected.contains("**粗体**"))
+        precondition(
+            initial.visualReplacementRange == NSRange(
+                location: visualReplacementStart,
+                length: "日本🙂".utf16.count
+            )
+        )
+        precondition(textView.visualMarkedRangeForSelfCheck() == initial.visualReplacementRange)
+        precondition(textView.markedRange() == initial.visualReplacementRange)
+        precondition(textView.hasMarkedText())
+        var actualRange = NSRange(location: NSNotFound, length: 0)
+        let marked = textView.attributedSubstring(
+            forProposedRange: initial.visualReplacementRange,
+            actualRange: &actualRange
+        )
+        precondition(marked?.string == "日本🙂")
+        precondition(actualRange == initial.visualReplacementRange)
+
+        textView.setMarkedText(
+            "日本語",
+            selectedRange: NSRange(location: 3, length: 0),
+            replacementRange: replacement
+        )
+        let updated = try bridge.compositionProjection(revision: revision)
+        let updatedProjected = try bridge.copyCompositionProjection(
+            revision: updated.revision,
+            generation: updated.generation
+        )
+        precondition(updated.generation != initial.generation)
+        precondition(updatedProjected.contains("日本語"))
+        precondition(textView.visualMirrorStringForSelfCheck() == updatedProjected)
+        precondition(textView.markedRange() == updated.visualReplacementRange)
+        precondition(updated.visualReplacementRange.length == "日本語".utf16.count)
+        do {
+            _ = try bridge.copyCompositionProjection(
+                revision: revision,
+                generation: initial.generation
+            )
+            preconditionFailure("stale visual composition unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 16)
+        }
+
+        try bridge.cancelComposition()
+        textView.refreshFromRust()
+        precondition(!textView.hasMarkedText())
+        precondition(textView.markedRange().location == NSNotFound)
+        precondition(bridge.state.revision == revision)
+        precondition(bridge.source == sourceBefore)
+        let canonicalVisual = try bridge.projectedSource(revision: revision)
+        precondition(textView.visualMirrorStringForSelfCheck() == canonicalVisual)
+        print(
+            "Yu Visual IME self-check: visual preedit/replacement range is "
+                + "generation-bound; stale generation rejected and cancel preserved source"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual IME self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runBlockProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -3778,6 +3939,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--projection-hit-test-self-c
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-mirror-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualMirrorSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-ime-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualIMESelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
