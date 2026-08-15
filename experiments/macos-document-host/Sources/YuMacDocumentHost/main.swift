@@ -1167,7 +1167,35 @@ private final class DocumentTextView: NSTextView {
         synchronizingSelection = true
         super.setSelectedRange(range)
         synchronizingSelection = false
-        guard shouldSync, !bridge.composition.active else { return }
+        guard shouldSync else { return }
+        syncNativeSelectionToRust(range)
+    }
+
+    /// AppKit uses this plural entry point for mouse clicks, drag selection,
+    /// and some TextKit accessibility paths. The Rust editor currently owns a
+    /// single selection, so the first native range is the canonical one; the
+    /// important part is that mouse selection cannot leave Rust at an older
+    /// fixed line while the disposable TextKit mirror moves elsewhere.
+    override func setSelectedRanges(
+        _ ranges: [NSValue],
+        affinity: NSSelectionAffinity,
+        stillSelecting: Bool
+    ) {
+        let shouldSync = !synchronizingSelection
+        synchronizingSelection = true
+        super.setSelectedRanges(
+            ranges,
+            affinity: affinity,
+            stillSelecting: stillSelecting
+        )
+        synchronizingSelection = false
+        guard shouldSync else { return }
+        let range = clampedRange(selectedRange(), length: (string as NSString).length)
+        syncNativeSelectionToRust(range)
+    }
+
+    private func syncNativeSelectionToRust(_ range: NSRange) {
+        guard !bridge.composition.active else { return }
         do {
             try bridge.setSelection(range)
             canonicalRevision = bridge.state.revision
@@ -2138,6 +2166,39 @@ private func runClipboardSelfCheck(path: String) -> Never {
     }
 }
 
+private func runSelectionSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let textView = DocumentTextView(bridge: bridge)
+        let source = bridge.source as NSString
+        let first = source.range(of: "日本語")
+        let second = source.range(of: "Emoji")
+        precondition(first.location != NSNotFound)
+        precondition(second.location != NSNotFound)
+
+        let firstCaret = NSRange(location: first.location + first.length, length: 0)
+        textView.setSelectedRanges(
+            [NSValue(range: firstCaret)],
+            affinity: .downstream,
+            stillSelecting: false
+        )
+        precondition(bridge.selection.range == firstCaret)
+
+        let secondCaret = NSRange(location: second.location + second.length, length: 0)
+        textView.setSelectedRanges(
+            [NSValue(range: secondCaret)],
+            affinity: .downstream,
+            stillSelecting: false
+        )
+        precondition(bridge.selection.range == secondCaret)
+        print("Yu Selection self-check: setSelectedRanges tracks two distinct source positions")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Selection self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runAccessibilitySelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -2293,6 +2354,10 @@ private func runAccessibilitySelfCheck(path: String) -> Never {
 }
 
 let app = NSApplication.shared
+if let flag = CommandLine.arguments.firstIndex(of: "--selection-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runSelectionSelfCheck(path: CommandLine.arguments[flag + 1])
+}
 if let flag = CommandLine.arguments.firstIndex(of: "--clipboard-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runClipboardSelfCheck(path: CommandLine.arguments[flag + 1])
