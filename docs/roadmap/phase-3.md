@@ -13,14 +13,16 @@ retained scene/GPU 绘制。
 - [x] macOS storage FFI 提供 expected-Revision projection UTF-8 count/fill
 - [x] macOS storage FFI 提供 source UTF-16 ↔ visual UTF-16 caret round-trip
 - [x] Swift/AppKit projection self-check 覆盖 strong/emphasis/link delimiter 与 Unicode caret
-- [ ] 按 parser-owned block ranges 合并 heading/list/task/fence/table projection
+- [x] macOS storage FFI 按 parser-owned block index 暴露 source range/kind/visual lengths 与 UTF-8 snapshot
+- [x] Swift block projection self-check 覆盖 heading/task/fenced-code、Unicode 和 stale/out-of-bounds
+- [ ] 完善 heading/list/task/fence/table 的 visual delimiter 语义，并统一 block projection kind
 - [ ] composition overlay 投影与 source/visual selection adapter
 - [ ] visual selection range、hit-testing 和 point↔source mapping
 - [ ] stale Revision/generation 在 native projection callbacks 上的全路径回归
 
 ## Track B：Native layout
 
-- [ ] block-scoped viewport projection snapshot 与惰性 layout
+- [ ] block-scoped viewport projection snapshot 与惰性 layout（当前仅完成 projection metadata/UTF-8 诊断）
 - [ ] CoreText shaping metrics 与 `yu-layout` line/caret contract 对齐
 - [ ] TextKit mirror 仅作为过渡适配器，支持 visual/source 双向映射
 - [ ] macOS 鼠标点击、拖选、上下移动和 IME 在 visual projection 下回归

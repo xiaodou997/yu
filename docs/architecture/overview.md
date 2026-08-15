@@ -359,6 +359,13 @@ Revision-bound visual UTF-8 count/fill，后者把 source UTF-16 caret 映射为
 round-trip source。它们只提供 owned diagnostic snapshots；当前生产 TextKit mirror 仍保留 source
 坐标，直到 block projection、composition 和 point hit-testing 契约全部接通。
 
+同一边界现在还暴露 `yu_storage_session_projection_block_count` 与
+`yu_storage_session_projected_block`：native host 可按 parser-owned block index 惰性取得 source
+UTF-16 range、稳定 block/projection kind、visual 长度和 owned UTF-8。查询始终携带 expected
+Revision，越界或过期结果不会写入 metadata；Swift 只校验快照和长度，不重建 block ranges 或
+Markdown 语义。该接口是后续 block-local composition、layout 和 visual hit-testing 的输入，
+当前仍不替换生产 TextKit source mirror。
+
 随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
 `ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16
 range、document-space block origin/height、measured 和稳定 kind tag。它只复制 owned scalar，

@@ -90,6 +90,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 语法会从 visual 文本移除，但 source UTF-16 caret 必须在当前 Revision 内 round-trip。完整 block
 projection、IME 映射和 GPU scene 接入会在该边界稳定后进行。
 
+验证 parser-owned block projection 的 count/fill、source range、kind、visual 长度以及 stale/
+越界拒绝（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --block-projection-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+该自检逐 block 消费 Rust 返回的 owned UTF-8，不在 Swift 重建 Markdown block；当前只建立
+block-local projection 诊断边界，生产 TextKit mirror 和完整 visual delimiter 语义保持不变。
+
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立
 source、dirty 或 history。

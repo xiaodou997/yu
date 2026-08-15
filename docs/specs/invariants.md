@@ -178,6 +178,12 @@
     stale Revision、surrogate split、未知 affinity 或 projection 错误必须拒绝。查询不得修改
     canonical source、selection、composition、history 或 Revision，Swift 不得从 delimiter 自行
     推导 source range。
+39. `yu_storage_session_projection_block_count` 与 `yu_storage_session_projected_block` 必须携带
+    expected Revision；block index、source UTF-16 range、parser kind、projection kind 和 visual
+    UTF-8/UTF-16 长度必须来自同一 Rust parser/projection revision。stale Revision、无效 index、
+    UTF-8/UTF-16 转换失败或 projection 错误必须拒绝，且不得写入半成品 metadata；count/fill
+    查询只能返回 owned bytes/scalars，不得让 Swift 解析 Markdown、取得 Block/Projection 指针，
+    或修改 source、selection、composition、history、Revision。
 
 ## Accessibility
 

@@ -82,6 +82,29 @@ private struct NativeProjectionCaret {
     }
 }
 
+private struct NativeProjectionBlock {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let sourceRange: NSRange
+    let visualUTF8Length: Int
+    let visualUTF16Length: Int
+    let kind: UInt8
+    let projectionKind: UInt8
+
+    init(_ value: YuStorageProjectionBlock) {
+        revision = value.revision
+        blockIndex = value.block_index
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        visualUTF8Length = Int(value.visual_utf8_length)
+        visualUTF16Length = Int(value.visual_utf16_length)
+        kind = value.kind
+        projectionKind = value.projection_kind
+    }
+}
+
 private struct NativeAccessibilitySnapshot {
     let revision: UInt64
     let numberOfCharacters: Int
@@ -486,6 +509,55 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeProjectionCaret(value)
+    }
+
+    func projectionBlockCount(revision: UInt64) throws -> Int {
+        var count = 0
+        let status = yu_storage_session_projection_block_count(handle, revision, &count)
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return count
+    }
+
+    func projectedBlock(
+        revision: UInt64,
+        blockIndex: UInt64
+    ) throws -> (NativeProjectionBlock, String) {
+        var metadata = YuStorageProjectionBlock()
+        var required = 0
+        let sizeStatus = yu_storage_session_projected_block(
+            handle,
+            revision,
+            blockIndex,
+            &metadata,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var bytes = Array(repeating: UInt8(0), count: required)
+        var written = required
+        let copyStatus = bytes.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_projected_block(
+                handle,
+                revision,
+                blockIndex,
+                &metadata,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard copyStatus == StorageStatus.ok, written >= 0, written <= bytes.count else {
+            throw BridgeError.operation(copyStatus)
+        }
+        return (
+            NativeProjectionBlock(metadata),
+            String(decoding: bytes.prefix(written), as: UTF8.self)
+        )
     }
 
     var state: NativeStorageState {
@@ -2378,6 +2450,70 @@ private func runProjectionSelfCheck(path: String) -> Never {
     }
 }
 
+private func runBlockProjectionSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let count = try bridge.projectionBlockCount(revision: revision)
+        precondition(count > 0)
+
+        var previousEnd = 0
+        var kinds = Set<UInt8>()
+        var visualTexts: [String] = []
+        for index in 0..<count {
+            let (block, visual) = try bridge.projectedBlock(
+                revision: revision,
+                blockIndex: UInt64(index)
+            )
+            precondition(block.revision == revision)
+            precondition(block.blockIndex == UInt64(index))
+            precondition(block.sourceRange.location >= previousEnd)
+            previousEnd = NSMaxRange(block.sourceRange)
+            precondition(block.visualUTF8Length == visual.utf8.count)
+            precondition(block.visualUTF16Length == visual.utf16.count)
+            kinds.insert(block.kind)
+            visualTexts.append(visual)
+            print(
+                "  block=\(index) kind=\(block.kind) projection=\(block.projectionKind) "
+                    + "source=\(block.sourceRange) visualUTF16=\(block.visualUTF16Length)"
+            )
+        }
+
+        precondition(kinds.contains(3), "heading block missing")
+        precondition(kinds.contains(4), "fenced-code block missing")
+        precondition(kinds.contains(7), "task-list block missing")
+        precondition(visualTexts.contains { $0.contains("粗体") })
+        precondition(visualTexts.contains { $0.contains("链接") })
+        precondition(visualTexts.contains { $0.contains("任务") })
+        precondition(visualTexts.contains { $0.contains("fn main") })
+        precondition(visualTexts.allSatisfy { !$0.contains("**粗体**") })
+        precondition(visualTexts.allSatisfy { !$0.contains("[链接](https://example.com)") })
+
+        do {
+            _ = try bridge.projectedBlock(revision: revision, blockIndex: UInt64(count))
+            preconditionFailure("out-of-bounds block unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 14)
+        }
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.projectionBlockCount(revision: revision)
+            preconditionFailure("stale block count unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
+        print(
+            "Yu Block Projection self-check: revision=\(revision) blocks=\(count) "
+                + "source ranges and visual lengths are revision-bound"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Block Projection self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runAccessibilitySelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -2544,6 +2680,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--undo-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runBlockProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--clipboard-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

@@ -73,6 +73,27 @@ enum {
     YU_STORAGE_CARET_AFFINITY_DOWNSTREAM = 1,
 };
 
+/* Stable parser-owned block tags used by projection snapshots. These values
+ * mirror BlockKind::viewport_tag(), but the Rust enum layout is not part of
+ * the C ABI. */
+enum {
+    YU_STORAGE_PROJECTION_BLOCK_BLANK_LINE = 0,
+    YU_STORAGE_PROJECTION_BLOCK_REFERENCE_DEFINITION = 1,
+    YU_STORAGE_PROJECTION_BLOCK_PARAGRAPH = 2,
+    YU_STORAGE_PROJECTION_BLOCK_HEADING = 3,
+    YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE = 4,
+    YU_STORAGE_PROJECTION_BLOCK_BLOCK_QUOTE = 5,
+    YU_STORAGE_PROJECTION_BLOCK_LIST_ITEM = 6,
+    YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM = 7,
+};
+
+enum {
+    YU_STORAGE_PROJECTION_INLINE = 0,
+    YU_STORAGE_PROJECTION_FENCED_CODE = 1,
+    YU_STORAGE_PROJECTION_REFERENCE_DEFINITION = 2,
+    YU_STORAGE_PROJECTION_TASK_LIST = 3,
+};
+
 enum {
     YU_STORAGE_DISK_UNCHANGED = 0,
     YU_STORAGE_DISK_CHANGED = 1,
@@ -152,6 +173,17 @@ typedef struct YuStorageProjectionCaret {
     uint64_t round_trip_source_utf16;
     uint8_t affinity;
 } YuStorageProjectionCaret;
+
+typedef struct YuStorageProjectionBlock {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t visual_utf8_length;
+    uint64_t visual_utf16_length;
+    uint8_t kind;
+    uint8_t projection_kind;
+} YuStorageProjectionBlock;
 
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
@@ -248,6 +280,17 @@ int32_t yu_storage_session_projection_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     YuStorageProjectionCaret *output);
+int32_t yu_storage_session_projection_block_count(
+    const YuStorageSession *session, uint64_t expected_revision,
+    size_t *output);
+/* Returns one parser-owned block's projected UTF-8 and metadata. A null
+ * output with zero capacity is the length-query form; metadata is still
+ * filled so the caller can validate source range, kind and visual lengths
+ * before allocating its second-call buffer. */
+int32_t yu_storage_session_projected_block(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, YuStorageProjectionBlock *metadata,
+    uint8_t *output, size_t capacity, size_t *written);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,
