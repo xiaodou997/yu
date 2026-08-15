@@ -161,6 +161,11 @@ impl Rgba8 {
     }
 
     #[must_use]
+    pub const fn packed(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
     pub const fn red(self) -> u8 {
         self.0.to_be_bytes()[0]
     }

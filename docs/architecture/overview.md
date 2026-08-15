@@ -514,6 +514,14 @@ entry 会被拒绝。共享 `yu-render` 当前没有 `wgpu`/Metal device 或窗�
 Scene → RenderPlan` 端到端 revision、atlas upload 去重和 command origin；实际 texture 生命周期
 和 command encoding 由 macOS backend 承担，不回写 shared plan。
 
+macOS storage FFI 的 `yu_storage_session_macos_visual_render_plan` 是这一链路的诊断 publication：
+Rust 使用 CoreText-shaped layout 和 `CoreTextGlyphRasterizer` 生成临时 CPU `GlyphAtlas`，然后复用
+`yu_workspace::assemble_viewport_render_frame`，只把 Revision-bound glyph command、page metadata
+和 damage 的 owned scalars 复制给 Swift。count/fill 在完整 plan 验证后才写数组，容量不足或 stale
+Revision 不会发布部分窗口；atlas 像素、CoreText object、layout/cache 和 GPU handle 不跨 FFI。
+CoreText numeric face id 由进程内共享 catalog 保持稳定，因此反复建立 shaper 不需要清空 layout cache。
+`--visual-render-plan-self-check` 只验证此边界，生产 TextKit mirror 和 Metal surface 仍未切换。
+
 `platform/macos/yu-render-macos` 是共享 render boundary 之外的第一层真实 backend：Rust 侧拥有
 `MetalDevice`、`CAMetalLayer`、surface generation、`MetalTexture`、`MetalAtlas`、
 `MetalPipeline` 和 backend-owned retained color target，Objective-C bridge 只负责 Apple

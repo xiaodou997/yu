@@ -192,6 +192,14 @@ impl DocumentSession {
         &self.editor
     }
 
+    /// Returns the canonical editor mutably for product-internal integration
+    /// layers that assemble revision-bound layout/scene snapshots. The caller
+    /// must keep all mutations on the same session boundary; no second editor
+    /// or source is created.
+    pub fn editor_mut(&mut self) -> &mut EditorDocument {
+        &mut self.editor
+    }
+
     /// Returns the canonical source selection owned by the editor.
     #[must_use]
     pub fn selection(&self) -> EditorSelection {
@@ -617,6 +625,12 @@ impl DocumentEditorSession {
     #[must_use]
     pub fn document(&self) -> &DocumentSession {
         &self.document
+    }
+
+    /// Gives an integration layer temporary mutable access to the canonical
+    /// document while retaining the unified session as the ownership boundary.
+    pub fn document_mut(&mut self) -> &mut DocumentSession {
+        &mut self.document
     }
 
     #[must_use]

@@ -412,3 +412,12 @@
     block index 和 source UTF-16 range；Rust 必须先通过 `ViewportSceneInput`/`SceneBuilder` 验证
     顺序、有限矩形和 content bounds，再执行 count/fill。容量不足或 stale Revision 不得发布部分
     primitive，Swift 不得根据 block kind、source text 或数组位置重新推导 scene geometry。
+20. `yu_storage_session_macos_visual_render_plan` 返回的 snapshot、glyph command、atlas page 和
+    damage 必须来自同一 Revision；command 必须保持 RenderPlan painter order，source UTF-16 range、
+    origin、bounds、advance、page rectangle、fingerprint 和 damage 都必须是有限且已验证的 owned
+    scalar。count/fill 在 Rust 完整构造 plan 后执行；任一数组容量不足或 stale/invalid 输入不得写入
+    部分输出，Swift 不得重建 glyph layout、atlas 像素或 page identity。
+21. `yu-font-macos::FaceTable` 的 numeric `FontFaceId` 必须在同一进程内的 CoreText shaper/rasterizer
+    实例之间保持稳定；layout cache 可以把 face id 交给后续新建的 rasterizer，不能依赖清空 layout
+    state 来修复 shaper identity。Face catalog 只保存 Rust-owned PostScript name metadata，不得
+    把 `CTFontRef` 或 native pointer 写入 shared editor/layout state。
