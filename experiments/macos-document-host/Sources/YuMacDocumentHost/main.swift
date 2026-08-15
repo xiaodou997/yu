@@ -66,6 +66,22 @@ private struct NativeSelection {
     }
 }
 
+private struct NativeProjectionCaret {
+    let revision: UInt64
+    let sourceUTF16: UInt64
+    let visualUTF16: UInt64
+    let roundTripSourceUTF16: UInt64
+    let affinity: UInt8
+
+    init(_ value: YuStorageProjectionCaret) {
+        revision = value.revision
+        sourceUTF16 = value.source_utf16
+        visualUTF16 = value.visual_utf16
+        roundTripSourceUTF16 = value.round_trip_source_utf16
+        affinity = value.affinity
+    }
+}
+
 private struct NativeAccessibilitySnapshot {
     let revision: UInt64
     let numberOfCharacters: Int
@@ -439,6 +455,37 @@ private final class StorageBridge {
                 written
             )
         }
+    }
+
+    func projectedSource(revision: UInt64) throws -> String {
+        try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_projected_source(
+                handle,
+                revision,
+                output,
+                capacity,
+                written
+            )
+        }
+    }
+
+    func projectionCaret(
+        revision: UInt64,
+        sourceUTF16: UInt64,
+        affinity: UInt8
+    ) throws -> NativeProjectionCaret {
+        var value = YuStorageProjectionCaret()
+        let status = yu_storage_session_projection_caret(
+            handle,
+            revision,
+            sourceUTF16,
+            affinity,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeProjectionCaret(value)
     }
 
     var state: NativeStorageState {
@@ -2288,6 +2335,49 @@ private func runUndoSelfCheck(path: String) -> Never {
     }
 }
 
+private func runProjectionSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let source = bridge.source
+        let projected = try bridge.projectedSource(revision: revision)
+        precondition(projected.contains("粗体"))
+        precondition(projected.contains("强调"))
+        precondition(projected.contains("链接"))
+        precondition(!projected.contains("**粗体**"))
+        precondition(!projected.contains("*强调*"))
+        precondition(!projected.contains("[链接](https://example.com)"))
+
+        let strongMarker = (source as NSString).range(of: "**粗体**")
+        precondition(strongMarker.location != NSNotFound)
+        let insideStrong = UInt64(strongMarker.location + 2)
+        let caret = try bridge.projectionCaret(
+            revision: revision,
+            sourceUTF16: insideStrong,
+            affinity: 1
+        )
+        precondition(caret.revision == revision)
+        precondition(caret.roundTripSourceUTF16 == insideStrong)
+        precondition(caret.visualUTF16 < UInt64(projected.utf16.count))
+
+        let end = try bridge.projectionCaret(
+            revision: revision,
+            sourceUTF16: UInt64(source.utf16.count),
+            affinity: 1
+        )
+        precondition(end.visualUTF16 == UInt64(projected.utf16.count))
+        precondition(end.roundTripSourceUTF16 == UInt64(source.utf16.count))
+        print(
+            "Yu Projection self-check: source UTF-16 \(source.utf16.count) -> "
+                + "visual UTF-16 \(projected.utf16.count); caret round-trips"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Projection self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runAccessibilitySelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -2450,6 +2540,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--selection-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--undo-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runUndoSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--clipboard-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

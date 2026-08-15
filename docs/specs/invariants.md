@@ -173,6 +173,11 @@
     `ViewportRenderFrame`；检查必须发生在 native command conversion 之前，只有 `render_plan` 成功
     后才能推进 consumer Revision。stale、回退或 backend 失败不得改变已接受 Revision，consumer
     不得持有 source、layout、native object 或 GPU handle。
+38. `yu_storage_session_projected_source` 与 `yu_storage_session_projection_caret` 必须携带
+    expected Revision，并只返回由 Rust parser/projection 生成的 owned visual UTF-8/UTF-16 值；
+    stale Revision、surrogate split、未知 affinity 或 projection 错误必须拒绝。查询不得修改
+    canonical source、selection、composition、history 或 Revision，Swift 不得从 delimiter 自行
+    推导 source range。
 
 ## Accessibility
 

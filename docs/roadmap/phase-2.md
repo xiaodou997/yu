@@ -91,8 +91,7 @@ label、角色、task 状态/press、URL 属性、Rotor 返回目标和编辑后
 
 ## 下一步
 
-下一阶段应完成 macOS 真实跨应用 HTML paste 回归，并固定 URL 打开策略、图片/表格 action 和
-Windows/Linux clipboard/action adapter 的产品边界；Rotor/语义 action 的真实导航回归仍需补一轮。
-完整 Markdown visual projection 仍放在这些边界稳定之后。在
-进入完整 Markdown visual projection 前，继续保持一个 `DocumentEditorSession` handle，不要恢复
-storage/editor 两个独立 handle。
+macOS 原生输入、选择、剪贴板、Accessibility 和 Undo/Redo 边界已经完成当前人工验收；Windows/Linux
+adapter 与 Rotor 跨平台回归仍留在后续平台阶段。Phase 3 现在从 source-backed projection FFI
+开始，但暂不替换生产 TextKit mirror。在进入完整 Markdown visual projection 前，继续保持一个
+`DocumentEditorSession` handle，不要恢复 storage/editor 两个独立 handle。

@@ -145,6 +145,14 @@ typedef struct YuStorageSelection {
     uint8_t affinity;
 } YuStorageSelection;
 
+typedef struct YuStorageProjectionCaret {
+    uint64_t revision;
+    uint64_t source_utf16;
+    uint64_t visual_utf16;
+    uint64_t round_trip_source_utf16;
+    uint8_t affinity;
+} YuStorageProjectionCaret;
+
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
     uint64_t number_of_characters_utf16;
@@ -229,6 +237,17 @@ int32_t yu_storage_session_source_length(const YuStorageSession *session,
 int32_t yu_storage_session_copy_source(const YuStorageSession *session,
                                        uint8_t *output, size_t capacity,
                                        size_t *written);
+/* Returns a revision-bound source projection for native layout probes. The
+ * result is visual text only; canonical Markdown source remains owned by the
+ * session and is queried through yu_storage_session_copy_source. */
+int32_t yu_storage_session_projected_source(YuStorageSession *session,
+                                            uint64_t expected_revision,
+                                            uint8_t *output, size_t capacity,
+                                            size_t *written);
+int32_t yu_storage_session_projection_caret(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t source_utf16, uint8_t affinity,
+    YuStorageProjectionCaret *output);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,

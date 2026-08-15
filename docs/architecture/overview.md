@@ -353,6 +353,12 @@ block 的真实 line count/height 交给 CoreText-backed `caret_scroll_request_w
 CoreText width/line metrics，Rust 不会在一次 scroll query 中静默重置既有 viewport measurements。
 `YuNativeViewportAdapter` 的职责仍限于 stale 检查与最后的 AppKit clip clamp。
 
+Phase 3 的 macOS document host 另通过同一个 `DocumentEditorSession` storage FFI 暴露
+`yu_storage_session_projected_source` 与 `yu_storage_session_projection_caret`。前者是
+Revision-bound visual UTF-8 count/fill，后者把 source UTF-16 caret 映射为 visual UTF-16 并返回
+round-trip source。它们只提供 owned diagnostic snapshots；当前生产 TextKit mirror 仍保留 source
+坐标，直到 block projection、composition 和 point hit-testing 契约全部接通。
+
 随后 `yu_macos_composition_session_shaped_viewport_blocks` 以 count/fill ABI 暴露同一 shaped
 `ViewportLayout` 的局部 metadata：Revision、可见 block range、content height、source UTF-16
 range、document-space block origin/height、measured 和稳定 kind tag。它只复制 owned scalar，
