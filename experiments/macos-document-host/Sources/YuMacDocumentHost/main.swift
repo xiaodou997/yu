@@ -636,6 +636,9 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let damageCount: Int
     let atlasPageCount: Int
     let imageResourceCount: Int
+    let imageRequestCount: Int
+    let imageFailureCount: Int
+    let imageEvictionCount: Int
     let submitted: Bool
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
@@ -649,6 +652,9 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
         damageCount = Int(value.damage_count)
         atlasPageCount = Int(value.atlas_page_count)
         imageResourceCount = Int(value.image_resource_count)
+        imageRequestCount = Int(value.image_request_count)
+        imageFailureCount = Int(value.image_failure_count)
+        imageEvictionCount = Int(value.image_eviction_count)
         submitted = value.submitted != 0
     }
 }
@@ -7093,7 +7099,9 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
                 }
                 RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
             }
+            precondition(imageReady.imageRequestCount > 0)
             precondition(imageReady.imageResourceCount > 0)
+            precondition(imageReady.imageFailureCount == 0)
             precondition(imageReady.uploadedImages > 0 || repeated.imageResourceCount > 0)
             imagePublicationReady = true
         }

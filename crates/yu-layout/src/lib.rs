@@ -481,6 +481,34 @@ pub struct ImagePlacement {
     bounds: LayoutRect,
 }
 
+/// Intrinsic pixel dimensions supplied by a decoded image publication. The
+/// layout layer uses the dimensions only to choose a finite aspect-preserving
+/// rectangle; pixels and resource identities remain outside this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageIntrinsicSize {
+    width: u32,
+    height: u32,
+}
+
+impl ImageIntrinsicSize {
+    pub fn new(width: u32, height: u32) -> Result<Self, LayoutError> {
+        if width == 0 || height == 0 {
+            return Err(LayoutError::InvalidImageBounds);
+        }
+        Ok(Self { width, height })
+    }
+
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+}
+
 impl ImagePlacement {
     #[must_use]
     pub const fn source(self) -> TextRange {
@@ -860,6 +888,33 @@ impl LayoutSnapshot {
     #[must_use]
     pub fn images(&self) -> &[ImagePlacement] {
         &self.images
+    }
+
+    /// Applies decoded image dimensions without changing source or visual
+    /// mappings. Width is capped to the remaining line width and height keeps
+    /// the decoded aspect ratio, so hit-testing and the later scene overlay
+    /// share the same bounds once a publication becomes ready.
+    pub fn apply_image_intrinsic_sizes(
+        &mut self,
+        measurements: &[(TextRange, ImageIntrinsicSize)],
+    ) -> Result<(), LayoutError> {
+        for placement in &mut self.images {
+            let Some((_, size)) = measurements
+                .iter()
+                .find(|(source, _)| *source == placement.source)
+            else {
+                continue;
+            };
+            let bounds = placement.bounds;
+            let intrinsic_width = size.width as f32;
+            let intrinsic_height = size.height as f32;
+            let available_width = (self.config.max_width - bounds.x).max(1.0);
+            let scale = (available_width / intrinsic_width).min(1.0);
+            let width = (intrinsic_width * scale).max(1.0);
+            let height = (intrinsic_height * scale).max(self.config.line_height);
+            placement.bounds = LayoutRect::new(bounds.x, bounds.y, width, height)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1650,6 +1705,29 @@ mod tests {
             .expect("right image hit");
         assert_eq!(right_hit.image(), Some(image.source()));
         assert_eq!(right_hit.source(), image.source().end());
+    }
+
+    #[test]
+    fn intrinsic_image_size_preserves_aspect_ratio_and_hit_test_bounds() {
+        let source = "![alt](image.png)";
+        let projection = projection(source);
+        let mut layout =
+            LayoutSnapshot::from_projection(&projection, LayoutConfig::new(80.0, 10.0))
+                .expect("image layout");
+        let image_source = layout.images()[0].source();
+        layout
+            .apply_image_intrinsic_sizes(&[(
+                image_source,
+                ImageIntrinsicSize::new(200, 100).expect("dimensions"),
+            )])
+            .expect("intrinsic size");
+        let image = layout.images()[0];
+        assert_eq!(image.bounds().width(), 80.0);
+        assert_eq!(image.bounds().height(), 40.0);
+        let hit = layout
+            .hit_test(LayoutPoint::new(79.0, 39.0))
+            .expect("intrinsic image hit");
+        assert_eq!(hit.image(), Some(image_source));
     }
 
     #[derive(Clone, Copy)]

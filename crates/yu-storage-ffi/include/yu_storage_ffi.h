@@ -594,6 +594,9 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t damage_count;
     uint64_t atlas_page_count;
     uint64_t image_resource_count;
+    uint64_t image_request_count;
+    uint64_t image_failure_count;
+    uint64_t image_eviction_count;
     uint8_t submitted;
 } YuStorageMacosRenderHostSurfaceSnapshot;
 

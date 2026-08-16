@@ -44,7 +44,7 @@ use yu_workspace::{
 };
 
 #[cfg(target_os = "macos")]
-use yu_assets::{ImageCache, ImagePublication, ImageRequest, ImageRequestResult};
+use yu_assets::{ImageCache, ImageFailureKind, ImagePublication, ImageRequest, ImageRequestResult};
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
 #[cfg(target_os = "macos")]
@@ -53,9 +53,10 @@ use yu_font::{GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer};
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
 #[cfg(target_os = "macos")]
 use yu_render_macos::{
-    CoreTextViewportFrameBuilder, CoreTextViewportFrameError, MacosImageDecodeWorker, MetalAtlas,
-    MetalDevice, MetalFrameRenderer, MetalImageAtlas, MetalSurface, MetalSurfaceConfig,
-    MetalUploader, MetalViewAttachmentOwned, MetalViewportHostSession,
+    CoreTextViewportFrameBuilder, CoreTextViewportFrameError, MacosImageDecodeError,
+    MacosImageDecodeWorker, MetalAtlas, MetalDevice, MetalFrameRenderer, MetalImageAtlas,
+    MetalSurface, MetalSurfaceConfig, MetalUploader, MetalViewAttachmentOwned,
+    MetalViewportHostSession,
 };
 
 pub const YU_STORAGE_OK: i32 = 0;
@@ -732,6 +733,9 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub damage_count: u64,
     pub atlas_page_count: u64,
     pub image_resource_count: u64,
+    pub image_request_count: u64,
+    pub image_failure_count: u64,
+    pub image_eviction_count: u64,
     pub submitted: u8,
 }
 
@@ -885,6 +889,21 @@ struct MacosImageResourceState {
     worker: MacosImageDecodeWorker,
     publications: BTreeMap<u64, ImagePublication>,
     in_flight: HashSet<ImageKey>,
+    visible_request_count: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_image_failure_kind(error: &MacosImageDecodeError) -> ImageFailureKind {
+    match error {
+        MacosImageDecodeError::UnsupportedPlatform => ImageFailureKind::Unsupported,
+        MacosImageDecodeError::InvalidPath | MacosImageDecodeError::Location(_) => {
+            ImageFailureKind::Io
+        }
+        MacosImageDecodeError::NativeDecodeFailed | MacosImageDecodeError::Decode(_) => {
+            ImageFailureKind::Decode
+        }
+        MacosImageDecodeError::WorkerClosed => ImageFailureKind::Worker,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -896,6 +915,7 @@ impl MacosImageResourceState {
                 .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
             publications: BTreeMap::new(),
             in_flight: HashSet::new(),
+            visible_request_count: 0,
         })
     }
 
@@ -905,6 +925,7 @@ impl MacosImageResourceState {
         revision: yu_core::Revision,
         document_path: PathBuf,
     ) -> Result<(), i32> {
+        self.visible_request_count = requests.len();
         while let Some(result) = self
             .worker
             .try_recv()
@@ -912,14 +933,23 @@ impl MacosImageResourceState {
         {
             let (request, result) = result.into_parts();
             self.in_flight.remove(request.key());
-            let Ok(image) = result else {
-                continue;
-            };
-            let Ok(publication) = self.cache.publish_decoded(request, revision, image) else {
-                continue;
-            };
-            self.publications
-                .insert(publication.key().fingerprint(), publication);
+            match result {
+                Ok(image) => {
+                    let Ok(publication) = self.cache.publish_decoded(request, revision, image)
+                    else {
+                        continue;
+                    };
+                    self.publications
+                        .insert(publication.key().fingerprint(), publication);
+                }
+                Err(error) => {
+                    let _ = self.cache.record_failure(
+                        request,
+                        revision,
+                        macos_image_failure_kind(&error),
+                    );
+                }
+            }
         }
 
         self.publications.clear();
@@ -927,9 +957,12 @@ impl MacosImageResourceState {
             if self.in_flight.contains(request.key()) {
                 continue;
             }
-            if let ImageRequestResult::Ready(publication) = self.cache.request(request) {
-                self.publications
-                    .insert(publication.key().fingerprint(), publication);
+            match self.cache.request(request) {
+                ImageRequestResult::Ready(publication) => {
+                    self.publications
+                        .insert(publication.key().fingerprint(), publication);
+                }
+                ImageRequestResult::Pending | ImageRequestResult::Failed(_) => {}
             }
         }
 
@@ -4955,7 +4988,10 @@ fn image_resource_key(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_image_requests(session: &mut YuStorageSession) -> Result<Vec<ImageRequest>, i32> {
+fn macos_image_requests(
+    session: &mut YuStorageSession,
+    block_indices: &[usize],
+) -> Result<Vec<ImageRequest>, i32> {
     let source = session.session.snapshot();
     let revision = session.session.revision();
     let definitions = session
@@ -4966,7 +5002,7 @@ fn macos_image_requests(session: &mut YuStorageSession) -> Result<Vec<ImageReque
         .reference_definitions()
         .clone();
     let mut requests = Vec::new();
-    for block_index in 0..session.session.block_count() {
+    for &block_index in block_indices {
         let projection = session
             .session
             .block_projection(block_index)
@@ -5235,8 +5271,29 @@ fn macos_render_host_frame(
         });
     }
 
-    let image_requests = macos_image_requests(session)?;
+    {
+        let state = session
+            .macos_render_host
+            .as_mut()
+            .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+        state
+            .builder
+            .update_config(config)
+            .map_err(|error| macos_render_host_error_status(&error))?;
+    }
     let document_path = session.session.path().to_path_buf();
+    let visible_blocks = {
+        let state = session
+            .macos_render_host
+            .as_mut()
+            .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+        let document = session.session.document_mut().editor_mut();
+        state
+            .builder
+            .visible_block_indices(document)
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
+    };
+    let image_requests = macos_image_requests(session, &visible_blocks)?;
     let state = session
         .macos_render_host
         .as_mut()
@@ -5250,17 +5307,19 @@ fn macos_render_host_frame(
         .sync_surface_generation(surface_generation)
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     state
-        .builder
-        .update_config(config)
-        .map_err(|error| macos_render_host_error_status(&error))?;
-    state
         .image_resources
         .sync(image_requests, revision, document_path)?;
+    let image_publications = state
+        .image_resources
+        .publications
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
     let publication = {
         let document = session.session.document_mut().editor_mut();
         state
             .builder
-            .publish(document)
+            .publish_with_images(document, &image_publications)
             .map_err(|error| macos_render_host_error_status(&error))?
     };
     state
@@ -6120,6 +6179,9 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let image_failure_count = state.image_resources.cache.failure_count();
+        let image_eviction_count = state.image_resources.cache.eviction_count();
+        let image_request_count = state.image_resources.visible_request_count;
         let surface_state = match state.surface.as_mut() {
             Some(surface) => surface,
             None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
@@ -6159,6 +6221,9 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 atlas_page_count: host_snapshot.atlas_page_count,
                 image_resource_count: u64::try_from(surface_state.image_atlas.resource_count())
                     .unwrap_or(u64::MAX),
+                image_request_count: u64::try_from(image_request_count).unwrap_or(u64::MAX),
+                image_failure_count: u64::try_from(image_failure_count).unwrap_or(u64::MAX),
+                image_eviction_count,
                 submitted: 1,
             };
         }
