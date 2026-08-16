@@ -372,7 +372,7 @@ composition 现在也通过同一 storage handle 暴露 generation-bound 的
 projected UTF-8、preedit/visual selection 和 active marked caret；Swift 必须同时保存 source
 Revision 与 composition generation，旧 generation 的 copy/caret 会被拒绝。begin/update/cancel
 只改变 transient overlay，canonical source、Markdown CST、history 和 Revision 保持不变；真实
-TextKit mirror 仍沿用现有生命周期，尚未切换为最终 visual selection/hit-testing。
+TextKit mirror 仍沿用现有生命周期，visual IME renderer 与最终 Metal 输入接管尚未切换。
 
 在同一 projection bridge 上，`yu_storage_session_projection_selection` 现在把 source UTF-16
 selection 映射为 visual UTF-16 range，并返回 source round-trip range；非折叠 selection 的两端
@@ -387,9 +387,10 @@ TextKit 过渡镜像现在还可以通过 `yu_storage_session_projection_source_
 canonical source，并返回 visual round-trip 边界。Swift 的 visual-mirror self-check 只创建临时
 `NSTextStorage`/`NSLayoutManager` 验证 projected UTF-8 可被 TextKit 接收，再用同一 Revision 的
 Rust reverse mapping 校验 hidden delimiter 和 Unicode；Rust source 发生编辑后旧镜像查询立即被
-拒绝。`DocumentTextView` 已增加 visual pointer adapter：它用匹配当前字体/宽度的临时 visual
-TextKit layout 将点击/拖选解析为 visual boundary，再交给 Rust reverse mapping，把 canonical
-source range 同步回现有 source mirror；生产窗口在布局完成后启用该路径，映射失败时回退 AppKit
+拒绝。`DocumentTextView` 已增加 visual pointer adapter：生产点击/拖选现在把 document-space
+point 交给 `yu_storage_session_macos_projection_hit_test`，由 Rust 使用同一 Revision、CoreText
+shaper 和 parser-owned block layout 直接返回 visual/source boundary；临时 TextKit visual mirror
+只负责 caret/selection 矩形、输入、IME 和 Accessibility，shaped endpoint 失败时回退 AppKit
 source selection。source→visual caret 也通过 Rust projection caret 查询后定位到同一临时布局；
 TextKit 仍是输入/IME/Accessibility owner。当前选区背景也由同一 visual range 生成 line-fragment
 rectangles，source TextKit 的 selection background 在 adapter 开启时清空，避免 hidden delimiter
@@ -398,8 +399,10 @@ rectangles，source TextKit 的 selection background 在 adapter 开启时清空
 absolute target。生产 `Up/Down/Shift-Up/Shift-Down` 现在先由 host 发布同一字体/宽度的 CoreText
 metrics，再通过 `yu_storage_session_macos_move_vertical` 让 Rust 使用 caller-owned shaper 解析
 相邻 visual line；返回的普通 `CommandResult` 继续驱动 source mirror、projected highlight 和
-caret reveal。透明 surface 仍不接收输入；最终 shaped Metal point hit-test 和 visual IME preedit
-仍待后续。
+caret reveal。透明 surface 仍不接收输入；shaped visual IME preedit 和最终 renderer 迁移仍待
+后续。`yu_storage_session_macos_projection_hit_test` 会验证已发布的 viewport
+max-width/line-height/default-advance；point 与 snapped caret 均为 document-space，Swift 不得
+按字体 advance 或 Markdown delimiter 自行猜测 visual boundary。
 同一 mirror 在 composition active 时还可以消费 storage FFI 返回的 visual replacement range
 和 generation-bound projected preedit，并让 `markedRange`/`attributedSubstring` 读取 visual
 坐标；metadata、文本和 callback 必须匹配同一 Revision + generation，过期时清空 visual mirror

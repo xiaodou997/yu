@@ -218,16 +218,17 @@
     affinity、visual UTF-16 surrogate split、逆序/越界 range 或 projection 错误必须先清空 output
     再拒绝；TextKit 只可持有 owned projected text/selection，不能解析 Markdown、缓存 source range
     或在 Rust source 变更后继续使用旧 Revision。
-45. `DocumentTextView` 的 visual pointer adapter 只能在拥有同一 Revision 的 disposable visual
-    TextKit mirror 时处理点击/拖选；Rust reverse mapping 成功后才能提交 source selection 并更新
-    native source mirror，任何 stale/范围/映射失败都必须回退 AppKit source selection，不能修改
-    source、composition 或 history。产品窗口可以在 visual layout ready 后启用该 adapter，但
-    scroll origin、字体宽度和 Revision 必须与当前 mirror 一致；source→visual caret 同样必须先
-    经过 Rust mapping，visual selection highlight 必须来自同一 Rust visual range，不能把 source
+45. `DocumentTextView` 的 visual pointer adapter 必须把 document-space point 交给同一 Revision 的
+    Rust `yu_storage_session_macos_projection_hit_test`，由 CoreText-shaped block layout 返回
+    visual/source boundary；临时 TextKit visual mirror 只能提供 caret/selection 矩形、输入、IME、
+    Accessibility 和失败回退，不能作为生产 glyph hit-test 的权威。Rust reverse mapping 成功后
+    才能提交 source selection 并更新 native source mirror，任何 stale/范围/映射失败都必须回退
+    AppKit source selection，不能修改 source、composition 或 history。字体 size、visual width、
+    viewport metrics、scroll origin 和 Revision 必须与当前 Rust published viewport 一致；
+    source→visual caret 与 visual selection highlight 仍必须来自同一 Rust mapping，不能把 source
     delimiter 的 TextKit 默认背景当作最终选区。selection/caret 变化触发的 scroll reveal 必须查询
     同一 Revision 的 shaped `CaretScrollRequest`，stale/invalid target 不得触碰 `NSClipView`，
-    absolute target 只能由平台在 content/clip boundary 做最后 clamp；最终 shaped Metal hit-test
-    不能由 Swift 猜测。
+    absolute target 只能由平台在 content/clip boundary 做最后 clamp。
 
 46. visual IME overlay 只能使用同一 expected Revision + composition generation 返回的 Rust
     projected UTF-8、visual replacement range 和 marked selection；`DocumentTextView` 在 metadata、
@@ -244,6 +245,13 @@
     的 caret/hit-test，并返回普通 `CommandResult`。该命令只能改变 selection/preferred-X，不能推进
     source Revision、history 或 SourceSync；stale Revision、非法 command、metrics 不匹配或 active
     composition 必须拒绝，Swift 不得自行按 glyph/Markdown 文本猜测跨行 source range。
+
+49. `yu_storage_session_macos_projection_hit_test` 必须清空 output 后验证 expected Revision、
+    finite point、CoreText size/width 和已发布 viewport metrics；Rust 只能从当前 parser-owned
+    block 的 shaped `LayoutSnapshot` 产生命中，再通过完整 lossless projection 返回 source/visual
+    UTF-16 round-trip。输入 point 与返回 snapped caret 的 x/y 都是 document-space；stale Revision、
+    viewport 不匹配、空 block、CoreText/layout 失败和非 macOS unavailable 必须拒绝，Swift 不得
+    复制 block HeightIndex、重建 glyph advance 或继续使用旧命中结果。
 
 ## Accessibility
 

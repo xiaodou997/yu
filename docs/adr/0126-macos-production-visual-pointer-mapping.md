@@ -2,7 +2,7 @@
 
 ## 状态
 
-已接受（Phase 3 Track B；输入映射先于最终 visual selection/IME overlay）。
+已接受并由 ADR 0129 细化（Phase 3 Track B；TextKit visual mirror 不再是生产 glyph 命中权威）。
 
 ## 背景
 
@@ -15,13 +15,12 @@
 ## 决策
 
 - `DocumentTextView` 在布局完成后启用 visual pointer adapter。它从 Rust 取得当前 projected
-  UTF-8，创建匹配当前字体和宽度的 disposable `NSTextStorage`/`NSLayoutManager`，只用它把
-  AppKit point 转成 visual UTF-16 boundary；这个 mirror 不拥有 source、Revision、selection 或
-  history。
-- 单击和拖选先在 disposable visual mirror 中命中，再调用
-  `yu_storage_session_projection_source_selection` 把 visual range 映射成 canonical source range。
-  只有 Rust reverse mapping 成功且 Revision 仍匹配时才更新 source selection；失败时交给
-  AppKit 原生 source hit-test。
+  UTF-8，创建匹配当前字体和宽度的 disposable `NSTextStorage`/`NSLayoutManager`，用于
+  caret/selection 矩形和输入宿主；这个 mirror 不拥有 source、Revision、selection 或 history。
+- 单击和拖选把 document-space point 交给 ADR 0129 定义的
+  `yu_storage_session_macos_projection_hit_test`，由 Rust CoreText-shaped block layout 返回
+  visual boundary，再调用 `yu_storage_session_projection_source_selection` 映射成 canonical
+  source range。Revision、viewport 或映射失败时交给 AppKit 原生 source hit-test。
 - 当前 source selection 的 focus/caret 通过 `yu_storage_session_projection_caret` 映射成
   visual UTF-16，再用同一 visual mirror 得到 caret rect。`DocumentTextView` 重载
   `drawInsertionPoint` 绘制该 visual caret；TextKit 仍拥有 NSTextInputClient、IME、复制粘贴和
@@ -34,9 +33,10 @@
 
 ## 结果
 
-产品窗口现在可以通过 Rust source/visual mapping 处理鼠标单击、拖选和 caret 定位；canonical
-Markdown source、selection、composition 和 history 仍只有 Rust 一份。TextKit source mirror 的
-输入和 Accessibility 兼容性不变，projection 不可用时保持可编辑回退。
+产品窗口现在可以通过同一 CoreText-shaped Rust layout/source mapping 处理鼠标单击、拖选和
+caret 定位；canonical Markdown source、selection、composition 和 history 仍只有 Rust 一份。
+TextKit source mirror 的输入和 Accessibility 兼容性不变，projection 或 published viewport
+不可用时保持可编辑回退。
 
 ## 验证
 
