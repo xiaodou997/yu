@@ -1152,6 +1152,20 @@ mod tests {
             blocks.block_index_for_offset(ByteOffset::new(source.len() as u64 + 1)),
             None
         );
+        assert_eq!(
+            blocks.block_index_range_for_source_range(
+                TextRange::new(ByteOffset::new(8), ByteOffset::new(10))
+                    .expect("test range should be valid")
+            ),
+            Some(1..3)
+        );
+        assert_eq!(
+            blocks.block_index_range_for_source_range(
+                TextRange::new(ByteOffset::new(9), ByteOffset::new(18))
+                    .expect("test range should be valid")
+            ),
+            Some(2..3)
+        );
     }
 
     #[test]

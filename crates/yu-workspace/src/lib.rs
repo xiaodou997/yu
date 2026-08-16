@@ -524,7 +524,11 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
     atlas: &GlyphAtlas,
     color: Rgba8,
 ) -> Result<ViewportSceneFrame, ViewportSceneError> {
-    let viewport_snapshot = document.visible_blocks_with_shaper(viewport, shaper)?;
+    let viewport_snapshot = if document.composition().is_some() {
+        document.visible_blocks_with_composition_and_shaper(viewport, shaper)?
+    } else {
+        document.visible_blocks_with_shaper(viewport, shaper)?
+    };
     let revision = viewport_snapshot.revision();
     let config = document.viewport_config().layout();
     let geometries = viewport_snapshot
@@ -551,9 +555,12 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
     )?;
 
     let mut layouts = Vec::with_capacity(viewport_snapshot.blocks().len());
-    let composition_block = document.composition_block_index();
+    let composition_blocks = document.composition_block_range();
     for block in viewport_snapshot.blocks() {
-        let layout = if composition_block == Some(block.index()) {
+        let layout = if composition_blocks
+            .as_ref()
+            .is_some_and(|span| span.contains(&block.index()))
+        {
             document.block_layout_with_composition_and_shaper(block.index(), config, shaper)?
         } else {
             document

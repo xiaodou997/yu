@@ -38,7 +38,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 生产 pointer adapter 使用同一 CoreText-shaped Rust block layout 命中 visual boundary；TextKit 只保留输入/IME/AX/矩形回退
 - [x] visual IME active caret 使用 Revision + composition generation-bound CoreText shaped block geometry
 - [x] visual IME preedit 在所属 block 使用 CoreText shaped glyph、CPU atlas 与持久 Metal surface 发布
-- [ ] visual IME preedit 的跨 block layout 与完整 visual renderer 迁移
+- [x] visual IME preedit 的跨 block transient layout：按受影响 block span 投影、重测 viewport 高度并进入持久 RenderPlan/Metal publication
+- [ ] 完整 visual renderer 迁移（移除 TextKit source mirror 的生产渲染职责）
 
 ## Track C：Scene and rendering
 

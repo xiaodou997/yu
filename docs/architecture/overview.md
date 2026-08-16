@@ -400,22 +400,23 @@ absolute target。生产 `Up/Down/Shift-Up/Shift-Down` 现在先由 host 发布�
 metrics，再通过 `yu_storage_session_macos_move_vertical` 让 Rust 使用 caller-owned shaper 解析
 相邻 visual line；返回的普通 `CommandResult` 继续驱动 source mirror、projected highlight 和
 caret reveal。透明 surface 仍不接收输入；当前 block-local shaped visual IME preedit 已进入
-同一持久 CoreText/RenderPlan/Metal publication，但跨 block preedit 与完整 visual renderer 迁移仍待
-后续。`yu_storage_session_macos_projection_hit_test` 会验证已发布的 viewport
+同一持久 CoreText/RenderPlan/Metal publication；跨 block preedit 已通过受影响 block span 的
+transient layout 发布，完整 visual renderer 迁移仍待后续。`yu_storage_session_macos_projection_hit_test` 会验证已发布的 viewport
 max-width/line-height/default-advance；point 与 snapped caret 均为 document-space，Swift 不得
 按字体 advance 或 Markdown delimiter 自行猜测 visual boundary。
 同一 mirror 在 composition active 时还可以消费 storage FFI 返回的 visual replacement range
 和 generation-bound projected preedit，并让 `markedRange`/`attributedSubstring` 读取 visual
 坐标；metadata、文本和 callback 必须匹配同一 Revision + generation，过期时清空 visual mirror
 并保留 source mirror 回退。该路径仍不替换生产 IME renderer；持久 surface 现在会在 composition
-generation 改变时重新提交 transient block glyph。visual preedit 继续沿用
-Revision + composition generation 协议。现在同一 storage handle 还提供
+generation 改变时重新提交 transient block glyph。跨 block replacement 的首 block 承载完整 preedit，
+后续 block 清除被替换 source，viewport working state 重新测量高度；canonical source、Revision、
+LayoutCache 和 history 不变。visual preedit 继续沿用 Revision + composition generation 协议。现在同一 storage handle 还提供
 `yu_storage_session_macos_composition_shaped_caret`：它对活动 preedit 构建未缓存的 CoreText
 shaped block layout，返回 block-local caret point/line-height，以及 full projected UTF-16 的
 selection/replacement range；Swift visual IME self-check 会同时验证 geometry 与 generation，旧
 generation 不得发布。该 endpoint 仍负责 IME caret geometry handoff，而同一 composition overlay
-已经由 workspace 的 transient block layout 进入 Metal glyph publication；跨 block 情况安全回退
-到 native source mirror。
+已经由 workspace 的 transient block layout 进入 Metal glyph publication；无法建立合法 span 的
+情况才安全回退到 native source mirror。
 
 视觉 scene/glyph/render-plan 的两次 count/fill 调用也携带同一
 `composition_generation`。Rust 在非零 fill capacity 前校验上一次 header；如果 marked text 在
@@ -587,8 +588,8 @@ CoreText numeric face id 由进程内共享 catalog 保持稳定，因此反复�
 
 `platform/macos/yu-render-macos::CoreTextViewportFrameBuilder` 是诊断 FFI 与 backend 之间的 Rust
 准备层：它持有稳定 `CoreTextShaper`、CPU `GlyphAtlas`、`RenderPlanBuilder` 和
-`ViewportFramePublisher`，按可见 shaped layout（活动 composition 所在 block 使用未缓存 transient
-layout）按需 rasterize glyph，并让同一 page fingerprint 跨 Revision/generation 进入 `MetalAtlas`。
+`ViewportFramePublisher`，按可见 shaped layout（活动 composition 的受影响 block span 使用未缓存
+transient layout）按需 rasterize glyph，并让同一 page fingerprint 跨 Revision/generation 进入 `MetalAtlas`。
 `publish_and_submit` 严格复用
 `publication → revision gate → atlas sync → render_plan → consumer commit` 顺序；它不持有
 `EditorDocument`、surface 或 GPU handle。ignored AppKit probe 现在使用真实 CoreText publication

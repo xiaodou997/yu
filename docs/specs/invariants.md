@@ -492,12 +492,13 @@
    部分 glyph。每个 glyph 只能携带 Rust-owned atlas placement、几何、颜色和所属 block 的 source
    UTF-16 range，不得跨 ABI 暴露 atlas 像素、CoreText/scene/layout 指针或 GPU handle；当前 glyph-only
    bridge 遇到非 glyph primitive 必须整体拒绝，而不能静默丢弃。
-6. 活动 composition 若 `EditorDocument::composition_block_index` 能证明 replacement 完全属于
-   一个 Markdown block，CoreText viewport builder、workspace scene 和 diagnostic glyph/render-plan
-   bridge 必须对该 block 使用未缓存的 `block_layout_with_composition_and_shaper`，并把 preedit glyph
-   放入同一 atlas/RenderPlan/Metal submit；跨 block replacement 必须不构造部分 transient scene，安全
-   留在 native source mirror。composition generation 改变但 Revision 不变时，macOS submit key 必须
-   仍然失效并重新发布；cancel 后必须重新发布 canonical glyph scene。
+6. 活动 composition 必须通过 `EditorDocument::composition_block_range` 得到受影响的半开 block
+   span；CoreText viewport builder、workspace scene 和 diagnostic glyph/render-plan bridge 对 span
+   内每个 block 使用未缓存的 `block_layout_with_composition_and_shaper`，首 block 承载完整 preedit，
+   后续 block 清除其被替换的 source。transient block 高度只写入当前 viewport working state，不得
+   写入 canonical `LayoutCache`、source、Markdown CST、Revision 或 Undo；无法解析的范围仍必须整体
+   回退 native source mirror，而不能发布部分 scene。composition generation 改变但 Revision 不变
+   时，macOS submit key 必须仍然失效并重新发布；cancel 后必须重新发布 canonical glyph scene。
 7. `yu_storage_session_macos_visual_render_plan` 与
    `yu_storage_session_macos_visual_scene_glyphs` 的 count/fill header 必须同时携带
    `composition_generation`。当 fill capacity 非零时，Rust 必须先验证调用方保留的 header 与当前

@@ -2907,12 +2907,16 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
 
         let query_y = point_y.max(0.0);
         let viewport = ViewportRect::new(query_y, metrics.line_height());
-        let snapshot = match session
-            .session
-            .visible_blocks_with_shaper(viewport, &shaper)
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => return storage_status(error),
+        let snapshot = {
+            let document = session.session.document_mut().editor_mut();
+            match if document.composition().is_some() {
+                document.visible_blocks_with_composition_and_shaper(viewport, &shaper)
+            } else {
+                document.visible_blocks_with_shaper(viewport, &shaper)
+            } {
+                Ok(snapshot) => snapshot,
+                Err(error) => return status_from_editor_error(error),
+            }
         };
         let mut selected = None;
         let mut best_distance = f32::INFINITY;
@@ -2934,14 +2938,27 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
         let Some(block) = selected else {
             return YU_STORAGE_INVALID_SELECTION;
         };
-        let layout =
-            match session
-                .session
-                .block_layout_with_shaper(block.index(), layout_config, &shaper)
+        let layout = {
+            let document = session.session.document_mut().editor_mut();
+            let composition_blocks = document.composition_block_range();
+            match if composition_blocks
+                .as_ref()
+                .is_some_and(|span| span.contains(&block.index()))
             {
+                document.block_layout_with_composition_and_shaper(
+                    block.index(),
+                    layout_config,
+                    &shaper,
+                )
+            } else {
+                document
+                    .block_layout_with_shaper(block.index(), layout_config, &shaper)
+                    .cloned()
+            } {
                 Ok(layout) => layout,
-                Err(error) => return storage_status(error),
-            };
+                Err(error) => return status_from_editor_error(error),
+            }
+        };
         if layout.lines().is_empty() {
             return YU_STORAGE_INVALID_SELECTION;
         }
@@ -3836,12 +3853,16 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_viewport_blocks(
             return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
         }
         let viewport = ViewportRect::new(scroll_y, viewport_height);
-        let viewport_snapshot = match session
-            .session
-            .visible_blocks_with_shaper(viewport, &shaper)
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => return storage_status(error),
+        let viewport_snapshot = {
+            let document = session.session.document_mut().editor_mut();
+            match if document.composition().is_some() {
+                document.visible_blocks_with_composition_and_shaper(viewport, &shaper)
+            } else {
+                document.visible_blocks_with_shaper(viewport, &shaper)
+            } {
+                Ok(snapshot) => snapshot,
+                Err(error) => return status_from_editor_error(error),
+            }
         };
         let source = session.session.snapshot();
         let mut encoded = Vec::with_capacity(viewport_snapshot.blocks().len());
@@ -3943,10 +3964,18 @@ fn macos_visual_scene(
     }
 
     let viewport = ViewportRect::new(scroll_y, viewport_height);
-    let viewport_snapshot = session
-        .session
-        .visible_blocks_with_shaper(viewport, &shaper)
-        .map_err(storage_status)?;
+    let viewport_snapshot = {
+        let document = session.session.document_mut().editor_mut();
+        if document.composition().is_some() {
+            document
+                .visible_blocks_with_composition_and_shaper(viewport, &shaper)
+                .map_err(status_from_editor_error)?
+        } else {
+            document
+                .visible_blocks_with_shaper(viewport, &shaper)
+                .map_err(status_from_editor_error)?
+        }
+    };
     let revision = viewport_snapshot.revision();
     let source = session.session.snapshot();
     let geometries = viewport_snapshot
@@ -4350,16 +4379,19 @@ fn macos_visual_scene_glyphs(
     let config = state.builder.config();
     let source = session.session.snapshot();
     let layout_config = session.session.viewport_config().layout();
-    let composition_block = session
+    let composition_blocks = session
         .session
         .document()
         .editor()
-        .composition_block_index();
+        .composition_block_range();
     let mut block_metadata = Vec::with_capacity(input.blocks().len());
     {
         let document = session.session.document_mut().editor_mut();
         for block in input.blocks() {
-            let glyph_count = if composition_block == Some(block.index()) {
+            let glyph_count = if composition_blocks
+                .as_ref()
+                .is_some_and(|span| span.contains(&block.index()))
+            {
                 document
                     .block_layout_with_composition_and_shaper(
                         block.index(),
@@ -4505,18 +4537,27 @@ fn macos_visual_render_plan(
     let viewport = ViewportRect::new(scroll_y, viewport_height);
     let composition_generation = session.session.composition_generation();
     let document = session.session.document_mut().editor_mut();
-    let viewport_snapshot = document
-        .visible_blocks_with_shaper(viewport, &shaper)
-        .map_err(|error| storage_status(error.into()))?;
+    let viewport_snapshot = if document.composition().is_some() {
+        document
+            .visible_blocks_with_composition_and_shaper(viewport, &shaper)
+            .map_err(|error| storage_status(error.into()))?
+    } else {
+        document
+            .visible_blocks_with_shaper(viewport, &shaper)
+            .map_err(|error| storage_status(error.into()))?
+    };
     let source = document.snapshot();
     let config = document.viewport_config().layout();
     let rasterizer = shaper.rasterizer();
     let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::default());
     let mut block_glyphs = Vec::with_capacity(viewport_snapshot.blocks().len());
-    let composition_block = document.composition_block_index();
+    let composition_blocks = document.composition_block_range();
 
     for block in viewport_snapshot.blocks() {
-        let layout = if composition_block == Some(block.index()) {
+        let layout = if composition_blocks
+            .as_ref()
+            .is_some_and(|span| span.contains(&block.index()))
+        {
             document
                 .block_layout_with_composition_and_shaper(block.index(), config, &shaper)
                 .map_err(status_from_editor_error)?
@@ -7343,6 +7384,74 @@ mod tests {
         assert_eq!(repeated.atlas_page_count, first.atlas_page_count);
         assert_eq!(repeated.atlas_glyph_count, first.atlas_glyph_count);
         assert_eq!(repeated.upload_count, 0);
+
+        let source = "# 羽🙂\n\nparagraph 日本語 **bold**\n\n- [ ] task\n";
+        let composition_start = source.find("日本語").expect("composition start");
+        let composition_end = source.find("task").expect("composition end") + "ta".len();
+        let composition_start_utf16 = source[..composition_start].encode_utf16().count() as u64;
+        let composition_end_utf16 = source[..composition_end].encode_utf16().count() as u64;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_begin_composition(
+                    raw,
+                    0,
+                    composition_start_utf16,
+                    composition_end_utf16,
+                    "日本🙂".as_ptr(),
+                    "日本🙂".len(),
+                    2,
+                    2,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut cross_block = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    &mut cross_block,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(cross_block.revision, 0);
+        assert_eq!(cross_block.composition_generation, 1);
+        assert!(cross_block.frame_serial > repeated.frame_serial);
+        assert!(cross_block.command_count > 0);
+        assert!(cross_block.atlas_glyph_count >= repeated.atlas_glyph_count);
+
+        assert_eq!(
+            unsafe { yu_storage_session_cancel_composition(raw, 0, 1) },
+            YU_STORAGE_OK
+        );
+        let mut after_cancel = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    &mut after_cancel,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(after_cancel.revision, 0);
+        assert_eq!(after_cancel.composition_generation, 2);
+        assert_eq!(after_cancel.command_count, repeated.command_count);
+        assert!(after_cancel.frame_serial > cross_block.frame_serial);
 
         let mut resized = YuStorageMacosRenderHostSnapshot::default();
         assert_eq!(

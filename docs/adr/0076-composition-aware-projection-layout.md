@@ -2,7 +2,7 @@
 
 ## 状态
 
-已接受（Phase 1 诊断）
+已接受（Phase 1 诊断；跨 block 规则由 ADR 0133 扩展）
 
 ## 背景
 
@@ -24,7 +24,8 @@ shaping 和 caret 几何，而又不能把 marked text 写入 source、Revision 
 - `EditorDocument::block_layout_with_composition*` 返回未缓存的 transient layout。composition
   更新不推进 canonical Revision，因此不能进入普通 `LayoutCache`，也不能通过 source edit
   remap；commit/cancel 后下次查询自然回到 canonical layout。
-- 不支持跨 block composition replacement；范围不属于请求 block/projection 时明确失败。
+- block-local projection 是单 block fast path；跨 block replacement 的 span 投影与 viewport working
+  state 规则由 ADR 0133 定义，不能把它误缩减成一个 block-local index。
 
 ## 结果
 

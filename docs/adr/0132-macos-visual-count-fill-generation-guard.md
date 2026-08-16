@@ -33,7 +33,8 @@ composition 文本。host/surface 输出也回传同一 generation，便于 self
 - 两次 count/fill 之间的日文、emoji、dead-key preedit 更新不会污染旧数组；
 - cancel 即使不改变 source Revision，也会使旧 transient header 失效；
 - ABI 没有增加独立的 generation 参数，旧的 count/fill 使用方式保持不变；
-- canonical scene/render-plan 仍由 source Revision 驱动，跨 block preedit 仍按现有安全回退策略处理。
+- canonical scene/render-plan 仍由 source Revision 驱动；跨 block preedit 的 transient layout 由
+  ADR 0133 定义，generation guard 同样覆盖该受影响 block span。
 
 ## 验证
 
