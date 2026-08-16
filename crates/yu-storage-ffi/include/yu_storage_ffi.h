@@ -174,6 +174,16 @@ typedef struct YuStorageSelection {
     uint8_t affinity;
 } YuStorageSelection;
 
+/* Revision-bound selection endpoints. The anchor/focus pair preserves the
+ * direction of a native visual drag; YuStorageSelection remains the ordered
+ * range used by legacy callers. */
+typedef struct YuStorageSelectionEndpoints {
+    uint64_t revision;
+    uint64_t anchor_utf16;
+    uint64_t focus_utf16;
+    uint8_t affinity;
+} YuStorageSelectionEndpoints;
+
 typedef struct YuStorageProjectionCaret {
     uint64_t revision;
     uint64_t source_utf16;
@@ -847,11 +857,16 @@ int32_t yu_storage_session_accessibility_line_for_position(
 
 int32_t yu_storage_session_selection(const YuStorageSession *session,
                                      YuStorageSelection *output);
+int32_t yu_storage_session_selection_endpoints(
+    const YuStorageSession *session, YuStorageSelectionEndpoints *output);
 int32_t yu_storage_session_set_selection(YuStorageSession *session,
                                          uint64_t expected_revision,
                                          uint64_t start_utf16,
                                          uint64_t end_utf16,
                                          uint8_t affinity);
+int32_t yu_storage_session_set_selection_endpoints(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t anchor_utf16, uint64_t focus_utf16, uint8_t affinity);
 int32_t yu_storage_session_execute_command(YuStorageSession *session,
                                             uint8_t command, uint64_t block,
                                             YuStorageCommandResult *output);

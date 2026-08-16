@@ -67,6 +67,20 @@ private struct NativeSelection {
     }
 }
 
+private struct NativeSelectionEndpoints {
+    let revision: UInt64
+    let anchorUTF16: UInt64
+    let focusUTF16: UInt64
+    let affinity: UInt8
+
+    init(_ value: YuStorageSelectionEndpoints) {
+        revision = value.revision
+        anchorUTF16 = value.anchor_utf16
+        focusUTF16 = value.focus_utf16
+        affinity = value.affinity
+    }
+}
+
 private struct NativeProjectionCaret {
     let revision: UInt64
     let sourceUTF16: UInt64
@@ -1953,6 +1967,16 @@ private final class StorageBridge {
         return NativeSelection(value)
     }
 
+    var selectionEndpoints: NativeSelectionEndpoints {
+        var value = YuStorageSelectionEndpoints()
+        let status = yu_storage_session_selection_endpoints(handle, &value)
+        precondition(
+            status == StorageStatus.ok,
+            "Rust selection endpoint query failed: \(status)"
+        )
+        return NativeSelectionEndpoints(value)
+    }
+
     var accessibilitySnapshot: NativeAccessibilitySnapshot {
         var value = YuStorageAccessibilitySnapshot()
         let status = yu_storage_session_accessibility_snapshot(handle, &value)
@@ -2049,6 +2073,22 @@ private final class StorageBridge {
             current.revision,
             UInt64(range.location),
             UInt64(range.location + range.length),
+            affinity
+        )
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    func setSelectionEndpoints(
+        anchorUTF16: UInt64,
+        focusUTF16: UInt64,
+        affinity: UInt8 = 1
+    ) throws {
+        let current = selection
+        let status = yu_storage_session_set_selection_endpoints(
+            handle,
+            current.revision,
+            anchorUTF16,
+            focusUTF16,
             affinity
         )
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
@@ -2983,11 +3023,11 @@ private final class DocumentTextView: NSTextView {
         }
         if !extending || visualSelectionAnchor == nil {
             if extending {
-                let selection = bridge.selection
-                let sourceUTF16 = UInt64(selection.range.location)
+                let endpoints = bridge.selectionEndpoints
+                let sourceUTF16 = endpoints.anchorUTF16
                 visualSelectionAnchor = visualUTF16ForSource(
                     sourceUTF16,
-                    affinity: selection.affinity,
+                    affinity: endpoints.affinity,
                     mirror: visualMirror
                 ) ?? visualOffset
             } else {
@@ -2999,7 +3039,10 @@ private final class DocumentTextView: NSTextView {
             location: min(anchor, visualOffset),
             length: abs(visualOffset - anchor)
         )
-        return applyVisualSelection(visualRange)
+        return applyVisualSelection(
+            visualRange,
+            anchorIsVisualStart: anchor <= visualOffset
+        )
     }
 
     private func visualUTF16ForSource(
@@ -3022,7 +3065,10 @@ private final class DocumentTextView: NSTextView {
     }
 
     @discardableResult
-    private func applyVisualSelection(_ visualRange: NSRange) -> Bool {
+    private func applyVisualSelection(
+        _ visualRange: NSRange,
+        anchorIsVisualStart: Bool? = nil
+    ) -> Bool {
         guard visualMirrorEnabled,
               !bridge.composition.active,
               let visualMirror,
@@ -3038,7 +3084,21 @@ private final class DocumentTextView: NSTextView {
                 visualRange: visualRange,
                 affinity: 1
             )
-            try bridge.setSelection(source.sourceRange, affinity: source.affinity)
+            if let anchorIsVisualStart {
+                let anchorUTF16 = anchorIsVisualStart
+                    ? UInt64(source.sourceRange.location)
+                    : UInt64(NSMaxRange(source.sourceRange))
+                let focusUTF16 = anchorIsVisualStart
+                    ? UInt64(NSMaxRange(source.sourceRange))
+                    : UInt64(source.sourceRange.location)
+                try bridge.setSelectionEndpoints(
+                    anchorUTF16: anchorUTF16,
+                    focusUTF16: focusUTF16,
+                    affinity: source.affinity
+                )
+            } else {
+                try bridge.setSelection(source.sourceRange, affinity: source.affinity)
+            }
             canonicalRevision = bridge.state.revision
             synchronizingSelection = true
             super.setSelectedRange(source.sourceRange)
@@ -5340,6 +5400,29 @@ private func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
         )
         precondition(bridge.selection.range.location == 0)
 
+        let visualEnd = (projected as NSString).range(of: "粗体")
+        precondition(visualEnd.location != NSNotFound)
+        guard let endPoint = textView.visualMirrorPointForSelfCheck(
+            visualUTF16: visualEnd.location + visualEnd.length
+        ) else {
+            preconditionFailure("visual mirror end point is unavailable")
+        }
+        precondition(
+            textView.applyVisualPointerSelectionForSelfCheck(
+                at: endPoint,
+                extending: false
+            )
+        )
+        precondition(
+            textView.applyVisualPointerSelectionForSelfCheck(
+                at: NSPoint(x: 0.0, y: 0.0),
+                extending: true
+            )
+        )
+        let endpoints = bridge.selectionEndpoints
+        precondition(endpoints.anchorUTF16 > endpoints.focusUTF16)
+        precondition(bridge.selection.range.location == Int(endpoints.focusUTF16))
+
         var staleRejected = false
         do {
             _ = try bridge.macosProjectionHitTest(
@@ -5354,7 +5437,8 @@ private func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
         precondition(staleRejected)
         print(
             "Yu shaped projection hit-test self-check: CoreText point→visual→source "
-                + "mapping is Revision-bound (visual UTF-16 \(hit.visualUTF16))"
+                + "mapping is Revision-bound (visual UTF-16 \(hit.visualUTF16)); "
+                + "reverse drag preserves anchor/focus"
         )
         exit(EXIT_SUCCESS)
     } catch {
