@@ -566,3 +566,14 @@
 14. `YuStorageMacosRenderHostSurfaceSnapshot` 的 `uploaded_images` 只统计本次成功替换的 image
     texture，`image_resource_count` 统计持久 atlas 中可供当前 RenderPlan 查找的资源；这两个计数
     不得把 ImageIO pending、失败或 stale publication 伪装成 ready。
+15. macOS 持久 surface 的 image request 只能来自当前 CoreText viewport 加 overscan 命中的 block；
+    viewport 外的 image 不得因为整篇文档扫描而排入 worker。`image_request_count` 统计本帧实际
+    生成的可见请求，不能把 cache 中的历史 publication 当作新请求。
+16. `ImageCache` 的 capacity 必须是显式正数；超过容量时只能淘汰最久未使用的 publication，且
+    eviction 不得改变 canonical source、Projection ranges 或已提交的旧 Revision。解码失败必须
+    记录 `Revision + ImageKey + failure kind + attempts`，同一 Revision 在失败记录存在时不得重复
+    排队；进入新 Revision 后才允许重新尝试。
+17. ready publication 的 intrinsic width/height 只能更新同一 Revision 可见 placement 的
+    document-space bounds，并保持 source/visual mapping 与 image hit-test range 不变；宽度受当前
+    layout content width 限制时必须保持宽高比。当前阶段 intrinsic bounds 仍是 viewport layout 的
+    overlay measurement，不能声称已经更新完整 block height index 或 scroll extent。

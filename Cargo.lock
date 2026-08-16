@@ -246,6 +246,7 @@ dependencies = [
  "yu-core",
  "yu-editor",
  "yu-font",
+ "yu-layout",
  "yu-render",
  "yu-scene",
  "yu-storage",

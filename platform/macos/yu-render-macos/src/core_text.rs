@@ -8,6 +8,7 @@
 use std::error::Error;
 use std::fmt;
 
+use yu_assets::ImagePublication;
 use yu_editor::{EditorDocument, EditorDocumentError};
 use yu_font::{
     AtlasError, FontRequest, GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer,
@@ -168,16 +169,48 @@ impl CoreTextViewportFrameBuilder {
         &mut self,
         document: &mut EditorDocument,
     ) -> Result<ViewportFramePublication, CoreTextViewportFrameError> {
+        self.publish_with_images(document, &[])
+    }
+
+    /// Prepares a viewport using dimensions from ready image publications.
+    /// The image bytes remain owned by the platform cache; only dimensions
+    /// enter the source-backed layout/scene calculation.
+    pub fn publish_with_images(
+        &mut self,
+        document: &mut EditorDocument,
+        image_publications: &[ImagePublication],
+    ) -> Result<ViewportFramePublication, CoreTextViewportFrameError> {
         self.rasterize_visible_glyphs(document)?;
         self.publisher
-            .publish(
+            .publish_with_images(
                 document,
                 self.config,
                 &self.shaper,
                 &self.atlas,
                 &mut self.render_plans,
+                image_publications,
             )
             .map_err(CoreTextViewportFrameError::Publish)
+    }
+
+    /// Returns the block indices in the current viewport/overscan window.
+    /// This is used by the image resource scheduler so off-screen images do
+    /// not enter the ImageIO queue.
+    pub fn visible_block_indices(
+        &self,
+        document: &mut EditorDocument,
+    ) -> Result<Vec<usize>, EditorDocumentError> {
+        let snapshot = if document.composition().is_some() {
+            document
+                .visible_blocks_with_composition_and_shaper(self.config.viewport(), &self.shaper)?
+        } else {
+            document.visible_blocks_with_shaper(self.config.viewport(), &self.shaper)?
+        };
+        Ok(snapshot
+            .blocks()
+            .iter()
+            .map(|block| block.index())
+            .collect())
     }
 
     /// Updates the viewport/scene inputs while retaining the CoreText shaper,

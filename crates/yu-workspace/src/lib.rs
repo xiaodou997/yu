@@ -11,10 +11,13 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use yu_assets::ImageKey;
+use yu_assets::{ImageKey, ImagePublication};
 use yu_core::Revision;
-use yu_editor::{BlockKind, EditorDocument, EditorDocumentError, ShapingProvider, ViewportRect};
+use yu_editor::{
+    BlockKind, EditorDocument, EditorDocumentError, ImageSource, ShapingProvider, ViewportRect,
+};
 use yu_font::GlyphAtlas;
+use yu_layout::ImageIntrinsicSize;
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
     ImagePrimitive, Rect, Rgba8, Scene, SceneBuilder, SceneError, ViewportBlockGeometry,
@@ -485,15 +488,31 @@ impl ViewportFramePublisher {
         atlas: &GlyphAtlas,
         render_plans: &mut RenderPlanBuilder,
     ) -> Result<ViewportFramePublication, ViewportPublishError> {
+        self.publish_with_images(document, config, shaper, atlas, render_plans, &[])
+    }
+
+    /// Publishes the viewport while applying dimensions from already-ready
+    /// image publications. Missing images keep the normal placeholder layout.
+    pub fn publish_with_images<S: ShapingProvider>(
+        &mut self,
+        document: &mut EditorDocument,
+        config: ViewportRenderConfig,
+        shaper: &S,
+        atlas: &GlyphAtlas,
+        render_plans: &mut RenderPlanBuilder,
+        image_publications: &[ImagePublication],
+    ) -> Result<ViewportFramePublication, ViewportPublishError> {
         // RenderPlanBuilder carries page-fingerprint state across frames. Build against a
         // staged copy so a later publication failure cannot advance caller-owned state.
         let mut staged_render_plans = render_plans.clone();
-        let frame = assemble_viewport_render_frame(
+        let frame = assemble_viewport_render_frame_with_images(
             document,
+            config.viewport(),
             config,
             shaper,
             atlas,
             &mut staged_render_plans,
+            image_publications,
         )?;
         let revision = document.revision();
         if frame.revision() != revision {
@@ -537,6 +556,32 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
     atlas: &GlyphAtlas,
     color: Rgba8,
 ) -> Result<ViewportSceneFrame, ViewportSceneError> {
+    assemble_viewport_scene_with_images(
+        document,
+        viewport,
+        shaper,
+        font_size,
+        scene_viewport,
+        atlas,
+        color,
+        &[],
+    )
+}
+
+/// Builds a viewport scene with dimensions from ready image publications.
+/// Publications are optional and are matched by the same source-backed
+/// destination fingerprint used by the image primitive.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
+    document: &mut EditorDocument,
+    viewport: ViewportRect,
+    shaper: &S,
+    font_size: f32,
+    scene_viewport: Rect,
+    atlas: &GlyphAtlas,
+    color: Rgba8,
+    image_publications: &[ImagePublication],
+) -> Result<ViewportSceneFrame, ViewportSceneError> {
     let viewport_snapshot = if document.composition().is_some() {
         document.visible_blocks_with_composition_and_shaper(viewport, shaper)?
     } else {
@@ -567,10 +612,25 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
         geometries,
     )?;
 
+    let source = document.snapshot();
+    let definitions = document.markdown().reference_definitions().clone();
+    let image_key = |image: ImageSource| {
+        let destination = image.destination().or_else(|| {
+            image
+                .reference()
+                .and_then(|reference| definitions.lookup(&source, reference))
+                .map(|definition| definition.destination())
+        })?;
+        let start = usize::try_from(destination.start().get()).ok()?;
+        let end = usize::try_from(destination.end().get()).ok()?;
+        let destination = source.as_str().get(start..end)?;
+        ImageKey::new(destination.to_owned()).ok()
+    };
+
     let mut layouts = Vec::with_capacity(viewport_snapshot.blocks().len());
     let composition_blocks = document.composition_block_range();
     for block in viewport_snapshot.blocks() {
-        let layout = if composition_blocks
+        let mut layout = if composition_blocks
             .as_ref()
             .is_some_and(|span| span.contains(&block.index()))
         {
@@ -580,6 +640,28 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
                 .block_layout_with_shaper(block.index(), config, shaper)?
                 .clone()
         };
+        let measurements = layout
+            .projection()
+            .images()
+            .iter()
+            .copied()
+            .filter_map(|image| {
+                let key = image_key(image)?;
+                let publication = image_publications.iter().find(|publication| {
+                    publication.revision() == revision
+                        && publication.key().fingerprint() == key.fingerprint()
+                })?;
+                let size = ImageIntrinsicSize::new(
+                    publication.image().width(),
+                    publication.image().height(),
+                )
+                .ok()?;
+                Some((image.source(), size))
+            })
+            .collect::<Vec<_>>();
+        layout
+            .apply_image_intrinsic_sizes(&measurements)
+            .map_err(EditorDocumentError::from)?;
         layouts.push(layout);
     }
     let layout_refs = layouts.iter().collect::<Vec<_>>();
@@ -589,8 +671,6 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
         .iter()
         .map(|block| viewport_block_background(block.kind()))
         .collect::<Vec<_>>();
-    let source = document.snapshot();
-    let definitions = document.markdown().reference_definitions();
     let mut images = Vec::with_capacity(layouts.len());
     for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
         let mut block_images = Vec::new();
@@ -604,25 +684,7 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
             else {
                 continue;
             };
-            let destination = image.destination().or_else(|| {
-                image
-                    .reference()
-                    .and_then(|reference| definitions.lookup(&source, reference))
-                    .map(|definition| definition.destination())
-            });
-            let Some(destination) = destination else {
-                continue;
-            };
-            let Ok(start) = usize::try_from(destination.start().get()) else {
-                continue;
-            };
-            let Ok(end) = usize::try_from(destination.end().get()) else {
-                continue;
-            };
-            let Some(destination) = source.as_str().get(start..end) else {
-                continue;
-            };
-            let Ok(key) = ImageKey::new(destination.to_owned()) else {
+            let Some(key) = image_key(image) else {
                 continue;
             };
             let bounds = placement.bounds();
@@ -666,14 +728,36 @@ pub fn assemble_viewport_render_frame<S: ShapingProvider>(
     atlas: &GlyphAtlas,
     render_plans: &mut RenderPlanBuilder,
 ) -> Result<ViewportRenderFrame, ViewportSceneError> {
-    let scene = assemble_viewport_scene(
+    assemble_viewport_render_frame_with_images(
         document,
         config.viewport(),
+        config,
+        shaper,
+        atlas,
+        render_plans,
+        &[],
+    )
+}
+
+/// Builds a render frame while applying ready image intrinsic dimensions.
+pub fn assemble_viewport_render_frame_with_images<S: ShapingProvider>(
+    document: &mut EditorDocument,
+    viewport: ViewportRect,
+    config: ViewportRenderConfig,
+    shaper: &S,
+    atlas: &GlyphAtlas,
+    render_plans: &mut RenderPlanBuilder,
+    image_publications: &[ImagePublication],
+) -> Result<ViewportRenderFrame, ViewportSceneError> {
+    let scene = assemble_viewport_scene_with_images(
+        document,
+        viewport,
         shaper,
         config.font_size(),
         config.scene_viewport(),
         atlas,
         config.color(),
+        image_publications,
     )?;
     if scene.revision() != document.revision() {
         return Err(ViewportFrameError::Stale {
@@ -788,6 +872,60 @@ mod tests {
                 .iter()
                 .all(|primitive| matches!(primitive, Primitive::Glyph(_)))
         );
+    }
+
+    #[test]
+    fn ready_image_publication_updates_scene_intrinsic_bounds() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 160.0);
+        let mut document = EditorDocument::new("![alt](image.png)");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let source = document
+            .block_projection(0)
+            .expect("image projection")
+            .visual()
+            .images()[0]
+            .source();
+        let mut cache = yu_assets::ImageCache::new();
+        let publication = cache
+            .publish_decoded(
+                yu_assets::ImageRequest::new(document.revision(), source, "image.png")
+                    .expect("image request"),
+                document.revision(),
+                yu_assets::DecodedImage::new(200, 100, vec![255; 200 * 100 * 4])
+                    .expect("decoded image"),
+            )
+            .expect("image publication");
+        let frame = assemble_viewport_scene_with_images(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+            &[publication],
+        )
+        .expect("scene frame");
+        let image = frame
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Image(image) => Some(*image),
+                Primitive::FillRect { .. } | Primitive::Glyph(_) => None,
+            })
+            .expect("image primitive");
+        assert_eq!(image.bounds().width(), 200.0);
+        assert_eq!(image.bounds().height(), 100.0);
     }
 
     #[test]

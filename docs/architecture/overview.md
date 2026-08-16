@@ -669,6 +669,10 @@ rectangle，不阻塞编辑线程。`yu-layout` 现在把每个 image 的 source
 按 painter order 进入 Scene/RenderPlan；layout hit-test 命中图片时返回完整 source range，FFI
 同时以 UTF-16 返回该 range。资源未 ready 时仍只显示 placeholder，实际产品 host 的 ImageIO
 worker/`MetalImageAtlas` publication wiring 现在由 macOS 持久 surface host 持有：host 每次 frame
-轮询 worker，把同一 Revision 的 ready publication 同步进持久 image atlas，再用带图片资源的
-RenderPlan 提交；首帧或解码失败仍保留 fallback。Swift surface snapshot 同时报告本次上传的
-image 数量和 atlas resource 数量，便于区分“命令已发布”和“纹理已 ready”。见 ADR 0141、0142、0143、0144。
+只为 CoreText 当前 viewport/overscan 的 block 轮询 worker，把同一 Revision 的 ready publication
+同步进持久 image atlas，再用带图片资源的 RenderPlan 提交；首帧或解码失败仍保留 fallback。
+`ImageCache` 有显式容量、LRU eviction 和按 Revision 绑定的失败记录，surface snapshot 同时报告
+本次可见请求、失败与 eviction 计数，以及上传的 image 数量和 atlas resource 数量，便于区分
+“命令已发布”“资源请求已排队”“解码失败”和“纹理已 ready”。ready publication 会在下一次
+layout 中按解码得到的 intrinsic 宽高比更新可见 placement bounds；当前仍不把图片高度变化写回
+完整 block height index，完整 block reflow/scroll-height 更新留在后续阶段。见 ADR 0141、0142、0143、0144、0145。

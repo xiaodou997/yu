@@ -284,11 +284,53 @@ impl ImagePublication {
     }
 }
 
+/// Stable reason class recorded when a platform decoder cannot publish an
+/// image. Platform-specific errors remain outside this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageFailureKind {
+    Decode,
+    Unsupported,
+    Io,
+    Worker,
+}
+
+/// Revision-bound failure metadata for one image destination.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageFailure {
+    revision: Revision,
+    key: ImageKey,
+    kind: ImageFailureKind,
+    attempts: u32,
+}
+
+impl ImageFailure {
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &ImageKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ImageFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
 /// Result of requesting a resource from the cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImageRequestResult {
     Ready(ImagePublication),
     Pending,
+    Failed(ImageFailure),
 }
 
 /// Errors raised while publishing decoded image data.
@@ -300,6 +342,7 @@ pub enum ImageCacheError {
     },
     Decode(ImageDecodeError),
     GenerationOverflow,
+    InvalidCapacity,
 }
 
 impl fmt::Display for ImageCacheError {
@@ -313,6 +356,7 @@ impl fmt::Display for ImageCacheError {
             }
             Self::Decode(error) => error.fmt(formatter),
             Self::GenerationOverflow => formatter.write_str("image generation overflowed"),
+            Self::InvalidCapacity => formatter.write_str("image cache capacity must be positive"),
         }
     }
 }
@@ -321,7 +365,7 @@ impl Error for ImageCacheError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Decode(error) => Some(error),
-            Self::StaleRevision { .. } | Self::GenerationOverflow => None,
+            Self::StaleRevision { .. } | Self::GenerationOverflow | Self::InvalidCapacity => None,
         }
     }
 }
@@ -336,6 +380,7 @@ impl From<ImageDecodeError> for ImageCacheError {
 struct CacheEntry {
     generation: u64,
     image: DecodedImage,
+    last_used: u64,
 }
 
 /// Revision-aware decoded image cache with a pollable asynchronous work queue.
@@ -345,22 +390,71 @@ struct CacheEntry {
 /// calls [`Self::publish_decoded`] on the owner thread. A cached image can be
 /// rebound to a newer Revision without decoding again, while a publication
 /// for an old Revision is rejected before it can reach a texture uploader.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ImageCache {
     entries: HashMap<ImageKey, CacheEntry>,
+    failures: HashMap<ImageKey, ImageFailure>,
     pending: VecDeque<ImageRequest>,
     pending_keys: HashSet<ImageKey>,
     next_generation: u64,
+    next_access: u64,
+    capacity: usize,
+    evictions: u64,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
 }
 
 impl ImageCache {
+    pub const DEFAULT_CAPACITY: usize = 64;
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            failures: HashMap::new(),
+            pending: VecDeque::new(),
+            pending_keys: HashSet::new(),
+            next_generation: 0,
+            next_access: 0,
+            capacity: capacity.max(1),
+            evictions: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Changes the decoded-image capacity and returns the number of entries
+    /// evicted while enforcing the new limit.
+    pub fn set_capacity(&mut self, capacity: usize) -> Result<usize, ImageCacheError> {
+        if capacity == 0 {
+            return Err(ImageCacheError::InvalidCapacity);
+        }
+        self.capacity = capacity;
+        Ok(self.trim_to_capacity())
+    }
+
     pub fn request(&mut self, request: ImageRequest) -> ImageRequestResult {
-        if let Some(entry) = self.entries.get(request.key()) {
+        if let Some(failure) = self.failures.get(request.key()) {
+            if failure.revision == request.revision {
+                return ImageRequestResult::Failed(failure.clone());
+            }
+            self.failures.remove(request.key());
+        }
+        let access_tick = self.next_access_tick();
+        if let Some(entry) = self.entries.get_mut(request.key()) {
+            entry.last_used = access_tick;
             return ImageRequestResult::Ready(ImagePublication {
                 revision: request.revision,
                 generation: entry.generation,
@@ -406,13 +500,17 @@ impl ImageCache {
             .checked_add(1)
             .ok_or(ImageCacheError::GenerationOverflow)?;
         let generation = self.next_generation;
+        let access_tick = self.next_access_tick();
+        self.failures.remove(&request.key);
         self.entries.insert(
             request.key.clone(),
             CacheEntry {
                 generation,
                 image: image.clone(),
+                last_used: access_tick,
             },
         );
+        self.trim_to_capacity();
         Ok(ImagePublication {
             revision: current_revision,
             generation,
@@ -428,14 +526,84 @@ impl ImageCache {
     }
 
     #[must_use]
+    pub fn failure_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    #[must_use]
+    pub fn failure(&self, key: &ImageKey) -> Option<&ImageFailure> {
+        self.failures.get(key)
+    }
+
+    #[must_use]
+    pub fn eviction_count(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Records a stable failure for the current Revision. A later Revision
+    /// automatically clears the old failure when it requests the same key.
+    pub fn record_failure(
+        &mut self,
+        request: ImageRequest,
+        current_revision: Revision,
+        kind: ImageFailureKind,
+    ) -> Result<ImageFailure, ImageCacheError> {
+        if request.revision != current_revision {
+            return Err(ImageCacheError::StaleRevision {
+                expected: current_revision,
+                actual: request.revision,
+            });
+        }
+        self.pending.retain(|pending| pending.key != request.key);
+        self.pending_keys.remove(&request.key);
+        let attempts = self
+            .failures
+            .get(&request.key)
+            .filter(|failure| failure.revision == current_revision)
+            .map_or(1, |failure| failure.attempts.saturating_add(1));
+        let failure = ImageFailure {
+            revision: current_revision,
+            key: request.key.clone(),
+            kind,
+            attempts,
+        };
+        self.failures.insert(request.key, failure.clone());
+        Ok(failure)
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.failures.clear();
         self.pending.clear();
         self.pending_keys.clear();
+    }
+
+    fn next_access_tick(&mut self) -> u64 {
+        self.next_access = self.next_access.saturating_add(1);
+        self.next_access
+    }
+
+    fn trim_to_capacity(&mut self) -> usize {
+        let mut evicted = 0;
+        while self.entries.len() > self.capacity {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&key);
+            evicted += 1;
+            self.evictions = self.evictions.saturating_add(1);
+        }
+        evicted
     }
 }
 
@@ -556,5 +724,58 @@ mod tests {
         assert_eq!(rebound.generation(), publication.generation());
         assert_eq!(rebound.image().pixels(), publication.image().pixels());
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn bounded_cache_evicts_the_least_recently_used_publication() {
+        let source =
+            TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(4)).expect("range");
+        let mut cache = ImageCache::with_capacity(1);
+        cache
+            .publish_decoded(
+                request(0, source, "first.png"),
+                Revision::INITIAL,
+                decoded(1),
+            )
+            .expect("first publication");
+        cache
+            .publish_decoded(
+                request(0, source, "second.png"),
+                Revision::INITIAL,
+                decoded(2),
+            )
+            .expect("second publication");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.eviction_count(), 1);
+        assert!(matches!(
+            cache.request(request(0, source, "first.png")),
+            ImageRequestResult::Pending
+        ));
+    }
+
+    #[test]
+    fn failures_are_revision_bound_and_report_attempts() {
+        let source =
+            TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(4)).expect("range");
+        let mut cache = ImageCache::new();
+        let failed = cache
+            .record_failure(
+                request(0, source, "broken.png"),
+                Revision::INITIAL,
+                ImageFailureKind::Decode,
+            )
+            .expect("failure");
+        assert_eq!(failed.attempts(), 1);
+        let ImageRequestResult::Failed(current) = cache.request(request(0, source, "broken.png"))
+        else {
+            panic!("same revision should expose the recorded failure");
+        };
+        assert_eq!(current.kind(), ImageFailureKind::Decode);
+        assert_eq!(cache.failure_count(), 1);
+        assert!(matches!(
+            cache.request(request(1, source, "broken.png")),
+            ImageRequestResult::Pending
+        ));
+        assert_eq!(cache.failure_count(), 0);
     }
 }

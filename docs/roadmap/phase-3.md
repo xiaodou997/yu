@@ -68,7 +68,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] ImageIO 解码 worker、Metal RGBA texture ownership、ready-image RenderPlan command 和未就绪 placeholder（资源级纵向切片）
 - [x] image placement 使用 source/alt/visual ranges 生成 document-space layout geometry；Scene/RenderPlan 以 glyph 后 overlay 顺序发布，metrics/CoreText hit-test 返回完整 image source range
 - [x] 将 `ImagePublication`/`MetalImageAtlas` 接入 macOS 持久 surface host；snapshot 暴露 image upload/resource 计数，surface self-check 覆盖 ImageIO→Metal ready texture
-- [ ] 为可见 viewport 的 image placement 增加 intrinsic 尺寸测量、atlas eviction 和资源失败诊断；当前 host 仍按文档 image source 请求并保留 fallback
+- [x] image 请求收敛到 CoreText 当前 viewport/overscan block；`ImageCache` 增加有上限的 LRU、Revision-bound 失败诊断，ready publication 在下一帧按真实 intrinsic 宽高比更新 placement bounds
+- [ ] 完整 intrinsic image block reflow、scroll-height 更新与 GPU atlas texture eviction；当前阶段只更新可见 image placement 的 bounds，未 ready/失败仍保留 fallback
 
 ## 约束
 
