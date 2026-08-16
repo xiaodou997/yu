@@ -30,9 +30,10 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] storage FFI shaped viewport header 暴露 scroll/viewport/max-scroll 坐标协议
 - [x] storage FFI shaped caret scroll target 与 visual viewport transform self-check
 - [x] TextKit 过渡镜像自检支持 visual/source 双向映射（生产 view 尚未切换）
-- [x] `DocumentTextView` opt-in visual pointer adapter 与 source-mirror fallback self-check
+- [x] `DocumentTextView` visual pointer adapter 与 source-mirror fallback self-check
 - [x] `DocumentTextView` opt-in visual IME composition mirror、marked range 与 attributed substring self-check
-- [ ] 生产 visual view 的鼠标点击、拖选、上下移动和 IME 回归
+- [x] 生产 visual view 启用点击/拖选 visual boundary→Rust source selection，以及 source→visual caret 映射
+- [ ] 生产 visual view 的滚动边界、上下移动、最终 selection 绘制和 IME 回归
 
 ## Track C：Scene and rendering
 

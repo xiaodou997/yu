@@ -2186,7 +2186,7 @@ private final class ProjectionTextKitMirror {
     let layoutManager: NSLayoutManager
     let textContainer: NSTextContainer
 
-    init(text: String, revision: UInt64, width: CGFloat) {
+    init(text: String, revision: UInt64, width: CGFloat, font: NSFont) {
         self.revision = revision
         textStorage = NSTextStorage(string: text)
         layoutManager = NSLayoutManager()
@@ -2199,6 +2199,13 @@ private final class ProjectionTextKitMirror {
         textContainer.lineFragmentPadding = 0.0
         layoutManager.addTextContainer(textContainer)
         textStorage.addLayoutManager(layoutManager)
+        if textStorage.length > 0 {
+            textStorage.addAttribute(
+                .font,
+                value: font,
+                range: NSRange(location: 0, length: textStorage.length)
+            )
+        }
     }
 
     var string: String { textStorage.string }
@@ -2231,14 +2238,35 @@ private final class ProjectionTextKitMirror {
         }
         return point
     }
+
+    func caretRect(forVisualUTF16 offset: Int) -> NSRect {
+        guard textStorage.length > 0 else {
+            return NSRect(x: 0.0, y: 0.0, width: 1.0, height: 16.0)
+        }
+        let clamped = min(max(offset, 0), textStorage.length)
+        let character = min(clamped, textStorage.length - 1)
+        let glyph = layoutManager.glyphIndexForCharacter(at: character)
+        let lineRect = layoutManager.lineFragmentRect(
+            forGlyphAt: glyph,
+            effectiveRange: nil
+        )
+        let point = point(forVisualUTF16: clamped)
+        let x = clamped >= textStorage.length ? lineRect.maxX : point.x
+        return NSRect(
+            x: x,
+            y: lineRect.minY,
+            width: 1.0,
+            height: max(lineRect.height, 1.0)
+        )
+    }
 }
 
 /// The native source mirror is deliberately a view cache, never a second
 /// document model. Rust owns canonical source, revision, selection and
 /// composition generation; this TextKit object only projects those values for
-/// AppKit's NSTextInputClient callbacks. The optional visual pointer adapter
-/// uses a separate disposable TextKit layout and remains disabled in the
-/// production source view until visual rendering is ready.
+/// AppKit's NSTextInputClient callbacks. The visual pointer adapter uses a
+/// separate disposable TextKit layout for point-to-visual-boundary hit testing,
+/// then asks Rust to map that visual boundary back to canonical source ranges.
 private final class DocumentTextView: NSTextView {
     private enum Command {
         static let deleteBackward: UInt8 = 1
@@ -2331,10 +2359,11 @@ private final class DocumentTextView: NSTextView {
         postAccessibilityRefresh()
     }
 
-    /// Enables the not-yet-production visual pointer adapter for a focused
-    /// self-check. The visible NSTextView remains the canonical source mirror;
-    /// this only builds a disposable TextKit layout from Rust projected text.
-    func setVisualMirrorEnabledForSelfCheck(_ enabled: Bool) throws {
+    /// Enables the visual pointer adapter. The visible NSTextView remains the
+    /// canonical source mirror; this only builds a disposable TextKit layout
+    /// from Rust projected text and maps the resulting visual boundary back
+    /// through Rust before changing selection.
+    func setVisualMirrorEnabled(_ enabled: Bool) throws {
         visualMirrorEnabled = enabled
         visualSelectionAnchor = nil
         if enabled {
@@ -2344,6 +2373,15 @@ private final class DocumentTextView: NSTextView {
             visualCompositionGeneration = nil
             visualViewport = nil
         }
+    }
+
+    func setVisualMirrorEnabledForSelfCheck(_ enabled: Bool) throws {
+        try setVisualMirrorEnabled(enabled)
+    }
+
+    func refreshVisualMirrorForDisplay() throws {
+        guard visualMirrorEnabled else { return }
+        try refreshVisualMirror()
     }
 
     func visualMirrorPointForSelfCheck(visualUTF16: Int) -> NSPoint? {
@@ -2383,6 +2421,25 @@ private final class DocumentTextView: NSTextView {
         return visualViewport.documentPoint(
             forViewportPoint: visualViewport.viewportPoint(forDocumentPoint: point)
         )
+    }
+
+    func visualCaretRectForDisplay() -> NSRect? {
+        guard visualMirrorEnabled,
+              let visualMirror,
+              visualMirror.revision == bridge.state.revision else {
+            return nil
+        }
+        let selection = bridge.selection
+        let sourceUTF16 = UInt64(selection.range.location + selection.range.length)
+        guard let visualUTF16 = visualUTF16ForSource(
+            sourceUTF16,
+            affinity: selection.affinity,
+            mirror: visualMirror
+        ) else {
+            return nil
+        }
+        let rect = visualMirror.caretRect(forVisualUTF16: visualUTF16)
+        return rect.offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
     }
 
     func visualMirrorStringForSelfCheck() -> String? {
@@ -2447,7 +2504,8 @@ private final class DocumentTextView: NSTextView {
         visualMirror = ProjectionTextKitMirror(
             text: projected,
             revision: revision,
-            width: width
+            width: width,
+            font: font ?? NSFont.systemFont(ofSize: 16.0)
         )
         visualCompositionGeneration = generation
     }
@@ -2478,7 +2536,17 @@ private final class DocumentTextView: NSTextView {
         }
         let visualOffset = visualMirror.visualUTF16(at: point)
         if !extending || visualSelectionAnchor == nil {
-            visualSelectionAnchor = visualOffset
+            if extending {
+                let selection = bridge.selection
+                let sourceUTF16 = UInt64(selection.range.location)
+                visualSelectionAnchor = visualUTF16ForSource(
+                    sourceUTF16,
+                    affinity: selection.affinity,
+                    mirror: visualMirror
+                ) ?? visualOffset
+            } else {
+                visualSelectionAnchor = visualOffset
+            }
         }
         guard let anchor = visualSelectionAnchor else { return false }
         let visualRange = NSRange(
@@ -2486,6 +2554,25 @@ private final class DocumentTextView: NSTextView {
             length: abs(visualOffset - anchor)
         )
         return applyVisualSelection(visualRange)
+    }
+
+    private func visualUTF16ForSource(
+        _ sourceUTF16: UInt64,
+        affinity: UInt8,
+        mirror: ProjectionTextKitMirror
+    ) -> Int? {
+        guard let caret = try? bridge.projectionCaret(
+            revision: mirror.revision,
+            sourceUTF16: sourceUTF16,
+            affinity: affinity
+        ),
+              caret.revision == mirror.revision,
+              let visualUTF16 = Int(exactly: caret.visualUTF16),
+              visualUTF16 >= 0,
+              visualUTF16 <= mirror.utf16Length else {
+            return nil
+        }
+        return visualUTF16
     }
 
     @discardableResult
@@ -2514,7 +2601,9 @@ private final class DocumentTextView: NSTextView {
             return true
         } catch {
             synchronizingSelection = false
-            onError?(error)
+            // A stale visual point is an expected race with source editing;
+            // let the caller fall back to AppKit's source hit-test instead of
+            // interrupting typing with a modal error.
             return false
         }
     }
@@ -2739,10 +2828,10 @@ private final class DocumentTextView: NSTextView {
         syncNativeSelectionToRust(range)
     }
 
-    /// The visual pointer adapter is intentionally opt-in until the window
-    /// draws the projected TextKit layout. When enabled by a future visual
-    /// document view, Rust resolves the visual point/selection and the source
-    /// mirror receives only the resulting canonical source range.
+    /// The visual pointer adapter resolves the click/drag point in the
+    /// projected stream, then lets Rust convert that visual range into the
+    /// canonical source selection. If the projected mirror is stale or
+    /// unavailable, AppKit's source hit-test remains the safe fallback.
     override func mouseDown(with event: NSEvent) {
         if visualMirrorEnabled,
            applyVisualPointerSelection(
@@ -2772,6 +2861,21 @@ private final class DocumentTextView: NSTextView {
             return
         }
         super.mouseUp(with: event)
+    }
+
+    /// Source delimiters may be hidden by the Rust projection. Draw the
+    /// insertion point at the revision-bound visual caret while retaining the
+    /// TextKit view as the input/IME/Accessibility owner.
+    override func drawInsertionPoint(
+        in rect: NSRect,
+        color: NSColor,
+        turnedOn: Bool
+    ) {
+        guard let visualRect = visualCaretRectForDisplay() else {
+            super.drawInsertionPoint(in: rect, color: color, turnedOn: turnedOn)
+            return
+        }
+        super.drawInsertionPoint(in: visualRect, color: color, turnedOn: turnedOn)
     }
 
     private func syncNativeSelectionToRust(_ range: NSRange) {
@@ -3150,7 +3254,9 @@ private final class DocumentTextView: NSTextView {
                 visualMirror = nil
                 visualCompositionGeneration = nil
                 visualViewport = nil
-                onError?(error)
+                // Projection is an enhancement to the source mirror. If a
+                // refresh races an edit, keep TextKit interactive and let the
+                // next layout/source revision rebuild the disposable mirror.
             }
         }
     }
@@ -3600,6 +3706,8 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private var promptedExternalDisk: DiskState?
     private var surfaceBoundsObserver: NSObjectProtocol?
     private weak var documentScrollView: NSScrollView?
+    private var visualPointerAdapterEnabled = false
+    private var visualPointerLayoutWidth: CGFloat = -1.0
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
@@ -3729,6 +3837,25 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         let viewportFrame = view.convert(scrollView.contentView.frame, from: scrollView)
         if surfaceHostView.frame != viewportFrame {
             surfaceHostView.frame = viewportFrame
+        }
+        let visualWidth = max(
+            textView.bounds.width - 2.0 * textView.textContainerOrigin.x,
+            1.0
+        )
+        do {
+            if !visualPointerAdapterEnabled {
+                try textView.setVisualMirrorEnabled(true)
+                visualPointerAdapterEnabled = true
+                visualPointerLayoutWidth = visualWidth
+            } else if abs(visualPointerLayoutWidth - visualWidth) > 0.5 {
+                try textView.refreshVisualMirrorForDisplay()
+                visualPointerLayoutWidth = visualWidth
+            }
+        } catch {
+            visualPointerAdapterEnabled = false
+            visualPointerLayoutWidth = -1.0
+            try? textView.setVisualMirrorEnabled(false)
+            statusLabel.toolTip = "Visual pointer inactive: \(error.localizedDescription)"
         }
         surfaceCoordinator.scheduleSubmit()
     }
@@ -4352,8 +4479,10 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
         precondition(
             textView.visualMirrorPointForSelfCheck(visualUTF16: visualStrong.location) != nil
         )
+        precondition(textView.visualCaretRectForDisplay() != nil)
         precondition(textView.applyVisualSelectionForSelfCheck(visualStrong))
         precondition(bridge.selection.range == sourceStrong)
+        precondition(textView.visualCaretRectForDisplay() != nil)
         let glyphRange = mirrorLayout.glyphRange(
             forCharacterRange: visualStrong,
             actualCharacterRange: nil

@@ -387,13 +387,16 @@ TextKit 过渡镜像现在还可以通过 `yu_storage_session_projection_source_
 canonical source，并返回 visual round-trip 边界。Swift 的 visual-mirror self-check 只创建临时
 `NSTextStorage`/`NSLayoutManager` 验证 projected UTF-8 可被 TextKit 接收，再用同一 Revision 的
 Rust reverse mapping 校验 hidden delimiter 和 Unicode；Rust source 发生编辑后旧镜像查询立即被
-拒绝。`DocumentTextView` 已增加 opt-in 的 visual pointer adapter：它可以用临时 visual TextKit
-layout 将点击/拖选结果交给 Rust reverse mapping，再把 canonical source range 同步回现有 source
-mirror；默认仍关闭该路径，生产窗口在 visual renderer 完成前继续走 AppKit source selection。
-同一 opt-in mirror 在 composition active 时还可以消费 storage FFI 返回的 visual replacement range
+拒绝。`DocumentTextView` 已增加 visual pointer adapter：它用匹配当前字体/宽度的临时 visual
+TextKit layout 将点击/拖选解析为 visual boundary，再交给 Rust reverse mapping，把 canonical
+source range 同步回现有 source mirror；生产窗口在布局完成后启用该路径，映射失败时回退 AppKit
+source selection。source→visual caret 也通过 Rust projection caret 查询后定位到同一临时布局；
+TextKit 仍是输入/IME/Accessibility owner，最终 selection 绘制和 shaped Metal hit-test 仍待后续。
+同一 mirror 在 composition active 时还可以消费 storage FFI 返回的 visual replacement range
 和 generation-bound projected preedit，并让 `markedRange`/`attributedSubstring` 读取 visual
 坐标；metadata、文本和 callback 必须匹配同一 Revision + generation，过期时清空 visual mirror
-并保留 source mirror 回退。该路径只用于协议 self-check，尚未替换生产 IME renderer。
+并保留 source mirror 回退。该路径仍不替换生产 IME renderer，visual preedit 会继续沿用
+Revision + composition generation 协议。
 
 storage FFI 现在还提供 parser-owned block 的 `yu_storage_session_block_layout`，以及 macOS
 `yu_storage_session_macos_block_layout`/`yu_storage_session_macos_block_caret`。前者使用显式
@@ -457,7 +460,7 @@ scene，只导出 glyph primitive 的 owned metadata：atlas page/矩形、origi
 颜色以及对应 block 的 source UTF-16 range。count/fill 两阶段 ABI 在容量不足时不会写入部分数组，
 并且 header、glyph 数组和 host publication 必须属于同一 Revision/frame/surface generation；Swift
 不拥有 atlas 像素、layout、scene 或 GPU handle。该入口目前是 `--visual-scene-glyph-self-check` 的
-诊断/opt-in 协议，仍不切换生产 TextKit source mirror，也不提交真实 Metal surface。见 ADR 0121。
+诊断/opt-in 协议，仍不替换生产 TextKit source mirror，也不提交真实 Metal surface。见 ADR 0121。
 
 在 glyph publication 稳定后，`yu_storage_session_macos_render_host_surface_submit` 增加一个更窄的
 真实 surface 验证入口：Swift 在 AppKit main thread 提供临时 `NSView`，Rust 同步创建

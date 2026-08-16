@@ -220,8 +220,9 @@
 45. `DocumentTextView` 的 visual pointer adapter 只能在拥有同一 Revision 的 disposable visual
     TextKit mirror 时处理点击/拖选；Rust reverse mapping 成功后才能提交 source selection 并更新
     native source mirror，任何 stale/范围/映射失败都必须回退 AppKit source selection，不能修改
-    source、composition 或 history。默认产品窗口必须关闭该 adapter，直到 visual renderer、scroll
-    origin 和 IME 坐标共享同一 visual layout。
+    source、composition 或 history。产品窗口可以在 visual layout ready 后启用该 adapter，但
+    scroll origin、字体宽度和 Revision 必须与当前 mirror 一致；source→visual caret 同样必须先
+    经过 Rust mapping，最终 shaped Metal hit-test 不能由 Swift 猜测。
 
 46. visual IME overlay 只能使用同一 expected Revision + composition generation 返回的 Rust
     projected UTF-8、visual replacement range 和 marked selection；`DocumentTextView` 在 metadata、
