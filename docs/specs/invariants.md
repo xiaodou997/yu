@@ -488,6 +488,14 @@
     `yu_storage_session_selection_endpoints` 读取 Rust anchor/focus，并通过
     `yu_storage_session_set_selection_endpoints` 写回同一 Revision 的方向。AppKit/TextKit 可以只
     接收 ordered range，但下一次继续拖动或 Shift-click 不得丢失 Rust anchor。
+30. macOS `DocumentTextView` 只有在 persistent Metal surface 已成功提交当前 Revision、
+    composition generation 和完整 submit geometry，且 `MacosVisualDecorationView` 持有同一
+    Revision 的有效 Rust-shaped frame 时，才可以隐藏 source glyph/insertion-point 绘制。
+    submit geometry 必须覆盖字体大小、内容宽度、scroll origin、viewport/surface 尺寸和 backing
+    scale；编辑、滚动、resize、DPI/字体变化、active composition、stale publication、surface
+    detach、native submit 失败或 decoration 失效都必须恢复 TextKit 绘制。该门控只能影响绘制，
+    不得替换 TextKit 的 string、selection、NSTextInputClient、IME、clipboard 或 Accessibility
+    ownership。
 
 ## CoreText viewport preparation
 

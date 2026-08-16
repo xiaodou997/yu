@@ -528,6 +528,15 @@ selection/caret；active composition、frame stale、surface detach 或 native s
 overlay 并恢复 TextKit 自绘。TextKit visual mirror 现在只作为上述失败/组合输入 fallback，完整
 visual renderer 仍未迁移。见 ADR 0136、0137。
 
+在该 sibling 与 persistent Metal surface 均稳定后，`DocumentTextView` 还使用一个更窄的
+source-glyph gate：只有当前 Revision、composition generation、字体/宽度、scroll origin、
+viewport/surface 尺寸和 backing scale 全部与最后一次成功 submit 相同，且 decoration frame
+有效时，才停止 TextKit source glyph 和 insertion point 的绘制。TextKit 仍保留 string、
+selection、NSTextInputClient、IME、复制粘贴和 Accessibility 所有权；编辑、active marked
+text、滚动或 resize 期间先继续显示 native source mirror，直到新的 Rust publication 到达
+surface。stale、detach 或 submit 失败会立即清除门控并恢复 TextKit 绘制，因此这一步是主视觉
+层验证，不是完整 visual renderer 迁移。见 ADR 0139。
+
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
 文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
 编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、
