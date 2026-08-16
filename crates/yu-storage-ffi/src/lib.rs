@@ -496,6 +496,9 @@ pub const YU_STORAGE_RENDER_PAGE_NONE: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct YuStorageVisualRenderPlanSnapshot {
     pub revision: u64,
+    /// Monotonic transient IME identity captured with this count/fill
+    /// publication. Native callers must use the same value for both calls.
+    pub composition_generation: u64,
     pub block_start: u64,
     pub block_end: u64,
     pub command_count: u64,
@@ -568,6 +571,7 @@ pub struct YuStorageVisualRenderDamage {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct YuStorageMacosRenderHostSnapshot {
     pub revision: u64,
+    pub composition_generation: u64,
     pub frame_revision: u64,
     pub surface_generation: u64,
     pub frame_serial: u64,
@@ -592,6 +596,7 @@ pub struct YuStorageMacosRenderHostSnapshot {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub revision: u64,
+    pub composition_generation: u64,
     pub surface_generation: u64,
     pub frame_serial: u64,
     pub uploaded_pages: u64,
@@ -635,6 +640,7 @@ pub struct YuStorageVisualSceneGlyph {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct YuStorageVisualSceneGlyphSnapshot {
     pub revision: u64,
+    pub composition_generation: u64,
     pub frame_revision: u64,
     pub surface_generation: u64,
     pub frame_serial: u64,
@@ -922,6 +928,28 @@ fn validate_composition(
     }
     if session.composition().is_none() {
         return Err(YU_STORAGE_NO_OVERLAY);
+    }
+    Ok(())
+}
+
+/// Validates the header returned by a count query before a native caller
+/// performs the matching fill query.  Revision alone is insufficient while
+/// marked text is active because composition updates deliberately keep the
+/// canonical Revision unchanged.  The first count query passes a zeroed
+/// header; only a non-zero array capacity is a fill operation that must match
+/// the prior header identity.
+#[cfg(target_os = "macos")]
+fn validate_visual_fill_identity(
+    session: &DocumentEditorSession,
+    expected_revision: u64,
+    prior_revision: u64,
+    prior_generation: u64,
+) -> Result<(), i32> {
+    if prior_revision != expected_revision {
+        return Err(YU_STORAGE_STALE_REVISION);
+    }
+    if prior_generation != session.composition_generation() {
+        return Err(YU_STORAGE_STALE_COMPOSITION);
     }
     Ok(())
 }
@@ -4085,6 +4113,7 @@ fn macos_render_host_config(
 #[cfg(target_os = "macos")]
 fn macos_render_host_snapshot(
     state: &MacosRenderHostState,
+    composition_generation: u64,
 ) -> Result<YuStorageMacosRenderHostSnapshot, i32> {
     let publication = state
         .builder
@@ -4101,6 +4130,7 @@ fn macos_render_host_snapshot(
     let frame_serial = state.host.frame_serial().unwrap_or(u64::MAX);
     Ok(YuStorageMacosRenderHostSnapshot {
         revision: publication.revision().get(),
+        composition_generation,
         frame_revision,
         surface_generation: state.host.surface_generation(),
         frame_serial,
@@ -4237,7 +4267,7 @@ fn macos_render_host_frame(
         .host
         .accept_publication(publication)
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-    macos_render_host_snapshot(state)
+    macos_render_host_snapshot(state, session.session.composition_generation())
 }
 
 #[cfg(target_os = "macos")]
@@ -4425,6 +4455,7 @@ fn macos_visual_scene_glyphs(
     let glyph_count = u64::try_from(glyphs.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
     let snapshot = YuStorageVisualSceneGlyphSnapshot {
         revision: host_snapshot.revision,
+        composition_generation: host_snapshot.composition_generation,
         frame_revision: host_snapshot.frame_revision,
         surface_generation: host_snapshot.surface_generation,
         frame_serial: host_snapshot.frame_serial,
@@ -4472,6 +4503,7 @@ fn macos_visual_render_plan(
     }
 
     let viewport = ViewportRect::new(scroll_y, viewport_height);
+    let composition_generation = session.session.composition_generation();
     let document = session.session.document_mut().editor_mut();
     let viewport_snapshot = document
         .visible_blocks_with_shaper(viewport, &shaper)
@@ -4615,6 +4647,7 @@ fn macos_visual_render_plan(
         u64::try_from(viewport_snapshot.range().end()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
     let snapshot = YuStorageVisualRenderPlanSnapshot {
         revision: plan.revision().get(),
+        composition_generation,
         block_start,
         block_end,
         command_count: u64::try_from(commands.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
@@ -4672,6 +4705,31 @@ pub unsafe extern "C" fn yu_storage_session_macos_visual_render_plan(
         || (damage_capacity > 0 && damage.is_null())
     {
         return YU_STORAGE_NULL_POINTER;
+    }
+    // Keep the count-query header long enough to validate the matching fill
+    // call. Composition updates do not change the canonical Revision, so a
+    // Revision-only check would permit a stale capacity/header pair.
+    let prior_snapshot = unsafe { *snapshot };
+    let is_fill = command_capacity > 0 || page_capacity > 0 || damage_capacity > 0;
+    #[cfg(not(target_os = "macos"))]
+    let _ = (prior_snapshot, is_fill);
+    #[cfg(target_os = "macos")]
+    if is_fill
+        && let Err(status) = validate_visual_fill_identity(
+            &session.session,
+            expected_revision,
+            prior_snapshot.revision,
+            prior_snapshot.composition_generation,
+        )
+    {
+        // SAFETY: output pointers were checked for null and belong to caller.
+        unsafe {
+            *snapshot = YuStorageVisualRenderPlanSnapshot::default();
+            *written_commands = 0;
+            *written_pages = 0;
+            *written_damage = 0;
+        }
+        return status;
     }
     // SAFETY: output pointers were checked for null and belong to the caller.
     unsafe {
@@ -4961,6 +5019,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
         unsafe {
             *snapshot = YuStorageMacosRenderHostSurfaceSnapshot {
                 revision: submission.revision().get(),
+                composition_generation: host_snapshot.composition_generation,
                 surface_generation: submission.surface_generation(),
                 frame_serial: submission.frame_serial(),
                 uploaded_pages: u64::try_from(submission.uploaded_pages()).unwrap_or(u64::MAX),
@@ -5025,6 +5084,25 @@ pub unsafe extern "C" fn yu_storage_session_macos_visual_scene_glyphs(
     if capacity > 0 && glyphs.is_null() {
         return YU_STORAGE_NULL_POINTER;
     }
+    let prior_snapshot = unsafe { *snapshot };
+    #[cfg(target_os = "macos")]
+    if capacity > 0
+        && let Err(status) = validate_visual_fill_identity(
+            &session.session,
+            expected_revision,
+            prior_snapshot.revision,
+            prior_snapshot.composition_generation,
+        )
+    {
+        // SAFETY: output pointers were checked for null and belong to caller.
+        unsafe {
+            *snapshot = YuStorageVisualSceneGlyphSnapshot::default();
+            *written = 0;
+        }
+        return status;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = prior_snapshot;
     // SAFETY: output pointers were checked above and belong to the caller.
     unsafe {
         *snapshot = YuStorageVisualSceneGlyphSnapshot::default();
@@ -7106,6 +7184,59 @@ mod tests {
                 && rect.height >= 0.0
         }));
 
+        let composition_start = source.find("粗体").expect("composition target");
+        let composition_start_utf16 = source[..composition_start].encode_utf16().count() as u64;
+        let composition_end_utf16 = composition_start_utf16 + "粗体".encode_utf16().count() as u64;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_begin_composition(
+                    raw,
+                    0,
+                    composition_start_utf16,
+                    composition_end_utf16,
+                    "日本🙂".as_ptr(),
+                    "日本🙂".len(),
+                    2,
+                    2,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut stale_commands = vec![YuStorageVisualRenderCommand::default(); commands.len()];
+        let mut stale_pages = vec![YuStorageVisualRenderPage::default(); pages.len()];
+        let mut stale_damage = vec![YuStorageVisualRenderDamage::default(); damage.len()];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    stale_commands.as_mut_ptr(),
+                    stale_commands.len(),
+                    stale_pages.as_mut_ptr(),
+                    stale_pages.len(),
+                    stale_damage.as_mut_ptr(),
+                    stale_damage.len(),
+                    &mut written_commands,
+                    &mut written_pages,
+                    &mut written_damage,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+        assert_eq!(snapshot, YuStorageVisualRenderPlanSnapshot::default());
+        assert_eq!(written_commands, 0);
+        assert_eq!(written_pages, 0);
+        assert_eq!(written_damage, 0);
+        assert_eq!(
+            unsafe { yu_storage_session_cancel_composition(raw, 0, 1) },
+            YU_STORAGE_OK
+        );
+
         let mut result = YuStorageCommandResult::default();
         assert_eq!(
             unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
@@ -7412,6 +7543,50 @@ mod tests {
             glyphs
                 .iter()
                 .any(|glyph| glyph.page != YU_STORAGE_RENDER_PAGE_NONE)
+        );
+
+        let composition_start = source.find("粗体").expect("composition target");
+        let composition_start_utf16 = source[..composition_start].encode_utf16().count() as u64;
+        let composition_end_utf16 = composition_start_utf16 + "粗体".encode_utf16().count() as u64;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_begin_composition(
+                    raw,
+                    0,
+                    composition_start_utf16,
+                    composition_end_utf16,
+                    "日本🙂".as_ptr(),
+                    "日本🙂".len(),
+                    2,
+                    2,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut stale_glyphs = vec![YuStorageVisualSceneGlyph::default(); glyphs.len()];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_scene_glyphs(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    0,
+                    &mut snapshot,
+                    stale_glyphs.as_mut_ptr(),
+                    stale_glyphs.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+        assert_eq!(snapshot, YuStorageVisualSceneGlyphSnapshot::default());
+        assert_eq!(written, 0);
+        assert_eq!(
+            unsafe { yu_storage_session_cancel_composition(raw, 0, 1) },
+            YU_STORAGE_OK
         );
 
         let mut result = YuStorageCommandResult::default();

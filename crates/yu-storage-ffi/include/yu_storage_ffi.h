@@ -411,6 +411,7 @@ enum {
 
 typedef struct YuStorageVisualRenderPlanSnapshot {
     uint64_t revision;
+    uint64_t composition_generation;
     uint64_t block_start;
     uint64_t block_end;
     uint64_t command_count;
@@ -468,6 +469,7 @@ typedef struct YuStorageVisualRenderDamage {
  * remain Rust-owned; this snapshot is for native lifecycle coordination. */
 typedef struct YuStorageMacosRenderHostSnapshot {
     uint64_t revision;
+    uint64_t composition_generation;
     uint64_t frame_revision;
     uint64_t surface_generation;
     uint64_t frame_serial;
@@ -487,6 +489,7 @@ typedef struct YuStorageMacosRenderHostSnapshot {
 
 typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t revision;
+    uint64_t composition_generation;
     uint64_t surface_generation;
     uint64_t frame_serial;
     uint64_t uploaded_pages;
@@ -520,6 +523,7 @@ typedef struct YuStorageVisualSceneGlyph {
 
 typedef struct YuStorageVisualSceneGlyphSnapshot {
     uint64_t revision;
+    uint64_t composition_generation;
     uint64_t frame_revision;
     uint64_t surface_generation;
     uint64_t frame_serial;
