@@ -3305,9 +3305,29 @@ private enum BridgeError: LocalizedError {
 private final class MacosSurfaceHostView: NSView {
     var onWindowStateChange: ((Bool) -> Void)?
     var onGeometryChange: (() -> Void)?
+    private(set) var nativeContentVisible = false
+
+    /// The Rust surface is a visual projection only. Keep AppKit input,
+    /// selection and scrolling on the TextKit mirror underneath it.
+    func setNativeContentVisible(_ visible: Bool) {
+        if nativeContentVisible == visible {
+            // NSView defaults to visible before the first successful submit;
+            // keep the fallback state deterministic even on the first bind.
+            isHidden = !visible
+            return
+        }
+        nativeContentVisible = visible
+        isHidden = !visible
+    }
+
+    /// Let hit testing continue to the source TextKit view below the overlay.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         if newWindow == nil {
+            setNativeContentVisible(false)
             onWindowStateChange?(false)
         }
         super.viewWillMove(toWindow: newWindow)
@@ -3315,6 +3335,9 @@ private final class MacosSurfaceHostView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if window == nil {
+            setNativeContentVisible(false)
+        }
         onWindowStateChange?(window != nil)
         onGeometryChange?()
     }
@@ -3356,7 +3379,7 @@ private final class MacosSurfaceHostCoordinator {
     }
 
     private let bridge: StorageBridge
-    private weak var surfaceView: NSView?
+    private weak var surfaceView: MacosSurfaceHostView?
     private weak var scrollView: NSScrollView?
     private var fontSize: CGFloat
     private var metrics: Metrics?
@@ -3374,7 +3397,7 @@ private final class MacosSurfaceHostCoordinator {
     }
 
     func bind(
-        surfaceView: NSView,
+        surfaceView: MacosSurfaceHostView,
         scrollView: NSScrollView,
         fontSize: CGFloat
     ) {
@@ -3389,6 +3412,7 @@ private final class MacosSurfaceHostCoordinator {
         lastSubmitKey = nil
         lastSnapshot = nil
         isAttached = false
+        surfaceView.setNativeContentVisible(false)
     }
 
     func setFontSize(_ fontSize: CGFloat) {
@@ -3410,6 +3434,7 @@ private final class MacosSurfaceHostCoordinator {
             do {
                 _ = try self.submitNow()
             } catch {
+                self.surfaceView?.setNativeContentVisible(false)
                 self.onError?(error)
             }
         }
@@ -3445,6 +3470,7 @@ private final class MacosSurfaceHostCoordinator {
             scale: Double(scale)
         )
         if isAttached, key == lastSubmitKey {
+            surfaceView.setNativeContentVisible(true)
             return lastSnapshot
         }
 
@@ -3468,6 +3494,7 @@ private final class MacosSurfaceHostCoordinator {
         isAttached = true
         lastSubmitKey = key
         lastSnapshot = snapshot
+        surfaceView.setNativeContentVisible(true)
         return snapshot
     }
 
@@ -3485,6 +3512,7 @@ private final class MacosSurfaceHostCoordinator {
         lastSubmitKey = nil
         lastSnapshot = nil
         metrics = nil
+        surfaceView?.setNativeContentVisible(false)
     }
 
     private func ensureMetrics(
@@ -3571,6 +3599,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private var externalCheckWorkItem: DispatchWorkItem?
     private var promptedExternalDisk: DiskState?
     private var surfaceBoundsObserver: NSObjectProtocol?
+    private weak var documentScrollView: NSScrollView?
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
@@ -3602,8 +3631,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
-        surfaceHostView.translatesAutoresizingMaskIntoConstraints = false
+        surfaceHostView.translatesAutoresizingMaskIntoConstraints = true
+        surfaceHostView.autoresizingMask = []
         surfaceHostView.setAccessibilityElement(false)
+        documentScrollView = scrollView
 
         textView.isEditable = true
         textView.isSelectable = true
@@ -3671,18 +3702,14 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         toolbar.addArrangedSubview(reloadButton)
         toolbar.addArrangedSubview(statusLabel)
 
-        // The native surface host stays behind the source TextKit mirror. It
-        // participates in the real window lifecycle and receives drawable/
-        // resize/scroll submissions, but it does not replace what the user
-        // currently sees or create a second document model.
-        root.addSubview(surfaceHostView)
         root.addSubview(toolbar)
         root.addSubview(scrollView)
+        // The Rust surface is a visual projection above the TextKit mirror.
+        // Its hitTest returns nil, so keyboard, IME, selection and scrolling
+        // remain owned by the source view underneath it. The frame is synced
+        // to the clip viewport in viewDidLayout, excluding native scrollers.
+        root.addSubview(surfaceHostView, positioned: .above, relativeTo: scrollView)
         NSLayoutConstraint.activate([
-            surfaceHostView.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
-            surfaceHostView.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
-            surfaceHostView.topAnchor.constraint(equalTo: scrollView.topAnchor),
-            surfaceHostView.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
             toolbar.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
@@ -3694,6 +3721,16 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         view = root
         startFileWatcher()
         updateStatus()
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        guard let scrollView = documentScrollView else { return }
+        let viewportFrame = view.convert(scrollView.contentView.frame, from: scrollView)
+        if surfaceHostView.frame != viewportFrame {
+            surfaceHostView.frame = viewportFrame
+        }
+        surfaceCoordinator.scheduleSubmit()
     }
 
     func refreshFromRust() {
@@ -5409,6 +5446,7 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
             scrollView: scrollView,
             fontSize: 14.0
         )
+        precondition(surfaceView.isHidden)
         surfaceView.onWindowStateChange = { attached in
             if attached {
                 coordinator.scheduleSubmit()
@@ -5439,6 +5477,8 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         precondition(first.surfaceGeneration == 0)
         precondition(first.submitted)
         precondition(coordinator.isAttached)
+        precondition(surfaceView.nativeContentVisible)
+        precondition(surfaceView.hitTest(NSPoint(x: 12.0, y: 12.0)) == nil)
 
         let resizedFrame = NSRect(x: 0.0, y: 0.0, width: 540.0, height: 280.0)
         root.setFrameSize(resizedFrame.size)
@@ -5465,6 +5505,7 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
 
         surfaceView.removeFromSuperview()
         precondition(!coordinator.isAttached)
+        precondition(!surfaceView.nativeContentVisible)
         coordinator.detach()
         precondition(errors.isEmpty, errors.joined(separator: "; "))
         print(

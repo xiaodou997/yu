@@ -4,8 +4,8 @@
 
 在不复制 Markdown source、selection、IME 或 history 的前提下，把 Rust 的 source-backed
 projection、layout 和 hit-testing 接入 macOS native editor。阶段初期只建立 Revision-bound
-FFI 与诊断边界，待 source↔visual↔point 映射稳定后再替换真实 TextKit mirror，最后才进入
-retained scene/GPU 绘制。
+FFI 与诊断边界；当前已进入最小可见 RenderPlan overlay，但 TextKit 仍保留为输入、IME、
+Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍需后续逐步替换。
 
 ## Track A：Projection bridge
 
@@ -45,7 +45,8 @@ retained scene/GPU 绘制。
 - [x] product `NSView` surface lifecycle coordinator 接入 attach/layout/resize/scroll/edit/close，空文档通过 CoreText metrics FFI 初始化 viewport（source TextKit mirror 仍可见）
 - [x] macOS document host 诊断桥持有 persistent CoreText/atlas/publication host；编辑、scroll、resize 的 frame serial、surface generation 和 stale Revision self-check
 - [x] macOS native GPU surface 在 ignored AppKit probe 中消费 Rust-owned CoreText workspace publication（生产窗口仍保留 source mirror）
-- [ ] heading、emphasis、code、link 的最小真实 visual render
+- [x] heading、emphasis、code、link 的最小真实 visual render 通过产品窗口 persistent Metal
+  surface 可见提交；TextKit 仍保留为透明 overlay 下的输入/AX/回退表面
 
 ## 约束
 

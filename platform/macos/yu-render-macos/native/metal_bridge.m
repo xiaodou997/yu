@@ -115,6 +115,11 @@ int yu_metal_create_layer(
     layer.device = (id<MTLDevice>)device_ptr;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     layer.framebufferOnly = YES;
+    // The product keeps a TextKit source mirror underneath this projection.
+    // Transparent untouched pixels let that mirror remain the input and
+    // accessibility fallback while Rust contributes only its glyph coverage.
+    layer.opaque = NO;
+    layer.backgroundColor = NSColor.clearColor.CGColor;
     layer.contentsScale = scale;
     layer.drawableSize = CGSizeMake(pixel_width, pixel_height);
     *out_layer = (void *)layer;

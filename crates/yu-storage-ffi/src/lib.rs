@@ -4343,19 +4343,20 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
 }
 
 /// Submits the persistent host publication to a real AppKit-backed
-/// `CAMetalLayer`. This is an opt-in diagnostic bridge for the native shell;
-/// the caller supplies an existing `NSView` pointer and must invoke the
-/// synchronous call on the AppKit main thread. Rust lazily creates and then
-/// retains the backend-owned surface/renderer/atlas for the same view, while
-/// the CoreText publication and host Revision remain persistent on the storage
-/// session.
+/// `CAMetalLayer`. The native shell supplies an existing `NSView` pointer and
+/// must invoke the synchronous call on the AppKit main thread. Rust lazily
+/// creates and then retains the backend-owned surface/renderer/atlas for the
+/// same view, while the CoreText publication and host Revision remain
+/// persistent on the storage session. The product currently uses the surface
+/// as a transparent visual overlay; TextKit remains the input/IME/AX fallback
+/// and is not replaced by this bridge.
 ///
 /// The first surface starts at generation zero. A changed surface config
 /// resizes that same layer, advances its generation, and lets the host session
 /// force the next frame through a full clear. Call
 /// `yu_storage_session_macos_render_host_surface_detach` on the AppKit main
 /// thread when the view is closing. This bridge remains opt-in and does not
-/// switch the production TextKit mirror.
+/// remove or replace the production TextKit mirror.
 ///
 /// # Safety
 /// `session` must be a live handle, `view` must be a valid main-thread-owned
