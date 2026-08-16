@@ -469,6 +469,13 @@ view attachment、Metal device、renderer、atlas、target 和 command queue 都
 generation 并触发下一帧 full clear。该入口由 `--macos-render-host-surface-self-check` 显式触发，不是
 可视化演示模式，也不改变生产 TextKit source mirror。见 ADR 0122、0123。
 
+当前 document-host 的产品窗口已经增加一个置于 source TextKit mirror 后方的
+`MacosSurfaceHostView` 和 `MacosSurfaceHostCoordinator`。它们只把 AppKit attach/layout/resize、
+scroll、编辑 Revision 和 close 生命周期安排成上述 surface submit；同一 geometry/Revision 不会
+重复提交，离开 window 前一定 detach。空文档使用 `yu_storage_session_macos_font_metrics` 配置
+CoreText viewport。该 adapter 仍不替换用户可见的 source TextKit mirror，也不让 Swift 拥有
+Markdown、layout、scene 或 Metal handle。见 ADR 0124。
+
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
 文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
 编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、

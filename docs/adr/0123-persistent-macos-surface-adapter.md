@@ -32,9 +32,8 @@ ADR 0122 用同步调用验证了 storage FFI 到真实 `CAMetalLayer` drawable 
 
 document-host self-check 现在覆盖：首次真实 drawable submit、同 Revision 重复提交、atlas upload
 复用、surface resize/generation、编辑后的 stale Revision、新 Revision 提交以及显式 detach。
-生产窗口仍未接入该 adapter；下一步可以在产品 NSView 的生命周期中拥有同一 state，并把窗口
-resize、scroll、close 事件映射到该协议，而不改变 TextKit source mirror、IME、Accessibility 或
-canonical source ownership。
+产品窗口的 `NSView` lifecycle 接入由 ADR 0124 完成；用户可见表面仍是 source TextKit mirror，
+正式 visual renderer 尚未替换它。IME、Accessibility 和 canonical source ownership 不受影响。
 
 ## 验证
 

@@ -434,6 +434,14 @@
     实例之间保持稳定；layout cache 可以把 face id 交给后续新建的 rasterizer，不能依赖清空 layout
     state 来修复 shaper identity。Face catalog 只保存 Rust-owned PostScript name metadata，不得
     把 `CTFontRef` 或 native pointer 写入 shared editor/layout state。
+24. `yu_storage_session_macos_font_metrics` 返回的 metrics 必须通过 expected Revision，并且 size、
+    line height、default advance 都必须是有限正数；它不依赖 parser block，空 Markdown 也必须能用
+    它初始化 viewport。stale Revision 必须清空输出并拒绝后续 viewport configuration。
+25. `MacosSurfaceHostView`/`MacosSurfaceHostCoordinator` 只能在 AppKit main thread 把 window、layout、
+    scroll、edit Revision 和 close 事件映射到 persistent surface submit；同一 Revision/geometry/scale
+    submit key 不得重复提交，view 离开 window、window close 或 controller 销毁前必须幂等 detach。
+    surface host 是 source TextKit mirror 的 sibling，不得拥有 Markdown source、selection、IME、
+    accessibility semantic nodes 或 native GPU handle。
 
 ## CoreText viewport preparation
 

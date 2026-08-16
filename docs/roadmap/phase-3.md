@@ -42,6 +42,7 @@ retained scene/GPU 绘制。
 - [x] persistent macOS host 通过 count/fill ABI 暴露 Revision-bound retained glyph primitives（含 atlas placement、metrics、bounds 与 source block range；生产 view 仍未切换）
 - [x] macOS document host opt-in surface-submit self-check 使用临时 AppKit `NSView` 完成 `CAMetalLayer` attachment、drawable、atlas upload 与真实 Metal submit（生产窗口仍保留 source mirror）
 - [x] persistent native surface adapter 复用同一 view 的 Metal surface/renderer/atlas，覆盖重复提交、resize generation、显式 detach 与 stale Revision（生产窗口仍未切换）
+- [x] product `NSView` surface lifecycle coordinator 接入 attach/layout/resize/scroll/edit/close，空文档通过 CoreText metrics FFI 初始化 viewport（source TextKit mirror 仍可见）
 - [x] macOS document host 诊断桥持有 persistent CoreText/atlas/publication host；编辑、scroll、resize 的 frame serial、surface generation 和 stale Revision self-check
 - [x] macOS native GPU surface 在 ignored AppKit probe 中消费 Rust-owned CoreText workspace publication（生产窗口仍保留 source mirror）
 - [ ] heading、emphasis、code、link 的最小真实 visual render

@@ -175,7 +175,7 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 ```
 
 这个 self-check 只返回 lifecycle scalar；它不启动可视化演示模式，也不替换生产 TextKit source
-mirror。完整 native visual view/Metal submit 会在后续阶段接入。
+mirror。产品窗口的 native surface lifecycle 已接入，但正式 visual renderer 仍在后续阶段。
 
 验证真实 AppKit `NSView` → `CAMetalLayer` attachment、drawable acquisition、atlas upload、
 retained target blit/present 和 stale Revision 拒绝（显式测试命令，会短暂创建并关闭临时窗口）：
@@ -189,6 +189,19 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 atlas、Metal target 和 attachment，重复提交应复用 atlas upload，surface 尺寸变化会推进 generation，
 结束前显式 detach。它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
 
+验证产品 document-host 窗口中的 `NSView` lifecycle coordinator。它会在真实 AppKit window 中把
+attach、layout/resize、scroll、编辑 Revision 和 close detach 映射到同一个 Rust surface session；
+surface view 位于 source TextKit mirror 后方，因此不会开启第二套可见文档模型：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --macos-render-host-lifecycle-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+生命周期 coordinator 使用 `yu_storage_session_macos_font_metrics`，所以空 Markdown 没有 parser
+block 时也可以初始化 CoreText viewport；metrics、surface submit 和 detach 仍受 Revision/main-thread
+契约约束。正式 heading/emphasis/code/link visual renderer 尚未替换 source TextKit mirror。
+
 验证 persistent host 从 retained scene 导出的 glyph primitive count/fill、atlas placement、
 source block range、block 顺序、几何有限性以及编辑后的 stale Revision 拒绝（不启动窗口）：
 
@@ -199,7 +212,7 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 
 该自检只缓存 Rust 返回的 owned glyph metadata；atlas 像素、CoreText/layout/scene 对象和 Metal
 handle 不穿过 FFI。当前 source range 是所属 block 的 UTF-16 范围，因此同一 block 的多个 glyph
-可以共享该范围；生产窗口仍使用 source TextKit mirror，真实 Metal surface submit 属于后续阶段。
+可以共享该范围；生产窗口仍使用 source TextKit mirror，native surface lifecycle 已在其后方运行。
 
 验证 marked-text composition 的 transient projection、visual selection、active caret 与
 Revision/generation 生命周期（不启动窗口）：
