@@ -664,5 +664,8 @@ UTF-16 ranges、kind 和 resource fingerprint，native 可以用已有 source-ra
 只把 owned RGBA8 bytes 带回 Rust；`MetalImageAtlas` 负责按 publication generation 上传
 backend-owned `MTLPixelFormatRGBA8Unorm` texture。Scene/RenderPlan 通过 opaque resource
 fingerprint 携带 `Image` command；Metal 侧没有 ready texture 时绘制 command 自带的 fallback
-rectangle，不阻塞编辑线程。该资源级纵向切片尚未把图片自动插入现有 block layout，因此产品窗口
-仍不会因为这次改动突然显示图片；下一步再定义 image placement/hit-test。见 ADR 0141、0142。
+rectangle，不阻塞编辑线程。`yu-layout` 现在把每个 image 的 source/alt/visual ranges 投影为
+`ImagePlacement`，`yu-workspace` 将其转换为 document-space `ImagePrimitive`，并在 glyph 之后
+按 painter order 进入 Scene/RenderPlan；layout hit-test 命中图片时返回完整 source range，FFI
+同时以 UTF-16 返回该 range。资源未 ready 时仍只显示 placeholder，实际产品 host 的 ImageIO
+worker/`MetalImageAtlas` publication wiring 仍是后续工作。见 ADR 0141、0142、0143。

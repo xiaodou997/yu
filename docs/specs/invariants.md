@@ -549,3 +549,13 @@
    image ranges；inline/reference kind、resolved destination range 和 resource fingerprint 必须
    一致，count/fill 容量不足或 stale Revision 不得写入部分数组。该 ABI 只发布 source metadata，
    不得把 decoded bytes、ImageIO 对象或 Metal texture 当作已完成的 visual render。
+
+10. `ImagePlacement` 的 source、alt-label 和 visual ranges 必须来自同一 Revision 的
+    `Projection::images()`；layout 只能测量 placement 几何，不能复制 destination 字符串或把
+    decoded pixels 写入 editor/source state。
+11. image placement 的 bounds 必须是有限、非负的 document-space 几何，并在 Scene 中位于对应
+    block glyph 之后；资源未 ready 时必须保留 opaque resource fingerprint 和 fallback，而不能
+    阻塞编辑线程或发布半成品 texture。
+12. `LayoutHit::image()` 非空时必须返回完整 image source range；metrics/CoreText FFI hit-test
+    必须将该 range 编码为同一 Revision 的 UTF-16 起止值，普通文字命中使用
+    `YU_STORAGE_IMAGE_DESTINATION_NONE` sentinel。命中映射不得让 native host 重新解析 Markdown。

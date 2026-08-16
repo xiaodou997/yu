@@ -23,8 +23,9 @@ Accepted（Phase 3 Track C）
 5. Scene/RenderPlan 新增 `ImagePrimitive`/`RenderCommand::Image`，只携带 opaque resource id、
    bounds 和 fallback color。native command 在 resource 尚未 ready 时降级为 FillRect；ready 时
    由独立 image texture binding 进入 `yu_image_fragment`，编辑线程不等待 ImageIO。
-6. 本 ADR 只完成资源级协议和 Metal 消费路径，不自动为 Markdown image 生成 block layout、
-   selection/hit-test 或产品 UI placement；这些需要下一份 ADR 明确几何和 source mapping。
+6. 本 ADR 只完成资源级协议和 Metal 消费路径；source-backed image placement、Scene/RenderPlan
+   overlay 与 hit-test 映射由 ADR 0143 定义。实际产品 host 将 ImagePublication 交给
+   `MetalImageAtlas` 的持久 wiring 仍独立推进。
 
 ## 结果
 
@@ -32,7 +33,9 @@ Accepted（Phase 3 Track C）
   的 ownership 边界。
 - RenderPlan 可以稳定表示“ready image”与“暂未 ready 的 placeholder”，设备重建只需清空
   `MetalImageAtlas`，不影响 parser/layout/editor。
-- 当前产品窗口仍不会自动显示 Markdown 图片，这是刻意保留的 placement 边界，而不是遗漏。
+- layout/scene 现在可以稳定表达 source-backed image overlay；当前产品窗口仍可能因为持久
+  host 尚未接入 image publication 而显示 fallback，这是资源 ready wiring 的边界，而不是
+  parser/layout 丢失图片。
 
 ## 验证
 

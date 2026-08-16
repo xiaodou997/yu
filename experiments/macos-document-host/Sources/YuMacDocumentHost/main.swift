@@ -169,6 +169,7 @@ private struct NativeProjectionHit {
     let sourceUTF16: UInt64
     let visualUTF16: UInt64
     let roundTripSourceUTF16: UInt64
+    let imageSourceRange: NSRange?
     let line: UInt64
     let point: CGPoint
     let affinity: UInt8
@@ -178,6 +179,15 @@ private struct NativeProjectionHit {
         sourceUTF16 = value.source_utf16
         visualUTF16 = value.visual_utf16
         roundTripSourceUTF16 = value.round_trip_source_utf16
+        if value.image_source_start_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE
+            || value.image_source_end_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE {
+            imageSourceRange = nil
+        } else {
+            imageSourceRange = NSRange(
+                location: Int(value.image_source_start_utf16),
+                length: Int(value.image_source_end_utf16 - value.image_source_start_utf16)
+            )
+        }
         line = value.line
         point = CGPoint(x: CGFloat(value.x), y: CGFloat(value.y))
         affinity = value.affinity
@@ -652,6 +662,7 @@ private struct NativeVisualRenderCommand {
     let advanceX: CGFloat
     let bounds: CGRect
     let colorRGBA: UInt32
+    let resource: UInt64
 
     init(_ value: YuStorageVisualRenderCommand) {
         revision = value.revision
@@ -679,6 +690,7 @@ private struct NativeVisualRenderCommand {
             height: CGFloat(value.bounds_height)
         )
         colorRGBA = value.color_rgba
+        resource = value.resource
     }
 }
 
@@ -6695,12 +6707,15 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
         precondition(snapshot.blockRange.count > 0)
         precondition(abs(snapshot.viewportWidth - CGFloat(maxWidth)) < 0.01)
 
+        let expectsImage = bridge.source.contains("![")
         var previousBlock: UInt64?
         var previousSourceEnd: Int = 0
         var sawFill = false
         var sawGlyph = false
+        var sawImage = false
         let fillKind = UInt8(YU_STORAGE_RENDER_COMMAND_FILL_RECT)
         let glyphKind = UInt8(YU_STORAGE_RENDER_COMMAND_GLYPH)
+        let imageKind = UInt8(YU_STORAGE_RENDER_COMMAND_IMAGE)
         for command in commands {
             precondition(command.revision == revision)
             precondition(command.bounds.origin.x.isFinite)
@@ -6718,6 +6733,12 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
                 sawGlyph = true
                 precondition(command.advanceX.isFinite && command.advanceX >= 0.0)
                 precondition(command.atlasRect.width >= 0.0 && command.atlasRect.height >= 0.0)
+            case imageKind:
+                sawImage = true
+                precondition(command.page == YU_STORAGE_RENDER_PAGE_NONE)
+                precondition(command.atlasRect.width == 0.0 && command.atlasRect.height == 0.0)
+                precondition(command.resource != 0)
+                precondition(command.bounds.width > 0.0 && command.bounds.height > 0.0)
             default:
                 preconditionFailure("unknown visual render command kind")
             }
@@ -6735,6 +6756,7 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
         }
         precondition(sawFill)
         precondition(sawGlyph)
+        precondition(!expectsImage || sawImage)
 
         precondition(pages.dropFirst().enumerated().allSatisfy { offset, page in
             page.page > pages[offset].page

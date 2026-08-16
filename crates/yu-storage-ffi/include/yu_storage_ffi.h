@@ -235,6 +235,10 @@ typedef struct YuStorageProjectionHit {
     uint64_t source_utf16;
     uint64_t visual_utf16;
     uint64_t round_trip_source_utf16;
+    /* Complete Markdown image source range, or
+     * YU_STORAGE_IMAGE_DESTINATION_NONE for a regular text hit. */
+    uint64_t image_source_start_utf16;
+    uint64_t image_source_end_utf16;
     uint64_t line;
     float x;
     float y;

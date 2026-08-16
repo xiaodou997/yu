@@ -274,6 +274,11 @@ pub struct YuStorageProjectionHit {
     pub source_utf16: u64,
     pub visual_utf16: u64,
     pub round_trip_source_utf16: u64,
+    /// Complete Markdown image source range when the hit landed on an image
+    /// placement; both fields are `YU_STORAGE_IMAGE_DESTINATION_NONE` for a
+    /// regular text hit.
+    pub image_source_start_utf16: u64,
+    pub image_source_end_utf16: u64,
     pub line: u64,
     pub x: f32,
     pub y: f32,
@@ -3038,6 +3043,11 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
         Ok(offset) => offset.get(),
         Err(_) => return YU_STORAGE_INVALID_SELECTION,
     };
+    let (image_source_start_utf16, image_source_end_utf16) =
+        match image_utf16_range(&snapshot, hit.image()) {
+            Ok(range) => range,
+            Err(status) => return status,
+        };
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe {
         *output = YuStorageProjectionHit {
@@ -3045,6 +3055,8 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
             source_utf16,
             visual_utf16,
             round_trip_source_utf16,
+            image_source_start_utf16,
+            image_source_end_utf16,
             line: hit.line() as u64,
             x: hit.point().x(),
             y: hit.point().y(),
@@ -3216,6 +3228,11 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
             Ok(offset) => offset.get(),
             Err(_) => return YU_STORAGE_INVALID_SELECTION,
         };
+        let (image_source_start_utf16, image_source_end_utf16) =
+            match image_utf16_range(&source, hit.image()) {
+                Ok(range) => range,
+                Err(status) => return status,
+            };
         let point = hit.point();
         let document_y = block.y() + point.y();
         if !point.x().is_finite() || !document_y.is_finite() {
@@ -3229,6 +3246,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
                 source_utf16,
                 visual_utf16,
                 round_trip_source_utf16,
+                image_source_start_utf16,
+                image_source_end_utf16,
                 line: line_base.saturating_add(hit.line() as u64),
                 x: point.x(),
                 y: document_y,
@@ -4815,7 +4834,6 @@ fn macos_visual_scene(
     Ok((snapshot, primitives))
 }
 
-#[cfg(target_os = "macos")]
 fn image_utf16_range(source: &TextSnapshot, range: Option<TextRange>) -> Result<(u64, u64), i32> {
     let Some(range) = range else {
         return Ok((
@@ -4849,6 +4867,41 @@ fn image_destination(
 }
 
 #[cfg(target_os = "macos")]
+fn image_resource_key(
+    source: &TextSnapshot,
+    image: ImageSource,
+    definitions: &yu_markdown::ReferenceDefinitionIndex,
+) -> Option<ImageKey> {
+    let destination = image_destination(source, image, definitions)?;
+    let start = usize::try_from(destination.start().get()).ok()?;
+    let end = usize::try_from(destination.end().get()).ok()?;
+    let destination = source.as_str().get(start..end)?;
+    ImageKey::new(destination.to_owned()).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn renderable_image_count(
+    source: &TextSnapshot,
+    layout: &LayoutSnapshot,
+    definitions: &yu_markdown::ReferenceDefinitionIndex,
+) -> usize {
+    layout
+        .images()
+        .iter()
+        .filter(|placement| {
+            layout
+                .projection()
+                .images()
+                .iter()
+                .copied()
+                .find(|image| image.source() == placement.source())
+                .and_then(|image| image_resource_key(source, image, definitions))
+                .is_some()
+        })
+        .count()
+}
+
+#[cfg(target_os = "macos")]
 fn macos_visual_images(
     session: &mut YuStorageSession,
     expected_revision: u64,
@@ -4878,15 +4931,8 @@ fn macos_visual_images(
                 image_utf16_range(&source, destination)?;
             let (reference_start_utf16, reference_end_utf16) =
                 image_utf16_range(&source, image.reference())?;
-            let resource_fingerprint = destination
-                .and_then(|range| {
-                    let start = usize::try_from(range.start().get()).ok()?;
-                    let end = usize::try_from(range.end().get()).ok()?;
-                    let text = source.as_str().get(start..end)?;
-                    ImageKey::new(text.to_owned())
-                        .ok()
-                        .map(|key| key.fingerprint())
-                })
+            let resource_fingerprint = image_resource_key(&source, image, &definitions)
+                .map(|key| key.fingerprint())
                 .unwrap_or(0);
             encoded.push(YuStorageVisualImage {
                 revision: source.revision().get(),
@@ -5365,6 +5411,7 @@ fn macos_visual_render_plan(
     };
     let source = document.snapshot();
     let config = document.viewport_config().layout();
+    let definitions = document.markdown().reference_definitions().clone();
     let rasterizer = shaper.rasterizer();
     let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::default());
     let mut block_glyphs = Vec::with_capacity(viewport_snapshot.blocks().len());
@@ -5398,6 +5445,7 @@ fn macos_visual_render_plan(
             block.index(),
             block.source(),
             layout.glyphs().len(),
+            renderable_image_count(&source, &layout, &definitions),
             viewport_block_background(block.kind()),
         ));
     }
@@ -5426,7 +5474,7 @@ fn macos_visual_render_plan(
     }
 
     let mut block_metadata = Vec::new();
-    for (block_index, source_range, glyph_count, background) in block_glyphs {
+    for (block_index, source_range, glyph_count, image_count, background) in block_glyphs {
         let source_start_utf16 = source
             .utf16_offset(source_range.start())
             .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
@@ -5451,6 +5499,15 @@ fn macos_visual_render_plan(
                 source_end_utf16,
             ),
             glyph_count,
+        ));
+        block_metadata.extend(std::iter::repeat_n(
+            (
+                YU_STORAGE_RENDER_COMMAND_IMAGE,
+                block_index,
+                source_start_utf16,
+                source_end_utf16,
+            ),
+            image_count,
         ));
     }
     if block_metadata.len() != plan.commands().len() {
@@ -7272,6 +7329,14 @@ mod tests {
         assert_eq!(hit.source_utf16, source_start_utf16);
         assert_eq!(hit.visual_utf16, 7);
         assert_eq!(hit.round_trip_source_utf16, source_start_utf16);
+        assert_eq!(
+            hit.image_source_start_utf16,
+            YU_STORAGE_IMAGE_DESTINATION_NONE
+        );
+        assert_eq!(
+            hit.image_source_end_utf16,
+            YU_STORAGE_IMAGE_DESTINATION_NONE
+        );
         assert_eq!(hit.line, 0);
         assert_eq!(hit.x, 7.0);
         assert_eq!(hit.y, 0.0);
@@ -7318,6 +7383,39 @@ mod tests {
             },
             YU_STORAGE_STALE_REVISION
         );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_projection_hit_test_exposes_image_source_range() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-image-hit-test-{id}.md"));
+        let source = "![alt](image.png)";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut hit = YuStorageProjectionHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_hit_test(raw, 0, 1.0, 0.0, 80.0, 10.0, 1.0, &mut hit)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(hit.revision, 0);
+        assert_eq!(hit.image_source_start_utf16, 0);
+        assert_eq!(
+            hit.image_source_end_utf16,
+            source.encode_utf16().count() as u64
+        );
+        assert_eq!(hit.source_utf16, 0);
+        assert_eq!(hit.visual_utf16, 0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

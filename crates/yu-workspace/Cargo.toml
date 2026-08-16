@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 yu-core = { path = "../yu-core" }
+yu-assets = { path = "../yu-assets" }
 yu-editor = { path = "../yu-editor" }
 yu-font = { path = "../yu-font" }
 yu-render = { path = "../yu-render" }

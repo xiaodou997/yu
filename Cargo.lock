@@ -192,6 +192,8 @@ dependencies = [
  "yu-core",
  "yu-font",
  "yu-layout",
+ "yu-projection",
+ "yu-text",
 ]
 
 [[package]]
@@ -240,6 +242,7 @@ dependencies = [
 name = "yu-workspace"
 version = "0.1.0"
 dependencies = [
+ "yu-assets",
  "yu-core",
  "yu-editor",
  "yu-font",
