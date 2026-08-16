@@ -24,7 +24,8 @@
   rotor 只查询当前 child tree；链接 destination 只暴露 `accessibilityURL`，task checkbox press 回到
   Rust `toggle_task` Transaction；macOS VoiceOver 真实朗读已由人工确认通过；Rotor/语义 action
   的跨平台回归仍属于后续工作；
-- 不包含 Markdown visual projection、最终渲染或 workspace/tab。
+- 当前包含最小 Rust glyph overlay、visual pointer/caret 映射和 TextKit 回退；仍不包含完整
+  Markdown delimiter reveal、最终 selection 绘制、IME visual overlay 或 workspace/tab。
 
 构建并运行：
 
@@ -98,7 +99,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 ```
 
 该自检使用 Rust 返回的 visual selection 和 projection-local point，不在 Swift 重建 Markdown delimiter
-或布局；stale Revision 会被拒绝，命中结果只携带 layout-local 坐标，尚未接入生产 TextKit mirror。
+或布局；stale Revision 会被拒绝，命中结果只携带 layout-local 坐标。生产 pointer adapter 会
+复用同一 Revision-bound reverse mapping，失败时回到 source hit-test。
 
 验证 TextKit 过渡镜像接收 Rust projected UTF-8，并通过 Rust reverse mapping 完成 visual/source
 selection、caret 双向 round-trip 与 stale Revision 拒绝（不启动窗口）：
@@ -109,8 +111,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 ```
 
 该自检中的 `NSTextStorage`/`NSLayoutManager` 只是一份可丢弃的 visual view cache，并会经过
-`DocumentTextView` 的 opt-in pointer adapter 验证点击/拖选结果回到 Rust source selection；生产窗口
-默认仍使用 canonical source mirror，尚未改变 IME、复制粘贴或 Accessibility 路径。
+`DocumentTextView` 的 pointer adapter 验证点击/拖选结果回到 Rust source selection；生产窗口在
+布局完成后启用同一 adapter，仍由 canonical source mirror 接收 IME、复制粘贴和 Accessibility。
 
 验证 parser-owned block 的 metrics layout、macOS CoreText shaped layout 与 block-local caret（不启动窗口）：
 
