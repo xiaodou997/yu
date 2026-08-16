@@ -24,9 +24,9 @@
   rotor 只查询当前 child tree；链接 destination 只暴露 `accessibilityURL`，task checkbox press 回到
   Rust `toggle_task` Transaction；macOS VoiceOver 真实朗读已由人工确认通过；Rotor/语义 action
   的跨平台回归仍属于后续工作；
-- 当前包含最小 Rust glyph overlay、visual pointer/caret 映射、projected selection highlight、
-  Revision-bound caret reveal、CoreText shaped vertical command 和 TextKit 回退；仍不包含完整
-  Markdown delimiter reveal、最终 shaped Metal hit-test、visual IME overlay 或 workspace/tab。
+- 当前包含最小 Rust glyph overlay、CoreText-shaped Rust visual pointer/caret 映射、projected
+  selection highlight、Revision-bound caret reveal、CoreText shaped vertical command 和 TextKit
+  回退；仍不包含完整 Markdown delimiter reveal、shaped visual IME renderer 或 workspace/tab。
 
 构建并运行：
 
@@ -103,6 +103,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 或布局；stale Revision 会被拒绝，命中结果只携带 layout-local 坐标。生产 pointer adapter 会
 复用同一 Revision-bound reverse mapping，失败时回到 source hit-test。
 
+验证生产 pointer adapter 使用 CoreText-shaped Rust block layout 做 point→visual→source 命中（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --shaped-projection-hit-test-self-check experiments/macos-document-host/Fixtures/projection.md
+```
+
+该自检先发布同一字体/宽度的 viewport metrics，再用 Rust shaped endpoint 命中 document-space
+原点并检查 source/visual round-trip；stale Revision 必须拒绝。生产 TextKit mirror 仍只负责
+输入、IME、Accessibility、caret/selection 矩形和 source hit-test 回退。
+
 验证 TextKit 过渡镜像接收 Rust projected UTF-8，并通过 Rust reverse mapping 完成 visual/source
 selection、caret 双向 round-trip 与 stale Revision 拒绝（不启动窗口）：
 
@@ -111,9 +122,9 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
   --visual-mirror-self-check experiments/macos-document-host/Fixtures/projection.md
 ```
 
-该自检中的 `NSTextStorage`/`NSLayoutManager` 只是一份可丢弃的 visual view cache，并会经过
-`DocumentTextView` 的 pointer adapter 验证点击/拖选结果回到 Rust source selection；生产窗口在
-布局完成后启用同一 adapter，仍由 canonical source mirror 接收 IME、复制粘贴和 Accessibility。
+该自检中的 `NSTextStorage`/`NSLayoutManager` 只是一份可丢弃的 visual view cache，用于验证
+caret/selection 矩形和 reverse mapping；生产窗口的点击/拖选由上面的 CoreText-shaped Rust
+endpoint 命中，仍由 canonical source mirror 接收 IME、复制粘贴和 Accessibility。
 
 验证 parser-owned block 的 metrics layout、macOS CoreText shaped layout 与 block-local caret（不启动窗口）：
 

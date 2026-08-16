@@ -2783,6 +2783,174 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
     YU_STORAGE_OK
 }
 
+/// Resolves a document-space point through the current CoreText-shaped block
+/// layout. The endpoint is Revision-bound and uses the same published
+/// viewport metrics as the native surface; it never asks the Swift/AppKit
+/// mirror to approximate glyph positions. The returned `x`/`y` are snapped
+/// document-space caret coordinates, while source/visual offsets are mapped
+/// through the full lossless projection.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    point_x: f32,
+    point_y: f32,
+    size: f32,
+    max_width: f32,
+    output: *mut YuStorageProjectionHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageProjectionHit::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            point_x,
+            point_y,
+            size,
+            max_width,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(&session.session, expected_revision) {
+            return status;
+        }
+        if !point_x.is_finite()
+            || !point_y.is_finite()
+            || !size.is_finite()
+            || size <= 0.0
+            || !max_width.is_finite()
+            || max_width <= 0.0
+        {
+            return YU_STORAGE_EDITOR_ERROR;
+        }
+        let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        let viewport_config = session.session.viewport_config();
+        let published = viewport_config.layout();
+        if (published.max_width() - max_width).abs() > 0.05
+            || (published.line_height() - metrics.line_height()).abs() > 0.05
+            || (published.default_advance() - metrics.default_advance()).abs() > 0.05
+        {
+            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        }
+
+        let query_y = point_y.max(0.0);
+        let viewport = ViewportRect::new(query_y, metrics.line_height());
+        let snapshot = match session
+            .session
+            .visible_blocks_with_shaper(viewport, &shaper)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return storage_status(error),
+        };
+        let mut selected = None;
+        let mut best_distance = f32::INFINITY;
+        for block in snapshot.blocks() {
+            let top = block.y();
+            let bottom = top + block.height();
+            let distance = if query_y < top {
+                top - query_y
+            } else if query_y > bottom {
+                query_y - bottom
+            } else {
+                0.0
+            };
+            if distance < best_distance {
+                best_distance = distance;
+                selected = Some(*block);
+            }
+        }
+        let Some(block) = selected else {
+            return YU_STORAGE_INVALID_SELECTION;
+        };
+        let layout =
+            match session
+                .session
+                .block_layout_with_shaper(block.index(), layout_config, &shaper)
+            {
+                Ok(layout) => layout,
+                Err(error) => return storage_status(error),
+            };
+        if layout.lines().is_empty() {
+            return YU_STORAGE_INVALID_SELECTION;
+        }
+        let local_y = (query_y - block.y()).max(0.0);
+        let hit = match layout.hit_test(LayoutPoint::new(point_x, local_y)) {
+            Ok(hit) => hit,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let projection = match session.session.inline_projection() {
+            Ok(projection) => projection,
+            Err(error) => return storage_status(error),
+        };
+        let visual = match projection.source_to_visual(hit.source(), hit.bias()) {
+            Ok(visual) => visual,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let projected = match projected_utf8(&projection) {
+            Ok(projected) => projected,
+            Err(status) => return status,
+        };
+        let visual_utf16 = match visual_utf16_offset(&projected, visual) {
+            Ok(offset) => offset,
+            Err(status) => return status,
+        };
+        let round_trip_source = match projection.visual_to_source(visual, hit.bias()) {
+            Ok(offset) => offset,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let source = session.session.snapshot();
+        let source_utf16 = match source.utf16_offset(hit.source()) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let round_trip_source_utf16 = match source.utf16_offset(round_trip_source) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let point = hit.point();
+        let document_y = block.y() + point.y();
+        if !point.x().is_finite() || !document_y.is_finite() {
+            return YU_STORAGE_EDITOR_ERROR;
+        }
+        let line_base = (block.y() / metrics.line_height()).floor().max(0.0) as u64;
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuStorageProjectionHit {
+                revision: session.session.revision().get(),
+                source_utf16,
+                visual_utf16,
+                round_trip_source_utf16,
+                line: line_base.saturating_add(hit.line() as u64),
+                x: point.x(),
+                y: document_y,
+                affinity: affinity_to_ffi(match hit.bias() {
+                    ProjectionBias::Before => CaretAffinity::Upstream,
+                    ProjectionBias::After => CaretAffinity::Downstream,
+                }),
+            };
+        }
+        YU_STORAGE_OK
+    }
+}
+
 /// Returns metadata for the active transient composition projection. The
 /// canonical source Revision is guarded by `expected_revision`; the returned
 /// generation must be supplied to later count/fill and caret queries.
@@ -5793,6 +5961,78 @@ mod tests {
             },
             YU_STORAGE_STALE_REVISION
         );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_shaped_projection_hit_test_is_revision_bound() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yu-storage-ffi-shaped-projection-hit-test-{id}.md"));
+        let source = "before **粗体** after\nnext";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut metrics = YuStorageMacosFontMetrics::default();
+        assert_eq!(
+            unsafe { yu_storage_session_macos_font_metrics(raw, 0, 14.0, 500.0, &mut metrics) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height,
+                    metrics.default_advance,
+                    metrics.line_height,
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut hit = YuStorageProjectionHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_projection_hit_test(
+                    raw, 0, 0.0, 0.0, 14.0, 500.0, &mut hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(hit.revision, 0);
+        assert_eq!(hit.source_utf16, 0);
+        assert_eq!(hit.visual_utf16, 0);
+        assert_eq!(hit.round_trip_source_utf16, 0);
+        assert_eq!(hit.line, 0);
+        assert!(hit.x.is_finite());
+        assert!(hit.y.is_finite());
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_projection_hit_test(
+                    raw, 0, 0.0, 0.0, 14.0, 500.0, &mut hit,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(hit.revision, 0);
+        assert_eq!(hit.visual_utf16, 0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

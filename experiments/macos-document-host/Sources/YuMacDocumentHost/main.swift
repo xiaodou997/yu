@@ -1194,6 +1194,28 @@ private final class StorageBridge {
         return NativeProjectionHit(value)
     }
 
+    func macosProjectionHitTest(
+        revision: UInt64,
+        point: CGPoint,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NativeProjectionHit {
+        var value = YuStorageProjectionHit()
+        let status = yu_storage_session_macos_projection_hit_test(
+            handle,
+            revision,
+            Float(point.x),
+            Float(point.y),
+            size,
+            maxWidth,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeProjectionHit(value)
+    }
+
     func projectionBlockCount(revision: UInt64) throws -> Int {
         var count = 0
         let status = yu_storage_session_projection_block_count(handle, revision, &count)
@@ -2315,9 +2337,10 @@ private final class ProjectionTextKitMirror {
 /// The native source mirror is deliberately a view cache, never a second
 /// document model. Rust owns canonical source, revision, selection and
 /// composition generation; this TextKit object only projects those values for
-/// AppKit's NSTextInputClient callbacks. The visual pointer adapter uses a
-/// separate disposable TextKit layout for point-to-visual-boundary hit testing,
-/// then asks Rust to map that visual boundary back to canonical source ranges.
+/// AppKit's NSTextInputClient callbacks. The visual pointer adapter asks
+/// Rust's CoreText-shaped block layout for the visual boundary, then maps that
+/// boundary back to canonical source ranges. The disposable TextKit visual
+/// mirror remains a geometry and input/IME/accessibility host.
 private final class DocumentTextView: NSTextView {
     private enum Command {
         static let deleteBackward: UInt8 = 1
@@ -2414,9 +2437,9 @@ private final class DocumentTextView: NSTextView {
     }
 
     /// Enables the visual pointer adapter. The visible NSTextView remains the
-    /// canonical source mirror; this only builds a disposable TextKit layout
-    /// from Rust projected text and maps the resulting visual boundary back
-    /// through Rust before changing selection.
+    /// canonical source mirror; this builds a disposable TextKit layout from
+    /// Rust projected text for caret/selection/input presentation, while
+    /// pointer boundaries come from Rust's CoreText-shaped endpoint.
     func setVisualMirrorEnabled(_ enabled: Bool) throws {
         visualMirrorEnabled = enabled
         visualSelectionAnchor = nil
@@ -2550,6 +2573,14 @@ private final class DocumentTextView: NSTextView {
         return visualMirror.string
     }
 
+    @discardableResult
+    func applyVisualPointerSelectionForSelfCheck(
+        at point: NSPoint,
+        extending: Bool = false
+    ) -> Bool {
+        applyVisualPointerSelection(at: point, extending: extending)
+    }
+
     func visualMarkedRangeForSelfCheck() -> NSRange? {
         guard visualMirrorEnabled,
               bridge.composition.active,
@@ -2621,6 +2652,33 @@ private final class DocumentTextView: NSTextView {
         )
     }
 
+    /// Resolves a visual document point through the Rust CoreText-shaped
+    /// block layout. TextKit remains the input/IME/accessibility host, but it
+    /// must not guess glyph boundaries for production pointer selection.
+    private func shapedVisualOffset(
+        at point: NSPoint,
+        mirror: ProjectionTextKitMirror
+    ) -> Int? {
+        guard point.x.isFinite,
+              point.y.isFinite,
+              let (size, width) = visualLayoutMetrics(),
+              let hit = try? bridge.macosProjectionHitTest(
+                  revision: mirror.revision,
+                  point: CGPoint(x: point.x, y: point.y),
+                  size: size,
+                  maxWidth: width
+              ),
+              hit.revision == mirror.revision,
+              hit.point.x.isFinite,
+              hit.point.y.isFinite,
+              let visualOffset = Int(exactly: hit.visualUTF16),
+              visualOffset >= 0,
+              visualOffset <= mirror.utf16Length else {
+            return nil
+        }
+        return visualOffset
+    }
+
     @discardableResult
     private func applyVisualPointerSelection(
         at point: NSPoint,
@@ -2632,7 +2690,13 @@ private final class DocumentTextView: NSTextView {
               visualMirror.revision == bridge.state.revision else {
             return false
         }
-        let visualOffset = visualMirror.visualUTF16(at: point)
+        guard let visualOffset = shapedVisualOffset(at: point, mirror: visualMirror) else {
+            // The Rust endpoint is deliberately strict about Revision and
+            // published viewport metrics. If geometry is stale, return to
+            // AppKit's canonical source hit-test instead of selecting an
+            // offset from a mismatched visual mirror.
+            return false
+        }
         if !extending || visualSelectionAnchor == nil {
             if extending {
                 let selection = bridge.selection
@@ -2707,9 +2771,9 @@ private final class DocumentTextView: NSTextView {
     }
 
     // These queries deliberately read a fresh Rust snapshot instead of
-    // trusting TextKit's disposable projection. TextKit remains responsible
-    // for drawing and hit testing; source text, UTF-16 length, selection and
-    // logical line ranges remain Revision-bound Rust data.
+    // trusting TextKit's disposable projection. TextKit remains the source
+    // mirror and AppKit fallback surface; source text, UTF-16 length,
+    // selection and logical line ranges remain Revision-bound Rust data.
     override func accessibilityValue() -> String? {
         bridge.copySourceIfAvailable ?? canonicalSource
     }
@@ -3638,6 +3702,7 @@ private final class MacosSurfaceHostCoordinator {
     private weak var surfaceView: MacosSurfaceHostView?
     private weak var scrollView: NSScrollView?
     private var fontSize: CGFloat
+    private var contentWidth: CGFloat?
     private var metrics: Metrics?
     private var lastSubmitKey: SubmitKey?
     private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
@@ -3664,6 +3729,7 @@ private final class MacosSurfaceHostCoordinator {
         self.surfaceView = surfaceView
         self.scrollView = scrollView
         self.fontSize = max(fontSize, 1.0)
+        contentWidth = nil
         metrics = nil
         lastSubmitKey = nil
         lastSnapshot = nil
@@ -3678,6 +3744,26 @@ private final class MacosSurfaceHostCoordinator {
         metrics = nil
         lastSubmitKey = nil
         scheduleSubmit()
+    }
+
+    /// Publishes the text content width used by the source TextKit mirror.
+    /// The transparent surface may span the full clip viewport, while native
+    /// text insets reduce the actual wrapping width. Keeping this value in
+    /// the coordinator makes metrics, shaped hit-testing and render layout
+    /// share one width contract.
+    func setContentWidth(_ width: CGFloat) {
+        let next = max(width, 1.0)
+        if let current = contentWidth, abs(current - next) <= 0.5 {
+            return
+        }
+        contentWidth = next
+        metrics = nil
+        lastSubmitKey = nil
+        scheduleSubmit()
+    }
+
+    private func layoutWidth(for surfaceView: MacosSurfaceHostView) -> CGFloat {
+        max(contentWidth ?? surfaceView.bounds.width, 1.0)
     }
 
     func scheduleSubmit() {
@@ -3707,7 +3793,7 @@ private final class MacosSurfaceHostCoordinator {
         }
         let revision = bridge.state.revision
         let size = max(fontSize, 1.0)
-        let maxWidth = max(surfaceView.bounds.width, 1.0)
+        let maxWidth = layoutWidth(for: surfaceView)
         do {
             _ = try ensureMetrics(
                 revision: revision,
@@ -3733,7 +3819,7 @@ private final class MacosSurfaceHostCoordinator {
         }
         let revision = bridge.state.revision
         let size = max(fontSize, 1.0)
-        let maxWidth = max(surfaceView.bounds.width, 1.0)
+        let maxWidth = layoutWidth(for: surfaceView)
         let viewportBounds = scrollView.contentView.bounds
         let viewportHeight = max(viewportBounds.height, 1.0)
         let currentScrollY = max(viewportBounds.origin.y, 0.0)
@@ -3794,7 +3880,7 @@ private final class MacosSurfaceHostCoordinator {
         let viewportBounds = scrollView.contentView.bounds
         let viewportHeight = max(viewportBounds.height, 1.0)
         let scrollY = max(viewportBounds.origin.y, 0.0)
-        let maxWidth = surfaceWidth
+        let maxWidth = layoutWidth(for: surfaceView)
         let scale = max(window.backingScaleFactor, 1.0)
         let key = SubmitKey(
             revision: revision,
@@ -4085,6 +4171,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             textView.bounds.width - 2.0 * textView.textContainerOrigin.x,
             1.0
         )
+        surfaceCoordinator.setContentWidth(visualWidth)
         do {
             if !visualPointerAdapterEnabled {
                 try textView.setVisualMirrorEnabled(true)
@@ -4696,6 +4783,76 @@ private func runProjectionHitTestSelfCheck(path: String) -> Never {
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Yu Projection hit-test self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+private func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let textView = DocumentTextView(bridge: bridge)
+        textView.frame = NSRect(x: 0.0, y: 0.0, width: CGFloat(maxWidth), height: 600.0)
+        textView.font = NSFont.systemFont(ofSize: CGFloat(size))
+        let pointerWidth = Float(
+            max(textView.bounds.width - 2.0 * textView.textContainerOrigin.x, 1.0)
+        )
+        let metrics = try bridge.macosFontMetrics(
+            revision: revision,
+            size: size,
+            maxWidth: pointerWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: pointerWidth,
+            lineHeight: Float(metrics.lineHeight),
+            defaultAdvance: Float(metrics.defaultAdvance),
+            estimatedBlockHeight: Float(metrics.lineHeight),
+            overscan: 0.0
+        )
+        try textView.setVisualMirrorEnabledForSelfCheck(true)
+
+        let projected = try bridge.projectedSource(revision: revision)
+        let hit = try bridge.macosProjectionHitTest(
+            revision: revision,
+            point: CGPoint(x: 0.0, y: 0.0),
+            size: size,
+            maxWidth: pointerWidth
+        )
+        precondition(hit.revision == revision)
+        precondition(hit.sourceUTF16 <= UInt64(bridge.source.utf16.count))
+        precondition(hit.visualUTF16 <= UInt64(projected.utf16.count))
+        precondition(hit.roundTripSourceUTF16 <= UInt64(bridge.source.utf16.count))
+        precondition(hit.point.x.isFinite && hit.point.y.isFinite)
+        precondition(hit.line == 0)
+        precondition(
+            textView.applyVisualPointerSelectionForSelfCheck(
+                at: NSPoint(x: 0.0, y: 0.0)
+            )
+        )
+        precondition(bridge.selection.range.location == 0)
+
+        var staleRejected = false
+        do {
+            _ = try bridge.macosProjectionHitTest(
+                revision: revision + 1,
+                point: CGPoint(x: 0.0, y: 0.0),
+                size: size,
+                maxWidth: pointerWidth
+            )
+        } catch BridgeError.operation(let status) {
+            staleRejected = status == 13
+        }
+        precondition(staleRejected)
+        print(
+            "Yu shaped projection hit-test self-check: CoreText point→visual→source "
+                + "mapping is Revision-bound (visual UTF-16 \(hit.visualUTF16))"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu shaped projection hit-test self-check failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
 }
@@ -6215,6 +6372,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--projection-hit-test-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runProjectionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--shaped-projection-hit-test-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runShapedProjectionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-mirror-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

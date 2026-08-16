@@ -622,6 +622,13 @@ int32_t yu_storage_session_projection_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     float point_x, float point_y, float max_width, float line_height,
     float default_advance, YuStorageProjectionHit *output);
+/* Revision-bound macOS CoreText-shaped point hit-test. point_x/point_y are
+ * document-space coordinates; returned x/y are snapped document-space caret
+ * coordinates. The native TextKit mirror is not consulted. */
+int32_t yu_storage_session_macos_projection_hit_test(
+    YuStorageSession *session, uint64_t expected_revision,
+    float point_x, float point_y, float size, float max_width,
+    YuStorageProjectionHit *output);
 int32_t yu_storage_session_composition_projection(
     YuStorageSession *session, uint64_t expected_revision,
     YuStorageCompositionProjection *output);
