@@ -12,7 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use yu_core::Revision;
-use yu_editor::{EditorDocument, EditorDocumentError, ShapingProvider, ViewportRect};
+use yu_editor::{BlockKind, EditorDocument, EditorDocumentError, ShapingProvider, ViewportRect};
 use yu_font::GlyphAtlas;
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
@@ -31,6 +31,17 @@ pub use workspace::{
 pub struct ViewportSceneFrame {
     input: ViewportSceneInput,
     scene: Scene,
+}
+
+/// Returns the optional background used by the product visual projection for
+/// one parser block. The scene crate receives only the resulting color, so
+/// Markdown semantics stay at this editor-to-scene integration boundary.
+#[must_use]
+pub fn viewport_block_background(kind: BlockKind) -> Option<Rgba8> {
+    match kind {
+        BlockKind::FencedCodeBlock { .. } => Some(Rgba8::new(245, 246, 248, 255)),
+        _ => None,
+    }
 }
 
 impl ViewportSceneFrame {
@@ -571,7 +582,12 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
     }
     let layout_refs = layouts.iter().collect::<Vec<_>>();
     let mut builder = SceneBuilder::new(revision, scene_viewport)?;
-    builder.append_viewport(&input, &layout_refs, atlas, font_size, color)?;
+    let fills = viewport_snapshot
+        .blocks()
+        .iter()
+        .map(|block| viewport_block_background(block.kind()))
+        .collect::<Vec<_>>();
+    builder.append_viewport_with_fills(&input, &layout_refs, atlas, font_size, color, &fills)?;
     Ok(ViewportSceneFrame {
         input,
         scene: builder.finish(),
@@ -710,6 +726,65 @@ mod tests {
                 .primitives()
                 .iter()
                 .all(|primitive| matches!(primitive, Primitive::Glyph(_)))
+        );
+    }
+
+    #[test]
+    fn fenced_code_viewport_emits_fill_before_glyphs() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 160.0);
+        let mut document = EditorDocument::new("```rust\nlet x = 1;\n```\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_render_frame(
+            &mut document,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+                Rgba8::black(),
+            ),
+            &shaper,
+            &atlas,
+            &mut RenderPlanBuilder::new(),
+        )
+        .expect("code block frame");
+
+        let primitives = frame.scene().scene().primitives();
+        let Some((first, rest)) = primitives.split_first() else {
+            panic!("code block scene should not be empty");
+        };
+        match first {
+            Primitive::FillRect { bounds, color } => {
+                assert_eq!(*color, Rgba8::new(245, 246, 248, 255));
+                assert_eq!(bounds.x(), 0.0);
+                assert_eq!(bounds.y(), 0.0);
+                assert_eq!(bounds.width(), 240.0);
+                assert!(bounds.height() > 0.0);
+            }
+            Primitive::Glyph(_) => panic!("code block background must precede glyphs"),
+        }
+        assert!(
+            rest.iter()
+                .any(|primitive| matches!(primitive, Primitive::Glyph(_)))
+        );
+        assert!(matches!(
+            frame.plan().commands().first(),
+            Some(yu_render::RenderCommand::FillRect { .. })
+        ));
+        assert!(
+            frame
+                .plan()
+                .commands()
+                .iter()
+                .any(|command| matches!(command, yu_render::RenderCommand::Glyph { .. }))
         );
     }
 

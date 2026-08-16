@@ -535,6 +535,24 @@ impl SceneBuilder {
         font_size: f32,
         color: Rgba8,
     ) -> Result<usize, SceneError> {
+        self.append_viewport_with_fills(input, layouts, atlas, font_size, color, &[])
+    }
+
+    /// Appends every visible block and optional background fills in one
+    /// preflighted scene transaction. `fills` is ordered like
+    /// `input.blocks()`; a `None` entry keeps the block glyph-only. The scene
+    /// layer stays Markdown-agnostic: callers choose a color from their own
+    /// block-kind/style policy, while this method only validates geometry and
+    /// preserves fill-before-glyph painter order.
+    pub fn append_viewport_with_fills(
+        &mut self,
+        input: &ViewportSceneInput,
+        layouts: &[&LayoutSnapshot],
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+        fills: &[Option<Rgba8>],
+    ) -> Result<usize, SceneError> {
         if input.revision() != self.revision {
             return Err(SceneError::ViewportRevisionMismatch {
                 expected: self.revision,
@@ -546,9 +564,20 @@ impl SceneBuilder {
                 "viewport layout count must match input blocks",
             ));
         }
+        if !fills.is_empty() && fills.len() != input.blocks().len() {
+            return Err(SceneError::InvalidViewportInput(
+                "viewport fill count must match input blocks",
+            ));
+        }
 
         let mut primitives = Vec::new();
-        for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter().copied()) {
+        for (offset, (geometry, layout)) in input
+            .blocks()
+            .iter()
+            .copied()
+            .zip(layouts.iter().copied())
+            .enumerate()
+        {
             if geometry.revision() != self.revision {
                 return Err(SceneError::ViewportRevisionMismatch {
                     expected: self.revision,
@@ -564,15 +593,31 @@ impl SceneBuilder {
             if layout.source_range() != geometry.source() {
                 return Err(SceneError::ViewportSourceMismatch);
             }
-            primitives.extend(self.collect_layout_primitives_at(
-                layout,
-                atlas,
-                font_size,
-                color,
-                Point::new(0.0, geometry.y()),
-            )?);
+            if let Some(fill) = fills.get(offset).copied().flatten() {
+                let bounds = Rect::new(
+                    self.viewport.x(),
+                    geometry.y(),
+                    self.viewport.width(),
+                    geometry.height(),
+                )?;
+                primitives.push(Primitive::FillRect {
+                    bounds,
+                    color: fill,
+                });
+            }
+            primitives.extend(
+                self.collect_layout_primitives_at(
+                    layout,
+                    atlas,
+                    font_size,
+                    color,
+                    Point::new(0.0, geometry.y()),
+                )?
+                .into_iter()
+                .map(Primitive::Glyph),
+            );
         }
-        self.commit_glyphs(primitives)
+        self.commit_primitives(primitives)
     }
 
     fn collect_layout_primitives_at(
@@ -613,28 +658,33 @@ impl SceneBuilder {
     }
 
     fn commit_glyphs(&mut self, glyphs: Vec<GlyphPrimitive>) -> Result<usize, SceneError> {
-        if glyphs.len() > self.max_primitives.saturating_sub(self.primitives.len()) {
+        self.commit_primitives(glyphs.into_iter().map(Primitive::Glyph).collect())
+    }
+
+    fn commit_primitives(&mut self, primitives: Vec<Primitive>) -> Result<usize, SceneError> {
+        if primitives.len() > self.max_primitives.saturating_sub(self.primitives.len()) {
             return Err(SceneError::PrimitiveLimitExceeded);
         }
         let new_len = self
             .primitives
             .len()
-            .checked_add(glyphs.len())
+            .checked_add(primitives.len())
             .ok_or(SceneError::PrimitiveLimitExceeded)?;
-        if !glyphs.is_empty() && u32::try_from(new_len.saturating_sub(1)).is_err() {
+        if !primitives.is_empty() && u32::try_from(new_len.saturating_sub(1)).is_err() {
             return Err(SceneError::PrimitiveLimitExceeded);
         }
 
         let mut damage = self.damage.clone();
-        for glyph in &glyphs {
-            glyph.origin.validate()?;
-            let bounds = glyph.bounds();
+        for primitive in &primitives {
+            if let Primitive::Glyph(glyph) = primitive {
+                glyph.origin.validate()?;
+            }
+            let bounds = primitive.bounds();
             bounds.validate()?;
             damage.add(bounds)?;
         }
-        let count = glyphs.len();
-        self.primitives
-            .extend(glyphs.into_iter().map(Primitive::Glyph));
+        let count = primitives.len();
+        self.primitives.extend(primitives);
         self.damage = damage;
         Ok(count)
     }

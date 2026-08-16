@@ -369,9 +369,10 @@
 5. atlas page upload 必须是 owned alpha bytes，page fingerprint 未变化时不得重复产生 upload；
    `RenderUploader` 返回的 texture/device handle 只能由 backend 持有，不能写回 scene、layout 或
    editor canonical state。
-6. `SceneBuilder::append_layout` 必须先校验 layout/scene Revision、font size 和所有 atlas
-   entry，再追加 glyph primitive；任一失败不得发布部分 layout scene。glyph primitive 的 origin
-   必须直接来自 placement 的 layout 坐标，不能在 renderer 中重新推导 source position。
+6. `SceneBuilder::append_layout` 与 `append_viewport_with_fills` 必须先校验 layout/scene Revision、
+   font size、所有 atlas entry 和 fill geometry，再追加 primitive；任一失败不得发布部分 layout
+   scene。viewport fill 必须先于所属 block 的 glyph，glyph primitive 的 origin 必须直接来自
+   placement 的 layout 坐标，不能在 renderer 中重新推导 source position。
 7. macOS partial-damage frame 的 backend command culling 必须只按已验证 native command bounds
    与 damage region 做严格相交过滤，保留原 painter order、跨 region command 只保留一次；full
    clear 必须保留完整 command list，culling 不得修改 shared `RenderPlan`、scene 或 Revision。
@@ -439,11 +440,12 @@
     block index 和 source UTF-16 range；Rust 必须先通过 `ViewportSceneInput`/`SceneBuilder` 验证
     顺序、有限矩形和 content bounds，再执行 count/fill。容量不足或 stale Revision 不得发布部分
     primitive，Swift 不得根据 block kind、source text 或数组位置重新推导 scene geometry。
-20. `yu_storage_session_macos_visual_render_plan` 返回的 snapshot、glyph command、atlas page 和
-    damage 必须来自同一 Revision；command 必须保持 RenderPlan painter order，source UTF-16 range、
-    origin、bounds、advance、page rectangle、fingerprint 和 damage 都必须是有限且已验证的 owned
-    scalar。count/fill 在 Rust 完整构造 plan 后执行；任一数组容量不足或 stale/invalid 输入不得写入
-    部分输出，Swift 不得重建 glyph layout、atlas 像素或 page identity。
+20. `yu_storage_session_macos_visual_render_plan` 返回的 snapshot、fill/glyph command、atlas page
+    和 damage 必须来自同一 Revision；command 必须保持 RenderPlan painter order，source UTF-16
+    range、origin、bounds、advance、page rectangle、fingerprint 和 damage 都必须是有限且已验证的
+    owned scalar。FillRect 的 atlas/page 字段必须使用 none/zero defaults，glyph 才能引用 atlas
+    page。count/fill 在 Rust 完整构造 plan 后执行；任一数组容量不足或 stale/invalid 输入不得写入
+    部分输出，Swift 不得重建 layout、atlas 像素或 page identity。
 21. `yu_storage_session_macos_render_host_surface_submit` 只能在 AppKit main thread 接收调用方仍然
     有效的 `NSView`，并严格按 `MetalSurface attachment → current Revision frame publication →
     atlas staging → render_plan/drawable submit → consumer commit` 顺序执行；surface、renderer、
@@ -517,8 +519,9 @@
 5. `yu_storage_session_macos_visual_scene_glyphs` 的 header、glyph 数组和 persistent host publication
    必须绑定同一 Revision、frame serial 与 surface generation；count/fill 的容量不足路径不得写入
    部分 glyph。每个 glyph 只能携带 Rust-owned atlas placement、几何、颜色和所属 block 的 source
-   UTF-16 range，不得跨 ABI 暴露 atlas 像素、CoreText/scene/layout 指针或 GPU handle；当前 glyph-only
-   bridge 遇到非 glyph primitive 必须整体拒绝，而不能静默丢弃。
+   UTF-16 range，不得跨 ABI 暴露 atlas 像素、CoreText/scene/layout 指针或 GPU handle。该 glyph-only
+   bridge 可以过滤同一 retained scene 中的 solid FillRect，但不得把 FillRect 伪装成 glyph，也不得
+   改变 glyph painter order 或 block/source metadata。
 6. 活动 composition 必须通过 `EditorDocument::composition_block_range` 得到受影响的半开 block
    span；CoreText viewport builder、workspace scene 和 diagnostic glyph/render-plan bridge 对 span
    内每个 block 使用未缓存的 `block_layout_with_composition_and_shaper`，首 block 承载完整 preedit，

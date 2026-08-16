@@ -61,6 +61,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] heading、emphasis、code、link 的最小真实 visual render 通过产品窗口 persistent Metal
   surface 可见提交；TextKit 仍保留为透明 overlay 下的输入/AX/回退表面
 - [x] 当前 Revision、composition generation、submit geometry 和 Rust decoration frame 同时有效时隐藏 TextKit source glyph；编辑、滚动、resize、IME、stale、detach 与 submit 失败自动恢复
+- [x] fenced code block 的 Revision-bound `FillRect` 背景进入 Scene/RenderPlan/Metal solid pipeline，并保持 fill-before-glyph painter order
 
 ## 约束
 

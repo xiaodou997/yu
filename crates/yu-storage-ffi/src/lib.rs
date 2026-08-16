@@ -35,7 +35,9 @@ use yu_render::{RenderCommand, RenderPlanBuilder};
 #[cfg(target_os = "macos")]
 use yu_scene::{Primitive, Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput};
 #[cfg(target_os = "macos")]
-use yu_workspace::{ViewportRenderConfig, assemble_viewport_render_frame};
+use yu_workspace::{
+    ViewportRenderConfig, assemble_viewport_render_frame, viewport_block_background,
+};
 
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
@@ -599,7 +601,9 @@ pub struct YuStorageVisualRenderPlanSnapshot {
 
 /// One owned render command. Glyph atlas placement, baseline origin, metrics,
 /// source block range and command bounds are copied from the Rust
-/// `RenderPlan`; no scene or atlas reference crosses the ABI.
+/// `RenderPlan`; solid block fills use the same bounds/color fields and set
+/// atlas values to their zero/none defaults. No scene or atlas reference
+/// crosses the ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct YuStorageVisualRenderCommand {
@@ -5114,6 +5118,13 @@ fn macos_visual_scene_glyphs(
     let mut current = metadata.next();
     let mut glyphs = Vec::with_capacity(scene.primitives().len());
     for primitive in scene.primitives().iter().copied() {
+        // This ABI is intentionally glyph-only. The retained scene may now
+        // also contain solid block fills; skip those primitives without
+        // reinterpreting them as glyph metadata. The full render-plan ABI
+        // below carries both command kinds.
+        let Primitive::Glyph(glyph) = primitive else {
+            continue;
+        };
         loop {
             match current {
                 Some((_, _, _, 0)) => current = metadata.next(),
@@ -5122,9 +5133,6 @@ fn macos_visual_scene_glyphs(
             }
         }
         let Some((block_index, source_start_utf16, source_end_utf16, glyph_count)) = current else {
-            return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
-        };
-        let Primitive::Glyph(glyph) = primitive else {
             return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
         };
         let entry = glyph.atlas();
@@ -5262,7 +5270,12 @@ fn macos_visual_render_plan(
                 atlas.insert(glyph).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
             }
         }
-        block_glyphs.push((block.index(), block.source(), layout.glyphs().len()));
+        block_glyphs.push((
+            block.index(),
+            block.source(),
+            layout.glyphs().len(),
+            viewport_block_background(block.kind()),
+        ));
     }
 
     let scene_height = viewport_snapshot
@@ -5289,7 +5302,7 @@ fn macos_visual_render_plan(
     }
 
     let mut block_metadata = Vec::new();
-    for (block_index, source_range, glyph_count) in block_glyphs {
+    for (block_index, source_range, glyph_count, background) in block_glyphs {
         let source_start_utf16 = source
             .utf16_offset(source_range.start())
             .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
@@ -5298,8 +5311,21 @@ fn macos_visual_render_plan(
             .utf16_offset(source_range.end())
             .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
             .get();
+        if background.is_some() {
+            block_metadata.push((
+                YU_STORAGE_RENDER_COMMAND_FILL_RECT,
+                block_index,
+                source_start_utf16,
+                source_end_utf16,
+            ));
+        }
         block_metadata.extend(std::iter::repeat_n(
-            (block_index, source_start_utf16, source_end_utf16),
+            (
+                YU_STORAGE_RENDER_COMMAND_GLYPH,
+                block_index,
+                source_start_utf16,
+                source_end_utf16,
+            ),
             glyph_count,
         ));
     }
@@ -5309,42 +5335,71 @@ fn macos_visual_render_plan(
 
     let mut commands = Vec::with_capacity(plan.commands().len());
     for (command, metadata) in plan.commands().iter().copied().zip(block_metadata) {
-        let (block_index, source_start_utf16, source_end_utf16) = metadata;
-        let RenderCommand::Glyph {
-            page,
-            rect,
-            origin,
-            metrics,
-            color,
-        } = command
-        else {
-            return Err(YU_STORAGE_EDITOR_ERROR);
+        let (metadata_kind, block_index, source_start_utf16, source_end_utf16) = metadata;
+        let block_index = u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+        let encoded = match command {
+            RenderCommand::FillRect { bounds, color } => {
+                if metadata_kind != YU_STORAGE_RENDER_COMMAND_FILL_RECT {
+                    return Err(YU_STORAGE_EDITOR_ERROR);
+                }
+                YuStorageVisualRenderCommand {
+                    revision: plan.revision().get(),
+                    block_index,
+                    source_start_utf16,
+                    source_end_utf16,
+                    kind: YU_STORAGE_RENDER_COMMAND_FILL_RECT,
+                    page: YU_STORAGE_RENDER_PAGE_NONE,
+                    atlas_x: 0,
+                    atlas_y: 0,
+                    atlas_width: 0,
+                    atlas_height: 0,
+                    origin_x: bounds.x(),
+                    origin_y: bounds.y(),
+                    bearing_x: 0.0,
+                    bearing_y: 0.0,
+                    advance_x: 0.0,
+                    bounds_x: bounds.x(),
+                    bounds_y: bounds.y(),
+                    bounds_width: bounds.width(),
+                    bounds_height: bounds.height(),
+                    color_rgba: color.packed(),
+                }
+            }
+            RenderCommand::Glyph {
+                page,
+                rect,
+                origin,
+                metrics,
+                color,
+            } => {
+                if metadata_kind != YU_STORAGE_RENDER_COMMAND_GLYPH {
+                    return Err(YU_STORAGE_EDITOR_ERROR);
+                }
+                YuStorageVisualRenderCommand {
+                    revision: plan.revision().get(),
+                    block_index,
+                    source_start_utf16,
+                    source_end_utf16,
+                    kind: YU_STORAGE_RENDER_COMMAND_GLYPH,
+                    page: page.unwrap_or(YU_STORAGE_RENDER_PAGE_NONE),
+                    atlas_x: rect.x(),
+                    atlas_y: rect.y(),
+                    atlas_width: rect.width(),
+                    atlas_height: rect.height(),
+                    origin_x: origin.x(),
+                    origin_y: origin.y(),
+                    bearing_x: metrics.bearing_x(),
+                    bearing_y: metrics.bearing_y(),
+                    advance_x: metrics.advance_x(),
+                    bounds_x: origin.x() + metrics.bearing_x(),
+                    bounds_y: origin.y() - metrics.bearing_y(),
+                    bounds_width: rect.width() as f32,
+                    bounds_height: rect.height() as f32,
+                    color_rgba: color.packed(),
+                }
+            }
         };
-        let page = page.unwrap_or(YU_STORAGE_RENDER_PAGE_NONE);
-        let bounds_width = rect.width() as f32;
-        let bounds_height = rect.height() as f32;
-        commands.push(YuStorageVisualRenderCommand {
-            revision: plan.revision().get(),
-            block_index: u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-            source_start_utf16,
-            source_end_utf16,
-            kind: YU_STORAGE_RENDER_COMMAND_GLYPH,
-            page,
-            atlas_x: rect.x(),
-            atlas_y: rect.y(),
-            atlas_width: rect.width(),
-            atlas_height: rect.height(),
-            origin_x: origin.x(),
-            origin_y: origin.y(),
-            bearing_x: metrics.bearing_x(),
-            bearing_y: metrics.bearing_y(),
-            advance_x: metrics.advance_x(),
-            bounds_x: origin.x() + metrics.bearing_x(),
-            bounds_y: origin.y() - metrics.bearing_y(),
-            bounds_width,
-            bounds_height,
-            color_rgba: color.packed(),
-        });
+        commands.push(encoded);
     }
 
     let pages = plan
@@ -8159,16 +8214,35 @@ mod tests {
         assert_eq!(written_pages, page_required);
         assert_eq!(written_damage, damage_required);
         assert!(commands.iter().all(|command| {
-            command.revision == 0
-                && command.kind == YU_STORAGE_RENDER_COMMAND_GLYPH
-                && command.bounds_width.is_finite()
+            let geometry_valid = command.bounds_width.is_finite()
                 && command.bounds_height.is_finite()
                 && command.bounds_width >= 0.0
                 && command.bounds_height >= 0.0
                 && command.origin_x.is_finite()
-                && command.origin_y.is_finite()
-                && command.advance_x.is_finite()
+                && command.origin_y.is_finite();
+            command.revision == 0
+                && geometry_valid
+                && match command.kind {
+                    YU_STORAGE_RENDER_COMMAND_FILL_RECT => {
+                        command.page == YU_STORAGE_RENDER_PAGE_NONE
+                            && command.atlas_width == 0
+                            && command.atlas_height == 0
+                            && command.advance_x == 0.0
+                    }
+                    YU_STORAGE_RENDER_COMMAND_GLYPH => command.advance_x.is_finite(),
+                    _ => false,
+                }
         }));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.kind == YU_STORAGE_RENDER_COMMAND_FILL_RECT)
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.kind == YU_STORAGE_RENDER_COMMAND_GLYPH)
+        );
         assert!(commands.windows(2).all(|pair| {
             pair[0].block_index <= pair[1].block_index
                 && pair[0].source_end_utf16 <= pair[1].source_end_utf16

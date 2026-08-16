@@ -467,15 +467,18 @@ range、document-space block origin/height、measured 和稳定 kind tag。它�
 origin，绝不根据 kind 或 source 重新布局。这样 FFI/native host、editor layout cache 和 scene
 都共享同一 block origin，而不会各自维护 HeightIndex 的副本。
 
-完整可见窗口使用 `SceneBuilder::append_viewport` 批量组装：它按 `ViewportSceneInput` 的 block
-顺序预检所有 layout、source range、Revision、atlas entry、glyph bounds 和 primitive budget，
-然后一次性发布 glyph primitives 与 damage。任何一个 block 失败都不会留下 viewport 前缀；这
-使 stale frame 可以整体丢弃并在新的 Revision 重试，而不会让 renderer 接收到部分窗口。
+完整可见窗口使用 `SceneBuilder::append_viewport_with_fills` 批量组装：它按
+`ViewportSceneInput` 的 block 顺序预检所有 layout、source range、Revision、atlas entry、fill/glyph
+geometry 和 primitive budget，然后一次性发布 block fills、glyph primitives 与 damage。每个
+fill 先于所属 block 的 glyph，其他 block 没有 fill 时保持原有 glyph-only 结果。任何一个 block
+失败都不会留下 viewport 前缀；这使 stale frame 可以整体丢弃并在新的 Revision 重试，而不会让
+renderer 接收到部分窗口。
 
 `yu-workspace::assemble_viewport_scene` 是 editor 到 retained scene 的组合边界。它只消费
 `EditorDocument::visible_blocks_with_shaper` 返回的当前 Revision metadata，并按同一 block index
-取得 shaped `LayoutSnapshot`；随后交给 `ViewportSceneInput` 和 `SceneBuilder::append_viewport`。
-因此 macOS host 不需要复制 Markdown block traversal、HeightIndex 或 layout cache，后续窗口/Metal
+取得 shaped `LayoutSnapshot`；随后在 editor-to-scene 边界把 fenced code 的 `BlockKind` 映射为
+可选背景颜色，再交给 `ViewportSceneInput` 和 `SceneBuilder::append_viewport_with_fills`。因此
+macOS host 不需要复制 Markdown block traversal、HeightIndex 或 layout cache，后续窗口/Metal
 层只消费 `ViewportSceneFrame`/`RenderPlan`。
 
 当前 document-host 诊断桥还提供 `yu_storage_session_macos_render_host_frame`。`YuStorageSession`
@@ -602,19 +605,21 @@ Revision、font size 和 CPU `GlyphAtlas` entry，并在全部 placement 解析�
 primitive；失败不会留下部分 scene。
 
 `yu-render` 将 scene 与对应的 CPU `GlyphAtlas` 转换为 backend-neutral `RenderPlan`：命令保持
-painter order，atlas page 通过尺寸/bytes fingerprint 去重 `AtlasPageUpload`，stale/missing
-entry 会被拒绝。共享 `yu-render` 当前没有 `wgpu`/Metal device 或窗口依赖；`RenderUploader` 只定义未来 backend
-上传 alpha page 的最小边界。`yu-render` 已用 fake uploader 覆盖 `FontShaper → LayoutSnapshot →
-Scene → RenderPlan` 端到端 revision、atlas upload 去重和 command origin；实际 texture 生命周期
-和 command encoding 由 macOS backend 承担，不回写 shared plan。
+painter order，solid `FillRect` 不需要 atlas，glyph 的 atlas page 通过尺寸/bytes fingerprint
+去重 `AtlasPageUpload`，stale/missing entry 会被拒绝。共享 `yu-render` 当前没有 `wgpu`/Metal
+device 或窗口依赖；`RenderUploader` 只定义未来 backend 上传 alpha page 的最小边界。`yu-render`
+已用 fake uploader 覆盖 `FontShaper → LayoutSnapshot → Scene → RenderPlan` 端到端 revision、
+fill/glyph command order、atlas upload 去重和 command origin；实际 texture 生命周期和 command
+encoding 由 macOS backend 承担，不回写 shared plan。
 
 macOS storage FFI 的 `yu_storage_session_macos_visual_render_plan` 是这一链路的诊断 publication：
 Rust 使用 CoreText-shaped layout 和 `CoreTextGlyphRasterizer` 生成临时 CPU `GlyphAtlas`，然后复用
-`yu_workspace::assemble_viewport_render_frame`，只把 Revision-bound glyph command、page metadata
+`yu_workspace::assemble_viewport_render_frame`，把 Revision-bound fill/glyph command、page metadata
 和 damage 的 owned scalars 复制给 Swift。count/fill 在完整 plan 验证后才写数组，容量不足或 stale
 Revision 不会发布部分窗口；atlas 像素、CoreText object、layout/cache 和 GPU handle 不跨 FFI。
 CoreText numeric face id 由进程内共享 catalog 保持稳定，因此反复建立 shaper 不需要清空 layout cache。
-`--visual-render-plan-self-check` 只验证此边界，生产 TextKit mirror 和 Metal surface 仍未切换。
+`--visual-render-plan-self-check` 使用 code fixture 同时验证 solid fill、shaped glyph、painter
+order、atlas page fingerprints 和 stale Revision；生产 TextKit mirror 和 Metal surface 仍可回退。
 
 `platform/macos/yu-render-macos::CoreTextViewportFrameBuilder` 是诊断 FFI 与 backend 之间的 Rust
 准备层：它持有稳定 `CoreTextShaper`、CPU `GlyphAtlas`、`RenderPlanBuilder` 和
