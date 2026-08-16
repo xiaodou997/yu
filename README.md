@@ -235,6 +235,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS Rust/CoreText-shaped decoration geometry](docs/adr/0137-macos-rust-shaped-decoration-geometry.md)
 - [macOS visual selection anchor/focus](docs/adr/0138-macos-visual-selection-anchor-focus.md)
 - [macOS primary Rust surface glyph gate](docs/adr/0139-macos-primary-rust-surface-glyph-gate.md)
+- [macOS code block fill primitive](docs/adr/0140-macos-code-block-fill-primitive.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)

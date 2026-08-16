@@ -6571,16 +6571,30 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
 
         var previousBlock: UInt64?
         var previousSourceEnd: Int = 0
+        var sawFill = false
+        var sawGlyph = false
+        let fillKind = UInt8(YU_STORAGE_RENDER_COMMAND_FILL_RECT)
+        let glyphKind = UInt8(YU_STORAGE_RENDER_COMMAND_GLYPH)
         for command in commands {
             precondition(command.revision == revision)
-            precondition(command.kind == YU_STORAGE_RENDER_COMMAND_GLYPH)
             precondition(command.bounds.origin.x.isFinite)
             precondition(command.bounds.origin.y.isFinite)
             precondition(command.bounds.width.isFinite && command.bounds.height.isFinite)
             precondition(command.bounds.width >= 0.0 && command.bounds.height >= 0.0)
             precondition(command.origin.x.isFinite && command.origin.y.isFinite)
-            precondition(command.advanceX.isFinite && command.advanceX >= 0.0)
-            precondition(command.atlasRect.width >= 0.0 && command.atlasRect.height >= 0.0)
+            switch command.kind {
+            case fillKind:
+                sawFill = true
+                precondition(command.page == YU_STORAGE_RENDER_PAGE_NONE)
+                precondition(command.atlasRect.width == 0.0 && command.atlasRect.height == 0.0)
+                precondition(command.advanceX == 0.0)
+            case glyphKind:
+                sawGlyph = true
+                precondition(command.advanceX.isFinite && command.advanceX >= 0.0)
+                precondition(command.atlasRect.width >= 0.0 && command.atlasRect.height >= 0.0)
+            default:
+                preconditionFailure("unknown visual render command kind")
+            }
             if let previousBlock, command.blockIndex != previousBlock {
                 precondition(command.sourceRange.location >= previousSourceEnd)
             }
@@ -6593,6 +6607,8 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
                 precondition(Int(command.page) < pages.count)
             }
         }
+        precondition(sawFill)
+        precondition(sawGlyph)
 
         precondition(pages.dropFirst().enumerated().allSatisfy { offset, page in
             page.page > pages[offset].page
@@ -6628,7 +6644,7 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
             precondition(status == 13)
         }
         print(
-            "Yu Visual Render Plan self-check: shaped glyph commands, atlas page fingerprints, "
+            "Yu Visual Render Plan self-check: block fills, shaped glyph commands, atlas page fingerprints, "
                 + "damage and stale Revision rejection are valid"
         )
         exit(EXIT_SUCCESS)
