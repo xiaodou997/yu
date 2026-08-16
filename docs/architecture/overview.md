@@ -518,6 +518,14 @@ Metal bridge 在提交边界统一减去该原点得到 surface-local 坐标。v
 可见 surface 尺寸，不会误变成整篇文档高度。这个修复是完整 visual renderer 迁移的前置契约，
 并不关闭 TextKit source mirror 的字形回退。见 ADR 0135。
 
+产品窗口现在还有一个独立的 `MacosVisualDecorationView` sibling，位于 Metal surface 之上，
+只绘制当前 Revision 的 visual selection/caret rectangles，并对 hit-test 返回空。它使用已经
+通过 Revision 校验的 disposable visual mirror 几何；因此不会复制 source、selection、IME 或
+Accessibility state。TextKit 在 decoration frame 有效时停止自绘 selection/caret，frame stale、
+surface detach 或 native submit 失败时立即清空 overlay 并恢复 TextKit 自绘。这个边界先把
+装饰像素从 source view 拆出，下一步再把 geometry provider 从 TextKit mirror 替换为 Rust layout
+decoration FFI。见 ADR 0136。
+
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
 文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
 编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、

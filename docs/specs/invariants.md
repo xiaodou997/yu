@@ -469,7 +469,11 @@
     submit key 不得重复提交，view 离开 window、window close 或 controller 销毁前必须幂等 detach。
     surface host 是 source TextKit mirror 的 sibling，不得拥有 Markdown source、selection、IME、
     accessibility semantic nodes 或 native GPU handle。
-26. `yu_storage_session_macos_composition_projection_hit_test` 必须同时验证 expected Revision 与
+26. `MacosVisualDecorationView` 只能保存当前 Revision 的 owned selection/caret rectangles，必须
+    对 AppKit hit-test 返回 `nil`，不得拥有 source、selection、IME 或 Accessibility state。它位于
+    Metal surface 之上、source TextKit mirror 之外；geometry 失效、surface detach、窗口离开或
+    native submit 失败时必须清空并恢复 TextKit 的自绘装饰。
+27. `yu_storage_session_macos_composition_projection_hit_test` 必须同时验证 expected Revision 与
     composition generation，并使用 composition-aware transient block layout 加完整 transient
     projection 返回命中结果；输出的 block index、document-space point、source/visual UTF-16、
     visual selection/replacement 必须来自同一 generation。过期 generation 必须清空输出并返回

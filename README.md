@@ -231,6 +231,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS cross-block composition transient layout](docs/adr/0133-macos-cross-block-composition-layout.md)
 - [macOS cross-block composition hit-test](docs/adr/0134-macos-cross-block-composition-hit-test.md)
 - [macOS document-space RenderPlan viewport](docs/adr/0135-macos-document-space-render-viewport.md)
+- [macOS visual decoration sibling](docs/adr/0136-macos-visual-decoration-sibling.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)
