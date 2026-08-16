@@ -68,6 +68,14 @@ pub enum RenderCommand {
         metrics: yu_font::GlyphMetrics,
         color: Rgba8,
     },
+    /// An image resource reference. If the backend has not published the
+    /// resource yet, it must draw `fallback` instead of blocking the render
+    /// thread or failing the whole frame.
+    Image {
+        resource: u64,
+        bounds: Rect,
+        fallback: Rgba8,
+    },
 }
 
 /// A complete render preparation result for one source revision.
@@ -212,6 +220,13 @@ impl RenderPlanBuilder {
                         color: glyph.color(),
                     });
                 }
+                Primitive::Image(image) => {
+                    commands.push(RenderCommand::Image {
+                        resource: image.resource(),
+                        bounds: image.bounds(),
+                        fallback: image.fallback(),
+                    });
+                }
             }
         }
 
@@ -276,7 +291,8 @@ mod tests {
     use yu_layout::{LayoutConfig, LayoutSnapshot};
     use yu_projection::Projection;
     use yu_scene::{
-        GlyphPrimitive, SceneBuilder, SceneError, ViewportBlockGeometry, ViewportSceneInput,
+        GlyphPrimitive, ImagePrimitive, SceneBuilder, SceneError, ViewportBlockGeometry,
+        ViewportSceneInput,
     };
     use yu_text::TextBuffer;
 
@@ -555,8 +571,35 @@ mod tests {
                 assert_eq!(origin.x(), layout.glyphs()[0].x());
                 assert_eq!(origin.y(), layout.glyphs()[0].y());
             }
-            RenderCommand::FillRect { .. } => panic!("expected glyph command"),
+            RenderCommand::FillRect { .. } | RenderCommand::Image { .. } => {
+                panic!("expected glyph command")
+            }
         }
+    }
+
+    #[test]
+    fn image_primitives_become_revision_bound_resource_commands() {
+        let revision = Revision::new(7);
+        let viewport = Rect::new(0.0, 0.0, 320.0, 200.0).expect("viewport");
+        let bounds = Rect::new(24.0, 32.0, 120.0, 80.0).expect("image bounds");
+        let fallback = Rgba8::new(230, 232, 236, 255);
+        let mut scene = SceneBuilder::new(revision, viewport).expect("scene");
+        scene
+            .image(ImagePrimitive::new(0xfeed_beef, bounds, fallback))
+            .expect("image primitive");
+        let scene = scene.finish();
+        let mut plans = RenderPlanBuilder::new();
+        let atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("atlas config"));
+        let plan = plans.build(&scene, &atlas).expect("image plan");
+        assert_eq!(plan.revision(), revision);
+        assert_eq!(
+            plan.commands(),
+            &[RenderCommand::Image {
+                resource: 0xfeed_beef,
+                bounds,
+                fallback,
+            }]
+        );
     }
 
     #[test]
@@ -587,7 +630,9 @@ mod tests {
                 assert_eq!(glyph.origin().x(), layout.glyphs()[0].x());
                 assert_eq!(glyph.origin().y(), layout.glyphs()[0].y() + 40.0);
             }
-            Primitive::FillRect { .. } => panic!("expected glyph primitive"),
+            Primitive::FillRect { .. } | Primitive::Image(_) => {
+                panic!("expected glyph primitive")
+            }
         }
 
         let mut stale_builder = SceneBuilder::new(Revision::new(9), viewport).expect("scene");
@@ -686,7 +731,9 @@ mod tests {
             .iter()
             .map(|primitive| match primitive {
                 Primitive::Glyph(glyph) => glyph.origin(),
-                Primitive::FillRect { .. } => panic!("expected glyph primitive"),
+                Primitive::FillRect { .. } | Primitive::Image(_) => {
+                    panic!("expected glyph primitive")
+                }
             })
             .collect::<Vec<_>>();
         assert_eq!(origins[0].y(), first.glyphs()[0].y());

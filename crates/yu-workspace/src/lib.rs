@@ -769,7 +769,9 @@ mod tests {
                 assert_eq!(bounds.width(), 240.0);
                 assert!(bounds.height() > 0.0);
             }
-            Primitive::Glyph(_) => panic!("code block background must precede glyphs"),
+            Primitive::Glyph(_) | Primitive::Image(_) => {
+                panic!("code block background must precede glyphs")
+            }
         }
         assert!(
             rest.iter()

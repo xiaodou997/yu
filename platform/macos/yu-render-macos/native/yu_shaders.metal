@@ -51,3 +51,13 @@ fragment float4 yu_glyph_fragment(
     float coverage = atlas.sample(atlas_sampler, input.uv).r;
     return float4(primitive.color.rgb, primitive.color.a * coverage);
 }
+
+fragment float4 yu_image_fragment(
+    YuVertexOut input [[stage_in]],
+    texture2d<float, access::sample> image [[texture(0)]],
+    sampler image_sampler [[sampler(0)]],
+    constant YuPrimitiveUniforms& primitive [[buffer(0)]]
+) {
+    float4 sampled = image.sample(image_sampler, input.uv);
+    return float4(sampled.rgb * primitive.color.rgb, sampled.a * primitive.color.a);
+}

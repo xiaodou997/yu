@@ -11,6 +11,7 @@ build = "build.rs"
 
 [dependencies]
 yu-core = { path = "../../../crates/yu-core" }
+yu-assets = { path = "../../../crates/yu-assets" }
 yu-editor = { path = "../../../crates/yu-editor" }
 yu-font = { path = "../../../crates/yu-font" }
 yu-render = { path = "../../../crates/yu-render" }
