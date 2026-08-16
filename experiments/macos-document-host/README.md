@@ -24,8 +24,9 @@
   rotor 只查询当前 child tree；链接 destination 只暴露 `accessibilityURL`，task checkbox press 回到
   Rust `toggle_task` Transaction；macOS VoiceOver 真实朗读已由人工确认通过；Rotor/语义 action
   的跨平台回归仍属于后续工作；
-- 当前包含最小 Rust glyph overlay、visual pointer/caret 映射和 TextKit 回退；仍不包含完整
-  Markdown delimiter reveal、最终 selection 绘制、IME visual overlay 或 workspace/tab。
+- 当前包含最小 Rust glyph overlay、visual pointer/caret 映射、projected selection highlight、
+  Revision-bound caret reveal 和 TextKit 回退；仍不包含完整 Markdown delimiter reveal、最终
+  shaped Metal hit-test、visual IME overlay 或 workspace/tab。
 
 构建并运行：
 
@@ -204,8 +205,10 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 ```
 
 生命周期 coordinator 使用 `yu_storage_session_macos_font_metrics`，所以空 Markdown 没有 parser
-block 时也可以初始化 CoreText viewport；metrics、surface submit 和 detach 仍受 Revision/main-thread
-契约约束。覆盖层提交失败时自动隐藏，输入、IME、caret、selection 和 Accessibility 回到 TextKit。
+block 时也可以初始化 CoreText viewport；metrics、surface submit、caret reveal 和 detach 仍受
+Revision/main-thread 契约约束。覆盖层提交失败时自动隐藏，输入、IME、caret、selection 和
+Accessibility 回到 TextKit；selection highlight 的 visual rectangles 和 scroll target 仍来自
+同一 Rust projection/viewport 契约。
 
 验证 persistent host 从 retained scene 导出的 glyph primitive count/fill、atlas placement、
 source block range、block 顺序、几何有限性以及编辑后的 stale Revision 拒绝（不启动窗口）：
