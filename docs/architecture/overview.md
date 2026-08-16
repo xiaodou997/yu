@@ -512,6 +512,12 @@ scroll、编辑 Revision 和 close 生命周期安排成上述 surface submit；
 到 source mirror。空文档使用 `yu_storage_session_macos_font_metrics` 配置 CoreText viewport。
 该 adapter 不让 Swift 拥有 Markdown、layout、scene 或 Metal handle。见 ADR 0124、0125。
 
+当前 render host 已进一步固定 document-space viewport 原点：block glyph、damage 和 caret 的
+`y` 坐标仍来自同一份文档坐标，而 `RenderPlan::viewport().y()` 取当前 scroll origin，native
+Metal bridge 在提交边界统一减去该原点得到 surface-local 坐标。viewport 的 width/height 仍是
+可见 surface 尺寸，不会误变成整篇文档高度。这个修复是完整 visual renderer 迁移的前置契约，
+并不关闭 TextKit source mirror 的字形回退。见 ADR 0135。
+
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
 文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
 编辑后可以先 `invalidate_stale`，再发布新结果。这个 cache 不拥有 source、EditorDocument、

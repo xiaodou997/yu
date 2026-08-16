@@ -504,7 +504,11 @@
    写入 canonical `LayoutCache`、source、Markdown CST、Revision 或 Undo；无法解析的范围仍必须整体
    回退 native source mirror，而不能发布部分 scene。composition generation 改变但 Revision 不变
    时，macOS submit key 必须仍然失效并重新发布；cancel 后必须重新发布 canonical glyph scene。
-7. `yu_storage_session_macos_visual_render_plan` 与
+7. `yu-layout`/CoreText 产生的 block glyph、caret 和 damage 坐标必须保持 document space；macOS
+   RenderPlan 的 viewport 原点必须使用同一 frame 的 `scroll_y`，native Metal bridge 才能在唯一
+   边界转换为 surface-local 坐标。viewport width/height 代表可见 surface 尺寸，不得用整篇文档
+   高度替代；scroll origin 不一致的 frame 不得作为生产 visual renderer 的提交输入。
+8. `yu_storage_session_macos_visual_render_plan` 与
    `yu_storage_session_macos_visual_scene_glyphs` 的 count/fill header 必须同时携带
    `composition_generation`。当 fill capacity 非零时，Rust 必须先验证调用方保留的 header 与当前
    Revision/generation 完全一致；generation 变化必须返回 `YU_STORAGE_STALE_COMPOSITION`、清空

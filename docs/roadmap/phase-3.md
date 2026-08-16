@@ -40,6 +40,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] visual IME composition hit-test 使用 Revision + composition generation-bound transient projection，覆盖跨 block document-space mapping
 - [x] visual IME preedit 在所属 block 使用 CoreText shaped glyph、CPU atlas 与持久 Metal surface 发布
 - [x] visual IME preedit 的跨 block transient layout：按受影响 block span 投影、重测 viewport 高度并进入持久 RenderPlan/Metal publication
+- [x] macOS RenderPlan 将 document-space scroll origin 传入 Metal viewport，统一滚动后的 glyph/damage 坐标变换（仍保留 TextKit 字形回退）
 - [ ] 完整 visual renderer 迁移（移除 TextKit source mirror 的生产渲染职责）
 
 ## Track C：Scene and rendering
