@@ -11,12 +11,14 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use yu_assets::ImageKey;
 use yu_core::Revision;
 use yu_editor::{BlockKind, EditorDocument, EditorDocumentError, ShapingProvider, ViewportRect};
 use yu_font::GlyphAtlas;
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
-    Rect, Rgba8, Scene, SceneBuilder, SceneError, ViewportBlockGeometry, ViewportSceneInput,
+    ImagePrimitive, Rect, Rgba8, Scene, SceneBuilder, SceneError, ViewportBlockGeometry,
+    ViewportSceneInput,
 };
 
 mod workspace;
@@ -587,7 +589,66 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
         .iter()
         .map(|block| viewport_block_background(block.kind()))
         .collect::<Vec<_>>();
-    builder.append_viewport_with_fills(&input, &layout_refs, atlas, font_size, color, &fills)?;
+    let source = document.snapshot();
+    let definitions = document.markdown().reference_definitions();
+    let mut images = Vec::with_capacity(layouts.len());
+    for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
+        let mut block_images = Vec::new();
+        for placement in layout.images() {
+            let Some(image) = layout
+                .projection()
+                .images()
+                .iter()
+                .copied()
+                .find(|image| image.source() == placement.source())
+            else {
+                continue;
+            };
+            let destination = image.destination().or_else(|| {
+                image
+                    .reference()
+                    .and_then(|reference| definitions.lookup(&source, reference))
+                    .map(|definition| definition.destination())
+            });
+            let Some(destination) = destination else {
+                continue;
+            };
+            let Ok(start) = usize::try_from(destination.start().get()) else {
+                continue;
+            };
+            let Ok(end) = usize::try_from(destination.end().get()) else {
+                continue;
+            };
+            let Some(destination) = source.as_str().get(start..end) else {
+                continue;
+            };
+            let Ok(key) = ImageKey::new(destination.to_owned()) else {
+                continue;
+            };
+            let bounds = placement.bounds();
+            let bounds = Rect::new(
+                bounds.x(),
+                bounds.y() + block.y(),
+                bounds.width(),
+                bounds.height(),
+            )?;
+            block_images.push(ImagePrimitive::new(
+                key.fingerprint(),
+                bounds,
+                Rgba8::new(232, 234, 238, 255),
+            ));
+        }
+        images.push(block_images);
+    }
+    builder.append_viewport_with_fills_and_images(
+        &input,
+        &layout_refs,
+        atlas,
+        font_size,
+        color,
+        &fills,
+        &images,
+    )?;
     Ok(ViewportSceneFrame {
         input,
         scene: builder.finish(),

@@ -142,6 +142,7 @@ pub enum LayoutError {
     InvalidMetrics(u32),
     Shaping(String),
     InvalidPoint,
+    InvalidImageBounds,
     OffsetOverflow,
 }
 
@@ -325,6 +326,9 @@ impl fmt::Display for LayoutError {
             Self::InvalidPoint => {
                 formatter.write_str("layout point must contain finite coordinates")
             }
+            Self::InvalidImageBounds => {
+                formatter.write_str("image bounds must be finite and have positive height")
+            }
             Self::OffsetOverflow => formatter.write_str("layout offset overflow"),
         }
     }
@@ -338,6 +342,7 @@ impl Error for LayoutError {
             | Self::InvalidMetrics(_)
             | Self::Shaping(_)
             | Self::InvalidPoint
+            | Self::InvalidImageBounds
             | Self::OffsetOverflow => None,
         }
     }
@@ -354,6 +359,59 @@ impl From<ProjectionError> for LayoutError {
 pub struct LayoutPoint {
     x: f32,
     y: f32,
+}
+
+/// A finite, non-negative image rectangle in block-local layout coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayoutRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl LayoutRect {
+    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Result<Self, LayoutError> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || !width.is_finite()
+            || !height.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || width < 0.0
+            || height <= 0.0
+            || !(x + width).is_finite()
+            || !(y + height).is_finite()
+        {
+            return Err(LayoutError::InvalidImageBounds);
+        }
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    #[must_use]
+    pub const fn x(self) -> f32 {
+        self.x
+    }
+
+    #[must_use]
+    pub const fn y(self) -> f32 {
+        self.y
+    }
+
+    #[must_use]
+    pub const fn width(self) -> f32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(self) -> f32 {
+        self.height
+    }
 }
 
 impl LayoutPoint {
@@ -409,6 +467,45 @@ pub struct GlyphPlacement {
     x: f32,
     y: f32,
     style: VisualRunStyle,
+}
+
+/// Source-backed geometry for one Markdown image. The destination/resource
+/// identity is intentionally resolved by the workspace layer; layout only
+/// determines where the image occupies the projected alt-label span.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImagePlacement {
+    source: TextRange,
+    label: TextRange,
+    visual: VisualRange,
+    line: usize,
+    bounds: LayoutRect,
+}
+
+impl ImagePlacement {
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn label(self) -> TextRange {
+        self.label
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualRange {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn line(self) -> usize {
+        self.line
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> LayoutRect {
+        self.bounds
+    }
 }
 
 impl GlyphPlacement {
@@ -589,6 +686,7 @@ pub struct LayoutHit {
     line: usize,
     point: LayoutPoint,
     bias: ProjectionBias,
+    image: Option<TextRange>,
 }
 
 impl LayoutHit {
@@ -616,6 +714,14 @@ impl LayoutHit {
     pub const fn bias(self) -> ProjectionBias {
         self.bias
     }
+
+    /// Returns the complete source range when this point landed on an image
+    /// placement. Callers can use it to select/activate the image as one
+    /// source-backed object instead of placing a caret inside its alt label.
+    #[must_use]
+    pub const fn image(self) -> Option<TextRange> {
+        self.image
+    }
 }
 
 /// A revision-bound, block-local layout snapshot.
@@ -626,6 +732,7 @@ pub struct LayoutSnapshot {
     lines: Vec<VisualLine>,
     clusters: Vec<VisualCluster>,
     glyphs: Vec<GlyphPlacement>,
+    images: Vec<ImagePlacement>,
 }
 
 impl LayoutSnapshot {
@@ -682,8 +789,10 @@ impl LayoutSnapshot {
             lines: Vec::new(),
             clusters: Vec::new(),
             glyphs: Vec::new(),
+            images: Vec::new(),
         };
         layout.build(metrics)?;
+        layout.build_image_placements()?;
         Ok(layout)
     }
 
@@ -700,8 +809,10 @@ impl LayoutSnapshot {
             lines: Vec::new(),
             clusters: Vec::new(),
             glyphs: Vec::new(),
+            images: Vec::new(),
         };
         layout.build_shaped(shaper)?;
+        layout.build_image_placements()?;
         Ok(layout)
     }
 
@@ -743,6 +854,12 @@ impl LayoutSnapshot {
     #[must_use]
     pub fn glyphs(&self) -> &[GlyphPlacement] {
         &self.glyphs
+    }
+
+    /// Returns source-backed image geometry in parser span order.
+    #[must_use]
+    pub fn images(&self) -> &[ImagePlacement] {
+        &self.images
     }
 
     #[must_use]
@@ -811,12 +928,26 @@ impl LayoutSnapshot {
                 })
             })
             .collect::<Result<Vec<_>, LayoutError>>()?;
+        let images = self
+            .images
+            .iter()
+            .map(|image| {
+                Ok(ImagePlacement {
+                    source: map_source_range(image.source, changes)?,
+                    label: map_source_range(image.label, changes)?,
+                    visual: image.visual,
+                    line: image.line,
+                    bounds: image.bounds,
+                })
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
         Ok(Some(Self {
             projection,
             config: self.config,
             lines,
             clusters,
             glyphs,
+            images,
         }))
     }
 
@@ -853,6 +984,46 @@ impl LayoutSnapshot {
     /// Hit-tests a local point and returns a source boundary.
     pub fn hit_test(&self, point: LayoutPoint) -> Result<LayoutHit, LayoutError> {
         point.validate()?;
+        if let Some(image) = self.images.iter().find(|image| {
+            let bounds = image.bounds;
+            point.x >= bounds.x()
+                && point.x <= bounds.x() + bounds.width()
+                && point.y >= bounds.y()
+                && point.y <= bounds.y() + bounds.height()
+        }) {
+            let bounds = image.bounds;
+            let midpoint = bounds.x() + bounds.width() * 0.5;
+            let before = point.x < midpoint;
+            let visual = if before {
+                image.visual.start()
+            } else {
+                image.visual.end()
+            };
+            let source = if before {
+                image.source.start()
+            } else {
+                image.source.end()
+            };
+            return Ok(LayoutHit {
+                source,
+                visual,
+                line: image.line,
+                point: LayoutPoint::new(
+                    if before {
+                        bounds.x()
+                    } else {
+                        bounds.x() + bounds.width()
+                    },
+                    bounds.y(),
+                ),
+                bias: if before {
+                    ProjectionBias::Before
+                } else {
+                    ProjectionBias::After
+                },
+                image: Some(image.source),
+            });
+        }
         let line = self.line_for_y(point.y);
         let line_data = &self.lines[line];
         let mut visual = line_data.visual.start();
@@ -891,7 +1062,64 @@ impl LayoutSnapshot {
             line,
             point: LayoutPoint::new(x, line_data.y()),
             bias,
+            image: None,
         })
+    }
+
+    fn build_image_placements(&mut self) -> Result<(), LayoutError> {
+        let mut placements = Vec::with_capacity(self.projection.images().len());
+        for image in self.projection.images().iter().copied() {
+            let visual_start = self
+                .projection
+                .source_to_visual(image.label().start(), ProjectionBias::Before)?;
+            let visual_end = self
+                .projection
+                .source_to_visual(image.label().end(), ProjectionBias::After)?;
+            let visual =
+                VisualRange::new(visual_start, visual_end).ok_or(LayoutError::OffsetOverflow)?;
+            let line_index = self.line_for_visual(visual.start(), ProjectionBias::Before);
+            let line = &self.lines[line_index];
+            let mut left = f32::INFINITY;
+            let mut right = 0.0_f32;
+            let mut found_cluster = false;
+            for cluster_index in line.clusters.clone() {
+                let cluster = self.clusters[cluster_index];
+                if cluster.is_line_break() {
+                    continue;
+                }
+                let overlaps = if visual.is_empty() {
+                    cluster.visual().start() == visual.start()
+                } else {
+                    cluster.visual().start() < visual.end()
+                        && visual.start() < cluster.visual().end()
+                };
+                if overlaps {
+                    found_cluster = true;
+                    left = left.min(cluster.x());
+                    right = right.max(cluster.x() + cluster.width());
+                }
+            }
+            if !found_cluster {
+                let point = self
+                    .point_for_visual(visual.start(), ProjectionBias::Before)?
+                    .1;
+                left = point.x();
+                right = point.x();
+            }
+            let minimum_width = self.config.line_height * 4.0;
+            let remaining = (self.config.max_width - left).max(self.config.line_height);
+            let width = (right - left).max(minimum_width).min(remaining);
+            let bounds = LayoutRect::new(left.max(0.0), line.y(), width, self.config.line_height)?;
+            placements.push(ImagePlacement {
+                source: image.source(),
+                label: image.label(),
+                visual,
+                line: line_index,
+                bounds,
+            });
+        }
+        self.images = placements;
+        Ok(())
     }
 
     fn build<M: ClusterMetrics>(&mut self, metrics: &M) -> Result<(), LayoutError> {
@@ -1390,6 +1618,38 @@ mod tests {
         let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
             .expect("source range should be ordered");
         Projection::inline(&snapshot, range).expect("projection should build")
+    }
+
+    #[test]
+    fn image_placement_uses_alt_span_and_hit_test_returns_whole_source_range() {
+        let source = "![alt](image.png)";
+        let projection = projection(source);
+        let layout = LayoutSnapshot::from_projection(&projection, LayoutConfig::new(80.0, 10.0))
+            .expect("image layout");
+        assert_eq!(layout.images().len(), 1);
+        let image = layout.images()[0];
+        assert_eq!(image.label().start().get(), 2);
+        assert_eq!(image.label().end().get(), 5);
+        assert!(image.bounds().width() >= 40.0);
+        assert_eq!(image.bounds().y(), 0.0);
+
+        let left_hit = layout
+            .hit_test(LayoutPoint::new(
+                image.bounds().x() + 1.0,
+                image.bounds().y() + 5.0,
+            ))
+            .expect("left image hit");
+        assert_eq!(left_hit.image(), Some(image.source()));
+        assert_eq!(left_hit.source(), image.source().start());
+
+        let right_hit = layout
+            .hit_test(LayoutPoint::new(
+                image.bounds().x() + image.bounds().width() - 1.0,
+                image.bounds().y() + 5.0,
+            ))
+            .expect("right image hit");
+        assert_eq!(right_hit.image(), Some(image.source()));
+        assert_eq!(right_hit.source(), image.source().end());
     }
 
     #[derive(Clone, Copy)]

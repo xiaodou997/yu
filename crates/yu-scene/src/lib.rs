@@ -598,6 +598,32 @@ impl SceneBuilder {
         color: Rgba8,
         fills: &[Option<Rgba8>],
     ) -> Result<usize, SceneError> {
+        self.append_viewport_with_fills_and_images(
+            input,
+            layouts,
+            atlas,
+            font_size,
+            color,
+            fills,
+            &[],
+        )
+    }
+
+    /// Appends visible blocks with optional backgrounds and source-backed
+    /// image overlays. Images are ordered after the block's glyphs so an
+    /// opaque ready texture or fallback placeholder covers the projected alt
+    /// label without changing canonical source text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_viewport_with_fills_and_images(
+        &mut self,
+        input: &ViewportSceneInput,
+        layouts: &[&LayoutSnapshot],
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+        fills: &[Option<Rgba8>],
+        images: &[Vec<ImagePrimitive>],
+    ) -> Result<usize, SceneError> {
         if input.revision() != self.revision {
             return Err(SceneError::ViewportRevisionMismatch {
                 expected: self.revision,
@@ -612,6 +638,11 @@ impl SceneBuilder {
         if !fills.is_empty() && fills.len() != input.blocks().len() {
             return Err(SceneError::InvalidViewportInput(
                 "viewport fill count must match input blocks",
+            ));
+        }
+        if !images.is_empty() && images.len() != input.blocks().len() {
+            return Err(SceneError::InvalidViewportInput(
+                "viewport image count must match input blocks",
             ));
         }
 
@@ -661,6 +692,9 @@ impl SceneBuilder {
                 .into_iter()
                 .map(Primitive::Glyph),
             );
+            if let Some(block_images) = images.get(offset) {
+                primitives.extend(block_images.iter().copied().map(Primitive::Image));
+            }
         }
         self.commit_primitives(primitives)
     }
@@ -783,9 +817,12 @@ impl SceneBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yu_core::{ByteOffset, TextRange};
     use yu_font::{
         GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
     };
+    use yu_projection::Projection;
+    use yu_text::TextBuffer;
 
     fn atlas_entry(glyph: u32) -> AtlasEntry {
         let key = GlyphRasterKey::new(
@@ -851,5 +888,38 @@ mod tests {
         assert!(Rect::new(0.0, 0.0, f32::NAN, 1.0).is_err());
         assert!(Point::new(f32::INFINITY, 0.0).validate().is_err());
         assert_eq!(DamageSet::new(0), Err(SceneError::InvalidDamageBudget));
+    }
+
+    #[test]
+    fn viewport_images_are_appended_after_block_content() {
+        let source = TextBuffer::new("").snapshot();
+        let source_range = TextRange::new(ByteOffset::ZERO, ByteOffset::ZERO).expect("range");
+        let projection = Projection::inline(&source, source_range).expect("projection");
+        let layout =
+            LayoutSnapshot::from_projection(&projection, yu_layout::LayoutConfig::new(80.0, 10.0))
+                .expect("layout");
+        let revision = layout.revision();
+        let geometry = ViewportBlockGeometry::new(revision, 0, source_range, 0.0, 10.0, true, 0)
+            .expect("geometry");
+        let input = ViewportSceneInput::new(revision, 0..1, 10.0, vec![geometry]).expect("input");
+        let bounds = Rect::new(4.0, 0.0, 32.0, 10.0).expect("image bounds");
+        let image = ImagePrimitive::new(42, bounds, Rgba8::new(232, 234, 238, 255));
+        let atlas = GlyphAtlas::new(GlyphAtlasConfig::default());
+        let mut builder =
+            SceneBuilder::new(revision, Rect::new(0.0, 0.0, 80.0, 10.0).expect("viewport"))
+                .expect("builder");
+        let count = builder
+            .append_viewport_with_fills_and_images(
+                &input,
+                &[&layout],
+                &atlas,
+                12.0,
+                Rgba8::black(),
+                &[],
+                &[vec![image]],
+            )
+            .expect("append image");
+        assert_eq!(count, 1);
+        assert_eq!(builder.finish().primitives(), &[Primitive::Image(image)]);
     }
 }
