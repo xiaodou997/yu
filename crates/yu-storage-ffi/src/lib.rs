@@ -44,7 +44,10 @@ use yu_workspace::{
 };
 
 #[cfg(target_os = "macos")]
-use yu_assets::{ImageCache, ImageFailureKind, ImagePublication, ImageRequest, ImageRequestResult};
+use yu_assets::{
+    ImageCache, ImageFailureKind, ImageIntrinsicPublication, ImagePublication, ImageRequest,
+    ImageRequestResult,
+};
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
 #[cfg(target_os = "macos")]
@@ -889,6 +892,7 @@ struct MacosImageResourceState {
     cache: ImageCache,
     worker: MacosImageDecodeWorker,
     publications: BTreeMap<u64, ImagePublication>,
+    intrinsics: BTreeMap<u64, ImageIntrinsicPublication>,
     in_flight: HashSet<ImageKey>,
     visible_request_count: usize,
 }
@@ -915,6 +919,7 @@ impl MacosImageResourceState {
             worker: MacosImageDecodeWorker::new()
                 .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
             publications: BTreeMap::new(),
+            intrinsics: BTreeMap::new(),
             in_flight: HashSet::new(),
             visible_request_count: 0,
         })
@@ -927,6 +932,7 @@ impl MacosImageResourceState {
         document_path: PathBuf,
     ) -> Result<(), i32> {
         self.visible_request_count = requests.len();
+        self.cache.advance_retry_clock();
         while let Some(result) = self
             .worker
             .try_recv()
@@ -954,16 +960,29 @@ impl MacosImageResourceState {
         }
 
         self.publications.clear();
+        self.intrinsics.clear();
         for request in requests {
+            let request_for_metadata = request.clone();
             if self.in_flight.contains(request.key()) {
+                if let Some(intrinsic) = self.cache.intrinsic_publication(&request_for_metadata) {
+                    self.intrinsics
+                        .insert(intrinsic.key().fingerprint(), intrinsic);
+                }
                 continue;
             }
             match self.cache.request(request) {
                 ImageRequestResult::Ready(publication) => {
+                    let intrinsic = publication.intrinsic_publication();
                     self.publications
                         .insert(publication.key().fingerprint(), publication);
+                    self.intrinsics
+                        .insert(intrinsic.key().fingerprint(), intrinsic);
                 }
                 ImageRequestResult::Pending | ImageRequestResult::Failed(_) => {}
+            }
+            if let Some(intrinsic) = self.cache.intrinsic_publication(&request_for_metadata) {
+                self.intrinsics
+                    .insert(intrinsic.key().fingerprint(), intrinsic);
             }
         }
 
@@ -5316,11 +5335,17 @@ fn macos_render_host_frame(
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    let image_intrinsics = state
+        .image_resources
+        .intrinsics
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
     let publication = {
         let document = session.session.document_mut().editor_mut();
         state
             .builder
-            .publish_with_images(document, &image_publications)
+            .publish_with_images_and_intrinsics(document, &image_publications, &image_intrinsics)
             .map_err(|error| macos_render_host_error_status(&error))?
     };
     state
