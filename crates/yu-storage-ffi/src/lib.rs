@@ -1804,6 +1804,71 @@ pub unsafe extern "C" fn yu_storage_session_execute_command(
     command_result_output(&session.session, result, output)
 }
 
+/// Executes one vertical caret command against the current macOS shaped
+/// block layouts. The command result still uses the ordinary source/selection
+/// contract; CoreText is only a caller-owned layout provider for this query.
+/// The host must have published matching viewport metrics first.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_move_vertical(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    command: u8,
+    size: f32,
+    max_width: f32,
+    output: *mut YuStorageCommandResult,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageCommandResult::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session, expected_revision, command, size, max_width);
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(&session.session, expected_revision) {
+            return status;
+        }
+        let (up, extend) = match command {
+            YU_STORAGE_COMMAND_MOVE_UP => (true, false),
+            YU_STORAGE_COMMAND_MOVE_DOWN => (false, false),
+            YU_STORAGE_COMMAND_MOVE_UP_EXTEND => (true, true),
+            YU_STORAGE_COMMAND_MOVE_DOWN_EXTEND => (false, true),
+            _ => return YU_STORAGE_INVALID_COMMAND,
+        };
+        let (shaper, metrics, config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        let viewport_config = session.session.viewport_config().layout();
+        if (viewport_config.max_width() - max_width).abs() > 0.05
+            || (viewport_config.line_height() - metrics.line_height()).abs() > 0.05
+            || (viewport_config.default_advance() - metrics.default_advance()).abs() > 0.05
+        {
+            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        }
+        let result = match session
+            .session
+            .move_vertical_with_shaper(up, extend, config, &shaper)
+        {
+            Ok(result) => result,
+            Err(error) => return storage_status(error),
+        };
+        command_result_output(&session.session, result, output)
+    }
+}
+
 /// Inserts permanent text through the same editor command path used by all
 /// other native edits. `expected_revision` prevents an NSTextInputClient
 /// callback queued for an older source mirror from applying late.
@@ -5619,6 +5684,112 @@ mod tests {
         assert_eq!(
             unsafe {
                 yu_storage_session_projection_hit_test(raw, 0, 7.1, 0.0, 80.0, 1.0, 1.0, &mut hit)
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_shaped_vertical_command_preserves_revision_and_selection_contract() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-shaped-vertical-{id}.md"));
+        let source = "abcdefghij\nxy\n1234567890";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut metrics = YuStorageMacosFontMetrics::default();
+        assert_eq!(
+            unsafe { yu_storage_session_macos_font_metrics(raw, 0, 14.0, 500.0, &mut metrics) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height,
+                    metrics.default_advance,
+                    metrics.line_height,
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let first_line_end = source.find('\n').expect("line ending") as u64;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection(
+                    raw,
+                    0,
+                    first_line_end,
+                    first_line_end,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_move_vertical(
+                    raw,
+                    0,
+                    YU_STORAGE_COMMAND_MOVE_DOWN,
+                    14.0,
+                    500.0,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(result.revision, 0);
+        assert_eq!(result.selection_start_utf16, first_line_end + 1 + 2);
+        assert_eq!(result.selection_end_utf16, first_line_end + 1 + 2);
+
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_move_vertical(
+                    raw,
+                    0,
+                    YU_STORAGE_COMMAND_MOVE_DOWN,
+                    14.0,
+                    500.0,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(result.revision, 0);
+        let second_line_focus = result.selection_end_utf16;
+        assert!(second_line_focus > first_line_end + 1 + 2);
+        assert!(second_line_focus <= source.encode_utf16().count() as u64);
+
+        let mut inserted = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut inserted) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_move_vertical(
+                    raw,
+                    0,
+                    YU_STORAGE_COMMAND_MOVE_UP,
+                    14.0,
+                    500.0,
+                    &mut result,
+                )
             },
             YU_STORAGE_STALE_REVISION
         );
