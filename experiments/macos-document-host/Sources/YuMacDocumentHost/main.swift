@@ -2691,6 +2691,7 @@ private final class DocumentTextView: NSTextView {
     private var visualSelectionAnchor: Int?
     private var sourceSelectedTextAttributes: [NSAttributedString.Key: Any]?
     private var externalVisualDecorationsEnabled = false
+    private var sourceGlyphsHidden = false
     var onDocumentChange: (() -> Void)?
     var onBeforeCommand: (() -> Void)?
     var onCaretChange: (() -> Void)?
@@ -2790,6 +2791,21 @@ private final class DocumentTextView: NSTextView {
         guard externalVisualDecorationsEnabled != enabled else { return }
         externalVisualDecorationsEnabled = enabled
         needsDisplay = true
+    }
+
+    /// Hides only TextKit's source glyph painting after the Rust surface and
+    /// its decoration geometry have both been accepted for the same
+    /// Revision/generation. TextKit remains the live NSTextInputClient and
+    /// Accessibility owner; clearing this flag restores the complete native
+    /// fallback without rebuilding the document model.
+    func setSourceGlyphsHidden(_ hidden: Bool) {
+        guard sourceGlyphsHidden != hidden else { return }
+        sourceGlyphsHidden = hidden
+        needsDisplay = true
+    }
+
+    var sourceGlyphsHiddenForSelfCheck: Bool {
+        sourceGlyphsHidden
     }
 
     func refreshVisualMirrorForDisplay() throws {
@@ -3377,7 +3393,7 @@ private final class DocumentTextView: NSTextView {
         color: NSColor,
         turnedOn: Bool
     ) {
-        if externalVisualDecorationsEnabled {
+        if sourceGlyphsHidden || externalVisualDecorationsEnabled {
             return
         }
         guard let visualRect = visualCaretRectForDisplay() else {
@@ -3388,6 +3404,7 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func draw(_ rect: NSRect) {
+        guard !sourceGlyphsHidden else { return }
         super.draw(rect)
         guard visualMirrorEnabled, !externalVisualDecorationsEnabled else { return }
         let selectionRects = visualSelectionRectsForDisplay()
@@ -4015,7 +4032,9 @@ private final class MacosSurfaceHostView: NSView {
     }
 }
 
-/// Draws visual selection/caret decorations above the Rust glyph surface.
+/// Draws visual selection/caret decorations above the Rust-shaped glyph
+/// surface. Geometry is supplied by Rust; TextKit remains the fallback
+/// painter while the surface publication is stale or unavailable.
 ///
 /// This view is intentionally transparent to AppKit hit-testing. The source
 /// TextKit view remains the owner of keyboard, IME and Accessibility events;
@@ -4127,6 +4146,7 @@ private final class MacosSurfaceHostCoordinator {
     private var scheduleToken: UInt64 = 0
 
     var onError: ((Error) -> Void)?
+    var onSurfaceStateChange: (() -> Void)?
     private(set) var isAttached = false
 
     init(bridge: StorageBridge, fontSize: CGFloat = 16.0) {
@@ -4179,6 +4199,49 @@ private final class MacosSurfaceHostCoordinator {
         scheduleSubmit()
     }
 
+    /// Returns true only when the Metal surface has accepted the current Rust
+    /// revision, transient composition generation and complete submit
+    /// geometry. A visible old frame is deliberately insufficient: source
+    /// glyphs must remain available until the replacement publication has
+    /// reached the native surface after an edit, scroll, resize or scale
+    /// change.
+    func hasCurrentPublication(revision: UInt64, compositionGeneration: UInt64) -> Bool {
+        guard isAttached,
+              surfaceView?.nativeContentVisible == true,
+              let snapshot = lastSnapshot,
+              let currentKey = currentSubmitKey else {
+            return false
+        }
+        return snapshot.submitted
+            && snapshot.revision == revision
+            && snapshot.compositionGeneration == compositionGeneration
+            && currentKey.revision == revision
+            && currentKey.compositionGeneration == compositionGeneration
+            && lastSubmitKey == currentKey
+    }
+
+    private var currentSubmitKey: SubmitKey? {
+        guard let surfaceView,
+              let scrollView,
+              let window = surfaceView.window,
+              surfaceView.bounds.width > 0.0,
+              surfaceView.bounds.height > 0.0 else {
+            return nil
+        }
+        let viewportBounds = scrollView.contentView.bounds
+        return SubmitKey(
+            revision: bridge.state.revision,
+            compositionGeneration: bridge.composition.generation,
+            size: Double(max(fontSize, 1.0)),
+            maxWidth: Double(layoutWidth(for: surfaceView)),
+            scrollY: Double(max(viewportBounds.origin.y, 0.0)),
+            viewportHeight: Double(max(viewportBounds.height, 1.0)),
+            surfaceWidth: Double(max(surfaceView.bounds.width, 1.0)),
+            surfaceHeight: Double(max(surfaceView.bounds.height, 1.0)),
+            scale: Double(max(window.backingScaleFactor, 1.0))
+        )
+    }
+
     private func layoutWidth(for surfaceView: MacosSurfaceHostView) -> CGFloat {
         max(contentWidth ?? surfaceView.bounds.width, 1.0)
     }
@@ -4194,6 +4257,7 @@ private final class MacosSurfaceHostCoordinator {
                 _ = try self.submitNow()
             } catch {
                 self.surfaceView?.setNativeContentVisible(false)
+                self.onSurfaceStateChange?()
                 self.onError?(error)
             }
         }
@@ -4382,6 +4446,7 @@ private final class MacosSurfaceHostCoordinator {
         lastSubmitKey = key
         lastSnapshot = snapshot
         surfaceView.setNativeContentVisible(true)
+        onSurfaceStateChange?()
         return snapshot
     }
 
@@ -4400,6 +4465,7 @@ private final class MacosSurfaceHostCoordinator {
         lastSnapshot = nil
         metrics = nil
         surfaceView?.setNativeContentVisible(false)
+        onSurfaceStateChange?()
     }
 
     private func ensureMetrics(
@@ -4496,6 +4562,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         self.surfaceCoordinator = MacosSurfaceHostCoordinator(bridge: bridge)
         self.initialState = bridge.state
         super.init(nibName: nil, bundle: nil)
+        surfaceCoordinator.onSurfaceStateChange = { [weak self] in
+            self?.updateVisualDecorations()
+        }
         surfaceCoordinator.onError = { [weak self] error in
             // The source TextKit mirror remains usable when a machine has no
             // Metal drawable; surface lifecycle failure is diagnostic, not a
@@ -4688,6 +4757,22 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private func clearVisualDecorations() {
         decorationHostView.clear()
         textView.setExternalVisualDecorationsEnabled(false)
+        textView.setSourceGlyphsHidden(false)
+    }
+
+    private func syncSourceGlyphVisibility() {
+        let revision = bridge.state.revision
+        let publicationCurrent = surfaceCoordinator.hasCurrentPublication(
+            revision: revision,
+            compositionGeneration: bridge.composition.generation
+        )
+        let decorationCurrent = decorationHostView.revision == revision
+            && decorationHostView.hasValidFrame
+        textView.setSourceGlyphsHidden(
+            publicationCurrent
+                && decorationCurrent
+                && !bridge.composition.active
+        )
     }
 
     /// Publishes Rust/CoreText-shaped decoration geometry into the sibling
@@ -4739,6 +4824,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                     compositionActive: false
                 )
                 textView.setExternalVisualDecorationsEnabled(true)
+                syncSourceGlyphVisibility()
                 return
             } catch {
                 // Active marked text intentionally returns NO_OVERLAY; stale
@@ -4747,6 +4833,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             }
         }
         updateVisualDecorationsFromTextKit()
+        syncSourceGlyphVisibility()
     }
 
     /// Converts the disposable visual mirror geometry into the sibling
@@ -4770,6 +4857,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             compositionActive: bridge.composition.active
         )
         textView.setExternalVisualDecorationsEnabled(true)
+        syncSourceGlyphVisibility()
     }
 
     @objc private func save() {
@@ -5594,6 +5682,11 @@ private func runVisualDecorationSelfCheck(path: String) -> Never {
         precondition(decoration.selectionRects.count == rustSelection.count)
         precondition(decoration.caretRect != nil)
         precondition(decoration.hitTest(NSPoint(x: 1.0, y: 1.0)) == nil)
+        textView.setSourceGlyphsHidden(true)
+        precondition(textView.sourceGlyphsHiddenForSelfCheck)
+        precondition(textView.string == bridge.source)
+        textView.setSourceGlyphsHidden(false)
+        precondition(!textView.sourceGlyphsHiddenForSelfCheck)
 
         _ = try bridge.insertText("x")
         do {
@@ -6980,29 +7073,71 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         precondition(coordinator.isAttached)
         precondition(surfaceView.nativeContentVisible)
         precondition(surfaceView.hitTest(NSPoint(x: 12.0, y: 12.0)) == nil)
+        precondition(
+            coordinator.hasCurrentPublication(
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation
+            )
+        )
 
         let resizedFrame = NSRect(x: 0.0, y: 0.0, width: 540.0, height: 280.0)
         root.setFrameSize(resizedFrame.size)
         surfaceView.frame = resizedFrame
         scrollView.frame = resizedFrame
         window.setContentSize(resizedFrame.size)
+        precondition(
+            !coordinator.hasCurrentPublication(
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation
+            )
+        )
         window.displayIfNeeded()
         let resized = try unwrapSelfCheck(coordinator.submitNow())
         precondition(resized.surfaceGeneration == first.surfaceGeneration + 1)
         precondition(resized.frameSerial > first.frameSerial)
         precondition(resized.submitted)
+        precondition(
+            coordinator.hasCurrentPublication(
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation
+            )
+        )
 
         scrollView.contentView.setBoundsOrigin(NSPoint(x: 0.0, y: 120.0))
+        precondition(
+            !coordinator.hasCurrentPublication(
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation
+            )
+        )
         let scrolled = try unwrapSelfCheck(coordinator.submitNow())
         precondition(scrolled.surfaceGeneration == resized.surfaceGeneration)
         precondition(scrolled.frameSerial > resized.frameSerial)
         precondition(scrolled.submitted)
+        precondition(
+            coordinator.hasCurrentPublication(
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation
+            )
+        )
 
         _ = try bridge.insertText("!")
+        precondition(
+            !coordinator.hasCurrentPublication(
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation
+            )
+        )
         let edited = try unwrapSelfCheck(coordinator.submitNow())
         precondition(edited.revision == bridge.state.revision)
         precondition(edited.frameSerial > scrolled.frameSerial)
         precondition(edited.submitted)
+        precondition(
+            coordinator.hasCurrentPublication(
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation
+            )
+        )
 
         surfaceView.removeFromSuperview()
         precondition(!coordinator.isAttached)
