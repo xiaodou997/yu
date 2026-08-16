@@ -631,9 +631,11 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let surfaceGeneration: UInt64
     let frameSerial: UInt64
     let uploadedPages: Int
+    let uploadedImages: Int
     let commandCount: Int
     let damageCount: Int
     let atlasPageCount: Int
+    let imageResourceCount: Int
     let submitted: Bool
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
@@ -642,9 +644,11 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
         surfaceGeneration = value.surface_generation
         frameSerial = value.frame_serial
         uploadedPages = Int(value.uploaded_pages)
+        uploadedImages = Int(value.uploaded_images)
         commandCount = Int(value.command_count)
         damageCount = Int(value.damage_count)
         atlasPageCount = Int(value.atlas_page_count)
+        imageResourceCount = Int(value.image_resource_count)
         submitted = value.submitted != 0
     }
 }
@@ -6949,8 +6953,39 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
     }
 }
 
+private func installMacosImageSelfCheckFixture(at markdownPath: String) throws -> URL? {
+    let markdownURL = URL(fileURLWithPath: markdownPath)
+    let imageURL = markdownURL.deletingLastPathComponent()
+        .appendingPathComponent("assets", isDirectory: true)
+        .appendingPathComponent("yu-logo.png")
+    let fileManager = FileManager.default
+    guard !fileManager.fileExists(atPath: imageURL.path) else {
+        return nil
+    }
+    try fileManager.createDirectory(
+        at: imageURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    let png = Data([
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+        0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0, 0, 0, 181, 28, 12, 2,
+        0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15,
+        0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78,
+        68, 174, 66, 96, 130
+    ])
+    try png.write(to: imageURL, options: .atomic)
+    return imageURL
+}
+
+private func removeMacosImageSelfCheckFixture(_ imageURL: URL?) {
+    guard let imageURL else { return }
+    try? FileManager.default.removeItem(at: imageURL)
+    try? FileManager.default.removeItem(at: imageURL.deletingLastPathComponent())
+}
+
 private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
     do {
+        let imageFixture = try installMacosImageSelfCheckFixture(at: path)
         let bridge = try StorageBridge(path: path)
         let sourceBefore = bridge.source
         let revision = bridge.state.revision
@@ -7036,6 +7071,35 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
         precondition(repeated.frameSerial > first.frameSerial)
         precondition(repeated.uploadedPages == 0)
         precondition(repeated.submitted)
+
+        var imagePublicationReady = false
+        if sourceBefore.contains("![") {
+            var imageReady = repeated
+            for _ in 0..<20 {
+                let candidate = try bridge.macosRenderHostSurfaceSubmit(
+                    revision: revision,
+                    size: size,
+                    maxWidth: maxWidth,
+                    scrollY: 0.0,
+                    viewportHeight: viewportHeight,
+                    surfaceWidth: Double(maxWidth),
+                    surfaceHeight: Double(viewportHeight),
+                    scale: 2.0,
+                    view: rawView
+                )
+                imageReady = candidate
+                if candidate.imageResourceCount > 0 {
+                    break
+                }
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+            }
+            precondition(imageReady.imageResourceCount > 0)
+            precondition(imageReady.uploadedImages > 0 || repeated.imageResourceCount > 0)
+            imagePublicationReady = true
+        }
+        // The self-check exits explicitly below, so clean the temporary
+        // fixture before that exit instead of relying on Swift defer.
+        removeMacosImageSelfCheckFixture(imageFixture)
 
         let strong = (sourceBefore as NSString).range(of: "粗体")
         precondition(strong.location != NSNotFound)
@@ -7161,6 +7225,7 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
         print(
             "Yu macOS Metal surface self-check: persistent CAMetalLayer attachment, repeated submit, "
                 + "resize/generation, atlas reuse and stale Revision rejection are valid"
+                + (imagePublicationReady ? "; ImageIO publication reached ready Metal texture" : "")
         )
         exit(EXIT_SUCCESS)
     } catch {
