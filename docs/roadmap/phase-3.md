@@ -34,7 +34,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] `DocumentTextView` opt-in visual IME composition mirror、marked range 与 attributed substring self-check
 - [x] 生产 visual view 启用点击/拖选 visual boundary→Rust source selection，以及 source→visual caret 映射
 - [x] 生产 visual view 的 projected selection highlight 与同一 Revision 的 shaped caret reveal
-- [ ] 最终 shaped Metal hit-test、跨 visual line 上下移动与 visual IME 回归
+- [x] 生产 Up/Down/Shift-Up/Shift-Down 使用当前 CoreText metrics/shaper 的 Revision-bound command
+- [ ] 最终 shaped Metal hit-test 与 visual IME 回归
 
 ## Track C：Scene and rendering
 

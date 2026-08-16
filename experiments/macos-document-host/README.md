@@ -25,8 +25,8 @@
   Rust `toggle_task` Transaction；macOS VoiceOver 真实朗读已由人工确认通过；Rotor/语义 action
   的跨平台回归仍属于后续工作；
 - 当前包含最小 Rust glyph overlay、visual pointer/caret 映射、projected selection highlight、
-  Revision-bound caret reveal 和 TextKit 回退；仍不包含完整 Markdown delimiter reveal、最终
-  shaped Metal hit-test、visual IME overlay 或 workspace/tab。
+  Revision-bound caret reveal、CoreText shaped vertical command 和 TextKit 回退；仍不包含完整
+  Markdown delimiter reveal、最终 shaped Metal hit-test、visual IME overlay 或 workspace/tab。
 
 构建并运行：
 
@@ -146,6 +146,17 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 
 该自检先将 CoreText 的 line height/default advance 发布到 Rust viewport policy，再请求一个完整
 可见窗口；Swift 只消费 owned block 元数据，不创建第二套 Markdown parser、layout 或渲染树。
+
+验证生产上下移动使用 CoreText shaped block layout、保持 preferred-X/selection Revision，且不
+修改 source（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --shaped-vertical-self-check experiments/macos-document-host/Fixtures/block-projection.md
+```
+
+该自检通过同一个 storage FFI 发布 viewport metrics，再执行两次 shaped Down；返回值仍是普通
+`CommandResult`，stale Revision 会被 Rust 拒绝。生产窗口在键盘命令前同步准备相同 metrics。
 
 验证 Rust `ViewportSceneInput`/`SceneBuilder` 生成的最小 owned scene primitive count/fill、背景/文本
 顺序、source range、document-space 矩形和 stale Revision 拒绝（不启动窗口）：

@@ -1831,6 +1831,24 @@ private final class StorageBridge {
         return NativeCommandResult(result)
     }
 
+    func executeShapedVerticalCommand(
+        _ command: UInt8,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NativeCommandResult {
+        var result = YuStorageCommandResult()
+        let status = yu_storage_session_macos_move_vertical(
+            handle,
+            state.revision,
+            command,
+            size,
+            maxWidth,
+            &result
+        )
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return NativeCommandResult(result)
+    }
+
     func commandAvailable(_ command: UInt8, block: UInt64 = 0) -> Bool {
         var available: UInt8 = 0
         let status = yu_storage_session_command_available(handle, command, block, &available)
@@ -2336,6 +2354,7 @@ private final class DocumentTextView: NSTextView {
     private var visualSelectionAnchor: Int?
     private var sourceSelectedTextAttributes: [NSAttributedString.Key: Any]?
     var onDocumentChange: (() -> Void)?
+    var onBeforeCommand: (() -> Void)?
     var onCaretChange: (() -> Void)?
     var onError: ((Error) -> Void)?
 
@@ -3220,9 +3239,39 @@ private final class DocumentTextView: NSTextView {
     @discardableResult
     private func routeCommand(_ command: UInt8) -> Bool {
         guard !bridge.composition.active else { return false }
+        let isVertical = command == Command.moveUp
+            || command == Command.moveDown
+            || command == Command.moveUpExtend
+            || command == Command.moveDownExtend
+        if isVertical {
+            // The production coordinator publishes the current CoreText
+            // metrics synchronously before Rust resolves a vertical target.
+            // Headless/self-check views leave this callback unset and retain
+            // the ordinary metrics command path.
+            onBeforeCommand?()
+        }
         guard bridge.commandAvailable(command) else { return false }
         do {
-            apply(try bridge.executeCommand(command))
+            let result: NativeCommandResult
+            if isVertical, let (size, width) = visualLayoutMetrics() {
+                do {
+                    result = try bridge.executeShapedVerticalCommand(
+                        command,
+                        size: size,
+                        maxWidth: width
+                    )
+                } catch BridgeError.operation(let status)
+                    where status == StorageStatus.invalidViewport {
+                    // A key can arrive before the first surface/layout
+                    // publication. Preserve editing availability by falling
+                    // back to Rust's ordinary metrics command; the next
+                    // command will retry the shaped path after preparation.
+                    result = try bridge.executeCommand(command)
+                }
+            } else {
+                result = try bridge.executeCommand(command)
+            }
+            apply(result)
             synchronizeProjection()
             postAccessibilityRefresh()
             onDocumentChange?()
@@ -3231,6 +3280,13 @@ private final class DocumentTextView: NSTextView {
             onError?(error)
             return false
         }
+    }
+
+    private func visualLayoutMetrics() -> (Float, Float)? {
+        guard let font, bounds.width.isFinite, bounds.width > 0.0 else { return nil }
+        let width = max(bounds.width - 2.0 * textContainerOrigin.x, 1.0)
+        guard width.isFinite, width > 0.0 else { return nil }
+        return (Float(max(font.pointSize, 1.0)), Float(width))
     }
 
     /// Menu actions use these explicit entry points instead of NSTextView's
@@ -3640,6 +3696,29 @@ private final class MacosSurfaceHostCoordinator {
         }
     }
 
+    /// Publishes CoreText metrics before a vertical editor command enters the
+    /// Rust command path. This keeps the command's shaped line wrapping and
+    /// the subsequent caret reveal on one Revision/width contract even when a
+    /// key arrives before the next asynchronous surface submit.
+    func prepareForEditorCommand() {
+        guard let surfaceView,
+              surfaceView.bounds.width > 0.0 else {
+            return
+        }
+        let revision = bridge.state.revision
+        let size = max(fontSize, 1.0)
+        let maxWidth = max(surfaceView.bounds.width, 1.0)
+        do {
+            _ = try ensureMetrics(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth
+            )
+        } catch {
+            onError?(error)
+        }
+    }
+
     /// Reveals the current Rust-owned caret using the same Revision-bound
     /// CoreText/shaped viewport contract as surface submission. This is a
     /// scroll-only adapter: it never asks TextKit for a caret and never lets
@@ -3904,6 +3983,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             self.initialState = self.bridge.state
             self.updateStatus()
             self.surfaceCoordinator.scheduleSubmit()
+        }
+        textView.onBeforeCommand = { [weak self] in
+            self?.surfaceCoordinator.prepareForEditorCommand()
         }
         textView.onCaretChange = { [weak self] in
             // AppKit may deliver selection changes while TextKit is still
@@ -5017,6 +5099,58 @@ private func runShapedViewportSelfCheck(path: String) -> Never {
     }
 }
 
+private func runShapedVerticalSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let metrics = try bridge.macosFontMetrics(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(metrics.lineHeight),
+            defaultAdvance: Float(metrics.defaultAdvance),
+            estimatedBlockHeight: Float(metrics.lineHeight),
+            overscan: 0.0
+        )
+        let firstLineEnd = (bridge.source as NSString).range(of: "\n").location
+        precondition(firstLineEnd != NSNotFound)
+        try bridge.setSelection(
+            NSRange(location: firstLineEnd, length: 0),
+            affinity: 1
+        )
+        let first = try bridge.executeShapedVerticalCommand(
+            14,
+            size: size,
+            maxWidth: maxWidth
+        )
+        precondition(first.revision == revision)
+        precondition(first.selection.length == 0)
+        precondition(first.selection.location > firstLineEnd)
+        let second = try bridge.executeShapedVerticalCommand(
+            14,
+            size: size,
+            maxWidth: maxWidth
+        )
+        precondition(second.revision == revision)
+        precondition(second.selection.location > first.selection.location)
+        precondition(bridge.state.revision == revision)
+        print(
+            "Yu Shaped Vertical self-check: CoreText line movement preserved "
+                + "Revision=\(revision), focus=\(second.selection.location)"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Shaped Vertical self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runVisualViewportSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -6101,6 +6235,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--block-layout-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--shaped-viewport-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runShapedViewportSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--shaped-vertical-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runShapedVerticalSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-viewport-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

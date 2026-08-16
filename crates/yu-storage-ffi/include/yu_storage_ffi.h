@@ -747,6 +747,9 @@ int32_t yu_storage_session_set_selection(YuStorageSession *session,
 int32_t yu_storage_session_execute_command(YuStorageSession *session,
                                             uint8_t command, uint64_t block,
                                             YuStorageCommandResult *output);
+int32_t yu_storage_session_macos_move_vertical(
+    YuStorageSession *session, uint64_t expected_revision, uint8_t command,
+    float size, float max_width, YuStorageCommandResult *output);
 int32_t yu_storage_session_command_available(const YuStorageSession *session,
                                              uint8_t command, uint64_t block,
                                              uint8_t *output);

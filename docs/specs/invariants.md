@@ -99,8 +99,9 @@
 21. `MoveUp/Down` 必须通过当前或相邻 block 的 `LayoutSnapshot` 做 visual-line caret/hit-test
     映射；preferred-X 必须在连续上下移动中保持，且横向/word movement、edit、显式 selection、
     composition/reset 时清除。平台层不得在 Rust command 之外自行修改跨 block source selection；
-    caret reveal 必须通过 revision-bound `CaretScrollRequest` 查询，真实 scroll container 仍属于
-    后续 GUI 契约。
+    visual layout ready 时 macOS 必须先发布同一 CoreText metrics，再通过 shaped vertical command
+    进入 Rust；未就绪时只能有限回退到普通 metrics command。caret reveal 必须通过 revision-bound
+    `CaretScrollRequest` 查询，真实 scroll container 仍属于平台 adapter。
 22. `MoveUpExtend/MoveDownExtend` 必须保留 `EditorSelection::anchor()`，只更新 focus，并与普通
     Up/Down 共用 layout/preferred-X/source affinity；回到 anchor 时必须产生 collapsed selection。
     Shift 垂直移动不得推进 Revision、history 或 SourceSync，marked text 期间不得执行。
@@ -238,6 +239,11 @@
     `yu_storage_session_macos_shaped_caret_scroll_request` 的 caret/target scroll 必须来自同一
     CoreText metrics 与 Rust `ViewportLayout`。Swift 只能做显式 document↔viewport 平移并在 Revision
     不匹配时丢弃 snapshot；不得复制 HeightIndex、重算 block origin，或把 stale target 应用到新文本。
+48. `yu_storage_session_macos_move_vertical` 必须携带 expected Revision、vertical command 和
+    与已发布 viewport 相同的 CoreText size/width；Rust 只能用 caller-owned shaper 计算相邻 block
+    的 caret/hit-test，并返回普通 `CommandResult`。该命令只能改变 selection/preferred-X，不能推进
+    source Revision、history 或 SourceSync；stale Revision、非法 command、metrics 不匹配或 active
+    composition 必须拒绝，Swift 不得自行按 glyph/Markdown 文本猜测跨行 source range。
 
 ## Accessibility
 

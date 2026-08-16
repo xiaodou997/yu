@@ -395,7 +395,11 @@ TextKit 仍是输入/IME/Accessibility owner。当前选区背景也由同一 vi
 rectangles，source TextKit 的 selection background 在 adapter 开启时清空，避免 hidden delimiter
 被直接高亮。source selection/caret 通知会异步调用同一 Rust Revision 的
 `yu_storage_session_macos_shaped_caret_scroll_request`，并只在 AppKit clip boundary 内应用
-absolute target；最终 shaped Metal hit-test、跨 visual line 上下移动和 visual IME preedit 仍待后续。
+absolute target。生产 `Up/Down/Shift-Up/Shift-Down` 现在先由 host 发布同一字体/宽度的 CoreText
+metrics，再通过 `yu_storage_session_macos_move_vertical` 让 Rust 使用 caller-owned shaper 解析
+相邻 visual line；返回的普通 `CommandResult` 继续驱动 source mirror、projected highlight 和
+caret reveal。透明 surface 仍不接收输入；最终 shaped Metal point hit-test 和 visual IME preedit
+仍待后续。
 同一 mirror 在 composition active 时还可以消费 storage FFI 返回的 visual replacement range
 和 generation-bound projected preedit，并让 `markedRange`/`attributedSubstring` 读取 visual
 坐标；metadata、文本和 callback 必须匹配同一 Revision + generation，过期时清空 visual mirror

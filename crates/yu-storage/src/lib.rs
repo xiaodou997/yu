@@ -475,6 +475,21 @@ impl DocumentSession {
         self.editor.execute(command).map_err(StorageError::Editor)
     }
 
+    /// Executes a vertical caret movement using a caller-owned shaping
+    /// provider. Source, selection, preferred-X and history remain owned by
+    /// the editor; only the layout used for this command is shaped.
+    pub fn move_vertical_with_shaper<S: ShapingProvider>(
+        &mut self,
+        up: bool,
+        extend: bool,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<CommandResult, StorageError> {
+        self.editor
+            .move_vertical_with_shaper(up, extend, config, shaper)
+            .map_err(StorageError::Editor)
+    }
+
     /// Applies an external transaction through the same source/parser/history
     /// path used by editor commands.
     pub fn apply_transaction(
@@ -742,6 +757,19 @@ impl DocumentEditorSession {
 
     pub fn execute(&mut self, command: EditorCommand) -> Result<CommandResult, StorageError> {
         self.document.execute(command)
+    }
+
+    /// Executes a vertical caret movement through the unified file-backed
+    /// session using a caller-owned shaped layout provider.
+    pub fn move_vertical_with_shaper<S: ShapingProvider>(
+        &mut self,
+        up: bool,
+        extend: bool,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<CommandResult, StorageError> {
+        self.document
+            .move_vertical_with_shaper(up, extend, config, shaper)
     }
 
     pub fn route_key(&mut self, event: KeyEvent) -> Result<KeyRouteResult, StorageError> {

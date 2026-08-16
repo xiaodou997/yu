@@ -1358,6 +1358,46 @@ impl EditorDocument {
         direction: VerticalDirection,
         extend: bool,
     ) -> Result<CommandResult, EditorDocumentError> {
+        let config = self.viewport_config().layout();
+        self.move_vertical_with_loader(direction, extend, config, |document, index, config| {
+            document.block_layout(index, config).cloned()
+        })
+    }
+
+    /// Executes a vertical movement against a caller-owned shaped layout
+    /// provider. The source selection/history contract is identical to the
+    /// regular command path; only the block layout used for line/caret hit
+    /// testing changes. The shaper remains outside the canonical editor.
+    pub fn move_vertical_with_shaper<S: ShapingProvider>(
+        &mut self,
+        up: bool,
+        extend: bool,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        self.last_source_change = None;
+        let direction = if up {
+            VerticalDirection::Up
+        } else {
+            VerticalDirection::Down
+        };
+        self.move_vertical_with_loader(direction, extend, config, |document, index, config| {
+            document
+                .block_layout_with_shaper(index, config, shaper)
+                .cloned()
+        })
+    }
+
+    fn move_vertical_with_loader<F>(
+        &mut self,
+        direction: VerticalDirection,
+        extend: bool,
+        config: LayoutConfig,
+        mut load_layout: F,
+    ) -> Result<CommandResult, EditorDocumentError>
+    where
+        F: FnMut(&mut Self, usize, LayoutConfig) -> Result<LayoutSnapshot, EditorDocumentError>,
+    {
         self.history.break_group();
 
         if !extend && !self.selection.is_empty() {
@@ -1388,9 +1428,9 @@ impl EditorDocument {
         let preferred_x = self.preferred_x.map(PreferredCaretX::value);
         let block_count = self.markdown.blocks().len();
         let (current_x, target_block) = {
-            let layout = self.block_layout(block_index, LayoutConfig::default())?;
+            let layout = load_layout(self, block_index, config)?;
             let caret = layout.caret_for_source(focus, projection_bias)?;
-            let line_count = navigable_line_count(layout, block_index + 1 < block_count);
+            let line_count = navigable_line_count(&layout, block_index + 1 < block_count);
             let next_line = caret.line().checked_add(1);
             let target_block = match direction {
                 VerticalDirection::Up if caret.line() > 0 && caret.line() < line_count => {
@@ -1413,9 +1453,9 @@ impl EditorDocument {
         };
         let desired_x = preferred_x.unwrap_or(current_x);
         let (target, target_width) = {
-            let layout = self.block_layout(target_block, LayoutConfig::default())?;
+            let layout = load_layout(self, target_block, config)?;
             let target_line_index = target_line.unwrap_or_else(|| {
-                navigable_line_count(layout, target_block + 1 < block_count).saturating_sub(1)
+                navigable_line_count(&layout, target_block + 1 < block_count).saturating_sub(1)
             });
             let Some(target_line) = layout.lines().get(target_line_index) else {
                 return Ok(self.command_result(false));
@@ -2121,6 +2161,29 @@ mod tests {
             .execute(EditorCommand::MoveLeft)
             .expect("horizontal movement should clear preferred x");
         assert_eq!(document.preferred_x, None);
+    }
+
+    #[test]
+    fn shaped_vertical_commands_use_caller_shaper_and_keep_revision() {
+        let source = "abcdefghij\nxy\n1234567890";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, "abcdefghij".len());
+        let revision = document.revision();
+        let config = LayoutConfig::new(80.0, 12.0).with_default_advance(2.0);
+
+        document
+            .move_vertical_with_shaper(false, false, config, &WideShaper)
+            .expect("shaped down should succeed");
+        assert_eq!(document.selection().focus().get(), 13);
+        assert_eq!(document.preferred_x, Some(PreferredCaretX::new(20.0)));
+
+        document
+            .move_vertical_with_shaper(false, false, config, &WideShaper)
+            .expect("second shaped down should preserve preferred x");
+        assert_eq!(document.selection().focus().get(), 24);
+        assert_eq!(document.preferred_x, Some(PreferredCaretX::new(20.0)));
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.snapshot().as_str(), source);
     }
 
     #[test]
