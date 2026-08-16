@@ -2503,6 +2503,7 @@ private final class DocumentTextView: NSTextView {
     private var visualViewport: NativeVisualViewport?
     private var visualSelectionAnchor: Int?
     private var sourceSelectedTextAttributes: [NSAttributedString.Key: Any]?
+    private var externalVisualDecorationsEnabled = false
     var onDocumentChange: (() -> Void)?
     var onBeforeCommand: (() -> Void)?
     var onCaretChange: (() -> Void)?
@@ -2593,6 +2594,15 @@ private final class DocumentTextView: NSTextView {
 
     func setVisualMirrorEnabledForSelfCheck(_ enabled: Bool) throws {
         try setVisualMirrorEnabled(enabled)
+    }
+
+    /// Moves projected selection/caret painting out of the TextKit view. The
+    /// view remains the input/IME/Accessibility owner; disabling this flag is
+    /// the safe fallback when the sibling decoration surface is unavailable.
+    func setExternalVisualDecorationsEnabled(_ enabled: Bool) {
+        guard externalVisualDecorationsEnabled != enabled else { return }
+        externalVisualDecorationsEnabled = enabled
+        needsDisplay = true
     }
 
     func refreshVisualMirrorForDisplay() throws {
@@ -3160,6 +3170,9 @@ private final class DocumentTextView: NSTextView {
         color: NSColor,
         turnedOn: Bool
     ) {
+        if externalVisualDecorationsEnabled {
+            return
+        }
         guard let visualRect = visualCaretRectForDisplay() else {
             super.drawInsertionPoint(in: rect, color: color, turnedOn: turnedOn)
             return
@@ -3169,7 +3182,7 @@ private final class DocumentTextView: NSTextView {
 
     override func draw(_ rect: NSRect) {
         super.draw(rect)
-        guard visualMirrorEnabled else { return }
+        guard visualMirrorEnabled, !externalVisualDecorationsEnabled else { return }
         let selectionRects = visualSelectionRectsForDisplay()
         guard !selectionRects.isEmpty else { return }
         NSColor.selectedTextBackgroundColor.withAlphaComponent(0.38).setFill()
@@ -3795,6 +3808,75 @@ private final class MacosSurfaceHostView: NSView {
     }
 }
 
+/// Draws visual selection/caret decorations above the Rust glyph surface.
+///
+/// This view is intentionally transparent to AppKit hit-testing. The source
+/// TextKit view remains the owner of keyboard, IME and Accessibility events;
+/// this layer only owns the pixels for transient visual decorations. Geometry
+/// is supplied by the revision-bound visual mirror and is discarded whenever
+/// the mirror is stale or the surface detaches.
+private final class MacosVisualDecorationView: NSView {
+    private(set) var revision: UInt64?
+    private(set) var selectionRects: [NSRect] = []
+    private(set) var caretRect: NSRect?
+    private(set) var compositionActive = false
+
+    var hasValidFrame: Bool {
+        revision != nil && caretRect != nil
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    func update(
+        revision: UInt64,
+        selectionRects: [NSRect],
+        caretRect: NSRect?,
+        compositionActive: Bool
+    ) {
+        self.revision = revision
+        self.selectionRects = selectionRects.filter(Self.isDrawable)
+        self.caretRect = caretRect.flatMap { Self.isDrawable($0) ? $0 : nil }
+        self.compositionActive = compositionActive
+        needsDisplay = true
+    }
+
+    func clear() {
+        revision = nil
+        selectionRects.removeAll(keepingCapacity: true)
+        caretRect = nil
+        compositionActive = false
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard revision != nil else { return }
+
+        NSColor.selectedTextBackgroundColor.withAlphaComponent(0.38).setFill()
+        for rect in selectionRects {
+            let clipped = rect.intersection(dirtyRect)
+            guard !clipped.isNull, !clipped.isEmpty else { continue }
+            clipped.fill()
+        }
+
+        guard let caretRect else { return }
+        let clippedCaret = caretRect.intersection(dirtyRect)
+        guard !clippedCaret.isNull, !clippedCaret.isEmpty else { return }
+        let color = compositionActive
+            ? NSColor.controlAccentColor
+            : NSColor.textColor
+        color.setFill()
+        clippedCaret.fill()
+    }
+
+    private static func isDrawable(_ rect: NSRect) -> Bool {
+        rect.minX.isFinite && rect.minY.isFinite
+            && rect.width.isFinite && rect.height.isFinite
+            && rect.width > 0.0 && rect.height > 0.0
+    }
+}
+
 /// Coordinates a persistent Rust surface with one product `NSView`.
 ///
 /// The coordinator is deliberately an AppKit lifecycle adapter, not a second
@@ -4147,6 +4229,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private let bridge: StorageBridge
     private lazy var textView = DocumentTextView(bridge: bridge)
     private let surfaceHostView = MacosSurfaceHostView()
+    private let decorationHostView = MacosVisualDecorationView()
     private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
     private var saveButton: NSButton?
@@ -4169,6 +4252,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             // The source TextKit mirror remains usable when a machine has no
             // Metal drawable; surface lifecycle failure is diagnostic, not a
             // reason to interrupt editing with a modal alert.
+            self?.clearVisualDecorations()
             self?.statusLabel.toolTip = "Native surface inactive: \(error.localizedDescription)"
         }
     }
@@ -4202,12 +4286,14 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             guard let self else { return }
             self.initialState = self.bridge.state
             self.updateStatus()
+            self.updateVisualDecorations()
             self.surfaceCoordinator.scheduleSubmit()
         }
         textView.onBeforeCommand = { [weak self] in
             self?.surfaceCoordinator.prepareForEditorCommand()
         }
         textView.onCaretChange = { [weak self] in
+            self?.updateVisualDecorations()
             // AppKit may deliver selection changes while TextKit is still
             // inside its event callback. Defer the scroll mutation until the
             // same main-thread turn has finished, while retaining the Rust
@@ -4240,12 +4326,15 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             guard let self else { return }
             if attached {
                 self.surfaceCoordinator.scheduleSubmit()
+                self.updateVisualDecorations()
             } else {
                 self.surfaceCoordinator.detach()
+                self.clearVisualDecorations()
             }
         }
         surfaceHostView.onGeometryChange = { [weak self] in
             self?.surfaceCoordinator.scheduleSubmit()
+            self?.updateVisualDecorations()
         }
         scrollView.contentView.postsBoundsChangedNotifications = true
         surfaceBoundsObserver = NotificationCenter.default.addObserver(
@@ -4254,6 +4343,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             queue: .main
         ) { [weak self] _ in
             self?.surfaceCoordinator.scheduleSubmit()
+            self?.updateVisualDecorations()
         }
 
         statusLabel.setAccessibilityElement(true)
@@ -4280,6 +4370,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         // remain owned by the source view underneath it. The frame is synced
         // to the clip viewport in viewDidLayout, excluding native scrollers.
         root.addSubview(surfaceHostView, positioned: .above, relativeTo: scrollView)
+        root.addSubview(decorationHostView, positioned: .above, relativeTo: surfaceHostView)
         NSLayoutConstraint.activate([
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
@@ -4301,6 +4392,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         if surfaceHostView.frame != viewportFrame {
             surfaceHostView.frame = viewportFrame
         }
+        if decorationHostView.frame != viewportFrame {
+            decorationHostView.frame = viewportFrame
+        }
         let visualWidth = max(
             textView.bounds.width - 2.0 * textView.textContainerOrigin.x,
             1.0
@@ -4321,6 +4415,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             try? textView.setVisualMirrorEnabled(false)
             statusLabel.toolTip = "Visual pointer inactive: \(error.localizedDescription)"
         }
+        updateVisualDecorations()
         surfaceCoordinator.scheduleSubmit()
         surfaceCoordinator.revealCaretIfNeeded()
     }
@@ -4332,12 +4427,43 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             promptedExternalDisk = nil
         }
         updateStatus()
+        updateVisualDecorations()
         surfaceCoordinator.scheduleSubmit()
         surfaceCoordinator.revealCaretIfNeeded()
     }
 
     func detachSurfaceHost() {
         surfaceCoordinator.detach()
+        clearVisualDecorations()
+    }
+
+    private func clearVisualDecorations() {
+        decorationHostView.clear()
+        textView.setExternalVisualDecorationsEnabled(false)
+    }
+
+    /// Converts the revision-bound visual mirror geometry into the sibling
+    /// decoration view's local coordinates. The conversion goes through
+    /// AppKit's view tree so scroll origin, text-container inset and window
+    /// layout are applied exactly once.
+    private func updateVisualDecorations() {
+        guard visualPointerAdapterEnabled,
+              decorationHostView.superview != nil,
+              let caret = textView.visualCaretRectForDisplay() else {
+            clearVisualDecorations()
+            return
+        }
+        let selection = textView.visualSelectionRectsForDisplay().map {
+            textView.convert($0, to: decorationHostView)
+        }
+        let convertedCaret = textView.convert(caret, to: decorationHostView)
+        decorationHostView.update(
+            revision: bridge.state.revision,
+            selectionRects: selection,
+            caretRect: convertedCaret,
+            compositionActive: bridge.composition.active
+        )
+        textView.setExternalVisualDecorationsEnabled(true)
     }
 
     @objc private func save() {
@@ -5077,6 +5203,57 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Yu Visual Mirror self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+private func runVisualDecorationSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let textView = DocumentTextView(bridge: bridge)
+        let root = NSView(frame: NSRect(x: 0.0, y: 0.0, width: 640.0, height: 480.0))
+        let decoration = MacosVisualDecorationView(frame: root.bounds)
+        textView.frame = root.bounds
+        root.addSubview(textView)
+        root.addSubview(decoration)
+
+        try textView.setVisualMirrorEnabledForSelfCheck(true)
+        let revision = bridge.state.revision
+        let sourceStrong = (bridge.source as NSString).range(of: "**粗体**")
+        precondition(sourceStrong.location != NSNotFound)
+        precondition(textView.applyVisualSelectionForSelfCheck(
+            NSRange(location: sourceStrong.location + 2, length: 2)
+        ))
+        guard let caret = textView.visualCaretRectForDisplay() else {
+            preconditionFailure("visual caret geometry is unavailable")
+        }
+        let selection = textView.visualSelectionRectsForDisplay()
+        precondition(!selection.isEmpty)
+
+        decoration.update(
+            revision: revision,
+            selectionRects: selection.map { textView.convert($0, to: decoration) },
+            caretRect: textView.convert(caret, to: decoration),
+            compositionActive: false
+        )
+        precondition(decoration.hasValidFrame)
+        precondition(decoration.revision == revision)
+        precondition(decoration.selectionRects.count == selection.count)
+        precondition(decoration.caretRect != nil)
+        precondition(decoration.hitTest(NSPoint(x: 1.0, y: 1.0)) == nil)
+
+        _ = try bridge.insertText("x")
+        precondition(textView.visualCaretRectForDisplay() == nil)
+        decoration.clear()
+        precondition(!decoration.hasValidFrame)
+        precondition(decoration.revision == nil)
+        print(
+            "Yu Visual Decoration self-check: revision-bound selection/caret "
+                + "overlay owns \(selection.count) selection rects and falls back on stale geometry"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual Decoration self-check failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
 }
@@ -6749,6 +6926,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--shaped-projection-hit-test
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-mirror-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualMirrorSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-decoration-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualDecorationSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-ime-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
