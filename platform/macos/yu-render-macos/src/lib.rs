@@ -1789,6 +1789,22 @@ impl MetalViewportHostSession {
         uploader: &mut MetalUploader,
         atlas: &mut MetalAtlas,
     ) -> Result<MetalViewportHostSubmission, MetalViewportHostError> {
+        let images = MetalImageAtlas::new();
+        self.submit_with_images(renderer, surface, uploader, atlas, &images)
+    }
+
+    /// Submits the current frame while reusing a host-owned image atlas.
+    /// Image textures are deliberately supplied separately from the glyph
+    /// atlas so a decoded publication can arrive without rebuilding the
+    /// source-backed frame or blocking the editor thread.
+    pub fn submit_with_images(
+        &mut self,
+        renderer: &mut MetalFrameRenderer,
+        surface: &MetalSurface,
+        uploader: &mut MetalUploader,
+        atlas: &mut MetalAtlas,
+        images: &MetalImageAtlas,
+    ) -> Result<MetalViewportHostSubmission, MetalViewportHostError> {
         self.validate_surface_generation(surface.generation())?;
         let frame = self.frame_cache.get(self.current_revision).ok_or(
             MetalViewportHostError::NoCurrentFrame {
@@ -1800,12 +1816,13 @@ impl MetalViewportHostSession {
             .ok_or(MetalViewportHostError::NoCurrentFrame {
                 revision: self.current_revision,
             })?;
-        let result = renderer.submit_viewport_frame(
+        let result = renderer.submit_viewport_frame_with_images(
             surface,
             self.current_revision,
             frame,
             uploader,
             atlas,
+            images,
         )?;
         let submission = MetalViewportHostSubmission {
             revision: result.revision(),

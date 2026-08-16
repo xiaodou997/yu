@@ -559,3 +559,10 @@
 12. `LayoutHit::image()` 非空时必须返回完整 image source range；metrics/CoreText FFI hit-test
     必须将该 range 编码为同一 Revision 的 UTF-16 起止值，普通文字命中使用
     `YU_STORAGE_IMAGE_DESTINATION_NONE` sentinel。命中映射不得让 native host 重新解析 Markdown。
+13. macOS 持久 surface 的 image worker 只能通过 `ImageCache::publish_decoded` 发布；worker 返回
+    的旧 Revision 或解码失败结果必须被丢弃，不能进入 `MacosImageResourceState` 的 publication
+    map。当前 Revision 的 publication 必须在 surface submit 前同步到同一 surface 生命周期内的
+    `MetalImageAtlas`，RenderPlan 才能选择 ready texture；否则 backend 必须绘制 command fallback。
+14. `YuStorageMacosRenderHostSurfaceSnapshot` 的 `uploaded_images` 只统计本次成功替换的 image
+    texture，`image_resource_count` 统计持久 atlas 中可供当前 RenderPlan 查找的资源；这两个计数
+    不得把 ImageIO pending、失败或 stale publication 伪装成 ready。

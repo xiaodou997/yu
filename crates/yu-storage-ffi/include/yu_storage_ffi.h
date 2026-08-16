@@ -589,9 +589,11 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t surface_generation;
     uint64_t frame_serial;
     uint64_t uploaded_pages;
+    uint64_t uploaded_images;
     uint64_t command_count;
     uint64_t damage_count;
     uint64_t atlas_page_count;
+    uint64_t image_resource_count;
     uint8_t submitted;
 } YuStorageMacosRenderHostSurfaceSnapshot;
 

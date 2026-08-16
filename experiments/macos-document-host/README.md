@@ -240,13 +240,15 @@ retained target blit/present 和 stale Revision 拒绝（显式测试命令，�
 
 ```bash
 swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --macos-render-host-surface-self-check experiments/macos-document-host/Fixtures/block-projection.md
+  --macos-render-host-surface-self-check experiments/macos-document-host/Fixtures/render-images-plan.md
 ```
 
 该 self-check 只返回 Rust-owned lifecycle scalar；同一个 storage session 会复用 surface、renderer、
-atlas、Metal target 和 attachment，重复提交应复用 atlas upload，composition generation 变化会
-强制提交新的 preedit glyph frame，cancel 会恢复 canonical glyph scene，surface 尺寸变化会推进
-generation，结束前显式 detach。它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
+glyph/image atlas、Metal target 和 attachment，重复提交应复用 atlas upload。含图片的 fixture 会在
+验收期间临时写入 1×1 PNG，要求第一次 fallback 后由 ImageIO worker 发布 ready texture，并在输出中
+报告 `ImageIO publication reached ready Metal texture`。composition generation 变化会强制提交新的
+preedit glyph frame，cancel 会恢复 canonical glyph scene，surface 尺寸变化会推进 generation，
+结束前显式 detach。它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
 
 scene/glyph/render-plan 的两次 count/fill 调用也把 `composition_generation` 放进 header。若 marked
 text 在 count 与 fill 之间更新或取消，Rust 返回 stale composition、清空 written 计数并拒绝写入

@@ -13,6 +13,9 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
 
+#[cfg(target_os = "macos")]
+use std::collections::{BTreeMap, HashSet};
+
 use yu_assets::ImageKey;
 use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
@@ -41,6 +44,8 @@ use yu_workspace::{
 };
 
 #[cfg(target_os = "macos")]
+use yu_assets::{ImageCache, ImagePublication, ImageRequest, ImageRequestResult};
+#[cfg(target_os = "macos")]
 use yu_font::FontRequest;
 #[cfg(target_os = "macos")]
 use yu_font::{GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer};
@@ -48,9 +53,9 @@ use yu_font::{GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer};
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
 #[cfg(target_os = "macos")]
 use yu_render_macos::{
-    CoreTextViewportFrameBuilder, CoreTextViewportFrameError, MetalAtlas, MetalDevice,
-    MetalFrameRenderer, MetalSurface, MetalSurfaceConfig, MetalUploader, MetalViewAttachmentOwned,
-    MetalViewportHostSession,
+    CoreTextViewportFrameBuilder, CoreTextViewportFrameError, MacosImageDecodeWorker, MetalAtlas,
+    MetalDevice, MetalFrameRenderer, MetalImageAtlas, MetalSurface, MetalSurfaceConfig,
+    MetalUploader, MetalViewAttachmentOwned, MetalViewportHostSession,
 };
 
 pub const YU_STORAGE_OK: i32 = 0;
@@ -722,9 +727,11 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub surface_generation: u64,
     pub frame_serial: u64,
     pub uploaded_pages: u64,
+    pub uploaded_images: u64,
     pub command_count: u64,
     pub damage_count: u64,
     pub atlas_page_count: u64,
+    pub image_resource_count: u64,
     pub submitted: u8,
 }
 
@@ -873,11 +880,78 @@ pub struct YuStorageCompositionState {
 }
 
 #[cfg(target_os = "macos")]
+struct MacosImageResourceState {
+    cache: ImageCache,
+    worker: MacosImageDecodeWorker,
+    publications: BTreeMap<u64, ImagePublication>,
+    in_flight: HashSet<ImageKey>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosImageResourceState {
+    fn new() -> Result<Self, i32> {
+        Ok(Self {
+            cache: ImageCache::new(),
+            worker: MacosImageDecodeWorker::new()
+                .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+            publications: BTreeMap::new(),
+            in_flight: HashSet::new(),
+        })
+    }
+
+    fn sync(
+        &mut self,
+        requests: Vec<ImageRequest>,
+        revision: yu_core::Revision,
+        document_path: PathBuf,
+    ) -> Result<(), i32> {
+        while let Some(result) = self
+            .worker
+            .try_recv()
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
+        {
+            let (request, result) = result.into_parts();
+            self.in_flight.remove(request.key());
+            let Ok(image) = result else {
+                continue;
+            };
+            let Ok(publication) = self.cache.publish_decoded(request, revision, image) else {
+                continue;
+            };
+            self.publications
+                .insert(publication.key().fingerprint(), publication);
+        }
+
+        self.publications.clear();
+        for request in requests {
+            if self.in_flight.contains(request.key()) {
+                continue;
+            }
+            if let ImageRequestResult::Ready(publication) = self.cache.request(request) {
+                self.publications
+                    .insert(publication.key().fingerprint(), publication);
+            }
+        }
+
+        while let Some(request) = self.cache.pending() {
+            if !self.in_flight.insert(request.key().clone()) {
+                continue;
+            }
+            if self.worker.submit(request, document_path.clone()).is_err() {
+                return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct MacosRenderHostState {
     builder: CoreTextViewportFrameBuilder,
     host: MetalViewportHostSession,
     size: f32,
     surface: Option<MacosPersistentSurfaceState>,
+    image_resources: MacosImageResourceState,
 }
 
 #[cfg(target_os = "macos")]
@@ -887,6 +961,7 @@ struct MacosPersistentSurfaceState {
     renderer: MetalFrameRenderer,
     uploader: MetalUploader,
     atlas: MetalAtlas,
+    image_atlas: MetalImageAtlas,
     view: std::ptr::NonNull<c_void>,
 }
 
@@ -4880,6 +4955,36 @@ fn image_resource_key(
 }
 
 #[cfg(target_os = "macos")]
+fn macos_image_requests(session: &mut YuStorageSession) -> Result<Vec<ImageRequest>, i32> {
+    let source = session.session.snapshot();
+    let revision = session.session.revision();
+    let definitions = session
+        .session
+        .document()
+        .editor()
+        .markdown()
+        .reference_definitions()
+        .clone();
+    let mut requests = Vec::new();
+    for block_index in 0..session.session.block_count() {
+        let projection = session
+            .session
+            .block_projection(block_index)
+            .map_err(storage_status)?;
+        for image in projection.visual().images().iter().copied() {
+            let Some(key) = image_resource_key(&source, image, &definitions) else {
+                continue;
+            };
+            requests.push(
+                ImageRequest::new(revision, image.source(), key.destination().to_owned())
+                    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?,
+            );
+        }
+    }
+    Ok(requests)
+}
+
+#[cfg(target_os = "macos")]
 fn renderable_image_count(
     source: &TextSnapshot,
     layout: &LayoutSnapshot,
@@ -5116,18 +5221,22 @@ fn macos_render_host_frame(
             initial_serial,
         )
         .map_err(|error| macos_render_host_error_status(&error))?;
-        let surface = session
-            .macos_render_host
-            .take()
-            .and_then(|state| state.surface);
+        let previous = session.macos_render_host.take();
+        let (surface, image_resources) = match previous {
+            Some(state) => (state.surface, state.image_resources),
+            None => (None, MacosImageResourceState::new()?),
+        };
         session.macos_render_host = Some(MacosRenderHostState {
             builder,
             host: MetalViewportHostSession::new(revision, surface_generation),
             size,
             surface,
+            image_resources,
         });
     }
 
+    let image_requests = macos_image_requests(session)?;
+    let document_path = session.session.path().to_path_buf();
     let state = session
         .macos_render_host
         .as_mut()
@@ -5144,6 +5253,9 @@ fn macos_render_host_frame(
         .builder
         .update_config(config)
         .map_err(|error| macos_render_host_error_status(&error))?;
+    state
+        .image_resources
+        .sync(image_requests, revision, document_path)?;
     let publication = {
         let document = session.session.document_mut().editor_mut();
         state
@@ -5205,6 +5317,7 @@ fn macos_render_host_surface_prepare(
         renderer,
         uploader: MetalUploader::new(device.clone()),
         atlas: MetalAtlas::new(),
+        image_atlas: MetalImageAtlas::new(),
         view,
     });
     Ok(0)
@@ -6001,15 +6114,33 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             Some(state) => state,
             None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
         };
+        let publications = state
+            .image_resources
+            .publications
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let surface_state = match state.surface.as_mut() {
             Some(surface) => surface,
             None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
         };
-        let submission = match state.host.submit(
+        let mut uploaded_images = 0_usize;
+        for publication in &publications {
+            match surface_state
+                .image_atlas
+                .sync_publication(&mut surface_state.uploader, publication)
+            {
+                Ok(true) => uploaded_images += 1,
+                Ok(false) => {}
+                Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+            }
+        }
+        let submission = match state.host.submit_with_images(
             &mut surface_state.renderer,
             &surface_state.surface,
             &mut surface_state.uploader,
             &mut surface_state.atlas,
+            &surface_state.image_atlas,
         ) {
             Ok(submission) => submission,
             Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
@@ -6022,9 +6153,12 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 surface_generation: submission.surface_generation(),
                 frame_serial: submission.frame_serial(),
                 uploaded_pages: u64::try_from(submission.uploaded_pages()).unwrap_or(u64::MAX),
+                uploaded_images: u64::try_from(uploaded_images).unwrap_or(u64::MAX),
                 command_count: host_snapshot.command_count,
                 damage_count: host_snapshot.damage_count,
                 atlas_page_count: host_snapshot.atlas_page_count,
+                image_resource_count: u64::try_from(surface_state.image_atlas.resource_count())
+                    .unwrap_or(u64::MAX),
                 submitted: 1,
             };
         }

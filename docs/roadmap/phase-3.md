@@ -67,7 +67,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] macOS storage FFI 暴露 source-backed image metadata count/fill；Swift self-check 覆盖 reference resolution、fingerprint 与 stale Revision
 - [x] ImageIO 解码 worker、Metal RGBA texture ownership、ready-image RenderPlan command 和未就绪 placeholder（资源级纵向切片）
 - [x] image placement 使用 source/alt/visual ranges 生成 document-space layout geometry；Scene/RenderPlan 以 glyph 后 overlay 顺序发布，metrics/CoreText hit-test 返回完整 image source range
-- [ ] 将 `ImagePublication`/`MetalImageAtlas` 接入产品持久 surface host，并补充 ready texture 的端到端窗口验收
+- [x] 将 `ImagePublication`/`MetalImageAtlas` 接入 macOS 持久 surface host；snapshot 暴露 image upload/resource 计数，surface self-check 覆盖 ImageIO→Metal ready texture
+- [ ] 为可见 viewport 的 image placement 增加 intrinsic 尺寸测量、atlas eviction 和资源失败诊断；当前 host 仍按文档 image source 请求并保留 fallback
 
 ## 约束
 

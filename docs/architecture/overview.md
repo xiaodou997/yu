@@ -668,4 +668,7 @@ rectangle，不阻塞编辑线程。`yu-layout` 现在把每个 image 的 source
 `ImagePlacement`，`yu-workspace` 将其转换为 document-space `ImagePrimitive`，并在 glyph 之后
 按 painter order 进入 Scene/RenderPlan；layout hit-test 命中图片时返回完整 source range，FFI
 同时以 UTF-16 返回该 range。资源未 ready 时仍只显示 placeholder，实际产品 host 的 ImageIO
-worker/`MetalImageAtlas` publication wiring 仍是后续工作。见 ADR 0141、0142、0143。
+worker/`MetalImageAtlas` publication wiring 现在由 macOS 持久 surface host 持有：host 每次 frame
+轮询 worker，把同一 Revision 的 ready publication 同步进持久 image atlas，再用带图片资源的
+RenderPlan 提交；首帧或解码失败仍保留 fallback。Swift surface snapshot 同时报告本次上传的
+image 数量和 atlas resource 数量，便于区分“命令已发布”和“纹理已 ready”。见 ADR 0141、0142、0143、0144。
