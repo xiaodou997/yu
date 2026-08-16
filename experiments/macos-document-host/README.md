@@ -117,7 +117,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 `--visual-ime-self-check` 还会在同一 visual IME composition 生命周期中调用
 `yu_storage_session_macos_composition_shaped_caret`，检查 CoreText block-local caret、visual
 selection/replacement range、Revision + generation 绑定，以及旧 generation 的拒绝。当前
-Metal surface 仍不直接绘制 preedit glyph，TextKit 继续作为输入宿主。
+Metal surface 已能消费所属 block 的 transient shaped preedit glyph；TextKit 仍继续作为输入、
+Accessibility 和失败回退宿主。
 
 验证 TextKit 过渡镜像接收 Rust projected UTF-8，并通过 Rust reverse mapping 完成 visual/source
 selection、caret 双向 round-trip 与 stale Revision 拒绝（不启动窗口）：
@@ -206,8 +207,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 ```
 
 这个 self-check 只返回 lifecycle scalar；它不启动可视化演示模式，也不替换生产 TextKit source
-mirror。产品窗口的 native surface lifecycle 已接入，成功提交后会显示最小 Rust glyph overlay；
-完整 visual projection、caret 和 hit-testing 仍在后续阶段。
+mirror。产品窗口的 native surface lifecycle 已接入，成功提交后会显示 Rust glyph overlay；活动
+composition 会在同一持久 publication 中重建所属 block 的 shaped preedit glyph。
 
 验证真实 AppKit `NSView` → `CAMetalLayer` attachment、drawable acquisition、atlas upload、
 retained target blit/present 和 stale Revision 拒绝（显式测试命令，会短暂创建并关闭临时窗口）：
@@ -218,8 +219,9 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 ```
 
 该 self-check 只返回 Rust-owned lifecycle scalar；同一个 storage session 会复用 surface、renderer、
-atlas、Metal target 和 attachment，重复提交应复用 atlas upload，surface 尺寸变化会推进 generation，
-结束前显式 detach。它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
+atlas、Metal target 和 attachment，重复提交应复用 atlas upload，composition generation 变化会
+强制提交新的 preedit glyph frame，cancel 会恢复 canonical glyph scene，surface 尺寸变化会推进
+generation，结束前显式 detach。它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
 
 验证产品 document-host 窗口中的 `NSView` lifecycle coordinator。它会在真实 AppKit window 中把
 attach、layout/resize、scroll、编辑 Revision 和 close detach 映射到同一个 Rust surface session；

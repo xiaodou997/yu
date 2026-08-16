@@ -4320,13 +4320,32 @@ fn macos_visual_scene_glyphs(
     let config = state.builder.config();
     let source = session.session.snapshot();
     let layout_config = session.session.viewport_config().layout();
+    let composition_block = session
+        .session
+        .document()
+        .editor()
+        .composition_block_index();
     let mut block_metadata = Vec::with_capacity(input.blocks().len());
     {
         let document = session.session.document_mut().editor_mut();
         for block in input.blocks() {
-            let layout = document
-                .block_layout_with_shaper(block.index(), layout_config, state.builder.shaper())
-                .map_err(status_from_editor_error)?;
+            let glyph_count = if composition_block == Some(block.index()) {
+                document
+                    .block_layout_with_composition_and_shaper(
+                        block.index(),
+                        layout_config,
+                        state.builder.shaper(),
+                    )
+                    .map_err(status_from_editor_error)?
+                    .glyphs()
+                    .len()
+            } else {
+                document
+                    .block_layout_with_shaper(block.index(), layout_config, state.builder.shaper())
+                    .map_err(status_from_editor_error)?
+                    .glyphs()
+                    .len()
+            };
             let source_start_utf16 = source
                 .utf16_offset(block.source().start())
                 .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
@@ -4339,7 +4358,7 @@ fn macos_visual_scene_glyphs(
                 block.index(),
                 source_start_utf16,
                 source_end_utf16,
-                layout.glyphs().len(),
+                glyph_count,
             ));
         }
     }
@@ -4462,12 +4481,19 @@ fn macos_visual_render_plan(
     let rasterizer = shaper.rasterizer();
     let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::default());
     let mut block_glyphs = Vec::with_capacity(viewport_snapshot.blocks().len());
+    let composition_block = document.composition_block_index();
 
     for block in viewport_snapshot.blocks() {
-        let layout = document
-            .block_layout_with_shaper(block.index(), config, &shaper)
-            .map_err(status_from_editor_error)?
-            .clone();
+        let layout = if composition_block == Some(block.index()) {
+            document
+                .block_layout_with_composition_and_shaper(block.index(), config, &shaper)
+                .map_err(status_from_editor_error)?
+        } else {
+            document
+                .block_layout_with_shaper(block.index(), config, &shaper)
+                .map_err(status_from_editor_error)?
+                .clone()
+        };
         for placement in layout.glyphs() {
             let key = GlyphRasterKey::new(placement.face(), placement.glyph(), size)
                 .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;

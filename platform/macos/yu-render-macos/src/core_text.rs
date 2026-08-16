@@ -266,9 +266,19 @@ impl CoreTextViewportFrameBuilder {
         let viewport = document.visible_blocks_with_shaper(self.config.viewport(), &self.shaper)?;
         let layout_config = document.viewport_config().layout();
         let rasterizer = self.shaper.rasterizer();
+        let composition_block = document.composition_block_index();
         for block in viewport.blocks() {
-            let layout =
-                document.block_layout_with_shaper(block.index(), layout_config, &self.shaper)?;
+            let layout = if composition_block == Some(block.index()) {
+                document.block_layout_with_composition_and_shaper(
+                    block.index(),
+                    layout_config,
+                    &self.shaper,
+                )?
+            } else {
+                document
+                    .block_layout_with_shaper(block.index(), layout_config, &self.shaper)?
+                    .clone()
+            };
             for placement in layout.glyphs() {
                 let key = GlyphRasterKey::new(
                     placement.face(),
@@ -292,6 +302,7 @@ impl CoreTextViewportFrameBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yu_core::{ByteOffset, TextRange, Utf16Offset, Utf16Range};
     use yu_editor::{EditorCommand, ViewportConfig, ViewportRect};
     use yu_scene::{Rect, Rgba8};
 
@@ -335,6 +346,35 @@ mod tests {
         assert!(second.frame().plan().uploads().is_empty());
         assert_eq!(builder.atlas_page_count(), page_count);
         assert_eq!(builder.atlas_glyph_count(), glyph_count);
+
+        let source = document.snapshot();
+        let composition_start = source.as_str().find("world").expect("composition target");
+        let composition_end = composition_start + "world".len();
+        document
+            .begin_composition(
+                TextRange::new(
+                    ByteOffset::new(composition_start as u64),
+                    ByteOffset::new(composition_end as u64),
+                )
+                .expect("composition range"),
+                "日本🙂",
+                Utf16Range::empty(Utf16Offset::new(2)),
+            )
+            .expect("composition");
+        let composed = builder
+            .publish(&mut document)
+            .expect("composition publication");
+        assert_eq!(composed.revision(), document.revision());
+        assert_ne!(
+            composed.frame().plan().commands().len(),
+            second.frame().plan().commands().len()
+        );
+        assert!(builder.atlas_glyph_count() >= glyph_count);
+
+        assert!(document.cancel_composition());
+        let cancelled = builder.publish(&mut document).expect("cancel publication");
+        assert_eq!(cancelled.revision(), document.revision());
+        assert_eq!(document.composition(), None);
 
         document
             .execute(EditorCommand::insert_text("界"))

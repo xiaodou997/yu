@@ -156,6 +156,24 @@ impl EditorDocument {
         self.markdown.blocks().block_index_for_offset(offset)
     }
 
+    /// Returns the parser block that can host the active composition without
+    /// crossing a block boundary.  Composition layout is intentionally
+    /// block-local: a marked-text replacement spanning multiple Markdown
+    /// blocks stays on the native fallback surface until a later phase adds a
+    /// multi-block projection contract.
+    #[must_use]
+    pub fn composition_block_index(&self) -> Option<usize> {
+        let composition = self.composition.as_ref()?;
+        let index = self
+            .markdown
+            .blocks()
+            .block_index_for_offset(composition.replacement_range().start())?;
+        let block = self.markdown.blocks().get(index)?;
+        let replacement = composition.replacement_range();
+        (replacement.start() >= block.range().start() && replacement.end() <= block.range().end())
+            .then_some(index)
+    }
+
     /// Returns a revision-bound block layout snapshot from the current
     /// projection. The snapshot is owned by a cache keyed by block range,
     /// block kind and layout configuration; source edits remap unaffected
@@ -2555,6 +2573,21 @@ mod tests {
                 >= 2
         );
         assert_eq!(document.snapshot().as_str(), "hello");
+    }
+
+    #[test]
+    fn composition_block_index_rejects_cross_block_replacements() {
+        let mut document = EditorDocument::new("first\n\nsecond");
+        document
+            .begin_composition(source_range(2, 10), "x", utf16_range(0, 1))
+            .expect("composition should begin");
+        assert_eq!(document.composition_block_index(), None);
+
+        let _ = document.cancel_composition();
+        document
+            .begin_composition(source_range(2, 2), "x", utf16_range(0, 1))
+            .expect("composition should begin");
+        assert_eq!(document.composition_block_index(), Some(0));
     }
 
     #[test]

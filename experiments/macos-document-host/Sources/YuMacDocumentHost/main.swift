@@ -3750,6 +3750,7 @@ private final class MacosSurfaceHostCoordinator {
 
     private struct SubmitKey: Equatable {
         let revision: UInt64
+        let compositionGeneration: UInt64
         let size: Double
         let maxWidth: Double
         let scrollY: Double
@@ -3943,8 +3944,14 @@ private final class MacosSurfaceHostCoordinator {
         let scrollY = max(viewportBounds.origin.y, 0.0)
         let maxWidth = layoutWidth(for: surfaceView)
         let scale = max(window.backingScaleFactor, 1.0)
+        // Composition updates do not advance the canonical Revision. Include
+        // the Rust-owned generation in the submit key so every marked-text
+        // update/cancel publishes a fresh transient glyph scene instead of
+        // reusing the previous frame by geometry alone.
+        let compositionGeneration = bridge.composition.generation
         let key = SubmitKey(
             revision: revision,
+            compositionGeneration: compositionGeneration,
             size: Double(size),
             maxWidth: Double(maxWidth),
             scrollY: Double(scrollY),
@@ -5840,6 +5847,7 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
 private func runMacosRenderHostSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
+        let sourceBefore = bridge.source
         let revision = bridge.state.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
@@ -5890,6 +5898,41 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
         precondition(repeated.atlasPageCount == first.atlasPageCount)
         precondition(repeated.atlasGlyphCount == first.atlasGlyphCount)
         precondition(repeated.uploadCount == 0)
+
+        let strong = (sourceBefore as NSString).range(of: "粗体")
+        precondition(strong.location != NSNotFound)
+        try bridge.beginComposition(
+            replacementRange: strong,
+            preedit: "日本🙂",
+            selection: NSRange(location: 2, length: 0)
+        )
+        let composed = try bridge.macosRenderHostFrame(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 240.0,
+            surfaceGeneration: 0
+        )
+        precondition(composed.revision == revision)
+        precondition(composed.frameSerial > repeated.frameSerial)
+        // The canonical projection contains two visible CJK glyphs here;
+        // the transient Japanese/emoji preedit contributes a different shaped
+        // glyph sequence to the same persistent Metal publication.
+        precondition(composed.commandCount != repeated.commandCount)
+        precondition(composed.atlasGlyphCount >= repeated.atlasGlyphCount)
+        try bridge.cancelComposition()
+        let cancelled = try bridge.macosRenderHostFrame(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 240.0,
+            surfaceGeneration: 0
+        )
+        precondition(cancelled.revision == revision)
+        precondition(cancelled.frameSerial > composed.frameSerial)
+        precondition(cancelled.commandCount == repeated.commandCount)
 
         let resized = try bridge.macosRenderHostFrame(
             revision: revision,
@@ -5945,6 +5988,7 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
 private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
+        let sourceBefore = bridge.source
         let revision = bridge.state.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
@@ -6027,6 +6071,45 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
         precondition(repeated.frameSerial > first.frameSerial)
         precondition(repeated.uploadedPages == 0)
         precondition(repeated.submitted)
+
+        let strong = (sourceBefore as NSString).range(of: "粗体")
+        precondition(strong.location != NSNotFound)
+        try bridge.beginComposition(
+            replacementRange: strong,
+            preedit: "日本🙂",
+            selection: NSRange(location: 2, length: 0)
+        )
+        let composed = try bridge.macosRenderHostSurfaceSubmit(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: viewportHeight,
+            surfaceWidth: Double(maxWidth),
+            surfaceHeight: Double(viewportHeight),
+            scale: 2.0,
+            view: rawView
+        )
+        precondition(composed.revision == revision)
+        precondition(composed.frameSerial > repeated.frameSerial)
+        precondition(composed.commandCount != repeated.commandCount)
+        precondition(composed.submitted)
+        try bridge.cancelComposition()
+        let cancelled = try bridge.macosRenderHostSurfaceSubmit(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: viewportHeight,
+            surfaceWidth: Double(maxWidth),
+            surfaceHeight: Double(viewportHeight),
+            scale: 2.0,
+            view: rawView
+        )
+        precondition(cancelled.revision == revision)
+        precondition(cancelled.frameSerial > composed.frameSerial)
+        precondition(cancelled.commandCount == repeated.commandCount)
+        precondition(cancelled.submitted)
 
         let resized = try bridge.macosRenderHostSurfaceSubmit(
             revision: revision,
