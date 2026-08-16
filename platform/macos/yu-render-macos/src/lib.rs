@@ -11,7 +11,7 @@
 //! state. It can submit a clear-only frame or a small retained render plan to
 //! an attached layer, but does not create a window or own editor state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -21,7 +21,10 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
-use yu_assets::{DecodedImage, ImageDecodeError, ImageLocation, ImageLocationError, ImageRequest};
+use yu_assets::{
+    DecodedImage, ImageDecodeError, ImageLocation, ImageLocationError, ImagePublication,
+    ImageRequest,
+};
 use yu_core::Revision;
 use yu_render::{AtlasPageUpload, RenderCommand, RenderPlan, RenderUploader};
 use yu_scene::Rgba8;
@@ -1187,6 +1190,7 @@ pub struct MetalImageAtlas {
     images: BTreeMap<u64, MetalTexture>,
     identities: BTreeMap<u64, ImageTextureIdentity>,
     device_registry_id: Option<u64>,
+    evictions: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1235,6 +1239,35 @@ impl MetalImageAtlas {
     #[must_use]
     pub fn resource_count(&self) -> usize {
         self.images.len()
+    }
+
+    /// Retains only publications that can be referenced by the current
+    /// viewport RenderPlan. Resources leaving the visible publication set are
+    /// dropped before native command conversion, so the GPU cache cannot grow
+    /// with every image visited during a long document scroll.
+    pub fn retain_publications(&mut self, publications: &[ImagePublication]) -> usize {
+        let retained = publications
+            .iter()
+            .map(|publication| publication.key().fingerprint())
+            .collect::<BTreeSet<_>>();
+        let before = self.images.len();
+        self.images
+            .retain(|resource, _| retained.contains(resource));
+        self.identities
+            .retain(|resource, _| retained.contains(resource));
+        let evicted = before.saturating_sub(self.images.len());
+        self.evictions = self
+            .evictions
+            .saturating_add(u64::try_from(evicted).unwrap_or(u64::MAX));
+        if self.images.is_empty() {
+            self.device_registry_id = None;
+        }
+        evicted
+    }
+
+    #[must_use]
+    pub const fn eviction_count(&self) -> u64 {
+        self.evictions
     }
 
     fn resource_sizes(&self) -> BTreeMap<u64, (u32, u32)> {

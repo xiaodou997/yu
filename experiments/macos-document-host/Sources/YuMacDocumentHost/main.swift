@@ -639,6 +639,7 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let imageRequestCount: Int
     let imageFailureCount: Int
     let imageEvictionCount: Int
+    let imageAtlasEvictionCount: Int
     let submitted: Bool
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
@@ -655,6 +656,7 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
         imageRequestCount = Int(value.image_request_count)
         imageFailureCount = Int(value.image_failure_count)
         imageEvictionCount = Int(value.image_eviction_count)
+        imageAtlasEvictionCount = Int(value.image_atlas_eviction_count)
         submitted = value.submitted != 0
     }
 }
@@ -7103,6 +7105,23 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
             precondition(imageReady.imageResourceCount > 0)
             precondition(imageReady.imageFailureCount == 0)
             precondition(imageReady.uploadedImages > 0 || repeated.imageResourceCount > 0)
+
+            // Move past the fixture's visible block. The host must drop the
+            // now-unreferenced Metal texture instead of retaining every image
+            // visited during a long document scroll.
+            let offscreen = try bridge.macosRenderHostSurfaceSubmit(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 10_000.0,
+                viewportHeight: viewportHeight,
+                surfaceWidth: Double(maxWidth),
+                surfaceHeight: Double(viewportHeight),
+                scale: 2.0,
+                view: rawView
+            )
+            precondition(offscreen.imageResourceCount == 0)
+            precondition(offscreen.imageAtlasEvictionCount > imageReady.imageAtlasEvictionCount)
             imagePublicationReady = true
         }
         // The self-check exits explicitly below, so clean the temporary

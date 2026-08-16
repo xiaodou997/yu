@@ -674,5 +674,8 @@ worker/`MetalImageAtlas` publication wiring 现在由 macOS 持久 surface host 
 `ImageCache` 有显式容量、LRU eviction 和按 Revision 绑定的失败记录，surface snapshot 同时报告
 本次可见请求、失败与 eviction 计数，以及上传的 image 数量和 atlas resource 数量，便于区分
 “命令已发布”“资源请求已排队”“解码失败”和“纹理已 ready”。ready publication 会在下一次
-layout 中按解码得到的 intrinsic 宽高比更新可见 placement bounds；当前仍不把图片高度变化写回
-完整 block height index，完整 block reflow/scroll-height 更新留在后续阶段。见 ADR 0141、0142、0143、0144、0145。
+layout 中按解码得到的 intrinsic 宽高比更新可见 placement bounds，并把图片底部纳入对应 block 的
+HeightIndex，进而更新 document content height 和 max scroll。Metal image atlas 在每次提交前只
+保留当前 publication 集合，离开可见集合的 GPU texture 会被淘汰；surface snapshot 另报告 atlas
+eviction 累计值。资源未 ready 时仍使用 placeholder，完整图片资源重试/预取策略留在后续阶段。
+见 ADR 0141、0142、0143、0144、0145、0146。

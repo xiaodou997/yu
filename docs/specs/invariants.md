@@ -575,5 +575,10 @@
     排队；进入新 Revision 后才允许重新尝试。
 17. ready publication 的 intrinsic width/height 只能更新同一 Revision 可见 placement 的
     document-space bounds，并保持 source/visual mapping 与 image hit-test range 不变；宽度受当前
-    layout content width 限制时必须保持宽高比。当前阶段 intrinsic bounds 仍是 viewport layout 的
-    overlay measurement，不能声称已经更新完整 block height index 或 scroll extent。
+    layout content width 限制时必须保持宽高比；placement 的底部必须参与对应 block 的 HeightIndex，
+    content height 与 max scroll 必须随同一 Revision 的可见测量更新。该更新不能修改 canonical
+    source、projection ranges、selection 或 image hit-test 映射。
+18. `MetalImageAtlas` 在每次持久 surface submit 前必须只保留当前 Revision publication 集合中的
+    resource fingerprint；离开集合的 GPU texture 与 identity 必须一起淘汰，`image_resource_count`
+    不得继续统计离屏资源。atlas eviction 只能发生在 native command conversion 之前，不能让当前
+    RenderPlan 引用已淘汰 texture；`image_atlas_eviction_count` 只记录成功提交边界前的累计淘汰次数。

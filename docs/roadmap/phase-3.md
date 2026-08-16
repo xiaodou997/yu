@@ -69,7 +69,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] image placement 使用 source/alt/visual ranges 生成 document-space layout geometry；Scene/RenderPlan 以 glyph 后 overlay 顺序发布，metrics/CoreText hit-test 返回完整 image source range
 - [x] 将 `ImagePublication`/`MetalImageAtlas` 接入 macOS 持久 surface host；snapshot 暴露 image upload/resource 计数，surface self-check 覆盖 ImageIO→Metal ready texture
 - [x] image 请求收敛到 CoreText 当前 viewport/overscan block；`ImageCache` 增加有上限的 LRU、Revision-bound 失败诊断，ready publication 在下一帧按真实 intrinsic 宽高比更新 placement bounds
-- [ ] 完整 intrinsic image block reflow、scroll-height 更新与 GPU atlas texture eviction；当前阶段只更新可见 image placement 的 bounds，未 ready/失败仍保留 fallback
+- [x] intrinsic image 高度进入对应 block 的 HeightIndex、content height 与 max scroll；Metal image atlas 在 publication 集合变化时淘汰离屏 texture，snapshot 暴露 atlas eviction 计数
+- [ ] 图片尺寸 metadata 的跨帧持久化、预取/重试策略与大规模图片集合的调度压测；未 ready/失败仍保留 fallback
 
 ## 约束
 

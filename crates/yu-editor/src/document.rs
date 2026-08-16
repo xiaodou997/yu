@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Range};
-use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
+use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
@@ -12,8 +12,8 @@ use yu_text::{
 
 use crate::{
     BlockProjection, CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay,
-    EditorCommand, EditorSelection, KeyEvent, KeyRouteResult, LayoutBackend, LayoutCache,
-    LayoutCacheStats, LayoutPoint, Projection, ProjectionCache, ProjectionCacheStats,
+    EditorCommand, EditorSelection, ImageSource, KeyEvent, KeyRouteResult, LayoutBackend,
+    LayoutCache, LayoutCacheStats, LayoutPoint, Projection, ProjectionCache, ProjectionCacheStats,
     ProjectionError, SelectionError, SourceChange, ViewportCaret, ViewportConfig, ViewportError,
     ViewportLayout, ViewportRect, ViewportSnapshot, ViewportStats,
     command::{
@@ -393,8 +393,31 @@ impl EditorDocument {
         viewport: ViewportRect,
         shaper: &S,
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        self.visible_blocks_with_shaper_and_image_resolver(viewport, shaper, |_| None)
+    }
+
+    /// Measures the visible window with ready image dimensions supplied by a
+    /// caller-owned resolver. Only selected blocks are inspected, so the
+    /// resolver does not turn a viewport query into a full-document image
+    /// scan. Image geometry remains transient to the layout snapshot while
+    /// the resulting block height is retained in the viewport HeightIndex.
+    pub fn visible_blocks_with_shaper_and_image_resolver<S, F>(
+        &mut self,
+        viewport: ViewportRect,
+        shaper: &S,
+        image_resolver: F,
+    ) -> Result<ViewportSnapshot, EditorDocumentError>
+    where
+        S: ShapingProvider,
+        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+    {
         let mut layout = std::mem::take(&mut self.viewport);
-        let result = self.measure_visible_blocks_with_shaper(&mut layout, viewport, shaper);
+        let result = self.measure_visible_blocks_with_shaper_and_images(
+            &mut layout,
+            viewport,
+            shaper,
+            &image_resolver,
+        );
         self.viewport = layout;
         result
     }
@@ -409,11 +432,39 @@ impl EditorDocument {
         viewport: ViewportRect,
         shaper: &S,
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        self.visible_blocks_with_composition_and_shaper_and_image_resolver(viewport, shaper, |_| {
+            None
+        })
+    }
+
+    /// Composition-aware variant of
+    /// [`Self::visible_blocks_with_shaper_and_image_resolver`]. Ready image
+    /// dimensions are applied to transient composition layouts as well, while
+    /// the canonical source and layout cache remain untouched.
+    pub fn visible_blocks_with_composition_and_shaper_and_image_resolver<S, F>(
+        &mut self,
+        viewport: ViewportRect,
+        shaper: &S,
+        image_resolver: F,
+    ) -> Result<ViewportSnapshot, EditorDocumentError>
+    where
+        S: ShapingProvider,
+        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+    {
         if self.composition.is_none() {
-            return self.visible_blocks_with_shaper(viewport, shaper);
+            return self.visible_blocks_with_shaper_and_image_resolver(
+                viewport,
+                shaper,
+                image_resolver,
+            );
         }
         let mut layout = std::mem::take(&mut self.viewport);
-        let result = self.measure_visible_blocks_with_composition(&mut layout, viewport, shaper);
+        let result = self.measure_visible_blocks_with_composition_and_images(
+            &mut layout,
+            viewport,
+            shaper,
+            &image_resolver,
+        );
         self.viewport = layout;
         result
     }
@@ -484,12 +535,17 @@ impl EditorDocument {
             .map_err(EditorDocumentError::Viewport)
     }
 
-    fn measure_visible_blocks_with_shaper<S: ShapingProvider>(
+    fn measure_visible_blocks_with_shaper_and_images<S, F>(
         &mut self,
         layout: &mut ViewportLayout,
         viewport: ViewportRect,
         shaper: &S,
-    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        image_resolver: &F,
+    ) -> Result<ViewportSnapshot, EditorDocumentError>
+    where
+        S: ShapingProvider,
+        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+    {
         layout
             .set_backend(LayoutBackend::Shaped)
             .map_err(EditorDocumentError::Viewport)?;
@@ -500,11 +556,11 @@ impl EditorDocument {
         for _ in 0..8 {
             let mut changed = false;
             for index in range.start()..range.end() {
-                let line_count = self
+                let mut block_layout = self
                     .block_layout_with_shaper(index, config, shaper)?
-                    .lines()
-                    .len();
-                let height = config.line_height() * (line_count as f32);
+                    .clone();
+                apply_image_measurements(&mut block_layout, image_resolver)?;
+                let height = block_layout.block_height();
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -522,12 +578,17 @@ impl EditorDocument {
             .map_err(EditorDocumentError::Viewport)
     }
 
-    fn measure_visible_blocks_with_composition<S: ShapingProvider>(
+    fn measure_visible_blocks_with_composition_and_images<S, F>(
         &mut self,
         layout: &mut ViewportLayout,
         viewport: ViewportRect,
         shaper: &S,
-    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        image_resolver: &F,
+    ) -> Result<ViewportSnapshot, EditorDocumentError>
+    where
+        S: ShapingProvider,
+        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+    {
         layout
             .set_backend(LayoutBackend::Shaped)
             .map_err(EditorDocumentError::Viewport)?;
@@ -544,11 +605,11 @@ impl EditorDocument {
             // measure the affected span before measuring the visible window.
             if let Some(span) = composition_span.as_ref() {
                 for index in span.clone() {
-                    let line_count = self
+                    let mut block_layout = self
                         .block_layout_with_composition_and_shaper(index, config, shaper)?
-                        .lines()
-                        .len();
-                    let height = config.line_height() * line_count.max(1) as f32;
+                        .clone();
+                    apply_image_measurements(&mut block_layout, image_resolver)?;
+                    let height = block_layout.block_height();
                     changed |= layout
                         .set_block_height(index, height)
                         .map_err(EditorDocumentError::Viewport)?;
@@ -562,11 +623,11 @@ impl EditorDocument {
                 {
                     continue;
                 }
-                let line_count = self
+                let mut block_layout = self
                     .block_layout_with_shaper(index, config, shaper)?
-                    .lines()
-                    .len();
-                let height = config.line_height() * line_count.max(1) as f32;
+                    .clone();
+                apply_image_measurements(&mut block_layout, image_resolver)?;
+                let height = block_layout.block_height();
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -1699,6 +1760,25 @@ impl EditorDocument {
     fn current_list_line(&self) -> Option<SourceLine> {
         source_line(&self.snapshot(), self.selection.focus()).ok()
     }
+}
+
+fn apply_image_measurements<F>(
+    layout: &mut LayoutSnapshot,
+    image_resolver: &F,
+) -> Result<(), EditorDocumentError>
+where
+    F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+{
+    let measurements = layout
+        .projection()
+        .images()
+        .iter()
+        .copied()
+        .filter_map(|image| image_resolver(image).map(|size| (image.source(), size)))
+        .collect::<Vec<_>>();
+    layout
+        .apply_image_intrinsic_sizes(&measurements)
+        .map_err(EditorDocumentError::Layout)
 }
 
 fn source_change_from_applied(
@@ -3306,6 +3386,36 @@ mod tests {
             .visible_blocks(ViewportRect::new(0.0, 2.0))
             .expect("metrics viewport should remeasure after backend switch");
         assert_eq!(metrics_again.blocks()[0].height(), 1.0);
+    }
+
+    #[test]
+    fn ready_image_intrinsic_height_updates_block_index_and_content_height() {
+        let mut document = EditorDocument::new("![alt](image.png)\n\ntext");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(80.0, 10.0),
+                10.0,
+                0.0,
+            ))
+            .expect("viewport config should be valid");
+
+        let placeholder = document
+            .visible_blocks_with_shaper(ViewportRect::new(0.0, 100.0), &WideShaper)
+            .expect("placeholder viewport should measure");
+        assert_eq!(placeholder.blocks()[0].height(), 20.0);
+
+        let intrinsic = ImageIntrinsicSize::new(200, 100).expect("image dimensions");
+        let ready = document
+            .visible_blocks_with_shaper_and_image_resolver(
+                ViewportRect::new(0.0, 100.0),
+                &WideShaper,
+                |_| Some(intrinsic),
+            )
+            .expect("ready image viewport should measure");
+        assert_eq!(ready.blocks()[0].height(), 40.0);
+        assert_eq!(ready.blocks()[1].y(), 40.0);
+        assert!(ready.content_height() > placeholder.content_height());
+        assert!(ready.content_height() >= ready.blocks()[1].y() + ready.blocks()[1].height());
     }
 
     #[test]

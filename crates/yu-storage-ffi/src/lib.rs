@@ -736,6 +736,7 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub image_request_count: u64,
     pub image_failure_count: u64,
     pub image_eviction_count: u64,
+    pub image_atlas_eviction_count: u64,
     pub submitted: u8,
 }
 
@@ -6186,6 +6187,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             Some(surface) => surface,
             None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
         };
+        surface_state.image_atlas.retain_publications(&publications);
         let mut uploaded_images = 0_usize;
         for publication in &publications {
             match surface_state
@@ -6224,6 +6226,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 image_request_count: u64::try_from(image_request_count).unwrap_or(u64::MAX),
                 image_failure_count: u64::try_from(image_failure_count).unwrap_or(u64::MAX),
                 image_eviction_count,
+                image_atlas_eviction_count: surface_state.image_atlas.eviction_count(),
                 submitted: 1,
             };
         }

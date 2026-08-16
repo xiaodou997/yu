@@ -917,6 +917,18 @@ impl LayoutSnapshot {
         Ok(())
     }
 
+    /// Returns the block height after image placement measurement. Ordinary
+    /// text keeps its line-height total; a ready image may extend the block
+    /// beyond that line box and therefore must participate in the viewport
+    /// height index.
+    #[must_use]
+    pub fn block_height(&self) -> f32 {
+        let line_height = self.lines.len() as f32 * self.config.line_height;
+        self.images.iter().fold(line_height, |height, image| {
+            height.max(image.bounds.y() + image.bounds.height())
+        })
+    }
+
     #[must_use]
     pub fn projection(&self) -> &Projection {
         &self.projection
@@ -1724,6 +1736,7 @@ mod tests {
         let image = layout.images()[0];
         assert_eq!(image.bounds().width(), 80.0);
         assert_eq!(image.bounds().height(), 40.0);
+        assert_eq!(layout.block_height(), 40.0);
         let hit = layout
             .hit_test(LayoutPoint::new(79.0, 39.0))
             .expect("intrinsic image hit");
