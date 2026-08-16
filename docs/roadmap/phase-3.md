@@ -33,7 +33,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] `DocumentTextView` visual pointer adapter 与 source-mirror fallback self-check
 - [x] `DocumentTextView` opt-in visual IME composition mirror、marked range 与 attributed substring self-check
 - [x] 生产 visual view 启用点击/拖选 visual boundary→Rust source selection，以及 source→visual caret 映射
-- [ ] 生产 visual view 的滚动边界、上下移动、最终 selection 绘制和 IME 回归
+- [x] 生产 visual view 的 projected selection highlight 与同一 Revision 的 shaped caret reveal
+- [ ] 最终 shaped Metal hit-test、跨 visual line 上下移动与 visual IME 回归
 
 ## Track C：Scene and rendering
 

@@ -222,7 +222,11 @@
     native source mirror，任何 stale/范围/映射失败都必须回退 AppKit source selection，不能修改
     source、composition 或 history。产品窗口可以在 visual layout ready 后启用该 adapter，但
     scroll origin、字体宽度和 Revision 必须与当前 mirror 一致；source→visual caret 同样必须先
-    经过 Rust mapping，最终 shaped Metal hit-test 不能由 Swift 猜测。
+    经过 Rust mapping，visual selection highlight 必须来自同一 Rust visual range，不能把 source
+    delimiter 的 TextKit 默认背景当作最终选区。selection/caret 变化触发的 scroll reveal 必须查询
+    同一 Revision 的 shaped `CaretScrollRequest`，stale/invalid target 不得触碰 `NSClipView`，
+    absolute target 只能由平台在 content/clip boundary 做最后 clamp；最终 shaped Metal hit-test
+    不能由 Swift 猜测。
 
 46. visual IME overlay 只能使用同一 expected Revision + composition generation 返回的 Rust
     projected UTF-8、visual replacement range 和 marked selection；`DocumentTextView` 在 metadata、

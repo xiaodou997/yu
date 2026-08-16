@@ -391,7 +391,11 @@ Rust reverse mapping 校验 hidden delimiter 和 Unicode；Rust source 发生编
 TextKit layout 将点击/拖选解析为 visual boundary，再交给 Rust reverse mapping，把 canonical
 source range 同步回现有 source mirror；生产窗口在布局完成后启用该路径，映射失败时回退 AppKit
 source selection。source→visual caret 也通过 Rust projection caret 查询后定位到同一临时布局；
-TextKit 仍是输入/IME/Accessibility owner，最终 selection 绘制和 shaped Metal hit-test 仍待后续。
+TextKit 仍是输入/IME/Accessibility owner。当前选区背景也由同一 visual range 生成 line-fragment
+rectangles，source TextKit 的 selection background 在 adapter 开启时清空，避免 hidden delimiter
+被直接高亮。source selection/caret 通知会异步调用同一 Rust Revision 的
+`yu_storage_session_macos_shaped_caret_scroll_request`，并只在 AppKit clip boundary 内应用
+absolute target；最终 shaped Metal hit-test、跨 visual line 上下移动和 visual IME preedit 仍待后续。
 同一 mirror 在 composition active 时还可以消费 storage FFI 返回的 visual replacement range
 和 generation-bound projected preedit，并让 `markedRange`/`attributedSubstring` 读取 visual
 坐标；metadata、文本和 callback 必须匹配同一 Revision + generation，过期时清空 visual mirror

@@ -2259,6 +2259,39 @@ private final class ProjectionTextKitMirror {
             height: max(lineRect.height, 1.0)
         )
     }
+
+    /// Returns line-fragment rectangles for a projected visual selection.
+    /// The rectangles are local to `textContainer`; callers add the native
+    /// TextKit container origin when painting in the view coordinate space.
+    /// This mirror is disposable, so the caller must validate its Revision
+    /// before using the result.
+    func selectionRects(forVisualRange range: NSRange) -> [NSRect] {
+        guard range.location >= 0,
+              range.length > 0,
+              NSMaxRange(range) <= textStorage.length else {
+            return []
+        }
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: range,
+            actualCharacterRange: nil
+        )
+        guard glyphRange.location != NSNotFound, glyphRange.length > 0 else {
+            return []
+        }
+        var rects: [NSRect] = []
+        layoutManager.enumerateEnclosingRects(
+            forGlyphRange: glyphRange,
+            withinSelectedGlyphRange: glyphRange,
+            in: textContainer
+        ) { rect, _ in
+            guard rect.width.isFinite, rect.height.isFinite,
+                  rect.width > 0.0, rect.height > 0.0 else {
+                return
+            }
+            rects.append(rect)
+        }
+        return rects
+    }
 }
 
 /// The native source mirror is deliberately a view cache, never a second
@@ -2301,7 +2334,9 @@ private final class DocumentTextView: NSTextView {
     private var visualCompositionGeneration: UInt64?
     private var visualViewport: NativeVisualViewport?
     private var visualSelectionAnchor: Int?
+    private var sourceSelectedTextAttributes: [NSAttributedString.Key: Any]?
     var onDocumentChange: (() -> Void)?
+    var onCaretChange: (() -> Void)?
     var onError: ((Error) -> Void)?
 
     init(bridge: StorageBridge) {
@@ -2367,12 +2402,24 @@ private final class DocumentTextView: NSTextView {
         visualMirrorEnabled = enabled
         visualSelectionAnchor = nil
         if enabled {
+            if sourceSelectedTextAttributes == nil {
+                sourceSelectedTextAttributes = selectedTextAttributes
+            }
+            var attributes = selectedTextAttributes
+            attributes[.backgroundColor] = NSColor.clear
+            attributes[.foregroundColor] = textColor ?? NSColor.textColor
+            selectedTextAttributes = attributes
             try refreshVisualMirror()
         } else {
             visualMirror = nil
             visualCompositionGeneration = nil
             visualViewport = nil
+            if let sourceSelectedTextAttributes {
+                selectedTextAttributes = sourceSelectedTextAttributes
+            }
+            self.sourceSelectedTextAttributes = nil
         }
+        needsDisplay = true
     }
 
     func setVisualMirrorEnabledForSelfCheck(_ enabled: Bool) throws {
@@ -2440,6 +2487,38 @@ private final class DocumentTextView: NSTextView {
         }
         let rect = visualMirror.caretRect(forVisualUTF16: visualUTF16)
         return rect.offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
+    }
+
+    /// Maps the current Rust-owned source selection into visual TextKit
+    /// rectangles. The source NSTextView selection background is cleared when
+    /// this adapter is enabled, so these rectangles are the only selection
+    /// highlight in the projected surface.
+    func visualSelectionRectsForDisplay() -> [NSRect] {
+        guard visualMirrorEnabled,
+              !bridge.composition.active,
+              let visualMirror,
+              visualMirror.revision == bridge.state.revision else {
+            return []
+        }
+        let selection = bridge.selection
+        guard selection.revision == visualMirror.revision,
+              selection.range.location >= 0,
+              selection.range.length > 0,
+              let projection = try? bridge.projectionSelection(
+                  revision: selection.revision,
+                  sourceRange: selection.range,
+                  affinity: selection.affinity
+              ),
+              projection.revision == visualMirror.revision else {
+            return []
+        }
+        return visualMirror.selectionRects(forVisualRange: projection.visualRange).map {
+            $0.offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
+        }
+    }
+
+    func visualSelectionRectsForSelfCheck() -> [NSRect] {
+        visualSelectionRectsForDisplay()
     }
 
     func visualMirrorStringForSelfCheck() -> String? {
@@ -2876,6 +2955,19 @@ private final class DocumentTextView: NSTextView {
             return
         }
         super.drawInsertionPoint(in: visualRect, color: color, turnedOn: turnedOn)
+    }
+
+    override func draw(_ rect: NSRect) {
+        super.draw(rect)
+        guard visualMirrorEnabled else { return }
+        let selectionRects = visualSelectionRectsForDisplay()
+        guard !selectionRects.isEmpty else { return }
+        NSColor.selectedTextBackgroundColor.withAlphaComponent(0.38).setFill()
+        for selectionRect in selectionRects {
+            let clipped = selectionRect.intersection(rect)
+            guard !clipped.isNull, !clipped.isEmpty else { continue }
+            clipped.fill()
+        }
     }
 
     private func syncNativeSelectionToRust(_ range: NSRange) {
@@ -3384,6 +3476,8 @@ private final class DocumentTextView: NSTextView {
 
     private func postSelectionChanged() {
         NSAccessibility.post(element: self, notification: .selectedTextChanged)
+        needsDisplay = true
+        onCaretChange?()
     }
 }
 
@@ -3543,6 +3637,64 @@ private final class MacosSurfaceHostCoordinator {
                 self.surfaceView?.setNativeContentVisible(false)
                 self.onError?(error)
             }
+        }
+    }
+
+    /// Reveals the current Rust-owned caret using the same Revision-bound
+    /// CoreText/shaped viewport contract as surface submission. This is a
+    /// scroll-only adapter: it never asks TextKit for a caret and never lets
+    /// AppKit invent document geometry. A stale or unavailable request is
+    /// ignored so a transient surface race cannot interrupt editing.
+    func revealCaretIfNeeded() {
+        guard let surfaceView,
+              let scrollView,
+              surfaceView.bounds.width > 0.0,
+              surfaceView.bounds.height > 0.0 else {
+            return
+        }
+        let revision = bridge.state.revision
+        let size = max(fontSize, 1.0)
+        let maxWidth = max(surfaceView.bounds.width, 1.0)
+        let viewportBounds = scrollView.contentView.bounds
+        let viewportHeight = max(viewportBounds.height, 1.0)
+        let currentScrollY = max(viewportBounds.origin.y, 0.0)
+        do {
+            let metrics = try ensureMetrics(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth
+            )
+            let request = try bridge.macosShapedCaretScrollRequest(
+                revision: revision,
+                size: Float(size),
+                maxWidth: Float(maxWidth),
+                scrollY: Float(currentScrollY),
+                viewportHeight: Float(viewportHeight),
+                margin: max(metrics.lineHeight, 4.0)
+            )
+            guard request.revision == revision,
+                  request.currentScrollY.isFinite,
+                  request.targetScrollY.isFinite,
+                  request.targetScrollY >= 0.0,
+                  request.needsScroll else {
+                return
+            }
+            let nativeMaxScrollY = max(
+                (scrollView.documentView?.bounds.height ?? 0.0) - viewportHeight,
+                0.0
+            )
+            let targetScrollY = min(max(request.targetScrollY, 0.0), nativeMaxScrollY)
+            guard abs(targetScrollY - currentScrollY) > 0.5 else { return }
+            var origin = viewportBounds.origin
+            origin.y = targetScrollY
+            scrollView.contentView.setBoundsOrigin(origin)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            lastSubmitKey = nil
+            scheduleSubmit()
+        } catch {
+            // Caret reveal is an enhancement to the source TextKit view. The
+            // source mirror remains interactive if shaped metrics are stale,
+            // unavailable, or temporarily racing a document edit.
         }
     }
 
@@ -3753,6 +3905,15 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             self.updateStatus()
             self.surfaceCoordinator.scheduleSubmit()
         }
+        textView.onCaretChange = { [weak self] in
+            // AppKit may deliver selection changes while TextKit is still
+            // inside its event callback. Defer the scroll mutation until the
+            // same main-thread turn has finished, while retaining the Rust
+            // Revision captured by the coordinator's query.
+            DispatchQueue.main.async { [weak self] in
+                self?.surfaceCoordinator.revealCaretIfNeeded()
+            }
+        }
         textView.onError = { [weak self] error in self?.show(error) }
         scrollView.documentView = textView
         // `DocumentTextView` is created before the window has a laid-out
@@ -3858,6 +4019,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             statusLabel.toolTip = "Visual pointer inactive: \(error.localizedDescription)"
         }
         surfaceCoordinator.scheduleSubmit()
+        surfaceCoordinator.revealCaretIfNeeded()
     }
 
     func refreshFromRust() {
@@ -3868,6 +4030,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         }
         updateStatus()
         surfaceCoordinator.scheduleSubmit()
+        surfaceCoordinator.revealCaretIfNeeded()
     }
 
     func detachSurfaceHost() {
@@ -4483,6 +4646,11 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
         precondition(textView.applyVisualSelectionForSelfCheck(visualStrong))
         precondition(bridge.selection.range == sourceStrong)
         precondition(textView.visualCaretRectForDisplay() != nil)
+        let selectionRects = textView.visualSelectionRectsForSelfCheck()
+        precondition(!selectionRects.isEmpty)
+        precondition(selectionRects.allSatisfy {
+            $0.width.isFinite && $0.height.isFinite && $0.width > 0.0 && $0.height > 0.0
+        })
         let glyphRange = mirrorLayout.glyphRange(
             forCharacterRange: visualStrong,
             actualCharacterRange: nil
@@ -4530,7 +4698,8 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
         precondition(mirrorStorage.string == projected)
         print(
             "Yu Visual Mirror self-check: TextKit visual UTF-16 range "
-                + "\(visualStrong) ↔ source range \(sourceStrong); stale mirror rejected"
+                + "\(visualStrong) ↔ source range \(sourceStrong), selection highlight "
+                + "rects=\(selectionRects.count); stale mirror rejected"
         )
         exit(EXIT_SUCCESS)
     } catch {
