@@ -4357,8 +4357,8 @@ fn macos_render_host_config(
     viewport_height: f32,
 ) -> Result<ViewportRenderConfig, i32> {
     let scene_height = viewport_height.max(1.0);
-    let scene_viewport =
-        Rect::new(0.0, 0.0, max_width, scene_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let scene_viewport = Rect::new(0.0, viewport.scroll_y(), max_width, scene_height)
+        .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
     Ok(ViewportRenderConfig::new(
         viewport,
         size,
@@ -4812,8 +4812,11 @@ fn macos_visual_render_plan(
         .content_height()
         .max(viewport_height)
         .max(1.0);
+    // The retained commands keep document-space coordinates.  The native
+    // Metal bridge subtracts the render-plan viewport origin when it maps
+    // them into the surface, so the plan must carry the current scroll.
     let scene_viewport =
-        Rect::new(0.0, 0.0, max_width, scene_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+        Rect::new(0.0, scroll_y, max_width, scene_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
     let mut render_plans = RenderPlanBuilder::new();
     let frame = assemble_viewport_render_frame(
         document,
@@ -7541,6 +7544,21 @@ mod tests {
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_render_host_config_tracks_document_scroll_origin() {
+        let viewport = ViewportRect::new(137.5, 240.0);
+        let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0)
+            .expect("valid macOS render host config");
+
+        assert_eq!(config.viewport().scroll_y(), 137.5);
+        assert_eq!(config.viewport().height(), 240.0);
+        assert_eq!(config.scene_viewport().x(), 0.0);
+        assert_eq!(config.scene_viewport().y(), 137.5);
+        assert_eq!(config.scene_viewport().width(), 500.0);
+        assert_eq!(config.scene_viewport().height(), 240.0);
     }
 
     #[cfg(target_os = "macos")]
