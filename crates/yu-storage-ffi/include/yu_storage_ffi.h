@@ -382,6 +382,45 @@ typedef struct YuStorageShapedViewportSnapshot {
     float max_scroll_y;
 } YuStorageShapedViewportSnapshot;
 
+/* Rust/CoreText-shaped visual decoration geometry. Selection rectangles and
+ * caret coordinates are document-space and must be offset by scroll_y before
+ * a native viewport sibling paints them. Active marked text returns
+ * YU_STORAGE_NO_OVERLAY so the host can retain its transient TextKit path. */
+typedef struct YuStorageMacosVisualDecorationSnapshot {
+    uint64_t revision;
+    uint64_t composition_generation;
+    uint64_t selection_count;
+    uint8_t caret_present;
+    float content_height;
+    float scroll_y;
+    float viewport_height;
+    float max_scroll_y;
+    float viewport_width;
+} YuStorageMacosVisualDecorationSnapshot;
+
+typedef struct YuStorageMacosVisualDecorationRect {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t line_index;
+    float x;
+    float y;
+    float width;
+    float height;
+    uint8_t kind;
+} YuStorageMacosVisualDecorationRect;
+
+typedef struct YuStorageMacosVisualDecorationCaret {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t line_index;
+    float x;
+    float y;
+    float width;
+    float height;
+    uint8_t affinity;
+    uint8_t present;
+} YuStorageMacosVisualDecorationCaret;
+
 /* Revision-bound shaped caret geometry and absolute document scroll target. */
 typedef struct YuStorageCaretScrollRequest {
     uint64_t revision;
@@ -729,6 +768,14 @@ int32_t yu_storage_session_macos_shaped_viewport_blocks(
     float max_width, float scroll_y, float viewport_height,
     YuStorageShapedViewportSnapshot *snapshot,
     YuStorageShapedViewportBlock *blocks, size_t capacity, size_t *written);
+int32_t yu_storage_session_macos_visual_decorations(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t expected_generation, float size, float max_width,
+    float scroll_y, float viewport_height,
+    YuStorageMacosVisualDecorationSnapshot *snapshot,
+    YuStorageMacosVisualDecorationCaret *caret,
+    YuStorageMacosVisualDecorationRect *rects, size_t capacity,
+    size_t *written);
 int32_t yu_storage_session_macos_shaped_caret_scroll_request(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height, float margin,
