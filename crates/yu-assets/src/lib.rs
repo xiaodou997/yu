@@ -174,6 +174,51 @@ pub struct DecodedImage {
     pixels: Arc<[u8]>,
 }
 
+/// Intrinsic dimensions retained independently from decoded pixel ownership.
+///
+/// A platform may evict CPU pixels or GPU textures while the editor still
+/// needs the image's aspect ratio to keep its HeightIndex stable. Keeping this
+/// small value separate from [`DecodedImage`] lets those resource policies
+/// remain bounded without making layout jump back to the placeholder size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageDimensions {
+    width: u32,
+    height: u32,
+}
+
+impl ImageDimensions {
+    #[must_use]
+    pub const fn new(width: u32, height: u32) -> Option<Self> {
+        if width == 0 || height == 0 {
+            None
+        } else {
+            Some(Self { width, height })
+        }
+    }
+
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+}
+
+impl DecodedImage {
+    #[must_use]
+    pub const fn dimensions(&self) -> ImageDimensions {
+        // DecodedImage validates dimensions during construction, so this is
+        // infallible and keeps the metadata handoff allocation-free.
+        ImageDimensions {
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
 impl DecodedImage {
     pub fn new(
         width: u32,
@@ -282,6 +327,45 @@ impl ImagePublication {
     pub const fn image(&self) -> &DecodedImage {
         &self.image
     }
+
+    #[must_use]
+    pub const fn dimensions(&self) -> ImageDimensions {
+        self.image.dimensions()
+    }
+
+    #[must_use]
+    pub fn intrinsic_publication(&self) -> ImageIntrinsicPublication {
+        ImageIntrinsicPublication {
+            revision: self.revision,
+            key: self.key.clone(),
+            dimensions: self.dimensions(),
+        }
+    }
+}
+
+/// A revision-bound intrinsic-size publication without decoded pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageIntrinsicPublication {
+    revision: Revision,
+    key: ImageKey,
+    dimensions: ImageDimensions,
+}
+
+impl ImageIntrinsicPublication {
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &ImageKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn dimensions(&self) -> ImageDimensions {
+        self.dimensions
+    }
 }
 
 /// Stable reason class recorded when a platform decoder cannot publish an
@@ -301,6 +385,7 @@ pub struct ImageFailure {
     key: ImageKey,
     kind: ImageFailureKind,
     attempts: u32,
+    next_retry_tick: u64,
 }
 
 impl ImageFailure {
@@ -322,6 +407,67 @@ impl ImageFailure {
     #[must_use]
     pub const fn attempts(&self) -> u32 {
         self.attempts
+    }
+
+    #[must_use]
+    pub const fn next_retry_tick(&self) -> u64 {
+        self.next_retry_tick
+    }
+
+    #[must_use]
+    pub const fn is_exhausted(&self, policy: ImageRetryPolicy) -> bool {
+        self.attempts >= policy.max_attempts()
+    }
+}
+
+/// Bounded retry policy for transient image decode failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageRetryPolicy {
+    max_attempts: u32,
+    base_delay_ticks: u64,
+    max_delay_ticks: u64,
+}
+
+impl ImageRetryPolicy {
+    #[must_use]
+    pub const fn new(max_attempts: u32, base_delay_ticks: u64, max_delay_ticks: u64) -> Self {
+        Self {
+            max_attempts: if max_attempts == 0 { 1 } else { max_attempts },
+            base_delay_ticks,
+            max_delay_ticks: if max_delay_ticks < base_delay_ticks {
+                base_delay_ticks
+            } else {
+                max_delay_ticks
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    #[must_use]
+    pub const fn base_delay_ticks(self) -> u64 {
+        self.base_delay_ticks
+    }
+
+    #[must_use]
+    pub const fn max_delay_ticks(self) -> u64 {
+        self.max_delay_ticks
+    }
+
+    fn delay_for_attempt(self, attempts: u32) -> u64 {
+        let shift = attempts.saturating_sub(1).min(63);
+        self.base_delay_ticks
+            .saturating_mul(1_u64 << shift)
+            .min(self.max_delay_ticks)
+    }
+}
+
+impl Default for ImageRetryPolicy {
+    fn default() -> Self {
+        Self::new(3, 2, 60)
     }
 }
 
@@ -383,6 +529,12 @@ struct CacheEntry {
     last_used: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MetadataEntry {
+    dimensions: ImageDimensions,
+    last_used: u64,
+}
+
 /// Revision-aware decoded image cache with a pollable asynchronous work queue.
 ///
 /// The cache never starts threads or touches a filesystem. A platform worker
@@ -393,6 +545,7 @@ struct CacheEntry {
 #[derive(Clone, Debug)]
 pub struct ImageCache {
     entries: HashMap<ImageKey, CacheEntry>,
+    metadata: HashMap<ImageKey, MetadataEntry>,
     failures: HashMap<ImageKey, ImageFailure>,
     pending: VecDeque<ImageRequest>,
     pending_keys: HashSet<ImageKey>,
@@ -400,6 +553,10 @@ pub struct ImageCache {
     next_access: u64,
     capacity: usize,
     evictions: u64,
+    metadata_capacity: usize,
+    metadata_evictions: u64,
+    retry_policy: ImageRetryPolicy,
+    retry_tick: u64,
 }
 
 impl Default for ImageCache {
@@ -410,6 +567,7 @@ impl Default for ImageCache {
 
 impl ImageCache {
     pub const DEFAULT_CAPACITY: usize = 64;
+    pub const DEFAULT_METADATA_CAPACITY: usize = 256;
 
     #[must_use]
     pub fn new() -> Self {
@@ -420,6 +578,7 @@ impl ImageCache {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            metadata: HashMap::new(),
             failures: HashMap::new(),
             pending: VecDeque::new(),
             pending_keys: HashSet::new(),
@@ -427,6 +586,10 @@ impl ImageCache {
             next_access: 0,
             capacity: capacity.max(1),
             evictions: 0,
+            metadata_capacity: capacity.max(Self::DEFAULT_METADATA_CAPACITY),
+            metadata_evictions: 0,
+            retry_policy: ImageRetryPolicy::default(),
+            retry_tick: 0,
         }
     }
 
@@ -445,12 +608,52 @@ impl ImageCache {
         Ok(self.trim_to_capacity())
     }
 
+    #[must_use]
+    pub fn metadata_capacity(&self) -> usize {
+        self.metadata_capacity
+    }
+
+    /// Changes the bounded intrinsic metadata capacity independently of the
+    /// decoded-pixel capacity.
+    pub fn set_metadata_capacity(&mut self, capacity: usize) -> Result<usize, ImageCacheError> {
+        if capacity == 0 {
+            return Err(ImageCacheError::InvalidCapacity);
+        }
+        self.metadata_capacity = capacity;
+        Ok(self.trim_metadata_to_capacity())
+    }
+
+    #[must_use]
+    pub const fn retry_policy(&self) -> ImageRetryPolicy {
+        self.retry_policy
+    }
+
+    pub fn set_retry_policy(&mut self, policy: ImageRetryPolicy) {
+        self.retry_policy = policy;
+    }
+
+    /// Advances the logical frame clock used by the retry backoff policy.
+    /// Hosts call this once before scheduling a new viewport batch.
+    pub fn advance_retry_clock(&mut self) {
+        self.retry_tick = self.retry_tick.saturating_add(1);
+    }
+
+    #[must_use]
+    pub const fn retry_tick(&self) -> u64 {
+        self.retry_tick
+    }
+
     pub fn request(&mut self, request: ImageRequest) -> ImageRequestResult {
         if let Some(failure) = self.failures.get(request.key()) {
-            if failure.revision == request.revision {
+            if failure.revision == request.revision
+                && (failure.is_exhausted(self.retry_policy)
+                    || self.retry_tick < failure.next_retry_tick)
+            {
                 return ImageRequestResult::Failed(failure.clone());
             }
-            self.failures.remove(request.key());
+            if failure.revision != request.revision {
+                self.failures.remove(request.key());
+            }
         }
         let access_tick = self.next_access_tick();
         if let Some(entry) = self.entries.get_mut(request.key()) {
@@ -501,6 +704,14 @@ impl ImageCache {
             .ok_or(ImageCacheError::GenerationOverflow)?;
         let generation = self.next_generation;
         let access_tick = self.next_access_tick();
+        self.metadata.insert(
+            request.key.clone(),
+            MetadataEntry {
+                dimensions: image.dimensions(),
+                last_used: access_tick,
+            },
+        );
+        self.trim_metadata_to_capacity();
         self.failures.remove(&request.key);
         self.entries.insert(
             request.key.clone(),
@@ -523,6 +734,32 @@ impl ImageCache {
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[must_use]
+    pub fn metadata_len(&self) -> usize {
+        self.metadata.len()
+    }
+
+    #[must_use]
+    pub fn metadata_eviction_count(&self) -> u64 {
+        self.metadata_evictions
+    }
+
+    /// Returns known intrinsic dimensions even if decoded pixels were evicted.
+    /// The returned publication is rebound to the request's current Revision.
+    pub fn intrinsic_publication(
+        &mut self,
+        request: &ImageRequest,
+    ) -> Option<ImageIntrinsicPublication> {
+        let access_tick = self.next_access_tick();
+        let metadata = self.metadata.get_mut(request.key())?;
+        metadata.last_used = access_tick;
+        Some(ImageIntrinsicPublication {
+            revision: request.revision,
+            key: request.key.clone(),
+            dimensions: metadata.dimensions,
+        })
     }
 
     #[must_use]
@@ -561,11 +798,15 @@ impl ImageCache {
             .get(&request.key)
             .filter(|failure| failure.revision == current_revision)
             .map_or(1, |failure| failure.attempts.saturating_add(1));
+        let next_retry_tick = self
+            .retry_tick
+            .saturating_add(self.retry_policy.delay_for_attempt(attempts));
         let failure = ImageFailure {
             revision: current_revision,
             key: request.key.clone(),
             kind,
             attempts,
+            next_retry_tick,
         };
         self.failures.insert(request.key, failure.clone());
         Ok(failure)
@@ -578,6 +819,7 @@ impl ImageCache {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.metadata.clear();
         self.failures.clear();
         self.pending.clear();
         self.pending_keys.clear();
@@ -602,6 +844,24 @@ impl ImageCache {
             self.entries.remove(&key);
             evicted += 1;
             self.evictions = self.evictions.saturating_add(1);
+        }
+        evicted
+    }
+
+    fn trim_metadata_to_capacity(&mut self) -> usize {
+        let mut evicted = 0;
+        while self.metadata.len() > self.metadata_capacity {
+            let Some(key) = self
+                .metadata
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.metadata.remove(&key);
+            evicted += 1;
+            self.metadata_evictions = self.metadata_evictions.saturating_add(1);
         }
         evicted
     }
@@ -751,6 +1011,82 @@ mod tests {
             cache.request(request(0, source, "first.png")),
             ImageRequestResult::Pending
         ));
+    }
+
+    #[test]
+    fn intrinsic_metadata_survives_pixel_eviction() {
+        let source =
+            TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(4)).expect("range");
+        let mut cache = ImageCache::with_capacity(1);
+        cache
+            .publish_decoded(
+                request(0, source, "first.png"),
+                Revision::INITIAL,
+                DecodedImage::new(320, 180, vec![1; 320 * 180 * 4]).expect("first image"),
+            )
+            .expect("first publication");
+        cache
+            .publish_decoded(
+                request(0, source, "second.png"),
+                Revision::INITIAL,
+                DecodedImage::new(64, 32, vec![2; 64 * 32 * 4]).expect("second image"),
+            )
+            .expect("second publication");
+
+        let first = request(4, source, "first.png");
+        assert!(matches!(
+            cache.request(first.clone()),
+            ImageRequestResult::Pending
+        ));
+        let intrinsic = cache
+            .intrinsic_publication(&first)
+            .expect("metadata remains after pixel eviction");
+        assert_eq!(intrinsic.revision(), Revision::new(4));
+        assert_eq!(
+            intrinsic.dimensions(),
+            ImageDimensions::new(320, 180).expect("positive dimensions")
+        );
+        assert_eq!(cache.metadata_len(), 2);
+    }
+
+    #[test]
+    fn failed_requests_retry_with_bounded_backoff() {
+        let source =
+            TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(4)).expect("range");
+        let mut cache = ImageCache::new();
+        cache.set_retry_policy(ImageRetryPolicy::new(2, 1, 1));
+        let image_request = request(0, source, "transient.png");
+        let first = cache
+            .record_failure(
+                image_request.clone(),
+                Revision::INITIAL,
+                ImageFailureKind::Io,
+            )
+            .expect("first failure");
+        assert_eq!(first.attempts(), 1);
+        assert_eq!(first.next_retry_tick(), 1);
+        assert!(matches!(
+            cache.request(image_request.clone()),
+            ImageRequestResult::Failed(_)
+        ));
+
+        cache.advance_retry_clock();
+        assert!(matches!(
+            cache.request(image_request.clone()),
+            ImageRequestResult::Pending
+        ));
+        let retry_request = cache.pending().expect("due retry");
+        let second = cache
+            .record_failure(retry_request, Revision::INITIAL, ImageFailureKind::Io)
+            .expect("second failure");
+        assert_eq!(second.attempts(), 2);
+        assert!(second.is_exhausted(cache.retry_policy()));
+
+        cache.advance_retry_clock();
+        let ImageRequestResult::Failed(exhausted) = cache.request(image_request) else {
+            panic!("exhausted retries must remain failed");
+        };
+        assert_eq!(exhausted.attempts(), 2);
     }
 
     #[test]

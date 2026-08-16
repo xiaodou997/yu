@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use yu_assets::{ImageKey, ImagePublication};
+use yu_assets::{ImageIntrinsicPublication, ImageKey, ImagePublication};
 use yu_core::Revision;
 use yu_editor::{
     BlockKind, EditorDocument, EditorDocumentError, ImageSource, ShapingProvider, ViewportRect,
@@ -502,10 +502,34 @@ impl ViewportFramePublisher {
         render_plans: &mut RenderPlanBuilder,
         image_publications: &[ImagePublication],
     ) -> Result<ViewportFramePublication, ViewportPublishError> {
+        self.publish_with_images_and_intrinsics(
+            document,
+            config,
+            shaper,
+            atlas,
+            render_plans,
+            image_publications,
+            &[],
+        )
+    }
+
+    /// Publishes the viewport while applying ready pixels and/or intrinsic
+    /// dimensions retained after those pixels were evicted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_with_images_and_intrinsics<S: ShapingProvider>(
+        &mut self,
+        document: &mut EditorDocument,
+        config: ViewportRenderConfig,
+        shaper: &S,
+        atlas: &GlyphAtlas,
+        render_plans: &mut RenderPlanBuilder,
+        image_publications: &[ImagePublication],
+        image_intrinsics: &[ImageIntrinsicPublication],
+    ) -> Result<ViewportFramePublication, ViewportPublishError> {
         // RenderPlanBuilder carries page-fingerprint state across frames. Build against a
         // staged copy so a later publication failure cannot advance caller-owned state.
         let mut staged_render_plans = render_plans.clone();
-        let frame = assemble_viewport_render_frame_with_images(
+        let frame = assemble_viewport_render_frame_with_images_and_intrinsics(
             document,
             config.viewport(),
             config,
@@ -513,6 +537,7 @@ impl ViewportFramePublisher {
             atlas,
             &mut staged_render_plans,
             image_publications,
+            image_intrinsics,
         )?;
         let revision = document.revision();
         if frame.revision() != revision {
@@ -582,6 +607,34 @@ pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
     color: Rgba8,
     image_publications: &[ImagePublication],
 ) -> Result<ViewportSceneFrame, ViewportSceneError> {
+    assemble_viewport_scene_with_images_and_intrinsics(
+        document,
+        viewport,
+        shaper,
+        font_size,
+        scene_viewport,
+        atlas,
+        color,
+        image_publications,
+        &[],
+    )
+}
+
+/// Builds a viewport scene with ready pixels and/or retained intrinsic image
+/// dimensions. Intrinsic publications are deliberately separate from decoded
+/// pixels so CPU/GPU cache eviction cannot make document geometry jump.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
+    document: &mut EditorDocument,
+    viewport: ViewportRect,
+    shaper: &S,
+    font_size: f32,
+    scene_viewport: Rect,
+    atlas: &GlyphAtlas,
+    color: Rgba8,
+    image_publications: &[ImagePublication],
+    image_intrinsics: &[ImageIntrinsicPublication],
+) -> Result<ViewportSceneFrame, ViewportSceneError> {
     let source = document.snapshot();
     let definitions = document.markdown().reference_definitions().clone();
     let document_revision = document.revision();
@@ -599,11 +652,22 @@ pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
     };
     let intrinsic_size = |image: ImageSource| {
         let key = image_key(image)?;
-        let publication = image_publications.iter().find(|publication| {
+        if let Some(publication) = image_publications.iter().find(|publication| {
             publication.revision() == document_revision
                 && publication.key().fingerprint() == key.fingerprint()
+        }) {
+            return ImageIntrinsicSize::new(
+                publication.image().width(),
+                publication.image().height(),
+            )
+            .ok();
+        }
+        let intrinsic = image_intrinsics.iter().find(|intrinsic| {
+            intrinsic.revision() == document_revision
+                && intrinsic.key().fingerprint() == key.fingerprint()
         })?;
-        ImageIntrinsicSize::new(publication.image().width(), publication.image().height()).ok()
+        let dimensions = intrinsic.dimensions();
+        ImageIntrinsicSize::new(dimensions.width(), dimensions.height()).ok()
     };
     let viewport_snapshot = if document.composition().is_some() {
         document.visible_blocks_with_composition_and_shaper_and_image_resolver(
@@ -753,7 +817,32 @@ pub fn assemble_viewport_render_frame_with_images<S: ShapingProvider>(
     render_plans: &mut RenderPlanBuilder,
     image_publications: &[ImagePublication],
 ) -> Result<ViewportRenderFrame, ViewportSceneError> {
-    let scene = assemble_viewport_scene_with_images(
+    assemble_viewport_render_frame_with_images_and_intrinsics(
+        document,
+        viewport,
+        config,
+        shaper,
+        atlas,
+        render_plans,
+        image_publications,
+        &[],
+    )
+}
+
+/// Builds a render frame while applying ready image pixels and retained
+/// intrinsic dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvider>(
+    document: &mut EditorDocument,
+    viewport: ViewportRect,
+    config: ViewportRenderConfig,
+    shaper: &S,
+    atlas: &GlyphAtlas,
+    render_plans: &mut RenderPlanBuilder,
+    image_publications: &[ImagePublication],
+    image_intrinsics: &[ImageIntrinsicPublication],
+) -> Result<ViewportRenderFrame, ViewportSceneError> {
+    let scene = assemble_viewport_scene_with_images_and_intrinsics(
         document,
         viewport,
         shaper,
@@ -762,6 +851,7 @@ pub fn assemble_viewport_render_frame_with_images<S: ShapingProvider>(
         atlas,
         config.color(),
         image_publications,
+        image_intrinsics,
     )?;
     if scene.revision() != document.revision() {
         return Err(ViewportFrameError::Stale {
@@ -908,6 +998,7 @@ mod tests {
                     .expect("decoded image"),
             )
             .expect("image publication");
+        let intrinsic = publication.intrinsic_publication();
         let frame = assemble_viewport_scene_with_images(
             &mut document,
             viewport,
@@ -931,6 +1022,31 @@ mod tests {
         assert_eq!(image.bounds().width(), 200.0);
         assert_eq!(image.bounds().height(), 100.0);
         assert!(frame.input().content_height() >= 100.0);
+
+        let metadata_only = assemble_viewport_scene_with_images_and_intrinsics(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+            &[],
+            &[intrinsic],
+        )
+        .expect("metadata-only scene frame");
+        let metadata_image = metadata_only
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Image(image) => Some(*image),
+                Primitive::FillRect { .. } | Primitive::Glyph(_) => None,
+            })
+            .expect("metadata-only image primitive");
+        assert_eq!(metadata_image.bounds().width(), 200.0);
+        assert_eq!(metadata_image.bounds().height(), 100.0);
+        assert!(metadata_only.input().content_height() >= 100.0);
     }
 
     #[test]

@@ -569,16 +569,19 @@
 15. macOS 持久 surface 的 image request 只能来自当前 CoreText viewport 加 overscan 命中的 block；
     viewport 外的 image 不得因为整篇文档扫描而排入 worker。`image_request_count` 统计本帧实际
     生成的可见请求，不能把 cache 中的历史 publication 当作新请求。
-16. `ImageCache` 的 capacity 必须是显式正数；超过容量时只能淘汰最久未使用的 publication，且
-    eviction 不得改变 canonical source、Projection ranges 或已提交的旧 Revision。解码失败必须
-    记录 `Revision + ImageKey + failure kind + attempts`，同一 Revision 在失败记录存在时不得重复
-    排队；进入新 Revision 后才允许重新尝试。
-17. ready publication 的 intrinsic width/height 只能更新同一 Revision 可见 placement 的
+16. `ImageCache` 的 capacity 必须是显式正数；超过容量时只能淘汰最久未使用的 decoded
+    publication，且 eviction 不得改变 canonical source、Projection ranges 或已提交的旧 Revision。
+    intrinsic `ImageDimensions` metadata 使用独立的有界 LRU，淘汰 decoded pixels 不得让已知尺寸
+    退回 placeholder；metadata eviction 也不能写入 source 或 GPU 状态。
+17. 解码失败必须记录 `Revision + ImageKey + failure kind + attempts + next_retry_tick`。同一
+    Revision 在退避窗口内不得重复排队；到达 retry tick 后最多按 `ImageRetryPolicy` 重新排队，达到
+    `max_attempts` 后保持 fallback。进入新 Revision 会清除旧失败并允许重新尝试。
+18. ready publication 的 intrinsic width/height 只能更新同一 Revision 可见 placement 的
     document-space bounds，并保持 source/visual mapping 与 image hit-test range 不变；宽度受当前
     layout content width 限制时必须保持宽高比；placement 的底部必须参与对应 block 的 HeightIndex，
     content height 与 max scroll 必须随同一 Revision 的可见测量更新。该更新不能修改 canonical
     source、projection ranges、selection 或 image hit-test 映射。
-18. `MetalImageAtlas` 在每次持久 surface submit 前必须只保留当前 Revision publication 集合中的
+19. `MetalImageAtlas` 在每次持久 surface submit 前必须只保留当前 Revision publication 集合中的
     resource fingerprint；离开集合的 GPU texture 与 identity 必须一起淘汰，`image_resource_count`
     不得继续统计离屏资源。atlas eviction 只能发生在 native command conversion 之前，不能让当前
     RenderPlan 引用已淘汰 texture；`image_atlas_eviction_count` 只记录成功提交边界前的累计淘汰次数。

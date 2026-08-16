@@ -57,6 +57,7 @@ version = "0.1.0"
 dependencies = [
  "yu-core",
  "yu-editor",
+ "yu-layout",
  "yu-markdown",
  "yu-storage",
  "yu-text",

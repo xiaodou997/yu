@@ -31,7 +31,8 @@ Accepted（Phase 3 Track C）
 - ready 图片变高会推动后续 block 的 document-space y，并同步更新 content height/max scroll。
 - 滚动离开图片后，GPU atlas 不再无限保留历史 texture；回到图片时可从 CPU cache 重新 publication
   并上传，source-backed image command 不变。
-- 未 ready 或解码失败仍使用 placeholder/fallback；尺寸 metadata 持久化、预取和重试策略留待后续。
+- 未 ready 或解码失败仍使用 placeholder/fallback；尺寸 metadata 持久化、退避重试和窗口调度
+  由 ADR 0147 继续定义。
 
 ## 验证
 

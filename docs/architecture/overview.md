@@ -677,5 +677,9 @@ worker/`MetalImageAtlas` publication wiring 现在由 macOS 持久 surface host 
 layout 中按解码得到的 intrinsic 宽高比更新可见 placement bounds，并把图片底部纳入对应 block 的
 HeightIndex，进而更新 document content height 和 max scroll。Metal image atlas 在每次提交前只
 保留当前 publication 集合，离开可见集合的 GPU texture 会被淘汰；surface snapshot 另报告 atlas
-eviction 累计值。资源未 ready 时仍使用 placeholder，完整图片资源重试/预取策略留在后续阶段。
-见 ADR 0141、0142、0143、0144、0145、0146。
+eviction 累计值。`ImageCache` 另外保留有界的 `ImageDimensions` metadata，即使 decoded CPU
+pixels 被 LRU 淘汰，下一帧仍可用 metadata 重建 intrinsic placement 与 HeightIndex；metadata 不携带
+source 或 GPU 对象。失败请求使用显式的逻辑 frame clock 与有界指数退避，达到最大尝试次数后在
+当前 Revision 保持 fallback，进入新 Revision 才会重新允许排队。当前调度仍只收集 viewport/overscan
+block；`yu-image-scheduling-bench` 对 2,000/100,000 级图片集合比较 overscan 0/160/640px 的
+候选请求量，避免把完整文档扫描误当作预取。见 ADR 0141、0142、0143、0144、0145、0146、0147。

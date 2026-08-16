@@ -70,7 +70,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 将 `ImagePublication`/`MetalImageAtlas` 接入 macOS 持久 surface host；snapshot 暴露 image upload/resource 计数，surface self-check 覆盖 ImageIO→Metal ready texture
 - [x] image 请求收敛到 CoreText 当前 viewport/overscan block；`ImageCache` 增加有上限的 LRU、Revision-bound 失败诊断，ready publication 在下一帧按真实 intrinsic 宽高比更新 placement bounds
 - [x] intrinsic image 高度进入对应 block 的 HeightIndex、content height 与 max scroll；Metal image atlas 在 publication 集合变化时淘汰离屏 texture，snapshot 暴露 atlas eviction 计数
-- [ ] 图片尺寸 metadata 的跨帧持久化、预取/重试策略与大规模图片集合的调度压测；未 ready/失败仍保留 fallback
+- [x] 图片 intrinsic metadata 与 decoded pixels 分离并跨帧保留；同一 Revision 的失败按有界指数退避重试，仍保留 fallback
+- [x] `yu-image-scheduling-bench` 覆盖 2,000/100,000 级图片 block 的 viewport/overscan 请求量与耗时
 
 ## 约束
 

@@ -8,7 +8,7 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_assets::ImagePublication;
+use yu_assets::{ImageIntrinsicPublication, ImagePublication};
 use yu_editor::{EditorDocument, EditorDocumentError};
 use yu_font::{
     AtlasError, FontRequest, GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer,
@@ -180,15 +180,27 @@ impl CoreTextViewportFrameBuilder {
         document: &mut EditorDocument,
         image_publications: &[ImagePublication],
     ) -> Result<ViewportFramePublication, CoreTextViewportFrameError> {
+        self.publish_with_images_and_intrinsics(document, image_publications, &[])
+    }
+
+    /// Prepares a viewport using ready pixels and/or intrinsic dimensions
+    /// retained after those pixels were evicted.
+    pub fn publish_with_images_and_intrinsics(
+        &mut self,
+        document: &mut EditorDocument,
+        image_publications: &[ImagePublication],
+        image_intrinsics: &[ImageIntrinsicPublication],
+    ) -> Result<ViewportFramePublication, CoreTextViewportFrameError> {
         self.rasterize_visible_glyphs(document)?;
         self.publisher
-            .publish_with_images(
+            .publish_with_images_and_intrinsics(
                 document,
                 self.config,
                 &self.shaper,
                 &self.atlas,
                 &mut self.render_plans,
                 image_publications,
+                image_intrinsics,
             )
             .map_err(CoreTextViewportFrameError::Publish)
     }
