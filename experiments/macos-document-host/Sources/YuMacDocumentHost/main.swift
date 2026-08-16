@@ -306,6 +306,74 @@ private struct NativeShapedViewportSnapshot {
     }
 }
 
+private struct NativeVisualDecorationSnapshot {
+    let revision: UInt64
+    let compositionGeneration: UInt64
+    let selectionCount: Int
+    let caretPresent: Bool
+    let contentHeight: CGFloat
+    let scrollY: CGFloat
+    let viewportHeight: CGFloat
+    let maxScrollY: CGFloat
+    let viewportWidth: CGFloat
+
+    init(_ value: YuStorageMacosVisualDecorationSnapshot) {
+        revision = value.revision
+        compositionGeneration = value.composition_generation
+        selectionCount = Int(value.selection_count)
+        caretPresent = value.caret_present != 0
+        contentHeight = CGFloat(value.content_height)
+        scrollY = CGFloat(value.scroll_y)
+        viewportHeight = CGFloat(value.viewport_height)
+        maxScrollY = CGFloat(value.max_scroll_y)
+        viewportWidth = CGFloat(value.viewport_width)
+    }
+}
+
+private struct NativeVisualDecorationRect {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let lineIndex: UInt64
+    let rect: CGRect
+    let kind: UInt8
+
+    init(_ value: YuStorageMacosVisualDecorationRect) {
+        revision = value.revision
+        blockIndex = value.block_index
+        lineIndex = value.line_index
+        rect = CGRect(
+            x: CGFloat(value.x),
+            y: CGFloat(value.y),
+            width: CGFloat(value.width),
+            height: CGFloat(value.height)
+        )
+        kind = value.kind
+    }
+}
+
+private struct NativeVisualDecorationCaret {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let lineIndex: UInt64
+    let rect: CGRect
+    let affinity: UInt8
+    let present: Bool
+
+    init(_ value: YuStorageMacosVisualDecorationCaret) {
+        revision = value.revision
+        blockIndex = value.block_index
+        lineIndex = value.line_index
+        rect = CGRect(
+            x: CGFloat(value.x),
+            y: CGFloat(value.y),
+            width: CGFloat(value.width),
+            height: CGFloat(value.height)
+        )
+        affinity = value.affinity
+        present = value.present != 0
+    }
+}
+
 private struct NativeVisualSceneSnapshot {
     let revision: UInt64
     let blockRange: Range<UInt64>
@@ -1499,6 +1567,85 @@ private final class StorageBridge {
         return (
             NativeShapedViewportSnapshot(snapshot),
             values.map(NativeShapedViewportBlock.init)
+        )
+    }
+
+    func macosVisualDecorations(
+        revision: UInt64,
+        compositionGeneration: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float
+    ) throws -> (
+        NativeVisualDecorationSnapshot,
+        NativeVisualDecorationCaret,
+        [NativeVisualDecorationRect]
+    ) {
+        var snapshot = YuStorageMacosVisualDecorationSnapshot()
+        var caret = YuStorageMacosVisualDecorationCaret()
+        var required = 0
+        let sizeStatus = yu_storage_session_macos_visual_decorations(
+            handle,
+            revision,
+            compositionGeneration,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            &snapshot,
+            &caret,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        guard snapshot.revision == revision,
+              snapshot.composition_generation == compositionGeneration,
+              snapshot.selection_count == UInt64(required),
+              required >= 0 else {
+            throw BridgeError.operation(StorageStatus.invalidViewport)
+        }
+        var values = Array(
+            repeating: YuStorageMacosVisualDecorationRect(),
+            count: required
+        )
+        var written = required
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_macos_visual_decorations(
+                handle,
+                revision,
+                compositionGeneration,
+                size,
+                maxWidth,
+                scrollY,
+                viewportHeight,
+                &snapshot,
+                &caret,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard fillStatus == StorageStatus.ok else {
+            throw BridgeError.operation(fillStatus)
+        }
+        guard written == required,
+              caret.revision == revision || caret.present == 0,
+              values.allSatisfy({
+                  $0.revision == revision
+                      && $0.width.isFinite && $0.width > 0.0
+                      && $0.height.isFinite && $0.height > 0.0
+                      && $0.x.isFinite && $0.y.isFinite
+              }) else {
+            throw BridgeError.operation(StorageStatus.invalidViewport)
+        }
+        return (
+            NativeVisualDecorationSnapshot(snapshot),
+            NativeVisualDecorationCaret(caret),
+            values.map(NativeVisualDecorationRect.init)
         )
     }
 
@@ -4015,6 +4162,47 @@ private final class MacosSurfaceHostCoordinator {
         }
     }
 
+    /// Returns the same revision-bound CoreText metrics and viewport inputs
+    /// used by the Rust render host. Visual decorations use this accessor so
+    /// their geometry query cannot silently drift to TextKit's independent
+    /// wrapping width or line height.
+    func visualDecorationGeometry() -> (
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float,
+        lineHeight: Float
+    )? {
+        guard let surfaceView,
+              let scrollView,
+              surfaceView.bounds.width > 0.0,
+              surfaceView.bounds.height > 0.0 else {
+            return nil
+        }
+        let revision = bridge.state.revision
+        let size = max(fontSize, 1.0)
+        let maxWidth = layoutWidth(for: surfaceView)
+        let viewportBounds = scrollView.contentView.bounds
+        let viewportHeight = max(viewportBounds.height, 1.0)
+        let scrollY = max(viewportBounds.origin.y, 0.0)
+        do {
+            let metrics = try ensureMetrics(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth
+            )
+            return (
+                Float(size),
+                Float(maxWidth),
+                Float(scrollY),
+                Float(viewportHeight),
+                metrics.lineHeight
+            )
+        } catch {
+            return nil
+        }
+    }
+
     /// Reveals the current Rust-owned caret using the same Revision-bound
     /// CoreText/shaped viewport contract as surface submission. This is a
     /// scroll-only adapter: it never asks TextKit for a caret and never lets
@@ -4442,11 +4630,69 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         textView.setExternalVisualDecorationsEnabled(false)
     }
 
-    /// Converts the revision-bound visual mirror geometry into the sibling
-    /// decoration view's local coordinates. The conversion goes through
-    /// AppKit's view tree so scroll origin, text-container inset and window
-    /// layout are applied exactly once.
+    /// Publishes Rust/CoreText-shaped decoration geometry into the sibling
+    /// overlay. The Rust coordinates are document-space and the only native
+    /// transform here is the current scroll offset into the surface sibling's
+    /// viewport-local coordinate system. TextKit remains a fallback for active
+    /// composition, stale geometry, or a not-yet-laid-out surface.
     private func updateVisualDecorations() {
+        guard decorationHostView.superview != nil else {
+            clearVisualDecorations()
+            return
+        }
+        if let geometry = surfaceCoordinator.visualDecorationGeometry() {
+            do {
+                let (snapshot, caret, selection) = try bridge.macosVisualDecorations(
+                    revision: bridge.state.revision,
+                    compositionGeneration: bridge.composition.generation,
+                    size: geometry.size,
+                    maxWidth: geometry.maxWidth,
+                    scrollY: geometry.scrollY,
+                    viewportHeight: geometry.viewportHeight
+                )
+                guard snapshot.revision == bridge.state.revision,
+                      snapshot.caretPresent,
+                      caret.present,
+                      caret.revision == snapshot.revision else {
+                    updateVisualDecorationsFromTextKit()
+                    return
+                }
+                let scrollY = geometry.scrollY
+                let localSelection = selection.map {
+                    NSRect(
+                        x: $0.rect.origin.x,
+                        y: $0.rect.origin.y - CGFloat(scrollY),
+                        width: $0.rect.width,
+                        height: $0.rect.height
+                    )
+                }
+                let localCaret = NSRect(
+                    x: caret.rect.origin.x,
+                    y: caret.rect.origin.y - CGFloat(scrollY),
+                    width: caret.rect.width,
+                    height: caret.rect.height
+                )
+                decorationHostView.update(
+                    revision: snapshot.revision,
+                    selectionRects: localSelection,
+                    caretRect: localCaret,
+                    compositionActive: false
+                )
+                textView.setExternalVisualDecorationsEnabled(true)
+                return
+            } catch {
+                // Active marked text intentionally returns NO_OVERLAY; stale
+                // revisions and unavailable CoreText metrics use the same
+                // disposable TextKit path below.
+            }
+        }
+        updateVisualDecorationsFromTextKit()
+    }
+
+    /// Converts the disposable visual mirror geometry into the sibling
+    /// decoration view's local coordinates. This remains the source/IME
+    /// fallback while the Rust-shaped provider is unavailable or transient.
+    private func updateVisualDecorationsFromTextKit() {
         guard visualPointerAdapterEnabled,
               decorationHostView.superview != nil,
               let caret = textView.visualCaretRectForDisplay() else {
@@ -5219,37 +5465,73 @@ private func runVisualDecorationSelfCheck(path: String) -> Never {
 
         try textView.setVisualMirrorEnabledForSelfCheck(true)
         let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let metrics = try bridge.macosFontMetrics(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(metrics.lineHeight),
+            defaultAdvance: Float(metrics.defaultAdvance),
+            estimatedBlockHeight: Float(metrics.lineHeight),
+            overscan: 0.0
+        )
         let sourceStrong = (bridge.source as NSString).range(of: "**粗体**")
         precondition(sourceStrong.location != NSNotFound)
         precondition(textView.applyVisualSelectionForSelfCheck(
             NSRange(location: sourceStrong.location + 2, length: 2)
         ))
-        guard let caret = textView.visualCaretRectForDisplay() else {
-            preconditionFailure("visual caret geometry is unavailable")
-        }
-        let selection = textView.visualSelectionRectsForDisplay()
-        precondition(!selection.isEmpty)
+        let (rustSnapshot, rustCaret, rustSelection) = try bridge.macosVisualDecorations(
+            revision: revision,
+            compositionGeneration: bridge.composition.generation,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 480.0
+        )
+        precondition(rustSnapshot.revision == revision)
+        precondition(rustSnapshot.caretPresent)
+        precondition(rustCaret.present)
+        precondition(!rustSelection.isEmpty)
+        precondition(rustSnapshot.selectionCount == rustSelection.count)
 
         decoration.update(
             revision: revision,
-            selectionRects: selection.map { textView.convert($0, to: decoration) },
-            caretRect: textView.convert(caret, to: decoration),
+            selectionRects: rustSelection.map(\.rect),
+            caretRect: rustCaret.rect,
             compositionActive: false
         )
         precondition(decoration.hasValidFrame)
         precondition(decoration.revision == revision)
-        precondition(decoration.selectionRects.count == selection.count)
+        precondition(decoration.selectionRects.count == rustSelection.count)
         precondition(decoration.caretRect != nil)
         precondition(decoration.hitTest(NSPoint(x: 1.0, y: 1.0)) == nil)
 
         _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.macosVisualDecorations(
+                revision: revision,
+                compositionGeneration: bridge.composition.generation,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 480.0
+            )
+            preconditionFailure("stale Rust decoration geometry unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 13)
+        }
         precondition(textView.visualCaretRectForDisplay() == nil)
         decoration.clear()
         precondition(!decoration.hasValidFrame)
         precondition(decoration.revision == nil)
         print(
-            "Yu Visual Decoration self-check: revision-bound selection/caret "
-                + "overlay owns \(selection.count) selection rects and falls back on stale geometry"
+            "Yu Visual Decoration self-check: Rust/CoreText-shaped revision-bound "
+                + "overlay owns \(rustSelection.count) selection rects and falls back on stale geometry"
         )
         exit(EXIT_SUCCESS)
     } catch {

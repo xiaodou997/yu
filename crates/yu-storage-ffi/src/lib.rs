@@ -454,6 +454,56 @@ pub struct YuStorageShapedViewportSnapshot {
     pub max_scroll_y: f32,
 }
 
+/// Owned, revision- and composition-generation-bound visual decoration
+/// snapshot. Selection rectangles are returned by the companion count/fill
+/// query; their coordinates are document-space and therefore must be offset
+/// by the native scroll position before painting in a viewport sibling.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageMacosVisualDecorationSnapshot {
+    pub revision: u64,
+    pub composition_generation: u64,
+    pub selection_count: u64,
+    pub caret_present: u8,
+    pub content_height: f32,
+    pub scroll_y: f32,
+    pub viewport_height: f32,
+    pub max_scroll_y: f32,
+    pub viewport_width: f32,
+}
+
+/// One Rust-shaped selection rectangle. Coordinates are in the document
+/// layout space of the requested viewport; no AppKit/TextKit object crosses
+/// the C ABI.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageMacosVisualDecorationRect {
+    pub revision: u64,
+    pub block_index: u64,
+    pub line_index: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub kind: u8,
+}
+
+/// One Rust-shaped caret geometry record. The caret is document-space and is
+/// present only when its block is part of the requested visible window.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageMacosVisualDecorationCaret {
+    pub revision: u64,
+    pub block_index: u64,
+    pub line_index: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub affinity: u8,
+    pub present: u8,
+}
+
 /// Revision-bound shaped caret geometry and the absolute document scroll
 /// target required to reveal it in a native visual viewport.
 #[repr(C)]
@@ -4155,6 +4205,297 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_viewport_blocks(
 }
 
 #[cfg(target_os = "macos")]
+type MacosVisualDecorations = (
+    YuStorageMacosVisualDecorationSnapshot,
+    YuStorageMacosVisualDecorationCaret,
+    Vec<YuStorageMacosVisualDecorationRect>,
+);
+
+/// Builds the Rust/CoreText-shaped selection and caret geometry used by the
+/// native decoration sibling. The returned rectangles are document-space;
+/// the caller owns the final scroll-to-viewport transform. Active marked text
+/// deliberately returns `NO_OVERLAY`: composition geometry remains on the
+/// transient TextKit fallback until a composition-aware decoration protocol
+/// is introduced.
+#[cfg(target_os = "macos")]
+fn macos_visual_decorations(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+) -> Result<MacosVisualDecorations, i32> {
+    validate_revision(&session.session, expected_revision)?;
+    if session.session.composition_generation() != expected_generation {
+        return Err(YU_STORAGE_STALE_COMPOSITION);
+    }
+    if session.session.composition().is_some() {
+        return Err(YU_STORAGE_NO_OVERLAY);
+    }
+    if !size.is_finite()
+        || size <= 0.0
+        || !max_width.is_finite()
+        || max_width <= 0.0
+        || !scroll_y.is_finite()
+        || scroll_y < 0.0
+        || !viewport_height.is_finite()
+        || viewport_height <= 0.0
+    {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let (shaper, metrics, _layout_config) = core_text_system_ui_layout(size, max_width)?;
+    let viewport_config = session.session.viewport_config();
+    let configured = viewport_config.layout();
+    if (configured.max_width() - max_width).abs() > 0.05
+        || (configured.line_height() - metrics.line_height()).abs() > 0.05
+        || (configured.default_advance() - metrics.default_advance()).abs() > 0.05
+    {
+        return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
+    }
+
+    let viewport = ViewportRect::new(scroll_y, viewport_height);
+    let (selection, viewport_snapshot) = {
+        let document = session.session.document_mut().editor_mut();
+        let selection = document.selection();
+        let viewport_snapshot = document
+            .visible_blocks_with_shaper(viewport, &shaper)
+            .map_err(status_from_editor_error)?;
+        (selection, viewport_snapshot)
+    };
+    if viewport_snapshot.revision().get() != expected_revision {
+        return Err(YU_STORAGE_STALE_REVISION);
+    }
+
+    let mut caret = YuStorageMacosVisualDecorationCaret {
+        revision: expected_revision,
+        ..YuStorageMacosVisualDecorationCaret::default()
+    };
+    let focus_block = session
+        .session
+        .document_mut()
+        .editor()
+        .block_index_for_source(selection.focus());
+    let mut rectangles = Vec::new();
+    let selection_range = selection.ordered_range();
+    let document = session.session.document_mut().editor_mut();
+
+    for block in viewport_snapshot.blocks().iter().copied() {
+        let block_index = block.index();
+        let block_index_u64 =
+            u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+        let layout = document
+            .block_layout_with_shaper(block_index, configured, &shaper)
+            .map_err(status_from_editor_error)?
+            .clone();
+        if layout.revision().get() != expected_revision {
+            return Err(YU_STORAGE_STALE_REVISION);
+        }
+
+        if focus_block == Some(block_index) {
+            let bias = projection_bias_from_affinity(selection.affinity());
+            let layout_caret = layout
+                .caret_for_source(selection.focus(), bias)
+                .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+            let point = layout_caret.point();
+            if !point.x().is_finite() || !point.y().is_finite() {
+                return Err(YU_STORAGE_EDITOR_ERROR);
+            }
+            caret = YuStorageMacosVisualDecorationCaret {
+                revision: expected_revision,
+                block_index: block_index_u64,
+                line_index: u64::try_from(layout_caret.line())
+                    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+                x: point.x(),
+                y: block.y() + point.y(),
+                width: 1.0,
+                height: metrics.line_height(),
+                affinity: affinity_to_ffi(selection.affinity()),
+                present: 1,
+            };
+            if !caret.y.is_finite() {
+                return Err(YU_STORAGE_EDITOR_ERROR);
+            }
+        }
+
+        if selection.is_empty() {
+            continue;
+        }
+        let block_source = block.source();
+        let start = selection_range.start().max(block_source.start());
+        let end = selection_range.end().min(block_source.end());
+        if start >= end {
+            continue;
+        }
+        let visual_start = layout
+            .projection()
+            .source_to_visual(start, ProjectionBias::Before)
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+        let visual_end = layout
+            .projection()
+            .source_to_visual(end, ProjectionBias::After)
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+        if visual_start >= visual_end {
+            continue;
+        }
+        for line in layout.lines() {
+            let line_visual = line.visual();
+            let line_start = line_visual.start().max(visual_start);
+            let line_end = line_visual.end().min(visual_end);
+            if line_start >= line_end {
+                continue;
+            }
+            let mut left = f32::INFINITY;
+            let mut right = f32::NEG_INFINITY;
+            for cluster_index in line.cluster_range() {
+                let cluster = layout.clusters()[cluster_index];
+                let cluster_visual = cluster.visual();
+                if cluster.is_line_break()
+                    || cluster_visual.end() <= line_start
+                    || cluster_visual.start() >= line_end
+                {
+                    continue;
+                }
+                let x = cluster.x();
+                let cluster_right = x + cluster.width();
+                if !x.is_finite() || !cluster_right.is_finite() || cluster.width() <= 0.0 {
+                    continue;
+                }
+                left = left.min(x);
+                right = right.max(cluster_right);
+            }
+            if !left.is_finite() || !right.is_finite() || right <= left {
+                continue;
+            }
+            let y = block.y() + line.y();
+            if !y.is_finite() {
+                return Err(YU_STORAGE_EDITOR_ERROR);
+            }
+            rectangles.push(YuStorageMacosVisualDecorationRect {
+                revision: expected_revision,
+                block_index: block_index_u64,
+                line_index: u64::try_from(line.index())
+                    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+                x: left,
+                y,
+                width: right - left,
+                height: metrics.line_height(),
+                kind: 0,
+            });
+        }
+    }
+
+    let selection_count =
+        u64::try_from(rectangles.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let content_height = viewport_snapshot.content_height();
+    if !content_height.is_finite() || !metrics.line_height().is_finite() {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let snapshot = YuStorageMacosVisualDecorationSnapshot {
+        revision: expected_revision,
+        composition_generation: session.session.composition_generation(),
+        selection_count,
+        caret_present: caret.present,
+        content_height,
+        scroll_y,
+        viewport_height,
+        max_scroll_y: (content_height - viewport_height).max(0.0),
+        viewport_width: max_width,
+    };
+    Ok((snapshot, caret, rectangles))
+}
+
+/// Returns Rust/CoreText-shaped visual selection rectangles and caret geometry
+/// using a revision- and composition-generation-bound count/fill ABI. The
+/// first call may pass `capacity = 0` and a null `rects` pointer. No partial
+/// rectangle writes occur when the caller's capacity is too small.
+///
+/// # Safety
+/// `session` must be live. `snapshot`, `caret`, and `written` must be writable;
+/// `rects` must point to `capacity` writable values when `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_visual_decorations(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    snapshot: *mut YuStorageMacosVisualDecorationSnapshot,
+    caret: *mut YuStorageMacosVisualDecorationCaret,
+    rects: *mut YuStorageMacosVisualDecorationRect,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if snapshot.is_null() || caret.is_null() || written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && rects.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output pointers were checked for null and belong to the caller.
+    unsafe {
+        *snapshot = YuStorageMacosVisualDecorationSnapshot::default();
+        *caret = YuStorageMacosVisualDecorationCaret::default();
+        *written = 0;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            expected_generation,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            rects,
+            capacity,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let (header, decoration_caret, encoded) = match macos_visual_decorations(
+            session,
+            expected_revision,
+            expected_generation,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+        ) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+        // SAFETY: output pointers were checked above.
+        unsafe {
+            *snapshot = header;
+            *caret = decoration_caret;
+            *written = encoded.len();
+        }
+        if capacity == 0 && rects.is_null() {
+            return YU_STORAGE_OK;
+        }
+        if encoded.len() > capacity {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+        if !encoded.is_empty() {
+            // SAFETY: capacity was checked against the encoded rectangle count.
+            unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), rects, encoded.len()) };
+        }
+        YU_STORAGE_OK
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn macos_visual_scene(
     session: &mut YuStorageSession,
     expected_revision: u64,
@@ -7129,6 +7470,214 @@ mod tests {
             YU_STORAGE_STALE_REVISION
         );
         assert_eq!(snapshot, YuStorageShapedViewportSnapshot::default());
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_visual_decorations_are_shaped_count_fill_and_generation_bound() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yu-storage-ffi-macos-visual-decorations-{id}.md"));
+        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n\nsecond line\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let selection_start = source.find("Paragraph").expect("selection start");
+        let selection_end = source.find("日本語").expect("selection end") + "日本語".len();
+        let start_utf16 = source[..selection_start].encode_utf16().count() as u64;
+        let end_utf16 = source[..selection_end].encode_utf16().count() as u64;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection(
+                    raw,
+                    0,
+                    start_utf16,
+                    end_utf16,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut snapshot = YuStorageMacosVisualDecorationSnapshot::default();
+        let mut caret = YuStorageMacosVisualDecorationCaret::default();
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_decorations(
+                    raw,
+                    0,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    &mut caret,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(required > 0);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.composition_generation, 0);
+        assert_eq!(snapshot.selection_count, required as u64);
+        assert_eq!(snapshot.caret_present, 1);
+        assert_eq!(caret.present, 1);
+        assert!(caret.x.is_finite() && caret.y.is_finite());
+
+        let mut too_small = vec![YuStorageMacosVisualDecorationRect::default(); required - 1];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_decorations(
+                    raw,
+                    0,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    &mut caret,
+                    too_small.as_mut_ptr(),
+                    too_small.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+        assert_eq!(written, required);
+        assert!(
+            too_small
+                .iter()
+                .all(|rect| *rect == YuStorageMacosVisualDecorationRect::default())
+        );
+
+        let mut rects = vec![YuStorageMacosVisualDecorationRect::default(); required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_decorations(
+                    raw,
+                    0,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    &mut caret,
+                    rects.as_mut_ptr(),
+                    rects.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, required);
+        assert!(rects.iter().all(|rect| {
+            rect.revision == 0
+                && rect.width > 0.0
+                && rect.height > 0.0
+                && rect.x.is_finite()
+                && rect.y.is_finite()
+        }));
+
+        assert_eq!(
+            unsafe {
+                yu_storage_session_begin_composition(
+                    raw,
+                    0,
+                    start_utf16,
+                    end_utf16,
+                    "日".as_ptr(),
+                    "日".len(),
+                    1,
+                    1,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_decorations(
+                    raw,
+                    0,
+                    1,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    &mut caret,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_NO_OVERLAY
+        );
+        assert_eq!(snapshot, YuStorageMacosVisualDecorationSnapshot::default());
+        assert_eq!(caret, YuStorageMacosVisualDecorationCaret::default());
+        assert_eq!(required, 0);
+        assert_eq!(
+            unsafe { yu_storage_session_cancel_composition(raw, 0, 1) },
+            YU_STORAGE_OK
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_decorations(
+                    raw,
+                    0,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    &mut caret,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(snapshot, YuStorageMacosVisualDecorationSnapshot::default());
+        assert_eq!(caret, YuStorageMacosVisualDecorationCaret::default());
+        assert_eq!(required, 0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

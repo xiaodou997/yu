@@ -471,13 +471,19 @@
     accessibility semantic nodes 或 native GPU handle。
 26. `MacosVisualDecorationView` 只能保存当前 Revision 的 owned selection/caret rectangles，必须
     对 AppKit hit-test 返回 `nil`，不得拥有 source、selection、IME 或 Accessibility state。它位于
-    Metal surface 之上、source TextKit mirror 之外；geometry 失效、surface detach、窗口离开或
+    Metal surface 之上、source TextKit mirror 之外；正常路径必须消费 Rust/CoreText-shaped
+    document-space geometry，active composition、geometry 失效、surface detach、窗口离开或
     native submit 失败时必须清空并恢复 TextKit 的自绘装饰。
 27. `yu_storage_session_macos_composition_projection_hit_test` 必须同时验证 expected Revision 与
     composition generation，并使用 composition-aware transient block layout 加完整 transient
     projection 返回命中结果；输出的 block index、document-space point、source/visual UTF-16、
     visual selection/replacement 必须来自同一 generation。过期 generation 必须清空输出并返回
     `YU_STORAGE_STALE_COMPOSITION`，native host 不得用 canonical hit-test 结果重建 preedit 偏移。
+28. `yu_storage_session_macos_visual_decorations` 的 count/fill 两次调用都必须验证 expected
+    Revision 与 composition generation；header、caret、selection rectangle 的 Revision 必须一致，
+    capacity 不足不得部分写入。矩形和 caret 是 Rust layout 的 document-space owned scalar，Swift
+    只能应用 header 的 scroll transform；active composition 返回 `YU_STORAGE_NO_OVERLAY`，不得把
+    transient preedit 当作普通 selection decoration。
 
 ## CoreText viewport preparation
 

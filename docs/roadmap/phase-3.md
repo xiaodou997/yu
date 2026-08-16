@@ -35,6 +35,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 生产 visual view 启用点击/拖选 visual boundary→Rust source selection，以及 source→visual caret 映射
 - [x] 生产 visual view 的 projected selection highlight 与同一 Revision 的 shaped caret reveal
 - [x] 产品窗口接入独立 visual decoration sibling，负责 selection/caret 绘制并在 stale/detach 时回退 TextKit
+- [x] decoration sibling 改用 Rust/CoreText-shaped document-space count/fill geometry；active composition、stale 与不可见 caret 保留 TextKit fallback
 - [x] 生产 Up/Down/Shift-Up/Shift-Down 使用当前 CoreText metrics/shaper 的 Revision-bound command
 - [x] 生产 pointer adapter 使用同一 CoreText-shaped Rust block layout 命中 visual boundary；TextKit 只保留输入/IME/AX/矩形回退
 - [x] visual IME active caret 使用 Revision + composition generation-bound CoreText shaped block geometry
