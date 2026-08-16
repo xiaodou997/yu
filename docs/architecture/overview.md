@@ -660,6 +660,9 @@ edit 时同步这些 ranges，图片 URL 不进入 `EditorDocument` 的第二份
 Revision-bound `ImagePublication`；decoded bytes 可以跨 Revision 重绑定，旧 Revision 的结果在
 cache boundary 被拒绝。macOS storage FFI 的 `YuStorageVisualImage` 只复制同一 Revision 的
 UTF-16 ranges、kind 和 resource fingerprint，native 可以用已有 source-range API 取得 destination
-后再排入 ImageIO。当前阶段尚未创建 RGBA Metal texture 或 Image RenderCommand；下一阶段才把
-ready publication 接入 backend-owned texture，并为未就绪图片定义不阻塞编辑线程的 placeholder。
-见 ADR 0141。
+后再排入 ImageIO。`yu-render-macos` 现在提供独立的 ImageIO worker，将相对路径解析到文档目录，
+只把 owned RGBA8 bytes 带回 Rust；`MetalImageAtlas` 负责按 publication generation 上传
+backend-owned `MTLPixelFormatRGBA8Unorm` texture。Scene/RenderPlan 通过 opaque resource
+fingerprint 携带 `Image` command；Metal 侧没有 ready texture 时绘制 command 自带的 fallback
+rectangle，不阻塞编辑线程。该资源级纵向切片尚未把图片自动插入现有 block layout，因此产品窗口
+仍不会因为这次改动突然显示图片；下一步再定义 image placement/hit-test。见 ADR 0141、0142。

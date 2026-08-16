@@ -15,9 +15,13 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 
+use yu_assets::{DecodedImage, ImageDecodeError, ImageLocation, ImageLocationError, ImageRequest};
 use yu_core::Revision;
 use yu_render::{AtlasPageUpload, RenderCommand, RenderPlan, RenderUploader};
 use yu_scene::Rgba8;
@@ -35,7 +39,9 @@ pub use core_text::{CoreTextViewportFrameBuilder, CoreTextViewportFrameError};
 mod native {
     use std::ffi::c_void;
 
-    use super::{NativeDamageRect, NativeDrawCommand, NativeTextureBinding};
+    use super::{
+        NativeDamageRect, NativeDrawCommand, NativeImageTextureBinding, NativeTextureBinding,
+    };
 
     unsafe extern "C" {
         pub fn yu_metal_create_device(
@@ -85,6 +91,23 @@ mod native {
             pixel_length: usize,
             out_texture: *mut *mut c_void,
         ) -> i32;
+        pub fn yu_metal_upload_rgba_texture(
+            device: *mut c_void,
+            width: u32,
+            height: u32,
+            pixels: *const u8,
+            pixel_length: usize,
+            out_texture: *mut *mut c_void,
+        ) -> i32;
+        pub fn yu_macos_image_decode_file(
+            path_bytes: *const u8,
+            path_length: usize,
+            out_width: *mut u32,
+            out_height: *mut u32,
+            out_pixels: *mut *mut c_void,
+            out_pixel_length: *mut usize,
+        ) -> i32;
+        pub fn yu_macos_image_free_bytes(pixels: *mut c_void);
         pub fn yu_metal_create_render_target(
             device: *mut c_void,
             width: u32,
@@ -125,9 +148,233 @@ mod native {
             damage_count: usize,
             textures: *const NativeTextureBinding,
             texture_count: usize,
+            image_textures: *const NativeImageTextureBinding,
+            image_texture_count: usize,
         ) -> i32;
         pub fn yu_metal_release_pipeline(pipeline: *mut c_void);
         pub fn yu_metal_release(object: *mut c_void);
+    }
+}
+
+/// Errors raised by the macOS ImageIO decoder boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MacosImageDecodeError {
+    UnsupportedPlatform,
+    InvalidPath,
+    Location(ImageLocationError),
+    NativeDecodeFailed,
+    Decode(ImageDecodeError),
+    WorkerClosed,
+}
+
+impl fmt::Display for MacosImageDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPlatform => {
+                formatter.write_str("macOS ImageIO decoding is unavailable on this platform")
+            }
+            Self::InvalidPath => formatter.write_str("image path is not valid UTF-8"),
+            Self::Location(error) => error.fmt(formatter),
+            Self::NativeDecodeFailed => formatter.write_str("ImageIO could not decode the image"),
+            Self::Decode(error) => error.fmt(formatter),
+            Self::WorkerClosed => formatter.write_str("macOS image decode worker is closed"),
+        }
+    }
+}
+
+impl Error for MacosImageDecodeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Location(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::UnsupportedPlatform
+            | Self::InvalidPath
+            | Self::NativeDecodeFailed
+            | Self::WorkerClosed => None,
+        }
+    }
+}
+
+impl From<ImageDecodeError> for MacosImageDecodeError {
+    fn from(error: ImageDecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+impl From<ImageLocationError> for MacosImageDecodeError {
+    fn from(error: ImageLocationError) -> Self {
+        Self::Location(error)
+    }
+}
+
+/// One result returned by [`MacosImageDecodeWorker`]. The request is returned
+/// unchanged so the owner can publish it through `yu-assets::ImageCache` and
+/// retain the source Revision/key association.
+#[derive(Debug)]
+pub struct MacosImageDecodeResult {
+    request: ImageRequest,
+    result: Result<DecodedImage, MacosImageDecodeError>,
+}
+
+impl MacosImageDecodeResult {
+    #[must_use]
+    pub fn request(&self) -> &ImageRequest {
+        &self.request
+    }
+
+    #[must_use = "inspect or publish the decode result"]
+    pub fn result(&self) -> &Result<DecodedImage, MacosImageDecodeError> {
+        &self.result
+    }
+
+    pub fn into_parts(self) -> (ImageRequest, Result<DecodedImage, MacosImageDecodeError>) {
+        (self.request, self.result)
+    }
+}
+
+/// Small ImageIO-backed decoder used by a platform host or worker thread.
+///
+/// The decoder owns no cache and performs no editor mutation. It resolves a
+/// source-backed request against the Markdown document path and returns owned
+/// RGBA8 pixels suitable for `yu-assets::ImageCache::publish_decoded`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MacosImageDecoder;
+
+impl MacosImageDecoder {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    pub fn decode_request(
+        &self,
+        request: &ImageRequest,
+        document_path: impl AsRef<Path>,
+    ) -> Result<DecodedImage, MacosImageDecodeError> {
+        let location = ImageLocation::resolve(document_path, request.key().destination())?;
+        self.decode_file(location.path())
+    }
+
+    pub fn decode_file(&self, path: &Path) -> Result<DecodedImage, MacosImageDecodeError> {
+        #[cfg(target_os = "macos")]
+        {
+            let path = path.to_str().ok_or(MacosImageDecodeError::InvalidPath)?;
+            let mut width = 0_u32;
+            let mut height = 0_u32;
+            let mut raw_pixels = std::ptr::null_mut();
+            let mut pixel_length = 0_usize;
+            let decoded = unsafe {
+                native::yu_macos_image_decode_file(
+                    path.as_bytes().as_ptr(),
+                    path.len(),
+                    &mut width,
+                    &mut height,
+                    &mut raw_pixels,
+                    &mut pixel_length,
+                )
+            };
+            let raw_pixels =
+                NonNull::new(raw_pixels).ok_or(MacosImageDecodeError::NativeDecodeFailed)?;
+            let pixels = unsafe {
+                let slice =
+                    std::slice::from_raw_parts(raw_pixels.as_ptr().cast::<u8>(), pixel_length);
+                let copied = std::sync::Arc::<[u8]>::from(slice);
+                native::yu_macos_image_free_bytes(raw_pixels.as_ptr());
+                copied
+            };
+            if decoded == 0 {
+                return Err(MacosImageDecodeError::NativeDecodeFailed);
+            }
+            return DecodedImage::new(width, height, pixels).map_err(Into::into);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = path;
+            Err(MacosImageDecodeError::UnsupportedPlatform)
+        }
+    }
+}
+
+struct DecodeJob {
+    request: ImageRequest,
+    document_path: PathBuf,
+}
+
+/// Background ImageIO worker. The worker communicates only through owned
+/// requests/results; the owner thread remains responsible for cache
+/// publication and Revision validation.
+pub struct MacosImageDecodeWorker {
+    sender: Option<Sender<DecodeJob>>,
+    receiver: Receiver<MacosImageDecodeResult>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl fmt::Debug for MacosImageDecodeWorker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MacosImageDecodeWorker")
+    }
+}
+
+impl MacosImageDecodeWorker {
+    pub fn new() -> Result<Self, MacosImageDecodeError> {
+        let (sender, jobs) = mpsc::channel::<DecodeJob>();
+        let (results, receiver) = mpsc::channel::<MacosImageDecodeResult>();
+        let join = thread::Builder::new()
+            .name("yu-imageio".to_owned())
+            .spawn(move || {
+                let decoder = MacosImageDecoder::new();
+                while let Ok(job) = jobs.recv() {
+                    let result = decoder.decode_request(&job.request, &job.document_path);
+                    if results
+                        .send(MacosImageDecodeResult {
+                            request: job.request,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| MacosImageDecodeError::WorkerClosed)?;
+        Ok(Self {
+            sender: Some(sender),
+            receiver,
+            join: Some(join),
+        })
+    }
+
+    pub fn submit(
+        &self,
+        request: ImageRequest,
+        document_path: impl Into<PathBuf>,
+    ) -> Result<(), MacosImageDecodeError> {
+        self.sender
+            .as_ref()
+            .ok_or(MacosImageDecodeError::WorkerClosed)?
+            .send(DecodeJob {
+                request,
+                document_path: document_path.into(),
+            })
+            .map_err(|_| MacosImageDecodeError::WorkerClosed)
+    }
+
+    pub fn try_recv(&self) -> Result<Option<MacosImageDecodeResult>, MacosImageDecodeError> {
+        match self.receiver.try_recv() {
+            Ok(result) => Ok(Some(result)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(MacosImageDecodeError::WorkerClosed),
+        }
+    }
+}
+
+impl Drop for MacosImageDecodeWorker {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 
@@ -135,6 +382,7 @@ const METAL_SHADER_SOURCE: &str = include_str!("../native/yu_shaders.metal");
 
 const DRAW_FILL_RECT: u32 = 0;
 const DRAW_GLYPH: u32 = 1;
+const DRAW_IMAGE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -153,6 +401,7 @@ struct NativeDrawCommand {
     blue: f32,
     alpha: f32,
     page: u32,
+    resource: u64,
 }
 
 #[repr(C)]
@@ -169,6 +418,14 @@ struct NativeDamageRect {
 #[derive(Clone, Copy, Debug)]
 struct NativeTextureBinding {
     page: u32,
+    texture: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct NativeImageTextureBinding {
+    resource: u64,
     texture: *mut std::ffi::c_void,
 }
 
@@ -711,6 +968,68 @@ impl MetalUploader {
     pub fn new(device: MetalDevice) -> Self {
         Self { device }
     }
+
+    /// Uploads an owned RGBA8 image into a backend texture. The same retained
+    /// texture wrapper is used for alpha atlas pages and image resources; the
+    /// native bridge chooses the Metal pixel format from this entry point.
+    pub fn upload_rgba_image(
+        &mut self,
+        image: &DecodedImage,
+    ) -> Result<MetalTexture, MetalRenderError> {
+        let expected = usize::try_from(image.width())
+            .ok()
+            .and_then(|width| {
+                usize::try_from(image.height())
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(MetalRenderError::InvalidPixelBuffer {
+                expected: usize::MAX,
+                actual: image.pixels().len(),
+            })?;
+        if image.pixels().len() != expected {
+            return Err(MetalRenderError::InvalidPixelBuffer {
+                expected,
+                actual: image.pixels().len(),
+            });
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut raw = std::ptr::null_mut();
+            let uploaded = unsafe {
+                native::yu_metal_upload_rgba_texture(
+                    self.device.raw(),
+                    image.width(),
+                    image.height(),
+                    image.pixels().as_ptr(),
+                    image.pixels().len(),
+                    &mut raw,
+                )
+            };
+            let raw = NonNull::new(raw).ok_or(MetalRenderError::NativeFailure(
+                "MTLTexture allocation failed",
+            ))?;
+            if uploaded == 0 {
+                unsafe { native::yu_metal_release(raw.as_ptr()) };
+                return Err(MetalRenderError::NativeFailure(
+                    "MTLTexture RGBA upload failed",
+                ));
+            }
+            return Ok(MetalTexture {
+                raw,
+                width: image.width(),
+                height: image.height(),
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = image;
+            Err(MetalRenderError::UnsupportedPlatform)
+        }
+    }
 }
 
 impl RenderUploader for MetalUploader {
@@ -852,6 +1171,85 @@ impl MetalAtlas {
             .iter()
             .map(|(page, texture)| NativeTextureBinding {
                 page: *page,
+                texture: texture.raw(),
+            })
+            .collect()
+    }
+}
+
+/// GPU-resident decoded images keyed by the source-backed resource identity.
+///
+/// This cache is intentionally separate from [`MetalAtlas`]: glyph page
+/// invalidation and image resource publication have different lifetimes, and
+/// a device reset can clear either cache without touching the editor scene.
+#[derive(Debug, Default)]
+pub struct MetalImageAtlas {
+    images: BTreeMap<u64, MetalTexture>,
+    identities: BTreeMap<u64, ImageTextureIdentity>,
+    device_registry_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageTextureIdentity {
+    width: u32,
+    height: u32,
+    generation: u64,
+}
+
+impl MetalImageAtlas {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stages one decoded publication. Re-publishing the same generation is
+    /// a no-op; a newer generation atomically replaces the old texture only
+    /// after the upload succeeds.
+    pub fn sync_publication(
+        &mut self,
+        uploader: &mut MetalUploader,
+        publication: &yu_assets::ImagePublication,
+    ) -> Result<bool, MetalRenderError> {
+        let device_registry_id = uploader.device().registry_id();
+        if let Some(existing) = self.device_registry_id
+            && existing != device_registry_id
+        {
+            return Err(MetalRenderError::DeviceMismatch);
+        }
+        let resource = publication.key().fingerprint();
+        let identity = ImageTextureIdentity {
+            width: publication.image().width(),
+            height: publication.image().height(),
+            generation: publication.generation(),
+        };
+        if self.identities.get(&resource) == Some(&identity) {
+            return Ok(false);
+        }
+        let texture = uploader.upload_rgba_image(publication.image())?;
+        self.images.insert(resource, texture);
+        self.identities.insert(resource, identity);
+        self.device_registry_id = Some(device_registry_id);
+        Ok(true)
+    }
+
+    #[must_use]
+    pub fn resource_count(&self) -> usize {
+        self.images.len()
+    }
+
+    fn resource_sizes(&self) -> BTreeMap<u64, (u32, u32)> {
+        self.images
+            .iter()
+            .map(|(resource, texture)| (*resource, (texture.width(), texture.height())))
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_bindings(&self) -> Vec<NativeImageTextureBinding> {
+        self.images
+            .iter()
+            .map(|(resource, texture)| NativeImageTextureBinding {
+                resource: *resource,
                 texture: texture.raw(),
             })
             .collect()
@@ -1533,6 +1931,20 @@ impl MetalFrameRenderer {
         plan: &RenderPlan,
         atlas: &MetalAtlas,
     ) -> Result<(), MetalRenderError> {
+        let images = MetalImageAtlas::new();
+        self.render_plan_with_images(surface, plan, atlas, &images)
+    }
+
+    /// Retained rendering entry point with decoded image resources. Missing
+    /// image resources are converted to their command fallback rectangle;
+    /// the render thread never waits for ImageIO.
+    pub fn render_plan_with_images(
+        &mut self,
+        surface: &MetalSurface,
+        plan: &RenderPlan,
+        atlas: &MetalAtlas,
+        images: &MetalImageAtlas,
+    ) -> Result<(), MetalRenderError> {
         if self.queue.device().registry_id() != surface.device().registry_id()
             || self.pipeline.device().registry_id() != surface.device().registry_id()
         {
@@ -1541,7 +1953,8 @@ impl MetalFrameRenderer {
 
         let recreated_target = self.ensure_target(surface)?;
         let viewport = plan.viewport();
-        let all_commands = build_native_commands(plan, &atlas.page_sizes())?;
+        let all_commands =
+            build_native_commands(plan, &atlas.page_sizes(), &images.resource_sizes())?;
         let damage = build_native_damage(plan)?;
         let full_clear = recreated_target
             || self.needs_full_clear
@@ -1575,6 +1988,7 @@ impl MetalFrameRenderer {
         #[cfg(target_os = "macos")]
         {
             let bindings = atlas.native_bindings();
+            let image_bindings = images.native_bindings();
             let target = self
                 .target
                 .as_ref()
@@ -1595,6 +2009,8 @@ impl MetalFrameRenderer {
                     damage.len(),
                     bindings.as_ptr(),
                     bindings.len(),
+                    image_bindings.as_ptr(),
+                    image_bindings.len(),
                 )
             };
             return match status {
@@ -1623,6 +2039,7 @@ impl MetalFrameRenderer {
                 surface,
                 plan,
                 atlas,
+                images,
                 viewport_width,
                 viewport_height,
                 scale,
@@ -1645,8 +2062,20 @@ impl MetalFrameRenderer {
         frame: &ViewportRenderFrame,
         atlas: &MetalAtlas,
     ) -> Result<(), MetalRenderError> {
+        let images = MetalImageAtlas::new();
+        self.render_viewport_frame_with_images(surface, current_revision, frame, atlas, &images)
+    }
+
+    pub fn render_viewport_frame_with_images(
+        &mut self,
+        surface: &MetalSurface,
+        current_revision: Revision,
+        frame: &ViewportRenderFrame,
+        atlas: &MetalAtlas,
+        images: &MetalImageAtlas,
+    ) -> Result<(), MetalRenderError> {
         self.frame_consumer.validate(current_revision, frame)?;
-        self.render_plan(surface, frame.plan(), atlas)?;
+        self.render_plan_with_images(surface, frame.plan(), atlas, images)?;
         self.frame_consumer.commit(current_revision, frame)
     }
 
@@ -1664,9 +2093,29 @@ impl MetalFrameRenderer {
         uploader: &mut MetalUploader,
         atlas: &mut MetalAtlas,
     ) -> Result<MetalFrameSubmission, MetalRenderError> {
+        let images = MetalImageAtlas::new();
+        self.submit_viewport_frame_with_images(
+            surface,
+            current_revision,
+            frame,
+            uploader,
+            atlas,
+            &images,
+        )
+    }
+
+    pub fn submit_viewport_frame_with_images(
+        &mut self,
+        surface: &MetalSurface,
+        current_revision: Revision,
+        frame: &ViewportRenderFrame,
+        uploader: &mut MetalUploader,
+        atlas: &mut MetalAtlas,
+        images: &MetalImageAtlas,
+    ) -> Result<MetalFrameSubmission, MetalRenderError> {
         self.frame_consumer.validate(current_revision, frame)?;
         let uploaded_pages = atlas.sync_plan(uploader, frame.plan())?;
-        self.render_plan(surface, frame.plan(), atlas)?;
+        self.render_plan_with_images(surface, frame.plan(), atlas, images)?;
         self.frame_consumer.commit(current_revision, frame)?;
         Ok(MetalFrameSubmission {
             revision: frame.revision(),
@@ -1764,6 +2213,7 @@ fn normalized_channel(channel: u8) -> f32 {
 fn build_native_commands(
     plan: &RenderPlan,
     page_sizes: &BTreeMap<u32, (u32, u32)>,
+    image_sizes: &BTreeMap<u64, (u32, u32)>,
 ) -> Result<Vec<NativeDrawCommand>, MetalRenderError> {
     let viewport = plan.viewport();
     let mut commands = Vec::with_capacity(plan.commands().len());
@@ -1804,6 +2254,7 @@ fn build_native_commands(
                     blue: normalized_channel(color.blue()),
                     alpha: normalized_channel(color.alpha()),
                     page: u32::MAX,
+                    resource: 0,
                 });
             }
             RenderCommand::Glyph {
@@ -1860,7 +2311,70 @@ fn build_native_commands(
                     blue: normalized_channel(color.blue()),
                     alpha: normalized_channel(color.alpha()),
                     page,
+                    resource: 0,
                 });
+            }
+            RenderCommand::Image {
+                resource,
+                bounds,
+                fallback,
+            } => {
+                if !bounds.x().is_finite()
+                    || !bounds.y().is_finite()
+                    || !bounds.width().is_finite()
+                    || !bounds.height().is_finite()
+                {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "image geometry is not finite",
+                    ));
+                }
+                if bounds.width() == 0.0 || bounds.height() == 0.0 {
+                    continue;
+                }
+                let x = bounds.x() - viewport.x();
+                let y = bounds.y() - viewport.y();
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "image position is not finite",
+                    ));
+                }
+                if image_sizes.contains_key(&resource) {
+                    commands.push(NativeDrawCommand {
+                        kind: DRAW_IMAGE,
+                        x,
+                        y,
+                        width: bounds.width(),
+                        height: bounds.height(),
+                        u0: 0.0,
+                        v0: 0.0,
+                        u1: 1.0,
+                        v1: 1.0,
+                        red: 1.0,
+                        green: 1.0,
+                        blue: 1.0,
+                        alpha: 1.0,
+                        page: u32::MAX,
+                        resource,
+                    });
+                } else {
+                    commands.push(NativeDrawCommand {
+                        kind: DRAW_FILL_RECT,
+                        x,
+                        y,
+                        width: bounds.width(),
+                        height: bounds.height(),
+                        u0: 0.0,
+                        v0: 0.0,
+                        u1: 0.0,
+                        v1: 0.0,
+                        red: normalized_channel(fallback.red()),
+                        green: normalized_channel(fallback.green()),
+                        blue: normalized_channel(fallback.blue()),
+                        alpha: normalized_channel(fallback.alpha()),
+                        page: u32::MAX,
+                        resource: 0,
+                    });
+                }
             }
         }
     }
@@ -2128,7 +2642,8 @@ mod tests {
         let mut page_sizes = BTreeMap::new();
         page_sizes.insert(0, (16, 16));
 
-        let commands = build_native_commands(&plan, &page_sizes).expect("native commands");
+        let commands =
+            build_native_commands(&plan, &page_sizes, &BTreeMap::new()).expect("native commands");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].kind, DRAW_FILL_RECT);
         assert_eq!(commands[0].x, 0.0);
@@ -2140,6 +2655,47 @@ mod tests {
         assert_eq!(commands[1].height, 6.0);
         assert_eq!(commands[1].u0, entry.rect().x() as f32 / 16.0);
         assert_eq!(commands[1].v0, entry.rect().y() as f32 / 16.0);
+    }
+
+    #[test]
+    fn native_image_command_uses_placeholder_until_resource_is_ready() {
+        use std::collections::BTreeMap;
+
+        use yu_core::Revision;
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{ImagePrimitive, Rect, SceneBuilder};
+
+        let bounds = Rect::new(4.0, 6.0, 32.0, 24.0).expect("image bounds");
+        let fallback = Rgba8::new(230, 232, 236, 255);
+        let mut scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 120.0, 80.0).expect("viewport"),
+        )
+        .expect("scene");
+        scene
+            .image(ImagePrimitive::new(42, bounds, fallback))
+            .expect("image");
+        let atlas = yu_font::GlyphAtlas::new(
+            yu_font::GlyphAtlasConfig::new(16, 16, 1).expect("atlas config"),
+        );
+        let plan = RenderPlanBuilder::new()
+            .build(&scene.finish(), &atlas)
+            .expect("plan");
+
+        let placeholder = build_native_commands(&plan, &BTreeMap::new(), &BTreeMap::new())
+            .expect("placeholder commands");
+        assert_eq!(placeholder.len(), 1);
+        assert_eq!(placeholder[0].kind, DRAW_FILL_RECT);
+        assert_eq!(placeholder[0].resource, 0);
+        assert_eq!(placeholder[0].red, normalized_channel(fallback.red()));
+
+        let mut ready = BTreeMap::new();
+        ready.insert(42, (2, 2));
+        let image = build_native_commands(&plan, &BTreeMap::new(), &ready).expect("image command");
+        assert_eq!(image.len(), 1);
+        assert_eq!(image[0].kind, DRAW_IMAGE);
+        assert_eq!(image[0].resource, 42);
+        assert_eq!(image[0].u1, 1.0);
     }
 
     #[test]
@@ -2176,7 +2732,8 @@ mod tests {
             .expect("plan");
 
         assert_eq!(
-            build_native_commands(&plan, &BTreeMap::new()).expect_err("missing page"),
+            build_native_commands(&plan, &BTreeMap::new(), &BTreeMap::new())
+                .expect_err("missing page"),
             MetalRenderError::MissingAtlasPage(0)
         );
     }
@@ -2230,6 +2787,7 @@ mod tests {
                 blue: 0.0,
                 alpha: 1.0,
                 page: u32::MAX,
+                resource: 0,
             },
             NativeDrawCommand {
                 kind: DRAW_GLYPH,
@@ -2246,6 +2804,7 @@ mod tests {
                 blue: 1.0,
                 alpha: 1.0,
                 page: 2,
+                resource: 0,
             },
             NativeDrawCommand {
                 kind: DRAW_FILL_RECT,
@@ -2262,6 +2821,7 @@ mod tests {
                 blue: 0.0,
                 alpha: 1.0,
                 page: u32::MAX,
+                resource: 0,
             },
         ];
         let damage = [NativeDamageRect {
@@ -2294,6 +2854,7 @@ mod tests {
             blue: 1.0,
             alpha: 1.0,
             page: u32::MAX,
+            resource: 0,
         };
         let damage = [
             NativeDamageRect {
@@ -2324,12 +2885,37 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn imageio_decoder_returns_owned_rgba_pixels_for_a_local_png() {
+        let path = std::env::temp_dir().join(format!(
+            "yu-imageio-{}-{}.png",
+            std::process::id(),
+            Revision::INITIAL.get()
+        ));
+        let png: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15,
+            0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        std::fs::write(&path, png).expect("write PNG fixture");
+        let image = MacosImageDecoder::new()
+            .decode_file(&path)
+            .expect("decode PNG fixture");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((image.width(), image.height()), (1, 1));
+        assert_eq!(image.pixels().len(), 4);
+    }
+
+    #[cfg(target_os = "macos")]
     #[ignore = "requires a macOS session with a Metal-capable device"]
     #[test]
     fn macos_device_surface_and_atlas_upload_are_live() {
+        use yu_assets::{DecodedImage, ImageCache, ImageRequest};
+        use yu_core::{ByteOffset, TextRange};
         use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportRect};
         use yu_font::{FontRequest, GlyphAtlasConfig};
-        use yu_scene::{Rect, Rgba8};
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{ImagePrimitive, Rect, Rgba8, SceneBuilder};
         use yu_workspace::ViewportRenderConfig;
 
         let device = MetalDevice::system_default().expect("Metal device");
@@ -2383,7 +2969,60 @@ mod tests {
         );
         assert_eq!(gpu_atlas.page_count(), 1);
 
+        let image_source =
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(5)).expect("image source range");
+        let image_request = ImageRequest::new(Revision::INITIAL, image_source, "fixture.png")
+            .expect("image request");
+        let mut image_cache = ImageCache::new();
+        let publication = image_cache
+            .publish_decoded(
+                image_request,
+                Revision::INITIAL,
+                DecodedImage::new(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255])
+                    .expect("decoded image"),
+            )
+            .expect("image publication");
+        let mut image_atlas = MetalImageAtlas::new();
+        assert!(
+            image_atlas
+                .sync_publication(&mut uploader, &publication)
+                .expect("RGBA texture upload")
+        );
+        assert!(
+            !image_atlas
+                .sync_publication(&mut uploader, &publication)
+                .expect("duplicate RGBA texture upload")
+        );
+        assert_eq!(image_atlas.resource_count(), 1);
+
+        let mut image_scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 320.0, 180.0).expect("image viewport"),
+        )
+        .expect("image scene");
+        image_scene
+            .image(ImagePrimitive::new(
+                publication.key().fingerprint(),
+                Rect::new(16.0, 16.0, 128.0, 64.0).expect("image bounds"),
+                Rgba8::new(230, 232, 236, 255),
+            ))
+            .expect("image primitive");
+        let image_plan = RenderPlanBuilder::new()
+            .build(
+                &image_scene.finish(),
+                &yu_font::GlyphAtlas::new(
+                    GlyphAtlasConfig::new(16, 16, 1).expect("image atlas config"),
+                ),
+            )
+            .expect("image render plan");
+
         let mut frame_renderer = MetalFrameRenderer::new(device).expect("command queue/pipeline");
+        let result =
+            frame_renderer.render_plan_with_images(&surface, &image_plan, &gpu_atlas, &image_atlas);
+        assert!(matches!(
+            result,
+            Ok(()) | Err(MetalRenderError::DrawableUnavailable)
+        ));
         let result = frame_renderer.render_plan(&surface, plan, &gpu_atlas);
         assert!(matches!(
             result,

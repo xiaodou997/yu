@@ -65,7 +65,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] `yu-projection::ImageSource` 保留 inline/reference image 的 source/label/destination ranges，并随 strictly-outside edit 映射
 - [x] `yu-assets::ImageCache` 建立可轮询异步解码队列、destination 去重、RGBA8 校验和 Revision-bound CPU publication
 - [x] macOS storage FFI 暴露 source-backed image metadata count/fill；Swift self-check 覆盖 reference resolution、fingerprint 与 stale Revision
-- [ ] ImageIO 解码 worker、Metal RGBA texture ownership、ready-image RenderPlan command 和未就绪 placeholder
+- [x] ImageIO 解码 worker、Metal RGBA texture ownership、ready-image RenderPlan command 和未就绪 placeholder（资源级纵向切片；image placement/hit-test 另列下一阶段）
 
 ## 约束
 

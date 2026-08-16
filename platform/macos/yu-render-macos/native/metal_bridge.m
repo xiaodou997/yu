@@ -23,12 +23,18 @@ typedef struct {
     float blue;
     float alpha;
     uint32_t page;
+    uint64_t resource;
 } YuMetalDrawCommand;
 
 typedef struct {
     uint32_t page;
     void *texture;
 } YuMetalTextureBinding;
+
+typedef struct {
+    uint64_t resource;
+    void *texture;
+} YuMetalImageTextureBinding;
 
 typedef struct {
     float x;
@@ -54,6 +60,7 @@ typedef struct {
     id<MTLRenderPipelineState> clear_pipeline;
     id<MTLRenderPipelineState> solid_pipeline;
     id<MTLRenderPipelineState> glyph_pipeline;
+    id<MTLRenderPipelineState> image_pipeline;
     id<MTLSamplerState> sampler;
 } YuMetalPipeline;
 
@@ -297,6 +304,45 @@ int yu_metal_upload_alpha_texture(
     return 1;
 }
 
+int yu_metal_upload_rgba_texture(
+    void *device_ptr,
+    uint32_t width,
+    uint32_t height,
+    const uint8_t *pixels,
+    size_t pixel_length,
+    void **out_texture
+) {
+    if (device_ptr == NULL || pixels == NULL || out_texture == NULL || width == 0 || height == 0) {
+        return 0;
+    }
+    if ((size_t)width > SIZE_MAX / 4 || (size_t)height > SIZE_MAX / ((size_t)width * 4)) {
+        return 0;
+    }
+    size_t bytes_per_row = (size_t)width * 4;
+    size_t expected = bytes_per_row * (size_t)height;
+    if (expected != pixel_length) {
+        return 0;
+    }
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                      width:width
+                                     height:height
+                                  mipmapped:NO];
+    if (descriptor == nil) {
+        return 0;
+    }
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [(id<MTLDevice>)device_ptr newTextureWithDescriptor:descriptor];
+    if (texture == nil) {
+        return 0;
+    }
+    MTLRegion region = MTLRegionMake2D(0, 0, width, height);
+    [texture replaceRegion:region mipmapLevel:0 withBytes:pixels bytesPerRow:bytes_per_row];
+    *out_texture = (void *)texture;
+    return 1;
+}
+
 int yu_metal_create_render_target(
     void *device_ptr,
     uint32_t width,
@@ -421,10 +467,12 @@ int yu_metal_create_pipeline(
     id<MTLFunction> vertex = [library newFunctionWithName:@"yu_vertex"];
     id<MTLFunction> solid = [library newFunctionWithName:@"yu_solid_fragment"];
     id<MTLFunction> glyph = [library newFunctionWithName:@"yu_glyph_fragment"];
-    if (vertex == nil || solid == nil || glyph == nil) {
+    id<MTLFunction> image = [library newFunctionWithName:@"yu_image_fragment"];
+    if (vertex == nil || solid == nil || glyph == nil || image == nil) {
         [vertex release];
         [solid release];
         [glyph release];
+        [image release];
         [library release];
         return 0;
     }
@@ -454,6 +502,8 @@ int yu_metal_create_pipeline(
 
     MTLRenderPipelineDescriptor *glyph_descriptor = [solid_descriptor copy];
     glyph_descriptor.fragmentFunction = glyph;
+    MTLRenderPipelineDescriptor *image_descriptor = [solid_descriptor copy];
+    image_descriptor.fragmentFunction = image;
     MTLRenderPipelineDescriptor *clear_descriptor = [solid_descriptor copy];
     clear_descriptor.colorAttachments[0].blendingEnabled = NO;
 
@@ -464,6 +514,8 @@ int yu_metal_create_pipeline(
         [device newRenderPipelineStateWithDescriptor:solid_descriptor error:&pipeline_error];
     id<MTLRenderPipelineState> glyph_pipeline =
         [device newRenderPipelineStateWithDescriptor:glyph_descriptor error:&pipeline_error];
+    id<MTLRenderPipelineState> image_pipeline =
+        [device newRenderPipelineStateWithDescriptor:image_descriptor error:&pipeline_error];
 
     MTLSamplerDescriptor *sampler_descriptor = [[MTLSamplerDescriptor alloc] init];
     sampler_descriptor.minFilter = MTLSamplerMinMagFilterLinear;
@@ -474,18 +526,22 @@ int yu_metal_create_pipeline(
 
     [sampler_descriptor release];
     [clear_descriptor release];
+    [image_descriptor release];
     [glyph_descriptor release];
     [solid_descriptor release];
     [vertex_descriptor release];
     [vertex release];
     [solid release];
     [glyph release];
+    [image release];
     [library release];
 
-    if (clear_pipeline == nil || solid_pipeline == nil || glyph_pipeline == nil || sampler == nil) {
+    if (clear_pipeline == nil || solid_pipeline == nil || glyph_pipeline == nil
+        || image_pipeline == nil || sampler == nil) {
         [clear_pipeline release];
         [solid_pipeline release];
         [glyph_pipeline release];
+        [image_pipeline release];
         [sampler release];
         return 0;
     }
@@ -501,6 +557,7 @@ int yu_metal_create_pipeline(
     pipeline->clear_pipeline = clear_pipeline;
     pipeline->solid_pipeline = solid_pipeline;
     pipeline->glyph_pipeline = glyph_pipeline;
+    pipeline->image_pipeline = image_pipeline;
     pipeline->sampler = sampler;
     *out_pipeline = (void *)pipeline;
     return 1;
@@ -546,7 +603,9 @@ static int yu_metal_encode_command(
     YuMetalPipeline *pipeline,
     YuMetalDrawCommand command,
     const YuMetalTextureBinding *textures,
-    size_t texture_count
+    size_t texture_count,
+    const YuMetalImageTextureBinding *image_textures,
+    size_t image_texture_count
 ) {
     YuMetalVertex vertices[6] = {
         {command.x, command.y, command.u0, command.v0},
@@ -577,6 +636,20 @@ static int yu_metal_encode_command(
             return 0;
         }
         [encoder setRenderPipelineState:pipeline->glyph_pipeline];
+        [encoder setFragmentTexture:(id<MTLTexture>)texture_ptr atIndex:0];
+        [encoder setFragmentSamplerState:pipeline->sampler atIndex:0];
+    } else if (command.kind == 2) {
+        void *texture_ptr = NULL;
+        for (size_t texture_index = 0; texture_index < image_texture_count; texture_index += 1) {
+            if (image_textures[texture_index].resource == command.resource) {
+                texture_ptr = image_textures[texture_index].texture;
+                break;
+            }
+        }
+        if (texture_ptr == NULL) {
+            return 0;
+        }
+        [encoder setRenderPipelineState:pipeline->image_pipeline];
         [encoder setFragmentTexture:(id<MTLTexture>)texture_ptr atIndex:0];
         [encoder setFragmentSamplerState:pipeline->sampler atIndex:0];
     } else {
@@ -623,13 +696,16 @@ int yu_metal_render_plan(
     const YuMetalDamageRect *damage,
     size_t damage_count,
     const YuMetalTextureBinding *textures,
-    size_t texture_count
+    size_t texture_count,
+    const YuMetalImageTextureBinding *image_textures,
+    size_t image_texture_count
 ) {
     if (queue_ptr == NULL || layer_ptr == NULL || pipeline_ptr == NULL || target_ptr == NULL
         || viewport_width <= 0.0f || viewport_height <= 0.0f || scale <= 0.0f
         || (command_count > 0 && commands == NULL)
         || (damage_count > 0 && damage == NULL)
-        || (texture_count > 0 && textures == NULL)) {
+        || (texture_count > 0 && textures == NULL)
+        || (image_texture_count > 0 && image_textures == NULL)) {
         return 0;
     }
 
@@ -679,7 +755,14 @@ int yu_metal_render_plan(
         };
         [encoder setScissorRect:full_scissor];
         for (size_t index = 0; index < command_count; index += 1) {
-            if (!yu_metal_encode_command(encoder, pipeline, commands[index], textures, texture_count)) {
+            if (!yu_metal_encode_command(
+                    encoder,
+                    pipeline,
+                    commands[index],
+                    textures,
+                    texture_count,
+                    image_textures,
+                    image_texture_count)) {
                 [encoder endEncoding];
                 return 5;
             }
@@ -699,7 +782,14 @@ int yu_metal_render_plan(
             [encoder setScissorRect:scissor];
             yu_metal_encode_clear_rect(encoder, pipeline, damage_rect);
             for (size_t index = 0; index < command_count; index += 1) {
-                if (!yu_metal_encode_command(encoder, pipeline, commands[index], textures, texture_count)) {
+                if (!yu_metal_encode_command(
+                        encoder,
+                        pipeline,
+                        commands[index],
+                        textures,
+                        texture_count,
+                        image_textures,
+                        image_texture_count)) {
                     [encoder endEncoding];
                     return 5;
                 }
@@ -736,6 +826,7 @@ void yu_metal_release_pipeline(void *pipeline_ptr) {
     [pipeline->clear_pipeline release];
     [pipeline->solid_pipeline release];
     [pipeline->glyph_pipeline release];
+    [pipeline->image_pipeline release];
     [pipeline->sampler release];
     free(pipeline);
 }

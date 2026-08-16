@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use yu_core::{Revision, TextRange};
@@ -45,6 +46,72 @@ impl ImageKey {
         hash
     }
 }
+
+/// A filesystem location resolved from a Markdown image destination.
+///
+/// Resolution is deliberately kept outside the parser and editor model. The
+/// destination remains the source-backed [`ImageKey`], while a platform host
+/// supplies the document path used to turn relative destinations into an
+/// absolute filesystem location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageLocation(PathBuf);
+
+impl ImageLocation {
+    /// Resolves a local image destination against the directory containing the
+    /// Markdown document. Remote URLs and data URLs are rejected explicitly;
+    /// they need a separate, policy-controlled loader and must not silently
+    /// become filesystem paths.
+    pub fn resolve(
+        document_path: impl AsRef<Path>,
+        destination: &str,
+    ) -> Result<Self, ImageLocationError> {
+        let destination = destination.trim();
+        if destination.is_empty() {
+            return Err(ImageLocationError::EmptyDestination);
+        }
+        if destination.contains("://") || destination.starts_with("data:") {
+            return Err(ImageLocationError::UnsupportedScheme);
+        }
+        let path = Path::new(destination);
+        if path.is_absolute() {
+            return Ok(Self(path.to_path_buf()));
+        }
+        let document_path = document_path.as_ref();
+        let parent = document_path
+            .parent()
+            .ok_or(ImageLocationError::MissingDocumentParent)?;
+        Ok(Self(parent.join(path)))
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// Errors raised while resolving an image destination for a local decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageLocationError {
+    EmptyDestination,
+    UnsupportedScheme,
+    MissingDocumentParent,
+}
+
+impl fmt::Display for ImageLocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyDestination => formatter.write_str("image destination must not be empty"),
+            Self::UnsupportedScheme => {
+                formatter.write_str("remote and data image destinations are unsupported")
+            }
+            Self::MissingDocumentParent => {
+                formatter.write_str("document path has no parent directory")
+            }
+        }
+    }
+}
+
+impl Error for ImageLocationError {}
 
 /// Errors raised while creating an image resource key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,6 +442,34 @@ impl ImageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_locations_resolve_from_document_parent() {
+        let location = ImageLocation::resolve("/tmp/notes/readme.md", "../img/yu.png")
+            .expect("local image location");
+        assert_eq!(location.path(), Path::new("/tmp/notes/../img/yu.png"));
+    }
+
+    #[test]
+    fn absolute_locations_are_preserved() {
+        let location = ImageLocation::resolve("/tmp/notes/readme.md", "/tmp/yu.png")
+            .expect("absolute image location");
+        assert_eq!(location.path(), Path::new("/tmp/yu.png"));
+    }
+
+    #[test]
+    fn remote_and_data_locations_are_rejected() {
+        assert_eq!(
+            ImageLocation::resolve("/tmp/readme.md", "https://example.com/yu.png")
+                .expect_err("remote image"),
+            ImageLocationError::UnsupportedScheme
+        );
+        assert_eq!(
+            ImageLocation::resolve("/tmp/readme.md", "data:image/png;base64,AA==")
+                .expect_err("data image"),
+            ImageLocationError::UnsupportedScheme
+        );
+    }
 
     fn request(revision: u64, source: TextRange, destination: &str) -> ImageRequest {
         ImageRequest::new(Revision::new(revision), source, destination).expect("request")

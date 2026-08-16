@@ -475,6 +475,7 @@ typedef struct YuStorageVisualScenePrimitive {
 enum {
     YU_STORAGE_RENDER_COMMAND_FILL_RECT = 0,
     YU_STORAGE_RENDER_COMMAND_GLYPH = 1,
+    YU_STORAGE_RENDER_COMMAND_IMAGE = 2,
     YU_STORAGE_RENDER_PAGE_NONE = UINT32_MAX,
     YU_STORAGE_IMAGE_DESTINATION_NONE = UINT64_MAX,
     YU_STORAGE_IMAGE_INLINE = 0,
@@ -535,6 +536,7 @@ typedef struct YuStorageVisualRenderCommand {
     float bounds_width;
     float bounds_height;
     uint32_t color_rgba;
+    uint64_t resource;
 } YuStorageVisualRenderCommand;
 
 typedef struct YuStorageVisualRenderPage {

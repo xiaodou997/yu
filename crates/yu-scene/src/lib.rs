@@ -253,11 +253,51 @@ impl GlyphPrimitive {
     }
 }
 
+/// A source-independent image draw operation.
+///
+/// `resource` is a stable `yu-assets::ImageKey::fingerprint()` supplied by
+/// the host. The scene carries only that scalar identity and a fallback
+/// color; decoded pixels and GPU textures remain owned by the platform
+/// backend.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImagePrimitive {
+    resource: u64,
+    bounds: Rect,
+    fallback: Rgba8,
+}
+
+impl ImagePrimitive {
+    #[must_use]
+    pub const fn new(resource: u64, bounds: Rect, fallback: Rgba8) -> Self {
+        Self {
+            resource,
+            bounds,
+            fallback,
+        }
+    }
+
+    #[must_use]
+    pub const fn resource(self) -> u64 {
+        self.resource
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> Rect {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn fallback(self) -> Rgba8 {
+        self.fallback
+    }
+}
+
 /// One retained scene primitive. Insertion order is the painter's order.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Primitive {
     FillRect { bounds: Rect, color: Rgba8 },
     Glyph(GlyphPrimitive),
+    Image(ImagePrimitive),
 }
 
 impl Primitive {
@@ -266,6 +306,7 @@ impl Primitive {
         match self {
             Self::FillRect { bounds, .. } => bounds,
             Self::Glyph(glyph) => glyph.bounds(),
+            Self::Image(image) => image.bounds(),
         }
     }
 }
@@ -487,6 +528,10 @@ impl SceneBuilder {
 
     pub fn glyph(&mut self, glyph: GlyphPrimitive) -> Result<u32, SceneError> {
         self.push(Primitive::Glyph(glyph))
+    }
+
+    pub fn image(&mut self, image: ImagePrimitive) -> Result<u32, SceneError> {
+        self.push(Primitive::Image(image))
     }
 
     /// Appends all shaped glyphs from a layout using entries already present

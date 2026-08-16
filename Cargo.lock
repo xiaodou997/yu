@@ -175,6 +175,7 @@ dependencies = [
 name = "yu-render-macos"
 version = "0.1.0"
 dependencies = [
+ "yu-assets",
  "yu-core",
  "yu-editor",
  "yu-font",

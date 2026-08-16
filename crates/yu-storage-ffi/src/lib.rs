@@ -575,6 +575,7 @@ pub struct YuStorageVisualScenePrimitive {
 
 pub const YU_STORAGE_RENDER_COMMAND_FILL_RECT: u8 = 0;
 pub const YU_STORAGE_RENDER_COMMAND_GLYPH: u8 = 1;
+pub const YU_STORAGE_RENDER_COMMAND_IMAGE: u8 = 2;
 pub const YU_STORAGE_RENDER_PAGE_NONE: u32 = u32::MAX;
 pub const YU_STORAGE_IMAGE_DESTINATION_NONE: u64 = u64::MAX;
 pub const YU_STORAGE_IMAGE_INLINE: u8 = 0;
@@ -652,6 +653,7 @@ pub struct YuStorageVisualRenderCommand {
     pub bounds_width: f32,
     pub bounds_height: f32,
     pub color_rgba: u32,
+    pub resource: u64,
 }
 
 /// One owned atlas-page publication record. The corresponding alpha bytes are
@@ -5485,6 +5487,7 @@ fn macos_visual_render_plan(
                     bounds_width: bounds.width(),
                     bounds_height: bounds.height(),
                     color_rgba: color.packed(),
+                    resource: 0,
                 }
             }
             RenderCommand::Glyph {
@@ -5518,6 +5521,39 @@ fn macos_visual_render_plan(
                     bounds_width: rect.width() as f32,
                     bounds_height: rect.height() as f32,
                     color_rgba: color.packed(),
+                    resource: 0,
+                }
+            }
+            RenderCommand::Image {
+                resource,
+                bounds,
+                fallback,
+            } => {
+                if metadata_kind != YU_STORAGE_RENDER_COMMAND_IMAGE {
+                    return Err(YU_STORAGE_EDITOR_ERROR);
+                }
+                YuStorageVisualRenderCommand {
+                    revision: plan.revision().get(),
+                    block_index,
+                    source_start_utf16,
+                    source_end_utf16,
+                    kind: YU_STORAGE_RENDER_COMMAND_IMAGE,
+                    page: YU_STORAGE_RENDER_PAGE_NONE,
+                    atlas_x: 0,
+                    atlas_y: 0,
+                    atlas_width: 0,
+                    atlas_height: 0,
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    bearing_x: 0.0,
+                    bearing_y: 0.0,
+                    advance_x: 0.0,
+                    bounds_x: bounds.x(),
+                    bounds_y: bounds.y(),
+                    bounds_width: bounds.width(),
+                    bounds_height: bounds.height(),
+                    color_rgba: fallback.packed(),
+                    resource,
                 }
             }
         };
