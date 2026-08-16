@@ -185,9 +185,9 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
   --macos-render-host-surface-self-check experiments/macos-document-host/Fixtures/block-projection.md
 ```
 
-该 self-check 只返回 Rust-owned lifecycle scalar，surface、renderer、atlas、Metal target 和
-attachment 在同步调用结束时释放；它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
-后续真实窗口 adapter 才会持久拥有 surface 并处理 resize/generation。
+该 self-check 只返回 Rust-owned lifecycle scalar；同一个 storage session 会复用 surface、renderer、
+atlas、Metal target 和 attachment，重复提交应复用 atlas upload，surface 尺寸变化会推进 generation，
+结束前显式 detach。它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
 
 验证 persistent host 从 retained scene 导出的 glyph primitive count/fill、atlas placement、
 source block range、block 顺序、几何有限性以及编辑后的 stale Revision 拒绝（不启动窗口）：

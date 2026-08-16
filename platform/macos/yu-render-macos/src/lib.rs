@@ -437,6 +437,31 @@ pub struct MetalViewAttachment<'surface> {
     _surface: PhantomData<&'surface MetalSurface>,
 }
 
+/// An explicitly owned AppKit attachment for a backend adapter that stores a
+/// surface and its attachment in the same state object. Unlike
+/// [`MetalViewAttachment`], this type does not encode the surface lifetime;
+/// callers must drop it before the `MetalSurface` it was created from. It is
+/// intentionally kept separate from the scoped public API so ordinary callers
+/// retain the compile-time lifetime guard.
+#[cfg(target_os = "macos")]
+pub struct MetalViewAttachmentOwned {
+    raw: NonNull<std::ffi::c_void>,
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Debug for MetalViewAttachmentOwned {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MetalViewAttachmentOwned")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MetalViewAttachmentOwned {
+    fn drop(&mut self) {
+        unsafe { native::yu_metal_detach_layer_from_view(self.raw.as_ptr()) };
+    }
+}
+
 impl fmt::Debug for MetalViewAttachment<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("MetalViewAttachment")
@@ -537,6 +562,37 @@ impl MetalSurface {
             let _ = view;
             Err(MetalRenderError::UnsupportedPlatform)
         }
+    }
+
+    /// Attaches this surface for an explicitly owned backend adapter.
+    ///
+    /// # Safety
+    ///
+    /// `view` must be a valid, main-thread-owned `NSView` pointer for the
+    /// lifetime of the returned attachment. The caller must drop the returned
+    /// attachment before dropping this surface.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn attach_to_view_owned(
+        &self,
+        view: NonNull<std::ffi::c_void>,
+    ) -> Result<MetalViewAttachmentOwned, MetalRenderError> {
+        let mut raw_attachment = std::ptr::null_mut();
+        let attached = unsafe {
+            native::yu_metal_attach_layer_to_view(
+                self.raw_layer(),
+                view.as_ptr(),
+                &mut raw_attachment,
+            )
+        };
+        let raw_attachment =
+            NonNull::new(raw_attachment).ok_or(MetalRenderError::ViewAttachmentUnavailable)?;
+        if attached == 0 {
+            unsafe { native::yu_metal_detach_layer_from_view(raw_attachment.as_ptr()) };
+            return Err(MetalRenderError::ViewAttachmentUnavailable);
+        }
+        Ok(MetalViewAttachmentOwned {
+            raw: raw_attachment,
+        })
     }
 
     pub fn resize(&mut self, config: MetalSurfaceConfig) -> Result<(), MetalRenderError> {

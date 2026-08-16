@@ -210,6 +210,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS document host render lifecycle](docs/adr/0120-macos-render-host-lifecycle.md)
 - [Revision-bound retained scene glyph bridge](docs/adr/0121-retained-scene-glyph-bridge.md)
 - [macOS real surface submit self-check](docs/adr/0122-macos-real-surface-submit.md)
+- [Persistent macOS native surface adapter](docs/adr/0123-persistent-macos-surface-adapter.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)

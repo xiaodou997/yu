@@ -1623,6 +1623,13 @@ private final class StorageBridge {
         return NativeMacosRenderHostSurfaceSnapshot(value)
     }
 
+    func macosRenderHostSurfaceDetach() throws {
+        let status = yu_storage_session_macos_render_host_surface_detach(handle)
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+    }
+
     func macosShapedCaretScrollRequest(
         revision: UInt64,
         size: Float,
@@ -4899,6 +4906,8 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
         application.activate(ignoringOtherApps: true)
         window.displayIfNeeded()
         defer {
+            try? bridge.macosRenderHostSurfaceDetach()
+            try? bridge.macosRenderHostSurfaceDetach()
             window.orderOut(nil)
             window.close()
         }
@@ -4924,16 +4933,78 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
         precondition(first.atlasPageCount > 0)
         precondition(first.submitted)
 
+        let repeated = try bridge.macosRenderHostSurfaceSubmit(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: viewportHeight,
+            surfaceWidth: Double(maxWidth),
+            surfaceHeight: Double(viewportHeight),
+            scale: 2.0,
+            view: rawView
+        )
+        precondition(repeated.surfaceGeneration == first.surfaceGeneration)
+        precondition(repeated.frameSerial > first.frameSerial)
+        precondition(repeated.uploadedPages == 0)
+        precondition(repeated.submitted)
+
+        let resized = try bridge.macosRenderHostSurfaceSubmit(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: viewportHeight,
+            surfaceWidth: Double(maxWidth + 20.0),
+            surfaceHeight: Double(viewportHeight + 20.0),
+            scale: 2.0,
+            view: rawView
+        )
+        precondition(resized.surfaceGeneration == first.surfaceGeneration + 1)
+        precondition(resized.frameSerial > repeated.frameSerial)
+        precondition(resized.uploadedPages == 0)
+        precondition(resized.submitted)
+
+        let largerSize: Float = 16.0
+        let largerShaped = try bridge.macosBlockLayout(
+            revision: revision,
+            blockIndex: 2,
+            size: largerSize,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(largerShaped.lineHeight),
+            defaultAdvance: Float(largerShaped.defaultAdvance),
+            estimatedBlockHeight: Float(largerShaped.lineHeight),
+            overscan: 0.0
+        )
+        let resizedFont = try bridge.macosRenderHostSurfaceSubmit(
+            revision: revision,
+            size: largerSize,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: viewportHeight,
+            surfaceWidth: Double(maxWidth + 20.0),
+            surfaceHeight: Double(viewportHeight + 20.0),
+            scale: 2.0,
+            view: rawView
+        )
+        precondition(resizedFont.surfaceGeneration == resized.surfaceGeneration)
+        precondition(resizedFont.frameSerial > resized.frameSerial)
+        precondition(resizedFont.submitted)
+
         _ = try bridge.insertText("!")
         do {
             _ = try bridge.macosRenderHostSurfaceSubmit(
                 revision: revision,
-                size: size,
+                size: largerSize,
                 maxWidth: maxWidth,
                 scrollY: 0.0,
                 viewportHeight: viewportHeight,
-                surfaceWidth: Double(maxWidth),
-                surfaceHeight: Double(viewportHeight),
+                surfaceWidth: Double(maxWidth + 20.0),
+                surfaceHeight: Double(viewportHeight + 20.0),
                 scale: 2.0,
                 view: rawView
             )
@@ -4944,21 +5015,22 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
 
         let next = try bridge.macosRenderHostSurfaceSubmit(
             revision: bridge.state.revision,
-            size: size,
+            size: largerSize,
             maxWidth: maxWidth,
             scrollY: 0.0,
             viewportHeight: viewportHeight,
-            surfaceWidth: Double(maxWidth),
-            surfaceHeight: Double(viewportHeight),
+            surfaceWidth: Double(maxWidth + 20.0),
+            surfaceHeight: Double(viewportHeight + 20.0),
             scale: 2.0,
             view: rawView
         )
         precondition(next.revision == bridge.state.revision)
-        precondition(next.frameSerial > first.frameSerial)
+        precondition(next.surfaceGeneration == resized.surfaceGeneration)
+        precondition(next.frameSerial > resizedFont.frameSerial)
         precondition(next.submitted)
         print(
-            "Yu macOS Metal surface self-check: CAMetalLayer attachment, real drawable submit, "
-                + "atlas upload and stale Revision rejection are valid"
+            "Yu macOS Metal surface self-check: persistent CAMetalLayer attachment, repeated submit, "
+                + "resize/generation, atlas reuse and stale Revision rejection are valid"
         )
         exit(EXIT_SUCCESS)
     } catch {

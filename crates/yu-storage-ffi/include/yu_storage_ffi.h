@@ -682,6 +682,8 @@ int32_t yu_storage_session_macos_render_host_surface_submit(
     float max_width, float scroll_y, float viewport_height,
     double surface_width, double surface_height, double scale, void *view,
     YuStorageMacosRenderHostSurfaceSnapshot *snapshot);
+int32_t yu_storage_session_macos_render_host_surface_detach(
+    YuStorageSession *session);
 int32_t yu_storage_session_macos_visual_scene_glyphs(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,

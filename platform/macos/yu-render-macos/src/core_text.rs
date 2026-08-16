@@ -120,6 +120,19 @@ impl CoreTextViewportFrameBuilder {
         config: ViewportRenderConfig,
         atlas_config: GlyphAtlasConfig,
     ) -> Result<Self, CoreTextViewportFrameError> {
+        Self::with_shaper_and_initial_serial(shaper, config, atlas_config, 0)
+    }
+
+    /// Creates a builder whose first publication continues after an existing
+    /// builder serial. The new builder still starts with fresh shaping and
+    /// atlas state; only the publication identity is carried across a host
+    /// rebuild.
+    pub fn with_shaper_and_initial_serial(
+        shaper: CoreTextShaper,
+        config: ViewportRenderConfig,
+        atlas_config: GlyphAtlasConfig,
+        initial_serial: u64,
+    ) -> Result<Self, CoreTextViewportFrameError> {
         let font_size = config.font_size();
         if !font_size.is_finite() || font_size <= 0.0 {
             return Err(CoreTextViewportFrameError::InvalidConfig(
@@ -135,7 +148,7 @@ impl CoreTextViewportFrameBuilder {
             shaper,
             atlas: GlyphAtlas::new(atlas_config),
             render_plans: RenderPlanBuilder::new(),
-            publisher: ViewportFramePublisher::new(),
+            publisher: ViewportFramePublisher::with_next_serial(initial_serial),
             config,
         })
     }
