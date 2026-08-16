@@ -13,6 +13,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 yu-core = { path = "../yu-core" }
+yu-assets = { path = "../yu-assets" }
 yu-editor = { path = "../yu-editor" }
 yu-export = { path = "../yu-export" }
 yu-scene = { path = "../yu-scene" }
@@ -25,6 +26,7 @@ yu-font-macos = { path = "../../platform/macos/yu-font-macos" }
 yu-render = { path = "../yu-render" }
 yu-render-macos = { path = "../../platform/macos/yu-render-macos" }
 yu-workspace = { path = "../yu-workspace" }
+yu-markdown = { path = "../yu-markdown" }
 
 [lints]
 workspace = true

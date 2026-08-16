@@ -14,6 +14,7 @@ private extension NSPasteboard.PasteboardType {
 
 private enum StorageStatus {
     static let ok: Int32 = 0
+    static let staleRevision: Int32 = 13
     static let externalChange: Int32 = 4
     static let unsavedChanges: Int32 = 5
     static let htmlImportRejected: Int32 = 18
@@ -431,6 +432,47 @@ private struct NativeVisualScenePrimitive {
             height: CGFloat(value.height)
         )
         kind = value.kind
+    }
+}
+
+private struct NativeVisualImage {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let sourceRange: NSRange
+    let labelRange: NSRange
+    let destinationRange: NSRange?
+    let referenceRange: NSRange?
+    let resourceFingerprint: UInt64
+    let kind: UInt8
+
+    init(_ value: YuStorageVisualImage) {
+        revision = value.revision
+        blockIndex = value.block_index
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        labelRange = NSRange(
+            location: Int(value.label_start_utf16),
+            length: Int(value.label_end_utf16 - value.label_start_utf16)
+        )
+        destinationRange = NativeVisualImage.optionalRange(
+            start: value.destination_start_utf16,
+            end: value.destination_end_utf16
+        )
+        referenceRange = NativeVisualImage.optionalRange(
+            start: value.reference_start_utf16,
+            end: value.reference_end_utf16
+        )
+        resourceFingerprint = value.resource_fingerprint
+        kind = value.kind
+    }
+
+    private static func optionalRange(start: UInt64, end: UInt64) -> NSRange? {
+        guard start != UInt64.max, end != UInt64.max, end >= start else {
+            return nil
+        }
+        return NSRange(location: Int(start), length: Int(end - start))
     }
 }
 
@@ -1711,6 +1753,35 @@ private final class StorageBridge {
             NativeVisualSceneSnapshot(snapshot),
             values.map(NativeVisualScenePrimitive.init)
         )
+    }
+
+    func macosVisualImages(revision: UInt64) throws -> [NativeVisualImage] {
+        var required = 0
+        let sizeStatus = yu_storage_session_macos_visual_images(
+            handle,
+            revision,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var values = Array(repeating: YuStorageVisualImage(), count: required)
+        var written = required
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_macos_visual_images(
+                handle,
+                revision,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard fillStatus == StorageStatus.ok, written == required else {
+            throw BridgeError.operation(fillStatus)
+        }
+        return values.map(NativeVisualImage.init)
     }
 
     func macosVisualSceneGlyphs(
@@ -6530,6 +6601,61 @@ private func runVisualSceneGlyphSelfCheck(path: String) -> Never {
     }
 }
 
+private func runVisualImageSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let images = try bridge.macosVisualImages(revision: revision)
+        precondition(images.count >= 2)
+        let inlineKind = UInt8(YU_STORAGE_IMAGE_INLINE)
+        let referenceKind = UInt8(YU_STORAGE_IMAGE_REFERENCE)
+        var sawInline = false
+        var sawReference = false
+        for image in images {
+            precondition(image.revision == revision)
+            precondition(image.sourceRange.location >= 0)
+            precondition(NSMaxRange(image.sourceRange) <= (bridge.source as NSString).length)
+            precondition(NSMaxRange(image.labelRange) <= (bridge.source as NSString).length)
+            precondition(image.resourceFingerprint != 0)
+            if let destination = image.destinationRange {
+                precondition(NSMaxRange(destination) <= (bridge.source as NSString).length)
+            }
+            if let reference = image.referenceRange {
+                precondition(NSMaxRange(reference) <= (bridge.source as NSString).length)
+            }
+            switch image.kind {
+            case inlineKind:
+                sawInline = true
+                precondition(image.destinationRange != nil)
+                precondition(image.referenceRange == nil)
+            case referenceKind:
+                sawReference = true
+                precondition(image.referenceRange != nil)
+                precondition(image.destinationRange != nil)
+            default:
+                preconditionFailure("unknown image metadata kind")
+            }
+        }
+        precondition(sawInline && sawReference)
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.macosVisualImages(revision: revision)
+            preconditionFailure("stale image metadata unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == StorageStatus.staleRevision)
+        }
+        print(
+            "Yu Visual Image self-check: source ranges, reference resolution, "
+                + "resource fingerprints and stale Revision rejection are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual Image self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runVisualRenderPlanSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -7479,6 +7605,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-viewport-self-check
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualSceneSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-image-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualImageSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-glyph-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

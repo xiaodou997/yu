@@ -137,6 +137,49 @@ pub struct VisualRun {
     style: VisualRunStyle,
 }
 
+/// Source-backed metadata for one Markdown image in a projection.
+///
+/// The projection does not copy the destination or alt text. Native/resource
+/// layers resolve these ranges against the same `TextSnapshot` and may keep
+/// their own decoded/cache representation outside the editor model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageSource {
+    source: TextRange,
+    label: TextRange,
+    destination: Option<TextRange>,
+    reference: Option<TextRange>,
+}
+
+impl ImageSource {
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn label(self) -> TextRange {
+        self.label
+    }
+
+    /// Returns the inline destination range, when the image uses `![](...)`.
+    #[must_use]
+    pub const fn destination(self) -> Option<TextRange> {
+        self.destination
+    }
+
+    /// Returns the reference label range, when the image uses a reference
+    /// form such as `![logo][asset]` or `![logo][]`.
+    #[must_use]
+    pub const fn reference(self) -> Option<TextRange> {
+        self.reference
+    }
+
+    #[must_use]
+    pub const fn is_reference(self) -> bool {
+        self.reference.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LineBreakSpec {
     source: TextRange,
@@ -329,6 +372,7 @@ pub struct Projection {
     source: TextSnapshot,
     source_range: TextRange,
     runs: Vec<VisualRun>,
+    images: Vec<ImageSource>,
     visual_len: VisualOffset,
     composition: Option<CompositionState>,
 }
@@ -445,6 +489,23 @@ impl Projection {
             spans,
             default_style,
         )?;
+        let images = spans
+            .iter()
+            .filter_map(|span| match span.kind() {
+                InlineSpanKind::Image | InlineSpanKind::ReferenceImage => Some(ImageSource {
+                    source: span.source_range(),
+                    label: span.content(),
+                    destination: span.destination(),
+                    reference: span.reference(),
+                }),
+                InlineSpanKind::Emphasis
+                | InlineSpanKind::Strong
+                | InlineSpanKind::CodeSpan
+                | InlineSpanKind::Link
+                | InlineSpanKind::ReferenceLink
+                | InlineSpanKind::Autolink => None,
+            })
+            .collect::<Vec<_>>();
         let visual_len = runs
             .last()
             .map_or(VisualOffset::ZERO, |run| run.visual.end());
@@ -452,6 +513,7 @@ impl Projection {
             source: source.clone(),
             source_range,
             runs,
+            images,
             visual_len,
             composition: None,
         })
@@ -520,6 +582,7 @@ impl Projection {
             source: self.source.clone(),
             source_range: self.source_range,
             runs,
+            images: self.images.clone(),
             visual_len: shift_visual(self.visual_len, visual_delta)?,
             composition: Some(CompositionState {
                 replacement_range,
@@ -582,6 +645,24 @@ impl Projection {
             source: snapshot.clone(),
             source_range,
             runs,
+            images: self
+                .images
+                .iter()
+                .map(|image| {
+                    Ok(ImageSource {
+                        source: map_range(image.source, changes)?,
+                        label: map_range(image.label, changes)?,
+                        destination: image
+                            .destination
+                            .map(|range| map_range(range, changes))
+                            .transpose()?,
+                        reference: image
+                            .reference
+                            .map(|range| map_range(range, changes))
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ProjectionError>>()?,
             visual_len: self.visual_len,
             composition: None,
         }))
@@ -606,6 +687,12 @@ impl Projection {
     #[must_use]
     pub fn runs(&self) -> &[VisualRun] {
         &self.runs
+    }
+
+    /// Returns source-backed image metadata in parser span order.
+    #[must_use]
+    pub fn images(&self) -> &[ImageSource] {
+        &self.images
     }
 
     #[must_use]
@@ -2104,6 +2191,55 @@ mod tests {
         assert_eq!(
             retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers(),
             0
+        );
+    }
+
+    #[test]
+    fn projection_exposes_source_backed_image_metadata_and_maps_it() {
+        let source = "![logo](assets/yu.png) and ![mark][asset]\n[asset]: icons/yu.png\n";
+        let mut buffer = TextBuffer::with_backend(source, StorageBackend::PieceTree);
+        let snapshot = buffer.snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = Projection::inline(&snapshot, range).expect("projection should build");
+        assert_eq!(inline.images().len(), 2);
+        let image = inline.images()[0];
+        let destination = image.destination().expect("destination");
+        let destination_start = usize::try_from(destination.start().get()).expect("start");
+        let destination_end = usize::try_from(destination.end().get()).expect("end");
+        assert_eq!(&source[destination_start..destination_end], "assets/yu.png");
+        assert_eq!(
+            image.label(),
+            TextRange::new(ByteOffset::new(2), ByteOffset::new(6)).expect("label")
+        );
+        assert!(!image.is_reference());
+        assert!(inline.images()[1].is_reference());
+
+        let markdown = yu_markdown::parse(&snapshot);
+        let paragraph = markdown.blocks().get(0).expect("paragraph block").range();
+        let paragraph_projection = Projection::inline_with_definitions(
+            &snapshot,
+            paragraph,
+            markdown.reference_definitions(),
+        )
+        .expect("definition-aware projection should build");
+        assert_eq!(paragraph_projection.images().len(), 2);
+        assert!(paragraph_projection.images()[1].is_reference());
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(TextRange::empty(snapshot.len_bytes()), "x")],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("prefix edit should apply");
+        let mapped = paragraph_projection
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .expect("map should succeed")
+            .expect("outside edit should preserve projection");
+        assert_eq!(mapped.images().len(), 2);
+        assert_eq!(
+            mapped.images()[0].source(),
+            paragraph_projection.images()[0].source()
         );
     }
 

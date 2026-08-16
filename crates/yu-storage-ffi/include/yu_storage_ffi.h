@@ -476,7 +476,28 @@ enum {
     YU_STORAGE_RENDER_COMMAND_FILL_RECT = 0,
     YU_STORAGE_RENDER_COMMAND_GLYPH = 1,
     YU_STORAGE_RENDER_PAGE_NONE = UINT32_MAX,
+    YU_STORAGE_IMAGE_DESTINATION_NONE = UINT64_MAX,
+    YU_STORAGE_IMAGE_INLINE = 0,
+    YU_STORAGE_IMAGE_REFERENCE = 1,
 };
+
+/* Source-backed image metadata. Destination/reference values are UTF-16
+ * ranges in the same Revision; decoded pixels and native texture handles do
+ * not cross this ABI. */
+typedef struct YuStorageVisualImage {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t label_start_utf16;
+    uint64_t label_end_utf16;
+    uint64_t destination_start_utf16;
+    uint64_t destination_end_utf16;
+    uint64_t reference_start_utf16;
+    uint64_t reference_end_utf16;
+    uint64_t resource_fingerprint;
+    uint8_t kind;
+} YuStorageVisualImage;
 
 typedef struct YuStorageVisualRenderPlanSnapshot {
     uint64_t revision;
@@ -795,6 +816,9 @@ int32_t yu_storage_session_macos_visual_scene(
     float max_width, float scroll_y, float viewport_height,
     YuStorageVisualSceneSnapshot *snapshot,
     YuStorageVisualScenePrimitive *primitives, size_t capacity, size_t *written);
+int32_t yu_storage_session_macos_visual_images(
+    YuStorageSession *session, uint64_t expected_revision,
+    YuStorageVisualImage *images, size_t capacity, size_t *written);
 int32_t yu_storage_session_macos_visual_render_plan(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,

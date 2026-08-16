@@ -13,13 +13,14 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
 
+use yu_assets::ImageKey;
 use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
     AccessibilityTextSnapshot, BlockKind, BlockProjection, BlockProjectionKind, CaretAffinity,
-    CaretScrollRequest, CommandResult, EditorCommand, EditorDocumentError, EditorKey, KeyEvent,
-    KeyModifiers, KeyRouteResult, LayoutConfig, LayoutPoint, LayoutSnapshot, Projection,
+    CaretScrollRequest, CommandResult, EditorCommand, EditorDocumentError, EditorKey, ImageSource,
+    KeyEvent, KeyModifiers, KeyRouteResult, LayoutConfig, LayoutPoint, LayoutSnapshot, Projection,
     ProjectionBias, SelectionError, SourceSync, ViewportConfig, ViewportRect, VisualOffset,
     VisualRunKind,
 };
@@ -575,6 +576,30 @@ pub struct YuStorageVisualScenePrimitive {
 pub const YU_STORAGE_RENDER_COMMAND_FILL_RECT: u8 = 0;
 pub const YU_STORAGE_RENDER_COMMAND_GLYPH: u8 = 1;
 pub const YU_STORAGE_RENDER_PAGE_NONE: u32 = u32::MAX;
+pub const YU_STORAGE_IMAGE_DESTINATION_NONE: u64 = u64::MAX;
+pub const YU_STORAGE_IMAGE_INLINE: u8 = 0;
+pub const YU_STORAGE_IMAGE_REFERENCE: u8 = 1;
+
+/// Source-backed metadata for one image in the current Markdown Revision.
+/// Destination and reference values are UTF-16 source ranges; native code can
+/// fetch the actual bytes through the existing expected-Revision source range
+/// API and hand them to an async platform decoder.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageVisualImage {
+    pub revision: u64,
+    pub block_index: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub label_start_utf16: u64,
+    pub label_end_utf16: u64,
+    pub destination_start_utf16: u64,
+    pub destination_end_utf16: u64,
+    pub reference_start_utf16: u64,
+    pub reference_end_utf16: u64,
+    pub resource_fingerprint: u64,
+    pub kind: u8,
+}
 
 /// Owned metadata for one backend-neutral render-plan publication. Atlas
 /// pixels remain an owned Rust-side upload payload; this ABI exposes their
@@ -4789,6 +4814,103 @@ fn macos_visual_scene(
 }
 
 #[cfg(target_os = "macos")]
+fn image_utf16_range(source: &TextSnapshot, range: Option<TextRange>) -> Result<(u64, u64), i32> {
+    let Some(range) = range else {
+        return Ok((
+            YU_STORAGE_IMAGE_DESTINATION_NONE,
+            YU_STORAGE_IMAGE_DESTINATION_NONE,
+        ));
+    };
+    let start = source
+        .utf16_offset(range.start())
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    let end = source
+        .utf16_offset(range.end())
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    Ok((start, end))
+}
+
+#[cfg(target_os = "macos")]
+fn image_destination(
+    source: &TextSnapshot,
+    image: ImageSource,
+    definitions: &yu_markdown::ReferenceDefinitionIndex,
+) -> Option<TextRange> {
+    image.destination().or_else(|| {
+        image
+            .reference()
+            .and_then(|reference| definitions.lookup(source, reference))
+            .map(|definition| definition.destination())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_visual_images(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+) -> Result<Vec<YuStorageVisualImage>, i32> {
+    validate_revision(&session.session, expected_revision)?;
+    let source = session.session.snapshot();
+    let definitions = session
+        .session
+        .document()
+        .editor()
+        .markdown()
+        .reference_definitions()
+        .clone();
+    let mut encoded = Vec::new();
+    for block_index in 0..session.session.block_count() {
+        let projection = session
+            .session
+            .block_projection(block_index)
+            .map_err(storage_status)?;
+        for image in projection.visual().images().iter().copied() {
+            let destination = image_destination(&source, image, &definitions);
+            let (source_start_utf16, source_end_utf16) =
+                image_utf16_range(&source, Some(image.source()))?;
+            let (label_start_utf16, label_end_utf16) =
+                image_utf16_range(&source, Some(image.label()))?;
+            let (destination_start_utf16, destination_end_utf16) =
+                image_utf16_range(&source, destination)?;
+            let (reference_start_utf16, reference_end_utf16) =
+                image_utf16_range(&source, image.reference())?;
+            let resource_fingerprint = destination
+                .and_then(|range| {
+                    let start = usize::try_from(range.start().get()).ok()?;
+                    let end = usize::try_from(range.end().get()).ok()?;
+                    let text = source.as_str().get(start..end)?;
+                    ImageKey::new(text.to_owned())
+                        .ok()
+                        .map(|key| key.fingerprint())
+                })
+                .unwrap_or(0);
+            encoded.push(YuStorageVisualImage {
+                revision: source.revision().get(),
+                block_index: u64::try_from(block_index)
+                    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+                source_start_utf16,
+                source_end_utf16,
+                label_start_utf16,
+                label_end_utf16,
+                destination_start_utf16,
+                destination_end_utf16,
+                reference_start_utf16,
+                reference_end_utf16,
+                resource_fingerprint,
+                kind: if image.is_reference() {
+                    YU_STORAGE_IMAGE_REFERENCE
+                } else {
+                    YU_STORAGE_IMAGE_INLINE
+                },
+            });
+        }
+    }
+    Ok(encoded)
+}
+
+#[cfg(target_os = "macos")]
 type MacosVisualRenderPlan = (
     YuStorageVisualRenderPlanSnapshot,
     Vec<YuStorageVisualRenderCommand>,
@@ -6032,6 +6154,63 @@ pub unsafe extern "C" fn yu_storage_session_macos_visual_scene(
     }
 }
 
+/// Returns source-backed image metadata for the current Markdown Revision.
+/// The count/fill result contains no decoded bytes or native image objects;
+/// callers resolve destination ranges through the existing source-range API
+/// and schedule decoding on their own worker queue.
+///
+/// # Safety
+/// `session` must be null or a live handle. `snapshot` and `written` must be
+/// writable. `images` must point to `capacity` writable entries when
+/// `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_visual_images(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    images: *mut YuStorageVisualImage,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && images.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` was checked above and belongs to the caller.
+    unsafe { *written = 0 };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session, expected_revision, images, capacity);
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let encoded = match macos_visual_images(session, expected_revision) {
+            Ok(images) => images,
+            Err(status) => return status,
+        };
+        // SAFETY: `written` was checked above and belongs to the caller.
+        unsafe { *written = encoded.len() };
+        if capacity == 0 && images.is_null() {
+            return YU_STORAGE_OK;
+        }
+        if encoded.len() > capacity {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+        if !encoded.is_empty() {
+            // SAFETY: capacity was checked against the encoded image count.
+            unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), images, encoded.len()) };
+        }
+        YU_STORAGE_OK
+    }
+}
+
 /// Resolves the current focus caret through the macOS CoreText-shaped
 /// viewport policy. `caret_y` is document-space, while `current_scroll_y` and
 /// `target_scroll_y` are absolute document scroll offsets. The native host
@@ -6596,6 +6775,76 @@ mod tests {
         );
         assert_eq!(session.session.snapshot().as_str(), "羽 日本語 🙂\n");
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_visual_images_publish_source_ranges_and_reject_stale_revision() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-images-{id}.md"));
+        let source = "![logo](assets/yu.png)\n\n![mark][asset]\n\n[asset]: icons/yu.png\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_images(raw, 0, ptr::null_mut(), 0, &mut required)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(required, 2);
+        let mut images = vec![YuStorageVisualImage::default(); required];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_images(
+                    raw,
+                    0,
+                    images.as_mut_ptr(),
+                    images.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, 2);
+        assert_eq!(images[0].kind, YU_STORAGE_IMAGE_INLINE);
+        assert_eq!(images[1].kind, YU_STORAGE_IMAGE_REFERENCE);
+        assert!(images.iter().all(|image| image.revision == 0));
+        assert!(images.iter().all(|image| image.resource_fingerprint != 0));
+        assert_eq!(
+            images[1].destination_end_utf16 - images[1].destination_start_utf16,
+            "icons/yu.png".encode_utf16().count() as u64
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"x".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        let mut stale_written = 99;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_images(
+                    raw,
+                    0,
+                    images.as_mut_ptr(),
+                    images.len(),
+                    &mut stale_written,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(stale_written, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]
