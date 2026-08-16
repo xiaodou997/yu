@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Range};
@@ -159,19 +160,25 @@ impl EditorDocument {
     /// Returns the parser block that can host the active composition without
     /// crossing a block boundary.  Composition layout is intentionally
     /// block-local: a marked-text replacement spanning multiple Markdown
-    /// blocks stays on the native fallback surface until a later phase adds a
-    /// multi-block projection contract.
+    /// blocks has no single block-local index and must use the span-aware
+    /// transient viewport path.
     #[must_use]
     pub fn composition_block_index(&self) -> Option<usize> {
+        let span = self.composition_block_range()?;
+        (span.len() == 1).then_some(span.start)
+    }
+
+    /// Returns the half-open parser block-index span touched by the active
+    /// composition replacement. The span is source-range based and includes
+    /// blank/container blocks crossed by the native selection. A caller can
+    /// therefore build one transient projection per affected block without
+    /// rescanning Markdown or inventing a second block traversal.
+    #[must_use]
+    pub fn composition_block_range(&self) -> Option<Range<usize>> {
         let composition = self.composition.as_ref()?;
-        let index = self
-            .markdown
+        self.markdown
             .blocks()
-            .block_index_for_offset(composition.replacement_range().start())?;
-        let block = self.markdown.blocks().get(index)?;
-        let replacement = composition.replacement_range();
-        (replacement.start() >= block.range().start() && replacement.end() <= block.range().end())
-            .then_some(index)
+            .block_index_range_for_source_range(composition.replacement_range())
     }
 
     /// Returns a revision-bound block layout snapshot from the current
@@ -290,12 +297,48 @@ impl EditorDocument {
                 self.markdown.reference_definitions(),
             )?
             .clone();
-        projection
-            .with_composition(
+        let span = self
+            .composition_block_range()
+            .ok_or(EditorDocumentError::CompositionNotActive)?;
+        let (replacement, text, selection) = if span.len() == 1 {
+            (
                 composition.replacement_range(),
                 Arc::from(composition.text()),
                 composition.selection_bytes(),
             )
+        } else if index == span.start {
+            let replacement = TextRange::new(
+                composition
+                    .replacement_range()
+                    .start()
+                    .max(block.range().start()),
+                block.range().end(),
+            )
+            .ok_or(EditorDocumentError::CompositionNotActive)?;
+            (
+                replacement,
+                Arc::from(composition.text()),
+                composition.selection_bytes(),
+            )
+        } else if span.contains(&index) {
+            let replacement = TextRange::new(
+                block.range().start(),
+                composition
+                    .replacement_range()
+                    .end()
+                    .min(block.range().end()),
+            )
+            .ok_or(EditorDocumentError::CompositionNotActive)?;
+            (
+                replacement,
+                Arc::<str>::from(""),
+                TextRange::empty(ByteOffset::ZERO),
+            )
+        } else {
+            return Err(EditorDocumentError::CompositionNotActive);
+        };
+        projection
+            .with_composition(replacement, text, selection)
             .map_err(EditorDocumentError::Projection)
     }
 
@@ -352,6 +395,25 @@ impl EditorDocument {
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
         let mut layout = std::mem::take(&mut self.viewport);
         let result = self.measure_visible_blocks_with_shaper(&mut layout, viewport, shaper);
+        self.viewport = layout;
+        result
+    }
+
+    /// Measures the visible window with the active IME overlay projected into
+    /// every affected Markdown block. Canonical viewport heights remain the
+    /// cache/HeightIndex source when no composition is active; transient
+    /// composition heights are applied only to the working viewport state and
+    /// are never inserted into `LayoutCache`.
+    pub fn visible_blocks_with_composition_and_shaper<S: ShapingProvider>(
+        &mut self,
+        viewport: ViewportRect,
+        shaper: &S,
+    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        if self.composition.is_none() {
+            return self.visible_blocks_with_shaper(viewport, shaper);
+        }
+        let mut layout = std::mem::take(&mut self.viewport);
+        let result = self.measure_visible_blocks_with_composition(&mut layout, viewport, shaper);
         self.viewport = layout;
         result
     }
@@ -443,6 +505,68 @@ impl EditorDocument {
                     .lines()
                     .len();
                 let height = config.line_height() * (line_count as f32);
+                changed |= layout
+                    .set_block_height(index, height)
+                    .map_err(EditorDocumentError::Viewport)?;
+            }
+            let next = layout
+                .visible_range(&self.markdown, viewport)
+                .map_err(EditorDocumentError::Viewport)?;
+            if next == range || !changed {
+                break;
+            }
+            range = next;
+        }
+        layout
+            .snapshot(&self.markdown, range)
+            .map_err(EditorDocumentError::Viewport)
+    }
+
+    fn measure_visible_blocks_with_composition<S: ShapingProvider>(
+        &mut self,
+        layout: &mut ViewportLayout,
+        viewport: ViewportRect,
+        shaper: &S,
+    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        layout
+            .set_backend(LayoutBackend::Shaped)
+            .map_err(EditorDocumentError::Viewport)?;
+        let mut range = layout
+            .visible_range(&self.markdown, viewport)
+            .map_err(EditorDocumentError::Viewport)?;
+        let config = layout.config().layout();
+        let composition_span = self.composition_block_range();
+        for _ in 0..8 {
+            let mut changed = false;
+
+            // A transient block may be above the current scroll window. Its
+            // height still contributes to every later document-space y, so
+            // measure the affected span before measuring the visible window.
+            if let Some(span) = composition_span.as_ref() {
+                for index in span.clone() {
+                    let line_count = self
+                        .block_layout_with_composition_and_shaper(index, config, shaper)?
+                        .lines()
+                        .len();
+                    let height = config.line_height() * line_count.max(1) as f32;
+                    changed |= layout
+                        .set_block_height(index, height)
+                        .map_err(EditorDocumentError::Viewport)?;
+                }
+            }
+
+            for index in range.start()..range.end() {
+                if composition_span
+                    .as_ref()
+                    .is_some_and(|span| span.contains(&index))
+                {
+                    continue;
+                }
+                let line_count = self
+                    .block_layout_with_shaper(index, config, shaper)?
+                    .lines()
+                    .len();
+                let height = config.line_height() * line_count.max(1) as f32;
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -2588,6 +2712,56 @@ mod tests {
             .begin_composition(source_range(2, 2), "x", utf16_range(0, 1))
             .expect("composition should begin");
         assert_eq!(document.composition_block_index(), Some(0));
+    }
+
+    #[test]
+    fn cross_block_composition_projects_first_and_clears_following_blocks() {
+        let source = "first **x**\n\nsecond 日本語";
+        let mut document = EditorDocument::new(source);
+        let start = source.find("x").expect("first block target");
+        let end = source.find("日本語").expect("last block target") + "日本".len();
+        document
+            .begin_composition(
+                source_range(start as u64, end as u64),
+                "日本🙂",
+                utf16_range(2, 2),
+            )
+            .expect("cross-block composition should begin");
+
+        let span = document
+            .composition_block_range()
+            .expect("composition should touch blocks");
+        assert!(span.len() >= 2);
+        assert_eq!(document.composition_block_index(), None);
+        let config = LayoutConfig::new(80.0, 1.0);
+        for index in span.clone() {
+            let layout = document
+                .block_layout_with_composition_and_shaper(index, config, &WideShaper)
+                .expect("transient cross-block layout");
+            if index == span.start {
+                assert_eq!(layout.projection().composition_text(), Some("日本🙂"));
+                assert!(layout.glyphs().len() >= 2);
+            } else {
+                assert_eq!(layout.projection().composition_text(), Some(""));
+            }
+        }
+
+        document
+            .set_viewport_config(ViewportConfig::new(config, 1.0, 0.0))
+            .expect("viewport config");
+        let viewport = document
+            .visible_blocks_with_composition_and_shaper(ViewportRect::new(0.0, 12.0), &WideShaper)
+            .expect("transient cross-block viewport");
+        assert_eq!(viewport.revision(), document.revision());
+        assert!(
+            viewport
+                .blocks()
+                .iter()
+                .filter(|block| span.contains(&block.index()))
+                .all(|block| block.height() > 0.0)
+        );
+        assert_eq!(document.snapshot().as_str(), source);
+        assert_eq!(document.revision(), Revision::INITIAL);
     }
 
     #[test]

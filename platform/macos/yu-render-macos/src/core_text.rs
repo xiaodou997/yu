@@ -263,12 +263,20 @@ impl CoreTextViewportFrameBuilder {
         &mut self,
         document: &mut EditorDocument,
     ) -> Result<(), CoreTextViewportFrameError> {
-        let viewport = document.visible_blocks_with_shaper(self.config.viewport(), &self.shaper)?;
+        let viewport = if document.composition().is_some() {
+            document
+                .visible_blocks_with_composition_and_shaper(self.config.viewport(), &self.shaper)?
+        } else {
+            document.visible_blocks_with_shaper(self.config.viewport(), &self.shaper)?
+        };
         let layout_config = document.viewport_config().layout();
         let rasterizer = self.shaper.rasterizer();
-        let composition_block = document.composition_block_index();
+        let composition_blocks = document.composition_block_range();
         for block in viewport.blocks() {
-            let layout = if composition_block == Some(block.index()) {
+            let layout = if composition_blocks
+                .as_ref()
+                .is_some_and(|span| span.contains(&block.index()))
+            {
                 document.block_layout_with_composition_and_shaper(
                     block.index(),
                     layout_config,

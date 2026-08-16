@@ -562,6 +562,36 @@ impl BlockSequence {
         })
     }
 
+    /// Finds the half-open block-index span touched by a source range.
+    ///
+    /// The first block is located with the same boundary rules as
+    /// [`Self::block_index_for_offset`]. Only records through the range end are
+    /// then visited, so the cost is proportional to the affected span rather
+    /// than to the size of the document. This is used by transient IME
+    /// projection, where a marked-text replacement may cross multiple blocks
+    /// but must not make every frame scan the full block sequence.
+    #[must_use]
+    pub fn block_index_range_for_source_range(&self, range: TextRange) -> Option<Range<usize>> {
+        if range.is_empty() {
+            let index = self.block_index_for_offset(range.start())?;
+            return Some(index..index.saturating_add(1));
+        }
+
+        let first = self.block_index_for_offset(range.start())?;
+        let mut end = first;
+        for record in self.resolved_records_from(first) {
+            let block_range = record.block.range();
+            if block_range.start() >= range.end() {
+                break;
+            }
+            end = end.saturating_add(1);
+            if block_range.end() >= range.end() {
+                break;
+            }
+        }
+        (end > first).then_some(first..end)
+    }
+
     pub(crate) fn resolved_records_from(&self, index: usize) -> ResolvedBlockIter<'_> {
         assert!(index <= self.len);
         let mut remaining = index;
