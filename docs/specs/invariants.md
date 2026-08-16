@@ -484,6 +484,10 @@
     capacity 不足不得部分写入。矩形和 caret 是 Rust layout 的 document-space owned scalar，Swift
     只能应用 header 的 scroll transform；active composition 返回 `YU_STORAGE_NO_OVERLAY`，不得把
     transient preedit 当作普通 selection decoration。
+29. visual pointer 的反向拖选不得把 ordered source range 当作完整 selection state；必须通过
+    `yu_storage_session_selection_endpoints` 读取 Rust anchor/focus，并通过
+    `yu_storage_session_set_selection_endpoints` 写回同一 Revision 的方向。AppKit/TextKit 可以只
+    接收 ordered range，但下一次继续拖动或 Shift-click 不得丢失 Rust anchor。
 
 ## CoreText viewport preparation
 

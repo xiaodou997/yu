@@ -187,6 +187,19 @@ pub struct YuStorageSelection {
     pub affinity: u8,
 }
 
+/// Revision-bound selection endpoints. `anchor_utf16` and `focus_utf16`
+/// preserve the direction of a native drag, while `start_utf16`/`end_utf16`
+/// in [`YuStorageSelection`] intentionally remain the ordered range used by
+/// existing TextKit and Accessibility callers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageSelectionEndpoints {
+    pub revision: u64,
+    pub anchor_utf16: u64,
+    pub focus_utf16: u64,
+    pub affinity: u8,
+}
+
 /// Revision-bound source/visual caret mapping for the native projection
 /// adapter. Both positions use UTF-16 units so AppKit can consume the result
 /// without owning a second Markdown parser or coordinate model.
@@ -1055,6 +1068,24 @@ fn selection_from_ffi(
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)
 }
 
+fn selection_endpoints_from_ffi(
+    session: &DocumentEditorSession,
+    anchor_utf16: u64,
+    focus_utf16: u64,
+    affinity: u8,
+) -> Result<yu_editor::EditorSelection, i32> {
+    let affinity = caret_affinity_from_ffi(affinity)?;
+    let snapshot = session.snapshot();
+    let anchor = snapshot
+        .byte_offset_for_utf16(Utf16Offset::new(anchor_utf16))
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let focus = snapshot
+        .byte_offset_for_utf16(Utf16Offset::new(focus_utf16))
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    yu_editor::EditorSelection::range(&snapshot, anchor, focus, affinity)
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)
+}
+
 fn source_range_from_ffi(
     session: &DocumentEditorSession,
     start_utf16: u64,
@@ -1088,6 +1119,42 @@ fn selection_output(session: &DocumentEditorSession, output: *mut YuStorageSelec
             revision: session.revision().get(),
             start_utf16: range.start().get(),
             end_utf16: range.end().get(),
+            affinity: match selection.affinity() {
+                CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+            },
+        };
+    }
+    YU_STORAGE_OK
+}
+
+fn selection_endpoints_output(
+    session: &DocumentEditorSession,
+    output: *mut YuStorageSelectionEndpoints,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let snapshot = session.snapshot();
+    let selection = session.selection();
+    let anchor_utf16 = match snapshot.utf16_offset(selection.anchor()) {
+        Ok(offset) => offset.get(),
+        Err(error) => {
+            return status_from_editor_error(EditorDocumentError::Selection(error.into()));
+        }
+    };
+    let focus_utf16 = match snapshot.utf16_offset(selection.focus()) {
+        Ok(offset) => offset.get(),
+        Err(error) => {
+            return status_from_editor_error(EditorDocumentError::Selection(error.into()));
+        }
+    };
+    // SAFETY: output is checked above and belongs to the caller.
+    unsafe {
+        *output = YuStorageSelectionEndpoints {
+            revision: session.revision().get(),
+            anchor_utf16,
+            focus_utf16,
             affinity: match selection.affinity() {
                 CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
                 CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
@@ -1879,6 +1946,23 @@ pub unsafe extern "C" fn yu_storage_session_selection(
     selection_output(&session.session, output)
 }
 
+/// Returns the current selection's anchor/focus endpoints without losing
+/// backward-drag direction. The ordered range remains available through
+/// `yu_storage_session_selection` for callers that do not need direction.
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_selection_endpoints(
+    session: *const YuStorageSession,
+    output: *mut YuStorageSelectionEndpoints,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    selection_endpoints_output(&session.session, output)
+}
+
 /// # Safety
 ///
 /// `session` must be a live handle. The expected revision and UTF-16 range
@@ -1901,6 +1985,38 @@ pub unsafe extern "C" fn yu_storage_session_set_selection(
         Ok(selection) => selection,
         Err(status) => return status,
     };
+    session
+        .session
+        .set_selection(selection)
+        .map_or_else(storage_status, |_| YU_STORAGE_OK)
+}
+
+/// Sets a revision-bound selection while preserving anchor/focus direction.
+/// This is used by shaped visual pointer drags; ordinary native selection
+/// synchronization can continue using the ordered-range entry point above.
+///
+/// # Safety
+/// `session` must be live. All UTF-16 offsets must belong to the expected
+/// source revision and `affinity` must be a known value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_selection_endpoints(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    anchor_utf16: u64,
+    focus_utf16: u64,
+    affinity: u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let selection =
+        match selection_endpoints_from_ffi(&session.session, anchor_utf16, focus_utf16, affinity) {
+            Ok(selection) => selection,
+            Err(status) => return status,
+        };
     session
         .session
         .set_selection(selection)
@@ -6467,6 +6583,72 @@ mod tests {
             String::from_utf8(source).expect("UTF-8 source"),
             "# 羽\n日本語 🙂\n"
         );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_selection_endpoints_preserve_visual_drag_direction() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-selection-endpoints-{id}.md"));
+        let source = "alpha 日本語";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let end = source.encode_utf16().count() as u64;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    end,
+                    0,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut endpoints = YuStorageSelectionEndpoints::default();
+        assert_eq!(
+            unsafe { yu_storage_session_selection_endpoints(raw, &mut endpoints) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(endpoints.revision, 0);
+        assert_eq!(endpoints.anchor_utf16, end);
+        assert_eq!(endpoints.focus_utf16, 0);
+        assert_eq!(endpoints.affinity, YU_STORAGE_CARET_AFFINITY_UPSTREAM);
+
+        let mut ordered = YuStorageSelection::default();
+        assert_eq!(
+            unsafe { yu_storage_session_selection(raw, &mut ordered) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(ordered.start_utf16, 0);
+        assert_eq!(ordered.end_utf16, end);
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_set_selection_endpoints(raw, 0, end, 0, 0) },
+            YU_STORAGE_STALE_REVISION
+        );
+        endpoints = YuStorageSelectionEndpoints {
+            revision: 99,
+            ..YuStorageSelectionEndpoints::default()
+        };
+        assert_eq!(
+            unsafe { yu_storage_session_selection_endpoints(raw, &mut endpoints) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(endpoints.revision, 1);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
