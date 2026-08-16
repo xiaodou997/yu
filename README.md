@@ -217,6 +217,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS projected selection and caret reveal](docs/adr/0127-macos-visual-selection-and-caret-reveal.md)
 - [macOS shaped vertical editor command](docs/adr/0128-macos-shaped-vertical-command.md)
 - [macOS CoreText-shaped pointer hit-test](docs/adr/0129-macos-shaped-pointer-hit-test.md)
+- [macOS visual IME shaped caret geometry](docs/adr/0130-macos-visual-ime-shaped-caret.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)

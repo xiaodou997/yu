@@ -995,6 +995,42 @@ private struct NativeCompositionCaret {
     }
 }
 
+private struct NativeCompositionShapedCaret {
+    let revision: UInt64
+    let generation: UInt64
+    let sourceUTF16: UInt64
+    let blockIndex: UInt64
+    let visualUTF16: UInt64
+    let roundTripSourceUTF16: UInt64
+    let lineIndex: UInt64
+    let point: CGPoint
+    let size: CGSize
+    let visualSelection: NSRange
+    let visualReplacement: NSRange
+    let affinity: UInt8
+
+    init(_ value: YuStorageCompositionShapedCaret) {
+        revision = value.revision
+        generation = value.generation
+        sourceUTF16 = value.source_utf16
+        blockIndex = value.block_index
+        visualUTF16 = value.visual_utf16
+        roundTripSourceUTF16 = value.round_trip_source_utf16
+        lineIndex = value.line_index
+        point = CGPoint(x: CGFloat(value.caret_x), y: CGFloat(value.caret_y))
+        size = CGSize(width: CGFloat(value.caret_width), height: CGFloat(value.caret_height))
+        visualSelection = NSRange(
+            location: Int(value.visual_selection_start_utf16),
+            length: Int(value.visual_selection_end_utf16 - value.visual_selection_start_utf16)
+        )
+        visualReplacement = NSRange(
+            location: Int(value.visual_replacement_start_utf16),
+            length: Int(value.visual_replacement_end_utf16 - value.visual_replacement_start_utf16)
+        )
+        affinity = value.affinity
+    }
+}
+
 private struct NativeCommandResult {
     let revision: UInt64
     let selection: NSRange
@@ -2004,6 +2040,31 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeCompositionCaret(value)
+    }
+
+    func macosCompositionShapedCaret(
+        revision: UInt64,
+        generation: UInt64,
+        sourceUTF16: UInt64,
+        affinity: UInt8,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NativeCompositionShapedCaret {
+        var value = YuStorageCompositionShapedCaret()
+        let status = yu_storage_session_macos_composition_shaped_caret(
+            handle,
+            revision,
+            generation,
+            sourceUTF16,
+            affinity,
+            size,
+            maxWidth,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeCompositionShapedCaret(value)
     }
 
     func copySourceRange(_ range: NSRange, revision: UInt64) -> String {
@@ -4952,6 +5013,21 @@ private func runVisualIMESelfCheck(path: String) -> Never {
         let bridge = try StorageBridge(path: path)
         let sourceBefore = bridge.source
         let revision = bridge.state.revision
+        let shapedSize: Float = 14.0
+        let shapedWidth: Float = 500.0
+        let metrics = try bridge.macosFontMetrics(
+            revision: revision,
+            size: shapedSize,
+            maxWidth: shapedWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: shapedWidth,
+            lineHeight: Float(metrics.lineHeight),
+            defaultAdvance: Float(metrics.defaultAdvance),
+            estimatedBlockHeight: Float(metrics.lineHeight),
+            overscan: 0.0
+        )
         let textView = DocumentTextView(bridge: bridge)
         try textView.setVisualMirrorEnabledForSelfCheck(true)
 
@@ -4984,6 +5060,22 @@ private func runVisualIMESelfCheck(path: String) -> Never {
         precondition(textView.visualMarkedRangeForSelfCheck() == initial.visualReplacementRange)
         precondition(textView.markedRange() == initial.visualReplacementRange)
         precondition(textView.hasMarkedText())
+        let initialShapedCaret = try bridge.macosCompositionShapedCaret(
+            revision: initial.revision,
+            generation: initial.generation,
+            sourceUTF16: UInt64(replacement.location),
+            affinity: 1,
+            size: shapedSize,
+            maxWidth: shapedWidth
+        )
+        precondition(initialShapedCaret.revision == revision)
+        precondition(initialShapedCaret.generation == initial.generation)
+        precondition(initialShapedCaret.sourceUTF16 == UInt64(replacement.location))
+        precondition(initialShapedCaret.visualSelection == initial.visualSelection)
+        precondition(initialShapedCaret.visualReplacement == initial.visualReplacementRange)
+        precondition(initialShapedCaret.point.x.isFinite)
+        precondition(initialShapedCaret.point.y.isFinite)
+        precondition(initialShapedCaret.size.height > 0.0)
         var actualRange = NSRange(location: NSNotFound, length: 0)
         let marked = textView.attributedSubstring(
             forProposedRange: initial.visualReplacementRange,
@@ -5007,12 +5099,38 @@ private func runVisualIMESelfCheck(path: String) -> Never {
         precondition(textView.visualMirrorStringForSelfCheck() == updatedProjected)
         precondition(textView.markedRange() == updated.visualReplacementRange)
         precondition(updated.visualReplacementRange.length == "日本語".utf16.count)
+        let updatedShapedCaret = try bridge.macosCompositionShapedCaret(
+            revision: updated.revision,
+            generation: updated.generation,
+            sourceUTF16: UInt64(replacement.location),
+            affinity: 1,
+            size: shapedSize,
+            maxWidth: shapedWidth
+        )
+        precondition(updatedShapedCaret.generation == updated.generation)
+        precondition(updatedShapedCaret.visualSelection == updated.visualSelection)
+        precondition(updatedShapedCaret.visualReplacement == updated.visualReplacementRange)
+        precondition(updatedShapedCaret.point.x.isFinite)
+        precondition(updatedShapedCaret.point.y.isFinite)
         do {
             _ = try bridge.copyCompositionProjection(
                 revision: revision,
                 generation: initial.generation
             )
             preconditionFailure("stale visual composition unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 16)
+        }
+        do {
+            _ = try bridge.macosCompositionShapedCaret(
+                revision: revision,
+                generation: initial.generation,
+                sourceUTF16: UInt64(replacement.location),
+                affinity: 1,
+                size: shapedSize,
+                maxWidth: shapedWidth
+            )
+            preconditionFailure("stale shaped composition caret unexpectedly succeeded")
         } catch BridgeError.operation(let status) {
             precondition(status == 16)
         }

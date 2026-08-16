@@ -407,7 +407,12 @@ max-width/line-height/default-advance；point 与 snapped caret 均为 document-
 和 generation-bound projected preedit，并让 `markedRange`/`attributedSubstring` 读取 visual
 坐标；metadata、文本和 callback 必须匹配同一 Revision + generation，过期时清空 visual mirror
 并保留 source mirror 回退。该路径仍不替换生产 IME renderer，visual preedit 会继续沿用
-Revision + composition generation 协议。
+Revision + composition generation 协议。现在同一 storage handle 还提供
+`yu_storage_session_macos_composition_shaped_caret`：它对活动 preedit 构建未缓存的 CoreText
+shaped block layout，返回 block-local caret point/line-height，以及 full projected UTF-16 的
+selection/replacement range；Swift visual IME self-check 会同时验证 geometry 与 generation，旧
+generation 不得发布。该 endpoint 仍是 shaped geometry handoff，尚未让 Metal surface 绘制
+preedit glyph。
 
 storage FFI 现在还提供 parser-owned block 的 `yu_storage_session_block_layout`，以及 macOS
 `yu_storage_session_macos_block_layout`/`yu_storage_session_macos_block_caret`。前者使用显式

@@ -36,7 +36,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 生产 visual view 的 projected selection highlight 与同一 Revision 的 shaped caret reveal
 - [x] 生产 Up/Down/Shift-Up/Shift-Down 使用当前 CoreText metrics/shaper 的 Revision-bound command
 - [x] 生产 pointer adapter 使用同一 CoreText-shaped Rust block layout 命中 visual boundary；TextKit 只保留输入/IME/AX/矩形回退
-- [ ] visual IME preedit 的 shaped Metal 回归与最终 renderer 迁移
+- [x] visual IME active caret 使用 Revision + composition generation-bound CoreText shaped block geometry
+- [ ] visual IME preedit 的 shaped Metal 绘制与最终 renderer 迁移
 
 ## Track C：Scene and rendering
 

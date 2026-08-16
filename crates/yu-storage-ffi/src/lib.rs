@@ -303,6 +303,32 @@ pub struct YuStorageCompositionCaret {
     pub affinity: u8,
 }
 
+/// Revision- and composition-generation-bound CoreText-shaped caret geometry
+/// for the active marked-text projection. Coordinates are local to the
+/// parser-owned block; visual UTF-16 ranges remain in the full projected
+/// stream so a native host can pair geometry with its existing projection
+/// metadata without reparsing Markdown.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageCompositionShapedCaret {
+    pub revision: u64,
+    pub generation: u64,
+    pub source_utf16: u64,
+    pub block_index: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub line_index: u64,
+    pub caret_x: f32,
+    pub caret_y: f32,
+    pub caret_width: f32,
+    pub caret_height: f32,
+    pub visual_selection_start_utf16: u64,
+    pub visual_selection_end_utf16: u64,
+    pub visual_replacement_start_utf16: u64,
+    pub visual_replacement_end_utf16: u64,
+    pub affinity: u8,
+}
+
 /// Revision-bound metadata for one parser-owned block projection. The visual
 /// bytes are returned by the companion query; lengths are included here so a
 /// native host can validate its allocation and its UTF-16 layout without
@@ -3109,6 +3135,204 @@ pub unsafe extern "C" fn yu_storage_session_composition_caret(
         };
     }
     YU_STORAGE_OK
+}
+
+/// Resolves the active marked-text caret through an uncached CoreText-shaped
+/// composition layout. Canonical source and Revision remain unchanged; the
+/// expected generation guards the transient preedit. Caret geometry is local
+/// to the owning parser block, while visual UTF-16 ranges use the full
+/// transient projected stream.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_composition_shaped_caret(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    source_utf16: u64,
+    affinity: u8,
+    size: f32,
+    max_width: f32,
+    output: *mut YuStorageCompositionShapedCaret,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageCompositionShapedCaret::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            expected_generation,
+            source_utf16,
+            affinity,
+            size,
+            max_width,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) =
+            validate_composition(&session.session, expected_revision, expected_generation)
+        {
+            return status;
+        }
+        let affinity = match caret_affinity_from_ffi(affinity) {
+            Ok(affinity) => affinity,
+            Err(status) => return status,
+        };
+        if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
+            return YU_STORAGE_EDITOR_ERROR;
+        }
+        let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        let viewport_config = session.session.viewport_config();
+        let published = viewport_config.layout();
+        if (published.max_width() - max_width).abs() > 0.05
+            || (published.line_height() - metrics.line_height()).abs() > 0.05
+            || (published.default_advance() - metrics.default_advance()).abs() > 0.05
+        {
+            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        }
+
+        let snapshot = session.session.snapshot();
+        if snapshot
+            .byte_offset_for_utf16(Utf16Offset::new(source_utf16))
+            .is_err()
+        {
+            return YU_STORAGE_INVALID_SELECTION;
+        }
+        let (replacement, selection_start_utf16, selection_end_utf16) = {
+            let Some(overlay) = session.session.composition() else {
+                return YU_STORAGE_NO_OVERLAY;
+            };
+            (
+                overlay.replacement_range(),
+                overlay.selection_utf16().start().get(),
+                overlay.selection_utf16().end().get(),
+            )
+        };
+        let Some(block_index) = session
+            .session
+            .document()
+            .editor()
+            .block_index_for_source(replacement.start())
+        else {
+            return YU_STORAGE_INVALID_SELECTION;
+        };
+        let full_projection = match composition_projection(&mut session.session) {
+            Ok(projection) => projection,
+            Err(status) => return status,
+        };
+        let layout = match session
+            .session
+            .document_mut()
+            .editor_mut()
+            .block_layout_with_composition_and_shaper(block_index, layout_config, &shaper)
+        {
+            Ok(layout) => layout,
+            Err(error) => return status_from_editor_error(error),
+        };
+        if layout.lines().is_empty() {
+            return YU_STORAGE_INVALID_SELECTION;
+        }
+        let (block_visual, block_bias) = match composition_active_visual_caret(
+            layout.projection(),
+            selection_start_utf16,
+            selection_end_utf16,
+        ) {
+            Ok(caret) => caret,
+            Err(status) => return status,
+        };
+        let caret = match layout.caret_for_visual(block_visual, block_bias) {
+            Ok(caret) => caret,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let (active_visual, active_bias) = match composition_active_visual_caret(
+            &full_projection,
+            selection_start_utf16,
+            selection_end_utf16,
+        ) {
+            Ok(caret) => caret,
+            Err(status) => return status,
+        };
+        let full_projected = match projected_utf8(&full_projection) {
+            Ok(projected) => projected,
+            Err(status) => return status,
+        };
+        let visual_utf16 = match visual_utf16_offset(&full_projected, active_visual) {
+            Ok(offset) => offset,
+            Err(status) => return status,
+        };
+        let round_trip_source = match full_projection.visual_to_source(active_visual, active_bias) {
+            Ok(offset) => offset,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip_source) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let (visual_selection_start_utf16, visual_selection_end_utf16) =
+            match composition_visual_selection_utf16(&full_projection, &full_projected) {
+                Ok(selection) => selection,
+                Err(status) => return status,
+            };
+        let (visual_replacement_start_utf16, visual_replacement_end_utf16) =
+            match composition_visual_replacement_utf16(&full_projection, &full_projected) {
+                Ok(replacement) => replacement,
+                Err(status) => return status,
+            };
+        let point = caret.point();
+        let line_height = metrics.line_height();
+        if !point.x().is_finite()
+            || !point.y().is_finite()
+            || !line_height.is_finite()
+            || line_height <= 0.0
+        {
+            return YU_STORAGE_EDITOR_ERROR;
+        }
+        let block_index = match u64::try_from(block_index) {
+            Ok(index) => index,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let line_index = match u64::try_from(caret.line()) {
+            Ok(index) => index,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuStorageCompositionShapedCaret {
+                revision: snapshot.revision().get(),
+                generation: session.session.composition_generation(),
+                source_utf16,
+                block_index,
+                visual_utf16,
+                round_trip_source_utf16,
+                line_index,
+                caret_x: point.x(),
+                caret_y: point.y(),
+                caret_width: 0.0,
+                caret_height: line_height,
+                visual_selection_start_utf16,
+                visual_selection_end_utf16,
+                visual_replacement_start_utf16,
+                visual_replacement_end_utf16,
+                affinity: affinity_to_ffi(affinity),
+            };
+        }
+        YU_STORAGE_OK
+    }
 }
 
 /// Returns the number of parser-owned blocks in the expected source revision.
@@ -7491,6 +7715,111 @@ mod tests {
             unsafe { yu_storage_session_composition_projection(raw, 0, &mut updated) },
             YU_STORAGE_NO_OVERLAY
         );
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_composition_shaped_caret_is_generation_bound() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yu-storage-ffi-composition-shaped-caret-{id}.md"));
+        let source = "before **x** after";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_begin_composition(
+                    raw,
+                    0,
+                    9,
+                    10,
+                    "日本🙂".as_ptr(),
+                    "日本🙂".len(),
+                    2,
+                    4,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut metrics = YuStorageMacosFontMetrics::default();
+        assert_eq!(
+            unsafe { yu_storage_session_macos_font_metrics(raw, 0, 14.0, 500.0, &mut metrics) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height,
+                    metrics.default_advance,
+                    metrics.line_height,
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut caret = YuStorageCompositionShapedCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_composition_shaped_caret(
+                    raw,
+                    0,
+                    1,
+                    9,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    14.0,
+                    500.0,
+                    &mut caret,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(caret.revision, 0);
+        assert_eq!(caret.generation, 1);
+        assert_eq!(caret.source_utf16, 9);
+        assert_eq!(caret.block_index, 0);
+        assert_eq!(caret.visual_utf16, 11);
+        assert_eq!(caret.round_trip_source_utf16, 10);
+        assert_eq!(caret.visual_selection_start_utf16, 9);
+        assert_eq!(caret.visual_selection_end_utf16, 11);
+        assert_eq!(caret.visual_replacement_start_utf16, 7);
+        assert_eq!(caret.visual_replacement_end_utf16, 11);
+        assert!(caret.caret_x.is_finite());
+        assert!(caret.caret_y.is_finite());
+        assert!(caret.caret_height > 0.0);
+
+        let mut updated = YuStorageCompositionShapedCaret {
+            revision: 99,
+            ..YuStorageCompositionShapedCaret::default()
+        };
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_composition_shaped_caret(
+                    raw,
+                    0,
+                    2,
+                    9,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    14.0,
+                    500.0,
+                    &mut updated,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+        assert_eq!(updated, YuStorageCompositionShapedCaret::default());
+
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }

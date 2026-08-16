@@ -253,6 +253,14 @@
     viewport 不匹配、空 block、CoreText/layout 失败和非 macOS unavailable 必须拒绝，Swift 不得
     复制 block HeightIndex、重建 glyph advance 或继续使用旧命中结果。
 
+50. `yu_storage_session_macos_composition_shaped_caret` 必须同时验证 expected Revision 与
+    composition generation、canonical source UTF-16 boundary、CoreText size/width 和已发布
+    viewport metrics；它只能从未缓存的 transient composition block layout 返回 block-local
+    caret geometry，并将 visual selection/replacement 作为同一 full projected stream 的 UTF-16
+    range。旧 generation、stale Revision、无 overlay、surrogate split、layout/CoreText 失败和
+    non-macOS unavailable 必须先清空 output 再拒绝；该 geometry 不得推进 source Revision、history
+    或把 preedit 写入 canonical source。
+
 ## Accessibility
 
 1. 原生 Accessibility 文本 range 使用 UTF-16，并绑定一个明确的 Revision。
