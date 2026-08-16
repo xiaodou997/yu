@@ -114,6 +114,11 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 原点并检查 source/visual round-trip；stale Revision 必须拒绝。生产 TextKit mirror 仍只负责
 输入、IME、Accessibility、caret/selection 矩形和 source hit-test 回退。
 
+`--visual-ime-self-check` 还会在同一 visual IME composition 生命周期中调用
+`yu_storage_session_macos_composition_shaped_caret`，检查 CoreText block-local caret、visual
+selection/replacement range、Revision + generation 绑定，以及旧 generation 的拒绝。当前
+Metal surface 仍不直接绘制 preedit glyph，TextKit 继续作为输入宿主。
+
 验证 TextKit 过渡镜像接收 Rust projected UTF-8，并通过 Rust reverse mapping 完成 visual/source
 selection、caret 双向 round-trip 与 stale Revision 拒绝（不启动窗口）：
 

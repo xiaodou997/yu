@@ -262,6 +262,28 @@ typedef struct YuStorageCompositionCaret {
     uint8_t affinity;
 } YuStorageCompositionCaret;
 
+/* Revision/generation-bound CoreText-shaped caret geometry for the active
+ * marked-text projection. caret_x/caret_y are local to block_index; visual
+ * UTF-16 ranges remain in the full transient projected stream. */
+typedef struct YuStorageCompositionShapedCaret {
+    uint64_t revision;
+    uint64_t generation;
+    uint64_t source_utf16;
+    uint64_t block_index;
+    uint64_t visual_utf16;
+    uint64_t round_trip_source_utf16;
+    uint64_t line_index;
+    float caret_x;
+    float caret_y;
+    float caret_width;
+    float caret_height;
+    uint64_t visual_selection_start_utf16;
+    uint64_t visual_selection_end_utf16;
+    uint64_t visual_replacement_start_utf16;
+    uint64_t visual_replacement_end_utf16;
+    uint8_t affinity;
+} YuStorageCompositionShapedCaret;
+
 typedef struct YuStorageProjectionBlock {
     uint64_t revision;
     uint64_t block_index;
@@ -640,6 +662,10 @@ int32_t yu_storage_session_composition_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t expected_generation, uint64_t source_utf16, uint8_t affinity,
     YuStorageCompositionCaret *output);
+int32_t yu_storage_session_macos_composition_shaped_caret(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t expected_generation, uint64_t source_utf16, uint8_t affinity,
+    float size, float max_width, YuStorageCompositionShapedCaret *output);
 int32_t yu_storage_session_projection_block_count(
     const YuStorageSession *session, uint64_t expected_revision,
     size_t *output);
