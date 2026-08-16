@@ -420,11 +420,17 @@
 21. `yu_storage_session_macos_render_host_surface_submit` 只能在 AppKit main thread 接收调用方仍然
     有效的 `NSView`，并严格按 `MetalSurface attachment → current Revision frame publication →
     atlas staging → render_plan/drawable submit → consumer commit` 顺序执行；surface、renderer、
-    atlas、target、attachment 和 queue 都是同步 backend-owned 临时资源，不能写入 `YuStorageSession`
-    或跨 ABI 返回。stale Revision、无 drawable、drawable 尺寸不匹配、atlas/native 失败都必须返回
-    错误且不写入 `submitted=1`；成功结果只能包含 owned scalar。该 diagnostic bridge 当前只支持
-    新建 surface generation 0，后续 persistent native view adapter 才能接管 resize/generation。
-22. `yu-font-macos::FaceTable` 的 numeric `FontFaceId` 必须在同一进程内的 CoreText shaper/rasterizer
+    atlas、target、attachment 和 queue 都是 Rust/backend-owned 状态，只能留在
+    `YuStorageSession` 的 opt-in adapter 中，不能跨 ABI 返回。stale Revision、无 drawable、drawable
+    尺寸不匹配、atlas/native 失败都必须返回错误且不写入 `submitted=1`；成功结果只能包含 owned
+    scalar。首次创建 surface generation 必须为 0；同一 adapter 后续只能通过受控 resize 单调推进
+    generation。
+22. `MacosPersistentSurfaceState` 复用同一 view 的 `MetalSurface`、`MetalFrameRenderer`、`MetalAtlas`
+    和 target；相同 Revision 的重复 submit 不得重新上传未变化 page，surface config/scale 变化必须
+    通过 `MetalSurface::resize` 单调推进 generation，并在 host submit 前同步该 generation。view
+    identity 变化必须先显式 detach；owned attachment 的 `Drop` 必须先恢复 view backing layer，再
+    释放 surface。detach/close 不得留下 native layer、GPU handle 或 host submission。
+23. `yu-font-macos::FaceTable` 的 numeric `FontFaceId` 必须在同一进程内的 CoreText shaper/rasterizer
     实例之间保持稳定；layout cache 可以把 face id 交给后续新建的 rasterizer，不能依赖清空 layout
     state 来修复 shaper identity。Face catalog 只保存 Rust-owned PostScript name metadata，不得
     把 `CTFontRef` 或 native pointer 写入 shared editor/layout state。

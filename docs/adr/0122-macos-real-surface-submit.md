@@ -2,7 +2,8 @@
 
 ## 状态
 
-已接受（Phase 3 Track C，macOS 诊断/opt-in 边界；生产窗口仍保留 source TextKit mirror）。
+已接受（Phase 3 Track C，macOS 诊断/opt-in 边界；生产窗口仍保留 source TextKit mirror；
+持久 surface adapter 的后续扩展见 ADR 0123）。
 
 ## 背景
 
@@ -13,6 +14,9 @@ glyph metadata 暴露给 native，但 document host 仍没有从 Swift/AppKit �
 真实调用边界。
 
 ## 决策
+
+本 ADR 固定首个真实 surface submit 的 ABI 和提交顺序；资源从同步临时对象扩展为 persistent
+adapter 的规则见 ADR 0123。
 
 - 新增 `yu_storage_session_macos_render_host_surface_submit`。Swift 传入一个当前 AppKit main
   thread 的 `NSView` 指针和 surface 尺寸；Rust 在同步调用内创建 `MetalDevice`、`MetalSurface`、
@@ -32,11 +36,11 @@ glyph metadata 暴露给 native，但 document host 仍没有从 Swift/AppKit �
 
 ## 结果
 
-现在可以从 document-host 的 Rust FFI 边界实测真实 `CAMetalLayer` attachment、atlas upload、
-drawable acquisition、retained target blit、present/commit 和 stale Revision rejection。生产
-窗口仍没有第二套 visual document model，也没有改变 IME、复制粘贴、Accessibility 或 source
-TextKit mirror。下一步应把 surface/renderer/atlas 从同步 self-check 提升为由产品窗口拥有的
-persistent native view adapter，并覆盖 resize、scroll、drawable unavailable 与 close 生命周期。
+现在可以从 document-host 的 Rust FFI 边界实测首次真实 `CAMetalLayer` attachment、atlas upload、
+drawable acquisition、retained target blit、present/commit 和 stale Revision rejection。这个
+初始版本故意把 surface/renderer/atlas 限定在同步调用范围内；持久化、resize/generation 和显式
+detach 由 ADR 0123 扩展。生产窗口仍没有第二套 visual document model，也没有改变 IME、复制粘贴、
+Accessibility 或 source TextKit mirror。
 
 ## 验证
 

@@ -46,7 +46,8 @@ use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
 #[cfg(target_os = "macos")]
 use yu_render_macos::{
     CoreTextViewportFrameBuilder, CoreTextViewportFrameError, MetalAtlas, MetalDevice,
-    MetalFrameRenderer, MetalSurface, MetalSurfaceConfig, MetalUploader, MetalViewportHostSession,
+    MetalFrameRenderer, MetalSurface, MetalSurfaceConfig, MetalUploader, MetalViewAttachmentOwned,
+    MetalViewportHostSession,
 };
 
 pub const YU_STORAGE_OK: i32 = 0;
@@ -709,6 +710,28 @@ struct MacosRenderHostState {
     builder: CoreTextViewportFrameBuilder,
     host: MetalViewportHostSession,
     size: f32,
+    surface: Option<MacosPersistentSurfaceState>,
+}
+
+#[cfg(target_os = "macos")]
+struct MacosPersistentSurfaceState {
+    surface: MetalSurface,
+    attachment: Option<MetalViewAttachmentOwned>,
+    renderer: MetalFrameRenderer,
+    uploader: MetalUploader,
+    atlas: MetalAtlas,
+    view: std::ptr::NonNull<c_void>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosPersistentSurfaceState {
+    fn drop(&mut self) {
+        // `MetalViewAttachmentOwned` must detach while the surface's native
+        // layer is still retained. The explicit take keeps release ordering
+        // deterministic; callers still explicitly detach on AppKit main thread
+        // when the view/window is closing.
+        self.attachment.take();
+    }
 }
 
 #[repr(C)]
@@ -3642,16 +3665,27 @@ fn macos_render_host_frame(
         return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
     }
     if rebuild {
-        let builder = CoreTextViewportFrameBuilder::with_shaper(
+        let initial_serial = session
+            .macos_render_host
+            .as_ref()
+            .and_then(|state| state.builder.last_publication())
+            .map_or(0, |publication| publication.serial());
+        let builder = CoreTextViewportFrameBuilder::with_shaper_and_initial_serial(
             shaper.ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
             config,
             GlyphAtlasConfig::default(),
+            initial_serial,
         )
         .map_err(|error| macos_render_host_error_status(&error))?;
+        let surface = session
+            .macos_render_host
+            .take()
+            .and_then(|state| state.surface);
         session.macos_render_host = Some(MacosRenderHostState {
             builder,
             host: MetalViewportHostSession::new(revision, surface_generation),
             size,
+            surface,
         });
     }
 
@@ -3683,6 +3717,58 @@ fn macos_render_host_frame(
         .accept_publication(publication)
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     macos_render_host_snapshot(state)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_render_host_surface_prepare(
+    session: &mut YuStorageSession,
+    view: std::ptr::NonNull<c_void>,
+    surface_width: f64,
+    surface_height: f64,
+    scale: f64,
+) -> Result<u64, i32> {
+    let config = MetalSurfaceConfig::new(surface_width, surface_height, scale)
+        .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    let state = session
+        .macos_render_host
+        .as_mut()
+        .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    if let Some(surface) = state.surface.as_mut() {
+        if surface.view != view {
+            return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+        }
+        if surface.surface.config() != config {
+            surface
+                .surface
+                .resize(config)
+                .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+        }
+        return Ok(surface.surface.generation());
+    }
+
+    let device = MetalDevice::system_default().map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    let surface = MetalSurface::new(device.clone(), config)
+        .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    // SAFETY: the caller has validated that this is a live AppKit view on the
+    // main thread, and the adapter explicitly drops the attachment first.
+    let attachment = unsafe { surface.attach_to_view_owned(view) }
+        .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    let renderer = match MetalFrameRenderer::new(device.clone()) {
+        Ok(renderer) => renderer,
+        Err(_) => {
+            drop(attachment);
+            return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+        }
+    };
+    state.surface = Some(MacosPersistentSurfaceState {
+        surface,
+        attachment: Some(attachment),
+        renderer,
+        uploader: MetalUploader::new(device.clone()),
+        atlas: MetalAtlas::new(),
+        view,
+    });
+    Ok(0)
 }
 
 #[cfg(target_os = "macos")]
@@ -4195,14 +4281,17 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
 /// Submits the persistent host publication to a real AppKit-backed
 /// `CAMetalLayer`. This is an opt-in diagnostic bridge for the native shell;
 /// the caller supplies an existing `NSView` pointer and must invoke the
-/// synchronous call on the AppKit main thread. Rust creates the backend-owned
-/// surface/renderer for this call, while the CoreText publication and host
-/// Revision remain persistent on the storage session.
+/// synchronous call on the AppKit main thread. Rust lazily creates and then
+/// retains the backend-owned surface/renderer/atlas for the same view, while
+/// the CoreText publication and host Revision remain persistent on the storage
+/// session.
 ///
-/// The surface starts at generation zero. A future persistent native view
-/// adapter will own resize generations and reuse the GPU atlas across calls;
-/// this bridge deliberately proves the first real submit without switching the
-/// production TextKit mirror.
+/// The first surface starts at generation zero. A changed surface config
+/// resizes that same layer, advances its generation, and lets the host session
+/// force the next frame through a full clear. Call
+/// `yu_storage_session_macos_render_host_surface_detach` on the AppKit main
+/// thread when the view is closing. This bridge remains opt-in and does not
+/// switch the production TextKit mirror.
 ///
 /// # Safety
 /// `session` must be a live handle, `view` must be a valid main-thread-owned
@@ -4252,26 +4341,29 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
     {
         use std::ptr::NonNull;
 
-        let device = match MetalDevice::system_default() {
-            Ok(device) => device,
-            Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
-        };
-        let surface_config = match MetalSurfaceConfig::new(surface_width, surface_height, scale) {
-            Ok(config) => config,
-            Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
-        };
-        let surface = match MetalSurface::new(device.clone(), surface_config) {
-            Ok(surface) => surface,
-            Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
-        };
         let Some(view) = NonNull::new(view) else {
             return YU_STORAGE_NULL_POINTER;
         };
-        // SAFETY: the caller guarantees a live AppKit NSView on the main
-        // thread for this synchronous bridge call.
-        let attachment = match unsafe { surface.attach_to_view(view) } {
-            Ok(attachment) => attachment,
-            Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+        if let Err(status) = validate_revision(&session.session, expected_revision) {
+            return status;
+        }
+        let has_surface = session
+            .macos_render_host
+            .as_ref()
+            .is_some_and(|state| state.surface.is_some());
+        let surface_generation = if has_surface {
+            match macos_render_host_surface_prepare(
+                session,
+                view,
+                surface_width,
+                surface_height,
+                scale,
+            ) {
+                Ok(generation) => generation,
+                Err(status) => return status,
+            }
+        } else {
+            0
         };
         let host_snapshot = match macos_render_host_frame(
             session,
@@ -4280,39 +4372,42 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             max_width,
             scroll_y,
             viewport_height,
-            0,
+            surface_generation,
         ) {
             Ok(snapshot) => snapshot,
-            Err(status) => {
-                drop(attachment);
-                return status;
-            }
+            Err(status) => return status,
         };
-        let mut renderer = match MetalFrameRenderer::new(device.clone()) {
-            Ok(renderer) => renderer,
-            Err(_) => {
-                drop(attachment);
-                return YU_STORAGE_RENDER_HOST_UNAVAILABLE;
-            }
-        };
-        let mut uploader = MetalUploader::new(device);
-        let mut atlas = MetalAtlas::new();
+        let surface_missing_after_frame = session
+            .macos_render_host
+            .as_ref()
+            .is_none_or(|state| state.surface.is_none());
+        if surface_missing_after_frame
+            && let Err(status) = macos_render_host_surface_prepare(
+                session,
+                view,
+                surface_width,
+                surface_height,
+                scale,
+            )
+        {
+            return status;
+        }
         let state = match session.macos_render_host.as_mut() {
             Some(state) => state,
-            None => {
-                drop(attachment);
-                return YU_STORAGE_RENDER_HOST_UNAVAILABLE;
-            }
+            None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
         };
-        let submission = match state
-            .host
-            .submit(&mut renderer, &surface, &mut uploader, &mut atlas)
-        {
+        let surface_state = match state.surface.as_mut() {
+            Some(surface) => surface,
+            None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+        };
+        let submission = match state.host.submit(
+            &mut surface_state.renderer,
+            &surface_state.surface,
+            &mut surface_state.uploader,
+            &mut surface_state.atlas,
+        ) {
             Ok(submission) => submission,
-            Err(_) => {
-                drop(attachment);
-                return YU_STORAGE_RENDER_HOST_UNAVAILABLE;
-            }
+            Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
         };
         // SAFETY: `snapshot` is a caller-owned output pointer checked above.
         unsafe {
@@ -4327,9 +4422,28 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 submitted: 1,
             };
         }
-        drop(attachment);
         YU_STORAGE_OK
     }
+}
+
+/// Detaches and releases the persistent native surface adapter, if one is
+/// attached. The call must run on the AppKit main thread so the owned view
+/// attachment can restore the previous backing layer safely. It is idempotent.
+///
+/// # Safety
+/// `session` must be null or a live storage handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
+    session: *mut YuStorageSession,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    #[cfg(target_os = "macos")]
+    if let Some(state) = session.macos_render_host.as_mut() {
+        state.surface.take();
+    }
+    YU_STORAGE_OK
 }
 
 /// Returns the actual glyph primitives from the persistent Rust retained

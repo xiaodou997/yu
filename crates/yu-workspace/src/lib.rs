@@ -416,6 +416,18 @@ impl ViewportFramePublisher {
         Self::default()
     }
 
+    /// Creates a publisher whose next publication serial follows an existing
+    /// publisher. This is used when a platform rebuilds only its shaping or
+    /// layout state while retaining the same document/session lifecycle.
+    #[must_use]
+    pub fn with_next_serial(next_serial: u64) -> Self {
+        Self {
+            cache: ViewportFrameCache::new(),
+            next_serial,
+            last_publication: None,
+        }
+    }
+
     #[must_use]
     pub fn current_revision(&self) -> Option<Revision> {
         self.cache.current_revision()
