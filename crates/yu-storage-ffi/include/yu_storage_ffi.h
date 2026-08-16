@@ -291,6 +291,15 @@ typedef struct YuStorageBlockLayout {
     uint8_t shaped;
 } YuStorageBlockLayout;
 
+/* Revision-bound CoreText metrics used to configure an empty or non-empty
+ * viewport before requesting a render-host frame. */
+typedef struct YuStorageMacosFontMetrics {
+    uint64_t revision;
+    float size;
+    float line_height;
+    float default_advance;
+} YuStorageMacosFontMetrics;
+
 /* Revision-bound source caret resolved through one block-local layout. */
 typedef struct YuStorageBlockCaret {
     uint64_t revision;
@@ -643,6 +652,9 @@ int32_t yu_storage_session_macos_block_layout(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, float size, float max_width,
     YuStorageBlockLayout *output);
+int32_t yu_storage_session_macos_font_metrics(
+    YuStorageSession *session, uint64_t expected_revision,
+    float size, float max_width, YuStorageMacosFontMetrics *output);
 int32_t yu_storage_session_macos_block_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, uint64_t source_utf16, uint8_t affinity,

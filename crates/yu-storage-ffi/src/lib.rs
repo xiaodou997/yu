@@ -341,6 +341,19 @@ pub struct YuStorageBlockLayout {
     pub shaped: u8,
 }
 
+/// Revision-bound CoreText metrics for configuring an empty or non-empty
+/// viewport. This is intentionally independent of parser block metadata so a
+/// native host can initialize a surface before the Markdown document has a
+/// parser-owned block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageMacosFontMetrics {
+    pub revision: u64,
+    pub size: f32,
+    pub line_height: f32,
+    pub default_advance: f32,
+}
+
 /// Revision-bound source caret resolved through one block-local layout. The
 /// point is local to the block and the visual offset is block-local UTF-16.
 #[repr(C)]
@@ -3021,6 +3034,57 @@ pub unsafe extern "C" fn yu_storage_session_block_layout(
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = metadata };
     YU_STORAGE_OK
+}
+
+/// Returns revision-bound CoreText metrics without requiring a parser-owned
+/// block. Native hosts use this to configure the viewport for an empty
+/// document before requesting a render-host frame.
+///
+/// # Safety
+/// `session` must be null or a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_font_metrics(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    output: *mut YuStorageMacosFontMetrics,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageMacosFontMetrics::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session, expected_revision, size, max_width);
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(&session.session, expected_revision) {
+            return status;
+        }
+        let (_, metrics, _) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuStorageMacosFontMetrics {
+                revision: session.session.revision().get(),
+                size,
+                line_height: metrics.line_height(),
+                default_advance: metrics.default_advance(),
+            };
+        }
+        YU_STORAGE_OK
+    }
 }
 
 /// Returns one block's layout using the macOS System UI CoreText shaper. On
@@ -5834,6 +5898,44 @@ mod tests {
             },
             YU_STORAGE_STALE_REVISION
         );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_font_metrics_support_empty_documents() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-empty-metrics-{id}.md"));
+        fs::write(&path, "").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut metrics = YuStorageMacosFontMetrics::default();
+        assert_eq!(
+            unsafe { yu_storage_session_macos_font_metrics(raw, 0, 14.0, 500.0, &mut metrics) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(metrics.revision, 0);
+        assert_eq!(metrics.size, 14.0);
+        assert!(metrics.line_height > 0.0);
+        assert!(metrics.default_advance > 0.0);
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_macos_font_metrics(raw, 0, 14.0, 500.0, &mut metrics) },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(metrics, YuStorageMacosFontMetrics::default());
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

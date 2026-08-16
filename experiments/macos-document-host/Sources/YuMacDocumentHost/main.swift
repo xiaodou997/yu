@@ -17,6 +17,7 @@ private enum StorageStatus {
     static let externalChange: Int32 = 4
     static let unsavedChanges: Int32 = 5
     static let htmlImportRejected: Int32 = 18
+    static let invalidViewport: Int32 = 20
 }
 
 private enum DiskState: UInt8 {
@@ -221,6 +222,20 @@ private struct NativeBlockLayout {
         kind = value.kind
         projectionKind = value.projection_kind
         shaped = value.shaped != 0
+    }
+}
+
+private struct NativeMacosFontMetrics {
+    let revision: UInt64
+    let size: CGFloat
+    let lineHeight: CGFloat
+    let defaultAdvance: CGFloat
+
+    init(_ value: YuStorageMacosFontMetrics) {
+        revision = value.revision
+        size = CGFloat(value.size)
+        lineHeight = CGFloat(value.line_height)
+        defaultAdvance = CGFloat(value.default_advance)
     }
 }
 
@@ -1270,6 +1285,25 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeBlockLayout(value)
+    }
+
+    func macosFontMetrics(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NativeMacosFontMetrics {
+        var value = YuStorageMacosFontMetrics()
+        let status = yu_storage_session_macos_font_metrics(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeMacosFontMetrics(value)
     }
 
     func macosBlockCaret(
@@ -3265,6 +3299,238 @@ private enum BridgeError: LocalizedError {
     }
 }
 
+/// A real product-window surface host. Rust still owns the native layer and
+/// GPU resources; this view only reports AppKit window/geometry lifecycle and
+/// never becomes the canonical document model.
+private final class MacosSurfaceHostView: NSView {
+    var onWindowStateChange: ((Bool) -> Void)?
+    var onGeometryChange: (() -> Void)?
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            onWindowStateChange?(false)
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onWindowStateChange?(window != nil)
+        onGeometryChange?()
+    }
+
+    override func layout() {
+        super.layout()
+        onGeometryChange?()
+    }
+}
+
+/// Coordinates a persistent Rust surface with one product `NSView`.
+///
+/// The coordinator is deliberately an AppKit lifecycle adapter, not a second
+/// editor or renderer. It converts window/layout/scroll/revision changes into
+/// the already validated synchronous FFI submit protocol and detaches before
+/// the view leaves its window.
+private final class MacosSurfaceHostCoordinator {
+    private struct MetricsKey: Equatable {
+        let revision: UInt64
+        let size: Double
+        let maxWidth: Double
+    }
+
+    private struct Metrics {
+        let key: MetricsKey
+        let lineHeight: Float
+        let defaultAdvance: Float
+    }
+
+    private struct SubmitKey: Equatable {
+        let revision: UInt64
+        let size: Double
+        let maxWidth: Double
+        let scrollY: Double
+        let viewportHeight: Double
+        let surfaceWidth: Double
+        let surfaceHeight: Double
+        let scale: Double
+    }
+
+    private let bridge: StorageBridge
+    private weak var surfaceView: NSView?
+    private weak var scrollView: NSScrollView?
+    private var fontSize: CGFloat
+    private var metrics: Metrics?
+    private var lastSubmitKey: SubmitKey?
+    private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
+    private var submitScheduled = false
+    private var scheduleToken: UInt64 = 0
+
+    var onError: ((Error) -> Void)?
+    private(set) var isAttached = false
+
+    init(bridge: StorageBridge, fontSize: CGFloat = 16.0) {
+        self.bridge = bridge
+        self.fontSize = max(fontSize, 1.0)
+    }
+
+    func bind(
+        surfaceView: NSView,
+        scrollView: NSScrollView,
+        fontSize: CGFloat
+    ) {
+        if isAttached {
+            detach()
+        }
+        scheduleToken &+= 1
+        self.surfaceView = surfaceView
+        self.scrollView = scrollView
+        self.fontSize = max(fontSize, 1.0)
+        metrics = nil
+        lastSubmitKey = nil
+        lastSnapshot = nil
+        isAttached = false
+    }
+
+    func setFontSize(_ fontSize: CGFloat) {
+        let next = max(fontSize, 1.0)
+        guard abs(self.fontSize - next) > 0.001 else { return }
+        self.fontSize = next
+        metrics = nil
+        lastSubmitKey = nil
+        scheduleSubmit()
+    }
+
+    func scheduleSubmit() {
+        guard !submitScheduled else { return }
+        submitScheduled = true
+        let token = scheduleToken
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.scheduleToken == token else { return }
+            self.submitScheduled = false
+            do {
+                _ = try self.submitNow()
+            } catch {
+                self.onError?(error)
+            }
+        }
+    }
+
+    @discardableResult
+    func submitNow() throws -> NativeMacosRenderHostSurfaceSnapshot? {
+        guard let surfaceView,
+              let scrollView,
+              let window = surfaceView.window,
+              surfaceView.bounds.width > 0.0,
+              surfaceView.bounds.height > 0.0 else {
+            return nil
+        }
+
+        let revision = bridge.state.revision
+        let size = max(fontSize, 1.0)
+        let surfaceWidth = max(surfaceView.bounds.width, 1.0)
+        let surfaceHeight = max(surfaceView.bounds.height, 1.0)
+        let viewportBounds = scrollView.contentView.bounds
+        let viewportHeight = max(viewportBounds.height, 1.0)
+        let scrollY = max(viewportBounds.origin.y, 0.0)
+        let maxWidth = surfaceWidth
+        let scale = max(window.backingScaleFactor, 1.0)
+        let key = SubmitKey(
+            revision: revision,
+            size: Double(size),
+            maxWidth: Double(maxWidth),
+            scrollY: Double(scrollY),
+            viewportHeight: Double(viewportHeight),
+            surfaceWidth: Double(surfaceWidth),
+            surfaceHeight: Double(surfaceHeight),
+            scale: Double(scale)
+        )
+        if isAttached, key == lastSubmitKey {
+            return lastSnapshot
+        }
+
+        _ = try ensureMetrics(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth
+        )
+        let rawView = Unmanaged.passUnretained(surfaceView).toOpaque()
+        let snapshot = try bridge.macosRenderHostSurfaceSubmit(
+            revision: revision,
+            size: Float(size),
+            maxWidth: Float(maxWidth),
+            scrollY: Float(scrollY),
+            viewportHeight: Float(viewportHeight),
+            surfaceWidth: Double(surfaceWidth),
+            surfaceHeight: Double(surfaceHeight),
+            scale: Double(scale),
+            view: rawView
+        )
+        isAttached = true
+        lastSubmitKey = key
+        lastSnapshot = snapshot
+        return snapshot
+    }
+
+    func detach() {
+        scheduleToken &+= 1
+        submitScheduled = false
+        if isAttached {
+            do {
+                try bridge.macosRenderHostSurfaceDetach()
+            } catch {
+                onError?(error)
+            }
+        }
+        isAttached = false
+        lastSubmitKey = nil
+        lastSnapshot = nil
+        metrics = nil
+    }
+
+    private func ensureMetrics(
+        revision: UInt64,
+        size: CGFloat,
+        maxWidth: CGFloat
+    ) throws -> Metrics {
+        let key = MetricsKey(
+            revision: revision,
+            size: Double(size),
+            maxWidth: Double(maxWidth)
+        )
+        if let metrics, metrics.key == key {
+            return metrics
+        }
+        let layout = try bridge.macosFontMetrics(
+            revision: revision,
+            size: Float(size),
+            maxWidth: Float(maxWidth)
+        )
+        guard layout.revision == revision,
+              abs(layout.size - size) <= 0.001,
+              layout.lineHeight.isFinite,
+              layout.lineHeight > 0.0,
+              layout.defaultAdvance.isFinite,
+              layout.defaultAdvance > 0.0 else {
+            throw BridgeError.operation(StorageStatus.invalidViewport)
+        }
+        let next = Metrics(
+            key: key,
+            lineHeight: Float(layout.lineHeight),
+            defaultAdvance: Float(layout.defaultAdvance)
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: Float(maxWidth),
+            lineHeight: next.lineHeight,
+            defaultAdvance: next.defaultAdvance,
+            estimatedBlockHeight: next.lineHeight,
+            overscan: 0.0
+        )
+        metrics = next
+        return next
+    }
+}
+
 /// Watches the containing directory rather than the file inode. Rust still
 /// owns the file fingerprint and all reload/conflict decisions; this object
 /// only turns native vnode notifications into a main-thread callback. Watching
@@ -3295,6 +3561,8 @@ private final class NativeFileWatcher {
 private final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private let bridge: StorageBridge
     private lazy var textView = DocumentTextView(bridge: bridge)
+    private let surfaceHostView = MacosSurfaceHostView()
+    private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
     private var saveButton: NSButton?
     private var reloadButton: NSButton?
@@ -3302,15 +3570,30 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private var fileWatcher: NativeFileWatcher?
     private var externalCheckWorkItem: DispatchWorkItem?
     private var promptedExternalDisk: DiskState?
+    private var surfaceBoundsObserver: NSObjectProtocol?
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
+        self.surfaceCoordinator = MacosSurfaceHostCoordinator(bridge: bridge)
         self.initialState = bridge.state
         super.init(nibName: nil, bundle: nil)
+        surfaceCoordinator.onError = { [weak self] error in
+            // The source TextKit mirror remains usable when a machine has no
+            // Metal drawable; surface lifecycle failure is diagnostic, not a
+            // reason to interrupt editing with a modal alert.
+            self?.statusLabel.toolTip = "Native surface inactive: \(error.localizedDescription)"
+        }
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    deinit {
+        if let surfaceBoundsObserver {
+            NotificationCenter.default.removeObserver(surfaceBoundsObserver)
+        }
+        surfaceCoordinator.detach()
+    }
 
     override func loadView() {
         let root = NSView()
@@ -3319,6 +3602,8 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.translatesAutoresizingMaskIntoConstraints = false
+        surfaceHostView.translatesAutoresizingMaskIntoConstraints = false
+        surfaceHostView.setAccessibilityElement(false)
 
         textView.isEditable = true
         textView.isSelectable = true
@@ -3327,6 +3612,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             guard let self else { return }
             self.initialState = self.bridge.state
             self.updateStatus()
+            self.surfaceCoordinator.scheduleSubmit()
         }
         textView.onError = { [weak self] error in self?.show(error) }
         scrollView.documentView = textView
@@ -3342,6 +3628,31 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             height: CGFloat.greatestFiniteMagnitude
         )
         textView.textContainer?.widthTracksTextView = true
+
+        surfaceCoordinator.bind(
+            surfaceView: surfaceHostView,
+            scrollView: scrollView,
+            fontSize: textView.font?.pointSize ?? 16.0
+        )
+        surfaceHostView.onWindowStateChange = { [weak self] attached in
+            guard let self else { return }
+            if attached {
+                self.surfaceCoordinator.scheduleSubmit()
+            } else {
+                self.surfaceCoordinator.detach()
+            }
+        }
+        surfaceHostView.onGeometryChange = { [weak self] in
+            self?.surfaceCoordinator.scheduleSubmit()
+        }
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        surfaceBoundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.surfaceCoordinator.scheduleSubmit()
+        }
 
         statusLabel.setAccessibilityElement(true)
         statusLabel.setAccessibilityLabel("文档状态")
@@ -3360,9 +3671,18 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         toolbar.addArrangedSubview(reloadButton)
         toolbar.addArrangedSubview(statusLabel)
 
+        // The native surface host stays behind the source TextKit mirror. It
+        // participates in the real window lifecycle and receives drawable/
+        // resize/scroll submissions, but it does not replace what the user
+        // currently sees or create a second document model.
+        root.addSubview(surfaceHostView)
         root.addSubview(toolbar)
         root.addSubview(scrollView)
         NSLayoutConstraint.activate([
+            surfaceHostView.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+            surfaceHostView.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+            surfaceHostView.topAnchor.constraint(equalTo: scrollView.topAnchor),
+            surfaceHostView.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
             toolbar.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
@@ -3383,6 +3703,11 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             promptedExternalDisk = nil
         }
         updateStatus()
+        surfaceCoordinator.scheduleSubmit()
+    }
+
+    func detachSurfaceHost() {
+        surfaceCoordinator.detach()
     }
 
     @objc private func save() {
@@ -3633,12 +3958,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        controller?.requestClose() ?? true
+        let shouldClose = controller?.requestClose() ?? true
+        if shouldClose {
+            controller?.detachSurfaceHost()
+        }
+        return shouldClose
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        controller?.detachSurfaceHost()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let controller, !controller.requestClose() else { return .terminateNow }
-        return .terminateCancel
+        guard let controller else { return .terminateNow }
+        guard controller.requestClose() else { return .terminateCancel }
+        controller.detachSurfaceHost()
+        return .terminateNow
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -5039,6 +5374,110 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
     }
 }
 
+private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let application = NSApplication.shared
+        application.setActivationPolicy(.regular)
+        let initialFrame = NSRect(x: 0.0, y: 0.0, width: 500.0, height: 240.0)
+        let window = NSWindow(
+            contentRect: initialFrame,
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let root = NSView(frame: initialFrame)
+        let surfaceView = MacosSurfaceHostView(frame: initialFrame)
+        let scrollView = NSScrollView(frame: initialFrame)
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.documentView = NSView(
+            frame: NSRect(x: 0.0, y: 0.0, width: initialFrame.width, height: 1200.0)
+        )
+        root.addSubview(surfaceView)
+        root.addSubview(scrollView)
+        window.contentView = root
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        application.activate(ignoringOtherApps: true)
+
+        let coordinator = MacosSurfaceHostCoordinator(bridge: bridge, fontSize: 14.0)
+        var errors: [String] = []
+        coordinator.onError = { error in errors.append(error.localizedDescription) }
+        coordinator.bind(
+            surfaceView: surfaceView,
+            scrollView: scrollView,
+            fontSize: 14.0
+        )
+        surfaceView.onWindowStateChange = { attached in
+            if attached {
+                coordinator.scheduleSubmit()
+            } else {
+                coordinator.detach()
+            }
+        }
+        surfaceView.onGeometryChange = {
+            coordinator.scheduleSubmit()
+        }
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        let observer = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView,
+            queue: .main
+        ) { _ in
+            coordinator.scheduleSubmit()
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            coordinator.detach()
+            window.orderOut(nil)
+            window.close()
+        }
+
+        window.displayIfNeeded()
+        let first = try unwrapSelfCheck(coordinator.submitNow())
+        precondition(first.surfaceGeneration == 0)
+        precondition(first.submitted)
+        precondition(coordinator.isAttached)
+
+        let resizedFrame = NSRect(x: 0.0, y: 0.0, width: 540.0, height: 280.0)
+        root.setFrameSize(resizedFrame.size)
+        surfaceView.frame = resizedFrame
+        scrollView.frame = resizedFrame
+        window.setContentSize(resizedFrame.size)
+        window.displayIfNeeded()
+        let resized = try unwrapSelfCheck(coordinator.submitNow())
+        precondition(resized.surfaceGeneration == first.surfaceGeneration + 1)
+        precondition(resized.frameSerial > first.frameSerial)
+        precondition(resized.submitted)
+
+        scrollView.contentView.setBoundsOrigin(NSPoint(x: 0.0, y: 120.0))
+        let scrolled = try unwrapSelfCheck(coordinator.submitNow())
+        precondition(scrolled.surfaceGeneration == resized.surfaceGeneration)
+        precondition(scrolled.frameSerial > resized.frameSerial)
+        precondition(scrolled.submitted)
+
+        _ = try bridge.insertText("!")
+        let edited = try unwrapSelfCheck(coordinator.submitNow())
+        precondition(edited.revision == bridge.state.revision)
+        precondition(edited.frameSerial > scrolled.frameSerial)
+        precondition(edited.submitted)
+
+        surfaceView.removeFromSuperview()
+        precondition(!coordinator.isAttached)
+        coordinator.detach()
+        precondition(errors.isEmpty, errors.joined(separator: "; "))
+        print(
+            "Yu macOS surface lifecycle self-check: product NSView attach, resize, scroll, "
+                + "edit revision and close detach are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu macOS surface lifecycle self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func unwrapSelfCheck<T>(_ value: T?) throws -> T {
     guard let value else {
         throw BridgeError.operation(14)
@@ -5347,6 +5786,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-self-che
 if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-surface-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runMacosRenderHostSurfaceSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-lifecycle-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runMacosRenderHostLifecycleSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
