@@ -582,10 +582,37 @@ pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
     color: Rgba8,
     image_publications: &[ImagePublication],
 ) -> Result<ViewportSceneFrame, ViewportSceneError> {
+    let source = document.snapshot();
+    let definitions = document.markdown().reference_definitions().clone();
+    let document_revision = document.revision();
+    let image_key = |image: ImageSource| {
+        let destination = image.destination().or_else(|| {
+            image
+                .reference()
+                .and_then(|reference| definitions.lookup(&source, reference))
+                .map(|definition| definition.destination())
+        })?;
+        let start = usize::try_from(destination.start().get()).ok()?;
+        let end = usize::try_from(destination.end().get()).ok()?;
+        let destination = source.as_str().get(start..end)?;
+        ImageKey::new(destination.to_owned()).ok()
+    };
+    let intrinsic_size = |image: ImageSource| {
+        let key = image_key(image)?;
+        let publication = image_publications.iter().find(|publication| {
+            publication.revision() == document_revision
+                && publication.key().fingerprint() == key.fingerprint()
+        })?;
+        ImageIntrinsicSize::new(publication.image().width(), publication.image().height()).ok()
+    };
     let viewport_snapshot = if document.composition().is_some() {
-        document.visible_blocks_with_composition_and_shaper(viewport, shaper)?
+        document.visible_blocks_with_composition_and_shaper_and_image_resolver(
+            viewport,
+            shaper,
+            intrinsic_size,
+        )?
     } else {
-        document.visible_blocks_with_shaper(viewport, shaper)?
+        document.visible_blocks_with_shaper_and_image_resolver(viewport, shaper, intrinsic_size)?
     };
     let revision = viewport_snapshot.revision();
     let config = document.viewport_config().layout();
@@ -612,21 +639,6 @@ pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
         geometries,
     )?;
 
-    let source = document.snapshot();
-    let definitions = document.markdown().reference_definitions().clone();
-    let image_key = |image: ImageSource| {
-        let destination = image.destination().or_else(|| {
-            image
-                .reference()
-                .and_then(|reference| definitions.lookup(&source, reference))
-                .map(|definition| definition.destination())
-        })?;
-        let start = usize::try_from(destination.start().get()).ok()?;
-        let end = usize::try_from(destination.end().get()).ok()?;
-        let destination = source.as_str().get(start..end)?;
-        ImageKey::new(destination.to_owned()).ok()
-    };
-
     let mut layouts = Vec::with_capacity(viewport_snapshot.blocks().len());
     let composition_blocks = document.composition_block_range();
     for block in viewport_snapshot.blocks() {
@@ -646,16 +658,8 @@ pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
             .iter()
             .copied()
             .filter_map(|image| {
-                let key = image_key(image)?;
-                let publication = image_publications.iter().find(|publication| {
-                    publication.revision() == revision
-                        && publication.key().fingerprint() == key.fingerprint()
-                })?;
-                let size = ImageIntrinsicSize::new(
-                    publication.image().width(),
-                    publication.image().height(),
-                )
-                .ok()?;
+                image_key(image)?;
+                let size = intrinsic_size(image)?;
                 Some((image.source(), size))
             })
             .collect::<Vec<_>>();
@@ -926,6 +930,7 @@ mod tests {
             .expect("image primitive");
         assert_eq!(image.bounds().width(), 200.0);
         assert_eq!(image.bounds().height(), 100.0);
+        assert!(frame.input().content_height() >= 100.0);
     }
 
     #[test]
