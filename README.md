@@ -57,6 +57,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   canonical source、Revision、缓存或 Undo；
 - composition FFI 以 canonical Revision + transient generation 绑定 projected UTF-8、visual
   selection 和 caret，native mirror 不复制 Markdown parser；
+- active composition 若完全落在一个 Markdown block 内，会以 transient CoreText shaped layout
+  进入同一 Rust RenderPlan、glyph atlas 和持久 Metal surface；跨 block replacement 仍安全回退；
 - opt-in visual mirror 额外消费 Rust generation-bound visual replacement range，让 marked-text
   preedit、`markedRange` 和 `attributedSubstring` 使用同一 visual 坐标；默认生产 view 仍走 source
   mirror，过期 generation 自动回退；
@@ -218,6 +220,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS shaped vertical editor command](docs/adr/0128-macos-shaped-vertical-command.md)
 - [macOS CoreText-shaped pointer hit-test](docs/adr/0129-macos-shaped-pointer-hit-test.md)
 - [macOS visual IME shaped caret geometry](docs/adr/0130-macos-visual-ime-shaped-caret.md)
+- [macOS visual IME Metal preedit glyph publication](docs/adr/0131-macos-visual-ime-metal-preedit.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)

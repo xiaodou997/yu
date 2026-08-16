@@ -37,7 +37,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 生产 Up/Down/Shift-Up/Shift-Down 使用当前 CoreText metrics/shaper 的 Revision-bound command
 - [x] 生产 pointer adapter 使用同一 CoreText-shaped Rust block layout 命中 visual boundary；TextKit 只保留输入/IME/AX/矩形回退
 - [x] visual IME active caret 使用 Revision + composition generation-bound CoreText shaped block geometry
-- [ ] visual IME preedit 的 shaped Metal 绘制与最终 renderer 迁移
+- [x] visual IME preedit 在所属 block 使用 CoreText shaped glyph、CPU atlas 与持久 Metal surface 发布
+- [ ] visual IME preedit 的跨 block layout 与完整 visual renderer 迁移
 
 ## Track C：Scene and rendering
 
@@ -50,6 +51,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] product `NSView` surface lifecycle coordinator 接入 attach/layout/resize/scroll/edit/close，空文档通过 CoreText metrics FFI 初始化 viewport（source TextKit mirror 仍可见）
 - [x] macOS document host 诊断桥持有 persistent CoreText/atlas/publication host；编辑、scroll、resize 的 frame serial、surface generation 和 stale Revision self-check
 - [x] macOS native GPU surface 在 ignored AppKit probe 中消费 Rust-owned CoreText workspace publication（生产窗口仍保留 source mirror）
+- [x] active composition 的 transient block layout/glyph atlas 进入同一持久 RenderPlan 与 Metal submit，Swift submit key 绑定 composition generation
 - [x] heading、emphasis、code、link 的最小真实 visual render 通过产品窗口 persistent Metal
   surface 可见提交；TextKit 仍保留为透明 overlay 下的输入/AX/回退表面
 

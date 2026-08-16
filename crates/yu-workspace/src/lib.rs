@@ -551,12 +551,16 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
     )?;
 
     let mut layouts = Vec::with_capacity(viewport_snapshot.blocks().len());
+    let composition_block = document.composition_block_index();
     for block in viewport_snapshot.blocks() {
-        layouts.push(
+        let layout = if composition_block == Some(block.index()) {
+            document.block_layout_with_composition_and_shaper(block.index(), config, shaper)?
+        } else {
             document
                 .block_layout_with_shaper(block.index(), config, shaper)?
-                .clone(),
-        );
+                .clone()
+        };
+        layouts.push(layout);
     }
     let layout_refs = layouts.iter().collect::<Vec<_>>();
     let mut builder = SceneBuilder::new(revision, scene_viewport)?;
