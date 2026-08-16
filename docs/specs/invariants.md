@@ -498,3 +498,9 @@
    放入同一 atlas/RenderPlan/Metal submit；跨 block replacement 必须不构造部分 transient scene，安全
    留在 native source mirror。composition generation 改变但 Revision 不变时，macOS submit key 必须
    仍然失效并重新发布；cancel 后必须重新发布 canonical glyph scene。
+7. `yu_storage_session_macos_visual_render_plan` 与
+   `yu_storage_session_macos_visual_scene_glyphs` 的 count/fill header 必须同时携带
+   `composition_generation`。当 fill capacity 非零时，Rust 必须先验证调用方保留的 header 与当前
+   Revision/generation 完全一致；generation 变化必须返回 `YU_STORAGE_STALE_COMPOSITION`、清空
+   header/written 计数并禁止部分数组写入。host/surface snapshot 也必须回传同一 generation，Swift
+   不得只用 canonical Revision 判定 marked-text glyph frame 是否仍可提交。

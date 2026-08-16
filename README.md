@@ -59,6 +59,8 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
   selection 和 caret，native mirror 不复制 Markdown parser；
 - active composition 若完全落在一个 Markdown block 内，会以 transient CoreText shaped layout
   进入同一 Rust RenderPlan、glyph atlas 和持久 Metal surface；跨 block replacement 仍安全回退；
+- visual scene/glyph/render-plan 的 count/fill header 同时绑定 composition generation；marked-text
+  在两次 FFI 调用之间更新或取消时，Rust 拒绝 stale fill，避免旧容量与新 glyph 数据错配；
 - opt-in visual mirror 额外消费 Rust generation-bound visual replacement range，让 marked-text
   preedit、`markedRange` 和 `attributedSubstring` 使用同一 visual 坐标；默认生产 view 仍走 source
   mirror，过期 generation 自动回退；
@@ -221,6 +223,7 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [macOS CoreText-shaped pointer hit-test](docs/adr/0129-macos-shaped-pointer-hit-test.md)
 - [macOS visual IME shaped caret geometry](docs/adr/0130-macos-visual-ime-shaped-caret.md)
 - [macOS visual IME Metal preedit glyph publication](docs/adr/0131-macos-visual-ime-metal-preedit.md)
+- [macOS visual count/fill composition generation guard](docs/adr/0132-macos-visual-count-fill-generation-guard.md)
 - [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
 - [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
 - [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)

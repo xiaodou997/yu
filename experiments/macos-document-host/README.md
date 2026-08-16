@@ -223,6 +223,10 @@ atlas、Metal target 和 attachment，重复提交应复用 atlas upload，compo
 强制提交新的 preedit glyph frame，cancel 会恢复 canonical glyph scene，surface 尺寸变化会推进
 generation，结束前显式 detach。它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
 
+scene/glyph/render-plan 的两次 count/fill 调用也把 `composition_generation` 放进 header。若 marked
+text 在 count 与 fill 之间更新或取消，Rust 返回 stale composition、清空 written 计数并拒绝写入
+旧容量数组；host/surface scalar 同样回传 generation。
+
 验证产品 document-host 窗口中的 `NSView` lifecycle coordinator。它会在真实 AppKit window 中把
 attach、layout/resize、scroll、编辑 Revision 和 close detach 映射到同一个 Rust surface session；
 surface view 位于 source TextKit mirror 上方但不参与 hit-test，成功提交后只显示 Rust glyph overlay，

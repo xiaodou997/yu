@@ -417,6 +417,12 @@ generation 不得发布。该 endpoint 仍负责 IME caret geometry handoff，�
 已经由 workspace 的 transient block layout 进入 Metal glyph publication；跨 block 情况安全回退
 到 native source mirror。
 
+视觉 scene/glyph/render-plan 的两次 count/fill 调用也携带同一
+`composition_generation`。Rust 在非零 fill capacity 前校验上一次 header；如果 marked text 在
+两次调用之间更新或取消，即使 canonical Revision 没有变化，也会返回 stale composition 并清空
+输出，避免 Swift 把旧容量与新 glyph 数组配对。host/surface snapshot 回传该 generation，产品提交
+key 因此同时绑定 Revision、几何、surface generation 和 transient composition identity。
+
 storage FFI 现在还提供 parser-owned block 的 `yu_storage_session_block_layout`，以及 macOS
 `yu_storage_session_macos_block_layout`/`yu_storage_session_macos_block_caret`。前者使用显式
 metrics 配置构造单 block `LayoutSnapshot`，后者使用 `CoreTextShaper::from_system_ui` 和同一

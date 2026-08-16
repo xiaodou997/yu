@@ -354,6 +354,7 @@ private struct NativeVisualScenePrimitive {
 
 private struct NativeVisualRenderPlanSnapshot {
     let revision: UInt64
+    let compositionGeneration: UInt64
     let blockRange: Range<UInt64>
     let commandCount: Int
     let uploadCount: Int
@@ -366,6 +367,7 @@ private struct NativeVisualRenderPlanSnapshot {
 
     init(_ value: YuStorageVisualRenderPlanSnapshot) {
         revision = value.revision
+        compositionGeneration = value.composition_generation
         blockRange = value.block_start..<value.block_end
         commandCount = Int(value.command_count)
         uploadCount = Int(value.upload_count)
@@ -380,6 +382,7 @@ private struct NativeVisualRenderPlanSnapshot {
 
 private struct NativeVisualSceneGlyphSnapshot {
     let revision: UInt64
+    let compositionGeneration: UInt64
     let frameRevision: UInt64
     let surfaceGeneration: UInt64
     let frameSerial: UInt64
@@ -393,6 +396,7 @@ private struct NativeVisualSceneGlyphSnapshot {
 
     init(_ value: YuStorageVisualSceneGlyphSnapshot) {
         revision = value.revision
+        compositionGeneration = value.composition_generation
         frameRevision = value.frame_revision
         surfaceGeneration = value.surface_generation
         frameSerial = value.frame_serial
@@ -449,6 +453,7 @@ private struct NativeVisualSceneGlyph {
 
 private struct NativeMacosRenderHostSnapshot {
     let revision: UInt64
+    let compositionGeneration: UInt64
     let frameRevision: UInt64
     let surfaceGeneration: UInt64
     let frameSerial: UInt64
@@ -467,6 +472,7 @@ private struct NativeMacosRenderHostSnapshot {
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
         revision = value.revision
+        compositionGeneration = value.composition_generation
         frameRevision = value.frame_revision
         surfaceGeneration = value.surface_generation
         frameSerial = value.frame_serial
@@ -487,6 +493,7 @@ private struct NativeMacosRenderHostSnapshot {
 
 private struct NativeMacosRenderHostSurfaceSnapshot {
     let revision: UInt64
+    let compositionGeneration: UInt64
     let surfaceGeneration: UInt64
     let frameSerial: UInt64
     let uploadedPages: Int
@@ -497,6 +504,7 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
         revision = value.revision
+        compositionGeneration = value.composition_generation
         surfaceGeneration = value.surface_generation
         frameSerial = value.frame_serial
         uploadedPages = Int(value.uploaded_pages)
@@ -5688,6 +5696,7 @@ private func runVisualSceneGlyphSelfCheck(path: String) -> Never {
             surfaceGeneration: 0
         )
         precondition(snapshot.revision == revision)
+        precondition(snapshot.compositionGeneration == bridge.composition.generation)
         precondition(snapshot.frameRevision == revision)
         precondition(snapshot.glyphCount == glyphs.count)
         precondition(snapshot.glyphCount > 0)
@@ -5766,6 +5775,7 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
             viewportHeight: 1_000.0
         )
         precondition(snapshot.revision == revision)
+        precondition(snapshot.compositionGeneration == bridge.composition.generation)
         precondition(snapshot.commandCount == commands.count)
         precondition(snapshot.uploadCount == pages.count)
         precondition(snapshot.damageCount == damage.count)
@@ -5875,6 +5885,7 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
             surfaceGeneration: 0
         )
         precondition(first.revision == revision)
+        precondition(first.compositionGeneration == bridge.composition.generation)
         precondition(first.frameRevision == revision)
         precondition(first.surfaceGeneration == 0)
         precondition(first.frameSerial == 1)
@@ -5894,6 +5905,7 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
             viewportHeight: 240.0,
             surfaceGeneration: 0
         )
+        precondition(repeated.compositionGeneration == bridge.composition.generation)
         precondition(repeated.frameSerial > first.frameSerial)
         precondition(repeated.atlasPageCount == first.atlasPageCount)
         precondition(repeated.atlasGlyphCount == first.atlasGlyphCount)
@@ -5915,6 +5927,7 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
             surfaceGeneration: 0
         )
         precondition(composed.revision == revision)
+        precondition(composed.compositionGeneration == bridge.composition.generation)
         precondition(composed.frameSerial > repeated.frameSerial)
         // The canonical projection contains two visible CJK glyphs here;
         // the transient Japanese/emoji preedit contributes a different shaped
@@ -5931,6 +5944,7 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
             surfaceGeneration: 0
         )
         precondition(cancelled.revision == revision)
+        precondition(cancelled.compositionGeneration == bridge.composition.generation)
         precondition(cancelled.frameSerial > composed.frameSerial)
         precondition(cancelled.commandCount == repeated.commandCount)
 
@@ -5942,6 +5956,7 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
             viewportHeight: 180.0,
             surfaceGeneration: 1
         )
+        precondition(resized.compositionGeneration == bridge.composition.generation)
         precondition(resized.surfaceGeneration == 1)
         precondition(abs(resized.scrollY - 12.0) < 0.01)
         precondition(abs(resized.viewportHeight - 180.0) < 0.01)
@@ -5970,6 +5985,7 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
             viewportHeight: 240.0,
             surfaceGeneration: 1
         )
+        precondition(next.compositionGeneration == bridge.composition.generation)
         precondition(next.revision == bridge.state.revision)
         precondition(next.frameRevision == bridge.state.revision)
         precondition(next.surfaceGeneration == 1)
@@ -6067,6 +6083,7 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
             scale: 2.0,
             view: rawView
         )
+        precondition(repeated.compositionGeneration == bridge.composition.generation)
         precondition(repeated.surfaceGeneration == first.surfaceGeneration)
         precondition(repeated.frameSerial > first.frameSerial)
         precondition(repeated.uploadedPages == 0)
@@ -6091,6 +6108,7 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
             view: rawView
         )
         precondition(composed.revision == revision)
+        precondition(composed.compositionGeneration == bridge.composition.generation)
         precondition(composed.frameSerial > repeated.frameSerial)
         precondition(composed.commandCount != repeated.commandCount)
         precondition(composed.submitted)
@@ -6107,6 +6125,7 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
             view: rawView
         )
         precondition(cancelled.revision == revision)
+        precondition(cancelled.compositionGeneration == bridge.composition.generation)
         precondition(cancelled.frameSerial > composed.frameSerial)
         precondition(cancelled.commandCount == repeated.commandCount)
         precondition(cancelled.submitted)
@@ -6122,6 +6141,7 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
             scale: 2.0,
             view: rawView
         )
+        precondition(resized.compositionGeneration == bridge.composition.generation)
         precondition(resized.surfaceGeneration == first.surfaceGeneration + 1)
         precondition(resized.frameSerial > repeated.frameSerial)
         precondition(resized.uploadedPages == 0)

@@ -20,7 +20,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] Swift composition projection self-check 覆盖 Unicode preedit、update stale generation、cancel/source 保持
 - [ ] 完善 heading/list/task/fence/table 的 visual delimiter 语义，并统一 block projection kind
 - [x] visual selection range、metrics hit-testing 和 point↔source mapping 的 Revision-bound 诊断契约
-- [ ] stale Revision/generation 在 native projection callbacks 上的全路径回归
+- [x] stale Revision/generation 在 native projection callbacks 上的全路径回归（含视觉 scene/glyph/render-plan count/fill header）
 
 ## Track B：Native layout
 
