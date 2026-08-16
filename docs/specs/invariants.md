@@ -469,6 +469,11 @@
     submit key 不得重复提交，view 离开 window、window close 或 controller 销毁前必须幂等 detach。
     surface host 是 source TextKit mirror 的 sibling，不得拥有 Markdown source、selection、IME、
     accessibility semantic nodes 或 native GPU handle。
+26. `yu_storage_session_macos_composition_projection_hit_test` 必须同时验证 expected Revision 与
+    composition generation，并使用 composition-aware transient block layout 加完整 transient
+    projection 返回命中结果；输出的 block index、document-space point、source/visual UTF-16、
+    visual selection/replacement 必须来自同一 generation。过期 generation 必须清空输出并返回
+    `YU_STORAGE_STALE_COMPOSITION`，native host 不得用 canonical hit-test 结果重建 preedit 偏移。
 
 ## CoreText viewport preparation
 

@@ -60,6 +60,9 @@ macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输
 - active composition 会以 transient CoreText shaped layout 进入同一 Rust RenderPlan、glyph atlas
   和持久 Metal surface；跨 block replacement 按受影响 block span 投影，首 block 承载 preedit，后续
   block 清除被替换 source，source/Revision 仍保持不变；
+- macOS composition hit-test 通过 Revision + generation-bound transient projection 返回 block、
+  document-space point、visual selection/replacement 与 source/visual UTF-16 round-trip；native host
+  不复制跨 block preedit 偏移；
 - visual scene/glyph/render-plan 的 count/fill header 同时绑定 composition generation；marked-text
   在两次 FFI 调用之间更新或取消时，Rust 拒绝 stale fill，避免旧容量与新 glyph 数据错配；
 - opt-in visual mirror 额外消费 Rust generation-bound visual replacement range，让 marked-text

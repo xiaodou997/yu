@@ -121,6 +121,18 @@ Metal surface 已能消费受影响 block span 的 transient shaped preedit glyp
 由首 block 承载 preedit、后续 block 清除被替换 source，无法建立合法 span 时才回退；TextKit 仍继续作为输入、
 Accessibility 和失败回退宿主。
 
+验证跨 block transient 点命中时，Rust CoreText layout、document-space block origin 与完整
+transient projection 使用同一个 `Revision + composition generation`：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --composition-hit-test-self-check \
+  experiments/macos-document-host/Fixtures/composition-cross-block.md
+```
+
+该自检命中后续 block，确认 visual selection/replacement 与 composition metadata 一致，并确认
+旧 generation 被拒绝；native host 不需要复制跨 block source→visual 偏移规则。
+
 验证 TextKit 过渡镜像接收 Rust projected UTF-8，并通过 Rust reverse mapping 完成 visual/source
 selection、caret 双向 round-trip 与 stale Revision 拒绝（不启动窗口）：
 

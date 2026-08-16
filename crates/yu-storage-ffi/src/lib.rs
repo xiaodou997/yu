@@ -329,6 +329,29 @@ pub struct YuStorageCompositionShapedCaret {
     pub affinity: u8,
 }
 
+/// Revision- and composition-generation-bound CoreText-shaped point hit-test
+/// for the transient marked-text projection. Coordinates are document-space;
+/// source and visual offsets are mapped through the same full transient
+/// projection, so a native host never has to reconstruct preedit offsets.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageCompositionProjectionHit {
+    pub revision: u64,
+    pub generation: u64,
+    pub source_utf16: u64,
+    pub block_index: u64,
+    pub visual_utf16: u64,
+    pub round_trip_source_utf16: u64,
+    pub line: u64,
+    pub x: f32,
+    pub y: f32,
+    pub visual_selection_start_utf16: u64,
+    pub visual_selection_end_utf16: u64,
+    pub visual_replacement_start_utf16: u64,
+    pub visual_replacement_end_utf16: u64,
+    pub affinity: u8,
+}
+
 /// Revision-bound metadata for one parser-owned block projection. The visual
 /// bytes are returned by the companion query; lengths are included here so a
 /// native host can validate its allocation and its UTF-16 layout without
@@ -3012,6 +3035,211 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
                 line: line_base.saturating_add(hit.line() as u64),
                 x: point.x(),
                 y: document_y,
+                affinity: affinity_to_ffi(match hit.bias() {
+                    ProjectionBias::Before => CaretAffinity::Upstream,
+                    ProjectionBias::After => CaretAffinity::Downstream,
+                }),
+            };
+        }
+        YU_STORAGE_OK
+    }
+}
+
+/// Resolves a document-space point through the current CoreText-shaped
+/// transient composition layout. Unlike the canonical projection hit-test,
+/// this endpoint is bound to both the source Revision and the composition
+/// generation, and maps the hit through the full transient projection.
+/// `x`/`y` are document-space coordinates and the returned visual ranges are
+/// UTF-16 offsets in that same transient projected stream.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_composition_projection_hit_test(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    expected_generation: u64,
+    point_x: f32,
+    point_y: f32,
+    size: f32,
+    max_width: f32,
+    output: *mut YuStorageCompositionProjectionHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageCompositionProjectionHit::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            expected_generation,
+            point_x,
+            point_y,
+            size,
+            max_width,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) =
+            validate_composition(&session.session, expected_revision, expected_generation)
+        {
+            return status;
+        }
+        if !point_x.is_finite()
+            || !point_y.is_finite()
+            || !size.is_finite()
+            || size <= 0.0
+            || !max_width.is_finite()
+            || max_width <= 0.0
+        {
+            return YU_STORAGE_EDITOR_ERROR;
+        }
+        let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        let viewport_config = session.session.viewport_config();
+        let published = viewport_config.layout();
+        if (published.max_width() - max_width).abs() > 0.05
+            || (published.line_height() - metrics.line_height()).abs() > 0.05
+            || (published.default_advance() - metrics.default_advance()).abs() > 0.05
+        {
+            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        }
+
+        let query_y = point_y.max(0.0);
+        let viewport = ViewportRect::new(query_y, metrics.line_height());
+        let viewport_snapshot = {
+            let document = session.session.document_mut().editor_mut();
+            match document.visible_blocks_with_composition_and_shaper(viewport, &shaper) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return status_from_editor_error(error),
+            }
+        };
+        let mut selected = None;
+        let mut best_distance = f32::INFINITY;
+        for block in viewport_snapshot.blocks() {
+            let top = block.y();
+            let bottom = top + block.height();
+            let distance = if query_y < top {
+                top - query_y
+            } else if query_y > bottom {
+                query_y - bottom
+            } else {
+                0.0
+            };
+            if distance < best_distance {
+                best_distance = distance;
+                selected = Some(*block);
+            }
+        }
+        let Some(block) = selected else {
+            return YU_STORAGE_INVALID_SELECTION;
+        };
+        let layout = {
+            let document = session.session.document_mut().editor_mut();
+            let composition_blocks = document.composition_block_range();
+            if composition_blocks
+                .as_ref()
+                .is_some_and(|span| span.contains(&block.index()))
+            {
+                document
+                    .block_layout_with_composition_and_shaper(block.index(), layout_config, &shaper)
+                    .map_err(status_from_editor_error)
+            } else {
+                document
+                    .block_layout_with_shaper(block.index(), layout_config, &shaper)
+                    .cloned()
+                    .map_err(status_from_editor_error)
+            }
+        };
+        let layout = match layout {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        if layout.lines().is_empty() {
+            return YU_STORAGE_INVALID_SELECTION;
+        }
+        let local_y = (query_y - block.y()).max(0.0);
+        let hit = match layout.hit_test(LayoutPoint::new(point_x, local_y)) {
+            Ok(hit) => hit,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let projection = match composition_projection(&mut session.session) {
+            Ok(projection) => projection,
+            Err(status) => return status,
+        };
+        let visual = match projection.source_to_visual(hit.source(), hit.bias()) {
+            Ok(visual) => visual,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let projected = match projected_utf8(&projection) {
+            Ok(projected) => projected,
+            Err(status) => return status,
+        };
+        let visual_utf16 = match visual_utf16_offset(&projected, visual) {
+            Ok(offset) => offset,
+            Err(status) => return status,
+        };
+        let round_trip_source = match projection.visual_to_source(visual, hit.bias()) {
+            Ok(offset) => offset,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let source = session.session.snapshot();
+        let source_utf16 = match source.utf16_offset(hit.source()) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let round_trip_source_utf16 = match source.utf16_offset(round_trip_source) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let (visual_selection_start_utf16, visual_selection_end_utf16) =
+            match composition_visual_selection_utf16(&projection, &projected) {
+                Ok(selection) => selection,
+                Err(status) => return status,
+            };
+        let (visual_replacement_start_utf16, visual_replacement_end_utf16) =
+            match composition_visual_replacement_utf16(&projection, &projected) {
+                Ok(replacement) => replacement,
+                Err(status) => return status,
+            };
+        let point = hit.point();
+        let document_y = block.y() + point.y();
+        if !point.x().is_finite() || !document_y.is_finite() {
+            return YU_STORAGE_EDITOR_ERROR;
+        }
+        let line_base = (block.y() / metrics.line_height()).floor().max(0.0) as u64;
+        let block_index = match u64::try_from(block.index()) {
+            Ok(index) => index,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuStorageCompositionProjectionHit {
+                revision: session.session.revision().get(),
+                generation: session.session.composition_generation(),
+                source_utf16,
+                block_index,
+                visual_utf16,
+                round_trip_source_utf16,
+                line: line_base.saturating_add(hit.line() as u64),
+                x: point.x(),
+                y: document_y,
+                visual_selection_start_utf16,
+                visual_selection_end_utf16,
+                visual_replacement_start_utf16,
+                visual_replacement_end_utf16,
                 affinity: affinity_to_ffi(match hit.bias() {
                     ProjectionBias::Before => CaretAffinity::Upstream,
                     ProjectionBias::After => CaretAffinity::Downstream,
@@ -8129,6 +8357,181 @@ mod tests {
             YU_STORAGE_STALE_COMPOSITION
         );
         assert_eq!(updated, YuStorageCompositionShapedCaret::default());
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_composition_hit_test_maps_cross_block_transient_coordinates() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "yu-storage-ffi-composition-hit-test-cross-block-{id}.md"
+        ));
+        let source = "first **x**\n\nsecond 日本語";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let replacement_start = source.find('x').expect("replacement start");
+        let replacement_end = source.find("日本語").expect("replacement end") + "日本".len();
+        let replacement_start_utf16 = source[..replacement_start].encode_utf16().count() as u64;
+        let replacement_end_utf16 = source[..replacement_end].encode_utf16().count() as u64;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_begin_composition(
+                    raw,
+                    0,
+                    replacement_start_utf16,
+                    replacement_end_utf16,
+                    "日本🙂".as_ptr(),
+                    "日本🙂".len(),
+                    2,
+                    2,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut viewport = YuStorageShapedViewportSnapshot::default();
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_shaped_viewport_blocks(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut viewport,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut blocks = vec![YuStorageShapedViewportBlock::default(); required];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_shaped_viewport_blocks(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut viewport,
+                    blocks.as_mut_ptr(),
+                    blocks.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, blocks.len());
+        let second_start = source.find("second").expect("second block");
+        let second_start_utf16 = source[..second_start].encode_utf16().count() as u64;
+        let second = blocks
+            .iter()
+            .find(|block| {
+                block.source_start_utf16 <= second_start_utf16
+                    && block.source_end_utf16 >= second_start_utf16
+            })
+            .copied()
+            .or_else(|| blocks.get(2).copied())
+            .expect("second block geometry");
+
+        let mut composition_hit = YuStorageCompositionProjectionHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_composition_projection_hit_test(
+                    raw,
+                    0,
+                    1,
+                    499.0,
+                    second.y + second.height * 0.5,
+                    14.0,
+                    500.0,
+                    &mut composition_hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(composition_hit.revision, 0);
+        assert_eq!(composition_hit.generation, 1);
+        assert_eq!(composition_hit.block_index, second.block_index);
+        assert!(composition_hit.x.is_finite());
+        assert!(composition_hit.y.is_finite());
+        assert!(composition_hit.visual_utf16 >= composition_hit.visual_replacement_start_utf16);
+        assert!(
+            composition_hit.visual_selection_end_utf16
+                >= composition_hit.visual_selection_start_utf16
+        );
+
+        let mut projection = YuStorageCompositionProjection::default();
+        assert_eq!(
+            unsafe { yu_storage_session_composition_projection(raw, 0, &mut projection) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            composition_hit.visual_selection_start_utf16,
+            projection.visual_selection_start_utf16
+        );
+        assert_eq!(
+            composition_hit.visual_selection_end_utf16,
+            projection.visual_selection_end_utf16
+        );
+        assert_eq!(
+            composition_hit.visual_replacement_start_utf16,
+            projection.visual_replacement_start_utf16
+        );
+        assert_eq!(
+            composition_hit.visual_replacement_end_utf16,
+            projection.visual_replacement_end_utf16
+        );
+
+        let mut stale = YuStorageCompositionProjectionHit {
+            revision: 99,
+            ..YuStorageCompositionProjectionHit::default()
+        };
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_composition_projection_hit_test(
+                    raw,
+                    0,
+                    2,
+                    499.0,
+                    second.y + second.height * 0.5,
+                    14.0,
+                    500.0,
+                    &mut stale,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+        assert_eq!(stale, YuStorageCompositionProjectionHit::default());
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

@@ -417,6 +417,11 @@ selection/replacement range；Swift visual IME self-check 会同时验证 geomet
 generation 不得发布。该 endpoint 仍负责 IME caret geometry handoff，而同一 composition overlay
 已经由 workspace 的 transient block layout 进入 Metal glyph publication；无法建立合法 span 的
 情况才安全回退到 native source mirror。
+跨 block 点命中使用独立的
+`yu_storage_session_macos_composition_projection_hit_test`：它额外校验 composition generation，
+对命中的 transient block 使用 CoreText layout，再通过完整 transient projection 返回 source/visual
+UTF-16、document-space point、visual selection/replacement 和 block index；旧 canonical
+`yu_storage_session_macos_projection_hit_test` ABI 保持为普通 pointer/回退路径。
 
 视觉 scene/glyph/render-plan 的两次 count/fill 调用也携带同一
 `composition_generation`。Rust 在非零 fill capacity 前校验上一次 header；如果 marked text 在

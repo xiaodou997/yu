@@ -1039,6 +1039,40 @@ private struct NativeCompositionShapedCaret {
     }
 }
 
+private struct NativeCompositionProjectionHit {
+    let revision: UInt64
+    let generation: UInt64
+    let sourceUTF16: UInt64
+    let blockIndex: UInt64
+    let visualUTF16: UInt64
+    let roundTripSourceUTF16: UInt64
+    let line: UInt64
+    let point: CGPoint
+    let visualSelection: NSRange
+    let visualReplacement: NSRange
+    let affinity: UInt8
+
+    init(_ value: YuStorageCompositionProjectionHit) {
+        revision = value.revision
+        generation = value.generation
+        sourceUTF16 = value.source_utf16
+        blockIndex = value.block_index
+        visualUTF16 = value.visual_utf16
+        roundTripSourceUTF16 = value.round_trip_source_utf16
+        line = value.line
+        point = CGPoint(x: CGFloat(value.x), y: CGFloat(value.y))
+        visualSelection = NSRange(
+            location: Int(value.visual_selection_start_utf16),
+            length: Int(value.visual_selection_end_utf16 - value.visual_selection_start_utf16)
+        )
+        visualReplacement = NSRange(
+            location: Int(value.visual_replacement_start_utf16),
+            length: Int(value.visual_replacement_end_utf16 - value.visual_replacement_start_utf16)
+        )
+        affinity = value.affinity
+    }
+}
+
 private struct NativeCommandResult {
     let revision: UInt64
     let selection: NSRange
@@ -2073,6 +2107,30 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeCompositionShapedCaret(value)
+    }
+
+    func macosCompositionProjectionHitTest(
+        revision: UInt64,
+        generation: UInt64,
+        point: CGPoint,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NativeCompositionProjectionHit {
+        var value = YuStorageCompositionProjectionHit()
+        let status = yu_storage_session_macos_composition_projection_hit_test(
+            handle,
+            revision,
+            generation,
+            Float(point.x),
+            Float(point.y),
+            size,
+            maxWidth,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeCompositionProjectionHit(value)
     }
 
     func copySourceRange(_ range: NSRange, revision: UInt64) -> String {
@@ -5169,6 +5227,96 @@ private func runVisualIMESelfCheck(path: String) -> Never {
     }
 }
 
+private func runCompositionHitTestSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let source = bridge.source as NSString
+        let replacementStart = source.range(of: "x")
+        let replacementEnd = source.range(of: "日本語")
+        precondition(replacementStart.location != NSNotFound)
+        precondition(replacementEnd.location != NSNotFound)
+        let replacement = NSRange(
+            location: replacementStart.location,
+            length: replacementEnd.location + 2 - replacementStart.location
+        )
+        try bridge.beginComposition(
+            replacementRange: replacement,
+            preedit: "日本🙂",
+            selection: NSRange(location: 2, length: 2)
+        )
+
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let metrics = try bridge.macosFontMetrics(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(metrics.lineHeight),
+            defaultAdvance: Float(metrics.defaultAdvance),
+            estimatedBlockHeight: Float(metrics.lineHeight),
+            overscan: 0.0
+        )
+        let (_, blocks) = try bridge.macosShapedViewportBlocks(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0
+        )
+        let secondBlock = blocks.first { block in
+            block.sourceRange.location <= replacementEnd.location
+                && NSMaxRange(block.sourceRange) >= replacementEnd.location
+        } ?? blocks.last!
+        let point = CGPoint(
+            x: CGFloat(maxWidth - 1.0),
+            y: secondBlock.y + secondBlock.height * 0.5
+        )
+        let projection = try bridge.compositionProjection(revision: revision)
+        let hit = try bridge.macosCompositionProjectionHitTest(
+            revision: revision,
+            generation: projection.generation,
+            point: point,
+            size: size,
+            maxWidth: maxWidth
+        )
+        precondition(hit.revision == revision)
+        precondition(hit.generation == projection.generation)
+        precondition(hit.blockIndex == secondBlock.blockIndex)
+        precondition(hit.point.x.isFinite && hit.point.y.isFinite)
+        precondition(hit.visualSelection == projection.visualSelection)
+        precondition(hit.visualReplacement == projection.visualReplacementRange)
+        precondition(hit.visualUTF16 >= UInt64(projection.visualReplacementRange.location))
+        do {
+            _ = try bridge.macosCompositionProjectionHitTest(
+                revision: revision,
+                generation: projection.generation + 1,
+                point: point,
+                size: size,
+                maxWidth: maxWidth
+            )
+            preconditionFailure("stale composition hit unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == 16)
+        }
+        try bridge.cancelComposition()
+        precondition(!bridge.composition.active)
+        precondition(bridge.state.revision == revision)
+        print(
+            "Yu Composition Hit-Test self-check: cross-block transient point mapped "
+                + "at block \(hit.blockIndex), generation \(hit.generation)"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Composition Hit-Test self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runBlockProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -6605,6 +6753,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-mirror-self-check")
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-ime-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualIMESelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--composition-hit-test-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runCompositionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
