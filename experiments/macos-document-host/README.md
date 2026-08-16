@@ -199,6 +199,18 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检目前只验证矩形 scene 协议，不连接生产 TextKit、glyph atlas 或 Metal surface；Swift 不推导
 block 高度或 Markdown 语义。
 
+验证 inline/reference image 的 source/label/destination UTF-16 ranges、resource fingerprint 和
+编辑后的 stale Revision 拒绝（当前阶段不解码图片、不创建 Metal texture）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --visual-image-self-check experiments/macos-document-host/Fixtures/render-images.md
+```
+
+图片 destination 由 Rust projection 返回，Swift 只可通过现有 source-range API 取得文本并交给
+后续 ImageIO worker；`yu-assets::ImageCache` 的 pending/decoded publication 规则在 Rust 单元测试
+中验证。
+
 验证 CoreText-shaped glyph、CPU atlas page metadata、backend-neutral RenderPlan damage，以及同一
 Revision 的 count/fill/stale 协议（不启动窗口）：
 

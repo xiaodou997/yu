@@ -652,3 +652,14 @@ partial-damage frame 在进入 Objective-C bridge 前由 macOS backend 按 nativ
 过滤不与 dirty region 相交的命令；full-clear frame 仍发送完整 painter-order list。过滤只影响
 backend-owned 临时 ABI 数组，不能修改 shared `RenderPlan` 或 scene，因此不会引入第二套 source
 geometry。见 ADR 0073。
+
+图片资源沿用同一条 source-backed 边界。`yu-projection::ImageSource` 只引用 image source、alt
+label、inline destination 和 reference label 的 `TextRange`；Projection 映射 strictly-outside
+edit 时同步这些 ranges，图片 URL 不进入 `EditorDocument` 的第二份状态。`yu-assets::ImageCache`
+把 destination 作为去重 key，提供可由平台 worker 轮询的 pending 队列、RGBA8 尺寸校验和
+Revision-bound `ImagePublication`；decoded bytes 可以跨 Revision 重绑定，旧 Revision 的结果在
+cache boundary 被拒绝。macOS storage FFI 的 `YuStorageVisualImage` 只复制同一 Revision 的
+UTF-16 ranges、kind 和 resource fingerprint，native 可以用已有 source-range API 取得 destination
+后再排入 ImageIO。当前阶段尚未创建 RGBA Metal texture 或 Image RenderCommand；下一阶段才把
+ready publication 接入 backend-owned texture，并为未就绪图片定义不阻塞编辑线程的 placeholder。
+见 ADR 0141。

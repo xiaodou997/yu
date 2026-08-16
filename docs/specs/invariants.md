@@ -50,6 +50,9 @@
 2. 每个结果携带输入 Revision。
 3. 过期结果不得发布到当前编辑状态。
 4. 取消只是优化；Revision 检查才是正确性边界。
+5. `yu-assets::ImageCache` 的 pending image request 必须按 destination 去重；`DecodedImage`
+   必须验证正尺寸与 `width*height*4` RGBA8 长度，旧 Revision 的 publication 必须在 cache/native
+   texture boundary 前拒绝，ready bytes 可以跨 Revision 重绑定但 generation 必须可观测。
 
 ## Input
 
@@ -304,6 +307,9 @@
    普通 Transaction 替换 marker 状态字节，非 task block 必须拒绝且不改变文档。
 8. 列表编辑命令只能对当前 parser 识别的 `ListItem`/`TaskListItem` 行生效；空项退出必须保留
    原有 line ending，Indent/Outdent 最多改动两个 ASCII 空格，selection 必须通过 ChangeSet 映射。
+9. `Projection::images()` 返回的 `ImageSource` 只能保存 parser-owned source/label/destination/
+   reference ranges；这些 ranges 必须随 strictly-outside edit 映射，intersecting edit 必须重新
+   解析，图片 URL/alt 文本不得成为 editor 的第二份 canonical state。
 
 ## Layout
 
@@ -539,3 +545,7 @@
    Revision/generation 完全一致；generation 变化必须返回 `YU_STORAGE_STALE_COMPOSITION`、清空
    header/written 计数并禁止部分数组写入。host/surface snapshot 也必须回传同一 generation，Swift
    不得只用 canonical Revision 判定 marked-text glyph frame 是否仍可提交。
+9. `yu_storage_session_macos_visual_images` 的每个记录必须来自同一 Revision 的 parser-owned
+   image ranges；inline/reference kind、resolved destination range 和 resource fingerprint 必须
+   一致，count/fill 容量不足或 stale Revision 不得写入部分数组。该 ABI 只发布 source metadata，
+   不得把 decoded bytes、ImageIO 对象或 Metal texture 当作已完成的 visual render。

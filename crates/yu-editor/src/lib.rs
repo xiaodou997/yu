@@ -43,6 +43,6 @@ pub use yu_layout::{
 };
 pub use yu_markdown::{Block, BlockKind, MarkdownDocument};
 pub use yu_projection::{
-    BlockProjection, BlockProjectionKind, CodeProjection, Projection, ProjectionBias,
+    BlockProjection, BlockProjectionKind, CodeProjection, ImageSource, Projection, ProjectionBias,
     ProjectionError, VisualOffset, VisualRange, VisualRun, VisualRunKind, VisualRunStyle,
 };
