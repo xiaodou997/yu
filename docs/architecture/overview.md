@@ -165,6 +165,11 @@ composition、stale geometry、resize 和 submit 失败都回到完整 TextKit s
 caret 或 selection 像素。role 切换会一起更新 selection paint attributes，避免旧的 projected
 样式跨帧残留。见 ADR 0151。
 
+当前 production host 已进一步限制 `projectedTextKitOverlay` 只能服务 active composition。
+普通 stale Revision、不可用 geometry、surface 尚未提交或 Rust decoration 查询失败都会清除
+旧 overlay 并回到 `sourceFallback`；只有同一 Revision 的 Rust surface 与 decoration 再次成对
+有效后才恢复 `rustSurface`。见 ADR 0152。
+
 `EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
 按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
 Revision。光标移动、显式 selection、composition 边界和 reset 会断开 group；新的永久 edit 会清空

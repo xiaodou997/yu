@@ -64,6 +64,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 产品窗口将 source-glyph gate 收敛为带 frame identity 与 fallback reason 的显式 visual render state machine，并提供无窗口 transition self-check
 - [x] Rust surface 与 Rust-shaped decoration 成对控制可见性；TextKit fallback 不再与旧 Rust glyph surface 叠加
 - [x] `DocumentTextView` 以 source fallback、projected TextKit overlay、Rust surface 三种显式 presentation role 管理绘制责任
+- [x] projected TextKit overlay 限制在 active composition；普通 stale/geometry/surface 失败直接回到 canonical source fallback
 - [x] fenced code block 的 Revision-bound `FillRect` 背景进入 Scene/RenderPlan/Metal solid pipeline，并保持 fill-before-glyph painter order
 - [x] `yu-projection::ImageSource` 保留 inline/reference image 的 source/label/destination ranges，并随 strictly-outside edit 映射
 - [x] `yu-assets::ImageCache` 建立可轮询异步解码队列、destination 去重、RGBA8 校验和 Revision-bound CPU publication
