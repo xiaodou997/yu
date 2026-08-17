@@ -4745,6 +4745,11 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private var visualPointerAdapterEnabled = false
     private var visualPointerLayoutWidth: CGFloat = -1.0
     private var visualRenderStateMachine = VisualRenderStateMachine()
+    /// True only when the current decoration sibling came from the same Rust
+    /// shaped frame that may become the primary visual surface. TextKit
+    /// projected decorations are a fallback overlay and must never hide the
+    /// source mirror or leave a stale Metal frame visible underneath it.
+    private var rustDecorationFrameAccepted = false
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
@@ -4947,8 +4952,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         reason: VisualRenderFallbackReason = .disabled
     ) {
         decorationHostView.clear()
+        rustDecorationFrameAccepted = false
         textView.setExternalVisualDecorationsEnabled(false)
         textView.setSourceGlyphsHidden(false)
+        surfaceHostView.setNativeContentVisible(false)
         visualRenderStateMachine.enterFallback(reason)
     }
 
@@ -4963,8 +4970,13 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             && decorationHostView.hasValidFrame
         let canHideSourceGlyphs = publicationCurrent
             && decorationCurrent
+            && rustDecorationFrameAccepted
             && !bridge.composition.active
         textView.setSourceGlyphsHidden(canHideSourceGlyphs)
+        // The Rust surface and its Rust-shaped decoration frame are one
+        // visual publication. If either side is stale, hide the surface as a
+        // unit and let TextKit render the source mirror until both are ready.
+        surfaceHostView.setNativeContentVisible(canHideSourceGlyphs)
 
         if canHideSourceGlyphs,
            let snapshot = surfaceCoordinator.lastSnapshot,
@@ -5049,6 +5061,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                       snapshot.caretPresent,
                       caret.present,
                       caret.revision == snapshot.revision else {
+                    rustDecorationFrameAccepted = false
                     updateVisualDecorationsFromTextKit()
                     return
                 }
@@ -5073,6 +5086,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                     caretRect: localCaret,
                     compositionActive: false
                 )
+                rustDecorationFrameAccepted = true
                 textView.setExternalVisualDecorationsEnabled(true)
                 syncSourceGlyphVisibility()
                 return
@@ -5080,10 +5094,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                 // Active marked text intentionally returns NO_OVERLAY; stale
                 // revisions and unavailable CoreText metrics use the same
                 // disposable TextKit path below.
+                rustDecorationFrameAccepted = false
             }
         }
         updateVisualDecorationsFromTextKit()
-        syncSourceGlyphVisibility()
     }
 
     /// Converts the disposable visual mirror geometry into the sibling
@@ -5096,6 +5110,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             clearVisualDecorations(reason: .visualMirrorUnavailable)
             return
         }
+        rustDecorationFrameAccepted = false
         let selection = textView.visualSelectionRectsForDisplay().map {
             textView.convert($0, to: decorationHostView)
         }
