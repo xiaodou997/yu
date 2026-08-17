@@ -100,6 +100,10 @@ enum {
     YU_STORAGE_PROJECTION_FENCED_CODE = 1,
     YU_STORAGE_PROJECTION_REFERENCE_DEFINITION = 2,
     YU_STORAGE_PROJECTION_TASK_LIST = 3,
+    YU_STORAGE_PROJECTION_HEADING = 4,
+    YU_STORAGE_PROJECTION_BLOCK_QUOTE = 5,
+    YU_STORAGE_PROJECTION_LIST = 6,
+    YU_STORAGE_PROJECTION_TABLE = 7,
 };
 
 enum {
@@ -328,6 +332,16 @@ typedef struct YuStorageProjectionBlock {
     uint8_t kind;
     uint8_t projection_kind;
 } YuStorageProjectionBlock;
+
+/* Parser-owned GFM table cell range. row 0 is the header, row 1 is the
+ * delimiter, and body rows start at row 2. Offsets are UTF-16 positions in
+ * the requested revision. */
+typedef struct YuStorageTableCellRange {
+    uint64_t row;
+    uint64_t column;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+} YuStorageTableCellRange;
 
 /* Revision-bound layout metadata for one parser-owned block. width/height
  * are block-local layout points; shaped is non-zero for CoreText output. */
@@ -792,6 +806,10 @@ int32_t yu_storage_session_projected_block(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, YuStorageProjectionBlock *metadata,
     uint8_t *output, size_t capacity, size_t *written);
+int32_t yu_storage_session_projected_table_cells(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, YuStorageTableCellRange *output,
+    size_t capacity, size_t *written);
 int32_t yu_storage_session_block_layout(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, float max_width, float line_height,

@@ -89,6 +89,7 @@ impl ProjectionCache {
             BlockProjection::Heading(_)
             | BlockProjection::BlockQuote(_)
             | BlockProjection::List(_)
+            | BlockProjection::Table(_)
             | BlockProjection::FencedCode(_)
             | BlockProjection::ReferenceDefinition(_)
             | BlockProjection::TaskList(_) => {
@@ -114,6 +115,7 @@ impl ProjectionCache {
             BlockProjection::Heading(_)
             | BlockProjection::BlockQuote(_)
             | BlockProjection::List(_)
+            | BlockProjection::Table(_)
             | BlockProjection::FencedCode(_)
             | BlockProjection::ReferenceDefinition(_)
             | BlockProjection::TaskList(_) => {

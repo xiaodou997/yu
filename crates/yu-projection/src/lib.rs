@@ -14,7 +14,8 @@ use std::sync::Arc;
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 use yu_markdown::{
     Block, BlockKind, InlineDocument, InlineNodeKind, InlineParseError, InlineSpan, InlineSpanKind,
-    ReferenceDefinitionIndex, parse_inline, parse_inline_with_definitions,
+    ReferenceDefinitionIndex, TableBlock, parse_inline, parse_inline_with_definitions,
+    parse_table_in_snapshot,
 };
 use yu_text::{AnchorMapError, ChangeSet, TextChange, TextPositionError, TextSnapshot};
 
@@ -1191,6 +1192,24 @@ fn map_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, Project
     TextRange::new(start, end).ok_or(ProjectionError::OffsetOverflow)
 }
 
+fn map_table_cell(
+    range: yu_markdown::TableCellRange,
+    changes: &ChangeSet,
+) -> Result<yu_markdown::TableCellRange, ProjectionError> {
+    let mapped = map_range(byte_range(range.start(), range.end())?, changes)?;
+    Ok(yu_markdown::TableCellRange::new(
+        usize::try_from(mapped.start()).map_err(|_| ProjectionError::OffsetOverflow)?,
+        usize::try_from(mapped.end()).map_err(|_| ProjectionError::OffsetOverflow)?,
+    ))
+}
+
+fn map_table_row(
+    range: yu_markdown::TableRowRange,
+    changes: &ChangeSet,
+) -> Result<TextRange, ProjectionError> {
+    map_range(byte_range(range.start(), range.end())?, changes)
+}
+
 fn build_runs(
     source: &TextSnapshot,
     source_range: TextRange,
@@ -1420,9 +1439,133 @@ pub enum BlockProjectionKind {
     Heading,
     BlockQuote,
     List,
+    Table,
     FencedCode,
     ReferenceDefinition,
     TaskList,
+}
+
+/// A source-backed GFM table projection.
+///
+/// The visual stream is intentionally still the ordinary inline projection in
+/// this stage.  `TableBlock` carries absolute source ranges for the header,
+/// delimiter and body cells so a later retained table layout can replace the
+/// pipes with a grid without creating a second document model.
+#[derive(Clone, Debug)]
+pub struct TableProjection {
+    visual: Projection,
+    table: TableBlock,
+}
+
+impl TableProjection {
+    fn from_block(
+        source: &TextSnapshot,
+        block: Block,
+        definitions: Option<&ReferenceDefinitionIndex>,
+    ) -> Result<Option<Self>, ProjectionError> {
+        let Some(table) = parse_table_in_snapshot(source, block.range()) else {
+            return Ok(None);
+        };
+        let visual = match definitions {
+            Some(definitions) => {
+                Projection::inline_with_definitions(source, block.range(), definitions)?
+            }
+            None => Projection::inline(source, block.range())?,
+        };
+        Ok(Some(Self { visual, table }))
+    }
+
+    #[must_use]
+    pub fn visual(&self) -> &Projection {
+        &self.visual
+    }
+
+    #[must_use]
+    pub fn table(&self) -> &TableBlock {
+        &self.table
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.visual.revision()
+    }
+
+    #[must_use]
+    pub fn source_range(&self) -> TextRange {
+        self.visual.source_range()
+    }
+
+    pub fn with_composition(
+        &self,
+        replacement_range: TextRange,
+        text: impl Into<Arc<str>>,
+        selection_bytes: TextRange,
+    ) -> Result<Self, ProjectionError> {
+        Ok(Self {
+            visual: self
+                .visual
+                .with_composition(replacement_range, text, selection_bytes)?,
+            table: self.table.clone(),
+        })
+    }
+
+    fn map_through(
+        &self,
+        changes: &ChangeSet,
+        snapshot: &TextSnapshot,
+    ) -> Result<Option<Self>, ProjectionError> {
+        let Some(visual) = self.visual.map_through(changes, snapshot)? else {
+            return Ok(None);
+        };
+        let source_range = map_table_cell(self.table.source_range(), changes)?;
+        let header = self
+            .table
+            .header()
+            .iter()
+            .copied()
+            .map(|range| map_table_cell(range, changes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let delimiter = self
+            .table
+            .delimiter()
+            .iter()
+            .copied()
+            .map(|range| map_table_cell(range, changes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows = self
+            .table
+            .rows()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .copied()
+                    .map(|range| map_table_cell(range, changes))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let row_ranges = self
+            .table
+            .row_ranges()
+            .iter()
+            .copied()
+            .map(|range| {
+                let mapped = map_table_row(range, changes)?;
+                Ok(yu_markdown::TableRowRange::new(
+                    usize::try_from(mapped.start()).map_err(|_| ProjectionError::OffsetOverflow)?,
+                    usize::try_from(mapped.end()).map_err(|_| ProjectionError::OffsetOverflow)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProjectionError>>()?;
+        let table = TableBlock::from_mapped_ranges(
+            source_range,
+            header,
+            delimiter,
+            self.table.alignments().to_vec(),
+            rows,
+            row_ranges,
+        );
+        Ok(Some(Self { visual, table }))
+    }
 }
 
 /// A source-backed fenced-code projection.
@@ -1591,6 +1734,7 @@ pub enum BlockProjection {
     Heading(Projection),
     BlockQuote(Projection),
     List(Projection),
+    Table(TableProjection),
     FencedCode(CodeProjection),
     ReferenceDefinition(Projection),
     TaskList(Projection),
@@ -1603,6 +1747,13 @@ impl BlockProjection {
                 Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
             }
             BlockKind::TaskListItem { .. } => Self::task_list(source, block, None),
+            BlockKind::Paragraph => {
+                if let Some(table) = TableProjection::from_block(source, block, None)? {
+                    Ok(Self::Table(table))
+                } else {
+                    Self::from_block_without_definitions(source, block)
+                }
+            }
             _ => Self::from_block_without_definitions(source, block),
         }
     }
@@ -1632,6 +1783,15 @@ impl BlockProjection {
             BlockKind::ListItem { .. } => {
                 Self::structural_inline(source, block, definitions, BlockProjectionKind::List)
             }
+            BlockKind::Paragraph => {
+                if let Some(table) = TableProjection::from_block(source, block, Some(definitions))?
+                {
+                    Ok(Self::Table(table))
+                } else {
+                    Projection::inline_with_definitions(source, block.range(), definitions)
+                        .map(Self::Inline)
+                }
+            }
             _ => Projection::inline_with_definitions(source, block.range(), definitions)
                 .map(Self::Inline),
         }
@@ -1659,6 +1819,9 @@ impl BlockProjection {
             Self::List(projection) => projection
                 .with_composition(replacement_range, text, selection_bytes)
                 .map(Self::List),
+            Self::Table(projection) => projection
+                .with_composition(replacement_range, text, selection_bytes)
+                .map(Self::Table),
             Self::FencedCode(projection) => projection
                 .with_composition(replacement_range, text, selection_bytes)
                 .map(Self::FencedCode),
@@ -1737,6 +1900,7 @@ impl BlockProjection {
                 let inline = parse_inline(source, block.range())?;
                 Projection::from_inline(&inline).map(Self::List)
             }
+            BlockKind::Paragraph => Projection::inline(source, block.range()).map(Self::Inline),
             _ => Projection::inline(source, block.range()).map(Self::Inline),
         }
     }
@@ -1748,6 +1912,7 @@ impl BlockProjection {
             Self::Heading(_) => BlockProjectionKind::Heading,
             Self::BlockQuote(_) => BlockProjectionKind::BlockQuote,
             Self::List(_) => BlockProjectionKind::List,
+            Self::Table(_) => BlockProjectionKind::Table,
             Self::FencedCode(_) => BlockProjectionKind::FencedCode,
             Self::ReferenceDefinition(_) => BlockProjectionKind::ReferenceDefinition,
             Self::TaskList(_) => BlockProjectionKind::TaskList,
@@ -1761,6 +1926,7 @@ impl BlockProjection {
             Self::Heading(projection) => projection,
             Self::BlockQuote(projection) => projection,
             Self::List(projection) => projection,
+            Self::Table(projection) => projection.visual(),
             Self::FencedCode(projection) => projection.visual(),
             Self::ReferenceDefinition(projection) => projection,
             Self::TaskList(projection) => projection,
@@ -1795,6 +1961,9 @@ impl BlockProjection {
                 .map(Self::BlockQuote)),
             Self::List(projection) => {
                 Ok(projection.map_through(changes, snapshot)?.map(Self::List))
+            }
+            Self::Table(projection) => {
+                Ok(projection.map_through(changes, snapshot)?.map(Self::Table))
             }
             Self::FencedCode(projection) => Ok(projection
                 .map_through(changes, snapshot)?
@@ -2291,6 +2460,68 @@ mod tests {
         assert!(list_projection.visual().runs().iter().any(|run| {
             run.kind() == VisualRunKind::Visible && run.source().start() == list.range().start()
         }));
+    }
+
+    #[test]
+    fn table_projection_keeps_absolute_source_cell_ranges() {
+        let source = "intro\n\n| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let table_block = markdown.blocks().get(2).expect("table paragraph");
+        let projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            table_block,
+            markdown.reference_definitions(),
+        )
+        .expect("table projection should build");
+        assert_eq!(projection.kind(), BlockProjectionKind::Table);
+        let BlockProjection::Table(table) = &projection else {
+            panic!("expected table projection");
+        };
+        assert_eq!(table.table().column_count(), 2);
+        assert_eq!(table.table().body_row_count(), 1);
+        assert_eq!(
+            table.table().source_range().start(),
+            table_block.range().start().get() as usize
+        );
+        assert_eq!(
+            table.table().header()[0].start(),
+            source.find("A").expect("header")
+        );
+        assert_eq!(
+            table.table().rows()[0][1].end(),
+            source.rfind('2').expect("body") + 1
+        );
+        let projected = projection
+            .visual()
+            .runs()
+            .iter()
+            .filter(|run| run.kind() != VisualRunKind::HiddenSyntax)
+            .map(|run| projection.visual().text_for_run(*run))
+            .collect::<Result<String, _>>()
+            .expect("table visual text");
+        assert!(projected.contains("| A | B |"));
+
+        let mut buffer = TextBuffer::new(source);
+        let edit = yu_text::Transaction::new(
+            buffer.revision(),
+            [yu_text::Edit::new(
+                TextRange::empty(ByteOffset::ZERO),
+                "前缀\n",
+            )],
+        );
+        let applied = buffer.apply(&edit).expect("prefix edit should apply");
+        let mapped = projection
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .expect("table mapping should succeed")
+            .expect("outside edit should retain table projection");
+        let BlockProjection::Table(mapped_table) = mapped else {
+            panic!("mapped projection should remain a table");
+        };
+        assert_eq!(
+            mapped_table.table().header()[0].start(),
+            table.table().header()[0].start() + 7
+        );
     }
 
     #[test]

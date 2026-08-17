@@ -32,7 +32,9 @@ pub use inline::{
     InlinePunctuation, InlineSpan, InlineSpanKind, parse_inline, parse_inline_with_definitions,
 };
 pub use reference::{ReferenceDefinition, ReferenceDefinitionIndex};
-pub use table::{TableAlignment, TableBlock, TableCellRange, parse_table};
+pub use table::{
+    TableAlignment, TableBlock, TableCellRange, TableRowRange, parse_table, parse_table_in_snapshot,
+};
 pub use task::TaskMarker;
 
 /// A lossless block view of one immutable text revision.

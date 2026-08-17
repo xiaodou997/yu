@@ -3158,6 +3158,7 @@ mod tests {
                 | BlockProjection::Heading(_)
                 | BlockProjection::BlockQuote(_)
                 | BlockProjection::List(_)
+                | BlockProjection::Table(_)
                 | BlockProjection::ReferenceDefinition(_)
                 | BlockProjection::TaskList(_) => {
                     panic!("fenced code must not use inline projection")
@@ -3187,6 +3188,7 @@ mod tests {
             | BlockProjection::Heading(_)
             | BlockProjection::BlockQuote(_)
             | BlockProjection::List(_)
+            | BlockProjection::Table(_)
             | BlockProjection::ReferenceDefinition(_)
             | BlockProjection::TaskList(_) => {
                 panic!("fenced code must use code projection")
@@ -3209,6 +3211,7 @@ mod tests {
             | BlockProjection::Heading(_)
             | BlockProjection::BlockQuote(_)
             | BlockProjection::List(_)
+            | BlockProjection::Table(_)
             | BlockProjection::ReferenceDefinition(_)
             | BlockProjection::TaskList(_) => {
                 panic!("fenced code must use code projection")
