@@ -5102,8 +5102,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     /// Publishes Rust/CoreText-shaped decoration geometry into the sibling
     /// overlay. The Rust coordinates are document-space and the only native
     /// transform here is the current scroll offset into the surface sibling's
-    /// viewport-local coordinate system. TextKit remains a fallback for active
-    /// composition, stale geometry, or a not-yet-laid-out surface.
+    /// viewport-local coordinate system. TextKit's projected overlay is kept
+    /// only for active composition; ordinary stale geometry or an unavailable
+    /// surface returns to the canonical source fallback instead.
     private func updateVisualDecorations() {
         guard decorationHostView.superview != nil else {
             clearVisualDecorations(reason: .missingGeometry)
@@ -5124,7 +5125,11 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                       caret.present,
                       caret.revision == snapshot.revision else {
                     rustDecorationFrameAccepted = false
-                    updateVisualDecorationsFromTextKit()
+                    if bridge.composition.active {
+                        updateVisualDecorationsFromTextKit()
+                    } else {
+                        clearVisualDecorations(reason: .decorationUnavailable)
+                    }
                     return
                 }
                 let scrollY = geometry.scrollY
@@ -5153,19 +5158,31 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                 return
             } catch {
                 // Active marked text intentionally returns NO_OVERLAY; stale
-                // revisions and unavailable CoreText metrics use the same
-                // disposable TextKit path below.
+                // revisions and unavailable CoreText metrics must not use a
+                // projected TextKit overlay in ordinary source mode.
                 rustDecorationFrameAccepted = false
+                if bridge.composition.active {
+                    updateVisualDecorationsFromTextKit()
+                } else {
+                    clearVisualDecorations(reason: .decorationUnavailable)
+                }
+                return
             }
         }
-        updateVisualDecorationsFromTextKit()
+        if bridge.composition.active {
+            updateVisualDecorationsFromTextKit()
+        } else {
+            clearVisualDecorations(reason: .missingGeometry)
+        }
     }
 
     /// Converts the disposable visual mirror geometry into the sibling
-    /// decoration view's local coordinates. This remains the source/IME
-    /// fallback while the Rust-shaped provider is unavailable or transient.
+    /// decoration view's local coordinates for active marked text only. A
+    /// normal Revision/geometry failure uses the canonical source fallback;
+    /// it must not turn TextKit's projected caret into a second renderer.
     private func updateVisualDecorationsFromTextKit() {
-        guard visualPointerAdapterEnabled,
+        guard bridge.composition.active,
+              visualPointerAdapterEnabled,
               decorationHostView.superview != nil,
               let caret = textView.visualCaretRectForDisplay() else {
             clearVisualDecorations(reason: .visualMirrorUnavailable)
