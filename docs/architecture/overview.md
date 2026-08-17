@@ -171,6 +171,12 @@ caret 或 selection 像素。role 切换会一起更新 selection paint attribut
 和 selection geometry 进入 `rustSurface`；普通 stale Revision、不可用 geometry、surface 尚未
 提交或 Rust decoration 查询失败都会清除旧 overlay 并回到 `sourceFallback`。见 ADR 0152、0153。
 
+composition publication 现在还把 count/fill header 与 Swift source-glyph gate 统一到同一
+generation contract：preedit update/cancel 会使旧 RenderPlan、scene-glyph 或 decoration fill
+立即 stale，新的 surface snapshot 与 Rust caret/selection 必须重新成对发布；Swift 的纯 gate
+predicate 只接受同一 Revision、composition generation、surface/frame identity 的 publication。
+见 ADR 0154。
+
 `EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
 按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
 Revision。光标移动、显式 selection、composition 边界和 reset 会断开 group；新的永久 edit 会清空

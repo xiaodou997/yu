@@ -4280,6 +4280,51 @@ private struct VisualRenderFrameIdentity: Equatable, CustomStringConvertible {
     }
 }
 
+private struct VisualRenderPublicationIdentity: Equatable {
+    let frame: VisualRenderFrameIdentity
+    let submitted: Bool
+
+    init(frame: VisualRenderFrameIdentity, submitted: Bool) {
+        self.frame = frame
+        self.submitted = submitted
+    }
+
+    init(_ snapshot: NativeMacosRenderHostSurfaceSnapshot) {
+        frame = VisualRenderFrameIdentity(
+            revision: snapshot.revision,
+            compositionGeneration: snapshot.compositionGeneration,
+            surfaceGeneration: snapshot.surfaceGeneration,
+            frameSerial: snapshot.frameSerial
+        )
+        submitted = snapshot.submitted
+    }
+}
+
+/// Returns the one publication identity that is allowed to hide TextKit's
+/// source glyphs. Keeping this predicate pure makes the composition-generation
+/// race testable without constructing an AppKit view or a Metal drawable.
+private func acceptedVisualRenderFrame(
+    revision: UInt64,
+    compositionGeneration: UInt64,
+    publicationCurrent: Bool,
+    publication: VisualRenderPublicationIdentity?,
+    decorationRevision: UInt64?,
+    decorationHasValidFrame: Bool,
+    rustDecorationFrameAccepted: Bool
+) -> VisualRenderFrameIdentity? {
+    guard publicationCurrent,
+          decorationRevision == revision,
+          decorationHasValidFrame,
+          rustDecorationFrameAccepted,
+          let publication,
+          publication.submitted,
+          publication.frame.revision == revision,
+          publication.frame.compositionGeneration == compositionGeneration else {
+        return nil
+    }
+    return publication.frame
+}
+
 private enum VisualRenderFallbackReason: String, Equatable, CustomStringConvertible {
     case disabled
     case detached
@@ -5024,9 +5069,16 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         )
         let decorationCurrent = decorationHostView.revision == revision
             && decorationHostView.hasValidFrame
-        let canHideSourceGlyphs = publicationCurrent
-            && decorationCurrent
-            && rustDecorationFrameAccepted
+        let activeFrame = acceptedVisualRenderFrame(
+            revision: revision,
+            compositionGeneration: compositionGeneration,
+            publicationCurrent: publicationCurrent,
+            publication: surfaceCoordinator.lastSnapshot.map(VisualRenderPublicationIdentity.init),
+            decorationRevision: decorationHostView.revision,
+            decorationHasValidFrame: decorationHostView.hasValidFrame,
+            rustDecorationFrameAccepted: rustDecorationFrameAccepted
+        )
+        let canHideSourceGlyphs = activeFrame != nil
         if canHideSourceGlyphs {
             textView.useRustSurfacePresentation()
         } else if useProjectedTextKitFallback {
@@ -5039,19 +5091,8 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         // unit and let TextKit render the source mirror until both are ready.
         surfaceHostView.setNativeContentVisible(canHideSourceGlyphs)
 
-        if canHideSourceGlyphs,
-           let snapshot = surfaceCoordinator.lastSnapshot,
-           snapshot.submitted,
-           snapshot.revision == revision,
-           snapshot.compositionGeneration == compositionGeneration {
-            visualRenderStateMachine.activate(
-                VisualRenderFrameIdentity(
-                    revision: snapshot.revision,
-                    compositionGeneration: snapshot.compositionGeneration,
-                    surfaceGeneration: snapshot.surfaceGeneration,
-                    frameSerial: snapshot.frameSerial
-                )
-            )
+        if let activeFrame {
+            visualRenderStateMachine.activate(activeFrame)
             return
         }
 
@@ -5071,9 +5112,6 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         publicationCurrent: Bool,
         decorationCurrent: Bool
     ) -> VisualRenderFallbackReason {
-        if bridge.composition.active {
-            return .compositionActive
-        }
         guard decorationCurrent else {
             if let decorationRevision = decorationHostView.revision,
                decorationRevision != revision {
@@ -5094,6 +5132,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                 return .staleComposition
             }
             return snapshot.submitted ? .waitingForSurface : .surfaceSubmitFailed
+        }
+        if bridge.composition.active {
+            return .compositionActive
         }
         return .invalidFrame
     }
@@ -6131,13 +6172,59 @@ private func runVisualRenderStateSelfCheck() -> Never {
     precondition(machine.state.isActive)
     precondition(machine.diagnosticDescription.contains("revision=7"))
 
+    let publication = VisualRenderPublicationIdentity(frame: frame, submitted: true)
+    precondition(
+        acceptedVisualRenderFrame(
+            revision: 7,
+            compositionGeneration: 3,
+            publicationCurrent: true,
+            publication: publication,
+            decorationRevision: 7,
+            decorationHasValidFrame: true,
+            rustDecorationFrameAccepted: true
+        ) == frame
+    )
+    precondition(
+        acceptedVisualRenderFrame(
+            revision: 7,
+            compositionGeneration: 4,
+            publicationCurrent: true,
+            publication: publication,
+            decorationRevision: 7,
+            decorationHasValidFrame: true,
+            rustDecorationFrameAccepted: true
+        ) == nil
+    )
+    precondition(
+        acceptedVisualRenderFrame(
+            revision: 7,
+            compositionGeneration: 3,
+            publicationCurrent: false,
+            publication: publication,
+            decorationRevision: 7,
+            decorationHasValidFrame: true,
+            rustDecorationFrameAccepted: true
+        ) == nil
+    )
+    precondition(
+        acceptedVisualRenderFrame(
+            revision: 7,
+            compositionGeneration: 3,
+            publicationCurrent: true,
+            publication: publication,
+            decorationRevision: 8,
+            decorationHasValidFrame: true,
+            rustDecorationFrameAccepted: true
+        ) == nil
+    )
+
     machine.enterFallback(.staleComposition)
     precondition(machine.state == .fallback(.staleComposition))
     precondition(!machine.state.isActive)
     precondition(machine.transitionSerial >= 4)
     print(
         "Yu Visual Render State self-check: explicit active/fallback transitions "
-            + "preserve frame identity and diagnostics"
+            + "preserve frame identity, generation gate and diagnostics"
     )
     exit(EXIT_SUCCESS)
 }
@@ -7120,6 +7207,71 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
                 && item.rect.height >= 0.0
         })
 
+        let compositionRange = (bridge.source as NSString).range(of: "粗体")
+        precondition(compositionRange.location != NSNotFound)
+        try bridge.beginComposition(
+            replacementRange: compositionRange,
+            preedit: "日本🙂",
+            selection: NSRange(location: 0, length: 2)
+        )
+        let initialComposition = bridge.composition
+        let (compositionPlan, compositionCommands, _, _) = try bridge.macosVisualRenderPlan(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0
+        )
+        precondition(compositionPlan.revision == revision)
+        precondition(compositionPlan.compositionGeneration == initialComposition.generation)
+        precondition(compositionPlan.commandCount == compositionCommands.count)
+        precondition(compositionPlan.commandCount > 0)
+        precondition(compositionCommands.allSatisfy { $0.revision == revision })
+        let (compositionDecoration, compositionCaret, compositionSelection) =
+            try bridge.macosVisualDecorations(
+                revision: revision,
+                compositionGeneration: initialComposition.generation,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 1_000.0
+            )
+        precondition(compositionDecoration.revision == revision)
+        precondition(compositionDecoration.compositionGeneration == initialComposition.generation)
+        precondition(compositionDecoration.caretPresent)
+        precondition(compositionCaret.present)
+        precondition(compositionDecoration.selectionCount == compositionSelection.count)
+        precondition(!compositionSelection.isEmpty)
+
+        try bridge.updateComposition(
+            preedit: "日本語",
+            selection: NSRange(location: 1, length: 2)
+        )
+        let updatedComposition = bridge.composition
+        precondition(updatedComposition.generation != initialComposition.generation)
+        let (updatedPlan, _, _, _) = try bridge.macosVisualRenderPlan(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0
+        )
+        precondition(updatedPlan.revision == revision)
+        precondition(updatedPlan.compositionGeneration == updatedComposition.generation)
+        let (updatedDecoration, updatedCaret, _) = try bridge.macosVisualDecorations(
+            revision: revision,
+            compositionGeneration: updatedComposition.generation,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0
+        )
+        precondition(updatedDecoration.compositionGeneration == updatedComposition.generation)
+        precondition(updatedDecoration.caretPresent && updatedCaret.present)
+        try bridge.cancelComposition()
+        precondition(!bridge.composition.active)
+        precondition(bridge.state.revision == revision)
+
         _ = try bridge.insertText("x")
         do {
             _ = try bridge.macosVisualRenderPlan(
@@ -7135,7 +7287,7 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
         }
         print(
             "Yu Visual Render Plan self-check: block fills, shaped glyph commands, atlas page fingerprints, "
-                + "damage and stale Revision rejection are valid"
+                + "damage, composition generation handoff and stale Revision rejection are valid"
         )
         exit(EXIT_SUCCESS)
     } catch {
