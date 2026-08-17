@@ -26,7 +26,8 @@ pub use shaping::{
     FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
 };
 pub use table::{
-    TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeHit, TableResizeTarget,
+    TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeCommit, TableResizeGesture,
+    TableResizeGestureError, TableResizeHit, TableResizeTarget,
 };
 
 /// Layout dimensions and wrapping policy independent of any font backend.
@@ -1881,7 +1882,7 @@ fn map_source_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, 
 mod tests {
     use super::*;
     use unicode_segmentation::UnicodeSegmentation;
-    use yu_core::{ByteOffset, TextRange};
+    use yu_core::{ByteOffset, Revision, TextRange};
     use yu_projection::Projection;
     use yu_text::TextBuffer;
 
@@ -2549,6 +2550,68 @@ mod tests {
                 .expect("outside tolerance"),
             None
         );
+    }
+
+    #[test]
+    fn table_resize_gesture_is_revision_bound_and_source_neutral() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table block");
+        let projection = BlockProjection::from_block(&snapshot, block).expect("table projection");
+        let layout = LayoutSnapshot::from_block_projection_with_metrics(
+            &projection,
+            LayoutConfig::new(20.0, 2.0),
+            &MonospaceMetrics::new(1.0),
+        )
+        .expect("table layout");
+        let hit = layout
+            .table()
+            .expect("table metadata")
+            .resize_hit_test(LayoutPoint::new(3.1, 0.5), 0.2)
+            .expect("column resize hit")
+            .expect("column divider");
+        let source_range = layout.table().expect("table metadata").source_range();
+        let mut gesture =
+            TableResizeGesture::begin(layout.revision(), 0, hit, 3.1).expect("gesture begin");
+        assert_eq!(gesture.target(), TableResizeTarget::Column { index: 0 });
+        assert_eq!(gesture.delta(), 0.0);
+        assert_eq!(gesture.proposed_position(), 3.0);
+        gesture
+            .update(layout.revision(), 4.0)
+            .expect("gesture update");
+        assert!((gesture.delta() - 0.9).abs() < 1.0e-5);
+        assert!((gesture.proposed_position() - 3.9).abs() < 1.0e-5);
+        assert_eq!(
+            gesture
+                .update(Revision::new(1), 5.0)
+                .expect_err("stale update"),
+            TableResizeGestureError::StaleRevision {
+                expected: layout.revision(),
+                actual: Revision::new(1),
+            }
+        );
+        assert_eq!(gesture.current_pointer(), 4.0);
+        let commit = gesture.finish(layout.revision()).expect("gesture finish");
+        assert_eq!(commit.revision(), layout.revision());
+        assert_eq!(commit.block_index(), 0);
+        assert_eq!(commit.target(), TableResizeTarget::Column { index: 0 });
+        assert_eq!(commit.initial_position(), 3.0);
+        assert!((commit.final_position() - 3.9).abs() < 1.0e-5);
+        assert!((commit.delta() - 0.9).abs() < 1.0e-5);
+        assert_eq!(
+            layout.table().expect("table metadata").source_range(),
+            source_range
+        );
+        assert_eq!(
+            TableResizeGesture::begin(layout.revision(), 0, hit, f32::NAN)
+                .expect_err("non-finite pointer"),
+            TableResizeGestureError::NonFinitePointer(f32::NAN.to_bits())
+        );
+        let cancelled =
+            TableResizeGesture::begin(layout.revision(), 0, hit, 3.1).expect("cancel begin");
+        assert_eq!(cancelled.cancel(layout.revision()), Ok(()));
     }
 
     #[test]
