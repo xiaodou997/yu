@@ -1535,6 +1535,75 @@ private final class StorageBridge {
         return Array(cells.prefix(written))
     }
 
+    func tableLayoutCells(
+        revision: UInt64,
+        blockIndex: UInt64,
+        maxWidth: Float,
+        lineHeight: Float,
+        defaultAdvance: Float
+    ) throws -> [YuStorageTableLayoutCell] {
+        var required = 0
+        let sizeStatus = yu_storage_session_table_layout_cells(
+            handle,
+            revision,
+            blockIndex,
+            maxWidth,
+            lineHeight,
+            defaultAdvance,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var cells = Array(repeating: YuStorageTableLayoutCell(), count: required)
+        var written = required
+        let copyStatus = cells.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_table_layout_cells(
+                handle,
+                revision,
+                blockIndex,
+                maxWidth,
+                lineHeight,
+                defaultAdvance,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard copyStatus == StorageStatus.ok, written >= 0, written <= cells.count else {
+            throw BridgeError.operation(copyStatus)
+        }
+        return Array(cells.prefix(written))
+    }
+
+    func tableCellHitTest(
+        revision: UInt64,
+        blockIndex: UInt64,
+        point: CGPoint,
+        maxWidth: Float,
+        lineHeight: Float,
+        defaultAdvance: Float
+    ) throws -> YuStorageTableCellHit {
+        var value = YuStorageTableCellHit()
+        let status = yu_storage_session_table_cell_hit_test(
+            handle,
+            revision,
+            blockIndex,
+            maxWidth,
+            lineHeight,
+            defaultAdvance,
+            Float(point.x),
+            Float(point.y),
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return value
+    }
+
     func blockLayout(
         revision: UInt64,
         blockIndex: UInt64,
@@ -6565,6 +6634,30 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
             precondition(cells.map(\.row) == [0, 0, 1, 1, 2, 2])
             precondition(cells.map(\.column) == [0, 1, 0, 1, 0, 1])
             precondition(cells.allSatisfy { $0.source_start_utf16 <= $0.source_end_utf16 })
+
+            let layoutCells = try bridge.tableLayoutCells(
+                revision: revision,
+                blockIndex: UInt64(tableIndex),
+                maxWidth: 20.0,
+                lineHeight: 2.0,
+                defaultAdvance: 1.0
+            )
+            precondition(layoutCells.count == 4, "table layout cell count mismatch")
+            precondition(layoutCells.map(\.row) == [0, 0, 1, 1])
+            precondition(layoutCells.map(\.column) == [0, 1, 0, 1])
+            precondition(layoutCells[0].y == 0.0)
+            precondition(layoutCells[2].y == 2.0)
+            precondition(layoutCells[1].alignment == YU_STORAGE_TABLE_ALIGNMENT_CENTER)
+            let hit = try bridge.tableCellHitTest(
+                revision: revision,
+                blockIndex: UInt64(tableIndex),
+                point: CGPoint(x: 3.5, y: 2.5),
+                maxWidth: 20.0,
+                lineHeight: 2.0,
+                defaultAdvance: 1.0
+            )
+            precondition(hit.row == 1 && hit.column == 1, "table hit-test mismatch")
+            precondition(hit.x == 3.0 && hit.y == 2.0)
         } else {
             preconditionFailure("table projection missing")
         }

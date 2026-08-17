@@ -103,9 +103,8 @@ impl TableBlock {
         &self.header
     }
 
-    /// Returns the parser-owned delimiter row.  Delimiter cells are kept in
-    /// the source model even though a future table layout may render the row
-    /// as borders rather than visible text.
+    /// Returns the parser-owned delimiter row. Delimiter cells remain in the
+    /// source model even though projection/layout suppress their visible row.
     #[must_use]
     pub fn delimiter(&self) -> &[TableCellRange] {
         &self.delimiter
@@ -126,6 +125,25 @@ impl TableBlock {
     #[must_use]
     pub fn row_ranges(&self) -> &[TableRowRange] {
         &self.row_ranges
+    }
+
+    /// Returns the complete source range for one physical row, including its
+    /// line ending when the next row is present.  This is useful when a
+    /// visual layout replaces a row with semantic geometry and must suppress
+    /// the parser-owned line break as well as the row's text.
+    #[must_use]
+    pub fn row_source_range(&self, row: usize) -> Option<TableCellRange> {
+        let current = *self.row_ranges.get(row)?;
+        let end = self
+            .row_ranges
+            .get(row.saturating_add(1))
+            .map_or(self.source_range.end(), |next| next.start());
+        Some(TableCellRange::new(current.start(), end))
+    }
+
+    #[must_use]
+    pub fn delimiter_source_range(&self) -> Option<TableCellRange> {
+        self.row_source_range(1)
     }
 
     #[must_use]

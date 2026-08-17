@@ -24,8 +24,8 @@ use yu_editor::{
     AccessibilityTextSnapshot, BlockKind, BlockProjection, BlockProjectionKind, CaretAffinity,
     CaretScrollRequest, CommandResult, EditorCommand, EditorDocumentError, EditorKey, ImageSource,
     KeyEvent, KeyModifiers, KeyRouteResult, LayoutConfig, LayoutPoint, LayoutSnapshot, Projection,
-    ProjectionBias, SelectionError, SourceSync, ViewportConfig, ViewportRect, VisualOffset,
-    VisualRunKind,
+    ProjectionBias, SelectionError, SourceSync, TableAlignment, TableCellLayout, TableLayoutHit,
+    ViewportConfig, ViewportRect, VisualOffset, VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_markdown::TableCellRange;
@@ -85,6 +85,11 @@ pub const YU_STORAGE_HTML_IMPORT_REJECTED: i32 = 18;
 pub const YU_STORAGE_CORE_TEXT_UNAVAILABLE: i32 = 19;
 pub const YU_STORAGE_INVALID_VIEWPORT_CONFIG: i32 = 20;
 pub const YU_STORAGE_RENDER_HOST_UNAVAILABLE: i32 = 21;
+
+pub const YU_STORAGE_TABLE_ALIGNMENT_DEFAULT: u8 = 0;
+pub const YU_STORAGE_TABLE_ALIGNMENT_LEFT: u8 = 1;
+pub const YU_STORAGE_TABLE_ALIGNMENT_CENTER: u8 = 2;
+pub const YU_STORAGE_TABLE_ALIGNMENT_RIGHT: u8 = 3;
 
 pub const YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND: u8 = 0;
 pub const YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS: u8 = 1;
@@ -414,6 +419,43 @@ pub struct YuStorageTableCellRange {
     pub column: u64,
     pub source_start_utf16: u64,
     pub source_end_utf16: u64,
+}
+
+/// Revision-bound geometry for one visible source-backed table cell. `row = 0`
+/// is the header and body rows start at `row = 1`; the Markdown delimiter row
+/// is intentionally absent from this visible layout list.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageTableLayoutCell {
+    pub revision: u64,
+    pub block_index: u64,
+    pub row: u64,
+    pub column: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub alignment: u8,
+}
+
+/// Revision-bound hit-test result for a visible table cell. The point supplied
+/// by the native caller remains in its local table coordinate system; the
+/// result returns the hit cell's bounds and source range.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageTableCellHit {
+    pub revision: u64,
+    pub block_index: u64,
+    pub row: u64,
+    pub column: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// Revision-bound layout metadata for one parser-owned block. `width` and
@@ -1875,6 +1917,70 @@ fn table_cell_ranges(
         }
     }
     Ok(encoded)
+}
+
+fn table_alignment_tag(alignment: TableAlignment) -> u8 {
+    match alignment {
+        TableAlignment::Default => YU_STORAGE_TABLE_ALIGNMENT_DEFAULT,
+        TableAlignment::Left => YU_STORAGE_TABLE_ALIGNMENT_LEFT,
+        TableAlignment::Center => YU_STORAGE_TABLE_ALIGNMENT_CENTER,
+        TableAlignment::Right => YU_STORAGE_TABLE_ALIGNMENT_RIGHT,
+    }
+}
+
+fn table_source_utf16_range(snapshot: &TextSnapshot, source: TextRange) -> Result<(u64, u64), i32> {
+    let start = snapshot
+        .utf16_offset(source.start())
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    let end = snapshot
+        .utf16_offset(source.end())
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    Ok((start, end))
+}
+
+fn table_layout_cell_metadata(
+    snapshot: &TextSnapshot,
+    revision: u64,
+    block_index: u64,
+    cell: TableCellLayout,
+) -> Result<YuStorageTableLayoutCell, i32> {
+    let (source_start_utf16, source_end_utf16) = table_source_utf16_range(snapshot, cell.source())?;
+    Ok(YuStorageTableLayoutCell {
+        revision,
+        block_index,
+        row: u64::try_from(cell.row()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        column: u64::try_from(cell.column()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        source_start_utf16,
+        source_end_utf16,
+        x: cell.bounds().x(),
+        y: cell.bounds().y(),
+        width: cell.bounds().width(),
+        height: cell.bounds().height(),
+        alignment: table_alignment_tag(cell.alignment()),
+    })
+}
+
+fn table_layout_hit_metadata(
+    snapshot: &TextSnapshot,
+    revision: u64,
+    block_index: u64,
+    hit: TableLayoutHit,
+) -> Result<YuStorageTableCellHit, i32> {
+    let (source_start_utf16, source_end_utf16) = table_source_utf16_range(snapshot, hit.source())?;
+    Ok(YuStorageTableCellHit {
+        revision,
+        block_index,
+        row: u64::try_from(hit.row()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        column: u64::try_from(hit.column()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        source_start_utf16,
+        source_end_utf16,
+        x: hit.bounds().x(),
+        y: hit.bounds().y(),
+        width: hit.bounds().width(),
+        height: hit.bounds().height(),
+    })
 }
 
 fn viewport_block_kind(kind: BlockKind) -> u8 {
@@ -4220,6 +4326,150 @@ pub unsafe extern "C" fn yu_storage_session_projected_table_cells(
     }
     // SAFETY: the caller supplied at least `encoded.len()` writable entries.
     unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
+    YU_STORAGE_OK
+}
+
+/// Returns source-backed visible table cell geometry for one parser-owned
+/// block. The Markdown delimiter row is intentionally omitted from the
+/// returned list, while its source range remains available to the projection
+/// and layout layers. The count/fill convention mirrors the other native array
+/// queries.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable entries when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_layout_cells(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block_index: u64,
+    max_width: f32,
+    line_height: f32,
+    default_advance: f32,
+    output: *mut YuStorageTableLayoutCell,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` was checked for null and belongs to the caller.
+    unsafe { *written = 0 };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let block_index = match usize::try_from(block_index) {
+        Ok(index) if index < session.session.block_count() => index,
+        _ => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
+    let layout = match session.session.block_layout(block_index, config) {
+        Ok(layout) => layout,
+        Err(error) => return storage_status(error),
+    };
+    let Some(table) = layout.table() else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let snapshot = session.session.snapshot();
+    let encoded = match table
+        .cells()
+        .iter()
+        .copied()
+        .map(|cell| {
+            table_layout_cell_metadata(
+                &snapshot,
+                session.session.revision().get(),
+                u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+                cell,
+            )
+        })
+        .collect::<Result<Vec<_>, i32>>()
+    {
+        Ok(encoded) => encoded,
+        Err(status) => return status,
+    };
+    // SAFETY: `written` was checked above and belongs to the caller.
+    unsafe { *written = encoded.len() };
+    if encoded.is_empty() {
+        return YU_STORAGE_OK;
+    }
+    if capacity == 0 && output.is_null() {
+        return YU_STORAGE_OK;
+    }
+    if capacity < encoded.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: the caller supplied at least `encoded.len()` writable entries.
+    unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
+    YU_STORAGE_OK
+}
+
+/// Resolves a local table point to the visible source-backed cell containing
+/// it. Points outside the table return `YU_STORAGE_INVALID_SELECTION`.
+///
+/// # Safety
+/// `session` and `output` must be live/writable pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_cell_hit_test(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block_index: u64,
+    max_width: f32,
+    line_height: f32,
+    default_advance: f32,
+    point_x: f32,
+    point_y: f32,
+    output: *mut YuStorageTableCellHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `output` was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTableCellHit::default() };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let block_index = match usize::try_from(block_index) {
+        Ok(index) if index < session.session.block_count() => index,
+        _ => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
+    let layout = match session.session.block_layout(block_index, config) {
+        Ok(layout) => layout,
+        Err(error) => return storage_status(error),
+    };
+    let Some(table) = layout.table() else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let hit = match table.hit_test(LayoutPoint::new(point_x, point_y)) {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return YU_STORAGE_INVALID_SELECTION,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let snapshot = session.session.snapshot();
+    let metadata = match table_layout_hit_metadata(
+        &snapshot,
+        session.session.revision().get(),
+        match u64::try_from(block_index) {
+            Ok(block_index) => block_index,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        },
+        hit,
+    ) {
+        Ok(metadata) => metadata,
+        Err(status) => return status,
+    };
+    // SAFETY: `output` was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
     YU_STORAGE_OK
 }
 
@@ -7737,6 +7987,103 @@ mod tests {
             [0, 1, 0, 1, 0, 1]
         );
 
+        let mut layout_count = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_layout_cells(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    ptr::null_mut(),
+                    0,
+                    &mut layout_count,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(layout_count, 4);
+        let mut layout_cells = vec![YuStorageTableLayoutCell::default(); layout_count];
+        let mut written_layout = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_layout_cells(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    layout_cells.as_mut_ptr(),
+                    layout_cells.len(),
+                    &mut written_layout,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written_layout, 4);
+        assert_eq!(
+            layout_cells.iter().map(|cell| cell.row).collect::<Vec<_>>(),
+            [0, 0, 1, 1]
+        );
+        assert_eq!(
+            layout_cells
+                .iter()
+                .map(|cell| cell.column)
+                .collect::<Vec<_>>(),
+            [0, 1, 0, 1]
+        );
+        assert_eq!(layout_cells[0].x, 0.0);
+        assert_eq!(layout_cells[0].y, 0.0);
+        assert_eq!(layout_cells[2].y, 2.0);
+        assert_eq!(layout_cells[1].alignment, YU_STORAGE_TABLE_ALIGNMENT_CENTER);
+        assert!(
+            layout_cells
+                .iter()
+                .all(|cell| cell.source_start_utf16 <= cell.source_end_utf16)
+        );
+
+        let mut hit = YuStorageTableCellHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_cell_hit_test(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    3.5,
+                    2.5,
+                    &mut hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(hit.row, 1);
+        assert_eq!(hit.column, 1);
+        assert_eq!(hit.x, 3.0);
+        assert_eq!(hit.y, 2.0);
+        assert!(hit.source_start_utf16 < hit.source_end_utf16);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_cell_hit_test(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    99.0,
+                    99.0,
+                    &mut hit,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+
         let mut metadata = YuStorageProjectionBlock::default();
         let mut written = 0;
         assert_eq!(
@@ -7785,6 +8132,38 @@ mod tests {
                     ptr::null_mut(),
                     0,
                     &mut table_count,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_layout_cells(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    ptr::null_mut(),
+                    0,
+                    &mut layout_count,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_cell_hit_test(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    3.5,
+                    2.5,
+                    &mut hit,
                 )
             },
             YU_STORAGE_STALE_REVISION
