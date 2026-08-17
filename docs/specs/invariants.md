@@ -167,8 +167,11 @@
     primitive 与 damage，失败不得发布 viewport 前缀；layout 只能按 geometry origin 平移。
 35. `yu-workspace::assemble_viewport_scene` 必须从同一次 `EditorDocument::visible_blocks_with_shaper`
     结果建立 `ViewportSceneInput`，再按相同 block index/config 取得 shaped layout；它不得复制或
-    修改 HeightIndex、source、selection、composition 或 history。返回的 `ViewportSceneFrame`、
-    `Scene` 与 `RenderPlan` 必须共享该结果的 Revision，任何 layout/atlas 失败都不得发布部分 scene。
+    修改 HeightIndex、source、selection、composition 或 history。可选的
+    `ViewportRenderConfig::with_table_resize` 只能对同一 Revision/block 的 transient layout
+    应用 column override，且必须让 table decoration、glyph 和 render plan 共用该 layout；row
+    target 或 stale commit 必须在 assembly 前拒绝。返回的 `ViewportSceneFrame`、`Scene` 与
+    `RenderPlan` 必须共享该结果的 Revision，任何 layout/atlas 失败都不得发布部分 scene。
 36. `ViewportRenderFrame` 的 scene 与 render plan 必须拥有同一 Revision；`ViewportFrameCache` 只
     能发布等于调用方当前 Revision 的 frame，必须拒绝 stale frame 和较旧 Revision 回退，并在
     `invalidate_stale`/替换时保持 scene+plan 原子。cache 不得持有 source、EditorDocument、
@@ -323,6 +326,9 @@
     source range。`yu-scene::TablePrimitive` 只能保存这些 range、geometry、role 和 color，不得
     保存 cell 文本；viewport scene 必须先提交 table decoration 再提交 cell glyph，scene/render
     可以把 role 降级为 solid fill，但不能改变 source Revision 或让 native consumer 重新解析表格。
+    如果 scene 使用 caller-owned transient column override，table decoration、cell glyph 和
+    render plan 必须全部来自同一份 override layout，canonical layout cache 和 source ranges
+    仍保持原值。
     `TableCellAddress` 的 visible row 必须使用 header=0、body 从 1 开始并跳过 delimiter row。
     Tab/Shift-Tab 只能将 caret 移到相邻 visible cell 的 source 起点；在首/尾无目标时必须返回
     `Unhandled`，且该命令不得创建 Transaction、Undo entry 或 Revision。`yu_storage_session_table_resize_hit_test`

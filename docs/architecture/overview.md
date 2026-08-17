@@ -538,6 +538,10 @@ renderer 接收到部分窗口。
 取得 shaped `LayoutSnapshot`；随后在 editor-to-scene 边界把 fenced code 的 `BlockKind` 映射为
 可选背景颜色，再交给 `ViewportSceneInput` 和 `SceneBuilder::append_viewport_with_fills`。因此
 macOS host 不需要复制 Markdown block traversal、HeightIndex 或 layout cache，后续窗口/Metal
+只消费这份 retained scene。`ViewportRenderConfig::with_table_resize` 可以携带一个 caller-owned
+`TableResizeCommit`；workspace 在 image intrinsic 应用后对同一 block 的 transient layout 做
+column resize，再让 table decoration、cell glyph 和 `RenderPlan` 从同一 geometry 生成。配置不
+持有 source mirror，Revision 失配或 deferred row target 会在 scene assembly 前拒绝。
 层只消费 `ViewportSceneFrame`/`RenderPlan`。
 
 当前 document-host 诊断桥还提供 `yu_storage_session_macos_render_host_frame`。`YuStorageSession`
