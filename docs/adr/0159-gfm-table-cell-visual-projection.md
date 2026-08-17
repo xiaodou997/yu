@@ -21,15 +21,19 @@
 4. visible run 的 source range 必须仍然是 canonical snapshot range；`source_to_visual` 与
    `visual_to_source` 在 cell 边界使用同一 projection bias 契约。严格位于 table 之前或之后的
    edit 继续只映射 ranges，触及 table 内容则重新解析。
-5. 当前阶段不把 cell glyph 自动放入生产 scene。下一阶段由 layout/scene 消费 cell-only runs，
-   按 `TableLayoutSnapshot` 的列、行和 alignment 定位 glyph，并保持 selection/border 的
-   painter order。
+5. `yu-layout` 消费 cell-only runs，按 `TableLayoutSnapshot` 的列、行和 alignment 定位
+   cluster/glyph；`yu-workspace` 将 table selection/header/border 作为 glyph 前的 scene
+   decoration 提交。完整 macOS 产品窗口仍保留 native source/IME/Accessibility fallback，
+   不在这一决策中切换最终 visual renderer。
 
 ## 结果
 
 - table visual stream 不再包含 Markdown pipe、delimiter 文本或物理行尾，避免 scene overlay
   与 source glyph 重叠。
+- layout 不再把 cell-only runs 当作一条线性段落；每个 visible cluster/glyph 都落在其
+  source-backed cell 的列和可见行内，alignment 只改变 cell content origin。
 - 每个可见字节仍能通过 projection 双向映射到原始 cell source range；编辑、复制、IME 和
   undo 继续走统一 Transaction/Revision 路径。
-- 在 cell glyph 定位完成前，通用 layout 只能把这些 runs 当作连续 source-backed text；生产
-  窗口继续保留现有 fallback，不会因为诊断 projection 提前显示错误的表格几何。
+- table scene decoration 与 glyph 保持同一 Revision，并按 decoration-before-glyph 的 painter
+  order 发布；生产窗口仍保留现有 fallback，不会因为诊断/viewport scene 提前改变 native
+  输入和 Accessibility 责任。

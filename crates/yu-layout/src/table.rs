@@ -1,12 +1,15 @@
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{ByteOffset, Revision, TextRange};
 use yu_markdown::{TableAlignment, TableCellRange};
-use yu_projection::{ProjectionError, TableProjection, VisualRunStyle};
+use yu_projection::{
+    Projection, ProjectionBias, ProjectionError, TableProjection, VisualOffset, VisualRange,
+    VisualRunKind, VisualRunStyle,
+};
 use yu_text::{ChangeSet, TextSnapshot};
 
 use crate::{
     ClusterMetrics, LayoutConfig, LayoutError, LayoutPoint, LayoutRect, ShapingProvider,
-    map_source_range,
+    map_source_range, source_range_contains,
 };
 
 /// Geometry for one visible GFM table cell. The row index is visual-table
@@ -17,8 +20,11 @@ pub struct TableCellLayout {
     row: usize,
     column: usize,
     source: TextRange,
+    visual: VisualRange,
     bounds: LayoutRect,
     alignment: TableAlignment,
+    content_x: f32,
+    content_width: f32,
 }
 
 impl TableCellLayout {
@@ -38,6 +44,11 @@ impl TableCellLayout {
     }
 
     #[must_use]
+    pub const fn visual(self) -> VisualRange {
+        self.visual
+    }
+
+    #[must_use]
     pub const fn bounds(self) -> LayoutRect {
         self.bounds
     }
@@ -45,6 +56,20 @@ impl TableCellLayout {
     #[must_use]
     pub const fn alignment(self) -> TableAlignment {
         self.alignment
+    }
+
+    /// Returns the x coordinate at which the visible cell content begins.
+    /// Padding and Markdown alignment are already applied.
+    #[must_use]
+    pub const fn content_x(self) -> f32 {
+        self.content_x
+    }
+
+    /// Returns the measured width of the visible cell content, excluding
+    /// padding and alignment slack.
+    #[must_use]
+    pub const fn content_width(self) -> f32 {
+        self.content_width
     }
 }
 
@@ -102,6 +127,7 @@ pub struct TableLayoutSnapshot {
     row_height: f32,
     bounds: LayoutRect,
     cells: Vec<TableCellLayout>,
+    row_sources: Vec<TextRange>,
 }
 
 impl TableLayoutSnapshot {
@@ -110,8 +136,8 @@ impl TableLayoutSnapshot {
         config: LayoutConfig,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
-        Self::from_projection_with_measure(projection, config, |text, _source| {
-            measure_text(text, metrics)
+        Self::from_projection_with_measure(projection, config, |text, _source, style| {
+            measure_text(text, metrics, style)
         })
     }
 
@@ -120,9 +146,9 @@ impl TableLayoutSnapshot {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<Self, LayoutError> {
-        Self::from_projection_with_measure(projection, config, |text, source| {
+        Self::from_projection_with_measure(projection, config, |text, source, style| {
             shaper
-                .shape(text, source, VisualRunStyle::Plain)
+                .shape(text, source, style)
                 .map(|shaped| shaped.advance())
                 .map_err(|error| LayoutError::Shaping(error.to_string()))
         })
@@ -134,7 +160,7 @@ impl TableLayoutSnapshot {
         mut measure: F,
     ) -> Result<Self, LayoutError>
     where
-        F: FnMut(&str, TextRange) -> Result<f32, LayoutError>,
+        F: FnMut(&str, TextRange, VisualRunStyle) -> Result<f32, LayoutError>,
     {
         config.validate()?;
         let table = projection.table();
@@ -150,21 +176,24 @@ impl TableLayoutSnapshot {
             return Err(LayoutError::InvalidTable("table body row is inconsistent"));
         }
 
-        let source = projection.visual().source();
         let padding = config.default_advance();
         let mut natural_widths = vec![padding * 2.0; column_count];
+        let mut measured_rows = Vec::with_capacity(rows.len());
         for row in &rows {
+            let mut measured_row = Vec::with_capacity(column_count);
             for (column, cell) in row.iter().copied().enumerate() {
                 let source_range = table_cell_range(cell)?;
-                let text = read_source_range(source, source_range)?;
-                let content_width = measure(&text, source_range)?;
+                let (visual, content_width) =
+                    measure_cell_content(projection, source_range, &mut measure)?;
                 if !content_width.is_finite() || content_width < 0.0 {
                     return Err(LayoutError::InvalidMetrics(content_width.to_bits()));
                 }
                 natural_widths[column] = natural_widths[column]
                     .max(content_width + padding * 2.0)
                     .max(padding * 2.0);
+                measured_row.push((source_range, visual, content_width));
             }
+            measured_rows.push(measured_row);
         }
 
         let natural_total = natural_widths.iter().sum::<f32>();
@@ -184,21 +213,43 @@ impl TableLayoutSnapshot {
 
         let alignments = table.alignments();
         let mut cells = Vec::with_capacity(row_count.saturating_mul(column_count));
-        for (row, source_cells) in rows.iter().enumerate() {
+        for (row, measured_cells) in measured_rows.iter().enumerate() {
             let y = row_height * row as f32;
             let mut x = 0.0_f32;
-            for (column, cell) in source_cells.iter().copied().enumerate() {
+            for (column, (source, visual, content_width)) in
+                measured_cells.iter().copied().enumerate()
+            {
                 let width = column_widths[column];
+                let available = (width - padding * 2.0).max(0.0);
+                let slack = (available - content_width).max(0.0);
+                let alignment_offset = match alignments[column] {
+                    TableAlignment::Center => slack * 0.5,
+                    TableAlignment::Right => slack,
+                    TableAlignment::Default | TableAlignment::Left => 0.0,
+                };
                 cells.push(TableCellLayout {
                     row,
                     column,
-                    source: table_cell_range(cell)?,
+                    source,
+                    visual,
                     bounds: LayoutRect::new(x, y, width, row_height)?,
                     alignment: alignments[column],
+                    content_x: x + padding + alignment_offset,
+                    content_width,
                 });
                 x += width;
             }
         }
+
+        let row_sources = (0..row_count)
+            .map(|row| {
+                let physical_row = row.saturating_add(usize::from(row > 0));
+                table
+                    .row_source_range(physical_row)
+                    .ok_or(LayoutError::OffsetOverflow)
+                    .and_then(table_cell_range)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             revision: projection.revision(),
@@ -211,6 +262,7 @@ impl TableLayoutSnapshot {
             row_height,
             bounds,
             cells,
+            row_sources,
         })
     }
 
@@ -247,6 +299,43 @@ impl TableLayoutSnapshot {
     #[must_use]
     pub fn cells(&self) -> &[TableCellLayout] {
         &self.cells
+    }
+
+    #[must_use]
+    pub fn row_sources(&self) -> &[TextRange] {
+        &self.row_sources
+    }
+
+    /// Resolves a visual boundary that lands on a structural table run to a
+    /// visible cell source boundary. Interior cell positions return `None` so
+    /// the normal projection mapping can preserve per-grapheme precision;
+    /// structural pipe/row-ending positions must not return hidden bytes.
+    #[must_use]
+    pub fn source_for_visual_hit(
+        &self,
+        projection: &Projection,
+        visual: VisualOffset,
+        _bias: ProjectionBias,
+    ) -> Option<ByteOffset> {
+        let structural_hidden = projection.runs().iter().any(|run| {
+            run.kind() == VisualRunKind::HiddenSyntax
+                && run.visual().is_empty()
+                && run.visual().start() == visual
+                && !self
+                    .cells
+                    .iter()
+                    .any(|cell| source_range_contains(cell.source(), run.source()))
+        });
+        if !structural_hidden {
+            return None;
+        }
+
+        self.cells
+            .iter()
+            .copied()
+            .find(|cell| cell.visual.start() >= visual)
+            .map(|cell| cell.source.start())
+            .or_else(|| self.cells.last().map(|cell| cell.source.end()))
     }
 
     /// Returns the visible cell containing `point`, or `None` outside the
@@ -304,8 +393,11 @@ impl TableLayoutSnapshot {
                     row: cell.row,
                     column: cell.column,
                     source: map_source_range(cell.source, changes)?,
+                    visual: cell.visual,
                     bounds: cell.bounds,
                     alignment: cell.alignment,
+                    content_x: cell.content_x,
+                    content_width: cell.content_width,
                 })
             })
             .collect::<Result<Vec<_>, LayoutError>>()?;
@@ -320,6 +412,12 @@ impl TableLayoutSnapshot {
             row_height: self.row_height,
             bounds: self.bounds,
             cells,
+            row_sources: self
+                .row_sources
+                .iter()
+                .copied()
+                .map(|range| map_source_range(range, changes))
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }
@@ -330,35 +428,55 @@ fn table_cell_range(range: TableCellRange) -> Result<TextRange, LayoutError> {
     TextRange::new(start, end).ok_or(LayoutError::OffsetOverflow)
 }
 
-fn read_source_range(source: &TextSnapshot, range: TextRange) -> Result<String, LayoutError> {
-    let start = usize::try_from(range.start()).map_err(|_| LayoutError::OffsetOverflow)?;
-    let end = usize::try_from(range.end()).map_err(|_| LayoutError::OffsetOverflow)?;
-    let mut bytes = Vec::with_capacity(end.saturating_sub(start));
-    let mut chunks = source
-        .chunk_cursor(range.start())
-        .map_err(|error| LayoutError::Projection(ProjectionError::SourcePosition(error)))?;
-    for chunk in &mut chunks {
-        let chunk_start =
-            usize::try_from(chunk.start()).map_err(|_| LayoutError::OffsetOverflow)?;
-        let chunk_end = chunk_start
-            .checked_add(chunk.text().len())
-            .ok_or(LayoutError::OffsetOverflow)?;
-        if chunk_start >= end {
-            break;
+fn measure_cell_content<F>(
+    projection: &TableProjection,
+    source: TextRange,
+    measure: &mut F,
+) -> Result<(VisualRange, f32), LayoutError>
+where
+    F: FnMut(&str, TextRange, VisualRunStyle) -> Result<f32, LayoutError>,
+{
+    let visual_start = projection
+        .visual()
+        .source_to_visual(source.start(), ProjectionBias::After)?;
+    let visual_end = projection
+        .visual()
+        .source_to_visual(source.end(), ProjectionBias::Before)?;
+    let visual = VisualRange::new(visual_start, visual_end).ok_or(LayoutError::OffsetOverflow)?;
+    let mut width = 0.0_f32;
+    for run in projection.visual().runs().iter().copied() {
+        if matches!(
+            run.kind(),
+            VisualRunKind::HiddenSyntax | VisualRunKind::LineBreak { .. }
+        ) {
+            continue;
         }
-        let local_start = start.max(chunk_start).saturating_sub(chunk_start);
-        let local_end = end.min(chunk_end).saturating_sub(chunk_start);
-        if local_start < local_end {
-            bytes.extend_from_slice(&chunk.text().as_bytes()[local_start..local_end]);
+        if !source_range_contains(source, run.source()) {
+            continue;
         }
+        let overlaps = if visual.is_empty() {
+            run.visual().is_empty() && run.visual().start() == visual.start()
+        } else {
+            run.visual().start() < visual.end() && visual.start() < run.visual().end()
+        };
+        if !overlaps {
+            continue;
+        }
+        let text = projection.visual().text_for_run(run)?;
+        let shape_source = projection.visual().shape_source_range_for_run(run);
+        width += measure(&text, shape_source, run.style())?;
     }
-    String::from_utf8(bytes).map_err(|_| LayoutError::OffsetOverflow)
+    Ok((visual, width))
 }
 
-fn measure_text<M: ClusterMetrics>(text: &str, metrics: &M) -> Result<f32, LayoutError> {
+fn measure_text<M: ClusterMetrics>(
+    text: &str,
+    metrics: &M,
+    style: VisualRunStyle,
+) -> Result<f32, LayoutError> {
     let mut width = 0.0_f32;
     for cluster in text.graphemes(true) {
-        let advance = metrics.advance(cluster, VisualRunStyle::Plain);
+        let advance = metrics.advance(cluster, style);
         if !advance.is_finite() || advance < 0.0 {
             return Err(LayoutError::InvalidMetrics(advance.to_bits()));
         }

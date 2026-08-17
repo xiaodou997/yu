@@ -313,12 +313,14 @@ delimiter。列表 bullet 与任务文本继续可见，后续 layout/scene 可�
 source-backed `TableProjection` 与 stable projection tag；header、delimiter、body row 和
 cell ranges 通过 Rust/FFI 暴露。`TableProjection` 只保留 header/body cell 内容的
 source-backed visual runs，并隐藏 pipe、cell 周围空白、row line ending 和 parser-owned
-delimiter physical row；`TableLayoutSnapshot` 再按 metrics 生成可见 header/body cell 的列宽、行高和 bounds；新的
+delimiter physical row；`TableLayoutSnapshot` 再按 metrics/shaper 生成可见 header/body cell 的列宽、行高、可见
+range 和 content origin，并把 cell 内的 cluster/glyph 重定位到对应的列、行和 alignment；新的
 `yu_storage_session_table_layout_cells` 与 `yu_storage_session_table_cell_hit_test` 只传递
 Revision-bound geometry 和 source ranges。`yu-scene::TablePrimitive` 现在生成 source-backed
 header fill、selection fill 和 border geometry，`yu-render` 暂时把这些角色映射为现有
-solid-fill command；下一步仍需把这些 cell-only visual runs 按同一 layout cell 几何定位到
-生产 scene，当前窗口暂不接入 table overlay。
+solid-fill command；`yu-workspace` 已将 table decoration 以 glyph 前的 painter order 接入
+viewport scene，selection 仍按 source range 命中 cell。当前 macOS 产品窗口仍保留 native
+source/IME/Accessibility fallback，完整 visual renderer 切换不在本阶段。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和

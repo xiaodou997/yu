@@ -165,8 +165,12 @@ task 和 fenced code；GFM table 仍在 block kind 层报告为 `Paragraph`，�
 它暴露 header、delimiter、body row 和 cell 的绝对 source byte ranges。visual stream 只保留
 header/body cell 内容的 source-backed runs；pipe、cell 周围空白、每行 line ending 和
 parser-owned delimiter physical row 都是 zero-width hidden ranges。`yu-layout::TableLayoutSnapshot`
-在同一 source range 上按 metrics 生成可见 cell 的列宽、行高和 bounds；delimiter 只作为 source
-range 保留，不生成可见 cell。macOS
+在同一 source range 上按 metrics/shaper 生成可见 cell 的列宽、行高、bounds、visual range 和
+content origin；它只测量 projection 中的 visible runs，因此 cell 内的 emphasis/code 等 style
+会影响列宽，但 hidden pipe、周围空白和 delimiter 不会进入宽度。随后 `LayoutSnapshot` 将
+source-backed cluster/glyph 重定位到 cell 的列、行和 alignment；delimiter 只作为 source range
+保留，不生成可见 cell。cell-aware caret/hit-test 在隐藏结构边界使用同一 projection bias，避免
+把点击落到 pipe 或行尾空白。macOS
 FFI 通过 `yu_storage_session_projected_table_cells` 暴露 parser cell ranges，并通过
 `yu_storage_session_table_layout_cells` / `yu_storage_session_table_cell_hit_test` 暴露
 Revision-bound UTF-16 geometry 与 source-backed hit-test，Swift 不需要自行扫描 `|` 或复制文本。

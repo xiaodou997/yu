@@ -21,6 +21,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 建立 source-backed GFM table projection kind 与 UTF-16 cell-range count/fill ABI
 - [x] table visual projection 只保留 source-backed cell runs，隐藏 pipe、cell 空白、row line ending 与 delimiter physical row，并覆盖 source↔visual mapping
 - [x] `TableLayoutSnapshot` 隐藏 delimiter physical row，按 metrics 生成 source-backed cell geometry，并提供 Rust/FFI hit-test count/fill 诊断契约
+- [x] shaped table layout 按 projection visible runs 测量 cell 宽度，并把 source-backed cluster/glyph 定位到 column/row/alignment；cell-aware caret/hit-test 在 hidden boundary 返回可见 cell source boundary，内部位置保持 projection bias
 - [x] heading/blockquote/list 与 task/fence 复用 parser-owned structural prefix，统一 block projection kind tag；列表 bullet/task 文本仍保持 source-visible
 - [x] visual selection range、metrics hit-testing 和 point↔source mapping 的 Revision-bound 诊断契约
 - [x] stale Revision/generation 在 native projection callbacks 上的全路径回归（含视觉 scene/glyph/render-plan count/fill header）
@@ -52,7 +53,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 ## Track C：Scene and rendering
 
 - [x] Rust `ViewportSceneInput`/`SceneBuilder` 生成 Revision-bound 最小 owned scene snapshot，macOS host 以 count/fill 自检 primitive 顺序、来源范围、坐标和 stale 丢弃（诊断桥，尚未替换生产 renderer）
-- [x] `yu-scene` 消费 `TableLayoutSnapshot` 生成 source-backed header/selection/border `TablePrimitive`，并由 `yu-render` 以 solid-fill command 保持 painter order（诊断 scene，生产 visual table overlay 尚未切换）
+- [x] `yu-scene` 消费 `TableLayoutSnapshot` 生成 source-backed header/selection/border `TablePrimitive`，并由 `yu-render` 以 solid-fill command 保持 painter order；`yu-workspace` 在 viewport scene 中先提交 table decoration 再提交 cell glyph（完整产品窗口仍保留 native fallback）
 - [x] Rust 使用 CoreText glyph rasterization、CPU `GlyphAtlas` 与 `yu_workspace::assemble_viewport_render_frame` 生成 Revision-bound RenderPlan；macOS host 以 count/fill 自检 glyph command、atlas page fingerprint、damage 和 stale 丢弃（诊断桥，尚未接入生产窗口）
 - [x] `yu-render-macos` 新增持久 `CoreTextViewportFrameBuilder`，重复 Revision 重用 CPU atlas/RenderPlan fingerprint；ignored AppKit probe 使用真实 CoreText publication 进入 `MetalAtlas`/retained target（生产窗口仍未切换）
 - [x] persistent macOS host 通过 count/fill ABI 暴露 Revision-bound retained glyph primitives（含 atlas placement、metrics、bounds 与 source block range；生产 view 仍未切换）

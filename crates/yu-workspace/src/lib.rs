@@ -20,8 +20,8 @@ use yu_font::GlyphAtlas;
 use yu_layout::ImageIntrinsicSize;
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
-    ImagePrimitive, Rect, Rgba8, Scene, SceneBuilder, SceneError, ViewportBlockGeometry,
-    ViewportSceneInput,
+    ImagePrimitive, Rect, Rgba8, Scene, SceneBuilder, SceneError, TableSceneStyle,
+    ViewportBlockGeometry, ViewportSceneInput,
 };
 
 mod workspace;
@@ -47,6 +47,16 @@ pub fn viewport_block_background(kind: BlockKind) -> Option<Rgba8> {
         BlockKind::FencedCodeBlock { .. } => Some(Rgba8::new(245, 246, 248, 255)),
         _ => None,
     }
+}
+
+#[must_use]
+fn viewport_table_style() -> TableSceneStyle {
+    TableSceneStyle::new(
+        1.0,
+        Rgba8::new(190, 195, 205, 255),
+        Some(Rgba8::new(248, 249, 251, 255)),
+        Some(Rgba8::new(210, 225, 255, 255)),
+    )
 }
 
 impl ViewportSceneFrame {
@@ -638,6 +648,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
     let source = document.snapshot();
     let definitions = document.markdown().reference_definitions().clone();
     let document_revision = document.revision();
+    let selection = Some(document.selection().ordered_range());
     let image_key = |image: ImageSource| {
         let destination = image.destination().or_else(|| {
             image
@@ -770,7 +781,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
         }
         images.push(block_images);
     }
-    builder.append_viewport_with_fills_and_images(
+    builder.append_viewport_with_fills_and_images_and_tables(
         &input,
         &layout_refs,
         atlas,
@@ -778,6 +789,8 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
         color,
         &fills,
         &images,
+        Some(viewport_table_style()),
+        selection,
     )?;
     Ok(ViewportSceneFrame {
         input,
@@ -868,7 +881,8 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvi
 mod tests {
     use std::sync::Arc;
 
-    use yu_editor::{EditorCommand, LayoutConfig, ViewportConfig};
+    use yu_core::ByteOffset;
+    use yu_editor::{CaretAffinity, EditorCommand, EditorSelection, LayoutConfig, ViewportConfig};
     use yu_font::{
         FontDatabase, FontFaceSpec, FontRequest, FontShaper, GlyphAtlasConfig, GlyphBitmap,
         GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
@@ -1107,6 +1121,72 @@ mod tests {
                 .commands()
                 .iter()
                 .any(|command| matches!(command, yu_render::RenderCommand::Glyph { .. }))
+        );
+    }
+
+    #[test]
+    fn table_viewport_emits_decorations_before_source_backed_cell_glyphs() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        let viewport = ViewportRect::new(0.0, 160.0);
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let body_offset = ByteOffset::new(source.rfind('2').expect("body cell") as u64);
+        let selection = EditorSelection::range(
+            &document.snapshot(),
+            body_offset,
+            ByteOffset::new(body_offset.get() + 1),
+            CaretAffinity::Downstream,
+        )
+        .expect("selection");
+        document.set_selection(selection).expect("set selection");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("table scene frame");
+
+        let primitives = frame.scene().primitives();
+        let first_glyph = primitives
+            .iter()
+            .position(|primitive| matches!(primitive, Primitive::Glyph(_)))
+            .expect("cell glyph");
+        assert!(
+            primitives[..first_glyph]
+                .iter()
+                .all(|primitive| matches!(primitive, Primitive::Table(_)))
+        );
+        assert!(primitives[..first_glyph].iter().any(|primitive| {
+            matches!(
+                primitive,
+                Primitive::Table(table) if table.role() == yu_scene::TablePrimitiveRole::HeaderFill
+            )
+        }));
+        assert!(primitives[..first_glyph].iter().any(|primitive| {
+            matches!(
+                primitive,
+                Primitive::Table(table)
+                    if table.role() == yu_scene::TablePrimitiveRole::SelectionFill
+                        && table.source().contains(body_offset)
+            )
+        }));
+        assert!(
+            primitives[first_glyph..]
+                .iter()
+                .any(|primitive| matches!(primitive, Primitive::Glyph(_)))
         );
     }
 

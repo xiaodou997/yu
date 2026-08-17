@@ -699,6 +699,17 @@ impl SceneBuilder {
         style: TableSceneStyle,
         selection: Option<yu_core::TextRange>,
     ) -> Result<usize, SceneError> {
+        let primitives = self.collect_table_primitives(layout, origin, style, selection)?;
+        self.commit_primitives(primitives)
+    }
+
+    fn collect_table_primitives(
+        &self,
+        layout: &yu_layout::TableLayoutSnapshot,
+        origin: Point,
+        style: TableSceneStyle,
+        selection: Option<yu_core::TextRange>,
+    ) -> Result<Vec<Primitive>, SceneError> {
         if self.revision != layout.revision() {
             return Err(SceneError::RevisionMismatch {
                 scene: self.revision,
@@ -806,7 +817,7 @@ impl SceneBuilder {
                 TablePrimitiveRole::Border,
             )));
         }
-        self.commit_primitives(primitives)
+        Ok(primitives)
     }
 
     /// Appends all shaped glyphs from a layout using entries already present
@@ -899,6 +910,28 @@ impl SceneBuilder {
         fills: &[Option<Rgba8>],
         images: &[Vec<ImagePrimitive>],
     ) -> Result<usize, SceneError> {
+        self.append_viewport_with_fills_and_images_and_tables(
+            input, layouts, atlas, font_size, color, fills, images, None, None,
+        )
+    }
+
+    /// Appends visible blocks with optional table decorations. Table fills and
+    /// borders are emitted before the block glyphs, so a cell overlay cannot
+    /// cover its source-backed text. The optional selection is source-based
+    /// and is applied only to table layouts in the same revision.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_viewport_with_fills_and_images_and_tables(
+        &mut self,
+        input: &ViewportSceneInput,
+        layouts: &[&LayoutSnapshot],
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+        fills: &[Option<Rgba8>],
+        images: &[Vec<ImagePrimitive>],
+        table_style: Option<TableSceneStyle>,
+        selection: Option<yu_core::TextRange>,
+    ) -> Result<usize, SceneError> {
         if input.revision() != self.revision {
             return Err(SceneError::ViewportRevisionMismatch {
                 expected: self.revision,
@@ -955,6 +988,14 @@ impl SceneBuilder {
                     bounds,
                     color: fill,
                 });
+            }
+            if let (Some(style), Some(table)) = (table_style, layout.table()) {
+                primitives.extend(self.collect_table_primitives(
+                    table,
+                    Point::new(0.0, geometry.y()),
+                    style,
+                    selection,
+                )?);
             }
             primitives.extend(
                 self.collect_layout_primitives_at(
