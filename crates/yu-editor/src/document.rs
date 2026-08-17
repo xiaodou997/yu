@@ -1009,6 +1009,8 @@ impl EditorDocument {
             EditorCommand::MoveDown => self.move_down(false),
             EditorCommand::MoveUpExtend => self.move_up(true),
             EditorCommand::MoveDownExtend => self.move_down(true),
+            EditorCommand::MoveTableCellNext => self.move_table_cell(false),
+            EditorCommand::MoveTableCellPrevious => self.move_table_cell(true),
             EditorCommand::InsertNewline => self.insert_newline(),
             EditorCommand::IndentList => self.indent_list(),
             EditorCommand::OutdentList => self.outdent_list(),
@@ -1047,6 +1049,10 @@ impl EditorDocument {
             EditorCommand::MoveDown | EditorCommand::MoveDownExtend => {
                 self.vertical_command_available(VerticalDirection::Down)
             }
+            EditorCommand::MoveTableCellNext => self.table_cell_navigation_target(false).is_some(),
+            EditorCommand::MoveTableCellPrevious => {
+                self.table_cell_navigation_target(true).is_some()
+            }
             EditorCommand::InsertNewline => true,
             EditorCommand::IndentList => self
                 .current_list_line()
@@ -1076,7 +1082,7 @@ impl EditorDocument {
     /// list item; in a paragraph they remain available for native focus or
     /// text-input policy.
     pub fn route_key(&mut self, event: KeyEvent) -> Result<KeyRouteResult, EditorDocumentError> {
-        let Some(command) = command_for_key(event) else {
+        let Some(command) = self.command_for_key(event) else {
             return Ok(KeyRouteResult::Unhandled);
         };
         if self.composition.is_some() {
@@ -1091,6 +1097,21 @@ impl EditorDocument {
             return Ok(KeyRouteResult::Unhandled);
         }
         Ok(KeyRouteResult::Executed(result))
+    }
+
+    fn command_for_key(&mut self, event: KeyEvent) -> Option<EditorCommand> {
+        if event.key() == crate::EditorKey::Tab {
+            let previous = event.modifiers() == crate::KeyModifiers::SHIFT;
+            let plain = event.modifiers() == crate::KeyModifiers::NONE;
+            if (plain || previous) && self.table_cell_navigation_target(previous).is_some() {
+                return Some(if previous {
+                    EditorCommand::move_table_cell_previous()
+                } else {
+                    EditorCommand::move_table_cell_next()
+                });
+            }
+        }
+        command_for_key(event)
     }
 
     /// Toggles the source-backed `[ ]`/`[x]` marker of one task-list block.
@@ -1434,6 +1455,33 @@ impl EditorDocument {
         self.selection =
             EditorSelection::cursor(&self.snapshot(), target, crate::CaretAffinity::Downstream)?;
         Ok(self.command_result(false))
+    }
+
+    fn move_table_cell(&mut self, previous: bool) -> Result<CommandResult, EditorDocumentError> {
+        self.history.break_group();
+        let Some(target) = self.table_cell_navigation_target(previous) else {
+            return Ok(self.command_result(false));
+        };
+        self.selection =
+            EditorSelection::cursor(&self.snapshot(), target, crate::CaretAffinity::Downstream)?;
+        self.preferred_x = None;
+        Ok(self.command_result(false))
+    }
+
+    fn table_cell_navigation_target(&self, previous: bool) -> Option<ByteOffset> {
+        let focus = self.selection.focus();
+        let block_index = self.block_index_for_offset(focus)?;
+        let block = self.markdown.blocks().get(block_index)?;
+        let snapshot = self.snapshot();
+        let table = yu_markdown::parse_table_in_snapshot(&snapshot, block.range())?;
+        let offset = usize::try_from(focus.get()).ok()?;
+        let current = table.visible_cell_for_source(offset)?;
+        let (_, target) = if previous {
+            table.previous_visible_cell(current)?
+        } else {
+            table.next_visible_cell(current)?
+        };
+        ByteOffset::try_from(target.start()).ok()
     }
 
     fn move_right(&mut self) -> Result<CommandResult, EditorDocumentError> {
@@ -2115,6 +2163,43 @@ mod tests {
         document
             .set_selection(selection)
             .expect("test caret should belong to document");
+    }
+
+    #[test]
+    fn table_tab_navigation_uses_visible_source_cells() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find('A').expect("header A"));
+
+        let next = document
+            .route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE))
+            .expect("tab route");
+        assert!(matches!(next, KeyRouteResult::Executed(result) if !result.changed()));
+        assert_eq!(
+            document.selection().focus(),
+            ByteOffset::new(source.find('B').expect("header B") as u64)
+        );
+
+        let previous = document
+            .route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::SHIFT))
+            .expect("shift-tab route");
+        assert!(matches!(previous, KeyRouteResult::Executed(result) if !result.changed()));
+        assert_eq!(
+            document.selection().focus(),
+            ByteOffset::new(source.find('A').expect("header A") as u64)
+        );
+
+        set_caret(&mut document, source.rfind('2').expect("last cell"));
+        assert_eq!(
+            document
+                .route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE))
+                .expect("last-cell tab route"),
+            KeyRouteResult::Unhandled
+        );
+        assert_eq!(
+            document.selection().focus(),
+            ByteOffset::new(source.rfind('2').expect("last cell") as u64)
+        );
     }
 
     #[derive(Clone, Copy, Debug)]

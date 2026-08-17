@@ -33,7 +33,8 @@ pub use inline::{
 };
 pub use reference::{ReferenceDefinition, ReferenceDefinitionIndex};
 pub use table::{
-    TableAlignment, TableBlock, TableCellRange, TableRowRange, parse_table, parse_table_in_snapshot,
+    TableAlignment, TableBlock, TableCellAddress, TableCellRange, TableRowRange, parse_table,
+    parse_table_in_snapshot,
 };
 pub use task::TaskMarker;
 

@@ -114,6 +114,12 @@ enum {
 };
 
 enum {
+    YU_STORAGE_TABLE_RESIZE_NONE = 0,
+    YU_STORAGE_TABLE_RESIZE_COLUMN = 1,
+    YU_STORAGE_TABLE_RESIZE_ROW = 2,
+};
+
+enum {
     YU_STORAGE_DISK_UNCHANGED = 0,
     YU_STORAGE_DISK_CHANGED = 1,
     YU_STORAGE_DISK_MISSING = 2,
@@ -380,6 +386,17 @@ typedef struct YuStorageTableCellHit {
     float width;
     float height;
 } YuStorageTableCellHit;
+
+/* Revision-bound hit-test result for an internal visible table divider. kind
+ * is YU_STORAGE_TABLE_RESIZE_COLUMN or YU_STORAGE_TABLE_RESIZE_ROW; index is
+ * the column/row immediately before the divider and position is local x/y. */
+typedef struct YuStorageTableResizeHit {
+    uint64_t revision;
+    uint64_t block_index;
+    uint8_t kind;
+    uint64_t index;
+    float position;
+} YuStorageTableResizeHit;
 
 /* Revision-bound layout metadata for one parser-owned block. width/height
  * are block-local layout points; shaped is non-zero for CoreText output. */
@@ -858,6 +875,11 @@ int32_t yu_storage_session_table_cell_hit_test(
     uint64_t block_index, float max_width, float line_height,
     float default_advance, float point_x, float point_y,
     YuStorageTableCellHit *output);
+int32_t yu_storage_session_table_resize_hit_test(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, float max_width, float line_height,
+    float default_advance, float point_x, float point_y, float tolerance,
+    YuStorageTableResizeHit *output);
 int32_t yu_storage_session_block_layout(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, float max_width, float line_height,

@@ -56,6 +56,31 @@ pub struct TableRowRange {
     end: usize,
 }
 
+/// A visible table cell address. Row `0` is the header; body rows start at
+/// `1`. The delimiter row is intentionally absent from this coordinate space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TableCellAddress {
+    row: usize,
+    column: usize,
+}
+
+impl TableCellAddress {
+    #[must_use]
+    pub const fn new(row: usize, column: usize) -> Self {
+        Self { row, column }
+    }
+
+    #[must_use]
+    pub const fn row(self) -> usize {
+        self.row
+    }
+
+    #[must_use]
+    pub const fn column(self) -> usize {
+        self.column
+    }
+}
+
 impl TableRowRange {
     #[must_use]
     pub const fn new(start: usize, end: usize) -> Self {
@@ -154,6 +179,80 @@ impl TableBlock {
     #[must_use]
     pub fn body_row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Returns the number of visible rows. The parser-owned delimiter row is
+    /// not part of this coordinate space.
+    #[must_use]
+    pub fn visible_row_count(&self) -> usize {
+        usize::from(!self.header.is_empty()).saturating_add(self.rows.len())
+    }
+
+    /// Returns a source-backed visible cell for a row/column address.
+    #[must_use]
+    pub fn visible_cell(&self, address: TableCellAddress) -> Option<TableCellRange> {
+        if address.column >= self.column_count() {
+            return None;
+        }
+        if address.row == 0 {
+            return self.header.get(address.column).copied();
+        }
+        self.rows
+            .get(address.row.saturating_sub(1))
+            .and_then(|row| row.get(address.column))
+            .copied()
+    }
+
+    /// Returns the visible cell containing a source byte boundary. Cell ends
+    /// are included so a caret immediately before the structural pipe still
+    /// remains owned by the preceding source-backed cell.
+    #[must_use]
+    pub fn visible_cell_for_source(&self, offset: usize) -> Option<TableCellAddress> {
+        let mut address = TableCellAddress::new(0, 0);
+        for row in std::iter::once(&self.header).chain(self.rows.iter()) {
+            for (column, cell) in row.iter().copied().enumerate() {
+                if (cell.start() == cell.end() && offset == cell.start())
+                    || (cell.start() <= offset && offset <= cell.end())
+                {
+                    return Some(address);
+                }
+                address = TableCellAddress::new(address.row(), column.saturating_add(1));
+            }
+            address = TableCellAddress::new(address.row().saturating_add(1), 0);
+        }
+        None
+    }
+
+    /// Returns the next visible cell in row-major order.
+    #[must_use]
+    pub fn next_visible_cell(
+        &self,
+        address: TableCellAddress,
+    ) -> Option<(TableCellAddress, TableCellRange)> {
+        let next_column = address.column.saturating_add(1);
+        let next = if next_column < self.column_count() {
+            TableCellAddress::new(address.row(), next_column)
+        } else {
+            TableCellAddress::new(address.row().saturating_add(1), 0)
+        };
+        self.visible_cell(next).map(|cell| (next, cell))
+    }
+
+    /// Returns the previous visible cell in row-major order.
+    #[must_use]
+    pub fn previous_visible_cell(
+        &self,
+        address: TableCellAddress,
+    ) -> Option<(TableCellAddress, TableCellRange)> {
+        let previous = if address.column > 0 {
+            TableCellAddress::new(address.row(), address.column - 1)
+        } else {
+            address
+                .row()
+                .checked_sub(1)
+                .map(|row| TableCellAddress::new(row, self.column_count().saturating_sub(1)))?
+        };
+        self.visible_cell(previous).map(|cell| (previous, cell))
     }
 
     #[must_use]
@@ -497,5 +596,29 @@ mod tests {
         );
         assert_eq!(table.column_count(), 2);
         assert_eq!(table.body_row_count(), 1);
+    }
+
+    #[test]
+    fn visible_cell_navigation_skips_delimiter_row() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
+        let table = parse_table(source).expect("table");
+
+        assert_eq!(table.visible_row_count(), 3);
+        let first = TableCellAddress::new(0, 0);
+        assert_eq!(table.visible_cell(first), Some(TableCellRange::new(2, 3)));
+        let next = table.next_visible_cell(first).expect("next cell");
+        assert_eq!(next.0, TableCellAddress::new(0, 1));
+        assert_eq!(next.1, TableCellRange::new(6, 7));
+        let body = table.next_visible_cell(next.0).expect("first body cell");
+        assert_eq!(body.0, TableCellAddress::new(1, 0));
+        assert_eq!(body.1, TableCellRange::new(26, 27));
+        assert_eq!(
+            table.visible_cell_for_source(30),
+            Some(TableCellAddress::new(1, 1))
+        );
+        assert_eq!(
+            table.previous_visible_cell(body.0),
+            Some((TableCellAddress::new(0, 1), TableCellRange::new(6, 7)))
+        );
     }
 }
