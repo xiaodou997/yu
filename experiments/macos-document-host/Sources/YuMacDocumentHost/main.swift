@@ -4208,6 +4208,89 @@ private final class MacosVisualDecorationView: NSView {
     }
 }
 
+/// The source TextKit mirror is still the native input/IME/Accessibility
+/// owner, but its glyph painting can be gated once a matching Rust surface
+/// frame and decoration frame are both available.  Keep the gate explicit:
+/// a pair of booleans cannot explain why a frame was rejected, and that makes
+/// a transient edit/scroll/IME race look like an unexplained visual glitch.
+private struct VisualRenderFrameIdentity: Equatable, CustomStringConvertible {
+    let revision: UInt64
+    let compositionGeneration: UInt64
+    let surfaceGeneration: UInt64
+    let frameSerial: UInt64
+
+    var description: String {
+        "revision=\(revision), composition=\(compositionGeneration), "
+            + "surface=\(surfaceGeneration), frame=\(frameSerial)"
+    }
+}
+
+private enum VisualRenderFallbackReason: String, Equatable, CustomStringConvertible {
+    case disabled
+    case detached
+    case missingGeometry
+    case waitingForSurface
+    case staleRevision
+    case staleComposition
+    case decorationUnavailable
+    case invalidFrame
+    case compositionActive
+    case surfaceSubmitFailed
+    case visualMirrorUnavailable
+
+    var description: String { rawValue }
+}
+
+private enum VisualRenderState: Equatable, CustomStringConvertible {
+    case fallback(VisualRenderFallbackReason)
+    case active(VisualRenderFrameIdentity)
+
+    var isActive: Bool {
+        if case .active = self { return true }
+        return false
+    }
+
+    var fallbackReason: VisualRenderFallbackReason? {
+        guard case .fallback(let reason) = self else { return nil }
+        return reason
+    }
+
+    var description: String {
+        switch self {
+        case .fallback(let reason):
+            return "fallback(\(reason))"
+        case .active(let frame):
+            return "active(\(frame))"
+        }
+    }
+}
+
+/// Small deterministic state machine for the source-glyph gate.  This is
+/// deliberately independent of AppKit so its transition rules can be tested
+/// without creating a window or a Metal drawable.
+private struct VisualRenderStateMachine {
+    private(set) var state: VisualRenderState = .fallback(.disabled)
+    private(set) var transitionSerial: UInt64 = 0
+
+    mutating func enterFallback(_ reason: VisualRenderFallbackReason) {
+        let next = VisualRenderState.fallback(reason)
+        guard state != next else { return }
+        state = next
+        transitionSerial &+= 1
+    }
+
+    mutating func activate(_ frame: VisualRenderFrameIdentity) {
+        let next = VisualRenderState.active(frame)
+        guard state != next else { return }
+        state = next
+        transitionSerial &+= 1
+    }
+
+    var diagnosticDescription: String {
+        "state=\(state); transitions=\(transitionSerial)"
+    }
+}
+
 /// Coordinates a persistent Rust surface with one product `NSView`.
 ///
 /// The coordinator is deliberately an AppKit lifecycle adapter, not a second
@@ -4661,6 +4744,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private weak var documentScrollView: NSScrollView?
     private var visualPointerAdapterEnabled = false
     private var visualPointerLayoutWidth: CGFloat = -1.0
+    private var visualRenderStateMachine = VisualRenderStateMachine()
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
@@ -4674,7 +4758,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             // The source TextKit mirror remains usable when a machine has no
             // Metal drawable; surface lifecycle failure is diagnostic, not a
             // reason to interrupt editing with a modal alert.
-            self?.clearVisualDecorations()
+            self?.clearVisualDecorations(reason: .surfaceSubmitFailed)
             self?.statusLabel.toolTip = "Native surface inactive: \(error.localizedDescription)"
         }
     }
@@ -4751,7 +4835,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                 self.updateVisualDecorations()
             } else {
                 self.surfaceCoordinator.detach()
-                self.clearVisualDecorations()
+                self.clearVisualDecorations(reason: .detached)
             }
         }
         surfaceHostView.onGeometryChange = { [weak self] in
@@ -4856,28 +4940,89 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
 
     func detachSurfaceHost() {
         surfaceCoordinator.detach()
-        clearVisualDecorations()
+        clearVisualDecorations(reason: .detached)
     }
 
-    private func clearVisualDecorations() {
+    private func clearVisualDecorations(
+        reason: VisualRenderFallbackReason = .disabled
+    ) {
         decorationHostView.clear()
         textView.setExternalVisualDecorationsEnabled(false)
         textView.setSourceGlyphsHidden(false)
+        visualRenderStateMachine.enterFallback(reason)
     }
 
     private func syncSourceGlyphVisibility() {
         let revision = bridge.state.revision
+        let compositionGeneration = bridge.composition.generation
         let publicationCurrent = surfaceCoordinator.hasCurrentPublication(
             revision: revision,
-            compositionGeneration: bridge.composition.generation
+            compositionGeneration: compositionGeneration
         )
         let decorationCurrent = decorationHostView.revision == revision
             && decorationHostView.hasValidFrame
-        textView.setSourceGlyphsHidden(
-            publicationCurrent
-                && decorationCurrent
-                && !bridge.composition.active
+        let canHideSourceGlyphs = publicationCurrent
+            && decorationCurrent
+            && !bridge.composition.active
+        textView.setSourceGlyphsHidden(canHideSourceGlyphs)
+
+        if canHideSourceGlyphs,
+           let snapshot = surfaceCoordinator.lastSnapshot,
+           snapshot.submitted,
+           snapshot.revision == revision,
+           snapshot.compositionGeneration == compositionGeneration {
+            visualRenderStateMachine.activate(
+                VisualRenderFrameIdentity(
+                    revision: snapshot.revision,
+                    compositionGeneration: snapshot.compositionGeneration,
+                    surfaceGeneration: snapshot.surfaceGeneration,
+                    frameSerial: snapshot.frameSerial
+                )
+            )
+            return
+        }
+
+        visualRenderStateMachine.enterFallback(
+            visualRenderFallbackReason(
+                revision: revision,
+                compositionGeneration: compositionGeneration,
+                publicationCurrent: publicationCurrent,
+                decorationCurrent: decorationCurrent
+            )
         )
+    }
+
+    private func visualRenderFallbackReason(
+        revision: UInt64,
+        compositionGeneration: UInt64,
+        publicationCurrent: Bool,
+        decorationCurrent: Bool
+    ) -> VisualRenderFallbackReason {
+        if bridge.composition.active {
+            return .compositionActive
+        }
+        guard decorationCurrent else {
+            if let decorationRevision = decorationHostView.revision,
+               decorationRevision != revision {
+                return .staleRevision
+            }
+            return .decorationUnavailable
+        }
+        guard publicationCurrent else {
+            guard let snapshot = surfaceCoordinator.lastSnapshot else {
+                return surfaceCoordinator.isAttached
+                    ? .waitingForSurface
+                    : .detached
+            }
+            if snapshot.revision != revision {
+                return .staleRevision
+            }
+            if snapshot.compositionGeneration != compositionGeneration {
+                return .staleComposition
+            }
+            return snapshot.submitted ? .waitingForSurface : .surfaceSubmitFailed
+        }
+        return .invalidFrame
     }
 
     /// Publishes Rust/CoreText-shaped decoration geometry into the sibling
@@ -4887,7 +5032,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     /// composition, stale geometry, or a not-yet-laid-out surface.
     private func updateVisualDecorations() {
         guard decorationHostView.superview != nil else {
-            clearVisualDecorations()
+            clearVisualDecorations(reason: .missingGeometry)
             return
         }
         if let geometry = surfaceCoordinator.visualDecorationGeometry() {
@@ -4948,7 +5093,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         guard visualPointerAdapterEnabled,
               decorationHostView.superview != nil,
               let caret = textView.visualCaretRectForDisplay() else {
-            clearVisualDecorations()
+            clearVisualDecorations(reason: .visualMirrorUnavailable)
             return
         }
         let selection = textView.visualSelectionRectsForDisplay().map {
@@ -5820,6 +5965,42 @@ private func runVisualDecorationSelfCheck(path: String) -> Never {
         fputs("Yu Visual Decoration self-check failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
+}
+
+private func runVisualRenderStateSelfCheck() -> Never {
+    var machine = VisualRenderStateMachine()
+    precondition(machine.state == .fallback(.disabled))
+    precondition(machine.transitionSerial == 0)
+
+    machine.enterFallback(.waitingForSurface)
+    precondition(machine.state == .fallback(.waitingForSurface))
+    let firstTransition = machine.transitionSerial
+    machine.enterFallback(.waitingForSurface)
+    precondition(machine.transitionSerial == firstTransition)
+
+    machine.enterFallback(.staleRevision)
+    precondition(machine.state.fallbackReason == .staleRevision)
+
+    let frame = VisualRenderFrameIdentity(
+        revision: 7,
+        compositionGeneration: 3,
+        surfaceGeneration: 11,
+        frameSerial: 19
+    )
+    machine.activate(frame)
+    precondition(machine.state == .active(frame))
+    precondition(machine.state.isActive)
+    precondition(machine.diagnosticDescription.contains("revision=7"))
+
+    machine.enterFallback(.staleComposition)
+    precondition(machine.state == .fallback(.staleComposition))
+    precondition(!machine.state.isActive)
+    precondition(machine.transitionSerial >= 4)
+    print(
+        "Yu Visual Render State self-check: explicit active/fallback transitions "
+            + "preserve frame identity and diagnostics"
+    )
+    exit(EXIT_SUCCESS)
 }
 
 private func runVisualIMESelfCheck(path: String) -> Never {
@@ -7704,6 +7885,9 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-mirror-self-check")
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-decoration-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualDecorationSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if CommandLine.arguments.contains("--visual-render-state-self-check") {
+    runVisualRenderStateSelfCheck()
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-ime-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

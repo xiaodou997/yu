@@ -61,6 +61,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] heading、emphasis、code、link 的最小真实 visual render 通过产品窗口 persistent Metal
   surface 可见提交；TextKit 仍保留为透明 overlay 下的输入/AX/回退表面
 - [x] 当前 Revision、composition generation、submit geometry 和 Rust decoration frame 同时有效时隐藏 TextKit source glyph；编辑、滚动、resize、IME、stale、detach 与 submit 失败自动恢复
+- [x] 产品窗口将 source-glyph gate 收敛为带 frame identity 与 fallback reason 的显式 visual render state machine，并提供无窗口 transition self-check
 - [x] fenced code block 的 Revision-bound `FillRect` 背景进入 Scene/RenderPlan/Metal solid pipeline，并保持 fill-before-glyph painter order
 - [x] `yu-projection::ImageSource` 保留 inline/reference image 的 source/label/destination ranges，并随 strictly-outside edit 映射
 - [x] `yu-assets::ImageCache` 建立可轮询异步解码队列、destination 去重、RGBA8 校验和 Revision-bound CPU publication

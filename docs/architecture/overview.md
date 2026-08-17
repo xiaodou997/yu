@@ -147,6 +147,13 @@ layout 返回 point/line/height。native 层只保存 owned scalar 和版本标�
  Rust overlay；后续 commit/cancel 使用保存的 native range 恢复 mirror，并要求最近一次
  projection/caret snapshot 仍属于同一 Revision + generation。见 ADR 0078。
 
+macOS product window 的 source-glyph gate 由显式 `VisualRenderStateMachine` 管理。fallback 状态
+携带 detached、待提交、stale Revision/generation、composition active、decoration 不可用或
+surface submit 失败等原因；active 状态同时绑定 Revision、composition generation、surface
+generation 与 frame serial。只有同一 frame 的 Metal publication 与 decoration caret 都有效时，
+TextKit source glyph 才会被隐藏；任何失配立即回到 native 绘制。该状态机只负责绘制门控和诊断，
+不改变 TextKit 的输入/IME/Accessibility 责任，也不代表完整 visual renderer 已迁移。见 ADR 0149。
+
 `EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
 按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
 Revision。光标移动、显式 selection、composition 边界和 reset 会断开 group；新的永久 edit 会清空
