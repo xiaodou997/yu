@@ -5027,7 +5027,6 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         let canHideSourceGlyphs = publicationCurrent
             && decorationCurrent
             && rustDecorationFrameAccepted
-            && !bridge.composition.active
         if canHideSourceGlyphs {
             textView.useRustSurfacePresentation()
         } else if useProjectedTextKitFallback {
@@ -5102,9 +5101,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     /// Publishes Rust/CoreText-shaped decoration geometry into the sibling
     /// overlay. The Rust coordinates are document-space and the only native
     /// transform here is the current scroll offset into the surface sibling's
-    /// viewport-local coordinate system. TextKit's projected overlay is kept
-    /// only for active composition; ordinary stale geometry or an unavailable
-    /// surface returns to the canonical source fallback instead.
+    /// viewport-local coordinate system. Active composition uses the same
+    /// generation-bound Rust geometry as the surface; TextKit's projected
+    /// overlay is only a failure fallback.
     private func updateVisualDecorations() {
         guard decorationHostView.superview != nil else {
             clearVisualDecorations(reason: .missingGeometry)
@@ -5151,15 +5150,15 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                     revision: snapshot.revision,
                     selectionRects: localSelection,
                     caretRect: localCaret,
-                    compositionActive: false
+                    compositionActive: bridge.composition.active
                 )
                 rustDecorationFrameAccepted = true
                 syncSourceGlyphVisibility()
                 return
             } catch {
-                // Active marked text intentionally returns NO_OVERLAY; stale
-                // revisions and unavailable CoreText metrics must not use a
-                // projected TextKit overlay in ordinary source mode.
+                // A transient TextKit projection is retained only when the
+                // generation-bound Rust decoration query cannot provide a
+                // drawable frame for active marked text.
                 rustDecorationFrameAccepted = false
                 if bridge.composition.active {
                     updateVisualDecorationsFromTextKit()
@@ -6024,6 +6023,47 @@ private func runVisualDecorationSelfCheck(path: String) -> Never {
         precondition(decoration.selectionRects.count == rustSelection.count)
         precondition(decoration.caretRect != nil)
         precondition(decoration.hitTest(NSPoint(x: 1.0, y: 1.0)) == nil)
+
+        let compositionRange = NSRange(
+            location: sourceStrong.location + 2,
+            length: 2
+        )
+        try bridge.beginComposition(
+            replacementRange: compositionRange,
+            preedit: "日本🙂",
+            selection: NSRange(location: 2, length: 2)
+        )
+        let composition = bridge.composition
+        precondition(composition.active)
+        let (compositionSnapshot, compositionCaret, compositionSelection) =
+            try bridge.macosVisualDecorations(
+                revision: revision,
+                compositionGeneration: composition.generation,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 480.0
+            )
+        precondition(compositionSnapshot.revision == revision)
+        precondition(compositionSnapshot.compositionGeneration == composition.generation)
+        precondition(compositionSnapshot.caretPresent)
+        precondition(compositionCaret.present)
+        precondition(
+            compositionCaret.rect.origin.x.isFinite
+                && compositionCaret.rect.origin.y.isFinite
+        )
+        precondition(compositionSnapshot.selectionCount == compositionSelection.count)
+        decoration.update(
+            revision: revision,
+            selectionRects: compositionSelection.map(\.rect),
+            caretRect: compositionCaret.rect,
+            compositionActive: true
+        )
+        precondition(decoration.compositionActive)
+        precondition(decoration.hasValidFrame)
+        try bridge.cancelComposition()
+        precondition(!bridge.composition.active)
+
         textView.useSourceFallbackPresentation()
         precondition(textView.presentationRoleForSelfCheck == "sourceFallback")
         textView.useProjectedTextKitOverlayPresentation()
