@@ -4,7 +4,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Range};
-use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
+use yu_layout::{
+    ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider,
+    TableResizeCommit,
+};
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
@@ -243,6 +246,62 @@ impl EditorDocument {
         self.layouts
             .get_or_build_block_with_shaper(&snapshot, block, config, projection, shaper)
             .map_err(EditorDocumentError::Layout)
+    }
+
+    /// Builds a transient metrics layout with a session-only table column
+    /// resize. The normal layout cache remains canonical and the Markdown
+    /// source is not changed; callers should discard the returned snapshot
+    /// when the visual override ends or the document Revision changes.
+    pub fn block_layout_with_table_resize(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        commit: TableResizeCommit,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        self.validate_table_resize_commit(index, commit)?;
+        let mut layout = self.block_layout(index, config)?.clone();
+        layout
+            .apply_table_resize(commit)
+            .map_err(EditorDocumentError::Layout)?;
+        Ok(layout)
+    }
+
+    /// Builds a transient shaped layout with a session-only table column
+    /// resize. Shaping state stays owned by the caller and the override is
+    /// never inserted into the document's layout cache.
+    pub fn block_layout_with_table_resize_and_shaper<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+        commit: TableResizeCommit,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        self.validate_table_resize_commit(index, commit)?;
+        let mut layout = self
+            .block_layout_with_shaper(index, config, shaper)?
+            .clone();
+        layout
+            .apply_table_resize(commit)
+            .map_err(EditorDocumentError::Layout)?;
+        Ok(layout)
+    }
+
+    fn validate_table_resize_commit(
+        &self,
+        index: usize,
+        commit: TableResizeCommit,
+    ) -> Result<(), EditorDocumentError> {
+        if commit.block_index() != index {
+            return Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
+                "table resize commit and block index differ",
+            )));
+        }
+        if commit.revision() != self.revision() {
+            return Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
+                "table resize commit and document revisions differ",
+            )));
+        }
+        Ok(())
     }
 
     /// Builds a transient metrics layout with the active IME preedit
@@ -2137,7 +2196,8 @@ mod tests {
     use unicode_segmentation::UnicodeSegmentation;
     use yu_core::{ByteOffset, Utf16Offset};
     use yu_layout::{
-        FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
+        FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
+        TableResizeGesture, TableResizeTarget, TextDirection,
     };
     use yu_markdown::BlockKind;
     use yu_projection::VisualRunStyle;
@@ -2200,6 +2260,65 @@ mod tests {
             document.selection().focus(),
             ByteOffset::new(source.rfind('2').expect("last cell") as u64)
         );
+    }
+
+    #[test]
+    fn table_column_resize_layout_is_transient_and_revision_bound() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let mut document = EditorDocument::new(source);
+        let config = LayoutConfig::new(20.0, 2.0);
+        let hit = document
+            .block_layout(0, config)
+            .expect("table layout")
+            .table()
+            .expect("table metadata")
+            .resize_hit_test(LayoutPoint::new(3.0, 0.5), 0.0)
+            .expect("resize hit-test")
+            .expect("column divider");
+        assert_eq!(hit.target(), TableResizeTarget::Column { index: 0 });
+        let revision = document.revision();
+        let mut gesture = TableResizeGesture::begin(revision, 0, hit, 3.0).expect("gesture begin");
+        gesture.update(revision, 4.0).expect("gesture update");
+        let commit = gesture.finish(revision).expect("gesture finish");
+        let resized = document
+            .block_layout_with_table_resize(0, config, commit)
+            .expect("transient table resize");
+
+        assert_eq!(
+            resized.table().expect("resized table").column_widths(),
+            &[4.0, 2.0]
+        );
+        assert_eq!(
+            resized.table().expect("resized table").cells()[1]
+                .bounds()
+                .x(),
+            4.0
+        );
+        assert_eq!(document.snapshot().as_str(), source);
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.layout_cache_stats().entries(), 1);
+        assert_eq!(
+            document
+                .block_layout(0, config)
+                .expect("canonical table layout")
+                .table()
+                .expect("canonical table metadata")
+                .column_widths(),
+            &[3.0, 3.0]
+        );
+
+        document
+            .apply_transaction(&Transaction::new(
+                revision,
+                [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+            ))
+            .expect("source edit");
+        assert!(matches!(
+            document.block_layout_with_table_resize(0, config, commit),
+            Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
+                "table resize commit and document revisions differ"
+            )))
+        ));
     }
 
     #[derive(Clone, Copy, Debug)]

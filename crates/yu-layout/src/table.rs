@@ -355,6 +355,7 @@ pub struct TableLayoutSnapshot {
     source_range: TextRange,
     delimiter_source: Option<TextRange>,
     column_widths: Vec<f32>,
+    padding: f32,
     row_height: f32,
     bounds: LayoutRect,
     cells: Vec<TableCellLayout>,
@@ -490,6 +491,7 @@ impl TableLayoutSnapshot {
                 .map(table_cell_range)
                 .transpose()?,
             column_widths,
+            padding,
             row_height,
             bounds,
             cells,
@@ -535,6 +537,136 @@ impl TableLayoutSnapshot {
     #[must_use]
     pub fn row_sources(&self) -> &[TextRange] {
         &self.row_sources
+    }
+
+    /// Returns a copy with one internal column divider moved by `delta`.
+    ///
+    /// This is deliberately a geometry-only operation. It preserves the
+    /// table's total width, keeps both adjacent columns usable, and leaves all
+    /// source/visual ranges untouched. Row geometry remains unchanged because
+    /// the current table layout contract still uses a uniform row height.
+    pub fn resized_columns(&self, index: usize, delta: f32) -> Result<Self, LayoutError> {
+        if !delta.is_finite() {
+            return Err(LayoutError::InvalidTable(
+                "table column resize delta must be finite",
+            ));
+        }
+        let Some(right_index) = index.checked_add(1) else {
+            return Err(LayoutError::InvalidTable(
+                "table column resize index is out of bounds",
+            ));
+        };
+        if right_index >= self.column_widths.len() {
+            return Err(LayoutError::InvalidTable(
+                "table column resize index is out of bounds",
+            ));
+        }
+
+        let left = self.column_widths[index];
+        let right = self.column_widths[right_index];
+        let pair_width = left + right;
+        if !left.is_finite() || !right.is_finite() || !pair_width.is_finite() || pair_width <= 0.0 {
+            return Err(LayoutError::InvalidTable(
+                "table column widths are not finite",
+            ));
+        }
+        let minimum = (self.padding * 2.0).min(pair_width * 0.5).max(f32::EPSILON);
+        let requested_left = left + delta;
+        if !requested_left.is_finite() {
+            return Err(LayoutError::InvalidTable(
+                "table column resize result is not finite",
+            ));
+        }
+        let new_left = requested_left.clamp(minimum, pair_width - minimum);
+        let new_right = pair_width - new_left;
+        if !new_right.is_finite() || new_right < minimum {
+            return Err(LayoutError::InvalidTable(
+                "table column resize result is invalid",
+            ));
+        }
+
+        let mut widths = self.column_widths.clone();
+        widths[index] = new_left;
+        widths[right_index] = new_right;
+        self.with_column_widths(widths)
+    }
+
+    fn with_column_widths(&self, column_widths: Vec<f32>) -> Result<Self, LayoutError> {
+        if column_widths.is_empty()
+            || column_widths
+                .iter()
+                .any(|width| !width.is_finite() || *width <= 0.0)
+        {
+            return Err(LayoutError::InvalidTable("table column widths are invalid"));
+        }
+        let total_width = column_widths.iter().sum::<f32>();
+        if !total_width.is_finite() || total_width <= 0.0 {
+            return Err(LayoutError::InvalidTable("table width is not finite"));
+        }
+        let mut starts = Vec::with_capacity(column_widths.len());
+        let mut x = self.bounds.x();
+        for width in column_widths.iter().copied() {
+            starts.push(x);
+            x += width;
+        }
+
+        let cells =
+            self.cells
+                .iter()
+                .copied()
+                .map(|cell| {
+                    let width = column_widths.get(cell.column).copied().ok_or(
+                        LayoutError::InvalidTable("table cell column is out of bounds"),
+                    )?;
+                    let column_x =
+                        starts
+                            .get(cell.column)
+                            .copied()
+                            .ok_or(LayoutError::InvalidTable(
+                                "table cell column is out of bounds",
+                            ))?;
+                    let available = (width - self.padding * 2.0).max(0.0);
+                    let slack = (available - cell.content_width).max(0.0);
+                    let alignment_offset = match cell.alignment {
+                        TableAlignment::Center => slack * 0.5,
+                        TableAlignment::Right => slack,
+                        TableAlignment::Default | TableAlignment::Left => 0.0,
+                    };
+                    Ok(TableCellLayout {
+                        row: cell.row,
+                        column: cell.column,
+                        source: cell.source,
+                        visual: cell.visual,
+                        bounds: LayoutRect::new(
+                            column_x,
+                            cell.bounds.y(),
+                            width,
+                            cell.bounds.height(),
+                        )?,
+                        alignment: cell.alignment,
+                        content_x: column_x + self.padding + alignment_offset,
+                        content_width: cell.content_width,
+                    })
+                })
+                .collect::<Result<Vec<_>, LayoutError>>()?;
+        let bounds = LayoutRect::new(
+            self.bounds.x(),
+            self.bounds.y(),
+            total_width,
+            self.bounds.height(),
+        )?;
+
+        Ok(Self {
+            revision: self.revision,
+            source_range: self.source_range,
+            delimiter_source: self.delimiter_source,
+            column_widths,
+            padding: self.padding,
+            row_height: self.row_height,
+            bounds,
+            cells,
+            row_sources: self.row_sources.clone(),
+        })
     }
 
     /// Resolves a visual boundary that lands on a structural table run to a
@@ -698,6 +830,7 @@ impl TableLayoutSnapshot {
             source_range,
             delimiter_source,
             column_widths: self.column_widths.clone(),
+            padding: self.padding,
             row_height: self.row_height,
             bounds: self.bounds,
             cells,
