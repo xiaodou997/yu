@@ -154,6 +154,11 @@ generation 与 frame serial。只有同一 frame 的 Metal publication 与 decor
 TextKit source glyph 才会被隐藏；任何失配立即回到 native 绘制。该状态机只负责绘制门控和诊断，
 不改变 TextKit 的输入/IME/Accessibility 责任，也不代表完整 visual renderer 已迁移。见 ADR 0149。
 
+Rust surface 与 decoration sibling 现在还遵循成对可见性门控：只有 decoration 确认来自同一
+Rust/CoreText-shaped frame 时才允许显示 surface；TextKit visual mirror 生成的 fallback
+decoration 不会隐藏 source glyph，也不会让旧 Metal frame 留在 source mirror 下方。这样
+composition、stale geometry、resize 和 submit 失败都回到完整 TextKit source 绘制。见 ADR 0150。
+
 `EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
 按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
 Revision。光标移动、显式 selection、composition 边界和 reset 会断开 group；新的永久 edit 会清空
