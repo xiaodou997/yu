@@ -190,7 +190,11 @@ Rust `yu-layout::TableResizeGesture` 为 native adapter 提供同样的按下/�
 捕获 Revision、block index、divider target 和 pointer anchor；移动只更新临时 pointer 与
 proposed divider position；释放返回 `TableResizeCommit` 几何候选。任何 update/finish/cancel
 都必须匹配捕获 Revision，且非有限 pointer 被拒绝。commit 不携带 cell 文本或 source edit，
-因此 Markdown 写回仍必须经过另一个明确的 editor transaction。
+因此 Markdown 写回仍必须经过另一个明确的 editor transaction。当前会话覆盖只对 column
+commit 调用 `LayoutSnapshot::apply_table_resize`：它返回保持总宽度的 transient geometry，
+并按相邻列最小宽度 clamp；`EditorDocument::block_layout_with_table_resize`（含 shaped
+版本）不会把覆盖插入 layout cache。row commit 仍只完成 hit/gesture 协议，直到 variable-row
+layout 同时更新 baseline、hit-test、viewport height index 和 scene border。
 
 definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
 offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地

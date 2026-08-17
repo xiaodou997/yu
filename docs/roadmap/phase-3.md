@@ -25,6 +25,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 表格 visible cell address 固定为 header=0、body 从 1 开始并跳过 delimiter；Editor Tab/Shift-Tab 按 source cell row-major 顺序移动 caret，不改变 Revision/Undo，首尾无目标时返回 Unhandled
 - [x] macOS storage FFI 暴露 Revision-bound table column/row divider resize hit-test（kind/index/局部 position）；outer edge、非法 tolerance、非 table block 和 stale Revision 拒绝，实际 drag transaction 后置
 - [x] `yu-layout::TableResizeGesture` 固定按下/移动/释放/取消的 Revision-bound、source-neutral 状态；document-host self-check 消费 column/row hit ABI 并验证 tolerance、source 不变和 stale 拒绝
+- [x] GFM table resize 第一版采用 session-only column geometry：transient layout 保持总宽度、最小列宽和 source ranges，不进入 layout cache；row geometry 等待 variable-row contract
 - [x] heading/blockquote/list 与 task/fence 复用 parser-owned structural prefix，统一 block projection kind tag；列表 bullet/task 文本仍保持 source-visible
 - [x] visual selection range、metrics hit-testing 和 point↔source mapping 的 Revision-bound 诊断契约
 - [x] stale Revision/generation 在 native projection callbacks 上的全路径回归（含视觉 scene/glyph/render-plan count/fill header）

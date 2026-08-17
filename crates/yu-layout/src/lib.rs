@@ -923,6 +923,34 @@ impl LayoutSnapshot {
         self.table.as_ref()
     }
 
+    /// Applies a source-neutral table resize to a transient copy of this
+    /// layout. The canonical projection, TextBuffer and layout cache remain
+    /// untouched; callers can keep the returned snapshot only for the current
+    /// visual session/frame.
+    pub fn apply_table_resize(&mut self, commit: TableResizeCommit) -> Result<(), LayoutError> {
+        if commit.revision() != self.revision() {
+            return Err(LayoutError::InvalidTable(
+                "table resize commit and layout revisions differ",
+            ));
+        }
+        let Some(table) = self.table.as_ref() else {
+            return Err(LayoutError::InvalidTable(
+                "table resize requires a table layout",
+            ));
+        };
+        let resized = match commit.target() {
+            TableResizeTarget::Column { index } => table.resized_columns(index, commit.delta())?,
+            TableResizeTarget::Row { .. } => {
+                return Err(LayoutError::InvalidTable(
+                    "row resize requires variable-row table layout",
+                ));
+            }
+        };
+        self.apply_table_geometry(&resized)?;
+        self.table = Some(resized);
+        Ok(())
+    }
+
     /// Applies decoded image dimensions without changing source or visual
     /// mappings. Width is capped to the remaining line width and height keeps
     /// the decoded aspect ratio, so hit-testing and the later scene overlay
@@ -2612,6 +2640,87 @@ mod tests {
         let cancelled =
             TableResizeGesture::begin(layout.revision(), 0, hit, 3.1).expect("cancel begin");
         assert_eq!(cancelled.cancel(layout.revision()), Ok(()));
+    }
+
+    #[test]
+    fn table_column_resize_is_transient_and_preserves_source_geometry_contract() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table block");
+        let projection = BlockProjection::from_block(&snapshot, block).expect("table projection");
+        let mut layout = LayoutSnapshot::from_block_projection_with_metrics(
+            &projection,
+            LayoutConfig::new(20.0, 2.0),
+            &MonospaceMetrics::new(1.0),
+        )
+        .expect("table layout");
+        let hit = layout
+            .table()
+            .expect("table metadata")
+            .resize_hit_test(LayoutPoint::new(3.0, 0.5), 0.0)
+            .expect("column resize hit-test")
+            .expect("column divider");
+        let gesture =
+            TableResizeGesture::begin(layout.revision(), 0, hit, 3.0).expect("gesture begin");
+        let mut gesture = gesture;
+        gesture
+            .update(layout.revision(), 4.0)
+            .expect("gesture update");
+        let commit = gesture.finish(layout.revision()).expect("gesture finish");
+        let source_range = layout.table().expect("table metadata").source_range();
+
+        layout
+            .apply_table_resize(commit)
+            .expect("column resize should produce a visual snapshot");
+
+        let table = layout.table().expect("resized table metadata");
+        assert_eq!(table.column_widths(), &[4.0, 2.0]);
+        assert_eq!(table.bounds().width(), 6.0);
+        assert_eq!(table.cells()[0].bounds().x(), 0.0);
+        assert_eq!(table.cells()[1].bounds().x(), 4.0);
+        assert_eq!(table.cells()[1].content_x(), 5.0);
+        assert_eq!(
+            layout.table().expect("table metadata").source_range(),
+            source_range
+        );
+        assert_eq!(layout.lines()[0].width(), 6.0);
+        assert_eq!(layout.clusters()[1].x(), 5.0);
+
+        let mut clamped_left = layout.clone();
+        let mut left_gesture = TableResizeGesture::begin(clamped_left.revision(), 0, hit, 3.0)
+            .expect("second gesture");
+        left_gesture
+            .update(clamped_left.revision(), -97.0)
+            .expect("large negative resize");
+        let left_commit = left_gesture
+            .finish(clamped_left.revision())
+            .expect("second commit");
+        clamped_left
+            .apply_table_resize(left_commit)
+            .expect("resize should clamp to minimum widths");
+        assert_eq!(
+            clamped_left.table().expect("clamped table").column_widths(),
+            &[2.0, 4.0]
+        );
+
+        let row_hit = layout
+            .table()
+            .expect("table metadata")
+            .resize_hit_test(LayoutPoint::new(1.0, 2.0), 0.0)
+            .expect("row resize hit-test")
+            .expect("row divider");
+        let row_commit = TableResizeGesture::begin(layout.revision(), 0, row_hit, 2.0)
+            .expect("row gesture")
+            .finish(layout.revision())
+            .expect("row commit");
+        assert_eq!(
+            layout.apply_table_resize(row_commit),
+            Err(LayoutError::InvalidTable(
+                "row resize requires variable-row table layout"
+            ))
+        );
     }
 
     #[test]

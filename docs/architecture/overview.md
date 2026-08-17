@@ -327,7 +327,9 @@ source/IME/Accessibility fallback，完整 visual renderer 切换不在本阶段
 （kind/index/局部 x 或 y），不在查询层修改 Markdown；末尾 Tab 自动新增行和真正的 resize
 transaction 仍是后续编辑阶段的工作。`yu-layout::TableResizeGesture` 已固定 native 按下/移动/
 释放状态：捕获 pointer anchor 后只生成临时 proposed divider position，释放返回不含 source
-edit 的 `TableResizeCommit`；stale Revision 或非有限坐标直接拒绝。document-host 的 block
+edit 的 `TableResizeCommit`；stale Revision 或非有限坐标直接拒绝。当前只把 column commit
+应用为 session-only transient layout：相邻列安全 clamp、总宽度保持不变，canonical Markdown
+和 layout cache 不变；row commit 等待完整 variable-row layout。document-host 的 block
 projection self-check 同时验证 column/row 命中、tolerance、source 不变和 stale 拒绝。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
