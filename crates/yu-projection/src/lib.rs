@@ -1447,10 +1447,11 @@ pub enum BlockProjectionKind {
 
 /// A source-backed GFM table projection.
 ///
-/// The visual stream is intentionally still the ordinary inline projection in
-/// this stage.  `TableBlock` carries absolute source ranges for the header,
-/// delimiter and body cells so a later retained table layout can replace the
-/// pipes with a grid without creating a second document model.
+/// Header/body text remains an ordinary source-backed inline projection while
+/// the parser-owned delimiter physical row is hidden. `TableBlock` carries
+/// absolute source ranges for the header, delimiter and body cells so the
+/// retained table layout can replace the hidden row with a grid without
+/// creating a second document model.
 #[derive(Clone, Debug)]
 pub struct TableProjection {
     visual: Projection,
@@ -1466,12 +1467,18 @@ impl TableProjection {
         let Some(table) = parse_table_in_snapshot(source, block.range()) else {
             return Ok(None);
         };
-        let visual = match definitions {
+        let inline = match definitions {
             Some(definitions) => {
-                Projection::inline_with_definitions(source, block.range(), definitions)?
+                parse_inline_with_definitions(source, block.range(), Some(definitions))?
             }
-            None => Projection::inline(source, block.range())?,
+            None => parse_inline(source, block.range())?,
         };
+        let hidden = table
+            .delimiter_source_range()
+            .into_iter()
+            .map(table_cell_to_text_range)
+            .collect::<Result<Vec<_>, _>>()?;
+        let visual = Projection::from_inline_with_hidden(&inline, &hidden)?;
         Ok(Some(Self { visual, table }))
     }
 
@@ -2078,6 +2085,12 @@ fn byte_range(start: usize, end: usize) -> Result<TextRange, ProjectionError> {
     TextRange::new(start, end).ok_or(ProjectionError::OffsetOverflow)
 }
 
+fn table_cell_to_text_range(
+    range: yu_markdown::TableCellRange,
+) -> Result<TextRange, ProjectionError> {
+    byte_range(range.start(), range.end())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2501,6 +2514,22 @@ mod tests {
             .collect::<Result<String, _>>()
             .expect("table visual text");
         assert!(projected.contains("| A | B |"));
+        assert!(!projected.contains("---"));
+        assert!(projection.visual().runs().iter().any(|run| {
+            run.kind() == VisualRunKind::HiddenSyntax
+                && run.source()
+                    == table
+                        .table()
+                        .delimiter_source_range()
+                        .map(|range| {
+                            TextRange::new(
+                                ByteOffset::try_from(range.start()).expect("range start"),
+                                ByteOffset::try_from(range.end()).expect("range end"),
+                            )
+                            .expect("delimiter range")
+                        })
+                        .expect("delimiter source range")
+        }));
 
         let mut buffer = TextBuffer::new(source);
         let edit = yu_text::Transaction::new(

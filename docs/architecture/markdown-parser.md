@@ -163,9 +163,12 @@ kind，但保留 bullet 与任务文本，避免在没有 list marker scene prim
 task 和 fenced code；GFM table 仍在 block kind 层报告为 `Paragraph`，但
 `parse_table_in_snapshot` 会为同一 source range 生成 source-backed `TableProjection`。
 它暴露 header、delimiter、body row 和 cell 的绝对 source byte ranges，当前 visual stream
-仍是 inline projection；后续 table layout 才会把 delimiter 转为网格/边框语义。macOS FFI
-通过 `yu_storage_session_projected_table_cells` 将这些 ranges 转成 Revision-bound UTF-16
-count/fill 数据，Swift 不需要自行扫描 `|`。
+仍保留 header/body 的 source-backed inline runs，但 parser-owned delimiter physical row 已由
+`TableProjection` 隐藏。`yu-layout::TableLayoutSnapshot` 在同一 source range 上按 metrics 生成
+可见 cell 的列宽、行高和 bounds；delimiter 只作为 source range 保留，不生成可见 cell。macOS
+FFI 通过 `yu_storage_session_projected_table_cells` 暴露 parser cell ranges，并通过
+`yu_storage_session_table_layout_cells` / `yu_storage_session_table_cell_hit_test` 暴露
+Revision-bound UTF-16 geometry 与 source-backed hit-test，Swift 不需要自行扫描 `|` 或复制文本。
 
 definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
 offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地

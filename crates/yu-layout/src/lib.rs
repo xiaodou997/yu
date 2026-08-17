@@ -20,10 +20,12 @@ use yu_projection::{
 use yu_text::{ChangeSet, TextSnapshot};
 
 mod shaping;
+mod table;
 
 pub use shaping::{
     FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
 };
+pub use table::{TableCellLayout, TableLayoutHit, TableLayoutSnapshot};
 
 /// Layout dimensions and wrapping policy independent of any font backend.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -143,6 +145,7 @@ pub enum LayoutError {
     Shaping(String),
     InvalidPoint,
     InvalidImageBounds,
+    InvalidTable(&'static str),
     OffsetOverflow,
 }
 
@@ -329,6 +332,7 @@ impl fmt::Display for LayoutError {
             Self::InvalidImageBounds => {
                 formatter.write_str("image bounds must be finite and have positive height")
             }
+            Self::InvalidTable(message) => write!(formatter, "invalid table layout: {message}"),
             Self::OffsetOverflow => formatter.write_str("layout offset overflow"),
         }
     }
@@ -343,6 +347,7 @@ impl Error for LayoutError {
             | Self::Shaping(_)
             | Self::InvalidPoint
             | Self::InvalidImageBounds
+            | Self::InvalidTable(_)
             | Self::OffsetOverflow => None,
         }
     }
@@ -761,6 +766,7 @@ pub struct LayoutSnapshot {
     clusters: Vec<VisualCluster>,
     glyphs: Vec<GlyphPlacement>,
     images: Vec<ImagePlacement>,
+    table: Option<TableLayoutSnapshot>,
 }
 
 impl LayoutSnapshot {
@@ -778,7 +784,8 @@ impl LayoutSnapshot {
         projection: &BlockProjection,
         config: LayoutConfig,
     ) -> Result<Self, LayoutError> {
-        Self::from_projection(projection.visual(), config)
+        let metrics = MonospaceMetrics::new(config.default_advance());
+        Self::from_block_projection_with_metrics(projection, config, &metrics)
     }
 
     /// Builds layout from a block projection with caller-provided metrics.
@@ -787,7 +794,13 @@ impl LayoutSnapshot {
         config: LayoutConfig,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
-        Self::from_projection_with_metrics(projection.visual(), config, metrics)
+        let mut layout = Self::from_projection_with_metrics(projection.visual(), config, metrics)?;
+        if let BlockProjection::Table(table) = projection {
+            layout.table = Some(TableLayoutSnapshot::from_projection(
+                table, config, metrics,
+            )?);
+        }
+        Ok(layout)
     }
 
     /// Builds a block layout from shaped glyph runs.
@@ -801,7 +814,13 @@ impl LayoutSnapshot {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<Self, LayoutError> {
-        Self::from_projection_with_shaper(projection.visual(), config, shaper)
+        let mut layout = Self::from_projection_with_shaper(projection.visual(), config, shaper)?;
+        if let BlockProjection::Table(table) = projection {
+            layout.table = Some(TableLayoutSnapshot::from_projection_with_shaper(
+                table, config, shaper,
+            )?);
+        }
+        Ok(layout)
     }
 
     /// Builds layout with a caller-provided grapheme advance provider.
@@ -818,6 +837,7 @@ impl LayoutSnapshot {
             clusters: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
+            table: None,
         };
         layout.build(metrics)?;
         layout.build_image_placements()?;
@@ -838,6 +858,7 @@ impl LayoutSnapshot {
             clusters: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
+            table: None,
         };
         layout.build_shaped(shaper)?;
         layout.build_image_placements()?;
@@ -888,6 +909,14 @@ impl LayoutSnapshot {
     #[must_use]
     pub fn images(&self) -> &[ImagePlacement] {
         &self.images
+    }
+
+    /// Returns table cell geometry when this block is a GFM table. The
+    /// delimiter row is source-backed but intentionally absent from visible
+    /// cell geometry.
+    #[must_use]
+    pub fn table(&self) -> Option<&TableLayoutSnapshot> {
+        self.table.as_ref()
     }
 
     /// Applies decoded image dimensions without changing source or visual
@@ -1008,6 +1037,11 @@ impl LayoutSnapshot {
                 })
             })
             .collect::<Result<Vec<_>, LayoutError>>()?;
+        let table = self
+            .table
+            .as_ref()
+            .map(|table| table.map_through(changes, snapshot))
+            .transpose()?;
         Ok(Some(Self {
             projection,
             config: self.config,
@@ -1015,6 +1049,7 @@ impl LayoutSnapshot {
             clusters,
             glyphs,
             images,
+            table,
         }))
     }
 
@@ -2167,6 +2202,99 @@ mod tests {
         assert_eq!(mapped.glyphs()[0].x(), layout.glyphs()[0].x());
         assert_eq!(mapped.glyphs()[0].y(), layout.glyphs()[0].y());
         assert_eq!(mapped.glyphs()[0].source().start().get(), 10);
+    }
+
+    #[test]
+    fn table_layout_hides_delimiter_row_and_hit_tests_source_cells() {
+        let source = "prefix\n\n| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(2).expect("table block");
+        let projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+        )
+        .expect("table projection");
+        let layout = LayoutSnapshot::from_block_projection_with_metrics(
+            &projection,
+            LayoutConfig::new(20.0, 2.0),
+            &MonospaceMetrics::new(1.0),
+        )
+        .expect("table layout");
+        let table = layout.table().expect("table layout metadata");
+
+        assert_eq!(table.cells().len(), 4);
+        assert_eq!(table.column_widths(), &[3.0, 3.0]);
+        assert_eq!(table.bounds().width(), 6.0);
+        assert_eq!(table.bounds().height(), 4.0);
+        let delimiter = table.delimiter_source().expect("delimiter source");
+        assert_eq!(
+            &source[usize::try_from(delimiter.start()).expect("delimiter start")
+                ..usize::try_from(delimiter.end()).expect("delimiter end")],
+            "| --- | :---: |\n"
+        );
+
+        let hit = table
+            .hit_test(LayoutPoint::new(3.5, 2.5))
+            .expect("hit-test should validate")
+            .expect("point should land in body cell");
+        assert_eq!(hit.row(), 1);
+        assert_eq!(hit.column(), 1);
+        assert_eq!(
+            &source[usize::try_from(hit.source().start()).expect("hit source start")
+                ..usize::try_from(hit.source().end()).expect("hit source end")],
+            "2"
+        );
+
+        let visual = layout
+            .projection()
+            .runs()
+            .iter()
+            .filter(|run| run.kind() != yu_projection::VisualRunKind::HiddenSyntax)
+            .map(|run| layout.projection().text_for_run(*run))
+            .collect::<Result<String, _>>()
+            .expect("table visual text");
+        assert!(!visual.contains("---"));
+    }
+
+    #[test]
+    fn table_layout_maps_cell_ranges_through_prefix_edits() {
+        let source = "intro\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let mut buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(2).expect("table block");
+        let projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+        )
+        .expect("table projection");
+        let layout =
+            LayoutSnapshot::from_block_projection(&projection, LayoutConfig::new(20.0, 1.0))
+                .expect("table layout");
+        let old_cell = layout.table().expect("table metadata").cells()[0].source();
+        let transaction = yu_text::Transaction::new(
+            buffer.revision(),
+            [yu_text::Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
+        );
+        let applied = buffer.apply(&transaction).expect("prefix edit");
+        let mapped = layout
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .expect("layout should map")
+            .expect("outside edit should preserve table layout");
+        assert_eq!(
+            mapped.table().expect("mapped table").cells()[0]
+                .source()
+                .start(),
+            ByteOffset::new(old_cell.start().get() + 3)
+        );
+        assert_eq!(
+            mapped.table().expect("mapped table").revision(),
+            applied.result_snapshot().revision()
+        );
     }
 
     fn usize_to_u64(value: usize) -> u64 {

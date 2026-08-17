@@ -18,7 +18,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] macOS storage FFI 暴露 generation-bound composition projection、visual selection 与 marked caret
 - [x] composition projection metadata 暴露 visual replacement range，供 visual IME overlay 绑定
 - [x] Swift composition projection self-check 覆盖 Unicode preedit、update stale generation、cancel/source 保持
-- [x] 建立 source-backed GFM table projection kind 与 UTF-16 cell-range count/fill ABI；visual delimiter/grid 语义仍待 table layout
+- [x] 建立 source-backed GFM table projection kind 与 UTF-16 cell-range count/fill ABI
+- [x] `TableLayoutSnapshot` 隐藏 delimiter physical row，按 metrics 生成 source-backed cell geometry，并提供 Rust/FFI hit-test count/fill 诊断契约
 - [x] heading/blockquote/list 与 task/fence 复用 parser-owned structural prefix，统一 block projection kind tag；列表 bullet/task 文本仍保持 source-visible
 - [x] visual selection range、metrics hit-testing 和 point↔source mapping 的 Revision-bound 诊断契约
 - [x] stale Revision/generation 在 native projection callbacks 上的全路径回归（含视觉 scene/glyph/render-plan count/fill header）

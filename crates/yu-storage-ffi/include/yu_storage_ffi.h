@@ -107,6 +107,13 @@ enum {
 };
 
 enum {
+    YU_STORAGE_TABLE_ALIGNMENT_DEFAULT = 0,
+    YU_STORAGE_TABLE_ALIGNMENT_LEFT = 1,
+    YU_STORAGE_TABLE_ALIGNMENT_CENTER = 2,
+    YU_STORAGE_TABLE_ALIGNMENT_RIGHT = 3,
+};
+
+enum {
     YU_STORAGE_DISK_UNCHANGED = 0,
     YU_STORAGE_DISK_CHANGED = 1,
     YU_STORAGE_DISK_MISSING = 2,
@@ -342,6 +349,37 @@ typedef struct YuStorageTableCellRange {
     uint64_t source_start_utf16;
     uint64_t source_end_utf16;
 } YuStorageTableCellRange;
+
+/* Revision-bound visible table cell geometry. row 0 is the header and body
+ * rows start at row 1; the Markdown delimiter row is source-backed but not
+ * present in this visible geometry list. */
+typedef struct YuStorageTableLayoutCell {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t row;
+    uint64_t column;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    float x;
+    float y;
+    float width;
+    float height;
+    uint8_t alignment;
+} YuStorageTableLayoutCell;
+
+/* Revision-bound hit-test result for one visible table cell. */
+typedef struct YuStorageTableCellHit {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t row;
+    uint64_t column;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    float x;
+    float y;
+    float width;
+    float height;
+} YuStorageTableCellHit;
 
 /* Revision-bound layout metadata for one parser-owned block. width/height
  * are block-local layout points; shaped is non-zero for CoreText output. */
@@ -810,6 +848,16 @@ int32_t yu_storage_session_projected_table_cells(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, YuStorageTableCellRange *output,
     size_t capacity, size_t *written);
+int32_t yu_storage_session_table_layout_cells(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, float max_width, float line_height,
+    float default_advance, YuStorageTableLayoutCell *output,
+    size_t capacity, size_t *written);
+int32_t yu_storage_session_table_cell_hit_test(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, float max_width, float line_height,
+    float default_advance, float point_x, float point_y,
+    YuStorageTableCellHit *output);
 int32_t yu_storage_session_block_layout(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, float max_width, float line_height,
