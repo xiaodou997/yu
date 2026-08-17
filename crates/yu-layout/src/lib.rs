@@ -25,7 +25,9 @@ mod table;
 pub use shaping::{
     FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
 };
-pub use table::{TableCellLayout, TableLayoutHit, TableLayoutSnapshot};
+pub use table::{
+    TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeHit, TableResizeTarget,
+};
 
 /// Layout dimensions and wrapping policy independent of any font backend.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2506,6 +2508,47 @@ mod tests {
             ByteOffset::new(source.find('B').expect("cell B") as u64)
         );
         assert_eq!(interior_hit.line(), 0);
+    }
+
+    #[test]
+    fn table_resize_hit_test_returns_revision_bound_internal_dividers() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table block");
+        let projection = BlockProjection::from_block(&snapshot, block).expect("table projection");
+        let layout = LayoutSnapshot::from_block_projection_with_metrics(
+            &projection,
+            LayoutConfig::new(20.0, 2.0),
+            &MonospaceMetrics::new(1.0),
+        )
+        .expect("table layout");
+        let column = layout
+            .table()
+            .expect("table metadata")
+            .resize_hit_test(LayoutPoint::new(3.1, 0.5), 0.2)
+            .expect("column resize hit")
+            .expect("column divider");
+        assert_eq!(column.target(), TableResizeTarget::Column { index: 0 });
+        assert_eq!(column.position(), 3.0);
+
+        let row = layout
+            .table()
+            .expect("table metadata")
+            .resize_hit_test(LayoutPoint::new(1.0, 2.1), 0.2)
+            .expect("row resize hit")
+            .expect("row divider");
+        assert_eq!(row.target(), TableResizeTarget::Row { index: 0 });
+        assert_eq!(row.position(), 2.0);
+        assert_eq!(
+            layout
+                .table()
+                .expect("table metadata")
+                .resize_hit_test(LayoutPoint::new(3.1, 0.0), 0.0)
+                .expect("outside tolerance"),
+            None
+        );
     }
 
     #[test]

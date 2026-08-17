@@ -21,6 +21,8 @@ pub enum EditorCommand {
     MoveDown,
     MoveUpExtend,
     MoveDownExtend,
+    MoveTableCellNext,
+    MoveTableCellPrevious,
     InsertNewline,
     IndentList,
     OutdentList,
@@ -141,6 +143,16 @@ impl EditorCommand {
     #[must_use]
     pub const fn move_down_extend() -> Self {
         Self::MoveDownExtend
+    }
+
+    #[must_use]
+    pub const fn move_table_cell_next() -> Self {
+        Self::MoveTableCellNext
+    }
+
+    #[must_use]
+    pub const fn move_table_cell_previous() -> Self {
+        Self::MoveTableCellPrevious
     }
 }
 

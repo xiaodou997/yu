@@ -22,6 +22,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] table visual projection 只保留 source-backed cell runs，隐藏 pipe、cell 空白、row line ending 与 delimiter physical row，并覆盖 source↔visual mapping
 - [x] `TableLayoutSnapshot` 隐藏 delimiter physical row，按 metrics 生成 source-backed cell geometry，并提供 Rust/FFI hit-test count/fill 诊断契约
 - [x] shaped table layout 按 projection visible runs 测量 cell 宽度，并把 source-backed cluster/glyph 定位到 column/row/alignment；cell-aware caret/hit-test 在 hidden boundary 返回可见 cell source boundary，内部位置保持 projection bias
+- [x] 表格 visible cell address 固定为 header=0、body 从 1 开始并跳过 delimiter；Editor Tab/Shift-Tab 按 source cell row-major 顺序移动 caret，不改变 Revision/Undo，首尾无目标时返回 Unhandled
+- [x] macOS storage FFI 暴露 Revision-bound table column/row divider resize hit-test（kind/index/局部 position）；outer edge、非法 tolerance、非 table block 和 stale Revision 拒绝，实际 drag transaction 后置
 - [x] heading/blockquote/list 与 task/fence 复用 parser-owned structural prefix，统一 block projection kind tag；列表 bullet/task 文本仍保持 source-visible
 - [x] visual selection range、metrics hit-testing 和 point↔source mapping 的 Revision-bound 诊断契约
 - [x] stale Revision/generation 在 native projection callbacks 上的全路径回归（含视觉 scene/glyph/render-plan count/fill header）

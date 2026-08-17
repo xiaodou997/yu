@@ -321,6 +321,11 @@ header fill、selection fill 和 border geometry，`yu-render` 暂时把这些�
 solid-fill command；`yu-workspace` 已将 table decoration 以 glyph 前的 painter order 接入
 viewport scene，selection 仍按 source range 命中 cell。当前 macOS 产品窗口仍保留 native
 source/IME/Accessibility fallback，完整 visual renderer 切换不在本阶段。
+表格 caret 的 visible address 使用 header=0、body 从 1 开始的 row-major 坐标，delimiter row
+不进入该坐标空间；Tab/Shift-Tab 只移动到相邻 source cell 起点，不产生 source Revision。列/行
+拖拽目前先由 `yu_storage_session_table_resize_hit_test` 提供 Revision-bound 内部分隔线命中
+（kind/index/局部 x 或 y），不在查询层修改 Markdown；末尾 Tab 自动新增行和真正的 resize
+transaction 仍是后续编辑阶段的工作。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和

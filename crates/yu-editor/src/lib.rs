@@ -39,8 +39,8 @@ pub use viewport::{
 pub use yu_layout::{
     ClusterMetrics, HeightIndex, HeightIndexError, ImageIntrinsicSize, LayoutCaret, LayoutConfig,
     LayoutError, LayoutHit, LayoutPoint, LayoutSnapshot, MonospaceMetrics, ShapedText,
-    ShapingProvider, TableCellLayout, TableLayoutHit, TableLayoutSnapshot, VisualCluster,
-    VisualLine,
+    ShapingProvider, TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeHit,
+    TableResizeTarget, VisualCluster, VisualLine,
 };
 pub use yu_markdown::{Block, BlockKind, MarkdownDocument, TableAlignment};
 pub use yu_projection::{

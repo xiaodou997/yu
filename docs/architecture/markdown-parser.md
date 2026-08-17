@@ -175,6 +175,18 @@ FFI 通过 `yu_storage_session_projected_table_cells` 暴露 parser cell ranges�
 `yu_storage_session_table_layout_cells` / `yu_storage_session_table_cell_hit_test` 暴露
 Revision-bound UTF-16 geometry 与 source-backed hit-test，Swift 不需要自行扫描 `|` 或复制文本。
 
+表格编辑使用同一份 source-backed cell 坐标：`TableCellAddress::row = 0` 是 header，body 从
+`row = 1` 开始，parser-owned delimiter physical row 不占用 visible address。编辑器的 Tab 与
+Shift-Tab 只在当前 caret 位于 visible cell 时按 row-major 顺序跳到相邻 cell 的 source 起点；
+它们不创建 Transaction、不改变 source Revision，也不把 delimiter pipe 当成可编辑 cell。当前
+处于表格首/尾且没有目标 cell 时命令返回 `Unhandled`；自动追加 body row 留到后续阶段。
+
+列宽/行高交互先采用纯几何查询：`yu_storage_session_table_resize_hit_test` 接受同一 Revision、
+block index、layout 参数、table-local point 和 tolerance，返回内部 column/row divider 的
+kind、index 与 x/y position。outer edge、表格外点、非法 tolerance 和 stale Revision 都被拒绝；
+该查询不改变 source、selection、history 或 layout cache。真正的 drag transaction 和把新宽高
+持久化为 Markdown 对齐/空白策略，必须在后续编辑命令阶段定义。
+
 definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
 offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地
 清空 projection/layout/viewport cache，因为一个 definition 的变化可能影响远处的 shortcut

@@ -25,7 +25,7 @@ use yu_editor::{
     CaretScrollRequest, CommandResult, EditorCommand, EditorDocumentError, EditorKey, ImageSource,
     KeyEvent, KeyModifiers, KeyRouteResult, LayoutConfig, LayoutPoint, LayoutSnapshot, Projection,
     ProjectionBias, SelectionError, SourceSync, TableAlignment, TableCellLayout, TableLayoutHit,
-    ViewportConfig, ViewportRect, VisualOffset, VisualRunKind,
+    TableResizeHit, TableResizeTarget, ViewportConfig, ViewportRect, VisualOffset, VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_markdown::TableCellRange;
@@ -90,6 +90,10 @@ pub const YU_STORAGE_TABLE_ALIGNMENT_DEFAULT: u8 = 0;
 pub const YU_STORAGE_TABLE_ALIGNMENT_LEFT: u8 = 1;
 pub const YU_STORAGE_TABLE_ALIGNMENT_CENTER: u8 = 2;
 pub const YU_STORAGE_TABLE_ALIGNMENT_RIGHT: u8 = 3;
+
+pub const YU_STORAGE_TABLE_RESIZE_NONE: u8 = 0;
+pub const YU_STORAGE_TABLE_RESIZE_COLUMN: u8 = 1;
+pub const YU_STORAGE_TABLE_RESIZE_ROW: u8 = 2;
 
 pub const YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND: u8 = 0;
 pub const YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS: u8 = 1;
@@ -456,6 +460,20 @@ pub struct YuStorageTableCellHit {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+/// Revision-bound hit-test result for an internal visible table divider. The
+/// `kind` field uses `YU_STORAGE_TABLE_RESIZE_COLUMN` or
+/// `YU_STORAGE_TABLE_RESIZE_ROW`; `index` identifies the visible column/row
+/// immediately before the divider and `position` is its local x/y coordinate.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageTableResizeHit {
+    pub revision: u64,
+    pub block_index: u64,
+    pub kind: u8,
+    pub index: u64,
+    pub position: f32,
 }
 
 /// Revision-bound layout metadata for one parser-owned block. `width` and
@@ -1980,6 +1998,30 @@ fn table_layout_hit_metadata(
         y: hit.bounds().y(),
         width: hit.bounds().width(),
         height: hit.bounds().height(),
+    })
+}
+
+fn table_resize_hit_metadata(
+    revision: u64,
+    block_index: u64,
+    hit: TableResizeHit,
+) -> Result<YuStorageTableResizeHit, i32> {
+    let (kind, index) = match hit.target() {
+        TableResizeTarget::Column { index } => (
+            YU_STORAGE_TABLE_RESIZE_COLUMN,
+            u64::try_from(index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        ),
+        TableResizeTarget::Row { index } => (
+            YU_STORAGE_TABLE_RESIZE_ROW,
+            u64::try_from(index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        ),
+    };
+    Ok(YuStorageTableResizeHit {
+        revision,
+        block_index,
+        kind,
+        index,
+        position: hit.position(),
     })
 }
 
@@ -4468,6 +4510,67 @@ pub unsafe extern "C" fn yu_storage_session_table_cell_hit_test(
         Ok(metadata) => metadata,
         Err(status) => return status,
     };
+    // SAFETY: `output` was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
+/// Resolves a local table point to an internal column or row divider. Outer
+/// table edges are not resize targets. The result is Revision-bound and does
+/// not mutate source, selection or layout state.
+///
+/// # Safety
+/// `session` and `output` must be live/writable pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_resize_hit_test(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block_index: u64,
+    max_width: f32,
+    line_height: f32,
+    default_advance: f32,
+    point_x: f32,
+    point_y: f32,
+    tolerance: f32,
+    output: *mut YuStorageTableResizeHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `output` was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTableResizeHit::default() };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let block_index = match usize::try_from(block_index) {
+        Ok(index) if index < session.session.block_count() => index,
+        _ => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
+    let layout = match session.session.block_layout(block_index, config) {
+        Ok(layout) => layout,
+        Err(error) => return storage_status(error),
+    };
+    let Some(table) = layout.table() else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let hit = match table.resize_hit_test(LayoutPoint::new(point_x, point_y), tolerance) {
+        Ok(Some(hit)) => hit,
+        Ok(None) => return YU_STORAGE_INVALID_SELECTION,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let block_index = match u64::try_from(block_index) {
+        Ok(block_index) => block_index,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let metadata =
+        match table_resize_hit_metadata(session.session.revision().get(), block_index, hit) {
+            Ok(metadata) => metadata,
+            Err(status) => return status,
+        };
     // SAFETY: `output` was checked for null and belongs to the caller.
     unsafe { *output = metadata };
     YU_STORAGE_OK
@@ -8085,6 +8188,68 @@ mod tests {
             YU_STORAGE_INVALID_SELECTION
         );
 
+        let mut resize_hit = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_hit_test(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    3.1,
+                    0.5,
+                    0.2,
+                    &mut resize_hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(resize_hit.revision, 0);
+        assert_eq!(resize_hit.block_index, table_index as u64);
+        assert_eq!(resize_hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        assert_eq!(resize_hit.index, 0);
+        assert_eq!(resize_hit.position, 3.0);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_hit_test(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    1.0,
+                    2.1,
+                    0.2,
+                    &mut resize_hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(resize_hit.kind, YU_STORAGE_TABLE_RESIZE_ROW);
+        assert_eq!(resize_hit.index, 0);
+        assert_eq!(resize_hit.position, 2.0);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_hit_test(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    3.1,
+                    0.0,
+                    0.0,
+                    &mut resize_hit,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(resize_hit, YuStorageTableResizeHit::default());
+
         let mut metadata = YuStorageProjectionBlock::default();
         let mut written = 0;
         assert_eq!(
@@ -8165,6 +8330,23 @@ mod tests {
                     3.5,
                     2.5,
                     &mut hit,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_hit_test(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    3.1,
+                    0.5,
+                    0.2,
+                    &mut resize_hit,
                 )
             },
             YU_STORAGE_STALE_REVISION

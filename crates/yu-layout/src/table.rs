@@ -112,6 +112,36 @@ impl TableLayoutHit {
     }
 }
 
+/// The resize divider selected by a table pointer interaction. Indices refer
+/// to the column or row immediately before the divider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TableResizeTarget {
+    Column { index: usize },
+    Row { index: usize },
+}
+
+/// A Revision-bound table resize hit. The native layer can use the target and
+/// axis position to start a drag without reconstructing table geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TableResizeHit {
+    target: TableResizeTarget,
+    position: f32,
+}
+
+impl TableResizeHit {
+    #[must_use]
+    pub const fn target(self) -> TableResizeTarget {
+        self.target
+    }
+
+    /// Returns the x coordinate for a column divider or y coordinate for a
+    /// row divider, both in the table-local layout space.
+    #[must_use]
+    pub const fn position(self) -> f32 {
+        self.position
+    }
+}
+
 /// A revision-bound table layout independent of scene/GPU painting.
 ///
 /// The delimiter row is a parser-owned source range but has no visible cell.
@@ -373,6 +403,64 @@ impl TableLayoutSnapshot {
             bounds: cell.bounds,
             point,
         }))
+    }
+
+    /// Finds an internal column or row divider within `tolerance` logical
+    /// pixels. Outer table edges are deliberately excluded because resizing
+    /// the table itself is a separate container/layout concern.
+    pub fn resize_hit_test(
+        &self,
+        point: LayoutPoint,
+        tolerance: f32,
+    ) -> Result<Option<TableResizeHit>, LayoutError> {
+        point.validate()?;
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(LayoutError::InvalidTable(
+                "resize tolerance must be finite and non-negative",
+            ));
+        }
+        if point.x() < self.bounds.x() - tolerance
+            || point.x() > self.bounds.x() + self.bounds.width() + tolerance
+            || point.y() < self.bounds.y() - tolerance
+            || point.y() > self.bounds.y() + self.bounds.height() + tolerance
+        {
+            return Ok(None);
+        }
+
+        let mut x = self.bounds.x();
+        for (index, width) in self
+            .column_widths
+            .iter()
+            .copied()
+            .take(self.column_widths.len().saturating_sub(1))
+            .enumerate()
+        {
+            x += width;
+            if (point.x() - x).abs() <= tolerance
+                && point.y() >= self.bounds.y()
+                && point.y() <= self.bounds.y() + self.bounds.height()
+            {
+                return Ok(Some(TableResizeHit {
+                    target: TableResizeTarget::Column { index },
+                    position: x,
+                }));
+            }
+        }
+
+        let row_count = self.row_sources.len();
+        for row in 0..row_count.saturating_sub(1) {
+            let y = self.bounds.y() + self.row_height * (row.saturating_add(1) as f32);
+            if (point.y() - y).abs() <= tolerance
+                && point.x() >= self.bounds.x()
+                && point.x() <= self.bounds.x() + self.bounds.width()
+            {
+                return Ok(Some(TableResizeHit {
+                    target: TableResizeTarget::Row { index: row },
+                    position: y,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     pub fn map_through(
