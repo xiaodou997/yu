@@ -155,6 +155,13 @@ Task-list block 的 projection 继续消费同一 block range 和 inline CST，�
 绘制/鼠标 overlay 尚未进入本阶段，`EditorCommand::toggle_task` 目前通过一个普通 Transaction
 只替换 marker 的状态字节，因此 Undo、Revision 和 projection cache 失效遵循统一编辑路径。
 
+heading 与 blockquote 的结构前缀不再由 projection consumer 自行识别：Markdown parser 通过
+`block_syntax_hidden_ranges` 返回 ATX marker、分隔空白和每个 blockquote 行的 `>` 前缀范围，
+projection 使用这些 ranges 建立 `Heading`/`BlockQuote` kind。普通 `ListItem` 返回 `List`
+kind，但保留 bullet 与任务文本，避免在没有 list marker scene primitive 时丢失可编辑 source。
+`BlockProjectionKind` 的稳定 FFI tag 因此能区分 inline、heading、blockquote、list、task 和
+fenced code；GFM table 仍由 `parse_table` 独立识别，尚未改变 block kind。
+
 definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
 offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地
 清空 projection/layout/viewport cache，因为一个 definition 的变化可能影响远处的 shortcut

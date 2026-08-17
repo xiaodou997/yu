@@ -847,6 +847,227 @@ pub fn task_marker(source: &TextSnapshot, block: Block) -> Option<TaskMarker> {
     task::parse_task_marker(source, block.range(), ordered)
 }
 
+/// Returns parser-owned block syntax ranges that the visual projection may
+/// hide without re-parsing Markdown in a consumer.
+///
+/// The ranges deliberately cover only structural prefixes. List bullets and
+/// task text remain source-visible; a later layout/scene layer can render the
+/// list marker from the stable `BlockKind` metadata. ATX heading and blockquote
+/// prefixes are hidden here because their visual counterparts are block-level
+/// style/indentation rather than editable text.
+#[must_use]
+pub fn block_syntax_hidden_ranges(source: &TextSnapshot, block: Block) -> Vec<TextRange> {
+    let lines = block_line_ranges(source, block.range());
+    match block.kind() {
+        BlockKind::AtxHeading { level } => lines
+            .first()
+            .and_then(|line| heading_prefix_range(source, *line, level))
+            .into_iter()
+            .collect(),
+        BlockKind::BlockQuote { .. } => lines
+            .iter()
+            .filter_map(|line| blockquote_prefix_range(source, *line))
+            .collect(),
+        BlockKind::BlankLine
+        | BlockKind::ReferenceDefinition
+        | BlockKind::Paragraph
+        | BlockKind::FencedCodeBlock { .. }
+        | BlockKind::ListItem { .. }
+        | BlockKind::TaskListItem { .. } => Vec::new(),
+    }
+}
+
+fn block_line_ranges(source: &TextSnapshot, range: TextRange) -> Vec<TextRange> {
+    let Ok(start) = usize::try_from(range.start()) else {
+        return Vec::new();
+    };
+    let Ok(end) = usize::try_from(range.end()) else {
+        return Vec::new();
+    };
+    let Ok(mut chunks) = source.chunk_cursor(range.start()) else {
+        return Vec::new();
+    };
+    let mut line_start = start;
+    let mut lines = Vec::new();
+    for chunk in &mut chunks {
+        let Ok(chunk_start) = usize::try_from(chunk.start()) else {
+            return Vec::new();
+        };
+        let chunk_end = chunk_start.saturating_add(chunk.text().len());
+        let local_start = start.max(chunk_start).saturating_sub(chunk_start);
+        let local_end = end.min(chunk_end).saturating_sub(chunk_start);
+        for (index, byte) in chunk.text().as_bytes()[local_start..local_end]
+            .iter()
+            .enumerate()
+        {
+            if *byte != b'\n' {
+                continue;
+            }
+            let absolute = chunk_start
+                .saturating_add(local_start)
+                .saturating_add(index + 1);
+            let Ok(line_end) = ByteOffset::try_from(absolute) else {
+                return Vec::new();
+            };
+            let Ok(line_start_offset) = ByteOffset::try_from(line_start) else {
+                return Vec::new();
+            };
+            let Some(line) = TextRange::new(line_start_offset, line_end) else {
+                return Vec::new();
+            };
+            lines.push(line);
+            line_start = absolute;
+        }
+    }
+    if line_start < end {
+        let Ok(line_start_offset) = ByteOffset::try_from(line_start) else {
+            return Vec::new();
+        };
+        let Ok(line_end) = ByteOffset::try_from(end) else {
+            return Vec::new();
+        };
+        if let Some(line) = TextRange::new(line_start_offset, line_end) {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn heading_prefix_range(source: &TextSnapshot, line: TextRange, level: u8) -> Option<TextRange> {
+    let start = usize::try_from(line.start()).ok()?;
+    let line_end = usize::try_from(line.end()).ok()?;
+    let mut cursor = SourceByteCursor::new(source, line)?;
+    let mut next = cursor.next();
+    let mut leading_spaces = 0_usize;
+    while let Some((_, b' ')) = next {
+        leading_spaces = leading_spaces.saturating_add(1);
+        if leading_spaces > 3 {
+            return None;
+        }
+        next = cursor.next();
+    }
+    let mut hashes = 0_u8;
+    while hashes < level {
+        let (_, byte) = next?;
+        if byte != b'#' {
+            return None;
+        }
+        hashes = hashes.saturating_add(1);
+        next = cursor.next();
+    }
+    let prefix_end = match next {
+        None => line_end,
+        Some((position, b'\n' | b'\r')) => position,
+        Some((position, b' ' | b'\t')) => {
+            let mut end = position.saturating_add(1);
+            for (next_position, byte) in cursor {
+                if matches!(byte, b' ' | b'\t') {
+                    end = next_position.saturating_add(1);
+                } else {
+                    end = next_position;
+                    break;
+                }
+            }
+            end
+        }
+        Some(_) => return None,
+    };
+    let start = ByteOffset::try_from(start).ok()?;
+    let end = ByteOffset::try_from(prefix_end.min(line_end)).ok()?;
+    (end > start).then(|| TextRange::new(start, end)).flatten()
+}
+
+fn blockquote_prefix_range(source: &TextSnapshot, line: TextRange) -> Option<TextRange> {
+    let start = usize::try_from(line.start()).ok()?;
+    let line_end = usize::try_from(line.end()).ok()?;
+    let mut cursor = SourceByteCursor::new(source, line)?;
+    let mut next = cursor.next();
+    let mut leading_spaces = 0_usize;
+    while let Some((_, b' ')) = next {
+        leading_spaces = leading_spaces.saturating_add(1);
+        if leading_spaces > 3 {
+            return None;
+        }
+        next = cursor.next();
+    }
+    let Some((_, b'>')) = next else {
+        return None;
+    };
+    next = cursor.next();
+    let prefix_end = match next {
+        None => line_end,
+        Some((position, b'\n' | b'\r')) => position,
+        Some((position, b' ' | b'\t')) => {
+            let mut end = position.saturating_add(1);
+            for (next_position, byte) in cursor {
+                if matches!(byte, b' ' | b'\t') {
+                    end = next_position.saturating_add(1);
+                } else {
+                    end = next_position;
+                    break;
+                }
+            }
+            end
+        }
+        Some(_) => return None,
+    };
+    let start = ByteOffset::try_from(start).ok()?;
+    let end = ByteOffset::try_from(prefix_end.min(line_end)).ok()?;
+    (end > start).then(|| TextRange::new(start, end)).flatten()
+}
+
+struct SourceByteCursor<'a> {
+    chunks: ChunkCursor<'a>,
+    requested_start: usize,
+    end: usize,
+    current: Option<&'a str>,
+    current_start: usize,
+    current_index: usize,
+}
+
+impl<'a> SourceByteCursor<'a> {
+    fn new(source: &'a TextSnapshot, range: TextRange) -> Option<Self> {
+        Some(Self {
+            chunks: source.chunk_cursor(range.start()).ok()?,
+            requested_start: usize::try_from(range.start()).ok()?,
+            end: usize::try_from(range.end()).ok()?,
+            current: None,
+            current_start: 0,
+            current_index: 0,
+        })
+    }
+}
+
+impl Iterator for SourceByteCursor<'_> {
+    type Item = (usize, u8);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(current) = self.current {
+                if self.current_index < self.current_start + current.len()
+                    && self.current_index < self.end
+                {
+                    let local = self.current_index - self.current_start;
+                    let position = self.current_index;
+                    let byte = current.as_bytes()[local];
+                    self.current_index += 1;
+                    return Some((position, byte));
+                }
+                self.current = None;
+            }
+
+            let chunk = self.chunks.next()?;
+            self.current_start = usize::try_from(chunk.start()).ok()?;
+            self.current_index = self.current_start.max(self.requested_start);
+            self.current = Some(chunk.text());
+            if self.current_index < self.end {
+                continue;
+            }
+            return None;
+        }
+    }
+}
+
 fn block(kind: BlockKind, start: usize, end: usize) -> Block {
     let start = ByteOffset::try_from(start).unwrap_or(ByteOffset::new(u64::MAX));
     let end = ByteOffset::try_from(end).unwrap_or(ByteOffset::new(u64::MAX));
@@ -1267,6 +1488,35 @@ mod tests {
             })
             .collect();
         assert_eq!(reconstructed, source);
+    }
+
+    #[test]
+    fn block_syntax_hidden_ranges_are_parser_owned_and_line_local() {
+        let source = "  ## 标题\n\n> 引用\n  延续\n\n- [ ] 任务\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let document = parse(&snapshot);
+
+        let heading = document.blocks().get(0).expect("heading block");
+        let heading_ranges = block_syntax_hidden_ranges(&snapshot, heading);
+        assert_eq!(heading_ranges.len(), 1);
+        assert_eq!(
+            &snapshot.as_str()
+                [heading_ranges[0].start().get() as usize..heading_ranges[0].end().get() as usize],
+            "  ## "
+        );
+
+        let quote = document.blocks().get(2).expect("quote block");
+        let quote_ranges = block_syntax_hidden_ranges(&snapshot, quote);
+        assert_eq!(quote_ranges.len(), 1);
+        assert_eq!(
+            &snapshot.as_str()
+                [quote_ranges[0].start().get() as usize..quote_ranges[0].end().get() as usize],
+            "> "
+        );
+
+        let task = document.blocks().get(4).expect("task block");
+        assert!(block_syntax_hidden_ranges(&snapshot, task).is_empty());
     }
 
     #[test]

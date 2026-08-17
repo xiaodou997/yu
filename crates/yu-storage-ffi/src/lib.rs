@@ -135,6 +135,9 @@ pub const YU_STORAGE_PROJECTION_INLINE: u8 = 0;
 pub const YU_STORAGE_PROJECTION_FENCED_CODE: u8 = 1;
 pub const YU_STORAGE_PROJECTION_REFERENCE_DEFINITION: u8 = 2;
 pub const YU_STORAGE_PROJECTION_TASK_LIST: u8 = 3;
+pub const YU_STORAGE_PROJECTION_HEADING: u8 = 4;
+pub const YU_STORAGE_PROJECTION_BLOCK_QUOTE: u8 = 5;
+pub const YU_STORAGE_PROJECTION_LIST: u8 = 6;
 
 pub const YU_STORAGE_DISK_UNCHANGED: u8 = 0;
 pub const YU_STORAGE_DISK_CHANGED: u8 = 1;
@@ -1794,6 +1797,9 @@ fn affinity_to_ffi(affinity: CaretAffinity) -> u8 {
 fn projection_kind_tag(projection: &BlockProjection) -> u8 {
     match projection.kind() {
         BlockProjectionKind::Inline => YU_STORAGE_PROJECTION_INLINE,
+        BlockProjectionKind::Heading => YU_STORAGE_PROJECTION_HEADING,
+        BlockProjectionKind::BlockQuote => YU_STORAGE_PROJECTION_BLOCK_QUOTE,
+        BlockProjectionKind::List => YU_STORAGE_PROJECTION_LIST,
         BlockProjectionKind::FencedCode => YU_STORAGE_PROJECTION_FENCED_CODE,
         BlockProjectionKind::ReferenceDefinition => YU_STORAGE_PROJECTION_REFERENCE_DEFINITION,
         BlockProjectionKind::TaskList => YU_STORAGE_PROJECTION_TASK_LIST,
@@ -7463,7 +7469,7 @@ mod tests {
     fn ffi_block_projection_is_revision_bound_and_parser_owned() {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-block-projection-{id}.md"));
-        let source = "# 标题\n\n段落 **粗体** 和 [链接](https://example.com)。\n\n- [ ] 任务\n\n```rust\nfn main() {}\n```\n";
+        let source = "# 标题\n\n段落 **粗体** 和 [链接](https://example.com)。\n\n- [ ] 任务\n\n> 引用\n\n1. 有序\n\n```rust\nfn main() {}\n```\n";
         fs::write(&path, source).expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
         let mut raw = ptr::null_mut();
@@ -7480,6 +7486,7 @@ mod tests {
         assert!(count >= 7);
         let mut previous_end = 0_u64;
         let mut seen_kinds = Vec::new();
+        let mut seen_projection_kinds = Vec::new();
         let mut projected_blocks = Vec::new();
         for index in 0..count {
             let mut metadata = YuStorageProjectionBlock::default();
@@ -7527,11 +7534,19 @@ mod tests {
                 String::from_utf8_lossy(&projected).encode_utf16().count()
             );
             seen_kinds.push(metadata.kind);
+            seen_projection_kinds.push(metadata.projection_kind);
             projected_blocks.push(String::from_utf8(projected).expect("projected UTF-8"));
         }
         assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_HEADING));
+        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_BLOCK_QUOTE));
+        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_LIST_ITEM));
         assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM));
         assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE));
+        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_HEADING));
+        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_QUOTE));
+        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_LIST));
+        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_TASK_LIST));
+        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_FENCED_CODE));
         assert!(projected_blocks.iter().any(|text| text.contains("粗体")));
         assert!(projected_blocks.iter().any(|text| text.contains("链接")));
         assert!(projected_blocks.iter().any(|text| text.contains("任务")));

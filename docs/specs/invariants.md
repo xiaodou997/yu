@@ -305,9 +305,13 @@
 7. task-list block 必须返回 `BlockProjection::TaskList`；projection 只能隐藏 parser-owned
    `TaskMarker` source range，不能删除 bullet 或任务文本。`EditorCommand::toggle_task` 必须只用
    普通 Transaction 替换 marker 状态字节，非 task block 必须拒绝且不改变文档。
-8. 列表编辑命令只能对当前 parser 识别的 `ListItem`/`TaskListItem` 行生效；空项退出必须保留
+8. `AtxHeading`、`BlockQuote` 和普通 `ListItem` 必须返回稳定的 `Heading`、`BlockQuote`、`List`
+   projection kind；heading/blockquote hidden prefix 只能来自
+   `yu_markdown::block_syntax_hidden_ranges`，Swift/native consumer 不得自行扫描 delimiter。
+   list bullet 与任务文本在 list marker scene primitive 尚未接入前必须保持 source-visible。
+9. 列表编辑命令只能对当前 parser 识别的 `ListItem`/`TaskListItem` 行生效；空项退出必须保留
    原有 line ending，Indent/Outdent 最多改动两个 ASCII 空格，selection 必须通过 ChangeSet 映射。
-9. `Projection::images()` 返回的 `ImageSource` 只能保存 parser-owned source/label/destination/
+10. `Projection::images()` 返回的 `ImageSource` 只能保存 parser-owned source/label/destination/
    reference ranges；这些 ranges 必须随 strictly-outside edit 映射，intersecting edit 必须重新
    解析，图片 URL/alt 文本不得成为 editor 的第二份 canonical state。
 
