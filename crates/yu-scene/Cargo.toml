@@ -14,6 +14,7 @@ yu-font = { path = "../yu-font" }
 yu-layout = { path = "../yu-layout" }
 
 [dev-dependencies]
+yu-markdown = { path = "../yu-markdown" }
 yu-projection = { path = "../yu-projection" }
 yu-text = { path = "../yu-text" }
 

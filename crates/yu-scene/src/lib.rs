@@ -292,12 +292,119 @@ impl ImagePrimitive {
     }
 }
 
+/// Semantic role for a source-backed table decoration. The renderer may map
+/// all roles to solid fills today, while native selection/accessibility layers
+/// can still distinguish header, selection and grid geometry without parsing
+/// Markdown again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TablePrimitiveRole {
+    HeaderFill,
+    SelectionFill,
+    Border,
+}
+
+/// One source-backed table decoration. `source` identifies the cell for a
+/// header/selection fill and the complete table range for a border.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TablePrimitive {
+    source: yu_core::TextRange,
+    bounds: Rect,
+    color: Rgba8,
+    role: TablePrimitiveRole,
+}
+
+impl TablePrimitive {
+    #[must_use]
+    pub const fn new(
+        source: yu_core::TextRange,
+        bounds: Rect,
+        color: Rgba8,
+        role: TablePrimitiveRole,
+    ) -> Self {
+        Self {
+            source,
+            bounds,
+            color,
+            role,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(self) -> yu_core::TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> Rect {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn color(self) -> Rgba8 {
+        self.color
+    }
+
+    #[must_use]
+    pub const fn role(self) -> TablePrimitiveRole {
+        self.role
+    }
+}
+
+/// Colors and border width used when projecting a table layout into scene
+/// decorations. `None` disables the corresponding fill while a zero border
+/// width disables grid lines.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TableSceneStyle {
+    border_width: f32,
+    border_color: Rgba8,
+    header_fill: Option<Rgba8>,
+    selection_fill: Option<Rgba8>,
+}
+
+impl TableSceneStyle {
+    #[must_use]
+    pub const fn new(
+        border_width: f32,
+        border_color: Rgba8,
+        header_fill: Option<Rgba8>,
+        selection_fill: Option<Rgba8>,
+    ) -> Self {
+        Self {
+            border_width,
+            border_color,
+            header_fill,
+            selection_fill,
+        }
+    }
+
+    #[must_use]
+    pub const fn border_width(self) -> f32 {
+        self.border_width
+    }
+
+    #[must_use]
+    pub const fn border_color(self) -> Rgba8 {
+        self.border_color
+    }
+
+    #[must_use]
+    pub const fn header_fill(self) -> Option<Rgba8> {
+        self.header_fill
+    }
+
+    #[must_use]
+    pub const fn selection_fill(self) -> Option<Rgba8> {
+        self.selection_fill
+    }
+}
+
 /// One retained scene primitive. Insertion order is the painter's order.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Primitive {
     FillRect { bounds: Rect, color: Rgba8 },
     Glyph(GlyphPrimitive),
     Image(ImagePrimitive),
+    Table(TablePrimitive),
 }
 
 impl Primitive {
@@ -307,6 +414,7 @@ impl Primitive {
             Self::FillRect { bounds, .. } => bounds,
             Self::Glyph(glyph) => glyph.bounds(),
             Self::Image(image) => image.bounds(),
+            Self::Table(table) => table.bounds(),
         }
     }
 }
@@ -389,6 +497,7 @@ pub enum SceneError {
     InvalidViewportInput(&'static str),
     InvalidDamageBudget,
     PrimitiveLimitExceeded,
+    InvalidTableStyle(u32),
     RevisionMismatch {
         scene: Revision,
         layout: Revision,
@@ -409,6 +518,11 @@ impl fmt::Display for SceneError {
             Self::InvalidViewportInput(message) => formatter.write_str(message),
             Self::InvalidDamageBudget => formatter.write_str("damage budget must be positive"),
             Self::PrimitiveLimitExceeded => formatter.write_str("scene primitive limit exceeded"),
+            Self::InvalidTableStyle(width) => write!(
+                formatter,
+                "invalid table border width {}",
+                f32::from_bits(*width)
+            ),
             Self::RevisionMismatch { scene, layout } => write!(
                 formatter,
                 "scene revision {scene:?} does not match layout revision {layout:?}"
@@ -474,6 +588,34 @@ impl Scene {
     }
 }
 
+fn translate_rect(rect: Rect, origin: Point) -> Result<Rect, SceneError> {
+    Rect::new(
+        rect.x() + origin.x(),
+        rect.y() + origin.y(),
+        rect.width(),
+        rect.height(),
+    )
+}
+
+fn translate_layout_rect(rect: yu_layout::LayoutRect, origin: Point) -> Result<Rect, SceneError> {
+    Rect::new(
+        rect.x() + origin.x(),
+        rect.y() + origin.y(),
+        rect.width(),
+        rect.height(),
+    )
+}
+
+fn ranges_intersect_or_caret(selection: yu_core::TextRange, cell: yu_core::TextRange) -> bool {
+    if selection.is_empty() {
+        if cell.is_empty() {
+            return selection.start() == cell.start();
+        }
+        return cell.contains(selection.start());
+    }
+    selection.start() < cell.end() && cell.start() < selection.end()
+}
+
 /// Builds a scene while keeping primitive and damage order deterministic.
 #[derive(Clone, Debug)]
 pub struct SceneBuilder {
@@ -532,6 +674,139 @@ impl SceneBuilder {
 
     pub fn image(&mut self, image: ImagePrimitive) -> Result<u32, SceneError> {
         self.push(Primitive::Image(image))
+    }
+
+    /// Appends source-backed table header, selection and grid decorations.
+    /// The table layout remains block-local; `origin` moves its geometry into
+    /// document/scene coordinates without copying cell text.
+    pub fn append_table(
+        &mut self,
+        layout: &yu_layout::TableLayoutSnapshot,
+        origin: Point,
+        style: TableSceneStyle,
+    ) -> Result<usize, SceneError> {
+        self.append_table_with_selection(layout, origin, style, None)
+    }
+
+    /// Appends table decorations and highlights every visible cell whose
+    /// source range intersects `selection`. A collapsed selection highlights
+    /// the cell containing its source caret; an unrelated selection produces
+    /// no selection primitive.
+    pub fn append_table_with_selection(
+        &mut self,
+        layout: &yu_layout::TableLayoutSnapshot,
+        origin: Point,
+        style: TableSceneStyle,
+        selection: Option<yu_core::TextRange>,
+    ) -> Result<usize, SceneError> {
+        if self.revision != layout.revision() {
+            return Err(SceneError::RevisionMismatch {
+                scene: self.revision,
+                layout: layout.revision(),
+            });
+        }
+        origin.validate()?;
+        if !style.border_width().is_finite() || style.border_width() < 0.0 {
+            return Err(SceneError::InvalidTableStyle(
+                style.border_width().to_bits(),
+            ));
+        }
+
+        let table_source = layout.source_range();
+        let mut primitives = Vec::new();
+        if let Some(color) = style.header_fill() {
+            for cell in layout
+                .cells()
+                .iter()
+                .copied()
+                .filter(|cell| cell.row() == 0)
+            {
+                primitives.push(Primitive::Table(TablePrimitive::new(
+                    cell.source(),
+                    translate_layout_rect(cell.bounds(), origin)?,
+                    color,
+                    TablePrimitiveRole::HeaderFill,
+                )));
+            }
+        }
+        if let Some(color) = style.selection_fill() {
+            for cell in layout.cells().iter().copied() {
+                if selection.is_some_and(|range| ranges_intersect_or_caret(range, cell.source())) {
+                    primitives.push(Primitive::Table(TablePrimitive::new(
+                        cell.source(),
+                        translate_layout_rect(cell.bounds(), origin)?,
+                        color,
+                        TablePrimitiveRole::SelectionFill,
+                    )));
+                }
+            }
+        }
+
+        let border_width = style.border_width();
+        let bounds = layout.bounds();
+        let thickness_x = border_width.min(bounds.width());
+        let thickness_y = border_width.min(bounds.height());
+        if thickness_x > 0.0 && thickness_y > 0.0 {
+            let border_color = style.border_color();
+            let total_width = bounds.width();
+            let total_height = bounds.height();
+            let mut x = 0.0;
+            for column_width in layout.column_widths() {
+                primitives.push(Primitive::Table(TablePrimitive::new(
+                    table_source,
+                    translate_rect(Rect::new(x, 0.0, thickness_x, total_height)?, origin)?,
+                    border_color,
+                    TablePrimitiveRole::Border,
+                )));
+                x += *column_width;
+            }
+            primitives.push(Primitive::Table(TablePrimitive::new(
+                table_source,
+                translate_rect(
+                    Rect::new(
+                        (total_width - thickness_x).max(0.0),
+                        0.0,
+                        thickness_x,
+                        total_height,
+                    )?,
+                    origin,
+                )?,
+                border_color,
+                TablePrimitiveRole::Border,
+            )));
+
+            let mut y = 0.0;
+            let row_count = layout
+                .cells()
+                .iter()
+                .map(|cell| cell.row())
+                .max()
+                .map_or(0, |row| row.saturating_add(1));
+            for _ in 0..row_count {
+                primitives.push(Primitive::Table(TablePrimitive::new(
+                    table_source,
+                    translate_rect(Rect::new(0.0, y, total_width, thickness_y)?, origin)?,
+                    border_color,
+                    TablePrimitiveRole::Border,
+                )));
+                y += layout.row_height();
+            }
+            primitives.push(Primitive::Table(TablePrimitive::new(
+                table_source,
+                translate_rect(
+                    Rect::new(
+                        0.0,
+                        (total_height - thickness_y).max(0.0),
+                        total_width,
+                        thickness_y,
+                    )?,
+                    origin,
+                )?,
+                border_color,
+                TablePrimitiveRole::Border,
+            )));
+        }
+        self.commit_primitives(primitives)
     }
 
     /// Appends all shaped glyphs from a layout using entries already present
@@ -888,6 +1163,111 @@ mod tests {
         assert!(Rect::new(0.0, 0.0, f32::NAN, 1.0).is_err());
         assert!(Point::new(f32::INFINITY, 0.0).validate().is_err());
         assert_eq!(DamageSet::new(0), Err(SceneError::InvalidDamageBudget));
+    }
+
+    #[test]
+    fn table_scene_primitives_are_source_backed_and_painter_ordered() {
+        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table block");
+        let projection = yu_projection::BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+        )
+        .expect("table projection");
+        let layout = LayoutSnapshot::from_block_projection(
+            &projection,
+            yu_layout::LayoutConfig::new(20.0, 2.0),
+        )
+        .expect("table layout");
+        let table = layout.table().expect("table layout");
+        let selected = table.cells()[3].source();
+        let style = TableSceneStyle::new(
+            1.0,
+            Rgba8::new(150, 155, 165, 255),
+            Some(Rgba8::new(235, 238, 244, 255)),
+            Some(Rgba8::new(210, 225, 255, 255)),
+        );
+        let mut builder = SceneBuilder::new(
+            layout.revision(),
+            Rect::new(0.0, 0.0, 40.0, 20.0).expect("viewport"),
+        )
+        .expect("builder");
+        let count = builder
+            .append_table_with_selection(table, Point::new(10.0, 20.0), style, Some(selected))
+            .expect("table scene");
+        assert_eq!(count, 9);
+        let scene = builder.finish();
+        assert_eq!(scene.primitives().len(), 9);
+        assert!(matches!(
+            scene.primitives()[0],
+            Primitive::Table(TablePrimitive {
+                role: TablePrimitiveRole::HeaderFill,
+                ..
+            })
+        ));
+        assert!(matches!(
+            scene.primitives()[2],
+            Primitive::Table(TablePrimitive {
+                role: TablePrimitiveRole::SelectionFill,
+                ..
+            })
+        ));
+        assert!(scene.primitives()[2].bounds().x() >= 10.0);
+        assert!(scene.primitives()[2].bounds().y() >= 20.0);
+        assert!(scene.primitives()[3..].iter().all(|primitive| matches!(
+            primitive,
+            Primitive::Table(TablePrimitive {
+                role: TablePrimitiveRole::Border,
+                source,
+                ..
+            }) if *source == table.source_range()
+        )));
+        assert_eq!(scene.revision(), layout.revision());
+    }
+
+    #[test]
+    fn table_scene_rejects_stale_layout_and_invalid_border_width() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table block");
+        let projection =
+            yu_projection::BlockProjection::from_block(&snapshot, block).expect("table projection");
+        let layout = LayoutSnapshot::from_block_projection(
+            &projection,
+            yu_layout::LayoutConfig::new(20.0, 2.0),
+        )
+        .expect("table layout");
+        let style = TableSceneStyle::new(1.0, Rgba8::black(), None, None);
+        let mut stale = SceneBuilder::new(
+            Revision::new(1),
+            Rect::new(0.0, 0.0, 40.0, 20.0).expect("viewport"),
+        )
+        .expect("builder");
+        assert!(matches!(
+            stale.append_table(layout.table().expect("table"), Point::new(0.0, 0.0), style),
+            Err(SceneError::RevisionMismatch { .. })
+        ));
+        let mut invalid = SceneBuilder::new(
+            layout.revision(),
+            Rect::new(0.0, 0.0, 40.0, 20.0).expect("viewport"),
+        )
+        .expect("builder");
+        let invalid_style = TableSceneStyle::new(f32::NAN, Rgba8::black(), None, None);
+        assert!(matches!(
+            invalid.append_table(
+                layout.table().expect("table"),
+                Point::new(0.0, 0.0),
+                invalid_style
+            ),
+            Err(SceneError::InvalidTableStyle(_))
+        ));
+        assert!(invalid.finish().primitives().is_empty());
     }
 
     #[test]

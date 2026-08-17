@@ -169,6 +169,7 @@ dependencies = [
  "yu-core",
  "yu-font",
  "yu-layout",
+ "yu-markdown",
  "yu-projection",
  "yu-scene",
  "yu-text",
@@ -195,6 +196,7 @@ dependencies = [
  "yu-core",
  "yu-font",
  "yu-layout",
+ "yu-markdown",
  "yu-projection",
  "yu-text",
 ]
