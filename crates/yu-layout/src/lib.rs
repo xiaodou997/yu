@@ -933,19 +933,32 @@ impl LayoutSnapshot {
                 "table resize commit and layout revisions differ",
             ));
         }
+        match commit.target() {
+            TableResizeTarget::Column { index } => {
+                self.apply_table_column_resize(index, commit.delta())
+            }
+            TableResizeTarget::Row { .. } => Err(LayoutError::InvalidTable(
+                "row resize requires variable-row table layout",
+            )),
+        }
+    }
+
+    /// Applies a transient column resize without requiring a native gesture
+    /// object. The caller must still bind the operation to this snapshot's
+    /// Revision and, when operating through `EditorDocument`, to the block
+    /// index. This is the narrow helper used by synchronous storage/FFI
+    /// geometry queries.
+    pub fn apply_table_column_resize(
+        &mut self,
+        index: usize,
+        delta: f32,
+    ) -> Result<(), LayoutError> {
         let Some(table) = self.table.as_ref() else {
             return Err(LayoutError::InvalidTable(
                 "table resize requires a table layout",
             ));
         };
-        let resized = match commit.target() {
-            TableResizeTarget::Column { index } => table.resized_columns(index, commit.delta())?,
-            TableResizeTarget::Row { .. } => {
-                return Err(LayoutError::InvalidTable(
-                    "row resize requires variable-row table layout",
-                ));
-            }
-        };
+        let resized = table.resized_columns(index, delta)?;
         self.apply_table_geometry(&resized)?;
         self.table = Some(resized);
         Ok(())

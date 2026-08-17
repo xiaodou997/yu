@@ -334,8 +334,10 @@
     路径直接改写 Markdown。非有限 pointer 必须拒绝，stale gesture 必须丢弃。当前
     `LayoutSnapshot::apply_table_resize` 只接受 column commit，必须保持相邻列总宽度、source
     ranges 和 Revision；`EditorDocument::block_layout_with_table_resize` 返回的 override
-    不得进入 canonical layout cache。row commit 在 variable-row layout contract 完成前必须
-    拒绝，不得只改变 cell rectangle 而留下错误的 baseline、height index 或 scene border。
+    不得进入 canonical layout cache。`yu_storage_session_table_layout_cells_with_resize` 必须
+    使用同一 expected Revision/block，返回一次调用内的 owned cell geometry，不能把 override
+    写入 session。row commit 在 variable-row layout contract 完成前必须拒绝，不得只改变 cell
+    rectangle 而留下错误的 baseline、height index 或 scene border。
 9. 列表编辑命令只能对当前 parser 识别的 `ListItem`/`TaskListItem` 行生效；空项退出必须保留
    原有 line ending，Indent/Outdent 最多改动两个 ASCII 空格，selection 必须通过 ChangeSet 映射。
 10. `Projection::images()` 返回的 `ImageSource` 只能保存 parser-owned source/label/destination/

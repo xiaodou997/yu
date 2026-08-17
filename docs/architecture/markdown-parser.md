@@ -194,7 +194,9 @@ proposed divider position；释放返回 `TableResizeCommit` 几何候选。任�
 commit 调用 `LayoutSnapshot::apply_table_resize`：它返回保持总宽度的 transient geometry，
 并按相邻列最小宽度 clamp；`EditorDocument::block_layout_with_table_resize`（含 shaped
 版本）不会把覆盖插入 layout cache。row commit 仍只完成 hit/gesture 协议，直到 variable-row
-layout 同时更新 baseline、hit-test、viewport height index 和 scene border。
+layout 同时更新 baseline、hit-test、viewport height index 和 scene border。storage FFI 的
+`yu_storage_session_table_layout_cells_with_resize` 复用同一规则，按一次调用返回 owned
+cell rectangles；Swift 不保存覆盖，也不重建表格。
 
 definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
 offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地

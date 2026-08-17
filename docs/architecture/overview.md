@@ -329,8 +329,10 @@ transaction 仍是后续编辑阶段的工作。`yu-layout::TableResizeGesture` 
 释放状态：捕获 pointer anchor 后只生成临时 proposed divider position，释放返回不含 source
 edit 的 `TableResizeCommit`；stale Revision 或非有限坐标直接拒绝。当前只把 column commit
 应用为 session-only transient layout：相邻列安全 clamp、总宽度保持不变，canonical Markdown
-和 layout cache 不变；row commit 等待完整 variable-row layout。document-host 的 block
-projection self-check 同时验证 column/row 命中、tolerance、source 不变和 stale 拒绝。
+和 layout cache 不变；row commit 等待完整 variable-row layout。storage FFI 的
+`yu_storage_session_table_layout_cells_with_resize` 只返回这份调用内的 owned cell geometry，
+不持有 override；document-host 的 block projection self-check 同时验证 column/row 命中、
+transient/canonical 几何差异、source 不变和 stale 拒绝。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和

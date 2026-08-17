@@ -1578,6 +1578,58 @@ private final class StorageBridge {
         return Array(cells.prefix(written))
     }
 
+    func tableLayoutCellsWithResize(
+        revision: UInt64,
+        blockIndex: UInt64,
+        resizeKind: UInt8,
+        resizeIndex: UInt64,
+        resizeDelta: Float,
+        maxWidth: Float,
+        lineHeight: Float,
+        defaultAdvance: Float
+    ) throws -> [YuStorageTableLayoutCell] {
+        var required = 0
+        let sizeStatus = yu_storage_session_table_layout_cells_with_resize(
+            handle,
+            revision,
+            blockIndex,
+            maxWidth,
+            lineHeight,
+            defaultAdvance,
+            resizeKind,
+            resizeIndex,
+            resizeDelta,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var cells = Array(repeating: YuStorageTableLayoutCell(), count: required)
+        var written = required
+        let copyStatus = cells.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_table_layout_cells_with_resize(
+                handle,
+                revision,
+                blockIndex,
+                maxWidth,
+                lineHeight,
+                defaultAdvance,
+                resizeKind,
+                resizeIndex,
+                resizeDelta,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard copyStatus == StorageStatus.ok, written >= 0, written <= cells.count else {
+            throw BridgeError.operation(copyStatus)
+        }
+        return Array(cells.prefix(written))
+    }
+
     func tableCellHitTest(
         revision: UInt64,
         blockIndex: UInt64,
@@ -6704,6 +6756,32 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
             precondition(columnResize.index == 0)
             precondition(abs(columnResize.position - columnDividerX) < 0.0001)
 
+            let resizedLayoutCells = try bridge.tableLayoutCellsWithResize(
+                revision: revision,
+                blockIndex: UInt64(tableIndex),
+                resizeKind: UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
+                resizeIndex: columnResize.index,
+                resizeDelta: 1.0,
+                maxWidth: 20.0,
+                lineHeight: 2.0,
+                defaultAdvance: 1.0
+            )
+            precondition(resizedLayoutCells.count == 4)
+            precondition(resizedLayoutCells[0].width == 4.0)
+            precondition(resizedLayoutCells[1].x == 4.0)
+            precondition(resizedLayoutCells[1].width == 2.0)
+            precondition(resizedLayoutCells[3].x == 4.0)
+            let canonicalLayoutCells = try bridge.tableLayoutCells(
+                revision: revision,
+                blockIndex: UInt64(tableIndex),
+                maxWidth: 20.0,
+                lineHeight: 2.0,
+                defaultAdvance: 1.0
+            )
+            precondition(canonicalLayoutCells[0].width == 3.0)
+            precondition(canonicalLayoutCells[1].x == 3.0)
+            precondition(bridge.source == sourceBeforeResize)
+
             let rowDividerY = layoutCells[0].y + layoutCells[0].height
             let rowResize = try bridge.tableResizeHitTest(
                 revision: revision,
@@ -6763,6 +6841,21 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
                     defaultAdvance: 1.0
                 )
                 preconditionFailure("stale table resize hit unexpectedly succeeded")
+            } catch BridgeError.operation(let status) {
+                precondition(status == 13)
+            }
+            do {
+                _ = try bridge.tableLayoutCellsWithResize(
+                    revision: revision,
+                    blockIndex: UInt64(tableIndex),
+                    resizeKind: UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
+                    resizeIndex: 0,
+                    resizeDelta: 1.0,
+                    maxWidth: 20.0,
+                    lineHeight: 2.0,
+                    defaultAdvance: 1.0
+                )
+                preconditionFailure("stale table resize layout unexpectedly succeeded")
             } catch BridgeError.operation(let status) {
                 precondition(status == 13)
             }
