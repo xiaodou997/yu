@@ -14,7 +14,8 @@ use std::sync::Arc;
 use yu_assets::{ImageIntrinsicPublication, ImageKey, ImagePublication};
 use yu_core::Revision;
 use yu_editor::{
-    BlockKind, EditorDocument, EditorDocumentError, ImageSource, ShapingProvider, ViewportRect,
+    BlockKind, EditorDocument, EditorDocumentError, ImageSource, LayoutError, ShapingProvider,
+    TableResizeCommit, TableResizeTarget, ViewportRect,
 };
 use yu_font::GlyphAtlas;
 use yu_layout::ImageIntrinsicSize;
@@ -129,6 +130,7 @@ pub struct ViewportRenderConfig {
     font_size: f32,
     scene_viewport: Rect,
     color: Rgba8,
+    table_resize: Option<TableResizeCommit>,
 }
 
 impl ViewportRenderConfig {
@@ -144,7 +146,16 @@ impl ViewportRenderConfig {
             font_size,
             scene_viewport,
             color,
+            table_resize: None,
         }
+    }
+
+    /// Returns a copy that carries one caller-owned, session-only table
+    /// geometry override into the next scene/render-plan build.
+    #[must_use]
+    pub const fn with_table_resize(mut self, resize: TableResizeCommit) -> Self {
+        self.table_resize = Some(resize);
+        self
     }
 
     #[must_use]
@@ -165,6 +176,11 @@ impl ViewportRenderConfig {
     #[must_use]
     pub const fn color(self) -> Rgba8 {
         self.color
+    }
+
+    #[must_use]
+    pub const fn table_resize(self) -> Option<TableResizeCommit> {
+        self.table_resize
     }
 }
 
@@ -603,6 +619,35 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
     )
 }
 
+/// Builds a viewport scene with one caller-owned session-only table resize.
+/// The override is applied only to the transient block layout used by this
+/// scene; source, selection, history and the document layout cache remain
+/// unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_viewport_scene_with_table_resize<S: ShapingProvider>(
+    document: &mut EditorDocument,
+    viewport: ViewportRect,
+    shaper: &S,
+    font_size: f32,
+    scene_viewport: Rect,
+    atlas: &GlyphAtlas,
+    color: Rgba8,
+    table_resize: TableResizeCommit,
+) -> Result<ViewportSceneFrame, ViewportSceneError> {
+    assemble_viewport_scene_with_images_and_intrinsics_and_table_resize(
+        document,
+        viewport,
+        shaper,
+        font_size,
+        scene_viewport,
+        atlas,
+        color,
+        &[],
+        &[],
+        Some(table_resize),
+    )
+}
+
 /// Builds a viewport scene with dimensions from ready image publications.
 /// Publications are optional and are matched by the same source-backed
 /// destination fingerprint used by the image primitive.
@@ -645,9 +690,53 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
     image_publications: &[ImagePublication],
     image_intrinsics: &[ImageIntrinsicPublication],
 ) -> Result<ViewportSceneFrame, ViewportSceneError> {
+    assemble_viewport_scene_with_images_and_intrinsics_and_table_resize(
+        document,
+        viewport,
+        shaper,
+        font_size,
+        scene_viewport,
+        atlas,
+        color,
+        image_publications,
+        image_intrinsics,
+        None,
+    )
+}
+
+/// Builds a viewport scene with ready image dimensions and an optional
+/// caller-owned session-only table column override. The override is rejected
+/// when stale or when it targets the deferred variable-row path.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: ShapingProvider>(
+    document: &mut EditorDocument,
+    viewport: ViewportRect,
+    shaper: &S,
+    font_size: f32,
+    scene_viewport: Rect,
+    atlas: &GlyphAtlas,
+    color: Rgba8,
+    image_publications: &[ImagePublication],
+    image_intrinsics: &[ImageIntrinsicPublication],
+    table_resize: Option<TableResizeCommit>,
+) -> Result<ViewportSceneFrame, ViewportSceneError> {
     let source = document.snapshot();
     let definitions = document.markdown().reference_definitions().clone();
     let document_revision = document.revision();
+    if let Some(resize) = table_resize {
+        if resize.revision() != document_revision {
+            return Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
+                "table resize and viewport document revisions differ",
+            ))
+            .into());
+        }
+        if matches!(resize.target(), TableResizeTarget::Row { .. }) {
+            return Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
+                "row resize requires variable-row table layout",
+            ))
+            .into());
+        }
+    }
     let selection = Some(document.selection().ordered_range());
     let image_key = |image: ImageSource| {
         let destination = image.destination().or_else(|| {
@@ -741,6 +830,11 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
         layout
             .apply_image_intrinsic_sizes(&measurements)
             .map_err(EditorDocumentError::from)?;
+        if let Some(resize) = table_resize.filter(|resize| resize.block_index() == block.index()) {
+            layout
+                .apply_table_resize(resize)
+                .map_err(EditorDocumentError::from)?;
+        }
         layouts.push(layout);
     }
     let layout_refs = layouts.iter().collect::<Vec<_>>();
@@ -855,7 +949,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvi
     image_publications: &[ImagePublication],
     image_intrinsics: &[ImageIntrinsicPublication],
 ) -> Result<ViewportRenderFrame, ViewportSceneError> {
-    let scene = assemble_viewport_scene_with_images_and_intrinsics(
+    let scene = assemble_viewport_scene_with_images_and_intrinsics_and_table_resize(
         document,
         viewport,
         shaper,
@@ -865,6 +959,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvi
         config.color(),
         image_publications,
         image_intrinsics,
+        config.table_resize(),
     )?;
     if scene.revision() != document.revision() {
         return Err(ViewportFrameError::Stale {
@@ -882,7 +977,10 @@ mod tests {
     use std::sync::Arc;
 
     use yu_core::ByteOffset;
-    use yu_editor::{CaretAffinity, EditorCommand, EditorSelection, LayoutConfig, ViewportConfig};
+    use yu_editor::{
+        CaretAffinity, EditorCommand, EditorSelection, LayoutConfig, LayoutPoint,
+        TableResizeGesture, ViewportConfig,
+    };
     use yu_font::{
         FontDatabase, FontFaceSpec, FontRequest, FontShaper, GlyphAtlasConfig, GlyphBitmap,
         GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
@@ -1188,6 +1286,113 @@ mod tests {
                 .iter()
                 .any(|primitive| matches!(primitive, Primitive::Glyph(_)))
         );
+    }
+
+    #[test]
+    fn table_resize_override_reaches_scene_and_render_plan_without_mutating_document() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 160.0);
+        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let layout_config = document.viewport_config().layout();
+        let canonical = document
+            .block_layout_with_shaper(0, layout_config, &shaper)
+            .expect("canonical table layout")
+            .clone();
+        let table = canonical.table().expect("table metadata");
+        let divider = table.bounds().x() + table.column_widths()[0];
+        let hit = table
+            .resize_hit_test(LayoutPoint::new(divider, 0.5), 0.0)
+            .expect("divider hit-test")
+            .expect("column divider");
+        let mut gesture = TableResizeGesture::begin(canonical.revision(), 0, hit, divider)
+            .expect("resize gesture");
+        gesture
+            .update(canonical.revision(), divider + 1.0)
+            .expect("resize update");
+        let commit = gesture.finish(canonical.revision()).expect("resize commit");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_render_frame(
+            &mut document,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+                Rgba8::black(),
+            )
+            .with_table_resize(commit),
+            &shaper,
+            &atlas,
+            &mut RenderPlanBuilder::new(),
+        )
+        .expect("transient table render frame");
+
+        let expected_divider = divider + 1.0;
+        assert!(frame.scene().scene().primitives().iter().any(|primitive| {
+            matches!(
+                primitive,
+                Primitive::Table(table)
+                    if table.role() == yu_scene::TablePrimitiveRole::Border
+                        && (table.bounds().x() - expected_divider).abs() < 0.001
+            )
+        }));
+        assert!(frame.plan().commands().iter().any(|command| {
+            matches!(
+                command,
+                yu_render::RenderCommand::FillRect { bounds, .. }
+                    if (bounds.x() - expected_divider).abs() < 0.001
+            )
+        }));
+        assert_eq!(document.snapshot().as_str(), source);
+        let canonical_after = document
+            .block_layout_with_shaper(0, layout_config, &shaper)
+            .expect("canonical layout after frame");
+        assert!(
+            (canonical_after.table().expect("table").column_widths()[0] - table.column_widths()[0])
+                .abs()
+                < 0.001
+        );
+        assert_eq!(document.layout_cache_stats().entries(), 1);
+
+        document
+            .apply_transaction(&yu_text::Transaction::new(
+                canonical.revision(),
+                [yu_text::Edit::new(
+                    yu_core::TextRange::empty(ByteOffset::ZERO),
+                    "前",
+                )],
+            ))
+            .expect("source edit");
+        let stale_error = assemble_viewport_render_frame(
+            &mut document,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+                Rgba8::black(),
+            )
+            .with_table_resize(commit),
+            &shaper,
+            &atlas,
+            &mut RenderPlanBuilder::new(),
+        )
+        .expect_err("stale table override");
+        assert!(matches!(
+            stale_error,
+            ViewportSceneError::Document(EditorDocumentError::Layout(
+                yu_editor::LayoutError::InvalidTable(
+                    "table resize and viewport document revisions differ"
+                )
+            ))
+        ));
     }
 
     #[test]
