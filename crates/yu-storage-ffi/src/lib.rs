@@ -9074,10 +9074,201 @@ mod tests {
         assert_eq!(written_commands, 0);
         assert_eq!(written_pages, 0);
         assert_eq!(written_damage, 0);
+
+        let mut composition_snapshot = YuStorageVisualRenderPlanSnapshot::default();
+        let mut composition_command_required = 0;
+        let mut composition_page_required = 0;
+        let mut composition_damage_required = 0;
         assert_eq!(
-            unsafe { yu_storage_session_cancel_composition(raw, 0, 1) },
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut composition_snapshot,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut composition_command_required,
+                    &mut composition_page_required,
+                    &mut composition_damage_required,
+                )
+            },
             YU_STORAGE_OK
         );
+        assert_eq!(composition_snapshot.revision, 0);
+        assert_eq!(composition_snapshot.composition_generation, 1);
+        assert!(composition_command_required > 0);
+        assert!(composition_page_required > 0);
+        assert!(composition_damage_required > 0);
+
+        let mut composition_commands =
+            vec![YuStorageVisualRenderCommand::default(); composition_command_required];
+        let mut composition_pages =
+            vec![YuStorageVisualRenderPage::default(); composition_page_required];
+        let mut composition_damage =
+            vec![YuStorageVisualRenderDamage::default(); composition_damage_required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut composition_snapshot,
+                    composition_commands.as_mut_ptr(),
+                    composition_commands.len(),
+                    composition_pages.as_mut_ptr(),
+                    composition_pages.len(),
+                    composition_damage.as_mut_ptr(),
+                    composition_damage.len(),
+                    &mut written_commands,
+                    &mut written_pages,
+                    &mut written_damage,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written_commands, composition_command_required);
+        assert_eq!(written_pages, composition_page_required);
+        assert_eq!(written_damage, composition_damage_required);
+        assert!(composition_commands.iter().all(|command| {
+            command.revision == 0
+                && command.bounds_width.is_finite()
+                && command.bounds_height.is_finite()
+        }));
+
+        assert_eq!(
+            unsafe {
+                yu_storage_session_update_composition(
+                    raw,
+                    0,
+                    1,
+                    "日本語".as_ptr(),
+                    "日本語".len(),
+                    3,
+                    3,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut stale_after_update_commands =
+            vec![YuStorageVisualRenderCommand::default(); composition_command_required];
+        let mut stale_after_update_pages =
+            vec![YuStorageVisualRenderPage::default(); composition_page_required];
+        let mut stale_after_update_damage =
+            vec![YuStorageVisualRenderDamage::default(); composition_damage_required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut composition_snapshot,
+                    stale_after_update_commands.as_mut_ptr(),
+                    stale_after_update_commands.len(),
+                    stale_after_update_pages.as_mut_ptr(),
+                    stale_after_update_pages.len(),
+                    stale_after_update_damage.as_mut_ptr(),
+                    stale_after_update_damage.len(),
+                    &mut written_commands,
+                    &mut written_pages,
+                    &mut written_damage,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+        assert_eq!(
+            composition_snapshot,
+            YuStorageVisualRenderPlanSnapshot::default()
+        );
+        assert_eq!(written_commands, 0);
+        assert_eq!(written_pages, 0);
+        assert_eq!(written_damage, 0);
+        assert!(
+            stale_after_update_commands
+                .iter()
+                .all(|command| *command == YuStorageVisualRenderCommand::default())
+        );
+
+        let mut updated_composition_snapshot = YuStorageVisualRenderPlanSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut updated_composition_snapshot,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut composition_command_required,
+                    &mut composition_page_required,
+                    &mut composition_damage_required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(updated_composition_snapshot.composition_generation, 2);
+        assert!(composition_command_required > 0);
+
+        assert_eq!(
+            unsafe { yu_storage_session_cancel_composition(raw, 0, 2) },
+            YU_STORAGE_OK
+        );
+        let mut stale_after_cancel_commands =
+            vec![YuStorageVisualRenderCommand::default(); composition_command_required];
+        let mut stale_after_cancel_pages =
+            vec![YuStorageVisualRenderPage::default(); composition_page_required];
+        let mut stale_after_cancel_damage =
+            vec![YuStorageVisualRenderDamage::default(); composition_damage_required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_render_plan(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut updated_composition_snapshot,
+                    stale_after_cancel_commands.as_mut_ptr(),
+                    stale_after_cancel_commands.len(),
+                    stale_after_cancel_pages.as_mut_ptr(),
+                    stale_after_cancel_pages.len(),
+                    stale_after_cancel_damage.as_mut_ptr(),
+                    stale_after_cancel_damage.len(),
+                    &mut written_commands,
+                    &mut written_pages,
+                    &mut written_damage,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+        assert_eq!(
+            updated_composition_snapshot,
+            YuStorageVisualRenderPlanSnapshot::default()
+        );
+        assert_eq!(written_commands, 0);
+        assert_eq!(written_pages, 0);
+        assert_eq!(written_damage, 0);
 
         let mut result = YuStorageCommandResult::default();
         assert_eq!(
