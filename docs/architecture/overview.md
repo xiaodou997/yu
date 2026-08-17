@@ -159,6 +159,12 @@ Rust/CoreText-shaped frame 时才允许显示 surface；TextKit visual mirror �
 decoration 不会隐藏 source glyph，也不会让旧 Metal frame 留在 source mirror 下方。这样
 composition、stale geometry、resize 和 submit 失败都回到完整 TextKit source 绘制。见 ADR 0150。
 
+`DocumentTextView` 的绘制责任进一步收敛为三个显式 presentation role：`sourceFallback` 恢复
+完整 canonical source 的 TextKit 绘制，`projectedTextKitOverlay` 只用于受控的 composition/视觉
+回退，`rustSurface` 则让 TextKit 保留输入、IME、Accessibility 和 selection 状态但不贡献字形、
+caret 或 selection 像素。role 切换会一起更新 selection paint attributes，避免旧的 projected
+样式跨帧残留。见 ADR 0151。
+
 `EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
 按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
 Revision。光标移动、显式 selection、composition 边界和 reset 会断开 group；新的永久 edit 会清空

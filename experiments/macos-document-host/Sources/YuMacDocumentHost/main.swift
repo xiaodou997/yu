@@ -2780,6 +2780,16 @@ private final class DocumentTextView: NSTextView {
         static let moveDownExtend: UInt8 = 16
     }
 
+    /// TextKit is always retained as the native input/IME/Accessibility host,
+    /// but it has three deliberately separate paint roles. Keeping this as
+    /// one role instead of independently toggling two booleans prevents a
+    /// stale projected caret or selection from surviving a surface fallback.
+    private enum PresentationRole: Equatable {
+        case sourceFallback
+        case projectedTextKitOverlay
+        case rustSurface
+    }
+
     private let bridge: StorageBridge
     private var canonicalSource: String
     private var canonicalRevision: UInt64
@@ -2795,6 +2805,7 @@ private final class DocumentTextView: NSTextView {
     private var visualViewport: NativeVisualViewport?
     private var visualSelectionAnchor: Int?
     private var sourceSelectedTextAttributes: [NSAttributedString.Key: Any]?
+    private var presentationRole: PresentationRole = .sourceFallback
     private var externalVisualDecorationsEnabled = false
     private var sourceGlyphsHidden = false
     var onDocumentChange: (() -> Void)?
@@ -2868,10 +2879,7 @@ private final class DocumentTextView: NSTextView {
             if sourceSelectedTextAttributes == nil {
                 sourceSelectedTextAttributes = selectedTextAttributes
             }
-            var attributes = selectedTextAttributes
-            attributes[.backgroundColor] = NSColor.clear
-            attributes[.foregroundColor] = textColor ?? NSColor.textColor
-            selectedTextAttributes = attributes
+            applyVisualSelectionPaint(hidden: true)
             try refreshVisualMirror()
         } else {
             visualMirror = nil
@@ -2881,6 +2889,7 @@ private final class DocumentTextView: NSTextView {
                 selectedTextAttributes = sourceSelectedTextAttributes
             }
             self.sourceSelectedTextAttributes = nil
+            setPresentationRole(.sourceFallback)
         }
         needsDisplay = true
     }
@@ -2893,9 +2902,9 @@ private final class DocumentTextView: NSTextView {
     /// view remains the input/IME/Accessibility owner; disabling this flag is
     /// the safe fallback when the sibling decoration surface is unavailable.
     func setExternalVisualDecorationsEnabled(_ enabled: Bool) {
-        guard externalVisualDecorationsEnabled != enabled else { return }
-        externalVisualDecorationsEnabled = enabled
-        needsDisplay = true
+        setPresentationRole(
+            enabled ? .projectedTextKitOverlay : .sourceFallback
+        )
     }
 
     /// Hides only TextKit's source glyph painting after the Rust surface and
@@ -2904,13 +2913,59 @@ private final class DocumentTextView: NSTextView {
     /// Accessibility owner; clearing this flag restores the complete native
     /// fallback without rebuilding the document model.
     func setSourceGlyphsHidden(_ hidden: Bool) {
-        guard sourceGlyphsHidden != hidden else { return }
-        sourceGlyphsHidden = hidden
-        needsDisplay = true
+        setPresentationRole(hidden ? .rustSurface : .sourceFallback)
+    }
+
+    /// Applies the production paint contract as one atomic transition. The
+    /// Rust surface coordinator owns the authoritative frame check; this view
+    /// only changes which pixels TextKit is allowed to contribute.
+    func useSourceFallbackPresentation() {
+        setPresentationRole(.sourceFallback)
+    }
+
+    func useProjectedTextKitOverlayPresentation() {
+        setPresentationRole(.projectedTextKitOverlay)
+    }
+
+    func useRustSurfacePresentation() {
+        setPresentationRole(.rustSurface)
     }
 
     var sourceGlyphsHiddenForSelfCheck: Bool {
         sourceGlyphsHidden
+    }
+
+    var presentationRoleForSelfCheck: String {
+        switch presentationRole {
+        case .sourceFallback: return "sourceFallback"
+        case .projectedTextKitOverlay: return "projectedTextKitOverlay"
+        case .rustSurface: return "rustSurface"
+        }
+    }
+
+    private func setPresentationRole(_ role: PresentationRole) {
+        guard presentationRole != role
+            || externalVisualDecorationsEnabled != (role != .sourceFallback)
+            || sourceGlyphsHidden != (role == .rustSurface) else {
+            return
+        }
+        presentationRole = role
+        externalVisualDecorationsEnabled = role != .sourceFallback
+        sourceGlyphsHidden = role == .rustSurface
+        applyVisualSelectionPaint(hidden: role != .sourceFallback)
+        needsDisplay = true
+    }
+
+    private func applyVisualSelectionPaint(hidden: Bool) {
+        guard visualMirrorEnabled else { return }
+        if hidden {
+            var attributes = selectedTextAttributes
+            attributes[.backgroundColor] = NSColor.clear
+            attributes[.foregroundColor] = textColor ?? NSColor.textColor
+            selectedTextAttributes = attributes
+        } else if let sourceSelectedTextAttributes {
+            selectedTextAttributes = sourceSelectedTextAttributes
+        }
     }
 
     func refreshVisualMirrorForDisplay() throws {
@@ -4953,13 +5008,14 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     ) {
         decorationHostView.clear()
         rustDecorationFrameAccepted = false
-        textView.setExternalVisualDecorationsEnabled(false)
-        textView.setSourceGlyphsHidden(false)
+        textView.useSourceFallbackPresentation()
         surfaceHostView.setNativeContentVisible(false)
         visualRenderStateMachine.enterFallback(reason)
     }
 
-    private func syncSourceGlyphVisibility() {
+    private func syncSourceGlyphVisibility(
+        useProjectedTextKitFallback: Bool = false
+    ) {
         let revision = bridge.state.revision
         let compositionGeneration = bridge.composition.generation
         let publicationCurrent = surfaceCoordinator.hasCurrentPublication(
@@ -4972,7 +5028,13 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             && decorationCurrent
             && rustDecorationFrameAccepted
             && !bridge.composition.active
-        textView.setSourceGlyphsHidden(canHideSourceGlyphs)
+        if canHideSourceGlyphs {
+            textView.useRustSurfacePresentation()
+        } else if useProjectedTextKitFallback {
+            textView.useProjectedTextKitOverlayPresentation()
+        } else {
+            textView.useSourceFallbackPresentation()
+        }
         // The Rust surface and its Rust-shaped decoration frame are one
         // visual publication. If either side is stale, hide the surface as a
         // unit and let TextKit render the source mirror until both are ready.
@@ -5087,7 +5149,6 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                     compositionActive: false
                 )
                 rustDecorationFrameAccepted = true
-                textView.setExternalVisualDecorationsEnabled(true)
                 syncSourceGlyphVisibility()
                 return
             } catch {
@@ -5121,8 +5182,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             caretRect: convertedCaret,
             compositionActive: bridge.composition.active
         )
-        textView.setExternalVisualDecorationsEnabled(true)
-        syncSourceGlyphVisibility()
+        syncSourceGlyphVisibility(useProjectedTextKitFallback: true)
     }
 
     @objc private func save() {
@@ -5947,11 +6007,18 @@ private func runVisualDecorationSelfCheck(path: String) -> Never {
         precondition(decoration.selectionRects.count == rustSelection.count)
         precondition(decoration.caretRect != nil)
         precondition(decoration.hitTest(NSPoint(x: 1.0, y: 1.0)) == nil)
+        textView.useSourceFallbackPresentation()
+        precondition(textView.presentationRoleForSelfCheck == "sourceFallback")
+        textView.useProjectedTextKitOverlayPresentation()
+        precondition(textView.presentationRoleForSelfCheck == "projectedTextKitOverlay")
+        textView.useRustSurfacePresentation()
+        precondition(textView.presentationRoleForSelfCheck == "rustSurface")
         textView.setSourceGlyphsHidden(true)
         precondition(textView.sourceGlyphsHiddenForSelfCheck)
         precondition(textView.string == bridge.source)
         textView.setSourceGlyphsHidden(false)
         precondition(!textView.sourceGlyphsHiddenForSelfCheck)
+        precondition(textView.presentationRoleForSelfCheck == "sourceFallback")
 
         _ = try bridge.insertText("x")
         do {
