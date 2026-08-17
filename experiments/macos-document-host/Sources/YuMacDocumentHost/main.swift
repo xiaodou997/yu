@@ -640,6 +640,11 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let imageFailureCount: Int
     let imageEvictionCount: Int
     let imageAtlasEvictionCount: Int
+    let imageCandidateCount: Int
+    let imageDuplicateCount: Int
+    let imageVisibleCandidateCount: Int
+    let imageOverscanCandidateCount: Int
+    let imageRetryCount: Int
     let submitted: Bool
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
@@ -657,6 +662,11 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
         imageFailureCount = Int(value.image_failure_count)
         imageEvictionCount = Int(value.image_eviction_count)
         imageAtlasEvictionCount = Int(value.image_atlas_eviction_count)
+        imageCandidateCount = Int(value.image_candidate_count)
+        imageDuplicateCount = Int(value.image_duplicate_count)
+        imageVisibleCandidateCount = Int(value.image_visible_candidate_count)
+        imageOverscanCandidateCount = Int(value.image_overscan_candidate_count)
+        imageRetryCount = Int(value.image_retry_count)
         submitted = value.submitted != 0
     }
 }
@@ -7102,6 +7112,13 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
                 RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
             }
             precondition(imageReady.imageRequestCount > 0)
+            precondition(imageReady.imageCandidateCount >= imageReady.imageRequestCount)
+            precondition(
+                imageReady.imageVisibleCandidateCount
+                    + imageReady.imageOverscanCandidateCount
+                    == imageReady.imageCandidateCount
+            )
+            precondition(imageReady.imageDuplicateCount <= imageReady.imageCandidateCount)
             precondition(imageReady.imageResourceCount > 0)
             precondition(imageReady.imageFailureCount == 0)
             precondition(imageReady.uploadedImages > 0 || repeated.imageResourceCount > 0)

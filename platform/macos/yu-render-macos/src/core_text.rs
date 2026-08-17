@@ -8,7 +8,7 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_assets::{ImageIntrinsicPublication, ImagePublication};
+use yu_assets::{ImageIntrinsicPublication, ImagePublication, ImageRequestPriority};
 use yu_editor::{EditorDocument, EditorDocumentError};
 use yu_font::{
     AtlasError, FontRequest, GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer,
@@ -212,16 +212,42 @@ impl CoreTextViewportFrameBuilder {
         &self,
         document: &mut EditorDocument,
     ) -> Result<Vec<usize>, EditorDocumentError> {
+        Ok(self
+            .viewport_image_blocks(document)?
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect())
+    }
+
+    /// Returns viewport/overscan block indices with an explicit request
+    /// priority. The classification is derived from the same document-space
+    /// geometry consumed by the renderer, so the scheduler never recreates a
+    /// second HeightIndex or scans the full document.
+    pub fn viewport_image_blocks(
+        &self,
+        document: &mut EditorDocument,
+    ) -> Result<Vec<(usize, ImageRequestPriority)>, EditorDocumentError> {
         let snapshot = if document.composition().is_some() {
             document
                 .visible_blocks_with_composition_and_shaper(self.config.viewport(), &self.shaper)?
         } else {
             document.visible_blocks_with_shaper(self.config.viewport(), &self.shaper)?
         };
+        let viewport = self.config.viewport();
+        let visible_top = viewport.scroll_y();
+        let visible_bottom = visible_top + viewport.height();
         Ok(snapshot
             .blocks()
             .iter()
-            .map(|block| block.index())
+            .map(|block| {
+                let block_bottom = block.y() + block.height();
+                let priority = if block_bottom > visible_top && block.y() < visible_bottom {
+                    ImageRequestPriority::Visible
+                } else {
+                    ImageRequestPriority::Overscan
+                };
+                (block.index(), priority)
+            })
             .collect())
     }
 

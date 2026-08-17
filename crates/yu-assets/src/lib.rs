@@ -166,6 +166,161 @@ impl ImageRequest {
     }
 }
 
+/// Scheduling priority for an image candidate selected by a viewport query.
+/// Visible candidates are always ordered before overscan candidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImageRequestPriority {
+    Visible,
+    Overscan,
+}
+
+/// One source-backed image occurrence discovered in a viewport block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageRequestCandidate {
+    request: ImageRequest,
+    block_index: usize,
+    priority: ImageRequestPriority,
+}
+
+impl ImageRequestCandidate {
+    #[must_use]
+    pub const fn new(
+        request: ImageRequest,
+        block_index: usize,
+        priority: ImageRequestPriority,
+    ) -> Self {
+        Self {
+            request,
+            block_index,
+            priority,
+        }
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &ImageRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub const fn block_index(&self) -> usize {
+        self.block_index
+    }
+
+    #[must_use]
+    pub const fn priority(&self) -> ImageRequestPriority {
+        self.priority
+    }
+}
+
+/// Counts collected while converting image occurrences into unique work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageScheduleStats {
+    candidate_count: usize,
+    unique_count: usize,
+    duplicate_count: usize,
+    visible_candidate_count: usize,
+    overscan_candidate_count: usize,
+}
+
+impl ImageScheduleStats {
+    #[must_use]
+    pub const fn candidate_count(self) -> usize {
+        self.candidate_count
+    }
+
+    #[must_use]
+    pub const fn unique_count(self) -> usize {
+        self.unique_count
+    }
+
+    #[must_use]
+    pub const fn duplicate_count(self) -> usize {
+        self.duplicate_count
+    }
+
+    #[must_use]
+    pub const fn visible_candidate_count(self) -> usize {
+        self.visible_candidate_count
+    }
+
+    #[must_use]
+    pub const fn overscan_candidate_count(self) -> usize {
+        self.overscan_candidate_count
+    }
+}
+
+/// Deterministic, deduplicated image work selected for one viewport batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageRequestPlan {
+    requests: Vec<ImageRequest>,
+    stats: ImageScheduleStats,
+}
+
+impl ImageRequestPlan {
+    /// Deduplicates by destination, keeps the most urgent occurrence, and
+    /// orders visible work before overscan work. A lower block index wins when
+    /// two occurrences have the same priority, making queue order stable.
+    #[must_use]
+    pub fn from_candidates(candidates: impl IntoIterator<Item = ImageRequestCandidate>) -> Self {
+        let mut stats = ImageScheduleStats::default();
+        let mut unique = HashMap::<ImageKey, ImageRequestCandidate>::new();
+        for candidate in candidates {
+            stats.candidate_count = stats.candidate_count.saturating_add(1);
+            match candidate.priority() {
+                ImageRequestPriority::Visible => {
+                    stats.visible_candidate_count = stats.visible_candidate_count.saturating_add(1);
+                }
+                ImageRequestPriority::Overscan => {
+                    stats.overscan_candidate_count =
+                        stats.overscan_candidate_count.saturating_add(1);
+                }
+            }
+            let key = candidate.request().key().clone();
+            if let Some(previous) = unique.get_mut(&key) {
+                stats.duplicate_count = stats.duplicate_count.saturating_add(1);
+                if candidate.priority() < previous.priority()
+                    || (candidate.priority() == previous.priority()
+                        && candidate.block_index() < previous.block_index())
+                {
+                    *previous = candidate;
+                }
+            } else {
+                unique.insert(key, candidate);
+            }
+        }
+
+        let mut selected = unique.into_values().collect::<Vec<_>>();
+        selected.sort_by_key(|candidate| {
+            (
+                candidate.priority(),
+                candidate.block_index(),
+                candidate.request().key().fingerprint(),
+            )
+        });
+        stats.unique_count = selected.len();
+        let requests = selected
+            .into_iter()
+            .map(|candidate| candidate.request)
+            .collect();
+        Self { requests, stats }
+    }
+
+    #[must_use]
+    pub fn requests(&self) -> &[ImageRequest] {
+        &self.requests
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> ImageScheduleStats {
+        self.stats
+    }
+
+    #[must_use]
+    pub fn into_requests(self) -> Vec<ImageRequest> {
+        self.requests
+    }
+}
+
 /// Owned decoded RGBA8 image data ready for a platform texture uploader.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedImage {
@@ -901,6 +1056,63 @@ mod tests {
 
     fn request(revision: u64, source: TextRange, destination: &str) -> ImageRequest {
         ImageRequest::new(Revision::new(revision), source, destination).expect("request")
+    }
+
+    #[test]
+    fn image_request_plan_deduplicates_and_prioritizes_visible_work() {
+        let source =
+            TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(4)).expect("range");
+        let plan = ImageRequestPlan::from_candidates([
+            ImageRequestCandidate::new(
+                request(0, source, "overscan.png"),
+                20,
+                ImageRequestPriority::Overscan,
+            ),
+            ImageRequestCandidate::new(
+                request(0, source, "visible.png"),
+                10,
+                ImageRequestPriority::Visible,
+            ),
+            ImageRequestCandidate::new(
+                request(0, source, "visible.png"),
+                30,
+                ImageRequestPriority::Overscan,
+            ),
+            ImageRequestCandidate::new(
+                request(0, source, "overscan.png"),
+                5,
+                ImageRequestPriority::Visible,
+            ),
+        ]);
+
+        assert_eq!(plan.stats().candidate_count(), 4);
+        assert_eq!(plan.stats().unique_count(), 2);
+        assert_eq!(plan.stats().duplicate_count(), 2);
+        assert_eq!(plan.stats().visible_candidate_count(), 2);
+        assert_eq!(plan.stats().overscan_candidate_count(), 2);
+        assert_eq!(plan.requests().len(), 2);
+        assert_eq!(plan.requests()[0].key().destination(), "overscan.png");
+        assert_eq!(plan.requests()[1].key().destination(), "visible.png");
+    }
+
+    #[test]
+    fn image_request_plan_keeps_lowest_block_for_equal_priority() {
+        let source =
+            TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(4)).expect("range");
+        let plan = ImageRequestPlan::from_candidates([
+            ImageRequestCandidate::new(
+                request(0, source, "same.png"),
+                9,
+                ImageRequestPriority::Visible,
+            ),
+            ImageRequestCandidate::new(
+                request(0, source, "same.png"),
+                3,
+                ImageRequestPriority::Visible,
+            ),
+        ]);
+        assert_eq!(plan.requests()[0].source(), source);
+        assert_eq!(plan.stats().duplicate_count(), 1);
     }
 
     fn decoded(byte: u8) -> DecodedImage {

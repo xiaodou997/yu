@@ -55,6 +55,7 @@ dependencies = [
 name = "yu-bench"
 version = "0.1.0"
 dependencies = [
+ "yu-assets",
  "yu-core",
  "yu-editor",
  "yu-layout",
