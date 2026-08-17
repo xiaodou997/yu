@@ -7947,6 +7947,7 @@ mod tests {
             .iter()
             .position(|kind| *kind == YU_STORAGE_PROJECTION_TABLE)
             .expect("table projection should be present");
+        assert_eq!(projected_blocks[table_index], "AB12");
         let mut table_count = 0;
         assert_eq!(
             unsafe {

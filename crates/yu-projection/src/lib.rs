@@ -1447,11 +1447,11 @@ pub enum BlockProjectionKind {
 
 /// A source-backed GFM table projection.
 ///
-/// Header/body text remains an ordinary source-backed inline projection while
-/// the parser-owned delimiter physical row is hidden. `TableBlock` carries
-/// absolute source ranges for the header, delimiter and body cells so the
-/// retained table layout can replace the hidden row with a grid without
-/// creating a second document model.
+/// Only source-backed cell contents remain visible. Pipes, surrounding
+/// whitespace, row line endings and the parser-owned delimiter physical row
+/// become zero-width hidden runs. `TableBlock` carries absolute source ranges
+/// for the header, delimiter and body cells so retained table layout can place
+/// those visible runs in a grid without creating a second document model.
 #[derive(Clone, Debug)]
 pub struct TableProjection {
     visual: Projection,
@@ -1473,11 +1473,7 @@ impl TableProjection {
             }
             None => parse_inline(source, block.range())?,
         };
-        let hidden = table
-            .delimiter_source_range()
-            .into_iter()
-            .map(table_cell_to_text_range)
-            .collect::<Result<Vec<_>, _>>()?;
+        let hidden = table_projection_hidden_ranges(&table)?;
         let visual = Projection::from_inline_with_hidden(&inline, &hidden)?;
         Ok(Some(Self { visual, table }))
     }
@@ -2091,6 +2087,56 @@ fn table_cell_to_text_range(
     byte_range(range.start(), range.end())
 }
 
+fn table_projection_hidden_ranges(table: &TableBlock) -> Result<Vec<TextRange>, ProjectionError> {
+    let mut hidden = Vec::new();
+    append_table_row_hidden(
+        table
+            .row_source_range(0)
+            .ok_or(ProjectionError::OffsetOverflow)?,
+        table.header(),
+        &mut hidden,
+    )?;
+    hidden.push(table_cell_to_text_range(
+        table
+            .delimiter_source_range()
+            .ok_or(ProjectionError::OffsetOverflow)?,
+    )?);
+    for (body_index, cells) in table.rows().iter().enumerate() {
+        append_table_row_hidden(
+            table
+                .row_source_range(body_index.saturating_add(2))
+                .ok_or(ProjectionError::OffsetOverflow)?,
+            cells,
+            &mut hidden,
+        )?;
+    }
+    Ok(hidden)
+}
+
+fn append_table_row_hidden(
+    row: yu_markdown::TableCellRange,
+    cells: &[yu_markdown::TableCellRange],
+    hidden: &mut Vec<TextRange>,
+) -> Result<(), ProjectionError> {
+    let row = table_cell_to_text_range(row)?;
+    let mut cursor = row.start();
+    for cell in cells {
+        let cell = table_cell_to_text_range(*cell)?;
+        if cell.start() < row.start() || cell.end() > row.end() || cell.start() < cursor {
+            return Err(ProjectionError::OffsetOverflow);
+        }
+        if cursor < cell.start() {
+            hidden
+                .push(TextRange::new(cursor, cell.start()).ok_or(ProjectionError::OffsetOverflow)?);
+        }
+        cursor = cell.end();
+    }
+    if cursor < row.end() {
+        hidden.push(TextRange::new(cursor, row.end()).ok_or(ProjectionError::OffsetOverflow)?);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2513,8 +2559,55 @@ mod tests {
             .map(|run| projection.visual().text_for_run(*run))
             .collect::<Result<String, _>>()
             .expect("table visual text");
-        assert!(projected.contains("| A | B |"));
+        assert_eq!(projected, "AB12");
+        assert!(!projected.contains('|'));
+        assert!(!projected.contains('\n'));
         assert!(!projected.contains("---"));
+        let visible_sources = projection
+            .visual()
+            .runs()
+            .iter()
+            .filter(|run| run.kind() == VisualRunKind::Visible)
+            .map(|run| run.source())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_sources,
+            table
+                .table()
+                .header()
+                .iter()
+                .chain(table.table().rows()[0].iter())
+                .copied()
+                .map(table_cell_to_text_range)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("cell ranges")
+        );
+        for (index, cell) in visible_sources.iter().copied().enumerate() {
+            let visual_start = projection
+                .visual()
+                .source_to_visual(cell.start(), ProjectionBias::After)
+                .expect("cell start should map to visual");
+            let visual_end = projection
+                .visual()
+                .source_to_visual(cell.end(), ProjectionBias::Before)
+                .expect("cell end should map to visual");
+            assert_eq!(visual_start.get(), index as u64);
+            assert_eq!(visual_end.get(), index as u64 + 1);
+            assert_eq!(
+                projection
+                    .visual()
+                    .visual_to_source(visual_start, ProjectionBias::After)
+                    .expect("visual start should map to cell"),
+                cell.start()
+            );
+            assert_eq!(
+                projection
+                    .visual()
+                    .visual_to_source(visual_end, ProjectionBias::Before)
+                    .expect("visual end should map to cell"),
+                cell.end()
+            );
+        }
         assert!(projection.visual().runs().iter().any(|run| {
             run.kind() == VisualRunKind::HiddenSyntax
                 && run.source()
@@ -2551,6 +2644,40 @@ mod tests {
             mapped_table.table().header()[0].start(),
             table.table().header()[0].start() + 7
         );
+    }
+
+    #[test]
+    fn table_projection_hides_crlf_structure_and_keeps_inline_cell_content() {
+        let source = "| **羽** | 🙂 |\r\n| --- | --- |\r\n|  | x |\r\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table paragraph");
+        let BlockProjection::Table(table) = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+        )
+        .expect("table projection") else {
+            panic!("expected table projection");
+        };
+        let projected = table
+            .visual()
+            .runs()
+            .iter()
+            .filter(|run| run.kind() != VisualRunKind::HiddenSyntax)
+            .map(|run| table.visual().text_for_run(*run))
+            .collect::<Result<String, _>>()
+            .expect("table visual text");
+        assert_eq!(projected, "羽🙂x");
+        assert!(!projected.contains(['|', '\r', '\n']));
+        assert_eq!(table.visual().visual_len().get(), projected.len() as u64);
+        assert!(table.visual().runs().iter().any(|run| {
+            run.kind() == VisualRunKind::HiddenSyntax
+                && run.source().len() >= 2
+                && source[usize::try_from(run.source().start().get()).expect("start")
+                    ..usize::try_from(run.source().end().get()).expect("end")]
+                    .contains("\r\n")
+        }));
     }
 
     #[test]
