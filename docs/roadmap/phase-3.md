@@ -72,6 +72,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] intrinsic image 高度进入对应 block 的 HeightIndex、content height 与 max scroll；Metal image atlas 在 publication 集合变化时淘汰离屏 texture，snapshot 暴露 atlas eviction 计数
 - [x] 图片 intrinsic metadata 与 decoded pixels 分离并跨帧保留；同一 Revision 的失败按有界指数退避重试，仍保留 fallback
 - [x] `yu-image-scheduling-bench` 覆盖 2,000/100,000 级图片 block 的 viewport/overscan 请求量与耗时
+- [x] `ImageRequestPlan` 按 destination 去重并以 visible 优先排序；macOS surface snapshot 暴露候选、去重、overscan 与 retry 计数
 
 ## 约束
 

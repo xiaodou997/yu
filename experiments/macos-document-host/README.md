@@ -248,7 +248,8 @@ glyph/image atlas、Metal target 和 attachment，重复提交应复用 atlas up
 验收期间临时写入 1×1 PNG，要求第一次 fallback 后由 ImageIO worker 发布 ready texture，并在输出中
 报告 `ImageIO publication reached ready Metal texture`；ready 图片的 intrinsic 高度会更新 Rust
 viewport 的 content height，随后把 scroll 移到 fixture 所在 block 之外并验证离屏 Metal texture
-淘汰。composition generation 变化会强制提交新的
+淘汰。snapshot 还会区分 image candidate、去重后的 request、visible/overscan 分布和退避 retry
+次数，便于确认重复 destination 没有重复排队。composition generation 变化会强制提交新的
 preedit glyph frame，cancel 会恢复 canonical glyph scene，surface 尺寸变化会推进 generation，
 结束前显式 detach。它不是产品可视化演示模式，也不切换生产 TextKit source mirror。
 

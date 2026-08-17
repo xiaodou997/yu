@@ -46,7 +46,7 @@ use yu_workspace::{
 #[cfg(target_os = "macos")]
 use yu_assets::{
     ImageCache, ImageFailureKind, ImageIntrinsicPublication, ImagePublication, ImageRequest,
-    ImageRequestResult,
+    ImageRequestCandidate, ImageRequestPlan, ImageRequestPriority, ImageRequestResult,
 };
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
@@ -740,6 +740,11 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub image_failure_count: u64,
     pub image_eviction_count: u64,
     pub image_atlas_eviction_count: u64,
+    pub image_candidate_count: u64,
+    pub image_duplicate_count: u64,
+    pub image_visible_candidate_count: u64,
+    pub image_overscan_candidate_count: u64,
+    pub image_retry_count: u64,
     pub submitted: u8,
 }
 
@@ -895,6 +900,11 @@ struct MacosImageResourceState {
     intrinsics: BTreeMap<u64, ImageIntrinsicPublication>,
     in_flight: HashSet<ImageKey>,
     visible_request_count: usize,
+    candidate_count: usize,
+    duplicate_count: usize,
+    visible_candidate_count: usize,
+    overscan_candidate_count: usize,
+    retry_count: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -922,16 +932,26 @@ impl MacosImageResourceState {
             intrinsics: BTreeMap::new(),
             in_flight: HashSet::new(),
             visible_request_count: 0,
+            candidate_count: 0,
+            duplicate_count: 0,
+            visible_candidate_count: 0,
+            overscan_candidate_count: 0,
+            retry_count: 0,
         })
     }
 
     fn sync(
         &mut self,
-        requests: Vec<ImageRequest>,
+        plan: ImageRequestPlan,
         revision: yu_core::Revision,
         document_path: PathBuf,
     ) -> Result<(), i32> {
-        self.visible_request_count = requests.len();
+        let stats = plan.stats();
+        self.visible_request_count = stats.unique_count();
+        self.candidate_count = stats.candidate_count();
+        self.duplicate_count = stats.duplicate_count();
+        self.visible_candidate_count = stats.visible_candidate_count();
+        self.overscan_candidate_count = stats.overscan_candidate_count();
         self.cache.advance_retry_clock();
         while let Some(result) = self
             .worker
@@ -961,7 +981,7 @@ impl MacosImageResourceState {
 
         self.publications.clear();
         self.intrinsics.clear();
-        for request in requests {
+        for request in plan.into_requests() {
             let request_for_metadata = request.clone();
             if self.in_flight.contains(request.key()) {
                 if let Some(intrinsic) = self.cache.intrinsic_publication(&request_for_metadata) {
@@ -970,7 +990,13 @@ impl MacosImageResourceState {
                 }
                 continue;
             }
-            match self.cache.request(request) {
+            let retry_candidate = self
+                .cache
+                .failure(request.key())
+                .is_some_and(|failure| failure.revision() == request_for_metadata.revision());
+            let result = self.cache.request(request);
+            let retry_scheduled = retry_candidate && matches!(&result, ImageRequestResult::Pending);
+            match result {
                 ImageRequestResult::Ready(publication) => {
                     let intrinsic = publication.intrinsic_publication();
                     self.publications
@@ -979,6 +1005,9 @@ impl MacosImageResourceState {
                         .insert(intrinsic.key().fingerprint(), intrinsic);
                 }
                 ImageRequestResult::Pending | ImageRequestResult::Failed(_) => {}
+            }
+            if retry_scheduled {
+                self.retry_count = self.retry_count.saturating_add(1);
             }
             if let Some(intrinsic) = self.cache.intrinsic_publication(&request_for_metadata) {
                 self.intrinsics
@@ -5010,8 +5039,8 @@ fn image_resource_key(
 #[cfg(target_os = "macos")]
 fn macos_image_requests(
     session: &mut YuStorageSession,
-    block_indices: &[usize],
-) -> Result<Vec<ImageRequest>, i32> {
+    block_indices: &[(usize, ImageRequestPriority)],
+) -> Result<ImageRequestPlan, i32> {
     let source = session.session.snapshot();
     let revision = session.session.revision();
     let definitions = session
@@ -5021,8 +5050,8 @@ fn macos_image_requests(
         .markdown()
         .reference_definitions()
         .clone();
-    let mut requests = Vec::new();
-    for &block_index in block_indices {
+    let mut candidates = Vec::new();
+    for &(block_index, priority) in block_indices {
         let projection = session
             .session
             .block_projection(block_index)
@@ -5031,13 +5060,12 @@ fn macos_image_requests(
             let Some(key) = image_resource_key(&source, image, &definitions) else {
                 continue;
             };
-            requests.push(
-                ImageRequest::new(revision, image.source(), key.destination().to_owned())
-                    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?,
-            );
+            let request = ImageRequest::new(revision, image.source(), key.destination().to_owned())
+                .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+            candidates.push(ImageRequestCandidate::new(request, block_index, priority));
         }
     }
-    Ok(requests)
+    Ok(ImageRequestPlan::from_candidates(candidates))
 }
 
 #[cfg(target_os = "macos")]
@@ -5302,7 +5330,7 @@ fn macos_render_host_frame(
             .map_err(|error| macos_render_host_error_status(&error))?;
     }
     let document_path = session.session.path().to_path_buf();
-    let visible_blocks = {
+    let viewport_blocks = {
         let state = session
             .macos_render_host
             .as_mut()
@@ -5310,10 +5338,10 @@ fn macos_render_host_frame(
         let document = session.session.document_mut().editor_mut();
         state
             .builder
-            .visible_block_indices(document)
+            .viewport_image_blocks(document)
             .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
     };
-    let image_requests = macos_image_requests(session, &visible_blocks)?;
+    let image_requests = macos_image_requests(session, &viewport_blocks)?;
     let state = session
         .macos_render_host
         .as_mut()
@@ -6208,6 +6236,11 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
         let image_failure_count = state.image_resources.cache.failure_count();
         let image_eviction_count = state.image_resources.cache.eviction_count();
         let image_request_count = state.image_resources.visible_request_count;
+        let image_candidate_count = state.image_resources.candidate_count;
+        let image_duplicate_count = state.image_resources.duplicate_count;
+        let image_visible_candidate_count = state.image_resources.visible_candidate_count;
+        let image_overscan_candidate_count = state.image_resources.overscan_candidate_count;
+        let image_retry_count = state.image_resources.retry_count;
         let surface_state = match state.surface.as_mut() {
             Some(surface) => surface,
             None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
@@ -6252,6 +6285,13 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 image_failure_count: u64::try_from(image_failure_count).unwrap_or(u64::MAX),
                 image_eviction_count,
                 image_atlas_eviction_count: surface_state.image_atlas.eviction_count(),
+                image_candidate_count: u64::try_from(image_candidate_count).unwrap_or(u64::MAX),
+                image_duplicate_count: u64::try_from(image_duplicate_count).unwrap_or(u64::MAX),
+                image_visible_candidate_count: u64::try_from(image_visible_candidate_count)
+                    .unwrap_or(u64::MAX),
+                image_overscan_candidate_count: u64::try_from(image_overscan_candidate_count)
+                    .unwrap_or(u64::MAX),
+                image_retry_count,
                 submitted: 1,
             };
         }

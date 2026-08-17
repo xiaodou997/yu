@@ -10,6 +10,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+yu-assets = { path = "../../crates/yu-assets" }
 yu-core = { path = "../../crates/yu-core" }
 yu-editor = { path = "../../crates/yu-editor" }
 yu-layout = { path = "../../crates/yu-layout" }

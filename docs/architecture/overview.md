@@ -682,4 +682,7 @@ pixels 被 LRU 淘汰，下一帧仍可用 metadata 重建 intrinsic placement �
 source 或 GPU 对象。失败请求使用显式的逻辑 frame clock 与有界指数退避，达到最大尝试次数后在
 当前 Revision 保持 fallback，进入新 Revision 才会重新允许排队。当前调度仍只收集 viewport/overscan
 block；`yu-image-scheduling-bench` 对 2,000/100,000 级图片集合比较 overscan 0/160/640px 的
-候选请求量，避免把完整文档扫描误当作预取。见 ADR 0141、0142、0143、0144、0145、0146、0147。
+候选请求量，避免把完整文档扫描误当作预取。调度现在先以 `ImageRequestPlan` 按 destination
+去重，再将 visible candidate 排在 overscan candidate 前；同优先级按 block index 稳定排序。
+macOS surface snapshot 同时报告原始候选、去重数、visible/overscan 分布和退避重试数，便于诊断
+“候选过多”“重复资源”与“重试过密”分别是哪一层造成的。见 ADR 0141、0142、0143、0144、0145、0146、0147、0148。

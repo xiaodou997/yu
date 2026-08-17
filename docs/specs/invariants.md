@@ -585,3 +585,7 @@
     resource fingerprint；离开集合的 GPU texture 与 identity 必须一起淘汰，`image_resource_count`
     不得继续统计离屏资源。atlas eviction 只能发生在 native command conversion 之前，不能让当前
     RenderPlan 引用已淘汰 texture；`image_atlas_eviction_count` 只记录成功提交边界前的累计淘汰次数。
+20. viewport/overscan image occurrence 必须先进入 `ImageRequestPlan`：同一 destination 在一个
+    batch 内只能保留一个 request，visible priority 必须排在 overscan priority 之前，同优先级按
+    block index 稳定排序。surface snapshot 的 candidate/duplicate/visible/overscan/retry 计数必须
+    来自同一个 plan/cache batch，不能把历史 publication 或 GPU resource 当作新 request。

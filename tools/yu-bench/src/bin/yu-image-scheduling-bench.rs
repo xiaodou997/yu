@@ -6,6 +6,7 @@ use std::env;
 use std::error::Error;
 use std::time::Instant;
 
+use yu_assets::{ImageRequest, ImageRequestCandidate, ImageRequestPlan, ImageRequestPriority};
 use yu_core::{ByteOffset, TextRange};
 use yu_editor::{EditorDocument, ImageIntrinsicSize, ViewportConfig, ViewportRect, VisualRunStyle};
 use yu_layout::{
@@ -107,6 +108,8 @@ fn run_case(
     let shaper = BenchShaper;
     let image_calls = Cell::new(0_usize);
     let measured_blocks = Cell::new(0_usize);
+    let scheduled_requests = Cell::new(0_usize);
+    let duplicate_candidates = Cell::new(0_usize);
     let start = Instant::now();
     let estimated_height = document.markdown().blocks().len() as f32 * 20.0;
     for iteration in 0..configuration.iterations {
@@ -124,15 +127,45 @@ fn run_case(
                 .get()
                 .saturating_add(snapshot.blocks().len()),
         );
+        let visible_top = scroll;
+        let visible_bottom = scroll + 480.0;
+        let plan = ImageRequestPlan::from_candidates(snapshot.blocks().iter().map(|block| {
+            let priority = if block.y() + block.height() > visible_top && block.y() < visible_bottom
+            {
+                ImageRequestPriority::Visible
+            } else {
+                ImageRequestPriority::Overscan
+            };
+            // Reuse a small destination set so the benchmark exercises the
+            // same-batch deduplication contract instead of only measuring
+            // unique-resource work.
+            let destination = format!("image-{}.png", block.index() % 4);
+            let request = ImageRequest::new(document.revision(), block.source(), destination)
+                .expect("benchmark image request");
+            ImageRequestCandidate::new(request, block.index(), priority)
+        }));
+        scheduled_requests.set(
+            scheduled_requests
+                .get()
+                .saturating_add(plan.stats().unique_count()),
+        );
+        duplicate_candidates.set(
+            duplicate_candidates
+                .get()
+                .saturating_add(plan.stats().duplicate_count()),
+        );
+        std::hint::black_box(plan);
         std::hint::black_box(snapshot);
     }
     let elapsed = start.elapsed();
     println!(
-        "overscan={overscan:.0}px blocks={} image-resolver-calls={} measured-blocks={} calls/iteration={:.1} elapsed={elapsed:?}",
+        "overscan={overscan:.0}px blocks={} image-resolver-calls={} measured-blocks={} calls/iteration={:.1} scheduled-requests={} duplicate-candidates={} elapsed={elapsed:?}",
         document.markdown().blocks().len(),
         image_calls.get(),
         measured_blocks.get(),
         image_calls.get() as f64 / configuration.iterations as f64,
+        scheduled_requests.get(),
+        duplicate_candidates.get(),
     );
     Ok(())
 }
