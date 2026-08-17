@@ -870,6 +870,15 @@ int32_t yu_storage_session_table_layout_cells(
     uint64_t block_index, float max_width, float line_height,
     float default_advance, YuStorageTableLayoutCell *output,
     size_t capacity, size_t *written);
+/* Returns one-call, session-only column geometry. The source and canonical
+ * layout remain unchanged; row resize is rejected until variable-row layout
+ * exists. */
+int32_t yu_storage_session_table_layout_cells_with_resize(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, float max_width, float line_height,
+    float default_advance, uint8_t resize_kind, uint64_t resize_index,
+    float resize_delta, YuStorageTableLayoutCell *output,
+    size_t capacity, size_t *written);
 int32_t yu_storage_session_table_cell_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, float max_width, float line_height,

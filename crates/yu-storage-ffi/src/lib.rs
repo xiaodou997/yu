@@ -1980,6 +1980,20 @@ fn table_layout_cell_metadata(
     })
 }
 
+fn table_layout_cells_metadata(
+    snapshot: &TextSnapshot,
+    revision: u64,
+    block_index: u64,
+    table: &yu_editor::TableLayoutSnapshot,
+) -> Result<Vec<YuStorageTableLayoutCell>, i32> {
+    table
+        .cells()
+        .iter()
+        .copied()
+        .map(|cell| table_layout_cell_metadata(snapshot, revision, block_index, cell))
+        .collect()
+}
+
 fn table_layout_hit_metadata(
     snapshot: &TextSnapshot,
     revision: u64,
@@ -4419,20 +4433,110 @@ pub unsafe extern "C" fn yu_storage_session_table_layout_cells(
         return YU_STORAGE_INVALID_SELECTION;
     };
     let snapshot = session.session.snapshot();
-    let encoded = match table
-        .cells()
-        .iter()
-        .copied()
-        .map(|cell| {
-            table_layout_cell_metadata(
-                &snapshot,
-                session.session.revision().get(),
-                u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-                cell,
-            )
-        })
-        .collect::<Result<Vec<_>, i32>>()
+    let block_index = match u64::try_from(block_index) {
+        Ok(block_index) => block_index,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let encoded = match table_layout_cells_metadata(
+        &snapshot,
+        session.session.revision().get(),
+        block_index,
+        table,
+    ) {
+        Ok(encoded) => encoded,
+        Err(status) => return status,
+    };
+    // SAFETY: `written` was checked above and belongs to the caller.
+    unsafe { *written = encoded.len() };
+    if encoded.is_empty() {
+        return YU_STORAGE_OK;
+    }
+    if capacity == 0 && output.is_null() {
+        return YU_STORAGE_OK;
+    }
+    if capacity < encoded.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: the caller supplied at least `encoded.len()` writable entries.
+    unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
+    YU_STORAGE_OK
+}
+
+/// Returns visible table cell geometry with a session-only column override.
+/// The override is applied to an owned transient layout snapshot for this
+/// call; it never changes Markdown source, selection, history or the
+/// editor-owned layout cache. Only `YU_STORAGE_TABLE_RESIZE_COLUMN` is
+/// supported in this first geometry bridge; row-height persistence remains a
+/// later variable-row layout concern.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable entries when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_layout_cells_with_resize(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block_index: u64,
+    max_width: f32,
+    line_height: f32,
+    default_advance: f32,
+    resize_kind: u8,
+    resize_index: u64,
+    resize_delta: f32,
+    output: *mut YuStorageTableLayoutCell,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` was checked above and belongs to the caller.
+    unsafe { *written = 0 };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    if resize_kind != YU_STORAGE_TABLE_RESIZE_COLUMN {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    let block_index = match usize::try_from(block_index) {
+        Ok(index) if index < session.session.block_count() => index,
+        _ => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let resize_index = match usize::try_from(resize_index) {
+        Ok(index) => index,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
+    let mut layout = match session.session.block_layout(block_index, config) {
+        Ok(layout) => layout,
+        Err(error) => return storage_status(error),
+    };
+    if layout
+        .apply_table_column_resize(resize_index, resize_delta)
+        .is_err()
     {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    let Some(table) = layout.table() else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let snapshot = session.session.snapshot();
+    let block_index = match u64::try_from(block_index) {
+        Ok(block_index) => block_index,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let encoded = match table_layout_cells_metadata(
+        &snapshot,
+        session.session.revision().get(),
+        block_index,
+        table,
+    ) {
         Ok(encoded) => encoded,
         Err(status) => return status,
     };
@@ -8149,6 +8253,94 @@ mod tests {
                 .all(|cell| cell.source_start_utf16 <= cell.source_end_utf16)
         );
 
+        let mut resized_layout_count = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_layout_cells_with_resize(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    YU_STORAGE_TABLE_RESIZE_COLUMN,
+                    0,
+                    1.0,
+                    ptr::null_mut(),
+                    0,
+                    &mut resized_layout_count,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(resized_layout_count, 4);
+        let mut resized_layout_cells =
+            vec![YuStorageTableLayoutCell::default(); resized_layout_count];
+        let mut written_resized_layout = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_layout_cells_with_resize(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    YU_STORAGE_TABLE_RESIZE_COLUMN,
+                    0,
+                    1.0,
+                    resized_layout_cells.as_mut_ptr(),
+                    resized_layout_cells.len(),
+                    &mut written_resized_layout,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written_resized_layout, 4);
+        assert_eq!(resized_layout_cells[0].width, 4.0);
+        assert_eq!(resized_layout_cells[1].x, 4.0);
+        assert_eq!(resized_layout_cells[1].width, 2.0);
+        assert_eq!(resized_layout_cells[2].x, 0.0);
+        assert_eq!(resized_layout_cells[3].x, 4.0);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_layout_cells_with_resize(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    YU_STORAGE_TABLE_RESIZE_ROW,
+                    0,
+                    1.0,
+                    ptr::null_mut(),
+                    0,
+                    &mut resized_layout_count,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_layout_cells_with_resize(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    YU_STORAGE_TABLE_RESIZE_COLUMN,
+                    0,
+                    f32::NAN,
+                    ptr::null_mut(),
+                    0,
+                    &mut resized_layout_count,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+
         let mut hit = YuStorageTableCellHit::default();
         assert_eq!(
             unsafe {
@@ -8314,6 +8506,25 @@ mod tests {
                     ptr::null_mut(),
                     0,
                     &mut layout_count,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_layout_cells_with_resize(
+                    raw,
+                    0,
+                    table_index as u64,
+                    20.0,
+                    2.0,
+                    1.0,
+                    YU_STORAGE_TABLE_RESIZE_COLUMN,
+                    0,
+                    1.0,
+                    ptr::null_mut(),
+                    0,
+                    &mut resized_layout_count,
                 )
             },
             YU_STORAGE_STALE_REVISION
