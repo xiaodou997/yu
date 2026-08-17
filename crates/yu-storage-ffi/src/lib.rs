@@ -25,7 +25,8 @@ use yu_editor::{
     CaretScrollRequest, CommandResult, EditorCommand, EditorDocumentError, EditorKey, ImageSource,
     KeyEvent, KeyModifiers, KeyRouteResult, LayoutConfig, LayoutPoint, LayoutSnapshot, Projection,
     ProjectionBias, SelectionError, SourceSync, TableAlignment, TableCellLayout, TableLayoutHit,
-    TableResizeHit, TableResizeTarget, ViewportConfig, ViewportRect, VisualOffset, VisualRunKind,
+    TableResizeCommit, TableResizeGesture, TableResizeGestureError, TableResizeHit,
+    TableResizeTarget, ViewportConfig, ViewportRect, VisualOffset, VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_markdown::TableCellRange;
@@ -85,6 +86,8 @@ pub const YU_STORAGE_HTML_IMPORT_REJECTED: i32 = 18;
 pub const YU_STORAGE_CORE_TEXT_UNAVAILABLE: i32 = 19;
 pub const YU_STORAGE_INVALID_VIEWPORT_CONFIG: i32 = 20;
 pub const YU_STORAGE_RENDER_HOST_UNAVAILABLE: i32 = 21;
+
+pub const YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE: i32 = 22;
 
 pub const YU_STORAGE_TABLE_ALIGNMENT_DEFAULT: u8 = 0;
 pub const YU_STORAGE_TABLE_ALIGNMENT_LEFT: u8 = 1;
@@ -474,6 +477,21 @@ pub struct YuStorageTableResizeHit {
     pub kind: u8,
     pub index: u64,
     pub position: f32,
+}
+
+/// Revision-bound, source-neutral table geometry produced by a native resize
+/// gesture. `final_position` and `delta` are updated for each pointer move;
+/// releasing the pointer returns the same shape as the committed candidate.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageTableResizeCommit {
+    pub revision: u64,
+    pub block_index: u64,
+    pub kind: u8,
+    pub index: u64,
+    pub initial_position: f32,
+    pub final_position: f32,
+    pub delta: f32,
 }
 
 /// Revision-bound layout metadata for one parser-owned block. `width` and
@@ -1138,6 +1156,8 @@ impl Drop for MacosPersistentSurfaceState {
 #[repr(C)]
 pub struct YuStorageSession {
     session: DocumentEditorSession,
+    table_resize_gesture: Option<TableResizeGesture>,
+    table_resize_override: Option<TableResizeCommit>,
     #[cfg(target_os = "macos")]
     macos_render_host: Option<MacosRenderHostState>,
 }
@@ -2039,6 +2059,54 @@ fn table_resize_hit_metadata(
     })
 }
 
+fn table_resize_commit_metadata(
+    commit: TableResizeCommit,
+) -> Result<YuStorageTableResizeCommit, i32> {
+    let (kind, index) = match commit.target() {
+        TableResizeTarget::Column { index } => (
+            YU_STORAGE_TABLE_RESIZE_COLUMN,
+            u64::try_from(index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        ),
+        TableResizeTarget::Row { index } => (
+            YU_STORAGE_TABLE_RESIZE_ROW,
+            u64::try_from(index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        ),
+    };
+    Ok(YuStorageTableResizeCommit {
+        revision: commit.revision().get(),
+        block_index: u64::try_from(commit.block_index())
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        kind,
+        index,
+        initial_position: commit.initial_position(),
+        final_position: commit.final_position(),
+        delta: commit.delta(),
+    })
+}
+
+fn begin_table_resize_session(
+    session: &mut YuStorageSession,
+    block_index: usize,
+    hit: TableResizeHit,
+    pointer_position: f32,
+) -> Result<YuStorageTableResizeHit, i32> {
+    if session.table_resize_gesture.is_some() {
+        return Err(YU_STORAGE_INVALID_STATE);
+    }
+    let gesture = TableResizeGesture::begin(
+        session.session.revision(),
+        block_index,
+        hit,
+        pointer_position,
+    )
+    .map_err(table_resize_gesture_status)?;
+    let block_index = u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let metadata = table_resize_hit_metadata(session.session.revision().get(), block_index, hit)?;
+    session.table_resize_override = Some(gesture.preview());
+    session.table_resize_gesture = Some(gesture);
+    Ok(metadata)
+}
+
 fn viewport_block_kind(kind: BlockKind) -> u8 {
     kind.viewport_tag()
 }
@@ -2359,6 +2427,25 @@ fn composition_active_visual_caret(
 
 fn validate_revision(session: &DocumentEditorSession, expected: u64) -> Result<(), i32> {
     if session.revision().get() != expected {
+        return Err(YU_STORAGE_STALE_REVISION);
+    }
+    Ok(())
+}
+
+fn table_resize_gesture_status(error: TableResizeGestureError) -> i32 {
+    match error {
+        TableResizeGestureError::StaleRevision { .. } => YU_STORAGE_STALE_REVISION,
+        TableResizeGestureError::NonFinitePointer(_) => YU_STORAGE_INVALID_SELECTION,
+    }
+}
+
+fn validate_table_resize_revision(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+) -> Result<(), i32> {
+    if session.session.revision().get() != expected_revision {
+        session.table_resize_gesture = None;
+        session.table_resize_override = None;
         return Err(YU_STORAGE_STALE_REVISION);
     }
     Ok(())
@@ -2871,6 +2958,8 @@ pub unsafe extern "C" fn yu_storage_session_open(
     };
     let session = Box::new(YuStorageSession {
         session,
+        table_resize_gesture: None,
+        table_resize_override: None,
         #[cfg(target_os = "macos")]
         macos_render_host: None,
     });
@@ -4680,6 +4769,240 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_hit_test(
     YU_STORAGE_OK
 }
 
+/// Starts one Revision-bound native table resize gesture. The hit result is
+/// copied to `output`, while the actual gesture remains Rust-owned on the
+/// session until update, finish or cancel. The initial preview is transient
+/// and does not mutate Markdown source or the canonical layout cache.
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_resize_begin(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block_index: u64,
+    max_width: f32,
+    line_height: f32,
+    default_advance: f32,
+    point_x: f32,
+    point_y: f32,
+    tolerance: f32,
+    pointer_position: f32,
+    output: *mut YuStorageTableResizeHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTableResizeHit::default() };
+    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
+        return status;
+    }
+    let block_index = match usize::try_from(block_index) {
+        Ok(index) if index < session.session.block_count() => index,
+        _ => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
+    let layout = match session.session.block_layout(block_index, config) {
+        Ok(layout) => layout,
+        Err(error) => return storage_status(error),
+    };
+    let Some(table) = layout.table() else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let hit = match table.resize_hit_test(LayoutPoint::new(point_x, point_y), tolerance) {
+        Ok(Some(hit)) => hit,
+        Ok(None) | Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let metadata = match begin_table_resize_session(session, block_index, hit, pointer_position) {
+        Ok(metadata) => metadata,
+        Err(status) => return status,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
+/// macOS/CoreText-shaped variant of table resize begin. The hit-test layout
+/// uses the same system shaper and font size as the retained render-host
+/// frame, so the divider captured by the gesture is in the same geometry
+/// space that scene/render-plan assembly will later consume.
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_table_resize_begin(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block_index: u64,
+    size: f32,
+    max_width: f32,
+    point_x: f32,
+    point_y: f32,
+    tolerance: f32,
+    pointer_position: f32,
+    output: *mut YuStorageTableResizeHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTableResizeHit::default() };
+    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
+        return status;
+    }
+    let block_index = match usize::try_from(block_index) {
+        Ok(index) if index < session.session.block_count() => index,
+        _ => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let (shaper, _metrics, config) = match core_text_system_ui_layout(size, max_width) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let layout = {
+        let document = session.session.document_mut().editor_mut();
+        match document.block_layout_with_shaper(block_index, config, &shaper) {
+            Ok(layout) => layout.clone(),
+            Err(error) => return status_from_editor_error(error),
+        }
+    };
+    let Some(table) = layout.table() else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let hit = match table.resize_hit_test(LayoutPoint::new(point_x, point_y), tolerance) {
+        Ok(Some(hit)) => hit,
+        Ok(None) | Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let metadata = match begin_table_resize_session(session, block_index, hit, pointer_position) {
+        Ok(metadata) => metadata,
+        Err(status) => return status,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
+/// Updates the Rust-owned table resize gesture and returns the transient
+/// geometry that the next render-host frame will consume.
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_resize_update(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    pointer_position: f32,
+    output: *mut YuStorageTableResizeCommit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTableResizeCommit::default() };
+    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
+        return status;
+    }
+    let revision = session.session.revision();
+    let Some(gesture) = session.table_resize_gesture.as_mut() else {
+        return YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE;
+    };
+    if let Err(error) = gesture.update(revision, pointer_position) {
+        session.table_resize_gesture = None;
+        session.table_resize_override = None;
+        return table_resize_gesture_status(error);
+    }
+    let commit = gesture.preview();
+    let metadata = match table_resize_commit_metadata(commit) {
+        Ok(metadata) => metadata,
+        Err(status) => return status,
+    };
+    session.table_resize_override = Some(commit);
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
+/// Finishes the current table resize gesture and keeps its final geometry as
+/// a session-only override for subsequent retained frames. No Markdown
+/// transaction is created by this function.
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_resize_finish(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    output: *mut YuStorageTableResizeCommit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTableResizeCommit::default() };
+    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
+        return status;
+    }
+    let revision = session.session.revision();
+    let Some(gesture) = session.table_resize_gesture.take() else {
+        return YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE;
+    };
+    let commit = match gesture.finish(revision) {
+        Ok(commit) => commit,
+        Err(error) => {
+            session.table_resize_override = None;
+            return table_resize_gesture_status(error);
+        }
+    };
+    let metadata = match table_resize_commit_metadata(commit) {
+        Ok(metadata) => metadata,
+        Err(status) => return status,
+    };
+    session.table_resize_override = Some(commit);
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
+/// Cancels a current table resize gesture and removes any session-only table
+/// geometry override. It is also safe to call after finish to clear the final
+/// preview; in that case the function returns `YU_STORAGE_OK`.
+///
+/// # Safety
+/// `session` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_resize_cancel(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
+        return status;
+    }
+    let Some(gesture) = session.table_resize_gesture.take() else {
+        session.table_resize_override = None;
+        return YU_STORAGE_OK;
+    };
+    session.table_resize_override = None;
+    gesture
+        .cancel(session.session.revision())
+        .map_or_else(table_resize_gesture_status, |_| YU_STORAGE_OK)
+}
+
 /// Returns revision-bound metrics layout metadata for one parser-owned block.
 /// The block remains owned by the Rust editor; only source ranges, visual
 /// length and measured scalar geometry cross the ABI.
@@ -5935,9 +6258,24 @@ fn macos_render_host_frame(
         return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
     }
 
+    let revision = session.session.revision();
+    let table_resize = match session.table_resize_override {
+        Some(commit) if commit.revision() == revision => {
+            if matches!(commit.target(), TableResizeTarget::Column { .. }) {
+                Some(commit)
+            } else {
+                None
+            }
+        }
+        Some(_) => {
+            session.table_resize_override = None;
+            None
+        }
+        None => None,
+    };
     let viewport = ViewportRect::new(scroll_y, viewport_height);
     let config = macos_render_host_config(viewport, size, max_width, viewport_height)?;
-    let revision = session.session.revision();
+    let config = table_resize.map_or(config, |commit| config.with_table_resize(commit));
     if session
         .macos_render_host
         .as_ref()
@@ -7775,6 +8113,8 @@ mod tests {
         let editor_session = DocumentEditorSession::open(&path).expect("open");
         let session = YuStorageSession {
             session: editor_session,
+            table_resize_gesture: None,
+            table_resize_override: None,
             #[cfg(target_os = "macos")]
             macos_render_host: None,
         };
@@ -8561,6 +8901,101 @@ mod tests {
                 )
             },
             YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_table_resize_gesture_lifecycle_is_revision_bound_and_source_neutral() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-table-gesture-{id}.md"));
+        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut hit = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_begin(
+                    raw, 0, 0, 20.0, 2.0, 1.0, 3.1, 0.5, 0.2, 3.1, &mut hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        assert_eq!(hit.index, 0);
+        assert_eq!(hit.position, 3.0);
+
+        let mut second_hit = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_begin(
+                    raw,
+                    0,
+                    0,
+                    20.0,
+                    2.0,
+                    1.0,
+                    3.1,
+                    0.5,
+                    0.2,
+                    3.1,
+                    &mut second_hit,
+                )
+            },
+            YU_STORAGE_INVALID_STATE
+        );
+        assert_eq!(second_hit, YuStorageTableResizeHit::default());
+
+        let mut preview = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_update(raw, 0, 4.1, &mut preview) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(preview.revision, 0);
+        assert_eq!(preview.block_index, 0);
+        assert_eq!(preview.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        assert_eq!(preview.index, 0);
+        assert_eq!(preview.initial_position, 3.0);
+        assert_eq!(preview.final_position, 4.0);
+        assert_eq!(preview.delta, 1.0);
+
+        let mut committed = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_finish(raw, 0, &mut committed) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(committed, preview);
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_update(raw, 0, 4.1, &mut preview) },
+            YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE
+        );
+        assert_eq!(preview, YuStorageTableResizeCommit::default());
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_cancel(raw, 0) },
+            YU_STORAGE_OK
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"x".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_finish(raw, 0, &mut committed) },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(committed, YuStorageTableResizeCommit::default());
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_cancel(raw, 1) },
+            YU_STORAGE_OK
         );
 
         unsafe { yu_storage_session_destroy(raw) };
@@ -10296,6 +10731,189 @@ mod tests {
         assert_eq!(config.scene_viewport().y(), 137.5);
         assert_eq!(config.scene_viewport().width(), 500.0);
         assert_eq!(config.scene_viewport().height(), 240.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_table_resize_preview_reaches_retained_render_host_frame() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-table-resize-{id}.md"));
+        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut first = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw, 0, 14.0, 500.0, 0.0, 240.0, 0, &mut first,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let state = unsafe { raw.as_ref() }.expect("session");
+        let divider = state
+            .macos_render_host
+            .as_ref()
+            .and_then(|host| host.builder.last_publication())
+            .and_then(|publication| {
+                publication
+                    .frame()
+                    .scene()
+                    .scene()
+                    .primitives()
+                    .iter()
+                    .filter_map(|primitive| match primitive {
+                        Primitive::Table(table)
+                            if table.role() == yu_scene::TablePrimitiveRole::Border
+                                && table.bounds().x() > 0.0
+                                && table.bounds().x() < 100.0 =>
+                        {
+                            Some(table.bounds().x())
+                        }
+                        _ => None,
+                    })
+                    .next()
+            })
+            .expect("CoreText table divider");
+        let point_y = metrics.line_height() * 0.5;
+        let mut hit = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_begin(
+                    raw,
+                    0,
+                    0,
+                    14.0,
+                    500.0,
+                    divider + 0.01,
+                    point_y,
+                    0.2,
+                    divider + 0.01,
+                    &mut hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut preview = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_update(raw, 0, divider + 1.01, &mut preview) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(preview.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        assert!((preview.final_position - (divider + 1.0)).abs() < 0.01);
+        let mut transient = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    &mut transient,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let state = unsafe { raw.as_ref() }.expect("session");
+        let publication = state
+            .macos_render_host
+            .as_ref()
+            .and_then(|host| host.builder.last_publication())
+            .expect("retained publication");
+        assert!(
+            publication
+                .frame()
+                .scene()
+                .scene()
+                .primitives()
+                .iter()
+                .any(|primitive| {
+                    matches!(
+                        primitive,
+                        Primitive::Table(table)
+                            if table.role() == yu_scene::TablePrimitiveRole::Border
+                                && (table.bounds().x() - (divider + 1.0)).abs() < 0.01
+                    )
+                })
+        );
+        assert_eq!(state.session.snapshot().as_str(), source);
+
+        let mut committed = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_finish(raw, 0, &mut committed) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(committed, preview);
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_cancel(raw, 0) },
+            YU_STORAGE_OK
+        );
+        let mut canonical_frame = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    &mut canonical_frame,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let state = unsafe { raw.as_ref() }.expect("session");
+        let publication = state
+            .macos_render_host
+            .as_ref()
+            .and_then(|host| host.builder.last_publication())
+            .expect("canonical publication");
+        assert!(
+            publication
+                .frame()
+                .scene()
+                .scene()
+                .primitives()
+                .iter()
+                .any(|primitive| {
+                    matches!(
+                        primitive,
+                        Primitive::Table(table)
+                            if table.role() == yu_scene::TablePrimitiveRole::Border
+                                && (table.bounds().x() - divider).abs() < 0.01
+                    )
+                })
+        );
+        assert_eq!(state.session.snapshot().as_str(), source);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
     }
 
     #[cfg(target_os = "macos")]

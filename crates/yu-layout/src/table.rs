@@ -263,14 +263,22 @@ impl TableResizeGesture {
     /// Completes the gesture and returns a source-neutral commit candidate.
     pub fn finish(self, revision: Revision) -> Result<TableResizeCommit, TableResizeGestureError> {
         self.ensure_revision(revision)?;
-        Ok(TableResizeCommit {
+        Ok(self.preview())
+    }
+
+    /// Returns the current source-neutral geometry candidate without ending
+    /// the gesture. Native hosts can use this for each pointer-move frame and
+    /// call [`Self::finish`] only when the pointer is released.
+    #[must_use]
+    pub fn preview(self) -> TableResizeCommit {
+        TableResizeCommit {
             revision: self.revision,
             block_index: self.block_index,
             target: self.target,
             initial_position: self.divider_position,
             final_position: self.proposed_position(),
             delta: self.delta(),
-        })
+        }
     }
 
     /// Cancels the gesture without producing a source mutation.

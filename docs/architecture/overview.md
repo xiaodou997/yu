@@ -542,6 +542,10 @@ macOS host 不需要复制 Markdown block traversal、HeightIndex 或 layout cac
 `TableResizeCommit`；workspace 在 image intrinsic 应用后对同一 block 的 transient layout 做
 column resize，再让 table decoration、cell glyph 和 `RenderPlan` 从同一 geometry 生成。配置不
 持有 source mirror，Revision 失配或 deferred row target 会在 scene assembly 前拒绝。
+macOS storage FFI 的 `table_resize_begin/update/finish/cancel` 把 pointer gesture 保存在
+`YuStorageSession`，而 CoreText-shaped begin 使用与 retained host 相同的 shaper/font size 捕获
+divider；因此 native host 不会用 metrics-only 坐标启动一个与最终 scene 错位的 drag。finish 只
+保留 session-only column preview，cancel 清除它，二者都不生成 Markdown transaction。
 层只消费 `ViewportSceneFrame`/`RenderPlan`。
 
 当前 document-host 诊断桥还提供 `yu_storage_session_macos_render_host_frame`。`YuStorageSession`

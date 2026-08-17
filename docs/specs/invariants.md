@@ -344,6 +344,11 @@
     使用同一 expected Revision/block，返回一次调用内的 owned cell geometry，不能把 override
     写入 session。row commit 在 variable-row layout contract 完成前必须拒绝，不得只改变 cell
     rectangle 而留下错误的 baseline、height index 或 scene border。
+    macOS storage FFI 的 `yu_storage_session_macos_table_resize_begin` 必须使用与 retained
+    CoreText frame 相同的 font size/shaper 捕获 divider；metrics-only begin 只能用于通用诊断，
+    不得被 native retained host 当作 shaped pointer geometry。session-owned preview 在每次
+    update 后进入下一帧，finish 保留最终 column preview，cancel 清除 preview；这些生命周期
+    API 都不得创建 Markdown transaction，且 stale update/finish 必须丢弃 gesture。
 9. 列表编辑命令只能对当前 parser 识别的 `ListItem`/`TaskListItem` 行生效；空项退出必须保留
    原有 line ending，Indent/Outdent 最多改动两个 ASCII 空格，selection 必须通过 ChangeSet 映射。
 10. `Projection::images()` 返回的 `ImageSource` 只能保存 parser-owned source/label/destination/
