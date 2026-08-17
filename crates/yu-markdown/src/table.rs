@@ -393,7 +393,16 @@ fn trimmed_cell(line_start: usize, line: &str, start: usize, end: usize) -> Tabl
     let value = &line[start..end];
     let left = value.len().saturating_sub(value.trim_start().len());
     let right = value.trim_end().len();
-    TableCellRange::new(line_start + start + left, line_start + start + right)
+    let trimmed_start = line_start + start + left;
+    let trimmed_end = line_start + start + right;
+    if trimmed_start <= trimmed_end {
+        TableCellRange::new(trimmed_start, trimmed_end)
+    } else {
+        // A whitespace-only cell has no source content. Keep a valid empty
+        // range at the start of the trimmed area so projection can hide all
+        // structural bytes without inventing cell text.
+        TableCellRange::new(trimmed_end, trimmed_end)
+    }
 }
 
 fn parse_alignment(source: &str, cell: TableCellRange) -> Option<TableAlignment> {
@@ -443,6 +452,13 @@ mod tests {
             .map(|range| &source[range.start()..range.end()])
             .collect::<Vec<_>>();
         assert_eq!(header, ["A", "`x|y`", "C\\|D"]);
+    }
+
+    #[test]
+    fn whitespace_only_cells_have_valid_empty_ranges() {
+        let table =
+            parse_table("| A | B |\r\n| --- | --- |\r\n|  | x |\r\n").expect("table should parse");
+        assert_eq!(table.rows()[0][0].start(), table.rows()[0][0].end());
     }
 
     #[test]

@@ -162,10 +162,11 @@ kind，但保留 bullet 与任务文本，避免在没有 list marker scene prim
 `BlockProjectionKind` 的稳定 FFI tag 因此能区分 inline、heading、blockquote、list、table、
 task 和 fenced code；GFM table 仍在 block kind 层报告为 `Paragraph`，但
 `parse_table_in_snapshot` 会为同一 source range 生成 source-backed `TableProjection`。
-它暴露 header、delimiter、body row 和 cell 的绝对 source byte ranges，当前 visual stream
-仍保留 header/body 的 source-backed inline runs，但 parser-owned delimiter physical row 已由
-`TableProjection` 隐藏。`yu-layout::TableLayoutSnapshot` 在同一 source range 上按 metrics 生成
-可见 cell 的列宽、行高和 bounds；delimiter 只作为 source range 保留，不生成可见 cell。macOS
+它暴露 header、delimiter、body row 和 cell 的绝对 source byte ranges。visual stream 只保留
+header/body cell 内容的 source-backed runs；pipe、cell 周围空白、每行 line ending 和
+parser-owned delimiter physical row 都是 zero-width hidden ranges。`yu-layout::TableLayoutSnapshot`
+在同一 source range 上按 metrics 生成可见 cell 的列宽、行高和 bounds；delimiter 只作为 source
+range 保留，不生成可见 cell。macOS
 FFI 通过 `yu_storage_session_projected_table_cells` 暴露 parser cell ranges，并通过
 `yu_storage_session_table_layout_cells` / `yu_storage_session_table_cell_hit_test` 暴露
 Revision-bound UTF-16 geometry 与 source-backed hit-test，Swift 不需要自行扫描 `|` 或复制文本。

@@ -312,12 +312,13 @@
 8a. GFM table 必须保持 `Paragraph` parser block kind，同时返回 source-backed `TableProjection`。
     header、delimiter、body rows 和 cells 只能保存 canonical Snapshot ranges；`TableProjection`
     的 strictly-outside edit 映射必须保持这些 ranges 与 visual projection 同一 Revision，cell
-    内容编辑则必须重新构建 projection。projection 负责隐藏 parser-owned delimiter physical
-    row；`TableLayoutSnapshot` 只能用这些 ranges 和外部 metrics 生成可见 cell geometry，不能
-    复制 cell 文本或把 delimiter 伪造成第二份 document model。native hit-test 必须返回同一
-    Revision 的 source range。`yu-scene::TablePrimitive` 只能保存这些 range、geometry、role
-    和 color，不得保存 cell 文本；scene/render 可以把 role 降级为 solid fill，但不能改变
-    source Revision 或让 native consumer 重新解析表格。
+    内容编辑则必须重新构建 projection。projection 只能保留 header/body cell 内容的
+    source-backed visual runs；pipe、cell 周围空白、row line ending 和 parser-owned delimiter
+    physical row 必须是 zero-width hidden ranges。`TableLayoutSnapshot` 只能用这些 ranges 和
+    外部 metrics 生成可见 cell geometry，不能复制 cell 文本或把 delimiter 伪造成第二份 document
+    model。native hit-test 必须返回同一 Revision 的 source range。`yu-scene::TablePrimitive` 只能
+    保存这些 range、geometry、role 和 color，不得保存 cell 文本；scene/render 可以把 role 降级为
+    solid fill，但不能改变 source Revision 或让 native consumer 重新解析表格。
 9. 列表编辑命令只能对当前 parser 识别的 `ListItem`/`TaskListItem` 行生效；空项退出必须保留
    原有 line ending，Indent/Outdent 最多改动两个 ASCII 空格，selection 必须通过 ChangeSet 映射。
 10. `Projection::images()` 返回的 `ImageSource` 只能保存 parser-owned source/label/destination/
