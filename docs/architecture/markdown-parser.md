@@ -159,8 +159,13 @@ heading 与 blockquote 的结构前缀不再由 projection consumer 自行识别
 `block_syntax_hidden_ranges` 返回 ATX marker、分隔空白和每个 blockquote 行的 `>` 前缀范围，
 projection 使用这些 ranges 建立 `Heading`/`BlockQuote` kind。普通 `ListItem` 返回 `List`
 kind，但保留 bullet 与任务文本，避免在没有 list marker scene primitive 时丢失可编辑 source。
-`BlockProjectionKind` 的稳定 FFI tag 因此能区分 inline、heading、blockquote、list、task 和
-fenced code；GFM table 仍由 `parse_table` 独立识别，尚未改变 block kind。
+`BlockProjectionKind` 的稳定 FFI tag 因此能区分 inline、heading、blockquote、list、table、
+task 和 fenced code；GFM table 仍在 block kind 层报告为 `Paragraph`，但
+`parse_table_in_snapshot` 会为同一 source range 生成 source-backed `TableProjection`。
+它暴露 header、delimiter、body row 和 cell 的绝对 source byte ranges，当前 visual stream
+仍是 inline projection；后续 table layout 才会把 delimiter 转为网格/边框语义。macOS FFI
+通过 `yu_storage_session_projected_table_cells` 将这些 ranges 转成 Revision-bound UTF-16
+count/fill 数据，Swift 不需要自行扫描 `|`。
 
 definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
 offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地

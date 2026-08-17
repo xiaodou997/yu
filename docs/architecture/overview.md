@@ -309,8 +309,10 @@ heading、blockquote 和普通 list 现在也由 parser 统一标记为 `Heading
 projection kind。heading 的 ATX 前缀与 blockquote 每行的 `>` 前缀由
 `yu_markdown::block_syntax_hidden_ranges` 提供 source-backed hidden ranges；Swift 不扫描这些
 delimiter。列表 bullet 与任务文本继续可见，后续 layout/scene 可用稳定 `BlockKind` metadata
-绘制真正的列表 marker。table 仍暂时保留为 paragraph/inline projection，待 table layout ABI
-定义后再独立升级。
+绘制真正的列表 marker。table 在 block kind 层仍保留为 paragraph，但已经有独立的
+source-backed `TableProjection` 与 stable projection tag；header、delimiter、body row 和
+cell ranges 通过 Rust/FFI 暴露，待 table layout ABI 定义后再把 delimiter 转为 visual table
+overlay。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和

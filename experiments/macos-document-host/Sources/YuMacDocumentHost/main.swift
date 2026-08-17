@@ -1501,6 +1501,40 @@ private final class StorageBridge {
         )
     }
 
+    func projectedTableCells(
+        revision: UInt64,
+        blockIndex: UInt64
+    ) throws -> [YuStorageTableCellRange] {
+        var required = 0
+        let sizeStatus = yu_storage_session_projected_table_cells(
+            handle,
+            revision,
+            blockIndex,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var cells = Array(repeating: YuStorageTableCellRange(), count: required)
+        var written = required
+        let copyStatus = cells.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_projected_table_cells(
+                handle,
+                revision,
+                blockIndex,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard copyStatus == StorageStatus.ok, written >= 0, written <= cells.count else {
+            throw BridgeError.operation(copyStatus)
+        }
+        return Array(cells.prefix(written))
+    }
+
     func blockLayout(
         revision: UInt64,
         blockIndex: UInt64,
@@ -6510,6 +6544,30 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
         precondition(visualTexts.allSatisfy { !$0.contains("> 引用块") })
         precondition(visualTexts.allSatisfy { !$0.contains("**粗体**") })
         precondition(visualTexts.allSatisfy { !$0.contains("[链接](https://example.com)") })
+
+        var tableIndex: Int?
+        for index in 0..<count {
+            let (block, _) = try bridge.projectedBlock(
+                revision: revision,
+                blockIndex: UInt64(index)
+            )
+            if block.projectionKind == 7 {
+                tableIndex = index
+                break
+            }
+        }
+        if let tableIndex {
+            let cells = try bridge.projectedTableCells(
+                revision: revision,
+                blockIndex: UInt64(tableIndex)
+            )
+            precondition(cells.count == 6, "table cell count mismatch")
+            precondition(cells.map(\.row) == [0, 0, 1, 1, 2, 2])
+            precondition(cells.map(\.column) == [0, 1, 0, 1, 0, 1])
+            precondition(cells.allSatisfy { $0.source_start_utf16 <= $0.source_end_utf16 })
+        } else {
+            preconditionFailure("table projection missing")
+        }
 
         do {
             _ = try bridge.projectedBlock(revision: revision, blockIndex: UInt64(count))

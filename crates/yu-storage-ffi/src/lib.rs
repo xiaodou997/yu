@@ -17,7 +17,7 @@ use std::ptr;
 use std::collections::{BTreeMap, HashSet};
 
 use yu_assets::ImageKey;
-use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
+use yu_core::{ByteOffset, LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
@@ -28,6 +28,7 @@ use yu_editor::{
     VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
+use yu_markdown::TableCellRange;
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, DiskState, DocumentEditorSession, ExternalFileState,
     SaveOutcome, StorageError, Utf8Bom,
@@ -138,6 +139,7 @@ pub const YU_STORAGE_PROJECTION_TASK_LIST: u8 = 3;
 pub const YU_STORAGE_PROJECTION_HEADING: u8 = 4;
 pub const YU_STORAGE_PROJECTION_BLOCK_QUOTE: u8 = 5;
 pub const YU_STORAGE_PROJECTION_LIST: u8 = 6;
+pub const YU_STORAGE_PROJECTION_TABLE: u8 = 7;
 
 pub const YU_STORAGE_DISK_UNCHANGED: u8 = 0;
 pub const YU_STORAGE_DISK_CHANGED: u8 = 1;
@@ -400,6 +402,18 @@ pub struct YuStorageProjectionBlock {
     pub visual_utf16_length: u64,
     pub kind: u8,
     pub projection_kind: u8,
+}
+
+/// One parser-owned GFM table cell range. `row = 0` is the header, `row = 1`
+/// is the delimiter row, and body rows start at `row = 2`. All offsets are
+/// UTF-16 positions in the revision supplied to the query.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageTableCellRange {
+    pub row: u64,
+    pub column: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
 }
 
 /// Revision-bound layout metadata for one parser-owned block. `width` and
@@ -1800,10 +1814,67 @@ fn projection_kind_tag(projection: &BlockProjection) -> u8 {
         BlockProjectionKind::Heading => YU_STORAGE_PROJECTION_HEADING,
         BlockProjectionKind::BlockQuote => YU_STORAGE_PROJECTION_BLOCK_QUOTE,
         BlockProjectionKind::List => YU_STORAGE_PROJECTION_LIST,
+        BlockProjectionKind::Table => YU_STORAGE_PROJECTION_TABLE,
         BlockProjectionKind::FencedCode => YU_STORAGE_PROJECTION_FENCED_CODE,
         BlockProjectionKind::ReferenceDefinition => YU_STORAGE_PROJECTION_REFERENCE_DEFINITION,
         BlockProjectionKind::TaskList => YU_STORAGE_PROJECTION_TASK_LIST,
     }
+}
+
+fn table_cell_metadata(
+    snapshot: &TextSnapshot,
+    row: usize,
+    column: usize,
+    cell: TableCellRange,
+) -> Result<YuStorageTableCellRange, i32> {
+    let start = ByteOffset::try_from(cell.start()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let end = ByteOffset::try_from(cell.end()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    let source_start_utf16 = snapshot
+        .utf16_offset(start)
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    let source_end_utf16 = snapshot
+        .utf16_offset(end)
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .get();
+    Ok(YuStorageTableCellRange {
+        row: u64::try_from(row).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        column: u64::try_from(column).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        source_start_utf16,
+        source_end_utf16,
+    })
+}
+
+fn table_cell_ranges(
+    snapshot: &TextSnapshot,
+    projection: &BlockProjection,
+) -> Result<Vec<YuStorageTableCellRange>, i32> {
+    let BlockProjection::Table(table) = projection else {
+        return Err(YU_STORAGE_INVALID_SELECTION);
+    };
+    let metadata = table.table();
+    let capacity = metadata
+        .header()
+        .len()
+        .saturating_mul(metadata.rows().len().saturating_add(2));
+    let mut encoded = Vec::with_capacity(capacity);
+    for (column, cell) in metadata.header().iter().copied().enumerate() {
+        encoded.push(table_cell_metadata(snapshot, 0, column, cell)?);
+    }
+    for (column, cell) in metadata.delimiter().iter().copied().enumerate() {
+        encoded.push(table_cell_metadata(snapshot, 1, column, cell)?);
+    }
+    for (body_index, row) in metadata.rows().iter().enumerate() {
+        for (column, cell) in row.iter().copied().enumerate() {
+            encoded.push(table_cell_metadata(
+                snapshot,
+                body_index.saturating_add(2),
+                column,
+                cell,
+            )?);
+        }
+    }
+    Ok(encoded)
 }
 
 fn viewport_block_kind(kind: BlockKind) -> u8 {
@@ -4091,6 +4162,65 @@ pub unsafe extern "C" fn yu_storage_session_projected_block(
         };
     }
     write_bytes(projected.as_bytes(), output, capacity, written)
+}
+
+/// Returns parser-owned GFM table cell ranges for one projected block.
+///
+/// The count/fill convention mirrors the other native array queries: callers
+/// may pass a null output with zero capacity to learn the required cell count.
+/// `row = 0` is the header, `row = 1` is the delimiter row, and body rows start
+/// at `row = 2`. Cell text is never copied across the ABI.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable entries when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_projected_table_cells(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block_index: u64,
+    output: *mut YuStorageTableCellRange,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let block_index = match usize::try_from(block_index) {
+        Ok(index) => index,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let projection = match session.session.block_projection(block_index) {
+        Ok(projection) => projection,
+        Err(error) => return storage_status(error),
+    };
+    let encoded = match table_cell_ranges(&session.session.snapshot(), &projection) {
+        Ok(encoded) => encoded,
+        Err(status) => return status,
+    };
+    // SAFETY: `written` is checked above and belongs to the caller.
+    unsafe { *written = encoded.len() };
+    if encoded.is_empty() {
+        return YU_STORAGE_OK;
+    }
+    if capacity == 0 && output.is_null() {
+        return YU_STORAGE_OK;
+    }
+    if capacity < encoded.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: the caller supplied at least `encoded.len()` writable entries.
+    unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
+    YU_STORAGE_OK
 }
 
 /// Returns revision-bound metrics layout metadata for one parser-owned block.
@@ -7469,7 +7599,7 @@ mod tests {
     fn ffi_block_projection_is_revision_bound_and_parser_owned() {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-block-projection-{id}.md"));
-        let source = "# 标题\n\n段落 **粗体** 和 [链接](https://example.com)。\n\n- [ ] 任务\n\n> 引用\n\n1. 有序\n\n```rust\nfn main() {}\n```\n";
+        let source = "# 标题\n\n段落 **粗体** 和 [链接](https://example.com)。\n\n- [ ] 任务\n\n> 引用\n\n1. 有序\n\n| A | B |\n| --- | :---: |\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n";
         fs::write(&path, source).expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
         let mut raw = ptr::null_mut();
@@ -7547,6 +7677,7 @@ mod tests {
         assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_LIST));
         assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_TASK_LIST));
         assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_FENCED_CODE));
+        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_TABLE));
         assert!(projected_blocks.iter().any(|text| text.contains("粗体")));
         assert!(projected_blocks.iter().any(|text| text.contains("链接")));
         assert!(projected_blocks.iter().any(|text| text.contains("任务")));
@@ -7560,6 +7691,50 @@ mod tests {
             projected_blocks
                 .iter()
                 .all(|text| !text.contains("[链接](https://example.com)"))
+        );
+
+        let table_index = seen_projection_kinds
+            .iter()
+            .position(|kind| *kind == YU_STORAGE_PROJECTION_TABLE)
+            .expect("table projection should be present");
+        let mut table_count = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projected_table_cells(
+                    raw,
+                    0,
+                    table_index as u64,
+                    ptr::null_mut(),
+                    0,
+                    &mut table_count,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(table_count, 6);
+        let mut cells = vec![YuStorageTableCellRange::default(); table_count];
+        let mut written_cells = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projected_table_cells(
+                    raw,
+                    0,
+                    table_index as u64,
+                    cells.as_mut_ptr(),
+                    cells.len(),
+                    &mut written_cells,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written_cells, 6);
+        assert_eq!(
+            cells.iter().map(|cell| cell.row).collect::<Vec<_>>(),
+            [0, 0, 1, 1, 2, 2]
+        );
+        assert_eq!(
+            cells.iter().map(|cell| cell.column).collect::<Vec<_>>(),
+            [0, 1, 0, 1, 0, 1]
         );
 
         let mut metadata = YuStorageProjectionBlock::default();
@@ -7597,6 +7772,19 @@ mod tests {
                     ptr::null_mut(),
                     0,
                     &mut written,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projected_table_cells(
+                    raw,
+                    0,
+                    table_index as u64,
+                    ptr::null_mut(),
+                    0,
+                    &mut table_count,
                 )
             },
             YU_STORAGE_STALE_REVISION
