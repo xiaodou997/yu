@@ -796,9 +796,9 @@ impl LayoutSnapshot {
     ) -> Result<Self, LayoutError> {
         let mut layout = Self::from_projection_with_metrics(projection.visual(), config, metrics)?;
         if let BlockProjection::Table(table) = projection {
-            layout.table = Some(TableLayoutSnapshot::from_projection(
-                table, config, metrics,
-            )?);
+            let table_layout = TableLayoutSnapshot::from_projection(table, config, metrics)?;
+            layout.apply_table_geometry(&table_layout)?;
+            layout.table = Some(table_layout);
         }
         Ok(layout)
     }
@@ -816,9 +816,10 @@ impl LayoutSnapshot {
     ) -> Result<Self, LayoutError> {
         let mut layout = Self::from_projection_with_shaper(projection.visual(), config, shaper)?;
         if let BlockProjection::Table(table) = projection {
-            layout.table = Some(TableLayoutSnapshot::from_projection_with_shaper(
-                table, config, shaper,
-            )?);
+            let table_layout =
+                TableLayoutSnapshot::from_projection_with_shaper(table, config, shaper)?;
+            layout.apply_table_geometry(&table_layout)?;
+            layout.table = Some(table_layout);
         }
         Ok(layout)
     }
@@ -1072,7 +1073,14 @@ impl LayoutSnapshot {
         visual: VisualOffset,
         bias: ProjectionBias,
     ) -> Result<LayoutCaret, LayoutError> {
-        let source = self.projection.visual_to_source(visual, bias)?;
+        let source = match self
+            .table
+            .as_ref()
+            .and_then(|table| table.source_for_visual_hit(&self.projection, visual, bias))
+        {
+            Some(source) => source,
+            None => self.projection.visual_to_source(visual, bias)?,
+        };
         let (line, point) = self.point_for_visual(visual, bias)?;
         Ok(LayoutCaret {
             source,
@@ -1157,7 +1165,14 @@ impl LayoutSnapshot {
             }
         }
 
-        let source = self.projection.visual_to_source(visual, bias)?;
+        let source = match self
+            .table
+            .as_ref()
+            .and_then(|table| table.source_for_visual_hit(&self.projection, visual, bias))
+        {
+            Some(source) => source,
+            None => self.projection.visual_to_source(visual, bias)?,
+        };
         Ok(LayoutHit {
             source,
             visual,
@@ -1593,6 +1608,155 @@ impl LayoutSnapshot {
         Ok(())
     }
 
+    /// Replaces the temporary linear text coordinates produced by the generic
+    /// projection pass with the retained GFM table grid. The projection still
+    /// owns every source/visual range; this method only changes layout x/y and
+    /// line membership so scene glyphs, caret queries and hit-testing agree
+    /// with the table cell geometry.
+    fn apply_table_geometry(&mut self, table: &TableLayoutSnapshot) -> Result<(), LayoutError> {
+        if table.revision() != self.revision() {
+            return Err(LayoutError::InvalidTable(
+                "table and text layout revisions differ",
+            ));
+        }
+        let original_clusters = self.clusters.clone();
+        let mut targets = vec![None; self.clusters.len()];
+        for cell in table.cells().iter().copied() {
+            let mut x = cell.content_x();
+            for (index, cluster) in original_clusters.iter().copied().enumerate() {
+                if cluster.is_line_break()
+                    || !source_range_contains(cell.source(), cluster.source())
+                {
+                    continue;
+                }
+                if targets[index].is_some() {
+                    return Err(LayoutError::InvalidTable(
+                        "a visual cluster belongs to multiple table cells",
+                    ));
+                }
+                targets[index] = Some((cell.row(), cluster.x(), x));
+                self.clusters[index] = VisualCluster {
+                    source: cluster.source,
+                    visual: cluster.visual,
+                    line: cell.row(),
+                    x,
+                    width: cluster.width,
+                    style: cluster.style,
+                    line_break: false,
+                };
+                x += cluster.width;
+            }
+        }
+        if self
+            .clusters
+            .iter()
+            .zip(targets.iter())
+            .any(|(cluster, target)| !cluster.is_line_break() && target.is_none())
+        {
+            return Err(LayoutError::InvalidTable(
+                "a table visual cluster has no source cell",
+            ));
+        }
+
+        let mut used_clusters = vec![false; self.clusters.len()];
+        for (glyph_index, original_glyph) in self.glyphs.clone().into_iter().enumerate() {
+            let Some((index, (_, target))) = self
+                .clusters
+                .iter()
+                .copied()
+                .zip(targets.iter().copied())
+                .enumerate()
+                .find(|(index, (cluster, target))| {
+                    !used_clusters[*index]
+                        && target.is_some()
+                        && cluster.source() == original_glyph.source
+                        && cluster.visual() == original_glyph.visual
+                })
+            else {
+                return Err(LayoutError::InvalidTable(
+                    "a shaped table glyph has no visual cluster",
+                ));
+            };
+            let (row, old_cluster_x, new_cluster_x) = target.expect("target checked above");
+            used_clusters[index] = true;
+            let old_baseline = self.baseline_for_line(original_glyph.line)?;
+            let y_offset = original_glyph.y - old_baseline;
+            let x_offset = original_glyph.x - old_cluster_x;
+            if !x_offset.is_finite() || !y_offset.is_finite() {
+                return Err(LayoutError::InvalidPoint);
+            }
+            let new_baseline = self.baseline_for_line(row)?;
+            let glyph = &mut self.glyphs[glyph_index];
+            glyph.x = new_cluster_x + x_offset;
+            glyph.y = new_baseline + y_offset;
+            glyph.line = row;
+        }
+
+        for image in &mut self.images {
+            let Some(cell) = table
+                .cells()
+                .iter()
+                .copied()
+                .find(|cell| source_range_contains(cell.source(), image.source))
+            else {
+                continue;
+            };
+            let available = (cell.bounds().x() + cell.bounds().width() - cell.content_x()).max(1.0);
+            let width = image.bounds.width().min(available).max(1.0);
+            image.line = cell.row();
+            image.bounds = LayoutRect::new(
+                cell.content_x(),
+                cell.bounds().y(),
+                width,
+                image.bounds.height().min(cell.bounds().height()),
+            )?;
+        }
+
+        let mut lines = Vec::with_capacity(table.row_sources().len());
+        let mut cluster_start = 0;
+        for (row, source) in table.row_sources().iter().copied().enumerate() {
+            let start = cluster_start;
+            if cluster_start < self.clusters.len() && self.clusters[cluster_start].line() < row {
+                return Err(LayoutError::InvalidTable(
+                    "table cluster lines are not ordered",
+                ));
+            }
+            while cluster_start < self.clusters.len() && self.clusters[cluster_start].line() == row
+            {
+                cluster_start += 1;
+            }
+            let mut row_cells = table
+                .cells()
+                .iter()
+                .copied()
+                .filter(|cell| cell.row() == row);
+            let first = row_cells
+                .clone()
+                .next()
+                .ok_or(LayoutError::InvalidTable("table row has no cells"))?;
+            let last = row_cells
+                .next_back()
+                .ok_or(LayoutError::InvalidTable("table row has no cells"))?;
+            let visual = VisualRange::new(first.visual().start(), last.visual().end())
+                .ok_or(LayoutError::OffsetOverflow)?;
+            lines.push(VisualLine {
+                index: row,
+                source,
+                visual,
+                y: first.bounds().y(),
+                width: table.bounds().width(),
+                clusters: start..cluster_start,
+            });
+        }
+        if cluster_start != self.clusters.len() {
+            return Err(LayoutError::InvalidTable(
+                "table cluster lines exceed table rows",
+            ));
+        }
+        self.lines = lines;
+        Ok(())
+    }
+
     fn push_line(&mut self, draft: LineDraft) -> Result<(), LayoutError> {
         let source = TextRange::new(draft.source_start, draft.source_end)
             .ok_or(LayoutError::OffsetOverflow)?;
@@ -1685,6 +1849,10 @@ impl LayoutSnapshot {
             })
             .unwrap_or(line.visual().start())
     }
+}
+
+fn source_range_contains(outer: TextRange, inner: TextRange) -> bool {
+    outer.start() <= inner.start() && inner.end() <= outer.end()
 }
 
 fn map_source_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, LayoutError> {
@@ -2257,6 +2425,87 @@ mod tests {
             .collect::<Result<String, _>>()
             .expect("table visual text");
         assert!(!visual.contains("---"));
+    }
+
+    #[test]
+    fn shaped_table_glyphs_follow_source_cells_and_visual_rows() {
+        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table block");
+        let projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+        )
+        .expect("table projection");
+        let layout = LayoutSnapshot::from_block_projection_with_shaper(
+            &projection,
+            LayoutConfig::new(20.0, 2.0),
+            &TestShaper {
+                shape: TestShape::FixedGrapheme(1.0),
+            },
+        )
+        .expect("shaped table layout");
+
+        assert_eq!(layout.lines().len(), 2);
+        assert_eq!(layout.lines()[0].width(), 6.0);
+        assert_eq!(layout.lines()[1].width(), 6.0);
+        assert_eq!(layout.glyphs().len(), 4);
+        assert_eq!(
+            layout
+                .glyphs()
+                .iter()
+                .map(|glyph| (glyph.x(), glyph.y(), glyph.line()))
+                .collect::<Vec<_>>(),
+            vec![(1.0, 2.0, 0), (4.0, 2.0, 0), (1.0, 4.0, 1), (4.0, 4.0, 1)]
+        );
+
+        let first_cell = layout.table().expect("table metadata").cells()[0];
+        assert_eq!(first_cell.visual().start().get(), 0);
+        assert_eq!(first_cell.visual().end().get(), 1);
+        assert_eq!(first_cell.content_x(), 1.0);
+        let body_hit = layout
+            .hit_test(LayoutPoint::new(4.1, 2.5))
+            .expect("table hit-test");
+        assert_eq!(body_hit.line(), 1);
+        assert_eq!(
+            body_hit.source(),
+            ByteOffset::new(source.rfind('2').expect("body 2") as u64)
+        );
+    }
+
+    #[test]
+    fn table_hit_test_keeps_interior_cell_source_boundaries() {
+        let source = "| AB | CD |\n| --- | --- |\n| 12 | 34 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table block");
+        let projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+        )
+        .expect("table projection");
+        let layout = LayoutSnapshot::from_block_projection_with_shaper(
+            &projection,
+            LayoutConfig::new(40.0, 2.0),
+            &TestShaper {
+                shape: TestShape::FixedGrapheme(1.0),
+            },
+        )
+        .expect("shaped table layout");
+
+        let interior_hit = layout
+            .hit_test(LayoutPoint::new(2.1, 0.5))
+            .expect("interior table hit-test");
+        assert_eq!(
+            interior_hit.source(),
+            ByteOffset::new(source.find('B').expect("cell B") as u64)
+        );
+        assert_eq!(interior_hit.line(), 0);
     }
 
     #[test]
