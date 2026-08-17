@@ -480,8 +480,8 @@
 26. `MacosVisualDecorationView` 只能保存当前 Revision 的 owned selection/caret rectangles，必须
     对 AppKit hit-test 返回 `nil`，不得拥有 source、selection、IME 或 Accessibility state。它位于
     Metal surface 之上、source TextKit mirror 之外；正常路径必须消费 Rust/CoreText-shaped
-    document-space geometry，active composition、geometry 失效、surface detach、窗口离开或
-    native submit 失败时必须清空并恢复 TextKit 的自绘装饰。
+    document-space geometry，包括 composition-aware transient layout；geometry 失效、surface
+    detach、窗口离开或 native submit 失败时必须清空并恢复 TextKit 的自绘装饰。
 27. `yu_storage_session_macos_composition_projection_hit_test` 必须同时验证 expected Revision 与
     composition generation，并使用 composition-aware transient block layout 加完整 transient
     projection 返回命中结果；输出的 block index、document-space point、source/visual UTF-16、
@@ -490,8 +490,9 @@
 28. `yu_storage_session_macos_visual_decorations` 的 count/fill 两次调用都必须验证 expected
     Revision 与 composition generation；header、caret、selection rectangle 的 Revision 必须一致，
     capacity 不足不得部分写入。矩形和 caret 是 Rust layout 的 document-space owned scalar，Swift
-    只能应用 header 的 scroll transform；active composition 返回 `YU_STORAGE_NO_OVERLAY`，不得把
-    transient preedit 当作普通 selection decoration。
+    只能应用 header 的 scroll transform；active composition 必须使用 transient block layout 和
+    preedit visual selection，不能把 canonical source selection 当作 preedit geometry。Rust 查询
+    失败时 native host 才可进入 generation-bound TextKit fallback。
 29. visual pointer 的反向拖选不得把 ordered source range 当作完整 selection state；必须通过
     `yu_storage_session_selection_endpoints` 读取 Rust anchor/focus，并通过
     `yu_storage_session_set_selection_endpoints` 写回同一 Revision 的方向。AppKit/TextKit 可以只
@@ -500,8 +501,10 @@
     composition generation 和完整 submit geometry，且 `MacosVisualDecorationView` 持有同一
     Revision 的有效 Rust-shaped frame 时，才可以隐藏 source glyph/insertion-point 绘制。
     submit geometry 必须覆盖字体大小、内容宽度、scroll origin、viewport/surface 尺寸和 backing
-    scale；编辑、滚动、resize、DPI/字体变化、active composition、stale publication、surface
-    detach、native submit 失败或 decoration 失效都必须恢复 TextKit 绘制。该门控只能影响绘制，
+    scale；编辑、滚动、resize、DPI/字体变化、composition generation 失配、stale publication、
+    surface detach、native submit 失败或 decoration 失效都必须恢复 TextKit 绘制。active
+    composition 在 Rust transient glyph/decoration/publication 同时有效时可以保持 Rust 绘制。
+    该门控只能影响绘制，
     不得替换 TextKit 的 string、selection、NSTextInputClient、IME、clipboard 或 Accessibility
     ownership。
 

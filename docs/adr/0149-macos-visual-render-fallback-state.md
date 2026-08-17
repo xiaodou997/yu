@@ -22,7 +22,9 @@ generation、尚未提交的新几何与真正的 surface submit 失败。
    `surfaceSubmitFailed`、`visualMirrorUnavailable` 等。满足全部条件时才进入 active 状态。
 3. active 状态绑定 `revision`、`compositionGeneration`、`surfaceGeneration` 和 `frameSerial`。
    只有相同 submit frame 同时被 surface coordinator 接受、decoration sibling 持有有效 caret
-   frame 且没有 active composition 时，`DocumentTextView` 才隐藏 source glyph。
+   frame 时，`DocumentTextView` 才隐藏 source glyph；active composition 也必须使用同一
+   generation 的 transient Rust glyph/decoration，不能以 TextKit projected overlay 伪造 active
+   frame。
 4. 状态机只改变绘制门控和诊断；TextKit 仍然是输入、IME、复制粘贴、Accessibility 以及失败
    回退宿主。状态变化不得复制或改写 canonical Markdown。
 5. Swift host 提供无窗口 `--visual-render-state-self-check`，验证重复 fallback 不制造虚假

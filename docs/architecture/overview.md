@@ -156,8 +156,9 @@ TextKit source glyph 才会被隐藏；任何失配立即回到 native 绘制。
 
 Rust surface 与 decoration sibling 现在还遵循成对可见性门控：只有 decoration 确认来自同一
 Rust/CoreText-shaped frame 时才允许显示 surface；TextKit visual mirror 生成的 fallback
-decoration 不会隐藏 source glyph，也不会让旧 Metal frame 留在 source mirror 下方。这样
-composition、stale geometry、resize 和 submit 失败都回到完整 TextKit source 绘制。见 ADR 0150。
+decoration 不会隐藏 source glyph，也不会让旧 Metal frame 留在 source mirror 下方。这样 stale
+geometry、resize 和 submit 失败都回到完整 TextKit source 绘制；active composition 在 Rust
+transient geometry 可用时也可以保持 Rust surface/decoration 成对发布。见 ADR 0150、0153。
 
 `DocumentTextView` 的绘制责任进一步收敛为三个显式 presentation role：`sourceFallback` 恢复
 完整 canonical source 的 TextKit 绘制，`projectedTextKitOverlay` 只用于受控的 composition/视觉
@@ -165,10 +166,10 @@ composition、stale geometry、resize 和 submit 失败都回到完整 TextKit s
 caret 或 selection 像素。role 切换会一起更新 selection paint attributes，避免旧的 projected
 样式跨帧残留。见 ADR 0151。
 
-当前 production host 已进一步限制 `projectedTextKitOverlay` 只能服务 active composition。
-普通 stale Revision、不可用 geometry、surface 尚未提交或 Rust decoration 查询失败都会清除
-旧 overlay 并回到 `sourceFallback`；只有同一 Revision 的 Rust surface 与 decoration 再次成对
-有效后才恢复 `rustSurface`。见 ADR 0152。
+当前 production host 已进一步限制 `projectedTextKitOverlay` 只能服务 active composition 的
+失败回退。正常 active composition 由同一 Revision/generation 的 Rust transient glyph、caret
+和 selection geometry 进入 `rustSurface`；普通 stale Revision、不可用 geometry、surface 尚未
+提交或 Rust decoration 查询失败都会清除旧 overlay 并回到 `sourceFallback`。见 ADR 0152、0153。
 
 `EditorHistory` 只保存有界 inverse Transaction，不保存完整 Snapshot。连续输入、删除和列表命令
 按 group 聚合；Undo 逆序回放、Redo 正序回放，并将每个 entry 的 base Revision 重绑定到当前
@@ -550,17 +551,17 @@ Metal bridge 在提交边界统一减去该原点得到 surface-local 坐标。v
 通过 Revision + composition generation 校验的 Rust/CoreText-shaped geometry FFI；选择矩形和
 caret 是 document-space owned scalar，Swift 只应用当前 scroll origin，不复制 source、selection、
 IME、HeightIndex 或 Accessibility state。TextKit 在 decoration frame 有效时停止自绘
-selection/caret；active composition、frame stale、surface detach 或 native submit 失败时立即清空
-overlay 并恢复 TextKit 自绘。TextKit visual mirror 现在只作为上述失败/组合输入 fallback，完整
-visual renderer 仍未迁移。见 ADR 0136、0137。
+selection/caret；Rust composition geometry 失效、frame stale、surface detach 或 native submit
+失败时立即清空 overlay 并恢复 TextKit 自绘。TextKit visual mirror 现在只作为显式失败回退，
+完整 visual renderer 仍未迁移。见 ADR 0136、0137、0153。
 
 在该 sibling 与 persistent Metal surface 均稳定后，`DocumentTextView` 还使用一个更窄的
 source-glyph gate：只有当前 Revision、composition generation、字体/宽度、scroll origin、
 viewport/surface 尺寸和 backing scale 全部与最后一次成功 submit 相同，且 decoration frame
 有效时，才停止 TextKit source glyph 和 insertion point 的绘制。TextKit 仍保留 string、
-selection、NSTextInputClient、IME、复制粘贴和 Accessibility 所有权；编辑、active marked
-text、滚动或 resize 期间先继续显示 native source mirror，直到新的 Rust publication 到达
-surface。stale、detach 或 submit 失败会立即清除门控并恢复 TextKit 绘制，因此这一步是主视觉
+selection、NSTextInputClient、IME、复制粘贴和 Accessibility 所有权；编辑、composition
+generation 变化、滚动或 resize 期间先继续显示 native source mirror，直到新的 Rust publication
+到达 surface。stale、detach 或 submit 失败会立即清除门控并恢复 TextKit 绘制，因此这一步是主视觉
 层验证，不是完整 visual renderer 迁移。见 ADR 0139。
 
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前

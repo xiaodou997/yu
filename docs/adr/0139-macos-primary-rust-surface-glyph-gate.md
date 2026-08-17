@@ -22,9 +22,10 @@ text 更新变成不可恢复的空白状态。
 2. 当前 geometry 包含字体大小、内容宽度、scroll origin、viewport 尺寸、surface 尺寸和
    backing scale。滚动、resize、DPI、字体或内容变化产生的新 key 尚未提交时，旧 surface
    不足以触发隐藏。
-3. 编辑、active composition、stale publication、surface detach、native submit 失败或
-   decoration 失效都会立即恢复 TextKit 绘制。TextKit 的 string、selection、IME、clipboard
-   和 Accessibility 状态不被复制或替换。
+3. 编辑、composition generation 失配、stale publication、surface detach、native submit 失败
+   或 decoration 失效都会立即恢复 TextKit 绘制；active composition 在 Rust transient glyph
+   和 decoration 同一 generation 成功发布时可以继续使用 Rust surface。TextKit 的 string、
+   selection、IME、clipboard 和 Accessibility 状态不被复制或替换。
 4. Rust surface 和 decoration sibling 仍然 `hitTest == nil`；输入、命中后的 source
    selection、VoiceOver 语义和所有 canonical state 继续由 Rust session + TextKit native
    bridge 管理。

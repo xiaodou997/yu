@@ -17,7 +17,8 @@ decoration 可能同时参与绘制，既难诊断，也不能把 TextKit 明确
    查询；TextKit visual mirror 产生的 decoration 永远不能打开 source-glyph gate。
 2. 只有以下条件全部满足时，产品窗口才同时显示 Rust surface、Rust decoration，并隐藏 TextKit
    source glyph：surface publication、decoration frame、Revision、composition generation 和
-   submit geometry 全部匹配，且没有 active composition。
+   submit geometry 全部匹配。active composition 也可以满足该条件，但其 glyph/caret/selection
+   必须全部来自同一 generation 的 transient Rust layout（见 ADR 0153）。
 3. 任一条件失配时，surface 与 source-glyph gate 成对关闭；TextKit source mirror 恢复绘制，
    visual decoration 仍可作为输入/IME 的暂态 fallback，但不能与旧 Rust glyph surface 叠加。
 4. `MacosSurfaceHostCoordinator` 的 Rust 资源、canonical source、selection 和 IME 契约不变；
@@ -27,8 +28,8 @@ decoration 可能同时参与绘制，既难诊断，也不能把 TextKit 明确
 
 - Rust glyph 与 Rust-shaped caret/selection 不再跨来源混合；旧 surface 不会在回退时留在 source
   mirror 下方。
-- active composition、stale geometry、surface submit 失败会完整回到 TextKit，而不是显示一半
-  Rust、一半 native 的不一致帧。
+- stale geometry、surface submit 失败会完整回到 TextKit，而不是显示一半 Rust、一半 native 的
+  不一致帧；composition generation 失配也遵循同一回退规则。
 - 当前仍保留 TextKit visual mirror 的输入/IME/Accessibility 和失败回退职责；完整 visual
   renderer 迁移仍是后续工作。
 

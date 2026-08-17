@@ -20,11 +20,12 @@ shaped layout 坐标。
   decoration sibling 的 viewport-local y，不复制 HeightIndex、换行或 Markdown projection。
 - count 与 fill 每次都验证 expected Revision、expected composition generation；Revision 或
   generation 变化时清空输出并拒绝调用，容量不足时不得部分写入矩形数组。
-- active composition 返回 `YU_STORAGE_NO_OVERLAY`。marked text 仍由 `DocumentTextView` 的
-  TextKit 输入/IME fallback 绘制，直到另有 composition-aware decoration 协议；这避免把暂态
-  preedit 误当成 canonical selection。
+- active composition 现在使用 composition-aware transient block layout 返回 generation-bound
+  caret/selection；只有该查询失败时才返回到 `DocumentTextView` 的 TextKit 输入/IME fallback。
+  preedit 仍不被当作 canonical source selection。详见 ADR 0153。
 - Swift 只在 caret、header、矩形都通过 revision/有限值检查时关闭 TextKit 自绘；CoreText 不可用、
-  block 不在 viewport、surface 尚未布局、stale 或 composition active 都恢复现有 TextKit fallback。
+  block 不在 viewport、surface 尚未布局或 stale 时恢复现有 TextKit fallback。composition active
+  只在 Rust transient geometry 不可用时回退。
 
 ## 结果
 

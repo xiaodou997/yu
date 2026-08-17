@@ -35,7 +35,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 生产 visual view 启用点击/拖选 visual boundary→Rust source selection，以及 source→visual caret 映射
 - [x] 生产 visual view 的 projected selection highlight 与同一 Revision 的 shaped caret reveal
 - [x] 产品窗口接入独立 visual decoration sibling，负责 selection/caret 绘制并在 stale/detach 时回退 TextKit
-- [x] decoration sibling 改用 Rust/CoreText-shaped document-space count/fill geometry；active composition、stale 与不可见 caret 保留 TextKit fallback
+- [x] decoration sibling 改用 Rust/CoreText-shaped document-space count/fill geometry；active composition 使用 generation-bound transient Rust layout，查询失败时保留 TextKit fallback
 - [x] 生产 Up/Down/Shift-Up/Shift-Down 使用当前 CoreText metrics/shaper 的 Revision-bound command
 - [x] 生产 pointer adapter 使用同一 CoreText-shaped Rust block layout 命中 visual boundary；TextKit 只保留输入/IME/AX/矩形回退
 - [x] visual pointer 正向/反向拖选通过 Rust endpoint ABI 保留 anchor/focus 方向，继续拖动和 Shift-click 不丢失 selection 语义
@@ -65,6 +65,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] Rust surface 与 Rust-shaped decoration 成对控制可见性；TextKit fallback 不再与旧 Rust glyph surface 叠加
 - [x] `DocumentTextView` 以 source fallback、projected TextKit overlay、Rust surface 三种显式 presentation role 管理绘制责任
 - [x] projected TextKit overlay 限制在 active composition；普通 stale/geometry/surface 失败直接回到 canonical source fallback
+- [x] active composition 的 Rust surface 与 Rust decoration 共用 transient block layout、caret/selection geometry 和 composition generation；TextKit overlay 仅作为失败回退
 - [x] fenced code block 的 Revision-bound `FillRect` 背景进入 Scene/RenderPlan/Metal solid pipeline，并保持 fill-before-glyph painter order
 - [x] `yu-projection::ImageSource` 保留 inline/reference image 的 source/label/destination ranges，并随 strictly-outside edit 映射
 - [x] `yu-assets::ImageCache` 建立可轮询异步解码队列、destination 去重、RGBA8 校验和 Revision-bound CPU publication

@@ -4537,9 +4537,9 @@ type MacosVisualDecorations = (
 /// Builds the Rust/CoreText-shaped selection and caret geometry used by the
 /// native decoration sibling. The returned rectangles are document-space;
 /// the caller owns the final scroll-to-viewport transform. Active marked text
-/// deliberately returns `NO_OVERLAY`: composition geometry remains on the
-/// transient TextKit fallback until a composition-aware decoration protocol
-/// is introduced.
+/// uses the same uncached composition projection and viewport layout as the
+/// Rust surface, so its transient caret/selection remains generation-bound and
+/// does not require a second TextKit paint path.
 #[cfg(target_os = "macos")]
 fn macos_visual_decorations(
     session: &mut YuStorageSession,
@@ -4553,9 +4553,6 @@ fn macos_visual_decorations(
     validate_revision(&session.session, expected_revision)?;
     if session.session.composition_generation() != expected_generation {
         return Err(YU_STORAGE_STALE_COMPOSITION);
-    }
-    if session.session.composition().is_some() {
-        return Err(YU_STORAGE_NO_OVERLAY);
     }
     if !size.is_finite()
         || size <= 0.0
@@ -4579,12 +4576,30 @@ fn macos_visual_decorations(
     }
 
     let viewport = ViewportRect::new(scroll_y, viewport_height);
+    let composition = session.session.composition().map(|overlay| {
+        (
+            overlay.replacement_range().start(),
+            overlay.selection_utf16().start().get(),
+            overlay.selection_utf16().end().get(),
+        )
+    });
+    let composition_blocks = session
+        .session
+        .document()
+        .editor()
+        .composition_block_range();
     let (selection, viewport_snapshot) = {
         let document = session.session.document_mut().editor_mut();
         let selection = document.selection();
-        let viewport_snapshot = document
-            .visible_blocks_with_shaper(viewport, &shaper)
-            .map_err(status_from_editor_error)?;
+        let viewport_snapshot = if composition.is_some() {
+            document
+                .visible_blocks_with_composition_and_shaper(viewport, &shaper)
+                .map_err(status_from_editor_error)?
+        } else {
+            document
+                .visible_blocks_with_shaper(viewport, &shaper)
+                .map_err(status_from_editor_error)?
+        };
         (selection, viewport_snapshot)
     };
     if viewport_snapshot.revision().get() != expected_revision {
@@ -4595,11 +4610,24 @@ fn macos_visual_decorations(
         revision: expected_revision,
         ..YuStorageMacosVisualDecorationCaret::default()
     };
-    let focus_block = session
-        .session
-        .document_mut()
-        .editor()
-        .block_index_for_source(selection.focus());
+    let focus_block = if let Some((replacement_start, _, _)) = composition {
+        composition_blocks
+            .as_ref()
+            .map(|span| span.start)
+            .or_else(|| {
+                session
+                    .session
+                    .document()
+                    .editor()
+                    .block_index_for_source(replacement_start)
+            })
+    } else {
+        session
+            .session
+            .document()
+            .editor()
+            .block_index_for_source(selection.focus())
+    };
     let mut rectangles = Vec::new();
     let selection_range = selection.ordered_range();
     let document = session.session.document_mut().editor_mut();
@@ -4608,19 +4636,42 @@ fn macos_visual_decorations(
         let block_index = block.index();
         let block_index_u64 =
             u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-        let layout = document
-            .block_layout_with_shaper(block_index, configured, &shaper)
-            .map_err(status_from_editor_error)?
-            .clone();
+        let layout = if composition_blocks
+            .as_ref()
+            .is_some_and(|span| span.contains(&block_index))
+        {
+            document
+                .block_layout_with_composition_and_shaper(block_index, configured, &shaper)
+                .map_err(status_from_editor_error)?
+        } else {
+            document
+                .block_layout_with_shaper(block_index, configured, &shaper)
+                .map_err(status_from_editor_error)?
+                .clone()
+        };
         if layout.revision().get() != expected_revision {
             return Err(YU_STORAGE_STALE_REVISION);
         }
 
         if focus_block == Some(block_index) {
-            let bias = projection_bias_from_affinity(selection.affinity());
-            let layout_caret = layout
-                .caret_for_source(selection.focus(), bias)
-                .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+            let (layout_caret, affinity) = if let Some((_, start_utf16, end_utf16)) = composition {
+                let (visual, bias) =
+                    composition_active_visual_caret(layout.projection(), start_utf16, end_utf16)?;
+                (
+                    layout
+                        .caret_for_visual(visual, bias)
+                        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            } else {
+                let bias = projection_bias_from_affinity(selection.affinity());
+                (
+                    layout
+                        .caret_for_source(selection.focus(), bias)
+                        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+                    affinity_to_ffi(selection.affinity()),
+                )
+            };
             let point = layout_caret.point();
             if !point.x().is_finite() || !point.y().is_finite() {
                 return Err(YU_STORAGE_EDITOR_ERROR);
@@ -4634,7 +4685,7 @@ fn macos_visual_decorations(
                 y: block.y() + point.y(),
                 width: 1.0,
                 height: metrics.line_height(),
-                affinity: affinity_to_ffi(selection.affinity()),
+                affinity,
                 present: 1,
             };
             if !caret.y.is_finite() {
@@ -4642,23 +4693,32 @@ fn macos_visual_decorations(
             }
         }
 
-        if selection.is_empty() {
-            continue;
-        }
-        let block_source = block.source();
-        let start = selection_range.start().max(block_source.start());
-        let end = selection_range.end().min(block_source.end());
-        if start >= end {
-            continue;
-        }
-        let visual_start = layout
-            .projection()
-            .source_to_visual(start, ProjectionBias::Before)
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-        let visual_end = layout
-            .projection()
-            .source_to_visual(end, ProjectionBias::After)
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+        let (visual_start, visual_end) = if composition.is_some() {
+            let Some(visual_selection) = layout.projection().composition_selection_visual() else {
+                continue;
+            };
+            (visual_selection.start(), visual_selection.end())
+        } else {
+            if selection.is_empty() {
+                continue;
+            }
+            let block_source = block.source();
+            let start = selection_range.start().max(block_source.start());
+            let end = selection_range.end().min(block_source.end());
+            if start >= end {
+                continue;
+            }
+            (
+                layout
+                    .projection()
+                    .source_to_visual(start, ProjectionBias::Before)
+                    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+                layout
+                    .projection()
+                    .source_to_visual(end, ProjectionBias::After)
+                    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+            )
+        };
         if visual_start >= visual_end {
             continue;
         }
@@ -8505,12 +8565,34 @@ mod tests {
                     end_utf16,
                     "日".as_ptr(),
                     "日".len(),
-                    1,
+                    0,
                     1,
                 )
             },
             YU_STORAGE_OK
         );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_decorations(
+                    raw,
+                    0,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    &mut caret,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+        assert_eq!(snapshot, YuStorageMacosVisualDecorationSnapshot::default());
+        assert_eq!(caret, YuStorageMacosVisualDecorationCaret::default());
+        assert_eq!(required, 0);
         assert_eq!(
             unsafe {
                 yu_storage_session_macos_visual_decorations(
@@ -8528,11 +8610,44 @@ mod tests {
                     &mut required,
                 )
             },
-            YU_STORAGE_NO_OVERLAY
+            YU_STORAGE_OK
         );
-        assert_eq!(snapshot, YuStorageMacosVisualDecorationSnapshot::default());
-        assert_eq!(caret, YuStorageMacosVisualDecorationCaret::default());
-        assert_eq!(required, 0);
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.composition_generation, 1);
+        assert_eq!(snapshot.selection_count, required as u64);
+        assert!(required > 0);
+        assert_eq!(snapshot.caret_present, 1);
+        assert_eq!(caret.present, 1);
+        assert!(caret.x.is_finite() && caret.y.is_finite());
+        let mut composition_rects = vec![YuStorageMacosVisualDecorationRect::default(); required];
+        let mut composition_written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_decorations(
+                    raw,
+                    0,
+                    1,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    &mut caret,
+                    composition_rects.as_mut_ptr(),
+                    composition_rects.len(),
+                    &mut composition_written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(composition_written, required);
+        assert!(composition_rects.iter().all(|rect| {
+            rect.revision == 0
+                && rect.width > 0.0
+                && rect.height > 0.0
+                && rect.x.is_finite()
+                && rect.y.is_finite()
+        }));
         assert_eq!(
             unsafe { yu_storage_session_cancel_composition(raw, 0, 1) },
             YU_STORAGE_OK
