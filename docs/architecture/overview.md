@@ -314,7 +314,10 @@ source-backed `TableProjection` 与 stable projection tag；header、delimiter�
 cell ranges 通过 Rust/FFI 暴露。`TableProjection` 隐藏 parser-owned delimiter physical row，
 `TableLayoutSnapshot` 再按 metrics 生成可见 header/body cell 的列宽、行高和 bounds；新的
 `yu_storage_session_table_layout_cells` 与 `yu_storage_session_table_cell_hit_test` 只传递
-Revision-bound geometry 和 source ranges，后续 scene 才负责绘制边框与 selection overlay。
+Revision-bound geometry 和 source ranges。`yu-scene::TablePrimitive` 现在生成 source-backed
+header fill、selection fill 和 border geometry，`yu-render` 暂时把这些角色映射为现有
+solid-fill command；完整生产 visual table overlay 仍需等 projection 不再显示 Markdown pipe
+文本后再接入窗口。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和

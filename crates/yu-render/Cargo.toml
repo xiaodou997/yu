@@ -15,6 +15,7 @@ yu-scene = { path = "../yu-scene" }
 
 [dev-dependencies]
 yu-layout = { path = "../yu-layout" }
+yu-markdown = { path = "../yu-markdown" }
 yu-projection = { path = "../yu-projection" }
 yu-text = { path = "../yu-text" }
 

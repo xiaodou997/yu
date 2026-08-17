@@ -51,6 +51,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 ## Track C：Scene and rendering
 
 - [x] Rust `ViewportSceneInput`/`SceneBuilder` 生成 Revision-bound 最小 owned scene snapshot，macOS host 以 count/fill 自检 primitive 顺序、来源范围、坐标和 stale 丢弃（诊断桥，尚未替换生产 renderer）
+- [x] `yu-scene` 消费 `TableLayoutSnapshot` 生成 source-backed header/selection/border `TablePrimitive`，并由 `yu-render` 以 solid-fill command 保持 painter order（诊断 scene，生产 visual table overlay 尚未切换）
 - [x] Rust 使用 CoreText glyph rasterization、CPU `GlyphAtlas` 与 `yu_workspace::assemble_viewport_render_frame` 生成 Revision-bound RenderPlan；macOS host 以 count/fill 自检 glyph command、atlas page fingerprint、damage 和 stale 丢弃（诊断桥，尚未接入生产窗口）
 - [x] `yu-render-macos` 新增持久 `CoreTextViewportFrameBuilder`，重复 Revision 重用 CPU atlas/RenderPlan fingerprint；ignored AppKit probe 使用真实 CoreText publication 进入 `MetalAtlas`/retained target（生产窗口仍未切换）
 - [x] persistent macOS host 通过 count/fill ABI 暴露 Revision-bound retained glyph primitives（含 atlas placement、metrics、bounds 与 source block range；生产 view 仍未切换）

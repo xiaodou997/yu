@@ -227,6 +227,16 @@ impl RenderPlanBuilder {
                         fallback: image.fallback(),
                     });
                 }
+                Primitive::Table(table) => {
+                    // Table roles remain available in the retained scene for
+                    // native selection/accessibility consumers. The current
+                    // backend-neutral renderer uses the existing solid-fill
+                    // command until a dedicated table pipeline is needed.
+                    commands.push(RenderCommand::FillRect {
+                        bounds: table.bounds(),
+                        color: table.color(),
+                    });
+                }
             }
         }
 
@@ -291,8 +301,8 @@ mod tests {
     use yu_layout::{LayoutConfig, LayoutSnapshot};
     use yu_projection::Projection;
     use yu_scene::{
-        GlyphPrimitive, ImagePrimitive, SceneBuilder, SceneError, ViewportBlockGeometry,
-        ViewportSceneInput,
+        GlyphPrimitive, ImagePrimitive, Point, SceneBuilder, SceneError, TablePrimitiveRole,
+        TableSceneStyle, ViewportBlockGeometry, ViewportSceneInput,
     };
     use yu_text::TextBuffer;
 
@@ -603,6 +613,59 @@ mod tests {
     }
 
     #[test]
+    fn table_scene_primitives_become_solid_fill_commands_without_losing_scene_roles() {
+        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table block");
+        let projection = yu_projection::BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+        )
+        .expect("table projection");
+        let layout =
+            LayoutSnapshot::from_block_projection(&projection, LayoutConfig::new(20.0, 2.0))
+                .expect("table layout");
+        let table = layout.table().expect("table layout");
+        let selected = table.cells()[2].source();
+        let style = TableSceneStyle::new(
+            1.0,
+            Rgba8::new(150, 155, 165, 255),
+            Some(Rgba8::new(235, 238, 244, 255)),
+            Some(Rgba8::new(210, 225, 255, 255)),
+        );
+        let mut builder = SceneBuilder::new(
+            layout.revision(),
+            Rect::new(0.0, 0.0, 40.0, 20.0).expect("viewport"),
+        )
+        .expect("scene");
+        builder
+            .append_table_with_selection(table, Point::new(3.0, 4.0), style, Some(selected))
+            .expect("table scene");
+        let scene = builder.finish();
+        assert!(scene.primitives().iter().any(|primitive| matches!(
+            primitive,
+            yu_scene::Primitive::Table(table)
+                if table.role() == TablePrimitiveRole::SelectionFill
+        )));
+        let mut plans = RenderPlanBuilder::new();
+        let plan = plans
+            .build(
+                &scene,
+                &GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("atlas")),
+            )
+            .expect("table render plan");
+        assert_eq!(plan.commands().len(), scene.primitives().len());
+        assert!(
+            plan.commands()
+                .iter()
+                .all(|command| matches!(command, RenderCommand::FillRect { .. }))
+        );
+    }
+
+    #[test]
     fn viewport_block_layout_is_translated_to_document_space_atomically() {
         let font_size = 14.0;
         let layout = shaped_layout(font_size);
@@ -630,7 +693,7 @@ mod tests {
                 assert_eq!(glyph.origin().x(), layout.glyphs()[0].x());
                 assert_eq!(glyph.origin().y(), layout.glyphs()[0].y() + 40.0);
             }
-            Primitive::FillRect { .. } | Primitive::Image(_) => {
+            Primitive::FillRect { .. } | Primitive::Image(_) | Primitive::Table(_) => {
                 panic!("expected glyph primitive")
             }
         }
@@ -731,7 +794,7 @@ mod tests {
             .iter()
             .map(|primitive| match primitive {
                 Primitive::Glyph(glyph) => glyph.origin(),
-                Primitive::FillRect { .. } | Primitive::Image(_) => {
+                Primitive::FillRect { .. } | Primitive::Image(_) | Primitive::Table(_) => {
                     panic!("expected glyph primitive")
                 }
             })

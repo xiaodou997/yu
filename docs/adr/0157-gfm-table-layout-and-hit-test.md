@@ -21,13 +21,15 @@
 4. `yu_storage_session_table_layout_cells` 使用 count/fill ABI 返回 Revision-bound UTF-16
    source range、bounds 和 alignment；`yu_storage_session_table_cell_hit_test` 返回同一
    Revision 的命中 cell。过期 Revision、非 table block 和 table 外点都必须拒绝。
-5. 该阶段只定义 layout/diagnostic contract；边框、hover、selection overlay 和完整 table
-   scene 仍由后续 renderer/scene 阶段消费这些 geometry。
+5. `yu-scene::TablePrimitive` 消费同一 `TableLayoutSnapshot` 生成 source-backed header fill、
+   selection fill 和 border geometry；`yu-render` 当前把这些 semantic roles 映射成现有
+   solid-fill command。该阶段仍不切换生产窗口的 visual table overlay。
 
 ## 结果
 
 - native host 不需要扫描 `|`、解析 delimiter 或复制 cell 文本。
 - table layout 可以在严格外部编辑后映射 source ranges，同时复用不变的几何；table 内容
   变化则由 projection/layout cache 重新构建。
-- Rust 单元测试、storage FFI 回归和 macOS block self-check 共同验证 delimiter 隐藏、四个
-  可见 cell、列/行几何、center alignment、hit-test 以及 stale Revision 行为。
+- Rust 单元测试、storage FFI 回归、scene/render 回归和 macOS block self-check 共同验证
+  delimiter 隐藏、四个可见 cell、列/行几何、center alignment、hit-test、semantic table
+  primitive 和 stale Revision 行为。
