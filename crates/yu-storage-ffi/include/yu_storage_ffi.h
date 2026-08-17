@@ -27,6 +27,7 @@ enum {
     YU_STORAGE_CORE_TEXT_UNAVAILABLE = 19,
     YU_STORAGE_INVALID_VIEWPORT_CONFIG = 20,
     YU_STORAGE_RENDER_HOST_UNAVAILABLE = 21,
+    YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE = 22,
 };
 
 enum {
@@ -397,6 +398,18 @@ typedef struct YuStorageTableResizeHit {
     uint64_t index;
     float position;
 } YuStorageTableResizeHit;
+
+/* Revision-bound, source-neutral geometry produced by a native table resize
+ * gesture. update returns a preview; finish returns the final candidate. */
+typedef struct YuStorageTableResizeCommit {
+    uint64_t revision;
+    uint64_t block_index;
+    uint8_t kind;
+    uint64_t index;
+    float initial_position;
+    float final_position;
+    float delta;
+} YuStorageTableResizeCommit;
 
 /* Revision-bound layout metadata for one parser-owned block. width/height
  * are block-local layout points; shaped is non-zero for CoreText output. */
@@ -889,6 +902,26 @@ int32_t yu_storage_session_table_resize_hit_test(
     uint64_t block_index, float max_width, float line_height,
     float default_advance, float point_x, float point_y, float tolerance,
     YuStorageTableResizeHit *output);
+int32_t yu_storage_session_table_resize_begin(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, float max_width, float line_height,
+    float default_advance, float point_x, float point_y, float tolerance,
+    float pointer_position, YuStorageTableResizeHit *output);
+/* macOS/CoreText-shaped begin variant; its divider coordinates match the
+ * retained macOS render-host frame for the supplied font size. */
+int32_t yu_storage_session_macos_table_resize_begin(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t block_index, float size, float max_width,
+    float point_x, float point_y, float tolerance, float pointer_position,
+    YuStorageTableResizeHit *output);
+int32_t yu_storage_session_table_resize_update(
+    YuStorageSession *session, uint64_t expected_revision,
+    float pointer_position, YuStorageTableResizeCommit *output);
+int32_t yu_storage_session_table_resize_finish(
+    YuStorageSession *session, uint64_t expected_revision,
+    YuStorageTableResizeCommit *output);
+int32_t yu_storage_session_table_resize_cancel(
+    YuStorageSession *session, uint64_t expected_revision);
 int32_t yu_storage_session_block_layout(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, float max_width, float line_height,

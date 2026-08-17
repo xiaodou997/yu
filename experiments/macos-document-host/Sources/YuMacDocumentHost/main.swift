@@ -19,6 +19,7 @@ private enum StorageStatus {
     static let unsavedChanges: Int32 = 5
     static let htmlImportRejected: Int32 = 18
     static let invalidViewport: Int32 = 20
+    static let tableResizeNotActive: Int32 = 22
 }
 
 private enum DiskState: UInt8 {
@@ -214,6 +215,26 @@ private struct NativeProjectionBlock {
         visualUTF16Length = Int(value.visual_utf16_length)
         kind = value.kind
         projectionKind = value.projection_kind
+    }
+}
+
+private struct NativeTableResizeCommit: Equatable {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let kind: UInt8
+    let index: UInt64
+    let initialPosition: Float
+    let finalPosition: Float
+    let delta: Float
+
+    init(_ value: YuStorageTableResizeCommit) {
+        revision = value.revision
+        blockIndex = value.block_index
+        kind = value.kind
+        index = value.index
+        initialPosition = value.initial_position
+        finalPosition = value.final_position
+        delta = value.delta
     }
 }
 
@@ -1682,6 +1703,101 @@ private final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return value
+    }
+
+    func tableResizeBegin(
+        revision: UInt64,
+        blockIndex: UInt64,
+        point: CGPoint,
+        tolerance: Float,
+        pointerPosition: Float,
+        maxWidth: Float,
+        lineHeight: Float,
+        defaultAdvance: Float
+    ) throws -> YuStorageTableResizeHit {
+        var value = YuStorageTableResizeHit()
+        let status = yu_storage_session_table_resize_begin(
+            handle,
+            revision,
+            blockIndex,
+            maxWidth,
+            lineHeight,
+            defaultAdvance,
+            Float(point.x),
+            Float(point.y),
+            tolerance,
+            pointerPosition,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return value
+    }
+
+    func macosTableResizeBegin(
+        revision: UInt64,
+        blockIndex: UInt64,
+        size: Float,
+        maxWidth: Float,
+        point: CGPoint,
+        tolerance: Float,
+        pointerPosition: Float
+    ) throws -> YuStorageTableResizeHit {
+        var value = YuStorageTableResizeHit()
+        let status = yu_storage_session_macos_table_resize_begin(
+            handle,
+            revision,
+            blockIndex,
+            size,
+            maxWidth,
+            Float(point.x),
+            Float(point.y),
+            tolerance,
+            pointerPosition,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return value
+    }
+
+    func tableResizeUpdate(
+        revision: UInt64,
+        pointerPosition: Float
+    ) throws -> NativeTableResizeCommit {
+        var value = YuStorageTableResizeCommit()
+        let status = yu_storage_session_table_resize_update(
+            handle,
+            revision,
+            pointerPosition,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeTableResizeCommit(value)
+    }
+
+    func tableResizeFinish(revision: UInt64) throws -> NativeTableResizeCommit {
+        var value = YuStorageTableResizeCommit()
+        let status = yu_storage_session_table_resize_finish(
+            handle,
+            revision,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeTableResizeCommit(value)
+    }
+
+    func tableResizeCancel(revision: UInt64) throws {
+        let status = yu_storage_session_table_resize_cancel(handle, revision)
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
     }
 
     func blockLayout(
@@ -6756,6 +6872,33 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
             precondition(columnResize.index == 0)
             precondition(abs(columnResize.position - columnDividerX) < 0.0001)
 
+            let begunResize = try bridge.tableResizeBegin(
+                revision: revision,
+                blockIndex: UInt64(tableIndex),
+                point: CGPoint(x: CGFloat(columnDividerX + 0.1), y: 0.5),
+                tolerance: 0.2,
+                pointerPosition: Float(columnDividerX + 0.1),
+                maxWidth: 20.0,
+                lineHeight: 2.0,
+                defaultAdvance: 1.0
+            )
+            precondition(begunResize.revision == columnResize.revision)
+            precondition(begunResize.block_index == columnResize.block_index)
+            precondition(begunResize.kind == columnResize.kind)
+            precondition(begunResize.index == columnResize.index)
+            precondition(abs(begunResize.position - columnResize.position) < 0.0001)
+            let preview = try bridge.tableResizeUpdate(
+                revision: revision,
+                pointerPosition: Float(columnDividerX + 1.1)
+            )
+            precondition(preview.revision == revision)
+            precondition(preview.blockIndex == UInt64(tableIndex))
+            precondition(preview.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
+            precondition(preview.index == 0)
+            precondition(abs(preview.delta - 1.0) < 0.0001)
+            let finishedResize = try bridge.tableResizeFinish(revision: revision)
+            precondition(finishedResize == preview)
+
             let resizedLayoutCells = try bridge.tableLayoutCellsWithResize(
                 revision: revision,
                 blockIndex: UInt64(tableIndex),
@@ -6796,6 +6939,27 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
             precondition(rowResize.kind == YU_STORAGE_TABLE_RESIZE_ROW)
             precondition(rowResize.index == 0)
             precondition(abs(rowResize.position - rowDividerY) < 0.0001)
+            let begunRowResize = try bridge.tableResizeBegin(
+                revision: revision,
+                blockIndex: UInt64(tableIndex),
+                point: CGPoint(x: 1.0, y: CGFloat(rowDividerY + 0.1)),
+                tolerance: 0.2,
+                pointerPosition: Float(rowDividerY + 0.1),
+                maxWidth: 20.0,
+                lineHeight: 2.0,
+                defaultAdvance: 1.0
+            )
+            precondition(begunRowResize.revision == rowResize.revision)
+            precondition(begunRowResize.block_index == rowResize.block_index)
+            precondition(begunRowResize.kind == rowResize.kind)
+            precondition(begunRowResize.index == rowResize.index)
+            precondition(abs(begunRowResize.position - rowResize.position) < 0.0001)
+            let rowPreview = try bridge.tableResizeUpdate(
+                revision: revision,
+                pointerPosition: Float(rowDividerY + 0.2)
+            )
+            precondition(rowPreview.kind == YU_STORAGE_TABLE_RESIZE_ROW)
+            try bridge.tableResizeCancel(revision: revision)
             do {
                 _ = try bridge.tableResizeHitTest(
                     revision: revision,
@@ -7695,6 +7859,62 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
         precondition(repeated.atlasGlyphCount == first.atlasGlyphCount)
         precondition(repeated.uploadCount == 0)
 
+        var tableIndex: UInt64?
+        let blockCount = try bridge.projectionBlockCount(revision: revision)
+        if blockCount > 0 {
+            for index in 0..<blockCount {
+                let (block, _) = try bridge.projectedBlock(
+                    revision: revision,
+                    blockIndex: UInt64(index)
+                )
+                if block.projectionKind == UInt8(YU_STORAGE_PROJECTION_TABLE) {
+                    tableIndex = UInt64(index)
+                    break
+                }
+            }
+        }
+        if let tableIndex {
+            let tableHit = try bridge.macosTableResizeBegin(
+                revision: revision,
+                blockIndex: tableIndex,
+                size: size,
+                maxWidth: maxWidth,
+                point: CGPoint(x: 0.0, y: 0.5),
+                tolerance: maxWidth,
+                pointerPosition: 0.0
+            )
+            precondition(tableHit.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
+            let tablePreview = try bridge.tableResizeUpdate(
+                revision: revision,
+                pointerPosition: tableHit.position + 1.0
+            )
+            precondition(tablePreview.revision == revision)
+            precondition(tablePreview.blockIndex == tableIndex)
+            precondition(tablePreview.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
+            precondition(abs(tablePreview.delta - (tableHit.position + 1.0)) < 0.01)
+            let resizedTableFrame = try bridge.macosRenderHostFrame(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 240.0,
+                surfaceGeneration: 0
+            )
+            precondition(resizedTableFrame.frameSerial > repeated.frameSerial)
+            let finishedTable = try bridge.tableResizeFinish(revision: revision)
+            precondition(finishedTable == tablePreview)
+            try bridge.tableResizeCancel(revision: revision)
+            let restoredTableFrame = try bridge.macosRenderHostFrame(
+                revision: revision,
+                size: size,
+                maxWidth: maxWidth,
+                scrollY: 0.0,
+                viewportHeight: 240.0,
+                surfaceGeneration: 0
+            )
+            precondition(restoredTableFrame.frameSerial > resizedTableFrame.frameSerial)
+        }
+
         let strong = (sourceBefore as NSString).range(of: "粗体")
         precondition(strong.location != NSNotFound)
         try bridge.beginComposition(
@@ -7776,7 +7996,8 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
         precondition(next.frameSerial > resized.frameSerial)
         print(
             "Yu macOS Render Host self-check: persistent CoreText/atlas publication, "
-                + "viewport resize, surface generation and stale Revision rejection are valid"
+                + "table resize preview lifecycle, viewport resize, surface generation and "
+                + "stale Revision rejection are valid"
         )
         exit(EXIT_SUCCESS)
     } catch {
