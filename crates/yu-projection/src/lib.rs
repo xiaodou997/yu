@@ -1417,6 +1417,9 @@ fn style_for(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlockProjectionKind {
     Inline,
+    Heading,
+    BlockQuote,
+    List,
     FencedCode,
     ReferenceDefinition,
     TaskList,
@@ -1585,6 +1588,9 @@ impl CodeProjection {
 #[derive(Clone, Debug)]
 pub enum BlockProjection {
     Inline(Projection),
+    Heading(Projection),
+    BlockQuote(Projection),
+    List(Projection),
     FencedCode(CodeProjection),
     ReferenceDefinition(Projection),
     TaskList(Projection),
@@ -1617,6 +1623,15 @@ impl BlockProjection {
             BlockKind::FencedCodeBlock { .. } => {
                 CodeProjection::from_block(source, block).map(Self::FencedCode)
             }
+            BlockKind::AtxHeading { .. } => {
+                Self::structural_inline(source, block, definitions, BlockProjectionKind::Heading)
+            }
+            BlockKind::BlockQuote { .. } => {
+                Self::structural_inline(source, block, definitions, BlockProjectionKind::BlockQuote)
+            }
+            BlockKind::ListItem { .. } => {
+                Self::structural_inline(source, block, definitions, BlockProjectionKind::List)
+            }
             _ => Projection::inline_with_definitions(source, block.range(), definitions)
                 .map(Self::Inline),
         }
@@ -1635,6 +1650,15 @@ impl BlockProjection {
             Self::Inline(projection) => projection
                 .with_composition(replacement_range, text, selection_bytes)
                 .map(Self::Inline),
+            Self::Heading(projection) => projection
+                .with_composition(replacement_range, text, selection_bytes)
+                .map(Self::Heading),
+            Self::BlockQuote(projection) => projection
+                .with_composition(replacement_range, text, selection_bytes)
+                .map(Self::BlockQuote),
+            Self::List(projection) => projection
+                .with_composition(replacement_range, text, selection_bytes)
+                .map(Self::List),
             Self::FencedCode(projection) => projection
                 .with_composition(replacement_range, text, selection_bytes)
                 .map(Self::FencedCode),
@@ -1666,6 +1690,25 @@ impl BlockProjection {
         Projection::from_inline_with_hidden(&inline, &[marker.range()]).map(Self::TaskList)
     }
 
+    fn structural_inline(
+        source: &TextSnapshot,
+        block: Block,
+        definitions: &ReferenceDefinitionIndex,
+        kind: BlockProjectionKind,
+    ) -> Result<Self, ProjectionError> {
+        let inline = parse_inline_with_definitions(source, block.range(), Some(definitions))?;
+        let projection = Projection::from_inline_with_hidden(
+            &inline,
+            &yu_markdown::block_syntax_hidden_ranges(source, block),
+        )?;
+        Ok(match kind {
+            BlockProjectionKind::Heading => Self::Heading(projection),
+            BlockProjectionKind::BlockQuote => Self::BlockQuote(projection),
+            BlockProjectionKind::List => Self::List(projection),
+            _ => Self::Inline(projection),
+        })
+    }
+
     fn from_block_without_definitions(
         source: &TextSnapshot,
         block: Block,
@@ -1673,6 +1716,26 @@ impl BlockProjection {
         match block.kind() {
             BlockKind::FencedCodeBlock { .. } => {
                 CodeProjection::from_block(source, block).map(Self::FencedCode)
+            }
+            BlockKind::AtxHeading { .. } => {
+                let inline = parse_inline(source, block.range())?;
+                let projection = Projection::from_inline_with_hidden(
+                    &inline,
+                    &yu_markdown::block_syntax_hidden_ranges(source, block),
+                )?;
+                Ok(Self::Heading(projection))
+            }
+            BlockKind::BlockQuote { .. } => {
+                let inline = parse_inline(source, block.range())?;
+                let projection = Projection::from_inline_with_hidden(
+                    &inline,
+                    &yu_markdown::block_syntax_hidden_ranges(source, block),
+                )?;
+                Ok(Self::BlockQuote(projection))
+            }
+            BlockKind::ListItem { .. } => {
+                let inline = parse_inline(source, block.range())?;
+                Projection::from_inline(&inline).map(Self::List)
             }
             _ => Projection::inline(source, block.range()).map(Self::Inline),
         }
@@ -1682,6 +1745,9 @@ impl BlockProjection {
     pub const fn kind(&self) -> BlockProjectionKind {
         match self {
             Self::Inline(_) => BlockProjectionKind::Inline,
+            Self::Heading(_) => BlockProjectionKind::Heading,
+            Self::BlockQuote(_) => BlockProjectionKind::BlockQuote,
+            Self::List(_) => BlockProjectionKind::List,
             Self::FencedCode(_) => BlockProjectionKind::FencedCode,
             Self::ReferenceDefinition(_) => BlockProjectionKind::ReferenceDefinition,
             Self::TaskList(_) => BlockProjectionKind::TaskList,
@@ -1692,6 +1758,9 @@ impl BlockProjection {
     pub fn visual(&self) -> &Projection {
         match self {
             Self::Inline(projection) => projection,
+            Self::Heading(projection) => projection,
+            Self::BlockQuote(projection) => projection,
+            Self::List(projection) => projection,
             Self::FencedCode(projection) => projection.visual(),
             Self::ReferenceDefinition(projection) => projection,
             Self::TaskList(projection) => projection,
@@ -1717,6 +1786,15 @@ impl BlockProjection {
         match self {
             Self::Inline(projection) => {
                 Ok(projection.map_through(changes, snapshot)?.map(Self::Inline))
+            }
+            Self::Heading(projection) => Ok(projection
+                .map_through(changes, snapshot)?
+                .map(Self::Heading)),
+            Self::BlockQuote(projection) => Ok(projection
+                .map_through(changes, snapshot)?
+                .map(Self::BlockQuote)),
+            Self::List(projection) => {
+                Ok(projection.map_through(changes, snapshot)?.map(Self::List))
             }
             Self::FencedCode(projection) => Ok(projection
                 .map_through(changes, snapshot)?
@@ -2148,6 +2226,70 @@ mod tests {
         }));
         assert!(projection.visual().runs().iter().any(|run| {
             run.kind() == VisualRunKind::Visible && run.style() == VisualRunStyle::Strong
+        }));
+    }
+
+    #[test]
+    fn structural_block_projection_hides_heading_and_quote_prefixes() {
+        let source = "  ## **标题**\n\n> 引用\n> **继续**\n\n- item\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+
+        let heading = markdown.blocks().get(0).expect("heading block");
+        let heading_projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            heading,
+            markdown.reference_definitions(),
+        )
+        .expect("heading projection should build");
+        assert_eq!(heading_projection.kind(), BlockProjectionKind::Heading);
+        assert_eq!(
+            heading_projection
+                .visual()
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .count(),
+            3
+        );
+        let heading_text = heading_projection
+            .visual()
+            .runs()
+            .iter()
+            .filter(|run| run.kind() != VisualRunKind::HiddenSyntax)
+            .map(|run| heading_projection.visual().text_for_run(*run))
+            .collect::<Result<String, _>>()
+            .expect("heading visual text");
+        assert_eq!(heading_text, "标题\n");
+
+        let quote = markdown.blocks().get(2).expect("quote block");
+        let quote_projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            quote,
+            markdown.reference_definitions(),
+        )
+        .expect("quote projection should build");
+        assert_eq!(quote_projection.kind(), BlockProjectionKind::BlockQuote);
+        let quote_text = quote_projection
+            .visual()
+            .runs()
+            .iter()
+            .filter(|run| run.kind() != VisualRunKind::HiddenSyntax)
+            .map(|run| quote_projection.visual().text_for_run(*run))
+            .collect::<Result<String, _>>()
+            .expect("quote visual text");
+        assert_eq!(quote_text, "引用\n继续\n");
+
+        let list = markdown.blocks().get(4).expect("list block");
+        let list_projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            list,
+            markdown.reference_definitions(),
+        )
+        .expect("list projection should build");
+        assert_eq!(list_projection.kind(), BlockProjectionKind::List);
+        assert!(list_projection.visual().runs().iter().any(|run| {
+            run.kind() == VisualRunKind::Visible && run.source().start() == list.range().start()
         }));
     }
 

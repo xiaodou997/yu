@@ -6495,12 +6495,19 @@ private func runBlockProjectionSelfCheck(path: String) -> Never {
         }
 
         precondition(kinds.contains(3), "heading block missing")
+        precondition(kinds.contains(5), "blockquote block missing")
+        precondition(kinds.contains(6), "list block missing")
         precondition(kinds.contains(4), "fenced-code block missing")
         precondition(kinds.contains(7), "task-list block missing")
         precondition(visualTexts.contains { $0.contains("粗体") })
         precondition(visualTexts.contains { $0.contains("链接") })
         precondition(visualTexts.contains { $0.contains("任务") })
         precondition(visualTexts.contains { $0.contains("fn main") })
+        precondition(visualTexts.contains { $0.contains("引用块") })
+        precondition(visualTexts.contains { $0.contains("有序列表") })
+        precondition(visualTexts.contains { $0.contains("Projection blocks") })
+        precondition(visualTexts.allSatisfy { !$0.contains("# Projection blocks") })
+        precondition(visualTexts.allSatisfy { !$0.contains("> 引用块") })
         precondition(visualTexts.allSatisfy { !$0.contains("**粗体**") })
         precondition(visualTexts.allSatisfy { !$0.contains("[链接](https://example.com)") })
 

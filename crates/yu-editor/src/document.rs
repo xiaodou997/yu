@@ -3155,6 +3155,9 @@ mod tests {
                     }));
                 }
                 BlockProjection::Inline(_)
+                | BlockProjection::Heading(_)
+                | BlockProjection::BlockQuote(_)
+                | BlockProjection::List(_)
                 | BlockProjection::ReferenceDefinition(_)
                 | BlockProjection::TaskList(_) => {
                     panic!("fenced code must not use inline projection")
@@ -3181,6 +3184,9 @@ mod tests {
         {
             BlockProjection::FencedCode(code) => code.content(),
             BlockProjection::Inline(_)
+            | BlockProjection::Heading(_)
+            | BlockProjection::BlockQuote(_)
+            | BlockProjection::List(_)
             | BlockProjection::ReferenceDefinition(_)
             | BlockProjection::TaskList(_) => {
                 panic!("fenced code must use code projection")
@@ -3200,6 +3206,9 @@ mod tests {
         let new_content = match projection {
             BlockProjection::FencedCode(code) => code.content(),
             BlockProjection::Inline(_)
+            | BlockProjection::Heading(_)
+            | BlockProjection::BlockQuote(_)
+            | BlockProjection::List(_)
             | BlockProjection::ReferenceDefinition(_)
             | BlockProjection::TaskList(_) => {
                 panic!("fenced code must use code projection")
