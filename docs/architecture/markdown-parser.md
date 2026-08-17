@@ -186,6 +186,11 @@ block index、layout 参数、table-local point 和 tolerance，返回内部 col
 kind、index 与 x/y position。outer edge、表格外点、非法 tolerance 和 stale Revision 都被拒绝；
 该查询不改变 source、selection、history 或 layout cache。真正的 drag transaction 和把新宽高
 持久化为 Markdown 对齐/空白策略，必须在后续编辑命令阶段定义。
+Rust `yu-layout::TableResizeGesture` 为 native adapter 提供同样的按下/移动/释放边界：按下时
+捕获 Revision、block index、divider target 和 pointer anchor；移动只更新临时 pointer 与
+proposed divider position；释放返回 `TableResizeCommit` 几何候选。任何 update/finish/cancel
+都必须匹配捕获 Revision，且非有限 pointer 被拒绝。commit 不携带 cell 文本或 source edit，
+因此 Markdown 写回仍必须经过另一个明确的 editor transaction。
 
 definition index 的 fingerprint 只描述定义顺序、label 与 destination 内容，不包含绝对 source
 offset。因此前缀插入仍可映射普通 projection；新增、删除或修改 definition 时，编辑器会保守地

@@ -1,3 +1,5 @@
+use std::{error::Error, fmt};
+
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{ByteOffset, Revision, TextRange};
 use yu_markdown::{TableAlignment, TableCellRange};
@@ -139,6 +141,205 @@ impl TableResizeHit {
     #[must_use]
     pub const fn position(self) -> f32 {
         self.position
+    }
+}
+
+/// Errors raised when a native table resize gesture no longer matches the
+/// Revision that produced its initial hit-test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableResizeGestureError {
+    StaleRevision {
+        expected: Revision,
+        actual: Revision,
+    },
+    NonFinitePointer(u32),
+}
+
+impl fmt::Display for TableResizeGestureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleRevision { expected, actual } => write!(
+                formatter,
+                "table resize gesture requires {expected:?}, received {actual:?}"
+            ),
+            Self::NonFinitePointer(bits) => {
+                write!(
+                    formatter,
+                    "table resize pointer is not finite: {}",
+                    f32::from_bits(*bits)
+                )
+            }
+        }
+    }
+}
+
+impl Error for TableResizeGestureError {}
+
+/// A Revision-bound, source-neutral table resize gesture.
+///
+/// The gesture stores the pointer anchor separately from the divider position
+/// returned by layout. This preserves the small tolerance offset from the
+/// mouse-down event while the native caller drags. `finish` returns a commit
+/// candidate only; it does not change Markdown source, selection or history.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TableResizeGesture {
+    revision: Revision,
+    block_index: usize,
+    target: TableResizeTarget,
+    divider_position: f32,
+    start_pointer: f32,
+    current_pointer: f32,
+}
+
+impl TableResizeGesture {
+    pub fn begin(
+        revision: Revision,
+        block_index: usize,
+        hit: TableResizeHit,
+        pointer_position: f32,
+    ) -> Result<Self, TableResizeGestureError> {
+        validate_pointer(pointer_position)?;
+        validate_pointer(hit.position())?;
+        Ok(Self {
+            revision,
+            block_index,
+            target: hit.target(),
+            divider_position: hit.position(),
+            start_pointer: pointer_position,
+            current_pointer: pointer_position,
+        })
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn block_index(self) -> usize {
+        self.block_index
+    }
+
+    #[must_use]
+    pub const fn target(self) -> TableResizeTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn start_pointer(self) -> f32 {
+        self.start_pointer
+    }
+
+    #[must_use]
+    pub const fn current_pointer(self) -> f32 {
+        self.current_pointer
+    }
+
+    /// Returns the pointer displacement since mouse-down.
+    #[must_use]
+    pub fn delta(self) -> f32 {
+        self.current_pointer - self.start_pointer
+    }
+
+    /// Returns the proposed divider position in table-local layout space.
+    #[must_use]
+    pub fn proposed_position(self) -> f32 {
+        self.divider_position + self.delta()
+    }
+
+    pub fn update(
+        &mut self,
+        revision: Revision,
+        pointer_position: f32,
+    ) -> Result<(), TableResizeGestureError> {
+        self.ensure_revision(revision)?;
+        validate_pointer(pointer_position)?;
+        validate_pointer(pointer_position - self.start_pointer)?;
+        validate_pointer(self.divider_position + (pointer_position - self.start_pointer))?;
+        self.current_pointer = pointer_position;
+        Ok(())
+    }
+
+    /// Completes the gesture and returns a source-neutral commit candidate.
+    pub fn finish(self, revision: Revision) -> Result<TableResizeCommit, TableResizeGestureError> {
+        self.ensure_revision(revision)?;
+        Ok(TableResizeCommit {
+            revision: self.revision,
+            block_index: self.block_index,
+            target: self.target,
+            initial_position: self.divider_position,
+            final_position: self.proposed_position(),
+            delta: self.delta(),
+        })
+    }
+
+    /// Cancels the gesture without producing a source mutation.
+    pub fn cancel(self, revision: Revision) -> Result<(), TableResizeGestureError> {
+        self.ensure_revision(revision)
+    }
+
+    fn ensure_revision(&self, actual: Revision) -> Result<(), TableResizeGestureError> {
+        if self.revision == actual {
+            Ok(())
+        } else {
+            Err(TableResizeGestureError::StaleRevision {
+                expected: self.revision,
+                actual,
+            })
+        }
+    }
+}
+
+/// The result of releasing a table resize pointer. It describes geometry only;
+/// a later editor transaction must decide whether and how that geometry can
+/// be represented in Markdown before changing the canonical source.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TableResizeCommit {
+    revision: Revision,
+    block_index: usize,
+    target: TableResizeTarget,
+    initial_position: f32,
+    final_position: f32,
+    delta: f32,
+}
+
+impl TableResizeCommit {
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn block_index(self) -> usize {
+        self.block_index
+    }
+
+    #[must_use]
+    pub const fn target(self) -> TableResizeTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn initial_position(self) -> f32 {
+        self.initial_position
+    }
+
+    #[must_use]
+    pub const fn final_position(self) -> f32 {
+        self.final_position
+    }
+
+    #[must_use]
+    pub const fn delta(self) -> f32 {
+        self.delta
+    }
+}
+
+fn validate_pointer(pointer: f32) -> Result<(), TableResizeGestureError> {
+    if pointer.is_finite() {
+        Ok(())
+    } else {
+        Err(TableResizeGestureError::NonFinitePointer(pointer.to_bits()))
     }
 }
 

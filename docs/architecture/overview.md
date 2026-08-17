@@ -325,7 +325,10 @@ source/IME/Accessibility fallback，完整 visual renderer 切换不在本阶段
 不进入该坐标空间；Tab/Shift-Tab 只移动到相邻 source cell 起点，不产生 source Revision。列/行
 拖拽目前先由 `yu_storage_session_table_resize_hit_test` 提供 Revision-bound 内部分隔线命中
 （kind/index/局部 x 或 y），不在查询层修改 Markdown；末尾 Tab 自动新增行和真正的 resize
-transaction 仍是后续编辑阶段的工作。
+transaction 仍是后续编辑阶段的工作。`yu-layout::TableResizeGesture` 已固定 native 按下/移动/
+释放状态：捕获 pointer anchor 后只生成临时 proposed divider position，释放返回不含 source
+edit 的 `TableResizeCommit`；stale Revision 或非有限坐标直接拒绝。document-host 的 block
+projection self-check 同时验证 column/row 命中、tolerance、source 不变和 stale 拒绝。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和
