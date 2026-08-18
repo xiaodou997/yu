@@ -240,8 +240,8 @@ private struct NativeTableResizeCommit: Equatable {
 }
 
 /// Read-only, Revision-bound metadata for one visible table column divider.
-/// The descriptor is suitable for a future native Accessibility element, but
-/// it does not own a resize session or any Markdown source.
+/// The descriptor is suitable for an ephemeral native Accessibility element,
+/// but it does not own a resize session or any Markdown source.
 private struct NativeTableResizeAccessibilityDivider: Equatable {
     let revision: UInt64
     let blockIndex: UInt64
@@ -250,6 +250,24 @@ private struct NativeTableResizeAccessibilityDivider: Equatable {
     let columnCount: UInt64
     let rect: CGRect
     let tableSourceRange: NSRange
+
+    init(
+        revision: UInt64,
+        blockIndex: UInt64,
+        kind: UInt8,
+        index: UInt64,
+        columnCount: UInt64,
+        rect: CGRect,
+        tableSourceRange: NSRange
+    ) {
+        self.revision = revision
+        self.blockIndex = blockIndex
+        self.kind = kind
+        self.index = index
+        self.columnCount = columnCount
+        self.rect = rect
+        self.tableSourceRange = tableSourceRange
+    }
 
     init(_ value: YuStorageTableResizeAccessibilityDivider) {
         revision = value.revision
@@ -1107,6 +1125,69 @@ private final class YuAccessibilitySemanticElement: NSObject,
     func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
         guard let text = accessibilityString(for: range) else { return nil }
         return NSAttributedString(string: text)
+    }
+}
+
+/// A Revision-bound native Accessibility splitter for one visible Markdown
+/// table column divider. The element is deliberately ephemeral: it owns only
+/// scalar geometry and source provenance, while all resize actions go back
+/// through `DocumentTextView` to the Rust session-only preview.
+private final class YuAccessibilityTableResizeElement: NSObject,
+    NSAccessibilityElementProtocol,
+    NSAccessibilityStepper
+{
+    let descriptor: NativeTableResizeAccessibilityDivider
+    weak var parentObject: AnyObject?
+    weak var frameOwner: DocumentTextView?
+
+    init(
+        descriptor: NativeTableResizeAccessibilityDivider,
+        parent: AnyObject?,
+        owner: DocumentTextView
+    ) {
+        self.descriptor = descriptor
+        parentObject = parent
+        frameOwner = owner
+        super.init()
+    }
+
+    @objc func accessibilityFrame() -> NSRect {
+        frameOwner?.accessibilityFrameForTableResizeDescriptor(descriptor) ?? .zero
+    }
+
+    @objc func accessibilityParent() -> Any? { parentObject }
+
+    @objc var accessibilityRole: NSAccessibility.Role { .splitter }
+
+    @objc var accessibilityRoleDescription: String? { "表格列分隔线" }
+
+    @objc(accessibilityLabel) func accessibilityLabel() -> String? {
+        let left = descriptor.index + 1
+        let right = left + 1
+        return "表格第 \(left) 列与第 \(right) 列之间的分隔线"
+    }
+
+    @objc var accessibilityTitle: String? { accessibilityLabel() }
+
+    /// The value is intentionally human-readable rather than a second source
+    /// model. It gives VoiceOver context while the effective x coordinate
+    /// remains owned by the Revision-bound Rust layout query.
+    @objc(accessibilityValue) func accessibilityValue() -> Any? {
+        "第 \(descriptor.index + 1) / \(descriptor.columnCount) 列分隔线"
+    }
+
+    @objc func accessibilityPerformIncrement() -> Bool {
+        frameOwner?.performTableResizeAccessibilityAction(descriptor, direction: 1)
+            ?? false
+    }
+
+    @objc func accessibilityPerformDecrement() -> Bool {
+        frameOwner?.performTableResizeAccessibilityAction(descriptor, direction: -1)
+            ?? false
+    }
+
+    @objc func accessibilityIdentifier() -> String {
+        "yu-table-divider-\(descriptor.revision)-\(descriptor.blockIndex)-\(descriptor.index)"
     }
 }
 
@@ -3222,6 +3303,10 @@ private final class DocumentTextView: NSTextView {
     private var canonicalRevision: UInt64
     private var semanticNodes: [NativeAccessibilitySemanticNode] = []
     private var semanticElements: [YuAccessibilitySemanticElement] = []
+    private var tableResizeAccessibilityDescriptors:
+        [NativeTableResizeAccessibilityDivider] = []
+    private var tableResizeAccessibilityElements:
+        [YuAccessibilityTableResizeElement] = []
     private var headingRotorDelegate: YuAccessibilityRotorDelegate!
     private var linkRotorDelegate: YuAccessibilityRotorDelegate!
     private var nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
@@ -3246,6 +3331,12 @@ private final class DocumentTextView: NSTextView {
     var onTableResizeUpdate: ((NSPoint) -> Bool)?
     var onTableResizeFinish: (() -> Bool)?
     var onTableResizeCancel: (() -> Bool)?
+    var tableResizeAccessibilityProvider:
+        (() -> [NativeTableResizeAccessibilityDivider])?
+    var tableResizeAccessibilityFrameProvider:
+        ((NativeTableResizeAccessibilityDivider) -> NSRect)?
+    var onTableResizeAccessibilityAction:
+        ((NativeTableResizeAccessibilityDivider, Int) -> Bool)?
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
@@ -3817,12 +3908,23 @@ private final class DocumentTextView: NSTextView {
 
     /// AppKit asks for these children through Objective-C Accessibility
     /// dispatch. The document TextKit element remains the editable source
-    /// surface; semantic children are stable owned nodes for VoiceOver
-    /// navigation and never become a second text model.
-    @objc var accessibilityChildren: [Any]? { semanticElements }
+    /// surface; semantic children and visible table splitters are stable,
+    /// Revision-bound elements and never become a second text model.
+    @objc var accessibilityChildren: [Any]? {
+        semanticElements.map { $0 as Any } + tableResizeAccessibilityElements
+            .map { $0 as Any }
+    }
 
     @objc var accessibilityChildrenInNavigationOrder: [Any]? {
-        semanticElements
+        semanticElements.map { $0 as Any } + tableResizeAccessibilityElements
+            .map { $0 as Any }
+    }
+
+    /// Expose the same elements through AppKit's dedicated splitter
+    /// attribute. VoiceOver may discover them either as document children or
+    /// through this role-specific collection.
+    @objc var accessibilitySplitters: [Any]? {
+        tableResizeAccessibilityElements.map { $0 as Any }
     }
 
     /// Heading and Link rotors make the semantic tree discoverable without
@@ -4555,6 +4657,73 @@ private final class DocumentTextView: NSTextView {
         return window.convertToScreen(convert(local, to: nil))
     }
 
+    func accessibilityFrameForTableResizeDescriptor(
+        _ descriptor: NativeTableResizeAccessibilityDivider
+    ) -> NSRect {
+        guard descriptor.revision == bridge.state.revision,
+              !bridge.composition.active else {
+            return .zero
+        }
+        return tableResizeAccessibilityFrameProvider?(descriptor) ?? .zero
+    }
+
+    @discardableResult
+    func performTableResizeAccessibilityAction(
+        _ descriptor: NativeTableResizeAccessibilityDivider,
+        direction: Int
+    ) -> Bool {
+        guard descriptor.revision == bridge.state.revision,
+              descriptor.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
+              descriptor.columnCount >= 2,
+              descriptor.index < descriptor.columnCount - 1,
+              direction == 1 || direction == -1,
+              !bridge.composition.active else {
+            return false
+        }
+        let changed = onTableResizeAccessibilityAction?(descriptor, direction) ?? false
+        if changed {
+            refreshTableResizeAccessibility(postNotification: true)
+        }
+        return changed
+    }
+
+    /// Rebuilds only the visible table splitter children. The provider owns
+    /// no AppKit objects; it returns fresh scalar descriptors from the
+    /// coordinator, and stale Revision descriptors are discarded before they
+    /// become discoverable by VoiceOver.
+    func refreshTableResizeAccessibility(postNotification: Bool = false) {
+        let descriptors = (tableResizeAccessibilityProvider?() ?? []).filter {
+            $0.revision == bridge.state.revision
+                && $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
+                && $0.columnCount >= 2
+                && $0.index < $0.columnCount - 1
+                && $0.rect.origin.x.isFinite
+                && $0.rect.origin.y.isFinite
+                && $0.rect.width.isFinite
+                && $0.rect.height.isFinite
+                && $0.rect.width > 0.0
+                && $0.rect.height > 0.0
+        }
+        guard descriptors != tableResizeAccessibilityDescriptors else {
+            if postNotification {
+                NSAccessibility.post(element: self, notification: .layoutChanged)
+            }
+            return
+        }
+        postDestroyedTableResizeAccessibilityElements()
+        tableResizeAccessibilityDescriptors = descriptors
+        tableResizeAccessibilityElements = descriptors.map {
+            YuAccessibilityTableResizeElement(
+                descriptor: $0,
+                parent: self,
+                owner: self
+            )
+        }
+        if postNotification {
+            NSAccessibility.post(element: self, notification: .layoutChanged)
+        }
+    }
+
     private func rebuildSemanticAccessibilityTree() {
         postDestroyedSemanticElements()
         let nodes = semanticNodes.filter {
@@ -4585,11 +4754,41 @@ private final class DocumentTextView: NSTextView {
             parent.semanticChildren.append(element)
         }
         semanticElements = topLevel
+        rebuildTableResizeAccessibilityTree()
     }
 
     private func postDestroyedSemanticElements() {
-        guard !semanticElements.isEmpty else { return }
         for element in flattenSemanticElements(semanticElements) {
+            NSAccessibility.post(element: element, notification: .uiElementDestroyed)
+        }
+        postDestroyedTableResizeAccessibilityElements()
+    }
+
+    private func rebuildTableResizeAccessibilityTree() {
+        let descriptors = (tableResizeAccessibilityProvider?() ?? []).filter {
+            $0.revision == bridge.state.revision
+                && $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
+                && $0.columnCount >= 2
+                && $0.index < $0.columnCount - 1
+                && $0.rect.origin.x.isFinite
+                && $0.rect.origin.y.isFinite
+                && $0.rect.width.isFinite
+                && $0.rect.height.isFinite
+                && $0.rect.width > 0.0
+                && $0.rect.height > 0.0
+        }
+        tableResizeAccessibilityDescriptors = descriptors
+        tableResizeAccessibilityElements = descriptors.map {
+            YuAccessibilityTableResizeElement(
+                descriptor: $0,
+                parent: self,
+                owner: self
+            )
+        }
+    }
+
+    private func postDestroyedTableResizeAccessibilityElements() {
+        for element in tableResizeAccessibilityElements {
             NSAccessibility.post(element: element, notification: .uiElementDestroyed)
         }
     }
@@ -5155,8 +5354,8 @@ private final class MacosSurfaceHostCoordinator {
     }
 
     /// Returns the visible, read-only divider descriptors from the same
-    /// document-space CoreText layout used by hover and begin. Callers may
-    /// project these into native Accessibility elements, but the descriptors
+    /// document-space CoreText layout used by hover and begin. Callers project
+    /// these into ephemeral native Accessibility elements; the descriptors
     /// never retain a Rust layout or open a resize gesture.
     func tableResizeAccessibilityDividers() -> [NativeTableResizeAccessibilityDivider] {
         guard !bridge.composition.active,
@@ -5174,6 +5373,67 @@ private final class MacosSurfaceHostCoordinator {
         } catch {
             return []
         }
+    }
+
+    /// Converts one document-space divider descriptor into a screen-space AX
+    /// frame. The conversion is intentionally performed at query time so a
+    /// scroll, window move, or surface detach cannot leave an element holding
+    /// stale AppKit coordinates.
+    func tableResizeAccessibilityFrame(
+        for descriptor: NativeTableResizeAccessibilityDivider
+    ) -> NSRect {
+        guard descriptor.revision == bridge.state.revision,
+              !bridge.composition.active,
+              let surfaceView,
+              let window = surfaceView.window,
+              let geometry = visualDecorationGeometry() else {
+            return .zero
+        }
+        let local = descriptor.rect.offsetBy(
+            dx: 0.0,
+            dy: -CGFloat(geometry.scrollY)
+        )
+        return window.convertToScreen(surfaceView.convert(local, to: nil))
+    }
+
+    /// Performs one VoiceOver increment/decrement as a Rust-owned transient
+    /// resize. The effective divider descriptor is queried again after the
+    /// action, so repeated actions accumulate through the session override
+    /// without changing Markdown source or creating an editor transaction.
+    @discardableResult
+    func adjustTableResizeAccessibility(
+        _ descriptor: NativeTableResizeAccessibilityDivider,
+        direction: Int
+    ) -> Bool {
+        guard descriptor.revision == bridge.state.revision,
+              descriptor.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
+              descriptor.columnCount >= 2,
+              descriptor.index < descriptor.columnCount - 1,
+              (direction == 1 || direction == -1),
+              !bridge.composition.active,
+              !tableResizePointerState.isActive,
+              let geometry = visualDecorationGeometry() else {
+            return false
+        }
+        let step = max(
+            CGFloat(8.0),
+            min(CGFloat(16.0), CGFloat(geometry.lineHeight) * 0.5)
+        )
+        let dividerPoint = NSPoint(
+            x: descriptor.rect.midX,
+            y: descriptor.rect.midY
+        )
+        guard beginTableResize(at: dividerPoint) else { return false }
+        let updatedPoint = NSPoint(
+            x: dividerPoint.x + CGFloat(direction) * step,
+            y: dividerPoint.y
+        )
+        guard updateTableResize(at: updatedPoint),
+              finishTableResize() else {
+            _ = cancelTableResize()
+            return false
+        }
+        return true
     }
 
     /// Attempts to start a CoreText-shaped table divider gesture at a
@@ -5280,16 +5540,18 @@ private final class MacosSurfaceHostCoordinator {
         guard tableResizePointerState.acceptsUpdate(revision: revision) else {
             return false
         }
+        var finished = false
         do {
             _ = try bridge.tableResizeFinish(revision: revision)
             _ = tableResizePointerState.finish(revision: revision)
             lastSubmitKey = nil
             scheduleSubmit()
+            finished = true
         } catch {
             tableResizePointerState.reset()
             onError?(error)
         }
-        return true
+        return finished
     }
 
     /// Cancels only an active pointer gesture. Document edits use
@@ -5614,6 +5876,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         self.initialState = bridge.state
         super.init(nibName: nil, bundle: nil)
         surfaceCoordinator.onSurfaceStateChange = { [weak self] in
+            self?.textView.refreshTableResizeAccessibility()
             self?.updateVisualDecorations()
         }
         surfaceCoordinator.onError = { [weak self] error in
@@ -5654,6 +5917,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             guard let self else { return }
             self.initialState = self.bridge.state
             self.surfaceCoordinator.resetTableResizeAfterDocumentChange()
+            self.textView.refreshTableResizeAccessibility()
             self.updateStatus()
             self.updateVisualDecorations()
             self.surfaceCoordinator.scheduleSubmit()
@@ -5687,6 +5951,20 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         textView.onTableResizeCancel = { [weak self] in
             self?.surfaceCoordinator.cancelTableResize() ?? false
         }
+        textView.tableResizeAccessibilityProvider = { [weak self] in
+            self?.surfaceCoordinator.tableResizeAccessibilityDividers() ?? []
+        }
+        textView.tableResizeAccessibilityFrameProvider = { [weak self] descriptor in
+            self?.surfaceCoordinator.tableResizeAccessibilityFrame(for: descriptor)
+                ?? .zero
+        }
+        textView.onTableResizeAccessibilityAction = { [weak self] descriptor, direction in
+            guard let self else { return false }
+            return self.surfaceCoordinator.adjustTableResizeAccessibility(
+                descriptor,
+                direction: direction
+            )
+        }
         scrollView.documentView = textView
         // `DocumentTextView` is created before the window has a laid-out
         // content size. Give the scroll view a real initial document frame
@@ -5706,19 +5984,23 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             scrollView: scrollView,
             fontSize: textView.font?.pointSize ?? 16.0
         )
+        textView.refreshTableResizeAccessibility()
         surfaceHostView.onWindowStateChange = { [weak self] attached in
             guard let self else { return }
             if attached {
                 self.surfaceCoordinator.scheduleSubmit()
                 self.updateVisualDecorations()
+                self.textView.refreshTableResizeAccessibility()
             } else {
                 self.surfaceCoordinator.detach()
                 self.clearVisualDecorations(reason: .detached)
+                self.textView.refreshTableResizeAccessibility()
             }
         }
         surfaceHostView.onGeometryChange = { [weak self] in
             self?.surfaceCoordinator.scheduleSubmit()
             self?.updateVisualDecorations()
+            self?.textView.refreshTableResizeAccessibility()
         }
         scrollView.contentView.postsBoundsChangedNotifications = true
         surfaceBoundsObserver = NotificationCenter.default.addObserver(
@@ -5728,6 +6010,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         ) { [weak self] _ in
             self?.surfaceCoordinator.scheduleSubmit()
             self?.updateVisualDecorations()
+            self?.textView.refreshTableResizeAccessibility()
         }
 
         statusLabel.setAccessibilityElement(true)
@@ -5784,6 +6067,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             1.0
         )
         surfaceCoordinator.setContentWidth(visualWidth)
+        textView.refreshTableResizeAccessibility()
         do {
             if !visualPointerAdapterEnabled {
                 try textView.setVisualMirrorEnabled(true)
@@ -5800,6 +6084,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             statusLabel.toolTip = "Visual pointer inactive: \(error.localizedDescription)"
         }
         updateVisualDecorations()
+        textView.refreshTableResizeAccessibility()
         surfaceCoordinator.scheduleSubmit()
         surfaceCoordinator.revealCaretIfNeeded()
     }
@@ -5807,12 +6092,14 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     func refreshFromRust() {
         textView.refreshFromRust()
         surfaceCoordinator.resetTableResizeAfterDocumentChange()
+        textView.refreshTableResizeAccessibility()
         initialState = bridge.state
         if initialState.disk == .unchanged {
             promptedExternalDisk = nil
         }
         updateStatus()
         updateVisualDecorations()
+        textView.refreshTableResizeAccessibility()
         surfaceCoordinator.scheduleSubmit()
         surfaceCoordinator.revealCaretIfNeeded()
     }
@@ -9329,12 +9616,60 @@ private func runAccessibilitySelfCheck(path: String) -> Never {
             actionChildren = initialChildren
         }
 
+        // Headless splitter contract: the real coordinator supplies these
+        // descriptors from CoreText geometry, while this self-check injects
+        // one scalar descriptor to verify AppKit role/action/lifecycle
+        // behavior without requiring a window or VoiceOver session.
+        let splitterRevision = bridge.state.revision
+        let splitterDescriptor = NativeTableResizeAccessibilityDivider(
+            revision: splitterRevision,
+            blockIndex: 0,
+            kind: UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
+            index: 0,
+            columnCount: 2,
+            rect: NSRect(x: 100.0, y: 10.0, width: 2.0, height: 20.0),
+            tableSourceRange: NSRange(location: 0, length: 0)
+        )
+        var splitterActions: [Int] = []
+        textView.tableResizeAccessibilityProvider = {
+            bridge.state.revision == splitterRevision ? [splitterDescriptor] : []
+        }
+        textView.tableResizeAccessibilityFrameProvider = { _ in
+            NSRect(x: 1.0, y: 2.0, width: 3.0, height: 20.0)
+        }
+        textView.onTableResizeAccessibilityAction = { descriptor, direction in
+            guard descriptor.revision == splitterRevision else { return false }
+            splitterActions.append(direction)
+            return true
+        }
+        textView.refreshTableResizeAccessibility(postNotification: true)
+        guard let splitter = (textView.accessibilitySplitters ?? []).first
+            as? YuAccessibilityTableResizeElement else {
+            preconditionFailure("table splitter accessibility child is missing")
+        }
+        precondition(splitter.accessibilityRole == .splitter)
+        precondition(splitter.accessibilityLabel() != nil)
+        precondition(
+            splitter.accessibilityIdentifier()
+                == "yu-table-divider-\(splitterRevision)-0-0"
+        )
+        precondition(splitter.parentObject === textView)
+        precondition(splitter.accessibilityFrame() == NSRect(x: 1.0, y: 2.0, width: 3.0, height: 20.0))
+        precondition(splitter.accessibilityPerformIncrement())
+        precondition(splitter.accessibilityPerformDecrement())
+        precondition(splitterActions == [1, -1])
+        print(
+            "Yu Accessibility self-check: splitter role/action revision=\(splitterRevision)"
+        )
+
         _ = try bridge.insertText("\n")
         if let staleCandidate = actionChildren.first {
             precondition(staleCandidate.accessibilityLabel == nil)
         }
         textView.refreshFromRust()
         let nextRevision = bridge.state.revision
+        precondition(!splitter.accessibilityPerformIncrement())
+        precondition((textView.accessibilitySplitters ?? []).isEmpty)
         let nextChildren = (textView.accessibilityChildren ?? [])
             .compactMap { $0 as? YuAccessibilitySemanticElement }
         precondition(nextRevision != actionRevision)

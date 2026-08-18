@@ -2,7 +2,7 @@
 
 ## 状态
 
-已接受（2026-08-18）
+已接受（2026-08-18；可操作 splitter 由 ADR 0170 承接）
 
 ## 背景
 
@@ -20,16 +20,19 @@ ADR 0168 保留了完整 splitter Accessibility element，原因是 native 层�
    source、selection、history、layout cache 或 surface submit state；active composition 时返回空集合，
    避免把 transient composition layout 暴露成稳定 AX target。
 3. Swift 只保留 owned scalar descriptor，并通过 coordinator 转发查询；Swift 不扫描 Markdown
-   pipe、不推断 block 高度，也不持有 Rust layout。真正的 `NSAccessibility` splitter element 与
-   increment/decrement transaction 留到下一阶段，必须先决定焦点、步长、stale element 销毁通知和
-   source-neutral preview 的提交/取消语义。
+   pipe、不推断 block 高度，也不持有 Rust layout。可操作的 NSAccessibility splitter element、
+   increment/decrement 步长、stale element 销毁通知和 source-neutral preview 语义在后续 ADR 0170
+   中定义；本 ADR 仍是其几何 ABI 基础。
 
 ## 结果
 
 - VoiceOver/native adapter 现在有一个可验证、Revision-bound 的 divider geometry 契约。
 - descriptor 与 pointer hover/begin 使用同一 CoreText document-space 坐标，未来不需要第二套表格
   测量逻辑。
-- 由于 descriptor 是只读的，当前不会产生伪造的可操作 AX 控件，也不会把像素宽度写入 Markdown。
+- 由于 descriptor ABI 本身是只读的，它不会伪造 source edit，也不会把像素宽度写入 Markdown；
+  可操作 native splitter 的生命周期由 ADR 0170 另行负责。
+- ADR 0170 在不改变本 descriptor ABI 的前提下，将其投影为临时 native splitter；本 ADR 的
+  count/fill 与 Revision 约束保持不变。
 
 ## 验证
 

@@ -401,7 +401,8 @@ typedef struct YuStorageTableResizeHit {
 
 /* Revision-bound, document-space metadata for one visible table column
  * divider. This is a read-only Accessibility/inspection descriptor; it does
- * not open a resize gesture or mutate source, selection, history or layout. */
+ * not open a resize gesture or mutate source, selection, history or layout.
+ * When a session-only column preview exists, geometry reflects that preview. */
 typedef struct YuStorageTableResizeAccessibilityDivider {
     uint64_t revision;
     uint64_t block_index;
@@ -976,7 +977,8 @@ int32_t yu_storage_session_macos_shaped_viewport_blocks(
     YuStorageShapedViewportBlock *blocks, size_t capacity, size_t *written);
 /* Returns read-only, document-space descriptors for visible table column
  * dividers. The first call may use null output/zero capacity to query count;
- * no resize session is opened and source remains unchanged. */
+ * an existing session-only column preview is reflected, but no resize session
+ * is opened and source remains unchanged. */
 int32_t yu_storage_session_macos_table_resize_accessibility_dividers(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,

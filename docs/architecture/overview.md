@@ -346,10 +346,11 @@ gesture 或 submit failure 会清理 pointer state，并回到 TextKit source fa
 离开窗口或结束/取消 drag 后恢复普通 arrow；hover 不打开 session，也不改变 selection 或 Revision。
 finish 仍只保留 session-only geometry。由于 GFM 没有列宽字段，source 写回必须等待明确的 editor
 command/transaction、格式化规则与 Undo 语义；Accessibility 继续暴露 source-backed semantic tree，
-不伪造无法稳定枚举和操作的 divider 节点。storage FFI 现在额外提供当前 viewport 内的
-Revision-bound、document-space column divider descriptor count/fill；它只描述几何，不打开 gesture
-或改变 source，active composition 返回空集合。真正的 splitter AX element、键盘增减步长和 stale
-element 生命周期仍后置。见 ADR 0167、0168、0169。
+同时把当前 viewport 内的 divider descriptor 投影成真实 NSAccessibility splitter child；splitter 的
+increment/decrement 只更新 Rust session-only preview，不创建 Markdown transaction。descriptor 查询
+会复用当前 column override，所以连续 VoiceOver 动作会累积在有效 divider 上；active composition、
+source Revision 变化、detach 或 stale geometry 会返回空集合并发布 uiElementDestroyed，避免 AX
+保留过期 source/坐标。见 ADR 0167、0168、0169、0170。
 
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和
 marker（task 新项重置为 `[ ]`，ordered marker 在可表示范围内递增）；空 list/task item 的
