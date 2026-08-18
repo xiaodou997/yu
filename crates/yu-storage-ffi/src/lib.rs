@@ -710,6 +710,10 @@ pub const YU_STORAGE_RENDER_PAGE_NONE: u32 = u32::MAX;
 pub const YU_STORAGE_IMAGE_DESTINATION_NONE: u64 = u64::MAX;
 pub const YU_STORAGE_IMAGE_INLINE: u8 = 0;
 pub const YU_STORAGE_IMAGE_REFERENCE: u8 = 1;
+pub const YU_STORAGE_IMAGE_RESOURCE_UNKNOWN: u8 = 0;
+pub const YU_STORAGE_IMAGE_RESOURCE_PENDING: u8 = 1;
+pub const YU_STORAGE_IMAGE_RESOURCE_READY: u8 = 2;
+pub const YU_STORAGE_IMAGE_RESOURCE_FAILED: u8 = 3;
 
 /// Source-backed metadata for one image in the current Markdown Revision.
 /// Destination and reference values are UTF-16 source ranges; native code can
@@ -730,6 +734,9 @@ pub struct YuStorageVisualImage {
     pub reference_end_utf16: u64,
     pub resource_fingerprint: u64,
     pub kind: u8,
+    /// Resource readiness for the current viewport host. This is deliberately
+    /// appended to preserve the existing C ABI layout for older fields.
+    pub resource_status: u8,
 }
 
 /// Owned metadata for one backend-neutral render-plan publication. Atlas
@@ -6476,6 +6483,33 @@ fn image_resource_key(
 }
 
 #[cfg(target_os = "macos")]
+fn macos_image_resource_status(
+    host: Option<&MacosRenderHostState>,
+    key: Option<&ImageKey>,
+    revision: u64,
+) -> u8 {
+    let (Some(host), Some(key)) = (host, key) else {
+        return YU_STORAGE_IMAGE_RESOURCE_UNKNOWN;
+    };
+    let resources = &host.image_resources;
+    let fingerprint = key.fingerprint();
+    if resources.publications.contains_key(&fingerprint) {
+        return YU_STORAGE_IMAGE_RESOURCE_READY;
+    }
+    if resources
+        .cache
+        .failure(key)
+        .is_some_and(|failure| failure.revision().get() == revision)
+    {
+        return YU_STORAGE_IMAGE_RESOURCE_FAILED;
+    }
+    if resources.in_flight.contains(key) || resources.intrinsics.contains_key(&fingerprint) {
+        return YU_STORAGE_IMAGE_RESOURCE_PENDING;
+    }
+    YU_STORAGE_IMAGE_RESOURCE_UNKNOWN
+}
+
+#[cfg(target_os = "macos")]
 fn macos_image_requests(
     session: &mut YuStorageSession,
     block_indices: &[(usize, ImageRequestPriority)],
@@ -6543,6 +6577,7 @@ fn macos_visual_images(
         .markdown()
         .reference_definitions()
         .clone();
+    let host = session.macos_render_host.as_ref();
     let mut encoded = Vec::new();
     for block_index in 0..session.session.block_count() {
         let projection = session
@@ -6559,9 +6594,13 @@ fn macos_visual_images(
                 image_utf16_range(&source, destination)?;
             let (reference_start_utf16, reference_end_utf16) =
                 image_utf16_range(&source, image.reference())?;
-            let resource_fingerprint = image_resource_key(&source, image, &definitions)
+            let resource_key = image_resource_key(&source, image, &definitions);
+            let resource_fingerprint = resource_key
+                .as_ref()
                 .map(|key| key.fingerprint())
                 .unwrap_or(0);
+            let resource_status =
+                macos_image_resource_status(host, resource_key.as_ref(), source.revision().get());
             encoded.push(YuStorageVisualImage {
                 revision: source.revision().get(),
                 block_index: u64::try_from(block_index)
@@ -6580,6 +6619,7 @@ fn macos_visual_images(
                 } else {
                     YU_STORAGE_IMAGE_INLINE
                 },
+                resource_status,
             });
         }
     }
@@ -8666,6 +8706,11 @@ mod tests {
         assert_eq!(images[1].kind, YU_STORAGE_IMAGE_REFERENCE);
         assert!(images.iter().all(|image| image.revision == 0));
         assert!(images.iter().all(|image| image.resource_fingerprint != 0));
+        assert!(
+            images
+                .iter()
+                .all(|image| image.resource_status == YU_STORAGE_IMAGE_RESOURCE_UNKNOWN)
+        );
         assert_eq!(
             images[1].destination_end_utf16 - images[1].destination_start_utf16,
             "icons/yu.png".encode_utf16().count() as u64

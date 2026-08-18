@@ -584,6 +584,10 @@ enum {
     YU_STORAGE_IMAGE_DESTINATION_NONE = UINT64_MAX,
     YU_STORAGE_IMAGE_INLINE = 0,
     YU_STORAGE_IMAGE_REFERENCE = 1,
+    YU_STORAGE_IMAGE_RESOURCE_UNKNOWN = 0,
+    YU_STORAGE_IMAGE_RESOURCE_PENDING = 1,
+    YU_STORAGE_IMAGE_RESOURCE_READY = 2,
+    YU_STORAGE_IMAGE_RESOURCE_FAILED = 3,
 };
 
 /* Source-backed image metadata. Destination/reference values are UTF-16
@@ -602,6 +606,7 @@ typedef struct YuStorageVisualImage {
     uint64_t reference_end_utf16;
     uint64_t resource_fingerprint;
     uint8_t kind;
+    uint8_t resource_status;
 } YuStorageVisualImage;
 
 typedef struct YuStorageVisualRenderPlanSnapshot {
