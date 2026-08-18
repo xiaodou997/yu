@@ -764,14 +764,17 @@ private func applyEmbeddedResourceFallback(
     refreshNeeded: inout Bool
 ) -> Bool {
     switch status {
-    case UInt8(YU_STORAGE_IMAGE_RESOURCE_READY):
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_READY):
         return true
-    case UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING),
-         UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED):
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_PENDING),
+         UInt8(YU_STORAGE_EMBEDDED_RESOURCE_FAILED):
         fallbackRanges.append(sourceRange)
         refreshNeeded = true
         return true
-    case UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN):
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED):
+        fallbackRanges.append(sourceRange)
+        return true
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNKNOWN):
         if resourceFingerprint == 0 {
             fallbackRanges.append(sourceRange)
             return true
@@ -781,6 +784,37 @@ private func applyEmbeddedResourceFallback(
     default:
         refreshNeeded = true
         return false
+    }
+}
+
+private struct NativeVisualEmbeddedResource {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let sourceRange: NSRange
+    let infoRange: NSRange
+    let contentRange: NSRange
+    let resourceFingerprint: UInt64
+    let kind: UInt8
+    let resourceStatus: UInt8
+
+    init(_ value: YuStorageVisualEmbeddedResource) {
+        revision = value.revision
+        blockIndex = value.block_index
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        infoRange = NSRange(
+            location: Int(value.info_start_utf16),
+            length: Int(value.info_end_utf16 - value.info_start_utf16)
+        )
+        contentRange = NSRange(
+            location: Int(value.content_start_utf16),
+            length: Int(value.content_end_utf16 - value.content_start_utf16)
+        )
+        resourceFingerprint = value.resource_fingerprint
+        kind = value.kind
+        resourceStatus = value.resource_status
     }
 }
 
@@ -2495,6 +2529,37 @@ private final class StorageBridge {
             throw BridgeError.operation(fillStatus)
         }
         return values.map(NativeVisualImage.init)
+    }
+
+    func macosVisualEmbeddedResources(
+        revision: UInt64
+    ) throws -> [NativeVisualEmbeddedResource] {
+        var required = 0
+        let sizeStatus = yu_storage_session_macos_visual_embedded_resources(
+            handle,
+            revision,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var values = Array(repeating: YuStorageVisualEmbeddedResource(), count: required)
+        var written = required
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_macos_visual_embedded_resources(
+                handle,
+                revision,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard fillStatus == StorageStatus.ok, written == required else {
+            throw BridgeError.operation(fillStatus)
+        }
+        return values.map(NativeVisualEmbeddedResource.init)
     }
 
     func macosVisualSceneGlyphs(
@@ -6140,6 +6205,30 @@ private final class MacosSurfaceHostCoordinator {
                     return
                 }
             }
+            if blocks.contains(where: {
+                $0.kind == UInt8(YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE)
+            }) {
+                let embeddedResources = try bridge.macosVisualEmbeddedResources(
+                    revision: revision
+                )
+                for resource in embeddedResources
+                    where visibleBlockIndexes.contains(resource.blockIndex) {
+                    guard applyEmbeddedResourceFallback(
+                        status: resource.resourceStatus,
+                        sourceRange: resource.sourceRange,
+                        resourceFingerprint: resource.resourceFingerprint,
+                        fallbackRanges: &fallbackRanges,
+                        refreshNeeded: &imageRefreshNeeded
+                    ) else {
+                        sourceFallbackCoverage = VisualSourceFallbackCoverage(
+                            revision: revision,
+                            ranges: [],
+                            complete: false
+                        )
+                        return
+                    }
+                }
+            }
             sourceFallbackCoverage = VisualSourceFallbackCoverage(
                 revision: revision,
                 ranges: fallbackRanges,
@@ -9294,6 +9383,49 @@ private func runVisualImageSelfCheck(path: String) -> Never {
     }
 }
 
+private func runVisualEmbeddedResourceSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let resources = try bridge.macosVisualEmbeddedResources(revision: revision)
+        precondition(resources.count == 2)
+        let mathKind = UInt8(YU_STORAGE_EMBEDDED_MATH)
+        let mermaidKind = UInt8(YU_STORAGE_EMBEDDED_MERMAID)
+        precondition(resources.contains { $0.kind == mathKind })
+        precondition(resources.contains { $0.kind == mermaidKind })
+        for resource in resources {
+            precondition(resource.revision == revision)
+            precondition(resource.sourceRange.location >= 0)
+            precondition(
+                NSMaxRange(resource.sourceRange) <= (bridge.source as NSString).length
+            )
+            precondition(NSMaxRange(resource.infoRange) <= (bridge.source as NSString).length)
+            precondition(NSMaxRange(resource.contentRange) <= (bridge.source as NSString).length)
+            precondition(resource.resourceFingerprint != 0)
+            precondition(
+                resource.resourceStatus
+                    == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
+            )
+        }
+
+        _ = try bridge.insertText("x")
+        do {
+            _ = try bridge.macosVisualEmbeddedResources(revision: revision)
+            preconditionFailure("stale embedded resource metadata unexpectedly succeeded")
+        } catch BridgeError.operation(let status) {
+            precondition(status == StorageStatus.staleRevision)
+        }
+        print(
+            "Yu Visual Embedded Resource self-check: Math/Mermaid source, info/content ranges, "
+                + "unsupported status and stale Revision rejection are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Visual Embedded Resource self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runVisualRenderPlanSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -10090,6 +10222,22 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
             )
         )
 
+        if bridge.source.contains("```mermaid") || bridge.source.contains("```math") {
+            let embeddedResources = try bridge.macosVisualEmbeddedResources(
+                revision: bridge.state.revision
+            )
+            let fallbackRanges = coordinator.sourceFallbackCoverage?.ranges ?? []
+            precondition(!embeddedResources.isEmpty)
+            precondition(
+                embeddedResources.allSatisfy { resource in
+                    fallbackRanges.contains {
+                        NSIntersectionRange($0, resource.sourceRange).length
+                            == resource.sourceRange.length
+                    }
+                }
+            )
+        }
+
         var asyncImageRefreshReady = false
         if bridge.source.contains("![") {
             let deadline = Date(timeIntervalSinceNow: 3.0)
@@ -10716,6 +10864,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-image-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualImageSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--visual-embedded-resource-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runVisualEmbeddedResourceSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-scene-glyph-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

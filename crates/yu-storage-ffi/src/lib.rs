@@ -714,6 +714,13 @@ pub const YU_STORAGE_IMAGE_RESOURCE_UNKNOWN: u8 = 0;
 pub const YU_STORAGE_IMAGE_RESOURCE_PENDING: u8 = 1;
 pub const YU_STORAGE_IMAGE_RESOURCE_READY: u8 = 2;
 pub const YU_STORAGE_IMAGE_RESOURCE_FAILED: u8 = 3;
+pub const YU_STORAGE_EMBEDDED_RESOURCE_UNKNOWN: u8 = 0;
+pub const YU_STORAGE_EMBEDDED_RESOURCE_PENDING: u8 = 1;
+pub const YU_STORAGE_EMBEDDED_RESOURCE_READY: u8 = 2;
+pub const YU_STORAGE_EMBEDDED_RESOURCE_FAILED: u8 = 3;
+pub const YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED: u8 = 4;
+pub const YU_STORAGE_EMBEDDED_MATH: u8 = 0;
+pub const YU_STORAGE_EMBEDDED_MERMAID: u8 = 1;
 
 /// Source-backed metadata for one image in the current Markdown Revision.
 /// Destination and reference values are UTF-16 source ranges; native code can
@@ -736,6 +743,26 @@ pub struct YuStorageVisualImage {
     pub kind: u8,
     /// Resource readiness for the current viewport host. This is deliberately
     /// appended to preserve the existing C ABI layout for older fields.
+    pub resource_status: u8,
+}
+
+/// Source-backed metadata for an embedded Math or Mermaid fenced block.
+/// Renderer state is intentionally separate from the Markdown source: native
+/// code can keep the complete source range visible until a future renderer
+/// publishes a revision-bound resource.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageVisualEmbeddedResource {
+    pub revision: u64,
+    pub block_index: u64,
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    pub info_start_utf16: u64,
+    pub info_end_utf16: u64,
+    pub content_start_utf16: u64,
+    pub content_end_utf16: u64,
+    pub resource_fingerprint: u64,
+    pub kind: u8,
     pub resource_status: u8,
 }
 
@@ -6627,6 +6654,86 @@ fn macos_visual_images(
 }
 
 #[cfg(target_os = "macos")]
+fn embedded_resource_kind(source: &TextSnapshot, info: TextRange) -> Option<u8> {
+    let start = usize::try_from(info.start().get()).ok()?;
+    let end = usize::try_from(info.end().get()).ok()?;
+    let language = source.as_str().get(start..end)?.split_whitespace().next()?;
+    if language.eq_ignore_ascii_case("mermaid") {
+        Some(YU_STORAGE_EMBEDDED_MERMAID)
+    } else if language.eq_ignore_ascii_case("math")
+        || language.eq_ignore_ascii_case("latex")
+        || language.eq_ignore_ascii_case("tex")
+        || language.eq_ignore_ascii_case("katex")
+    {
+        Some(YU_STORAGE_EMBEDDED_MATH)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange, kind: u8) -> u64 {
+    let start = usize::try_from(source_range.start().get()).ok();
+    let end = usize::try_from(source_range.end().get()).ok();
+    let bytes = start
+        .zip(end)
+        .and_then(|(start, end)| source.as_str().as_bytes().get(start..end));
+    let mut hash = 1_469_598_103_934_665_603_u64 ^ u64::from(kind);
+    if let Some(bytes) = bytes {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(1_099_511_628_211_u64);
+        }
+    }
+    hash
+}
+
+#[cfg(target_os = "macos")]
+fn macos_visual_embedded_resources(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+) -> Result<Vec<YuStorageVisualEmbeddedResource>, i32> {
+    validate_revision(&session.session, expected_revision)?;
+    let source = session.session.snapshot();
+    let mut encoded = Vec::new();
+    for block_index in 0..session.session.block_count() {
+        let projection = session
+            .session
+            .block_projection(block_index)
+            .map_err(storage_status)?;
+        let BlockProjection::FencedCode(code) = projection else {
+            continue;
+        };
+        let Some(kind) = embedded_resource_kind(&source, code.info_string()) else {
+            continue;
+        };
+        let (source_start_utf16, source_end_utf16) =
+            image_utf16_range(&source, Some(code.source_range()))?;
+        let (info_start_utf16, info_end_utf16) =
+            image_utf16_range(&source, Some(code.info_string()))?;
+        let (content_start_utf16, content_end_utf16) =
+            image_utf16_range(&source, Some(code.content()))?;
+        encoded.push(YuStorageVisualEmbeddedResource {
+            revision: source.revision().get(),
+            block_index: u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+            source_start_utf16,
+            source_end_utf16,
+            info_start_utf16,
+            info_end_utf16,
+            content_start_utf16,
+            content_end_utf16,
+            resource_fingerprint: embedded_resource_fingerprint(&source, code.source_range(), kind),
+            kind,
+            // Math/Mermaid renderers are intentionally not part of this
+            // stage; publishing an explicit unsupported state keeps source
+            // fallback precise without pretending the block was rendered.
+            resource_status: YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED,
+        });
+    }
+    Ok(encoded)
+}
+
+#[cfg(target_os = "macos")]
 type MacosVisualRenderPlan = (
     YuStorageVisualRenderPlanSnapshot,
     Vec<YuStorageVisualRenderCommand>,
@@ -8097,6 +8204,63 @@ pub unsafe extern "C" fn yu_storage_session_macos_visual_images(
     }
 }
 
+/// Returns source-backed Math/Mermaid fenced-block metadata for the current
+/// Markdown Revision. The current stage publishes these resources as
+/// explicitly unsupported, so native hosts retain their complete source range
+/// until a renderer is added.
+///
+/// # Safety
+/// `session` must be null or a live handle. `embedded` and `written` must be
+/// writable. `embedded` must point to `capacity` writable entries when
+/// `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_visual_embedded_resources(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    embedded: *mut YuStorageVisualEmbeddedResource,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && embedded.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` was checked above and belongs to the caller.
+    unsafe { *written = 0 };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session, expected_revision, embedded, capacity);
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let encoded = match macos_visual_embedded_resources(session, expected_revision) {
+            Ok(resources) => resources,
+            Err(status) => return status,
+        };
+        // SAFETY: `written` was checked above and belongs to the caller.
+        unsafe { *written = encoded.len() };
+        if capacity == 0 && embedded.is_null() {
+            return YU_STORAGE_OK;
+        }
+        if encoded.len() > capacity {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+        if !encoded.is_empty() {
+            // SAFETY: capacity was checked against the encoded resource count.
+            unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), embedded, encoded.len()) };
+        }
+        YU_STORAGE_OK
+    }
+}
+
 /// Resolves the current focus caret through the macOS CoreText-shaped
 /// viewport policy. `caret_y` is document-space, while `current_scroll_y` and
 /// `target_scroll_y` are absolute document scroll offsets. The native host
@@ -8729,6 +8893,96 @@ mod tests {
                     0,
                     images.as_mut_ptr(),
                     images.len(),
+                    &mut stale_written,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(stale_written, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_visual_embedded_resources_publish_math_and_mermaid_ranges() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-embedded-{id}.md"));
+        let source = "```mermaid\nflowchart TD\n    A --> B\n```\n\n```math\nx^2 + y^2\n```\n\n```rust\nfn main() {}\n```\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_embedded_resources(
+                    raw,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(required, 2);
+        let mut resources = vec![YuStorageVisualEmbeddedResource::default(); required];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_embedded_resources(
+                    raw,
+                    0,
+                    resources.as_mut_ptr(),
+                    resources.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, 2);
+        assert_eq!(resources[0].kind, YU_STORAGE_EMBEDDED_MERMAID);
+        assert_eq!(resources[1].kind, YU_STORAGE_EMBEDDED_MATH);
+        assert!(resources.iter().all(|resource| resource.revision == 0));
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.resource_fingerprint != 0)
+        );
+        assert!(resources.iter().all(|resource| {
+            resource.resource_status == YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
+        }));
+        let mermaid_source = source.find("```mermaid").expect("mermaid source");
+        let mermaid_end = source[mermaid_source..]
+            .find("```\n\n")
+            .map(|end| mermaid_source + end + 4)
+            .expect("mermaid fence");
+        assert_eq!(
+            resources[0].source_end_utf16 - resources[0].source_start_utf16,
+            source[mermaid_source..mermaid_end].encode_utf16().count() as u64
+        );
+        assert!(resources[0].content_end_utf16 > resources[0].content_start_utf16);
+        assert!(resources[1].info_end_utf16 > resources[1].info_start_utf16);
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"x".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        let mut stale_written = 99;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_embedded_resources(
+                    raw,
+                    0,
+                    resources.as_mut_ptr(),
+                    resources.len(),
                     &mut stale_written,
                 )
             },
