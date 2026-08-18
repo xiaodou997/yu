@@ -751,6 +751,39 @@ private struct VisualSourceFallbackCoverage: Equatable {
     }
 }
 
+/// Applies the shared source-fallback policy for an embedded resource. Images
+/// use it today; Math/Mermaid renderers can feed the same decision once their
+/// resource publication state is exposed through the backend-neutral ABI.
+/// Returning `false` is fail-closed: the caller must keep the whole source
+/// mirror visible because a non-zero resource identity was not classified.
+private func applyEmbeddedResourceFallback(
+    status: UInt8,
+    sourceRange: NSRange,
+    resourceFingerprint: UInt64,
+    fallbackRanges: inout [NSRange],
+    refreshNeeded: inout Bool
+) -> Bool {
+    switch status {
+    case UInt8(YU_STORAGE_IMAGE_RESOURCE_READY):
+        return true
+    case UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING),
+         UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED):
+        fallbackRanges.append(sourceRange)
+        refreshNeeded = true
+        return true
+    case UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN):
+        if resourceFingerprint == 0 {
+            fallbackRanges.append(sourceRange)
+            return true
+        }
+        refreshNeeded = true
+        return false
+    default:
+        refreshNeeded = true
+        return false
+    }
+}
+
 private struct NativeMacosRenderHostSnapshot {
     let revision: UInt64
     let compositionGeneration: UInt64
@@ -5425,6 +5458,9 @@ private struct TableResizePointerState {
 /// the already validated synchronous FFI submit protocol and detaches before
 /// the view leaves its window.
 private final class MacosSurfaceHostCoordinator {
+    private static let maxImageRefreshAttempts = 40
+    private static let imageRefreshDelay: DispatchTimeInterval = .milliseconds(50)
+
     private struct MetricsKey: Equatable {
         let revision: UInt64
         let size: Double
@@ -5460,6 +5496,9 @@ private final class MacosSurfaceHostCoordinator {
     private(set) var sourceFallbackCoverage: VisualSourceFallbackCoverage?
     private var submitScheduled = false
     private var scheduleToken: UInt64 = 0
+    private var imageRefreshTask: DispatchWorkItem?
+    private var imageRefreshAttempts = 0
+    private var imageRefreshNeeded = false
     private var tableResizePointerState = TableResizePointerState()
 
     var onError: ((Error) -> Void)?
@@ -5479,6 +5518,7 @@ private final class MacosSurfaceHostCoordinator {
         if isAttached {
             detach()
         }
+        cancelImageResourceRefresh()
         scheduleToken &+= 1
         self.surfaceView = surfaceView
         self.scrollView = scrollView
@@ -5488,6 +5528,7 @@ private final class MacosSurfaceHostCoordinator {
         lastSubmitKey = nil
         lastSnapshot = nil
         sourceFallbackCoverage = nil
+        imageRefreshNeeded = false
         tableResizePointerState.reset()
         isAttached = false
         surfaceView.setNativeContentVisible(false)
@@ -5567,6 +5608,7 @@ private final class MacosSurfaceHostCoordinator {
     }
 
     func scheduleSubmit() {
+        imageRefreshAttempts = 0
         guard !submitScheduled else { return }
         submitScheduled = true
         let token = scheduleToken
@@ -5578,11 +5620,55 @@ private final class MacosSurfaceHostCoordinator {
             } catch {
                 self.clearTableResizeState()
                 self.sourceFallbackCoverage = nil
+                self.imageRefreshNeeded = false
+                self.cancelImageResourceRefresh()
                 self.surfaceView?.setNativeContentVisible(false)
                 self.onSurfaceStateChange?()
                 self.onError?(error)
             }
         }
+    }
+
+    private func cancelImageResourceRefresh() {
+        imageRefreshTask?.cancel()
+        imageRefreshTask = nil
+        imageRefreshAttempts = 0
+    }
+
+    /// Polls only while the current viewport has an image resource that is
+    /// pending, failed, or otherwise unproven. The Rust worker is deliberately
+    /// asynchronous and has no callback into AppKit, so a short bounded poll
+    /// is the smallest safe bridge. Every attempt invalidates the submit key
+    /// to force Rust to drain worker results and republish the frame.
+    private func scheduleImageResourceRefresh() {
+        guard imageRefreshNeeded,
+              isAttached,
+              imageRefreshTask == nil,
+              imageRefreshAttempts < Self.maxImageRefreshAttempts else {
+            return
+        }
+        let token = scheduleToken
+        imageRefreshAttempts += 1
+        let task = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.scheduleToken == token,
+                  self.isAttached else {
+                return
+            }
+            self.imageRefreshTask = nil
+            self.lastSubmitKey = nil
+            do {
+                _ = try self.submitNow()
+            } catch {
+                self.imageRefreshNeeded = false
+                self.cancelImageResourceRefresh()
+                self.surfaceView?.setNativeContentVisible(false)
+                self.onSurfaceStateChange?()
+                self.onError?(error)
+            }
+        }
+        imageRefreshTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.imageRefreshDelay, execute: task)
     }
 
     /// Publishes CoreText metrics before a vertical editor command enters the
@@ -5985,6 +6071,7 @@ private final class MacosSurfaceHostCoordinator {
         scrollY: Float,
         viewportHeight: Float
     ) {
+        imageRefreshNeeded = false
         // An empty plan or an unknown command kind already forces the full
         // source fallback. There is no useful block range to overlay in that
         // case, so keep the coverage contract complete and let the publication
@@ -6038,27 +6125,13 @@ private final class MacosSurfaceHostCoordinator {
             let visibleBlockIndexes = Set(blocks.map(\.blockIndex))
             let images = try bridge.macosVisualImages(revision: revision)
             for image in images where visibleBlockIndexes.contains(image.blockIndex) {
-                switch image.resourceStatus {
-                case UInt8(YU_STORAGE_IMAGE_RESOURCE_READY):
-                    break
-                case UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING),
-                     UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED):
-                    fallbackRanges.append(image.sourceRange)
-                case UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN):
-                    // A missing destination has an exact source range we can
-                    // keep visible. A non-zero key with no host state cannot
-                    // be proven safe, so fail closed for the whole source.
-                    if image.resourceFingerprint == 0 {
-                        fallbackRanges.append(image.sourceRange)
-                    } else {
-                        sourceFallbackCoverage = VisualSourceFallbackCoverage(
-                            revision: revision,
-                            ranges: [],
-                            complete: false
-                        )
-                        return
-                    }
-                default:
+                guard applyEmbeddedResourceFallback(
+                    status: image.resourceStatus,
+                    sourceRange: image.sourceRange,
+                    resourceFingerprint: image.resourceFingerprint,
+                    fallbackRanges: &fallbackRanges,
+                    refreshNeeded: &imageRefreshNeeded
+                ) else {
                     sourceFallbackCoverage = VisualSourceFallbackCoverage(
                         revision: revision,
                         ranges: [],
@@ -6122,6 +6195,7 @@ private final class MacosSurfaceHostCoordinator {
             // surface; source TextKit remains the canonical visible fallback
             // until a publication with actual draw commands exists.
             surfaceView.setNativeContentVisible(lastSnapshot?.hasVisualContent == true)
+            scheduleImageResourceRefresh()
             return lastSnapshot
         }
 
@@ -6155,12 +6229,18 @@ private final class MacosSurfaceHostCoordinator {
         )
         surfaceView.setNativeContentVisible(snapshot.hasVisualContent)
         onSurfaceStateChange?()
+        if imageRefreshNeeded {
+            scheduleImageResourceRefresh()
+        } else {
+            cancelImageResourceRefresh()
+        }
         return snapshot
     }
 
     func detach() {
         scheduleToken &+= 1
         submitScheduled = false
+        cancelImageResourceRefresh()
         clearTableResizeState()
         if isAttached {
             do {
@@ -6173,6 +6253,7 @@ private final class MacosSurfaceHostCoordinator {
         lastSubmitKey = nil
         lastSnapshot = nil
         sourceFallbackCoverage = nil
+        imageRefreshNeeded = false
         metrics = nil
         surfaceView?.setNativeContentVisible(false)
         onSurfaceStateChange?()
@@ -7964,6 +8045,51 @@ private func runVisualRenderStateSelfCheck() -> Never {
         complete: true
     )
     precondition(partialCoverage.ranges == [NSRange(location: 12, length: 8)])
+    var embeddedFallbackRanges: [NSRange] = []
+    var embeddedRefreshNeeded = false
+    precondition(
+        applyEmbeddedResourceFallback(
+            status: UInt8(YU_STORAGE_IMAGE_RESOURCE_READY),
+            sourceRange: NSRange(location: 1, length: 2),
+            resourceFingerprint: 7,
+            fallbackRanges: &embeddedFallbackRanges,
+            refreshNeeded: &embeddedRefreshNeeded
+        )
+    )
+    precondition(embeddedFallbackRanges.isEmpty)
+    precondition(
+        applyEmbeddedResourceFallback(
+            status: UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING),
+            sourceRange: NSRange(location: 3, length: 2),
+            resourceFingerprint: 7,
+            fallbackRanges: &embeddedFallbackRanges,
+            refreshNeeded: &embeddedRefreshNeeded
+        )
+    )
+    precondition(embeddedFallbackRanges == [NSRange(location: 3, length: 2)])
+    precondition(embeddedRefreshNeeded)
+    precondition(
+        applyEmbeddedResourceFallback(
+            status: UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN),
+            sourceRange: NSRange(location: 5, length: 2),
+            resourceFingerprint: 0,
+            fallbackRanges: &embeddedFallbackRanges,
+            refreshNeeded: &embeddedRefreshNeeded
+        )
+    )
+    precondition(embeddedFallbackRanges == [
+        NSRange(location: 3, length: 2),
+        NSRange(location: 5, length: 2)
+    ])
+    precondition(
+        !applyEmbeddedResourceFallback(
+            status: UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN),
+            sourceRange: NSRange(location: 7, length: 2),
+            resourceFingerprint: 9,
+            fallbackRanges: &embeddedFallbackRanges,
+            refreshNeeded: &embeddedRefreshNeeded
+        )
+    )
     precondition(
         acceptedVisualRenderFrame(
             revision: 7,
@@ -9886,6 +10012,8 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
 
 private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
     do {
+        let imageFixture = try installMacosImageSelfCheckFixture(at: path)
+        defer { removeMacosImageSelfCheckFixture(imageFixture) }
         let bridge = try StorageBridge(path: path)
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
@@ -9962,6 +10090,23 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
             )
         )
 
+        var asyncImageRefreshReady = false
+        if bridge.source.contains("![") {
+            let deadline = Date(timeIntervalSinceNow: 3.0)
+            while Date() < deadline {
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+                if let snapshot = coordinator.lastSnapshot,
+                   snapshot.imageResourceCount > 0,
+                   let coverage = coordinator.sourceFallbackCoverage,
+                   coverage.complete,
+                   coverage.ranges.isEmpty {
+                    asyncImageRefreshReady = true
+                    break
+                }
+            }
+            precondition(asyncImageRefreshReady)
+        }
+
         let resizedFrame = NSRect(x: 0.0, y: 0.0, width: 540.0, height: 280.0)
         root.setFrameSize(resizedFrame.size)
         surfaceView.frame = resizedFrame
@@ -10026,9 +10171,11 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         precondition(!surfaceView.nativeContentVisible)
         coordinator.detach()
         precondition(errors.isEmpty, errors.joined(separator: "; "))
+        removeMacosImageSelfCheckFixture(imageFixture)
         print(
             "Yu macOS surface lifecycle self-check: product NSView attach, resize, scroll, "
                 + "edit revision and close detach are valid"
+                + (asyncImageRefreshReady ? "; async image refresh is valid" : "")
         )
         exit(EXIT_SUCCESS)
     } catch {
