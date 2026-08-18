@@ -17,7 +17,7 @@ use std::ptr;
 use std::collections::{BTreeMap, HashSet};
 
 use yu_assets::ImageKey;
-use yu_core::{ByteOffset, LineIndex, TextRange, Utf16Offset, Utf16Range};
+use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
@@ -47,8 +47,10 @@ use yu_workspace::{
 
 #[cfg(target_os = "macos")]
 use yu_assets::{
-    ImageCache, ImageFailureKind, ImageIntrinsicPublication, ImagePublication, ImageRequest,
-    ImageRequestCandidate, ImageRequestPlan, ImageRequestPriority, ImageRequestResult,
+    EmbeddedFailureKind, EmbeddedRenderRequest, EmbeddedRenderer, EmbeddedRequestResult,
+    EmbeddedResourceCache, EmbeddedResourceKind, ImageCache, ImageFailureKind,
+    ImageIntrinsicPublication, ImagePublication, ImageRequest, ImageRequestCandidate,
+    ImageRequestPlan, ImageRequestPriority, ImageRequestResult, UnsupportedEmbeddedRenderer,
 };
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
@@ -1071,6 +1073,37 @@ struct MacosImageResourceState {
 }
 
 #[cfg(target_os = "macos")]
+struct MacosEmbeddedResourceState {
+    cache: EmbeddedResourceCache,
+    renderer: Box<dyn EmbeddedRenderer>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosEmbeddedResourceState {
+    fn new() -> Self {
+        Self {
+            cache: EmbeddedResourceCache::new(),
+            renderer: Box::new(UnsupportedEmbeddedRenderer),
+        }
+    }
+
+    fn status_for(
+        &mut self,
+        request: EmbeddedRenderRequest,
+        revision: Revision,
+    ) -> Result<u8, i32> {
+        let _ = self.cache.request(request.clone());
+        while self
+            .cache
+            .render_pending(revision, self.renderer.as_ref())
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
+            .is_some()
+        {}
+        Ok(macos_embedded_resource_status(self.cache.request(request)))
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn macos_image_failure_kind(error: &MacosImageDecodeError) -> ImageFailureKind {
     match error {
         MacosImageDecodeError::UnsupportedPlatform => ImageFailureKind::Unsupported,
@@ -1228,6 +1261,8 @@ pub struct YuStorageSession {
     table_resize_override: Option<TableResizeCommit>,
     #[cfg(target_os = "macos")]
     macos_render_host: Option<MacosRenderHostState>,
+    #[cfg(target_os = "macos")]
+    macos_embedded_resources: MacosEmbeddedResourceState,
 }
 
 fn read_utf8<'a>(pointer: *const u8, length: usize) -> Result<&'a str, i32> {
@@ -3088,6 +3123,8 @@ pub unsafe extern "C" fn yu_storage_session_open(
         table_resize_override: None,
         #[cfg(target_os = "macos")]
         macos_render_host: None,
+        #[cfg(target_os = "macos")]
+        macos_embedded_resources: MacosEmbeddedResourceState::new(),
     });
     // SAFETY: the pointer is transferred to the native caller as an opaque
     // handle and is reclaimed only by `yu_storage_session_destroy`.
@@ -6672,6 +6709,40 @@ fn embedded_resource_kind(source: &TextSnapshot, info: TextRange) -> Option<u8> 
 }
 
 #[cfg(target_os = "macos")]
+fn embedded_resource_kind_from_ffi(kind: u8) -> Option<EmbeddedResourceKind> {
+    match kind {
+        YU_STORAGE_EMBEDDED_MATH => Some(EmbeddedResourceKind::Math),
+        YU_STORAGE_EMBEDDED_MERMAID => Some(EmbeddedResourceKind::Mermaid),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_embedded_resource_status(result: EmbeddedRequestResult) -> u8 {
+    match result {
+        EmbeddedRequestResult::Ready(_) => YU_STORAGE_EMBEDDED_RESOURCE_READY,
+        EmbeddedRequestResult::Pending => YU_STORAGE_EMBEDDED_RESOURCE_PENDING,
+        EmbeddedRequestResult::Failed(failure) => match failure.kind() {
+            EmbeddedFailureKind::Unsupported => YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED,
+            EmbeddedFailureKind::InvalidSource
+            | EmbeddedFailureKind::Render
+            | EmbeddedFailureKind::Worker => YU_STORAGE_EMBEDDED_RESOURCE_FAILED,
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn embedded_resource_content(source: &TextSnapshot, content: TextRange) -> Result<String, i32> {
+    let start = usize::try_from(content.start().get()).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    let end = usize::try_from(content.end().get()).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    source
+        .as_str()
+        .get(start..end)
+        .map(str::to_owned)
+        .ok_or(YU_STORAGE_EDITOR_ERROR)
+}
+
+#[cfg(target_os = "macos")]
 fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange, kind: u8) -> u64 {
     let start = usize::try_from(source_range.start().get()).ok();
     let end = usize::try_from(source_range.end().get()).ok();
@@ -6695,6 +6766,7 @@ fn macos_visual_embedded_resources(
 ) -> Result<Vec<YuStorageVisualEmbeddedResource>, i32> {
     validate_revision(&session.session, expected_revision)?;
     let source = session.session.snapshot();
+    let revision = source.revision();
     let mut encoded = Vec::new();
     for block_index in 0..session.session.block_count() {
         let projection = session
@@ -6707,6 +6779,22 @@ fn macos_visual_embedded_resources(
         let Some(kind) = embedded_resource_kind(&source, code.info_string()) else {
             continue;
         };
+        let embedded_kind = embedded_resource_kind_from_ffi(kind).ok_or(YU_STORAGE_EDITOR_ERROR)?;
+        let content = embedded_resource_content(&source, code.content())?;
+        // An empty fenced body is still a valid source-backed resource. Keep
+        // it in the cache path with a trim-neutral sentinel so the FFI can
+        // publish unsupported/failed state instead of rejecting metadata.
+        let content = if content.is_empty() {
+            "\n".to_owned()
+        } else {
+            content
+        };
+        let request =
+            EmbeddedRenderRequest::new(revision, code.source_range(), embedded_kind, content)
+                .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+        let resource_status = session
+            .macos_embedded_resources
+            .status_for(request, revision)?;
         let (source_start_utf16, source_end_utf16) =
             image_utf16_range(&source, Some(code.source_range()))?;
         let (info_start_utf16, info_end_utf16) =
@@ -6724,10 +6812,7 @@ fn macos_visual_embedded_resources(
             content_end_utf16,
             resource_fingerprint: embedded_resource_fingerprint(&source, code.source_range(), kind),
             kind,
-            // Math/Mermaid renderers are intentionally not part of this
-            // stage; publishing an explicit unsupported state keeps source
-            // fallback precise without pretending the block was rendered.
-            resource_status: YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED,
+            resource_status,
         });
     }
     Ok(encoded)
@@ -8205,9 +8290,9 @@ pub unsafe extern "C" fn yu_storage_session_macos_visual_images(
 }
 
 /// Returns source-backed Math/Mermaid fenced-block metadata for the current
-/// Markdown Revision. The current stage publishes these resources as
-/// explicitly unsupported, so native hosts retain their complete source range
-/// until a renderer is added.
+/// Markdown Revision. Requests pass through the session-owned embedded cache;
+/// the default host renderer is explicitly unsupported, so native hosts retain
+/// their complete source range until a concrete renderer is registered.
 ///
 /// # Safety
 /// `session` must be null or a live handle. `embedded` and `written` must be
@@ -8816,6 +8901,8 @@ mod tests {
             table_resize_override: None,
             #[cfg(target_os = "macos")]
             macos_render_host: None,
+            #[cfg(target_os = "macos")]
+            macos_embedded_resources: MacosEmbeddedResourceState::new(),
         };
         assert_eq!(
             close_state(session.session.close_state()),
@@ -8932,6 +9019,10 @@ mod tests {
             YU_STORAGE_OK
         );
         assert_eq!(required, 2);
+        assert_eq!(
+            unsafe { (*raw).macos_embedded_resources.cache.failure_count() },
+            2
+        );
         let mut resources = vec![YuStorageVisualEmbeddedResource::default(); required];
         let mut written = 0;
         assert_eq!(
@@ -8990,6 +9081,56 @@ mod tests {
         );
         assert_eq!(stale_written, 0);
 
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_visual_embedded_resources_keep_empty_body_on_unsupported_path() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-empty-embedded-{id}.md"));
+        let source = "```math\n```\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_embedded_resources(
+                    raw,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(required, 1);
+        let mut resource = YuStorageVisualEmbeddedResource::default();
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_embedded_resources(
+                    raw,
+                    0,
+                    &mut resource,
+                    1,
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, 1);
+        assert_eq!(
+            resource.resource_status,
+            YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
+        );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }

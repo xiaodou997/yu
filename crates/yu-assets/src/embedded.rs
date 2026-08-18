@@ -686,7 +686,7 @@ impl EmbeddedResourceCache {
 
     /// Runs one pending request through a replaceable renderer. Hosts that
     /// need a real background thread can use `pending` and `complete` instead.
-    pub fn render_pending<R: EmbeddedRenderer>(
+    pub fn render_pending<R: EmbeddedRenderer + ?Sized>(
         &mut self,
         current_revision: Revision,
         renderer: &R,
