@@ -539,6 +539,7 @@ private struct NativeVisualImage {
     let referenceRange: NSRange?
     let resourceFingerprint: UInt64
     let kind: UInt8
+    let resourceStatus: UInt8
 
     init(_ value: YuStorageVisualImage) {
         revision = value.revision
@@ -561,6 +562,7 @@ private struct NativeVisualImage {
         )
         resourceFingerprint = value.resource_fingerprint
         kind = value.kind
+        resourceStatus = value.resource_status
     }
 
     private static func optionalRange(start: UInt64, end: UInt64) -> NSRange? {
@@ -6033,6 +6035,38 @@ private final class MacosSurfaceHostCoordinator {
                 )
                 return
             }
+            let visibleBlockIndexes = Set(blocks.map(\.blockIndex))
+            let images = try bridge.macosVisualImages(revision: revision)
+            for image in images where visibleBlockIndexes.contains(image.blockIndex) {
+                switch image.resourceStatus {
+                case UInt8(YU_STORAGE_IMAGE_RESOURCE_READY):
+                    break
+                case UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING),
+                     UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED):
+                    fallbackRanges.append(image.sourceRange)
+                case UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN):
+                    // A missing destination has an exact source range we can
+                    // keep visible. A non-zero key with no host state cannot
+                    // be proven safe, so fail closed for the whole source.
+                    if image.resourceFingerprint == 0 {
+                        fallbackRanges.append(image.sourceRange)
+                    } else {
+                        sourceFallbackCoverage = VisualSourceFallbackCoverage(
+                            revision: revision,
+                            ranges: [],
+                            complete: false
+                        )
+                        return
+                    }
+                default:
+                    sourceFallbackCoverage = VisualSourceFallbackCoverage(
+                        revision: revision,
+                        ranges: [],
+                        complete: false
+                    )
+                    return
+                }
+            }
             sourceFallbackCoverage = VisualSourceFallbackCoverage(
                 revision: revision,
                 ranges: fallbackRanges,
@@ -9539,17 +9573,16 @@ private func runMacosRenderHostSelfCheck(path: String) -> Never {
 
 private func installMacosImageSelfCheckFixture(at markdownPath: String) throws -> URL? {
     let markdownURL = URL(fileURLWithPath: markdownPath)
-    let imageURL = markdownURL.deletingLastPathComponent()
+    let assetsURL = markdownURL.deletingLastPathComponent()
         .appendingPathComponent("assets", isDirectory: true)
-        .appendingPathComponent("yu-logo.png")
+    let imageURL = assetsURL.appendingPathComponent("yu-logo.png")
+    let referenceImageURL = assetsURL.appendingPathComponent("yu-mark.png")
     let fileManager = FileManager.default
-    guard !fileManager.fileExists(atPath: imageURL.path) else {
+    guard !fileManager.fileExists(atPath: imageURL.path)
+        || !fileManager.fileExists(atPath: referenceImageURL.path) else {
         return nil
     }
-    try fileManager.createDirectory(
-        at: imageURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true
-    )
+    try fileManager.createDirectory(at: assetsURL, withIntermediateDirectories: true)
     let png = Data([
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
         0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0, 0, 0, 181, 28, 12, 2,
@@ -9558,6 +9591,7 @@ private func installMacosImageSelfCheckFixture(at markdownPath: String) throws -
         68, 174, 66, 96, 130
     ])
     try png.write(to: imageURL, options: .atomic)
+    try png.write(to: referenceImageURL, options: .atomic)
     return imageURL
 }
 
@@ -9688,6 +9722,12 @@ private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
             precondition(imageReady.imageResourceCount > 0)
             precondition(imageReady.imageFailureCount == 0)
             precondition(imageReady.uploadedImages > 0 || repeated.imageResourceCount > 0)
+            let publishedImages = try bridge.macosVisualImages(revision: revision)
+            precondition(
+                publishedImages.contains {
+                    $0.resourceStatus == UInt8(YU_STORAGE_IMAGE_RESOURCE_READY)
+                }
+            )
 
             // Move past the fixture's visible block. The host must drop the
             // now-unreferenced Metal texture instead of retaining every image
