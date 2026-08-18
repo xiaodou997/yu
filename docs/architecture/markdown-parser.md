@@ -192,7 +192,10 @@ block snapshot 解析 document `y` 对应的 block，再转到 table-local point
 由 `MacosSurfaceHostCoordinator` 转发并按 Revision 清理。`DocumentTextView` 的 hover 查询复用
 同一 FFI，只在内部 column divider 上显示 resize cursor，且不打开 session。finish 前后 canonical
 source 必须相等；GFM 列宽写回暂不定义，未来必须通过明确的 editor transaction 和序列化策略完成。
-见 ADR 0167、0168。
+storage FFI 另提供只读的当前 viewport column divider descriptor count/fill，包含 document-space
+rect、column index/count 和 table source range；active composition 不暴露 descriptor。Swift 只消费
+owned scalar，真正的 AX splitter action 仍需单独定义焦点、步长和 stale element 生命周期。见 ADR
+0167、0168、0169。
 Rust `yu-layout::TableResizeGesture` 为 native adapter 提供同样的按下/移动/释放边界：按下时
 捕获 Revision、block index、divider target 和 pointer anchor；移动只更新临时 pointer 与
 proposed divider position；释放返回 `TableResizeCommit` 几何候选。任何 update/finish/cancel
