@@ -28,5 +28,8 @@ yu-render-macos = { path = "../../platform/macos/yu-render-macos" }
 yu-workspace = { path = "../yu-workspace" }
 yu-markdown = { path = "../yu-markdown" }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+yu-embedded-math = { path = "../yu-embedded-math" }
+
 [lints]
 workspace = true

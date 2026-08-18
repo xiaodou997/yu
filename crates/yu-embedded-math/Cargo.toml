@@ -1,0 +1,18 @@
+[package]
+name = "yu-embedded-math"
+description = "Small native Math renderer for Yu embedded Markdown resources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-assets = { path = "../yu-assets" }
+
+[dev-dependencies]
+yu-core = { path = "../yu-core" }
+
+[lints]
+workspace = true
