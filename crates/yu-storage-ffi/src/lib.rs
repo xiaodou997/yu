@@ -4964,12 +4964,37 @@ fn macos_table_resize_hit_at_point(
     let Some(block) = selected else {
         return Err(YU_STORAGE_INVALID_SELECTION);
     };
+    let table_resize = match session.table_resize_override {
+        Some(commit) if commit.revision().get() == expected_revision => {
+            if matches!(commit.target(), TableResizeTarget::Column { .. }) {
+                Some(commit)
+            } else {
+                None
+            }
+        }
+        Some(_) => {
+            session.table_resize_override = None;
+            None
+        }
+        None => None,
+    };
     let layout = {
         let document = session.session.document_mut().editor_mut();
-        document
-            .block_layout_with_shaper(block.index(), layout_config, &shaper)
-            .map_err(status_from_editor_error)?
-            .clone()
+        let layout = if let Some(commit) =
+            table_resize.filter(|commit| commit.block_index() == block.index())
+        {
+            document.block_layout_with_table_resize_and_shaper(
+                block.index(),
+                layout_config,
+                &shaper,
+                commit,
+            )
+        } else {
+            document
+                .block_layout_with_shaper(block.index(), layout_config, &shaper)
+                .cloned()
+        };
+        layout.map_err(status_from_editor_error)?
     };
     let Some(table) = layout.table() else {
         return Err(YU_STORAGE_INVALID_SELECTION);
@@ -5704,7 +5729,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_viewport_blocks(
 /// Returns Revision-bound, document-space metadata for visible table column
 /// dividers. The count/fill contract is read-only and intentionally separate
 /// from the resize gesture ABI so Accessibility can enumerate targets without
-/// opening a session or retaining a Rust layout object.
+/// opening a session or retaining a Rust layout object. An existing
+/// session-only column override is reflected in the returned geometry.
 ///
 /// # Safety
 /// `session` must be live; `written` must be writable; `dividers` must point to
@@ -5789,12 +5815,44 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_accessibility_div
         };
         let source = session.session.snapshot();
         let divider_width = (metrics.default_advance() * 0.25).max(1.0);
+        // Accessibility actions keep a session-only table preview alive after
+        // each increment/decrement. Reuse that override here so the next
+        // descriptor enumeration exposes the effective divider position
+        // instead of resetting VoiceOver to the canonical layout.
+        let table_resize = match session.table_resize_override {
+            Some(commit) if commit.revision() == viewport_snapshot.revision() => {
+                if matches!(commit.target(), TableResizeTarget::Column { .. }) {
+                    Some(commit)
+                } else {
+                    None
+                }
+            }
+            Some(_) => {
+                session.table_resize_override = None;
+                None
+            }
+            None => None,
+        };
         let mut encoded = Vec::new();
         for block in viewport_snapshot.blocks() {
             let layout = {
                 let document = session.session.document_mut().editor_mut();
-                match document.block_layout_with_shaper(block.index(), layout_config, &shaper) {
-                    Ok(layout) => layout.clone(),
+                let layout = if let Some(commit) =
+                    table_resize.filter(|commit| commit.block_index() == block.index())
+                {
+                    document.block_layout_with_table_resize_and_shaper(
+                        block.index(),
+                        layout_config,
+                        &shaper,
+                        commit,
+                    )
+                } else {
+                    document
+                        .block_layout_with_shaper(block.index(), layout_config, &shaper)
+                        .cloned()
+                };
+                match layout {
+                    Ok(layout) => layout,
                     Err(error) => return status_from_editor_error(error),
                 }
             };
@@ -11350,6 +11408,65 @@ mod tests {
             YU_STORAGE_OK
         );
         assert_eq!(committed, preview);
+        let mut effective_required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_accessibility_dividers(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    ptr::null_mut(),
+                    0,
+                    &mut effective_required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut effective_dividers =
+            vec![YuStorageTableResizeAccessibilityDivider::default(); effective_required];
+        let mut effective_written = effective_required;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_accessibility_dividers(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    effective_dividers.as_mut_ptr(),
+                    effective_dividers.len(),
+                    &mut effective_written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let effective_divider = effective_dividers
+            .iter()
+            .find(|divider| divider.index == 0)
+            .expect("effective accessible table divider");
+        assert_eq!(effective_written, effective_required);
+        assert!((effective_divider.x - committed.final_position).abs() < 0.01);
+        let mut effective_hit = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_hit_test(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    effective_divider.x + 0.01,
+                    point_y,
+                    0.2,
+                    &mut effective_hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(effective_hit.index, 0);
         assert_eq!(
             unsafe { yu_storage_session_table_resize_cancel(raw, 0) },
             YU_STORAGE_OK
