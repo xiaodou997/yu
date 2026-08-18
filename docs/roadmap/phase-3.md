@@ -82,6 +82,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] active composition 的 Rust surface 与 Rust decoration 共用 transient block layout、caret/selection geometry 和 composition generation；TextKit overlay 仅作为失败回退
 - [x] RenderPlan/decoration count-fill 在 composition update/cancel 后拒绝旧 generation，清空旧 header 并要求重新 publication
 - [x] source-glyph gate 抽出纯 publication identity predicate，验证 surface、decoration、Revision 和 composition generation 必须同帧匹配
+- [x] visual publication 额外要求当前 RenderPlan 含有可绘制 command；空/空白文档保留 TextKit source fallback，避免空 Metal surface 隐藏可编辑内容
 - [x] fenced code block 的 Revision-bound `FillRect` 背景进入 Scene/RenderPlan/Metal solid pipeline，并保持 fill-before-glyph painter order
 - [x] `yu-projection::ImageSource` 保留 inline/reference image 的 source/label/destination ranges，并随 strictly-outside edit 映射
 - [x] `yu-assets::ImageCache` 建立可轮询异步解码队列、destination 去重、RGBA8 校验和 Revision-bound CPU publication

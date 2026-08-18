@@ -732,6 +732,8 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let imageRetryCount: Int
     let submitted: Bool
 
+    var hasVisualContent: Bool { commandCount > 0 }
+
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
         revision = value.revision
         compositionGeneration = value.composition_generation
@@ -5063,10 +5065,24 @@ private struct VisualRenderFrameIdentity: Equatable, CustomStringConvertible {
 private struct VisualRenderPublicationIdentity: Equatable {
     let frame: VisualRenderFrameIdentity
     let submitted: Bool
+    let commandCount: Int
 
-    init(frame: VisualRenderFrameIdentity, submitted: Bool) {
+    /// A submitted surface is not necessarily useful to the editor. An empty
+    /// render plan can be a valid publication for an empty/whitespace-only
+    /// document, but it must not hide the source TextKit mirror: there is no
+    /// visual content for the native surface to replace. Keeping this policy
+    /// beside the publication identity makes the source-glyph gate explicit
+    /// and prevents a blank surface from looking like a successful migration.
+    var hasVisualContent: Bool { commandCount > 0 }
+
+    init(
+        frame: VisualRenderFrameIdentity,
+        submitted: Bool,
+        commandCount: Int = 1
+    ) {
         self.frame = frame
         self.submitted = submitted
+        self.commandCount = commandCount
     }
 
     init(_ snapshot: NativeMacosRenderHostSurfaceSnapshot) {
@@ -5077,6 +5093,7 @@ private struct VisualRenderPublicationIdentity: Equatable {
             frameSerial: snapshot.frameSerial
         )
         submitted = snapshot.submitted
+        commandCount = snapshot.commandCount
     }
 }
 
@@ -5098,6 +5115,7 @@ private func acceptedVisualRenderFrame(
           rustDecorationFrameAccepted,
           let publication,
           publication.submitted,
+          publication.hasVisualContent,
           publication.frame.revision == revision,
           publication.frame.compositionGeneration == compositionGeneration else {
         return nil
@@ -5117,6 +5135,7 @@ private enum VisualRenderFallbackReason: String, Equatable, CustomStringConverti
     case compositionActive
     case surfaceSubmitFailed
     case visualMirrorUnavailable
+    case noVisualContent
 
     var description: String { rawValue }
 }
@@ -5324,7 +5343,6 @@ private final class MacosSurfaceHostCoordinator {
     /// change.
     func hasCurrentPublication(revision: UInt64, compositionGeneration: UInt64) -> Bool {
         guard isAttached,
-              surfaceView?.nativeContentVisible == true,
               let snapshot = lastSnapshot,
               let currentKey = currentSubmitKey else {
             return false
@@ -5803,7 +5821,11 @@ private final class MacosSurfaceHostCoordinator {
             scale: Double(scale)
         )
         if isAttached, key == lastSubmitKey {
-            surfaceView.setNativeContentVisible(true)
+            // A same-key submit can be reached after the controller has
+            // rejected an empty plan. Do not briefly re-show that blank
+            // surface; source TextKit remains the canonical visible fallback
+            // until a publication with actual draw commands exists.
+            surfaceView.setNativeContentVisible(lastSnapshot?.hasVisualContent == true)
             return lastSnapshot
         }
 
@@ -5827,7 +5849,7 @@ private final class MacosSurfaceHostCoordinator {
         isAttached = true
         lastSubmitKey = key
         lastSnapshot = snapshot
-        surfaceView.setNativeContentVisible(true)
+        surfaceView.setNativeContentVisible(snapshot.hasVisualContent)
         onSurfaceStateChange?()
         return snapshot
     }
@@ -6308,6 +6330,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                 return .staleComposition
             }
             return snapshot.submitted ? .waitingForSurface : .surfaceSubmitFailed
+        }
+        if surfaceCoordinator.lastSnapshot?.commandCount == 0 {
+            return .noVisualContent
         }
         if bridge.composition.active {
             return .compositionActive
@@ -7624,6 +7649,21 @@ private func runVisualRenderStateSelfCheck() -> Never {
             publicationCurrent: true,
             publication: publication,
             decorationRevision: 8,
+            decorationHasValidFrame: true,
+            rustDecorationFrameAccepted: true
+        ) == nil
+    )
+    precondition(
+        acceptedVisualRenderFrame(
+            revision: 7,
+            compositionGeneration: 3,
+            publicationCurrent: true,
+            publication: VisualRenderPublicationIdentity(
+                frame: frame,
+                submitted: true,
+                commandCount: 0
+            ),
+            decorationRevision: 7,
             decorationHasValidFrame: true,
             rustDecorationFrameAccepted: true
         ) == nil
