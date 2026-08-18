@@ -341,7 +341,12 @@ Rust，mouse-up/取消分别调用 finish/cancel。新增的 document-space Core
 会从同一份 viewport block snapshot 找到 table block，Swift 不复制 block 高度或猜测 source pipe；每次
 preview update 都使 retained surface submit key 失效。表面层仍返回 `hitTest == nil`，所以没有命中
 divider 时 selection、IME、复制粘贴和 VoiceOver 路径完全不变。source Revision、detach、stale
-gesture 或 submit failure 会清理 pointer state，并回到 TextKit source fallback。见 ADR 0167。
+gesture 或 submit failure 会清理 pointer state，并回到 TextKit source fallback。`DocumentTextView`
+的 hover 查询复用同一 FFI，只在内部 column divider 上显示 `resizeLeftRight` cursor，离开 divider、
+离开窗口或结束/取消 drag 后恢复普通 arrow；hover 不打开 session，也不改变 selection 或 Revision。
+finish 仍只保留 session-only geometry。由于 GFM 没有列宽字段，source 写回必须等待明确的 editor
+command/transaction、格式化规则与 Undo 语义；Accessibility 继续暴露 source-backed semantic tree，
+不伪造无法稳定枚举和操作的 divider 节点。见 ADR 0167、0168。
 
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和
 marker（task 新项重置为 `[ ]`，ordered marker 在可表示范围内递增）；空 list/task item 的

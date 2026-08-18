@@ -49,6 +49,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] decoration sibling 改用 Rust/CoreText-shaped document-space count/fill geometry；active composition 使用 generation-bound transient Rust layout，查询失败时保留 TextKit fallback
 - [x] 生产 Up/Down/Shift-Up/Shift-Down 使用当前 CoreText metrics/shaper 的 Revision-bound command
 - [x] 生产 pointer adapter 使用同一 CoreText-shaped Rust block layout 命中 visual boundary；TextKit 只保留输入/IME/AX/矩形回退
+- [x] macOS table divider hover 复用 document-space shaped hit-test，显示/清理 resize cursor；hover 不创建 session，finish 前后 source 保持不变
 - [x] visual pointer 正向/反向拖选通过 Rust endpoint ABI 保留 anchor/focus 方向，继续拖动和 Shift-click 不丢失 selection 语义
 - [x] visual IME active caret 使用 Revision + composition generation-bound CoreText shaped block geometry
 - [x] visual IME composition hit-test 使用 Revision + composition generation-bound transient projection，覆盖跨 block document-space mapping
