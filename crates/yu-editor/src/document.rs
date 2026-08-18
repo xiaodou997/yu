@@ -1047,6 +1047,14 @@ impl EditorDocument {
         command: EditorCommand,
     ) -> Result<CommandResult, EditorDocumentError> {
         self.last_source_change = None;
+        // A native text input client owns the transient marked-text lifecycle
+        // while a composition is active.  Keep the same invariant at the
+        // platform-independent editor boundary so a caller cannot bypass the
+        // FFI/menu availability guard and accidentally create a permanent
+        // transaction over the composition's fixed replacement range.
+        if self.composition.is_some() {
+            return Err(EditorDocumentError::CompositionActive);
+        }
         if !matches!(
             command,
             EditorCommand::MoveUp
