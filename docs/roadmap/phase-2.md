@@ -29,6 +29,7 @@ Phase 1 固定了编辑器内核、Markdown 投影和 macOS 输入/渲染风险�
 - [x] 无窗口 close-before-discard 状态机：save、discard、cancel 与 external conflict
 - [x] macOS 最小文档窗口 host：打开、源码镜像、标题/dirty 状态、保存/重载和关闭提示
 - [x] macOS P0 稳定打开门槛：启动先完成 TextKit source fallback，Rust visual/surface 延后启用；`.md` UTI、source/state 启动快照验证与 open/edit/undo/redo/copy/paste/save/reopen workflow self-check
+- [x] macOS P0 基础交互回归：Enter/移动/删除/撤销/重做、选区回写、clean reload、外部冲突关闭/保存拒绝，以及空/缺失路径 self-check
 - [x] Rust `DocumentEditorSession`：把 `DocumentSession`、`EditorDocument`、composition 和 close 绑定到一个可变会话
 - [x] 统一 session FFI：command、selection、native key route 和 composition 通过同一 handle
 - [x] macOS 可编辑文档 host：将 `NSTextInputClient` 的 marked range/source sync 接入统一 session FFI
