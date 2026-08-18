@@ -479,6 +479,27 @@ pub struct YuStorageTableResizeHit {
     pub position: f32,
 }
 
+/// Revision-bound, document-space metadata for one visible table column
+/// divider. This is a read-only accessibility/inspection contract: it does
+/// not open a resize gesture or mutate source, selection, history or layout
+/// state. `x`/`y` are document coordinates and `width`/`height` describe the
+/// narrow divider hit region spanning the visible table.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageTableResizeAccessibilityDivider {
+    pub revision: u64,
+    pub block_index: u64,
+    pub kind: u8,
+    pub index: u64,
+    pub column_count: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub table_source_start_utf16: u64,
+    pub table_source_end_utf16: u64,
+}
+
 /// Revision-bound, source-neutral table geometry produced by a native resize
 /// gesture. `final_position` and `delta` are updated for each pointer move;
 /// releasing the pointer returns the same shape as the committed candidate.
@@ -2057,6 +2078,64 @@ fn table_resize_hit_metadata(
         index,
         position: hit.position(),
     })
+}
+
+fn table_resize_accessibility_metadata(
+    snapshot: &TextSnapshot,
+    revision: u64,
+    block_index: u64,
+    block_y: f32,
+    divider_width: f32,
+    table: &yu_editor::TableLayoutSnapshot,
+) -> Result<Vec<YuStorageTableResizeAccessibilityDivider>, i32> {
+    let column_count =
+        u64::try_from(table.column_widths().len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    if column_count < 2 {
+        return Ok(Vec::new());
+    }
+    let (table_source_start_utf16, table_source_end_utf16) =
+        table_source_utf16_range(snapshot, table.source_range())?;
+    let bounds = table.bounds();
+    let width = divider_width.max(1.0);
+    let y = block_y + bounds.y();
+    if !block_y.is_finite()
+        || !divider_width.is_finite()
+        || divider_width <= 0.0
+        || !y.is_finite()
+        || !bounds.height().is_finite()
+        || bounds.height() <= 0.0
+    {
+        return Err(YU_STORAGE_INVALID_SELECTION);
+    }
+    let divider_count = table.column_widths().len().saturating_sub(1);
+    let mut x = bounds.x();
+    let mut dividers = Vec::with_capacity(divider_count);
+    for (index, column_width) in table
+        .column_widths()
+        .iter()
+        .copied()
+        .take(divider_count)
+        .enumerate()
+    {
+        x += column_width;
+        if !x.is_finite() {
+            return Err(YU_STORAGE_INVALID_SELECTION);
+        }
+        dividers.push(YuStorageTableResizeAccessibilityDivider {
+            revision,
+            block_index,
+            kind: YU_STORAGE_TABLE_RESIZE_COLUMN,
+            index: u64::try_from(index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+            column_count,
+            x,
+            y,
+            width,
+            height: bounds.height(),
+            table_source_start_utf16,
+            table_source_end_utf16,
+        });
+    }
+    Ok(dividers)
 }
 
 fn table_resize_commit_metadata(
@@ -5617,6 +5696,140 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_viewport_blocks(
         if !encoded.is_empty() {
             // SAFETY: capacity was checked against the encoded block count.
             unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), blocks, encoded.len()) };
+        }
+        YU_STORAGE_OK
+    }
+}
+
+/// Returns Revision-bound, document-space metadata for visible table column
+/// dividers. The count/fill contract is read-only and intentionally separate
+/// from the resize gesture ABI so Accessibility can enumerate targets without
+/// opening a session or retaining a Rust layout object.
+///
+/// # Safety
+/// `session` must be live; `written` must be writable; `dividers` must point to
+/// `capacity` writable values when `capacity > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_table_resize_accessibility_dividers(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    dividers: *mut YuStorageTableResizeAccessibilityDivider,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if capacity > 0 && dividers.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` was checked for null and belongs to the caller.
+    unsafe { *written = 0 };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            dividers,
+            capacity,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(&session.session, expected_revision) {
+            return status;
+        }
+        if !size.is_finite()
+            || size <= 0.0
+            || !max_width.is_finite()
+            || max_width <= 0.0
+            || !scroll_y.is_finite()
+            || scroll_y < 0.0
+            || !viewport_height.is_finite()
+            || viewport_height <= 0.0
+        {
+            return YU_STORAGE_EDITOR_ERROR;
+        }
+        let (shaper, metrics, _layout_config) = match core_text_system_ui_layout(size, max_width) {
+            Ok(layout) => layout,
+            Err(status) => return status,
+        };
+        let layout_config = session.session.viewport_config().layout();
+        if (layout_config.max_width() - max_width).abs() > 0.05
+            || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
+            || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
+        {
+            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        }
+
+        let viewport = ViewportRect::new(scroll_y, viewport_height);
+        let viewport_snapshot = {
+            let document = session.session.document_mut().editor_mut();
+            if document.composition().is_some() {
+                return YU_STORAGE_OK;
+            }
+            match document.visible_blocks_with_shaper(viewport, &shaper) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return status_from_editor_error(error),
+            }
+        };
+        let source = session.session.snapshot();
+        let divider_width = (metrics.default_advance() * 0.25).max(1.0);
+        let mut encoded = Vec::new();
+        for block in viewport_snapshot.blocks() {
+            let layout = {
+                let document = session.session.document_mut().editor_mut();
+                match document.block_layout_with_shaper(block.index(), layout_config, &shaper) {
+                    Ok(layout) => layout.clone(),
+                    Err(error) => return status_from_editor_error(error),
+                }
+            };
+            let Some(table) = layout.table() else {
+                continue;
+            };
+            let block_index = match u64::try_from(block.index()) {
+                Ok(index) => index,
+                Err(_) => return YU_STORAGE_INVALID_SELECTION,
+            };
+            let metadata = match table_resize_accessibility_metadata(
+                &source,
+                viewport_snapshot.revision().get(),
+                block_index,
+                block.y(),
+                divider_width,
+                table,
+            ) {
+                Ok(metadata) => metadata,
+                Err(status) => return status,
+            };
+            encoded.extend(metadata);
+        }
+
+        // SAFETY: `written` was checked for null and belongs to the caller.
+        unsafe { *written = encoded.len() };
+        if capacity == 0 && dividers.is_null() {
+            return YU_STORAGE_OK;
+        }
+        if encoded.len() > capacity {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+        if !encoded.is_empty() {
+            // SAFETY: capacity was checked against the encoded count.
+            unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), dividers, encoded.len()) };
         }
         YU_STORAGE_OK
     }
@@ -10975,6 +11188,55 @@ mod tests {
                     .next()
             })
             .expect("CoreText table divider");
+        let mut accessibility_required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_accessibility_dividers(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    ptr::null_mut(),
+                    0,
+                    &mut accessibility_required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(accessibility_required >= 1);
+        let mut accessibility_dividers =
+            vec![YuStorageTableResizeAccessibilityDivider::default(); accessibility_required];
+        let mut accessibility_written = accessibility_required;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_accessibility_dividers(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    accessibility_dividers.as_mut_ptr(),
+                    accessibility_dividers.len(),
+                    &mut accessibility_written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(accessibility_written, accessibility_required);
+        let accessibility_divider = accessibility_dividers
+            .iter()
+            .find(|divider| divider.index == 0)
+            .expect("first accessible table divider");
+        assert_eq!(accessibility_divider.revision, 0);
+        assert_eq!(accessibility_divider.block_index, 0);
+        assert_eq!(accessibility_divider.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        assert!(accessibility_divider.column_count >= 2);
+        assert!((accessibility_divider.x - divider).abs() < 0.01);
+        assert!(accessibility_divider.height > 0.0);
+        assert_eq!(state.session.snapshot().as_str(), source);
         let point_y = metrics.line_height() * 0.5;
         let mut document_hit = YuStorageTableResizeHit::default();
         assert_eq!(

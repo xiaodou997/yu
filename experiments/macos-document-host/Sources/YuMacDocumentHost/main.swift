@@ -239,6 +239,37 @@ private struct NativeTableResizeCommit: Equatable {
     }
 }
 
+/// Read-only, Revision-bound metadata for one visible table column divider.
+/// The descriptor is suitable for a future native Accessibility element, but
+/// it does not own a resize session or any Markdown source.
+private struct NativeTableResizeAccessibilityDivider: Equatable {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let kind: UInt8
+    let index: UInt64
+    let columnCount: UInt64
+    let rect: CGRect
+    let tableSourceRange: NSRange
+
+    init(_ value: YuStorageTableResizeAccessibilityDivider) {
+        revision = value.revision
+        blockIndex = value.block_index
+        kind = value.kind
+        index = value.index
+        columnCount = value.column_count
+        rect = CGRect(
+            x: CGFloat(value.x),
+            y: CGFloat(value.y),
+            width: CGFloat(value.width),
+            height: CGFloat(value.height)
+        )
+        tableSourceRange = NSRange(
+            location: Int(value.table_source_start_utf16),
+            length: Int(value.table_source_end_utf16 - value.table_source_start_utf16)
+        )
+    }
+}
+
 private struct NativeBlockLayout {
     let revision: UInt64
     let blockIndex: UInt64
@@ -2008,6 +2039,52 @@ private final class StorageBridge {
             NativeShapedViewportSnapshot(snapshot),
             values.map(NativeShapedViewportBlock.init)
         )
+    }
+
+    func macosTableResizeAccessibilityDividers(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float
+    ) throws -> [NativeTableResizeAccessibilityDivider] {
+        var required = 0
+        let sizeStatus = yu_storage_session_macos_table_resize_accessibility_dividers(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            scrollY,
+            viewportHeight,
+            nil,
+            0,
+            &required
+        )
+        guard sizeStatus == StorageStatus.ok else {
+            throw BridgeError.operation(sizeStatus)
+        }
+        var values = Array(
+            repeating: YuStorageTableResizeAccessibilityDivider(),
+            count: required
+        )
+        var written = required
+        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_macos_table_resize_accessibility_dividers(
+                handle,
+                revision,
+                size,
+                maxWidth,
+                scrollY,
+                viewportHeight,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard fillStatus == StorageStatus.ok, written == required else {
+            throw BridgeError.operation(fillStatus)
+        }
+        return values.map(NativeTableResizeAccessibilityDivider.init)
     }
 
     func macosVisualDecorations(
@@ -5074,6 +5151,28 @@ private final class MacosSurfaceHostCoordinator {
             return hit.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
         } catch {
             return false
+        }
+    }
+
+    /// Returns the visible, read-only divider descriptors from the same
+    /// document-space CoreText layout used by hover and begin. Callers may
+    /// project these into native Accessibility elements, but the descriptors
+    /// never retain a Rust layout or open a resize gesture.
+    func tableResizeAccessibilityDividers() -> [NativeTableResizeAccessibilityDivider] {
+        guard !bridge.composition.active,
+              let geometry = visualDecorationGeometry() else {
+            return []
+        }
+        do {
+            return try bridge.macosTableResizeAccessibilityDividers(
+                revision: bridge.state.revision,
+                size: geometry.size,
+                maxWidth: geometry.maxWidth,
+                scrollY: geometry.scrollY,
+                viewportHeight: geometry.viewportHeight
+            )
+        } catch {
+            return []
         }
     }
 
@@ -8913,10 +9012,10 @@ private func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         )
 
         let surfaceView = MacosSurfaceHostView(
-            frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 240.0)
+            frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 1000.0)
         )
         let scrollView = NSScrollView(
-            frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 240.0)
+            frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 1000.0)
         )
         scrollView.documentView = NSView(
             frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 1000.0)
@@ -8955,6 +9054,19 @@ private func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         precondition(nearest.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
         dividerPoint = NSPoint(x: CGFloat(nearest.position + 0.1), y: tableY)
         let sourceBeforeResize = bridge.source
+        let accessibilityDividers = coordinator.tableResizeAccessibilityDividers()
+        guard let accessibilityDivider = accessibilityDividers.first(where: {
+            $0.blockIndex == tableBlockIndex && $0.index == nearest.index
+        }) else {
+            throw BridgeError.operation(StorageStatus.invalidSelection)
+        }
+        precondition(accessibilityDivider.revision == revision)
+        precondition(accessibilityDivider.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
+        precondition(accessibilityDivider.columnCount >= 2)
+        precondition(accessibilityDivider.rect.height > 0.0)
+        precondition(accessibilityDivider.rect.contains(
+            NSPoint(x: accessibilityDivider.rect.midX, y: tableY)
+        ))
         precondition(coordinator.tableResizeHover(at: dividerPoint))
         precondition(
             !coordinator.tableResizeHover(
@@ -8984,7 +9096,8 @@ private func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         coordinator.detach()
         print(
             "Yu macOS table resize coordinator self-check: document-space CoreText hit, "
-                + "mouse update/finish/cancel, stale revision reset and headless surface fallback are valid"
+                + "Accessibility divider descriptor, mouse update/finish/cancel, stale revision reset "
+                + "and headless surface fallback are valid"
         )
         exit(EXIT_SUCCESS)
     } catch {
