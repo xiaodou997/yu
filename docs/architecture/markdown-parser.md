@@ -186,6 +186,10 @@ block index、layout 参数、table-local point 和 tolerance，返回内部 col
 kind、index 与 x/y position。outer edge、表格外点、非法 tolerance 和 stale Revision 都被拒绝；
 该查询不改变 source、selection、history 或 layout cache。真正的 drag transaction 和把新宽高
 持久化为 Markdown 对齐/空白策略，必须在后续编辑命令阶段定义。
+macOS 产品窗口使用额外的 CoreText-shaped document-space hit/begin 入口：Rust 先从同一 viewport
+block snapshot 解析 document `y` 对应的 block，再转到 table-local point；Swift 不需要复制 block
+高度或猜测 source pipe。该入口仍只产生 session-only preview，拖动/提交/取消的 pointer 生命周期
+由 `MacosSurfaceHostCoordinator` 转发并按 Revision 清理。见 ADR 0167。
 Rust `yu-layout::TableResizeGesture` 为 native adapter 提供同样的按下/移动/释放边界：按下时
 捕获 Revision、block index、divider target 和 pointer anchor；移动只更新临时 pointer 与
 proposed divider position；释放返回 `TableResizeCommit` 几何候选。任何 update/finish/cancel

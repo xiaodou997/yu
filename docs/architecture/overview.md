@@ -335,6 +335,14 @@ edit 的 `TableResizeCommit`；stale Revision 或非有限坐标直接拒绝。�
 transient/canonical 几何差异、source 不变和 stale 拒绝。
 composition overlay 不推进 source Revision，因此不会触发 projection cache 失效。
 
+macOS 产品窗口现在也把这条协议接到真实 pointer 路由：`DocumentTextView` 在普通 visual/source
+selection 之前尝试 divider begin，active drag 的 x/y 标量由 `MacosSurfaceHostCoordinator` 转发到
+Rust，mouse-up/取消分别调用 finish/cancel。新增的 document-space CoreText-shaped hit/begin FFI
+会从同一份 viewport block snapshot 找到 table block，Swift 不复制 block 高度或猜测 source pipe；每次
+preview update 都使 retained surface submit key 失效。表面层仍返回 `hitTest == nil`，所以没有命中
+divider 时 selection、IME、复制粘贴和 VoiceOver 路径完全不变。source Revision、detach、stale
+gesture 或 submit failure 会清理 pointer state，并回到 TextKit source fallback。见 ADR 0167。
+
 列表编辑命令也保持 source-backed：`InsertNewline` 只读取当前行，非空 list item 复制其缩进和
 marker（task 新项重置为 `[ ]`，ordered marker 在可表示范围内递增）；空 list/task item 的
 Enter 或 `DeleteBackward` 删除 prefix 以退出列表。`IndentList`/`OutdentList` 只对 parser 识别的
@@ -582,6 +590,12 @@ scroll、编辑 Revision 和 close 生命周期安排成上述 surface submit；
 接收。透明 CAMetalLayer 在成功提交后显示 Rust glyph coverage，失败或 detach 时自动隐藏并回退
 到 source mirror。空文档使用 `yu_storage_session_macos_font_metrics` 配置 CoreText viewport。
 该 adapter 不让 Swift 拥有 Markdown、layout、scene 或 Metal handle。见 ADR 0124、0125。
+
+该产品窗口还把 GFM table divider 接入同一 input host：`DocumentTextView` 只在 Rust document-space
+CoreText hit 成功时吞掉普通 selection，`MacosSurfaceHostCoordinator` 保存 Revision/axis 并把 drag
+样本送入 FFI。preview 的每次 update 都主动 invalidates submit key，finish 保留 session-only
+column geometry，Escape、source edit、detach 或 stale/submit failure 清理 gesture 后恢复 source
+fallback。row divider 仍只走协议与命中，不提前承诺 variable-row retained layout。见 ADR 0167。
 
 当前 render host 已进一步固定 document-space viewport 原点：block glyph、damage 和 caret 的
 `y` 坐标仍来自同一份文档坐标，而 `RenderPlan::viewport().y()` 取当前 scroll origin，native

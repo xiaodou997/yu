@@ -914,6 +914,17 @@ int32_t yu_storage_session_macos_table_resize_begin(
     uint64_t block_index, float size, float max_width,
     float point_x, float point_y, float tolerance, float pointer_position,
     YuStorageTableResizeHit *output);
+/* Document-space CoreText-shaped table resize hit/begin variants. These
+ * resolve the table block from the same y-coordinate space as the retained
+ * macOS render host, so the native shell does not need to guess a block. */
+int32_t yu_storage_session_macos_table_resize_hit_test(
+    YuStorageSession *session, uint64_t expected_revision,
+    float size, float max_width, float point_x, float point_y, float tolerance,
+    YuStorageTableResizeHit *output);
+int32_t yu_storage_session_macos_table_resize_begin_at_point(
+    YuStorageSession *session, uint64_t expected_revision,
+    float size, float max_width, float point_x, float point_y, float tolerance,
+    float pointer_position, YuStorageTableResizeHit *output);
 int32_t yu_storage_session_table_resize_update(
     YuStorageSession *session, uint64_t expected_revision,
     float pointer_position, YuStorageTableResizeCommit *output);
