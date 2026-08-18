@@ -681,6 +681,7 @@ typedef struct YuStorageMacosRenderHostSnapshot {
     float max_scroll_y;
     float viewport_width;
     uint8_t published;
+    uint64_t command_kind_mask;
 } YuStorageMacosRenderHostSnapshot;
 
 typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
@@ -704,6 +705,7 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t image_overscan_candidate_count;
     uint64_t image_retry_count;
     uint8_t submitted;
+    uint64_t command_kind_mask;
 } YuStorageMacosRenderHostSurfaceSnapshot;
 
 typedef struct YuStorageVisualSceneGlyph {
