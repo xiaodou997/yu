@@ -101,6 +101,16 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该检查确认窗口先完成 TextKit source fallback，再进入可选的 Rust visual/surface 生命周期；窗口未出现
 或启动期间发生异常时以失败退出。
 
+验证基础键盘、选区和文件生命周期边界（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --document-interaction-self-check experiments/macos-document-host/Fixtures/sample.md
+```
+
+该自检覆盖 Enter、左右移动、删除、撤销/重做、鼠标选区回写、clean reload、外部修改关闭提示、
+冲突保存拒绝，以及空文件/缺失文件打开路径。
+
 验证同一个 `DocumentEditorSession` 提供 source-backed Markdown projection 和 source↔visual
 caret 映射（不启动窗口）：
 

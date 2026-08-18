@@ -2800,7 +2800,11 @@ private final class StorageBridge {
     func commandAvailable(_ command: UInt8, block: UInt64 = 0) -> Bool {
         var available: UInt8 = 0
         let status = yu_storage_session_command_available(handle, command, block, &available)
-        precondition(status == StorageStatus.ok, "Rust command availability query failed: \(status)")
+        // Availability is a capability query, not a reason to abort the
+        // host. During a close/reload race the session can reject it; the
+        // native editor should simply leave the command disabled and retain
+        // the source fallback.
+        guard status == StorageStatus.ok else { return false }
         return available != 0
     }
 
@@ -3141,13 +3145,17 @@ private final class StorageBridge {
     ) -> String {
         var required = 0
         let sizeStatus = operation(nil, 0, &required)
-        precondition(sizeStatus == StorageStatus.ok, "Rust storage length query failed: \(sizeStatus)")
+        guard sizeStatus == StorageStatus.ok, required >= 0 else { return "" }
         var bytes = Array(repeating: UInt8(0), count: required)
         let copyStatus = bytes.withUnsafeMutableBufferPointer { buffer in
             operation(buffer.baseAddress, buffer.count, &required)
         }
-        precondition(copyStatus == StorageStatus.ok, "Rust storage copy failed: \(copyStatus)")
-        return String(decoding: bytes, as: UTF8.self)
+        guard copyStatus == StorageStatus.ok,
+              required >= 0,
+              required <= bytes.count else {
+            return ""
+        }
+        return String(decoding: bytes.prefix(required), as: UTF8.self)
     }
 
     private func copyBytesThrowing(
@@ -7001,6 +7009,134 @@ private func runDocumentWorkflowSelfCheck(path: String) -> Never {
     }
 }
 
+/// Exercises the native keyboard/selection route and the file lifecycle
+/// states that can otherwise only be reached through a real window:
+/// newline/delete/move commands, selection write-back, clean reload,
+/// external-change close prompting, and conflict-safe save.
+private func runDocumentInteractionSelfCheck(path: String) -> Never {
+    let fileManager = FileManager.default
+    let sourceURL = URL(fileURLWithPath: path)
+    let temporaryURL = fileManager.temporaryDirectory
+        .appendingPathComponent("yu-interaction-\(UUID().uuidString).md")
+    let emptyURL = fileManager.temporaryDirectory
+        .appendingPathComponent("yu-empty-\(UUID().uuidString).md")
+    do {
+        try fileManager.copyItem(at: sourceURL, to: temporaryURL)
+        defer {
+            try? fileManager.removeItem(at: temporaryURL)
+            try? fileManager.removeItem(at: emptyURL)
+        }
+
+        do {
+            let bridge = try StorageBridge(path: temporaryURL.path)
+            let textView = DocumentTextView(bridge: bridge)
+            let sourceBefore = bridge.source
+            let end = NSRange(location: sourceBefore.utf16.count, length: 0)
+            try bridge.setSelection(end)
+
+            textView.insertText("A", replacementRange: end)
+            textView.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+            textView.insertText(
+                "B",
+                replacementRange: NSRange(
+                    location: bridge.selection.range.location,
+                    length: 0
+                )
+            )
+            precondition(bridge.source.hasSuffix("A\nB"))
+
+            textView.doCommand(by: #selector(NSResponder.moveLeft(_:)))
+            textView.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+            precondition(bridge.source.hasSuffix("AB"))
+            textView.performUndo()
+            precondition(bridge.source.hasSuffix("A\nB"))
+            textView.performRedo()
+            precondition(bridge.source.hasSuffix("AB"))
+
+            let japanese = (bridge.source as NSString).range(of: "日本語")
+            precondition(japanese.location != NSNotFound)
+            textView.setSelectedRanges(
+                [NSValue(range: japanese)],
+                affinity: .downstream,
+                stillSelecting: false
+            )
+            precondition(bridge.selection.range == japanese)
+
+            try bridge.save()
+            precondition(!bridge.state.dirty)
+
+            let externalSource = bridge.source + "\n外部版本"
+            try externalSource.write(
+                to: temporaryURL,
+                atomically: true,
+                encoding: .utf8
+            )
+            precondition(bridge.state.disk == .changed)
+            try bridge.reload()
+            textView.refreshFromRust()
+            precondition(bridge.source == externalSource)
+            precondition(!bridge.state.dirty)
+
+            let localEnd = NSRange(location: bridge.source.utf16.count, length: 0)
+            textView.insertText("本地修改", replacementRange: localEnd)
+            precondition(bridge.state.dirty)
+            let conflictingSource = externalSource + "\n外部再次修改"
+            try conflictingSource.write(
+                to: temporaryURL,
+                atomically: true,
+                encoding: .utf8
+            )
+            precondition(bridge.state.disk == .changed)
+
+            let close = try bridge.requestClose()
+            precondition(close.result == 1)
+            precondition(close.close_state >= 3)
+            try bridge.cancelClose()
+            precondition(bridge.state.closeState == 0)
+
+            do {
+                try bridge.save()
+                preconditionFailure("external conflict save unexpectedly succeeded")
+            } catch BridgeError.operation(let status) {
+                precondition(status == StorageStatus.externalChange)
+            }
+            precondition(bridge.state.dirty)
+        }
+
+        do {
+            let emptyHandle = FileManager.default.createFile(
+                atPath: emptyURL.path,
+                contents: Data()
+            )
+            precondition(emptyHandle)
+            let emptyBridge = try StorageBridge(path: emptyURL.path)
+            let emptyTextView = DocumentTextView(bridge: emptyBridge)
+            precondition(emptyBridge.source.isEmpty)
+            precondition(emptyTextView.string.isEmpty)
+        }
+
+        do {
+            _ = try StorageBridge(
+                path: temporaryURL.deletingLastPathComponent()
+                    .appendingPathComponent("yu-missing-\(UUID().uuidString).md")
+                    .path
+            )
+            preconditionFailure("missing file unexpectedly opened")
+        } catch BridgeError.open(let status) {
+            precondition(status != StorageStatus.ok)
+        }
+
+        print(
+            "Yu Document Interaction self-check: keyboard commands, selection, "
+                + "clean reload, external conflict and empty/missing paths passed"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Document Interaction self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -9908,6 +10044,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--undo-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--document-workflow-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runDocumentWorkflowSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--document-interaction-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runDocumentInteractionSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
