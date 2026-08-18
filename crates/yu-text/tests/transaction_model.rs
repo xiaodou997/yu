@@ -10,6 +10,53 @@ fn deterministic_random_edits_match_string_model_and_inverse() {
     }
 }
 
+#[test]
+fn multi_edit_transaction_is_sorted_atomically_and_inverse_is_exact() {
+    for backend in StorageBackend::ALL {
+        let source = "alpha 世界🙂 omega";
+        let mut buffer = TextBuffer::with_backend(source, backend);
+        let world_start = source.find("世界").expect("world fixture");
+        let world_end = world_start + "世界".len();
+        let omega_start = source.find("omega").expect("omega fixture");
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [
+                // Deliberately provide edits from right to left.  The buffer
+                // must sort them by source range before applying one atomic
+                // revision transition.
+                Edit::new(
+                    TextRange::new(
+                        ByteOffset::try_from(omega_start).expect("offset fits"),
+                        ByteOffset::try_from(omega_start + "omega".len()).expect("offset fits"),
+                    )
+                    .expect("omega range"),
+                    "document",
+                ),
+                Edit::new(
+                    TextRange::new(
+                        ByteOffset::try_from(world_start).expect("offset fits"),
+                        ByteOffset::try_from(world_end).expect("offset fits"),
+                    )
+                    .expect("world range"),
+                    "Yu",
+                ),
+                Edit::new(TextRange::empty(ByteOffset::ZERO), "羽 "),
+            ],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .expect("non-overlapping edits should apply atomically");
+        assert_eq!(buffer.snapshot().as_str(), "羽 alpha Yu🙂 document");
+        assert_eq!(applied.change_set().changes().len(), 3);
+
+        buffer
+            .apply(applied.inverse())
+            .expect("inverse should restore all edits");
+        assert_eq!(buffer.snapshot().as_str(), source, "backend {backend}");
+        assert_eq!(buffer.revision().get(), 2, "backend {backend}");
+    }
+}
+
 fn run_model(backend: StorageBackend) {
     let mut seed = 0x5955_4544_4954_4f52_u64;
     let mut model = String::from("# 羽\n\nHello, 世界🙂\n");
