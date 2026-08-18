@@ -9135,6 +9135,28 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_embedded_state_accepts_native_math_renderer_publication() {
+        let mut state = MacosEmbeddedResourceState {
+            cache: EmbeddedResourceCache::new(),
+            renderer: Box::new(yu_embedded_math::MathRenderer::default()),
+        };
+        let request = EmbeddedRenderRequest::new(
+            Revision::INITIAL,
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(3)).expect("range"),
+            EmbeddedResourceKind::Math,
+            "x^2",
+        )
+        .expect("request");
+        assert_eq!(
+            state
+                .status_for(request, Revision::INITIAL)
+                .expect("status"),
+            YU_STORAGE_EMBEDDED_RESOURCE_READY
+        );
+    }
+
     #[test]
     fn owned_byte_queries_support_null_zero_capacity_length_form() {
         let mut written = 0;

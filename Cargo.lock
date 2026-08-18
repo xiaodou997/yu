@@ -92,6 +92,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "yu-embedded-math"
+version = "0.1.0"
+dependencies = [
+ "yu-assets",
+ "yu-core",
+]
+
+[[package]]
 name = "yu-export"
 version = "0.1.0"
 dependencies = [
@@ -217,6 +225,7 @@ dependencies = [
  "yu-assets",
  "yu-core",
  "yu-editor",
+ "yu-embedded-math",
  "yu-export",
  "yu-font",
  "yu-font-macos",
