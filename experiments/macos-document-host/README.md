@@ -80,6 +80,27 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 该自检通过同一个 `DocumentTextView` 执行一次插入、撤销和重做，确认 TextKit 不建立第二套
 history，Rust source、revision 和 redo 状态保持一致。
 
+验证第一阶段产品工作流（不启动窗口）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --document-workflow-self-check experiments/macos-document-host/Fixtures/sample.md
+```
+
+该自检会把 fixture 复制到临时路径，依次执行打开、中文/日文/Emoji/组合字符编辑、撤销、重做、
+私有 pasteboard 复制粘贴、保存和重新打开，并确认重新打开的 canonical Markdown 与保存前完全一致。
+仓库 fixture 不会被修改，用户的全局剪贴板也不会被触碰。
+
+验证真实 AppKit 窗口启动顺序（会短暂打开窗口后自动退出）：
+
+```bash
+swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+  --launch-window-self-check experiments/macos-document-host/Fixtures/sample.md
+```
+
+该检查确认窗口先完成 TextKit source fallback，再进入可选的 Rust visual/surface 生命周期；窗口未出现
+或启动期间发生异常时以失败退出。
+
 验证同一个 `DocumentEditorSession` 提供 source-backed Markdown projection 和 source↔visual
 caret 映射（不启动窗口）：
 

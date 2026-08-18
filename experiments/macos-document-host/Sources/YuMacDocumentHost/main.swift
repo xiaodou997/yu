@@ -53,6 +53,20 @@ private struct NativeStorageState {
         bom = value.bom != 0
         closeState = value.close_state
     }
+
+    /// A deliberately conservative state used only when the native host is
+    /// losing access to an already-open Rust session.  Treating the document
+    /// as dirty/changed disables destructive menu actions and keeps the
+    /// source TextKit fallback alive; it is safer than aborting the process
+    /// from an FFI status query.
+    init(unavailable: Void) {
+        revision = 0
+        savedRevision = 0
+        dirty = true
+        disk = .changed
+        bom = false
+        closeState = 0
+    }
 }
 
 private struct NativeSelection {
@@ -1400,6 +1414,9 @@ private struct NativeCommandResult {
 
 private final class StorageBridge {
     private var handle: OpaquePointer
+    private let openedPath: String
+    private var cachedSource: String
+    private var cachedState: NativeStorageState
 
     init(path: String) throws {
         var created: OpaquePointer?
@@ -1411,6 +1428,28 @@ private final class StorageBridge {
             throw BridgeError.open(status)
         }
         handle = created
+        openedPath = path
+        cachedSource = ""
+        cachedState = NativeStorageState(unavailable: ())
+
+        // Validate the two snapshots needed to construct the native source
+        // mirror before returning from init.  A malformed path/file or an ABI
+        // mismatch now becomes a normal launch error instead of a later
+        // `precondition` abort while AppKit is laying out the first window.
+        do {
+            cachedSource = try copyBytesThrowing { output, capacity, written in
+                yu_storage_session_copy_source(
+                    created,
+                    output,
+                    capacity,
+                    written
+                )
+            }
+            cachedState = try readState()
+        } catch {
+            yu_storage_session_destroy(created)
+            throw error
+        }
     }
 
     deinit {
@@ -1418,25 +1457,28 @@ private final class StorageBridge {
     }
 
     var path: String {
-        copyBytes { output, capacity, written in
+        copyBytesIfAvailable { output, capacity, written in
             yu_storage_session_copy_path(
                 handle,
                 output,
                 capacity,
                 written
             )
-        }
+        } ?? openedPath
     }
 
     var source: String {
-        copyBytes { output, capacity, written in
+        if let current = copyBytesIfAvailable({ output, capacity, written in
             yu_storage_session_copy_source(
                 handle,
                 output,
                 capacity,
                 written
             )
+        }) {
+            cachedSource = current
         }
+        return cachedSource
     }
 
     var copySourceIfAvailable: String? {
@@ -2564,12 +2606,18 @@ private final class StorageBridge {
     }
 
     var state: NativeStorageState {
+        if let current = try? readState() {
+            cachedState = current
+        }
+        return cachedState
+    }
+
+    private func readState() throws -> NativeStorageState {
         var value = YuStorageState()
-        let status = yu_storage_session_state(
-            handle,
-            &value
-        )
-        precondition(status == StorageStatus.ok, "Rust storage state query failed: \(status)")
+        let status = yu_storage_session_state(handle, &value)
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
         return NativeStorageState(value)
     }
 
@@ -4273,6 +4321,29 @@ private final class DocumentTextView: NSTextView {
         try sourceFromPasteboard(pasteboard)
     }
 
+    /// Runs the production copy payload against a private pasteboard so the
+    /// workflow smoke test never changes the user's global clipboard.
+    func copyToPasteboardForSelfCheck(_ pasteboard: NSPasteboard) throws {
+        try finishCompositionForClipboard()
+        let revision = bridge.state.revision
+        let text = bridge.copySelection()
+        guard !text.isEmpty else { return }
+        let html = try bridge.copySelectionHTML(revision: revision)
+        try publishSourceToPasteboard(text, html: html, to: pasteboard)
+    }
+
+    /// Runs the production paste transaction against a private pasteboard.
+    /// The same Rust selection/insert path is used; AppKit notifications are
+    /// intentionally omitted because this is a headless check.
+    func pasteFromPasteboardForSelfCheck(_ pasteboard: NSPasteboard) throws {
+        try finishCompositionForClipboard()
+        guard let text = try sourceFromPasteboard(pasteboard), !text.isEmpty else {
+            return
+        }
+        apply(try bridge.insertText(text))
+        synchronizeProjection()
+    }
+
     override func selectAll(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
@@ -4503,8 +4574,11 @@ private final class DocumentTextView: NSTextView {
         synchronizeProjection()
     }
 
-    private func publishSourceToPasteboard(_ source: String, html: String) throws {
-        let pasteboard = NSPasteboard.general
+    private func publishSourceToPasteboard(
+        _ source: String,
+        html: String,
+        to pasteboard: NSPasteboard = .general
+    ) throws {
         pasteboard.clearContents()
         guard pasteboard.setString(source, forType: .string),
               pasteboard.setString(source, forType: .yuMarkdown),
@@ -5864,6 +5938,11 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private var visualPointerAdapterEnabled = false
     private var visualPointerLayoutWidth: CGFloat = -1.0
     private var visualRenderStateMachine = VisualRenderStateMachine()
+    /// The source TextKit mirror must have one complete layout pass before
+    /// optional Rust projection/surface work is allowed to run. This keeps
+    /// opening a document on the primary editing path independent from the
+    /// enhancement layer's first drawable/metrics publication.
+    private var visualEnhancementsReady = false
     /// True only when the current decoration sibling came from the same Rust
     /// shaped frame that may become the primary visual surface. TextKit
     /// projected decorations are a fallback overlay and must never hide the
@@ -5920,7 +5999,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             self.textView.refreshTableResizeAccessibility()
             self.updateStatus()
             self.updateVisualDecorations()
-            self.surfaceCoordinator.scheduleSubmit()
+            self.scheduleVisualSubmit()
         }
         textView.onBeforeCommand = { [weak self] in
             self?.surfaceCoordinator.prepareForEditorCommand()
@@ -5932,7 +6011,8 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             // same main-thread turn has finished, while retaining the Rust
             // Revision captured by the coordinator's query.
             DispatchQueue.main.async { [weak self] in
-                self?.surfaceCoordinator.revealCaretIfNeeded()
+                guard let self, self.visualEnhancementsReady else { return }
+                self.surfaceCoordinator.revealCaretIfNeeded()
             }
         }
         textView.onError = { [weak self] error in self?.show(error) }
@@ -5988,8 +6068,12 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         surfaceHostView.onWindowStateChange = { [weak self] attached in
             guard let self else { return }
             if attached {
-                self.surfaceCoordinator.scheduleSubmit()
-                self.updateVisualDecorations()
+                if self.visualEnhancementsReady {
+                    self.surfaceCoordinator.scheduleSubmit()
+                    self.updateVisualDecorations()
+                } else {
+                    self.clearVisualDecorations(reason: .disabled)
+                }
                 self.textView.refreshTableResizeAccessibility()
             } else {
                 self.surfaceCoordinator.detach()
@@ -5998,7 +6082,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             }
         }
         surfaceHostView.onGeometryChange = { [weak self] in
-            self?.surfaceCoordinator.scheduleSubmit()
+            self?.scheduleVisualSubmit()
             self?.updateVisualDecorations()
             self?.textView.refreshTableResizeAccessibility()
         }
@@ -6008,7 +6092,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             object: scrollView.contentView,
             queue: .main
         ) { [weak self] _ in
-            self?.surfaceCoordinator.scheduleSubmit()
+            self?.scheduleVisualSubmit()
             self?.updateVisualDecorations()
             self?.textView.refreshTableResizeAccessibility()
         }
@@ -6062,6 +6146,13 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         if decorationHostView.frame != viewportFrame {
             decorationHostView.frame = viewportFrame
         }
+        guard visualEnhancementsReady else {
+            // Keep the native source mirror fully visible during the first
+            // layout. The enhancement layer is enabled from viewDidAppear,
+            // after AppKit has a real window/clip geometry to report.
+            clearVisualDecorations(reason: .disabled)
+            return
+        }
         let visualWidth = max(
             textView.bounds.width - 2.0 * textView.textContainerOrigin.x,
             1.0
@@ -6089,6 +6180,20 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         surfaceCoordinator.revealCaretIfNeeded()
     }
 
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard !visualEnhancementsReady else { return }
+        visualEnhancementsReady = true
+        // Defer the first optional projection submit by one main-thread turn
+        // so source TextKit focus/IME setup has completed before any native
+        // surface callback can run.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.view.window != nil else { return }
+            self.view.needsLayout = true
+            self.scheduleVisualSubmit()
+        }
+    }
+
     func refreshFromRust() {
         textView.refreshFromRust()
         surfaceCoordinator.resetTableResizeAfterDocumentChange()
@@ -6100,8 +6205,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         updateStatus()
         updateVisualDecorations()
         textView.refreshTableResizeAccessibility()
-        surfaceCoordinator.scheduleSubmit()
-        surfaceCoordinator.revealCaretIfNeeded()
+        scheduleVisualSubmit()
+        if visualEnhancementsReady {
+            surfaceCoordinator.revealCaretIfNeeded()
+        }
     }
 
     func detachSurfaceHost() {
@@ -6207,6 +6314,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     /// generation-bound Rust geometry as the surface; TextKit's projected
     /// overlay is only a failure fallback.
     private func updateVisualDecorations() {
+        guard visualEnhancementsReady else {
+            clearVisualDecorations(reason: .disabled)
+            return
+        }
         guard decorationHostView.superview != nil else {
             clearVisualDecorations(reason: .missingGeometry)
             return
@@ -6275,6 +6386,11 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         } else {
             clearVisualDecorations(reason: .missingGeometry)
         }
+    }
+
+    private func scheduleVisualSubmit() {
+        guard visualEnhancementsReady else { return }
+        surfaceCoordinator.scheduleSubmit()
     }
 
     /// Converts the disposable visual mirror geometry into the sibling
@@ -6508,14 +6624,24 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var controller: DocumentViewController?
+    private var launchSelfCheck = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let path: String
-        if let argument = CommandLine.arguments.dropFirst().first, !argument.hasPrefix("-") {
+        launchSelfCheck = CommandLine.arguments.contains("--launch-window-self-check")
+        if let argument = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
             path = URL(fileURLWithPath: argument).path
         } else {
             let panel = NSOpenPanel()
-            panel.allowedContentTypes = [.text, .plainText]
+            // `.md` is not consistently classified as `UTType.text` by
+            // Finder (especially for files created by scripts). Include the
+            // Markdown declaration explicitly while retaining ordinary text
+            // files in the first-stage host.
+            var contentTypes: [UTType] = [.text, .plainText]
+            if let markdown = UTType(filenameExtension: "md") {
+                contentTypes.append(markdown)
+            }
+            panel.allowedContentTypes = contentTypes
             panel.canChooseDirectories = false
             guard panel.runModal() == .OK, let url = panel.url else {
                 NSApp.terminate(nil)
@@ -6543,7 +6669,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             installMainMenu(for: controller)
             controller.focusDocument()
             print("Yu document host opened path=\(bridge.path) revision=\(bridge.state.revision)")
+            if launchSelfCheck {
+                // Give AppKit one complete appearance/layout turn. This is a
+                // real window smoke test: source fallback must become visible
+                // before optional Rust surface work is allowed to run.
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
+                    guard window.isVisible else {
+                        fputs("Yu launch self-check failed: window is not visible\n", stderr)
+                        exit(EXIT_FAILURE)
+                    }
+                    print("Yu launch self-check: window appeared and remained stable")
+                    NSApp.terminate(nil)
+                }
+            }
         } catch {
+            if launchSelfCheck {
+                fputs("Yu launch self-check failed: \(error)\n", stderr)
+                exit(EXIT_FAILURE)
+            }
             let alert = NSAlert(error: error)
             alert.runModal()
             NSApp.terminate(nil)
@@ -6783,6 +6926,77 @@ private func runUndoSelfCheck(path: String) -> Never {
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Yu Undo self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+/// Verifies the first product-level contract without opening a window:
+/// source TextKit construction, Unicode edit, Rust undo/redo, native
+/// clipboard payload/paste, save, and a fresh session reopening the exact
+/// bytes. The input fixture is copied to a temporary path so the repository
+/// file is never modified.
+private func runDocumentWorkflowSelfCheck(path: String) -> Never {
+    let fileManager = FileManager.default
+    let sourceURL = URL(fileURLWithPath: path)
+    let temporaryURL = fileManager.temporaryDirectory
+        .appendingPathComponent("yu-workflow-\(UUID().uuidString).md")
+    do {
+        try fileManager.copyItem(at: sourceURL, to: temporaryURL)
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+
+        let sourceBefore: String
+        let savedSource: String
+        do {
+            let bridge = try StorageBridge(path: temporaryURL.path)
+            let textView = DocumentTextView(bridge: bridge)
+            sourceBefore = bridge.source
+            precondition(sourceBefore.contains("日本語"))
+            precondition(sourceBefore.contains("🙂"))
+
+            let addition = "\nYu workflow: 日本語 🙂 é"
+            let end = NSRange(location: sourceBefore.utf16.count, length: 0)
+            try bridge.setSelection(end)
+            textView.insertText(addition, replacementRange: end)
+            precondition(bridge.source == sourceBefore + addition)
+            precondition(bridge.state.dirty)
+
+            textView.performUndo()
+            precondition(bridge.source == sourceBefore)
+            textView.performRedo()
+            precondition(bridge.source == sourceBefore + addition)
+
+            let insertedRange = NSRange(
+                location: sourceBefore.utf16.count,
+                length: addition.utf16.count
+            )
+            try bridge.setSelection(insertedRange)
+            let pasteboard = NSPasteboard.withUniqueName()
+            try textView.copyToPasteboardForSelfCheck(pasteboard)
+            precondition(
+                pasteboard.string(forType: .yuMarkdown) == addition,
+                "copy must publish canonical source"
+            )
+
+            let pasteEnd = NSRange(location: bridge.source.utf16.count, length: 0)
+            try bridge.setSelection(pasteEnd)
+            try textView.pasteFromPasteboardForSelfCheck(pasteboard)
+            precondition(bridge.source == sourceBefore + addition + addition)
+
+            try bridge.save()
+            precondition(!bridge.state.dirty)
+            savedSource = bridge.source
+        }
+
+        let reopened = try StorageBridge(path: temporaryURL.path)
+        precondition(reopened.source == savedSource)
+        precondition(!reopened.state.dirty)
+        print(
+            "Yu Document Workflow self-check: open/edit/undo/redo/copy/paste/save/reopen "
+                + "passed; UTF-8 source bytes are stable"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Document Workflow self-check failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
 }
@@ -9690,6 +9904,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--selection-self-check"),
 if let flag = CommandLine.arguments.firstIndex(of: "--undo-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runUndoSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--document-workflow-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runDocumentWorkflowSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
