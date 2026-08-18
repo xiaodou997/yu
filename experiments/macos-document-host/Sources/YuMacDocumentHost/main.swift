@@ -681,6 +681,16 @@ private let supportedVisualRenderCommandMask =
         | visualRenderCommandGlyphBit
         | visualRenderCommandImageBit
 
+private let supportedVisualBlockKindMask =
+    (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_BLANK_LINE))
+        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_REFERENCE_DEFINITION))
+        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_PARAGRAPH))
+        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_HEADING))
+        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE))
+        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_BLOCK_QUOTE))
+        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_LIST_ITEM))
+        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM))
+
 private func hasSupportedVisualRenderCommands(
     commandCount: Int,
     commandKindMask: UInt64
@@ -688,6 +698,22 @@ private func hasSupportedVisualRenderCommands(
     commandCount > 0
         && commandKindMask != 0
         && (commandKindMask & ~supportedVisualRenderCommandMask) == 0
+}
+
+private func hasSupportedVisualBlockKinds(_ blockKindMask: UInt64) -> Bool {
+    blockKindMask != 0
+        && (blockKindMask & ~supportedVisualBlockKindMask) == 0
+}
+
+private func hasSupportedVisualPublication(
+    commandCount: Int,
+    commandKindMask: UInt64,
+    blockKindMask: UInt64
+) -> Bool {
+    hasSupportedVisualRenderCommands(
+        commandCount: commandCount,
+        commandKindMask: commandKindMask
+    ) && hasSupportedVisualBlockKinds(blockKindMask)
 }
 
 private struct NativeMacosRenderHostSnapshot {
@@ -709,6 +735,7 @@ private struct NativeMacosRenderHostSnapshot {
     let viewportWidth: CGFloat
     let published: Bool
     let commandKindMask: UInt64
+    let blockKindMask: UInt64
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
         revision = value.revision
@@ -729,6 +756,7 @@ private struct NativeMacosRenderHostSnapshot {
         viewportWidth = CGFloat(value.viewport_width)
         published = value.published != 0
         commandKindMask = value.command_kind_mask
+        blockKindMask = value.block_kind_mask
     }
 }
 
@@ -754,11 +782,13 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let imageRetryCount: Int
     let submitted: Bool
     let commandKindMask: UInt64
+    let blockKindMask: UInt64
 
     var hasVisualContent: Bool {
-        hasSupportedVisualRenderCommands(
+        hasSupportedVisualPublication(
             commandCount: commandCount,
-            commandKindMask: commandKindMask
+            commandKindMask: commandKindMask,
+            blockKindMask: blockKindMask
         )
     }
 
@@ -784,6 +814,7 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
         imageRetryCount = Int(value.image_retry_count)
         submitted = value.submitted != 0
         commandKindMask = value.command_kind_mask
+        blockKindMask = value.block_kind_mask
     }
 }
 
@@ -5096,6 +5127,7 @@ private struct VisualRenderPublicationIdentity: Equatable {
     let submitted: Bool
     let commandCount: Int
     let commandKindMask: UInt64
+    let blockKindMask: UInt64
 
     /// A submitted surface is not necessarily useful to the editor. An empty
     /// render plan can be a valid publication for an empty/whitespace-only
@@ -5104,9 +5136,10 @@ private struct VisualRenderPublicationIdentity: Equatable {
     /// beside the publication identity makes the source-glyph gate explicit
     /// and prevents a blank surface from looking like a successful migration.
     var hasVisualContent: Bool {
-        hasSupportedVisualRenderCommands(
+        hasSupportedVisualPublication(
             commandCount: commandCount,
-            commandKindMask: commandKindMask
+            commandKindMask: commandKindMask,
+            blockKindMask: blockKindMask
         )
     }
 
@@ -5114,12 +5147,14 @@ private struct VisualRenderPublicationIdentity: Equatable {
         frame: VisualRenderFrameIdentity,
         submitted: Bool,
         commandCount: Int = 1,
-        commandKindMask: UInt64 = supportedVisualRenderCommandMask
+        commandKindMask: UInt64 = supportedVisualRenderCommandMask,
+        blockKindMask: UInt64 = supportedVisualBlockKindMask
     ) {
         self.frame = frame
         self.submitted = submitted
         self.commandCount = commandCount
         self.commandKindMask = commandKindMask
+        self.blockKindMask = blockKindMask
     }
 
     init(_ snapshot: NativeMacosRenderHostSurfaceSnapshot) {
@@ -5132,6 +5167,7 @@ private struct VisualRenderPublicationIdentity: Equatable {
         submitted = snapshot.submitted
         commandCount = snapshot.commandCount
         commandKindMask = snapshot.commandKindMask
+        blockKindMask = snapshot.blockKindMask
     }
 }
 
@@ -5175,6 +5211,7 @@ private enum VisualRenderFallbackReason: String, Equatable, CustomStringConverti
     case visualMirrorUnavailable
     case noVisualContent
     case unsupportedContent
+    case unsupportedBlockContent
 
     var description: String { rawValue }
 }
@@ -6372,9 +6409,16 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         }
         if let snapshot = surfaceCoordinator.lastSnapshot,
            !snapshot.hasVisualContent {
-            return snapshot.commandCount == 0
-                ? .noVisualContent
-                : .unsupportedContent
+            if snapshot.commandCount == 0 {
+                return .noVisualContent
+            }
+            if !hasSupportedVisualRenderCommands(
+                commandCount: snapshot.commandCount,
+                commandKindMask: snapshot.commandKindMask
+            ) {
+                return .unsupportedContent
+            }
+            return .unsupportedBlockContent
         }
         if bridge.composition.active {
             return .compositionActive
@@ -7731,6 +7775,25 @@ private func runVisualRenderStateSelfCheck() -> Never {
             commandCount: 1,
             commandKindMask: 0
         )
+    )
+    precondition(
+        !hasSupportedVisualBlockKinds(supportedVisualBlockKindMask | (UInt64(1) << 63))
+    )
+    precondition(
+        acceptedVisualRenderFrame(
+            revision: 7,
+            compositionGeneration: 3,
+            publicationCurrent: true,
+            publication: VisualRenderPublicationIdentity(
+                frame: frame,
+                submitted: true,
+                commandCount: 1,
+                blockKindMask: supportedVisualBlockKindMask | (UInt64(1) << 63)
+            ),
+            decorationRevision: 7,
+            decorationHasValidFrame: true,
+            rustDecorationFrameAccepted: true
+        ) == nil
     )
 
     machine.enterFallback(.staleComposition)
@@ -9595,6 +9658,7 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         precondition(first.surfaceGeneration == 0)
         precondition(first.submitted)
         precondition(first.commandKindMask != 0)
+        precondition(first.blockKindMask != 0)
         precondition(first.hasVisualContent)
         precondition(coordinator.isAttached)
         precondition(surfaceView.nativeContentVisible)

@@ -839,6 +839,9 @@ pub struct YuStorageMacosRenderHostSnapshot {
     /// diagnostics while newer hosts can reject commands they do not know
     /// how to draw.
     pub command_kind_mask: u64,
+    /// Bitset of parser-owned block tags present in the current viewport.
+    /// Unknown tags are represented by the high sentinel bit.
+    pub block_kind_mask: u64,
 }
 
 /// Scalar result from the opt-in real CAMetalLayer submit bridge. The view,
@@ -870,6 +873,8 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     /// Same command-kind capability bitset as the retained host snapshot.
     /// Native presentation must treat unknown bits as a fallback condition.
     pub command_kind_mask: u64,
+    /// Same viewport block-tag summary as the retained host snapshot.
+    pub block_kind_mask: u64,
 }
 
 /// One glyph primitive copied from the retained scene produced by the
@@ -6616,6 +6621,22 @@ fn macos_render_command_kind_mask(commands: &[RenderCommand]) -> u64 {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_render_block_kind_mask(input: &ViewportSceneInput) -> u64 {
+    input.blocks().iter().fold(0_u64, |mask, block| {
+        let kind = block.kind();
+        // Current parser tags are small stable values. Keep one high sentinel
+        // for any future tag that cannot be represented by this u64 summary;
+        // the native gate will reject it until its renderer is implemented.
+        let bit = if kind < 63 {
+            1_u64 << u32::from(kind)
+        } else {
+            1_u64 << 63
+        };
+        mask | bit
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn macos_render_host_config(
     viewport: ViewportRect,
     size: f32,
@@ -6676,6 +6697,7 @@ fn macos_render_host_snapshot(
         viewport_width: config.scene_viewport().width(),
         published: 1,
         command_kind_mask: macos_render_command_kind_mask(plan.commands()),
+        block_kind_mask: macos_render_block_kind_mask(frame.scene().input()),
     })
 }
 
@@ -7756,6 +7778,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 image_retry_count,
                 submitted: 1,
                 command_kind_mask: host_snapshot.command_kind_mask,
+                block_kind_mask: host_snapshot.block_kind_mask,
             };
         }
         YU_STORAGE_OK
@@ -11593,6 +11616,10 @@ mod tests {
             | (1_u64 << u32::from(YU_STORAGE_RENDER_COMMAND_GLYPH))
             | (1_u64 << u32::from(YU_STORAGE_RENDER_COMMAND_IMAGE));
         assert_eq!(first.command_kind_mask & !supported_command_mask, 0);
+        let supported_block_kind_mask = (0..=YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM)
+            .fold(0_u64, |mask, kind| mask | (1_u64 << u32::from(kind)));
+        assert_ne!(first.block_kind_mask, 0);
+        assert_eq!(first.block_kind_mask & !supported_block_kind_mask, 0);
 
         let mut repeated = YuStorageMacosRenderHostSnapshot::default();
         assert_eq!(
@@ -11657,6 +11684,7 @@ mod tests {
         assert!(cross_block.frame_serial > repeated.frame_serial);
         assert!(cross_block.command_count > 0);
         assert_eq!(cross_block.command_kind_mask, first.command_kind_mask);
+        assert_eq!(cross_block.block_kind_mask, first.block_kind_mask);
         assert!(cross_block.atlas_glyph_count >= repeated.atlas_glyph_count);
 
         assert_eq!(
