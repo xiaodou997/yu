@@ -10,7 +10,7 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_core::Revision;
+use yu_core::{Revision, TextRange};
 use yu_font::{AtlasEntry, GlyphRasterKey};
 use yu_layout::LayoutSnapshot;
 
@@ -292,6 +292,91 @@ impl ImagePrimitive {
     }
 }
 
+/// A source-backed SVG embedded resource draw operation.
+///
+/// The scene intentionally carries only the resource identity and intrinsic
+/// dimensions. SVG markup remains owned by the backend-neutral render-plan
+/// upload, so the retained scene cannot accidentally become a second document
+/// source of truth. `kind` is the stable wire tag from `yu-assets` (Math is 0,
+/// Mermaid is 1) without making the scene depend on a concrete asset cache.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EmbeddedSvgPrimitive {
+    resource: u64,
+    generation: u64,
+    kind: u8,
+    source: TextRange,
+    bounds: Rect,
+    width: u32,
+    height: u32,
+    fallback: Rgba8,
+}
+
+impl EmbeddedSvgPrimitive {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        resource: u64,
+        generation: u64,
+        kind: u8,
+        source: TextRange,
+        bounds: Rect,
+        width: u32,
+        height: u32,
+        fallback: Rgba8,
+    ) -> Self {
+        Self {
+            resource,
+            generation,
+            kind,
+            source,
+            bounds,
+            width,
+            height,
+            fallback,
+        }
+    }
+
+    #[must_use]
+    pub const fn resource(self) -> u64 {
+        self.resource
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> u8 {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> Rect {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+
+    #[must_use]
+    pub const fn fallback(self) -> Rgba8 {
+        self.fallback
+    }
+}
+
 /// Semantic role for a source-backed table decoration. The renderer may map
 /// all roles to solid fills today, while native selection/accessibility layers
 /// can still distinguish header, selection and grid geometry without parsing
@@ -404,6 +489,7 @@ pub enum Primitive {
     FillRect { bounds: Rect, color: Rgba8 },
     Glyph(GlyphPrimitive),
     Image(ImagePrimitive),
+    EmbeddedSvg(EmbeddedSvgPrimitive),
     Table(TablePrimitive),
 }
 
@@ -414,6 +500,7 @@ impl Primitive {
             Self::FillRect { bounds, .. } => bounds,
             Self::Glyph(glyph) => glyph.bounds(),
             Self::Image(image) => image.bounds(),
+            Self::EmbeddedSvg(svg) => svg.bounds(),
             Self::Table(table) => table.bounds(),
         }
     }
@@ -497,6 +584,10 @@ pub enum SceneError {
     InvalidViewportInput(&'static str),
     InvalidDamageBudget,
     PrimitiveLimitExceeded,
+    InvalidEmbeddedDimensions {
+        width: u32,
+        height: u32,
+    },
     InvalidTableStyle(u32),
     RevisionMismatch {
         scene: Revision,
@@ -518,6 +609,10 @@ impl fmt::Display for SceneError {
             Self::InvalidViewportInput(message) => formatter.write_str(message),
             Self::InvalidDamageBudget => formatter.write_str("damage budget must be positive"),
             Self::PrimitiveLimitExceeded => formatter.write_str("scene primitive limit exceeded"),
+            Self::InvalidEmbeddedDimensions { width, height } => write!(
+                formatter,
+                "embedded SVG dimensions must be positive, got {width}x{height}"
+            ),
             Self::InvalidTableStyle(width) => write!(
                 formatter,
                 "invalid table border width {}",
@@ -656,6 +751,14 @@ impl SceneBuilder {
         if let Primitive::Glyph(glyph) = primitive {
             glyph.origin.validate()?;
         }
+        if let Primitive::EmbeddedSvg(svg) = primitive
+            && (svg.width() == 0 || svg.height() == 0)
+        {
+            return Err(SceneError::InvalidEmbeddedDimensions {
+                width: svg.width(),
+                height: svg.height(),
+            });
+        }
         primitive.bounds().validate()?;
         let index =
             u32::try_from(self.primitives.len()).map_err(|_| SceneError::PrimitiveLimitExceeded)?;
@@ -674,6 +777,10 @@ impl SceneBuilder {
 
     pub fn image(&mut self, image: ImagePrimitive) -> Result<u32, SceneError> {
         self.push(Primitive::Image(image))
+    }
+
+    pub fn embedded_svg(&mut self, svg: EmbeddedSvgPrimitive) -> Result<u32, SceneError> {
+        self.push(Primitive::EmbeddedSvg(svg))
     }
 
     /// Appends source-backed table header, selection and grid decorations.
@@ -1342,5 +1449,34 @@ mod tests {
             .expect("append image");
         assert_eq!(count, 1);
         assert_eq!(builder.finish().primitives(), &[Primitive::Image(image)]);
+    }
+
+    #[test]
+    fn embedded_svg_primitive_keeps_source_identity_and_rejects_empty_dimensions() {
+        let revision = Revision::new(11);
+        let viewport = Rect::new(0.0, 0.0, 320.0, 200.0).expect("viewport");
+        let source = TextRange::new(ByteOffset::new(4), ByteOffset::new(12)).expect("source");
+        let bounds = Rect::new(12.0, 18.0, 160.0, 80.0).expect("bounds");
+        let fallback = Rgba8::new(238, 239, 244, 255);
+        let svg = EmbeddedSvgPrimitive::new(0xfeed_beef, 3, 0, source, bounds, 640, 320, fallback);
+        let mut builder = SceneBuilder::new(revision, viewport).expect("builder");
+        builder.embedded_svg(svg).expect("embedded SVG");
+        let scene = builder.finish();
+        assert_eq!(scene.primitives(), &[Primitive::EmbeddedSvg(svg)]);
+        assert_eq!(svg.source(), source);
+        assert_eq!(svg.resource(), 0xfeed_beef);
+        assert_eq!(svg.width(), 640);
+        assert_eq!(svg.height(), 320);
+
+        let invalid =
+            EmbeddedSvgPrimitive::new(0xfeed_beef, 4, 0, source, bounds, 0, 320, fallback);
+        let mut invalid_builder = SceneBuilder::new(revision, viewport).expect("builder");
+        assert_eq!(
+            invalid_builder.embedded_svg(invalid),
+            Err(SceneError::InvalidEmbeddedDimensions {
+                width: 0,
+                height: 320,
+            })
+        );
     }
 }

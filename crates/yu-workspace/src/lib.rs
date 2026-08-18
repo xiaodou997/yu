@@ -1128,7 +1128,10 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 Primitive::Image(image) => Some(*image),
-                Primitive::FillRect { .. } | Primitive::Glyph(_) | Primitive::Table(_) => None,
+                Primitive::FillRect { .. }
+                | Primitive::Glyph(_)
+                | Primitive::EmbeddedSvg(_)
+                | Primitive::Table(_) => None,
             })
             .expect("image primitive");
         assert_eq!(image.bounds().width(), 200.0);
@@ -1153,7 +1156,10 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 Primitive::Image(image) => Some(*image),
-                Primitive::FillRect { .. } | Primitive::Glyph(_) | Primitive::Table(_) => None,
+                Primitive::FillRect { .. }
+                | Primitive::Glyph(_)
+                | Primitive::EmbeddedSvg(_)
+                | Primitive::Table(_) => None,
             })
             .expect("metadata-only image primitive");
         assert_eq!(metadata_image.bounds().width(), 200.0);
@@ -1201,7 +1207,10 @@ mod tests {
                 assert_eq!(bounds.width(), 240.0);
                 assert!(bounds.height() > 0.0);
             }
-            Primitive::Glyph(_) | Primitive::Image(_) | Primitive::Table(_) => {
+            Primitive::Glyph(_)
+            | Primitive::Image(_)
+            | Primitive::EmbeddedSvg(_)
+            | Primitive::Table(_) => {
                 panic!("code block background must precede glyphs")
             }
         }

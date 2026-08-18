@@ -98,6 +98,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] 图片 intrinsic metadata 与 decoded pixels 分离并跨帧保留；同一 Revision 的失败按有界指数退避重试，仍保留 fallback
 - [x] `yu-image-scheduling-bench` 覆盖 2,000/100,000 级图片 block 的 viewport/overscan 请求量与耗时
 - [x] `ImageRequestPlan` 按 destination 去重并以 visible 优先排序；macOS surface snapshot 暴露候选、去重、overscan 与 retry 计数
+- [x] embedded Math/Mermaid 建立 `EmbeddedSvgPrimitive` → `EmbeddedSvgUpload` → `RenderCommand::EmbeddedSvg` 的 Revision/source/fingerprint/dimensions 消费边界；macOS FFI 追加 count/fill 诊断字段，Metal 尚以安全 fallback rectangle 等待真正 SVG consumer
 
 ## 约束
 

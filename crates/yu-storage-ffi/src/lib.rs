@@ -708,6 +708,7 @@ pub struct YuStorageVisualScenePrimitive {
 pub const YU_STORAGE_RENDER_COMMAND_FILL_RECT: u8 = 0;
 pub const YU_STORAGE_RENDER_COMMAND_GLYPH: u8 = 1;
 pub const YU_STORAGE_RENDER_COMMAND_IMAGE: u8 = 2;
+pub const YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG: u8 = 3;
 pub const YU_STORAGE_RENDER_PAGE_NONE: u32 = u32::MAX;
 pub const YU_STORAGE_IMAGE_DESTINATION_NONE: u64 = u64::MAX;
 pub const YU_STORAGE_IMAGE_INLINE: u8 = 0;
@@ -789,6 +790,10 @@ pub struct YuStorageVisualRenderPlanSnapshot {
     pub viewport_height: f32,
     pub max_scroll_y: f32,
     pub viewport_width: f32,
+    /// Appended diagnostics for the embedded SVG scene/render boundary.
+    pub embedded_command_count: u64,
+    pub embedded_upload_count: u64,
+    pub embedded_upload_bytes: u64,
 }
 
 /// One owned render command. Glyph atlas placement, baseline origin, metrics,
@@ -820,6 +825,13 @@ pub struct YuStorageVisualRenderCommand {
     pub bounds_height: f32,
     pub color_rgba: u32,
     pub resource: u64,
+    /// Appended embedded-resource identity and intrinsic dimensions. Existing
+    /// native callers can ignore these fields; a future SVG backend can use
+    /// them to match a render-plan upload to its command.
+    pub embedded_generation: u64,
+    pub embedded_kind: u8,
+    pub embedded_width: u32,
+    pub embedded_height: u32,
 }
 
 /// One owned atlas-page publication record. The corresponding alpha bytes are
@@ -6847,6 +6859,7 @@ fn macos_render_command_kind_mask(commands: &[RenderCommand]) -> u64 {
             RenderCommand::FillRect { .. } => YU_STORAGE_RENDER_COMMAND_FILL_RECT,
             RenderCommand::Glyph { .. } => YU_STORAGE_RENDER_COMMAND_GLYPH,
             RenderCommand::Image { .. } => YU_STORAGE_RENDER_COMMAND_IMAGE,
+            RenderCommand::EmbeddedSvg { .. } => YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG,
         };
         mask | (1_u64 << u32::from(kind))
     })
@@ -7487,6 +7500,10 @@ fn macos_visual_render_plan(
                     bounds_height: bounds.height(),
                     color_rgba: color.packed(),
                     resource: 0,
+                    embedded_generation: 0,
+                    embedded_kind: 0,
+                    embedded_width: 0,
+                    embedded_height: 0,
                 }
             }
             RenderCommand::Glyph {
@@ -7521,6 +7538,10 @@ fn macos_visual_render_plan(
                     bounds_height: rect.height() as f32,
                     color_rgba: color.packed(),
                     resource: 0,
+                    embedded_generation: 0,
+                    embedded_kind: 0,
+                    embedded_width: 0,
+                    embedded_height: 0,
                 }
             }
             RenderCommand::Image {
@@ -7553,6 +7574,50 @@ fn macos_visual_render_plan(
                     bounds_height: bounds.height(),
                     color_rgba: fallback.packed(),
                     resource,
+                    embedded_generation: 0,
+                    embedded_kind: 0,
+                    embedded_width: 0,
+                    embedded_height: 0,
+                }
+            }
+            RenderCommand::EmbeddedSvg {
+                resource,
+                generation,
+                kind,
+                bounds,
+                width,
+                height,
+                fallback,
+            } => {
+                if metadata_kind != YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG {
+                    return Err(YU_STORAGE_EDITOR_ERROR);
+                }
+                YuStorageVisualRenderCommand {
+                    revision: plan.revision().get(),
+                    block_index,
+                    source_start_utf16,
+                    source_end_utf16,
+                    kind: YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG,
+                    page: YU_STORAGE_RENDER_PAGE_NONE,
+                    atlas_x: 0,
+                    atlas_y: 0,
+                    atlas_width: 0,
+                    atlas_height: 0,
+                    origin_x: 0.0,
+                    origin_y: 0.0,
+                    bearing_x: 0.0,
+                    bearing_y: 0.0,
+                    advance_x: 0.0,
+                    bounds_x: bounds.x(),
+                    bounds_y: bounds.y(),
+                    bounds_width: bounds.width(),
+                    bounds_height: bounds.height(),
+                    color_rgba: fallback.packed(),
+                    resource,
+                    embedded_generation: generation,
+                    embedded_kind: kind,
+                    embedded_width: width,
+                    embedded_height: height,
                 }
             }
         };
@@ -7599,6 +7664,26 @@ fn macos_visual_render_plan(
         viewport_height,
         max_scroll_y: (viewport_snapshot.content_height() - viewport_height).max(0.0),
         viewport_width: max_width,
+        embedded_command_count: u64::try_from(
+            plan.commands()
+                .iter()
+                .filter(|command| matches!(command, RenderCommand::EmbeddedSvg { .. }))
+                .count(),
+        )
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        embedded_upload_count: u64::try_from(plan.embedded_uploads().len())
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        embedded_upload_bytes: {
+            let mut total = 0_u64;
+            for upload in plan.embedded_uploads() {
+                let bytes = u64::try_from(upload.markup().len())
+                    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+                total = total
+                    .checked_add(bytes)
+                    .ok_or(YU_STORAGE_INVALID_SELECTION)?;
+            }
+            total
+        },
     };
     Ok((snapshot, commands, pages, damage))
 }
@@ -11269,6 +11354,9 @@ mod tests {
         assert_eq!(snapshot.upload_count, page_required as u64);
         assert_eq!(snapshot.damage_count, damage_required as u64);
         assert_eq!(snapshot.viewport_width, 500.0);
+        assert_eq!(snapshot.embedded_command_count, 0);
+        assert_eq!(snapshot.embedded_upload_count, 0);
+        assert_eq!(snapshot.embedded_upload_bytes, 0);
 
         let mut too_small_commands =
             vec![YuStorageVisualRenderCommand::default(); command_required - 1];
@@ -11355,6 +11443,10 @@ mod tests {
                 && command.origin_y.is_finite();
             command.revision == 0
                 && geometry_valid
+                && command.embedded_generation == 0
+                && command.embedded_kind == 0
+                && command.embedded_width == 0
+                && command.embedded_height == 0
                 && match command.kind {
                     YU_STORAGE_RENDER_COMMAND_FILL_RECT => {
                         command.page == YU_STORAGE_RENDER_PAGE_NONE

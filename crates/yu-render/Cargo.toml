@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+yu-assets = { path = "../yu-assets" }
 yu-core = { path = "../yu-core" }
 yu-font = { path = "../yu-font" }
 yu-scene = { path = "../yu-scene" }

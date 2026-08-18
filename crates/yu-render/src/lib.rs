@@ -13,6 +13,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use yu_assets::{EmbeddedRenderPayload, EmbeddedRenderPublication};
 use yu_core::Revision;
 use yu_font::{AtlasError, GlyphAtlas, GlyphRasterKey};
 use yu_scene::{Point, Primitive, Rect, Rgba8, Scene};
@@ -25,6 +26,57 @@ pub struct AtlasPageUpload {
     height: u32,
     pixels: Arc<[u8]>,
     fingerprint: u64,
+}
+
+/// An owned SVG payload that a concrete backend may upload or compile for a
+/// single render plan. The source range and resource identity remain attached
+/// so a platform can reject stale work without consulting the Markdown tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedSvgUpload {
+    resource: u64,
+    generation: u64,
+    kind: u8,
+    source: yu_core::TextRange,
+    width: u32,
+    height: u32,
+    markup: Arc<str>,
+}
+
+impl EmbeddedSvgUpload {
+    #[must_use]
+    pub const fn resource(&self) -> u64 {
+        self.resource
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> u8 {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> yu_core::TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[must_use]
+    pub fn markup(&self) -> &str {
+        &self.markup
+    }
 }
 
 impl AtlasPageUpload {
@@ -76,6 +128,18 @@ pub enum RenderCommand {
         bounds: Rect,
         fallback: Rgba8,
     },
+    /// A published SVG resource reference. The markup itself is carried by
+    /// [`EmbeddedSvgUpload`], while this copyable command stays small enough
+    /// for native command buffers and retains a safe fallback color.
+    EmbeddedSvg {
+        resource: u64,
+        generation: u64,
+        kind: u8,
+        bounds: Rect,
+        width: u32,
+        height: u32,
+        fallback: Rgba8,
+    },
 }
 
 /// A complete render preparation result for one source revision.
@@ -85,6 +149,7 @@ pub struct RenderPlan {
     viewport: Rect,
     damage: Vec<Rect>,
     uploads: Vec<AtlasPageUpload>,
+    embedded_uploads: Vec<EmbeddedSvgUpload>,
     commands: Vec<RenderCommand>,
 }
 
@@ -110,13 +175,18 @@ impl RenderPlan {
     }
 
     #[must_use]
+    pub fn embedded_uploads(&self) -> &[EmbeddedSvgUpload] {
+        &self.embedded_uploads
+    }
+
+    #[must_use]
     pub fn commands(&self) -> &[RenderCommand] {
         &self.commands
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty() && self.uploads.is_empty()
+        self.commands.is_empty() && self.uploads.is_empty() && self.embedded_uploads.is_empty()
     }
 }
 
@@ -126,6 +196,20 @@ pub enum RenderError {
     Atlas(AtlasError),
     MissingAtlasEntry(GlyphRasterKey),
     StaleAtlasEntry(GlyphRasterKey),
+    MissingEmbeddedPublication {
+        resource: u64,
+        generation: u64,
+    },
+    NonSvgEmbeddedPublication {
+        resource: u64,
+    },
+    EmbeddedDimensionsMismatch {
+        resource: u64,
+        primitive_width: u32,
+        primitive_height: u32,
+        publication_width: u32,
+        publication_height: u32,
+    },
 }
 
 impl fmt::Display for RenderError {
@@ -146,6 +230,27 @@ impl fmt::Display for RenderError {
                     key.glyph().get()
                 )
             }
+            Self::MissingEmbeddedPublication {
+                resource,
+                generation,
+            } => write!(
+                formatter,
+                "scene references missing embedded SVG resource {resource:#x} generation {generation}"
+            ),
+            Self::NonSvgEmbeddedPublication { resource } => write!(
+                formatter,
+                "embedded resource {resource:#x} is not an SVG publication"
+            ),
+            Self::EmbeddedDimensionsMismatch {
+                resource,
+                primitive_width,
+                primitive_height,
+                publication_width,
+                publication_height,
+            } => write!(
+                formatter,
+                "embedded resource {resource:#x} dimensions {primitive_width}x{primitive_height} do not match publication {publication_width}x{publication_height}"
+            ),
         }
     }
 }
@@ -165,6 +270,7 @@ struct PageFingerprint {
 #[derive(Clone, Debug, Default)]
 pub struct RenderPlanBuilder {
     uploaded_pages: HashMap<u32, PageFingerprint>,
+    uploaded_embedded: HashMap<(u64, u64), u64>,
 }
 
 impl RenderPlanBuilder {
@@ -174,9 +280,24 @@ impl RenderPlanBuilder {
     }
 
     pub fn build(&mut self, scene: &Scene, atlas: &GlyphAtlas) -> Result<RenderPlan, RenderError> {
+        self.build_with_embedded(scene, atlas, &[])
+    }
+
+    /// Builds a plan after validating and consuming revision-bound embedded
+    /// SVG publications. The ordinary [`Self::build`] path deliberately
+    /// supplies no publications, so an embedded primitive cannot become
+    /// visible by accident before a renderer has crossed this boundary.
+    pub fn build_with_embedded(
+        &mut self,
+        scene: &Scene,
+        atlas: &GlyphAtlas,
+        publications: &[EmbeddedRenderPublication],
+    ) -> Result<RenderPlan, RenderError> {
         let mut uploads = Vec::new();
+        let mut embedded_uploads = Vec::new();
         let mut commands = Vec::with_capacity(scene.primitives().len());
         let mut next_pages = self.uploaded_pages.clone();
+        let mut next_embedded = self.uploaded_embedded.clone();
 
         for primitive in scene.primitives().iter().copied() {
             match primitive {
@@ -227,6 +348,59 @@ impl RenderPlanBuilder {
                         fallback: image.fallback(),
                     });
                 }
+                Primitive::EmbeddedSvg(svg) => {
+                    let publication = publications.iter().find(|publication| {
+                        publication.revision() == scene.revision()
+                            && publication.key().fingerprint() == svg.resource()
+                            && publication.generation() == svg.generation()
+                            && publication.kind().tag() == svg.kind()
+                            && publication.source_range() == svg.source()
+                    });
+                    let publication =
+                        publication.ok_or(RenderError::MissingEmbeddedPublication {
+                            resource: svg.resource(),
+                            generation: svg.generation(),
+                        })?;
+                    let EmbeddedRenderPayload::Svg { dimensions, markup } = publication.payload()
+                    else {
+                        return Err(RenderError::NonSvgEmbeddedPublication {
+                            resource: svg.resource(),
+                        });
+                    };
+                    if dimensions.width() != svg.width() || dimensions.height() != svg.height() {
+                        return Err(RenderError::EmbeddedDimensionsMismatch {
+                            resource: svg.resource(),
+                            primitive_width: svg.width(),
+                            primitive_height: svg.height(),
+                            publication_width: dimensions.width(),
+                            publication_height: dimensions.height(),
+                        });
+                    }
+                    let upload_key = (svg.resource(), svg.generation());
+                    if next_embedded.get(&upload_key).copied()
+                        != Some(publication.key().fingerprint())
+                    {
+                        embedded_uploads.push(EmbeddedSvgUpload {
+                            resource: svg.resource(),
+                            generation: svg.generation(),
+                            kind: svg.kind(),
+                            source: svg.source(),
+                            width: dimensions.width(),
+                            height: dimensions.height(),
+                            markup: Arc::clone(markup),
+                        });
+                        next_embedded.insert(upload_key, publication.key().fingerprint());
+                    }
+                    commands.push(RenderCommand::EmbeddedSvg {
+                        resource: svg.resource(),
+                        generation: svg.generation(),
+                        kind: svg.kind(),
+                        bounds: svg.bounds(),
+                        width: dimensions.width(),
+                        height: dimensions.height(),
+                        fallback: svg.fallback(),
+                    });
+                }
                 Primitive::Table(table) => {
                     // Table roles remain available in the retained scene for
                     // native selection/accessibility consumers. The current
@@ -241,11 +415,13 @@ impl RenderPlanBuilder {
         }
 
         self.uploaded_pages = next_pages;
+        self.uploaded_embedded = next_embedded;
         Ok(RenderPlan {
             revision: scene.revision(),
             viewport: scene.viewport(),
             damage: scene.damage().rects().to_vec(),
             uploads,
+            embedded_uploads,
             commands,
         })
     }
@@ -256,11 +432,21 @@ impl RenderPlanBuilder {
 
     pub fn reset(&mut self) {
         self.uploaded_pages.clear();
+        self.uploaded_embedded.clear();
     }
 
     #[must_use]
     pub fn uploaded_page_count(&self) -> usize {
         self.uploaded_pages.len()
+    }
+
+    #[must_use]
+    pub fn uploaded_embedded_count(&self) -> usize {
+        self.uploaded_embedded.len()
+    }
+
+    pub fn invalidate_embedded(&mut self, resource: u64, generation: u64) {
+        self.uploaded_embedded.remove(&(resource, generation));
     }
 }
 
@@ -293,6 +479,7 @@ fn hash_page(page: u32, width: u32, height: u32, pixels: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use yu_assets::{EmbeddedRenderPayload, EmbeddedRenderRequest, EmbeddedResourceKind};
     use yu_core::{ByteOffset, TextRange};
     use yu_font::{
         AtlasEntry, FontDatabase, FontFaceId, FontFaceSpec, FontRequest, FontShaper,
@@ -301,8 +488,8 @@ mod tests {
     use yu_layout::{LayoutConfig, LayoutSnapshot};
     use yu_projection::Projection;
     use yu_scene::{
-        GlyphPrimitive, ImagePrimitive, Point, SceneBuilder, SceneError, TablePrimitiveRole,
-        TableSceneStyle, ViewportBlockGeometry, ViewportSceneInput,
+        EmbeddedSvgPrimitive, GlyphPrimitive, ImagePrimitive, Point, SceneBuilder, SceneError,
+        TablePrimitiveRole, TableSceneStyle, ViewportBlockGeometry, ViewportSceneInput,
     };
     use yu_text::TextBuffer;
 
@@ -581,7 +768,9 @@ mod tests {
                 assert_eq!(origin.x(), layout.glyphs()[0].x());
                 assert_eq!(origin.y(), layout.glyphs()[0].y());
             }
-            RenderCommand::FillRect { .. } | RenderCommand::Image { .. } => {
+            RenderCommand::FillRect { .. }
+            | RenderCommand::Image { .. }
+            | RenderCommand::EmbeddedSvg { .. } => {
                 panic!("expected glyph command")
             }
         }
@@ -609,6 +798,152 @@ mod tests {
                 bounds,
                 fallback,
             }]
+        );
+    }
+
+    #[test]
+    fn published_embedded_svg_becomes_upload_and_revision_bound_command() {
+        let revision = Revision::new(7);
+        let source = TextRange::new(ByteOffset::new(10), ByteOffset::new(18)).expect("source");
+        let request =
+            EmbeddedRenderRequest::new(revision, source, EmbeddedResourceKind::Math, "x^2 + y^2")
+                .expect("request");
+        let mut cache = yu_assets::EmbeddedResourceCache::new();
+        let publication = cache
+            .publish(
+                request,
+                revision,
+                EmbeddedRenderPayload::svg(640, 320, "<svg viewBox=\"0 0 640 320\"/>")
+                    .expect("SVG"),
+            )
+            .expect("publication");
+        let bounds = Rect::new(24.0, 32.0, 160.0, 80.0).expect("bounds");
+        let fallback = Rgba8::new(230, 232, 236, 255);
+        let primitive = EmbeddedSvgPrimitive::new(
+            publication.key().fingerprint(),
+            publication.generation(),
+            publication.kind().tag(),
+            publication.source_range(),
+            bounds,
+            640,
+            320,
+            fallback,
+        );
+        let mut scene = SceneBuilder::new(
+            revision,
+            Rect::new(0.0, 0.0, 320.0, 200.0).expect("viewport"),
+        )
+        .expect("scene");
+        scene.embedded_svg(primitive).expect("embedded primitive");
+        let scene = scene.finish();
+        let atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("atlas config"));
+        let mut plans = RenderPlanBuilder::new();
+        let first = plans
+            .build_with_embedded(&scene, &atlas, std::slice::from_ref(&publication))
+            .expect("first plan");
+        assert_eq!(first.embedded_uploads().len(), 1);
+        assert_eq!(first.embedded_uploads()[0].resource(), primitive.resource());
+        assert_eq!(first.embedded_uploads()[0].source(), source);
+        assert_eq!(
+            first.embedded_uploads()[0].markup(),
+            "<svg viewBox=\"0 0 640 320\"/>"
+        );
+        assert!(matches!(
+            first.commands(),
+            [RenderCommand::EmbeddedSvg {
+                resource,
+                generation,
+                kind,
+                width: 640,
+                height: 320,
+                ..
+            }] if *resource == primitive.resource()
+                && *generation == primitive.generation()
+                && *kind == EmbeddedResourceKind::Math.tag()
+        ));
+        let second = plans
+            .build_with_embedded(&scene, &atlas, std::slice::from_ref(&publication))
+            .expect("second plan");
+        assert!(second.embedded_uploads().is_empty());
+        assert_eq!(plans.uploaded_embedded_count(), 1);
+    }
+
+    #[test]
+    fn embedded_svg_requires_matching_publication_before_it_can_be_rendered() {
+        let revision = Revision::new(8);
+        let source = TextRange::new(ByteOffset::new(1), ByteOffset::new(3)).expect("source");
+        let primitive = EmbeddedSvgPrimitive::new(
+            42,
+            1,
+            EmbeddedResourceKind::Math.tag(),
+            source,
+            Rect::new(0.0, 0.0, 12.0, 12.0).expect("bounds"),
+            12,
+            12,
+            Rgba8::black(),
+        );
+        let mut scene =
+            SceneBuilder::new(revision, Rect::new(0.0, 0.0, 20.0, 20.0).expect("viewport"))
+                .expect("scene");
+        scene.embedded_svg(primitive).expect("embedded primitive");
+        let atlas = GlyphAtlas::new(GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"));
+        let error = RenderPlanBuilder::new()
+            .build(&scene.finish(), &atlas)
+            .expect_err("missing publication");
+        assert_eq!(
+            error,
+            RenderError::MissingEmbeddedPublication {
+                resource: 42,
+                generation: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn embedded_svg_rejects_intrinsic_dimension_drift() {
+        let revision = Revision::new(9);
+        let source = TextRange::new(ByteOffset::new(0), ByteOffset::new(2)).expect("source");
+        let request = EmbeddedRenderRequest::new(revision, source, EmbeddedResourceKind::Math, "x")
+            .expect("request");
+        let mut cache = yu_assets::EmbeddedResourceCache::new();
+        let publication = cache
+            .publish(
+                request,
+                revision,
+                EmbeddedRenderPayload::svg(20, 10, "<svg/>").expect("SVG"),
+            )
+            .expect("publication");
+        let primitive = EmbeddedSvgPrimitive::new(
+            publication.key().fingerprint(),
+            publication.generation(),
+            publication.kind().tag(),
+            source,
+            Rect::new(0.0, 0.0, 20.0, 10.0).expect("bounds"),
+            21,
+            10,
+            Rgba8::black(),
+        );
+        let mut builder =
+            SceneBuilder::new(revision, Rect::new(0.0, 0.0, 30.0, 20.0).expect("viewport"))
+                .expect("scene");
+        builder.embedded_svg(primitive).expect("primitive");
+        let atlas = GlyphAtlas::new(GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"));
+        let error = RenderPlanBuilder::new()
+            .build_with_embedded(
+                &builder.finish(),
+                &atlas,
+                std::slice::from_ref(&publication),
+            )
+            .expect_err("dimension drift");
+        assert_eq!(
+            error,
+            RenderError::EmbeddedDimensionsMismatch {
+                resource: publication.key().fingerprint(),
+                primitive_width: 21,
+                primitive_height: 10,
+                publication_width: 20,
+                publication_height: 10,
+            }
         );
     }
 
@@ -693,7 +1028,10 @@ mod tests {
                 assert_eq!(glyph.origin().x(), layout.glyphs()[0].x());
                 assert_eq!(glyph.origin().y(), layout.glyphs()[0].y() + 40.0);
             }
-            Primitive::FillRect { .. } | Primitive::Image(_) | Primitive::Table(_) => {
+            Primitive::FillRect { .. }
+            | Primitive::Image(_)
+            | Primitive::EmbeddedSvg(_)
+            | Primitive::Table(_) => {
                 panic!("expected glyph primitive")
             }
         }
@@ -794,7 +1132,10 @@ mod tests {
             .iter()
             .map(|primitive| match primitive {
                 Primitive::Glyph(glyph) => glyph.origin(),
-                Primitive::FillRect { .. } | Primitive::Image(_) | Primitive::Table(_) => {
+                Primitive::FillRect { .. }
+                | Primitive::Image(_)
+                | Primitive::EmbeddedSvg(_)
+                | Primitive::Table(_) => {
                     panic!("expected glyph primitive")
                 }
             })

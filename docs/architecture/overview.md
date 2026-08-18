@@ -702,6 +702,15 @@ device 或窗口依赖；`RenderUploader` 只定义未来 backend 上传 alpha p
 fill/glyph command order、atlas upload 去重和 command origin；实际 texture 生命周期和 command
 encoding 由 macOS backend 承担，不回写 shared plan。
 
+Embedded Math/Mermaid 也遵循同一条显式消费边界：`yu-scene::EmbeddedSvgPrimitive` 只携带
+fingerprint、generation、kind、source range、intrinsic dimensions、bounds 和 fallback，SVG
+markup 不进入 retained scene。只有 `RenderPlanBuilder::build_with_embedded` 收到同 Revision
+且 source/resource/dimensions 全部匹配的 `EmbeddedRenderPublication`，才会生成
+`RenderCommand::EmbeddedSvg` 与一次性的 `EmbeddedSvgUpload`；普通 `build` 会拒绝缺失
+publication。当前 macOS backend 对该 command 做有限的 geometry 校验并画 fallback rectangle，
+待真正的 SVG consumer 接入后再切换为 vector/raster 绘制，避免 FFI cache ready 状态先于实际
+可绘制内容。
+
 macOS storage FFI 的 `yu_storage_session_macos_visual_render_plan` 是这一链路的诊断 publication：
 Rust 使用 CoreText-shaped layout 和 `CoreTextGlyphRasterizer` 生成临时 CPU `GlyphAtlas`，然后复用
 `yu_workspace::assemble_viewport_render_frame`，把 Revision-bound fill/glyph command、page metadata
