@@ -588,6 +588,13 @@ enum {
     YU_STORAGE_IMAGE_RESOURCE_PENDING = 1,
     YU_STORAGE_IMAGE_RESOURCE_READY = 2,
     YU_STORAGE_IMAGE_RESOURCE_FAILED = 3,
+    YU_STORAGE_EMBEDDED_RESOURCE_UNKNOWN = 0,
+    YU_STORAGE_EMBEDDED_RESOURCE_PENDING = 1,
+    YU_STORAGE_EMBEDDED_RESOURCE_READY = 2,
+    YU_STORAGE_EMBEDDED_RESOURCE_FAILED = 3,
+    YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED = 4,
+    YU_STORAGE_EMBEDDED_MATH = 0,
+    YU_STORAGE_EMBEDDED_MERMAID = 1,
 };
 
 /* Source-backed image metadata. Destination/reference values are UTF-16
@@ -608,6 +615,21 @@ typedef struct YuStorageVisualImage {
     uint8_t kind;
     uint8_t resource_status;
 } YuStorageVisualImage;
+
+/* Source-backed metadata for Math/Mermaid fenced blocks. */
+typedef struct YuStorageVisualEmbeddedResource {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t info_start_utf16;
+    uint64_t info_end_utf16;
+    uint64_t content_start_utf16;
+    uint64_t content_end_utf16;
+    uint64_t resource_fingerprint;
+    uint8_t kind;
+    uint8_t resource_status;
+} YuStorageVisualEmbeddedResource;
 
 typedef struct YuStorageVisualRenderPlanSnapshot {
     uint64_t revision;
@@ -1013,6 +1035,9 @@ int32_t yu_storage_session_macos_visual_scene(
 int32_t yu_storage_session_macos_visual_images(
     YuStorageSession *session, uint64_t expected_revision,
     YuStorageVisualImage *images, size_t capacity, size_t *written);
+int32_t yu_storage_session_macos_visual_embedded_resources(
+    YuStorageSession *session, uint64_t expected_revision,
+    YuStorageVisualEmbeddedResource *embedded, size_t capacity, size_t *written);
 int32_t yu_storage_session_macos_visual_render_plan(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
