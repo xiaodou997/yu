@@ -3158,10 +3158,13 @@ private final class DocumentTextView: NSTextView {
     private var presentationRole: PresentationRole = .sourceFallback
     private var externalVisualDecorationsEnabled = false
     private var sourceGlyphsHidden = false
+    private var tableResizeTrackingArea: NSTrackingArea?
+    private var tableResizeCursorActive = false
     var onDocumentChange: (() -> Void)?
     var onBeforeCommand: (() -> Void)?
     var onCaretChange: (() -> Void)?
     var onError: ((Error) -> Void)?
+    var onTableResizeHover: ((NSPoint) -> Bool)?
     var onTableResizeBegin: ((NSPoint) -> Bool)?
     var onTableResizeUpdate: ((NSPoint) -> Bool)?
     var onTableResizeFinish: (() -> Bool)?
@@ -3212,6 +3215,45 @@ private final class DocumentTextView: NSTextView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func updateTrackingAreas() {
+        if let tableResizeTrackingArea {
+            removeTrackingArea(tableResizeTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [
+                .mouseEnteredAndExited,
+                .mouseMoved,
+                .activeInKeyWindow,
+                .inVisibleRect
+            ],
+            owner: self,
+            userInfo: nil
+        )
+        tableResizeTrackingArea = area
+        addTrackingArea(area)
+        super.updateTrackingAreas()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+        if window == nil {
+            setTableResizeCursor(active: false)
+        }
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let divider = onTableResizeHover?(visualPoint(for: event)) ?? false
+        setTableResizeCursor(active: divider)
+        super.mouseMoved(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setTableResizeCursor(active: false)
+        super.mouseExited(with: event)
+    }
 
     func refreshFromRust() {
         canonicalSource = bridge.source
@@ -3504,6 +3546,13 @@ private final class DocumentTextView: NSTextView {
             x: local.x - textContainerOrigin.x,
             y: local.y - textContainerOrigin.y
         )
+    }
+
+    private func setTableResizeCursor(active: Bool) {
+        let next = active && window != nil
+        guard tableResizeCursorActive != next else { return }
+        tableResizeCursorActive = next
+        (next ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
     }
 
     /// Resolves a visual document point through the Rust CoreText-shaped
@@ -3872,6 +3921,7 @@ private final class DocumentTextView: NSTextView {
         if event.buttonNumber == 0,
            onTableResizeBegin?(visualPoint(for: event)) == true {
             visualSelectionAnchor = nil
+            setTableResizeCursor(active: true)
             return
         }
         if visualMirrorEnabled,
@@ -3887,6 +3937,7 @@ private final class DocumentTextView: NSTextView {
 
     override func mouseDragged(with event: NSEvent) {
         if onTableResizeUpdate?(visualPoint(for: event)) == true {
+            setTableResizeCursor(active: true)
             return
         }
         if visualSelectionAnchor != nil,
@@ -3902,6 +3953,7 @@ private final class DocumentTextView: NSTextView {
     override func mouseUp(with event: NSEvent) {
         if event.buttonNumber == 0,
            onTableResizeFinish?() == true {
+            setTableResizeCursor(active: false)
             return
         }
         if visualSelectionAnchor != nil {
@@ -4132,6 +4184,7 @@ private final class DocumentTextView: NSTextView {
         let name = NSStringFromSelector(selector)
         if name == "cancel:" || name == "cancelOperation:" {
             if onTableResizeCancel?() == true {
+                setTableResizeCursor(active: false)
                 return
             }
             do {
@@ -4993,6 +5046,37 @@ private final class MacosSurfaceHostCoordinator {
         }
     }
 
+    /// Resolves the current document-space point against the same shaped
+    /// table geometry used by the pointer begin path. Hover is intentionally
+    /// read-only: it never opens a Rust resize session and silently falls
+    /// back to the normal arrow when metrics or the Revision are stale.
+    func tableResizeHover(at point: NSPoint) -> Bool {
+        if let session = tableResizePointerState.session,
+           session.revision == bridge.state.revision {
+            return session.kind == YU_STORAGE_TABLE_RESIZE_COLUMN
+        }
+        guard !bridge.composition.active,
+              point.x.isFinite,
+              point.y.isFinite,
+              let geometry = visualDecorationGeometry() else {
+            return false
+        }
+        let revision = bridge.state.revision
+        let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
+        do {
+            let hit = try bridge.macosTableResizeHitTestAtDocumentPoint(
+                revision: revision,
+                size: geometry.size,
+                maxWidth: geometry.maxWidth,
+                point: CGPoint(x: point.x, y: point.y),
+                tolerance: tolerance
+            )
+            return hit.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
+        } catch {
+            return false
+        }
+    }
+
     /// Attempts to start a CoreText-shaped table divider gesture at a
     /// document-space point. The hit-test is intentionally non-mutating and
     /// is followed by a matching Rust begin call so row gestures can choose
@@ -5489,6 +5573,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             }
         }
         textView.onError = { [weak self] error in self?.show(error) }
+        textView.onTableResizeHover = { [weak self] point in
+            self?.surfaceCoordinator.tableResizeHover(at: point) ?? false
+        }
         textView.onTableResizeBegin = { [weak self] point in
             self?.surfaceCoordinator.beginTableResize(at: point) ?? false
         }
@@ -8867,6 +8954,13 @@ private func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         )
         precondition(nearest.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
         dividerPoint = NSPoint(x: CGFloat(nearest.position + 0.1), y: tableY)
+        let sourceBeforeResize = bridge.source
+        precondition(coordinator.tableResizeHover(at: dividerPoint))
+        precondition(
+            !coordinator.tableResizeHover(
+                at: NSPoint(x: CGFloat(maxWidth) + 100.0, y: tableY)
+            )
+        )
         precondition(coordinator.beginTableResize(at: dividerPoint))
         precondition(coordinator.tableResizeActiveForSelfCheck)
         precondition(
@@ -8876,6 +8970,7 @@ private func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         )
         precondition(coordinator.finishTableResize())
         precondition(!coordinator.tableResizeActiveForSelfCheck)
+        precondition(bridge.source == sourceBeforeResize)
 
         precondition(coordinator.beginTableResize(at: dividerPoint))
         precondition(coordinator.cancelTableResize())
