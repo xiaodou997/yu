@@ -4826,6 +4826,185 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_begin(
     YU_STORAGE_OK
 }
 
+#[cfg(target_os = "macos")]
+fn macos_table_resize_hit_at_point(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    point_x: f32,
+    point_y: f32,
+    tolerance: f32,
+) -> Result<(usize, TableResizeHit), i32> {
+    validate_table_resize_revision(session, expected_revision)?;
+    if !size.is_finite()
+        || size <= 0.0
+        || !max_width.is_finite()
+        || max_width <= 0.0
+        || !point_x.is_finite()
+        || !point_y.is_finite()
+        || !tolerance.is_finite()
+        || tolerance < 0.0
+    {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let (shaper, metrics, layout_config) = core_text_system_ui_layout(size, max_width)?;
+    let configured = session.session.viewport_config().layout();
+    if (configured.max_width() - max_width).abs() > 0.05
+        || (configured.line_height() - metrics.line_height()).abs() > 0.05
+        || (configured.default_advance() - metrics.default_advance()).abs() > 0.05
+    {
+        return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
+    }
+
+    let query_y = point_y.max(0.0);
+    let viewport = ViewportRect::new(query_y, metrics.line_height());
+    let snapshot = {
+        let document = session.session.document_mut().editor_mut();
+        document
+            .visible_blocks_with_shaper(viewport, &shaper)
+            .map_err(status_from_editor_error)?
+    };
+    let mut selected = None;
+    let mut best_distance = f32::INFINITY;
+    for block in snapshot.blocks() {
+        let top = block.y();
+        let bottom = top + block.height();
+        let distance = if query_y < top {
+            top - query_y
+        } else if query_y > bottom {
+            query_y - bottom
+        } else {
+            0.0
+        };
+        if distance < best_distance {
+            best_distance = distance;
+            selected = Some(*block);
+        }
+    }
+    let Some(block) = selected else {
+        return Err(YU_STORAGE_INVALID_SELECTION);
+    };
+    let layout = {
+        let document = session.session.document_mut().editor_mut();
+        document
+            .block_layout_with_shaper(block.index(), layout_config, &shaper)
+            .map_err(status_from_editor_error)?
+            .clone()
+    };
+    let Some(table) = layout.table() else {
+        return Err(YU_STORAGE_INVALID_SELECTION);
+    };
+    let local_y = query_y - block.y();
+    let hit = table
+        .resize_hit_test(LayoutPoint::new(point_x, local_y), tolerance)
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .ok_or(YU_STORAGE_INVALID_SELECTION)?;
+    Ok((block.index(), hit))
+}
+
+/// Resolves a document-space point through the CoreText-shaped viewport and
+/// returns an internal table divider without mutating the session.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_table_resize_hit_test(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    point_x: f32,
+    point_y: f32,
+    tolerance: f32,
+    output: *mut YuStorageTableResizeHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTableResizeHit::default() };
+    let (block_index, hit) = match macos_table_resize_hit_at_point(
+        session,
+        expected_revision,
+        size,
+        max_width,
+        point_x,
+        point_y,
+        tolerance,
+    ) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let block_index = match u64::try_from(block_index) {
+        Ok(value) => value,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let metadata =
+        match table_resize_hit_metadata(session.session.revision().get(), block_index, hit) {
+            Ok(value) => value,
+            Err(status) => return status,
+        };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
+/// Starts a CoreText-shaped table resize gesture from a document-space point.
+/// The Rust session owns the gesture after this call; the native shell only
+/// needs to forward pointer movement along the returned divider axis.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_table_resize_begin_at_point(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    point_x: f32,
+    point_y: f32,
+    tolerance: f32,
+    pointer_position: f32,
+    output: *mut YuStorageTableResizeHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTableResizeHit::default() };
+    if !pointer_position.is_finite() {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    let (block_index, hit) = match macos_table_resize_hit_at_point(
+        session,
+        expected_revision,
+        size,
+        max_width,
+        point_x,
+        point_y,
+        tolerance,
+    ) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let metadata = match begin_table_resize_session(session, block_index, hit, pointer_position) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
 /// macOS/CoreText-shaped variant of table resize begin. The hit-test layout
 /// uses the same system shaper and font size as the retained render-host
 /// frame, so the divider captured by the gesture is in the same geometry
@@ -10797,6 +10976,47 @@ mod tests {
             })
             .expect("CoreText table divider");
         let point_y = metrics.line_height() * 0.5;
+        let mut document_hit = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_hit_test(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    divider + 0.01,
+                    point_y,
+                    0.2,
+                    &mut document_hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(document_hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        assert_eq!(document_hit.index, 0);
+        assert!((document_hit.position - divider).abs() < 0.01);
+        let mut document_begin = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_begin_at_point(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    divider + 0.01,
+                    point_y,
+                    0.2,
+                    divider + 0.01,
+                    &mut document_begin,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(document_begin, document_hit);
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_cancel(raw, 0) },
+            YU_STORAGE_OK
+        );
         let mut hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {

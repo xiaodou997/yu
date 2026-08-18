@@ -18,6 +18,7 @@ private enum StorageStatus {
     static let externalChange: Int32 = 4
     static let unsavedChanges: Int32 = 5
     static let htmlImportRejected: Int32 = 18
+    static let invalidSelection: Int32 = 14
     static let invalidViewport: Int32 = 20
     static let tableResizeNotActive: Int32 = 22
 }
@@ -1763,6 +1764,56 @@ private final class StorageBridge {
         return value
     }
 
+    func macosTableResizeHitTestAtDocumentPoint(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        point: CGPoint,
+        tolerance: Float
+    ) throws -> YuStorageTableResizeHit {
+        var value = YuStorageTableResizeHit()
+        let status = yu_storage_session_macos_table_resize_hit_test(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            Float(point.x),
+            Float(point.y),
+            tolerance,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return value
+    }
+
+    func macosTableResizeBeginAtDocumentPoint(
+        revision: UInt64,
+        size: Float,
+        maxWidth: Float,
+        point: CGPoint,
+        tolerance: Float,
+        pointerPosition: Float
+    ) throws -> YuStorageTableResizeHit {
+        var value = YuStorageTableResizeHit()
+        let status = yu_storage_session_macos_table_resize_begin_at_point(
+            handle,
+            revision,
+            size,
+            maxWidth,
+            Float(point.x),
+            Float(point.y),
+            tolerance,
+            pointerPosition,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return value
+    }
+
     func tableResizeUpdate(
         revision: UInt64,
         pointerPosition: Float
@@ -3111,6 +3162,10 @@ private final class DocumentTextView: NSTextView {
     var onBeforeCommand: (() -> Void)?
     var onCaretChange: (() -> Void)?
     var onError: ((Error) -> Void)?
+    var onTableResizeBegin: ((NSPoint) -> Bool)?
+    var onTableResizeUpdate: ((NSPoint) -> Bool)?
+    var onTableResizeFinish: (() -> Bool)?
+    var onTableResizeCancel: (() -> Bool)?
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
@@ -3814,6 +3869,11 @@ private final class DocumentTextView: NSTextView {
     /// canonical source selection. If the projected mirror is stale or
     /// unavailable, AppKit's source hit-test remains the safe fallback.
     override func mouseDown(with event: NSEvent) {
+        if event.buttonNumber == 0,
+           onTableResizeBegin?(visualPoint(for: event)) == true {
+            visualSelectionAnchor = nil
+            return
+        }
         if visualMirrorEnabled,
            applyVisualPointerSelection(
                at: visualPoint(for: event),
@@ -3826,6 +3886,9 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if onTableResizeUpdate?(visualPoint(for: event)) == true {
+            return
+        }
         if visualSelectionAnchor != nil,
            applyVisualPointerSelection(
                at: visualPoint(for: event),
@@ -3837,6 +3900,10 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if event.buttonNumber == 0,
+           onTableResizeFinish?() == true {
+            return
+        }
         if visualSelectionAnchor != nil {
             visualSelectionAnchor = nil
             return
@@ -4064,6 +4131,9 @@ private final class DocumentTextView: NSTextView {
     override func doCommand(by selector: Selector) {
         let name = NSStringFromSelector(selector)
         if name == "cancel:" || name == "cancelOperation:" {
+            if onTableResizeCancel?() == true {
+                return
+            }
             do {
                 if bridge.composition.active {
                     try bridge.cancelComposition()
@@ -4690,6 +4760,53 @@ private struct VisualRenderStateMachine {
     }
 }
 
+private struct TableResizePointerSession: Equatable {
+    let revision: UInt64
+    let kind: UInt8
+}
+
+/// Keeps the native pointer route explicit and headless-testable. Rust owns
+/// the geometry preview; this state only answers whether subsequent mouse
+/// events belong to the active divider gesture and when a revision invalidates
+/// that route.
+private struct TableResizePointerState {
+    private(set) var session: TableResizePointerSession?
+
+    var isActive: Bool { session != nil }
+
+    @discardableResult
+    mutating func begin(revision: UInt64, kind: UInt8) -> Bool {
+        guard kind == YU_STORAGE_TABLE_RESIZE_COLUMN
+            || kind == YU_STORAGE_TABLE_RESIZE_ROW else {
+            return false
+        }
+        session = TableResizePointerSession(revision: revision, kind: kind)
+        return true
+    }
+
+    func acceptsUpdate(revision: UInt64) -> Bool {
+        session?.revision == revision
+    }
+
+    @discardableResult
+    mutating func finish(revision: UInt64) -> Bool {
+        guard acceptsUpdate(revision: revision) else { return false }
+        session = nil
+        return true
+    }
+
+    @discardableResult
+    mutating func cancel(revision: UInt64) -> Bool {
+        guard acceptsUpdate(revision: revision) else { return false }
+        session = nil
+        return true
+    }
+
+    mutating func reset() {
+        session = nil
+    }
+}
+
 /// Coordinates a persistent Rust surface with one product `NSView`.
 ///
 /// The coordinator is deliberately an AppKit lifecycle adapter, not a second
@@ -4731,6 +4848,7 @@ private final class MacosSurfaceHostCoordinator {
     private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
     private var submitScheduled = false
     private var scheduleToken: UInt64 = 0
+    private var tableResizePointerState = TableResizePointerState()
 
     var onError: ((Error) -> Void)?
     var onSurfaceStateChange: (() -> Void)?
@@ -4757,6 +4875,7 @@ private final class MacosSurfaceHostCoordinator {
         metrics = nil
         lastSubmitKey = nil
         lastSnapshot = nil
+        tableResizePointerState.reset()
         isAttached = false
         surfaceView.setNativeContentVisible(false)
     }
@@ -4843,6 +4962,7 @@ private final class MacosSurfaceHostCoordinator {
             do {
                 _ = try self.submitNow()
             } catch {
+                self.clearTableResizeState()
                 self.surfaceView?.setNativeContentVisible(false)
                 self.onSurfaceStateChange?()
                 self.onError?(error)
@@ -4871,6 +4991,154 @@ private final class MacosSurfaceHostCoordinator {
         } catch {
             onError?(error)
         }
+    }
+
+    /// Attempts to start a CoreText-shaped table divider gesture at a
+    /// document-space point. The hit-test is intentionally non-mutating and
+    /// is followed by a matching Rust begin call so row gestures can choose
+    /// their y-axis pointer coordinate before the preview is created.
+    @discardableResult
+    func beginTableResize(at point: NSPoint) -> Bool {
+        guard !bridge.composition.active,
+              point.x.isFinite,
+              point.y.isFinite,
+              let geometry = visualDecorationGeometry() else {
+            return false
+        }
+        let revision = bridge.state.revision
+        let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
+        do {
+            let hit = try bridge.macosTableResizeHitTestAtDocumentPoint(
+                revision: revision,
+                size: geometry.size,
+                maxWidth: geometry.maxWidth,
+                point: CGPoint(x: point.x, y: point.y),
+                tolerance: tolerance
+            )
+            // The retained render host currently consumes only column
+            // overrides; keep row dividers on the normal selection path until
+            // variable-row layout is published end-to-end.
+            guard hit.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN) else {
+                return false
+            }
+            let pointerPosition = Float(point.x)
+            let begun = try bridge.macosTableResizeBeginAtDocumentPoint(
+                revision: revision,
+                size: geometry.size,
+                maxWidth: geometry.maxWidth,
+                point: CGPoint(x: point.x, y: point.y),
+                tolerance: tolerance,
+                pointerPosition: pointerPosition
+            )
+            guard begun.revision == revision,
+                  tableResizePointerState.begin(
+                      revision: revision,
+                      kind: begun.kind
+                  ) else {
+                return false
+            }
+            lastSubmitKey = nil
+            scheduleSubmit()
+            return true
+        } catch BridgeError.operation(let status)
+            where status == StorageStatus.invalidSelection {
+            // A click between table dividers belongs to normal selection.
+            return false
+        } catch {
+            // A stale/temporarily unavailable shaped layout must never make
+            // the source TextKit editor stop accepting pointer input.
+            tableResizePointerState.reset()
+            onError?(error)
+            return false
+        }
+    }
+
+    /// Forwards one drag sample to Rust and invalidates the retained surface
+    /// even though the ordinary geometry submit key has not changed.
+    @discardableResult
+    func updateTableResize(at point: NSPoint) -> Bool {
+        let revision = bridge.state.revision
+        guard let session = tableResizePointerState.session,
+              session.revision == revision,
+              point.x.isFinite,
+              point.y.isFinite else {
+            return false
+        }
+        let pointerPosition = session.kind == YU_STORAGE_TABLE_RESIZE_COLUMN
+            ? Float(point.x)
+            : Float(point.y)
+        do {
+            _ = try bridge.tableResizeUpdate(
+                revision: revision,
+                pointerPosition: pointerPosition
+            )
+            lastSubmitKey = nil
+            scheduleSubmit()
+            return true
+        } catch BridgeError.operation(let status)
+            where status == StorageStatus.staleRevision
+                || status == StorageStatus.tableResizeNotActive {
+            tableResizePointerState.reset()
+            lastSubmitKey = nil
+            return true
+        } catch {
+            tableResizePointerState.reset()
+            onError?(error)
+            return true
+        }
+    }
+
+    /// Finishes the Rust gesture. The final preview remains attached to the
+    /// current session until the next source revision or explicit reset, so
+    /// the retained frame shows the committed divider immediately.
+    @discardableResult
+    func finishTableResize() -> Bool {
+        let revision = bridge.state.revision
+        guard tableResizePointerState.acceptsUpdate(revision: revision) else {
+            return false
+        }
+        do {
+            _ = try bridge.tableResizeFinish(revision: revision)
+            _ = tableResizePointerState.finish(revision: revision)
+            lastSubmitKey = nil
+            scheduleSubmit()
+        } catch {
+            tableResizePointerState.reset()
+            onError?(error)
+        }
+        return true
+    }
+
+    /// Cancels only an active pointer gesture. Document edits use
+    /// `resetTableResizeAfterDocumentChange()` to also clear a finished
+    /// preview that Rust intentionally keeps for the current frame.
+    @discardableResult
+    func cancelTableResize() -> Bool {
+        let revision = bridge.state.revision
+        guard tableResizePointerState.acceptsUpdate(revision: revision) else {
+            return false
+        }
+        do {
+            try bridge.tableResizeCancel(revision: revision)
+            _ = tableResizePointerState.cancel(revision: revision)
+            lastSubmitKey = nil
+            scheduleSubmit()
+        } catch {
+            tableResizePointerState.reset()
+            onError?(error)
+        }
+        return true
+    }
+
+    /// Clears both an active gesture and the finished preview when the
+    /// canonical source revision changes. The FFI call is harmless when no
+    /// gesture exists and is revision-bound to avoid clearing a newer edit.
+    func resetTableResizeAfterDocumentChange() {
+        clearTableResizeState()
+    }
+
+    var tableResizeActiveForSelfCheck: Bool {
+        tableResizePointerState.isActive
     }
 
     /// Returns the same revision-bound CoreText metrics and viewport inputs
@@ -5040,6 +5308,7 @@ private final class MacosSurfaceHostCoordinator {
     func detach() {
         scheduleToken &+= 1
         submitScheduled = false
+        clearTableResizeState()
         if isAttached {
             do {
                 try bridge.macosRenderHostSurfaceDetach()
@@ -5053,6 +5322,12 @@ private final class MacosSurfaceHostCoordinator {
         metrics = nil
         surfaceView?.setNativeContentVisible(false)
         onSurfaceStateChange?()
+    }
+
+    private func clearTableResizeState() {
+        try? bridge.tableResizeCancel(revision: bridge.state.revision)
+        tableResizePointerState.reset()
+        lastSubmitKey = nil
     }
 
     private func ensureMetrics(
@@ -5195,6 +5470,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         textView.onDocumentChange = { [weak self] in
             guard let self else { return }
             self.initialState = self.bridge.state
+            self.surfaceCoordinator.resetTableResizeAfterDocumentChange()
             self.updateStatus()
             self.updateVisualDecorations()
             self.surfaceCoordinator.scheduleSubmit()
@@ -5213,6 +5489,18 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             }
         }
         textView.onError = { [weak self] error in self?.show(error) }
+        textView.onTableResizeBegin = { [weak self] point in
+            self?.surfaceCoordinator.beginTableResize(at: point) ?? false
+        }
+        textView.onTableResizeUpdate = { [weak self] point in
+            self?.surfaceCoordinator.updateTableResize(at: point) ?? false
+        }
+        textView.onTableResizeFinish = { [weak self] in
+            self?.surfaceCoordinator.finishTableResize() ?? false
+        }
+        textView.onTableResizeCancel = { [weak self] in
+            self?.surfaceCoordinator.cancelTableResize() ?? false
+        }
         scrollView.documentView = textView
         // `DocumentTextView` is created before the window has a laid-out
         // content size. Give the scroll view a real initial document frame
@@ -5332,6 +5620,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
 
     func refreshFromRust() {
         textView.refreshFromRust()
+        surfaceCoordinator.resetTableResizeAfterDocumentChange()
         initialState = bridge.state
         if initialState.disk == .unchanged {
             promptedExternalDisk = nil
@@ -8470,6 +8759,145 @@ private func unwrapSelfCheck<T>(_ value: T?) throws -> T {
     return value
 }
 
+private func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
+    do {
+        var pointerState = TableResizePointerState()
+        precondition(
+            pointerState.begin(
+                revision: 7,
+                kind: UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
+            )
+        )
+        precondition(!pointerState.finish(revision: 8))
+        precondition(pointerState.isActive)
+        precondition(pointerState.cancel(revision: 7))
+        precondition(!pointerState.isActive)
+
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let metrics = try bridge.macosFontMetrics(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(metrics.lineHeight),
+            defaultAdvance: Float(metrics.defaultAdvance),
+            estimatedBlockHeight: Float(metrics.lineHeight),
+            overscan: 0.0
+        )
+        let (_, blocks) = try bridge.macosShapedViewportBlocks(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1000.0
+        )
+        let blockCount = try bridge.projectionBlockCount(revision: revision)
+        let tableBlockIndex = try (0..<blockCount).compactMap { index -> UInt64? in
+            let (block, _) = try bridge.projectedBlock(
+                revision: revision,
+                blockIndex: UInt64(index)
+            )
+            return block.projectionKind == UInt8(YU_STORAGE_PROJECTION_TABLE)
+                ? block.blockIndex
+                : nil
+        }.first
+        guard let tableBlockIndex,
+              let tableBlock = blocks.first(where: { $0.blockIndex == tableBlockIndex }) else {
+            throw BridgeError.operation(StorageStatus.invalidSelection)
+        }
+        var tableY = tableBlock.y + 0.5
+        var nearest = try bridge.macosTableResizeHitTestAtDocumentPoint(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            point: CGPoint(x: 0.0, y: tableY),
+            tolerance: maxWidth
+        )
+        precondition(nearest.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
+        var dividerPoint = NSPoint(
+            x: CGFloat(nearest.position + 0.1),
+            y: tableY
+        )
+
+        let surfaceView = MacosSurfaceHostView(
+            frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 240.0)
+        )
+        let scrollView = NSScrollView(
+            frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 240.0)
+        )
+        scrollView.documentView = NSView(
+            frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 1000.0)
+        )
+        let coordinator = MacosSurfaceHostCoordinator(bridge: bridge, fontSize: CGFloat(size))
+        coordinator.bind(
+            surfaceView: surfaceView,
+            scrollView: scrollView,
+            fontSize: CGFloat(size)
+        )
+        coordinator.setContentWidth(CGFloat(maxWidth))
+        // Setting the viewport policy can invalidate measured block heights.
+        // Re-read the table y/divider after the coordinator has prepared the
+        // same metrics contract used by the product pointer path.
+        _ = coordinator.visualDecorationGeometry()
+        let (_, currentBlocks) = try bridge.macosShapedViewportBlocks(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1000.0
+        )
+        guard let currentTableBlock = currentBlocks.first(where: {
+            $0.blockIndex == tableBlockIndex
+        }) else {
+            throw BridgeError.operation(StorageStatus.invalidSelection)
+        }
+        tableY = currentTableBlock.y + 0.5
+        nearest = try bridge.macosTableResizeHitTestAtDocumentPoint(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            point: CGPoint(x: 0.0, y: tableY),
+            tolerance: maxWidth
+        )
+        precondition(nearest.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
+        dividerPoint = NSPoint(x: CGFloat(nearest.position + 0.1), y: tableY)
+        precondition(coordinator.beginTableResize(at: dividerPoint))
+        precondition(coordinator.tableResizeActiveForSelfCheck)
+        precondition(
+            coordinator.updateTableResize(
+                at: NSPoint(x: dividerPoint.x + 1.0, y: dividerPoint.y)
+            )
+        )
+        precondition(coordinator.finishTableResize())
+        precondition(!coordinator.tableResizeActiveForSelfCheck)
+
+        precondition(coordinator.beginTableResize(at: dividerPoint))
+        precondition(coordinator.cancelTableResize())
+        precondition(!coordinator.tableResizeActiveForSelfCheck)
+
+        precondition(coordinator.beginTableResize(at: dividerPoint))
+        _ = try bridge.insertText("x")
+        coordinator.resetTableResizeAfterDocumentChange()
+        precondition(!coordinator.tableResizeActiveForSelfCheck)
+        precondition(!coordinator.updateTableResize(at: dividerPoint))
+        coordinator.detach()
+        print(
+            "Yu macOS table resize coordinator self-check: document-space CoreText hit, "
+                + "mouse update/finish/cancel, stale revision reset and headless surface fallback are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu macOS table resize coordinator self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runCompositionProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -8798,6 +9226,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-surface-
 if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-lifecycle-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runMacosRenderHostLifecycleSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--macos-table-resize-coordinator-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runMacosTableResizeCoordinatorSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
