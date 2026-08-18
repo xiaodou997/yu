@@ -1,12 +1,18 @@
 #![forbid(unsafe_code)]
 
-//! Source-independent image resource preparation.
+//! Source-independent image and embedded-resource preparation.
 //!
 //! `yu-assets` is deliberately a small handoff contract rather than an image
 //! decoder. The editor supplies a Revision-bound destination range through an
 //! [`ImageRequest`]; a platform worker can decode it off-thread and publish
 //! owned RGBA bytes back through [`ImageCache`]. GPU texture handles never
-//! enter this crate.
+//! enter this crate. Math/Mermaid requests use the same Revision-bound
+//! handoff shape through [`EmbeddedResourceCache`] without selecting a
+//! concrete renderer.
+
+mod embedded;
+
+pub use embedded::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
