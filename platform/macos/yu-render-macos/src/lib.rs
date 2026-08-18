@@ -2426,6 +2426,50 @@ fn build_native_commands(
                     });
                 }
             }
+            RenderCommand::EmbeddedSvg {
+                bounds, fallback, ..
+            } => {
+                // The publication/upload boundary is now explicit, but this
+                // Metal backend does not yet rasterize SVG. Keep the source
+                // block visible with its deterministic fallback instead of
+                // silently dropping it or inventing a second SVG pipeline.
+                if !bounds.x().is_finite()
+                    || !bounds.y().is_finite()
+                    || !bounds.width().is_finite()
+                    || !bounds.height().is_finite()
+                {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "embedded SVG geometry is not finite",
+                    ));
+                }
+                if bounds.width() == 0.0 || bounds.height() == 0.0 {
+                    continue;
+                }
+                let x = bounds.x() - viewport.x();
+                let y = bounds.y() - viewport.y();
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(MetalRenderError::InvalidRenderCommand(
+                        "embedded SVG position is not finite",
+                    ));
+                }
+                commands.push(NativeDrawCommand {
+                    kind: DRAW_FILL_RECT,
+                    x,
+                    y,
+                    width: bounds.width(),
+                    height: bounds.height(),
+                    u0: 0.0,
+                    v0: 0.0,
+                    u1: 0.0,
+                    v1: 0.0,
+                    red: normalized_channel(fallback.red()),
+                    green: normalized_channel(fallback.green()),
+                    blue: normalized_channel(fallback.blue()),
+                    alpha: normalized_channel(fallback.alpha()),
+                    page: u32::MAX,
+                    resource: 0,
+                });
+            }
         }
     }
     Ok(commands)

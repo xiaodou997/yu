@@ -580,6 +580,7 @@ enum {
     YU_STORAGE_RENDER_COMMAND_FILL_RECT = 0,
     YU_STORAGE_RENDER_COMMAND_GLYPH = 1,
     YU_STORAGE_RENDER_COMMAND_IMAGE = 2,
+    YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG = 3,
     YU_STORAGE_RENDER_PAGE_NONE = UINT32_MAX,
     YU_STORAGE_IMAGE_DESTINATION_NONE = UINT64_MAX,
     YU_STORAGE_IMAGE_INLINE = 0,
@@ -644,6 +645,10 @@ typedef struct YuStorageVisualRenderPlanSnapshot {
     float viewport_height;
     float max_scroll_y;
     float viewport_width;
+    /* Appended diagnostics for backend-neutral embedded SVG publication. */
+    uint64_t embedded_command_count;
+    uint64_t embedded_upload_count;
+    uint64_t embedded_upload_bytes;
 } YuStorageVisualRenderPlanSnapshot;
 
 typedef struct YuStorageVisualRenderCommand {
@@ -668,6 +673,12 @@ typedef struct YuStorageVisualRenderCommand {
     float bounds_height;
     uint32_t color_rgba;
     uint64_t resource;
+    /* Appended embedded-resource identity/dimensions. Older native callers
+     * can ignore these fields while newer hosts can gate SVG uploads. */
+    uint64_t embedded_generation;
+    uint8_t embedded_kind;
+    uint32_t embedded_width;
+    uint32_t embedded_height;
 } YuStorageVisualRenderCommand;
 
 typedef struct YuStorageVisualRenderPage {
