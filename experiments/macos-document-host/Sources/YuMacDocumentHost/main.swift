@@ -670,6 +670,26 @@ private struct NativeVisualSceneGlyph {
     }
 }
 
+private let visualRenderCommandFillRectBit =
+    UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_FILL_RECT)
+private let visualRenderCommandGlyphBit =
+    UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_GLYPH)
+private let visualRenderCommandImageBit =
+    UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_IMAGE)
+private let supportedVisualRenderCommandMask =
+    visualRenderCommandFillRectBit
+        | visualRenderCommandGlyphBit
+        | visualRenderCommandImageBit
+
+private func hasSupportedVisualRenderCommands(
+    commandCount: Int,
+    commandKindMask: UInt64
+) -> Bool {
+    commandCount > 0
+        && commandKindMask != 0
+        && (commandKindMask & ~supportedVisualRenderCommandMask) == 0
+}
+
 private struct NativeMacosRenderHostSnapshot {
     let revision: UInt64
     let compositionGeneration: UInt64
@@ -688,6 +708,7 @@ private struct NativeMacosRenderHostSnapshot {
     let maxScrollY: CGFloat
     let viewportWidth: CGFloat
     let published: Bool
+    let commandKindMask: UInt64
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
         revision = value.revision
@@ -707,6 +728,7 @@ private struct NativeMacosRenderHostSnapshot {
         maxScrollY = CGFloat(value.max_scroll_y)
         viewportWidth = CGFloat(value.viewport_width)
         published = value.published != 0
+        commandKindMask = value.command_kind_mask
     }
 }
 
@@ -731,8 +753,14 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let imageOverscanCandidateCount: Int
     let imageRetryCount: Int
     let submitted: Bool
+    let commandKindMask: UInt64
 
-    var hasVisualContent: Bool { commandCount > 0 }
+    var hasVisualContent: Bool {
+        hasSupportedVisualRenderCommands(
+            commandCount: commandCount,
+            commandKindMask: commandKindMask
+        )
+    }
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
         revision = value.revision
@@ -755,6 +783,7 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
         imageOverscanCandidateCount = Int(value.image_overscan_candidate_count)
         imageRetryCount = Int(value.image_retry_count)
         submitted = value.submitted != 0
+        commandKindMask = value.command_kind_mask
     }
 }
 
@@ -5066,6 +5095,7 @@ private struct VisualRenderPublicationIdentity: Equatable {
     let frame: VisualRenderFrameIdentity
     let submitted: Bool
     let commandCount: Int
+    let commandKindMask: UInt64
 
     /// A submitted surface is not necessarily useful to the editor. An empty
     /// render plan can be a valid publication for an empty/whitespace-only
@@ -5073,16 +5103,23 @@ private struct VisualRenderPublicationIdentity: Equatable {
     /// visual content for the native surface to replace. Keeping this policy
     /// beside the publication identity makes the source-glyph gate explicit
     /// and prevents a blank surface from looking like a successful migration.
-    var hasVisualContent: Bool { commandCount > 0 }
+    var hasVisualContent: Bool {
+        hasSupportedVisualRenderCommands(
+            commandCount: commandCount,
+            commandKindMask: commandKindMask
+        )
+    }
 
     init(
         frame: VisualRenderFrameIdentity,
         submitted: Bool,
-        commandCount: Int = 1
+        commandCount: Int = 1,
+        commandKindMask: UInt64 = supportedVisualRenderCommandMask
     ) {
         self.frame = frame
         self.submitted = submitted
         self.commandCount = commandCount
+        self.commandKindMask = commandKindMask
     }
 
     init(_ snapshot: NativeMacosRenderHostSurfaceSnapshot) {
@@ -5094,6 +5131,7 @@ private struct VisualRenderPublicationIdentity: Equatable {
         )
         submitted = snapshot.submitted
         commandCount = snapshot.commandCount
+        commandKindMask = snapshot.commandKindMask
     }
 }
 
@@ -5136,6 +5174,7 @@ private enum VisualRenderFallbackReason: String, Equatable, CustomStringConverti
     case surfaceSubmitFailed
     case visualMirrorUnavailable
     case noVisualContent
+    case unsupportedContent
 
     var description: String { rawValue }
 }
@@ -6331,8 +6370,11 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             }
             return snapshot.submitted ? .waitingForSurface : .surfaceSubmitFailed
         }
-        if surfaceCoordinator.lastSnapshot?.commandCount == 0 {
-            return .noVisualContent
+        if let snapshot = surfaceCoordinator.lastSnapshot,
+           !snapshot.hasVisualContent {
+            return snapshot.commandCount == 0
+                ? .noVisualContent
+                : .unsupportedContent
         }
         if bridge.composition.active {
             return .compositionActive
@@ -7667,6 +7709,28 @@ private func runVisualRenderStateSelfCheck() -> Never {
             decorationHasValidFrame: true,
             rustDecorationFrameAccepted: true
         ) == nil
+    )
+    precondition(
+        acceptedVisualRenderFrame(
+            revision: 7,
+            compositionGeneration: 3,
+            publicationCurrent: true,
+            publication: VisualRenderPublicationIdentity(
+                frame: frame,
+                submitted: true,
+                commandCount: 1,
+                commandKindMask: supportedVisualRenderCommandMask | (UInt64(1) << 7)
+            ),
+            decorationRevision: 7,
+            decorationHasValidFrame: true,
+            rustDecorationFrameAccepted: true
+        ) == nil
+    )
+    precondition(
+        !hasSupportedVisualRenderCommands(
+            commandCount: 1,
+            commandKindMask: 0
+        )
     )
 
     machine.enterFallback(.staleComposition)
@@ -9530,6 +9594,8 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         let first = try unwrapSelfCheck(coordinator.submitNow())
         precondition(first.surfaceGeneration == 0)
         precondition(first.submitted)
+        precondition(first.commandKindMask != 0)
+        precondition(first.hasVisualContent)
         precondition(coordinator.isAttached)
         precondition(surfaceView.nativeContentVisible)
         precondition(surfaceView.hitTest(NSPoint(x: 12.0, y: 12.0)) == nil)
