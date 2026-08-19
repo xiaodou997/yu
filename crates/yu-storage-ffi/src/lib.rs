@@ -6183,6 +6183,7 @@ fn macos_visual_decorations(
     }
 
     let viewport = ViewportRect::new(scroll_y, viewport_height);
+    let canonical_source_is_empty = session.session.snapshot().is_empty();
     let composition = session.session.composition().map(|overlay| {
         (
             overlay.replacement_range().start(),
@@ -6217,6 +6218,19 @@ fn macos_visual_decorations(
         revision: expected_revision,
         ..YuStorageMacosVisualDecorationCaret::default()
     };
+    if viewport_snapshot.blocks().is_empty() && canonical_source_is_empty && composition.is_none() {
+        caret = YuStorageMacosVisualDecorationCaret {
+            revision: expected_revision,
+            block_index: u64::MAX,
+            line_index: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: metrics.line_height(),
+            affinity: affinity_to_ffi(selection.affinity()),
+            present: 1,
+        };
+    }
     let focus_block = if let Some((replacement_start, _, _)) = composition {
         composition_blocks
             .as_ref()
@@ -6378,7 +6392,14 @@ fn macos_visual_decorations(
 
     let selection_count =
         u64::try_from(rectangles.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-    let content_height = viewport_snapshot.content_height();
+    let content_height = if viewport_snapshot.blocks().is_empty()
+        && canonical_source_is_empty
+        && composition.is_none()
+    {
+        metrics.line_height()
+    } else {
+        viewport_snapshot.content_height()
+    };
     if !content_height.is_finite() || !metrics.line_height().is_finite() {
         return Err(YU_STORAGE_EDITOR_ERROR);
     }
@@ -11489,6 +11510,72 @@ mod tests {
         assert_eq!(snapshot, YuStorageMacosVisualDecorationSnapshot::default());
         assert_eq!(caret, YuStorageMacosVisualDecorationCaret::default());
         assert_eq!(required, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_empty_document_publishes_one_line_caret_geometry() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yu-storage-ffi-macos-empty-decorations-{id}.md"));
+        fs::write(&path, "").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut snapshot = YuStorageMacosVisualDecorationSnapshot::default();
+        let mut caret = YuStorageMacosVisualDecorationCaret::default();
+        let mut required = usize::MAX;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_visual_decorations(
+                    raw,
+                    0,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    1_000.0,
+                    &mut snapshot,
+                    &mut caret,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(required, 0);
+        assert_eq!(snapshot.selection_count, 0);
+        assert_eq!(snapshot.caret_present, 1);
+        assert_eq!(snapshot.content_height, metrics.line_height());
+        assert_eq!(caret.present, 1);
+        assert_eq!(caret.block_index, u64::MAX);
+        assert_eq!(caret.line_index, 0);
+        assert_eq!((caret.x, caret.y, caret.width), (0.0, 0.0, 1.0));
+        assert_eq!(caret.height, metrics.line_height());
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
