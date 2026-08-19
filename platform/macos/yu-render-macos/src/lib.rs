@@ -26,7 +26,7 @@ use yu_assets::{
     ImageRequest,
 };
 use yu_core::Revision;
-use yu_render::{AtlasPageUpload, RenderCommand, RenderPlan, RenderUploader};
+use yu_render::{AtlasPageUpload, EmbeddedSvgUpload, RenderCommand, RenderPlan, RenderUploader};
 use yu_scene::Rgba8;
 use yu_workspace::{
     ViewportFrameCache, ViewportFrameError, ViewportFramePublication, ViewportRenderFrame,
@@ -111,6 +111,14 @@ mod native {
             out_pixel_length: *mut usize,
         ) -> i32;
         pub fn yu_macos_image_free_bytes(pixels: *mut c_void);
+        pub fn yu_macos_svg_rasterize(
+            markup_bytes: *const u8,
+            markup_length: usize,
+            width: u32,
+            height: u32,
+            out_pixels: *mut *mut c_void,
+            out_pixel_length: *mut usize,
+        ) -> i32;
         pub fn yu_metal_create_render_target(
             device: *mut c_void,
             width: u32,
@@ -194,6 +202,217 @@ impl Error for MacosImageDecodeError {
             | Self::InvalidPath
             | Self::NativeDecodeFailed
             | Self::WorkerClosed => None,
+        }
+    }
+}
+
+/// Upper bounds for the native SVG rasterization handoff. Embedded markup is
+/// untrusted document content, so a renderer cannot request an unbounded
+/// bitmap or make the AppKit decoder retain arbitrarily large source data.
+pub const MACOS_EMBEDDED_SVG_MAX_DIMENSION: u32 = 4096;
+pub const MACOS_EMBEDDED_SVG_MAX_MARKUP_BYTES: usize = 4 * 1024 * 1024;
+pub const MACOS_EMBEDDED_SVG_MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
+
+/// Errors raised while converting a bounded embedded SVG to RGBA8 pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MacosEmbeddedSvgError {
+    UnsupportedPlatform,
+    InvalidMarkup,
+    MarkupTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
+    InvalidDimensions,
+    DimensionsTooLarge {
+        width: u32,
+        height: u32,
+        maximum: u32,
+    },
+    PixelBufferTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
+    NativeRasterizeFailed,
+    InvalidPixelBuffer {
+        expected: usize,
+        actual: usize,
+    },
+    Decode(ImageDecodeError),
+}
+
+impl fmt::Display for MacosEmbeddedSvgError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPlatform => {
+                formatter.write_str("macOS SVG rasterization is unavailable on this platform")
+            }
+            Self::InvalidMarkup => formatter.write_str("embedded SVG markup is empty"),
+            Self::MarkupTooLarge { actual, maximum } => {
+                write!(
+                    formatter,
+                    "embedded SVG markup has {actual} bytes, maximum is {maximum}"
+                )
+            }
+            Self::InvalidDimensions => {
+                formatter.write_str("embedded SVG dimensions must be positive")
+            }
+            Self::DimensionsTooLarge {
+                width,
+                height,
+                maximum,
+            } => write!(
+                formatter,
+                "embedded SVG dimensions {width}x{height} exceed maximum {maximum}"
+            ),
+            Self::PixelBufferTooLarge { actual, maximum } => write!(
+                formatter,
+                "embedded SVG pixel buffer has {actual} bytes, maximum is {maximum}"
+            ),
+            Self::NativeRasterizeFailed => {
+                formatter.write_str("AppKit could not rasterize the embedded SVG")
+            }
+            Self::InvalidPixelBuffer { expected, actual } => write!(
+                formatter,
+                "embedded SVG rasterizer returned {actual} bytes, expected {expected}"
+            ),
+            Self::Decode(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for MacosEmbeddedSvgError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error),
+            Self::UnsupportedPlatform
+            | Self::InvalidMarkup
+            | Self::MarkupTooLarge { .. }
+            | Self::InvalidDimensions
+            | Self::DimensionsTooLarge { .. }
+            | Self::PixelBufferTooLarge { .. }
+            | Self::NativeRasterizeFailed
+            | Self::InvalidPixelBuffer { .. } => None,
+        }
+    }
+}
+
+impl From<ImageDecodeError> for MacosEmbeddedSvgError {
+    fn from(error: ImageDecodeError) -> Self {
+        Self::Decode(error)
+    }
+}
+
+/// AppKit-backed SVG rasterizer used only at the macOS resource-consumer
+/// boundary. The type is stateless; the retained cache lives in
+/// [`MetalImageAtlas`], so rasterization can be retried without coupling
+/// native object lifetime to the editor or scene.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MacosEmbeddedSvgRasterizer;
+
+impl MacosEmbeddedSvgRasterizer {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    pub fn rasterize_upload(
+        &self,
+        upload: &EmbeddedSvgUpload,
+    ) -> Result<DecodedImage, MacosEmbeddedSvgError> {
+        self.rasterize(upload.markup(), upload.width(), upload.height())
+    }
+
+    pub fn rasterize(
+        &self,
+        markup: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<DecodedImage, MacosEmbeddedSvgError> {
+        if markup.trim().is_empty() {
+            return Err(MacosEmbeddedSvgError::InvalidMarkup);
+        }
+        if markup.len() > MACOS_EMBEDDED_SVG_MAX_MARKUP_BYTES {
+            return Err(MacosEmbeddedSvgError::MarkupTooLarge {
+                actual: markup.len(),
+                maximum: MACOS_EMBEDDED_SVG_MAX_MARKUP_BYTES,
+            });
+        }
+        if width == 0 || height == 0 {
+            return Err(MacosEmbeddedSvgError::InvalidDimensions);
+        }
+        if width > MACOS_EMBEDDED_SVG_MAX_DIMENSION || height > MACOS_EMBEDDED_SVG_MAX_DIMENSION {
+            return Err(MacosEmbeddedSvgError::DimensionsTooLarge {
+                width,
+                height,
+                maximum: MACOS_EMBEDDED_SVG_MAX_DIMENSION,
+            });
+        }
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(MacosEmbeddedSvgError::PixelBufferTooLarge {
+                actual: usize::MAX,
+                maximum: MACOS_EMBEDDED_SVG_MAX_PIXEL_BYTES,
+            })?;
+        if expected > MACOS_EMBEDDED_SVG_MAX_PIXEL_BYTES {
+            return Err(MacosEmbeddedSvgError::PixelBufferTooLarge {
+                actual: expected,
+                maximum: MACOS_EMBEDDED_SVG_MAX_PIXEL_BYTES,
+            });
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut raw_pixels = std::ptr::null_mut();
+            let mut pixel_length = 0_usize;
+            let rasterized = unsafe {
+                native::yu_macos_svg_rasterize(
+                    markup.as_bytes().as_ptr(),
+                    markup.len(),
+                    width,
+                    height,
+                    &mut raw_pixels,
+                    &mut pixel_length,
+                )
+            };
+            let raw_pixels =
+                NonNull::new(raw_pixels).ok_or(MacosEmbeddedSvgError::NativeRasterizeFailed)?;
+            if rasterized == 0 {
+                unsafe { native::yu_macos_image_free_bytes(raw_pixels.as_ptr()) };
+                return Err(MacosEmbeddedSvgError::NativeRasterizeFailed);
+            }
+            if pixel_length > MACOS_EMBEDDED_SVG_MAX_PIXEL_BYTES {
+                unsafe { native::yu_macos_image_free_bytes(raw_pixels.as_ptr()) };
+                return Err(MacosEmbeddedSvgError::PixelBufferTooLarge {
+                    actual: pixel_length,
+                    maximum: MACOS_EMBEDDED_SVG_MAX_PIXEL_BYTES,
+                });
+            }
+            let pixels = unsafe {
+                let slice =
+                    std::slice::from_raw_parts(raw_pixels.as_ptr().cast::<u8>(), pixel_length);
+                let copied = std::sync::Arc::<[u8]>::from(slice);
+                native::yu_macos_image_free_bytes(raw_pixels.as_ptr());
+                copied
+            };
+            if pixels.len() != expected {
+                return Err(MacosEmbeddedSvgError::InvalidPixelBuffer {
+                    expected,
+                    actual: pixels.len(),
+                });
+            }
+            return DecodedImage::new(width, height, pixels).map_err(Into::into);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (markup, width, height, expected);
+            Err(MacosEmbeddedSvgError::UnsupportedPlatform)
         }
     }
 }
@@ -386,6 +605,12 @@ const METAL_SHADER_SOURCE: &str = include_str!("../native/yu_shaders.metal");
 const DRAW_FILL_RECT: u32 = 0;
 const DRAW_GLYPH: u32 = 1;
 const DRAW_IMAGE: u32 = 2;
+const IMAGE_KIND_REGULAR: u32 = 0;
+const IMAGE_KIND_EMBEDDED_SVG_BASE: u32 = 1;
+
+const fn embedded_image_kind(kind: u8) -> u32 {
+    IMAGE_KIND_EMBEDDED_SVG_BASE + kind as u32
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -405,6 +630,7 @@ struct NativeDrawCommand {
     alpha: f32,
     page: u32,
     resource: u64,
+    image_kind: u32,
 }
 
 #[repr(C)]
@@ -429,6 +655,7 @@ struct NativeTextureBinding {
 #[derive(Clone, Copy, Debug)]
 struct NativeImageTextureBinding {
     resource: u64,
+    image_kind: u32,
     texture: *mut std::ffi::c_void,
 }
 
@@ -1189,6 +1416,8 @@ impl MetalAtlas {
 pub struct MetalImageAtlas {
     images: BTreeMap<u64, MetalTexture>,
     identities: BTreeMap<u64, ImageTextureIdentity>,
+    embedded_images: BTreeMap<(u64, u32), MetalTexture>,
+    embedded_identities: BTreeMap<(u64, u32), ImageTextureIdentity>,
     device_registry_id: Option<u64>,
     evictions: u64,
 }
@@ -1236,9 +1465,67 @@ impl MetalImageAtlas {
         Ok(true)
     }
 
+    /// Rasterizes and uploads one revision-bound embedded SVG. The key space
+    /// is explicitly separate from ordinary image resources so a hash
+    /// collision cannot make an embedded command sample a Markdown image.
+    pub fn sync_embedded_svg(
+        &mut self,
+        uploader: &mut MetalUploader,
+        upload: &EmbeddedSvgUpload,
+    ) -> Result<bool, MetalRenderError> {
+        let device_registry_id = uploader.device().registry_id();
+        if let Some(existing) = self.device_registry_id
+            && existing != device_registry_id
+        {
+            return Err(MetalRenderError::DeviceMismatch);
+        }
+        let resource = (upload.resource(), upload.kind().into());
+        let identity = ImageTextureIdentity {
+            width: upload.width(),
+            height: upload.height(),
+            generation: upload.generation(),
+        };
+        if self.embedded_identities.get(&resource) == Some(&identity) {
+            return Ok(false);
+        }
+        let image = MacosEmbeddedSvgRasterizer::new()
+            .rasterize_upload(upload)
+            .map_err(|_| MetalRenderError::NativeFailure("embedded SVG rasterization failed"))?;
+        let texture = uploader.upload_rgba_image(&image)?;
+        self.embedded_images.insert(resource, texture);
+        self.embedded_identities.insert(resource, identity);
+        self.device_registry_id = Some(device_registry_id);
+        Ok(true)
+    }
+
+    /// Synchronizes all first-seen embedded uploads from one render plan.
+    pub fn sync_embedded_plan(
+        &mut self,
+        uploader: &mut MetalUploader,
+        plan: &RenderPlan,
+    ) -> Result<usize, MetalRenderError> {
+        let mut uploaded = 0_usize;
+        for upload in plan.embedded_uploads() {
+            if self.sync_embedded_svg(uploader, upload)? {
+                uploaded = uploaded.saturating_add(1);
+            }
+        }
+        Ok(uploaded)
+    }
+
     #[must_use]
     pub fn resource_count(&self) -> usize {
         self.images.len()
+    }
+
+    #[must_use]
+    pub fn embedded_resource_count(&self) -> usize {
+        self.embedded_images.len()
+    }
+
+    #[must_use]
+    pub fn total_resource_count(&self) -> usize {
+        self.images.len().saturating_add(self.embedded_images.len())
     }
 
     /// Retains only publications that can be referenced by the current
@@ -1259,7 +1546,30 @@ impl MetalImageAtlas {
         self.evictions = self
             .evictions
             .saturating_add(u64::try_from(evicted).unwrap_or(u64::MAX));
-        if self.images.is_empty() {
+        if self.images.is_empty() && self.embedded_images.is_empty() {
+            self.device_registry_id = None;
+        }
+        evicted
+    }
+
+    /// Retains only embedded resources referenced by the current scene. The
+    /// caller supplies `(resource fingerprint, kind tag)` pairs; generations
+    /// are cache identity details and are replaced atomically for one pair.
+    pub fn retain_embedded_resources(&mut self, resources: &[(u64, u8)]) -> usize {
+        let retained = resources
+            .iter()
+            .map(|(resource, kind)| (*resource, u32::from(*kind)))
+            .collect::<BTreeSet<_>>();
+        let before = self.embedded_images.len();
+        self.embedded_images
+            .retain(|resource, _| retained.contains(resource));
+        self.embedded_identities
+            .retain(|resource, _| retained.contains(resource));
+        let evicted = before.saturating_sub(self.embedded_images.len());
+        self.evictions = self
+            .evictions
+            .saturating_add(u64::try_from(evicted).unwrap_or(u64::MAX));
+        if self.images.is_empty() && self.embedded_images.is_empty() {
             self.device_registry_id = None;
         }
         evicted
@@ -1277,14 +1587,29 @@ impl MetalImageAtlas {
             .collect()
     }
 
+    fn embedded_resource_sizes(&self) -> BTreeMap<(u64, u32), (u32, u32)> {
+        self.embedded_images
+            .iter()
+            .map(|(resource, texture)| (*resource, (texture.width(), texture.height())))
+            .collect()
+    }
+
     #[cfg(target_os = "macos")]
     fn native_bindings(&self) -> Vec<NativeImageTextureBinding> {
         self.images
             .iter()
             .map(|(resource, texture)| NativeImageTextureBinding {
                 resource: *resource,
+                image_kind: IMAGE_KIND_REGULAR,
                 texture: texture.raw(),
             })
+            .chain(self.embedded_images.iter().map(|(resource, texture)| {
+                NativeImageTextureBinding {
+                    resource: resource.0,
+                    image_kind: embedded_image_kind(resource.1 as u8),
+                    texture: texture.raw(),
+                }
+            }))
             .collect()
     }
 }
@@ -1515,6 +1840,7 @@ pub struct MetalFrameRenderer {
 pub struct MetalFrameSubmission {
     revision: Revision,
     uploaded_pages: usize,
+    uploaded_embedded: usize,
 }
 
 impl MetalFrameSubmission {
@@ -1526,6 +1852,11 @@ impl MetalFrameSubmission {
     #[must_use]
     pub const fn uploaded_pages(self) -> usize {
         self.uploaded_pages
+    }
+
+    #[must_use]
+    pub const fn uploaded_embedded(self) -> usize {
+        self.uploaded_embedded
     }
 }
 
@@ -1629,6 +1960,7 @@ pub struct MetalViewportHostSubmission {
     surface_generation: u64,
     frame_serial: u64,
     uploaded_pages: usize,
+    uploaded_embedded: usize,
 }
 
 impl MetalViewportHostSubmission {
@@ -1650,6 +1982,11 @@ impl MetalViewportHostSubmission {
     #[must_use]
     pub const fn uploaded_pages(self) -> usize {
         self.uploaded_pages
+    }
+
+    #[must_use]
+    pub const fn uploaded_embedded(self) -> usize {
+        self.uploaded_embedded
     }
 }
 
@@ -1822,8 +2159,8 @@ impl MetalViewportHostSession {
         uploader: &mut MetalUploader,
         atlas: &mut MetalAtlas,
     ) -> Result<MetalViewportHostSubmission, MetalViewportHostError> {
-        let images = MetalImageAtlas::new();
-        self.submit_with_images(renderer, surface, uploader, atlas, &images)
+        let mut images = MetalImageAtlas::new();
+        self.submit_with_images(renderer, surface, uploader, atlas, &mut images)
     }
 
     /// Submits the current frame while reusing a host-owned image atlas.
@@ -1836,7 +2173,7 @@ impl MetalViewportHostSession {
         surface: &MetalSurface,
         uploader: &mut MetalUploader,
         atlas: &mut MetalAtlas,
-        images: &MetalImageAtlas,
+        images: &mut MetalImageAtlas,
     ) -> Result<MetalViewportHostSubmission, MetalViewportHostError> {
         self.validate_surface_generation(surface.generation())?;
         let frame = self.frame_cache.get(self.current_revision).ok_or(
@@ -1862,6 +2199,7 @@ impl MetalViewportHostSession {
             surface_generation: self.surface_generation,
             frame_serial,
             uploaded_pages: result.uploaded_pages(),
+            uploaded_embedded: result.uploaded_embedded(),
         };
         self.last_submission = Some(submission);
         Ok(submission)
@@ -2003,8 +2341,12 @@ impl MetalFrameRenderer {
 
         let recreated_target = self.ensure_target(surface)?;
         let viewport = plan.viewport();
-        let all_commands =
-            build_native_commands(plan, &atlas.page_sizes(), &images.resource_sizes())?;
+        let all_commands = build_native_commands(
+            plan,
+            &atlas.page_sizes(),
+            &images.resource_sizes(),
+            &images.embedded_resource_sizes(),
+        )?;
         let damage = build_native_damage(plan)?;
         let full_clear = recreated_target
             || self.needs_full_clear
@@ -2143,14 +2485,14 @@ impl MetalFrameRenderer {
         uploader: &mut MetalUploader,
         atlas: &mut MetalAtlas,
     ) -> Result<MetalFrameSubmission, MetalRenderError> {
-        let images = MetalImageAtlas::new();
+        let mut images = MetalImageAtlas::new();
         self.submit_viewport_frame_with_images(
             surface,
             current_revision,
             frame,
             uploader,
             atlas,
-            &images,
+            &mut images,
         )
     }
 
@@ -2161,15 +2503,17 @@ impl MetalFrameRenderer {
         frame: &ViewportRenderFrame,
         uploader: &mut MetalUploader,
         atlas: &mut MetalAtlas,
-        images: &MetalImageAtlas,
+        images: &mut MetalImageAtlas,
     ) -> Result<MetalFrameSubmission, MetalRenderError> {
         self.frame_consumer.validate(current_revision, frame)?;
         let uploaded_pages = atlas.sync_plan(uploader, frame.plan())?;
+        let uploaded_embedded = images.sync_embedded_plan(uploader, frame.plan())?;
         self.render_plan_with_images(surface, frame.plan(), atlas, images)?;
         self.frame_consumer.commit(current_revision, frame)?;
         Ok(MetalFrameSubmission {
             revision: frame.revision(),
             uploaded_pages,
+            uploaded_embedded,
         })
     }
 
@@ -2264,6 +2608,7 @@ fn build_native_commands(
     plan: &RenderPlan,
     page_sizes: &BTreeMap<u32, (u32, u32)>,
     image_sizes: &BTreeMap<u64, (u32, u32)>,
+    embedded_image_sizes: &BTreeMap<(u64, u32), (u32, u32)>,
 ) -> Result<Vec<NativeDrawCommand>, MetalRenderError> {
     let viewport = plan.viewport();
     let mut commands = Vec::with_capacity(plan.commands().len());
@@ -2305,6 +2650,7 @@ fn build_native_commands(
                     alpha: normalized_channel(color.alpha()),
                     page: u32::MAX,
                     resource: 0,
+                    image_kind: IMAGE_KIND_REGULAR,
                 });
             }
             RenderCommand::Glyph {
@@ -2362,6 +2708,7 @@ fn build_native_commands(
                     alpha: normalized_channel(color.alpha()),
                     page,
                     resource: 0,
+                    image_kind: IMAGE_KIND_REGULAR,
                 });
             }
             RenderCommand::Image {
@@ -2405,6 +2752,7 @@ fn build_native_commands(
                         alpha: 1.0,
                         page: u32::MAX,
                         resource,
+                        image_kind: IMAGE_KIND_REGULAR,
                     });
                 } else {
                     commands.push(NativeDrawCommand {
@@ -2423,16 +2771,17 @@ fn build_native_commands(
                         alpha: normalized_channel(fallback.alpha()),
                         page: u32::MAX,
                         resource: 0,
+                        image_kind: IMAGE_KIND_REGULAR,
                     });
                 }
             }
             RenderCommand::EmbeddedSvg {
-                bounds, fallback, ..
+                resource,
+                kind,
+                bounds,
+                fallback,
+                ..
             } => {
-                // The publication/upload boundary is now explicit, but this
-                // Metal backend does not yet rasterize SVG. Keep the source
-                // block visible with its deterministic fallback instead of
-                // silently dropping it or inventing a second SVG pipeline.
                 if !bounds.x().is_finite()
                     || !bounds.y().is_finite()
                     || !bounds.width().is_finite()
@@ -2452,23 +2801,45 @@ fn build_native_commands(
                         "embedded SVG position is not finite",
                     ));
                 }
-                commands.push(NativeDrawCommand {
-                    kind: DRAW_FILL_RECT,
-                    x,
-                    y,
-                    width: bounds.width(),
-                    height: bounds.height(),
-                    u0: 0.0,
-                    v0: 0.0,
-                    u1: 0.0,
-                    v1: 0.0,
-                    red: normalized_channel(fallback.red()),
-                    green: normalized_channel(fallback.green()),
-                    blue: normalized_channel(fallback.blue()),
-                    alpha: normalized_channel(fallback.alpha()),
-                    page: u32::MAX,
-                    resource: 0,
-                });
+                if embedded_image_sizes.contains_key(&(resource, u32::from(kind))) {
+                    commands.push(NativeDrawCommand {
+                        kind: DRAW_IMAGE,
+                        x,
+                        y,
+                        width: bounds.width(),
+                        height: bounds.height(),
+                        u0: 0.0,
+                        v0: 0.0,
+                        u1: 1.0,
+                        v1: 1.0,
+                        red: 1.0,
+                        green: 1.0,
+                        blue: 1.0,
+                        alpha: 1.0,
+                        page: u32::MAX,
+                        resource,
+                        image_kind: embedded_image_kind(kind),
+                    });
+                } else {
+                    commands.push(NativeDrawCommand {
+                        kind: DRAW_FILL_RECT,
+                        x,
+                        y,
+                        width: bounds.width(),
+                        height: bounds.height(),
+                        u0: 0.0,
+                        v0: 0.0,
+                        u1: 0.0,
+                        v1: 0.0,
+                        red: normalized_channel(fallback.red()),
+                        green: normalized_channel(fallback.green()),
+                        blue: normalized_channel(fallback.blue()),
+                        alpha: normalized_channel(fallback.alpha()),
+                        page: u32::MAX,
+                        resource: 0,
+                        image_kind: IMAGE_KIND_REGULAR,
+                    });
+                }
             }
         }
     }
@@ -2737,7 +3108,8 @@ mod tests {
         page_sizes.insert(0, (16, 16));
 
         let commands =
-            build_native_commands(&plan, &page_sizes, &BTreeMap::new()).expect("native commands");
+            build_native_commands(&plan, &page_sizes, &BTreeMap::new(), &BTreeMap::new())
+                .expect("native commands");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].kind, DRAW_FILL_RECT);
         assert_eq!(commands[0].x, 0.0);
@@ -2776,8 +3148,9 @@ mod tests {
             .build(&scene.finish(), &atlas)
             .expect("plan");
 
-        let placeholder = build_native_commands(&plan, &BTreeMap::new(), &BTreeMap::new())
-            .expect("placeholder commands");
+        let placeholder =
+            build_native_commands(&plan, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
+                .expect("placeholder commands");
         assert_eq!(placeholder.len(), 1);
         assert_eq!(placeholder[0].kind, DRAW_FILL_RECT);
         assert_eq!(placeholder[0].resource, 0);
@@ -2785,7 +3158,8 @@ mod tests {
 
         let mut ready = BTreeMap::new();
         ready.insert(42, (2, 2));
-        let image = build_native_commands(&plan, &BTreeMap::new(), &ready).expect("image command");
+        let image = build_native_commands(&plan, &BTreeMap::new(), &ready, &BTreeMap::new())
+            .expect("image command");
         assert_eq!(image.len(), 1);
         assert_eq!(image[0].kind, DRAW_IMAGE);
         assert_eq!(image[0].resource, 42);
@@ -2826,7 +3200,7 @@ mod tests {
             .expect("plan");
 
         assert_eq!(
-            build_native_commands(&plan, &BTreeMap::new(), &BTreeMap::new())
+            build_native_commands(&plan, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new(),)
                 .expect_err("missing page"),
             MetalRenderError::MissingAtlasPage(0)
         );
@@ -2882,6 +3256,7 @@ mod tests {
                 alpha: 1.0,
                 page: u32::MAX,
                 resource: 0,
+                image_kind: IMAGE_KIND_REGULAR,
             },
             NativeDrawCommand {
                 kind: DRAW_GLYPH,
@@ -2899,6 +3274,7 @@ mod tests {
                 alpha: 1.0,
                 page: 2,
                 resource: 0,
+                image_kind: IMAGE_KIND_REGULAR,
             },
             NativeDrawCommand {
                 kind: DRAW_FILL_RECT,
@@ -2916,6 +3292,7 @@ mod tests {
                 alpha: 1.0,
                 page: u32::MAX,
                 resource: 0,
+                image_kind: IMAGE_KIND_REGULAR,
             },
         ];
         let damage = [NativeDamageRect {
@@ -2949,6 +3326,7 @@ mod tests {
             alpha: 1.0,
             page: u32::MAX,
             resource: 0,
+            image_kind: IMAGE_KIND_REGULAR,
         };
         let damage = [
             NativeDamageRect {
@@ -2998,6 +3376,112 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!((image.width(), image.height()), (1, 1));
         assert_eq!(image.pixels().len(), 4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn appkit_svg_rasterizer_returns_bounded_rgba_pixels() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3">
+            <rect width="4" height="3" fill="#ff0000"/>
+        </svg>"##;
+        let image = MacosEmbeddedSvgRasterizer::new()
+            .rasterize(svg, 4, 3)
+            .expect("AppKit SVG rasterization");
+        assert_eq!((image.width(), image.height()), (4, 3));
+        assert_eq!(image.pixels().len(), 4 * 3 * 4);
+        assert!(
+            image.pixels().chunks_exact(4).any(|pixel| {
+                pixel[0] > 200 && pixel[1] < 32 && pixel[2] < 32 && pixel[3] > 200
+            })
+        );
+    }
+
+    #[test]
+    fn embedded_native_command_uses_image_quad_only_for_ready_texture() {
+        use std::collections::BTreeMap;
+
+        use yu_assets::{EmbeddedRenderPayload, EmbeddedRenderRequest, EmbeddedResourceKind};
+        use yu_core::{ByteOffset, TextRange};
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{EmbeddedSvgPrimitive, Rect, SceneBuilder};
+
+        let revision = Revision::INITIAL;
+        let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("source");
+        let request =
+            EmbeddedRenderRequest::new(revision, source, EmbeddedResourceKind::Math, "x^2")
+                .expect("embedded request");
+        let mut cache = yu_assets::EmbeddedResourceCache::new();
+        let publication = cache
+            .publish(
+                request,
+                revision,
+                EmbeddedRenderPayload::svg(
+                    32,
+                    16,
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"16\"/>",
+                )
+                .expect("svg"),
+            )
+            .expect("publication");
+        let primitive = EmbeddedSvgPrimitive::new(
+            publication.key().fingerprint(),
+            publication.generation(),
+            publication.kind().tag(),
+            publication.source_range(),
+            Rect::new(4.0, 6.0, 32.0, 16.0).expect("bounds"),
+            32,
+            16,
+            Rgba8::new(230, 232, 236, 255),
+        );
+        let mut scene =
+            SceneBuilder::new(revision, Rect::new(0.0, 0.0, 80.0, 40.0).expect("viewport"))
+                .expect("scene");
+        scene.embedded_svg(primitive).expect("primitive");
+        let atlas = yu_font::GlyphAtlas::new(
+            yu_font::GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"),
+        );
+        let plan = RenderPlanBuilder::new()
+            .build_with_embedded(&scene.finish(), &atlas, std::slice::from_ref(&publication))
+            .expect("plan");
+
+        let fallback =
+            build_native_commands(&plan, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
+                .expect("fallback command");
+        assert_eq!(fallback[0].kind, DRAW_FILL_RECT);
+        assert_eq!(fallback[0].image_kind, IMAGE_KIND_REGULAR);
+
+        let mut embedded_sizes = BTreeMap::new();
+        embedded_sizes.insert(
+            (primitive.resource(), u32::from(primitive.kind())),
+            (32, 16),
+        );
+        let ready =
+            build_native_commands(&plan, &BTreeMap::new(), &BTreeMap::new(), &embedded_sizes)
+                .expect("ready command");
+        assert_eq!(ready[0].kind, DRAW_IMAGE);
+        assert_eq!(ready[0].image_kind, embedded_image_kind(primitive.kind()));
+        assert_eq!(ready[0].resource, primitive.resource());
+        assert_eq!(ready[0].u1, 1.0);
+        assert_ne!(
+            embedded_image_kind(EmbeddedResourceKind::Math.tag()),
+            embedded_image_kind(EmbeddedResourceKind::Mermaid.tag())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn embedded_svg_rasterizer_rejects_oversized_requests_before_appkit() {
+        let error = MacosEmbeddedSvgRasterizer::new()
+            .rasterize("<svg/>", MACOS_EMBEDDED_SVG_MAX_DIMENSION + 1, 1)
+            .expect_err("oversized dimensions");
+        assert_eq!(
+            error,
+            MacosEmbeddedSvgError::DimensionsTooLarge {
+                width: MACOS_EMBEDDED_SVG_MAX_DIMENSION + 1,
+                height: 1,
+                maximum: MACOS_EMBEDDED_SVG_MAX_DIMENSION,
+            }
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -8147,7 +8147,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             &surface_state.surface,
             &mut surface_state.uploader,
             &mut surface_state.atlas,
-            &surface_state.image_atlas,
+            &mut surface_state.image_atlas,
         ) {
             Ok(submission) => submission,
             Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
