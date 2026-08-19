@@ -633,8 +633,10 @@ viewport/surface 尺寸和 backing scale 全部与最后一次成功 submit 相�
 有效时，才停止 TextKit source glyph 和 insertion point 的绘制。TextKit 仍保留 string、
 selection、NSTextInputClient、IME、复制粘贴和 Accessibility 所有权；编辑、composition
 generation 变化、滚动或 resize 期间先继续显示 native source mirror，直到新的 Rust publication
-到达 surface。stale、detach 或 submit 失败会立即清除门控并恢复 TextKit 绘制，因此这一步是主视觉
-层验证，不是完整 visual renderer 迁移。见 ADR 0139。
+到达 surface。stale、detach 或 submit 失败会立即清除门控并恢复 TextKit 绘制。retained coverage
+现在是 all-or-nothing：已接受的 Metal frame 不再叠加局部 TextKit source glyph；未知 block、ABI
+状态或 coverage mismatch 会让整帧 fail-closed。TextKit 仍作为整页故障回退，因此这一步是主视觉层
+收口，不是完整 visual renderer 迁移。见 ADR 0139、0178。
 
 `ViewportRenderFrame` 将 scene 与 render plan 绑定到同一个 Revision，`ViewportFrameCache` 是当前
 文档的单项发布门：`publish_if_current` 拒绝 stale frame，也不允许旧 Revision 回退覆盖新 frame；
@@ -798,8 +800,9 @@ worker/`MetalImageAtlas` publication wiring 现在由 macOS 持久 surface host 
 只为 CoreText 当前 viewport/overscan 的 block 轮询 worker，把同一 Revision 的 ready publication
 同步进持久 image atlas，再用带图片资源的 RenderPlan 提交；首帧或解码失败仍保留 fallback。
 这里的 fallback 由 `ImagePrimitive` 自带的 opaque placeholder 在 Metal 中绘制；pending/failed
-已知状态不再把 image source range 交回 TextKit。无稳定 fingerprint 的 unknown image 仍保留局部
-TextKit range，有 fingerprint 但无法分类的 unknown 状态则整页 fail-closed。
+已知状态不再把 image source range 交回 TextKit。无稳定 fingerprint 的 unknown image 保留 Rust
+projection 已有的 alt-label glyph；有 fingerprint 但无法分类的 unknown 状态则整页 fail-closed。
+生产 presentation 不再把局部 TextKit 字形混合到 accepted Metal frame。见 ADR 0178。
 `ImageCache` 有显式容量、LRU eviction 和按 Revision 绑定的失败记录，surface snapshot 同时报告
 本次可见请求、失败与 eviction 计数，以及上传的 image 数量和 atlas resource 数量，便于区分
 “命令已发布”“资源请求已排队”“解码失败”和“纹理已 ready”。ready publication 会在下一次

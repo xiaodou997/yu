@@ -24,9 +24,10 @@
   rotor 只查询当前 child tree；链接 destination 只暴露 `accessibilityURL`，task checkbox press 回到
   Rust `toggle_task` Transaction；macOS VoiceOver 真实朗读已由人工确认通过；Rotor/语义 action
   的跨平台回归仍属于后续工作；
-- 当前包含最小 Rust glyph overlay、CoreText-shaped Rust visual pointer/caret 映射、projected
-  selection highlight、Revision-bound caret reveal、CoreText shaped vertical command 和 TextKit
-  回退；仍不包含完整 Markdown delimiter reveal、shaped visual IME renderer 或 workspace/tab。
+- 当前产品窗口已接入 retained Rust scene、CoreText shaping、Metal glyph/image/Math/task/decorations、
+  visual pointer/caret、跨 block IME preedit 和 Revision-bound caret reveal。accepted Metal frame
+  不再混合局部 TextKit source glyph；TextKit 仍是输入/IME/Accessibility 宿主和整页故障回退。
+  当前仍不包含完整 Markdown delimiter reveal、正式 workspace/tab 或完整产品 UI。
 
 构建并运行：
 

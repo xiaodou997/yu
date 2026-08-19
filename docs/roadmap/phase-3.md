@@ -105,7 +105,8 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] task-list 隐藏的 `[ ]`/`[x]` marker 由 source-backed `TaskCheckboxPrimitive` 补画；todo/done 状态随 Revision 进入既有 solid/Metal pipeline，FFI 使用独立 command tag 保持诊断语义
 - [x] task checkbox pointer 使用当前已发布 retained frame 的 document-space bounds 做 Revision-bound hit-test；macOS 普通主键点击复用现有 `ToggleTask` transaction，stale/composition/框外查询回退普通文本选择
 - [x] 普通与 IME selection/caret 作为 source-backed `EditorDecorationPrimitive` 进入同一 retained Scene/RenderPlan/Metal publication；surface snapshot 以语义 layer count 验证覆盖，selection-only 变化主动撤销同 Revision 旧 frame，AppKit decoration sibling 降为 stale/mismatch/unavailable fallback
-- [x] 图片 pending/failed 使用 retained placeholder，embedded pending/failed/unsupported 使用 retained fenced-code projection；已知资源状态不再触发 TextKit source-range paint，unknown identity/status 仍局部或整页 fail-closed
+- [x] 图片 pending/failed 使用 retained placeholder，embedded pending/failed/unsupported 使用 retained fenced-code projection；已知资源状态不再触发 TextKit source-range paint，unknown status 整页 fail-closed
+- [x] macOS production presentation 移除局部 TextKit source-range 混合绘制；accepted Metal frame 必须拥有完整 retained coverage，未知 block/status 改为整页 fail-closed
 
 ## 约束
 
