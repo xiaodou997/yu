@@ -24,9 +24,9 @@ use yu_font::GlyphAtlas;
 use yu_layout::ImageIntrinsicSize;
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
-    EmbeddedSvgPrimitive, ImagePrimitive, Rect, Rgba8, Scene, SceneBuilder, SceneError,
-    TableSceneStyle, TaskCheckboxPrimitive, TaskCheckboxPrimitiveRole, ViewportBlockGeometry,
-    ViewportSceneInput,
+    EmbeddedSvgPrimitive, ImagePrimitive, Point, Primitive, Rect, Rgba8, Scene, SceneBuilder,
+    SceneError, TableSceneStyle, TaskCheckboxPrimitive, TaskCheckboxPrimitiveRole,
+    ViewportBlockGeometry, ViewportSceneInput,
 };
 
 mod workspace;
@@ -41,6 +41,41 @@ pub use workspace::{
 pub struct ViewportSceneFrame {
     input: ViewportSceneInput,
     scene: Scene,
+}
+
+/// A parser- and Revision-bound task checkbox target from one published scene.
+///
+/// `source` is the exact `[ ]`/`[x]` marker range rather than the containing
+/// list item. Platform shells use `block_index` only to invoke the existing
+/// canonical `ToggleTask` editor command after validating this hit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TaskCheckboxHit {
+    revision: Revision,
+    block_index: usize,
+    source: yu_core::TextRange,
+    bounds: Rect,
+}
+
+impl TaskCheckboxHit {
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn block_index(self) -> usize {
+        self.block_index
+    }
+
+    #[must_use]
+    pub const fn source(self) -> yu_core::TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> Rect {
+        self.bounds
+    }
 }
 
 /// Returns the optional background used by the product visual projection for
@@ -134,6 +169,41 @@ impl ViewportSceneFrame {
     #[must_use]
     pub fn into_parts(self) -> (ViewportSceneInput, Scene) {
         (self.input, self.scene)
+    }
+
+    /// Resolves a document-space point against the task checkbox borders in
+    /// this exact published frame. Interior/check painter layers are ignored,
+    /// so one visible checkbox can produce at most one semantic hit.
+    pub fn task_checkbox_hit_test(
+        &self,
+        expected_revision: Revision,
+        point: Point,
+    ) -> Result<Option<TaskCheckboxHit>, ViewportFrameError> {
+        if self.revision() != expected_revision {
+            return Err(ViewportFrameError::Stale {
+                expected: expected_revision,
+                actual: self.revision(),
+            });
+        }
+        let Some(task) = self.scene.primitives().iter().find_map(|primitive| {
+            let Primitive::TaskCheckbox(task) = primitive else {
+                return None;
+            };
+            (task.role() == TaskCheckboxPrimitiveRole::Border && task.bounds().contains(point))
+                .then_some(*task)
+        }) else {
+            return Ok(None);
+        };
+        let block = self.input.blocks().iter().copied().find(|block| {
+            block.source().start() <= task.source().start()
+                && task.source().end() <= block.source().end()
+        });
+        Ok(block.map(|block| TaskCheckboxHit {
+            revision: self.revision(),
+            block_index: block.index(),
+            source: task.source(),
+            bounds: task.bounds(),
+        }))
     }
 }
 
@@ -1350,6 +1420,77 @@ mod tests {
                 })
                 .count(),
             5
+        );
+    }
+
+    #[test]
+    fn task_checkbox_hit_test_uses_published_revision_and_border_geometry() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let mut document = EditorDocument::new("- [ ] todo\nparagraph\n- [x] done\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("task scene");
+        let border = frame
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::TaskCheckbox(task)
+                    if task.role() == TaskCheckboxPrimitiveRole::Border =>
+                {
+                    Some(*task)
+                }
+                _ => None,
+            })
+            .expect("todo checkbox border");
+        let bounds = border.bounds();
+        let point = Point::new(
+            bounds.x() + bounds.width() * 0.5,
+            bounds.y() + bounds.height() * 0.5,
+        );
+        let hit = frame
+            .task_checkbox_hit_test(frame.revision(), point)
+            .expect("current revision")
+            .expect("checkbox hit");
+        assert_eq!(hit.revision(), document.revision());
+        assert_eq!(hit.block_index(), 0);
+        assert_eq!(hit.source(), border.source());
+        assert_eq!(hit.bounds(), bounds);
+        assert_eq!(
+            frame
+                .task_checkbox_hit_test(
+                    frame.revision(),
+                    Point::new(bounds.right() + 1.0, bounds.y())
+                )
+                .expect("outside query"),
+            None
+        );
+        assert!(matches!(
+            frame.task_checkbox_hit_test(Revision::new(frame.revision().get() + 1), point),
+            Err(ViewportFrameError::Stale { .. })
+        ));
+        assert_eq!(
+            frame
+                .task_checkbox_hit_test(frame.revision(), Point::new(f32::NAN, bounds.y()))
+                .expect("non-finite point is not a hit"),
+            None
         );
     }
 

@@ -129,6 +129,18 @@ impl Rect {
             && other.y <= self.bottom()
     }
 
+    /// Returns whether a finite point lies inside this rectangle, including
+    /// its outer edges. Non-finite pointer input is never a hit.
+    #[must_use]
+    pub fn contains(self, point: Point) -> bool {
+        point.x().is_finite()
+            && point.y().is_finite()
+            && point.x() >= self.x
+            && point.x() <= self.right()
+            && point.y() >= self.y
+            && point.y() <= self.bottom()
+    }
+
     fn validate(self) -> Result<(), SceneError> {
         if !self.x.is_finite()
             || !self.y.is_finite()

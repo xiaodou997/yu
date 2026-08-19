@@ -388,6 +388,20 @@ typedef struct YuStorageTableCellHit {
     float height;
 } YuStorageTableCellHit;
 
+/* One source-backed task checkbox from the currently published macOS retained
+ * frame. Bounds use document-space scene coordinates; the marker range is the
+ * exact parser-owned [ ]/[x] source range. */
+typedef struct YuStorageTaskCheckboxHit {
+    uint64_t revision;
+    uint64_t block_index;
+    uint64_t marker_start_utf16;
+    uint64_t marker_end_utf16;
+    float x;
+    float y;
+    float width;
+    float height;
+} YuStorageTaskCheckboxHit;
+
 /* Revision-bound hit-test result for an internal visible table divider. kind
  * is YU_STORAGE_TABLE_RESIZE_COLUMN or YU_STORAGE_TABLE_RESIZE_ROW; index is
  * the column/row immediately before the divider and position is local x/y. */
@@ -982,6 +996,12 @@ int32_t yu_storage_session_macos_table_resize_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     float size, float max_width, float point_x, float point_y, float tolerance,
     YuStorageTableResizeHit *output);
+/* Resolves a document-space point against the exact task checkbox geometry in
+ * the current persistent macOS render-host publication. It is read-only and
+ * rejects stale revisions, active composition and points outside a checkbox. */
+int32_t yu_storage_session_macos_task_checkbox_hit_test(
+    YuStorageSession *session, uint64_t expected_revision,
+    float point_x, float point_y, YuStorageTaskCheckboxHit *output);
 int32_t yu_storage_session_macos_table_resize_begin_at_point(
     YuStorageSession *session, uint64_t expected_revision,
     float size, float max_width, float point_x, float point_y, float tolerance,

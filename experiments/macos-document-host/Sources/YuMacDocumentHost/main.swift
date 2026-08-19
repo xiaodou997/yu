@@ -210,6 +210,28 @@ private struct NativeProjectionHit {
     }
 }
 
+private struct NativeTaskCheckboxHit: Equatable {
+    let revision: UInt64
+    let blockIndex: UInt64
+    let markerRange: NSRange
+    let bounds: CGRect
+
+    init(_ value: YuStorageTaskCheckboxHit) {
+        revision = value.revision
+        blockIndex = value.block_index
+        markerRange = NSRange(
+            location: Int(value.marker_start_utf16),
+            length: Int(value.marker_end_utf16 - value.marker_start_utf16)
+        )
+        bounds = CGRect(
+            x: CGFloat(value.x),
+            y: CGFloat(value.y),
+            width: CGFloat(value.width),
+            height: CGFloat(value.height)
+        )
+    }
+}
+
 private struct NativeProjectionBlock {
     let revision: UInt64
     let blockIndex: UInt64
@@ -2125,6 +2147,24 @@ private final class StorageBridge {
         return value
     }
 
+    func macosTaskCheckboxHitTest(
+        revision: UInt64,
+        point: CGPoint
+    ) throws -> NativeTaskCheckboxHit {
+        var value = YuStorageTaskCheckboxHit()
+        let status = yu_storage_session_macos_task_checkbox_hit_test(
+            handle,
+            revision,
+            Float(point.x),
+            Float(point.y),
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeTaskCheckboxHit(value)
+    }
+
     func macosTableResizeBeginAtDocumentPoint(
         revision: UInt64,
         size: Float,
@@ -3594,11 +3634,13 @@ private final class DocumentTextView: NSTextView {
     private var sourceGlyphsHidden = false
     private var tableResizeTrackingArea: NSTrackingArea?
     private var tableResizeCursorActive = false
+    private var taskCheckboxPointerConsumed = false
     var onDocumentChange: (() -> Void)?
     var onBeforeCommand: (() -> Void)?
     var onCaretChange: (() -> Void)?
     var onError: ((Error) -> Void)?
     var onTableResizeHover: ((NSPoint) -> Bool)?
+    var onTaskCheckboxPress: ((NSPoint) -> Bool)?
     var onTableResizeBegin: ((NSPoint) -> Bool)?
     var onTableResizeUpdate: ((NSPoint) -> Bool)?
     var onTableResizeFinish: (() -> Bool)?
@@ -4298,7 +4340,14 @@ private final class DocumentTextView: NSTextView {
     func toggleTaskAccessibilityNode(_ node: NativeAccessibilitySemanticNode) -> Bool {
         guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem,
               node.revision == bridge.state.revision,
-              let block = node.actionBlock,
+              let block = node.actionBlock else {
+            return false
+        }
+        return toggleTask(block: block, revision: node.revision)
+    }
+
+    private func toggleTask(block: UInt64, revision: UInt64) -> Bool {
+        guard revision == bridge.state.revision,
               !bridge.composition.active,
               bridge.commandAvailable(Command.toggleTask, block: block) else {
             return false
@@ -4315,6 +4364,15 @@ private final class DocumentTextView: NSTextView {
             onError?(error)
             return false
         }
+    }
+
+    func toggleTaskPointerHit(_ hit: NativeTaskCheckboxHit) -> Bool {
+        toggleTask(block: hit.blockIndex, revision: hit.revision)
+    }
+
+    @discardableResult
+    func pressTaskCheckboxForSelfCheck(at point: NSPoint) -> Bool {
+        onTaskCheckboxPress?(point) ?? false
     }
 
     override func accessibilityString(for range: NSRange) -> String? {
@@ -4402,6 +4460,15 @@ private final class DocumentTextView: NSTextView {
     /// unavailable, AppKit's source hit-test remains the safe fallback.
     override func mouseDown(with event: NSEvent) {
         if event.buttonNumber == 0,
+           event.clickCount == 1,
+           !event.modifierFlags.contains(.shift),
+           onTaskCheckboxPress?(visualPoint(for: event)) == true {
+            visualSelectionAnchor = nil
+            taskCheckboxPointerConsumed = true
+            return
+        }
+        taskCheckboxPointerConsumed = false
+        if event.buttonNumber == 0,
            onTableResizeBegin?(visualPoint(for: event)) == true {
             visualSelectionAnchor = nil
             setTableResizeCursor(active: true)
@@ -4419,6 +4486,9 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if taskCheckboxPointerConsumed {
+            return
+        }
         if onTableResizeUpdate?(visualPoint(for: event)) == true {
             setTableResizeCursor(active: true)
             return
@@ -4434,6 +4504,10 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if taskCheckboxPointerConsumed {
+            taskCheckboxPointerConsumed = false
+            return
+        }
         if event.buttonNumber == 0,
            onTableResizeFinish?() == true {
             setTableResizeCursor(active: false)
@@ -5810,6 +5884,43 @@ private final class MacosSurfaceHostCoordinator {
         }
     }
 
+    /// Resolves a primary click against the exact Rust scene publication that
+    /// is currently visible. The coordinator returns metadata only; canonical
+    /// mutation stays in `DocumentTextView`'s existing command path.
+    func taskCheckboxHit(at point: NSPoint) -> NativeTaskCheckboxHit? {
+        let revision = bridge.state.revision
+        guard !bridge.composition.active,
+              point.x.isFinite,
+              point.y.isFinite,
+              hasCurrentPublication(
+                  revision: revision,
+                  compositionGeneration: bridge.composition.generation
+              ) else {
+            return nil
+        }
+        do {
+            let hit = try bridge.macosTaskCheckboxHitTest(
+                revision: revision,
+                point: CGPoint(x: point.x, y: point.y)
+            )
+            guard hit.revision == revision,
+                  hit.bounds.width > 0.0,
+                  hit.bounds.height > 0.0 else {
+                return nil
+            }
+            return hit
+        } catch BridgeError.operation(let status)
+            where status == StorageStatus.invalidSelection
+                || status == StorageStatus.staleRevision {
+            return nil
+        } catch {
+            // A missing/stale retained publication is an enhancement miss.
+            // Preserve AppKit's ordinary source selection without surfacing a
+            // modal error for a pointer query.
+            return nil
+        }
+    }
+
     /// Returns the visible, read-only divider descriptors from the same
     /// document-space CoreText layout used by hover and begin. Callers project
     /// these into ephemeral native Accessibility elements; the descriptors
@@ -6544,6 +6655,13 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         textView.onError = { [weak self] error in self?.show(error) }
         textView.onTableResizeHover = { [weak self] point in
             self?.surfaceCoordinator.tableResizeHover(at: point) ?? false
+        }
+        textView.onTaskCheckboxPress = { [weak self] point in
+            guard let self,
+                  let hit = self.surfaceCoordinator.taskCheckboxHit(at: point) else {
+                return false
+            }
+            return self.textView.toggleTaskPointerHit(hit)
         }
         textView.onTableResizeBegin = { [weak self] point in
             self?.surfaceCoordinator.beginTableResize(at: point) ?? false
@@ -10623,6 +10741,95 @@ private func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
     }
 }
 
+private func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
+    do {
+        let bridge = try StorageBridge(path: path)
+        let revision = bridge.state.revision
+        let size: Float = 14.0
+        let maxWidth: Float = 500.0
+        let metrics = try bridge.macosFontMetrics(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth
+        )
+        try bridge.setViewportConfig(
+            revision: revision,
+            maxWidth: maxWidth,
+            lineHeight: Float(metrics.lineHeight),
+            defaultAdvance: Float(metrics.defaultAdvance),
+            estimatedBlockHeight: Float(metrics.lineHeight),
+            overscan: 0.0
+        )
+        let (_, commands, _, _) = try bridge.macosVisualRenderPlan(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0
+        )
+        guard let task = commands.first(where: {
+            $0.kind == UInt8(YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX)
+        }) else {
+            throw BridgeError.operation(StorageStatus.invalidSelection)
+        }
+        _ = try bridge.macosRenderHostFrame(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            scrollY: 0.0,
+            viewportHeight: 1_000.0,
+            surfaceGeneration: 0
+        )
+        let point = NSPoint(x: task.bounds.midX, y: task.bounds.midY)
+        let publishedHit = try bridge.macosTaskCheckboxHitTest(
+            revision: revision,
+            point: point
+        )
+        precondition(publishedHit.revision == revision)
+        precondition(publishedHit.blockIndex == task.blockIndex)
+        precondition(publishedHit.markerRange.length == 3)
+        precondition(publishedHit.bounds.contains(point))
+
+        let textView = DocumentTextView(bridge: bridge)
+        var documentChanges = 0
+        textView.onDocumentChange = { documentChanges += 1 }
+        textView.onTaskCheckboxPress = { [weak textView] point in
+            guard let textView,
+                  let hit = try? bridge.macosTaskCheckboxHitTest(
+                      revision: bridge.state.revision,
+                      point: point
+                  ) else {
+                return false
+            }
+            return textView.toggleTaskPointerHit(hit)
+        }
+        let sourceBefore = bridge.source
+        precondition(textView.pressTaskCheckboxForSelfCheck(at: point))
+        precondition(documentChanges == 1)
+        precondition(bridge.state.revision == revision + 1)
+        precondition(bridge.source != sourceBefore)
+        precondition(bridge.source.contains("- [x] todo"))
+        do {
+            _ = try bridge.macosTaskCheckboxHitTest(revision: revision, point: point)
+            preconditionFailure("stale task checkbox publication was accepted")
+        } catch BridgeError.operation(let status) {
+            precondition(status == StorageStatus.staleRevision)
+        }
+        precondition(
+            !textView.pressTaskCheckboxForSelfCheck(
+                at: NSPoint(x: task.bounds.maxX + 20.0, y: task.bounds.midY)
+            )
+        )
+        print(
+            "Yu macOS task checkbox self-check: published hit, canonical toggle and stale Revision rejection are valid"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu macOS task checkbox self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func runCompositionProjectionSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -11015,6 +11222,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-lifecycl
 if let flag = CommandLine.arguments.firstIndex(of: "--macos-table-resize-coordinator-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runMacosTableResizeCoordinatorSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--macos-task-checkbox-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runMacosTaskCheckboxSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
