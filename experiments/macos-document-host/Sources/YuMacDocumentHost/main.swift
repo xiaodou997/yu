@@ -585,6 +585,9 @@ private struct NativeVisualRenderPlanSnapshot {
     let viewportHeight: CGFloat
     let maxScrollY: CGFloat
     let viewportWidth: CGFloat
+    let embeddedCommandCount: Int
+    let embeddedUploadCount: Int
+    let embeddedUploadBytes: Int
 
     init(_ value: YuStorageVisualRenderPlanSnapshot) {
         revision = value.revision
@@ -598,6 +601,9 @@ private struct NativeVisualRenderPlanSnapshot {
         viewportHeight = CGFloat(value.viewport_height)
         maxScrollY = CGFloat(value.max_scroll_y)
         viewportWidth = CGFloat(value.viewport_width)
+        embeddedCommandCount = Int(value.embedded_command_count)
+        embeddedUploadCount = Int(value.embedded_upload_count)
+        embeddedUploadBytes = Int(value.embedded_upload_bytes)
     }
 }
 
@@ -678,10 +684,13 @@ private let visualRenderCommandGlyphBit =
     UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_GLYPH)
 private let visualRenderCommandImageBit =
     UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_IMAGE)
+private let visualRenderCommandEmbeddedSvgBit =
+    UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG)
 private let supportedVisualRenderCommandMask =
     visualRenderCommandFillRectBit
         | visualRenderCommandGlyphBit
         | visualRenderCommandImageBit
+        | visualRenderCommandEmbeddedSvgBit
 
 private let supportedVisualBlockKindMask =
     (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_BLANK_LINE))
@@ -933,6 +942,10 @@ private struct NativeVisualRenderCommand {
     let bounds: CGRect
     let colorRGBA: UInt32
     let resource: UInt64
+    let embeddedGeneration: UInt64
+    let embeddedKind: UInt8
+    let embeddedWidth: Int
+    let embeddedHeight: Int
 
     init(_ value: YuStorageVisualRenderCommand) {
         revision = value.revision
@@ -961,6 +974,10 @@ private struct NativeVisualRenderCommand {
         )
         colorRGBA = value.color_rgba
         resource = value.resource
+        embeddedGeneration = value.embedded_generation
+        embeddedKind = value.embedded_kind
+        embeddedWidth = Int(value.embedded_width)
+        embeddedHeight = Int(value.embedded_height)
     }
 }
 
@@ -8261,6 +8278,12 @@ private func runVisualRenderStateSelfCheck() -> Never {
         )
     )
     precondition(
+        hasSupportedVisualRenderCommands(
+            commandCount: 1,
+            commandKindMask: visualRenderCommandEmbeddedSvgBit
+        )
+    )
+    precondition(
         !hasSupportedVisualBlockKinds(supportedVisualBlockKindMask | (UInt64(1) << 63))
     )
     precondition(
@@ -9477,12 +9500,17 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
         let expectsImage = bridge.source.contains("![")
         var previousBlock: UInt64?
         var previousSourceEnd: Int = 0
+        var previousEmbeddedBlock: UInt64?
+        var previousEmbeddedSourceEnd: Int = 0
+        var enteredEmbeddedOverlay = false
         var sawFill = false
         var sawGlyph = false
         var sawImage = false
+        var sawEmbedded = false
         let fillKind = UInt8(YU_STORAGE_RENDER_COMMAND_FILL_RECT)
         let glyphKind = UInt8(YU_STORAGE_RENDER_COMMAND_GLYPH)
         let imageKind = UInt8(YU_STORAGE_RENDER_COMMAND_IMAGE)
+        let embeddedKind = UInt8(YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG)
         for command in commands {
             precondition(command.revision == revision)
             precondition(command.bounds.origin.x.isFinite)
@@ -9506,17 +9534,47 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
                 precondition(command.atlasRect.width == 0.0 && command.atlasRect.height == 0.0)
                 precondition(command.resource != 0)
                 precondition(command.bounds.width > 0.0 && command.bounds.height > 0.0)
+            case embeddedKind:
+                sawEmbedded = true
+                precondition(command.page == YU_STORAGE_RENDER_PAGE_NONE)
+                precondition(command.atlasRect.width == 0.0 && command.atlasRect.height == 0.0)
+                precondition(command.resource != 0)
+                precondition(command.embeddedGeneration != 0)
+                precondition(
+                    command.embeddedKind == UInt8(YU_STORAGE_EMBEDDED_MATH)
+                        || command.embeddedKind == UInt8(YU_STORAGE_EMBEDDED_MERMAID)
+                )
+                precondition(command.embeddedWidth > 0 && command.embeddedHeight > 0)
+                precondition(command.bounds.width > 0.0 && command.bounds.height > 0.0)
             default:
                 preconditionFailure("unknown visual render command kind")
             }
-            if let previousBlock, command.blockIndex != previousBlock {
-                precondition(command.sourceRange.location >= previousSourceEnd)
+            if command.kind == embeddedKind {
+                enteredEmbeddedOverlay = true
+                if let previousEmbeddedBlock, command.blockIndex != previousEmbeddedBlock {
+                    precondition(command.sourceRange.location >= previousEmbeddedSourceEnd)
+                }
+                previousEmbeddedSourceEnd = max(
+                    previousEmbeddedSourceEnd,
+                    NSMaxRange(command.sourceRange)
+                )
+                if let previousEmbeddedBlock {
+                    precondition(command.blockIndex >= previousEmbeddedBlock)
+                }
+                previousEmbeddedBlock = command.blockIndex
+            } else {
+                // Embedded SVGs are a final overlay pass so they cannot be
+                // painted underneath later text from another block.
+                precondition(!enteredEmbeddedOverlay)
+                if let previousBlock, command.blockIndex != previousBlock {
+                    precondition(command.sourceRange.location >= previousSourceEnd)
+                }
+                previousSourceEnd = max(previousSourceEnd, NSMaxRange(command.sourceRange))
+                if let previousBlock {
+                    precondition(command.blockIndex >= previousBlock)
+                }
+                previousBlock = command.blockIndex
             }
-            previousSourceEnd = max(previousSourceEnd, NSMaxRange(command.sourceRange))
-            if let previousBlock {
-                precondition(command.blockIndex >= previousBlock)
-            }
-            previousBlock = command.blockIndex
             if command.page != YU_STORAGE_RENDER_PAGE_NONE {
                 precondition(Int(command.page) < pages.count)
             }
@@ -9524,6 +9582,9 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
         precondition(sawFill)
         precondition(sawGlyph)
         precondition(!expectsImage || sawImage)
+        let expectsEmbedded = bridge.source.contains("```math")
+        precondition(!expectsEmbedded || sawEmbedded)
+        precondition(!expectsEmbedded || snapshot.embeddedCommandCount > 0)
 
         precondition(pages.dropFirst().enumerated().allSatisfy { offset, page in
             page.page > pages[offset].page
@@ -10237,14 +10298,29 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
             )
             let fallbackRanges = coordinator.sourceFallbackCoverage?.ranges ?? []
             precondition(!embeddedResources.isEmpty)
-            precondition(
-                embeddedResources.allSatisfy { resource in
-                    fallbackRanges.contains {
-                        NSIntersectionRange($0, resource.sourceRange).length
-                            == resource.sourceRange.length
-                    }
+            precondition(coordinator.sourceFallbackCoverage?.complete == true)
+            for resource in embeddedResources {
+                let isFallbackCovered = fallbackRanges.contains {
+                    NSIntersectionRange($0, resource.sourceRange).length
+                        == resource.sourceRange.length
                 }
-            )
+                switch resource.kind {
+                case UInt8(YU_STORAGE_EMBEDDED_MATH):
+                    precondition(
+                        resource.resourceStatus
+                            == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_READY)
+                    )
+                    precondition(!isFallbackCovered)
+                case UInt8(YU_STORAGE_EMBEDDED_MERMAID):
+                    precondition(
+                        resource.resourceStatus
+                            == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
+                    )
+                    precondition(isFallbackCovered)
+                default:
+                    preconditionFailure("unknown embedded resource kind")
+                }
+            }
         }
 
         var asyncImageRefreshReady = false

@@ -1,4 +1,4 @@
-# Embedded resources
+# Embedded resources **粗体**
 
 ```mermaid
 flowchart TD

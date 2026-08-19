@@ -12338,7 +12338,8 @@ mod tests {
         );
         let supported_command_mask = (1_u64 << u32::from(YU_STORAGE_RENDER_COMMAND_FILL_RECT))
             | (1_u64 << u32::from(YU_STORAGE_RENDER_COMMAND_GLYPH))
-            | (1_u64 << u32::from(YU_STORAGE_RENDER_COMMAND_IMAGE));
+            | (1_u64 << u32::from(YU_STORAGE_RENDER_COMMAND_IMAGE))
+            | (1_u64 << u32::from(YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG));
         assert_eq!(first.command_kind_mask & !supported_command_mask, 0);
         let supported_block_kind_mask = (0..=YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM)
             .fold(0_u64, |mask, kind| mask | (1_u64 << u32::from(kind)));
