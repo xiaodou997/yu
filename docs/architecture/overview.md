@@ -722,8 +722,10 @@ RGBA8，再复用 `MetalImageAtlas` 与既有 image quad shader。普通图片�
 或 FFI。macOS storage FFI 默认启用受限 `yu-embedded-math::MathRenderer`，因此 `math`、
 `latex`、`tex` 和 `katex` fenced block 会进入这条真实链路；Mermaid 仍明确报告 unsupported，
 不会伪装成空白成功。native visual gate 识别 `EmbeddedSvg` command；ready 的 Math 只由
-Metal surface 绘制，unsupported 的 Mermaid 继续通过同一 Revision-bound source coverage
-保留对应 TextKit fallback range。
+Metal surface 绘制，unsupported 的 Mermaid 则由同一 retained fenced-code source projection
+显示，不再要求 TextKit 重绘 source range。pending/failed embedded publication 也保持 projected
+source 并触发有界刷新；只有 resource identity/status 无法分类时才 fail-closed 回到 TextKit。
+见 ADR 0177。
 
 Task-list projection 隐藏 parser-owned `[ ]`/`[x]` 后，`yu-workspace` 会在 marker 的 projected
 caret boundary 生成 source-backed checkbox layers。`yu-scene::TaskCheckboxPrimitive` 保留 marker
@@ -795,6 +797,9 @@ rectangle，不阻塞编辑线程。`yu-layout` 现在把每个 image 的 source
 worker/`MetalImageAtlas` publication wiring 现在由 macOS 持久 surface host 持有：host 每次 frame
 只为 CoreText 当前 viewport/overscan 的 block 轮询 worker，把同一 Revision 的 ready publication
 同步进持久 image atlas，再用带图片资源的 RenderPlan 提交；首帧或解码失败仍保留 fallback。
+这里的 fallback 由 `ImagePrimitive` 自带的 opaque placeholder 在 Metal 中绘制；pending/failed
+已知状态不再把 image source range 交回 TextKit。无稳定 fingerprint 的 unknown image 仍保留局部
+TextKit range，有 fingerprint 但无法分类的 unknown 状态则整页 fail-closed。
 `ImageCache` 有显式容量、LRU eviction 和按 Revision 绑定的失败记录，surface snapshot 同时报告
 本次可见请求、失败与 eviction 计数，以及上传的 image 数量和 atlas resource 数量，便于区分
 “命令已发布”“资源请求已排队”“解码失败”和“纹理已 ready”。ready publication 会在下一次

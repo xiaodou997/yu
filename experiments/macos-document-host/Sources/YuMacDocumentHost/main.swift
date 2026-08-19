@@ -785,37 +785,68 @@ private struct VisualSourceFallbackCoverage: Equatable {
     }
 }
 
-/// Applies the shared source-fallback policy for an embedded resource. Images
-/// and the macOS Math renderer feed the same decision; Mermaid remains an
-/// explicit unsupported resource until its renderer is implemented.
-/// Returning `false` is fail-closed: the caller must keep the whole source
-/// mirror visible because a non-zero resource identity was not classified.
-private func applyEmbeddedResourceFallback(
-    status: UInt8,
+/// Normalizes the separate image/embedded C status domains before applying a
+/// shared coverage policy. Raw numeric equality between those domains is not
+/// part of the native host contract.
+private enum RetainedResourceCoverageState {
+    case unknown
+    case pending
+    case ready
+    case failed
+    case unsupported
+    case invalid
+}
+
+private func imageResourceCoverageState(_ status: UInt8) -> RetainedResourceCoverageState {
+    switch status {
+    case UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN): return .unknown
+    case UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING): return .pending
+    case UInt8(YU_STORAGE_IMAGE_RESOURCE_READY): return .ready
+    case UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED): return .failed
+    default: return .invalid
+    }
+}
+
+private func embeddedResourceCoverageState(_ status: UInt8) -> RetainedResourceCoverageState {
+    switch status {
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNKNOWN): return .unknown
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_PENDING): return .pending
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_READY): return .ready
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_FAILED): return .failed
+    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED): return .unsupported
+    default: return .invalid
+    }
+}
+
+/// Proves whether a resource is covered by the current retained publication.
+/// Ready resources use their texture; pending/failed images use the scene's
+/// placeholder, while pending/failed/unsupported embedded blocks keep their
+/// projected source glyphs. Only an unknown resource with no stable identity
+/// needs a local TextKit range. An unclassified non-zero identity is
+/// fail-closed because it may represent a renderer state unknown to this host.
+private func applyRetainedResourceCoverage(
+    state: RetainedResourceCoverageState,
     sourceRange: NSRange,
     resourceFingerprint: UInt64,
     fallbackRanges: inout [NSRange],
     refreshNeeded: inout Bool
 ) -> Bool {
-    switch status {
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_READY):
+    switch state {
+    case .ready:
         return true
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_PENDING),
-         UInt8(YU_STORAGE_EMBEDDED_RESOURCE_FAILED):
-        fallbackRanges.append(sourceRange)
+    case .pending, .failed:
         refreshNeeded = true
         return true
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED):
-        fallbackRanges.append(sourceRange)
+    case .unsupported:
         return true
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNKNOWN):
+    case .unknown:
         if resourceFingerprint == 0 {
             fallbackRanges.append(sourceRange)
             return true
         }
         refreshNeeded = true
         return false
-    default:
+    case .invalid:
         refreshNeeded = true
         return false
     }
@@ -6367,8 +6398,8 @@ private final class MacosSurfaceHostCoordinator {
             let visibleBlockIndexes = Set(blocks.map(\.blockIndex))
             let images = try bridge.macosVisualImages(revision: revision)
             for image in images where visibleBlockIndexes.contains(image.blockIndex) {
-                guard applyEmbeddedResourceFallback(
-                    status: image.resourceStatus,
+                guard applyRetainedResourceCoverage(
+                    state: imageResourceCoverageState(image.resourceStatus),
                     sourceRange: image.sourceRange,
                     resourceFingerprint: image.resourceFingerprint,
                     fallbackRanges: &fallbackRanges,
@@ -6390,8 +6421,8 @@ private final class MacosSurfaceHostCoordinator {
                 )
                 for resource in embeddedResources
                     where visibleBlockIndexes.contains(resource.blockIndex) {
-                    guard applyEmbeddedResourceFallback(
-                        status: resource.resourceStatus,
+                    guard applyRetainedResourceCoverage(
+                        state: embeddedResourceCoverageState(resource.resourceStatus),
                         sourceRange: resource.sourceRange,
                         resourceFingerprint: resource.resourceFingerprint,
                         fallbackRanges: &fallbackRanges,
@@ -8332,8 +8363,8 @@ private func runVisualRenderStateSelfCheck() -> Never {
     var embeddedFallbackRanges: [NSRange] = []
     var embeddedRefreshNeeded = false
     precondition(
-        applyEmbeddedResourceFallback(
-            status: UInt8(YU_STORAGE_IMAGE_RESOURCE_READY),
+        applyRetainedResourceCoverage(
+            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_READY)),
             sourceRange: NSRange(location: 1, length: 2),
             resourceFingerprint: 7,
             fallbackRanges: &embeddedFallbackRanges,
@@ -8342,34 +8373,62 @@ private func runVisualRenderStateSelfCheck() -> Never {
     )
     precondition(embeddedFallbackRanges.isEmpty)
     precondition(
-        applyEmbeddedResourceFallback(
-            status: UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING),
+        applyRetainedResourceCoverage(
+            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING)),
             sourceRange: NSRange(location: 3, length: 2),
             resourceFingerprint: 7,
             fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
-    precondition(embeddedFallbackRanges == [NSRange(location: 3, length: 2)])
+    precondition(embeddedFallbackRanges.isEmpty)
     precondition(embeddedRefreshNeeded)
     precondition(
-        applyEmbeddedResourceFallback(
-            status: UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN),
+        applyRetainedResourceCoverage(
+            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED)),
+            sourceRange: NSRange(location: 3, length: 2),
+            resourceFingerprint: 7,
+            fallbackRanges: &embeddedFallbackRanges,
+            refreshNeeded: &embeddedRefreshNeeded
+        )
+    )
+    precondition(embeddedFallbackRanges.isEmpty)
+    precondition(
+        applyRetainedResourceCoverage(
+            state: embeddedResourceCoverageState(
+                UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
+            ),
+            sourceRange: NSRange(location: 4, length: 2),
+            resourceFingerprint: 11,
+            fallbackRanges: &embeddedFallbackRanges,
+            refreshNeeded: &embeddedRefreshNeeded
+        )
+    )
+    precondition(embeddedFallbackRanges.isEmpty)
+    precondition(
+        applyRetainedResourceCoverage(
+            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN)),
             sourceRange: NSRange(location: 5, length: 2),
             resourceFingerprint: 0,
             fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
-    precondition(embeddedFallbackRanges == [
-        NSRange(location: 3, length: 2),
-        NSRange(location: 5, length: 2)
-    ])
+    precondition(embeddedFallbackRanges == [NSRange(location: 5, length: 2)])
     precondition(
-        !applyEmbeddedResourceFallback(
-            status: UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN),
+        !applyRetainedResourceCoverage(
+            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN)),
             sourceRange: NSRange(location: 7, length: 2),
             resourceFingerprint: 9,
+            fallbackRanges: &embeddedFallbackRanges,
+            refreshNeeded: &embeddedRefreshNeeded
+        )
+    )
+    precondition(
+        !applyRetainedResourceCoverage(
+            state: imageResourceCoverageState(255),
+            sourceRange: NSRange(location: 9, length: 2),
+            resourceFingerprint: 13,
             fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
@@ -10561,7 +10620,7 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
                         resource.resourceStatus
                             == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
                     )
-                    precondition(isFallbackCovered)
+                    precondition(!isFallbackCovered)
                 default:
                     preconditionFailure("unknown embedded resource kind")
                 }
@@ -10570,6 +10629,8 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
 
         var asyncImageRefreshReady = false
         if bridge.source.contains("![") {
+            precondition(coordinator.sourceFallbackCoverage?.complete == true)
+            precondition(coordinator.sourceFallbackCoverage?.ranges.isEmpty == true)
             let deadline = Date(timeIntervalSinceNow: 3.0)
             while Date() < deadline {
                 RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))

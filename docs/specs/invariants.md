@@ -647,3 +647,9 @@
     batch 内只能保留一个 request，visible priority 必须排在 overscan priority 之前，同优先级按
     block index 稳定排序。surface snapshot 的 candidate/duplicate/visible/overscan/retry 计数必须
     来自同一个 plan/cache batch，不能把历史 publication 或 GPU resource 当作新 request。
+21. visual source coverage 已验证当前 Revision、command mask、block mask 与 viewport blocks 后，
+    ready resource 必须由 ready texture 覆盖；pending/failed image 必须由 retained `ImagePrimitive`
+    placeholder 覆盖；pending/failed/unsupported embedded block 必须由 retained fenced-code source
+    projection 覆盖。这些已知状态不得再添加 TextKit source fallback range。unknown 且 fingerprint
+    为零时可保留对应局部 source range；unknown 且 fingerprint 非零或未知 status 必须让 coverage
+    incomplete 并整页 fail-closed，不能把未分类状态伪装成 retained coverage。
