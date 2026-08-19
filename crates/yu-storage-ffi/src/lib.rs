@@ -714,6 +714,7 @@ pub const YU_STORAGE_RENDER_COMMAND_FILL_RECT: u8 = 0;
 pub const YU_STORAGE_RENDER_COMMAND_GLYPH: u8 = 1;
 pub const YU_STORAGE_RENDER_COMMAND_IMAGE: u8 = 2;
 pub const YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG: u8 = 3;
+pub const YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX: u8 = 4;
 pub const YU_STORAGE_RENDER_PAGE_NONE: u32 = u32::MAX;
 pub const YU_STORAGE_IMAGE_DESTINATION_NONE: u64 = u64::MAX;
 pub const YU_STORAGE_IMAGE_INLINE: u8 = 0;
@@ -7529,6 +7530,37 @@ fn macos_visual_render_plan(
             *image_count,
         ));
     }
+    for task in frame
+        .scene()
+        .scene()
+        .primitives()
+        .iter()
+        .filter_map(|primitive| match primitive {
+            Primitive::TaskCheckbox(task) => Some(*task),
+            _ => None,
+        })
+    {
+        let Some((block_index, source_range, _, _, _)) =
+            block_glyphs.iter().find(|(_, source_range, _, _, _)| {
+                source_range.start() <= task.source().start()
+                    && task.source().end() <= source_range.end()
+            })
+        else {
+            return Err(YU_STORAGE_EDITOR_ERROR);
+        };
+        block_metadata.push((
+            YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX,
+            *block_index,
+            source
+                .utf16_offset(source_range.start())
+                .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+                .get(),
+            source
+                .utf16_offset(source_range.end())
+                .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+                .get(),
+        ));
+    }
     for (block_index, source_range, _, _, _) in &block_glyphs {
         let embedded_count = embedded_publications
             .iter()
@@ -7562,7 +7594,9 @@ fn macos_visual_render_plan(
         let block_index = u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
         let encoded = match command {
             RenderCommand::FillRect { bounds, color } => {
-                if metadata_kind != YU_STORAGE_RENDER_COMMAND_FILL_RECT {
+                if metadata_kind != YU_STORAGE_RENDER_COMMAND_FILL_RECT
+                    && metadata_kind != YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX
+                {
                     return Err(YU_STORAGE_EDITOR_ERROR);
                 }
                 YuStorageVisualRenderCommand {
@@ -7570,7 +7604,7 @@ fn macos_visual_render_plan(
                     block_index,
                     source_start_utf16,
                     source_end_utf16,
-                    kind: YU_STORAGE_RENDER_COMMAND_FILL_RECT,
+                    kind: metadata_kind,
                     page: YU_STORAGE_RENDER_PAGE_NONE,
                     atlas_x: 0,
                     atlas_y: 0,
@@ -11618,7 +11652,8 @@ mod tests {
                 && command.embedded_width == 0
                 && command.embedded_height == 0
                 && match command.kind {
-                    YU_STORAGE_RENDER_COMMAND_FILL_RECT => {
+                    YU_STORAGE_RENDER_COMMAND_FILL_RECT
+                    | YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX => {
                         command.page == YU_STORAGE_RENDER_PAGE_NONE
                             && command.atlas_width == 0
                             && command.atlas_height == 0
@@ -11638,10 +11673,24 @@ mod tests {
                 .iter()
                 .any(|command| command.kind == YU_STORAGE_RENDER_COMMAND_GLYPH)
         );
-        assert!(commands.windows(2).all(|pair| {
+        assert!(commands.iter().any(|command| {
+            command.kind == YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX
+                && command.bounds_width > 0.0
+                && command.bounds_height > 0.0
+        }));
+        let task_overlay = commands
+            .iter()
+            .position(|command| command.kind == YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX)
+            .expect("task checkbox overlay");
+        assert!(commands[..task_overlay].windows(2).all(|pair| {
             pair[0].block_index <= pair[1].block_index
                 && pair[0].source_end_utf16 <= pair[1].source_end_utf16
         }));
+        assert!(
+            commands[task_overlay..]
+                .iter()
+                .all(|command| { command.kind == YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX })
+        );
         assert!(pages.windows(2).all(|pair| pair[0].page < pair[1].page));
         assert!(pages.iter().all(|page| {
             page.revision == 0 && page.width > 0 && page.height > 0 && page.fingerprint != 0

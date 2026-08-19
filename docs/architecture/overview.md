@@ -719,6 +719,12 @@ RGBA8，再复用 `MetalImageAtlas` 与既有 image quad shader。普通图片�
 Metal surface 绘制，unsupported 的 Mermaid 继续通过同一 Revision-bound source coverage
 保留对应 TextKit fallback range。
 
+Task-list projection 隐藏 parser-owned `[ ]`/`[x]` 后，`yu-workspace` 会在 marker 的 projected
+caret boundary 生成 source-backed checkbox layers。`yu-scene::TaskCheckboxPrimitive` 保留 marker
+range、几何与语义 role，`yu-render` 将各层降为既有 solid-fill command；macOS FFI 仍用独立
+task-checkbox tag 诊断 painter order。状态切换只修改 canonical Markdown，下一 Revision 自动重建
+对应 todo/done layers，Swift 不推导 task marker。见 ADR 0174。
+
 macOS storage FFI 的 `yu_storage_session_macos_visual_render_plan` 是这一链路的诊断 publication：
 Rust 使用 CoreText-shaped layout 和 `CoreTextGlyphRasterizer` 生成临时 CPU `GlyphAtlas`，然后复用
 `yu_workspace::assemble_viewport_render_frame`，把 Revision-bound fill/glyph command、page metadata

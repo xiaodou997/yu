@@ -102,6 +102,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] macOS AppKit `NSImage` 受限 SVG→RGBA8 rasterizer 接入 `MetalImageAtlas`，embedded texture 复用现有 image quad，native image kind 与普通图片隔离；rasterize/upload 失败仍保留 fallback，且有尺寸、markup 和像素内存上限
 - [x] macOS storage FFI 默认启用受限 `yu-embedded-math::MathRenderer`；Math publication 在真实 viewport 状态中为 ready，Mermaid 保持显式 unsupported，并由 Swift self-check 验证两种状态
 - [x] macOS visual render gate 接受 ready 的 `EmbeddedSvg` command；Math 不再触发整页 TextKit fallback，unsupported Mermaid 只保留对应 source range fallback，并由 render-plan/lifecycle self-check 验证
+- [x] task-list 隐藏的 `[ ]`/`[x]` marker 由 source-backed `TaskCheckboxPrimitive` 补画；todo/done 状态随 Revision 进入既有 solid/Metal pipeline，FFI 使用独立 command tag 保持诊断语义
 
 ## 约束
 

@@ -398,6 +398,67 @@ pub struct TablePrimitive {
     role: TablePrimitiveRole,
 }
 
+/// Semantic layer of a source-backed task checkbox decoration.
+///
+/// The backend currently lowers every layer to a solid rectangle. Keeping the
+/// role in the retained scene preserves enough information for diagnostics
+/// and a future vector renderer without making the renderer parse Markdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TaskCheckboxPrimitiveRole {
+    Border,
+    Interior,
+    Check,
+}
+
+/// One rectangle belonging to a projected task checkbox.
+///
+/// `source` is the parser-owned `[ ]`/`[x]` marker range. Multiple layers may
+/// refer to the same range; insertion order is their painter order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TaskCheckboxPrimitive {
+    source: TextRange,
+    bounds: Rect,
+    color: Rgba8,
+    role: TaskCheckboxPrimitiveRole,
+}
+
+impl TaskCheckboxPrimitive {
+    #[must_use]
+    pub const fn new(
+        source: TextRange,
+        bounds: Rect,
+        color: Rgba8,
+        role: TaskCheckboxPrimitiveRole,
+    ) -> Self {
+        Self {
+            source,
+            bounds,
+            color,
+            role,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> Rect {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn color(self) -> Rgba8 {
+        self.color
+    }
+
+    #[must_use]
+    pub const fn role(self) -> TaskCheckboxPrimitiveRole {
+        self.role
+    }
+}
+
 impl TablePrimitive {
     #[must_use]
     pub const fn new(
@@ -491,6 +552,7 @@ pub enum Primitive {
     Image(ImagePrimitive),
     EmbeddedSvg(EmbeddedSvgPrimitive),
     Table(TablePrimitive),
+    TaskCheckbox(TaskCheckboxPrimitive),
 }
 
 impl Primitive {
@@ -502,6 +564,7 @@ impl Primitive {
             Self::Image(image) => image.bounds(),
             Self::EmbeddedSvg(svg) => svg.bounds(),
             Self::Table(table) => table.bounds(),
+            Self::TaskCheckbox(task) => task.bounds(),
         }
     }
 }
@@ -781,6 +844,10 @@ impl SceneBuilder {
 
     pub fn embedded_svg(&mut self, svg: EmbeddedSvgPrimitive) -> Result<u32, SceneError> {
         self.push(Primitive::EmbeddedSvg(svg))
+    }
+
+    pub fn task_checkbox(&mut self, task: TaskCheckboxPrimitive) -> Result<u32, SceneError> {
+        self.push(Primitive::TaskCheckbox(task))
     }
 
     /// Appends source-backed table header, selection and grid decorations.
@@ -1478,5 +1545,37 @@ mod tests {
                 height: 320,
             })
         );
+    }
+
+    #[test]
+    fn task_checkbox_layers_keep_parser_marker_identity_and_painter_order() {
+        let revision = Revision::new(12);
+        let viewport = Rect::new(0.0, 0.0, 320.0, 200.0).expect("viewport");
+        let source = TextRange::new(ByteOffset::new(2), ByteOffset::new(5)).expect("marker");
+        let outer = TaskCheckboxPrimitive::new(
+            source,
+            Rect::new(12.0, 18.0, 14.0, 14.0).expect("outer"),
+            Rgba8::new(38, 111, 219, 255),
+            TaskCheckboxPrimitiveRole::Border,
+        );
+        let check = TaskCheckboxPrimitive::new(
+            source,
+            Rect::new(16.0, 23.0, 3.0, 3.0).expect("check"),
+            Rgba8::white(),
+            TaskCheckboxPrimitiveRole::Check,
+        );
+        let mut builder = SceneBuilder::new(revision, viewport).expect("builder");
+        builder.task_checkbox(outer).expect("outer layer");
+        builder.task_checkbox(check).expect("check layer");
+        let scene = builder.finish();
+        assert_eq!(
+            scene.primitives(),
+            &[
+                Primitive::TaskCheckbox(outer),
+                Primitive::TaskCheckbox(check),
+            ]
+        );
+        assert_eq!(outer.source(), source);
+        assert_eq!(check.role(), TaskCheckboxPrimitiveRole::Check);
     }
 }
