@@ -33,4 +33,5 @@ rectangle。缓存按 `(resource, kind)` 替换 generation；由于 shared `Rend
 这条路径让 macOS 首个真实 consumer 不需要引入 WebView、DOM 或新的 SVG/GPU renderer，并
 保持 SVG markup 不进入 Scene。AppKit SVG 支持和栅格化成本属于平台边界；其他平台可以继续
 采用自己的 consumer。当前仅保证受限 raster output，不承诺完整 SVG 动画、脚本或外部资源
-加载语义。
+加载语义。macOS storage FFI 已将受限 Math renderer 设为默认；Mermaid 在 renderer 未实现前
+仍返回 unsupported。

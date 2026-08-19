@@ -752,8 +752,8 @@ private struct VisualSourceFallbackCoverage: Equatable {
 }
 
 /// Applies the shared source-fallback policy for an embedded resource. Images
-/// use it today; Math/Mermaid renderers can feed the same decision once their
-/// resource publication state is exposed through the backend-neutral ABI.
+/// and the macOS Math renderer feed the same decision; Mermaid remains an
+/// explicit unsupported resource until its renderer is implemented.
 /// Returning `false` is fail-closed: the caller must keep the whole source
 /// mirror visible because a non-zero resource identity was not classified.
 private func applyEmbeddedResourceFallback(
@@ -9402,10 +9402,19 @@ private func runVisualEmbeddedResourceSelfCheck(path: String) -> Never {
             precondition(NSMaxRange(resource.infoRange) <= (bridge.source as NSString).length)
             precondition(NSMaxRange(resource.contentRange) <= (bridge.source as NSString).length)
             precondition(resource.resourceFingerprint != 0)
-            precondition(
-                resource.resourceStatus
-                    == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
-            )
+            if resource.kind == mathKind {
+                precondition(
+                    resource.resourceStatus
+                        == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_READY)
+                )
+            } else if resource.kind == mermaidKind {
+                precondition(
+                    resource.resourceStatus
+                        == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
+                )
+            } else {
+                preconditionFailure("unknown embedded resource kind")
+            }
         }
 
         _ = try bridge.insertText("x")
@@ -9417,7 +9426,7 @@ private func runVisualEmbeddedResourceSelfCheck(path: String) -> Never {
         }
         print(
             "Yu Visual Embedded Resource self-check: Math/Mermaid source, info/content ranges, "
-                + "unsupported status and stale Revision rejection are valid"
+                + "Math ready/Mermaid unsupported status and stale Revision rejection are valid"
         )
         exit(EXIT_SUCCESS)
     } catch {

@@ -713,7 +713,9 @@ publication。macOS backend 在 submit path 内把新的 `EmbeddedSvgUpload` 交
 RGBA8，再复用 `MetalImageAtlas` 与既有 image quad shader。普通图片和 embedded texture 使用
 独立的 native image kind，避免 fingerprint 偶然相同而采错纹理；缺少 publication、栅格化失败
 或尚未上传时仍画确定性的 fallback rectangle。AppKit/Metal object 不进入 shared scene、plan
-或 FFI。
+或 FFI。macOS storage FFI 默认启用受限 `yu-embedded-math::MathRenderer`，因此 `math`、
+`latex`、`tex` 和 `katex` fenced block 会进入这条真实链路；Mermaid 仍明确报告 unsupported，
+不会伪装成空白成功。
 
 macOS storage FFI 的 `yu_storage_session_macos_visual_render_plan` 是这一链路的诊断 publication：
 Rust 使用 CoreText-shaped layout 和 `CoreTextGlyphRasterizer` 生成临时 CPU `GlyphAtlas`，然后复用
