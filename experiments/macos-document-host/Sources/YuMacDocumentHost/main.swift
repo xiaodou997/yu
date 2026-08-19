@@ -872,6 +872,8 @@ private struct NativeMacosRenderHostSnapshot {
     let published: Bool
     let commandKindMask: UInt64
     let blockKindMask: UInt64
+    let selectionDecorationCount: Int
+    let caretDecorationCount: Int
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
         revision = value.revision
@@ -893,6 +895,8 @@ private struct NativeMacosRenderHostSnapshot {
         published = value.published != 0
         commandKindMask = value.command_kind_mask
         blockKindMask = value.block_kind_mask
+        selectionDecorationCount = Int(value.selection_decoration_count)
+        caretDecorationCount = Int(value.caret_decoration_count)
     }
 }
 
@@ -919,6 +923,8 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let submitted: Bool
     let commandKindMask: UInt64
     let blockKindMask: UInt64
+    let selectionDecorationCount: Int
+    let caretDecorationCount: Int
 
     var hasVisualContent: Bool {
         hasSupportedVisualRenderCommands(
@@ -950,6 +956,8 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
         submitted = value.submitted != 0
         commandKindMask = value.command_kind_mask
         blockKindMask = value.block_kind_mask
+        selectionDecorationCount = Int(value.selection_decoration_count)
+        caretDecorationCount = Int(value.caret_decoration_count)
     }
 }
 
@@ -5341,6 +5349,7 @@ private final class MacosVisualDecorationView: NSView {
     private(set) var selectionRects: [NSRect] = []
     private(set) var caretRect: NSRect?
     private(set) var compositionActive = false
+    private(set) var paintsDecorations = true
 
     var hasValidFrame: Bool {
         revision != nil && caretRect != nil
@@ -5354,12 +5363,15 @@ private final class MacosVisualDecorationView: NSView {
         revision: UInt64,
         selectionRects: [NSRect],
         caretRect: NSRect?,
-        compositionActive: Bool
+        compositionActive: Bool,
+        paintsDecorations: Bool = true
     ) {
         self.revision = revision
         self.selectionRects = selectionRects.filter(Self.isDrawable)
         self.caretRect = caretRect.flatMap { Self.isDrawable($0) ? $0 : nil }
         self.compositionActive = compositionActive
+        self.paintsDecorations = paintsDecorations
+        isHidden = !paintsDecorations
         needsDisplay = true
     }
 
@@ -5368,11 +5380,13 @@ private final class MacosVisualDecorationView: NSView {
         selectionRects.removeAll(keepingCapacity: true)
         caretRect = nil
         compositionActive = false
+        paintsDecorations = true
+        isHidden = false
         needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard revision != nil else { return }
+        guard revision != nil, paintsDecorations else { return }
 
         NSColor.selectedTextBackgroundColor.withAlphaComponent(0.38).setFill()
         for rect in selectionRects {
@@ -5396,6 +5410,28 @@ private final class MacosVisualDecorationView: NSView {
             && rect.width.isFinite && rect.height.isFinite
             && rect.width > 0.0 && rect.height > 0.0
     }
+}
+
+/// Proves that one submitted Rust surface contains the same transient editor
+/// decoration layers as the independently queried Rust/CoreText geometry.
+/// AppKit painting is disabled only after all publication identities and both
+/// semantic layer counts match.
+private func submittedSurfaceOwnsVisualDecorations(
+    _ snapshot: NativeMacosRenderHostSurfaceSnapshot?,
+    revision: UInt64,
+    compositionGeneration: UInt64,
+    selectionCount: Int,
+    caretPresent: Bool
+) -> Bool {
+    guard let snapshot,
+          snapshot.submitted,
+          snapshot.revision == revision,
+          snapshot.compositionGeneration == compositionGeneration,
+          snapshot.selectionDecorationCount == selectionCount,
+          snapshot.caretDecorationCount == (caretPresent ? 1 : 0) else {
+        return false
+    }
+    return true
 }
 
 /// The source TextKit mirror is still the native input/IME/Accessibility
@@ -7036,11 +7072,19 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                     width: caret.rect.width,
                     height: caret.rect.height
                 )
+                let surfaceOwnsDecorations = submittedSurfaceOwnsVisualDecorations(
+                    surfaceCoordinator.lastSnapshot,
+                    revision: snapshot.revision,
+                    compositionGeneration: snapshot.compositionGeneration,
+                    selectionCount: localSelection.count,
+                    caretPresent: caret.present
+                )
                 decorationHostView.update(
                     revision: snapshot.revision,
                     selectionRects: localSelection,
                     caretRect: localCaret,
-                    compositionActive: bridge.composition.active
+                    compositionActive: bridge.composition.active,
+                    paintsDecorations: !surfaceOwnsDecorations
                 )
                 rustDecorationFrameAccepted = true
                 syncSourceGlyphVisibility()
@@ -10437,6 +10481,26 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         precondition(first.submitted)
         precondition(first.commandKindMask != 0)
         precondition(first.blockKindMask != 0)
+        precondition(first.selectionDecorationCount == 0)
+        precondition(first.caretDecorationCount == 1)
+        precondition(
+            submittedSurfaceOwnsVisualDecorations(
+                first,
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation,
+                selectionCount: 0,
+                caretPresent: true
+            )
+        )
+        precondition(
+            !submittedSurfaceOwnsVisualDecorations(
+                first,
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation,
+                selectionCount: 1,
+                caretPresent: true
+            )
+        )
         precondition(first.hasVisualContent)
         precondition(coordinator.isAttached)
         precondition(surfaceView.nativeContentVisible)
