@@ -23,8 +23,9 @@ cache 命中后直接把 Math 状态报告为 ready，native host 可能在 Scen
 3. Upload 与 command 分离：markup 是一次性 backend upload，command 只携带小型资源
    identity、bounds、dimensions 和 fallback。这保持 command 可复制，并让后端自己决定
    何时编译、缓存和淘汰 SVG。
-4. macOS FFI 将 embedded command kind、generation、kind、dimensions 追加到 render
-   command ABI，并将 embedded command/upload count 与 markup byte count 追加到 plan
+4. `yu-workspace` 的 viewport assembly 将匹配的 publication 同时交给 Scene 和
+   RenderPlan；macOS 诊断 FFI 也沿用这一入口，追加 embedded command kind、generation、
+   kind、dimensions，并将 embedded command/upload count 与 markup byte count 追加到 plan
    snapshot。旧字段顺序不改变。
 5. 当前 Metal backend 只把 `EmbeddedSvg` 绘制为确定性的 fallback rectangle。它会
    校验几何并且不会把 SVG publication 当成已完成的可视渲染；真正的 SVG raster/vector
@@ -32,7 +33,8 @@ cache 命中后直接把 Math 状态报告为 ready，native host 可能在 Scen
 
 ## 不做什么
 
-- 不在这一阶段修改 Markdown source projection 或隐藏 fenced source。
+- 不在这一阶段修改 Markdown source projection 或隐藏 fenced source；当前 Scene primitive
+  使用透明 fallback，仍由 source glyph/host fallback 保持可见。
 - 不在 FFI cache ready 状态和真正可绘制状态之间建立隐式假设。
 - 不把 SVG markup 放进 `Scene`、`RenderCommand` 或 canonical document model。
 

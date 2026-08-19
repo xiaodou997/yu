@@ -702,7 +702,8 @@ device 或窗口依赖；`RenderUploader` 只定义未来 backend 上传 alpha p
 fill/glyph command order、atlas upload 去重和 command origin；实际 texture 生命周期和 command
 encoding 由 macOS backend 承担，不回写 shared plan。
 
-Embedded Math/Mermaid 也遵循同一条显式消费边界：`yu-scene::EmbeddedSvgPrimitive` 只携带
+Embedded Math/Mermaid 也遵循同一条显式消费边界：`yu-workspace` 的 viewport assembly 只把
+visible、Revision 匹配的 publication 同时交给 Scene 与 RenderPlan；`yu-scene::EmbeddedSvgPrimitive` 只携带
 fingerprint、generation、kind、source range、intrinsic dimensions、bounds 和 fallback，SVG
 markup 不进入 retained scene。只有 `RenderPlanBuilder::build_with_embedded` 收到同 Revision
 且 source/resource/dimensions 全部匹配的 `EmbeddedRenderPublication`，才会生成
