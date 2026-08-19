@@ -220,6 +220,18 @@ impl DocumentSession {
             .map_err(StorageError::Editor)
     }
 
+    /// Builds the selection-bound visual projection used by the native mirror
+    /// and retained renderer. It bypasses Revision-only caches so a caret move
+    /// can reveal inline syntax without mutating canonical source.
+    pub fn inline_projection_for_visual_state(&self) -> Result<Projection, StorageError> {
+        let snapshot = self.editor.snapshot();
+        let source_range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("a snapshot's full range is always ordered");
+        self.editor
+            .projection_with_selection_reveal(source_range)
+            .map_err(StorageError::Editor)
+    }
+
     /// Builds an owned metrics layout for the current full-source projection.
     ///
     /// This is intentionally a diagnostic/native bridge operation rather than
@@ -288,6 +300,35 @@ impl DocumentSession {
             .block_projection(index)
             .cloned()
             .map_err(StorageError::Editor)
+    }
+
+    pub fn block_projection_for_visual_state(
+        &self,
+        index: usize,
+    ) -> Result<BlockProjection, StorageError> {
+        if self.editor.selection_reveal_block_index() == Some(index) {
+            self.editor
+                .block_projection_with_selection_reveal(index)
+                .map_err(StorageError::Editor)
+        } else {
+            let block = self
+                .editor
+                .markdown()
+                .blocks()
+                .get(index)
+                .ok_or(StorageError::Editor(
+                    EditorDocumentError::BlockOutOfBounds {
+                        index,
+                        blocks: self.editor.markdown().blocks().len(),
+                    },
+                ))?;
+            BlockProjection::from_block_with_definitions(
+                &self.editor.snapshot(),
+                block,
+                self.editor.markdown().reference_definitions(),
+            )
+            .map_err(|error| StorageError::Editor(error.into()))
+        }
     }
 
     /// Builds an owned metrics layout for one parser-owned block. The block
@@ -702,6 +743,10 @@ impl DocumentEditorSession {
         self.document.inline_projection()
     }
 
+    pub fn inline_projection_for_visual_state(&self) -> Result<Projection, StorageError> {
+        self.document.inline_projection_for_visual_state()
+    }
+
     pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<LayoutSnapshot, StorageError> {
         self.document.inline_layout(config)
     }
@@ -722,6 +767,13 @@ impl DocumentEditorSession {
 
     pub fn block_projection(&mut self, index: usize) -> Result<BlockProjection, StorageError> {
         self.document.block_projection(index)
+    }
+
+    pub fn block_projection_for_visual_state(
+        &self,
+        index: usize,
+    ) -> Result<BlockProjection, StorageError> {
+        self.document.block_projection_for_visual_state(index)
     }
 
     pub fn block_layout(

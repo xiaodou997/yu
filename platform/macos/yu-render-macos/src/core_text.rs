@@ -227,12 +227,8 @@ impl CoreTextViewportFrameBuilder {
         &self,
         document: &mut EditorDocument,
     ) -> Result<Vec<(usize, ImageRequestPriority)>, EditorDocumentError> {
-        let snapshot = if document.composition().is_some() {
-            document
-                .visible_blocks_with_composition_and_shaper(self.config.viewport(), &self.shaper)?
-        } else {
-            document.visible_blocks_with_shaper(self.config.viewport(), &self.shaper)?
-        };
+        let snapshot = document
+            .visible_blocks_with_visual_state_and_shaper(self.config.viewport(), &self.shaper)?;
         let viewport = self.config.viewport();
         let visible_top = viewport.scroll_y();
         let visible_bottom = visible_top + viewport.height();
@@ -334,30 +330,16 @@ impl CoreTextViewportFrameBuilder {
         &mut self,
         document: &mut EditorDocument,
     ) -> Result<(), CoreTextViewportFrameError> {
-        let viewport = if document.composition().is_some() {
-            document
-                .visible_blocks_with_composition_and_shaper(self.config.viewport(), &self.shaper)?
-        } else {
-            document.visible_blocks_with_shaper(self.config.viewport(), &self.shaper)?
-        };
+        let viewport = document
+            .visible_blocks_with_visual_state_and_shaper(self.config.viewport(), &self.shaper)?;
         let layout_config = document.viewport_config().layout();
         let rasterizer = self.shaper.rasterizer();
-        let composition_blocks = document.composition_block_range();
         for block in viewport.blocks() {
-            let layout = if composition_blocks
-                .as_ref()
-                .is_some_and(|span| span.contains(&block.index()))
-            {
-                document.block_layout_with_composition_and_shaper(
-                    block.index(),
-                    layout_config,
-                    &self.shaper,
-                )?
-            } else {
-                document
-                    .block_layout_with_shaper(block.index(), layout_config, &self.shaper)?
-                    .clone()
-            };
+            let layout = document.block_layout_for_visual_state_with_shaper(
+                block.index(),
+                layout_config,
+                &self.shaper,
+            )?;
             for placement in layout.glyphs() {
                 let key = GlyphRasterKey::new(
                     placement.face(),

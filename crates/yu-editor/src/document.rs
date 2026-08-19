@@ -121,6 +121,32 @@ impl EditorDocument {
             .map_err(EditorDocumentError::Projection)
     }
 
+    /// Builds a transient full/range projection using the current source
+    /// selection as an inline-syntax reveal context. Selection changes do not
+    /// advance Revision, so this result deliberately bypasses the canonical
+    /// projection cache.
+    pub fn projection_with_selection_reveal(
+        &self,
+        range: TextRange,
+    ) -> Result<Projection, EditorDocumentError> {
+        if self.composition.is_some() {
+            return Projection::inline_with_definitions(
+                &self.snapshot(),
+                range,
+                self.markdown.reference_definitions(),
+            )
+            .map_err(EditorDocumentError::Projection);
+        }
+        let active = self.selection_reveal_range();
+        Projection::inline_with_definitions_and_reveal(
+            &self.snapshot(),
+            range,
+            self.markdown.reference_definitions(),
+            active,
+        )
+        .map_err(EditorDocumentError::Projection)
+    }
+
     #[must_use]
     pub fn projection_cache_stats(&self) -> ProjectionCacheStats {
         self.projections.stats()
@@ -147,6 +173,75 @@ impl EditorDocument {
                 self.markdown.reference_definitions(),
             )
             .map_err(EditorDocumentError::Projection)
+    }
+
+    /// Builds one selection-bound block projection without inserting it into
+    /// the Revision-only cache. Callers use this only for the focus block;
+    /// all other blocks continue to share canonical cached projections.
+    pub fn block_projection_with_selection_reveal(
+        &self,
+        index: usize,
+    ) -> Result<BlockProjection, EditorDocumentError> {
+        let block =
+            self.markdown
+                .blocks()
+                .get(index)
+                .ok_or(EditorDocumentError::BlockOutOfBounds {
+                    index,
+                    blocks: self.markdown.blocks().len(),
+                })?;
+        BlockProjection::from_block_with_definitions_and_reveal(
+            &self.snapshot(),
+            block,
+            self.markdown.reference_definitions(),
+            self.selection.ordered_range(),
+        )
+        .map_err(EditorDocumentError::Projection)
+    }
+
+    /// Returns the parser block whose inline syntax may be revealed by the
+    /// current selection focus. IME composition owns transient projection
+    /// state while active and therefore suppresses selection reveal.
+    #[must_use]
+    pub fn selection_reveal_block_index(&self) -> Option<usize> {
+        if self.composition.is_some() {
+            return None;
+        }
+        let index = self.block_index_for_source(self.selection.focus())?;
+        let block = self.markdown.blocks().get(index)?;
+        let snapshot = self.snapshot();
+        let canonical = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            block,
+            self.markdown.reference_definitions(),
+        )
+        .ok()?;
+        let revealed = BlockProjection::from_block_with_definitions_and_reveal(
+            &snapshot,
+            block,
+            self.markdown.reference_definitions(),
+            self.selection.ordered_range(),
+        )
+        .ok()?;
+        (revealed.visual().visual_len() > canonical.visual().visual_len()).then_some(index)
+    }
+
+    fn selection_reveal_range(&self) -> TextRange {
+        let selection = self.selection.ordered_range();
+        let Some(index) = self.selection_reveal_block_index() else {
+            return TextRange::empty(self.selection.focus());
+        };
+        let Some(block) = self.markdown.blocks().get(index) else {
+            return TextRange::empty(self.selection.focus());
+        };
+        if selection.is_empty() {
+            return selection;
+        }
+        TextRange::new(
+            selection.start().max(block.range().start()),
+            selection.end().min(block.range().end()),
+        )
+        .unwrap_or_else(|| TextRange::empty(self.selection.focus()))
     }
 
     /// Returns the parser-owned block containing a canonical source offset.
@@ -246,6 +341,74 @@ impl EditorDocument {
         self.layouts
             .get_or_build_block_with_shaper(&snapshot, block, config, projection, shaper)
             .map_err(EditorDocumentError::Layout)
+    }
+
+    /// Builds a transient metrics layout for the focus block's currently
+    /// revealed inline syntax.
+    pub fn block_layout_with_selection_reveal(
+        &self,
+        index: usize,
+        config: LayoutConfig,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        let projection = self.block_projection_with_selection_reveal(index)?;
+        LayoutSnapshot::from_block_projection(&projection, config)
+            .map_err(EditorDocumentError::Layout)
+    }
+
+    /// Shaping-aware selection reveal layout. The result is intentionally
+    /// transient because moving a caret does not change source Revision.
+    pub fn block_layout_with_selection_reveal_and_shaper<S: ShapingProvider>(
+        &self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        let projection = self.block_projection_with_selection_reveal(index)?;
+        LayoutSnapshot::from_block_projection_with_shaper(&projection, config, shaper)
+            .map_err(EditorDocumentError::Layout)
+    }
+
+    /// Returns an owned layout for the current transient visual state.
+    /// Composition takes priority, selection reveal applies only to its focus
+    /// block, and unaffected blocks clone the canonical cached layout.
+    pub fn block_layout_for_visual_state_with_shaper<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        if self
+            .composition_block_range()
+            .as_ref()
+            .is_some_and(|span| span.contains(&index))
+        {
+            self.block_layout_with_composition_and_shaper(index, config, shaper)
+        } else if self.selection_reveal_block_index() == Some(index) {
+            self.block_layout_with_selection_reveal_and_shaper(index, config, shaper)
+        } else {
+            self.block_layout_with_shaper(index, config, shaper)
+                .cloned()
+        }
+    }
+
+    /// Metrics counterpart of
+    /// [`Self::block_layout_for_visual_state_with_shaper`].
+    pub fn block_layout_for_visual_state(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+        if self
+            .composition_block_range()
+            .as_ref()
+            .is_some_and(|span| span.contains(&index))
+        {
+            self.block_layout_with_composition(index, config)
+        } else if self.selection_reveal_block_index() == Some(index) {
+            self.block_layout_with_selection_reveal(index, config)
+        } else {
+            self.block_layout(index, config).cloned()
+        }
     }
 
     /// Builds a transient metrics layout with a session-only table column
@@ -528,6 +691,58 @@ impl EditorDocument {
         result
     }
 
+    /// Measures the viewport using the document's complete transient visual
+    /// state. IME composition wins while active; otherwise the focus block is
+    /// measured with selection-driven inline syntax reveal.
+    pub fn visible_blocks_with_visual_state_and_shaper<S: ShapingProvider>(
+        &mut self,
+        viewport: ViewportRect,
+        shaper: &S,
+    ) -> Result<ViewportSnapshot, EditorDocumentError> {
+        self.visible_blocks_with_visual_state_and_shaper_and_image_resolver(
+            viewport,
+            shaper,
+            |_| None,
+        )
+    }
+
+    /// Image-aware variant of
+    /// [`Self::visible_blocks_with_visual_state_and_shaper`].
+    pub fn visible_blocks_with_visual_state_and_shaper_and_image_resolver<S, F>(
+        &mut self,
+        viewport: ViewportRect,
+        shaper: &S,
+        image_resolver: F,
+    ) -> Result<ViewportSnapshot, EditorDocumentError>
+    where
+        S: ShapingProvider,
+        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+    {
+        if self.composition.is_some() {
+            return self.visible_blocks_with_composition_and_shaper_and_image_resolver(
+                viewport,
+                shaper,
+                image_resolver,
+            );
+        }
+        if self.selection_reveal_block_index().is_none() {
+            return self.visible_blocks_with_shaper_and_image_resolver(
+                viewport,
+                shaper,
+                image_resolver,
+            );
+        }
+        let mut layout = std::mem::take(&mut self.viewport);
+        let result = self.measure_visible_blocks_with_selection_reveal_and_images(
+            &mut layout,
+            viewport,
+            shaper,
+            &image_resolver,
+        );
+        self.viewport = layout;
+        result
+    }
+
     /// Resolves the current focus caret into a revision-bound scroll request.
     ///
     /// The returned target is document-space `scroll_y`; the platform only
@@ -637,6 +852,65 @@ impl EditorDocument {
             .map_err(EditorDocumentError::Viewport)
     }
 
+    fn measure_visible_blocks_with_selection_reveal_and_images<S, F>(
+        &mut self,
+        layout: &mut ViewportLayout,
+        viewport: ViewportRect,
+        shaper: &S,
+        image_resolver: &F,
+    ) -> Result<ViewportSnapshot, EditorDocumentError>
+    where
+        S: ShapingProvider,
+        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+    {
+        layout
+            .set_backend(LayoutBackend::Shaped)
+            .map_err(EditorDocumentError::Viewport)?;
+        let mut range = layout
+            .visible_range(&self.markdown, viewport)
+            .map_err(EditorDocumentError::Viewport)?;
+        let config = layout.config().layout();
+        let reveal_block = self.selection_reveal_block_index();
+        for _ in 0..8 {
+            let mut changed = false;
+
+            // The focus block can sit above the visible window. Its revealed
+            // syntax may rewrap, so measure it first to keep every later block
+            // y-coordinate consistent with the retained scene.
+            if let Some(index) = reveal_block {
+                let mut block_layout =
+                    self.block_layout_with_selection_reveal_and_shaper(index, config, shaper)?;
+                apply_image_measurements(&mut block_layout, image_resolver)?;
+                changed |= layout
+                    .set_block_height(index, block_layout.block_height())
+                    .map_err(EditorDocumentError::Viewport)?;
+            }
+
+            for index in range.start()..range.end() {
+                if reveal_block == Some(index) {
+                    continue;
+                }
+                let mut block_layout = self
+                    .block_layout_with_shaper(index, config, shaper)?
+                    .clone();
+                apply_image_measurements(&mut block_layout, image_resolver)?;
+                changed |= layout
+                    .set_block_height(index, block_layout.block_height())
+                    .map_err(EditorDocumentError::Viewport)?;
+            }
+            let next = layout
+                .visible_range(&self.markdown, viewport)
+                .map_err(EditorDocumentError::Viewport)?;
+            if next == range || !changed {
+                break;
+            }
+            range = next;
+        }
+        layout
+            .snapshot(&self.markdown, range)
+            .map_err(EditorDocumentError::Viewport)
+    }
+
     fn measure_visible_blocks_with_composition_and_images<S, F>(
         &mut self,
         layout: &mut ViewportLayout,
@@ -725,7 +999,7 @@ impl EditorDocument {
         let config = layout.config().layout();
         let projection_bias = self.selection_projection_bias();
         let (caret_x, caret_y, line_count) = {
-            let block_layout = self.block_layout(block_index, config)?;
+            let block_layout = self.block_layout_for_visual_state(block_index, config)?;
             let caret = block_layout.caret_for_source(focus, projection_bias)?;
             (
                 caret.point().x(),
@@ -773,7 +1047,8 @@ impl EditorDocument {
         let config = layout.config().layout();
         let projection_bias = self.selection_projection_bias();
         let (caret_x, caret_y, line_count) = {
-            let block_layout = self.block_layout_with_shaper(block_index, config, shaper)?;
+            let block_layout =
+                self.block_layout_for_visual_state_with_shaper(block_index, config, shaper)?;
             let caret = block_layout.caret_for_source(focus, projection_bias)?;
             (
                 caret.point().x(),
@@ -1678,7 +1953,7 @@ impl EditorDocument {
     ) -> Result<CommandResult, EditorDocumentError> {
         let config = self.viewport_config().layout();
         self.move_vertical_with_loader(direction, extend, config, |document, index, config| {
-            document.block_layout(index, config).cloned()
+            document.block_layout_for_visual_state(index, config)
         })
     }
 
@@ -1700,9 +1975,7 @@ impl EditorDocument {
             VerticalDirection::Down
         };
         self.move_vertical_with_loader(direction, extend, config, |document, index, config| {
-            document
-                .block_layout_with_shaper(index, config, shaper)
-                .cloned()
+            document.block_layout_for_visual_state_with_shaper(index, config, shaper)
         })
     }
 
@@ -3289,6 +3562,80 @@ mod tests {
             ))
         ));
         assert_eq!(document.projection_cache_stats().entries(), 0);
+    }
+
+    #[test]
+    fn selection_reveal_is_transient_and_does_not_pollute_revision_caches() {
+        let source = "before **strong** after";
+        let mut document = EditorDocument::new(source);
+        let strong = source.find("strong").expect("strong content");
+        let block_index = document
+            .block_index_for_source(ByteOffset::new(strong as u64))
+            .expect("focus block");
+        let canonical_hidden = document
+            .block_projection(block_index)
+            .expect("canonical projection")
+            .visual()
+            .runs()
+            .iter()
+            .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+            .count();
+        let cached = document.projection_cache_stats();
+
+        let snapshot = document.snapshot();
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &snapshot,
+                    ByteOffset::new((strong + 2) as u64),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("selection"),
+            )
+            .expect("set selection");
+        let revealed = document
+            .block_projection_with_selection_reveal(block_index)
+            .expect("revealed projection");
+
+        assert_eq!(canonical_hidden, 2);
+        assert_eq!(
+            revealed
+                .visual()
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .count(),
+            0
+        );
+        assert_eq!(revealed.visual().visual_len().get(), source.len() as u64);
+        assert_eq!(document.revision(), Revision::new(0));
+        assert_eq!(document.projection_cache_stats(), cached);
+        assert_eq!(document.selection_reveal_block_index(), Some(block_index));
+
+        let snapshot = document.snapshot();
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &snapshot,
+                    ByteOffset::new(source.len() as u64),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("outside selection"),
+            )
+            .expect("set outside selection");
+        assert_eq!(document.selection_reveal_block_index(), None);
+        let hidden_again = document
+            .block_projection_with_selection_reveal(block_index)
+            .expect("hidden projection");
+        assert_eq!(
+            hidden_again
+                .visual()
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .count(),
+            2
+        );
     }
 
     #[test]
