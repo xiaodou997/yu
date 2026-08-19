@@ -621,6 +621,9 @@ IME、HeightIndex 或 Accessibility state。正常 publication 还把相同 geom
 snapshot 公布 selection/caret layer count；只有 Revision、composition generation 和两种 count
 都与独立 geometry query 一致时，sibling 才关闭 AppKit 绘制。Rust composition geometry 失效、
 frame stale、surface detach、native submit 失败或 count 不一致时，sibling 继续作为 AppKit fallback。
+由于 selection/caret movement 不推进 source Revision，native caret-change 会先撤销 current surface
+snapshot 与 submit dedup key、恢复 TextKit fallback，再合并调度同 Revision 的新 retained frame；
+相同 layer count 不能让旧位置继续被接受。
 TextKit visual mirror 只作为 active composition 的最后失败回退，完整 visual renderer 仍未迁移。
 见 ADR 0136、0137、0153、0176。
 

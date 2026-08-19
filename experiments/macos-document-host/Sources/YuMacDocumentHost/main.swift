@@ -5824,6 +5824,16 @@ private final class MacosSurfaceHostCoordinator {
         }
     }
 
+    /// Selection/caret movement does not advance the canonical source
+    /// Revision, but it does change retained editor-decoration geometry.
+    /// Revoke the current visual publication before scheduling its replacement
+    /// so equal primitive counts cannot make an old caret look current.
+    func invalidateEditorDecorationPublication() {
+        lastSubmitKey = nil
+        lastSnapshot = nil
+        sourceFallbackCoverage = nil
+    }
+
     private func cancelImageResourceRefresh() {
         imageRefreshTask?.cancel()
         imageRefreshTask = nil
@@ -6678,7 +6688,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             self?.surfaceCoordinator.prepareForEditorCommand()
         }
         textView.onCaretChange = { [weak self] in
-            self?.updateVisualDecorations()
+            guard let self else { return }
+            self.surfaceCoordinator.invalidateEditorDecorationPublication()
+            self.clearVisualDecorations(reason: .waitingForSurface)
+            self.scheduleVisualSubmit()
             // AppKit may deliver selection changes while TextKit is still
             // inside its event callback. Defer the scroll mutation until the
             // same main-thread turn has finished, while retaining the Rust
@@ -10511,6 +10524,18 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
                 compositionGeneration: bridge.composition.generation
             )
         )
+        coordinator.invalidateEditorDecorationPublication()
+        precondition(coordinator.lastSnapshot == nil)
+        precondition(
+            !coordinator.hasCurrentPublication(
+                revision: bridge.state.revision,
+                compositionGeneration: bridge.composition.generation
+            )
+        )
+        let selectionOnlyRefresh = try unwrapSelfCheck(coordinator.submitNow())
+        precondition(selectionOnlyRefresh.revision == first.revision)
+        precondition(selectionOnlyRefresh.frameSerial > first.frameSerial)
+        precondition(selectionOnlyRefresh.caretDecorationCount == 1)
 
         if bridge.source.contains("```mermaid") || bridge.source.contains("```math") {
             let embeddedResources = try bridge.macosVisualEmbeddedResources(

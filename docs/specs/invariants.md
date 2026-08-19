@@ -559,7 +559,9 @@
     surface snapshot 必须公布同一 frame 的 selection/caret primitive count；Swift 只有在 Revision、
     composition generation 和两个 count 都与独立 Rust decoration geometry 一致时，才可关闭
     `MacosVisualDecorationView` 的 AppKit paint。count 不匹配必须保留 fallback，不得根据颜色或矩形
-    形状推断 primitive 语义。
+    形状推断 primitive 语义。selection/caret-only 变化不会推进 source Revision，因此 native
+    `onCaretChange` 必须先撤销 last surface snapshot/submit key 并恢复 TextKit fallback，再调度同
+    Revision 的新 retained publication；不得让相同 primitive count 复用旧位置。
 
 ## CoreText viewport preparation
 

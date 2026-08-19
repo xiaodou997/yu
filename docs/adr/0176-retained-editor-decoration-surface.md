@@ -30,7 +30,11 @@ canonical source Revision.
    counts. Swift disables `MacosVisualDecorationView` painting only when the
    submitted surface has the current Revision and composition generation and
    its counts equal the independently queried Rust decoration geometry.
-6. A missing, stale or count-mismatched surface keeps AppKit decoration
+6. Selection/caret movement does not advance source Revision. Every native
+   caret-change event therefore revokes the current surface snapshot and
+   submit deduplication key, restores TextKit fallback, and coalesces a new
+   retained publication before Metal decorations can be accepted again.
+7. A missing, stale or count-mismatched surface keeps AppKit decoration
    painting enabled. TextKit continues to own source, selection, input, IME and
    Accessibility throughout this migration.
 
