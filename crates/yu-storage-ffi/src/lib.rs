@@ -39,7 +39,9 @@ use yu_text::{EditError, TextSnapshot};
 #[cfg(target_os = "macos")]
 use yu_render::{RenderCommand, RenderPlanBuilder};
 #[cfg(target_os = "macos")]
-use yu_scene::{Primitive, Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput};
+use yu_scene::{
+    Point, Primitive, Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput,
+};
 #[cfg(target_os = "macos")]
 use yu_workspace::{
     ViewportRenderConfig, assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded,
@@ -466,6 +468,22 @@ pub struct YuStorageTableCellHit {
     pub column: u64,
     pub source_start_utf16: u64,
     pub source_end_utf16: u64,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// One task checkbox hit from the currently published macOS retained frame.
+/// The marker range is the parser-owned `[ ]`/`[x]` source, while the bounds
+/// remain in document-space scene coordinates.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageTaskCheckboxHit {
+    pub revision: u64,
+    pub block_index: u64,
+    pub marker_start_utf16: u64,
+    pub marker_end_utf16: u64,
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -5178,6 +5196,97 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_hit_test(
         };
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = metadata };
+    YU_STORAGE_OK
+}
+
+/// Resolves a document-space point against task checkbox geometry from the
+/// current persistent macOS render-host publication. This function never
+/// reparses Markdown, rebuilds layout or mutates the editor. A native caller
+/// may pass the returned block to the existing `ToggleTask` command only while
+/// the returned Revision is still current.
+///
+/// # Safety
+/// `session` must be a live handle and `output` must be writable.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_task_checkbox_hit_test(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    point_x: f32,
+    point_y: f32,
+    output: *mut YuStorageTaskCheckboxHit,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageTaskCheckboxHit::default() };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    if !point_x.is_finite() || !point_y.is_finite() {
+        return YU_STORAGE_EDITOR_ERROR;
+    }
+    if session.session.composition().is_some() {
+        return YU_STORAGE_INVALID_STATE;
+    }
+
+    let hit = {
+        let state = match session.macos_render_host.as_ref() {
+            Some(state) => state,
+            None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+        };
+        let publication = match state.builder.last_publication() {
+            Some(publication) => publication,
+            None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+        };
+        if publication.revision().get() != expected_revision
+            || state.host.frame_revision() != Some(publication.revision())
+            || state.host.frame_serial() != Some(publication.serial())
+        {
+            return YU_STORAGE_STALE_REVISION;
+        }
+        match publication
+            .frame()
+            .scene()
+            .task_checkbox_hit_test(publication.revision(), Point::new(point_x, point_y))
+        {
+            Ok(Some(hit)) => hit,
+            Ok(None) => return YU_STORAGE_INVALID_SELECTION,
+            Err(_) => return YU_STORAGE_STALE_REVISION,
+        }
+    };
+
+    let source = session.session.snapshot();
+    let marker_start_utf16 = match source.utf16_offset(hit.source().start()) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let marker_end_utf16 = match source.utf16_offset(hit.source().end()) {
+        Ok(offset) => offset.get(),
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let block_index = match u64::try_from(hit.block_index()) {
+        Ok(index) => index,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let bounds = hit.bounds();
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe {
+        *output = YuStorageTaskCheckboxHit {
+            revision: hit.revision().get(),
+            block_index,
+            marker_start_utf16,
+            marker_end_utf16,
+            x: bounds.x(),
+            y: bounds.y(),
+            width: bounds.width(),
+            height: bounds.height(),
+        };
+    }
     YU_STORAGE_OK
 }
 
@@ -11981,6 +12090,177 @@ mod tests {
         assert_eq!(written_commands, 0);
         assert_eq!(written_pages, 0);
         assert_eq!(written_damage, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_task_checkbox_hit_uses_current_published_frame_and_canonical_command() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-task-hit-{id}.md"));
+        let source = "- [ ] todo\nparagraph\n- [x] done\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut frame = YuStorageMacosRenderHostSnapshot::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_render_host_frame(
+                    raw, 0, 14.0, 500.0, 0.0, 240.0, 0, &mut frame,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let checkbox = {
+            let state = unsafe { raw.as_ref() }.expect("session");
+            state
+                .macos_render_host
+                .as_ref()
+                .and_then(|host| host.builder.last_publication())
+                .and_then(|publication| {
+                    publication
+                        .frame()
+                        .scene()
+                        .scene()
+                        .primitives()
+                        .iter()
+                        .find_map(|primitive| match primitive {
+                            Primitive::TaskCheckbox(task)
+                                if task.role() == yu_scene::TaskCheckboxPrimitiveRole::Border =>
+                            {
+                                Some(*task)
+                            }
+                            _ => None,
+                        })
+                })
+                .expect("published task checkbox")
+        };
+        let bounds = checkbox.bounds();
+        let point_x = bounds.x() + bounds.width() * 0.5;
+        let point_y = bounds.y() + bounds.height() * 0.5;
+        let mut hit = YuStorageTaskCheckboxHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(hit.revision, 0);
+        assert_eq!(hit.block_index, 0);
+        assert_eq!((hit.marker_start_utf16, hit.marker_end_utf16), (2, 5));
+        assert_eq!(
+            (hit.x, hit.y, hit.width, hit.height),
+            (bounds.x(), bounds.y(), bounds.width(), bounds.height())
+        );
+        let hit_block = hit.block_index;
+
+        let mut outside = YuStorageTaskCheckboxHit {
+            revision: 99,
+            ..YuStorageTaskCheckboxHit::default()
+        };
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_task_checkbox_hit_test(
+                    raw,
+                    0,
+                    bounds.right() + 2.0,
+                    point_y,
+                    &mut outside,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(outside, YuStorageTaskCheckboxHit::default());
+
+        assert_eq!(
+            unsafe { yu_storage_session_begin_composition(raw, 0, 6, 6, b"n".as_ptr(), 1, 1, 1) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
+            },
+            YU_STORAGE_INVALID_STATE
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_cancel_composition(raw, 0, 1) },
+            YU_STORAGE_OK
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_execute_command(
+                    raw,
+                    YU_STORAGE_COMMAND_TOGGLE_TASK,
+                    hit_block,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(result.changed != 0);
+        assert_eq!(result.revision, 1);
+        assert!(
+            unsafe { raw.as_ref() }
+                .expect("session")
+                .session
+                .snapshot()
+                .as_str()
+                .starts_with("- [x] todo")
+        );
+
+        hit = YuStorageTaskCheckboxHit {
+            revision: 99,
+            ..YuStorageTaskCheckboxHit::default()
+        };
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(hit, YuStorageTaskCheckboxHit::default());
+
+        let mut undo = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_execute_command(raw, YU_STORAGE_COMMAND_UNDO, 0, &mut undo)
+            },
+            YU_STORAGE_OK
+        );
+        assert!(undo.changed != 0);
+        assert_eq!(undo.revision, 2);
+        assert!(
+            unsafe { raw.as_ref() }
+                .expect("session")
+                .session
+                .snapshot()
+                .as_str()
+                .starts_with("- [ ] todo")
+        );
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

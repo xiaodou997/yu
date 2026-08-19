@@ -302,8 +302,8 @@ body 中的 Markdown delimiter 当作 emphasis。
 task-list block 返回 `BlockProjection::TaskList`，只隐藏 parser-owned `TaskMarker` 的 `[ ]`/
 `[x]`/`[X]` source range，列表 bullet 和任务文本仍可通过 source/visual mapping 定位。当前
 `EditorCommand::toggle_task` 将状态字节替换为普通 Transaction；因此 source Revision、Undo 和
-projection/layout cache 失效与其他永久编辑一致，checkbox 的原生绘制和鼠标 overlay 留到 GUI
-阶段。
+projection/layout cache 失效与其他永久编辑一致。macOS 原生绘制和 pointer hit 已接入 retained
+scene publication；其他平台可复用相同 source-backed scene contract。
 
 heading、blockquote 和普通 list 现在也由 parser 统一标记为 `Heading`、`BlockQuote`、`List`
 projection kind。heading 的 ATX 前缀与 blockquote 每行的 `>` 前缀由
@@ -724,6 +724,11 @@ caret boundary 生成 source-backed checkbox layers。`yu-scene::TaskCheckboxPri
 range、几何与语义 role，`yu-render` 将各层降为既有 solid-fill command；macOS FFI 仍用独立
 task-checkbox tag 诊断 painter order。状态切换只修改 canonical Markdown，下一 Revision 自动重建
 对应 todo/done layers，Swift 不推导 task marker。见 ADR 0174。
+
+任务框鼠标交互直接查询 persistent render host 当前 publication 中的 border primitive；命中结果
+绑定 Revision、parser block 与精确 marker range，随后复用 `ToggleTask` command。Swift 不推导几何、
+不解析 Markdown，旧 frame、IME composition 和框外点击都回退 TextKit 的普通选择路径。见
+ADR 0175。
 
 macOS storage FFI 的 `yu_storage_session_macos_visual_render_plan` 是这一链路的诊断 publication：
 Rust 使用 CoreText-shaped layout 和 `CoreTextGlyphRasterizer` 生成临时 CPU `GlyphAtlas`，然后复用
