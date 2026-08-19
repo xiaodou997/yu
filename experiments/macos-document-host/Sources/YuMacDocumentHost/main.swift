@@ -741,6 +741,22 @@ private func hasSupportedVisualBlockKinds(_ blockKindMask: UInt64) -> Bool {
         && (blockKindMask & ~supportedVisualBlockKindMask) == 0
 }
 
+private func hasCompleteRetainedBlockCoverage(
+    blockKindMask: UInt64,
+    publishedBlockKindMask: UInt64,
+    blockCount: Int,
+    canonicalSourceIsEmpty: Bool,
+    compositionActive: Bool
+) -> Bool {
+    guard blockKindMask == publishedBlockKindMask else { return false }
+    if blockCount == 0 {
+        return blockKindMask == 0
+            && canonicalSourceIsEmpty
+            && !compositionActive
+    }
+    return hasSupportedVisualBlockKinds(blockKindMask)
+}
+
 private func visualBlockKindBit(_ kind: UInt8) -> UInt64 {
     kind < 63 ? (UInt64(1) << UInt64(kind)) : (UInt64(1) << 63)
 }
@@ -6282,8 +6298,13 @@ private final class MacosSurfaceHostCoordinator {
                 let bit = visualBlockKindBit(block.kind)
                 blockKindMask |= bit
             }
-            guard blockKindMask == snapshot.blockKindMask,
-                  hasSupportedVisualBlockKinds(blockKindMask) else {
+            guard hasCompleteRetainedBlockCoverage(
+                blockKindMask: blockKindMask,
+                publishedBlockKindMask: snapshot.blockKindMask,
+                blockCount: blocks.count,
+                canonicalSourceIsEmpty: bridge.source.isEmpty,
+                compositionActive: bridge.composition.active
+            ) else {
                 retainedCoverage = VisualRetainedCoverage(
                     revision: revision,
                     complete: false
@@ -8395,6 +8416,42 @@ private func runVisualRenderStateSelfCheck() -> Never {
         !hasSupportedVisualBlockKinds(supportedVisualBlockKindMask | (UInt64(1) << 63))
     )
     precondition(
+        hasCompleteRetainedBlockCoverage(
+            blockKindMask: 0,
+            publishedBlockKindMask: 0,
+            blockCount: 0,
+            canonicalSourceIsEmpty: true,
+            compositionActive: false
+        )
+    )
+    precondition(
+        !hasCompleteRetainedBlockCoverage(
+            blockKindMask: 0,
+            publishedBlockKindMask: 0,
+            blockCount: 0,
+            canonicalSourceIsEmpty: true,
+            compositionActive: true
+        )
+    )
+    precondition(
+        !hasCompleteRetainedBlockCoverage(
+            blockKindMask: 0,
+            publishedBlockKindMask: 0,
+            blockCount: 0,
+            canonicalSourceIsEmpty: false,
+            compositionActive: false
+        )
+    )
+    precondition(
+        hasCompleteRetainedBlockCoverage(
+            blockKindMask: supportedVisualBlockKindMask,
+            publishedBlockKindMask: supportedVisualBlockKindMask,
+            blockCount: 1,
+            canonicalSourceIsEmpty: false,
+            compositionActive: false
+        )
+    )
+    precondition(
         acceptedVisualRenderFrame(
             revision: 7,
             compositionGeneration: 3,
@@ -10419,7 +10476,11 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         precondition(first.surfaceGeneration == 0)
         precondition(first.submitted)
         precondition(first.commandKindMask != 0)
-        precondition(first.blockKindMask != 0)
+        if bridge.source.isEmpty {
+            precondition(first.blockKindMask == 0)
+        } else {
+            precondition(first.blockKindMask != 0)
+        }
         precondition(first.selectionDecorationCount == 0)
         precondition(first.caretDecorationCount == 1)
         precondition(

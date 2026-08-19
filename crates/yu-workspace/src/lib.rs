@@ -203,6 +203,24 @@ fn append_editor_decorations(
         document.block_index_for_source(selection.focus())
     };
 
+    // An empty canonical document intentionally has no Markdown block or text
+    // layout. Publish its insertion point directly so the retained frame can
+    // still own the visible editor instead of requiring a TextKit glyph pass.
+    if input.blocks().is_empty() && document.snapshot().is_empty() && composition.is_none() {
+        builder.editor_decoration(EditorDecorationPrimitive::new(
+            TextRange::empty(selection.focus()),
+            Rect::new(
+                0.0,
+                0.0,
+                style.caret_width,
+                document.viewport_config().layout().line_height(),
+            )?,
+            style.caret,
+            EditorDecorationPrimitiveRole::Caret,
+        ))?;
+        return Ok(());
+    }
+
     let mut caret = None;
     for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
         let (visual_start, visual_end, layer_source) = if let Some(overlay) = composition {
@@ -1168,10 +1186,18 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
             )
         })
         .collect::<Result<Vec<_>, SceneError>>()?;
+    let content_height = if viewport_snapshot.blocks().is_empty()
+        && source.is_empty()
+        && document.composition().is_none()
+    {
+        config.line_height()
+    } else {
+        viewport_snapshot.content_height()
+    };
     let input = ViewportSceneInput::new(
         revision,
         viewport_snapshot.range().start()..viewport_snapshot.range().end(),
-        viewport_snapshot.content_height(),
+        content_height,
         geometries,
     )?;
 
@@ -1530,6 +1556,141 @@ mod tests {
                 .iter()
                 .all(|primitive| matches!(primitive, Primitive::Glyph(_)))
         );
+    }
+
+    #[test]
+    fn empty_document_publishes_one_line_retained_caret_frame() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let mut document = EditorDocument::new("");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        ));
+        let mut plans = RenderPlanBuilder::new();
+        let frame =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("empty retained frame");
+
+        assert!(frame.scene().input().blocks().is_empty());
+        assert_eq!(frame.scene().input().content_height(), 20.0);
+        let primitives = frame.scene().scene().primitives();
+        assert_eq!(primitives.len(), 1);
+        let Primitive::EditorDecoration(caret) = primitives[0] else {
+            panic!("empty scene must contain only its caret");
+        };
+        assert_eq!(caret.role(), EditorDecorationPrimitiveRole::Caret);
+        assert_eq!(caret.source(), TextRange::empty(ByteOffset::new(0)));
+        assert_eq!(
+            caret.bounds(),
+            Rect::new(0.0, 0.0, 1.0, 20.0).expect("empty caret bounds")
+        );
+        assert!(matches!(
+            frame.plan().commands(),
+            [yu_render::RenderCommand::FillRect { .. }]
+        ));
+    }
+
+    #[test]
+    fn whitespace_document_keeps_a_submittable_retained_caret_frame() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let mut document = EditorDocument::new("   \n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        ));
+        let mut plans = RenderPlanBuilder::new();
+        let frame =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("whitespace retained frame");
+
+        assert!(frame.scene().input().content_height() >= 20.0);
+        assert!(!frame.plan().commands().is_empty());
+        assert!(frame.scene().scene().primitives().iter().any(|primitive| {
+            matches!(
+                primitive,
+                Primitive::EditorDecoration(decoration)
+                    if decoration.role() == EditorDecorationPrimitiveRole::Caret
+            )
+        }));
+    }
+
+    #[test]
+    fn empty_document_composition_does_not_hide_unprojected_preedit() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let mut document = EditorDocument::new("");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        document
+            .begin_composition(
+                TextRange::empty(ByteOffset::new(0)),
+                "日",
+                Utf16Range::new(Utf16Offset::new(0), Utf16Offset::new(1))
+                    .expect("preedit selection"),
+            )
+            .expect("begin composition");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        ));
+        let mut plans = RenderPlanBuilder::new();
+        let frame =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("composition fallback frame");
+
+        assert!(frame.plan().commands().is_empty());
+        assert!(frame.scene().scene().primitives().is_empty());
     }
 
     #[test]
