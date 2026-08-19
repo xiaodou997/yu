@@ -52,14 +52,17 @@ use yu_assets::{
     EmbeddedRequestResult, EmbeddedResourceCache, EmbeddedResourceKind, ImageCache,
     ImageFailureKind, ImageIntrinsicPublication, ImagePublication, ImageRequest,
     ImageRequestCandidate, ImageRequestPlan, ImageRequestPriority, ImageRequestResult,
-    UnsupportedEmbeddedRenderer,
 };
+#[cfg(target_os = "macos")]
+use yu_embedded_math::MathRenderer;
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
 #[cfg(target_os = "macos")]
 use yu_font::{GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer};
 #[cfg(target_os = "macos")]
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
+#[cfg(all(target_os = "macos", test))]
+use yu_render_macos::MacosEmbeddedSvgRasterizer;
 #[cfg(target_os = "macos")]
 use yu_render_macos::{
     CoreTextViewportFrameBuilder, CoreTextViewportFrameError, MacosImageDecodeError,
@@ -1097,7 +1100,7 @@ impl MacosEmbeddedResourceState {
     fn new() -> Self {
         Self {
             cache: EmbeddedResourceCache::new(),
-            renderer: Box::new(UnsupportedEmbeddedRenderer),
+            renderer: Box::new(MathRenderer::default()),
         }
     }
 
@@ -9190,7 +9193,7 @@ mod tests {
         assert_eq!(required, 2);
         assert_eq!(
             unsafe { (*raw).macos_embedded_resources.cache.failure_count() },
-            2
+            1
         );
         let mut resources = vec![YuStorageVisualEmbeddedResource::default(); required];
         let mut written = 0;
@@ -9215,9 +9218,14 @@ mod tests {
                 .iter()
                 .all(|resource| resource.resource_fingerprint != 0)
         );
-        assert!(resources.iter().all(|resource| {
-            resource.resource_status == YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
-        }));
+        assert_eq!(
+            resources[0].resource_status,
+            YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
+        );
+        assert_eq!(
+            resources[1].resource_status,
+            YU_STORAGE_EMBEDDED_RESOURCE_READY
+        );
         let mermaid_source = source.find("```mermaid").expect("mermaid source");
         let mermaid_end = source[mermaid_source..]
             .find("```\n\n")
@@ -9256,7 +9264,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn ffi_visual_embedded_resources_keep_empty_body_on_unsupported_path() {
+    fn ffi_visual_embedded_resources_keep_empty_body_on_failed_path() {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-empty-embedded-{id}.md"));
         let source = "```math\n```\n";
@@ -9298,7 +9306,7 @@ mod tests {
         assert_eq!(written, 1);
         assert_eq!(
             resource.resource_status,
-            YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
+            YU_STORAGE_EMBEDDED_RESOURCE_FAILED
         );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
@@ -9306,11 +9314,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_embedded_state_accepts_native_math_renderer_publication() {
-        let mut state = MacosEmbeddedResourceState {
-            cache: EmbeddedResourceCache::new(),
-            renderer: Box::new(yu_embedded_math::MathRenderer::default()),
-        };
+    fn macos_embedded_state_defaults_to_math_and_keeps_mermaid_unsupported() {
+        let mut state = MacosEmbeddedResourceState::new();
         let request = EmbeddedRenderRequest::new(
             Revision::INITIAL,
             TextRange::new(ByteOffset::ZERO, ByteOffset::new(3)).expect("range"),
@@ -9320,9 +9325,37 @@ mod tests {
         .expect("request");
         assert_eq!(
             state
-                .status_for(request, Revision::INITIAL)
+                .status_for(request.clone(), Revision::INITIAL)
                 .expect("status"),
             YU_STORAGE_EMBEDDED_RESOURCE_READY
+        );
+        let publication = state
+            .publication_for(request, Revision::INITIAL)
+            .expect("publication")
+            .expect("ready math publication");
+        let yu_assets::EmbeddedRenderPayload::Svg { dimensions, markup } = publication.payload()
+        else {
+            panic!("Math renderer must publish SVG");
+        };
+        let image = MacosEmbeddedSvgRasterizer::new()
+            .rasterize(markup, dimensions.width(), dimensions.height())
+            .expect("AppKit must rasterize the default Math SVG");
+        assert_eq!(
+            (image.width(), image.height()),
+            (dimensions.width(), dimensions.height())
+        );
+        let mermaid = EmbeddedRenderRequest::new(
+            Revision::INITIAL,
+            TextRange::new(ByteOffset::new(4), ByteOffset::new(12)).expect("range"),
+            EmbeddedResourceKind::Mermaid,
+            "flowchart TD",
+        )
+        .expect("request");
+        assert_eq!(
+            state
+                .status_for(mermaid, Revision::INITIAL)
+                .expect("status"),
+            YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
         );
     }
 
@@ -9353,10 +9386,6 @@ mod tests {
             },
             YU_STORAGE_OK
         );
-        unsafe {
-            (*raw).macos_embedded_resources.renderer =
-                Box::new(yu_embedded_math::MathRenderer::default());
-        }
         let (snapshot, commands, _, _) = macos_visual_render_plan(
             unsafe { raw.as_mut() }.expect("session"),
             0,
