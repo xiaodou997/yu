@@ -745,44 +745,13 @@ private func visualBlockKindBit(_ kind: UInt8) -> UInt64 {
     kind < 63 ? (UInt64(1) << UInt64(kind)) : (UInt64(1) << 63)
 }
 
-private func mergeSourceRanges(_ ranges: [NSRange]) -> [NSRange] {
-    let sorted = ranges
-        .filter { $0.location >= 0 && $0.length > 0 }
-        .sorted {
-            if $0.location == $1.location { return $0.length < $1.length }
-            return $0.location < $1.location
-        }
-    var merged: [NSRange] = []
-    for range in sorted {
-        guard range.location <= Int.max - range.length else { continue }
-        if let last = merged.last,
-           NSMaxRange(last) >= range.location {
-            merged[merged.count - 1] = NSRange(
-                location: last.location,
-                length: max(NSMaxRange(last), NSMaxRange(range)) - last.location
-            )
-        } else {
-            merged.append(range)
-        }
-    }
-    return merged
-}
-
-/// Describes the source ranges that must remain painted by TextKit while the
-/// rest of the current Rust publication is visible in the Metal surface.
-/// `complete == false` is fail-closed: the controller must keep the complete
-/// source mirror visible until it can prove the range list covers the same
-/// Revision-bound viewport as the publication.
-private struct VisualSourceFallbackCoverage: Equatable {
+/// Proves that one retained publication covers every visible block and
+/// resource for the same Revision. Coverage is deliberately all-or-nothing:
+/// an incomplete result keeps the complete source mirror visible instead of
+/// mixing TextKit glyphs into an otherwise accepted Metal frame.
+private struct VisualRetainedCoverage: Equatable {
     let revision: UInt64
-    let ranges: [NSRange]
     let complete: Bool
-
-    init(revision: UInt64, ranges: [NSRange], complete: Bool) {
-        self.revision = revision
-        self.ranges = mergeSourceRanges(ranges)
-        self.complete = complete
-    }
 }
 
 /// Normalizes the separate image/embedded C status domains before applying a
@@ -821,14 +790,13 @@ private func embeddedResourceCoverageState(_ status: UInt8) -> RetainedResourceC
 /// Proves whether a resource is covered by the current retained publication.
 /// Ready resources use their texture; pending/failed images use the scene's
 /// placeholder, while pending/failed/unsupported embedded blocks keep their
-/// projected source glyphs. Only an unknown resource with no stable identity
-/// needs a local TextKit range. An unclassified non-zero identity is
-/// fail-closed because it may represent a renderer state unknown to this host.
+/// projected source glyphs. An unknown image with no stable identity also
+/// keeps the retained projected alt label. An unclassified non-zero identity
+/// is fail-closed because it may represent a renderer state unknown to this
+/// host.
 private func applyRetainedResourceCoverage(
     state: RetainedResourceCoverageState,
-    sourceRange: NSRange,
     resourceFingerprint: UInt64,
-    fallbackRanges: inout [NSRange],
     refreshNeeded: inout Bool
 ) -> Bool {
     switch state {
@@ -841,7 +809,6 @@ private func applyRetainedResourceCoverage(
         return true
     case .unknown:
         if resourceFingerprint == 0 {
-            fallbackRanges.append(sourceRange)
             return true
         }
         refreshNeeded = true
@@ -3645,7 +3612,6 @@ private final class DocumentTextView: NSTextView {
         case sourceFallback
         case projectedTextKitOverlay
         case rustSurface
-        case rustSurfaceWithSourceFallback
     }
 
     private let bridge: StorageBridge
@@ -3668,7 +3634,6 @@ private final class DocumentTextView: NSTextView {
     private var visualSelectionAnchor: Int?
     private var sourceSelectedTextAttributes: [NSAttributedString.Key: Any]?
     private var presentationRole: PresentationRole = .sourceFallback
-    private var sourceFallbackRanges: [NSRange] = []
     private var externalVisualDecorationsEnabled = false
     private var sourceGlyphsHidden = false
     private var tableResizeTrackingArea: NSTrackingArea?
@@ -3838,22 +3803,15 @@ private final class DocumentTextView: NSTextView {
     /// Rust surface coordinator owns the authoritative frame check; this view
     /// only changes which pixels TextKit is allowed to contribute.
     func useSourceFallbackPresentation() {
-        setSourceFallbackRanges([])
         setPresentationRole(.sourceFallback)
     }
 
     func useProjectedTextKitOverlayPresentation() {
-        setSourceFallbackRanges([])
         setPresentationRole(.projectedTextKitOverlay)
     }
 
-    func useRustSurfacePresentation(sourceFallbackRanges: [NSRange] = []) {
-        setSourceFallbackRanges(sourceFallbackRanges)
-        setPresentationRole(
-            sourceFallbackRanges.isEmpty
-                ? .rustSurface
-                : .rustSurfaceWithSourceFallback
-        )
+    func useRustSurfacePresentation() {
+        setPresentationRole(.rustSurface)
     }
 
     var sourceGlyphsHiddenForSelfCheck: Bool {
@@ -3865,31 +3823,7 @@ private final class DocumentTextView: NSTextView {
         case .sourceFallback: return "sourceFallback"
         case .projectedTextKitOverlay: return "projectedTextKitOverlay"
         case .rustSurface: return "rustSurface"
-        case .rustSurfaceWithSourceFallback: return "rustSurfaceWithSourceFallback"
         }
-    }
-
-    var sourceFallbackRangesForSelfCheck: [NSRange] {
-        sourceFallbackRanges
-    }
-
-    private func setSourceFallbackRanges(_ ranges: [NSRange]) {
-        let sourceLength = (string as NSString).length
-        let bounded = ranges.compactMap { range -> NSRange? in
-            guard range.location >= 0,
-                  range.length > 0,
-                  range.location < sourceLength else {
-                return nil
-            }
-            let length = min(range.length, sourceLength - range.location)
-            return length > 0
-                ? NSRange(location: range.location, length: length)
-                : nil
-        }
-        let normalized = mergeSourceRanges(bounded)
-        guard normalized != sourceFallbackRanges else { return }
-        sourceFallbackRanges = normalized
-        needsDisplay = true
     }
 
     private func setPresentationRole(_ role: PresentationRole) {
@@ -4579,10 +4513,6 @@ private final class DocumentTextView: NSTextView {
 
     override func draw(_ rect: NSRect) {
         guard !sourceGlyphsHidden else { return }
-        if presentationRole == .rustSurfaceWithSourceFallback {
-            drawSourceFallbackGlyphs(in: rect)
-            return
-        }
         super.draw(rect)
         guard visualMirrorEnabled, !externalVisualDecorationsEnabled else { return }
         let selectionRects = visualSelectionRectsForDisplay()
@@ -4593,35 +4523,6 @@ private final class DocumentTextView: NSTextView {
             guard !clipped.isNull, !clipped.isEmpty else { continue }
             clipped.fill()
         }
-    }
-
-    private func drawSourceFallbackGlyphs(in dirtyRect: NSRect) {
-        guard !sourceFallbackRanges.isEmpty,
-              let textContainer,
-              let layoutManager = textContainer.layoutManager else {
-            return
-        }
-        layoutManager.ensureLayout(for: textContainer)
-        let sourceLength = (string as NSString).length
-        let origin = textContainerOrigin
-        for range in sourceFallbackRanges {
-            guard range.location >= 0,
-                  range.location < sourceLength,
-                  range.length > 0 else {
-                continue
-            }
-            let bounded = NSRange(
-                location: range.location,
-                length: min(range.length, sourceLength - range.location)
-            )
-            let glyphRange = layoutManager.glyphRange(
-                forCharacterRange: bounded,
-                actualCharacterRange: nil
-            )
-            guard glyphRange.length > 0 else { continue }
-            layoutManager.drawGlyphs(forGlyphRange: glyphRange, at: origin)
-        }
-        _ = dirtyRect
     }
 
     private func syncNativeSelectionToRust(_ range: NSRange) {
@@ -5541,7 +5442,7 @@ private func acceptedVisualRenderFrame(
     decorationRevision: UInt64?,
     decorationHasValidFrame: Bool,
     rustDecorationFrameAccepted: Bool,
-    sourceFallbackCoverage: VisualSourceFallbackCoverage? = nil
+    retainedCoverage: VisualRetainedCoverage? = nil
 ) -> VisualRenderFrameIdentity? {
     guard publicationCurrent,
           decorationRevision == revision,
@@ -5554,8 +5455,8 @@ private func acceptedVisualRenderFrame(
           publication.frame.compositionGeneration == compositionGeneration else {
         return nil
     }
-    if let sourceFallbackCoverage,
-       (!sourceFallbackCoverage.complete || sourceFallbackCoverage.revision != revision) {
+    if let retainedCoverage,
+       (!retainedCoverage.complete || retainedCoverage.revision != revision) {
         return nil
     }
     return publication.frame
@@ -5575,7 +5476,7 @@ private enum VisualRenderFallbackReason: String, Equatable, CustomStringConverti
     case visualMirrorUnavailable
     case noVisualContent
     case unsupportedContent
-    case sourceFallbackCoverageUnavailable
+    case retainedCoverageUnavailable
 
     var description: String { rawValue }
 }
@@ -5719,7 +5620,7 @@ private final class MacosSurfaceHostCoordinator {
     private var metrics: Metrics?
     private var lastSubmitKey: SubmitKey?
     private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
-    private(set) var sourceFallbackCoverage: VisualSourceFallbackCoverage?
+    private(set) var retainedCoverage: VisualRetainedCoverage?
     private var submitScheduled = false
     private var scheduleToken: UInt64 = 0
     private var imageRefreshTask: DispatchWorkItem?
@@ -5753,7 +5654,7 @@ private final class MacosSurfaceHostCoordinator {
         metrics = nil
         lastSubmitKey = nil
         lastSnapshot = nil
-        sourceFallbackCoverage = nil
+        retainedCoverage = nil
         imageRefreshNeeded = false
         tableResizePointerState.reset()
         isAttached = false
@@ -5766,7 +5667,7 @@ private final class MacosSurfaceHostCoordinator {
         self.fontSize = next
         metrics = nil
         lastSubmitKey = nil
-        sourceFallbackCoverage = nil
+        retainedCoverage = nil
         scheduleSubmit()
     }
 
@@ -5783,7 +5684,7 @@ private final class MacosSurfaceHostCoordinator {
         contentWidth = next
         metrics = nil
         lastSubmitKey = nil
-        sourceFallbackCoverage = nil
+        retainedCoverage = nil
         scheduleSubmit()
     }
 
@@ -5845,7 +5746,7 @@ private final class MacosSurfaceHostCoordinator {
                 _ = try self.submitNow()
             } catch {
                 self.clearTableResizeState()
-                self.sourceFallbackCoverage = nil
+                self.retainedCoverage = nil
                 self.imageRefreshNeeded = false
                 self.cancelImageResourceRefresh()
                 self.surfaceView?.setNativeContentVisible(false)
@@ -5862,7 +5763,7 @@ private final class MacosSurfaceHostCoordinator {
     func invalidateEditorDecorationPublication() {
         lastSubmitKey = nil
         lastSnapshot = nil
-        sourceFallbackCoverage = nil
+        retainedCoverage = nil
     }
 
     private func cancelImageResourceRefresh() {
@@ -6126,7 +6027,7 @@ private final class MacosSurfaceHostCoordinator {
                 return false
             }
             lastSubmitKey = nil
-            sourceFallbackCoverage = nil
+            retainedCoverage = nil
             scheduleSubmit()
             return true
         } catch BridgeError.operation(let status)
@@ -6162,7 +6063,7 @@ private final class MacosSurfaceHostCoordinator {
                 pointerPosition: pointerPosition
             )
             lastSubmitKey = nil
-            sourceFallbackCoverage = nil
+            retainedCoverage = nil
             scheduleSubmit()
             return true
         } catch BridgeError.operation(let status)
@@ -6170,7 +6071,7 @@ private final class MacosSurfaceHostCoordinator {
                 || status == StorageStatus.tableResizeNotActive {
             tableResizePointerState.reset()
             lastSubmitKey = nil
-            sourceFallbackCoverage = nil
+            retainedCoverage = nil
             return true
         } catch {
             tableResizePointerState.reset()
@@ -6193,7 +6094,7 @@ private final class MacosSurfaceHostCoordinator {
             _ = try bridge.tableResizeFinish(revision: revision)
             _ = tableResizePointerState.finish(revision: revision)
             lastSubmitKey = nil
-            sourceFallbackCoverage = nil
+            retainedCoverage = nil
             scheduleSubmit()
             finished = true
         } catch {
@@ -6216,7 +6117,7 @@ private final class MacosSurfaceHostCoordinator {
             try bridge.tableResizeCancel(revision: revision)
             _ = tableResizePointerState.cancel(revision: revision)
             lastSubmitKey = nil
-            sourceFallbackCoverage = nil
+            retainedCoverage = nil
             scheduleSubmit()
         } catch {
             tableResizePointerState.reset()
@@ -6327,7 +6228,7 @@ private final class MacosSurfaceHostCoordinator {
             scrollView.contentView.setBoundsOrigin(origin)
             scrollView.reflectScrolledClipView(scrollView.contentView)
             lastSubmitKey = nil
-            sourceFallbackCoverage = nil
+            retainedCoverage = nil
             scheduleSubmit()
         } catch {
             // Caret reveal is an enhancement to the source TextKit view. The
@@ -6336,7 +6237,7 @@ private final class MacosSurfaceHostCoordinator {
         }
     }
 
-    private func updateSourceFallbackCoverage(
+    private func updateRetainedCoverage(
         snapshot: NativeMacosRenderHostSurfaceSnapshot,
         revision: UInt64,
         size: Float,
@@ -6346,17 +6247,16 @@ private final class MacosSurfaceHostCoordinator {
     ) {
         imageRefreshNeeded = false
         // An empty plan or an unknown command kind already forces the full
-        // source fallback. There is no useful block range to overlay in that
-        // case, so keep the coverage contract complete and let the publication
-        // predicate reject the frame for its command-level reason.
+        // source fallback. Keep the retained coverage contract complete and
+        // let the publication predicate reject the frame for its command-level
+        // reason.
         guard snapshot.commandCount > 0,
               hasSupportedVisualRenderCommands(
                   commandCount: snapshot.commandCount,
                   commandKindMask: snapshot.commandKindMask
               ) else {
-            sourceFallbackCoverage = VisualSourceFallbackCoverage(
+            retainedCoverage = VisualRetainedCoverage(
                 revision: revision,
-                ranges: [],
                 complete: true
             )
             return
@@ -6371,26 +6271,21 @@ private final class MacosSurfaceHostCoordinator {
                 viewportHeight: viewportHeight
             )
             guard viewport.revision == revision else {
-                sourceFallbackCoverage = VisualSourceFallbackCoverage(
+                retainedCoverage = VisualRetainedCoverage(
                     revision: revision,
-                    ranges: [],
                     complete: false
                 )
                 return
             }
             var blockKindMask: UInt64 = 0
-            var fallbackRanges: [NSRange] = []
             for block in blocks {
                 let bit = visualBlockKindBit(block.kind)
                 blockKindMask |= bit
-                if !hasSupportedVisualBlockKinds(bit) {
-                    fallbackRanges.append(block.sourceRange)
-                }
             }
-            guard blockKindMask == snapshot.blockKindMask else {
-                sourceFallbackCoverage = VisualSourceFallbackCoverage(
+            guard blockKindMask == snapshot.blockKindMask,
+                  hasSupportedVisualBlockKinds(blockKindMask) else {
+                retainedCoverage = VisualRetainedCoverage(
                     revision: revision,
-                    ranges: [],
                     complete: false
                 )
                 return
@@ -6400,14 +6295,11 @@ private final class MacosSurfaceHostCoordinator {
             for image in images where visibleBlockIndexes.contains(image.blockIndex) {
                 guard applyRetainedResourceCoverage(
                     state: imageResourceCoverageState(image.resourceStatus),
-                    sourceRange: image.sourceRange,
                     resourceFingerprint: image.resourceFingerprint,
-                    fallbackRanges: &fallbackRanges,
                     refreshNeeded: &imageRefreshNeeded
                 ) else {
-                    sourceFallbackCoverage = VisualSourceFallbackCoverage(
+                    retainedCoverage = VisualRetainedCoverage(
                         revision: revision,
-                        ranges: [],
                         complete: false
                     )
                     return
@@ -6423,29 +6315,24 @@ private final class MacosSurfaceHostCoordinator {
                     where visibleBlockIndexes.contains(resource.blockIndex) {
                     guard applyRetainedResourceCoverage(
                         state: embeddedResourceCoverageState(resource.resourceStatus),
-                        sourceRange: resource.sourceRange,
                         resourceFingerprint: resource.resourceFingerprint,
-                        fallbackRanges: &fallbackRanges,
                         refreshNeeded: &imageRefreshNeeded
                     ) else {
-                        sourceFallbackCoverage = VisualSourceFallbackCoverage(
+                        retainedCoverage = VisualRetainedCoverage(
                             revision: revision,
-                            ranges: [],
                             complete: false
                         )
                         return
                     }
                 }
             }
-            sourceFallbackCoverage = VisualSourceFallbackCoverage(
+            retainedCoverage = VisualRetainedCoverage(
                 revision: revision,
-                ranges: fallbackRanges,
                 complete: true
             )
         } catch {
-            sourceFallbackCoverage = VisualSourceFallbackCoverage(
+            retainedCoverage = VisualRetainedCoverage(
                 revision: revision,
-                ranges: [],
                 complete: false
             )
         }
@@ -6491,7 +6378,11 @@ private final class MacosSurfaceHostCoordinator {
             // rejected an empty plan. Do not briefly re-show that blank
             // surface; source TextKit remains the canonical visible fallback
             // until a publication with actual draw commands exists.
-            surfaceView.setNativeContentVisible(lastSnapshot?.hasVisualContent == true)
+            surfaceView.setNativeContentVisible(
+                lastSnapshot?.hasVisualContent == true
+                    && retainedCoverage?.revision == revision
+                    && retainedCoverage?.complete == true
+            )
             scheduleImageResourceRefresh()
             return lastSnapshot
         }
@@ -6516,7 +6407,7 @@ private final class MacosSurfaceHostCoordinator {
         isAttached = true
         lastSubmitKey = key
         lastSnapshot = snapshot
-        updateSourceFallbackCoverage(
+        updateRetainedCoverage(
             snapshot: snapshot,
             revision: revision,
             size: Float(size),
@@ -6524,7 +6415,11 @@ private final class MacosSurfaceHostCoordinator {
             scrollY: Float(scrollY),
             viewportHeight: Float(viewportHeight)
         )
-        surfaceView.setNativeContentVisible(snapshot.hasVisualContent)
+        surfaceView.setNativeContentVisible(
+            snapshot.hasVisualContent
+                && retainedCoverage?.revision == revision
+                && retainedCoverage?.complete == true
+        )
         onSurfaceStateChange?()
         if imageRefreshNeeded {
             scheduleImageResourceRefresh()
@@ -6549,7 +6444,7 @@ private final class MacosSurfaceHostCoordinator {
         isAttached = false
         lastSubmitKey = nil
         lastSnapshot = nil
-        sourceFallbackCoverage = nil
+        retainedCoverage = nil
         imageRefreshNeeded = false
         metrics = nil
         surfaceView?.setNativeContentVisible(false)
@@ -6560,7 +6455,7 @@ private final class MacosSurfaceHostCoordinator {
         try? bridge.tableResizeCancel(revision: bridge.state.revision)
         tableResizePointerState.reset()
         lastSubmitKey = nil
-        sourceFallbackCoverage = nil
+        retainedCoverage = nil
     }
 
     private func ensureMetrics(
@@ -6955,11 +6850,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     ) {
         let revision = bridge.state.revision
         let compositionGeneration = bridge.composition.generation
-        let sourceFallbackCoverage =
-            surfaceCoordinator.sourceFallbackCoverage
-            ?? VisualSourceFallbackCoverage(
+        let retainedCoverage =
+            surfaceCoordinator.retainedCoverage
+            ?? VisualRetainedCoverage(
                 revision: revision,
-                ranges: [],
                 complete: false
             )
         let publicationCurrent = surfaceCoordinator.hasCurrentPublication(
@@ -6976,17 +6870,11 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             decorationRevision: decorationHostView.revision,
             decorationHasValidFrame: decorationHostView.hasValidFrame,
             rustDecorationFrameAccepted: rustDecorationFrameAccepted,
-            sourceFallbackCoverage: sourceFallbackCoverage
+            retainedCoverage: retainedCoverage
         )
         let canHideSourceGlyphs = activeFrame != nil
         if canHideSourceGlyphs {
-            if sourceFallbackCoverage.ranges.isEmpty {
-                textView.useRustSurfacePresentation()
-            } else {
-                textView.useRustSurfacePresentation(
-                    sourceFallbackRanges: sourceFallbackCoverage.ranges
-                )
-            }
+            textView.useRustSurfacePresentation()
         } else if useProjectedTextKitFallback {
             textView.useProjectedTextKitOverlayPresentation()
         } else {
@@ -6995,8 +6883,8 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         // The Rust surface and its Rust-shaped decoration frame are one
         // visual publication. If either side is stale, hide the surface as a
         // unit and let TextKit render the source mirror until both are ready.
-        // A complete coverage result may instead leave only unsupported
-        // block ranges painted by TextKit above the accepted Rust surface.
+        // Coverage is all-or-nothing, so TextKit never paints source glyphs
+        // above an accepted Rust surface.
         surfaceHostView.setNativeContentVisible(canHideSourceGlyphs)
 
         if let activeFrame {
@@ -7053,10 +6941,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                 return .unsupportedContent
             }
         }
-        guard let coverage = surfaceCoordinator.sourceFallbackCoverage,
+        guard let coverage = surfaceCoordinator.retainedCoverage,
               coverage.complete,
               coverage.revision == revision else {
-            return .sourceFallbackCoverageUnavailable
+            return .retainedCoverageUnavailable
         }
         if bridge.composition.active {
             return .compositionActive
@@ -8277,18 +8165,9 @@ private func runVisualDecorationSelfCheck(path: String) -> Never {
         precondition(textView.presentationRoleForSelfCheck == "sourceFallback")
         textView.useProjectedTextKitOverlayPresentation()
         precondition(textView.presentationRoleForSelfCheck == "projectedTextKitOverlay")
-        textView.useRustSurfacePresentation(
-            sourceFallbackRanges: [NSRange(location: 0, length: 2)]
-        )
-        precondition(
-            textView.presentationRoleForSelfCheck == "rustSurfaceWithSourceFallback"
-        )
-        precondition(
-            textView.sourceFallbackRangesForSelfCheck == [NSRange(location: 0, length: 2)]
-        )
-        precondition(!textView.sourceGlyphsHiddenForSelfCheck)
         textView.useRustSurfacePresentation()
         precondition(textView.presentationRoleForSelfCheck == "rustSurface")
+        precondition(textView.sourceGlyphsHiddenForSelfCheck)
         textView.setSourceGlyphsHidden(true)
         precondition(textView.sourceGlyphsHiddenForSelfCheck)
         precondition(textView.string == bridge.source)
@@ -8351,85 +8230,56 @@ private func runVisualRenderStateSelfCheck() -> Never {
     precondition(machine.diagnosticDescription.contains("revision=7"))
 
     let publication = VisualRenderPublicationIdentity(frame: frame, submitted: true)
-    let partialCoverage = VisualSourceFallbackCoverage(
-        revision: 7,
-        ranges: [
-            NSRange(location: 12, length: 4),
-            NSRange(location: 14, length: 6)
-        ],
-        complete: true
-    )
-    precondition(partialCoverage.ranges == [NSRange(location: 12, length: 8)])
-    var embeddedFallbackRanges: [NSRange] = []
     var embeddedRefreshNeeded = false
     precondition(
         applyRetainedResourceCoverage(
             state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_READY)),
-            sourceRange: NSRange(location: 1, length: 2),
             resourceFingerprint: 7,
-            fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
-    precondition(embeddedFallbackRanges.isEmpty)
     precondition(
         applyRetainedResourceCoverage(
             state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING)),
-            sourceRange: NSRange(location: 3, length: 2),
             resourceFingerprint: 7,
-            fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
-    precondition(embeddedFallbackRanges.isEmpty)
     precondition(embeddedRefreshNeeded)
     precondition(
         applyRetainedResourceCoverage(
             state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED)),
-            sourceRange: NSRange(location: 3, length: 2),
             resourceFingerprint: 7,
-            fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
-    precondition(embeddedFallbackRanges.isEmpty)
     precondition(
         applyRetainedResourceCoverage(
             state: embeddedResourceCoverageState(
                 UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
             ),
-            sourceRange: NSRange(location: 4, length: 2),
             resourceFingerprint: 11,
-            fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
-    precondition(embeddedFallbackRanges.isEmpty)
     precondition(
         applyRetainedResourceCoverage(
             state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN)),
-            sourceRange: NSRange(location: 5, length: 2),
             resourceFingerprint: 0,
-            fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
-    precondition(embeddedFallbackRanges == [NSRange(location: 5, length: 2)])
     precondition(
         !applyRetainedResourceCoverage(
             state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN)),
-            sourceRange: NSRange(location: 7, length: 2),
             resourceFingerprint: 9,
-            fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
     precondition(
         !applyRetainedResourceCoverage(
             state: imageResourceCoverageState(255),
-            sourceRange: NSRange(location: 9, length: 2),
             resourceFingerprint: 13,
-            fallbackRanges: &embeddedFallbackRanges,
             refreshNeeded: &embeddedRefreshNeeded
         )
     )
@@ -8476,6 +8326,21 @@ private func runVisualRenderStateSelfCheck() -> Never {
             decorationHasValidFrame: true,
             rustDecorationFrameAccepted: true
         ) == nil
+    )
+    precondition(
+        acceptedVisualRenderFrame(
+            revision: 7,
+            compositionGeneration: 3,
+            publicationCurrent: true,
+            publication: publication,
+            decorationRevision: 7,
+            decorationHasValidFrame: true,
+            rustDecorationFrameAccepted: true,
+            retainedCoverage: VisualRetainedCoverage(
+                revision: 7,
+                complete: true
+            )
+        ) == frame
     )
     precondition(
         acceptedVisualRenderFrame(
@@ -8543,8 +8408,11 @@ private func runVisualRenderStateSelfCheck() -> Never {
             decorationRevision: 7,
             decorationHasValidFrame: true,
             rustDecorationFrameAccepted: true,
-            sourceFallbackCoverage: partialCoverage
-        ) == frame
+            retainedCoverage: VisualRetainedCoverage(
+                revision: 7,
+                complete: false
+            )
+        ) == nil
     )
     precondition(
         acceptedVisualRenderFrame(
@@ -8555,10 +8423,9 @@ private func runVisualRenderStateSelfCheck() -> Never {
             decorationRevision: 7,
             decorationHasValidFrame: true,
             rustDecorationFrameAccepted: true,
-            sourceFallbackCoverage: VisualSourceFallbackCoverage(
-                revision: 7,
-                ranges: [],
-                complete: false
+            retainedCoverage: VisualRetainedCoverage(
+                revision: 8,
+                complete: true
             )
         ) == nil
     )
@@ -10600,27 +10467,20 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
             let embeddedResources = try bridge.macosVisualEmbeddedResources(
                 revision: bridge.state.revision
             )
-            let fallbackRanges = coordinator.sourceFallbackCoverage?.ranges ?? []
             precondition(!embeddedResources.isEmpty)
-            precondition(coordinator.sourceFallbackCoverage?.complete == true)
+            precondition(coordinator.retainedCoverage?.complete == true)
             for resource in embeddedResources {
-                let isFallbackCovered = fallbackRanges.contains {
-                    NSIntersectionRange($0, resource.sourceRange).length
-                        == resource.sourceRange.length
-                }
                 switch resource.kind {
                 case UInt8(YU_STORAGE_EMBEDDED_MATH):
                     precondition(
                         resource.resourceStatus
                             == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_READY)
                     )
-                    precondition(!isFallbackCovered)
                 case UInt8(YU_STORAGE_EMBEDDED_MERMAID):
                     precondition(
                         resource.resourceStatus
                             == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
                     )
-                    precondition(!isFallbackCovered)
                 default:
                     preconditionFailure("unknown embedded resource kind")
                 }
@@ -10629,16 +10489,14 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
 
         var asyncImageRefreshReady = false
         if bridge.source.contains("![") {
-            precondition(coordinator.sourceFallbackCoverage?.complete == true)
-            precondition(coordinator.sourceFallbackCoverage?.ranges.isEmpty == true)
+            precondition(coordinator.retainedCoverage?.complete == true)
             let deadline = Date(timeIntervalSinceNow: 3.0)
             while Date() < deadline {
                 RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
                 if let snapshot = coordinator.lastSnapshot,
                    snapshot.imageResourceCount > 0,
-                   let coverage = coordinator.sourceFallbackCoverage,
-                   coverage.complete,
-                   coverage.ranges.isEmpty {
+                   let coverage = coordinator.retainedCoverage,
+                   coverage.complete {
                     asyncImageRefreshReady = true
                     break
                 }
