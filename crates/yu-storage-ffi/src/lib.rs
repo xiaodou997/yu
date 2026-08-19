@@ -42,15 +42,17 @@ use yu_render::{RenderCommand, RenderPlanBuilder};
 use yu_scene::{Primitive, Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput};
 #[cfg(target_os = "macos")]
 use yu_workspace::{
-    ViewportRenderConfig, assemble_viewport_render_frame, viewport_block_background,
+    ViewportRenderConfig, assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded,
+    viewport_block_background,
 };
 
 #[cfg(target_os = "macos")]
 use yu_assets::{
-    EmbeddedFailureKind, EmbeddedRenderRequest, EmbeddedRenderer, EmbeddedRequestResult,
-    EmbeddedResourceCache, EmbeddedResourceKind, ImageCache, ImageFailureKind,
-    ImageIntrinsicPublication, ImagePublication, ImageRequest, ImageRequestCandidate,
-    ImageRequestPlan, ImageRequestPriority, ImageRequestResult, UnsupportedEmbeddedRenderer,
+    EmbeddedFailureKind, EmbeddedRenderPublication, EmbeddedRenderRequest, EmbeddedRenderer,
+    EmbeddedRequestResult, EmbeddedResourceCache, EmbeddedResourceKind, ImageCache,
+    ImageFailureKind, ImageIntrinsicPublication, ImagePublication, ImageRequest,
+    ImageRequestCandidate, ImageRequestPlan, ImageRequestPriority, ImageRequestResult,
+    UnsupportedEmbeddedRenderer,
 };
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
@@ -1099,11 +1101,11 @@ impl MacosEmbeddedResourceState {
         }
     }
 
-    fn status_for(
+    fn request_result(
         &mut self,
         request: EmbeddedRenderRequest,
         revision: Revision,
-    ) -> Result<u8, i32> {
+    ) -> Result<EmbeddedRequestResult, i32> {
         let _ = self.cache.request(request.clone());
         while self
             .cache
@@ -1111,7 +1113,28 @@ impl MacosEmbeddedResourceState {
             .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
             .is_some()
         {}
-        Ok(macos_embedded_resource_status(self.cache.request(request)))
+        Ok(self.cache.request(request))
+    }
+
+    fn status_for(
+        &mut self,
+        request: EmbeddedRenderRequest,
+        revision: Revision,
+    ) -> Result<u8, i32> {
+        Ok(macos_embedded_resource_status(
+            self.request_result(request, revision)?,
+        ))
+    }
+
+    fn publication_for(
+        &mut self,
+        request: EmbeddedRenderRequest,
+        revision: Revision,
+    ) -> Result<Option<EmbeddedRenderPublication>, i32> {
+        match self.request_result(request, revision)? {
+            EmbeddedRequestResult::Ready(publication) => Ok(Some(publication)),
+            EmbeddedRequestResult::Pending | EmbeddedRequestResult::Failed(_) => Ok(None),
+        }
     }
 }
 
@@ -7365,11 +7388,13 @@ fn macos_visual_render_plan(
             .map_err(|error| storage_status(error.into()))?
     };
     let source = document.snapshot();
+    let revision = source.revision();
     let config = document.viewport_config().layout();
     let definitions = document.markdown().reference_definitions().clone();
     let rasterizer = shaper.rasterizer();
     let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::default());
     let mut block_glyphs = Vec::with_capacity(viewport_snapshot.blocks().len());
+    let mut embedded_requests = Vec::new();
     let composition_blocks = document.composition_block_range();
 
     for block in viewport_snapshot.blocks() {
@@ -7403,7 +7428,39 @@ fn macos_visual_render_plan(
             renderable_image_count(&source, &layout, &definitions),
             viewport_block_background(block.kind()),
         ));
+        let projection = document
+            .block_projection(block.index())
+            .map_err(status_from_editor_error)?
+            .clone();
+        let BlockProjection::FencedCode(code) = projection else {
+            continue;
+        };
+        let Some(kind) = embedded_resource_kind(&source, code.info_string()) else {
+            continue;
+        };
+        let embedded_kind = embedded_resource_kind_from_ffi(kind).ok_or(YU_STORAGE_EDITOR_ERROR)?;
+        let content = embedded_resource_content(&source, code.content())?;
+        let content = if content.is_empty() {
+            "\n".to_owned()
+        } else {
+            content
+        };
+        embedded_requests.push(
+            EmbeddedRenderRequest::new(revision, code.source_range(), embedded_kind, content)
+                .map_err(|_| YU_STORAGE_EDITOR_ERROR)?,
+        );
     }
+
+    let embedded_publications = {
+        let embedded_resources = &mut session.macos_embedded_resources;
+        let mut publications = Vec::with_capacity(embedded_requests.len());
+        for request in embedded_requests {
+            if let Some(publication) = embedded_resources.publication_for(request, revision)? {
+                publications.push(publication);
+            }
+        }
+        publications
+    };
 
     let scene_height = viewport_snapshot
         .content_height()
@@ -7415,12 +7472,16 @@ fn macos_visual_render_plan(
     let scene_viewport =
         Rect::new(0.0, scroll_y, max_width, scene_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
     let mut render_plans = RenderPlanBuilder::new();
-    let frame = assemble_viewport_render_frame(
+    let frame = assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded(
         document,
+        viewport,
         ViewportRenderConfig::new(viewport, size, scene_viewport, Rgba8::black()),
         &shaper,
         &atlas,
         &mut render_plans,
+        &[],
+        &[],
+        &embedded_publications,
     )
     .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
     let plan = frame.plan();
@@ -7429,7 +7490,7 @@ fn macos_visual_render_plan(
     }
 
     let mut block_metadata = Vec::new();
-    for (block_index, source_range, glyph_count, image_count, background) in block_glyphs {
+    for (block_index, source_range, glyph_count, image_count, background) in &block_glyphs {
         let source_start_utf16 = source
             .utf16_offset(source_range.start())
             .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
@@ -7441,7 +7502,7 @@ fn macos_visual_render_plan(
         if background.is_some() {
             block_metadata.push((
                 YU_STORAGE_RENDER_COMMAND_FILL_RECT,
-                block_index,
+                *block_index,
                 source_start_utf16,
                 source_end_utf16,
             ));
@@ -7449,20 +7510,43 @@ fn macos_visual_render_plan(
         block_metadata.extend(std::iter::repeat_n(
             (
                 YU_STORAGE_RENDER_COMMAND_GLYPH,
-                block_index,
+                *block_index,
                 source_start_utf16,
                 source_end_utf16,
             ),
-            glyph_count,
+            *glyph_count,
         ));
         block_metadata.extend(std::iter::repeat_n(
             (
                 YU_STORAGE_RENDER_COMMAND_IMAGE,
-                block_index,
+                *block_index,
                 source_start_utf16,
                 source_end_utf16,
             ),
-            image_count,
+            *image_count,
+        ));
+    }
+    for (block_index, source_range, _, _, _) in &block_glyphs {
+        let embedded_count = embedded_publications
+            .iter()
+            .filter(|publication| publication.source_range() == *source_range)
+            .count();
+        let source_start_utf16 = source
+            .utf16_offset(source_range.start())
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+            .get();
+        let source_end_utf16 = source
+            .utf16_offset(source_range.end())
+            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+            .get();
+        block_metadata.extend(std::iter::repeat_n(
+            (
+                YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG,
+                *block_index,
+                source_start_utf16,
+                source_end_utf16,
+            ),
+            embedded_count,
         ));
     }
     if block_metadata.len() != plan.commands().len() {
@@ -9240,6 +9324,63 @@ mod tests {
                 .expect("status"),
             YU_STORAGE_EMBEDDED_RESOURCE_READY
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_visual_render_plan_consumes_published_math_svg() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-embedded-plan-{id}.md"));
+        fs::write(&path, "```math\nx^2 + y^2\n```\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_viewport_config(
+                    raw,
+                    0,
+                    500.0,
+                    metrics.line_height(),
+                    metrics.default_advance(),
+                    metrics.line_height(),
+                    0.0,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        unsafe {
+            (*raw).macos_embedded_resources.renderer =
+                Box::new(yu_embedded_math::MathRenderer::default());
+        }
+        let (snapshot, commands, _, _) = macos_visual_render_plan(
+            unsafe { raw.as_mut() }.expect("session"),
+            0,
+            14.0,
+            500.0,
+            0.0,
+            240.0,
+        )
+        .expect("embedded render plan");
+        assert_eq!(snapshot.revision, 0);
+        assert_eq!(snapshot.embedded_command_count, 1);
+        assert_eq!(snapshot.embedded_upload_count, 1);
+        assert!(snapshot.embedded_upload_bytes > 0);
+        let embedded = commands
+            .iter()
+            .find(|command| command.kind == YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG)
+            .expect("embedded command");
+        assert_ne!(embedded.resource, 0);
+        assert_eq!(embedded.embedded_kind, YU_STORAGE_EMBEDDED_MATH);
+        assert_eq!(embedded.embedded_generation, 1);
+        assert!(embedded.embedded_width > 0);
+        assert!(embedded.embedded_height > 0);
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]

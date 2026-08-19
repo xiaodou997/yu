@@ -11,7 +11,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use yu_assets::{ImageIntrinsicPublication, ImageKey, ImagePublication};
+use yu_assets::{
+    EmbeddedRenderPayload, EmbeddedRenderPublication, ImageIntrinsicPublication, ImageKey,
+    ImagePublication,
+};
 use yu_core::Revision;
 use yu_editor::{
     BlockKind, EditorDocument, EditorDocumentError, ImageSource, LayoutError, ShapingProvider,
@@ -21,8 +24,8 @@ use yu_font::GlyphAtlas;
 use yu_layout::ImageIntrinsicSize;
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
-    ImagePrimitive, Rect, Rgba8, Scene, SceneBuilder, SceneError, TableSceneStyle,
-    ViewportBlockGeometry, ViewportSceneInput,
+    EmbeddedSvgPrimitive, ImagePrimitive, Rect, Rgba8, Scene, SceneBuilder, SceneError,
+    TableSceneStyle, ViewportBlockGeometry, ViewportSceneInput,
 };
 
 mod workspace;
@@ -720,6 +723,41 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: Sh
     image_intrinsics: &[ImageIntrinsicPublication],
     table_resize: Option<TableResizeCommit>,
 ) -> Result<ViewportSceneFrame, ViewportSceneError> {
+    assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table_resize(
+        document,
+        viewport,
+        shaper,
+        font_size,
+        scene_viewport,
+        atlas,
+        color,
+        image_publications,
+        image_intrinsics,
+        &[],
+        table_resize,
+    )
+}
+
+/// Builds a viewport scene with ready image dimensions and revision-bound SVG
+/// publications. Embedded primitives are appended only for matching visible
+/// fenced blocks; source glyphs remain in painter order and the primitive uses
+/// a transparent fallback until a native SVG consumer is available.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table_resize<
+    S: ShapingProvider,
+>(
+    document: &mut EditorDocument,
+    viewport: ViewportRect,
+    shaper: &S,
+    font_size: f32,
+    scene_viewport: Rect,
+    atlas: &GlyphAtlas,
+    color: Rgba8,
+    image_publications: &[ImagePublication],
+    image_intrinsics: &[ImageIntrinsicPublication],
+    embedded_publications: &[EmbeddedRenderPublication],
+    table_resize: Option<TableResizeCommit>,
+) -> Result<ViewportSceneFrame, ViewportSceneError> {
     let source = document.snapshot();
     let definitions = document.markdown().reference_definitions().clone();
     let document_revision = document.revision();
@@ -886,6 +924,33 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: Sh
         Some(viewport_table_style()),
         selection,
     )?;
+    for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
+        let Some(publication) = embedded_publications.iter().find(|publication| {
+            publication.revision() == revision
+                && publication.source_range() == layout.projection().source_range()
+        }) else {
+            continue;
+        };
+        let EmbeddedRenderPayload::Svg { dimensions, .. } = publication.payload() else {
+            continue;
+        };
+        let width = (dimensions.width() as f32).min(scene_viewport.width());
+        let height = (dimensions.height() as f32).min(block.height().max(1.0));
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
+        let bounds = Rect::new(0.0, block.y(), width, height)?;
+        builder.embedded_svg(EmbeddedSvgPrimitive::new(
+            publication.key().fingerprint(),
+            publication.generation(),
+            publication.kind().tag(),
+            publication.source_range(),
+            bounds,
+            dimensions.width(),
+            dimensions.height(),
+            Rgba8::new(0, 0, 0, 0),
+        ))?;
+    }
     Ok(ViewportSceneFrame {
         input,
         scene: builder.finish(),
@@ -949,7 +1014,38 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvi
     image_publications: &[ImagePublication],
     image_intrinsics: &[ImageIntrinsicPublication],
 ) -> Result<ViewportRenderFrame, ViewportSceneError> {
-    let scene = assemble_viewport_scene_with_images_and_intrinsics_and_table_resize(
+    assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded(
+        document,
+        viewport,
+        config,
+        shaper,
+        atlas,
+        render_plans,
+        image_publications,
+        image_intrinsics,
+        &[],
+    )
+}
+
+/// Builds a render frame while applying ready image dimensions and explicit
+/// revision-bound embedded SVG publications. The same publication list is
+/// passed to scene assembly and RenderPlan construction so a command cannot
+/// be emitted without its matching upload payload.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded<
+    S: ShapingProvider,
+>(
+    document: &mut EditorDocument,
+    viewport: ViewportRect,
+    config: ViewportRenderConfig,
+    shaper: &S,
+    atlas: &GlyphAtlas,
+    render_plans: &mut RenderPlanBuilder,
+    image_publications: &[ImagePublication],
+    image_intrinsics: &[ImageIntrinsicPublication],
+    embedded_publications: &[EmbeddedRenderPublication],
+) -> Result<ViewportRenderFrame, ViewportSceneError> {
+    let scene = assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table_resize(
         document,
         viewport,
         shaper,
@@ -959,6 +1055,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvi
         config.color(),
         image_publications,
         image_intrinsics,
+        embedded_publications,
         config.table_resize(),
     )?;
     if scene.revision() != document.revision() {
@@ -968,7 +1065,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvi
         }
         .into());
     }
-    let plan = render_plans.build(scene.scene(), atlas)?;
+    let plan = render_plans.build_with_embedded(scene.scene(), atlas, embedded_publications)?;
     ViewportRenderFrame::new(scene, plan).map_err(ViewportSceneError::from)
 }
 
@@ -976,6 +1073,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvi
 mod tests {
     use std::sync::Arc;
 
+    use yu_assets::{EmbeddedRenderPayload, EmbeddedRenderRequest, EmbeddedResourceKind};
     use yu_core::ByteOffset;
     use yu_editor::{
         CaretAffinity, EditorCommand, EditorSelection, LayoutConfig, LayoutPoint,
@@ -1078,6 +1176,74 @@ mod tests {
                 .iter()
                 .all(|primitive| matches!(primitive, Primitive::Glyph(_)))
         );
+    }
+
+    #[test]
+    fn published_math_is_consumed_by_viewport_scene_and_render_plan() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 240.0);
+        let mut document = EditorDocument::new("```math\nx^2 + y^2\n```\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let projection = document.block_projection(0).expect("math projection");
+        let yu_editor::BlockProjection::FencedCode(code) = projection else {
+            panic!("expected fenced math block");
+        };
+        let source_range = code.source_range();
+        let request = EmbeddedRenderRequest::new(
+            document.revision(),
+            source_range,
+            EmbeddedResourceKind::Math,
+            "x^2 + y^2",
+        )
+        .expect("math request");
+        let mut cache = yu_assets::EmbeddedResourceCache::new();
+        let publication = cache
+            .publish(
+                request,
+                document.revision(),
+                EmbeddedRenderPayload::svg(640, 320, "<svg viewBox=\"0 0 640 320\"/>")
+                    .expect("math SVG"),
+            )
+            .expect("math publication");
+        let mut plans = RenderPlanBuilder::new();
+        let frame = assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded(
+            &mut document,
+            viewport,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 240.0, 240.0).expect("scene viewport"),
+                Rgba8::black(),
+            ),
+            &shaper,
+            &atlas,
+            &mut plans,
+            &[],
+            &[],
+            std::slice::from_ref(&publication),
+        )
+        .expect("embedded frame");
+        assert!(frame.scene().scene().primitives().iter().any(|primitive| {
+            matches!(primitive, Primitive::EmbeddedSvg(svg) if svg.source() == source_range)
+        }));
+        assert!(frame.plan().commands().iter().any(|command| {
+            matches!(command, yu_render::RenderCommand::EmbeddedSvg {
+                resource,
+                generation,
+                ..
+            } if *resource == publication.key().fingerprint()
+                && *generation == publication.generation())
+        }));
+        assert_eq!(frame.plan().embedded_uploads().len(), 1);
+        assert_eq!(frame.plan().embedded_uploads()[0].source(), source_range);
     }
 
     #[test]
