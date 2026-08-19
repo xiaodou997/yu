@@ -43,7 +43,9 @@ pub use yu_layout::{
     TableResizeGesture, TableResizeGestureError, TableResizeHit, TableResizeTarget, VisualCluster,
     VisualLine,
 };
-pub use yu_markdown::{Block, BlockKind, MarkdownDocument, TableAlignment};
+pub use yu_markdown::{
+    Block, BlockKind, MarkdownDocument, TableAlignment, TaskMarker, TaskState, task_marker,
+};
 pub use yu_projection::{
     BlockProjection, BlockProjectionKind, CodeProjection, ImageSource, Projection, ProjectionBias,
     ProjectionError, TableProjection, VisualOffset, VisualRange, VisualRun, VisualRunKind,

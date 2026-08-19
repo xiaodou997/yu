@@ -17,15 +17,16 @@ use yu_assets::{
 };
 use yu_core::Revision;
 use yu_editor::{
-    BlockKind, EditorDocument, EditorDocumentError, ImageSource, LayoutError, ShapingProvider,
-    TableResizeCommit, TableResizeTarget, ViewportRect,
+    BlockKind, EditorDocument, EditorDocumentError, ImageSource, LayoutError, ProjectionBias,
+    ShapingProvider, TableResizeCommit, TableResizeTarget, TaskState, ViewportRect, task_marker,
 };
 use yu_font::GlyphAtlas;
 use yu_layout::ImageIntrinsicSize;
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
     EmbeddedSvgPrimitive, ImagePrimitive, Rect, Rgba8, Scene, SceneBuilder, SceneError,
-    TableSceneStyle, ViewportBlockGeometry, ViewportSceneInput,
+    TableSceneStyle, TaskCheckboxPrimitive, TaskCheckboxPrimitiveRole, ViewportBlockGeometry,
+    ViewportSceneInput,
 };
 
 mod workspace;
@@ -61,6 +62,57 @@ fn viewport_table_style() -> TableSceneStyle {
         Some(Rgba8::new(248, 249, 251, 255)),
         Some(Rgba8::new(210, 225, 255, 255)),
     )
+}
+
+fn append_task_checkbox(
+    builder: &mut SceneBuilder,
+    layout: &yu_layout::LayoutSnapshot,
+    block_y: f32,
+    marker: yu_editor::TaskMarker,
+    state: TaskState,
+) -> Result<(), ViewportSceneError> {
+    let caret = layout
+        .caret_for_source(marker.range().start(), ProjectionBias::After)
+        .map_err(EditorDocumentError::from)?;
+    let line_height = layout.config().line_height();
+    let size = line_height * 0.68;
+    let x = caret.point().x();
+    let y = block_y + caret.point().y() + (line_height - size) * 0.5;
+    let bounds = Rect::new(x, y, size, size)?;
+    let border = match state {
+        TaskState::Todo => Rgba8::new(118, 124, 134, 255),
+        TaskState::Done => Rgba8::new(38, 111, 219, 255),
+    };
+    builder.task_checkbox(TaskCheckboxPrimitive::new(
+        marker.range(),
+        bounds,
+        border,
+        TaskCheckboxPrimitiveRole::Border,
+    ))?;
+
+    match state {
+        TaskState::Todo => {
+            let inset = (size * 0.14).max(0.5).min(size * 0.3);
+            builder.task_checkbox(TaskCheckboxPrimitive::new(
+                marker.range(),
+                Rect::new(x + inset, y + inset, size - inset * 2.0, size - inset * 2.0)?,
+                Rgba8::white(),
+                TaskCheckboxPrimitiveRole::Interior,
+            ))?;
+        }
+        TaskState::Done => {
+            let unit = size / 5.0;
+            for (column, row) in [(1.0, 2.4), (1.8, 3.1), (2.7, 2.4), (3.6, 1.5)] {
+                builder.task_checkbox(TaskCheckboxPrimitive::new(
+                    marker.range(),
+                    Rect::new(x + unit * column, y + unit * row, unit * 0.85, unit * 0.85)?,
+                    Rgba8::white(),
+                    TaskCheckboxPrimitiveRole::Check,
+                ))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ViewportSceneFrame {
@@ -324,6 +376,7 @@ pub enum ViewportSceneError {
     Scene(SceneError),
     Render(RenderError),
     Frame(ViewportFrameError),
+    InvalidTaskMarker { block: usize },
 }
 
 impl fmt::Display for ViewportSceneError {
@@ -333,6 +386,12 @@ impl fmt::Display for ViewportSceneError {
             Self::Scene(error) => error.fmt(formatter),
             Self::Render(error) => error.fmt(formatter),
             Self::Frame(error) => error.fmt(formatter),
+            Self::InvalidTaskMarker { block } => {
+                write!(
+                    formatter,
+                    "task-list block {block} has no parser-owned marker"
+                )
+            }
         }
     }
 }
@@ -344,6 +403,7 @@ impl Error for ViewportSceneError {
             Self::Scene(error) => Some(error),
             Self::Render(error) => Some(error),
             Self::Frame(error) => Some(error),
+            Self::InvalidTaskMarker { .. } => None,
         }
     }
 }
@@ -925,6 +985,22 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         selection,
     )?;
     for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
+        let BlockKind::TaskListItem { state, .. } = block.kind() else {
+            continue;
+        };
+        let Some(markdown_block) = document.markdown().blocks().get(block.index()) else {
+            return Err(ViewportSceneError::InvalidTaskMarker {
+                block: block.index(),
+            });
+        };
+        let Some(marker) = task_marker(&source, markdown_block) else {
+            return Err(ViewportSceneError::InvalidTaskMarker {
+                block: block.index(),
+            });
+        };
+        append_task_checkbox(&mut builder, layout, block.y(), marker, state)?;
+    }
+    for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
         let Some(publication) = embedded_publications.iter().find(|publication| {
             publication.revision() == revision
                 && publication.source_range() == layout.projection().source_range()
@@ -1179,6 +1255,105 @@ mod tests {
     }
 
     #[test]
+    fn task_markers_become_source_backed_checkbox_layers() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let mut document = EditorDocument::new("- [ ] todo\n- [x] done\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("task scene");
+        let layers = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::TaskCheckbox(task) => Some(*task),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(layers.len(), 7);
+        let snapshot = document.snapshot();
+        let todo = task_marker(
+            &snapshot,
+            document.markdown().blocks().get(0).expect("todo block"),
+        )
+        .expect("todo marker")
+        .range();
+        let done = task_marker(
+            &snapshot,
+            document.markdown().blocks().get(1).expect("done block"),
+        )
+        .expect("done marker")
+        .range();
+        assert_eq!(
+            layers.iter().filter(|layer| layer.source() == todo).count(),
+            2
+        );
+        assert_eq!(
+            layers.iter().filter(|layer| layer.source() == done).count(),
+            5
+        );
+        assert!(layers.iter().any(|layer| {
+            layer.source() == todo && layer.role() == TaskCheckboxPrimitiveRole::Interior
+        }));
+        assert!(layers.iter().any(|layer| {
+            layer.source() == done && layer.role() == TaskCheckboxPrimitiveRole::Check
+        }));
+        assert!(
+            layers
+                .iter()
+                .all(|layer| { layer.bounds().width() > 0.0 && layer.bounds().height() > 0.0 })
+        );
+
+        let initial_revision = document.revision();
+        document
+            .execute(EditorCommand::toggle_task(0))
+            .expect("toggle todo");
+        assert!(document.revision() > initial_revision);
+        let toggled_atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let toggled = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            &toggled_atlas,
+            Rgba8::black(),
+        )
+        .expect("toggled task scene");
+        assert_eq!(
+            toggled
+                .scene()
+                .primitives()
+                .iter()
+                .filter(|primitive| {
+                    matches!(
+                        primitive,
+                        Primitive::TaskCheckbox(layer) if layer.source() == todo
+                    )
+                })
+                .count(),
+            5
+        );
+    }
+
+    #[test]
     fn published_math_is_consumed_by_viewport_scene_and_render_plan() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
@@ -1297,7 +1472,8 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::Table(_) => None,
+                | Primitive::Table(_)
+                | Primitive::TaskCheckbox(_) => None,
             })
             .expect("image primitive");
         assert_eq!(image.bounds().width(), 200.0);
@@ -1325,7 +1501,8 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::Table(_) => None,
+                | Primitive::Table(_)
+                | Primitive::TaskCheckbox(_) => None,
             })
             .expect("metadata-only image primitive");
         assert_eq!(metadata_image.bounds().width(), 200.0);
@@ -1376,7 +1553,8 @@ mod tests {
             Primitive::Glyph(_)
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
-            | Primitive::Table(_) => {
+            | Primitive::Table(_)
+            | Primitive::TaskCheckbox(_) => {
                 panic!("code block background must precede glyphs")
             }
         }

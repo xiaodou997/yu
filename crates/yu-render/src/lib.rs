@@ -411,6 +411,12 @@ impl RenderPlanBuilder {
                         color: table.color(),
                     });
                 }
+                Primitive::TaskCheckbox(task) => {
+                    commands.push(RenderCommand::FillRect {
+                        bounds: task.bounds(),
+                        color: task.color(),
+                    });
+                }
             }
         }
 
@@ -489,7 +495,8 @@ mod tests {
     use yu_projection::Projection;
     use yu_scene::{
         EmbeddedSvgPrimitive, GlyphPrimitive, ImagePrimitive, Point, SceneBuilder, SceneError,
-        TablePrimitiveRole, TableSceneStyle, ViewportBlockGeometry, ViewportSceneInput,
+        TablePrimitiveRole, TableSceneStyle, TaskCheckboxPrimitive, TaskCheckboxPrimitiveRole,
+        ViewportBlockGeometry, ViewportSceneInput,
     };
     use yu_text::TextBuffer;
 
@@ -1001,6 +1008,50 @@ mod tests {
     }
 
     #[test]
+    fn task_checkbox_layers_lower_to_solid_render_commands_in_order() {
+        let revision = Revision::new(13);
+        let viewport = Rect::new(0.0, 0.0, 320.0, 200.0).expect("viewport");
+        let source = TextRange::new(ByteOffset::new(2), ByteOffset::new(5)).expect("marker");
+        let outer_bounds = Rect::new(12.0, 18.0, 14.0, 14.0).expect("outer");
+        let check_bounds = Rect::new(16.0, 23.0, 3.0, 3.0).expect("check");
+        let outer_color = Rgba8::new(38, 111, 219, 255);
+        let mut scene = SceneBuilder::new(revision, viewport).expect("scene");
+        scene
+            .task_checkbox(TaskCheckboxPrimitive::new(
+                source,
+                outer_bounds,
+                outer_color,
+                TaskCheckboxPrimitiveRole::Border,
+            ))
+            .expect("outer");
+        scene
+            .task_checkbox(TaskCheckboxPrimitive::new(
+                source,
+                check_bounds,
+                Rgba8::white(),
+                TaskCheckboxPrimitiveRole::Check,
+            ))
+            .expect("check");
+        let scene = scene.finish();
+        let mut plans = RenderPlanBuilder::new();
+        let atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("atlas"));
+        let plan = plans.build(&scene, &atlas).expect("render plan");
+        assert_eq!(
+            plan.commands(),
+            &[
+                RenderCommand::FillRect {
+                    bounds: outer_bounds,
+                    color: outer_color,
+                },
+                RenderCommand::FillRect {
+                    bounds: check_bounds,
+                    color: Rgba8::white(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn viewport_block_layout_is_translated_to_document_space_atomically() {
         let font_size = 14.0;
         let layout = shaped_layout(font_size);
@@ -1031,7 +1082,8 @@ mod tests {
             Primitive::FillRect { .. }
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
-            | Primitive::Table(_) => {
+            | Primitive::Table(_)
+            | Primitive::TaskCheckbox(_) => {
                 panic!("expected glyph primitive")
             }
         }
@@ -1135,7 +1187,8 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Image(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::Table(_) => {
+                | Primitive::Table(_)
+                | Primitive::TaskCheckbox(_) => {
                     panic!("expected glyph primitive")
                 }
             })

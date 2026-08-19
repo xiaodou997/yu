@@ -686,11 +686,14 @@ private let visualRenderCommandImageBit =
     UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_IMAGE)
 private let visualRenderCommandEmbeddedSvgBit =
     UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG)
+private let visualRenderCommandTaskCheckboxBit =
+    UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX)
 private let supportedVisualRenderCommandMask =
     visualRenderCommandFillRectBit
         | visualRenderCommandGlyphBit
         | visualRenderCommandImageBit
         | visualRenderCommandEmbeddedSvgBit
+        | visualRenderCommandTaskCheckboxBit
 
 private let supportedVisualBlockKindMask =
     (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_BLANK_LINE))
@@ -8284,6 +8287,12 @@ private func runVisualRenderStateSelfCheck() -> Never {
         )
     )
     precondition(
+        hasSupportedVisualRenderCommands(
+            commandCount: 1,
+            commandKindMask: visualRenderCommandTaskCheckboxBit
+        )
+    )
+    precondition(
         !hasSupportedVisualBlockKinds(supportedVisualBlockKindMask | (UInt64(1) << 63))
     )
     precondition(
@@ -9502,15 +9511,20 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
         var previousSourceEnd: Int = 0
         var previousEmbeddedBlock: UInt64?
         var previousEmbeddedSourceEnd: Int = 0
+        var previousTaskBlock: UInt64?
+        var previousTaskSourceEnd: Int = 0
+        var enteredTaskOverlay = false
         var enteredEmbeddedOverlay = false
         var sawFill = false
         var sawGlyph = false
         var sawImage = false
         var sawEmbedded = false
+        var sawTask = false
         let fillKind = UInt8(YU_STORAGE_RENDER_COMMAND_FILL_RECT)
         let glyphKind = UInt8(YU_STORAGE_RENDER_COMMAND_GLYPH)
         let imageKind = UInt8(YU_STORAGE_RENDER_COMMAND_IMAGE)
         let embeddedKind = UInt8(YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG)
+        let taskKind = UInt8(YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX)
         for command in commands {
             precondition(command.revision == revision)
             precondition(command.bounds.origin.x.isFinite)
@@ -9546,10 +9560,30 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
                 )
                 precondition(command.embeddedWidth > 0 && command.embeddedHeight > 0)
                 precondition(command.bounds.width > 0.0 && command.bounds.height > 0.0)
+            case taskKind:
+                sawTask = true
+                precondition(command.page == YU_STORAGE_RENDER_PAGE_NONE)
+                precondition(command.atlasRect.width == 0.0 && command.atlasRect.height == 0.0)
+                precondition(command.advanceX == 0.0)
+                precondition(command.bounds.width > 0.0 && command.bounds.height > 0.0)
             default:
                 preconditionFailure("unknown visual render command kind")
             }
-            if command.kind == embeddedKind {
+            if command.kind == taskKind {
+                precondition(!enteredEmbeddedOverlay)
+                enteredTaskOverlay = true
+                if let previousTaskBlock, command.blockIndex != previousTaskBlock {
+                    precondition(command.sourceRange.location >= previousTaskSourceEnd)
+                }
+                previousTaskSourceEnd = max(
+                    previousTaskSourceEnd,
+                    NSMaxRange(command.sourceRange)
+                )
+                if let previousTaskBlock {
+                    precondition(command.blockIndex >= previousTaskBlock)
+                }
+                previousTaskBlock = command.blockIndex
+            } else if command.kind == embeddedKind {
                 enteredEmbeddedOverlay = true
                 if let previousEmbeddedBlock, command.blockIndex != previousEmbeddedBlock {
                     precondition(command.sourceRange.location >= previousEmbeddedSourceEnd)
@@ -9565,7 +9599,7 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
             } else {
                 // Embedded SVGs are a final overlay pass so they cannot be
                 // painted underneath later text from another block.
-                precondition(!enteredEmbeddedOverlay)
+                precondition(!enteredTaskOverlay && !enteredEmbeddedOverlay)
                 if let previousBlock, command.blockIndex != previousBlock {
                     precondition(command.sourceRange.location >= previousSourceEnd)
                 }
@@ -9582,6 +9616,10 @@ private func runVisualRenderPlanSelfCheck(path: String) -> Never {
         precondition(sawFill)
         precondition(sawGlyph)
         precondition(!expectsImage || sawImage)
+        let expectsTask = bridge.source.contains("[ ]")
+            || bridge.source.contains("[x]")
+            || bridge.source.contains("[X]")
+        precondition(!expectsTask || sawTask)
         let expectsEmbedded = bridge.source.contains("```math")
         precondition(!expectsEmbedded || sawEmbedded)
         precondition(!expectsEmbedded || snapshot.embeddedCommandCount > 0)
