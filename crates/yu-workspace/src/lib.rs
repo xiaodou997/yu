@@ -1159,15 +1159,12 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         let dimensions = intrinsic.dimensions();
         ImageIntrinsicSize::new(dimensions.width(), dimensions.height()).ok()
     };
-    let viewport_snapshot = if document.composition().is_some() {
-        document.visible_blocks_with_composition_and_shaper_and_image_resolver(
+    let viewport_snapshot = document
+        .visible_blocks_with_visual_state_and_shaper_and_image_resolver(
             viewport,
             shaper,
             intrinsic_size,
-        )?
-    } else {
-        document.visible_blocks_with_shaper_and_image_resolver(viewport, shaper, intrinsic_size)?
-    };
+        )?;
     let revision = viewport_snapshot.revision();
     let config = document.viewport_config().layout();
     let geometries = viewport_snapshot
@@ -1202,18 +1199,9 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     )?;
 
     let mut layouts = Vec::with_capacity(viewport_snapshot.blocks().len());
-    let composition_blocks = document.composition_block_range();
     for block in viewport_snapshot.blocks() {
-        let mut layout = if composition_blocks
-            .as_ref()
-            .is_some_and(|span| span.contains(&block.index()))
-        {
-            document.block_layout_with_composition_and_shaper(block.index(), config, shaper)?
-        } else {
-            document
-                .block_layout_with_shaper(block.index(), config, shaper)?
-                .clone()
-        };
+        let mut layout =
+            document.block_layout_for_visual_state_with_shaper(block.index(), config, shaper)?;
         let measurements = layout
             .projection()
             .images()
@@ -1487,13 +1475,13 @@ mod tests {
         font_size: f32,
     ) -> GlyphAtlas {
         let snapshot = document
-            .visible_blocks_with_shaper(viewport, shaper)
+            .visible_blocks_with_visual_state_and_shaper(viewport, shaper)
             .expect("viewport");
         let config = document.viewport_config().layout();
         let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(64, 64, 1).expect("atlas config"));
         for block in snapshot.blocks() {
             let layout = document
-                .block_layout_with_shaper(block.index(), config, shaper)
+                .block_layout_for_visual_state_with_shaper(block.index(), config, shaper)
                 .expect("layout");
             for placement in layout.glyphs() {
                 let key = GlyphRasterKey::new(placement.face(), placement.glyph(), font_size)
@@ -1765,6 +1753,95 @@ mod tests {
             frame.plan().commands().len(),
             frame.scene().scene().primitives().len()
         );
+    }
+
+    #[test]
+    fn retained_frame_reveals_inline_syntax_at_selection_without_source_edit() {
+        let source = "before **strong** after";
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let style = EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        );
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(style);
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let mut plans = RenderPlanBuilder::new();
+        let hidden =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("hidden frame");
+        let hidden_glyphs = hidden
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .filter(|primitive| matches!(primitive, Primitive::Glyph(_)))
+            .count();
+        let revision = document.revision();
+
+        let strong = source.find("strong").expect("strong content");
+        let snapshot = document.snapshot();
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &snapshot,
+                    ByteOffset::new((strong + 2) as u64),
+                    CaretAffinity::Downstream,
+                )
+                .expect("selection"),
+            )
+            .expect("set selection");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let revealed =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("revealed frame");
+        let revealed_glyphs = revealed
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .filter(|primitive| matches!(primitive, Primitive::Glyph(_)))
+            .count();
+
+        assert_eq!(document.revision(), revision);
+        assert_eq!(revealed.revision(), revision);
+        assert_eq!(revealed_glyphs, hidden_glyphs + 4);
+        let caret = revealed
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::EditorDecoration(decoration)
+                    if decoration.role() == EditorDecorationPrimitiveRole::Caret =>
+                {
+                    Some(*decoration)
+                }
+                _ => None,
+            })
+            .expect("revealed caret");
+        assert_eq!(
+            caret.source(),
+            TextRange::empty(ByteOffset::new((strong + 2) as u64))
+        );
+        assert!(caret.bounds().x() > 0.0);
     }
 
     #[test]

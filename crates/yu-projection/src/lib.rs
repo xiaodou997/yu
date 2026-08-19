@@ -410,6 +410,20 @@ impl Projection {
         Self::from_inline(&inline)
     }
 
+    /// Builds an inline projection that reveals parser-owned syntax for every
+    /// supported semantic span touched by `active`. This is a transient view:
+    /// the canonical source and its Revision are unchanged, and callers should
+    /// not put the result in a source-only projection cache.
+    pub fn inline_with_definitions_and_reveal(
+        source: &TextSnapshot,
+        source_range: TextRange,
+        definitions: &ReferenceDefinitionIndex,
+        active: TextRange,
+    ) -> Result<Self, ProjectionError> {
+        let inline = parse_inline_with_definitions(source, source_range, Some(definitions))?;
+        Self::from_inline_with_hidden_and_reveal(&inline, &[], active)
+    }
+
     /// Builds a zero-width projection for source-only blocks such as link
     /// definitions. The source remains canonical and addressable, but it does
     /// not contribute visual bytes.
@@ -440,11 +454,31 @@ impl Projection {
         inline: &InlineDocument,
         extra_hidden: &[TextRange],
     ) -> Result<Self, ProjectionError> {
+        Self::from_inline_with_optional_reveal(inline, extra_hidden, None)
+    }
+
+    /// Builds a projection while revealing paired inline syntax touched by an
+    /// active canonical selection. Block-level `extra_hidden` ranges remain
+    /// hidden; heading/list/table reveal policies are independent features.
+    pub fn from_inline_with_hidden_and_reveal(
+        inline: &InlineDocument,
+        extra_hidden: &[TextRange],
+        active: TextRange,
+    ) -> Result<Self, ProjectionError> {
+        Self::from_inline_with_optional_reveal(inline, extra_hidden, Some(active))
+    }
+
+    fn from_inline_with_optional_reveal(
+        inline: &InlineDocument,
+        extra_hidden: &[TextRange],
+        active: Option<TextRange>,
+    ) -> Result<Self, ProjectionError> {
         let source = inline.source();
         let source_range = inline.source_range();
         let mut hidden = inline
             .spans()
             .iter()
+            .filter(|span| !active.is_some_and(|active| reveals_inline_span(**span, active)))
             .flat_map(|span| [span.opening(), span.closing()])
             .collect::<Vec<_>>();
         hidden.extend_from_slice(extra_hidden);
@@ -1308,6 +1342,26 @@ fn build_runs(
     Ok(runs)
 }
 
+fn reveals_inline_span(span: InlineSpan, active: TextRange) -> bool {
+    if !matches!(
+        span.kind(),
+        InlineSpanKind::Emphasis
+            | InlineSpanKind::Strong
+            | InlineSpanKind::CodeSpan
+            | InlineSpanKind::Link
+            | InlineSpanKind::ReferenceLink
+            | InlineSpanKind::Autolink
+    ) {
+        return false;
+    }
+    let source = span.source_range();
+    if active.is_empty() {
+        source.start() < active.start() && active.start() < source.end()
+    } else {
+        active.start() < source.end() && source.start() < active.end()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProjectionEvent {
     Hidden(TextRange),
@@ -1749,7 +1803,7 @@ impl BlockProjection {
             BlockKind::ReferenceDefinition => {
                 Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
             }
-            BlockKind::TaskListItem { .. } => Self::task_list(source, block, None),
+            BlockKind::TaskListItem { .. } => Self::task_list(source, block, None, None),
             BlockKind::Paragraph => {
                 if let Some(table) = TableProjection::from_block(source, block, None)? {
                     Ok(Self::Table(table))
@@ -1769,34 +1823,90 @@ impl BlockProjection {
         block: Block,
         definitions: &ReferenceDefinitionIndex,
     ) -> Result<Self, ProjectionError> {
+        Self::from_block_with_definitions_and_optional_reveal(source, block, definitions, None)
+    }
+
+    /// Builds a transient block projection whose supported inline syntax is
+    /// visible when touched by `active`. The block kind and all source-backed
+    /// metadata remain identical to the canonical cached projection.
+    pub fn from_block_with_definitions_and_reveal(
+        source: &TextSnapshot,
+        block: Block,
+        definitions: &ReferenceDefinitionIndex,
+        active: TextRange,
+    ) -> Result<Self, ProjectionError> {
+        Self::from_block_with_definitions_and_optional_reveal(
+            source,
+            block,
+            definitions,
+            Some(active),
+        )
+    }
+
+    fn from_block_with_definitions_and_optional_reveal(
+        source: &TextSnapshot,
+        block: Block,
+        definitions: &ReferenceDefinitionIndex,
+        active: Option<TextRange>,
+    ) -> Result<Self, ProjectionError> {
         match block.kind() {
             BlockKind::ReferenceDefinition => {
                 Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
             }
-            BlockKind::TaskListItem { .. } => Self::task_list(source, block, Some(definitions)),
+            BlockKind::TaskListItem { .. } => {
+                Self::task_list(source, block, Some(definitions), active)
+            }
             BlockKind::FencedCodeBlock { .. } => {
                 CodeProjection::from_block(source, block).map(Self::FencedCode)
             }
-            BlockKind::AtxHeading { .. } => {
-                Self::structural_inline(source, block, definitions, BlockProjectionKind::Heading)
-            }
-            BlockKind::BlockQuote { .. } => {
-                Self::structural_inline(source, block, definitions, BlockProjectionKind::BlockQuote)
-            }
-            BlockKind::ListItem { .. } => {
-                Self::structural_inline(source, block, definitions, BlockProjectionKind::List)
-            }
+            BlockKind::AtxHeading { .. } => Self::structural_inline(
+                source,
+                block,
+                definitions,
+                BlockProjectionKind::Heading,
+                active,
+            ),
+            BlockKind::BlockQuote { .. } => Self::structural_inline(
+                source,
+                block,
+                definitions,
+                BlockProjectionKind::BlockQuote,
+                active,
+            ),
+            BlockKind::ListItem { .. } => Self::structural_inline(
+                source,
+                block,
+                definitions,
+                BlockProjectionKind::List,
+                active,
+            ),
             BlockKind::Paragraph => {
                 if let Some(table) = TableProjection::from_block(source, block, Some(definitions))?
                 {
                     Ok(Self::Table(table))
                 } else {
-                    Projection::inline_with_definitions(source, block.range(), definitions)
-                        .map(Self::Inline)
+                    let inline =
+                        parse_inline_with_definitions(source, block.range(), Some(definitions))?;
+                    match active {
+                        Some(active) => {
+                            Projection::from_inline_with_hidden_and_reveal(&inline, &[], active)
+                        }
+                        None => Projection::from_inline(&inline),
+                    }
+                    .map(Self::Inline)
                 }
             }
-            _ => Projection::inline_with_definitions(source, block.range(), definitions)
-                .map(Self::Inline),
+            _ => {
+                let inline =
+                    parse_inline_with_definitions(source, block.range(), Some(definitions))?;
+                match active {
+                    Some(active) => {
+                        Projection::from_inline_with_hidden_and_reveal(&inline, &[], active)
+                    }
+                    None => Projection::from_inline(&inline),
+                }
+                .map(Self::Inline)
+            }
         }
     }
 
@@ -1841,6 +1951,7 @@ impl BlockProjection {
         source: &TextSnapshot,
         block: Block,
         definitions: Option<&ReferenceDefinitionIndex>,
+        active: Option<TextRange>,
     ) -> Result<Self, ProjectionError> {
         let marker = yu_markdown::task_marker(source, block).ok_or(
             ProjectionError::InvalidTaskListBlock {
@@ -1853,7 +1964,13 @@ impl BlockProjection {
             }
             None => parse_inline(source, block.range())?,
         };
-        Projection::from_inline_with_hidden(&inline, &[marker.range()]).map(Self::TaskList)
+        match active {
+            Some(active) => {
+                Projection::from_inline_with_hidden_and_reveal(&inline, &[marker.range()], active)
+            }
+            None => Projection::from_inline_with_hidden(&inline, &[marker.range()]),
+        }
+        .map(Self::TaskList)
     }
 
     fn structural_inline(
@@ -1861,12 +1978,16 @@ impl BlockProjection {
         block: Block,
         definitions: &ReferenceDefinitionIndex,
         kind: BlockProjectionKind,
+        active: Option<TextRange>,
     ) -> Result<Self, ProjectionError> {
         let inline = parse_inline_with_definitions(source, block.range(), Some(definitions))?;
-        let projection = Projection::from_inline_with_hidden(
-            &inline,
-            &yu_markdown::block_syntax_hidden_ranges(source, block),
-        )?;
+        let hidden = yu_markdown::block_syntax_hidden_ranges(source, block);
+        let projection = match active {
+            Some(active) => {
+                Projection::from_inline_with_hidden_and_reveal(&inline, &hidden, active)
+            }
+            None => Projection::from_inline_with_hidden(&inline, &hidden),
+        }?;
         Ok(match kind {
             BlockProjectionKind::Heading => Self::Heading(projection),
             BlockProjectionKind::BlockQuote => Self::BlockQuote(projection),
@@ -2151,6 +2272,89 @@ mod tests {
                 .expect("source range should be ordered"),
         )
         .expect("projection should build")
+    }
+
+    fn projection_with_reveal(source: &str, active: TextRange) -> Projection {
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .expect("source range should be ordered");
+        let inline = parse_inline(&snapshot, range).expect("inline parse");
+        Projection::from_inline_with_hidden_and_reveal(&inline, &[], active)
+            .expect("revealed projection should build")
+    }
+
+    fn projected_text(projection: &Projection) -> String {
+        projection
+            .runs()
+            .iter()
+            .filter(|run| run.kind() != VisualRunKind::HiddenSyntax)
+            .map(|run| projection.text_for_run(*run).expect("run text"))
+            .collect()
+    }
+
+    #[test]
+    fn active_inline_span_reveals_only_its_parser_owned_syntax() {
+        let source = "a **strong** [link](url) `code` ![img](asset.png) z";
+        let strong = source.find("strong").expect("strong content");
+        let projection = projection_with_reveal(
+            source,
+            TextRange::empty(ByteOffset::new((strong + 2) as u64)),
+        );
+
+        assert_eq!(projected_text(&projection), "a **strong** link code img z");
+        assert_eq!(
+            projection
+                .runs()
+                .iter()
+                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
+                .count(),
+            6
+        );
+        let opening_end = ByteOffset::new(strong as u64);
+        let visual = projection
+            .source_to_visual(opening_end, ProjectionBias::After)
+            .expect("revealed opening boundary");
+        assert_eq!(
+            projection
+                .visual_to_source(visual, ProjectionBias::After)
+                .expect("revealed syntax round trip"),
+            opening_end
+        );
+    }
+
+    #[test]
+    fn selection_reveals_links_but_keeps_image_syntax_projected() {
+        let source = "[link](https://example.test) and ![img](asset.png)";
+        let label = source.find("link").expect("link label");
+        let projection = projection_with_reveal(
+            source,
+            TextRange::new(
+                ByteOffset::new(label as u64),
+                ByteOffset::new((label + "link".len()) as u64),
+            )
+            .expect("active selection"),
+        );
+
+        assert_eq!(
+            projected_text(&projection),
+            "[link](https://example.test) and img"
+        );
+        assert!(projection.images().iter().any(|image| {
+            let start = usize::try_from(image.source().start()).expect("image start");
+            source[start..].starts_with("![img]")
+        }));
+    }
+
+    #[test]
+    fn caret_on_span_outer_boundary_does_not_reveal_adjacent_syntax() {
+        let source = "**strong** tail";
+        let projection = projection_with_reveal(
+            source,
+            TextRange::empty(ByteOffset::new("**strong**".len() as u64)),
+        );
+
+        assert_eq!(projected_text(&projection), "strong tail");
     }
 
     #[test]

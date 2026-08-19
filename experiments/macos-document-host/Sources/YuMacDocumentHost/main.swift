@@ -6636,6 +6636,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         }
         textView.onCaretChange = { [weak self] in
             guard let self else { return }
+            try? self.textView.refreshVisualMirrorForDisplay()
             self.surfaceCoordinator.invalidateEditorDecorationPublication()
             self.clearVisualDecorations(reason: .waitingForSurface)
             self.scheduleVisualSubmit()
@@ -7999,6 +8000,9 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
         let bridge = try StorageBridge(path: path)
         let textView = DocumentTextView(bridge: bridge)
         try textView.setVisualMirrorEnabledForSelfCheck(true)
+        textView.onCaretChange = {
+            try? textView.refreshVisualMirrorForDisplay()
+        }
         let revision = bridge.state.revision
         let projected = try bridge.projectedSource(revision: revision)
         let mirrorStorage = NSTextStorage(string: projected)
@@ -8021,6 +8025,11 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
         precondition(textView.visualCaretRectForDisplay() != nil)
         precondition(textView.applyVisualSelectionForSelfCheck(visualStrong))
         precondition(bridge.selection.range == sourceStrong)
+        let revealed = try bridge.projectedSource(revision: revision)
+        let revealedStrong = (revealed as NSString).range(of: "**粗体**")
+        precondition(revealedStrong.location != NSNotFound)
+        precondition(revealedStrong.length == sourceStrong.length)
+        precondition(textView.visualMirrorStringForSelfCheck() == revealed)
         precondition(textView.visualCaretRectForDisplay() != nil)
         let selectionRects = textView.visualSelectionRectsForSelfCheck()
         precondition(!selectionRects.isEmpty)
@@ -8038,25 +8047,32 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
             sourceRange: sourceStrong,
             affinity: 1
         )
-        precondition(forward.visualRange == visualStrong)
+        precondition(forward.visualRange == revealedStrong)
         let reverse = try bridge.projectionSourceSelection(
             revision: revision,
-            visualRange: visualStrong,
+            visualRange: revealedStrong,
             affinity: 1
         )
         precondition(reverse.revision == revision)
-        precondition(reverse.visualRange == visualStrong)
+        precondition(reverse.visualRange == revealedStrong)
         precondition(reverse.sourceRange == sourceStrong)
-        precondition(reverse.roundTripVisualRange == visualStrong)
+        precondition(reverse.roundTripVisualRange == revealedStrong)
 
         let visualCaret = try bridge.projectionSourceCaret(
             revision: revision,
-            visualUTF16: UInt64(visualStrong.location),
+            visualUTF16: UInt64(revealedStrong.location),
             affinity: 0
         )
         precondition(visualCaret.revision == revision)
         precondition(visualCaret.sourceUTF16 == UInt64(sourceStrong.location))
-        precondition(visualCaret.roundTripVisualUTF16 == UInt64(visualStrong.location))
+        precondition(visualCaret.roundTripVisualUTF16 == UInt64(revealedStrong.location))
+
+        precondition(
+            textView.applyVisualSelectionForSelfCheck(NSRange(location: 0, length: 0))
+        )
+        let hiddenAgain = try bridge.projectedSource(revision: revision)
+        precondition(hiddenAgain == projected)
+        precondition(textView.visualMirrorStringForSelfCheck() == projected)
 
         _ = try bridge.insertText("x")
         do {
@@ -8074,8 +8090,8 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
         precondition(mirrorStorage.string == projected)
         print(
             "Yu Visual Mirror self-check: TextKit visual UTF-16 range "
-                + "\(visualStrong) ↔ source range \(sourceStrong), selection highlight "
-                + "rects=\(selectionRects.count); stale mirror rejected"
+                + "\(revealedStrong) ↔ source range \(sourceStrong), delimiters reveal/hide, "
+                + "selection highlight rects=\(selectionRects.count); stale mirror rejected"
         )
         exit(EXIT_SUCCESS)
     } catch {
@@ -10413,6 +10429,11 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         let imageFixture = try installMacosImageSelfCheckFixture(at: path)
         defer { removeMacosImageSelfCheckFixture(imageFixture) }
         let bridge = try StorageBridge(path: path)
+        let strong = (bridge.source as NSString).range(of: "**粗体**")
+        precondition(strong.location != NSNotFound)
+        try bridge.setSelection(NSRange(location: strong.location + 2, length: 0))
+        let revealedSource = try bridge.projectedSource(revision: bridge.state.revision)
+        precondition(revealedSource.contains("**粗体**"))
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
         let initialFrame = NSRect(x: 0.0, y: 0.0, width: 500.0, height: 240.0)
@@ -10482,7 +10503,10 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
             precondition(first.blockKindMask != 0)
         }
         precondition(first.selectionDecorationCount == 0)
-        precondition(first.caretDecorationCount == 1)
+        precondition(
+            first.caretDecorationCount == 1,
+            "initial caret missing: clip=\(scrollView.contentView.bounds) sourceSelection=\(bridge.selection.range)"
+        )
         precondition(
             submittedSurfaceOwnsVisualDecorations(
                 first,
@@ -10511,6 +10535,9 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
                 compositionGeneration: bridge.composition.generation
             )
         )
+        try bridge.setSelection(NSRange(location: 0, length: 0))
+        let hiddenSource = try bridge.projectedSource(revision: bridge.state.revision)
+        precondition(!hiddenSource.contains("**粗体**"))
         coordinator.invalidateEditorDecorationPublication()
         precondition(coordinator.lastSnapshot == nil)
         precondition(
@@ -10523,6 +10550,7 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         precondition(selectionOnlyRefresh.revision == first.revision)
         precondition(selectionOnlyRefresh.frameSerial > first.frameSerial)
         precondition(selectionOnlyRefresh.caretDecorationCount == 1)
+        precondition(selectionOnlyRefresh.commandCount + 4 == first.commandCount)
 
         if bridge.source.contains("```mermaid") || bridge.source.contains("```math") {
             let embeddedResources = try bridge.macosVisualEmbeddedResources(

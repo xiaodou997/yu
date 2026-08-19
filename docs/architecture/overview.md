@@ -125,6 +125,14 @@ Revision 对齐的 `MarkdownDocument`、revision-bound `EditorSelection`、trans
 和 `ProjectionCache`。平台 view 可以保留 AppKit 的渲染/输入投影，但永久命令必须回到该边界
 并通过 Transaction 提交。
 
+普通投影隐藏 emphasis、strong、code span 和 link 等 parser-owned inline delimiter；caret 严格
+位于 span 内或非空 selection 与 span 相交时，焦点 block 使用不入缓存的 transient reveal
+projection/layout。selection-only 变化不推进 source Revision，因此 canonical projection/layout
+cache 仍只由 Revision 标识；revealed frame 通过新的 publication serial 区分。delimiter 可能改变
+换行，所以 viewport lookup 前会先重新测量焦点 block。活动 IME composition 优先于 reveal，避免
+两个 transient 文本模型叠加。macOS projected mirror、hit test、decoration、glyph atlas 与 retained
+scene 必须读取同一个 visual state。见 ADR 0179。
+
 composition 需要参与视觉布局时，`Projection::with_composition` 在 canonical projection 上建立
 一个不入缓存的临时视图：替换范围外仍使用 parser-owned runs，preedit 是 plain
 `VisualRunKind::Composition`。layout/shaping 通过 projection 读取临时文本和零基 shaping range，
