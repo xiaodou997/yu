@@ -612,14 +612,17 @@ Metal bridge 在提交边界统一减去该原点得到 surface-local 坐标。v
 可见 surface 尺寸，不会误变成整篇文档高度。这个修复是完整 visual renderer 迁移的前置契约，
 并不关闭 TextKit source mirror 的字形回退。见 ADR 0135。
 
-产品窗口现在还有一个独立的 `MacosVisualDecorationView` sibling，位于 Metal surface 之上，
-只绘制当前 Revision 的 visual selection/caret rectangles，并对 hit-test 返回空。它使用已经
+产品窗口保留一个独立的 `MacosVisualDecorationView` sibling，位于 Metal surface 之上，
+只保存当前 Revision 的 visual selection/caret rectangles，并对 hit-test 返回空。它使用已经
 通过 Revision + composition generation 校验的 Rust/CoreText-shaped geometry FFI；选择矩形和
 caret 是 document-space owned scalar，Swift 只应用当前 scroll origin，不复制 source、selection、
-IME、HeightIndex 或 Accessibility state。TextKit 在 decoration frame 有效时停止自绘
-selection/caret；Rust composition geometry 失效、frame stale、surface detach 或 native submit
-失败时立即清空 overlay 并恢复 TextKit 自绘。TextKit visual mirror 现在只作为显式失败回退，
-完整 visual renderer 仍未迁移。见 ADR 0136、0137、0153。
+IME、HeightIndex 或 Accessibility state。正常 publication 还把相同 geometry 作为 source-backed
+`EditorDecorationPrimitive` 放进 retained scene，由既有 solid/Metal pipeline 绘制。host surface
+snapshot 公布 selection/caret layer count；只有 Revision、composition generation 和两种 count
+都与独立 geometry query 一致时，sibling 才关闭 AppKit 绘制。Rust composition geometry 失效、
+frame stale、surface detach、native submit 失败或 count 不一致时，sibling 继续作为 AppKit fallback。
+TextKit visual mirror 只作为 active composition 的最后失败回退，完整 visual renderer 仍未迁移。
+见 ADR 0136、0137、0153、0176。
 
 在该 sibling 与 persistent Metal surface 均稳定后，`DocumentTextView` 还使用一个更窄的
 source-glyph gate：只有当前 Revision、composition generation、字体/宽度、scroll origin、

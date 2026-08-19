@@ -434,6 +434,68 @@ pub struct TaskCheckboxPrimitive {
     role: TaskCheckboxPrimitiveRole,
 }
 
+/// Semantic role for transient editor chrome retained with a visual frame.
+///
+/// These roles remain distinct in the scene even though the current renderer
+/// lowers them to solid rectangles. Platform hosts can therefore prove that a
+/// submitted frame owns the selection/caret pixels without inferring meaning
+/// from color or geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EditorDecorationPrimitiveRole {
+    Selection,
+    Caret,
+    CompositionCaret,
+}
+
+/// One source-backed selection or caret rectangle.
+///
+/// `source` is the canonical selection intersection for a selection layer and
+/// an empty range at the canonical focus/replacement boundary for a caret.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditorDecorationPrimitive {
+    source: TextRange,
+    bounds: Rect,
+    color: Rgba8,
+    role: EditorDecorationPrimitiveRole,
+}
+
+impl EditorDecorationPrimitive {
+    #[must_use]
+    pub const fn new(
+        source: TextRange,
+        bounds: Rect,
+        color: Rgba8,
+        role: EditorDecorationPrimitiveRole,
+    ) -> Self {
+        Self {
+            source,
+            bounds,
+            color,
+            role,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> Rect {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn color(self) -> Rgba8 {
+        self.color
+    }
+
+    #[must_use]
+    pub const fn role(self) -> EditorDecorationPrimitiveRole {
+        self.role
+    }
+}
+
 impl TaskCheckboxPrimitive {
     #[must_use]
     pub const fn new(
@@ -565,6 +627,7 @@ pub enum Primitive {
     EmbeddedSvg(EmbeddedSvgPrimitive),
     Table(TablePrimitive),
     TaskCheckbox(TaskCheckboxPrimitive),
+    EditorDecoration(EditorDecorationPrimitive),
 }
 
 impl Primitive {
@@ -577,6 +640,7 @@ impl Primitive {
             Self::EmbeddedSvg(svg) => svg.bounds(),
             Self::Table(table) => table.bounds(),
             Self::TaskCheckbox(task) => task.bounds(),
+            Self::EditorDecoration(decoration) => decoration.bounds(),
         }
     }
 }
@@ -860,6 +924,13 @@ impl SceneBuilder {
 
     pub fn task_checkbox(&mut self, task: TaskCheckboxPrimitive) -> Result<u32, SceneError> {
         self.push(Primitive::TaskCheckbox(task))
+    }
+
+    pub fn editor_decoration(
+        &mut self,
+        decoration: EditorDecorationPrimitive,
+    ) -> Result<u32, SceneError> {
+        self.push(Primitive::EditorDecoration(decoration))
     }
 
     /// Appends source-backed table header, selection and grid decorations.

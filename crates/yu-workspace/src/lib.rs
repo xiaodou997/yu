@@ -15,18 +15,19 @@ use yu_assets::{
     EmbeddedRenderPayload, EmbeddedRenderPublication, ImageIntrinsicPublication, ImageKey,
     ImagePublication,
 };
-use yu_core::Revision;
+use yu_core::{Revision, TextRange};
 use yu_editor::{
-    BlockKind, EditorDocument, EditorDocumentError, ImageSource, LayoutError, ProjectionBias,
-    ShapingProvider, TableResizeCommit, TableResizeTarget, TaskState, ViewportRect, task_marker,
+    BlockKind, CaretAffinity, EditorDocument, EditorDocumentError, ImageSource, LayoutError,
+    ProjectionBias, ShapingProvider, TableResizeCommit, TableResizeTarget, TaskState, ViewportRect,
+    task_marker,
 };
 use yu_font::GlyphAtlas;
 use yu_layout::ImageIntrinsicSize;
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
-    EmbeddedSvgPrimitive, ImagePrimitive, Point, Primitive, Rect, Rgba8, Scene, SceneBuilder,
-    SceneError, TableSceneStyle, TaskCheckboxPrimitive, TaskCheckboxPrimitiveRole,
-    ViewportBlockGeometry, ViewportSceneInput,
+    EditorDecorationPrimitive, EditorDecorationPrimitiveRole, EmbeddedSvgPrimitive, ImagePrimitive,
+    Point, Primitive, Rect, Rgba8, Scene, SceneBuilder, SceneError, TableSceneStyle,
+    TaskCheckboxPrimitive, TaskCheckboxPrimitiveRole, ViewportBlockGeometry, ViewportSceneInput,
 };
 
 mod workspace;
@@ -150,6 +151,194 @@ fn append_task_checkbox(
     Ok(())
 }
 
+/// Platform-selected colors and geometry for selection/caret scene layers.
+///
+/// This stays outside `yu-scene`: the retained scene records semantic roles,
+/// while the workspace/platform boundary chooses product colors and whether
+/// editor chrome belongs in a publication at all.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditorDecorationStyle {
+    selection: Rgba8,
+    caret: Rgba8,
+    composition_caret: Rgba8,
+    caret_width: f32,
+}
+
+impl EditorDecorationStyle {
+    #[must_use]
+    pub const fn new(
+        selection: Rgba8,
+        caret: Rgba8,
+        composition_caret: Rgba8,
+        caret_width: f32,
+    ) -> Self {
+        Self {
+            selection,
+            caret,
+            composition_caret,
+            caret_width,
+        }
+    }
+}
+
+fn append_editor_decorations(
+    builder: &mut SceneBuilder,
+    document: &EditorDocument,
+    input: &ViewportSceneInput,
+    layouts: &[yu_layout::LayoutSnapshot],
+    style: EditorDecorationStyle,
+) -> Result<(), ViewportSceneError> {
+    if !style.caret_width.is_finite() || style.caret_width <= 0.0 {
+        return Err(
+            SceneError::InvalidGeometry("editor caret width must be finite and positive").into(),
+        );
+    }
+    let selection = document.selection();
+    let selection_range = selection.ordered_range();
+    let composition = document.composition();
+    let composition_blocks = document.composition_block_range();
+    let focus_block = if composition.is_some() {
+        composition_blocks.as_ref().map(|span| span.start)
+    } else {
+        document.block_index_for_source(selection.focus())
+    };
+
+    let mut caret = None;
+    for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
+        let (visual_start, visual_end, layer_source) = if let Some(overlay) = composition {
+            let Some(visual) = layout.projection().composition_selection_visual() else {
+                if focus_block == Some(geometry.index()) {
+                    let visual = layout
+                        .projection()
+                        .source_to_visual(
+                            overlay.replacement_range().start(),
+                            ProjectionBias::Before,
+                        )
+                        .map_err(EditorDocumentError::from)?;
+                    let layout_caret = layout
+                        .caret_for_visual(visual, ProjectionBias::After)
+                        .map_err(EditorDocumentError::from)?;
+                    caret = Some((
+                        TextRange::empty(overlay.replacement_range().start()),
+                        layout_caret,
+                        EditorDecorationPrimitiveRole::CompositionCaret,
+                        geometry.y(),
+                        layout.config().line_height(),
+                    ));
+                }
+                continue;
+            };
+            if focus_block == Some(geometry.index()) {
+                let layout_caret = layout
+                    .caret_for_visual(visual.end(), ProjectionBias::After)
+                    .map_err(EditorDocumentError::from)?;
+                caret = Some((
+                    TextRange::empty(overlay.replacement_range().start()),
+                    layout_caret,
+                    EditorDecorationPrimitiveRole::CompositionCaret,
+                    geometry.y(),
+                    layout.config().line_height(),
+                ));
+            }
+            (visual.start(), visual.end(), overlay.replacement_range())
+        } else {
+            if focus_block == Some(geometry.index()) {
+                let bias = match selection.affinity() {
+                    CaretAffinity::Upstream => ProjectionBias::Before,
+                    CaretAffinity::Downstream => ProjectionBias::After,
+                };
+                let layout_caret = layout
+                    .caret_for_source(selection.focus(), bias)
+                    .map_err(EditorDocumentError::from)?;
+                caret = Some((
+                    TextRange::empty(selection.focus()),
+                    layout_caret,
+                    EditorDecorationPrimitiveRole::Caret,
+                    geometry.y(),
+                    layout.config().line_height(),
+                ));
+            }
+            if selection.is_empty() {
+                continue;
+            }
+            let start = selection_range.start().max(geometry.source().start());
+            let end = selection_range.end().min(geometry.source().end());
+            if start >= end {
+                continue;
+            }
+            let source = TextRange::new(start, end).expect("ordered selection intersection");
+            (
+                layout
+                    .projection()
+                    .source_to_visual(start, ProjectionBias::Before)
+                    .map_err(EditorDocumentError::from)?,
+                layout
+                    .projection()
+                    .source_to_visual(end, ProjectionBias::After)
+                    .map_err(EditorDocumentError::from)?,
+                source,
+            )
+        };
+
+        if visual_start >= visual_end {
+            continue;
+        }
+        for line in layout.lines() {
+            let line_start = line.visual().start().max(visual_start);
+            let line_end = line.visual().end().min(visual_end);
+            if line_start >= line_end {
+                continue;
+            }
+            let mut left = f32::INFINITY;
+            let mut right = f32::NEG_INFINITY;
+            for cluster_index in line.cluster_range() {
+                let cluster = layout.clusters()[cluster_index];
+                if cluster.is_line_break()
+                    || cluster.visual().end() <= line_start
+                    || cluster.visual().start() >= line_end
+                {
+                    continue;
+                }
+                left = left.min(cluster.x());
+                right = right.max(cluster.x() + cluster.width());
+            }
+            if left.is_finite() && right.is_finite() && right > left {
+                builder.editor_decoration(EditorDecorationPrimitive::new(
+                    layer_source,
+                    Rect::new(
+                        left,
+                        geometry.y() + line.y(),
+                        right - left,
+                        layout.config().line_height(),
+                    )?,
+                    style.selection,
+                    EditorDecorationPrimitiveRole::Selection,
+                ))?;
+            }
+        }
+    }
+
+    if let Some((source, caret, role, block_y, line_height)) = caret {
+        let color = if role == EditorDecorationPrimitiveRole::CompositionCaret {
+            style.composition_caret
+        } else {
+            style.caret
+        };
+        builder.editor_decoration(EditorDecorationPrimitive::new(
+            source,
+            Rect::new(
+                caret.point().x(),
+                block_y + caret.point().y(),
+                style.caret_width,
+                line_height,
+            )?,
+            color,
+            role,
+        ))?;
+    }
+    Ok(())
+}
+
 impl ViewportSceneFrame {
     #[must_use]
     pub fn revision(&self) -> Revision {
@@ -256,6 +445,7 @@ pub struct ViewportRenderConfig {
     scene_viewport: Rect,
     color: Rgba8,
     table_resize: Option<TableResizeCommit>,
+    editor_decorations: Option<EditorDecorationStyle>,
 }
 
 impl ViewportRenderConfig {
@@ -272,6 +462,7 @@ impl ViewportRenderConfig {
             scene_viewport,
             color,
             table_resize: None,
+            editor_decorations: None,
         }
     }
 
@@ -280,6 +471,12 @@ impl ViewportRenderConfig {
     #[must_use]
     pub const fn with_table_resize(mut self, resize: TableResizeCommit) -> Self {
         self.table_resize = Some(resize);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_editor_decorations(mut self, style: EditorDecorationStyle) -> Self {
+        self.editor_decorations = Some(style);
         self
     }
 
@@ -306,6 +503,11 @@ impl ViewportRenderConfig {
     #[must_use]
     pub const fn table_resize(self) -> Option<TableResizeCommit> {
         self.table_resize
+    }
+
+    #[must_use]
+    pub const fn editor_decorations(self) -> Option<EditorDecorationStyle> {
+        self.editor_decorations
     }
 }
 
@@ -865,6 +1067,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: Sh
         image_intrinsics,
         &[],
         table_resize,
+        None,
     )
 }
 
@@ -887,6 +1090,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     image_intrinsics: &[ImageIntrinsicPublication],
     embedded_publications: &[EmbeddedRenderPublication],
     table_resize: Option<TableResizeCommit>,
+    editor_decorations: Option<EditorDecorationStyle>,
 ) -> Result<ViewportSceneFrame, ViewportSceneError> {
     let source = document.snapshot();
     let definitions = document.markdown().reference_definitions().clone();
@@ -1097,6 +1301,9 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
             Rgba8::new(0, 0, 0, 0),
         ))?;
     }
+    if let Some(style) = editor_decorations {
+        append_editor_decorations(&mut builder, document, &input, &layouts, style)?;
+    }
     Ok(ViewportSceneFrame {
         input,
         scene: builder.finish(),
@@ -1203,6 +1410,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded<
         image_intrinsics,
         embedded_publications,
         config.table_resize(),
+        config.editor_decorations(),
     )?;
     if scene.revision() != document.revision() {
         return Err(ViewportFrameError::Stale {
@@ -1220,7 +1428,7 @@ mod tests {
     use std::sync::Arc;
 
     use yu_assets::{EmbeddedRenderPayload, EmbeddedRenderRequest, EmbeddedResourceKind};
-    use yu_core::ByteOffset;
+    use yu_core::{ByteOffset, TextRange, Utf16Offset, Utf16Range};
     use yu_editor::{
         CaretAffinity, EditorCommand, EditorSelection, LayoutConfig, LayoutPoint,
         TableResizeGesture, ViewportConfig,
@@ -1322,6 +1530,135 @@ mod tests {
                 .iter()
                 .all(|primitive| matches!(primitive, Primitive::Glyph(_)))
         );
+    }
+
+    #[test]
+    fn configured_editor_decorations_publish_selection_and_caret_layers() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let mut document = EditorDocument::new("alpha beta");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let snapshot = document.snapshot();
+        document
+            .set_selection(
+                EditorSelection::range(
+                    &snapshot,
+                    ByteOffset::new(0),
+                    ByteOffset::new(5),
+                    CaretAffinity::Downstream,
+                )
+                .expect("selection"),
+            )
+            .expect("set selection");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let style = EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        );
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(style);
+        let mut plans = RenderPlanBuilder::new();
+        let frame =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("decorated frame");
+        let decorations = frame
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::EditorDecoration(decoration) => Some(*decoration),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decorations
+                .iter()
+                .filter(|decoration| {
+                    decoration.role() == EditorDecorationPrimitiveRole::Selection
+                })
+                .count(),
+            1
+        );
+        let caret = decorations
+            .iter()
+            .find(|decoration| decoration.role() == EditorDecorationPrimitiveRole::Caret)
+            .expect("caret decoration");
+        assert_eq!(caret.source(), TextRange::empty(ByteOffset::new(5)));
+        assert_eq!(caret.bounds().width(), 1.0);
+        assert_eq!(
+            frame.plan().commands().len(),
+            frame.scene().scene().primitives().len()
+        );
+    }
+
+    #[test]
+    fn composition_decorations_use_transient_projection_without_source_edit() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let mut document = EditorDocument::new("日本 alpha");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let revision = document.revision();
+        document
+            .begin_composition(
+                TextRange::new(ByteOffset::new(7), ByteOffset::new(12)).expect("replacement"),
+                "日本",
+                Utf16Range::new(Utf16Offset::new(0), Utf16Offset::new(1))
+                    .expect("preedit selection"),
+            )
+            .expect("begin composition");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        ));
+        let mut plans = RenderPlanBuilder::new();
+        let frame =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("composition frame");
+        assert_eq!(document.revision(), revision);
+        let roles = frame
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::EditorDecoration(decoration) => Some(decoration.role()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(roles.contains(&EditorDecorationPrimitiveRole::Selection));
+        assert!(roles.contains(&EditorDecorationPrimitiveRole::CompositionCaret));
+        assert!(!roles.contains(&EditorDecorationPrimitiveRole::Caret));
     }
 
     #[test]
@@ -1614,7 +1951,8 @@ mod tests {
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
                 | Primitive::Table(_)
-                | Primitive::TaskCheckbox(_) => None,
+                | Primitive::TaskCheckbox(_)
+                | Primitive::EditorDecoration(_) => None,
             })
             .expect("image primitive");
         assert_eq!(image.bounds().width(), 200.0);
@@ -1643,7 +1981,8 @@ mod tests {
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
                 | Primitive::Table(_)
-                | Primitive::TaskCheckbox(_) => None,
+                | Primitive::TaskCheckbox(_)
+                | Primitive::EditorDecoration(_) => None,
             })
             .expect("metadata-only image primitive");
         assert_eq!(metadata_image.bounds().width(), 200.0);
@@ -1695,7 +2034,8 @@ mod tests {
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
             | Primitive::Table(_)
-            | Primitive::TaskCheckbox(_) => {
+            | Primitive::TaskCheckbox(_)
+            | Primitive::EditorDecoration(_) => {
                 panic!("code block background must precede glyphs")
             }
         }

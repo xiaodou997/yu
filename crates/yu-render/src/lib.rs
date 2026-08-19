@@ -417,6 +417,12 @@ impl RenderPlanBuilder {
                         color: task.color(),
                     });
                 }
+                Primitive::EditorDecoration(decoration) => {
+                    commands.push(RenderCommand::FillRect {
+                        bounds: decoration.bounds(),
+                        color: decoration.color(),
+                    });
+                }
             }
         }
 
@@ -1083,7 +1089,8 @@ mod tests {
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
             | Primitive::Table(_)
-            | Primitive::TaskCheckbox(_) => {
+            | Primitive::TaskCheckbox(_)
+            | Primitive::EditorDecoration(_) => {
                 panic!("expected glyph primitive")
             }
         }
@@ -1188,7 +1195,8 @@ mod tests {
                 | Primitive::Image(_)
                 | Primitive::EmbeddedSvg(_)
                 | Primitive::Table(_)
-                | Primitive::TaskCheckbox(_) => {
+                | Primitive::TaskCheckbox(_)
+                | Primitive::EditorDecoration(_) => {
                     panic!("expected glyph primitive")
                 }
             })

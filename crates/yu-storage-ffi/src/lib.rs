@@ -40,11 +40,13 @@ use yu_text::{EditError, TextSnapshot};
 use yu_render::{RenderCommand, RenderPlanBuilder};
 #[cfg(target_os = "macos")]
 use yu_scene::{
-    Point, Primitive, Rect, Rgba8, SceneBuilder, ViewportBlockGeometry, ViewportSceneInput,
+    EditorDecorationPrimitiveRole, Point, Primitive, Rect, Rgba8, SceneBuilder,
+    ViewportBlockGeometry, ViewportSceneInput,
 };
 #[cfg(target_os = "macos")]
 use yu_workspace::{
-    ViewportRenderConfig, assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded,
+    EditorDecorationStyle, ViewportRenderConfig,
+    assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded,
     viewport_block_background,
 };
 
@@ -914,6 +916,11 @@ pub struct YuStorageMacosRenderHostSnapshot {
     /// Bitset of parser-owned block tags present in the current viewport.
     /// Unknown tags are represented by the high sentinel bit.
     pub block_kind_mask: u64,
+    /// Counts of semantic editor decoration layers retained by this exact
+    /// frame. Native code uses them to disable its AppKit painter only after
+    /// the submitted surface proves equivalent selection/caret coverage.
+    pub selection_decoration_count: u64,
+    pub caret_decoration_count: u64,
 }
 
 /// Scalar result from the opt-in real CAMetalLayer submit bridge. The view,
@@ -947,6 +954,8 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub command_kind_mask: u64,
     /// Same viewport block-tag summary as the retained host snapshot.
     pub block_kind_mask: u64,
+    pub selection_decoration_count: u64,
+    pub caret_decoration_count: u64,
 }
 
 /// One glyph primitive copied from the retained scene produced by the
@@ -7027,12 +7036,40 @@ fn macos_render_host_config(
     let scene_height = viewport_height.max(1.0);
     let scene_viewport = Rect::new(0.0, viewport.scroll_y(), max_width, scene_height)
         .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-    Ok(ViewportRenderConfig::new(
-        viewport,
-        size,
-        scene_viewport,
-        Rgba8::black(),
-    ))
+    Ok(
+        ViewportRenderConfig::new(viewport, size, scene_viewport, Rgba8::black())
+            .with_editor_decorations(EditorDecorationStyle::new(
+                Rgba8::new(0, 122, 255, 97),
+                Rgba8::black(),
+                Rgba8::new(0, 122, 255, 255),
+                1.0,
+            )),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_editor_decoration_counts(scene: &yu_scene::Scene) -> Result<(u64, u64), i32> {
+    let mut selection = 0_u64;
+    let mut caret = 0_u64;
+    for primitive in scene.primitives() {
+        let Primitive::EditorDecoration(decoration) = primitive else {
+            continue;
+        };
+        match decoration.role() {
+            EditorDecorationPrimitiveRole::Selection => {
+                selection = selection
+                    .checked_add(1)
+                    .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+            }
+            EditorDecorationPrimitiveRole::Caret
+            | EditorDecorationPrimitiveRole::CompositionCaret => {
+                caret = caret
+                    .checked_add(1)
+                    .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+            }
+        }
+    }
+    Ok((selection, caret))
 }
 
 #[cfg(target_os = "macos")]
@@ -7053,6 +7090,8 @@ fn macos_render_host_snapshot(
         .frame_revision()
         .map_or(u64::MAX, |revision| revision.get());
     let frame_serial = state.host.frame_serial().unwrap_or(u64::MAX);
+    let (selection_decoration_count, caret_decoration_count) =
+        macos_editor_decoration_counts(frame.scene().scene())?;
     Ok(YuStorageMacosRenderHostSnapshot {
         revision: publication.revision().get(),
         composition_generation,
@@ -7079,6 +7118,8 @@ fn macos_render_host_snapshot(
         published: 1,
         command_kind_mask: macos_render_command_kind_mask(plan.commands()),
         block_kind_mask: macos_render_block_kind_mask(frame.scene().input()),
+        selection_decoration_count,
+        caret_decoration_count,
     })
 }
 
@@ -8326,6 +8367,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 submitted: 1,
                 command_kind_mask: host_snapshot.command_kind_mask,
                 block_kind_mask: host_snapshot.block_kind_mask,
+                selection_decoration_count: host_snapshot.selection_decoration_count,
+                caret_decoration_count: host_snapshot.caret_decoration_count,
             };
         }
         YU_STORAGE_OK
@@ -12661,6 +12704,8 @@ mod tests {
         assert!(first.atlas_page_count > 0);
         assert!(first.atlas_glyph_count > 0);
         assert!(first.published != 0);
+        assert_eq!(first.selection_decoration_count, 0);
+        assert_eq!(first.caret_decoration_count, 1);
         assert_ne!(
             first.command_kind_mask & (1_u64 << u32::from(YU_STORAGE_RENDER_COMMAND_GLYPH)),
             0

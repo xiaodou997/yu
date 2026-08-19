@@ -524,8 +524,10 @@
 26. `MacosVisualDecorationView` 只能保存当前 Revision 的 owned selection/caret rectangles，必须
     对 AppKit hit-test 返回 `nil`，不得拥有 source、selection、IME 或 Accessibility state。它位于
     Metal surface 之上、source TextKit mirror 之外；正常路径必须消费 Rust/CoreText-shaped
-    document-space geometry，包括 composition-aware transient layout；geometry 失效、surface
-    detach、窗口离开或 native submit 失败时必须清空并恢复 TextKit 的自绘装饰。
+    document-space geometry，包括 composition-aware transient layout。若同一 surface publication
+    已证明包含等量 selection/caret scene layers，该 view 必须停止绘制但保留 frame identity；否则
+    它才可作为 AppKit decoration fallback。geometry 失效、surface detach、窗口离开或 native
+    submit 失败时必须清空并恢复 TextKit 的自绘装饰。
 27. `yu_storage_session_macos_composition_projection_hit_test` 必须同时验证 expected Revision 与
     composition generation，并使用 composition-aware transient block layout 加完整 transient
     projection 返回命中结果；输出的 block index、document-space point、source/visual UTF-16、
@@ -551,6 +553,13 @@
     该门控只能影响绘制，
     不得替换 TextKit 的 string、selection、NSTextInputClient、IME、clipboard 或 Accessibility
     ownership。
+31. `EditorDecorationPrimitive` 必须保存 canonical source range、owned document-space bounds、颜色
+    和 selection/caret/composition-caret role；普通 selection/caret 与 active composition 都必须从
+    生成当前 viewport frame 的同一 projection/layout 得到。`YuStorageMacosRenderHostSnapshot` 与
+    surface snapshot 必须公布同一 frame 的 selection/caret primitive count；Swift 只有在 Revision、
+    composition generation 和两个 count 都与独立 Rust decoration geometry 一致时，才可关闭
+    `MacosVisualDecorationView` 的 AppKit paint。count 不匹配必须保留 fallback，不得根据颜色或矩形
+    形状推断 primitive 语义。
 
 ## CoreText viewport preparation
 

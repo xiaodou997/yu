@@ -104,6 +104,7 @@ Accessibility、caret/selection 和失败回退表面。完整 visual mirror 仍
 - [x] macOS visual render gate 接受 ready 的 `EmbeddedSvg` command；Math 不再触发整页 TextKit fallback，unsupported Mermaid 只保留对应 source range fallback，并由 render-plan/lifecycle self-check 验证
 - [x] task-list 隐藏的 `[ ]`/`[x]` marker 由 source-backed `TaskCheckboxPrimitive` 补画；todo/done 状态随 Revision 进入既有 solid/Metal pipeline，FFI 使用独立 command tag 保持诊断语义
 - [x] task checkbox pointer 使用当前已发布 retained frame 的 document-space bounds 做 Revision-bound hit-test；macOS 普通主键点击复用现有 `ToggleTask` transaction，stale/composition/框外查询回退普通文本选择
+- [x] 普通与 IME selection/caret 作为 source-backed `EditorDecorationPrimitive` 进入同一 retained Scene/RenderPlan/Metal publication；surface snapshot 以语义 layer count 验证覆盖，AppKit decoration sibling 降为 mismatch/unavailable fallback
 
 ## 约束
 
