@@ -454,24 +454,39 @@ impl Projection {
         inline: &InlineDocument,
         extra_hidden: &[TextRange],
     ) -> Result<Self, ProjectionError> {
-        Self::from_inline_with_optional_reveal(inline, extra_hidden, None)
+        Self::from_inline_with_optional_reveal(inline, extra_hidden, None, false)
     }
 
     /// Builds a projection while revealing paired inline syntax touched by an
     /// active canonical selection. Block-level `extra_hidden` ranges remain
-    /// hidden; heading/list/table reveal policies are independent features.
+    /// hidden; structural focus blocks use
+    /// [`Self::from_inline_with_structural_reveal`] explicitly.
     pub fn from_inline_with_hidden_and_reveal(
         inline: &InlineDocument,
         extra_hidden: &[TextRange],
         active: TextRange,
     ) -> Result<Self, ProjectionError> {
-        Self::from_inline_with_optional_reveal(inline, extra_hidden, Some(active))
+        Self::from_inline_with_optional_reveal(inline, extra_hidden, Some(active), false)
+    }
+
+    /// Builds an active structural-block projection. Paired inline syntax
+    /// touched by `active` is revealed as usual, and the caller-provided
+    /// parser-owned block prefixes are revealed together. This constructor is
+    /// reserved for the focus block; task markers and other always-hidden
+    /// syntax must keep using [`Self::from_inline_with_hidden_and_reveal`].
+    pub fn from_inline_with_structural_reveal(
+        inline: &InlineDocument,
+        structural_hidden: &[TextRange],
+        active: TextRange,
+    ) -> Result<Self, ProjectionError> {
+        Self::from_inline_with_optional_reveal(inline, structural_hidden, Some(active), true)
     }
 
     fn from_inline_with_optional_reveal(
         inline: &InlineDocument,
         extra_hidden: &[TextRange],
         active: Option<TextRange>,
+        reveal_extra_hidden: bool,
     ) -> Result<Self, ProjectionError> {
         let source = inline.source();
         let source_range = inline.source_range();
@@ -481,7 +496,9 @@ impl Projection {
             .filter(|span| !active.is_some_and(|active| reveals_inline_span(**span, active)))
             .flat_map(|span| [span.opening(), span.closing()])
             .collect::<Vec<_>>();
-        hidden.extend_from_slice(extra_hidden);
+        if !reveal_extra_hidden {
+            hidden.extend_from_slice(extra_hidden);
+        }
         let line_breaks = inline
             .nodes()
             .iter()
@@ -1984,7 +2001,7 @@ impl BlockProjection {
         let hidden = yu_markdown::block_syntax_hidden_ranges(source, block);
         let projection = match active {
             Some(active) => {
-                Projection::from_inline_with_hidden_and_reveal(&inline, &hidden, active)
+                Projection::from_inline_with_structural_reveal(&inline, &hidden, active)
             }
             None => Projection::from_inline_with_hidden(&inline, &hidden),
         }?;
@@ -2659,6 +2676,20 @@ mod tests {
         assert!(projection.visual().runs().iter().any(|run| {
             run.kind() == VisualRunKind::Visible && run.style() == VisualRunStyle::Strong
         }));
+
+        let text = source.find("text").expect("strong task text");
+        let active = BlockProjection::from_block_with_definitions_and_reveal(
+            &snapshot,
+            block,
+            markdown.reference_definitions(),
+            TextRange::empty(ByteOffset::new((text + 1) as u64)),
+        )
+        .expect("active task projection should build");
+        let marker = yu_markdown::task_marker(&snapshot, block).expect("task marker");
+        assert!(active.visual().runs().iter().any(|run| {
+            run.kind() == VisualRunKind::HiddenSyntax && run.source() == marker.range()
+        }));
+        assert_eq!(projected_text(active.visual()), "-  task **text**\n");
     }
 
     #[test]
@@ -2693,6 +2724,16 @@ mod tests {
             .collect::<Result<String, _>>()
             .expect("heading visual text");
         assert_eq!(heading_text, "标题\n");
+        let heading_revealed = BlockProjection::from_block_with_definitions_and_reveal(
+            &snapshot,
+            heading,
+            markdown.reference_definitions(),
+            TextRange::empty(ByteOffset::new(
+                source.find("标题").expect("heading text") as u64
+            )),
+        )
+        .expect("active heading projection should build");
+        assert_eq!(projected_text(heading_revealed.visual()), "  ## **标题**\n");
 
         let quote = markdown.blocks().get(2).expect("quote block");
         let quote_projection = BlockProjection::from_block_with_definitions(
@@ -2711,6 +2752,16 @@ mod tests {
             .collect::<Result<String, _>>()
             .expect("quote visual text");
         assert_eq!(quote_text, "引用\n继续\n");
+        let quote_revealed = BlockProjection::from_block_with_definitions_and_reveal(
+            &snapshot,
+            quote,
+            markdown.reference_definitions(),
+            TextRange::empty(ByteOffset::new(
+                source.find("引用").expect("quote text") as u64
+            )),
+        )
+        .expect("active quote projection should build");
+        assert_eq!(projected_text(quote_revealed.visual()), "> 引用\n> 继续\n");
 
         let list = markdown.blocks().get(4).expect("list block");
         let list_projection = BlockProjection::from_block_with_definitions(

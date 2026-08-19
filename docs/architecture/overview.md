@@ -133,6 +133,12 @@ cache 仍只由 Revision 标识；revealed frame 通过新的 publication serial
 两个 transient 文本模型叠加。macOS projected mirror、hit test、decoration、glyph atlas 与 retained
 scene 必须读取同一个 visual state。见 ADR 0179。
 
+结构化 block 使用同一条 transient visual-state 路径：焦点进入 ATX heading 或 blockquote 时，
+projection 同时揭示 parser-owned `#`/`>` prefix 与命中的 inline delimiter。只有 transient
+projection 的 visual length 确实变化时，该 block 才进入 reveal remeasure；普通 paragraph/list
+不会仅因 caret 移动而绕过 canonical viewport cache。普通 list marker 当前仍是唯一 bullet/序号
+字形，在独立 semantic list-marker scene primitive 完成前保持 source-visible。见 ADR 0180。
+
 composition 需要参与视觉布局时，`Projection::with_composition` 在 canonical projection 上建立
 一个不入缓存的临时视图：替换范围外仍使用 parser-owned runs，preedit 是 plain
 `VisualRunKind::Composition`。layout/shaping 通过 projection 读取临时文本和零基 shaping range，

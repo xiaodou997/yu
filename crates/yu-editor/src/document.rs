@@ -3639,6 +3639,76 @@ mod tests {
     }
 
     #[test]
+    fn structural_prefix_reveal_is_focus_bound_and_source_neutral() {
+        let source = "## heading\n\nplain\n\n- item\n";
+        let mut document = EditorDocument::new(source);
+        let heading = source.find("heading").expect("heading text");
+        let heading_index = document
+            .block_index_for_source(ByteOffset::new(heading as u64))
+            .expect("heading block");
+        let canonical = document
+            .block_projection(heading_index)
+            .expect("canonical heading projection")
+            .clone();
+        let cached = document.projection_cache_stats();
+
+        let snapshot = document.snapshot();
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &snapshot,
+                    ByteOffset::new((heading + 2) as u64),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("heading selection"),
+            )
+            .expect("set heading selection");
+        let revealed = document
+            .block_projection_with_selection_reveal(heading_index)
+            .expect("revealed heading projection");
+        let heading_source_len = source.find('\n').expect("heading line ending") as u64 + 1;
+
+        assert_eq!(document.selection_reveal_block_index(), Some(heading_index));
+        assert_eq!(
+            canonical.visual().visual_len().get() + 3,
+            heading_source_len
+        );
+        assert_eq!(revealed.visual().visual_len().get(), heading_source_len);
+        assert_eq!(document.revision(), Revision::new(0));
+        assert_eq!(document.projection_cache_stats(), cached);
+
+        let plain = source.find("plain").expect("plain text");
+        let snapshot = document.snapshot();
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &snapshot,
+                    ByteOffset::new(plain as u64),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("plain selection"),
+            )
+            .expect("set plain selection");
+        assert_eq!(document.selection_reveal_block_index(), None);
+        assert_eq!(document.revision(), Revision::new(0));
+
+        let item = source.find("item").expect("list item");
+        let snapshot = document.snapshot();
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &snapshot,
+                    ByteOffset::new(item as u64),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("list selection"),
+            )
+            .expect("set list selection");
+        assert_eq!(document.selection_reveal_block_index(), None);
+        assert_eq!(document.revision(), Revision::new(0));
+    }
+
+    #[test]
     fn block_projection_uses_incremental_markdown_ranges_and_remaps_prefix_edits() {
         let source = "intro\n\nparagraph **羽🙂**\n\n```rust\ncode\n```\n";
         let mut document = EditorDocument::new(source);

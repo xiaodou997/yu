@@ -10429,11 +10429,13 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         let imageFixture = try installMacosImageSelfCheckFixture(at: path)
         defer { removeMacosImageSelfCheckFixture(imageFixture) }
         let bridge = try StorageBridge(path: path)
+        let heading = (bridge.source as NSString).range(of: "Projection blocks")
+        precondition(heading.location != NSNotFound)
         let strong = (bridge.source as NSString).range(of: "**粗体**")
         precondition(strong.location != NSNotFound)
-        try bridge.setSelection(NSRange(location: strong.location + 2, length: 0))
-        let revealedSource = try bridge.projectedSource(revision: bridge.state.revision)
-        precondition(revealedSource.contains("**粗体**"))
+        let plain = (bridge.source as NSString).range(of: "Paragraph with")
+        precondition(plain.location != NSNotFound)
+        try bridge.setSelection(NSRange(location: heading.location, length: 0))
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
         let initialFrame = NSRect(x: 0.0, y: 0.0, width: 500.0, height: 240.0)
@@ -10535,9 +10537,9 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
                 compositionGeneration: bridge.composition.generation
             )
         )
-        try bridge.setSelection(NSRange(location: 0, length: 0))
-        let hiddenSource = try bridge.projectedSource(revision: bridge.state.revision)
-        precondition(!hiddenSource.contains("**粗体**"))
+        try bridge.setSelection(NSRange(location: strong.location + 2, length: 0))
+        let inlineSource = try bridge.projectedSource(revision: bridge.state.revision)
+        precondition(inlineSource.contains("**粗体**"))
         coordinator.invalidateEditorDecorationPublication()
         precondition(coordinator.lastSnapshot == nil)
         precondition(
@@ -10546,11 +10548,22 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
                 compositionGeneration: bridge.composition.generation
             )
         )
-        let selectionOnlyRefresh = try unwrapSelfCheck(coordinator.submitNow())
-        precondition(selectionOnlyRefresh.revision == first.revision)
-        precondition(selectionOnlyRefresh.frameSerial > first.frameSerial)
-        precondition(selectionOnlyRefresh.caretDecorationCount == 1)
-        precondition(selectionOnlyRefresh.commandCount + 4 == first.commandCount)
+        let inlineReveal = try unwrapSelfCheck(coordinator.submitNow())
+        precondition(inlineReveal.revision == first.revision)
+        precondition(inlineReveal.frameSerial > first.frameSerial)
+        precondition(inlineReveal.caretDecorationCount == 1)
+        precondition(inlineReveal.commandCount == first.commandCount + 2)
+
+        try bridge.setSelection(NSRange(location: plain.location, length: 0))
+        let hiddenSource = try bridge.projectedSource(revision: bridge.state.revision)
+        precondition(!hiddenSource.contains("**粗体**"))
+        coordinator.invalidateEditorDecorationPublication()
+        let noReveal = try unwrapSelfCheck(coordinator.submitNow())
+        precondition(noReveal.revision == first.revision)
+        precondition(noReveal.frameSerial > inlineReveal.frameSerial)
+        precondition(noReveal.caretDecorationCount == 1)
+        precondition(noReveal.commandCount + 2 == first.commandCount)
+        precondition(noReveal.commandCount + 4 == inlineReveal.commandCount)
 
         if bridge.source.contains("```mermaid") || bridge.source.contains("```math") {
             let embeddedResources = try bridge.macosVisualEmbeddedResources(
@@ -10659,8 +10672,8 @@ private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
         precondition(errors.isEmpty, errors.joined(separator: "; "))
         removeMacosImageSelfCheckFixture(imageFixture)
         print(
-            "Yu macOS surface lifecycle self-check: product NSView attach, resize, scroll, "
-                + "edit revision and close detach are valid"
+            "Yu macOS surface lifecycle self-check: heading/inline/no-reveal frames, "
+                + "product NSView attach, resize, scroll, edit revision and close detach are valid"
                 + (asyncImageRefreshReady ? "; async image refresh is valid" : "")
         )
         exit(EXIT_SUCCESS)

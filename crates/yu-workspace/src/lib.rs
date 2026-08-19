@@ -1756,8 +1756,8 @@ mod tests {
     }
 
     #[test]
-    fn retained_frame_reveals_inline_syntax_at_selection_without_source_edit() {
-        let source = "before **strong** after";
+    fn retained_frame_reveals_active_markdown_syntax_without_source_edit() {
+        let source = "# before **strong** after\n\nplain";
         let font_size = 14.0;
         let shaper = shaper(font_size);
         let viewport = ViewportRect::new(0.0, 120.0);
@@ -1822,7 +1822,7 @@ mod tests {
 
         assert_eq!(document.revision(), revision);
         assert_eq!(revealed.revision(), revision);
-        assert_eq!(revealed_glyphs, hidden_glyphs + 4);
+        assert_eq!(revealed_glyphs, hidden_glyphs + 6);
         let caret = revealed
             .scene()
             .scene()
