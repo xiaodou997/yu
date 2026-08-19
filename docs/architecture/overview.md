@@ -708,9 +708,12 @@ fingerprint、generation、kind、source range、intrinsic dimensions、bounds �
 markup 不进入 retained scene。只有 `RenderPlanBuilder::build_with_embedded` 收到同 Revision
 且 source/resource/dimensions 全部匹配的 `EmbeddedRenderPublication`，才会生成
 `RenderCommand::EmbeddedSvg` 与一次性的 `EmbeddedSvgUpload`；普通 `build` 会拒绝缺失
-publication。当前 macOS backend 对该 command 做有限的 geometry 校验并画 fallback rectangle，
-待真正的 SVG consumer 接入后再切换为 vector/raster 绘制，避免 FFI cache ready 状态先于实际
-可绘制内容。
+publication。macOS backend 在 submit path 内把新的 `EmbeddedSvgUpload` 交给 AppKit
+`NSImage` SVG 解码器，栅格化为受尺寸、markup 字节数和 RGBA pixel bytes 上限约束的 owned
+RGBA8，再复用 `MetalImageAtlas` 与既有 image quad shader。普通图片和 embedded texture 使用
+独立的 native image kind，避免 fingerprint 偶然相同而采错纹理；缺少 publication、栅格化失败
+或尚未上传时仍画确定性的 fallback rectangle。AppKit/Metal object 不进入 shared scene、plan
+或 FFI。
 
 macOS storage FFI 的 `yu_storage_session_macos_visual_render_plan` 是这一链路的诊断 publication：
 Rust 使用 CoreText-shaped layout 和 `CoreTextGlyphRasterizer` 生成临时 CPU `GlyphAtlas`，然后复用

@@ -24,6 +24,7 @@ typedef struct {
     float alpha;
     uint32_t page;
     uint64_t resource;
+    uint32_t image_kind;
 } YuMetalDrawCommand;
 
 typedef struct {
@@ -33,6 +34,7 @@ typedef struct {
 
 typedef struct {
     uint64_t resource;
+    uint32_t image_kind;
     void *texture;
 } YuMetalImageTextureBinding;
 
@@ -641,7 +643,8 @@ static int yu_metal_encode_command(
     } else if (command.kind == 2) {
         void *texture_ptr = NULL;
         for (size_t texture_index = 0; texture_index < image_texture_count; texture_index += 1) {
-            if (image_textures[texture_index].resource == command.resource) {
+            if (image_textures[texture_index].resource == command.resource
+                && image_textures[texture_index].image_kind == command.image_kind) {
                 texture_ptr = image_textures[texture_index].texture;
                 break;
             }
