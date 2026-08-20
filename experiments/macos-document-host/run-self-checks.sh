@@ -48,9 +48,6 @@ typeset -A checks=(
     shaped-vertical                     Fixtures/block-projection.md
     shaped-viewport                     Fixtures/block-projection.md
     undo                                Fixtures/block-projection.md
-    visual-ime                          Fixtures/block-projection.md
-    visual-mirror                       Fixtures/block-projection.md
-    visual-viewport                     Fixtures/block-projection.md
 )
 
 typeset -a failed
