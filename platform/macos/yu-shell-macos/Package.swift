@@ -8,14 +8,14 @@ let packageDirectory = URL(fileURLWithPath: #filePath)
     .path
 
 let package = Package(
-    name: "YuMacDocumentHost",
+    name: "YuShellMacOS",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "YuMacDocumentHost", targets: ["YuMacDocumentHost"]),
+        .executable(name: "Yu", targets: ["Yu"]),
     ],
     targets: [
         .executableTarget(
-            name: "YuMacDocumentHost",
+            name: "Yu",
             dependencies: ["YuStorageFFI"],
             linkerSettings: [
                 .unsafeFlags([

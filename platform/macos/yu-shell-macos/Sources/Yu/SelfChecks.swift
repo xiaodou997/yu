@@ -9,7 +9,7 @@ import YuStorageFFI
 //
 // 它们不是产品代码。v1 时期这 3800 行与产品代码混在 main.swift 里，且从未
 // 进入 CI，因而无节制地膨胀；现在它们独立成文件，并由
-// experiments/macos-document-host/run-self-checks.sh 在 CI 中执行。
+// platform/macos/yu-shell-macos/run-self-checks.sh 在 CI 中执行。
 //
 // 调用入口（顶层 CommandLine 分发）必须留在 main.swift——Swift 只允许
 // main.swift 含有顶层可执行语句。

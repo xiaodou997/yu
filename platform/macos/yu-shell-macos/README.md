@@ -32,20 +32,20 @@
 构建并运行：
 
 ```bash
-experiments/macos-document-host/build-app.sh
-open experiments/macos-document-host/.build/YuMacDocumentHost.app
+platform/macos/yu-shell-macos/build-app.sh
+open platform/macos/yu-shell-macos/.build/YuMacDocumentHost.app
 ```
 
 也可以直接打开指定的 Markdown 文件：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost /path/to/file.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost /path/to/file.md
 ```
 
 可以在不启动窗口的情况下验证 AppKit semantic child tree 的 Revision/parent/label 契约：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
   --accessibility-self-check /path/to/file.md
 ```
 
@@ -56,7 +56,7 @@ VoiceOver 朗读已由人工确认，Rotor/语义 action 的真实导航仍应�
 验证 native clipboard priority/fallback（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
   --clipboard-self-check /path/to/file.md
 ```
 
@@ -67,15 +67,15 @@ table、browser wrapper 和 unsafe HTML fixture，覆盖接受与拒绝路径。
 验证鼠标/拖选使用的 AppKit `setSelectedRanges` 是否同步到 Rust selection（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --selection-self-check experiments/macos-document-host/Fixtures/sample.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --selection-self-check platform/macos/yu-shell-macos/Fixtures/sample.md
 ```
 
 验证 native undo/redo 菜单与 Rust history 的桥接（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --undo-self-check experiments/macos-document-host/Fixtures/sample.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --undo-self-check platform/macos/yu-shell-macos/Fixtures/sample.md
 ```
 
 该自检通过同一个 `DocumentTextView` 执行一次插入、撤销和重做，确认 TextKit 不建立第二套
@@ -84,8 +84,8 @@ history，Rust source、revision 和 redo 状态保持一致。
 验证第一阶段产品工作流（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --document-workflow-self-check experiments/macos-document-host/Fixtures/sample.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --document-workflow-self-check platform/macos/yu-shell-macos/Fixtures/sample.md
 ```
 
 该自检会把 fixture 复制到临时路径，依次执行打开、中文/日文/Emoji/组合字符编辑、撤销、重做、
@@ -95,8 +95,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 验证真实 AppKit 窗口启动顺序（会短暂打开窗口后自动退出）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --launch-window-self-check experiments/macos-document-host/Fixtures/sample.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --launch-window-self-check platform/macos/yu-shell-macos/Fixtures/sample.md
 ```
 
 该检查确认窗口先完成 TextKit source fallback，再进入可选的 Rust visual/surface 生命周期；窗口未出现
@@ -105,8 +105,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 验证基础键盘、选区和文件生命周期边界（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --document-interaction-self-check experiments/macos-document-host/Fixtures/sample.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --document-interaction-self-check platform/macos/yu-shell-macos/Fixtures/sample.md
 ```
 
 该自检覆盖 Enter、左右移动、删除、撤销/重做、鼠标选区回写、clean reload、外部修改关闭提示、
@@ -116,8 +116,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 caret 映射（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --projection-self-check experiments/macos-document-host/Fixtures/projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --projection-self-check platform/macos/yu-shell-macos/Fixtures/projection.md
 ```
 
 该自检只验证 projection FFI 契约，不改变生产窗口的 TextKit source mirror；隐藏的 emphasis/link
@@ -127,8 +127,8 @@ projection、IME 映射和 GPU scene 接入会在该边界稳定后进行。
 验证 visual selection 与 metrics-layout point hit-test 的 source↔visual round-trip（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --projection-hit-test-self-check experiments/macos-document-host/Fixtures/projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --projection-hit-test-self-check platform/macos/yu-shell-macos/Fixtures/projection.md
 ```
 
 该自检使用 Rust 返回的 visual selection 和 projection-local point，不在 Swift 重建 Markdown delimiter
@@ -138,8 +138,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 验证生产 pointer adapter 使用 CoreText-shaped Rust block layout 做 point→visual→source 命中（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --shaped-projection-hit-test-self-check experiments/macos-document-host/Fixtures/projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --shaped-projection-hit-test-self-check platform/macos/yu-shell-macos/Fixtures/projection.md
 ```
 
 该自检先发布同一字体/宽度的 viewport metrics，再用 Rust shaped endpoint 命中 document-space
@@ -157,9 +157,9 @@ Accessibility 和失败回退宿主。
 transient projection 使用同一个 `Revision + composition generation`：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
   --composition-hit-test-self-check \
-  experiments/macos-document-host/Fixtures/composition-cross-block.md
+  platform/macos/yu-shell-macos/Fixtures/composition-cross-block.md
 ```
 
 该自检命中后续 block，确认 visual selection/replacement 与 composition metadata 一致，并确认
@@ -169,8 +169,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 selection、caret 双向 round-trip 与 stale Revision 拒绝（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --visual-mirror-self-check experiments/macos-document-host/Fixtures/projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --visual-mirror-self-check platform/macos/yu-shell-macos/Fixtures/projection.md
 ```
 
 该自检中的 `NSTextStorage`/`NSLayoutManager` 只是一份可丢弃的 visual view cache，用于验证
@@ -180,8 +180,8 @@ endpoint 命中，仍由 canonical source mirror 接收 IME、复制粘贴和 Ac
 验证 parser-owned block 的 metrics layout、macOS CoreText shaped layout 与 block-local caret（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --block-layout-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --block-layout-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 该自检同时比较 metrics/CoreText 的 block visual 长度，检查 CoreText line height/caret point，并确认
@@ -191,8 +191,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 越界拒绝（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --block-projection-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --block-projection-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 该自检逐 block 消费 Rust 返回的 owned UTF-8，不在 Swift 重建 Markdown block；表格 block
@@ -205,8 +205,8 @@ geometry override，并验证 canonical layout/source 不变、tolerance 和 sta
 measured 标记和 stale Revision 拒绝（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --shaped-viewport-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --shaped-viewport-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 该自检先将 CoreText 的 line height/default advance 发布到 Rust viewport policy，再请求一个完整
@@ -216,8 +216,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 修改 source（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --shaped-vertical-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --shaped-vertical-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 该自检通过同一个 storage FFI 发布 viewport metrics，再执行两次 shaped Down；返回值仍是普通
@@ -227,8 +227,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 顺序、source range、document-space 矩形和 stale Revision 拒绝（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --visual-scene-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --visual-scene-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 该自检目前只验证矩形 scene 协议，不连接生产 TextKit、glyph atlas 或 Metal surface；Swift 不推导
@@ -238,8 +238,8 @@ block 高度或 Markdown 语义。
 编辑后的 stale Revision 拒绝（当前阶段不解码图片、不创建 Metal texture）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --visual-image-self-check experiments/macos-document-host/Fixtures/render-images.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --visual-image-self-check platform/macos/yu-shell-macos/Fixtures/render-images.md
 ```
 
 图片 destination 由 Rust projection 返回，Swift 只可通过现有 source-range API 取得文本并交给
@@ -250,8 +250,8 @@ swift run --package-path experiments/macos-document-host YuMacDocumentHost \
 Revision 的 count/fill/stale 协议（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --visual-render-plan-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --visual-render-plan-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 该自检只接收 Rust 返回的 glyph command、page fingerprint 和 damage owned scalars；atlas 像素、
@@ -262,8 +262,8 @@ persistent surface lifecycle 提交；source TextKit mirror 仍保留为输入�
 scroll、resize、surface generation 与编辑后的 stale Revision（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --macos-render-host-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --macos-render-host-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 这个 self-check 只返回 lifecycle scalar；它不启动可视化演示模式，也不替换生产 TextKit source
@@ -274,8 +274,8 @@ composition 会在同一持久 publication 中重建受影响 block span 的 sha
 retained target blit/present 和 stale Revision 拒绝（显式测试命令，会短暂创建并关闭临时窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --macos-render-host-surface-self-check experiments/macos-document-host/Fixtures/render-images-plan.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --macos-render-host-surface-self-check platform/macos/yu-shell-macos/Fixtures/render-images-plan.md
 ```
 
 该 self-check 只返回 Rust-owned lifecycle scalar；同一个 storage session 会复用 surface、renderer、
@@ -298,8 +298,8 @@ surface view 位于 source TextKit mirror 上方但不参与 hit-test，成功�
 不会开启第二套 source/selection 文档模型：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --macos-render-host-lifecycle-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --macos-render-host-lifecycle-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 生命周期 coordinator 使用 `yu_storage_session_macos_font_metrics`，所以空 Markdown 没有 parser
@@ -312,8 +312,8 @@ Accessibility 回到 TextKit；selection highlight 的 visual rectangles 和 scr
 source block range、block 顺序、几何有限性以及编辑后的 stale Revision 拒绝（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --visual-scene-glyph-self-check experiments/macos-document-host/Fixtures/block-projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --visual-scene-glyph-self-check platform/macos/yu-shell-macos/Fixtures/block-projection.md
 ```
 
 该自检只缓存 Rust 返回的 owned glyph metadata；atlas 像素、CoreText/layout/scene 对象和 Metal
@@ -325,8 +325,8 @@ overlay 在其上方消费同一 Rust-owned publication。
 Revision/generation 生命周期（不启动窗口）：
 
 ```bash
-swift run --package-path experiments/macos-document-host YuMacDocumentHost \
-  --composition-projection-self-check experiments/macos-document-host/Fixtures/projection.md
+swift run --package-path platform/macos/yu-shell-macos YuMacDocumentHost \
+  --composition-projection-self-check platform/macos/yu-shell-macos/Fixtures/projection.md
 ```
 
 该自检使用 Unicode/emoji preedit，确认 update 后旧 generation 被拒绝，cancel 不推进 source

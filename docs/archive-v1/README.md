@@ -23,6 +23,7 @@
 | `architecture/text-buffer.md` | v1 Piece Tree / 文本存储设计 |
 | `specs/invariants.md` | v1 核心不变量（659 行） |
 | `roadmap/phase-1..3.md` | v1 阶段路线 |
+| `experiments/` | v1 风险实验记录；其中的命令路径反映当时的目录结构 |
 
 ## 为什么整体归档
 
