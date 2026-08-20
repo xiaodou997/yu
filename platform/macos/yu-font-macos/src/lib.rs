@@ -991,8 +991,10 @@ fn rasterize_glyph(
         let source_start = row
             .checked_mul(stride)
             .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
-        let target_row = height_usize - 1 - row;
-        let target_start = target_row
+        // CGBitmapContext 的绘制坐标原点在左下，但内存布局是 top-down：
+        // 扫描线 0 就是图像顶部。因此这里直接按行拷贝——额外翻转会让每个
+        // 字形上下颠倒，而拉丁字母颠倒后不易察觉，中文一眼可见。
+        let target_start = row
             .checked_mul(width_usize)
             .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
         let source_row = source
@@ -1491,6 +1493,65 @@ mod tests {
                  CJK/emoji 很可能被拉丁字体解释了"
             );
         }
+    }
+
+    /// 字形位图的方向必须正确。
+    ///
+    /// `CGBitmapContext` 的绘制坐标原点在左下，但内存布局是 top-down——
+    /// 扫描线 0 就是图像顶部。v1 的拷贝循环额外做了一次 `height - 1 - row`
+    /// 翻转，于是每个字形上下颠倒。拉丁字母颠倒后不易察觉（配合当时的字体
+    /// 错位问题更看不出来），中文则一眼可见。
+    ///
+    /// 用 "F" 做探针：它在水平与垂直两个方向都不对称，一次断言可以同时抓住
+    /// 上下颠倒与左右镜像。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rasterized_glyph_orientation_is_upright() {
+        let size = 24.0_f32;
+        let shaper =
+            CoreTextShaper::from_system_ui(FontRequest::new("System UI", size).expect("request"))
+                .expect("shaper");
+        let rasterizer = shaper.rasterizer();
+        let text = "F";
+        let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1)).expect("range");
+        let shaped =
+            ShapingProvider::shape(&shaper, text, source, VisualRunStyle::Plain).expect("shape");
+        let run = shaped.runs().first().expect("one run");
+        let glyph = run.glyphs().first().expect("one glyph");
+        let raster = rasterizer
+            .rasterize(GlyphRasterKey::new(run.face(), glyph.id(), size).expect("key"))
+            .expect("rasterize");
+        let bitmap = raster.bitmap();
+        let (width, height) = (bitmap.width() as usize, bitmap.height() as usize);
+        assert!(
+            width >= 4 && height >= 4,
+            "glyph bitmap is too small to probe"
+        );
+
+        let ink = |rows: std::ops::Range<usize>, cols: std::ops::Range<usize>| -> u64 {
+            rows.flat_map(|row| {
+                cols.clone().map(move |col| {
+                    u64::from(bitmap.pixels()[row * bitmap.stride() as usize + col])
+                })
+            })
+            .sum()
+        };
+
+        // "F" 的两条横都在上半部：上半墨迹必须明显多于下半。
+        let top = ink(0..height / 2, 0..width);
+        let bottom = ink(height / 2..height, 0..width);
+        assert!(
+            top > bottom,
+            "字形上下颠倒：上半墨迹 {top} 不多于下半 {bottom}"
+        );
+
+        // "F" 的竖笔在左侧：左半墨迹必须明显多于右半。
+        let left = ink(0..height, 0..width / 2);
+        let right = ink(0..height, width / 2..width);
+        assert!(
+            left > right,
+            "字形左右镜像：左半墨迹 {left} 不多于右半 {right}"
+        );
     }
 
     #[cfg(target_os = "macos")]
