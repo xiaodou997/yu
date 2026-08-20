@@ -956,6 +956,25 @@ int32_t yu_storage_session_macos_render_host_frame(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
     uint64_t surface_generation, YuStorageMacosRenderHostSnapshot *snapshot);
+/* Geometry the platform supplies for one frame submission. Only AppKit knows
+ * these values (view bounds, clip view scroll offset, backing scale); every
+ * other decision stays in Rust. */
+typedef struct YuStorageFrameGeometry {
+    float size;
+    float max_width;
+    float scroll_y;
+    float viewport_height;
+    double surface_width;
+    double surface_height;
+    double scale;
+} YuStorageFrameGeometry;
+/* Reports whether submitting the next frame with this geometry would be
+ * equivalent to the frame already on screen. Revision, composition generation
+ * and geometry must all match; marked-text updates do not advance the
+ * Revision, so the generation participates in the comparison. */
+int32_t yu_storage_session_macos_frame_is_current(
+    YuStorageSession *session, const YuStorageFrameGeometry *geometry,
+    uint8_t *out_current);
 int32_t yu_storage_session_macos_render_host_surface_submit(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,

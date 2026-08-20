@@ -827,6 +827,24 @@ pub struct YuStorageMacosRenderHostSnapshot {
     pub caret_decoration_count: u64,
 }
 
+/// 平台在一次帧提交中提供的几何。
+///
+/// 只有 AppKit 知道这些值（view bounds、clip view 滚动位置、backing scale）。
+/// 除此之外的一切判断——Revision、composition generation、是否与上一帧等价、
+/// 是否需要重算度量、是否需要重试资源——都由 Rust 完成，平台不再为了做决策
+/// 而反复查询编辑状态。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YuStorageFrameGeometry {
+    pub size: f32,
+    pub max_width: f32,
+    pub scroll_y: f32,
+    pub viewport_height: f32,
+    pub surface_width: f64,
+    pub surface_height: f64,
+    pub scale: f64,
+}
+
 /// Scalar result from the opt-in real CAMetalLayer submit bridge. The view,
 /// layer, renderer, atlas and command queue remain owned by the synchronous
 /// Rust call; only lifecycle metadata crosses the ABI.
@@ -1129,6 +1147,70 @@ struct MacosRenderHostState {
     size: f32,
     surface: Option<MacosPersistentSurfaceState>,
     image_resources: MacosImageResourceState,
+    /// 上一次成功提交的帧标识，用于跳过完全等价的重复提交。
+    ///
+    /// 这个判断此前在 Swift：平台每帧都要先查 Revision 和 composition
+    /// generation 才能组装出比较用的键，一次提交因此产生七八次 FFI 往返。
+    /// 状态在 Rust，决策就该在 Rust。
+    last_frame_key: Option<MacosFrameKey>,
+}
+
+/// 平台提供的一帧几何。
+///
+/// 这些值只有 AppKit 知道（view bounds、clip view 滚动位置、backing scale），
+/// 因此必须由平台传入；其余判断全部留在 Rust。用位模式比较而不是浮点相等，
+/// 避免 NaN 让「相同几何」永远判为不同而每帧重画。
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MacosFrameGeometry {
+    size_bits: u32,
+    max_width_bits: u32,
+    scroll_y_bits: u32,
+    viewport_height_bits: u32,
+    surface_width_bits: u64,
+    surface_height_bits: u64,
+    scale_bits: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosFrameGeometry {
+    fn from_request(request: &YuStorageFrameGeometry) -> Result<Self, i32> {
+        let finite32 = |value: f32, positive: bool| {
+            value.is_finite() && (if positive { value > 0.0 } else { value >= 0.0 })
+        };
+        let finite64 = |value: f64| value.is_finite() && value > 0.0;
+        if !finite32(request.size, true)
+            || !finite32(request.max_width, true)
+            || !finite32(request.scroll_y, false)
+            || !finite32(request.viewport_height, true)
+            || !finite64(request.surface_width)
+            || !finite64(request.surface_height)
+            || !finite64(request.scale)
+        {
+            return Err(YU_STORAGE_EDITOR_ERROR);
+        }
+        Ok(Self {
+            size_bits: request.size.to_bits(),
+            max_width_bits: request.max_width.to_bits(),
+            scroll_y_bits: request.scroll_y.to_bits(),
+            viewport_height_bits: request.viewport_height.to_bits(),
+            surface_width_bits: request.surface_width.to_bits(),
+            surface_height_bits: request.surface_height.to_bits(),
+            scale_bits: request.scale.to_bits(),
+        })
+    }
+}
+
+/// 一帧的完整身份：Rust 拥有的编辑状态 + 平台提供的几何。
+///
+/// 两者必须一起比较：几何不变但 Revision 变了要重画；Revision 不变但
+/// composition generation 变了同样要重画——marked text 更新不推进 Revision。
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MacosFrameKey {
+    revision: u64,
+    composition_generation: u64,
+    geometry: MacosFrameGeometry,
 }
 
 #[cfg(target_os = "macos")]
@@ -6488,6 +6570,8 @@ fn macos_render_host_frame(
             size,
             surface,
             image_resources,
+            // 重建 host 后没有可复用的帧，下一次提交必须真正执行。
+            last_frame_key: None,
         });
     }
 
@@ -7477,6 +7561,84 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 caret_decoration_count: host_snapshot.caret_decoration_count,
             };
         }
+        // 记录这一帧的身份，供 `frame_is_current` 判断后续提交是否等价。
+        if let Ok(geometry) = MacosFrameGeometry::from_request(&YuStorageFrameGeometry {
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            surface_width,
+            surface_height,
+            scale,
+        }) {
+            let composition_generation = session.session.composition_generation();
+            if let Some(state) = session.macos_render_host.as_mut() {
+                state.last_frame_key = Some(MacosFrameKey {
+                    revision: expected_revision,
+                    composition_generation,
+                    geometry,
+                });
+            }
+        }
+        YU_STORAGE_OK
+    }
+}
+
+/// 判断按给定几何提交的下一帧是否与已在屏幕上的帧完全等价。
+///
+/// 等价要求 Revision、composition generation 与几何三者都不变——marked text
+/// 更新不推进 Revision，因此 generation 必须一同参与比较，否则相同几何下的
+/// preedit 变化会被误判为无需重画。
+///
+/// 这个判断此前在平台侧：Swift 每帧先查 Revision、再查 composition
+/// generation，才能组装出比较用的键，一次提交因此产生多次纯查询往返。状态在
+/// Rust，决策也该在 Rust（不变量 I3）。
+///
+/// # Safety
+/// `session`、`geometry` 与 `out_current` 必须是调用方拥有的有效指针。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_frame_is_current(
+    session: *mut YuStorageSession,
+    geometry: *const YuStorageFrameGeometry,
+    out_current: *mut u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if out_current.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // 先把输出置为「不是当前帧」：任何后续失败路径都不能留下陈旧的 1，
+    // 那会让平台误以为可以跳过提交（不变量 I4）。
+    // SAFETY: `out_current` was checked above and belongs to the caller.
+    unsafe { *out_current = 0 };
+    let Some(geometry) = (unsafe { geometry.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session, geometry);
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let geometry = match MacosFrameGeometry::from_request(geometry) {
+            Ok(geometry) => geometry,
+            Err(status) => return status,
+        };
+        let key = MacosFrameKey {
+            revision: session.session.revision().get(),
+            composition_generation: session.session.composition_generation(),
+            geometry,
+        };
+        let current = session.macos_render_host.as_ref().is_some_and(|state| {
+            // 没有 surface 时不能声称当前帧有效：内容还没有真正上屏。
+            state.surface.is_some() && state.last_frame_key == Some(key)
+        });
+        // SAFETY: `out_current` was checked above and belongs to the caller.
+        unsafe { *out_current = u8::from(current) };
         YU_STORAGE_OK
     }
 }
@@ -10989,6 +11151,74 @@ mod tests {
         assert_eq!(config.scene_viewport().height(), 240.0);
         // backing scale 必须进入配置：字形按它取样，后端再除回逻辑坐标。
         assert_eq!(config.raster_scale(), 2.0);
+    }
+
+    /// 没有已提交的帧时，任何几何都不能被判为"当前"。
+    ///
+    /// 这条判断决定平台是否跳过提交。误判为当前会让编辑或滚动后的内容停留在
+    /// 上一帧；而在 surface 尚未建立时误判为当前，则会让窗口一直空白。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_frame_is_current_requires_a_submitted_frame() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-frame-current-{id}.md"));
+        fs::write(&path, "# \u{6807}\u{9898}\n\nbody\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let geometry = YuStorageFrameGeometry {
+            size: 14.0,
+            max_width: 500.0,
+            scroll_y: 0.0,
+            viewport_height: 240.0,
+            surface_width: 500.0,
+            surface_height: 240.0,
+            scale: 2.0,
+        };
+        let mut current = 1_u8;
+        assert_eq!(
+            unsafe { yu_storage_session_macos_frame_is_current(raw, &geometry, &mut current) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(current, 0, "尚未提交任何帧时不得判为当前");
+
+        // 非法几何必须被拒绝，而不是当作"不同"从而每帧重画。
+        for invalid in [
+            YuStorageFrameGeometry {
+                size: 0.0,
+                ..geometry
+            },
+            YuStorageFrameGeometry {
+                scale: f64::NAN,
+                ..geometry
+            },
+            YuStorageFrameGeometry {
+                viewport_height: -1.0,
+                ..geometry
+            },
+        ] {
+            let mut out = 1_u8;
+            assert_eq!(
+                unsafe { yu_storage_session_macos_frame_is_current(raw, &invalid, &mut out) },
+                YU_STORAGE_EDITOR_ERROR
+            );
+            assert_eq!(out, 0);
+        }
+
+        // 空指针必须返回明确状态，不得写入半成品输出。
+        let mut out = 1_u8;
+        assert_eq!(
+            unsafe { yu_storage_session_macos_frame_is_current(raw, std::ptr::null(), &mut out) },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(out, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
     }
 
     /// backing scale 非法时不得污染配置。
