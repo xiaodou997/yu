@@ -2839,6 +2839,10 @@ mod tests {
             "code line\n",
             "```\n",
             "\n",
+            "| a | b |\n",
+            "| --- | --- |\n",
+            "| 1 | 2 |\n",
+            "\n",
             "[ref]: /url\n",
         );
         let mut document = EditorDocument::new(source);

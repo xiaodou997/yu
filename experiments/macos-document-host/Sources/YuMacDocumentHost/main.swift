@@ -597,65 +597,12 @@ private let visualRenderCommandEmbeddedSvgBit =
     UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG)
 private let visualRenderCommandTaskCheckboxBit =
     UInt64(1) << UInt64(YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX)
-private let supportedVisualRenderCommandMask =
-    visualRenderCommandFillRectBit
-        | visualRenderCommandGlyphBit
-        | visualRenderCommandImageBit
-        | visualRenderCommandEmbeddedSvgBit
-        | visualRenderCommandTaskCheckboxBit
 
-private let supportedVisualBlockKindMask =
-    (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_BLANK_LINE))
-        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_REFERENCE_DEFINITION))
-        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_PARAGRAPH))
-        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_HEADING))
-        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE))
-        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_BLOCK_QUOTE))
-        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_LIST_ITEM))
-        | (UInt64(1) << UInt64(YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM))
 
-private func hasSupportedVisualRenderCommands(
-    commandCount: Int,
-    commandKindMask: UInt64
-) -> Bool {
-    commandCount > 0
-        && commandKindMask != 0
-        && (commandKindMask & ~supportedVisualRenderCommandMask) == 0
-}
 
-private func hasSupportedVisualBlockKinds(_ blockKindMask: UInt64) -> Bool {
-    blockKindMask != 0
-        && (blockKindMask & ~supportedVisualBlockKindMask) == 0
-}
 
-private func hasCompleteRetainedBlockCoverage(
-    blockKindMask: UInt64,
-    publishedBlockKindMask: UInt64,
-    blockCount: Int,
-    canonicalSourceIsEmpty: Bool,
-    compositionActive: Bool
-) -> Bool {
-    guard blockKindMask == publishedBlockKindMask else { return false }
-    if blockCount == 0 {
-        return blockKindMask == 0
-            && canonicalSourceIsEmpty
-            && !compositionActive
-    }
-    return hasSupportedVisualBlockKinds(blockKindMask)
-}
 
-private func visualBlockKindBit(_ kind: UInt8) -> UInt64 {
-    kind < 63 ? (UInt64(1) << UInt64(kind)) : (UInt64(1) << 63)
-}
 
-/// Proves that one retained publication covers every visible block and
-/// resource for the same Revision. Coverage is deliberately all-or-nothing:
-/// an incomplete result keeps the complete source mirror visible instead of
-/// mixing TextKit glyphs into an otherwise accepted Metal frame.
-private struct VisualRetainedCoverage: Equatable {
-    let revision: UInt64
-    let complete: Bool
-}
 
 /// Normalizes the separate image/embedded C status domains before applying a
 /// shared coverage policy. Raw numeric equality between those domains is not
@@ -697,28 +644,21 @@ private func embeddedResourceCoverageState(_ status: UInt8) -> RetainedResourceC
 /// keeps the retained projected alt label. An unclassified non-zero identity
 /// is fail-closed because it may represent a renderer state unknown to this
 /// host.
-private func applyRetainedResourceCoverage(
+/// 资源未就绪或指纹失效时安排一次刷新。
+///
+/// 这里只回答「要不要再取一次」。coverage 判断已随 TextKit fallback 一同
+/// 删除（不变量 I5）：没有第二条渲染路径可以回退。
+private func retainedResourceNeedsRefresh(
     state: RetainedResourceCoverageState,
-    resourceFingerprint: UInt64,
-    refreshNeeded: inout Bool
+    resourceFingerprint: UInt64
 ) -> Bool {
     switch state {
-    case .ready:
-        return true
-    case .pending, .failed:
-        refreshNeeded = true
-        return true
-    case .unsupported:
+    case .ready, .unsupported:
+        return false
+    case .pending, .failed, .invalid:
         return true
     case .unknown:
-        if resourceFingerprint == 0 {
-            return true
-        }
-        refreshNeeded = true
-        return false
-    case .invalid:
-        refreshNeeded = true
-        return false
+        return resourceFingerprint != 0
     }
 }
 
@@ -826,13 +766,6 @@ private struct NativeMacosRenderHostSurfaceSnapshot {
     let blockKindMask: UInt64
     let selectionDecorationCount: Int
     let caretDecorationCount: Int
-
-    var hasVisualContent: Bool {
-        hasSupportedVisualRenderCommands(
-            commandCount: commandCount,
-            commandKindMask: commandKindMask
-        )
-    }
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
         revision = value.revision
@@ -3403,15 +3336,6 @@ private final class DocumentTextView: NSTextView {
         static let moveDownExtend: UInt8 = 16
     }
 
-    /// TextKit is always retained as the native input/IME/Accessibility host,
-    /// but it has explicit, deliberately separate paint roles. Keeping this as
-    /// one role instead of independently toggling two booleans prevents a
-    /// stale projected caret or selection from surviving a surface fallback.
-    private enum PresentationRole: Equatable {
-        case sourceFallback
-        case projectedTextKitOverlay
-        case rustSurface
-    }
 
     private let bridge: StorageBridge
     private var canonicalSource: String
@@ -3432,9 +3356,6 @@ private final class DocumentTextView: NSTextView {
     private var visualViewport: NativeVisualViewport?
     private var visualSelectionAnchor: Int?
     private var sourceSelectedTextAttributes: [NSAttributedString.Key: Any]?
-    private var presentationRole: PresentationRole = .sourceFallback
-    private var externalVisualDecorationsEnabled = false
-    private var sourceGlyphsHidden = false
     private var tableResizeTrackingArea: NSTrackingArea?
     private var tableResizeCursorActive = false
     private var taskCheckboxPointerConsumed = false
@@ -3541,7 +3462,6 @@ private final class DocumentTextView: NSTextView {
     }
 
     func refreshFromRust() {
-        useSourceFallbackPresentation()
         canonicalSource = bridge.source
         canonicalRevision = bridge.state.revision
         semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
@@ -3571,7 +3491,6 @@ private final class DocumentTextView: NSTextView {
                 selectedTextAttributes = sourceSelectedTextAttributes
             }
             self.sourceSelectedTextAttributes = nil
-            setPresentationRole(.sourceFallback)
         }
         needsDisplay = true
     }
@@ -3580,63 +3499,13 @@ private final class DocumentTextView: NSTextView {
         try setVisualMirrorEnabled(enabled)
     }
 
-    /// Moves projected selection/caret painting out of the TextKit view. The
-    /// view remains the input/IME/Accessibility owner; disabling this flag is
-    /// the safe fallback when the sibling decoration surface is unavailable.
-    func setExternalVisualDecorationsEnabled(_ enabled: Bool) {
-        setPresentationRole(
-            enabled ? .projectedTextKitOverlay : .sourceFallback
-        )
-    }
 
-    /// Hides only TextKit's source glyph painting after the Rust surface and
-    /// its decoration geometry have both been accepted for the same
-    /// Revision/generation. TextKit remains the live NSTextInputClient and
-    /// Accessibility owner; clearing this flag restores the complete native
-    /// fallback without rebuilding the document model.
-    func setSourceGlyphsHidden(_ hidden: Bool) {
-        setPresentationRole(hidden ? .rustSurface : .sourceFallback)
-    }
 
-    /// Applies the production paint contract as one atomic transition. The
-    /// Rust surface coordinator owns the authoritative frame check; this view
-    /// only changes which pixels TextKit is allowed to contribute.
-    func useSourceFallbackPresentation() {
-        setPresentationRole(.sourceFallback)
-    }
 
-    func useProjectedTextKitOverlayPresentation() {
-        setPresentationRole(.projectedTextKitOverlay)
-    }
 
-    func useRustSurfacePresentation() {
-        setPresentationRole(.rustSurface)
-    }
 
-    var sourceGlyphsHiddenForSelfCheck: Bool {
-        sourceGlyphsHidden
-    }
 
-    var presentationRoleForSelfCheck: String {
-        switch presentationRole {
-        case .sourceFallback: return "sourceFallback"
-        case .projectedTextKitOverlay: return "projectedTextKitOverlay"
-        case .rustSurface: return "rustSurface"
-        }
-    }
 
-    private func setPresentationRole(_ role: PresentationRole) {
-        guard presentationRole != role
-            || externalVisualDecorationsEnabled != (role != .sourceFallback)
-            || sourceGlyphsHidden != (role == .rustSurface) else {
-            return
-        }
-        presentationRole = role
-        externalVisualDecorationsEnabled = role != .sourceFallback
-        sourceGlyphsHidden = role == .rustSurface
-        applyVisualSelectionPaint(hidden: role != .sourceFallback)
-        needsDisplay = true
-    }
 
     private func applyVisualSelectionPaint(hidden: Bool) {
         guard visualMirrorEnabled else { return }
@@ -4295,34 +4164,17 @@ private final class DocumentTextView: NSTextView {
     /// Source delimiters may be hidden by the Rust projection. Draw the
     /// insertion point at the revision-bound visual caret while retaining the
     /// TextKit view as the input/IME/Accessibility owner.
+    /// caret 由 Rust retained decoration 绘制。TextKit 不贡献像素。
     override func drawInsertionPoint(
         in rect: NSRect,
         color: NSColor,
         turnedOn: Bool
-    ) {
-        if sourceGlyphsHidden || externalVisualDecorationsEnabled {
-            return
-        }
-        guard let visualRect = visualCaretRectForDisplay() else {
-            super.drawInsertionPoint(in: rect, color: color, turnedOn: turnedOn)
-            return
-        }
-        super.drawInsertionPoint(in: visualRect, color: color, turnedOn: turnedOn)
-    }
+    ) {}
 
-    override func draw(_ rect: NSRect) {
-        guard !sourceGlyphsHidden else { return }
-        super.draw(rect)
-        guard visualMirrorEnabled, !externalVisualDecorationsEnabled else { return }
-        let selectionRects = visualSelectionRectsForDisplay()
-        guard !selectionRects.isEmpty else { return }
-        NSColor.selectedTextBackgroundColor.withAlphaComponent(0.38).setFill()
-        for selectionRect in selectionRects {
-            let clipped = selectionRect.intersection(rect)
-            guard !clipped.isNull, !clipped.isEmpty else { continue }
-            clipped.fill()
-        }
-    }
+    /// Rust surface 是唯一渲染路径（不变量 I5）。本视图仍然是
+    /// `NSTextInputClient` 与 Accessibility 的宿主，但不绘制任何像素：
+    /// 没有 fallback 路径，也就不需要判断「该不该画」。
+    override func draw(_ rect: NSRect) {}
 
     private func syncNativeSelectionToRust(_ range: NSRange) {
         guard !bridge.composition.active else { return }
@@ -5143,192 +4995,12 @@ private final class MacosVisualDecorationView: NSView {
     }
 }
 
-/// Proves that one submitted Rust surface contains the same transient editor
-/// decoration layers as the independently queried Rust/CoreText geometry.
-/// AppKit painting is disabled only after all publication identities and both
-/// semantic layer counts match.
-private func submittedSurfaceOwnsVisualDecorations(
-    _ snapshot: NativeMacosRenderHostSurfaceSnapshot?,
-    revision: UInt64,
-    compositionGeneration: UInt64,
-    selectionCount: Int,
-    caretPresent: Bool
-) -> Bool {
-    guard let snapshot,
-          snapshot.submitted,
-          snapshot.revision == revision,
-          snapshot.compositionGeneration == compositionGeneration,
-          snapshot.selectionDecorationCount == selectionCount,
-          snapshot.caretDecorationCount == (caretPresent ? 1 : 0) else {
-        return false
-    }
-    return true
-}
 
-/// The source TextKit mirror is still the native input/IME/Accessibility
-/// owner, but its glyph painting can be gated once a matching Rust surface
-/// frame and decoration frame are both available.  Keep the gate explicit:
-/// a pair of booleans cannot explain why a frame was rejected, and that makes
-/// a transient edit/scroll/IME race look like an unexplained visual glitch.
-private struct VisualRenderFrameIdentity: Equatable, CustomStringConvertible {
-    let revision: UInt64
-    let compositionGeneration: UInt64
-    let surfaceGeneration: UInt64
-    let frameSerial: UInt64
 
-    var description: String {
-        "revision=\(revision), composition=\(compositionGeneration), "
-            + "surface=\(surfaceGeneration), frame=\(frameSerial)"
-    }
-}
 
-private struct VisualRenderPublicationIdentity: Equatable {
-    let frame: VisualRenderFrameIdentity
-    let submitted: Bool
-    let commandCount: Int
-    let commandKindMask: UInt64
-    let blockKindMask: UInt64
 
-    /// A submitted surface is not necessarily useful to the editor. An empty
-    /// render plan can be a valid publication for an empty/whitespace-only
-    /// document, but it must not hide the source TextKit mirror: there is no
-    /// visual content for the native surface to replace. Keeping this policy
-    /// beside the publication identity makes the source-glyph gate explicit
-    /// and prevents a blank surface from looking like a successful migration.
-    var hasVisualContent: Bool {
-        hasSupportedVisualRenderCommands(
-            commandCount: commandCount,
-            commandKindMask: commandKindMask
-        )
-    }
 
-    init(
-        frame: VisualRenderFrameIdentity,
-        submitted: Bool,
-        commandCount: Int = 1,
-        commandKindMask: UInt64 = supportedVisualRenderCommandMask,
-        blockKindMask: UInt64 = supportedVisualBlockKindMask
-    ) {
-        self.frame = frame
-        self.submitted = submitted
-        self.commandCount = commandCount
-        self.commandKindMask = commandKindMask
-        self.blockKindMask = blockKindMask
-    }
 
-    init(_ snapshot: NativeMacosRenderHostSurfaceSnapshot) {
-        frame = VisualRenderFrameIdentity(
-            revision: snapshot.revision,
-            compositionGeneration: snapshot.compositionGeneration,
-            surfaceGeneration: snapshot.surfaceGeneration,
-            frameSerial: snapshot.frameSerial
-        )
-        submitted = snapshot.submitted
-        commandCount = snapshot.commandCount
-        commandKindMask = snapshot.commandKindMask
-        blockKindMask = snapshot.blockKindMask
-    }
-}
-
-/// Returns the one publication identity that is allowed to hide TextKit's
-/// source glyphs. Keeping this predicate pure makes the composition-generation
-/// race testable without constructing an AppKit view or a Metal drawable.
-private func acceptedVisualRenderFrame(
-    revision: UInt64,
-    compositionGeneration: UInt64,
-    publicationCurrent: Bool,
-    publication: VisualRenderPublicationIdentity?,
-    decorationRevision: UInt64?,
-    decorationHasValidFrame: Bool,
-    rustDecorationFrameAccepted: Bool,
-    retainedCoverage: VisualRetainedCoverage? = nil
-) -> VisualRenderFrameIdentity? {
-    guard publicationCurrent,
-          decorationRevision == revision,
-          decorationHasValidFrame,
-          rustDecorationFrameAccepted,
-          let publication,
-          publication.submitted,
-          publication.hasVisualContent,
-          publication.frame.revision == revision,
-          publication.frame.compositionGeneration == compositionGeneration else {
-        return nil
-    }
-    if let retainedCoverage,
-       (!retainedCoverage.complete || retainedCoverage.revision != revision) {
-        return nil
-    }
-    return publication.frame
-}
-
-private enum VisualRenderFallbackReason: String, Equatable, CustomStringConvertible {
-    case disabled
-    case detached
-    case missingGeometry
-    case waitingForSurface
-    case staleRevision
-    case staleComposition
-    case decorationUnavailable
-    case invalidFrame
-    case compositionActive
-    case surfaceSubmitFailed
-    case visualMirrorUnavailable
-    case noVisualContent
-    case unsupportedContent
-    case retainedCoverageUnavailable
-
-    var description: String { rawValue }
-}
-
-private enum VisualRenderState: Equatable, CustomStringConvertible {
-    case fallback(VisualRenderFallbackReason)
-    case active(VisualRenderFrameIdentity)
-
-    var isActive: Bool {
-        if case .active = self { return true }
-        return false
-    }
-
-    var fallbackReason: VisualRenderFallbackReason? {
-        guard case .fallback(let reason) = self else { return nil }
-        return reason
-    }
-
-    var description: String {
-        switch self {
-        case .fallback(let reason):
-            return "fallback(\(reason))"
-        case .active(let frame):
-            return "active(\(frame))"
-        }
-    }
-}
-
-/// Small deterministic state machine for the source-glyph gate.  This is
-/// deliberately independent of AppKit so its transition rules can be tested
-/// without creating a window or a Metal drawable.
-private struct VisualRenderStateMachine {
-    private(set) var state: VisualRenderState = .fallback(.disabled)
-    private(set) var transitionSerial: UInt64 = 0
-
-    mutating func enterFallback(_ reason: VisualRenderFallbackReason) {
-        let next = VisualRenderState.fallback(reason)
-        guard state != next else { return }
-        state = next
-        transitionSerial &+= 1
-    }
-
-    mutating func activate(_ frame: VisualRenderFrameIdentity) {
-        let next = VisualRenderState.active(frame)
-        guard state != next else { return }
-        state = next
-        transitionSerial &+= 1
-    }
-
-    var diagnosticDescription: String {
-        "state=\(state); transitions=\(transitionSerial)"
-    }
-}
 
 private struct TableResizePointerSession: Equatable {
     let revision: UInt64
@@ -5419,7 +5091,6 @@ private final class MacosSurfaceHostCoordinator {
     private var metrics: Metrics?
     private var lastSubmitKey: SubmitKey?
     private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
-    private(set) var retainedCoverage: VisualRetainedCoverage?
     private var submitScheduled = false
     private var scheduleToken: UInt64 = 0
     private var imageRefreshTask: DispatchWorkItem?
@@ -5453,7 +5124,6 @@ private final class MacosSurfaceHostCoordinator {
         metrics = nil
         lastSubmitKey = nil
         lastSnapshot = nil
-        retainedCoverage = nil
         imageRefreshNeeded = false
         tableResizePointerState.reset()
         isAttached = false
@@ -5466,7 +5136,6 @@ private final class MacosSurfaceHostCoordinator {
         self.fontSize = next
         metrics = nil
         lastSubmitKey = nil
-        retainedCoverage = nil
         scheduleSubmit()
     }
 
@@ -5483,7 +5152,6 @@ private final class MacosSurfaceHostCoordinator {
         contentWidth = next
         metrics = nil
         lastSubmitKey = nil
-        retainedCoverage = nil
         scheduleSubmit()
     }
 
@@ -5545,7 +5213,6 @@ private final class MacosSurfaceHostCoordinator {
                 _ = try self.submitNow()
             } catch {
                 self.clearTableResizeState()
-                self.retainedCoverage = nil
                 self.imageRefreshNeeded = false
                 self.cancelImageResourceRefresh()
                 self.surfaceView?.setNativeContentVisible(false)
@@ -5562,7 +5229,6 @@ private final class MacosSurfaceHostCoordinator {
     func invalidateEditorDecorationPublication() {
         lastSubmitKey = nil
         lastSnapshot = nil
-        retainedCoverage = nil
     }
 
     private func cancelImageResourceRefresh() {
@@ -5826,7 +5492,6 @@ private final class MacosSurfaceHostCoordinator {
                 return false
             }
             lastSubmitKey = nil
-            retainedCoverage = nil
             scheduleSubmit()
             return true
         } catch BridgeError.operation(let status)
@@ -5862,7 +5527,6 @@ private final class MacosSurfaceHostCoordinator {
                 pointerPosition: pointerPosition
             )
             lastSubmitKey = nil
-            retainedCoverage = nil
             scheduleSubmit()
             return true
         } catch BridgeError.operation(let status)
@@ -5870,7 +5534,6 @@ private final class MacosSurfaceHostCoordinator {
                 || status == StorageStatus.tableResizeNotActive {
             tableResizePointerState.reset()
             lastSubmitKey = nil
-            retainedCoverage = nil
             return true
         } catch {
             tableResizePointerState.reset()
@@ -5893,7 +5556,6 @@ private final class MacosSurfaceHostCoordinator {
             _ = try bridge.tableResizeFinish(revision: revision)
             _ = tableResizePointerState.finish(revision: revision)
             lastSubmitKey = nil
-            retainedCoverage = nil
             scheduleSubmit()
             finished = true
         } catch {
@@ -5916,7 +5578,6 @@ private final class MacosSurfaceHostCoordinator {
             try bridge.tableResizeCancel(revision: revision)
             _ = tableResizePointerState.cancel(revision: revision)
             lastSubmitKey = nil
-            retainedCoverage = nil
             scheduleSubmit()
         } catch {
             tableResizePointerState.reset()
@@ -6027,7 +5688,6 @@ private final class MacosSurfaceHostCoordinator {
             scrollView.contentView.setBoundsOrigin(origin)
             scrollView.reflectScrolledClipView(scrollView.contentView)
             lastSubmitKey = nil
-            retainedCoverage = nil
             scheduleSubmit()
         } catch {
             // Caret reveal is an enhancement to the source TextKit view. The
@@ -6036,7 +5696,12 @@ private final class MacosSurfaceHostCoordinator {
         }
     }
 
-    private func updateRetainedCoverage(
+    /// 扫描当前 viewport 的图片与嵌入资源，决定是否需要安排一次刷新。
+    ///
+    /// 这里不再做 retained coverage 判断：Rust surface 是唯一渲染路径，
+    /// 资源未就绪时由 Rust 绘制 placeholder，不存在回退 TextKit 的分支
+    /// （不变量 I5）。资源状态只影响「要不要再取一次」，不影响「谁来画」。
+    private func updateResourceRefreshState(
         snapshot: NativeMacosRenderHostSurfaceSnapshot,
         revision: UInt64,
         size: Float,
@@ -6045,22 +5710,7 @@ private final class MacosSurfaceHostCoordinator {
         viewportHeight: Float
     ) {
         imageRefreshNeeded = false
-        // An empty plan or an unknown command kind already forces the full
-        // source fallback. Keep the retained coverage contract complete and
-        // let the publication predicate reject the frame for its command-level
-        // reason.
-        guard snapshot.commandCount > 0,
-              hasSupportedVisualRenderCommands(
-                  commandCount: snapshot.commandCount,
-                  commandKindMask: snapshot.commandKindMask
-              ) else {
-            retainedCoverage = VisualRetainedCoverage(
-                revision: revision,
-                complete: true
-            )
-            return
-        }
-
+        guard snapshot.commandCount > 0 else { return }
         do {
             let (viewport, blocks) = try bridge.macosShapedViewportBlocks(
                 revision: revision,
@@ -6069,76 +5719,34 @@ private final class MacosSurfaceHostCoordinator {
                 scrollY: scrollY,
                 viewportHeight: viewportHeight
             )
-            guard viewport.revision == revision else {
-                retainedCoverage = VisualRetainedCoverage(
-                    revision: revision,
-                    complete: false
-                )
-                return
-            }
-            var blockKindMask: UInt64 = 0
-            for block in blocks {
-                let bit = visualBlockKindBit(block.kind)
-                blockKindMask |= bit
-            }
-            guard hasCompleteRetainedBlockCoverage(
-                blockKindMask: blockKindMask,
-                publishedBlockKindMask: snapshot.blockKindMask,
-                blockCount: blocks.count,
-                canonicalSourceIsEmpty: bridge.source.isEmpty,
-                compositionActive: bridge.composition.active
-            ) else {
-                retainedCoverage = VisualRetainedCoverage(
-                    revision: revision,
-                    complete: false
-                )
-                return
-            }
+            guard viewport.revision == revision else { return }
             let visibleBlockIndexes = Set(blocks.map(\.blockIndex))
             let images = try bridge.macosVisualImages(revision: revision)
             for image in images where visibleBlockIndexes.contains(image.blockIndex) {
-                guard applyRetainedResourceCoverage(
+                if retainedResourceNeedsRefresh(
                     state: imageResourceCoverageState(image.resourceStatus),
-                    resourceFingerprint: image.resourceFingerprint,
-                    refreshNeeded: &imageRefreshNeeded
-                ) else {
-                    retainedCoverage = VisualRetainedCoverage(
-                        revision: revision,
-                        complete: false
-                    )
-                    return
+                    resourceFingerprint: image.resourceFingerprint
+                ) {
+                    imageRefreshNeeded = true
                 }
             }
-            if blocks.contains(where: {
+            guard blocks.contains(where: {
                 $0.kind == UInt8(YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE)
-            }) {
-                let embeddedResources = try bridge.macosVisualEmbeddedResources(
-                    revision: revision
-                )
-                for resource in embeddedResources
-                    where visibleBlockIndexes.contains(resource.blockIndex) {
-                    guard applyRetainedResourceCoverage(
-                        state: embeddedResourceCoverageState(resource.resourceStatus),
-                        resourceFingerprint: resource.resourceFingerprint,
-                        refreshNeeded: &imageRefreshNeeded
-                    ) else {
-                        retainedCoverage = VisualRetainedCoverage(
-                            revision: revision,
-                            complete: false
-                        )
-                        return
-                    }
+            }) else { return }
+            let embeddedResources = try bridge.macosVisualEmbeddedResources(
+                revision: revision
+            )
+            for resource in embeddedResources
+                where visibleBlockIndexes.contains(resource.blockIndex) {
+                if retainedResourceNeedsRefresh(
+                    state: embeddedResourceCoverageState(resource.resourceStatus),
+                    resourceFingerprint: resource.resourceFingerprint
+                ) {
+                    imageRefreshNeeded = true
                 }
             }
-            retainedCoverage = VisualRetainedCoverage(
-                revision: revision,
-                complete: true
-            )
         } catch {
-            retainedCoverage = VisualRetainedCoverage(
-                revision: revision,
-                complete: false
-            )
+            // 资源查询失败不影响绘制；下一帧会重试。
         }
     }
 
@@ -6182,11 +5790,9 @@ private final class MacosSurfaceHostCoordinator {
             // rejected an empty plan. Do not briefly re-show that blank
             // surface; source TextKit remains the canonical visible fallback
             // until a publication with actual draw commands exists.
-            surfaceView.setNativeContentVisible(
-                lastSnapshot?.hasVisualContent == true
-                    && retainedCoverage?.revision == revision
-                    && retainedCoverage?.complete == true
-            )
+            // Rust surface 是唯一渲染路径：attach 之后一直可见，
+            // 内容由 retained frame 决定，不由 coverage 决定（不变量 I5）。
+            surfaceView.setNativeContentVisible(true)
             scheduleImageResourceRefresh()
             return lastSnapshot
         }
@@ -6211,7 +5817,7 @@ private final class MacosSurfaceHostCoordinator {
         isAttached = true
         lastSubmitKey = key
         lastSnapshot = snapshot
-        updateRetainedCoverage(
+        updateResourceRefreshState(
             snapshot: snapshot,
             revision: revision,
             size: Float(size),
@@ -6219,11 +5825,7 @@ private final class MacosSurfaceHostCoordinator {
             scrollY: Float(scrollY),
             viewportHeight: Float(viewportHeight)
         )
-        surfaceView.setNativeContentVisible(
-            snapshot.hasVisualContent
-                && retainedCoverage?.revision == revision
-                && retainedCoverage?.complete == true
-        )
+        surfaceView.setNativeContentVisible(true)
         onSurfaceStateChange?()
         if imageRefreshNeeded {
             scheduleImageResourceRefresh()
@@ -6248,7 +5850,6 @@ private final class MacosSurfaceHostCoordinator {
         isAttached = false
         lastSubmitKey = nil
         lastSnapshot = nil
-        retainedCoverage = nil
         imageRefreshNeeded = false
         metrics = nil
         surfaceView?.setNativeContentVisible(false)
@@ -6259,7 +5860,6 @@ private final class MacosSurfaceHostCoordinator {
         try? bridge.tableResizeCancel(revision: bridge.state.revision)
         tableResizePointerState.reset()
         lastSubmitKey = nil
-        retainedCoverage = nil
     }
 
     private func ensureMetrics(
@@ -6350,7 +5950,6 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private weak var documentScrollView: NSScrollView?
     private var visualPointerAdapterEnabled = false
     private var visualPointerLayoutWidth: CGFloat = -1.0
-    private var visualRenderStateMachine = VisualRenderStateMachine()
     /// The source TextKit mirror must have one complete layout pass before
     /// optional Rust projection/surface work is allowed to run. This keeps
     /// opening a document on the primary editing path independent from the
@@ -6375,7 +5974,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             // The source TextKit mirror remains usable when a machine has no
             // Metal drawable; surface lifecycle failure is diagnostic, not a
             // reason to interrupt editing with a modal alert.
-            self?.clearVisualDecorations(reason: .surfaceSubmitFailed)
+            self?.clearVisualDecorations()
             self?.statusLabel.toolTip = "Native surface inactive: \(error.localizedDescription)"
         }
     }
@@ -6421,7 +6020,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             guard let self else { return }
             try? self.textView.refreshVisualMirrorForDisplay()
             self.surfaceCoordinator.invalidateEditorDecorationPublication()
-            self.clearVisualDecorations(reason: .waitingForSurface)
+            self.clearVisualDecorations()
             self.scheduleVisualSubmit()
             // AppKit may deliver selection changes while TextKit is still
             // inside its event callback. Defer the scroll mutation until the
@@ -6496,12 +6095,12 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                     self.surfaceCoordinator.scheduleSubmit()
                     self.updateVisualDecorations()
                 } else {
-                    self.clearVisualDecorations(reason: .disabled)
+                    self.clearVisualDecorations()
                 }
                 self.textView.refreshTableResizeAccessibility()
             } else {
                 self.surfaceCoordinator.detach()
-                self.clearVisualDecorations(reason: .detached)
+                self.clearVisualDecorations()
                 self.textView.refreshTableResizeAccessibility()
             }
         }
@@ -6574,7 +6173,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             // Keep the native source mirror fully visible during the first
             // layout. The enhancement layer is enabled from viewDidAppear,
             // after AppKit has a real window/clip geometry to report.
-            clearVisualDecorations(reason: .disabled)
+            clearVisualDecorations()
             return
         }
         let visualWidth = max(
@@ -6637,125 +6236,23 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
 
     func detachSurfaceHost() {
         surfaceCoordinator.detach()
-        clearVisualDecorations(reason: .detached)
+        clearVisualDecorations()
     }
 
-    private func clearVisualDecorations(
-        reason: VisualRenderFallbackReason = .disabled
-    ) {
+    /// surface 不可用时只清掉装饰几何。绝不把绘制责任交回 TextKit——
+    /// 那条路径已经不存在了（不变量 I5）。
+    private func clearVisualDecorations() {
         decorationHostView.clear()
         rustDecorationFrameAccepted = false
-        textView.useSourceFallbackPresentation()
-        surfaceHostView.setNativeContentVisible(false)
-        visualRenderStateMachine.enterFallback(reason)
     }
 
-    private func syncSourceGlyphVisibility(
-        useProjectedTextKitFallback: Bool = false
-    ) {
-        let revision = bridge.state.revision
-        let compositionGeneration = bridge.composition.generation
-        let retainedCoverage =
-            surfaceCoordinator.retainedCoverage
-            ?? VisualRetainedCoverage(
-                revision: revision,
-                complete: false
-            )
-        let publicationCurrent = surfaceCoordinator.hasCurrentPublication(
-            revision: revision,
-            compositionGeneration: compositionGeneration
-        )
-        let decorationCurrent = decorationHostView.revision == revision
-            && decorationHostView.hasValidFrame
-        let activeFrame = acceptedVisualRenderFrame(
-            revision: revision,
-            compositionGeneration: compositionGeneration,
-            publicationCurrent: publicationCurrent,
-            publication: surfaceCoordinator.lastSnapshot.map(VisualRenderPublicationIdentity.init),
-            decorationRevision: decorationHostView.revision,
-            decorationHasValidFrame: decorationHostView.hasValidFrame,
-            rustDecorationFrameAccepted: rustDecorationFrameAccepted,
-            retainedCoverage: retainedCoverage
-        )
-        let canHideSourceGlyphs = activeFrame != nil
-        if canHideSourceGlyphs {
-            textView.useRustSurfacePresentation()
-        } else if useProjectedTextKitFallback {
-            textView.useProjectedTextKitOverlayPresentation()
-        } else {
-            textView.useSourceFallbackPresentation()
-        }
-        // The Rust surface and its Rust-shaped decoration frame are one
-        // visual publication. If either side is stale, hide the surface as a
-        // unit and let TextKit render the source mirror until both are ready.
-        // Coverage is all-or-nothing, so TextKit never paints source glyphs
-        // above an accepted Rust surface.
-        surfaceHostView.setNativeContentVisible(canHideSourceGlyphs)
-
-        if let activeFrame {
-            visualRenderStateMachine.activate(activeFrame)
-            return
-        }
-
-        visualRenderStateMachine.enterFallback(
-            visualRenderFallbackReason(
-                revision: revision,
-                compositionGeneration: compositionGeneration,
-                publicationCurrent: publicationCurrent,
-                decorationCurrent: decorationCurrent
-            )
-        )
+    /// Rust surface 是唯一渲染路径（不变量 I5）。TextKit 永不绘制像素，
+    /// 因此这里没有 gate、没有 fallback reason、没有 coverage 判断：
+    /// surface 一旦 attach 就保持可见，未支持的语法由 Rust 按源码文本绘制。
+    private func syncSourceGlyphVisibility() {
+        surfaceHostView.setNativeContentVisible(true)
     }
 
-    private func visualRenderFallbackReason(
-        revision: UInt64,
-        compositionGeneration: UInt64,
-        publicationCurrent: Bool,
-        decorationCurrent: Bool
-    ) -> VisualRenderFallbackReason {
-        guard decorationCurrent else {
-            if let decorationRevision = decorationHostView.revision,
-               decorationRevision != revision {
-                return .staleRevision
-            }
-            return .decorationUnavailable
-        }
-        guard publicationCurrent else {
-            guard let snapshot = surfaceCoordinator.lastSnapshot else {
-                return surfaceCoordinator.isAttached
-                    ? .waitingForSurface
-                    : .detached
-            }
-            if snapshot.revision != revision {
-                return .staleRevision
-            }
-            if snapshot.compositionGeneration != compositionGeneration {
-                return .staleComposition
-            }
-            return snapshot.submitted ? .waitingForSurface : .surfaceSubmitFailed
-        }
-        if let snapshot = surfaceCoordinator.lastSnapshot,
-           !snapshot.hasVisualContent {
-            if snapshot.commandCount == 0 {
-                return .noVisualContent
-            }
-            if !hasSupportedVisualRenderCommands(
-                commandCount: snapshot.commandCount,
-                commandKindMask: snapshot.commandKindMask
-            ) {
-                return .unsupportedContent
-            }
-        }
-        guard let coverage = surfaceCoordinator.retainedCoverage,
-              coverage.complete,
-              coverage.revision == revision else {
-            return .retainedCoverageUnavailable
-        }
-        if bridge.composition.active {
-            return .compositionActive
-        }
-        return .invalidFrame
-    }
 
     /// Publishes Rust/CoreText-shaped decoration geometry into the sibling
     /// overlay. The Rust coordinates are document-space and the only native
@@ -6765,11 +6262,11 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     /// overlay is only a failure fallback.
     private func updateVisualDecorations() {
         guard visualEnhancementsReady else {
-            clearVisualDecorations(reason: .disabled)
+            clearVisualDecorations()
             return
         }
         guard decorationHostView.superview != nil else {
-            clearVisualDecorations(reason: .missingGeometry)
+            clearVisualDecorations()
             return
         }
         if let geometry = surfaceCoordinator.visualDecorationGeometry() {
@@ -6790,7 +6287,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                     if bridge.composition.active {
                         updateVisualDecorationsFromTextKit()
                     } else {
-                        clearVisualDecorations(reason: .decorationUnavailable)
+                        clearVisualDecorations()
                     }
                     return
                 }
@@ -6809,19 +6306,15 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                     width: caret.rect.width,
                     height: caret.rect.height
                 )
-                let surfaceOwnsDecorations = submittedSurfaceOwnsVisualDecorations(
-                    surfaceCoordinator.lastSnapshot,
-                    revision: snapshot.revision,
-                    compositionGeneration: snapshot.compositionGeneration,
-                    selectionCount: localSelection.count,
-                    caretPresent: caret.present
-                )
+                // selection/caret 已作为 source-backed decoration 进入同一
+                // retained frame，AppKit sibling 只保留几何用于命中测试，
+                // 永不绘制——不存在第二条渲染路径（不变量 I5）。
                 decorationHostView.update(
                     revision: snapshot.revision,
                     selectionRects: localSelection,
                     caretRect: localCaret,
                     compositionActive: bridge.composition.active,
-                    paintsDecorations: !surfaceOwnsDecorations
+                    paintsDecorations: false
                 )
                 rustDecorationFrameAccepted = true
                 syncSourceGlyphVisibility()
@@ -6834,7 +6327,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
                 if bridge.composition.active {
                     updateVisualDecorationsFromTextKit()
                 } else {
-                    clearVisualDecorations(reason: .decorationUnavailable)
+                    clearVisualDecorations()
                 }
                 return
             }
@@ -6842,7 +6335,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         if bridge.composition.active {
             updateVisualDecorationsFromTextKit()
         } else {
-            clearVisualDecorations(reason: .missingGeometry)
+            clearVisualDecorations()
         }
     }
 
@@ -6860,7 +6353,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
               visualPointerAdapterEnabled,
               decorationHostView.superview != nil,
               let caret = textView.visualCaretRectForDisplay() else {
-            clearVisualDecorations(reason: .visualMirrorUnavailable)
+            clearVisualDecorations()
             return
         }
         rustDecorationFrameAccepted = false
@@ -6874,7 +6367,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             caretRect: convertedCaret,
             compositionActive: bridge.composition.active
         )
-        syncSourceGlyphVisibility(useProjectedTextKitFallback: true)
+        syncSourceGlyphVisibility()
     }
 
     @objc private func save() {
@@ -7884,278 +7377,6 @@ private func runVisualMirrorSelfCheck(path: String) -> Never {
 }
 
 
-private func runVisualRenderStateSelfCheck() -> Never {
-    var machine = VisualRenderStateMachine()
-    precondition(machine.state == .fallback(.disabled))
-    precondition(machine.transitionSerial == 0)
-
-    machine.enterFallback(.waitingForSurface)
-    precondition(machine.state == .fallback(.waitingForSurface))
-    let firstTransition = machine.transitionSerial
-    machine.enterFallback(.waitingForSurface)
-    precondition(machine.transitionSerial == firstTransition)
-
-    machine.enterFallback(.staleRevision)
-    precondition(machine.state.fallbackReason == .staleRevision)
-
-    let frame = VisualRenderFrameIdentity(
-        revision: 7,
-        compositionGeneration: 3,
-        surfaceGeneration: 11,
-        frameSerial: 19
-    )
-    machine.activate(frame)
-    precondition(machine.state == .active(frame))
-    precondition(machine.state.isActive)
-    precondition(machine.diagnosticDescription.contains("revision=7"))
-
-    let publication = VisualRenderPublicationIdentity(frame: frame, submitted: true)
-    var embeddedRefreshNeeded = false
-    precondition(
-        applyRetainedResourceCoverage(
-            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_READY)),
-            resourceFingerprint: 7,
-            refreshNeeded: &embeddedRefreshNeeded
-        )
-    )
-    precondition(
-        applyRetainedResourceCoverage(
-            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING)),
-            resourceFingerprint: 7,
-            refreshNeeded: &embeddedRefreshNeeded
-        )
-    )
-    precondition(embeddedRefreshNeeded)
-    precondition(
-        applyRetainedResourceCoverage(
-            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED)),
-            resourceFingerprint: 7,
-            refreshNeeded: &embeddedRefreshNeeded
-        )
-    )
-    precondition(
-        applyRetainedResourceCoverage(
-            state: embeddedResourceCoverageState(
-                UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
-            ),
-            resourceFingerprint: 11,
-            refreshNeeded: &embeddedRefreshNeeded
-        )
-    )
-    precondition(
-        applyRetainedResourceCoverage(
-            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN)),
-            resourceFingerprint: 0,
-            refreshNeeded: &embeddedRefreshNeeded
-        )
-    )
-    precondition(
-        !applyRetainedResourceCoverage(
-            state: imageResourceCoverageState(UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN)),
-            resourceFingerprint: 9,
-            refreshNeeded: &embeddedRefreshNeeded
-        )
-    )
-    precondition(
-        !applyRetainedResourceCoverage(
-            state: imageResourceCoverageState(255),
-            resourceFingerprint: 13,
-            refreshNeeded: &embeddedRefreshNeeded
-        )
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 3,
-            publicationCurrent: true,
-            publication: publication,
-            decorationRevision: 7,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true
-        ) == frame
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 4,
-            publicationCurrent: true,
-            publication: publication,
-            decorationRevision: 7,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true
-        ) == nil
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 3,
-            publicationCurrent: false,
-            publication: publication,
-            decorationRevision: 7,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true
-        ) == nil
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 3,
-            publicationCurrent: true,
-            publication: publication,
-            decorationRevision: 8,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true
-        ) == nil
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 3,
-            publicationCurrent: true,
-            publication: publication,
-            decorationRevision: 7,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true,
-            retainedCoverage: VisualRetainedCoverage(
-                revision: 7,
-                complete: true
-            )
-        ) == frame
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 3,
-            publicationCurrent: true,
-            publication: VisualRenderPublicationIdentity(
-                frame: frame,
-                submitted: true,
-                commandCount: 0
-            ),
-            decorationRevision: 7,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true
-        ) == nil
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 3,
-            publicationCurrent: true,
-            publication: VisualRenderPublicationIdentity(
-                frame: frame,
-                submitted: true,
-                commandCount: 1,
-                commandKindMask: supportedVisualRenderCommandMask | (UInt64(1) << 7)
-            ),
-            decorationRevision: 7,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true
-        ) == nil
-    )
-    precondition(
-        !hasSupportedVisualRenderCommands(
-            commandCount: 1,
-            commandKindMask: 0
-        )
-    )
-    precondition(
-        hasSupportedVisualRenderCommands(
-            commandCount: 1,
-            commandKindMask: visualRenderCommandEmbeddedSvgBit
-        )
-    )
-    precondition(
-        hasSupportedVisualRenderCommands(
-            commandCount: 1,
-            commandKindMask: visualRenderCommandTaskCheckboxBit
-        )
-    )
-    precondition(
-        !hasSupportedVisualBlockKinds(supportedVisualBlockKindMask | (UInt64(1) << 63))
-    )
-    precondition(
-        hasCompleteRetainedBlockCoverage(
-            blockKindMask: 0,
-            publishedBlockKindMask: 0,
-            blockCount: 0,
-            canonicalSourceIsEmpty: true,
-            compositionActive: false
-        )
-    )
-    precondition(
-        !hasCompleteRetainedBlockCoverage(
-            blockKindMask: 0,
-            publishedBlockKindMask: 0,
-            blockCount: 0,
-            canonicalSourceIsEmpty: true,
-            compositionActive: true
-        )
-    )
-    precondition(
-        !hasCompleteRetainedBlockCoverage(
-            blockKindMask: 0,
-            publishedBlockKindMask: 0,
-            blockCount: 0,
-            canonicalSourceIsEmpty: false,
-            compositionActive: false
-        )
-    )
-    precondition(
-        hasCompleteRetainedBlockCoverage(
-            blockKindMask: supportedVisualBlockKindMask,
-            publishedBlockKindMask: supportedVisualBlockKindMask,
-            blockCount: 1,
-            canonicalSourceIsEmpty: false,
-            compositionActive: false
-        )
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 3,
-            publicationCurrent: true,
-            publication: VisualRenderPublicationIdentity(
-                frame: frame,
-                submitted: true,
-                commandCount: 1,
-                blockKindMask: supportedVisualBlockKindMask | (UInt64(1) << 63)
-            ),
-            decorationRevision: 7,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true,
-            retainedCoverage: VisualRetainedCoverage(
-                revision: 7,
-                complete: false
-            )
-        ) == nil
-    )
-    precondition(
-        acceptedVisualRenderFrame(
-            revision: 7,
-            compositionGeneration: 3,
-            publicationCurrent: true,
-            publication: publication,
-            decorationRevision: 7,
-            decorationHasValidFrame: true,
-            rustDecorationFrameAccepted: true,
-            retainedCoverage: VisualRetainedCoverage(
-                revision: 8,
-                complete: true
-            )
-        ) == nil
-    )
-
-    machine.enterFallback(.staleComposition)
-    precondition(machine.state == .fallback(.staleComposition))
-    precondition(!machine.state.isActive)
-    precondition(machine.transitionSerial >= 4)
-    print(
-        "Yu Visual Render State self-check: explicit active/fallback transitions "
-            + "preserve frame identity, generation gate and diagnostics"
-    )
-    exit(EXIT_SUCCESS)
-}
 
 private func runVisualIMESelfCheck(path: String) -> Never {
     do {
@@ -9014,577 +8235,9 @@ private func runVisualViewportSelfCheck(path: String) -> Never {
 
 
 
-private func installMacosImageSelfCheckFixture(at markdownPath: String) throws -> URL? {
-    let markdownURL = URL(fileURLWithPath: markdownPath)
-    let assetsURL = markdownURL.deletingLastPathComponent()
-        .appendingPathComponent("assets", isDirectory: true)
-    let imageURL = assetsURL.appendingPathComponent("yu-logo.png")
-    let referenceImageURL = assetsURL.appendingPathComponent("yu-mark.png")
-    let fileManager = FileManager.default
-    guard !fileManager.fileExists(atPath: imageURL.path)
-        || !fileManager.fileExists(atPath: referenceImageURL.path) else {
-        return nil
-    }
-    try fileManager.createDirectory(at: assetsURL, withIntermediateDirectories: true)
-    let png = Data([
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
-        0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0, 0, 0, 181, 28, 12, 2,
-        0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15,
-        0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78,
-        68, 174, 66, 96, 130
-    ])
-    try png.write(to: imageURL, options: .atomic)
-    try png.write(to: referenceImageURL, options: .atomic)
-    return imageURL
-}
 
-private func removeMacosImageSelfCheckFixture(_ imageURL: URL?) {
-    guard let imageURL else { return }
-    try? FileManager.default.removeItem(at: imageURL)
-    try? FileManager.default.removeItem(at: imageURL.deletingLastPathComponent())
-}
 
-private func runMacosRenderHostSurfaceSelfCheck(path: String) -> Never {
-    do {
-        let imageFixture = try installMacosImageSelfCheckFixture(at: path)
-        let bridge = try StorageBridge(path: path)
-        let sourceBefore = bridge.source
-        let revision = bridge.state.revision
-        let size: Float = 14.0
-        let maxWidth: Float = 500.0
-        let viewportHeight: Float = 240.0
-        let shaped = try bridge.macosBlockLayout(
-            revision: revision,
-            blockIndex: 2,
-            size: size,
-            maxWidth: maxWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: maxWidth,
-            lineHeight: Float(shaped.lineHeight),
-            defaultAdvance: Float(shaped.defaultAdvance),
-            estimatedBlockHeight: Float(shaped.lineHeight),
-            overscan: 0.0
-        )
 
-        let application = NSApplication.shared
-        application.setActivationPolicy(.regular)
-        let frame = NSRect(
-            x: 0.0,
-            y: 0.0,
-            width: CGFloat(maxWidth),
-            height: CGFloat(viewportHeight)
-        )
-        let window = NSWindow(
-            contentRect: frame,
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        let view = NSView(frame: frame)
-        window.contentView = view
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        application.activate(ignoringOtherApps: true)
-        window.displayIfNeeded()
-        defer {
-            try? bridge.macosRenderHostSurfaceDetach()
-            try? bridge.macosRenderHostSurfaceDetach()
-            window.orderOut(nil)
-            window.close()
-        }
-
-        let rawView = Unmanaged.passUnretained(view).toOpaque()
-        let first = try bridge.macosRenderHostSurfaceSubmit(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: viewportHeight,
-            surfaceWidth: Double(maxWidth),
-            surfaceHeight: Double(viewportHeight),
-            scale: 2.0,
-            view: rawView
-        )
-        precondition(first.revision == revision)
-        precondition(first.surfaceGeneration == 0)
-        precondition(first.frameSerial > 0)
-        precondition(first.uploadedPages > 0)
-        precondition(first.commandCount > 0)
-        precondition(first.damageCount > 0)
-        precondition(first.atlasPageCount > 0)
-        precondition(first.submitted)
-
-        let repeated = try bridge.macosRenderHostSurfaceSubmit(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: viewportHeight,
-            surfaceWidth: Double(maxWidth),
-            surfaceHeight: Double(viewportHeight),
-            scale: 2.0,
-            view: rawView
-        )
-        precondition(repeated.compositionGeneration == bridge.composition.generation)
-        precondition(repeated.surfaceGeneration == first.surfaceGeneration)
-        precondition(repeated.frameSerial > first.frameSerial)
-        precondition(repeated.uploadedPages == 0)
-        precondition(repeated.submitted)
-
-        var imagePublicationReady = false
-        if sourceBefore.contains("![") {
-            var imageReady = repeated
-            for _ in 0..<20 {
-                let candidate = try bridge.macosRenderHostSurfaceSubmit(
-                    revision: revision,
-                    size: size,
-                    maxWidth: maxWidth,
-                    scrollY: 0.0,
-                    viewportHeight: viewportHeight,
-                    surfaceWidth: Double(maxWidth),
-                    surfaceHeight: Double(viewportHeight),
-                    scale: 2.0,
-                    view: rawView
-                )
-                imageReady = candidate
-                if candidate.imageResourceCount > 0 {
-                    break
-                }
-                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
-            }
-            precondition(imageReady.imageRequestCount > 0)
-            precondition(imageReady.imageCandidateCount >= imageReady.imageRequestCount)
-            precondition(
-                imageReady.imageVisibleCandidateCount
-                    + imageReady.imageOverscanCandidateCount
-                    == imageReady.imageCandidateCount
-            )
-            precondition(imageReady.imageDuplicateCount <= imageReady.imageCandidateCount)
-            precondition(imageReady.imageResourceCount > 0)
-            precondition(imageReady.imageFailureCount == 0)
-            precondition(imageReady.uploadedImages > 0 || repeated.imageResourceCount > 0)
-            let publishedImages = try bridge.macosVisualImages(revision: revision)
-            precondition(
-                publishedImages.contains {
-                    $0.resourceStatus == UInt8(YU_STORAGE_IMAGE_RESOURCE_READY)
-                }
-            )
-
-            // Move past the fixture's visible block. The host must drop the
-            // now-unreferenced Metal texture instead of retaining every image
-            // visited during a long document scroll.
-            let offscreen = try bridge.macosRenderHostSurfaceSubmit(
-                revision: revision,
-                size: size,
-                maxWidth: maxWidth,
-                scrollY: 10_000.0,
-                viewportHeight: viewportHeight,
-                surfaceWidth: Double(maxWidth),
-                surfaceHeight: Double(viewportHeight),
-                scale: 2.0,
-                view: rawView
-            )
-            precondition(offscreen.imageResourceCount == 0)
-            precondition(offscreen.imageAtlasEvictionCount > imageReady.imageAtlasEvictionCount)
-            imagePublicationReady = true
-        }
-        // The self-check exits explicitly below, so clean the temporary
-        // fixture before that exit instead of relying on Swift defer.
-        removeMacosImageSelfCheckFixture(imageFixture)
-
-        let strong = (sourceBefore as NSString).range(of: "粗体")
-        precondition(strong.location != NSNotFound)
-        try bridge.beginComposition(
-            replacementRange: strong,
-            preedit: "日本🙂",
-            selection: NSRange(location: 2, length: 0)
-        )
-        let composed = try bridge.macosRenderHostSurfaceSubmit(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: viewportHeight,
-            surfaceWidth: Double(maxWidth),
-            surfaceHeight: Double(viewportHeight),
-            scale: 2.0,
-            view: rawView
-        )
-        precondition(composed.revision == revision)
-        precondition(composed.compositionGeneration == bridge.composition.generation)
-        precondition(composed.frameSerial > repeated.frameSerial)
-        precondition(composed.commandCount != repeated.commandCount)
-        precondition(composed.submitted)
-        try bridge.cancelComposition()
-        let cancelled = try bridge.macosRenderHostSurfaceSubmit(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: viewportHeight,
-            surfaceWidth: Double(maxWidth),
-            surfaceHeight: Double(viewportHeight),
-            scale: 2.0,
-            view: rawView
-        )
-        precondition(cancelled.revision == revision)
-        precondition(cancelled.compositionGeneration == bridge.composition.generation)
-        precondition(cancelled.frameSerial > composed.frameSerial)
-        precondition(cancelled.commandCount == repeated.commandCount)
-        precondition(cancelled.submitted)
-
-        let resized = try bridge.macosRenderHostSurfaceSubmit(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: viewportHeight,
-            surfaceWidth: Double(maxWidth + 20.0),
-            surfaceHeight: Double(viewportHeight + 20.0),
-            scale: 2.0,
-            view: rawView
-        )
-        precondition(resized.compositionGeneration == bridge.composition.generation)
-        precondition(resized.surfaceGeneration == first.surfaceGeneration + 1)
-        precondition(resized.frameSerial > repeated.frameSerial)
-        precondition(resized.uploadedPages == 0)
-        precondition(resized.submitted)
-
-        let largerSize: Float = 16.0
-        let largerShaped = try bridge.macosBlockLayout(
-            revision: revision,
-            blockIndex: 2,
-            size: largerSize,
-            maxWidth: maxWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: maxWidth,
-            lineHeight: Float(largerShaped.lineHeight),
-            defaultAdvance: Float(largerShaped.defaultAdvance),
-            estimatedBlockHeight: Float(largerShaped.lineHeight),
-            overscan: 0.0
-        )
-        let resizedFont = try bridge.macosRenderHostSurfaceSubmit(
-            revision: revision,
-            size: largerSize,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: viewportHeight,
-            surfaceWidth: Double(maxWidth + 20.0),
-            surfaceHeight: Double(viewportHeight + 20.0),
-            scale: 2.0,
-            view: rawView
-        )
-        precondition(resizedFont.surfaceGeneration == resized.surfaceGeneration)
-        precondition(resizedFont.frameSerial > resized.frameSerial)
-        precondition(resizedFont.submitted)
-
-        _ = try bridge.insertText("!")
-        do {
-            _ = try bridge.macosRenderHostSurfaceSubmit(
-                revision: revision,
-                size: largerSize,
-                maxWidth: maxWidth,
-                scrollY: 0.0,
-                viewportHeight: viewportHeight,
-                surfaceWidth: Double(maxWidth + 20.0),
-                surfaceHeight: Double(viewportHeight + 20.0),
-                scale: 2.0,
-                view: rawView
-            )
-            preconditionFailure("stale Metal surface submission unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 13)
-        }
-
-        let next = try bridge.macosRenderHostSurfaceSubmit(
-            revision: bridge.state.revision,
-            size: largerSize,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: viewportHeight,
-            surfaceWidth: Double(maxWidth + 20.0),
-            surfaceHeight: Double(viewportHeight + 20.0),
-            scale: 2.0,
-            view: rawView
-        )
-        precondition(next.revision == bridge.state.revision)
-        precondition(next.surfaceGeneration == resized.surfaceGeneration)
-        precondition(next.frameSerial > resizedFont.frameSerial)
-        precondition(next.submitted)
-        print(
-            "Yu macOS Metal surface self-check: persistent CAMetalLayer attachment, repeated submit, "
-                + "resize/generation, atlas reuse and stale Revision rejection are valid"
-                + (imagePublicationReady ? "; ImageIO publication reached ready Metal texture" : "")
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu macOS Metal surface self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
-
-private func runMacosRenderHostLifecycleSelfCheck(path: String) -> Never {
-    do {
-        let imageFixture = try installMacosImageSelfCheckFixture(at: path)
-        defer { removeMacosImageSelfCheckFixture(imageFixture) }
-        let bridge = try StorageBridge(path: path)
-        let heading = (bridge.source as NSString).range(of: "Projection blocks")
-        precondition(heading.location != NSNotFound)
-        let strong = (bridge.source as NSString).range(of: "**粗体**")
-        precondition(strong.location != NSNotFound)
-        let plain = (bridge.source as NSString).range(of: "Paragraph with")
-        precondition(plain.location != NSNotFound)
-        try bridge.setSelection(NSRange(location: heading.location, length: 0))
-        let application = NSApplication.shared
-        application.setActivationPolicy(.regular)
-        let initialFrame = NSRect(x: 0.0, y: 0.0, width: 500.0, height: 240.0)
-        let window = NSWindow(
-            contentRect: initialFrame,
-            styleMask: [.titled, .closable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        let root = NSView(frame: initialFrame)
-        let surfaceView = MacosSurfaceHostView(frame: initialFrame)
-        let scrollView = NSScrollView(frame: initialFrame)
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.documentView = NSView(
-            frame: NSRect(x: 0.0, y: 0.0, width: initialFrame.width, height: 1200.0)
-        )
-        root.addSubview(surfaceView)
-        root.addSubview(scrollView)
-        window.contentView = root
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        application.activate(ignoringOtherApps: true)
-
-        let coordinator = MacosSurfaceHostCoordinator(bridge: bridge, fontSize: 14.0)
-        var errors: [String] = []
-        coordinator.onError = { error in errors.append(error.localizedDescription) }
-        coordinator.bind(
-            surfaceView: surfaceView,
-            scrollView: scrollView,
-            fontSize: 14.0
-        )
-        precondition(surfaceView.isHidden)
-        surfaceView.onWindowStateChange = { attached in
-            if attached {
-                coordinator.scheduleSubmit()
-            } else {
-                coordinator.detach()
-            }
-        }
-        surfaceView.onGeometryChange = {
-            coordinator.scheduleSubmit()
-        }
-        scrollView.contentView.postsBoundsChangedNotifications = true
-        let observer = NotificationCenter.default.addObserver(
-            forName: NSView.boundsDidChangeNotification,
-            object: scrollView.contentView,
-            queue: .main
-        ) { _ in
-            coordinator.scheduleSubmit()
-        }
-        defer {
-            NotificationCenter.default.removeObserver(observer)
-            coordinator.detach()
-            window.orderOut(nil)
-            window.close()
-        }
-
-        window.displayIfNeeded()
-        let first = try unwrapSelfCheck(coordinator.submitNow())
-        precondition(first.surfaceGeneration == 0)
-        precondition(first.submitted)
-        precondition(first.commandKindMask != 0)
-        if bridge.source.isEmpty {
-            precondition(first.blockKindMask == 0)
-        } else {
-            precondition(first.blockKindMask != 0)
-        }
-        precondition(first.selectionDecorationCount == 0)
-        precondition(
-            first.caretDecorationCount == 1,
-            "initial caret missing: clip=\(scrollView.contentView.bounds) sourceSelection=\(bridge.selection.range)"
-        )
-        precondition(
-            submittedSurfaceOwnsVisualDecorations(
-                first,
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation,
-                selectionCount: 0,
-                caretPresent: true
-            )
-        )
-        precondition(
-            !submittedSurfaceOwnsVisualDecorations(
-                first,
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation,
-                selectionCount: 1,
-                caretPresent: true
-            )
-        )
-        precondition(first.hasVisualContent)
-        precondition(coordinator.isAttached)
-        precondition(surfaceView.nativeContentVisible)
-        precondition(surfaceView.hitTest(NSPoint(x: 12.0, y: 12.0)) == nil)
-        precondition(
-            coordinator.hasCurrentPublication(
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation
-            )
-        )
-        try bridge.setSelection(NSRange(location: strong.location + 2, length: 0))
-        let inlineSource = try bridge.projectedSource(revision: bridge.state.revision)
-        precondition(inlineSource.contains("**粗体**"))
-        coordinator.invalidateEditorDecorationPublication()
-        precondition(coordinator.lastSnapshot == nil)
-        precondition(
-            !coordinator.hasCurrentPublication(
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation
-            )
-        )
-        let inlineReveal = try unwrapSelfCheck(coordinator.submitNow())
-        precondition(inlineReveal.revision == first.revision)
-        precondition(inlineReveal.frameSerial > first.frameSerial)
-        precondition(inlineReveal.caretDecorationCount == 1)
-        precondition(inlineReveal.commandCount == first.commandCount + 2)
-
-        try bridge.setSelection(NSRange(location: plain.location, length: 0))
-        let hiddenSource = try bridge.projectedSource(revision: bridge.state.revision)
-        precondition(!hiddenSource.contains("**粗体**"))
-        coordinator.invalidateEditorDecorationPublication()
-        let noReveal = try unwrapSelfCheck(coordinator.submitNow())
-        precondition(noReveal.revision == first.revision)
-        precondition(noReveal.frameSerial > inlineReveal.frameSerial)
-        precondition(noReveal.caretDecorationCount == 1)
-        precondition(noReveal.commandCount + 2 == first.commandCount)
-        precondition(noReveal.commandCount + 4 == inlineReveal.commandCount)
-
-        if bridge.source.contains("```mermaid") || bridge.source.contains("```math") {
-            let embeddedResources = try bridge.macosVisualEmbeddedResources(
-                revision: bridge.state.revision
-            )
-            precondition(!embeddedResources.isEmpty)
-            precondition(coordinator.retainedCoverage?.complete == true)
-            for resource in embeddedResources {
-                switch resource.kind {
-                case UInt8(YU_STORAGE_EMBEDDED_MATH):
-                    precondition(
-                        resource.resourceStatus
-                            == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_READY)
-                    )
-                case UInt8(YU_STORAGE_EMBEDDED_MERMAID):
-                    precondition(
-                        resource.resourceStatus
-                            == UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED)
-                    )
-                default:
-                    preconditionFailure("unknown embedded resource kind")
-                }
-            }
-        }
-
-        var asyncImageRefreshReady = false
-        if bridge.source.contains("![") {
-            precondition(coordinator.retainedCoverage?.complete == true)
-            let deadline = Date(timeIntervalSinceNow: 3.0)
-            while Date() < deadline {
-                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
-                if let snapshot = coordinator.lastSnapshot,
-                   snapshot.imageResourceCount > 0,
-                   let coverage = coordinator.retainedCoverage,
-                   coverage.complete {
-                    asyncImageRefreshReady = true
-                    break
-                }
-            }
-            precondition(asyncImageRefreshReady)
-        }
-
-        let resizedFrame = NSRect(x: 0.0, y: 0.0, width: 540.0, height: 280.0)
-        root.setFrameSize(resizedFrame.size)
-        surfaceView.frame = resizedFrame
-        scrollView.frame = resizedFrame
-        window.setContentSize(resizedFrame.size)
-        precondition(
-            !coordinator.hasCurrentPublication(
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation
-            )
-        )
-        window.displayIfNeeded()
-        let resized = try unwrapSelfCheck(coordinator.submitNow())
-        precondition(resized.surfaceGeneration == first.surfaceGeneration + 1)
-        precondition(resized.frameSerial > first.frameSerial)
-        precondition(resized.submitted)
-        precondition(
-            coordinator.hasCurrentPublication(
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation
-            )
-        )
-
-        scrollView.contentView.setBoundsOrigin(NSPoint(x: 0.0, y: 120.0))
-        precondition(
-            !coordinator.hasCurrentPublication(
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation
-            )
-        )
-        let scrolled = try unwrapSelfCheck(coordinator.submitNow())
-        precondition(scrolled.surfaceGeneration == resized.surfaceGeneration)
-        precondition(scrolled.frameSerial > resized.frameSerial)
-        precondition(scrolled.submitted)
-        precondition(
-            coordinator.hasCurrentPublication(
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation
-            )
-        )
-
-        _ = try bridge.insertText("!")
-        precondition(
-            !coordinator.hasCurrentPublication(
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation
-            )
-        )
-        let edited = try unwrapSelfCheck(coordinator.submitNow())
-        precondition(edited.revision == bridge.state.revision)
-        precondition(edited.frameSerial > scrolled.frameSerial)
-        precondition(edited.submitted)
-        precondition(
-            coordinator.hasCurrentPublication(
-                revision: bridge.state.revision,
-                compositionGeneration: bridge.composition.generation
-            )
-        )
-
-        surfaceView.removeFromSuperview()
-        precondition(!coordinator.isAttached)
-        precondition(!surfaceView.nativeContentVisible)
-        coordinator.detach()
-        precondition(errors.isEmpty, errors.joined(separator: "; "))
-        removeMacosImageSelfCheckFixture(imageFixture)
-        print(
-            "Yu macOS surface lifecycle self-check: heading/inline/no-reveal frames, "
-                + "product NSView attach, resize, scroll, edit revision and close detach are valid"
-                + (asyncImageRefreshReady ? "; async image refresh is valid" : "")
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu macOS surface lifecycle self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
 
 private func unwrapSelfCheck<T>(_ value: T?) throws -> T {
     guard let value else {
@@ -10165,9 +8818,6 @@ if let flag = CommandLine.arguments.firstIndex(of: "--visual-mirror-self-check")
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualMirrorSelfCheck(path: CommandLine.arguments[flag + 1])
 }
-if CommandLine.arguments.contains("--visual-render-state-self-check") {
-    runVisualRenderStateSelfCheck()
-}
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-ime-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualIMESelfCheck(path: CommandLine.arguments[flag + 1])
@@ -10195,14 +8845,6 @@ if let flag = CommandLine.arguments.firstIndex(of: "--shaped-vertical-self-check
 if let flag = CommandLine.arguments.firstIndex(of: "--visual-viewport-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runVisualViewportSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-surface-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runMacosRenderHostSurfaceSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--macos-render-host-lifecycle-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runMacosRenderHostLifecycleSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--macos-table-resize-coordinator-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
