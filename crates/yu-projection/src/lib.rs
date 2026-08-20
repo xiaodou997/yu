@@ -263,6 +263,9 @@ pub enum ProjectionError {
     InvalidListBlock {
         range: TextRange,
     },
+    InvalidBlockQuoteBlock {
+        range: TextRange,
+    },
     CompositionRangeOutsideProjection {
         range: TextRange,
         projection: TextRange,
@@ -315,6 +318,9 @@ impl fmt::Display for ProjectionError {
             Self::InvalidListBlock { range } => {
                 write!(formatter, "invalid list block range {range:?}")
             }
+            Self::InvalidBlockQuoteBlock { range } => {
+                write!(formatter, "invalid blockquote block range {range:?}")
+            }
             Self::CompositionRangeOutsideProjection { range, projection } => write!(
                 formatter,
                 "composition range {range:?} is outside projection {projection:?}"
@@ -348,6 +354,7 @@ impl Error for ProjectionError {
             | Self::InvalidCodeBlock { .. }
             | Self::InvalidTaskListBlock { .. }
             | Self::InvalidListBlock { .. }
+            | Self::InvalidBlockQuoteBlock { .. }
             | Self::CompositionRangeOutsideProjection { .. }
             | Self::CompositionSelectionOutOfBounds { .. }
             | Self::CompositionSelectionNotUtf8Boundary { .. }
@@ -384,6 +391,7 @@ pub struct Projection {
     visual_len: VisualOffset,
     composition: Option<CompositionState>,
     leading_marker: Option<LeadingMarker>,
+    block_quote: Option<BlockQuotePresentation>,
 }
 
 /// A semantic marker painted before a projected block while retaining the
@@ -410,6 +418,33 @@ impl LeadingMarker {
     #[must_use]
     pub const fn indent(&self) -> u8 {
         self.indent
+    }
+}
+
+/// Parser-owned blockquote metadata retained by the visual projection.
+/// Prefixes identify every physical `>` range while `source` owns the complete
+/// block represented by one semantic quote decoration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockQuotePresentation {
+    source: TextRange,
+    prefixes: Arc<[TextRange]>,
+    depth: u8,
+}
+
+impl BlockQuotePresentation {
+    #[must_use]
+    pub const fn source(&self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub fn prefixes(&self) -> &[TextRange] {
+        &self.prefixes
+    }
+
+    #[must_use]
+    pub const fn depth(&self) -> u8 {
+        self.depth
     }
 }
 
@@ -604,6 +639,7 @@ impl Projection {
             visual_len,
             composition: None,
             leading_marker: None,
+            block_quote: None,
         })
     }
 
@@ -623,6 +659,30 @@ impl Projection {
             source,
             text: text.into(),
             indent,
+        });
+        Ok(self)
+    }
+
+    fn with_block_quote(
+        mut self,
+        source: TextRange,
+        prefixes: Vec<TextRange>,
+        depth: u8,
+    ) -> Result<Self, ProjectionError> {
+        if depth == 0 || prefixes.is_empty() {
+            return Err(ProjectionError::InvalidBlockQuoteBlock { range: source });
+        }
+        if source != self.source_range
+            || prefixes
+                .iter()
+                .any(|prefix| prefix.start() < source.start() || prefix.end() > source.end())
+        {
+            return Err(ProjectionError::InvalidBlockQuoteBlock { range: source });
+        }
+        self.block_quote = Some(BlockQuotePresentation {
+            source,
+            prefixes: prefixes.into(),
+            depth,
         });
         Ok(self)
     }
@@ -703,6 +763,7 @@ impl Projection {
                 replacement_range.end() <= marker.source.start()
                     || marker.source.end() <= replacement_range.start()
             }),
+            block_quote: self.block_quote.clone(),
         })
     }
 
@@ -788,6 +849,23 @@ impl Projection {
                     })
                 })
                 .transpose()?,
+            block_quote: self
+                .block_quote
+                .as_ref()
+                .map(|quote| {
+                    Ok::<BlockQuotePresentation, ProjectionError>(BlockQuotePresentation {
+                        source: map_range(quote.source, changes)?,
+                        prefixes: quote
+                            .prefixes
+                            .iter()
+                            .copied()
+                            .map(|prefix| map_range(prefix, changes))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into(),
+                        depth: quote.depth,
+                    })
+                })
+                .transpose()?,
         }))
     }
 
@@ -818,6 +896,12 @@ impl Projection {
     #[must_use]
     pub fn leading_marker(&self) -> Option<&LeadingMarker> {
         self.leading_marker.as_ref()
+    }
+
+    /// Returns parser-owned semantic blockquote metadata for this projection.
+    #[must_use]
+    pub fn block_quote(&self) -> Option<&BlockQuotePresentation> {
+        self.block_quote.as_ref()
     }
 
     /// Returns source-backed image metadata in parser span order.
@@ -2078,7 +2162,7 @@ impl BlockProjection {
     ) -> Result<Self, ProjectionError> {
         let inline = parse_inline_with_definitions(source, block.range(), Some(definitions))?;
         let hidden = yu_markdown::block_syntax_hidden_ranges(source, block);
-        let projection = match active {
+        let mut projection = match active {
             Some(active) => {
                 Projection::from_inline_with_structural_reveal(&inline, &hidden, active)
             }
@@ -2091,6 +2175,9 @@ impl BlockProjection {
                 }
             }
         }?;
+        if kind == BlockProjectionKind::BlockQuote {
+            projection = with_block_quote_presentation(projection, block, hidden)?;
+        }
         Ok(match kind {
             BlockProjectionKind::Heading => Self::Heading(projection),
             BlockProjectionKind::BlockQuote => Self::BlockQuote(projection),
@@ -2117,11 +2204,9 @@ impl BlockProjection {
             }
             BlockKind::BlockQuote { .. } => {
                 let inline = parse_inline(source, block.range())?;
-                let projection = Projection::from_inline_with_hidden(
-                    &inline,
-                    &yu_markdown::block_syntax_hidden_ranges(source, block),
-                )?;
-                Ok(Self::BlockQuote(projection))
+                let hidden = yu_markdown::block_syntax_hidden_ranges(source, block);
+                let projection = Projection::from_inline_with_hidden(&inline, &hidden)?;
+                with_block_quote_presentation(projection, block, hidden).map(Self::BlockQuote)
             }
             BlockKind::ListItem { .. } => {
                 let inline = parse_inline(source, block.range())?;
@@ -2221,6 +2306,19 @@ fn with_semantic_list_marker(
         Arc::from("•")
     };
     projection.with_leading_marker(marker.marker_range(), text, marker.indent())
+}
+
+fn with_block_quote_presentation(
+    projection: Projection,
+    block: Block,
+    prefixes: Vec<TextRange>,
+) -> Result<Projection, ProjectionError> {
+    let BlockKind::BlockQuote { depth } = block.kind() else {
+        return Err(ProjectionError::InvalidBlockQuoteBlock {
+            range: block.range(),
+        });
+    };
+    projection.with_block_quote(block.range(), prefixes, depth)
 }
 
 fn line_ranges(source: &TextSnapshot, range: TextRange) -> Result<Vec<TextRange>, ProjectionError> {
@@ -2847,6 +2945,17 @@ mod tests {
         )
         .expect("quote projection should build");
         assert_eq!(quote_projection.kind(), BlockProjectionKind::BlockQuote);
+        let quote_presentation = quote_projection
+            .visual()
+            .block_quote()
+            .expect("blockquote presentation");
+        assert_eq!(quote_presentation.source(), quote.range());
+        assert_eq!(quote_presentation.depth(), 1);
+        assert_eq!(quote_presentation.prefixes().len(), 2);
+        assert_eq!(
+            quote_presentation.prefixes(),
+            yu_markdown::block_syntax_hidden_ranges(&snapshot, quote)
+        );
         let quote_text = quote_projection
             .visual()
             .runs()
@@ -2866,6 +2975,10 @@ mod tests {
         )
         .expect("active quote projection should build");
         assert_eq!(projected_text(quote_revealed.visual()), "> 引用\n> 继续\n");
+        assert_eq!(
+            quote_revealed.visual().block_quote(),
+            Some(quote_presentation)
+        );
 
         let list = markdown.blocks().get(4).expect("list block");
         let list_projection = BlockProjection::from_block_with_definitions(

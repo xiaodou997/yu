@@ -37,18 +37,18 @@ pub use viewport::{
     ViewportLayout, ViewportRange, ViewportRect, ViewportSnapshot, ViewportStats,
 };
 pub use yu_layout::{
-    ClusterMetrics, HeightIndex, HeightIndexError, ImageIntrinsicSize, LayoutCaret, LayoutConfig,
-    LayoutError, LayoutHit, LayoutPoint, LayoutSnapshot, MonospaceMetrics, ShapedText,
-    ShapingProvider, TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeCommit,
-    TableResizeGesture, TableResizeGestureError, TableResizeHit, TableResizeTarget, VisualCluster,
-    VisualLine,
+    BlockQuoteLayout, ClusterMetrics, HeightIndex, HeightIndexError, ImageIntrinsicSize,
+    LayoutCaret, LayoutConfig, LayoutError, LayoutHit, LayoutPoint, LayoutSnapshot,
+    MonospaceMetrics, ShapedText, ShapingProvider, TableCellLayout, TableLayoutHit,
+    TableLayoutSnapshot, TableResizeCommit, TableResizeGesture, TableResizeGestureError,
+    TableResizeHit, TableResizeTarget, VisualCluster, VisualLine,
 };
 pub use yu_markdown::{
     Block, BlockKind, ListMarker, MarkdownDocument, TableAlignment, TaskMarker, TaskState,
     list_marker, task_marker,
 };
 pub use yu_projection::{
-    BlockProjection, BlockProjectionKind, CodeProjection, ImageSource, LeadingMarker, Projection,
-    ProjectionBias, ProjectionError, TableProjection, VisualOffset, VisualRange, VisualRun,
-    VisualRunKind, VisualRunStyle,
+    BlockProjection, BlockProjectionKind, BlockQuotePresentation, CodeProjection, ImageSource,
+    LeadingMarker, Projection, ProjectionBias, ProjectionError, TableProjection, VisualOffset,
+    VisualRange, VisualRun, VisualRunKind, VisualRunStyle,
 };

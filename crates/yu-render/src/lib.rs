@@ -401,6 +401,12 @@ impl RenderPlanBuilder {
                         fallback: svg.fallback(),
                     });
                 }
+                Primitive::BlockQuote(quote) => {
+                    commands.push(RenderCommand::FillRect {
+                        bounds: quote.bounds(),
+                        color: quote.color(),
+                    });
+                }
                 Primitive::Table(table) => {
                     // Table roles remain available in the retained scene for
                     // native selection/accessibility consumers. The current
@@ -1088,6 +1094,7 @@ mod tests {
             Primitive::FillRect { .. }
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
+            | Primitive::BlockQuote(_)
             | Primitive::Table(_)
             | Primitive::TaskCheckbox(_)
             | Primitive::EditorDecoration(_) => {
@@ -1194,6 +1201,7 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Image(_)
                 | Primitive::EmbeddedSvg(_)
+                | Primitive::BlockQuote(_)
                 | Primitive::Table(_)
                 | Primitive::TaskCheckbox(_)
                 | Primitive::EditorDecoration(_) => {
