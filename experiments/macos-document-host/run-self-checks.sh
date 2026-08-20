@@ -17,7 +17,14 @@ set -euo pipefail
 host_dir="${0:A:h}"
 cd "$host_dir"
 
-if [[ "${1:-}" == "--build" ]]; then
+# --build 是增量构建。删除一个 C 类型或 FFI 函数后，SwiftPM 可能不会重编引用
+# 它的文件，本地因此看到「构建通过」而 CI 的干净检出会失败。改动 FFI 边界后
+# 用 --clean-build 验证。
+if [[ "${1:-}" == "--clean-build" ]]; then
+    rm -rf .build
+    ./build-rust-ffi.sh >/dev/null
+    swift build >/dev/null
+elif [[ "${1:-}" == "--build" ]]; then
     ./build-rust-ffi.sh >/dev/null
     swift build >/dev/null
 fi
