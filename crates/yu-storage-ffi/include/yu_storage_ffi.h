@@ -1033,6 +1033,14 @@ int32_t yu_storage_session_macos_block_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageBlockCaret *output);
+/* Resolves a source caret's shaped geometry without the caller naming a
+ * block. The platform needs this for IME candidate-window placement: only the
+ * Rust layout knows where the caret is on screen, because TextKit lays out
+ * canonical source while the screen shows the projection. */
+int32_t yu_storage_session_macos_source_caret(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t source_utf16, uint8_t affinity,
+    float size, float max_width, YuStorageBlockCaret *output);
 int32_t yu_storage_session_set_viewport_config(
     YuStorageSession *session, uint64_t expected_revision,
     float max_width, float line_height, float default_advance,
