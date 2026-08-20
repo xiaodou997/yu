@@ -2053,8 +2053,13 @@ pub enum BlockProjection {
 impl BlockProjection {
     pub fn from_block(source: &TextSnapshot, block: Block) -> Result<Self, ProjectionError> {
         match block.kind() {
+            // 引用定义是一整行源码，不是行内装饰。整行隐藏会让它的
+            // visual width 为零，光标无法进入，用户再也找不回自己写的
+            // `[ref]: /url`——这违反不变量 A2/I5。视觉弱化属于样式问题，
+            // 应由 Mark decoration 表达，不能用隐藏实现。
             BlockKind::ReferenceDefinition => {
-                Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
+                let inline = parse_inline(source, block.range())?;
+                Projection::from_inline(&inline).map(Self::ReferenceDefinition)
             }
             BlockKind::TaskListItem { .. } => Self::task_list(source, block, None, None),
             BlockKind::Paragraph => {
@@ -2069,7 +2074,7 @@ impl BlockProjection {
     }
 
     /// Builds a block projection using a revision-bound reference definition
-    /// index. Definition blocks stay hidden; ordinary inline blocks resolve
+    /// index. Definition blocks stay visible as source; ordinary inline blocks resolve
     /// shortcut references against the same source revision.
     pub fn from_block_with_definitions(
         source: &TextSnapshot,
@@ -2103,8 +2108,17 @@ impl BlockProjection {
         active: Option<TextRange>,
     ) -> Result<Self, ProjectionError> {
         match block.kind() {
+            // 同 `from_block`：引用定义整行必须保持可见可编辑。
             BlockKind::ReferenceDefinition => {
-                Projection::hidden(source, block.range()).map(Self::ReferenceDefinition)
+                let inline =
+                    parse_inline_with_definitions(source, block.range(), Some(definitions))?;
+                match active {
+                    Some(active) => {
+                        Projection::from_inline_with_hidden_and_reveal(&inline, &[], active)
+                    }
+                    None => Projection::from_inline(&inline),
+                }
+                .map(Self::ReferenceDefinition)
             }
             BlockKind::TaskListItem { .. } => {
                 Self::task_list(source, block, Some(definitions), active)
@@ -2927,16 +2941,23 @@ mod tests {
             4
         );
 
+        // 引用定义行保留自己的语义 kind，但整行源码必须保持可见：
+        // 整行隐藏会让 visual width 归零，光标无法进入该行，用户再也
+        // 无法编辑或删除自己写的定义（不变量 A2/I5）。
         let definition = markdown.blocks().get(0).expect("definition should exist");
-        let hidden = BlockProjection::from_block_with_definitions(
+        let projected = BlockProjection::from_block_with_definitions(
             &snapshot,
             definition,
             markdown.reference_definitions(),
         )
         .expect("definition block projection should build");
-        assert_eq!(hidden.kind(), BlockProjectionKind::ReferenceDefinition);
-        assert_eq!(hidden.visual().visual_len(), VisualOffset::ZERO);
-        assert_eq!(hidden.visual().source_range(), definition.range());
+        assert_eq!(projected.kind(), BlockProjectionKind::ReferenceDefinition);
+        assert_ne!(
+            projected.visual().visual_len(),
+            VisualOffset::ZERO,
+            "引用定义整行必须可见"
+        );
+        assert_eq!(projected.visual().source_range(), definition.range());
     }
 
     #[test]

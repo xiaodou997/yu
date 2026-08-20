@@ -2814,4 +2814,92 @@ mod tests {
         assert_eq!(retry.revision(), document.revision());
         assert!(retry_plans.uploaded_page_count() > 0);
     }
+
+    /// 守护不变量 I5：Rust 渲染器是唯一渲染路径，不存在第二条兜底路径。
+    ///
+    /// parser 能产出的每一种 block kind 都必须能被投影、布局并产出 glyph。
+    /// 一旦某个 kind 画不出来，删掉 TextKit fallback 后它就会变成空白区域，
+    /// 因此这条断言是「允许删除 fallback」的前提证明，不能降级为警告。
+    #[test]
+    fn every_parser_block_kind_produces_renderable_glyphs() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 900.0);
+        let source = concat!(
+            "# heading\n",
+            "\n",
+            "paragraph with **bold**\n",
+            "\n",
+            "> quoted line\n",
+            "\n",
+            "- list item\n",
+            "- [ ] task item\n",
+            "\n",
+            "```rust\n",
+            "code line\n",
+            "```\n",
+            "\n",
+            "[ref]: /url\n",
+        );
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 900.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("scene frame");
+
+        // 全部 8 种 parser block kind 都必须出现在这一个 viewport 里，
+        // 否则这条测试就没有真正覆盖到它声称覆盖的范围。
+        let kinds: std::collections::BTreeSet<u8> = frame
+            .input()
+            .blocks()
+            .iter()
+            .map(|block| block.kind())
+            .collect();
+        let expected: std::collections::BTreeSet<u8> = (0..=7).collect();
+        assert_eq!(
+            kinds, expected,
+            "fixture 未覆盖全部 block kind，实际 {kinds:?}"
+        );
+
+        // 每个非空行 block 都必须产出 glyph。
+        let config = document.viewport_config().layout();
+        for block in frame.input().blocks() {
+            if block.kind() == 0 {
+                continue; // BlankLine 没有可见字形
+            }
+            let layout = document
+                .block_layout_for_visual_state_with_shaper(block.index(), config, &shaper)
+                .expect("block layout");
+            assert!(
+                !layout.glyphs().is_empty(),
+                "block kind {} (source {:?}) 没有产出任何 glyph，\
+                 删除 TextKit fallback 后它会变成空白",
+                block.kind(),
+                block.source()
+            );
+        }
+
+        // 这些 glyph 必须真的进入 scene，而不是只存在于 layout 里。
+        let glyph_count = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter(|primitive| matches!(primitive, Primitive::Glyph(_)))
+            .count();
+        assert!(glyph_count > 0, "scene 中没有任何 glyph primitive");
+    }
 }
