@@ -6,8 +6,9 @@ import YuStorageFFI
 
 // Metal surface 的 AppKit 宿主与帧提交调度。
 //
-// 注：帧调度决策目前仍在 Swift 侧，每个决策点都要一次 FFI 查询去取
-// Rust 的状态。S1 的后续工作是把这部分移入 Rust，见
+// 「这一帧和屏幕上那一帧是不是同一帧」由 Rust 判断（`macosFrameIsCurrent`），
+// 平台只负责把 AppKit 才知道的几何递过去。metrics 计算与资源刷新判断仍在
+// 本文件，属于 S1 帧调度迁移的后续步骤，见
 // docs/architecture/overview-v2.md 第 8 节。
 
 /// A real product-window surface host. Rust still owns the native layer and
@@ -125,16 +126,18 @@ final class MacosSurfaceHostCoordinator {
         let defaultAdvance: Float
     }
 
-    private struct SubmitKey: Equatable {
-        let revision: UInt64
-        let compositionGeneration: UInt64
-        let size: Double
-        let maxWidth: Double
-        let scrollY: Double
-        let viewportHeight: Double
-        let surfaceWidth: Double
-        let surfaceHeight: Double
-        let scale: Double
+    /// 一帧里只有 AppKit 知道的那部分。
+    ///
+    /// 这里刻意不含 Revision、composition generation 或 selection：它们是 Rust
+    /// 的状态，平台把它们复制过来只会多出一份可能过期的副本。
+    private struct FrameGeometry {
+        let size: CGFloat
+        let maxWidth: CGFloat
+        let scrollY: CGFloat
+        let viewportHeight: CGFloat
+        let surfaceWidth: CGFloat
+        let surfaceHeight: CGFloat
+        let scale: CGFloat
     }
 
     private let bridge: StorageBridge
@@ -143,7 +146,6 @@ final class MacosSurfaceHostCoordinator {
     private var fontSize: CGFloat
     private var contentWidth: CGFloat?
     private var metrics: Metrics?
-    private var lastSubmitKey: SubmitKey?
     private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
     private var submitScheduled = false
     private var scheduleToken: UInt64 = 0
@@ -176,7 +178,6 @@ final class MacosSurfaceHostCoordinator {
         self.fontSize = max(fontSize, 1.0)
         contentWidth = nil
         metrics = nil
-        lastSubmitKey = nil
         lastSnapshot = nil
         imageRefreshNeeded = false
         tableResizePointerState.reset()
@@ -189,7 +190,6 @@ final class MacosSurfaceHostCoordinator {
         guard abs(self.fontSize - next) > 0.001 else { return }
         self.fontSize = next
         metrics = nil
-        lastSubmitKey = nil
         scheduleSubmit()
     }
 
@@ -205,31 +205,37 @@ final class MacosSurfaceHostCoordinator {
         }
         contentWidth = next
         metrics = nil
-        lastSubmitKey = nil
         scheduleSubmit()
     }
 
-    /// Returns true only when the Metal surface has accepted the current Rust
-    /// revision, transient composition generation and complete submit
-    /// geometry. A visible old frame is deliberately insufficient: source
-    /// glyphs must remain available until the replacement publication has
-    /// reached the native surface after an edit, scroll, resize or scale
-    /// change.
-    func hasCurrentPublication(revision: UInt64, compositionGeneration: UInt64) -> Bool {
-        guard isAttached,
-              let snapshot = lastSnapshot,
-              let currentKey = currentSubmitKey else {
+    /// 屏幕上那一帧是否就是当前状态该有的那一帧。
+    ///
+    /// 判断整个交给 Rust：编辑状态、composition、selection 与表格 resize 覆盖
+    /// 都在那边，平台只递上自己知道的几何。可见的旧帧不算数——编辑、滚动、
+    /// 缩放或改变 backing scale 之后，替换帧真正到达 surface 之前都必须判为
+    /// 「不是当前帧」。
+    func hasCurrentFrame() -> Bool {
+        guard isAttached, let geometry = currentFrameGeometry else {
             return false
         }
-        return snapshot.submitted
-            && snapshot.revision == revision
-            && snapshot.compositionGeneration == compositionGeneration
-            && currentKey.revision == revision
-            && currentKey.compositionGeneration == compositionGeneration
-            && lastSubmitKey == currentKey
+        return frameIsCurrent(geometry)
     }
 
-    private var currentSubmitKey: SubmitKey? {
+    /// 把平台几何递给 Rust 的适配器。`FrameGeometry` 是本协调器的内部形状，
+    /// 不应该出现在 bridge 的签名里。
+    private func frameIsCurrent(_ geometry: FrameGeometry) -> Bool {
+        bridge.macosFrameIsCurrent(
+            size: Float(geometry.size),
+            maxWidth: Float(geometry.maxWidth),
+            scrollY: Float(geometry.scrollY),
+            viewportHeight: Float(geometry.viewportHeight),
+            surfaceWidth: Double(geometry.surfaceWidth),
+            surfaceHeight: Double(geometry.surfaceHeight),
+            scale: Double(geometry.scale)
+        )
+    }
+
+    private var currentFrameGeometry: FrameGeometry? {
         guard let surfaceView,
               let scrollView,
               let window = surfaceView.window,
@@ -238,16 +244,14 @@ final class MacosSurfaceHostCoordinator {
             return nil
         }
         let viewportBounds = scrollView.contentView.bounds
-        return SubmitKey(
-            revision: bridge.state.revision,
-            compositionGeneration: bridge.composition.generation,
-            size: Double(max(fontSize, 1.0)),
-            maxWidth: Double(layoutWidth(for: surfaceView)),
-            scrollY: Double(max(viewportBounds.origin.y, 0.0)),
-            viewportHeight: Double(max(viewportBounds.height, 1.0)),
-            surfaceWidth: Double(max(surfaceView.bounds.width, 1.0)),
-            surfaceHeight: Double(max(surfaceView.bounds.height, 1.0)),
-            scale: Double(max(window.backingScaleFactor, 1.0))
+        return FrameGeometry(
+            size: max(fontSize, 1.0),
+            maxWidth: layoutWidth(for: surfaceView),
+            scrollY: max(viewportBounds.origin.y, 0.0),
+            viewportHeight: max(viewportBounds.height, 1.0),
+            surfaceWidth: max(surfaceView.bounds.width, 1.0),
+            surfaceHeight: max(surfaceView.bounds.height, 1.0),
+            scale: max(window.backingScaleFactor, 1.0)
         )
     }
 
@@ -274,15 +278,6 @@ final class MacosSurfaceHostCoordinator {
                 self.onError?(error)
             }
         }
-    }
-
-    /// Selection/caret movement does not advance the canonical source
-    /// Revision, but it does change retained editor-decoration geometry.
-    /// Revoke the current visual publication before scheduling its replacement
-    /// so equal primitive counts cannot make an old caret look current.
-    func invalidateEditorDecorationPublication() {
-        lastSubmitKey = nil
-        lastSnapshot = nil
     }
 
     private func cancelImageResourceRefresh() {
@@ -312,9 +307,12 @@ final class MacosSurfaceHostCoordinator {
                 return
             }
             self.imageRefreshTask = nil
-            self.lastSubmitKey = nil
             do {
-                _ = try self.submitNow()
+                // 强制提交：几何与编辑状态都没变，Rust 会判为「当前帧」，
+                // 但这次提交的目的正是让它去收割 worker 的结果并重新发布。
+                // 这个 force 是资源刷新判断仍留在平台侧的直接后果，随该判断
+                // 一起移入 Rust 后即可消失。
+                _ = try self.submitNow(force: true)
             } catch {
                 self.imageRefreshNeeded = false
                 self.cancelImageResourceRefresh()
@@ -389,10 +387,7 @@ final class MacosSurfaceHostCoordinator {
         guard !bridge.composition.active,
               point.x.isFinite,
               point.y.isFinite,
-              hasCurrentPublication(
-                  revision: revision,
-                  compositionGeneration: bridge.composition.generation
-              ) else {
+              hasCurrentFrame() else {
             return nil
         }
         do {
@@ -545,7 +540,6 @@ final class MacosSurfaceHostCoordinator {
                   ) else {
                 return false
             }
-            lastSubmitKey = nil
             scheduleSubmit()
             return true
         } catch BridgeError.operation(let status)
@@ -580,14 +574,12 @@ final class MacosSurfaceHostCoordinator {
                 revision: revision,
                 pointerPosition: pointerPosition
             )
-            lastSubmitKey = nil
             scheduleSubmit()
             return true
         } catch BridgeError.operation(let status)
             where status == StorageStatus.staleRevision
                 || status == StorageStatus.tableResizeNotActive {
             tableResizePointerState.reset()
-            lastSubmitKey = nil
             return true
         } catch {
             tableResizePointerState.reset()
@@ -609,7 +601,6 @@ final class MacosSurfaceHostCoordinator {
         do {
             _ = try bridge.tableResizeFinish(revision: revision)
             _ = tableResizePointerState.finish(revision: revision)
-            lastSubmitKey = nil
             scheduleSubmit()
             finished = true
         } catch {
@@ -631,7 +622,6 @@ final class MacosSurfaceHostCoordinator {
         do {
             try bridge.tableResizeCancel(revision: revision)
             _ = tableResizePointerState.cancel(revision: revision)
-            lastSubmitKey = nil
             scheduleSubmit()
         } catch {
             tableResizePointerState.reset()
@@ -741,7 +731,6 @@ final class MacosSurfaceHostCoordinator {
             origin.y = targetScrollY
             scrollView.contentView.setBoundsOrigin(origin)
             scrollView.reflectScrolledClipView(scrollView.contentView)
-            lastSubmitKey = nil
             scheduleSubmit()
         } catch {
             // Caret reveal is an enhancement to the source TextKit view. The
@@ -804,46 +793,19 @@ final class MacosSurfaceHostCoordinator {
         }
     }
 
+    /// 提交一帧。
+    ///
+    /// `force` 只为资源刷新轮询而存在：那条路径需要一次真实提交去收割
+    /// 异步 worker 的结果，而此时几何与编辑状态都没有变化，Rust 会正确地
+    /// 判定「与屏幕上的帧等价」。资源刷新判断移入 Rust 后这个参数即可删除。
     @discardableResult
-    func submitNow() throws -> NativeMacosRenderHostSurfaceSnapshot? {
+    func submitNow(force: Bool = false) throws -> NativeMacosRenderHostSurfaceSnapshot? {
         guard let surfaceView,
-              let scrollView,
-              let window = surfaceView.window,
-              surfaceView.bounds.width > 0.0,
-              surfaceView.bounds.height > 0.0 else {
+              let geometry = currentFrameGeometry else {
             return nil
         }
 
-        let revision = bridge.state.revision
-        let size = max(fontSize, 1.0)
-        let surfaceWidth = max(surfaceView.bounds.width, 1.0)
-        let surfaceHeight = max(surfaceView.bounds.height, 1.0)
-        let viewportBounds = scrollView.contentView.bounds
-        let viewportHeight = max(viewportBounds.height, 1.0)
-        let scrollY = max(viewportBounds.origin.y, 0.0)
-        let maxWidth = layoutWidth(for: surfaceView)
-        let scale = max(window.backingScaleFactor, 1.0)
-        // Composition updates do not advance the canonical Revision. Include
-        // the Rust-owned generation in the submit key so every marked-text
-        // update/cancel publishes a fresh transient glyph scene instead of
-        // reusing the previous frame by geometry alone.
-        let compositionGeneration = bridge.composition.generation
-        let key = SubmitKey(
-            revision: revision,
-            compositionGeneration: compositionGeneration,
-            size: Double(size),
-            maxWidth: Double(maxWidth),
-            scrollY: Double(scrollY),
-            viewportHeight: Double(viewportHeight),
-            surfaceWidth: Double(surfaceWidth),
-            surfaceHeight: Double(surfaceHeight),
-            scale: Double(scale)
-        )
-        if isAttached, key == lastSubmitKey {
-            // A same-key submit can be reached after the controller has
-            // rejected an empty plan. Do not briefly re-show that blank
-            // surface; source TextKit remains the canonical visible fallback
-            // until a publication with actual draw commands exists.
+        if !force, isAttached, frameIsCurrent(geometry) {
             // Rust surface 是唯一渲染路径：attach 之后一直可见，
             // 内容由 retained frame 决定，不由 coverage 决定（不变量 I5）。
             surfaceView.setNativeContentVisible(true)
@@ -851,33 +813,33 @@ final class MacosSurfaceHostCoordinator {
             return lastSnapshot
         }
 
+        let revision = bridge.state.revision
         _ = try ensureMetrics(
             revision: revision,
-            size: size,
-            maxWidth: maxWidth
+            size: geometry.size,
+            maxWidth: geometry.maxWidth
         )
         let rawView = Unmanaged.passUnretained(surfaceView).toOpaque()
         let snapshot = try bridge.macosRenderHostSurfaceSubmit(
             revision: revision,
-            size: Float(size),
-            maxWidth: Float(maxWidth),
-            scrollY: Float(scrollY),
-            viewportHeight: Float(viewportHeight),
-            surfaceWidth: Double(surfaceWidth),
-            surfaceHeight: Double(surfaceHeight),
-            scale: Double(scale),
+            size: Float(geometry.size),
+            maxWidth: Float(geometry.maxWidth),
+            scrollY: Float(geometry.scrollY),
+            viewportHeight: Float(geometry.viewportHeight),
+            surfaceWidth: Double(geometry.surfaceWidth),
+            surfaceHeight: Double(geometry.surfaceHeight),
+            scale: Double(geometry.scale),
             view: rawView
         )
         isAttached = true
-        lastSubmitKey = key
         lastSnapshot = snapshot
         updateResourceRefreshState(
             snapshot: snapshot,
             revision: revision,
-            size: Float(size),
-            maxWidth: Float(maxWidth),
-            scrollY: Float(scrollY),
-            viewportHeight: Float(viewportHeight)
+            size: Float(geometry.size),
+            maxWidth: Float(geometry.maxWidth),
+            scrollY: Float(geometry.scrollY),
+            viewportHeight: Float(geometry.viewportHeight)
         )
         surfaceView.setNativeContentVisible(true)
         onSurfaceStateChange?()
@@ -902,7 +864,6 @@ final class MacosSurfaceHostCoordinator {
             }
         }
         isAttached = false
-        lastSubmitKey = nil
         lastSnapshot = nil
         imageRefreshNeeded = false
         metrics = nil
@@ -913,7 +874,6 @@ final class MacosSurfaceHostCoordinator {
     private func clearTableResizeState() {
         try? bridge.tableResizeCancel(revision: bridge.state.revision)
         tableResizePointerState.reset()
-        lastSubmitKey = nil
     }
 
     private func ensureMetrics(

@@ -2123,6 +2123,39 @@ final class StorageBridge {
         return NativeMacosRenderHostSurfaceSnapshot(value)
     }
 
+    /// 询问 Rust：按这个几何提交下一帧，是否与已经在屏幕上的那一帧等价。
+    ///
+    /// 平台只提供 AppKit 才知道的东西——view bounds、clip view 滚动位置、
+    /// backing scale。Revision、composition generation、selection 与表格
+    /// resize 覆盖全部由 Rust 自己读取，平台不再为了做决策而反复查询状态
+    /// （不变量 I3）。
+    ///
+    /// 查询失败一律按「不是当前帧」处理：多提交一帧只是浪费一次绘制，
+    /// 少提交一帧则是画面停在旧内容上，而且没有任何报错。
+    func macosFrameIsCurrent(
+        size: Float,
+        maxWidth: Float,
+        scrollY: Float,
+        viewportHeight: Float,
+        surfaceWidth: Double,
+        surfaceHeight: Double,
+        scale: Double
+    ) -> Bool {
+        var geometry = YuStorageFrameGeometry(
+            size: size,
+            max_width: maxWidth,
+            scroll_y: scrollY,
+            viewport_height: viewportHeight,
+            surface_width: surfaceWidth,
+            surface_height: surfaceHeight,
+            scale: scale
+        )
+        var current: UInt8 = 0
+        let status = yu_storage_session_macos_frame_is_current(handle, &geometry, &current)
+        guard status == StorageStatus.ok else { return false }
+        return current != 0
+    }
+
     func macosRenderHostSurfaceDetach() throws {
         let status = yu_storage_session_macos_render_host_surface_detach(handle)
         guard status == StorageStatus.ok else {

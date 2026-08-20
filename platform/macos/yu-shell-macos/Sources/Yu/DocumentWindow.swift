@@ -114,7 +114,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         }
         textView.onCaretChange = { [weak self] in
             guard let self else { return }
-            self.surfaceCoordinator.invalidateEditorDecorationPublication()
+            // 光标移动不推进 Revision，但会改变 caret 与选区装饰。Rust 的帧
+            // 身份已经把 selection 算在内，平台不需要再显式作废任何东西。
             self.scheduleVisualSubmit()
             // AppKit may deliver selection changes while TextKit is still
             // inside its event callback. Defer the scroll mutation until the
@@ -382,6 +383,54 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         _ = view.window?.makeFirstResponder(textView)
     }
 
+    /// 真实窗口下的帧调度自检。
+    ///
+    /// 「这一帧是否等价于屏幕上那一帧」的判断已经移入 Rust。判断漏掉一项不会
+    /// 报错，只会让画面停住——光标不动、preedit 不更新、拖动中的列宽不动，
+    /// 三者都表现为「编辑器卡了」而没有任何日志。headless self-check 覆盖不到
+    /// 这条路径：它需要真实的 NSWindow 与 Metal surface 才会有「已提交的帧」。
+    ///
+    /// 反向验证：把 `MacosFrameKey` 的 `selection` 去掉，第 3 步失败。
+    func runFrameSchedulingSelfCheck() throws {
+        struct Failure: LocalizedError {
+            let message: String
+            var errorDescription: String? { message }
+        }
+        func require(_ condition: Bool, _ message: String) throws {
+            guard condition else { throw Failure(message: message) }
+        }
+
+        // 1. 真实 surface 上必须先有一帧。
+        let snapshot = try surfaceCoordinator.submitNow(force: true)
+        try require(snapshot?.submitted == true, "首帧未提交")
+        try require((snapshot?.commandCount ?? 0) > 0, "首帧没有任何绘制指令")
+
+        // 2. 状态没变时必须判为等价，否则每一次布局回调都会整帧重画。
+        try require(surfaceCoordinator.hasCurrentFrame(), "刚提交的帧未被判为当前帧")
+
+        // 3. 光标移动不推进 Revision，但必须让帧失效。
+        let sourceLength = bridge.source.utf16.count
+        try require(sourceLength > 4, "fixture 太短，无法移动光标")
+        let before = bridge.selection
+        try bridge.setSelection(NSRange(location: 3, length: 0))
+        try require(bridge.state.revision == before.revision, "移动光标不应推进 Revision")
+        try require(
+            !surfaceCoordinator.hasCurrentFrame(),
+            "光标移动后仍被判为当前帧——caret 会停在原处且不会报错"
+        )
+
+        // 4. 重新提交之后必须再次等价。
+        let republished = try surfaceCoordinator.submitNow()
+        try require(republished?.submitted == true, "光标移动后的重提交失败")
+        try require(surfaceCoordinator.hasCurrentFrame(), "重提交后未恢复为当前帧")
+
+        print(
+            "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
+                + "caret=\(republished?.caretDecorationCount ?? 0) "
+                + "selection=\(republished?.selectionDecorationCount ?? 0)"
+        )
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         let state = bridge.state
         if menuItem.action == #selector(saveFromMenu(_:)) {
@@ -587,6 +636,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         exit(EXIT_FAILURE)
                     }
                     print("Yu launch self-check: window appeared and remained stable")
+                    do {
+                        try controller.runFrameSchedulingSelfCheck()
+                    } catch {
+                        fputs("Yu frame scheduling self-check failed: \(error)\n", stderr)
+                        exit(EXIT_FAILURE)
+                    }
                     NSApp.terminate(nil)
                 }
             }

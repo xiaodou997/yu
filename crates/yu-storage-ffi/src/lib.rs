@@ -1201,16 +1201,85 @@ impl MacosFrameGeometry {
     }
 }
 
-/// 一帧的完整身份：Rust 拥有的编辑状态 + 平台提供的几何。
+/// 表格 resize 的有效覆盖，作为帧身份的一部分。
 ///
-/// 两者必须一起比较：几何不变但 Revision 变了要重画；Revision 不变但
-/// composition generation 变了同样要重画——marked text 更新不推进 Revision。
+/// 拖动分隔线既不推进 Revision 也不改变几何，但整张表的列宽都会变。少了这一项，
+/// 一次拖动会被判为「与屏幕上的帧等价」而整段被跳过。
+///
+/// 与几何同理用位模式比较：`TableResizeCommit` 携带 f32，直接用 `PartialEq`
+/// 会让任何 NaN 与自身不等，从而每帧重画。
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MacosFrameTableResize {
+    revision: u64,
+    block_index: usize,
+    target: TableResizeTarget,
+    initial_position_bits: u32,
+    final_position_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosFrameTableResize {
+    fn capture(commit: TableResizeCommit) -> Self {
+        Self {
+            revision: commit.revision().get(),
+            block_index: commit.block_index(),
+            target: commit.target(),
+            initial_position_bits: commit.initial_position().to_bits(),
+            final_position_bits: commit.final_position().to_bits(),
+        }
+    }
+}
+
+/// 一帧的完整身份：Rust 拥有的可视状态 + 平台提供的几何。
+///
+/// 全部一起比较，任何一项变化都要重画：
+///
+/// - `revision`：源码改变。
+/// - `composition_generation`：marked text 更新——它不推进 Revision。
+/// - `selection`：光标与选区装饰改变——它同样不推进 Revision。
+/// - `table_resize`：拖动中的列宽覆盖——既不推进 Revision 也不改变几何。
+/// - `geometry`：字号、换行宽度、滚动、surface 尺寸与 backing scale。
+///
+/// 这个列表就是「帧内容取决于什么」的完整定义。新增一种不推进 Revision 的
+/// 可视状态时必须同时加进来，否则它的变化会被静默跳过——本项目最危险的失败
+/// 模式正是这种不报错的漏画。
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MacosFrameKey {
     revision: u64,
     composition_generation: u64,
+    selection: yu_editor::EditorSelection,
+    table_resize: Option<MacosFrameTableResize>,
     geometry: MacosFrameGeometry,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosFrameKey {
+    /// 用当前会话状态与平台几何组装帧身份。
+    ///
+    /// 提交路径与 `frame_is_current` 共用这一个构造函数。两边各写一份是这个
+    /// 判断最容易出错的地方：只要有一项不对称，就会出现「明明变了却判为等价」
+    /// 或「明明没变却每帧重画」。
+    fn capture(session: &YuStorageSession, geometry: MacosFrameGeometry) -> Self {
+        let revision = session.session.revision();
+        // 与 `macos_render_host_frame` 使用同一条过滤规则：只有匹配当前
+        // Revision 的列覆盖会进入渲染配置，其余不影响画面，也就不该影响身份。
+        let table_resize = session
+            .table_resize_override
+            .filter(|commit| {
+                commit.revision() == revision
+                    && matches!(commit.target(), TableResizeTarget::Column { .. })
+            })
+            .map(MacosFrameTableResize::capture);
+        Self {
+            revision: revision.get(),
+            composition_generation: session.session.composition_generation(),
+            selection: session.session.selection(),
+            table_resize,
+            geometry,
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -7571,13 +7640,9 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             surface_height,
             scale,
         }) {
-            let composition_generation = session.session.composition_generation();
+            let key = MacosFrameKey::capture(session, geometry);
             if let Some(state) = session.macos_render_host.as_mut() {
-                state.last_frame_key = Some(MacosFrameKey {
-                    revision: expected_revision,
-                    composition_generation,
-                    geometry,
-                });
+                state.last_frame_key = Some(key);
             }
         }
         YU_STORAGE_OK
@@ -7586,9 +7651,10 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
 
 /// 判断按给定几何提交的下一帧是否与已在屏幕上的帧完全等价。
 ///
-/// 等价要求 Revision、composition generation 与几何三者都不变——marked text
-/// 更新不推进 Revision，因此 generation 必须一同参与比较，否则相同几何下的
-/// preedit 变化会被误判为无需重画。
+/// 等价的完整定义见 [`MacosFrameKey`]：Revision、composition generation、
+/// selection、表格 resize 覆盖与几何全部不变才算等价。其中前四项里有三项
+/// 不推进 Revision，只比 Revision 会把光标移动、preedit 更新与列宽拖动
+/// 全部静默跳过。
 ///
 /// 这个判断此前在平台侧：Swift 每帧先查 Revision、再查 composition
 /// generation，才能组装出比较用的键，一次提交因此产生多次纯查询往返。状态在
@@ -7628,11 +7694,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_frame_is_current(
             Ok(geometry) => geometry,
             Err(status) => return status,
         };
-        let key = MacosFrameKey {
-            revision: session.session.revision().get(),
-            composition_generation: session.session.composition_generation(),
-            geometry,
-        };
+        let key = MacosFrameKey::capture(session, geometry);
         let current = session.macos_render_host.as_ref().is_some_and(|state| {
             // 没有 surface 时不能声称当前帧有效：内容还没有真正上屏。
             state.surface.is_some() && state.last_frame_key == Some(key)
@@ -7659,6 +7721,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
     #[cfg(target_os = "macos")]
     if let Some(state) = session.macos_render_host.as_mut() {
         state.surface.take();
+        // 记录的帧已经随 surface 一起消失，不能留下来让下一次绑定误判等价。
+        state.last_frame_key = None;
     }
     YU_STORAGE_OK
 }
@@ -11216,6 +11280,102 @@ mod tests {
             YU_STORAGE_NULL_POINTER
         );
         assert_eq!(out, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// 帧身份必须覆盖每一项「不推进 Revision 却改变画面」的状态。
+    ///
+    /// 这个判断决定平台是否跳过提交，而漏掉一项不会报错——只会让光标停在原处、
+    /// preedit 不更新、拖动中的列宽不动。三者都表现为「编辑器卡住了」，却没有
+    /// 任何日志或错误码可查，正是本项目最危险的失败模式。
+    ///
+    /// 反向验证：把 `selection` 从 `MacosFrameKey` 去掉，第二段断言失败；
+    /// 把 `table_resize` 去掉，第三段断言失败。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_frame_key_notices_state_that_does_not_advance_revision() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-frame-key-{id}.md"));
+        fs::write(&path, "| A | B |\n| --- | :---: |\n| 1 | 2 |\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let request = YuStorageFrameGeometry {
+            size: 14.0,
+            max_width: 500.0,
+            scroll_y: 0.0,
+            viewport_height: 240.0,
+            surface_width: 500.0,
+            surface_height: 240.0,
+            scale: 2.0,
+        };
+        let geometry = MacosFrameGeometry::from_request(&request).expect("几何合法");
+        let capture = |geometry: MacosFrameGeometry| {
+            // SAFETY: `raw` is a live session handle and no other borrow is
+            // outstanding at this point.
+            let session = unsafe { raw.as_ref() }.expect("session");
+            MacosFrameKey::capture(session, geometry)
+        };
+
+        let baseline = capture(geometry);
+        assert_eq!(
+            baseline,
+            capture(geometry),
+            "状态未变时必须得到同一身份，否则每帧都会重画"
+        );
+
+        // 光标移动不推进 Revision，但会改变 caret 装饰。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection(raw, 0, 2, 2, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+            },
+            YU_STORAGE_OK
+        );
+        let moved = capture(geometry);
+        assert_eq!(moved.revision, baseline.revision, "选区变化不推进 Revision");
+        assert_ne!(baseline, moved, "光标移动必须让帧身份改变");
+
+        // 拖动列分隔线既不推进 Revision 也不改变几何。
+        let mut hit = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_begin(
+                    raw, 0, 0, 20.0, 2.0, 1.0, 3.1, 0.5, 0.2, 3.1, &mut hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        let mut preview = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_update(raw, 0, 4.1, &mut preview) },
+            YU_STORAGE_OK
+        );
+        let dragged = capture(geometry);
+        assert_eq!(dragged.revision, moved.revision, "拖动不推进 Revision");
+        assert_eq!(dragged.geometry, moved.geometry, "拖动不改变平台几何");
+        assert_ne!(moved, dragged, "列宽覆盖变化必须让帧身份改变");
+
+        // 再拖一格：同一个 gesture 内的位移同样必须被看见。
+        assert_eq!(
+            unsafe { yu_storage_session_table_resize_update(raw, 0, 5.1, &mut preview) },
+            YU_STORAGE_OK
+        );
+        assert_ne!(dragged, capture(geometry), "同一手势内的位移必须被看见");
+
+        // 几何本身仍然参与比较。
+        let scrolled = MacosFrameGeometry::from_request(&YuStorageFrameGeometry {
+            scroll_y: 40.0,
+            ..request
+        })
+        .expect("几何合法");
+        assert_ne!(capture(geometry), capture(scrolled), "滚动必须让帧身份改变");
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
