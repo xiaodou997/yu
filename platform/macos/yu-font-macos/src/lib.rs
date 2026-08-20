@@ -1239,6 +1239,18 @@ fn shape_run(
         starts.push(index);
     }
 
+    // CTRun 的 positions 是相对整条 CTLine 的绝对坐标，而 `Glyph::x_offset`
+    // 的契约是「相对按 advance 累加出的笔位的微调」（kerning、mark
+    // positioning）。布局层会自己累加 advance 再叠加 x_offset，因此这里必须
+    // 先减去本 run 在行内的起点，否则从第二个 run 起，run 的起始位置会被计入
+    // 两次——混合中英文时每段文字被越推越远，最终溢出可视宽度。
+    let run_origin_x = positions
+        .first()
+        .map(|position| position.x as f32)
+        .unwrap_or(0.0);
+    if !run_origin_x.is_finite() {
+        return Err(CoreTextShapeError::InvalidGlyphRun);
+    }
     let mut glyphs = Vec::with_capacity(glyph_count);
     let mut pen_x = 0.0_f32;
     for (index, raw_glyph) in raw_glyphs.into_iter().enumerate() {
@@ -1259,7 +1271,7 @@ fn shape_run(
         {
             return Err(CoreTextShapeError::InvalidGlyphRun);
         }
-        let x_offset = position_x - pen_x;
+        let x_offset = position_x - run_origin_x - pen_x;
         if !x_offset.is_finite() {
             return Err(CoreTextShapeError::InvalidGlyphRun);
         }
@@ -1492,6 +1504,52 @@ mod tests {
                 "{text:?} rasterized {height}px tall, not taller than Latin {latin}px — \
                  CJK/emoji 很可能被拉丁字体解释了"
             );
+        }
+    }
+
+    /// `Glyph::x_offset` 必须是相对笔位的微调，不能是 CTLine 的绝对坐标。
+    ///
+    /// CTRun 的 positions 相对整条 CTLine，而布局层会自己按 advance 累加笔位
+    /// 再叠加 x_offset。若不减去 run 在行内的起点，从第二个 run 起该起点会被
+    /// 计入两次：混合中英文时每段文字被越推越远，最终溢出可视宽度——真实窗口
+    /// 里表现为词与词之间出现大段空隙、行尾内容被截断。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn glyph_x_offset_is_relative_to_the_run_pen() {
+        let size = 16.0_f32;
+        let shaper =
+            CoreTextShaper::from_system_ui(FontRequest::new("System UI", size).expect("request"))
+                .expect("shaper");
+        // 混合脚本才会被 CoreText 切成多个 run。
+        let text = "capability mask\u{3001}block kind";
+        let source = TextRange::new(
+            ByteOffset::ZERO,
+            ByteOffset::new(u64::try_from(text.len()).expect("len fits")),
+        )
+        .expect("source range");
+        let shaped =
+            ShapingProvider::shape(&shaper, text, source, VisualRunStyle::Plain).expect("shape");
+        assert!(
+            shaped.runs().len() > 1,
+            "fixture 未产生多个 run，测不到 run 起点被重复计入的问题"
+        );
+
+        for (index, run) in shaped.runs().iter().enumerate() {
+            let first = run.glyphs().first().expect("run has glyphs");
+            assert!(
+                first.x_offset().abs() < 1.0,
+                "run {index} 的首个 glyph x_offset = {}，看起来是 CTLine 绝对坐标而非笔位微调",
+                first.x_offset()
+            );
+            // 其余 glyph 的偏移也只应是微调，量级远小于自身 advance。
+            for glyph in run.glyphs() {
+                assert!(
+                    glyph.x_offset().abs() <= glyph.advance().max(1.0),
+                    "glyph x_offset = {} 超过自身 advance = {}",
+                    glyph.x_offset(),
+                    glyph.advance()
+                );
+            }
         }
     }
 
