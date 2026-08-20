@@ -142,12 +142,24 @@ pub enum CoreTextRasterError {
     InvalidNativeBitmap,
     InvalidRasterData(Arc<str>),
     Atlas(Arc<str>),
+    /// 重建 face 得到的字体与 shaping 时选中的不是同一个。宁可失败也不能
+    /// 用错误的字体解释 glyph id——那会画出无关字形而不报任何错。
+    FaceMismatch {
+        expected: Arc<str>,
+        actual: Arc<str>,
+    },
 }
 
 impl fmt::Display for CoreTextRasterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedPlatform => formatter.write_str("CoreText is only available on macOS"),
+            Self::FaceMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "CoreText face rebuild mismatch: expected {expected}, got {actual}"
+                )
+            }
             Self::UnknownFace(face) => {
                 write!(formatter, "CoreText face id {} is unknown", face.get())
             }
@@ -363,17 +375,46 @@ impl CoreTextFontResolver {
     }
 }
 
+/// 一个 face 的身份，以及重建它所需的信息。
+///
+/// 只记 PostScript 名是不够的：CoreText 为系统 UI 字体做 cascade fallback 时
+/// 会选中私有字体（`.SFNS-Regular`、`.PingFangUITextSC-Regular`、
+/// `.AppleColorEmojiUI`），这些名字**无法**通过 `CTFontCreateWithName` 重建
+/// ——该函数在名字不可解析时不返回 null，而是静默回退到默认字体。用回退后的
+/// 字体去解释原字体的 glyph id，画出来就是完全无关的字形。
+///
+/// 因此这里额外记住触发该 face 的样本文本，栅格化时用与 shaping 完全相同的
+/// fallback 机制（`CTFontCreateForString`）重新选中同一个字体。
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct FaceEntry {
+    postscript_name: String,
+    /// 触发该 face 的样本文本。base font 自身对应空串。
+    sample: String,
+    /// base font 的字重与斜体。face 身份也取决于它们：同一个样本字符在
+    /// Bold 与 Regular 的 base 下会 cascade 到不同的 face
+    /// （`.PingFangUIDisplaySC-Bold` 与 `-Regular`）。
+    weight: FontWeight,
+    slant: FontSlant,
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct FaceTable {
     next: u32,
     ids: BTreeMap<String, FontFaceId>,
-    names: Vec<String>,
+    entries: Vec<FaceEntry>,
 }
 
 #[cfg(target_os = "macos")]
 impl FaceTable {
-    fn id_for(&mut self, postscript_name: &str) -> Result<FontFaceId, CoreTextShapeError> {
+    fn id_for(
+        &mut self,
+        postscript_name: &str,
+        sample: &str,
+        weight: FontWeight,
+        slant: FontSlant,
+    ) -> Result<FontFaceId, CoreTextShapeError> {
         if let Some(face) = self.ids.get(postscript_name) {
             return Ok(*face);
         }
@@ -382,15 +423,18 @@ impl FaceTable {
             .next
             .checked_add(1)
             .ok_or(CoreTextShapeError::FaceIdOverflow)?;
-        self.names.push(postscript_name.to_owned());
+        self.entries.push(FaceEntry {
+            postscript_name: postscript_name.to_owned(),
+            sample: sample.to_owned(),
+            weight,
+            slant,
+        });
         self.ids.insert(postscript_name.to_owned(), face);
         Ok(face)
     }
 
-    fn name_for(&self, face: FontFaceId) -> Option<&str> {
-        self.names
-            .get(usize::try_from(face.get()).ok()?)
-            .map(String::as_str)
+    fn entry_for(&self, face: FontFaceId) -> Option<&FaceEntry> {
+        self.entries.get(usize::try_from(face.get()).ok()?)
     }
 }
 
@@ -556,7 +600,11 @@ impl CoreTextShaper {
     pub fn rasterizer(&self) -> CoreTextGlyphRasterizer {
         #[cfg(target_os = "macos")]
         {
-            CoreTextGlyphRasterizer::with_faces(Arc::clone(&self.faces), self.font_source)
+            CoreTextGlyphRasterizer::with_faces(
+                Arc::clone(&self.faces),
+                self.font_source,
+                Arc::from(self.request.family()),
+            )
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -567,11 +615,17 @@ impl CoreTextShaper {
     }
 
     #[cfg(target_os = "macos")]
-    fn face_id(&self, postscript_name: &str) -> Result<FontFaceId, CoreTextShapeError> {
+    fn face_id(
+        &self,
+        postscript_name: &str,
+        sample: &str,
+        weight: FontWeight,
+        slant: FontSlant,
+    ) -> Result<FontFaceId, CoreTextShapeError> {
         self.faces
             .lock()
             .map_err(|_| CoreTextShapeError::FaceTablePoisoned)?
-            .id_for(postscript_name)
+            .id_for(postscript_name, sample, weight, slant)
     }
 
     fn shape_request(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, CoreTextShapeError> {
@@ -599,6 +653,8 @@ pub struct CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
     faces: Arc<Mutex<FaceTable>>,
     font_source: CoreTextFontSource,
+    /// base font 的 family，用于重放 shaping 时的 fallback 选择。
+    requested_family: Arc<str>,
     #[cfg(target_os = "macos")]
     metrics: Arc<Mutex<FontMetricsCache>>,
     #[cfg(target_os = "macos")]
@@ -611,6 +667,7 @@ impl Clone for CoreTextGlyphRasterizer {
             #[cfg(target_os = "macos")]
             faces: Arc::clone(&self.faces),
             font_source: self.font_source,
+            requested_family: Arc::clone(&self.requested_family),
             #[cfg(target_os = "macos")]
             metrics: Arc::clone(&self.metrics),
             #[cfg(target_os = "macos")]
@@ -621,19 +678,25 @@ impl Clone for CoreTextGlyphRasterizer {
 
 impl CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
-    fn with_faces(faces: Arc<Mutex<FaceTable>>, font_source: CoreTextFontSource) -> Self {
+    fn with_faces(
+        faces: Arc<Mutex<FaceTable>>,
+        font_source: CoreTextFontSource,
+        requested_family: Arc<str>,
+    ) -> Self {
         Self {
             faces,
             font_source,
+            requested_family,
             metrics: Arc::new(Mutex::new(FontMetricsCache::new())),
             atlas: Arc::new(Mutex::new(GlyphAtlas::new(GlyphAtlasConfig::default()))),
         }
     }
 
     #[cfg(not(target_os = "macos"))]
-    const fn unsupported() -> Self {
+    fn unsupported() -> Self {
         Self {
             font_source: CoreTextFontSource::RequestedFamily,
+            requested_family: Arc::from(""),
         }
     }
 
@@ -761,28 +824,58 @@ impl GlyphRasterizer for CoreTextGlyphRasterizer {
 
 #[cfg(target_os = "macos")]
 impl CoreTextGlyphRasterizer {
+    /// 重建某个 face 对应的 `CTFont`。
+    ///
+    /// 关键在于**不能按 PostScript 名重建**：CoreText 为系统 UI 字体做 cascade
+    /// fallback 时选中的是私有字体（`.PingFangUITextSC-Regular`、
+    /// `.AppleColorEmojiUI` 等），`CTFontCreateWithName` 对这些名字既不成功也
+    /// 不失败，而是静默返回默认字体。用它去解释原字体的 glyph id，画出来就是
+    /// 完全无关的字形——中文和 emoji 会变成拉丁/西里尔符号。
+    ///
+    /// 因此这里重放 shaping 时的选择过程：先取 base font，再用记录下来的样本
+    /// 字符触发同一次 `CTFontCreateForString` fallback，最后校验结果确实是同
+    /// 一个 face。校验失败宁可报错，也不画出错误字形。
     fn font_for_face(
         &self,
         face: FontFaceId,
         size: f32,
     ) -> Result<CFRetained<CTFont>, CoreTextRasterError> {
-        let postscript_name = self
+        let entry = self
             .faces
             .lock()
             .map_err(|_| CoreTextRasterError::FaceTablePoisoned)?
-            .name_for(face)
-            .map(str::to_owned)
+            .entry_for(face)
+            .cloned()
             .ok_or(CoreTextRasterError::UnknownFace(face))?;
-        if self.font_source == CoreTextFontSource::SystemUi
-            && postscript_name.trim_start().starts_with('.')
-        {
-            return unsafe {
-                CTFont::new_ui_font_for_language(CTFontUIFontType::System, size as _, None)
-            }
-            .ok_or(CoreTextRasterError::FontUnavailable);
+
+        // 复用 shaping 侧构造 base font 的同一个函数：两条路径各写一遍迟早
+        // 会分叉，而分叉的表现就是画出错误字形。
+        let request = FontRequest::new(&*self.requested_family, size)
+            .map_err(|_| CoreTextRasterError::FontUnavailable)?
+            .with_weight(entry.weight)
+            .with_slant(entry.slant);
+        let base = create_core_text_font(&request, self.font_source)
+            .map_err(|_| CoreTextRasterError::FontUnavailable)?;
+
+        let font = if entry.sample.is_empty() {
+            base
+        } else {
+            let sample = CFString::from_str(&entry.sample);
+            let range = CFRange {
+                location: 0,
+                length: sample.length(),
+            };
+            unsafe { base.for_string(&sample, range) }
+        };
+
+        let actual = unsafe { font.post_script_name() }.to_string();
+        if actual != entry.postscript_name {
+            return Err(CoreTextRasterError::FaceMismatch {
+                expected: Arc::from(entry.postscript_name.as_str()),
+                actual: Arc::from(actual.as_str()),
+            });
         }
-        let name = CFString::from_str(&postscript_name);
-        Ok(unsafe { CTFont::with_name(&name, size as _, std::ptr::null()) })
+        Ok(font)
     }
 }
 
@@ -1037,6 +1130,26 @@ fn shape_with_core_text(
 }
 
 #[cfg(target_os = "macos")]
+/// 该 run 的首个字符，用作重建其 fallback 字体的样本。
+///
+/// CoreText 的 cascade 是按字符决定的，首字符足以重新选中同一个 face。
+#[cfg(target_os = "macos")]
+fn run_sample(request: &ShapeRequest<'_>, source: TextRange) -> String {
+    let base = request.source().start().get();
+    let Some(start) = source.start().get().checked_sub(base) else {
+        return String::new();
+    };
+    let Ok(start) = usize::try_from(start) else {
+        return String::new();
+    };
+    request
+        .text()
+        .get(start..)
+        .and_then(|tail| tail.chars().next())
+        .map(String::from)
+        .unwrap_or_default()
+}
+
 fn shape_run(
     shaper: &CoreTextShaper,
     request: &ShapeRequest<'_>,
@@ -1068,7 +1181,11 @@ fn shape_run(
     if postscript_name.trim().is_empty() {
         return Err(CoreTextShapeError::MissingRunFont);
     }
-    let face_id = shaper.face_id(&postscript_name)?;
+    // 记住触发这个 face 的字符：栅格化时要用同样的 fallback 机制重建它，
+    // 私有 UI 字体的名字无法反过来创建字体。
+    let sample = run_sample(request, source);
+    let styled = style_font_request(request.font(), request.style());
+    let face_id = shaper.face_id(&postscript_name, &sample, styled.weight(), styled.slant())?;
 
     let cf_range = CFRange {
         location: 0,
@@ -1315,6 +1432,65 @@ mod tests {
         let expected = shaped.advance() / sample.graphemes(true).count() as f32;
         assert!((metrics.default_advance() - expected).abs() < 0.001);
         assert!(metrics.line_height() > 0.0);
+    }
+
+    /// shaping 选中的 face 与栅格化实际使用的字体必须是同一个。
+    ///
+    /// 这是 v1 一直缺失的断言，因而下述缺陷长期存在且不报任何错误：栅格化
+    /// 曾按 PostScript 名重建字体，而 CoreText 为系统 UI 字体 cascade 出的
+    /// 私有字体（`.PingFangUITextSC-Regular`、`.AppleColorEmojiUI`）无法被
+    /// `CTFontCreateWithName` 重建——它静默返回默认字体。于是中文和 emoji 的
+    /// glyph id 被拉丁字体解释，屏幕上是一片无关字形，而每个 API 都「成功」。
+    ///
+    /// 断言分两层：字体身份一致（由 font_for_face 的自校验保证），以及
+    /// CJK/emoji 的字形尺寸确实大于拉丁字母——身份校验万一被绕过，尺寸也能
+    /// 暴露出「用拉丁字体画中文」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rasterized_font_matches_shaped_face_across_scripts() {
+        let size = 16.0_f32;
+        let shaper =
+            CoreTextShaper::from_system_ui(FontRequest::new("System UI", size).expect("request"))
+                .expect("shaper");
+        let rasterizer = shaper.rasterizer();
+
+        // 比较字形高度而不是宽度：CJK 字形填满 em box，拉丁字母只到 cap
+        // height，因此高度差异是稳定的。宽度不行——「日」本身就是窄字形，
+        // 正确渲染时也只有 12px 宽，和 "H" 一样。
+        let mut heights: Vec<(&str, u32)> = Vec::new();
+        for text in ["H", "\u{5f00}", "\u{65e5}", "\u{1f642}"] {
+            let source = TextRange::new(
+                ByteOffset::ZERO,
+                ByteOffset::new(u64::try_from(text.len()).expect("len fits")),
+            )
+            .expect("source range");
+            let shaped = ShapingProvider::shape(&shaper, text, source, VisualRunStyle::Plain)
+                .expect("shape should succeed");
+            let mut max_height = 0;
+            for run in shaped.runs() {
+                for glyph in run.glyphs() {
+                    let key =
+                        GlyphRasterKey::new(run.face(), glyph.id(), size).expect("raster key");
+                    // font_for_face 的自校验在这里生效：字体身份不一致会返回
+                    // FaceMismatch，而不是默默画错。
+                    let raster = rasterizer
+                        .rasterize(key)
+                        .unwrap_or_else(|error| panic!("rasterize {text:?} failed: {error}"));
+                    max_height = max_height.max(raster.bitmap().height());
+                }
+            }
+            assert!(max_height > 0, "{text:?} produced an empty bitmap");
+            heights.push((text, max_height));
+        }
+
+        let latin = heights[0].1;
+        for (text, height) in &heights[1..] {
+            assert!(
+                *height > latin,
+                "{text:?} rasterized {height}px tall, not taller than Latin {latin}px — \
+                 CJK/emoji 很可能被拉丁字体解释了"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
