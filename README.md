@@ -103,14 +103,17 @@ tools/verify.sh
 tools/verify.sh --rust-only     # 只跑 Rust 检查
 tools/verify.sh --clean         # 产品壳用干净构建（改动 FFI 边界后必须）
 
-# 构建并打开 Yu.app
-open "$(platform/macos/yu-shell-macos/build-app.sh)"
+# 构建并（重新）启动 Yu.app
+platform/macos/yu-shell-macos/run-app.sh README.md
 
 # 其它
 cargo test -p yu-render-macos -- --ignored       # 需要有 Metal device 的 macOS session
 cargo run -p yu-inspect -- README.md
 cargo run --release -p yu-bench -- --size-mib 1 --iterations 20 --random-edits 2000 --retained-snapshots 8
 ```
+
+`run-app.sh` 会先终止已在运行的实例：macOS 的 `open` 对运行中的 app 只会把它
+带到前台、不会加载新二进制，直接 `open` 会让已修好的 bug 看起来仍在复现。
 
 `verify.sh` 存在的理由是手敲验证命令容易漏。例如
 `cargo test --workspace | grep "^test result: ok" | awk '{s+=$4}'` 会跳过
