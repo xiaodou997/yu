@@ -1826,12 +1826,42 @@ impl MetalRenderTarget {
 /// target; later frames clear and redraw only the plan's damage regions before
 /// blitting to a drawable. Window creation and AppKit ownership remain outside
 /// this crate.
+/// 决定这一帧是否必须整体重绘，而不是只重绘 damage 区域。
+///
+/// 保持为纯函数，这样滚动/resize/surface 重建的组合可以在没有 Metal device
+/// 的情况下测试——渲染路径本身的测试都需要真实 GPU，是 ignored 的。
+///
+/// 关键的一条是 `last_viewport != viewport`：damage 描述的是**内容**的变化，
+/// 表达不了 viewport 自身的位移。滚动时每个 block 的内容都没变，damage 因此
+/// 可能是空的，但屏幕上所有字形的位置都变了；沿用局部重绘会把旧字形留在
+/// retained target 上，表现为滚动后字形互相重叠。
+fn requires_full_clear(
+    recreated_target: bool,
+    needs_full_clear: bool,
+    last_viewport: Option<yu_scene::Rect>,
+    viewport: yu_scene::Rect,
+    last_surface_generation: Option<u64>,
+    surface_generation: u64,
+) -> bool {
+    recreated_target
+        || needs_full_clear
+        || last_viewport != Some(viewport)
+        || last_surface_generation != Some(surface_generation)
+}
+
 pub struct MetalFrameRenderer {
     queue: MetalCommandQueue,
     pipeline: MetalPipeline,
     target: Option<MetalRenderTarget>,
     needs_full_clear: bool,
     last_surface_generation: Option<u64>,
+    /// 上一帧提交时的 render plan viewport。
+    ///
+    /// damage 描述的是**内容**的变化，无法表达 viewport 自身的位移：滚动时
+    /// 每个 block 的内容都没变，damage 因此可能是空的，但屏幕上所有字形的
+    /// 位置都变了。沿用局部重绘会把旧字形留在 retained target 上，表现为
+    /// 滚动后字形互相重叠。
+    last_viewport: Option<yu_scene::Rect>,
     frame_consumer: MetalFrameConsumer,
 }
 
@@ -2242,6 +2272,7 @@ impl MetalFrameRenderer {
             target: None,
             needs_full_clear: true,
             last_surface_generation: None,
+            last_viewport: None,
             frame_consumer: MetalFrameConsumer::new(),
         })
     }
@@ -2291,6 +2322,7 @@ impl MetalFrameRenderer {
                     // submission performs a full clear into its own storage.
                     self.needs_full_clear = true;
                     self.last_surface_generation = None;
+                    self.last_viewport = None;
                     Ok(())
                 }
                 2 => Err(MetalRenderError::DrawableUnavailable),
@@ -2348,9 +2380,14 @@ impl MetalFrameRenderer {
             &images.embedded_resource_sizes(),
         )?;
         let damage = build_native_damage(plan)?;
-        let full_clear = recreated_target
-            || self.needs_full_clear
-            || self.last_surface_generation != Some(surface.generation());
+        let full_clear = requires_full_clear(
+            recreated_target,
+            self.needs_full_clear,
+            self.last_viewport,
+            viewport,
+            self.last_surface_generation,
+            surface.generation(),
+        );
         let scale = surface.config().scale() as f32;
         if !scale.is_finite() || scale <= 0.0 {
             return Err(MetalRenderError::InvalidRenderCommand(
@@ -2409,6 +2446,7 @@ impl MetalFrameRenderer {
                 1 => {
                     self.needs_full_clear = false;
                     self.last_surface_generation = Some(surface.generation());
+                    self.last_viewport = Some(viewport);
                     Ok(())
                 }
                 2 => Err(MetalRenderError::DrawableUnavailable),
@@ -3345,6 +3383,73 @@ mod tests {
 
         let culled = cull_native_commands(vec![command], &damage);
         assert_eq!(culled, vec![command]);
+    }
+
+    /// 滚动必须触发整帧重绘。
+    ///
+    /// damage 只描述内容变化：滚动时每个 block 的内容都没变，damage 可能是空
+    /// 的，但所有字形的屏幕位置都变了。沿用局部重绘会把旧字形留在 retained
+    /// target 上，表现为滚动后字形互相重叠——这是真实窗口里观察到的现象。
+    #[test]
+    fn viewport_movement_forces_a_full_clear() {
+        let viewport = yu_scene::Rect::new(0.0, 0.0, 320.0, 240.0).expect("viewport");
+        let scrolled = yu_scene::Rect::new(0.0, 40.0, 320.0, 240.0).expect("scrolled viewport");
+
+        // 稳定状态：同一 viewport、同一 surface generation，允许局部重绘。
+        assert!(!requires_full_clear(
+            false,
+            false,
+            Some(viewport),
+            viewport,
+            Some(7),
+            7
+        ));
+
+        // 滚动：viewport 位移，必须整帧重绘。
+        assert!(requires_full_clear(
+            false,
+            false,
+            Some(viewport),
+            scrolled,
+            Some(7),
+            7
+        ));
+
+        // 首帧尚无记录的 viewport，同样必须整帧重绘。
+        assert!(requires_full_clear(
+            false,
+            false,
+            None,
+            viewport,
+            Some(7),
+            7
+        ));
+
+        // 其余既有条件保持不变。
+        assert!(requires_full_clear(
+            true,
+            false,
+            Some(viewport),
+            viewport,
+            Some(7),
+            7
+        ));
+        assert!(requires_full_clear(
+            false,
+            true,
+            Some(viewport),
+            viewport,
+            Some(7),
+            7
+        ));
+        assert!(requires_full_clear(
+            false,
+            false,
+            Some(viewport),
+            viewport,
+            Some(7),
+            8
+        ));
     }
 
     #[cfg(not(target_os = "macos"))]
