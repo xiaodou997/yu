@@ -893,24 +893,6 @@ pub struct YuStorageAccessibilityRange {
     pub end_utf16: u64,
 }
 
-/// One source-backed semantic node for a VoiceOver/native accessibility tree.
-/// `index` and `parent` are valid only for the same `revision`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageAccessibilityNode {
-    pub revision: u64,
-    pub index: u32,
-    pub parent: u32,
-    pub kind: u8,
-    pub flags: u8,
-    pub level: u8,
-    pub reserved: u8,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-    pub label_start_utf16: u64,
-    pub label_end_utf16: u64,
-}
-
 /// Extended semantic node payload. The original
 /// `YuStorageAccessibilityNode` ABI remains unchanged; native clients that
 /// need URL/action metadata opt into the V2 fill function below.
@@ -1285,14 +1267,6 @@ fn close_state(session: CloseState) -> u8 {
     }
 }
 
-fn external_file_state_from_ffi(value: u8) -> Result<ExternalFileState, i32> {
-    match value {
-        YU_STORAGE_DISK_CHANGED => Ok(ExternalFileState::Changed),
-        YU_STORAGE_DISK_MISSING => Ok(ExternalFileState::Missing),
-        _ => Err(YU_STORAGE_INVALID_STATE),
-    }
-}
-
 fn status_from_editor_error(error: EditorDocumentError) -> i32 {
     match error {
         EditorDocumentError::Edit(EditError::StaleRevision { .. })
@@ -1534,28 +1508,6 @@ fn accessibility_semantic_snapshot(
         .map_err(status_from_accessibility_error)
 }
 
-fn accessibility_semantic_node_output(
-    node: AccessibilitySemanticNode,
-) -> YuStorageAccessibilityNode {
-    let source = node.source_range().range();
-    let label = node.label_range().range();
-    YuStorageAccessibilityNode {
-        revision: node.source_range().revision().get(),
-        index: node.index(),
-        parent: node
-            .parent()
-            .unwrap_or(YU_STORAGE_ACCESSIBILITY_PARENT_NONE),
-        kind: node.kind().tag(),
-        flags: node.flags(),
-        level: node.level(),
-        reserved: 0,
-        source_start_utf16: source.start().get(),
-        source_end_utf16: source.end().get(),
-        label_start_utf16: label.start().get(),
-        label_end_utf16: label.end().get(),
-    }
-}
-
 fn accessibility_semantic_node_v2_output(
     node: AccessibilitySemanticNode,
 ) -> YuStorageAccessibilityNodeV2 {
@@ -1594,43 +1546,6 @@ fn accessibility_semantic_node_v2_output(
             .and_then(|block| u64::try_from(block).ok())
             .unwrap_or(YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK),
     }
-}
-
-fn write_accessibility_nodes(
-    nodes: &[AccessibilitySemanticNode],
-    output: *mut YuStorageAccessibilityNode,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    if written.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: `written` is a caller-owned output pointer checked above.
-    unsafe { *written = nodes.len() };
-    if nodes.is_empty() {
-        return YU_STORAGE_OK;
-    }
-    if output.is_null() {
-        return if capacity == 0 {
-            YU_STORAGE_OK
-        } else {
-            YU_STORAGE_NULL_POINTER
-        };
-    }
-    if capacity < nodes.len() {
-        return YU_STORAGE_BUFFER_TOO_SMALL;
-    }
-    let converted = nodes
-        .iter()
-        .copied()
-        .map(accessibility_semantic_node_output)
-        .collect::<Vec<_>>();
-    // SAFETY: capacity was checked against the number of converted nodes, and
-    // the native caller supplied writable storage for that many values.
-    unsafe {
-        ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
-    }
-    YU_STORAGE_OK
 }
 
 fn write_accessibility_nodes_v2(
@@ -3077,27 +2992,6 @@ pub unsafe extern "C" fn yu_storage_session_destroy(session: *mut YuStorageSessi
 
 /// # Safety
 ///
-/// `session` must be null or a live handle; `output` must be writable when
-/// non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_path_length(
-    session: *const YuStorageSession,
-    output: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    let path = session.session.path().to_string_lossy();
-    // SAFETY: `output` was checked and belongs to the caller.
-    unsafe { *output = path.len() };
-    YU_STORAGE_OK
-}
-
-/// # Safety
-///
 /// `session` must be null or a live handle. `output`/`written` must describe a
 /// valid writable buffer, except for the documented null/zero-capacity query.
 #[unsafe(no_mangle)]
@@ -3112,27 +3006,6 @@ pub unsafe extern "C" fn yu_storage_session_copy_path(
     };
     let path = session.session.path().to_string_lossy();
     write_bytes(path.as_bytes(), output, capacity, written)
-}
-
-/// # Safety
-///
-/// `session` must be null or a live handle and `output` must be writable when
-/// non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_source_length(
-    session: *const YuStorageSession,
-    output: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    let source = session.session.snapshot();
-    // SAFETY: `output` was checked and belongs to the caller.
-    unsafe { *output = source.as_str().len() };
-    YU_STORAGE_OK
 }
 
 /// # Safety
@@ -7989,34 +7862,6 @@ pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_node_count(
     YU_STORAGE_OK
 }
 
-/// Copies the Revision-bound semantic Accessibility tree in document order.
-/// The count/fill convention matches other native owned queries: a null output
-/// with zero capacity returns the required node count.
-///
-/// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable nodes when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_nodes(
-    session: *const YuStorageSession,
-    expected_revision: u64,
-    output: *mut YuStorageAccessibilityNode,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let snapshot = match accessibility_semantic_snapshot(&session.session) {
-        Ok(snapshot) => snapshot,
-        Err(status) => return status,
-    };
-    write_accessibility_nodes(snapshot.nodes(), output, capacity, written)
-}
-
 /// Copies the extended Revision-bound semantic tree. This V2 function keeps
 /// the original `yu_storage_session_accessibility_semantic_nodes` struct ABI
 /// intact while adding parser-resolved destination and task action metadata.
@@ -8255,28 +8100,6 @@ pub unsafe extern "C" fn yu_storage_session_discard_close(session: *mut YuStorag
     session
         .session
         .discard_close()
-        .map(|_| YU_STORAGE_OK)
-        .unwrap_or(YU_STORAGE_INVALID_STATE)
-}
-
-/// # Safety
-///
-/// `session` must be null or a live handle returned by the open function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_save_failed_external(
-    session: *mut YuStorageSession,
-    external_state: u8,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    let state = match external_file_state_from_ffi(external_state) {
-        Ok(state) => state,
-        Err(status) => return status,
-    };
-    session
-        .session
-        .save_failed_external(state)
         .map(|_| YU_STORAGE_OK)
         .unwrap_or(YU_STORAGE_INVALID_STATE)
 }
@@ -12435,11 +12258,11 @@ mod tests {
             "root, blocks, and inline semantic nodes (count={count})"
         );
 
-        let mut nodes = vec![YuStorageAccessibilityNode::default(); count];
+        let mut nodes = vec![YuStorageAccessibilityNodeV2::default(); count];
         let mut written = 0;
         assert_eq!(
             unsafe {
-                yu_storage_session_accessibility_semantic_nodes(
+                yu_storage_session_accessibility_semantic_nodes_v2(
                     raw,
                     0,
                     nodes.as_mut_ptr(),
@@ -12471,32 +12294,17 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_LINK)
         );
-        let mut extended_nodes = vec![YuStorageAccessibilityNodeV2::default(); count];
-        let mut extended_written = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_accessibility_semantic_nodes_v2(
-                    raw,
-                    0,
-                    extended_nodes.as_mut_ptr(),
-                    extended_nodes.len(),
-                    &mut extended_written,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(extended_written, count);
-        let link = extended_nodes
+        let link = nodes
             .iter()
             .find(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_LINK)
             .expect("link semantic node");
         assert!(link.destination_end_utf16 > link.destination_start_utf16);
-        let reference_link = extended_nodes
+        let reference_link = nodes
             .iter()
             .find(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_LINK)
             .expect("reference link semantic node");
         assert!(reference_link.destination_end_utf16 > reference_link.destination_start_utf16);
-        let task = extended_nodes
+        let task = nodes
             .iter()
             .find(|node| node.kind == YU_STORAGE_ACCESSIBILITY_KIND_TASK_LIST_ITEM)
             .expect("task semantic node");
