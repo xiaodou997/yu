@@ -39,9 +39,7 @@ use yu_text::{EditError, TextSnapshot};
 #[cfg(target_os = "macos")]
 use yu_render::{RenderCommand, RenderPlanBuilder};
 #[cfg(target_os = "macos")]
-use yu_scene::{
-    EditorDecorationPrimitiveRole, Point, Primitive, Rect, Rgba8, ViewportSceneInput,
-};
+use yu_scene::{EditorDecorationPrimitiveRole, Point, Primitive, Rect, Rgba8, ViewportSceneInput};
 #[cfg(target_os = "macos")]
 use yu_workspace::{
     EditorDecorationStyle, ViewportRenderConfig,
@@ -694,8 +692,6 @@ pub struct YuStorageCaretScrollRequest {
     pub needs_scroll: u8,
 }
 
-
-
 pub const YU_STORAGE_RENDER_COMMAND_FILL_RECT: u8 = 0;
 pub const YU_STORAGE_RENDER_COMMAND_GLYPH: u8 = 1;
 pub const YU_STORAGE_RENDER_COMMAND_IMAGE: u8 = 2;
@@ -923,8 +919,6 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub selection_decoration_count: u64,
     pub caret_decoration_count: u64,
 }
-
-
 
 /// Revision-bound source coordinates used by the native Accessibility adapter.
 /// The snapshot is intentionally compact: text and line contents are queried
@@ -6392,7 +6386,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_visual_decorations(
     }
 }
 
-
 fn image_utf16_range(source: &TextSnapshot, range: Option<TextRange>) -> Result<(u64, u64), i32> {
     let Some(range) = range else {
         return Ok((
@@ -7076,7 +7069,6 @@ fn macos_render_host_surface_prepare(
     });
     Ok(0)
 }
-
 
 #[cfg(target_os = "macos")]
 fn macos_visual_render_plan(
@@ -7960,8 +7952,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
     }
     YU_STORAGE_OK
 }
-
-
 
 /// Returns source-backed image metadata for the current Markdown Revision.
 /// The count/fill result contains no decoded bytes or native image objects;
@@ -11027,7 +11017,6 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
-
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_visual_render_plan_is_glyph_atlas_bound_and_atomic() {
@@ -12269,7 +12258,6 @@ mod tests {
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }
-
 
     #[cfg(target_os = "macos")]
     #[test]
