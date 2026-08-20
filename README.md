@@ -47,7 +47,7 @@ v2 重构分 7 个阶段推进，每个阶段结束时 app 必须可运行、CI 
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| S1 | 拆炸弹：渲染循环移入 Rust，删除 TextKit fallback 与 count/fill FFI | 进行中 |
+| S1 | 拆炸弹：删除 TextKit fallback 与诊断桥，帧调度移入 Rust，app 转正 | 进行中 |
 | S2 | 地基：坐标收敛、`yu-text` 换 ropey、CI 强制依赖方向 | 未开始 |
 | S3 | 解析器：移植 lezer-markdown 算法，建立 CommonMark spec 差分测试 | 未开始 |
 | S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 未开始 |

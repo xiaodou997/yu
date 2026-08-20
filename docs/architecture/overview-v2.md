@@ -383,13 +383,38 @@ IME composition 的 generation 模型、`EditorScenario` 标记 DSL 测试方法
 
 原则：**先拆炸弹，再自底向上重建。** 每个阶段结束时 app 必须能运行，CI 必须全绿。
 
-### S1 · 拆炸弹（纯删除，不引入新设计）
+### S1 · 拆炸弹（以删除为主）
 
-渲染循环移入 Rust；删除 TextKit fallback、capability mask、coverage gate、
-count/fill FFI；app 从 `experiments/` 转正为 `platform/macos/`。
+删除 TextKit fallback、capability mask、coverage gate 与诊断桥；把帧调度决策
+移入 Rust；app 从 `experiments/` 转正为 `platform/macos/`。
 
-- 验收：`yu-storage-ffi` < 1,000 行；Swift < 2,000 行；总代码量下降 ≥ 20,000 行；
-  heading / emphasis / code / link / image / table / task / IME / AX 全部保持可用。
+**「渲染循环移入 Rust」的澄清。** 本文初版把这一步理解为「把 Metal 编码从
+Swift 搬到 Rust」。实际调查发现 Metal 编码本来就在 Rust
+（`yu_metal_render_plan` 直接把 RenderPlan 编码成 Metal 命令），Swift 侧那
+14,340 行 FFI 不是为了绘制，而是为了让 Swift **验证和兜底**。
+
+真正需要移入 Rust 的是**帧调度决策**：`MacosSurfaceHostCoordinator`（928 行
+Swift）在平台侧决定何时提交帧、如何处理 metrics/scroll/resize/资源刷新。
+状态在 Rust、决策在 Swift，于是每个决策点都要一次 FFI 查询——这才是 FFI
+函数数量膨胀的成因。
+
+**行数目标的修正。** 初版定下「`yu-storage-ffi` < 1,000 行」，前提是认为其
+体积主要来自 count/fill 诊断桥。逐个统计 81 个 FFI 的调用者后，这个前提不
+成立：只有 4 个没有调用者，其余 77 个都被产品代码真实使用。实际构成是：
+
+```text
+mod tests        4,593 行 (36%)   测试，是资产，不计入削减目标
+生产 FFI 代码    ~7,800 行        77 个函数 ≈ 100 行/函数
+```
+
+跨 C ABI 的每个函数都要做 null 检查、Revision 校验、类型转换与错误码映射，
+100 行/函数并不异常。因此验收指标从「行数」改为「函数数量与职责」：
+
+- FFI 函数 ≤ 40 个，且全部落在 I3 允许的类别内
+  （文件、输入事件、selection 查询、Accessibility、surface 生命周期）；
+- Swift 产品代码 < 2,000 行，self-check 移出主文件；
+- app 在 `platform/macos/` 且进入 CI；
+- heading / emphasis / code / link / image / table / task / IME / AX 全部保持可用。
 
 ### S2 · 地基
 
