@@ -5589,50 +5589,135 @@ pub unsafe extern "C" fn yu_storage_session_macos_block_caret(
 
     #[cfg(target_os = "macos")]
     {
-        if let Err(status) = validate_revision(&session.session, expected_revision) {
-            return status;
-        }
-        let affinity = match caret_affinity_from_ffi(affinity) {
-            Ok(affinity) => affinity,
-            Err(status) => return status,
-        };
         let block_index = match usize::try_from(block_index) {
-            Ok(index) if index < session.session.block_count() => index,
-            _ => return YU_STORAGE_INVALID_SELECTION,
+            Ok(index) => index,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
         };
-        let (shaper, metrics, config) = match core_text_system_ui_layout(size, max_width) {
-            Ok(layout) => layout,
-            Err(status) => return status,
-        };
-        let snapshot = session.session.snapshot();
-        if snapshot
-            .byte_offset_for_utf16(Utf16Offset::new(source_utf16))
-            .is_err()
-        {
-            return YU_STORAGE_INVALID_SELECTION;
-        }
-        let layout = match session
-            .session
-            .block_layout_with_shaper(block_index, config, &shaper)
-        {
-            Ok(layout) => layout,
-            Err(error) => return storage_status(error),
-        };
-        let caret = match block_caret_from_layout(
-            &session.session,
-            block_index,
+        match macos_shaped_caret(
+            session,
+            expected_revision,
+            Some(block_index),
             source_utf16,
             affinity,
-            &layout,
-            metrics.line_height(),
-            1,
+            size,
+            max_width,
         ) {
-            Ok(caret) => caret,
-            Err(status) => return status,
-        };
+            // SAFETY: output was checked for null and belongs to the caller.
+            Ok(caret) => unsafe {
+                *output = caret;
+                YU_STORAGE_OK
+            },
+            Err(status) => status,
+        }
+    }
+}
+
+/// Shared body for the block-scoped and source-scoped caret queries.
+///
+/// `block_index` of `None` means "resolve the owning block from the source
+/// offset". Platforms do not parse Markdown and therefore cannot know which
+/// block owns an offset (invariant I1); resolving it here also keeps the
+/// lookup and the layout inside one Revision check instead of letting an
+/// intermediate block index race a concurrent edit.
+#[cfg(target_os = "macos")]
+fn macos_shaped_caret(
+    session: &mut YuStorageSession,
+    expected_revision: u64,
+    block_index: Option<usize>,
+    source_utf16: u64,
+    affinity: u8,
+    size: f32,
+    max_width: f32,
+) -> Result<YuStorageBlockCaret, i32> {
+    validate_revision(&session.session, expected_revision)?;
+    let affinity = caret_affinity_from_ffi(affinity)?;
+    let (shaper, metrics, config) = core_text_system_ui_layout(size, max_width)?;
+    let snapshot = session.session.snapshot();
+    let Ok(offset) = snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) else {
+        return Err(YU_STORAGE_INVALID_SELECTION);
+    };
+    let block_index = match block_index {
+        Some(index) if index < session.session.block_count() => index,
+        Some(_) => return Err(YU_STORAGE_INVALID_SELECTION),
+        None => session
+            .session
+            .document()
+            .editor()
+            .block_index_for_source(offset)
+            .ok_or(YU_STORAGE_INVALID_SELECTION)?,
+    };
+    let layout = session
+        .session
+        .block_layout_with_shaper(block_index, config, &shaper)
+        .map_err(storage_status)?;
+    block_caret_from_layout(
+        &session.session,
+        block_index,
+        source_utf16,
+        affinity,
+        &layout,
+        metrics.line_height(),
+        1,
+    )
+}
+
+/// Resolves a source caret's shaped geometry without the caller naming a block.
+///
+/// The platform needs this for IME candidate-window placement: AppKit's
+/// `firstRect(forCharacterRange:)` must report where the caret actually is on
+/// screen, and only the Rust layout knows that — TextKit lays out canonical
+/// source while the screen shows the projection (invariants H3, I1).
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_source_caret(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    affinity: u8,
+    size: f32,
+    max_width: f32,
+    output: *mut YuStorageBlockCaret,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: output was checked for null and belongs to the caller.
+    unsafe { *output = YuStorageBlockCaret::default() };
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            source_utf16,
+            affinity,
+            size,
+            max_width,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+    }
+
+    #[cfg(target_os = "macos")]
+    match macos_shaped_caret(
+        session,
+        expected_revision,
+        None,
+        source_utf16,
+        affinity,
+        size,
+        max_width,
+    ) {
         // SAFETY: output was checked for null and belongs to the caller.
-        unsafe { *output = caret };
-        YU_STORAGE_OK
+        Ok(caret) => unsafe {
+            *output = caret;
+            YU_STORAGE_OK
+        },
+        Err(status) => status,
     }
 }
 
@@ -10049,6 +10134,130 @@ mod tests {
                     raw,
                     0,
                     2,
+                    source_utf16,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut caret,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// `macos_source_caret` 让平台在不知道 block 归属的情况下取得 caret 几何。
+    /// AppKit 的 `firstRect(forCharacterRange:)` 需要它来定位 IME 候选窗：
+    /// TextKit 排的是 canonical source，屏幕显示的是投影结果，两者字符位置
+    /// 不对应，用默认实现会让候选窗偏离真实插入点（不变量 H3、I1）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_source_caret_resolves_owning_block_and_is_revision_bound() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-source-caret-{id}.md"));
+        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let source_start = source.find("**粗体**").expect("strong marker");
+        let source_utf16 = source[..source_start].encode_utf16().count() as u64;
+
+        // 不指定 block 的查询必须与显式指定正确 block 的查询完全一致。
+        let mut expected = YuStorageBlockCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_block_caret(
+                    raw,
+                    0,
+                    2,
+                    source_utf16,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut expected,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut caret = YuStorageBlockCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_source_caret(
+                    raw,
+                    0,
+                    source_utf16,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut caret,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(caret.block_index, expected.block_index);
+        assert_eq!(caret.source_utf16, expected.source_utf16);
+        assert_eq!(caret.visual_utf16, expected.visual_utf16);
+        assert_eq!(caret.caret_x, expected.caret_x);
+        assert_eq!(caret.caret_y, expected.caret_y);
+        assert_eq!(caret.caret_height, expected.caret_height);
+        assert_eq!(caret.shaped, 1);
+        assert!(caret.caret_x.is_finite() && caret.caret_y.is_finite());
+
+        // 文档开头属于另一个 block，块归属必须真的按 offset 解析而非写死。
+        let mut first = YuStorageBlockCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_source_caret(
+                    raw,
+                    0,
+                    0,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut first,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_ne!(first.block_index, caret.block_index);
+
+        // 越界 offset 必须被拒绝，且不写入半成品结果。
+        let out_of_range = source.encode_utf16().count() as u64 + 1;
+        let mut rejected = YuStorageBlockCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_source_caret(
+                    raw,
+                    0,
+                    out_of_range,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut rejected,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(rejected, YuStorageBlockCaret::default());
+
+        // 编辑之后旧 Revision 的查询必须整体拒绝。
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_source_caret(
+                    raw,
+                    0,
                     source_utf16,
                     YU_STORAGE_CARET_AFFINITY_UPSTREAM,
                     14.0,

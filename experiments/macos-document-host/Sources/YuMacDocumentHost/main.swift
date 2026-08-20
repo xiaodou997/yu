@@ -2158,6 +2158,31 @@ private final class StorageBridge {
         return NativeBlockCaret(value)
     }
 
+    /// 不需要调用方指定 block 的 caret 几何查询。平台不解析 Markdown，
+    /// 无法知道某个 source offset 属于哪个 block（不变量 I1）。
+    func macosSourceCaret(
+        revision: UInt64,
+        sourceUTF16: UInt64,
+        affinity: UInt8,
+        size: Float,
+        maxWidth: Float
+    ) throws -> NativeBlockCaret {
+        var value = YuStorageBlockCaret()
+        let status = yu_storage_session_macos_source_caret(
+            handle,
+            revision,
+            sourceUTF16,
+            affinity,
+            size,
+            maxWidth,
+            &value
+        )
+        guard status == StorageStatus.ok else {
+            throw BridgeError.operation(status)
+        }
+        return NativeBlockCaret(value)
+    }
+
     func setViewportConfig(
         revision: UInt64,
         maxWidth: Float,
@@ -4086,6 +4111,71 @@ private final class DocumentTextView: NSTextView {
             onError?(error)
             return false
         }
+    }
+
+    /// IME 候选窗定位。
+    ///
+    /// 必须用 Rust 几何：NSTextView 的默认实现基于 TextKit 布局，而 TextKit
+    /// 排的是 canonical source，屏幕上显示的却是 Rust 的投影结果（未聚焦的
+    /// Markdown 语法被隐藏），两者的字符位置并不对应。沿用默认实现会让候选窗
+    /// 偏离真实插入点，违反不变量 H3（OS 查询的 caret rect 必须与当前编辑
+    /// 状态一致）。
+    ///
+    /// 几何不可用时回退到默认实现：候选窗位置略偏，好过不显示。
+    override func firstRect(
+        forCharacterRange range: NSRange,
+        actualRange: NSRangePointer?
+    ) -> NSRect {
+        guard let caretRect = rustCaretRect(forSourceUTF16: range.location) else {
+            return super.firstRect(forCharacterRange: range, actualRange: actualRange)
+        }
+        actualRange?.pointee = NSRange(location: range.location, length: 0)
+        let viewRect = NSRect(
+            x: caretRect.origin.x + textContainerOrigin.x,
+            y: caretRect.origin.y + textContainerOrigin.y,
+            width: max(caretRect.width, 1.0),
+            height: caretRect.height
+        )
+        let windowRect = convert(viewRect, to: nil)
+        return window?.convertToScreen(windowRect) ?? windowRect
+    }
+
+    /// 当前 Revision 下某个 source offset 的 caret 矩形，document-space。
+    /// composition 期间使用同一 generation 绑定的 transient 布局，
+    /// 否则 preedit 的候选窗会落在提交前的旧位置。
+    private func rustCaretRect(forSourceUTF16 sourceUTF16: Int) -> NSRect? {
+        guard sourceUTF16 >= 0,
+              let (size, width) = visualLayoutMetrics() else {
+            return nil
+        }
+        let revision = bridge.state.revision
+        let offset = UInt64(sourceUTF16)
+        if bridge.composition.active {
+            guard let caret = try? bridge.macosCompositionShapedCaret(
+                revision: revision,
+                generation: bridge.composition.generation,
+                sourceUTF16: offset,
+                affinity: 0,
+                size: size,
+                maxWidth: width
+            ), caret.revision == revision else {
+                return nil
+            }
+            return NSRect(origin: caret.point, size: caret.size)
+        }
+        guard let caret = try? bridge.macosSourceCaret(
+            revision: revision,
+            sourceUTF16: offset,
+            affinity: 0,
+            size: size,
+            maxWidth: width
+        ), caret.revision == revision else {
+            return nil
+        }
+        return NSRect(
+            origin: caret.point,
+            size: CGSize(width: 1.0, height: caret.height)
+        )
     }
 
     private func visualLayoutMetrics() -> (Float, Float)? {
