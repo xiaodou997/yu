@@ -78,5 +78,7 @@ fi
 print -r -- "全部 ${#checks} 个 self-check 通过"
 
 # launch-window-self-check 会经由 applicationDidFinishLaunching 真正创建
-# NSWindow，需要可用的窗口服务，因此不在此列。本地验证：
+# NSWindow，需要可用的窗口服务，因此不在此列。它顺带跑帧调度自检：只有真实
+# 的 NSWindow 与 Metal surface 才会产生「已提交的帧」，headless 覆盖不到
+# 「屏幕上那一帧还算不算数」这个判断。改动帧调度后必须在本地跑一次：
 #   "$binary" --launch-window-self-check Fixtures/block-projection.md
