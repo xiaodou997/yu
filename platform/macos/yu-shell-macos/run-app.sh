@@ -27,7 +27,13 @@ if pgrep -f "$binary" >/dev/null 2>&1; then
 fi
 
 if (( $# > 0 )); then
-    open "$app" --args "${@:A}"
+    # 传绝对路径：app 的工作目录不是 shell 的当前目录。
+    target="${1:A}"
+    if [[ ! -e "$target" ]]; then
+        print -r -- "文件不存在: $target" >&2
+        exit 1
+    fi
+    open "$app" --args "$target"
 else
     open "$app"
 fi
