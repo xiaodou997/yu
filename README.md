@@ -98,23 +98,24 @@ cd yu
 ## 本地验证
 
 ```bash
-# Rust 核心
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-python3 tools/check-ffi-header.py                # C 头文件与 FFI 实现一致性
-cargo test -p yu-render-macos -- --ignored       # 需要有 Metal device 的 macOS session
-
-# macOS 产品壳：构建并运行全部 headless self-check
-platform/macos/yu-shell-macos/run-self-checks.sh --build
+# 全量验证：fmt / clippy / test / FFI 头文件一致性 / 产品壳 self-check
+tools/verify.sh
+tools/verify.sh --rust-only     # 只跑 Rust 检查
+tools/verify.sh --clean         # 产品壳用干净构建（改动 FFI 边界后必须）
 
 # 构建并打开 Yu.app
 open "$(platform/macos/yu-shell-macos/build-app.sh)"
 
-# 工具
+# 其它
+cargo test -p yu-render-macos -- --ignored       # 需要有 Metal device 的 macOS session
 cargo run -p yu-inspect -- README.md
 cargo run --release -p yu-bench -- --size-mib 1 --iterations 20 --random-edits 2000 --retained-snapshots 8
 ```
+
+`verify.sh` 存在的理由是手敲验证命令容易漏。例如
+`cargo test --workspace | grep "^test result: ok" | awk '{s+=$4}'` 会跳过
+`test result: FAILED` 的行——失败被静默吞掉，还显示出一个看起来正常的用例数。
+脚本以退出码为准，任一步失败立即中止。
 
 Swift 产品壳通过 `YuStorageFFI` C module 链接 Rust static library，因此必须先运行
 `build-rust-ffi.sh`，或使用会自动执行它的 `build-app.sh` / `run-self-checks.sh --build`。
