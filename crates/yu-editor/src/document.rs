@@ -3704,8 +3704,33 @@ mod tests {
                 .expect("list selection"),
             )
             .expect("set list selection");
-        assert_eq!(document.selection_reveal_block_index(), None);
+        let list_index = document
+            .block_index_for_source(ByteOffset::new(item as u64))
+            .expect("list block");
+        assert_eq!(document.selection_reveal_block_index(), Some(list_index));
+        let canonical_list = document
+            .block_projection(list_index)
+            .expect("canonical list projection")
+            .clone();
+        let list_cached = document.projection_cache_stats();
+        assert_eq!(
+            canonical_list
+                .visual()
+                .leading_marker()
+                .expect("semantic list marker")
+                .text(),
+            "•"
+        );
+        let revealed_list = document
+            .block_projection_with_selection_reveal(list_index)
+            .expect("revealed list projection");
+        assert!(revealed_list.visual().leading_marker().is_none());
+        assert_eq!(
+            revealed_list.visual().visual_len().get(),
+            canonical_list.visual().visual_len().get() + 2
+        );
         assert_eq!(document.revision(), Revision::new(0));
+        assert_eq!(document.projection_cache_stats(), list_cached);
     }
 
     #[test]

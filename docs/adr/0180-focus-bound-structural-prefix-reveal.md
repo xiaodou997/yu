@@ -1,5 +1,8 @@
 # ADR 0180: Focus-bound structural prefix reveal
 
+> Ordinary-list decisions in items 3-5 are superseded by ADR 0181. Heading,
+> blockquote and task-list decisions remain current.
+
 ## Context
 
 Canonical block projections hide parser-owned ATX heading and blockquote

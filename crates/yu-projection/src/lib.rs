@@ -14,7 +14,7 @@ use std::sync::Arc;
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
 use yu_markdown::{
     Block, BlockKind, InlineDocument, InlineNodeKind, InlineParseError, InlineSpan, InlineSpanKind,
-    ReferenceDefinitionIndex, TableBlock, parse_inline, parse_inline_with_definitions,
+    ReferenceDefinitionIndex, TableBlock, list_marker, parse_inline, parse_inline_with_definitions,
     parse_table_in_snapshot,
 };
 use yu_text::{AnchorMapError, ChangeSet, TextChange, TextPositionError, TextSnapshot};
@@ -260,6 +260,9 @@ pub enum ProjectionError {
     InvalidTaskListBlock {
         range: TextRange,
     },
+    InvalidListBlock {
+        range: TextRange,
+    },
     CompositionRangeOutsideProjection {
         range: TextRange,
         projection: TextRange,
@@ -309,6 +312,9 @@ impl fmt::Display for ProjectionError {
             Self::InvalidTaskListBlock { range } => {
                 write!(formatter, "invalid task-list block range {range:?}")
             }
+            Self::InvalidListBlock { range } => {
+                write!(formatter, "invalid list block range {range:?}")
+            }
             Self::CompositionRangeOutsideProjection { range, projection } => write!(
                 formatter,
                 "composition range {range:?} is outside projection {projection:?}"
@@ -341,6 +347,7 @@ impl Error for ProjectionError {
             | Self::NotFencedCodeBlock { .. }
             | Self::InvalidCodeBlock { .. }
             | Self::InvalidTaskListBlock { .. }
+            | Self::InvalidListBlock { .. }
             | Self::CompositionRangeOutsideProjection { .. }
             | Self::CompositionSelectionOutOfBounds { .. }
             | Self::CompositionSelectionNotUtf8Boundary { .. }
@@ -376,6 +383,34 @@ pub struct Projection {
     images: Vec<ImageSource>,
     visual_len: VisualOffset,
     composition: Option<CompositionState>,
+    leading_marker: Option<LeadingMarker>,
+}
+
+/// A semantic marker painted before a projected block while retaining the
+/// exact Markdown token as its canonical source identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeadingMarker {
+    source: TextRange,
+    text: Arc<str>,
+    indent: u8,
+}
+
+impl LeadingMarker {
+    #[must_use]
+    pub const fn source(&self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Returns the parser-owned leading-space count retained by the marker.
+    #[must_use]
+    pub const fn indent(&self) -> u8 {
+        self.indent
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -568,7 +603,28 @@ impl Projection {
             images,
             visual_len,
             composition: None,
+            leading_marker: None,
         })
+    }
+
+    fn with_leading_marker(
+        mut self,
+        source: TextRange,
+        text: impl Into<Arc<str>>,
+        indent: u8,
+    ) -> Result<Self, ProjectionError> {
+        if source.start() < self.source_range.start() || source.end() > self.source_range.end() {
+            return Err(ProjectionError::SourceOutsideRange {
+                offset: source.start(),
+                range: self.source_range,
+            });
+        }
+        self.leading_marker = Some(LeadingMarker {
+            source,
+            text: text.into(),
+            indent,
+        });
+        Ok(self)
     }
 
     /// Projects transient IME preedit text over a canonical source range.
@@ -642,6 +698,10 @@ impl Projection {
                 selection_bytes,
                 visual: VisualRange::new(visual_start, visual_end)
                     .ok_or(ProjectionError::OffsetOverflow)?,
+            }),
+            leading_marker: self.leading_marker.clone().filter(|marker| {
+                replacement_range.end() <= marker.source.start()
+                    || marker.source.end() <= replacement_range.start()
             }),
         })
     }
@@ -717,6 +777,17 @@ impl Projection {
                 .collect::<Result<Vec<_>, ProjectionError>>()?,
             visual_len: self.visual_len,
             composition: None,
+            leading_marker: self
+                .leading_marker
+                .as_ref()
+                .map(|marker| {
+                    Ok::<LeadingMarker, ProjectionError>(LeadingMarker {
+                        source: map_range(marker.source, changes)?,
+                        text: marker.text.clone(),
+                        indent: marker.indent,
+                    })
+                })
+                .transpose()?,
         }))
     }
 
@@ -739,6 +810,14 @@ impl Projection {
     #[must_use]
     pub fn runs(&self) -> &[VisualRun] {
         &self.runs
+    }
+
+    /// Returns the source-backed semantic marker placed before this block.
+    /// Focus projections reveal the real Markdown prefix and therefore return
+    /// `None` here.
+    #[must_use]
+    pub fn leading_marker(&self) -> Option<&LeadingMarker> {
+        self.leading_marker.as_ref()
     }
 
     /// Returns source-backed image metadata in parser span order.
@@ -2003,7 +2082,14 @@ impl BlockProjection {
             Some(active) => {
                 Projection::from_inline_with_structural_reveal(&inline, &hidden, active)
             }
-            None => Projection::from_inline_with_hidden(&inline, &hidden),
+            None => {
+                let projection = Projection::from_inline_with_hidden(&inline, &hidden)?;
+                if kind == BlockProjectionKind::List {
+                    with_semantic_list_marker(projection, source, block)
+                } else {
+                    Ok(projection)
+                }
+            }
         }?;
         Ok(match kind {
             BlockProjectionKind::Heading => Self::Heading(projection),
@@ -2039,7 +2125,9 @@ impl BlockProjection {
             }
             BlockKind::ListItem { .. } => {
                 let inline = parse_inline(source, block.range())?;
-                Projection::from_inline(&inline).map(Self::List)
+                let hidden = yu_markdown::block_syntax_hidden_ranges(source, block);
+                let projection = Projection::from_inline_with_hidden(&inline, &hidden)?;
+                with_semantic_list_marker(projection, source, block).map(Self::List)
             }
             BlockKind::Paragraph => Projection::inline(source, block.range()).map(Self::Inline),
             _ => Projection::inline(source, block.range()).map(Self::Inline),
@@ -2117,6 +2205,22 @@ impl BlockProjection {
                 .map(Self::TaskList)),
         }
     }
+}
+
+fn with_semantic_list_marker(
+    projection: Projection,
+    source: &TextSnapshot,
+    block: Block,
+) -> Result<Projection, ProjectionError> {
+    let marker = list_marker(source, block).ok_or(ProjectionError::InvalidListBlock {
+        range: block.range(),
+    })?;
+    let text: Arc<str> = if marker.ordered() {
+        Arc::from(format!("{}{}", marker.start(), marker.marker()))
+    } else {
+        Arc::from("•")
+    };
+    projection.with_leading_marker(marker.marker_range(), text, marker.indent())
 }
 
 fn line_ranges(source: &TextSnapshot, range: TextRange) -> Result<Vec<TextRange>, ProjectionError> {
@@ -2693,8 +2797,8 @@ mod tests {
     }
 
     #[test]
-    fn structural_block_projection_hides_heading_and_quote_prefixes() {
-        let source = "  ## **标题**\n\n> 引用\n> **继续**\n\n- item\n";
+    fn structural_block_projection_hides_prefixes_and_reveals_focus_source() {
+        let source = "  ## **标题**\n\n> 引用\n> **继续**\n\n- item\n\n12) ordered\n";
         let snapshot = TextBuffer::new(source).snapshot();
         let markdown = yu_markdown::parse(&snapshot);
 
@@ -2771,9 +2875,46 @@ mod tests {
         )
         .expect("list projection should build");
         assert_eq!(list_projection.kind(), BlockProjectionKind::List);
-        assert!(list_projection.visual().runs().iter().any(|run| {
-            run.kind() == VisualRunKind::Visible && run.source().start() == list.range().start()
-        }));
+        assert_eq!(projected_text(list_projection.visual()), "item\n");
+        let marker = list_projection
+            .visual()
+            .leading_marker()
+            .expect("semantic bullet");
+        assert_eq!(marker.text(), "•");
+        assert_eq!(
+            marker.source(),
+            yu_markdown::list_marker(&snapshot, list)
+                .expect("parser marker")
+                .marker_range()
+        );
+        let list_revealed = BlockProjection::from_block_with_definitions_and_reveal(
+            &snapshot,
+            list,
+            markdown.reference_definitions(),
+            TextRange::empty(ByteOffset::new(
+                source.find("item").expect("list text") as u64
+            )),
+        )
+        .expect("active list projection should build");
+        assert_eq!(projected_text(list_revealed.visual()), "- item\n");
+        assert!(list_revealed.visual().leading_marker().is_none());
+
+        let ordered = markdown.blocks().get(6).expect("ordered list block");
+        let ordered_projection = BlockProjection::from_block_with_definitions(
+            &snapshot,
+            ordered,
+            markdown.reference_definitions(),
+        )
+        .expect("ordered projection");
+        assert_eq!(projected_text(ordered_projection.visual()), "ordered\n");
+        assert_eq!(
+            ordered_projection
+                .visual()
+                .leading_marker()
+                .expect("semantic ordinal")
+                .text(),
+            "12)"
+        );
     }
 
     #[test]

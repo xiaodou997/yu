@@ -322,8 +322,12 @@ scene publication；其他平台可复用相同 source-backed scene contract。
 heading、blockquote 和普通 list 现在也由 parser 统一标记为 `Heading`、`BlockQuote`、`List`
 projection kind。heading 的 ATX 前缀与 blockquote 每行的 `>` 前缀由
 `yu_markdown::block_syntax_hidden_ranges` 提供 source-backed hidden ranges；Swift 不扫描这些
-delimiter。列表 bullet 与任务文本继续可见，后续 layout/scene 可用稳定 `BlockKind` metadata
-绘制真正的列表 marker。table 在 block kind 层仍保留为 paragraph，但已经有独立的
+delimiter。普通列表的 canonical projection 同样隐藏 parser-owned 首行 prefix，并通过
+`LeadingMarker` 保留精确 marker source range 与 parser-accepted leading-space count：unordered marker 投影为 `•`，ordered marker
+保留实际起始序号与 `.`/`)`。`yu-layout` 对该 marker 使用同一个 shaper/glyph atlas，建立
+hanging gutter 并将正文、换行与 hit-test 一起偏移；focus projection 则移除 semantic marker、
+显示真实 Markdown prefix，且不改变 source Revision。task list 继续使用原有 bullet + checkbox
+路径，避免 checkbox 与普通 marker replacement 混为一层。table 在 block kind 层仍保留为 paragraph，但已经有独立的
 source-backed `TableProjection` 与 stable projection tag；header、delimiter、body row 和
 cell ranges 通过 Rust/FFI 暴露。`TableProjection` 只保留 header/body cell 内容的
 source-backed visual runs，并隐藏 pipe、cell 周围空白、row line ending 和 parser-owned
@@ -712,7 +716,9 @@ bitmap 或 GPU handle。`DamageSet` 会合并相交/相邻区域，并在超出�
 
 shaped `yu-layout::LayoutSnapshot` 保留 painter-order 的 `GlyphPlacement`：face/glyph identity、
 source/visual cluster range、line index、x 和 baseline y。metrics-only layout 的 glyph list 为空，
-因此不会伪造 atlas identity。`SceneBuilder::append_layout` 在追加前检查 layout/scene
+因此不会伪造 atlas identity。semantic list marker 也会先经过 shaping，再以真实 marker source
+range 和零宽 visual identity 进入同一 glyph placement 流；正文使用 marker advance + 默认空隙
+形成的 hanging gutter。`SceneBuilder::append_layout` 在追加前检查 layout/scene
 Revision、font size 和 CPU `GlyphAtlas` entry，并在全部 placement 解析成功后按顺序生成 glyph
 primitive；失败不会留下部分 scene。
 

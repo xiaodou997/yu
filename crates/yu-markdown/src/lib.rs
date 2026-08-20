@@ -38,6 +38,52 @@ pub use table::{
 };
 pub use task::TaskMarker;
 
+/// Parser-owned source ranges and semantics for the first-line marker of a
+/// list item. `marker_range` covers only `-`, `*`, `+`, `1.` or `1)`, while
+/// `prefix_range` also includes leading indentation and following whitespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ListMarker {
+    ordered: bool,
+    marker: char,
+    start: u32,
+    indent: u8,
+    marker_range: TextRange,
+    prefix_range: TextRange,
+}
+
+impl ListMarker {
+    #[must_use]
+    pub const fn ordered(self) -> bool {
+        self.ordered
+    }
+
+    #[must_use]
+    pub const fn marker(self) -> char {
+        self.marker
+    }
+
+    #[must_use]
+    pub const fn start(self) -> u32 {
+        self.start
+    }
+
+    /// Returns the exact number of parser-accepted leading ASCII spaces.
+    #[must_use]
+    pub const fn indent(self) -> u8 {
+        self.indent
+    }
+
+    #[must_use]
+    pub const fn marker_range(self) -> TextRange {
+        self.marker_range
+    }
+
+    #[must_use]
+    pub const fn prefix_range(self) -> TextRange {
+        self.prefix_range
+    }
+}
+
 /// A lossless block view of one immutable text revision.
 #[derive(Clone, Debug)]
 pub struct MarkdownDocument {
@@ -850,14 +896,108 @@ pub fn task_marker(source: &TextSnapshot, block: Block) -> Option<TaskMarker> {
     task::parse_task_marker(source, block.range(), ordered)
 }
 
+/// Returns the parser-owned first-line list marker and structural prefix.
+///
+/// Consumers use the exact prefix range for source hiding and retain the
+/// marker range as the identity of a semantic bullet or ordinal. Parsing is
+/// chunk-aware and validates the source against the stable `BlockKind`
+/// metadata instead of asking projection/layout code to rescan Markdown.
+#[must_use]
+pub fn list_marker(source: &TextSnapshot, block: Block) -> Option<ListMarker> {
+    let (ordered, expected_marker, expected_start) = match block.kind() {
+        BlockKind::ListItem {
+            ordered,
+            marker,
+            start,
+            ..
+        }
+        | BlockKind::TaskListItem {
+            ordered,
+            marker,
+            start,
+            ..
+        } => (ordered, marker, start),
+        _ => return None,
+    };
+    let prefix_start = block.range().start();
+    let mut cursor = SourceByteCursor::new(source, block.range())?;
+    let mut next = cursor.next();
+    let mut leading_spaces = 0_usize;
+    while let Some((_, b' ')) = next {
+        leading_spaces = leading_spaces.saturating_add(1);
+        if leading_spaces > 3 {
+            return None;
+        }
+        next = cursor.next();
+    }
+
+    let marker_start = next?.0;
+    let (marker_end, parsed_marker, parsed_start, mut following) = if ordered {
+        let mut value = 0_u32;
+        let mut digits = 0_usize;
+        let mut current = next?;
+        while current.1.is_ascii_digit() {
+            value = value
+                .checked_mul(10)?
+                .checked_add(u32::from(current.1 - b'0'))?;
+            digits = digits.saturating_add(1);
+            if digits > 9 {
+                return None;
+            }
+            current = cursor.next()?;
+        }
+        if !matches!(current.1, b'.' | b')') {
+            return None;
+        }
+        (
+            current.0.checked_add(1)?,
+            char::from(current.1),
+            value,
+            cursor.next(),
+        )
+    } else {
+        let (position, byte) = next?;
+        if !matches!(byte, b'-' | b'+' | b'*') {
+            return None;
+        }
+        (position.checked_add(1)?, char::from(byte), 1, cursor.next())
+    };
+    if parsed_marker != expected_marker || parsed_start != expected_start {
+        return None;
+    }
+    if following.is_some_and(|(_, byte)| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n')) {
+        return None;
+    }
+    let mut prefix_end = marker_end;
+    while let Some((position, byte)) = following {
+        if !matches!(byte, b' ' | b'\t') {
+            break;
+        }
+        prefix_end = position.checked_add(1)?;
+        following = cursor.next();
+    }
+    Some(ListMarker {
+        ordered,
+        marker: parsed_marker,
+        start: parsed_start,
+        indent: u8::try_from(leading_spaces).ok()?,
+        marker_range: TextRange::new(
+            ByteOffset::try_from(marker_start).ok()?,
+            ByteOffset::try_from(marker_end).ok()?,
+        )?,
+        prefix_range: TextRange::new(prefix_start, ByteOffset::try_from(prefix_end).ok()?)?,
+    })
+}
+
 /// Returns parser-owned block syntax ranges that the visual projection may
 /// hide without re-parsing Markdown in a consumer.
 ///
-/// The ranges deliberately cover only structural prefixes. List bullets and
-/// task text remain source-visible; a later layout/scene layer can render the
-/// list marker from the stable `BlockKind` metadata. ATX heading and blockquote
-/// prefixes are hidden here because their visual counterparts are block-level
-/// style/indentation rather than editable text.
+/// The ranges deliberately cover only structural prefixes. Ordinary list
+/// prefixes are hidden because projection/layout retain a source-backed
+/// semantic marker; task-list prefixes remain visible because their checkbox
+/// is an additional control rather than a replacement for the bullet. ATX
+/// heading and blockquote prefixes are block-level style/indentation rather
+/// than editable text.
 #[must_use]
 pub fn block_syntax_hidden_ranges(source: &TextSnapshot, block: Block) -> Vec<TextRange> {
     let lines = block_line_ranges(source, block.range());
@@ -875,8 +1015,11 @@ pub fn block_syntax_hidden_ranges(source: &TextSnapshot, block: Block) -> Vec<Te
         | BlockKind::ReferenceDefinition
         | BlockKind::Paragraph
         | BlockKind::FencedCodeBlock { .. }
-        | BlockKind::ListItem { .. }
         | BlockKind::TaskListItem { .. } => Vec::new(),
+        BlockKind::ListItem { .. } => list_marker(source, block)
+            .map(ListMarker::prefix_range)
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -1495,7 +1638,7 @@ mod tests {
 
     #[test]
     fn block_syntax_hidden_ranges_are_parser_owned_and_line_local() {
-        let source = "  ## 标题\n\n> 引用\n  延续\n\n- [ ] 任务\n";
+        let source = "  ## 标题\n\n> 引用\n  延续\n\n- 普通\n\n- [ ] 任务\n";
         let buffer = TextBuffer::new(source);
         let snapshot = buffer.snapshot();
         let document = parse(&snapshot);
@@ -1518,8 +1661,62 @@ mod tests {
             "> "
         );
 
-        let task = document.blocks().get(4).expect("task block");
+        let list = document.blocks().get(4).expect("list block");
+        let list_ranges = block_syntax_hidden_ranges(&snapshot, list);
+        assert_eq!(list_ranges.len(), 1);
+        assert_eq!(
+            &snapshot.as_str()
+                [list_ranges[0].start().get() as usize..list_ranges[0].end().get() as usize],
+            "- "
+        );
+
+        let task = document.blocks().get(6).expect("task block");
         assert!(block_syntax_hidden_ranges(&snapshot, task).is_empty());
+    }
+
+    #[test]
+    fn list_markers_keep_token_and_prefix_ranges_distinct() {
+        let source = "  - item\n12) ordered\n+\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let document = parse(&snapshot);
+
+        let unordered = list_marker(&snapshot, document.blocks().get(0).expect("unordered list"))
+            .expect("unordered marker");
+        assert!(!unordered.ordered());
+        assert_eq!(unordered.marker(), '-');
+        assert_eq!(unordered.start(), 1);
+        assert_eq!(unordered.indent(), 2);
+        assert_eq!(
+            &source[unordered.marker_range().start().get() as usize
+                ..unordered.marker_range().end().get() as usize],
+            "-"
+        );
+        assert_eq!(
+            &source[unordered.prefix_range().start().get() as usize
+                ..unordered.prefix_range().end().get() as usize],
+            "  - "
+        );
+
+        let ordered = list_marker(&snapshot, document.blocks().get(1).expect("ordered list"))
+            .expect("ordered marker");
+        assert!(ordered.ordered());
+        assert_eq!(ordered.marker(), ')');
+        assert_eq!(ordered.start(), 12);
+        assert_eq!(ordered.indent(), 0);
+        assert_eq!(
+            &source[ordered.marker_range().start().get() as usize
+                ..ordered.marker_range().end().get() as usize],
+            "12)"
+        );
+        assert_eq!(
+            &source[ordered.prefix_range().start().get() as usize
+                ..ordered.prefix_range().end().get() as usize],
+            "12) "
+        );
+
+        let empty = list_marker(&snapshot, document.blocks().get(2).expect("empty list"))
+            .expect("empty marker");
+        assert_eq!(empty.marker_range(), empty.prefix_range());
     }
 
     #[test]
