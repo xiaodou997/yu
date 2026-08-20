@@ -29,7 +29,7 @@ elif [[ "${1:-}" == "--build" ]]; then
     swift build >/dev/null
 fi
 
-binary="$(swift build --show-bin-path)/YuMacDocumentHost"
+binary="$(swift build --show-bin-path)/Yu"
 if [[ ! -x "$binary" ]]; then
     print -r -- "未找到可执行文件 $binary，请先运行 $0 --build" >&2
     exit 1

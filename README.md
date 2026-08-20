@@ -74,8 +74,11 @@ crates/yu-assets        图片/嵌入资源的异步调度、LRU 与内存预算
 crates/yu-storage       UTF-8 Markdown 文档会话、原子保存、外部变更检测
 crates/yu-workspace     tab 与 document session 生命周期
 crates/yu-export        Revision-bound 剪贴板与 HTML 导出（comrak）
-platform/macos/         CoreText shaping、Metal 后端、CAMetalLayer 渲染循环
-                        Swift 只负责 NSWindow / 菜单 / NSTextInputClient / AX
+platform/macos/yu-font-macos    CoreText 字体目录、fallback、shaping、栅格化
+platform/macos/yu-render-macos  Metal device、CAMetalLayer、render plan 编码
+platform/macos/yu-storage-macos FSEvents 文件通知适配
+platform/macos/yu-shell-macos   Swift 产品壳：NSWindow / 菜单 /
+                                NSTextInputClient / Accessibility
 tools/yu-inspect        Markdown 结构检查 CLI
 tools/yu-bench          可重复的参考 workload
 ```
@@ -90,30 +93,35 @@ git clone git@github.com:xiaodou997/yu.git
 cd yu
 ```
 
-项目固定使用 Rust 1.97。macOS 输入实验还需要 Xcode/Swift 工具链。
+项目固定使用 Rust 1.97。构建 macOS 产品壳还需要 Xcode/Swift 工具链。
 
 ## 本地验证
 
 ```bash
+# Rust 核心
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo test -p yu-editor --test editor_behavior
-cargo test -p yu-render-macos -- --ignored  # 需要有 Metal device 的 macOS session
+python3 tools/check-ffi-header.py                # C 头文件与 FFI 实现一致性
+cargo test -p yu-render-macos -- --ignored       # 需要有 Metal device 的 macOS session
+
+# macOS 产品壳：构建并运行全部 headless self-check
+platform/macos/yu-shell-macos/run-self-checks.sh --build
+
+# 构建并打开 Yu.app
+open "$(platform/macos/yu-shell-macos/build-app.sh)"
+
+# 工具
 cargo run -p yu-inspect -- README.md
 cargo run --release -p yu-bench -- --size-mib 1 --iterations 20 --random-edits 2000 --retained-snapshots 8
-experiments/macos-text-input/build-rust-ffi.sh
-swift build --package-path experiments/macos-text-input
-experiments/macos-document-host/build-app.sh
 ```
 
-macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust static library；因此必须
-先运行 `build-rust-ffi.sh`，或直接使用会自动执行它的 `build-app.sh`。构建产物位于被忽略的
-`experiments/macos-text-input/.rust/`，不会提交到仓库。
+Swift 产品壳通过 `YuStorageFFI` C module 链接 Rust static library，因此必须先运行
+`build-rust-ffi.sh`，或使用会自动执行它的 `build-app.sh` / `run-self-checks.sh --build`。
+构建产物位于被忽略的 `.rust/` 与 `.build/`，不会提交到仓库。
 
-最小 macOS 文档 host 同样先构建 `yu-storage-ffi` static library，再由 Swift Package 链接；
-它只验证产品壳生命周期，暂不提供可编辑文本或完整 Markdown 投影。构建产物位于被忽略的
-`experiments/macos-document-host/.rust/` 和 `.build/`，不会提交到仓库。
+> **改动 FFI 边界后请用 `run-self-checks.sh --clean-build`。** SwiftPM 的增量构建
+> 可能不会重编引用已删类型的文件，本地看到「构建通过」而 CI 的干净检出会失败。
 
 ## 文档
 
@@ -128,11 +136,9 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 - [ADR 规范](docs/adr/README.md) — 编号从 0001 重新开始
 - [v1 归档](docs/archive-v1/README.md) — 183 篇 v1 ADR 与设计文档，全部 superseded
 
-### 实验记录
-
-- [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
-- [文本存储候选对比](docs/experiments/storage-candidates-2026-08-09.md)
-- [增量 Markdown 实验](docs/experiments/incremental-markdown-2026-08-09.md)
+v1 时期的风险实验记录已随其他 v1 文档归档到
+[`docs/archive-v1/experiments/`](docs/archive-v1/experiments/)，其中的命令路径
+反映当时的目录结构。
 
 个人笔记、临时调研和未整理草稿请放在本地 `.notes/`，该目录不会提交。
 
