@@ -14,8 +14,8 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{Affinity, ByteOffset, TextAnchor, TextRange};
 use yu_projection::{
-    BlockProjection, BlockQuotePresentation, LeadingMarker, Projection, ProjectionBias,
-    ProjectionError, VisualOffset, VisualRange, VisualRunKind, VisualRunStyle,
+    BlockProjection, BlockQuotePresentation, HeadingPresentation, LeadingMarker, Projection,
+    ProjectionBias, ProjectionError, VisualOffset, VisualRange, VisualRunKind, VisualRunStyle,
 };
 use yu_text::{ChangeSet, TextSnapshot};
 
@@ -218,6 +218,53 @@ fn shape_marker<S: ShapingProvider>(
 
 fn marker_gutter(marker_width: f32, indent: u8, default_advance: f32) -> f32 {
     marker_width + default_advance * (f32::from(indent) + 1.0)
+}
+
+#[derive(Clone, Copy)]
+struct HeadingMetrics {
+    level: u8,
+    font_scale: f32,
+    line_height_scale: f32,
+}
+
+fn heading_metrics(heading: HeadingPresentation) -> Result<HeadingMetrics, LayoutError> {
+    let (font_scale, line_height_scale) = match heading.level() {
+        1 => (2.0, 2.2),
+        2 => (1.7, 1.9),
+        3 => (1.45, 1.65),
+        4 => (1.25, 1.4),
+        5 => (1.1, 1.2),
+        6 => (1.0, 1.1),
+        _ => {
+            return Err(LayoutError::InvalidConfig(
+                "heading level must be between one and six",
+            ));
+        }
+    };
+    Ok(HeadingMetrics {
+        level: heading.level(),
+        font_scale,
+        line_height_scale,
+    })
+}
+
+fn heading_config(config: LayoutConfig, heading: HeadingMetrics) -> LayoutConfig {
+    LayoutConfig::new(
+        config.max_width,
+        config.line_height * heading.line_height_scale,
+    )
+    .with_default_advance(config.default_advance * heading.font_scale)
+}
+
+struct HeadingClusterMetrics<'a, M> {
+    metrics: &'a M,
+    scale: f32,
+}
+
+impl<M: ClusterMetrics> ClusterMetrics for HeadingClusterMetrics<'_, M> {
+    fn advance(&self, cluster: &str, _style: VisualRunStyle) -> f32 {
+        self.metrics.advance(cluster, VisualRunStyle::Strong) * self.scale
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -593,6 +640,7 @@ pub struct GlyphPlacement {
     x: f32,
     y: f32,
     style: VisualRunStyle,
+    font_scale: f32,
 }
 
 /// Source-backed geometry for one Markdown image. The destination/resource
@@ -670,6 +718,37 @@ pub struct BlockQuoteLayout {
     bars: Vec<LayoutRect>,
 }
 
+/// Parser-level heading typography retained with block-local layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadingLayout {
+    source: TextRange,
+    level: u8,
+    font_scale: f32,
+    line_height_scale: f32,
+}
+
+impl HeadingLayout {
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn level(self) -> u8 {
+        self.level
+    }
+
+    #[must_use]
+    pub const fn font_scale(self) -> f32 {
+        self.font_scale
+    }
+
+    #[must_use]
+    pub const fn line_height_scale(self) -> f32 {
+        self.line_height_scale
+    }
+}
+
 impl BlockQuoteLayout {
     #[must_use]
     pub const fn source(&self) -> TextRange {
@@ -727,6 +806,12 @@ impl GlyphPlacement {
     #[must_use]
     pub const fn style(self) -> VisualRunStyle {
         self.style
+    }
+
+    /// Returns the raster-size multiplier relative to the viewport base font.
+    #[must_use]
+    pub const fn font_scale(self) -> f32 {
+        self.font_scale
     }
 }
 
@@ -913,6 +998,7 @@ pub struct LayoutSnapshot {
     glyphs: Vec<GlyphPlacement>,
     images: Vec<ImagePlacement>,
     table: Option<TableLayoutSnapshot>,
+    heading: Option<HeadingLayout>,
     block_quote: Option<BlockQuoteLayout>,
 }
 
@@ -978,22 +1064,25 @@ impl LayoutSnapshot {
         metrics: &M,
     ) -> Result<Self, LayoutError> {
         config.validate()?;
+        let heading = projection.heading().map(heading_metrics).transpose()?;
+        let layout_config = heading.map_or(config, |heading| heading_config(config, heading));
+        layout_config.validate()?;
         let marker = projection.leading_marker();
         let marker_width = marker
             .map(|marker| measure_marker(marker.text(), metrics))
             .transpose()?;
-        let gutter = marker
-            .zip(marker_width)
-            .map(|(marker, width)| marker_gutter(width, marker.indent(), config.default_advance));
+        let gutter = marker.zip(marker_width).map(|(marker, width)| {
+            marker_gutter(width, marker.indent(), layout_config.default_advance)
+        });
         let quote = projection
             .block_quote()
-            .map(|quote| block_quote_metrics(quote, config))
+            .map(|quote| block_quote_metrics(quote, layout_config))
             .transpose()?;
         let total_gutter = gutter.unwrap_or(0.0) + quote.map_or(0.0, |quote| quote.gutter);
         let build_config = if total_gutter > 0.0 {
-            inset_config(config, total_gutter)
+            inset_config(layout_config, total_gutter)
         } else {
-            config
+            layout_config
         };
         let mut layout = Self {
             projection: projection.clone(),
@@ -1003,14 +1092,27 @@ impl LayoutSnapshot {
             glyphs: Vec::new(),
             images: Vec::new(),
             table: None,
+            heading: heading.map(|heading| HeadingLayout {
+                source: projection.source_range(),
+                level: heading.level,
+                font_scale: heading.font_scale,
+                line_height_scale: heading.line_height_scale,
+            }),
             block_quote: quote.map(|quote| BlockQuoteLayout {
                 source: projection.source_range(),
                 depth: quote.depth,
                 bars: Vec::new(),
             }),
         };
-        layout.build(metrics)?;
-        layout.config = config;
+        if let Some(heading) = heading {
+            layout.build(&HeadingClusterMetrics {
+                metrics,
+                scale: heading.font_scale,
+            })?;
+        } else {
+            layout.build(metrics)?;
+        }
+        layout.config = layout_config;
         if total_gutter > 0.0 {
             layout.apply_horizontal_inset(total_gutter)?;
         }
@@ -1028,23 +1130,26 @@ impl LayoutSnapshot {
         shaper: &S,
     ) -> Result<Self, LayoutError> {
         config.validate()?;
+        let heading = projection.heading().map(heading_metrics).transpose()?;
+        let layout_config = heading.map_or(config, |heading| heading_config(config, heading));
+        layout_config.validate()?;
         let marker = projection
             .leading_marker()
             .map(|marker| shape_marker(marker, shaper))
             .transpose()?;
-        let gutter = marker
-            .as_ref()
-            .map(|marker| marker_gutter(marker.advance, marker.indent, config.default_advance));
+        let gutter = marker.as_ref().map(|marker| {
+            marker_gutter(marker.advance, marker.indent, layout_config.default_advance)
+        });
         let quote = projection
             .block_quote()
-            .map(|quote| block_quote_metrics(quote, config))
+            .map(|quote| block_quote_metrics(quote, layout_config))
             .transpose()?;
         let quote_gutter = quote.map_or(0.0, |quote| quote.gutter);
         let total_gutter = gutter.unwrap_or(0.0) + quote_gutter;
         let build_config = if total_gutter > 0.0 {
-            inset_config(config, total_gutter)
+            inset_config(layout_config, total_gutter)
         } else {
-            config
+            layout_config
         };
         let mut layout = Self {
             projection: projection.clone(),
@@ -1054,14 +1159,24 @@ impl LayoutSnapshot {
             glyphs: Vec::new(),
             images: Vec::new(),
             table: None,
+            heading: heading.map(|heading| HeadingLayout {
+                source: projection.source_range(),
+                level: heading.level,
+                font_scale: heading.font_scale,
+                line_height_scale: heading.line_height_scale,
+            }),
             block_quote: quote.map(|quote| BlockQuoteLayout {
                 source: projection.source_range(),
                 depth: quote.depth,
                 bars: Vec::new(),
             }),
         };
-        layout.build_shaped(shaper)?;
-        layout.config = config;
+        layout.build_shaped(
+            shaper,
+            heading.map_or(1.0, |heading| heading.font_scale),
+            heading.is_some(),
+        )?;
+        layout.config = layout_config;
         if total_gutter > 0.0 {
             layout.apply_horizontal_inset(total_gutter)?;
         }
@@ -1127,6 +1242,12 @@ impl LayoutSnapshot {
     #[must_use]
     pub fn table(&self) -> Option<&TableLayoutSnapshot> {
         self.table.as_ref()
+    }
+
+    /// Returns parser-derived heading level and effective typography scales.
+    #[must_use]
+    pub const fn heading(&self) -> Option<HeadingLayout> {
+        self.heading
     }
 
     /// Returns semantic blockquote bar geometry, if this projection owns one.
@@ -1264,6 +1385,7 @@ impl LayoutSnapshot {
                     x: glyph_x,
                     y: glyph_y,
                     style: VisualRunStyle::Plain,
+                    font_scale: 1.0,
                 });
                 x += glyph.advance();
             }
@@ -1351,6 +1473,7 @@ impl LayoutSnapshot {
                     x: glyph.x,
                     y: glyph.y,
                     style: glyph.style,
+                    font_scale: glyph.font_scale,
                 })
             })
             .collect::<Result<Vec<_>, LayoutError>>()?;
@@ -1372,6 +1495,15 @@ impl LayoutSnapshot {
             .as_ref()
             .map(|table| table.map_through(changes, snapshot))
             .transpose()?;
+        let heading = self
+            .heading
+            .map(|heading| {
+                Ok::<HeadingLayout, LayoutError>(HeadingLayout {
+                    source: map_source_range(heading.source, changes)?,
+                    ..heading
+                })
+            })
+            .transpose()?;
         let block_quote = self
             .block_quote
             .as_ref()
@@ -1391,6 +1523,7 @@ impl LayoutSnapshot {
             glyphs,
             images,
             table,
+            heading,
             block_quote,
         }))
     }
@@ -1737,7 +1870,15 @@ impl LayoutSnapshot {
         Ok(())
     }
 
-    fn build_shaped<S: ShapingProvider>(&mut self, shaper: &S) -> Result<(), LayoutError> {
+    fn build_shaped<S: ShapingProvider>(
+        &mut self,
+        shaper: &S,
+        font_scale: f32,
+        force_bold: bool,
+    ) -> Result<(), LayoutError> {
+        if !font_scale.is_finite() || font_scale <= 0.0 {
+            return Err(LayoutError::InvalidMetrics(font_scale.to_bits()));
+        }
         let source_range = self.projection.source_range();
         let runs = self.projection.runs().to_vec();
         let mut line_source_start = source_range.start();
@@ -1788,8 +1929,13 @@ impl LayoutSnapshot {
                 .text_for_run(run)
                 .map_err(LayoutError::Projection)?;
             let shape_source = self.projection.shape_source_range_for_run(run);
+            let shape_style = if force_bold {
+                VisualRunStyle::Strong
+            } else {
+                run.style()
+            };
             let shaped = shaper
-                .shape(&text, shape_source, run.style())
+                .shape_scaled(&text, shape_source, shape_style, font_scale)
                 .map_err(|error| LayoutError::Shaping(error.to_string()))?;
             if shaped.source() != shape_source {
                 return Err(LayoutError::Shaping(
@@ -1909,6 +2055,7 @@ impl LayoutSnapshot {
                         x: glyph_x,
                         y: glyph_y,
                         style: glyph_run.style(),
+                        font_scale,
                     });
                     self.clusters.push(VisualCluster {
                         source: canonical_source,
@@ -2270,6 +2417,51 @@ mod tests {
             .hit_test(LayoutPoint::new(1.0, 0.0))
             .expect("marker gutter hit");
         assert_eq!(hit.source(), ByteOffset::ZERO);
+    }
+
+    #[test]
+    fn heading_level_controls_line_metrics_bold_shaping_and_raster_scale() {
+        let h1 = first_block_projection("# title\n");
+        let h6 = first_block_projection("###### title\n");
+        let config = LayoutConfig::new(80.0, 10.0).with_default_advance(2.0);
+        let h1_metrics = LayoutSnapshot::from_block_projection(&h1, config).expect("H1 layout");
+        let h6_metrics = LayoutSnapshot::from_block_projection(&h6, config).expect("H6 layout");
+
+        let h1_heading = h1_metrics.heading().expect("H1 typography");
+        let h6_heading = h6_metrics.heading().expect("H6 typography");
+        assert_eq!(h1_heading.level(), 1);
+        assert_eq!(h1_heading.source(), h1.visual().source_range());
+        assert_eq!(h1_heading.font_scale(), 2.0);
+        assert_eq!(h1_heading.line_height_scale(), 2.2);
+        assert_eq!(h6_heading.level(), 6);
+        assert_eq!(h6_heading.font_scale(), 1.0);
+        assert_eq!(h6_heading.line_height_scale(), 1.1);
+        assert_eq!(h1_metrics.config().line_height(), 22.0);
+        assert_eq!(h6_metrics.config().line_height(), 11.0);
+        assert_eq!(h1_metrics.clusters()[0].width(), 4.0);
+        assert_eq!(h6_metrics.clusters()[0].width(), 2.0);
+
+        let shaped = LayoutSnapshot::from_block_projection_with_shaper(
+            &h1,
+            config,
+            &TestShaper {
+                shape: TestShape::FixedGrapheme(2.0),
+            },
+        )
+        .expect("shaped H1 layout");
+        assert!(
+            shaped
+                .glyphs()
+                .iter()
+                .all(|glyph| glyph.style() == VisualRunStyle::Strong)
+        );
+        assert!(
+            shaped
+                .glyphs()
+                .iter()
+                .all(|glyph| glyph.font_scale() == 2.0)
+        );
+        assert_eq!(shaped.clusters()[0].width(), 4.0);
     }
 
     #[test]

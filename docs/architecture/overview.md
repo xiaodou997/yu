@@ -322,7 +322,11 @@ scene publication；其他平台可复用相同 source-backed scene contract。
 heading、blockquote 和普通 list 现在也由 parser 统一标记为 `Heading`、`BlockQuote`、`List`
 projection kind。heading 的 ATX 前缀与 blockquote 每行的 `>` 前缀由
 `yu_markdown::block_syntax_hidden_ranges` 提供 source-backed hidden ranges；Swift 不扫描这些
-delimiter。blockquote projection 额外保留完整 block source、parser-owned physical prefix ranges
+delimiter。heading projection 同时保留完整 source、精确 prefix 与 H1-H6 level；`yu-layout` 将
+level 映射为 source-neutral 的 font/line-height scale，并通过 Bold shaping 生成 glyph。每个
+`GlyphPlacement` 携带实际 raster scale，因此同一 retained frame 可以同时引用标题和正文尺寸的
+atlas entry；CoreText、storage FFI 与 scene 都只消费该 scale，不重新判断 Markdown level。focus
+reveal 显示真实 `#` 时继续保留相同 heading metadata 与字号。见 ADR 0183。blockquote projection 额外保留完整 block source、parser-owned physical prefix ranges
 和 quote depth；`yu-layout` 按 depth 统一扣减正文可用宽度，并让换行、图片、caret、hit-test 与
 引用缩进共享同一坐标系。每一级引用线作为 glyph 前的 source-backed `BlockQuotePrimitive` 进入
 retained scene，并由 renderer 降为既有 solid-fill command；focus reveal 只改变 delimiter 显隐，

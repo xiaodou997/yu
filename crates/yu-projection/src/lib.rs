@@ -263,6 +263,9 @@ pub enum ProjectionError {
     InvalidListBlock {
         range: TextRange,
     },
+    InvalidHeadingBlock {
+        range: TextRange,
+    },
     InvalidBlockQuoteBlock {
         range: TextRange,
     },
@@ -318,6 +321,9 @@ impl fmt::Display for ProjectionError {
             Self::InvalidListBlock { range } => {
                 write!(formatter, "invalid list block range {range:?}")
             }
+            Self::InvalidHeadingBlock { range } => {
+                write!(formatter, "invalid heading block range {range:?}")
+            }
             Self::InvalidBlockQuoteBlock { range } => {
                 write!(formatter, "invalid blockquote block range {range:?}")
             }
@@ -354,6 +360,7 @@ impl Error for ProjectionError {
             | Self::InvalidCodeBlock { .. }
             | Self::InvalidTaskListBlock { .. }
             | Self::InvalidListBlock { .. }
+            | Self::InvalidHeadingBlock { .. }
             | Self::InvalidBlockQuoteBlock { .. }
             | Self::CompositionRangeOutsideProjection { .. }
             | Self::CompositionSelectionOutOfBounds { .. }
@@ -391,6 +398,7 @@ pub struct Projection {
     visual_len: VisualOffset,
     composition: Option<CompositionState>,
     leading_marker: Option<LeadingMarker>,
+    heading: Option<HeadingPresentation>,
     block_quote: Option<BlockQuotePresentation>,
 }
 
@@ -418,6 +426,31 @@ impl LeadingMarker {
     #[must_use]
     pub const fn indent(&self) -> u8 {
         self.indent
+    }
+}
+
+/// Parser-owned heading metadata retained independently of delimiter reveal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadingPresentation {
+    source: TextRange,
+    prefix: TextRange,
+    level: u8,
+}
+
+impl HeadingPresentation {
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn prefix(self) -> TextRange {
+        self.prefix
+    }
+
+    #[must_use]
+    pub const fn level(self) -> u8 {
+        self.level
     }
 }
 
@@ -639,6 +672,7 @@ impl Projection {
             visual_len,
             composition: None,
             leading_marker: None,
+            heading: None,
             block_quote: None,
         })
     }
@@ -683,6 +717,28 @@ impl Projection {
             source,
             prefixes: prefixes.into(),
             depth,
+        });
+        Ok(self)
+    }
+
+    fn with_heading(
+        mut self,
+        source: TextRange,
+        prefix: TextRange,
+        level: u8,
+    ) -> Result<Self, ProjectionError> {
+        if !(1..=6).contains(&level)
+            || source != self.source_range
+            || prefix.start() < source.start()
+            || prefix.end() > source.end()
+            || prefix.is_empty()
+        {
+            return Err(ProjectionError::InvalidHeadingBlock { range: source });
+        }
+        self.heading = Some(HeadingPresentation {
+            source,
+            prefix,
+            level,
         });
         Ok(self)
     }
@@ -763,6 +819,7 @@ impl Projection {
                 replacement_range.end() <= marker.source.start()
                     || marker.source.end() <= replacement_range.start()
             }),
+            heading: self.heading,
             block_quote: self.block_quote.clone(),
         })
     }
@@ -849,6 +906,16 @@ impl Projection {
                     })
                 })
                 .transpose()?,
+            heading: self
+                .heading
+                .map(|heading| {
+                    Ok::<HeadingPresentation, ProjectionError>(HeadingPresentation {
+                        source: map_range(heading.source, changes)?,
+                        prefix: map_range(heading.prefix, changes)?,
+                        level: heading.level,
+                    })
+                })
+                .transpose()?,
             block_quote: self
                 .block_quote
                 .as_ref()
@@ -896,6 +963,12 @@ impl Projection {
     #[must_use]
     pub fn leading_marker(&self) -> Option<&LeadingMarker> {
         self.leading_marker.as_ref()
+    }
+
+    /// Returns parser-owned heading level and prefix identity.
+    #[must_use]
+    pub const fn heading(&self) -> Option<HeadingPresentation> {
+        self.heading
     }
 
     /// Returns parser-owned semantic blockquote metadata for this projection.
@@ -2175,8 +2248,14 @@ impl BlockProjection {
                 }
             }
         }?;
-        if kind == BlockProjectionKind::BlockQuote {
-            projection = with_block_quote_presentation(projection, block, hidden)?;
+        match kind {
+            BlockProjectionKind::Heading => {
+                projection = with_heading_presentation(projection, block, hidden)?;
+            }
+            BlockProjectionKind::BlockQuote => {
+                projection = with_block_quote_presentation(projection, block, hidden)?;
+            }
+            _ => {}
         }
         Ok(match kind {
             BlockProjectionKind::Heading => Self::Heading(projection),
@@ -2196,11 +2275,9 @@ impl BlockProjection {
             }
             BlockKind::AtxHeading { .. } => {
                 let inline = parse_inline(source, block.range())?;
-                let projection = Projection::from_inline_with_hidden(
-                    &inline,
-                    &yu_markdown::block_syntax_hidden_ranges(source, block),
-                )?;
-                Ok(Self::Heading(projection))
+                let hidden = yu_markdown::block_syntax_hidden_ranges(source, block);
+                let projection = Projection::from_inline_with_hidden(&inline, &hidden)?;
+                with_heading_presentation(projection, block, hidden).map(Self::Heading)
             }
             BlockKind::BlockQuote { .. } => {
                 let inline = parse_inline(source, block.range())?;
@@ -2319,6 +2396,24 @@ fn with_block_quote_presentation(
         });
     };
     projection.with_block_quote(block.range(), prefixes, depth)
+}
+
+fn with_heading_presentation(
+    projection: Projection,
+    block: Block,
+    prefixes: Vec<TextRange>,
+) -> Result<Projection, ProjectionError> {
+    let BlockKind::AtxHeading { level } = block.kind() else {
+        return Err(ProjectionError::InvalidHeadingBlock {
+            range: block.range(),
+        });
+    };
+    let [prefix] = prefixes.as_slice() else {
+        return Err(ProjectionError::InvalidHeadingBlock {
+            range: block.range(),
+        });
+    };
+    projection.with_heading(block.range(), *prefix, level)
 }
 
 fn line_ranges(source: &TextSnapshot, range: TextRange) -> Result<Vec<TextRange>, ProjectionError> {
@@ -2908,6 +3003,16 @@ mod tests {
         )
         .expect("heading projection should build");
         assert_eq!(heading_projection.kind(), BlockProjectionKind::Heading);
+        let heading_presentation = heading_projection
+            .visual()
+            .heading()
+            .expect("heading presentation");
+        assert_eq!(heading_presentation.source(), heading.range());
+        assert_eq!(heading_presentation.level(), 2);
+        assert_eq!(
+            heading_presentation.prefix(),
+            yu_markdown::block_syntax_hidden_ranges(&snapshot, heading)[0]
+        );
         assert_eq!(
             heading_projection
                 .visual()
@@ -2936,6 +3041,10 @@ mod tests {
         )
         .expect("active heading projection should build");
         assert_eq!(projected_text(heading_revealed.visual()), "  ## **标题**\n");
+        assert_eq!(
+            heading_revealed.visual().heading(),
+            Some(heading_presentation)
+        );
 
         let quote = markdown.blocks().get(2).expect("quote block");
         let quote_projection = BlockProjection::from_block_with_definitions(

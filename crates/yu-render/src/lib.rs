@@ -571,8 +571,12 @@ mod tests {
         let mut index = 0_usize;
         for layout in layouts {
             for placement in layout.glyphs() {
-                let key = GlyphRasterKey::new(placement.face(), placement.glyph(), font_size)
-                    .expect("key");
+                let key = GlyphRasterKey::new(
+                    placement.face(),
+                    placement.glyph(),
+                    font_size * placement.font_scale(),
+                )
+                .expect("key");
                 if atlas.entry(key).is_none() {
                     let value = u8::try_from(index + 1).expect("test glyph value");
                     let bitmap = GlyphBitmap::new(2, 3, 2, vec![value; 6]).expect("bitmap");

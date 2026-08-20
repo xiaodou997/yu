@@ -942,6 +942,22 @@ impl ShapingProvider for CoreTextShaper {
         let request = ShapeRequest::new(text, source, style, self.request.clone())?;
         <Self as TextShaper>::shape(self, &request)
     }
+
+    fn shape_scaled(
+        &self,
+        text: &str,
+        source: TextRange,
+        style: VisualRunStyle,
+        scale: f32,
+    ) -> Result<ShapedText, Self::Error> {
+        let size = self.request.size() * scale;
+        let font = FontRequest::new(self.request.family(), size)
+            .map_err(|error| ShapeError::Backend(Arc::from(error.to_string())))?
+            .with_weight(self.request.weight())
+            .with_slant(self.request.slant());
+        let request = ShapeRequest::new(text, source, style, font)?;
+        <Self as TextShaper>::shape(self, &request)
+    }
 }
 
 #[cfg(target_os = "macos")]

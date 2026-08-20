@@ -1490,8 +1490,12 @@ mod tests {
                 .block_layout_for_visual_state_with_shaper(block.index(), config, shaper)
                 .expect("layout");
             for placement in layout.glyphs() {
-                let key = GlyphRasterKey::new(placement.face(), placement.glyph(), font_size)
-                    .expect("glyph key");
+                let key = GlyphRasterKey::new(
+                    placement.face(),
+                    placement.glyph(),
+                    font_size * placement.font_scale(),
+                )
+                .expect("glyph key");
                 if atlas.entry(key).is_none() {
                     let glyph = RasterizedGlyph::new(
                         key,
@@ -1509,7 +1513,7 @@ mod tests {
     fn editor_viewport_is_assembled_into_revision_bound_render_plan() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportRect::new(0.0, 200.0);
         let mut document = EditorDocument::new("# title\n\nhello **world**");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -1524,7 +1528,7 @@ mod tests {
             viewport,
             &shaper,
             font_size,
-            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rect::new(0.0, 0.0, 240.0, 200.0).expect("scene viewport"),
             &atlas,
             Rgba8::black(),
         )
@@ -1610,6 +1614,57 @@ mod tests {
         };
         assert_eq!(bounds, quote.bounds());
         assert_eq!(color, quote.color());
+    }
+
+    #[test]
+    fn heading_and_body_share_a_frame_with_distinct_raster_sizes() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 180.0);
+        let mut document = EditorDocument::new("# title\n\nplain");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 180.0).expect("scene viewport"),
+            Rgba8::black(),
+        );
+        let mut plans = RenderPlanBuilder::new();
+        let frame =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("mixed typography frame");
+
+        let glyph_sizes = frame
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Glyph(glyph) => Some(glyph.key().size()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let heading = glyph_sizes
+            .iter()
+            .position(|size| *size == 28.0)
+            .expect("H1 raster size");
+        let body = glyph_sizes
+            .iter()
+            .position(|size| *size == 14.0)
+            .expect("body raster size");
+        assert!(heading < body);
+        assert_eq!(
+            frame.plan().commands().len(),
+            frame.scene().scene().primitives().len()
+        );
+        assert!(frame.scene().input().blocks()[0].height() > 20.0);
     }
 
     #[test]

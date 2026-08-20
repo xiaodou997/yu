@@ -634,6 +634,22 @@ impl ShapingProvider for FontShaper {
         let request = ShapeRequest::new(text, source, style, self.request.clone())?;
         self.backend.shape(&request)
     }
+
+    fn shape_scaled(
+        &self,
+        text: &str,
+        source: TextRange,
+        style: VisualRunStyle,
+        scale: f32,
+    ) -> Result<ShapedText, Self::Error> {
+        let size = self.request.size * scale;
+        let font = FontRequest::new(self.request.family.clone(), size)
+            .map_err(|error| ShapeError::Backend(Arc::from(error.to_string())))?
+            .with_weight(self.request.weight)
+            .with_slant(self.request.slant);
+        let request = ShapeRequest::new(text, source, style, font)?;
+        self.backend.shape(&request)
+    }
 }
 
 /// A layout-facing advance provider backed by the same fallback database.
@@ -792,5 +808,24 @@ mod tests {
         assert_eq!(layout.lines().len(), 1);
         assert_eq!(layout.lines()[0].width(), 2.0);
         assert_eq!(layout.clusters().len(), 2);
+    }
+
+    #[test]
+    fn font_shaper_shapes_scaled_requests_at_the_target_size() {
+        let shaper = FontShaper::new(
+            database(),
+            FontRequest::new("Latin", 2.0).expect("request should be valid"),
+        )
+        .expect("shaper should build");
+        let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1)).expect("source range");
+        let body = ShapingProvider::shape(&shaper, "a", source, VisualRunStyle::Plain)
+            .expect("body shaping");
+        let heading =
+            ShapingProvider::shape_scaled(&shaper, "a", source, VisualRunStyle::Strong, 2.0)
+                .expect("heading shaping");
+
+        assert_eq!(body.advance(), 1.0);
+        assert_eq!(heading.advance(), 2.0);
+        assert_eq!(heading.runs()[0].style(), VisualRunStyle::Strong);
     }
 }
