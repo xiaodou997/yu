@@ -2649,6 +2649,12 @@ fn build_native_commands(
     embedded_image_sizes: &BTreeMap<(u64, u32), (u32, u32)>,
 ) -> Result<Vec<NativeDrawCommand>, MetalRenderError> {
     let viewport = plan.viewport();
+    let raster_scale = plan.raster_scale();
+    if !raster_scale.is_finite() || raster_scale <= 0.0 {
+        return Err(MetalRenderError::InvalidRenderCommand(
+            "render plan raster scale must be finite and positive",
+        ));
+    }
     let mut commands = Vec::with_capacity(plan.commands().len());
     for command in plan.commands() {
         match *command {
@@ -2721,10 +2727,14 @@ fn build_native_commands(
                 if rect.width() == 0 || rect.height() == 0 {
                     continue;
                 }
-                let x = origin.x() + metrics.bearing_x() - viewport.x();
-                let y = origin.y() - metrics.bearing_y() - viewport.y();
-                let width = rect.width() as f32;
-                let height = rect.height() as f32;
+                // atlas 矩形与 bearing 都是按 `font_size × raster_scale`
+                // 栅格化出来的物理像素；除回逻辑坐标后，quad 才与 shader 使用
+                // 的 document-space 单位一致，纹理也才能与 Retina 的物理像素
+                // 1:1 对应而不被拉伸。
+                let x = origin.x() + metrics.bearing_x() / raster_scale - viewport.x();
+                let y = origin.y() - metrics.bearing_y() / raster_scale - viewport.y();
+                let width = rect.width() as f32 / raster_scale;
+                let height = rect.height() as f32 / raster_scale;
                 if !x.is_finite() || !y.is_finite() {
                     return Err(MetalRenderError::InvalidRenderCommand(
                         "glyph origin is not finite",
@@ -3383,6 +3393,78 @@ mod tests {
 
         let culled = cull_native_commands(vec![command], &damage);
         assert_eq!(culled, vec![command]);
+    }
+
+    /// glyph quad 必须按 raster scale 除回逻辑坐标。
+    ///
+    /// 字形按 `font_size × raster_scale` 栅格化，atlas 矩形与 bearing 因此是
+    /// 物理像素。若直接当逻辑坐标用，Retina 上字号会翻倍；若不提高取样倍率，
+    /// 1x 纹理又会被拉伸到 2x 而发虚。两者必须成对：取样乘、绘制除。
+    #[test]
+    fn glyph_quad_is_divided_back_to_logical_coordinates() {
+        use std::collections::BTreeMap;
+        use yu_core::Revision;
+        use yu_font::{
+            FontFaceId, GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphId, GlyphMetrics,
+            GlyphRasterKey, RasterizedGlyph,
+        };
+        use yu_render::RenderPlanBuilder;
+        use yu_scene::{GlyphPrimitive, Point, Rect, SceneBuilder};
+
+        // 2x 取样：24x12 物理像素的位图对应 12x6 逻辑点。
+        let key =
+            GlyphRasterKey::new(FontFaceId::from_raw(1), GlyphId::from_raw(7), 32.0).expect("key");
+        let bitmap = GlyphBitmap::new(24, 12, 24, vec![255; 24 * 12]).expect("bitmap");
+        let metrics = GlyphMetrics::new(2.0, 20.0, 30.0).expect("metrics");
+        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(64, 64, 1).expect("config"));
+        let entry = atlas
+            .insert(RasterizedGlyph::new(key, metrics, bitmap))
+            .expect("entry");
+
+        let viewport = Rect::new(0.0, 0.0, 200.0, 100.0).expect("viewport");
+        let mut scene = SceneBuilder::new(Revision::INITIAL, viewport).expect("scene");
+        scene
+            .glyph(GlyphPrimitive::new(
+                entry,
+                Point::new(50.0, 60.0),
+                Rgba8::white(),
+            ))
+            .expect("glyph");
+        let scene = scene.finish();
+
+        let mut builder = RenderPlanBuilder::new();
+        builder.set_raster_scale(2.0).expect("raster scale");
+        let plan = builder.build(&scene, &atlas).expect("plan");
+        assert_eq!(plan.raster_scale(), 2.0);
+
+        let commands = build_native_commands(
+            &plan,
+            &atlas_page_sizes(&plan),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("commands");
+        let glyph = commands
+            .iter()
+            .find(|command| command.kind == DRAW_GLYPH)
+            .expect("glyph command");
+
+        // 24x12 物理像素 ÷ 2 = 12x6 逻辑点。
+        assert_eq!(glyph.width, 12.0);
+        assert_eq!(glyph.height, 6.0);
+        // bearing 同样是物理像素：x = 50 + 2/2，y = 60 - 20/2。
+        assert_eq!(glyph.x, 51.0);
+        assert_eq!(glyph.y, 50.0);
+    }
+
+    /// 从 plan 的上传页推导页尺寸，供 build_native_commands 校验 UV 范围。
+    fn atlas_page_sizes(
+        plan: &yu_render::RenderPlan,
+    ) -> std::collections::BTreeMap<u32, (u32, u32)> {
+        plan.uploads()
+            .iter()
+            .map(|upload| (upload.page(), (upload.width(), upload.height())))
+            .collect()
     }
 
     /// 滚动必须触发整帧重绘。

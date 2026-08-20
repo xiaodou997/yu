@@ -40,6 +40,13 @@ pub struct GlyphRasterKey {
     face: FontFaceId,
     glyph: GlyphId,
     size_bits: u32,
+    /// 栅格化分辨率相对逻辑尺寸的倍率。
+    ///
+    /// 必须与 `size` 分开保存，不能折进 `size`：系统字体有 optical size 变体
+    /// （macOS 上 16pt 选 PingFang UI **Text**、32pt 选 **Display**），把倍率
+    /// 乘进 size 会选到另一个字体，glyph id 的含义随之改变。字体选择用
+    /// `size`，放大靠绘制时的变换矩阵。
+    raster_scale_bits: u32,
 }
 
 impl GlyphRasterKey {
@@ -51,7 +58,22 @@ impl GlyphRasterKey {
             face,
             glyph,
             size_bits: size.to_bits(),
+            raster_scale_bits: 1.0_f32.to_bits(),
         })
+    }
+
+    /// 声明栅格化倍率。倍率参与缓存键，因此不同 DPI 的位图不会互相覆盖。
+    pub fn with_raster_scale(mut self, scale: f32) -> Result<Self, RasterDataError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(RasterDataError::InvalidSize(scale.to_bits()));
+        }
+        self.raster_scale_bits = scale.to_bits();
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn raster_scale(self) -> f32 {
+        f32::from_bits(self.raster_scale_bits)
     }
 
     #[must_use]
@@ -589,6 +611,13 @@ impl AtlasPage {
 #[derive(Clone, Debug)]
 pub struct GlyphAtlas {
     config: GlyphAtlasConfig,
+    /// 本 atlas 中所有位图的栅格化倍率。
+    ///
+    /// 由 atlas 自己持有，而不是让每个调用方各自记住：查询方（scene 组装）
+    /// 只知道逻辑字号，不该被迫了解渲染 DPI。`entry`/`get` 会把查询键规范化
+    /// 到这个倍率，插入时则要求键与之一致，避免同一字形按不同 DPI 存出两份
+    /// 而互相查不到。
+    raster_scale: f32,
     pages: Vec<AtlasPage>,
     entries: HashMap<GlyphRasterKey, AtlasEntry>,
     glyphs: HashMap<GlyphRasterKey, Arc<RasterizedGlyph>>,
@@ -601,6 +630,7 @@ impl GlyphAtlas {
     pub fn new(config: GlyphAtlasConfig) -> Self {
         Self {
             config,
+            raster_scale: 1.0,
             pages: Vec::new(),
             entries: HashMap::new(),
             glyphs: HashMap::new(),
@@ -614,14 +644,33 @@ impl GlyphAtlas {
         self.config
     }
 
+    /// 声明本 atlas 的栅格化倍率。非有限或非正值会被忽略。
+    #[must_use]
+    pub fn with_raster_scale(mut self, scale: f32) -> Self {
+        if scale.is_finite() && scale > 0.0 {
+            self.raster_scale = scale;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn raster_scale(&self) -> f32 {
+        self.raster_scale
+    }
+
+    /// 把查询键规范化到本 atlas 的倍率。
+    fn normalized(&self, key: GlyphRasterKey) -> GlyphRasterKey {
+        key.with_raster_scale(self.raster_scale).unwrap_or(key)
+    }
+
     #[must_use]
     pub fn get(&self, key: GlyphRasterKey) -> Option<Arc<RasterizedGlyph>> {
-        self.glyphs.get(&key).cloned()
+        self.glyphs.get(&self.normalized(key)).cloned()
     }
 
     #[must_use]
     pub fn entry(&self, key: GlyphRasterKey) -> Option<AtlasEntry> {
-        self.entries.get(&key).copied()
+        self.entries.get(&self.normalized(key)).copied()
     }
 
     #[must_use]

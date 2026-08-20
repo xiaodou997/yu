@@ -38,8 +38,8 @@ use yu_projection::VisualRunStyle;
 
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{
-    CFArray, CFAttributedString, CFDictionary, CFRange, CFRetained, CFString, CGPoint, CGRect,
-    CGSize,
+    CFArray, CFAttributedString, CFDictionary, CFRange, CFRetained, CFString, CGAffineTransform,
+    CGPoint, CGRect, CGSize,
 };
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::{
@@ -762,7 +762,8 @@ impl GlyphRasterizer for CoreTextGlyphRasterizer {
             return Ok(metrics);
         }
 
-        let font = self.font_for_face(key.face(), key.size())?;
+        // 度量是逻辑量，与栅格分辨率无关。
+        let font = self.font_for_face(key.face(), key.size(), 1.0)?;
         let metrics = FontMetricsSnapshot::new(
             unsafe { font.ascent() } as f32,
             unsafe { font.descent() } as f32,
@@ -789,7 +790,7 @@ impl GlyphRasterizer for CoreTextGlyphRasterizer {
 
         let glyph = u16::try_from(key.glyph().get())
             .map_err(|_| CoreTextRasterError::InvalidGlyphId(key.glyph().get()))?;
-        let font = self.font_for_face(key.face(), key.size())?;
+        let font = self.font_for_face(key.face(), key.size(), key.raster_scale())?;
         let (bounds, advance) = native_glyph_geometry(&font, glyph)?;
         let (bitmap, bearing_x, bearing_y) = rasterize_glyph(&font, glyph, bounds)?;
         let metrics = GlyphMetrics::new(bearing_x, bearing_y, advance)
@@ -839,6 +840,7 @@ impl CoreTextGlyphRasterizer {
         &self,
         face: FontFaceId,
         size: f32,
+        raster_scale: f32,
     ) -> Result<CFRetained<CTFont>, CoreTextRasterError> {
         let entry = self
             .faces
@@ -850,11 +852,14 @@ impl CoreTextGlyphRasterizer {
 
         // 复用 shaping 侧构造 base font 的同一个函数：两条路径各写一遍迟早
         // 会分叉，而分叉的表现就是画出错误字形。
+        //
+        // size 必须是**逻辑**尺寸，栅格倍率只进变换矩阵——否则会选到另一个
+        // optical size 变体（PingFang UI Text ↔ Display），glyph id 随之失配。
         let request = FontRequest::new(&*self.requested_family, size)
             .map_err(|_| CoreTextRasterError::FontUnavailable)?
             .with_weight(entry.weight)
             .with_slant(entry.slant);
-        let base = create_core_text_font(&request, self.font_source)
+        let base = create_core_text_font_scaled(&request, self.font_source, raster_scale)
             .map_err(|_| CoreTextRasterError::FontUnavailable)?;
 
         let font = if entry.sample.is_empty() {
@@ -1065,9 +1070,15 @@ fn style_font_request(request: &FontRequest, style: VisualRunStyle) -> FontReque
 }
 
 #[cfg(target_os = "macos")]
-fn create_core_text_font(
+/// 构造 base font。
+///
+/// `raster_scale` 只作用于绘制变换矩阵，**不能**乘进 size：系统字体有 optical
+/// size 变体（macOS 上 16pt 选 PingFang UI Text、32pt 选 Display），改 size 会
+/// 选到另一个字体，其 glyph id 与 shaping 时的不再对应。
+fn create_core_text_font_scaled(
     request: &FontRequest,
     source: CoreTextFontSource,
+    raster_scale: f32,
 ) -> Result<CFRetained<CTFont>, CoreTextShapeError> {
     let base = match source {
         CoreTextFontSource::RequestedFamily => {
@@ -1087,10 +1098,31 @@ fn create_core_text_font(
     if request.slant() != FontSlant::Upright {
         value.insert(CTFontSymbolicTraits::TraitItalic);
     }
+    let matrix = CGAffineTransform {
+        a: f64::from(raster_scale),
+        b: 0.0,
+        c: 0.0,
+        d: f64::from(raster_scale),
+        tx: 0.0,
+        ty: 0.0,
+    };
+    let matrix_ptr = if (raster_scale - 1.0).abs() < f32::EPSILON {
+        std::ptr::null()
+    } else {
+        std::ptr::from_ref(&matrix)
+    };
     Ok(unsafe {
-        base.copy_with_symbolic_traits(request.size() as _, std::ptr::null(), value, mask)
+        base.copy_with_symbolic_traits(request.size() as _, matrix_ptr, value, mask)
             .unwrap_or(base)
     })
+}
+
+#[cfg(target_os = "macos")]
+fn create_core_text_font(
+    request: &FontRequest,
+    source: CoreTextFontSource,
+) -> Result<CFRetained<CTFont>, CoreTextShapeError> {
+    create_core_text_font_scaled(request, source, 1.0)
 }
 
 #[cfg(target_os = "macos")]
