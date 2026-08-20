@@ -10,119 +10,78 @@ macOS、Windows 与 Linux 上提供低资源、低延迟的编辑体验。
 macOS 是第一个产品级平台。共享编辑器内核使用 Rust；平台输入、窗口、Accessibility 等
 能力允许使用 Swift、Objective-C 或其他适合该平台的语言实现。
 
-> Yu 目前处于早期基础设施阶段，尚不能作为日常 Markdown 编辑器使用。
+> **状态：v2 架构重构中。** 当前不能作为日常 Markdown 编辑器使用。
+> v1 已在 tag `v1-final` 冻结，完整状态保留在分支 `archive/v1-source-projection`。
+> 重构依据见 [架构总览 v2](docs/architecture/overview-v2.md)。
 
 ## 设计目标
 
-- Markdown source 是唯一持久化真源，不通过富文本模型往返序列化；
-- Lossless CST 保留 delimiter、空白、换行和未完成语法；
-- task-list marker 保留 source range，视觉层只投影隐藏 `[ ]`/`[x]`，状态切换仍是普通 Transaction；
-- 列表 Enter、空项 Backspace、缩进和反缩进都只通过 source Transaction 改写当前行；
-- Undo/Redo 只保存有界 inverse Transaction，连续输入、删除和列表操作按 group 回放；
-- Transaction、Snapshot、Anchor 与 Revision 构成统一编辑协议；
-- selection/caret、Unicode grapheme command 与 Accessibility 查询共享同一个 Revision；
-- macOS 原生快捷键先经过共享 Rust command route，普通字符仍交给 `NSTextInputClient`；
-- 原生命令结果显式声明 `None/Range/Full` source sync，局部编辑只复制变化的 UTF-16 范围；
-- `yu-editor` integration tests 使用 `EditorScenario` 标记 DSL 同时断言 source、caret/selection、
-  Revision 和 composition overlay，新增编辑行为先固定可复现的行为契约；
-- `yu-storage::DocumentSession` 统一 UTF-8 Markdown open/save/reload、BOM 元数据、Revision-bound
-  dirty 和外部文件冲突检测；保存使用同目录临时文件加原子 rename，不覆盖外部修改；
-- 打开软链接时保留用户可见路径，但读写、指纹和原子替换都指向 canonical target；macOS/Unix
-  回归测试验证软链接本身不被替换且目标权限被保留；Windows replace semantics 仍待定义；
-- `yu-storage::RecoveryStore` 提供调用方驱动的 autosave/recovery envelope；它只保存独立恢复候选，
-  不自动覆盖目标文件，也不在共享核心内启动定时器；
-- `yu-workspace::Workspace` 管理多个 `WorkspaceTab` 和唯一 active tab；每个 tab 只拥有一个
-  `DocumentEditorSession`，重复打开、dirty close、save/discard/cancel 和外部冲突都在无窗口
-  生命周期契约中处理；
-- `yu-storage::FileWatchDebouncer` 与 `CloseStateMachine` 固定文件通知去抖、dirty close、取消/丢弃和
-  外部冲突提示；macOS flag 适配不把 watcher 线程或 AppKit 对象带入共享核心；
-- `yu-storage-ffi` 让 macOS 文档壳只消费 Rust-owned source snapshot、Revision/dirty 状态和 close
-  结果；现在同一 handle 也承载 command、selection、key route、普通文本和 IME composition，
-  `DocumentTextView` 只是可丢弃 native mirror，避免形成第二份 source；
-- macOS 文档 host 的 copy/paste/cut/selectAll 已回到统一 session；copy/cut 同时发布 canonical
-  Markdown UTI、纯文本和同一 source range 生成的语义 HTML，paste 优先保留 Markdown source；
-- `yu-export` 固定 Revision-bound source selection 的 Markdown/纯文本/HTML clipboard payload，
-  HTML 只消费当前 parser 已识别的语义，未识别语法按转义文本回退，不读取 TextKit mirror；
-- macOS Accessibility 在现有文本快照之外提供 Revision-bound、source-backed Markdown semantic
-  node count/fill 查询；Swift 将 owned 节点映射为实现 AppKit `NSAccessibilityElementProtocol` 的
-  child，并提供 Heading/Link custom rotor、链接 URL 属性和 task checkbox press；文本、URL 和几何仍
-  按节点 Revision 回查，不保存第二份文档；真正的外部链接打开策略和 VoiceOver 朗读仍需人工验收；
-- `yu-workspace::ViewportFramePublisher` 把当前 `EditorDocument` 组装成带 Revision/serial 的
-  owned publication，macOS host 只消费已验证的 publication；
-- viewport render frame 通过不可变共享 handle 在 publisher cache、publication 和 macOS host
-  之间传递，避免 scene/render plan 深拷贝；
-- viewport publication 使用 staged `RenderPlanBuilder`，只有 frame、serial 和 cache 全部通过
-  后才提交 atlas fingerprint，失败重试不会污染上传去重状态；
-- IME preedit 通过 transient composition projection/layout 参与换行和 shaping，但不进入
-  canonical source、Revision、缓存或 Undo；
-- composition FFI 以 canonical Revision + transient generation 绑定 projected UTF-8、visual
-  selection 和 caret，native mirror 不复制 Markdown parser；
-- active composition 会以 transient CoreText shaped layout 进入同一 Rust RenderPlan、glyph atlas
-  和持久 Metal surface；跨 block replacement 按受影响 block span 投影，首 block 承载 preedit，后续
-  block 清除被替换 source，source/Revision 仍保持不变；
-- macOS composition hit-test 通过 Revision + generation-bound transient projection 返回 block、
-  document-space point、visual selection/replacement 与 source/visual UTF-16 round-trip；native host
-  不复制跨 block preedit 偏移；
-- visual scene/glyph/render-plan 的 count/fill header 同时绑定 composition generation；marked-text
-  在两次 FFI 调用之间更新或取消时，Rust 拒绝 stale fill，避免旧容量与新 glyph 数据错配；
-- opt-in visual mirror 额外消费 Rust generation-bound visual replacement range，让 marked-text
-  preedit、`markedRange` 和 `attributedSubstring` 使用同一 visual 坐标；默认生产 view 仍走 source
-  mirror，过期 generation 自动回退；
-- macOS `NSTextInputClient` lifecycle 将 canonical replacement、当前 native marked range 和
-  marked presentation 分开管理；`unmarkText` 不会误取消 Rust overlay，commit/cancel 均消费
-  同一 generation-bound composition snapshot；
-- macOS retained Metal 的 partial-damage frame 会在 native bridge 前按 command bounds 做
-  backend-owned culling，保持 painter order 而减少无关命令编码；
-- macOS `doCommand(by:)` 只允许 allowlist 内的 Selector 进入同一 Rust command/availability 入口；
-- macOS Option/Control word movement 使用 Unicode word-boundary segment，不物化整份文档；
-- 解析、投影、布局、绘制和资源加载都只处理受影响部分；
-- 中文、日文、RTL、emoji、组合字符与原生 IME 是一等公民；
-- 不依赖 Chromium、DOM 或常驻 JavaScript runtime；
-- 大文件和高成本嵌入内容具备明确的预算与降级模式。
+Yu 的技术本质是：
+
+> 一个 Markdown 源码编辑器内核 + 一个实时 Source Projection 系统
+> + 一个增量原生布局引擎 + 一个 retained GPU renderer
+> + 少量平台原生输入与窗口适配。
+
+它**不是** WebView Markdown 编辑器、富文本编辑器、HTML 编辑器或 Markdown 格式转换器。
+
+不可破坏的原则（完整表述见[核心不变量](docs/specs/invariants.md)）：
+
+1. Markdown source 永远是唯一真源，不通过富文本模型往返序列化；
+2. 所有永久修改都经过 Transaction；
+3. 视觉表现的唯一来源是 Decoration，Markdown 语义只存在于 `yu-markdown` 一个 crate；
+4. 所有派生数据都绑定 Revision，过期结果整体拒绝；
+5. IME composition 永远是 transient overlay；
+6. 平台层不解析 Markdown；
+7. 缓存、GPU 和异步资源不能改变编辑语义；
+8. 只处理发生变化和当前可见的内容；
+9. 不存在第二条渲染路径——Rust 渲染器是唯一渲染器；
+10. crate 依赖图必须是严格 DAG，由 CI 强制。
+
+中文、日文、RTL、emoji、组合字符与原生 IME 是一等公民。不依赖 Chromium、DOM
+或常驻 JavaScript runtime。
 
 ## 当前阶段
 
-项目已完成 Phase 1、Phase 2 的主要 Contracts & Risk Spikes，当前进入 **Phase 3：Source Projection
-& Native Layout**。这些阶段都不承诺完整 CommonMark 或产品 UI；它先固定最容易影响长期架构的契约：
+v2 重构分 7 个阶段推进，每个阶段结束时 app 必须可运行、CI 必须全绿。
+阶段定义与验收标准见[架构总览 v2 第 8 节](docs/architecture/overview-v2.md)。
 
-- 强类型源码坐标、Revision 与稳定 Anchor；
-- Snapshot、Transaction、ChangeSet 与可逆编辑；
-- 引用源码范围的 lossless Markdown 结构；
-- macOS `NSTextInputClient` 输入链路实验；
-- 增量实现必须满足的等价性和源码保真不变量。
-
-详细进度见 [Phase 1 路线](docs/roadmap/phase-1.md)。
-当前存储/文档会话进度见 [Phase 2 路线](docs/roadmap/phase-2.md)。
-当前 source projection/native layout 进度见 [Phase 3 路线](docs/roadmap/phase-3.md)。
+| 阶段 | 内容 | 状态 |
+| --- | --- | --- |
+| S1 | 拆炸弹：渲染循环移入 Rust，删除 TextKit fallback 与 count/fill FFI | 进行中 |
+| S2 | 地基：坐标收敛、`yu-text` 换 ropey、CI 强制依赖方向 | 未开始 |
+| S3 | 解析器：移植 lezer-markdown 算法，建立 CommonMark spec 差分测试 | 未开始 |
+| S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 未开始 |
+| S5 | 布局重写：UAX #14 断行、UAX #9 bidi、widget 盒模型 | 未开始 |
+| S6 | 语义 extension 化：每种语法收敛为一个 extension | 未开始 |
+| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 未开始 |
 
 ## 仓库结构
 
+目标形态。依赖方向严格单向，反向依赖是 CI 失败。
+
 ```text
-crates/yu-core          坐标、范围、Revision、Anchor
-crates/yu-editor        EditorDocument、selection、commands、CompositionOverlay 和平台无关编辑状态
-crates/yu-editor-ffi    原生平台调用的 CompositionOverlay 与 command C ABI static library
-crates/yu-text          Snapshot、Transaction、Piece Tree 和候选文本存储
-crates/yu-storage       UTF-8 Markdown 文档会话、BOM、原子保存和外部变更检测
-crates/yu-storage-ffi   macOS 文档壳消费 DocumentSession 的窄 C ABI
-platform/macos/yu-storage-macos macOS FSEvents/DispatchSource flag 适配与文件通知 debounce
-crates/yu-markdown      lossless block/inline CST 与增量 Markdown parser
-crates/yu-export        Revision-bound Markdown/纯文本/HTML clipboard payload exporter
-crates/yu-projection    Source → Visual Markdown 投影
-crates/yu-layout        block layout、caret/hit-test 和 viewport 高度索引
-crates/yu-font          font fallback、GlyphRun、metrics/rasterization 契约与 CPU glyph atlas
-crates/yu-scene         revision-bound retained primitives、viewport 与 damage tracking
-crates/yu-render        backend-neutral render plan 与 atlas page upload boundary
-crates/yu-workspace     EditorDocument → ViewportSceneInput → Scene → RenderPlan 集成层
-platform/macos/yu-font-macos  macOS-only CoreText 字体目录、fallback、shaping 与 glyph rasterization 适配
-platform/macos/yu-render-macos macOS-only Metal device、NSView layer attachment、clear/render plan frame、damage/scissor、pipeline 与 alpha atlas upload 适配
+crates/yu-core          坐标、Revision、Anchor
+crates/yu-text          Rope（ropey）、Snapshot、Transaction 原语
+crates/yu-syntax        增量 CST：block/inline 两级、fragment 复用、精确 range
+crates/yu-markdown      ★ Markdown 语法 extension 集合（Markdown 只存在于这一层）
+crates/yu-state         EditorState、Transaction 应用、History、Facet
+crates/yu-decoration    ★ RangeSet<Decoration>、source↔visual 映射
+crates/yu-layout        行盒、widget 盒、UAX#14 断行、UAX#9 bidi、hit-test
+crates/yu-scene         retained primitives 与 damage 追踪
+crates/yu-render        后端中立 RenderPlan：Glyph / FillRect / Texture / Quad
+crates/yu-font          字体解析、shaping、栅格化契约（只依赖 yu-core）
+crates/yu-assets        图片/嵌入资源的异步调度、LRU 与内存预算
+crates/yu-storage       UTF-8 Markdown 文档会话、原子保存、外部变更检测
+crates/yu-workspace     tab 与 document session 生命周期
+crates/yu-export        Revision-bound 剪贴板与 HTML 导出（comrak）
+platform/macos/         CoreText shaping、Metal 后端、CAMetalLayer 渲染循环
+                        Swift 只负责 NSWindow / 菜单 / NSTextInputClient / AX
 tools/yu-inspect        Markdown 结构检查 CLI
-tools/yu-bench          可重复的第一阶段参考 workload
-experiments/            可丢弃的平台风险实验
-docs/                   架构规范、ADR 和阶段计划
+tools/yu-bench          可重复的参考 workload
 ```
 
-`yu-text` 已选择持久化 Piece Tree 作为产品默认后端。平坦 UTF-8 后端继续作为正确性 oracle，
-Persistent Rope 保留为实验对照；三者运行相同的 Transaction model tests。
+旁路依赖（不在主链路上）：`tree-sitter` 仅用于 fenced code block 内部的代码高亮；
+`comrak` 仅用于 HTML 导出与 CommonMark spec 差分测试。
 
 ## 获取源码
 
@@ -158,100 +117,19 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 
 ## 文档
 
-正式架构文档和代码一起进行版本管理，因为这些规范定义了模块边界和测试不变量：
+先读这两份，它们优先于代码和一切历史文档：
 
-- [架构总览](docs/architecture/overview.md)
-- [Text Buffer](docs/architecture/text-buffer.md)
-- [Markdown Parser](docs/architecture/markdown-parser.md)
-- [核心不变量](docs/specs/invariants.md)
+- **[架构总览 v2](docs/architecture/overview-v2.md)** — 分层、依赖方向、组件决策、迭代阶段
+- **[核心不变量](docs/specs/invariants.md)** — 任何实现都不得违反的约束
+
+其他：
+
 - [坐标与位置](docs/specs/coordinates.md)
-- [Architecture Decision Records](docs/adr/)
-- [macOS Metal surface boundary](docs/adr/0034-macos-metal-surface-boundary.md)
-- [macOS clear frame lifecycle](docs/adr/0035-macos-clear-present-frame.md)
-- [macOS retained Metal plan pipeline](docs/adr/0036-macos-retained-metal-plan-pipeline.md)
-- [macOS AppKit attachment and damage frame](docs/adr/0037-macos-appkit-attachment-damage-frame.md)
-- [macOS AppKit host probe](docs/adr/0038-macos-appkit-host-probe.md)
-- [Markdown block CST v1](docs/adr/0039-markdown-block-cst-v1.md)
-- [Markdown inline links and breaks](docs/adr/0040-markdown-inline-links-breaks.md)
-- [Markdown line-break projection and layout](docs/adr/0041-markdown-line-break-projection-layout.md)
-- [Markdown reference links and autolinks](docs/adr/0042-markdown-reference-links-autolinks.md)
-- [Markdown reference definitions and shortcuts](docs/adr/0043-reference-definitions-shortcuts.md)
-- [Markdown task-list projection](docs/adr/0044-task-list-projection.md)
-- [Markdown list editing commands](docs/adr/0045-list-editing-commands.md)
-- [Editor history and undo groups](docs/adr/0046-editor-history-and-undo-groups.md)
-- [macOS key command routing](docs/adr/0047-macos-key-command-routing.md)
-- [Native command source synchronization](docs/adr/0048-native-command-source-sync.md)
-- [macOS Selector command bridge](docs/adr/0049-macos-selector-command-bridge.md)
-- [Unicode word movement](docs/adr/0050-unicode-word-movement.md)
-- [Vertical caret and preferred-X](docs/adr/0051-vertical-caret-preferred-x.md)
-- [Shift vertical selection](docs/adr/0052-shift-vertical-selection.md)
-- [Revision-bound caret scroll request](docs/adr/0053-caret-scroll-request.md)
-- [macOS NSScrollView consumer](docs/adr/0054-macos-scrollview-consumer.md)
-- [macOS NSScrollView host attachment](docs/adr/0055-macos-scrollview-host-attachment.md)
-- [Viewport metrics FFI contract](docs/adr/0056-viewport-metrics-ffi-contract.md)
-- [CoreText system UI viewport metrics](docs/adr/0057-coretext-system-ui-viewport-metrics.md)
-- [macOS CoreText shaped line comparison](docs/adr/0058-macos-coretext-shaped-line-comparison.md)
-- [Projection-aware shaped layout](docs/adr/0059-projection-aware-shaped-layout.md)
-- [Revision-bound projection caret query](docs/adr/0060-revision-bound-projection-caret.md)
-- [Block-local projection caret query](docs/adr/0061-block-local-projection-caret.md)
-- [Block-local shaped caret geometry](docs/adr/0062-block-local-shaped-caret-geometry.md)
-- [macOS shaped caret scroll request](docs/adr/0063-shaped-caret-scroll-request.md)
-- [Shaped viewport block snapshot](docs/adr/0064-shaped-viewport-block-snapshot.md)
-- [Viewport scene input](docs/adr/0065-viewport-scene-input.md)
-- [Batched viewport scene assembly](docs/adr/0066-batched-viewport-scene-assembly.md)
-- [Editor viewport scene integration](docs/adr/0067-editor-viewport-scene-integration.md)
-- [Revision-aware viewport frame publication](docs/adr/0068-revision-aware-viewport-frame-publication.md)
-- [macOS revision-aware Metal frame consumer](docs/adr/0069-macos-revision-aware-metal-frame-consumer.md)
-- [macOS viewport frame submission](docs/adr/0070-macos-viewport-frame-submission.md)
-- [macOS viewport host session](docs/adr/0071-macos-viewport-host-session.md)
-- [Yu workspace viewport frame publisher](docs/adr/0072-yu-workspace-viewport-frame-publisher.md)
-- [macOS command-level damage culling](docs/adr/0073-macos-command-level-damage-culling.md)
-- [Shared viewport frame handle](docs/adr/0074-shared-viewport-frame-handle.md)
-- [Atomic viewport publication](docs/adr/0075-atomic-viewport-publication.md)
-- [Composition-aware projection/layout](docs/adr/0076-composition-aware-projection-layout.md)
-- [Composition projection FFI](docs/adr/0077-composition-projection-ffi.md)
-- [macOS NSTextInputClient composition lifecycle](docs/adr/0078-macos-nstextinputclient-composition-lifecycle.md)
-- [Visual viewport scroll coordinate contract](docs/adr/0116-visual-viewport-scroll-coordinate.md)
-- [Revision-bound visual scene snapshot bridge](docs/adr/0117-visual-scene-snapshot.md)
-- [Shaped glyph RenderPlan publication](docs/adr/0118-visual-render-plan-publication.md)
-- [CoreText to Metal frame preparation](docs/adr/0119-coretext-metal-frame-preparation.md)
-- [macOS document host render lifecycle](docs/adr/0120-macos-render-host-lifecycle.md)
-- [Revision-bound retained scene glyph bridge](docs/adr/0121-retained-scene-glyph-bridge.md)
-- [macOS real surface submit self-check](docs/adr/0122-macos-real-surface-submit.md)
-- [Persistent macOS native surface adapter](docs/adr/0123-persistent-macos-surface-adapter.md)
-- [macOS product NSView surface lifecycle](docs/adr/0124-macos-product-surface-lifecycle.md)
-- [macOS minimal visible RenderPlan projection](docs/adr/0125-macos-minimal-visible-render-plan.md)
-- [macOS production visual pointer mapping](docs/adr/0126-macos-production-visual-pointer-mapping.md)
-- [macOS projected selection and caret reveal](docs/adr/0127-macos-visual-selection-and-caret-reveal.md)
-- [macOS shaped vertical editor command](docs/adr/0128-macos-shaped-vertical-command.md)
-- [macOS CoreText-shaped pointer hit-test](docs/adr/0129-macos-shaped-pointer-hit-test.md)
-- [macOS visual IME shaped caret geometry](docs/adr/0130-macos-visual-ime-shaped-caret.md)
-- [macOS visual IME Metal preedit glyph publication](docs/adr/0131-macos-visual-ime-metal-preedit.md)
-- [macOS visual count/fill composition generation guard](docs/adr/0132-macos-visual-count-fill-generation-guard.md)
-- [macOS cross-block composition transient layout](docs/adr/0133-macos-cross-block-composition-layout.md)
-- [macOS cross-block composition hit-test](docs/adr/0134-macos-cross-block-composition-hit-test.md)
-- [macOS document-space RenderPlan viewport](docs/adr/0135-macos-document-space-render-viewport.md)
-- [macOS visual decoration sibling](docs/adr/0136-macos-visual-decoration-sibling.md)
-- [macOS Rust/CoreText-shaped decoration geometry](docs/adr/0137-macos-rust-shaped-decoration-geometry.md)
-- [macOS visual selection anchor/focus](docs/adr/0138-macos-visual-selection-anchor-focus.md)
-- [macOS primary Rust surface glyph gate](docs/adr/0139-macos-primary-rust-surface-glyph-gate.md)
-- [macOS code block fill primitive](docs/adr/0140-macos-code-block-fill-primitive.md)
-- [Editor behavior test DSL](docs/adr/0085-editor-behavior-test-dsl.md)
-- [Composition command boundary](docs/adr/0171-composition-command-boundary.md)
-- [yu-storage document session](docs/adr/0086-yu-storage-document-session.md)
-- [macOS file watch and close state](docs/adr/0087-macos-file-watch-close-state.md)
-- [macOS minimal document host](docs/adr/0088-macos-document-host.md)
-- [unified document editor session](docs/adr/0089-unified-document-editor-session.md)
-- [macOS writable native mirror](docs/adr/0090-macos-writable-native-mirror.md)
-- [source-backed Markdown Accessibility semantic tree](docs/adr/0101-source-backed-accessibility-semantic-tree.md)
-- [macOS Accessibility semantic children](docs/adr/0102-macos-accessibility-semantic-children.md)
-- [macOS Accessibility custom rotors](docs/adr/0103-macos-accessibility-custom-rotors.md)
-- [macOS Accessibility semantic actions](docs/adr/0104-macos-accessibility-semantic-actions.md)
-- [Phase 1 路线](docs/roadmap/phase-1.md)
-- [Phase 2 路线](docs/roadmap/phase-2.md)
-- [macOS IME 实测](docs/experiments/macos-ime-2026-08-09.md)
-- [macOS IME 人工验收模板](docs/experiments/macos-ime-manual-acceptance-2026-08-13.md)
-- [DocumentEditorSession headless benchmark](docs/experiments/yu-session-benchmark-2026-08-14.md)
+- [ADR 规范](docs/adr/README.md) — 编号从 0001 重新开始
+- [v1 归档](docs/archive-v1/README.md) — 183 篇 v1 ADR 与设计文档，全部 superseded
+
+### 实验记录
+
 - [macOS CompositionOverlay FFI 实验](docs/experiments/macos-composition-ffi-2026-08-10.md)
 - [文本存储候选对比](docs/experiments/storage-candidates-2026-08-09.md)
 - [增量 Markdown 实验](docs/experiments/incremental-markdown-2026-08-09.md)
@@ -260,8 +138,13 @@ macOS 输入实验的 Swift target 通过 `YuEditorFFI` C module 链接 Rust sta
 
 ## 贡献
 
-Yu 尚处在协议和基础数据结构快速演进期。提交实现前，请先阅读架构不变量与相关 ADR；新增
-编辑行为应同时提供行为测试，增量算法应提供与完整算法的等价性验证。
+Yu 正在进行 v2 架构重构，协议和基础数据结构快速演进。提交实现前请先阅读
+[架构总览 v2](docs/architecture/overview-v2.md) 与[核心不变量](docs/specs/invariants.md)。
+
+- 新增编辑行为必须同时提供行为测试；
+- 增量算法必须提供与完整算法的等价性验证；
+- 违反不变量的改动会被拒绝，即使功能正确；
+- 不要为「实现了某功能」新增 ADR，规则见 [ADR 规范](docs/adr/README.md)。
 
 ## License
 
