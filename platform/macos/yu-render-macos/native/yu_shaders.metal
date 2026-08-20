@@ -26,10 +26,13 @@ vertex YuVertexOut yu_vertex(
     constant YuFrameUniforms& frame [[buffer(1)]]
 ) {
     YuVertexOut output;
-    float2 pixel = input.position * frame.scale;
+    // position 与 viewport 同为 document-space 逻辑坐标，而 NDC 是归一化的、
+    // 与物理像素无关，因此这里**不能**再乘 backing scale：那会让内容整体放大
+    // scale 倍，并使按逻辑宽度算好的换行位置溢出可视区域。
+    // scale 只用于 damage scissor（那里确实需要物理像素）。
     float2 ndc = float2(
-        (pixel.x / frame.viewport.x) * 2.0 - 1.0,
-        1.0 - (pixel.y / frame.viewport.y) * 2.0
+        (input.position.x / frame.viewport.x) * 2.0 - 1.0,
+        1.0 - (input.position.y / frame.viewport.y) * 2.0
     );
     output.position = float4(ndc, 0.0, 1.0);
     output.uv = input.uv;
