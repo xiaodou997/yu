@@ -410,6 +410,41 @@ pub struct TablePrimitive {
     role: TablePrimitiveRole,
 }
 
+/// One source-backed blockquote bar. Multiple bars may share the same block
+/// source when a parser reports nested quote depth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockQuotePrimitive {
+    source: TextRange,
+    bounds: Rect,
+    color: Rgba8,
+}
+
+impl BlockQuotePrimitive {
+    #[must_use]
+    pub const fn new(source: TextRange, bounds: Rect, color: Rgba8) -> Self {
+        Self {
+            source,
+            bounds,
+            color,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> Rect {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn color(self) -> Rgba8 {
+        self.color
+    }
+}
+
 /// Semantic layer of a source-backed task checkbox decoration.
 ///
 /// The backend currently lowers every layer to a solid rectangle. Keeping the
@@ -625,6 +660,7 @@ pub enum Primitive {
     Glyph(GlyphPrimitive),
     Image(ImagePrimitive),
     EmbeddedSvg(EmbeddedSvgPrimitive),
+    BlockQuote(BlockQuotePrimitive),
     Table(TablePrimitive),
     TaskCheckbox(TaskCheckboxPrimitive),
     EditorDecoration(EditorDecorationPrimitive),
@@ -638,6 +674,7 @@ impl Primitive {
             Self::Glyph(glyph) => glyph.bounds(),
             Self::Image(image) => image.bounds(),
             Self::EmbeddedSvg(svg) => svg.bounds(),
+            Self::BlockQuote(quote) => quote.bounds(),
             Self::Table(table) => table.bounds(),
             Self::TaskCheckbox(task) => task.bounds(),
             Self::EditorDecoration(decoration) => decoration.bounds(),
@@ -922,6 +959,10 @@ impl SceneBuilder {
         self.push(Primitive::EmbeddedSvg(svg))
     }
 
+    pub fn block_quote(&mut self, quote: BlockQuotePrimitive) -> Result<u32, SceneError> {
+        self.push(Primitive::BlockQuote(quote))
+    }
+
     pub fn task_checkbox(&mut self, task: TaskCheckboxPrimitive) -> Result<u32, SceneError> {
         self.push(Primitive::TaskCheckbox(task))
     }
@@ -1189,6 +1230,37 @@ impl SceneBuilder {
         table_style: Option<TableSceneStyle>,
         selection: Option<yu_core::TextRange>,
     ) -> Result<usize, SceneError> {
+        self.append_viewport_with_decorations(
+            input,
+            layouts,
+            atlas,
+            font_size,
+            color,
+            fills,
+            images,
+            table_style,
+            selection,
+            None,
+        )
+    }
+
+    /// Appends visible blocks with table and blockquote decorations before
+    /// glyph content. Markdown meaning remains outside the scene layer: the
+    /// layout supplies source-backed quote bars and the caller supplies color.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_viewport_with_decorations(
+        &mut self,
+        input: &ViewportSceneInput,
+        layouts: &[&LayoutSnapshot],
+        atlas: &yu_font::GlyphAtlas,
+        font_size: f32,
+        color: Rgba8,
+        fills: &[Option<Rgba8>],
+        images: &[Vec<ImagePrimitive>],
+        table_style: Option<TableSceneStyle>,
+        selection: Option<yu_core::TextRange>,
+        block_quote_color: Option<Rgba8>,
+    ) -> Result<usize, SceneError> {
         if input.revision() != self.revision {
             return Err(SceneError::ViewportRevisionMismatch {
                 expected: self.revision,
@@ -1253,6 +1325,15 @@ impl SceneBuilder {
                     style,
                     selection,
                 )?);
+            }
+            if let (Some(quote_color), Some(quote)) = (block_quote_color, layout.block_quote()) {
+                for bounds in quote.bars().iter().copied() {
+                    primitives.push(Primitive::BlockQuote(BlockQuotePrimitive::new(
+                        quote.source(),
+                        translate_layout_rect(bounds, Point::new(0.0, geometry.y()))?,
+                        quote_color,
+                    )));
+                }
             }
             primitives.extend(
                 self.collect_layout_primitives_at(

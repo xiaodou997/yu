@@ -14,8 +14,8 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{Affinity, ByteOffset, TextAnchor, TextRange};
 use yu_projection::{
-    BlockProjection, LeadingMarker, Projection, ProjectionBias, ProjectionError, VisualOffset,
-    VisualRange, VisualRunKind, VisualRunStyle,
+    BlockProjection, BlockQuotePresentation, LeadingMarker, Projection, ProjectionBias,
+    ProjectionError, VisualOffset, VisualRange, VisualRunKind, VisualRunStyle,
 };
 use yu_text::{ChangeSet, TextSnapshot};
 
@@ -218,6 +218,37 @@ fn shape_marker<S: ShapingProvider>(
 
 fn marker_gutter(marker_width: f32, indent: u8, default_advance: f32) -> f32 {
     marker_width + default_advance * (f32::from(indent) + 1.0)
+}
+
+#[derive(Clone, Copy)]
+struct BlockQuoteMetrics {
+    depth: u8,
+    unit: f32,
+    bar_width: f32,
+    gutter: f32,
+}
+
+fn block_quote_metrics(
+    quote: &BlockQuotePresentation,
+    config: LayoutConfig,
+) -> Result<BlockQuoteMetrics, LayoutError> {
+    if quote.depth() == 0 {
+        return Err(LayoutError::InvalidConfig(
+            "blockquote depth must be positive",
+        ));
+    }
+    let bar_width = (config.line_height * 0.12).clamp(1.0, 3.0);
+    let unit = (config.default_advance * 2.0).max(bar_width + config.default_advance);
+    let gutter = unit * f32::from(quote.depth());
+    if !unit.is_finite() || !gutter.is_finite() {
+        return Err(LayoutError::InvalidMetrics(gutter.to_bits()));
+    }
+    Ok(BlockQuoteMetrics {
+        depth: quote.depth(),
+        unit,
+        bar_width,
+        gutter,
+    })
 }
 
 impl ClusterMetrics for MonospaceMetrics {
@@ -456,7 +487,7 @@ pub struct LayoutPoint {
     y: f32,
 }
 
-/// A finite, non-negative image rectangle in block-local layout coordinates.
+/// A finite, non-negative rectangle in block-local layout coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutRect {
     x: f32,
@@ -628,6 +659,31 @@ impl ImagePlacement {
     #[must_use]
     pub const fn bounds(self) -> LayoutRect {
         self.bounds
+    }
+}
+
+/// Source-backed blockquote decoration geometry in block-local coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockQuoteLayout {
+    source: TextRange,
+    depth: u8,
+    bars: Vec<LayoutRect>,
+}
+
+impl BlockQuoteLayout {
+    #[must_use]
+    pub const fn source(&self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn depth(&self) -> u8 {
+        self.depth
+    }
+
+    #[must_use]
+    pub fn bars(&self) -> &[LayoutRect] {
+        &self.bars
     }
 }
 
@@ -857,6 +913,7 @@ pub struct LayoutSnapshot {
     glyphs: Vec<GlyphPlacement>,
     images: Vec<ImagePlacement>,
     table: Option<TableLayoutSnapshot>,
+    block_quote: Option<BlockQuoteLayout>,
 }
 
 impl LayoutSnapshot {
@@ -928,7 +985,16 @@ impl LayoutSnapshot {
         let gutter = marker
             .zip(marker_width)
             .map(|(marker, width)| marker_gutter(width, marker.indent(), config.default_advance));
-        let build_config = gutter.map_or(config, |gutter| inset_config(config, gutter));
+        let quote = projection
+            .block_quote()
+            .map(|quote| block_quote_metrics(quote, config))
+            .transpose()?;
+        let total_gutter = gutter.unwrap_or(0.0) + quote.map_or(0.0, |quote| quote.gutter);
+        let build_config = if total_gutter > 0.0 {
+            inset_config(config, total_gutter)
+        } else {
+            config
+        };
         let mut layout = Self {
             projection: projection.clone(),
             config: build_config,
@@ -937,13 +1003,21 @@ impl LayoutSnapshot {
             glyphs: Vec::new(),
             images: Vec::new(),
             table: None,
+            block_quote: quote.map(|quote| BlockQuoteLayout {
+                source: projection.source_range(),
+                depth: quote.depth,
+                bars: Vec::new(),
+            }),
         };
         layout.build(metrics)?;
         layout.config = config;
-        if let Some(gutter) = gutter {
-            layout.apply_leading_marker_gutter(gutter)?;
+        if total_gutter > 0.0 {
+            layout.apply_horizontal_inset(total_gutter)?;
         }
         layout.build_image_placements()?;
+        if let Some(quote) = quote {
+            layout.refresh_block_quote_geometry(quote)?;
+        }
         Ok(layout)
     }
 
@@ -961,7 +1035,17 @@ impl LayoutSnapshot {
         let gutter = marker
             .as_ref()
             .map(|marker| marker_gutter(marker.advance, marker.indent, config.default_advance));
-        let build_config = gutter.map_or(config, |gutter| inset_config(config, gutter));
+        let quote = projection
+            .block_quote()
+            .map(|quote| block_quote_metrics(quote, config))
+            .transpose()?;
+        let quote_gutter = quote.map_or(0.0, |quote| quote.gutter);
+        let total_gutter = gutter.unwrap_or(0.0) + quote_gutter;
+        let build_config = if total_gutter > 0.0 {
+            inset_config(config, total_gutter)
+        } else {
+            config
+        };
         let mut layout = Self {
             projection: projection.clone(),
             config: build_config,
@@ -970,14 +1054,24 @@ impl LayoutSnapshot {
             glyphs: Vec::new(),
             images: Vec::new(),
             table: None,
+            block_quote: quote.map(|quote| BlockQuoteLayout {
+                source: projection.source_range(),
+                depth: quote.depth,
+                bars: Vec::new(),
+            }),
         };
         layout.build_shaped(shaper)?;
         layout.config = config;
+        if total_gutter > 0.0 {
+            layout.apply_horizontal_inset(total_gutter)?;
+        }
         if let Some(marker) = marker {
-            let gutter = marker_gutter(marker.advance, marker.indent, config.default_advance);
-            layout.apply_shaped_leading_marker(marker, gutter)?;
+            layout.apply_shaped_leading_marker(marker, quote_gutter)?;
         }
         layout.build_image_placements()?;
+        if let Some(quote) = quote {
+            layout.refresh_block_quote_geometry(quote)?;
+        }
         Ok(layout)
     }
 
@@ -1033,6 +1127,12 @@ impl LayoutSnapshot {
     #[must_use]
     pub fn table(&self) -> Option<&TableLayoutSnapshot> {
         self.table.as_ref()
+    }
+
+    /// Returns semantic blockquote bar geometry, if this projection owns one.
+    #[must_use]
+    pub fn block_quote(&self) -> Option<&BlockQuoteLayout> {
+        self.block_quote.as_ref()
     }
 
     /// Applies a source-neutral table resize to a transient copy of this
@@ -1100,6 +1200,10 @@ impl LayoutSnapshot {
             let height = (intrinsic_height * scale).max(self.config.line_height);
             placement.bounds = LayoutRect::new(bounds.x, bounds.y, width, height)?;
         }
+        if let Some(presentation) = self.projection.block_quote() {
+            let metrics = block_quote_metrics(presentation, self.config)?;
+            self.refresh_block_quote_geometry(metrics)?;
+        }
         Ok(())
     }
 
@@ -1120,7 +1224,7 @@ impl LayoutSnapshot {
         &self.projection
     }
 
-    fn apply_leading_marker_gutter(&mut self, gutter: f32) -> Result<(), LayoutError> {
+    fn apply_horizontal_inset(&mut self, gutter: f32) -> Result<(), LayoutError> {
         if !gutter.is_finite() || gutter < 0.0 {
             return Err(LayoutError::InvalidMetrics(gutter.to_bits()));
         }
@@ -1139,11 +1243,10 @@ impl LayoutSnapshot {
     fn apply_shaped_leading_marker(
         &mut self,
         marker: ShapedLeadingMarker,
-        gutter: f32,
+        origin_x: f32,
     ) -> Result<(), LayoutError> {
-        self.apply_leading_marker_gutter(gutter)?;
         let baseline = self.baseline_for_line(0)?;
-        let mut x = f32::from(marker.indent) * self.config.default_advance;
+        let mut x = origin_x + f32::from(marker.indent) * self.config.default_advance;
         let mut placements = Vec::new();
         for run in marker.shaped.runs() {
             for glyph in run.glyphs() {
@@ -1167,6 +1270,26 @@ impl LayoutSnapshot {
         }
         placements.append(&mut self.glyphs);
         self.glyphs = placements;
+        Ok(())
+    }
+
+    fn refresh_block_quote_geometry(
+        &mut self,
+        metrics: BlockQuoteMetrics,
+    ) -> Result<(), LayoutError> {
+        let height = self.block_height().max(self.config.line_height);
+        let source = self.projection.source_range();
+        let mut bars = Vec::with_capacity(usize::from(metrics.depth));
+        for level in 0..metrics.depth {
+            let unit_start = f32::from(level) * metrics.unit;
+            let x = unit_start + (metrics.unit - metrics.bar_width) * 0.25;
+            bars.push(LayoutRect::new(x, 0.0, metrics.bar_width, height)?);
+        }
+        self.block_quote = Some(BlockQuoteLayout {
+            source,
+            depth: metrics.depth,
+            bars,
+        });
         Ok(())
     }
 
@@ -1249,6 +1372,17 @@ impl LayoutSnapshot {
             .as_ref()
             .map(|table| table.map_through(changes, snapshot))
             .transpose()?;
+        let block_quote = self
+            .block_quote
+            .as_ref()
+            .map(|quote| {
+                Ok::<BlockQuoteLayout, LayoutError>(BlockQuoteLayout {
+                    source: map_source_range(quote.source, changes)?,
+                    depth: quote.depth,
+                    bars: quote.bars.clone(),
+                })
+            })
+            .transpose()?;
         Ok(Some(Self {
             projection,
             config: self.config,
@@ -1257,6 +1391,7 @@ impl LayoutSnapshot {
             glyphs,
             images,
             table,
+            block_quote,
         }))
     }
 
@@ -2134,6 +2269,35 @@ mod tests {
         let hit = layout
             .hit_test(LayoutPoint::new(1.0, 0.0))
             .expect("marker gutter hit");
+        assert_eq!(hit.source(), ByteOffset::ZERO);
+    }
+
+    #[test]
+    fn blockquote_reserves_content_width_and_builds_source_backed_bars() {
+        let projection = first_block_projection("> first\n> second\n");
+        let layout = LayoutSnapshot::from_block_projection(
+            &projection,
+            LayoutConfig::new(80.0, 10.0).with_default_advance(2.0),
+        )
+        .expect("blockquote layout");
+
+        assert_eq!(layout.clusters()[0].x(), 4.0);
+        assert_eq!(layout.lines()[0].width(), 14.0);
+        let quote = layout.block_quote().expect("blockquote geometry");
+        assert_eq!(quote.source(), projection.visual().source_range());
+        assert_eq!(quote.depth(), 1);
+        assert_eq!(quote.bars().len(), 1);
+        assert!((quote.bars()[0].x() - 0.7).abs() < f32::EPSILON * 2.0);
+        assert!((quote.bars()[0].width() - 1.2).abs() < f32::EPSILON * 2.0);
+        assert_eq!(quote.bars()[0].height(), layout.block_height());
+
+        let caret = layout
+            .caret_for_source(ByteOffset::new(2), ProjectionBias::After)
+            .expect("content caret");
+        assert_eq!(caret.point().x(), 4.0);
+        let hit = layout
+            .hit_test(LayoutPoint::new(1.0, 0.0))
+            .expect("blockquote gutter hit");
         assert_eq!(hit.source(), ByteOffset::ZERO);
     }
 

@@ -100,6 +100,11 @@ fn viewport_table_style() -> TableSceneStyle {
     )
 }
 
+#[must_use]
+const fn viewport_block_quote_color() -> Rgba8 {
+    Rgba8::new(176, 181, 190, 255)
+}
+
 fn append_task_checkbox(
     builder: &mut SceneBuilder,
     layout: &yu_layout::LayoutSnapshot,
@@ -1261,7 +1266,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         }
         images.push(block_images);
     }
-    builder.append_viewport_with_fills_and_images_and_tables(
+    builder.append_viewport_with_decorations(
         &input,
         &layout_refs,
         atlas,
@@ -1271,6 +1276,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         &images,
         Some(viewport_table_style()),
         selection,
+        Some(viewport_block_quote_color()),
     )?;
     for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
         let BlockKind::TaskListItem { state, .. } = block.kind() else {
@@ -1544,6 +1550,66 @@ mod tests {
                 .iter()
                 .all(|primitive| matches!(primitive, Primitive::Glyph(_)))
         );
+    }
+
+    #[test]
+    fn blockquote_bar_precedes_glyphs_and_lowers_to_source_backed_fill() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportRect::new(0.0, 120.0);
+        let source = "> quoted\n> second\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rgba8::black(),
+        );
+        let mut plans = RenderPlanBuilder::new();
+        let frame =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("blockquote frame");
+        let primitives = frame.scene().scene().primitives();
+        let quote_index = primitives
+            .iter()
+            .position(|primitive| matches!(primitive, Primitive::BlockQuote(_)))
+            .expect("blockquote primitive");
+        let glyph_index = primitives
+            .iter()
+            .position(|primitive| matches!(primitive, Primitive::Glyph(_)))
+            .expect("glyph primitive");
+        assert!(quote_index < glyph_index);
+
+        let Primitive::BlockQuote(quote) = primitives[quote_index] else {
+            unreachable!("located blockquote primitive");
+        };
+        assert_eq!(
+            quote.source(),
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(source.len() as u64))
+                .expect("source range")
+        );
+        assert_eq!(quote.color(), viewport_block_quote_color());
+        assert_eq!(
+            quote.bounds().height(),
+            frame.scene().input().blocks()[0].height()
+        );
+        assert!(quote.bounds().right() < 7.0);
+
+        let yu_render::RenderCommand::FillRect { bounds, color } =
+            frame.plan().commands()[quote_index]
+        else {
+            panic!("blockquote must lower to a fill command");
+        };
+        assert_eq!(bounds, quote.bounds());
+        assert_eq!(color, quote.color());
     }
 
     #[test]
@@ -2188,6 +2254,7 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
+                | Primitive::BlockQuote(_)
                 | Primitive::Table(_)
                 | Primitive::TaskCheckbox(_)
                 | Primitive::EditorDecoration(_) => None,
@@ -2218,6 +2285,7 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
+                | Primitive::BlockQuote(_)
                 | Primitive::Table(_)
                 | Primitive::TaskCheckbox(_)
                 | Primitive::EditorDecoration(_) => None,
@@ -2271,6 +2339,7 @@ mod tests {
             Primitive::Glyph(_)
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
+            | Primitive::BlockQuote(_)
             | Primitive::Table(_)
             | Primitive::TaskCheckbox(_)
             | Primitive::EditorDecoration(_) => {
