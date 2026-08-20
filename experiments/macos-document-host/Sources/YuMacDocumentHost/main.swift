@@ -2275,84 +2275,6 @@ private final class StorageBridge {
         return values.map(NativeTableResizeAccessibilityDivider.init)
     }
 
-    func macosVisualDecorations(
-        revision: UInt64,
-        compositionGeneration: UInt64,
-        size: Float,
-        maxWidth: Float,
-        scrollY: Float,
-        viewportHeight: Float
-    ) throws -> (
-        NativeVisualDecorationSnapshot,
-        NativeVisualDecorationCaret,
-        [NativeVisualDecorationRect]
-    ) {
-        var snapshot = YuStorageMacosVisualDecorationSnapshot()
-        var caret = YuStorageMacosVisualDecorationCaret()
-        var required = 0
-        let sizeStatus = yu_storage_session_macos_visual_decorations(
-            handle,
-            revision,
-            compositionGeneration,
-            size,
-            maxWidth,
-            scrollY,
-            viewportHeight,
-            &snapshot,
-            &caret,
-            nil,
-            0,
-            &required
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        guard snapshot.revision == revision,
-              snapshot.composition_generation == compositionGeneration,
-              snapshot.selection_count == UInt64(required),
-              required >= 0 else {
-            throw BridgeError.operation(StorageStatus.invalidViewport)
-        }
-        var values = Array(
-            repeating: YuStorageMacosVisualDecorationRect(),
-            count: required
-        )
-        var written = required
-        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_macos_visual_decorations(
-                handle,
-                revision,
-                compositionGeneration,
-                size,
-                maxWidth,
-                scrollY,
-                viewportHeight,
-                &snapshot,
-                &caret,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
-        }
-        guard fillStatus == StorageStatus.ok else {
-            throw BridgeError.operation(fillStatus)
-        }
-        guard written == required,
-              caret.revision == revision || caret.present == 0,
-              values.allSatisfy({
-                  $0.revision == revision
-                      && $0.width.isFinite && $0.width > 0.0
-                      && $0.height.isFinite && $0.height > 0.0
-                      && $0.x.isFinite && $0.y.isFinite
-              }) else {
-            throw BridgeError.operation(StorageStatus.invalidViewport)
-        }
-        return (
-            NativeVisualDecorationSnapshot(snapshot),
-            NativeVisualDecorationCaret(caret),
-            values.map(NativeVisualDecorationRect.init)
-        )
-    }
 
 
     func macosVisualImages(revision: UInt64) throws -> [NativeVisualImage] {
@@ -3192,122 +3114,6 @@ private final class StorageBridge {
     }
 }
 
-/// A disposable TextKit layout for the Rust-owned visual projection. It is
-/// created only when the visual pointer adapter is enabled; it never owns a
-/// source revision or Markdown semantics.
-private final class ProjectionTextKitMirror {
-    let revision: UInt64
-    let textStorage: NSTextStorage
-    let layoutManager: NSLayoutManager
-    let textContainer: NSTextContainer
-
-    init(text: String, revision: UInt64, width: CGFloat, font: NSFont) {
-        self.revision = revision
-        textStorage = NSTextStorage(string: text)
-        layoutManager = NSLayoutManager()
-        textContainer = NSTextContainer(
-            size: NSSize(
-                width: max(width, 1.0),
-                height: CGFloat.greatestFiniteMagnitude
-            )
-        )
-        textContainer.lineFragmentPadding = 0.0
-        layoutManager.addTextContainer(textContainer)
-        textStorage.addLayoutManager(layoutManager)
-        if textStorage.length > 0 {
-            textStorage.addAttribute(
-                .font,
-                value: font,
-                range: NSRange(location: 0, length: textStorage.length)
-            )
-        }
-    }
-
-    var string: String { textStorage.string }
-
-    var utf16Length: Int { textStorage.length }
-
-    func visualUTF16(at point: NSPoint) -> Int {
-        guard textStorage.length > 0 else { return 0 }
-        var fraction: CGFloat = 0.0
-        let glyph = layoutManager.glyphIndex(
-            for: point,
-            in: textContainer,
-            fractionOfDistanceThroughGlyph: &fraction
-        )
-        let character = layoutManager.characterIndexForGlyph(at: glyph)
-        return min(max(character, 0), textStorage.length)
-    }
-
-    func point(forVisualUTF16 offset: Int) -> NSPoint {
-        guard textStorage.length > 0 else { return .zero }
-        let clamped = min(max(offset, 0), textStorage.length)
-        let glyph = layoutManager.glyphIndexForCharacter(at: min(clamped, textStorage.length - 1))
-        var point = layoutManager.location(forGlyphAt: glyph)
-        if clamped >= textStorage.length {
-            let rect = layoutManager.boundingRect(
-                forGlyphRange: NSRange(location: glyph, length: 1),
-                in: textContainer
-            )
-            point.x = rect.maxX
-        }
-        return point
-    }
-
-    func caretRect(forVisualUTF16 offset: Int) -> NSRect {
-        guard textStorage.length > 0 else {
-            return NSRect(x: 0.0, y: 0.0, width: 1.0, height: 16.0)
-        }
-        let clamped = min(max(offset, 0), textStorage.length)
-        let character = min(clamped, textStorage.length - 1)
-        let glyph = layoutManager.glyphIndexForCharacter(at: character)
-        let lineRect = layoutManager.lineFragmentRect(
-            forGlyphAt: glyph,
-            effectiveRange: nil
-        )
-        let point = point(forVisualUTF16: clamped)
-        let x = clamped >= textStorage.length ? lineRect.maxX : point.x
-        return NSRect(
-            x: x,
-            y: lineRect.minY,
-            width: 1.0,
-            height: max(lineRect.height, 1.0)
-        )
-    }
-
-    /// Returns line-fragment rectangles for a projected visual selection.
-    /// The rectangles are local to `textContainer`; callers add the native
-    /// TextKit container origin when painting in the view coordinate space.
-    /// This mirror is disposable, so the caller must validate its Revision
-    /// before using the result.
-    func selectionRects(forVisualRange range: NSRange) -> [NSRect] {
-        guard range.location >= 0,
-              range.length > 0,
-              NSMaxRange(range) <= textStorage.length else {
-            return []
-        }
-        let glyphRange = layoutManager.glyphRange(
-            forCharacterRange: range,
-            actualCharacterRange: nil
-        )
-        guard glyphRange.location != NSNotFound, glyphRange.length > 0 else {
-            return []
-        }
-        var rects: [NSRect] = []
-        layoutManager.enumerateEnclosingRects(
-            forGlyphRange: glyphRange,
-            withinSelectedGlyphRange: glyphRange,
-            in: textContainer
-        ) { rect, _ in
-            guard rect.width.isFinite, rect.height.isFinite,
-                  rect.width > 0.0, rect.height > 0.0 else {
-                return
-            }
-            rects.append(rect)
-        }
-        return rects
-    }
-}
 
 /// The native source mirror is deliberately a view cache, never a second
 /// document model. Rust owns canonical source, revision, selection and
@@ -3350,12 +3156,9 @@ private final class DocumentTextView: NSTextView {
     private var linkRotorDelegate: YuAccessibilityRotorDelegate!
     private var nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
     private var synchronizingSelection = false
-    private var visualMirror: ProjectionTextKitMirror?
-    private var visualMirrorEnabled = false
     private var visualCompositionGeneration: UInt64?
     private var visualViewport: NativeVisualViewport?
     private var visualSelectionAnchor: Int?
-    private var sourceSelectedTextAttributes: [NSAttributedString.Key: Any]?
     private var tableResizeTrackingArea: NSTrackingArea?
     private var tableResizeCursorActive = false
     private var taskCheckboxPointerConsumed = false
@@ -3470,34 +3273,6 @@ private final class DocumentTextView: NSTextView {
         postAccessibilityRefresh()
     }
 
-    /// Enables the visual pointer adapter. The visible NSTextView remains the
-    /// canonical source mirror; this builds a disposable TextKit layout from
-    /// Rust projected text for caret/selection/input presentation, while
-    /// pointer boundaries come from Rust's CoreText-shaped endpoint.
-    func setVisualMirrorEnabled(_ enabled: Bool) throws {
-        visualMirrorEnabled = enabled
-        visualSelectionAnchor = nil
-        if enabled {
-            if sourceSelectedTextAttributes == nil {
-                sourceSelectedTextAttributes = selectedTextAttributes
-            }
-            applyVisualSelectionPaint(hidden: true)
-            try refreshVisualMirror()
-        } else {
-            visualMirror = nil
-            visualCompositionGeneration = nil
-            visualViewport = nil
-            if let sourceSelectedTextAttributes {
-                selectedTextAttributes = sourceSelectedTextAttributes
-            }
-            self.sourceSelectedTextAttributes = nil
-        }
-        needsDisplay = true
-    }
-
-    func setVisualMirrorEnabledForSelfCheck(_ enabled: Bool) throws {
-        try setVisualMirrorEnabled(enabled)
-    }
 
 
 
@@ -3507,122 +3282,16 @@ private final class DocumentTextView: NSTextView {
 
 
 
-    private func applyVisualSelectionPaint(hidden: Bool) {
-        guard visualMirrorEnabled else { return }
-        if hidden {
-            var attributes = selectedTextAttributes
-            attributes[.backgroundColor] = NSColor.clear
-            attributes[.foregroundColor] = textColor ?? NSColor.textColor
-            selectedTextAttributes = attributes
-        } else if let sourceSelectedTextAttributes {
-            selectedTextAttributes = sourceSelectedTextAttributes
-        }
-    }
 
-    func refreshVisualMirrorForDisplay() throws {
-        guard visualMirrorEnabled else { return }
-        try refreshVisualMirror()
-    }
 
-    func visualMirrorPointForSelfCheck(visualUTF16: Int) -> NSPoint? {
-        guard visualMirrorEnabled,
-              let visualMirror,
-              visualMirror.revision == bridge.state.revision,
-              visualUTF16 >= 0,
-              visualUTF16 <= visualMirror.utf16Length else {
-            return nil
-        }
-        return visualMirror.point(forVisualUTF16: visualUTF16)
-    }
 
-    func setVisualViewportForSelfCheck(_ viewport: NativeVisualViewport) {
-        guard visualMirrorEnabled,
-              viewport.revision == bridge.state.revision else {
-            visualViewport = nil
-            return
-        }
-        visualViewport = viewport
-    }
 
-    func visualViewportPointForSelfCheck(visualUTF16: Int) -> NSPoint? {
-        guard let documentPoint = visualMirrorPointForSelfCheck(visualUTF16: visualUTF16),
-              let visualViewport,
-              visualViewport.revision == bridge.state.revision else {
-            return nil
-        }
-        return visualViewport.viewportPoint(forDocumentPoint: documentPoint)
-    }
 
-    func visualViewportRoundTripForSelfCheck(_ point: NSPoint) -> NSPoint? {
-        guard let visualViewport,
-              visualViewport.revision == bridge.state.revision else {
-            return nil
-        }
-        return visualViewport.documentPoint(
-            forViewportPoint: visualViewport.viewportPoint(forDocumentPoint: point)
-        )
-    }
 
-    func visualCaretRectForDisplay() -> NSRect? {
-        guard visualMirrorEnabled,
-              let visualMirror,
-              visualMirror.revision == bridge.state.revision else {
-            return nil
-        }
-        let selection = bridge.selection
-        let sourceUTF16 = UInt64(selection.range.location + selection.range.length)
-        guard let visualUTF16 = visualUTF16ForSource(
-            sourceUTF16,
-            affinity: selection.affinity,
-            mirror: visualMirror
-        ) else {
-            return nil
-        }
-        let rect = visualMirror.caretRect(forVisualUTF16: visualUTF16)
-        return rect.offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
-    }
 
-    /// Maps the current Rust-owned source selection into visual TextKit
-    /// rectangles. The source NSTextView selection background is cleared when
-    /// this adapter is enabled, so these rectangles are the only selection
-    /// highlight in the projected surface.
-    func visualSelectionRectsForDisplay() -> [NSRect] {
-        guard visualMirrorEnabled,
-              !bridge.composition.active,
-              let visualMirror,
-              visualMirror.revision == bridge.state.revision else {
-            return []
-        }
-        let selection = bridge.selection
-        guard selection.revision == visualMirror.revision,
-              selection.range.location >= 0,
-              selection.range.length > 0,
-              let projection = try? bridge.projectionSelection(
-                  revision: selection.revision,
-                  sourceRange: selection.range,
-                  affinity: selection.affinity
-              ),
-              projection.revision == visualMirror.revision else {
-            return []
-        }
-        return visualMirror.selectionRects(forVisualRange: projection.visualRange).map {
-            $0.offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
-        }
-    }
 
-    func visualSelectionRectsForSelfCheck() -> [NSRect] {
-        visualSelectionRectsForDisplay()
-    }
 
-    func visualMirrorStringForSelfCheck() -> String? {
-        guard visualMirrorEnabled,
-              let visualMirror,
-              visualMirror.revision == bridge.state.revision,
-              visualCompositionGeneration == currentCompositionGeneration() else {
-            return nil
-        }
-        return visualMirror.string
-    }
+
 
     @discardableResult
     func applyVisualPointerSelectionForSelfCheck(
@@ -3632,63 +3301,12 @@ private final class DocumentTextView: NSTextView {
         applyVisualPointerSelection(at: point, extending: extending)
     }
 
-    func visualMarkedRangeForSelfCheck() -> NSRange? {
-        guard visualMirrorEnabled,
-              bridge.composition.active,
-              let visualMirror,
-              visualMirror.revision == bridge.state.revision,
-              let generation = visualCompositionGeneration,
-              let projection = try? bridge.compositionProjection(revision: bridge.state.revision),
-              projection.generation == generation,
-              projection.visualReplacementRange.location >= 0,
-              NSMaxRange(projection.visualReplacementRange) <= visualMirror.utf16Length else {
-            return nil
-        }
-        return projection.visualReplacementRange
-    }
 
     @discardableResult
     func applyVisualSelectionForSelfCheck(_ visualRange: NSRange) -> Bool {
         applyVisualSelection(visualRange)
     }
 
-    private func refreshVisualMirror() throws {
-        guard visualMirrorEnabled else {
-            visualMirror = nil
-            visualCompositionGeneration = nil
-            return
-        }
-        let revision = bridge.state.revision
-        let projected: String
-        let generation: UInt64?
-        if bridge.composition.active {
-            let metadata = try bridge.compositionProjection(revision: revision)
-            let value = try bridge.copyCompositionProjection(
-                revision: metadata.revision,
-                generation: metadata.generation
-            )
-            // A marked-text callback may race a composition update. Do not
-            // publish a mirror unless both metadata and copied text belong to
-            // the same generation-bound snapshot.
-            let current = try bridge.compositionProjection(revision: revision)
-            guard current.generation == metadata.generation else {
-                throw BridgeError.operation(16)
-            }
-            projected = value
-            generation = metadata.generation
-        } else {
-            projected = try bridge.projectedSource(revision: revision)
-            generation = nil
-        }
-        let width = max(bounds.width - 2.0 * textContainerOrigin.x, 1.0)
-        visualMirror = ProjectionTextKitMirror(
-            text: projected,
-            revision: revision,
-            width: width,
-            font: font ?? NSFont.systemFont(ofSize: 16.0)
-        )
-        visualCompositionGeneration = generation
-    }
 
     private func currentCompositionGeneration() -> UInt64? {
         guard bridge.composition.active else { return nil }
@@ -3713,25 +3331,25 @@ private final class DocumentTextView: NSTextView {
     /// Resolves a visual document point through the Rust CoreText-shaped
     /// block layout. TextKit remains the input/IME/accessibility host, but it
     /// must not guess glyph boundaries for production pointer selection.
-    private func shapedVisualOffset(
-        at point: NSPoint,
-        mirror: ProjectionTextKitMirror
-    ) -> Int? {
+    /// 命中测试完全由 Rust layout 完成。此处不再用 TextKit 布局出的
+    /// visual 长度做上界校验——那等于用第二套布局系统验证第一套，
+    /// 而第二套布局系统本身就是要消除的对象（不变量 I5、E1）。
+    /// Rust 返回的 visualUTF16 已绑定同一 Revision，越界由 Rust 侧拒绝。
+    private func shapedVisualOffset(at point: NSPoint) -> Int? {
         guard point.x.isFinite,
               point.y.isFinite,
               let (size, width) = visualLayoutMetrics(),
               let hit = try? bridge.macosProjectionHitTest(
-                  revision: mirror.revision,
+                  revision: bridge.state.revision,
                   point: CGPoint(x: point.x, y: point.y),
                   size: size,
                   maxWidth: width
               ),
-              hit.revision == mirror.revision,
+              hit.revision == bridge.state.revision,
               hit.point.x.isFinite,
               hit.point.y.isFinite,
               let visualOffset = Int(exactly: hit.visualUTF16),
-              visualOffset >= 0,
-              visualOffset <= mirror.utf16Length else {
+              visualOffset >= 0 else {
             return nil
         }
         return visualOffset
@@ -3742,17 +3360,10 @@ private final class DocumentTextView: NSTextView {
         at point: NSPoint,
         extending: Bool
     ) -> Bool {
-        guard visualMirrorEnabled,
-              !bridge.composition.active,
-              let visualMirror,
-              visualMirror.revision == bridge.state.revision else {
-            return false
-        }
-        guard let visualOffset = shapedVisualOffset(at: point, mirror: visualMirror) else {
-            // The Rust endpoint is deliberately strict about Revision and
-            // published viewport metrics. If geometry is stale, return to
-            // AppKit's canonical source hit-test instead of selecting an
-            // offset from a mismatched visual mirror.
+        guard !bridge.composition.active else { return false }
+        guard let visualOffset = shapedVisualOffset(at: point) else {
+            // Rust 端对 Revision 与已发布的 viewport metrics 有意严格。
+            // 几何过期时放弃本次指针选区，等下一帧重试。
             return false
         }
         if !extending || visualSelectionAnchor == nil {
@@ -3761,8 +3372,7 @@ private final class DocumentTextView: NSTextView {
                 let sourceUTF16 = endpoints.anchorUTF16
                 visualSelectionAnchor = visualUTF16ForSource(
                     sourceUTF16,
-                    affinity: endpoints.affinity,
-                    mirror: visualMirror
+                    affinity: endpoints.affinity
                 ) ?? visualOffset
             } else {
                 visualSelectionAnchor = visualOffset
@@ -3781,18 +3391,17 @@ private final class DocumentTextView: NSTextView {
 
     private func visualUTF16ForSource(
         _ sourceUTF16: UInt64,
-        affinity: UInt8,
-        mirror: ProjectionTextKitMirror
+        affinity: UInt8
     ) -> Int? {
+        let revision = bridge.state.revision
         guard let caret = try? bridge.projectionCaret(
-            revision: mirror.revision,
+            revision: revision,
             sourceUTF16: sourceUTF16,
             affinity: affinity
         ),
-              caret.revision == mirror.revision,
+              caret.revision == revision,
               let visualUTF16 = Int(exactly: caret.visualUTF16),
-              visualUTF16 >= 0,
-              visualUTF16 <= mirror.utf16Length else {
+              visualUTF16 >= 0 else {
             return nil
         }
         return visualUTF16
@@ -3803,18 +3412,14 @@ private final class DocumentTextView: NSTextView {
         _ visualRange: NSRange,
         anchorIsVisualStart: Bool? = nil
     ) -> Bool {
-        guard visualMirrorEnabled,
-              !bridge.composition.active,
-              let visualMirror,
-              visualMirror.revision == bridge.state.revision,
+        guard !bridge.composition.active,
               visualRange.location >= 0,
-              visualRange.length >= 0,
-              NSMaxRange(visualRange) <= visualMirror.utf16Length else {
+              visualRange.length >= 0 else {
             return false
         }
         do {
             let source = try bridge.projectionSourceSelection(
-                revision: visualMirror.revision,
+                revision: bridge.state.revision,
                 visualRange: visualRange,
                 affinity: 1
             )
@@ -4115,11 +3720,10 @@ private final class DocumentTextView: NSTextView {
             setTableResizeCursor(active: true)
             return
         }
-        if visualMirrorEnabled,
-           applyVisualPointerSelection(
-               at: visualPoint(for: event),
-               extending: event.modifierFlags.contains(.shift)
-           ) {
+        if applyVisualPointerSelection(
+            at: visualPoint(for: event),
+            extending: event.modifierFlags.contains(.shift)
+        ) {
             return
         }
         visualSelectionAnchor = nil
@@ -4355,9 +3959,6 @@ private final class DocumentTextView: NSTextView {
     }
 
     override func markedRange() -> NSRange {
-        if let visualRange = visualMarkedRangeForSelfCheck() {
-            return visualRange
-        }
         return nativeMarkedRange
     }
 
@@ -4365,15 +3966,6 @@ private final class DocumentTextView: NSTextView {
         forProposedRange proposedRange: NSRange,
         actualRange: NSRangePointer?
     ) -> NSAttributedString? {
-        if let visualString = visualMirrorStringForSelfCheck() {
-            let length = (visualString as NSString).length
-            let range = clampedRange(proposedRange, length: length)
-            actualRange?.pointee = range
-            guard range.location != NSNotFound else { return nil }
-            return NSAttributedString(
-                string: (visualString as NSString).substring(with: range)
-            )
-        }
         let range = clampedRange(proposedRange, length: (string as NSString).length)
         actualRange?.pointee = range
         guard range.location != NSNotFound else { return nil }
@@ -4612,18 +4204,6 @@ private final class DocumentTextView: NSTextView {
         selectedRange = clampedRange(selection, length: (string as NSString).length)
         synchronizingSelection = false
         needsDisplay = true
-        if visualMirrorEnabled {
-            do {
-                try refreshVisualMirror()
-            } catch {
-                visualMirror = nil
-                visualCompositionGeneration = nil
-                visualViewport = nil
-                // Projection is an enhancement to the source mirror. If a
-                // refresh races an edit, keep TextKit interactive and let the
-                // next layout/source revision rebuild the disposable mirror.
-            }
-        }
     }
 
     private func stringValue(_ value: Any) -> String {
@@ -4918,82 +4498,6 @@ private final class MacosSurfaceHostView: NSView {
     }
 }
 
-/// Draws visual selection/caret decorations above the Rust-shaped glyph
-/// surface. Geometry is supplied by Rust; TextKit remains the fallback
-/// painter while the surface publication is stale or unavailable.
-///
-/// This view is intentionally transparent to AppKit hit-testing. The source
-/// TextKit view remains the owner of keyboard, IME and Accessibility events;
-/// this layer only owns the pixels for transient visual decorations. Geometry
-/// is supplied by the revision-bound visual mirror and is discarded whenever
-/// the mirror is stale or the surface detaches.
-private final class MacosVisualDecorationView: NSView {
-    private(set) var revision: UInt64?
-    private(set) var selectionRects: [NSRect] = []
-    private(set) var caretRect: NSRect?
-    private(set) var compositionActive = false
-    private(set) var paintsDecorations = true
-
-    var hasValidFrame: Bool {
-        revision != nil && caretRect != nil
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        nil
-    }
-
-    func update(
-        revision: UInt64,
-        selectionRects: [NSRect],
-        caretRect: NSRect?,
-        compositionActive: Bool,
-        paintsDecorations: Bool = true
-    ) {
-        self.revision = revision
-        self.selectionRects = selectionRects.filter(Self.isDrawable)
-        self.caretRect = caretRect.flatMap { Self.isDrawable($0) ? $0 : nil }
-        self.compositionActive = compositionActive
-        self.paintsDecorations = paintsDecorations
-        isHidden = !paintsDecorations
-        needsDisplay = true
-    }
-
-    func clear() {
-        revision = nil
-        selectionRects.removeAll(keepingCapacity: true)
-        caretRect = nil
-        compositionActive = false
-        paintsDecorations = true
-        isHidden = false
-        needsDisplay = true
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard revision != nil, paintsDecorations else { return }
-
-        NSColor.selectedTextBackgroundColor.withAlphaComponent(0.38).setFill()
-        for rect in selectionRects {
-            let clipped = rect.intersection(dirtyRect)
-            guard !clipped.isNull, !clipped.isEmpty else { continue }
-            clipped.fill()
-        }
-
-        guard let caretRect else { return }
-        let clippedCaret = caretRect.intersection(dirtyRect)
-        guard !clippedCaret.isNull, !clippedCaret.isEmpty else { return }
-        let color = compositionActive
-            ? NSColor.controlAccentColor
-            : NSColor.textColor
-        color.setFill()
-        clippedCaret.fill()
-    }
-
-    private static func isDrawable(_ rect: NSRect) -> Bool {
-        rect.minX.isFinite && rect.minY.isFinite
-            && rect.width.isFinite && rect.height.isFinite
-            && rect.width > 0.0 && rect.height > 0.0
-    }
-}
 
 
 
@@ -5937,7 +5441,6 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     private let bridge: StorageBridge
     private lazy var textView = DocumentTextView(bridge: bridge)
     private let surfaceHostView = MacosSurfaceHostView()
-    private let decorationHostView = MacosVisualDecorationView()
     private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
     private var saveButton: NSButton?
@@ -5959,7 +5462,6 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     /// shaped frame that may become the primary visual surface. TextKit
     /// projected decorations are a fallback overlay and must never hide the
     /// source mirror or leave a stale Metal frame visible underneath it.
-    private var rustDecorationFrameAccepted = false
 
     init(bridge: StorageBridge) {
         self.bridge = bridge
@@ -5968,13 +5470,12 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         super.init(nibName: nil, bundle: nil)
         surfaceCoordinator.onSurfaceStateChange = { [weak self] in
             self?.textView.refreshTableResizeAccessibility()
-            self?.updateVisualDecorations()
+            self?.syncSourceGlyphVisibility()
         }
         surfaceCoordinator.onError = { [weak self] error in
             // The source TextKit mirror remains usable when a machine has no
             // Metal drawable; surface lifecycle failure is diagnostic, not a
             // reason to interrupt editing with a modal alert.
-            self?.clearVisualDecorations()
             self?.statusLabel.toolTip = "Native surface inactive: \(error.localizedDescription)"
         }
     }
@@ -6010,7 +5511,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             self.surfaceCoordinator.resetTableResizeAfterDocumentChange()
             self.textView.refreshTableResizeAccessibility()
             self.updateStatus()
-            self.updateVisualDecorations()
+            self.syncSourceGlyphVisibility()
             self.scheduleVisualSubmit()
         }
         textView.onBeforeCommand = { [weak self] in
@@ -6018,9 +5519,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         }
         textView.onCaretChange = { [weak self] in
             guard let self else { return }
-            try? self.textView.refreshVisualMirrorForDisplay()
             self.surfaceCoordinator.invalidateEditorDecorationPublication()
-            self.clearVisualDecorations()
             self.scheduleVisualSubmit()
             // AppKit may deliver selection changes while TextKit is still
             // inside its event callback. Defer the scroll mutation until the
@@ -6093,20 +5592,18 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             if attached {
                 if self.visualEnhancementsReady {
                     self.surfaceCoordinator.scheduleSubmit()
-                    self.updateVisualDecorations()
+                    self.syncSourceGlyphVisibility()
                 } else {
-                    self.clearVisualDecorations()
                 }
                 self.textView.refreshTableResizeAccessibility()
             } else {
                 self.surfaceCoordinator.detach()
-                self.clearVisualDecorations()
                 self.textView.refreshTableResizeAccessibility()
             }
         }
         surfaceHostView.onGeometryChange = { [weak self] in
             self?.scheduleVisualSubmit()
-            self?.updateVisualDecorations()
+            self?.syncSourceGlyphVisibility()
             self?.textView.refreshTableResizeAccessibility()
         }
         scrollView.contentView.postsBoundsChangedNotifications = true
@@ -6116,7 +5613,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             queue: .main
         ) { [weak self] _ in
             self?.scheduleVisualSubmit()
-            self?.updateVisualDecorations()
+            self?.syncSourceGlyphVisibility()
             self?.textView.refreshTableResizeAccessibility()
         }
 
@@ -6144,7 +5641,6 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         // remain owned by the source view underneath it. The frame is synced
         // to the clip viewport in viewDidLayout, excluding native scrollers.
         root.addSubview(surfaceHostView, positioned: .above, relativeTo: scrollView)
-        root.addSubview(decorationHostView, positioned: .above, relativeTo: surfaceHostView)
         NSLayoutConstraint.activate([
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
@@ -6166,14 +5662,10 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         if surfaceHostView.frame != viewportFrame {
             surfaceHostView.frame = viewportFrame
         }
-        if decorationHostView.frame != viewportFrame {
-            decorationHostView.frame = viewportFrame
-        }
         guard visualEnhancementsReady else {
             // Keep the native source mirror fully visible during the first
             // layout. The enhancement layer is enabled from viewDidAppear,
             // after AppKit has a real window/clip geometry to report.
-            clearVisualDecorations()
             return
         }
         let visualWidth = max(
@@ -6182,22 +5674,9 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
         )
         surfaceCoordinator.setContentWidth(visualWidth)
         textView.refreshTableResizeAccessibility()
-        do {
-            if !visualPointerAdapterEnabled {
-                try textView.setVisualMirrorEnabled(true)
-                visualPointerAdapterEnabled = true
-                visualPointerLayoutWidth = visualWidth
-            } else if abs(visualPointerLayoutWidth - visualWidth) > 0.5 {
-                try textView.refreshVisualMirrorForDisplay()
-                visualPointerLayoutWidth = visualWidth
-            }
-        } catch {
-            visualPointerAdapterEnabled = false
-            visualPointerLayoutWidth = -1.0
-            try? textView.setVisualMirrorEnabled(false)
-            statusLabel.toolTip = "Visual pointer inactive: \(error.localizedDescription)"
-        }
-        updateVisualDecorations()
+        // 指针命中测试直接走 Rust layout，不需要预先建立任何 TextKit 镜像，
+        // 因而也没有「适配器未就绪」这个状态。
+        syncSourceGlyphVisibility()
         textView.refreshTableResizeAccessibility()
         surfaceCoordinator.scheduleSubmit()
         surfaceCoordinator.revealCaretIfNeeded()
@@ -6226,7 +5705,7 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
             promptedExternalDisk = nil
         }
         updateStatus()
-        updateVisualDecorations()
+        syncSourceGlyphVisibility()
         textView.refreshTableResizeAccessibility()
         scheduleVisualSubmit()
         if visualEnhancementsReady {
@@ -6236,15 +5715,8 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
 
     func detachSurfaceHost() {
         surfaceCoordinator.detach()
-        clearVisualDecorations()
     }
 
-    /// surface 不可用时只清掉装饰几何。绝不把绘制责任交回 TextKit——
-    /// 那条路径已经不存在了（不变量 I5）。
-    private func clearVisualDecorations() {
-        decorationHostView.clear()
-        rustDecorationFrameAccepted = false
-    }
 
     /// Rust surface 是唯一渲染路径（不变量 I5）。TextKit 永不绘制像素，
     /// 因此这里没有 gate、没有 fallback reason、没有 coverage 判断：
@@ -6254,121 +5726,12 @@ private final class DocumentViewController: NSViewController, NSMenuItemValidati
     }
 
 
-    /// Publishes Rust/CoreText-shaped decoration geometry into the sibling
-    /// overlay. The Rust coordinates are document-space and the only native
-    /// transform here is the current scroll offset into the surface sibling's
-    /// viewport-local coordinate system. Active composition uses the same
-    /// generation-bound Rust geometry as the surface; TextKit's projected
-    /// overlay is only a failure fallback.
-    private func updateVisualDecorations() {
-        guard visualEnhancementsReady else {
-            clearVisualDecorations()
-            return
-        }
-        guard decorationHostView.superview != nil else {
-            clearVisualDecorations()
-            return
-        }
-        if let geometry = surfaceCoordinator.visualDecorationGeometry() {
-            do {
-                let (snapshot, caret, selection) = try bridge.macosVisualDecorations(
-                    revision: bridge.state.revision,
-                    compositionGeneration: bridge.composition.generation,
-                    size: geometry.size,
-                    maxWidth: geometry.maxWidth,
-                    scrollY: geometry.scrollY,
-                    viewportHeight: geometry.viewportHeight
-                )
-                guard snapshot.revision == bridge.state.revision,
-                      snapshot.caretPresent,
-                      caret.present,
-                      caret.revision == snapshot.revision else {
-                    rustDecorationFrameAccepted = false
-                    if bridge.composition.active {
-                        updateVisualDecorationsFromTextKit()
-                    } else {
-                        clearVisualDecorations()
-                    }
-                    return
-                }
-                let scrollY = geometry.scrollY
-                let localSelection = selection.map {
-                    NSRect(
-                        x: $0.rect.origin.x,
-                        y: $0.rect.origin.y - CGFloat(scrollY),
-                        width: $0.rect.width,
-                        height: $0.rect.height
-                    )
-                }
-                let localCaret = NSRect(
-                    x: caret.rect.origin.x,
-                    y: caret.rect.origin.y - CGFloat(scrollY),
-                    width: caret.rect.width,
-                    height: caret.rect.height
-                )
-                // selection/caret 已作为 source-backed decoration 进入同一
-                // retained frame，AppKit sibling 只保留几何用于命中测试，
-                // 永不绘制——不存在第二条渲染路径（不变量 I5）。
-                decorationHostView.update(
-                    revision: snapshot.revision,
-                    selectionRects: localSelection,
-                    caretRect: localCaret,
-                    compositionActive: bridge.composition.active,
-                    paintsDecorations: false
-                )
-                rustDecorationFrameAccepted = true
-                syncSourceGlyphVisibility()
-                return
-            } catch {
-                // A transient TextKit projection is retained only when the
-                // generation-bound Rust decoration query cannot provide a
-                // drawable frame for active marked text.
-                rustDecorationFrameAccepted = false
-                if bridge.composition.active {
-                    updateVisualDecorationsFromTextKit()
-                } else {
-                    clearVisualDecorations()
-                }
-                return
-            }
-        }
-        if bridge.composition.active {
-            updateVisualDecorationsFromTextKit()
-        } else {
-            clearVisualDecorations()
-        }
-    }
 
     private func scheduleVisualSubmit() {
         guard visualEnhancementsReady else { return }
         surfaceCoordinator.scheduleSubmit()
     }
 
-    /// Converts the disposable visual mirror geometry into the sibling
-    /// decoration view's local coordinates for active marked text only. A
-    /// normal Revision/geometry failure uses the canonical source fallback;
-    /// it must not turn TextKit's projected caret into a second renderer.
-    private func updateVisualDecorationsFromTextKit() {
-        guard bridge.composition.active,
-              visualPointerAdapterEnabled,
-              decorationHostView.superview != nil,
-              let caret = textView.visualCaretRectForDisplay() else {
-            clearVisualDecorations()
-            return
-        }
-        rustDecorationFrameAccepted = false
-        let selection = textView.visualSelectionRectsForDisplay().map {
-            textView.convert($0, to: decorationHostView)
-        }
-        let convertedCaret = textView.convert(caret, to: decorationHostView)
-        decorationHostView.update(
-            revision: bridge.state.revision,
-            selectionRects: selection,
-            caretRect: convertedCaret,
-            compositionActive: bridge.composition.active
-        )
-        syncSourceGlyphVisibility()
-    }
 
     @objc private func save() {
         do {
@@ -7202,7 +6565,6 @@ private func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
             estimatedBlockHeight: Float(metrics.lineHeight),
             overscan: 0.0
         )
-        try textView.setVisualMirrorEnabledForSelfCheck(true)
 
         let projected = try bridge.projectedSource(revision: revision)
         let hit = try bridge.macosProjectionHitTest(
@@ -7224,13 +6586,36 @@ private func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
         )
         precondition(bridge.selection.range.location == 0)
 
-        let visualEnd = (projected as NSString).range(of: "粗体")
-        precondition(visualEnd.location != NSNotFound)
-        guard let endPoint = textView.visualMirrorPointForSelfCheck(
-            visualUTF16: visualEnd.location + visualEnd.length
-        ) else {
-            preconditionFailure("visual mirror end point is unavailable")
+        // 用 Rust 自己的 caret 几何反推指针坐标，而不是再建一套 TextKit
+        // 布局来求点：这样断言的是「caret 几何与 hit-test 互为逆运算」，
+        // 属于 Rust 内部自洽性，不引入第二套布局系统（不变量 E1、I5）。
+        let sourceEnd = (bridge.source as NSString).range(of: "粗体")
+        precondition(sourceEnd.location != NSNotFound)
+        let sourceEndUTF16 = UInt64(sourceEnd.location + sourceEnd.length)
+        let (_, viewportBlocks) = try bridge.macosShapedViewportBlocks(
+            revision: revision,
+            size: size,
+            maxWidth: pointerWidth,
+            scrollY: 0.0,
+            viewportHeight: 600.0
+        )
+        guard let targetBlock = viewportBlocks.first(where: {
+            UInt64($0.sourceRange.location) <= sourceEndUTF16
+                && sourceEndUTF16 <= UInt64(NSMaxRange($0.sourceRange))
+        }) else {
+            preconditionFailure("no viewport block contains the target source offset")
         }
+        let endCaret = try bridge.macosBlockCaret(
+            revision: revision,
+            blockIndex: targetBlock.blockIndex,
+            sourceUTF16: sourceEndUTF16,
+            affinity: 0,
+            size: size,
+            maxWidth: pointerWidth
+        )
+        precondition(endCaret.revision == revision)
+        precondition(endCaret.point.x.isFinite && endCaret.point.y.isFinite)
+        let endPoint = endCaret.point
         precondition(
             textView.applyVisualPointerSelectionForSelfCheck(
                 at: endPoint,
@@ -7271,258 +6656,9 @@ private func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
     }
 }
 
-private func runVisualMirrorSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let textView = DocumentTextView(bridge: bridge)
-        try textView.setVisualMirrorEnabledForSelfCheck(true)
-        textView.onCaretChange = {
-            try? textView.refreshVisualMirrorForDisplay()
-        }
-        let revision = bridge.state.revision
-        let projected = try bridge.projectedSource(revision: revision)
-        let mirrorStorage = NSTextStorage(string: projected)
-        let mirrorLayout = NSLayoutManager()
-        let mirrorContainer = NSTextContainer(
-            size: NSSize(width: 500.0, height: CGFloat.greatestFiniteMagnitude)
-        )
-        mirrorContainer.lineFragmentPadding = 0.0
-        mirrorLayout.addTextContainer(mirrorContainer)
-        mirrorStorage.addLayoutManager(mirrorLayout)
-        precondition(mirrorStorage.string == projected)
-
-        let sourceStrong = (bridge.source as NSString).range(of: "**粗体**")
-        let visualStrong = (projected as NSString).range(of: "粗体")
-        precondition(sourceStrong.location != NSNotFound)
-        precondition(visualStrong.location != NSNotFound)
-        precondition(
-            textView.visualMirrorPointForSelfCheck(visualUTF16: visualStrong.location) != nil
-        )
-        precondition(textView.visualCaretRectForDisplay() != nil)
-        precondition(textView.applyVisualSelectionForSelfCheck(visualStrong))
-        precondition(bridge.selection.range == sourceStrong)
-        let revealed = try bridge.projectedSource(revision: revision)
-        let revealedStrong = (revealed as NSString).range(of: "**粗体**")
-        precondition(revealedStrong.location != NSNotFound)
-        precondition(revealedStrong.length == sourceStrong.length)
-        precondition(textView.visualMirrorStringForSelfCheck() == revealed)
-        precondition(textView.visualCaretRectForDisplay() != nil)
-        let selectionRects = textView.visualSelectionRectsForSelfCheck()
-        precondition(!selectionRects.isEmpty)
-        precondition(selectionRects.allSatisfy {
-            $0.width.isFinite && $0.height.isFinite && $0.width > 0.0 && $0.height > 0.0
-        })
-        let glyphRange = mirrorLayout.glyphRange(
-            forCharacterRange: visualStrong,
-            actualCharacterRange: nil
-        )
-        precondition(glyphRange.length > 0)
-
-        let forward = try bridge.projectionSelection(
-            revision: revision,
-            sourceRange: sourceStrong,
-            affinity: 1
-        )
-        precondition(forward.visualRange == revealedStrong)
-        let reverse = try bridge.projectionSourceSelection(
-            revision: revision,
-            visualRange: revealedStrong,
-            affinity: 1
-        )
-        precondition(reverse.revision == revision)
-        precondition(reverse.visualRange == revealedStrong)
-        precondition(reverse.sourceRange == sourceStrong)
-        precondition(reverse.roundTripVisualRange == revealedStrong)
-
-        let visualCaret = try bridge.projectionSourceCaret(
-            revision: revision,
-            visualUTF16: UInt64(revealedStrong.location),
-            affinity: 0
-        )
-        precondition(visualCaret.revision == revision)
-        precondition(visualCaret.sourceUTF16 == UInt64(sourceStrong.location))
-        precondition(visualCaret.roundTripVisualUTF16 == UInt64(revealedStrong.location))
-
-        precondition(
-            textView.applyVisualSelectionForSelfCheck(NSRange(location: 0, length: 0))
-        )
-        let hiddenAgain = try bridge.projectedSource(revision: revision)
-        precondition(hiddenAgain == projected)
-        precondition(textView.visualMirrorStringForSelfCheck() == projected)
-
-        _ = try bridge.insertText("x")
-        do {
-            _ = try bridge.projectionSourceSelection(
-                revision: revision,
-                visualRange: visualStrong,
-                affinity: 1
-            )
-            preconditionFailure("stale visual mirror mapping unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 13)
-        }
-        // The native mirror remains a disposable old-revision snapshot; it is
-        // not silently patched after Rust source changes.
-        precondition(mirrorStorage.string == projected)
-        print(
-            "Yu Visual Mirror self-check: TextKit visual UTF-16 range "
-                + "\(revealedStrong) ↔ source range \(sourceStrong), delimiters reveal/hide, "
-                + "selection highlight rects=\(selectionRects.count); stale mirror rejected"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Visual Mirror self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
 
 
 
-private func runVisualIMESelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let sourceBefore = bridge.source
-        let revision = bridge.state.revision
-        let shapedSize: Float = 14.0
-        let shapedWidth: Float = 500.0
-        let metrics = try bridge.macosFontMetrics(
-            revision: revision,
-            size: shapedSize,
-            maxWidth: shapedWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: shapedWidth,
-            lineHeight: Float(metrics.lineHeight),
-            defaultAdvance: Float(metrics.defaultAdvance),
-            estimatedBlockHeight: Float(metrics.lineHeight),
-            overscan: 0.0
-        )
-        let textView = DocumentTextView(bridge: bridge)
-        try textView.setVisualMirrorEnabledForSelfCheck(true)
-
-        let sourceStrong = (sourceBefore as NSString).range(of: "**粗体**")
-        precondition(sourceStrong.location != NSNotFound)
-        let replacement = NSRange(location: sourceStrong.location + 2, length: 2)
-        let visualStrong = try bridge.projectedSource(revision: revision)
-        let visualReplacementStart = (visualStrong as NSString).range(of: "粗体").location
-        precondition(visualReplacementStart != NSNotFound)
-
-        textView.setMarkedText(
-            "日本🙂",
-            selectedRange: NSRange(location: 2, length: 2),
-            replacementRange: replacement
-        )
-        let initial = try bridge.compositionProjection(revision: revision)
-        let initialProjected = try bridge.copyCompositionProjection(
-            revision: initial.revision,
-            generation: initial.generation
-        )
-        precondition(textView.visualMirrorStringForSelfCheck() == initialProjected)
-        precondition(initialProjected.contains("日本🙂"))
-        precondition(!initialProjected.contains("**粗体**"))
-        precondition(
-            initial.visualReplacementRange == NSRange(
-                location: visualReplacementStart,
-                length: "日本🙂".utf16.count
-            )
-        )
-        precondition(textView.visualMarkedRangeForSelfCheck() == initial.visualReplacementRange)
-        precondition(textView.markedRange() == initial.visualReplacementRange)
-        precondition(textView.hasMarkedText())
-        let initialShapedCaret = try bridge.macosCompositionShapedCaret(
-            revision: initial.revision,
-            generation: initial.generation,
-            sourceUTF16: UInt64(replacement.location),
-            affinity: 1,
-            size: shapedSize,
-            maxWidth: shapedWidth
-        )
-        precondition(initialShapedCaret.revision == revision)
-        precondition(initialShapedCaret.generation == initial.generation)
-        precondition(initialShapedCaret.sourceUTF16 == UInt64(replacement.location))
-        precondition(initialShapedCaret.visualSelection == initial.visualSelection)
-        precondition(initialShapedCaret.visualReplacement == initial.visualReplacementRange)
-        precondition(initialShapedCaret.point.x.isFinite)
-        precondition(initialShapedCaret.point.y.isFinite)
-        precondition(initialShapedCaret.size.height > 0.0)
-        var actualRange = NSRange(location: NSNotFound, length: 0)
-        let marked = textView.attributedSubstring(
-            forProposedRange: initial.visualReplacementRange,
-            actualRange: &actualRange
-        )
-        precondition(marked?.string == "日本🙂")
-        precondition(actualRange == initial.visualReplacementRange)
-
-        textView.setMarkedText(
-            "日本語",
-            selectedRange: NSRange(location: 3, length: 0),
-            replacementRange: replacement
-        )
-        let updated = try bridge.compositionProjection(revision: revision)
-        let updatedProjected = try bridge.copyCompositionProjection(
-            revision: updated.revision,
-            generation: updated.generation
-        )
-        precondition(updated.generation != initial.generation)
-        precondition(updatedProjected.contains("日本語"))
-        precondition(textView.visualMirrorStringForSelfCheck() == updatedProjected)
-        precondition(textView.markedRange() == updated.visualReplacementRange)
-        precondition(updated.visualReplacementRange.length == "日本語".utf16.count)
-        let updatedShapedCaret = try bridge.macosCompositionShapedCaret(
-            revision: updated.revision,
-            generation: updated.generation,
-            sourceUTF16: UInt64(replacement.location),
-            affinity: 1,
-            size: shapedSize,
-            maxWidth: shapedWidth
-        )
-        precondition(updatedShapedCaret.generation == updated.generation)
-        precondition(updatedShapedCaret.visualSelection == updated.visualSelection)
-        precondition(updatedShapedCaret.visualReplacement == updated.visualReplacementRange)
-        precondition(updatedShapedCaret.point.x.isFinite)
-        precondition(updatedShapedCaret.point.y.isFinite)
-        do {
-            _ = try bridge.copyCompositionProjection(
-                revision: revision,
-                generation: initial.generation
-            )
-            preconditionFailure("stale visual composition unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 16)
-        }
-        do {
-            _ = try bridge.macosCompositionShapedCaret(
-                revision: revision,
-                generation: initial.generation,
-                sourceUTF16: UInt64(replacement.location),
-                affinity: 1,
-                size: shapedSize,
-                maxWidth: shapedWidth
-            )
-            preconditionFailure("stale shaped composition caret unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 16)
-        }
-
-        try bridge.cancelComposition()
-        textView.refreshFromRust()
-        precondition(!textView.hasMarkedText())
-        precondition(textView.markedRange().location == NSNotFound)
-        precondition(bridge.state.revision == revision)
-        precondition(bridge.source == sourceBefore)
-        let canonicalVisual = try bridge.projectedSource(revision: revision)
-        precondition(textView.visualMirrorStringForSelfCheck() == canonicalVisual)
-        print(
-            "Yu Visual IME self-check: visual preedit/replacement range is "
-                + "generation-bound; stale generation rejected and cancel preserved source"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Visual IME self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
 
 private func runCompositionHitTestSelfCheck(path: String) -> Never {
     do {
@@ -8093,141 +7229,6 @@ private func runShapedVerticalSelfCheck(path: String) -> Never {
     }
 }
 
-private func runVisualViewportSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
-        let size: Float = 14.0
-        let maxWidth: Float = 500.0
-        let shaped = try bridge.macosBlockLayout(
-            revision: revision,
-            blockIndex: 2,
-            size: size,
-            maxWidth: maxWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: maxWidth,
-            lineHeight: Float(shaped.lineHeight),
-            defaultAdvance: Float(shaped.defaultAdvance),
-            estimatedBlockHeight: Float(shaped.lineHeight),
-            overscan: 0.0
-        )
-
-        let viewportHeight = max(shaped.lineHeight * 2.0, 1.0)
-        let (fullSnapshot, _) = try bridge.macosShapedViewportBlocks(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: 1_000.0
-        )
-        let expectedMaxScroll = max(fullSnapshot.contentHeight - viewportHeight, 0.0)
-        precondition(expectedMaxScroll > 0.0)
-        let scrollY = min(shaped.lineHeight, expectedMaxScroll)
-        let (snapshot, blocks) = try bridge.macosShapedViewportBlocks(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: Float(scrollY),
-            viewportHeight: Float(viewportHeight)
-        )
-        let viewport = NativeVisualViewport(snapshot)
-        precondition(viewport.revision == revision)
-        precondition(abs(viewport.requestedScrollY - scrollY) < 0.01)
-        precondition(abs(viewport.viewportHeight - viewportHeight) < 0.01)
-        precondition(abs(viewport.maxScrollY - expectedMaxScroll) < 0.01)
-        precondition(snapshot.blockRange.count == blocks.count)
-        precondition(!blocks.isEmpty)
-        precondition(blocks.allSatisfy { $0.revision == revision && $0.y.isFinite })
-
-        let firstDocumentPoint = NSPoint(
-            x: 12.0,
-            y: blocks[0].y + min(1.0, blocks[0].height / 2.0)
-        )
-        let firstViewportPoint = viewport.viewportPoint(forDocumentPoint: firstDocumentPoint)
-        let firstRoundTrip = viewport.documentPoint(forViewportPoint: firstViewportPoint)
-        precondition(abs(firstRoundTrip.x - firstDocumentPoint.x) < 0.001)
-        precondition(abs(firstRoundTrip.y - firstDocumentPoint.y) < 0.001)
-        precondition(
-            abs(firstViewportPoint.y - (firstDocumentPoint.y - viewport.effectiveScrollY)) < 0.001
-        )
-
-        let textView = DocumentTextView(bridge: bridge)
-        try textView.setVisualMirrorEnabledForSelfCheck(true)
-        textView.setVisualViewportForSelfCheck(viewport)
-        let visualDocumentPoint = try unwrapSelfCheck(
-            textView.visualMirrorPointForSelfCheck(visualUTF16: 0)
-        )
-        let visualViewportPoint = try unwrapSelfCheck(
-            textView.visualViewportPointForSelfCheck(visualUTF16: 0)
-        )
-        precondition(
-            abs(
-                viewport.documentPoint(forViewportPoint: visualViewportPoint).y
-                    - visualDocumentPoint.y
-            ) < 0.001
-        )
-        let textViewRoundTrip = try unwrapSelfCheck(
-            textView.visualViewportRoundTripForSelfCheck(visualDocumentPoint)
-        )
-        precondition(abs(textViewRoundTrip.y - visualDocumentPoint.y) < 0.001)
-
-        let sourceEnd = (bridge.source as NSString).length
-        try bridge.setSelection(NSRange(location: sourceEnd, length: 0))
-        let request = try bridge.macosShapedCaretScrollRequest(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: Float(scrollY),
-            viewportHeight: Float(viewportHeight),
-            margin: 0.0
-        )
-        precondition(request.revision == revision)
-        precondition(request.sourceUTF16 == UInt64(sourceEnd))
-        precondition(request.caretPoint.y >= 0.0)
-        precondition(request.currentScrollY == scrollY)
-        precondition(request.targetScrollY >= request.currentScrollY)
-        precondition(request.targetScrollY <= viewport.maxScrollY + 0.01)
-        precondition(request.needsScroll)
-
-        _ = try bridge.insertText("x")
-        precondition(textView.visualViewportPointForSelfCheck(visualUTF16: 0) == nil)
-        do {
-            _ = try bridge.macosShapedViewportBlocks(
-                revision: revision,
-                size: size,
-                maxWidth: maxWidth,
-                scrollY: Float(scrollY),
-                viewportHeight: Float(viewportHeight)
-            )
-            preconditionFailure("stale visual viewport unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 13)
-        }
-        do {
-            _ = try bridge.macosShapedCaretScrollRequest(
-                revision: revision,
-                size: size,
-                maxWidth: maxWidth,
-                scrollY: Float(scrollY),
-                viewportHeight: Float(viewportHeight),
-                margin: 0.0
-            )
-            preconditionFailure("stale caret scroll request unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 13)
-        }
-        print(
-            "Yu Visual Viewport self-check: document↔viewport scroll transform and "
-                + "shaped caret reveal are Revision-bound"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Visual Viewport self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
 
 
 
@@ -8814,14 +7815,6 @@ if let flag = CommandLine.arguments.firstIndex(of: "--shaped-projection-hit-test
    CommandLine.arguments.indices.contains(flag + 1) {
     runShapedProjectionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
 }
-if let flag = CommandLine.arguments.firstIndex(of: "--visual-mirror-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runVisualMirrorSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--visual-ime-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runVisualIMESelfCheck(path: CommandLine.arguments[flag + 1])
-}
 if let flag = CommandLine.arguments.firstIndex(of: "--composition-hit-test-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runCompositionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
@@ -8841,10 +7834,6 @@ if let flag = CommandLine.arguments.firstIndex(of: "--shaped-viewport-self-check
 if let flag = CommandLine.arguments.firstIndex(of: "--shaped-vertical-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runShapedVerticalSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--visual-viewport-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runVisualViewportSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--macos-table-resize-coordinator-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
