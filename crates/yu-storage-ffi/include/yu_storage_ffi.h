@@ -510,45 +510,6 @@ typedef struct YuStorageShapedViewportSnapshot {
     float max_scroll_y;
 } YuStorageShapedViewportSnapshot;
 
-/* Rust/CoreText-shaped visual decoration geometry. Selection rectangles and
- * caret coordinates are document-space and must be offset by scroll_y before
- * a native viewport sibling paints them. Active marked text returns
- * YU_STORAGE_NO_OVERLAY so the host can retain its transient TextKit path. */
-typedef struct YuStorageMacosVisualDecorationSnapshot {
-    uint64_t revision;
-    uint64_t composition_generation;
-    uint64_t selection_count;
-    uint8_t caret_present;
-    float content_height;
-    float scroll_y;
-    float viewport_height;
-    float max_scroll_y;
-    float viewport_width;
-} YuStorageMacosVisualDecorationSnapshot;
-
-typedef struct YuStorageMacosVisualDecorationRect {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t line_index;
-    float x;
-    float y;
-    float width;
-    float height;
-    uint8_t kind;
-} YuStorageMacosVisualDecorationRect;
-
-typedef struct YuStorageMacosVisualDecorationCaret {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t line_index;
-    float x;
-    float y;
-    float width;
-    float height;
-    uint8_t affinity;
-    uint8_t present;
-} YuStorageMacosVisualDecorationCaret;
-
 /* Revision-bound shaped caret geometry and absolute document scroll target. */
 typedef struct YuStorageCaretScrollRequest {
     uint64_t revision;
@@ -563,32 +524,6 @@ typedef struct YuStorageCaretScrollRequest {
     float margin;
     uint8_t needs_scroll;
 } YuStorageCaretScrollRequest;
-
-/* Revision-bound owned scene metadata assembled by Rust's retained scene
- * boundary. Primitive payloads are currently validated rectangle scalars. */
-typedef struct YuStorageVisualSceneSnapshot {
-    uint64_t revision;
-    uint64_t block_start;
-    uint64_t block_end;
-    uint64_t primitive_count;
-    float content_height;
-    float scroll_y;
-    float viewport_height;
-    float max_scroll_y;
-    float viewport_width;
-} YuStorageVisualSceneSnapshot;
-
-typedef struct YuStorageVisualScenePrimitive {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    float x;
-    float y;
-    float width;
-    float height;
-    uint8_t kind;
-} YuStorageVisualScenePrimitive;
 
 enum {
     YU_STORAGE_RENDER_COMMAND_FILL_RECT = 0,
@@ -767,44 +702,6 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t caret_decoration_count;
 } YuStorageMacosRenderHostSurfaceSnapshot;
 
-typedef struct YuStorageVisualSceneGlyph {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    uint32_t page;
-    uint32_t atlas_x;
-    uint32_t atlas_y;
-    uint32_t atlas_width;
-    uint32_t atlas_height;
-    float origin_x;
-    float origin_y;
-    float bearing_x;
-    float bearing_y;
-    float advance_x;
-    float bounds_x;
-    float bounds_y;
-    float bounds_width;
-    float bounds_height;
-    uint32_t color_rgba;
-} YuStorageVisualSceneGlyph;
-
-typedef struct YuStorageVisualSceneGlyphSnapshot {
-    uint64_t revision;
-    uint64_t composition_generation;
-    uint64_t frame_revision;
-    uint64_t surface_generation;
-    uint64_t frame_serial;
-    uint64_t block_start;
-    uint64_t block_end;
-    uint64_t glyph_count;
-    float content_height;
-    float scroll_y;
-    float viewport_height;
-    float max_scroll_y;
-    float viewport_width;
-} YuStorageVisualSceneGlyphSnapshot;
-
 typedef struct YuStorageAccessibilitySnapshot {
     uint64_t revision;
     uint64_t number_of_characters_utf16;
@@ -819,20 +716,6 @@ typedef struct YuStorageAccessibilityRange {
     uint64_t start_utf16;
     uint64_t end_utf16;
 } YuStorageAccessibilityRange;
-
-typedef struct YuStorageAccessibilityNode {
-    uint64_t revision;
-    uint32_t index;
-    uint32_t parent;
-    uint8_t kind;
-    uint8_t flags;
-    uint8_t level;
-    uint8_t reserved;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    uint64_t label_start_utf16;
-    uint64_t label_end_utf16;
-} YuStorageAccessibilityNode;
 
 typedef struct YuStorageAccessibilityNodeV2 {
     uint64_t revision;
@@ -879,13 +762,9 @@ int32_t yu_storage_session_open(const uint8_t *path, size_t path_length,
                                 YuStorageSession **output);
 void yu_storage_session_destroy(YuStorageSession *session);
 
-int32_t yu_storage_session_path_length(const YuStorageSession *session,
-                                       size_t *output);
 int32_t yu_storage_session_copy_path(const YuStorageSession *session,
                                      uint8_t *output, size_t capacity,
                                      size_t *written);
-int32_t yu_storage_session_source_length(const YuStorageSession *session,
-                                         size_t *output);
 int32_t yu_storage_session_copy_source(const YuStorageSession *session,
                                        uint8_t *output, size_t capacity,
                                        size_t *written);
@@ -1059,23 +938,10 @@ int32_t yu_storage_session_macos_table_resize_accessibility_dividers(
     float max_width, float scroll_y, float viewport_height,
     YuStorageTableResizeAccessibilityDivider *dividers, size_t capacity,
     size_t *written);
-int32_t yu_storage_session_macos_visual_decorations(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t expected_generation, float size, float max_width,
-    float scroll_y, float viewport_height,
-    YuStorageMacosVisualDecorationSnapshot *snapshot,
-    YuStorageMacosVisualDecorationCaret *caret,
-    YuStorageMacosVisualDecorationRect *rects, size_t capacity,
-    size_t *written);
 int32_t yu_storage_session_macos_shaped_caret_scroll_request(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height, float margin,
     YuStorageCaretScrollRequest *output);
-int32_t yu_storage_session_macos_visual_scene(
-    YuStorageSession *session, uint64_t expected_revision, float size,
-    float max_width, float scroll_y, float viewport_height,
-    YuStorageVisualSceneSnapshot *snapshot,
-    YuStorageVisualScenePrimitive *primitives, size_t capacity, size_t *written);
 int32_t yu_storage_session_macos_visual_images(
     YuStorageSession *session, uint64_t expected_revision,
     YuStorageVisualImage *images, size_t capacity, size_t *written);
@@ -1101,11 +967,6 @@ int32_t yu_storage_session_macos_render_host_surface_submit(
     YuStorageMacosRenderHostSurfaceSnapshot *snapshot);
 int32_t yu_storage_session_macos_render_host_surface_detach(
     YuStorageSession *session);
-int32_t yu_storage_session_macos_visual_scene_glyphs(
-    YuStorageSession *session, uint64_t expected_revision, float size,
-    float max_width, float scroll_y, float viewport_height,
-    uint64_t surface_generation, YuStorageVisualSceneGlyphSnapshot *snapshot,
-    YuStorageVisualSceneGlyph *glyphs, size_t capacity, size_t *written);
 int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t expected_revision,
                                              uint64_t start_utf16,
@@ -1129,9 +990,6 @@ int32_t yu_storage_session_accessibility_snapshot(
     const YuStorageSession *session, YuStorageAccessibilitySnapshot *output);
 int32_t yu_storage_session_accessibility_semantic_node_count(
     const YuStorageSession *session, uint64_t expected_revision, size_t *output);
-int32_t yu_storage_session_accessibility_semantic_nodes(
-    const YuStorageSession *session, uint64_t expected_revision,
-    YuStorageAccessibilityNode *output, size_t capacity, size_t *written);
 int32_t yu_storage_session_accessibility_semantic_nodes_v2(
     const YuStorageSession *session, uint64_t expected_revision,
     YuStorageAccessibilityNodeV2 *output, size_t capacity, size_t *written);
@@ -1209,7 +1067,5 @@ int32_t yu_storage_session_request_close(YuStorageSession *session,
 int32_t yu_storage_session_cancel_close(YuStorageSession *session);
 int32_t yu_storage_session_save_close(YuStorageSession *session);
 int32_t yu_storage_session_discard_close(YuStorageSession *session);
-int32_t yu_storage_session_save_failed_external(YuStorageSession *session,
-                                                uint8_t external_state);
 
 #endif
