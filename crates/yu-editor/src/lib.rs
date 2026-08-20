@@ -44,10 +44,11 @@ pub use yu_layout::{
     VisualLine,
 };
 pub use yu_markdown::{
-    Block, BlockKind, MarkdownDocument, TableAlignment, TaskMarker, TaskState, task_marker,
+    Block, BlockKind, ListMarker, MarkdownDocument, TableAlignment, TaskMarker, TaskState,
+    list_marker, task_marker,
 };
 pub use yu_projection::{
-    BlockProjection, BlockProjectionKind, CodeProjection, ImageSource, Projection, ProjectionBias,
-    ProjectionError, TableProjection, VisualOffset, VisualRange, VisualRun, VisualRunKind,
-    VisualRunStyle,
+    BlockProjection, BlockProjectionKind, CodeProjection, ImageSource, LeadingMarker, Projection,
+    ProjectionBias, ProjectionError, TableProjection, VisualOffset, VisualRange, VisualRun,
+    VisualRunKind, VisualRunStyle,
 };

@@ -14,8 +14,8 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{Affinity, ByteOffset, TextAnchor, TextRange};
 use yu_projection::{
-    BlockProjection, Projection, ProjectionBias, ProjectionError, VisualOffset, VisualRange,
-    VisualRunKind, VisualRunStyle,
+    BlockProjection, LeadingMarker, Projection, ProjectionBias, ProjectionError, VisualOffset,
+    VisualRange, VisualRunKind, VisualRunStyle,
 };
 use yu_text::{ChangeSet, TextSnapshot};
 
@@ -131,6 +131,93 @@ impl Default for MonospaceMetrics {
     fn default() -> Self {
         Self::new(1.0)
     }
+}
+
+fn measure_marker<M: ClusterMetrics>(text: &str, metrics: &M) -> Result<f32, LayoutError> {
+    let mut width = 0.0_f32;
+    for cluster in text.graphemes(true) {
+        let advance = metrics.advance(cluster, VisualRunStyle::Plain);
+        if !advance.is_finite() || advance < 0.0 {
+            return Err(LayoutError::InvalidMetrics(advance.to_bits()));
+        }
+        width += advance;
+    }
+    Ok(width)
+}
+
+fn inset_config(config: LayoutConfig, gutter: f32) -> LayoutConfig {
+    let minimum = config
+        .default_advance
+        .min(config.max_width)
+        .max(f32::EPSILON);
+    LayoutConfig::new((config.max_width - gutter).max(minimum), config.line_height)
+        .with_default_advance(config.default_advance)
+}
+
+struct ShapedLeadingMarker {
+    source: TextRange,
+    shaped: ShapedText,
+    advance: f32,
+    indent: u8,
+}
+
+fn shape_marker<S: ShapingProvider>(
+    marker: &LeadingMarker,
+    shaper: &S,
+) -> Result<ShapedLeadingMarker, LayoutError> {
+    let text_len = u64::try_from(marker.text().len()).map_err(|_| LayoutError::OffsetOverflow)?;
+    let synthetic = TextRange::new(ByteOffset::ZERO, ByteOffset::new(text_len))
+        .ok_or(LayoutError::OffsetOverflow)?;
+    let shaped = shaper
+        .shape(marker.text(), synthetic, VisualRunStyle::Plain)
+        .map_err(|error| LayoutError::Shaping(error.to_string()))?;
+    if shaped.source() != synthetic {
+        return Err(LayoutError::Shaping(
+            "shaper returned a source range different from the semantic marker".into(),
+        ));
+    }
+    for run in shaped.runs() {
+        if run.source().start() < synthetic.start() || run.source().end() > synthetic.end() {
+            return Err(LayoutError::Shaping(
+                "semantic marker glyph run is outside its shaping range".into(),
+            ));
+        }
+        let mut previous = run.source().start();
+        for glyph in run.glyphs() {
+            let source = glyph.source();
+            if source.start() < run.source().start()
+                || source.end() > run.source().end()
+                || source.start() < previous
+            {
+                return Err(LayoutError::Shaping(
+                    "semantic marker glyph ranges must be ordered".into(),
+                ));
+            }
+            if !glyph.advance().is_finite() || glyph.advance() < 0.0 {
+                return Err(LayoutError::InvalidMetrics(glyph.advance().to_bits()));
+            }
+            if !glyph.x_offset().is_finite() || !glyph.y_offset().is_finite() {
+                return Err(LayoutError::Shaping(
+                    "semantic marker glyph offsets must be finite".into(),
+                ));
+            }
+            previous = source.end();
+        }
+    }
+    let advance = shaped.advance();
+    if !advance.is_finite() || advance < 0.0 {
+        return Err(LayoutError::InvalidMetrics(advance.to_bits()));
+    }
+    Ok(ShapedLeadingMarker {
+        source: marker.source(),
+        shaped,
+        advance,
+        indent: marker.indent(),
+    })
+}
+
+fn marker_gutter(marker_width: f32, indent: u8, default_advance: f32) -> f32 {
+    marker_width + default_advance * (f32::from(indent) + 1.0)
 }
 
 impl ClusterMetrics for MonospaceMetrics {
@@ -834,9 +921,17 @@ impl LayoutSnapshot {
         metrics: &M,
     ) -> Result<Self, LayoutError> {
         config.validate()?;
+        let marker = projection.leading_marker();
+        let marker_width = marker
+            .map(|marker| measure_marker(marker.text(), metrics))
+            .transpose()?;
+        let gutter = marker
+            .zip(marker_width)
+            .map(|(marker, width)| marker_gutter(width, marker.indent(), config.default_advance));
+        let build_config = gutter.map_or(config, |gutter| inset_config(config, gutter));
         let mut layout = Self {
             projection: projection.clone(),
-            config,
+            config: build_config,
             lines: Vec::new(),
             clusters: Vec::new(),
             glyphs: Vec::new(),
@@ -844,6 +939,10 @@ impl LayoutSnapshot {
             table: None,
         };
         layout.build(metrics)?;
+        layout.config = config;
+        if let Some(gutter) = gutter {
+            layout.apply_leading_marker_gutter(gutter)?;
+        }
         layout.build_image_placements()?;
         Ok(layout)
     }
@@ -855,9 +954,17 @@ impl LayoutSnapshot {
         shaper: &S,
     ) -> Result<Self, LayoutError> {
         config.validate()?;
+        let marker = projection
+            .leading_marker()
+            .map(|marker| shape_marker(marker, shaper))
+            .transpose()?;
+        let gutter = marker
+            .as_ref()
+            .map(|marker| marker_gutter(marker.advance, marker.indent, config.default_advance));
+        let build_config = gutter.map_or(config, |gutter| inset_config(config, gutter));
         let mut layout = Self {
             projection: projection.clone(),
-            config,
+            config: build_config,
             lines: Vec::new(),
             clusters: Vec::new(),
             glyphs: Vec::new(),
@@ -865,6 +972,11 @@ impl LayoutSnapshot {
             table: None,
         };
         layout.build_shaped(shaper)?;
+        layout.config = config;
+        if let Some(marker) = marker {
+            let gutter = marker_gutter(marker.advance, marker.indent, config.default_advance);
+            layout.apply_shaped_leading_marker(marker, gutter)?;
+        }
         layout.build_image_placements()?;
         Ok(layout)
     }
@@ -1006,6 +1118,56 @@ impl LayoutSnapshot {
     #[must_use]
     pub fn projection(&self) -> &Projection {
         &self.projection
+    }
+
+    fn apply_leading_marker_gutter(&mut self, gutter: f32) -> Result<(), LayoutError> {
+        if !gutter.is_finite() || gutter < 0.0 {
+            return Err(LayoutError::InvalidMetrics(gutter.to_bits()));
+        }
+        for line in &mut self.lines {
+            line.width += gutter;
+        }
+        for cluster in &mut self.clusters {
+            cluster.x += gutter;
+        }
+        for glyph in &mut self.glyphs {
+            glyph.x += gutter;
+        }
+        Ok(())
+    }
+
+    fn apply_shaped_leading_marker(
+        &mut self,
+        marker: ShapedLeadingMarker,
+        gutter: f32,
+    ) -> Result<(), LayoutError> {
+        self.apply_leading_marker_gutter(gutter)?;
+        let baseline = self.baseline_for_line(0)?;
+        let mut x = f32::from(marker.indent) * self.config.default_advance;
+        let mut placements = Vec::new();
+        for run in marker.shaped.runs() {
+            for glyph in run.glyphs() {
+                let glyph_x = x + glyph.x_offset();
+                let glyph_y = baseline + glyph.y_offset();
+                if !glyph_x.is_finite() || !glyph_y.is_finite() {
+                    return Err(LayoutError::InvalidPoint);
+                }
+                placements.push(GlyphPlacement {
+                    face: run.face(),
+                    glyph: glyph.id(),
+                    source: marker.source,
+                    visual: VisualRange::empty(VisualOffset::ZERO),
+                    line: 0,
+                    x: glyph_x,
+                    y: glyph_y,
+                    style: VisualRunStyle::Plain,
+                });
+                x += glyph.advance();
+            }
+        }
+        placements.append(&mut self.glyphs);
+        self.glyphs = placements;
+        Ok(())
     }
 
     /// Builds a height index for this snapshot's lines.
@@ -1924,7 +2086,7 @@ mod tests {
     use super::*;
     use unicode_segmentation::UnicodeSegmentation;
     use yu_core::{ByteOffset, Revision, TextRange};
-    use yu_projection::Projection;
+    use yu_projection::{BlockProjection, Projection};
     use yu_text::TextBuffer;
 
     fn projection(source: &str) -> Projection {
@@ -1932,6 +2094,76 @@ mod tests {
         let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
             .expect("source range should be ordered");
         Projection::inline(&snapshot, range).expect("projection should build")
+    }
+
+    fn first_block_projection(source: &str) -> BlockProjection {
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        BlockProjection::from_block_with_definitions(
+            &snapshot,
+            markdown.blocks().get(0).expect("first block"),
+            markdown.reference_definitions(),
+        )
+        .expect("block projection")
+    }
+
+    #[test]
+    fn semantic_list_marker_reserves_a_source_backed_hanging_gutter() {
+        let projection = first_block_projection("  - item\n");
+        assert_eq!(
+            projection
+                .visual()
+                .leading_marker()
+                .expect("semantic list marker")
+                .text(),
+            "•"
+        );
+        let layout = LayoutSnapshot::from_block_projection(
+            &projection,
+            LayoutConfig::new(80.0, 10.0).with_default_advance(2.0),
+        )
+        .expect("list layout");
+
+        assert_eq!(layout.clusters()[0].x(), 8.0);
+        assert_eq!(layout.lines()[0].width(), 16.0);
+        let prefix_end = ByteOffset::new(4);
+        let caret = layout
+            .caret_for_source(prefix_end, ProjectionBias::After)
+            .expect("content caret");
+        assert_eq!(caret.point().x(), 8.0);
+        let hit = layout
+            .hit_test(LayoutPoint::new(1.0, 0.0))
+            .expect("marker gutter hit");
+        assert_eq!(hit.source(), ByteOffset::ZERO);
+    }
+
+    #[test]
+    fn shaped_semantic_marker_enters_the_glyph_stream_with_marker_source() {
+        let projection = first_block_projection("12) item\n");
+        let marker = projection
+            .visual()
+            .leading_marker()
+            .expect("ordered marker")
+            .clone();
+        let layout = LayoutSnapshot::from_block_projection_with_shaper(
+            &projection,
+            LayoutConfig::new(80.0, 10.0).with_default_advance(1.0),
+            &TestShaper {
+                shape: TestShape::FixedGrapheme(2.0),
+            },
+        )
+        .expect("shaped list layout");
+
+        assert_eq!(
+            layout
+                .glyphs()
+                .iter()
+                .take(3)
+                .map(|glyph| glyph.source())
+                .collect::<Vec<_>>(),
+            vec![marker.source(); 3]
+        );
+        assert_eq!(layout.clusters()[0].x(), 7.0);
     }
 
     #[test]
