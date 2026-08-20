@@ -6270,12 +6270,18 @@ fn macos_render_host_config(
     size: f32,
     max_width: f32,
     viewport_height: f32,
+    raster_scale: f32,
 ) -> Result<ViewportRenderConfig, i32> {
     let scene_height = viewport_height.max(1.0);
     let scene_viewport = Rect::new(0.0, viewport.scroll_y(), max_width, scene_height)
         .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
     Ok(
         ViewportRenderConfig::new(viewport, size, scene_viewport, Rgba8::black())
+            .with_raster_scale(raster_scale)
+            // Rust surface 是唯一渲染路径，背景必须由这一帧自己画出来
+            // （不变量 I5）。暗色模式需要平台把实际的 textBackgroundColor
+            // 传进来，目前固定为白底。
+            .with_background(Rgba8::white())
             .with_editor_decorations(EditorDecorationStyle::new(
                 Rgba8::new(0, 122, 255, 97),
                 Rgba8::black(),
@@ -6360,15 +6366,38 @@ fn macos_render_host_snapshot(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_render_host_frame(
-    session: &mut YuStorageSession,
+/// 一次 retained frame 请求的全部参数。
+///
+/// 打包而非平铺：这些值总是同进同出，且必须来自同一次平台查询——把它们拆成
+/// 独立参数容易在调用点混入不同来源的值（例如上一帧的 scroll 配这一帧的
+/// scale），而那类错误编译器发现不了。
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct MacosFrameRequest {
     expected_revision: u64,
     size: f32,
     max_width: f32,
     scroll_y: f32,
     viewport_height: f32,
     surface_generation: u64,
+    /// backing scale：字形按它取样，后端再除回逻辑坐标。
+    raster_scale: f32,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_render_host_frame(
+    session: &mut YuStorageSession,
+    request: MacosFrameRequest,
 ) -> Result<YuStorageMacosRenderHostSnapshot, i32> {
+    let MacosFrameRequest {
+        expected_revision,
+        size,
+        max_width,
+        scroll_y,
+        viewport_height,
+        surface_generation,
+        raster_scale,
+    } = request;
     validate_revision(&session.session, expected_revision)?;
     if !size.is_finite()
         || size <= 0.0
@@ -6425,7 +6454,8 @@ fn macos_render_host_frame(
         None => None,
     };
     let viewport = ViewportRect::new(scroll_y, viewport_height);
-    let config = macos_render_host_config(viewport, size, max_width, viewport_height)?;
+    let config =
+        macos_render_host_config(viewport, size, max_width, viewport_height, raster_scale)?;
     let config = table_resize.map_or(config, |commit| config.with_table_resize(commit));
     if session
         .macos_render_host
@@ -6710,6 +6740,10 @@ fn macos_visual_render_plan(
     }
 
     let mut block_metadata = Vec::new();
+    // 整帧背景是 scene 的第一个 primitive，不属于任何 block；它必须先入表，
+    // 否则下面的逐条配对会整体错位。归到 block 0 是为了不破坏这条诊断对
+    // block_index 单调递增的断言——它排在所有内容之前，语义上就是帧级底色。
+    block_metadata.push((YU_STORAGE_RENDER_COMMAND_FILL_RECT, 0, 0, 0));
     for (block_index, source_range, glyph_count, image_count, background) in &block_glyphs {
         let source_start_utf16 = source
             .utf16_offset(source_range.start())
@@ -7228,14 +7262,19 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
 
     #[cfg(target_os = "macos")]
     {
+        // 这条诊断查询没有绑定 Metal surface，因此没有 backing scale 可用；
+        // 按逻辑尺寸取样即可，它不负责上屏。
         let value = match macos_render_host_frame(
             session,
-            expected_revision,
-            size,
-            max_width,
-            scroll_y,
-            viewport_height,
-            surface_generation,
+            MacosFrameRequest {
+                expected_revision,
+                size,
+                max_width,
+                scroll_y,
+                viewport_height,
+                surface_generation,
+                raster_scale: 1.0,
+            },
         ) {
             Ok(value) => value,
             Err(status) => return status,
@@ -7336,12 +7375,15 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
         };
         let host_snapshot = match macos_render_host_frame(
             session,
-            expected_revision,
-            size,
-            max_width,
-            scroll_y,
-            viewport_height,
-            surface_generation,
+            MacosFrameRequest {
+                expected_revision,
+                size,
+                max_width,
+                scroll_y,
+                viewport_height,
+                surface_generation,
+                raster_scale: scale as f32,
+            },
         ) {
             Ok(snapshot) => snapshot,
             Err(status) => return status,
@@ -10936,7 +10978,7 @@ mod tests {
     #[test]
     fn macos_render_host_config_tracks_document_scroll_origin() {
         let viewport = ViewportRect::new(137.5, 240.0);
-        let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0)
+        let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0, 2.0)
             .expect("valid macOS render host config");
 
         assert_eq!(config.viewport().scroll_y(), 137.5);
@@ -10945,6 +10987,27 @@ mod tests {
         assert_eq!(config.scene_viewport().y(), 137.5);
         assert_eq!(config.scene_viewport().width(), 500.0);
         assert_eq!(config.scene_viewport().height(), 240.0);
+        // backing scale 必须进入配置：字形按它取样，后端再除回逻辑坐标。
+        assert_eq!(config.raster_scale(), 2.0);
+    }
+
+    /// backing scale 非法时不得污染配置。
+    ///
+    /// 这个值会同时决定字形的取样倍率和后端的除数，取到 0 或 NaN 会让整帧
+    /// 几何失效，因此宁可退回 1.0 按逻辑尺寸渲染（只是不够清晰）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_render_host_config_rejects_invalid_raster_scale() {
+        let viewport = ViewportRect::new(0.0, 240.0);
+        for invalid in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0, invalid)
+                .expect("config should still build");
+            assert_eq!(
+                config.raster_scale(),
+                1.0,
+                "非法 raster scale {invalid} 应退回 1.0"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

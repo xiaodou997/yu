@@ -465,6 +465,17 @@ impl ViewportRenderFrame {
 pub struct ViewportRenderConfig {
     viewport: ViewportRect,
     font_size: f32,
+    /// 编辑区背景色。
+    ///
+    /// 删除 TextKit fallback 后，Rust surface 是唯一渲染路径（不变量 I5），
+    /// 背景必须由这一帧自己画出来：Metal layer 是透明的，未触及的像素会露出
+    /// 下层视图，而下层视图已经不再绘制任何东西。
+    background: Rgba8,
+    /// glyph 栅格化相对逻辑尺寸的倍率，默认 `1.0`。
+    ///
+    /// Retina 上应设为 backing scale：字形按 `font_size × raster_scale`
+    /// 取样，后端再把 atlas 矩形除回逻辑坐标，纹理才能与物理像素 1:1 对应。
+    raster_scale: f32,
     scene_viewport: Rect,
     color: Rgba8,
     table_resize: Option<TableResizeCommit>,
@@ -482,6 +493,8 @@ impl ViewportRenderConfig {
         Self {
             viewport,
             font_size,
+            background: Rgba8::white(),
+            raster_scale: 1.0,
             scene_viewport,
             color,
             table_resize: None,
@@ -511,6 +524,31 @@ impl ViewportRenderConfig {
     #[must_use]
     pub const fn font_size(self) -> f32 {
         self.font_size
+    }
+
+    #[must_use]
+    pub const fn with_background(mut self, background: Rgba8) -> Self {
+        self.background = background;
+        self
+    }
+
+    #[must_use]
+    pub const fn background(self) -> Rgba8 {
+        self.background
+    }
+
+    /// 设置 glyph 栅格化倍率。非有限或非正值会被忽略，保留原值。
+    #[must_use]
+    pub fn with_raster_scale(mut self, scale: f32) -> Self {
+        if scale.is_finite() && scale > 0.0 {
+            self.raster_scale = scale;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn raster_scale(self) -> f32 {
+        self.raster_scale
     }
 
     #[must_use]
@@ -1086,6 +1124,8 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: Sh
         scene_viewport,
         atlas,
         color,
+        // 这些兼容入口不带背景配置，按白底渲染。
+        Rgba8::white(),
         image_publications,
         image_intrinsics,
         &[],
@@ -1109,6 +1149,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     scene_viewport: Rect,
     atlas: &GlyphAtlas,
     color: Rgba8,
+    background: Rgba8,
     image_publications: &[ImagePublication],
     image_intrinsics: &[ImageIntrinsicPublication],
     embedded_publications: &[EmbeddedRenderPublication],
@@ -1230,6 +1271,10 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     }
     let layout_refs = layouts.iter().collect::<Vec<_>>();
     let mut builder = SceneBuilder::new(revision, scene_viewport)?;
+    // 背景必须是这一帧的第一个 primitive：Metal layer 透明，未触及的像素会
+    // 露出下层视图，而 TextKit fallback 删除后下层已不再绘制任何东西
+    // （不变量 I5）。放在最前面也保证它位于所有内容之下。
+    builder.fill_rect(scene_viewport, background)?;
     let fills = viewport_snapshot
         .blocks()
         .iter()
@@ -1426,6 +1471,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded<
         config.scene_viewport(),
         atlas,
         config.color(),
+        config.background(),
         image_publications,
         image_intrinsics,
         embedded_publications,
@@ -1547,10 +1593,11 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, yu_render::RenderCommand::Glyph { .. }))
         );
+        // 首个 primitive 是整帧背景，其余都应是字形。
+        let primitives = frame.scene().primitives();
+        assert!(matches!(primitives[0], Primitive::FillRect { .. }));
         assert!(
-            frame
-                .scene()
-                .primitives()
+            primitives[1..]
                 .iter()
                 .all(|primitive| matches!(primitive, Primitive::Glyph(_)))
         );
@@ -1701,9 +1748,11 @@ mod tests {
         assert!(frame.scene().input().blocks().is_empty());
         assert_eq!(frame.scene().input().content_height(), 20.0);
         let primitives = frame.scene().scene().primitives();
-        assert_eq!(primitives.len(), 1);
-        let Primitive::EditorDecoration(caret) = primitives[0] else {
-            panic!("empty scene must contain only its caret");
+        // 背景 + caret：空文档也必须画出背景，否则透出下层视图。
+        assert_eq!(primitives.len(), 2);
+        assert!(matches!(primitives[0], Primitive::FillRect { .. }));
+        let Primitive::EditorDecoration(caret) = primitives[1] else {
+            panic!("empty scene must contain its background and caret");
         };
         assert_eq!(caret.role(), EditorDecorationPrimitiveRole::Caret);
         assert_eq!(caret.source(), TextRange::empty(ByteOffset::new(0)));
@@ -1711,9 +1760,13 @@ mod tests {
             caret.bounds(),
             Rect::new(0.0, 0.0, 1.0, 20.0).expect("empty caret bounds")
         );
+        // 背景 + caret 两条 fill 指令。
         assert!(matches!(
             frame.plan().commands(),
-            [yu_render::RenderCommand::FillRect { .. }]
+            [
+                yu_render::RenderCommand::FillRect { .. },
+                yu_render::RenderCommand::FillRect { .. }
+            ]
         ));
     }
 
@@ -1798,8 +1851,16 @@ mod tests {
             assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
                 .expect("composition fallback frame");
 
-        assert!(frame.plan().commands().is_empty());
-        assert!(frame.scene().scene().primitives().is_empty());
+        // 只剩背景：preedit 未投影时不得凭空画出内容，但背景仍要覆盖，
+        // 否则会透出下层视图。
+        assert!(matches!(
+            frame.plan().commands(),
+            [yu_render::RenderCommand::FillRect { .. }]
+        ));
+        assert!(matches!(
+            frame.scene().scene().primitives(),
+            [Primitive::FillRect { .. }]
+        ));
     }
 
     #[test]
@@ -2380,8 +2441,13 @@ mod tests {
         .expect("code block frame");
 
         let primitives = frame.scene().scene().primitives();
-        let Some((first, rest)) = primitives.split_first() else {
+        // 跳过整帧背景，再检查代码块自己的底色先于字形。
+        let Some((background, primitives)) = primitives.split_first() else {
             panic!("code block scene should not be empty");
+        };
+        assert!(matches!(background, Primitive::FillRect { .. }));
+        let Some((first, rest)) = primitives.split_first() else {
+            panic!("code block scene should carry its own fill");
         };
         match first {
             Primitive::FillRect { bounds, color } => {
@@ -2454,6 +2520,9 @@ mod tests {
         .expect("table scene frame");
 
         let primitives = frame.scene().primitives();
+        assert!(matches!(primitives[0], Primitive::FillRect { .. }));
+        // 背景之后、首个字形之前只应有表格装饰。
+        let primitives = &primitives[1..];
         let first_glyph = primitives
             .iter()
             .position(|primitive| matches!(primitive, Primitive::Glyph(_)))

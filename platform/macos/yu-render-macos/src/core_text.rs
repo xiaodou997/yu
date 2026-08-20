@@ -145,10 +145,18 @@ impl CoreTextViewportFrameBuilder {
                 "CoreText shaper size must match viewport font size",
             ));
         }
+        let mut render_plans = RenderPlanBuilder::new();
+        render_plans
+            .set_raster_scale(config.raster_scale())
+            .map_err(|_| {
+                CoreTextViewportFrameError::InvalidConfig(
+                    "viewport render config has an invalid raster scale",
+                )
+            })?;
         Ok(Self {
             shaper,
-            atlas: GlyphAtlas::new(atlas_config),
-            render_plans: RenderPlanBuilder::new(),
+            atlas: GlyphAtlas::new(atlas_config).with_raster_scale(config.raster_scale()),
+            render_plans,
             publisher: ViewportFramePublisher::with_next_serial(initial_serial),
             config,
         })
@@ -341,14 +349,20 @@ impl CoreTextViewportFrameBuilder {
                 &self.shaper,
             )?;
             for placement in layout.glyphs() {
+                // 按物理像素取样：Retina 上 raster_scale 是 backing scale，
+                // 后端会把 atlas 矩形除回逻辑坐标。否则 1x 纹理会被拉伸到 2x
+                // 而发虚。
+                // size 保持逻辑尺寸——它决定 optical size 变体，必须与 shaping
+                // 时一致；栅格倍率是独立维度，参与缓存键并只影响绘制分辨率。
                 let key = GlyphRasterKey::new(
                     placement.face(),
                     placement.glyph(),
                     self.config.font_size() * placement.font_scale(),
                 )
+                .and_then(|key| key.with_raster_scale(self.config.raster_scale()))
                 .map_err(|_| {
                     CoreTextViewportFrameError::InvalidConfig(
-                        "CoreText glyph raster key has an invalid font size",
+                        "CoreText glyph raster key has an invalid font size or raster scale",
                     )
                 })?;
                 if self.atlas.entry(key).is_none() {

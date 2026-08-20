@@ -147,6 +147,12 @@ pub enum RenderCommand {
 pub struct RenderPlan {
     revision: Revision,
     viewport: Rect,
+    /// glyph atlas 相对逻辑坐标的采样倍率。
+    ///
+    /// 字形按 `font_size × raster_scale` 栅格化，因此 atlas 中的矩形是物理
+    /// 像素。后端必须除回这个倍率才能得到逻辑坐标的目标矩形——否则在 Retina
+    /// 上要么尺寸翻倍，要么把 1x 纹理拉伸到 2x 而发虚。
+    raster_scale: f32,
     damage: Vec<Rect>,
     uploads: Vec<AtlasPageUpload>,
     embedded_uploads: Vec<EmbeddedSvgUpload>,
@@ -162,6 +168,11 @@ impl RenderPlan {
     #[must_use]
     pub const fn viewport(&self) -> Rect {
         self.viewport
+    }
+
+    #[must_use]
+    pub const fn raster_scale(&self) -> f32 {
+        self.raster_scale
     }
 
     #[must_use]
@@ -210,11 +221,16 @@ pub enum RenderError {
         publication_width: u32,
         publication_height: u32,
     },
+    /// atlas 采样倍率必须是有限正数。
+    InvalidRasterScale,
 }
 
 impl fmt::Display for RenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidRasterScale => {
+                formatter.write_str("atlas raster scale must be a finite positive number")
+            }
             Self::Atlas(error) => write!(formatter, "glyph atlas query failed: {error}"),
             Self::MissingAtlasEntry(key) => {
                 write!(
@@ -271,12 +287,26 @@ struct PageFingerprint {
 pub struct RenderPlanBuilder {
     uploaded_pages: HashMap<u32, PageFingerprint>,
     uploaded_embedded: HashMap<(u64, u64), u64>,
+    raster_scale: Option<f32>,
 }
 
 impl RenderPlanBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 声明 glyph atlas 相对逻辑坐标的采样倍率。
+    ///
+    /// 未声明时为 `1.0`，即 atlas 按逻辑尺寸栅格化。在 Retina 上应声明为
+    /// backing scale，并按同一倍率栅格化字形，后端才能把 atlas 矩形除回逻辑
+    /// 坐标、让纹理与物理像素 1:1 对应。
+    pub fn set_raster_scale(&mut self, scale: f32) -> Result<(), RenderError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(RenderError::InvalidRasterScale);
+        }
+        self.raster_scale = Some(scale);
+        Ok(())
     }
 
     pub fn build(&mut self, scene: &Scene, atlas: &GlyphAtlas) -> Result<RenderPlan, RenderError> {
@@ -437,6 +467,7 @@ impl RenderPlanBuilder {
         Ok(RenderPlan {
             revision: scene.revision(),
             viewport: scene.viewport(),
+            raster_scale: self.raster_scale.unwrap_or(1.0),
             damage: scene.damage().rects().to_vec(),
             uploads,
             embedded_uploads,
