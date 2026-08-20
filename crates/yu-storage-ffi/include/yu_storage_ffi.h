@@ -669,8 +669,6 @@ typedef struct YuStorageMacosRenderHostSnapshot {
     float max_scroll_y;
     float viewport_width;
     uint8_t published;
-    uint64_t command_kind_mask;
-    uint64_t block_kind_mask;
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
 } YuStorageMacosRenderHostSnapshot;
@@ -696,8 +694,6 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t image_overscan_candidate_count;
     uint64_t image_retry_count;
     uint8_t submitted;
-    uint64_t command_kind_mask;
-    uint64_t block_kind_mask;
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
 } YuStorageMacosRenderHostSurfaceSnapshot;

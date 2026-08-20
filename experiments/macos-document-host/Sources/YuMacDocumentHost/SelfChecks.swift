@@ -1,5 +1,7 @@
 import AppKit
+import Darwin
 import Foundation
+import UniformTypeIdentifiers
 import YuStorageFFI
 
 // self-check：验证 Rust↔Swift 边界上的真实行为（剪贴板、selection、undo、
