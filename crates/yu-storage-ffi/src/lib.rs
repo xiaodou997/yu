@@ -7513,8 +7513,12 @@ fn macos_visual_render_plan(
             .block_layout_for_visual_state_with_shaper(block.index(), config, &shaper)
             .map_err(status_from_editor_error)?;
         for placement in layout.glyphs() {
-            let key = GlyphRasterKey::new(placement.face(), placement.glyph(), size)
-                .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+            let key = GlyphRasterKey::new(
+                placement.face(),
+                placement.glyph(),
+                size * placement.font_scale(),
+            )
+            .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
             if atlas.entry(key).is_none() {
                 let glyph = rasterizer
                     .rasterize(key)

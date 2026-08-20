@@ -1374,8 +1374,9 @@ impl SceneBuilder {
 
         let mut primitives = Vec::with_capacity(layout.glyphs().len());
         for placement in layout.glyphs() {
-            let key = GlyphRasterKey::new(placement.face(), placement.glyph(), font_size)
-                .map_err(|_| SceneError::InvalidFontSize(font_size.to_bits()))?;
+            let glyph_size = font_size * placement.font_scale();
+            let key = GlyphRasterKey::new(placement.face(), placement.glyph(), glyph_size)
+                .map_err(|_| SceneError::InvalidFontSize(glyph_size.to_bits()))?;
             let entry = atlas.entry(key).ok_or(SceneError::MissingGlyphAtlas(key))?;
             let glyph = GlyphPrimitive::new(
                 entry,

@@ -212,6 +212,39 @@ impl ShapedText {
     pub const fn advance(&self) -> f32 {
         self.advance
     }
+
+    /// Scales deterministic shaped coordinates while retaining glyph/source
+    /// identity. Real font backends should override `shape_scaled` and shape
+    /// at the target point size so hinting and optical-size behavior remain
+    /// native; this fallback keeps lightweight providers source-compatible.
+    #[must_use]
+    fn scaled(self, scale: f32) -> Self {
+        let runs = self
+            .runs
+            .into_iter()
+            .map(|run| {
+                let glyphs = run
+                    .glyphs
+                    .into_iter()
+                    .map(|glyph| Glyph {
+                        advance: glyph.advance * scale,
+                        x_offset: glyph.x_offset * scale,
+                        y_offset: glyph.y_offset * scale,
+                        ..glyph
+                    })
+                    .collect();
+                GlyphRun::new(
+                    run.face,
+                    run.source,
+                    run.style,
+                    run.direction,
+                    run.script,
+                    glyphs,
+                )
+            })
+            .collect();
+        Self::new(self.source, runs)
+    }
 }
 
 /// A source-backed shaping provider consumed by `LayoutSnapshot`.
@@ -224,4 +257,19 @@ pub trait ShapingProvider {
         source: TextRange,
         style: VisualRunStyle,
     ) -> Result<ShapedText, Self::Error>;
+
+    /// Shapes at a finite, positive scale relative to the provider's base
+    /// font request. The layout boundary validates the scale before calling.
+    /// Providers backed by a native font engine should override this method;
+    /// the default is suitable for deterministic and benchmark shapers.
+    fn shape_scaled(
+        &self,
+        text: &str,
+        source: TextRange,
+        style: VisualRunStyle,
+        scale: f32,
+    ) -> Result<ShapedText, Self::Error> {
+        self.shape(text, source, style)
+            .map(|shaped| shaped.scaled(scale))
+    }
 }
