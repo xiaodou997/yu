@@ -17,6 +17,9 @@ jobs:
           toolchain: 1.97.0
           components: rustfmt, clippy
       - run: cargo fmt --all --check
+      # 本地 tools/verify.sh 必须能跑到这里的每一条命令。删掉一个 crate 时
+      # 曾经打断过一个 CI job 而本地全绿——本地门禁给了它无权给的绿灯。
+      - run: python3 tools/check-ci-parity.py
       # cargo 只拦得住依赖环，拦不住方向：yu-font 依赖 yu-layout 在 cargo
       # 看来完全合法，而那正是不变量 E2 禁止的反向依赖。
       - run: python3 tools/check-deps.py

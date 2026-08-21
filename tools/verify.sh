@@ -28,6 +28,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "cargo test"
 cargo test --workspace
 
+step "本地门禁与 CI 一致"
+python3 tools/check-ci-parity.py
+
 step "crate 依赖方向"
 python3 tools/check-deps.py
 
