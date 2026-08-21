@@ -1794,28 +1794,6 @@ final class StorageBridge {
         return NativeBlockCaret(value)
     }
 
-    func setViewportConfig(
-        revision: UInt64,
-        maxWidth: Float,
-        lineHeight: Float,
-        defaultAdvance: Float,
-        estimatedBlockHeight: Float,
-        overscan: Float
-    ) throws {
-        let status = yu_storage_session_set_viewport_config(
-            handle,
-            revision,
-            maxWidth,
-            lineHeight,
-            defaultAdvance,
-            estimatedBlockHeight,
-            overscan
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-    }
-
     func macosShapedViewportBlocks(
         revision: UInt64,
         size: Float,
@@ -2168,8 +2146,7 @@ final class StorageBridge {
         size: Float,
         maxWidth: Float,
         scrollY: Float,
-        viewportHeight: Float,
-        margin: Float
+        viewportHeight: Float
     ) throws -> NativeCaretScrollRequest {
         var value = YuStorageCaretScrollRequest()
         let status = yu_storage_session_macos_shaped_caret_scroll_request(
@@ -2179,7 +2156,6 @@ final class StorageBridge {
             maxWidth,
             scrollY,
             viewportHeight,
-            margin,
             &value
         )
         guard status == StorageStatus.ok else {

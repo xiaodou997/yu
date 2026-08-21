@@ -114,18 +114,6 @@ final class MacosSurfaceHostCoordinator {
     private static let maxImageRefreshAttempts = 40
     private static let imageRefreshDelay: DispatchTimeInterval = .milliseconds(50)
 
-    private struct MetricsKey: Equatable {
-        let revision: UInt64
-        let size: Double
-        let maxWidth: Double
-    }
-
-    private struct Metrics {
-        let key: MetricsKey
-        let lineHeight: Float
-        let defaultAdvance: Float
-    }
-
     /// 一帧里只有 AppKit 知道的那部分。
     ///
     /// 这里刻意不含 Revision、composition generation 或 selection：它们是 Rust
@@ -145,7 +133,6 @@ final class MacosSurfaceHostCoordinator {
     private weak var scrollView: NSScrollView?
     private var fontSize: CGFloat
     private var contentWidth: CGFloat?
-    private var metrics: Metrics?
     private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
     private var submitScheduled = false
     private var scheduleToken: UInt64 = 0
@@ -177,7 +164,6 @@ final class MacosSurfaceHostCoordinator {
         self.scrollView = scrollView
         self.fontSize = max(fontSize, 1.0)
         contentWidth = nil
-        metrics = nil
         lastSnapshot = nil
         imageRefreshNeeded = false
         tableResizePointerState.reset()
@@ -189,7 +175,6 @@ final class MacosSurfaceHostCoordinator {
         let next = max(fontSize, 1.0)
         guard abs(self.fontSize - next) > 0.001 else { return }
         self.fontSize = next
-        metrics = nil
         scheduleSubmit()
     }
 
@@ -204,7 +189,6 @@ final class MacosSurfaceHostCoordinator {
             return
         }
         contentWidth = next
-        metrics = nil
         scheduleSubmit()
     }
 
@@ -323,29 +307,6 @@ final class MacosSurfaceHostCoordinator {
         }
         imageRefreshTask = task
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.imageRefreshDelay, execute: task)
-    }
-
-    /// Publishes CoreText metrics before a vertical editor command enters the
-    /// Rust command path. This keeps the command's shaped line wrapping and
-    /// the subsequent caret reveal on one Revision/width contract even when a
-    /// key arrives before the next asynchronous surface submit.
-    func prepareForEditorCommand() {
-        guard let surfaceView,
-              surfaceView.bounds.width > 0.0 else {
-            return
-        }
-        let revision = bridge.state.revision
-        let size = max(fontSize, 1.0)
-        let maxWidth = layoutWidth(for: surfaceView)
-        do {
-            _ = try ensureMetrics(
-                revision: revision,
-                size: size,
-                maxWidth: maxWidth
-            )
-        } catch {
-            onError?(error)
-        }
     }
 
     /// Resolves the current document-space point against the same shaped
@@ -475,9 +436,18 @@ final class MacosSurfaceHostCoordinator {
               let geometry = visualDecorationGeometry() else {
             return false
         }
+        // VoiceOver 每次增减的列宽步长。这是这个文件里唯一还需要字体度量的
+        // 地方，而且只在辅助功能动作时走一次，不在每帧路径上。
+        guard let metrics = try? bridge.macosFontMetrics(
+            revision: bridge.state.revision,
+            size: geometry.size,
+            maxWidth: geometry.maxWidth
+        ) else {
+            return false
+        }
         let step = max(
             CGFloat(8.0),
-            min(CGFloat(16.0), CGFloat(geometry.lineHeight) * 0.5)
+            min(CGFloat(16.0), CGFloat(metrics.lineHeight) * 0.5)
         )
         let dividerPoint = NSPoint(
             x: descriptor.rect.midX,
@@ -641,16 +611,15 @@ final class MacosSurfaceHostCoordinator {
         tableResizePointerState.isActive
     }
 
-    /// Returns the same revision-bound CoreText metrics and viewport inputs
-    /// used by the Rust render host. Visual decorations use this accessor so
-    /// their geometry query cannot silently drift to TextKit's independent
-    /// wrapping width or line height.
+    /// 视觉装饰查询所用的 viewport 输入，与 Rust render host 完全同源。
+    ///
+    /// 这里只回答 AppKit 知道的量。行高与默认步进不在其中：它们由 Rust 在每个
+    /// shaped 入口自行对齐，平台不再取回来又送回去。
     func visualDecorationGeometry() -> (
         size: Float,
         maxWidth: Float,
         scrollY: Float,
-        viewportHeight: Float,
-        lineHeight: Float
+        viewportHeight: Float
     )? {
         guard let surfaceView,
               let scrollView,
@@ -658,28 +627,13 @@ final class MacosSurfaceHostCoordinator {
               surfaceView.bounds.height > 0.0 else {
             return nil
         }
-        let revision = bridge.state.revision
-        let size = max(fontSize, 1.0)
-        let maxWidth = layoutWidth(for: surfaceView)
         let viewportBounds = scrollView.contentView.bounds
-        let viewportHeight = max(viewportBounds.height, 1.0)
-        let scrollY = max(viewportBounds.origin.y, 0.0)
-        do {
-            let metrics = try ensureMetrics(
-                revision: revision,
-                size: size,
-                maxWidth: maxWidth
-            )
-            return (
-                Float(size),
-                Float(maxWidth),
-                Float(scrollY),
-                Float(viewportHeight),
-                metrics.lineHeight
-            )
-        } catch {
-            return nil
-        }
+        return (
+            Float(max(fontSize, 1.0)),
+            Float(layoutWidth(for: surfaceView)),
+            Float(max(viewportBounds.origin.y, 0.0)),
+            Float(max(viewportBounds.height, 1.0))
+        )
     }
 
     /// Reveals the current Rust-owned caret using the same Revision-bound
@@ -701,18 +655,12 @@ final class MacosSurfaceHostCoordinator {
         let viewportHeight = max(viewportBounds.height, 1.0)
         let currentScrollY = max(viewportBounds.origin.y, 0.0)
         do {
-            let metrics = try ensureMetrics(
-                revision: revision,
-                size: size,
-                maxWidth: maxWidth
-            )
             let request = try bridge.macosShapedCaretScrollRequest(
                 revision: revision,
                 size: Float(size),
                 maxWidth: Float(maxWidth),
                 scrollY: Float(currentScrollY),
-                viewportHeight: Float(viewportHeight),
-                margin: max(metrics.lineHeight, 4.0)
+                viewportHeight: Float(viewportHeight)
             )
             guard request.revision == revision,
                   request.currentScrollY.isFinite,
@@ -814,11 +762,6 @@ final class MacosSurfaceHostCoordinator {
         }
 
         let revision = bridge.state.revision
-        _ = try ensureMetrics(
-            revision: revision,
-            size: geometry.size,
-            maxWidth: geometry.maxWidth
-        )
         let rawView = Unmanaged.passUnretained(surfaceView).toOpaque()
         let snapshot = try bridge.macosRenderHostSurfaceSubmit(
             revision: revision,
@@ -866,7 +809,6 @@ final class MacosSurfaceHostCoordinator {
         isAttached = false
         lastSnapshot = nil
         imageRefreshNeeded = false
-        metrics = nil
         surfaceView?.setNativeContentVisible(false)
         onSurfaceStateChange?()
     }
@@ -876,46 +818,4 @@ final class MacosSurfaceHostCoordinator {
         tableResizePointerState.reset()
     }
 
-    private func ensureMetrics(
-        revision: UInt64,
-        size: CGFloat,
-        maxWidth: CGFloat
-    ) throws -> Metrics {
-        let key = MetricsKey(
-            revision: revision,
-            size: Double(size),
-            maxWidth: Double(maxWidth)
-        )
-        if let metrics, metrics.key == key {
-            return metrics
-        }
-        let layout = try bridge.macosFontMetrics(
-            revision: revision,
-            size: Float(size),
-            maxWidth: Float(maxWidth)
-        )
-        guard layout.revision == revision,
-              abs(layout.size - size) <= 0.001,
-              layout.lineHeight.isFinite,
-              layout.lineHeight > 0.0,
-              layout.defaultAdvance.isFinite,
-              layout.defaultAdvance > 0.0 else {
-            throw BridgeError.operation(StorageStatus.invalidViewport)
-        }
-        let next = Metrics(
-            key: key,
-            lineHeight: Float(layout.lineHeight),
-            defaultAdvance: Float(layout.defaultAdvance)
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: Float(maxWidth),
-            lineHeight: next.lineHeight,
-            defaultAdvance: next.defaultAdvance,
-            estimatedBlockHeight: next.lineHeight,
-            overscan: 0.0
-        )
-        metrics = next
-        return next
-    }
 }

@@ -916,10 +916,6 @@ int32_t yu_storage_session_macos_source_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageBlockCaret *output);
-int32_t yu_storage_session_set_viewport_config(
-    YuStorageSession *session, uint64_t expected_revision,
-    float max_width, float line_height, float default_advance,
-    float estimated_block_height, float overscan);
 int32_t yu_storage_session_macos_shaped_viewport_blocks(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
@@ -936,7 +932,7 @@ int32_t yu_storage_session_macos_table_resize_accessibility_dividers(
     size_t *written);
 int32_t yu_storage_session_macos_shaped_caret_scroll_request(
     YuStorageSession *session, uint64_t expected_revision, float size,
-    float max_width, float scroll_y, float viewport_height, float margin,
+    float max_width, float scroll_y, float viewport_height,
     YuStorageCaretScrollRequest *output);
 int32_t yu_storage_session_macos_visual_images(
     YuStorageSession *session, uint64_t expected_revision,

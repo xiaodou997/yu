@@ -2377,6 +2377,50 @@ fn block_caret_from_layout(
     })
 }
 
+/// viewport 配置与 CoreText 度量之间允许的偏差。
+///
+/// 度量来自浮点排版计算，逐次重算会有末位差异；容差必须大于该差异，否则每帧
+/// 都会判为「配置不一致」而重建 ViewportLayout，把已缓存的 block 高度全部丢掉。
+#[cfg(target_os = "macos")]
+const MACOS_VIEWPORT_CONFIG_TOLERANCE: f32 = 0.05;
+
+/// 让会话的 viewport 配置与这一次的 CoreText 度量对齐。
+///
+/// 这里此前是十份逐字相同的校验：Rust 自己用 CoreText 算出行高与默认步进，
+/// 却要求平台先把同样的值原样送回来，不一致就整个调用失败。平台在这条链路上
+/// 没有任何独有信息——它先调 `macos_font_metrics` 取值，再调
+/// `set_viewport_config` 送回，每帧两次纯往返，换来的只是一个 Rust 本来就
+/// 知道的数字。校验因此改为发布：由 Rust 自己保证配置正确（不变量 I3）。
+///
+/// 只在超出容差时才真正写入：`set_viewport_config` 会重建 `ViewportLayout`，
+/// 连带丢掉已缓存的 block 高度，那正是 J2「按 block height index 定位可见范围」
+/// 依赖的东西。
+#[cfg(target_os = "macos")]
+fn macos_publish_viewport_config(
+    session: &mut YuStorageSession,
+    max_width: f32,
+    metrics: CoreTextViewportMetrics,
+) -> Result<(), i32> {
+    let published = session.session.viewport_config().layout();
+    if (published.max_width() - max_width).abs() <= MACOS_VIEWPORT_CONFIG_TOLERANCE
+        && (published.line_height() - metrics.line_height()).abs()
+            <= MACOS_VIEWPORT_CONFIG_TOLERANCE
+        && (published.default_advance() - metrics.default_advance()).abs()
+            <= MACOS_VIEWPORT_CONFIG_TOLERANCE
+    {
+        return Ok(());
+    }
+    let layout = LayoutConfig::new(max_width, metrics.line_height())
+        .with_default_advance(metrics.default_advance());
+    // estimated_block_height 取一个行高、overscan 取 0，与平台此前送回来的
+    // 值一致。这两项是策略而不是平台信息，因此现在由 Rust 决定。
+    let config = ViewportConfig::new(layout, metrics.line_height(), 0.0);
+    session
+        .session
+        .set_viewport_config(config)
+        .map_err(|_| YU_STORAGE_INVALID_VIEWPORT_CONFIG)
+}
+
 #[cfg(target_os = "macos")]
 fn core_text_system_ui_layout(
     size: f32,
@@ -2757,12 +2801,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_move_vertical(
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        let viewport_config = session.session.viewport_config().layout();
-        if (viewport_config.max_width() - max_width).abs() > 0.05
-            || (viewport_config.line_height() - metrics.line_height()).abs() > 0.05
-            || (viewport_config.default_advance() - metrics.default_advance()).abs() > 0.05
-        {
-            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+            return status;
         }
         let result = match session
             .session
@@ -3717,13 +3757,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        let viewport_config = session.session.viewport_config();
-        let published = viewport_config.layout();
-        if (published.max_width() - max_width).abs() > 0.05
-            || (published.line_height() - metrics.line_height()).abs() > 0.05
-            || (published.default_advance() - metrics.default_advance()).abs() > 0.05
-        {
-            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+            return status;
         }
 
         let query_y = point_y.max(0.0);
@@ -3899,13 +3934,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_composition_projection_hit_tes
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        let viewport_config = session.session.viewport_config();
-        let published = viewport_config.layout();
-        if (published.max_width() - max_width).abs() > 0.05
-            || (published.line_height() - metrics.line_height()).abs() > 0.05
-            || (published.default_advance() - metrics.default_advance()).abs() > 0.05
-        {
-            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+            return status;
         }
 
         let query_y = point_y.max(0.0);
@@ -4261,13 +4291,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_composition_shaped_caret(
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        let viewport_config = session.session.viewport_config();
-        let published = viewport_config.layout();
-        if (published.max_width() - max_width).abs() > 0.05
-            || (published.line_height() - metrics.line_height()).abs() > 0.05
-            || (published.default_advance() - metrics.default_advance()).abs() > 0.05
-        {
-            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+            return status;
         }
 
         let snapshot = session.session.snapshot();
@@ -4939,13 +4964,7 @@ fn macos_table_resize_hit_at_point(
         return Err(YU_STORAGE_EDITOR_ERROR);
     }
     let (shaper, metrics, layout_config) = core_text_system_ui_layout(size, max_width)?;
-    let configured = session.session.viewport_config().layout();
-    if (configured.max_width() - max_width).abs() > 0.05
-        || (configured.line_height() - metrics.line_height()).abs() > 0.05
-        || (configured.default_advance() - metrics.default_advance()).abs() > 0.05
-    {
-        return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
-    }
+    macos_publish_viewport_config(session, max_width, metrics)?;
 
     let query_y = point_y.max(0.0);
     let viewport = ViewportRect::new(query_y, metrics.line_height());
@@ -5732,39 +5751,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_source_caret(
     }
 }
 
-/// Applies native viewport metrics to the revision-bound Rust viewport policy.
-/// This changes only layout estimates and measured-block state; it never
-/// changes the canonical source or its revision.
-///
-/// # Safety
-/// `session` must be null or a live handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_set_viewport_config(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    max_width: f32,
-    line_height: f32,
-    default_advance: f32,
-    estimated_block_height: f32,
-    overscan: f32,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let config = ViewportConfig::new(
-        LayoutConfig::new(max_width, line_height).with_default_advance(default_advance),
-        estimated_block_height,
-        overscan,
-    );
-    session
-        .session
-        .set_viewport_config(config)
-        .map_or(YU_STORAGE_INVALID_VIEWPORT_CONFIG, |_| YU_STORAGE_OK)
-}
-
 /// Returns the current macOS CoreText-shaped viewport block metadata using a
 /// count/fill ABI. The first call may pass `capacity = 0` and a null `blocks`
 /// pointer to learn the required count. The snapshot header is written on
@@ -5831,13 +5817,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_viewport_blocks(
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        let viewport_config = session.session.viewport_config();
-        let layout_config = viewport_config.layout();
-        if (layout_config.max_width() - max_width).abs() > 0.05
-            || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
-            || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
-        {
-            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+            return status;
         }
         let viewport = ViewportRect::new(scroll_y, viewport_height);
         let viewport_snapshot = {
@@ -5973,16 +5954,12 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_accessibility_div
         {
             return YU_STORAGE_EDITOR_ERROR;
         }
-        let (shaper, metrics, _layout_config) = match core_text_system_ui_layout(size, max_width) {
+        let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        let layout_config = session.session.viewport_config().layout();
-        if (layout_config.max_width() - max_width).abs() > 0.05
-            || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
-            || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
-        {
-            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+            return status;
         }
 
         let viewport = ViewportRect::new(scroll_y, viewport_height);
@@ -6580,14 +6557,7 @@ fn macos_render_host_frame(
             .map_err(|_| YU_STORAGE_CORE_TEXT_UNAVAILABLE)?;
         (metrics, None)
     };
-    let viewport_config = session.session.viewport_config();
-    let layout_config = viewport_config.layout();
-    if (layout_config.max_width() - max_width).abs() > 0.05
-        || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
-        || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
-    {
-        return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
-    }
+    macos_publish_viewport_config(session, max_width, metrics)?;
 
     let revision = session.session.revision();
     let table_resize = match session.table_resize_override {
@@ -6783,14 +6753,7 @@ fn macos_visual_render_plan(
         return Err(YU_STORAGE_EDITOR_ERROR);
     }
     let (shaper, metrics, _layout_config) = core_text_system_ui_layout(size, max_width)?;
-    let viewport_config = session.session.viewport_config();
-    let layout_config = viewport_config.layout();
-    if (layout_config.max_width() - max_width).abs() > 0.05
-        || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
-        || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
-    {
-        return Err(YU_STORAGE_INVALID_VIEWPORT_CONFIG);
-    }
+    macos_publish_viewport_config(session, max_width, metrics)?;
 
     let viewport = ViewportRect::new(scroll_y, viewport_height);
     let composition_generation = session.session.composition_generation();
@@ -7856,7 +7819,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_caret_scroll_request(
     max_width: f32,
     scroll_y: f32,
     viewport_height: f32,
-    margin: f32,
     output: *mut YuStorageCaretScrollRequest,
 ) -> i32 {
     let Some(session) = (unsafe { session.as_mut() }) else {
@@ -7877,7 +7839,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_caret_scroll_request(
             max_width,
             scroll_y,
             viewport_height,
-            margin,
         );
         return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
     }
@@ -7894,14 +7855,13 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_caret_scroll_request(
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        let viewport_config = session.session.viewport_config();
-        let layout_config = viewport_config.layout();
-        if (layout_config.max_width() - max_width).abs() > 0.05
-            || (layout_config.line_height() - metrics.line_height()).abs() > 0.05
-            || (layout_config.default_advance() - metrics.default_advance()).abs() > 0.05
-        {
-            return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+            return status;
         }
+        // 露出光标时在视口边缘留出的余量。此前由平台传入，而平台算的正是
+        // `max(line_height, 4.0)`——一个 Rust 自己就知道的值。为了拿到它，
+        // 平台必须先查一次字体度量，于是每次光标移动多一次纯往返。
+        let margin = metrics.line_height().max(4.0);
         let request = match session.session.caret_scroll_request_with_shaper(
             ViewportRect::new(scroll_y, viewport_height),
             margin,
@@ -8642,21 +8602,6 @@ mod tests {
         let mut raw = ptr::null_mut();
         assert_eq!(
             unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height(),
-                    metrics.default_advance(),
-                    metrics.line_height(),
-                    0.0,
-                )
-            },
             YU_STORAGE_OK
         );
         let (snapshot, commands, _, _) = macos_visual_render_plan(
@@ -9752,25 +9697,6 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let mut metrics = YuStorageMacosFontMetrics::default();
-        assert_eq!(
-            unsafe { yu_storage_session_macos_font_metrics(raw, 0, 14.0, 500.0, &mut metrics) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height,
-                    metrics.default_advance,
-                    metrics.line_height,
-                    0.0,
-                )
-            },
-            YU_STORAGE_OK
-        );
         let first_line_end = source.find('\n').expect("line ending") as u64;
         assert_eq!(
             unsafe {
@@ -9856,26 +9782,6 @@ mod tests {
         let mut raw = ptr::null_mut();
         assert_eq!(
             unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let mut metrics = YuStorageMacosFontMetrics::default();
-        assert_eq!(
-            unsafe { yu_storage_session_macos_font_metrics(raw, 0, 14.0, 500.0, &mut metrics) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height,
-                    metrics.default_advance,
-                    metrics.line_height,
-                    0.0,
-                )
-            },
             YU_STORAGE_OK
         );
 
@@ -10368,22 +10274,9 @@ mod tests {
             unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
             YU_STORAGE_OK
         );
-
+        // 这些断言用行高做几何基准；配置的发布已经由 Rust 自己完成，
+        // 这里只是取同一份度量来算期望值。
         let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height(),
-                    metrics.default_advance(),
-                    metrics.line_height(),
-                    0.0,
-                )
-            },
-            YU_STORAGE_OK
-        );
 
         let mut snapshot = YuStorageShapedViewportSnapshot::default();
         let mut required = 0;
@@ -10547,22 +10440,6 @@ mod tests {
         let mut raw = ptr::null_mut();
         assert_eq!(
             unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height(),
-                    metrics.default_advance(),
-                    metrics.line_height(),
-                    0.0,
-                )
-            },
             YU_STORAGE_OK
         );
 
@@ -11043,21 +10920,6 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height(),
-                    metrics.default_advance(),
-                    metrics.line_height(),
-                    0.0,
-                )
-            },
-            YU_STORAGE_OK
-        );
         let mut frame = YuStorageMacosRenderHostSnapshot::default();
         assert_eq!(
             unsafe {
@@ -11285,6 +11147,57 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
+    /// viewport 配置由 Rust 自己发布，且已经对齐时不得重建。
+    ///
+    /// 这条路径此前靠十份重复校验守着：平台没送对值就整个调用失败。现在校验
+    /// 变成了发布，失败模式也随之变了——发布错了不会报错，只会让整份文档按
+    /// 错误的行高与换行宽度排版。因此这里直接断言发布后的配置内容。
+    ///
+    /// 「已对齐就跳过」不是优化：`set_viewport_config` 会重建 `ViewportLayout`
+    /// 并丢掉缓存的 block 高度，那是 J2 定位可见范围的依据。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_viewport_config_is_published_by_rust_and_kept_when_aligned() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-viewport-config-{id}.md"));
+        fs::write(&path, "# \u{6807}\u{9898}\n\nparagraph\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        // SAFETY: `raw` is a live session handle owned by this test.
+        let session = unsafe { raw.as_mut() }.expect("session");
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+
+        macos_publish_viewport_config(session, 500.0, metrics).expect("publish");
+        let published = session.session.viewport_config().layout();
+        assert!((published.max_width() - 500.0).abs() <= f32::EPSILON);
+        assert!((published.line_height() - metrics.line_height()).abs() <= f32::EPSILON);
+        assert!((published.default_advance() - metrics.default_advance()).abs() <= f32::EPSILON);
+
+        // 用一个可辨认的 estimated_block_height 观察「跳过」是否真的发生。
+        let marked = ViewportConfig::new(published, 987.0, 0.0);
+        session.session.set_viewport_config(marked).expect("marked");
+        macos_publish_viewport_config(session, 500.0, metrics).expect("republish");
+        assert!(
+            (session.session.viewport_config().estimated_block_height() - 987.0).abs()
+                <= f32::EPSILON,
+            "配置已经对齐时不得重建 ViewportLayout"
+        );
+
+        // 换行宽度变化必须真正重新发布。
+        macos_publish_viewport_config(session, 640.0, metrics).expect("publish width");
+        assert!(
+            (session.session.viewport_config().layout().max_width() - 640.0).abs() <= f32::EPSILON,
+            "宽度变化必须重新发布配置"
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     /// 帧身份必须覆盖每一项「不推进 Revision 却改变画面」的状态。
     ///
     /// 这个判断决定平台是否跳过提交，而漏掉一项不会报错——只会让光标停在原处、
@@ -11413,22 +11326,10 @@ mod tests {
             unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
             YU_STORAGE_OK
         );
-
+        // 这些断言用行高做几何基准；配置的发布已经由 Rust 自己完成，
+        // 这里只是取同一份度量来算期望值。
         let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height(),
-                    metrics.default_advance(),
-                    metrics.line_height(),
-                    0.0,
-                )
-            },
-            YU_STORAGE_OK
-        );
+
         let mut first = YuStorageMacosRenderHostSnapshot::default();
         assert_eq!(
             unsafe {
@@ -11745,22 +11646,6 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height(),
-                    metrics.default_advance(),
-                    metrics.line_height(),
-                    0.0,
-                )
-            },
-            YU_STORAGE_OK
-        );
-
         let mut first = YuStorageMacosRenderHostSnapshot::default();
         assert_eq!(
             unsafe {
@@ -11962,22 +11847,10 @@ mod tests {
             unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
             YU_STORAGE_OK
         );
-
+        // 这些断言用行高做几何基准；配置的发布已经由 Rust 自己完成，
+        // 这里只是取同一份度量来算期望值。
         let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height(),
-                    metrics.default_advance(),
-                    metrics.line_height(),
-                    0.0,
-                )
-            },
-            YU_STORAGE_OK
-        );
+
         let source_utf16 = source.encode_utf16().count() as u64;
         assert_eq!(
             unsafe {
@@ -11992,7 +11865,9 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let viewport_height = metrics.line_height();
+        // 余量现在由 Rust 取一个行高，视口必须容得下它，否则测的就不再是
+        // 「光标在视口外要滚多少」而是余量本身的退化情形。
+        let viewport_height = metrics.line_height() * 4.0;
         let mut request = YuStorageCaretScrollRequest::default();
         assert_eq!(
             unsafe {
@@ -12003,7 +11878,6 @@ mod tests {
                     500.0,
                     0.0,
                     viewport_height,
-                    0.0,
                     &mut request,
                 )
             },
@@ -12031,7 +11905,6 @@ mod tests {
                     500.0,
                     0.0,
                     viewport_height,
-                    0.0,
                     &mut request,
                 )
             },
@@ -12279,26 +12152,6 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let mut metrics = YuStorageMacosFontMetrics::default();
-        assert_eq!(
-            unsafe { yu_storage_session_macos_font_metrics(raw, 0, 14.0, 500.0, &mut metrics) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height,
-                    metrics.default_advance,
-                    metrics.line_height,
-                    0.0,
-                )
-            },
-            YU_STORAGE_OK
-        );
-
         let mut caret = YuStorageCompositionShapedCaret::default();
         assert_eq!(
             unsafe {
@@ -12389,21 +12242,6 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_viewport_config(
-                    raw,
-                    0,
-                    500.0,
-                    metrics.line_height(),
-                    metrics.default_advance(),
-                    metrics.line_height(),
-                    0.0,
-                )
-            },
-            YU_STORAGE_OK
-        );
         let mut viewport = YuStorageShapedViewportSnapshot::default();
         let mut required = 0;
         assert_eq!(
