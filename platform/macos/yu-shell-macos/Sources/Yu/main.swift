@@ -30,33 +30,9 @@ if let flag = CommandLine.arguments.firstIndex(of: "--document-interaction-self-
    CommandLine.arguments.indices.contains(flag + 1) {
     runDocumentInteractionSelfCheck(path: CommandLine.arguments[flag + 1])
 }
-if let flag = CommandLine.arguments.firstIndex(of: "--projection-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--projection-hit-test-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runProjectionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
-}
 if let flag = CommandLine.arguments.firstIndex(of: "--shaped-projection-hit-test-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runShapedProjectionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--composition-hit-test-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runCompositionHitTestSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--block-projection-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runBlockProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--block-layout-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runBlockLayoutSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--shaped-viewport-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runShapedViewportSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--shaped-vertical-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
@@ -69,10 +45,6 @@ if let flag = CommandLine.arguments.firstIndex(of: "--macos-table-resize-coordin
 if let flag = CommandLine.arguments.firstIndex(of: "--macos-task-checkbox-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runMacosTaskCheckboxSelfCheck(path: CommandLine.arguments[flag + 1])
-}
-if let flag = CommandLine.arguments.firstIndex(of: "--composition-projection-self-check"),
-   CommandLine.arguments.indices.contains(flag + 1) {
-    runCompositionProjectionSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 if let flag = CommandLine.arguments.firstIndex(of: "--clipboard-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {

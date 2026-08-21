@@ -50,7 +50,6 @@ final class DocumentTextView: NSTextView {
     private var nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
     private var synchronizingSelection = false
     private var visualCompositionGeneration: UInt64?
-    private var visualViewport: NativeVisualViewport?
     private var visualSelectionAnchor: Int?
     private var tableResizeTrackingArea: NSTrackingArea?
     private var tableResizeCursorActive = false
@@ -1127,9 +1126,6 @@ final class DocumentTextView: NSTextView {
 
     private func synchronizeProjection() {
         let active = bridge.composition
-        if let visualViewport, visualViewport.revision != bridge.state.revision {
-            self.visualViewport = nil
-        }
         let projected: String
         let selection: NSRange
         if active.active {

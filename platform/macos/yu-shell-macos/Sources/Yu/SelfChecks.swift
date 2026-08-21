@@ -353,103 +353,6 @@ func runDocumentInteractionSelfCheck(path: String) -> Never {
     }
 }
 
-func runProjectionSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
-        let source = bridge.source
-        let projected = try bridge.projectedSource(revision: revision)
-        precondition(projected.contains("粗体"))
-        precondition(projected.contains("强调"))
-        precondition(projected.contains("链接"))
-        precondition(!projected.contains("**粗体**"))
-        precondition(!projected.contains("*强调*"))
-        precondition(!projected.contains("[链接](https://example.com)"))
-
-        let strongMarker = (source as NSString).range(of: "**粗体**")
-        precondition(strongMarker.location != NSNotFound)
-        let insideStrong = UInt64(strongMarker.location + 2)
-        let caret = try bridge.projectionCaret(
-            revision: revision,
-            sourceUTF16: insideStrong,
-            affinity: 1
-        )
-        precondition(caret.revision == revision)
-        precondition(caret.roundTripSourceUTF16 == insideStrong)
-        precondition(caret.visualUTF16 < UInt64(projected.utf16.count))
-
-        let end = try bridge.projectionCaret(
-            revision: revision,
-            sourceUTF16: UInt64(source.utf16.count),
-            affinity: 1
-        )
-        precondition(end.visualUTF16 == UInt64(projected.utf16.count))
-        precondition(end.roundTripSourceUTF16 == UInt64(source.utf16.count))
-        print(
-            "Yu Projection self-check: source UTF-16 \(source.utf16.count) -> "
-                + "visual UTF-16 \(projected.utf16.count); caret round-trips"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Projection self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
-
-func runProjectionHitTestSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
-        let source = bridge.source
-        let projected = try bridge.projectedSource(revision: revision)
-        let sourceStrong = (source as NSString).range(of: "**粗体**")
-        let visualStrong = (projected as NSString).range(of: "粗体")
-        precondition(sourceStrong.location != NSNotFound)
-        precondition(visualStrong.location != NSNotFound)
-
-        let selection = try bridge.projectionSelection(
-            revision: revision,
-            sourceRange: sourceStrong,
-            affinity: 1
-        )
-        precondition(selection.revision == revision)
-        precondition(selection.sourceRange == sourceStrong)
-        precondition(selection.visualRange == visualStrong)
-        precondition(selection.roundTripSourceRange == sourceStrong)
-
-        let visualPrefix = (projected as NSString).substring(to: visualStrong.location)
-        let line = UInt64(visualPrefix.components(separatedBy: "\n").count - 1)
-        let linePrefix = (visualPrefix as NSString).substring(
-            from: (visualPrefix as NSString).range(of: "\n", options: .backwards).location + 1
-        )
-        let point = CGPoint(x: CGFloat(linePrefix.utf16.count) + 0.1, y: CGFloat(line))
-        let hit = try bridge.projectionHitTest(revision: revision, point: point)
-        precondition(hit.revision == revision)
-        precondition(hit.line == line)
-        precondition(hit.sourceUTF16 == UInt64(sourceStrong.location))
-        precondition(hit.visualUTF16 == UInt64(visualStrong.location))
-        precondition(hit.roundTripSourceUTF16 == UInt64(sourceStrong.location))
-        precondition(abs(hit.point.x - CGFloat(linePrefix.utf16.count)) < 0.001)
-        precondition(abs(hit.point.y - CGFloat(line)) < 0.001)
-
-        var staleRejected = false
-        do {
-            _ = try bridge.projectionHitTest(revision: revision + 1, point: point)
-        } catch {
-            staleRejected = true
-        }
-        precondition(staleRejected)
-        print(
-            "Yu Projection hit-test self-check: visual selection and "
-                + "point↔source round-trip are Revision-bound"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Projection hit-test self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
-
 func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
@@ -463,7 +366,6 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
             max(textView.bounds.width - 2.0 * textView.textContainerOrigin.x, 1.0)
         )
 
-        let projected = try bridge.projectedSource(revision: revision)
         let hit = try bridge.macosProjectionHitTest(
             revision: revision,
             point: CGPoint(x: 0.0, y: 0.0),
@@ -472,7 +374,6 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
         )
         precondition(hit.revision == revision)
         precondition(hit.sourceUTF16 <= UInt64(bridge.source.utf16.count))
-        precondition(hit.visualUTF16 <= UInt64(projected.utf16.count))
         precondition(hit.roundTripSourceUTF16 <= UInt64(bridge.source.utf16.count))
         precondition(hit.point.x.isFinite && hit.point.y.isFinite)
         precondition(hit.line == 0)
@@ -489,22 +390,10 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
         let sourceEnd = (bridge.source as NSString).range(of: "粗体")
         precondition(sourceEnd.location != NSNotFound)
         let sourceEndUTF16 = UInt64(sourceEnd.location + sourceEnd.length)
-        let (_, viewportBlocks) = try bridge.macosShapedViewportBlocks(
+        // 由 Rust 自己定位所属块：平台不需要先拿到 viewport 的块列表再挑一个，
+        // 那等于把布局几何搬到平台侧（不变量 I3）。
+        let endCaret = try bridge.macosSourceCaret(
             revision: revision,
-            size: size,
-            maxWidth: pointerWidth,
-            scrollY: 0.0,
-            viewportHeight: 600.0
-        )
-        guard let targetBlock = viewportBlocks.first(where: {
-            UInt64($0.sourceRange.location) <= sourceEndUTF16
-                && sourceEndUTF16 <= UInt64(NSMaxRange($0.sourceRange))
-        }) else {
-            preconditionFailure("no viewport block contains the target source offset")
-        }
-        let endCaret = try bridge.macosBlockCaret(
-            revision: revision,
-            blockIndex: targetBlock.blockIndex,
             sourceUTF16: sourceEndUTF16,
             affinity: 0,
             size: size,
@@ -556,510 +445,6 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
 
 
 
-
-func runCompositionHitTestSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
-        let source = bridge.source as NSString
-        let replacementStart = source.range(of: "x")
-        let replacementEnd = source.range(of: "日本語")
-        precondition(replacementStart.location != NSNotFound)
-        precondition(replacementEnd.location != NSNotFound)
-        let replacement = NSRange(
-            location: replacementStart.location,
-            length: replacementEnd.location + 2 - replacementStart.location
-        )
-        try bridge.beginComposition(
-            replacementRange: replacement,
-            preedit: "日本🙂",
-            selection: NSRange(location: 2, length: 2)
-        )
-
-        let size: Float = 14.0
-        let maxWidth: Float = 500.0
-        let (_, blocks) = try bridge.macosShapedViewportBlocks(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: 1_000.0
-        )
-        let secondBlock = blocks.first { block in
-            block.sourceRange.location <= replacementEnd.location
-                && NSMaxRange(block.sourceRange) >= replacementEnd.location
-        } ?? blocks.last!
-        let point = CGPoint(
-            x: CGFloat(maxWidth - 1.0),
-            y: secondBlock.y + secondBlock.height * 0.5
-        )
-        let projection = try bridge.compositionProjection(revision: revision)
-        let hit = try bridge.macosCompositionProjectionHitTest(
-            revision: revision,
-            generation: projection.generation,
-            point: point,
-            size: size,
-            maxWidth: maxWidth
-        )
-        precondition(hit.revision == revision)
-        precondition(hit.generation == projection.generation)
-        precondition(hit.blockIndex == secondBlock.blockIndex)
-        precondition(hit.point.x.isFinite && hit.point.y.isFinite)
-        precondition(hit.visualSelection == projection.visualSelection)
-        precondition(hit.visualReplacement == projection.visualReplacementRange)
-        precondition(hit.visualUTF16 >= UInt64(projection.visualReplacementRange.location))
-        do {
-            _ = try bridge.macosCompositionProjectionHitTest(
-                revision: revision,
-                generation: projection.generation + 1,
-                point: point,
-                size: size,
-                maxWidth: maxWidth
-            )
-            preconditionFailure("stale composition hit unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 16)
-        }
-        try bridge.cancelComposition()
-        precondition(!bridge.composition.active)
-        precondition(bridge.state.revision == revision)
-        print(
-            "Yu Composition Hit-Test self-check: cross-block transient point mapped "
-                + "at block \(hit.blockIndex), generation \(hit.generation)"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Composition Hit-Test self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
-
-func runBlockProjectionSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
-        let count = try bridge.projectionBlockCount(revision: revision)
-        precondition(count > 0)
-
-        var previousEnd = 0
-        var kinds = Set<UInt8>()
-        var visualTexts: [String] = []
-        for index in 0..<count {
-            let (block, visual) = try bridge.projectedBlock(
-                revision: revision,
-                blockIndex: UInt64(index)
-            )
-            precondition(block.revision == revision)
-            precondition(block.blockIndex == UInt64(index))
-            precondition(block.sourceRange.location >= previousEnd)
-            previousEnd = NSMaxRange(block.sourceRange)
-            precondition(block.visualUTF8Length == visual.utf8.count)
-            precondition(block.visualUTF16Length == visual.utf16.count)
-            kinds.insert(block.kind)
-            visualTexts.append(visual)
-            print(
-                "  block=\(index) kind=\(block.kind) projection=\(block.projectionKind) "
-                    + "source=\(block.sourceRange) visualUTF16=\(block.visualUTF16Length)"
-            )
-        }
-
-        precondition(kinds.contains(3), "heading block missing")
-        precondition(kinds.contains(5), "blockquote block missing")
-        precondition(kinds.contains(6), "list block missing")
-        precondition(kinds.contains(4), "fenced-code block missing")
-        precondition(kinds.contains(7), "task-list block missing")
-        precondition(visualTexts.contains { $0.contains("粗体") })
-        precondition(visualTexts.contains { $0.contains("链接") })
-        precondition(visualTexts.contains { $0.contains("任务") })
-        precondition(visualTexts.contains { $0.contains("fn main") })
-        precondition(visualTexts.contains { $0.contains("引用块") })
-        precondition(visualTexts.contains { $0.contains("有序列表") })
-        precondition(visualTexts.contains { $0.contains("Projection blocks") })
-        precondition(visualTexts.allSatisfy { !$0.contains("# Projection blocks") })
-        precondition(visualTexts.allSatisfy { !$0.contains("> 引用块") })
-        precondition(visualTexts.allSatisfy { !$0.contains("**粗体**") })
-        precondition(visualTexts.allSatisfy { !$0.contains("[链接](https://example.com)") })
-
-        var tableIndex: Int?
-        for index in 0..<count {
-            let (block, _) = try bridge.projectedBlock(
-                revision: revision,
-                blockIndex: UInt64(index)
-            )
-            if block.projectionKind == 7 {
-                tableIndex = index
-                break
-            }
-        }
-        if let tableIndex {
-            let cells = try bridge.projectedTableCells(
-                revision: revision,
-                blockIndex: UInt64(tableIndex)
-            )
-            precondition(cells.count == 6, "table cell count mismatch")
-            precondition(cells.map(\.row) == [0, 0, 1, 1, 2, 2])
-            precondition(cells.map(\.column) == [0, 1, 0, 1, 0, 1])
-            precondition(cells.allSatisfy { $0.source_start_utf16 <= $0.source_end_utf16 })
-
-            let layoutCells = try bridge.tableLayoutCells(
-                revision: revision,
-                blockIndex: UInt64(tableIndex),
-                maxWidth: 20.0,
-                lineHeight: 2.0,
-                defaultAdvance: 1.0
-            )
-            precondition(layoutCells.count == 4, "table layout cell count mismatch")
-            precondition(layoutCells.map(\.row) == [0, 0, 1, 1])
-            precondition(layoutCells.map(\.column) == [0, 1, 0, 1])
-            precondition(layoutCells[0].y == 0.0)
-            precondition(layoutCells[2].y == 2.0)
-            precondition(layoutCells[1].alignment == YU_STORAGE_TABLE_ALIGNMENT_CENTER)
-            let hit = try bridge.tableCellHitTest(
-                revision: revision,
-                blockIndex: UInt64(tableIndex),
-                point: CGPoint(x: 3.5, y: 2.5),
-                maxWidth: 20.0,
-                lineHeight: 2.0,
-                defaultAdvance: 1.0
-            )
-            precondition(hit.row == 1 && hit.column == 1, "table hit-test mismatch")
-            precondition(hit.x == 3.0 && hit.y == 2.0)
-
-            let sourceBeforeResize = bridge.source
-            let columnDividerX = layoutCells[0].x + layoutCells[0].width
-            let columnResize = try bridge.tableResizeHitTest(
-                revision: revision,
-                blockIndex: UInt64(tableIndex),
-                point: CGPoint(x: CGFloat(columnDividerX + 0.1), y: 0.5),
-                tolerance: 0.2,
-                maxWidth: 20.0,
-                lineHeight: 2.0,
-                defaultAdvance: 1.0
-            )
-            precondition(columnResize.revision == revision)
-            precondition(columnResize.block_index == UInt64(tableIndex))
-            precondition(columnResize.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
-            precondition(columnResize.index == 0)
-            precondition(abs(columnResize.position - columnDividerX) < 0.0001)
-
-            let begunResize = try bridge.tableResizeBegin(
-                revision: revision,
-                blockIndex: UInt64(tableIndex),
-                point: CGPoint(x: CGFloat(columnDividerX + 0.1), y: 0.5),
-                tolerance: 0.2,
-                pointerPosition: Float(columnDividerX + 0.1),
-                maxWidth: 20.0,
-                lineHeight: 2.0,
-                defaultAdvance: 1.0
-            )
-            precondition(begunResize.revision == columnResize.revision)
-            precondition(begunResize.block_index == columnResize.block_index)
-            precondition(begunResize.kind == columnResize.kind)
-            precondition(begunResize.index == columnResize.index)
-            precondition(abs(begunResize.position - columnResize.position) < 0.0001)
-            let preview = try bridge.tableResizeAction(
-                revision: revision,
-                action: UInt8(YU_STORAGE_TABLE_RESIZE_UPDATE),
-                pointerPosition: Float(columnDividerX + 1.1)
-            )
-            precondition(preview.revision == revision)
-            precondition(preview.blockIndex == UInt64(tableIndex))
-            precondition(preview.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
-            precondition(preview.index == 0)
-            precondition(abs(preview.delta - 1.0) < 0.0001)
-            let finishedResize = try bridge.tableResizeAction(
-                revision: revision,
-                action: UInt8(YU_STORAGE_TABLE_RESIZE_FINISH)
-            )
-            precondition(finishedResize == preview)
-
-            let resizedLayoutCells = try bridge.tableLayoutCellsWithResize(
-                revision: revision,
-                blockIndex: UInt64(tableIndex),
-                resizeKind: UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
-                resizeIndex: columnResize.index,
-                resizeDelta: 1.0,
-                maxWidth: 20.0,
-                lineHeight: 2.0,
-                defaultAdvance: 1.0
-            )
-            precondition(resizedLayoutCells.count == 4)
-            precondition(resizedLayoutCells[0].width == 4.0)
-            precondition(resizedLayoutCells[1].x == 4.0)
-            precondition(resizedLayoutCells[1].width == 2.0)
-            precondition(resizedLayoutCells[3].x == 4.0)
-            let canonicalLayoutCells = try bridge.tableLayoutCells(
-                revision: revision,
-                blockIndex: UInt64(tableIndex),
-                maxWidth: 20.0,
-                lineHeight: 2.0,
-                defaultAdvance: 1.0
-            )
-            precondition(canonicalLayoutCells[0].width == 3.0)
-            precondition(canonicalLayoutCells[1].x == 3.0)
-            precondition(bridge.source == sourceBeforeResize)
-
-            let rowDividerY = layoutCells[0].y + layoutCells[0].height
-            let rowResize = try bridge.tableResizeHitTest(
-                revision: revision,
-                blockIndex: UInt64(tableIndex),
-                point: CGPoint(x: 1.0, y: CGFloat(rowDividerY + 0.1)),
-                tolerance: 0.2,
-                maxWidth: 20.0,
-                lineHeight: 2.0,
-                defaultAdvance: 1.0
-            )
-            precondition(rowResize.revision == revision)
-            precondition(rowResize.kind == YU_STORAGE_TABLE_RESIZE_ROW)
-            precondition(rowResize.index == 0)
-            precondition(abs(rowResize.position - rowDividerY) < 0.0001)
-            let begunRowResize = try bridge.tableResizeBegin(
-                revision: revision,
-                blockIndex: UInt64(tableIndex),
-                point: CGPoint(x: 1.0, y: CGFloat(rowDividerY + 0.1)),
-                tolerance: 0.2,
-                pointerPosition: Float(rowDividerY + 0.1),
-                maxWidth: 20.0,
-                lineHeight: 2.0,
-                defaultAdvance: 1.0
-            )
-            precondition(begunRowResize.revision == rowResize.revision)
-            precondition(begunRowResize.block_index == rowResize.block_index)
-            precondition(begunRowResize.kind == rowResize.kind)
-            precondition(begunRowResize.index == rowResize.index)
-            precondition(abs(begunRowResize.position - rowResize.position) < 0.0001)
-            let rowPreview = try bridge.tableResizeAction(
-                revision: revision,
-                action: UInt8(YU_STORAGE_TABLE_RESIZE_UPDATE),
-                pointerPosition: Float(rowDividerY + 0.2)
-            )
-            precondition(rowPreview.kind == YU_STORAGE_TABLE_RESIZE_ROW)
-            try bridge.tableResizeAction(
-                revision: revision,
-                action: UInt8(YU_STORAGE_TABLE_RESIZE_CANCEL)
-            )
-            do {
-                _ = try bridge.tableResizeHitTest(
-                    revision: revision,
-                    blockIndex: UInt64(tableIndex),
-                    point: CGPoint(x: CGFloat(columnDividerX + 0.1), y: 0.5),
-                    tolerance: 0.0,
-                    maxWidth: 20.0,
-                    lineHeight: 2.0,
-                    defaultAdvance: 1.0
-                )
-                preconditionFailure("outside resize tolerance unexpectedly succeeded")
-            } catch BridgeError.operation(let status) {
-                precondition(status == 14)
-            }
-            precondition(bridge.source == sourceBeforeResize)
-        } else {
-            preconditionFailure("table projection missing")
-        }
-
-        do {
-            _ = try bridge.projectedBlock(revision: revision, blockIndex: UInt64(count))
-            preconditionFailure("out-of-bounds block unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 14)
-        }
-
-        _ = try bridge.insertText("x")
-        do {
-            _ = try bridge.projectionBlockCount(revision: revision)
-            preconditionFailure("stale block count unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 13)
-        }
-        if let tableIndex {
-            do {
-                _ = try bridge.tableResizeHitTest(
-                    revision: revision,
-                    blockIndex: UInt64(tableIndex),
-                    point: CGPoint(x: 3.1, y: 0.5),
-                    tolerance: 0.2,
-                    maxWidth: 20.0,
-                    lineHeight: 2.0,
-                    defaultAdvance: 1.0
-                )
-                preconditionFailure("stale table resize hit unexpectedly succeeded")
-            } catch BridgeError.operation(let status) {
-                precondition(status == 13)
-            }
-            do {
-                _ = try bridge.tableLayoutCellsWithResize(
-                    revision: revision,
-                    blockIndex: UInt64(tableIndex),
-                    resizeKind: UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
-                    resizeIndex: 0,
-                    resizeDelta: 1.0,
-                    maxWidth: 20.0,
-                    lineHeight: 2.0,
-                    defaultAdvance: 1.0
-                )
-                preconditionFailure("stale table resize layout unexpectedly succeeded")
-            } catch BridgeError.operation(let status) {
-                precondition(status == 13)
-            }
-        }
-        print(
-            "Yu Block Projection self-check: revision=\(revision) blocks=\(count) "
-                + "source ranges and visual lengths are revision-bound"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Block Projection self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
-
-func runBlockLayoutSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
-        let blockIndex: UInt64 = 2
-        let (block, _) = try bridge.projectedBlock(
-            revision: revision,
-            blockIndex: blockIndex
-        )
-        precondition(block.kind == 2, "paragraph block missing")
-
-        let metrics = try bridge.blockLayout(
-            revision: revision,
-            blockIndex: blockIndex,
-            maxWidth: 80.0,
-            lineHeight: 1.0,
-            defaultAdvance: 1.0
-        )
-        precondition(metrics.revision == revision)
-        precondition(metrics.blockIndex == blockIndex)
-        precondition(!metrics.shaped)
-        precondition(metrics.lineCount > 0)
-        precondition(metrics.height > 0.0)
-        precondition(metrics.visualUTF16Length == block.visualUTF16Length)
-
-        let shaped = try bridge.macosBlockLayout(
-            revision: revision,
-            blockIndex: blockIndex,
-            size: 14.0,
-            maxWidth: 500.0
-        )
-        precondition(shaped.revision == revision)
-        precondition(shaped.blockIndex == blockIndex)
-        precondition(shaped.shaped)
-        precondition(shaped.lineCount > 0)
-        precondition(shaped.height > 0.0)
-        precondition(shaped.lineHeight > 0.0)
-        precondition(shaped.defaultAdvance > 0.0)
-        precondition(shaped.visualUTF16Length == block.visualUTF16Length)
-
-        let source = bridge.source
-        let marker = (source as NSString).range(of: "**粗体**")
-        precondition(marker.location != NSNotFound)
-        let caret = try bridge.macosBlockCaret(
-            revision: revision,
-            blockIndex: blockIndex,
-            sourceUTF16: UInt64(marker.location),
-            affinity: 0,
-            size: 14.0,
-            maxWidth: 500.0
-        )
-        precondition(caret.revision == revision)
-        precondition(caret.blockIndex == blockIndex)
-        precondition(caret.sourceUTF16 == UInt64(marker.location))
-        precondition(caret.shaped)
-        precondition(caret.height == shaped.lineHeight)
-        precondition(caret.point.x.isFinite && caret.point.y.isFinite)
-
-        _ = try bridge.insertText("x")
-        do {
-            _ = try bridge.macosBlockLayout(
-                revision: revision,
-                blockIndex: blockIndex,
-                size: 14.0,
-                maxWidth: 500.0
-            )
-            preconditionFailure("stale block layout unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 13)
-        }
-        print(
-            "Yu Block Layout self-check: metrics/CoreText block geometry and caret "
-                + "are Revision-bound"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Block Layout self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
-
-func runShapedViewportSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
-        let size: Float = 14.0
-        let maxWidth: Float = 500.0
-        let shaped = try bridge.macosBlockLayout(
-            revision: revision,
-            blockIndex: 2,
-            size: size,
-            maxWidth: maxWidth
-        )
-
-        let (snapshot, blocks) = try bridge.macosShapedViewportBlocks(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: 1_000.0
-        )
-        precondition(snapshot.revision == revision)
-        precondition(snapshot.blockRange.count == blocks.count)
-        precondition(!blocks.isEmpty)
-        precondition(snapshot.contentHeight >= shaped.lineHeight)
-        precondition(blocks.allSatisfy { block in
-            block.revision == revision
-                && block.height > 0.0
-                && block.y.isFinite
-                && block.height.isFinite
-                && block.sourceRange.location >= 0
-        })
-        let ordered = zip(blocks, blocks.dropFirst()).allSatisfy { first, second -> Bool in
-            let sourceOrdered = NSMaxRange(first.sourceRange) <= second.sourceRange.location
-            return first.blockIndex < second.blockIndex
-                && sourceOrdered
-                && first.y < second.y
-        }
-        precondition(ordered)
-        precondition(blocks.contains { $0.kind == 3 }, "heading block missing")
-        precondition(blocks.contains { $0.kind == 7 }, "task-list block missing")
-        precondition(blocks.contains { $0.kind == 4 }, "fenced-code block missing")
-        precondition(blocks.allSatisfy { $0.measured })
-
-        _ = try bridge.insertText("x")
-        do {
-            _ = try bridge.macosShapedViewportBlocks(
-                revision: revision,
-                size: size,
-                maxWidth: maxWidth,
-                scrollY: 0.0,
-                viewportHeight: 1_000.0
-            )
-            preconditionFailure("stale shaped viewport unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 13)
-        }
-        print(
-            "Yu Shaped Viewport self-check: revision=\(revision) blocks=\(blocks.count) "
-                + "document-space origins/heights and source ranges are revision-bound"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Shaped Viewport self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
 
 func runShapedVerticalSelfCheck(path: String) -> Never {
     do {
@@ -1136,40 +521,6 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         let revision = bridge.state.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
-        let (_, blocks) = try bridge.macosShapedViewportBlocks(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: 1000.0
-        )
-        let blockCount = try bridge.projectionBlockCount(revision: revision)
-        let tableBlockIndex = try (0..<blockCount).compactMap { index -> UInt64? in
-            let (block, _) = try bridge.projectedBlock(
-                revision: revision,
-                blockIndex: UInt64(index)
-            )
-            return block.projectionKind == UInt8(YU_STORAGE_PROJECTION_TABLE)
-                ? block.blockIndex
-                : nil
-        }.first
-        guard let tableBlockIndex,
-              let tableBlock = blocks.first(where: { $0.blockIndex == tableBlockIndex }) else {
-            throw BridgeError.operation(StorageStatus.invalidSelection)
-        }
-        var tableY = tableBlock.y + 0.5
-        var nearest = try bridge.macosTableResizeHitTestAtDocumentPoint(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            point: CGPoint(x: 0.0, y: tableY),
-            tolerance: maxWidth
-        )
-        precondition(nearest.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
-        var dividerPoint = NSPoint(
-            x: CGFloat(nearest.position + 0.1),
-            y: tableY
-        )
 
         let surfaceView = MacosSurfaceHostView(
             frame: NSRect(x: 0.0, y: 0.0, width: 500.0, height: 1000.0)
@@ -1187,46 +538,30 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
             fontSize: CGFloat(size)
         )
         coordinator.setContentWidth(CGFloat(maxWidth))
-        // Setting the viewport policy can invalidate measured block heights.
-        // Re-read the table y/divider after the coordinator has prepared the
-        // same metrics contract used by the product pointer path.
-        _ = coordinator.visualDecorationGeometry()
-        let (_, currentBlocks) = try bridge.macosShapedViewportBlocks(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: 1000.0
-        )
-        guard let currentTableBlock = currentBlocks.first(where: {
-            $0.blockIndex == tableBlockIndex
-        }) else {
-            throw BridgeError.operation(StorageStatus.invalidSelection)
-        }
-        tableY = currentTableBlock.y + 0.5
-        nearest = try bridge.macosTableResizeHitTestAtDocumentPoint(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            point: CGPoint(x: 0.0, y: tableY),
-            tolerance: maxWidth
-        )
-        precondition(nearest.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
-        dividerPoint = NSPoint(x: CGFloat(nearest.position + 0.1), y: tableY)
+        // 分隔线的位置由 Rust 自己的 Accessibility 描述符给出。平台不需要先取
+        // viewport 的块列表、再逐块找出哪个是表格——那是把布局几何搬到平台侧
+        // （不变量 I3）。这条路径同时就是 VoiceOver 用的那一条。
         let sourceBeforeResize = bridge.source
         let accessibilityDividers = coordinator.tableResizeAccessibilityDividers()
         guard let accessibilityDivider = accessibilityDividers.first(where: {
-            $0.blockIndex == tableBlockIndex && $0.index == nearest.index
+            $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
         }) else {
             throw BridgeError.operation(StorageStatus.invalidSelection)
         }
         precondition(accessibilityDivider.revision == revision)
-        precondition(accessibilityDivider.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
         precondition(accessibilityDivider.columnCount >= 2)
         precondition(accessibilityDivider.rect.height > 0.0)
-        precondition(accessibilityDivider.rect.contains(
-            NSPoint(x: accessibilityDivider.rect.midX, y: tableY)
-        ))
+        let tableY = accessibilityDivider.rect.midY
+        let dividerPoint = NSPoint(x: accessibilityDivider.rect.midX, y: tableY)
+        let nearest = try bridge.macosTableResizeHitTestAtDocumentPoint(
+            revision: revision,
+            size: size,
+            maxWidth: maxWidth,
+            point: dividerPoint,
+            tolerance: maxWidth
+        )
+        precondition(nearest.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
+        precondition(nearest.index == accessibilityDivider.index)
         precondition(coordinator.tableResizeHover(at: dividerPoint))
         precondition(
             !coordinator.tableResizeHover(
@@ -1272,18 +607,6 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         let revision = bridge.state.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
-        let (_, commands, _, _) = try bridge.macosVisualRenderPlan(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth,
-            scrollY: 0.0,
-            viewportHeight: 1_000.0
-        )
-        guard let task = commands.first(where: {
-            $0.kind == UInt8(YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX)
-        }) else {
-            throw BridgeError.operation(StorageStatus.invalidSelection)
-        }
         _ = try bridge.macosRenderHostFrame(
             revision: revision,
             size: size,
@@ -1292,13 +615,49 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
             viewportHeight: 1_000.0,
             surfaceGeneration: 0
         )
-        let point = NSPoint(x: task.bounds.midX, y: task.bounds.midY)
-        let publishedHit = try bridge.macosTaskCheckboxHitTest(
-            revision: revision,
-            point: point
-        )
+        // 用 Rust 自己的 point→source 映射找出待办那一行的纵坐标，再沿这一行
+        // 向右找出 checkbox 的可命中点。此前是把整份 RenderPlan 取过 ABI 再从
+        // 里面挑一条 TASK_CHECKBOX 指令——RenderPlan 不跨 C ABI（不变量 I2）。
+        let sourceString = bridge.source as NSString
+        let markerRange = sourceString.range(of: "- [ ] todo")
+        precondition(markerRange.location != NSNotFound)
+        var taskLineY: CGFloat?
+        for step in 0..<200 {
+            let y = CGFloat(step) * 2.0
+            guard let hit = try? bridge.macosProjectionHitTest(
+                revision: revision,
+                point: CGPoint(x: 1.0, y: y),
+                size: size,
+                maxWidth: maxWidth
+            ) else { continue }
+            if hit.sourceUTF16 >= UInt64(markerRange.location),
+               hit.sourceUTF16 <= UInt64(NSMaxRange(markerRange)) {
+                taskLineY = y
+                break
+            }
+        }
+        guard let taskLineY else {
+            throw BridgeError.operation(StorageStatus.invalidSelection)
+        }
+        // 在这一行附近扫描出一个真正命中 checkbox 的点。平台已经拿不到任何
+        // 绘制几何，只能像用户点击那样去试——这正是这条路径该被测的样子。
+        var found: (point: NSPoint, hit: NativeTaskCheckboxHit)?
+        outer: for dy in stride(from: -8.0, through: 24.0, by: 2.0) {
+            for dx in stride(from: 0.0, through: 48.0, by: 2.0) {
+                let probe = NSPoint(x: dx, y: taskLineY + dy)
+                if let hit = try? bridge.macosTaskCheckboxHitTest(
+                    revision: revision,
+                    point: probe
+                ) {
+                    found = (probe, hit)
+                    break outer
+                }
+            }
+        }
+        guard let (point, publishedHit) = found else {
+            throw BridgeError.operation(StorageStatus.invalidSelection)
+        }
         precondition(publishedHit.revision == revision)
-        precondition(publishedHit.blockIndex == task.blockIndex)
         precondition(publishedHit.markerRange.length == 3)
         precondition(publishedHit.bounds.contains(point))
 
@@ -1329,7 +688,7 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         }
         precondition(
             !textView.pressTaskCheckboxForSelfCheck(
-                at: NSPoint(x: task.bounds.maxX + 20.0, y: task.bounds.midY)
+                at: NSPoint(x: publishedHit.bounds.maxX + 20.0, y: publishedHit.bounds.midY)
             )
         )
         print(
@@ -1338,93 +697,6 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Yu macOS task checkbox self-check failed: \(error)\n", stderr)
-        exit(EXIT_FAILURE)
-    }
-}
-
-func runCompositionProjectionSelfCheck(path: String) -> Never {
-    do {
-        let bridge = try StorageBridge(path: path)
-        let sourceBefore = bridge.source
-        let revision = bridge.state.revision
-        let strong = (sourceBefore as NSString).range(of: "**粗体**")
-        precondition(strong.location != NSNotFound)
-        let replacement = NSRange(location: strong.location + 2, length: 2)
-        try bridge.beginComposition(
-            replacementRange: replacement,
-            preedit: "日本🙂",
-            selection: NSRange(location: 2, length: 2)
-        )
-
-        let initial = try bridge.compositionProjection(revision: revision)
-        precondition(initial.revision == revision)
-        precondition(initial.generation == bridge.composition.generation)
-        precondition(initial.replacementRange == replacement)
-        precondition(initial.preeditSelection == NSRange(location: 2, length: 2))
-        let projected = try bridge.copyCompositionProjection(
-            revision: initial.revision,
-            generation: initial.generation
-        )
-        precondition(projected.contains("日本🙂"))
-        precondition(!projected.contains("**粗体**"))
-        precondition(initial.projectedUTF8Length == projected.utf8.count)
-        precondition(initial.projectedUTF16Length == projected.utf16.count)
-        precondition(initial.visualSelection.length == 2)
-
-        let caret = try bridge.compositionCaret(
-            revision: initial.revision,
-            generation: initial.generation,
-            sourceUTF16: UInt64(replacement.location),
-            affinity: 1
-        )
-        precondition(caret.revision == revision)
-        precondition(caret.generation == initial.generation)
-        precondition(caret.sourceUTF16 == UInt64(replacement.location))
-        precondition(caret.visualSelection == initial.visualSelection)
-        precondition(caret.visualUTF16 == UInt64(initial.visualSelection.location + initial.visualSelection.length))
-
-        try bridge.updateComposition(
-            preedit: "日本語",
-            selection: NSRange(location: 3, length: 0)
-        )
-        let updated = try bridge.compositionProjection(revision: revision)
-        precondition(updated.generation != initial.generation)
-        precondition(updated.preeditSelection == NSRange(location: 3, length: 0))
-        do {
-            _ = try bridge.copyCompositionProjection(
-                revision: revision,
-                generation: initial.generation
-            )
-            preconditionFailure("stale composition projection unexpectedly succeeded")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 16)
-        }
-        let updatedCaret = try bridge.compositionCaret(
-            revision: revision,
-            generation: updated.generation,
-            sourceUTF16: UInt64(replacement.location),
-            affinity: 1
-        )
-        precondition(updatedCaret.visualSelection.length == 0)
-        precondition(updatedCaret.visualUTF16 == UInt64(updated.visualSelection.location))
-
-        try bridge.cancelComposition()
-        precondition(!bridge.composition.active)
-        precondition(bridge.state.revision == revision)
-        precondition(bridge.source == sourceBefore)
-        do {
-            _ = try bridge.compositionProjection(revision: revision)
-            preconditionFailure("cancelled composition unexpectedly projected")
-        } catch BridgeError.operation(let status) {
-            precondition(status == 15)
-        }
-        print(
-            "Yu Composition Projection self-check: revision=\(revision) "
-                + "generation \(initial.generation)->\(updated.generation); source preserved"
-        )
-        exit(EXIT_SUCCESS)
-    } catch {
-        fputs("Yu Composition Projection self-check failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
 }
