@@ -126,8 +126,19 @@ yu-core → yu-text → yu-syntax → yu-markdown → yu-state → yu-decoration
 `Glyph` / `FillRect` / `Texture` / `Quad`。
 新增语法**不得**新增 RenderCommand 变体。
 
-**E4.** `yu-text` 不得让 ropey 的 char index 或 ropey 类型逃逸出 crate 边界；
+**E4.** `yu-text` 不得让 ropey 的类型或索引逃逸出 crate 边界；
 对外只暴露 `ByteOffset`。
+
+由 `tools/check-rope-leak.py` 强制，四条机械规则：只有 `yu-text` 可以依赖
+ropey；只有 `crates/yu-text/src/storage/ropey_backend.rs` 可以引用 ropey 的
+路径；该文件不得有无限定的 `pub`；不得开启 ropey 的 `metric_chars` feature。
+后两条合起来使 ropey 的类型不可能进入 `yu-text` 的公开签名——要写进签名就得
+先写出路径，而能写路径的文件什么都不导出。
+
+本条初版写的是「char index 或 ropey 类型」。选定的 ropey 2.x 是全字节索引
+的，char 相关 API 只在 `metric_chars` 下存在而 Yu 没有开，因此 char index
+不是需要防的东西，而是不存在的东西——第四条规则守的就是它继续不存在。真正
+要防的是类型与依赖的扩散，条文据此改写。
 
 **E5.** 断行、bidi 与分词属于共享 Rust（UAX #14 / #9 / #29）；
 shaping 与栅格化属于平台。平台后端不得决定断行位置。

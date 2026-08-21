@@ -181,7 +181,7 @@ yu-core → yu-text → yu-syntax → yu-markdown → yu-state → yu-decoration
 | 层 | 职责 | 明确禁止 |
 | --- | --- | --- |
 | `yu-core` | 坐标、Revision、Anchor | 依赖任何其他 crate |
-| `yu-text` | Rope、Snapshot、Transaction 原语 | 泄漏 ropey 的 char index |
+| `yu-text` | Rope、Snapshot、Transaction 原语 | 让 ropey 的类型或索引逃逸出 crate |
 | `yu-syntax` | 增量解析、CST、fragment 复用 | 知道任何视觉概念 |
 | `yu-markdown` | Markdown 语法定义与 decoration 产出 | 直接构造 Scene/Render 对象 |
 | `yu-state` | EditorState、Transaction 应用、History、Facet | 知道具体语言 |
@@ -307,10 +307,30 @@ parse 错意味着**投影错、隐藏错、编辑落到错误的 source range**
 
 | 问题 | 对策 |
 | --- | --- |
-| ropey 主索引是 char，Yu 是 byte，混用是真实 bug 源 | `yu-text` 包一层只暴露 `ByteOffset`，ropey 类型禁止逃逸出 crate，CI 检查 |
+| ~~ropey 主索引是 char，Yu 是 byte，混用是真实 bug 源~~ | **已失效，见下。** |
+| 用的是 `2.0.0-beta.1`，不是稳定版 | 版本锁在 `Cargo.lock`；适配层只有一个文件，上游 API 变动的影响面是它 |
 | 丢失 Piece Tree 的「原文件区零拷贝」，打开时有一次 chunk 重建 | 可接受；必要时用 `Rope::from_reader` 流式加载 |
 | 全内存，不支持 mmap / GB 级文件 | 百万行以内无问题；GB 级文件另立方案，不在 v2 范围 |
 | ropey 不提供 Revision / Anchor / History | 本就由 `yu-text` / `yu-state` 提供，与 Helix 做法一致 |
+| 新建文档整篇扫描比 Piece Tree 慢约 15% | Piece Tree 新建时是一整块连续内存，那是它最有利的一刻；构造快出的约 1ms 抵掉大半，而编辑与坐标查询快 15–60 倍 |
+
+**char index 那一条为什么失效。** 上表初版针对的是 ropey 1.6：它的主索引是
+char，`insert` / `remove` 收 char index，于是每一次 byte↔char 转换都是一个
+「在某个 emoji 上悄悄切错位置」的机会，对策只能是「包一层 + 靠检查」。
+
+ropey 2.x 是全字节索引的重写。`insert` / `remove` / `slice` /
+`is_char_boundary` / `byte_to_utf16_idx` / `line_to_byte_idx` 收的全是字节
+偏移；char 相关的 API 只在 `metric_chars` feature 下才编译进来，而 Yu 没有
+开它。适配层里 byte↔char 转换点的数量因此是**零**——不是「都包起来了」，
+是根本写不出来。E4 从一条要靠纪律守的约定，变成了一件编译期事实。
+
+代价是 beta。权衡的结论是接受：这里要防的是一类不会 panic、只会在某个字符
+上悄悄错位的 bug，而消除它的手段是「让它无法被表达」而不是「小心一点」。
+
+**实际形状比预计的小得多。** `yu-text` 在 v1 时期就有可插拔的存储后端抽象，
+契约是纯字节索引的。所以这一项不是重写 3,201 行，而是实现第四个后端、并入
+已有的跨后端差分测试、然后删掉三个自研后端（1,323 行）与只为「有多个后端」
+而存在的比较脚手架。`yu-text` 3,050 行 → 1,573 行。
 
 **移植 lezer-markdown**
 
@@ -355,7 +375,7 @@ parse 错意味着**投影错、隐藏错、编辑落到错误的 source range**
 | crate | v1 行数 | 处置 |
 | --- | --- | --- |
 | `yu-core` | 332 | **保留**，收敛坐标类型 |
-| `yu-text` | 3,201 | **改造**：底层换 ropey，保留 Snapshot/Transaction 包装 |
+| `yu-text` | 3,201 | **已完成**：底层换 ropey，保留 Snapshot/Transaction 包装。现 1,573 行 |
 | `yu-markdown` | 6,026 | **重写**：拆为 `yu-syntax`（lezer 移植）+ `yu-markdown`（extensions） |
 | `yu-projection` | 3,775 | **删除**：由 `yu-decoration` 取代 |
 | `yu-editor` | 9,127 | **拆分**：编辑状态入 `yu-state`，语法相关行为入 `yu-markdown` extension |
@@ -377,7 +397,10 @@ v1 中被保留的高价值资产：Transaction/Revision/Anchor 编辑协议、`
 的原子保存与外部冲突检测、CoreText shaping 与 Metal retained 渲染的已验证路径、
 IME composition 的 generation 模型、`EditorScenario` 标记 DSL 测试方法。
 
-**已执行的删除。** `yu-editor-ffi` 与 `platform/macos/yu-storage-macos` 已删除
+**已执行的删除。** `yu-text` 的三个自研存储后端（Flat / Piece Tree /
+自研 Persistent Rope，共 1,323 行）已删除，连同 `StorageBackend` 与
+`TextBuffer::with_backend` 这套只为比较候选而存在的选择机制。
+`yu-editor-ffi` 与 `platform/macos/yu-storage-macos` 已删除
 （两者都是零消费者）。`experiments/` 整个目录已删除：`macos-document-host` 转正
 为 `platform/macos/yu-shell-macos`，`macos-text-input` 是 README 自称「可丢弃」的
 风险实验，它验证的假设（自绘 `NSView` 接 `NSTextInputClient`）与产品最终采用的
@@ -447,7 +470,16 @@ I3 的哪一类，且没有第二个入口能推导出它。当前 43 个函数�
 `yu-core` 坐标类型收敛；`yu-text` 换 ropey；CI 强制依赖方向，
 `yu-font` 的反向依赖必须消失。
 
-- 验收：依赖图为严格 DAG 且方向正确；ropey 的 char index 不泄漏出 `yu-text`。
+- 验收：依赖图为严格 DAG 且方向正确；ropey 不泄漏出 `yu-text`。
+
+**验收口径的修正。** 原文写的是「ropey 的 char index 不泄漏出 `yu-text`」。
+选了全字节索引的 ropey 2.x 之后，char index 在这套 feature 下不存在，这条
+验收会永远为真而不说明任何事情。实际要守的是完整的 E4：ropey 的**类型与
+依赖**只能出现在一个文件里。`tools/check-rope-leak.py` 拆成四条机械规则强制
+（依赖归属、路径引用归属、适配层不导出、不开 `metric_chars`），已进 CI。
+
+已完成：`yu-font` 反向依赖消除并进 CI；`yu-text` 换 ropey。
+剩余：`yu-core` 坐标类型收敛。
 
 ### S3 · 解析器
 
@@ -504,7 +536,7 @@ UAX #9 bidi、CJK 禁则、widget 盒模型（intrinsic size + baseline 对齐�
 | CodeMirror 6 | State / Transaction / Facet / **RangeSet / Decoration** | MIT |
 | @lezer/markdown | **增量 Markdown 解析算法与 extension 机制** | MIT |
 | Helix | Rust 编辑器内核形态、Transaction / Selection、doc_formatter | MPL-2.0 |
-| ropey | Rope 实现，直接依赖 | MIT |
+| ropey | Rope 实现，直接依赖（`2.0.0-beta.1`，全字节索引） | MIT OR Apache-2.0 |
 | comrak | CommonMark 正确性 oracle 与 HTML 导出，直接依赖 | BSD-2-Clause |
 | tree-sitter | 代码块内部高亮，直接依赖 | MIT |
 | Zed | SumTree、坐标系统思想（**仅思想，代码不可参考**） | GPL-3.0 |
