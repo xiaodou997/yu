@@ -1351,6 +1351,7 @@ final class StorageBridge {
             yu_storage_session_copy_selection(
                 handle,
                 current,
+                UInt8(YU_STORAGE_CLIPBOARD_TEXT),
                 output,
                 capacity,
                 written
@@ -1360,9 +1361,10 @@ final class StorageBridge {
 
     func copySelectionHTML(revision: UInt64) throws -> String {
         try copyBytesThrowing { output, capacity, written in
-            yu_storage_session_copy_selection_html(
+            yu_storage_session_copy_selection(
                 handle,
                 revision,
+                UInt8(YU_STORAGE_CLIPBOARD_HTML),
                 output,
                 capacity,
                 written
