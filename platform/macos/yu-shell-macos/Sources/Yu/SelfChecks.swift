@@ -462,19 +462,6 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
         let pointerWidth = Float(
             max(textView.bounds.width - 2.0 * textView.textContainerOrigin.x, 1.0)
         )
-        let metrics = try bridge.macosFontMetrics(
-            revision: revision,
-            size: size,
-            maxWidth: pointerWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: pointerWidth,
-            lineHeight: Float(metrics.lineHeight),
-            defaultAdvance: Float(metrics.defaultAdvance),
-            estimatedBlockHeight: Float(metrics.lineHeight),
-            overscan: 0.0
-        )
 
         let projected = try bridge.projectedSource(revision: revision)
         let hit = try bridge.macosProjectionHitTest(
@@ -591,19 +578,6 @@ func runCompositionHitTestSelfCheck(path: String) -> Never {
 
         let size: Float = 14.0
         let maxWidth: Float = 500.0
-        let metrics = try bridge.macosFontMetrics(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: maxWidth,
-            lineHeight: Float(metrics.lineHeight),
-            defaultAdvance: Float(metrics.defaultAdvance),
-            estimatedBlockHeight: Float(metrics.lineHeight),
-            overscan: 0.0
-        )
         let (_, blocks) = try bridge.macosShapedViewportBlocks(
             revision: revision,
             size: size,
@@ -1024,14 +998,6 @@ func runShapedViewportSelfCheck(path: String) -> Never {
             size: size,
             maxWidth: maxWidth
         )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: maxWidth,
-            lineHeight: Float(shaped.lineHeight),
-            defaultAdvance: Float(shaped.defaultAdvance),
-            estimatedBlockHeight: Float(shaped.lineHeight),
-            overscan: 0.0
-        )
 
         let (snapshot, blocks) = try bridge.macosShapedViewportBlocks(
             revision: revision,
@@ -1093,19 +1059,6 @@ func runShapedVerticalSelfCheck(path: String) -> Never {
         let revision = bridge.state.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
-        let metrics = try bridge.macosFontMetrics(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: maxWidth,
-            lineHeight: Float(metrics.lineHeight),
-            defaultAdvance: Float(metrics.defaultAdvance),
-            estimatedBlockHeight: Float(metrics.lineHeight),
-            overscan: 0.0
-        )
         let firstLineEnd = (bridge.source as NSString).range(of: "\n").location
         precondition(firstLineEnd != NSNotFound)
         try bridge.setSelection(
@@ -1175,19 +1128,6 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         let revision = bridge.state.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
-        let metrics = try bridge.macosFontMetrics(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: maxWidth,
-            lineHeight: Float(metrics.lineHeight),
-            defaultAdvance: Float(metrics.defaultAdvance),
-            estimatedBlockHeight: Float(metrics.lineHeight),
-            overscan: 0.0
-        )
         let (_, blocks) = try bridge.macosShapedViewportBlocks(
             revision: revision,
             size: size,
@@ -1324,19 +1264,6 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         let revision = bridge.state.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
-        let metrics = try bridge.macosFontMetrics(
-            revision: revision,
-            size: size,
-            maxWidth: maxWidth
-        )
-        try bridge.setViewportConfig(
-            revision: revision,
-            maxWidth: maxWidth,
-            lineHeight: Float(metrics.lineHeight),
-            defaultAdvance: Float(metrics.defaultAdvance),
-            estimatedBlockHeight: Float(metrics.lineHeight),
-            overscan: 0.0
-        )
         let (_, commands, _, _) = try bridge.macosVisualRenderPlan(
             revision: revision,
             size: size,

@@ -109,9 +109,6 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             self.syncSourceGlyphVisibility()
             self.scheduleVisualSubmit()
         }
-        textView.onBeforeCommand = { [weak self] in
-            self?.surfaceCoordinator.prepareForEditorCommand()
-        }
         textView.onCaretChange = { [weak self] in
             guard let self else { return }
             // 光标移动不推进 Revision，但会改变 caret 与选区装饰。Rust 的帧

@@ -56,7 +56,6 @@ final class DocumentTextView: NSTextView {
     private var tableResizeCursorActive = false
     private var taskCheckboxPointerConsumed = false
     var onDocumentChange: (() -> Void)?
-    var onBeforeCommand: (() -> Void)?
     var onCaretChange: (() -> Void)?
     var onError: ((Error) -> Void)?
     var onTableResizeHover: ((NSPoint) -> Bool)?
@@ -942,13 +941,6 @@ final class DocumentTextView: NSTextView {
             || command == Command.moveDown
             || command == Command.moveUpExtend
             || command == Command.moveDownExtend
-        if isVertical {
-            // The production coordinator publishes the current CoreText
-            // metrics synchronously before Rust resolves a vertical target.
-            // Headless/self-check views leave this callback unset and retain
-            // the ordinary metrics command path.
-            onBeforeCommand?()
-        }
         guard bridge.commandAvailable(command) else { return false }
         do {
             let result: NativeCommandResult
