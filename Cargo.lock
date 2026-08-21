@@ -314,6 +314,7 @@ dependencies = [
  "yu-layout",
  "yu-markdown",
  "yu-storage",
+ "yu-syntax",
  "yu-text",
 ]
 

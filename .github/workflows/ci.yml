@@ -35,6 +35,19 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # 随机 fuzz 单独成 job：它是唯一一条**不确定**的检查，混进上面那组会让
+  # 「本地绿 = CI 绿」这个前提失效。它找到的每个失败都要被最小化后写进
+  # crates/yu-syntax/tests/corpus/，从此由确定性的 cargo test 永久看守。
+  # 只跑一个平台：解析器没有平台相关行为，跑三份只是烧三倍时间。
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+      - run: tools/fuzz.sh 120
+
   # v1 时期产品壳与它的 self-check 从未进入 CI，因而没有反馈回路，
   # self-check 代码无节制地长到了 3800 行。v2 起它们必须每次提交都跑。
   macos-shell:

@@ -33,7 +33,59 @@ fn main() -> Result<(), Box<dyn Error>> {
         &expected_random_result,
         configuration,
     )?;
+    run_syntax(&source, configuration)?;
 
+    Ok(())
+}
+
+/// `yu-syntax` 的解析工作负载。
+///
+/// 这里是**报告**，不是门禁。J1 的门禁是
+/// `crates/yu-syntax/tests/incremental.rs` 里那条重扫字节数的断言——它对同样
+/// 的输入永远给同样的答案，而这里的耗时随机器和负载浮动。两者回答的问题不同：
+/// 断言回答「复用还在不在」，这里回答「移植过来的解析器有多快」。
+fn run_syntax(source: &str, configuration: Configuration) -> Result<(), Box<dyn Error>> {
+    let mut full_samples = Vec::with_capacity(configuration.iterations);
+    for _ in 0..configuration.iterations {
+        let start = Instant::now();
+        let parsed = yu_syntax::parse(source)?;
+        full_samples.push(start.elapsed());
+        std::hint::black_box(parsed.tree().child_count());
+    }
+
+    let baseline = yu_syntax::parse(source)?;
+    let fragments = yu_syntax::TreeFragment::from_tree(baseline.tree());
+    let middle = nearest_char_boundary(source, source.len() / 2);
+    let middle_offset =
+        ByteOffset::try_from(middle).map_err(|_| io::Error::other("fixture is too large"))?;
+
+    let mut incremental_samples = Vec::with_capacity(configuration.iterations);
+    let mut reparsed_bytes = 0_u32;
+    for _ in 0..configuration.iterations {
+        let mut buffer = TextBuffer::new(source);
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(TextRange::empty(middle_offset), "X")],
+        );
+        let applied = buffer
+            .apply(&transaction)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let moved = yu_syntax::TreeFragment::apply_change_set(&fragments, applied.change_set());
+        let start = Instant::now();
+        let parsed = yu_syntax::parse_with_fragments(applied.result_snapshot(), &moved)?;
+        incremental_samples.push(start.elapsed());
+        reparsed_bytes = parsed.reparsed_bytes();
+        std::hint::black_box(parsed.tree().child_count());
+    }
+
+    println!();
+    println!("yu-syntax parse workload");
+    println!("  full parse median: {:?}", median(&mut full_samples));
+    println!(
+        "  single-character incremental median: {:?} (reparsed-bytes={reparsed_bytes} / {} total)",
+        median(&mut incremental_samples),
+        source.len()
+    );
     Ok(())
 }
 

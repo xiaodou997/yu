@@ -188,6 +188,16 @@ impl Line {
     }
 
     /// 第 `goal` 列对应的字节位置。
+    /// 第 `goal` 列对应的字节位置。
+    ///
+    /// **返回值一定落在字符边界上。** 按字符而不是按字节前进：一个多字节
+    /// 字符占一列，达到 `goal` 时如果停在它的首字节之后，返回的位置就在字符
+    /// 中间，而 `scrub()` 会拿这个位置去切字符串。
+    ///
+    /// 目前没有能走到那里的输入——所有调用点的 `goal` 都落在行首的空白里，
+    /// 而空白全是 ASCII。这里写成无条件成立的契约而不是依赖那个论证：
+    /// 论证依赖「容器缩进永远是空白」这条别处的性质，它随时可能被改动，
+    /// 而改动的人不会知道这里有个隐含前提。
     pub(crate) fn find_column(&self, goal: usize) -> usize {
         let bytes = self.text.as_bytes();
         let mut index = 0_usize;
@@ -196,10 +206,14 @@ impl Line {
             let byte = bytes[index];
             if byte == b'\t' {
                 indent += 4 - indent % 4;
-            } else if byte & 0xC0 != 0x80 {
+            } else {
                 indent += 1;
             }
             index += 1;
+            // 跳过这个字符剩下的续字节。
+            while index < bytes.len() && bytes[index] & 0xC0 == 0x80 {
+                index += 1;
+            }
         }
         index
     }
@@ -494,10 +508,11 @@ fn html_block_starts(rest: &str, condition: usize) -> bool {
         // /^<(?:script|pre|style)(?:\s|>|$)/i
         // 规范 0.30 起把 `textarea` 加进了第 1 条，上游停在 0.29（规范用例 #171）。
         0 => ["script", "pre", "style", "textarea"].iter().any(|tag| {
+            // 按字节比较而不是切字符串：`<` 后面可能是多字节字符，
+            // 按长度切会落进字符中间。
             let after = 1 + tag.len();
-            rest.len() > tag.len()
-                && rest[1..].len() >= tag.len()
-                && rest[1..1 + tag.len()].eq_ignore_ascii_case(tag)
+            bytes.len() >= after
+                && bytes[1..after].eq_ignore_ascii_case(tag.as_bytes())
                 && bytes
                     .get(after)
                     .is_none_or(|byte| is_space_byte(*byte) || *byte == b'>')
@@ -508,15 +523,11 @@ fn html_block_starts(rest: &str, condition: usize) -> bool {
         4 => rest.starts_with("<![CDATA["),
         // /^\s*<\/?(?:tag)(?:\s|\/?>|$)/i
         5 => {
-            let (name_start, _) = if rest.starts_with("</") {
-                (2, true)
-            } else {
-                (1, false)
-            };
+            let name_start = if rest.starts_with("</") { 2 } else { 1 };
             HTML_BLOCK_TAGS.iter().any(|tag| {
                 let after = name_start + tag.len();
-                rest.len() >= after
-                    && rest[name_start..after].eq_ignore_ascii_case(tag)
+                bytes.len() >= after
+                    && bytes[name_start..after].eq_ignore_ascii_case(tag.as_bytes())
                     && match bytes.get(after) {
                         None => true,
                         Some(b'>') => true,
