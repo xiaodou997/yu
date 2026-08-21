@@ -825,6 +825,9 @@ pub struct YuStorageMacosRenderHostSnapshot {
     /// the submitted surface proves equivalent selection/caret coverage.
     pub selection_decoration_count: u64,
     pub caret_decoration_count: u64,
+    /// 当前可见范围内还有未落定的图片或内嵌资源，需要再提交一次去收割 worker
+    /// 的结果。这个判断此前在平台侧，要三次纯查询往返才能得出。
+    pub resource_refresh_pending: u8,
 }
 
 /// 平台在一次帧提交中提供的几何。
@@ -873,6 +876,8 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub submitted: u8,
     pub selection_decoration_count: u64,
     pub caret_decoration_count: u64,
+    /// 见 [`YuStorageMacosRenderHostSnapshot::resource_refresh_pending`]。
+    pub resource_refresh_pending: u8,
 }
 
 /// Revision-bound source coordinates used by the native Accessibility adapter.
@@ -6490,6 +6495,8 @@ fn macos_render_host_snapshot(
         published: 1,
         selection_decoration_count,
         caret_decoration_count,
+        // 调用方在离开 host 借用之后填入；这里没有 session 可查。
+        resource_refresh_pending: 0,
     })
 }
 
@@ -6675,7 +6682,105 @@ fn macos_render_host_frame(
         .host
         .accept_publication(publication)
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-    macos_render_host_snapshot(state, session.session.composition_generation())
+    let mut snapshot = macos_render_host_snapshot(state, session.session.composition_generation())?;
+    // 在离开 host 的可变借用之后再问：这一帧的可见资源是否已经全部落定。
+    let visible_blocks = viewport_blocks
+        .iter()
+        .map(|&(index, _)| index)
+        .collect::<Vec<_>>();
+    snapshot.resource_refresh_pending = u8::from(macos_frame_needs_resource_refresh(
+        session,
+        &visible_blocks,
+    )?);
+    Ok(snapshot)
+}
+
+/// 这一帧的可见资源是否还有未落定的，需要再提交一次去收割 worker 结果。
+///
+/// 判断此前在平台侧：Swift 每提交一帧就要再查三次——可见 block 列表、全部图片
+/// 状态、全部内嵌资源状态——然后自己做集合运算。三次查询的答案全在 Rust 手里，
+/// 而且平台还得复制一份状态码的语义表（不变量 I3）。
+///
+/// 只看可见范围（J3：高成本资源只对当前 viewport 调度）。内嵌资源的
+/// `status_for` 同时会推进渲染流水线，因此这里也是 Math/Mermaid 真正被驱动的
+/// 地方——此前靠平台的轮询查询顺带驱动，那是个不该由平台承担的职责。
+#[cfg(target_os = "macos")]
+fn macos_frame_needs_resource_refresh(
+    session: &mut YuStorageSession,
+    visible_blocks: &[usize],
+) -> Result<bool, i32> {
+    let source = session.session.snapshot();
+    let revision = source.revision();
+    let definitions = session
+        .session
+        .document()
+        .editor()
+        .markdown()
+        .reference_definitions()
+        .clone();
+    let mut pending = false;
+    for &block_index in visible_blocks {
+        let projection = session
+            .session
+            .block_projection(block_index)
+            .map_err(storage_status)?;
+        for image in projection.visual().images().iter().copied() {
+            let key = image_resource_key(&source, image, &definitions);
+            let fingerprint = key.as_ref().map_or(0, ImageKey::fingerprint);
+            let status = macos_image_resource_status(
+                session.macos_render_host.as_ref(),
+                key.as_ref(),
+                revision.get(),
+            );
+            if macos_resource_status_needs_refresh(status, fingerprint) {
+                pending = true;
+            }
+        }
+        let BlockProjection::FencedCode(code) = projection else {
+            continue;
+        };
+        let Some(kind) = embedded_resource_kind(&source, code.info_string()) else {
+            continue;
+        };
+        let embedded_kind = embedded_resource_kind_from_ffi(kind).ok_or(YU_STORAGE_EDITOR_ERROR)?;
+        let content = embedded_resource_content(&source, code.content())?;
+        // 空的 fenced body 仍然是合法的源码资源，用一个 trim 中性的哨兵保持它
+        // 走同一条缓存路径，与 `macos_visual_embedded_resources` 一致。
+        let content = if content.is_empty() {
+            "\n".to_owned()
+        } else {
+            content
+        };
+        let request =
+            EmbeddedRenderRequest::new(revision, code.source_range(), embedded_kind, content)
+                .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+        let status = session
+            .macos_embedded_resources
+            .status_for(request, revision)?;
+        let fingerprint = embedded_resource_fingerprint(&source, code.source_range(), kind);
+        if macos_resource_status_needs_refresh(status, fingerprint) {
+            pending = true;
+        }
+    }
+    Ok(pending)
+}
+
+/// 一个资源的状态是否意味着「还要再取一次」。
+///
+/// 图片与内嵌资源的状态码在 READY / PENDING / FAILED / UNKNOWN 上取值相同，
+/// UNSUPPORTED 只出现在内嵌资源上，因此可以共用这一张表。
+///
+/// 已就绪与明确不支持都是终态，不再重试。未知状态只在有稳定身份（指纹非零）
+/// 时才重试：指纹为零表示这个资源根本没有可调度的目标，重试只会空转。
+/// 无法识别的状态码按需要重试处理——宁可多画一帧，也不要停在一个谁也不认识
+/// 的状态上。
+#[cfg(target_os = "macos")]
+const fn macos_resource_status_needs_refresh(status: u8, fingerprint: u64) -> bool {
+    match status {
+        YU_STORAGE_IMAGE_RESOURCE_READY | YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED => false,
+        YU_STORAGE_IMAGE_RESOURCE_UNKNOWN => fingerprint != 0,
+        _ => true,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -7591,6 +7696,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 submitted: 1,
                 selection_decoration_count: host_snapshot.selection_decoration_count,
                 caret_decoration_count: host_snapshot.caret_decoration_count,
+                resource_refresh_pending: host_snapshot.resource_refresh_pending,
             };
         }
         // 记录这一帧的身份，供 `frame_is_current` 判断后续提交是否等价。
@@ -11145,6 +11251,58 @@ mod tests {
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
+    }
+
+    /// 一帧必须自己报告可见范围内是否还有未落定的资源。
+    ///
+    /// 这个标志决定平台要不要再提交一次去收割 worker 结果。恒为 0 时图片会
+    /// 永远停在 placeholder 上——没有报错，只是图不出来；恒为 1 时平台会一直
+    /// 空转轮询。两种都不会有任何日志。
+    ///
+    /// 反向验证：让 `macos_frame_needs_resource_refresh` 恒返回 false，
+    /// 第二段断言失败；恒返回 true，第一段断言失败。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_frame_reports_pending_resources_for_the_visible_range() {
+        fn frame_pending(source: &str, name: &str) -> u8 {
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("yu-storage-ffi-{name}-{id}.md"));
+            fs::write(&path, source).expect("fixture");
+            let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+            let mut raw = ptr::null_mut();
+            assert_eq!(
+                unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+                YU_STORAGE_OK
+            );
+            let mut frame = YuStorageMacosRenderHostSnapshot::default();
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_macos_render_host_frame(
+                        raw, 0, 14.0, 500.0, 0.0, 240.0, 0, &mut frame,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            assert_eq!(frame.published, 1);
+            unsafe { yu_storage_session_destroy(raw) };
+            fs::remove_file(path).expect("cleanup");
+            frame.resource_refresh_pending
+        }
+
+        // 纯文本没有任何可调度的资源，第一帧就是终态。恒为 1 会让平台一直轮询。
+        assert_eq!(
+            frame_pending("# \u{6807}\u{9898}\n\nparagraph\n", "frame-no-resource"),
+            0,
+            "没有资源的文档不得要求再次提交"
+        );
+
+        // 图片在第一帧一定还没解码完（未知或在途），必须要求再提交一次；
+        // 否则它会永远停在 placeholder 上，而且不报错。
+        assert_eq!(
+            frame_pending("![logo](assets/yu.png)\n", "frame-image"),
+            1,
+            "可见图片未就绪时必须要求再次提交"
+        );
     }
 
     /// viewport 配置由 Rust 自己发布，且已经对齐时不得重建。

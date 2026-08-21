@@ -601,6 +601,7 @@ struct NativeMacosRenderHostSnapshot {
     let published: Bool
     let selectionDecorationCount: Int
     let caretDecorationCount: Int
+    let resourceRefreshPending: Bool
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
         revision = value.revision
@@ -622,6 +623,7 @@ struct NativeMacosRenderHostSnapshot {
         published = value.published != 0
         selectionDecorationCount = Int(value.selection_decoration_count)
         caretDecorationCount = Int(value.caret_decoration_count)
+        resourceRefreshPending = value.resource_refresh_pending != 0
     }
 }
 struct NativeMacosRenderHostSurfaceSnapshot {
@@ -647,6 +649,9 @@ struct NativeMacosRenderHostSurfaceSnapshot {
     let submitted: Bool
     let selectionDecorationCount: Int
     let caretDecorationCount: Int
+    /// Rust 在提交这一帧时给出的结论：可见范围内还有资源没落定。
+    /// 平台据此安排一次有界轮询，不自己判断资源状态。
+    let resourceRefreshPending: Bool
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
         revision = value.revision
@@ -671,6 +676,7 @@ struct NativeMacosRenderHostSurfaceSnapshot {
         submitted = value.submitted != 0
         selectionDecorationCount = Int(value.selection_decoration_count)
         caretDecorationCount = Int(value.caret_decoration_count)
+        resourceRefreshPending = value.resource_refresh_pending != 0
     }
 }
 struct NativeVisualRenderCommand {
