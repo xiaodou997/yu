@@ -2,18 +2,45 @@
 
 Yu 不使用同一个 `usize` 表示所有位置。
 
+## 源码坐标
+
+全部定义在 `yu-core`（`position.rs`）。
+
 | 类型 | 用途 | 是否可跨 Revision 保存 |
 | --- | --- | --- |
 | `ByteOffset` | UTF-8 存储、parser、source range | 否 |
 | `Utf16Offset` | AppKit/TSF 等原生桥接 | 否 |
 | `LineIndex` | 零基源码逻辑行，按 LF 分隔 | 否 |
-| `GraphemeOffset` | 用户感知的字符移动与删除 | 否 |
 | `TextAnchor` | selection、异步结果、批注 | 是，需要映射 |
 | `SourceCaretPosition` | source caret 与视觉行 affinity | 否 |
 | `NativeCaretPosition` | AppKit UTF-16 caret 与视觉行 affinity | 否 |
-| VisualOffset | projection 后的 UTF-8 visual byte offset | 否 |
-| `VisualPosition` | 投影后的逻辑位置 | 否 |
-| `Point` | 布局坐标 | 否 |
+| `VisualOffset` | projection 后的 UTF-8 visual byte offset | 否 |
+
+## 视觉坐标
+
+一套实现，空间进类型，全部定义在 `yu-core::geometry`：
+`Point<S>` / `Size<S>` / `Rect<S>` / `Scale<From, To>`。
+
+| 空间 | 原点与单位 | 谁用 |
+| --- | --- | --- |
+| `Block` | 该 block 左上角，逻辑像素。额外约束 `x >= 0 && y >= 0 && height > 0` | `yu-layout`（别名 `LayoutPoint` / `LayoutRect`） |
+| `Document` | 文档内容左上角，逻辑像素，**不含**滚动位移 | `yu-scene` / `yu-render`（别名 `Point` / `Rect`） |
+| `Device` | drawable 表面左上角，物理像素 | 平台后端：scissor、栅格化目标 |
+
+跨空间只有两条通道，都必须显式写出来：`Rect::translate_into`（平移原点）与
+`Rect::scale` / `Rect::unscale`（换单位）。混用是编译错误，不是运行时检查。
+反方向换算用除法而不是乘以倒数——一个 ULP 决定字形落在哪个物理像素上。
+
+见不变量 E6 与 `tools/check-geometry.py`。
+
+> **不属于视觉坐标的两个整数量**：`yu-font::AtlasRect` 是 atlas 页内的纹理
+> 坐标，`yu-layout::ImageIntrinsicSize` 是解码后图片自身的像素尺寸。两者都不
+> 落在上面任何一个空间里，也都不是 `f32`。
+
+## 视口
+
+`ViewportSpan(scroll_y, height)` 是视口在文档 y 轴上占的区间，不是矩形——
+它没有 x 也没有宽度，视口的水平范围由布局的 `max_width` 决定。
 
 ## Anchor affinity
 
@@ -69,7 +96,7 @@ AX screen point  ──► platform coordinate map   ──► layout point
 
 ## Viewport reveal
 
-Caret reveal 查询使用 `ViewportRect(scroll_y, height)` 作为平台输入，Rust 返回绑定当前
+Caret reveal 查询使用 `ViewportSpan(scroll_y, height)` 作为平台输入，Rust 返回绑定当前
 Revision 的 `CaretScrollRequest`。其中 caret 的 `y` 是 document-space 行顶，`target_scroll_y`
 也是 document-space 的绝对滚动位置；平台不得把它当成 view-local delta，也不得在请求返回后
 重新按 UTF-16 selection 推导 block 高度。平台应用前必须确认请求 Revision 仍然是当前 source
@@ -85,6 +112,9 @@ Projection/Layout 状态。
 `NSTextInputClient.characterIndex(for:)` 和 Accessibility point query 接收 screen coordinate；
 mouse event 则先进入 view-local coordinate。平台适配层必须显式转换，不能让一个 `Point` 同时
 隐含两种坐标空间。
+
+> 这一条在 Rust 侧已经由类型保证：`Point<S>` 的空间是类型参数，一个值不可能
+> 同时属于两个空间。screen ↔ view-local 这一段仍在 AppKit 侧，仍需人工遵守。
 
 原生 selection 写回使用反向路径，但仍保留 Revision 边界：
 
