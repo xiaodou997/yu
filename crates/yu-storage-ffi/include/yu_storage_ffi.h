@@ -98,6 +98,8 @@ enum {
     YU_STORAGE_TABLE_RESIZE_NONE = 0,
     YU_STORAGE_TABLE_RESIZE_COLUMN = 1,
     YU_STORAGE_TABLE_RESIZE_ROW = 2,
+    YU_STORAGE_TABLE_RESIZE_PROBE = 0,
+    YU_STORAGE_TABLE_RESIZE_BEGIN = 1,
     YU_STORAGE_TABLE_RESIZE_UPDATE = 0,
     YU_STORAGE_TABLE_RESIZE_FINISH = 1,
     YU_STORAGE_TABLE_RESIZE_CANCEL = 2,
@@ -554,23 +556,20 @@ int32_t yu_storage_session_macos_composition_shaped_caret(
 int32_t yu_storage_session_table_resize_action(
     YuStorageSession *session, uint64_t expected_revision, uint8_t action,
     float pointer_position, YuStorageTableResizeCommit *output);
-/* Document-space CoreText-shaped table resize hit/begin variants. These
- * resolve the table block from the same y-coordinate space as the retained
- * macOS render host, so the native shell does not need to guess a block. */
-int32_t yu_storage_session_macos_table_resize_hit_test(
-    YuStorageSession *session, uint64_t expected_revision,
-    float size, float max_width, float point_x, float point_y, float tolerance,
-    YuStorageTableResizeHit *output);
+/* Probes or begins a table divider drag from one document-space point. The
+ * read-only probe (hover) and the gesture start differed only by
+ * `pointer_position`; they are two uses of one hit test. PROBE never mutates
+ * session state and never reads `pointer_position`. */
+int32_t yu_storage_session_macos_table_resize_at_point(
+    YuStorageSession *session, uint64_t expected_revision, uint8_t action,
+    float size, float max_width, float point_x, float point_y,
+    float tolerance, float pointer_position, YuStorageTableResizeHit *output);
 /* Resolves a document-space point against the exact task checkbox geometry in
  * the current persistent macOS render-host publication. It is read-only and
  * rejects stale revisions, active composition and points outside a checkbox. */
 int32_t yu_storage_session_macos_task_checkbox_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     float point_x, float point_y, YuStorageTaskCheckboxHit *output);
-int32_t yu_storage_session_macos_table_resize_begin_at_point(
-    YuStorageSession *session, uint64_t expected_revision,
-    float size, float max_width, float point_x, float point_y, float tolerance,
-    float pointer_position, YuStorageTableResizeHit *output);
 int32_t yu_storage_session_macos_font_metrics(
     YuStorageSession *session, uint64_t expected_revision,
     float size, float max_width, YuStorageMacosFontMetrics *output);

@@ -98,6 +98,10 @@ pub const YU_STORAGE_TABLE_RESIZE_NONE: u8 = 0;
 pub const YU_STORAGE_TABLE_RESIZE_COLUMN: u8 = 1;
 pub const YU_STORAGE_TABLE_RESIZE_ROW: u8 = 2;
 
+/// `yu_storage_session_macos_table_resize_at_point` 的动作。
+pub const YU_STORAGE_TABLE_RESIZE_PROBE: u8 = 0;
+pub const YU_STORAGE_TABLE_RESIZE_BEGIN: u8 = 1;
+
 /// `yu_storage_session_table_resize_action` 的动作。
 pub const YU_STORAGE_TABLE_RESIZE_UPDATE: u8 = 0;
 pub const YU_STORAGE_TABLE_RESIZE_FINISH: u8 = 1;
@@ -3195,57 +3199,6 @@ fn macos_table_resize_hit_at_point(
     Ok((block.index(), hit))
 }
 
-/// Resolves a document-space point through the CoreText-shaped viewport and
-/// returns an internal table divider without mutating the session.
-///
-/// # Safety
-/// `session` must be a live handle and `output` must be writable.
-#[cfg(target_os = "macos")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_table_resize_hit_test(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    size: f32,
-    max_width: f32,
-    point_x: f32,
-    point_y: f32,
-    tolerance: f32,
-    output: *mut YuStorageTableResizeHit,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageTableResizeHit::default() };
-    let (block_index, hit) = match macos_table_resize_hit_at_point(
-        session,
-        expected_revision,
-        size,
-        max_width,
-        point_x,
-        point_y,
-        tolerance,
-    ) {
-        Ok(value) => value,
-        Err(status) => return status,
-    };
-    let block_index = match u64::try_from(block_index) {
-        Ok(value) => value,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let metadata =
-        match table_resize_hit_metadata(session.session.revision().get(), block_index, hit) {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = metadata };
-    YU_STORAGE_OK
-}
-
 /// Resolves a document-space point against task checkbox geometry from the
 /// current persistent macOS render-host publication. This function never
 /// reparses Markdown, rebuilds layout or mutates the editor. A native caller
@@ -3337,17 +3290,24 @@ pub unsafe extern "C" fn yu_storage_session_macos_task_checkbox_hit_test(
     YU_STORAGE_OK
 }
 
-/// Starts a CoreText-shaped table resize gesture from a document-space point.
-/// The Rust session owns the gesture after this call; the native shell only
-/// needs to forward pointer movement along the returned divider axis.
+/// 用一个文档坐标点探测或开始一次表格分隔线拖动。
+///
+/// 探测（hover 用的只读命中测试）与开始拖动此前是两个 FFI，参数只差一个
+/// `pointer_position`，其余完全相同——同一次命中测试的两种用途。合成一个带
+/// action 的入口后，「探测不得改变状态」这条约束写在一处而不是靠两份实现各自
+/// 保证。
+///
+/// - `PROBE`：只解析，不开手势，`pointer_position` 不被读取。
+/// - `BEGIN`：解析并开手势，之后由 `table_resize_action` 推进。
 ///
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
 #[cfg(target_os = "macos")]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_table_resize_begin_at_point(
+pub unsafe extern "C" fn yu_storage_session_macos_table_resize_at_point(
     session: *mut YuStorageSession,
     expected_revision: u64,
+    action: u8,
     size: f32,
     max_width: f32,
     point_x: f32,
@@ -3364,7 +3324,13 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_begin_at_point(
     }
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = YuStorageTableResizeHit::default() };
-    if !pointer_position.is_finite() {
+    if !matches!(
+        action,
+        YU_STORAGE_TABLE_RESIZE_PROBE | YU_STORAGE_TABLE_RESIZE_BEGIN
+    ) {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    if action == YU_STORAGE_TABLE_RESIZE_BEGIN && !pointer_position.is_finite() {
         return YU_STORAGE_INVALID_SELECTION;
     }
     let (block_index, hit) = match macos_table_resize_hit_at_point(
@@ -3379,9 +3345,20 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_begin_at_point(
         Ok(value) => value,
         Err(status) => return status,
     };
-    let metadata = match begin_table_resize_session(session, block_index, hit, pointer_position) {
-        Ok(value) => value,
-        Err(status) => return status,
+    let metadata = if action == YU_STORAGE_TABLE_RESIZE_BEGIN {
+        match begin_table_resize_session(session, block_index, hit, pointer_position) {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
+    } else {
+        let block_index = match u64::try_from(block_index) {
+            Ok(value) => value,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        match table_resize_hit_metadata(session.session.revision().get(), block_index, hit) {
+            Ok(value) => value,
+            Err(status) => return status,
+        }
     };
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = metadata };
@@ -6007,6 +5984,135 @@ mod tests {
     ///
     /// 反向验证：把 `selection` 从 `MacosFrameKey` 去掉，第二段断言失败；
     /// 把 `table_resize` 去掉，第三段断言失败。
+    /// PROBE 不得改变状态，未知 action 不得被当成 BEGIN 执行。
+    ///
+    /// 探测与开始拖动合成一个入口之后，「hover 只读」这条约束从两份实现各自
+    /// 保证变成了一处 action 分支。分错会在鼠标划过表格时静默开出一个手势，
+    /// 后续的 update 就会真的改列宽——没有报错。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_table_resize_probe_does_not_open_a_gesture() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-resize-probe-{id}.md"));
+        fs::write(&path, "| A | B |\n| --- | :---: |\n| 1 | 2 |\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        // 先探出一个真实存在的分隔线位置。
+        let mut probe = YuStorageTableResizeHit::default();
+        let mut divider = None;
+        for step in 0_u16..400 {
+            let x = f32::from(step) * 0.5;
+            let status = unsafe {
+                yu_storage_session_macos_table_resize_at_point(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_PROBE,
+                    14.0,
+                    500.0,
+                    x,
+                    1.0,
+                    0.4,
+                    0.0,
+                    &mut probe,
+                )
+            };
+            if status == YU_STORAGE_OK {
+                divider = Some(x);
+                break;
+            }
+        }
+        let divider = divider.expect("a column divider must be reachable");
+        assert_eq!(probe.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+
+        // 探测不得开出手势：紧接着的 UPDATE 必须报「没有手势」。
+        let mut commit = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    divider + 1.0,
+                    &mut commit,
+                )
+            },
+            YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE
+        );
+
+        // 未知 action 必须被拒绝，同样不得开出手势。
+        let mut rejected = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_at_point(
+                    raw,
+                    0,
+                    9,
+                    14.0,
+                    500.0,
+                    divider,
+                    1.0,
+                    0.4,
+                    divider,
+                    &mut rejected,
+                )
+            },
+            YU_STORAGE_INVALID_COMMAND
+        );
+        assert_eq!(rejected, YuStorageTableResizeHit::default());
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    divider + 1.0,
+                    &mut commit,
+                )
+            },
+            YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE
+        );
+
+        // BEGIN 之后 UPDATE 必须成立。
+        let mut begun = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_table_resize_at_point(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_BEGIN,
+                    14.0,
+                    500.0,
+                    divider,
+                    1.0,
+                    0.4,
+                    divider,
+                    &mut begun,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    divider + 1.0,
+                    &mut commit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_frame_key_notices_state_that_does_not_advance_revision() {
@@ -6907,14 +7013,16 @@ mod tests {
         let mut document_hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_hit_test(
+                yu_storage_session_macos_table_resize_at_point(
                     raw,
                     0,
+                    YU_STORAGE_TABLE_RESIZE_PROBE,
                     14.0,
                     500.0,
                     divider + 0.01,
                     point_y,
                     0.2,
+                    0.0,
                     &mut document_hit,
                 )
             },
@@ -6926,9 +7034,10 @@ mod tests {
         let mut document_begin = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_begin_at_point(
+                yu_storage_session_macos_table_resize_at_point(
                     raw,
                     0,
+                    YU_STORAGE_TABLE_RESIZE_BEGIN,
                     14.0,
                     500.0,
                     divider + 0.01,
@@ -6956,9 +7065,10 @@ mod tests {
         let mut hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_begin_at_point(
+                yu_storage_session_macos_table_resize_at_point(
                     raw,
                     0,
+                    YU_STORAGE_TABLE_RESIZE_BEGIN,
                     14.0,
                     500.0,
                     divider + 0.01,
@@ -7084,14 +7194,16 @@ mod tests {
         let mut effective_hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_hit_test(
+                yu_storage_session_macos_table_resize_at_point(
                     raw,
                     0,
+                    YU_STORAGE_TABLE_RESIZE_PROBE,
                     14.0,
                     500.0,
                     effective_divider.x + 0.01,
                     point_y,
                     0.2,
+                    0.0,
                     &mut effective_hit,
                 )
             },
