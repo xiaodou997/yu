@@ -377,6 +377,14 @@ v1 中被保留的高价值资产：Transaction/Revision/Anchor 编辑协议、`
 的原子保存与外部冲突检测、CoreText shaping 与 Metal retained 渲染的已验证路径、
 IME composition 的 generation 模型、`EditorScenario` 标记 DSL 测试方法。
 
+**已执行的删除。** `yu-editor-ffi` 与 `platform/macos/yu-storage-macos` 已删除
+（两者都是零消费者）。`experiments/` 整个目录已删除：`macos-document-host` 转正
+为 `platform/macos/yu-shell-macos`，`macos-text-input` 是 README 自称「可丢弃」的
+风险实验，它验证的假设（自绘 `NSView` 接 `NSTextInputClient`）与产品最终采用的
+`NSTextView` 子类相反，且它依赖已删除的 `yu-editor-ffi`。它承担的人工 IME 验收
+改写为 [`docs/specs/manual-acceptance-macos.md`](../specs/manual-acceptance-macos.md)，
+针对产品 app。
+
 ---
 
 ## 8. 迭代阶段
