@@ -30,11 +30,14 @@ pub struct TreeFragment {
     tree: Tree,
     /// 旧位置 = 新位置 + `offset`。
     offset: i64,
-    /// 终点是不是一次改动的左边界（而非文档末尾）。
+    /// 起点是不是一次改动的右边界（而非解析的起点）。
     ///
-    /// 上游的 `TreeFragment` 还有一个对称的 `openStart`，但 Markdown 的
-    /// `FragmentCursor` 从不读它——起点一侧的约束由 `move_to` 里的
-    /// `fragment.from <= line_start` 表达。不留没有读者的字段。
+    /// 这个字段决定复用能不能从 fragment 的第一个字节开始，见
+    /// [`FragmentCursor::move_to`]。上游 `@lezer/common` 定义了它，
+    /// 但 `@lezer/markdown` 的 `FragmentCursor` 从不读它——那是个真 bug，
+    /// 说明见 `move_to`。
+    open_start: bool,
+    /// 终点是不是一次改动的左边界（而非文档末尾）。
     open_end: bool,
 }
 
@@ -60,6 +63,7 @@ impl TreeFragment {
             to: tree.len_bytes(),
             tree: tree.clone(),
             offset: 0,
+            open_start: false,
             open_end: false,
         }]
     }
@@ -94,6 +98,7 @@ impl TreeFragment {
                             to: u32::try_from(to.max(0)).unwrap_or(0),
                             tree: candidate.tree.clone(),
                             offset: candidate.offset + offset,
+                            open_start: change_index > 0,
                             open_end: change.is_some(),
                         });
                     }
@@ -177,6 +182,28 @@ impl<'a> FragmentCursor<'a> {
             return false;
         };
         if fragment.from > pos.saturating_sub(1) {
+            return false;
+        }
+        // **复用必须从一个在新旧两份文档里都成立的行首开始。**
+        //
+        // fragment 内部新旧字节逐一对应（差一个 `offset`），所以 fragment
+        // **内部**的换行在两边都是换行。但 fragment 的第一个字节不在这个保证
+        // 里：如果它是一次改动的右边界（`open_start`），那么新文档里的行首
+        // 映射回旧文档可能落在半行上，那里的解析状态根本不是「行首」。
+        //
+        // 上游 `@lezer/markdown` 只判 `fragment.from <= lineStart`，漏了这一
+        // 条。规范用例 253 加一次插入就能触发：
+        //
+        // ```text
+        // 1.  段落
+        //
+        //         indented code      ← 8 空格，是列表项里的缩进代码块
+        // ```
+        //
+        // 在第一个空格后插一个换行，这一行只剩 7 个空格，不再是代码块；
+        // 但它的字节没变，旧树里的 CodeBlock 会被原样复用。不 panic、
+        // 不报错，只是块类型悄悄错了。
+        if fragment.open_start && line_start <= fragment.from {
             return false;
         }
         if self.fragment_end.is_none() {

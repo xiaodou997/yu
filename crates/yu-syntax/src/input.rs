@@ -32,7 +32,7 @@ pub trait Input {
     fn read(&self, range: Range<u32>) -> String;
 }
 
-impl Input for &str {
+impl Input for str {
     fn len_bytes(&self) -> u32 {
         u32::try_from(self.len()).unwrap_or(u32::MAX)
     }
@@ -61,9 +61,9 @@ impl Input for &str {
 
 /// 不变量 E4 要求 ropey 的索引不逃逸出 `yu-text`，所以这里只用
 /// `ByteOffset` 与 `ChunkCursor` 说话。
-impl Input for &TextSnapshot {
+impl Input for TextSnapshot {
     fn len_bytes(&self) -> u32 {
-        u32::try_from(TextSnapshot::len_bytes(self).get()).unwrap_or(u32::MAX)
+        u32::try_from(self.len_bytes().get()).unwrap_or(u32::MAX)
     }
 
     fn read_line_into(&self, from: u32, out: &mut String) {
@@ -157,7 +157,7 @@ mod tests {
         let mut offset = 0_u32;
         for expected in source.split('\n') {
             let mut line = String::new();
-            (&snapshot).read_line_into(offset, &mut line);
+            snapshot.read_line_into(offset, &mut line);
             assert_eq!(line, expected, "从 {offset} 起读到的行与源码不符");
             offset += u32::try_from(expected.len() + 1).expect("测试数据不会溢出");
         }
@@ -173,16 +173,16 @@ mod tests {
         for offset in 0..u32::try_from(source.len()).expect("测试数据不会溢出") {
             let mut from_snapshot = String::new();
             let mut from_str = String::new();
-            (&snapshot).read_line_into(offset, &mut from_snapshot);
+            snapshot.read_line_into(offset, &mut from_snapshot);
             text.read_line_into(offset, &mut from_str);
             assert_eq!(from_snapshot, from_str, "偏移 {offset} 处两种输入不一致");
             assert_eq!(
-                (&snapshot).byte_at(offset),
+                snapshot.byte_at(offset),
                 text.byte_at(offset),
                 "偏移 {offset} 处字节不一致"
             );
         }
-        assert_eq!((&snapshot).byte_at(Input::len_bytes(&text)), None);
+        assert_eq!(snapshot.byte_at(text.len_bytes()), None);
     }
 
     #[test]
@@ -191,9 +191,9 @@ mod tests {
         let buffer = TextBuffer::new(source.clone());
         let snapshot = buffer.snapshot();
         for (start, end) in [(0_u32, 10_u32), (1_400, 1_600), (0, 20_000)] {
-            let end = end.min(Input::len_bytes(&source.as_str()));
+            let end = end.min(source.as_str().len_bytes());
             assert_eq!(
-                (&snapshot).read(start..end),
+                snapshot.read(start..end),
                 source.as_str().read(start..end),
                 "区间 {start}..{end} 不一致"
             );
