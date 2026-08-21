@@ -255,24 +255,12 @@ fn run_backend(
         "  fragmented chunk scan median: {:?}",
         median(&mut fragmented_chunk_samples)
     );
+    println!("  initial structure: chunks={}", initial_stats.chunks());
     println!(
-        "  initial structure: chunks={} nodes={} height={}",
-        initial_stats.chunks(),
-        initial_stats.nodes(),
-        initial_stats.height()
+        "  after repeated insert/inverse: chunks={}",
+        round_trip_stats.chunks()
     );
-    println!(
-        "  after repeated insert/inverse: chunks={} nodes={} height={}",
-        round_trip_stats.chunks(),
-        round_trip_stats.nodes(),
-        round_trip_stats.height()
-    );
-    println!(
-        "  after random edits: chunks={} nodes={} height={}",
-        random_stats.chunks(),
-        random_stats.nodes(),
-        random_stats.height()
-    );
+    println!("  after random edits: chunks={}", random_stats.chunks());
     println!(
         "  retained allocation estimate: {} (snapshots={} snapshot-bytes={} nodes={} node-bytes={} auxiliary={} auxiliary-bytes={} text-buffers={} text-bytes={} materialized-buffers={} materialized-bytes={})",
         human_bytes(retention.estimated_bytes()),

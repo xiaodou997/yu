@@ -1,6 +1,7 @@
 mod flat;
 mod piece_tree;
 mod rope;
+mod ropey_backend;
 
 use std::collections::HashSet;
 use std::fmt;
@@ -11,6 +12,7 @@ use crate::TextSummary;
 use flat::{FlatChunkCursor, FlatSnapshot, FlatStore};
 use piece_tree::{PieceTreeChunkCursor, PieceTreeSnapshot, PieceTreeStore};
 use rope::{RopeChunkCursor, RopeSnapshot, RopeStore};
+use ropey_backend::{RopeyChunkCursor, RopeySnapshot, RopeyStore};
 use yu_core::ByteOffset;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +70,7 @@ enum StorageChunkCursor<'a> {
     Flat(FlatChunkCursor<'a>),
     PieceTree(PieceTreeChunkCursor<'a>),
     Rope(RopeChunkCursor<'a>),
+    Ropey(RopeyChunkCursor<'a>),
 }
 
 impl<'a> Iterator for StorageChunkCursor<'a> {
@@ -78,6 +81,7 @@ impl<'a> Iterator for StorageChunkCursor<'a> {
             Self::Flat(cursor) => cursor.next(),
             Self::PieceTree(cursor) => cursor.next(),
             Self::Rope(cursor) => cursor.next(),
+            Self::Ropey(cursor) => cursor.next(),
         }
     }
 }
@@ -89,10 +93,16 @@ pub enum StorageBackend {
     #[default]
     PieceTree,
     PersistentRope,
+    Ropey,
 }
 
 impl StorageBackend {
-    pub const ALL: [Self; 3] = [Self::FlatReference, Self::PieceTree, Self::PersistentRope];
+    pub const ALL: [Self; 4] = [
+        Self::FlatReference,
+        Self::PieceTree,
+        Self::PersistentRope,
+        Self::Ropey,
+    ];
 }
 
 impl fmt::Display for StorageBackend {
@@ -101,18 +111,20 @@ impl fmt::Display for StorageBackend {
             Self::FlatReference => formatter.write_str("flat-reference"),
             Self::PieceTree => formatter.write_str("piece-tree"),
             Self::PersistentRope => formatter.write_str("persistent-rope"),
+            Self::Ropey => formatter.write_str("ropey"),
         }
     }
 }
 
 /// Structural metrics used by tests and candidate benchmarks.
+///
+/// `chunks` 是唯一对每个后端都有定义的结构量：一段连续的 `&str`。节点数与树高
+/// 只对自研树有意义，第三方 rope 不暴露也不该暴露，因此不在这里。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StorageStats {
     backend: StorageBackend,
     bytes: usize,
     chunks: usize,
-    nodes: usize,
-    height: usize,
 }
 
 /// De-duplicated logical allocations retained by a set of snapshots.
@@ -242,6 +254,20 @@ impl AllocationCollector {
         }
     }
 
+    /// 按数据指针去重一片 chunk 文本。
+    ///
+    /// 第三方 rope 的叶子节点是私有的，拿不到 `Arc`；但 chunk 的数据指针就是
+    /// 那片叶子分配的地址，去重口径与 `add_text` 一致。
+    pub(crate) fn add_chunk_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let id = text.as_ptr() as usize;
+        if self.text_ids.insert(id) {
+            self.text_bytes += text.len();
+        }
+    }
+
     pub(crate) fn add_materialized(&mut self, text: &Arc<str>) {
         let id = Arc::as_ptr(text) as *const () as usize;
         if self.materialized_ids.insert(id) {
@@ -267,19 +293,11 @@ impl AllocationCollector {
 }
 
 impl StorageStats {
-    pub(crate) const fn new(
-        backend: StorageBackend,
-        bytes: usize,
-        chunks: usize,
-        nodes: usize,
-        height: usize,
-    ) -> Self {
+    pub(crate) const fn new(backend: StorageBackend, bytes: usize, chunks: usize) -> Self {
         Self {
             backend,
             bytes,
             chunks,
-            nodes,
-            height,
         }
     }
 
@@ -297,16 +315,6 @@ impl StorageStats {
     pub const fn chunks(self) -> usize {
         self.chunks
     }
-
-    #[must_use]
-    pub const fn nodes(self) -> usize {
-        self.nodes
-    }
-
-    #[must_use]
-    pub const fn height(self) -> usize {
-        self.height
-    }
 }
 
 #[derive(Debug)]
@@ -314,6 +322,7 @@ pub(crate) enum Storage {
     Flat(FlatStore),
     PieceTree(PieceTreeStore),
     Rope(RopeStore),
+    Ropey(RopeyStore),
 }
 
 impl Storage {
@@ -322,6 +331,7 @@ impl Storage {
             StorageBackend::FlatReference => Self::Flat(FlatStore::new(text)),
             StorageBackend::PieceTree => Self::PieceTree(PieceTreeStore::new(text)),
             StorageBackend::PersistentRope => Self::Rope(RopeStore::new(text)),
+            StorageBackend::Ropey => Self::Ropey(RopeyStore::new(text)),
         }
     }
 
@@ -330,6 +340,7 @@ impl Storage {
             Self::Flat(_) => StorageBackend::FlatReference,
             Self::PieceTree(_) => StorageBackend::PieceTree,
             Self::Rope(_) => StorageBackend::PersistentRope,
+            Self::Ropey(_) => StorageBackend::Ropey,
         }
     }
 
@@ -338,6 +349,7 @@ impl Storage {
             Self::Flat(store) => store.len_bytes(),
             Self::PieceTree(store) => store.len_bytes(),
             Self::Rope(store) => store.len_bytes(),
+            Self::Ropey(store) => store.len_bytes(),
         }
     }
 
@@ -346,6 +358,7 @@ impl Storage {
             Self::Flat(store) => store.is_char_boundary(offset),
             Self::PieceTree(store) => store.is_char_boundary(offset),
             Self::Rope(store) => store.is_char_boundary(offset),
+            Self::Ropey(store) => store.is_char_boundary(offset),
         }
     }
 
@@ -354,6 +367,7 @@ impl Storage {
             Self::Flat(store) => store.slice(range),
             Self::PieceTree(store) => store.slice(range),
             Self::Rope(store) => store.slice(range),
+            Self::Ropey(store) => store.slice(range),
         }
     }
 
@@ -362,6 +376,7 @@ impl Storage {
             Self::Flat(store) => store.replace_range(range, &inserted),
             Self::PieceTree(store) => store.replace_range(range, inserted),
             Self::Rope(store) => store.replace_range(range, inserted),
+            Self::Ropey(store) => store.replace_range(range, &inserted),
         }
     }
 
@@ -370,6 +385,7 @@ impl Storage {
             Self::Flat(store) => StorageSnapshot::Flat(store.snapshot()),
             Self::PieceTree(store) => StorageSnapshot::PieceTree(store.snapshot()),
             Self::Rope(store) => StorageSnapshot::Rope(store.snapshot()),
+            Self::Ropey(store) => StorageSnapshot::Ropey(store.snapshot()),
         }
     }
 
@@ -378,6 +394,7 @@ impl Storage {
             Self::Flat(store) => store.stats(),
             Self::PieceTree(store) => store.stats(),
             Self::Rope(store) => store.stats(),
+            Self::Ropey(store) => store.stats(),
         }
     }
 }
@@ -387,21 +404,36 @@ pub(crate) enum StorageSnapshot {
     Flat(FlatSnapshot),
     PieceTree(PieceTreeSnapshot),
     Rope(RopeSnapshot),
+    Ropey(RopeySnapshot),
 }
 
 impl StorageSnapshot {
+    /// O(1) 的长度查询。
+    ///
+    /// `stats()` 也带 `bytes`，但它要数 chunk，对 rope 后端是 O(chunk 数)；
+    /// 长度查询在每一次 offset 校验上都会走到，必须走这条路。
+    pub(crate) fn len_bytes(&self) -> usize {
+        match self {
+            Self::Flat(snapshot) => snapshot.len_bytes(),
+            Self::PieceTree(snapshot) => snapshot.len_bytes(),
+            Self::Rope(snapshot) => snapshot.len_bytes(),
+            Self::Ropey(snapshot) => snapshot.len_bytes(),
+        }
+    }
+
     pub(crate) fn write_to(&self, output: &mut String) {
         match self {
             Self::Flat(snapshot) => snapshot.write_to(output),
             Self::PieceTree(snapshot) => snapshot.write_to(output),
             Self::Rope(snapshot) => snapshot.write_to(output),
+            Self::Ropey(snapshot) => snapshot.write_to(output),
         }
     }
 
     pub(crate) fn contiguous_arc(&self) -> Option<Arc<str>> {
         match self {
             Self::Flat(snapshot) => Some(snapshot.text()),
-            Self::PieceTree(_) | Self::Rope(_) => None,
+            Self::PieceTree(_) | Self::Rope(_) | Self::Ropey(_) => None,
         }
     }
 
@@ -410,6 +442,7 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.stats(),
             Self::PieceTree(snapshot) => snapshot.stats(),
             Self::Rope(snapshot) => snapshot.stats(),
+            Self::Ropey(snapshot) => snapshot.stats(),
         }
     }
 
@@ -418,6 +451,7 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.summary(),
             Self::PieceTree(snapshot) => snapshot.summary(),
             Self::Rope(snapshot) => snapshot.summary(),
+            Self::Ropey(snapshot) => snapshot.summary(),
         }
     }
 
@@ -428,6 +462,7 @@ impl StorageSnapshot {
                 StorageChunkCursor::PieceTree(snapshot.chunks_from(offset))
             }
             Self::Rope(snapshot) => StorageChunkCursor::Rope(snapshot.chunks_from(offset)),
+            Self::Ropey(snapshot) => StorageChunkCursor::Ropey(snapshot.chunks_from(offset)),
         };
         ChunkCursor { inner }
     }
@@ -437,6 +472,7 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.chunk_before(offset),
             Self::PieceTree(snapshot) => snapshot.chunk_before(offset),
             Self::Rope(snapshot) => snapshot.chunk_before(offset),
+            Self::Ropey(snapshot) => snapshot.chunk_before(offset),
         }?;
         Some((chunk.start, chunk.text))
     }
@@ -446,6 +482,7 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.is_char_boundary(offset),
             Self::PieceTree(snapshot) => snapshot.is_char_boundary(offset),
             Self::Rope(snapshot) => snapshot.is_char_boundary(offset),
+            Self::Ropey(snapshot) => snapshot.is_char_boundary(offset),
         }
     }
 
@@ -454,6 +491,7 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.prefix_summary(offset),
             Self::PieceTree(snapshot) => snapshot.prefix_summary(offset),
             Self::Rope(snapshot) => snapshot.prefix_summary(offset),
+            Self::Ropey(snapshot) => snapshot.prefix_summary(offset),
         }
     }
 
@@ -462,6 +500,7 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.byte_offset_for_utf16(offset),
             Self::PieceTree(snapshot) => snapshot.byte_offset_for_utf16(offset),
             Self::Rope(snapshot) => snapshot.byte_offset_for_utf16(offset),
+            Self::Ropey(snapshot) => snapshot.byte_offset_for_utf16(offset),
         }
     }
 
@@ -470,6 +509,7 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.byte_offset_for_line(line),
             Self::PieceTree(snapshot) => snapshot.byte_offset_for_line(line),
             Self::Rope(snapshot) => snapshot.byte_offset_for_line(line),
+            Self::Ropey(snapshot) => snapshot.byte_offset_for_line(line),
         }
     }
 
@@ -478,6 +518,7 @@ impl StorageSnapshot {
             Self::Flat(snapshot) => snapshot.collect_allocations(collector),
             Self::PieceTree(snapshot) => snapshot.collect_allocations(collector),
             Self::Rope(snapshot) => snapshot.collect_allocations(collector),
+            Self::Ropey(snapshot) => snapshot.collect_allocations(collector),
         }
     }
 }

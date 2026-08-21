@@ -411,15 +411,16 @@ impl RopeSnapshot {
         write_all(&self.root, output);
     }
 
+    pub(super) fn len_bytes(&self) -> usize {
+        self.root.as_ref().map_or(0, |node| node.bytes)
+    }
+
     pub(super) fn stats(&self) -> StorageStats {
-        let (bytes, leaves, height) = self
+        let (bytes, leaves) = self
             .root
             .as_ref()
-            .map_or((0, 0, 0), |node| (node.bytes, node.leaves, node.height));
-        let nodes = leaves
-            .saturating_mul(2)
-            .saturating_sub(usize::from(leaves > 0));
-        StorageStats::new(StorageBackend::PersistentRope, bytes, leaves, nodes, height)
+            .map_or((0, 0), |node| (node.bytes, node.leaves));
+        StorageStats::new(StorageBackend::PersistentRope, bytes, leaves)
     }
 
     pub(super) fn summary(&self) -> TextSummary {

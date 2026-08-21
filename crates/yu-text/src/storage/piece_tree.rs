@@ -540,13 +540,15 @@ impl PieceTreeSnapshot {
         write_all(&self.root, output);
     }
 
+    pub(super) fn len_bytes(&self) -> usize {
+        link_bytes(&self.root)
+    }
+
     pub(super) fn stats(&self) -> StorageStats {
         StorageStats::new(
             StorageBackend::PieceTree,
             link_bytes(&self.root),
             link_pieces(&self.root),
-            link_pieces(&self.root),
-            link_height(&self.root),
         )
     }
 

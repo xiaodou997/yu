@@ -26,6 +26,9 @@ jobs:
       # 头文件是手写的，与 Rust 实现之间没有编译期约束：删掉一个
       # extern "C" fn 不会让头文件报错，孤儿声明也不会让构建失败。
       - run: python3 tools/check-ffi-header.py
+      # 字节/字符索引混用不会 panic，只会在某个 emoji 上悄悄切错位置。
+      # 不变量 E4 要求 ropey 留在 yu-text 里，这条边界只能靠检查守。
+      - run: python3 tools/check-rope-leak.py
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
