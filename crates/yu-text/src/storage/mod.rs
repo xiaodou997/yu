@@ -90,9 +90,9 @@ impl<'a> Iterator for StorageChunkCursor<'a> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum StorageBackend {
     FlatReference,
-    #[default]
     PieceTree,
     PersistentRope,
+    #[default]
     Ropey,
 }
 
