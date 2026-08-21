@@ -421,10 +421,26 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         try require(republished?.submitted == true, "光标移动后的重提交失败")
         try require(surfaceCoordinator.hasCurrentFrame(), "重提交后未恢复为当前帧")
 
+        // 5. 可滚动范围必须等于 Rust 这一帧的内容高度。
+        //    它此前来自 document view 自己的 TextKit 排版，两套布局高度不同，
+        //    长文档的尾部因此滚不到——没有报错，只是滚不下去。
+        let contentHeight = republished?.contentHeight ?? 0.0
+        try require(contentHeight > 0.0, "帧未报告内容高度")
+        guard let scrollView = documentScrollView,
+              let documentView = scrollView.documentView else {
+            throw Failure(message: "没有可滚动的 document view")
+        }
+        let expectedExtent = max(contentHeight, scrollView.contentView.bounds.height)
+        try require(
+            abs(documentView.frame.height - expectedExtent) <= 0.5,
+            "可滚动范围 \(documentView.frame.height) 不等于内容高度 \(expectedExtent)"
+        )
+
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
                 + "caret=\(republished?.caretDecorationCount ?? 0) "
-                + "selection=\(republished?.selectionDecorationCount ?? 0)"
+                + "selection=\(republished?.selectionDecorationCount ?? 0) "
+                + "extent=\(Int(documentView.frame.height))"
         )
     }
 

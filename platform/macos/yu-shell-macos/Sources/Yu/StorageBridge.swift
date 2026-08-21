@@ -526,6 +526,8 @@ struct NativeMacosRenderHostSurfaceSnapshot {
     /// Rust 在提交这一帧时给出的结论：可见范围内还有资源没落定。
     /// 平台据此安排一次有界轮询，不自己判断资源状态。
     let resourceRefreshPending: Bool
+    /// 这一帧渲染出来的文档总高度，可滚动范围的唯一依据。
+    let contentHeight: CGFloat
 
     init(_ value: YuStorageMacosRenderHostSurfaceSnapshot) {
         revision = value.revision
@@ -551,6 +553,7 @@ struct NativeMacosRenderHostSurfaceSnapshot {
         selectionDecorationCount = Int(value.selection_decoration_count)
         caretDecorationCount = Int(value.caret_decoration_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
+        contentHeight = CGFloat(value.content_height)
     }
 }
 struct NativeVisualRenderCommand {

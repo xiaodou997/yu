@@ -669,6 +669,9 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
     uint8_t resource_refresh_pending;
+    /* Rendered document height for this frame. The scrollable extent must come
+     * from here: the platform has no second layout to derive it from (I5). */
+    float content_height;
 } YuStorageMacosRenderHostSurfaceSnapshot;
 
 typedef struct YuStorageAccessibilitySnapshot {

@@ -106,7 +106,12 @@ final class DocumentTextView: NSTextView {
         linkRotorDelegate = YuAccessibilityRotorDelegate(owner: self, kind: .link)
         minSize = NSSize(width: 0, height: 0)
         maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        isVerticallyResizable = true
+        // 可滚动范围由 Rust 这一帧的内容高度决定（见
+        // `MacosSurfaceHostCoordinator.applyContentHeight`）。这个视图不绘制
+        // 任何像素，它自己的 TextKit 排版高度不该成为第二个滚动范围来源——
+        // 两套高度不一致时长文档尾部滚不到，而且它是在窗口出现之后异步长出来
+        // 的，会把视口一起拖走。
+        isVerticallyResizable = false
         isHorizontallyResizable = false
         autoresizingMask = [.width]
         semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
