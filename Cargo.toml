@@ -18,7 +18,6 @@ members = [
     "crates/yu-workspace",
     "platform/macos/yu-font-macos",
     "platform/macos/yu-render-macos",
-    "platform/macos/yu-storage-macos",
     "tools/yu-bench",
     "tools/yu-inspect",
 ]
