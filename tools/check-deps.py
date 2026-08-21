@@ -103,6 +103,7 @@ ALLOWED: dict[str, set[str]] = {
         "yu-layout",
         "yu-markdown",
         "yu-storage",
+        "yu-syntax",
         "yu-text",
     },
     "yu-inspect": {"yu-markdown", "yu-text"},

@@ -11,6 +11,7 @@
 #   tools/verify.sh              Rust 检查 + macOS 产品壳 self-check
 #   tools/verify.sh --rust-only  只跑 Rust 检查
 #   tools/verify.sh --clean      产品壳用干净构建（改动 FFI 边界后必须）
+#   tools/verify.sh --fuzz       只跑随机 fuzz（不是确定性门禁，见下）
 
 set -euo pipefail
 
@@ -42,6 +43,21 @@ python3 tools/check-rope-leak.py
 
 step "视觉坐标只有一套实现"
 python3 tools/check-geometry.py
+
+# 随机 fuzz 不是确定性门禁，默认不跑。它在这里出现有两个理由：
+#
+#   1. CI 有一个跑它的 job，而 tools/check-ci-parity.py 要求本地门禁**知道**
+#      CI 的每一条命令——「本地全绿而 CI 会红」是这个项目踩过的坑；
+#   2. 让人知道有这么个东西可以手动跑。
+#
+# 分工见 crates/yu-syntax/tests/corpus/README.md：fuzz 负责发现，
+# corpus 负责不复发，只有后者进确定性门禁。
+if [[ "${1:-}" == "--fuzz" ]]; then
+    step "语法解析 fuzz"
+    tools/fuzz.sh 120
+    printf "\n\033[1;32m✓ fuzz 跑完\033[0m\n"
+    exit 0
+fi
 
 if [[ "${1:-}" == "--rust-only" ]]; then
     printf "\n\033[1;32m✓ Rust 检查全部通过\033[0m\n"

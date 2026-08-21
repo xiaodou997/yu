@@ -111,16 +111,28 @@ impl<'a> InlineContext<'a> {
         self.text.as_bytes().get(index).copied()
     }
 
-    /// `from..to` 的文本，越界端点会被夹住。
+    /// `from..to` 的文本。越界的端点被夹住，不在字符边界上的端点**向内取整**。
+    ///
+    /// 向内取整而不是返回空串。这里的调用方是「往后看最多 N 个字节」这类
+    /// 前瞻（实体最多 30 字节、HTML 标签到段落末尾），端点落在多字节字符
+    /// 中间是常态。返回空串会让 `&#65;` 能不能被识别取决于它后面 30 字节内
+    /// 有没有一个 CJK 字符——不报错，只是有时候不解析。这条是 comrak 差分
+    /// 抓出来的。
     fn slice(&self, from: u32, to: u32) -> &'a str {
         let len = self.text.len();
-        let start = usize::try_from(from.saturating_sub(self.offset))
+        let mut start = usize::try_from(from.saturating_sub(self.offset))
             .unwrap_or(len)
             .min(len);
-        let end = usize::try_from(to.saturating_sub(self.offset))
+        let mut end = usize::try_from(to.saturating_sub(self.offset))
             .unwrap_or(len)
             .min(len);
-        if end <= start || !self.text.is_char_boundary(start) || !self.text.is_char_boundary(end) {
+        while start > 0 && !self.text.is_char_boundary(start) {
+            start -= 1;
+        }
+        while end > start && !self.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end <= start {
             return "";
         }
         &self.text[start..end]

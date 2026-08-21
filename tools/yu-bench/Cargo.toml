@@ -15,6 +15,7 @@ yu-core = { path = "../../crates/yu-core" }
 yu-editor = { path = "../../crates/yu-editor" }
 yu-layout = { path = "../../crates/yu-layout" }
 yu-markdown = { path = "../../crates/yu-markdown" }
+yu-syntax = { path = "../../crates/yu-syntax" }
 yu-storage = { path = "../../crates/yu-storage" }
 yu-text = { path = "../../crates/yu-text" }
 
