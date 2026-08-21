@@ -1944,6 +1944,21 @@ mod tests {
         let shaper = shaper(font_size);
         let viewport = ViewportRect::new(0.0, 120.0);
         let mut document = EditorDocument::new(source);
+        // 基线要求「没有任何语法被聚焦」。新文档的光标落在文首，正好会揭示
+        // 第一个块的语法，因此这里把它显式移到最后一个普通段落里。
+        {
+            let snapshot = document.snapshot();
+            document
+                .set_selection(
+                    EditorSelection::cursor(
+                        &snapshot,
+                        snapshot.len_bytes(),
+                        CaretAffinity::Downstream,
+                    )
+                    .expect("baseline caret"),
+                )
+                .expect("baseline selection");
+        }
         document
             .set_viewport_config(ViewportConfig::new(
                 LayoutConfig::new(240.0, 20.0),

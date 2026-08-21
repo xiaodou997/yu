@@ -2792,6 +2792,20 @@ mod tests {
         output
     }
 
+    /// 把光标显式放到文末。
+    ///
+    /// 新文档的光标现在落在文首（打开文件应该看到开头）。需要「光标在末尾」
+    /// 这个前提的用例必须自己建立它，而不是依赖一个隐含默认。
+    fn session_with_caret_at_end(source: &str) -> *mut YuCompositionSession {
+        let handle = session(source);
+        let end = source.encode_utf16().count() as u64;
+        assert_eq!(
+            unsafe { yu_composition_session_set_selection(handle, 0, end, end, 1) },
+            YU_FFI_OK
+        );
+        handle
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_core_text_viewport_metrics_returns_owned_native_values() {
@@ -3534,7 +3548,7 @@ mod tests {
     #[test]
     fn ffi_shaped_caret_scroll_request_uses_core_text_layout_and_viewport_state() {
         let source = "one\n\ntwo **羽🙂**\n\nthree\n";
-        let handle = session(source);
+        let handle = session_with_caret_at_end(source);
         let mut metrics = YuCoreTextViewportMetrics::default();
         let sample = "M中🙂e\u{301}";
         assert_eq!(
@@ -4140,7 +4154,7 @@ mod tests {
 
     #[test]
     fn ffi_key_route_maps_macos_option_word_movement() {
-        let handle = session("hello world");
+        let handle = session_with_caret_at_end("hello world");
         let mut result = YuEditorCommandResult::default();
         assert_eq!(
             unsafe {
@@ -4300,7 +4314,7 @@ mod tests {
 
     #[test]
     fn ffi_viewport_config_is_revision_bound_and_controls_metrics_layout() {
-        let handle = session("abcdefgh");
+        let handle = session_with_caret_at_end("abcdefgh");
         assert_eq!(
             unsafe {
                 yu_composition_session_set_viewport_config(handle, 0, 6.0, 2.0, 2.0, 2.0, 0.0)
@@ -4336,7 +4350,7 @@ mod tests {
 
     #[test]
     fn ffi_caret_scroll_request_returns_revision_bound_absolute_target() {
-        let handle = session("one\n\ntwo\n\nthree");
+        let handle = session_with_caret_at_end("one\n\ntwo\n\nthree");
         let mut request = YuEditorCaretScrollRequest::default();
         assert_eq!(
             unsafe {
