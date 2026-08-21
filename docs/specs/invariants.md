@@ -143,6 +143,19 @@ ropey；只有 `crates/yu-text/src/storage/ropey_backend.rs` 可以引用 ropey 
 **E5.** 断行、bidi 与分词属于共享 Rust（UAX #14 / #9 / #29）；
 shaping 与栅格化属于平台。平台后端不得决定断行位置。
 
+**E6.** **视觉坐标只有一套实现，坐标空间在类型里。**
+`Point` / `Size` / `Rect` 只定义在 `yu-core::geometry`，空间
+（`Block` / `Document` / `Device`）作为类型参数存在。跨空间只能走
+`translate_into`（平移原点）与 `scale` / `unscale`（换单位），
+不得以裸 `f32` 直接搬运。任何组件不得自行摊开 `x/y/width/height: f32`。
+
+由 `tools/check-geometry.py` 强制。例外只有跨 C ABI 的平铺结构体与非 f32 的
+整数量（atlas 纹理坐标、图片自身像素尺寸），逐个登记并写明单位。
+
+这一条守的是两次真实事故：绝对坐标被当成相对坐标，逻辑坐标上又乘了一次
+backing scale。两次都不 panic、不报错，只是画错，都要靠真实窗口才发现——
+和字节/字符索引混用属于同一类失败模式。
+
 ---
 
 ## F. 已登记的规范偏差

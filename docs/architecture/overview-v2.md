@@ -180,7 +180,7 @@ yu-core → yu-text → yu-syntax → yu-markdown → yu-state → yu-decoration
 
 | 层 | 职责 | 明确禁止 |
 | --- | --- | --- |
-| `yu-core` | 坐标、Revision、Anchor | 依赖任何其他 crate |
+| `yu-core` | 坐标（源码坐标与带空间参数的视觉坐标）、Revision、Anchor | 依赖任何其他 crate |
 | `yu-text` | Rope、Snapshot、Transaction 原语 | 让 ropey 的类型或索引逃逸出 crate |
 | `yu-syntax` | 增量解析、CST、fragment 复用 | 知道任何视觉概念 |
 | `yu-markdown` | Markdown 语法定义与 decoration 产出 | 直接构造 Scene/Render 对象 |
@@ -374,7 +374,7 @@ ropey 2.x 是全字节索引的重写。`insert` / `remove` / `slice` /
 
 | crate | v1 行数 | 处置 |
 | --- | --- | --- |
-| `yu-core` | 332 | **保留**，收敛坐标类型 |
+| `yu-core` | 332 | **已完成**：收敛坐标类型，视觉坐标带空间参数。现 1,308 行 |
 | `yu-text` | 3,201 | **已完成**：底层换 ropey，保留 Snapshot/Transaction 包装。现 1,573 行 |
 | `yu-markdown` | 6,026 | **重写**：拆为 `yu-syntax`（lezer 移植）+ `yu-markdown`（extensions） |
 | `yu-projection` | 3,775 | **删除**：由 `yu-decoration` 取代 |
@@ -470,16 +470,51 @@ I3 的哪一类，且没有第二个入口能推导出它。当前 43 个函数�
 `yu-core` 坐标类型收敛；`yu-text` 换 ropey；CI 强制依赖方向，
 `yu-font` 的反向依赖必须消失。
 
-- 验收：依赖图为严格 DAG 且方向正确；ropey 不泄漏出 `yu-text`。
+- 验收：依赖图为严格 DAG 且方向正确；ropey 不泄漏出 `yu-text`；
+  视觉坐标只有一套实现且坐标空间在类型里。
 
-**验收口径的修正。** 原文写的是「ropey 的 char index 不泄漏出 `yu-text`」。
-选了全字节索引的 ropey 2.x 之后，char index 在这套 feature 下不存在，这条
-验收会永远为真而不说明任何事情。实际要守的是完整的 E4：ropey 的**类型与
-依赖**只能出现在一个文件里。`tools/check-rope-leak.py` 拆成四条机械规则强制
-（依赖归属、路径引用归属、适配层不导出、不开 `metric_chars`），已进 CI。
+**ropey 验收口径的修正。** 原文写的是「ropey 的 char index 不泄漏出
+`yu-text`」。选了全字节索引的 ropey 2.x 之后，char index 在这套 feature 下
+不存在，这条验收会永远为真而不说明任何事情。实际要守的是完整的 E4：ropey
+的**类型与依赖**只能出现在一个文件里。`tools/check-rope-leak.py` 拆成四条
+机械规则强制（依赖归属、路径引用归属、适配层不导出、不开 `metric_chars`），
+已进 CI。
 
-已完成：`yu-font` 反向依赖消除并进 CI；`yu-text` 换 ropey。
-剩余：`yu-core` 坐标类型收敛。
+**「坐标类型收敛」的口径。** 第 7 节只写了「保留，收敛坐标类型」，没有给验收
+标准。逐个看过之后，实际情况分成两半：
+
+- **源码坐标早就收敛了。** `ByteOffset` / `TextRange` / `Utf16Offset` /
+  `Utf16Range` / `LineIndex` 全在 `yu-core`，全仓库统一使用，没有第二套。
+  这一半不需要动。
+- **视觉坐标没有。** `yu-layout` 与 `yu-scene` 各写了一份结构完全相同的
+  `Point` / `Rect`，`yu-editor` 与平台层则直接散着 `x/y/width/height: f32`
+  四元组。
+
+但把它们合成**一个** `Rect` 是错的，那会丢掉现在还在的信息：这些矩形分属
+block 局部、文档、物理像素三个空间。两次真实事故都出在这条缝上——`768b5e3`
+把 CTLine 的绝对坐标当成 run 内相对坐标，`5fac1fe` 在已经是逻辑坐标的位置上
+又乘了一次 backing scale。都不报错，只是画错，都要靠真实窗口才能发现。
+
+因此验收定为：**收敛实现，把空间放进类型。** `yu-core::geometry` 提供
+`Point<S>` / `Size<S>` / `Rect<S>` / `Scale<From, To>`，算术与校验只写一遍；
+`Block` / `Document` / `Device` 三个空间标记进入类型参数，跨空间只有
+`translate_into`（平移原点）与 `scale` / `unscale`（换单位）两条显式通道。
+混用不再是「看起来对」的调用，而是编译不过。这是第 10 节所说「借鉴 Zed 的
+坐标系统思想」的具体落点。
+
+由 `tools/check-geometry.py` 守住（已进 CI）：不得再出现散装的
+`width/height: f32` 四元组，不得在 `yu-core` 之外定义第二个
+`Point` / `Size` / `Rect`。例外只有跨 C ABI 的平铺结构体与非 f32 的整数量
+（atlas 纹理坐标、图片自身像素尺寸），逐个登记并写明单位。
+
+**已知未做。** `yu-core` 里还有 284 行 shaping 类型与 19 行 `TextStyle`，
+占全 crate 近四分之一，而第 4.3 节给 `yu-core` 的职责是「坐标、Revision、Anchor」，
+shaping 属于 `yu-font`。它们现在住在 `yu-core`，是为了让 `yu-layout` 能依赖
+`ShapingProvider` 这个接口而不依赖 `yu-font` 的实现。这是「`yu-core` 职责
+收敛」，不是「坐标类型收敛」，且会新增若干依赖边，另立议题。
+
+S2 三项全部完成：`yu-font` 反向依赖消除并进 CI；`yu-text` 换 ropey；
+`yu-core` 坐标类型收敛。
 
 ### S3 · 解析器
 
