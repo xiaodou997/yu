@@ -540,8 +540,9 @@ final class MacosSurfaceHostCoordinator {
             ? Float(point.x)
             : Float(point.y)
         do {
-            _ = try bridge.tableResizeUpdate(
+            _ = try bridge.tableResizeAction(
                 revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_UPDATE),
                 pointerPosition: pointerPosition
             )
             scheduleSubmit()
@@ -569,7 +570,10 @@ final class MacosSurfaceHostCoordinator {
         }
         var finished = false
         do {
-            _ = try bridge.tableResizeFinish(revision: revision)
+            _ = try bridge.tableResizeAction(
+                revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_FINISH)
+            )
             _ = tableResizePointerState.finish(revision: revision)
             scheduleSubmit()
             finished = true
@@ -590,7 +594,10 @@ final class MacosSurfaceHostCoordinator {
             return false
         }
         do {
-            try bridge.tableResizeCancel(revision: revision)
+            try bridge.tableResizeAction(
+                revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_CANCEL)
+            )
             _ = tableResizePointerState.cancel(revision: revision)
             scheduleSubmit()
         } catch {
@@ -797,7 +804,10 @@ final class MacosSurfaceHostCoordinator {
     }
 
     private func clearTableResizeState() {
-        try? bridge.tableResizeCancel(revision: bridge.state.revision)
+        _ = try? bridge.tableResizeAction(
+            revision: bridge.state.revision,
+            action: UInt8(YU_STORAGE_TABLE_RESIZE_CANCEL)
+        )
         tableResizePointerState.reset()
     }
 

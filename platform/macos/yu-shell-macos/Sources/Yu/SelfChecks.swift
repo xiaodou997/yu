@@ -757,8 +757,9 @@ func runBlockProjectionSelfCheck(path: String) -> Never {
             precondition(begunResize.kind == columnResize.kind)
             precondition(begunResize.index == columnResize.index)
             precondition(abs(begunResize.position - columnResize.position) < 0.0001)
-            let preview = try bridge.tableResizeUpdate(
+            let preview = try bridge.tableResizeAction(
                 revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_UPDATE),
                 pointerPosition: Float(columnDividerX + 1.1)
             )
             precondition(preview.revision == revision)
@@ -766,7 +767,10 @@ func runBlockProjectionSelfCheck(path: String) -> Never {
             precondition(preview.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
             precondition(preview.index == 0)
             precondition(abs(preview.delta - 1.0) < 0.0001)
-            let finishedResize = try bridge.tableResizeFinish(revision: revision)
+            let finishedResize = try bridge.tableResizeAction(
+                revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_FINISH)
+            )
             precondition(finishedResize == preview)
 
             let resizedLayoutCells = try bridge.tableLayoutCellsWithResize(
@@ -824,12 +828,16 @@ func runBlockProjectionSelfCheck(path: String) -> Never {
             precondition(begunRowResize.kind == rowResize.kind)
             precondition(begunRowResize.index == rowResize.index)
             precondition(abs(begunRowResize.position - rowResize.position) < 0.0001)
-            let rowPreview = try bridge.tableResizeUpdate(
+            let rowPreview = try bridge.tableResizeAction(
                 revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_UPDATE),
                 pointerPosition: Float(rowDividerY + 0.2)
             )
             precondition(rowPreview.kind == YU_STORAGE_TABLE_RESIZE_ROW)
-            try bridge.tableResizeCancel(revision: revision)
+            try bridge.tableResizeAction(
+                revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_CANCEL)
+            )
             do {
                 _ = try bridge.tableResizeHitTest(
                     revision: revision,

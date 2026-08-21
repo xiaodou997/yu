@@ -1465,14 +1465,18 @@ final class StorageBridge {
         return value
     }
 
-    func tableResizeUpdate(
+    /// 推进一次分隔线拖动。`pointerPosition` 只对 `.update` 有意义。
+    @discardableResult
+    func tableResizeAction(
         revision: UInt64,
-        pointerPosition: Float
+        action: UInt8,
+        pointerPosition: Float = 0.0
     ) throws -> NativeTableResizeCommit {
         var value = YuStorageTableResizeCommit()
-        let status = yu_storage_session_table_resize_update(
+        let status = yu_storage_session_table_resize_action(
             handle,
             revision,
+            action,
             pointerPosition,
             &value
         )
@@ -1480,26 +1484,6 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeTableResizeCommit(value)
-    }
-
-    func tableResizeFinish(revision: UInt64) throws -> NativeTableResizeCommit {
-        var value = YuStorageTableResizeCommit()
-        let status = yu_storage_session_table_resize_finish(
-            handle,
-            revision,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeTableResizeCommit(value)
-    }
-
-    func tableResizeCancel(revision: UInt64) throws {
-        let status = yu_storage_session_table_resize_cancel(handle, revision)
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
     }
 
     func blockLayout(
