@@ -59,18 +59,19 @@ impl FlatSnapshot {
         Arc::clone(&self.text)
     }
 
+    pub(super) fn len_bytes(&self) -> usize {
+        self.text.len()
+    }
+
     pub(super) fn write_to(&self, output: &mut String) {
         output.push_str(&self.text);
     }
 
     pub(super) fn stats(&self) -> StorageStats {
-        let present = usize::from(!self.text.is_empty());
         StorageStats::new(
             StorageBackend::FlatReference,
             self.text.len(),
-            present,
-            present,
-            present,
+            usize::from(!self.text.is_empty()),
         )
     }
 

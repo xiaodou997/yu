@@ -15,6 +15,18 @@ impl TextSummary {
         line_breaks: 0,
     };
 
+    /// 由后端已经维护好的累计量直接构造。
+    ///
+    /// 用于 summary 本来就是 O(1) 常驻在树根上的存储后端；语义必须与
+    /// `from_text` 对同一段文本的结果逐字段相等，跨后端差分测试守护这一点。
+    pub(crate) const fn from_parts(bytes: u64, utf16_units: u64, line_breaks: u64) -> Self {
+        Self {
+            bytes,
+            utf16_units,
+            line_breaks,
+        }
+    }
+
     #[must_use]
     pub fn from_text(text: &str) -> Self {
         Self {

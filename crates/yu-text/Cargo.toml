@@ -9,6 +9,16 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# ropey 2.x 是全字节索引的，没有 char index 可泄漏——不变量 E4 因此由构造
+# 保证，而不是靠纪律。metric_lines_lf 让换行计数与 TextSummary 一致（只数
+# `\n`），metric_utf16 供 NSTextInputClient 的 UTF-16 坐标使用。
+# 允许引用 ropey 的文件只有 src/storage/ropey_backend.rs，由
+# tools/check-rope-leak.py 强制。
+ropey = { version = "2.0.0-beta.1", default-features = false, features = [
+    "simd",
+    "metric_lines_lf",
+    "metric_utf16",
+] }
 yu-core = { path = "../yu-core" }
 
 [lints]

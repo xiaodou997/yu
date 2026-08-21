@@ -66,8 +66,7 @@ impl TextSnapshot {
         self.inner
             .contiguous
             .get_or_init(|| {
-                let stats = self.inner.storage.stats();
-                let mut text = String::with_capacity(stats.bytes());
+                let mut text = String::with_capacity(self.inner.storage.len_bytes());
                 self.inner.storage.write_to(&mut text);
                 Arc::from(text)
             })
@@ -76,13 +75,12 @@ impl TextSnapshot {
 
     #[must_use]
     pub fn len_bytes(&self) -> ByteOffset {
-        ByteOffset::try_from(self.inner.storage.stats().bytes())
-            .unwrap_or(ByteOffset::new(u64::MAX))
+        ByteOffset::try_from(self.inner.storage.len_bytes()).unwrap_or(ByteOffset::new(u64::MAX))
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.storage.stats().bytes() == 0
+        self.inner.storage.len_bytes() == 0
     }
 
     #[must_use]
@@ -319,6 +317,9 @@ mod tests {
 
     #[test]
     fn insert_inverse_round_trips_do_not_fragment_tree_backends() {
+        // 只针对自研树：它们在往返后必须把碎片合并回初始形状。ropey 有自己
+        // 的叶子尺寸策略，往返后会稳定在多一块的位置——那不是碎片累积，
+        // 它的守护测试是下面那条。
         let source = "0123456789abcdef".repeat(1_024);
         for backend in [StorageBackend::PieceTree, StorageBackend::PersistentRope] {
             let mut buffer = TextBuffer::with_backend(source.clone(), backend);
@@ -346,6 +347,62 @@ mod tests {
                 "backend {backend} accumulated fragments"
             );
         }
+    }
+
+    #[test]
+    fn fragmentation_tracks_document_size_not_edit_count() {
+        // 碎片化的失败模式是静默的：文档还是对的，只是每一次扫描越来越慢。
+        // 因此断言必须盯住「碎片数由文档大小决定」这个量纲，而不是盯住某个
+        // 具体块数——后者是实现细节，会随叶子尺寸策略变化。
+        //
+        // 定点往返测不出这个：每次都在同一个偏移上切，第一次之后树形状就不
+        // 再变了。必须让编辑位置散开。
+        let source = "0123456789abcdef 羽🙂\n".repeat(2_048);
+        let mut buffer = TextBuffer::with_backend(source.clone(), StorageBackend::Ropey);
+        let mut model = source.clone();
+        let mut seed = 0x5955_4245_4e43_4821_u64;
+
+        for _ in 0..4_000 {
+            let mut next = || {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (seed >> 33) as usize
+            };
+            let mut start = next() % (model.len() + 1);
+            while !model.is_char_boundary(start) {
+                start -= 1;
+            }
+            let mut end = (start + next() % 24).min(model.len());
+            while !model.is_char_boundary(end) {
+                end -= 1;
+            }
+            let inserted = ["羽", "Yu", "🙂", "\n", ""][next() % 5];
+            let range = TextRange::new(
+                ByteOffset::try_from(start).expect("test offset should fit u64"),
+                ByteOffset::try_from(end).expect("test offset should fit u64"),
+            )
+            .expect("ordered offsets should form a range");
+            buffer
+                .apply(&Transaction::new(
+                    buffer.revision(),
+                    [Edit::new(range, inserted)],
+                ))
+                .expect("model transaction should apply");
+            model.replace_range(start..end, inserted);
+        }
+
+        let edited = buffer.storage_stats().chunks();
+        let fresh = TextBuffer::with_backend(model.clone(), StorageBackend::Ropey)
+            .storage_stats()
+            .chunks();
+
+        assert_eq!(buffer.snapshot().as_str(), model);
+        assert!(
+            edited <= fresh * 2,
+            "4000 次编辑后碎片数 {edited} 超过同样文本新建时 {fresh} 的两倍——\
+             碎片正在随编辑次数增长，而不是随文档大小"
+        );
     }
 
     #[test]
@@ -419,30 +476,58 @@ mod tests {
     }
 
     #[test]
-    fn chunk_before_returns_the_preceding_piece_without_materializing() {
+    fn chunk_before_returns_the_last_chunk_ending_at_or_before_the_offset() {
+        // 期望值由 `chunks()` 自己算出，而不是写死块数。第一版这里断言的是
+        // 「第二块的前一块是第一块」，并在只有一块时 `continue`——对会把整份
+        // 文档合成一个叶子的后端，那等于整条用例被静默跳过。契约本身与分块
+        // 方式无关：结束于 offset 或更早的最后一个 chunk。
+        let source = "a羽🙂 line\n".repeat(4_000);
         for backend in StorageBackend::ALL {
-            let mut buffer = TextBuffer::with_backend("alpha beta", backend);
+            let mut buffer = TextBuffer::with_backend(source.clone(), backend);
             buffer
                 .apply(&Transaction::new(
                     buffer.revision(),
-                    [Edit::new(TextRange::empty(ByteOffset::new(5)), "羽")],
+                    [Edit::new(TextRange::empty(ByteOffset::new(4)), "羽")],
                 ))
                 .expect("edit should apply");
             let snapshot = buffer.snapshot();
             let chunks: Vec<_> = snapshot.chunks().collect();
-            if chunks.len() < 2 {
-                continue;
+            assert!(!chunks.is_empty(), "backend {backend}");
+
+            let mut probes = vec![ByteOffset::new(0), snapshot.len_bytes()];
+            for chunk in &chunks {
+                let first = chunk.text().chars().next().map_or(0, char::len_utf8);
+                let last = chunk.text().chars().next_back().map_or(0, char::len_utf8);
+                probes.push(chunk.start());
+                probes.push(ByteOffset::new(chunk.start().get() + first as u64));
+                probes.push(chunk.end());
+                probes.push(ByteOffset::new(
+                    chunk.end().get().saturating_sub(last as u64),
+                ));
             }
 
-            let before = snapshot
-                .chunk_before(chunks[1].start())
-                .expect("preceding chunk lookup should validate")
-                .expect("a second chunk must have a predecessor");
-            assert_eq!(before.start(), chunks[0].start(), "backend {backend}");
-            assert_eq!(before.text(), chunks[0].text(), "backend {backend}");
+            // H7：跨 chunk 边界的查询不得为一次移动物化整份 Snapshot。
+            // 断言的是「查询没有引起物化」而不是「一份都没有」——Flat 后端
+            // 本身就是一整块连续缓冲，写成后者会让它被静默跳过。
+            let materialized_before =
+                retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers();
+
+            for probe in probes {
+                let expected = chunks.iter().rfind(|chunk| chunk.end() <= probe).copied();
+                let actual = snapshot
+                    .chunk_before(probe)
+                    .expect("probe offsets are UTF-8 boundaries");
+                assert_eq!(
+                    actual.map(|chunk| (chunk.start(), chunk.text())),
+                    expected.map(|chunk| (chunk.start(), chunk.text())),
+                    "backend {backend}, offset {}",
+                    probe.get()
+                );
+            }
+
             assert_eq!(
                 retained_snapshot_stats(std::slice::from_ref(&snapshot)).materialized_buffers(),
-                0,
+                materialized_before,
                 "backend {backend}"
             );
         }

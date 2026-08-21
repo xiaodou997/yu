@@ -37,6 +37,9 @@ python3 tools/check-deps.py
 step "FFI 头文件一致性"
 python3 tools/check-ffi-header.py
 
+step "ropey 未逃逸出 yu-text"
+python3 tools/check-rope-leak.py
+
 if [[ "${1:-}" == "--rust-only" ]]; then
     printf "\n\033[1;32m✓ Rust 检查全部通过\033[0m\n"
     exit 0
