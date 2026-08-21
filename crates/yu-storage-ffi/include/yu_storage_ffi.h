@@ -314,6 +314,11 @@ typedef struct YuStorageTableResizeAccessibilityDivider {
     float height;
     uint64_t table_source_start_utf16;
     uint64_t table_source_end_utf16;
+    /* Column-width step for one VoiceOver increment/decrement, derived from the
+     * table's own row height. This is a policy, not platform information: the
+     * platform used to query font metrics through a dedicated FFI just to
+     * compute it (I3). */
+    float adjust_step;
 } YuStorageTableResizeAccessibilityDivider;
 
 /* Revision-bound, source-neutral geometry produced by a native table resize
@@ -329,14 +334,6 @@ typedef struct YuStorageTableResizeCommit {
 } YuStorageTableResizeCommit;
 
 
-/* Revision-bound CoreText metrics used to configure an empty or non-empty
- * viewport before requesting a render-host frame. */
-typedef struct YuStorageMacosFontMetrics {
-    uint64_t revision;
-    float size;
-    float line_height;
-    float default_advance;
-} YuStorageMacosFontMetrics;
 
 /* Revision-bound source caret resolved through one block-local layout. */
 typedef struct YuStorageBlockCaret {
@@ -570,9 +567,6 @@ int32_t yu_storage_session_macos_table_resize_at_point(
 int32_t yu_storage_session_macos_task_checkbox_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     float point_x, float point_y, YuStorageTaskCheckboxHit *output);
-int32_t yu_storage_session_macos_font_metrics(
-    YuStorageSession *session, uint64_t expected_revision,
-    float size, float max_width, YuStorageMacosFontMetrics *output);
 /* Resolves a source caret's shaped geometry without the caller naming a
  * block. The platform needs this for IME candidate-window placement: only the
  * Rust layout knows where the caret is on screen, because TextKit lays out

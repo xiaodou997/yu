@@ -434,22 +434,11 @@ final class MacosSurfaceHostCoordinator {
               (direction == 1 || direction == -1),
               !bridge.composition.active,
               !tableResizePointerState.isActive,
-              let geometry = visualDecorationGeometry() else {
+              visualDecorationGeometry() != nil else {
             return false
         }
-        // VoiceOver 每次增减的列宽步长。这是这个文件里唯一还需要字体度量的
-        // 地方，而且只在辅助功能动作时走一次，不在每帧路径上。
-        guard let metrics = try? bridge.macosFontMetrics(
-            revision: bridge.state.revision,
-            size: geometry.size,
-            maxWidth: geometry.maxWidth
-        ) else {
-            return false
-        }
-        let step = max(
-            CGFloat(8.0),
-            min(CGFloat(16.0), CGFloat(metrics.lineHeight) * 0.5)
-        )
+        // 步长由 Rust 随描述符一起给出——它是策略，不是平台信息。
+        let step = descriptor.adjustStep
         let dividerPoint = NSPoint(
             x: descriptor.rect.midX,
             y: descriptor.rect.midY
