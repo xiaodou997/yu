@@ -36,26 +36,6 @@ enum {
 };
 
 enum {
-    YU_STORAGE_KEY_CHARACTER = 0,
-    YU_STORAGE_KEY_ENTER = 1,
-    YU_STORAGE_KEY_TAB = 2,
-    YU_STORAGE_KEY_BACKSPACE = 3,
-    YU_STORAGE_KEY_DELETE = 4,
-    YU_STORAGE_KEY_LEFT = 5,
-    YU_STORAGE_KEY_RIGHT = 6,
-    YU_STORAGE_KEY_UP = 7,
-    YU_STORAGE_KEY_DOWN = 8,
-    YU_STORAGE_KEY_ESCAPE = 9,
-};
-
-enum {
-    YU_STORAGE_KEY_MODIFIER_COMMAND = 1 << 0,
-    YU_STORAGE_KEY_MODIFIER_SHIFT = 1 << 1,
-    YU_STORAGE_KEY_MODIFIER_CONTROL = 1 << 2,
-    YU_STORAGE_KEY_MODIFIER_OPTION = 1 << 3,
-};
-
-enum {
     YU_STORAGE_COMMAND_DELETE_BACKWARD = 1,
     YU_STORAGE_COMMAND_DELETE_FORWARD = 2,
     YU_STORAGE_COMMAND_MOVE_LEFT = 3,
@@ -224,14 +204,6 @@ typedef struct YuStorageProjectionSelection {
     uint8_t affinity;
 } YuStorageProjectionSelection;
 
-/* Reverse caret mapping for a native visual mirror. All offsets are UTF-16. */
-typedef struct YuStorageProjectionSourceCaret {
-    uint64_t revision;
-    uint64_t visual_utf16;
-    uint64_t source_utf16;
-    uint64_t round_trip_visual_utf16;
-    uint8_t affinity;
-} YuStorageProjectionSourceCaret;
 
 /* Reverse selection mapping for a native visual mirror. Non-collapsed visual
  * edges map to the outer source range, retaining hidden Markdown syntax. */
@@ -755,10 +727,6 @@ int32_t yu_storage_session_projection_selection(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_start_utf16, uint64_t source_end_utf16,
     uint8_t affinity, YuStorageProjectionSelection *output);
-int32_t yu_storage_session_projection_source_caret(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t visual_utf16, uint8_t affinity,
-    YuStorageProjectionSourceCaret *output);
 int32_t yu_storage_session_projection_source_selection(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t visual_start_utf16, uint64_t visual_end_utf16,
@@ -837,13 +805,6 @@ int32_t yu_storage_session_table_resize_begin(
     uint64_t block_index, float max_width, float line_height,
     float default_advance, float point_x, float point_y, float tolerance,
     float pointer_position, YuStorageTableResizeHit *output);
-/* macOS/CoreText-shaped begin variant; its divider coordinates match the
- * retained macOS render-host frame for the supplied font size. */
-int32_t yu_storage_session_macos_table_resize_begin(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, float size, float max_width,
-    float point_x, float point_y, float tolerance, float pointer_position,
-    YuStorageTableResizeHit *output);
 /* Document-space CoreText-shaped table resize hit/begin variants. These
  * resolve the table block from the same y-coordinate space as the retained
  * macOS render host, so the native shell does not need to guess a block. */
@@ -1002,9 +963,6 @@ int32_t yu_storage_session_macos_move_vertical(
 int32_t yu_storage_session_command_available(const YuStorageSession *session,
                                              uint8_t command, uint64_t block,
                                              uint8_t *output);
-int32_t yu_storage_session_route_key(YuStorageSession *session, uint8_t key_kind,
-                                     uint32_t key, uint8_t modifiers,
-                                     YuStorageCommandResult *output);
 int32_t yu_storage_session_insert_text(YuStorageSession *session,
                                         uint64_t expected_revision,
                                         const uint8_t *text, size_t text_length,

@@ -22,11 +22,11 @@ use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
     AccessibilityTextSnapshot, BlockKind, BlockProjection, BlockProjectionKind, CaretAffinity,
-    CaretScrollRequest, CommandResult, EditorCommand, EditorDocumentError, EditorKey, ImageSource,
-    KeyEvent, KeyModifiers, KeyRouteResult, LayoutConfig, LayoutPoint, LayoutSnapshot, Projection,
-    ProjectionBias, SelectionError, SourceSync, TableAlignment, TableCellLayout, TableLayoutHit,
-    TableResizeCommit, TableResizeGesture, TableResizeGestureError, TableResizeHit,
-    TableResizeTarget, ViewportConfig, ViewportRect, VisualOffset, VisualRunKind,
+    CaretScrollRequest, CommandResult, EditorCommand, EditorDocumentError, ImageSource,
+    LayoutConfig, LayoutPoint, LayoutSnapshot, Projection, ProjectionBias, SelectionError,
+    SourceSync, TableAlignment, TableCellLayout, TableLayoutHit, TableResizeCommit,
+    TableResizeGesture, TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig,
+    ViewportRect, VisualOffset, VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_markdown::TableCellRange;
@@ -109,20 +109,6 @@ pub const YU_STORAGE_TABLE_RESIZE_ROW: u8 = 2;
 pub const YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND: u8 = 0;
 pub const YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS: u8 = 1;
 
-pub const YU_STORAGE_KEY_CHARACTER: u8 = 0;
-pub const YU_STORAGE_KEY_ENTER: u8 = 1;
-pub const YU_STORAGE_KEY_TAB: u8 = 2;
-pub const YU_STORAGE_KEY_BACKSPACE: u8 = 3;
-pub const YU_STORAGE_KEY_DELETE: u8 = 4;
-pub const YU_STORAGE_KEY_LEFT: u8 = 5;
-pub const YU_STORAGE_KEY_RIGHT: u8 = 6;
-pub const YU_STORAGE_KEY_UP: u8 = 7;
-pub const YU_STORAGE_KEY_DOWN: u8 = 8;
-pub const YU_STORAGE_KEY_ESCAPE: u8 = 9;
-pub const YU_STORAGE_KEY_MODIFIER_COMMAND: u8 = 1 << 0;
-pub const YU_STORAGE_KEY_MODIFIER_SHIFT: u8 = 1 << 1;
-pub const YU_STORAGE_KEY_MODIFIER_CONTROL: u8 = 1 << 2;
-pub const YU_STORAGE_KEY_MODIFIER_OPTION: u8 = 1 << 3;
 pub const YU_STORAGE_COMMAND_DELETE_BACKWARD: u8 = 1;
 pub const YU_STORAGE_COMMAND_DELETE_FORWARD: u8 = 2;
 pub const YU_STORAGE_COMMAND_MOVE_LEFT: u8 = 3;
@@ -265,20 +251,6 @@ pub struct YuStorageProjectionSelection {
     pub visual_end_utf16: u64,
     pub round_trip_source_start_utf16: u64,
     pub round_trip_source_end_utf16: u64,
-    pub affinity: u8,
-}
-
-/// Revision-bound reverse caret mapping for a native visual mirror. The input
-/// visual coordinate and the returned source coordinate use UTF-16 units;
-/// `round_trip_visual_utf16` proves the source boundary maps back under the
-/// requested affinity.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageProjectionSourceCaret {
-    pub revision: u64,
-    pub visual_utf16: u64,
-    pub source_utf16: u64,
-    pub round_trip_visual_utf16: u64,
     pub affinity: u8,
 }
 
@@ -1771,24 +1743,6 @@ fn command_from_ffi(command: u8, block: u64) -> Result<EditorCommand, i32> {
     }
 }
 
-fn key_from_ffi(kind: u8, value: u32) -> Result<EditorKey, i32> {
-    match kind {
-        YU_STORAGE_KEY_CHARACTER => char::from_u32(value)
-            .map(EditorKey::Character)
-            .ok_or(YU_STORAGE_INVALID_KEY),
-        YU_STORAGE_KEY_ENTER => Ok(EditorKey::Enter),
-        YU_STORAGE_KEY_TAB => Ok(EditorKey::Tab),
-        YU_STORAGE_KEY_BACKSPACE => Ok(EditorKey::Backspace),
-        YU_STORAGE_KEY_DELETE => Ok(EditorKey::Delete),
-        YU_STORAGE_KEY_LEFT => Ok(EditorKey::Left),
-        YU_STORAGE_KEY_RIGHT => Ok(EditorKey::Right),
-        YU_STORAGE_KEY_UP => Ok(EditorKey::Up),
-        YU_STORAGE_KEY_DOWN => Ok(EditorKey::Down),
-        YU_STORAGE_KEY_ESCAPE => Ok(EditorKey::Escape),
-        _ => Err(YU_STORAGE_INVALID_KEY),
-    }
-}
-
 fn command_result_output(
     session: &DocumentEditorSession,
     result: CommandResult,
@@ -2838,36 +2792,6 @@ pub unsafe extern "C" fn yu_storage_session_command_available(
     YU_STORAGE_OK
 }
 
-/// # Safety
-///
-/// `session` must be a live handle and `output` must be writable when a key
-/// is handled. Printable text is intentionally left to native text input.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_route_key(
-    session: *mut YuStorageSession,
-    key_kind: u8,
-    key: u32,
-    modifiers: u8,
-    output: *mut YuStorageCommandResult,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    let key = match key_from_ffi(key_kind, key) {
-        Ok(key) => key,
-        Err(status) => return status,
-    };
-    let event = KeyEvent::new(key, KeyModifiers::from_bits(modifiers));
-    let route = match session.session.route_key(event) {
-        Ok(route) => route,
-        Err(error) => return storage_status(error),
-    };
-    let KeyRouteResult::Executed(result) = route else {
-        return YU_STORAGE_KEY_UNHANDLED;
-    };
-    command_result_output(&session.session, result, output)
-}
-
 /// Returns the current transient composition metadata. The source revision
 /// remains unchanged while `active` is non-zero; `generation` changes on each
 /// successful begin/update/commit/cancel transition.
@@ -3376,82 +3300,6 @@ pub unsafe extern "C" fn yu_storage_session_projection_selection(
             visual_end_utf16,
             round_trip_source_start_utf16,
             round_trip_source_end_utf16,
-            affinity: affinity_to_ffi(affinity),
-        };
-    }
-    YU_STORAGE_OK
-}
-
-/// Maps one visual UTF-16 caret from a native TextKit mirror back to the
-/// canonical source. The visual stream is Rust-owned projected text; Swift
-/// must not infer hidden Markdown delimiter ranges itself.
-///
-/// # Safety
-/// `session` must be a live handle and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_projection_source_caret(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    visual_utf16: u64,
-    affinity: u8,
-    output: *mut YuStorageProjectionSourceCaret,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageProjectionSourceCaret::default() };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let affinity = match caret_affinity_from_ffi(affinity) {
-        Ok(affinity) => affinity,
-        Err(status) => return status,
-    };
-    let projection = match session.session.inline_projection_for_visual_state() {
-        Ok(projection) => projection,
-        Err(error) => return storage_status(error),
-    };
-    let projected = match projected_utf8(&projection) {
-        Ok(projected) => projected,
-        Err(status) => return status,
-    };
-    let visual_byte = match utf16_byte_offset(&projected, visual_utf16) {
-        Ok(offset) => offset,
-        Err(status) => return status,
-    };
-    let visual = VisualOffset::new(match u64::try_from(visual_byte) {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    });
-    let bias = projection_bias_from_affinity(affinity);
-    let source = match projection.visual_to_source(visual, bias) {
-        Ok(source) => source,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let round_trip_visual = match projection.source_to_visual(source, bias) {
-        Ok(visual) => visual,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let snapshot = session.session.snapshot();
-    let source_utf16 = match snapshot.utf16_offset(source) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let round_trip_visual_utf16 = match visual_utf16_offset(&projected, round_trip_visual) {
-        Ok(offset) => offset,
-        Err(status) => return status,
-    };
-    // SAFETY: output was checked above and belongs to the caller.
-    unsafe {
-        *output = YuStorageProjectionSourceCaret {
-            revision: session.session.revision().get(),
-            visual_utf16,
-            source_utf16,
-            round_trip_visual_utf16,
             affinity: affinity_to_ffi(affinity),
         };
     }
@@ -5187,69 +5035,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_begin_at_point(
     };
     let metadata = match begin_table_resize_session(session, block_index, hit, pointer_position) {
         Ok(value) => value,
-        Err(status) => return status,
-    };
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = metadata };
-    YU_STORAGE_OK
-}
-
-/// macOS/CoreText-shaped variant of table resize begin. The hit-test layout
-/// uses the same system shaper and font size as the retained render-host
-/// frame, so the divider captured by the gesture is in the same geometry
-/// space that scene/render-plan assembly will later consume.
-///
-/// # Safety
-/// `session` must be live and `output` must be writable.
-#[cfg(target_os = "macos")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_table_resize_begin(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    size: f32,
-    max_width: f32,
-    point_x: f32,
-    point_y: f32,
-    tolerance: f32,
-    pointer_position: f32,
-    output: *mut YuStorageTableResizeHit,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageTableResizeHit::default() };
-    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
-        return status;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) if index < session.session.block_count() => index,
-        _ => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let (shaper, _metrics, config) = match core_text_system_ui_layout(size, max_width) {
-        Ok(value) => value,
-        Err(status) => return status,
-    };
-    let layout = {
-        let document = session.session.document_mut().editor_mut();
-        match document.block_layout_with_shaper(block_index, config, &shaper) {
-            Ok(layout) => layout.clone(),
-            Err(error) => return status_from_editor_error(error),
-        }
-    };
-    let Some(table) = layout.table() else {
-        return YU_STORAGE_INVALID_SELECTION;
-    };
-    let hit = match table.resize_hit_test(LayoutPoint::new(point_x, point_y), tolerance) {
-        Ok(Some(hit)) => hit,
-        Ok(None) | Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let metadata = match begin_table_resize_session(session, block_index, hit, pointer_position) {
-        Ok(metadata) => metadata,
         Err(status) => return status,
     };
     // SAFETY: output was checked for null and belongs to the caller.
@@ -9473,26 +9258,28 @@ mod tests {
             .encode_utf16()
             .count() as u64;
 
-        let mut caret = YuStorageProjectionSourceCaret {
+        // 折叠选区就是「一个光标」的映射，与非折叠区间走同一条路径。
+        let mut collapsed = YuStorageProjectionSourceSelection {
             revision: 99,
-            ..YuStorageProjectionSourceCaret::default()
+            ..YuStorageProjectionSourceSelection::default()
         };
         assert_eq!(
             unsafe {
-                yu_storage_session_projection_source_caret(
+                yu_storage_session_projection_source_selection(
                     raw,
                     0,
                     visual_start_utf16,
+                    visual_start_utf16,
                     YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    &mut caret,
+                    &mut collapsed,
                 )
             },
             YU_STORAGE_OK
         );
-        assert_eq!(caret.revision, 0);
-        assert_eq!(caret.visual_utf16, visual_start_utf16);
-        assert_eq!(caret.source_utf16, source_start_utf16);
-        assert_eq!(caret.round_trip_visual_utf16, visual_start_utf16);
+        assert_eq!(collapsed.revision, 0);
+        assert_eq!(collapsed.visual_start_utf16, visual_start_utf16);
+        assert_eq!(collapsed.source_start_utf16, source_start_utf16);
+        assert_eq!(collapsed.round_trip_visual_start_utf16, visual_start_utf16);
 
         let mut selection = YuStorageProjectionSourceSelection::default();
         assert_eq!(
@@ -9516,23 +9303,26 @@ mod tests {
         assert_eq!(selection.round_trip_visual_start_utf16, visual_start_utf16);
         assert_eq!(selection.round_trip_visual_end_utf16, visual_end_utf16);
 
+        // surrogate 中间位置不得穿过 ABI（不变量 I4）。
         let emoji_visual_start = projected.find("🙂").expect("emoji") as u64;
         let emoji_utf16 = projected[..emoji_visual_start as usize]
             .encode_utf16()
             .count() as u64;
+        let mut surrogate = YuStorageProjectionSourceSelection::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_projection_source_caret(
+                yu_storage_session_projection_source_selection(
                     raw,
                     0,
                     emoji_utf16 + 1,
+                    emoji_utf16 + 1,
                     YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut caret,
+                    &mut surrogate,
                 )
             },
             YU_STORAGE_INVALID_SELECTION
         );
-        assert_eq!(caret, YuStorageProjectionSourceCaret::default());
+        assert_eq!(surrogate, YuStorageProjectionSourceSelection::default());
 
         selection.revision = 99;
         assert_eq!(
@@ -11131,9 +10921,8 @@ mod tests {
         let mut hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_begin(
+                yu_storage_session_macos_table_resize_begin_at_point(
                     raw,
-                    0,
                     0,
                     14.0,
                     500.0,

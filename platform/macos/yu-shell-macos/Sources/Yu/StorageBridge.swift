@@ -135,21 +135,6 @@ struct NativeProjectionSelection {
         affinity = value.affinity
     }
 }
-struct NativeProjectionSourceCaret {
-    let revision: UInt64
-    let visualUTF16: UInt64
-    let sourceUTF16: UInt64
-    let roundTripVisualUTF16: UInt64
-    let affinity: UInt8
-
-    init(_ value: YuStorageProjectionSourceCaret) {
-        revision = value.revision
-        visualUTF16 = value.visual_utf16
-        sourceUTF16 = value.source_utf16
-        roundTripVisualUTF16 = value.round_trip_visual_utf16
-        affinity = value.affinity
-    }
-}
 struct NativeProjectionSourceSelection {
     let revision: UInt64
     let visualRange: NSRange
@@ -1084,25 +1069,6 @@ final class StorageBridge {
         return NativeProjectionSelection(value)
     }
 
-    func projectionSourceCaret(
-        revision: UInt64,
-        visualUTF16: UInt64,
-        affinity: UInt8
-    ) throws -> NativeProjectionSourceCaret {
-        var value = YuStorageProjectionSourceCaret()
-        let status = yu_storage_session_projection_source_caret(
-            handle,
-            revision,
-            visualUTF16,
-            affinity,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeProjectionSourceCaret(value)
-    }
-
     func projectionSourceSelection(
         revision: UInt64,
         visualRange: NSRange,
@@ -1419,34 +1385,6 @@ final class StorageBridge {
             maxWidth,
             lineHeight,
             defaultAdvance,
-            Float(point.x),
-            Float(point.y),
-            tolerance,
-            pointerPosition,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return value
-    }
-
-    func macosTableResizeBegin(
-        revision: UInt64,
-        blockIndex: UInt64,
-        size: Float,
-        maxWidth: Float,
-        point: CGPoint,
-        tolerance: Float,
-        pointerPosition: Float
-    ) throws -> YuStorageTableResizeHit {
-        var value = YuStorageTableResizeHit()
-        let status = yu_storage_session_macos_table_resize_begin(
-            handle,
-            revision,
-            blockIndex,
-            size,
-            maxWidth,
             Float(point.x),
             Float(point.y),
             tolerance,
@@ -2188,13 +2126,6 @@ final class StorageBridge {
         // the source fallback.
         guard status == StorageStatus.ok else { return false }
         return available != 0
-    }
-
-    func routeKey(kind: UInt8, value: UInt32 = 0, modifiers: UInt8 = 0) throws -> NativeCommandResult {
-        var result = YuStorageCommandResult()
-        let status = yu_storage_session_route_key(handle, kind, value, modifiers, &result)
-        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
-        return NativeCommandResult(result)
     }
 
     func beginComposition(replacementRange: NSRange, preedit: String, selection: NSRange) throws {
