@@ -98,6 +98,9 @@ enum {
     YU_STORAGE_TABLE_RESIZE_NONE = 0,
     YU_STORAGE_TABLE_RESIZE_COLUMN = 1,
     YU_STORAGE_TABLE_RESIZE_ROW = 2,
+    YU_STORAGE_TABLE_RESIZE_UPDATE = 0,
+    YU_STORAGE_TABLE_RESIZE_FINISH = 1,
+    YU_STORAGE_TABLE_RESIZE_CANCEL = 2,
 };
 
 enum {
@@ -805,6 +808,15 @@ int32_t yu_storage_session_table_resize_begin(
     uint64_t block_index, float max_width, float line_height,
     float default_advance, float point_x, float point_y, float tolerance,
     float pointer_position, YuStorageTableResizeHit *output);
+/* Advances one table divider drag. update/finish/cancel were three separate
+ * entry points with identical parameters and preconditions; they are three
+ * phases of one pointer gesture, which I3 already allows as an input event.
+ * `pointer_position` is read only for UPDATE. `output` must be writable for
+ * every action: failure paths clear it first and never leave a half-written
+ * value (I4). */
+int32_t yu_storage_session_table_resize_action(
+    YuStorageSession *session, uint64_t expected_revision, uint8_t action,
+    float pointer_position, YuStorageTableResizeCommit *output);
 /* Document-space CoreText-shaped table resize hit/begin variants. These
  * resolve the table block from the same y-coordinate space as the retained
  * macOS render host, so the native shell does not need to guess a block. */
@@ -822,14 +834,6 @@ int32_t yu_storage_session_macos_table_resize_begin_at_point(
     YuStorageSession *session, uint64_t expected_revision,
     float size, float max_width, float point_x, float point_y, float tolerance,
     float pointer_position, YuStorageTableResizeHit *output);
-int32_t yu_storage_session_table_resize_update(
-    YuStorageSession *session, uint64_t expected_revision,
-    float pointer_position, YuStorageTableResizeCommit *output);
-int32_t yu_storage_session_table_resize_finish(
-    YuStorageSession *session, uint64_t expected_revision,
-    YuStorageTableResizeCommit *output);
-int32_t yu_storage_session_table_resize_cancel(
-    YuStorageSession *session, uint64_t expected_revision);
 int32_t yu_storage_session_block_layout(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t block_index, float max_width, float line_height,

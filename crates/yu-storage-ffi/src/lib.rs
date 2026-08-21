@@ -106,6 +106,11 @@ pub const YU_STORAGE_TABLE_RESIZE_NONE: u8 = 0;
 pub const YU_STORAGE_TABLE_RESIZE_COLUMN: u8 = 1;
 pub const YU_STORAGE_TABLE_RESIZE_ROW: u8 = 2;
 
+/// `yu_storage_session_table_resize_action` 的动作。
+pub const YU_STORAGE_TABLE_RESIZE_UPDATE: u8 = 0;
+pub const YU_STORAGE_TABLE_RESIZE_FINISH: u8 = 1;
+pub const YU_STORAGE_TABLE_RESIZE_CANCEL: u8 = 2;
+
 pub const YU_STORAGE_SCENE_PRIMITIVE_BACKGROUND: u8 = 0;
 pub const YU_STORAGE_SCENE_PRIMITIVE_TEXT_BOUNDS: u8 = 1;
 
@@ -5042,15 +5047,28 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_begin_at_point(
     YU_STORAGE_OK
 }
 
-/// Updates the Rust-owned table resize gesture and returns the transient
-/// geometry that the next render-host frame will consume.
+/// 推进一次表格分隔线拖动。
+///
+/// update / finish / cancel 此前是三个独立 FFI，参数与前置条件完全一致，只在
+/// 「对 gesture 做什么」上不同。它们是同一个指针手势的三个阶段，属于不变量 I3
+/// 允许的「输入事件」这一类——一个带 action 的入口就够了。
+///
+/// - `UPDATE`：把 `pointer_position` 送进手势，返回本帧要用的临时几何。
+/// - `FINISH`：结束手势，最终几何作为 session 级覆盖保留给后续帧。
+///   不产生任何 Markdown transaction。
+/// - `CANCEL`：结束手势并清除覆盖。没有手势时返回 OK——它同时用于清掉
+///   finish 之后仍然保留的那份预览。
+///
+/// `pointer_position` 只在 `UPDATE` 下被读取。`output` 三种 action 都必须可写：
+/// 失败路径先把它清零，不留半成品（不变量 I4）。
 ///
 /// # Safety
 /// `session` must be live and `output` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_table_resize_update(
+pub unsafe extern "C" fn yu_storage_session_table_resize_action(
     session: *mut YuStorageSession,
     expected_revision: u64,
+    action: u8,
     pointer_position: f32,
     output: *mut YuStorageTableResizeCommit,
 ) -> i32 {
@@ -5062,61 +5080,50 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_update(
     }
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = YuStorageTableResizeCommit::default() };
+    if !matches!(
+        action,
+        YU_STORAGE_TABLE_RESIZE_UPDATE
+            | YU_STORAGE_TABLE_RESIZE_FINISH
+            | YU_STORAGE_TABLE_RESIZE_CANCEL
+    ) {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
     if let Err(status) = validate_table_resize_revision(session, expected_revision) {
         return status;
     }
     let revision = session.session.revision();
-    let Some(gesture) = session.table_resize_gesture.as_mut() else {
-        return YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE;
-    };
-    if let Err(error) = gesture.update(revision, pointer_position) {
-        session.table_resize_gesture = None;
-        session.table_resize_override = None;
-        return table_resize_gesture_status(error);
-    }
-    let commit = gesture.preview();
-    let metadata = match table_resize_commit_metadata(commit) {
-        Ok(metadata) => metadata,
-        Err(status) => return status,
-    };
-    session.table_resize_override = Some(commit);
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = metadata };
-    YU_STORAGE_OK
-}
 
-/// Finishes the current table resize gesture and keeps its final geometry as
-/// a session-only override for subsequent retained frames. No Markdown
-/// transaction is created by this function.
-///
-/// # Safety
-/// `session` must be live and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_table_resize_finish(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    output: *mut YuStorageTableResizeCommit,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
+    if action == YU_STORAGE_TABLE_RESIZE_CANCEL {
+        let Some(gesture) = session.table_resize_gesture.take() else {
+            session.table_resize_override = None;
+            return YU_STORAGE_OK;
+        };
+        session.table_resize_override = None;
+        return gesture
+            .cancel(revision)
+            .map_or_else(table_resize_gesture_status, |_| YU_STORAGE_OK);
     }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageTableResizeCommit::default() };
-    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
-        return status;
-    }
-    let revision = session.session.revision();
-    let Some(gesture) = session.table_resize_gesture.take() else {
-        return YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE;
-    };
-    let commit = match gesture.finish(revision) {
-        Ok(commit) => commit,
-        Err(error) => {
+
+    let commit = if action == YU_STORAGE_TABLE_RESIZE_UPDATE {
+        let Some(gesture) = session.table_resize_gesture.as_mut() else {
+            return YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE;
+        };
+        if let Err(error) = gesture.update(revision, pointer_position) {
+            session.table_resize_gesture = None;
             session.table_resize_override = None;
             return table_resize_gesture_status(error);
+        }
+        gesture.preview()
+    } else {
+        let Some(gesture) = session.table_resize_gesture.take() else {
+            return YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE;
+        };
+        match gesture.finish(revision) {
+            Ok(commit) => commit,
+            Err(error) => {
+                session.table_resize_override = None;
+                return table_resize_gesture_status(error);
+            }
         }
     };
     let metadata = match table_resize_commit_metadata(commit) {
@@ -5127,33 +5134,6 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_finish(
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = metadata };
     YU_STORAGE_OK
-}
-
-/// Cancels a current table resize gesture and removes any session-only table
-/// geometry override. It is also safe to call after finish to clear the final
-/// preview; in that case the function returns `YU_STORAGE_OK`.
-///
-/// # Safety
-/// `session` must be live.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_table_resize_cancel(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
-        return status;
-    }
-    let Some(gesture) = session.table_resize_gesture.take() else {
-        session.table_resize_override = None;
-        return YU_STORAGE_OK;
-    };
-    session.table_resize_override = None;
-    gesture
-        .cancel(session.session.revision())
-        .map_or_else(table_resize_gesture_status, |_| YU_STORAGE_OK)
 }
 
 /// Returns revision-bound metrics layout metadata for one parser-owned block.
@@ -8871,7 +8851,15 @@ mod tests {
 
         let mut preview = YuStorageTableResizeCommit::default();
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_update(raw, 0, 4.1, &mut preview) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    4.1,
+                    &mut preview,
+                )
+            },
             YU_STORAGE_OK
         );
         assert_eq!(preview.revision, 0);
@@ -8884,17 +8872,41 @@ mod tests {
 
         let mut committed = YuStorageTableResizeCommit::default();
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_finish(raw, 0, &mut committed) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_FINISH,
+                    0.0,
+                    &mut committed,
+                )
+            },
             YU_STORAGE_OK
         );
         assert_eq!(committed, preview);
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_update(raw, 0, 4.1, &mut preview) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    4.1,
+                    &mut preview,
+                )
+            },
             YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE
         );
         assert_eq!(preview, YuStorageTableResizeCommit::default());
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_cancel(raw, 0) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_CANCEL,
+                    0.0,
+                    &mut YuStorageTableResizeCommit::default(),
+                )
+            },
             YU_STORAGE_OK
         );
 
@@ -8904,12 +8916,28 @@ mod tests {
             YU_STORAGE_OK
         );
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_finish(raw, 0, &mut committed) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_FINISH,
+                    0.0,
+                    &mut committed,
+                )
+            },
             YU_STORAGE_STALE_REVISION
         );
         assert_eq!(committed, YuStorageTableResizeCommit::default());
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_cancel(raw, 1) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    1,
+                    YU_STORAGE_TABLE_RESIZE_CANCEL,
+                    0.0,
+                    &mut YuStorageTableResizeCommit::default(),
+                )
+            },
             YU_STORAGE_OK
         );
 
@@ -10543,6 +10571,79 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
+    /// 未知的 action 必须被拒绝，且不得触碰手势状态。
+    ///
+    /// 三个动作合成一个入口之后，「传错 action 会发生什么」成了一个新的失败面。
+    /// 静默地把未知值当成某个动作执行，会在拖动中途清掉覆盖或提交错误几何——
+    /// 都不报错。
+    #[test]
+    fn ffi_table_resize_action_rejects_unknown_actions() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-resize-action-{id}.md"));
+        fs::write(&path, "| A | B |\n| --- | :---: |\n| 1 | 2 |\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let mut hit = YuStorageTableResizeHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_begin(
+                    raw, 0, 0, 20.0, 2.0, 1.0, 3.1, 0.5, 0.2, 3.1, &mut hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut preview = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    4.1,
+                    &mut preview,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(preview.final_position, 4.0);
+
+        for unknown in [3_u8, 255] {
+            let mut out = preview;
+            assert_eq!(
+                unsafe { yu_storage_session_table_resize_action(raw, 0, unknown, 9.9, &mut out) },
+                YU_STORAGE_INVALID_COMMAND
+            );
+            assert_eq!(
+                out,
+                YuStorageTableResizeCommit::default(),
+                "不得留下半成品输出"
+            );
+        }
+
+        // 手势必须仍然活着：未知 action 不得当成 cancel 或 finish。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    5.1,
+                    &mut preview,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(preview.final_position, 5.0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     /// 一帧必须自己报告可见范围内是否还有未落定的资源。
     ///
     /// 这个标志决定平台要不要再提交一次去收割 worker 结果。恒为 0 时图片会
@@ -10730,7 +10831,15 @@ mod tests {
         assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
         let mut preview = YuStorageTableResizeCommit::default();
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_update(raw, 0, 4.1, &mut preview) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    4.1,
+                    &mut preview,
+                )
+            },
             YU_STORAGE_OK
         );
         let dragged = capture(geometry);
@@ -10740,7 +10849,15 @@ mod tests {
 
         // 再拖一格：同一个 gesture 内的位移同样必须被看见。
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_update(raw, 0, 5.1, &mut preview) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    5.1,
+                    &mut preview,
+                )
+            },
             YU_STORAGE_OK
         );
         assert_ne!(dragged, capture(geometry), "同一手势内的位移必须被看见");
@@ -10915,7 +11032,15 @@ mod tests {
         );
         assert_eq!(document_begin, document_hit);
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_cancel(raw, 0) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_CANCEL,
+                    0.0,
+                    &mut YuStorageTableResizeCommit::default(),
+                )
+            },
             YU_STORAGE_OK
         );
         let mut hit = YuStorageTableResizeHit::default();
@@ -10937,7 +11062,15 @@ mod tests {
         );
         let mut preview = YuStorageTableResizeCommit::default();
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_update(raw, 0, divider + 1.01, &mut preview) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    divider + 1.01,
+                    &mut preview,
+                )
+            },
             YU_STORAGE_OK
         );
         assert_eq!(preview.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
@@ -10984,7 +11117,15 @@ mod tests {
 
         let mut committed = YuStorageTableResizeCommit::default();
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_finish(raw, 0, &mut committed) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_FINISH,
+                    0.0,
+                    &mut committed,
+                )
+            },
             YU_STORAGE_OK
         );
         assert_eq!(committed, preview);
@@ -11048,7 +11189,15 @@ mod tests {
         );
         assert_eq!(effective_hit.index, 0);
         assert_eq!(
-            unsafe { yu_storage_session_table_resize_cancel(raw, 0) },
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_CANCEL,
+                    0.0,
+                    &mut YuStorageTableResizeCommit::default(),
+                )
+            },
             YU_STORAGE_OK
         );
         let mut canonical_frame = YuStorageMacosRenderHostSnapshot::default();
