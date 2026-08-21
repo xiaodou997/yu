@@ -43,9 +43,18 @@ ALLOWED: dict[str, set[str]] = {
     # yu-decoration 与布局重写一起做（理由见 docs/architecture/overview-v2.md
     # 第 8 节）。这条边先登记，是为了让方向从一开始就被约束住。
     "yu-syntax": {"yu-core", "yu-text"},
-    "yu-markdown": {"yu-core", "yu-text"},
+    # yu-markdown 产出 decoration（第 4.3 节的职责），所以它依赖
+    # yu-decoration——那是个不认识 Markdown 的原语，在它下方。
+    "yu-markdown": {"yu-core", "yu-decoration", "yu-syntax", "yu-text"},
     "yu-embedded-math": {"yu-assets"},
-    # 3 层：投影（S4 由 yu-decoration 取代）。
+    # 3 层：装饰中枢。
+    #
+    # yu-decoration 不认识 Markdown（第 4.3 节的禁止项），所以它只依赖
+    # yu-core（坐标）与 yu-text（ChangeSet，`map` 的输入）。它**不**依赖
+    # yu-syntax：装饰由 yu-markdown 的 extension 产出，中枢只承载结果。
+    "yu-decoration": {"yu-core", "yu-text"},
+    # yu-projection 是 v1 的实现，S4 结束时删除。在那之前两者并存，
+    # 由 yu-decoration 的差分测试逐点比对。
     "yu-projection": {"yu-core", "yu-markdown", "yu-text"},
     # 4-6 层：布局 → 场景 → 绘制指令。
     "yu-layout": {"yu-core", "yu-markdown", "yu-projection", "yu-text"},
@@ -122,6 +131,10 @@ ALLOWED_DEV: dict[str, set[str]] = {
     "yu-render": {"yu-layout", "yu-markdown", "yu-projection", "yu-text"},
     "yu-scene": {"yu-markdown", "yu-projection", "yu-text"},
     "yu-embedded-math": {"yu-core"},
+    # 临时：yu-projection 是 yu-decoration 的 source↔visual 映射的 oracle。
+    # 一个已经在产品里跑着的实现比自证性质更强。这条边随 yu-projection
+    # 在 S4 末尾被删除而消失。
+    "yu-decoration": {"yu-projection"},
 }
 
 

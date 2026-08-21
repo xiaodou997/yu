@@ -321,3 +321,89 @@ mod tests {
         assert!(LineIndex::new(2) > LineIndex::new(1));
     }
 }
+
+/// An offset in the projected UTF-8 visual stream.
+///
+/// It is not a source byte offset. A visual offset is only meaningful for the
+/// projection revision and range that produced it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VisualOffset(u64);
+
+impl VisualOffset {
+    pub const ZERO: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn checked_add(self, bytes: u64) -> Option<Self> {
+        match self.0.checked_add(bytes) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
+impl fmt::Debug for VisualOffset {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "VisualOffset({})", self.0)
+    }
+}
+
+impl TryFrom<usize> for VisualOffset {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Ok(Self(value.try_into()?))
+    }
+}
+
+/// A half-open range in projected UTF-8 visual bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VisualRange {
+    start: VisualOffset,
+    end: VisualOffset,
+}
+
+impl VisualRange {
+    #[must_use]
+    pub const fn new(start: VisualOffset, end: VisualOffset) -> Option<Self> {
+        if start.get() <= end.get() {
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn empty(at: VisualOffset) -> Self {
+        Self { start: at, end: at }
+    }
+
+    #[must_use]
+    pub const fn start(self) -> VisualOffset {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn end(self) -> VisualOffset {
+        self.end
+    }
+
+    #[must_use]
+    pub const fn len(self) -> u64 {
+        self.end.get() - self.start.get()
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.start.get() == self.end.get()
+    }
+}

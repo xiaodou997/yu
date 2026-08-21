@@ -17,6 +17,7 @@ use yu_text::{
 };
 
 mod block_sequence;
+mod decorations;
 mod inline;
 mod reference;
 mod table;
@@ -27,6 +28,7 @@ pub use block_sequence::{
     RetainedBlockStats, TaskState,
 };
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
+pub use decorations::{inline_syntax_decoration_set, inline_syntax_decorations};
 pub use inline::{
     InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError,
     InlinePunctuation, InlineSpan, InlineSpanKind, parse_inline, parse_inline_with_definitions,

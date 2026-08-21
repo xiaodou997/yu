@@ -11,6 +11,8 @@ repository.workspace = true
 [dependencies]
 yu-core = { path = "../yu-core" }
 yu-text = { path = "../yu-text" }
+yu-syntax = { path = "../yu-syntax" }
+yu-decoration = { path = "../yu-decoration" }
 
 [lints]
 workspace = true
