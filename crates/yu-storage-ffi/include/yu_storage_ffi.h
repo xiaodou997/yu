@@ -129,6 +129,12 @@ enum {
 };
 
 enum {
+    YU_STORAGE_CLOSE_RESOLVE_CANCEL = 0,
+    YU_STORAGE_CLOSE_RESOLVE_SAVE = 1,
+    YU_STORAGE_CLOSE_RESOLVE_DISCARD = 2,
+};
+
+enum {
     YU_STORAGE_ACCESSIBILITY_PARENT_NONE = UINT32_MAX,
     YU_STORAGE_ACCESSIBILITY_FLAG_ORDERED = 1 << 0,
     YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE = 1 << 1,
@@ -168,12 +174,6 @@ typedef struct YuStorageCloseRequest {
     uint8_t close_state;
 } YuStorageCloseRequest;
 
-typedef struct YuStorageSelection {
-    uint64_t revision;
-    uint64_t start_utf16;
-    uint64_t end_utf16;
-    uint8_t affinity;
-} YuStorageSelection;
 
 /* Revision-bound selection endpoints. The anchor/focus pair preserves the
  * direction of a native visual drag; YuStorageSelection remains the ordered
@@ -646,8 +646,6 @@ int32_t yu_storage_import_html_fragment(const uint8_t *html, size_t html_length,
                                         size_t *written);
 int32_t yu_storage_session_accessibility_snapshot(
     const YuStorageSession *session, YuStorageAccessibilitySnapshot *output);
-int32_t yu_storage_session_accessibility_semantic_node_count(
-    const YuStorageSession *session, uint64_t expected_revision, size_t *output);
 int32_t yu_storage_session_accessibility_semantic_nodes_v2(
     const YuStorageSession *session, uint64_t expected_revision,
     YuStorageAccessibilityNodeV2 *output, size_t capacity, size_t *written);
@@ -658,15 +656,8 @@ int32_t yu_storage_session_accessibility_line_for_position(
     const YuStorageSession *session, uint64_t expected_revision,
     uint64_t offset_utf16, uint64_t *output);
 
-int32_t yu_storage_session_selection(const YuStorageSession *session,
-                                     YuStorageSelection *output);
 int32_t yu_storage_session_selection_endpoints(
     const YuStorageSession *session, YuStorageSelectionEndpoints *output);
-int32_t yu_storage_session_set_selection(YuStorageSession *session,
-                                         uint64_t expected_revision,
-                                         uint64_t start_utf16,
-                                         uint64_t end_utf16,
-                                         uint8_t affinity);
 int32_t yu_storage_session_set_selection_endpoints(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t anchor_utf16, uint64_t focus_utf16, uint8_t affinity);
@@ -719,8 +710,12 @@ int32_t yu_storage_session_reload(YuStorageSession *session,
 
 int32_t yu_storage_session_request_close(YuStorageSession *session,
                                           YuStorageCloseRequest *output);
-int32_t yu_storage_session_cancel_close(YuStorageSession *session);
-int32_t yu_storage_session_save_close(YuStorageSession *session);
-int32_t yu_storage_session_discard_close(YuStorageSession *session);
+/* Ends one close negotiation. cancel/save/discard were three separate entry
+ * points with identical parameters, preconditions and status codes; they are
+ * three exits from one negotiation, which I3 already allows as a file
+ * operation. `request_close` stays separate: it is the query that starts the
+ * negotiation and reports whether the user must be asked. */
+int32_t yu_storage_session_close_resolve(YuStorageSession *session,
+                                          uint8_t action);
 
 #endif

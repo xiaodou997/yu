@@ -157,6 +157,11 @@ pub const YU_STORAGE_CLOSE_PROMPT_EXTERNAL_MISSING: u8 = 4;
 pub const YU_STORAGE_CLOSE_NOW: u8 = 0;
 pub const YU_STORAGE_CLOSE_PROMPT: u8 = 1;
 pub const YU_STORAGE_CLOSE_ALREADY_CLOSED: u8 = 2;
+
+/// `yu_storage_session_close_resolve` 的收场方式。
+pub const YU_STORAGE_CLOSE_RESOLVE_CANCEL: u8 = 0;
+pub const YU_STORAGE_CLOSE_RESOLVE_SAVE: u8 = 1;
+pub const YU_STORAGE_CLOSE_RESOLVE_DISCARD: u8 = 2;
 pub const YU_STORAGE_EXTERNAL_CHANGED: u8 = YU_STORAGE_DISK_CHANGED;
 pub const YU_STORAGE_EXTERNAL_MISSING: u8 = YU_STORAGE_DISK_MISSING;
 pub const YU_STORAGE_ACCESSIBILITY_PARENT_NONE: u32 = u32::MAX;
@@ -198,19 +203,9 @@ pub struct YuStorageCloseRequest {
     pub close_state: u8,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageSelection {
-    pub revision: u64,
-    pub start_utf16: u64,
-    pub end_utf16: u64,
-    pub affinity: u8,
-}
-
-/// Revision-bound selection endpoints. `anchor_utf16` and `focus_utf16`
-/// preserve the direction of a native drag, while `start_utf16`/`end_utf16`
-/// in [`YuStorageSelection`] intentionally remain the ordered range used by
-/// existing TextKit and Accessibility callers.
+/// Revision-bound selection endpoints. `anchor_utf16` 与 `focus_utf16` 保留
+/// 原生拖动的方向；有序区间由调用方取两者的 min/max 推导，不再单独占一个
+/// ABI 入口。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct YuStorageSelectionEndpoints {
@@ -1131,26 +1126,6 @@ fn caret_affinity_from_ffi(value: u8) -> Result<CaretAffinity, i32> {
     }
 }
 
-fn selection_from_ffi(
-    session: &DocumentEditorSession,
-    start_utf16: u64,
-    end_utf16: u64,
-    affinity: u8,
-) -> Result<yu_editor::EditorSelection, i32> {
-    let affinity = caret_affinity_from_ffi(affinity)?;
-    let range = Utf16Range::new(Utf16Offset::new(start_utf16), Utf16Offset::new(end_utf16))
-        .ok_or(YU_STORAGE_INVALID_SELECTION)?;
-    let snapshot = session.snapshot();
-    let start = snapshot
-        .byte_offset_for_utf16(range.start())
-        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-    let end = snapshot
-        .byte_offset_for_utf16(range.end())
-        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-    yu_editor::EditorSelection::range(&snapshot, start, end, affinity)
-        .map_err(|_| YU_STORAGE_INVALID_SELECTION)
-}
-
 fn selection_endpoints_from_ffi(
     session: &DocumentEditorSession,
     anchor_utf16: u64,
@@ -1184,31 +1159,6 @@ fn source_range_from_ffi(
         .byte_offset_for_utf16(range.end())
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
     TextRange::new(start, end).ok_or(YU_STORAGE_INVALID_SELECTION)
-}
-
-fn selection_output(session: &DocumentEditorSession, output: *mut YuStorageSelection) -> i32 {
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    let snapshot = session.snapshot();
-    let selection = session.selection();
-    let range = match selection.utf16_range(&snapshot) {
-        Ok(range) => range,
-        Err(error) => return status_from_editor_error(EditorDocumentError::Selection(error)),
-    };
-    // SAFETY: output is checked above and belongs to the caller.
-    unsafe {
-        *output = YuStorageSelection {
-            revision: session.revision().get(),
-            start_utf16: range.start().get(),
-            end_utf16: range.end().get(),
-            affinity: match selection.affinity() {
-                CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-            },
-        };
-    }
-    YU_STORAGE_OK
 }
 
 fn selection_endpoints_output(
@@ -2068,20 +2018,6 @@ fn validate_table_resize_revision(
     Ok(())
 }
 
-/// # Safety
-///
-/// `session` must be null or a live handle and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_selection(
-    session: *const YuStorageSession,
-    output: *mut YuStorageSelection,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    selection_output(&session.session, output)
-}
-
 /// Returns the current selection's anchor/focus endpoints without losing
 /// backward-drag direction. The ordered range remains available through
 /// `yu_storage_session_selection` for callers that do not need direction.
@@ -2097,34 +2033,6 @@ pub unsafe extern "C" fn yu_storage_session_selection_endpoints(
         return YU_STORAGE_NULL_POINTER;
     };
     selection_endpoints_output(&session.session, output)
-}
-
-/// # Safety
-///
-/// `session` must be a live handle. The expected revision and UTF-16 range
-/// must describe a valid source selection; `affinity` must be a known value.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_set_selection(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    start_utf16: u64,
-    end_utf16: u64,
-    affinity: u8,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let selection = match selection_from_ffi(&session.session, start_utf16, end_utf16, affinity) {
-        Ok(selection) => selection,
-        Err(status) => return status,
-    };
-    session
-        .session
-        .set_selection(selection)
-        .map_or_else(storage_status, |_| YU_STORAGE_OK)
 }
 
 /// Sets a revision-bound selection while preserving anchor/focus direction.
@@ -5089,34 +4997,6 @@ pub unsafe extern "C" fn yu_storage_session_accessibility_snapshot(
     accessibility_snapshot_output(&session.session, output)
 }
 
-/// Returns the number of Revision-bound semantic Accessibility nodes.
-///
-/// # Safety
-/// `session` must be null or a live handle; `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_node_count(
-    session: *const YuStorageSession,
-    expected_revision: u64,
-    output: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let snapshot = match accessibility_semantic_snapshot(&session.session) {
-        Ok(snapshot) => snapshot,
-        Err(status) => return status,
-    };
-    // SAFETY: output is checked above and belongs to the caller.
-    unsafe { *output = snapshot.nodes().len() };
-    YU_STORAGE_OK
-}
-
 /// Copies the extended Revision-bound semantic tree. This V2 function keeps
 /// the original `yu_storage_session_accessibility_semantic_nodes` struct ABI
 /// intact while adding parser-resolved destination and task action metadata.
@@ -5315,48 +5195,39 @@ pub unsafe extern "C" fn yu_storage_session_request_close(
     YU_STORAGE_OK
 }
 
-/// # Safety
+/// 结束一次关闭协商。
 ///
+/// cancel / save / discard 此前是三个独立 FFI：同样的 session 参数、同样的
+/// 前置状态、同样的返回码，只在「怎么收场」上不同。它们是同一个关闭协商的
+/// 三个出口，属于不变量 I3 的「文件操作」一类，一个带 action 的入口就够了。
+///
+/// 协商本身仍由 `request_close` 发起——它是查询，返回是否需要向用户提问。
+///
+/// # Safety
 /// `session` must be null or a live handle returned by the open function.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_cancel_close(session: *mut YuStorageSession) -> i32 {
+pub unsafe extern "C" fn yu_storage_session_close_resolve(
+    session: *mut YuStorageSession,
+    action: u8,
+) -> i32 {
     let Some(session) = (unsafe { session.as_mut() }) else {
         return YU_STORAGE_NULL_POINTER;
     };
-    session
-        .session
-        .cancel_close()
-        .map(|_| YU_STORAGE_OK)
-        .unwrap_or(YU_STORAGE_INVALID_STATE)
-}
-
-/// # Safety
-///
-/// `session` must be null or a live handle returned by the open function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_save_close(session: *mut YuStorageSession) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    match session.session.save_close() {
-        Ok(_) => YU_STORAGE_OK,
-        Err(error) => status_from_error(error),
+    match action {
+        YU_STORAGE_CLOSE_RESOLVE_CANCEL => session
+            .session
+            .cancel_close()
+            .map_or(YU_STORAGE_INVALID_STATE, |_| YU_STORAGE_OK),
+        YU_STORAGE_CLOSE_RESOLVE_SAVE => match session.session.save_close() {
+            Ok(_) => YU_STORAGE_OK,
+            Err(error) => status_from_error(error),
+        },
+        YU_STORAGE_CLOSE_RESOLVE_DISCARD => session
+            .session
+            .discard_close()
+            .map_or(YU_STORAGE_INVALID_STATE, |_| YU_STORAGE_OK),
+        _ => YU_STORAGE_INVALID_COMMAND,
     }
-}
-
-/// # Safety
-///
-/// `session` must be null or a live handle returned by the open function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_discard_close(session: *mut YuStorageSession) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    session
-        .session
-        .discard_close()
-        .map(|_| YU_STORAGE_OK)
-        .unwrap_or(YU_STORAGE_INVALID_STATE)
 }
 
 #[cfg(test)]
@@ -5523,13 +5394,9 @@ mod tests {
         assert_eq!(endpoints.focus_utf16, 0);
         assert_eq!(endpoints.affinity, YU_STORAGE_CARET_AFFINITY_UPSTREAM);
 
-        let mut ordered = YuStorageSelection::default();
-        assert_eq!(
-            unsafe { yu_storage_session_selection(raw, &mut ordered) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(ordered.start_utf16, 0);
-        assert_eq!(ordered.end_utf16, end);
+        // 有序区间由端点推导，不再单独跨 ABI。
+        assert_eq!(endpoints.focus_utf16.min(endpoints.anchor_utf16), 0);
+        assert_eq!(endpoints.focus_utf16.max(endpoints.anchor_utf16), end);
 
         let mut result = YuStorageCommandResult::default();
         assert_eq!(
@@ -5635,7 +5502,7 @@ mod tests {
         let source_utf16 = source[..strong + 2].encode_utf16().count() as u64;
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(
+                yu_storage_session_set_selection_endpoints(
                     raw,
                     0,
                     source_utf16,
@@ -5659,7 +5526,7 @@ mod tests {
         let end_utf16 = source.encode_utf16().count() as u64;
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(
+                yu_storage_session_set_selection_endpoints(
                     raw,
                     0,
                     end_utf16,
@@ -5703,7 +5570,7 @@ mod tests {
         let first_line_end = source.find('\n').expect("line ending") as u64;
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(
+                yu_storage_session_set_selection_endpoints(
                     raw,
                     0,
                     first_line_end,
@@ -6180,7 +6047,13 @@ mod tests {
         // 光标移动不推进 Revision，但会改变 caret 装饰。
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(raw, 0, 2, 2, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    2,
+                    2,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
             },
             YU_STORAGE_OK
         );
@@ -7502,7 +7375,7 @@ mod tests {
         let source_utf16 = source.encode_utf16().count() as u64;
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(
+                yu_storage_session_set_selection_endpoints(
                     raw,
                     0,
                     source_utf16,
@@ -7762,7 +7635,15 @@ mod tests {
 
         let mut count = 0;
         assert_eq!(
-            unsafe { yu_storage_session_accessibility_semantic_node_count(raw, 0, &mut count) },
+            unsafe {
+                yu_storage_session_accessibility_semantic_nodes_v2(
+                    raw,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            },
             YU_STORAGE_OK
         );
         assert!(
@@ -7826,7 +7707,13 @@ mod tests {
         let mut stale_count = 0;
         assert_eq!(
             unsafe {
-                yu_storage_session_accessibility_semantic_node_count(raw, 1, &mut stale_count)
+                yu_storage_session_accessibility_semantic_nodes_v2(
+                    raw,
+                    1,
+                    ptr::null_mut(),
+                    0,
+                    &mut stale_count,
+                )
             },
             YU_STORAGE_STALE_REVISION
         );
@@ -7848,17 +7735,23 @@ mod tests {
         );
         assert!(!raw.is_null());
 
-        let mut selection = YuStorageSelection::default();
+        let mut selection = YuStorageSelectionEndpoints::default();
         assert_eq!(
-            unsafe { yu_storage_session_selection(raw, &mut selection) },
+            unsafe { yu_storage_session_selection_endpoints(raw, &mut selection) },
             YU_STORAGE_OK
         );
         assert_eq!(selection.revision, 0);
-        assert_eq!(selection.start_utf16, 0, "新文档的光标落在文首");
+        assert_eq!(selection.focus_utf16, 0, "新文档的光标落在文首");
         // 后面的 MOVE_LEFT 与 composition 都以「光标在末尾」为前提，显式建立。
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(raw, 0, 4, 4, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    4,
+                    4,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
             },
             YU_STORAGE_OK
         );
@@ -8002,7 +7895,13 @@ mod tests {
         // 新文档的光标落在文首；这个用例断言的是「在末尾追加」，前提要自己建立。
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(raw, 0, 1, 1, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    1,
+                    1,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
             },
             YU_STORAGE_OK
         );
@@ -8057,7 +7956,13 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(raw, 0, 1, 6, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    1,
+                    6,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
             },
             YU_STORAGE_OK
         );
@@ -8105,7 +8010,13 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                yu_storage_session_set_selection(raw, 0, 0, 5, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    0,
+                    5,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
             },
             YU_STORAGE_OK
         );

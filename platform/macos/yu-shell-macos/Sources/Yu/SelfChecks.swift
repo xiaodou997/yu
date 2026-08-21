@@ -307,7 +307,7 @@ func runDocumentInteractionSelfCheck(path: String) -> Never {
             let close = try bridge.requestClose()
             precondition(close.result == 1)
             precondition(close.close_state >= 3)
-            try bridge.cancelClose()
+            try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_CANCEL))
             precondition(bridge.state.closeState == 0)
 
             do {

@@ -501,13 +501,13 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         do {
             if response == .alertFirstButtonReturn {
                 if request.close_state >= 3 {
-                    try bridge.discardAndClose()
+                    try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_DISCARD))
                 } else {
-                    try bridge.saveAndClose()
+                    try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_SAVE))
                 }
                 return true
             }
-            try bridge.cancelClose()
+            try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_CANCEL))
             return false
         } catch {
             show(error)
