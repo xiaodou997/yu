@@ -687,60 +687,6 @@ final class MacosSurfaceHostCoordinator {
         }
     }
 
-    /// 扫描当前 viewport 的图片与嵌入资源，决定是否需要安排一次刷新。
-    ///
-    /// 这里不再做 retained coverage 判断：Rust surface 是唯一渲染路径，
-    /// 资源未就绪时由 Rust 绘制 placeholder，不存在回退 TextKit 的分支
-    /// （不变量 I5）。资源状态只影响「要不要再取一次」，不影响「谁来画」。
-    private func updateResourceRefreshState(
-        snapshot: NativeMacosRenderHostSurfaceSnapshot,
-        revision: UInt64,
-        size: Float,
-        maxWidth: Float,
-        scrollY: Float,
-        viewportHeight: Float
-    ) {
-        imageRefreshNeeded = false
-        guard snapshot.commandCount > 0 else { return }
-        do {
-            let (viewport, blocks) = try bridge.macosShapedViewportBlocks(
-                revision: revision,
-                size: size,
-                maxWidth: maxWidth,
-                scrollY: scrollY,
-                viewportHeight: viewportHeight
-            )
-            guard viewport.revision == revision else { return }
-            let visibleBlockIndexes = Set(blocks.map(\.blockIndex))
-            let images = try bridge.macosVisualImages(revision: revision)
-            for image in images where visibleBlockIndexes.contains(image.blockIndex) {
-                if retainedResourceNeedsRefresh(
-                    state: imageResourceCoverageState(image.resourceStatus),
-                    resourceFingerprint: image.resourceFingerprint
-                ) {
-                    imageRefreshNeeded = true
-                }
-            }
-            guard blocks.contains(where: {
-                $0.kind == UInt8(YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE)
-            }) else { return }
-            let embeddedResources = try bridge.macosVisualEmbeddedResources(
-                revision: revision
-            )
-            for resource in embeddedResources
-                where visibleBlockIndexes.contains(resource.blockIndex) {
-                if retainedResourceNeedsRefresh(
-                    state: embeddedResourceCoverageState(resource.resourceStatus),
-                    resourceFingerprint: resource.resourceFingerprint
-                ) {
-                    imageRefreshNeeded = true
-                }
-            }
-        } catch {
-            // 资源查询失败不影响绘制；下一帧会重试。
-        }
-    }
-
     /// 提交一帧。
     ///
     /// `force` 只为资源刷新轮询而存在：那条路径需要一次真实提交去收割
@@ -776,14 +722,10 @@ final class MacosSurfaceHostCoordinator {
         )
         isAttached = true
         lastSnapshot = snapshot
-        updateResourceRefreshState(
-            snapshot: snapshot,
-            revision: revision,
-            size: Float(geometry.size),
-            maxWidth: Float(geometry.maxWidth),
-            scrollY: Float(geometry.scrollY),
-            viewportHeight: Float(geometry.viewportHeight)
-        )
+        // 「还有资源没落定吗」由 Rust 在提交这一帧时一并回答。平台此前要为此
+        // 再查三次——可见 block、全部图片状态、全部内嵌资源状态——还得自己复制
+        // 一份状态码语义表（不变量 I3）。
+        imageRefreshNeeded = snapshot.resourceRefreshPending
         surfaceView.setNativeContentVisible(true)
         onSurfaceStateChange?()
         if imageRefreshNeeded {

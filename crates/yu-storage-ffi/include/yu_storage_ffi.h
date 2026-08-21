@@ -671,6 +671,10 @@ typedef struct YuStorageMacosRenderHostSnapshot {
     uint8_t published;
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
+    /* Non-zero when the visible range still has an image or embedded resource
+     * that has not settled. The platform schedules one more submit so Rust can
+     * drain its worker results; it does not classify resource states itself. */
+    uint8_t resource_refresh_pending;
 } YuStorageMacosRenderHostSnapshot;
 
 typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
@@ -696,6 +700,7 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint8_t submitted;
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
+    uint8_t resource_refresh_pending;
 } YuStorageMacosRenderHostSurfaceSnapshot;
 
 typedef struct YuStorageAccessibilitySnapshot {
