@@ -111,30 +111,6 @@ struct NativeProjectionCaret {
         affinity = value.affinity
     }
 }
-struct NativeProjectionSelection {
-    let revision: UInt64
-    let sourceRange: NSRange
-    let visualRange: NSRange
-    let roundTripSourceRange: NSRange
-    let affinity: UInt8
-
-    init(_ value: YuStorageProjectionSelection) {
-        revision = value.revision
-        sourceRange = NSRange(
-            location: Int(value.source_start_utf16),
-            length: Int(value.source_end_utf16 - value.source_start_utf16)
-        )
-        visualRange = NSRange(
-            location: Int(value.visual_start_utf16),
-            length: Int(value.visual_end_utf16 - value.visual_start_utf16)
-        )
-        roundTripSourceRange = NSRange(
-            location: Int(value.round_trip_source_start_utf16),
-            length: Int(value.round_trip_source_end_utf16 - value.round_trip_source_start_utf16)
-        )
-        affinity = value.affinity
-    }
-}
 struct NativeProjectionSourceSelection {
     let revision: UInt64
     let visualRange: NSRange
@@ -209,28 +185,6 @@ struct NativeTaskCheckboxHit: Equatable {
         )
     }
 }
-struct NativeProjectionBlock {
-    let revision: UInt64
-    let blockIndex: UInt64
-    let sourceRange: NSRange
-    let visualUTF8Length: Int
-    let visualUTF16Length: Int
-    let kind: UInt8
-    let projectionKind: UInt8
-
-    init(_ value: YuStorageProjectionBlock) {
-        revision = value.revision
-        blockIndex = value.block_index
-        sourceRange = NSRange(
-            location: Int(value.source_start_utf16),
-            length: Int(value.source_end_utf16 - value.source_start_utf16)
-        )
-        visualUTF8Length = Int(value.visual_utf8_length)
-        visualUTF16Length = Int(value.visual_utf16_length)
-        kind = value.kind
-        projectionKind = value.projection_kind
-    }
-}
 struct NativeTableResizeCommit: Equatable {
     let revision: UInt64
     let blockIndex: UInt64
@@ -298,38 +252,6 @@ struct NativeTableResizeAccessibilityDivider: Equatable {
         )
     }
 }
-struct NativeBlockLayout {
-    let revision: UInt64
-    let blockIndex: UInt64
-    let sourceRange: NSRange
-    let visualUTF16Length: Int
-    let lineCount: UInt64
-    let width: CGFloat
-    let height: CGFloat
-    let lineHeight: CGFloat
-    let defaultAdvance: CGFloat
-    let kind: UInt8
-    let projectionKind: UInt8
-    let shaped: Bool
-
-    init(_ value: YuStorageBlockLayout) {
-        revision = value.revision
-        blockIndex = value.block_index
-        sourceRange = NSRange(
-            location: Int(value.source_start_utf16),
-            length: Int(value.source_end_utf16 - value.source_start_utf16)
-        )
-        visualUTF16Length = Int(value.visual_utf16_length)
-        lineCount = value.line_count
-        width = CGFloat(value.width)
-        height = CGFloat(value.height)
-        lineHeight = CGFloat(value.line_height)
-        defaultAdvance = CGFloat(value.default_advance)
-        kind = value.kind
-        projectionKind = value.projection_kind
-        shaped = value.shaped != 0
-    }
-}
 struct NativeMacosFontMetrics {
     let revision: UInt64
     let size: CGFloat
@@ -366,78 +288,6 @@ struct NativeBlockCaret {
         height = CGFloat(value.caret_height)
         affinity = value.affinity
         shaped = value.shaped != 0
-    }
-}
-struct NativeShapedViewportBlock {
-    let revision: UInt64
-    let blockIndex: UInt64
-    let sourceRange: NSRange
-    let y: CGFloat
-    let height: CGFloat
-    let measured: Bool
-    let kind: UInt8
-
-    init(_ value: YuStorageShapedViewportBlock) {
-        revision = value.revision
-        blockIndex = value.block_index
-        sourceRange = NSRange(
-            location: Int(value.source_start_utf16),
-            length: Int(value.source_end_utf16 - value.source_start_utf16)
-        )
-        y = CGFloat(value.y)
-        height = CGFloat(value.height)
-        measured = value.measured != 0
-        kind = value.kind
-    }
-}
-struct NativeShapedViewportSnapshot {
-    let revision: UInt64
-    let blockRange: Range<UInt64>
-    let contentHeight: CGFloat
-    let scrollY: CGFloat
-    let viewportHeight: CGFloat
-    let maxScrollY: CGFloat
-
-    init(_ value: YuStorageShapedViewportSnapshot) {
-        revision = value.revision
-        blockRange = value.block_start..<value.block_end
-        contentHeight = CGFloat(value.content_height)
-        scrollY = CGFloat(value.scroll_y)
-        viewportHeight = CGFloat(value.viewport_height)
-        maxScrollY = CGFloat(value.max_scroll_y)
-    }
-}
-struct NativeVisualRenderPlanSnapshot {
-    let revision: UInt64
-    let compositionGeneration: UInt64
-    let blockRange: Range<UInt64>
-    let commandCount: Int
-    let uploadCount: Int
-    let damageCount: Int
-    let contentHeight: CGFloat
-    let scrollY: CGFloat
-    let viewportHeight: CGFloat
-    let maxScrollY: CGFloat
-    let viewportWidth: CGFloat
-    let embeddedCommandCount: Int
-    let embeddedUploadCount: Int
-    let embeddedUploadBytes: Int
-
-    init(_ value: YuStorageVisualRenderPlanSnapshot) {
-        revision = value.revision
-        compositionGeneration = value.composition_generation
-        blockRange = value.block_start..<value.block_end
-        commandCount = Int(value.command_count)
-        uploadCount = Int(value.upload_count)
-        damageCount = Int(value.damage_count)
-        contentHeight = CGFloat(value.content_height)
-        scrollY = CGFloat(value.scroll_y)
-        viewportHeight = CGFloat(value.viewport_height)
-        maxScrollY = CGFloat(value.max_scroll_y)
-        viewportWidth = CGFloat(value.viewport_width)
-        embeddedCommandCount = Int(value.embedded_command_count)
-        embeddedUploadCount = Int(value.embedded_upload_count)
-        embeddedUploadBytes = Int(value.embedded_upload_bytes)
     }
 }
 struct NativeMacosRenderHostSnapshot {
@@ -539,127 +389,6 @@ struct NativeMacosRenderHostSurfaceSnapshot {
         caretDecorationCount = Int(value.caret_decoration_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
         contentHeight = CGFloat(value.content_height)
-    }
-}
-struct NativeVisualRenderCommand {
-    let revision: UInt64
-    let blockIndex: UInt64
-    let sourceRange: NSRange
-    let kind: UInt8
-    let page: UInt32
-    let atlasRect: CGRect
-    let origin: CGPoint
-    let bearingX: CGFloat
-    let bearingY: CGFloat
-    let advanceX: CGFloat
-    let bounds: CGRect
-    let colorRGBA: UInt32
-    let resource: UInt64
-    let embeddedGeneration: UInt64
-    let embeddedKind: UInt8
-    let embeddedWidth: Int
-    let embeddedHeight: Int
-
-    init(_ value: YuStorageVisualRenderCommand) {
-        revision = value.revision
-        blockIndex = value.block_index
-        sourceRange = NSRange(
-            location: Int(value.source_start_utf16),
-            length: Int(value.source_end_utf16 - value.source_start_utf16)
-        )
-        kind = value.kind
-        page = value.page
-        atlasRect = CGRect(
-            x: CGFloat(value.atlas_x),
-            y: CGFloat(value.atlas_y),
-            width: CGFloat(value.atlas_width),
-            height: CGFloat(value.atlas_height)
-        )
-        origin = CGPoint(x: CGFloat(value.origin_x), y: CGFloat(value.origin_y))
-        bearingX = CGFloat(value.bearing_x)
-        bearingY = CGFloat(value.bearing_y)
-        advanceX = CGFloat(value.advance_x)
-        bounds = CGRect(
-            x: CGFloat(value.bounds_x),
-            y: CGFloat(value.bounds_y),
-            width: CGFloat(value.bounds_width),
-            height: CGFloat(value.bounds_height)
-        )
-        colorRGBA = value.color_rgba
-        resource = value.resource
-        embeddedGeneration = value.embedded_generation
-        embeddedKind = value.embedded_kind
-        embeddedWidth = Int(value.embedded_width)
-        embeddedHeight = Int(value.embedded_height)
-    }
-}
-struct NativeVisualRenderPage {
-    let revision: UInt64
-    let page: UInt32
-    let width: Int
-    let height: Int
-    let fingerprint: UInt64
-
-    init(_ value: YuStorageVisualRenderPage) {
-        revision = value.revision
-        page = value.page
-        width = Int(value.width)
-        height = Int(value.height)
-        fingerprint = value.fingerprint
-    }
-}
-struct NativeVisualRenderDamage {
-    let revision: UInt64
-    let rect: CGRect
-
-    init(_ value: YuStorageVisualRenderDamage) {
-        revision = value.revision
-        rect = CGRect(
-            x: CGFloat(value.x),
-            y: CGFloat(value.y),
-            width: CGFloat(value.width),
-            height: CGFloat(value.height)
-        )
-    }
-}
-struct NativeVisualViewport {
-    let revision: UInt64
-    let blockRange: Range<UInt64>
-    let contentHeight: CGFloat
-    let contentOriginY: CGFloat
-    let requestedScrollY: CGFloat
-    let viewportHeight: CGFloat
-    let maxScrollY: CGFloat
-
-    init(_ snapshot: NativeShapedViewportSnapshot, contentOriginY: CGFloat = 0.0) {
-        revision = snapshot.revision
-        blockRange = snapshot.blockRange
-        contentHeight = snapshot.contentHeight
-        self.contentOriginY = contentOriginY
-        requestedScrollY = snapshot.scrollY
-        viewportHeight = snapshot.viewportHeight
-        maxScrollY = snapshot.maxScrollY
-    }
-
-    /// Native scroll views clamp their content offset. Keeping the clamp in
-    /// this adapter makes document↔viewport conversion deterministic even if
-    /// a platform callback briefly reports an out-of-range offset.
-    var effectiveScrollY: CGFloat {
-        min(max(requestedScrollY, 0.0), maxScrollY)
-    }
-
-    func viewportPoint(forDocumentPoint point: NSPoint) -> NSPoint {
-        NSPoint(
-            x: point.x,
-            y: point.y - contentOriginY - effectiveScrollY
-        )
-    }
-
-    func documentPoint(forViewportPoint point: NSPoint) -> NSPoint {
-        NSPoint(
-            x: point.x,
-            y: point.y + contentOriginY + effectiveScrollY
-        )
     }
 }
 struct NativeCaretScrollRequest {
@@ -816,28 +545,6 @@ struct NativeCompositionProjection {
         projectedUTF8Length = Int(value.projected_utf8_length)
     }
 }
-struct NativeCompositionCaret {
-    let revision: UInt64
-    let generation: UInt64
-    let sourceUTF16: UInt64
-    let visualUTF16: UInt64
-    let roundTripSourceUTF16: UInt64
-    let visualSelection: NSRange
-    let affinity: UInt8
-
-    init(_ value: YuStorageCompositionCaret) {
-        revision = value.revision
-        generation = value.generation
-        sourceUTF16 = value.source_utf16
-        visualUTF16 = value.visual_utf16
-        roundTripSourceUTF16 = value.round_trip_source_utf16
-        visualSelection = NSRange(
-            location: Int(value.visual_selection_start_utf16),
-            length: Int(value.visual_selection_end_utf16 - value.visual_selection_start_utf16)
-        )
-        affinity = value.affinity
-    }
-}
 struct NativeCompositionShapedCaret {
     let revision: UInt64
     let generation: UInt64
@@ -862,39 +569,6 @@ struct NativeCompositionShapedCaret {
         lineIndex = value.line_index
         point = CGPoint(x: CGFloat(value.caret_x), y: CGFloat(value.caret_y))
         size = CGSize(width: CGFloat(value.caret_width), height: CGFloat(value.caret_height))
-        visualSelection = NSRange(
-            location: Int(value.visual_selection_start_utf16),
-            length: Int(value.visual_selection_end_utf16 - value.visual_selection_start_utf16)
-        )
-        visualReplacement = NSRange(
-            location: Int(value.visual_replacement_start_utf16),
-            length: Int(value.visual_replacement_end_utf16 - value.visual_replacement_start_utf16)
-        )
-        affinity = value.affinity
-    }
-}
-struct NativeCompositionProjectionHit {
-    let revision: UInt64
-    let generation: UInt64
-    let sourceUTF16: UInt64
-    let blockIndex: UInt64
-    let visualUTF16: UInt64
-    let roundTripSourceUTF16: UInt64
-    let line: UInt64
-    let point: CGPoint
-    let visualSelection: NSRange
-    let visualReplacement: NSRange
-    let affinity: UInt8
-
-    init(_ value: YuStorageCompositionProjectionHit) {
-        revision = value.revision
-        generation = value.generation
-        sourceUTF16 = value.source_utf16
-        blockIndex = value.block_index
-        visualUTF16 = value.visual_utf16
-        roundTripSourceUTF16 = value.round_trip_source_utf16
-        line = value.line
-        point = CGPoint(x: CGFloat(value.x), y: CGFloat(value.y))
         visualSelection = NSRange(
             location: Int(value.visual_selection_start_utf16),
             length: Int(value.visual_selection_end_utf16 - value.visual_selection_start_utf16)
@@ -1018,18 +692,6 @@ final class StorageBridge {
         }
     }
 
-    func projectedSource(revision: UInt64) throws -> String {
-        try copyBytesThrowing { output, capacity, written in
-            yu_storage_session_projected_source(
-                handle,
-                revision,
-                output,
-                capacity,
-                written
-            )
-        }
-    }
-
     func projectionCaret(
         revision: UInt64,
         sourceUTF16: UInt64,
@@ -1047,26 +709,6 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeProjectionCaret(value)
-    }
-
-    func projectionSelection(
-        revision: UInt64,
-        sourceRange: NSRange,
-        affinity: UInt8
-    ) throws -> NativeProjectionSelection {
-        var value = YuStorageProjectionSelection()
-        let status = yu_storage_session_projection_selection(
-            handle,
-            revision,
-            UInt64(sourceRange.location),
-            UInt64(sourceRange.location + sourceRange.length),
-            affinity,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeProjectionSelection(value)
     }
 
     func projectionSourceSelection(
@@ -1089,30 +731,6 @@ final class StorageBridge {
         return NativeProjectionSourceSelection(value)
     }
 
-    func projectionHitTest(
-        revision: UInt64,
-        point: CGPoint,
-        maxWidth: Float = 80.0,
-        lineHeight: Float = 1.0,
-        defaultAdvance: Float = 1.0
-    ) throws -> NativeProjectionHit {
-        var value = YuStorageProjectionHit()
-        let status = yu_storage_session_projection_hit_test(
-            handle,
-            revision,
-            Float(point.x),
-            Float(point.y),
-            maxWidth,
-            lineHeight,
-            defaultAdvance,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeProjectionHit(value)
-    }
-
     func macosProjectionHitTest(
         revision: UInt64,
         point: CGPoint,
@@ -1133,268 +751,6 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeProjectionHit(value)
-    }
-
-    func projectionBlockCount(revision: UInt64) throws -> Int {
-        var count = 0
-        let status = yu_storage_session_projection_block_count(handle, revision, &count)
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return count
-    }
-
-    func projectedBlock(
-        revision: UInt64,
-        blockIndex: UInt64
-    ) throws -> (NativeProjectionBlock, String) {
-        var metadata = YuStorageProjectionBlock()
-        var required = 0
-        let sizeStatus = yu_storage_session_projected_block(
-            handle,
-            revision,
-            blockIndex,
-            &metadata,
-            nil,
-            0,
-            &required
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        var bytes = Array(repeating: UInt8(0), count: required)
-        var written = required
-        let copyStatus = bytes.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_projected_block(
-                handle,
-                revision,
-                blockIndex,
-                &metadata,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
-        }
-        guard copyStatus == StorageStatus.ok, written >= 0, written <= bytes.count else {
-            throw BridgeError.operation(copyStatus)
-        }
-        return (
-            NativeProjectionBlock(metadata),
-            String(decoding: bytes.prefix(written), as: UTF8.self)
-        )
-    }
-
-    func projectedTableCells(
-        revision: UInt64,
-        blockIndex: UInt64
-    ) throws -> [YuStorageTableCellRange] {
-        var required = 0
-        let sizeStatus = yu_storage_session_projected_table_cells(
-            handle,
-            revision,
-            blockIndex,
-            nil,
-            0,
-            &required
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        var cells = Array(repeating: YuStorageTableCellRange(), count: required)
-        var written = required
-        let copyStatus = cells.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_projected_table_cells(
-                handle,
-                revision,
-                blockIndex,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
-        }
-        guard copyStatus == StorageStatus.ok, written >= 0, written <= cells.count else {
-            throw BridgeError.operation(copyStatus)
-        }
-        return Array(cells.prefix(written))
-    }
-
-    func tableLayoutCells(
-        revision: UInt64,
-        blockIndex: UInt64,
-        maxWidth: Float,
-        lineHeight: Float,
-        defaultAdvance: Float
-    ) throws -> [YuStorageTableLayoutCell] {
-        var required = 0
-        let sizeStatus = yu_storage_session_table_layout_cells(
-            handle,
-            revision,
-            blockIndex,
-            maxWidth,
-            lineHeight,
-            defaultAdvance,
-            nil,
-            0,
-            &required
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        var cells = Array(repeating: YuStorageTableLayoutCell(), count: required)
-        var written = required
-        let copyStatus = cells.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_table_layout_cells(
-                handle,
-                revision,
-                blockIndex,
-                maxWidth,
-                lineHeight,
-                defaultAdvance,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
-        }
-        guard copyStatus == StorageStatus.ok, written >= 0, written <= cells.count else {
-            throw BridgeError.operation(copyStatus)
-        }
-        return Array(cells.prefix(written))
-    }
-
-    func tableLayoutCellsWithResize(
-        revision: UInt64,
-        blockIndex: UInt64,
-        resizeKind: UInt8,
-        resizeIndex: UInt64,
-        resizeDelta: Float,
-        maxWidth: Float,
-        lineHeight: Float,
-        defaultAdvance: Float
-    ) throws -> [YuStorageTableLayoutCell] {
-        var required = 0
-        let sizeStatus = yu_storage_session_table_layout_cells_with_resize(
-            handle,
-            revision,
-            blockIndex,
-            maxWidth,
-            lineHeight,
-            defaultAdvance,
-            resizeKind,
-            resizeIndex,
-            resizeDelta,
-            nil,
-            0,
-            &required
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        var cells = Array(repeating: YuStorageTableLayoutCell(), count: required)
-        var written = required
-        let copyStatus = cells.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_table_layout_cells_with_resize(
-                handle,
-                revision,
-                blockIndex,
-                maxWidth,
-                lineHeight,
-                defaultAdvance,
-                resizeKind,
-                resizeIndex,
-                resizeDelta,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
-        }
-        guard copyStatus == StorageStatus.ok, written >= 0, written <= cells.count else {
-            throw BridgeError.operation(copyStatus)
-        }
-        return Array(cells.prefix(written))
-    }
-
-    func tableCellHitTest(
-        revision: UInt64,
-        blockIndex: UInt64,
-        point: CGPoint,
-        maxWidth: Float,
-        lineHeight: Float,
-        defaultAdvance: Float
-    ) throws -> YuStorageTableCellHit {
-        var value = YuStorageTableCellHit()
-        let status = yu_storage_session_table_cell_hit_test(
-            handle,
-            revision,
-            blockIndex,
-            maxWidth,
-            lineHeight,
-            defaultAdvance,
-            Float(point.x),
-            Float(point.y),
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return value
-    }
-
-    func tableResizeHitTest(
-        revision: UInt64,
-        blockIndex: UInt64,
-        point: CGPoint,
-        tolerance: Float,
-        maxWidth: Float,
-        lineHeight: Float,
-        defaultAdvance: Float
-    ) throws -> YuStorageTableResizeHit {
-        var value = YuStorageTableResizeHit()
-        let status = yu_storage_session_table_resize_hit_test(
-            handle,
-            revision,
-            blockIndex,
-            maxWidth,
-            lineHeight,
-            defaultAdvance,
-            Float(point.x),
-            Float(point.y),
-            tolerance,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return value
-    }
-
-    func tableResizeBegin(
-        revision: UInt64,
-        blockIndex: UInt64,
-        point: CGPoint,
-        tolerance: Float,
-        pointerPosition: Float,
-        maxWidth: Float,
-        lineHeight: Float,
-        defaultAdvance: Float
-    ) throws -> YuStorageTableResizeHit {
-        var value = YuStorageTableResizeHit()
-        let status = yu_storage_session_table_resize_begin(
-            handle,
-            revision,
-            blockIndex,
-            maxWidth,
-            lineHeight,
-            defaultAdvance,
-            Float(point.x),
-            Float(point.y),
-            tolerance,
-            pointerPosition,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return value
     }
 
     func macosTableResizeHitTestAtDocumentPoint(
@@ -1486,50 +842,6 @@ final class StorageBridge {
         return NativeTableResizeCommit(value)
     }
 
-    func blockLayout(
-        revision: UInt64,
-        blockIndex: UInt64,
-        maxWidth: Float,
-        lineHeight: Float,
-        defaultAdvance: Float
-    ) throws -> NativeBlockLayout {
-        var value = YuStorageBlockLayout()
-        let status = yu_storage_session_block_layout(
-            handle,
-            revision,
-            blockIndex,
-            maxWidth,
-            lineHeight,
-            defaultAdvance,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeBlockLayout(value)
-    }
-
-    func macosBlockLayout(
-        revision: UInt64,
-        blockIndex: UInt64,
-        size: Float,
-        maxWidth: Float
-    ) throws -> NativeBlockLayout {
-        var value = YuStorageBlockLayout()
-        let status = yu_storage_session_macos_block_layout(
-            handle,
-            revision,
-            blockIndex,
-            size,
-            maxWidth,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeBlockLayout(value)
-    }
-
     func macosFontMetrics(
         revision: UInt64,
         size: Float,
@@ -1547,31 +859,6 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeMacosFontMetrics(value)
-    }
-
-    func macosBlockCaret(
-        revision: UInt64,
-        blockIndex: UInt64,
-        sourceUTF16: UInt64,
-        affinity: UInt8,
-        size: Float,
-        maxWidth: Float
-    ) throws -> NativeBlockCaret {
-        var value = YuStorageBlockCaret()
-        let status = yu_storage_session_macos_block_caret(
-            handle,
-            revision,
-            blockIndex,
-            sourceUTF16,
-            affinity,
-            size,
-            maxWidth,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeBlockCaret(value)
     }
 
     /// 不需要调用方指定 block 的 caret 几何查询。平台不解析 Markdown，
@@ -1597,55 +884,6 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeBlockCaret(value)
-    }
-
-    func macosShapedViewportBlocks(
-        revision: UInt64,
-        size: Float,
-        maxWidth: Float,
-        scrollY: Float,
-        viewportHeight: Float
-    ) throws -> (NativeShapedViewportSnapshot, [NativeShapedViewportBlock]) {
-        var snapshot = YuStorageShapedViewportSnapshot()
-        var required = 0
-        let sizeStatus = yu_storage_session_macos_shaped_viewport_blocks(
-            handle,
-            revision,
-            size,
-            maxWidth,
-            scrollY,
-            viewportHeight,
-            &snapshot,
-            nil,
-            0,
-            &required
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        var values = Array(repeating: YuStorageShapedViewportBlock(), count: required)
-        var written = required
-        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_macos_shaped_viewport_blocks(
-                handle,
-                revision,
-                size,
-                maxWidth,
-                scrollY,
-                viewportHeight,
-                &snapshot,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
-        }
-        guard fillStatus == StorageStatus.ok, written == required else {
-            throw BridgeError.operation(fillStatus)
-        }
-        return (
-            NativeShapedViewportSnapshot(snapshot),
-            values.map(NativeShapedViewportBlock.init)
-        )
     }
 
     func macosTableResizeAccessibilityDividers(
@@ -1696,99 +934,6 @@ final class StorageBridge {
 
 
 
-
-    func macosVisualRenderPlan(
-        revision: UInt64,
-        size: Float,
-        maxWidth: Float,
-        scrollY: Float,
-        viewportHeight: Float
-    ) throws -> (
-        NativeVisualRenderPlanSnapshot,
-        [NativeVisualRenderCommand],
-        [NativeVisualRenderPage],
-        [NativeVisualRenderDamage]
-    ) {
-        var snapshot = YuStorageVisualRenderPlanSnapshot()
-        var commandRequired = 0
-        var pageRequired = 0
-        var damageRequired = 0
-        let sizeStatus = yu_storage_session_macos_visual_render_plan(
-            handle,
-            revision,
-            size,
-            maxWidth,
-            scrollY,
-            viewportHeight,
-            &snapshot,
-            nil,
-            0,
-            nil,
-            0,
-            nil,
-            0,
-            &commandRequired,
-            &pageRequired,
-            &damageRequired
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        precondition(snapshot.command_count == UInt64(commandRequired))
-        precondition(snapshot.upload_count == UInt64(pageRequired))
-        precondition(snapshot.damage_count == UInt64(damageRequired))
-        var commandValues = Array(
-            repeating: YuStorageVisualRenderCommand(),
-            count: commandRequired
-        )
-        var pageValues = Array(
-            repeating: YuStorageVisualRenderPage(),
-            count: pageRequired
-        )
-        var damageValues = Array(
-            repeating: YuStorageVisualRenderDamage(),
-            count: damageRequired
-        )
-        var writtenCommands = commandRequired
-        var writtenPages = pageRequired
-        var writtenDamage = damageRequired
-        let fillStatus = commandValues.withUnsafeMutableBufferPointer { commandBuffer in
-            pageValues.withUnsafeMutableBufferPointer { pageBuffer in
-                damageValues.withUnsafeMutableBufferPointer { damageBuffer in
-                    yu_storage_session_macos_visual_render_plan(
-                        handle,
-                        revision,
-                        size,
-                        maxWidth,
-                        scrollY,
-                        viewportHeight,
-                        &snapshot,
-                        commandBuffer.baseAddress,
-                        commandBuffer.count,
-                        pageBuffer.baseAddress,
-                        pageBuffer.count,
-                        damageBuffer.baseAddress,
-                        damageBuffer.count,
-                        &writtenCommands,
-                        &writtenPages,
-                        &writtenDamage
-                    )
-                }
-            }
-        }
-        guard fillStatus == StorageStatus.ok,
-              writtenCommands == commandRequired,
-              writtenPages == pageRequired,
-              writtenDamage == damageRequired else {
-            throw BridgeError.operation(fillStatus)
-        }
-        return (
-            NativeVisualRenderPlanSnapshot(snapshot),
-            commandValues.map(NativeVisualRenderCommand.init),
-            pageValues.map(NativeVisualRenderPage.init),
-            damageValues.map(NativeVisualRenderDamage.init)
-        )
-    }
 
     func macosRenderHostFrame(
         revision: UInt64,
@@ -2196,43 +1341,6 @@ final class StorageBridge {
         return NativeCompositionProjection(value)
     }
 
-    func copyCompositionProjection(
-        revision: UInt64,
-        generation: UInt64
-    ) throws -> String {
-        try copyBytesThrowing { output, capacity, written in
-            yu_storage_session_copy_composition_projection(
-                handle,
-                revision,
-                generation,
-                output,
-                capacity,
-                written
-            )
-        }
-    }
-
-    func compositionCaret(
-        revision: UInt64,
-        generation: UInt64,
-        sourceUTF16: UInt64,
-        affinity: UInt8
-    ) throws -> NativeCompositionCaret {
-        var value = YuStorageCompositionCaret()
-        let status = yu_storage_session_composition_caret(
-            handle,
-            revision,
-            generation,
-            sourceUTF16,
-            affinity,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeCompositionCaret(value)
-    }
-
     func macosCompositionShapedCaret(
         revision: UInt64,
         generation: UInt64,
@@ -2256,30 +1364,6 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeCompositionShapedCaret(value)
-    }
-
-    func macosCompositionProjectionHitTest(
-        revision: UInt64,
-        generation: UInt64,
-        point: CGPoint,
-        size: Float,
-        maxWidth: Float
-    ) throws -> NativeCompositionProjectionHit {
-        var value = YuStorageCompositionProjectionHit()
-        let status = yu_storage_session_macos_composition_projection_hit_test(
-            handle,
-            revision,
-            generation,
-            Float(point.x),
-            Float(point.y),
-            size,
-            maxWidth,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeCompositionProjectionHit(value)
     }
 
     func copySourceRange(_ range: NSRange, revision: UInt64) -> String {

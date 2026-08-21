@@ -39,21 +39,14 @@ fi
 # 否则 precondition 会以「缺少某某 block」失败，看起来像回归。
 typeset -A checks=(
     accessibility                       Fixtures/block-projection.md
-    block-layout                        Fixtures/block-projection.md
-    block-projection                    Fixtures/block-projection.md
     clipboard                           Fixtures/block-projection.md
-    composition-hit-test                Fixtures/composition-cross-block.md
-    composition-projection              Fixtures/block-projection.md
     document-interaction                Fixtures/composition-cross-block.md
     document-workflow                   Fixtures/render-surface.md
     macos-table-resize-coordinator      Fixtures/block-projection.md
     macos-task-checkbox                 Fixtures/render-tasks.md
-    projection                          Fixtures/block-projection.md
-    projection-hit-test                 Fixtures/block-projection.md
     selection                           Fixtures/sample.md
     shaped-projection-hit-test          Fixtures/block-projection.md
     shaped-vertical                     Fixtures/block-projection.md
-    shaped-viewport                     Fixtures/block-projection.md
     undo                                Fixtures/block-projection.md
 )
 

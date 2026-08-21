@@ -17,19 +17,17 @@ use std::ptr;
 use std::collections::{BTreeMap, HashSet};
 
 use yu_assets::ImageKey;
-use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
+use yu_core::{LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
-    AccessibilityTextSnapshot, BlockKind, BlockProjection, BlockProjectionKind, CaretAffinity,
-    CaretScrollRequest, CommandResult, EditorCommand, EditorDocumentError, ImageSource,
-    LayoutConfig, LayoutPoint, LayoutSnapshot, Projection, ProjectionBias, SelectionError,
-    SourceSync, TableAlignment, TableCellLayout, TableLayoutHit, TableResizeCommit,
-    TableResizeGesture, TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig,
-    ViewportRect, VisualOffset, VisualRunKind,
+    AccessibilityTextSnapshot, BlockProjection, CaretAffinity, CaretScrollRequest, CommandResult,
+    EditorCommand, EditorDocumentError, ImageSource, LayoutConfig, LayoutPoint, LayoutSnapshot,
+    Projection, ProjectionBias, SelectionError, SourceSync, TableResizeCommit, TableResizeGesture,
+    TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig, ViewportRect,
+    VisualOffset, VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
-use yu_markdown::TableCellRange;
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, DiskState, DocumentEditorSession, ExternalFileState,
     SaveOutcome, StorageError, Utf8Bom,
@@ -37,29 +35,23 @@ use yu_storage::{
 use yu_text::{EditError, TextSnapshot};
 
 #[cfg(target_os = "macos")]
-use yu_render::{RenderCommand, RenderPlanBuilder};
-#[cfg(target_os = "macos")]
 use yu_scene::{EditorDecorationPrimitiveRole, Point, Primitive, Rect, Rgba8};
 #[cfg(target_os = "macos")]
-use yu_workspace::{
-    EditorDecorationStyle, ViewportRenderConfig,
-    assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded,
-    viewport_block_background,
-};
+use yu_workspace::{EditorDecorationStyle, ViewportRenderConfig};
 
 #[cfg(target_os = "macos")]
 use yu_assets::{
-    EmbeddedFailureKind, EmbeddedRenderPublication, EmbeddedRenderRequest, EmbeddedRenderer,
-    EmbeddedRequestResult, EmbeddedResourceCache, EmbeddedResourceKind, ImageCache,
-    ImageFailureKind, ImageIntrinsicPublication, ImagePublication, ImageRequest,
-    ImageRequestCandidate, ImageRequestPlan, ImageRequestPriority, ImageRequestResult,
+    EmbeddedFailureKind, EmbeddedRenderRequest, EmbeddedRenderer, EmbeddedRequestResult,
+    EmbeddedResourceCache, EmbeddedResourceKind, ImageCache, ImageFailureKind,
+    ImageIntrinsicPublication, ImagePublication, ImageRequest, ImageRequestCandidate,
+    ImageRequestPlan, ImageRequestPriority, ImageRequestResult,
 };
 #[cfg(target_os = "macos")]
 use yu_embedded_math::MathRenderer;
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
 #[cfg(target_os = "macos")]
-use yu_font::{GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer};
+use yu_font::GlyphAtlasConfig;
 #[cfg(target_os = "macos")]
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
 #[cfg(all(target_os = "macos", test))]
@@ -241,24 +233,6 @@ pub struct YuStorageProjectionCaret {
     pub affinity: u8,
 }
 
-/// Revision-bound source selection projected into visual UTF-16 coordinates.
-/// Non-collapsed selections map their source start/end with the outer
-/// projection boundaries, so hidden Markdown delimiters are not accidentally
-/// reintroduced into the visual range. Collapsed selections retain the caller
-/// affinity and should be handled as a caret by native hosts.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageProjectionSelection {
-    pub revision: u64,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-    pub visual_start_utf16: u64,
-    pub visual_end_utf16: u64,
-    pub round_trip_source_start_utf16: u64,
-    pub round_trip_source_end_utf16: u64,
-    pub affinity: u8,
-}
-
 /// Revision-bound reverse selection mapping for a native visual mirror.
 /// Non-collapsed visual boundaries use the outer source projection edges so
 /// hidden Markdown delimiters remain part of the canonical source selection.
@@ -319,22 +293,6 @@ pub struct YuStorageCompositionProjection {
     pub visual_replacement_end_utf16: u64,
 }
 
-/// Revision- and composition-generation-bound caret mapping for the active
-/// marked-text projection. `visual_utf16` and the visual selection are owned
-/// projected-stream coordinates; source remains canonical UTF-16.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageCompositionCaret {
-    pub revision: u64,
-    pub generation: u64,
-    pub source_utf16: u64,
-    pub visual_utf16: u64,
-    pub round_trip_source_utf16: u64,
-    pub visual_selection_start_utf16: u64,
-    pub visual_selection_end_utf16: u64,
-    pub affinity: u8,
-}
-
 /// Revision- and composition-generation-bound CoreText-shaped caret geometry
 /// for the active marked-text projection. Coordinates are local to the
 /// parser-owned block; visual UTF-16 ranges remain in the full projected
@@ -359,95 +317,6 @@ pub struct YuStorageCompositionShapedCaret {
     pub visual_replacement_start_utf16: u64,
     pub visual_replacement_end_utf16: u64,
     pub affinity: u8,
-}
-
-/// Revision- and composition-generation-bound CoreText-shaped point hit-test
-/// for the transient marked-text projection. Coordinates are document-space;
-/// source and visual offsets are mapped through the same full transient
-/// projection, so a native host never has to reconstruct preedit offsets.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageCompositionProjectionHit {
-    pub revision: u64,
-    pub generation: u64,
-    pub source_utf16: u64,
-    pub block_index: u64,
-    pub visual_utf16: u64,
-    pub round_trip_source_utf16: u64,
-    pub line: u64,
-    pub x: f32,
-    pub y: f32,
-    pub visual_selection_start_utf16: u64,
-    pub visual_selection_end_utf16: u64,
-    pub visual_replacement_start_utf16: u64,
-    pub visual_replacement_end_utf16: u64,
-    pub affinity: u8,
-}
-
-/// Revision-bound metadata for one parser-owned block projection. The visual
-/// bytes are returned by the companion query; lengths are included here so a
-/// native host can validate its allocation and its UTF-16 layout without
-/// reparsing Markdown.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageProjectionBlock {
-    pub revision: u64,
-    pub block_index: u64,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-    pub visual_utf8_length: u64,
-    pub visual_utf16_length: u64,
-    pub kind: u8,
-    pub projection_kind: u8,
-}
-
-/// One parser-owned GFM table cell range. `row = 0` is the header, `row = 1`
-/// is the delimiter row, and body rows start at `row = 2`. All offsets are
-/// UTF-16 positions in the revision supplied to the query.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageTableCellRange {
-    pub row: u64,
-    pub column: u64,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-}
-
-/// Revision-bound geometry for one visible source-backed table cell. `row = 0`
-/// is the header and body rows start at `row = 1`; the Markdown delimiter row
-/// is intentionally absent from this visible layout list.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageTableLayoutCell {
-    pub revision: u64,
-    pub block_index: u64,
-    pub row: u64,
-    pub column: u64,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-    pub alignment: u8,
-}
-
-/// Revision-bound hit-test result for a visible table cell. The point supplied
-/// by the native caller remains in its local table coordinate system; the
-/// result returns the hit cell's bounds and source range.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageTableCellHit {
-    pub revision: u64,
-    pub block_index: u64,
-    pub row: u64,
-    pub column: u64,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
 }
 
 /// One task checkbox hit from the currently published macOS retained frame.
@@ -516,27 +385,6 @@ pub struct YuStorageTableResizeCommit {
     pub delta: f32,
 }
 
-/// Revision-bound layout metadata for one parser-owned block. `width` and
-/// `height` are local layout points; `shaped` distinguishes deterministic
-/// metrics from macOS CoreText output.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageBlockLayout {
-    pub revision: u64,
-    pub block_index: u64,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-    pub visual_utf16_length: u64,
-    pub line_count: u64,
-    pub width: f32,
-    pub height: f32,
-    pub line_height: f32,
-    pub default_advance: f32,
-    pub kind: u8,
-    pub projection_kind: u8,
-    pub shaped: u8,
-}
-
 /// Revision-bound CoreText metrics for configuring an empty or non-empty
 /// viewport. This is intentionally independent of parser block metadata so a
 /// native host can initialize a surface before the Markdown document has a
@@ -567,38 +415,6 @@ pub struct YuStorageBlockCaret {
     pub caret_height: f32,
     pub affinity: u8,
     pub shaped: u8,
-}
-
-/// Revision-bound metadata for one block returned by a shaped viewport query.
-/// `y` and `height` are document-space points; source ranges are UTF-16 units.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageShapedViewportBlock {
-    pub revision: u64,
-    pub block_index: u64,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-    pub y: f32,
-    pub height: f32,
-    pub measured: u8,
-    pub kind: u8,
-}
-
-/// Owned metadata for one shaped viewport snapshot. Blocks are returned via
-/// the count/fill ABI and never retain Rust references across the boundary.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageShapedViewportSnapshot {
-    pub revision: u64,
-    pub block_start: u64,
-    pub block_end: u64,
-    pub content_height: f32,
-    /// Document-space viewport inputs used for this snapshot. `scroll_y` is
-    /// the requested native scroll offset; callers clamp it to `max_scroll_y`
-    /// when converting viewport-local points back to document coordinates.
-    pub scroll_y: f32,
-    pub viewport_height: f32,
-    pub max_scroll_y: f32,
 }
 
 /// Revision-bound shaped caret geometry and the absolute document scroll
@@ -639,95 +455,6 @@ pub const YU_STORAGE_EMBEDDED_RESOURCE_FAILED: u8 = 3;
 pub const YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED: u8 = 4;
 pub const YU_STORAGE_EMBEDDED_MATH: u8 = 0;
 pub const YU_STORAGE_EMBEDDED_MERMAID: u8 = 1;
-
-/// Owned metadata for one backend-neutral render-plan publication. Atlas
-/// pixels remain an owned Rust-side upload payload; this ABI exposes their
-/// page identity/fingerprint so native diagnostics can validate publication
-/// without retaining Rust allocations.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageVisualRenderPlanSnapshot {
-    pub revision: u64,
-    /// Monotonic transient IME identity captured with this count/fill
-    /// publication. Native callers must use the same value for both calls.
-    pub composition_generation: u64,
-    pub block_start: u64,
-    pub block_end: u64,
-    pub command_count: u64,
-    pub upload_count: u64,
-    pub damage_count: u64,
-    pub content_height: f32,
-    pub scroll_y: f32,
-    pub viewport_height: f32,
-    pub max_scroll_y: f32,
-    pub viewport_width: f32,
-    /// Appended diagnostics for the embedded SVG scene/render boundary.
-    pub embedded_command_count: u64,
-    pub embedded_upload_count: u64,
-    pub embedded_upload_bytes: u64,
-}
-
-/// One owned render command. Glyph atlas placement, baseline origin, metrics,
-/// source block range and command bounds are copied from the Rust
-/// `RenderPlan`; solid block fills use the same bounds/color fields and set
-/// atlas values to their zero/none defaults. No scene or atlas reference
-/// crosses the ABI.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageVisualRenderCommand {
-    pub revision: u64,
-    pub block_index: u64,
-    pub source_start_utf16: u64,
-    pub source_end_utf16: u64,
-    pub kind: u8,
-    pub page: u32,
-    pub atlas_x: u32,
-    pub atlas_y: u32,
-    pub atlas_width: u32,
-    pub atlas_height: u32,
-    pub origin_x: f32,
-    pub origin_y: f32,
-    pub bearing_x: f32,
-    pub bearing_y: f32,
-    pub advance_x: f32,
-    pub bounds_x: f32,
-    pub bounds_y: f32,
-    pub bounds_width: f32,
-    pub bounds_height: f32,
-    pub color_rgba: u32,
-    pub resource: u64,
-    /// Appended embedded-resource identity and intrinsic dimensions. Existing
-    /// native callers can ignore these fields; a future SVG backend can use
-    /// them to match a render-plan upload to its command.
-    pub embedded_generation: u64,
-    pub embedded_kind: u8,
-    pub embedded_width: u32,
-    pub embedded_height: u32,
-}
-
-/// One owned atlas-page publication record. The corresponding alpha bytes are
-/// retained only by Rust's `RenderPlan`/renderer pipeline for this diagnostic
-/// call; the fingerprint makes page deduplication observable at the boundary.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageVisualRenderPage {
-    pub revision: u64,
-    pub page: u32,
-    pub width: u32,
-    pub height: u32,
-    pub fingerprint: u64,
-}
-
-/// One owned damage rectangle from the same render plan publication.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct YuStorageVisualRenderDamage {
-    pub revision: u64,
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
 
 /// Revision-bound state published by the persistent macOS render host. This
 /// is a scalar lifecycle contract: command/page bytes remain owned by Rust's
@@ -949,11 +676,13 @@ impl MacosEmbeddedResourceState {
         ))
     }
 
+    /// 只有测试用到：断言默认 Math 渲染器确实产出可光栅化的 SVG。
+    #[cfg(test)]
     fn publication_for(
         &mut self,
         request: EmbeddedRenderRequest,
         revision: Revision,
-    ) -> Result<Option<EmbeddedRenderPublication>, i32> {
+    ) -> Result<Option<yu_assets::EmbeddedRenderPublication>, i32> {
         match self.request_result(request, revision)? {
             EmbeddedRequestResult::Ready(publication) => Ok(Some(publication)),
             EmbeddedRequestResult::Pending | EmbeddedRequestResult::Failed(_) => Ok(None),
@@ -1390,28 +1119,6 @@ fn validate_composition(
     }
     if session.composition().is_none() {
         return Err(YU_STORAGE_NO_OVERLAY);
-    }
-    Ok(())
-}
-
-/// Validates the header returned by a count query before a native caller
-/// performs the matching fill query.  Revision alone is insufficient while
-/// marked text is active because composition updates deliberately keep the
-/// canonical Revision unchanged.  The first count query passes a zeroed
-/// header; only a non-zero array capacity is a fill operation that must match
-/// the prior header identity.
-#[cfg(target_os = "macos")]
-fn validate_visual_fill_identity(
-    session: &DocumentEditorSession,
-    expected_revision: u64,
-    prior_revision: u64,
-    prior_generation: u64,
-) -> Result<(), i32> {
-    if prior_revision != expected_revision {
-        return Err(YU_STORAGE_STALE_REVISION);
-    }
-    if prior_generation != session.composition_generation() {
-        return Err(YU_STORAGE_STALE_COMPOSITION);
     }
     Ok(())
 }
@@ -1897,84 +1604,6 @@ fn affinity_to_ffi(affinity: CaretAffinity) -> u8 {
     }
 }
 
-fn projection_kind_tag(projection: &BlockProjection) -> u8 {
-    match projection.kind() {
-        BlockProjectionKind::Inline => YU_STORAGE_PROJECTION_INLINE,
-        BlockProjectionKind::Heading => YU_STORAGE_PROJECTION_HEADING,
-        BlockProjectionKind::BlockQuote => YU_STORAGE_PROJECTION_BLOCK_QUOTE,
-        BlockProjectionKind::List => YU_STORAGE_PROJECTION_LIST,
-        BlockProjectionKind::Table => YU_STORAGE_PROJECTION_TABLE,
-        BlockProjectionKind::FencedCode => YU_STORAGE_PROJECTION_FENCED_CODE,
-        BlockProjectionKind::ReferenceDefinition => YU_STORAGE_PROJECTION_REFERENCE_DEFINITION,
-        BlockProjectionKind::TaskList => YU_STORAGE_PROJECTION_TASK_LIST,
-    }
-}
-
-fn table_cell_metadata(
-    snapshot: &TextSnapshot,
-    row: usize,
-    column: usize,
-    cell: TableCellRange,
-) -> Result<YuStorageTableCellRange, i32> {
-    let start = ByteOffset::try_from(cell.start()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-    let end = ByteOffset::try_from(cell.end()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-    let source_start_utf16 = snapshot
-        .utf16_offset(start)
-        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-        .get();
-    let source_end_utf16 = snapshot
-        .utf16_offset(end)
-        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-        .get();
-    Ok(YuStorageTableCellRange {
-        row: u64::try_from(row).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        column: u64::try_from(column).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        source_start_utf16,
-        source_end_utf16,
-    })
-}
-
-fn table_cell_ranges(
-    snapshot: &TextSnapshot,
-    projection: &BlockProjection,
-) -> Result<Vec<YuStorageTableCellRange>, i32> {
-    let BlockProjection::Table(table) = projection else {
-        return Err(YU_STORAGE_INVALID_SELECTION);
-    };
-    let metadata = table.table();
-    let capacity = metadata
-        .header()
-        .len()
-        .saturating_mul(metadata.rows().len().saturating_add(2));
-    let mut encoded = Vec::with_capacity(capacity);
-    for (column, cell) in metadata.header().iter().copied().enumerate() {
-        encoded.push(table_cell_metadata(snapshot, 0, column, cell)?);
-    }
-    for (column, cell) in metadata.delimiter().iter().copied().enumerate() {
-        encoded.push(table_cell_metadata(snapshot, 1, column, cell)?);
-    }
-    for (body_index, row) in metadata.rows().iter().enumerate() {
-        for (column, cell) in row.iter().copied().enumerate() {
-            encoded.push(table_cell_metadata(
-                snapshot,
-                body_index.saturating_add(2),
-                column,
-                cell,
-            )?);
-        }
-    }
-    Ok(encoded)
-}
-
-fn table_alignment_tag(alignment: TableAlignment) -> u8 {
-    match alignment {
-        TableAlignment::Default => YU_STORAGE_TABLE_ALIGNMENT_DEFAULT,
-        TableAlignment::Left => YU_STORAGE_TABLE_ALIGNMENT_LEFT,
-        TableAlignment::Center => YU_STORAGE_TABLE_ALIGNMENT_CENTER,
-        TableAlignment::Right => YU_STORAGE_TABLE_ALIGNMENT_RIGHT,
-    }
-}
-
 fn table_source_utf16_range(snapshot: &TextSnapshot, source: TextRange) -> Result<(u64, u64), i32> {
     let start = snapshot
         .utf16_offset(source.start())
@@ -1985,63 +1614,6 @@ fn table_source_utf16_range(snapshot: &TextSnapshot, source: TextRange) -> Resul
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
         .get();
     Ok((start, end))
-}
-
-fn table_layout_cell_metadata(
-    snapshot: &TextSnapshot,
-    revision: u64,
-    block_index: u64,
-    cell: TableCellLayout,
-) -> Result<YuStorageTableLayoutCell, i32> {
-    let (source_start_utf16, source_end_utf16) = table_source_utf16_range(snapshot, cell.source())?;
-    Ok(YuStorageTableLayoutCell {
-        revision,
-        block_index,
-        row: u64::try_from(cell.row()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        column: u64::try_from(cell.column()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        source_start_utf16,
-        source_end_utf16,
-        x: cell.bounds().x(),
-        y: cell.bounds().y(),
-        width: cell.bounds().width(),
-        height: cell.bounds().height(),
-        alignment: table_alignment_tag(cell.alignment()),
-    })
-}
-
-fn table_layout_cells_metadata(
-    snapshot: &TextSnapshot,
-    revision: u64,
-    block_index: u64,
-    table: &yu_editor::TableLayoutSnapshot,
-) -> Result<Vec<YuStorageTableLayoutCell>, i32> {
-    table
-        .cells()
-        .iter()
-        .copied()
-        .map(|cell| table_layout_cell_metadata(snapshot, revision, block_index, cell))
-        .collect()
-}
-
-fn table_layout_hit_metadata(
-    snapshot: &TextSnapshot,
-    revision: u64,
-    block_index: u64,
-    hit: TableLayoutHit,
-) -> Result<YuStorageTableCellHit, i32> {
-    let (source_start_utf16, source_end_utf16) = table_source_utf16_range(snapshot, hit.source())?;
-    Ok(YuStorageTableCellHit {
-        revision,
-        block_index,
-        row: u64::try_from(hit.row()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        column: u64::try_from(hit.column()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        source_start_utf16,
-        source_end_utf16,
-        x: hit.bounds().x(),
-        y: hit.bounds().y(),
-        width: hit.bounds().width(),
-        height: hit.bounds().height(),
-    })
 }
 
 fn table_resize_hit_metadata(
@@ -2172,72 +1744,6 @@ fn begin_table_resize_session(
     session.table_resize_override = Some(gesture.preview());
     session.table_resize_gesture = Some(gesture);
     Ok(metadata)
-}
-
-fn viewport_block_kind(kind: BlockKind) -> u8 {
-    kind.viewport_tag()
-}
-
-fn block_layout_metadata(
-    session: &mut DocumentEditorSession,
-    block_index: usize,
-    layout: &LayoutSnapshot,
-    line_height: f32,
-    default_advance: f32,
-    shaped: u8,
-) -> Result<YuStorageBlockLayout, i32> {
-    if layout.revision() != session.revision() {
-        return Err(YU_STORAGE_STALE_REVISION);
-    }
-    let Some((source_range, kind)) = session.block_metadata(block_index) else {
-        return Err(YU_STORAGE_INVALID_SELECTION);
-    };
-    let projection = session
-        .block_projection(block_index)
-        .map_err(storage_status)?;
-    let projected = projected_utf8(layout.projection())?;
-    let visual_utf16_length = visual_utf16_offset(&projected, layout.visual_len())?;
-    let line_count = u64::try_from(layout.lines().len())
-        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-        .max(1);
-    let width = layout
-        .lines()
-        .iter()
-        .map(|line| line.width())
-        .fold(0.0_f32, f32::max);
-    let height = line_height * line_count as f32;
-    if !width.is_finite()
-        || !height.is_finite()
-        || !line_height.is_finite()
-        || line_height <= 0.0
-        || !default_advance.is_finite()
-        || default_advance <= 0.0
-    {
-        return Err(YU_STORAGE_EDITOR_ERROR);
-    }
-    Ok(YuStorageBlockLayout {
-        revision: session.revision().get(),
-        block_index: u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        source_start_utf16: session
-            .snapshot()
-            .utf16_offset(source_range.start())
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-            .get(),
-        source_end_utf16: session
-            .snapshot()
-            .utf16_offset(source_range.end())
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-            .get(),
-        visual_utf16_length,
-        line_count,
-        width,
-        height,
-        line_height,
-        default_advance,
-        kind,
-        projection_kind: projection_kind_tag(&projection),
-        shaped,
-    })
 }
 
 fn block_caret_from_layout(
@@ -3097,41 +2603,6 @@ pub unsafe extern "C" fn yu_storage_session_copy_source(
     write_bytes(source.as_str().as_bytes(), output, capacity, written)
 }
 
-/// Returns the current revision's source-backed inline projection as UTF-8.
-/// Hidden Markdown delimiter runs are omitted; visible text and parser-owned
-/// line-break runs retain their source order. The projection is built through
-/// the editor cache owned by this same session and is never treated as
-/// canonical source.
-///
-/// # Safety
-/// `session` must be a live handle. `expected_revision` must match the current
-/// session revision. `written` must be writable; `output` must provide
-/// `capacity` writable bytes when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_projected_source(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    output: *mut u8,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let projection = match session.session.inline_projection_for_visual_state() {
-        Ok(projection) => projection,
-        Err(error) => return storage_status(error),
-    };
-    let projected = match projected_utf8(&projection) {
-        Ok(projected) => projected,
-        Err(status) => return status,
-    };
-    write_bytes(projected.as_bytes(), output, capacity, written)
-}
-
 /// Maps one canonical source caret through the current inline projection.
 /// `visual_utf16` and `round_trip_source_utf16` are both bound to
 /// `expected_revision`; hidden delimiter affinity is controlled by the same
@@ -3201,111 +2672,6 @@ pub unsafe extern "C" fn yu_storage_session_projection_caret(
                 CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
                 CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
             },
-        };
-    }
-    YU_STORAGE_OK
-}
-
-/// Maps a canonical source selection through the current inline projection.
-/// Non-collapsed ranges use `Before` for the start and `After` for the end so
-/// hidden Markdown delimiters do not become visual selection content. A
-/// collapsed range is a caret and keeps the requested affinity.
-///
-/// # Safety
-/// `session` must be a live handle and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_projection_selection(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    source_start_utf16: u64,
-    source_end_utf16: u64,
-    affinity: u8,
-    output: *mut YuStorageProjectionSelection,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageProjectionSelection::default() };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let affinity = match caret_affinity_from_ffi(affinity) {
-        Ok(affinity) => affinity,
-        Err(status) => return status,
-    };
-    if source_start_utf16 > source_end_utf16 {
-        return YU_STORAGE_INVALID_SELECTION;
-    }
-    let snapshot = session.session.snapshot();
-    let source_start = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_start_utf16)) {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let source_end = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_end_utf16)) {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let projection = match session.session.inline_projection_for_visual_state() {
-        Ok(projection) => projection,
-        Err(error) => return storage_status(error),
-    };
-    let (start_bias, end_bias) = if source_start_utf16 == source_end_utf16 {
-        let bias = projection_bias_from_affinity(affinity);
-        (bias, bias)
-    } else {
-        (ProjectionBias::Before, ProjectionBias::After)
-    };
-    let visual_start = match projection.source_to_visual(source_start, start_bias) {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let visual_end = match projection.source_to_visual(source_end, end_bias) {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let round_trip_start = match projection.visual_to_source(visual_start, start_bias) {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let round_trip_end = match projection.visual_to_source(visual_end, end_bias) {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let projected = match projected_utf8(&projection) {
-        Ok(projected) => projected,
-        Err(status) => return status,
-    };
-    let visual_start_utf16 = match visual_utf16_offset(&projected, visual_start) {
-        Ok(offset) => offset,
-        Err(status) => return status,
-    };
-    let visual_end_utf16 = match visual_utf16_offset(&projected, visual_end) {
-        Ok(offset) => offset,
-        Err(status) => return status,
-    };
-    let round_trip_source_start_utf16 = match snapshot.utf16_offset(round_trip_start) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let round_trip_source_end_utf16 = match snapshot.utf16_offset(round_trip_end) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe {
-        *output = YuStorageProjectionSelection {
-            revision: session.session.revision().get(),
-            source_start_utf16,
-            source_end_utf16,
-            visual_start_utf16,
-            visual_end_utf16,
-            round_trip_source_start_utf16,
-            round_trip_source_end_utf16,
-            affinity: affinity_to_ffi(affinity),
         };
     }
     YU_STORAGE_OK
@@ -3422,94 +2788,6 @@ pub unsafe extern "C" fn yu_storage_session_projection_source_selection(
             round_trip_visual_start_utf16,
             round_trip_visual_end_utf16,
             affinity: affinity_to_ffi(affinity),
-        };
-    }
-    YU_STORAGE_OK
-}
-
-/// Resolves a projection-local point through the current full-source metrics
-/// projection. The layout configuration is explicit in the ABI so the native
-/// host cannot silently apply a second wrapping/line-height policy. Returned
-/// coordinates are snapped caret coordinates in the same layout space.
-///
-/// # Safety
-/// `session` must be a live handle and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    point_x: f32,
-    point_y: f32,
-    max_width: f32,
-    line_height: f32,
-    default_advance: f32,
-    output: *mut YuStorageProjectionHit,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageProjectionHit::default() };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
-    let layout = match session.session.inline_layout(config) {
-        Ok(layout) => layout,
-        Err(error) => return storage_status(error),
-    };
-    let hit = match layout.hit_test(LayoutPoint::new(point_x, point_y)) {
-        Ok(hit) => hit,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let snapshot = session.session.snapshot();
-    let projected = match projected_utf8(layout.projection()) {
-        Ok(projected) => projected,
-        Err(status) => return status,
-    };
-    let visual_utf16 = match visual_utf16_offset(&projected, hit.visual()) {
-        Ok(offset) => offset,
-        Err(status) => return status,
-    };
-    let round_trip_source = match layout
-        .projection()
-        .visual_to_source(hit.visual(), hit.bias())
-    {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let source_utf16 = match snapshot.utf16_offset(hit.source()) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip_source) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let (image_source_start_utf16, image_source_end_utf16) =
-        match image_utf16_range(&snapshot, hit.image()) {
-            Ok(range) => range,
-            Err(status) => return status,
-        };
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe {
-        *output = YuStorageProjectionHit {
-            revision: session.session.revision().get(),
-            source_utf16,
-            visual_utf16,
-            round_trip_source_utf16,
-            image_source_start_utf16,
-            image_source_end_utf16,
-            line: hit.line() as u64,
-            x: hit.point().x(),
-            y: hit.point().y(),
-            affinity: affinity_to_ffi(match hit.bias() {
-                ProjectionBias::Before => CaretAffinity::Upstream,
-                ProjectionBias::After => CaretAffinity::Downstream,
-            }),
         };
     }
     YU_STORAGE_OK
@@ -3688,206 +2966,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
     }
 }
 
-/// Resolves a document-space point through the current CoreText-shaped
-/// transient composition layout. Unlike the canonical projection hit-test,
-/// this endpoint is bound to both the source Revision and the composition
-/// generation, and maps the hit through the full transient projection.
-/// `x`/`y` are document-space coordinates and the returned visual ranges are
-/// UTF-16 offsets in that same transient projected stream.
-///
-/// # Safety
-/// `session` must be a live handle and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_composition_projection_hit_test(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    expected_generation: u64,
-    point_x: f32,
-    point_y: f32,
-    size: f32,
-    max_width: f32,
-    output: *mut YuStorageCompositionProjectionHit,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageCompositionProjectionHit::default() };
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (
-            session,
-            expected_revision,
-            expected_generation,
-            point_x,
-            point_y,
-            size,
-            max_width,
-        );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Err(status) =
-            validate_composition(&session.session, expected_revision, expected_generation)
-        {
-            return status;
-        }
-        if !point_x.is_finite()
-            || !point_y.is_finite()
-            || !size.is_finite()
-            || size <= 0.0
-            || !max_width.is_finite()
-            || max_width <= 0.0
-        {
-            return YU_STORAGE_EDITOR_ERROR;
-        }
-        let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
-            Ok(layout) => layout,
-            Err(status) => return status,
-        };
-        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
-            return status;
-        }
-
-        let query_y = point_y.max(0.0);
-        let viewport = ViewportRect::new(query_y, metrics.line_height());
-        let viewport_snapshot = {
-            let document = session.session.document_mut().editor_mut();
-            match document.visible_blocks_with_composition_and_shaper(viewport, &shaper) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return status_from_editor_error(error),
-            }
-        };
-        let mut selected = None;
-        let mut best_distance = f32::INFINITY;
-        for block in viewport_snapshot.blocks() {
-            let top = block.y();
-            let bottom = top + block.height();
-            let distance = if query_y < top {
-                top - query_y
-            } else if query_y > bottom {
-                query_y - bottom
-            } else {
-                0.0
-            };
-            if distance < best_distance {
-                best_distance = distance;
-                selected = Some(*block);
-            }
-        }
-        let Some(block) = selected else {
-            return YU_STORAGE_INVALID_SELECTION;
-        };
-        let layout = {
-            let document = session.session.document_mut().editor_mut();
-            let composition_blocks = document.composition_block_range();
-            if composition_blocks
-                .as_ref()
-                .is_some_and(|span| span.contains(&block.index()))
-            {
-                document
-                    .block_layout_with_composition_and_shaper(block.index(), layout_config, &shaper)
-                    .map_err(status_from_editor_error)
-            } else {
-                document
-                    .block_layout_with_shaper(block.index(), layout_config, &shaper)
-                    .cloned()
-                    .map_err(status_from_editor_error)
-            }
-        };
-        let layout = match layout {
-            Ok(layout) => layout,
-            Err(status) => return status,
-        };
-        if layout.lines().is_empty() {
-            return YU_STORAGE_INVALID_SELECTION;
-        }
-        let local_y = (query_y - block.y()).max(0.0);
-        let hit = match layout.hit_test(LayoutPoint::new(point_x, local_y)) {
-            Ok(hit) => hit,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        let projection = match composition_projection(&mut session.session) {
-            Ok(projection) => projection,
-            Err(status) => return status,
-        };
-        let visual = match projection.source_to_visual(hit.source(), hit.bias()) {
-            Ok(visual) => visual,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        let projected = match projected_utf8(&projection) {
-            Ok(projected) => projected,
-            Err(status) => return status,
-        };
-        let visual_utf16 = match visual_utf16_offset(&projected, visual) {
-            Ok(offset) => offset,
-            Err(status) => return status,
-        };
-        let round_trip_source = match projection.visual_to_source(visual, hit.bias()) {
-            Ok(offset) => offset,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        let source = session.session.snapshot();
-        let source_utf16 = match source.utf16_offset(hit.source()) {
-            Ok(offset) => offset.get(),
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        let round_trip_source_utf16 = match source.utf16_offset(round_trip_source) {
-            Ok(offset) => offset.get(),
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        let (visual_selection_start_utf16, visual_selection_end_utf16) =
-            match composition_visual_selection_utf16(&projection, &projected) {
-                Ok(selection) => selection,
-                Err(status) => return status,
-            };
-        let (visual_replacement_start_utf16, visual_replacement_end_utf16) =
-            match composition_visual_replacement_utf16(&projection, &projected) {
-                Ok(replacement) => replacement,
-                Err(status) => return status,
-            };
-        let point = hit.point();
-        let document_y = block.y() + point.y();
-        if !point.x().is_finite() || !document_y.is_finite() {
-            return YU_STORAGE_EDITOR_ERROR;
-        }
-        let line_base = (block.y() / metrics.line_height()).floor().max(0.0) as u64;
-        let block_index = match u64::try_from(block.index()) {
-            Ok(index) => index,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        // SAFETY: output was checked for null and belongs to the caller.
-        unsafe {
-            *output = YuStorageCompositionProjectionHit {
-                revision: session.session.revision().get(),
-                generation: session.session.composition_generation(),
-                source_utf16,
-                block_index,
-                visual_utf16,
-                round_trip_source_utf16,
-                line: line_base.saturating_add(hit.line() as u64),
-                x: point.x(),
-                y: document_y,
-                visual_selection_start_utf16,
-                visual_selection_end_utf16,
-                visual_replacement_start_utf16,
-                visual_replacement_end_utf16,
-                affinity: affinity_to_ffi(match hit.bias() {
-                    ProjectionBias::Before => CaretAffinity::Upstream,
-                    ProjectionBias::After => CaretAffinity::Downstream,
-                }),
-            };
-        }
-        YU_STORAGE_OK
-    }
-}
-
 /// Returns metadata for the active transient composition projection. The
 /// canonical source Revision is guarded by `expected_revision`; the returned
 /// generation must be supplied to later count/fill and caret queries.
@@ -3917,134 +2995,6 @@ pub unsafe extern "C" fn yu_storage_session_composition_projection(
     };
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = metadata };
-    YU_STORAGE_OK
-}
-
-/// Copies the current transient projected UTF-8 stream using the same
-/// two-call count/fill contract as source snapshots. Both canonical Revision
-/// and transient composition generation are validated before projection work.
-///
-/// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable bytes when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_copy_composition_projection(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    expected_generation: u64,
-    output: *mut u8,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if let Err(status) =
-        validate_composition(&session.session, expected_revision, expected_generation)
-    {
-        return status;
-    }
-    let (_, projected) = match composition_projection_metadata(&mut session.session) {
-        Ok(value) => value,
-        Err(status) => return status,
-    };
-    write_bytes(projected.as_bytes(), output, capacity, written)
-}
-
-/// Resolves the active marked-text caret through the transient projection.
-/// The input source boundary is validated against canonical source; the
-/// visual caret is the active end of the preedit selection, matching AppKit's
-/// marked-text insertion point. Both visual selection and round-trip source
-/// are returned in owned UTF-16/scalar form.
-///
-/// # Safety
-/// `session` must be a live handle and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_composition_caret(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    expected_generation: u64,
-    source_utf16: u64,
-    affinity: u8,
-    output: *mut YuStorageCompositionCaret,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageCompositionCaret::default() };
-    if let Err(status) =
-        validate_composition(&session.session, expected_revision, expected_generation)
-    {
-        return status;
-    }
-    let affinity = match caret_affinity_from_ffi(affinity) {
-        Ok(affinity) => affinity,
-        Err(status) => return status,
-    };
-    let snapshot = session.session.snapshot();
-    if snapshot
-        .byte_offset_for_utf16(Utf16Offset::new(source_utf16))
-        .is_err()
-    {
-        return YU_STORAGE_INVALID_SELECTION;
-    }
-    let projection = match composition_projection(&mut session.session) {
-        Ok(projection) => projection,
-        Err(status) => return status,
-    };
-    let overlay = match session.session.composition() {
-        Some(overlay) => overlay,
-        None => return YU_STORAGE_NO_OVERLAY,
-    };
-    let (active_visual, active_bias) = match composition_active_visual_caret(
-        &projection,
-        overlay.selection_utf16().start().get(),
-        overlay.selection_utf16().end().get(),
-    ) {
-        Ok(caret) => caret,
-        Err(status) => return status,
-    };
-    let projected = match projected_utf8(&projection) {
-        Ok(projected) => projected,
-        Err(status) => return status,
-    };
-    let visual_utf16 = match visual_utf16_offset(&projected, active_visual) {
-        Ok(offset) => offset,
-        Err(status) => return status,
-    };
-    let round_trip = match projection.visual_to_source(active_visual, active_bias) {
-        Ok(offset) => offset,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let round_trip_source_utf16 = match snapshot.utf16_offset(round_trip) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let (visual_selection_start_utf16, visual_selection_end_utf16) =
-        match composition_visual_selection_utf16(&projection, &projected) {
-            Ok(selection) => selection,
-            Err(status) => return status,
-        };
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe {
-        *output = YuStorageCompositionCaret {
-            revision: snapshot.revision().get(),
-            generation: session.session.composition_generation(),
-            source_utf16,
-            visual_utf16,
-            round_trip_source_utf16,
-            visual_selection_start_utf16,
-            visual_selection_end_utf16,
-            affinity: match affinity {
-                CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-            },
-        };
-    }
     YU_STORAGE_OK
 }
 
@@ -4239,523 +3189,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_composition_shaped_caret(
         }
         YU_STORAGE_OK
     }
-}
-
-/// Returns the number of parser-owned blocks in the expected source revision.
-/// Block indices are revision-bound and must be queried again after an edit.
-///
-/// # Safety
-/// `session` and `output` must be valid pointers for the duration of this
-/// synchronous call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_projection_block_count(
-    session: *const YuStorageSession,
-    expected_revision: u64,
-    output: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    // SAFETY: `output` was checked above and belongs to the caller.
-    unsafe { *output = session.session.block_count() };
-    YU_STORAGE_OK
-}
-
-/// Returns one parser-owned block projection as owned UTF-8 plus revision,
-/// source-range, kind and visual-length metadata. The null/zero-capacity
-/// output form is a safe length query and still fills `metadata`.
-///
-/// # Safety
-/// `session` must be a live handle. `metadata` and `written` must be writable;
-/// `output` must provide `capacity` writable bytes when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_projected_block(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    metadata: *mut YuStorageProjectionBlock,
-    output: *mut u8,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if metadata.is_null() || written.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) => index,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let Some((source_range, kind)) = session.session.block_metadata(block_index) else {
-        return YU_STORAGE_INVALID_SELECTION;
-    };
-    let projection = match session.session.block_projection(block_index) {
-        Ok(projection) => projection,
-        Err(error) => return storage_status(error),
-    };
-    let projected = match projected_utf8(projection.visual()) {
-        Ok(projected) => projected,
-        Err(status) => return status,
-    };
-    let snapshot = session.session.snapshot();
-    let source_start_utf16 = match snapshot.utf16_offset(source_range.start()) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let source_end_utf16 = match snapshot.utf16_offset(source_range.end()) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let block_index = match u64::try_from(block_index) {
-        Ok(index) => index,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let visual_utf8_length = match u64::try_from(projected.len()) {
-        Ok(length) => length,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let visual_utf16_length = match u64::try_from(projected.encode_utf16().count()) {
-        Ok(length) => length,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    // SAFETY: `metadata` was checked above and belongs to the caller. No
-    // metadata is written until every revision/range/projection conversion
-    // has succeeded.
-    unsafe {
-        *metadata = YuStorageProjectionBlock {
-            revision: session.session.revision().get(),
-            block_index,
-            source_start_utf16,
-            source_end_utf16,
-            visual_utf8_length,
-            visual_utf16_length,
-            kind,
-            projection_kind: projection_kind_tag(&projection),
-        };
-    }
-    write_bytes(projected.as_bytes(), output, capacity, written)
-}
-
-/// Returns parser-owned GFM table cell ranges for one projected block.
-///
-/// The count/fill convention mirrors the other native array queries: callers
-/// may pass a null output with zero capacity to learn the required cell count.
-/// `row = 0` is the header, `row = 1` is the delimiter row, and body rows start
-/// at `row = 2`. Cell text is never copied across the ABI.
-///
-/// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable entries when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_projected_table_cells(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    output: *mut YuStorageTableCellRange,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if written.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if capacity > 0 && output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) => index,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let projection = match session.session.block_projection(block_index) {
-        Ok(projection) => projection,
-        Err(error) => return storage_status(error),
-    };
-    let encoded = match table_cell_ranges(&session.session.snapshot(), &projection) {
-        Ok(encoded) => encoded,
-        Err(status) => return status,
-    };
-    // SAFETY: `written` is checked above and belongs to the caller.
-    unsafe { *written = encoded.len() };
-    if encoded.is_empty() {
-        return YU_STORAGE_OK;
-    }
-    if capacity == 0 && output.is_null() {
-        return YU_STORAGE_OK;
-    }
-    if capacity < encoded.len() {
-        return YU_STORAGE_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: the caller supplied at least `encoded.len()` writable entries.
-    unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
-    YU_STORAGE_OK
-}
-
-/// Returns source-backed visible table cell geometry for one parser-owned
-/// block. The Markdown delimiter row is intentionally omitted from the
-/// returned list, while its source range remains available to the projection
-/// and layout layers. The count/fill convention mirrors the other native array
-/// queries.
-///
-/// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable entries when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_table_layout_cells(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    max_width: f32,
-    line_height: f32,
-    default_advance: f32,
-    output: *mut YuStorageTableLayoutCell,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if written.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if capacity > 0 && output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: `written` was checked for null and belongs to the caller.
-    unsafe { *written = 0 };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) if index < session.session.block_count() => index,
-        _ => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
-    let layout = match session.session.block_layout(block_index, config) {
-        Ok(layout) => layout,
-        Err(error) => return storage_status(error),
-    };
-    let Some(table) = layout.table() else {
-        return YU_STORAGE_INVALID_SELECTION;
-    };
-    let snapshot = session.session.snapshot();
-    let block_index = match u64::try_from(block_index) {
-        Ok(block_index) => block_index,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let encoded = match table_layout_cells_metadata(
-        &snapshot,
-        session.session.revision().get(),
-        block_index,
-        table,
-    ) {
-        Ok(encoded) => encoded,
-        Err(status) => return status,
-    };
-    // SAFETY: `written` was checked above and belongs to the caller.
-    unsafe { *written = encoded.len() };
-    if encoded.is_empty() {
-        return YU_STORAGE_OK;
-    }
-    if capacity == 0 && output.is_null() {
-        return YU_STORAGE_OK;
-    }
-    if capacity < encoded.len() {
-        return YU_STORAGE_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: the caller supplied at least `encoded.len()` writable entries.
-    unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
-    YU_STORAGE_OK
-}
-
-/// Returns visible table cell geometry with a session-only column override.
-/// The override is applied to an owned transient layout snapshot for this
-/// call; it never changes Markdown source, selection, history or the
-/// editor-owned layout cache. Only `YU_STORAGE_TABLE_RESIZE_COLUMN` is
-/// supported in this first geometry bridge; row-height persistence remains a
-/// later variable-row layout concern.
-///
-/// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable entries when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_table_layout_cells_with_resize(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    max_width: f32,
-    line_height: f32,
-    default_advance: f32,
-    resize_kind: u8,
-    resize_index: u64,
-    resize_delta: f32,
-    output: *mut YuStorageTableLayoutCell,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if written.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if capacity > 0 && output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: `written` was checked above and belongs to the caller.
-    unsafe { *written = 0 };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    if resize_kind != YU_STORAGE_TABLE_RESIZE_COLUMN {
-        return YU_STORAGE_INVALID_SELECTION;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) if index < session.session.block_count() => index,
-        _ => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let resize_index = match usize::try_from(resize_index) {
-        Ok(index) => index,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
-    let mut layout = match session.session.block_layout(block_index, config) {
-        Ok(layout) => layout,
-        Err(error) => return storage_status(error),
-    };
-    if layout
-        .apply_table_column_resize(resize_index, resize_delta)
-        .is_err()
-    {
-        return YU_STORAGE_INVALID_SELECTION;
-    }
-    let Some(table) = layout.table() else {
-        return YU_STORAGE_INVALID_SELECTION;
-    };
-    let snapshot = session.session.snapshot();
-    let block_index = match u64::try_from(block_index) {
-        Ok(block_index) => block_index,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let encoded = match table_layout_cells_metadata(
-        &snapshot,
-        session.session.revision().get(),
-        block_index,
-        table,
-    ) {
-        Ok(encoded) => encoded,
-        Err(status) => return status,
-    };
-    // SAFETY: `written` was checked above and belongs to the caller.
-    unsafe { *written = encoded.len() };
-    if encoded.is_empty() {
-        return YU_STORAGE_OK;
-    }
-    if capacity == 0 && output.is_null() {
-        return YU_STORAGE_OK;
-    }
-    if capacity < encoded.len() {
-        return YU_STORAGE_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: the caller supplied at least `encoded.len()` writable entries.
-    unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), output, encoded.len()) };
-    YU_STORAGE_OK
-}
-
-/// Resolves a local table point to the visible source-backed cell containing
-/// it. Points outside the table return `YU_STORAGE_INVALID_SELECTION`.
-///
-/// # Safety
-/// `session` and `output` must be live/writable pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_table_cell_hit_test(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    max_width: f32,
-    line_height: f32,
-    default_advance: f32,
-    point_x: f32,
-    point_y: f32,
-    output: *mut YuStorageTableCellHit,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: `output` was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageTableCellHit::default() };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) if index < session.session.block_count() => index,
-        _ => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
-    let layout = match session.session.block_layout(block_index, config) {
-        Ok(layout) => layout,
-        Err(error) => return storage_status(error),
-    };
-    let Some(table) = layout.table() else {
-        return YU_STORAGE_INVALID_SELECTION;
-    };
-    let hit = match table.hit_test(LayoutPoint::new(point_x, point_y)) {
-        Ok(Some(hit)) => hit,
-        Ok(None) => return YU_STORAGE_INVALID_SELECTION,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let snapshot = session.session.snapshot();
-    let metadata = match table_layout_hit_metadata(
-        &snapshot,
-        session.session.revision().get(),
-        match u64::try_from(block_index) {
-            Ok(block_index) => block_index,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        },
-        hit,
-    ) {
-        Ok(metadata) => metadata,
-        Err(status) => return status,
-    };
-    // SAFETY: `output` was checked for null and belongs to the caller.
-    unsafe { *output = metadata };
-    YU_STORAGE_OK
-}
-
-/// Resolves a local table point to an internal column or row divider. Outer
-/// table edges are not resize targets. The result is Revision-bound and does
-/// not mutate source, selection or layout state.
-///
-/// # Safety
-/// `session` and `output` must be live/writable pointers.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_table_resize_hit_test(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    max_width: f32,
-    line_height: f32,
-    default_advance: f32,
-    point_x: f32,
-    point_y: f32,
-    tolerance: f32,
-    output: *mut YuStorageTableResizeHit,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: `output` was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageTableResizeHit::default() };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) if index < session.session.block_count() => index,
-        _ => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
-    let layout = match session.session.block_layout(block_index, config) {
-        Ok(layout) => layout,
-        Err(error) => return storage_status(error),
-    };
-    let Some(table) = layout.table() else {
-        return YU_STORAGE_INVALID_SELECTION;
-    };
-    let hit = match table.resize_hit_test(LayoutPoint::new(point_x, point_y), tolerance) {
-        Ok(Some(hit)) => hit,
-        Ok(None) => return YU_STORAGE_INVALID_SELECTION,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let block_index = match u64::try_from(block_index) {
-        Ok(block_index) => block_index,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let metadata =
-        match table_resize_hit_metadata(session.session.revision().get(), block_index, hit) {
-            Ok(metadata) => metadata,
-            Err(status) => return status,
-        };
-    // SAFETY: `output` was checked for null and belongs to the caller.
-    unsafe { *output = metadata };
-    YU_STORAGE_OK
-}
-
-/// Starts one Revision-bound native table resize gesture. The hit result is
-/// copied to `output`, while the actual gesture remains Rust-owned on the
-/// session until update, finish or cancel. The initial preview is transient
-/// and does not mutate Markdown source or the canonical layout cache.
-///
-/// # Safety
-/// `session` must be live and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_table_resize_begin(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    max_width: f32,
-    line_height: f32,
-    default_advance: f32,
-    point_x: f32,
-    point_y: f32,
-    tolerance: f32,
-    pointer_position: f32,
-    output: *mut YuStorageTableResizeHit,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageTableResizeHit::default() };
-    if let Err(status) = validate_table_resize_revision(session, expected_revision) {
-        return status;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) if index < session.session.block_count() => index,
-        _ => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
-    let layout = match session.session.block_layout(block_index, config) {
-        Ok(layout) => layout,
-        Err(error) => return storage_status(error),
-    };
-    let Some(table) = layout.table() else {
-        return YU_STORAGE_INVALID_SELECTION;
-    };
-    let hit = match table.resize_hit_test(LayoutPoint::new(point_x, point_y), tolerance) {
-        Ok(Some(hit)) => hit,
-        Ok(None) | Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let metadata = match begin_table_resize_session(session, block_index, hit, pointer_position) {
-        Ok(metadata) => metadata,
-        Err(status) => return status,
-    };
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = metadata };
-    YU_STORAGE_OK
 }
 
 #[cfg(target_os = "macos")]
@@ -5136,58 +3569,6 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_action(
     YU_STORAGE_OK
 }
 
-/// Returns revision-bound metrics layout metadata for one parser-owned block.
-/// The block remains owned by the Rust editor; only source ranges, visual
-/// length and measured scalar geometry cross the ABI.
-///
-/// # Safety
-/// `session` must be live and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_block_layout(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    max_width: f32,
-    line_height: f32,
-    default_advance: f32,
-    output: *mut YuStorageBlockLayout,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageBlockLayout::default() };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let block_index = match usize::try_from(block_index) {
-        Ok(index) if index < session.session.block_count() => index,
-        _ => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let config = LayoutConfig::new(max_width, line_height).with_default_advance(default_advance);
-    let layout = match session.session.block_layout(block_index, config) {
-        Ok(layout) => layout,
-        Err(error) => return storage_status(error),
-    };
-    let metadata = match block_layout_metadata(
-        &mut session.session,
-        block_index,
-        &layout,
-        line_height,
-        default_advance,
-        0,
-    ) {
-        Ok(metadata) => metadata,
-        Err(status) => return status,
-    };
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = metadata };
-    YU_STORAGE_OK
-}
-
 /// Returns revision-bound CoreText metrics without requiring a parser-owned
 /// block. Native hosts use this to configure the viewport for an empty
 /// document before requesting a render-host frame.
@@ -5236,138 +3617,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_font_metrics(
             };
         }
         YU_STORAGE_OK
-    }
-}
-
-/// Returns one block's layout using the macOS System UI CoreText shaper. On
-/// non-macOS targets the stable symbol returns `CORE_TEXT_UNAVAILABLE` after
-/// clearing output.
-///
-/// # Safety
-/// `session` must be live and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_block_layout(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    size: f32,
-    max_width: f32,
-    output: *mut YuStorageBlockLayout,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageBlockLayout::default() };
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (session, expected_revision, block_index, size, max_width);
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Err(status) = validate_revision(&session.session, expected_revision) {
-            return status;
-        }
-        let block_index = match usize::try_from(block_index) {
-            Ok(index) if index < session.session.block_count() => index,
-            _ => return YU_STORAGE_INVALID_SELECTION,
-        };
-        let (shaper, metrics, config) = match core_text_system_ui_layout(size, max_width) {
-            Ok(layout) => layout,
-            Err(status) => return status,
-        };
-        let layout = match session
-            .session
-            .block_layout_with_shaper(block_index, config, &shaper)
-        {
-            Ok(layout) => layout,
-            Err(error) => return storage_status(error),
-        };
-        let metadata = match block_layout_metadata(
-            &mut session.session,
-            block_index,
-            &layout,
-            metrics.line_height(),
-            metrics.default_advance(),
-            1,
-        ) {
-            Ok(metadata) => metadata,
-            Err(status) => return status,
-        };
-        // SAFETY: output was checked for null and belongs to the caller.
-        unsafe { *output = metadata };
-        YU_STORAGE_OK
-    }
-}
-
-/// Resolves a source caret through one block's CoreText-shaped layout. The
-/// result is block-local and source-backed; no CoreText object crosses the
-/// boundary. Non-macOS targets return `CORE_TEXT_UNAVAILABLE`.
-///
-/// # Safety
-/// `session` must be live and `output` must be writable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_block_caret(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    block_index: u64,
-    source_utf16: u64,
-    affinity: u8,
-    size: f32,
-    max_width: f32,
-    output: *mut YuStorageBlockCaret,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if output.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = YuStorageBlockCaret::default() };
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (
-            session,
-            expected_revision,
-            block_index,
-            source_utf16,
-            affinity,
-            size,
-            max_width,
-        );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let block_index = match usize::try_from(block_index) {
-            Ok(index) => index,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        match macos_shaped_caret(
-            session,
-            expected_revision,
-            Some(block_index),
-            source_utf16,
-            affinity,
-            size,
-            max_width,
-        ) {
-            // SAFETY: output was checked for null and belongs to the caller.
-            Ok(caret) => unsafe {
-                *output = caret;
-                YU_STORAGE_OK
-            },
-            Err(status) => status,
-        }
     }
 }
 
@@ -5477,145 +3726,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_source_caret(
             YU_STORAGE_OK
         },
         Err(status) => status,
-    }
-}
-
-/// Returns the current macOS CoreText-shaped viewport block metadata using a
-/// count/fill ABI. The first call may pass `capacity = 0` and a null `blocks`
-/// pointer to learn the required count. The snapshot header is written on
-/// both calls; block output is never partially written when capacity is too
-/// small. Non-macOS targets return `CORE_TEXT_UNAVAILABLE` after clearing
-/// output.
-///
-/// # Safety
-/// `session` must be null or a live handle. `snapshot` and `written` must
-/// point to writable values. `blocks` must point to `capacity` writable values
-/// when `capacity > 0`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_shaped_viewport_blocks(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    size: f32,
-    max_width: f32,
-    scroll_y: f32,
-    viewport_height: f32,
-    snapshot: *mut YuStorageShapedViewportSnapshot,
-    blocks: *mut YuStorageShapedViewportBlock,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if snapshot.is_null() || written.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if capacity > 0 && blocks.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: output pointers were checked for null and belong to the caller.
-    unsafe {
-        *snapshot = YuStorageShapedViewportSnapshot::default();
-        *written = 0;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (
-            session,
-            expected_revision,
-            size,
-            max_width,
-            scroll_y,
-            viewport_height,
-            blocks,
-            capacity,
-        );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Err(status) = validate_revision(&session.session, expected_revision) {
-            return status;
-        }
-        if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
-            return YU_STORAGE_EDITOR_ERROR;
-        }
-        let (shaper, metrics, _layout_config) = match core_text_system_ui_layout(size, max_width) {
-            Ok(layout) => layout,
-            Err(status) => return status,
-        };
-        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
-            return status;
-        }
-        let viewport = ViewportRect::new(scroll_y, viewport_height);
-        let viewport_snapshot = {
-            let document = session.session.document_mut().editor_mut();
-            match document.visible_blocks_with_visual_state_and_shaper(viewport, &shaper) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return status_from_editor_error(error),
-            }
-        };
-        let source = session.session.snapshot();
-        let mut encoded = Vec::with_capacity(viewport_snapshot.blocks().len());
-        for block in viewport_snapshot.blocks() {
-            let source_start_utf16 = match source.utf16_offset(block.source().start()) {
-                Ok(offset) => offset.get(),
-                Err(_) => return YU_STORAGE_INVALID_SELECTION,
-            };
-            let source_end_utf16 = match source.utf16_offset(block.source().end()) {
-                Ok(offset) => offset.get(),
-                Err(_) => return YU_STORAGE_INVALID_SELECTION,
-            };
-            let block_index = match u64::try_from(block.index()) {
-                Ok(index) => index,
-                Err(_) => return YU_STORAGE_INVALID_SELECTION,
-            };
-            encoded.push(YuStorageShapedViewportBlock {
-                revision: viewport_snapshot.revision().get(),
-                block_index,
-                source_start_utf16,
-                source_end_utf16,
-                y: block.y(),
-                height: block.height(),
-                measured: u8::from(block.is_measured()),
-                kind: viewport_block_kind(block.kind()),
-            });
-        }
-        let block_start = match u64::try_from(viewport_snapshot.range().start()) {
-            Ok(index) => index,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        let block_end = match u64::try_from(viewport_snapshot.range().end()) {
-            Ok(index) => index,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
-        let header = YuStorageShapedViewportSnapshot {
-            revision: viewport_snapshot.revision().get(),
-            block_start,
-            block_end,
-            content_height: viewport_snapshot.content_height(),
-            scroll_y,
-            viewport_height,
-            max_scroll_y: (viewport_snapshot.content_height() - viewport_height).max(0.0),
-        };
-        // SAFETY: pointers were checked above and belong to the caller.
-        unsafe {
-            *snapshot = header;
-            *written = encoded.len();
-        }
-        if capacity == 0 && blocks.is_null() {
-            return YU_STORAGE_OK;
-        }
-        if encoded.len() > capacity {
-            return YU_STORAGE_BUFFER_TOO_SMALL;
-        }
-        if !encoded.is_empty() {
-            // SAFETY: capacity was checked against the encoded block count.
-            unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), blocks, encoded.len()) };
-        }
-        YU_STORAGE_OK
     }
 }
 
@@ -5887,28 +3997,6 @@ fn macos_image_requests(
 }
 
 #[cfg(target_os = "macos")]
-fn renderable_image_count(
-    source: &TextSnapshot,
-    layout: &LayoutSnapshot,
-    definitions: &yu_markdown::ReferenceDefinitionIndex,
-) -> usize {
-    layout
-        .images()
-        .iter()
-        .filter(|placement| {
-            layout
-                .projection()
-                .images()
-                .iter()
-                .copied()
-                .find(|image| image.source() == placement.source())
-                .and_then(|image| image_resource_key(source, image, definitions))
-                .is_some()
-        })
-        .count()
-}
-
-#[cfg(target_os = "macos")]
 fn embedded_resource_kind(source: &TextSnapshot, info: TextRange) -> Option<u8> {
     let start = usize::try_from(info.start().get()).ok()?;
     let end = usize::try_from(info.end().get()).ok()?;
@@ -5976,14 +4064,6 @@ fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange,
     }
     hash
 }
-
-#[cfg(target_os = "macos")]
-type MacosVisualRenderPlan = (
-    YuStorageVisualRenderPlanSnapshot,
-    Vec<YuStorageVisualRenderCommand>,
-    Vec<YuStorageVisualRenderPage>,
-    Vec<YuStorageVisualRenderDamage>,
-);
 
 #[cfg(target_os = "macos")]
 fn macos_render_host_error_status(error: &CoreTextViewportFrameError) -> i32 {
@@ -6436,608 +4516,6 @@ fn macos_render_host_surface_prepare(
         view,
     });
     Ok(0)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_visual_render_plan(
-    session: &mut YuStorageSession,
-    expected_revision: u64,
-    size: f32,
-    max_width: f32,
-    scroll_y: f32,
-    viewport_height: f32,
-) -> Result<MacosVisualRenderPlan, i32> {
-    validate_revision(&session.session, expected_revision)?;
-    if !size.is_finite()
-        || size <= 0.0
-        || !max_width.is_finite()
-        || max_width <= 0.0
-        || !scroll_y.is_finite()
-        || scroll_y < 0.0
-        || !viewport_height.is_finite()
-        || viewport_height <= 0.0
-    {
-        return Err(YU_STORAGE_EDITOR_ERROR);
-    }
-    let (shaper, metrics, _layout_config) = core_text_system_ui_layout(size, max_width)?;
-    macos_publish_viewport_config(session, max_width, metrics)?;
-
-    let viewport = ViewportRect::new(scroll_y, viewport_height);
-    let composition_generation = session.session.composition_generation();
-    let document = session.session.document_mut().editor_mut();
-    let viewport_snapshot = document
-        .visible_blocks_with_visual_state_and_shaper(viewport, &shaper)
-        .map_err(|error| storage_status(error.into()))?;
-    let source = document.snapshot();
-    let revision = source.revision();
-    let config = document.viewport_config().layout();
-    let definitions = document.markdown().reference_definitions().clone();
-    let rasterizer = shaper.rasterizer();
-    let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::default());
-    let mut block_glyphs = Vec::with_capacity(viewport_snapshot.blocks().len());
-    let mut embedded_requests = Vec::new();
-    for block in viewport_snapshot.blocks() {
-        let layout = document
-            .block_layout_for_visual_state_with_shaper(block.index(), config, &shaper)
-            .map_err(status_from_editor_error)?;
-        for placement in layout.glyphs() {
-            let key = GlyphRasterKey::new(
-                placement.face(),
-                placement.glyph(),
-                size * placement.font_scale(),
-            )
-            .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-            if atlas.entry(key).is_none() {
-                let glyph = rasterizer
-                    .rasterize(key)
-                    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-                atlas.insert(glyph).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-            }
-        }
-        block_glyphs.push((
-            block.index(),
-            block.source(),
-            layout.glyphs().len(),
-            renderable_image_count(&source, &layout, &definitions),
-            viewport_block_background(block.kind()),
-        ));
-        let projection = document
-            .block_projection(block.index())
-            .map_err(status_from_editor_error)?
-            .clone();
-        let BlockProjection::FencedCode(code) = projection else {
-            continue;
-        };
-        let Some(kind) = embedded_resource_kind(&source, code.info_string()) else {
-            continue;
-        };
-        let embedded_kind = embedded_resource_kind_from_ffi(kind).ok_or(YU_STORAGE_EDITOR_ERROR)?;
-        let content = embedded_resource_content(&source, code.content())?;
-        let content = if content.is_empty() {
-            "\n".to_owned()
-        } else {
-            content
-        };
-        embedded_requests.push(
-            EmbeddedRenderRequest::new(revision, code.source_range(), embedded_kind, content)
-                .map_err(|_| YU_STORAGE_EDITOR_ERROR)?,
-        );
-    }
-
-    let embedded_publications = {
-        let embedded_resources = &mut session.macos_embedded_resources;
-        let mut publications = Vec::with_capacity(embedded_requests.len());
-        for request in embedded_requests {
-            if let Some(publication) = embedded_resources.publication_for(request, revision)? {
-                publications.push(publication);
-            }
-        }
-        publications
-    };
-
-    let scene_height = viewport_snapshot
-        .content_height()
-        .max(viewport_height)
-        .max(1.0);
-    // The retained commands keep document-space coordinates.  The native
-    // Metal bridge subtracts the render-plan viewport origin when it maps
-    // them into the surface, so the plan must carry the current scroll.
-    let scene_viewport =
-        Rect::new(0.0, scroll_y, max_width, scene_height).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-    let mut render_plans = RenderPlanBuilder::new();
-    let frame = assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded(
-        document,
-        viewport,
-        ViewportRenderConfig::new(viewport, size, scene_viewport, Rgba8::black()),
-        &shaper,
-        &atlas,
-        &mut render_plans,
-        &[],
-        &[],
-        &embedded_publications,
-    )
-    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-    let plan = frame.plan();
-    if plan.revision().get() != expected_revision {
-        return Err(YU_STORAGE_STALE_REVISION);
-    }
-
-    let mut block_metadata = Vec::new();
-    // 整帧背景是 scene 的第一个 primitive，不属于任何 block；它必须先入表，
-    // 否则下面的逐条配对会整体错位。归到 block 0 是为了不破坏这条诊断对
-    // block_index 单调递增的断言——它排在所有内容之前，语义上就是帧级底色。
-    block_metadata.push((YU_STORAGE_RENDER_COMMAND_FILL_RECT, 0, 0, 0));
-    for (block_index, source_range, glyph_count, image_count, background) in &block_glyphs {
-        let source_start_utf16 = source
-            .utf16_offset(source_range.start())
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-            .get();
-        let source_end_utf16 = source
-            .utf16_offset(source_range.end())
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-            .get();
-        if background.is_some() {
-            block_metadata.push((
-                YU_STORAGE_RENDER_COMMAND_FILL_RECT,
-                *block_index,
-                source_start_utf16,
-                source_end_utf16,
-            ));
-        }
-        block_metadata.extend(std::iter::repeat_n(
-            (
-                YU_STORAGE_RENDER_COMMAND_GLYPH,
-                *block_index,
-                source_start_utf16,
-                source_end_utf16,
-            ),
-            *glyph_count,
-        ));
-        block_metadata.extend(std::iter::repeat_n(
-            (
-                YU_STORAGE_RENDER_COMMAND_IMAGE,
-                *block_index,
-                source_start_utf16,
-                source_end_utf16,
-            ),
-            *image_count,
-        ));
-    }
-    for task in frame
-        .scene()
-        .scene()
-        .primitives()
-        .iter()
-        .filter_map(|primitive| match primitive {
-            Primitive::TaskCheckbox(task) => Some(*task),
-            _ => None,
-        })
-    {
-        let Some((block_index, source_range, _, _, _)) =
-            block_glyphs.iter().find(|(_, source_range, _, _, _)| {
-                source_range.start() <= task.source().start()
-                    && task.source().end() <= source_range.end()
-            })
-        else {
-            return Err(YU_STORAGE_EDITOR_ERROR);
-        };
-        block_metadata.push((
-            YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX,
-            *block_index,
-            source
-                .utf16_offset(source_range.start())
-                .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-                .get(),
-            source
-                .utf16_offset(source_range.end())
-                .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-                .get(),
-        ));
-    }
-    for (block_index, source_range, _, _, _) in &block_glyphs {
-        let embedded_count = embedded_publications
-            .iter()
-            .filter(|publication| publication.source_range() == *source_range)
-            .count();
-        let source_start_utf16 = source
-            .utf16_offset(source_range.start())
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-            .get();
-        let source_end_utf16 = source
-            .utf16_offset(source_range.end())
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
-            .get();
-        block_metadata.extend(std::iter::repeat_n(
-            (
-                YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG,
-                *block_index,
-                source_start_utf16,
-                source_end_utf16,
-            ),
-            embedded_count,
-        ));
-    }
-    if block_metadata.len() != plan.commands().len() {
-        return Err(YU_STORAGE_EDITOR_ERROR);
-    }
-
-    let mut commands = Vec::with_capacity(plan.commands().len());
-    for (command, metadata) in plan.commands().iter().copied().zip(block_metadata) {
-        let (metadata_kind, block_index, source_start_utf16, source_end_utf16) = metadata;
-        let block_index = u64::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-        let encoded = match command {
-            RenderCommand::FillRect { bounds, color } => {
-                if metadata_kind != YU_STORAGE_RENDER_COMMAND_FILL_RECT
-                    && metadata_kind != YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX
-                {
-                    return Err(YU_STORAGE_EDITOR_ERROR);
-                }
-                YuStorageVisualRenderCommand {
-                    revision: plan.revision().get(),
-                    block_index,
-                    source_start_utf16,
-                    source_end_utf16,
-                    kind: metadata_kind,
-                    page: YU_STORAGE_RENDER_PAGE_NONE,
-                    atlas_x: 0,
-                    atlas_y: 0,
-                    atlas_width: 0,
-                    atlas_height: 0,
-                    origin_x: bounds.x(),
-                    origin_y: bounds.y(),
-                    bearing_x: 0.0,
-                    bearing_y: 0.0,
-                    advance_x: 0.0,
-                    bounds_x: bounds.x(),
-                    bounds_y: bounds.y(),
-                    bounds_width: bounds.width(),
-                    bounds_height: bounds.height(),
-                    color_rgba: color.packed(),
-                    resource: 0,
-                    embedded_generation: 0,
-                    embedded_kind: 0,
-                    embedded_width: 0,
-                    embedded_height: 0,
-                }
-            }
-            RenderCommand::Glyph {
-                page,
-                rect,
-                origin,
-                metrics,
-                color,
-            } => {
-                if metadata_kind != YU_STORAGE_RENDER_COMMAND_GLYPH {
-                    return Err(YU_STORAGE_EDITOR_ERROR);
-                }
-                YuStorageVisualRenderCommand {
-                    revision: plan.revision().get(),
-                    block_index,
-                    source_start_utf16,
-                    source_end_utf16,
-                    kind: YU_STORAGE_RENDER_COMMAND_GLYPH,
-                    page: page.unwrap_or(YU_STORAGE_RENDER_PAGE_NONE),
-                    atlas_x: rect.x(),
-                    atlas_y: rect.y(),
-                    atlas_width: rect.width(),
-                    atlas_height: rect.height(),
-                    origin_x: origin.x(),
-                    origin_y: origin.y(),
-                    bearing_x: metrics.bearing_x(),
-                    bearing_y: metrics.bearing_y(),
-                    advance_x: metrics.advance_x(),
-                    bounds_x: origin.x() + metrics.bearing_x(),
-                    bounds_y: origin.y() - metrics.bearing_y(),
-                    bounds_width: rect.width() as f32,
-                    bounds_height: rect.height() as f32,
-                    color_rgba: color.packed(),
-                    resource: 0,
-                    embedded_generation: 0,
-                    embedded_kind: 0,
-                    embedded_width: 0,
-                    embedded_height: 0,
-                }
-            }
-            RenderCommand::Image {
-                resource,
-                bounds,
-                fallback,
-            } => {
-                if metadata_kind != YU_STORAGE_RENDER_COMMAND_IMAGE {
-                    return Err(YU_STORAGE_EDITOR_ERROR);
-                }
-                YuStorageVisualRenderCommand {
-                    revision: plan.revision().get(),
-                    block_index,
-                    source_start_utf16,
-                    source_end_utf16,
-                    kind: YU_STORAGE_RENDER_COMMAND_IMAGE,
-                    page: YU_STORAGE_RENDER_PAGE_NONE,
-                    atlas_x: 0,
-                    atlas_y: 0,
-                    atlas_width: 0,
-                    atlas_height: 0,
-                    origin_x: 0.0,
-                    origin_y: 0.0,
-                    bearing_x: 0.0,
-                    bearing_y: 0.0,
-                    advance_x: 0.0,
-                    bounds_x: bounds.x(),
-                    bounds_y: bounds.y(),
-                    bounds_width: bounds.width(),
-                    bounds_height: bounds.height(),
-                    color_rgba: fallback.packed(),
-                    resource,
-                    embedded_generation: 0,
-                    embedded_kind: 0,
-                    embedded_width: 0,
-                    embedded_height: 0,
-                }
-            }
-            RenderCommand::EmbeddedSvg {
-                resource,
-                generation,
-                kind,
-                bounds,
-                width,
-                height,
-                fallback,
-            } => {
-                if metadata_kind != YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG {
-                    return Err(YU_STORAGE_EDITOR_ERROR);
-                }
-                YuStorageVisualRenderCommand {
-                    revision: plan.revision().get(),
-                    block_index,
-                    source_start_utf16,
-                    source_end_utf16,
-                    kind: YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG,
-                    page: YU_STORAGE_RENDER_PAGE_NONE,
-                    atlas_x: 0,
-                    atlas_y: 0,
-                    atlas_width: 0,
-                    atlas_height: 0,
-                    origin_x: 0.0,
-                    origin_y: 0.0,
-                    bearing_x: 0.0,
-                    bearing_y: 0.0,
-                    advance_x: 0.0,
-                    bounds_x: bounds.x(),
-                    bounds_y: bounds.y(),
-                    bounds_width: bounds.width(),
-                    bounds_height: bounds.height(),
-                    color_rgba: fallback.packed(),
-                    resource,
-                    embedded_generation: generation,
-                    embedded_kind: kind,
-                    embedded_width: width,
-                    embedded_height: height,
-                }
-            }
-        };
-        commands.push(encoded);
-    }
-
-    let pages = plan
-        .uploads()
-        .iter()
-        .map(|upload| YuStorageVisualRenderPage {
-            revision: plan.revision().get(),
-            page: upload.page(),
-            width: upload.width(),
-            height: upload.height(),
-            fingerprint: upload.fingerprint(),
-        })
-        .collect::<Vec<_>>();
-    let damage = plan
-        .damage()
-        .iter()
-        .copied()
-        .map(|rect| YuStorageVisualRenderDamage {
-            revision: plan.revision().get(),
-            x: rect.x(),
-            y: rect.y(),
-            width: rect.width(),
-            height: rect.height(),
-        })
-        .collect::<Vec<_>>();
-    let block_start = u64::try_from(viewport_snapshot.range().start())
-        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-    let block_end =
-        u64::try_from(viewport_snapshot.range().end()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-    let snapshot = YuStorageVisualRenderPlanSnapshot {
-        revision: plan.revision().get(),
-        composition_generation,
-        block_start,
-        block_end,
-        command_count: u64::try_from(commands.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        upload_count: u64::try_from(pages.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        damage_count: u64::try_from(damage.len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        content_height: viewport_snapshot.content_height(),
-        scroll_y,
-        viewport_height,
-        max_scroll_y: (viewport_snapshot.content_height() - viewport_height).max(0.0),
-        viewport_width: max_width,
-        embedded_command_count: u64::try_from(
-            plan.commands()
-                .iter()
-                .filter(|command| matches!(command, RenderCommand::EmbeddedSvg { .. }))
-                .count(),
-        )
-        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        embedded_upload_count: u64::try_from(plan.embedded_uploads().len())
-            .map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
-        embedded_upload_bytes: {
-            let mut total = 0_u64;
-            for upload in plan.embedded_uploads() {
-                let bytes = u64::try_from(upload.markup().len())
-                    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-                total = total
-                    .checked_add(bytes)
-                    .ok_or(YU_STORAGE_INVALID_SELECTION)?;
-            }
-            total
-        },
-    };
-    Ok((snapshot, commands, pages, damage))
-}
-
-/// Returns an owned, count/fill render-plan publication assembled from
-/// CoreText-shaped layouts, a CPU glyph atlas and `yu-workspace`'s existing
-/// scene/render pipeline. The native side receives command/page/damage scalars
-/// only; production TextKit and Metal submission remain separate.
-///
-/// # Safety
-/// All output pointers must be writable when non-null. A non-zero capacity
-/// requires the corresponding array pointer to be non-null. On capacity
-/// failure no output array is partially written.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_visual_render_plan(
-    session: *mut YuStorageSession,
-    expected_revision: u64,
-    size: f32,
-    max_width: f32,
-    scroll_y: f32,
-    viewport_height: f32,
-    snapshot: *mut YuStorageVisualRenderPlanSnapshot,
-    commands: *mut YuStorageVisualRenderCommand,
-    command_capacity: usize,
-    pages: *mut YuStorageVisualRenderPage,
-    page_capacity: usize,
-    damage: *mut YuStorageVisualRenderDamage,
-    damage_capacity: usize,
-    written_commands: *mut usize,
-    written_pages: *mut usize,
-    written_damage: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_mut() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if snapshot.is_null()
-        || written_commands.is_null()
-        || written_pages.is_null()
-        || written_damage.is_null()
-    {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    if (command_capacity > 0 && commands.is_null())
-        || (page_capacity > 0 && pages.is_null())
-        || (damage_capacity > 0 && damage.is_null())
-    {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // Keep the count-query header long enough to validate the matching fill
-    // call. Composition updates do not change the canonical Revision, so a
-    // Revision-only check would permit a stale capacity/header pair.
-    let prior_snapshot = unsafe { *snapshot };
-    let is_fill = command_capacity > 0 || page_capacity > 0 || damage_capacity > 0;
-    #[cfg(not(target_os = "macos"))]
-    let _ = (prior_snapshot, is_fill);
-    #[cfg(target_os = "macos")]
-    if is_fill
-        && let Err(status) = validate_visual_fill_identity(
-            &session.session,
-            expected_revision,
-            prior_snapshot.revision,
-            prior_snapshot.composition_generation,
-        )
-    {
-        // SAFETY: output pointers were checked for null and belong to caller.
-        unsafe {
-            *snapshot = YuStorageVisualRenderPlanSnapshot::default();
-            *written_commands = 0;
-            *written_pages = 0;
-            *written_damage = 0;
-        }
-        return status;
-    }
-    // SAFETY: output pointers were checked for null and belong to the caller.
-    unsafe {
-        *snapshot = YuStorageVisualRenderPlanSnapshot::default();
-        *written_commands = 0;
-        *written_pages = 0;
-        *written_damage = 0;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (
-            session,
-            expected_revision,
-            size,
-            max_width,
-            scroll_y,
-            viewport_height,
-            commands,
-            command_capacity,
-            pages,
-            page_capacity,
-            damage,
-            damage_capacity,
-        );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let (header, encoded_commands, encoded_pages, encoded_damage) =
-            match macos_visual_render_plan(
-                session,
-                expected_revision,
-                size,
-                max_width,
-                scroll_y,
-                viewport_height,
-            ) {
-                Ok(plan) => plan,
-                Err(status) => return status,
-            };
-        // SAFETY: output pointers were checked above and belong to the caller.
-        unsafe {
-            *snapshot = header;
-            *written_commands = encoded_commands.len();
-            *written_pages = encoded_pages.len();
-            *written_damage = encoded_damage.len();
-        }
-        if command_capacity == 0
-            && commands.is_null()
-            && page_capacity == 0
-            && pages.is_null()
-            && damage_capacity == 0
-            && damage.is_null()
-        {
-            return YU_STORAGE_OK;
-        }
-        if encoded_commands.len() > command_capacity
-            || encoded_pages.len() > page_capacity
-            || encoded_damage.len() > damage_capacity
-        {
-            return YU_STORAGE_BUFFER_TOO_SMALL;
-        }
-        if !encoded_commands.is_empty() {
-            // SAFETY: capacity was checked against the command count.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    encoded_commands.as_ptr(),
-                    commands,
-                    encoded_commands.len(),
-                );
-            }
-        }
-        if !encoded_pages.is_empty() {
-            // SAFETY: capacity was checked against the page count.
-            unsafe {
-                ptr::copy_nonoverlapping(encoded_pages.as_ptr(), pages, encoded_pages.len());
-            }
-        }
-        if !encoded_damage.is_empty() {
-            // SAFETY: capacity was checked against the damage count.
-            unsafe {
-                ptr::copy_nonoverlapping(encoded_damage.as_ptr(), damage, encoded_damage.len());
-            }
-        }
-        YU_STORAGE_OK
-    }
 }
 
 /// Advances the persistent Rust-owned macOS render host through one viewport
@@ -7883,6 +5361,8 @@ pub unsafe extern "C" fn yu_storage_session_discard_close(session: *mut YuStorag
 
 #[cfg(test)]
 mod tests {
+    use yu_core::ByteOffset;
+
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7961,44 +5441,6 @@ mod tests {
                 .expect("status"),
             YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_visual_render_plan_consumes_published_math_svg() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-embedded-plan-{id}.md"));
-        fs::write(&path, "```math\nx^2 + y^2\n```\n").expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-        let (snapshot, commands, _, _) = macos_visual_render_plan(
-            unsafe { raw.as_mut() }.expect("session"),
-            0,
-            14.0,
-            500.0,
-            0.0,
-            240.0,
-        )
-        .expect("embedded render plan");
-        assert_eq!(snapshot.revision, 0);
-        assert_eq!(snapshot.embedded_command_count, 1);
-        assert_eq!(snapshot.embedded_upload_count, 1);
-        assert!(snapshot.embedded_upload_bytes > 0);
-        let embedded = commands
-            .iter()
-            .find(|command| command.kind == YU_STORAGE_RENDER_COMMAND_EMBEDDED_SVG)
-            .expect("embedded command");
-        assert_ne!(embedded.resource, 0);
-        assert_eq!(embedded.embedded_kind, YU_STORAGE_EMBEDDED_MATH);
-        assert_eq!(embedded.embedded_generation, 1);
-        assert!(embedded.embedded_width > 0);
-        assert!(embedded.embedded_height > 0);
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]
@@ -8124,30 +5566,19 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let mut required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(raw, 0, ptr::null_mut(), 0, &mut required)
-            },
-            YU_STORAGE_OK
-        );
-        let mut projected = vec![0_u8; required];
-        let mut written = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(
-                    raw,
-                    0,
-                    projected.as_mut_ptr(),
-                    projected.len(),
-                    &mut written,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(written, required);
-        let projected = String::from_utf8(projected).expect("projected UTF-8");
-        assert_eq!(projected, "羽 链接 🙂\n");
+        // 投影文本不再跨 ABI（不变量 I3）；直接查内部投影，断言不变。
+        {
+            // SAFETY: `raw` is a live session handle owned by this test.
+            let session = unsafe { raw.as_mut() }.expect("session");
+            let projection = session
+                .session
+                .inline_projection_for_visual_state()
+                .expect("projection");
+            assert_eq!(
+                projected_utf8(&projection).expect("projected"),
+                "羽 链接 🙂\n"
+            );
+        }
 
         let mut caret = YuStorageProjectionCaret::default();
         assert_eq!(
@@ -8169,12 +5600,6 @@ mod tests {
         assert_eq!(
             unsafe { yu_storage_session_insert_text(raw, 0, b"x".as_ptr(), 1, &mut result) },
             YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(raw, 0, ptr::null_mut(), 0, &mut required)
-            },
-            YU_STORAGE_STALE_REVISION
         );
         assert_eq!(
             unsafe {
@@ -8221,30 +5646,15 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let mut required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(raw, 0, ptr::null_mut(), 0, &mut required)
-            },
-            YU_STORAGE_OK
-        );
-        let mut projected = vec![0_u8; required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(
-                    raw,
-                    0,
-                    projected.as_mut_ptr(),
-                    projected.len(),
-                    &mut required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            String::from_utf8(projected).expect("projected UTF-8"),
-            source
-        );
+        {
+            // SAFETY: `raw` is a live session handle owned by this test.
+            let session = unsafe { raw.as_mut() }.expect("session");
+            let projection = session
+                .session
+                .inline_projection_for_visual_state()
+                .expect("projection");
+            assert_eq!(projected_utf8(&projection).expect("projected"), source);
+        }
 
         let end_utf16 = source.encode_utf16().count() as u64;
         assert_eq!(
@@ -8259,844 +5669,18 @@ mod tests {
             },
             YU_STORAGE_OK
         );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(raw, 0, ptr::null_mut(), 0, &mut required)
-            },
-            YU_STORAGE_OK
-        );
-        let mut projected = vec![0_u8; required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(
-                    raw,
-                    0,
-                    projected.as_mut_ptr(),
-                    projected.len(),
-                    &mut required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            String::from_utf8(projected).expect("projected UTF-8"),
-            "before strong after"
-        );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[test]
-    fn ffi_block_projection_is_revision_bound_and_parser_owned() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-block-projection-{id}.md"));
-        let source = "# 标题\n\n段落 **粗体** 和 [链接](https://example.com)。\n\n- [ ] 任务\n\n> 引用\n\n1. 有序\n\n| A | B |\n| --- | :---: |\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let mut count = 0;
-        assert_eq!(
-            unsafe { yu_storage_session_projection_block_count(raw, 0, &mut count) },
-            YU_STORAGE_OK
-        );
-        assert!(count >= 7);
-        let mut previous_end = 0_u64;
-        let mut seen_kinds = Vec::new();
-        let mut seen_projection_kinds = Vec::new();
-        let mut projected_blocks = Vec::new();
-        for index in 0..count {
-            let mut metadata = YuStorageProjectionBlock::default();
-            let mut required = 0;
+        {
+            // SAFETY: `raw` is a live session handle owned by this test.
+            let session = unsafe { raw.as_mut() }.expect("session");
+            let projection = session
+                .session
+                .inline_projection_for_visual_state()
+                .expect("projection");
             assert_eq!(
-                unsafe {
-                    yu_storage_session_projected_block(
-                        raw,
-                        0,
-                        index as u64,
-                        &mut metadata,
-                        ptr::null_mut(),
-                        0,
-                        &mut required,
-                    )
-                },
-                YU_STORAGE_OK
+                projected_utf8(&projection).expect("projected"),
+                "before strong after"
             );
-            assert_eq!(metadata.revision, 0);
-            assert_eq!(metadata.block_index, index as u64);
-            assert!(metadata.source_start_utf16 <= metadata.source_end_utf16);
-            assert!(metadata.source_start_utf16 >= previous_end);
-            previous_end = metadata.source_end_utf16;
-            assert_eq!(required, metadata.visual_utf8_length as usize);
-            let mut projected = vec![0_u8; required];
-            let mut written = 0;
-            assert_eq!(
-                unsafe {
-                    yu_storage_session_projected_block(
-                        raw,
-                        0,
-                        index as u64,
-                        &mut metadata,
-                        projected.as_mut_ptr(),
-                        projected.len(),
-                        &mut written,
-                    )
-                },
-                YU_STORAGE_OK
-            );
-            assert_eq!(written, required);
-            assert_eq!(metadata.visual_utf8_length as usize, projected.len());
-            assert_eq!(
-                metadata.visual_utf16_length as usize,
-                String::from_utf8_lossy(&projected).encode_utf16().count()
-            );
-            seen_kinds.push(metadata.kind);
-            seen_projection_kinds.push(metadata.projection_kind);
-            projected_blocks.push(String::from_utf8(projected).expect("projected UTF-8"));
         }
-        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_HEADING));
-        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_BLOCK_QUOTE));
-        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_LIST_ITEM));
-        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM));
-        assert!(seen_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE));
-        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_HEADING));
-        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_BLOCK_QUOTE));
-        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_LIST));
-        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_TASK_LIST));
-        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_FENCED_CODE));
-        assert!(seen_projection_kinds.contains(&YU_STORAGE_PROJECTION_TABLE));
-        assert!(projected_blocks.iter().any(|text| text.contains("粗体")));
-        assert!(projected_blocks.iter().any(|text| text.contains("链接")));
-        assert!(projected_blocks.iter().any(|text| text.contains("任务")));
-        assert!(projected_blocks.iter().any(|text| text.contains("fn main")));
-        assert!(
-            projected_blocks
-                .iter()
-                .all(|text| !text.contains("**粗体**"))
-        );
-        assert!(
-            projected_blocks
-                .iter()
-                .all(|text| !text.contains("[链接](https://example.com)"))
-        );
-
-        let table_index = seen_projection_kinds
-            .iter()
-            .position(|kind| *kind == YU_STORAGE_PROJECTION_TABLE)
-            .expect("table projection should be present");
-        assert_eq!(projected_blocks[table_index], "AB12");
-        let mut table_count = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_table_cells(
-                    raw,
-                    0,
-                    table_index as u64,
-                    ptr::null_mut(),
-                    0,
-                    &mut table_count,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(table_count, 6);
-        let mut cells = vec![YuStorageTableCellRange::default(); table_count];
-        let mut written_cells = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_table_cells(
-                    raw,
-                    0,
-                    table_index as u64,
-                    cells.as_mut_ptr(),
-                    cells.len(),
-                    &mut written_cells,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(written_cells, 6);
-        assert_eq!(
-            cells.iter().map(|cell| cell.row).collect::<Vec<_>>(),
-            [0, 0, 1, 1, 2, 2]
-        );
-        assert_eq!(
-            cells.iter().map(|cell| cell.column).collect::<Vec<_>>(),
-            [0, 1, 0, 1, 0, 1]
-        );
-
-        let mut layout_count = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_layout_cells(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    ptr::null_mut(),
-                    0,
-                    &mut layout_count,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(layout_count, 4);
-        let mut layout_cells = vec![YuStorageTableLayoutCell::default(); layout_count];
-        let mut written_layout = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_layout_cells(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    layout_cells.as_mut_ptr(),
-                    layout_cells.len(),
-                    &mut written_layout,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(written_layout, 4);
-        assert_eq!(
-            layout_cells.iter().map(|cell| cell.row).collect::<Vec<_>>(),
-            [0, 0, 1, 1]
-        );
-        assert_eq!(
-            layout_cells
-                .iter()
-                .map(|cell| cell.column)
-                .collect::<Vec<_>>(),
-            [0, 1, 0, 1]
-        );
-        assert_eq!(layout_cells[0].x, 0.0);
-        assert_eq!(layout_cells[0].y, 0.0);
-        assert_eq!(layout_cells[2].y, 2.0);
-        assert_eq!(layout_cells[1].alignment, YU_STORAGE_TABLE_ALIGNMENT_CENTER);
-        assert!(
-            layout_cells
-                .iter()
-                .all(|cell| cell.source_start_utf16 <= cell.source_end_utf16)
-        );
-
-        let mut resized_layout_count = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_layout_cells_with_resize(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    YU_STORAGE_TABLE_RESIZE_COLUMN,
-                    0,
-                    1.0,
-                    ptr::null_mut(),
-                    0,
-                    &mut resized_layout_count,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(resized_layout_count, 4);
-        let mut resized_layout_cells =
-            vec![YuStorageTableLayoutCell::default(); resized_layout_count];
-        let mut written_resized_layout = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_layout_cells_with_resize(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    YU_STORAGE_TABLE_RESIZE_COLUMN,
-                    0,
-                    1.0,
-                    resized_layout_cells.as_mut_ptr(),
-                    resized_layout_cells.len(),
-                    &mut written_resized_layout,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(written_resized_layout, 4);
-        assert_eq!(resized_layout_cells[0].width, 4.0);
-        assert_eq!(resized_layout_cells[1].x, 4.0);
-        assert_eq!(resized_layout_cells[1].width, 2.0);
-        assert_eq!(resized_layout_cells[2].x, 0.0);
-        assert_eq!(resized_layout_cells[3].x, 4.0);
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_layout_cells_with_resize(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    YU_STORAGE_TABLE_RESIZE_ROW,
-                    0,
-                    1.0,
-                    ptr::null_mut(),
-                    0,
-                    &mut resized_layout_count,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_layout_cells_with_resize(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    YU_STORAGE_TABLE_RESIZE_COLUMN,
-                    0,
-                    f32::NAN,
-                    ptr::null_mut(),
-                    0,
-                    &mut resized_layout_count,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-
-        let mut hit = YuStorageTableCellHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_cell_hit_test(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    3.5,
-                    2.5,
-                    &mut hit,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(hit.row, 1);
-        assert_eq!(hit.column, 1);
-        assert_eq!(hit.x, 3.0);
-        assert_eq!(hit.y, 2.0);
-        assert!(hit.source_start_utf16 < hit.source_end_utf16);
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_cell_hit_test(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    99.0,
-                    99.0,
-                    &mut hit,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-
-        let mut resize_hit = YuStorageTableResizeHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_hit_test(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    3.1,
-                    0.5,
-                    0.2,
-                    &mut resize_hit,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(resize_hit.revision, 0);
-        assert_eq!(resize_hit.block_index, table_index as u64);
-        assert_eq!(resize_hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
-        assert_eq!(resize_hit.index, 0);
-        assert_eq!(resize_hit.position, 3.0);
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_hit_test(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    1.0,
-                    2.1,
-                    0.2,
-                    &mut resize_hit,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(resize_hit.kind, YU_STORAGE_TABLE_RESIZE_ROW);
-        assert_eq!(resize_hit.index, 0);
-        assert_eq!(resize_hit.position, 2.0);
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_hit_test(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    3.1,
-                    0.0,
-                    0.0,
-                    &mut resize_hit,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(resize_hit, YuStorageTableResizeHit::default());
-
-        let mut metadata = YuStorageProjectionBlock::default();
-        let mut written = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_block(
-                    raw,
-                    0,
-                    count as u64,
-                    &mut metadata,
-                    ptr::null_mut(),
-                    0,
-                    &mut written,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"x".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe { yu_storage_session_projection_block_count(raw, 0, &mut count) },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_block(
-                    raw,
-                    0,
-                    0,
-                    &mut metadata,
-                    ptr::null_mut(),
-                    0,
-                    &mut written,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_table_cells(
-                    raw,
-                    0,
-                    table_index as u64,
-                    ptr::null_mut(),
-                    0,
-                    &mut table_count,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_layout_cells(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    ptr::null_mut(),
-                    0,
-                    &mut layout_count,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_layout_cells_with_resize(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    YU_STORAGE_TABLE_RESIZE_COLUMN,
-                    0,
-                    1.0,
-                    ptr::null_mut(),
-                    0,
-                    &mut resized_layout_count,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_cell_hit_test(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    3.5,
-                    2.5,
-                    &mut hit,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_hit_test(
-                    raw,
-                    0,
-                    table_index as u64,
-                    20.0,
-                    2.0,
-                    1.0,
-                    3.1,
-                    0.5,
-                    0.2,
-                    &mut resize_hit,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[test]
-    fn ffi_table_resize_gesture_lifecycle_is_revision_bound_and_source_neutral() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-table-gesture-{id}.md"));
-        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let mut hit = YuStorageTableResizeHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_begin(
-                    raw, 0, 0, 20.0, 2.0, 1.0, 3.1, 0.5, 0.2, 3.1, &mut hit,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
-        assert_eq!(hit.index, 0);
-        assert_eq!(hit.position, 3.0);
-
-        let mut second_hit = YuStorageTableResizeHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_begin(
-                    raw,
-                    0,
-                    0,
-                    20.0,
-                    2.0,
-                    1.0,
-                    3.1,
-                    0.5,
-                    0.2,
-                    3.1,
-                    &mut second_hit,
-                )
-            },
-            YU_STORAGE_INVALID_STATE
-        );
-        assert_eq!(second_hit, YuStorageTableResizeHit::default());
-
-        let mut preview = YuStorageTableResizeCommit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_action(
-                    raw,
-                    0,
-                    YU_STORAGE_TABLE_RESIZE_UPDATE,
-                    4.1,
-                    &mut preview,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(preview.revision, 0);
-        assert_eq!(preview.block_index, 0);
-        assert_eq!(preview.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
-        assert_eq!(preview.index, 0);
-        assert_eq!(preview.initial_position, 3.0);
-        assert_eq!(preview.final_position, 4.0);
-        assert_eq!(preview.delta, 1.0);
-
-        let mut committed = YuStorageTableResizeCommit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_action(
-                    raw,
-                    0,
-                    YU_STORAGE_TABLE_RESIZE_FINISH,
-                    0.0,
-                    &mut committed,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(committed, preview);
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_action(
-                    raw,
-                    0,
-                    YU_STORAGE_TABLE_RESIZE_UPDATE,
-                    4.1,
-                    &mut preview,
-                )
-            },
-            YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE
-        );
-        assert_eq!(preview, YuStorageTableResizeCommit::default());
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_action(
-                    raw,
-                    0,
-                    YU_STORAGE_TABLE_RESIZE_CANCEL,
-                    0.0,
-                    &mut YuStorageTableResizeCommit::default(),
-                )
-            },
-            YU_STORAGE_OK
-        );
-
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"x".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_action(
-                    raw,
-                    0,
-                    YU_STORAGE_TABLE_RESIZE_FINISH,
-                    0.0,
-                    &mut committed,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(committed, YuStorageTableResizeCommit::default());
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_action(
-                    raw,
-                    1,
-                    YU_STORAGE_TABLE_RESIZE_CANCEL,
-                    0.0,
-                    &mut YuStorageTableResizeCommit::default(),
-                )
-            },
-            YU_STORAGE_OK
-        );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[test]
-    fn ffi_projection_selection_and_hit_test_round_trip_visual_coordinates() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-projection-hit-test-{id}.md"));
-        let source = "before **粗体** after\nnext";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let marker_start = source.find("**粗体**").expect("strong range");
-        let marker_end = marker_start + "**粗体**".len();
-        let source_start_utf16 = source[..marker_start].encode_utf16().count() as u64;
-        let source_end_utf16 = source[..marker_end].encode_utf16().count() as u64;
-        let mut selection = YuStorageProjectionSelection::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_selection(
-                    raw,
-                    0,
-                    source_start_utf16,
-                    source_end_utf16,
-                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut selection,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(selection.revision, 0);
-        assert_eq!(selection.source_start_utf16, source_start_utf16);
-        assert_eq!(selection.source_end_utf16, source_end_utf16);
-        assert_eq!(selection.visual_start_utf16, 7);
-        assert_eq!(selection.visual_end_utf16, 9);
-        assert_eq!(selection.round_trip_source_start_utf16, source_start_utf16);
-        assert_eq!(selection.round_trip_source_end_utf16, source_end_utf16);
-
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_selection(
-                    raw,
-                    0,
-                    source_end_utf16,
-                    source_start_utf16,
-                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut selection,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(selection.visual_end_utf16, 0);
-
-        let mut hit = YuStorageProjectionHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_hit_test(raw, 0, 7.1, 0.0, 80.0, 1.0, 1.0, &mut hit)
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(hit.revision, 0);
-        assert_eq!(hit.source_utf16, source_start_utf16);
-        assert_eq!(hit.visual_utf16, 7);
-        assert_eq!(hit.round_trip_source_utf16, source_start_utf16);
-        assert_eq!(
-            hit.image_source_start_utf16,
-            YU_STORAGE_IMAGE_DESTINATION_NONE
-        );
-        assert_eq!(
-            hit.image_source_end_utf16,
-            YU_STORAGE_IMAGE_DESTINATION_NONE
-        );
-        assert_eq!(hit.line, 0);
-        assert_eq!(hit.x, 7.0);
-        assert_eq!(hit.y, 0.0);
-        assert_eq!(hit.affinity, YU_STORAGE_CARET_AFFINITY_UPSTREAM);
-
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_hit_test(
-                    raw,
-                    0,
-                    f32::NAN,
-                    0.0,
-                    80.0,
-                    1.0,
-                    1.0,
-                    &mut hit,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(hit.visual_utf16, 0);
-
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_selection(
-                    raw,
-                    0,
-                    source_start_utf16,
-                    source_end_utf16,
-                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut selection,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_hit_test(raw, 0, 7.1, 0.0, 80.0, 1.0, 1.0, &mut hit)
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[test]
-    fn ffi_projection_hit_test_exposes_image_source_range() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-image-hit-test-{id}.md"));
-        let source = "![alt](image.png)";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let mut hit = YuStorageProjectionHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_hit_test(raw, 0, 1.0, 0.0, 80.0, 10.0, 1.0, &mut hit)
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(hit.revision, 0);
-        assert_eq!(hit.image_source_start_utf16, 0);
-        assert_eq!(
-            hit.image_source_end_utf16,
-            source.encode_utf16().count() as u64
-        );
-        assert_eq!(hit.source_utf16, 0);
-        assert_eq!(hit.visual_utf16, 0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
@@ -9241,412 +5825,6 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
-    #[test]
-    fn ffi_projection_visual_mirror_maps_caret_and_selection_back_to_source() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-visual-mirror-{id}.md"));
-        let source = "before **粗体** after\n日本🙂";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let mut required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(raw, 0, ptr::null_mut(), 0, &mut required)
-            },
-            YU_STORAGE_OK
-        );
-        let mut projected = vec![0_u8; required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projected_source(
-                    raw,
-                    0,
-                    projected.as_mut_ptr(),
-                    projected.len(),
-                    &mut required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        let projected = String::from_utf8(projected).expect("projected UTF-8");
-        let source_strong = source.find("**粗体**").expect("source strong") as u64;
-        let source_strong_end = source_strong + "**粗体**".len() as u64;
-        let visual_strong = projected.find("粗体").expect("visual strong") as u64;
-        let visual_strong_end = visual_strong + "粗体".len() as u64;
-        let source_start_utf16 = source[..source_strong as usize].encode_utf16().count() as u64;
-        let source_end_utf16 = source[..source_strong_end as usize].encode_utf16().count() as u64;
-        let visual_start_utf16 = projected[..visual_strong as usize].encode_utf16().count() as u64;
-        let visual_end_utf16 = projected[..visual_strong_end as usize]
-            .encode_utf16()
-            .count() as u64;
-
-        // 折叠选区就是「一个光标」的映射，与非折叠区间走同一条路径。
-        let mut collapsed = YuStorageProjectionSourceSelection {
-            revision: 99,
-            ..YuStorageProjectionSourceSelection::default()
-        };
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_source_selection(
-                    raw,
-                    0,
-                    visual_start_utf16,
-                    visual_start_utf16,
-                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    &mut collapsed,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(collapsed.revision, 0);
-        assert_eq!(collapsed.visual_start_utf16, visual_start_utf16);
-        assert_eq!(collapsed.source_start_utf16, source_start_utf16);
-        assert_eq!(collapsed.round_trip_visual_start_utf16, visual_start_utf16);
-
-        let mut selection = YuStorageProjectionSourceSelection::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_source_selection(
-                    raw,
-                    0,
-                    visual_start_utf16,
-                    visual_end_utf16,
-                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut selection,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(selection.revision, 0);
-        assert_eq!(selection.visual_start_utf16, visual_start_utf16);
-        assert_eq!(selection.visual_end_utf16, visual_end_utf16);
-        assert_eq!(selection.source_start_utf16, source_start_utf16);
-        assert_eq!(selection.source_end_utf16, source_end_utf16);
-        assert_eq!(selection.round_trip_visual_start_utf16, visual_start_utf16);
-        assert_eq!(selection.round_trip_visual_end_utf16, visual_end_utf16);
-
-        // surrogate 中间位置不得穿过 ABI（不变量 I4）。
-        let emoji_visual_start = projected.find("🙂").expect("emoji") as u64;
-        let emoji_utf16 = projected[..emoji_visual_start as usize]
-            .encode_utf16()
-            .count() as u64;
-        let mut surrogate = YuStorageProjectionSourceSelection::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_source_selection(
-                    raw,
-                    0,
-                    emoji_utf16 + 1,
-                    emoji_utf16 + 1,
-                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut surrogate,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(surrogate, YuStorageProjectionSourceSelection::default());
-
-        selection.revision = 99;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_source_selection(
-                    raw,
-                    0,
-                    visual_end_utf16,
-                    visual_start_utf16,
-                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut selection,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(selection, YuStorageProjectionSourceSelection::default());
-
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_projection_source_selection(
-                    raw,
-                    0,
-                    visual_start_utf16,
-                    visual_end_utf16,
-                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut selection,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(selection, YuStorageProjectionSourceSelection::default());
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[test]
-    fn ffi_block_layout_is_revision_bound_and_reports_metrics_geometry() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-block-layout-{id}.md"));
-        let source = "# 标题\n\n段落 **粗体**";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let mut layout = YuStorageBlockLayout::default();
-        assert_eq!(
-            unsafe { yu_storage_session_block_layout(raw, 0, 2, 80.0, 2.0, 1.5, &mut layout) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(layout.revision, 0);
-        assert_eq!(layout.block_index, 2);
-        assert_eq!(layout.kind, YU_STORAGE_PROJECTION_BLOCK_PARAGRAPH);
-        assert_eq!(layout.shaped, 0);
-        assert_eq!(layout.line_count, 1);
-        assert_eq!(layout.height, 2.0);
-        assert_eq!(layout.line_height, 2.0);
-        assert_eq!(layout.default_advance, 1.5);
-        assert!(layout.visual_utf16_length > 0);
-        assert!(layout.width > 0.0);
-
-        assert_eq!(
-            unsafe { yu_storage_session_block_layout(raw, 0, 2, 80.0, 2.0, 0.0, &mut layout) },
-            YU_STORAGE_EDITOR_ERROR
-        );
-        assert_eq!(layout.visual_utf16_length, 0);
-
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe { yu_storage_session_block_layout(raw, 0, 2, 80.0, 2.0, 1.5, &mut layout) },
-            YU_STORAGE_STALE_REVISION
-        );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ffi_macos_block_layout_and_caret_are_revision_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-block-layout-{id}.md"));
-        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let mut layout = YuStorageBlockLayout::default();
-        assert_eq!(
-            unsafe { yu_storage_session_macos_block_layout(raw, 0, 2, 14.0, 500.0, &mut layout) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(layout.revision, 0);
-        assert_eq!(layout.block_index, 2);
-        assert_eq!(layout.shaped, 1);
-        assert!(layout.line_count >= 1);
-        assert!(layout.height > 0.0);
-        assert!(layout.line_height > 0.0);
-        assert!(layout.default_advance > 0.0);
-
-        let source_start = source.find("**粗体**").expect("strong marker");
-        let source_utf16 = source[..source_start].encode_utf16().count() as u64;
-        let mut caret = YuStorageBlockCaret::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_block_caret(
-                    raw,
-                    0,
-                    2,
-                    source_utf16,
-                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    14.0,
-                    500.0,
-                    &mut caret,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(caret.revision, 0);
-        assert_eq!(caret.block_index, 2);
-        assert_eq!(caret.source_utf16, source_utf16);
-        assert_eq!(caret.shaped, 1);
-        assert!(caret.caret_x.is_finite());
-        assert!(caret.caret_y.is_finite());
-        assert_eq!(caret.caret_height, layout.line_height);
-
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe { yu_storage_session_macos_block_layout(raw, 0, 2, 14.0, 500.0, &mut layout) },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_block_caret(
-                    raw,
-                    0,
-                    2,
-                    source_utf16,
-                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    14.0,
-                    500.0,
-                    &mut caret,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    /// `macos_source_caret` 让平台在不知道 block 归属的情况下取得 caret 几何。
-    /// AppKit 的 `firstRect(forCharacterRange:)` 需要它来定位 IME 候选窗：
-    /// TextKit 排的是 canonical source，屏幕显示的是投影结果，两者字符位置
-    /// 不对应，用默认实现会让候选窗偏离真实插入点（不变量 H3、I1）。
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ffi_macos_source_caret_resolves_owning_block_and_is_revision_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-source-caret-{id}.md"));
-        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let source_start = source.find("**粗体**").expect("strong marker");
-        let source_utf16 = source[..source_start].encode_utf16().count() as u64;
-
-        // 不指定 block 的查询必须与显式指定正确 block 的查询完全一致。
-        let mut expected = YuStorageBlockCaret::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_block_caret(
-                    raw,
-                    0,
-                    2,
-                    source_utf16,
-                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    14.0,
-                    500.0,
-                    &mut expected,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        let mut caret = YuStorageBlockCaret::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_source_caret(
-                    raw,
-                    0,
-                    source_utf16,
-                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    14.0,
-                    500.0,
-                    &mut caret,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(caret.block_index, expected.block_index);
-        assert_eq!(caret.source_utf16, expected.source_utf16);
-        assert_eq!(caret.visual_utf16, expected.visual_utf16);
-        assert_eq!(caret.caret_x, expected.caret_x);
-        assert_eq!(caret.caret_y, expected.caret_y);
-        assert_eq!(caret.caret_height, expected.caret_height);
-        assert_eq!(caret.shaped, 1);
-        assert!(caret.caret_x.is_finite() && caret.caret_y.is_finite());
-
-        // 文档开头属于另一个 block，块归属必须真的按 offset 解析而非写死。
-        let mut first = YuStorageBlockCaret::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_source_caret(
-                    raw,
-                    0,
-                    0,
-                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    14.0,
-                    500.0,
-                    &mut first,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_ne!(first.block_index, caret.block_index);
-
-        // 越界 offset 必须被拒绝，且不写入半成品结果。
-        let out_of_range = source.encode_utf16().count() as u64 + 1;
-        let mut rejected = YuStorageBlockCaret::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_source_caret(
-                    raw,
-                    0,
-                    out_of_range,
-                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    14.0,
-                    500.0,
-                    &mut rejected,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(rejected, YuStorageBlockCaret::default());
-
-        // 编辑之后旧 Revision 的查询必须整体拒绝。
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_source_caret(
-                    raw,
-                    0,
-                    source_utf16,
-                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
-                    14.0,
-                    500.0,
-                    &mut caret,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_font_metrics_support_empty_documents() {
@@ -9680,651 +5858,6 @@ mod tests {
             YU_STORAGE_STALE_REVISION
         );
         assert_eq!(metrics, YuStorageMacosFontMetrics::default());
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ffi_macos_shaped_viewport_is_count_fill_and_revision_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-viewport-{id}.md"));
-        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n\n- [ ] 任务\n\n```rust\nfn main() {}\n```\n";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-        // 这些断言用行高做几何基准；配置的发布已经由 Rust 自己完成，
-        // 这里只是取同一份度量来算期望值。
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
-
-        let mut snapshot = YuStorageShapedViewportSnapshot::default();
-        let mut required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_shaped_viewport_blocks(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    ptr::null_mut(),
-                    0,
-                    &mut required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert!(required >= 5);
-        assert_eq!(snapshot.revision, 0);
-        assert_eq!(snapshot.block_start, 0);
-        assert_eq!(snapshot.block_end, required as u64);
-        assert!(snapshot.content_height >= metrics.line_height());
-        assert_eq!(snapshot.scroll_y, 0.0);
-        assert_eq!(snapshot.viewport_height, 1_000.0);
-        assert_eq!(snapshot.max_scroll_y, 0.0);
-
-        let mut too_small = vec![YuStorageShapedViewportBlock::default(); required - 1];
-        let mut written = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_shaped_viewport_blocks(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    too_small.as_mut_ptr(),
-                    too_small.len(),
-                    &mut written,
-                )
-            },
-            YU_STORAGE_BUFFER_TOO_SMALL
-        );
-        assert_eq!(written, required);
-        assert!(
-            too_small
-                .iter()
-                .all(|block| *block == YuStorageShapedViewportBlock::default())
-        );
-
-        let mut blocks = vec![YuStorageShapedViewportBlock::default(); required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_shaped_viewport_blocks(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    blocks.as_mut_ptr(),
-                    blocks.len(),
-                    &mut written,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(written, required);
-        assert!(blocks.windows(2).all(|pair| {
-            pair[0].block_index < pair[1].block_index
-                && pair[0].source_end_utf16 <= pair[1].source_start_utf16
-                && pair[0].y < pair[1].y
-        }));
-        assert!(blocks.iter().all(|block| {
-            block.revision == 0
-                && block.height > 0.0
-                && block.y.is_finite()
-                && block.height.is_finite()
-        }));
-        assert!(
-            blocks
-                .iter()
-                .any(|block| block.kind == YU_STORAGE_PROJECTION_BLOCK_HEADING)
-        );
-        assert!(
-            blocks
-                .iter()
-                .any(|block| block.kind == YU_STORAGE_PROJECTION_BLOCK_TASK_LIST_ITEM)
-        );
-        assert!(
-            blocks
-                .iter()
-                .any(|block| block.kind == YU_STORAGE_PROJECTION_BLOCK_FENCED_CODE)
-        );
-
-        let scrolled_height = metrics.line_height() * 2.0;
-        let scrolled_y = metrics.line_height();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_shaped_viewport_blocks(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    scrolled_y,
-                    scrolled_height,
-                    &mut snapshot,
-                    ptr::null_mut(),
-                    0,
-                    &mut required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(snapshot.scroll_y, scrolled_y);
-        assert_eq!(snapshot.viewport_height, scrolled_height);
-        assert!(snapshot.max_scroll_y > 0.0);
-
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_shaped_viewport_blocks(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    ptr::null_mut(),
-                    0,
-                    &mut required,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(snapshot, YuStorageShapedViewportSnapshot::default());
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ffi_macos_visual_render_plan_is_glyph_atlas_bound_and_atomic() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-render-plan-{id}.md"));
-        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n\n- [ ] 任务\n\n```rust\nfn main() {}\n```\n";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let mut snapshot = YuStorageVisualRenderPlanSnapshot::default();
-        let mut command_required = 0;
-        let mut page_required = 0;
-        let mut damage_required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                    &mut command_required,
-                    &mut page_required,
-                    &mut damage_required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert!(command_required > 0);
-        assert!(page_required > 0);
-        assert!(damage_required > 0);
-        assert_eq!(snapshot.revision, 0);
-        assert_eq!(snapshot.command_count, command_required as u64);
-        assert_eq!(snapshot.upload_count, page_required as u64);
-        assert_eq!(snapshot.damage_count, damage_required as u64);
-        assert_eq!(snapshot.viewport_width, 500.0);
-        assert_eq!(snapshot.embedded_command_count, 0);
-        assert_eq!(snapshot.embedded_upload_count, 0);
-        assert_eq!(snapshot.embedded_upload_bytes, 0);
-
-        let mut too_small_commands =
-            vec![YuStorageVisualRenderCommand::default(); command_required - 1];
-        let mut pages = vec![YuStorageVisualRenderPage::default(); page_required];
-        let mut damage = vec![YuStorageVisualRenderDamage::default(); damage_required];
-        let mut written_commands = 0;
-        let mut written_pages = 0;
-        let mut written_damage = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    too_small_commands.as_mut_ptr(),
-                    too_small_commands.len(),
-                    pages.as_mut_ptr(),
-                    pages.len(),
-                    damage.as_mut_ptr(),
-                    damage.len(),
-                    &mut written_commands,
-                    &mut written_pages,
-                    &mut written_damage,
-                )
-            },
-            YU_STORAGE_BUFFER_TOO_SMALL
-        );
-        assert_eq!(written_commands, command_required);
-        assert_eq!(written_pages, page_required);
-        assert_eq!(written_damage, damage_required);
-        assert!(
-            too_small_commands
-                .iter()
-                .all(|command| *command == YuStorageVisualRenderCommand::default())
-        );
-        assert!(
-            pages
-                .iter()
-                .all(|page| *page == YuStorageVisualRenderPage::default())
-        );
-        assert!(
-            damage
-                .iter()
-                .all(|rect| *rect == YuStorageVisualRenderDamage::default())
-        );
-
-        let mut commands = vec![YuStorageVisualRenderCommand::default(); command_required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    commands.as_mut_ptr(),
-                    commands.len(),
-                    pages.as_mut_ptr(),
-                    pages.len(),
-                    damage.as_mut_ptr(),
-                    damage.len(),
-                    &mut written_commands,
-                    &mut written_pages,
-                    &mut written_damage,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(written_commands, command_required);
-        assert_eq!(written_pages, page_required);
-        assert_eq!(written_damage, damage_required);
-        assert!(commands.iter().all(|command| {
-            let geometry_valid = command.bounds_width.is_finite()
-                && command.bounds_height.is_finite()
-                && command.bounds_width >= 0.0
-                && command.bounds_height >= 0.0
-                && command.origin_x.is_finite()
-                && command.origin_y.is_finite();
-            command.revision == 0
-                && geometry_valid
-                && command.embedded_generation == 0
-                && command.embedded_kind == 0
-                && command.embedded_width == 0
-                && command.embedded_height == 0
-                && match command.kind {
-                    YU_STORAGE_RENDER_COMMAND_FILL_RECT
-                    | YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX => {
-                        command.page == YU_STORAGE_RENDER_PAGE_NONE
-                            && command.atlas_width == 0
-                            && command.atlas_height == 0
-                            && command.advance_x == 0.0
-                    }
-                    YU_STORAGE_RENDER_COMMAND_GLYPH => command.advance_x.is_finite(),
-                    _ => false,
-                }
-        }));
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.kind == YU_STORAGE_RENDER_COMMAND_FILL_RECT)
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.kind == YU_STORAGE_RENDER_COMMAND_GLYPH)
-        );
-        assert!(commands.iter().any(|command| {
-            command.kind == YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX
-                && command.bounds_width > 0.0
-                && command.bounds_height > 0.0
-        }));
-        let task_overlay = commands
-            .iter()
-            .position(|command| command.kind == YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX)
-            .expect("task checkbox overlay");
-        assert!(commands[..task_overlay].windows(2).all(|pair| {
-            pair[0].block_index <= pair[1].block_index
-                && pair[0].source_end_utf16 <= pair[1].source_end_utf16
-        }));
-        assert!(
-            commands[task_overlay..]
-                .iter()
-                .all(|command| { command.kind == YU_STORAGE_RENDER_COMMAND_TASK_CHECKBOX })
-        );
-        assert!(pages.windows(2).all(|pair| pair[0].page < pair[1].page));
-        assert!(pages.iter().all(|page| {
-            page.revision == 0 && page.width > 0 && page.height > 0 && page.fingerprint != 0
-        }));
-        assert!(damage.iter().all(|rect| {
-            rect.revision == 0
-                && rect.x.is_finite()
-                && rect.y.is_finite()
-                && rect.width.is_finite()
-                && rect.height.is_finite()
-                && rect.width >= 0.0
-                && rect.height >= 0.0
-        }));
-
-        let composition_start = source.find("粗体").expect("composition target");
-        let composition_start_utf16 = source[..composition_start].encode_utf16().count() as u64;
-        let composition_end_utf16 = composition_start_utf16 + "粗体".encode_utf16().count() as u64;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_begin_composition(
-                    raw,
-                    0,
-                    composition_start_utf16,
-                    composition_end_utf16,
-                    "日本🙂".as_ptr(),
-                    "日本🙂".len(),
-                    2,
-                    2,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        let mut stale_commands = vec![YuStorageVisualRenderCommand::default(); commands.len()];
-        let mut stale_pages = vec![YuStorageVisualRenderPage::default(); pages.len()];
-        let mut stale_damage = vec![YuStorageVisualRenderDamage::default(); damage.len()];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    stale_commands.as_mut_ptr(),
-                    stale_commands.len(),
-                    stale_pages.as_mut_ptr(),
-                    stale_pages.len(),
-                    stale_damage.as_mut_ptr(),
-                    stale_damage.len(),
-                    &mut written_commands,
-                    &mut written_pages,
-                    &mut written_damage,
-                )
-            },
-            YU_STORAGE_STALE_COMPOSITION
-        );
-        assert_eq!(snapshot, YuStorageVisualRenderPlanSnapshot::default());
-        assert_eq!(written_commands, 0);
-        assert_eq!(written_pages, 0);
-        assert_eq!(written_damage, 0);
-
-        let mut composition_snapshot = YuStorageVisualRenderPlanSnapshot::default();
-        let mut composition_command_required = 0;
-        let mut composition_page_required = 0;
-        let mut composition_damage_required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut composition_snapshot,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                    &mut composition_command_required,
-                    &mut composition_page_required,
-                    &mut composition_damage_required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(composition_snapshot.revision, 0);
-        assert_eq!(composition_snapshot.composition_generation, 1);
-        assert!(composition_command_required > 0);
-        assert!(composition_page_required > 0);
-        assert!(composition_damage_required > 0);
-
-        let mut composition_commands =
-            vec![YuStorageVisualRenderCommand::default(); composition_command_required];
-        let mut composition_pages =
-            vec![YuStorageVisualRenderPage::default(); composition_page_required];
-        let mut composition_damage =
-            vec![YuStorageVisualRenderDamage::default(); composition_damage_required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut composition_snapshot,
-                    composition_commands.as_mut_ptr(),
-                    composition_commands.len(),
-                    composition_pages.as_mut_ptr(),
-                    composition_pages.len(),
-                    composition_damage.as_mut_ptr(),
-                    composition_damage.len(),
-                    &mut written_commands,
-                    &mut written_pages,
-                    &mut written_damage,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(written_commands, composition_command_required);
-        assert_eq!(written_pages, composition_page_required);
-        assert_eq!(written_damage, composition_damage_required);
-        assert!(composition_commands.iter().all(|command| {
-            command.revision == 0
-                && command.bounds_width.is_finite()
-                && command.bounds_height.is_finite()
-        }));
-
-        assert_eq!(
-            unsafe {
-                yu_storage_session_update_composition(
-                    raw,
-                    0,
-                    1,
-                    "日本語".as_ptr(),
-                    "日本語".len(),
-                    3,
-                    3,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        let mut stale_after_update_commands =
-            vec![YuStorageVisualRenderCommand::default(); composition_command_required];
-        let mut stale_after_update_pages =
-            vec![YuStorageVisualRenderPage::default(); composition_page_required];
-        let mut stale_after_update_damage =
-            vec![YuStorageVisualRenderDamage::default(); composition_damage_required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut composition_snapshot,
-                    stale_after_update_commands.as_mut_ptr(),
-                    stale_after_update_commands.len(),
-                    stale_after_update_pages.as_mut_ptr(),
-                    stale_after_update_pages.len(),
-                    stale_after_update_damage.as_mut_ptr(),
-                    stale_after_update_damage.len(),
-                    &mut written_commands,
-                    &mut written_pages,
-                    &mut written_damage,
-                )
-            },
-            YU_STORAGE_STALE_COMPOSITION
-        );
-        assert_eq!(
-            composition_snapshot,
-            YuStorageVisualRenderPlanSnapshot::default()
-        );
-        assert_eq!(written_commands, 0);
-        assert_eq!(written_pages, 0);
-        assert_eq!(written_damage, 0);
-        assert!(
-            stale_after_update_commands
-                .iter()
-                .all(|command| *command == YuStorageVisualRenderCommand::default())
-        );
-
-        let mut updated_composition_snapshot = YuStorageVisualRenderPlanSnapshot::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut updated_composition_snapshot,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                    &mut composition_command_required,
-                    &mut composition_page_required,
-                    &mut composition_damage_required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(updated_composition_snapshot.composition_generation, 2);
-        assert!(composition_command_required > 0);
-
-        assert_eq!(
-            unsafe { yu_storage_session_cancel_composition(raw, 0, 2) },
-            YU_STORAGE_OK
-        );
-        let mut stale_after_cancel_commands =
-            vec![YuStorageVisualRenderCommand::default(); composition_command_required];
-        let mut stale_after_cancel_pages =
-            vec![YuStorageVisualRenderPage::default(); composition_page_required];
-        let mut stale_after_cancel_damage =
-            vec![YuStorageVisualRenderDamage::default(); composition_damage_required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut updated_composition_snapshot,
-                    stale_after_cancel_commands.as_mut_ptr(),
-                    stale_after_cancel_commands.len(),
-                    stale_after_cancel_pages.as_mut_ptr(),
-                    stale_after_cancel_pages.len(),
-                    stale_after_cancel_damage.as_mut_ptr(),
-                    stale_after_cancel_damage.len(),
-                    &mut written_commands,
-                    &mut written_pages,
-                    &mut written_damage,
-                )
-            },
-            YU_STORAGE_STALE_COMPOSITION
-        );
-        assert_eq!(
-            updated_composition_snapshot,
-            YuStorageVisualRenderPlanSnapshot::default()
-        );
-        assert_eq!(written_commands, 0);
-        assert_eq!(written_pages, 0);
-        assert_eq!(written_damage, 0);
-
-        let mut result = YuStorageCommandResult::default();
-        assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_visual_render_plan(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut snapshot,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                    &mut written_commands,
-                    &mut written_pages,
-                    &mut written_damage,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
-        assert_eq!(snapshot, YuStorageVisualRenderPlanSnapshot::default());
-        assert_eq!(written_commands, 0);
-        assert_eq!(written_pages, 0);
-        assert_eq!(written_damage, 0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
@@ -10571,6 +6104,139 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
+    /// 测试用：不经 CoreText，在指定 block 上开始一次分隔线拖动。
+    ///
+    /// 产品走的是 `macos_table_resize_begin_at_point`（文档坐标 + CoreText 排版）。
+    /// 度量版此前也有一个 FFI 入口，但产品从不调用——它只有测试需要，因此现在
+    /// 留在测试里，不再穿过 ABI（不变量 I3）。
+    fn begin_table_resize_for_test(
+        raw: *mut YuStorageSession,
+        block_index: usize,
+        point_x: f32,
+        point_y: f32,
+        tolerance: f32,
+        pointer_position: f32,
+    ) -> Result<YuStorageTableResizeHit, i32> {
+        // SAFETY: `raw` is a live session handle owned by the calling test.
+        let session = unsafe { raw.as_mut() }.expect("session");
+        let config = LayoutConfig::new(20.0, 2.0).with_default_advance(1.0);
+        let layout = session
+            .session
+            .block_layout(block_index, config)
+            .map_err(storage_status)?;
+        let table = layout.table().ok_or(YU_STORAGE_INVALID_SELECTION)?;
+        let hit = match table.resize_hit_test(LayoutPoint::new(point_x, point_y), tolerance) {
+            Ok(Some(hit)) => hit,
+            Ok(None) | Err(_) => return Err(YU_STORAGE_INVALID_SELECTION),
+        };
+        begin_table_resize_session(session, block_index, hit, pointer_position)
+    }
+
+    /// 帧身份必须覆盖每一项「不推进 Revision 却改变画面」的状态。
+    ///
+    /// 这个判断决定平台是否跳过提交，而漏掉一项不会报错——只会让光标停在原处、
+    /// preedit 不更新、拖动中的列宽不动。三者都表现为「编辑器卡住了」，却没有
+    /// 任何日志或错误码可查，正是本项目最危险的失败模式。
+    ///
+    /// 反向验证：把 `selection` 从 `MacosFrameKey` 去掉，第二段断言失败；
+    /// 把 `table_resize` 去掉，第三段断言失败。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_frame_key_notices_state_that_does_not_advance_revision() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-frame-key-{id}.md"));
+        fs::write(&path, "| A | B |\n| --- | :---: |\n| 1 | 2 |\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let request = YuStorageFrameGeometry {
+            size: 14.0,
+            max_width: 500.0,
+            scroll_y: 0.0,
+            viewport_height: 240.0,
+            surface_width: 500.0,
+            surface_height: 240.0,
+            scale: 2.0,
+        };
+        let geometry = MacosFrameGeometry::from_request(&request).expect("几何合法");
+        let capture = |geometry: MacosFrameGeometry| {
+            // SAFETY: `raw` is a live session handle and no other borrow is
+            // outstanding at this point.
+            let session = unsafe { raw.as_ref() }.expect("session");
+            MacosFrameKey::capture(session, geometry)
+        };
+
+        let baseline = capture(geometry);
+        assert_eq!(
+            baseline,
+            capture(geometry),
+            "状态未变时必须得到同一身份，否则每帧都会重画"
+        );
+
+        // 光标移动不推进 Revision，但会改变 caret 装饰。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection(raw, 0, 2, 2, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+            },
+            YU_STORAGE_OK
+        );
+        let moved = capture(geometry);
+        assert_eq!(moved.revision, baseline.revision, "选区变化不推进 Revision");
+        assert_ne!(baseline, moved, "光标移动必须让帧身份改变");
+
+        // 拖动列分隔线既不推进 Revision 也不改变几何。
+        let hit =
+            begin_table_resize_for_test(raw, 0, 3.1, 0.5, 0.2, 3.1).expect("begin table resize");
+        assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        let mut preview = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    4.1,
+                    &mut preview,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let dragged = capture(geometry);
+        assert_eq!(dragged.revision, moved.revision, "拖动不推进 Revision");
+        assert_eq!(dragged.geometry, moved.geometry, "拖动不改变平台几何");
+        assert_ne!(moved, dragged, "列宽覆盖变化必须让帧身份改变");
+
+        // 再拖一格：同一个 gesture 内的位移同样必须被看见。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    5.1,
+                    &mut preview,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_ne!(dragged, capture(geometry), "同一手势内的位移必须被看见");
+
+        // 几何本身仍然参与比较。
+        let scrolled = MacosFrameGeometry::from_request(&YuStorageFrameGeometry {
+            scroll_y: 40.0,
+            ..request
+        })
+        .expect("几何合法");
+        assert_ne!(capture(geometry), capture(scrolled), "滚动必须让帧身份改变");
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     /// 未知的 action 必须被拒绝，且不得触碰手势状态。
     ///
     /// 三个动作合成一个入口之后，「传错 action 会发生什么」成了一个新的失败面。
@@ -10588,15 +6254,9 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let mut hit = YuStorageTableResizeHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_begin(
-                    raw, 0, 0, 20.0, 2.0, 1.0, 3.1, 0.5, 0.2, 3.1, &mut hit,
-                )
-            },
-            YU_STORAGE_OK
-        );
+        let hit =
+            begin_table_resize_for_test(raw, 0, 3.1, 0.5, 0.2, 3.1).expect("begin table resize");
+        assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
         let mut preview = YuStorageTableResizeCommit::default();
         assert_eq!(
             unsafe {
@@ -10639,6 +6299,495 @@ mod tests {
             YU_STORAGE_OK
         );
         assert_eq!(preview.final_position, 5.0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_table_resize_gesture_lifecycle_is_revision_bound_and_source_neutral() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-table-gesture-{id}.md"));
+        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let hit =
+            begin_table_resize_for_test(raw, 0, 3.1, 0.5, 0.2, 3.1).expect("begin table resize");
+        assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        assert_eq!(hit.index, 0);
+        assert_eq!(hit.position, 3.0);
+
+        // 已有手势时不得再开一个。
+        assert_eq!(
+            begin_table_resize_for_test(raw, 0, 3.1, 0.5, 0.2, 3.1),
+            Err(YU_STORAGE_INVALID_STATE)
+        );
+
+        let mut preview = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    4.1,
+                    &mut preview,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(preview.revision, 0);
+        assert_eq!(preview.block_index, 0);
+        assert_eq!(preview.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
+        assert_eq!(preview.index, 0);
+        assert_eq!(preview.initial_position, 3.0);
+        assert_eq!(preview.final_position, 4.0);
+        assert_eq!(preview.delta, 1.0);
+
+        let mut committed = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_FINISH,
+                    0.0,
+                    &mut committed,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(committed, preview);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    4.1,
+                    &mut preview,
+                )
+            },
+            YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE
+        );
+        assert_eq!(preview, YuStorageTableResizeCommit::default());
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_CANCEL,
+                    0.0,
+                    &mut YuStorageTableResizeCommit::default(),
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"x".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_FINISH,
+                    0.0,
+                    &mut committed,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(committed, YuStorageTableResizeCommit::default());
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    1,
+                    YU_STORAGE_TABLE_RESIZE_CANCEL,
+                    0.0,
+                    &mut YuStorageTableResizeCommit::default(),
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// `macos_source_caret` 让平台在不知道 block 归属的情况下取得 caret 几何。
+    /// AppKit 的 `firstRect(forCharacterRange:)` 需要它来定位 IME 候选窗：
+    /// TextKit 排的是 canonical source，屏幕显示的是投影结果，两者字符位置
+    /// 不对应，用默认实现会让候选窗偏离真实插入点（不变量 H3、I1）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_source_caret_resolves_owning_block_and_is_revision_bound() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-source-caret-{id}.md"));
+        let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let source_start = source.find("**粗体**").expect("strong marker");
+        let source_utf16 = source[..source_start].encode_utf16().count() as u64;
+
+        let mut caret = YuStorageBlockCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_source_caret(
+                    raw,
+                    0,
+                    source_utf16,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut caret,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        // 块归属必须由 Rust 按 offset 解析出来：目标偏移在第 3 个块里。
+        assert_eq!(caret.block_index, 2);
+        assert_eq!(caret.source_utf16, source_utf16);
+        assert_eq!(caret.shaped, 1);
+        assert!(caret.caret_height > 0.0);
+        assert!(caret.caret_x.is_finite() && caret.caret_y.is_finite());
+
+        // 文档开头属于另一个 block，块归属必须真的按 offset 解析而非写死。
+        let mut first = YuStorageBlockCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_source_caret(
+                    raw,
+                    0,
+                    0,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut first,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_ne!(first.block_index, caret.block_index);
+
+        // 越界 offset 必须被拒绝，且不写入半成品结果。
+        let out_of_range = source.encode_utf16().count() as u64 + 1;
+        let mut rejected = YuStorageBlockCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_source_caret(
+                    raw,
+                    0,
+                    out_of_range,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut rejected,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(rejected, YuStorageBlockCaret::default());
+
+        // 编辑之后旧 Revision 的查询必须整体拒绝。
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_macos_source_caret(
+                    raw,
+                    0,
+                    source_utf16,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    14.0,
+                    500.0,
+                    &mut caret,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_composition_projection_is_generation_bound_and_preserves_source() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yu-storage-ffi-composition-projection-{id}.md"));
+        let source = "before **x** after";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_begin_composition(
+                    raw,
+                    0,
+                    9,
+                    10,
+                    "日本🙂".as_ptr(),
+                    "日本🙂".len(),
+                    2,
+                    4,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut projection = YuStorageCompositionProjection::default();
+        assert_eq!(
+            unsafe { yu_storage_session_composition_projection(raw, 0, &mut projection) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(projection.revision, 0);
+        assert_eq!(projection.generation, 1);
+        assert_eq!(projection.replacement_start_utf16, 9);
+        assert_eq!(projection.replacement_end_utf16, 10);
+        assert_eq!(projection.preedit_selection_start_utf16, 2);
+        assert_eq!(projection.preedit_selection_end_utf16, 4);
+        assert_eq!(projection.visual_selection_start_utf16, 9);
+        assert_eq!(projection.visual_selection_end_utf16, 11);
+        assert_eq!(projection.visual_replacement_start_utf16, 7);
+        assert_eq!(projection.visual_replacement_end_utf16, 11);
+        assert_eq!(projection.projected_utf16_length, 17);
+        assert_eq!(
+            projection.projected_utf8_length,
+            "before 日本🙂 after".len() as u64
+        );
+
+        // preedit 投影文本与 composition caret 的几何都不再跨 ABI
+        // （不变量 I3）；这里保留的是 generation 绑定与 source 不变。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_update_composition(
+                    raw,
+                    0,
+                    projection.generation,
+                    "日本語".as_ptr(),
+                    "日本語".len(),
+                    3,
+                    3,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut updated = projection;
+        assert_eq!(
+            unsafe { yu_storage_session_composition_projection(raw, 0, &mut updated) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(updated.generation, 2);
+        assert_eq!(updated.projected_utf16_length, 16);
+        // 旧 generation 的写入必须整体拒绝。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_update_composition(
+                    raw,
+                    0,
+                    projection.generation,
+                    "x".as_ptr(),
+                    1,
+                    1,
+                    1,
+                )
+            },
+            YU_STORAGE_STALE_COMPOSITION
+        );
+
+        let mut canonical_required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_source(raw, ptr::null_mut(), 0, &mut canonical_required)
+            },
+            YU_STORAGE_OK
+        );
+        let mut canonical = vec![0_u8; canonical_required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_source(
+                    raw,
+                    canonical.as_mut_ptr(),
+                    canonical.len(),
+                    &mut canonical_required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            std::str::from_utf8(&canonical).expect("canonical UTF-8"),
+            source
+        );
+
+        let state = unsafe { yu_storage_session_cancel_composition(raw, 0, updated.generation) };
+        assert_eq!(state, YU_STORAGE_OK);
+        assert_eq!(
+            unsafe { yu_storage_session_composition_projection(raw, 0, &mut updated) },
+            YU_STORAGE_NO_OVERLAY
+        );
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_projection_visual_mirror_maps_caret_and_selection_back_to_source() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-visual-mirror-{id}.md"));
+        let source = "before **粗体** after\n日本🙂";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        // 投影文本不再跨 ABI（不变量 I3）；直接查内部投影。
+        let projected = {
+            // SAFETY: `raw` is a live session handle owned by this test.
+            let session = unsafe { raw.as_mut() }.expect("session");
+            let projection = session
+                .session
+                .inline_projection_for_visual_state()
+                .expect("projection");
+            projected_utf8(&projection).expect("projected")
+        };
+        let source_strong = source.find("**粗体**").expect("source strong") as u64;
+        let source_strong_end = source_strong + "**粗体**".len() as u64;
+        let visual_strong = projected.find("粗体").expect("visual strong") as u64;
+        let visual_strong_end = visual_strong + "粗体".len() as u64;
+        let source_start_utf16 = source[..source_strong as usize].encode_utf16().count() as u64;
+        let source_end_utf16 = source[..source_strong_end as usize].encode_utf16().count() as u64;
+        let visual_start_utf16 = projected[..visual_strong as usize].encode_utf16().count() as u64;
+        let visual_end_utf16 = projected[..visual_strong_end as usize]
+            .encode_utf16()
+            .count() as u64;
+
+        // 折叠选区就是「一个光标」的映射，与非折叠区间走同一条路径。
+        let mut collapsed = YuStorageProjectionSourceSelection {
+            revision: 99,
+            ..YuStorageProjectionSourceSelection::default()
+        };
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_source_selection(
+                    raw,
+                    0,
+                    visual_start_utf16,
+                    visual_start_utf16,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                    &mut collapsed,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(collapsed.revision, 0);
+        assert_eq!(collapsed.visual_start_utf16, visual_start_utf16);
+        assert_eq!(collapsed.source_start_utf16, source_start_utf16);
+        assert_eq!(collapsed.round_trip_visual_start_utf16, visual_start_utf16);
+
+        let mut selection = YuStorageProjectionSourceSelection::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_source_selection(
+                    raw,
+                    0,
+                    visual_start_utf16,
+                    visual_end_utf16,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    &mut selection,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(selection.revision, 0);
+        assert_eq!(selection.visual_start_utf16, visual_start_utf16);
+        assert_eq!(selection.visual_end_utf16, visual_end_utf16);
+        assert_eq!(selection.source_start_utf16, source_start_utf16);
+        assert_eq!(selection.source_end_utf16, source_end_utf16);
+        assert_eq!(selection.round_trip_visual_start_utf16, visual_start_utf16);
+        assert_eq!(selection.round_trip_visual_end_utf16, visual_end_utf16);
+
+        // surrogate 中间位置不得穿过 ABI（不变量 I4）。
+        let emoji_visual_start = projected.find("🙂").expect("emoji") as u64;
+        let emoji_utf16 = projected[..emoji_visual_start as usize]
+            .encode_utf16()
+            .count() as u64;
+        let mut surrogate = YuStorageProjectionSourceSelection::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_source_selection(
+                    raw,
+                    0,
+                    emoji_utf16 + 1,
+                    emoji_utf16 + 1,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    &mut surrogate,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(surrogate, YuStorageProjectionSourceSelection::default());
+
+        selection.revision = 99;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_source_selection(
+                    raw,
+                    0,
+                    visual_end_utf16,
+                    visual_start_utf16,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    &mut selection,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(selection, YuStorageProjectionSourceSelection::default());
+
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, 0, b"!".as_ptr(), 1, &mut result) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_source_selection(
+                    raw,
+                    0,
+                    visual_start_utf16,
+                    visual_end_utf16,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    &mut selection,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(selection, YuStorageProjectionSourceSelection::default());
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
@@ -10757,118 +6906,6 @@ mod tests {
             (session.session.viewport_config().layout().max_width() - 640.0).abs() <= f32::EPSILON,
             "宽度变化必须重新发布配置"
         );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    /// 帧身份必须覆盖每一项「不推进 Revision 却改变画面」的状态。
-    ///
-    /// 这个判断决定平台是否跳过提交，而漏掉一项不会报错——只会让光标停在原处、
-    /// preedit 不更新、拖动中的列宽不动。三者都表现为「编辑器卡住了」，却没有
-    /// 任何日志或错误码可查，正是本项目最危险的失败模式。
-    ///
-    /// 反向验证：把 `selection` 从 `MacosFrameKey` 去掉，第二段断言失败；
-    /// 把 `table_resize` 去掉，第三段断言失败。
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ffi_frame_key_notices_state_that_does_not_advance_revision() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-frame-key-{id}.md"));
-        fs::write(&path, "| A | B |\n| --- | :---: |\n| 1 | 2 |\n").expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        let request = YuStorageFrameGeometry {
-            size: 14.0,
-            max_width: 500.0,
-            scroll_y: 0.0,
-            viewport_height: 240.0,
-            surface_width: 500.0,
-            surface_height: 240.0,
-            scale: 2.0,
-        };
-        let geometry = MacosFrameGeometry::from_request(&request).expect("几何合法");
-        let capture = |geometry: MacosFrameGeometry| {
-            // SAFETY: `raw` is a live session handle and no other borrow is
-            // outstanding at this point.
-            let session = unsafe { raw.as_ref() }.expect("session");
-            MacosFrameKey::capture(session, geometry)
-        };
-
-        let baseline = capture(geometry);
-        assert_eq!(
-            baseline,
-            capture(geometry),
-            "状态未变时必须得到同一身份，否则每帧都会重画"
-        );
-
-        // 光标移动不推进 Revision，但会改变 caret 装饰。
-        assert_eq!(
-            unsafe {
-                yu_storage_session_set_selection(raw, 0, 2, 2, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
-            },
-            YU_STORAGE_OK
-        );
-        let moved = capture(geometry);
-        assert_eq!(moved.revision, baseline.revision, "选区变化不推进 Revision");
-        assert_ne!(baseline, moved, "光标移动必须让帧身份改变");
-
-        // 拖动列分隔线既不推进 Revision 也不改变几何。
-        let mut hit = YuStorageTableResizeHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_begin(
-                    raw, 0, 0, 20.0, 2.0, 1.0, 3.1, 0.5, 0.2, 3.1, &mut hit,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
-        let mut preview = YuStorageTableResizeCommit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_action(
-                    raw,
-                    0,
-                    YU_STORAGE_TABLE_RESIZE_UPDATE,
-                    4.1,
-                    &mut preview,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        let dragged = capture(geometry);
-        assert_eq!(dragged.revision, moved.revision, "拖动不推进 Revision");
-        assert_eq!(dragged.geometry, moved.geometry, "拖动不改变平台几何");
-        assert_ne!(moved, dragged, "列宽覆盖变化必须让帧身份改变");
-
-        // 再拖一格：同一个 gesture 内的位移同样必须被看见。
-        assert_eq!(
-            unsafe {
-                yu_storage_session_table_resize_action(
-                    raw,
-                    0,
-                    YU_STORAGE_TABLE_RESIZE_UPDATE,
-                    5.1,
-                    &mut preview,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_ne!(dragged, capture(geometry), "同一手势内的位移必须被看见");
-
-        // 几何本身仍然参与比较。
-        let scrolled = MacosFrameGeometry::from_request(&YuStorageFrameGeometry {
-            scroll_y: 40.0,
-            ..request
-        })
-        .expect("几何合法");
-        assert_ne!(capture(geometry), capture(scrolled), "滚动必须让帧身份改变");
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
@@ -11527,212 +7564,6 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
-    #[test]
-    fn ffi_composition_projection_is_generation_bound_and_preserves_source() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("yu-storage-ffi-composition-projection-{id}.md"));
-        let source = "before **x** after";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_begin_composition(
-                    raw,
-                    0,
-                    9,
-                    10,
-                    "日本🙂".as_ptr(),
-                    "日本🙂".len(),
-                    2,
-                    4,
-                )
-            },
-            YU_STORAGE_OK
-        );
-
-        let mut projection = YuStorageCompositionProjection::default();
-        assert_eq!(
-            unsafe { yu_storage_session_composition_projection(raw, 0, &mut projection) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(projection.revision, 0);
-        assert_eq!(projection.generation, 1);
-        assert_eq!(projection.replacement_start_utf16, 9);
-        assert_eq!(projection.replacement_end_utf16, 10);
-        assert_eq!(projection.preedit_selection_start_utf16, 2);
-        assert_eq!(projection.preedit_selection_end_utf16, 4);
-        assert_eq!(projection.visual_selection_start_utf16, 9);
-        assert_eq!(projection.visual_selection_end_utf16, 11);
-        assert_eq!(projection.visual_replacement_start_utf16, 7);
-        assert_eq!(projection.visual_replacement_end_utf16, 11);
-        assert_eq!(projection.projected_utf16_length, 17);
-        assert_eq!(
-            projection.projected_utf8_length,
-            "before 日本🙂 after".len() as u64
-        );
-
-        let mut required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_copy_composition_projection(
-                    raw,
-                    projection.revision,
-                    projection.generation,
-                    ptr::null_mut(),
-                    0,
-                    &mut required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(required, projection.projected_utf8_length as usize);
-        let mut small = vec![0_u8; required.saturating_sub(1)];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_copy_composition_projection(
-                    raw,
-                    projection.revision,
-                    projection.generation,
-                    small.as_mut_ptr(),
-                    small.len(),
-                    &mut required,
-                )
-            },
-            YU_STORAGE_BUFFER_TOO_SMALL
-        );
-        let mut projected = vec![0_u8; required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_copy_composition_projection(
-                    raw,
-                    projection.revision,
-                    projection.generation,
-                    projected.as_mut_ptr(),
-                    projected.len(),
-                    &mut required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            std::str::from_utf8(&projected).expect("projected text stays UTF-8"),
-            "before 日本🙂 after"
-        );
-
-        let mut caret = YuStorageCompositionCaret::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_composition_caret(
-                    raw,
-                    projection.revision,
-                    projection.generation,
-                    9,
-                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
-                    &mut caret,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(caret.revision, 0);
-        assert_eq!(caret.generation, 1);
-        assert_eq!(caret.source_utf16, 9);
-        assert_eq!(caret.visual_utf16, 11);
-        assert_eq!(caret.visual_selection_start_utf16, 9);
-        assert_eq!(caret.visual_selection_end_utf16, 11);
-        let mut invalid_caret = YuStorageCompositionCaret {
-            revision: 99,
-            ..YuStorageCompositionCaret::default()
-        };
-        assert_eq!(
-            unsafe {
-                yu_storage_session_composition_caret(
-                    raw,
-                    projection.revision,
-                    projection.generation,
-                    9,
-                    99,
-                    &mut invalid_caret,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(invalid_caret, YuStorageCompositionCaret::default());
-
-        assert_eq!(
-            unsafe {
-                yu_storage_session_update_composition(
-                    raw,
-                    0,
-                    projection.generation,
-                    "日本語".as_ptr(),
-                    "日本語".len(),
-                    3,
-                    3,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        let mut updated = projection;
-        assert_eq!(
-            unsafe { yu_storage_session_composition_projection(raw, 0, &mut updated) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(updated.generation, 2);
-        assert_eq!(updated.projected_utf16_length, 16);
-        assert_eq!(
-            unsafe {
-                yu_storage_session_copy_composition_projection(
-                    raw,
-                    0,
-                    projection.generation,
-                    ptr::null_mut(),
-                    0,
-                    &mut required,
-                )
-            },
-            YU_STORAGE_STALE_COMPOSITION
-        );
-
-        let mut canonical_required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_copy_source(raw, ptr::null_mut(), 0, &mut canonical_required)
-            },
-            YU_STORAGE_OK
-        );
-        let mut canonical = vec![0_u8; canonical_required];
-        assert_eq!(
-            unsafe {
-                yu_storage_session_copy_source(
-                    raw,
-                    canonical.as_mut_ptr(),
-                    canonical.len(),
-                    &mut canonical_required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            std::str::from_utf8(&canonical).expect("canonical UTF-8"),
-            source
-        );
-
-        let state = unsafe { yu_storage_session_cancel_composition(raw, 0, updated.generation) };
-        assert_eq!(state, YU_STORAGE_OK);
-        assert_eq!(
-            unsafe { yu_storage_session_composition_projection(raw, 0, &mut updated) },
-            YU_STORAGE_NO_OVERLAY
-        );
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_composition_shaped_caret_is_generation_bound() {
@@ -11813,166 +7644,6 @@ mod tests {
             YU_STORAGE_STALE_COMPOSITION
         );
         assert_eq!(updated, YuStorageCompositionShapedCaret::default());
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ffi_macos_composition_hit_test_maps_cross_block_transient_coordinates() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "yu-storage-ffi-composition-hit-test-cross-block-{id}.md"
-        ));
-        let source = "first **x**\n\nsecond 日本語";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-        let replacement_start = source.find('x').expect("replacement start");
-        let replacement_end = source.find("日本語").expect("replacement end") + "日本".len();
-        let replacement_start_utf16 = source[..replacement_start].encode_utf16().count() as u64;
-        let replacement_end_utf16 = source[..replacement_end].encode_utf16().count() as u64;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_begin_composition(
-                    raw,
-                    0,
-                    replacement_start_utf16,
-                    replacement_end_utf16,
-                    "日本🙂".as_ptr(),
-                    "日本🙂".len(),
-                    2,
-                    2,
-                )
-            },
-            YU_STORAGE_OK
-        );
-
-        let mut viewport = YuStorageShapedViewportSnapshot::default();
-        let mut required = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_shaped_viewport_blocks(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut viewport,
-                    ptr::null_mut(),
-                    0,
-                    &mut required,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        let mut blocks = vec![YuStorageShapedViewportBlock::default(); required];
-        let mut written = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_shaped_viewport_blocks(
-                    raw,
-                    0,
-                    14.0,
-                    500.0,
-                    0.0,
-                    1_000.0,
-                    &mut viewport,
-                    blocks.as_mut_ptr(),
-                    blocks.len(),
-                    &mut written,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(written, blocks.len());
-        let second_start = source.find("second").expect("second block");
-        let second_start_utf16 = source[..second_start].encode_utf16().count() as u64;
-        let second = blocks
-            .iter()
-            .find(|block| {
-                block.source_start_utf16 <= second_start_utf16
-                    && block.source_end_utf16 >= second_start_utf16
-            })
-            .copied()
-            .or_else(|| blocks.get(2).copied())
-            .expect("second block geometry");
-
-        let mut composition_hit = YuStorageCompositionProjectionHit::default();
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_composition_projection_hit_test(
-                    raw,
-                    0,
-                    1,
-                    499.0,
-                    second.y + second.height * 0.5,
-                    14.0,
-                    500.0,
-                    &mut composition_hit,
-                )
-            },
-            YU_STORAGE_OK
-        );
-        assert_eq!(composition_hit.revision, 0);
-        assert_eq!(composition_hit.generation, 1);
-        assert_eq!(composition_hit.block_index, second.block_index);
-        assert!(composition_hit.x.is_finite());
-        assert!(composition_hit.y.is_finite());
-        assert!(composition_hit.visual_utf16 >= composition_hit.visual_replacement_start_utf16);
-        assert!(
-            composition_hit.visual_selection_end_utf16
-                >= composition_hit.visual_selection_start_utf16
-        );
-
-        let mut projection = YuStorageCompositionProjection::default();
-        assert_eq!(
-            unsafe { yu_storage_session_composition_projection(raw, 0, &mut projection) },
-            YU_STORAGE_OK
-        );
-        assert_eq!(
-            composition_hit.visual_selection_start_utf16,
-            projection.visual_selection_start_utf16
-        );
-        assert_eq!(
-            composition_hit.visual_selection_end_utf16,
-            projection.visual_selection_end_utf16
-        );
-        assert_eq!(
-            composition_hit.visual_replacement_start_utf16,
-            projection.visual_replacement_start_utf16
-        );
-        assert_eq!(
-            composition_hit.visual_replacement_end_utf16,
-            projection.visual_replacement_end_utf16
-        );
-
-        let mut stale = YuStorageCompositionProjectionHit {
-            revision: 99,
-            ..YuStorageCompositionProjectionHit::default()
-        };
-        assert_eq!(
-            unsafe {
-                yu_storage_session_macos_composition_projection_hit_test(
-                    raw,
-                    0,
-                    2,
-                    499.0,
-                    second.y + second.height * 0.5,
-                    14.0,
-                    500.0,
-                    &mut stale,
-                )
-            },
-            YU_STORAGE_STALE_COMPOSITION
-        );
-        assert_eq!(stale, YuStorageCompositionProjectionHit::default());
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

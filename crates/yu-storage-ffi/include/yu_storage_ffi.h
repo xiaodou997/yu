@@ -193,19 +193,6 @@ typedef struct YuStorageProjectionCaret {
     uint8_t affinity;
 } YuStorageProjectionCaret;
 
-/* Revision-bound source selection projected into visual UTF-16 coordinates.
- * Non-collapsed source boundaries use the outer projection edges, so hidden
- * Markdown delimiters are not reintroduced into the visual selection. */
-typedef struct YuStorageProjectionSelection {
-    uint64_t revision;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    uint64_t visual_start_utf16;
-    uint64_t visual_end_utf16;
-    uint64_t round_trip_source_start_utf16;
-    uint64_t round_trip_source_end_utf16;
-    uint8_t affinity;
-} YuStorageProjectionSelection;
 
 
 /* Reverse selection mapping for a native visual mirror. Non-collapsed visual
@@ -256,18 +243,6 @@ typedef struct YuStorageCompositionProjection {
     uint64_t visual_replacement_end_utf16;
 } YuStorageCompositionProjection;
 
-/* Active marked-text caret in the transient projected stream. The visual
- * selection is returned in projected UTF-16 coordinates. */
-typedef struct YuStorageCompositionCaret {
-    uint64_t revision;
-    uint64_t generation;
-    uint64_t source_utf16;
-    uint64_t visual_utf16;
-    uint64_t round_trip_source_utf16;
-    uint64_t visual_selection_start_utf16;
-    uint64_t visual_selection_end_utf16;
-    uint8_t affinity;
-} YuStorageCompositionCaret;
 
 /* Revision/generation-bound CoreText-shaped caret geometry for the active
  * marked-text projection. caret_x/caret_y are local to block_index; visual
@@ -291,77 +266,10 @@ typedef struct YuStorageCompositionShapedCaret {
     uint8_t affinity;
 } YuStorageCompositionShapedCaret;
 
-/* Revision/generation-bound CoreText-shaped point hit-test for the active
- * marked-text projection. x/y are document-space coordinates; visual ranges
- * use UTF-16 offsets in the transient projected stream. */
-typedef struct YuStorageCompositionProjectionHit {
-    uint64_t revision;
-    uint64_t generation;
-    uint64_t source_utf16;
-    uint64_t block_index;
-    uint64_t visual_utf16;
-    uint64_t round_trip_source_utf16;
-    uint64_t line;
-    float x;
-    float y;
-    uint64_t visual_selection_start_utf16;
-    uint64_t visual_selection_end_utf16;
-    uint64_t visual_replacement_start_utf16;
-    uint64_t visual_replacement_end_utf16;
-    uint8_t affinity;
-} YuStorageCompositionProjectionHit;
 
-typedef struct YuStorageProjectionBlock {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    uint64_t visual_utf8_length;
-    uint64_t visual_utf16_length;
-    uint8_t kind;
-    uint8_t projection_kind;
-} YuStorageProjectionBlock;
 
-/* Parser-owned GFM table cell range. row 0 is the header, row 1 is the
- * delimiter, and body rows start at row 2. Offsets are UTF-16 positions in
- * the requested revision. */
-typedef struct YuStorageTableCellRange {
-    uint64_t row;
-    uint64_t column;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-} YuStorageTableCellRange;
 
-/* Revision-bound visible table cell geometry. row 0 is the header and body
- * rows start at row 1; the Markdown delimiter row is source-backed but not
- * present in this visible geometry list. */
-typedef struct YuStorageTableLayoutCell {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t row;
-    uint64_t column;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    float x;
-    float y;
-    float width;
-    float height;
-    uint8_t alignment;
-} YuStorageTableLayoutCell;
 
-/* Revision-bound hit-test result for one visible table cell. */
-typedef struct YuStorageTableCellHit {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t row;
-    uint64_t column;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    float x;
-    float y;
-    float width;
-    float height;
-} YuStorageTableCellHit;
 
 /* One source-backed task checkbox from the currently published macOS retained
  * frame. Bounds use document-space scene coordinates; the marker range is the
@@ -418,23 +326,6 @@ typedef struct YuStorageTableResizeCommit {
     float delta;
 } YuStorageTableResizeCommit;
 
-/* Revision-bound layout metadata for one parser-owned block. width/height
- * are block-local layout points; shaped is non-zero for CoreText output. */
-typedef struct YuStorageBlockLayout {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    uint64_t visual_utf16_length;
-    uint64_t line_count;
-    float width;
-    float height;
-    float line_height;
-    float default_advance;
-    uint8_t kind;
-    uint8_t projection_kind;
-    uint8_t shaped;
-} YuStorageBlockLayout;
 
 /* Revision-bound CoreText metrics used to configure an empty or non-empty
  * viewport before requesting a render-host frame. */
@@ -461,29 +352,7 @@ typedef struct YuStorageBlockCaret {
     uint8_t shaped;
 } YuStorageBlockCaret;
 
-/* Revision-bound block metadata returned by a CoreText-shaped viewport query.
- * y/height are document-space point coordinates; source ranges are UTF-16. */
-typedef struct YuStorageShapedViewportBlock {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    float y;
-    float height;
-    uint8_t measured;
-    uint8_t kind;
-} YuStorageShapedViewportBlock;
 
-typedef struct YuStorageShapedViewportSnapshot {
-    uint64_t revision;
-    uint64_t block_start;
-    uint64_t block_end;
-    float content_height;
-    /* Native viewport inputs used to interpret document-space block y. */
-    float scroll_y;
-    float viewport_height;
-    float max_scroll_y;
-} YuStorageShapedViewportSnapshot;
 
 /* Revision-bound shaped caret geometry and absolute document scroll target. */
 typedef struct YuStorageCaretScrollRequest {
@@ -525,70 +394,9 @@ enum {
 
 
 
-typedef struct YuStorageVisualRenderPlanSnapshot {
-    uint64_t revision;
-    uint64_t composition_generation;
-    uint64_t block_start;
-    uint64_t block_end;
-    uint64_t command_count;
-    uint64_t upload_count;
-    uint64_t damage_count;
-    float content_height;
-    float scroll_y;
-    float viewport_height;
-    float max_scroll_y;
-    float viewport_width;
-    /* Appended diagnostics for backend-neutral embedded SVG publication. */
-    uint64_t embedded_command_count;
-    uint64_t embedded_upload_count;
-    uint64_t embedded_upload_bytes;
-} YuStorageVisualRenderPlanSnapshot;
 
-typedef struct YuStorageVisualRenderCommand {
-    uint64_t revision;
-    uint64_t block_index;
-    uint64_t source_start_utf16;
-    uint64_t source_end_utf16;
-    uint8_t kind;
-    uint32_t page;
-    uint32_t atlas_x;
-    uint32_t atlas_y;
-    uint32_t atlas_width;
-    uint32_t atlas_height;
-    float origin_x;
-    float origin_y;
-    float bearing_x;
-    float bearing_y;
-    float advance_x;
-    float bounds_x;
-    float bounds_y;
-    float bounds_width;
-    float bounds_height;
-    uint32_t color_rgba;
-    uint64_t resource;
-    /* Appended embedded-resource identity/dimensions. Older native callers
-     * can ignore these fields while newer hosts can gate SVG uploads. */
-    uint64_t embedded_generation;
-    uint8_t embedded_kind;
-    uint32_t embedded_width;
-    uint32_t embedded_height;
-} YuStorageVisualRenderCommand;
 
-typedef struct YuStorageVisualRenderPage {
-    uint64_t revision;
-    uint32_t page;
-    uint32_t width;
-    uint32_t height;
-    uint64_t fingerprint;
-} YuStorageVisualRenderPage;
 
-typedef struct YuStorageVisualRenderDamage {
-    uint64_t revision;
-    float x;
-    float y;
-    float width;
-    float height;
-} YuStorageVisualRenderDamage;
 
 /* Scalar lifecycle state owned by the persistent Rust macOS render host.
  * UINT64_MAX in frame_revision/frame_serial means that no frame has been
@@ -715,29 +523,14 @@ int32_t yu_storage_session_copy_path(const YuStorageSession *session,
 int32_t yu_storage_session_copy_source(const YuStorageSession *session,
                                        uint8_t *output, size_t capacity,
                                        size_t *written);
-/* Returns a revision-bound source projection for native layout probes. The
- * result is visual text only; canonical Markdown source remains owned by the
- * session and is queried through yu_storage_session_copy_source. */
-int32_t yu_storage_session_projected_source(YuStorageSession *session,
-                                            uint64_t expected_revision,
-                                            uint8_t *output, size_t capacity,
-                                            size_t *written);
 int32_t yu_storage_session_projection_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     YuStorageProjectionCaret *output);
-int32_t yu_storage_session_projection_selection(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t source_start_utf16, uint64_t source_end_utf16,
-    uint8_t affinity, YuStorageProjectionSelection *output);
 int32_t yu_storage_session_projection_source_selection(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t visual_start_utf16, uint64_t visual_end_utf16,
     uint8_t affinity, YuStorageProjectionSourceSelection *output);
-int32_t yu_storage_session_projection_hit_test(
-    YuStorageSession *session, uint64_t expected_revision,
-    float point_x, float point_y, float max_width, float line_height,
-    float default_advance, YuStorageProjectionHit *output);
 /* Revision-bound macOS CoreText-shaped point hit-test. point_x/point_y are
  * document-space coordinates; returned x/y are snapped document-space caret
  * coordinates. The native TextKit mirror is not consulted. */
@@ -748,66 +541,10 @@ int32_t yu_storage_session_macos_projection_hit_test(
 int32_t yu_storage_session_composition_projection(
     YuStorageSession *session, uint64_t expected_revision,
     YuStorageCompositionProjection *output);
-int32_t yu_storage_session_copy_composition_projection(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t expected_generation, uint8_t *output, size_t capacity,
-    size_t *written);
-int32_t yu_storage_session_composition_caret(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t expected_generation, uint64_t source_utf16, uint8_t affinity,
-    YuStorageCompositionCaret *output);
 int32_t yu_storage_session_macos_composition_shaped_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t expected_generation, uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageCompositionShapedCaret *output);
-int32_t yu_storage_session_macos_composition_projection_hit_test(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t expected_generation, float point_x, float point_y,
-    float size, float max_width, YuStorageCompositionProjectionHit *output);
-int32_t yu_storage_session_projection_block_count(
-    const YuStorageSession *session, uint64_t expected_revision,
-    size_t *output);
-/* Returns one parser-owned block's projected UTF-8 and metadata. A null
- * output with zero capacity is the length-query form; metadata is still
- * filled so the caller can validate source range, kind and visual lengths
- * before allocating its second-call buffer. */
-int32_t yu_storage_session_projected_block(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, YuStorageProjectionBlock *metadata,
-    uint8_t *output, size_t capacity, size_t *written);
-int32_t yu_storage_session_projected_table_cells(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, YuStorageTableCellRange *output,
-    size_t capacity, size_t *written);
-int32_t yu_storage_session_table_layout_cells(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, float max_width, float line_height,
-    float default_advance, YuStorageTableLayoutCell *output,
-    size_t capacity, size_t *written);
-/* Returns one-call, session-only column geometry. The source and canonical
- * layout remain unchanged; row resize is rejected until variable-row layout
- * exists. */
-int32_t yu_storage_session_table_layout_cells_with_resize(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, float max_width, float line_height,
-    float default_advance, uint8_t resize_kind, uint64_t resize_index,
-    float resize_delta, YuStorageTableLayoutCell *output,
-    size_t capacity, size_t *written);
-int32_t yu_storage_session_table_cell_hit_test(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, float max_width, float line_height,
-    float default_advance, float point_x, float point_y,
-    YuStorageTableCellHit *output);
-int32_t yu_storage_session_table_resize_hit_test(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, float max_width, float line_height,
-    float default_advance, float point_x, float point_y, float tolerance,
-    YuStorageTableResizeHit *output);
-int32_t yu_storage_session_table_resize_begin(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, float max_width, float line_height,
-    float default_advance, float point_x, float point_y, float tolerance,
-    float pointer_position, YuStorageTableResizeHit *output);
 /* Advances one table divider drag. update/finish/cancel were three separate
  * entry points with identical parameters and preconditions; they are three
  * phases of one pointer gesture, which I3 already allows as an input event.
@@ -834,21 +571,9 @@ int32_t yu_storage_session_macos_table_resize_begin_at_point(
     YuStorageSession *session, uint64_t expected_revision,
     float size, float max_width, float point_x, float point_y, float tolerance,
     float pointer_position, YuStorageTableResizeHit *output);
-int32_t yu_storage_session_block_layout(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, float max_width, float line_height,
-    float default_advance, YuStorageBlockLayout *output);
-int32_t yu_storage_session_macos_block_layout(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, float size, float max_width,
-    YuStorageBlockLayout *output);
 int32_t yu_storage_session_macos_font_metrics(
     YuStorageSession *session, uint64_t expected_revision,
     float size, float max_width, YuStorageMacosFontMetrics *output);
-int32_t yu_storage_session_macos_block_caret(
-    YuStorageSession *session, uint64_t expected_revision,
-    uint64_t block_index, uint64_t source_utf16, uint8_t affinity,
-    float size, float max_width, YuStorageBlockCaret *output);
 /* Resolves a source caret's shaped geometry without the caller naming a
  * block. The platform needs this for IME candidate-window placement: only the
  * Rust layout knows where the caret is on screen, because TextKit lays out
@@ -857,11 +582,6 @@ int32_t yu_storage_session_macos_source_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageBlockCaret *output);
-int32_t yu_storage_session_macos_shaped_viewport_blocks(
-    YuStorageSession *session, uint64_t expected_revision, float size,
-    float max_width, float scroll_y, float viewport_height,
-    YuStorageShapedViewportSnapshot *snapshot,
-    YuStorageShapedViewportBlock *blocks, size_t capacity, size_t *written);
 /* Returns read-only, document-space descriptors for visible table column
  * dividers. The first call may use null output/zero capacity to query count;
  * an existing session-only column preview is reflected, but no resize session
@@ -875,14 +595,6 @@ int32_t yu_storage_session_macos_shaped_caret_scroll_request(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
     YuStorageCaretScrollRequest *output);
-int32_t yu_storage_session_macos_visual_render_plan(
-    YuStorageSession *session, uint64_t expected_revision, float size,
-    float max_width, float scroll_y, float viewport_height,
-    YuStorageVisualRenderPlanSnapshot *snapshot,
-    YuStorageVisualRenderCommand *commands, size_t command_capacity,
-    YuStorageVisualRenderPage *pages, size_t page_capacity,
-    YuStorageVisualRenderDamage *damage, size_t damage_capacity,
-    size_t *written_commands, size_t *written_pages, size_t *written_damage);
 int32_t yu_storage_session_macos_render_host_frame(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
