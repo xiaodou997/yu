@@ -37,6 +37,12 @@ ALLOWED: dict[str, set[str]] = {
     "yu-font": {"yu-core"},
     "yu-assets": {"yu-core"},
     # 2 层：解析与资源渲染。
+    #
+    # yu-syntax 在 yu-markdown 下方：它只认识语法树，不产出 decoration。
+    # 现阶段 yu-markdown 还没有依赖它——S3 只建解析器，接线在 S4/S5 随
+    # yu-decoration 与布局重写一起做（理由见 docs/architecture/overview-v2.md
+    # 第 8 节）。这条边先登记，是为了让方向从一开始就被约束住。
+    "yu-syntax": {"yu-core", "yu-text"},
     "yu-markdown": {"yu-core", "yu-text"},
     "yu-embedded-math": {"yu-assets"},
     # 3 层：投影（S4 由 yu-decoration 取代）。
