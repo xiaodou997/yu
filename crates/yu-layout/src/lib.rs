@@ -13,8 +13,8 @@ use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{
-    Affinity, ByteOffset, ClusterMetrics, FontFaceId, GlyphId, ShapedText, ShapingProvider,
-    TextAnchor, TextRange, TextStyle,
+    Affinity, ByteOffset, ClusterMetrics, FontFaceId, GeometryError, GlyphId, ShapedText,
+    ShapingProvider, TextAnchor, TextRange, TextStyle,
 };
 use yu_projection::{
     BlockProjection, BlockQuotePresentation, HeadingPresentation, LeadingMarker, Projection,
@@ -298,6 +298,7 @@ impl ClusterMetrics for MonospaceMetrics {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutError {
     Projection(ProjectionError),
+    Geometry(GeometryError),
     InvalidConfig(&'static str),
     InvalidMetrics(u32),
     Shaping(String),
@@ -477,6 +478,7 @@ impl fmt::Display for LayoutError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Projection(error) => error.fmt(formatter),
+            Self::Geometry(error) => error.fmt(formatter),
             Self::InvalidConfig(message) => formatter.write_str(message),
             Self::InvalidMetrics(advance) => write!(
                 formatter,
@@ -500,6 +502,7 @@ impl Error for LayoutError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Projection(error) => Some(error),
+            Self::Geometry(error) => Some(error),
             Self::InvalidConfig(_)
             | Self::InvalidMetrics(_)
             | Self::Shaping(_)
@@ -511,96 +514,30 @@ impl Error for LayoutError {
     }
 }
 
+impl From<GeometryError> for LayoutError {
+    fn from(error: GeometryError) -> Self {
+        Self::Geometry(error)
+    }
+}
+
 impl From<ProjectionError> for LayoutError {
     fn from(error: ProjectionError) -> Self {
         Self::Projection(error)
     }
 }
 
-/// A point in the block's local layout coordinate system.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LayoutPoint {
-    x: f32,
-    y: f32,
-}
+/// Block 局部坐标系里的点与矩形。
+///
+/// 实现在 `yu-core`，空间是 [`yu_core::Block`]。用别名而不是自己再写一份：
+/// 算术只写一遍，而「这是 block 局部坐标不是文档坐标」由类型参数带着走——
+/// 把它传给要 [`yu_core::Document`] 坐标的函数是编译错误，不是画错。
+pub type LayoutPoint = yu_core::Point<yu_core::Block>;
 
-/// A finite, non-negative rectangle in block-local layout coordinates.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LayoutRect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-impl LayoutRect {
-    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Result<Self, LayoutError> {
-        if !x.is_finite()
-            || !y.is_finite()
-            || !width.is_finite()
-            || !height.is_finite()
-            || x < 0.0
-            || y < 0.0
-            || width < 0.0
-            || height <= 0.0
-            || !(x + width).is_finite()
-            || !(y + height).is_finite()
-        {
-            return Err(LayoutError::InvalidImageBounds);
-        }
-        Ok(Self {
-            x,
-            y,
-            width,
-            height,
-        })
-    }
-
-    #[must_use]
-    pub const fn x(self) -> f32 {
-        self.x
-    }
-
-    #[must_use]
-    pub const fn y(self) -> f32 {
-        self.y
-    }
-
-    #[must_use]
-    pub const fn width(self) -> f32 {
-        self.width
-    }
-
-    #[must_use]
-    pub const fn height(self) -> f32 {
-        self.height
-    }
-}
-
-impl LayoutPoint {
-    #[must_use]
-    pub const fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
-    }
-
-    #[must_use]
-    pub const fn x(self) -> f32 {
-        self.x
-    }
-
-    #[must_use]
-    pub const fn y(self) -> f32 {
-        self.y
-    }
-
-    fn validate(self) -> Result<(), LayoutError> {
-        if self.x.is_finite() && self.y.is_finite() {
-            Ok(())
-        } else {
-            Err(LayoutError::InvalidPoint)
-        }
-    }
-}
+/// Block 局部坐标系里的矩形。见 [`LayoutPoint`]。
+///
+/// `yu_core::Block` 自带 `x >= 0 && y >= 0 && height > 0` 的约束，与这里
+/// 原来手写的校验一致。
+pub type LayoutRect = yu_core::Rect<yu_core::Block>;
 
 /// One grapheme-backed visual cluster in a line.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1305,11 +1242,11 @@ impl LayoutSnapshot {
             let bounds = placement.bounds;
             let intrinsic_width = size.width as f32;
             let intrinsic_height = size.height as f32;
-            let available_width = (self.config.max_width - bounds.x).max(1.0);
+            let available_width = (self.config.max_width - bounds.x()).max(1.0);
             let scale = (available_width / intrinsic_width).min(1.0);
             let width = (intrinsic_width * scale).max(1.0);
             let height = (intrinsic_height * scale).max(self.config.line_height);
-            placement.bounds = LayoutRect::new(bounds.x, bounds.y, width, height)?;
+            placement.bounds = LayoutRect::new(bounds.x(), bounds.y(), width, height)?;
         }
         if let Some(presentation) = self.projection.block_quote() {
             let metrics = block_quote_metrics(presentation, self.config)?;
@@ -1557,17 +1494,16 @@ impl LayoutSnapshot {
 
     /// Hit-tests a local point and returns a source boundary.
     pub fn hit_test(&self, point: LayoutPoint) -> Result<LayoutHit, LayoutError> {
-        point.validate()?;
+        if !point.is_finite() {
+            return Err(LayoutError::InvalidPoint);
+        }
         if let Some(image) = self.images.iter().find(|image| {
             let bounds = image.bounds;
-            point.x >= bounds.x()
-                && point.x <= bounds.x() + bounds.width()
-                && point.y >= bounds.y()
-                && point.y <= bounds.y() + bounds.height()
+            bounds.contains(point)
         }) {
             let bounds = image.bounds;
             let midpoint = bounds.x() + bounds.width() * 0.5;
-            let before = point.x < midpoint;
+            let before = point.x() < midpoint;
             let visual = if before {
                 image.visual.start()
             } else {
@@ -1598,13 +1534,13 @@ impl LayoutSnapshot {
                 image: Some(image.source),
             });
         }
-        let line = self.line_for_y(point.y);
+        let line = self.line_for_y(point.y());
         let line_data = &self.lines[line];
         let mut visual = line_data.visual.start();
         let mut bias = ProjectionBias::Before;
         let mut x = line_data.width;
 
-        if point.x <= 0.0 {
+        if point.x() <= 0.0 {
             x = 0.0;
         } else {
             for cluster_index in line_data.clusters.clone() {
@@ -1612,7 +1548,7 @@ impl LayoutSnapshot {
                 if cluster.line_break {
                     continue;
                 }
-                if point.x < cluster.x + cluster.width / 2.0 {
+                if point.x() < cluster.x + cluster.width / 2.0 {
                     visual = cluster.visual.start();
                     x = cluster.x;
                     bias = ProjectionBias::Before;
@@ -1622,7 +1558,7 @@ impl LayoutSnapshot {
                 x = cluster.x + cluster.width;
                 bias = ProjectionBias::After;
             }
-            if point.x >= line_data.width() {
+            if point.x() >= line_data.width() {
                 visual = self.line_content_visual_end(line_data);
                 x = line_data.width();
                 bias = ProjectionBias::Before;
