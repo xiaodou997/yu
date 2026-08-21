@@ -1,0 +1,25 @@
+[package]
+name = "yu-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-core = { path = "../yu-core" }
+yu-text = { path = "../yu-text" }
+unicode-general-category = "1.1.0"
+
+[lints]
+workspace = true
+
+# 全部只服务测试。comrak 是不变量 C7 的差分对象，其余三个是 spec 用例比对
+# 所需的 HTML 渲染件——Yu 产品不渲染 HTML（导出走 comrak，S7 的事），
+# 所以它们不该出现在产物依赖里。
+[dev-dependencies]
+comrak = { version = "0.54", default-features = false }
+entities = "1.0"
+percent-encoding = "2.3"
+serde_json = "1"
