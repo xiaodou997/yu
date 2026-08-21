@@ -1,0 +1,29 @@
+[package]
+name = "yu-decoration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-core = { path = "../yu-core" }
+# `map(&ChangeSet)` 的输入。迁移复用 `ChangeSet::map_anchor`，好让 decoration
+# 与 Anchor 的边界语义**由构造保证一致**，而不是靠两处各自小心。
+yu-text = { path = "../yu-text" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1"
+# **临时的、向上的测试依赖。**
+#
+# yu-projection 是 v1 的投影实现，S4 结束时删除。在那之前它是这个 crate 最
+# 有价值的 oracle：一个已经在产品里跑着的 source↔visual 映射，比任何自证的
+# 性质都强。tests/projection_differential.rs 拿真实 Markdown 逐点比对两者。
+#
+# 这条边随 yu-projection 一起消失。删掉那个 crate 时如果忘了删这里，
+# check-deps.py 会报「分层表里有但 workspace 里已不存在」。
+yu-projection = { path = "../yu-projection" }

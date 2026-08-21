@@ -169,9 +169,17 @@ v2:  每种 Markdown 语法 →  一组 Decoration（数据），进入同一个
 严格 DAG，箭头不允许反向，由 CI 强制：
 
 ```text
-yu-core → yu-text → yu-syntax → yu-markdown → yu-state → yu-decoration
-        → yu-layout → yu-scene → yu-render → yu-font → platform
+yu-core ─┬─ yu-text ── yu-syntax ─┐
+         ├─ yu-decoration ────────┴─ yu-markdown ── yu-state ─┐
+         └─ yu-font                                           │
+                    yu-layout ── yu-scene ── yu-render ── platform
 ```
+
+**`yu-decoration` 在 `yu-markdown` 下方。** 本节初版把它画在 `yu-state`
+之上，与第 4.3 节冲突：那里要求 `yu-markdown` 产出 decoration，而产出就得
+认识那个类型。`yu-decoration` 不知道 Markdown、不知道 layout，它是一个和
+`yu-text` 同级的**原语**，被上面的人使用，不使用上面的人。第 4.1 节的分层图
+按「谁是中枢」排版，容易读成依赖方向，这里以本节为准。
 
 `yu-font` 只能依赖 `yu-core`。它提供的是「给我一段文本和字体，返回 glyph 与 advance」，
 它不需要、也不允许知道 layout 与 projection 的存在。

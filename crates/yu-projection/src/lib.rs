@@ -19,91 +19,15 @@ use yu_markdown::{
 };
 use yu_text::{AnchorMapError, ChangeSet, TextChange, TextPositionError, TextSnapshot};
 
-/// An offset in the projected UTF-8 visual stream.
-///
-/// It is not a source byte offset. A visual offset is only meaningful for the
-/// projection revision and range that produced it.
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct VisualOffset(u64);
-
-impl VisualOffset {
-    pub const ZERO: Self = Self(0);
-
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    #[must_use]
-    pub const fn checked_add(self, bytes: u64) -> Option<Self> {
-        match self.0.checked_add(bytes) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
-    }
-}
-
-impl fmt::Debug for VisualOffset {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "VisualOffset({})", self.0)
-    }
-}
-
-impl TryFrom<usize> for VisualOffset {
-    type Error = std::num::TryFromIntError;
-
-    fn try_from(value: usize) -> Result<Self, Self::Error> {
-        Ok(Self(value.try_into()?))
-    }
-}
-
-/// A half-open range in projected UTF-8 visual bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct VisualRange {
-    start: VisualOffset,
-    end: VisualOffset,
-}
-
-impl VisualRange {
-    #[must_use]
-    pub const fn new(start: VisualOffset, end: VisualOffset) -> Option<Self> {
-        if start.get() <= end.get() {
-            Some(Self { start, end })
-        } else {
-            None
-        }
-    }
-
-    #[must_use]
-    pub const fn empty(at: VisualOffset) -> Self {
-        Self { start: at, end: at }
-    }
-
-    #[must_use]
-    pub const fn start(self) -> VisualOffset {
-        self.start
-    }
-
-    #[must_use]
-    pub const fn end(self) -> VisualOffset {
-        self.end
-    }
-
-    #[must_use]
-    pub const fn len(self) -> u64 {
-        self.end.get() - self.start.get()
-    }
-
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.start.get() == self.end.get()
-    }
-}
+// `VisualOffset` / `VisualRange` 从这里迁到了 `yu-core`。
+//
+// 迁移的理由：`docs/specs/coordinates.md` 一直把 `VisualOffset` 列在「全部
+// 定义在 yu-core」那张表里，而它实际住在这里——文档与代码脱节。真正逼着
+// 它必须搬的是 `yu-decoration`：它需要视觉坐标，却不能依赖一个 S4 就要
+// 删掉的 crate。
+//
+// 保留再导出，是为了不让这次搬家扩散到 `yu-storage-ffi` 等消费者。
+pub use yu_core::{VisualOffset, VisualRange};
 
 /// Which source spans contribute to a projected visual run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

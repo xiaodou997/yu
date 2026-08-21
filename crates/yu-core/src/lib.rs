@@ -12,6 +12,7 @@ pub use geometry::{
 };
 pub use position::{
     Affinity, ByteOffset, LineIndex, Revision, TextAnchor, TextRange, Utf16Offset, Utf16Range,
+    VisualOffset, VisualRange,
 };
 pub use shaping::{
     ClusterMetrics, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,

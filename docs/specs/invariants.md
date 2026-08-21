@@ -121,11 +121,23 @@ layout 正常完成，不得阻塞、不得整帧失败。资源就绪后发布 
 **E2.** crate 依赖图必须是严格 DAG，方向为：
 
 ```text
-yu-core → yu-text → yu-syntax → yu-markdown → yu-state → yu-decoration
-        → yu-layout → yu-scene → yu-render → yu-font → platform
+yu-core ─┬─ yu-text ── yu-syntax ─┐
+         ├─ yu-decoration ────────┴─ yu-markdown ── yu-state ─┐
+         └─ yu-font                                           │
+                    yu-layout ── yu-scene ── yu-render ── platform
 ```
 
 反向依赖是 CI 失败，不是待办事项。`yu-font` 只依赖 `yu-core`。
+
+**`yu-decoration` 在 `yu-markdown` 下方，不在上方。** 本条初版写的是
+`yu-markdown → yu-state → yu-decoration`，与第 4.3 节自相矛盾：那里给
+`yu-markdown` 的职责是「Markdown 语法定义与 **decoration 产出**」，而产出
+decoration 就必须认识 `Decoration` 这个类型。
+
+正确的方向由两条推出来：`yu-decoration` 的禁止项是「知道 Markdown」，一个
+不知道上层任何事情的数据结构属于下层；而 `yu-state` 要聚合各 extension 的
+产出，它在两者之上。于是 `yu-decoration` 是一个**原语**——像 `yu-text` 那样
+——而不是一个中间层。
 
 **E3.** `yu-render::RenderCommand` 的变体集合冻结为
 `Glyph` / `FillRect` / `Texture` / `Quad`。
