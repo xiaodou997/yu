@@ -26,12 +26,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  macos-input-spike:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: swift build --package-path experiments/macos-text-input
-
   # v1 时期产品壳与它的 self-check 从未进入 CI，因而没有反馈回路，
   # self-check 代码无节制地长到了 3800 行。v2 起它们必须每次提交都跑。
   macos-shell:
