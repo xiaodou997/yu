@@ -2,9 +2,8 @@
 
 //! Immutable text snapshots and transactional editing contracts.
 //!
-//! ropey is the selected product backend. Flat UTF-8, Piece Tree and the
-//! self-written Persistent Rope remain available as explicit correctness and
-//! performance comparison stores.
+//! Text lives in a ropey `Rope`, reached only through `storage::ropey_backend`.
+//! Everything this crate exposes is addressed in `ByteOffset` (invariant E4).
 
 mod buffer;
 mod position;
@@ -14,7 +13,7 @@ mod transaction;
 
 pub use buffer::{TextBuffer, TextSnapshot, retained_snapshot_stats};
 pub use position::TextPositionError;
-pub use storage::{ChunkCursor, SnapshotRetentionStats, StorageBackend, StorageStats, TextChunk};
+pub use storage::{ChunkCursor, SnapshotRetentionStats, StorageStats, TextChunk};
 pub use summary::TextSummary;
 pub use transaction::{
     AnchorMapError, AppliedTransaction, ChangeSet, Edit, EditError, TextChange, Transaction,

@@ -14,7 +14,7 @@ use std::ops::Range;
 use ropey::iter::Chunks;
 use ropey::{LineType, Rope};
 
-use super::{AllocationCollector, StorageBackend, StorageChunk, StorageStats};
+use super::{AllocationCollector, ChunkCursor, StorageChunk, StorageStats};
 use crate::TextSummary;
 
 /// Yu 的换行计数口径是「`\n` 的个数」（见 `TextSummary::from_text`）。
@@ -31,26 +31,26 @@ pub(crate) struct RopeyStore {
 }
 
 impl RopeyStore {
-    pub(super) fn new(text: String) -> Self {
+    pub(crate) fn new(text: String) -> Self {
         Self {
             rope: Rope::from_str(&text),
         }
     }
 
-    pub(super) fn len_bytes(&self) -> usize {
+    pub(crate) fn len_bytes(&self) -> usize {
         self.rope.len()
     }
 
-    pub(super) fn is_char_boundary(&self, offset: usize) -> bool {
+    pub(crate) fn is_char_boundary(&self, offset: usize) -> bool {
         // ropey 越界会 panic；不变量 I4 要求 panic 不穿过 ABI，所以先自己拦。
         offset <= self.rope.len() && self.rope.is_char_boundary(offset)
     }
 
-    pub(super) fn slice(&self, range: Range<usize>) -> String {
+    pub(crate) fn slice(&self, range: Range<usize>) -> String {
         self.rope.slice(range).to_string()
     }
 
-    pub(super) fn replace_range(&mut self, range: Range<usize>, inserted: &str) {
+    pub(crate) fn replace_range(&mut self, range: Range<usize>, inserted: &str) {
         let start = range.start;
         if !range.is_empty() {
             self.rope.remove(range);
@@ -60,13 +60,13 @@ impl RopeyStore {
         }
     }
 
-    pub(super) fn snapshot(&self) -> RopeySnapshot {
+    pub(crate) fn snapshot(&self) -> RopeySnapshot {
         RopeySnapshot {
             rope: self.rope.clone(),
         }
     }
 
-    pub(super) fn stats(&self) -> StorageStats {
+    pub(crate) fn stats(&self) -> StorageStats {
         self.snapshot().stats()
     }
 }
@@ -79,11 +79,11 @@ pub(crate) struct RopeySnapshot {
 }
 
 impl RopeySnapshot {
-    pub(super) fn len_bytes(&self) -> usize {
+    pub(crate) fn len_bytes(&self) -> usize {
         self.rope.len()
     }
 
-    pub(super) fn write_to(&self, output: &mut String) {
+    pub(crate) fn write_to(&self, output: &mut String) {
         for chunk in self.rope.chunks() {
             output.push_str(chunk);
         }
@@ -91,12 +91,12 @@ impl RopeySnapshot {
 
     /// chunk 数只能靠遍历，是 O(chunk 数) 的。因此它只服务诊断与 bench，
     /// 不在任何热路径上——热路径用 `len_bytes` / `summary`，都是 O(1)。
-    pub(super) fn stats(&self) -> StorageStats {
+    pub(crate) fn stats(&self) -> StorageStats {
         let chunks = self.rope.chunks().filter(|chunk| !chunk.is_empty()).count();
-        StorageStats::new(StorageBackend::Ropey, self.rope.len(), chunks)
+        StorageStats::new(self.rope.len(), chunks)
     }
 
-    pub(super) fn summary(&self) -> TextSummary {
+    pub(crate) fn summary(&self) -> TextSummary {
         TextSummary::from_parts(
             as_u64(self.rope.len()),
             as_u64(self.rope.len_utf16()),
@@ -104,11 +104,11 @@ impl RopeySnapshot {
         )
     }
 
-    pub(super) fn is_char_boundary(&self, offset: usize) -> bool {
+    pub(crate) fn is_char_boundary(&self, offset: usize) -> bool {
         offset <= self.rope.len() && self.rope.is_char_boundary(offset)
     }
 
-    pub(super) fn prefix_summary(&self, offset: usize) -> TextSummary {
+    pub(crate) fn prefix_summary(&self, offset: usize) -> TextSummary {
         TextSummary::from_parts(
             as_u64(offset),
             as_u64(self.rope.byte_to_utf16_idx(offset)),
@@ -116,7 +116,7 @@ impl RopeySnapshot {
         )
     }
 
-    pub(super) fn byte_offset_for_utf16(&self, offset: u64) -> Option<usize> {
+    pub(crate) fn byte_offset_for_utf16(&self, offset: u64) -> Option<usize> {
         let offset = usize::try_from(offset).ok()?;
         if offset > self.rope.len_utf16() {
             return None;
@@ -128,7 +128,7 @@ impl RopeySnapshot {
         (self.rope.byte_to_utf16_idx(byte) == offset).then_some(byte)
     }
 
-    pub(super) fn byte_offset_for_line(&self, line: u64) -> Option<usize> {
+    pub(crate) fn byte_offset_for_line(&self, line: u64) -> Option<usize> {
         let line = usize::try_from(line).ok()?;
         (line < self.rope.len_lines(LINES)).then(|| self.rope.line_to_byte_idx(line, LINES))
     }
@@ -136,21 +136,21 @@ impl RopeySnapshot {
     /// ropey 的节点是私有的，走不进去。但 chunk 的数据指针就是叶子分配的地址：
     /// 两个快照共享同一片叶子时拿到同一个指针，编辑过的叶子是新分配、新指针。
     /// 按指针去重得到的正是「去重后的叶子文本字节数」。
-    pub(super) fn collect_allocations(&self, collector: &mut AllocationCollector) {
+    pub(crate) fn collect_allocations(&self, collector: &mut AllocationCollector) {
         for chunk in self.rope.chunks() {
             collector.add_chunk_text(chunk);
         }
     }
 
-    pub(super) fn chunks_from(&self, offset: usize) -> RopeyChunkCursor<'_> {
+    pub(crate) fn chunks_from(&self, offset: usize) -> ChunkCursor<'_> {
         let (chunks, start) = self.rope.chunks_at(offset);
-        RopeyChunkCursor {
+        ChunkCursor::new(RopeyChunkCursor {
             chunks,
             next_start: start,
-        }
+        })
     }
 
-    pub(super) fn chunk_before(&self, offset: usize) -> Option<StorageChunk<'_>> {
+    pub(crate) fn chunk_before(&self, offset: usize) -> Option<(usize, &str)> {
         if self.rope.len() == 0 {
             return None;
         }
@@ -162,14 +162,11 @@ impl RopeySnapshot {
             return None;
         }
         let text = cursor.chunk();
-        (!text.is_empty()).then(|| StorageChunk {
-            start: cursor.byte_offset(),
-            text,
-        })
+        (!text.is_empty()).then(|| (cursor.byte_offset(), text))
     }
 }
 
-pub(super) struct RopeyChunkCursor<'a> {
+pub(crate) struct RopeyChunkCursor<'a> {
     chunks: Chunks<'a>,
     next_start: usize,
 }

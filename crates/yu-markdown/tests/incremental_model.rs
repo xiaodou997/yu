@@ -1,6 +1,6 @@
 use yu_core::{ByteOffset, TextRange};
 use yu_markdown::{MarkdownDocument, parse, parse_incremental};
-use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
+use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
 const INSERTIONS: [&str; 14] = [
     "羽",
@@ -21,15 +21,13 @@ const INSERTIONS: [&str; 14] = [
 
 #[test]
 fn incremental_parse_matches_full_parse_through_random_edits() {
-    for backend in StorageBackend::ALL {
-        run_model(backend);
-    }
+    run_model();
 }
 
-fn run_model(backend: StorageBackend) {
+fn run_model() {
     let mut seed = 0x5955_4d41_524b_444f_u64;
     let mut model = String::from("# Yu\n\nparagraph\n\n```rust\nfn main() {}\n```\n\nafter\n");
-    let mut buffer = TextBuffer::with_backend(model.clone(), backend);
+    let mut buffer = TextBuffer::new(model.clone());
     let mut document = parse(&buffer.snapshot());
 
     for step in 0..1_000 {
@@ -62,25 +60,17 @@ fn run_model(backend: StorageBackend) {
             parse_incremental(&document, applied.result_snapshot(), applied.change_set())
                 .expect("matching revisions should parse incrementally");
         let full = parse(applied.result_snapshot());
-        assert_documents_equal(incremental.document(), &full, backend, step);
+        assert_documents_equal(incremental.document(), &full, step);
         assert_eq!(applied.result_snapshot().as_str(), model);
         document = incremental.into_document();
     }
 }
 
-fn assert_documents_equal(
-    incremental: &MarkdownDocument,
-    full: &MarkdownDocument,
-    backend: StorageBackend,
-    step: usize,
-) {
-    assert_eq!(
-        incremental, full,
-        "backend {backend} diverged at step {step}"
-    );
+fn assert_documents_equal(incremental: &MarkdownDocument, full: &MarkdownDocument, step: usize) {
+    assert_eq!(incremental, full, "diverged at step {step}");
     assert!(
         incremental.has_lossless_coverage(),
-        "backend {backend} lost coverage at step {step}"
+        "lost coverage at step {step}"
     );
 }
 
@@ -128,123 +118,106 @@ fn deleting_fence_delimiters_propagates_to_eof() {
 
 #[test]
 fn local_edit_shares_persistent_prefix_and_shifted_suffix() {
-    for backend in StorageBackend::ALL {
-        let source = "# one\n\nalpha\n\n# two\n\nomega\n";
-        let mut buffer = TextBuffer::with_backend(source, backend);
-        let previous_snapshot = buffer.snapshot();
-        let previous = parse(&previous_snapshot);
-        let insert_at = source.find("alpha").expect("fixture contains alpha") + 2;
-        let transaction = Transaction::new(
-            buffer.revision(),
-            [Edit::new(
-                TextRange::empty(ByteOffset::try_from(insert_at).expect("offset fits u64")),
-                "羽",
-            )],
-        );
-        let applied = buffer.apply(&transaction).expect("edit should apply");
-        let materialized_before = retained_snapshot_stats(&[
-            previous_snapshot.clone(),
-            applied.result_snapshot().clone(),
-        ])
-        .materialized_buffers();
+    let source = "# one\n\nalpha\n\n# two\n\nomega\n";
+    let mut buffer = TextBuffer::new(source);
+    let previous_snapshot = buffer.snapshot();
+    let previous = parse(&previous_snapshot);
+    let insert_at = source.find("alpha").expect("fixture contains alpha") + 2;
+    let transaction = Transaction::new(
+        buffer.revision(),
+        [Edit::new(
+            TextRange::empty(ByteOffset::try_from(insert_at).expect("offset fits u64")),
+            "羽",
+        )],
+    );
+    let applied = buffer.apply(&transaction).expect("edit should apply");
+    let materialized_before =
+        retained_snapshot_stats(&[previous_snapshot.clone(), applied.result_snapshot().clone()])
+            .materialized_buffers();
 
-        let incremental =
-            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
-                .expect("matching revisions should parse incrementally");
-        let full = parse(applied.result_snapshot());
-        let shared = incremental
-            .document()
-            .blocks()
-            .shared_blocks_with(previous.blocks());
+    let incremental = parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+        .expect("matching revisions should parse incrementally");
+    let full = parse(applied.result_snapshot());
+    let shared = incremental
+        .document()
+        .blocks()
+        .shared_blocks_with(previous.blocks());
 
-        assert_eq!(incremental.document(), &full, "backend {backend}");
-        assert_eq!(
-            retained_snapshot_stats(&[previous_snapshot, applied.result_snapshot().clone()])
-                .materialized_buffers(),
-            materialized_before,
-            "backend {backend} materialized source during convergence"
-        );
-        assert_eq!(incremental.reused_prefix_blocks(), 1, "backend {backend}");
-        assert_eq!(incremental.reused_suffix_blocks(), 4, "backend {backend}");
-        assert_eq!(shared, 5, "backend {backend}");
-        assert!(
-            incremental.reparsed_range().end() < applied.result_snapshot().len_bytes(),
-            "backend {backend} scanned through EOF"
-        );
-        assert_eq!(
-            incremental.document().block_storage_stats().segments(),
-            3,
-            "backend {backend}"
-        );
-        assert_eq!(
-            incremental.document().block_storage_stats().allocations(),
-            2,
-            "backend {backend}"
-        );
-    }
+    assert_eq!(incremental.document(), &full);
+    assert_eq!(
+        retained_snapshot_stats(&[previous_snapshot, applied.result_snapshot().clone()])
+            .materialized_buffers(),
+        materialized_before,
+        "materialized source during convergence"
+    );
+    assert_eq!(incremental.reused_prefix_blocks(), 1);
+    assert_eq!(incremental.reused_suffix_blocks(), 4);
+    assert_eq!(shared, 5);
+    assert!(
+        incremental.reparsed_range().end() < applied.result_snapshot().len_bytes(),
+        "scanned through EOF"
+    );
+    assert_eq!(incremental.document().block_storage_stats().segments(), 3);
+    assert_eq!(
+        incremental.document().block_storage_stats().allocations(),
+        2
+    );
 }
 
 #[test]
 fn inserted_fence_prevents_false_hash_convergence() {
-    for backend in StorageBackend::ALL {
-        let source = "before\n\ninside\n\n# repeated\n\ninside\n";
-        let mut buffer = TextBuffer::with_backend(source, backend);
-        let previous = parse(&buffer.snapshot());
-        let fence_at = source.find("inside").expect("fixture contains paragraph");
-        let transaction = Transaction::new(
-            buffer.revision(),
-            [Edit::new(
-                TextRange::empty(ByteOffset::try_from(fence_at).expect("offset fits u64")),
-                "```\n",
-            )],
-        );
-        let applied = buffer.apply(&transaction).expect("edit should apply");
-        let incremental =
-            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
-                .expect("matching revisions should parse incrementally");
-        let full = parse(applied.result_snapshot());
+    let source = "before\n\ninside\n\n# repeated\n\ninside\n";
+    let mut buffer = TextBuffer::new(source);
+    let previous = parse(&buffer.snapshot());
+    let fence_at = source.find("inside").expect("fixture contains paragraph");
+    let transaction = Transaction::new(
+        buffer.revision(),
+        [Edit::new(
+            TextRange::empty(ByteOffset::try_from(fence_at).expect("offset fits u64")),
+            "```\n",
+        )],
+    );
+    let applied = buffer.apply(&transaction).expect("edit should apply");
+    let incremental = parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+        .expect("matching revisions should parse incrementally");
+    let full = parse(applied.result_snapshot());
 
-        assert_eq!(incremental.document(), &full, "backend {backend}");
-        assert_eq!(incremental.reused_suffix_blocks(), 0, "backend {backend}");
-        assert_eq!(
-            incremental.reparsed_range().end(),
-            applied.result_snapshot().len_bytes(),
-            "backend {backend}"
-        );
-    }
+    assert_eq!(incremental.document(), &full);
+    assert_eq!(incremental.reused_suffix_blocks(), 0);
+    assert_eq!(
+        incremental.reparsed_range().end(),
+        applied.result_snapshot().len_bytes()
+    );
 }
 
 #[test]
 fn container_marker_edit_matches_full_parse() {
-    for backend in StorageBackend::ALL {
-        let source = "> quote\n\n- one\n  continuation\n  - nested\n- two\n\nafter\n";
-        let mut buffer = TextBuffer::with_backend(source, backend);
-        let previous = parse(&buffer.snapshot());
-        let marker_at = source.find("- one").expect("fixture contains list marker");
-        let transaction = Transaction::new(
-            buffer.revision(),
-            [Edit::new(
-                TextRange::new(
-                    ByteOffset::try_from(marker_at).expect("offset fits u64"),
-                    ByteOffset::try_from(marker_at + 2).expect("offset fits u64"),
-                )
-                .expect("ordered marker range"),
-                "1. ",
-            )],
-        );
-        let applied = buffer
-            .apply(&transaction)
-            .expect("container marker edit should apply");
-        let incremental =
-            parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
-                .expect("matching revisions should parse incrementally");
-        let full = parse(applied.result_snapshot());
+    let source = "> quote\n\n- one\n  continuation\n  - nested\n- two\n\nafter\n";
+    let mut buffer = TextBuffer::new(source);
+    let previous = parse(&buffer.snapshot());
+    let marker_at = source.find("- one").expect("fixture contains list marker");
+    let transaction = Transaction::new(
+        buffer.revision(),
+        [Edit::new(
+            TextRange::new(
+                ByteOffset::try_from(marker_at).expect("offset fits u64"),
+                ByteOffset::try_from(marker_at + 2).expect("offset fits u64"),
+            )
+            .expect("ordered marker range"),
+            "1. ",
+        )],
+    );
+    let applied = buffer
+        .apply(&transaction)
+        .expect("container marker edit should apply");
+    let incremental = parse_incremental(&previous, applied.result_snapshot(), applied.change_set())
+        .expect("matching revisions should parse incrementally");
+    let full = parse(applied.result_snapshot());
 
-        assert_eq!(incremental.document(), &full, "backend {backend}");
-        assert!(incremental.document().has_lossless_coverage());
-        assert_eq!(
-            applied.result_snapshot().as_str(),
-            source.replacen("- ", "1. ", 1)
-        );
-    }
+    assert_eq!(incremental.document(), &full);
+    assert!(incremental.document().has_lossless_coverage());
+    assert_eq!(
+        applied.result_snapshot().as_str(),
+        source.replacen("- ", "1. ", 1)
+    );
 }

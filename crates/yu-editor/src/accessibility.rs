@@ -832,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn text_query_does_not_materialize_a_piece_tree_snapshot() {
+    fn text_query_does_not_materialize_a_snapshot() {
         let mut buffer = TextBuffer::new("alpha");
         let transaction = Transaction::new(
             buffer.revision(),

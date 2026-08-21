@@ -2576,7 +2576,7 @@ fn append_table_row_hidden(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
+    use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
     fn projection(source: &str) -> Projection {
         let buffer = TextBuffer::new(source);
@@ -3307,9 +3307,9 @@ mod tests {
     }
 
     #[test]
-    fn projection_scans_piece_tree_chunks_without_materializing_snapshot() {
+    fn projection_scans_chunks_without_materializing_snapshot() {
         let parts = ["before ", "**", "羽🙂", "**", " after"];
-        let mut buffer = TextBuffer::with_backend("", StorageBackend::PieceTree);
+        let mut buffer = TextBuffer::new("");
         for part in parts {
             let at = buffer.snapshot().len_bytes();
             let transaction = yu_text::Transaction::new(
@@ -3331,7 +3331,7 @@ mod tests {
     #[test]
     fn projection_consumes_parser_owned_inline_tokens() {
         let source = "before **羽🙂** after";
-        let buffer = TextBuffer::with_backend(source, StorageBackend::PieceTree);
+        let buffer = TextBuffer::new(source);
         let snapshot = buffer.snapshot();
         let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
             .expect("source range should be ordered");
@@ -3352,7 +3352,7 @@ mod tests {
     #[test]
     fn projection_exposes_source_backed_image_metadata_and_maps_it() {
         let source = "![logo](assets/yu.png) and ![mark][asset]\n[asset]: icons/yu.png\n";
-        let mut buffer = TextBuffer::with_backend(source, StorageBackend::PieceTree);
+        let mut buffer = TextBuffer::new(source);
         let snapshot = buffer.snapshot();
         let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
             .expect("source range should be ordered");
@@ -3401,7 +3401,7 @@ mod tests {
     #[test]
     fn projection_maps_through_prefix_edit_without_reparsing() {
         let source = "prefix **羽🙂** suffix";
-        let mut buffer = TextBuffer::with_backend(source, StorageBackend::PieceTree);
+        let mut buffer = TextBuffer::new(source);
         let snapshot = buffer.snapshot();
         let start = source.find("**").expect("strong delimiter should exist");
         let end = start + "**羽🙂**".len();
@@ -3664,7 +3664,7 @@ mod tests {
     #[test]
     fn fenced_code_projection_hides_fences_and_keeps_body_literal() {
         let source_text = "```rust\n**code**\nvalue\n```\n";
-        let buffer = TextBuffer::with_backend(source_text, StorageBackend::PieceTree);
+        let buffer = TextBuffer::new(source_text);
         let snapshot = buffer.snapshot();
         let markdown = yu_markdown::parse(&snapshot);
         let block = markdown.blocks().get(0).expect("code block should exist");

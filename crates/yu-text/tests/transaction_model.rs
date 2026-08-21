@@ -1,66 +1,62 @@
 use yu_core::{ByteOffset, TextRange, Utf16Offset};
-use yu_text::{Edit, StorageBackend, TextBuffer, TextSummary, Transaction};
+use yu_text::{Edit, TextBuffer, TextSummary, Transaction};
 
 const INSERTIONS: [&str; 7] = ["羽", "Yu", "🙂", "e\u{301}", "\n", "**", ""];
 
 #[test]
 fn deterministic_random_edits_match_string_model_and_inverse() {
-    for backend in StorageBackend::ALL {
-        run_model(backend);
-    }
+    run_model();
 }
 
 #[test]
 fn multi_edit_transaction_is_sorted_atomically_and_inverse_is_exact() {
-    for backend in StorageBackend::ALL {
-        let source = "alpha 世界🙂 omega";
-        let mut buffer = TextBuffer::with_backend(source, backend);
-        let world_start = source.find("世界").expect("world fixture");
-        let world_end = world_start + "世界".len();
-        let omega_start = source.find("omega").expect("omega fixture");
-        let transaction = Transaction::new(
-            buffer.revision(),
-            [
-                // Deliberately provide edits from right to left.  The buffer
-                // must sort them by source range before applying one atomic
-                // revision transition.
-                Edit::new(
-                    TextRange::new(
-                        ByteOffset::try_from(omega_start).expect("offset fits"),
-                        ByteOffset::try_from(omega_start + "omega".len()).expect("offset fits"),
-                    )
-                    .expect("omega range"),
-                    "document",
-                ),
-                Edit::new(
-                    TextRange::new(
-                        ByteOffset::try_from(world_start).expect("offset fits"),
-                        ByteOffset::try_from(world_end).expect("offset fits"),
-                    )
-                    .expect("world range"),
-                    "Yu",
-                ),
-                Edit::new(TextRange::empty(ByteOffset::ZERO), "羽 "),
-            ],
-        );
-        let applied = buffer
-            .apply(&transaction)
-            .expect("non-overlapping edits should apply atomically");
-        assert_eq!(buffer.snapshot().as_str(), "羽 alpha Yu🙂 document");
-        assert_eq!(applied.change_set().changes().len(), 3);
+    let source = "alpha 世界🙂 omega";
+    let mut buffer = TextBuffer::new(source);
+    let world_start = source.find("世界").expect("world fixture");
+    let world_end = world_start + "世界".len();
+    let omega_start = source.find("omega").expect("omega fixture");
+    let transaction = Transaction::new(
+        buffer.revision(),
+        [
+            // Deliberately provide edits from right to left.  The buffer
+            // must sort them by source range before applying one atomic
+            // revision transition.
+            Edit::new(
+                TextRange::new(
+                    ByteOffset::try_from(omega_start).expect("offset fits"),
+                    ByteOffset::try_from(omega_start + "omega".len()).expect("offset fits"),
+                )
+                .expect("omega range"),
+                "document",
+            ),
+            Edit::new(
+                TextRange::new(
+                    ByteOffset::try_from(world_start).expect("offset fits"),
+                    ByteOffset::try_from(world_end).expect("offset fits"),
+                )
+                .expect("world range"),
+                "Yu",
+            ),
+            Edit::new(TextRange::empty(ByteOffset::ZERO), "羽 "),
+        ],
+    );
+    let applied = buffer
+        .apply(&transaction)
+        .expect("non-overlapping edits should apply atomically");
+    assert_eq!(buffer.snapshot().as_str(), "羽 alpha Yu🙂 document");
+    assert_eq!(applied.change_set().changes().len(), 3);
 
-        buffer
-            .apply(applied.inverse())
-            .expect("inverse should restore all edits");
-        assert_eq!(buffer.snapshot().as_str(), source, "backend {backend}");
-        assert_eq!(buffer.revision().get(), 2, "backend {backend}");
-    }
+    buffer
+        .apply(applied.inverse())
+        .expect("inverse should restore all edits");
+    assert_eq!(buffer.snapshot().as_str(), source);
+    assert_eq!(buffer.revision().get(), 2);
 }
 
-fn run_model(backend: StorageBackend) {
+fn run_model() {
     let mut seed = 0x5955_4544_4954_4f52_u64;
     let mut model = String::from("# 羽\n\nHello, 世界🙂\n");
-    let mut buffer = TextBuffer::with_backend(model.clone(), backend);
+    let mut buffer = TextBuffer::new(model.clone());
 
     for step in 0..2_000 {
         let boundaries = char_boundaries(&model);
@@ -94,34 +90,25 @@ fn run_model(backend: StorageBackend) {
         let applied = buffer
             .apply(&transaction)
             .expect("model-generated transaction should apply");
-        assert_snapshot_matches_model(&buffer, &model, backend, step);
+        assert_snapshot_matches_model(&buffer, &model, step);
 
         if step % 5 == 0 {
             buffer
                 .apply(applied.inverse())
                 .expect("generated inverse should apply");
             model = before;
-            assert_snapshot_matches_model(&buffer, &model, backend, step);
+            assert_snapshot_matches_model(&buffer, &model, step);
         }
     }
 }
 
-fn assert_snapshot_matches_model(
-    buffer: &TextBuffer,
-    model: &str,
-    backend: StorageBackend,
-    step: usize,
-) {
+fn assert_snapshot_matches_model(buffer: &TextBuffer, model: &str, step: usize) {
     let snapshot = buffer.snapshot();
-    assert_eq!(
-        snapshot.as_str(),
-        model,
-        "backend {backend} content failed at step {step}"
-    );
+    assert_eq!(snapshot.as_str(), model, "content failed at step {step}");
     assert_eq!(
         snapshot.summary(),
         TextSummary::from_text(model),
-        "backend {backend} summary failed at step {step}"
+        "summary failed at step {step}"
     );
 
     if step.is_multiple_of(31) {
