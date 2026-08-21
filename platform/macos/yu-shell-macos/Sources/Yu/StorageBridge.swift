@@ -422,48 +422,6 @@ struct NativeShapedViewportSnapshot {
         maxScrollY = CGFloat(value.max_scroll_y)
     }
 }
-struct NativeVisualImage {
-    let revision: UInt64
-    let blockIndex: UInt64
-    let sourceRange: NSRange
-    let labelRange: NSRange
-    let destinationRange: NSRange?
-    let referenceRange: NSRange?
-    let resourceFingerprint: UInt64
-    let kind: UInt8
-    let resourceStatus: UInt8
-
-    init(_ value: YuStorageVisualImage) {
-        revision = value.revision
-        blockIndex = value.block_index
-        sourceRange = NSRange(
-            location: Int(value.source_start_utf16),
-            length: Int(value.source_end_utf16 - value.source_start_utf16)
-        )
-        labelRange = NSRange(
-            location: Int(value.label_start_utf16),
-            length: Int(value.label_end_utf16 - value.label_start_utf16)
-        )
-        destinationRange = NativeVisualImage.optionalRange(
-            start: value.destination_start_utf16,
-            end: value.destination_end_utf16
-        )
-        referenceRange = NativeVisualImage.optionalRange(
-            start: value.reference_start_utf16,
-            end: value.reference_end_utf16
-        )
-        resourceFingerprint = value.resource_fingerprint
-        kind = value.kind
-        resourceStatus = value.resource_status
-    }
-
-    private static func optionalRange(start: UInt64, end: UInt64) -> NSRange? {
-        guard start != UInt64.max, end != UInt64.max, end >= start else {
-            return nil
-        }
-        return NSRange(location: Int(start), length: Int(end - start))
-    }
-}
 struct NativeVisualRenderPlanSnapshot {
     let revision: UInt64
     let compositionGeneration: UInt64
@@ -495,90 +453,6 @@ struct NativeVisualRenderPlanSnapshot {
         embeddedCommandCount = Int(value.embedded_command_count)
         embeddedUploadCount = Int(value.embedded_upload_count)
         embeddedUploadBytes = Int(value.embedded_upload_bytes)
-    }
-}
-/// Normalizes the separate image/embedded C status domains before applying a
-/// shared coverage policy. Raw numeric equality between those domains is not
-/// part of the native host contract.
-enum RetainedResourceCoverageState {
-    case unknown
-    case pending
-    case ready
-    case failed
-    case unsupported
-    case invalid
-}
-func imageResourceCoverageState(_ status: UInt8) -> RetainedResourceCoverageState {
-    switch status {
-    case UInt8(YU_STORAGE_IMAGE_RESOURCE_UNKNOWN): return .unknown
-    case UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING): return .pending
-    case UInt8(YU_STORAGE_IMAGE_RESOURCE_READY): return .ready
-    case UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED): return .failed
-    default: return .invalid
-    }
-}
-func embeddedResourceCoverageState(_ status: UInt8) -> RetainedResourceCoverageState {
-    switch status {
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNKNOWN): return .unknown
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_PENDING): return .pending
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_READY): return .ready
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_FAILED): return .failed
-    case UInt8(YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED): return .unsupported
-    default: return .invalid
-    }
-}
-/// Proves whether a resource is covered by the current retained publication.
-/// Ready resources use their texture; pending/failed images use the scene's
-/// placeholder, while pending/failed/unsupported embedded blocks keep their
-/// projected source glyphs. An unknown image with no stable identity also
-/// keeps the retained projected alt label. An unclassified non-zero identity
-/// is fail-closed because it may represent a renderer state unknown to this
-/// host.
-/// 资源未就绪或指纹失效时安排一次刷新。
-///
-/// 这里只回答「要不要再取一次」。coverage 判断已随 TextKit fallback 一同
-/// 删除（不变量 I5）：没有第二条渲染路径可以回退。
-func retainedResourceNeedsRefresh(
-    state: RetainedResourceCoverageState,
-    resourceFingerprint: UInt64
-) -> Bool {
-    switch state {
-    case .ready, .unsupported:
-        return false
-    case .pending, .failed, .invalid:
-        return true
-    case .unknown:
-        return resourceFingerprint != 0
-    }
-}
-struct NativeVisualEmbeddedResource {
-    let revision: UInt64
-    let blockIndex: UInt64
-    let sourceRange: NSRange
-    let infoRange: NSRange
-    let contentRange: NSRange
-    let resourceFingerprint: UInt64
-    let kind: UInt8
-    let resourceStatus: UInt8
-
-    init(_ value: YuStorageVisualEmbeddedResource) {
-        revision = value.revision
-        blockIndex = value.block_index
-        sourceRange = NSRange(
-            location: Int(value.source_start_utf16),
-            length: Int(value.source_end_utf16 - value.source_start_utf16)
-        )
-        infoRange = NSRange(
-            location: Int(value.info_start_utf16),
-            length: Int(value.info_end_utf16 - value.info_start_utf16)
-        )
-        contentRange = NSRange(
-            location: Int(value.content_start_utf16),
-            length: Int(value.content_end_utf16 - value.content_start_utf16)
-        )
-        resourceFingerprint = value.resource_fingerprint
-        kind = value.kind
-        resourceStatus = value.resource_status
     }
 }
 struct NativeMacosRenderHostSnapshot {
@@ -1896,66 +1770,6 @@ final class StorageBridge {
     }
 
 
-
-    func macosVisualImages(revision: UInt64) throws -> [NativeVisualImage] {
-        var required = 0
-        let sizeStatus = yu_storage_session_macos_visual_images(
-            handle,
-            revision,
-            nil,
-            0,
-            &required
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        var values = Array(repeating: YuStorageVisualImage(), count: required)
-        var written = required
-        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_macos_visual_images(
-                handle,
-                revision,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
-        }
-        guard fillStatus == StorageStatus.ok, written == required else {
-            throw BridgeError.operation(fillStatus)
-        }
-        return values.map(NativeVisualImage.init)
-    }
-
-    func macosVisualEmbeddedResources(
-        revision: UInt64
-    ) throws -> [NativeVisualEmbeddedResource] {
-        var required = 0
-        let sizeStatus = yu_storage_session_macos_visual_embedded_resources(
-            handle,
-            revision,
-            nil,
-            0,
-            &required
-        )
-        guard sizeStatus == StorageStatus.ok else {
-            throw BridgeError.operation(sizeStatus)
-        }
-        var values = Array(repeating: YuStorageVisualEmbeddedResource(), count: required)
-        var written = required
-        let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_macos_visual_embedded_resources(
-                handle,
-                revision,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
-        }
-        guard fillStatus == StorageStatus.ok, written == required else {
-            throw BridgeError.operation(fillStatus)
-        }
-        return values.map(NativeVisualEmbeddedResource.init)
-    }
 
 
     func macosVisualRenderPlan(
