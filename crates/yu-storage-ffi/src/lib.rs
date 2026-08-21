@@ -808,7 +808,7 @@ pub struct YuStorageFrameGeometry {
 /// layer, renderer, atlas and command queue remain owned by the synchronous
 /// Rust call; only lifecycle metadata crosses the ABI.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub revision: u64,
     pub composition_generation: u64,
@@ -834,6 +834,9 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub caret_decoration_count: u64,
     /// 见 [`YuStorageMacosRenderHostSnapshot::resource_refresh_pending`]。
     pub resource_refresh_pending: u8,
+    /// 这一帧渲染出来的文档总高度。可滚动范围必须以它为准——平台没有第二套
+    /// 布局可以推导这个值（不变量 I5）。
+    pub content_height: f32,
 }
 
 /// Revision-bound source coordinates used by the native Accessibility adapter.
@@ -7531,6 +7534,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 selection_decoration_count: host_snapshot.selection_decoration_count,
                 caret_decoration_count: host_snapshot.caret_decoration_count,
                 resource_refresh_pending: host_snapshot.resource_refresh_pending,
+                content_height: host_snapshot.content_height,
             };
         }
         // 记录这一帧的身份，供 `frame_is_current` 判断后续提交是否等价。

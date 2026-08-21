@@ -687,6 +687,46 @@ final class MacosSurfaceHostCoordinator {
         }
     }
 
+    /// 让可滚动范围等于 Rust 这一帧渲染出来的内容高度。
+    ///
+    /// 滚动范围此前来自 document view 自己的 TextKit 排版——一套已经不再绘制
+    /// 任何像素的布局（不变量 I5）。两套布局算出的高度并不相同：投影里标题更
+    /// 大、块间有间距，因此实际内容比源码排版高得多，长文档的尾部根本滚不到，
+    /// 而且没有任何报错。
+    ///
+    /// 用 minSize/maxSize 把高度钉死，而不是只 `setFrameSize`：`NSTextView`
+    /// 在 `isVerticallyResizable` 下会按自己的排版把 frame 改回去。
+    private func applyContentHeight(_ contentHeight: CGFloat) {
+        guard let scrollView,
+              let documentView = scrollView.documentView,
+              contentHeight.isFinite,
+              contentHeight > 0.0 else {
+            return
+        }
+        // 内容比视口短时仍然占满视口，否则 clip view 会露出背景。
+        let target = max(contentHeight, scrollView.contentView.bounds.height)
+        if let textView = documentView as? NSTextView {
+            textView.minSize = NSSize(width: 0.0, height: target)
+            textView.maxSize = NSSize(
+                width: CGFloat.greatestFiniteMagnitude,
+                height: target
+            )
+        }
+        guard abs(documentView.frame.height - target) > 0.5 else { return }
+        // 改变可滚动范围不得移动视口。AppKit 在 document view 变高时会自行调整
+        // clip view 的 bounds origin——首帧就会把长文档直接滚到底部，用户打开
+        // 文件看到的是最后一屏，而且没有任何报错。滚动位置是用户的状态，
+        // 不是布局的副产品。
+        let origin = scrollView.contentView.bounds.origin
+        documentView.setFrameSize(
+            NSSize(width: documentView.frame.width, height: target)
+        )
+        if scrollView.contentView.bounds.origin != origin {
+            scrollView.contentView.setBoundsOrigin(origin)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+    }
+
     /// 提交一帧。
     ///
     /// `force` 只为资源刷新轮询而存在：那条路径需要一次真实提交去收割
@@ -722,6 +762,7 @@ final class MacosSurfaceHostCoordinator {
         )
         isAttached = true
         lastSnapshot = snapshot
+        applyContentHeight(snapshot.contentHeight)
         // 「还有资源没落定吗」由 Rust 在提交这一帧时一并回答。平台此前要为此
         // 再查三次——可见 block、全部图片状态、全部内嵌资源状态——还得自己复制
         // 一份状态码语义表（不变量 I3）。
