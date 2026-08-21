@@ -74,13 +74,12 @@ struct NativeSelection {
     let range: NSRange
     let affinity: UInt8
 
-    init(_ value: YuStorageSelection) {
-        revision = value.revision
-        range = NSRange(
-            location: Int(value.start_utf16),
-            length: Int(value.end_utf16 - value.start_utf16)
-        )
-        affinity = value.affinity
+    init(_ endpoints: NativeSelectionEndpoints) {
+        revision = endpoints.revision
+        let start = min(endpoints.anchorUTF16, endpoints.focusUTF16)
+        let end = max(endpoints.anchorUTF16, endpoints.focusUTF16)
+        range = NSRange(location: Int(start), length: Int(end - start))
+        affinity = endpoints.affinity
     }
 }
 struct NativeSelectionEndpoints {
@@ -1070,11 +1069,10 @@ final class StorageBridge {
         return NativeStorageState(value)
     }
 
+    /// 有序选区。anchor/focus 是完整形式，有序区间由它推导——两者不需要各占
+    /// 一个 FFI 入口。
     var selection: NativeSelection {
-        var value = YuStorageSelection()
-        let status = yu_storage_session_selection(handle, &value)
-        precondition(status == StorageStatus.ok, "Rust selection query failed: \(status)")
-        return NativeSelection(value)
+        NativeSelection(selectionEndpoints)
     }
 
     var selectionEndpoints: NativeSelectionEndpoints {
@@ -1110,10 +1108,13 @@ final class StorageBridge {
     /// retaining a second document model in AppKit.
     var accessibilitySemanticNodesIfAvailable: [NativeAccessibilitySemanticNode]? {
         let revision = state.revision
+        // count/fill 的长度查询形式：空指针 + 0 容量只回填数量。
         var count = 0
-        let countStatus = yu_storage_session_accessibility_semantic_node_count(
+        let countStatus = yu_storage_session_accessibility_semantic_nodes_v2(
             handle,
             revision,
+            nil,
+            0,
             &count
         )
         guard countStatus == StorageStatus.ok else { return nil }
@@ -1176,16 +1177,13 @@ final class StorageBridge {
         return NativeComposition(value)
     }
 
+    /// 正向选区就是 anchor 在前、focus 在后的端点形式。
     func setSelection(_ range: NSRange, affinity: UInt8 = 1) throws {
-        let current = selection
-        let status = yu_storage_session_set_selection(
-            handle,
-            current.revision,
-            UInt64(range.location),
-            UInt64(range.location + range.length),
-            affinity
+        try setSelectionEndpoints(
+            anchorUTF16: UInt64(range.location),
+            focusUTF16: UInt64(range.location + range.length),
+            affinity: affinity
         )
-        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
     }
 
     func setSelectionEndpoints(
@@ -1498,24 +1496,9 @@ final class StorageBridge {
         return request
     }
 
-    func cancelClose() throws {
-        let status = yu_storage_session_cancel_close(
-            handle
-        )
-        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
-    }
-
-    func saveAndClose() throws {
-        let status = yu_storage_session_save_close(
-            handle
-        )
-        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
-    }
-
-    func discardAndClose() throws {
-        let status = yu_storage_session_discard_close(
-            handle
-        )
+    /// 结束一次关闭协商。取消 / 保存后关闭 / 丢弃后关闭是同一个协商的三个出口。
+    func resolveClose(_ action: UInt8) throws {
+        let status = yu_storage_session_close_resolve(handle, action)
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
     }
 
