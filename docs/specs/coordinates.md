@@ -16,6 +16,25 @@ Yu 不使用同一个 `usize` 表示所有位置。
 | `NativeCaretPosition` | AppKit UTF-16 caret 与视觉行 affinity | 否 |
 | `VisualOffset` | projection 后的 UTF-8 visual byte offset | 否 |
 
+## 语法树里的位置
+
+`yu-syntax` 的节点**不存绝对位置**，只存「相对父节点的偏移」与「自身字节
+长度」，两者都是 `u32`。绝对位置由游标在下降时累加得出。
+
+这不是省内存的小聪明，是增量复用的前提：一棵子树不知道自己在文档里的哪个
+位置，因此编辑之后它换一个位置仍然有效，可以被整棵搬进新树而不必重写。
+换成绝对位置，任何一次插入都要改写它后面所有节点。
+
+两条随之而来的约束：
+
+- **`u32` 给树的位置定了 4 GiB 上限。** 超出时 `parse` 返回
+  `ParseError::SourceTooLarge`，明确拒绝而不是静默截断。这与
+  [架构总览 v2](../architecture/overview-v2.md) 第 6.4 节
+  「百万行以内无问题，GB 级文件另立方案」一致。
+- **树里的位置不能直接当 `ByteOffset` 用。** 它们要么是相对的，要么是
+  游标算出来的绝对值；跨出 `yu-syntax` 边界时转成 `ByteOffset`，
+  和其余所有裸 offset 一样受下面「Snapshot boundary」一节约束。
+
 ## 视觉坐标
 
 一套实现，空间进类型，全部定义在 `yu-core::geometry`：
