@@ -47,9 +47,9 @@ v2 重构分 7 个阶段推进，每个阶段结束时 app 必须可运行、CI 
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| S1 | 拆炸弹：删除 TextKit fallback 与诊断桥，帧调度移入 Rust，app 转正 | 进行中 |
-| S2 | 地基：坐标收敛、`yu-text` 换 ropey、CI 强制依赖方向 | 未开始 |
-| S3 | 解析器：移植 lezer-markdown 算法，建立 CommonMark spec 差分测试 | 未开始 |
+| S1 | 拆炸弹：删除 TextKit fallback 与诊断桥，帧调度移入 Rust，app 转正 | 已完成（Swift 行数目标未达成，见第 8 节） |
+| S2 | 地基：坐标收敛、`yu-text` 换 ropey、CI 强制依赖方向 | 已完成 |
+| S3 | 解析器：移植 lezer-markdown 算法，建立 CommonMark spec 差分测试 | 已完成 |
 | S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 未开始 |
 | S5 | 布局重写：UAX #14 断行、UAX #9 bidi、widget 盒模型 | 未开始 |
 | S6 | 语义 extension 化：每种语法收敛为一个 extension | 未开始 |
@@ -62,7 +62,7 @@ v2 重构分 7 个阶段推进，每个阶段结束时 app 必须可运行、CI 
 ```text
 crates/yu-core          坐标、Revision、Anchor
 crates/yu-text          Rope（ropey）、Snapshot、Transaction 原语
-crates/yu-syntax        增量 CST：block/inline 两级、fragment 复用、精确 range
+crates/yu-syntax        增量 CST：block/inline 两级、fragment 复用、精确 range（S3 已建立）
 crates/yu-markdown      ★ Markdown 语法 extension 集合（Markdown 只存在于这一层）
 crates/yu-state         EditorState、Transaction 应用、History、Facet
 crates/yu-decoration    ★ RangeSet<Decoration>、source↔visual 映射

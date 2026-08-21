@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use yu_core::{ByteOffset, TextRange};
-use yu_syntax::{NodeKind, Tree, TreeFragment, parse, parse_with_fragments};
+use yu_syntax::{Tree, TreeFragment, parse, parse_with_fragments};
 use yu_text::{Edit, TextBuffer, Transaction};
 
 #[path = "support/generator.rs"]
@@ -126,10 +126,11 @@ fn structural_invariants_hold_on_arbitrary_documents() {
     }
 }
 
-/// 供 `tools/fuzz.sh` 复用的检查体：任意输入下必须成立的四条。
+/// 任意输入下必须成立的四条。确定性测试与 `fuzz_soak` 共用同一个检查体
+/// ——fuzz 与门禁检查的是同一件事，区别只在种子。
 ///
 /// 返回 `Err` 而不是 panic，好让 fuzz 驱动能把失败样本写进 corpus 再退出。
-pub fn check_structural_invariants(source: &str) -> Result<(), String> {
+fn check_structural_invariants(source: &str) -> Result<(), String> {
     let parsed = parse(source).map_err(|error| format!("全量解析失败：{error}"))?;
     let tree = parsed.tree();
 
@@ -266,9 +267,6 @@ fn render_html(source: &str) -> String {
 fn seed_for(index: usize) -> u64 {
     0x5955_5F53_594E_5441_u64 ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
-
-/// 让编译器别把 `NodeKind` 当没用到——`check_ranges` 通过 `name()` 用了它。
-const _: fn(NodeKind) -> &'static str = NodeKind::name;
 
 /// corpus 目录必须存在且有 README，否则「fuzz 找到的样本要入库」这条约定
 /// 会随着目录被误删而无声消失。
