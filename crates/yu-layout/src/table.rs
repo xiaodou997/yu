@@ -1,17 +1,16 @@
 use std::{error::Error, fmt};
 
 use unicode_segmentation::UnicodeSegmentation;
-use yu_core::{ByteOffset, Revision, TextRange};
+use yu_core::{ByteOffset, ClusterMetrics, Revision, ShapingProvider, TextRange, TextStyle};
 use yu_markdown::{TableAlignment, TableCellRange};
 use yu_projection::{
     Projection, ProjectionBias, ProjectionError, TableProjection, VisualOffset, VisualRange,
-    VisualRunKind, VisualRunStyle,
+    VisualRunKind,
 };
 use yu_text::{ChangeSet, TextSnapshot};
 
 use crate::{
-    ClusterMetrics, LayoutConfig, LayoutError, LayoutPoint, LayoutRect, ShapingProvider,
-    map_source_range, source_range_contains,
+    LayoutConfig, LayoutError, LayoutPoint, LayoutRect, map_source_range, source_range_contains,
 };
 
 /// Geometry for one visible GFM table cell. The row index is visual-table
@@ -400,7 +399,7 @@ impl TableLayoutSnapshot {
         mut measure: F,
     ) -> Result<Self, LayoutError>
     where
-        F: FnMut(&str, TextRange, VisualRunStyle) -> Result<f32, LayoutError>,
+        F: FnMut(&str, TextRange, TextStyle) -> Result<f32, LayoutError>,
     {
         config.validate()?;
         let table = projection.table();
@@ -864,7 +863,7 @@ fn measure_cell_content<F>(
     measure: &mut F,
 ) -> Result<(VisualRange, f32), LayoutError>
 where
-    F: FnMut(&str, TextRange, VisualRunStyle) -> Result<f32, LayoutError>,
+    F: FnMut(&str, TextRange, TextStyle) -> Result<f32, LayoutError>,
 {
     let visual_start = projection
         .visual()
@@ -902,7 +901,7 @@ where
 fn measure_text<M: ClusterMetrics>(
     text: &str,
     metrics: &M,
-    style: VisualRunStyle,
+    style: TextStyle,
 ) -> Result<f32, LayoutError> {
     let mut width = 0.0_f32;
     for cluster in text.graphemes(true) {

@@ -1,5 +1,5 @@
-use yu_core::{Revision, TextRange};
-use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider};
+use yu_core::{Revision, ShapingProvider, TextRange};
+use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot};
 use yu_markdown::{Block, BlockKind, MarkdownDocument};
 use yu_projection::BlockProjection;
 use yu_text::{ChangeSet, TextSnapshot};

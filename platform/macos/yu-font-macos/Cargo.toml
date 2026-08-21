@@ -12,10 +12,12 @@ repository.workspace = true
 unicode-segmentation = "1.13"
 yu-core = { path = "../../../crates/yu-core" }
 yu-font = { path = "../../../crates/yu-font" }
-yu-projection = { path = "../../../crates/yu-projection" }
 
+# 仅测试用：验证 CoreText 的 advance 与 source cluster 能被布局消费。
+# 产物依赖只有 yu-core + yu-font；平台层本就允许向下依赖。
 [dev-dependencies]
 yu-layout = { path = "../../../crates/yu-layout" }
+yu-projection = { path = "../../../crates/yu-projection" }
 yu-text = { path = "../../../crates/yu-text" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

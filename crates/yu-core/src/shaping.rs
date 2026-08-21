@@ -1,7 +1,7 @@
 use std::fmt;
 
-use yu_core::TextRange;
-use yu_projection::VisualRunStyle;
+use crate::TextRange;
+use crate::style::TextStyle;
 
 /// Stable face identity carried by shaped glyph runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,7 +114,7 @@ impl Glyph {
 pub struct GlyphRun {
     face: FontFaceId,
     source: TextRange,
-    style: VisualRunStyle,
+    style: TextStyle,
     direction: TextDirection,
     script: Script,
     glyphs: Vec<Glyph>,
@@ -126,7 +126,7 @@ impl GlyphRun {
     pub fn new(
         face: FontFaceId,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
         direction: TextDirection,
         script: Script,
         glyphs: Vec<Glyph>,
@@ -154,7 +154,7 @@ impl GlyphRun {
     }
 
     #[must_use]
-    pub const fn style(&self) -> VisualRunStyle {
+    pub const fn style(&self) -> TextStyle {
         self.style
     }
 
@@ -255,7 +255,7 @@ pub trait ShapingProvider {
         &self,
         text: &str,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
     ) -> Result<ShapedText, Self::Error>;
 
     /// Shapes at a finite, positive scale relative to the provider's base
@@ -266,10 +266,19 @@ pub trait ShapingProvider {
         &self,
         text: &str,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
         scale: f32,
     ) -> Result<ShapedText, Self::Error> {
         self.shape(text, source, style)
             .map(|shaped| shaped.scaled(scale))
     }
+}
+
+/// 给一个 Unicode grapheme cluster 提供 advance。
+///
+/// 这个 trait 此前定义在 `yu-layout`，而实现它的是 `yu-font`——于是字体层必须
+/// 反向依赖布局层（overview-v2 第 2.4 节）。它描述的是「量一个 cluster 有多宽」，
+/// 属于字体契约，不属于布局。
+pub trait ClusterMetrics {
+    fn advance(&self, cluster: &str, style: TextStyle) -> f32;
 }

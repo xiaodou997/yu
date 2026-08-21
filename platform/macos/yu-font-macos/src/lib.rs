@@ -21,6 +21,7 @@ use unicode_segmentation::UnicodeSegmentation;
 #[cfg(target_os = "macos")]
 use yu_core::ByteOffset;
 use yu_core::TextRange;
+use yu_core::TextStyle;
 use yu_font::FontFaceId;
 use yu_font::{
     AtlasEntry, FontMetricKey, FontMetricsSnapshot, GlyphRasterKey, GlyphRasterizer,
@@ -34,7 +35,6 @@ use yu_font::{
 use yu_font::{
     FontRequest, ShapeError, ShapeRequest, ShapedText, ShapingProvider, TextDirection, TextShaper,
 };
-use yu_projection::VisualRunStyle;
 
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{
@@ -554,9 +554,8 @@ impl CoreTextShaper {
                 ),
             )
             .ok_or(CoreTextShapeError::InvalidViewportMetrics)?;
-            let request =
-                ShapeRequest::new(sample, source, VisualRunStyle::Plain, self.request.clone())
-                    .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
+            let request = ShapeRequest::new(sample, source, TextStyle::Plain, self.request.clone())
+                .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
             let shaped = self.shape_request(&request)?;
             let grapheme_count = sample.graphemes(true).count();
             let Some(run) = shaped.runs().first() else {
@@ -1037,7 +1036,7 @@ impl ShapingProvider for CoreTextShaper {
         &self,
         text: &str,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
     ) -> Result<ShapedText, Self::Error> {
         let request = ShapeRequest::new(text, source, style, self.request.clone())?;
         <Self as TextShaper>::shape(self, &request)
@@ -1047,7 +1046,7 @@ impl ShapingProvider for CoreTextShaper {
         &self,
         text: &str,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
         scale: f32,
     ) -> Result<ShapedText, Self::Error> {
         let size = self.request.size() * scale;
@@ -1061,11 +1060,11 @@ impl ShapingProvider for CoreTextShaper {
 }
 
 #[cfg(target_os = "macos")]
-fn style_font_request(request: &FontRequest, style: VisualRunStyle) -> FontRequest {
+fn style_font_request(request: &FontRequest, style: TextStyle) -> FontRequest {
     match style {
-        VisualRunStyle::Strong => request.clone().with_weight(FontWeight::Bold),
-        VisualRunStyle::Emphasis => request.clone().with_slant(FontSlant::Italic),
-        VisualRunStyle::Plain | VisualRunStyle::Code => request.clone(),
+        TextStyle::Strong => request.clone().with_weight(FontWeight::Bold),
+        TextStyle::Emphasis => request.clone().with_slant(FontSlant::Italic),
+        TextStyle::Plain | TextStyle::Code => request.clone(),
     }
 }
 
@@ -1437,7 +1436,7 @@ mod tests {
         )
         .expect("source range should be valid");
         let shape_request =
-            ShapeRequest::new(text, source, VisualRunStyle::Plain, request).expect("request");
+            ShapeRequest::new(text, source, TextStyle::Plain, request).expect("request");
         let shaped = TextShaper::shape(&shaper, &shape_request).expect("CoreText should shape");
 
         assert_eq!(shaped.source(), source);
@@ -1472,7 +1471,7 @@ mod tests {
             ByteOffset::new(u64::try_from(sample.len()).expect("sample should fit")),
         )
         .expect("source range should be valid");
-        let request = ShapeRequest::new(sample, source, VisualRunStyle::Plain, request)
+        let request = ShapeRequest::new(sample, source, TextStyle::Plain, request)
             .expect("request should be valid");
         let shaped = TextShaper::shape(&shaper, &request).expect("CoreText should shape");
         let expected = shaped.advance() / sample.graphemes(true).count() as f32;
@@ -1510,7 +1509,7 @@ mod tests {
                 ByteOffset::new(u64::try_from(text.len()).expect("len fits")),
             )
             .expect("source range");
-            let shaped = ShapingProvider::shape(&shaper, text, source, VisualRunStyle::Plain)
+            let shaped = ShapingProvider::shape(&shaper, text, source, TextStyle::Plain)
                 .expect("shape should succeed");
             let mut max_height = 0;
             for run in shaped.runs() {
@@ -1560,7 +1559,7 @@ mod tests {
         )
         .expect("source range");
         let shaped =
-            ShapingProvider::shape(&shaper, text, source, VisualRunStyle::Plain).expect("shape");
+            ShapingProvider::shape(&shaper, text, source, TextStyle::Plain).expect("shape");
         assert!(
             shaped.runs().len() > 1,
             "fixture 未产生多个 run，测不到 run 起点被重复计入的问题"
@@ -1605,7 +1604,7 @@ mod tests {
         let text = "F";
         let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1)).expect("range");
         let shaped =
-            ShapingProvider::shape(&shaper, text, source, VisualRunStyle::Plain).expect("shape");
+            ShapingProvider::shape(&shaper, text, source, TextStyle::Plain).expect("shape");
         let run = shaped.runs().first().expect("one run");
         let glyph = run.glyphs().first().expect("one glyph");
         let raster = rasterizer
@@ -1717,7 +1716,7 @@ mod tests {
         let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1))
             .expect("source range should be valid");
         let shape_request =
-            ShapeRequest::new("A", source, VisualRunStyle::Plain, request).expect("request");
+            ShapeRequest::new("A", source, TextStyle::Plain, request).expect("request");
         let shaped = TextShaper::shape(&shaper, &shape_request).expect("CoreText should shape");
         let run = shaped.runs().first().expect("shaped run");
         let glyph = run.glyphs().first().expect("shaped glyph");
@@ -1763,7 +1762,7 @@ mod tests {
         let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1))
             .expect("source range should be valid");
         let shape_request =
-            ShapeRequest::new("A", source, VisualRunStyle::Plain, request).expect("request");
+            ShapeRequest::new("A", source, TextStyle::Plain, request).expect("request");
         let shaped =
             TextShaper::shape(&first_shaper, &shape_request).expect("CoreText should shape");
         let glyph = shaped

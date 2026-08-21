@@ -7,12 +7,12 @@ use std::error::Error;
 use std::time::Instant;
 
 use yu_assets::{ImageRequest, ImageRequestCandidate, ImageRequestPlan, ImageRequestPriority};
-use yu_core::{ByteOffset, TextRange};
-use yu_editor::{EditorDocument, ImageIntrinsicSize, ViewportConfig, ViewportRect, VisualRunStyle};
-use yu_layout::{
-    FontFaceId, Glyph, GlyphId, GlyphRun, LayoutConfig, Script, ShapedText, ShapingProvider,
-    TextDirection,
+use yu_core::{
+    ByteOffset, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
+    TextDirection, TextRange, TextStyle,
 };
+use yu_editor::{EditorDocument, ImageIntrinsicSize, ViewportConfig, ViewportRect};
+use yu_layout::LayoutConfig;
 
 /// A deterministic shaper is enough for this benchmark: the workload measures
 /// how many image candidates a viewport/overscan query visits, not CoreText.
@@ -25,7 +25,7 @@ impl ShapingProvider for BenchShaper {
         &self,
         text: &str,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
     ) -> Result<ShapedText, Self::Error> {
         let mut glyphs = Vec::with_capacity(text.chars().count());
         for (start, character) in text.char_indices() {

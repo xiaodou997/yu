@@ -12,19 +12,18 @@ use std::fmt;
 use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
-use yu_core::{Affinity, ByteOffset, TextAnchor, TextRange};
+use yu_core::{
+    Affinity, ByteOffset, ClusterMetrics, FontFaceId, GlyphId, ShapedText, ShapingProvider,
+    TextAnchor, TextRange, TextStyle,
+};
 use yu_projection::{
     BlockProjection, BlockQuotePresentation, HeadingPresentation, LeadingMarker, Projection,
-    ProjectionBias, ProjectionError, VisualOffset, VisualRange, VisualRunKind, VisualRunStyle,
+    ProjectionBias, ProjectionError, VisualOffset, VisualRange, VisualRunKind,
 };
 use yu_text::{ChangeSet, TextSnapshot};
 
-mod shaping;
 mod table;
 
-pub use shaping::{
-    FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
-};
 pub use table::{
     TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeCommit, TableResizeGesture,
     TableResizeGestureError, TableResizeHit, TableResizeTarget,
@@ -100,15 +99,6 @@ impl Default for LayoutConfig {
     }
 }
 
-/// Supplies an advance for one Unicode grapheme cluster.
-///
-/// `yu-font::FontMetrics` is the current contract adapter; a native shaping
-/// backend can provide the same trait without changing the layout tree or
-/// hit-test contracts.
-pub trait ClusterMetrics {
-    fn advance(&self, cluster: &str, style: VisualRunStyle) -> f32;
-}
-
 /// Deterministic metrics used before a font/shaping backend exists.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MonospaceMetrics {
@@ -136,7 +126,7 @@ impl Default for MonospaceMetrics {
 fn measure_marker<M: ClusterMetrics>(text: &str, metrics: &M) -> Result<f32, LayoutError> {
     let mut width = 0.0_f32;
     for cluster in text.graphemes(true) {
-        let advance = metrics.advance(cluster, VisualRunStyle::Plain);
+        let advance = metrics.advance(cluster, TextStyle::Plain);
         if !advance.is_finite() || advance < 0.0 {
             return Err(LayoutError::InvalidMetrics(advance.to_bits()));
         }
@@ -169,7 +159,7 @@ fn shape_marker<S: ShapingProvider>(
     let synthetic = TextRange::new(ByteOffset::ZERO, ByteOffset::new(text_len))
         .ok_or(LayoutError::OffsetOverflow)?;
     let shaped = shaper
-        .shape(marker.text(), synthetic, VisualRunStyle::Plain)
+        .shape(marker.text(), synthetic, TextStyle::Plain)
         .map_err(|error| LayoutError::Shaping(error.to_string()))?;
     if shaped.source() != synthetic {
         return Err(LayoutError::Shaping(
@@ -262,8 +252,8 @@ struct HeadingClusterMetrics<'a, M> {
 }
 
 impl<M: ClusterMetrics> ClusterMetrics for HeadingClusterMetrics<'_, M> {
-    fn advance(&self, cluster: &str, _style: VisualRunStyle) -> f32 {
-        self.metrics.advance(cluster, VisualRunStyle::Strong) * self.scale
+    fn advance(&self, cluster: &str, _style: TextStyle) -> f32 {
+        self.metrics.advance(cluster, TextStyle::Strong) * self.scale
     }
 }
 
@@ -299,7 +289,7 @@ fn block_quote_metrics(
 }
 
 impl ClusterMetrics for MonospaceMetrics {
-    fn advance(&self, _cluster: &str, _style: VisualRunStyle) -> f32 {
+    fn advance(&self, _cluster: &str, _style: TextStyle) -> f32 {
         self.advance
     }
 }
@@ -620,7 +610,7 @@ pub struct VisualCluster {
     line: usize,
     x: f32,
     width: f32,
-    style: VisualRunStyle,
+    style: TextStyle,
     line_break: bool,
 }
 
@@ -639,7 +629,7 @@ pub struct GlyphPlacement {
     line: usize,
     x: f32,
     y: f32,
-    style: VisualRunStyle,
+    style: TextStyle,
     font_scale: f32,
 }
 
@@ -804,7 +794,7 @@ impl GlyphPlacement {
     }
 
     #[must_use]
-    pub const fn style(self) -> VisualRunStyle {
+    pub const fn style(self) -> TextStyle {
         self.style
     }
 
@@ -842,7 +832,7 @@ impl VisualCluster {
     }
 
     #[must_use]
-    pub const fn style(self) -> VisualRunStyle {
+    pub const fn style(self) -> TextStyle {
         self.style
     }
 
@@ -1384,7 +1374,7 @@ impl LayoutSnapshot {
                     line: 0,
                     x: glyph_x,
                     y: glyph_y,
-                    style: VisualRunStyle::Plain,
+                    style: TextStyle::Plain,
                     font_scale: 1.0,
                 });
                 x += glyph.advance();
@@ -1930,7 +1920,7 @@ impl LayoutSnapshot {
                 .map_err(LayoutError::Projection)?;
             let shape_source = self.projection.shape_source_range_for_run(run);
             let shape_style = if force_bold {
-                VisualRunStyle::Strong
+                TextStyle::Strong
             } else {
                 run.style()
             };
@@ -2367,7 +2357,7 @@ fn map_source_range(range: TextRange, changes: &ChangeSet) -> Result<TextRange, 
 mod tests {
     use super::*;
     use unicode_segmentation::UnicodeSegmentation;
-    use yu_core::{ByteOffset, Revision, TextRange};
+    use yu_core::{ByteOffset, Glyph, GlyphRun, Revision, Script, TextDirection, TextRange};
     use yu_projection::{BlockProjection, Projection};
     use yu_text::TextBuffer;
 
@@ -2453,7 +2443,7 @@ mod tests {
             shaped
                 .glyphs()
                 .iter()
-                .all(|glyph| glyph.style() == VisualRunStyle::Strong)
+                .all(|glyph| glyph.style() == TextStyle::Strong)
         );
         assert!(
             shaped
@@ -2598,7 +2588,7 @@ mod tests {
             &self,
             text: &str,
             source: TextRange,
-            style: VisualRunStyle,
+            style: TextStyle,
         ) -> Result<ShapedText, Self::Error> {
             if matches!(self.shape, TestShape::Error) {
                 return Err("boom");
@@ -2772,7 +2762,7 @@ mod tests {
             layout
                 .clusters()
                 .iter()
-                .all(|cluster| cluster.style() == VisualRunStyle::Code)
+                .all(|cluster| cluster.style() == TextStyle::Code)
         );
         assert_eq!(layout.lines()[0].width(), 11.0);
     }
