@@ -3,7 +3,14 @@
 //! Stable foundational types shared by Yu Editor's core crates.
 
 mod position;
+mod shaping;
+mod style;
 
 pub use position::{
     Affinity, ByteOffset, LineIndex, Revision, TextAnchor, TextRange, Utf16Offset, Utf16Range,
 };
+pub use shaping::{
+    ClusterMetrics, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
+    TextDirection,
+};
+pub use style::TextStyle;

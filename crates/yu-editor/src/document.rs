@@ -3,11 +3,8 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
-use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Range};
-use yu_layout::{
-    ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutSnapshot, ShapingProvider,
-    TableResizeCommit,
-};
+use yu_core::{ByteOffset, LineIndex, Revision, ShapingProvider, TextRange, Utf16Range};
+use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutSnapshot, TableResizeCommit};
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
@@ -2475,13 +2472,12 @@ mod tests {
     use super::*;
     use crate::{EditorKey, KeyModifiers, SourceSync, VisualRunKind};
     use unicode_segmentation::UnicodeSegmentation;
-    use yu_core::{ByteOffset, Utf16Offset};
-    use yu_layout::{
-        FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
-        TableResizeGesture, TableResizeTarget, TextDirection,
+    use yu_core::{
+        ByteOffset, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
+        TextDirection, TextStyle, Utf16Offset,
     };
+    use yu_layout::{TableResizeGesture, TableResizeTarget};
     use yu_markdown::BlockKind;
-    use yu_projection::VisualRunStyle;
     use yu_text::Edit;
 
     fn source_range(start: u64, end: u64) -> TextRange {
@@ -2612,7 +2608,7 @@ mod tests {
             &self,
             text: &str,
             source: TextRange,
-            style: VisualRunStyle,
+            style: TextStyle,
         ) -> Result<ShapedText, Self::Error> {
             let glyphs = text
                 .grapheme_indices(true)
@@ -3808,7 +3804,7 @@ mod tests {
                     assert_eq!(code.visual().visual_len().get(), code.content().len());
                     assert!(code.visual().runs().iter().any(|run| {
                         run.kind() == VisualRunKind::Visible
-                            && run.style() == crate::VisualRunStyle::Code
+                            && run.style() == crate::TextStyle::Code
                     }));
                 }
                 BlockProjection::Inline(_)

@@ -103,9 +103,6 @@ version = "0.1.0"
 dependencies = [
  "unicode-segmentation",
  "yu-core",
- "yu-layout",
- "yu-projection",
- "yu-text",
 ]
 
 [[package]]
@@ -137,6 +134,7 @@ version = "0.1.0"
 dependencies = [
  "unicode-segmentation",
  "yu-core",
+ "yu-font",
  "yu-markdown",
  "yu-projection",
  "yu-text",

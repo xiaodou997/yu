@@ -11,7 +11,7 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
+use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange, TextStyle};
 use yu_markdown::{
     Block, BlockKind, InlineDocument, InlineNodeKind, InlineParseError, InlineSpan, InlineSpanKind,
     ReferenceDefinitionIndex, TableBlock, list_marker, parse_inline, parse_inline_with_definitions,
@@ -120,22 +120,13 @@ pub enum VisualRunKind {
     Composition,
 }
 
-/// Semantic style carried by a visible visual run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum VisualRunStyle {
-    Plain,
-    Emphasis,
-    Strong,
-    Code,
-}
-
 /// A source-backed visual run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VisualRun {
     source: TextRange,
     visual: VisualRange,
     kind: VisualRunKind,
-    style: VisualRunStyle,
+    style: TextStyle,
 }
 
 /// Source-backed metadata for one Markdown image in a projection.
@@ -204,7 +195,7 @@ impl VisualRun {
     }
 
     #[must_use]
-    pub const fn style(self) -> VisualRunStyle {
+    pub const fn style(self) -> TextStyle {
         self.style
     }
 
@@ -537,7 +528,7 @@ impl Projection {
             &[source_range],
             &[],
             &[],
-            VisualRunStyle::Plain,
+            TextStyle::Plain,
         )
     }
 
@@ -622,7 +613,7 @@ impl Projection {
             &hidden,
             &line_breaks,
             inline.spans(),
-            VisualRunStyle::Plain,
+            TextStyle::Plain,
         )
     }
 
@@ -632,7 +623,7 @@ impl Projection {
         hidden: &[TextRange],
         line_breaks: &[LineBreakSpec],
         spans: &[InlineSpan],
-        default_style: VisualRunStyle,
+        default_style: TextStyle,
     ) -> Result<Self, ProjectionError> {
         source.utf16_offset(source_range.start())?;
         source.utf16_offset(source_range.end())?;
@@ -790,7 +781,7 @@ impl Projection {
                 visual: VisualRange::new(visual_start, visual_end)
                     .ok_or(ProjectionError::OffsetOverflow)?,
                 kind: VisualRunKind::Composition,
-                style: VisualRunStyle::Plain,
+                style: TextStyle::Plain,
             };
             let insertion = runs
                 .iter()
@@ -1503,7 +1494,7 @@ fn build_runs(
     hidden: &[TextRange],
     line_breaks: &[LineBreakSpec],
     spans: &[InlineSpan],
-    default_style: VisualRunStyle,
+    default_style: TextStyle,
 ) -> Result<Vec<VisualRun>, ProjectionError> {
     let mut runs = Vec::new();
     let mut source_cursor = source_range.start();
@@ -1562,7 +1553,7 @@ fn build_runs(
                     source: range,
                     visual: VisualRange::empty(visual_cursor),
                     kind: VisualRunKind::HiddenSyntax,
-                    style: VisualRunStyle::Plain,
+                    style: TextStyle::Plain,
                 });
                 source_cursor = range.end();
             }
@@ -1575,7 +1566,7 @@ fn build_runs(
                     visual: VisualRange::new(visual_cursor, visual_end)
                         .ok_or(ProjectionError::OffsetOverflow)?,
                     kind: VisualRunKind::LineBreak { hard },
-                    style: VisualRunStyle::Plain,
+                    style: TextStyle::Plain,
                 });
                 visual_cursor = visual_end;
                 source_cursor = event_range.end();
@@ -1668,7 +1659,7 @@ fn append_visible_runs(
     end: ByteOffset,
     mut visual_cursor: VisualOffset,
     spans: &[InlineSpan],
-    default_style: VisualRunStyle,
+    default_style: TextStyle,
 ) -> Result<VisualOffset, ProjectionError> {
     let mut boundaries = vec![start, end];
     for span in spans {
@@ -1702,11 +1693,7 @@ fn append_visible_runs(
     Ok(visual_cursor)
 }
 
-fn style_for(
-    range: TextRange,
-    spans: &[InlineSpan],
-    default_style: VisualRunStyle,
-) -> VisualRunStyle {
+fn style_for(range: TextRange, spans: &[InlineSpan], default_style: TextStyle) -> TextStyle {
     spans
         .iter()
         .filter(|span| {
@@ -1728,9 +1715,9 @@ fn style_for(
             )
         })
         .map_or(default_style, |span| match span.kind() {
-            InlineSpanKind::Emphasis => VisualRunStyle::Emphasis,
-            InlineSpanKind::Strong => VisualRunStyle::Strong,
-            InlineSpanKind::CodeSpan => VisualRunStyle::Code,
+            InlineSpanKind::Emphasis => TextStyle::Emphasis,
+            InlineSpanKind::Strong => TextStyle::Strong,
+            InlineSpanKind::CodeSpan => TextStyle::Code,
             InlineSpanKind::Link
             | InlineSpanKind::Image
             | InlineSpanKind::ReferenceLink
@@ -1931,7 +1918,7 @@ impl CodeProjection {
             &hidden,
             &[],
             &[],
-            VisualRunStyle::Code,
+            TextStyle::Code,
         )?;
         Ok(Self {
             visual,
@@ -2992,7 +2979,7 @@ mod tests {
                         .range()
         }));
         assert!(projection.visual().runs().iter().any(|run| {
-            run.kind() == VisualRunKind::Visible && run.style() == VisualRunStyle::Strong
+            run.kind() == VisualRunKind::Visible && run.style() == TextStyle::Strong
         }));
 
         let text = source.find("text").expect("strong task text");
@@ -3656,12 +3643,12 @@ mod tests {
         assert_eq!(
             visible_styles,
             vec![
-                VisualRunStyle::Strong,
-                VisualRunStyle::Plain,
-                VisualRunStyle::Emphasis,
-                VisualRunStyle::Plain,
-                VisualRunStyle::Code,
-                VisualRunStyle::Plain,
+                TextStyle::Strong,
+                TextStyle::Plain,
+                TextStyle::Emphasis,
+                TextStyle::Plain,
+                TextStyle::Code,
+                TextStyle::Plain,
             ]
         );
         assert_eq!(
@@ -3707,9 +3694,11 @@ mod tests {
                 .count(),
             2
         );
-        assert!(code.visual().runs().iter().any(|run| {
-            run.kind() == VisualRunKind::Visible && run.style() == VisualRunStyle::Code
-        }));
+        assert!(
+            code.visual().runs().iter().any(|run| {
+                run.kind() == VisualRunKind::Visible && run.style() == TextStyle::Code
+            })
+        );
         assert_eq!(
             code.visual()
                 .source_to_visual(code.content().start(), ProjectionBias::After)

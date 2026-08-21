@@ -10,12 +10,8 @@ repository.workspace = true
 
 [dependencies]
 yu-core = { path = "../yu-core" }
-yu-layout = { path = "../yu-layout" }
-yu-projection = { path = "../yu-projection" }
 unicode-segmentation = "1.13"
 
-[dev-dependencies]
-yu-text = { path = "../yu-text" }
 
 [lints]
 workspace = true

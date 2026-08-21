@@ -15,9 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use unicode_segmentation::UnicodeSegmentation;
-use yu_core::{ByteOffset, TextRange};
-use yu_layout::ClusterMetrics;
-use yu_projection::VisualRunStyle;
+use yu_core::{ByteOffset, ClusterMetrics, TextRange, TextStyle};
 
 mod raster;
 
@@ -26,7 +24,7 @@ pub use raster::{
     GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphMetrics, GlyphRasterKey, GlyphRasterizer,
     RasterDataError, RasterizedGlyph,
 };
-pub use yu_layout::{
+pub use yu_core::{
     FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
 };
 
@@ -338,11 +336,11 @@ impl FontRequest {
         self
     }
 
-    fn for_style(&self, style: VisualRunStyle) -> Self {
+    fn for_style(&self, style: TextStyle) -> Self {
         match style {
-            VisualRunStyle::Strong => self.clone().with_weight(FontWeight::Bold),
-            VisualRunStyle::Emphasis => self.clone().with_slant(FontSlant::Italic),
-            VisualRunStyle::Plain | VisualRunStyle::Code => self.clone(),
+            TextStyle::Strong => self.clone().with_weight(FontWeight::Bold),
+            TextStyle::Emphasis => self.clone().with_slant(FontSlant::Italic),
+            TextStyle::Plain | TextStyle::Code => self.clone(),
         }
     }
 }
@@ -352,7 +350,7 @@ impl FontRequest {
 pub struct ShapeRequest<'a> {
     text: &'a str,
     source: TextRange,
-    style: VisualRunStyle,
+    style: TextStyle,
     font: FontRequest,
     direction: TextDirection,
     script: Script,
@@ -362,7 +360,7 @@ impl<'a> ShapeRequest<'a> {
     pub fn new(
         text: &'a str,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
         font: FontRequest,
     ) -> Result<Self, ShapeError> {
         if source.len() != u64::try_from(text.len()).map_err(|_| ShapeError::OffsetOverflow)? {
@@ -392,7 +390,7 @@ impl<'a> ShapeRequest<'a> {
     }
 
     #[must_use]
-    pub const fn style(&self) -> VisualRunStyle {
+    pub const fn style(&self) -> TextStyle {
         self.style
     }
 
@@ -629,7 +627,7 @@ impl ShapingProvider for FontShaper {
         &self,
         text: &str,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
     ) -> Result<ShapedText, Self::Error> {
         let request = ShapeRequest::new(text, source, style, self.request.clone())?;
         self.backend.shape(&request)
@@ -639,7 +637,7 @@ impl ShapingProvider for FontShaper {
         &self,
         text: &str,
         source: TextRange,
-        style: VisualRunStyle,
+        style: TextStyle,
         scale: f32,
     ) -> Result<ShapedText, Self::Error> {
         let size = self.request.size * scale;
@@ -674,7 +672,7 @@ impl FontMetrics {
 }
 
 impl ClusterMetrics for FontMetrics {
-    fn advance(&self, cluster: &str, style: VisualRunStyle) -> f32 {
+    fn advance(&self, cluster: &str, style: TextStyle) -> f32 {
         let request = self.request.for_style(style);
         self.database
             .resolve(&request, cluster)
@@ -702,9 +700,6 @@ fn hash_cluster(cluster: &str) -> u32 {
 mod tests {
     use super::*;
     use yu_core::{ByteOffset, TextRange};
-    use yu_layout::{LayoutConfig, LayoutSnapshot};
-    use yu_projection::Projection;
-    use yu_text::TextBuffer;
 
     fn database() -> Arc<FontDatabase> {
         let mut database = FontDatabase::new();
@@ -741,7 +736,7 @@ mod tests {
         let request = ShapeRequest::new(
             "a🙂",
             TextRange::new(ByteOffset::ZERO, ByteOffset::new(5)).expect("range should be valid"),
-            VisualRunStyle::Plain,
+            TextStyle::Plain,
             FontRequest::new("Latin", 12.0).expect("request should be valid"),
         )
         .expect("shape request should be valid");
@@ -758,59 +753,6 @@ mod tests {
     }
 
     #[test]
-    fn font_metrics_feed_the_existing_layout_contract() {
-        let source = "ab";
-        let buffer = TextBuffer::new(source);
-        let snapshot = buffer.snapshot();
-        let projection = Projection::inline(
-            &snapshot,
-            TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("range should be valid"),
-        )
-        .expect("projection should build");
-        let metrics = FontMetrics::new(
-            database(),
-            FontRequest::new("Latin", 2.0).expect("request should be valid"),
-        )
-        .expect("metrics should build");
-        let layout = LayoutSnapshot::from_projection_with_metrics(
-            &projection,
-            LayoutConfig::new(2.0, 1.0),
-            &metrics,
-        )
-        .expect("layout should consume font metrics");
-        assert_eq!(layout.lines().len(), 1);
-        assert_eq!(layout.lines()[0].width(), 2.0);
-        assert_eq!(layout.clusters().len(), 2);
-    }
-
-    #[test]
-    fn font_shaper_feeds_shaping_aware_layout() {
-        let source = "ab";
-        let buffer = TextBuffer::new(source);
-        let snapshot = buffer.snapshot();
-        let projection = Projection::inline(
-            &snapshot,
-            TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("range should be valid"),
-        )
-        .expect("projection should build");
-        let shaper = FontShaper::new(
-            database(),
-            FontRequest::new("Latin", 2.0).expect("request should be valid"),
-        )
-        .expect("shaper should build");
-        let layout = LayoutSnapshot::from_projection_with_shaper(
-            &projection,
-            LayoutConfig::new(2.0, 1.0),
-            &shaper,
-        )
-        .expect("layout should consume shaped runs");
-
-        assert_eq!(layout.lines().len(), 1);
-        assert_eq!(layout.lines()[0].width(), 2.0);
-        assert_eq!(layout.clusters().len(), 2);
-    }
-
-    #[test]
     fn font_shaper_shapes_scaled_requests_at_the_target_size() {
         let shaper = FontShaper::new(
             database(),
@@ -818,14 +760,13 @@ mod tests {
         )
         .expect("shaper should build");
         let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1)).expect("source range");
-        let body = ShapingProvider::shape(&shaper, "a", source, VisualRunStyle::Plain)
-            .expect("body shaping");
-        let heading =
-            ShapingProvider::shape_scaled(&shaper, "a", source, VisualRunStyle::Strong, 2.0)
-                .expect("heading shaping");
+        let body =
+            ShapingProvider::shape(&shaper, "a", source, TextStyle::Plain).expect("body shaping");
+        let heading = ShapingProvider::shape_scaled(&shaper, "a", source, TextStyle::Strong, 2.0)
+            .expect("heading shaping");
 
         assert_eq!(body.advance(), 1.0);
         assert_eq!(heading.advance(), 2.0);
-        assert_eq!(heading.runs()[0].style(), VisualRunStyle::Strong);
+        assert_eq!(heading.runs()[0].style(), TextStyle::Strong);
     }
 }
