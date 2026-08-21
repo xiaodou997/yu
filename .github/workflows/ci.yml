@@ -17,6 +17,9 @@ jobs:
           toolchain: 1.97.0
           components: rustfmt, clippy
       - run: cargo fmt --all --check
+      # cargo 只拦得住依赖环，拦不住方向：yu-font 依赖 yu-layout 在 cargo
+      # 看来完全合法，而那正是不变量 E2 禁止的反向依赖。
+      - run: python3 tools/check-deps.py
       # 头文件是手写的，与 Rust 实现之间没有编译期约束：删掉一个
       # extern "C" fn 不会让头文件报错，孤儿声明也不会让构建失败。
       - run: python3 tools/check-ffi-header.py

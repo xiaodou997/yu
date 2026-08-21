@@ -28,6 +28,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "cargo test"
 cargo test --workspace
 
+step "crate 依赖方向"
+python3 tools/check-deps.py
+
 step "FFI 头文件一致性"
 python3 tools/check-ffi-header.py
 
