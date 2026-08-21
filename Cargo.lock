@@ -81,17 +81,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yu-editor-ffi"
-version = "0.1.0"
-dependencies = [
- "yu-core",
- "yu-editor",
- "yu-font",
- "yu-font-macos",
- "yu-text",
-]
-
-[[package]]
 name = "yu-embedded-math"
 version = "0.1.0"
 dependencies = [
