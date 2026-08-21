@@ -143,7 +143,7 @@ impl Iterator for TaskByteCursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_text::{StorageBackend, TextBuffer, Transaction};
+    use yu_text::{TextBuffer, Transaction};
 
     #[test]
     fn task_marker_parser_keeps_state_and_range_source_backed() {
@@ -190,20 +190,20 @@ mod tests {
             "[x]"
         );
 
-        let mut piece_tree = TextBuffer::with_backend("- [ ] item\n", StorageBackend::PieceTree);
-        piece_tree
+        let mut chunked = TextBuffer::new("- [ ] item\n");
+        chunked
             .apply(&Transaction::new(
-                piece_tree.revision(),
+                chunked.revision(),
                 [yu_text::Edit::new(TextRange::empty(ByteOffset::new(2)), "")],
             ))
             .expect("empty edit should apply");
         assert_eq!(
             parse_task_marker(
-                &piece_tree.snapshot(),
-                TextRange::new(ByteOffset::ZERO, piece_tree.snapshot().len_bytes()).expect("range"),
+                &chunked.snapshot(),
+                TextRange::new(ByteOffset::ZERO, chunked.snapshot().len_bytes()).expect("range"),
                 false
             )
-            .expect("piece tree marker")
+            .expect("chunked marker")
             .state(),
             TaskState::Todo
         );

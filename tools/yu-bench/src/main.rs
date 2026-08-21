@@ -10,7 +10,7 @@ use yu_markdown::{
     BlockCompactionPolicy, MarkdownRetentionStats, parse, parse_incremental,
     retained_markdown_stats,
 };
-use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
+use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
 const SECTION: &str = "# Yu\n\nA paragraph with **strong text**, 中文 and emoji 🙂.\n\n```rust\nfn main() {}\n```\n\n";
 const INSERTIONS: [&str; 6] = ["羽", "Yu", "🙂", "e\u{301}", "\n", "**"];
@@ -21,34 +21,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (random_script, expected_random_result) =
         random_edit_script(&source, configuration.random_edits);
 
-    println!("Yu Phase 1 storage comparison");
+    println!("Yu storage workload");
     println!("document bytes: {}", source.len());
     println!("timing iterations: {}", configuration.iterations);
     println!("random edits: {}", configuration.random_edits);
     println!("retained snapshots: {}", configuration.retained_snapshots);
 
-    for backend in StorageBackend::ALL {
-        run_backend(
-            backend,
-            &source,
-            &random_script,
-            &expected_random_result,
-            configuration,
-        )?;
-    }
+    run_storage(
+        &source,
+        &random_script,
+        &expected_random_result,
+        configuration,
+    )?;
 
     Ok(())
 }
 
-fn run_backend(
-    backend: StorageBackend,
+fn run_storage(
     source: &str,
     random_script: &[ScriptEdit],
     expected_random_result: &str,
     configuration: Configuration,
 ) -> Result<(), Box<dyn Error>> {
     let construct_start = Instant::now();
-    let mut buffer = TextBuffer::with_backend(source, backend);
+    let mut buffer = TextBuffer::new(source);
     let construct_time = construct_start.elapsed();
     let initial_stats = buffer.storage_stats();
     let middle = nearest_char_boundary(source, source.len() / 2);
@@ -115,15 +111,13 @@ fn run_backend(
 
     let incremental_measurements = [
         benchmark_incremental(
-            backend,
             source,
             "near-start",
             nearest_char_boundary(source, source.len() / 100),
             configuration.iterations,
         )?,
-        benchmark_incremental(backend, source, "middle", middle, configuration.iterations)?,
+        benchmark_incremental(source, "middle", middle, configuration.iterations)?,
         benchmark_incremental(
-            backend,
             source,
             "near-end",
             nearest_char_boundary(source, source.len() * 99 / 100),
@@ -131,7 +125,6 @@ fn run_backend(
         )?,
     ];
     let session = benchmark_incremental_session(
-        backend,
         source,
         random_script,
         expected_random_result,
@@ -147,7 +140,7 @@ fn run_backend(
         edit_samples.push(start.elapsed());
     }
 
-    let mut random_buffer = TextBuffer::with_backend(source, backend);
+    let mut random_buffer = TextBuffer::new(source);
     let mut retained_snapshots = Vec::with_capacity(configuration.retained_snapshots);
     retained_snapshots.push(random_buffer.snapshot());
     let retention_stride = configuration
@@ -170,7 +163,7 @@ fn run_backend(
     let random_time = random_start.elapsed();
     let random_snapshot = random_buffer.snapshot();
     if random_snapshot.as_str() != expected_random_result {
-        return Err(io::Error::other(format!("{backend} random edit result mismatch")).into());
+        return Err(io::Error::other("random edit result mismatch").into());
     }
     let mut fragmented_chunk_samples = Vec::with_capacity(configuration.iterations);
     for _ in 0..configuration.iterations {
@@ -189,7 +182,6 @@ fn run_backend(
     let random_stats = random_buffer.storage_stats();
     let retention = retained_snapshot_stats(&retained_snapshots);
     println!();
-    println!("backend: {backend}");
     println!("  construct: {construct_time:?}");
     println!("  snapshot median: {:?}", median(&mut snapshot_samples));
     println!(
@@ -262,14 +254,10 @@ fn run_backend(
     );
     println!("  after random edits: chunks={}", random_stats.chunks());
     println!(
-        "  retained allocation estimate: {} (snapshots={} snapshot-bytes={} nodes={} node-bytes={} auxiliary={} auxiliary-bytes={} text-buffers={} text-bytes={} materialized-buffers={} materialized-bytes={})",
+        "  retained allocation estimate: {} (snapshots={} snapshot-bytes={} text-buffers={} text-bytes={} materialized-buffers={} materialized-bytes={})",
         human_bytes(retention.estimated_bytes()),
         retention.snapshots(),
         retention.snapshot_bytes(),
-        retention.nodes(),
-        retention.node_bytes(),
-        retention.auxiliary_allocations(),
-        retention.auxiliary_bytes(),
         retention.text_buffers(),
         retention.text_bytes(),
         retention.materialized_buffers(),
@@ -291,13 +279,12 @@ struct IncrementalMeasurement {
 }
 
 fn benchmark_incremental(
-    backend: StorageBackend,
     source: &str,
     label: &'static str,
     offset: usize,
     iterations: usize,
 ) -> Result<IncrementalMeasurement, Box<dyn Error>> {
-    let mut buffer = TextBuffer::with_backend(source, backend);
+    let mut buffer = TextBuffer::new(source);
     let previous = parse(&buffer.snapshot());
     let range = TextRange::empty(
         ByteOffset::try_from(offset).map_err(|_| io::Error::other("fixture is too large"))?,
@@ -351,13 +338,12 @@ struct IncrementalSessionMeasurement {
 }
 
 fn benchmark_incremental_session(
-    backend: StorageBackend,
     source: &str,
     script: &[ScriptEdit],
     expected_result: &str,
     retained_documents: usize,
 ) -> Result<IncrementalSessionMeasurement, Box<dyn Error>> {
-    let mut buffer = TextBuffer::with_backend(source, backend);
+    let mut buffer = TextBuffer::new(source);
     let mut document = parse(&buffer.snapshot());
     let policy = BlockCompactionPolicy::default();
     let mut history = Vec::with_capacity(retained_documents);
@@ -407,14 +393,10 @@ fn benchmark_incremental_session(
     }
 
     if buffer.snapshot().as_str() != expected_result {
-        return Err(
-            io::Error::other(format!("{backend} incremental session text mismatch")).into(),
-        );
+        return Err(io::Error::other("incremental session text mismatch").into());
     }
     if document != parse(&buffer.snapshot()) {
-        return Err(
-            io::Error::other(format!("{backend} incremental session parse mismatch")).into(),
-        );
+        return Err(io::Error::other("incremental session parse mismatch").into());
     }
     if retained_documents == 1 {
         history.clear();

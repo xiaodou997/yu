@@ -32,10 +32,6 @@ impl Edit {
     pub fn inserted_text(&self) -> &str {
         &self.insert
     }
-
-    pub(crate) fn inserted_arc(&self) -> Arc<str> {
-        Arc::clone(&self.insert)
-    }
 }
 
 /// An atomic set of non-overlapping edits in one base revision.
@@ -390,38 +386,34 @@ mod tests {
 
     #[test]
     fn multi_edit_transaction_is_atomic_and_invertible() {
-        for backend in crate::StorageBackend::ALL {
-            let mut buffer = TextBuffer::with_backend("hello world", backend);
-            let transaction = Transaction::new(
-                buffer.revision(),
-                [Edit::new(range(0, 5), "hi"), Edit::new(range(11, 11), "!")],
-            );
+        let mut buffer = TextBuffer::new("hello world");
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(range(0, 5), "hi"), Edit::new(range(11, 11), "!")],
+        );
 
-            let applied = buffer
-                .apply(&transaction)
-                .expect("valid transaction should apply");
-            assert_eq!(buffer.snapshot().as_str(), "hi world!", "{backend}");
+        let applied = buffer
+            .apply(&transaction)
+            .expect("valid transaction should apply");
+        assert_eq!(buffer.snapshot().as_str(), "hi world!");
 
-            buffer
-                .apply(applied.inverse())
-                .expect("inverse transaction should apply");
-            assert_eq!(buffer.snapshot().as_str(), "hello world", "{backend}");
-        }
+        buffer
+            .apply(applied.inverse())
+            .expect("inverse transaction should apply");
+        assert_eq!(buffer.snapshot().as_str(), "hello world");
     }
 
     #[test]
     fn failed_transaction_does_not_mutate_buffer() {
-        for backend in crate::StorageBackend::ALL {
-            let mut buffer = TextBuffer::with_backend("羽", backend);
-            let transaction = Transaction::new(buffer.revision(), [Edit::new(range(1, 2), "x")]);
+        let mut buffer = TextBuffer::new("羽");
+        let transaction = Transaction::new(buffer.revision(), [Edit::new(range(1, 2), "x")]);
 
-            assert!(matches!(
-                buffer.apply(&transaction),
-                Err(EditError::NotUtf8Boundary(_))
-            ));
-            assert_eq!(buffer.snapshot().as_str(), "羽", "{backend}");
-            assert_eq!(buffer.revision(), Revision::INITIAL);
-        }
+        assert!(matches!(
+            buffer.apply(&transaction),
+            Err(EditError::NotUtf8Boundary(_))
+        ));
+        assert_eq!(buffer.snapshot().as_str(), "羽");
+        assert_eq!(buffer.revision(), Revision::INITIAL);
     }
 
     #[test]

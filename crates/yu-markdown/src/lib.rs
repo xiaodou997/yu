@@ -1478,7 +1478,7 @@ impl<'a> Iterator for RangeSlices<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_text::{Edit, StorageBackend, TextBuffer, Transaction, retained_snapshot_stats};
+    use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
     #[test]
     fn scanner_covers_source_without_gaps() {
@@ -1880,7 +1880,7 @@ mod tests {
             "https://example.com",
             ">\n\n[project]\n",
         ];
-        let mut buffer = TextBuffer::with_backend("", StorageBackend::PieceTree);
+        let mut buffer = TextBuffer::new("");
         for part in parts {
             let at = buffer.snapshot().len_bytes();
             let transaction =

@@ -1188,7 +1188,7 @@ impl Iterator for InlineByteCursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yu_text::{StorageBackend, TextBuffer, retained_snapshot_stats};
+    use yu_text::{TextBuffer, retained_snapshot_stats};
 
     #[test]
     fn inline_tokens_cover_source_and_preserve_delimiter_runs() {
@@ -1219,8 +1219,8 @@ mod tests {
     }
 
     #[test]
-    fn inline_tokens_scan_piece_tree_chunks_without_materializing() {
-        let mut buffer = TextBuffer::with_backend("", StorageBackend::PieceTree);
+    fn inline_tokens_scan_chunks_without_materializing() {
+        let mut buffer = TextBuffer::new("");
         for part in ["**", "羽🙂", "**", " and `", "code", "`"] {
             let at = buffer.snapshot().len_bytes();
             let transaction = yu_text::Transaction::new(

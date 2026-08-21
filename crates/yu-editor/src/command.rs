@@ -432,46 +432,41 @@ mod tests {
 
     #[test]
     fn chunk_boundaries_keep_combining_marks_and_zwj_emoji_together() {
-        for backend in yu_text::StorageBackend::ALL {
-            let mut buffer = TextBuffer::with_backend("e\u{301} 👩‍🔬x", backend);
-            buffer
-                .apply(&Transaction::new(
-                    buffer.revision(),
-                    [
-                        Edit::new(
-                            yu_core::TextRange::new(ByteOffset::new(0), ByteOffset::new(1))
-                                .expect("range"),
-                            "e",
-                        ),
-                        Edit::new(
-                            yu_core::TextRange::new(ByteOffset::new(4), ByteOffset::new(8))
-                                .expect("range"),
-                            "👩",
-                        ),
-                    ],
-                ))
-                .expect("edit should split the source into chunks");
-            let snapshot = buffer.snapshot();
-            let combining_end = ByteOffset::new("e\u{301}".len() as u64);
-            let emoji_start = ByteOffset::new("e\u{301} ".len() as u64);
-            let emoji_end = ByteOffset::new("e\u{301} 👩‍🔬".len() as u64);
+        let mut buffer = TextBuffer::new("e\u{301} 👩‍🔬x");
+        buffer
+            .apply(&Transaction::new(
+                buffer.revision(),
+                [
+                    Edit::new(
+                        yu_core::TextRange::new(ByteOffset::new(0), ByteOffset::new(1))
+                            .expect("range"),
+                        "e",
+                    ),
+                    Edit::new(
+                        yu_core::TextRange::new(ByteOffset::new(4), ByteOffset::new(8))
+                            .expect("range"),
+                        "👩",
+                    ),
+                ],
+            ))
+            .expect("edit should split the source into chunks");
+        let snapshot = buffer.snapshot();
+        let combining_end = ByteOffset::new("e\u{301}".len() as u64);
+        let emoji_start = ByteOffset::new("e\u{301} ".len() as u64);
+        let emoji_end = ByteOffset::new("e\u{301} 👩‍🔬".len() as u64);
 
-            assert_eq!(
-                next_grapheme_boundary(&snapshot, ByteOffset::ZERO).expect("boundary"),
-                combining_end,
-                "backend {backend}"
-            );
-            assert_eq!(
-                next_grapheme_boundary(&snapshot, emoji_start).expect("boundary"),
-                emoji_end,
-                "backend {backend}"
-            );
-            assert_eq!(
-                previous_grapheme_boundary(&snapshot, emoji_end).expect("boundary"),
-                emoji_start,
-                "backend {backend}"
-            );
-        }
+        assert_eq!(
+            next_grapheme_boundary(&snapshot, ByteOffset::ZERO).expect("boundary"),
+            combining_end
+        );
+        assert_eq!(
+            next_grapheme_boundary(&snapshot, emoji_start).expect("boundary"),
+            emoji_end
+        );
+        assert_eq!(
+            previous_grapheme_boundary(&snapshot, emoji_end).expect("boundary"),
+            emoji_start
+        );
     }
 
     #[test]
@@ -499,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_queries_do_not_materialize_a_piece_tree_snapshot() {
+    fn chunk_queries_do_not_materialize_a_snapshot() {
         let mut buffer = TextBuffer::new("prefix ".repeat(128) + "e\u{301} 👩‍🔬x");
         buffer
             .apply(&Transaction::new(
