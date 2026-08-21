@@ -60,7 +60,7 @@ impl TextSnapshot {
         self.inner.revision
     }
 
-    /// Returns a contiguous view, materializing Piece Tree/Rope chunks once.
+    /// Returns a contiguous view, materializing chunked backends once.
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.inner
@@ -188,7 +188,7 @@ pub struct TextBuffer {
 }
 
 impl TextBuffer {
-    /// Creates a buffer using Yu's selected Piece Tree backend.
+    /// Creates a buffer using Yu's selected ropey backend.
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
         Self::with_backend(text, StorageBackend::default())

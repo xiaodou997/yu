@@ -2,8 +2,9 @@
 
 //! Immutable text snapshots and transactional editing contracts.
 //!
-//! Piece Tree is the selected product backend. Flat UTF-8 and Persistent Rope
-//! remain available as explicit correctness and performance comparison stores.
+//! ropey is the selected product backend. Flat UTF-8, Piece Tree and the
+//! self-written Persistent Rope remain available as explicit correctness and
+//! performance comparison stores.
 
 mod buffer;
 mod position;
