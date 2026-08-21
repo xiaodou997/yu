@@ -669,11 +669,10 @@ mod tests {
         let viewport = Rect::new(0.0, 0.0, 80.0, 40.0).expect("viewport");
         let mut builder = SceneBuilder::new(revision, viewport).expect("builder");
         builder
-            .glyph(GlyphPrimitive::new(
-                entry,
-                Point::new(4.0, 20.0),
-                Rgba8::white(),
-            ))
+            .glyph(
+                GlyphPrimitive::new(entry, Point::new(4.0, 20.0), Rgba8::white())
+                    .expect("glyph bounds"),
+            )
             .expect("glyph primitive");
         builder.finish()
     }
@@ -686,18 +685,16 @@ mod tests {
         let viewport = Rect::new(0.0, 0.0, 80.0, 40.0).expect("viewport");
         let mut builder = SceneBuilder::new(Revision::new(4), viewport).expect("builder");
         builder
-            .glyph(GlyphPrimitive::new(
-                first,
-                Point::new(4.0, 20.0),
-                Rgba8::white(),
-            ))
+            .glyph(
+                GlyphPrimitive::new(first, Point::new(4.0, 20.0), Rgba8::white())
+                    .expect("glyph bounds"),
+            )
             .expect("first glyph");
         builder
-            .glyph(GlyphPrimitive::new(
-                second,
-                Point::new(12.0, 20.0),
-                Rgba8::white(),
-            ))
+            .glyph(
+                GlyphPrimitive::new(second, Point::new(12.0, 20.0), Rgba8::white())
+                    .expect("glyph bounds"),
+            )
             .expect("second glyph");
         let scene = builder.finish();
         let mut plans = RenderPlanBuilder::new();

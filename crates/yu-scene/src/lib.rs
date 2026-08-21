@@ -10,157 +10,24 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_core::{Revision, TextRange};
+use yu_core::{GeometryError, Revision, TextRange};
 use yu_font::{AtlasEntry, GlyphRasterKey};
-use yu_layout::LayoutSnapshot;
+use yu_layout::{LayoutRect, LayoutSnapshot};
 
 mod viewport;
 
 pub use viewport::{ViewportBlockGeometry, ViewportSceneInput};
 
-/// A finite point in scene coordinates. The coordinate system is chosen by
-/// the platform shell; Yu's current layout convention is x-right/y-down.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Point {
-    x: f32,
-    y: f32,
-}
+/// 文档坐标系里的点与矩形。
+///
+/// 实现在 `yu-core`，空间是 [`yu_core::Document`]：原点是文档内容左上角，
+/// 单位是逻辑像素，**不含**滚动位移。用别名而不是自己再写一份：算术只写一
+/// 遍，而空间由类型参数带着走——把 block 局部矩形直接当成场景矩形是编译错
+/// 误，唯一的通道是 [`yu_core::Rect::translate_into`]。
+pub type Point = yu_core::Point<yu_core::Document>;
 
-impl Point {
-    #[must_use]
-    pub const fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
-    }
-
-    #[must_use]
-    pub const fn x(self) -> f32 {
-        self.x
-    }
-
-    #[must_use]
-    pub const fn y(self) -> f32 {
-        self.y
-    }
-
-    fn validate(self) -> Result<(), SceneError> {
-        if self.x.is_finite() && self.y.is_finite() {
-            Ok(())
-        } else {
-            Err(SceneError::InvalidGeometry("point must be finite"))
-        }
-    }
-}
-
-/// A finite, non-negative rectangle in scene coordinates.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-impl Rect {
-    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Result<Self, SceneError> {
-        let rect = Self {
-            x,
-            y,
-            width,
-            height,
-        };
-        rect.validate()?;
-        Ok(rect)
-    }
-
-    #[must_use]
-    pub const fn x(self) -> f32 {
-        self.x
-    }
-
-    #[must_use]
-    pub const fn y(self) -> f32 {
-        self.y
-    }
-
-    #[must_use]
-    pub const fn width(self) -> f32 {
-        self.width
-    }
-
-    #[must_use]
-    pub const fn height(self) -> f32 {
-        self.height
-    }
-
-    #[must_use]
-    pub fn right(self) -> f32 {
-        self.x + self.width
-    }
-
-    #[must_use]
-    pub fn bottom(self) -> f32 {
-        self.y + self.height
-    }
-
-    #[must_use]
-    pub fn is_empty(self) -> bool {
-        self.width == 0.0 || self.height == 0.0
-    }
-
-    #[must_use]
-    pub fn union(self, other: Self) -> Self {
-        let left = self.x.min(other.x);
-        let top = self.y.min(other.y);
-        let right = self.right().max(other.right());
-        let bottom = self.bottom().max(other.bottom());
-        Self {
-            x: left,
-            y: top,
-            width: right - left,
-            height: bottom - top,
-        }
-    }
-
-    #[must_use]
-    pub fn intersects_or_touches(self, other: Self) -> bool {
-        self.x <= other.right()
-            && other.x <= self.right()
-            && self.y <= other.bottom()
-            && other.y <= self.bottom()
-    }
-
-    /// Returns whether a finite point lies inside this rectangle, including
-    /// its outer edges. Non-finite pointer input is never a hit.
-    #[must_use]
-    pub fn contains(self, point: Point) -> bool {
-        point.x().is_finite()
-            && point.y().is_finite()
-            && point.x() >= self.x
-            && point.x() <= self.right()
-            && point.y() >= self.y
-            && point.y() <= self.bottom()
-    }
-
-    fn validate(self) -> Result<(), SceneError> {
-        if !self.x.is_finite()
-            || !self.y.is_finite()
-            || !self.width.is_finite()
-            || !self.height.is_finite()
-            || self.width < 0.0
-            || self.height < 0.0
-        {
-            return Err(SceneError::InvalidGeometry(
-                "rectangle must be finite and non-negative",
-            ));
-        }
-        if !self.right().is_finite() || !self.bottom().is_finite() {
-            return Err(SceneError::InvalidGeometry(
-                "rectangle bounds must be finite",
-            ));
-        }
-        Ok(())
-    }
-}
+/// 文档坐标系里的矩形。见 [`Point`]。
+pub type Rect = yu_core::Rect<yu_core::Document>;
 
 /// Packed non-premultiplied sRGB color used by scene primitives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -220,16 +87,27 @@ pub struct GlyphPrimitive {
     atlas: AtlasEntry,
     origin: Point,
     color: Rgba8,
+    bounds: Rect,
 }
 
 impl GlyphPrimitive {
-    #[must_use]
-    pub const fn new(atlas: AtlasEntry, origin: Point, color: Rgba8) -> Self {
-        Self {
+    pub fn new(atlas: AtlasEntry, origin: Point, color: Rgba8) -> Result<Self, SceneError> {
+        let rect = atlas.rect();
+        // bounds 在构造时算好并校验，`bounds()` 因此永远合法。原来的做法是
+        // 用结构体字面量绕过校验、再让每个使用点自己 `validate()`——漏掉一
+        // 个使用点就是一个画错但不报错的字形。
+        let bounds = Rect::new(
+            origin.x() + atlas.metrics().bearing_x(),
+            origin.y() - atlas.metrics().bearing_y(),
+            rect.width() as f32,
+            rect.height() as f32,
+        )?;
+        Ok(Self {
             atlas,
             origin,
             color,
-        }
+            bounds,
+        })
     }
 
     #[must_use]
@@ -254,14 +132,8 @@ impl GlyphPrimitive {
 
     /// Returns the visual bounds in baseline-oriented scene coordinates.
     #[must_use]
-    pub fn bounds(self) -> Rect {
-        let rect = self.atlas.rect();
-        Rect {
-            x: self.origin.x() + self.atlas.metrics().bearing_x(),
-            y: self.origin.y() - self.atlas.metrics().bearing_y(),
-            width: rect.width() as f32,
-            height: rect.height() as f32,
-        }
+    pub const fn bounds(self) -> Rect {
+        self.bounds
     }
 }
 
@@ -717,7 +589,6 @@ impl DamageSet {
     }
 
     pub fn add(&mut self, rect: Rect) -> Result<(), SceneError> {
-        rect.validate()?;
         if rect.is_empty() {
             return Ok(());
         }
@@ -756,6 +627,7 @@ impl Default for DamageSet {
 /// Errors raised while constructing a retained scene.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SceneError {
+    Geometry(GeometryError),
     InvalidGeometry(&'static str),
     InvalidViewportInput(&'static str),
     InvalidDamageBudget,
@@ -781,6 +653,7 @@ pub enum SceneError {
 impl fmt::Display for SceneError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Geometry(error) => error.fmt(formatter),
             Self::InvalidGeometry(message) => formatter.write_str(message),
             Self::InvalidViewportInput(message) => formatter.write_str(message),
             Self::InvalidDamageBudget => formatter.write_str("damage budget must be positive"),
@@ -818,6 +691,12 @@ impl fmt::Display for SceneError {
                 key.glyph().get()
             ),
         }
+    }
+}
+
+impl From<GeometryError> for SceneError {
+    fn from(error: GeometryError) -> Self {
+        Self::Geometry(error)
     }
 }
 
@@ -859,22 +738,13 @@ impl Scene {
     }
 }
 
-fn translate_rect(rect: Rect, origin: Point) -> Result<Rect, SceneError> {
-    Rect::new(
-        rect.x() + origin.x(),
-        rect.y() + origin.y(),
-        rect.width(),
-        rect.height(),
-    )
-}
-
-fn translate_layout_rect(rect: yu_layout::LayoutRect, origin: Point) -> Result<Rect, SceneError> {
-    Rect::new(
-        rect.x() + origin.x(),
-        rect.y() + origin.y(),
-        rect.width(),
-        rect.height(),
-    )
+/// 把 block 局部矩形搬到文档坐标。`origin` 是该 block 左上角在文档中的位置。
+///
+/// 原来这里有两个函数：一个收 `LayoutRect`，一个收 `Rect`——后者的入参其实
+/// 也是 block 局部坐标，只是被当成文档坐标构造出来的，两个空间在类型上分不
+/// 开。现在 `LayoutRect` 就是 `Rect<Block>`，两者合而为一。
+fn translate_block_rect(rect: yu_layout::LayoutRect, origin: Point) -> Result<Rect, SceneError> {
+    Ok(rect.translate_into(origin)?)
 }
 
 fn ranges_intersect_or_caret(selection: yu_core::TextRange, cell: yu_core::TextRange) -> bool {
@@ -899,7 +769,6 @@ pub struct SceneBuilder {
 
 impl SceneBuilder {
     pub fn new(revision: Revision, viewport: Rect) -> Result<Self, SceneError> {
-        viewport.validate()?;
         Ok(Self {
             revision,
             viewport,
@@ -924,9 +793,6 @@ impl SceneBuilder {
         if self.primitives.len() >= self.max_primitives {
             return Err(SceneError::PrimitiveLimitExceeded);
         }
-        if let Primitive::Glyph(glyph) = primitive {
-            glyph.origin.validate()?;
-        }
         if let Primitive::EmbeddedSvg(svg) = primitive
             && (svg.width() == 0 || svg.height() == 0)
         {
@@ -935,7 +801,6 @@ impl SceneBuilder {
                 height: svg.height(),
             });
         }
-        primitive.bounds().validate()?;
         let index =
             u32::try_from(self.primitives.len()).map_err(|_| SceneError::PrimitiveLimitExceeded)?;
         self.primitives.push(primitive);
@@ -1014,7 +879,11 @@ impl SceneBuilder {
                 layout: layout.revision(),
             });
         }
-        origin.validate()?;
+        if !origin.is_finite() {
+            return Err(SceneError::InvalidGeometry(
+                "block origin must contain finite coordinates",
+            ));
+        }
         if !style.border_width().is_finite() || style.border_width() < 0.0 {
             return Err(SceneError::InvalidTableStyle(
                 style.border_width().to_bits(),
@@ -1032,7 +901,7 @@ impl SceneBuilder {
             {
                 primitives.push(Primitive::Table(TablePrimitive::new(
                     cell.source(),
-                    translate_layout_rect(cell.bounds(), origin)?,
+                    translate_block_rect(cell.bounds(), origin)?,
                     color,
                     TablePrimitiveRole::HeaderFill,
                 )));
@@ -1043,7 +912,7 @@ impl SceneBuilder {
                 if selection.is_some_and(|range| ranges_intersect_or_caret(range, cell.source())) {
                     primitives.push(Primitive::Table(TablePrimitive::new(
                         cell.source(),
-                        translate_layout_rect(cell.bounds(), origin)?,
+                        translate_block_rect(cell.bounds(), origin)?,
                         color,
                         TablePrimitiveRole::SelectionFill,
                     )));
@@ -1063,7 +932,10 @@ impl SceneBuilder {
             for column_width in layout.column_widths() {
                 primitives.push(Primitive::Table(TablePrimitive::new(
                     table_source,
-                    translate_rect(Rect::new(x, 0.0, thickness_x, total_height)?, origin)?,
+                    translate_block_rect(
+                        LayoutRect::new(x, 0.0, thickness_x, total_height)?,
+                        origin,
+                    )?,
                     border_color,
                     TablePrimitiveRole::Border,
                 )));
@@ -1071,8 +943,8 @@ impl SceneBuilder {
             }
             primitives.push(Primitive::Table(TablePrimitive::new(
                 table_source,
-                translate_rect(
-                    Rect::new(
+                translate_block_rect(
+                    LayoutRect::new(
                         (total_width - thickness_x).max(0.0),
                         0.0,
                         thickness_x,
@@ -1094,7 +966,10 @@ impl SceneBuilder {
             for _ in 0..row_count {
                 primitives.push(Primitive::Table(TablePrimitive::new(
                     table_source,
-                    translate_rect(Rect::new(0.0, y, total_width, thickness_y)?, origin)?,
+                    translate_block_rect(
+                        LayoutRect::new(0.0, y, total_width, thickness_y)?,
+                        origin,
+                    )?,
                     border_color,
                     TablePrimitiveRole::Border,
                 )));
@@ -1102,8 +977,8 @@ impl SceneBuilder {
             }
             primitives.push(Primitive::Table(TablePrimitive::new(
                 table_source,
-                translate_rect(
-                    Rect::new(
+                translate_block_rect(
+                    LayoutRect::new(
                         0.0,
                         (total_height - thickness_y).max(0.0),
                         total_width,
@@ -1330,7 +1205,7 @@ impl SceneBuilder {
                 for bounds in quote.bars().iter().copied() {
                     primitives.push(Primitive::BlockQuote(BlockQuotePrimitive::new(
                         quote.source(),
-                        translate_layout_rect(bounds, Point::new(0.0, geometry.y()))?,
+                        translate_block_rect(bounds, Point::new(0.0, geometry.y()))?,
                         quote_color,
                     )));
                 }
@@ -1367,7 +1242,11 @@ impl SceneBuilder {
                 layout: layout.revision(),
             });
         }
-        origin.validate()?;
+        if !origin.is_finite() {
+            return Err(SceneError::InvalidGeometry(
+                "block origin must contain finite coordinates",
+            ));
+        }
         if !font_size.is_finite() || font_size <= 0.0 {
             return Err(SceneError::InvalidFontSize(font_size.to_bits()));
         }
@@ -1382,9 +1261,7 @@ impl SceneBuilder {
                 entry,
                 Point::new(origin.x() + placement.x(), origin.y() + placement.y()),
                 color,
-            );
-            glyph.origin.validate()?;
-            glyph.bounds().validate()?;
+            )?;
             primitives.push(glyph);
         }
 
@@ -1410,12 +1287,7 @@ impl SceneBuilder {
 
         let mut damage = self.damage.clone();
         for primitive in &primitives {
-            if let Primitive::Glyph(glyph) = primitive {
-                glyph.origin.validate()?;
-            }
-            let bounds = primitive.bounds();
-            bounds.validate()?;
-            damage.add(bounds)?;
+            damage.add(primitive.bounds())?;
         }
         let count = primitives.len();
         self.primitives.extend(primitives);
@@ -1522,7 +1394,8 @@ mod tests {
             .expect("builder")
             .with_damage_budget(8)
             .expect("damage budget");
-        let glyph = GlyphPrimitive::new(atlas_entry(1), Point::new(10.0, 20.0), Rgba8::white());
+        let glyph = GlyphPrimitive::new(atlas_entry(1), Point::new(10.0, 20.0), Rgba8::white())
+            .expect("glyph bounds");
         builder
             .fill_rect(Rect::new(0.0, 0.0, 4.0, 4.0).expect("rect"), Rgba8::black())
             .expect("rect primitive");
@@ -1541,7 +1414,16 @@ mod tests {
     #[test]
     fn invalid_geometry_is_rejected_before_scene_publication() {
         assert!(Rect::new(0.0, 0.0, f32::NAN, 1.0).is_err());
-        assert!(Point::new(f32::INFINITY, 0.0).validate().is_err());
+        // 非有限的点自己是合法值（hit-test 可以问任何位置），但它做不出矩形。
+        assert!(!Point::new(f32::INFINITY, 0.0).is_finite());
+        assert!(
+            GlyphPrimitive::new(
+                atlas_entry(1),
+                Point::new(f32::INFINITY, 0.0),
+                Rgba8::white()
+            )
+            .is_err()
+        );
         assert_eq!(DamageSet::new(0), Err(SceneError::InvalidDamageBudget));
     }
 

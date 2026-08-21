@@ -3143,11 +3143,10 @@ mod tests {
             )
             .expect("fill");
         scene
-            .glyph(GlyphPrimitive::new(
-                entry,
-                Point::new(14.0, 32.0),
-                Rgba8::white(),
-            ))
+            .glyph(
+                GlyphPrimitive::new(entry, Point::new(14.0, 32.0), Rgba8::white())
+                    .expect("glyph bounds"),
+            )
             .expect("glyph");
         let plan = RenderPlanBuilder::new()
             .build(&scene.finish(), &atlas)
@@ -3237,11 +3236,10 @@ mod tests {
         let viewport = Rect::new(0.0, 0.0, 20.0, 20.0).expect("viewport");
         let mut scene = SceneBuilder::new(Revision::INITIAL, viewport).expect("scene");
         scene
-            .glyph(GlyphPrimitive::new(
-                entry,
-                Point::new(2.0, 4.0),
-                Rgba8::white(),
-            ))
+            .glyph(
+                GlyphPrimitive::new(entry, Point::new(2.0, 4.0), Rgba8::white())
+                    .expect("glyph bounds"),
+            )
             .expect("glyph");
         let plan = RenderPlanBuilder::new()
             .build(&scene.finish(), &atlas)
@@ -3424,11 +3422,10 @@ mod tests {
         let viewport = Rect::new(0.0, 0.0, 200.0, 100.0).expect("viewport");
         let mut scene = SceneBuilder::new(Revision::INITIAL, viewport).expect("scene");
         scene
-            .glyph(GlyphPrimitive::new(
-                entry,
-                Point::new(50.0, 60.0),
-                Rgba8::white(),
-            ))
+            .glyph(
+                GlyphPrimitive::new(entry, Point::new(50.0, 60.0), Rgba8::white())
+                    .expect("glyph bounds"),
+            )
             .expect("glyph");
         let scene = scene.finish();
 

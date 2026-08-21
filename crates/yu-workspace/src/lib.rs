@@ -747,6 +747,12 @@ impl From<EditorDocumentError> for ViewportSceneError {
     }
 }
 
+impl From<yu_core::GeometryError> for ViewportSceneError {
+    fn from(error: yu_core::GeometryError) -> Self {
+        Self::Scene(SceneError::from(error))
+    }
+}
+
 impl From<SceneError> for ViewportSceneError {
     fn from(error: SceneError) -> Self {
         Self::Scene(error)

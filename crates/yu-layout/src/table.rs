@@ -712,7 +712,9 @@ impl TableLayoutSnapshot {
     /// table bounds. The returned source range is the original Markdown cell
     /// content, not a copied visual string.
     pub fn hit_test(&self, point: LayoutPoint) -> Result<Option<TableLayoutHit>, LayoutError> {
-        point.validate()?;
+        if !point.is_finite() {
+            return Err(LayoutError::InvalidPoint);
+        }
         if point.x() < self.bounds.x()
             || point.y() < self.bounds.y()
             || point.x() > self.bounds.x() + self.bounds.width()
@@ -753,7 +755,9 @@ impl TableLayoutSnapshot {
         point: LayoutPoint,
         tolerance: f32,
     ) -> Result<Option<TableResizeHit>, LayoutError> {
-        point.validate()?;
+        if !point.is_finite() {
+            return Err(LayoutError::InvalidPoint);
+        }
         if !tolerance.is_finite() || tolerance < 0.0 {
             return Err(LayoutError::InvalidTable(
                 "resize tolerance must be finite and non-negative",
