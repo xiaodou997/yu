@@ -327,8 +327,9 @@ final class MacosSurfaceHostCoordinator {
         let revision = bridge.state.revision
         let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
         do {
-            let hit = try bridge.macosTableResizeHitTestAtDocumentPoint(
+            let hit = try bridge.macosTableResizeAtDocumentPoint(
                 revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_PROBE),
                 size: geometry.size,
                 maxWidth: geometry.maxWidth,
                 point: CGPoint(x: point.x, y: point.y),
@@ -481,8 +482,9 @@ final class MacosSurfaceHostCoordinator {
         let revision = bridge.state.revision
         let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
         do {
-            let hit = try bridge.macosTableResizeHitTestAtDocumentPoint(
+            let hit = try bridge.macosTableResizeAtDocumentPoint(
                 revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_PROBE),
                 size: geometry.size,
                 maxWidth: geometry.maxWidth,
                 point: CGPoint(x: point.x, y: point.y),
@@ -495,8 +497,9 @@ final class MacosSurfaceHostCoordinator {
                 return false
             }
             let pointerPosition = Float(point.x)
-            let begun = try bridge.macosTableResizeBeginAtDocumentPoint(
+            let begun = try bridge.macosTableResizeAtDocumentPoint(
                 revision: revision,
+                action: UInt8(YU_STORAGE_TABLE_RESIZE_BEGIN),
                 size: geometry.size,
                 maxWidth: geometry.maxWidth,
                 point: CGPoint(x: point.x, y: point.y),

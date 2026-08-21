@@ -553,8 +553,9 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         precondition(accessibilityDivider.rect.height > 0.0)
         let tableY = accessibilityDivider.rect.midY
         let dividerPoint = NSPoint(x: accessibilityDivider.rect.midX, y: tableY)
-        let nearest = try bridge.macosTableResizeHitTestAtDocumentPoint(
+        let nearest = try bridge.macosTableResizeAtDocumentPoint(
             revision: revision,
+            action: UInt8(YU_STORAGE_TABLE_RESIZE_PROBE),
             size: size,
             maxWidth: maxWidth,
             point: dividerPoint,

@@ -752,22 +752,28 @@ final class StorageBridge {
         return NativeProjectionHit(value)
     }
 
-    func macosTableResizeHitTestAtDocumentPoint(
+    /// 用一个文档坐标点探测或开始一次分隔线拖动。
+    /// `pointerPosition` 只对 `.begin` 有意义。
+    func macosTableResizeAtDocumentPoint(
         revision: UInt64,
+        action: UInt8,
         size: Float,
         maxWidth: Float,
         point: CGPoint,
-        tolerance: Float
+        tolerance: Float,
+        pointerPosition: Float = 0.0
     ) throws -> YuStorageTableResizeHit {
         var value = YuStorageTableResizeHit()
-        let status = yu_storage_session_macos_table_resize_hit_test(
+        let status = yu_storage_session_macos_table_resize_at_point(
             handle,
             revision,
+            action,
             size,
             maxWidth,
             Float(point.x),
             Float(point.y),
             tolerance,
+            pointerPosition,
             &value
         )
         guard status == StorageStatus.ok else {
@@ -792,32 +798,6 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeTaskCheckboxHit(value)
-    }
-
-    func macosTableResizeBeginAtDocumentPoint(
-        revision: UInt64,
-        size: Float,
-        maxWidth: Float,
-        point: CGPoint,
-        tolerance: Float,
-        pointerPosition: Float
-    ) throws -> YuStorageTableResizeHit {
-        var value = YuStorageTableResizeHit()
-        let status = yu_storage_session_macos_table_resize_begin_at_point(
-            handle,
-            revision,
-            size,
-            maxWidth,
-            Float(point.x),
-            Float(point.y),
-            tolerance,
-            pointerPosition,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return value
     }
 
     /// 推进一次分隔线拖动。`pointerPosition` 只对 `.update` 有意义。
