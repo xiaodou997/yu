@@ -40,6 +40,9 @@ python3 tools/check-ffi-header.py
 step "ropey 未逃逸出 yu-text"
 python3 tools/check-rope-leak.py
 
+step "视觉坐标只有一套实现"
+python3 tools/check-geometry.py
+
 if [[ "${1:-}" == "--rust-only" ]]; then
     printf "\n\033[1;32m✓ Rust 检查全部通过\033[0m\n"
     exit 0

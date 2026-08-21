@@ -25,7 +25,7 @@ use yu_assets::{
     DecodedImage, ImageDecodeError, ImageLocation, ImageLocationError, ImagePublication,
     ImageRequest,
 };
-use yu_core::Revision;
+use yu_core::{Device, Document, Point, Rect, Revision, Scale};
 use yu_render::{AtlasPageUpload, EmbeddedSvgUpload, RenderCommand, RenderPlan, RenderUploader};
 use yu_scene::Rgba8;
 use yu_workspace::{
@@ -2649,12 +2649,12 @@ fn build_native_commands(
     embedded_image_sizes: &BTreeMap<(u64, u32), (u32, u32)>,
 ) -> Result<Vec<NativeDrawCommand>, MetalRenderError> {
     let viewport = plan.viewport();
-    let raster_scale = plan.raster_scale();
-    if !raster_scale.is_finite() || raster_scale <= 0.0 {
-        return Err(MetalRenderError::InvalidRenderCommand(
+    // 栅格化缩放：逻辑坐标 → 物理像素。方向进类型，反方向只能走 `unscale`。
+    let raster = Scale::<Document, Device>::new(plan.raster_scale()).map_err(|_| {
+        MetalRenderError::InvalidRenderCommand(
             "render plan raster scale must be finite and positive",
-        ));
-    }
+        )
+    })?;
     let mut commands = Vec::with_capacity(plan.commands().len());
     for command in plan.commands() {
         match *command {
@@ -2731,15 +2731,30 @@ fn build_native_commands(
                 // 栅格化出来的物理像素；除回逻辑坐标后，quad 才与 shader 使用
                 // 的 document-space 单位一致，纹理也才能与 Retina 的物理像素
                 // 1:1 对应而不被拉伸。
-                let x = origin.x() + metrics.bearing_x() / raster_scale - viewport.x();
-                let y = origin.y() - metrics.bearing_y() / raster_scale - viewport.y();
-                let width = rect.width() as f32 / raster_scale;
-                let height = rect.height() as f32 / raster_scale;
-                if !x.is_finite() || !y.is_finite() {
-                    return Err(MetalRenderError::InvalidRenderCommand(
-                        "glyph origin is not finite",
-                    ));
-                }
+                //
+                // 换算方向写在类型里而不只是写在这段注释里：`raster` 是
+                // Document → Device，这里要的是反方向，所以是 `unscale`。
+                // 乘错方向（e751f71 与 5fac1fe 那一类）现在编译不过。
+                let device_quad = Rect::<Device>::new(
+                    metrics.bearing_x(),
+                    -metrics.bearing_y(),
+                    rect.width() as f32,
+                    rect.height() as f32,
+                )
+                .map_err(|_| {
+                    MetalRenderError::InvalidRenderCommand("glyph atlas quad is not finite")
+                })?;
+                let quad = Rect::<Document>::unscale(device_quad, raster)
+                    .and_then(|logical| {
+                        logical.translate_into(Point::<Document>::new(
+                            origin.x() - viewport.x(),
+                            origin.y() - viewport.y(),
+                        ))
+                    })
+                    .map_err(|_| {
+                        MetalRenderError::InvalidRenderCommand("glyph origin is not finite")
+                    })?;
+                let (x, y, width, height) = (quad.x(), quad.y(), quad.width(), quad.height());
                 commands.push(NativeDrawCommand {
                     kind: DRAW_GLYPH,
                     x,
@@ -3674,7 +3689,7 @@ mod tests {
     fn macos_device_surface_and_atlas_upload_are_live() {
         use yu_assets::{DecodedImage, ImageCache, ImageRequest};
         use yu_core::{ByteOffset, TextRange};
-        use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportRect};
+        use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportSpan};
         use yu_font::{FontRequest, GlyphAtlasConfig};
         use yu_render::RenderPlanBuilder;
         use yu_scene::{ImagePrimitive, Rect, Rgba8, SceneBuilder};
@@ -3707,7 +3722,7 @@ mod tests {
         let mut builder = CoreTextViewportFrameBuilder::with_shaper(
             shaper,
             ViewportRenderConfig::new(
-                ViewportRect::new(0.0, 160.0),
+                ViewportSpan::new(0.0, 160.0),
                 font_size,
                 Rect::new(0.0, 0.0, 320.0, 180.0).expect("scene viewport"),
                 Rgba8::white(),
@@ -3814,7 +3829,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn appkit_probe_publication() -> ViewportFramePublication {
-        use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportRect};
+        use yu_editor::{EditorDocument, LayoutConfig, ViewportConfig, ViewportSpan};
         use yu_font::{FontRequest, GlyphAtlasConfig};
         use yu_scene::{Rect, Rgba8};
         use yu_workspace::ViewportRenderConfig;
@@ -3827,7 +3842,7 @@ mod tests {
         let metrics = shaper
             .viewport_metrics("A羽🙂")
             .expect("CoreText probe metrics");
-        let viewport = ViewportRect::new(0.0, 160.0);
+        let viewport = ViewportSpan::new(0.0, 160.0);
         let mut document = EditorDocument::new("# Yu Metal\n\nhello **viewport**");
         document
             .set_viewport_config(ViewportConfig::new(

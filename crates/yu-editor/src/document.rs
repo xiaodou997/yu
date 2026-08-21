@@ -15,7 +15,7 @@ use crate::{
     EditorCommand, EditorSelection, ImageSource, KeyEvent, KeyRouteResult, LayoutBackend,
     LayoutCache, LayoutCacheStats, LayoutPoint, Projection, ProjectionCache, ProjectionCacheStats,
     ProjectionError, SelectionError, SourceChange, ViewportCaret, ViewportConfig, ViewportError,
-    ViewportLayout, ViewportRect, ViewportSnapshot, ViewportStats,
+    ViewportLayout, ViewportSnapshot, ViewportSpan, ViewportStats,
     command::{
         next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
         previous_word_boundary,
@@ -596,7 +596,7 @@ impl EditorDocument {
     /// metadata for a future scene or renderer.
     pub fn visible_blocks(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
         let mut layout = std::mem::take(&mut self.viewport);
         let result = self.measure_visible_blocks(&mut layout, viewport);
@@ -609,7 +609,7 @@ impl EditorDocument {
     /// switching backend, while estimates for off-screen blocks remain cheap.
     pub fn visible_blocks_with_shaper<S: ShapingProvider>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
         self.visible_blocks_with_shaper_and_image_resolver(viewport, shaper, |_| None)
@@ -622,7 +622,7 @@ impl EditorDocument {
     /// the resulting block height is retained in the viewport HeightIndex.
     pub fn visible_blocks_with_shaper_and_image_resolver<S, F>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
         image_resolver: F,
     ) -> Result<ViewportSnapshot, EditorDocumentError>
@@ -648,7 +648,7 @@ impl EditorDocument {
     /// are never inserted into `LayoutCache`.
     pub fn visible_blocks_with_composition_and_shaper<S: ShapingProvider>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
         self.visible_blocks_with_composition_and_shaper_and_image_resolver(viewport, shaper, |_| {
@@ -662,7 +662,7 @@ impl EditorDocument {
     /// the canonical source and layout cache remain untouched.
     pub fn visible_blocks_with_composition_and_shaper_and_image_resolver<S, F>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
         image_resolver: F,
     ) -> Result<ViewportSnapshot, EditorDocumentError>
@@ -693,7 +693,7 @@ impl EditorDocument {
     /// measured with selection-driven inline syntax reveal.
     pub fn visible_blocks_with_visual_state_and_shaper<S: ShapingProvider>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
         self.visible_blocks_with_visual_state_and_shaper_and_image_resolver(
@@ -707,7 +707,7 @@ impl EditorDocument {
     /// [`Self::visible_blocks_with_visual_state_and_shaper`].
     pub fn visible_blocks_with_visual_state_and_shaper_and_image_resolver<S, F>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
         image_resolver: F,
     ) -> Result<ViewportSnapshot, EditorDocumentError>
@@ -748,7 +748,7 @@ impl EditorDocument {
     /// block is measured before its document-space y is calculated.
     pub fn caret_scroll_request(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         margin: f32,
     ) -> Result<CaretScrollRequest, EditorDocumentError> {
         let mut layout = std::mem::take(&mut self.viewport);
@@ -761,7 +761,7 @@ impl EditorDocument {
     /// block height uses the same provider as the caller's visible viewport.
     pub fn caret_scroll_request_with_shaper<S: ShapingProvider>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         margin: f32,
         shaper: &S,
     ) -> Result<CaretScrollRequest, EditorDocumentError> {
@@ -775,7 +775,7 @@ impl EditorDocument {
     fn measure_visible_blocks(
         &mut self,
         layout: &mut ViewportLayout,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
     ) -> Result<ViewportSnapshot, EditorDocumentError> {
         layout
             .set_backend(LayoutBackend::Metrics)
@@ -809,7 +809,7 @@ impl EditorDocument {
     fn measure_visible_blocks_with_shaper_and_images<S, F>(
         &mut self,
         layout: &mut ViewportLayout,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
         image_resolver: &F,
     ) -> Result<ViewportSnapshot, EditorDocumentError>
@@ -852,7 +852,7 @@ impl EditorDocument {
     fn measure_visible_blocks_with_selection_reveal_and_images<S, F>(
         &mut self,
         layout: &mut ViewportLayout,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
         image_resolver: &F,
     ) -> Result<ViewportSnapshot, EditorDocumentError>
@@ -911,7 +911,7 @@ impl EditorDocument {
     fn measure_visible_blocks_with_composition_and_images<S, F>(
         &mut self,
         layout: &mut ViewportLayout,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
         image_resolver: &F,
     ) -> Result<ViewportSnapshot, EditorDocumentError>
@@ -978,7 +978,7 @@ impl EditorDocument {
     fn measure_caret_scroll_request_metrics(
         &mut self,
         layout: &mut ViewportLayout,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         margin: f32,
     ) -> Result<CaretScrollRequest, EditorDocumentError> {
         viewport.validate().map_err(EditorDocumentError::Viewport)?;
@@ -1025,7 +1025,7 @@ impl EditorDocument {
     fn measure_caret_scroll_request_shaped<S: ShapingProvider>(
         &mut self,
         layout: &mut ViewportLayout,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         margin: f32,
         shaper: &S,
     ) -> Result<CaretScrollRequest, EditorDocumentError> {
@@ -1074,7 +1074,7 @@ impl EditorDocument {
     fn finish_caret_scroll_request(
         &self,
         layout: &ViewportLayout,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         margin: f32,
         position: CaretLayoutPosition,
     ) -> Result<CaretScrollRequest, EditorDocumentError> {
@@ -1099,7 +1099,7 @@ impl EditorDocument {
             document_y,
             0.0,
             position.height,
-        );
+        )?;
         Ok(CaretScrollRequest::new(
             self.revision(),
             caret,
@@ -1116,12 +1116,13 @@ impl EditorDocument {
 
     fn empty_caret_scroll_request(
         &self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         margin: f32,
     ) -> CaretScrollRequest {
         CaretScrollRequest::new(
             self.revision(),
-            ViewportCaret::new(ByteOffset::ZERO, 0, 0.0, 0.0, 0.0, 0.0),
+            ViewportCaret::new(ByteOffset::ZERO, 0, 0.0, 0.0, 0.0, 0.0)
+                .expect("an all-zero caret box is always valid"),
             viewport.scroll_y(),
             viewport.scroll_y(),
             margin.min(viewport.height() / 2.0),
@@ -3314,7 +3315,7 @@ mod tests {
             .set_viewport_config(ViewportConfig::new(config, 1.0, 0.0))
             .expect("viewport config");
         let viewport = document
-            .visible_blocks_with_composition_and_shaper(ViewportRect::new(0.0, 12.0), &WideShaper)
+            .visible_blocks_with_composition_and_shaper(ViewportSpan::new(0.0, 12.0), &WideShaper)
             .expect("transient cross-block viewport");
         assert_eq!(viewport.revision(), document.revision());
         assert!(
@@ -3980,7 +3981,7 @@ mod tests {
             .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
             .expect("viewport config should be valid");
         let first = document
-            .visible_blocks(ViewportRect::new(0.0, 0.5))
+            .visible_blocks(ViewportSpan::new(0.0, 0.5))
             .expect("first viewport should measure");
         assert_eq!(first.revision(), document.revision());
         assert_eq!(first.blocks().len(), 1);
@@ -3990,13 +3991,13 @@ mod tests {
         assert_eq!(document.layout_cache_stats().builds(), 1);
 
         document
-            .visible_blocks(ViewportRect::new(0.0, 0.5))
+            .visible_blocks(ViewportSpan::new(0.0, 0.5))
             .expect("repeated viewport should hit layout cache");
         assert_eq!(document.layout_cache_stats().builds(), 1);
         assert!(document.layout_cache_stats().hits() >= 1);
 
         let last = document
-            .visible_blocks(ViewportRect::new(100.0, 0.5))
+            .visible_blocks(ViewportSpan::new(100.0, 0.5))
             .expect("far viewport should measure only its block");
         assert!(last.blocks().iter().all(|block| block.index() > 0));
         assert!(document.layout_cache_stats().builds() < document.markdown().blocks().len() as u64);
@@ -4020,7 +4021,7 @@ mod tests {
         assert_eq!(document.viewport_stats().remapped(), 0);
 
         let snapshot = document
-            .visible_blocks(ViewportRect::new(0.0, 1.0))
+            .visible_blocks(ViewportSpan::new(0.0, 1.0))
             .expect("first viewport query should materialize block state");
         assert!(!snapshot.blocks().is_empty());
         assert_eq!(
@@ -4037,18 +4038,18 @@ mod tests {
             .expect("viewport config should be valid");
 
         let metrics = document
-            .visible_blocks(ViewportRect::new(0.0, 2.0))
+            .visible_blocks(ViewportSpan::new(0.0, 2.0))
             .expect("metrics viewport should measure");
         assert_eq!(metrics.blocks()[0].height(), 1.0);
 
         let shaped = document
-            .visible_blocks_with_shaper(ViewportRect::new(0.0, 2.0), &WideShaper)
+            .visible_blocks_with_shaper(ViewportSpan::new(0.0, 2.0), &WideShaper)
             .expect("shaped viewport should measure");
         assert_eq!(shaped.blocks()[0].height(), 2.0);
         assert_eq!(shaped.content_height(), 2.0);
 
         let metrics_again = document
-            .visible_blocks(ViewportRect::new(0.0, 2.0))
+            .visible_blocks(ViewportSpan::new(0.0, 2.0))
             .expect("metrics viewport should remeasure after backend switch");
         assert_eq!(metrics_again.blocks()[0].height(), 1.0);
     }
@@ -4065,14 +4066,14 @@ mod tests {
             .expect("viewport config should be valid");
 
         let placeholder = document
-            .visible_blocks_with_shaper(ViewportRect::new(0.0, 100.0), &WideShaper)
+            .visible_blocks_with_shaper(ViewportSpan::new(0.0, 100.0), &WideShaper)
             .expect("placeholder viewport should measure");
         assert_eq!(placeholder.blocks()[0].height(), 20.0);
 
         let intrinsic = ImageIntrinsicSize::new(200, 100).expect("image dimensions");
         let ready = document
             .visible_blocks_with_shaper_and_image_resolver(
-                ViewportRect::new(0.0, 100.0),
+                ViewportSpan::new(0.0, 100.0),
                 &WideShaper,
                 |_| Some(intrinsic),
             )
@@ -4093,7 +4094,7 @@ mod tests {
         set_caret(&mut document, source.len());
 
         let request = document
-            .caret_scroll_request(ViewportRect::new(0.0, 1.0), 0.0)
+            .caret_scroll_request(ViewportSpan::new(0.0, 1.0), 0.0)
             .expect("caret scroll request should resolve");
         assert_eq!(request.revision(), document.revision());
         assert_eq!(request.caret().source().get(), source.len() as u64);
@@ -4103,14 +4104,14 @@ mod tests {
         assert_eq!(request.target_scroll_y(), 4.0);
 
         let visible = document
-            .caret_scroll_request(ViewportRect::new(request.target_scroll_y(), 1.0), 0.0)
+            .caret_scroll_request(ViewportSpan::new(request.target_scroll_y(), 1.0), 0.0)
             .expect("visible caret request should resolve");
         assert!(!visible.needs_scroll());
         assert_eq!(visible.target_scroll_y(), request.target_scroll_y());
 
         set_caret(&mut document, 0);
         let reveal_top = document
-            .caret_scroll_request(ViewportRect::new(request.target_scroll_y(), 1.0), 0.0)
+            .caret_scroll_request(ViewportSpan::new(request.target_scroll_y(), 1.0), 0.0)
             .expect("top caret request should resolve");
         assert!(reveal_top.needs_scroll());
         assert_eq!(reveal_top.target_scroll_y(), 0.0);
@@ -4120,11 +4121,11 @@ mod tests {
     fn caret_scroll_request_rejects_invalid_margin() {
         let mut document = EditorDocument::new("text");
         assert_eq!(
-            document.caret_scroll_request(ViewportRect::new(0.0, 1.0), -1.0),
+            document.caret_scroll_request(ViewportSpan::new(0.0, 1.0), -1.0),
             Err(EditorDocumentError::Viewport(ViewportError::InvalidMargin))
         );
         assert!(matches!(
-            document.caret_scroll_request(ViewportRect::new(0.0, 1.0), f32::NAN),
+            document.caret_scroll_request(ViewportSpan::new(0.0, 1.0), f32::NAN),
             Err(EditorDocumentError::Viewport(ViewportError::InvalidMargin))
         ));
     }
@@ -4136,7 +4137,7 @@ mod tests {
             .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
             .expect("viewport config should be valid");
         document
-            .visible_blocks(ViewportRect::new(100.0, 0.5))
+            .visible_blocks(ViewportSpan::new(100.0, 0.5))
             .expect("last block should be measured");
         let measured_before = document.viewport_stats().measured();
         let transaction = Transaction::new(
@@ -4150,7 +4151,7 @@ mod tests {
         assert!(document.viewport_stats().remapped() >= 1);
         assert_eq!(document.viewport_stats().measured(), measured_before);
         let visible = document
-            .visible_blocks(ViewportRect::new(100.0, 0.5))
+            .visible_blocks(ViewportSpan::new(100.0, 0.5))
             .expect("mapped viewport should remain queryable");
         assert_eq!(visible.revision(), document.revision());
         assert!(visible.blocks().iter().all(|block| block.index() > 0));
@@ -4163,7 +4164,7 @@ mod tests {
             .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
             .expect("viewport config should be valid");
         document
-            .visible_blocks(ViewportRect::new(0.0, 0.5))
+            .visible_blocks(ViewportSpan::new(0.0, 0.5))
             .expect("first block should be measured");
         let invalidated_before = document.viewport_stats().invalidated();
         let transaction = Transaction::new(
@@ -4175,7 +4176,7 @@ mod tests {
             .expect("heading edit should apply");
         assert!(document.viewport_stats().invalidated() > invalidated_before);
         let visible = document
-            .visible_blocks(ViewportRect::new(0.0, 0.5))
+            .visible_blocks(ViewportSpan::new(0.0, 0.5))
             .expect("new heading block should be queryable");
         assert_eq!(visible.revision(), document.revision());
     }

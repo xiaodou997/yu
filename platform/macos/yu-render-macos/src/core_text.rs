@@ -378,7 +378,7 @@ impl CoreTextViewportFrameBuilder {
 mod tests {
     use super::*;
     use yu_core::{ByteOffset, TextRange, Utf16Offset, Utf16Range};
-    use yu_editor::{EditorCommand, ViewportConfig, ViewportRect};
+    use yu_editor::{EditorCommand, ViewportConfig, ViewportSpan};
     use yu_scene::{Rect, Rgba8};
 
     #[test]
@@ -396,7 +396,7 @@ mod tests {
             ))
             .expect("viewport config");
         let config = ViewportRenderConfig::new(
-            ViewportRect::new(0.0, 240.0),
+            ViewportSpan::new(0.0, 240.0),
             font_size,
             Rect::new(0.0, 0.0, 320.0, 480.0).expect("scene viewport"),
             Rgba8::black(),

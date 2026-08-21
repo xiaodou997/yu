@@ -19,8 +19,8 @@ use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
 use yu_editor::{
     BlockProjection, CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay,
     EditorCommand, EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult,
-    LayoutConfig, LayoutSnapshot, Projection, ShapingProvider, ViewportConfig, ViewportRect,
-    ViewportSnapshot,
+    LayoutConfig, LayoutSnapshot, Projection, ShapingProvider, ViewportConfig, ViewportSnapshot,
+    ViewportSpan,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -377,7 +377,7 @@ impl DocumentSession {
     /// session that owns source, dirty state and file conflicts.
     pub fn visible_blocks(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
     ) -> Result<ViewportSnapshot, StorageError> {
         self.editor
             .visible_blocks(viewport)
@@ -388,7 +388,7 @@ impl DocumentSession {
     /// provider. The editor owns viewport estimates and measurements.
     pub fn visible_blocks_with_shaper<S: ShapingProvider>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
     ) -> Result<ViewportSnapshot, StorageError> {
         self.editor
@@ -401,7 +401,7 @@ impl DocumentSession {
     /// scroll target without changing canonical source state.
     pub fn caret_scroll_request_with_shaper<S: ShapingProvider>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         margin: f32,
         shaper: &S,
     ) -> Result<CaretScrollRequest, StorageError> {
@@ -841,14 +841,14 @@ impl DocumentEditorSession {
     /// editor handle outside the unified product session.
     pub fn visible_blocks(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
     ) -> Result<ViewportSnapshot, StorageError> {
         self.document.visible_blocks(viewport)
     }
 
     pub fn visible_blocks_with_shaper<S: ShapingProvider>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &S,
     ) -> Result<ViewportSnapshot, StorageError> {
         self.document.visible_blocks_with_shaper(viewport, shaper)
@@ -859,7 +859,7 @@ impl DocumentEditorSession {
     /// bound; it never mutates source or selection.
     pub fn caret_scroll_request_with_shaper<S: ShapingProvider>(
         &mut self,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         margin: f32,
         shaper: &S,
     ) -> Result<CaretScrollRequest, StorageError> {

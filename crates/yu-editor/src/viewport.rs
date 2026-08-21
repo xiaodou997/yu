@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
+use yu_core::{Affinity, ByteOffset, Document, Rect, Revision, TextAnchor, TextRange};
 use yu_layout::{HeightIndex, HeightIndexError, LayoutConfig};
 use yu_markdown::{BlockKind, MarkdownDocument};
 use yu_text::{AnchorMapError, ChangeSet, TextSnapshot};
@@ -78,14 +78,18 @@ impl Default for ViewportConfig {
     }
 }
 
-/// Scroll position and viewport height in the document's local y coordinate.
+/// 视口在文档 y 轴上占据的区间：滚动位置与高度。
+///
+/// 原来叫 `ViewportRect`，但它没有 x 也没有宽度——视口的水平范围由布局的
+/// `max_width` 决定，不由它携带。名字里带 `Rect` 会让人以为可以拿它去和
+/// [`yu_core::Rect`] 相交或比较。
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ViewportRect {
+pub struct ViewportSpan {
     scroll_y: f32,
     height: f32,
 }
 
-impl ViewportRect {
+impl ViewportSpan {
     #[must_use]
     pub const fn new(scroll_y: f32, height: f32) -> Self {
         Self { scroll_y, height }
@@ -125,29 +129,28 @@ impl ViewportRect {
 pub struct ViewportCaret {
     source: ByteOffset,
     block: usize,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    /// 文档坐标系里的 caret 盒。原来这里散着四个 `f32`，既没有校验，也说不出
+    /// 自己属于哪个坐标空间。
+    bounds: Rect<Document>,
 }
 
 impl ViewportCaret {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         source: ByteOffset,
         block: usize,
         x: f32,
         y: f32,
         width: f32,
         height: f32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ViewportError> {
+        let bounds = Rect::new(x, y, width, height).map_err(|_| {
+            ViewportError::InvalidViewport("caret bounds must be finite and non-negative")
+        })?;
+        Ok(Self {
             source,
             block,
-            x,
-            y,
-            width,
-            height,
-        }
+            bounds,
+        })
     }
 
     #[must_use]
@@ -160,24 +163,30 @@ impl ViewportCaret {
         self.block
     }
 
+    /// 文档坐标系里的 caret 盒。
     #[must_use]
-    pub const fn x(self) -> f32 {
-        self.x
+    pub const fn bounds(self) -> Rect<Document> {
+        self.bounds
     }
 
     #[must_use]
-    pub const fn y(self) -> f32 {
-        self.y
+    pub fn x(self) -> f32 {
+        self.bounds.x()
     }
 
     #[must_use]
-    pub const fn width(self) -> f32 {
-        self.width
+    pub fn y(self) -> f32 {
+        self.bounds.y()
     }
 
     #[must_use]
-    pub const fn height(self) -> f32 {
-        self.height
+    pub fn width(self) -> f32 {
+        self.bounds.width()
+    }
+
+    #[must_use]
+    pub fn height(self) -> f32 {
+        self.bounds.height()
     }
 }
 
@@ -673,7 +682,7 @@ impl ViewportLayout {
     pub fn visible_range(
         &mut self,
         markdown: &MarkdownDocument,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
     ) -> Result<ViewportRange, ViewportError> {
         viewport.validate()?;
         self.sync(markdown)?;
