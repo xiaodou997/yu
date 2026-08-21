@@ -94,12 +94,27 @@ enum {
     YU_STORAGE_TABLE_ALIGNMENT_RIGHT = 3,
 };
 
+/* Clipboard payload format for yu_storage_session_copy_selection. */
+enum {
+    YU_STORAGE_CLIPBOARD_TEXT = 0,
+    YU_STORAGE_CLIPBOARD_HTML = 1,
+};
+
+/* Which axis a table divider belongs to. */
 enum {
     YU_STORAGE_TABLE_RESIZE_NONE = 0,
     YU_STORAGE_TABLE_RESIZE_COLUMN = 1,
     YU_STORAGE_TABLE_RESIZE_ROW = 2,
+};
+
+/* Actions for yu_storage_session_macos_table_resize_at_point. */
+enum {
     YU_STORAGE_TABLE_RESIZE_PROBE = 0,
     YU_STORAGE_TABLE_RESIZE_BEGIN = 1,
+};
+
+/* Actions for yu_storage_session_table_resize_action. */
+enum {
     YU_STORAGE_TABLE_RESIZE_UPDATE = 0,
     YU_STORAGE_TABLE_RESIZE_FINISH = 1,
     YU_STORAGE_TABLE_RESIZE_CANCEL = 2,
@@ -178,8 +193,8 @@ typedef struct YuStorageCloseRequest {
 
 
 /* Revision-bound selection endpoints. The anchor/focus pair preserves the
- * direction of a native visual drag; YuStorageSelection remains the ordered
- * range used by legacy callers. */
+ * direction of a native visual drag; the ordered range is derived by the
+ * caller from min/max and does not need its own ABI entry. */
 typedef struct YuStorageSelectionEndpoints {
     uint64_t revision;
     uint64_t anchor_utf16;
@@ -624,14 +639,15 @@ int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t end_utf16,
                                              uint8_t *output, size_t capacity,
                                              size_t *written);
+/* Copies the current selection in the requested format. Plain text and the
+ * HTML fragment were two entry points with identical parameters differing only
+ * in output format; the clipboard is one selection in several
+ * representations. */
 int32_t yu_storage_session_copy_selection(const YuStorageSession *session,
                                           uint64_t expected_revision,
+                                          uint8_t format,
                                           uint8_t *output, size_t capacity,
                                           size_t *written);
-int32_t yu_storage_session_copy_selection_html(const YuStorageSession *session,
-                                               uint64_t expected_revision,
-                                               uint8_t *output, size_t capacity,
-                                               size_t *written);
 /* Converts allowlisted HTML to Markdown; policy rejection must fall back to
  * the caller's text/plain payload. This function does not access a session. */
 int32_t yu_storage_import_html_fragment(const uint8_t *html, size_t html_length,

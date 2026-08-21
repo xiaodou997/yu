@@ -95,6 +95,10 @@ pub const YU_STORAGE_TABLE_ALIGNMENT_CENTER: u8 = 2;
 pub const YU_STORAGE_TABLE_ALIGNMENT_RIGHT: u8 = 3;
 
 pub const YU_STORAGE_TABLE_RESIZE_NONE: u8 = 0;
+/// `yu_storage_session_copy_selection` 的输出格式。
+pub const YU_STORAGE_CLIPBOARD_TEXT: u8 = 0;
+pub const YU_STORAGE_CLIPBOARD_HTML: u8 = 1;
+
 pub const YU_STORAGE_TABLE_RESIZE_COLUMN: u8 = 1;
 pub const YU_STORAGE_TABLE_RESIZE_ROW: u8 = 2;
 
@@ -4813,9 +4817,11 @@ pub unsafe extern "C" fn yu_storage_session_copy_source_range(
     write_snapshot_range(&snapshot, range, output, capacity, written)
 }
 
-/// Copies the current Rust-owned selection as UTF-8. The expected revision
-/// makes the operation safe for a native clipboard callback that was queued
-/// before a source edit.
+/// 按指定格式取出当前选区。
+///
+/// 纯文本与 HTML 片段此前是两个 FFI，参数完全相同，只在输出格式上不同——
+/// 剪贴板本来就是「同一段选区的多种表示」。expected revision 让排队中的原生
+/// 剪贴板回调不会读到更新的 Revision。
 ///
 /// # Safety
 /// `session` must be a live handle. `written` must be writable; `output` must
@@ -4824,6 +4830,7 @@ pub unsafe extern "C" fn yu_storage_session_copy_source_range(
 pub unsafe extern "C" fn yu_storage_session_copy_selection(
     session: *const YuStorageSession,
     expected_revision: u64,
+    format: u8,
     output: *mut u8,
     capacity: usize,
     written: *mut usize,
@@ -4831,37 +4838,24 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
     let Some(session) = (unsafe { session.as_ref() }) else {
         return YU_STORAGE_NULL_POINTER;
     };
+    if !matches!(
+        format,
+        YU_STORAGE_CLIPBOARD_TEXT | YU_STORAGE_CLIPBOARD_HTML
+    ) {
+        if !written.is_null() {
+            // SAFETY: `written` was checked above and belongs to the caller.
+            unsafe { *written = 0 };
+        }
+        return YU_STORAGE_INVALID_COMMAND;
+    }
     if let Err(status) = validate_revision(&session.session, expected_revision) {
         return status;
     }
     let range = session.session.selection().ordered_range();
     let snapshot = session.session.snapshot();
-    write_snapshot_range(&snapshot, range, output, capacity, written)
-}
-
-/// Copies the current Rust-owned selection as a semantic HTML fragment. The
-/// expected revision protects a queued native clipboard callback from reading
-/// a newer selection/source revision.
-///
-/// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable bytes when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_copy_selection_html(
-    session: *const YuStorageSession,
-    expected_revision: u64,
-    output: *mut u8,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
+    if format == YU_STORAGE_CLIPBOARD_TEXT {
+        return write_snapshot_range(&snapshot, range, output, capacity, written);
     }
-    let range = session.session.selection().ordered_range();
-    let snapshot = session.session.snapshot();
     let payload = match export_clipboard(&snapshot, session.session.revision(), range) {
         Ok(payload) => payload,
         Err(error) => return status_from_export_error(error),
@@ -5890,6 +5884,87 @@ mod tests {
     ///
     /// 反向验证：把 `selection` 从 `MacosFrameKey` 去掉，第二段断言失败；
     /// 把 `table_resize` 去掉，第三段断言失败。
+    /// 未知的剪贴板格式必须被拒绝，且不得留下长度。
+    ///
+    /// 纯文本与 HTML 合成一个入口后，传错 format 会静默地把另一种表示放进剪贴板
+    /// ——粘贴出来是 HTML 标签或反过来，没有任何报错。
+    #[test]
+    fn ffi_copy_selection_rejects_unknown_formats() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-clipboard-format-{id}.md"));
+        fs::write(&path, "**\u{7fbd}** plain\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let end = "**\u{7fbd}** plain\n".encode_utf16().count() as u64;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    0,
+                    end,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+
+        let mut text_len = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_selection(
+                    raw,
+                    0,
+                    YU_STORAGE_CLIPBOARD_TEXT,
+                    ptr::null_mut(),
+                    0,
+                    &mut text_len,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut html_len = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_selection(
+                    raw,
+                    0,
+                    YU_STORAGE_CLIPBOARD_HTML,
+                    ptr::null_mut(),
+                    0,
+                    &mut html_len,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(text_len > 0 && html_len > text_len, "两种表示必须不同");
+
+        for unknown in [2_u8, 255] {
+            let mut written = 99;
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_copy_selection(
+                        raw,
+                        0,
+                        unknown,
+                        ptr::null_mut(),
+                        0,
+                        &mut written,
+                    )
+                },
+                YU_STORAGE_INVALID_COMMAND
+            );
+            assert_eq!(written, 0, "被拒绝的格式不得留下长度");
+        }
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     /// PROBE 不得改变状态，未知 action 不得被当成 BEGIN 执行。
     ///
     /// 探测与开始拖动合成一个入口之后，「hover 只读」这条约束从两份实现各自
@@ -7986,7 +8061,16 @@ mod tests {
         );
         let mut required = 0;
         assert_eq!(
-            unsafe { yu_storage_session_copy_selection(raw, 0, ptr::null_mut(), 0, &mut required) },
+            unsafe {
+                yu_storage_session_copy_selection(
+                    raw,
+                    0,
+                    YU_STORAGE_CLIPBOARD_TEXT,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
             YU_STORAGE_OK
         );
         let mut selected = vec![0_u8; required];
@@ -7996,6 +8080,7 @@ mod tests {
                 yu_storage_session_copy_selection(
                     raw,
                     0,
+                    YU_STORAGE_CLIPBOARD_TEXT,
                     selected.as_mut_ptr(),
                     selected.len(),
                     &mut written,
@@ -8008,7 +8093,16 @@ mod tests {
             "🙂日本語"
         );
         assert_eq!(
-            unsafe { yu_storage_session_copy_selection(raw, 1, ptr::null_mut(), 0, &mut required) },
+            unsafe {
+                yu_storage_session_copy_selection(
+                    raw,
+                    1,
+                    YU_STORAGE_CLIPBOARD_TEXT,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
             YU_STORAGE_STALE_REVISION
         );
         unsafe { yu_storage_session_destroy(raw) };
@@ -8042,7 +8136,14 @@ mod tests {
         let mut required = 0;
         assert_eq!(
             unsafe {
-                yu_storage_session_copy_selection_html(raw, 0, ptr::null_mut(), 0, &mut required)
+                yu_storage_session_copy_selection(
+                    raw,
+                    0,
+                    YU_STORAGE_CLIPBOARD_HTML,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
             },
             YU_STORAGE_OK
         );
@@ -8050,9 +8151,10 @@ mod tests {
         let mut written = 0;
         assert_eq!(
             unsafe {
-                yu_storage_session_copy_selection_html(
+                yu_storage_session_copy_selection(
                     raw,
                     0,
+                    YU_STORAGE_CLIPBOARD_HTML,
                     html.as_mut_ptr(),
                     html.len(),
                     &mut written,
@@ -8066,7 +8168,14 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                yu_storage_session_copy_selection_html(raw, 1, ptr::null_mut(), 0, &mut required)
+                yu_storage_session_copy_selection(
+                    raw,
+                    1,
+                    YU_STORAGE_CLIPBOARD_HTML,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
             },
             YU_STORAGE_STALE_REVISION
         );
