@@ -164,6 +164,15 @@ impl<S: CoordinateSpace> Point<S> {
     pub fn scale<T: CoordinateSpace>(self, scale: Scale<S, T>) -> Point<T> {
         Point::new(self.x * scale.factor(), self.y * scale.factor())
     }
+
+    /// 沿 `scale` 的反方向换算，即从 `T` 回到 `S`。
+    ///
+    /// 用除法而不是乘以倒数：倒数在非 2 的幂的缩放上会引入一个 ULP 的漂移，
+    /// 而这些值最终决定字形落在哪个物理像素上。
+    #[must_use]
+    pub fn unscale<T: CoordinateSpace>(source: Point<T>, scale: Scale<S, T>) -> Self {
+        Self::new(source.x() / scale.factor(), source.y() / scale.factor())
+    }
 }
 
 /// 一个坐标空间里的尺寸。
@@ -205,6 +214,17 @@ impl<S: CoordinateSpace> Size<S> {
 
     pub fn scale<T: CoordinateSpace>(self, scale: Scale<S, T>) -> Result<Size<T>, GeometryError> {
         Size::new(self.width * scale.factor(), self.height * scale.factor())
+    }
+
+    /// 沿 `scale` 的反方向换算。见 [`Point::unscale`] 为什么用除法。
+    pub fn unscale<T: CoordinateSpace>(
+        source: Size<T>,
+        scale: Scale<S, T>,
+    ) -> Result<Self, GeometryError> {
+        Self::new(
+            source.width() / scale.factor(),
+            source.height() / scale.factor(),
+        )
     }
 }
 
@@ -347,6 +367,22 @@ impl<S: CoordinateSpace> Rect<S> {
             self.height * scale.factor(),
         )
     }
+
+    /// 沿 `scale` 的反方向换算，即从 `T` 回到 `S`。典型用途是把按
+    /// `font_size × raster_scale` 栅格化出来的物理像素除回逻辑坐标。
+    ///
+    /// 用除法而不是乘以倒数：见 [`Point::unscale`]。
+    pub fn unscale<T: CoordinateSpace>(
+        source: Rect<T>,
+        scale: Scale<S, T>,
+    ) -> Result<Self, GeometryError> {
+        Self::new(
+            source.x() / scale.factor(),
+            source.y() / scale.factor(),
+            source.width() / scale.factor(),
+            source.height() / scale.factor(),
+        )
+    }
 }
 
 /// 两个坐标空间之间的换算因子。
@@ -372,16 +408,6 @@ impl<From: CoordinateSpace, To: CoordinateSpace> Scale<From, To> {
     #[must_use]
     pub const fn factor(self) -> f32 {
         self.factor
-    }
-
-    /// 反向换算。
-    #[must_use]
-    pub fn inverse(self) -> Scale<To, From> {
-        Scale {
-            // factor 已经保证是有限正数，倒数同样是有限正数。
-            factor: 1.0 / self.factor,
-            spaces: PhantomData,
-        }
     }
 }
 
@@ -556,17 +582,31 @@ mod tests {
     }
 
     #[test]
-    fn scale_round_trips_through_its_inverse() {
-        let logical = Rect::<Document>::new(3.0, 5.0, 7.0, 9.0).expect("valid document rect");
+    fn scale_and_unscale_round_trip_exactly() {
         let scale = Scale::<Document, Device>::new(2.0).expect("valid scale");
+        let logical = Rect::<Document>::new(3.0, 5.0, 7.0, 9.0).expect("valid document rect");
         let physical = logical.scale(scale).expect("scaled rect stays valid");
 
         assert_eq!(physical.x(), 6.0);
         assert_eq!(physical.width(), 14.0);
         assert_eq!(
-            physical.scale(scale.inverse()).expect("inverse is valid"),
+            Rect::<Document>::unscale(physical, scale).expect("unscale is valid"),
             logical
         );
+    }
+
+    #[test]
+    fn unscale_divides_instead_of_multiplying_by_the_reciprocal() {
+        // 缩放 3、坐标 5：`5.0 / 3.0` 与 `5.0 * (1.0 / 3.0)` 差一个 ULP。
+        // 一个 ULP 决定的是字形落在哪个物理像素上，所以 unscale 必须用除法。
+        assert_ne!(5.0_f32 / 3.0, 5.0_f32 * (1.0 / 3.0));
+
+        let scale = Scale::<Document, Device>::new(3.0).expect("valid scale");
+        let physical = Rect::<Device>::new(5.0, 5.0, 5.0, 5.0).expect("valid device rect");
+        let logical = Rect::<Document>::unscale(physical, scale).expect("unscale is valid");
+
+        assert_eq!(logical.x(), 5.0_f32 / 3.0);
+        assert_ne!(logical.x(), 5.0_f32 * (1.0 / 3.0));
     }
 
     #[test]

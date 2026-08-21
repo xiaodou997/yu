@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 use yu_core::{Revision, TextRange, Utf16Offset, Utf16Range};
-use yu_editor::{CaretAffinity, EditorCommand, EditorSelection, ViewportRect};
+use yu_editor::{CaretAffinity, EditorCommand, EditorSelection, ViewportSpan};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, CloseStateMachine, CloseTransition, DiskState,
     DocumentEditorSession, DocumentSession, ExternalFileState, RecoveryError, RecoveryOutcome,
@@ -104,7 +104,7 @@ fn unified_session_exposes_viewport_without_a_second_editor_handle() {
     let mut session = DocumentEditorSession::open(path.as_path()).expect("open fixture");
 
     let first = session
-        .visible_blocks(ViewportRect::new(0.0, 1.0))
+        .visible_blocks(ViewportSpan::new(0.0, 1.0))
         .expect("first viewport query should succeed");
     assert!(!first.blocks().is_empty());
     let entry_count = session.document().editor().viewport_stats().entries();
@@ -117,7 +117,7 @@ fn unified_session_exposes_viewport_without_a_second_editor_handle() {
         .execute(EditorCommand::insert_text("!"))
         .expect("edit should succeed");
     let second = session
-        .visible_blocks(ViewportRect::new(0.0, 1.0))
+        .visible_blocks(ViewportSpan::new(0.0, 1.0))
         .expect("mapped viewport query should succeed");
     assert_eq!(second.revision(), session.revision());
     assert_eq!(

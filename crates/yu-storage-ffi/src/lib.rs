@@ -24,7 +24,7 @@ use yu_editor::{
     AccessibilityTextSnapshot, BlockProjection, CaretAffinity, CaretScrollRequest, CommandResult,
     EditorCommand, EditorDocumentError, ImageSource, LayoutConfig, LayoutPoint, LayoutSnapshot,
     Projection, ProjectionBias, SelectionError, SourceSync, TableResizeCommit, TableResizeGesture,
-    TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig, ViewportRect,
+    TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig, ViewportSpan,
     VisualOffset, VisualRunKind,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
@@ -2768,7 +2768,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
         }
 
         let query_y = point_y.max(0.0);
-        let viewport = ViewportRect::new(query_y, metrics.line_height());
+        let viewport = ViewportSpan::new(query_y, metrics.line_height());
         let snapshot = {
             let document = session.session.document_mut().editor_mut();
             match document.visible_blocks_with_visual_state_and_shaper(viewport, &shaper) {
@@ -3128,7 +3128,7 @@ fn macos_table_resize_hit_at_point(
     macos_publish_viewport_config(session, max_width, metrics)?;
 
     let query_y = point_y.max(0.0);
-    let viewport = ViewportRect::new(query_y, metrics.line_height());
+    let viewport = ViewportSpan::new(query_y, metrics.line_height());
     let snapshot = {
         let document = session.session.document_mut().editor_mut();
         document
@@ -3634,7 +3634,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_accessibility_div
             return status;
         }
 
-        let viewport = ViewportRect::new(scroll_y, viewport_height);
+        let viewport = ViewportSpan::new(scroll_y, viewport_height);
         let viewport_snapshot = {
             let document = session.session.document_mut().editor_mut();
             if document.composition().is_some() {
@@ -3914,7 +3914,7 @@ fn macos_render_host_error_status(error: &CoreTextViewportFrameError) -> i32 {
 
 #[cfg(target_os = "macos")]
 fn macos_render_host_config(
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     size: f32,
     max_width: f32,
     viewport_height: f32,
@@ -4096,7 +4096,7 @@ fn macos_render_host_frame(
         }
         None => None,
     };
-    let viewport = ViewportRect::new(scroll_y, viewport_height);
+    let viewport = ViewportSpan::new(scroll_y, viewport_height);
     let config =
         macos_render_host_config(viewport, size, max_width, viewport_height, raster_scale)?;
     let config = table_resize.map_or(config, |commit| config.with_table_resize(commit));
@@ -4769,7 +4769,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_caret_scroll_request(
         // 平台必须先查一次字体度量，于是每次光标移动多一次纯往返。
         let margin = metrics.line_height().max(4.0);
         let request = match session.session.caret_scroll_request_with_shaper(
-            ViewportRect::new(scroll_y, viewport_height),
+            ViewportSpan::new(scroll_y, viewport_height),
             margin,
             &shaper,
         ) {
@@ -5766,7 +5766,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_render_host_config_tracks_document_scroll_origin() {
-        let viewport = ViewportRect::new(137.5, 240.0);
+        let viewport = ViewportSpan::new(137.5, 240.0);
         let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0, 2.0)
             .expect("valid macOS render host config");
 
@@ -6878,7 +6878,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_render_host_config_rejects_invalid_raster_scale() {
-        let viewport = ViewportRect::new(0.0, 240.0);
+        let viewport = ViewportSpan::new(0.0, 240.0);
         for invalid in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
             let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0, invalid)
                 .expect("config should still build");

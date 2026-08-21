@@ -34,7 +34,7 @@ pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use selection::{EditorSelection, SelectionError};
 pub use viewport::{
     CaretScrollRequest, ViewportBlock, ViewportCaret, ViewportConfig, ViewportError,
-    ViewportLayout, ViewportRange, ViewportRect, ViewportSnapshot, ViewportStats,
+    ViewportLayout, ViewportRange, ViewportSnapshot, ViewportSpan, ViewportStats,
 };
 pub use yu_core::{ClusterMetrics, ShapedText, ShapingProvider, TextStyle};
 pub use yu_layout::{

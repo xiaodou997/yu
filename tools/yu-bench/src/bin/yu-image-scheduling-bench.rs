@@ -11,7 +11,7 @@ use yu_core::{
     ByteOffset, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
     TextDirection, TextRange, TextStyle,
 };
-use yu_editor::{EditorDocument, ImageIntrinsicSize, ViewportConfig, ViewportRect};
+use yu_editor::{EditorDocument, ImageIntrinsicSize, ViewportConfig, ViewportSpan};
 use yu_layout::LayoutConfig;
 
 /// A deterministic shaper is enough for this benchmark: the workload measures
@@ -115,7 +115,7 @@ fn run_case(
     for iteration in 0..configuration.iterations {
         let scroll = (iteration as f32 * 137.0) % estimated_height.max(1.0);
         let snapshot = document.visible_blocks_with_shaper_and_image_resolver(
-            ViewportRect::new(scroll, 480.0),
+            ViewportSpan::new(scroll, 480.0),
             &shaper,
             |_| {
                 image_calls.set(image_calls.get().saturating_add(1));

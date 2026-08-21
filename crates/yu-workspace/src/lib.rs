@@ -18,7 +18,7 @@ use yu_assets::{
 use yu_core::{Revision, TextRange};
 use yu_editor::{
     BlockKind, CaretAffinity, EditorDocument, EditorDocumentError, ImageSource, LayoutError,
-    ProjectionBias, ShapingProvider, TableResizeCommit, TableResizeTarget, TaskState, ViewportRect,
+    ProjectionBias, ShapingProvider, TableResizeCommit, TableResizeTarget, TaskState, ViewportSpan,
     task_marker,
 };
 use yu_font::GlyphAtlas;
@@ -463,7 +463,7 @@ impl ViewportRenderFrame {
 /// Immutable inputs shared by one scene/render frame build.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewportRenderConfig {
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     font_size: f32,
     /// 编辑区背景色。
     ///
@@ -485,7 +485,7 @@ pub struct ViewportRenderConfig {
 impl ViewportRenderConfig {
     #[must_use]
     pub const fn new(
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         font_size: f32,
         scene_viewport: Rect,
         color: Rgba8,
@@ -517,7 +517,7 @@ impl ViewportRenderConfig {
     }
 
     #[must_use]
-    pub const fn viewport(self) -> ViewportRect {
+    pub const fn viewport(self) -> ViewportSpan {
         self.viewport
     }
 
@@ -1002,7 +1002,7 @@ impl ViewportFramePublisher {
 /// them atomically through `SceneBuilder::append_viewport`.
 pub fn assemble_viewport_scene<S: ShapingProvider>(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
     scene_viewport: Rect,
@@ -1028,7 +1028,7 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_scene_with_table_resize<S: ShapingProvider>(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
     scene_viewport: Rect,
@@ -1056,7 +1056,7 @@ pub fn assemble_viewport_scene_with_table_resize<S: ShapingProvider>(
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
     scene_viewport: Rect,
@@ -1083,7 +1083,7 @@ pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
     scene_viewport: Rect,
@@ -1112,7 +1112,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: ShapingProvider>(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
     scene_viewport: Rect,
@@ -1149,7 +1149,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     S: ShapingProvider,
 >(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
     scene_viewport: Rect,
@@ -1406,7 +1406,7 @@ pub fn assemble_viewport_render_frame<S: ShapingProvider>(
 /// Builds a render frame while applying ready image intrinsic dimensions.
 pub fn assemble_viewport_render_frame_with_images<S: ShapingProvider>(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     config: ViewportRenderConfig,
     shaper: &S,
     atlas: &GlyphAtlas,
@@ -1430,7 +1430,7 @@ pub fn assemble_viewport_render_frame_with_images<S: ShapingProvider>(
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvider>(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     config: ViewportRenderConfig,
     shaper: &S,
     atlas: &GlyphAtlas,
@@ -1460,7 +1460,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded<
     S: ShapingProvider,
 >(
     document: &mut EditorDocument,
-    viewport: ViewportRect,
+    viewport: ViewportSpan,
     config: ViewportRenderConfig,
     shaper: &S,
     atlas: &GlyphAtlas,
@@ -1528,7 +1528,7 @@ mod tests {
 
     fn atlas_for_document(
         document: &mut EditorDocument,
-        viewport: ViewportRect,
+        viewport: ViewportSpan,
         shaper: &FontShaper,
         font_size: f32,
     ) -> GlyphAtlas {
@@ -1565,7 +1565,7 @@ mod tests {
     fn editor_viewport_is_assembled_into_revision_bound_render_plan() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 200.0);
+        let viewport = ViewportSpan::new(0.0, 200.0);
         let mut document = EditorDocument::new("# title\n\nhello **world**");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -1613,7 +1613,7 @@ mod tests {
     fn blockquote_bar_precedes_glyphs_and_lowers_to_source_backed_fill() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let source = "> quoted\n> second\n";
         let mut document = EditorDocument::new(source);
         document
@@ -1673,7 +1673,7 @@ mod tests {
     fn heading_and_body_share_a_frame_with_distinct_raster_sizes() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 180.0);
+        let viewport = ViewportSpan::new(0.0, 180.0);
         let mut document = EditorDocument::new("# title\n\nplain");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -1724,7 +1724,7 @@ mod tests {
     fn empty_document_publishes_one_line_retained_caret_frame() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let mut document = EditorDocument::new("");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -1780,7 +1780,7 @@ mod tests {
     fn whitespace_document_keeps_a_submittable_retained_caret_frame() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let mut document = EditorDocument::new("   \n");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -1822,7 +1822,7 @@ mod tests {
     fn empty_document_composition_does_not_hide_unprojected_preedit() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let mut document = EditorDocument::new("");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -1873,7 +1873,7 @@ mod tests {
     fn configured_editor_decorations_publish_selection_and_caret_layers() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let mut document = EditorDocument::new("alpha beta");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -1948,7 +1948,7 @@ mod tests {
         let source = "# before **strong** after\n\nplain";
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let mut document = EditorDocument::new(source);
         // 基线要求「没有任何语法被聚焦」。新文档的光标落在文首，正好会揭示
         // 第一个块的语法，因此这里把它显式移到最后一个普通段落里。
@@ -2051,7 +2051,7 @@ mod tests {
     fn composition_decorations_use_transient_projection_without_source_edit() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let mut document = EditorDocument::new("日本 alpha");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2106,7 +2106,7 @@ mod tests {
     fn task_markers_become_source_backed_checkbox_layers() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let mut document = EditorDocument::new("- [ ] todo\n- [x] done\n");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2205,7 +2205,7 @@ mod tests {
     fn task_checkbox_hit_test_uses_published_revision_and_border_geometry() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 120.0);
+        let viewport = ViewportSpan::new(0.0, 120.0);
         let mut document = EditorDocument::new("- [ ] todo\nparagraph\n- [x] done\n");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2276,7 +2276,7 @@ mod tests {
     fn published_math_is_consumed_by_viewport_scene_and_render_plan() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 240.0);
+        let viewport = ViewportSpan::new(0.0, 240.0);
         let mut document = EditorDocument::new("```math\nx^2 + y^2\n```\n");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2344,7 +2344,7 @@ mod tests {
     fn ready_image_publication_updates_scene_intrinsic_bounds() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 160.0);
+        let viewport = ViewportSpan::new(0.0, 160.0);
         let mut document = EditorDocument::new("![alt](image.png)");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2437,7 +2437,7 @@ mod tests {
     fn fenced_code_viewport_emits_fill_before_glyphs() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 160.0);
+        let viewport = ViewportSpan::new(0.0, 160.0);
         let mut document = EditorDocument::new("```rust\nlet x = 1;\n```\n");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2510,7 +2510,7 @@ mod tests {
         let font_size = 14.0;
         let shaper = shaper(font_size);
         let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
-        let viewport = ViewportRect::new(0.0, 160.0);
+        let viewport = ViewportSpan::new(0.0, 160.0);
         let mut document = EditorDocument::new(source);
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2578,7 +2578,7 @@ mod tests {
     fn table_resize_override_reaches_scene_and_render_plan_without_mutating_document() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 160.0);
+        let viewport = ViewportSpan::new(0.0, 160.0);
         let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
         let mut document = EditorDocument::new(source);
         document
@@ -2685,7 +2685,7 @@ mod tests {
     fn missing_atlas_is_rejected_before_frame_publication() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 80.0);
+        let viewport = ViewportSpan::new(0.0, 80.0);
         let mut document = EditorDocument::new("paragraph");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2715,7 +2715,7 @@ mod tests {
     fn frame_cache_rejects_stale_publish_and_replaces_after_edit() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 80.0);
+        let viewport = ViewportSpan::new(0.0, 80.0);
         let mut document = EditorDocument::new("paragraph");
         document
             .set_viewport_config(ViewportConfig::new(
@@ -2801,7 +2801,7 @@ mod tests {
 
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 80.0);
+        let viewport = ViewportSpan::new(0.0, 80.0);
         let config = ViewportRenderConfig::new(
             viewport,
             font_size,
@@ -2857,7 +2857,7 @@ mod tests {
     fn frame_publisher_failure_does_not_commit_builder_or_cache() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 80.0);
+        let viewport = ViewportSpan::new(0.0, 80.0);
         let config = ViewportRenderConfig::new(
             viewport,
             font_size,
@@ -2914,7 +2914,7 @@ mod tests {
     fn every_parser_block_kind_produces_renderable_glyphs() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportRect::new(0.0, 900.0);
+        let viewport = ViewportSpan::new(0.0, 900.0);
         let source = concat!(
             "# heading\n",
             "\n",

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use yu_core::ByteOffset;
-use yu_editor::{CaretAffinity, EditorCommand, EditorSelection, ViewportRect};
+use yu_editor::{CaretAffinity, EditorCommand, EditorSelection, ViewportSpan};
 use yu_storage::{DocumentEditorSession, SaveOutcome};
 
 const SECTION: &str = "# Yu\n\nA paragraph with **strong text**, 中文 and emoji 🙂.\n\n```rust\nfn main() {}\n```\n\n";
@@ -127,7 +127,7 @@ fn run_workload(
 
     let viewport_warmup = if workload.materialize_viewport {
         let start = Instant::now();
-        let snapshot = session.visible_blocks(ViewportRect::new(0.0, 1.0))?;
+        let snapshot = session.visible_blocks(ViewportSpan::new(0.0, 1.0))?;
         if snapshot.blocks().is_empty() {
             return Err(io::Error::other("viewport warmup returned no blocks").into());
         }
@@ -173,7 +173,7 @@ fn run_workload(
         return Err(io::Error::other("edited session unexpectedly clean").into());
     }
     if workload.materialize_viewport {
-        let snapshot = session.visible_blocks(ViewportRect::new(0.0, 1.0))?;
+        let snapshot = session.visible_blocks(ViewportSpan::new(0.0, 1.0))?;
         if snapshot.revision() != session.revision() {
             return Err(io::Error::other("materialized viewport revision is stale").into());
         }
