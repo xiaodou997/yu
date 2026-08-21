@@ -214,6 +214,8 @@ struct NativeTableResizeAccessibilityDivider: Equatable {
     let columnCount: UInt64
     let rect: CGRect
     let tableSourceRange: NSRange
+    /// VoiceOver 每次增减的列宽步长，由 Rust 按表格行高给出。
+    let adjustStep: CGFloat
 
     init(
         revision: UInt64,
@@ -222,7 +224,8 @@ struct NativeTableResizeAccessibilityDivider: Equatable {
         index: UInt64,
         columnCount: UInt64,
         rect: CGRect,
-        tableSourceRange: NSRange
+        tableSourceRange: NSRange,
+        adjustStep: CGFloat = 8.0
     ) {
         self.revision = revision
         self.blockIndex = blockIndex
@@ -231,6 +234,7 @@ struct NativeTableResizeAccessibilityDivider: Equatable {
         self.columnCount = columnCount
         self.rect = rect
         self.tableSourceRange = tableSourceRange
+        self.adjustStep = adjustStep
     }
 
     init(_ value: YuStorageTableResizeAccessibilityDivider) {
@@ -249,19 +253,7 @@ struct NativeTableResizeAccessibilityDivider: Equatable {
             location: Int(value.table_source_start_utf16),
             length: Int(value.table_source_end_utf16 - value.table_source_start_utf16)
         )
-    }
-}
-struct NativeMacosFontMetrics {
-    let revision: UInt64
-    let size: CGFloat
-    let lineHeight: CGFloat
-    let defaultAdvance: CGFloat
-
-    init(_ value: YuStorageMacosFontMetrics) {
-        revision = value.revision
-        size = CGFloat(value.size)
-        lineHeight = CGFloat(value.line_height)
-        defaultAdvance = CGFloat(value.default_advance)
+        adjustStep = CGFloat(value.adjust_step)
     }
 }
 struct NativeBlockCaret {
@@ -819,25 +811,6 @@ final class StorageBridge {
             throw BridgeError.operation(status)
         }
         return NativeTableResizeCommit(value)
-    }
-
-    func macosFontMetrics(
-        revision: UInt64,
-        size: Float,
-        maxWidth: Float
-    ) throws -> NativeMacosFontMetrics {
-        var value = YuStorageMacosFontMetrics()
-        let status = yu_storage_session_macos_font_metrics(
-            handle,
-            revision,
-            size,
-            maxWidth,
-            &value
-        )
-        guard status == StorageStatus.ok else {
-            throw BridgeError.operation(status)
-        }
-        return NativeMacosFontMetrics(value)
     }
 
     /// 不需要调用方指定 block 的 caret 几何查询。平台不解析 Markdown，
