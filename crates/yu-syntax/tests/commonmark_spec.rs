@@ -82,7 +82,7 @@ fn load_examples() -> Vec<Example> {
 }
 
 fn render(markdown: &str) -> String {
-    let parsed = parse(&markdown).expect("规范用例都很短，不会超出长度上限");
+    let parsed = parse(markdown).expect("规范用例都很短，不会超出长度上限");
     html::render(markdown, parsed.tree())
 }
 
@@ -279,7 +279,7 @@ fn spec_report() {
         if !selected {
             continue;
         }
-        let tree = parse(&example.markdown.as_str())
+        let tree = parse(example.markdown.as_str())
             .expect("短用例")
             .into_tree();
         println!(

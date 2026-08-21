@@ -46,7 +46,7 @@ fn walk(tree: &Tree, from: u32, depth: usize, visit: &mut impl FnMut(&Tree, u32,
 #[test]
 fn ranges_are_ordered_valid_and_within_the_source() {
     for (number, source) in spec_inputs() {
-        let parsed = parse(&source.as_str()).expect("规范用例都很短");
+        let parsed = parse(source.as_str()).expect("规范用例都很短");
         let tree = parsed.tree();
         let len = u32::try_from(source.len()).expect("规范用例都很短");
         assert_eq!(
@@ -103,7 +103,7 @@ fn ranges_are_ordered_valid_and_within_the_source() {
 #[test]
 fn source_is_recoverable_from_positions_alone() {
     for (number, source) in spec_inputs() {
-        let parsed = parse(&source.as_str()).expect("规范用例都很短");
+        let parsed = parse(source.as_str()).expect("规范用例都很短");
         let rebuilt = rebuild(parsed.tree(), 0, &source);
         assert_eq!(
             rebuilt, source,
@@ -153,7 +153,7 @@ fn malformed_input_keeps_its_bytes_and_invents_nothing() {
         "text with \0 nul\n",
     ];
     for source in cases {
-        let parsed = parse(&source).expect("短输入");
+        let parsed = parse(source).expect("短输入");
         assert_eq!(
             rebuild(parsed.tree(), 0, source),
             source,
@@ -163,7 +163,7 @@ fn malformed_input_keeps_its_bytes_and_invents_nothing() {
 
     // 纯文本不该长出语义节点。
     let plain = "just words and numbers 123 across\ntwo lines\n";
-    let parsed = parse(&plain).expect("短输入");
+    let parsed = parse(plain).expect("短输入");
     assert_eq!(parsed.tree().to_sexp(), "Document(Paragraph)");
 }
 
@@ -180,7 +180,7 @@ fn malformed_input_keeps_its_bytes_and_invents_nothing() {
 fn nodes_carry_ranges_not_text() {
     let tree = {
         let owned = String::from("# heading\n\nparagraph with *emphasis*\n");
-        parse(&owned.as_str()).expect("短输入").into_tree()
+        parse(owned.as_str()).expect("短输入").into_tree()
         // `owned` 在这里被释放。
     };
     assert_eq!(tree.kind(), NodeKind::Document);
@@ -188,8 +188,8 @@ fn nodes_carry_ranges_not_text() {
 
     let short = format!("# t\n\n*{}*\n", "a".repeat(8));
     let long = format!("# t\n\n*{}*\n", "a".repeat(8 * 1_000));
-    let short_tree = parse(&short.as_str()).expect("短输入").into_tree();
-    let long_tree = parse(&long.as_str()).expect("长输入").into_tree();
+    let short_tree = parse(short.as_str()).expect("短输入").into_tree();
+    let long_tree = parse(long.as_str()).expect("长输入").into_tree();
     assert_eq!(
         node_count(&short_tree),
         node_count(&long_tree),
@@ -254,7 +254,7 @@ fn syntax_marks_cover_exactly_the_syntax_characters() {
     ];
 
     for (source, expected) in cases {
-        let parsed = parse(source).expect("短输入");
+        let parsed = parse(*source).expect("短输入");
         let mut found: Vec<(NodeKind, &str)> = Vec::new();
         walk(parsed.tree(), 0, 0, &mut |node, from, to, _| {
             if matches!(
