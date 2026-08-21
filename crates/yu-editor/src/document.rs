@@ -57,10 +57,10 @@ impl EditorDocument {
         let markdown = yu_markdown::parse(&snapshot);
         let selection = EditorSelection::cursor(
             &snapshot,
-            snapshot.len_bytes(),
+            yu_core::ByteOffset::ZERO,
             crate::CaretAffinity::Downstream,
         )
-        .expect("the end of a newly created source is a valid caret");
+        .expect("offset zero is always a valid caret");
         Self {
             buffer,
             markdown,
@@ -3059,6 +3059,9 @@ mod tests {
 
         let source = "plain";
         let mut document = EditorDocument::new(source);
+        // 光标显式放到行尾。此前这里依赖「新文档的光标在文末」这个隐含默认，
+        // 而那个默认本身是错的——打开文件应该看到开头。
+        set_caret(&mut document, source.len());
         document
             .execute(EditorCommand::insert_newline())
             .expect("unterminated newline should apply");

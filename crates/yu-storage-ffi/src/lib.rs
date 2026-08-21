@@ -12055,8 +12055,8 @@ mod tests {
         );
         assert_eq!(snapshot.revision, 0);
         assert_eq!(snapshot.number_of_characters_utf16, 11);
-        assert_eq!(snapshot.selection_start_utf16, 11);
-        assert_eq!(snapshot.selection_end_utf16, 11);
+        assert_eq!(snapshot.selection_start_utf16, 0, "新文档的光标落在文首");
+        assert_eq!(snapshot.selection_end_utf16, 0);
         assert_eq!(snapshot.line_count, 3);
         assert_eq!(
             snapshot.selection_affinity,
@@ -12241,7 +12241,14 @@ mod tests {
             YU_STORAGE_OK
         );
         assert_eq!(selection.revision, 0);
-        assert_eq!(selection.start_utf16, 4);
+        assert_eq!(selection.start_utf16, 0, "新文档的光标落在文首");
+        // 后面的 MOVE_LEFT 与 composition 都以「光标在末尾」为前提，显式建立。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection(raw, 0, 4, 4, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+            },
+            YU_STORAGE_OK
+        );
 
         let mut result = YuStorageCommandResult::default();
         assert_eq!(
@@ -12377,6 +12384,13 @@ mod tests {
         let mut raw = ptr::null_mut();
         assert_eq!(
             unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        // 新文档的光标落在文首；这个用例断言的是「在末尾追加」，前提要自己建立。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection(raw, 0, 1, 1, YU_STORAGE_CARET_AFFINITY_DOWNSTREAM)
+            },
             YU_STORAGE_OK
         );
         let mut result = YuStorageCommandResult::default();

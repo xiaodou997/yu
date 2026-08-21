@@ -328,7 +328,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use yu_editor::EditorCommand;
+    use yu_editor::{CaretAffinity, EditorCommand, EditorSelection};
     use yu_storage::{ClosePrompt, ExternalFileState, StorageError};
 
     use super::*;
@@ -416,6 +416,15 @@ mod tests {
         fs::write(path.as_path(), b"source").expect("write fixture");
         let mut workspace = Workspace::new();
         let opened = workspace.open_path(path.as_path()).expect("open fixture");
+        {
+            // 新文档的光标落在文首；这里断言的是「在末尾追加」，前提要自己建立。
+            let session = workspace.tab_mut(opened.id()).expect("tab").session_mut();
+            let snapshot = session.snapshot();
+            let caret =
+                EditorSelection::cursor(&snapshot, snapshot.len_bytes(), CaretAffinity::Downstream)
+                    .expect("caret at end");
+            session.set_selection(caret).expect("caret at end");
+        }
         workspace
             .tab_mut(opened.id())
             .expect("tab")

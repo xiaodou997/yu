@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 use yu_core::{Revision, TextRange, Utf16Offset, Utf16Range};
-use yu_editor::{EditorCommand, ViewportRect};
+use yu_editor::{CaretAffinity, EditorCommand, EditorSelection, ViewportRect};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, CloseStateMachine, CloseTransition, DiskState,
     DocumentEditorSession, DocumentSession, ExternalFileState, RecoveryError, RecoveryOutcome,
@@ -14,6 +14,15 @@ use yu_storage::{
 };
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 把光标移到文末。
+///
+/// 新文档的光标落在文首——打开文件应该看到开头。需要「在末尾追加」这个前提的
+/// 用例必须自己建立它，而不是依赖一个隐含默认。
+fn place_caret_at_end(snapshot: &yu_text::TextSnapshot) -> EditorSelection {
+    EditorSelection::cursor(snapshot, snapshot.len_bytes(), CaretAffinity::Downstream)
+        .expect("the end of a snapshot is a valid caret")
+}
 
 struct TestPath(PathBuf);
 
@@ -125,6 +134,8 @@ fn recovery_round_trip_preserves_source_revision_and_bom() {
     let root = TestDirectory::new("recovery-root");
     let store = RecoveryStore::new(root.as_path());
     let mut session = DocumentEditorSession::open(target.as_path()).expect("open fixture");
+    let caret = place_caret_at_end(&session.snapshot());
+    session.set_selection(caret).expect("caret at end");
     session
         .execute(EditorCommand::insert_text(" + 羽🙂"))
         .expect("edit should succeed");
@@ -226,6 +237,8 @@ fn save_is_atomic_and_reuses_bom_without_changing_editor_revision() {
     fs::write(path.as_path(), bom_bytes("hello")).expect("write fixture");
     let mut session = DocumentSession::open(path.as_path()).expect("open fixture");
     let initial = session.revision();
+    let caret = place_caret_at_end(&session.editor().snapshot());
+    session.set_selection(caret).expect("caret at end");
 
     session
         .execute(EditorCommand::insert_text("🙂"))
@@ -286,6 +299,8 @@ fn symlink_save_updates_target_and_preserves_link_and_permissions() {
         session.storage_path(),
         fs::canonicalize(target.as_path()).expect("canonical target")
     );
+    let caret = place_caret_at_end(&session.editor().snapshot());
+    session.set_selection(caret).expect("caret at end");
     session
         .execute(EditorCommand::insert_text(" edit"))
         .expect("edit symlink target");
@@ -531,6 +546,8 @@ fn unified_session_routes_edit_and_ime_through_one_source_revision() {
     assert_eq!(session.revision(), Revision::INITIAL);
     assert_eq!(session.snapshot().as_str(), "输入: ");
 
+    let caret = place_caret_at_end(&session.snapshot());
+    session.set_selection(caret).expect("caret at end");
     session
         .execute(EditorCommand::insert_text("🙂"))
         .expect("command should use canonical editor");
