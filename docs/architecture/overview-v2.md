@@ -585,7 +585,7 @@ CommonMark 规范用例与 comrak，不是扫描器——拿扫描器当 oracle 
 ### S4 · 中枢
 
 实现 `yu-decoration`（RangeSet + Decoration + map + source↔visual 映射）；
-`yu-state` 收敛编辑状态。**进行中。**
+`yu-state` 收敛编辑状态。**已完成。**
 
 > 本条初版写的是「`yu-state` 收敛 EditorState / Transaction / Facet /
 > History」。四项里有三项要改，理由在下面的「yu-state 收了什么」一节，
@@ -698,7 +698,38 @@ v2 的 reference table 建在装饰阶段，那时才需要选归一化方式。
 `docs/specs/invariants.md` 的 F3 登记，并补了一节说明，免得下一个人再按
 「S4 重新评估」这条线索去找一个不在那里的东西。
 
-**还没做的：** `EditorState`（见上，S5）、`Facet`（见上，S6）。
+**验收逐条核对。**
+
+- 「proptest 验证 decoration 在任意 ChangeSet **序列**下的迁移正确性」——
+  `crates/yu-decoration/tests/map_properties.rs`，512 用例，每例 1~8 步随机
+  编辑**累积**应用（`set = mapped`），每一步都校验三件事：装饰的每一端与
+  同位置的 `TextAnchor` 落在一处、集合结构自洽、记录的文档长度与实际相符。
+  边界语义因此不是另写一套，而是钉在既有的 `ChangeSet::map_anchor` 上。
+- 「source↔visual 双向映射 round-trip 无损」——满足，而且比这条更强。
+  round-trip 是自证性质，所以另有两条 oracle 差分：
+  `projection_differential.rs`（同一组隐藏区间，只比映射）与
+  `decoration_parity.rs`（两条链各自从源码走完，比最终结果）。
+
+**移交给后面阶段的四件事。**
+
+| 事项 | 去向 | 卡在哪 |
+| --- | --- | --- |
+| `EditorState` | S5 | 要等 projections / layouts / viewport 从 `EditorDocument` 挪走 |
+| `Facet` | S6 | 零消费者，配置聚合的需求要等 extension 化 |
+| 删除 `yu-projection` | S6 | `yu-storage-ffi` 有 6 处消费者，替代它们需要 Mark / Line 的真实装饰产出 |
+| 不变量 F3 | S6 | 见上，v2 的 reference table 还不存在 |
+
+第三项是 S4 唯一没能收干净的：第 5.2 节说 decoration 的双向映射「取代 v1 的
+`ProjectionMap`」，现在是两套并存。取代的**能力**已经具备并逐点验证过，
+缺的是把 FFI 那 6 处消费者迁过去，而那需要 S6 的装饰产出器先到位。在那之前
+`yu-decoration → yu-projection` 与 `yu-projection → yu-decoration/yu-syntax`
+两条临时 dev-dep 继续存在，`tools/check-deps.py` 里都写明了存续条件。
+
+**一条不会自己成立的性质。** D2 说装饰集合「可安全并发读取」，在 Rust 里就是
+`Send + Sync`，而它是由字段推导出来的，不是声明出来的。往树里塞一个 `Rc` 或
+`Cell` 做缓存，编译照过、测试全绿，只有把集合发给后台任务时才炸——而那条
+路径此刻还不存在（G1 的后台快照读取要到后面才接），所以没有任何现有测试会
+拦住它。`set.rs` 里一行编译期断言守着，反向验证过。
 
 ### S5 · 布局重写
 
