@@ -24,18 +24,27 @@
 //! `DecorationSet` 的双向映射（不变量 D4「这是投影映射链的唯一实现」），
 //! 让布局也做一遍就会有第二套映射。调用方在拿到布局结果之后自己换算。
 //!
-//! # 断行
+//! # 断行与重排
 //!
-//! 这一版是**按 grapheme 贪心**，与 `LayoutSnapshot` 同算法。UAX #14 的
-//! 断行机会、CJK 禁则与 UAX #9 bidi 是 S5 后续几刀的事；先让新旧两条路在
-//! 同一套规则下逐点可比，把「换了输入契约」与「换了断行算法」分成两次改动。
+//! 断行是 UAX #14（`unicode-linebreak`），在**逻辑**顺序上做；重排是 UAX #9
+//! （`unicode-bidi`）的 L1/L2，在断行**之后**逐行做。顺序不能反：L1 要重置的
+//! 是「行尾」的空白，而哪里是行尾要断完行才知道。
+//!
+//! CJK 禁则不需要另加 tailoring，UAX #14 的默认对表已经覆盖。
+//!
+//! # 这一版还没做的两件事
+//!
+//! - **RTL 段落不右对齐。** 重排给出的是行内的相对顺序，把整行推到
+//!   `max_width` 那一侧是对齐，属于 `LineStyle` 的事。
+//! - **方向变化处只给一个 caret 位置。** 见 [`BlockLayout::caret`]。
 
 use std::ops::Range;
 
+use unicode_bidi::{BidiInfo, Level};
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{CaretAffinity, ClusterMetrics, StyleId, TextAttrs, VisualOffset, VisualRange};
 
-use crate::{LayoutConfig, LayoutError, LayoutPoint};
+use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint};
 
 /// 把 [`StyleId`] 翻译成排版属性。
 ///
@@ -132,6 +141,8 @@ pub struct ClusterBox {
     width: f32,
     style: StyleId,
     line_break: bool,
+    /// UAX #9 的嵌入层级。偶数从左往右，奇数从右往左。
+    level: u8,
 }
 
 impl ClusterBox {
@@ -164,6 +175,39 @@ impl ClusterBox {
     #[must_use]
     pub const fn is_line_break(self) -> bool {
         self.line_break
+    }
+
+    /// UAX #9 的嵌入层级。偶数从左往右，奇数从右往左。
+    #[must_use]
+    pub const fn level(self) -> u8 {
+        self.level
+    }
+
+    /// 这个 grapheme 是不是从右往左排的。
+    ///
+    /// 它决定「视觉左边缘」对应的是这段文字的开头还是结尾——搞反了不会
+    /// panic，只会让光标停在字的另一头。
+    #[must_use]
+    pub const fn is_rtl(self) -> bool {
+        self.level % 2 == 1
+    }
+
+    /// 文字前进方向上的起点（LTR 是左边缘，RTL 是右边缘）。
+    const fn leading_x(self) -> f32 {
+        if self.is_rtl() {
+            self.x + self.width
+        } else {
+            self.x
+        }
+    }
+
+    /// 文字前进方向上的终点。
+    const fn trailing_x(self) -> f32 {
+        if self.is_rtl() {
+            self.x
+        } else {
+            self.x + self.width
+        }
     }
 }
 
@@ -258,6 +302,8 @@ struct Measured {
     mandatory_break: bool,
     /// 全是空白。行尾的空白不参与「排不下」的判断，它们悬在行外。
     space: bool,
+    /// UAX #9 的嵌入层级，取这个 grapheme 第一个字节的层级。
+    level: u8,
 }
 
 /// UAX #14 里构成强制换行的字符。
@@ -286,7 +332,8 @@ impl BlockLayout {
             VisualOffset::try_from(input.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
         validate_runs(input, visual_len)?;
 
-        let measured = measure(input, styles, metrics)?;
+        let bidi = BidiInfo::new(input.text(), base_level(config.base_direction()));
+        let measured = measure(input, styles, metrics, &bidi)?;
         let segment_starts = segment_starts(input.text, &measured)?;
 
         let mut layout = Self {
@@ -328,6 +375,7 @@ impl BlockLayout {
                         width: 0.0,
                         style: cluster.style,
                         line_break: true,
+                        level: cluster.level,
                     });
                     layout.push_line(&cursor, cluster.visual.end())?;
                     cursor = layout.next_line(&cursor, cluster.visual.end());
@@ -350,6 +398,7 @@ impl BlockLayout {
                     width: cluster.advance,
                     style: cluster.style,
                     line_break: false,
+                    level: cluster.level,
                 });
                 cursor.width += cluster.advance;
                 last_was_break = false;
@@ -368,6 +417,7 @@ impl BlockLayout {
                 empty,
             )?;
         }
+        layout.reorder_for_bidi(input.text(), &bidi)?;
         Ok(layout)
     }
 
@@ -405,7 +455,16 @@ impl BlockLayout {
     /// `docs/specs/coordinates.md`）。
     ///
     /// 落在一个 grapheme **内部**的偏移不是合法的 caret 位置，返回该 grapheme
-    /// 的左边缘。
+    /// 前进方向上的起点。
+    ///
+    /// # 方向变化处只给一个位置
+    ///
+    /// 方向变化处的一个视觉偏移在几何上对应**两个**位置：前一段的后沿与
+    /// 后一段的前沿。这里按 UAX #9 §3.4 的做法取**层级更低**（更接近段落
+    /// 基准方向）的那一侧。于是边界两侧的两个几何位置分别归属两个不同的
+    /// 偏移，都够得着；代价是同一个偏移的另一个位置画不出来。要两个都给，
+    /// caret 得再带一个方向参数，那是独立的一件事，见 overview-v2 §8 S5 的
+    /// 登记。
     pub fn caret(
         &self,
         visual: VisualOffset,
@@ -416,18 +475,25 @@ impl BlockLayout {
         }
         let line_index = self.line_for_visual(visual, affinity);
         let line = &self.lines[line_index];
-        // 行内没有簇时 `width` 就是 0，循环不跑，x 自然落在行首。
-        let mut x = line.width;
+        // 行内没有簇时循环不跑，x 落在行首。
+        let mut before = None;
+        let mut after = None;
+        let mut inside = None;
         for index in line.clusters.clone() {
             let cluster = self.clusters[index];
-            // 落在簇左边缘或簇**内部**都取左边缘：grapheme 内部不是合法的
-            // caret 位置，往右靠会把光标画进一个字里。
-            if visual < cluster.visual.end() {
-                x = cluster.x;
-                break;
+            if cluster.visual.end() == visual {
+                before = Some(cluster);
             }
-            x = cluster.x + cluster.width;
+            // 换行符不提供「它之前」那个位置：那个位置由行内最后一个文字
+            // grapheme 的后沿给出，与它自己的方向无关。
+            if cluster.visual.start() == visual && !cluster.line_break {
+                after = Some(cluster);
+            }
+            if cluster.visual.start() < visual && visual < cluster.visual.end() {
+                inside = Some(cluster);
+            }
         }
+        let x = caret_x(before, after, inside);
         Ok(CaretBox {
             visual,
             line: line_index,
@@ -436,38 +502,126 @@ impl BlockLayout {
     }
 
     /// 一个 block 局部坐标点落在哪个视觉偏移上。
+    ///
+    /// 取离该点最近的一个**caret 位置**，而不是最近的一条 grapheme 边缘。
+    /// 两者在 LTR 下一样，在重排过的行里不一样：方向变化处两条边缘落在同一个
+    /// x 上，而其中只有一条是 [`BlockLayout::caret`] 画得出来的。取边缘会让
+    /// 「点一下，光标跳到别处」——不 panic、不报错，只是不听话。
     pub fn hit(&self, point: LayoutPoint) -> Result<CaretBox, LayoutError> {
         let line_index = self.line_for_y(point.y());
         let line = &self.lines[line_index];
-        let mut visual = line.visual.start();
-        let mut x = line.width;
-
-        if point.x() <= 0.0 {
-            x = 0.0;
-        } else {
-            for index in line.clusters.clone() {
-                let cluster = self.clusters[index];
-                if cluster.line_break {
-                    continue;
+        let target = point.x().clamp(0.0, line.width);
+        let mut best: Option<(f32, f32, VisualOffset)> = None;
+        for (x, offset) in self.caret_positions(line) {
+            let distance = (x - target).abs();
+            // 打平时取更靠右那个，与 v1 的「过了中点算下一个」一致。
+            let better = match best {
+                None => true,
+                Some((best_distance, best_x, _)) => {
+                    distance < best_distance || (distance == best_distance && x > best_x)
                 }
-                if point.x() < cluster.x + cluster.width / 2.0 {
-                    visual = cluster.visual.start();
-                    x = cluster.x;
-                    break;
-                }
-                visual = cluster.visual.end();
-                x = cluster.x + cluster.width;
-            }
-            if point.x() >= line.width {
-                visual = self.line_content_visual_end(line);
-                x = line.width;
+            };
+            if better {
+                best = Some((distance, x, offset));
             }
         }
+        let (x, visual) = best.map_or((0.0, line.visual.start()), |(_, x, offset)| (x, offset));
         Ok(CaretBox {
             visual,
             line: line_index,
             point: LayoutPoint::new(x, line.y),
         })
+    }
+
+    /// 一行里所有 caret 位置，按逻辑顺序。
+    ///
+    /// 与 [`BlockLayout::caret`] 用同一条规则（[`caret_x`]），所以
+    /// `caret(hit(p).visual())` 一定回到 `hit(p)` 的位置。两处各写一遍规则
+    /// 就会在方向变化处对不上。
+    fn caret_positions(&self, line: &LineBox) -> Vec<(f32, VisualOffset)> {
+        let mut positions = Vec::new();
+        let mut before: Option<ClusterBox> = None;
+        for index in line.clusters.clone() {
+            let cluster = self.clusters[index];
+            if !cluster.line_break {
+                let matching = before.filter(|prev| prev.visual.end() == cluster.visual.start());
+                positions.push((
+                    caret_x(matching, Some(cluster), None),
+                    cluster.visual.start(),
+                ));
+            }
+            before = Some(cluster);
+        }
+        // 行末那个位置由最后一个**文字** grapheme 的后沿给出：换行符的
+        // 后沿属于下一行的行首。
+        if let Some(last) = line
+            .clusters
+            .clone()
+            .map(|index| self.clusters[index])
+            .rfind(|cluster| !cluster.line_break)
+        {
+            positions.push((caret_x(Some(last), None, None), last.visual.end()));
+        }
+        positions
+    }
+
+    /// UAX #9 的 L1/L2：按行把 level run 重排成视觉顺序，重新分配 x。
+    ///
+    /// 断行本身在**逻辑**顺序上做（UAX #14 就是这么定义的），重排在断行之后
+    /// 逐行做。簇仍然按逻辑顺序存放，只有 `x` 变了——视觉区间保持升序，
+    /// 上层按偏移查找的代码因此不需要知道有没有发生重排。
+    fn reorder_for_bidi(&mut self, text: &str, bidi: &BidiInfo<'_>) -> Result<(), LayoutError> {
+        if !bidi.has_rtl() {
+            return Ok(());
+        }
+        for line_index in 0..self.lines.len() {
+            let line = self.lines[line_index].clone();
+            if line.clusters.is_empty() {
+                continue;
+            }
+            let from = usize::try_from(line.visual.start().get())
+                .map_err(|_| LayoutError::OffsetOverflow)?;
+            let to = usize::try_from(line.visual.end().get())
+                .map_err(|_| LayoutError::OffsetOverflow)?;
+            if from >= to || from >= text.len() {
+                continue;
+            }
+            let paragraph = bidi
+                .paragraphs
+                .iter()
+                .find(|paragraph| paragraph.range.contains(&from))
+                .ok_or(LayoutError::OffsetOverflow)?;
+            let (levels, runs) = bidi.visual_runs(paragraph, from..to.min(paragraph.range.end));
+
+            let mut x = 0.0_f32;
+            for run in runs {
+                let rtl = levels[run.start].is_rtl();
+                let mut indices: Vec<usize> = line
+                    .clusters
+                    .clone()
+                    .filter(|index| {
+                        let start = self.clusters[*index].visual.start().get() as usize;
+                        run.contains(&start)
+                    })
+                    .collect();
+                if rtl {
+                    indices.reverse();
+                }
+                for index in indices {
+                    self.clusters[index].x = x;
+                    x += self.clusters[index].width;
+                }
+            }
+            // 落在段落之外的簇（行尾的强制换行符）留在行末。
+            for index in line.clusters.clone() {
+                let start = self.clusters[index].visual.start().get() as usize;
+                if start >= to.min(paragraph.range.end) {
+                    self.clusters[index].x = x;
+                    x += self.clusters[index].width;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn next_line(&self, cursor: &LineCursor, visual_start: VisualOffset) -> LineCursor {
@@ -520,21 +674,6 @@ impl BlockLayout {
         }
         self.lines.len().saturating_sub(1)
     }
-
-    fn line_content_visual_end(&self, line: &LineBox) -> VisualOffset {
-        line.clusters
-            .clone()
-            .rev()
-            .map(|index| self.clusters[index])
-            .find_map(|cluster| {
-                if cluster.line_break {
-                    None
-                } else {
-                    Some(cluster.visual.end())
-                }
-            })
-            .unwrap_or(line.visual.start())
-    }
 }
 
 /// 第一遍：把每个 run 切成 grapheme 并量出宽度。
@@ -542,6 +681,7 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
     input: LayoutInput<'_>,
     styles: &T,
     metrics: &M,
+    bidi: &BidiInfo<'_>,
 ) -> Result<Vec<Measured>, LayoutError> {
     let mut measured = Vec::new();
     for run in input.runs() {
@@ -578,6 +718,7 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
                 advance,
                 mandatory_break,
                 space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
+                level: bidi.levels[start + local].number(),
             });
         }
     }
@@ -616,6 +757,39 @@ fn segment_starts(text: &str, measured: &[Measured]) -> Result<Vec<usize>, Layou
     Ok(starts)
 }
 
+/// caret 的 x：给定「终点落在这里的簇」与「起点落在这里的簇」，选哪一侧。
+///
+/// 两侧方向相同时两个位置重合，选谁都一样。方向不同时按 UAX #9 §3.4 取
+/// **层级更低**的那一侧，也就是更接近段落基准方向的那一段。这样边界两侧的
+/// 两个几何位置分别归属两个不同的偏移，点得到也画得出。
+fn caret_x(
+    before: Option<ClusterBox>,
+    after: Option<ClusterBox>,
+    inside: Option<ClusterBox>,
+) -> f32 {
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            if before.level <= after.level {
+                before.trailing_x()
+            } else {
+                after.leading_x()
+            }
+        }
+        (Some(before), None) => before.trailing_x(),
+        (None, Some(after)) => after.leading_x(),
+        (None, None) => inside.map_or(0.0, ClusterBox::leading_x),
+    }
+}
+
+/// 把配置里的基准方向翻译成 UAX #9 的段落层级。`None` 表示按 P2/P3 推断。
+fn base_level(direction: BaseDirection) -> Option<Level> {
+    match direction {
+        BaseDirection::Auto => None,
+        BaseDirection::Ltr => Some(Level::ltr()),
+        BaseDirection::Rtl => Some(Level::rtl()),
+    }
+}
+
 /// runs 必须无缝铺满视觉文本，且每个边界都在 UTF-8 字符边界上。
 fn validate_runs(input: LayoutInput<'_>, visual_len: VisualOffset) -> Result<(), LayoutError> {
     let mut expected = VisualOffset::ZERO;
@@ -646,7 +820,7 @@ fn validate_runs(input: LayoutInput<'_>, visual_len: VisualOffset) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::{BlockLayout, LayoutInput, StyleTable, StyledRun, UniformStyleTable};
-    use crate::{LayoutConfig, LayoutError, LayoutPoint, MonospaceMetrics};
+    use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint, MonospaceMetrics};
     use yu_core::{CaretAffinity, StyleId, TextAttrs, TextStyle, VisualOffset, VisualRange};
 
     fn visual(start: u64, end: u64) -> VisualRange {
@@ -933,6 +1107,314 @@ mod tests {
                 text[from..to].chars().count() == 3,
                 "每一行应当正好是一个完整的 ZWJ 序列"
             );
+        }
+    }
+
+    fn build_with(text: &str, width: f32, direction: BaseDirection) -> BlockLayout {
+        BlockLayout::build(
+            LayoutInput::new(text, &plain(text)),
+            LayoutConfig::new(width, 1.0).with_base_direction(direction),
+            &UniformStyleTable::default(),
+            &MonospaceMetrics::default(),
+        )
+        .expect("布局")
+    }
+
+    /// 一行里每个 grapheme 占的 x 区间，按视觉从左到右排。
+    fn visual_order(layout: &BlockLayout, text: &str, line: usize) -> Vec<String> {
+        let mut boxes: Vec<_> = layout.lines()[line]
+            .cluster_range()
+            .map(|index| layout.clusters()[index])
+            .filter(|cluster| !cluster.is_line_break())
+            .collect();
+        boxes.sort_by(|a, b| a.x().partial_cmp(&b.x()).expect("有限"));
+        boxes
+            .iter()
+            .map(|cluster| {
+                let from = cluster.visual().start().get() as usize;
+                let to = cluster.visual().end().get() as usize;
+                text[from..to].to_owned()
+            })
+            .collect()
+    }
+
+    /// UAX #9 的 L2：RTL 段落里的字从右往左排。
+    #[test]
+    fn rtl_text_is_reordered_right_to_left() {
+        let text = "\u{5e9}\u{5dc}\u{5d5}\u{5dd}";
+        let layout = build_with(text, 80.0, BaseDirection::Auto);
+        assert!(layout.clusters().iter().all(|cluster| cluster.is_rtl()));
+        assert_eq!(
+            visual_order(&layout, text, 0),
+            ["\u{5dd}", "\u{5d5}", "\u{5dc}", "\u{5e9}"],
+            "视觉从左到右读到的应当是逻辑顺序的倒序"
+        );
+    }
+
+    /// LTR 段落里嵌一段 RTL：只有那一段就地翻转，两侧的拉丁字母不动。
+    #[test]
+    fn an_rtl_run_inside_ltr_flips_in_place() {
+        let text = "abc \u{5e9}\u{5dc}\u{5d5}\u{5dd} def";
+        let layout = build_with(text, 80.0, BaseDirection::Auto);
+        assert_eq!(
+            visual_order(&layout, text, 0),
+            [
+                "a", "b", "c", " ", "\u{5dd}", "\u{5d5}", "\u{5dc}", "\u{5e9}", " ", "d", "e", "f"
+            ]
+        );
+    }
+
+    /// RTL 段落里嵌一段 LTR：整行翻转，而那一段拉丁字母内部仍然从左往右。
+    /// 层级 2 是 UAX #9 的 I1——搞成 1 会把 "abc" 画成 "cba"。
+    #[test]
+    fn an_ltr_run_inside_rtl_keeps_its_own_order() {
+        let text = "\u{5e9}\u{5dc} abc \u{5d5}\u{5dd}";
+        let layout = build_with(text, 80.0, BaseDirection::Auto);
+        assert_eq!(
+            visual_order(&layout, text, 0),
+            [
+                "\u{5dd}", "\u{5d5}", " ", "a", "b", "c", " ", "\u{5dc}", "\u{5e9}"
+            ]
+        );
+        let latin: Vec<u8> = layout
+            .clusters()
+            .iter()
+            .filter(|cluster| {
+                let from = cluster.visual().start().get() as usize;
+                text[from..].starts_with(['a', 'b', 'c'])
+            })
+            .map(|cluster| cluster.level())
+            .collect();
+        assert_eq!(latin, [2, 2, 2]);
+    }
+
+    /// 基准方向可以被显式指定，不必等内容里出现强方向字符。
+    /// 纯拉丁文本在 RTL 段落里层级是 2，不是 0。
+    #[test]
+    fn base_direction_overrides_the_p2_p3_guess() {
+        let auto = build_with("abc", 80.0, BaseDirection::Auto);
+        let forced = build_with("abc", 80.0, BaseDirection::Rtl);
+        assert!(auto.clusters().iter().all(|cluster| cluster.level() == 0));
+        assert!(forced.clusters().iter().all(|cluster| cluster.level() == 2));
+    }
+
+    /// RTL 上下文里的数字仍然从左往右（UAX #9 的 W2/I1 把它们放到层级 2）。
+    /// 反过来会把电话号码和年份画反，而且不报错。
+    #[test]
+    fn european_numbers_stay_ltr_inside_rtl() {
+        let text = "\u{5e9}\u{5dc} 12";
+        let layout = build_with(text, 80.0, BaseDirection::Auto);
+        assert_eq!(
+            visual_order(&layout, text, 0),
+            ["1", "2", " ", "\u{5dc}", "\u{5e9}"]
+        );
+    }
+
+    /// 重排只换位置，不改宽度：每一行的 grapheme 必须严丝合缝地铺满
+    /// `[0, line.width)`，既不重叠也不留缝。一个错位的重排会让两个字画在
+    /// 同一处，而它不 panic、不报错。
+    #[test]
+    fn reordering_tiles_every_line_exactly_once() {
+        let cases = [
+            ("\u{5e9}\u{5dc}\u{5d5}\u{5dd} abc \u{5d0}\u{5d1} 12 xy", 5.0),
+            (
+                "\u{5e9}\u{5dc}\u{5d5}\u{5dd} abc \u{5d0}\u{5d1} 12 xy",
+                80.0,
+            ),
+            ("abc \u{5e9}\u{5dc}\n\u{5d5}\u{5dd} def", 4.0),
+            (
+                "\u{5e9}\u{5dc}\u{5d5}\u{5dd}\u{5e9}\u{5dc}\u{5d5}\u{5dd}",
+                3.0,
+            ),
+        ];
+        for (text, width) in cases {
+            let layout = build_with(text, width, BaseDirection::Auto);
+            for line in layout.lines() {
+                let mut spans: Vec<(f32, f32)> = line
+                    .cluster_range()
+                    .map(|index| layout.clusters()[index])
+                    .filter(|cluster| !cluster.is_line_break())
+                    .map(|cluster| (cluster.x(), cluster.x() + cluster.width()))
+                    .collect();
+                spans.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("有限"));
+                let mut expected = 0.0_f32;
+                for (from, to) in &spans {
+                    assert_eq!(
+                        *from,
+                        expected,
+                        "{text:?} @ {width} 第 {} 行有重叠或空隙",
+                        line.index()
+                    );
+                    expected = *to;
+                }
+                assert_eq!(
+                    expected,
+                    line.width(),
+                    "{text:?} @ {width} 第 {} 行铺出来的宽度与行宽不符",
+                    line.index()
+                );
+            }
+        }
+    }
+
+    /// UAX #9 的 L1 是**逐行**的：行尾的空白要重置成段落层级。
+    ///
+    /// LTR 段落里 `"abc \u{5e9}\u{5dc} \u{5d3}\u{5d1} def"` 的两个希伯来词
+    /// 之间那个空格层级是 1，跟着 RTL 一起翻转；可一旦它落在**行尾**，
+    /// L1 把它重置回层级 0，于是它排到行的最右边而不是留在翻转的那一段里。
+    /// 把整段一次性重排（而不是逐行）就会漏掉这一步，空格会画在词的左边。
+    #[test]
+    fn line_trailing_whitespace_is_reset_to_the_paragraph_level() {
+        let text = "abc \u{5e9}\u{5dc} \u{5d3}\u{5d1} def";
+        let layout = build_with(text, 6.0, BaseDirection::Auto);
+        assert_eq!(layout.lines().len(), 2);
+        assert_eq!(
+            visual_order(&layout, text, 0),
+            ["a", "b", "c", " ", "\u{5dc}", "\u{5e9}", " "],
+            "行尾空格排在最右，不在翻转的那一段里"
+        );
+        assert_eq!(
+            visual_order(&layout, text, 1),
+            ["\u{5d1}", "\u{5d3}", " ", "d", "e", "f"]
+        );
+    }
+
+    /// 重排是**逐行**做的（UAX #9 的 L1/L2 在断行之后）。整块一起翻转会让
+    /// 第二行的内容跑到第一行的位置上。
+    #[test]
+    fn reordering_happens_per_visual_line() {
+        let text = "\u{5e9}\u{5dc}\u{5d5}\u{5dd}\u{5d0}\u{5d1}";
+        let layout = build_with(text, 3.0, BaseDirection::Auto);
+        assert_eq!(layout.lines().len(), 2);
+        // 第一行是逻辑上前三个字，倒着排；第二行是后三个，也倒着排。
+        assert_eq!(
+            visual_order(&layout, text, 0),
+            ["\u{5d5}", "\u{5dc}", "\u{5e9}"]
+        );
+        assert_eq!(
+            visual_order(&layout, text, 1),
+            ["\u{5d1}", "\u{5d0}", "\u{5dd}"]
+        );
+    }
+
+    /// hit-test 取最近的一条 grapheme 边缘。重排之后簇的 x 不再随逻辑顺序
+    /// 递增，「从左往右扫到第一个越过中点的」会给出错的答案。
+    ///
+    /// 方向变化处两条边缘**落在同一个 x 上**（前一段的后沿与后一段的前沿）。
+    /// 这时取逻辑上在前的那一个，与 [`BlockLayout::caret`] 的选择一致——
+    /// 两边不一致的话，点一下光标就会跳到另一处。这条用例压的正是这个一致性。
+    #[test]
+    fn hit_test_finds_the_nearest_edge_after_reordering() {
+        let text = "abc \u{5e9}\u{5dc}\u{5d5}\u{5dd} def";
+        let layout = build_with(text, 80.0, BaseDirection::Auto);
+        let mut checked = 0_usize;
+        for cluster in layout.clusters() {
+            for x in [cluster.x(), cluster.x() + cluster.width()] {
+                let hit = layout.hit(LayoutPoint::new(x, 0.0)).expect("hit");
+                assert_eq!(hit.point().x(), x, "命中点应当落在那条边上");
+                let caret = layout
+                    .caret(hit.visual(), CaretAffinity::Downstream)
+                    .expect("caret");
+                assert_eq!(
+                    caret.point(),
+                    hit.point(),
+                    "x={x} 命中到 {:?} 之后，caret 应当回到同一处",
+                    hit.visual()
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 24);
+
+        // 不含歧义的一条：RTL 段落中间某个字的左边缘是它逻辑上的**终点**。
+        let hit = layout.hit(LayoutPoint::new(6.0, 0.0)).expect("hit");
+        assert_eq!(hit.visual(), VisualOffset::new(8));
+    }
+
+    /// 方向变化处两侧各有一个几何位置。取层级更低（更接近段落基准方向）
+    /// 的那一侧之后，两个位置分别归属两个不同的偏移，都够得着。
+    ///
+    /// 换成「一律取逻辑上在前那个的后沿」会让两个偏移都落在同一处，
+    /// 于是 RTL 段落右端那个位置画不出来也点不到——不 panic，只是光标不听话。
+    #[test]
+    fn caret_at_a_direction_boundary_follows_the_base_direction_side() {
+        let text = "abc \u{5e9}\u{5dc}\u{5d5}\u{5dd} def";
+        let layout = build_with(text, 80.0, BaseDirection::Auto);
+        // 偏移 4：左边是层级 0 的空格，右边是层级 1 的 \u{5e9}。取层级低的
+        // 那侧，也就是空格的后沿。
+        assert_eq!(
+            layout
+                .caret(VisualOffset::new(4), CaretAffinity::Downstream)
+                .expect("caret")
+                .point(),
+            LayoutPoint::new(4.0, 0.0)
+        );
+        // 偏移 12：左边是层级 1 的 \u{5dd}，右边是层级 0 的空格。同样取层级低
+        // 的那侧——空格的前沿，也就是希伯来文那一段的右端。
+        assert_eq!(
+            layout
+                .caret(VisualOffset::new(12), CaretAffinity::Downstream)
+                .expect("caret")
+                .point(),
+            LayoutPoint::new(8.0, 0.0)
+        );
+    }
+
+    /// RTL 行的行首 caret 在**右**边缘。这是「前进方向上的起点」与
+    /// 「左边缘」不是一回事的最小例子——两者搞混不 panic，只是光标画在
+    /// 整段文字的另一头。
+    #[test]
+    fn caret_at_the_start_of_an_rtl_line_sits_on_the_right() {
+        let text = "\u{5e9}\u{5dc}\u{5d5}\u{5dd}";
+        let layout = build_with(text, 80.0, BaseDirection::Auto);
+        assert_eq!(layout.lines()[0].width(), 4.0);
+        let start = layout
+            .caret(VisualOffset::ZERO, CaretAffinity::Downstream)
+            .expect("caret");
+        assert_eq!(start.point(), LayoutPoint::new(4.0, 0.0), "逻辑起点在最右");
+        let end = layout
+            .caret(VisualOffset::new(8), CaretAffinity::Downstream)
+            .expect("caret");
+        assert_eq!(end.point(), LayoutPoint::new(0.0, 0.0), "逻辑终点在最左");
+    }
+
+    /// caret 与 hit-test 必须用同一条规则。分别实现一遍，在方向变化处就会
+    /// 对不上：点一下，光标跳到别处。
+    ///
+    /// 软换行边界上的偏移在两行各有一个位置，由 affinity 选。所以这里要求的
+    /// 是**存在**一个 affinity，让 caret 回到 hit 给出的那一行的同一个 x——
+    /// 调用方本来就该用 hit 返回的行去定 affinity。
+    #[test]
+    fn every_caret_position_is_reachable_by_hit_test() {
+        for (text, width) in [
+            ("abc \u{5e9}\u{5dc}\u{5d5}\u{5dd} def", 80.0),
+            ("\u{5e9}\u{5dc} abc \u{5d5}\u{5dd}", 80.0),
+            ("\u{5e9}\u{5dc}\u{5d5}\u{5dd} 12 abc", 5.0),
+            ("abc \u{5e9}\u{5dc}\n\u{5d5}\u{5dd} def", 4.0),
+        ] {
+            let layout = build_with(text, width, BaseDirection::Auto);
+            for line in layout.lines() {
+                for (x, offset) in layout.caret_positions(line) {
+                    let hit = layout.hit(LayoutPoint::new(x, line.y())).expect("hit");
+                    assert_eq!(
+                        hit.point(),
+                        LayoutPoint::new(x, line.y()),
+                        "{text:?} @ {width} 的 caret 位置 x={x}（偏移 {offset:?}）点不回原处"
+                    );
+                    let reachable = [CaretAffinity::Upstream, CaretAffinity::Downstream]
+                        .into_iter()
+                        .any(|affinity| {
+                            let caret = layout.caret(hit.visual(), affinity).expect("caret");
+                            caret.line() == hit.line() && caret.point() == hit.point()
+                        });
+                    assert!(
+                        reachable,
+                        "{text:?} @ {width} 命中到 {:?} 之后，两种 affinity 都回不到 {:?}",
+                        hit.visual(),
+                        hit.point()
+                    );
+                }
+            }
         }
     }
 
