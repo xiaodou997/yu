@@ -606,6 +606,18 @@ oracle 回答，所以先把 `yu-syntax → yu-markdown → yu-decoration` 这�
 - **隐藏区间的差分**（`crates/yu-projection/tests/decoration_parity.rs`）。
   回答上一条刻意回避的另一半：**`yu-syntax` 的标记节点范围能不能真的驱动
   「隐藏语法」？** 76 份语料，答案是能，而且没有一条是 `yu-syntax` 错。
+- **分层合并**（D6，`DecorationSet::merge`）。第 5.2 节第 4 条要求多个
+  extension 各自产出集合、合并顺序确定。定序键早就是全序的，缺的是入口和
+  一个真实的多 extension 消费者。后者由把 `yu-markdown` 的产出器拆成
+  emphasis 与 code 两个独立 extension 提供——`` *`a`* `` 产出的四条区间分属
+  两个集合且彼此相邻，正好压到跨集合的相邻隐藏区间合并。
+
+  这里有一个要说明白的边界：两个产出器**共用同一个遍历**，所以「拆开再合并
+  等于不拆」在产出侧几乎是恒真的，拿它当拆分的验证会是一条什么都没测的
+  测试。它压的是 `merge`。而 `merge` 内部调用 `DecorationSet::new`，所以
+  `new` 自身的 bug 两条路会一起错——合并路径因此也接上了 v1 这个外部
+  oracle（`decoration_parity` 两条路都跑）。反向验证过：把相邻合并改成只合
+  重叠，8 条测试红，其中就有 v1 差分那几条。
 
 **关于「拿扫描器当 oracle」。** 上一节 S3 的末尾写着「拿扫描器当 oracle
 只会把它的非规范行为固化成期望」，这里看起来是反过来做了。区别在于比的是

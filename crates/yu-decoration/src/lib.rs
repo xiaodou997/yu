@@ -24,4 +24,4 @@ mod set;
 
 pub use decoration::{Decoration, DecorationRange, LineStyleId, StyleId, WidgetId, WidgetSide};
 pub use hidden::Bias;
-pub use set::{DecorationSet, MapError};
+pub use set::{DecorationSet, MapError, MergeError};

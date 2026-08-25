@@ -32,8 +32,53 @@ use yu_syntax::{NodeKind, Tree};
 #[must_use]
 pub fn inline_syntax_decorations(tree: &Tree) -> Vec<DecorationRange> {
     let mut out = Vec::new();
-    collect(tree, 0, &mut out);
+    collect(tree, 0, hides, &mut out);
     out
+}
+
+/// 只隐藏强调的定界符。**一个 extension 的产出。**
+///
+/// 与 [`code_decorations`] 一起构成 [`inline_syntax_decorations`] 的全部内容，
+/// 但两者是各自独立遍历树得出的，谁都不知道对方存在——第 4.3 节与不变量 D6
+/// 要求的就是这个。S6 会把每一种语法都变成这个形状。
+#[must_use]
+pub fn emphasis_decorations(tree: &Tree) -> Vec<DecorationRange> {
+    let mut out = Vec::new();
+    collect(
+        tree,
+        0,
+        |kind| matches!(kind, NodeKind::EmphasisMark),
+        &mut out,
+    );
+    out
+}
+
+/// 只隐藏行内代码与围栏的定界符。**另一个 extension 的产出。**
+#[must_use]
+pub fn code_decorations(tree: &Tree) -> Vec<DecorationRange> {
+    let mut out = Vec::new();
+    collect(tree, 0, |kind| matches!(kind, NodeKind::CodeMark), &mut out);
+    out
+}
+
+/// 上面两个 extension 各自的产出，各装进一个绑定 revision 的集合。
+///
+/// 交给 [`DecorationSet::merge`] 就得到与 [`inline_syntax_decoration_set`]
+/// 相同的结果。两条路都留着是有原因的，见 `tests/extension_merge.rs`：
+/// 它们**共用同一个 `collect`**，所以「拆开再合并等于不拆」这件事本身几乎
+/// 是恒真的，那条测试真正压的是 `merge`——强调与代码的区间在真实文档里是
+/// 交错的（`` *`a`* `` 就是 Emphasis/Code/Code/Emphasis），合并要把它们正确
+/// 定序并把相邻的隐藏区间接起来。
+#[must_use]
+pub fn extension_decoration_sets(
+    revision: Revision,
+    source_len: ByteOffset,
+    tree: &Tree,
+) -> Vec<DecorationSet> {
+    vec![
+        DecorationSet::new(revision, source_len, emphasis_decorations(tree)),
+        DecorationSet::new(revision, source_len, code_decorations(tree)),
+    ]
 }
 
 /// 把上面的产出装进一个绑定 revision 的集合。
@@ -50,7 +95,12 @@ pub fn inline_syntax_decoration_set(
     DecorationSet::new(revision, source_len, inline_syntax_decorations(tree))
 }
 
-fn collect(tree: &Tree, from: u32, out: &mut Vec<DecorationRange>) {
+fn collect(
+    tree: &Tree,
+    from: u32,
+    hides: impl Fn(NodeKind) -> bool + Copy,
+    out: &mut Vec<DecorationRange>,
+) {
     if hides(tree.kind())
         && let Some(range) = TextRange::new(
             ByteOffset::from(from),
@@ -65,7 +115,7 @@ fn collect(tree: &Tree, from: u32, out: &mut Vec<DecorationRange>) {
         let Some((child, position)) = tree.child(index) else {
             break;
         };
-        collect(child, from + position, out);
+        collect(child, from + position, hides, out);
     }
 }
 

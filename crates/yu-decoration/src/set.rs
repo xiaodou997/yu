@@ -35,6 +35,37 @@ impl core::fmt::Display for MapError {
 
 impl core::error::Error for MapError {}
 
+/// [`DecorationSet::merge`] 失败的原因。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MergeError {
+    /// 参与合并的某个集合属于另一个 Revision。
+    RevisionMismatch { expected: Revision, found: Revision },
+    /// 参与合并的某个集合看到的源码长度不同。
+    ///
+    /// 不取 max 也不截断：长度不同意味着两个 extension 看的是不同的文档，
+    /// 它们的 offset 不可比。合并会得到一份看起来正常、位置全错的集合——
+    /// 正是这个项目最危险的那类失败。
+    SourceLenMismatch {
+        expected: ByteOffset,
+        found: ByteOffset,
+    },
+}
+
+impl core::fmt::Display for MergeError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RevisionMismatch { expected, found } => {
+                write!(formatter, "要合并 {expected:?}，遇到 {found:?}")
+            }
+            Self::SourceLenMismatch { expected, found } => {
+                write!(formatter, "源码长度应为 {expected:?}，遇到 {found:?}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for MergeError {}
+
 /// 一份 revision 的全部装饰。
 ///
 /// 不可变、可克隆（克隆是 `Arc` 克隆）、可安全并发读取——不变量 D2。
@@ -73,6 +104,49 @@ impl DecorationSet {
             ranges: ranges.into(),
             hidden: index,
         }
+    }
+
+    /// 合并多个 extension 各自产出的集合（不变量 D6）。
+    ///
+    /// # 为什么不是「把所有 `DecorationRange` 收集起来调 [`DecorationSet::new`]」
+    ///
+    /// 因为 D6 的要点是每个 extension 的产出是一个**独立的单位**：可以单独
+    /// 缓存、单独重算、单独失效。把它们摊平成一个 range 列表就丢掉了这个边界，
+    /// 于是「只有强调的规则变了」也得让所有 extension 重跑一遍。借用而不是
+    /// 取所有权也是这个理由——调用方要留着各自的产出。
+    ///
+    /// 合并结果与 `sets` 的先后无关：定序键 [`DecorationRange::order_key`]
+    /// 是全序且只依赖装饰自身的值。extension 之间因此不需要相互感知。
+    ///
+    /// `revision` 与 `source_len` 显式传入而不是从第一个集合里取：空输入
+    /// 也要有确定的结果，而且从输入里推断会让「所有集合都错但彼此一致」
+    /// 这种情况静静通过。
+    ///
+    /// # Errors
+    ///
+    /// 任一集合的 Revision 或源码长度与给定的不符。
+    pub fn merge<'a>(
+        revision: Revision,
+        source_len: ByteOffset,
+        sets: impl IntoIterator<Item = &'a Self>,
+    ) -> Result<Self, MergeError> {
+        let mut ranges = Vec::new();
+        for set in sets {
+            if set.revision != revision {
+                return Err(MergeError::RevisionMismatch {
+                    expected: revision,
+                    found: set.revision,
+                });
+            }
+            if set.source_len != source_len {
+                return Err(MergeError::SourceLenMismatch {
+                    expected: source_len,
+                    found: set.source_len,
+                });
+            }
+            ranges.extend_from_slice(&set.ranges);
+        }
+        Ok(Self::new(revision, source_len, ranges))
     }
 
     #[must_use]
@@ -255,7 +329,7 @@ const _: fn(Decoration) -> bool = Decoration::hides_source;
 
 #[cfg(test)]
 mod tests {
-    use super::{DecorationSet, MapError};
+    use super::{DecorationSet, MapError, MergeError};
     use crate::decoration::{Decoration, DecorationRange, StyleId, WidgetId, WidgetSide};
     use crate::hidden::Bias;
     use yu_core::{ByteOffset, Revision, TextRange, VisualOffset};
@@ -297,6 +371,95 @@ mod tests {
         assert_eq!(
             decorations.visual_to_source(visual(0), Bias::Before),
             ByteOffset::new(0)
+        );
+    }
+
+    /// 拆成几个 extension 各自产出，再合并，必须与一次性构造完全相同。
+    #[test]
+    fn merging_extensions_equals_building_in_one_go() {
+        let mark = DecorationRange::new(range(2, 6), Decoration::Mark { style: StyleId(1) });
+        let one = set(12, vec![replace(0, 2), mark]);
+        let two = set(12, vec![replace(7, 9)]);
+        let merged = DecorationSet::merge(Revision::INITIAL, ByteOffset::new(12), [&one, &two])
+            .expect("同一个 revision 与长度");
+        let direct = set(12, vec![replace(0, 2), mark, replace(7, 9)]);
+
+        assert_eq!(merged.all(), direct.all());
+        assert_eq!(merged.visual_len(), direct.visual_len());
+    }
+
+    /// 合并结果不依赖 extension 的先后——不变量 D6 的「不得相互感知」。
+    #[test]
+    fn merging_does_not_depend_on_extension_order() {
+        let one = set(12, vec![replace(0, 2)]);
+        let two = set(
+            12,
+            vec![DecorationRange::new(
+                range(0, 2),
+                Decoration::Mark { style: StyleId(4) },
+            )],
+        );
+        let forward = DecorationSet::merge(Revision::INITIAL, ByteOffset::new(12), [&one, &two])
+            .expect("同一个 revision 与长度");
+        let backward = DecorationSet::merge(Revision::INITIAL, ByteOffset::new(12), [&two, &one])
+            .expect("同一个 revision 与长度");
+        assert_eq!(forward.all(), backward.all());
+    }
+
+    /// **相邻的隐藏区间来自不同 extension 时同样要合并。**
+    ///
+    /// 这是 merge 独有的风险：单个集合内部的相邻合并由 `merge_hidden` 保证，
+    /// 而两段分别来自两个 extension 时，只有合并后重新走一遍构造才会塌成
+    /// 一个视觉位置。不塌的话光标会卡在两段语法字符中间，不报错。
+    #[test]
+    fn adjacent_hidden_ranges_from_different_extensions_still_collapse() {
+        let one = set(8, vec![replace(0, 2)]);
+        let two = set(8, vec![replace(2, 4)]);
+        let merged = DecorationSet::merge(Revision::INITIAL, ByteOffset::new(8), [&one, &two])
+            .expect("同一个 revision 与长度");
+        assert_eq!(merged.visual_len(), visual(4));
+        assert_eq!(
+            merged.visual_to_source(visual(0), Bias::After),
+            ByteOffset::new(4),
+            "After 必须跳过来自两个 extension 的连续隐藏区间"
+        );
+    }
+
+    /// 空输入是合法的，结果是一份什么都不装饰的集合。
+    #[test]
+    fn merging_nothing_yields_an_empty_set() {
+        let merged =
+            DecorationSet::merge(Revision::INITIAL, ByteOffset::new(9), []).expect("空输入合法");
+        assert!(merged.is_empty());
+        assert_eq!(merged.visual_len(), visual(9));
+    }
+
+    /// Revision 不符必须拒绝，不能静默合并——同 `map` 的理由。
+    #[test]
+    fn merging_across_revisions_is_rejected() {
+        let one = set(8, vec![replace(0, 2)]);
+        let later = Revision::INITIAL.next().expect("不会溢出");
+        let other = DecorationSet::new(later, ByteOffset::new(8), vec![replace(4, 6)]);
+        assert_eq!(
+            DecorationSet::merge(Revision::INITIAL, ByteOffset::new(8), [&one, &other]).err(),
+            Some(MergeError::RevisionMismatch {
+                expected: Revision::INITIAL,
+                found: later,
+            })
+        );
+    }
+
+    /// 源码长度不符同样拒绝：两个 extension 看的是不同的文档，offset 不可比。
+    #[test]
+    fn merging_sets_built_against_different_lengths_is_rejected() {
+        let one = set(8, vec![replace(0, 2)]);
+        let other = set(9, vec![replace(4, 6)]);
+        assert_eq!(
+            DecorationSet::merge(Revision::INITIAL, ByteOffset::new(8), [&one, &other]).err(),
+            Some(MergeError::SourceLenMismatch {
+                expected: ByteOffset::new(8),
+                found: ByteOffset::new(9),
+            })
         );
     }
 
