@@ -191,7 +191,7 @@ CommonMark 规范用例号。
 | --- | --- | --- | --- | --- |
 | F1 | 引用式链接的**括号配对**不查 reference table。`[a [b]][ref]` 的分组与 CommonMark 不同 | 不变量 C6 的直接后果，见下 | 512, 523, 528, 569, 571 | 不修 |
 | F2 | 制表符不展开。跨越「标记/内容」边界的制表符整个归标记 | 不变量 A1/A3 的直接后果，见下 | 5, 6, 7 | 不修 |
-| F3 | 引用标签只做 simple lowercase，未做 Unicode full case folding。`[ẞ]` 匹配不上 `[SS]:` | 标签归一化属于 reference table，S4 落地时决定 | 540 | S4 重新评估 |
+| F3 | 引用标签只做 simple lowercase，未做 Unicode full case folding。`[ẞ]` 匹配不上 `[SS]:` | 失败的是对照用的参考渲染，不是 parser；v2 的 reference table 还不存在，见下 | 540 | S6 建 reference table 时决定 |
 
 ### F1 为什么不修
 
@@ -219,6 +219,31 @@ CommonMark 在块解析时把制表符展开成空格再计算缩进，于是一
 
 > 展开制表符属于**呈现**，不属于解析。真要让这几列显示出来，是 S4 的装饰层
 > 给制表符一个宽度，而不是让 parser 改写源码。
+
+### F3 为什么现在修不了
+
+这一条初版写的是「S4 落地时决定」，S4 查下来发现那个说法把三件事混在了
+一起。理清之后是这样：
+
+1. **让 540 失败的不是 parser，是对照用的参考渲染。**
+   `crates/yu-syntax/tests/support/html.rs` 的 `normalize_label` 用
+   `char::to_lowercase`（Unicode simple lowercase），而 CommonMark 要求
+   full case folding：`ẞ` 的 simple lowercase 是 `ß`，full fold 是 `ss`，
+   所以匹配不上 `[SS]:`。
+2. **`yu-syntax` 的产品链路里根本没有引用标签匹配。** 不变量 C6 规定 parser
+   只产出候选引用，成立与否由装饰阶段判定。所以「引用标签怎么归一化」这个
+   问题在 `yu-syntax` 里没有答案，也不该有。
+3. **`yu-markdown/src/reference.rs` 里那个 `to_ascii_lowercase` 是 v1 扫描器
+   自己的 reference table，与 540 无关。** 它随 v1 一起被 S6 取代。
+
+于是能做的只有一件事：把参考渲染改成 full case folding。Rust 标准库没有
+full case folding，要为一条规范用例给测试支撑代码引入一个依赖——**决定是
+不引入**，第 6 节的依赖取舍在这里同样适用，为了让一条用例变绿而扩大依赖面
+不划算。
+
+真正要决定的事被推到 S6：v2 的 reference table 建在装饰阶段，那时才需要选
+一种归一化。届时若选了 full case folding，参考渲染也要一起改，540 会变绿，
+这一行随之删除，棘轮从 643 上调。
 
 ---
 

@@ -684,11 +684,21 @@ autolink 内部的 `*` 是错的。这几个数字由 `decoration_parity.rs` 的
 给它们加能力（Widget 的 measure、Mark 的样式合并规则）。D7 也因此仍然只有
 字节层面的语义：widget 覆盖的 source 不占视觉字节，宽度是 layout 的事。
 
-**还没做的：** `EditorState`（见上，S5）、`Facet`（见上，S6）、不变量 F3 的
-引用标签归一化。F3 要先理清接线——实现点是
-`crates/yu-markdown/src/reference.rs` 里一行 ASCII lowercase，而规范用例 540
-登记在 `yu-syntax` 侧的 `commonmark_spec.rs`，那个 crate 里根本没有归一化
-代码。在理清之前，改那一行不知道会不会让 540 变绿。
+**F3 查清楚了，结论是它不属于 S4。** S3 把「引用标签的 Unicode full case
+folding」交给 S4 决定。查下来那句交接把三件事混在了一起：让规范用例 540
+失败的是**对照用的参考渲染**（`yu-syntax/tests/support/html.rs` 的
+`normalize_label` 用 simple lowercase）；`yu-syntax` 的产品链路里根本没有
+引用标签匹配（不变量 C6 规定 parser 只产出候选引用）；而
+`yu-markdown/src/reference.rs` 里那个 `to_ascii_lowercase` 是 v1 扫描器自己
+的 reference table，与 540 无关，随 v1 一起被 S6 取代。
+
+要让 540 变绿只需改参考渲染，但 Rust 标准库没有 full case folding，得为一条
+用例给测试支撑代码加一个依赖——**决定是不加**。真正要决定的事推到 S6：
+v2 的 reference table 建在装饰阶段，那时才需要选归一化方式。已改写
+`docs/specs/invariants.md` 的 F3 登记，并补了一节说明，免得下一个人再按
+「S4 重新评估」这条线索去找一个不在那里的东西。
+
+**还没做的：** `EditorState`（见上，S5）、`Facet`（见上，S6）。
 
 ### S5 · 布局重写
 
