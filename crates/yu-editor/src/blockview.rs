@@ -1,0 +1,1107 @@
+//! 一个块排完之后的样子：视觉几何 + 源码坐标 + 装饰。
+//!
+//! # 它取代了什么
+//!
+//! v1 的 `yu_layout::LayoutSnapshot` 同时干三件事：排文字、解释 Markdown
+//! （标题字号、引用 gutter、列表标记、表格网格、图片盒子）、把视觉坐标换算
+//! 回源码坐标。第二件事让布局层必须认识 Markdown——不变量 E1 禁止的那件事。
+//!
+//! v2 把这三件事分开：
+//!
+//! - 排文字是 [`BlockLayout`] 的事，它只看见视觉文本与不透明的样式 id；
+//! - 解释 Markdown 是 [`BlockLayoutInput`] 的事（本 crate），它把语法翻译成
+//!   字号倍率、缩进、网格；
+//! - 换算源码坐标是 `Projection` 的事——[`BlockView`] 在这里问它，自己不
+//!   再实现一遍（不变量 D4「这是投影映射链的唯一实现」）。
+//!
+//! [`BlockView`] 是把这三样拼起来的那个东西，也是产品侧唯一要打交道的类型。
+//!
+//! # 为什么它有自己的一套盒子
+//!
+//! [`BlockLayout`] 的输出**只有视觉坐标**，这是有意的。产品侧要的是源码
+//! 坐标（选中、编辑、Accessibility 都按源码走），所以这里把每个盒子补上
+//! 它的源码区间，得到 [`BlockCluster`] / [`BlockGlyph`] / [`BlockLine`]。
+//! 补的时候问的是 `Projection`，不是自己再算一遍。
+
+use std::ops::Range;
+
+use yu_core::{
+    ByteOffset, CaretAffinity, ClusterMetrics, FontFaceId, GlyphId, LineStyleId, Revision,
+    ShapingProvider, TextRange, TextStyle,
+};
+use yu_layout::{
+    BlockLayout, HeightIndex, HeightIndexError, LayoutConfig, LayoutError, LayoutPoint, LayoutRect,
+    NoWidgets, StyleTable,
+};
+use yu_projection::{
+    BlockProjection, Projection, ProjectionBias, VisualOffset, VisualRange, VisualRun,
+    VisualRunKind,
+};
+use yu_text::{ChangeSet, TextSnapshot};
+
+use crate::blockinput::{BlockLayoutInput, BlockOrnaments};
+use crate::geometry::source_range_contains;
+use crate::image::{ImagePlacement, build_image_placements, place_images_in_table};
+use crate::table::{TableLayout, TableResizeCommit};
+
+/// 一个视觉簇：视觉几何加上它对应的源码。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockCluster {
+    source: TextRange,
+    visual: VisualRange,
+    line: usize,
+    x: f32,
+    width: f32,
+    style: TextStyle,
+    line_break: bool,
+}
+
+impl BlockCluster {
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualRange {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn line(self) -> usize {
+        self.line
+    }
+
+    #[must_use]
+    pub const fn x(self) -> f32 {
+        self.x
+    }
+
+    #[must_use]
+    pub const fn width(self) -> f32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn style(self) -> TextStyle {
+        self.style
+    }
+
+    #[must_use]
+    pub const fn is_line_break(self) -> bool {
+        self.line_break
+    }
+}
+
+/// 一个排好位置的字形，附带它的源码区间。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockGlyph {
+    face: FontFaceId,
+    glyph: GlyphId,
+    source: TextRange,
+    visual: VisualRange,
+    line: usize,
+    origin: LayoutPoint,
+    style: TextStyle,
+    size_scale: f32,
+}
+
+impl BlockGlyph {
+    #[must_use]
+    pub const fn face(self) -> FontFaceId {
+        self.face
+    }
+
+    #[must_use]
+    pub const fn glyph(self) -> GlyphId {
+        self.glyph
+    }
+
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualRange {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn line(self) -> usize {
+        self.line
+    }
+
+    /// 字形基线左端在 block 空间里的位置。
+    #[must_use]
+    pub const fn origin(self) -> LayoutPoint {
+        self.origin
+    }
+
+    #[must_use]
+    pub const fn style(self) -> TextStyle {
+        self.style
+    }
+
+    /// 相对 shaper 基准字号的倍率。栅格化按它选字号。
+    #[must_use]
+    pub const fn size_scale(self) -> f32 {
+        self.size_scale
+    }
+}
+
+/// 一条视觉行。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockLine {
+    index: usize,
+    source: TextRange,
+    visual: VisualRange,
+    bounds: LayoutRect,
+    baseline: f32,
+    style: Option<LineStyleId>,
+    clusters: Range<usize>,
+}
+
+impl BlockLine {
+    #[must_use]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn visual(&self) -> VisualRange {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn bounds(&self) -> LayoutRect {
+        self.bounds
+    }
+
+    #[must_use]
+    pub const fn y(&self) -> f32 {
+        self.bounds.y()
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> f32 {
+        self.bounds.width()
+    }
+
+    /// 行高。有 widget 的行比 `line_height` 高，所以它不是常数。
+    #[must_use]
+    pub const fn height(&self) -> f32 {
+        self.bounds.height()
+    }
+
+    #[must_use]
+    pub const fn baseline(&self) -> f32 {
+        self.baseline
+    }
+
+    /// 这一行的行级样式 id，原样带出来给绘制方查表。
+    #[must_use]
+    pub const fn style(&self) -> Option<LineStyleId> {
+        self.style
+    }
+
+    #[must_use]
+    pub fn cluster_range(&self) -> Range<usize> {
+        self.clusters.clone()
+    }
+}
+
+/// caret 落在哪。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockCaret {
+    source: ByteOffset,
+    visual: VisualOffset,
+    line: usize,
+    point: LayoutPoint,
+    bias: ProjectionBias,
+}
+
+impl BlockCaret {
+    #[must_use]
+    pub const fn source(self) -> ByteOffset {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualOffset {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn line(self) -> usize {
+        self.line
+    }
+
+    #[must_use]
+    pub const fn point(self) -> LayoutPoint {
+        self.point
+    }
+
+    #[must_use]
+    pub const fn bias(self) -> ProjectionBias {
+        self.bias
+    }
+}
+
+/// 一次点击落在哪。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockHit {
+    caret: BlockCaret,
+    image: Option<TextRange>,
+}
+
+impl BlockHit {
+    #[must_use]
+    pub const fn source(self) -> ByteOffset {
+        self.caret.source
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualOffset {
+        self.caret.visual
+    }
+
+    #[must_use]
+    pub const fn line(self) -> usize {
+        self.caret.line
+    }
+
+    #[must_use]
+    pub const fn point(self) -> LayoutPoint {
+        self.caret.point
+    }
+
+    #[must_use]
+    pub const fn bias(self) -> ProjectionBias {
+        self.caret.bias
+    }
+
+    /// 点在某张图片上时给出它的源码区间。
+    #[must_use]
+    pub const fn image(self) -> Option<TextRange> {
+        self.image
+    }
+
+    pub(crate) const fn image_hit(
+        source: ByteOffset,
+        visual: VisualOffset,
+        line: usize,
+        point: LayoutPoint,
+        bias: ProjectionBias,
+        image: TextRange,
+    ) -> Self {
+        Self {
+            caret: BlockCaret {
+                source,
+                visual,
+                line,
+                point,
+                bias,
+            },
+            image: Some(image),
+        }
+    }
+}
+
+/// 一个块排完之后的全部结果。
+#[derive(Clone, Debug)]
+pub struct BlockView {
+    projection: BlockProjection,
+    config: LayoutConfig,
+    input: BlockLayoutInput,
+    layout: BlockLayout,
+    lines: Vec<BlockLine>,
+    clusters: Vec<BlockCluster>,
+    glyphs: Vec<BlockGlyph>,
+    images: Vec<ImagePlacement>,
+    table: Option<TableLayout>,
+}
+
+impl BlockView {
+    /// 按度量排。列表标记只算宽度，不产字形。
+    pub fn build<M: ClusterMetrics>(
+        projection: &BlockProjection,
+        config: LayoutConfig,
+        metrics: &M,
+    ) -> Result<Self, LayoutError> {
+        let input = BlockLayoutInput::derive(projection.visual(), config, metrics)?;
+        let layout = BlockLayout::build_all(
+            input.layout_input(),
+            config,
+            input.styles(),
+            &NoWidgets,
+            input.line_styles(),
+            metrics,
+        )?;
+        let table = match projection {
+            BlockProjection::Table(table) => {
+                Some(TableLayout::from_projection(table, config, metrics)?)
+            }
+            _ => None,
+        };
+        Self::assemble(projection, config, input, layout, table)
+    }
+
+    /// 按 shaping 后端排。列表标记的字形一并进字形流。
+    pub fn build_shaped<S: ShapingProvider>(
+        projection: &BlockProjection,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<Self, LayoutError> {
+        let input = BlockLayoutInput::derive_shaped(projection.visual(), config, shaper)?;
+        let layout = BlockLayout::build_shaped(
+            input.layout_input(),
+            config,
+            input.styles(),
+            &NoWidgets,
+            input.line_styles(),
+            shaper,
+        )?;
+        let table = match projection {
+            BlockProjection::Table(table) => Some(TableLayout::from_projection_with_shaper(
+                table, config, shaper,
+            )?),
+            _ => None,
+        };
+        Self::assemble(projection, config, input, layout, table)
+    }
+
+    fn assemble(
+        projection: &BlockProjection,
+        config: LayoutConfig,
+        input: BlockLayoutInput,
+        layout: BlockLayout,
+        table: Option<TableLayout>,
+    ) -> Result<Self, LayoutError> {
+        let visual = projection.visual();
+        let clusters = source_backed_clusters(visual, &layout, input.styles())?;
+        let glyphs = source_backed_glyphs(&layout, &clusters, input.ornaments())?;
+        let lines = flow_lines(visual, &layout)?;
+        let mut view = Self {
+            projection: projection.clone(),
+            config,
+            input,
+            layout,
+            lines,
+            clusters,
+            glyphs,
+            images: Vec::new(),
+            table,
+        };
+        view.images = build_image_placements(&view)?;
+        if let Some(table) = view.table.clone() {
+            view.apply_table_geometry(&table)?;
+        }
+        Ok(view)
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.projection.revision()
+    }
+
+    #[must_use]
+    pub fn source_range(&self) -> TextRange {
+        self.projection.source_range()
+    }
+
+    #[must_use]
+    pub fn visual_len(&self) -> VisualOffset {
+        self.projection.visual().visual_len()
+    }
+
+    #[must_use]
+    pub const fn config(&self) -> LayoutConfig {
+        self.config
+    }
+
+    /// 排文字的那一层。`yu-scene` 只需要这个加上字形。
+    #[must_use]
+    pub const fn layout(&self) -> &BlockLayout {
+        &self.layout
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> &Projection {
+        self.projection.visual()
+    }
+
+    #[must_use]
+    pub const fn block_projection(&self) -> &BlockProjection {
+        &self.projection
+    }
+
+    #[must_use]
+    pub fn lines(&self) -> &[BlockLine] {
+        &self.lines
+    }
+
+    #[must_use]
+    pub fn clusters(&self) -> &[BlockCluster] {
+        &self.clusters
+    }
+
+    #[must_use]
+    pub fn glyphs(&self) -> &[BlockGlyph] {
+        &self.glyphs
+    }
+
+    #[must_use]
+    pub fn images(&self) -> &[ImagePlacement] {
+        &self.images
+    }
+
+    #[must_use]
+    pub const fn table(&self) -> Option<&TableLayout> {
+        self.table.as_ref()
+    }
+
+    /// 「长什么样」那部分装饰：标题级别、列表标记、引用竖条。
+    #[must_use]
+    pub const fn ornaments(&self) -> &BlockOrnaments {
+        self.input.ornaments()
+    }
+
+    /// 块的高度。
+    ///
+    /// 表格块按网格算；其余按行盒累加，再让已经就绪的图片把它撑开——一张
+    /// 解码后的图片可以比它那一行高，可滚动范围必须算上它，否则长文档尾部
+    /// 滚不到。那个 bug 不报错。
+    #[must_use]
+    pub fn height(&self) -> f32 {
+        let base = self
+            .table
+            .as_ref()
+            .map_or_else(|| self.layout.height(), |table| table.bounds().height());
+        self.images.iter().fold(base, |height, image| {
+            height.max(image.bounds().y() + image.bounds().height())
+        })
+    }
+
+    /// 每条视觉行的高度，给视口的高度索引用。
+    pub fn height_index(&self) -> Result<HeightIndex, HeightIndexError> {
+        HeightIndex::new(self.lines.iter().map(BlockLine::height))
+    }
+
+    /// 一次源码编辑之后这个块还在不在。改到块里就整块作废。
+    pub fn map_through(
+        &self,
+        changes: &ChangeSet,
+        snapshot: &TextSnapshot,
+    ) -> Result<Option<Self>, LayoutError> {
+        let Some(projection) = self.projection.map_through(changes, snapshot)? else {
+            return Ok(None);
+        };
+        let table = self
+            .table
+            .as_ref()
+            .map(|table| table.map_through(changes, snapshot))
+            .transpose()?;
+        let mut view = Self {
+            projection,
+            ..self.clone()
+        };
+        view.table = table;
+        view.clusters = view
+            .clusters
+            .iter()
+            .copied()
+            .map(|cluster| {
+                Ok(BlockCluster {
+                    source: crate::geometry::map_source_range(cluster.source, changes)?,
+                    ..cluster
+                })
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
+        view.glyphs = view
+            .glyphs
+            .iter()
+            .copied()
+            .map(|glyph| {
+                Ok(BlockGlyph {
+                    source: crate::geometry::map_source_range(glyph.source, changes)?,
+                    ..glyph
+                })
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
+        view.lines = view
+            .lines
+            .iter()
+            .cloned()
+            .map(|line| {
+                Ok(BlockLine {
+                    source: crate::geometry::map_source_range(line.source, changes)?,
+                    ..line
+                })
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
+        view.images = view
+            .images
+            .iter()
+            .copied()
+            .map(|image| image.map_through(changes))
+            .collect::<Result<Vec<_>, LayoutError>>()?;
+        Ok(Some(view))
+    }
+
+    /// 源码偏移落在哪。
+    pub fn caret_for_source(
+        &self,
+        source: ByteOffset,
+        bias: ProjectionBias,
+    ) -> Result<BlockCaret, LayoutError> {
+        let visual = self.projection().source_to_visual(source, bias)?;
+        self.caret_for_visual(visual, bias)
+    }
+
+    /// 视觉偏移落在哪。
+    ///
+    /// composition 的多个视觉边界有意映射到同一段 canonical 替换范围，所以
+    /// 从源码那一侧查不回一个 preedit 内部的 caret——这个入口是给它准备的。
+    pub fn caret_for_visual(
+        &self,
+        visual: VisualOffset,
+        bias: ProjectionBias,
+    ) -> Result<BlockCaret, LayoutError> {
+        let source = match self
+            .table
+            .as_ref()
+            .and_then(|table| table.source_for_visual_hit(self.projection(), visual, bias))
+        {
+            Some(source) => source,
+            None => self.projection().visual_to_source(visual, bias)?,
+        };
+        let (line, point) = self.point_for_visual(visual, bias)?;
+        Ok(BlockCaret {
+            source,
+            visual,
+            line,
+            point,
+            bias,
+        })
+    }
+
+    /// 一个 block 局部坐标点落在哪。
+    pub fn hit_test(&self, point: LayoutPoint) -> Result<BlockHit, LayoutError> {
+        if !point.is_finite() {
+            return Err(LayoutError::InvalidPoint);
+        }
+        if let Some(image) = self
+            .images
+            .iter()
+            .find(|image| image.bounds().contains(point))
+        {
+            return Ok(image.hit(point));
+        }
+        let line_index = self.line_for_y(point.y());
+        let line = &self.lines[line_index];
+        let mut visual = line.visual.start();
+        let mut bias = ProjectionBias::Before;
+        let mut x = line.bounds.width();
+
+        let content_start = self.content_start(line);
+        if point.x() <= content_start {
+            x = content_start;
+        } else {
+            for index in line.clusters.clone() {
+                let cluster = self.clusters[index];
+                if cluster.line_break {
+                    continue;
+                }
+                if point.x() < cluster.x + cluster.width / 2.0 {
+                    visual = cluster.visual.start();
+                    x = cluster.x;
+                    bias = ProjectionBias::Before;
+                    break;
+                }
+                visual = cluster.visual.end();
+                x = cluster.x + cluster.width;
+                bias = ProjectionBias::After;
+            }
+            // 点在行末之外：落到这一行**内容**的末尾，而不是换行符之后。
+            // bias 取 Before，否则行末的隐藏语法（`**` 的收尾）会把源码
+            // 偏移推到标记外面去，选中就少了一段。
+            if point.x() >= line.bounds.width() {
+                visual = self.line_content_visual_end(line);
+                x = line.bounds.width();
+                bias = ProjectionBias::Before;
+            }
+        }
+        let source = match self
+            .table
+            .as_ref()
+            .and_then(|table| table.source_for_visual_hit(self.projection(), visual, bias))
+        {
+            Some(source) => source,
+            None => self.projection().visual_to_source(visual, bias)?,
+        };
+        Ok(BlockHit {
+            caret: BlockCaret {
+                source,
+                visual,
+                line: line_index,
+                point: LayoutPoint::new(x, line.bounds.y()),
+                bias,
+            },
+            image: None,
+        })
+    }
+
+    /// 会话内的表格列宽调整。canonical 源码与缓存布局都不动。
+    pub fn apply_table_column_resize(
+        &mut self,
+        index: usize,
+        delta: f32,
+    ) -> Result<(), LayoutError> {
+        let table = self
+            .table
+            .as_ref()
+            .ok_or(LayoutError::InvalidTable("block is not a table"))?
+            .resized_columns(index, delta)?;
+        self.apply_table_geometry(&table)?;
+        self.table = Some(table);
+        Ok(())
+    }
+
+    /// 应用一次表格拖拽的提交结果。
+    pub fn apply_table_resize(&mut self, commit: TableResizeCommit) -> Result<(), LayoutError> {
+        if commit.revision() != self.revision() {
+            return Err(LayoutError::InvalidTable(
+                "table resize commit is bound to another revision",
+            ));
+        }
+        match commit.target() {
+            crate::table::TableResizeTarget::Column { index } => {
+                self.apply_table_column_resize(index, commit.delta())
+            }
+            crate::table::TableResizeTarget::Row { .. } => Ok(()),
+        }
+    }
+
+    /// 解码后的图片尺寸到位，重算受影响的图片盒子（不变量 D7）。
+    pub fn apply_image_intrinsic_sizes(
+        &mut self,
+        sizes: &[(TextRange, yu_layout::ImageIntrinsicSize)],
+    ) -> Result<(), LayoutError> {
+        for image in &mut self.images {
+            if let Some((_, size)) = sizes
+                .iter()
+                .copied()
+                .find(|(source, _)| *source == image.source())
+            {
+                image.apply_intrinsic_size(size, self.config)?;
+            }
+        }
+        if let Some(table) = self.table.clone() {
+            place_images_in_table(&mut self.images, &table)?;
+        }
+        Ok(())
+    }
+
+    /// 一行内容的起点 x：点在它左边时 caret 停在这里。
+    ///
+    /// 它必须与 [`BlockView::point_for_visual`] 在行首给出的位置一致——
+    /// 两处各写一遍规则，就会「光标画在一处、点击落在另一处」。表格行的
+    /// 内容从单元格的 padding 之后开始，普通行从行级缩进之后开始。
+    fn content_start(&self, line: &BlockLine) -> f32 {
+        if self.table.is_some() {
+            return line
+                .clusters
+                .clone()
+                .map(|index| self.clusters[index])
+                .find(|cluster| !cluster.line_break)
+                .map_or(0.0, |cluster| cluster.x);
+        }
+        self.layout
+            .lines()
+            .get(line.index)
+            .map_or(0.0, yu_layout::LineBox::indent)
+    }
+
+    /// 一行里最后一个**文字**簇的视觉末尾。换行符不算内容。
+    fn line_content_visual_end(&self, line: &BlockLine) -> VisualOffset {
+        line.clusters
+            .clone()
+            .rev()
+            .map(|index| self.clusters[index])
+            .find_map(|cluster| (!cluster.line_break).then(|| cluster.visual.end()))
+            .unwrap_or(line.visual.start())
+    }
+
+    fn line_for_y(&self, y: f32) -> usize {
+        for (index, line) in self.lines.iter().enumerate() {
+            if y < line.bounds.y() + line.bounds.height() {
+                return index;
+            }
+        }
+        self.lines.len().saturating_sub(1)
+    }
+
+    fn point_for_visual(
+        &self,
+        visual: VisualOffset,
+        bias: ProjectionBias,
+    ) -> Result<(usize, LayoutPoint), LayoutError> {
+        if visual > self.visual_len() {
+            return Err(LayoutError::VisualOutOfBounds(visual));
+        }
+        let affinity = match bias {
+            ProjectionBias::Before => CaretAffinity::Upstream,
+            ProjectionBias::After => CaretAffinity::Downstream,
+        };
+        if self.table.is_some() {
+            return self.table_point_for_visual(visual, bias);
+        }
+        let caret = self.layout.caret(visual, affinity)?;
+        Ok((caret.line(), caret.point()))
+    }
+
+    /// 表格里的 caret 位置来自网格，不是文字流。
+    ///
+    /// 文字流那条路（`BlockLayout::caret`）问的是排在文字流里的簇，而表格
+    /// 的簇已经被搬进单元格了。两处必须走同一份簇，否则光标画在一个地方、
+    /// 点击落在另一个地方。
+    fn table_point_for_visual(
+        &self,
+        visual: VisualOffset,
+        bias: ProjectionBias,
+    ) -> Result<(usize, LayoutPoint), LayoutError> {
+        let line_index = self.line_for_visual(visual, bias);
+        let line = &self.lines[line_index];
+        for index in line.clusters.clone() {
+            let cluster = self.clusters[index];
+            if visual <= cluster.visual.start() {
+                return Ok((line_index, LayoutPoint::new(cluster.x, line.bounds.y())));
+            }
+            if visual < cluster.visual.end() {
+                let x = match bias {
+                    ProjectionBias::Before => cluster.x,
+                    ProjectionBias::After => cluster.x + cluster.width,
+                };
+                return Ok((line_index, LayoutPoint::new(x, line.bounds.y())));
+            }
+            if visual == cluster.visual.end() {
+                return Ok((
+                    line_index,
+                    LayoutPoint::new(cluster.x + cluster.width, line.bounds.y()),
+                ));
+            }
+        }
+        Ok((
+            line_index,
+            LayoutPoint::new(line.bounds.width(), line.bounds.y()),
+        ))
+    }
+
+    fn line_for_visual(&self, visual: VisualOffset, bias: ProjectionBias) -> usize {
+        for (index, line) in self.lines.iter().enumerate() {
+            if visual < line.visual.end()
+                || (visual == line.visual.end()
+                    && (bias == ProjectionBias::Before || index + 1 == self.lines.len()))
+            {
+                return index;
+            }
+        }
+        self.lines.len().saturating_sub(1)
+    }
+
+    /// 把文字流的簇、字形与行搬进表格网格。
+    ///
+    /// 这段算法原样来自 v1 的 `LayoutSnapshot::apply_table_geometry`。它在
+    /// 真实窗口里跑过，重写不会更对。S6 让表格变成真正的 block widget 时
+    /// 它会被 widget 内部的逐单元格布局取代。
+    fn apply_table_geometry(&mut self, table: &TableLayout) -> Result<(), LayoutError> {
+        if table.revision() != self.revision() {
+            return Err(LayoutError::InvalidTable(
+                "table and text layout revisions differ",
+            ));
+        }
+        let original = self.clusters.clone();
+        let mut targets = vec![None; self.clusters.len()];
+        for cell in table.cells().iter().copied() {
+            let mut x = cell.content_x();
+            for (index, cluster) in original.iter().copied().enumerate() {
+                if cluster.line_break || !source_range_contains(cell.source(), cluster.source()) {
+                    continue;
+                }
+                if targets[index].is_some() {
+                    return Err(LayoutError::InvalidTable(
+                        "a visual cluster belongs to multiple table cells",
+                    ));
+                }
+                targets[index] = Some((cell.row(), cluster.x, x));
+                self.clusters[index] = BlockCluster {
+                    line: cell.row(),
+                    x,
+                    ..cluster
+                };
+                x += cluster.width;
+            }
+        }
+        if self
+            .clusters
+            .iter()
+            .zip(targets.iter())
+            .any(|(cluster, target)| !cluster.line_break && target.is_none())
+        {
+            return Err(LayoutError::InvalidTable(
+                "a table visual cluster has no source cell",
+            ));
+        }
+
+        let mut used = vec![false; self.clusters.len()];
+        for glyph_index in 0..self.glyphs.len() {
+            let original_glyph = self.glyphs[glyph_index];
+            let Some((index, target)) = self
+                .clusters
+                .iter()
+                .copied()
+                .zip(targets.iter().copied())
+                .enumerate()
+                .find_map(|(index, (cluster, target))| {
+                    (!used[index]
+                        && target.is_some()
+                        && cluster.source == original_glyph.source
+                        && cluster.visual == original_glyph.visual)
+                        .then_some((index, target))
+                })
+            else {
+                return Err(LayoutError::InvalidTable(
+                    "a shaped table glyph has no visual cluster",
+                ));
+            };
+            let (row, old_cluster_x, new_cluster_x) = target.expect("target checked above");
+            used[index] = true;
+            let old_baseline = self.baseline_for_flow_line(original_glyph.line);
+            let y_offset = original_glyph.origin.y() - old_baseline;
+            let x_offset = original_glyph.origin.x() - old_cluster_x;
+            if !x_offset.is_finite() || !y_offset.is_finite() {
+                return Err(LayoutError::InvalidPoint);
+            }
+            let new_baseline = table.row_height() * (row as f32 + 1.0);
+            self.glyphs[glyph_index] = BlockGlyph {
+                line: row,
+                origin: LayoutPoint::new(new_cluster_x + x_offset, new_baseline + y_offset),
+                ..original_glyph
+            };
+        }
+
+        place_images_in_table(&mut self.images, table)?;
+
+        let mut lines = Vec::with_capacity(table.row_sources().len());
+        let mut cluster_start = 0;
+        for (row, source) in table.row_sources().iter().copied().enumerate() {
+            let start = cluster_start;
+            if cluster_start < self.clusters.len() && self.clusters[cluster_start].line() < row {
+                return Err(LayoutError::InvalidTable(
+                    "table cluster lines are not ordered",
+                ));
+            }
+            while cluster_start < self.clusters.len() && self.clusters[cluster_start].line() == row
+            {
+                cluster_start += 1;
+            }
+            let mut row_cells = table
+                .cells()
+                .iter()
+                .copied()
+                .filter(|cell| cell.row() == row);
+            let first = row_cells
+                .clone()
+                .next()
+                .ok_or(LayoutError::InvalidTable("table row has no cells"))?;
+            let last = row_cells
+                .next_back()
+                .ok_or(LayoutError::InvalidTable("table row has no cells"))?;
+            let visual = VisualRange::new(first.visual().start(), last.visual().end())
+                .ok_or(LayoutError::OffsetOverflow)?;
+            lines.push(BlockLine {
+                index: row,
+                source,
+                visual,
+                bounds: LayoutRect::new(
+                    0.0,
+                    first.bounds().y(),
+                    table.bounds().width(),
+                    table.row_height(),
+                )?,
+                baseline: table.row_height(),
+                style: None,
+                clusters: start..cluster_start,
+            });
+        }
+        if cluster_start != self.clusters.len() {
+            return Err(LayoutError::InvalidTable(
+                "table cluster lines exceed table rows",
+            ));
+        }
+        self.lines = lines;
+        Ok(())
+    }
+
+    fn baseline_for_flow_line(&self, index: usize) -> f32 {
+        self.layout
+            .lines()
+            .get(index)
+            .map_or(0.0, |line| line.bounds().y() + line.baseline())
+    }
+}
+
+/// 给每个视觉簇补上它的源码区间。
+///
+/// 问的是 `Projection`，不是自己再算一遍——不变量 D4 说投影映射链只有一个
+/// 实现。簇与 run 都按视觉偏移升序，所以是一次归并走位。
+fn source_backed_clusters(
+    projection: &Projection,
+    layout: &BlockLayout,
+    styles: &crate::blockinput::BlockStyleTable,
+) -> Result<Vec<BlockCluster>, LayoutError> {
+    let mut runs = projection
+        .runs()
+        .iter()
+        .copied()
+        .filter(|run| run.kind() != VisualRunKind::HiddenSyntax)
+        .peekable();
+    let mut current: Option<VisualRun> = runs.next();
+    let mut clusters = Vec::with_capacity(layout.clusters().len());
+    for cluster in layout.clusters() {
+        while current.is_some_and(|run| {
+            run.visual().end() <= cluster.visual().start() && !run.visual().is_empty()
+        }) {
+            current = runs.next();
+        }
+        let run = current.ok_or(LayoutError::OffsetOverflow)?;
+        let local_start = cluster
+            .visual()
+            .start()
+            .get()
+            .checked_sub(run.visual().start().get())
+            .ok_or(LayoutError::OffsetOverflow)?;
+        let local_end = cluster
+            .visual()
+            .end()
+            .get()
+            .checked_sub(run.visual().start().get())
+            .ok_or(LayoutError::OffsetOverflow)?;
+        let source = projection.source_range_for_run_slice(run, local_start, local_end)?;
+        // 字型取**解释之后**的那个，不是 run 自己声明的那个：标题把每一段
+        // 都排成粗体，栅格化必须按实际用的字面来，否则字画得比量出来的窄。
+        let style = styles
+            .attrs(cluster.style())
+            .ok_or(LayoutError::UnknownStyle(cluster.style()))?
+            .style();
+        clusters.push(BlockCluster {
+            source,
+            visual: cluster.visual(),
+            line: cluster.line(),
+            x: cluster.x(),
+            width: cluster.width(),
+            style,
+            line_break: cluster.is_line_break(),
+        });
+    }
+    Ok(clusters)
+}
+
+/// 给每个字形补上源码区间，并把列表标记的字形并进来。
+///
+/// 标记的字形排在最前面：它画在 gutter 里，而 gutter 在内容左边。
+fn source_backed_glyphs(
+    layout: &BlockLayout,
+    clusters: &[BlockCluster],
+    ornaments: &BlockOrnaments,
+) -> Result<Vec<BlockGlyph>, LayoutError> {
+    let mut glyphs = Vec::with_capacity(layout.glyphs().len());
+    if let Some(marker) = ornaments.marker()
+        && let Some(shaped) = marker.shaped()
+    {
+        let baseline = layout
+            .lines()
+            .first()
+            .map_or(0.0, |line| line.bounds().y() + line.baseline());
+        let mut x = marker.x();
+        for run in shaped.runs() {
+            for glyph in run.glyphs() {
+                let origin = LayoutPoint::new(x + glyph.x_offset(), baseline + glyph.y_offset());
+                if !origin.is_finite() {
+                    return Err(LayoutError::InvalidPoint);
+                }
+                glyphs.push(BlockGlyph {
+                    face: run.face(),
+                    glyph: glyph.id(),
+                    source: marker.source(),
+                    visual: VisualRange::empty(VisualOffset::ZERO),
+                    line: 0,
+                    origin,
+                    style: TextStyle::Plain,
+                    size_scale: 1.0,
+                });
+                x += glyph.advance();
+            }
+        }
+    }
+    for glyph in layout.glyphs() {
+        let cluster = clusters
+            .iter()
+            .find(|cluster| cluster.visual == glyph.visual())
+            .ok_or(LayoutError::Shaping(
+                "a shaped glyph has no visual cluster".into(),
+            ))?;
+        glyphs.push(BlockGlyph {
+            face: glyph.face(),
+            glyph: glyph.glyph(),
+            source: cluster.source,
+            visual: glyph.visual(),
+            line: glyph.line(),
+            origin: glyph.origin(),
+            style: cluster.style,
+            size_scale: glyph.size_scale(),
+        });
+    }
+    Ok(glyphs)
+}
+
+/// 给每条视觉行补上它覆盖的源码区间。
+///
+/// 一行的源码从上一行的结尾接着算，到它视觉结尾对应的源码为止；最后一行
+/// 一直算到块的结尾。这样**每一个源码字节都恰好属于一行**，包括被隐藏的
+/// 语法标记——代码围栏的收尾那一行看起来是空的，但它拥有 ``` 那几个字节，
+/// 少了这一条，按行查源码就会漏掉它们。
+fn flow_lines(
+    projection: &Projection,
+    layout: &BlockLayout,
+) -> Result<Vec<BlockLine>, LayoutError> {
+    let block = projection.source_range();
+    let mut lines = Vec::with_capacity(layout.lines().len());
+    let mut start = block.start();
+    let count = layout.lines().len();
+    for line in layout.lines() {
+        let end = if line.index() + 1 == count {
+            block.end()
+        } else {
+            projection.visual_to_source(line.visual().end(), ProjectionBias::Before)?
+        };
+        let end = end.max(start).min(block.end());
+        lines.push(BlockLine {
+            index: line.index(),
+            source: TextRange::new(start, end).ok_or(LayoutError::OffsetOverflow)?,
+            visual: line.visual(),
+            bounds: line.bounds(),
+            baseline: line.baseline(),
+            style: line.style(),
+            clusters: line.cluster_range(),
+        });
+        start = end;
+    }
+    Ok(lines)
+}

@@ -572,3 +572,296 @@ fn block_soft_wrapping_changes_only_line_assignment() {
         "块级语料里发生软换行的组合数变了（两边加起来必须是 13×4=52）"
     );
 }
+
+/// 第三条差分：`BlockView` 对 `LayoutSnapshot`。
+///
+/// 前两条比的是**排文字**这一段；这一条比的是产品侧真正拿到的那个东西——
+/// 源码坐标、图片盒子、表格网格、caret 与 hit-test 全都在内。`BlockView`
+/// 是 S5 末尾用来顶掉 `LayoutSnapshot` 的类型，顶掉之前必须逐点对得上。
+const VIEW_CORPUS: &[&str] = &[
+    "plain paragraph\n",
+    "# h1 title\n",
+    "### h3 *em* title\n",
+    "> quoted text\n",
+    "> > nested quote\n",
+    "- item one\n",
+    "1. ordered item\n",
+    "- [ ] task item\n",
+    "![alt text](/img.png)\n",
+    "before ![alt](/i.png) after\n",
+    "| a | b |\n|---|---|\n| 1 | 2 |\n",
+    "| long header | x |\n| --- | --- |\n| c | d |\n| e | f |\n",
+    "```rust\nlet x = 1;\n```\n",
+    "[ref]: /url\n",
+    "text with `code` and **strong**\n",
+];
+
+fn view_paths(source: &str, width: f32) -> (LayoutSnapshot, yu_editor::BlockView) {
+    let projection = block_projection_of(source);
+    let config = LayoutConfig::new(width, 10.0).with_default_advance(2.0);
+    let metrics = MonospaceMetrics::new(config.default_advance());
+    let old = LayoutSnapshot::from_block_projection_with_metrics(&projection, config, &metrics)
+        .expect("v1 块布局");
+    let new = yu_editor::BlockView::build(&projection, config, &metrics).expect("BlockView");
+    (old, new)
+}
+
+#[test]
+fn block_view_agrees_with_the_v1_snapshot_where_nothing_soft_wraps() {
+    let mut compared = 0_usize;
+    let mut tables = 0_usize;
+    let mut images = 0_usize;
+    for source in VIEW_CORPUS {
+        for width in [40.0_f32, 160.0] {
+            let (old, new) = view_paths(source, width);
+            // 表格块的「行」是网格的行，行数与换行符无关，那条软换行判据
+            // 对它没有意义——它本来就不折行。
+            if old.table().is_none() && soft_wrapped_old(&old) {
+                continue;
+            }
+            compared += 1;
+            let at = format!("语料 {source:?} 宽度 {width}");
+
+            assert_eq!(old.lines().len(), new.lines().len(), "{at} 的行数");
+            for (old_line, new_line) in old.lines().iter().zip(new.lines()) {
+                let at = format!("{at} 第 {} 行", old_line.index());
+                assert_eq!(old_line.index(), new_line.index(), "{at} 的行号");
+                assert_eq!(old_line.source(), new_line.source(), "{at} 的源码区间");
+                assert_eq!(old_line.visual(), new_line.visual(), "{at} 的视觉区间");
+                assert_eq!(old_line.y(), new_line.y(), "{at} 的 y");
+                assert_eq!(old_line.width(), new_line.width(), "{at} 的宽度");
+                assert_eq!(
+                    old_line.cluster_range(),
+                    new_line.cluster_range(),
+                    "{at} 的簇区间"
+                );
+            }
+            assert_eq!(old.block_height(), new.height(), "{at} 的块高");
+
+            assert_eq!(old.clusters().len(), new.clusters().len(), "{at} 的簇数");
+            for (index, (old_cluster, new_cluster)) in
+                old.clusters().iter().zip(new.clusters()).enumerate()
+            {
+                let at = format!("{at} 第 {index} 个簇");
+                assert_eq!(old_cluster.source(), new_cluster.source(), "{at} 的源码");
+                assert_eq!(old_cluster.visual(), new_cluster.visual(), "{at} 的视觉");
+                assert_eq!(old_cluster.line(), new_cluster.line(), "{at} 的行号");
+                assert_eq!(old_cluster.x(), new_cluster.x(), "{at} 的 x");
+                assert_eq!(old_cluster.width(), new_cluster.width(), "{at} 的宽度");
+                // v1 在两条路上给同一个簇不同的字型：按度量排时是 run 自己
+                // 声明的，按 shaping 排时是「标题一律粗体」解释之后的。v2
+                // 两条路都给解释之后的那个——栅格化按它选字面，给错了字会
+                // 画得比量出来的窄。
+                let old_style = if old.heading().is_some() {
+                    yu_core::TextStyle::Strong
+                } else {
+                    old_cluster.style()
+                };
+                assert_eq!(old_style, new_cluster.style(), "{at} 的样式");
+                assert_eq!(
+                    old_cluster.is_line_break(),
+                    new_cluster.is_line_break(),
+                    "{at} 的换行标记"
+                );
+            }
+
+            assert_eq!(old.images().len(), new.images().len(), "{at} 的图片数");
+            images += new.images().len();
+            for (old_image, new_image) in old.images().iter().zip(new.images()) {
+                assert_eq!(old_image.source(), new_image.source(), "{at} 的图片源码");
+                assert_eq!(old_image.label(), new_image.label(), "{at} 的图片标签");
+                assert_eq!(old_image.visual(), new_image.visual(), "{at} 的图片视觉");
+                assert_eq!(old_image.line(), new_image.line(), "{at} 的图片行号");
+                assert_eq!(old_image.bounds(), new_image.bounds(), "{at} 的图片盒子");
+            }
+
+            match (old.table(), new.table()) {
+                (Some(old_table), Some(new_table)) => {
+                    tables += 1;
+                    assert_eq!(old_table.bounds(), new_table.bounds(), "{at} 的表格外框");
+                    assert_eq!(
+                        old_table.column_widths(),
+                        new_table.column_widths(),
+                        "{at} 的列宽"
+                    );
+                    assert_eq!(
+                        old_table.cells().len(),
+                        new_table.cells().len(),
+                        "{at} 的格数"
+                    );
+                    for (old_cell, new_cell) in old_table.cells().iter().zip(new_table.cells()) {
+                        assert_eq!(old_cell.source(), new_cell.source(), "{at} 的格源码");
+                        assert_eq!(old_cell.bounds(), new_cell.bounds(), "{at} 的格几何");
+                        assert_eq!(old_cell.content_x(), new_cell.content_x(), "{at} 的内容 x");
+                    }
+                }
+                (None, None) => {}
+                (old_table, new_table) => {
+                    panic!(
+                        "{at} 的表格对不上: {:?} / {:?}",
+                        old_table.is_some(),
+                        new_table.is_some()
+                    )
+                }
+            }
+
+            // caret：每个簇边界，两种 bias。
+            let mut sources = vec![new.source_range().start()];
+            for cluster in new.clusters() {
+                sources.push(cluster.source().start());
+                sources.push(cluster.source().end());
+            }
+            sources.push(new.source_range().end());
+            sources.sort();
+            sources.dedup();
+            for source_offset in sources {
+                for bias in [ProjectionBias::Before, ProjectionBias::After] {
+                    let at = format!("{at} 源码 {} bias {bias:?}", source_offset.get());
+                    let old_caret = old
+                        .caret_for_source(source_offset, bias)
+                        .unwrap_or_else(|error| panic!("{at} 的 v1 caret: {error}"));
+                    let new_caret = new
+                        .caret_for_source(source_offset, bias)
+                        .unwrap_or_else(|error| panic!("{at} 的 v2 caret: {error}"));
+                    assert_eq!(old_caret.source(), new_caret.source(), "{at} 的源码");
+                    assert_eq!(old_caret.visual(), new_caret.visual(), "{at} 的视觉偏移");
+                    assert_eq!(old_caret.line(), new_caret.line(), "{at} 的行号");
+                    assert_eq!(old_caret.point(), new_caret.point(), "{at} 的位置");
+                }
+            }
+
+            // hit-test：每个簇的边缘与四分点。
+            for line in new.lines() {
+                let y = line.y();
+                let mut xs = vec![-1.0_f32, 0.0, line.width(), line.width() + 3.0];
+                for index in line.cluster_range() {
+                    let cluster = new.clusters()[index];
+                    xs.push(cluster.x());
+                    xs.push(cluster.x() + cluster.width() * 0.25);
+                    xs.push(cluster.x() + cluster.width() * 0.75);
+                    xs.push(cluster.x() + cluster.width());
+                }
+                for x in xs {
+                    let point = yu_layout::LayoutPoint::new(x, y);
+                    let at = format!("{at} 第 {} 行 x={x}", line.index());
+                    let old_hit = old
+                        .hit_test(point)
+                        .unwrap_or_else(|error| panic!("{at} 的 v1 hit: {error}"));
+                    let new_hit = new
+                        .hit_test(point)
+                        .unwrap_or_else(|error| panic!("{at} 的 v2 hit: {error}"));
+                    assert_eq!(old_hit.source(), new_hit.source(), "{at} 的源码");
+                    assert_eq!(old_hit.visual(), new_hit.visual(), "{at} 的视觉偏移");
+                    assert_eq!(old_hit.line(), new_hit.line(), "{at} 的行号");
+                    assert_eq!(old_hit.image(), new_hit.image(), "{at} 的图片命中");
+                    if x > 0.0 {
+                        assert_eq!(old_hit.point(), new_hit.point(), "{at} 的位置");
+                    } else {
+                        // 见上一条差分：点在 gutter 里时 v1 的 hit 与它自己的
+                        // caret 对不上。这里改为自证。
+                        // 用 After：点在行首左边时命中的是**这一行**的行首，
+                        // 而 Before 会把它解释成上一行的行末。
+                        let caret = new
+                            .caret_for_visual(new_hit.visual(), ProjectionBias::After)
+                            .unwrap_or_else(|error| panic!("{at} 的 v2 caret: {error}"));
+                        assert_eq!(new_hit.point(), caret.point(), "{at} 的 hit/caret 一致");
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        (compared, tables, images),
+        (29, 4, 4),
+        "BlockView 差分的组合数或语料构成变了。15 份语料 × 2 个宽度 = 30，\
+         其中一个组合在窄宽度下软换行，退出强口径"
+    );
+}
+
+/// 字形那条路的差分。
+///
+/// 上面比的是按度量排出来的几何，字形流是另一段代码：v1 在
+/// `LayoutSnapshot::build_shaped` 里边排边产字形，v2 由 `BlockLayout` 产出
+/// 视觉盒子、`BlockView` 补上源码区间并把列表标记的字形并进来。两条路的
+/// 字形必须一个不多一个不少、位置相同——少一个是丢字，位置错是画歪，
+/// 两样都不 panic。
+struct GraphemeShaper;
+
+impl yu_core::ShapingProvider for GraphemeShaper {
+    type Error = String;
+
+    fn shape(
+        &self,
+        text: &str,
+        source: TextRange,
+        style: yu_core::TextStyle,
+    ) -> Result<yu_core::ShapedText, Self::Error> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut glyphs = Vec::new();
+        for (offset, cluster) in text.grapheme_indices(true) {
+            let start = source.start().get() + offset as u64;
+            let range = TextRange::new(
+                ByteOffset::new(start),
+                ByteOffset::new(start + cluster.len() as u64),
+            )
+            .ok_or("有序")?;
+            glyphs.push(yu_core::Glyph::new(
+                yu_core::GlyphId::from_raw(cluster.chars().next().map_or(0, u32::from)),
+                range,
+                2.0,
+                0.0,
+                0.0,
+            ));
+        }
+        Ok(yu_core::ShapedText::new(
+            source,
+            vec![yu_core::GlyphRun::new(
+                yu_core::FontFaceId::from_raw(3),
+                source,
+                style,
+                yu_core::TextDirection::Ltr,
+                yu_core::Script::Latin,
+                glyphs,
+            )],
+        ))
+    }
+}
+
+#[test]
+fn block_view_glyphs_match_the_v1_snapshot() {
+    let mut compared = 0_usize;
+    let mut glyphs = 0_usize;
+    for source in VIEW_CORPUS {
+        let projection = block_projection_of(source);
+        let config = LayoutConfig::new(160.0, 10.0).with_default_advance(2.0);
+        let old =
+            LayoutSnapshot::from_block_projection_with_shaper(&projection, config, &GraphemeShaper)
+                .expect("v1 shaped 布局");
+        let new = yu_editor::BlockView::build_shaped(&projection, config, &GraphemeShaper)
+            .expect("BlockView shaped");
+        if old.table().is_none() && soft_wrapped_old(&old) {
+            continue;
+        }
+        compared += 1;
+        glyphs += new.glyphs().len();
+        let at = format!("语料 {source:?}");
+        assert_eq!(old.glyphs().len(), new.glyphs().len(), "{at} 的字形数");
+        for (index, (old_glyph, new_glyph)) in old.glyphs().iter().zip(new.glyphs()).enumerate() {
+            let at = format!("{at} 第 {index} 个字形");
+            assert_eq!(old_glyph.face(), new_glyph.face(), "{at} 的字面");
+            assert_eq!(old_glyph.glyph(), new_glyph.glyph(), "{at} 的字形 id");
+            assert_eq!(old_glyph.source(), new_glyph.source(), "{at} 的源码");
+            assert_eq!(old_glyph.visual(), new_glyph.visual(), "{at} 的视觉区间");
+            assert_eq!(old_glyph.line(), new_glyph.line(), "{at} 的行号");
+            assert_eq!(old_glyph.x(), new_glyph.origin().x(), "{at} 的 x");
+            assert_eq!(old_glyph.y(), new_glyph.origin().y(), "{at} 的 y");
+            assert_eq!(old_glyph.style(), new_glyph.style(), "{at} 的字型");
+            assert_eq!(
+                old_glyph.font_scale(),
+                new_glyph.size_scale(),
+                "{at} 的字号倍率"
+            );
+        }
+    }
+    assert_eq!((compared, glyphs), (15, 182), "字形差分的语料构成变了");
+}

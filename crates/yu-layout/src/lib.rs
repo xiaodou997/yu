@@ -105,7 +105,11 @@ impl LayoutConfig {
         self.default_advance
     }
 
-    fn validate(self) -> Result<(), LayoutError> {
+    /// 拒绝非有限或非正的尺寸。
+    ///
+    /// 一个 NaN 宽度在布局里会一路传播成不 panic 的错画面，那是本项目最
+    /// 危险的失败模式。配置从调用方来，所以入口先验一遍。
+    pub fn validate(self) -> Result<(), LayoutError> {
         if !self.max_width.is_finite() || self.max_width <= 0.0 {
             return Err(LayoutError::InvalidConfig(
                 "max_width must be finite and positive",

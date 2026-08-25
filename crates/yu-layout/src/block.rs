@@ -615,6 +615,9 @@ impl GlyphBox {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LineBox {
     index: usize,
+    /// 内容起点 x，也就是这一行的行级缩进。空行上 caret 与 hit-test 只能
+    /// 问它——问不到就把光标停在块的左边缘。
+    indent: f32,
     visual: VisualRange,
     /// 行盒在 block 局部坐标里的矩形。`x` 现在恒为 0（左对齐），
     /// 它是一个 [`LayoutRect`] 而不是散装的三个 `f32`，因为不变量 E6 要求
@@ -640,6 +643,13 @@ impl LineBox {
     #[must_use]
     pub const fn bounds(&self) -> LayoutRect {
         self.bounds
+    }
+
+    /// 内容起点 x（行级缩进）。行盒本身仍然从 0 开始——缩进吃掉的是可用
+    /// 宽度，不是把整行推走。
+    #[must_use]
+    pub const fn indent(&self) -> f32 {
+        self.indent
     }
 
     #[must_use]
@@ -1175,15 +1185,8 @@ impl BlockLayout {
     ///
     /// 空行上没有簇可问，caret 与 hit-test 只能问它。少了这一条，缩进块里
     /// 的空行会把光标停在块的左边缘。
-    fn content_start(&self, line: &LineBox) -> f32 {
-        line.style
-            .and_then(|style| {
-                self.line_attrs
-                    .iter()
-                    .find(|(_, id, _)| *id == style)
-                    .map(|(_, _, attrs)| attrs.indent())
-            })
-            .unwrap_or(0.0)
+    const fn content_start(&self, line: &LineBox) -> f32 {
+        line.indent
     }
 
     /// 一个 block 局部坐标点落在哪个视觉偏移上。
@@ -1468,6 +1471,7 @@ impl BlockLayout {
         }
         self.lines.push(LineBox {
             index: cursor.index,
+            indent: cursor.indent,
             visual,
             bounds: LayoutRect::new(0.0, y, cursor.width, height)?,
             baseline,
