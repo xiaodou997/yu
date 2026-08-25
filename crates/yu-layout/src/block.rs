@@ -1160,12 +1160,30 @@ impl BlockLayout {
                 inside = Some(cluster);
             }
         }
-        let x = caret_x(before, after, inside);
+        let x = match (before, after, inside) {
+            (None, None, None) => self.content_start(line),
+            _ => caret_x(before, after, inside),
+        };
         Ok(CaretBox {
             visual,
             line: line_index,
             point: LayoutPoint::new(x, line.bounds.y()),
         })
+    }
+
+    /// 一行内容的起点 x，也就是它的行级缩进。
+    ///
+    /// 空行上没有簇可问，caret 与 hit-test 只能问它。少了这一条，缩进块里
+    /// 的空行会把光标停在块的左边缘。
+    fn content_start(&self, line: &LineBox) -> f32 {
+        line.style
+            .and_then(|style| {
+                self.line_attrs
+                    .iter()
+                    .find(|(_, id, _)| *id == style)
+                    .map(|(_, _, attrs)| attrs.indent())
+            })
+            .unwrap_or(0.0)
     }
 
     /// 一个 block 局部坐标点落在哪个视觉偏移上。
@@ -1192,7 +1210,10 @@ impl BlockLayout {
                 best = Some((distance, x, offset));
             }
         }
-        let (x, visual) = best.map_or((0.0, line.visual.start()), |(_, x, offset)| (x, offset));
+        let (x, visual) = best.map_or_else(
+            || (self.content_start(line), line.visual.start()),
+            |(_, x, offset)| (x, offset),
+        );
         Ok(CaretBox {
             visual,
             line: line_index,
@@ -1366,6 +1387,11 @@ impl BlockLayout {
     }
 
     /// 开一条新行，按**行首**的视觉偏移定它的行级样式。
+    ///
+    /// 文末那个空行（视觉文本以强制换行结尾时会有一条）的行首正好落在最后
+    /// 一段的**右端点**上，半开区间接不住它。它属于最后那一段：接不住会让
+    /// 一个缩进块的最后一行退回零缩进，光标停在块的左边缘——不报错，只是
+    /// 停错地方。
     fn start_line(
         &self,
         index: usize,
@@ -1379,6 +1405,17 @@ impl BlockLayout {
             .find(|(range, _, _)| {
                 range.start() <= visual_start
                     && (visual_start < range.end() || range.start() == range.end())
+            })
+            .or_else(|| {
+                // 只有文末那个空行走这一条。块中间的一条行首落在某段右端点
+                // 上的行归下一段管，`find` 已经把它接走了。
+                (visual_start == self.visual_len)
+                    .then(|| {
+                        self.line_attrs
+                            .last()
+                            .filter(|(range, _, _)| range.end() == visual_start)
+                    })
+                    .flatten()
             })
             .map_or((None, LineAttrs::default()), |(_, style, attrs)| {
                 (Some(*style), *attrs)
@@ -2122,6 +2159,46 @@ mod tests {
             local_range(5).expect("局部空间"),
             TextRange::new(ByteOffset::ZERO, ByteOffset::new(5)).expect("有序")
         );
+    }
+
+    /// 文末的空行属于最后一段行级样式。半开区间接不住它。
+    #[test]
+    fn the_trailing_empty_line_keeps_the_last_line_style() {
+        struct Indent;
+        impl LineStyleTable for Indent {
+            fn attrs(&self, _style: LineStyleId) -> Option<LineAttrs> {
+                LineAttrs::new(4.0, 1.0).ok()
+            }
+        }
+        let text = "ab\n";
+        let spans = vec![LineSpan::new(visual(0, 3), LineStyleId(0))];
+        let layout = BlockLayout::build_all(
+            LayoutInput::new(text, &plain(text)).with_line_styles(&spans),
+            LayoutConfig::new(80.0, 1.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &Indent,
+            &MonospaceMetrics::default(),
+        )
+        .expect("布局");
+        assert_eq!(layout.lines().len(), 2);
+        assert_eq!(layout.lines()[1].style(), Some(LineStyleId(0)));
+        // caret 与 hit-test 在空行上都只能问行级缩进：问不到就把光标停在
+        // 块的左边缘，点一下也跳回那里。
+        assert_eq!(
+            layout
+                .caret(VisualOffset::new(3), CaretAffinity::Downstream)
+                .expect("行末 caret")
+                .point()
+                .x(),
+            4.0
+        );
+        let hit = layout
+            .hit(LayoutPoint::new(0.0, 1.5))
+            .expect("空行 hit-test");
+        assert_eq!(hit.line(), 1);
+        assert_eq!(hit.point().x(), 4.0);
+        assert_eq!(hit.visual(), VisualOffset::new(3));
     }
 
     /// 一份漏掉半段文本的 run 列表会画出少了几个字的一行，既不 panic 也不
