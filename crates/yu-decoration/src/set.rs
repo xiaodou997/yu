@@ -327,6 +327,18 @@ fn mapped_source_len(before: ByteOffset, changes: &ChangeSet) -> ByteOffset {
 /// 让 `Decoration` 在本模块可见（`merge_hidden` 通过 `hides_source` 用到）。
 const _: fn(Decoration) -> bool = Decoration::hides_source;
 
+/// 不变量 D2：装饰集合不可变、与 Revision 绑定，**可安全并发读取**。
+///
+/// 「可安全并发读取」在 Rust 里就是 `Send + Sync`，而它是由字段推导出来的，
+/// 不是声明出来的——今天成立不代表明天成立。往树里塞一个 `Rc` 或 `Cell`
+/// 做缓存，编译照过、测试全绿，只有把集合发给后台任务的那一刻才炸，而那
+/// 条路径此刻还不存在（S4 只建数据结构，G1 的后台快照读取要到后面才接）。
+/// 这一行让它在编译期就失败。
+const _: fn() = || {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<DecorationSet>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::{DecorationSet, MapError, MergeError};
