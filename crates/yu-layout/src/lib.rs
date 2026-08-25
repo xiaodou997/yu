@@ -14,7 +14,7 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{
     Affinity, ByteOffset, ClusterMetrics, FontFaceId, GeometryError, GlyphId, ShapedText,
-    ShapingProvider, TextAnchor, TextRange, TextStyle,
+    ShapingProvider, StyleId, TextAnchor, TextRange, TextStyle,
 };
 use yu_projection::{
     BlockProjection, BlockQuotePresentation, HeadingPresentation, LeadingMarker, Projection,
@@ -22,8 +22,13 @@ use yu_projection::{
 };
 use yu_text::{ChangeSet, TextSnapshot};
 
+mod block;
 mod table;
 
+pub use block::{
+    BlockLayout, CaretBox, ClusterBox, LayoutInput, LineBox, StyleTable, StyledRun,
+    UniformStyleTable,
+};
 pub use table::{
     TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeCommit, TableResizeGesture,
     TableResizeGestureError, TableResizeHit, TableResizeTarget,
@@ -306,6 +311,17 @@ pub enum LayoutError {
     InvalidImageBounds,
     InvalidTable(&'static str),
     OffsetOverflow,
+    /// 样式表里没有这个 id。装饰产出与样式表脱节时必须响，不能按默认字型排。
+    UnknownStyle(StyleId),
+    /// [`StyledRun`] 没有无缝铺满视觉文本。
+    RunsNotContiguous {
+        expected: VisualOffset,
+        found: VisualOffset,
+    },
+    /// run 的边界不在 UTF-8 字符边界上。
+    RunNotOnCharBoundary,
+    /// 查询用的视觉偏移超出了这个块。
+    VisualOutOfBounds(VisualOffset),
 }
 
 /// Errors raised by the viewport height index.
@@ -494,6 +510,19 @@ impl fmt::Display for LayoutError {
             }
             Self::InvalidTable(message) => write!(formatter, "invalid table layout: {message}"),
             Self::OffsetOverflow => formatter.write_str("layout offset overflow"),
+            Self::UnknownStyle(style) => {
+                write!(formatter, "style table has no entry for {style:?}")
+            }
+            Self::RunsNotContiguous { expected, found } => write!(
+                formatter,
+                "styled runs must tile the visual text: expected {expected:?}, found {found:?}"
+            ),
+            Self::RunNotOnCharBoundary => {
+                formatter.write_str("styled run boundary is not on a UTF-8 char boundary")
+            }
+            Self::VisualOutOfBounds(visual) => {
+                write!(formatter, "visual offset {visual:?} is outside this block")
+            }
         }
     }
 }
@@ -509,7 +538,11 @@ impl Error for LayoutError {
             | Self::InvalidPoint
             | Self::InvalidImageBounds
             | Self::InvalidTable(_)
-            | Self::OffsetOverflow => None,
+            | Self::OffsetOverflow
+            | Self::UnknownStyle(_)
+            | Self::RunsNotContiguous { .. }
+            | Self::RunNotOnCharBoundary
+            | Self::VisualOutOfBounds(_) => None,
         }
     }
 }

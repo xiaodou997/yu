@@ -3,33 +3,17 @@
 //! 对应 `docs/architecture/overview-v2.md` 第 5.1 节。不变量 D1 规定视觉表现
 //! 的唯一来源是 DecorationSet：任何「隐藏语法字符」「替换为控件」「改变样式」
 //! 都必须表达成这里的一个值，不得在 layout 或 scene 里开特殊分支。
+//!
+//! # 三个 id 现在住在 `yu-core`
+//!
+//! `StyleId` / `LineStyleId` / `WidgetId` / `WidgetSide` 原本定义在这个文件里。
+//! S5 把它们挪进了 `yu-core::style`：它们是**装饰层与布局层之间的共用词汇**，
+//! 而这两个 crate 互不依赖（不变量 E2），共用词汇只能住在共同下游。
+//! 这里原样再导出，本 crate 的公开面不变。含义仍然由上层解释，见
+//! `yu_core::style` 的模块文档。
 
 use yu_core::TextRange;
-
-/// 样式表里的一项。具体内容由上层解释，这一层只搬运标识。
-///
-/// 这一层**不认识 Markdown**（第 4.3 节）。它不知道 `StyleId(3)` 是不是
-/// 「加粗」，只知道两个相同的 id 该被同样对待。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StyleId(pub u32);
-
-/// 一个视觉物件的标识。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WidgetId(pub u32);
-
-/// 整行/整块样式的标识。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LineStyleId(pub u32);
-
-/// 空 range 上的 widget 落在光标的哪一侧。
-///
-/// 非空 range 的 widget 用不到它——那种情况下 widget 覆盖并隐藏了一段 source，
-/// 位置没有歧义。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum WidgetSide {
-    Before,
-    After,
-}
+pub use yu_core::{LineStyleId, StyleId, WidgetId, WidgetSide};
 
 /// 一条装饰。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
