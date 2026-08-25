@@ -8,6 +8,7 @@
 //! 理由见 `docs/architecture/overview-v2.md` 第 8 节 S4。
 
 mod accessibility;
+mod blockinput;
 mod command;
 mod document;
 mod keymap;
@@ -21,6 +22,10 @@ pub use accessibility::{
     AccessibilitySemanticKind, AccessibilitySemanticNode, AccessibilitySemanticSnapshot,
     AccessibilityTextError, AccessibilityTextPosition, AccessibilityTextRange,
     AccessibilityTextSnapshot,
+};
+pub use blockinput::{
+    BlockLayoutInput, BlockLineStyleTable, BlockOrnaments, BlockQuoteOrnament, BlockStyleTable,
+    HeadingOrnament, MarkerOrnament, style_id,
 };
 pub use command::{CommandResult, EditorCommand, KeyRouteResult, SourceChange, SourceSync};
 pub use document::{EditorDocument, EditorDocumentError};
