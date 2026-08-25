@@ -26,8 +26,8 @@ mod block;
 mod table;
 
 pub use block::{
-    BlockLayout, CaretBox, ClusterBox, LayoutInput, LineAttrs, LineBox, LineSpan, LineStyleTable,
-    NoLineStyles, NoWidgets, StyleTable, StyledRun, UniformStyleTable, WidgetBox,
+    BlockLayout, CaretBox, ClusterBox, GlyphBox, LayoutInput, LineAttrs, LineBox, LineSpan,
+    LineStyleTable, NoLineStyles, NoWidgets, StyleTable, StyledRun, UniformStyleTable, WidgetBox,
     WidgetConstraints, WidgetMeasure, WidgetMeasurement, WidgetMetrics, WidgetSpan,
 };
 pub use table::{
