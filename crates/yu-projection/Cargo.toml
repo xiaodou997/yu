@@ -15,3 +15,13 @@ yu-text = { path = "../yu-text" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# **临时的、向上的测试依赖，随本 crate 一起消失。**
+#
+# tests/decoration_parity.rs 比对两条产出隐藏区间的路：v1 的行内扫描器
+# （本 crate）与 yu-syntax 的语法树（经 yu-markdown 产出 decoration）。
+# 前者是 oracle，后者是 S6 要留下的那条。两者都在 yu-projection 删除前存在，
+# 这条边也就到那时为止。
+yu-decoration = { path = "../yu-decoration" }
+yu-syntax = { path = "../yu-syntax" }

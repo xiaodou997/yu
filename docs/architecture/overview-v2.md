@@ -61,6 +61,11 @@ CST 新节点 → Projection 新类型 → Layout 新分支 → Scene 新 Primit
 
 v1 自己的不变量「渲染层不认识 Markdown」已经被破坏。
 
+泄漏的代价不只是「改动要动 7 处」。S4 拿 v1 的行内扫描器与 `yu-syntax` 逐份
+文档比对隐藏区间（见第 8 节 S4），76 份语料里 v1 有 11 份判错，成因只有一个：
+**扫描器没有块级上下文**，于是在缩进代码块、`~~~` 围栏、HTML 注释、autolink
+内部照样去找行内定界符，把它们隐藏掉。呈现层拿到的是错的输入，而它不报错。
+
 ### 2.2 双渲染路径（TextKit fail-closed fallback）
 
 v1 要求 Rust surface 对当前 viewport 拥有**完整 retained coverage**，否则整页回退
@@ -580,10 +585,57 @@ CommonMark 规范用例与 comrak，不是扫描器——拿扫描器当 oracle 
 ### S4 · 中枢
 
 实现 `yu-decoration`（RangeSet + Decoration + map + source↔visual 映射）；
-`yu-state` 收敛 EditorState / Transaction / Facet / History。
+`yu-state` 收敛 EditorState / Transaction / Facet / History。**进行中。**
 
 - 验收：proptest 验证 decoration 在任意 ChangeSet 序列下的迁移正确性；
   source↔visual 双向映射 round-trip 无损。
+
+**做法：先打一条薄纵切，而不是按文档顺序做完。** S4 与 S3 最大的不同是
+**有 oracle**：`yu-projection` 的 source↔visual 映射已经在产品里跑着，
+而 S3 没有可比的既有实现。验收条目里的 round-trip 是个**自证**性质——一份
+把所有东西映射到 0 的实现也满足它。真正要问的「映射到的位置对不对」只能靠
+oracle 回答，所以先把 `yu-syntax → yu-markdown → yu-decoration` 这条链端到端
+接通一次，与 v1 逐点比对，再去做剩下的宽度。
+
+已完成的两块：
+
+- **映射的差分**（`crates/yu-decoration/tests/projection_differential.rs`）。
+  隐藏区间从真实 Projection 里取，原样喂给 `DecorationSet`，两边输入完全
+  一致，因此任何差异都只能来自映射本身。`yu-projection` 在查询时沿后继找
+  相邻隐藏区间，`yu-decoration` 在构造期合并——两条不同的路，同一个答案。
+- **隐藏区间的差分**（`crates/yu-projection/tests/decoration_parity.rs`）。
+  回答上一条刻意回避的另一半：**`yu-syntax` 的标记节点范围能不能真的驱动
+  「隐藏语法」？** 76 份语料，答案是能，而且没有一条是 `yu-syntax` 错。
+
+**关于「拿扫描器当 oracle」。** 上一节 S3 的末尾写着「拿扫描器当 oracle
+只会把它的非规范行为固化成期望」，这里看起来是反过来做了。区别在于比的是
+什么：S3 要比的是**解析结果**，扫描器的扁平块序列与 CST 没有共同契约，
+比它等于把非规范行为写进期望；这里比的是**哪些字节被隐藏**，两条路各自
+产出一组 source 区间，契约相同、可逐字节对齐。而且差异不是被吸收成期望，
+是被逐条归因登记的——`DIVERGENCES` 表里每一行都写明是谁错、为什么。
+
+**这轮拿到的实证。** 76 份语料里 60 份逐字节一致，16 份登记了差异，分两类：
+
+- **v1 扫描器错（10 条）。** 它没有块级上下文，于是在不该解析行内语法的
+  地方解析了：四空格与制表符缩进的代码块、`~~~` 围栏、HTML 注释、autolink
+  内部、多重反引号代码跨度的内部——用户看到的代码会静静少掉两个字符。
+  另有一类是遇到三个以上连续定界符（`***both***`、`**a*b***`）就整段放弃，
+  同一行里前面的强调仍然正确，**失败是局部的、静默的**。
+- **有意的不同（5 条）。** v1 隐藏的语法**种类**更多：链接括号与目标、
+  图片、autolink 尖括号、硬换行的尾随空格。`yu-markdown::decorations` 现在
+  只做强调与行内代码，其余种类是 S6 逐个 extension 的工作。
+
+剩下 1 条两者兼有：`<http://a.com/*b*>` 里 v1 隐藏尖括号是有意的，隐藏
+autolink 内部的 `*` 是错的。这几个数字由 `decoration_parity.rs` 的一条计数
+断言钉住，语料增删时会红。
+
+第一类是第 2.1 节「Markdown 语义泄漏」的直接实证：v1 的行内扫描器不是
+「差一点」，是**结构上拿不到判断所需的信息**。登记表两个方向都紧——差异
+消失了也要红，好让 S6 补齐装饰时必须回来删掉对应的行。
+
+**还没做的：** `yu-state` 的边界（`yu-editor` 里那 4,266 行 `document.rs`
+大部分是布局入口，属于 S5，不该被这一轮拖进来）、`Facet`（当前零消费者，
+建不建要看 S3 那条教训）、不变量 F3 的引用标签归一化。
 
 ### S5 · 布局重写
 

@@ -11,6 +11,10 @@
 //! 的标记节点范围，能不能真的驱动「隐藏语法」？** S3 结束时 `yu-syntax`
 //! 零消费者，这个问题没有答案；再拖到 S5 就要和布局重写一起爆。
 //!
+//! 答案是能。`crates/yu-projection/tests/decoration_parity.rs` 拿 v1 的行内
+//! 扫描器当 oracle，76 份语料逐字节比对，没有一处是这里的范围错了；判错的
+//! 11 份全是 v1 缺块级上下文。
+//!
 //! 老的扫描器（本 crate 的其余部分）仍然是产品链路，两者在 S6 之前并存。
 
 use yu_core::{ByteOffset, Revision, TextRange};
@@ -20,8 +24,8 @@ use yu_syntax::{NodeKind, Tree};
 /// 隐藏行内语法标记的装饰。
 ///
 /// 现在只覆盖强调与行内代码的定界符——挑这两种是因为 `yu-projection` 的
-/// `Projection::inline` 恰好也只隐藏它们，于是两者可以逐点比对
-/// （见 `tests/decoration_differential.rs`）。
+/// `Projection::inline` 恰好也只隐藏它们，于是两者可以逐份文档比对
+/// （见 `crates/yu-projection/tests/decoration_parity.rs`）。
 ///
 /// 块级前缀（`#`、`>`、列表标记）与链接的括号暂不隐藏：它们在 v1 里是靠
 /// 「语义 marker」而不是单纯隐藏来呈现的，属于 S6 逐个 extension 的工作。
