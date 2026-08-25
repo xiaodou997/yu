@@ -1637,7 +1637,7 @@ mod tests {
         let primitives = frame.scene().scene().primitives();
         let quote_index = primitives
             .iter()
-            .position(|primitive| matches!(primitive, Primitive::BlockQuote(_)))
+            .position(|primitive| matches!(primitive, Primitive::LineOrnament(_)))
             .expect("blockquote primitive");
         let glyph_index = primitives
             .iter()
@@ -1645,7 +1645,7 @@ mod tests {
             .expect("glyph primitive");
         assert!(quote_index < glyph_index);
 
-        let Primitive::BlockQuote(quote) = primitives[quote_index] else {
+        let Primitive::LineOrnament(quote) = primitives[quote_index] else {
             unreachable!("located blockquote primitive");
         };
         assert_eq!(
@@ -2391,7 +2391,7 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::BlockQuote(_)
+                | Primitive::LineOrnament(_)
                 | Primitive::Table(_)
                 | Primitive::TaskCheckbox(_)
                 | Primitive::EditorDecoration(_) => None,
@@ -2422,7 +2422,7 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::BlockQuote(_)
+                | Primitive::LineOrnament(_)
                 | Primitive::Table(_)
                 | Primitive::TaskCheckbox(_)
                 | Primitive::EditorDecoration(_) => None,
@@ -2481,7 +2481,7 @@ mod tests {
             Primitive::Glyph(_)
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
-            | Primitive::BlockQuote(_)
+            | Primitive::LineOrnament(_)
             | Primitive::Table(_)
             | Primitive::TaskCheckbox(_)
             | Primitive::EditorDecoration(_) => {
