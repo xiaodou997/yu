@@ -1,82 +1,10 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_core::{ByteOffset, Revision, Utf16Offset};
+use yu_core::{
+    ByteOffset, CaretAffinity, NativeCaretPosition, Revision, SourceCaretPosition, Utf16Offset,
+};
 use yu_text::{TextPositionError, TextSnapshot};
-
-/// Selects one of the two visual caret locations available at a line boundary.
-///
-/// This is deliberately separate from `yu_core::Affinity`, which controls how
-/// source anchors follow edits. Caret affinity is a layout concern: upstream is
-/// the end of the preceding visual line, downstream is the start of the next.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum CaretAffinity {
-    Upstream,
-    #[default]
-    Downstream,
-}
-
-/// A caret anchored to a UTF-8 source position in one immutable revision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SourceCaretPosition {
-    revision: Revision,
-    offset: ByteOffset,
-    affinity: CaretAffinity,
-}
-
-impl SourceCaretPosition {
-    pub(crate) const fn new(
-        revision: Revision,
-        offset: ByteOffset,
-        affinity: CaretAffinity,
-    ) -> Self {
-        Self {
-            revision,
-            offset,
-            affinity,
-        }
-    }
-
-    #[must_use]
-    pub const fn revision(self) -> Revision {
-        self.revision
-    }
-
-    #[must_use]
-    pub const fn offset(self) -> ByteOffset {
-        self.offset
-    }
-
-    #[must_use]
-    pub const fn affinity(self) -> CaretAffinity {
-        self.affinity
-    }
-}
-
-/// A caret position expressed in the UTF-16 coordinates used by native text systems.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct NativeCaretPosition {
-    revision: Revision,
-    offset: Utf16Offset,
-    affinity: CaretAffinity,
-}
-
-impl NativeCaretPosition {
-    #[must_use]
-    pub const fn revision(self) -> Revision {
-        self.revision
-    }
-
-    #[must_use]
-    pub const fn offset(self) -> Utf16Offset {
-        self.offset
-    }
-
-    #[must_use]
-    pub const fn affinity(self) -> CaretAffinity {
-        self.affinity
-    }
-}
 
 /// Revision-bound conversion at the source/native text-system boundary.
 ///
@@ -114,34 +42,30 @@ impl CaretPositionMap {
         affinity: CaretAffinity,
     ) -> Result<NativeCaretPosition, CaretPositionError> {
         self.source.byte_offset_for_utf16(offset)?;
-        Ok(NativeCaretPosition {
-            revision: self.revision(),
-            offset,
-            affinity,
-        })
+        Ok(NativeCaretPosition::new(self.revision(), offset, affinity))
     }
 
     pub fn to_native(
         &self,
         position: SourceCaretPosition,
     ) -> Result<NativeCaretPosition, CaretPositionError> {
-        self.validate_revision(position.revision)?;
-        Ok(NativeCaretPosition {
-            revision: self.revision(),
-            offset: self.source.utf16_offset(position.offset)?,
-            affinity: position.affinity,
-        })
+        self.validate_revision(position.revision())?;
+        Ok(NativeCaretPosition::new(
+            self.revision(),
+            self.source.utf16_offset(position.offset())?,
+            position.affinity(),
+        ))
     }
 
     pub fn to_source(
         &self,
         position: NativeCaretPosition,
     ) -> Result<SourceCaretPosition, CaretPositionError> {
-        self.validate_revision(position.revision)?;
+        self.validate_revision(position.revision())?;
         Ok(SourceCaretPosition::new(
             self.revision(),
-            self.source.byte_offset_for_utf16(position.offset)?,
-            position.affinity,
+            self.source.byte_offset_for_utf16(position.offset())?,
+            position.affinity(),
         ))
     }
 

@@ -407,3 +407,93 @@ impl VisualRange {
         self.start.get() == self.end.get()
     }
 }
+
+/// Selects one of the two visual caret locations available at a line boundary.
+///
+/// This is deliberately separate from [`Affinity`], which controls how source
+/// anchors follow edits. Caret affinity is a layout concern: upstream is the end
+/// of the preceding visual line, downstream is the start of the next.
+/// `docs/specs/coordinates.md` forbids reusing one for the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CaretAffinity {
+    Upstream,
+    #[default]
+    Downstream,
+}
+
+/// A caret anchored to a UTF-8 source position in one immutable revision.
+///
+/// Constructing one does **not** mean the position is valid: this type only
+/// records `(revision, offset, affinity)`. Whether the offset is on a character
+/// boundary of that revision is checked by the caret map that produced it
+/// (`yu_state::CaretPositionMap`), not here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SourceCaretPosition {
+    revision: Revision,
+    offset: ByteOffset,
+    affinity: CaretAffinity,
+}
+
+impl SourceCaretPosition {
+    #[must_use]
+    pub const fn new(revision: Revision, offset: ByteOffset, affinity: CaretAffinity) -> Self {
+        Self {
+            revision,
+            offset,
+            affinity,
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn offset(self) -> ByteOffset {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn affinity(self) -> CaretAffinity {
+        self.affinity
+    }
+}
+
+/// A caret position expressed in the UTF-16 coordinates used by native text systems.
+///
+/// Same caveat as [`SourceCaretPosition`]: the constructor records, it does not
+/// validate. A UTF-16 offset in the middle of a surrogate pair is rejected by the
+/// caret map, not by this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeCaretPosition {
+    revision: Revision,
+    offset: Utf16Offset,
+    affinity: CaretAffinity,
+}
+
+impl NativeCaretPosition {
+    #[must_use]
+    pub const fn new(revision: Revision, offset: Utf16Offset, affinity: CaretAffinity) -> Self {
+        Self {
+            revision,
+            offset,
+            affinity,
+        }
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn offset(self) -> Utf16Offset {
+        self.offset
+    }
+
+    #[must_use]
+    pub const fn affinity(self) -> CaretAffinity {
+        self.affinity
+    }
+}

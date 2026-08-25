@@ -1,10 +1,11 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange, Utf16Range};
+use yu_core::{
+    Affinity, ByteOffset, CaretAffinity, Revision, SourceCaretPosition, TextAnchor, TextRange,
+    Utf16Range,
+};
 use yu_text::{AnchorMapError, ChangeSet, TextPositionError, TextSnapshot};
-
-use crate::{CaretAffinity, SourceCaretPosition};
 
 /// A source selection whose two endpoints belong to one immutable revision.
 ///
@@ -105,7 +106,7 @@ impl EditorSelection {
     }
 
     /// Maps both endpoints through a successful source edit.
-    pub(crate) fn map_through(
+    pub fn map_through(
         self,
         change_set: &ChangeSet,
         snapshot: &TextSnapshot,

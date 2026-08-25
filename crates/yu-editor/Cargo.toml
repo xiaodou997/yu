@@ -13,6 +13,7 @@ yu-core = { path = "../yu-core" }
 yu-layout = { path = "../yu-layout" }
 yu-markdown = { path = "../yu-markdown" }
 yu-projection = { path = "../yu-projection" }
+yu-state = { path = "../yu-state" }
 yu-text = { path = "../yu-text" }
 unicode-segmentation = "1.13"
 

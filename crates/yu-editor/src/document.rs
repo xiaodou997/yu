@@ -6,6 +6,7 @@ use std::sync::Arc;
 use yu_core::{ByteOffset, LineIndex, Revision, ShapingProvider, TextRange, Utf16Range};
 use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutSnapshot, TableResizeCommit};
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
+use yu_state::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
 };
@@ -20,7 +21,6 @@ use crate::{
         next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
         previous_word_boundary,
     },
-    history::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats},
     keymap::command_for_key,
     list::ListLinePrefix,
 };

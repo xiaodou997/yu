@@ -618,6 +618,7 @@ dependencies = [
  "yu-layout",
  "yu-markdown",
  "yu-projection",
+ "yu-state",
  "yu-text",
 ]
 
@@ -739,6 +740,14 @@ dependencies = [
  "yu-layout",
  "yu-markdown",
  "yu-projection",
+ "yu-text",
+]
+
+[[package]]
+name = "yu-state"
+version = "0.1.0"
+dependencies = [
+ "yu-core",
  "yu-text",
 ]
 

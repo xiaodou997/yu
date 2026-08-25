@@ -585,7 +585,11 @@ CommonMark 规范用例与 comrak，不是扫描器——拿扫描器当 oracle 
 ### S4 · 中枢
 
 实现 `yu-decoration`（RangeSet + Decoration + map + source↔visual 映射）；
-`yu-state` 收敛 EditorState / Transaction / Facet / History。**进行中。**
+`yu-state` 收敛编辑状态。**进行中。**
+
+> 本条初版写的是「`yu-state` 收敛 EditorState / Transaction / Facet /
+> History」。四项里有三项要改，理由在下面的「yu-state 收了什么」一节，
+> 每一项都是往后推或换位置，没有一项是悄悄放宽验收。
 
 - 验收：proptest 验证 decoration 在任意 ChangeSet 序列下的迁移正确性；
   source↔visual 双向映射 round-trip 无损。
@@ -645,9 +649,46 @@ autolink 内部的 `*` 是错的。这几个数字由 `decoration_parity.rs` 的
 「差一点」，是**结构上拿不到判断所需的信息**。登记表两个方向都紧——差异
 消失了也要红，好让 S6 补齐装饰时必须回来删掉对应的行。
 
-**还没做的：** `yu-state` 的边界（`yu-editor` 里那 4,266 行 `document.rs`
-大部分是布局入口，属于 S5，不该被这一轮拖进来）、`Facet`（当前零消费者，
-建不建要看 S3 那条教训）、不变量 F3 的引用标签归一化。
+**yu-state 收了什么。** 建 `yu-state`，搬进 history（235 行）、selection
+（287）、caret 绑定（196）、composition（310），合计 1,028 行。边界不是猜的：
+这四个模块的 `use` 里只有 `yu-core` 与 `yu-text`，一个布局或投影类型都没有，
+搬迁前逐个文件核对过。`yu-editor` 依赖它并再导出，平台层与 FFI 的路径不变。
+
+初版那句话里的四项，三项要改：
+
+- **`Transaction` 留在 `yu-text`，不搬。** 它是文本编辑的原语，
+  `TextBuffer::apply` 就以它为输入；往上搬会让 `yu-text` 反过来依赖
+  `yu-state`。它出现在原句里是把「事务」和「编辑器状态」混为一谈了。
+- **`Facet` 不建，推迟到 S6。** 它零消费者，而 S4 的两条验收标准都不涉及
+  它。真实的配置聚合需求要等 extension 化才出现——S3 就是为同样的理由
+  没有移植 lezer 的 `configure`，那条教训是「建一份没有使用者也没有测试的
+  抽象会烂掉」。
+- **`EditorState` 推迟到 S5。** `EditorDocument` 的十个字段分得很干净：七个
+  是编辑状态（buffer / markdown / composition / selection / preferred_x /
+  last_source_change / history），三个是缓存与布局（projections / layouts /
+  viewport）。现在抽 `EditorState` 是纯机械重构，要动 4,266 行，产物是一个
+  `EditorState` 加一个**仍然 4,266 行**的 `EditorDocument`，而 S5 把那三个
+  字段挪走之后剩下的正好就是 `EditorState`，那时抽取几乎免费。顺序反了。
+
+**顺带修正一处坐标文档偏差。** `docs/specs/coordinates.md` 一直写着源码坐标
+「全部定义在 `yu-core`」，表里列着 `SourceCaretPosition` 与
+`NativeCaretPosition`，而它们实际住在 `yu-editor/src/caret.rs`。与上一轮
+`VisualOffset` / `VisualRange` 是同一种情况，处理也相同：三个纯坐标类型
+（含 `CaretAffinity`）迁进 `yu-core`，把逻辑（`CaretPositionMap`）留给
+`yu-state`。迁移时它们的构造函数从 `pub(crate)` 变成 `pub`，所以在类型的
+文档里写明了「构造只是记录，不代表位置合法」——校验属于 caret map。
+
+**Decoration 的三个变体暂时冻结。** `Mark` / `Line` / `Widget` 在
+`yu-decoration` 之外零消费者，只有 `Replace` 有。它们是不变量 D1 的必然
+要求，S5 与 S6 一定会用，所以不删；但在第一个真实消费者出现之前不该继续
+给它们加能力（Widget 的 measure、Mark 的样式合并规则）。D7 也因此仍然只有
+字节层面的语义：widget 覆盖的 source 不占视觉字节，宽度是 layout 的事。
+
+**还没做的：** `EditorState`（见上，S5）、`Facet`（见上，S6）、不变量 F3 的
+引用标签归一化。F3 要先理清接线——实现点是
+`crates/yu-markdown/src/reference.rs` 里一行 ASCII lowercase，而规范用例 540
+登记在 `yu-syntax` 侧的 `commonmark_spec.rs`，那个 crate 里根本没有归一化
+代码。在理清之前，改那一行不知道会不会让 540 变绿。
 
 ### S5 · 布局重写
 

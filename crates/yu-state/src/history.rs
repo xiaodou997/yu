@@ -4,7 +4,7 @@ use yu_text::{AppliedTransaction, Transaction};
 const DEFAULT_HISTORY_LIMIT: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HistoryGroup {
+pub enum HistoryGroup {
     Typing,
     Deletion,
     ListEditing,
@@ -13,28 +13,28 @@ pub(crate) enum HistoryGroup {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HistoryEntry {
+pub struct HistoryEntry {
     transaction: Transaction,
     group: u64,
 }
 
 impl HistoryEntry {
-    pub(crate) fn new(transaction: Transaction, group: u64) -> Self {
+    pub fn new(transaction: Transaction, group: u64) -> Self {
         Self { transaction, group }
     }
 
-    pub(crate) fn transaction_for(&self, revision: Revision) -> Transaction {
+    pub fn transaction_for(&self, revision: Revision) -> Transaction {
         Transaction::new(revision, self.transaction.edits().iter().cloned())
     }
 
-    pub(crate) fn group(&self) -> u64 {
+    pub fn group(&self) -> u64 {
         self.group
     }
 }
 
 /// Bounded inverse-transaction history with lightweight command grouping.
 #[derive(Debug)]
-pub(crate) struct EditorHistory {
+pub struct EditorHistory {
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     next_group: u64,
@@ -55,7 +55,7 @@ impl Default for EditorHistory {
 }
 
 impl EditorHistory {
-    pub(crate) fn record(&mut self, applied: &AppliedTransaction, kind: HistoryGroup) {
+    pub fn record(&mut self, applied: &AppliedTransaction, kind: HistoryGroup) {
         self.redo.clear();
         let group = match self.open_group {
             Some((open_kind, group)) if open_kind == kind => group,
@@ -71,17 +71,17 @@ impl EditorHistory {
         Self::trim(self.limit, &mut self.undo);
     }
 
-    pub(crate) fn break_group(&mut self) {
+    pub fn break_group(&mut self) {
         self.open_group = None;
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
         self.open_group = None;
     }
 
-    pub(crate) fn stats(&self) -> HistoryStats {
+    pub fn stats(&self) -> HistoryStats {
         HistoryStats {
             undo_entries: self.undo.len(),
             redo_entries: self.redo.len(),
@@ -89,7 +89,7 @@ impl EditorHistory {
         }
     }
 
-    pub(crate) fn pop_undo_group(&mut self) -> Option<Vec<HistoryEntry>> {
+    pub fn pop_undo_group(&mut self) -> Option<Vec<HistoryEntry>> {
         let group = self.undo.last()?.group;
         let mut entries = Vec::new();
         while self.undo.last().is_some_and(|entry| entry.group == group) {
@@ -99,7 +99,7 @@ impl EditorHistory {
         Some(entries)
     }
 
-    pub(crate) fn pop_redo_group(&mut self) -> Option<Vec<HistoryEntry>> {
+    pub fn pop_redo_group(&mut self) -> Option<Vec<HistoryEntry>> {
         let group = self.redo.last()?.group;
         let mut entries = Vec::new();
         while self.redo.last().is_some_and(|entry| entry.group == group) {
@@ -109,26 +109,26 @@ impl EditorHistory {
         Some(entries)
     }
 
-    pub(crate) fn restore_undo_group(&mut self, entries: &[HistoryEntry]) {
+    pub fn restore_undo_group(&mut self, entries: &[HistoryEntry]) {
         for entry in entries.iter().rev() {
             self.undo.push(entry.clone());
         }
         Self::trim(self.limit, &mut self.undo);
     }
 
-    pub(crate) fn restore_redo_group(&mut self, entries: &[HistoryEntry]) {
+    pub fn restore_redo_group(&mut self, entries: &[HistoryEntry]) {
         for entry in entries.iter().rev() {
             self.redo.push(entry.clone());
         }
         Self::trim(self.limit, &mut self.redo);
     }
 
-    pub(crate) fn push_redo_group(&mut self, entries: Vec<HistoryEntry>) {
+    pub fn push_redo_group(&mut self, entries: Vec<HistoryEntry>) {
         self.redo.extend(entries);
         Self::trim(self.limit, &mut self.redo);
     }
 
-    pub(crate) fn push_undo_group(&mut self, entries: Vec<HistoryEntry>) {
+    pub fn push_undo_group(&mut self, entries: Vec<HistoryEntry>) {
         self.undo.extend(entries);
         Self::trim(self.limit, &mut self.undo);
     }
