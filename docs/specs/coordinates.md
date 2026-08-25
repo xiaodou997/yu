@@ -56,6 +56,10 @@ Yu 不使用同一个 `usize` 表示所有位置。
 > 坐标，`yu-layout::ImageIntrinsicSize` 是解码后图片自身的像素尺寸。两者都不
 > 落在上面任何一个空间里，也都不是 `f32`。
 
+`yu-layout::LineBox` 与 `WidgetBox` 都持有 `Rect<Block>`，不摊开成
+`y/width/height: f32`。S5 加行高时 `tools/check-geometry.py` 拦过一次——行盒
+本来就是 block 空间里的一个矩形，那不是该登记例外的地方。
+
 ## 视口
 
 `ViewportSpan(scroll_y, height)` 是视口在文档 y 轴上占的区间，不是矩形——

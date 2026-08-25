@@ -738,6 +738,102 @@ UAX #9 bidi、CJK 禁则、widget 盒模型（intrinsic size + baseline 对齐�
 
 - 验收：`grep -ri markdown crates/yu-layout crates/yu-scene crates/yu-render` 零命中。
 
+**进行中。** 新引擎已建成并逐项验证，`yu-scene` / `yu-render` 的产品代码已
+清零；`yu-layout` 的 60 处产品侧命中还在，它们跟着 `LayoutSnapshot` 走。
+
+#### 已完成：`yu-layout::BlockLayout`
+
+输入是**视觉文本 + `StyledRun` + `WidgetSpan` + `LineSpan`**，输出**只有视觉
+坐标**。source ↔ visual 是 `DecorationSet` 的双向映射（D4「这是投影映射链的
+唯一实现」），布局再做一遍就会有第二套，所以调用方在拿到结果之后自己换算。
+
+| 刀 | commit | 内容 |
+| --- | --- | --- |
+| 1 | `d9c5164` | 输入契约与几何差分 |
+| 2 | `8d2927f` | UAX #14 断行、CJK 禁则 |
+| 3 | `fcd6b2c` | UAX #9 bidi |
+| 4 | `9dfd858` | widget 盒模型与 D7 placeholder |
+| 5 | `c149670` | 行级样式（缩进 + 行高倍率） |
+| 6 | `df99158` | `yu-scene` / `yu-render` 词汇清零 |
+
+#### 三个开放问题的答案
+
+**`StyleId` / `LineStyleId` / `WidgetId` 的解释权归产出装饰的那一层。** 它填
+`StyleTable` / `LineStyleTable` / `WidgetMeasure`，布局层只查表拿到「斜体、
+1.6 倍字号、缩进 2.0、宽 120 高 80 基线 72」。这是 E1 在布局层的落法——不是
+「不写 markdown 这个词」，是**拿不到**判断语法语义所需的信息。查不到的 id
+一律报错，不给默认值：那种 bug 只会画得不对，不会响。
+
+词汇（`StyleId` / `LineStyleId` / `WidgetId` / `WidgetSide` / `TextAttrs`）
+迁进了 `yu-core::style`。这不是偏好而是硬约束：`yu-font` 实现 `ClusterMetrics`
+时要用 `TextAttrs`，而 4.2 节规定 `yu-font` 只能依赖 `yu-core`。`yu-decoration`
+原样再导出，公开面不变。处理方式与 S3 的 `VisualOffset`、S4 的 caret 坐标
+一致：纯类型归 `yu-core`，逻辑留在原处。
+
+**几何差分按「有没有发生软换行」分两个口径。** v1 布局的断行是按 grapheme
+贪心（`line_width + advance > max_width` 就地断），没有 UAX #14。补上之后
+新旧断点必然不同，所以：
+
+- 没有软换行（换行全部来自强制换行符）：两条路本该一致，逐点比对行盒、
+  簇盒、caret、hit-test。56 个组合。
+- 发生软换行：oracle 失效，比对退化为一条仍然成立的性质——**断行规则只改变
+  grapheme 被分到哪一行，不改变 grapheme 本身**。36 个组合。
+
+两个口径各自钉了组合数（56 + 36 = 23×4），免得整批用例悄悄滑进弱口径那边
+还看起来是绿的。断行规则本身的正确性不拿 v1 当 oracle，也**没有**把 Unicode
+的 `LineBreakTest.txt` 搬进仓库——那只会再测一遍 `unicode-linebreak`，它在
+上游已经逐条跑过。这里证明的是「我们用对了它」。口径与 F3「不为一条用例扩大
+依赖面」一致。
+
+**渐进替换，新旧并存，靠差分守着。** 一次性重写没有 oracle 可用。
+
+#### 这一轮的实证
+
+- **v1 的断行不是「差一点」，是没有断行算法。** 24 个语料×宽度组合的断点在
+  UAX #14 落地后全变了。行尾空白现在悬在行外（UAX #14 的断行机会在空白
+  **之后**，让空白把整个词挤到下一行是错的），代价是这样的行宽会超过
+  `max_width`，这是有意的。
+- **CJK 禁则不需要 tailoring。** UAX #14 的默认对表已经覆盖：`、`「`」`不落
+  行首、`「`不落行末。窄到放不下时退回应急断行，禁则让位——看起来像禁则
+  失效，单独有一条用例记着它是宽度不够。
+- **方向变化处的 caret 取层级更低的那一侧**（UAX #9 §3.4）。第一版写的是
+  「一律取逻辑上在前那个的后沿」，那会让边界两侧的两个几何位置落在同一处，
+  RTL 段落右端那个位置既画不出也点不到。`caret` 与 `hit` 共用同一个
+  `caret_x`——两处各写一遍规则，在方向变化处就会对不上：点一下，光标跳到
+  别处。这条一致性本身是一条用例，而且它就是抓到上面那个问题的那条。
+- **`tools/check-geometry.py` 拦了一次。** `LineBox` 因为多了 `height` 变成
+  「自己摊开 width/height 的散装四元组」。改成持有一个 `LayoutRect`，不是
+  登记例外——行盒本来就是 block 空间里的一个矩形。E6 守得对。
+- **22 个变异里 4 个第一次没被抓到**，都补了用例。最有代表性的一个：把
+  「行尾空白不参与排不排得下的判断」去掉，三条用例全绿——因为它们的那一段
+  都是行首第一段，行宽为 0 时怎么算都放得下，压根走不到那个分支。补了
+  `"aa bb cc" @5` 才压住。
+
+#### 已登记的两个未做项
+
+- **RTL 段落不右对齐。** 重排给出的是行内相对顺序；把整行推到 `max_width`
+  那一侧是**对齐**，属于 `LineStyle`。
+- **方向变化处只给一个 caret 位置。** 要两个得给 `caret` 再带一个方向参数。
+
+#### 剩下的部分
+
+`yu-layout` 的 60 处产品侧命中全部集中在 `LayoutSnapshot`：标题字号、引用
+gutter 与竖条、列表标记、表格（`table.rs` 919 行）、图片几何。清掉它们等于
+删掉 `LayoutSnapshot`。
+
+**这不需要把 S6 的装饰产出器提前做。** `yu-editor` 允许认识 Markdown——E1 的
+禁止清单里没有它，`tools/check-deps.py` 也已登记 `yu-editor → yu-markdown`。
+所以路径是把 Markdown 解释**从 `yu-layout` 往上搬到 `yu-editor`**：仍然从
+v1 的 `Projection` 派生布局输入，只是派生的地方换了一层。用 `DecorationSet`
+取代 `Projection` 是 S6 的事。
+
+**验收那条 grep 抓不到表格。** `table` 不在 E1 的关键词里，但
+`TableLayoutSnapshot` 与 `yu-scene::TablePrimitive` 是同一种泄漏（第 3 节的
+对照表写着「表格 → 一个 block widget」）。按第 3 节做，不按 grep 做——否则
+grep 会绿而泄漏还在。`yu-scene` / `yu-render` 现在剩的命中也全在表格用例里
+（还在 `yu_markdown::parse`），随表格 widget 化一起清。
+
+
 ### S6 · 语义 extension 化
 
 将 heading / emphasis / list / quote / table / task / image / math 逐个改写为
