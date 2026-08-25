@@ -696,7 +696,9 @@ name = "yu-projection"
 version = "0.1.0"
 dependencies = [
  "yu-core",
+ "yu-decoration",
  "yu-markdown",
+ "yu-syntax",
  "yu-text",
 ]
 

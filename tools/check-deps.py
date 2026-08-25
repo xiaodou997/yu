@@ -135,6 +135,11 @@ ALLOWED_DEV: dict[str, set[str]] = {
     # 一个已经在产品里跑着的实现比自证性质更强。这条边随 yu-projection
     # 在 S4 末尾被删除而消失。
     "yu-decoration": {"yu-projection"},
+    # 临时：反过来的同一件事。tests/decoration_parity.rs 比对两条产出隐藏
+    # 区间的路——v1 的行内扫描器（本 crate）与 yu-syntax 的标记节点范围。
+    # 用例住在 yu-projection 而不是 yu-markdown，因为断言的主体是 v1 的行为，
+    # 而 v1 就在这里；这两条边都随 yu-projection 一起消失。
+    "yu-projection": {"yu-decoration", "yu-syntax"},
 }
 
 
