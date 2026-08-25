@@ -34,8 +34,10 @@
 //! 这条测试随 `yu-projection` 一起消失。
 
 use yu_core::{ByteOffset, Revision, TextRange, VisualOffset};
-use yu_decoration::{Bias, Decoration};
-use yu_markdown::{inline_syntax_decoration_set, inline_syntax_decorations};
+use yu_decoration::{Bias, Decoration, DecorationSet};
+use yu_markdown::{
+    extension_decoration_sets, inline_syntax_decoration_set, inline_syntax_decorations,
+};
 use yu_projection::{Projection, ProjectionBias, VisualRunKind};
 use yu_text::TextBuffer;
 
@@ -458,47 +460,52 @@ fn end_to_end_mapping_matches_the_v1_projection() {
         let projection = &both.projection;
 
         let parsed = yu_syntax::parse(*source).expect("测试文档很短");
-        let decorations = inline_syntax_decoration_set(
-            Revision::INITIAL,
-            ByteOffset::try_from(source.len()).expect("测试文档很短"),
-            parsed.tree(),
-        );
+        let len = ByteOffset::try_from(source.len()).expect("测试文档很短");
+        // 两条路都要与 v1 一致：一次性产出，以及两个 extension 各自产出再
+        // 合并。后者的 oracle 不能只是前者——`merge` 内部就调用 `new`，
+        // 拿前者当唯一对照的话，`new` 里的 bug 两条路会一起错。v1 是外部的。
+        let together = inline_syntax_decoration_set(Revision::INITIAL, len, parsed.tree());
+        let sets = extension_decoration_sets(Revision::INITIAL, len, parsed.tree());
+        let merged = DecorationSet::merge(Revision::INITIAL, len, sets.iter())
+            .expect("同一个 revision 与长度");
 
-        assert_eq!(
-            decorations.visual_len(),
-            projection.visual_len(),
-            "{source:?}：两条链对视觉长度的理解不一致"
-        );
-
-        // 只走字符边界：v1 会拒绝落在字符中间的偏移，DecorationSet 不持有
-        // 源码、做不了这个校验。两边契约不同的地方不拿来比。
-        for (offset, _) in source
-            .char_indices()
-            .chain(std::iter::once((source.len(), ' ')))
-        {
-            let offset = ByteOffset::new(u64::try_from(offset).expect("测试文档很短"));
+        for (path, decorations) in [("一次性产出", &together), ("extension 合并", &merged)] {
             assert_eq!(
-                decorations.source_to_visual(offset),
-                projection
-                    .source_to_visual(offset, ProjectionBias::After)
-                    .expect("整篇范围内的偏移都合法"),
-                "{source:?} 的 source {offset:?}：两条链的 source→visual 不同"
+                decorations.visual_len(),
+                projection.visual_len(),
+                "{source:?}（{path}）：两条链对视觉长度的理解不一致"
             );
-        }
 
-        for visual in 0..=decorations.visual_len().get() {
-            for (ours_bias, theirs_bias) in [
-                (Bias::Before, ProjectionBias::Before),
-                (Bias::After, ProjectionBias::After),
-            ] {
+            // 只走字符边界：v1 会拒绝落在字符中间的偏移，DecorationSet 不持有
+            // 源码、做不了这个校验。两边契约不同的地方不拿来比。
+            for (offset, _) in source
+                .char_indices()
+                .chain(std::iter::once((source.len(), ' ')))
+            {
+                let offset = ByteOffset::new(u64::try_from(offset).expect("测试文档很短"));
                 assert_eq!(
-                    decorations.visual_to_source(VisualOffset::new(visual), ours_bias),
+                    decorations.source_to_visual(offset),
                     projection
-                        .visual_to_source(VisualOffset::new(visual), theirs_bias)
-                        .expect("投影长度之内的偏移都合法"),
-                    "{source:?} 的 visual {visual} / {ours_bias:?}：\
-                     两条链的 visual→source 不同"
+                        .source_to_visual(offset, ProjectionBias::After)
+                        .expect("整篇范围内的偏移都合法"),
+                    "{source:?}（{path}）的 source {offset:?}：两条链的 source→visual 不同"
                 );
+            }
+
+            for visual in 0..=decorations.visual_len().get() {
+                for (ours_bias, theirs_bias) in [
+                    (Bias::Before, ProjectionBias::Before),
+                    (Bias::After, ProjectionBias::After),
+                ] {
+                    assert_eq!(
+                        decorations.visual_to_source(VisualOffset::new(visual), ours_bias),
+                        projection
+                            .visual_to_source(VisualOffset::new(visual), theirs_bias)
+                            .expect("投影长度之内的偏移都合法"),
+                        "{source:?}（{path}）的 visual {visual} / {ours_bias:?}：\
+                         两条链的 visual→source 不同"
+                    );
+                }
             }
         }
     }

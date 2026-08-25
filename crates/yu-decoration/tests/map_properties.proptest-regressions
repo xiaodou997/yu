@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 90c65e5403805f682890fc7170d7c68b424fc31075f0e6c1dd148d71e60550a3 # shrinks to spec = [(28, 0, false)], steps = [Step { at: 0, remove: 3, insert: "" }, Step { at: 24, remove: 5, insert: "x" }, Step { at: 0, remove: 5, insert: "" }, Step { at: 20, remove: 5, insert: "" }]
+cc 11e59c65a8713bb29da6e7d5e657d8e6d1c1abd98aadbae5c46f9f831eee2fc6 # shrinks to spec = [(14, 5, true), (19, 1, true)], steps = [Step { at: 0, remove: 0, insert: "" }]
