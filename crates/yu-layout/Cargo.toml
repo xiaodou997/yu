@@ -14,6 +14,7 @@ yu-markdown = { path = "../yu-markdown" }
 yu-projection = { path = "../yu-projection" }
 yu-text = { path = "../yu-text" }
 unicode-segmentation = "1.13"
+unicode-linebreak = "0.1"
 
 # 仅测试用：验证布局能消费真实字体后端的度量与 shaped run。
 # yu-font 只依赖 yu-core，这条边不进产物依赖图。

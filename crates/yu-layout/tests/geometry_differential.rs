@@ -14,15 +14,27 @@
 //!
 //! `LayoutSnapshot` 的断行是**按 grapheme 贪心**：`line_width + advance >
 //! max_width` 就地断，不找断行机会。它没有 UAX #14，没有 CJK 禁则，也没有
-//! bidi——S5 的验收要求补上这三样，补上之后新旧断点**必然不同**。
+//! bidi——而 S5 的验收要求补上这三样。补上之后新旧断点**必然不同**，
+//! 24 个语料×宽度组合确实不同了。
 //!
-//! 所以这条差分只在「两条路本该给出同一个答案」的那一面成立：**同一套
-//! 贪心规则下的几何累加、行盒边界、caret 与 hit-test**。它证明不了断行
-//! 规则对不对，那件事的 oracle 是 UAX #14 的官方测试套件，不是这里。
+//! 所以这条差分按「有没有发生软换行」分成两个口径：
 //!
-//! `oracle_boundary` 那一组用例把这条边界钉成可执行的：它断言现有实现会在
-//! 词中间断行。等 UAX #14 落地，那条断言会红，逼人回来把差分的范围重新划
-//! 清楚，而不是默默把新实现改回旧行为。
+//! - **没有软换行**（整块的换行全部来自强制换行符）：两条路本该给出同一份
+//!   几何，逐点比对行盒、簇盒、caret 与 hit-test。这是 oracle 可信的那一面。
+//! - **发生了软换行**：断点必然不同，比对退化为一条仍然成立的性质——
+//!   **断行规则只改变 grapheme 被分到哪一行，不改变 grapheme 本身**。
+//!   簇的视觉区间、宽度、样式、换行标记逐个相同，顺序相同。
+//!
+//! 两个口径各自钉了一个组合数。语料增删时会红，免得整批用例悄悄滑进
+//! 弱口径那一边还看起来是绿的。
+//!
+//! # 断行规则本身的正确性不在这里
+//!
+//! 它的 oracle 不可能是 v1。UAX #14 的实现是 `unicode-linebreak`，它在上游
+//! 用 Unicode 官方的 `LineBreakTest.txt` 逐条验证过；把那份文件搬进本仓库
+//! 只会再测一遍那个依赖。这里要证明的是**我们用对了它**：断点落在断行机会
+//! 上、强制换行被尊重、grapheme 不被劈开、行尾空白悬在行外、一个比整行还宽
+//! 的词仍然排得出来、CJK 禁则生效。这些在 `src/block.rs` 的单元测试里。
 
 use yu_core::{ByteOffset, CaretAffinity, StyleId, TextAttrs, TextRange, TextStyle, VisualOffset};
 use yu_layout::{
@@ -152,6 +164,25 @@ fn both_paths(source: &str, width: f32) -> (LayoutSnapshot, BlockLayout) {
     (old, new)
 }
 
+/// 一块布局里有没有发生软换行：行数超过「强制换行数 + 1」就有。
+fn soft_wrapped_old(layout: &LayoutSnapshot) -> bool {
+    let breaks = layout
+        .clusters()
+        .iter()
+        .filter(|cluster| cluster.is_line_break())
+        .count();
+    layout.lines().len() > breaks + 1
+}
+
+fn soft_wrapped_new(layout: &BlockLayout) -> bool {
+    let breaks = layout
+        .clusters()
+        .iter()
+        .filter(|cluster| cluster.is_line_break())
+        .count();
+    layout.lines().len() > breaks + 1
+}
+
 /// 视觉文本本身必须一致。这是几何比对的前提：字节都不一样就没什么好比的。
 #[test]
 fn derived_visual_text_matches_the_projection() {
@@ -174,18 +205,22 @@ fn derived_visual_text_matches_the_projection() {
     }
 }
 
+/// oracle 可信的那一面：没有软换行时，两条路的几何必须逐点相同。
 #[test]
-fn line_boxes_agree() {
+fn geometry_agrees_where_nothing_soft_wraps() {
+    let mut compared = 0_usize;
     for source in CORPUS {
         for width in WIDTHS {
             let (old, new) = both_paths(source, *width);
-            assert_eq!(
-                old.lines().len(),
-                new.lines().len(),
-                "语料 {source:?} 宽度 {width} 的行数不一致"
-            );
+            if soft_wrapped_old(&old) || soft_wrapped_new(&new) {
+                continue;
+            }
+            compared += 1;
+            let at = format!("语料 {source:?} 宽度 {width}");
+
+            assert_eq!(old.lines().len(), new.lines().len(), "{at} 的行数");
             for (old_line, new_line) in old.lines().iter().zip(new.lines()) {
-                let at = format!("语料 {source:?} 宽度 {width} 第 {} 行", old_line.index());
+                let at = format!("{at} 第 {} 行", old_line.index());
                 assert_eq!(old_line.index(), new_line.index(), "{at} 的行号");
                 assert_eq!(old_line.visual(), new_line.visual(), "{at} 的视觉区间");
                 assert_eq!(old_line.y(), new_line.y(), "{at} 的 y");
@@ -199,33 +234,101 @@ fn line_boxes_agree() {
             assert_eq!(
                 old.lines().len() as f32 * old.config().line_height(),
                 new.height(),
-                "语料 {source:?} 宽度 {width} 的块高"
+                "{at} 的块高"
             );
-        }
-    }
-}
 
-#[test]
-fn cluster_boxes_agree() {
-    for source in CORPUS {
-        for width in WIDTHS {
-            let (old, new) = both_paths(source, *width);
-            assert_eq!(
-                old.clusters().len(),
-                new.clusters().len(),
-                "语料 {source:?} 宽度 {width} 的簇数不一致"
-            );
             for (index, (old_cluster, new_cluster)) in
                 old.clusters().iter().zip(new.clusters()).enumerate()
             {
-                let at = format!("语料 {source:?} 宽度 {width} 第 {index} 个簇");
+                let at = format!("{at} 第 {index} 个簇");
+                assert_eq!(old_cluster.line(), new_cluster.line(), "{at} 的行号");
+                assert_eq!(old_cluster.x(), new_cluster.x(), "{at} 的 x");
+            }
+
+            // caret：每个 grapheme 边界、两种 affinity。grapheme 内部不是
+            // 合法的 caret 位置，两条路在那里的行为不构成契约。
+            let mut offsets = vec![VisualOffset::ZERO];
+            for cluster in new.clusters() {
+                offsets.push(cluster.visual().end());
+            }
+            offsets.push(new.visual_len());
+            offsets.dedup();
+            for offset in offsets {
+                for (affinity, bias) in [
+                    (CaretAffinity::Upstream, ProjectionBias::Before),
+                    (CaretAffinity::Downstream, ProjectionBias::After),
+                ] {
+                    let at = format!("{at} 偏移 {} affinity {affinity:?}", offset.get());
+                    let old_caret = old
+                        .caret_for_visual(offset, bias)
+                        .unwrap_or_else(|error| panic!("{at} 的 v1 caret: {error}"));
+                    let new_caret = new
+                        .caret(offset, affinity)
+                        .unwrap_or_else(|error| panic!("{at} 的 v2 caret: {error}"));
+                    assert_eq!(old_caret.line(), new_caret.line(), "{at} 的行号");
+                    assert_eq!(old_caret.point(), new_caret.point(), "{at} 的位置");
+                }
+            }
+
+            // hit-test：每个簇的左边缘、中点、右边缘，以及行首行尾之外。
+            for line in new.lines() {
+                let y = line.y();
+                let mut xs = vec![-1.0_f32, 0.0, line.width(), line.width() + 3.0];
+                for index in line.cluster_range() {
+                    let cluster = new.clusters()[index];
+                    xs.push(cluster.x());
+                    xs.push(cluster.x() + cluster.width() / 2.0);
+                    xs.push(cluster.x() + cluster.width());
+                }
+                for x in xs {
+                    let point = yu_layout::LayoutPoint::new(x, y);
+                    let at = format!("{at} 第 {} 行 x={x}", line.index());
+                    let old_hit = old
+                        .hit_test(point)
+                        .unwrap_or_else(|error| panic!("{at} 的 v1 hit: {error}"));
+                    let new_hit = new
+                        .hit(point)
+                        .unwrap_or_else(|error| panic!("{at} 的 v2 hit: {error}"));
+                    assert_eq!(old_hit.visual(), new_hit.visual(), "{at} 的视觉偏移");
+                    assert_eq!(old_hit.line(), new_hit.line(), "{at} 的行号");
+                    assert_eq!(old_hit.point(), new_hit.point(), "{at} 的位置");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        compared, 56,
+        "没有软换行的组合数变了。语料或宽度动过就更新这个数，\
+         但先确认不是有一批用例悄悄滑进了弱口径那一边"
+    );
+}
+
+/// 发生软换行时 oracle 失效，但这条性质仍然成立：**断行规则只决定 grapheme
+/// 被分到哪一行，不改变 grapheme 本身**。
+///
+/// 它压得住的东西：度量在两条路里一致、run 的样式没有错位、grapheme 切分
+/// 没有因为换了断行算法而变。压不住的是断点选得对不对——那件事见文件头。
+#[test]
+fn soft_wrapping_changes_only_line_assignment() {
+    let mut compared = 0_usize;
+    for source in CORPUS {
+        for width in WIDTHS {
+            let (old, new) = both_paths(source, *width);
+            if !soft_wrapped_old(&old) && !soft_wrapped_new(&new) {
+                continue;
+            }
+            compared += 1;
+            let at = format!("语料 {source:?} 宽度 {width}");
+            assert_eq!(old.clusters().len(), new.clusters().len(), "{at} 的簇数");
+            for (index, (old_cluster, new_cluster)) in
+                old.clusters().iter().zip(new.clusters()).enumerate()
+            {
+                let at = format!("{at} 第 {index} 个簇");
                 assert_eq!(
                     old_cluster.visual(),
                     new_cluster.visual(),
                     "{at} 的视觉区间"
                 );
-                assert_eq!(old_cluster.line(), new_cluster.line(), "{at} 的行号");
-                assert_eq!(old_cluster.x(), new_cluster.x(), "{at} 的 x");
                 assert_eq!(old_cluster.width(), new_cluster.width(), "{at} 的宽度");
                 assert_eq!(
                     old_cluster.is_line_break(),
@@ -240,94 +343,8 @@ fn cluster_boxes_agree() {
             }
         }
     }
-}
-
-/// caret 在每个 grapheme 边界上、两种 affinity 下都要落在同一处。
-///
-/// 只取 grapheme 边界：grapheme 内部的视觉偏移不是合法的 caret 位置，
-/// 两条路在那里的行为不构成契约。
-#[test]
-fn caret_positions_agree_at_cluster_boundaries() {
-    for source in CORPUS {
-        for width in WIDTHS {
-            let (old, new) = both_paths(source, *width);
-            let mut offsets = vec![VisualOffset::ZERO];
-            for cluster in new.clusters() {
-                offsets.push(cluster.visual().end());
-            }
-            offsets.push(new.visual_len());
-            offsets.dedup();
-
-            for offset in offsets {
-                for (affinity, bias) in [
-                    (CaretAffinity::Upstream, ProjectionBias::Before),
-                    (CaretAffinity::Downstream, ProjectionBias::After),
-                ] {
-                    let at = format!(
-                        "语料 {source:?} 宽度 {width} 偏移 {} affinity {affinity:?}",
-                        offset.get()
-                    );
-                    let old_caret = old
-                        .caret_for_visual(offset, bias)
-                        .unwrap_or_else(|error| panic!("{at} 的 v1 caret: {error}"));
-                    let new_caret = new
-                        .caret(offset, affinity)
-                        .unwrap_or_else(|error| panic!("{at} 的 v2 caret: {error}"));
-                    assert_eq!(old_caret.line(), new_caret.line(), "{at} 的行号");
-                    assert_eq!(old_caret.point(), new_caret.point(), "{at} 的位置");
-                }
-            }
-        }
-    }
-}
-
-/// hit-test 在每个簇的左边缘、中点、右边缘上都要落在同一处。
-#[test]
-fn hit_tests_agree() {
-    for source in CORPUS {
-        for width in WIDTHS {
-            let (old, new) = both_paths(source, *width);
-            for line in new.lines() {
-                let y = line.y();
-                let mut xs = vec![-1.0_f32, 0.0, line.width(), line.width() + 3.0];
-                for index in line.cluster_range() {
-                    let cluster = new.clusters()[index];
-                    xs.push(cluster.x());
-                    xs.push(cluster.x() + cluster.width() / 2.0);
-                    xs.push(cluster.x() + cluster.width());
-                }
-                for x in xs {
-                    let point = yu_layout::LayoutPoint::new(x, y);
-                    let at = format!("语料 {source:?} 宽度 {width} 第 {} 行 x={x}", line.index());
-                    let old_hit = old
-                        .hit_test(point)
-                        .unwrap_or_else(|error| panic!("{at} 的 v1 hit: {error}"));
-                    let new_hit = new
-                        .hit(point)
-                        .unwrap_or_else(|error| panic!("{at} 的 v2 hit: {error}"));
-                    assert_eq!(old_hit.visual(), new_hit.visual(), "{at} 的视觉偏移");
-                    assert_eq!(old_hit.line(), new_hit.line(), "{at} 的行号");
-                    assert_eq!(old_hit.point(), new_hit.point(), "{at} 的位置");
-                }
-            }
-        }
-    }
-}
-
-/// oracle 的边界：现有实现在**词中间**断行。
-///
-/// 这一条不是「期望它这样」，是「记下它现在这样」。UAX #14 落地之后
-/// `"one two"` 在宽度 5 下应当断在空格处而不是 `"one t"`，那时这条断言会红——
-/// 它的作用就是让上面几条差分的适用范围必须被重新审一遍。
-#[test]
-fn oracle_boundary_current_wrapping_breaks_inside_words() {
-    let (old, new) = both_paths("one two three", 5.0);
-    let first_old = old.lines().first().expect("至少一行");
-    let first_new = new.lines().first().expect("至少一行");
-    assert_eq!(first_old.visual(), first_new.visual());
     assert_eq!(
-        first_new.visual().end(),
-        VisualOffset::new(5),
-        "贪心断行会切在 \"one t\" 之后，而不是空格处"
+        compared, 36,
+        "发生软换行的组合数变了。语料或宽度动过就更新这个数（两边加起来必须是 23×4=92）"
     );
 }
