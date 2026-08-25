@@ -40,6 +40,19 @@ pub struct LayoutConfig {
     max_width: f32,
     line_height: f32,
     default_advance: f32,
+    base_direction: BaseDirection,
+}
+
+/// 段落的基准方向（UAX #9 的 P2/P3）。
+///
+/// 只有 [`BlockLayout`] 读它。`LayoutSnapshot`（v1）没有 bidi，忽略这个字段。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BaseDirection {
+    /// 按 UAX #9 的 P2/P3 从内容推断：取第一个强方向字符。
+    #[default]
+    Auto,
+    Ltr,
+    Rtl,
 }
 
 impl LayoutConfig {
@@ -49,7 +62,20 @@ impl LayoutConfig {
             max_width,
             line_height,
             default_advance: 1.0,
+            base_direction: BaseDirection::Auto,
         }
+    }
+
+    /// 覆盖段落基准方向。默认按内容推断。
+    #[must_use]
+    pub const fn with_base_direction(mut self, base_direction: BaseDirection) -> Self {
+        self.base_direction = base_direction;
+        self
+    }
+
+    #[must_use]
+    pub const fn base_direction(self) -> BaseDirection {
+        self.base_direction
     }
 
     /// Returns a copy using the fallback advance for metrics-only layout.
