@@ -11,8 +11,8 @@ pub use geometry::{
     Block, CoordinateSpace, Device, Document, GeometryError, Point, Rect, Scale, Size,
 };
 pub use position::{
-    Affinity, ByteOffset, LineIndex, Revision, TextAnchor, TextRange, Utf16Offset, Utf16Range,
-    VisualOffset, VisualRange,
+    Affinity, ByteOffset, CaretAffinity, LineIndex, NativeCaretPosition, Revision,
+    SourceCaretPosition, TextAnchor, TextRange, Utf16Offset, Utf16Range, VisualOffset, VisualRange,
 };
 pub use shaping::{
     ClusterMetrics, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,

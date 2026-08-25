@@ -56,12 +56,26 @@ ALLOWED: dict[str, set[str]] = {
     # yu-projection 是 v1 的实现，S4 结束时删除。在那之前两者并存，
     # 由 yu-decoration 的差分测试逐点比对。
     "yu-projection": {"yu-core", "yu-markdown", "yu-text"},
+    # yu-state 收编辑状态（S4）：history / selection / caret 绑定 / composition。
+    #
+    # 第 4.2 节把它画在 yu-markdown 之后，但这一轮搬进去的四个模块只用到
+    # yu-core 的坐标与 yu-text 的 Transaction/Snapshot，一个 Markdown 类型
+    # 都没有。不预先登记用不到的边——那正是「建一份没有使用者的抽象」的
+    # 另一种形态。等 EditorState 真的要聚合 extension 的装饰产出时再加。
+    "yu-state": {"yu-core", "yu-text"},
     # 4-6 层：布局 → 场景 → 绘制指令。
     "yu-layout": {"yu-core", "yu-markdown", "yu-projection", "yu-text"},
     "yu-scene": {"yu-core", "yu-font", "yu-layout"},
     "yu-render": {"yu-assets", "yu-core", "yu-font", "yu-scene"},
     # 7 层及以上：编辑状态、持久化、工作区。
-    "yu-editor": {"yu-core", "yu-layout", "yu-markdown", "yu-projection", "yu-text"},
+    "yu-editor": {
+        "yu-core",
+        "yu-layout",
+        "yu-markdown",
+        "yu-projection",
+        "yu-state",
+        "yu-text",
+    },
     "yu-export": {"yu-core", "yu-markdown", "yu-text"},
     "yu-storage": {"yu-core", "yu-editor", "yu-text"},
     "yu-workspace": {

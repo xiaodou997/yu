@@ -9,6 +9,7 @@ members = [
     "crates/yu-markdown",
     "crates/yu-syntax",
     "crates/yu-decoration",
+    "crates/yu-state",
     "crates/yu-export",
     "crates/yu-projection",
     "crates/yu-layout",
