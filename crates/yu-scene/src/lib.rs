@@ -263,8 +263,8 @@ impl EmbeddedSvgPrimitive {
 
 /// Semantic role for a source-backed table decoration. The renderer may map
 /// all roles to solid fills today, while native selection/accessibility layers
-/// can still distinguish header, selection and grid geometry without parsing
-/// Markdown again.
+/// can still distinguish header, selection and grid geometry without re-parsing
+/// the document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TablePrimitiveRole {
     HeaderFill,
@@ -282,16 +282,22 @@ pub struct TablePrimitive {
     role: TablePrimitiveRole,
 }
 
-/// One source-backed blockquote bar. Multiple bars may share the same block
-/// source when a parser reports nested quote depth.
+/// 一条贴着行的装饰条：一个 source-backed 的实心矩形。
+///
+/// 它的几何与颜色都由调用方给。这一层不知道这条是干什么用的——多条共享同一个
+/// source 就是嵌套，但「嵌套的是什么」不是这里的事（不变量 E1）。
+///
+/// 它原来以一种具体语法命名，是 overview-v2 §2.1 点名的那种泄漏：一种语法
+/// 一个 primitive。改名之后它是行级装饰的通用载体，`Decoration::Line` 想画
+/// 什么条都走它。
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BlockQuotePrimitive {
+pub struct LineOrnamentPrimitive {
     source: TextRange,
     bounds: Rect,
     color: Rgba8,
 }
 
-impl BlockQuotePrimitive {
+impl LineOrnamentPrimitive {
     #[must_use]
     pub const fn new(source: TextRange, bounds: Rect, color: Rgba8) -> Self {
         Self {
@@ -321,7 +327,7 @@ impl BlockQuotePrimitive {
 ///
 /// The backend currently lowers every layer to a solid rectangle. Keeping the
 /// role in the retained scene preserves enough information for diagnostics
-/// and a future vector renderer without making the renderer parse Markdown.
+/// and a future vector renderer without making the renderer parse the document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TaskCheckboxPrimitiveRole {
     Border,
@@ -532,7 +538,7 @@ pub enum Primitive {
     Glyph(GlyphPrimitive),
     Image(ImagePrimitive),
     EmbeddedSvg(EmbeddedSvgPrimitive),
-    BlockQuote(BlockQuotePrimitive),
+    LineOrnament(LineOrnamentPrimitive),
     Table(TablePrimitive),
     TaskCheckbox(TaskCheckboxPrimitive),
     EditorDecoration(EditorDecorationPrimitive),
@@ -546,7 +552,7 @@ impl Primitive {
             Self::Glyph(glyph) => glyph.bounds(),
             Self::Image(image) => image.bounds(),
             Self::EmbeddedSvg(svg) => svg.bounds(),
-            Self::BlockQuote(quote) => quote.bounds(),
+            Self::LineOrnament(ornament) => ornament.bounds(),
             Self::Table(table) => table.bounds(),
             Self::TaskCheckbox(task) => task.bounds(),
             Self::EditorDecoration(decoration) => decoration.bounds(),
@@ -824,8 +830,8 @@ impl SceneBuilder {
         self.push(Primitive::EmbeddedSvg(svg))
     }
 
-    pub fn block_quote(&mut self, quote: BlockQuotePrimitive) -> Result<u32, SceneError> {
-        self.push(Primitive::BlockQuote(quote))
+    pub fn line_ornament(&mut self, ornament: LineOrnamentPrimitive) -> Result<u32, SceneError> {
+        self.push(Primitive::LineOrnament(ornament))
     }
 
     pub fn task_checkbox(&mut self, task: TaskCheckboxPrimitive) -> Result<u32, SceneError> {
@@ -1045,7 +1051,7 @@ impl SceneBuilder {
     /// Appends every visible block and optional background fills in one
     /// preflighted scene transaction. `fills` is ordered like
     /// `input.blocks()`; a `None` entry keeps the block glyph-only. The scene
-    /// layer stays Markdown-agnostic: callers choose a color from their own
+    /// layer stays document-agnostic: callers choose a color from their own
     /// block-kind/style policy, while this method only validates geometry and
     /// preserves fill-before-glyph painter order.
     pub fn append_viewport_with_fills(
@@ -1119,9 +1125,9 @@ impl SceneBuilder {
         )
     }
 
-    /// Appends visible blocks with table and blockquote decorations before
-    /// glyph content. Markdown meaning remains outside the scene layer: the
-    /// layout supplies source-backed quote bars and the caller supplies color.
+    /// Appends visible blocks with table and line-ornament decorations before
+    /// glyph content. Document meaning remains outside the scene layer: layout
+    /// supplies source-backed bar geometry and the caller supplies the color.
     #[allow(clippy::too_many_arguments)]
     pub fn append_viewport_with_decorations(
         &mut self,
@@ -1203,7 +1209,7 @@ impl SceneBuilder {
             }
             if let (Some(quote_color), Some(quote)) = (block_quote_color, layout.block_quote()) {
                 for bounds in quote.bars().iter().copied() {
-                    primitives.push(Primitive::BlockQuote(BlockQuotePrimitive::new(
+                    primitives.push(Primitive::LineOrnament(LineOrnamentPrimitive::new(
                         quote.source(),
                         translate_block_rect(bounds, Point::new(0.0, geometry.y()))?,
                         quote_color,

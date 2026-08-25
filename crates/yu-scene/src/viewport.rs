@@ -6,7 +6,7 @@ use crate::SceneError;
 
 /// Owned geometry for one block selected by a revision-bound viewport query.
 ///
-/// The `kind` value is intentionally opaque to `yu-scene`: Markdown/parser
+/// The `kind` value is intentionally opaque to `yu-scene`: syntax/parser
 /// knowledge stays outside the retained scene crate while native bridges can
 /// carry a stable tag through to a future block renderer.
 #[derive(Clone, Copy, Debug, PartialEq)]

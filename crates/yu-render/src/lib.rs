@@ -30,7 +30,7 @@ pub struct AtlasPageUpload {
 
 /// An owned SVG payload that a concrete backend may upload or compile for a
 /// single render plan. The source range and resource identity remain attached
-/// so a platform can reject stale work without consulting the Markdown tree.
+/// so a platform can reject stale work without consulting the syntax tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddedSvgUpload {
     resource: u64,
@@ -431,10 +431,10 @@ impl RenderPlanBuilder {
                         fallback: svg.fallback(),
                     });
                 }
-                Primitive::BlockQuote(quote) => {
+                Primitive::LineOrnament(ornament) => {
                     commands.push(RenderCommand::FillRect {
-                        bounds: quote.bounds(),
-                        color: quote.color(),
+                        bounds: ornament.bounds(),
+                        color: ornament.color(),
                     });
                 }
                 Primitive::Table(table) => {
@@ -1126,7 +1126,7 @@ mod tests {
             Primitive::FillRect { .. }
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
-            | Primitive::BlockQuote(_)
+            | Primitive::LineOrnament(_)
             | Primitive::Table(_)
             | Primitive::TaskCheckbox(_)
             | Primitive::EditorDecoration(_) => {
@@ -1233,7 +1233,7 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Image(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::BlockQuote(_)
+                | Primitive::LineOrnament(_)
                 | Primitive::Table(_)
                 | Primitive::TaskCheckbox(_)
                 | Primitive::EditorDecoration(_) => {
