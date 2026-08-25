@@ -56,8 +56,8 @@ use std::ops::Range;
 use unicode_bidi::{BidiInfo, Level};
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{
-    CaretAffinity, ClusterMetrics, LineStyleId, Size, StyleId, TextAttrs, VisualOffset,
-    VisualRange, WidgetId, WidgetSide,
+    ByteOffset, CaretAffinity, ClusterMetrics, FontFaceId, GlyphId, LineStyleId, ShapingProvider,
+    Size, StyleId, TextAttrs, TextRange, VisualOffset, VisualRange, WidgetId, WidgetSide,
 };
 
 use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
@@ -553,6 +553,64 @@ impl ClusterBox {
     }
 }
 
+/// 一个排好位置的字形。
+///
+/// 只在 shaping 那条路上产生（[`BlockLayout::build_shaped`]）；按度量排的
+/// 布局没有字形，`glyphs()` 是空的。
+///
+/// `origin` 是字形的**基线左端**在 block 空间里的位置，字形偏移已经加进去
+/// 了。它不摊开成 `x/y: f32`——不变量 E6。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphBox {
+    face: FontFaceId,
+    glyph: GlyphId,
+    visual: VisualRange,
+    line: usize,
+    origin: LayoutPoint,
+    style: StyleId,
+    /// 相对 shaper 基准字号的倍率，来自这个字形所在 [`StyleId`] 的
+    /// [`TextAttrs::size_scale`]。栅格化要按它选字号。
+    size_scale: f32,
+}
+
+impl GlyphBox {
+    #[must_use]
+    pub const fn face(self) -> FontFaceId {
+        self.face
+    }
+
+    #[must_use]
+    pub const fn glyph(self) -> GlyphId {
+        self.glyph
+    }
+
+    /// 这个字形覆盖的视觉字节。连字覆盖多个 grapheme，组合记号可能为空。
+    #[must_use]
+    pub const fn visual(self) -> VisualRange {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn line(self) -> usize {
+        self.line
+    }
+
+    #[must_use]
+    pub const fn origin(self) -> LayoutPoint {
+        self.origin
+    }
+
+    #[must_use]
+    pub const fn style(self) -> StyleId {
+        self.style
+    }
+
+    #[must_use]
+    pub const fn size_scale(self) -> f32 {
+        self.size_scale
+    }
+}
+
 /// 一条视觉行。
 #[derive(Clone, Debug, PartialEq)]
 pub struct LineBox {
@@ -660,6 +718,8 @@ pub struct BlockLayout {
     lines: Vec<LineBox>,
     clusters: Vec<ClusterBox>,
     widgets: Vec<WidgetBox>,
+    /// 只有 shaping 那条路会填。按度量排的布局没有字形。
+    glyphs: Vec<GlyphBox>,
     /// 行级样式按视觉区间排好的解释结果，行首落在哪一段就用哪一段。
     line_attrs: Vec<(VisualRange, LineStyleId, LineAttrs)>,
 }
@@ -693,6 +753,16 @@ impl LineCursor {
     }
 }
 
+/// 一个字形在它自己的簇里的样子。位置要等断行与重排定了才知道。
+#[derive(Clone, Copy, Debug)]
+struct GlyphRecord {
+    face: FontFaceId,
+    glyph: GlyphId,
+    x_offset: f32,
+    y_offset: f32,
+    size_scale: f32,
+}
+
 /// 第一遍度量出来的一个 grapheme，还没有被分配到行。
 ///
 /// 度量与断行分成两遍，因为 UAX #14 的断行机会要在整段视觉文本上算，
@@ -702,6 +772,8 @@ struct Measured {
     visual: VisualRange,
     style: StyleId,
     advance: f32,
+    /// shaping 那条路上这个簇画出来是哪个字形。按度量排时是 `None`。
+    glyph: Option<GlyphRecord>,
     /// 这个 grapheme 本身就是一个强制换行（UAX #14 的 BK / CR / LF / NL）。
     mandatory_break: bool,
     /// 全是空白。行尾的空白不参与「排不下」的判断，它们悬在行外。
@@ -760,14 +832,86 @@ impl BlockLayout {
         L: LineStyleTable,
         M: ClusterMetrics,
     {
+        let (visual_len, bidi) = Self::prepare(input, config)?;
+        let measured = measure(input, styles, metrics, &bidi)?;
+        Self::assemble(
+            input,
+            config,
+            widgets,
+            line_styles,
+            &bidi,
+            visual_len,
+            measured,
+        )
+    }
+
+    /// 走 shaping 后端的完整版本。断行、重排、widget、行级样式与
+    /// [`BlockLayout::build_all`] 完全一致，只有「一个簇有多宽」换成了
+    /// 「shaper 给出的字形推进量」，并且多出 [`BlockLayout::glyphs`]。
+    ///
+    /// # shaping 坐标空间
+    ///
+    /// 每个 [`StyledRun`] 单独交给 shaper。`ShapingProvider` 的 range 参数是
+    /// 一个**零基的局部空间**（`0..text.len()`），不是源码坐标——布局层
+    /// 手里根本没有源码坐标（见本模块开头「坐标」一节）。返回的字形区间按
+    /// 这个局部空间读，再加上 run 的视觉起点变成视觉区间。
+    pub fn build_shaped<T, W, L, S>(
+        input: LayoutInput<'_>,
+        config: LayoutConfig,
+        styles: &T,
+        widgets: &W,
+        line_styles: &L,
+        shaper: &S,
+    ) -> Result<Self, LayoutError>
+    where
+        T: StyleTable,
+        W: WidgetMeasure,
+        L: LineStyleTable,
+        S: ShapingProvider,
+    {
+        let (visual_len, bidi) = Self::prepare(input, config)?;
+        let measured = measure_shaped(input, styles, shaper, &bidi)?;
+        Self::assemble(
+            input,
+            config,
+            widgets,
+            line_styles,
+            &bidi,
+            visual_len,
+            measured,
+        )
+    }
+
+    fn prepare<'a>(
+        input: LayoutInput<'a>,
+        config: LayoutConfig,
+    ) -> Result<(VisualOffset, BidiInfo<'a>), LayoutError> {
         config.validate()?;
         let visual_len =
             VisualOffset::try_from(input.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
         validate_runs(input, visual_len)?;
         validate_widgets(input, visual_len)?;
+        Ok((
+            visual_len,
+            BidiInfo::new(input.text(), base_level(config.base_direction())),
+        ))
+    }
 
-        let bidi = BidiInfo::new(input.text(), base_level(config.base_direction()));
-        let measured = measure(input, styles, metrics, &bidi)?;
+    /// 断行、摆 widget、重排、放字形。两条度量路径共用这一段——共用代码
+    /// 路径的差分是自证的，所以它只写一遍。
+    fn assemble<W, L>(
+        input: LayoutInput<'_>,
+        config: LayoutConfig,
+        widgets: &W,
+        line_styles: &L,
+        bidi: &BidiInfo<'_>,
+        visual_len: VisualOffset,
+        measured: Vec<Measured>,
+    ) -> Result<Self, LayoutError>
+    where
+        W: WidgetMeasure,
+        L: LineStyleTable,
+    {
         let segment_starts = segment_starts(input.text, &measured)?;
         let sizes = measure_widgets(input, config, widgets)?;
         let line_attrs = resolve_line_styles(input, line_styles)?;
@@ -778,6 +922,7 @@ impl BlockLayout {
             lines: Vec::new(),
             clusters: Vec::new(),
             widgets: Vec::new(),
+            glyphs: Vec::new(),
             line_attrs,
         };
         let mut cursor = layout.start_line(0, VisualOffset::ZERO, 0, 0);
@@ -866,8 +1011,53 @@ impl BlockLayout {
                 empty,
             )?;
         }
-        layout.reorder_for_bidi(input.text(), &bidi)?;
+        layout.reorder_for_bidi(input.text(), bidi)?;
+        layout.place_glyphs(&measured)?;
         Ok(layout)
+    }
+
+    /// 字形跟着它的簇走。位置在重排**之后**才算——重排改的就是簇的 x，
+    /// 在那之前算等于把 RTL 的字形画在逻辑位置上，不报错，只是画反。
+    fn place_glyphs(&mut self, measured: &[Measured]) -> Result<(), LayoutError> {
+        if measured.iter().all(|cluster| cluster.glyph.is_none()) {
+            return Ok(());
+        }
+        // 一个 Measured 恰好推出一个 ClusterBox，同序。
+        if measured.len() != self.clusters.len() {
+            return Err(LayoutError::Shaping(
+                "shaped cluster count does not match the laid out clusters".into(),
+            ));
+        }
+        let mut glyphs = Vec::new();
+        for (cluster, record) in self.clusters.iter().zip(measured) {
+            let Some(record) = record.glyph else {
+                continue;
+            };
+            let line = self
+                .lines
+                .get(cluster.line)
+                .ok_or(LayoutError::OffsetOverflow)?;
+            // 字形的绘制原点是推进盒的**左**边缘，与文字方向无关：RTL 的
+            // 字形也从左边缘往右画，方向只决定盒子按什么顺序摆。
+            let origin = LayoutPoint::new(
+                cluster.x + record.x_offset,
+                line.bounds.y() + line.baseline + record.y_offset,
+            );
+            if !origin.is_finite() {
+                return Err(LayoutError::InvalidPoint);
+            }
+            glyphs.push(GlyphBox {
+                face: record.face,
+                glyph: record.glyph,
+                visual: cluster.visual,
+                line: cluster.line,
+                origin,
+                style: cluster.style,
+                size_scale: record.size_scale,
+            });
+        }
+        self.glyphs = glyphs;
+        Ok(())
     }
 
     #[must_use]
@@ -894,6 +1084,12 @@ impl BlockLayout {
     #[must_use]
     pub fn widgets(&self) -> &[WidgetBox] {
         &self.widgets
+    }
+
+    /// 排好位置的字形，按逻辑顺序。按度量排的布局这里是空的。
+    #[must_use]
+    pub fn glyphs(&self) -> &[GlyphBox] {
+        &self.glyphs
     }
 
     /// 还画着 placeholder 的 widget。
@@ -1308,6 +1504,7 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
                 visual,
                 style: run.style(),
                 advance,
+                glyph: None,
                 mandatory_break,
                 space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
                 level: bidi.levels[start + local].number(),
@@ -1315,6 +1512,117 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
         }
     }
     Ok(measured)
+}
+
+/// 第一遍的 shaping 版本：把每个 run 交给 shaper，一个字形一个簇。
+///
+/// 与按度量走的 [`measure`] 有一处**有意**的不同：那一版按 grapheme 切，
+/// 这一版按 shaper 给出的字形切。连字因此不会被劈开——劈开画出来是两个不
+/// 相干的字形，不 panic 也不报错。
+///
+/// run 的文本交给 shaper 时带的是一个**零基局部空间**的 range，返回的字形
+/// range 按这个空间读。布局层没有源码坐标，也不该有（不变量 D4）。
+fn measure_shaped<T: StyleTable, S: ShapingProvider>(
+    input: LayoutInput<'_>,
+    styles: &T,
+    shaper: &S,
+    bidi: &BidiInfo<'_>,
+) -> Result<Vec<Measured>, LayoutError> {
+    let mut measured = Vec::new();
+    for run in input.runs() {
+        let attrs = styles
+            .attrs(run.style())
+            .ok_or(LayoutError::UnknownStyle(run.style()))?;
+        let start =
+            usize::try_from(run.visual().start().get()).map_err(|_| LayoutError::OffsetOverflow)?;
+        let end =
+            usize::try_from(run.visual().end().get()).map_err(|_| LayoutError::OffsetOverflow)?;
+        let text = input
+            .text()
+            .get(start..end)
+            .ok_or(LayoutError::RunNotOnCharBoundary)?;
+        if text.is_empty() {
+            continue;
+        }
+        let local = local_range(text.len())?;
+        let shaped = shaper
+            .shape_scaled(text, local, attrs.style(), attrs.size_scale())
+            .map_err(|error| LayoutError::Shaping(error.to_string()))?;
+        if shaped.source() != local {
+            return Err(LayoutError::Shaping(
+                "shaper returned a range different from the requested run".into(),
+            ));
+        }
+        let mut cursor = 0_usize;
+        for glyph_run in shaped.runs() {
+            for glyph in glyph_run.glyphs() {
+                let from = usize::try_from(glyph.source().start().get())
+                    .map_err(|_| LayoutError::OffsetOverflow)?;
+                let to = usize::try_from(glyph.source().end().get())
+                    .map_err(|_| LayoutError::OffsetOverflow)?;
+                // 字形必须按逻辑顺序、无缝、不越界地铺满这个 run。缺一段
+                // 就是丢字，重一段就是重画——两样都不 panic。
+                if from != cursor || to > text.len() {
+                    return Err(LayoutError::Shaping(
+                        "glyph ranges must tile the run in logical order".into(),
+                    ));
+                }
+                if !text.is_char_boundary(from) || !text.is_char_boundary(to) {
+                    return Err(LayoutError::RunNotOnCharBoundary);
+                }
+                cursor = to;
+                let cluster_text = &text[from..to];
+                let mandatory_break =
+                    !cluster_text.is_empty() && cluster_text.chars().all(is_mandatory_break_char);
+                let advance = if mandatory_break {
+                    0.0
+                } else {
+                    glyph.advance()
+                };
+                if !advance.is_finite() || advance < 0.0 {
+                    return Err(LayoutError::InvalidMetrics(advance.to_bits()));
+                }
+                if !glyph.x_offset().is_finite() || !glyph.y_offset().is_finite() {
+                    return Err(LayoutError::Shaping("glyph offsets must be finite".into()));
+                }
+                let visual_start = VisualOffset::try_from(start + from)
+                    .map_err(|_| LayoutError::OffsetOverflow)?;
+                let visual_end =
+                    VisualOffset::try_from(start + to).map_err(|_| LayoutError::OffsetOverflow)?;
+                let visual = VisualRange::new(visual_start, visual_end)
+                    .ok_or(LayoutError::OffsetOverflow)?;
+                measured.push(Measured {
+                    visual,
+                    style: run.style(),
+                    advance,
+                    // 强制换行符不进字形流：它没有可画的形状，画出来是一个
+                    // 豆腐块。它仍然是一个簇，仍然占视觉字节。
+                    glyph: (!mandatory_break).then_some(GlyphRecord {
+                        face: glyph_run.face(),
+                        glyph: glyph.id(),
+                        x_offset: glyph.x_offset(),
+                        y_offset: glyph.y_offset(),
+                        size_scale: attrs.size_scale(),
+                    }),
+                    mandatory_break,
+                    space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
+                    level: bidi.levels[start + from].number(),
+                });
+            }
+        }
+        if cursor != text.len() {
+            return Err(LayoutError::Shaping(
+                "glyph ranges must tile the run in logical order".into(),
+            ));
+        }
+    }
+    Ok(measured)
+}
+
+/// shaping 的零基局部空间。见 [`BlockLayout::build_shaped`]。
+fn local_range(len: usize) -> Result<TextRange, LayoutError> {
+    let end = u64::try_from(len).map_err(|_| LayoutError::OffsetOverflow)?;
+    TextRange::new(ByteOffset::ZERO, ByteOffset::new(end)).ok_or(LayoutError::OffsetOverflow)
 }
 
 /// 第二遍的输入：每一段的第一个 grapheme 下标，首尾各一个哨兵。
@@ -1494,10 +1802,13 @@ mod tests {
         StyledRun, UniformStyleTable, WidgetConstraints, WidgetMeasure, WidgetMeasurement,
         WidgetMetrics, WidgetSpan,
     };
+    use super::{NoLineStyles, local_range};
     use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint, MonospaceMetrics};
+    use unicode_segmentation::UnicodeSegmentation;
     use yu_core::{
-        CaretAffinity, LineStyleId, Size, StyleId, TextAttrs, TextStyle, VisualOffset, VisualRange,
-        WidgetId, WidgetSide,
+        ByteOffset, CaretAffinity, FontFaceId, Glyph, GlyphId, GlyphRun, LineStyleId, Script,
+        ShapedText, ShapingProvider, Size, StyleId, TextAttrs, TextDirection, TextRange, TextStyle,
+        VisualOffset, VisualRange, WidgetId, WidgetSide,
     };
 
     fn visual(start: u64, end: u64) -> VisualRange {
@@ -1515,6 +1826,302 @@ mod tests {
             &UniformStyleTable::default(),
             &MonospaceMetrics::default(),
         )
+    }
+
+    /// 一个 grapheme 一个字形，推进量固定；`ligate` 里的两个字节连成一个。
+    struct TestShaper {
+        advance: f32,
+        ligate: Option<&'static str>,
+        /// 每个字形往上抬多少。用来验证 y 偏移进了 origin。
+        rise: f32,
+        /// 每个字形往右挪多少。用来验证 x 偏移进了 origin。
+        shift: f32,
+    }
+
+    impl TestShaper {
+        const fn new(advance: f32) -> Self {
+            Self {
+                advance,
+                ligate: None,
+                rise: 0.0,
+                shift: 0.0,
+            }
+        }
+    }
+
+    impl ShapingProvider for TestShaper {
+        type Error = String;
+
+        fn shape(
+            &self,
+            text: &str,
+            source: TextRange,
+            style: TextStyle,
+        ) -> Result<ShapedText, Self::Error> {
+            let mut glyphs = Vec::new();
+            let mut cursor = 0_usize;
+            while cursor < text.len() {
+                let len = self
+                    .ligate
+                    .filter(|pair| text[cursor..].starts_with(*pair))
+                    .map_or_else(
+                        || {
+                            text[cursor..]
+                                .graphemes(true)
+                                .next()
+                                .map_or(0, |cluster| cluster.len())
+                        },
+                        str::len,
+                    );
+                let range = TextRange::new(
+                    ByteOffset::new(cursor as u64),
+                    ByteOffset::new((cursor + len) as u64),
+                )
+                .ok_or("有序")?;
+                glyphs.push(Glyph::new(
+                    GlyphId::from_raw(cursor as u32 + 1),
+                    range,
+                    self.advance,
+                    self.shift,
+                    self.rise,
+                ));
+                cursor += len;
+            }
+            Ok(ShapedText::new(
+                source,
+                vec![GlyphRun::new(
+                    FontFaceId::from_raw(7),
+                    source,
+                    style,
+                    TextDirection::Ltr,
+                    Script::Latin,
+                    glyphs,
+                )],
+            ))
+        }
+    }
+
+    fn build_shaped(
+        text: &str,
+        runs: &[StyledRun],
+        width: f32,
+        shaper: &TestShaper,
+    ) -> Result<BlockLayout, LayoutError> {
+        BlockLayout::build_shaped(
+            LayoutInput::new(text, runs),
+            LayoutConfig::new(width, 4.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &NoLineStyles,
+            shaper,
+        )
+    }
+
+    /// shaping 那条路与度量那条路共用断行、重排与行盒。共用的部分不重复
+    /// 验证（共用代码路径的差分是自证的），这里只钉住「字形跟着簇走」。
+    #[test]
+    fn shaped_glyphs_sit_on_their_cluster_and_baseline() {
+        let text = "ab cd";
+        let layout = build_shaped(text, &plain(text), 4.0, &TestShaper::new(1.0)).expect("布局");
+
+        // 宽度 4，"ab " 的可见部分是 2，加上 "cd" 的 2 正好 4——UAX #14 的
+        // 断点在空白之后，空白悬在行外。
+        assert_eq!(layout.lines().len(), 2);
+        assert_eq!(layout.glyphs().len(), 5);
+        for (glyph, cluster) in layout.glyphs().iter().zip(layout.clusters()) {
+            assert_eq!(glyph.visual(), cluster.visual());
+            assert_eq!(glyph.line(), cluster.line());
+            assert_eq!(glyph.origin().x(), cluster.x());
+            let line = &layout.lines()[cluster.line()];
+            assert_eq!(glyph.origin().y(), line.bounds().y() + line.baseline());
+            assert_eq!(glyph.face(), FontFaceId::from_raw(7));
+            assert_eq!(glyph.size_scale(), 1.0);
+        }
+    }
+
+    /// 字形偏移必须进 origin。丢掉它不会 panic，只会让重音记号落在错的地方。
+    #[test]
+    fn glyph_offsets_reach_the_origin() {
+        let text = "ab";
+        let shaper = TestShaper {
+            rise: -1.5,
+            shift: 0.25,
+            ..TestShaper::new(1.0)
+        };
+        let layout = build_shaped(text, &plain(text), 80.0, &shaper).expect("布局");
+        let line = &layout.lines()[0];
+        for (glyph, cluster) in layout.glyphs().iter().zip(layout.clusters()) {
+            assert_eq!(glyph.origin().x(), cluster.x() + 0.25);
+            assert_eq!(
+                glyph.origin().y(),
+                line.bounds().y() + line.baseline() - 1.5
+            );
+        }
+    }
+
+    /// 连字是一个簇，不能被断行劈开——劈开画出来是两个不相干的字形。
+    #[test]
+    fn a_ligature_stays_one_cluster() {
+        let text = "fi";
+        let shaper = TestShaper {
+            ligate: Some("fi"),
+            ..TestShaper::new(3.0)
+        };
+        let layout = build_shaped(text, &plain(text), 2.0, &shaper).expect("布局");
+        assert_eq!(layout.clusters().len(), 1);
+        assert_eq!(layout.clusters()[0].visual(), visual(0, 2));
+        assert_eq!(layout.glyphs().len(), 1);
+        assert_eq!(layout.lines().len(), 1);
+    }
+
+    /// 换行符不进字形流，但仍然是一个簇。少了这一条会画出一个豆腐块。
+    #[test]
+    fn a_mandatory_break_is_a_cluster_without_a_glyph() {
+        let text = "a\nb";
+        let layout = build_shaped(text, &plain(text), 80.0, &TestShaper::new(1.0)).expect("布局");
+        assert_eq!(layout.clusters().len(), 3);
+        assert!(layout.clusters()[1].is_line_break());
+        assert_eq!(layout.glyphs().len(), 2);
+        assert_eq!(layout.glyphs()[1].visual(), visual(2, 3));
+        assert_eq!(layout.glyphs()[1].line(), 1);
+    }
+
+    /// 字号倍率既要进推进量（断行随之改变），也要进 `size_scale`（栅格化
+    /// 按它选字号）。只做前者会得到几何对、糊掉的字。
+    #[test]
+    fn size_scale_reaches_both_the_advance_and_the_glyph() {
+        struct Doubling;
+        impl StyleTable for Doubling {
+            fn attrs(&self, style: StyleId) -> Option<TextAttrs> {
+                match style {
+                    StyleId(1) => TextAttrs::default().with_size_scale(2.0),
+                    _ => Some(TextAttrs::default()),
+                }
+            }
+        }
+        let text = "ab";
+        let runs = vec![
+            StyledRun::new(visual(0, 1), StyleId(0)),
+            StyledRun::new(visual(1, 2), StyleId(1)),
+        ];
+        let layout = BlockLayout::build_shaped(
+            LayoutInput::new(text, &runs),
+            LayoutConfig::new(80.0, 4.0),
+            &Doubling,
+            &NoWidgets,
+            &NoLineStyles,
+            &TestShaper::new(1.0),
+        )
+        .expect("布局");
+        assert_eq!(layout.clusters()[0].width(), 1.0);
+        assert_eq!(layout.clusters()[1].width(), 2.0);
+        assert_eq!(layout.glyphs()[0].size_scale(), 1.0);
+        assert_eq!(layout.glyphs()[1].size_scale(), 2.0);
+    }
+
+    /// 字形没铺满 run 就是丢字或重画，两样都不 panic。
+    ///
+    /// 三种坏法各钉一条：中间缺一段（丢字）、区间回退（重画）、末尾短一截。
+    /// 只钉最后一种会让「总长对得上但中间有缝」溜过去。
+    #[test]
+    fn glyph_ranges_must_tile_the_run() {
+        /// 按 `ranges` 逐个产字形，不管文本实际是什么。
+        struct Ranges(&'static [(u64, u64)]);
+        impl ShapingProvider for Ranges {
+            type Error = String;
+
+            fn shape(
+                &self,
+                _text: &str,
+                source: TextRange,
+                style: TextStyle,
+            ) -> Result<ShapedText, Self::Error> {
+                let glyphs = self
+                    .0
+                    .iter()
+                    .map(|(from, to)| {
+                        let range = TextRange::new(ByteOffset::new(*from), ByteOffset::new(*to))
+                            .ok_or("有序")?;
+                        Ok(Glyph::new(GlyphId::from_raw(1), range, 1.0, 0.0, 0.0))
+                    })
+                    .collect::<Result<Vec<_>, Self::Error>>()?;
+                Ok(ShapedText::new(
+                    source,
+                    vec![GlyphRun::new(
+                        FontFaceId::from_raw(1),
+                        source,
+                        style,
+                        TextDirection::Ltr,
+                        Script::Latin,
+                        glyphs,
+                    )],
+                ))
+            }
+        }
+        let text = "abc";
+        for ranges in [
+            &[(0, 1), (2, 3)][..],
+            &[(0, 2), (1, 3)][..],
+            &[(0, 1)][..],
+            &[(0, 1), (1, 2), (2, 4)][..],
+        ] {
+            assert!(
+                matches!(
+                    BlockLayout::build_shaped(
+                        LayoutInput::new(text, &plain(text)),
+                        LayoutConfig::new(80.0, 4.0),
+                        &UniformStyleTable::default(),
+                        &NoWidgets,
+                        &NoLineStyles,
+                        &Ranges(ranges),
+                    ),
+                    Err(LayoutError::Shaping(_))
+                ),
+                "{ranges:?} 应该被拒绝"
+            );
+        }
+        assert!(
+            BlockLayout::build_shaped(
+                LayoutInput::new(text, &plain(text)),
+                LayoutConfig::new(80.0, 4.0),
+                &UniformStyleTable::default(),
+                &NoWidgets,
+                &NoLineStyles,
+                &Ranges(&[(0, 1), (1, 2), (2, 3)]),
+            )
+            .is_ok()
+        );
+    }
+
+    /// RTL 行里字形跟着重排走。在重排之前算 origin 会把它们画在逻辑位置上。
+    #[test]
+    fn shaped_glyphs_follow_the_bidi_reorder() {
+        let text = "a\u{5d0}\u{5d1}";
+        let layout = BlockLayout::build_shaped(
+            LayoutInput::new(text, &plain(text)),
+            LayoutConfig::new(80.0, 4.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &NoLineStyles,
+            &TestShaper::new(1.0),
+        )
+        .expect("布局");
+        assert_eq!(layout.clusters().len(), 3);
+        // 逻辑顺序 a ℵ ℶ，视觉顺序 a ℶ ℵ：后两个换了位置。
+        assert_eq!(layout.clusters()[1].x(), 2.0);
+        assert_eq!(layout.clusters()[2].x(), 1.0);
+        for (glyph, cluster) in layout.glyphs().iter().zip(layout.clusters()) {
+            assert_eq!(glyph.origin().x(), cluster.x());
+        }
+    }
+
+    /// 零基局部空间就是 `0..len`。shaper 拿到的不是源码坐标。
+    #[test]
+    fn the_shaping_space_is_local_and_zero_based() {
+        assert_eq!(
+            local_range(5).expect("局部空间"),
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(5)).expect("有序")
+        );
     }
 
     /// 一份漏掉半段文本的 run 列表会画出少了几个字的一行，既不 panic 也不
