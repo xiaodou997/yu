@@ -13,8 +13,8 @@ use std::ops::Range;
 
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{
-    Affinity, ByteOffset, ClusterMetrics, FontFaceId, GeometryError, GlyphId, ShapedText,
-    ShapingProvider, StyleId, TextAnchor, TextRange, TextStyle, WidgetId,
+    Affinity, ByteOffset, ClusterMetrics, FontFaceId, GeometryError, GlyphId, LineStyleId,
+    ShapedText, ShapingProvider, StyleId, TextAnchor, TextRange, TextStyle, WidgetId,
 };
 use yu_projection::{
     BlockProjection, BlockQuotePresentation, HeadingPresentation, LeadingMarker, Projection,
@@ -26,9 +26,9 @@ mod block;
 mod table;
 
 pub use block::{
-    BlockLayout, CaretBox, ClusterBox, LayoutInput, LineBox, NoWidgets, StyleTable, StyledRun,
-    UniformStyleTable, WidgetBox, WidgetConstraints, WidgetMeasure, WidgetMeasurement,
-    WidgetMetrics, WidgetSpan,
+    BlockLayout, CaretBox, ClusterBox, LayoutInput, LineAttrs, LineBox, LineSpan, LineStyleTable,
+    NoLineStyles, NoWidgets, StyleTable, StyledRun, UniformStyleTable, WidgetBox,
+    WidgetConstraints, WidgetMeasure, WidgetMeasurement, WidgetMetrics, WidgetSpan,
 };
 pub use table::{
     TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeCommit, TableResizeGesture,
@@ -357,6 +357,12 @@ pub enum LayoutError {
     InvalidWidgetSize,
     /// widget 没有按 `(from, side)` 升序给出（不变量 D6 的定序）。
     WidgetsOutOfOrder,
+    /// 行样式表里没有这个 id。
+    UnknownLineStyle(LineStyleId),
+    /// 行级属性里有非有限或非正的值。
+    InvalidLineStyle,
+    /// 行级样式段没有升序、互不重叠地给出。
+    LineStylesOutOfOrder,
 }
 
 /// Errors raised by the viewport height index.
@@ -568,6 +574,15 @@ impl fmt::Display for LayoutError {
             Self::WidgetsOutOfOrder => {
                 formatter.write_str("widgets must be ordered by (offset, side)")
             }
+            Self::UnknownLineStyle(style) => {
+                write!(formatter, "line style table has no entry for {style:?}")
+            }
+            Self::InvalidLineStyle => formatter.write_str(
+                "line indent must be finite and non-negative, and the line height scale positive",
+            ),
+            Self::LineStylesOutOfOrder => {
+                formatter.write_str("line styles must be ordered and non-overlapping")
+            }
         }
     }
 }
@@ -591,7 +606,10 @@ impl Error for LayoutError {
             | Self::UnknownWidget(_)
             | Self::InvalidWidgetBaseline
             | Self::InvalidWidgetSize
-            | Self::WidgetsOutOfOrder => None,
+            | Self::WidgetsOutOfOrder
+            | Self::UnknownLineStyle(_)
+            | Self::InvalidLineStyle
+            | Self::LineStylesOutOfOrder => None,
         }
     }
 }

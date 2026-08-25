@@ -32,6 +32,12 @@
 //!
 //! CJK 禁则不需要另加 tailoring，UAX #14 的默认对表已经覆盖。
 //!
+//! # 行级样式
+//!
+//! [`LineSpan`] 给出缩进与行高倍率（[`LineAttrs`]）。缩进**吃掉可用宽度**，
+//! 不只是把内容右移。背景与前缀装饰的样子不在这一层：[`LineBox`] 原样带出
+//! 它的 [`LineStyleId`]，由上层拿同一张表去画。
+//!
 //! # widget
 //!
 //! widget 在视觉字节流里不占位（不变量 D7 的字节层面语义），但在行里占宽度
@@ -50,8 +56,8 @@ use std::ops::Range;
 use unicode_bidi::{BidiInfo, Level};
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{
-    CaretAffinity, ClusterMetrics, Size, StyleId, TextAttrs, VisualOffset, VisualRange, WidgetId,
-    WidgetSide,
+    CaretAffinity, ClusterMetrics, LineStyleId, Size, StyleId, TextAttrs, VisualOffset,
+    VisualRange, WidgetId, WidgetSide,
 };
 
 use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
@@ -313,6 +319,99 @@ impl WidgetBox {
     }
 }
 
+/// 视觉文本上的一段行级样式。
+///
+/// 「行级」指缩进、行高、背景、前缀装饰这类作用于整行的东西
+/// （overview-v2 §5.1 的 `Decoration::Line`）。一条视觉行的样式由**行首**
+/// 那个视觉偏移落在哪一段决定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LineSpan {
+    visual: VisualRange,
+    style: LineStyleId,
+}
+
+impl LineSpan {
+    #[must_use]
+    pub const fn new(visual: VisualRange, style: LineStyleId) -> Self {
+        Self { visual, style }
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualRange {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn style(self) -> LineStyleId {
+        self.style
+    }
+}
+
+/// 一个 [`LineStyleId`] 解释之后的行级属性。
+///
+/// 只有影响**几何**的两项在这里。背景色、前缀装饰的样子这些是画的事：
+/// [`LineBox`] 会把它的 [`LineStyleId`] 原样带出去，由上层拿同一张表去画。
+/// 让布局层认识「引用条是什么颜色」既没必要，也正是 E1 要挡的那种泄漏。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineAttrs {
+    indent: f32,
+    line_height_scale: f32,
+}
+
+impl LineAttrs {
+    /// 非有限或负的缩进、非正的行高倍率都被拒绝——一个 NaN 缩进会一路传播
+    /// 成不 panic 的错画面。
+    pub fn new(indent: f32, line_height_scale: f32) -> Result<Self, LayoutError> {
+        if !indent.is_finite() || indent < 0.0 {
+            return Err(LayoutError::InvalidLineStyle);
+        }
+        if !line_height_scale.is_finite() || line_height_scale <= 0.0 {
+            return Err(LayoutError::InvalidLineStyle);
+        }
+        Ok(Self {
+            indent,
+            line_height_scale,
+        })
+    }
+
+    /// 内容从行左边缘往右让开多少。
+    #[must_use]
+    pub const fn indent(self) -> f32 {
+        self.indent
+    }
+
+    /// 相对 `LayoutConfig::line_height` 的倍率。
+    #[must_use]
+    pub const fn line_height_scale(self) -> f32 {
+        self.line_height_scale
+    }
+}
+
+impl Default for LineAttrs {
+    fn default() -> Self {
+        Self {
+            indent: 0.0,
+            line_height_scale: 1.0,
+        }
+    }
+}
+
+/// 把 [`LineStyleId`] 翻译成行级属性。与 [`StyleTable`] 同样住在产出装饰的
+/// 那一层。未知 id 是错误，不是默认值。
+pub trait LineStyleTable {
+    fn attrs(&self, style: LineStyleId) -> Option<LineAttrs>;
+}
+
+/// 一张空的行样式表。没有行级装饰的调用方与测试用。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoLineStyles;
+
+impl LineStyleTable for NoLineStyles {
+    fn attrs(&self, _style: LineStyleId) -> Option<LineAttrs> {
+        None
+    }
+}
+
 /// 一个块的布局输入。
 ///
 /// `runs` 必须**无缝铺满** `text`：从 0 开始、首尾相接、终点等于
@@ -324,6 +423,7 @@ pub struct LayoutInput<'a> {
     text: &'a str,
     runs: &'a [StyledRun],
     widgets: &'a [WidgetSpan],
+    lines: &'a [LineSpan],
 }
 
 impl<'a> LayoutInput<'a> {
@@ -333,6 +433,7 @@ impl<'a> LayoutInput<'a> {
             text,
             runs,
             widgets: &[],
+            lines: &[],
         }
     }
 
@@ -348,6 +449,18 @@ impl<'a> LayoutInput<'a> {
     #[must_use]
     pub const fn widgets(&self) -> &'a [WidgetSpan] {
         self.widgets
+    }
+
+    /// 挂上行级样式。必须按视觉偏移升序且互不重叠。
+    #[must_use]
+    pub const fn with_line_styles(mut self, lines: &'a [LineSpan]) -> Self {
+        self.lines = lines;
+        self
+    }
+
+    #[must_use]
+    pub const fn line_styles(&self) -> &'a [LineSpan] {
+        self.lines
     }
 
     #[must_use]
@@ -450,6 +563,7 @@ pub struct LineBox {
     /// 视觉坐标只有一套实现、空间进类型。
     bounds: LayoutRect,
     baseline: f32,
+    style: Option<LineStyleId>,
     clusters: Range<usize>,
     widgets: Range<usize>,
 }
@@ -491,6 +605,15 @@ impl LineBox {
     #[must_use]
     pub const fn baseline(&self) -> f32 {
         self.baseline
+    }
+
+    /// 这条行用的行级样式。`None` 表示没有行级装饰盖到行首。
+    ///
+    /// 背景与前缀装饰的**几何**由 [`LineBox::bounds`] 给，**长什么样**由上层
+    /// 拿这个 id 去查同一张表。布局层不解释它。
+    #[must_use]
+    pub const fn style(&self) -> Option<LineStyleId> {
+        self.style
     }
 
     #[must_use]
@@ -537,6 +660,8 @@ pub struct BlockLayout {
     lines: Vec<LineBox>,
     clusters: Vec<ClusterBox>,
     widgets: Vec<WidgetBox>,
+    /// 行级样式按视觉区间排好的解释结果，行首落在哪一段就用哪一段。
+    line_attrs: Vec<(VisualRange, LineStyleId, LineAttrs)>,
 }
 
 /// 重排时行内待摆放的一样东西。
@@ -549,9 +674,23 @@ enum Item {
 struct LineCursor {
     index: usize,
     visual_start: VisualOffset,
+    /// 当前行内容右边缘的绝对 x（含缩进）。
     width: f32,
+    /// 内容起始 x。行级样式的缩进。
+    indent: f32,
+    /// 本行的文字行高（`config.line_height` × 行级倍率）。
+    line_height: f32,
+    style: Option<LineStyleId>,
     cluster_start: usize,
     widget_start: usize,
+}
+
+impl LineCursor {
+    /// 这一行有没有已经放下的内容。判「排不下要断行」时必须用它而不是
+    /// `width > 0`：缩进不是内容，拿它当内容会让每一行开头就断一次。
+    const fn has_content(&self) -> bool {
+        self.width > self.indent
+    }
 }
 
 /// 第一遍度量出来的一个 grapheme，还没有被分配到行。
@@ -603,6 +742,24 @@ impl BlockLayout {
         widgets: &W,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
+        Self::build_all(input, config, styles, widgets, &NoLineStyles, metrics)
+    }
+
+    /// 带 widget 与行级样式的完整版本。
+    pub fn build_all<T, W, L, M>(
+        input: LayoutInput<'_>,
+        config: LayoutConfig,
+        styles: &T,
+        widgets: &W,
+        line_styles: &L,
+        metrics: &M,
+    ) -> Result<Self, LayoutError>
+    where
+        T: StyleTable,
+        W: WidgetMeasure,
+        L: LineStyleTable,
+        M: ClusterMetrics,
+    {
         config.validate()?;
         let visual_len =
             VisualOffset::try_from(input.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
@@ -613,6 +770,7 @@ impl BlockLayout {
         let measured = measure(input, styles, metrics, &bidi)?;
         let segment_starts = segment_starts(input.text, &measured)?;
         let sizes = measure_widgets(input, config, widgets)?;
+        let line_attrs = resolve_line_styles(input, line_styles)?;
 
         let mut layout = Self {
             config,
@@ -620,14 +778,9 @@ impl BlockLayout {
             lines: Vec::new(),
             clusters: Vec::new(),
             widgets: Vec::new(),
+            line_attrs,
         };
-        let mut cursor = LineCursor {
-            index: 0,
-            visual_start: VisualOffset::ZERO,
-            width: 0.0,
-            cluster_start: 0,
-            widget_start: 0,
-        };
+        let mut cursor = layout.start_line(0, VisualOffset::ZERO, 0, 0);
         let mut last_was_break = false;
         let mut next_widget = 0_usize;
 
@@ -642,7 +795,7 @@ impl BlockLayout {
                 .skip_while(|cluster| cluster.space || cluster.mandatory_break)
                 .map(|cluster| cluster.advance)
                 .sum::<f32>();
-            if cursor.width > 0.0 && cursor.width + fit > config.max_width() {
+            if cursor.has_content() && cursor.width + fit > config.max_width() {
                 layout.push_line(&cursor, measured[from].visual.start())?;
                 cursor = layout.next_line(&cursor, measured[from].visual.start());
             }
@@ -673,7 +826,7 @@ impl BlockLayout {
                 // 一个自身就超过整行宽度的「词」必须还能排出来：段内退回
                 // 按 grapheme 断（UAX #14 允许的应急断行）。
                 if !cluster.space
-                    && cursor.width > 0.0
+                    && cursor.has_content()
                     && cursor.width + cluster.advance > config.max_width()
                 {
                     layout.push_line(&cursor, cluster.visual.start())?;
@@ -707,7 +860,7 @@ impl BlockLayout {
             let empty = cursor.visual_start;
             layout.push_line(
                 &LineCursor {
-                    width: 0.0,
+                    width: cursor.indent,
                     ..cursor
                 },
                 empty,
@@ -986,7 +1139,7 @@ impl BlockLayout {
             let measurement = sizes[*next];
             let metrics = measurement.metrics();
             let width = metrics.size().width();
-            if cursor.width > 0.0 && cursor.width + width > self.config.max_width() {
+            if cursor.has_content() && cursor.width + width > self.config.max_width() {
                 self.push_line(cursor, visual)?;
                 *cursor = self.next_line(cursor, visual);
             }
@@ -1008,12 +1161,41 @@ impl BlockLayout {
     }
 
     fn next_line(&self, cursor: &LineCursor, visual_start: VisualOffset) -> LineCursor {
-        LineCursor {
-            index: cursor.index.saturating_add(1),
+        self.start_line(
+            cursor.index.saturating_add(1),
             visual_start,
-            width: 0.0,
-            cluster_start: self.clusters.len(),
-            widget_start: self.widgets.len(),
+            self.clusters.len(),
+            self.widgets.len(),
+        )
+    }
+
+    /// 开一条新行，按**行首**的视觉偏移定它的行级样式。
+    fn start_line(
+        &self,
+        index: usize,
+        visual_start: VisualOffset,
+        cluster_start: usize,
+        widget_start: usize,
+    ) -> LineCursor {
+        let (style, attrs) = self
+            .line_attrs
+            .iter()
+            .find(|(range, _, _)| {
+                range.start() <= visual_start
+                    && (visual_start < range.end() || range.start() == range.end())
+            })
+            .map_or((None, LineAttrs::default()), |(_, style, attrs)| {
+                (Some(*style), *attrs)
+            });
+        LineCursor {
+            index,
+            visual_start,
+            width: attrs.indent(),
+            indent: attrs.indent(),
+            line_height: self.config.line_height() * attrs.line_height_scale(),
+            style,
+            cluster_start,
+            widget_start,
         }
     }
 
@@ -1031,7 +1213,7 @@ impl BlockLayout {
             .map_or(0.0, |line| line.bounds.y() + line.bounds.height());
         // 基线对齐：文字的基线在行底（ascent = line_height、descent = 0），
         // widget 按自己的 baseline 往下挂。谁要求的基线更深，行就往下长。
-        let mut baseline = self.config.line_height();
+        let mut baseline = cursor.line_height;
         let mut descent = 0.0_f32;
         for widget in &self.widgets[cursor.widget_start..] {
             baseline = baseline.max(widget.baseline);
@@ -1056,6 +1238,7 @@ impl BlockLayout {
             visual,
             bounds: LayoutRect::new(0.0, y, cursor.width, height)?,
             baseline,
+            style: cursor.style,
             clusters: cursor.cluster_start..self.clusters.len(),
             widgets: widget_start..self.widgets.len(),
         });
@@ -1257,6 +1440,26 @@ const fn side_rank(side: WidgetSide) -> u8 {
     }
 }
 
+/// 解释所有行级样式段，顺带校验它们升序、不重叠、落在文本范围内。
+fn resolve_line_styles<L: LineStyleTable>(
+    input: LayoutInput<'_>,
+    table: &L,
+) -> Result<Vec<(VisualRange, LineStyleId, LineAttrs)>, LayoutError> {
+    let mut resolved = Vec::with_capacity(input.line_styles().len());
+    let mut previous_end = VisualOffset::ZERO;
+    for span in input.line_styles() {
+        if span.visual.start() < previous_end {
+            return Err(LayoutError::LineStylesOutOfOrder);
+        }
+        let attrs = table
+            .attrs(span.style)
+            .ok_or(LayoutError::UnknownLineStyle(span.style))?;
+        resolved.push((span.visual, span.style, attrs));
+        previous_end = span.visual.end();
+    }
+    Ok(resolved)
+}
+
 /// runs 必须无缝铺满视觉文本，且每个边界都在 UTF-8 字符边界上。
 fn validate_runs(input: LayoutInput<'_>, visual_len: VisualOffset) -> Result<(), LayoutError> {
     let mut expected = VisualOffset::ZERO;
@@ -1287,13 +1490,14 @@ fn validate_runs(input: LayoutInput<'_>, visual_len: VisualOffset) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockLayout, LayoutInput, StyleTable, StyledRun, UniformStyleTable, WidgetConstraints,
-        WidgetMeasure, WidgetMeasurement, WidgetMetrics, WidgetSpan,
+        BlockLayout, LayoutInput, LineAttrs, LineSpan, LineStyleTable, NoWidgets, StyleTable,
+        StyledRun, UniformStyleTable, WidgetConstraints, WidgetMeasure, WidgetMeasurement,
+        WidgetMetrics, WidgetSpan,
     };
     use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint, MonospaceMetrics};
     use yu_core::{
-        CaretAffinity, Size, StyleId, TextAttrs, TextStyle, VisualOffset, VisualRange, WidgetId,
-        WidgetSide,
+        CaretAffinity, LineStyleId, Size, StyleId, TextAttrs, TextStyle, VisualOffset, VisualRange,
+        WidgetId, WidgetSide,
     };
 
     fn visual(start: u64, end: u64) -> VisualRange {
@@ -1474,6 +1678,139 @@ mod tests {
                 text[from..to].to_owned()
             })
             .collect()
+    }
+
+    /// 一张按 id 给行级属性的表。
+    struct LineStyles {
+        entries: Vec<(LineStyleId, f32, f32)>,
+    }
+
+    impl LineStyleTable for LineStyles {
+        fn attrs(&self, style: LineStyleId) -> Option<LineAttrs> {
+            let (_, indent, scale) = *self.entries.iter().find(|entry| entry.0 == style)?;
+            Some(LineAttrs::new(indent, scale).expect("测试给的值合法"))
+        }
+    }
+
+    fn build_lines(
+        text: &str,
+        width: f32,
+        spans: &[LineSpan],
+        table: &LineStyles,
+    ) -> Result<BlockLayout, LayoutError> {
+        BlockLayout::build_all(
+            LayoutInput::new(text, &plain(text)).with_line_styles(spans),
+            LayoutConfig::new(width, 1.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            table,
+            &MonospaceMetrics::default(),
+        )
+    }
+
+    /// 缩进把内容整体右移，而且**吃掉可用宽度**：同一段文字在缩进之后
+    /// 会更早换行。只移 x 不减可用宽度，缩进的段落会溢出到画面外。
+    #[test]
+    fn indent_shifts_content_and_shrinks_the_usable_width() {
+        let text = "abcd";
+        let table = LineStyles {
+            entries: vec![(LineStyleId(1), 2.0, 1.0)],
+        };
+        let spans = [LineSpan::new(visual(0, 4), LineStyleId(1))];
+
+        let plain_layout = build(text, &plain(text), 4.0).expect("布局");
+        assert_eq!(plain_layout.lines().len(), 1);
+
+        let layout = build_lines(text, 4.0, &spans, &table).expect("布局");
+        assert_eq!(layout.lines().len(), 2, "缩进 2.0 之后 4 个字排不进宽度 4");
+        assert_eq!(layout.clusters()[0].x(), 2.0, "内容从缩进处开始");
+        assert_eq!(layout.lines()[0].width(), 4.0, "行宽含缩进");
+        assert_eq!(layout.lines()[1].bounds().y(), 1.0);
+    }
+
+    /// 缩进不是内容：它不能让每一行开头就断一次。
+    #[test]
+    fn indent_alone_never_triggers_a_break() {
+        let text = "ab";
+        let table = LineStyles {
+            entries: vec![(LineStyleId(1), 3.0, 1.0)],
+        };
+        let spans = [LineSpan::new(visual(0, 2), LineStyleId(1))];
+        // 缩进 3.0 已经超过整行宽度 2.0；内容还是得排出来，不能无限断行。
+        let layout = build_lines(text, 2.0, &spans, &table).expect("布局");
+        assert_eq!(layout.lines().len(), 2);
+        assert_eq!(layout.clusters()[0].x(), 3.0);
+    }
+
+    /// 行高倍率撑高整行，后面的行跟着往下移。
+    #[test]
+    fn line_height_scale_grows_the_line_box() {
+        let text = "a\nb";
+        let table = LineStyles {
+            entries: vec![(LineStyleId(1), 0.0, 2.5)],
+        };
+        // 只盖住第一行。
+        let spans = [LineSpan::new(visual(0, 2), LineStyleId(1))];
+        let layout = build_lines(text, 80.0, &spans, &table).expect("布局");
+        assert_eq!(layout.lines()[0].height(), 2.5);
+        assert_eq!(layout.lines()[0].baseline(), 2.5);
+        assert_eq!(layout.lines()[1].bounds().y(), 2.5);
+        assert_eq!(
+            layout.lines()[1].height(),
+            1.0,
+            "第二行没被盖到，用默认行高"
+        );
+        assert_eq!(layout.height(), 3.5);
+    }
+
+    /// 行样式的 id 原样带出去，布局层不解释它。背景与前缀装饰长什么样是
+    /// 上层拿这个 id 查同一张表的事——让布局认识「引用条什么颜色」正是
+    /// 不变量 E1 要挡的泄漏。
+    #[test]
+    fn the_line_style_id_is_carried_through_untouched() {
+        let text = "a\nb";
+        let table = LineStyles {
+            entries: vec![(LineStyleId(9), 1.0, 1.0)],
+        };
+        let spans = [LineSpan::new(visual(0, 2), LineStyleId(9))];
+        let layout = build_lines(text, 80.0, &spans, &table).expect("布局");
+        assert_eq!(layout.lines()[0].style(), Some(LineStyleId(9)));
+        assert_eq!(layout.lines()[1].style(), None);
+    }
+
+    /// 表里没有的 id 是错误，不是默认属性；乱序或重叠的段也是错误。
+    #[test]
+    fn line_styles_are_validated() {
+        let text = "abcd";
+        let table = LineStyles {
+            entries: vec![(LineStyleId(1), 0.0, 1.0)],
+        };
+        assert_eq!(
+            build_lines(
+                text,
+                80.0,
+                &[LineSpan::new(visual(0, 2), LineStyleId(5))],
+                &table
+            ),
+            Err(LayoutError::UnknownLineStyle(LineStyleId(5)))
+        );
+        let overlapping = [
+            LineSpan::new(visual(0, 3), LineStyleId(1)),
+            LineSpan::new(visual(2, 4), LineStyleId(1)),
+        ];
+        assert_eq!(
+            build_lines(text, 80.0, &overlapping, &table),
+            Err(LayoutError::LineStylesOutOfOrder)
+        );
+        assert_eq!(
+            LineAttrs::new(f32::NAN, 1.0),
+            Err(LayoutError::InvalidLineStyle)
+        );
+        assert_eq!(
+            LineAttrs::new(-1.0, 1.0),
+            Err(LayoutError::InvalidLineStyle)
+        );
+        assert_eq!(LineAttrs::new(0.0, 0.0), Err(LayoutError::InvalidLineStyle));
     }
 
     /// 一张按 id 给尺寸的 widget 表。`ready` 为假模拟资源没就绪。
