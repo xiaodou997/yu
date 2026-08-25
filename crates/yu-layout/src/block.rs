@@ -32,6 +32,13 @@
 //!
 //! CJK 禁则不需要另加 tailoring，UAX #14 的默认对表已经覆盖。
 //!
+//! # widget
+//!
+//! widget 在视觉字节流里不占位（不变量 D7 的字节层面语义），但在行里占宽度
+//! 与高度。尺寸由 [`WidgetMeasure`] 给；资源没就绪时给 placeholder 尺寸，
+//! 布局照常完成，[`BlockLayout::pending_widgets`] 报出还欠着谁。发通知、
+//! 退避重试、源码回退不在这一层。
+//!
 //! # 这一版还没做的两件事
 //!
 //! - **RTL 段落不右对齐。** 重排给出的是行内的相对顺序，把整行推到
@@ -42,9 +49,12 @@ use std::ops::Range;
 
 use unicode_bidi::{BidiInfo, Level};
 use unicode_segmentation::UnicodeSegmentation;
-use yu_core::{CaretAffinity, ClusterMetrics, StyleId, TextAttrs, VisualOffset, VisualRange};
+use yu_core::{
+    CaretAffinity, ClusterMetrics, Size, StyleId, TextAttrs, VisualOffset, VisualRange, WidgetId,
+    WidgetSide,
+};
 
-use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint};
+use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
 
 /// 把 [`StyleId`] 翻译成排版属性。
 ///
@@ -103,6 +113,206 @@ impl StyledRun {
     }
 }
 
+/// 一个 widget 在视觉文本里的锚点。
+///
+/// widget 在视觉字节流里**不占位**（不变量 D7 的字节层面语义），所以它只有
+/// 一个偏移，没有区间。宽高是这一层的事，由 [`WidgetMeasure`] 给。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WidgetSpan {
+    visual: VisualOffset,
+    widget: WidgetId,
+    side: WidgetSide,
+}
+
+impl WidgetSpan {
+    #[must_use]
+    pub const fn new(visual: VisualOffset, widget: WidgetId, side: WidgetSide) -> Self {
+        Self {
+            visual,
+            widget,
+            side,
+        }
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualOffset {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn widget(self) -> WidgetId {
+        self.widget
+    }
+
+    #[must_use]
+    pub const fn side(self) -> WidgetSide {
+        self.side
+    }
+}
+
+/// 量一个 widget 时给它的约束。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WidgetConstraints {
+    available_width: f32,
+    line_height: f32,
+}
+
+impl WidgetConstraints {
+    /// 一整行的可用宽度。widget 拿到的是**整块**的宽度，不是当前行的剩余
+    /// 宽度：剩余宽度取决于它排在哪，而「排在哪」要等它的宽度定了才知道。
+    #[must_use]
+    pub const fn available_width(self) -> f32 {
+        self.available_width
+    }
+
+    /// 纯文本行的行高，给「跟文字一样高」这类 widget 用。
+    #[must_use]
+    pub const fn line_height(self) -> f32 {
+        self.line_height
+    }
+}
+
+/// 一个 widget 的尺寸与基线。
+///
+/// `baseline` 从盒子顶端往下量。它让 widget 与同一行的文字对齐——
+/// 把它当成「从底往上」会让图片和文字错开一整行高，而且不报错。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WidgetMetrics {
+    size: Size<yu_core::Block>,
+    baseline: f32,
+}
+
+impl WidgetMetrics {
+    /// 非有限或负的基线被拒绝；越过盒子底端也被拒绝。
+    pub fn new(size: Size<yu_core::Block>, baseline: f32) -> Result<Self, LayoutError> {
+        if !baseline.is_finite() || baseline < 0.0 || baseline > size.height() {
+            return Err(LayoutError::InvalidWidgetBaseline);
+        }
+        Ok(Self { size, baseline })
+    }
+
+    /// 基线落在盒子底端，也就是「坐在文字基线上」。
+    pub fn sitting_on_baseline(size: Size<yu_core::Block>) -> Result<Self, LayoutError> {
+        let baseline = size.height();
+        Self::new(size, baseline)
+    }
+
+    #[must_use]
+    pub const fn size(self) -> Size<yu_core::Block> {
+        self.size
+    }
+
+    #[must_use]
+    pub const fn baseline(self) -> f32 {
+        self.baseline
+    }
+}
+
+/// 量一个 widget 的结果。
+///
+/// 不变量 D7：资源没就绪时返回 [`WidgetMeasurement::Placeholder`]，布局照常
+/// 完成，不阻塞、不整帧失败。就绪之后由资源层发一次 Revision-bound 通知，
+/// 触发受影响范围重排——那一步不在这一层，这一层只负责**能不能在没就绪的
+/// 时候把画面排出来**，以及**告诉调用方哪些还没就绪**。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WidgetMeasurement {
+    Ready(WidgetMetrics),
+    Placeholder(WidgetMetrics),
+}
+
+impl WidgetMeasurement {
+    #[must_use]
+    pub const fn metrics(self) -> WidgetMetrics {
+        match self {
+            Self::Ready(metrics) | Self::Placeholder(metrics) => metrics,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+}
+
+/// 把 [`WidgetId`] 翻译成尺寸。
+///
+/// 与 [`StyleTable`] 一样，实现住在产出装饰的那一层。未知 id 返回 `None`，
+/// 布局报 [`LayoutError::UnknownWidget`]——「装饰产出了一个没人认识的
+/// widget」应该响，不该悄悄画成一个零宽的空洞。
+pub trait WidgetMeasure {
+    fn measure(
+        &self,
+        widget: WidgetId,
+        constraints: WidgetConstraints,
+    ) -> Option<WidgetMeasurement>;
+}
+
+/// 一张空的 widget 表。给还没有 widget 产出的调用方与测试用。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoWidgets;
+
+impl WidgetMeasure for NoWidgets {
+    fn measure(
+        &self,
+        _widget: WidgetId,
+        _constraints: WidgetConstraints,
+    ) -> Option<WidgetMeasurement> {
+        None
+    }
+}
+
+/// 排好的一个 widget 盒。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WidgetBox {
+    widget: WidgetId,
+    visual: VisualOffset,
+    side: WidgetSide,
+    line: usize,
+    bounds: LayoutRect,
+    baseline: f32,
+    ready: bool,
+}
+
+impl WidgetBox {
+    #[must_use]
+    pub const fn widget(self) -> WidgetId {
+        self.widget
+    }
+
+    #[must_use]
+    pub const fn visual(self) -> VisualOffset {
+        self.visual
+    }
+
+    #[must_use]
+    pub const fn side(self) -> WidgetSide {
+        self.side
+    }
+
+    #[must_use]
+    pub const fn line(self) -> usize {
+        self.line
+    }
+
+    #[must_use]
+    pub const fn bounds(self) -> LayoutRect {
+        self.bounds
+    }
+
+    /// 盒子顶端到文字基线的距离。
+    #[must_use]
+    pub const fn baseline(self) -> f32 {
+        self.baseline
+    }
+
+    /// 资源是否已就绪。`false` 表示这一格画的是 placeholder，资源到位之后
+    /// 这个块要重排。
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        self.ready
+    }
+}
+
 /// 一个块的布局输入。
 ///
 /// `runs` 必须**无缝铺满** `text`：从 0 开始、首尾相接、终点等于
@@ -113,12 +323,31 @@ impl StyledRun {
 pub struct LayoutInput<'a> {
     text: &'a str,
     runs: &'a [StyledRun],
+    widgets: &'a [WidgetSpan],
 }
 
 impl<'a> LayoutInput<'a> {
     #[must_use]
     pub const fn new(text: &'a str, runs: &'a [StyledRun]) -> Self {
-        Self { text, runs }
+        Self {
+            text,
+            runs,
+            widgets: &[],
+        }
+    }
+
+    /// 挂上 widget。必须按视觉偏移升序，同一偏移上 `Before` 在 `After` 之前
+    /// ——也就是 `DecorationRange::order_key` 的顺序（不变量 D6）。乱序会让
+    /// 同一位置的两个 widget 画反，不报错。
+    #[must_use]
+    pub const fn with_widgets(mut self, widgets: &'a [WidgetSpan]) -> Self {
+        self.widgets = widgets;
+        self
+    }
+
+    #[must_use]
+    pub const fn widgets(&self) -> &'a [WidgetSpan] {
+        self.widgets
     }
 
     #[must_use]
@@ -216,9 +445,13 @@ impl ClusterBox {
 pub struct LineBox {
     index: usize,
     visual: VisualRange,
-    y: f32,
-    width: f32,
+    /// 行盒在 block 局部坐标里的矩形。`x` 现在恒为 0（左对齐），
+    /// 它是一个 [`LayoutRect`] 而不是散装的三个 `f32`，因为不变量 E6 要求
+    /// 视觉坐标只有一套实现、空间进类型。
+    bounds: LayoutRect,
+    baseline: f32,
     clusters: Range<usize>,
+    widgets: Range<usize>,
 }
 
 impl LineBox {
@@ -233,18 +466,41 @@ impl LineBox {
     }
 
     #[must_use]
+    pub const fn bounds(&self) -> LayoutRect {
+        self.bounds
+    }
+
+    #[must_use]
     pub const fn y(&self) -> f32 {
-        self.y
+        self.bounds.y()
     }
 
     #[must_use]
     pub const fn width(&self) -> f32 {
-        self.width
+        self.bounds.width()
+    }
+
+    /// 行高。纯文本行等于 `LayoutConfig::line_height`；有 widget 时按基线
+    /// 对齐撑高。
+    #[must_use]
+    pub const fn height(&self) -> f32 {
+        self.bounds.height()
+    }
+
+    /// 行顶到文字基线的距离。
+    #[must_use]
+    pub const fn baseline(&self) -> f32 {
+        self.baseline
     }
 
     #[must_use]
     pub fn cluster_range(&self) -> Range<usize> {
         self.clusters.clone()
+    }
+
+    #[must_use]
+    pub fn widget_range(&self) -> Range<usize> {
+        self.widgets.clone()
     }
 }
 
@@ -280,6 +536,14 @@ pub struct BlockLayout {
     visual_len: VisualOffset,
     lines: Vec<LineBox>,
     clusters: Vec<ClusterBox>,
+    widgets: Vec<WidgetBox>,
+}
+
+/// 重排时行内待摆放的一样东西。
+#[derive(Clone, Copy, Debug)]
+enum Item {
+    Cluster(usize),
+    Widget(usize),
 }
 
 struct LineCursor {
@@ -287,6 +551,7 @@ struct LineCursor {
     visual_start: VisualOffset,
     width: f32,
     cluster_start: usize,
+    widget_start: usize,
 }
 
 /// 第一遍度量出来的一个 grapheme，还没有被分配到行。
@@ -327,28 +592,44 @@ impl BlockLayout {
         styles: &T,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
+        Self::build_with_widgets(input, config, styles, &NoWidgets, metrics)
+    }
+
+    /// 带 widget 的完整版本。
+    pub fn build_with_widgets<T: StyleTable, W: WidgetMeasure, M: ClusterMetrics>(
+        input: LayoutInput<'_>,
+        config: LayoutConfig,
+        styles: &T,
+        widgets: &W,
+        metrics: &M,
+    ) -> Result<Self, LayoutError> {
         config.validate()?;
         let visual_len =
             VisualOffset::try_from(input.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
         validate_runs(input, visual_len)?;
+        validate_widgets(input, visual_len)?;
 
         let bidi = BidiInfo::new(input.text(), base_level(config.base_direction()));
         let measured = measure(input, styles, metrics, &bidi)?;
         let segment_starts = segment_starts(input.text, &measured)?;
+        let sizes = measure_widgets(input, config, widgets)?;
 
         let mut layout = Self {
             config,
             visual_len,
             lines: Vec::new(),
             clusters: Vec::new(),
+            widgets: Vec::new(),
         };
         let mut cursor = LineCursor {
             index: 0,
             visual_start: VisualOffset::ZERO,
             width: 0.0,
             cluster_start: 0,
+            widget_start: 0,
         };
         let mut last_was_break = false;
+        let mut next_widget = 0_usize;
 
         for segment in segment_starts.windows(2) {
             let (from, to) = (segment[0], segment[1]);
@@ -367,6 +648,13 @@ impl BlockLayout {
             }
 
             for cluster in &measured[from..to] {
+                layout.place_widgets_at(
+                    input.widgets(),
+                    &sizes,
+                    &mut next_widget,
+                    cluster.visual.start(),
+                    &mut cursor,
+                )?;
                 if cluster.mandatory_break {
                     layout.clusters.push(ClusterBox {
                         visual: cluster.visual,
@@ -405,6 +693,14 @@ impl BlockLayout {
             }
         }
 
+        layout.place_widgets_at(
+            input.widgets(),
+            &sizes,
+            &mut next_widget,
+            visual_len,
+            &mut cursor,
+        )?;
+
         if layout.lines.is_empty() || !last_was_break {
             layout.push_line(&cursor, visual_len)?;
         } else {
@@ -441,10 +737,32 @@ impl BlockLayout {
         &self.clusters
     }
 
-    /// 块的高度。
+    /// 排好的 widget 盒，与输入的 [`WidgetSpan`] 一一对应、同序。
+    #[must_use]
+    pub fn widgets(&self) -> &[WidgetBox] {
+        &self.widgets
+    }
+
+    /// 还画着 placeholder 的 widget。
+    ///
+    /// 不变量 D7 要求资源就绪后触发受影响范围重排。发通知不是这一层的事，
+    /// 但**哪些没就绪**只有排完才知道，所以由这里报出来。空表示这一块的
+    /// 几何已经是最终的。
+    #[must_use]
+    pub fn pending_widgets(&self) -> Vec<WidgetId> {
+        self.widgets
+            .iter()
+            .filter(|widget| !widget.ready)
+            .map(|widget| widget.widget)
+            .collect()
+    }
+
+    /// 块的高度。逐行累加——有 widget 的行比 `line_height` 高。
     #[must_use]
     pub fn height(&self) -> f32 {
-        self.lines.len() as f32 * self.config.line_height()
+        self.lines
+            .last()
+            .map_or(0.0, |line| line.bounds.y() + line.bounds.height())
     }
 
     /// 视觉偏移落在哪里。
@@ -497,7 +815,7 @@ impl BlockLayout {
         Ok(CaretBox {
             visual,
             line: line_index,
-            point: LayoutPoint::new(x, line.y),
+            point: LayoutPoint::new(x, line.bounds.y()),
         })
     }
 
@@ -510,7 +828,7 @@ impl BlockLayout {
     pub fn hit(&self, point: LayoutPoint) -> Result<CaretBox, LayoutError> {
         let line_index = self.line_for_y(point.y());
         let line = &self.lines[line_index];
-        let target = point.x().clamp(0.0, line.width);
+        let target = point.x().clamp(0.0, line.bounds.width());
         let mut best: Option<(f32, f32, VisualOffset)> = None;
         for (x, offset) in self.caret_positions(line) {
             let distance = (x - target).abs();
@@ -529,7 +847,7 @@ impl BlockLayout {
         Ok(CaretBox {
             visual,
             line: line_index,
-            point: LayoutPoint::new(x, line.y),
+            point: LayoutPoint::new(x, line.bounds.y()),
         })
     }
 
@@ -576,7 +894,7 @@ impl BlockLayout {
         }
         for line_index in 0..self.lines.len() {
             let line = self.lines[line_index].clone();
-            if line.clusters.is_empty() {
+            if line.clusters.is_empty() && line.widgets.is_empty() {
                 continue;
             }
             let from = usize::try_from(line.visual.start().get())
@@ -591,35 +909,100 @@ impl BlockLayout {
                 .iter()
                 .find(|paragraph| paragraph.range.contains(&from))
                 .ok_or(LayoutError::OffsetOverflow)?;
-            let (levels, runs) = bidi.visual_runs(paragraph, from..to.min(paragraph.range.end));
+            let end = to.min(paragraph.range.end);
+            let (levels, runs) = bidi.visual_runs(paragraph, from..end);
 
             let mut x = 0.0_f32;
             for run in runs {
                 let rtl = levels[run.start].is_rtl();
-                let mut indices: Vec<usize> = line
-                    .clusters
-                    .clone()
-                    .filter(|index| {
-                        let start = self.clusters[*index].visual.start().get() as usize;
-                        run.contains(&start)
-                    })
-                    .collect();
+                let mut items = self.items_in(&line, |offset| run.contains(&offset));
                 if rtl {
-                    indices.reverse();
+                    items.reverse();
                 }
-                for index in indices {
+                x = self.lay_out(&items, x)?;
+            }
+            // 段落之外的东西（行尾的强制换行符、锚在行末的 widget）留在行末。
+            let tail = self.items_in(&line, |offset| offset >= end);
+            self.lay_out(&tail, x)?;
+        }
+        Ok(())
+    }
+
+    /// 一行里锚点满足 `keep` 的簇与 widget，按**逻辑**顺序。
+    ///
+    /// 同一个锚点上 widget 排在簇前面——widget 的视觉区间是空的，它插在
+    /// 前一个 grapheme 与后一个之间。
+    fn items_in(&self, line: &LineBox, keep: impl Fn(usize) -> bool) -> Vec<Item> {
+        let mut items: Vec<(u64, u8, Item)> = Vec::new();
+        for index in line.widgets.clone() {
+            let offset = self.widgets[index].visual.get();
+            if keep(offset as usize) {
+                items.push((offset, 0, Item::Widget(index)));
+            }
+        }
+        for index in line.clusters.clone() {
+            let offset = self.clusters[index].visual.start().get();
+            if keep(offset as usize) {
+                items.push((offset, 1, Item::Cluster(index)));
+            }
+        }
+        items.sort_by_key(|(offset, rank, _)| (*offset, *rank));
+        items.into_iter().map(|(_, _, item)| item).collect()
+    }
+
+    /// 从 `x` 起依次摆下这些东西，返回摆完之后的 x。
+    fn lay_out(&mut self, items: &[Item], mut x: f32) -> Result<f32, LayoutError> {
+        for item in items {
+            match *item {
+                Item::Cluster(index) => {
                     self.clusters[index].x = x;
                     x += self.clusters[index].width;
                 }
-            }
-            // 落在段落之外的簇（行尾的强制换行符）留在行末。
-            for index in line.clusters.clone() {
-                let start = self.clusters[index].visual.start().get() as usize;
-                if start >= to.min(paragraph.range.end) {
-                    self.clusters[index].x = x;
-                    x += self.clusters[index].width;
+                Item::Widget(index) => {
+                    let bounds = self.widgets[index].bounds;
+                    self.widgets[index].bounds =
+                        LayoutRect::new(x, bounds.y(), bounds.width(), bounds.height())?;
+                    x += bounds.width();
                 }
             }
+        }
+        Ok(x)
+    }
+
+    /// 放下锚在 `visual` 上的所有 widget。
+    ///
+    /// widget 排不进当前行时先断行——它像 UAX #14 的 CB（contingent break）：
+    /// 前后都允许断，但自身不可分割。
+    fn place_widgets_at(
+        &mut self,
+        spans: &[WidgetSpan],
+        sizes: &[WidgetMeasurement],
+        next: &mut usize,
+        visual: VisualOffset,
+        cursor: &mut LineCursor,
+    ) -> Result<(), LayoutError> {
+        while *next < spans.len() && spans[*next].visual == visual {
+            let span = spans[*next];
+            let measurement = sizes[*next];
+            let metrics = measurement.metrics();
+            let width = metrics.size().width();
+            if cursor.width > 0.0 && cursor.width + width > self.config.max_width() {
+                self.push_line(cursor, visual)?;
+                *cursor = self.next_line(cursor, visual);
+            }
+            // y 要等整行的基线定下来才知道，先记 0，在 push_line 里修正。
+            let bounds = LayoutRect::new(cursor.width, 0.0, width, metrics.size().height())?;
+            self.widgets.push(WidgetBox {
+                widget: span.widget,
+                visual,
+                side: span.side,
+                line: cursor.index,
+                bounds,
+                baseline: metrics.baseline(),
+                ready: measurement.is_ready(),
+            });
+            cursor.width += width;
+            *next += 1;
         }
         Ok(())
     }
@@ -630,6 +1013,7 @@ impl BlockLayout {
             visual_start,
             width: 0.0,
             cluster_start: self.clusters.len(),
+            widget_start: self.widgets.len(),
         }
     }
 
@@ -640,27 +1024,52 @@ impl BlockLayout {
     ) -> Result<(), LayoutError> {
         let visual =
             VisualRange::new(cursor.visual_start, visual_end).ok_or(LayoutError::OffsetOverflow)?;
-        let y = cursor.index as f32 * self.config.line_height();
-        if !y.is_finite() {
+        // y 逐行累加而不是 `index * line_height`：有 widget 的行会更高。
+        let y = self
+            .lines
+            .last()
+            .map_or(0.0, |line| line.bounds.y() + line.bounds.height());
+        // 基线对齐：文字的基线在行底（ascent = line_height、descent = 0），
+        // widget 按自己的 baseline 往下挂。谁要求的基线更深，行就往下长。
+        let mut baseline = self.config.line_height();
+        let mut descent = 0.0_f32;
+        for widget in &self.widgets[cursor.widget_start..] {
+            baseline = baseline.max(widget.baseline);
+            descent = descent.max(widget.bounds.height() - widget.baseline);
+        }
+        let height = baseline + descent;
+        if !y.is_finite() || !height.is_finite() {
             return Err(LayoutError::InvalidPoint);
+        }
+        let widget_start = cursor.widget_start;
+        for index in widget_start..self.widgets.len() {
+            let widget = self.widgets[index];
+            self.widgets[index].bounds = LayoutRect::new(
+                widget.bounds.x(),
+                y + baseline - widget.baseline,
+                widget.bounds.width(),
+                widget.bounds.height(),
+            )?;
         }
         self.lines.push(LineBox {
             index: cursor.index,
             visual,
-            y,
-            width: cursor.width,
+            bounds: LayoutRect::new(0.0, y, cursor.width, height)?,
+            baseline,
             clusters: cursor.cluster_start..self.clusters.len(),
+            widgets: widget_start..self.widgets.len(),
         });
         Ok(())
     }
 
     fn line_for_y(&self, y: f32) -> usize {
-        let raw = (y / self.config.line_height()).floor();
-        if raw.is_sign_negative() {
-            0
-        } else {
-            (raw as usize).min(self.lines.len().saturating_sub(1))
+        // 行高不再一定相同（widget 会撑高），所以按行的 y 区间找而不是除。
+        for (index, line) in self.lines.iter().enumerate() {
+            if y < line.bounds.y() + line.bounds.height() {
+                return index;
+            }
         }
+        self.lines.len().saturating_sub(1)
     }
 
     fn line_for_visual(&self, visual: VisualOffset, affinity: CaretAffinity) -> usize {
@@ -790,6 +1199,64 @@ fn base_level(direction: BaseDirection) -> Option<Level> {
     }
 }
 
+/// 量所有 widget。约束是整块的宽度，不是当前行的剩余宽度——剩余宽度取决于
+/// 它排在哪，而「排在哪」要等它的宽度定了才知道。
+fn measure_widgets<W: WidgetMeasure>(
+    input: LayoutInput<'_>,
+    config: LayoutConfig,
+    widgets: &W,
+) -> Result<Vec<WidgetMeasurement>, LayoutError> {
+    let constraints = WidgetConstraints {
+        available_width: config.max_width(),
+        line_height: config.line_height(),
+    };
+    input
+        .widgets()
+        .iter()
+        .map(|span| {
+            let measurement = widgets
+                .measure(span.widget, constraints)
+                .ok_or(LayoutError::UnknownWidget(span.widget))?;
+            let size = measurement.metrics().size();
+            if !size.width().is_finite() || !size.height().is_finite() {
+                return Err(LayoutError::InvalidWidgetSize);
+            }
+            Ok(measurement)
+        })
+        .collect()
+}
+
+/// widget 必须按视觉偏移升序、同偏移上 `Before` 在前，且都落在文本范围内。
+///
+/// 这就是 `DecorationRange::order_key` 的顺序（不变量 D6）。乱序不会 panic，
+/// 只会让同一处的两个 widget 画反。
+fn validate_widgets(input: LayoutInput<'_>, visual_len: VisualOffset) -> Result<(), LayoutError> {
+    let mut previous: Option<WidgetSpan> = None;
+    for span in input.widgets() {
+        if span.visual > visual_len {
+            return Err(LayoutError::VisualOutOfBounds(span.visual));
+        }
+        let index = usize::try_from(span.visual.get()).map_err(|_| LayoutError::OffsetOverflow)?;
+        if !input.text().is_char_boundary(index) {
+            return Err(LayoutError::RunNotOnCharBoundary);
+        }
+        if let Some(previous) = previous
+            && (previous.visual, side_rank(previous.side)) > (span.visual, side_rank(span.side))
+        {
+            return Err(LayoutError::WidgetsOutOfOrder);
+        }
+        previous = Some(*span);
+    }
+    Ok(())
+}
+
+const fn side_rank(side: WidgetSide) -> u8 {
+    match side {
+        WidgetSide::Before => 0,
+        WidgetSide::After => 1,
+    }
+}
+
 /// runs 必须无缝铺满视觉文本，且每个边界都在 UTF-8 字符边界上。
 fn validate_runs(input: LayoutInput<'_>, visual_len: VisualOffset) -> Result<(), LayoutError> {
     let mut expected = VisualOffset::ZERO;
@@ -819,9 +1286,15 @@ fn validate_runs(input: LayoutInput<'_>, visual_len: VisualOffset) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockLayout, LayoutInput, StyleTable, StyledRun, UniformStyleTable};
+    use super::{
+        BlockLayout, LayoutInput, StyleTable, StyledRun, UniformStyleTable, WidgetConstraints,
+        WidgetMeasure, WidgetMeasurement, WidgetMetrics, WidgetSpan,
+    };
     use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint, MonospaceMetrics};
-    use yu_core::{CaretAffinity, StyleId, TextAttrs, TextStyle, VisualOffset, VisualRange};
+    use yu_core::{
+        CaretAffinity, Size, StyleId, TextAttrs, TextStyle, VisualOffset, VisualRange, WidgetId,
+        WidgetSide,
+    };
 
     fn visual(start: u64, end: u64) -> VisualRange {
         VisualRange::new(VisualOffset::new(start), VisualOffset::new(end)).expect("有序")
@@ -1001,6 +1474,257 @@ mod tests {
                 text[from..to].to_owned()
             })
             .collect()
+    }
+
+    /// 一张按 id 给尺寸的 widget 表。`ready` 为假模拟资源没就绪。
+    struct Widgets {
+        entries: Vec<(WidgetId, f32, f32, f32, bool)>,
+    }
+
+    impl WidgetMeasure for Widgets {
+        fn measure(
+            &self,
+            widget: WidgetId,
+            constraints: WidgetConstraints,
+        ) -> Option<WidgetMeasurement> {
+            let (_, width, height, baseline, ready) =
+                *self.entries.iter().find(|entry| entry.0 == widget)?;
+            assert!(constraints.available_width() > 0.0);
+            assert!(constraints.line_height() > 0.0);
+            let metrics = WidgetMetrics::new(Size::new(width, height).expect("有限"), baseline)
+                .expect("基线合法");
+            Some(if ready {
+                WidgetMeasurement::Ready(metrics)
+            } else {
+                WidgetMeasurement::Placeholder(metrics)
+            })
+        }
+    }
+
+    fn build_widgets(
+        text: &str,
+        width: f32,
+        spans: &[WidgetSpan],
+        table: &Widgets,
+    ) -> Result<BlockLayout, LayoutError> {
+        BlockLayout::build_with_widgets(
+            LayoutInput::new(text, &plain(text)).with_widgets(spans),
+            LayoutConfig::new(width, 1.0),
+            &UniformStyleTable::default(),
+            table,
+            &MonospaceMetrics::default(),
+        )
+    }
+
+    /// widget 在视觉字节流里不占位，但在行里占宽度：它后面的字要让开。
+    #[test]
+    fn a_widget_takes_horizontal_space_without_taking_visual_bytes() {
+        let text = "ab";
+        let table = Widgets {
+            entries: vec![(WidgetId(1), 3.0, 1.0, 1.0, true)],
+        };
+        let spans = [WidgetSpan::new(
+            VisualOffset::new(1),
+            WidgetId(1),
+            WidgetSide::Before,
+        )];
+        let layout = build_widgets(text, 80.0, &spans, &table).expect("布局");
+        assert_eq!(
+            layout.visual_len(),
+            VisualOffset::new(2),
+            "视觉长度不含 widget"
+        );
+        assert_eq!(layout.clusters()[0].x(), 0.0);
+        assert_eq!(
+            layout.clusters()[1].x(),
+            4.0,
+            "'b' 要给 3.0 宽的 widget 让开"
+        );
+        let placed = layout.widgets()[0];
+        assert_eq!(placed.bounds().x(), 1.0);
+        assert_eq!(placed.bounds().width(), 3.0);
+        assert_eq!(layout.lines()[0].width(), 5.0);
+    }
+
+    /// widget 参与断行，而且自身不可分割：排不下就整个挪到下一行。
+    /// UAX #14 的 CB 就是这个语义——前后都能断，中间不能。
+    #[test]
+    fn a_widget_moves_to_the_next_line_when_it_does_not_fit() {
+        let text = "aab";
+        let table = Widgets {
+            entries: vec![(WidgetId(1), 3.0, 1.0, 1.0, true)],
+        };
+        let spans = [WidgetSpan::new(
+            VisualOffset::new(2),
+            WidgetId(1),
+            WidgetSide::Before,
+        )];
+        // 宽度 4 的行放得下 "aa"，再塞 3.0 宽的 widget 就超了。
+        let layout = build_widgets(text, 4.0, &spans, &table).expect("布局");
+        assert_eq!(layout.lines().len(), 2);
+        assert_eq!(
+            layout.lines()[0].width(),
+            2.0,
+            "widget 整个挪走，不切一半留下"
+        );
+        assert_eq!(layout.widgets()[0].line(), 1);
+        assert_eq!(layout.widgets()[0].bounds().x(), 0.0);
+        assert_eq!(layout.clusters()[2].x(), 3.0, "'b' 跟在 widget 后面");
+    }
+
+    /// 基线对齐：widget 按自己的 baseline 往下挂，谁要求得更深行就往下长，
+    /// 后面的行跟着往下移。行高一律按 `line_height` 算会让高图片压住下一行。
+    #[test]
+    fn a_tall_widget_grows_its_line_and_pushes_later_lines_down() {
+        let text = "a\nb";
+        let table = Widgets {
+            entries: vec![(WidgetId(1), 2.0, 4.0, 3.0, true)],
+        };
+        let spans = [WidgetSpan::new(
+            VisualOffset::ZERO,
+            WidgetId(1),
+            WidgetSide::Before,
+        )];
+        let layout = build_widgets(text, 80.0, &spans, &table).expect("布局");
+        assert_eq!(layout.lines().len(), 2);
+        // 文字的 ascent 是 1.0，widget 要求基线在 3.0 处，行基线取更深的那个。
+        assert_eq!(layout.lines()[0].baseline(), 3.0);
+        // 基线下面还剩 4.0 - 3.0 = 1.0 的 descent。
+        assert_eq!(layout.lines()[0].height(), 4.0);
+        assert_eq!(layout.lines()[0].y(), 0.0);
+        assert_eq!(layout.lines()[1].y(), 4.0, "第二行被顶下去");
+        assert_eq!(layout.lines()[1].height(), 1.0);
+        assert_eq!(layout.height(), 5.0);
+        // widget 盒顶 = 行顶 + 行基线 - widget 基线。
+        assert_eq!(layout.widgets()[0].bounds().y(), 0.0);
+    }
+
+    /// 不变量 D7：资源没就绪时用 placeholder 尺寸，布局照常完成、不报错，
+    /// 并且把「哪些还没就绪」报出来——不然没人知道该在资源到位后重排。
+    #[test]
+    fn a_pending_widget_lays_out_with_its_placeholder_size() {
+        let text = "ab";
+        let table = Widgets {
+            entries: vec![(WidgetId(7), 2.0, 1.0, 1.0, false)],
+        };
+        let spans = [WidgetSpan::new(
+            VisualOffset::new(1),
+            WidgetId(7),
+            WidgetSide::Before,
+        )];
+        let layout = build_widgets(text, 80.0, &spans, &table).expect("没就绪也要排出来");
+        assert_eq!(layout.lines().len(), 1);
+        assert_eq!(layout.widgets()[0].bounds().width(), 2.0);
+        assert!(!layout.widgets()[0].is_ready());
+        assert_eq!(layout.pending_widgets(), vec![WidgetId(7)]);
+
+        let ready = Widgets {
+            entries: vec![(WidgetId(7), 2.0, 1.0, 1.0, true)],
+        };
+        let layout = build_widgets(text, 80.0, &spans, &ready).expect("布局");
+        assert!(layout.pending_widgets().is_empty(), "就绪之后没有待办");
+    }
+
+    /// widget 表查不到的 id 是错误，不是零宽的空洞。
+    #[test]
+    fn unknown_widget_is_an_error() {
+        let text = "ab";
+        let table = Widgets { entries: vec![] };
+        let spans = [WidgetSpan::new(
+            VisualOffset::new(1),
+            WidgetId(3),
+            WidgetSide::Before,
+        )];
+        assert_eq!(
+            build_widgets(text, 80.0, &spans, &table),
+            Err(LayoutError::UnknownWidget(WidgetId(3)))
+        );
+    }
+
+    /// widget 必须按 `(offset, side)` 升序给出（不变量 D6 的定序）。
+    /// 乱序不会 panic，只会让同一处的两个 widget 画反。
+    #[test]
+    fn widgets_must_arrive_in_decoration_order() {
+        let text = "abc";
+        let table = Widgets {
+            entries: vec![
+                (WidgetId(1), 1.0, 1.0, 1.0, true),
+                (WidgetId(2), 1.0, 1.0, 1.0, true),
+            ],
+        };
+        let backwards = [
+            WidgetSpan::new(VisualOffset::new(2), WidgetId(1), WidgetSide::Before),
+            WidgetSpan::new(VisualOffset::new(1), WidgetId(2), WidgetSide::Before),
+        ];
+        assert_eq!(
+            build_widgets(text, 80.0, &backwards, &table),
+            Err(LayoutError::WidgetsOutOfOrder)
+        );
+        let side_backwards = [
+            WidgetSpan::new(VisualOffset::new(1), WidgetId(1), WidgetSide::After),
+            WidgetSpan::new(VisualOffset::new(1), WidgetId(2), WidgetSide::Before),
+        ];
+        assert_eq!(
+            build_widgets(text, 80.0, &side_backwards, &table),
+            Err(LayoutError::WidgetsOutOfOrder)
+        );
+        let ordered = [
+            WidgetSpan::new(VisualOffset::new(1), WidgetId(1), WidgetSide::Before),
+            WidgetSpan::new(VisualOffset::new(1), WidgetId(2), WidgetSide::After),
+        ];
+        let layout = build_widgets(text, 80.0, &ordered, &table).expect("布局");
+        assert_eq!(layout.widgets()[0].bounds().x(), 1.0);
+        assert_eq!(layout.widgets()[1].bounds().x(), 2.0);
+    }
+
+    /// widget 也要跟着 bidi 重排走。只搬文字不搬 widget，图片会压在字上。
+    #[test]
+    fn widgets_follow_the_bidi_reordering() {
+        let text = "\u{5e9}\u{5dc}\u{5d5}\u{5dd}";
+        let table = Widgets {
+            entries: vec![(WidgetId(1), 2.0, 1.0, 1.0, true)],
+        };
+        // 锚在第一个与第二个希伯来字母之间。逻辑顺序里它排第二，
+        // 视觉顺序里就该排倒数第二。
+        let spans = [WidgetSpan::new(
+            VisualOffset::new(2),
+            WidgetId(1),
+            WidgetSide::Before,
+        )];
+        let layout = build_widgets(text, 80.0, &spans, &table).expect("布局");
+        assert_eq!(layout.lines()[0].width(), 6.0);
+        // 视觉从左到右：\u{5dd}(1) \u{5d5}(1) \u{5dc}(1) widget(2) \u{5e9}(1)
+        let xs: Vec<f32> = layout.clusters().iter().map(|c| c.x()).collect();
+        assert_eq!(xs, vec![5.0, 2.0, 1.0, 0.0]);
+        assert_eq!(
+            layout.widgets()[0].bounds().x(),
+            3.0,
+            "重排前它在 x=1，跟着走才会到 x=3"
+        );
+    }
+
+    /// widget 的基线必须落在盒子里。越界会让它挂到别的行上去。
+    #[test]
+    fn widget_baseline_must_lie_inside_the_box() {
+        let size = Size::new(2.0, 3.0).expect("有限");
+        assert_eq!(
+            WidgetMetrics::new(size, 4.0),
+            Err(LayoutError::InvalidWidgetBaseline)
+        );
+        assert_eq!(
+            WidgetMetrics::new(size, -1.0),
+            Err(LayoutError::InvalidWidgetBaseline)
+        );
+        assert_eq!(
+            WidgetMetrics::new(size, f32::NAN),
+            Err(LayoutError::InvalidWidgetBaseline)
+        );
+        assert_eq!(
+            WidgetMetrics::sitting_on_baseline(size)
+                .expect("合法")
+                .baseline(),
+            3.0
+        );
     }
 
     /// UAX #14：断在词之间，不再断在词中间。
