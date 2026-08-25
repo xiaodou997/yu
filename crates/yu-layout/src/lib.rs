@@ -14,7 +14,7 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{
     Affinity, ByteOffset, ClusterMetrics, FontFaceId, GeometryError, GlyphId, ShapedText,
-    ShapingProvider, StyleId, TextAnchor, TextRange, TextStyle,
+    ShapingProvider, StyleId, TextAnchor, TextRange, TextStyle, WidgetId,
 };
 use yu_projection::{
     BlockProjection, BlockQuotePresentation, HeadingPresentation, LeadingMarker, Projection,
@@ -26,8 +26,9 @@ mod block;
 mod table;
 
 pub use block::{
-    BlockLayout, CaretBox, ClusterBox, LayoutInput, LineBox, StyleTable, StyledRun,
-    UniformStyleTable,
+    BlockLayout, CaretBox, ClusterBox, LayoutInput, LineBox, NoWidgets, StyleTable, StyledRun,
+    UniformStyleTable, WidgetBox, WidgetConstraints, WidgetMeasure, WidgetMeasurement,
+    WidgetMetrics, WidgetSpan,
 };
 pub use table::{
     TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeCommit, TableResizeGesture,
@@ -348,6 +349,14 @@ pub enum LayoutError {
     RunNotOnCharBoundary,
     /// 查询用的视觉偏移超出了这个块。
     VisualOutOfBounds(VisualOffset),
+    /// widget 表里没有这个 id。
+    UnknownWidget(WidgetId),
+    /// widget 的基线不在 `[0, height]` 里。
+    InvalidWidgetBaseline,
+    /// widget 的尺寸不是有限值。
+    InvalidWidgetSize,
+    /// widget 没有按 `(from, side)` 升序给出（不变量 D6 的定序）。
+    WidgetsOutOfOrder,
 }
 
 /// Errors raised by the viewport height index.
@@ -549,6 +558,16 @@ impl fmt::Display for LayoutError {
             Self::VisualOutOfBounds(visual) => {
                 write!(formatter, "visual offset {visual:?} is outside this block")
             }
+            Self::UnknownWidget(widget) => {
+                write!(formatter, "widget table has no entry for {widget:?}")
+            }
+            Self::InvalidWidgetBaseline => {
+                formatter.write_str("widget baseline must lie between zero and its height")
+            }
+            Self::InvalidWidgetSize => formatter.write_str("widget size must be finite"),
+            Self::WidgetsOutOfOrder => {
+                formatter.write_str("widgets must be ordered by (offset, side)")
+            }
         }
     }
 }
@@ -568,7 +587,11 @@ impl Error for LayoutError {
             | Self::UnknownStyle(_)
             | Self::RunsNotContiguous { .. }
             | Self::RunNotOnCharBoundary
-            | Self::VisualOutOfBounds(_) => None,
+            | Self::VisualOutOfBounds(_)
+            | Self::UnknownWidget(_)
+            | Self::InvalidWidgetBaseline
+            | Self::InvalidWidgetSize
+            | Self::WidgetsOutOfOrder => None,
         }
     }
 }
