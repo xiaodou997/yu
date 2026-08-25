@@ -9,12 +9,16 @@
 
 mod accessibility;
 mod blockinput;
+mod blockview;
 mod command;
 mod document;
+mod geometry;
+mod image;
 mod keymap;
 mod layout;
 mod list;
 mod projection;
+mod table;
 mod viewport;
 
 pub use accessibility::{
@@ -27,11 +31,20 @@ pub use blockinput::{
     BlockLayoutInput, BlockLineStyleTable, BlockOrnaments, BlockQuoteOrnament, BlockStyleTable,
     HeadingOrnament, MarkerOrnament, style_id,
 };
+pub use blockview::{BlockCaret, BlockCluster, BlockGlyph, BlockHit, BlockLine, BlockView};
 pub use command::{CommandResult, EditorCommand, KeyRouteResult, SourceChange, SourceSync};
 pub use document::{EditorDocument, EditorDocumentError};
+pub use image::ImagePlacement as BlockImagePlacement;
 pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
 pub use layout::{LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
+pub use table::{
+    TableCellLayout as TableCellGeometry, TableLayout, TableLayoutHit as TableGeometryHit,
+    TableResizeCommit as TableGeometryResizeCommit,
+    TableResizeGesture as TableGeometryResizeGesture,
+    TableResizeGestureError as TableGeometryResizeGestureError,
+    TableResizeHit as TableGeometryResizeHit, TableResizeTarget as TableGeometryResizeTarget,
+};
 pub use viewport::{
     CaretScrollRequest, ViewportBlock, ViewportCaret, ViewportConfig, ViewportError,
     ViewportLayout, ViewportRange, ViewportSnapshot, ViewportSpan, ViewportStats,
