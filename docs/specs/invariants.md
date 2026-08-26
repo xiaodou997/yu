@@ -118,6 +118,19 @@ layout 正常完成，不得阻塞、不得整帧失败。资源就绪后发布 
 及所有 platform crate 中不得出现任何 Markdown 语法概念。
 验证方式：`grep -ri "markdown\|heading\|emphasis\|blockquote\|codefence" <这些 crate>` 零命中。
 
+**那条 grep 是必要条件，不是充分条件。** `table` / `image` / `task` 都不在
+关键词里，而 `yu-layout::TableLayoutSnapshot` 与 `yu-scene::TablePrimitive`
+与 `HeadingPresentation` 是同一种泄漏：一种语法一个类型、一条全链路
+（架构总览第 2.1 节）。判据按第 3 节的对照表走，不按 grep 走——否则 grep
+会绿而泄漏还在。S5 结束时这三样分别成了：表格与图片的几何搬进 `yu-editor`
+（那一层允许认识 Markdown），场景层的三套语法 primitive 合并成一个渲染中立
+的 `OrnamentPrimitive`。
+
+**`yu-editor` 不在禁止清单里。** 它是允许认识 Markdown 的那一层，
+`tools/check-deps.py` 登记了 `yu-editor → yu-markdown`。不透明 id
+（`StyleId` / `LineStyleId` / `WidgetId`）的解释权就归它——布局层查表拿到
+「斜体、1.6 倍字号」，拿不到「这是二级标题」。
+
 **E2.** crate 依赖图必须是严格 DAG，方向为：
 
 ```text

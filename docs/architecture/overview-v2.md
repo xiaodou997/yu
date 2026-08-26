@@ -125,6 +125,7 @@ v2:  每种 Markdown 语法 →  一组 Decoration（数据），进入同一个
 | 隐藏未聚焦的 `##` | `HeadingPresentation` + layout 分支 | `Decoration::Replace(0..3)` |
 | task checkbox | Primitive + RenderCommand tag + Swift mask | `Decoration::Widget(Checkbox)` |
 | 表格 | `TableProjection` + `TablePrimitive` + 几何 FFI | 一个 block widget |
+| 任务框 / 引用条 | 各自一个 Scene Primitive | 一个渲染中立的 `OrnamentPrimitive` |
 | KaTeX / Mermaid | 专用 EmbeddedSvg 全链路 | 一个 block widget |
 | 语法高亮 / 拼写检查 / AI diff | 各自一条全链路 | 各自一个 extension 产 RangeSet |
 
@@ -738,23 +739,22 @@ UAX #9 bidi、CJK 禁则、widget 盒模型（intrinsic size + baseline 对齐�
 
 - 验收：`grep -ri markdown crates/yu-layout crates/yu-scene crates/yu-render` 零命中。
 
-**进行中。** 新引擎已建成并逐项验证，`yu-scene` / `yu-render` 的产品代码已
-清零；`yu-layout` 的 60 处产品侧命中还在，它们跟着 `LayoutSnapshot` 走。
-
-#### 已完成：`yu-layout::BlockLayout`
-
-输入是**视觉文本 + `StyledRun` + `WidgetSpan` + `LineSpan`**，输出**只有视觉
-坐标**。source ↔ visual 是 `DecorationSet` 的双向映射（D4「这是投影映射链的
-唯一实现」），布局再做一遍就会有第二套，所以调用方在拿到结果之后自己换算。
+**完成。** 验收 grep 零命中，而且不是靠改词做到的：`yu-layout` 的依赖只剩
+`yu-core`，它**拿不到**判断语法语义所需的信息。
 
 | 刀 | commit | 内容 |
 | --- | --- | --- |
-| 1 | `d9c5164` | 输入契约与几何差分 |
+| 1 | `d9c5164` | `BlockLayout` 的输入契约与几何差分 |
 | 2 | `8d2927f` | UAX #14 断行、CJK 禁则 |
 | 3 | `fcd6b2c` | UAX #9 bidi |
 | 4 | `9dfd858` | widget 盒模型与 D7 placeholder |
 | 5 | `c149670` | 行级样式（缩进 + 行高倍率） |
-| 6 | `df99158` | `yu-scene` / `yu-render` 词汇清零 |
+| 6 | `df99158` | `yu-scene` / `yu-render` 的第一轮词汇清零 |
+| 7 | `2506fb1` | `BlockLayout` 的 shaping 路径，字形跟着簇走 |
+| 8 | `e1ee5f9` | 输入装配器 `BlockLayoutInput` 进 `yu-editor` |
+| 9 | `d42e92c` | `BlockView` 接管产品侧，表格与图片几何离开 `yu-layout` |
+| 10 | `656a703` | 删掉 `LayoutSnapshot`，三个 crate 的词汇清零 |
+| 11 | `e9ec908` | 任务框的画家顺序（真实窗口对比抓到的） |
 
 #### 三个开放问题的答案
 
@@ -766,72 +766,85 @@ UAX #9 bidi、CJK 禁则、widget 盒模型（intrinsic size + baseline 对齐�
 
 词汇（`StyleId` / `LineStyleId` / `WidgetId` / `WidgetSide` / `TextAttrs`）
 迁进了 `yu-core::style`。这不是偏好而是硬约束：`yu-font` 实现 `ClusterMetrics`
-时要用 `TextAttrs`，而 4.2 节规定 `yu-font` 只能依赖 `yu-core`。`yu-decoration`
-原样再导出，公开面不变。处理方式与 S3 的 `VisualOffset`、S4 的 caret 坐标
-一致：纯类型归 `yu-core`，逻辑留在原处。
+时要用 `TextAttrs`，而 4.2 节规定 `yu-font` 只能依赖 `yu-core`。
 
 **几何差分按「有没有发生软换行」分两个口径。** v1 布局的断行是按 grapheme
-贪心（`line_width + advance > max_width` 就地断），没有 UAX #14。补上之后
-新旧断点必然不同，所以：
-
-- 没有软换行（换行全部来自强制换行符）：两条路本该一致，逐点比对行盒、
-  簇盒、caret、hit-test。56 个组合。
-- 发生软换行：oracle 失效，比对退化为一条仍然成立的性质——**断行规则只改变
-  grapheme 被分到哪一行，不改变 grapheme 本身**。36 个组合。
-
-两个口径各自钉了组合数（56 + 36 = 23×4），免得整批用例悄悄滑进弱口径那边
-还看起来是绿的。断行规则本身的正确性不拿 v1 当 oracle，也**没有**把 Unicode
-的 `LineBreakTest.txt` 搬进仓库——那只会再测一遍 `unicode-linebreak`，它在
-上游已经逐条跑过。这里证明的是「我们用对了它」。口径与 F3「不为一条用例扩大
-依赖面」一致。
+贪心，没有 UAX #14；补上之后新旧断点必然不同，所以强口径只覆盖「换行全部
+来自强制换行符」的组合，弱口径退化为「断行只改变 grapheme 分到哪一行，
+不改变 grapheme 本身」。两个口径各自钉了组合数。
 
 **渐进替换，新旧并存，靠差分守着。** 一次性重写没有 oracle 可用。
+
+#### 三层各自的落点
+
+| 层 | 输入 | 不知道的事 |
+| --- | --- | --- |
+| `yu-layout::BlockLayout` | 视觉文本 + `StyledRun` + `WidgetSpan` + `LineSpan` + 三张表 | 语法、源码坐标 |
+| `yu-editor::BlockLayoutInput` | `Projection` | —（它就是翻译的那一层） |
+| `yu-editor::BlockView` | 上面两样 + `Projection` 的映射 | — |
+
+`BlockLayout` 的输出**只有视觉坐标**。source ↔ visual 是 `DecorationSet` 的
+双向映射（不变量 D4「这是投影映射链的唯一实现」），布局再做一遍就会有第二套。
+`BlockView` 在拿到结果之后向 `Projection` 问源码区间，自己不算。
+
+`yu-scene` 的输入是 `SceneGlyph`（字面 / 字形 id / block 局部原点 / 字号
+倍率）与 `ViewportBlockContent`（底色 → 装饰 → 字形 → 图片 → 覆盖层）。
+它不认识布局的盒子类型，也不认识源码坐标。
 
 #### 这一轮的实证
 
 - **v1 的断行不是「差一点」，是没有断行算法。** 24 个语料×宽度组合的断点在
-  UAX #14 落地后全变了。行尾空白现在悬在行外（UAX #14 的断行机会在空白
-  **之后**，让空白把整个词挤到下一行是错的），代价是这样的行宽会超过
+  UAX #14 落地后全变了。行尾空白现在悬在行外，代价是这样的行宽会超过
   `max_width`，这是有意的。
-- **CJK 禁则不需要 tailoring。** UAX #14 的默认对表已经覆盖：`、`「`」`不落
-  行首、`「`不落行末。窄到放不下时退回应急断行，禁则让位——看起来像禁则
-  失效，单独有一条用例记着它是宽度不够。
-- **方向变化处的 caret 取层级更低的那一侧**（UAX #9 §3.4）。第一版写的是
-  「一律取逻辑上在前那个的后沿」，那会让边界两侧的两个几何位置落在同一处，
-  RTL 段落右端那个位置既画不出也点不到。`caret` 与 `hit` 共用同一个
-  `caret_x`——两处各写一遍规则，在方向变化处就会对不上：点一下，光标跳到
-  别处。这条一致性本身是一条用例，而且它就是抓到上面那个问题的那条。
+- **CJK 禁则不需要 tailoring。** UAX #14 的默认对表已经覆盖。
+- **方向变化处的 caret 取层级更低的那一侧**（UAX #9 §3.4）。`caret` 与 `hit`
+  共用同一个 `caret_x`——两处各写一遍规则，在方向变化处就会对不上。
+- **同一条毛病在 `BlockView` 上又犯了一次。** v1 的 `hit_test` 自己算 x
+  （点在 gutter 里报 0、点在行末报行宽），与它自己的 `caret_for_source`
+  对不上。现在 `hit_test` 只决定落在哪个视觉偏移上，几何位置回头问
+  `caret_for_visual`。软换行两侧的 upstream / downstream 也随之按不变量 H5 报。
 - **`tools/check-geometry.py` 拦了一次。** `LineBox` 因为多了 `height` 变成
-  「自己摊开 width/height 的散装四元组」。改成持有一个 `LayoutRect`，不是
-  登记例外——行盒本来就是 block 空间里的一个矩形。E6 守得对。
-- **22 个变异里 4 个第一次没被抓到**，都补了用例。最有代表性的一个：把
-  「行尾空白不参与排不排得下的判断」去掉，三条用例全绿——因为它们的那一段
-  都是行首第一段，行宽为 0 时怎么算都放得下，压根走不到那个分支。补了
-  `"aa bb cc" @5` 才压住。
+  散装四元组，改成持有一个 `LayoutRect`。
+- **变异验证 31 次，7 次第一次没被抓到。** 最有代表性的三个：把「行尾空白
+  不参与排不排得下的判断」去掉，三条用例全绿（它们那一段都是行首第一段，
+  行宽为 0 时怎么算都放得下）；引用竖条宽度的公式在 `line_height=1` 时怎么
+  写都得 1；「标题一律排粗体」用 `MonospaceMetrics` 断言等于没断言。
+- **真实窗口抓到一件 headless 看不见的事。** 前后两张 2000×2600 截图只有两处
+  不同，其中一处是任务复选框跑到了文字**底下**——不 panic、不报错，只是画面
+  变了。`macos-task-checkbox` 那条 self-check 断言的是命中判定，与画家顺序
+  无关。修完之后剩下的差异只有约 150 个像素，全落在最长那一行末尾一个字形的
+  抗锯齿边缘：`Σadvance + gutter` 与 `gutter + Σadvance` 差最后一位。
 
-#### 已登记的两个未做项
+#### 几何差分随 `LayoutSnapshot` 一起删除
+
+它守住了整轮迁移，但 oracle 没了就是没了。顶替它的是
+`crates/yu-editor/tests/block_view_properties.rs`：簇铺满视觉文本、行铺满块
+源码、caret 与 hit-test 说同一件事、块高盖得住每一行与每张图、表格的每个簇
+都属于某个格。**压不住的是「画出来好不好看」**——那件事从来只能靠真实窗口
+（`docs/specs/manual-acceptance-macos.md`）。差分历史留在 git 里。
+
+#### 已登记的四个未做项
 
 - **RTL 段落不右对齐。** 重排给出的是行内相对顺序；把整行推到 `max_width`
   那一侧是**对齐**，属于 `LineStyle`。
 - **方向变化处只给一个 caret 位置。** 要两个得给 `caret` 再带一个方向参数。
+- **表格与图片还不是 widget。** 第 3 节的对照表说它们是。真做成 widget 要求
+  被替代的那段 source 从视觉文本里**消失**（`Decoration::Replace`），而 v1 的
+  `Projection` 表达不了「隐藏但仍可被光标穿越」——它的隐藏 run 是给语法标记
+  用的。给一个 S6 就要删的类型加这个能力不划算。两者的几何算法原样搬进了
+  `yu-editor`（`table.rs` / `image.rs`），S6 随 `DecorationSet` 一起 widget 化，
+  届时列宽算法成为 widget measurer 的内部实现。
+- **`BlockView::hit_test` 没有 bidi。** 它照搬 v1 的按 x 扫描；bidi 正确的那条
+  在 `BlockLayout::hit` 里，但它只认视觉坐标。两者合流要等源码映射换成
+  `DecorationSet`。RTL 文档在 v1 里同样是这个行为，不是新引入的。
 
-#### 剩下的部分
+#### `EditorState` 没有抽
 
-`yu-layout` 的 60 处产品侧命中全部集中在 `LayoutSnapshot`：标题字号、引用
-gutter 与竖条、列表标记、表格（`table.rs` 919 行）、图片几何。清掉它们等于
-删掉 `LayoutSnapshot`。
-
-**这不需要把 S6 的装饰产出器提前做。** `yu-editor` 允许认识 Markdown——E1 的
-禁止清单里没有它，`tools/check-deps.py` 也已登记 `yu-editor → yu-markdown`。
-所以路径是把 Markdown 解释**从 `yu-layout` 往上搬到 `yu-editor`**：仍然从
-v1 的 `Projection` 派生布局输入，只是派生的地方换了一层。用 `DecorationSet`
-取代 `Projection` 是 S6 的事。
-
-**验收那条 grep 抓不到表格。** `table` 不在 E1 的关键词里，但
-`TableLayoutSnapshot` 与 `yu-scene::TablePrimitive` 是同一种泄漏（第 3 节的
-对照表写着「表格 → 一个 block widget」）。按第 3 节做，不按 grep 做——否则
-grep 会绿而泄漏还在。`yu-scene` / `yu-render` 现在剩的命中也全在表格用例里
-（还在 `yu_markdown::parse`），随表格 widget 化一起清。
+S4 的判断是「`EditorDocument` 的十个字段里三个（projections / layouts /
+viewport）是缓存与视图，挪走之后剩下的正好就是 `EditorState`，那时抽取几乎
+免费」。这一轮换掉了 `layouts` 装的东西（`LayoutSnapshot` → `BlockView`），
+没有把这三个字段挪走——挪走它们是「编辑状态与视图分家」，与布局重写不是
+同一件事。前提没满足就不抽，理由与 S4 相同。
 
 
 ### S6 · 语义 extension 化
@@ -840,6 +853,12 @@ grep 会绿而泄漏还在。`yu-scene` / `yu-render` 现在剩的命中也全�
 `yu-markdown` 内的 extension（parser + decoration 产出器）。
 
 - 验收：新增一种语法（如 `==高亮==`）的 diff 只落在 `yu-markdown` 内，且 < 200 行。
+
+S5 结束时留给它的入口是清楚的：`yu-editor::BlockLayoutInput` 现在从 v1 的
+`Projection` 派生布局输入，S6 把这个来源换成 `DecorationSet`。换掉之后
+`yu-projection` 就没有使用者了——目前只剩 `yu-editor` 与两条差分用的临时
+dev-dep 在用它。表格与图片的 widget 化、`BlockView::hit_test` 的 bidi 也在
+同一次换源里落地，理由见 S5 的「已登记的四个未做项」。
 
 ### S7 · 产品面
 
