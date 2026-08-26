@@ -28,7 +28,7 @@
 //! 刀不成立，因为它本来就该变。
 
 use yu_core::{ClusterMetrics, TextAttrs, TextStyle};
-use yu_editor::{BlockLayoutInput, BlockOrnaments};
+use yu_editor::{BlockLayoutInput, BlockOrnaments, VisualText};
 use yu_layout::{LayoutConfig, LineStyleTable, StyleTable};
 use yu_markdown::{ExtensionSet, parse};
 use yu_projection::BlockProjection;
@@ -126,7 +126,9 @@ fn derive_both(source: &str, index: usize) -> Option<(Derived, Derived)> {
     let decorations = ExtensionSet::markdown()
         .decorate(&snapshot, &tree, block, None)
         .expect("装饰产出不该失败");
-    let ours = BlockLayoutInput::from_decorations(&decorations, &snapshot, config, &StyleSensitive)
+    let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
+    let ours = BlockLayoutInput::from_decorations(&decorations, &visual, config, &StyleSensitive)
         .expect("从装饰派生");
 
     let projection =
@@ -337,9 +339,10 @@ fn a_heading_scales_every_style_in_the_table() {
     let decorations = ExtensionSet::markdown()
         .decorate(&snapshot, &tree, block, None)
         .expect("装饰产出");
-    let input =
-        BlockLayoutInput::from_decorations(&decorations, &snapshot, config, &StyleSensitive)
-            .expect("派生");
+    let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
+    let input = BlockLayoutInput::from_decorations(&decorations, &visual, config, &StyleSensitive)
+        .expect("派生");
 
     let layout = input.layout_input();
     assert!(!layout.runs().is_empty(), "标题里有三段不同字型的文字");
@@ -424,9 +427,11 @@ fn the_visual_text_is_the_source_minus_the_hidden_bytes() {
     }
     expected.push_str(&source[cursor..]);
 
+    let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
     let input = BlockLayoutInput::from_decorations(
         &decorations,
-        &snapshot,
+        &visual,
         LayoutConfig::new(400.0, 10.0),
         &StyleSensitive,
     )
@@ -447,9 +452,11 @@ fn an_empty_block_derives_an_empty_input() {
     let decorations = ExtensionSet::markdown()
         .decorate(&snapshot, &tree, block, None)
         .expect("装饰产出");
+    let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
     let input = BlockLayoutInput::from_decorations(
         &decorations,
-        &snapshot,
+        &visual,
         LayoutConfig::new(400.0, 10.0),
         &StyleSensitive,
     )
@@ -469,9 +476,11 @@ fn an_unknown_style_id_is_absent_not_defaulted() {
     let decorations = ExtensionSet::markdown()
         .decorate(&snapshot, &tree, block, None)
         .expect("装饰产出");
+    let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
     let input = BlockLayoutInput::from_decorations(
         &decorations,
-        &snapshot,
+        &visual,
         LayoutConfig::new(400.0, 10.0),
         &StyleSensitive,
     )
@@ -517,9 +526,11 @@ fn overlapping_hidden_ranges_are_not_counted_twice() {
         "这份语料的前提是隐藏区间真的重叠，实际是 {hidden:?}"
     );
 
+    let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
     let input = BlockLayoutInput::from_decorations(
         &decorations,
-        &snapshot,
+        &visual,
         LayoutConfig::new(400.0, 10.0),
         &StyleSensitive,
     )

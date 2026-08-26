@@ -15,11 +15,16 @@
 //! 差分历史留在 git 里：`git log --oneline -- crates/yu-editor/tests/geometry_differential.rs`。
 
 use yu_core::{ByteOffset, TextRange, VisualOffset};
-use yu_editor::{BlockLayoutInput, BlockView, LayoutConfig, LayoutPoint, MonospaceMetrics};
-use yu_projection::{BlockProjection, ProjectionBias};
-use yu_text::TextBuffer;
+use yu_decoration::Bias;
+use yu_editor::{
+    BlockDecorations, BlockLayoutInput, BlockView, LayoutConfig, LayoutPoint, MonospaceMetrics,
+    VisualText,
+};
+use yu_markdown::ExtensionSet;
+use yu_syntax::parse as parse_syntax;
+use yu_text::{TextBuffer, TextSnapshot};
 
-/// 覆盖每一种块投影：行内、标题、引用、列表、任务、表格、代码围栏、
+/// 覆盖每一种块：段落、标题、引用、列表、任务、表格、代码围栏、
 /// 引用定义、图片。
 const CORPUS: &[&str] = &[
     "",
@@ -46,21 +51,28 @@ const CORPUS: &[&str] = &[
 
 const WIDTHS: &[f32] = &[12.0, 40.0, 160.0];
 
+/// 第 `index` 个块的装饰与它的视觉文本。
+fn decorate(snapshot: &TextSnapshot, index: usize) -> Option<(BlockDecorations, VisualText)> {
+    let markdown = yu_markdown::parse(snapshot);
+    let block = markdown.blocks().get(index)?;
+    let tree = parse_syntax(snapshot).expect("测试文档很短").into_tree();
+    let decorations = ExtensionSet::markdown()
+        .decorate(snapshot, &tree, block, None)
+        .expect("装饰产出");
+    let visual = VisualText::new(snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
+    Some((decorations, visual))
+}
+
 fn view(source: &str, width: f32) -> Option<BlockView> {
     let buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
-    let markdown = yu_markdown::parse(&snapshot);
-    let block = markdown.blocks().get(0)?;
-    let projection = BlockProjection::from_block_with_definitions(
-        &snapshot,
-        block,
-        markdown.reference_definitions(),
-    )
-    .expect("块投影");
+    let (decorations, visual) = decorate(&snapshot, 0)?;
     let config = LayoutConfig::new(width, 10.0).with_default_advance(2.0);
     Some(
         BlockView::build(
-            &projection,
+            &visual,
+            &decorations,
             config,
             &MonospaceMetrics::new(config.default_advance()),
         )
@@ -68,31 +80,24 @@ fn view(source: &str, width: f32) -> Option<BlockView> {
     )
 }
 
-/// 派生出来的视觉文本必须与投影说的一样长，样式区间必须无缝铺满它。
+/// 派生出来的视觉文本必须与装饰投影说的一样长，样式区间必须无缝铺满它。
 ///
 /// 漏掉半段会画出少了几个字的一行，既不 panic 也不报错。
 #[test]
-fn the_derived_input_tiles_the_projection() {
+fn the_derived_input_tiles_the_visual_text() {
     let config = LayoutConfig::new(160.0, 10.0).with_default_advance(2.0);
     let metrics = MonospaceMetrics::new(config.default_advance());
     for source in CORPUS {
         let buffer = TextBuffer::new((*source).to_owned());
         let snapshot = buffer.snapshot();
-        let markdown = yu_markdown::parse(&snapshot);
-        let Some(block) = markdown.blocks().get(0) else {
+        let Some((decorations, visual)) = decorate(&snapshot, 0) else {
             continue;
         };
-        let projection = BlockProjection::from_block_with_definitions(
-            &snapshot,
-            block,
-            markdown.reference_definitions(),
-        )
-        .expect("块投影");
-        let input =
-            BlockLayoutInput::derive(projection.visual(), config, &metrics).expect("派生输入");
+        let input = BlockLayoutInput::from_decorations(&decorations, &visual, config, &metrics)
+            .expect("派生输入");
         assert_eq!(
             VisualOffset::try_from(input.text().len()).expect("短"),
-            projection.visual().visual_len(),
+            visual.visual_len(),
             "语料 {source:?} 的视觉长度"
         );
         let mut cursor = VisualOffset::ZERO;
@@ -104,7 +109,7 @@ fn the_derived_input_tiles_the_projection() {
             );
             cursor = run.visual().end();
         }
-        assert_eq!(cursor, projection.visual().visual_len());
+        assert_eq!(cursor, visual.visual_len());
     }
 }
 
@@ -228,7 +233,7 @@ fn every_source_boundary_has_a_caret_inside_the_block() {
             offsets.sort_by_key(|offset| offset.get());
             offsets.dedup();
             for offset in offsets {
-                for bias in [ProjectionBias::Before, ProjectionBias::After] {
+                for bias in [Bias::Before, Bias::After] {
                     let caret = view
                         .caret_for_source(offset, bias)
                         .unwrap_or_else(|error| panic!("{at} 源码 {}: {error}", offset.get()));
@@ -313,17 +318,11 @@ fn a_prefix_edit_shifts_the_source_ranges_and_keeps_the_geometry() {
     let source = "first\n\nsecond paragraph\n";
     let mut buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
-    let markdown = yu_markdown::parse(&snapshot);
-    let block = markdown.blocks().get(2).expect("第三个块");
-    let projection = BlockProjection::from_block_with_definitions(
-        &snapshot,
-        block,
-        markdown.reference_definitions(),
-    )
-    .expect("块投影");
+    let (decorations, visual) = decorate(&snapshot, 2).expect("第三个块");
     let config = LayoutConfig::new(160.0, 10.0).with_default_advance(2.0);
     let view = BlockView::build(
-        &projection,
+        &visual,
+        &decorations,
         config,
         &MonospaceMetrics::new(config.default_advance()),
     )

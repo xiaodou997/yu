@@ -2,8 +2,8 @@ use yu_core::{Revision, ShapingProvider, TextRange};
 use yu_layout::{LayoutConfig, LayoutError};
 
 use crate::blockview::BlockView;
-use yu_markdown::{Block, BlockKind, MarkdownDocument};
-use yu_projection::BlockProjection;
+use crate::visual::VisualText;
+use yu_markdown::{Block, BlockDecorations, BlockKind, MarkdownDocument};
 use yu_text::{ChangeSet, TextSnapshot};
 
 /// Cumulative counters for one editor's revision-bound layout cache.
@@ -97,13 +97,14 @@ struct LayoutEntry {
 }
 
 impl LayoutCache {
-    /// Returns a cached block layout or builds one from the supplied projection.
+    /// 缓存里有就取，没有就按这份装饰排一份。
     pub fn get_or_build_block(
         &mut self,
         snapshot: &TextSnapshot,
         block: Block,
         config: LayoutConfig,
-        projection: &BlockProjection,
+        visual: &VisualText,
+        decorations: &BlockDecorations,
     ) -> Result<&BlockView, LayoutError> {
         let key = LayoutKey::new(block, config, LayoutBackend::Metrics);
         self.prepare(snapshot);
@@ -113,20 +114,22 @@ impl LayoutCache {
         }
 
         let layout = BlockView::build(
-            projection,
+            visual,
+            decorations,
             config,
             &yu_layout::MonospaceMetrics::new(config.default_advance()),
         )?;
         Ok(self.insert(key, layout))
     }
 
-    /// Returns a cached block layout built from shaped glyph runs.
+    /// 同上，但用调用方给的 shaping 后端。
     pub fn get_or_build_block_with_shaper<S: ShapingProvider>(
         &mut self,
         snapshot: &TextSnapshot,
         block: Block,
         config: LayoutConfig,
-        projection: &BlockProjection,
+        visual: &VisualText,
+        decorations: &BlockDecorations,
         shaper: &S,
     ) -> Result<&BlockView, LayoutError> {
         let key = LayoutKey::new(block, config, LayoutBackend::Shaped);
@@ -136,7 +139,7 @@ impl LayoutCache {
             return Ok(&self.entries[index].layout);
         }
 
-        let layout = BlockView::build_shaped(projection, config, shaper)?;
+        let layout = BlockView::build_shaped(visual, decorations, config, shaper)?;
         Ok(self.insert(key, layout))
     }
 

@@ -17,8 +17,8 @@ use yu_assets::{
 };
 use yu_core::{Revision, TextRange};
 use yu_editor::{
-    BlockKind, BlockView, CaretAffinity, EditorDocument, EditorDocumentError, ImageSource,
-    LayoutError, ProjectionBias, ShapingProvider, TableLayout, TableResizeCommit,
+    Bias, BlockAnnotation, BlockKind, BlockView, CaretAffinity, EditorDocument,
+    EditorDocumentError, ImageSpan, LayoutError, ShapingProvider, TableLayout, TableResizeCommit,
     TableResizeTarget, TaskState, ViewportSpan, task_marker,
 };
 use yu_font::GlyphAtlas;
@@ -239,7 +239,7 @@ fn append_task_checkbox(
     state: TaskState,
 ) -> Result<(), ViewportSceneError> {
     let caret = layout
-        .caret_for_source(marker.range().start(), ProjectionBias::After)
+        .caret_for_source(marker.range().start(), Bias::After)
         .map_err(EditorDocumentError::from)?;
     let line_height = layout
         .lines()
@@ -379,17 +379,14 @@ fn append_editor_decorations(
     let mut caret = None;
     for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
         let (visual_start, visual_end, layer_source) = if let Some(overlay) = composition {
-            let Some(visual) = layout.projection().composition_selection_visual() else {
+            let Some(visual) = layout.visual().composition_selection_visual() else {
                 if focus_block == Some(geometry.index()) {
                     let visual = layout
-                        .projection()
-                        .source_to_visual(
-                            overlay.replacement_range().start(),
-                            ProjectionBias::Before,
-                        )
+                        .visual()
+                        .source_to_visual(overlay.replacement_range().start(), Bias::Before)
                         .map_err(EditorDocumentError::from)?;
                     let layout_caret = layout
-                        .caret_for_visual(visual, ProjectionBias::After)
+                        .caret_for_visual(visual, Bias::After)
                         .map_err(EditorDocumentError::from)?;
                     caret = Some((
                         TextRange::empty(overlay.replacement_range().start()),
@@ -403,7 +400,7 @@ fn append_editor_decorations(
             };
             if focus_block == Some(geometry.index()) {
                 let layout_caret = layout
-                    .caret_for_visual(visual.end(), ProjectionBias::After)
+                    .caret_for_visual(visual.end(), Bias::After)
                     .map_err(EditorDocumentError::from)?;
                 caret = Some((
                     TextRange::empty(overlay.replacement_range().start()),
@@ -417,8 +414,8 @@ fn append_editor_decorations(
         } else {
             if focus_block == Some(geometry.index()) {
                 let bias = match selection.affinity() {
-                    CaretAffinity::Upstream => ProjectionBias::Before,
-                    CaretAffinity::Downstream => ProjectionBias::After,
+                    CaretAffinity::Upstream => Bias::Before,
+                    CaretAffinity::Downstream => Bias::After,
                 };
                 let layout_caret = layout
                     .caret_for_source(selection.focus(), bias)
@@ -442,12 +439,12 @@ fn append_editor_decorations(
             let source = TextRange::new(start, end).expect("ordered selection intersection");
             (
                 layout
-                    .projection()
-                    .source_to_visual(start, ProjectionBias::Before)
+                    .visual()
+                    .source_to_visual(start, Bias::Before)
                     .map_err(EditorDocumentError::from)?,
                 layout
-                    .projection()
-                    .source_to_visual(end, ProjectionBias::After)
+                    .visual()
+                    .source_to_visual(end, Bias::After)
                     .map_err(EditorDocumentError::from)?,
                 source,
             )
@@ -1337,7 +1334,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         }
     }
     let selection = Some(document.selection().ordered_range());
-    let image_key = |image: ImageSource| {
+    let image_key = |image: ImageSpan| {
         let destination = image.destination().or_else(|| {
             image
                 .reference()
@@ -1349,7 +1346,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         let destination = source.as_str().get(start..end)?;
         ImageKey::new(destination.to_owned()).ok()
     };
-    let intrinsic_size = |image: ImageSource| {
+    let intrinsic_size = |image: ImageSpan| {
         let key = image_key(image)?;
         if let Some(publication) = image_publications.iter().find(|publication| {
             publication.revision() == document_revision
@@ -1412,10 +1409,11 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         let mut layout =
             document.block_layout_for_visual_state_with_shaper(block.index(), config, shaper)?;
         let measurements = layout
-            .projection()
-            .images()
+            .decorations()
+            .annotations()
             .iter()
             .copied()
+            .map(|BlockAnnotation::Image(image)| image)
             .filter_map(|image| {
                 image_key(image)?;
                 let size = intrinsic_size(image)?;
@@ -1490,10 +1488,11 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         let mut block_images = Vec::new();
         for placement in layout.images() {
             let Some(image) = layout
-                .projection()
-                .images()
+                .decorations()
+                .annotations()
                 .iter()
                 .copied()
+                .map(|BlockAnnotation::Image(image)| image)
                 .find(|image| image.source() == placement.source())
             else {
                 continue;
@@ -1541,7 +1540,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
         let Some(publication) = embedded_publications.iter().find(|publication| {
             publication.revision() == revision
-                && publication.source_range() == layout.projection().source_range()
+                && publication.source_range() == layout.visual().source_range()
         }) else {
             continue;
         };
@@ -2479,11 +2478,10 @@ mod tests {
             ))
             .expect("viewport config");
         let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
-        let projection = document.block_projection(0).expect("math projection");
-        let yu_editor::BlockProjection::FencedCode(code) = projection else {
-            panic!("expected fenced math block");
-        };
-        let source_range = code.source_range();
+        let source_range = document
+            .block_decorations(0)
+            .expect("math decorations")
+            .range();
         let request = EmbeddedRenderRequest::new(
             document.revision(),
             source_range,
@@ -2548,11 +2546,14 @@ mod tests {
             .expect("viewport config");
         let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
         let source = document
-            .block_projection(0)
-            .expect("image projection")
-            .visual()
-            .images()[0]
-            .source();
+            .block_decorations(0)
+            .expect("image decorations")
+            .annotations()
+            .iter()
+            .copied()
+            .map(|BlockAnnotation::Image(image)| image.source())
+            .next()
+            .expect("这个块上有一张图");
         let mut cache = yu_assets::ImageCache::new();
         let publication = cache
             .publish_decoded(

@@ -15,16 +15,20 @@
 use std::{error::Error, fmt};
 
 use unicode_segmentation::UnicodeSegmentation;
-use yu_core::{ByteOffset, ClusterMetrics, Revision, ShapingProvider, TextRange, TextStyle};
-use yu_markdown::{TableAlignment, TableCellRange};
-use yu_projection::{
-    Projection, ProjectionBias, TableProjection, VisualOffset, VisualRange, VisualRunKind,
+use yu_core::{
+    ByteOffset, ClusterMetrics, Revision, ShapingProvider, TextRange, TextStyle, VisualOffset,
+    VisualRange,
 };
-use yu_text::{ChangeSet, TextSnapshot};
+use yu_decoration::Bias;
+use yu_markdown::{TableAlignment, TableBlock, TableCellRange};
 
 use yu_layout::{LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
 
-use crate::geometry::{map_source_range, source_range_contains, upstream};
+use crate::blockinput::BlockLayoutInput;
+use crate::blockview::shift_range;
+use crate::geometry::{source_range_contains, upstream};
+use crate::visual::VisualText;
+use yu_layout::StyleTable;
 
 /// Geometry for one visible GFM table cell. The row index is visual-table
 /// based: `0` is the header and body rows start at `1`; the Markdown
@@ -383,31 +387,20 @@ pub struct TableLayout {
 }
 
 impl TableLayout {
-    pub fn from_projection<M: ClusterMetrics>(
-        projection: &TableProjection,
-        config: LayoutConfig,
-        metrics: &M,
-    ) -> Result<Self, LayoutError> {
-        Self::from_projection_with_measure(projection, config, |text, _source, style| {
-            measure_text(text, metrics, style)
-        })
-    }
-
-    pub fn from_projection_with_shaper<S: ShapingProvider>(
-        projection: &TableProjection,
-        config: LayoutConfig,
-        shaper: &S,
-    ) -> Result<Self, LayoutError> {
-        Self::from_projection_with_measure(projection, config, |text, source, style| {
-            shaper
-                .shape(text, source, style)
-                .map(|shaped| shaped.advance())
-                .map_err(|error| LayoutError::Shaping(error.to_string()))
-        })
-    }
-
-    fn from_projection_with_measure<F>(
-        projection: &TableProjection,
+    /// 按一张已经认出来的网格排几何。
+    ///
+    /// 网格从 `BlockOrnament::Table` 来（`yu-markdown` 的 table extension
+    /// 产的），单元格内容的宽度从**已经排好的文字流**来：`input` 里的样式段
+    /// 按单元格的视觉区间切一刀就是这一格的内容。自己再读一遍源码、再判一遍
+    /// 字型，就是把装配那一层重写一遍。
+    ///
+    /// # Errors
+    ///
+    /// 网格的行列对不上、度量非有限值、视觉偏移越界。
+    pub fn from_table<F>(
+        table: &TableBlock,
+        visual: &VisualText,
+        input: &BlockLayoutInput,
         config: LayoutConfig,
         mut measure: F,
     ) -> Result<Self, LayoutError>
@@ -415,7 +408,6 @@ impl TableLayout {
         F: FnMut(&str, TextRange, TextStyle) -> Result<f32, LayoutError>,
     {
         config.validate()?;
-        let table = projection.table();
         let column_count = table.column_count();
         if column_count == 0 || table.delimiter().len() != column_count {
             return Err(LayoutError::Upstream(
@@ -439,15 +431,15 @@ impl TableLayout {
             let mut measured_row = Vec::with_capacity(column_count);
             for (column, cell) in row.iter().copied().enumerate() {
                 let source_range = table_cell_range(cell)?;
-                let (visual, content_width) =
-                    measure_cell_content(projection, source_range, &mut measure)?;
+                let (cell_visual, content_width) =
+                    measure_cell_content(visual, input, source_range, &mut measure)?;
                 if !content_width.is_finite() || content_width < 0.0 {
                     return Err(LayoutError::InvalidMetrics(content_width.to_bits()));
                 }
                 natural_widths[column] = natural_widths[column]
                     .max(content_width + padding * 2.0)
                     .max(padding * 2.0);
-                measured_row.push((source_range, visual, content_width));
+                measured_row.push((source_range, cell_visual, content_width));
             }
             measured_rows.push(measured_row);
         }
@@ -508,8 +500,8 @@ impl TableLayout {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            revision: projection.revision(),
-            source_range: projection.source_range(),
+            revision: visual.revision(),
+            source_range: visual.source_range(),
             delimiter_source: table
                 .delimiter_source_range()
                 .map(table_cell_range)
@@ -698,25 +690,25 @@ impl TableLayout {
         })
     }
 
-    /// Resolves a visual boundary that lands on a structural table run to a
-    /// visible cell source boundary. Interior cell positions return `None` so
-    /// the normal projection mapping can preserve per-grapheme precision;
-    /// structural pipe/row-ending positions must not return hidden bytes.
+    /// 落在结构性隐藏区间上的视觉边界解析到哪个单元格。
+    ///
+    /// 单元格**内部**的位置返回 `None`，交给规范映射——那条能保持逐字素的
+    /// 精度。竖线、行尾这些结构位置不能返回被隐藏的字节：光标会停在一个
+    /// 看不见的 `|` 上。
     #[must_use]
     pub fn source_for_visual_hit(
         &self,
-        projection: &Projection,
+        text: &VisualText,
         visual: VisualOffset,
-        _bias: ProjectionBias,
     ) -> Option<ByteOffset> {
-        let structural_hidden = projection.runs().iter().any(|run| {
-            run.kind() == VisualRunKind::HiddenSyntax
-                && run.visual().is_empty()
-                && run.visual().start() == visual
+        let structural_hidden = text.decorations().all().iter().any(|entry| {
+            entry.decoration.hides_source()
+                && !entry.range.is_empty()
+                && text.canonical_source_to_visual(entry.range.start()) == visual
                 && !self
                     .cells
                     .iter()
-                    .any(|cell| source_range_contains(cell.source(), run.source()))
+                    .any(|cell| source_range_contains(cell.source(), entry.range))
         });
         if !structural_hidden {
             return None;
@@ -829,49 +821,36 @@ impl TableLayout {
         Ok(None)
     }
 
-    pub fn map_through(
-        &self,
-        changes: &ChangeSet,
-        snapshot: &TextSnapshot,
-    ) -> Result<Self, LayoutError> {
-        let source_range = map_source_range(self.source_range, changes)?;
-        let delimiter_source = self
-            .delimiter_source
-            .map(|range| map_source_range(range, changes))
-            .transpose()?;
-        let cells = self
-            .cells
-            .iter()
-            .map(|cell| {
-                Ok(TableCellLayout {
-                    row: cell.row,
-                    column: cell.column,
-                    source: map_source_range(cell.source, changes)?,
-                    visual: cell.visual,
-                    bounds: cell.bounds,
-                    alignment: cell.alignment,
-                    content_x: cell.content_x,
-                    content_width: cell.content_width,
-                })
-            })
-            .collect::<Result<Vec<_>, LayoutError>>()?;
-        snapshot
-            .utf16_offset(source_range.start())
-            .map_err(upstream)?;
+    /// 整张表的几何平移 `delta` 个字节。
+    ///
+    /// 只有源码区间会动：编辑落在块外，网格与列宽一个像素都不变。
+    pub(crate) fn shifted(&self, delta: i64) -> Result<Self, LayoutError> {
         Ok(Self {
-            revision: snapshot.revision(),
-            source_range,
-            delimiter_source,
+            revision: self.revision,
+            source_range: shift_range(self.source_range, delta)?,
+            delimiter_source: self
+                .delimiter_source
+                .map(|range| shift_range(range, delta))
+                .transpose()?,
             column_widths: self.column_widths.clone(),
             padding: self.padding,
             row_height: self.row_height,
             bounds: self.bounds,
-            cells,
+            cells: self
+                .cells
+                .iter()
+                .map(|cell| {
+                    Ok(TableCellLayout {
+                        source: shift_range(cell.source, delta)?,
+                        ..*cell
+                    })
+                })
+                .collect::<Result<Vec<_>, LayoutError>>()?,
             row_sources: self
                 .row_sources
                 .iter()
                 .copied()
-                .map(|range| map_source_range(range, changes))
+                .map(|range| shift_range(range, delta))
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
@@ -883,47 +862,78 @@ fn table_cell_range(range: TableCellRange) -> Result<TextRange, LayoutError> {
     TextRange::new(start, end).ok_or(LayoutError::OffsetOverflow)
 }
 
+/// 一个单元格的视觉区间与它内容的宽度。
+///
+/// 内容从**已经排好的样式段**里切：单元格的两端各问一次映射，落在这一段
+/// 里的样式段按视觉偏移裁一刀，就是这一格实际画出来的文字与它的字型。
 fn measure_cell_content<F>(
-    projection: &TableProjection,
+    text: &VisualText,
+    input: &BlockLayoutInput,
     source: TextRange,
     measure: &mut F,
 ) -> Result<(VisualRange, f32), LayoutError>
 where
     F: FnMut(&str, TextRange, TextStyle) -> Result<f32, LayoutError>,
 {
-    let visual_start = projection
-        .visual()
-        .source_to_visual(source.start(), ProjectionBias::After)
+    let visual_start = text
+        .source_to_visual(source.start(), Bias::After)
         .map_err(upstream)?;
-    let visual_end = projection
-        .visual()
-        .source_to_visual(source.end(), ProjectionBias::Before)
+    let visual_end = text
+        .source_to_visual(source.end(), Bias::Before)
         .map_err(upstream)?;
-    let visual = VisualRange::new(visual_start, visual_end).ok_or(LayoutError::OffsetOverflow)?;
+    let visual = VisualRange::new(visual_start, visual_end.max(visual_start))
+        .ok_or(LayoutError::OffsetOverflow)?;
     let mut width = 0.0_f32;
-    for run in projection.visual().runs().iter().copied() {
-        if matches!(
-            run.kind(),
-            VisualRunKind::HiddenSyntax | VisualRunKind::LineBreak { .. }
-        ) {
+    for run in input.layout_input().runs() {
+        let from = run.visual().start().max(visual.start());
+        let to = run.visual().end().min(visual.end());
+        if from >= to {
             continue;
         }
-        if !source_range_contains(source, run.source()) {
-            continue;
-        }
-        let overlaps = if visual.is_empty() {
-            run.visual().is_empty() && run.visual().start() == visual.start()
-        } else {
-            run.visual().start() < visual.end() && visual.start() < run.visual().end()
-        };
-        if !overlaps {
-            continue;
-        }
-        let text = projection.visual().text_for_run(run).map_err(upstream)?;
-        let shape_source = projection.visual().shape_source_range_for_run(run);
-        width += measure(&text, shape_source, run.style())?;
+        let (start, end) = (
+            usize::try_from(from.get()).map_err(|_| LayoutError::OffsetOverflow)?,
+            usize::try_from(to.get()).map_err(|_| LayoutError::OffsetOverflow)?,
+        );
+        let slice = input
+            .text()
+            .get(start..end)
+            .ok_or(LayoutError::OffsetOverflow)?;
+        let style = input
+            .styles()
+            .attrs(run.style())
+            .ok_or(LayoutError::UnknownStyle(run.style()))?
+            .style();
+        let shape_source = TextRange::new(
+            text.visual_to_source(from, Bias::After).map_err(upstream)?,
+            text.visual_to_source(to, Bias::Before).map_err(upstream)?,
+        )
+        .ok_or(LayoutError::OffsetOverflow)?;
+        width += measure(slice, shape_source, style)?;
     }
     Ok((visual, width))
+}
+
+/// 按度量量一段文字。`from_table` 的度量后端之一。
+pub(crate) fn measure_with<M: ClusterMetrics>(
+    text: &str,
+    _source: TextRange,
+    style: TextStyle,
+    metrics: &M,
+) -> Result<f32, LayoutError> {
+    measure_text(text, metrics, style)
+}
+
+/// 按 shaping 后端量一段文字。`from_table` 的另一个度量后端。
+pub(crate) fn shape_with<S: ShapingProvider>(
+    text: &str,
+    source: TextRange,
+    style: TextStyle,
+    shaper: &S,
+) -> Result<f32, LayoutError> {
+    shaper
+        .shape(text, source, style)
+        .map(|shaped| shaped.advance())
+        .map_err(|error| LayoutError::Shaping(error.to_string()))
 }
 
 fn measure_text<M: ClusterMetrics>(

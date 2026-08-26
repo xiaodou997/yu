@@ -21,11 +21,10 @@ use yu_core::{LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
-    AccessibilityTextSnapshot, BlockProjection, BlockView, CaretAffinity, CaretScrollRequest,
-    CommandResult, EditorCommand, EditorDocumentError, ImageSource, LayoutConfig, LayoutPoint,
-    Projection, ProjectionBias, SelectionError, SourceSync, TableResizeCommit, TableResizeGesture,
-    TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig, ViewportSpan,
-    VisualOffset, VisualRunKind,
+    AccessibilityTextSnapshot, Bias, BlockOrnament, BlockView, CaretAffinity, CaretScrollRequest,
+    CommandResult, EditorCommand, EditorDocumentError, ImageSpan, LayoutConfig, LayoutPoint,
+    SelectionError, SourceSync, TableResizeCommit, TableResizeGesture, TableResizeGestureError,
+    TableResizeHit, TableResizeTarget, ViewportConfig, ViewportSpan, VisualOffset, VisualText,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
@@ -1518,18 +1517,12 @@ fn write_snapshot_range(
     }
 }
 
-fn projected_utf8(projection: &Projection) -> Result<String, i32> {
-    let mut bytes = Vec::new();
-    for run in projection.runs() {
-        if matches!(run.kind(), VisualRunKind::HiddenSyntax) {
-            continue;
-        }
-        let text = projection
-            .text_for_run(*run)
-            .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-        bytes.extend_from_slice(text.as_bytes());
-    }
-    String::from_utf8(bytes).map_err(|_| YU_STORAGE_EDITOR_ERROR)
+/// 投影之后的视觉文本。
+///
+/// 它现在直接由 [`VisualText`] 持有——装饰应用一遍就得到它，不必再走一遍
+/// run 列表。原来那段循环是 v1 的形状：`Projection` 只有 run，没有文本。
+fn projected_utf8(text: &VisualText) -> String {
+    text.text().to_owned()
 }
 
 fn visual_utf16_offset(projected: &str, visual: VisualOffset) -> Result<u64, i32> {
@@ -1540,10 +1533,10 @@ fn visual_utf16_offset(projected: &str, visual: VisualOffset) -> Result<u64, i32
     u64::try_from(prefix.encode_utf16().count()).map_err(|_| YU_STORAGE_INVALID_SELECTION)
 }
 
-fn projection_bias_from_affinity(affinity: CaretAffinity) -> ProjectionBias {
+fn projection_bias_from_affinity(affinity: CaretAffinity) -> Bias {
     match affinity {
-        CaretAffinity::Upstream => ProjectionBias::Before,
-        CaretAffinity::Downstream => ProjectionBias::After,
+        CaretAffinity::Upstream => Bias::Before,
+        CaretAffinity::Downstream => Bias::After,
     }
 }
 
@@ -1725,10 +1718,10 @@ fn block_caret_from_layout(
     let caret = layout
         .caret_for_source(source, bias)
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
-    let projected = projected_utf8(layout.projection())?;
+    let projected = projected_utf8(layout.visual());
     let visual_utf16 = visual_utf16_offset(&projected, caret.visual())?;
     let round_trip = layout
-        .projection()
+        .visual()
         .visual_to_source(caret.visual(), bias)
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
     let round_trip_source_utf16 = snapshot
@@ -1849,8 +1842,8 @@ fn caret_scroll_request_metadata(
     })
 }
 
-fn composition_projection(session: &mut DocumentEditorSession) -> Result<Projection, i32> {
-    session.composition_projection().map_err(storage_status)
+fn composition_projection(session: &mut DocumentEditorSession) -> Result<VisualText, i32> {
+    session.composition_visual_text().map_err(storage_status)
 }
 
 fn utf16_byte_offset(text: &str, target: u64) -> Result<usize, i32> {
@@ -1887,7 +1880,7 @@ fn utf16_offset_in_utf8(text: &str, byte_offset: u64) -> Result<u64, i32> {
 }
 
 fn composition_visual_selection_utf16(
-    projection: &Projection,
+    projection: &VisualText,
     projected: &str,
 ) -> Result<(u64, u64), i32> {
     let visual_selection = projection
@@ -1900,14 +1893,14 @@ fn composition_visual_selection_utf16(
 }
 
 fn composition_visual_replacement_utf16(
-    projection: &Projection,
+    projection: &VisualText,
     projected: &str,
 ) -> Result<(u64, u64), i32> {
     let replacement = projection
         .composition_range()
         .ok_or(YU_STORAGE_NO_OVERLAY)?;
     let visual_start = projection
-        .source_to_visual(replacement.start(), ProjectionBias::Before)
+        .source_to_visual(replacement.start(), Bias::Before)
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
     let text_len = u64::try_from(
         projection
@@ -1931,7 +1924,7 @@ fn composition_projection_metadata(
     let projection = composition_projection(session)?;
     let snapshot = session.snapshot();
     let overlay = session.composition().ok_or(YU_STORAGE_NO_OVERLAY)?;
-    let projected = projected_utf8(&projection)?;
+    let projected = projected_utf8(&projection);
     let replacement_start_utf16 = snapshot
         .utf16_offset(overlay.replacement_range().start())
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
@@ -1966,10 +1959,10 @@ fn composition_projection_metadata(
 }
 
 fn composition_active_visual_caret(
-    projection: &Projection,
+    projection: &VisualText,
     selection_start_utf16: u64,
     selection_end_utf16: u64,
-) -> Result<(VisualOffset, ProjectionBias), i32> {
+) -> Result<(VisualOffset, Bias), i32> {
     if selection_start_utf16 > selection_end_utf16 {
         return Err(YU_STORAGE_INVALID_SELECTION);
     }
@@ -1980,7 +1973,7 @@ fn composition_active_visual_caret(
         .composition_range()
         .ok_or(YU_STORAGE_NO_OVERLAY)?;
     let visual_base = projection
-        .source_to_visual(replacement.start(), ProjectionBias::Before)
+        .source_to_visual(replacement.start(), Bias::Before)
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
         .get();
     let active = if selection_start == selection_end {
@@ -1992,7 +1985,7 @@ fn composition_active_visual_caret(
             .checked_add(u64::try_from(selection_end).map_err(|_| YU_STORAGE_INVALID_SELECTION)?)
             .ok_or(YU_STORAGE_INVALID_SELECTION)?
     };
-    Ok((VisualOffset::new(active), ProjectionBias::After))
+    Ok((VisualOffset::new(active), Bias::After))
 }
 
 fn validate_revision(session: &DocumentEditorSession, expected: u64) -> Result<(), i32> {
@@ -2547,7 +2540,7 @@ pub unsafe extern "C" fn yu_storage_session_projection_caret(
         Ok(source) => source,
         Err(_) => return YU_STORAGE_INVALID_SELECTION,
     };
-    let projection = match session.session.inline_projection_for_visual_state() {
+    let projection = match session.session.visual_text_for_visual_state() {
         Ok(projection) => projection,
         Err(error) => return storage_status(error),
     };
@@ -2556,10 +2549,7 @@ pub unsafe extern "C" fn yu_storage_session_projection_caret(
         Ok(visual) => visual,
         Err(_) => return YU_STORAGE_INVALID_SELECTION,
     };
-    let projected = match projected_utf8(&projection) {
-        Ok(projected) => projected,
-        Err(status) => return status,
-    };
+    let projected = projected_utf8(&projection);
     let visual_utf16 = match visual_utf16_offset(&projected, visual) {
         Ok(visual) => visual,
         Err(status) => return status,
@@ -2621,14 +2611,11 @@ pub unsafe extern "C" fn yu_storage_session_projection_source_selection(
     if visual_start_utf16 > visual_end_utf16 {
         return YU_STORAGE_INVALID_SELECTION;
     }
-    let projection = match session.session.inline_projection_for_visual_state() {
+    let projection = match session.session.visual_text_for_visual_state() {
         Ok(projection) => projection,
         Err(error) => return storage_status(error),
     };
-    let projected = match projected_utf8(&projection) {
-        Ok(projected) => projected,
-        Err(status) => return status,
-    };
+    let projected = projected_utf8(&projection);
     let visual_start_byte = match utf16_byte_offset(&projected, visual_start_utf16) {
         Ok(offset) => offset,
         Err(status) => return status,
@@ -2649,7 +2636,7 @@ pub unsafe extern "C" fn yu_storage_session_projection_source_selection(
         let bias = projection_bias_from_affinity(affinity);
         (bias, bias)
     } else {
-        (ProjectionBias::Before, ProjectionBias::After)
+        (Bias::Before, Bias::After)
     };
     let source_start = match projection.visual_to_source(visual_start, start_bias) {
         Ok(source) => source,
@@ -2815,7 +2802,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
             Ok(hit) => hit,
             Err(_) => return YU_STORAGE_INVALID_SELECTION,
         };
-        let projection = match session.session.inline_projection_for_visual_state() {
+        let projection = match session.session.visual_text_for_visual_state() {
             Ok(projection) => projection,
             Err(error) => return storage_status(error),
         };
@@ -2823,10 +2810,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
             Ok(visual) => visual,
             Err(_) => return YU_STORAGE_INVALID_SELECTION,
         };
-        let projected = match projected_utf8(&projection) {
-            Ok(projected) => projected,
-            Err(status) => return status,
-        };
+        let projected = projected_utf8(&projection);
         let visual_utf16 = match visual_utf16_offset(&projected, visual) {
             Ok(offset) => offset,
             Err(status) => return status,
@@ -2868,8 +2852,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
                 x: point.x(),
                 y: document_y,
                 affinity: affinity_to_ffi(match hit.bias() {
-                    ProjectionBias::Before => CaretAffinity::Upstream,
-                    ProjectionBias::After => CaretAffinity::Downstream,
+                    Bias::Before => CaretAffinity::Upstream,
+                    Bias::After => CaretAffinity::Downstream,
                 }),
             };
         }
@@ -3015,7 +2999,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_composition_shaped_caret(
             return YU_STORAGE_INVALID_SELECTION;
         }
         let (block_visual, block_bias) = match composition_active_visual_caret(
-            layout.projection(),
+            layout.visual(),
             selection_start_utf16,
             selection_end_utf16,
         ) {
@@ -3034,10 +3018,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_composition_shaped_caret(
             Ok(caret) => caret,
             Err(status) => return status,
         };
-        let full_projected = match projected_utf8(&full_projection) {
-            Ok(projected) => projected,
-            Err(status) => return status,
-        };
+        let full_projected = projected_utf8(&full_projection);
         let visual_utf16 = match visual_utf16_offset(&full_projected, active_visual) {
             Ok(offset) => offset,
             Err(status) => return status,
@@ -3743,10 +3724,35 @@ fn image_utf16_range(source: &TextSnapshot, range: Option<TextRange>) -> Result<
     Ok((start, end))
 }
 
+/// 一个块上的全部图片标注。
+#[cfg(target_os = "macos")]
+fn block_images(decorations: &yu_editor::BlockDecorations) -> Vec<ImageSpan> {
+    decorations
+        .annotations()
+        .iter()
+        .copied()
+        .map(|yu_editor::BlockAnnotation::Image(image)| image)
+        .collect()
+}
+
+/// 围栏代码块的语言名与正文区间。不是围栏代码块就是 `None`。
+#[cfg(target_os = "macos")]
+fn fenced_code_of(
+    decorations: &yu_editor::BlockDecorations,
+) -> Option<(yu_core::TextRange, yu_core::TextRange)> {
+    decorations
+        .line_styles()
+        .iter()
+        .find_map(|ornament| match ornament {
+            BlockOrnament::FencedCode { info, content } => Some((*info, *content)),
+            _ => None,
+        })
+}
+
 #[cfg(target_os = "macos")]
 fn image_destination(
     source: &TextSnapshot,
-    image: ImageSource,
+    image: ImageSpan,
     definitions: &yu_markdown::ReferenceDefinitionIndex,
 ) -> Option<TextRange> {
     image.destination().or_else(|| {
@@ -3760,7 +3766,7 @@ fn image_destination(
 #[cfg(target_os = "macos")]
 fn image_resource_key(
     source: &TextSnapshot,
-    image: ImageSource,
+    image: ImageSpan,
     definitions: &yu_markdown::ReferenceDefinitionIndex,
 ) -> Option<ImageKey> {
     let destination = image_destination(source, image, definitions)?;
@@ -3813,11 +3819,11 @@ fn macos_image_requests(
         .clone();
     let mut candidates = Vec::new();
     for &(block_index, priority) in block_indices {
-        let projection = session
+        let decorations = session
             .session
-            .block_projection(block_index)
+            .block_decorations(block_index)
             .map_err(storage_status)?;
-        for image in projection.visual().images().iter().copied() {
+        for image in block_images(&decorations) {
             let Some(key) = image_resource_key(&source, image, &definitions) else {
                 continue;
             };
@@ -4235,11 +4241,11 @@ fn macos_frame_needs_resource_refresh(
         .clone();
     let mut pending = false;
     for &block_index in visible_blocks {
-        let projection = session
+        let decorations = session
             .session
-            .block_projection(block_index)
+            .block_decorations(block_index)
             .map_err(storage_status)?;
-        for image in projection.visual().images().iter().copied() {
+        for image in block_images(&decorations) {
             let key = image_resource_key(&source, image, &definitions);
             let fingerprint = key.as_ref().map_or(0, ImageKey::fingerprint);
             let status = macos_image_resource_status(
@@ -4251,14 +4257,14 @@ fn macos_frame_needs_resource_refresh(
                 pending = true;
             }
         }
-        let BlockProjection::FencedCode(code) = projection else {
+        let Some((info, content_range)) = fenced_code_of(&decorations) else {
             continue;
         };
-        let Some(kind) = embedded_resource_kind(&source, code.info_string()) else {
+        let Some(kind) = embedded_resource_kind(&source, info) else {
             continue;
         };
         let embedded_kind = embedded_resource_kind_from_ffi(kind).ok_or(YU_STORAGE_EDITOR_ERROR)?;
-        let content = embedded_resource_content(&source, code.content())?;
+        let content = embedded_resource_content(&source, content_range)?;
         // 空的 fenced body 仍然是合法的源码资源，用一个 trim 中性的哨兵保持它
         // 走同一条缓存路径，与 `macos_visual_embedded_resources` 一致。
         let content = if content.is_empty() {
@@ -4267,12 +4273,12 @@ fn macos_frame_needs_resource_refresh(
             content
         };
         let request =
-            EmbeddedRenderRequest::new(revision, code.source_range(), embedded_kind, content)
+            EmbeddedRenderRequest::new(revision, decorations.range(), embedded_kind, content)
                 .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
         let status = session
             .macos_embedded_resources
             .status_for(request, revision)?;
-        let fingerprint = embedded_resource_fingerprint(&source, code.source_range(), kind);
+        let fingerprint = embedded_resource_fingerprint(&source, decorations.range(), kind);
         if macos_resource_status_needs_refresh(status, fingerprint) {
             pending = true;
         }
@@ -5354,12 +5360,9 @@ mod tests {
             let session = unsafe { raw.as_mut() }.expect("session");
             let projection = session
                 .session
-                .inline_projection_for_visual_state()
+                .visual_text_for_visual_state()
                 .expect("projection");
-            assert_eq!(
-                projected_utf8(&projection).expect("projected"),
-                "羽 链接 🙂\n"
-            );
+            assert_eq!(projected_utf8(&projection), "羽 链接 🙂\n");
         }
 
         let mut caret = YuStorageProjectionCaret::default();
@@ -5433,9 +5436,9 @@ mod tests {
             let session = unsafe { raw.as_mut() }.expect("session");
             let projection = session
                 .session
-                .inline_projection_for_visual_state()
+                .visual_text_for_visual_state()
                 .expect("projection");
-            assert_eq!(projected_utf8(&projection).expect("projected"), source);
+            assert_eq!(projected_utf8(&projection), source);
         }
 
         let end_utf16 = source.encode_utf16().count() as u64;
@@ -5456,12 +5459,9 @@ mod tests {
             let session = unsafe { raw.as_mut() }.expect("session");
             let projection = session
                 .session
-                .inline_projection_for_visual_state()
+                .visual_text_for_visual_state()
                 .expect("projection");
-            assert_eq!(
-                projected_utf8(&projection).expect("projected"),
-                "before strong after"
-            );
+            assert_eq!(projected_utf8(&projection), "before strong after");
         }
 
         unsafe { yu_storage_session_destroy(raw) };
@@ -6632,9 +6632,9 @@ mod tests {
             let session = unsafe { raw.as_mut() }.expect("session");
             let projection = session
                 .session
-                .inline_projection_for_visual_state()
+                .visual_text_for_visual_state()
                 .expect("projection");
-            projected_utf8(&projection).expect("projected")
+            projected_utf8(&projection)
         };
         let source_strong = source.find("**粗体**").expect("source strong") as u64;
         let source_strong_end = source_strong + "**粗体**".len() as u64;

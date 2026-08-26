@@ -860,8 +860,9 @@ S5 结束时留给它的入口是清楚的：`yu-editor::BlockLayoutInput` 现�
 dev-dep 在用它。表格与图片的 widget 化、`BlockView::hit_test` 的 bidi 也在
 同一次换源里落地，理由见 S5 的「已登记的四个未做项」。
 
-**进行中。** 第一刀落地：`yu-markdown` 成为 extension 集合，产出
-`DecorationSet`。消费者还没换——`BlockLayoutInput` 仍然吃 `Projection`。
+**进行中。** 三刀落地：`yu-markdown` 成为 extension 集合；`BlockLayoutInput`
+多一条从 `DecorationSet` 派生的路；消费者换完——`BlockView` 现在向装饰问
+源码区间，`yu-projection` 在产品链路上只剩差分测试在用。
 
 #### 第一刀：extension 集合，建在 `yu-syntax` 上
 
@@ -1002,25 +1003,96 @@ D6 禁止的相互感知。
   ——`visible_pieces` 里的 `cursor.max(to)` 早就把重叠吃掉了。后者直接删掉，
   没有当成「等价」留着；那条性质补了一条用例单独压着。
 
+#### 第三刀：换消费者
+
+`BlockView` 不再持有 `BlockProjection`，改成持有一份 `BlockDecorations` 加一份
+`VisualText`；`EditorDocument` 的 `ProjectionCache` 换成 `DecorationCache`。
+`map_through` / `caret_for_source` / `hit_test` 全部走 `DecorationSet` 的双向
+映射——不变量 D4 说那是投影映射链的唯一实现，这一刀把两套收敛回一套。
+
+**`VisualText` 不是第二个映射实现。** 它做的是 `DecorationSet` 按定义做不了的
+三件事，一件都不是「再算一遍」：
+
+| | 为什么装饰集合做不了 |
+| --- | --- |
+| 换原点 | 装饰集合的视觉偏移是**整篇文档**的，`BlockLayout` 排的是一个块 |
+| 拿出文本 | 装饰集合不持有源码，它是一组区间加一个 Revision |
+| 叠 composition | preedit 是往视觉文本里**插入**一段不在 source 里的文字，§5.1 的四个变体都表达不了（不变量 H1 说它是 transient overlay） |
+
+边界校验也留在这一层：装饰集合回答不了「这个偏移是不是字符边界」，而
+`docs/specs/coordinates.md` 不许静默取整。
+
+#### 语法树归 `EditorDocument` 的缓存
+
+`ExtensionSet::decorate` 要一棵整篇文档的树。两个可选的持有者：
+
+- `MarkdownDocument` 是每次解析重建的**值类型**，装不下「上一版的树」——而
+  增量解析（`parse_with_fragments`）恰恰需要那个；而且 `yu-export` 这类只要
+  块序列的调用方会被迫付解析的钱；
+- `EditorDocument` 的 `DecorationCache`：要装饰的人才付钱，旧树也有地方待着。
+
+选了后者。**增量解析还没接上**——这一版每换一个 Revision 整篇重解析一次，
+位置留好了而已。`yu-editor → yu-syntax` 因此从 dev-dependency 升成产品依赖。
+
+#### 顺手补齐的三种语法
+
+换源之前必须先把还挂在 v1 上的东西接过来，否则删掉 `Projection` 就是删掉功能：
+
+- **表格成了 extension。** `table_projection_hidden_ranges` 原样搬进
+  `yu-markdown`，网格由 `BlockOrnament::Table` 带给 `yu-editor`（它是块级的，
+  走 `Decoration::Line` 那条已有的通道）。两条差分各自逼出了一行登记：
+  `extension_parity` 12 → 11，`blockinput_differential` 8 → 7，`Pending` 整类
+  清空。
+- **图片多了一条语义标注。** 装饰说不出「这一段是一张图」——image extension
+  产的三条改的是字型与可见性，没有一条是这句话本身。于是加了
+  `BlockAnnotation::Image`，不进 `DecorationSet`。硬塞一条 `Decoration::Widget`
+  也能把信息带过去，但那会让「装饰集合里的每一条都真的改了点什么」不再成立。
+  图片真正 widget 化要等布局层能问 widget 要尺寸（§5.3）。
+- **围栏代码块多了 `BlockOrnament::FencedCode`。** 隐藏区间说得出「围栏那两行
+  不进视觉文本」，说不出「哪一段是语言名」，而 KaTeX / Mermaid 要按语言名决定
+  这个块渲染成什么。
+
+#### 这一刀的实证
+
+- **整篇文档的视觉字节流换了基准。** 原生镜像与 IME 用的那一份此前是
+  `Projection::inline`——只藏行内语法，`#`、`>`、`- ` 原样留着。现在它是每个块
+  装饰的合并，结构前缀也不见了。它安全是因为 Swift 侧的 `NSTextInputClient`
+  镜像持有的是 **canonical source**，视觉 UTF-16 只是拖选时内部往返的一个锚点
+  （`visualUTF16` → `projection_source_selection` → 源码区间），同一个
+  Revision 内自洽即可。
+- **preedit 的平移量可以是负数。** 把三个字替换成一个字符的 preedit 时，后面的
+  文字往前挪。第一版用 `u64` 算这一步，在那种情况下饱和到 0——不 panic、不
+  报错，只是 preedit 之后的每一个光标位置都差几个字节。用例是
+  `a_shorter_preedit_pulls_the_following_offsets_back`。
+- **改一条 reference definition 不再让所有缓存整表作废。** v1 的投影要先查表
+  才知道 `[id]` 是不是一个链接；语法树里 `[id]` 的 `LinkLabel` 是结构，隐藏
+  区间不依赖索引（不变量 C6 说的「解析目标」才需要）。那条整表作废现在没有
+  任何东西要作废，删掉了。
+- **块整体平移，不逐个区间问锚点。** 编辑落在块外时块内每一个偏移都在每一处
+  改动的同一侧，平移量是个常量。逐个区间去问锚点也对，只是把一个常量算了几百
+  遍——而算错其中一份的表现是「点击落在别处」，不报错。
+- **簇的源码区间两端取不同的 bias。** 起点 `After`、终点 `Before`：一个簇不该
+  把它两边被隐藏的语法也吞进来，否则选中一个字会连带选中它旁边的 `*`。
+
 #### 还没做的
 
-- **消费者没换。** `EditorDocument` 仍然缓存 `Projection`，`BlockView` 仍然向
-  它问源码区间。换源要连 `BlockView::map_through` / `caret_for_source` 一起换成
-  `DecorationSet` 的双向映射（D4）。
-- **语法树该由谁持有还没定。** 现在测试自己 `yu_syntax::parse` 一遍，
-  `yu-editor` 为此挂了一条临时 dev-dep。产品链路上它要么进
-  `MarkdownDocument`（一次解析一份缓存，但 `yu-export` 这类不需要装饰的调用方
-  也要付钱），要么进 `EditorDocument` 的缓存。
-- **表格没有 extension**，两条差分里各按 `Pending` 登记着一条。
+- **`yu-projection` 还在。** 产品链路上已经没有使用者，剩下三条差分测试
+  （`extension_parity` / `decoration_parity` / `projection_differential`）与
+  两条临时 dev-dep。删它是下一刀。
+- **增量解析没接上。** `DecorationCache` 每换一个 Revision 整篇重解析一次。
+  `yu-syntax` 那边 `parse_with_fragments` 已经在了，缺的是这里把 fragment
+  传下去。
+- **`BlockView::hit_test` 的 bidi** 仍然是 v1 的按 x 扫描（S5 登记的未做项）。
+  源码映射换完之后它与 `BlockLayout::hit` 可以合流，但那是独立的一刀。
+- **表格与图片没有 widget 化。** 第 3 节的对照表说它们终局是 widget，那要求
+  `BlockLayout` 能问 `WidgetRegistry` 要尺寸（§5.3），而它现在拿的是
+  `NoWidgets`。
 - **`block_sequence` 与语法树的块结构还没合并。** 三个症状同一个根因：task 的
   `[ ]` 只能靠 `block_sequence` 认（树里没有节点）、`- [x]` 会被解析成一个
   shortcut `Link`、Setext 标题两边都不认（`标题\n===` 在块序列里是两个块，
   在树里是一个 `SetextHeading1`）。GFM 的 TaskList 进 `yu-syntax` 能一次解决
   前两个，第三个要块身份两边一致。**这该是独立的一刀**，混进换源会让差分归因
   不了「是装配错了还是解析变了」。
-- **`decorations.rs`（S4 的那一小块）与 `decoration_parity.rs` 原样留着。**
-  它们证明过的事已经被第一刀覆盖，但语料比新差分大，删除要等消费者换完之后
-  一起做。
 
 ### S7 · 产品面
 

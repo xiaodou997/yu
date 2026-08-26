@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
+use yu_core::{Revision, TextRange, Utf16Range};
 use yu_editor::{
-    BlockProjection, BlockView, CaretScrollRequest, CommandResult, CompositionError,
+    BlockDecorations, BlockView, CaretScrollRequest, CommandResult, CompositionError,
     CompositionOverlay, EditorCommand, EditorDocument, EditorDocumentError, EditorSelection,
-    KeyEvent, KeyRouteResult, LayoutConfig, MonospaceMetrics, Projection, ShapingProvider,
-    ViewportConfig, ViewportSnapshot, ViewportSpan,
+    KeyEvent, KeyRouteResult, LayoutConfig, ShapingProvider, ViewportConfig, ViewportSnapshot,
+    ViewportSpan, VisualText,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -206,53 +206,40 @@ impl DocumentSession {
         self.editor.selection()
     }
 
-    /// Builds the current revision's source-backed inline projection through
-    /// the editor-owned projection cache. The returned value is an owned
-    /// snapshot so a native FFI caller cannot retain a Rust borrow across
-    /// another session operation.
-    pub fn inline_projection(&mut self) -> Result<Projection, StorageError> {
-        let snapshot = self.editor.snapshot();
-        let source_range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
-            .expect("a snapshot's full range is always ordered");
-        self.editor
-            .projection(source_range)
-            .cloned()
-            .map_err(StorageError::Editor)
-    }
-
-    /// Builds the selection-bound visual projection used by the native mirror
-    /// and retained renderer. It bypasses Revision-only caches so a caret move
-    /// can reveal inline syntax without mutating canonical source.
-    pub fn inline_projection_for_visual_state(&self) -> Result<Projection, StorageError> {
-        let snapshot = self.editor.snapshot();
-        let source_range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
-            .expect("a snapshot's full range is always ordered");
-        self.editor
-            .projection_with_selection_reveal(source_range)
-            .map_err(StorageError::Editor)
-    }
-
-    /// Builds an owned metrics layout for the current full-source projection.
+    /// 整篇文档的视觉字节流：装饰应用之后长什么样，以及它到源码的映射。
     ///
-    /// This is intentionally a diagnostic/native bridge operation rather than
-    /// a second layout cache. The editor remains the owner of projections and
-    /// source; callers receive a revision-bound snapshot that can answer
-    /// source↔visual↔point queries without retaining a borrow into the editor.
-    pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<BlockView, StorageError> {
-        let projection = BlockProjection::Inline(self.inline_projection()?);
-        BlockView::build(
-            &projection,
-            config,
-            &MonospaceMetrics::new(config.default_advance()),
-        )
-        .map_err(|error| StorageError::Editor(EditorDocumentError::Layout(error)))
+    /// 返回的是一份 owned 快照，好让原生 FFI 调用方不必跨调用持有一个 Rust
+    /// 借用。
+    ///
+    /// # Errors
+    ///
+    /// 解析或装饰产出失败。
+    pub fn visual_text(&mut self) -> Result<VisualText, StorageError> {
+        self.editor.visual_text().map_err(StorageError::Editor)
     }
 
-    /// Builds the current transient composition over the same full-source
-    /// projection used by native layout diagnostics. The preedit is visual
-    /// only: the canonical buffer, Markdown CST and source Revision remain
-    /// unchanged until `commit_composition` succeeds.
-    pub fn composition_projection(&mut self) -> Result<Projection, StorageError> {
+    /// 带「光标碰到语法就露出来」的那一份，给原生镜像与保留式渲染器用。
+    ///
+    /// 它绕过 Revision 缓存：移动光标不推进 Revision，但要能让语法露出来。
+    ///
+    /// # Errors
+    ///
+    /// 解析或装饰产出失败。
+    pub fn visual_text_for_visual_state(&mut self) -> Result<VisualText, StorageError> {
+        self.editor
+            .visual_text_for_visual_state()
+            .map_err(StorageError::Editor)
+    }
+
+    /// 把当前 preedit 叠在整篇文档的视觉字节流上。
+    ///
+    /// preedit 只改视觉：canonical 缓冲、Markdown CST 与 Revision 在
+    /// `commit_composition` 成功之前都不动。
+    ///
+    /// # Errors
+    ///
+    /// 没有进行中的 composition，或装饰产出失败。
+    pub fn composition_visual_text(&mut self) -> Result<VisualText, StorageError> {
         let overlay = self
             .editor
             .composition()
@@ -260,14 +247,7 @@ impl DocumentSession {
             .ok_or(StorageError::Editor(
                 EditorDocumentError::CompositionNotActive,
             ))?;
-        let snapshot = self.editor.snapshot();
-        let source_range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
-            .expect("a snapshot's full range is always ordered");
-        let base = self
-            .editor
-            .projection(source_range)
-            .map_err(StorageError::Editor)?
-            .clone();
+        let base = self.editor.visual_text().map_err(StorageError::Editor)?;
         base.with_composition(
             overlay.replacement_range(),
             overlay.text().to_owned(),
@@ -296,42 +276,33 @@ impl DocumentSession {
             .map(|block| (block.range(), block.kind().viewport_tag()))
     }
 
-    /// Builds an owned projection for one parser-owned block. The projection
-    /// remains tied to the current editor revision and is safe to hand to a
-    /// synchronous native snapshot query.
-    pub fn block_projection(&mut self, index: usize) -> Result<BlockProjection, StorageError> {
+    /// 一个块的规范装饰。绑在当前 Revision 上，交给同步的原生查询是安全的。
+    ///
+    /// # Errors
+    ///
+    /// 块下标越界，或装饰产出失败。
+    pub fn block_decorations(&mut self, index: usize) -> Result<BlockDecorations, StorageError> {
         self.editor
-            .block_projection(index)
+            .block_decorations(index)
             .cloned()
             .map_err(StorageError::Editor)
     }
 
-    pub fn block_projection_for_visual_state(
-        &self,
+    /// 一个块当前的视觉状态：焦点块带上「光标碰到语法就露出来」。
+    ///
+    /// # Errors
+    ///
+    /// 块下标越界，或装饰产出失败。
+    pub fn block_decorations_for_visual_state(
+        &mut self,
         index: usize,
-    ) -> Result<BlockProjection, StorageError> {
+    ) -> Result<BlockDecorations, StorageError> {
         if self.editor.selection_reveal_block_index() == Some(index) {
             self.editor
-                .block_projection_with_selection_reveal(index)
+                .block_decorations_with_selection_reveal(index)
                 .map_err(StorageError::Editor)
         } else {
-            let block = self
-                .editor
-                .markdown()
-                .blocks()
-                .get(index)
-                .ok_or(StorageError::Editor(
-                    EditorDocumentError::BlockOutOfBounds {
-                        index,
-                        blocks: self.editor.markdown().blocks().len(),
-                    },
-                ))?;
-            BlockProjection::from_block_with_definitions(
-                &self.editor.snapshot(),
-                block,
-                self.editor.markdown().reference_definitions(),
-            )
-            .map_err(|error| StorageError::Editor(error.into()))
+            self.block_decorations(index)
         }
     }
 
@@ -741,22 +712,27 @@ impl DocumentEditorSession {
         self.document.selection()
     }
 
-    /// Returns an owned source-backed projection from the same editor session
-    /// that owns source, revision, selection and history.
-    pub fn inline_projection(&mut self) -> Result<Projection, StorageError> {
-        self.document.inline_projection()
+    /// 整篇文档的视觉字节流，来自同一个持有源码/Revision/选区/历史的会话。
+    ///
+    /// # Errors
+    ///
+    /// 解析或装饰产出失败。
+    pub fn visual_text(&mut self) -> Result<VisualText, StorageError> {
+        self.document.visual_text()
     }
 
-    pub fn inline_projection_for_visual_state(&self) -> Result<Projection, StorageError> {
-        self.document.inline_projection_for_visual_state()
+    /// # Errors
+    ///
+    /// 解析或装饰产出失败。
+    pub fn visual_text_for_visual_state(&mut self) -> Result<VisualText, StorageError> {
+        self.document.visual_text_for_visual_state()
     }
 
-    pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<BlockView, StorageError> {
-        self.document.inline_layout(config)
-    }
-
-    pub fn composition_projection(&mut self) -> Result<Projection, StorageError> {
-        self.document.composition_projection()
+    /// # Errors
+    ///
+    /// 没有进行中的 composition，或装饰产出失败。
+    pub fn composition_visual_text(&mut self) -> Result<VisualText, StorageError> {
+        self.document.composition_visual_text()
     }
 
     #[must_use]
@@ -769,15 +745,21 @@ impl DocumentEditorSession {
         self.document.block_metadata(index)
     }
 
-    pub fn block_projection(&mut self, index: usize) -> Result<BlockProjection, StorageError> {
-        self.document.block_projection(index)
+    /// # Errors
+    ///
+    /// 块下标越界，或装饰产出失败。
+    pub fn block_decorations(&mut self, index: usize) -> Result<BlockDecorations, StorageError> {
+        self.document.block_decorations(index)
     }
 
-    pub fn block_projection_for_visual_state(
-        &self,
+    /// # Errors
+    ///
+    /// 块下标越界，或装饰产出失败。
+    pub fn block_decorations_for_visual_state(
+        &mut self,
         index: usize,
-    ) -> Result<BlockProjection, StorageError> {
-        self.document.block_projection_for_visual_state(index)
+    ) -> Result<BlockDecorations, StorageError> {
+        self.document.block_decorations_for_visual_state(index)
     }
 
     pub fn block_layout(

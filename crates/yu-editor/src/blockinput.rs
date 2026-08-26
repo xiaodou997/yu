@@ -29,14 +29,16 @@ use yu_core::{
     ByteOffset, ClusterMetrics, LineStyleId, ShapedText, ShapingProvider, StyleId, TextAttrs,
     TextRange, TextStyle,
 };
+use yu_core::{VisualOffset, VisualRange};
 use yu_decoration::Decoration;
 use yu_layout::{
     LayoutConfig, LayoutError, LayoutInput, LayoutRect, LineAttrs, LineSpan, LineStyleTable,
     StyleTable, StyledRun,
 };
 use yu_markdown::{BlockDecorations, BlockOrnament};
-use yu_projection::{LeadingMarker, Projection, VisualOffset, VisualRunKind};
-use yu_text::TextSnapshot;
+use yu_projection::{LeadingMarker, Projection, VisualRunKind};
+
+use crate::visual::VisualText;
 
 /// v1 那条路用到的四种字型，`StyleId` 就是它们在表里的下标。
 ///
@@ -336,16 +338,20 @@ impl BlockLayoutInput {
     /// `tests/blockinput_differential.rs` 守着——`Projection` 还在产品里跑
     /// 着，删它之前它就是 oracle。
     ///
+    /// `visual` 必须是同一份装饰投影出来的（[`VisualText`] 与
+    /// `decorations` 同 range 同 Revision）：视觉文本从那边来，样式段在这边
+    /// 算，两者对不上就是「画面少了几个字」。
+    ///
     /// # Errors
     ///
-    /// 源码读不出来、装饰指向的 id 查不到、几何参数不合法。
+    /// 装饰指向的 id 查不到、几何参数不合法、视觉偏移溢出。
     pub fn from_decorations<M: ClusterMetrics>(
         decorations: &BlockDecorations,
-        source: &TextSnapshot,
+        visual: &VisualText,
         config: LayoutConfig,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
-        let draft = DecorationDraft::read(decorations, source)?;
+        let draft = DecorationDraft::read(decorations, visual)?;
         let marker = draft
             .marker
             .as_ref()
@@ -361,11 +367,11 @@ impl BlockLayoutInput {
     /// 同 [`BlockLayoutInput::from_decorations`]，外加 shaping 失败。
     pub fn from_decorations_shaped<S: ShapingProvider>(
         decorations: &BlockDecorations,
-        source: &TextSnapshot,
+        visual: &VisualText,
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<Self, LayoutError> {
-        let draft = DecorationDraft::read(decorations, source)?;
+        let draft = DecorationDraft::read(decorations, visual)?;
         let marker = draft
             .marker
             .as_ref()
@@ -640,22 +646,11 @@ struct MarkerOrnamentSource {
 }
 
 impl DecorationDraft {
-    fn read(decorations: &BlockDecorations, source: &TextSnapshot) -> Result<Self, LayoutError> {
+    fn read(decorations: &BlockDecorations, visual: &VisualText) -> Result<Self, LayoutError> {
         let bounds = decorations.range();
-
-        // 隐藏区间只排序，**不**合并。不同 extension 可以盖在同一段 source
-        // 上（`- [x]` 就是 task 与 link 各盖一层），重叠由
-        // `visible_pieces` 里那句 `cursor.max(to)` 吃掉——再合并一遍是死代码，
-        // 变异验证正是这么发现的：把合并去掉，一条测试都不红。
-        let mut hidden: Vec<(u64, u64)> = decorations
-            .set()
-            .all()
-            .iter()
-            .filter(|entry| entry.decoration.hides_source())
-            .map(|entry| (entry.range.start().get(), entry.range.end().get()))
-            .filter(|(from, to)| from < to)
-            .collect();
-        hidden.sort_unstable();
+        if bounds != visual.source_range() || decorations.revision() != visual.revision() {
+            return Err(LayoutError::Upstream("视觉文本与装饰不是同一份产出".into()));
+        }
 
         let marks: Vec<Mark> = decorations
             .set()
@@ -670,46 +665,31 @@ impl DecorationDraft {
                 _ => None,
             })
             .collect();
-        let segments = flatten(bounds, &marks);
 
         // 没有 Mark 盖着的那些段落到这个 id 上。它排在 extension 的 id 之后，
-        // 所以不会与任何一个撞号。
+        // 所以不会与任何一个撞号。preedit 也用它——那段文字不在 source 里，
+        // 没有任何 extension 会给它字型。
         let mut styles = decorations.styles().to_vec();
         let plain = StyleId(u32::try_from(styles.len()).map_err(|_| LayoutError::OffsetOverflow)?);
         styles.push(TextAttrs::new(TextStyle::Plain));
 
-        let mut text = String::new();
+        // 样式段先在 **canonical** 视觉空间里排好：段落是 canonical 源码上的
+        // 区间，而 preedit 是叠在最后的一层平移。混着算会让 preedit 旁边那
+        // 一段文字排错字型——不报错，只是画得不对。
+        //
+        // 一段的两端各问一次映射，中间被隐藏的字节自然就没了：隐藏区间的
+        // 视觉宽度是零。自己再切一遍「可见片段」是把 D4 那条映射重写一遍。
         let mut runs: Vec<StyledRun> = Vec::new();
-        for (segment, style) in segments {
+        for (segment, style) in flatten(bounds, &marks) {
             let style = style.unwrap_or(plain);
-            // 一段样式可能被隐藏区间切成好几截。
-            for (from, to) in visible_pieces(segment, &hidden) {
-                let piece = TextRange::new(ByteOffset::new(from), ByteOffset::new(to))
-                    .ok_or(LayoutError::OffsetOverflow)?;
-                let start =
-                    VisualOffset::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
-                text.push_str(&read_source(source, piece)?);
-                let end =
-                    VisualOffset::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
-                if start == end {
-                    continue;
-                }
-                let visual = yu_projection::VisualRange::new(start, end)
-                    .ok_or(LayoutError::OffsetOverflow)?;
-                // 相邻同样式合成一段：布局那边少一次换字型，差分也不会因为
-                // 「隐藏区间把它切成几截」而假红。
-                match runs.last_mut() {
-                    Some(last) if last.style() == style && last.visual().end() == start => {
-                        *last = StyledRun::new(
-                            yu_projection::VisualRange::new(last.visual().start(), end)
-                                .ok_or(LayoutError::OffsetOverflow)?,
-                            style,
-                        );
-                    }
-                    _ => runs.push(StyledRun::new(visual, style)),
-                }
-            }
+            let start = visual.canonical_source_to_visual(segment.start());
+            let end = visual.canonical_source_to_visual(segment.end());
+            push_run(&mut runs, start, end, style)?;
         }
+        let runs = match visual.composition_visual() {
+            Some(span) => splice_composition(runs, visual, span, plain)?,
+            None => runs,
+        };
 
         let mut heading = None;
         let mut quote = None;
@@ -725,14 +705,16 @@ impl DecorationDraft {
                         indent: found.indent(),
                     });
                 }
-                // 表格的网格不进 `BlockLayoutInput`：它排的是文字流，而
-                // 表格的几何由 `TableLayout` 另算一遍再把簇搬进单元格。
-                BlockOrnament::Table(_) => {}
+                // 表格的网格不进文字流的排版输入：`TableLayout` 另算一遍
+                // 几何，再把排好的簇搬进单元格。围栏代码块的语言名与正文
+                // 也不进：它们是给嵌入渲染（KaTeX / Mermaid）看的语义，
+                // 排版上代码块就是一段等宽文字。
+                BlockOrnament::Table(_) | BlockOrnament::FencedCode { .. } => {}
             }
         }
 
         Ok(Self {
-            text,
+            text: visual.text().to_owned(),
             runs,
             styles,
             source_range: bounds,
@@ -821,56 +803,93 @@ impl DecorationDraft {
     }
 }
 
-/// `segment` 去掉 `hidden` 之后剩下的可见片段，升序。
+/// 追加一段样式区间，与前一段同样式且相接时合成一段。
 ///
-/// `hidden` 只需要按起点升序，**不需要**不重叠：`cursor.max(to)` 会把重叠
-/// 与包含都吃掉。多个 extension 盖在同一段 source 上是允许的，所以这一条
-/// 不是巧合，是这里必须成立的性质。
-fn visible_pieces(segment: TextRange, hidden: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let (mut cursor, end) = (segment.start().get(), segment.end().get());
-    let mut pieces = Vec::new();
-    for &(from, to) in hidden {
-        if to <= cursor {
-            continue;
-        }
-        if from >= end {
-            break;
-        }
-        if from > cursor {
-            pieces.push((cursor, from.min(end)));
-        }
-        cursor = cursor.max(to);
-        if cursor >= end {
-            return pieces;
-        }
+/// 合成不是为了省事：布局那边少一次换字型，差分也不会因为「隐藏区间把一段
+/// 样式切成几截」而假红。空段直接丢——整段都被隐藏时两端映射到同一个视觉
+/// 偏移，那不是一段文字。
+fn push_run(
+    runs: &mut Vec<StyledRun>,
+    start: VisualOffset,
+    end: VisualOffset,
+    style: StyleId,
+) -> Result<(), LayoutError> {
+    if start >= end {
+        return Ok(());
     }
-    if cursor < end {
-        pieces.push((cursor, end));
+    match runs.last_mut() {
+        Some(last) if last.style() == style && last.visual().end() == start => {
+            *last = StyledRun::new(
+                VisualRange::new(last.visual().start(), end).ok_or(LayoutError::OffsetOverflow)?,
+                style,
+            );
+        }
+        _ => runs.push(StyledRun::new(
+            VisualRange::new(start, end).ok_or(LayoutError::OffsetOverflow)?,
+            style,
+        )),
     }
-    pieces
+    Ok(())
 }
 
-fn read_source(source: &TextSnapshot, range: TextRange) -> Result<String, LayoutError> {
-    let start = usize::try_from(range.start()).map_err(|_| LayoutError::OffsetOverflow)?;
-    let end = usize::try_from(range.end()).map_err(|_| LayoutError::OffsetOverflow)?;
-    let mut text = String::with_capacity(end.saturating_sub(start));
-    let chunks = source
-        .chunk_cursor(range.start())
-        .map_err(|error| LayoutError::Upstream(error.to_string()))?;
-    for chunk in chunks {
-        let chunk_start =
-            usize::try_from(chunk.start()).map_err(|_| LayoutError::OffsetOverflow)?;
-        if chunk_start >= end {
-            break;
+/// 把 preedit 叠进 canonical 视觉空间里排好的样式段。
+///
+/// preedit 替换掉的那一段 canonical 文字整个让位：跨在边界上的样式段被裁到
+/// 边界处，之后的整体后移，中间空出来的那一段是 preedit 自己的 run。
+///
+/// preedit **不排 Markdown 字型**：它还没进 source，把它按周围的样式排会让
+/// 用户以为已经生效了。v1 也是给它一个 `Plain` 的 run。
+fn splice_composition(
+    runs: Vec<StyledRun>,
+    visual: &VisualText,
+    span: VisualRange,
+    plain: StyleId,
+) -> Result<Vec<StyledRun>, LayoutError> {
+    let replacement = visual
+        .composition_range()
+        .ok_or(LayoutError::Upstream("preedit 区间缺失".into()))?;
+    let old_start = visual.canonical_source_to_visual(replacement.start());
+    let old_end = visual.canonical_source_to_visual(replacement.end());
+    let shift = |offset: VisualOffset| -> Result<VisualOffset, LayoutError> {
+        let moved =
+            i128::from(offset.get()) + i128::from(span.end().get()) - i128::from(old_end.get());
+        u64::try_from(moved)
+            .map(VisualOffset::new)
+            .map_err(|_| LayoutError::OffsetOverflow)
+    };
+
+    let mut spliced: Vec<StyledRun> = Vec::with_capacity(runs.len().saturating_add(1));
+    for run in runs {
+        let (from, to) = (run.visual().start(), run.visual().end());
+        if to <= old_start {
+            push_run(&mut spliced, from, to, run.style())?;
+            continue;
         }
-        let chunk_end = chunk_start.saturating_add(chunk.text().len());
-        let local_start = start.max(chunk_start).saturating_sub(chunk_start);
-        let local_end = end.min(chunk_end).saturating_sub(chunk_start);
-        if local_start < local_end {
-            text.push_str(&chunk.text()[local_start..local_end]);
+        if from >= old_end {
+            push_run(&mut spliced, shift(from)?, shift(to)?, run.style())?;
+            continue;
+        }
+        if from < old_start {
+            push_run(&mut spliced, from, old_start, run.style())?;
+        }
+        if to > old_end {
+            push_run(&mut spliced, shift(old_end)?, shift(to)?, run.style())?;
         }
     }
-    Ok(text)
+    if !span.is_empty() {
+        let at = spliced
+            .iter()
+            .position(|run| run.visual().start() >= span.end())
+            .unwrap_or(spliced.len());
+        spliced.insert(
+            at,
+            StyledRun::new(
+                VisualRange::new(span.start(), span.end()).ok_or(LayoutError::OffsetOverflow)?,
+                plain,
+            ),
+        );
+    }
+    Ok(spliced)
 }
 
 #[cfg(test)]

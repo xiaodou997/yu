@@ -15,15 +15,9 @@ yu-layout = { path = "../yu-layout" }
 yu-markdown = { path = "../yu-markdown" }
 yu-projection = { path = "../yu-projection" }
 yu-state = { path = "../yu-state" }
+yu-syntax = { path = "../yu-syntax" }
 yu-text = { path = "../yu-text" }
 unicode-segmentation = "1.13"
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-# **临时的测试依赖。** tests/blockinput_differential.rs 要自己解析出一棵
-# `yu_syntax::Tree` 喂给 `ExtensionSet::decorate`。产品链路里这棵树该由谁
-# 持有（`MarkdownDocument` 还是 `EditorDocument` 的缓存）是切换消费者那一刀
-# 的问题，定下来之后这条边要么消失、要么升成产品依赖。
-yu-syntax = { path = "../yu-syntax" }

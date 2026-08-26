@@ -99,6 +99,17 @@ position 精确推导，且推导结果与原始字节完全一致。
 **D4.** DecorationSet 必须支持 O(log n) 的 source offset ↔ visual offset
 双向映射，且 round-trip 无损。这是投影映射链的唯一实现。
 
+**「唯一实现」允许上面有一层薄的换算，但那层不得自己数隐藏了多少字节。**
+S6 换消费者之后 `yu-editor::VisualText` 就是那一层，它只做三件 DecorationSet
+按定义做不了的事：**换原点**（装饰集合的视觉偏移是整篇文档的，而
+`BlockLayout` 排的是一个块）、**拿出文本**（装饰集合不持有源码）、
+**叠 composition**（preedit 是往视觉文本里插入一段不在 source 里的文字，
+D 节的四个变体都表达不了它，H1 也说它是 transient overlay）。
+
+判据是：**任何一处「这段被藏起来了吗」的判断都必须来自 DecorationSet。**
+自己再遍历一遍隐藏区间去切可见片段，就是第二个实现——哪怕结果一样，它会
+在下一次改动时分叉，而分叉的表现是光标与画面差几个字节，不报错。
+
 **D5.** `Replace` decoration 使对应 source 的 visual width 为零，
 但 source 长度不变、内容不变、可被光标穿越与选中。
 
