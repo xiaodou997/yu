@@ -63,6 +63,33 @@ mod task;
 
 pub use syntax::{DelimitedSpan, SyntaxNode};
 
+/// 扫空白时一次读多少字节。
+///
+/// 空白 run 通常只有一两个字节，一个窗口就够；长的按它自己的长度分几次读。
+/// 这个数字没有魔力，换成 16 或 128 都能工作。
+const SPACE_WINDOW: u64 = 64;
+
+/// 读 `from..to`，`from` 落在字符中间时往后挪到最近的边界。
+///
+/// 窗口的起点是按**字节**算出来的（`cursor - 64`），完全可能落在一个多字节
+/// 字符中间；`read_range` 在那里会失败，而调用方能做的只有就地放弃。那正是
+/// 静默地做错事：`# 标题` 后面跟 63 个空格时，收尾标记前的空白一个都不隐藏
+/// ——不 panic、不报错，只是画面里多出一串空格。这条是被用例抓到的。
+///
+/// UTF-8 一个字符最多 4 字节，所以最多往后挪 3 次。
+fn read_window(source: &TextSnapshot, from: u64, to: u64) -> Option<(u64, Vec<u8>)> {
+    let mut from = from;
+    while from < to {
+        if let Some(range) = TextRange::new(ByteOffset::new(from), ByteOffset::new(to))
+            && let Some(bytes) = read_range(source, range)
+        {
+            return Some((from, bytes));
+        }
+        from += 1;
+    }
+    None
+}
+
 /// 一个块在装饰阶段能看见的全部输入。
 ///
 /// 语法树整篇只解析一次，各家共用——每个 extension 自己再解析一遍会让
@@ -138,40 +165,62 @@ impl<'a> BlockContext<'a> {
     /// 结构标记与内容之间的那几个空格属于语法：`#   多空格` 的 `HeaderMark`
     /// 只有 `#` 一个字节，三个空格是树不表示的部分。留着它们的话标题会顶着
     /// 三个空格往右挪——不报错，只是画得不对。
+    ///
+    /// 按窗口分段读，不是一口气读到块末：引用块每个 `QuoteMark` 都要调一次，
+    /// 一次读到块末的话，一个五百行的引用块要复制五百次半个块。空白run 通常
+    /// 只有一两个字节，一个窗口就够，长的也只按它自己的长度付钱。
     #[must_use]
     pub fn skip_spaces(&self, offset: ByteOffset) -> ByteOffset {
-        let end = self.range().end();
-        let Some(window) = TextRange::new(offset, end) else {
-            return offset;
-        };
-        let Some(bytes) = read_range(self.source, window) else {
-            return offset;
-        };
-        let run = bytes
-            .iter()
-            .take_while(|byte| matches!(byte, b' ' | b'\t'))
-            .count();
-        ByteOffset::new(offset.get().saturating_add(run as u64))
+        let end = self.range().end().get();
+        let mut cursor = offset.get();
+        while cursor < end {
+            let stop = end.min(cursor.saturating_add(SPACE_WINDOW));
+            let scanned = stop - cursor;
+            let Some(window) = TextRange::new(ByteOffset::new(cursor), ByteOffset::new(stop))
+            else {
+                break;
+            };
+            let Some(bytes) = read_range(self.source, window) else {
+                break;
+            };
+            let run = bytes
+                .iter()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count() as u64;
+            cursor += run;
+            // 没跑满这个窗口，说明撞上了非空白。
+            if run < scanned {
+                break;
+            }
+        }
+        ByteOffset::new(cursor)
     }
 
     /// 从 `offset` 起**往回**跳过 ASCII 空格与制表符，不越出块的起点。
     ///
-    /// `# 标题 #` 的收尾标记前面那个空格也是语法。
+    /// `# 标题 #` 的收尾标记前面那个空格也是语法。分段读的理由同
+    /// [`BlockContext::skip_spaces`]。
     #[must_use]
     pub fn skip_spaces_back(&self, offset: ByteOffset) -> ByteOffset {
-        let start = self.range().start();
-        let Some(window) = TextRange::new(start, offset) else {
-            return offset;
-        };
-        let Some(bytes) = read_range(self.source, window) else {
-            return offset;
-        };
-        let run = bytes
-            .iter()
-            .rev()
-            .take_while(|byte| matches!(byte, b' ' | b'\t'))
-            .count();
-        ByteOffset::new(offset.get().saturating_sub(run as u64))
+        let start = self.range().start().get();
+        let mut cursor = offset.get();
+        while cursor > start {
+            let wanted = start.max(cursor.saturating_sub(SPACE_WINDOW));
+            let Some((from, bytes)) = read_window(self.source, wanted, cursor) else {
+                break;
+            };
+            let run = bytes
+                .iter()
+                .rev()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count() as u64;
+            let scanned = cursor - from;
+            cursor -= run;
+            if run < scanned {
+                break;
+            }
+        }
+        ByteOffset::new(cursor)
     }
 
     /// 这个块第一行的起点。列表标记的缩进由它算出来。
@@ -608,13 +657,9 @@ fn content_range(source: &TextSnapshot, block: Block) -> TextRange {
 
     let range = block.range();
     let (start, end) = (range.start().get(), range.end().get());
-    let Some(tail) = TextRange::new(
-        ByteOffset::new(end.saturating_sub(WINDOW).max(start)),
-        range.end(),
-    ) else {
-        return range;
-    };
-    let Some(bytes) = read_range(source, tail) else {
+    // 窗口起点按字节算，可能落在多字节字符中间；`read_window` 会挪到边界。
+    // 就地放弃的话这里会静静地退回未修剪的 range，症状只有慢。
+    let Some((_, bytes)) = read_window(source, end.saturating_sub(WINDOW).max(start), end) else {
         return range;
     };
     let trailing = bytes
