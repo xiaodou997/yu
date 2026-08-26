@@ -663,3 +663,36 @@ fn link_text_does_not_inherit_the_surrounding_style() {
         "外层的 Strong 仍然在，只是盖不住链接正文"
     );
 }
+
+/// 空白 run 跨过读窗口边界时也要数对。
+///
+/// `skip_spaces` 按 64 字节一段读，一次读到块末的话，一个五百行的引用块每个
+/// `QuoteMark` 都要复制半个块。分段之后要保证跨段的 run 不会在段边界处停住
+/// ——停住的话标题会顶着一串空格往右挪，不报错，只是画得不对。
+#[test]
+fn a_space_run_that_crosses_the_read_window_is_still_one_run() {
+    for spaces in [1_usize, 63, 64, 65, 130] {
+        let source = format!("#{}标题", " ".repeat(spaces));
+        let decorations = decorate(&source, None);
+        assert_eq!(
+            hidden(&decorations),
+            vec![(0, 1 + spaces as u64)],
+            "{spaces} 个空格的前缀没有整段隐藏"
+        );
+    }
+}
+
+/// 往回扫同理。
+#[test]
+fn a_backward_space_run_that_crosses_the_read_window_is_still_one_run() {
+    for spaces in [1_usize, 63, 64, 65, 130] {
+        let source = format!("# 标题{}#", " ".repeat(spaces));
+        let decorations = decorate(&source, None);
+        let end = source.len() as u64;
+        assert_eq!(
+            hidden(&decorations).last().copied(),
+            Some((end - 1 - spaces as u64, end)),
+            "{spaces} 个空格加收尾 `#` 没有整段隐藏"
+        );
+    }
+}
