@@ -71,8 +71,14 @@ ALLOWED: dict[str, set[str]] = {
     "yu-scene": {"yu-core", "yu-font", "yu-layout"},
     "yu-render": {"yu-assets", "yu-core", "yu-font", "yu-scene"},
     # 7 层及以上：编辑状态、持久化、工作区。
+    # yu-editor 是「允许认识 Markdown」的那一层（不变量 E1 的禁止清单里没有
+    # 它）。S6 让它同时读得懂两种装饰来源：v1 的 Projection 与 yu-markdown 的
+    # extension 产出，后者的类型（Decoration / DecorationSet）住在
+    # yu-decoration，所以多了这条边。它是**向下**的，不是临时的——
+    # Projection 删掉之后留下的正是这一条。
     "yu-editor": {
         "yu-core",
+        "yu-decoration",
         "yu-layout",
         "yu-markdown",
         "yu-projection",
@@ -161,6 +167,11 @@ ALLOWED_DEV: dict[str, set[str]] = {
     # 用例住在 yu-projection 而不是 yu-markdown，因为断言的主体是 v1 的行为，
     # 而 v1 就在这里；这两条边都随 yu-projection 一起消失。
     "yu-projection": {"yu-decoration", "yu-syntax"},
+    # 临时：tests/blockinput_differential.rs 要自己解析出一棵 Tree 喂给
+    # `ExtensionSet::decorate`。产品链路里这棵树该由谁持有还没定（见
+    # yu-editor/Cargo.toml 的注释），定下来之后这条边要么消失、要么升成
+    # 产品依赖。
+    "yu-editor": {"yu-syntax"},
 }
 
 

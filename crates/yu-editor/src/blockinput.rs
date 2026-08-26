@@ -24,23 +24,27 @@
 //! 「缩进 8.0」，不是「这是二级引用」。
 
 use crate::geometry::upstream;
+use crate::marks::{Mark, flatten};
 use yu_core::{
     ByteOffset, ClusterMetrics, LineStyleId, ShapedText, ShapingProvider, StyleId, TextAttrs,
     TextRange, TextStyle,
 };
+use yu_decoration::Decoration;
 use yu_layout::{
     LayoutConfig, LayoutError, LayoutInput, LayoutRect, LineAttrs, LineSpan, LineStyleTable,
     StyleTable, StyledRun,
 };
-use yu_projection::{
-    BlockQuotePresentation, HeadingPresentation, LeadingMarker, Projection, VisualOffset,
-    VisualRunKind,
-};
+use yu_markdown::{BlockDecorations, BlockOrnament};
+use yu_projection::{LeadingMarker, Projection, VisualOffset, VisualRunKind};
+use yu_text::TextSnapshot;
 
-/// 这个块用到的四种字型，`StyleId` 就是它们在表里的下标。
+/// v1 那条路用到的四种字型，`StyleId` 就是它们在表里的下标。
 ///
 /// 顺序与 [`TextStyle`] 一一对应，不是随便排的：id 的含义由**这一层**定，
 /// 布局层查表拿到的只有 [`TextAttrs`]。
+///
+/// `DecorationSet` 那条路的 id 数量由 extension 决定，不是四个——所以
+/// [`BlockStyleTable`] 是变长的，这个常量只管 v1 那条。
 const STYLE_COUNT: usize = 4;
 
 /// 整块只有一段行级样式，id 固定。
@@ -52,7 +56,7 @@ const BLOCK_LINE_STYLE: LineStyleId = LineStyleId(0);
 /// 产出与样式表脱节」的 bug 应该响，不应该只是画得不对。
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockStyleTable {
-    attrs: [TextAttrs; STYLE_COUNT],
+    attrs: Vec<TextAttrs>,
 }
 
 impl StyleTable for BlockStyleTable {
@@ -262,10 +266,13 @@ impl BlockLayoutInput {
         config: LayoutConfig,
         marker: Option<MarkerDraft>,
     ) -> Result<Self, LayoutError> {
-        let heading = projection.heading().map(heading_metrics).transpose()?;
+        let heading = projection
+            .heading()
+            .map(|heading| heading_metrics(heading.level()))
+            .transpose()?;
         let quote = projection
             .block_quote()
-            .map(|quote| block_quote_metrics(quote, config))
+            .map(|quote| block_quote_metrics(quote.depth(), config))
             .transpose()?;
 
         let quote_gutter = quote.map_or(0.0, |quote| quote.gutter);
@@ -283,7 +290,7 @@ impl BlockLayoutInput {
 
         let font_scale = heading.map_or(1.0, |heading| heading.font_scale);
         let styles = BlockStyleTable {
-            attrs: style_attrs(font_scale, heading.is_some())?,
+            attrs: style_attrs(font_scale, heading.is_some())?.to_vec(),
         };
         let line_styles = BlockLineStyleTable {
             attrs: LineAttrs::new(
@@ -320,6 +327,51 @@ impl BlockLayoutInput {
                 }),
             },
         })
+    }
+
+    /// 从 `yu-markdown` 的 extension 产出派生。
+    ///
+    /// 与 [`BlockLayoutInput::derive`] 是同一件事的两个来源：那条读 v1 的
+    /// `Projection`，这条读 `DecorationSet`。两条并存，靠
+    /// `tests/blockinput_differential.rs` 守着——`Projection` 还在产品里跑
+    /// 着，删它之前它就是 oracle。
+    ///
+    /// # Errors
+    ///
+    /// 源码读不出来、装饰指向的 id 查不到、几何参数不合法。
+    pub fn from_decorations<M: ClusterMetrics>(
+        decorations: &BlockDecorations,
+        source: &TextSnapshot,
+        config: LayoutConfig,
+        metrics: &M,
+    ) -> Result<Self, LayoutError> {
+        let draft = DecorationDraft::read(decorations, source)?;
+        let marker = draft
+            .marker
+            .as_ref()
+            .map(|marker| measure_marker_text(marker, metrics))
+            .transpose()?;
+        draft.assemble(config, marker)
+    }
+
+    /// 按 shaping 后端派生。与 [`BlockLayoutInput::derive_shaped`] 对应。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`BlockLayoutInput::from_decorations`]，外加 shaping 失败。
+    pub fn from_decorations_shaped<S: ShapingProvider>(
+        decorations: &BlockDecorations,
+        source: &TextSnapshot,
+        config: LayoutConfig,
+        shaper: &S,
+    ) -> Result<Self, LayoutError> {
+        let draft = DecorationDraft::read(decorations, source)?;
+        let marker = draft
+            .marker
+            .as_ref()
+            .map(|marker| shape_marker_text(marker, shaper))
+            .transpose()?;
+        draft.assemble(config, marker)
     }
 
     #[must_use]
@@ -425,10 +477,28 @@ fn measure_marker<M: ClusterMetrics>(
     marker: &LeadingMarker,
     metrics: &M,
 ) -> Result<MarkerDraft, LayoutError> {
+    measure_marker_parts(marker.source(), marker.text(), marker.indent(), metrics)
+}
+
+/// [`DecorationDraft`] 那条路的入口。量法与 v1 那条**共用**下面这一个函数
+/// ——差分要比的是「派生出了什么标记」，不是「同一段算术抄了两遍」。
+fn measure_marker_text<M: ClusterMetrics>(
+    marker: &MarkerOrnamentSource,
+    metrics: &M,
+) -> Result<MarkerDraft, LayoutError> {
+    measure_marker_parts(marker.source, &marker.text, marker.indent, metrics)
+}
+
+fn measure_marker_parts<M: ClusterMetrics>(
+    source: TextRange,
+    text: &str,
+    indent: u8,
+    metrics: &M,
+) -> Result<MarkerDraft, LayoutError> {
     use unicode_segmentation::UnicodeSegmentation;
 
     let mut advance = 0.0_f32;
-    for cluster in marker.text().graphemes(true) {
+    for cluster in text.graphemes(true) {
         let width = metrics.advance(cluster, TextStyle::Plain);
         if !width.is_finite() || width < 0.0 {
             return Err(LayoutError::InvalidMetrics(width.to_bits()));
@@ -436,9 +506,9 @@ fn measure_marker<M: ClusterMetrics>(
         advance += width;
     }
     Ok(MarkerDraft {
-        source: marker.source(),
-        text: marker.text().to_owned(),
-        indent: marker.indent(),
+        source,
+        text: text.to_owned(),
+        indent,
         advance,
         shaped: None,
     })
@@ -448,13 +518,29 @@ fn shape_marker<S: ShapingProvider>(
     marker: &LeadingMarker,
     shaper: &S,
 ) -> Result<MarkerDraft, LayoutError> {
-    let len = u64::try_from(marker.text().len()).map_err(|_| LayoutError::OffsetOverflow)?;
+    shape_marker_parts(marker.source(), marker.text(), marker.indent(), shaper)
+}
+
+fn shape_marker_text<S: ShapingProvider>(
+    marker: &MarkerOrnamentSource,
+    shaper: &S,
+) -> Result<MarkerDraft, LayoutError> {
+    shape_marker_parts(marker.source, &marker.text, marker.indent, shaper)
+}
+
+fn shape_marker_parts<S: ShapingProvider>(
+    source: TextRange,
+    text: &str,
+    indent: u8,
+    shaper: &S,
+) -> Result<MarkerDraft, LayoutError> {
+    let len = u64::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
     // 标记文本是合成的，不在 source 里。它的 shaping 空间是零基的局部空间，
     // 与 `BlockLayout::build_shaped` 给普通 run 的那一个同一种东西。
     let local = TextRange::new(ByteOffset::ZERO, ByteOffset::new(len))
         .ok_or(LayoutError::OffsetOverflow)?;
     let shaped = shaper
-        .shape(marker.text(), local, TextStyle::Plain)
+        .shape(text, local, TextStyle::Plain)
         .map_err(|error| LayoutError::Shaping(error.to_string()))?;
     if shaped.source() != local {
         return Err(LayoutError::Shaping(
@@ -466,9 +552,9 @@ fn shape_marker<S: ShapingProvider>(
         return Err(LayoutError::InvalidMetrics(advance.to_bits()));
     }
     Ok(MarkerDraft {
-        source: marker.source(),
-        text: marker.text().to_owned(),
-        indent: marker.indent(),
+        source,
+        text: text.to_owned(),
+        indent,
         advance,
         shaped: Some(shaped),
     })
@@ -481,8 +567,8 @@ struct HeadingMetrics {
     line_height_scale: f32,
 }
 
-fn heading_metrics(heading: HeadingPresentation) -> Result<HeadingMetrics, LayoutError> {
-    let (font_scale, line_height_scale) = match heading.level() {
+fn heading_metrics(level: u8) -> Result<HeadingMetrics, LayoutError> {
+    let (font_scale, line_height_scale) = match level {
         1 => (2.0, 2.2),
         2 => (1.7, 1.9),
         3 => (1.45, 1.65),
@@ -496,7 +582,7 @@ fn heading_metrics(heading: HeadingPresentation) -> Result<HeadingMetrics, Layou
         }
     };
     Ok(HeadingMetrics {
-        level: heading.level(),
+        level,
         font_scale,
         line_height_scale,
     })
@@ -510,27 +596,278 @@ struct BlockQuoteMetrics {
     gutter: f32,
 }
 
-fn block_quote_metrics(
-    quote: &BlockQuotePresentation,
-    config: LayoutConfig,
-) -> Result<BlockQuoteMetrics, LayoutError> {
-    if quote.depth() == 0 {
+fn block_quote_metrics(depth: u8, config: LayoutConfig) -> Result<BlockQuoteMetrics, LayoutError> {
+    if depth == 0 {
         return Err(LayoutError::InvalidConfig(
             "blockquote depth must be positive",
         ));
     }
     let bar_width = (config.line_height() * 0.12).clamp(1.0, 3.0);
     let unit = (config.default_advance() * 2.0).max(bar_width + config.default_advance());
-    let gutter = unit * f32::from(quote.depth());
+    let gutter = unit * f32::from(depth);
     if !unit.is_finite() || !gutter.is_finite() {
         return Err(LayoutError::InvalidMetrics(gutter.to_bits()));
     }
     Ok(BlockQuoteMetrics {
-        depth: quote.depth(),
+        depth,
         unit,
         bar_width,
         gutter,
     })
+}
+
+/// 从 [`BlockDecorations`] 读出来的中间件。
+///
+/// 它只负责「装饰说了什么」：视觉文本、样式段、三种装饰的**语义值**。
+/// 翻成几何（字号倍率、gutter、缩进）由 [`DecorationDraft::assemble`] 做，
+/// 走的是与 v1 那条路**同一批**函数——差分要比的是「派生出了什么」，不是
+/// 「同一段算术抄了两遍」。
+struct DecorationDraft {
+    text: String,
+    runs: Vec<StyledRun>,
+    styles: Vec<TextAttrs>,
+    source_range: TextRange,
+    heading: Option<u8>,
+    quote: Option<u8>,
+    marker: Option<MarkerOrnamentSource>,
+}
+
+/// 列表标记的语义值，还没量过宽度。
+struct MarkerOrnamentSource {
+    source: TextRange,
+    text: String,
+    indent: u8,
+}
+
+impl DecorationDraft {
+    fn read(decorations: &BlockDecorations, source: &TextSnapshot) -> Result<Self, LayoutError> {
+        let bounds = decorations.range();
+
+        // 隐藏区间只排序，**不**合并。不同 extension 可以盖在同一段 source
+        // 上（`- [x]` 就是 task 与 link 各盖一层），重叠由
+        // `visible_pieces` 里那句 `cursor.max(to)` 吃掉——再合并一遍是死代码，
+        // 变异验证正是这么发现的：把合并去掉，一条测试都不红。
+        let mut hidden: Vec<(u64, u64)> = decorations
+            .set()
+            .all()
+            .iter()
+            .filter(|entry| entry.decoration.hides_source())
+            .map(|entry| (entry.range.start().get(), entry.range.end().get()))
+            .filter(|(from, to)| from < to)
+            .collect();
+        hidden.sort_unstable();
+
+        let marks: Vec<Mark> = decorations
+            .set()
+            .all()
+            .iter()
+            .filter_map(|entry| match entry.decoration {
+                Decoration::Mark { style } => Some(Mark {
+                    range: entry.range,
+                    style,
+                    priority: entry.priority,
+                }),
+                _ => None,
+            })
+            .collect();
+        let segments = flatten(bounds, &marks);
+
+        // 没有 Mark 盖着的那些段落到这个 id 上。它排在 extension 的 id 之后，
+        // 所以不会与任何一个撞号。
+        let mut styles = decorations.styles().to_vec();
+        let plain = StyleId(u32::try_from(styles.len()).map_err(|_| LayoutError::OffsetOverflow)?);
+        styles.push(TextAttrs::new(TextStyle::Plain));
+
+        let mut text = String::new();
+        let mut runs: Vec<StyledRun> = Vec::new();
+        for (segment, style) in segments {
+            let style = style.unwrap_or(plain);
+            // 一段样式可能被隐藏区间切成好几截。
+            for (from, to) in visible_pieces(segment, &hidden) {
+                let piece = TextRange::new(ByteOffset::new(from), ByteOffset::new(to))
+                    .ok_or(LayoutError::OffsetOverflow)?;
+                let start =
+                    VisualOffset::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
+                text.push_str(&read_source(source, piece)?);
+                let end =
+                    VisualOffset::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
+                if start == end {
+                    continue;
+                }
+                let visual = yu_projection::VisualRange::new(start, end)
+                    .ok_or(LayoutError::OffsetOverflow)?;
+                // 相邻同样式合成一段：布局那边少一次换字型，差分也不会因为
+                // 「隐藏区间把它切成几截」而假红。
+                match runs.last_mut() {
+                    Some(last) if last.style() == style && last.visual().end() == start => {
+                        *last = StyledRun::new(
+                            yu_projection::VisualRange::new(last.visual().start(), end)
+                                .ok_or(LayoutError::OffsetOverflow)?,
+                            style,
+                        );
+                    }
+                    _ => runs.push(StyledRun::new(visual, style)),
+                }
+            }
+        }
+
+        let mut heading = None;
+        let mut quote = None;
+        let mut marker = None;
+        for (_, ornament) in decorations.line_ornaments() {
+            match ornament {
+                BlockOrnament::Heading { level } => heading = Some(*level),
+                BlockOrnament::QuoteBar { depth } => quote = Some(*depth),
+                BlockOrnament::Marker(found) => {
+                    marker = Some(MarkerOrnamentSource {
+                        source: found.source(),
+                        text: found.text().to_owned(),
+                        indent: found.indent(),
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            text,
+            runs,
+            styles,
+            source_range: bounds,
+            heading,
+            quote,
+            marker,
+        })
+    }
+
+    fn assemble(
+        self,
+        config: LayoutConfig,
+        marker: Option<MarkerDraft>,
+    ) -> Result<BlockLayoutInput, LayoutError> {
+        let heading = self.heading.map(heading_metrics).transpose()?;
+        let quote = self
+            .quote
+            .map(|depth| block_quote_metrics(depth, config))
+            .transpose()?;
+
+        let quote_gutter = quote.map_or(0.0, |quote| quote.gutter);
+        let marker_gutter = marker.as_ref().map_or(0.0, |marker| {
+            marker.advance + config.default_advance() * (f32::from(marker.indent) + 1.0)
+        });
+        let indent = quote_gutter + marker_gutter;
+
+        let visual_len =
+            VisualOffset::try_from(self.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
+        let visual = yu_projection::VisualRange::new(VisualOffset::ZERO, visual_len).ok_or(
+            LayoutError::InvalidConfig("visual text length must be a valid range"),
+        )?;
+
+        // 标题的字号倍率盖在**整张表**上，而不是让 heading extension 产一条
+        // 覆盖全块的 `Strong` Mark。理由是分层：「几级标题」是语义，归
+        // `yu-markdown`；「1.7 倍字号、排粗体」是呈现，只有这一层有
+        // `LayoutConfig` 说得出来。v1 的 `HeadingClusterMetrics` 也是在这一
+        // 层把字型整个丢掉，一律按 `Strong` 量。
+        let font_scale = heading.map_or(1.0, |heading| heading.font_scale);
+        let mut attrs = Vec::with_capacity(self.styles.len());
+        for base in self.styles {
+            let style = if heading.is_some() {
+                TextStyle::Strong
+            } else {
+                base.style()
+            };
+            attrs.push(
+                TextAttrs::new(style)
+                    .with_size_scale(font_scale)
+                    .ok_or(LayoutError::InvalidMetrics(font_scale.to_bits()))?,
+            );
+        }
+
+        Ok(BlockLayoutInput {
+            text: self.text,
+            runs: self.runs,
+            lines: vec![LineSpan::new(visual, BLOCK_LINE_STYLE)],
+            styles: BlockStyleTable { attrs },
+            line_styles: BlockLineStyleTable {
+                attrs: LineAttrs::new(
+                    indent,
+                    heading.map_or(1.0, |heading| heading.line_height_scale),
+                )?,
+            },
+            ornaments: BlockOrnaments {
+                heading: heading.map(|heading| HeadingOrnament {
+                    source: self.source_range,
+                    level: heading.level,
+                    font_scale: heading.font_scale,
+                    line_height_scale: heading.line_height_scale,
+                }),
+                marker: marker.map(|marker| MarkerOrnament {
+                    source: marker.source,
+                    text: marker.text,
+                    x: quote_gutter + f32::from(marker.indent) * config.default_advance(),
+                    advance: marker.advance,
+                    shaped: marker.shaped,
+                }),
+                quote: quote.map(|quote| BlockQuoteOrnament {
+                    source: self.source_range,
+                    depth: quote.depth,
+                    unit: quote.unit,
+                    bar_width: quote.bar_width,
+                }),
+            },
+        })
+    }
+}
+
+/// `segment` 去掉 `hidden` 之后剩下的可见片段，升序。
+///
+/// `hidden` 只需要按起点升序，**不需要**不重叠：`cursor.max(to)` 会把重叠
+/// 与包含都吃掉。多个 extension 盖在同一段 source 上是允许的，所以这一条
+/// 不是巧合，是这里必须成立的性质。
+fn visible_pieces(segment: TextRange, hidden: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let (mut cursor, end) = (segment.start().get(), segment.end().get());
+    let mut pieces = Vec::new();
+    for &(from, to) in hidden {
+        if to <= cursor {
+            continue;
+        }
+        if from >= end {
+            break;
+        }
+        if from > cursor {
+            pieces.push((cursor, from.min(end)));
+        }
+        cursor = cursor.max(to);
+        if cursor >= end {
+            return pieces;
+        }
+    }
+    if cursor < end {
+        pieces.push((cursor, end));
+    }
+    pieces
+}
+
+fn read_source(source: &TextSnapshot, range: TextRange) -> Result<String, LayoutError> {
+    let start = usize::try_from(range.start()).map_err(|_| LayoutError::OffsetOverflow)?;
+    let end = usize::try_from(range.end()).map_err(|_| LayoutError::OffsetOverflow)?;
+    let mut text = String::with_capacity(end.saturating_sub(start));
+    let chunks = source
+        .chunk_cursor(range.start())
+        .map_err(|error| LayoutError::Upstream(error.to_string()))?;
+    for chunk in chunks {
+        let chunk_start =
+            usize::try_from(chunk.start()).map_err(|_| LayoutError::OffsetOverflow)?;
+        if chunk_start >= end {
+            break;
+        }
+        let chunk_end = chunk_start.saturating_add(chunk.text().len());
+        let local_start = start.max(chunk_start).saturating_sub(chunk_start);
+        let local_end = end.min(chunk_end).saturating_sub(chunk_start);
+        if local_start < local_end {
+            text.push_str(&chunk.text()[local_start..local_end]);
+        }
+    }
+    Ok(text)
 }
 
 #[cfg(test)]

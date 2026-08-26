@@ -970,14 +970,57 @@ D6 禁止的相互感知。
 所以任务这一种语法的块类型与标记范围只能来自 `block_sequence`。这是 extension
 层里仅剩的一处 v1 依赖。
 
+#### 第二刀：`BlockLayoutInput` 多一条从 `DecorationSet` 派生的路
+
+`BlockLayoutInput::from_decorations` 与原有的 `derive(&Projection)` 并存，靠
+`crates/yu-editor/tests/blockinput_differential.rs` 守着。28 份语料里 **20 份
+两条路逐项完全一致**（视觉文本、样式段连同解析出来的 `TextAttrs`、行级几何、
+三种装饰），8 条登记差异全部是第一刀那批 v1 bug 在这一层的表现，加上表格。
+
+**这张登记表就是下一刀的验收清单。** S5 那种「前后截图只应有零处不同」在换源
+那一刀不成立——画面**本来就该**变，变的正是这 8 处。先把清单钉住，再去看窗口，
+才分得清哪些是修复、哪些是回归。
+
+**差分里哪两条路真的分开了。** 分开的是派生：视觉文本怎么拼、哪些字节进得去、
+每一段排什么字型。不分开的是几何算术——`heading_metrics` /
+`block_quote_metrics` / `measure_marker_parts` 两条路**共用同一批函数**。那是
+有意的：比对「2.0 倍字号抄了两遍还相等」什么都证明不了。
+
+**标题的字号倍率由装配层盖在整张样式表上**，不让 heading extension 产一条覆盖
+全块的 `Strong` Mark。理由是分层：「几级标题」是语义，归 `yu-markdown`；
+「1.7 倍、排粗体」是呈现，只有这一层有 `LayoutConfig` 说得出来。产 Mark 也能
+工作，但那等于把呈现决定塞回刚划清界限的那一层。
+
+**重叠的 `Mark` 压平成不重叠的 `StyledRun`**（`yu-editor/src/marks.rs`）：
+优先级高的赢，同级窄的赢，再同就按 `StyleId` 定序。第三条不是为了「对」，
+是为了**确定**——结果不能取决于哪个 extension 先跑（D6）。「窄的赢」就是 v1
+`style_for` 的「取最内层」，也是 link/image 那句「正文显式排 `Plain`」之所以
+有效的原因。
+
+- **变异验证 12 个，2 个活下来，都是等价变异。** 一个（`flatten` 的平局回退
+  顺序）本来就被 `StyleId` 定序压死了；另一个（预先合并隐藏区间）是**死代码**
+  ——`visible_pieces` 里的 `cursor.max(to)` 早就把重叠吃掉了。后者直接删掉，
+  没有当成「等价」留着；那条性质补了一条用例单独压着。
+
 #### 还没做的
 
-- **消费者没换。** `BlockLayoutInput::derive` 仍然吃 `Projection`。压平重叠
-  `Mark`（优先级高的赢、同级窄的赢）、把 `BlockOrnament` 翻成几何，都在那一刀。
-- **表格没有 extension**，`extension_parity.rs` 里按 `Pending` 登记着一条。
+- **消费者没换。** `EditorDocument` 仍然缓存 `Projection`，`BlockView` 仍然向
+  它问源码区间。换源要连 `BlockView::map_through` / `caret_for_source` 一起换成
+  `DecorationSet` 的双向映射（D4）。
+- **语法树该由谁持有还没定。** 现在测试自己 `yu_syntax::parse` 一遍，
+  `yu-editor` 为此挂了一条临时 dev-dep。产品链路上它要么进
+  `MarkdownDocument`（一次解析一份缓存，但 `yu-export` 这类不需要装饰的调用方
+  也要付钱），要么进 `EditorDocument` 的缓存。
+- **表格没有 extension**，两条差分里各按 `Pending` 登记着一条。
+- **`block_sequence` 与语法树的块结构还没合并。** 三个症状同一个根因：task 的
+  `[ ]` 只能靠 `block_sequence` 认（树里没有节点）、`- [x]` 会被解析成一个
+  shortcut `Link`、Setext 标题两边都不认（`标题\n===` 在块序列里是两个块，
+  在树里是一个 `SetextHeading1`）。GFM 的 TaskList 进 `yu-syntax` 能一次解决
+  前两个，第三个要块身份两边一致。**这该是独立的一刀**，混进换源会让差分归因
+  不了「是装配错了还是解析变了」。
 - **`decorations.rs`（S4 的那一小块）与 `decoration_parity.rs` 原样留着。**
-  它们证明过的事已经被这一刀覆盖，但它们的语料比新差分大，删除要等消费者换完
-  之后一起做。
+  它们证明过的事已经被第一刀覆盖，但语料比新差分大，删除要等消费者换完之后
+  一起做。
 
 ### S7 · 产品面
 
