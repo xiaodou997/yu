@@ -24,8 +24,9 @@
 //! 的表；那件事由 `yu-markdown` 自己的用例压。
 //!
 //! 登记表是紧的：未登记的文档必须逐字节一致，已登记的文档必须**精确**等于
-//! 登记值。后一条守的是「差异消失了但登记还留着」——表格 widget 化之后这条
-//! 测试会红，逼人把那一行删掉。口径与 `docs/specs/invariants.md` F 节一致。
+//! 登记值。后一条守的是「差异消失了但登记还留着」——表格 extension 落地时
+//! 它正是这么把 `Pending` 那一行逼出来的。口径与 `docs/specs/invariants.md`
+//! F 节一致。
 //!
 //! 这条测试随 `yu-projection` 一起消失。
 
@@ -35,13 +36,12 @@ use yu_projection::{BlockProjection, VisualRunKind};
 use yu_syntax::parse as parse_syntax;
 use yu_text::TextBuffer;
 
-/// 差异的归属。两类里没有「extension 错」——一条都没有。
+/// 差异的归属。只剩一类——「extension 错」一条都没有，「还没做的语法」也
+/// 随表格 extension 落地清空了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cause {
     /// v1 错，extension 对。删掉 v1 时一起消失。
     ProjectionBug,
-    /// extension 还没做这种语法。做完之后这一行要删。
-    Pending,
 }
 
 struct Divergence {
@@ -136,15 +136,6 @@ const DIVERGENCES: &[Divergence] = &[
         cause: Cause::ProjectionBug,
         why: "autolink 内部不解析行内语法。v1 在 URL 里找到了一对 `*` 并隐藏，\
               于是地址少掉两个字符",
-    },
-    Divergence {
-        source: "a | b\n--- | ---\n1 | 2",
-        extension: &[],
-        projection: &[(1, 4), (5, 16), (17, 20)],
-        cause: Cause::Pending,
-        why: "表格还没有对应的 extension。第 3 节的对照表说它终局是一个 block \
-              widget，那要求被替代的 source 从视觉文本里消失——S5 的四个未做项\
-              之一",
     },
 ];
 
@@ -342,6 +333,5 @@ fn divergence_causes_stay_accounted_for() {
             .count()
     };
     assert_eq!(count(Cause::ProjectionBug), 11, "v1 判错的条数变了");
-    assert_eq!(count(Cause::Pending), 1, "还没做的语法条数变了");
-    assert_eq!(DIVERGENCES.len(), 12);
+    assert_eq!(DIVERGENCES.len(), 11);
 }

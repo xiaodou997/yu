@@ -34,8 +34,8 @@ pub use decorations::{
     inline_syntax_decoration_set, inline_syntax_decorations,
 };
 pub use extension::{
-    BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension, ExtensionError,
-    ExtensionOutput, ExtensionSet, MarkerOrnament, SyntaxNode, reveals,
+    BlockAnnotation, BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension,
+    ExtensionError, ExtensionOutput, ExtensionSet, MarkerOrnament, SyntaxNode, reveals,
 };
 pub use inline::{
     InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError,

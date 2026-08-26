@@ -48,6 +48,7 @@ use yu_text::TextSnapshot;
 use crate::block_line_ranges;
 use crate::block_sequence::Block;
 use crate::reference::read_range;
+use crate::table::TableBlock;
 
 mod code_span;
 mod emphasis;
@@ -59,6 +60,7 @@ mod link;
 mod list;
 mod quote;
 mod syntax;
+mod table;
 mod task;
 
 pub use syntax::{DelimitedSpan, SyntaxNode};
@@ -261,6 +263,11 @@ pub enum BlockOrnament {
     ///
     /// [`MarkerOrnament::source`]: crate::extension::MarkerOrnament::source
     Marker(MarkerOrnament),
+    /// GFM 表格的网格：哪几段 source 是哪一行哪一列。
+    ///
+    /// 它比另外三个大得多，因为表格的「长什么样」本身就是一张二维结构。
+    /// 列宽、对齐的像素位置仍然不在这里——那要 `LayoutConfig`。
+    Table(TableBlock),
 }
 
 /// 列表标记的替代呈现。
@@ -299,6 +306,38 @@ impl MarkerOrnament {
     }
 }
 
+/// 还没 widget 化的语法留给上一层的语义标注。
+///
+/// 第 3 节的对照表说图片终局是一个 block widget：那时它由
+/// [`Decoration::Widget`] 表达，被替代的 source 从视觉文本里消失，盒子尺寸
+/// 由 `WidgetRegistry` 给（§5.3）。在那之前 alt 文本仍然原样排在视觉文本
+/// 里，而画图片盒子的那一层需要知道「这一段是一张图、它的 alt 在哪」。
+///
+/// 那件事**装饰表达不了**：这里没有任何视觉效果被装饰改掉——不隐藏、不换
+/// 字型、不加行级样式。硬塞一条 [`Decoration::Widget`] 进去会让「这条装饰
+/// 改了什么」不再有统一答案（不变量 D1 说装饰是视觉表现的唯一来源，反过来
+/// 也意味着集合里的每一条都得真的改了点什么）。
+///
+/// 所以它单独走一条通道。表格不在这里——表格是块级的，走
+/// [`BlockOrnament::Table`]，因为 [`Decoration::Line`] 本来就是「作用于
+/// 整块」的那条。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockAnnotation {
+    /// 一张图片。`source` 是整段 `![替代](目标)`，`label` 是替代文字。
+    ///
+    /// 目标不复制，只给区间（不变量 A2 / C4）：解析资源是 workspace 那一层
+    /// 的事，它拿同一份 `TextSnapshot` 读回来。
+    Image {
+        source: TextRange,
+        label: TextRange,
+        /// 行内式 `![替代](目标)` 的目标。
+        destination: Option<TextRange>,
+        /// 引用式的标签。`destination` 有值时它一定是 `None`——同一张图不会
+        /// 既是行内式又是引用式。
+        reference: Option<TextRange>,
+    },
+}
+
 /// 一个 extension 的产出：一组装饰，加上它自己那份 id 表。
 ///
 /// id 是**局部**的，从 0 开始。合并时由 [`ExtensionSet`] 整体平移，
@@ -308,6 +347,7 @@ pub struct ExtensionOutput {
     ranges: Vec<DecorationRange>,
     styles: Vec<TextAttrs>,
     line_styles: Vec<BlockOrnament>,
+    annotations: Vec<BlockAnnotation>,
 }
 
 impl ExtensionOutput {
@@ -370,6 +410,11 @@ impl ExtensionOutput {
             .push(DecorationRange::new(range, Decoration::Line { style }));
     }
 
+    /// 记一条语义标注。它不进 [`DecorationSet`]，理由见 [`BlockAnnotation`]。
+    pub fn annotate(&mut self, annotation: BlockAnnotation) {
+        self.annotations.push(annotation);
+    }
+
     #[must_use]
     pub fn ranges(&self) -> &[DecorationRange] {
         &self.ranges
@@ -414,6 +459,7 @@ pub struct BlockDecorations {
     set: DecorationSet,
     styles: Vec<TextAttrs>,
     line_styles: Vec<BlockOrnament>,
+    annotations: Vec<BlockAnnotation>,
 }
 
 impl BlockDecorations {
@@ -467,6 +513,12 @@ impl BlockDecorations {
         &self.line_styles
     }
 
+    /// 这个块上的语义标注，按 extension 的注册顺序、每家内部按 source 顺序。
+    #[must_use]
+    pub fn annotations(&self) -> &[BlockAnnotation] {
+        &self.annotations
+    }
+
     /// 这个块上的全部行级装饰，按定序。
     #[must_use]
     pub fn line_ornaments(&self) -> Vec<(TextRange, &BlockOrnament)> {
@@ -491,6 +543,7 @@ impl fmt::Debug for BlockDecorations {
             .field("decorations", &self.set.all())
             .field("styles", &self.styles)
             .field("line_styles", &self.line_styles)
+            .field("annotations", &self.annotations)
             .finish()
     }
 }
@@ -542,6 +595,7 @@ impl ExtensionSet {
                 Box::new(list::List),
                 Box::new(task::Task),
                 Box::new(fenced_code::FencedCode),
+                Box::new(table::Table),
                 Box::new(emphasis::Emphasis),
                 Box::new(code_span::CodeSpan),
                 Box::new(link::Link),
@@ -606,10 +660,14 @@ impl ExtensionSet {
         let mut sets = Vec::with_capacity(self.extensions.len());
         let mut styles = Vec::new();
         let mut line_styles = Vec::new();
+        let mut annotations = Vec::new();
         let bounds = block.range();
         for extension in &self.extensions {
             let mut out = ExtensionOutput::default();
             extension.decorate(&cx, &mut out);
+            // 标注在装饰之前收：一个只产标注、不产装饰的 extension 下面那句
+            // `continue` 会把它整个跳过。
+            annotations.append(&mut out.annotations);
             // 兜底：装饰不得越出这个块。`BlockContext::nodes` 已经把块外的
             // 节点滤掉了，所以正常情况下这里一条都不该滤掉；留着它是因为
             // extension 也可以自己造区间（列表标记就是），而越界的后果是
@@ -637,6 +695,7 @@ impl ExtensionSet {
             set,
             styles,
             line_styles,
+            annotations,
         })
     }
 }
