@@ -9,7 +9,7 @@
 use yu_core::{TextAttrs, TextStyle};
 use yu_syntax::NodeKind;
 
-use super::{BlockContext, Extension, ExtensionOutput};
+use super::{BlockContext, BlockOrnament, Extension, ExtensionOutput};
 use yu_core::TextRange;
 
 pub struct FencedCode;
@@ -55,11 +55,26 @@ impl Extension for FencedCode {
         //
         // 未闭合的围栏没有收尾行；只有一个标记时它就是开围栏，不能再算一次
         // 收尾，否则同一段 source 被隐藏两遍。
-        if let Some(closing) = marks.last()
+        let content_end = if let Some(closing) = marks.last()
             && closing.range() != opening.range()
             && let Some(suffix) = TextRange::new(closing.range().start(), cx.range().end())
         {
             out.replace(suffix);
+            closing.range().start()
+        } else {
+            cx.range().end()
+        };
+
+        // 语言名与正文的区间。隐藏区间说得出「围栏那两行不进视觉文本」，
+        // 说不出「哪一段是语言名」——而 KaTeX / Mermaid 那条路要按语言名
+        // 决定这个块渲染成什么。
+        let info = node
+            .children()
+            .find(|child| child.kind() == NodeKind::CodeInfo)
+            .map_or_else(|| TextRange::empty(content_start), |child| child.range());
+        if let Some(content) = TextRange::new(content_start, content_end.max(content_start)) {
+            let style = out.line_style(BlockOrnament::FencedCode { info, content });
+            out.line(cx.range(), style);
         }
     }
 }

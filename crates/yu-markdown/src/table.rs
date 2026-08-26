@@ -287,6 +287,47 @@ impl TableBlock {
         }
     }
 
+    /// 整张表平移 `delta` 个字节。
+    ///
+    /// 一次落在表格**之外**的编辑会让表内每一个偏移挪同样多——所有偏移都
+    /// 在每一处改动的同一侧，所以平移量是个常量。逐个区间去问锚点也对，
+    /// 只是把一个常量算了几十遍。落到负数或溢出时返回 `None`：那说明「编辑
+    /// 在表格之外」这个前提不成立，宁可让调用方重建。
+    #[must_use]
+    pub fn shifted(self, delta: i64) -> Option<Self> {
+        let cell = |range: TableCellRange| -> Option<TableCellRange> {
+            Some(TableCellRange::new(
+                shift(range.start(), delta)?,
+                shift(range.end(), delta)?,
+            ))
+        };
+        let cells = |ranges: &[TableCellRange]| -> Option<Vec<TableCellRange>> {
+            ranges.iter().copied().map(cell).collect()
+        };
+        Some(Self {
+            source_range: cell(self.source_range)?,
+            header: cells(&self.header)?,
+            delimiter: cells(&self.delimiter)?,
+            alignments: self.alignments,
+            rows: self
+                .rows
+                .iter()
+                .map(|row| cells(row))
+                .collect::<Option<Vec<_>>>()?,
+            row_ranges: self
+                .row_ranges
+                .iter()
+                .copied()
+                .map(|range| {
+                    Some(TableRowRange::new(
+                        shift(range.start(), delta)?,
+                        shift(range.end(), delta)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        })
+    }
+
     /// Rebuilds table metadata after a source-only range mapping.  The
     /// projection crate uses this to retain table identity across edits that
     /// occur before the table; cell text is still never copied here.
@@ -523,6 +564,11 @@ fn parse_alignment(source: &str, cell: TableCellRange) -> Option<TableAlignment>
         (false, true) => TableAlignment::Right,
         (false, false) => TableAlignment::Default,
     })
+}
+
+/// 一个字节偏移平移 `delta`。越界返回 `None`。
+fn shift(offset: usize, delta: i64) -> Option<usize> {
+    usize::try_from(i64::try_from(offset).ok()?.checked_add(delta)?).ok()
 }
 
 #[cfg(test)]

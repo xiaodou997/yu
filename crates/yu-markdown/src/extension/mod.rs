@@ -268,6 +268,37 @@ pub enum BlockOrnament {
     /// 它比另外三个大得多，因为表格的「长什么样」本身就是一张二维结构。
     /// 列宽、对齐的像素位置仍然不在这里——那要 `LayoutConfig`。
     Table(TableBlock),
+    /// 围栏代码块的两段：语言名与正文。
+    ///
+    /// 隐藏区间已经说了「围栏那两行不进视觉文本」，但没说**哪一段是语言
+    /// 名**。KaTeX / Mermaid 那条路要按语言名决定这个块渲染成什么，光看
+    /// 隐藏区间答不上来。围栏的字符与闭合与否由 `BlockKind` 带着，不重复。
+    FencedCode {
+        /// ```` ```rust ```` 里的 `rust`。没有语言名时是一段空区间。
+        info: TextRange,
+        /// 围栏之间的正文。
+        content: TextRange,
+    },
+}
+
+impl BlockOrnament {
+    /// 整条装饰平移 `delta` 个字节。越界返回 `None`。
+    #[must_use]
+    fn shifted(self, delta: i64) -> Option<Self> {
+        Some(match self {
+            Self::Heading { level } => Self::Heading { level },
+            Self::QuoteBar { depth } => Self::QuoteBar { depth },
+            Self::Marker(marker) => Self::Marker(MarkerOrnament {
+                source: shift_range(marker.source, delta)?,
+                ..marker
+            }),
+            Self::Table(table) => Self::Table(table.shifted(delta)?),
+            Self::FencedCode { info, content } => Self::FencedCode {
+                info: shift_range(info, delta)?,
+                content: shift_range(content, delta)?,
+            },
+        })
+    }
 }
 
 /// 列表标记的替代呈现。
@@ -321,21 +352,108 @@ impl MarkerOrnament {
 /// 所以它单独走一条通道。表格不在这里——表格是块级的，走
 /// [`BlockOrnament::Table`]，因为 [`Decoration::Line`] 本来就是「作用于
 /// 整块」的那条。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockAnnotation {
-    /// 一张图片。`source` 是整段 `![替代](目标)`，`label` 是替代文字。
-    ///
-    /// 目标不复制，只给区间（不变量 A2 / C4）：解析资源是 workspace 那一层
-    /// 的事，它拿同一份 `TextSnapshot` 读回来。
-    Image {
+    /// 一张图片。
+    Image(ImageSpan),
+}
+
+/// 一张图片在源码里的四段区间。
+///
+/// 目标不复制，只给区间（不变量 A2 / C4）：解析资源是 workspace 那一层的
+/// 事，它拿同一份 `TextSnapshot` 读回来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageSpan {
+    source: TextRange,
+    label: TextRange,
+    destination: Option<TextRange>,
+    reference: Option<TextRange>,
+}
+
+impl ImageSpan {
+    #[must_use]
+    pub const fn new(
         source: TextRange,
         label: TextRange,
-        /// 行内式 `![替代](目标)` 的目标。
         destination: Option<TextRange>,
-        /// 引用式的标签。`destination` 有值时它一定是 `None`——同一张图不会
-        /// 既是行内式又是引用式。
         reference: Option<TextRange>,
-    },
+    ) -> Self {
+        Self {
+            source,
+            label,
+            destination,
+            reference,
+        }
+    }
+
+    /// 整段 `![替代](目标)`。
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    /// 替代文字。图片盒子画在它上面。
+    #[must_use]
+    pub const fn label(self) -> TextRange {
+        self.label
+    }
+
+    /// 行内式的目标。引用式是 `None`。
+    #[must_use]
+    pub const fn destination(self) -> Option<TextRange> {
+        self.destination
+    }
+
+    /// 引用式的标签。`destination` 有值时一定是 `None`——同一张图不会既是
+    /// 行内式又是引用式。
+    #[must_use]
+    pub const fn reference(self) -> Option<TextRange> {
+        self.reference
+    }
+
+    #[must_use]
+    pub const fn is_reference(self) -> bool {
+        self.reference.is_some()
+    }
+
+    /// 整段平移 `delta` 个字节。越界返回 `None`。
+    #[must_use]
+    fn shifted(self, delta: i64) -> Option<Self> {
+        Some(Self {
+            source: shift_range(self.source, delta)?,
+            label: shift_range(self.label, delta)?,
+            destination: shift_optional(self.destination, delta)?,
+            reference: shift_optional(self.reference, delta)?,
+        })
+    }
+}
+
+impl BlockAnnotation {
+    /// 整条标注平移 `delta` 个字节。越界返回 `None`。
+    #[must_use]
+    fn shifted(self, delta: i64) -> Option<Self> {
+        let Self::Image(image) = self;
+        image.shifted(delta).map(Self::Image)
+    }
+}
+
+/// 一段可选区间平移 `delta`。`None` 平移之后还是 `None`，越界才失败——所以
+/// 返回的是 `Option<Option<..>>` 展平之后的语义：外层 `None` 是失败。
+fn shift_optional(range: Option<TextRange>, delta: i64) -> Option<Option<TextRange>> {
+    match range {
+        Some(range) => shift_range(range, delta).map(Some),
+        None => Some(None),
+    }
+}
+
+/// 一段区间平移 `delta` 个字节。落到负数或溢出返回 `None`。
+fn shift_range(range: TextRange, delta: i64) -> Option<TextRange> {
+    let shift = |offset: ByteOffset| -> Option<ByteOffset> {
+        u64::try_from(i64::try_from(offset.get()).ok()?.checked_add(delta)?)
+            .ok()
+            .map(ByteOffset::new)
+    };
+    TextRange::new(shift(range.start())?, shift(range.end())?)
 }
 
 /// 一个 extension 的产出：一组装饰，加上它自己那份 id 表。
@@ -519,6 +637,55 @@ impl BlockDecorations {
         &self.annotations
     }
 
+    /// 整份装饰平移 `delta` 个字节，绑到 `revision` 这一版源码上。
+    ///
+    /// 只在编辑落在这个块**之外**时成立：那时块内每一个偏移都在每一处改动
+    /// 的同一侧，平移量是个常量。判断「编辑在不在块外」是 `yu-editor` 的事
+    /// ——它知道块的边界，也知道碰到边界就得重新产装饰。两处都判会分叉。
+    ///
+    /// # Errors
+    ///
+    /// 平移之后有区间落到负数或越过新的文档长度。
+    pub fn shifted(
+        &self,
+        delta: i64,
+        revision: Revision,
+        source_len: ByteOffset,
+    ) -> Result<Self, ExtensionError> {
+        let ranges = self
+            .set
+            .all()
+            .iter()
+            .map(|entry| {
+                Some(DecorationRange {
+                    range: shift_range(entry.range, delta)?,
+                    decoration: entry.decoration,
+                    priority: entry.priority,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ExtensionError::ShiftOutOfBounds)?;
+        Ok(Self {
+            range: shift_range(self.range, delta).ok_or(ExtensionError::ShiftOutOfBounds)?,
+            set: DecorationSet::new(revision, source_len, ranges),
+            styles: self.styles.clone(),
+            line_styles: self
+                .line_styles
+                .iter()
+                .cloned()
+                .map(|ornament| ornament.shifted(delta))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(ExtensionError::ShiftOutOfBounds)?,
+            annotations: self
+                .annotations
+                .iter()
+                .copied()
+                .map(|annotation| annotation.shifted(delta))
+                .collect::<Option<Vec<_>>>()
+                .ok_or(ExtensionError::ShiftOutOfBounds)?,
+        })
+    }
+
     /// 这个块上的全部行级装饰，按定序。
     #[must_use]
     pub fn line_ornaments(&self) -> Vec<(TextRange, &BlockOrnament)> {
@@ -555,6 +722,8 @@ pub enum ExtensionError {
     Merge(MergeError),
     /// id 空间溢出。一个块上的样式数量本来就该是个位数。
     IdOverflow,
+    /// 平移之后有区间落到了负数或越界。说明「编辑在块外」的前提不成立。
+    ShiftOutOfBounds,
 }
 
 impl fmt::Display for ExtensionError {
@@ -562,6 +731,7 @@ impl fmt::Display for ExtensionError {
         match self {
             Self::Merge(error) => write!(formatter, "装饰集合合并失败：{error}"),
             Self::IdOverflow => formatter.write_str("一个块上的样式 id 溢出"),
+            Self::ShiftOutOfBounds => formatter.write_str("装饰平移之后越界"),
         }
     }
 }

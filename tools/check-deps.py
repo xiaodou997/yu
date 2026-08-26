@@ -83,6 +83,10 @@ ALLOWED: dict[str, set[str]] = {
         "yu-markdown",
         "yu-projection",
         "yu-state",
+        # 语法树按 Revision 缓存在 EditorDocument 里（yu-editor/src/decorations.rs
+        # 的模块文档写了为什么不放 MarkdownDocument）。S6 换消费者那一刀之前
+        # 这条边只是一条 dev-dependency，现在它在产品链路上。
+        "yu-syntax",
         "yu-text",
     },
     "yu-export": {"yu-core", "yu-markdown", "yu-text"},
@@ -167,11 +171,6 @@ ALLOWED_DEV: dict[str, set[str]] = {
     # 用例住在 yu-projection 而不是 yu-markdown，因为断言的主体是 v1 的行为，
     # 而 v1 就在这里；这两条边都随 yu-projection 一起消失。
     "yu-projection": {"yu-decoration", "yu-syntax"},
-    # 临时：tests/blockinput_differential.rs 要自己解析出一棵 Tree 喂给
-    # `ExtensionSet::decorate`。产品链路里这棵树该由谁持有还没定（见
-    # yu-editor/Cargo.toml 的注释），定下来之后这条边要么消失、要么升成
-    # 产品依赖。
-    "yu-editor": {"yu-syntax"},
 }
 
 

@@ -75,7 +75,9 @@ pub struct DecorationSet {
     source_len: ByteOffset,
     /// 按 [`DecorationRange::order_key`] 定序。区间查询在它上面二分。
     ranges: Arc<[DecorationRange]>,
-    /// 由 `ranges` 里会隐藏 source 的那些派生出来的映射索引。
+    /// 会隐藏 source 的那些装饰合并之后的区间：升序、不重叠、不相邻。
+    hidden_spans: Arc<[(ByteOffset, ByteOffset)]>,
+    /// 由 `hidden_spans` 建出来的映射索引。
     hidden: HiddenIndex,
 }
 
@@ -102,6 +104,10 @@ impl DecorationSet {
             revision,
             source_len,
             ranges: ranges.into(),
+            hidden_spans: hidden
+                .iter()
+                .map(|&(from, to)| (ByteOffset::new(from), ByteOffset::new(to)))
+                .collect(),
             hidden: index,
         }
     }
@@ -179,6 +185,17 @@ impl DecorationSet {
     #[must_use]
     pub fn all(&self) -> &[DecorationRange] {
         &self.ranges
+    }
+
+    /// 被藏起来的 source 区间，升序、不重叠、不相邻。
+    ///
+    /// 这是**映射索引的原料**，不是另算一遍：`source_to_visual` 的那棵树
+    /// 就建在这份数据上。想拼出视觉文本的调用方（`yu-editor::VisualText`）
+    /// 必须用它，自己再遍历一遍 [`DecorationSet::all`] 去数「哪些字节被
+    /// 藏了」就是第二个实现——不变量 D4 说那件事只能有一个实现。
+    #[must_use]
+    pub fn hidden_spans(&self) -> &[(ByteOffset, ByteOffset)] {
+        &self.hidden_spans
     }
 
     /// 与 `from..=to` 相接或相交的装饰，按定序返回。

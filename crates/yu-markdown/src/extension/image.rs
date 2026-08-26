@@ -7,7 +7,9 @@ use yu_core::{TextAttrs, TextRange, TextStyle};
 use yu_syntax::NodeKind;
 
 use super::SyntaxNode;
-use super::{BlockAnnotation, BlockContext, DelimitedSpan, Extension, ExtensionOutput, reveals};
+use super::{
+    BlockAnnotation, BlockContext, DelimitedSpan, Extension, ExtensionOutput, ImageSpan, reveals,
+};
 
 pub struct Image;
 
@@ -35,16 +37,17 @@ impl Extension for Image {
             // 一张图」。装饰说不出这句话——上面三条改的是字型与可见性，
             // 没有一条是「这里有张图」。理由见 `BlockAnnotation`。
             let destination = child_range(node, NodeKind::Url);
-            out.annotate(BlockAnnotation::Image {
-                source: node.range(),
-                label: span.content,
+            // 引用式的标签：`![替代][引用]` 取 `LinkLabel`，shortcut
+            // `![替代]` 没有 `LinkLabel`，标签就是替代文字本身。
+            let reference = destination
+                .is_none()
+                .then(|| child_range(node, NodeKind::LinkLabel).unwrap_or(span.content));
+            out.annotate(BlockAnnotation::Image(ImageSpan::new(
+                node.range(),
+                span.content,
                 destination,
-                // 引用式的标签：`![替代][引用]` 取 `LinkLabel`，shortcut
-                // `![替代]` 没有 `LinkLabel`，标签就是替代文字本身。
-                reference: destination
-                    .is_none()
-                    .then(|| child_range(node, NodeKind::LinkLabel).unwrap_or(span.content)),
-            });
+                reference,
+            )));
         }
     }
 }

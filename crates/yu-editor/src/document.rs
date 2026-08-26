@@ -15,19 +15,21 @@ use yu_text::{
 };
 
 use crate::{
-    BlockProjection, CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay,
-    EditorCommand, EditorSelection, ImageSource, KeyEvent, KeyRouteResult, LayoutBackend,
-    LayoutCache, LayoutCacheStats, LayoutPoint, Projection, ProjectionCache, ProjectionCacheStats,
-    ProjectionError, SelectionError, SourceChange, ViewportCaret, ViewportConfig, ViewportError,
-    ViewportLayout, ViewportSnapshot, ViewportSpan, ViewportStats,
+    CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay, DecorationCache,
+    DecorationCacheStats, DecorationError, EditorCommand, EditorSelection, KeyEvent,
+    KeyRouteResult, LayoutBackend, LayoutCache, LayoutCacheStats, LayoutPoint, SelectionError,
+    SourceChange, ViewportCaret, ViewportConfig, ViewportError, ViewportLayout, ViewportSnapshot,
+    ViewportSpan, ViewportStats, VisualText, VisualTextError,
     command::{
         next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
         previous_word_boundary,
     },
+    decorations::hidden_bytes,
     keymap::command_for_key,
     list::ListLinePrefix,
 };
-use yu_projection::ProjectionBias;
+use yu_decoration::Bias;
+use yu_markdown::{BlockAnnotation, BlockDecorations, ImageSpan};
 
 /// The canonical source and transient composition state owned by one editor.
 ///
@@ -43,7 +45,7 @@ pub struct EditorDocument {
     preferred_x: Option<PreferredCaretX>,
     last_source_change: Option<SourceChange>,
     history: EditorHistory,
-    projections: ProjectionCache,
+    decorations: DecorationCache,
     layouts: LayoutCache,
     viewport: ViewportLayout,
 }
@@ -69,7 +71,7 @@ impl EditorDocument {
             preferred_x: None,
             last_source_change: None,
             history: EditorHistory::default(),
-            projections: ProjectionCache::default(),
+            decorations: DecorationCache::default(),
             layouts: LayoutCache::default(),
             viewport: ViewportLayout::default(),
         }
@@ -112,121 +114,136 @@ impl EditorDocument {
         self.history.stats()
     }
 
-    /// Returns the source-backed projection for a range in the current
-    /// revision, building it on first use and reusing it on later queries.
-    pub fn projection(&mut self, range: TextRange) -> Result<&Projection, EditorDocumentError> {
-        let snapshot = self.snapshot();
-        self.projections
-            .get_or_build_with_definitions(&snapshot, range, self.markdown.reference_definitions())
-            .map_err(EditorDocumentError::Projection)
+    /// 整篇文档的视觉字节流：装饰应用之后长什么样，以及它到源码的映射。
+    ///
+    /// 这是 v2 里「一份文档一份 `DecorationSet`」那个东西的兑现处。原生
+    /// 镜像与 IME 用它把源码坐标换成视觉坐标。
+    ///
+    /// # Errors
+    ///
+    /// 解析或装饰产出失败。
+    pub fn visual_text(&mut self) -> Result<VisualText, EditorDocumentError> {
+        self.visual_text_with_reveal(None)
     }
 
-    /// Builds a transient full/range projection using the current source
-    /// selection as an inline-syntax reveal context. Selection changes do not
-    /// advance Revision, so this result deliberately bypasses the canonical
-    /// projection cache.
-    pub fn projection_with_selection_reveal(
-        &self,
-        range: TextRange,
-    ) -> Result<Projection, EditorDocumentError> {
+    /// 带「光标碰到语法就露出来」的那一份。
+    ///
+    /// 选区变化不推进 Revision，所以这份产出有意绕过规范缓存。
+    /// composition 期间不露出——preedit 已经占着这一段的视觉状态了。
+    ///
+    /// # Errors
+    ///
+    /// 解析或装饰产出失败。
+    pub fn visual_text_for_visual_state(&mut self) -> Result<VisualText, EditorDocumentError> {
         if self.composition.is_some() {
-            return Projection::inline_with_definitions(
-                &self.snapshot(),
-                range,
-                self.markdown.reference_definitions(),
-            )
-            .map_err(EditorDocumentError::Projection);
+            return self.visual_text_with_reveal(None);
         }
         let active = self.selection_reveal_range();
-        Projection::inline_with_definitions_and_reveal(
-            &self.snapshot(),
-            range,
-            self.markdown.reference_definitions(),
-            active,
-        )
-        .map_err(EditorDocumentError::Projection)
+        self.visual_text_with_reveal(Some(active))
+    }
+
+    fn visual_text_with_reveal(
+        &mut self,
+        active: Option<TextRange>,
+    ) -> Result<VisualText, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
+            .ok_or(EditorDocumentError::Visual(VisualTextError::OffsetOverflow))?;
+        // 先把块序列取成一个 `Vec<Block>`：`document_set` 要
+        // `&mut self.decorations`，同时要读 `self.markdown`，而方法调用借的
+        // 是整个 `self`。`Block` 是 `Copy` 的小结构，这一份拷贝比克隆整个
+        // `MarkdownDocument` 便宜得多——后者每次查询都要复制一遍块存储。
+        let blocks: Vec<_> = self.markdown.blocks().iter().collect();
+        let set = self.decorations.document_set(&snapshot, &blocks, active)?;
+        Ok(VisualText::new(&snapshot, range, set)?)
     }
 
     #[must_use]
-    pub fn projection_cache_stats(&self) -> ProjectionCacheStats {
-        self.projections.stats()
+    pub fn decoration_cache_stats(&self) -> DecorationCacheStats {
+        self.decorations.stats()
     }
 
-    /// Returns the projection for one parser-owned Markdown block.
-    pub fn block_projection(
+    /// 一个块的规范装饰（无光标露出）。
+    ///
+    /// # Errors
+    ///
+    /// 块下标越界，或装饰产出失败。
+    pub fn block_decorations(
         &mut self,
         index: usize,
-    ) -> Result<&BlockProjection, EditorDocumentError> {
-        let block =
-            self.markdown
-                .blocks()
-                .get(index)
-                .ok_or(EditorDocumentError::BlockOutOfBounds {
-                    index,
-                    blocks: self.markdown.blocks().len(),
-                })?;
+    ) -> Result<&BlockDecorations, EditorDocumentError> {
+        let block = self.block_at(index)?;
         let snapshot = self.snapshot();
-        self.projections
-            .get_or_build_block_with_definitions(
-                &snapshot,
-                block,
-                self.markdown.reference_definitions(),
-            )
-            .map_err(EditorDocumentError::Projection)
+        Ok(self.decorations.get_or_build_block(&snapshot, block)?)
     }
 
-    /// Builds one selection-bound block projection without inserting it into
-    /// the Revision-only cache. Callers use this only for the focus block;
-    /// all other blocks continue to share canonical cached projections.
-    pub fn block_projection_with_selection_reveal(
-        &self,
+    /// 焦点块那一份：光标碰到的行内语法露出来。
+    ///
+    /// 有意**不**进缓存——移动光标不推进 Revision，进了缓存别的块也会看见
+    /// 一份只对焦点块成立的产出。
+    ///
+    /// # Errors
+    ///
+    /// 块下标越界，或装饰产出失败。
+    pub fn block_decorations_with_selection_reveal(
+        &mut self,
         index: usize,
-    ) -> Result<BlockProjection, EditorDocumentError> {
-        let block =
-            self.markdown
-                .blocks()
-                .get(index)
-                .ok_or(EditorDocumentError::BlockOutOfBounds {
-                    index,
-                    blocks: self.markdown.blocks().len(),
-                })?;
-        BlockProjection::from_block_with_definitions_and_reveal(
-            &self.snapshot(),
-            block,
-            self.markdown.reference_definitions(),
-            self.selection.ordered_range(),
-        )
-        .map_err(EditorDocumentError::Projection)
+    ) -> Result<BlockDecorations, EditorDocumentError> {
+        let block = self.block_at(index)?;
+        let snapshot = self.snapshot();
+        let active = self.selection.ordered_range();
+        Ok(self.decorations.decorate(&snapshot, block, Some(active))?)
     }
 
-    /// Returns the parser block whose inline syntax may be revealed by the
-    /// current selection focus. IME composition owns transient projection
-    /// state while active and therefore suppresses selection reveal.
+    /// 一个块的视觉字节流。
+    ///
+    /// # Errors
+    ///
+    /// 块下标越界，或装饰产出失败。
+    pub fn block_visual_text(&mut self, index: usize) -> Result<VisualText, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let decorations = self.block_decorations(index)?.clone();
+        Ok(VisualText::new(
+            &snapshot,
+            decorations.range(),
+            decorations.set().clone(),
+        )?)
+    }
+
+    fn block_at(&self, index: usize) -> Result<yu_markdown::Block, EditorDocumentError> {
+        self.markdown
+            .blocks()
+            .get(index)
+            .ok_or(EditorDocumentError::BlockOutOfBounds {
+                index,
+                blocks: self.markdown.blocks().len(),
+            })
+    }
+
+    /// 当前光标可能让哪个块露出行内语法。
+    ///
+    /// 判据是**露出来的那份藏得更少**。composition 期间没有露出：preedit
+    /// 已经占着这一段的视觉状态。
     #[must_use]
-    pub fn selection_reveal_block_index(&self) -> Option<usize> {
+    pub fn selection_reveal_block_index(&mut self) -> Option<usize> {
         if self.composition.is_some() {
             return None;
         }
         let index = self.block_index_for_source(self.selection.focus())?;
         let block = self.markdown.blocks().get(index)?;
         let snapshot = self.snapshot();
-        let canonical = BlockProjection::from_block_with_definitions(
-            &snapshot,
-            block,
-            self.markdown.reference_definitions(),
-        )
-        .ok()?;
-        let revealed = BlockProjection::from_block_with_definitions_and_reveal(
-            &snapshot,
-            block,
-            self.markdown.reference_definitions(),
-            self.selection.ordered_range(),
-        )
-        .ok()?;
-        (revealed.visual().visual_len() > canonical.visual().visual_len()).then_some(index)
+        let active = self.selection.ordered_range();
+        let canonical = hidden_bytes(self.decorations.get_or_build_block(&snapshot, block).ok()?);
+        let revealed = hidden_bytes(
+            &self
+                .decorations
+                .decorate(&snapshot, block, Some(active))
+                .ok()?,
+        );
+        (revealed < canonical).then_some(index)
     }
 
-    fn selection_reveal_range(&self) -> TextRange {
+    fn selection_reveal_range(&mut self) -> TextRange {
         let selection = self.selection.ordered_range();
         let Some(index) = self.selection_reveal_block_index() else {
             return TextRange::empty(self.selection.focus());
@@ -288,25 +305,15 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
     ) -> Result<&BlockView, EditorDocumentError> {
-        let block =
-            self.markdown
-                .blocks()
-                .get(index)
-                .ok_or(EditorDocumentError::BlockOutOfBounds {
-                    index,
-                    blocks: self.markdown.blocks().len(),
-                })?;
+        let block = self.block_at(index)?;
         let snapshot = self.snapshot();
-        let projection = self
-            .projections
-            .get_or_build_block_with_definitions(
-                &snapshot,
-                block,
-                self.markdown.reference_definitions(),
-            )
-            .map_err(EditorDocumentError::Projection)?;
+        let decorations = self
+            .decorations
+            .get_or_build_block(&snapshot, block)?
+            .clone();
+        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
         self.layouts
-            .get_or_build_block(&snapshot, block, config, projection)
+            .get_or_build_block(&snapshot, block, config, &visual, &decorations)
             .map_err(EditorDocumentError::Layout)
     }
 
@@ -321,38 +328,31 @@ impl EditorDocument {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<&BlockView, EditorDocumentError> {
-        let block =
-            self.markdown
-                .blocks()
-                .get(index)
-                .ok_or(EditorDocumentError::BlockOutOfBounds {
-                    index,
-                    blocks: self.markdown.blocks().len(),
-                })?;
+        let block = self.block_at(index)?;
         let snapshot = self.snapshot();
-        let projection = self
-            .projections
-            .get_or_build_block_with_definitions(
-                &snapshot,
-                block,
-                self.markdown.reference_definitions(),
-            )
-            .map_err(EditorDocumentError::Projection)?;
+        let decorations = self
+            .decorations
+            .get_or_build_block(&snapshot, block)?
+            .clone();
+        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
         self.layouts
-            .get_or_build_block_with_shaper(&snapshot, block, config, projection, shaper)
+            .get_or_build_block_with_shaper(&snapshot, block, config, &visual, &decorations, shaper)
             .map_err(EditorDocumentError::Layout)
     }
 
     /// Builds a transient metrics layout for the focus block's currently
     /// revealed inline syntax.
     pub fn block_layout_with_selection_reveal(
-        &self,
+        &mut self,
         index: usize,
         config: LayoutConfig,
     ) -> Result<BlockView, EditorDocumentError> {
-        let projection = self.block_projection_with_selection_reveal(index)?;
+        let snapshot = self.snapshot();
+        let decorations = self.block_decorations_with_selection_reveal(index)?;
+        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
         BlockView::build(
-            &projection,
+            &visual,
+            &decorations,
             config,
             &yu_layout::MonospaceMetrics::new(config.default_advance()),
         )
@@ -362,13 +362,16 @@ impl EditorDocument {
     /// Shaping-aware selection reveal layout. The result is intentionally
     /// transient because moving a caret does not change source Revision.
     pub fn block_layout_with_selection_reveal_and_shaper<S: ShapingProvider>(
-        &self,
+        &mut self,
         index: usize,
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<BlockView, EditorDocumentError> {
-        let projection = self.block_projection_with_selection_reveal(index)?;
-        BlockView::build_shaped(&projection, config, shaper).map_err(EditorDocumentError::Layout)
+        let snapshot = self.snapshot();
+        let decorations = self.block_decorations_with_selection_reveal(index)?;
+        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
+        BlockView::build_shaped(&visual, &decorations, config, shaper)
+            .map_err(EditorDocumentError::Layout)
     }
 
     /// Returns an owned layout for the current transient visual state.
@@ -479,9 +482,10 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
     ) -> Result<BlockView, EditorDocumentError> {
-        let projection = self.block_projection_for_composition(index)?;
+        let (visual, decorations) = self.block_visual_for_composition(index)?;
         BlockView::build(
-            &projection,
+            &visual,
+            &decorations,
             config,
             &yu_layout::MonospaceMetrics::new(config.default_advance()),
         )
@@ -496,35 +500,25 @@ impl EditorDocument {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<BlockView, EditorDocumentError> {
-        let projection = self.block_projection_for_composition(index)?;
-        BlockView::build_shaped(&projection, config, shaper).map_err(EditorDocumentError::Layout)
+        let (visual, decorations) = self.block_visual_for_composition(index)?;
+        BlockView::build_shaped(&visual, &decorations, config, shaper)
+            .map_err(EditorDocumentError::Layout)
     }
 
-    fn block_projection_for_composition(
+    /// 把 preedit 叠在这个块的规范投影上。
+    ///
+    /// 一段 marked text 可能横跨几个块。跨块时第一个块吃掉 preedit 的全部
+    /// 文字（从替换起点到块末），后面的块只是「这一段没了」——它们的替换
+    /// 文本是空的。装饰本身不动：preedit 不是装饰（不变量 H1）。
+    fn block_visual_for_composition(
         &mut self,
         index: usize,
-    ) -> Result<BlockProjection, EditorDocumentError> {
+    ) -> Result<(VisualText, BlockDecorations), EditorDocumentError> {
         let composition = self
             .composition
             .as_ref()
             .ok_or(EditorDocumentError::CompositionNotActive)?;
-        let block =
-            self.markdown
-                .blocks()
-                .get(index)
-                .ok_or(EditorDocumentError::BlockOutOfBounds {
-                    index,
-                    blocks: self.markdown.blocks().len(),
-                })?;
-        let snapshot = self.snapshot();
-        let projection = self
-            .projections
-            .get_or_build_block_with_definitions(
-                &snapshot,
-                block,
-                self.markdown.reference_definitions(),
-            )?
-            .clone();
+        let block = self.block_at(index)?;
         let span = self
             .composition_block_range()
             .ok_or(EditorDocumentError::CompositionNotActive)?;
@@ -565,9 +559,14 @@ impl EditorDocument {
         } else {
             return Err(EditorDocumentError::CompositionNotActive);
         };
-        projection
-            .with_composition(replacement, text, selection)
-            .map_err(EditorDocumentError::Projection)
+        let snapshot = self.snapshot();
+        let decorations = self
+            .decorations
+            .get_or_build_block(&snapshot, block)?
+            .clone();
+        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?
+            .with_composition(replacement, text, selection)?;
+        Ok((visual, decorations))
     }
 
     #[must_use]
@@ -637,7 +636,7 @@ impl EditorDocument {
     ) -> Result<ViewportSnapshot, EditorDocumentError>
     where
         S: ShapingProvider,
-        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
     {
         let mut layout = std::mem::take(&mut self.viewport);
         let result = self.measure_visible_blocks_with_shaper_and_images(
@@ -677,7 +676,7 @@ impl EditorDocument {
     ) -> Result<ViewportSnapshot, EditorDocumentError>
     where
         S: ShapingProvider,
-        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
     {
         if self.composition.is_none() {
             return self.visible_blocks_with_shaper_and_image_resolver(
@@ -722,7 +721,7 @@ impl EditorDocument {
     ) -> Result<ViewportSnapshot, EditorDocumentError>
     where
         S: ShapingProvider,
-        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
     {
         if self.composition.is_some() {
             return self.visible_blocks_with_composition_and_shaper_and_image_resolver(
@@ -824,7 +823,7 @@ impl EditorDocument {
     ) -> Result<ViewportSnapshot, EditorDocumentError>
     where
         S: ShapingProvider,
-        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
     {
         layout
             .set_backend(LayoutBackend::Shaped)
@@ -867,7 +866,7 @@ impl EditorDocument {
     ) -> Result<ViewportSnapshot, EditorDocumentError>
     where
         S: ShapingProvider,
-        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
     {
         layout
             .set_backend(LayoutBackend::Shaped)
@@ -926,7 +925,7 @@ impl EditorDocument {
     ) -> Result<ViewportSnapshot, EditorDocumentError>
     where
         S: ShapingProvider,
-        F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
     {
         layout
             .set_backend(LayoutBackend::Shaped)
@@ -1182,31 +1181,26 @@ impl EditorDocument {
             applied.result_snapshot(),
             applied.change_set(),
         )?;
-        let definitions_changed = self.markdown.reference_definitions().fingerprint()
-            != incremental.document().reference_definitions().fingerprint();
         self.selection = self
             .selection
             .map_through(applied.change_set(), applied.result_snapshot())?;
-        if definitions_changed {
-            self.projections.clear();
-            self.layouts.clear();
-            self.viewport.clear();
-        } else {
-            self.projections
-                .map_through(applied.change_set(), applied.result_snapshot())
-                .map_err(EditorDocumentError::Projection)?;
-            self.layouts
-                .map_through(applied.change_set(), applied.result_snapshot())
-                .map_err(EditorDocumentError::Layout)?;
-            self.viewport
-                .map_through(
-                    applied.change_set(),
-                    applied.result_snapshot(),
-                    incremental.document(),
-                )
-                .map_err(EditorDocumentError::Viewport)?;
-        }
-        self.projections.retain_blocks(incremental.document());
+        // 改一条 reference definition 曾经要把所有缓存整表作废：v1 的投影
+        // 先查表才知道 `[id]` 是不是一个链接。换成语法树之后 `[id]` 的
+        // `LinkLabel` 是树给的结构，隐藏区间不再依赖索引（不变量 C6 说的
+        // 「解析目标」才需要），所以没有东西要作废了。
+        self.decorations
+            .shift_through(applied.change_set(), applied.result_snapshot());
+        self.layouts
+            .map_through(applied.change_set(), applied.result_snapshot())
+            .map_err(EditorDocumentError::Layout)?;
+        self.viewport
+            .map_through(
+                applied.change_set(),
+                applied.result_snapshot(),
+                incremental.document(),
+            )
+            .map_err(EditorDocumentError::Viewport)?;
+        self.decorations.retain_blocks(incremental.document());
         self.layouts.retain_blocks(incremental.document());
         self.markdown = incremental.into_document();
         self.last_source_change = source_change_from_applied(&before_snapshot, &applied)?;
@@ -1307,7 +1301,7 @@ impl EditorDocument {
         }
         self.buffer = TextBuffer::new(source);
         self.markdown = yu_markdown::parse(&self.buffer.snapshot());
-        self.projections.clear();
+        self.decorations.clear();
         self.layouts.clear();
         self.viewport.clear();
         self.history.clear();
@@ -2020,8 +2014,8 @@ impl EditorDocument {
             return Ok(self.command_result(false));
         };
         let projection_bias = match self.selection.affinity() {
-            crate::CaretAffinity::Upstream => ProjectionBias::Before,
-            crate::CaretAffinity::Downstream => ProjectionBias::After,
+            crate::CaretAffinity::Upstream => Bias::Before,
+            crate::CaretAffinity::Downstream => Bias::After,
         };
         let preferred_x = self.preferred_x.map(PreferredCaretX::value);
         let block_count = self.markdown.blocks().len();
@@ -2089,10 +2083,10 @@ impl EditorDocument {
         ending_at_offset
     }
 
-    fn selection_projection_bias(&self) -> ProjectionBias {
+    fn selection_projection_bias(&self) -> Bias {
         match self.selection.affinity() {
-            crate::CaretAffinity::Upstream => ProjectionBias::Before,
-            crate::CaretAffinity::Downstream => ProjectionBias::After,
+            crate::CaretAffinity::Upstream => Bias::Before,
+            crate::CaretAffinity::Downstream => Bias::After,
         }
     }
 
@@ -2162,14 +2156,17 @@ fn apply_image_measurements<F>(
     image_resolver: &F,
 ) -> Result<(), EditorDocumentError>
 where
-    F: Fn(ImageSource) -> Option<ImageIntrinsicSize>,
+    F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
 {
     let measurements = layout
-        .projection()
-        .images()
+        .decorations()
+        .annotations()
         .iter()
         .copied()
-        .filter_map(|image| image_resolver(image).map(|size| (image.source(), size)))
+        .filter_map(|annotation| {
+            let BlockAnnotation::Image(image) = annotation;
+            image_resolver(image).map(|size| (image.source(), size))
+        })
         .collect::<Vec<_>>();
     layout
         .apply_image_intrinsic_sizes(&measurements)
@@ -2372,11 +2369,19 @@ pub enum EditorDocumentError {
     Layout(LayoutError),
     Markdown(IncrementalParseError),
     Position(TextPositionError),
-    Projection(ProjectionError),
+    /// 解析或装饰产出失败。
+    Decoration(DecorationError),
+    /// 视觉字节流出错：偏移越界、落在字符中间、preedit 区间不合法。
+    Visual(VisualTextError),
     Selection(SelectionError),
     Viewport(ViewportError),
-    BlockOutOfBounds { index: usize, blocks: usize },
-    BlockNotTaskList { index: usize },
+    BlockOutOfBounds {
+        index: usize,
+        blocks: usize,
+    },
+    BlockNotTaskList {
+        index: usize,
+    },
     CompositionNotActive,
     CompositionActive,
 }
@@ -2389,7 +2394,8 @@ impl fmt::Display for EditorDocumentError {
             Self::Layout(error) => error.fmt(formatter),
             Self::Markdown(error) => error.fmt(formatter),
             Self::Position(error) => error.fmt(formatter),
-            Self::Projection(error) => error.fmt(formatter),
+            Self::Decoration(error) => error.fmt(formatter),
+            Self::Visual(error) => error.fmt(formatter),
             Self::Selection(error) => error.fmt(formatter),
             Self::Viewport(error) => error.fmt(formatter),
             Self::BlockOutOfBounds { index, blocks } => {
@@ -2418,7 +2424,8 @@ impl Error for EditorDocumentError {
             Self::Layout(error) => Some(error),
             Self::Markdown(error) => Some(error),
             Self::Position(error) => Some(error),
-            Self::Projection(error) => Some(error),
+            Self::Decoration(error) => Some(error),
+            Self::Visual(error) => Some(error),
             Self::Selection(error) => Some(error),
             Self::Viewport(error) => Some(error),
             Self::BlockOutOfBounds { .. }
@@ -2465,9 +2472,15 @@ impl From<TextPositionError> for EditorDocumentError {
     }
 }
 
-impl From<ProjectionError> for EditorDocumentError {
-    fn from(error: ProjectionError) -> Self {
-        Self::Projection(error)
+impl From<DecorationError> for EditorDocumentError {
+    fn from(error: DecorationError) -> Self {
+        Self::Decoration(error)
+    }
+}
+
+impl From<VisualTextError> for EditorDocumentError {
+    fn from(error: VisualTextError) -> Self {
+        Self::Visual(error)
     }
 }
 
@@ -2481,13 +2494,13 @@ impl From<SelectionError> for EditorDocumentError {
 mod tests {
     use super::*;
     use crate::table::{TableResizeGesture, TableResizeTarget};
-    use crate::{EditorKey, KeyModifiers, SourceSync, VisualRunKind};
+    use crate::{EditorKey, KeyModifiers, SourceSync};
     use unicode_segmentation::UnicodeSegmentation;
     use yu_core::{
         ByteOffset, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
         TextDirection, TextStyle, Utf16Offset,
     };
-    use yu_markdown::BlockKind;
+    use yu_markdown::{BlockKind, BlockOrnament};
     use yu_text::Edit;
 
     fn source_range(start: u64, end: u64) -> TextRange {
@@ -3221,10 +3234,10 @@ mod tests {
             .block_layout_with_composition(0, LayoutConfig::new(80.0, 1.0))
             .expect("composition metrics layout");
         assert_eq!(layout.revision(), revision);
-        assert_eq!(layout.projection().composition_text(), Some("日本"));
+        assert_eq!(layout.visual().composition_text(), Some("日本"));
         assert_eq!(
             layout
-                .projection()
+                .visual()
                 .composition_selection_visual()
                 .map(|range| range.start().get()),
             Some(8)
@@ -3240,7 +3253,7 @@ mod tests {
         let updated = document
             .block_layout_with_composition(0, LayoutConfig::new(80.0, 1.0))
             .expect("updated composition metrics layout");
-        assert_eq!(updated.projection().composition_text(), Some("日本語"));
+        assert_eq!(updated.visual().composition_text(), Some("日本語"));
         assert_eq!(document.revision(), revision);
         assert_eq!(document.layout_cache_stats().entries(), 0);
 
@@ -3248,7 +3261,7 @@ mod tests {
         let canonical = document
             .block_layout(0, LayoutConfig::new(80.0, 1.0))
             .expect("canonical layout after cancel");
-        assert_eq!(canonical.projection().composition_text(), None);
+        assert_eq!(canonical.visual().composition_text(), None);
         assert_eq!(document.revision(), revision);
     }
 
@@ -3261,7 +3274,7 @@ mod tests {
         let layout = document
             .block_layout_with_composition_and_shaper(0, LayoutConfig::new(80.0, 1.0), &WideShaper)
             .expect("composition shaped layout");
-        assert_eq!(layout.projection().composition_text(), Some("日本"));
+        assert_eq!(layout.visual().composition_text(), Some("日本"));
         assert!(layout.glyphs().len() >= 2);
         assert!(
             layout
@@ -3315,10 +3328,10 @@ mod tests {
                 .block_layout_with_composition_and_shaper(index, config, &WideShaper)
                 .expect("transient cross-block layout");
             if index == span.start {
-                assert_eq!(layout.projection().composition_text(), Some("日本🙂"));
+                assert_eq!(layout.visual().composition_text(), Some("日本🙂"));
                 assert!(layout.glyphs().len() >= 2);
             } else {
-                assert_eq!(layout.projection().composition_text(), Some(""));
+                assert_eq!(layout.visual().composition_text(), Some(""));
             }
         }
 
@@ -3362,25 +3375,74 @@ mod tests {
         assert_eq!(document.selection().focus().get(), "羽a".len() as u64);
     }
 
+    /// 一份装饰藏起来的 source 区间，升序、合并重叠。
+    ///
+    /// 合并是必须的：多个 extension 可以盖在同一段上（`- [x]` 就有三条互相
+    /// 重叠的），不合并会把同一段数几遍。
+    fn hidden_spans(decorations: &BlockDecorations) -> Vec<(u64, u64)> {
+        let mut spans: Vec<(u64, u64)> = decorations
+            .set()
+            .all()
+            .iter()
+            .filter(|entry| entry.decoration.hides_source())
+            .map(|entry| (entry.range.start().get(), entry.range.end().get()))
+            .filter(|(from, to)| from < to)
+            .collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (from, to) in spans {
+            match merged.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => merged.push((from, to)),
+            }
+        }
+        merged
+    }
+
+    /// 这个块投影之后的视觉长度。
+    fn visual_len_of(decorations: &BlockDecorations) -> u64 {
+        let set = decorations.set();
+        let range = decorations.range();
+        set.source_to_visual(range.end())
+            .get()
+            .saturating_sub(set.source_to_visual(range.start()).get())
+    }
+
+    /// 露出语法不得往规范缓存里加东西。
+    ///
+    /// 比的是「产了几份、存着几份、作废了几份」而不是整个计数结构：命中数
+    /// 会变（判断该不该露出本身就要问一次规范装饰），那不是污染。
+    fn assert_no_new_entries(now: DecorationCacheStats, before: DecorationCacheStats) {
+        assert_eq!(now.entries(), before.entries(), "缓存条数变了");
+        assert_eq!(now.builds(), before.builds(), "多产了一份规范装饰");
+        assert_eq!(now.invalidated(), before.invalidated(), "作废了缓存");
+    }
+
+    /// 行首标记的替代文字，没有就是 `None`。
+    fn marker_text_of(decorations: &BlockDecorations) -> Option<String> {
+        decorations
+            .line_styles()
+            .iter()
+            .find_map(|ornament| match ornament {
+                BlockOrnament::Marker(marker) => Some(marker.text().to_owned()),
+                _ => None,
+            })
+    }
+
     #[test]
-    fn projection_cache_reuses_and_remaps_unaffected_ranges() {
+    fn decoration_cache_reuses_and_remaps_unaffected_blocks() {
         let source = "prefix **羽🙂** suffix";
         let mut document = EditorDocument::new(source);
-        let start = source.find("**").expect("strong delimiter should exist");
-        let end = start + "**羽🙂**".len();
-        let range = source_range(start as u64, end as u64);
 
         {
-            let projection = document.projection(range).expect("projection should build");
-            assert_eq!(projection.visual_len().get(), "羽🙂".len() as u64);
+            let decorations = document.block_decorations(0).expect("装饰应当产得出来");
+            assert_eq!(hidden_spans(decorations).len(), 2, "两个 `**`");
         }
         {
-            let projection = document
-                .projection(range)
-                .expect("projection should be cached");
-            assert_eq!(projection.revision(), document.revision());
+            let decorations = document.block_decorations(0).expect("第二次该命中缓存");
+            assert_eq!(decorations.revision(), document.revision());
         }
-        let stats = document.projection_cache_stats();
+        let stats = document.decoration_cache_stats();
         assert_eq!(stats.entries(), 1);
         assert_eq!(stats.builds(), 1);
         assert_eq!(stats.hits(), 1);
@@ -3391,63 +3453,96 @@ mod tests {
         );
         document
             .apply_transaction(&transaction)
-            .expect("prefix edit should apply");
-        let shifted = source_range((start + "前".len()) as u64, (end + "前".len()) as u64);
-        let projection = document
-            .projection(shifted)
-            .expect("unaffected projection should be remapped");
-        assert_eq!(projection.visual_len().get(), "羽🙂".len() as u64);
-        let stats = document.projection_cache_stats();
-        assert_eq!(stats.remapped(), 1);
-        assert_eq!(stats.builds(), 1);
-        assert_eq!(stats.entries(), 1);
+            .expect("前缀编辑应当成功");
+        // 编辑落在块**内**（块从 0 开始），所以这一份必须重建。
+        assert_eq!(document.decoration_cache_stats().invalidated(), 1);
     }
 
+    /// 编辑落在块外时那些块整体平移，不重建。
     #[test]
-    fn projection_cache_invalidates_intersecting_ranges() {
-        let source = "prefix **羽🙂** suffix";
+    fn decoration_cache_shifts_blocks_that_the_edit_did_not_touch() {
+        let source = "intro
+
+prefix **羽🙂** suffix
+";
         let mut document = EditorDocument::new(source);
-        let start = source.find("**").expect("strong delimiter should exist");
-        let end = start + "**羽🙂**".len();
-        let range = source_range(start as u64, end as u64);
-        document.projection(range).expect("projection should build");
+        let index = document
+            .markdown()
+            .blocks()
+            .iter()
+            .position(|block| block.range().len() > 10 && block.kind() == BlockKind::Paragraph)
+            .expect("段落块");
+        let old_range = document
+            .block_decorations(index)
+            .expect("装饰应当产得出来")
+            .range();
 
         let transaction = Transaction::new(
             document.revision(),
-            [Edit::new(
-                TextRange::empty(ByteOffset::new((start + 2) as u64)),
-                "x",
-            )],
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
         );
         document
             .apply_transaction(&transaction)
-            .expect("inside edit should apply");
-        let stats = document.projection_cache_stats();
-        assert_eq!(stats.entries(), 0);
-        assert_eq!(stats.invalidated(), 1);
+            .expect("前缀编辑应当成功");
 
-        document
-            .projection(range)
-            .expect("projection should rebuild for the new revision");
-        assert_eq!(document.projection_cache_stats().builds(), 2);
+        let decorations = document
+            .block_decorations(index)
+            .expect("平移过的装饰应当直接可用")
+            .clone();
+        assert_eq!(
+            decorations.range().start().get(),
+            old_range.start().get() + 3
+        );
+        assert_eq!(decorations.revision(), document.revision());
+        assert_eq!(hidden_spans(&decorations).len(), 2);
+        let stats = document.decoration_cache_stats();
+        assert_eq!(stats.builds(), 1, "平移不重建");
+        assert_eq!(stats.remapped(), 1);
     }
 
+    /// 编辑碰到块的边界也算碰到。
+    ///
+    /// 紧贴块首插入的字符会改变块的语法归属——`#` 打进去就是标题了。沿用
+    /// 旧装饰的后果是「多打了一个 `#` 但标题级别没变」，不报错。
     #[test]
-    fn definition_index_changes_invalidate_nonlocal_projections() {
-        let source = "[id]: /docs\n\n[id]\n";
+    fn decoration_cache_invalidates_a_block_touched_at_its_boundary() {
+        let mut document = EditorDocument::new(
+            "# heading
+",
+        );
+        document.block_decorations(0).expect("装饰应当产得出来");
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(TextRange::empty(ByteOffset::ZERO), "#")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("编辑应当成功");
+        assert_eq!(document.decoration_cache_stats().entries(), 0);
+        let decorations = document.block_decorations(0).expect("重建");
+        assert_eq!(hidden_spans(decorations), vec![(0, 3)], "`## ` 整个隐藏");
+    }
+
+    /// 引用式链接的装饰不再依赖 definition 索引。
+    ///
+    /// `yu-syntax` 给的是结构：`[id]` 的 `LinkLabel` 是树上的节点，隐藏区间
+    /// 不需要先查表判断它是不是一个真链接（不变量 C6 说那件事发生在装饰
+    /// 阶段，而「解析目标」才需要索引）。所以改一条 definition 不会让别的块
+    /// 的装饰作废——它只是把块整体挪了一个字节。
+    #[test]
+    fn a_definition_edit_only_shifts_unrelated_blocks() {
+        let source = "[id]: /docs
+
+[id]
+";
         let mut document = EditorDocument::new(source);
         let paragraph = document
-            .markdown()
-            .blocks()
-            .get(2)
-            .expect("paragraph should exist")
+            .block_decorations(2)
+            .expect("引用式段落的装饰")
             .range();
-        document
-            .block_projection(2)
-            .expect("shortcut projection should build");
-        assert_eq!(document.projection_cache_stats().entries(), 1);
+        assert_eq!(document.decoration_cache_stats().entries(), 1);
 
-        let label_start = source.find("id").expect("definition label should exist");
+        let label_start = source.find("id").expect("definition 的标签");
         let transaction = Transaction::new(
             document.revision(),
             [Edit::new(
@@ -3457,76 +3552,23 @@ mod tests {
         );
         document
             .apply_transaction(&transaction)
-            .expect("definition edit should apply");
+            .expect("definition 编辑应当成功");
 
+        let shifted = document.block_decorations(2).expect("平移过的装饰");
         assert_eq!(
-            document
-                .markdown()
-                .reference_definitions()
-                .definitions()
-                .len(),
-            1
-        );
-        assert_eq!(document.projection_cache_stats().entries(), 0);
-        let new_paragraph = document
-            .markdown()
-            .blocks()
-            .get(2)
-            .expect("paragraph should remain")
-            .range();
-        assert_eq!(
-            new_paragraph,
+            shifted.range(),
             source_range(paragraph.start().get() + 1, paragraph.end().get() + 1)
         );
-        document
-            .block_projection(2)
-            .expect("unresolved shortcut should rebuild as literal inline text");
-        assert_eq!(document.projection_cache_stats().builds(), 2);
+        assert_eq!(document.decoration_cache_stats().builds(), 1);
+        assert_eq!(document.decoration_cache_stats().remapped(), 1);
     }
 
     #[test]
-    fn definition_index_fingerprint_allows_prefix_remapping() {
-        let source = "intro\n\n[id]: /docs\n\n[id]\n";
-        let mut document = EditorDocument::new(source);
-        let old_range = document
-            .markdown()
-            .blocks()
-            .get(4)
-            .expect("paragraph should exist")
-            .range();
-        document
-            .block_projection(4)
-            .expect("shortcut projection should build");
-
-        let transaction = Transaction::new(
-            document.revision(),
-            [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
-        );
-        document
-            .apply_transaction(&transaction)
-            .expect("prefix edit should apply");
-        let shifted_range = document
-            .markdown()
-            .blocks()
-            .get(4)
-            .expect("shifted paragraph should exist")
-            .range();
-        assert_eq!(shifted_range.start().get(), old_range.start().get() + 3);
-        document
-            .block_projection(4)
-            .expect("prefix shift should reuse shortcut projection");
-        assert_eq!(document.projection_cache_stats().builds(), 1);
-        assert_eq!(document.projection_cache_stats().remapped(), 1);
-    }
-
-    #[test]
-    fn toggle_task_is_a_source_transaction_and_rebuilds_task_projection() {
+    fn toggle_task_is_a_source_transaction_and_rebuilds_task_decorations() {
         let mut document = EditorDocument::new("- [ ] todo\n");
-        let projection = document
-            .block_projection(0)
-            .expect("task projection should build");
-        assert_eq!(projection.kind(), crate::BlockProjectionKind::TaskList);
-        assert_eq!(document.projection_cache_stats().builds(), 1);
+        let decorations = document.block_decorations(0).expect("任务项的装饰");
+        assert_eq!(hidden_spans(decorations), vec![(2, 5)], "`[ ]` 整个隐藏");
+        assert_eq!(document.decoration_cache_stats().builds(), 1);
 
         let result = document
             .execute(EditorCommand::toggle_task(0))
@@ -3545,7 +3587,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(document.projection_cache_stats().entries(), 0);
+        assert_eq!(document.decoration_cache_stats().entries(), 0);
 
         document
             .toggle_task(0)
@@ -3562,17 +3604,19 @@ mod tests {
         ));
     }
 
+    /// 落在字符中间的源码偏移必须被拒绝，不能静默取整
+    /// （`docs/specs/coordinates.md`）。
+    ///
+    /// 装饰集合自己回答不了这个问题——它不持有源码。校验归持有文本的
+    /// `VisualText`。
     #[test]
-    fn projection_query_rejects_non_utf8_source_boundaries() {
+    fn visual_text_rejects_non_utf8_source_boundaries() {
         let mut document = EditorDocument::new("羽");
-        let invalid = source_range(1, 3);
+        let text = document.visual_text().expect("视觉文本");
         assert!(matches!(
-            document.projection(invalid),
-            Err(EditorDocumentError::Projection(
-                ProjectionError::InlineParse(_)
-            ))
+            text.source_to_visual(ByteOffset::new(1), Bias::After),
+            Err(VisualTextError::SourceNotCharBoundary { .. })
         ));
-        assert_eq!(document.projection_cache_stats().entries(), 0);
     }
 
     #[test]
@@ -3583,15 +3627,12 @@ mod tests {
         let block_index = document
             .block_index_for_source(ByteOffset::new(strong as u64))
             .expect("focus block");
-        let canonical_hidden = document
-            .block_projection(block_index)
-            .expect("canonical projection")
-            .visual()
-            .runs()
-            .iter()
-            .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
-            .count();
-        let cached = document.projection_cache_stats();
+        let canonical = document
+            .block_decorations(block_index)
+            .expect("canonical decorations")
+            .clone();
+        let canonical_hidden = hidden_spans(&canonical).len();
+        let cached = document.decoration_cache_stats();
 
         let snapshot = document.snapshot();
         document
@@ -3605,22 +3646,14 @@ mod tests {
             )
             .expect("set selection");
         let revealed = document
-            .block_projection_with_selection_reveal(block_index)
-            .expect("revealed projection");
+            .block_decorations_with_selection_reveal(block_index)
+            .expect("revealed decorations");
 
         assert_eq!(canonical_hidden, 2);
-        assert_eq!(
-            revealed
-                .visual()
-                .runs()
-                .iter()
-                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
-                .count(),
-            0
-        );
-        assert_eq!(revealed.visual().visual_len().get(), source.len() as u64);
+        assert!(hidden_spans(&revealed).is_empty());
+        assert_eq!(visual_len_of(&revealed), source.len() as u64);
         assert_eq!(document.revision(), Revision::new(0));
-        assert_eq!(document.projection_cache_stats(), cached);
+        assert_no_new_entries(document.decoration_cache_stats(), cached);
         assert_eq!(document.selection_reveal_block_index(), Some(block_index));
 
         let snapshot = document.snapshot();
@@ -3636,17 +3669,9 @@ mod tests {
             .expect("set outside selection");
         assert_eq!(document.selection_reveal_block_index(), None);
         let hidden_again = document
-            .block_projection_with_selection_reveal(block_index)
-            .expect("hidden projection");
-        assert_eq!(
-            hidden_again
-                .visual()
-                .runs()
-                .iter()
-                .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
-                .count(),
-            2
-        );
+            .block_decorations_with_selection_reveal(block_index)
+            .expect("hidden decorations");
+        assert_eq!(hidden_spans(&hidden_again).len(), 2);
     }
 
     #[test]
@@ -3658,10 +3683,10 @@ mod tests {
             .block_index_for_source(ByteOffset::new(heading as u64))
             .expect("heading block");
         let canonical = document
-            .block_projection(heading_index)
-            .expect("canonical heading projection")
+            .block_decorations(heading_index)
+            .expect("canonical heading decorations")
             .clone();
-        let cached = document.projection_cache_stats();
+        let cached = document.decoration_cache_stats();
 
         let snapshot = document.snapshot();
         document
@@ -3675,18 +3700,15 @@ mod tests {
             )
             .expect("set heading selection");
         let revealed = document
-            .block_projection_with_selection_reveal(heading_index)
-            .expect("revealed heading projection");
+            .block_decorations_with_selection_reveal(heading_index)
+            .expect("revealed heading decorations");
         let heading_source_len = source.find('\n').expect("heading line ending") as u64 + 1;
 
         assert_eq!(document.selection_reveal_block_index(), Some(heading_index));
-        assert_eq!(
-            canonical.visual().visual_len().get() + 3,
-            heading_source_len
-        );
-        assert_eq!(revealed.visual().visual_len().get(), heading_source_len);
+        assert_eq!(visual_len_of(&canonical) + 3, heading_source_len);
+        assert_eq!(visual_len_of(&revealed), heading_source_len);
         assert_eq!(document.revision(), Revision::new(0));
-        assert_eq!(document.projection_cache_stats(), cached);
+        assert_no_new_entries(document.decoration_cache_stats(), cached);
 
         let plain = source.find("plain").expect("plain text");
         let snapshot = document.snapshot();
@@ -3720,32 +3742,25 @@ mod tests {
             .expect("list block");
         assert_eq!(document.selection_reveal_block_index(), Some(list_index));
         let canonical_list = document
-            .block_projection(list_index)
-            .expect("canonical list projection")
+            .block_decorations(list_index)
+            .expect("canonical list decorations")
             .clone();
-        let list_cached = document.projection_cache_stats();
-        assert_eq!(
-            canonical_list
-                .visual()
-                .leading_marker()
-                .expect("semantic list marker")
-                .text(),
-            "•"
-        );
+        let list_cached = document.decoration_cache_stats();
+        assert_eq!(marker_text_of(&canonical_list).as_deref(), Some("\u{2022}"));
         let revealed_list = document
-            .block_projection_with_selection_reveal(list_index)
-            .expect("revealed list projection");
-        assert!(revealed_list.visual().leading_marker().is_none());
+            .block_decorations_with_selection_reveal(list_index)
+            .expect("revealed list decorations");
+        assert!(marker_text_of(&revealed_list).is_none());
         assert_eq!(
-            revealed_list.visual().visual_len().get(),
-            canonical_list.visual().visual_len().get() + 2
+            visual_len_of(&revealed_list),
+            visual_len_of(&canonical_list) + 2
         );
         assert_eq!(document.revision(), Revision::new(0));
-        assert_eq!(document.projection_cache_stats(), list_cached);
+        assert_no_new_entries(document.decoration_cache_stats(), list_cached);
     }
 
     #[test]
-    fn block_projection_uses_incremental_markdown_ranges_and_remaps_prefix_edits() {
+    fn block_decorations_use_incremental_markdown_ranges_and_remap_prefix_edits() {
         let source = "intro\n\nparagraph **羽🙂**\n\n```rust\ncode\n```\n";
         let mut document = EditorDocument::new(source);
         let paragraph_index = document
@@ -3762,22 +3777,14 @@ mod tests {
             .range();
 
         {
-            let projection = document
-                .block_projection(paragraph_index)
-                .expect("paragraph projection should build");
-            assert_eq!(projection.source_range(), old_range);
-            assert_eq!(
-                projection
-                    .visual()
-                    .runs()
-                    .iter()
-                    .filter(|run| run.kind() == VisualRunKind::HiddenSyntax)
-                    .count(),
-                2
-            );
+            let decorations = document
+                .block_decorations(paragraph_index)
+                .expect("paragraph decorations should build");
+            assert_eq!(decorations.range(), old_range);
+            assert_eq!(hidden_spans(decorations).len(), 2);
         }
         assert_eq!(document.markdown().revision(), document.revision());
-        assert_eq!(document.projection_cache_stats().builds(), 1);
+        assert_eq!(document.decoration_cache_stats().builds(), 1);
 
         let transaction = Transaction::new(
             document.revision(),
@@ -3794,71 +3801,41 @@ mod tests {
         let new_range = new_block.range();
         assert_eq!(new_range.start().get(), old_range.start().get() + 3);
         assert_eq!(new_range.end().get(), old_range.end().get() + 3);
-        let projection = document
-            .block_projection(paragraph_index)
-            .expect("remapped paragraph projection should be reusable");
-        assert_eq!(projection.source_range(), new_range);
-        assert_eq!(document.projection_cache_stats().remapped(), 1);
-        assert_eq!(document.projection_cache_stats().builds(), 1);
+        let decorations = document
+            .block_decorations(paragraph_index)
+            .expect("remapped paragraph decorations should be reusable");
+        assert_eq!(decorations.range(), new_range);
+        assert_eq!(document.decoration_cache_stats().remapped(), 1);
+        assert_eq!(document.decoration_cache_stats().builds(), 1);
     }
 
+    /// 围栏代码块把围栏那两行整个藏起来，内容按等宽排。
+    ///
+    /// **内容里的 `**` 不解析**——树里 `FencedCode` 的内容是一个 `CodeText`
+    /// 叶子，遍历不到就产不出装饰。v1 需要一个专门的 `CodeProjection` 来
+    /// 保证这件事。
     #[test]
-    fn fenced_code_blocks_use_the_independent_code_projection() {
+    fn a_fenced_code_block_hides_its_fences_and_keeps_its_body_literal() {
         let mut document = EditorDocument::new("```rust\n**code**\n```\n");
         {
-            let projection = document
-                .block_projection(0)
-                .expect("fenced code projection should build");
-            match projection {
-                BlockProjection::FencedCode(code) => {
-                    assert_eq!(code.marker(), '`');
-                    assert!(code.closed());
-                    assert_eq!(code.visual().visual_len().get(), code.content().len());
-                    assert!(code.visual().runs().iter().any(|run| {
-                        run.kind() == VisualRunKind::Visible
-                            && run.style() == crate::TextStyle::Code
-                    }));
-                }
-                BlockProjection::Inline(_)
-                | BlockProjection::Heading(_)
-                | BlockProjection::BlockQuote(_)
-                | BlockProjection::List(_)
-                | BlockProjection::Table(_)
-                | BlockProjection::ReferenceDefinition(_)
-                | BlockProjection::TaskList(_) => {
-                    panic!("fenced code must not use inline projection")
-                }
-            }
+            let decorations = document.block_decorations(0).expect("围栏代码块的装饰");
+            assert_eq!(
+                hidden_spans(decorations),
+                vec![(0, 8), (17, 21)],
+                "开围栏连语言名与换行符，收尾围栏连它的换行符"
+            );
         }
-        assert_eq!(
-            document.projection_cache_stats().entries(),
-            1,
-            "code projection should be cached by block key"
-        );
+        assert_eq!(document.decoration_cache_stats().entries(), 1);
         assert!(matches!(
-            document.block_projection(1),
+            document.block_decorations(1),
             Err(EditorDocumentError::BlockOutOfBounds { index: 1, .. })
         ));
     }
 
     #[test]
-    fn cached_code_projection_remaps_when_a_prefix_edit_shifts_the_block() {
+    fn cached_code_decorations_remap_when_a_prefix_edit_shifts_the_block() {
         let mut document = EditorDocument::new("intro\n\n```rust\n**code**\n```\n");
-        let old_content = match document
-            .block_projection(2)
-            .expect("fenced code projection should build")
-        {
-            BlockProjection::FencedCode(code) => code.content(),
-            BlockProjection::Inline(_)
-            | BlockProjection::Heading(_)
-            | BlockProjection::BlockQuote(_)
-            | BlockProjection::List(_)
-            | BlockProjection::Table(_)
-            | BlockProjection::ReferenceDefinition(_)
-            | BlockProjection::TaskList(_) => {
-                panic!("fenced code must use code projection")
-            }
-        };
+        let old_hidden = hidden_spans(document.block_decorations(2).expect("围栏代码块的装饰"));
         let transaction = Transaction::new(
             document.revision(),
             [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
@@ -3867,25 +3844,20 @@ mod tests {
             .apply_transaction(&transaction)
             .expect("prefix edit should apply");
 
-        let projection = document
-            .block_projection(2)
-            .expect("shifted code projection should be reusable");
-        let new_content = match projection {
-            BlockProjection::FencedCode(code) => code.content(),
-            BlockProjection::Inline(_)
-            | BlockProjection::Heading(_)
-            | BlockProjection::BlockQuote(_)
-            | BlockProjection::List(_)
-            | BlockProjection::Table(_)
-            | BlockProjection::ReferenceDefinition(_)
-            | BlockProjection::TaskList(_) => {
-                panic!("fenced code must use code projection")
-            }
-        };
-        assert_eq!(new_content.start().get(), old_content.start().get() + 3);
-        assert_eq!(new_content.end().get(), old_content.end().get() + 3);
-        assert_eq!(document.projection_cache_stats().builds(), 1);
-        assert_eq!(document.projection_cache_stats().remapped(), 1);
+        let new_hidden = hidden_spans(
+            document
+                .block_decorations(2)
+                .expect("平移过的装饰应当直接可用"),
+        );
+        assert_eq!(
+            new_hidden,
+            old_hidden
+                .iter()
+                .map(|(from, to)| (from + 3, to + 3))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(document.decoration_cache_stats().builds(), 1);
+        assert_eq!(document.decoration_cache_stats().remapped(), 1);
     }
 
     #[test]
@@ -4196,7 +4168,7 @@ mod tests {
     fn block_projection_is_dropped_when_block_kind_changes() {
         let mut document = EditorDocument::new("paragraph **羽**\n");
         document
-            .block_projection(0)
+            .block_decorations(0)
             .expect("paragraph projection should build");
 
         let transaction = Transaction::new(
@@ -4215,11 +4187,11 @@ mod tests {
                 .kind(),
             BlockKind::AtxHeading { level: 1 }
         );
-        assert_eq!(document.projection_cache_stats().entries(), 0);
+        assert_eq!(document.decoration_cache_stats().entries(), 0);
         document
-            .block_projection(0)
+            .block_decorations(0)
             .expect("heading projection should build independently");
-        assert_eq!(document.projection_cache_stats().builds(), 2);
+        assert_eq!(document.decoration_cache_stats().builds(), 2);
     }
 
     #[test]

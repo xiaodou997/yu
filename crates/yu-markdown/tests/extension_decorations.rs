@@ -706,13 +706,14 @@ fn images(
     decorations
         .annotations()
         .iter()
-        .map(|annotation| match annotation {
-            BlockAnnotation::Image {
-                source,
-                label,
-                destination,
-                reference,
-            } => (*source, *label, *destination, *reference),
+        .map(|annotation| {
+            let BlockAnnotation::Image(image) = annotation;
+            (
+                image.source(),
+                image.label(),
+                image.destination(),
+                image.reference(),
+            )
         })
         .collect()
 }

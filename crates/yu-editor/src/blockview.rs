@@ -11,8 +11,9 @@
 //! - 排文字是 [`BlockLayout`] 的事，它只看见视觉文本与不透明的样式 id；
 //! - 解释 Markdown 是 [`BlockLayoutInput`] 的事（本 crate），它把语法翻译成
 //!   字号倍率、缩进、网格；
-//! - 换算源码坐标是 `Projection` 的事——[`BlockView`] 在这里问它，自己不
-//!   再实现一遍（不变量 D4「这是投影映射链的唯一实现」）。
+//! - 换算源码坐标是 `DecorationSet` 的事——[`BlockView`] 隔着
+//!   [`VisualText`] 问它，自己不再实现一遍（不变量 D4「这是投影映射链的
+//!   唯一实现」）。
 //!
 //! [`BlockView`] 是把这三样拼起来的那个东西，也是产品侧唯一要打交道的类型。
 //!
@@ -21,28 +22,27 @@
 //! [`BlockLayout`] 的输出**只有视觉坐标**，这是有意的。产品侧要的是源码
 //! 坐标（选中、编辑、Accessibility 都按源码走），所以这里把每个盒子补上
 //! 它的源码区间，得到 [`BlockCluster`] / [`BlockGlyph`] / [`BlockLine`]。
-//! 补的时候问的是 `Projection`，不是自己再算一遍。
+//! 补的时候问的是装饰集合的双向映射，不是自己再算一遍。
 
 use std::ops::Range;
 
 use yu_core::{
     ByteOffset, CaretAffinity, ClusterMetrics, FontFaceId, GlyphId, LineStyleId, Revision,
-    ShapingProvider, TextRange, TextStyle,
+    ShapingProvider, TextRange, TextStyle, VisualOffset, VisualRange,
 };
+use yu_decoration::Bias;
 use yu_layout::{
     BlockLayout, HeightIndex, HeightIndexError, LayoutConfig, LayoutError, LayoutPoint, LayoutRect,
     NoWidgets, StyleTable,
 };
-use yu_projection::{
-    BlockProjection, Projection, ProjectionBias, VisualOffset, VisualRange, VisualRun,
-    VisualRunKind,
-};
+use yu_markdown::{BlockDecorations, BlockOrnament};
 use yu_text::{ChangeSet, TextSnapshot};
 
 use crate::blockinput::{BlockLayoutInput, BlockOrnaments};
 use crate::geometry::{source_range_contains, upstream};
 use crate::image::{ImagePlacement, build_image_placements, place_images_in_table};
 use crate::table::{TableLayout, TableResizeCommit};
+use crate::visual::VisualText;
 
 /// 一个视觉簇：视觉几何加上它对应的源码。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -223,7 +223,7 @@ pub struct BlockCaret {
     visual: VisualOffset,
     line: usize,
     point: LayoutPoint,
-    bias: ProjectionBias,
+    bias: Bias,
 }
 
 impl BlockCaret {
@@ -248,7 +248,7 @@ impl BlockCaret {
     }
 
     #[must_use]
-    pub const fn bias(self) -> ProjectionBias {
+    pub const fn bias(self) -> Bias {
         self.bias
     }
 }
@@ -282,7 +282,7 @@ impl BlockHit {
     }
 
     #[must_use]
-    pub const fn bias(self) -> ProjectionBias {
+    pub const fn bias(self) -> Bias {
         self.caret.bias
     }
 
@@ -297,7 +297,7 @@ impl BlockHit {
         visual: VisualOffset,
         line: usize,
         point: LayoutPoint,
-        bias: ProjectionBias,
+        bias: Bias,
         image: TextRange,
     ) -> Self {
         Self {
@@ -316,7 +316,8 @@ impl BlockHit {
 /// 一个块排完之后的全部结果。
 #[derive(Clone, Debug)]
 pub struct BlockView {
-    projection: BlockProjection,
+    visual: VisualText,
+    decorations: BlockDecorations,
     config: LayoutConfig,
     input: BlockLayoutInput,
     layout: BlockLayout,
@@ -329,12 +330,16 @@ pub struct BlockView {
 
 impl BlockView {
     /// 按度量排。列表标记只算宽度，不产字形。
+    ///
+    /// `visual` 必须是 `decorations` 投影出来的那一份——preedit 可以已经叠
+    /// 在上面。两者对不上时 [`BlockLayoutInput`] 会拒绝。
     pub fn build<M: ClusterMetrics>(
-        projection: &BlockProjection,
+        visual: &VisualText,
+        decorations: &BlockDecorations,
         config: LayoutConfig,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
-        let input = BlockLayoutInput::derive(projection.visual(), config, metrics)?;
+        let input = BlockLayoutInput::from_decorations(decorations, visual, config, metrics)?;
         let layout = BlockLayout::build_all(
             input.layout_input(),
             config,
@@ -343,22 +348,24 @@ impl BlockView {
             input.line_styles(),
             metrics,
         )?;
-        let table = match projection {
-            BlockProjection::Table(table) => {
-                Some(TableLayout::from_projection(table, config, metrics)?)
-            }
-            _ => None,
-        };
-        Self::assemble(projection, config, input, layout, table)
+        let table = table_of(decorations)
+            .map(|table| {
+                TableLayout::from_table(table, visual, &input, config, |text, source, style| {
+                    crate::table::measure_with(text, source, style, metrics)
+                })
+            })
+            .transpose()?;
+        Self::assemble(visual, decorations, config, input, layout, table)
     }
 
     /// 按 shaping 后端排。列表标记的字形一并进字形流。
     pub fn build_shaped<S: ShapingProvider>(
-        projection: &BlockProjection,
+        visual: &VisualText,
+        decorations: &BlockDecorations,
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<Self, LayoutError> {
-        let input = BlockLayoutInput::derive_shaped(projection.visual(), config, shaper)?;
+        let input = BlockLayoutInput::from_decorations_shaped(decorations, visual, config, shaper)?;
         let layout = BlockLayout::build_shaped(
             input.layout_input(),
             config,
@@ -367,28 +374,30 @@ impl BlockView {
             input.line_styles(),
             shaper,
         )?;
-        let table = match projection {
-            BlockProjection::Table(table) => Some(TableLayout::from_projection_with_shaper(
-                table, config, shaper,
-            )?),
-            _ => None,
-        };
-        Self::assemble(projection, config, input, layout, table)
+        let table = table_of(decorations)
+            .map(|table| {
+                TableLayout::from_table(table, visual, &input, config, |text, source, style| {
+                    crate::table::shape_with(text, source, style, shaper)
+                })
+            })
+            .transpose()?;
+        Self::assemble(visual, decorations, config, input, layout, table)
     }
 
     fn assemble(
-        projection: &BlockProjection,
+        visual: &VisualText,
+        decorations: &BlockDecorations,
         config: LayoutConfig,
         input: BlockLayoutInput,
         layout: BlockLayout,
         table: Option<TableLayout>,
     ) -> Result<Self, LayoutError> {
-        let visual = projection.visual();
         let clusters = source_backed_clusters(visual, &layout, input.styles())?;
         let glyphs = source_backed_glyphs(&layout, &clusters, input.ornaments())?;
         let lines = flow_lines(visual, &layout)?;
         let mut view = Self {
-            projection: projection.clone(),
+            visual: visual.clone(),
+            decorations: decorations.clone(),
             config,
             input,
             layout,
@@ -407,17 +416,17 @@ impl BlockView {
 
     #[must_use]
     pub fn revision(&self) -> Revision {
-        self.projection.revision()
+        self.visual.revision()
     }
 
     #[must_use]
     pub fn source_range(&self) -> TextRange {
-        self.projection.source_range()
+        self.visual.source_range()
     }
 
     #[must_use]
     pub fn visual_len(&self) -> VisualOffset {
-        self.projection.visual().visual_len()
+        self.visual.visual_len()
     }
 
     #[must_use]
@@ -431,14 +440,16 @@ impl BlockView {
         &self.layout
     }
 
+    /// 这个块的视觉字节流与它到源码的映射。
     #[must_use]
-    pub fn projection(&self) -> &Projection {
-        self.projection.visual()
+    pub const fn visual(&self) -> &VisualText {
+        &self.visual
     }
 
+    /// 这个块的装饰产出：装饰集合、两张 id 表、语义标注。
     #[must_use]
-    pub const fn block_projection(&self) -> &BlockProjection {
-        &self.projection
+    pub const fn decorations(&self) -> &BlockDecorations {
+        &self.decorations
     }
 
     #[must_use]
@@ -494,35 +505,48 @@ impl BlockView {
     }
 
     /// 一次源码编辑之后这个块还在不在。改到块里就整块作废。
+    ///
+    /// 编辑落在块外时块里每一个偏移挪同样多，所以这里只做一次平移：装饰、
+    /// 视觉文本、簇、字形、行、图片、表格网格全部按同一个常量走。让它们各自
+    /// 问一遍锚点也对，只是把一个常量算了几百遍——而算错其中一份的表现是
+    /// 「点击落在别处」，不报错。
     pub fn map_through(
         &self,
         changes: &ChangeSet,
         snapshot: &TextSnapshot,
     ) -> Result<Option<Self>, LayoutError> {
-        let Some(projection) = self
-            .projection
-            .map_through(changes, snapshot)
-            .map_err(upstream)?
-        else {
+        if snapshot.revision() != changes.after() {
+            return Err(LayoutError::Upstream(
+                "快照与变更集的 Revision 对不上".into(),
+            ));
+        }
+        let Some(delta) = self.visual.shift_through(changes).map_err(upstream)? else {
             return Ok(None);
         };
-        let table = self
-            .table
-            .as_ref()
-            .map(|table| table.map_through(changes, snapshot))
-            .transpose()?;
+        let decorations = self
+            .decorations
+            .shifted(delta, snapshot.revision(), snapshot.len_bytes())
+            .map_err(upstream)?;
+        let visual = VisualText::new(snapshot, decorations.range(), decorations.set().clone())
+            .map_err(upstream)?;
+        let shift = |range: TextRange| shift_range(range, delta);
         let mut view = Self {
-            projection,
+            visual,
+            decorations,
             ..self.clone()
         };
-        view.table = table;
+        view.table = view
+            .table
+            .as_ref()
+            .map(|table| table.shifted(delta))
+            .transpose()?;
         view.clusters = view
             .clusters
             .iter()
             .copied()
             .map(|cluster| {
                 Ok(BlockCluster {
-                    source: crate::geometry::map_source_range(cluster.source, changes)?,
+                    source: shift(cluster.source)?,
                     ..cluster
                 })
             })
@@ -533,7 +557,7 @@ impl BlockView {
             .copied()
             .map(|glyph| {
                 Ok(BlockGlyph {
-                    source: crate::geometry::map_source_range(glyph.source, changes)?,
+                    source: shift(glyph.source)?,
                     ..glyph
                 })
             })
@@ -544,7 +568,7 @@ impl BlockView {
             .cloned()
             .map(|line| {
                 Ok(BlockLine {
-                    source: crate::geometry::map_source_range(line.source, changes)?,
+                    source: shift(line.source)?,
                     ..line
                 })
             })
@@ -553,7 +577,7 @@ impl BlockView {
             .images
             .iter()
             .copied()
-            .map(|image| image.map_through(changes))
+            .map(|image| image.shifted(delta))
             .collect::<Result<Vec<_>, LayoutError>>()?;
         Ok(Some(view))
     }
@@ -562,10 +586,10 @@ impl BlockView {
     pub fn caret_for_source(
         &self,
         source: ByteOffset,
-        bias: ProjectionBias,
+        bias: Bias,
     ) -> Result<BlockCaret, LayoutError> {
         let visual = self
-            .projection()
+            .visual
             .source_to_visual(source, bias)
             .map_err(upstream)?;
         self.caret_for_visual(visual, bias)
@@ -578,16 +602,16 @@ impl BlockView {
     pub fn caret_for_visual(
         &self,
         visual: VisualOffset,
-        bias: ProjectionBias,
+        bias: Bias,
     ) -> Result<BlockCaret, LayoutError> {
         let source = match self
             .table
             .as_ref()
-            .and_then(|table| table.source_for_visual_hit(self.projection(), visual, bias))
+            .and_then(|table| table.source_for_visual_hit(&self.visual, visual))
         {
             Some(source) => source,
             None => self
-                .projection()
+                .visual
                 .visual_to_source(visual, bias)
                 .map_err(upstream)?,
         };
@@ -621,7 +645,7 @@ impl BlockView {
         let line_index = self.line_for_y(point.y());
         let line = &self.lines[line_index];
         let mut visual = line.visual.start();
-        let mut bias = ProjectionBias::Before;
+        let mut bias = Bias::Before;
 
         let content_start = self.content_start(line);
         if point.x() > content_start {
@@ -633,25 +657,25 @@ impl BlockView {
                 }
                 if point.x() < cluster.x + cluster.width / 2.0 {
                     visual = cluster.visual.start();
-                    bias = ProjectionBias::Before;
+                    bias = Bias::Before;
                     inside = true;
                     break;
                 }
                 visual = cluster.visual.end();
-                bias = ProjectionBias::After;
+                bias = Bias::After;
             }
             // 落在行末：那个位置是**这一行**的末尾，不是下一行的开头。
             // 软换行处的两个位置分属 upstream 与 downstream（不变量 H5），
             // 报成 downstream 会让光标画到下一行去。
             if !inside && line_index + 1 < self.lines.len() {
                 visual = self.line_content_visual_end(line);
-                bias = ProjectionBias::Before;
+                bias = Bias::Before;
             }
         }
         // 反过来的同一件事：落在行首的那个位置属于**这一行**，不是上一行的
         // 末尾。两条合起来才让 `hit` 与 `caret` 在软换行的两侧都对得上。
         if line_index > 0 && visual == line.visual.start() {
-            bias = ProjectionBias::After;
+            bias = Bias::After;
         }
         let caret = self.caret_for_visual(visual, bias)?;
         Ok(BlockHit { caret, image: None })
@@ -750,14 +774,14 @@ impl BlockView {
     fn point_for_visual(
         &self,
         visual: VisualOffset,
-        bias: ProjectionBias,
+        bias: Bias,
     ) -> Result<(usize, LayoutPoint), LayoutError> {
         if visual > self.visual_len() {
             return Err(LayoutError::VisualOutOfBounds(visual));
         }
         let affinity = match bias {
-            ProjectionBias::Before => CaretAffinity::Upstream,
-            ProjectionBias::After => CaretAffinity::Downstream,
+            Bias::Before => CaretAffinity::Upstream,
+            Bias::After => CaretAffinity::Downstream,
         };
         if self.table.is_some() {
             return self.table_point_for_visual(visual, bias);
@@ -774,7 +798,7 @@ impl BlockView {
     fn table_point_for_visual(
         &self,
         visual: VisualOffset,
-        bias: ProjectionBias,
+        bias: Bias,
     ) -> Result<(usize, LayoutPoint), LayoutError> {
         let line_index = self.line_for_visual(visual, bias);
         let line = &self.lines[line_index];
@@ -785,8 +809,8 @@ impl BlockView {
             }
             if visual < cluster.visual.end() {
                 let x = match bias {
-                    ProjectionBias::Before => cluster.x,
-                    ProjectionBias::After => cluster.x + cluster.width,
+                    Bias::Before => cluster.x,
+                    Bias::After => cluster.x + cluster.width,
                 };
                 return Ok((line_index, LayoutPoint::new(x, line.bounds.y())));
             }
@@ -803,11 +827,11 @@ impl BlockView {
         ))
     }
 
-    fn line_for_visual(&self, visual: VisualOffset, bias: ProjectionBias) -> usize {
+    fn line_for_visual(&self, visual: VisualOffset, bias: Bias) -> usize {
         for (index, line) in self.lines.iter().enumerate() {
             if visual < line.visual.end()
                 || (visual == line.visual.end()
-                    && (bias == ProjectionBias::Before || index + 1 == self.lines.len()))
+                    && (bias == Bias::Before || index + 1 == self.lines.len()))
             {
                 return index;
             }
@@ -959,43 +983,23 @@ impl BlockView {
 
 /// 给每个视觉簇补上它的源码区间。
 ///
-/// 问的是 `Projection`，不是自己再算一遍——不变量 D4 说投影映射链只有一个
-/// 实现。簇与 run 都按视觉偏移升序，所以是一次归并走位。
+/// 问的是装饰集合的双向映射，不是自己再算一遍——不变量 D4 说投影映射链
+/// 只有一个实现。簇的起点取 `After`、终点取 `Before`：一个簇不该把它两边
+/// 被隐藏的语法也吞进来，否则选中一个字会连带选中它旁边的 `*`。
 fn source_backed_clusters(
-    projection: &Projection,
+    visual: &VisualText,
     layout: &BlockLayout,
     styles: &crate::blockinput::BlockStyleTable,
 ) -> Result<Vec<BlockCluster>, LayoutError> {
-    let mut runs = projection
-        .runs()
-        .iter()
-        .copied()
-        .filter(|run| run.kind() != VisualRunKind::HiddenSyntax)
-        .peekable();
-    let mut current: Option<VisualRun> = runs.next();
     let mut clusters = Vec::with_capacity(layout.clusters().len());
     for cluster in layout.clusters() {
-        while current.is_some_and(|run| {
-            run.visual().end() <= cluster.visual().start() && !run.visual().is_empty()
-        }) {
-            current = runs.next();
-        }
-        let run = current.ok_or(LayoutError::OffsetOverflow)?;
-        let local_start = cluster
-            .visual()
-            .start()
-            .get()
-            .checked_sub(run.visual().start().get())
-            .ok_or(LayoutError::OffsetOverflow)?;
-        let local_end = cluster
-            .visual()
-            .end()
-            .get()
-            .checked_sub(run.visual().start().get())
-            .ok_or(LayoutError::OffsetOverflow)?;
-        let source = projection
-            .source_range_for_run_slice(run, local_start, local_end)
+        let start = visual
+            .visual_to_source(cluster.visual().start(), Bias::After)
             .map_err(upstream)?;
+        let end = visual
+            .visual_to_source(cluster.visual().end(), Bias::Before)
+            .map_err(upstream)?;
+        let source = TextRange::new(start, end.max(start)).ok_or(LayoutError::OffsetOverflow)?;
         // 字型取**解释之后**的那个，不是 run 自己声明的那个：标题把每一段
         // 都排成粗体，栅格化必须按实际用的字面来，否则字画得比量出来的窄。
         let style = styles
@@ -1079,11 +1083,8 @@ fn source_backed_glyphs(
 /// 一直算到块的结尾。这样**每一个源码字节都恰好属于一行**，包括被隐藏的
 /// 语法标记——代码围栏的收尾那一行看起来是空的，但它拥有 ``` 那几个字节，
 /// 少了这一条，按行查源码就会漏掉它们。
-fn flow_lines(
-    projection: &Projection,
-    layout: &BlockLayout,
-) -> Result<Vec<BlockLine>, LayoutError> {
-    let block = projection.source_range();
+fn flow_lines(visual: &VisualText, layout: &BlockLayout) -> Result<Vec<BlockLine>, LayoutError> {
+    let block = visual.source_range();
     let mut lines = Vec::with_capacity(layout.lines().len());
     let mut start = block.start();
     let count = layout.lines().len();
@@ -1091,8 +1092,8 @@ fn flow_lines(
         let end = if line.index() + 1 == count {
             block.end()
         } else {
-            projection
-                .visual_to_source(line.visual().end(), ProjectionBias::Before)
+            visual
+                .visual_to_source(line.visual().end(), Bias::Before)
                 .map_err(upstream)?
         };
         let end = end.max(start).min(block.end());
@@ -1108,4 +1109,28 @@ fn flow_lines(
         start = end;
     }
     Ok(lines)
+}
+
+/// 这个块带着的表格网格，没有就是 `None`。
+fn table_of(decorations: &BlockDecorations) -> Option<&yu_markdown::TableBlock> {
+    decorations
+        .line_styles()
+        .iter()
+        .find_map(|ornament| match ornament {
+            BlockOrnament::Table(table) => Some(table),
+            _ => None,
+        })
+}
+
+/// 一段源码区间平移 `delta` 个字节。
+pub(crate) fn shift_range(range: TextRange, delta: i64) -> Result<TextRange, LayoutError> {
+    let shift = |offset: ByteOffset| -> Option<ByteOffset> {
+        u64::try_from(i64::try_from(offset.get()).ok()?.checked_add(delta)?)
+            .ok()
+            .map(ByteOffset::new)
+    };
+    shift(range.start())
+        .zip(shift(range.end()))
+        .and_then(|(start, end)| TextRange::new(start, end))
+        .ok_or(LayoutError::OffsetOverflow)
 }

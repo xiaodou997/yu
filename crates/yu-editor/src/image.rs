@@ -16,14 +16,14 @@
 //! `DecorationSet` 一起变成 widget，那时 `apply_intrinsic_size` 这套
 //! 「解码后改尺寸再重排」正好就是不变量 D7 的 placeholder → ready → 重排。
 
-use yu_core::TextRange;
+use yu_core::{TextRange, VisualRange};
+use yu_decoration::Bias;
 use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
-use yu_projection::{ProjectionBias, VisualRange};
+use yu_markdown::{BlockAnnotation, ImageSpan};
 
-use crate::blockview::{BlockHit, BlockView};
-use crate::geometry::{map_source_range, source_range_contains, upstream};
+use crate::blockview::{BlockHit, BlockView, shift_range};
+use crate::geometry::{source_range_contains, upstream};
 use crate::table::TableLayout;
-use yu_text::ChangeSet;
 
 /// 一张图片占的位置。
 ///
@@ -89,11 +89,7 @@ impl ImagePlacement {
                 },
                 self.bounds.y(),
             ),
-            if before {
-                ProjectionBias::Before
-            } else {
-                ProjectionBias::After
-            },
+            if before { Bias::Before } else { Bias::After },
             self.source,
         )
     }
@@ -114,10 +110,10 @@ impl ImagePlacement {
         Ok(())
     }
 
-    pub(crate) fn map_through(self, changes: &ChangeSet) -> Result<Self, LayoutError> {
+    pub(crate) fn shifted(self, delta: i64) -> Result<Self, LayoutError> {
         Ok(Self {
-            source: map_source_range(self.source, changes)?,
-            label: map_source_range(self.label, changes)?,
+            source: shift_range(self.source, delta)?,
+            label: shift_range(self.label, delta)?,
             ..self
         })
     }
@@ -129,19 +125,28 @@ impl ImagePlacement {
 /// 宽度。标签本身仍然在视觉文本里可编辑（不变量 I5：不支持的语法按源码
 /// 画出来，永不白屏）。
 pub(crate) fn build_image_placements(view: &BlockView) -> Result<Vec<ImagePlacement>, LayoutError> {
-    let projection = view.projection();
+    let text = view.visual();
     let config = view.config();
-    let mut placements = Vec::with_capacity(projection.images().len());
-    for image in projection.images().iter().copied() {
-        let visual_start = projection
-            .source_to_visual(image.label().start(), ProjectionBias::Before)
+    let annotated: Vec<ImageSpan> = view
+        .decorations()
+        .annotations()
+        .iter()
+        .map(|annotation| {
+            let BlockAnnotation::Image(image) = annotation;
+            *image
+        })
+        .collect();
+    let mut placements = Vec::with_capacity(annotated.len());
+    for image in annotated {
+        let visual_start = text
+            .source_to_visual(image.label().start(), Bias::Before)
             .map_err(upstream)?;
-        let visual_end = projection
-            .source_to_visual(image.label().end(), ProjectionBias::After)
+        let visual_end = text
+            .source_to_visual(image.label().end(), Bias::After)
             .map_err(upstream)?;
-        let visual =
-            VisualRange::new(visual_start, visual_end).ok_or(LayoutError::OffsetOverflow)?;
-        let caret = view.caret_for_visual(visual.start(), ProjectionBias::Before)?;
+        let visual = VisualRange::new(visual_start, visual_end.max(visual_start))
+            .ok_or(LayoutError::OffsetOverflow)?;
+        let caret = view.caret_for_visual(visual.start(), Bias::Before)?;
         let line = view
             .lines()
             .get(caret.line())
