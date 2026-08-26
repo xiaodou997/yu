@@ -12,7 +12,6 @@ use std::fmt;
 
 use yu_core::{GeometryError, Revision, TextRange};
 use yu_font::{AtlasEntry, GlyphRasterKey};
-use yu_layout::{LayoutRect, LayoutSnapshot};
 
 mod viewport;
 
@@ -261,49 +260,50 @@ impl EmbeddedSvgPrimitive {
     }
 }
 
-/// Semantic role for a source-backed table decoration. The renderer may map
-/// all roles to solid fills today, while native selection/accessibility layers
-/// can still distinguish header, selection and grid geometry without re-parsing
-/// the document.
+/// 一块装饰画的是什么层。
+///
+/// 后端今天把每一层都落成一个实心矩形；把层次留在 retained scene 里，是为了
+/// 让原生诊断、选中与 Accessibility 分辨得出「这是边框还是填充」，而不必
+/// 回头去解析文档。
+///
+/// 它是**渲染中立**的词汇：`Border` 就是一条边框，不管它属于表格、任务框
+/// 还是别的什么。此前这里有三套按语法命名的 primitive（表格 / 引用条 /
+/// 任务框），一种语法一条全链路，正是 overview-v2 §2.1 点名的泄漏。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TablePrimitiveRole {
-    HeaderFill,
-    SelectionFill,
+pub enum OrnamentRole {
+    /// 衬在内容底下的一块底色。
+    Background,
+    /// 盖在内容上的一块填充（选中高亮之类）。
+    Fill,
+    /// 一条边框线。
     Border,
+    /// 一条贴着内容左侧或上方的装饰条。
+    Bar,
+    /// 一个记号（勾、点）。
+    Mark,
 }
 
-/// One source-backed table decoration. `source` identifies the cell for a
-/// header/selection fill and the complete table range for a border.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TablePrimitive {
-    source: yu_core::TextRange,
-    bounds: Rect,
-    color: Rgba8,
-    role: TablePrimitiveRole,
-}
-
-/// 一条贴着行的装饰条：一个 source-backed 的实心矩形。
+/// 一块 source-backed 的装饰矩形。
 ///
-/// 它的几何与颜色都由调用方给。这一层不知道这条是干什么用的——多条共享同一个
-/// source 就是嵌套，但「嵌套的是什么」不是这里的事（不变量 E1）。
-///
-/// 它原来以一种具体语法命名，是 overview-v2 §2.1 点名的那种泄漏：一种语法
-/// 一个 primitive。改名之后它是行级装饰的通用载体，`Decoration::Line` 想画
-/// 什么条都走它。
+/// `source` 指着它对应的那段源码——一个单元格、一段被引用的正文、一个
+/// `[x]` 标记。几何与颜色都由调用方给：这一层只负责把它们留在场景里并
+/// 参与 damage 计算。
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LineOrnamentPrimitive {
+pub struct OrnamentPrimitive {
     source: TextRange,
     bounds: Rect,
     color: Rgba8,
+    role: OrnamentRole,
 }
 
-impl LineOrnamentPrimitive {
+impl OrnamentPrimitive {
     #[must_use]
-    pub const fn new(source: TextRange, bounds: Rect, color: Rgba8) -> Self {
+    pub const fn new(source: TextRange, bounds: Rect, color: Rgba8, role: OrnamentRole) -> Self {
         Self {
             source,
             bounds,
             color,
+            role,
         }
     }
 
@@ -321,30 +321,11 @@ impl LineOrnamentPrimitive {
     pub const fn color(self) -> Rgba8 {
         self.color
     }
-}
 
-/// Semantic layer of a source-backed task checkbox decoration.
-///
-/// The backend currently lowers every layer to a solid rectangle. Keeping the
-/// role in the retained scene preserves enough information for diagnostics
-/// and a future vector renderer without making the renderer parse the document.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TaskCheckboxPrimitiveRole {
-    Border,
-    Interior,
-    Check,
-}
-
-/// One rectangle belonging to a projected task checkbox.
-///
-/// `source` is the parser-owned `[ ]`/`[x]` marker range. Multiple layers may
-/// refer to the same range; insertion order is their painter order.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TaskCheckboxPrimitive {
-    source: TextRange,
-    bounds: Rect,
-    color: Rgba8,
-    role: TaskCheckboxPrimitiveRole,
+    #[must_use]
+    pub const fn role(self) -> OrnamentRole {
+        self.role
+    }
 }
 
 /// Semantic role for transient editor chrome retained with a visual frame.
@@ -409,125 +390,102 @@ impl EditorDecorationPrimitive {
     }
 }
 
-impl TaskCheckboxPrimitive {
-    #[must_use]
-    pub const fn new(
-        source: TextRange,
-        bounds: Rect,
-        color: Rgba8,
-        role: TaskCheckboxPrimitiveRole,
-    ) -> Self {
-        Self {
-            source,
-            bounds,
-            color,
-            role,
-        }
-    }
-
-    #[must_use]
-    pub const fn source(self) -> TextRange {
-        self.source
-    }
-
-    #[must_use]
-    pub const fn bounds(self) -> Rect {
-        self.bounds
-    }
-
-    #[must_use]
-    pub const fn color(self) -> Rgba8 {
-        self.color
-    }
-
-    #[must_use]
-    pub const fn role(self) -> TaskCheckboxPrimitiveRole {
-        self.role
-    }
-}
-
-impl TablePrimitive {
-    #[must_use]
-    pub const fn new(
-        source: yu_core::TextRange,
-        bounds: Rect,
-        color: Rgba8,
-        role: TablePrimitiveRole,
-    ) -> Self {
-        Self {
-            source,
-            bounds,
-            color,
-            role,
-        }
-    }
-
-    #[must_use]
-    pub const fn source(self) -> yu_core::TextRange {
-        self.source
-    }
-
-    #[must_use]
-    pub const fn bounds(self) -> Rect {
-        self.bounds
-    }
-
-    #[must_use]
-    pub const fn color(self) -> Rgba8 {
-        self.color
-    }
-
-    #[must_use]
-    pub const fn role(self) -> TablePrimitiveRole {
-        self.role
-    }
-}
-
-/// Colors and border width used when projecting a table layout into scene
-/// decorations. `None` disables the corresponding fill while a zero border
-/// width disables grid lines.
+/// 一个要画的字形：字面、字形 id、block 局部的基线左端、字号倍率。
+///
+/// 场景层要的只有这四样。它不认识布局的盒子类型，也不认识源码坐标——
+/// 那些属于上面那层（不变量 E1、E2）。
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TableSceneStyle {
-    border_width: f32,
-    border_color: Rgba8,
-    header_fill: Option<Rgba8>,
-    selection_fill: Option<Rgba8>,
+pub struct SceneGlyph {
+    face: yu_font::FontFaceId,
+    glyph: yu_font::GlyphId,
+    origin: yu_core::Point<yu_core::Block>,
+    size_scale: f32,
 }
 
-impl TableSceneStyle {
+impl SceneGlyph {
     #[must_use]
     pub const fn new(
-        border_width: f32,
-        border_color: Rgba8,
-        header_fill: Option<Rgba8>,
-        selection_fill: Option<Rgba8>,
+        face: yu_font::FontFaceId,
+        glyph: yu_font::GlyphId,
+        origin: yu_core::Point<yu_core::Block>,
+        size_scale: f32,
     ) -> Self {
         Self {
-            border_width,
-            border_color,
-            header_fill,
-            selection_fill,
+            face,
+            glyph,
+            origin,
+            size_scale,
         }
     }
 
     #[must_use]
-    pub const fn border_width(self) -> f32 {
-        self.border_width
+    pub const fn face(self) -> yu_font::FontFaceId {
+        self.face
     }
 
     #[must_use]
-    pub const fn border_color(self) -> Rgba8 {
-        self.border_color
+    pub const fn glyph(self) -> yu_font::GlyphId {
+        self.glyph
     }
 
     #[must_use]
-    pub const fn header_fill(self) -> Option<Rgba8> {
-        self.header_fill
+    pub const fn origin(self) -> yu_core::Point<yu_core::Block> {
+        self.origin
     }
 
     #[must_use]
-    pub const fn selection_fill(self) -> Option<Rgba8> {
-        self.selection_fill
+    pub const fn size_scale(self) -> f32 {
+        self.size_scale
+    }
+}
+
+/// 一个可见块在这一帧里要画的东西。
+///
+/// 画家顺序就是字段顺序：底色 → 装饰 → 字形 → 图片。装饰在字形之前，
+/// 所以单元格底色盖不住它自己的文字；图片在字形之后，所以一张就绪的图
+/// 盖得住它替代的那段文本。
+#[derive(Clone, Copy, Debug)]
+pub struct ViewportBlockContent<'a> {
+    revision: Revision,
+    source: TextRange,
+    glyphs: &'a [SceneGlyph],
+    fill: Option<Rgba8>,
+    ornaments: &'a [OrnamentPrimitive],
+    images: &'a [ImagePrimitive],
+}
+
+impl<'a> ViewportBlockContent<'a> {
+    #[must_use]
+    pub const fn new(revision: Revision, source: TextRange, glyphs: &'a [SceneGlyph]) -> Self {
+        Self {
+            revision,
+            source,
+            glyphs,
+            fill: None,
+            ornaments: &[],
+            images: &[],
+        }
+    }
+
+    /// 整块的底色。铺满视口宽度，衬在所有内容底下。
+    #[must_use]
+    pub const fn with_fill(mut self, fill: Option<Rgba8>) -> Self {
+        self.fill = fill;
+        self
+    }
+
+    /// 已经搬到文档坐标的装饰矩形。
+    #[must_use]
+    pub const fn with_ornaments(mut self, ornaments: &'a [OrnamentPrimitive]) -> Self {
+        self.ornaments = ornaments;
+        self
+    }
+
+    /// 已经搬到文档坐标的图片。
+    #[must_use]
+    pub const fn with_images(mut self, images: &'a [ImagePrimitive]) -> Self {
+        self.images = images;
+        self
     }
 }
 
@@ -538,9 +496,7 @@ pub enum Primitive {
     Glyph(GlyphPrimitive),
     Image(ImagePrimitive),
     EmbeddedSvg(EmbeddedSvgPrimitive),
-    LineOrnament(LineOrnamentPrimitive),
-    Table(TablePrimitive),
-    TaskCheckbox(TaskCheckboxPrimitive),
+    Ornament(OrnamentPrimitive),
     EditorDecoration(EditorDecorationPrimitive),
 }
 
@@ -552,9 +508,7 @@ impl Primitive {
             Self::Glyph(glyph) => glyph.bounds(),
             Self::Image(image) => image.bounds(),
             Self::EmbeddedSvg(svg) => svg.bounds(),
-            Self::LineOrnament(ornament) => ornament.bounds(),
-            Self::Table(table) => table.bounds(),
-            Self::TaskCheckbox(task) => task.bounds(),
+            Self::Ornament(ornament) => ornament.bounds(),
             Self::EditorDecoration(decoration) => decoration.bounds(),
         }
     }
@@ -642,7 +596,6 @@ pub enum SceneError {
         width: u32,
         height: u32,
     },
-    InvalidTableStyle(u32),
     RevisionMismatch {
         scene: Revision,
         layout: Revision,
@@ -667,11 +620,6 @@ impl fmt::Display for SceneError {
             Self::InvalidEmbeddedDimensions { width, height } => write!(
                 formatter,
                 "embedded SVG dimensions must be positive, got {width}x{height}"
-            ),
-            Self::InvalidTableStyle(width) => write!(
-                formatter,
-                "invalid table border width {}",
-                f32::from_bits(*width)
             ),
             Self::RevisionMismatch { scene, layout } => write!(
                 formatter,
@@ -749,18 +697,11 @@ impl Scene {
 /// 原来这里有两个函数：一个收 `LayoutRect`，一个收 `Rect`——后者的入参其实
 /// 也是 block 局部坐标，只是被当成文档坐标构造出来的，两个空间在类型上分不
 /// 开。现在 `LayoutRect` 就是 `Rect<Block>`，两者合而为一。
-fn translate_block_rect(rect: yu_layout::LayoutRect, origin: Point) -> Result<Rect, SceneError> {
+pub fn translate_block_rect(
+    rect: yu_layout::LayoutRect,
+    origin: Point,
+) -> Result<Rect, SceneError> {
     Ok(rect.translate_into(origin)?)
-}
-
-fn ranges_intersect_or_caret(selection: yu_core::TextRange, cell: yu_core::TextRange) -> bool {
-    if selection.is_empty() {
-        if cell.is_empty() {
-            return selection.start() == cell.start();
-        }
-        return cell.contains(selection.start());
-    }
-    selection.start() < cell.end() && cell.start() < selection.end()
 }
 
 /// Builds a scene while keeping primitive and damage order deterministic.
@@ -830,12 +771,8 @@ impl SceneBuilder {
         self.push(Primitive::EmbeddedSvg(svg))
     }
 
-    pub fn line_ornament(&mut self, ornament: LineOrnamentPrimitive) -> Result<u32, SceneError> {
-        self.push(Primitive::LineOrnament(ornament))
-    }
-
-    pub fn task_checkbox(&mut self, task: TaskCheckboxPrimitive) -> Result<u32, SceneError> {
-        self.push(Primitive::TaskCheckbox(task))
+    pub fn ornament(&mut self, ornament: OrnamentPrimitive) -> Result<u32, SceneError> {
+        self.push(Primitive::Ornament(ornament))
     }
 
     pub fn editor_decoration(
@@ -845,302 +782,38 @@ impl SceneBuilder {
         self.push(Primitive::EditorDecoration(decoration))
     }
 
-    /// Appends source-backed table header, selection and grid decorations.
-    /// The table layout remains block-local; `origin` moves its geometry into
-    /// document/scene coordinates without copying cell text.
-    pub fn append_table(
+    /// 把一组字形追加进场景。
+    ///
+    /// `origin` 是这个 block 左上角在文档坐标里的位置；字形的坐标是 block
+    /// 局部的，只有这里把它们搬过去。atlas 查表在改动场景**之前**全部做完，
+    /// 所以一次失败不会留下画了一半的块。
+    pub fn append_glyphs(
         &mut self,
-        layout: &yu_layout::TableLayoutSnapshot,
-        origin: Point,
-        style: TableSceneStyle,
-    ) -> Result<usize, SceneError> {
-        self.append_table_with_selection(layout, origin, style, None)
-    }
-
-    /// Appends table decorations and highlights every visible cell whose
-    /// source range intersects `selection`. A collapsed selection highlights
-    /// the cell containing its source caret; an unrelated selection produces
-    /// no selection primitive.
-    pub fn append_table_with_selection(
-        &mut self,
-        layout: &yu_layout::TableLayoutSnapshot,
-        origin: Point,
-        style: TableSceneStyle,
-        selection: Option<yu_core::TextRange>,
-    ) -> Result<usize, SceneError> {
-        let primitives = self.collect_table_primitives(layout, origin, style, selection)?;
-        self.commit_primitives(primitives)
-    }
-
-    fn collect_table_primitives(
-        &self,
-        layout: &yu_layout::TableLayoutSnapshot,
-        origin: Point,
-        style: TableSceneStyle,
-        selection: Option<yu_core::TextRange>,
-    ) -> Result<Vec<Primitive>, SceneError> {
-        if self.revision != layout.revision() {
-            return Err(SceneError::RevisionMismatch {
-                scene: self.revision,
-                layout: layout.revision(),
-            });
-        }
-        if !origin.is_finite() {
-            return Err(SceneError::InvalidGeometry(
-                "block origin must contain finite coordinates",
-            ));
-        }
-        if !style.border_width().is_finite() || style.border_width() < 0.0 {
-            return Err(SceneError::InvalidTableStyle(
-                style.border_width().to_bits(),
-            ));
-        }
-
-        let table_source = layout.source_range();
-        let mut primitives = Vec::new();
-        if let Some(color) = style.header_fill() {
-            for cell in layout
-                .cells()
-                .iter()
-                .copied()
-                .filter(|cell| cell.row() == 0)
-            {
-                primitives.push(Primitive::Table(TablePrimitive::new(
-                    cell.source(),
-                    translate_block_rect(cell.bounds(), origin)?,
-                    color,
-                    TablePrimitiveRole::HeaderFill,
-                )));
-            }
-        }
-        if let Some(color) = style.selection_fill() {
-            for cell in layout.cells().iter().copied() {
-                if selection.is_some_and(|range| ranges_intersect_or_caret(range, cell.source())) {
-                    primitives.push(Primitive::Table(TablePrimitive::new(
-                        cell.source(),
-                        translate_block_rect(cell.bounds(), origin)?,
-                        color,
-                        TablePrimitiveRole::SelectionFill,
-                    )));
-                }
-            }
-        }
-
-        let border_width = style.border_width();
-        let bounds = layout.bounds();
-        let thickness_x = border_width.min(bounds.width());
-        let thickness_y = border_width.min(bounds.height());
-        if thickness_x > 0.0 && thickness_y > 0.0 {
-            let border_color = style.border_color();
-            let total_width = bounds.width();
-            let total_height = bounds.height();
-            let mut x = 0.0;
-            for column_width in layout.column_widths() {
-                primitives.push(Primitive::Table(TablePrimitive::new(
-                    table_source,
-                    translate_block_rect(
-                        LayoutRect::new(x, 0.0, thickness_x, total_height)?,
-                        origin,
-                    )?,
-                    border_color,
-                    TablePrimitiveRole::Border,
-                )));
-                x += *column_width;
-            }
-            primitives.push(Primitive::Table(TablePrimitive::new(
-                table_source,
-                translate_block_rect(
-                    LayoutRect::new(
-                        (total_width - thickness_x).max(0.0),
-                        0.0,
-                        thickness_x,
-                        total_height,
-                    )?,
-                    origin,
-                )?,
-                border_color,
-                TablePrimitiveRole::Border,
-            )));
-
-            let mut y = 0.0;
-            let row_count = layout
-                .cells()
-                .iter()
-                .map(|cell| cell.row())
-                .max()
-                .map_or(0, |row| row.saturating_add(1));
-            for _ in 0..row_count {
-                primitives.push(Primitive::Table(TablePrimitive::new(
-                    table_source,
-                    translate_block_rect(
-                        LayoutRect::new(0.0, y, total_width, thickness_y)?,
-                        origin,
-                    )?,
-                    border_color,
-                    TablePrimitiveRole::Border,
-                )));
-                y += layout.row_height();
-            }
-            primitives.push(Primitive::Table(TablePrimitive::new(
-                table_source,
-                translate_block_rect(
-                    LayoutRect::new(
-                        0.0,
-                        (total_height - thickness_y).max(0.0),
-                        total_width,
-                        thickness_y,
-                    )?,
-                    origin,
-                )?,
-                border_color,
-                TablePrimitiveRole::Border,
-            )));
-        }
-        Ok(primitives)
-    }
-
-    /// Appends all shaped glyphs from a layout using entries already present
-    /// in the CPU atlas. The operation is revision-bound and resolves every
-    /// atlas entry before mutating the scene, so a failed lookup cannot leave
-    /// a partially appended layout.
-    pub fn append_layout(
-        &mut self,
-        layout: &LayoutSnapshot,
-        atlas: &yu_font::GlyphAtlas,
-        font_size: f32,
-        color: Rgba8,
-    ) -> Result<usize, SceneError> {
-        self.append_layout_at(layout, atlas, font_size, color, Point::new(0.0, 0.0))
-    }
-
-    /// Appends all shaped glyphs from a block layout at a document-space
-    /// origin. Layout coordinates remain block-local; only the scene origin
-    /// translates them, so the viewport height index remains the sole source
-    /// of block positioning.
-    pub fn append_layout_at(
-        &mut self,
-        layout: &LayoutSnapshot,
+        glyphs: &[SceneGlyph],
         atlas: &yu_font::GlyphAtlas,
         font_size: f32,
         color: Rgba8,
         origin: Point,
     ) -> Result<usize, SceneError> {
-        let primitives =
-            self.collect_layout_primitives_at(layout, atlas, font_size, color, origin)?;
+        let primitives = self.collect_glyphs(glyphs, atlas, font_size, color, origin)?;
         self.commit_glyphs(primitives)
     }
 
-    /// Appends every visible block in one preflighted scene transaction.
+    /// 一帧里所有可见块，一次事务提交。
     ///
-    /// The layouts are block-local and must be in the same order as
-    /// `input.blocks()`. Every revision, source range, atlas lookup, geometry
-    /// and primitive-budget check completes before the scene is mutated, so a
-    /// stale or partially materialized viewport cannot publish a prefix of its
-    /// primitives.
+    /// 每个块的内容由调用方装配好（[`ViewportBlockContent`]）：底色、装饰、
+    /// 字形、图片。**这一层不知道那些装饰是什么语法**——它只按画家顺序摆
+    /// 矩形和字形（不变量 E1）。
+    ///
+    /// revision、源码范围、atlas 查表、几何与 primitive 预算全部在改动场景
+    /// 之前校验完；一个过期或半成品的视口不可能只发布出它的前一半。
     pub fn append_viewport(
         &mut self,
         input: &ViewportSceneInput,
-        layouts: &[&LayoutSnapshot],
+        blocks: &[ViewportBlockContent<'_>],
         atlas: &yu_font::GlyphAtlas,
         font_size: f32,
         color: Rgba8,
-    ) -> Result<usize, SceneError> {
-        self.append_viewport_with_fills(input, layouts, atlas, font_size, color, &[])
-    }
-
-    /// Appends every visible block and optional background fills in one
-    /// preflighted scene transaction. `fills` is ordered like
-    /// `input.blocks()`; a `None` entry keeps the block glyph-only. The scene
-    /// layer stays document-agnostic: callers choose a color from their own
-    /// block-kind/style policy, while this method only validates geometry and
-    /// preserves fill-before-glyph painter order.
-    pub fn append_viewport_with_fills(
-        &mut self,
-        input: &ViewportSceneInput,
-        layouts: &[&LayoutSnapshot],
-        atlas: &yu_font::GlyphAtlas,
-        font_size: f32,
-        color: Rgba8,
-        fills: &[Option<Rgba8>],
-    ) -> Result<usize, SceneError> {
-        self.append_viewport_with_fills_and_images(
-            input,
-            layouts,
-            atlas,
-            font_size,
-            color,
-            fills,
-            &[],
-        )
-    }
-
-    /// Appends visible blocks with optional backgrounds and source-backed
-    /// image overlays. Images are ordered after the block's glyphs so an
-    /// opaque ready texture or fallback placeholder covers the projected alt
-    /// label without changing canonical source text.
-    #[allow(clippy::too_many_arguments)]
-    pub fn append_viewport_with_fills_and_images(
-        &mut self,
-        input: &ViewportSceneInput,
-        layouts: &[&LayoutSnapshot],
-        atlas: &yu_font::GlyphAtlas,
-        font_size: f32,
-        color: Rgba8,
-        fills: &[Option<Rgba8>],
-        images: &[Vec<ImagePrimitive>],
-    ) -> Result<usize, SceneError> {
-        self.append_viewport_with_fills_and_images_and_tables(
-            input, layouts, atlas, font_size, color, fills, images, None, None,
-        )
-    }
-
-    /// Appends visible blocks with optional table decorations. Table fills and
-    /// borders are emitted before the block glyphs, so a cell overlay cannot
-    /// cover its source-backed text. The optional selection is source-based
-    /// and is applied only to table layouts in the same revision.
-    #[allow(clippy::too_many_arguments)]
-    pub fn append_viewport_with_fills_and_images_and_tables(
-        &mut self,
-        input: &ViewportSceneInput,
-        layouts: &[&LayoutSnapshot],
-        atlas: &yu_font::GlyphAtlas,
-        font_size: f32,
-        color: Rgba8,
-        fills: &[Option<Rgba8>],
-        images: &[Vec<ImagePrimitive>],
-        table_style: Option<TableSceneStyle>,
-        selection: Option<yu_core::TextRange>,
-    ) -> Result<usize, SceneError> {
-        self.append_viewport_with_decorations(
-            input,
-            layouts,
-            atlas,
-            font_size,
-            color,
-            fills,
-            images,
-            table_style,
-            selection,
-            None,
-        )
-    }
-
-    /// Appends visible blocks with table and line-ornament decorations before
-    /// glyph content. Document meaning remains outside the scene layer: layout
-    /// supplies source-backed bar geometry and the caller supplies the color.
-    #[allow(clippy::too_many_arguments)]
-    pub fn append_viewport_with_decorations(
-        &mut self,
-        input: &ViewportSceneInput,
-        layouts: &[&LayoutSnapshot],
-        atlas: &yu_font::GlyphAtlas,
-        font_size: f32,
-        color: Rgba8,
-        fills: &[Option<Rgba8>],
-        images: &[Vec<ImagePrimitive>],
-        table_style: Option<TableSceneStyle>,
-        selection: Option<yu_core::TextRange>,
-        block_quote_color: Option<Rgba8>,
     ) -> Result<usize, SceneError> {
         if input.revision() != self.revision {
             return Err(SceneError::ViewportRevisionMismatch {
@@ -1148,106 +821,62 @@ impl SceneBuilder {
                 actual: input.revision(),
             });
         }
-        if layouts.len() != input.blocks().len() {
+        if blocks.len() != input.blocks().len() {
             return Err(SceneError::InvalidViewportInput(
-                "viewport layout count must match input blocks",
-            ));
-        }
-        if !fills.is_empty() && fills.len() != input.blocks().len() {
-            return Err(SceneError::InvalidViewportInput(
-                "viewport fill count must match input blocks",
-            ));
-        }
-        if !images.is_empty() && images.len() != input.blocks().len() {
-            return Err(SceneError::InvalidViewportInput(
-                "viewport image count must match input blocks",
+                "viewport block count must match input blocks",
             ));
         }
 
         let mut primitives = Vec::new();
-        for (offset, (geometry, layout)) in input
-            .blocks()
-            .iter()
-            .copied()
-            .zip(layouts.iter().copied())
-            .enumerate()
-        {
+        for (geometry, content) in input.blocks().iter().copied().zip(blocks) {
             if geometry.revision() != self.revision {
                 return Err(SceneError::ViewportRevisionMismatch {
                     expected: self.revision,
                     actual: geometry.revision(),
                 });
             }
-            if layout.revision() != geometry.revision() {
+            if content.revision != geometry.revision() {
                 return Err(SceneError::RevisionMismatch {
                     scene: geometry.revision(),
-                    layout: layout.revision(),
+                    layout: content.revision,
                 });
             }
-            if layout.source_range() != geometry.source() {
+            if content.source != geometry.source() {
                 return Err(SceneError::ViewportSourceMismatch);
             }
-            if let Some(fill) = fills.get(offset).copied().flatten() {
-                let bounds = Rect::new(
-                    self.viewport.x(),
-                    geometry.y(),
-                    self.viewport.width(),
-                    geometry.height(),
-                )?;
+            let origin = Point::new(0.0, geometry.y());
+            if let Some(fill) = content.fill {
                 primitives.push(Primitive::FillRect {
-                    bounds,
+                    bounds: Rect::new(
+                        self.viewport.x(),
+                        geometry.y(),
+                        self.viewport.width(),
+                        geometry.height(),
+                    )?,
                     color: fill,
                 });
             }
-            if let (Some(style), Some(table)) = (table_style, layout.table()) {
-                primitives.extend(self.collect_table_primitives(
-                    table,
-                    Point::new(0.0, geometry.y()),
-                    style,
-                    selection,
-                )?);
-            }
-            if let (Some(quote_color), Some(quote)) = (block_quote_color, layout.block_quote()) {
-                for bounds in quote.bars().iter().copied() {
-                    primitives.push(Primitive::LineOrnament(LineOrnamentPrimitive::new(
-                        quote.source(),
-                        translate_block_rect(bounds, Point::new(0.0, geometry.y()))?,
-                        quote_color,
-                    )));
-                }
+            for ornament in content.ornaments {
+                primitives.push(Primitive::Ornament(*ornament));
             }
             primitives.extend(
-                self.collect_layout_primitives_at(
-                    layout,
-                    atlas,
-                    font_size,
-                    color,
-                    Point::new(0.0, geometry.y()),
-                )?
-                .into_iter()
-                .map(Primitive::Glyph),
+                self.collect_glyphs(content.glyphs, atlas, font_size, color, origin)?
+                    .into_iter()
+                    .map(Primitive::Glyph),
             );
-            if let Some(block_images) = images.get(offset) {
-                primitives.extend(block_images.iter().copied().map(Primitive::Image));
-            }
+            primitives.extend(content.images.iter().copied().map(Primitive::Image));
         }
         self.commit_primitives(primitives)
     }
 
-    fn collect_layout_primitives_at(
+    fn collect_glyphs(
         &self,
-        layout: &LayoutSnapshot,
+        glyphs: &[SceneGlyph],
         atlas: &yu_font::GlyphAtlas,
         font_size: f32,
         color: Rgba8,
         origin: Point,
     ) -> Result<Vec<GlyphPrimitive>, SceneError> {
-        if self.revision != layout.revision() {
-            return Err(SceneError::RevisionMismatch {
-                scene: self.revision,
-                layout: layout.revision(),
-            });
-        }
         if !origin.is_finite() {
             return Err(SceneError::InvalidGeometry(
                 "block origin must contain finite coordinates",
@@ -1257,20 +886,21 @@ impl SceneBuilder {
             return Err(SceneError::InvalidFontSize(font_size.to_bits()));
         }
 
-        let mut primitives = Vec::with_capacity(layout.glyphs().len());
-        for placement in layout.glyphs() {
-            let glyph_size = font_size * placement.font_scale();
+        let mut primitives = Vec::with_capacity(glyphs.len());
+        for placement in glyphs.iter().copied() {
+            let glyph_size = font_size * placement.size_scale();
             let key = GlyphRasterKey::new(placement.face(), placement.glyph(), glyph_size)
                 .map_err(|_| SceneError::InvalidFontSize(glyph_size.to_bits()))?;
             let entry = atlas.entry(key).ok_or(SceneError::MissingGlyphAtlas(key))?;
-            let glyph = GlyphPrimitive::new(
+            primitives.push(GlyphPrimitive::new(
                 entry,
-                Point::new(origin.x() + placement.x(), origin.y() + placement.y()),
+                Point::new(
+                    origin.x() + placement.origin().x(),
+                    origin.y() + placement.origin().y(),
+                ),
                 color,
-            )?;
-            primitives.push(glyph);
+            )?);
         }
-
         Ok(primitives)
     }
 
@@ -1301,41 +931,6 @@ impl SceneBuilder {
         Ok(count)
     }
 
-    /// Appends one visible block layout using the document-space origin from
-    /// a validated viewport input. The source range and revision checks keep
-    /// a stale/local layout from being painted at another block's origin.
-    pub fn append_layout_at_block(
-        &mut self,
-        geometry: ViewportBlockGeometry,
-        layout: &LayoutSnapshot,
-        atlas: &yu_font::GlyphAtlas,
-        font_size: f32,
-        color: Rgba8,
-    ) -> Result<usize, SceneError> {
-        if geometry.revision() != self.revision {
-            return Err(SceneError::ViewportRevisionMismatch {
-                expected: self.revision,
-                actual: geometry.revision(),
-            });
-        }
-        if layout.revision() != geometry.revision() {
-            return Err(SceneError::RevisionMismatch {
-                scene: geometry.revision(),
-                layout: layout.revision(),
-            });
-        }
-        if layout.source_range() != geometry.source() {
-            return Err(SceneError::ViewportSourceMismatch);
-        }
-        self.append_layout_at(
-            layout,
-            atlas,
-            font_size,
-            color,
-            Point::new(0.0, geometry.y()),
-        )
-    }
-
     #[must_use]
     pub fn finish(self) -> Scene {
         Scene {
@@ -1354,8 +949,6 @@ mod tests {
     use yu_font::{
         GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
     };
-    use yu_projection::Projection;
-    use yu_text::TextBuffer;
 
     fn atlas_entry(glyph: u32) -> AtlasEntry {
         let key = GlyphRasterKey::new(
@@ -1433,142 +1026,78 @@ mod tests {
         assert_eq!(DamageSet::new(0), Err(SceneError::InvalidDamageBudget));
     }
 
+    /// 装饰的顺序就是插入顺序，几何搬到文档坐标，身份留着源码范围。
+    ///
+    /// 这里不再有表格：`yu-scene` 已经不认识它了（不变量 E1）。表格的网格
+    /// 由 `yu-workspace` 算完再交进来，那一段的用例住在那里。
     #[test]
-    fn table_scene_primitives_are_source_backed_and_painter_ordered() {
-        let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
-        let buffer = TextBuffer::new(source);
-        let snapshot = buffer.snapshot();
-        let markdown = yu_markdown::parse(&snapshot);
-        let block = markdown.blocks().get(0).expect("table block");
-        let projection = yu_projection::BlockProjection::from_block_with_definitions(
-            &snapshot,
-            block,
-            markdown.reference_definitions(),
-        )
-        .expect("table projection");
-        let layout = LayoutSnapshot::from_block_projection(
-            &projection,
-            yu_layout::LayoutConfig::new(20.0, 2.0),
-        )
-        .expect("table layout");
-        let table = layout.table().expect("table layout");
-        let selected = table.cells()[3].source();
-        let style = TableSceneStyle::new(
-            1.0,
-            Rgba8::new(150, 155, 165, 255),
-            Some(Rgba8::new(235, 238, 244, 255)),
-            Some(Rgba8::new(210, 225, 255, 255)),
+    fn ornaments_keep_source_identity_and_painter_order() {
+        let revision = Revision::new(5);
+        let table = TextRange::new(ByteOffset::new(0), ByteOffset::new(30)).expect("table");
+        let cell = TextRange::new(ByteOffset::new(2), ByteOffset::new(3)).expect("cell");
+        let mut builder =
+            SceneBuilder::new(revision, Rect::new(0.0, 0.0, 40.0, 40.0).expect("viewport"))
+                .expect("builder");
+        let header = OrnamentPrimitive::new(
+            cell,
+            Rect::new(10.0, 20.0, 6.0, 2.0).expect("bounds"),
+            Rgba8::new(235, 238, 244, 255),
+            OrnamentRole::Background,
         );
-        let mut builder = SceneBuilder::new(
-            layout.revision(),
-            Rect::new(0.0, 0.0, 40.0, 20.0).expect("viewport"),
-        )
-        .expect("builder");
-        let count = builder
-            .append_table_with_selection(table, Point::new(10.0, 20.0), style, Some(selected))
-            .expect("table scene");
-        assert_eq!(count, 9);
+        let border = OrnamentPrimitive::new(
+            table,
+            Rect::new(10.0, 20.0, 1.0, 6.0).expect("bounds"),
+            Rgba8::new(150, 155, 165, 255),
+            OrnamentRole::Border,
+        );
+        builder.ornament(header).expect("header");
+        builder.ornament(border).expect("border");
         let scene = builder.finish();
-        assert_eq!(scene.primitives().len(), 9);
-        assert!(matches!(
-            scene.primitives()[0],
-            Primitive::Table(TablePrimitive {
-                role: TablePrimitiveRole::HeaderFill,
-                ..
-            })
-        ));
-        assert!(matches!(
-            scene.primitives()[2],
-            Primitive::Table(TablePrimitive {
-                role: TablePrimitiveRole::SelectionFill,
-                ..
-            })
-        ));
-        assert!(scene.primitives()[2].bounds().x() >= 10.0);
-        assert!(scene.primitives()[2].bounds().y() >= 20.0);
-        assert!(scene.primitives()[3..].iter().all(|primitive| matches!(
-            primitive,
-            Primitive::Table(TablePrimitive {
-                role: TablePrimitiveRole::Border,
-                source,
-                ..
-            }) if *source == table.source_range()
-        )));
-        assert_eq!(scene.revision(), layout.revision());
-    }
-
-    #[test]
-    fn table_scene_rejects_stale_layout_and_invalid_border_width() {
-        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
-        let buffer = TextBuffer::new(source);
-        let snapshot = buffer.snapshot();
-        let markdown = yu_markdown::parse(&snapshot);
-        let block = markdown.blocks().get(0).expect("table block");
-        let projection =
-            yu_projection::BlockProjection::from_block(&snapshot, block).expect("table projection");
-        let layout = LayoutSnapshot::from_block_projection(
-            &projection,
-            yu_layout::LayoutConfig::new(20.0, 2.0),
-        )
-        .expect("table layout");
-        let style = TableSceneStyle::new(1.0, Rgba8::black(), None, None);
-        let mut stale = SceneBuilder::new(
-            Revision::new(1),
-            Rect::new(0.0, 0.0, 40.0, 20.0).expect("viewport"),
-        )
-        .expect("builder");
-        assert!(matches!(
-            stale.append_table(layout.table().expect("table"), Point::new(0.0, 0.0), style),
-            Err(SceneError::RevisionMismatch { .. })
-        ));
-        let mut invalid = SceneBuilder::new(
-            layout.revision(),
-            Rect::new(0.0, 0.0, 40.0, 20.0).expect("viewport"),
-        )
-        .expect("builder");
-        let invalid_style = TableSceneStyle::new(f32::NAN, Rgba8::black(), None, None);
-        assert!(matches!(
-            invalid.append_table(
-                layout.table().expect("table"),
-                Point::new(0.0, 0.0),
-                invalid_style
-            ),
-            Err(SceneError::InvalidTableStyle(_))
-        ));
-        assert!(invalid.finish().primitives().is_empty());
+        assert_eq!(
+            scene.primitives(),
+            &[Primitive::Ornament(header), Primitive::Ornament(border)]
+        );
+        assert_eq!(scene.damage().rects().len(), 1);
+        assert_eq!(scene.revision(), revision);
     }
 
     #[test]
     fn viewport_images_are_appended_after_block_content() {
-        let source = TextBuffer::new("").snapshot();
+        let revision = Revision::new(4);
         let source_range = TextRange::new(ByteOffset::ZERO, ByteOffset::ZERO).expect("range");
-        let projection = Projection::inline(&source, source_range).expect("projection");
-        let layout =
-            LayoutSnapshot::from_projection(&projection, yu_layout::LayoutConfig::new(80.0, 10.0))
-                .expect("layout");
-        let revision = layout.revision();
         let geometry = ViewportBlockGeometry::new(revision, 0, source_range, 0.0, 10.0, true, 0)
             .expect("geometry");
         let input = ViewportSceneInput::new(revision, 0..1, 10.0, vec![geometry]).expect("input");
         let bounds = Rect::new(4.0, 0.0, 32.0, 10.0).expect("image bounds");
         let image = ImagePrimitive::new(42, bounds, Rgba8::new(232, 234, 238, 255));
+        let ornament = OrnamentPrimitive::new(
+            source_range,
+            Rect::new(0.0, 0.0, 8.0, 10.0).expect("bar"),
+            Rgba8::new(176, 181, 190, 255),
+            OrnamentRole::Bar,
+        );
         let atlas = GlyphAtlas::new(GlyphAtlasConfig::default());
         let mut builder =
             SceneBuilder::new(revision, Rect::new(0.0, 0.0, 80.0, 10.0).expect("viewport"))
                 .expect("builder");
+        // 画家顺序：装饰在字形之前，图片在字形之后。这一块没有字形，所以
+        // 剩下装饰在前、图片在后。
         let count = builder
-            .append_viewport_with_fills_and_images(
+            .append_viewport(
                 &input,
-                &[&layout],
+                &[ViewportBlockContent::new(revision, source_range, &[])
+                    .with_ornaments(std::slice::from_ref(&ornament))
+                    .with_images(std::slice::from_ref(&image))],
                 &atlas,
                 12.0,
                 Rgba8::black(),
-                &[],
-                &[vec![image]],
             )
             .expect("append image");
-        assert_eq!(count, 1);
-        assert_eq!(builder.finish().primitives(), &[Primitive::Image(image)]);
+        assert_eq!(count, 2);
+        assert_eq!(
+            builder.finish().primitives(),
+            &[Primitive::Ornament(ornament), Primitive::Image(image)]
+        );
     }
 
     #[test]
@@ -1598,37 +1127,5 @@ mod tests {
                 height: 320,
             })
         );
-    }
-
-    #[test]
-    fn task_checkbox_layers_keep_parser_marker_identity_and_painter_order() {
-        let revision = Revision::new(12);
-        let viewport = Rect::new(0.0, 0.0, 320.0, 200.0).expect("viewport");
-        let source = TextRange::new(ByteOffset::new(2), ByteOffset::new(5)).expect("marker");
-        let outer = TaskCheckboxPrimitive::new(
-            source,
-            Rect::new(12.0, 18.0, 14.0, 14.0).expect("outer"),
-            Rgba8::new(38, 111, 219, 255),
-            TaskCheckboxPrimitiveRole::Border,
-        );
-        let check = TaskCheckboxPrimitive::new(
-            source,
-            Rect::new(16.0, 23.0, 3.0, 3.0).expect("check"),
-            Rgba8::white(),
-            TaskCheckboxPrimitiveRole::Check,
-        );
-        let mut builder = SceneBuilder::new(revision, viewport).expect("builder");
-        builder.task_checkbox(outer).expect("outer layer");
-        builder.task_checkbox(check).expect("check layer");
-        let scene = builder.finish();
-        assert_eq!(
-            scene.primitives(),
-            &[
-                Primitive::TaskCheckbox(outer),
-                Primitive::TaskCheckbox(check),
-            ]
-        );
-        assert_eq!(outer.source(), source);
-        assert_eq!(check.role(), TaskCheckboxPrimitiveRole::Check);
     }
 }

@@ -64,7 +64,10 @@ ALLOWED: dict[str, set[str]] = {
     # 另一种形态。等 EditorState 真的要聚合 extension 的装饰产出时再加。
     "yu-state": {"yu-core", "yu-text"},
     # 4-6 层：布局 → 场景 → 绘制指令。
-    "yu-layout": {"yu-core", "yu-markdown", "yu-projection", "yu-text"},
+    # yu-layout 只依赖 yu-core。S5 把 Markdown 的解释权搬到 yu-editor 之后，
+    # 布局层剩下的输入是「视觉文本 + 不透明的样式 id」，它拿不到判断语法
+    # 语义所需的信息——这是不变量 E1 在这一层的落法。
+    "yu-layout": {"yu-core"},
     "yu-scene": {"yu-core", "yu-font", "yu-layout"},
     "yu-render": {"yu-assets", "yu-core", "yu-font", "yu-scene"},
     # 7 层及以上：编辑状态、持久化、工作区。
@@ -141,9 +144,13 @@ ALLOWED_DEV: dict[str, set[str]] = {
     # 「布局能消费真实字体后端」是消费侧契约，用例住在 yu-layout。
     "yu-layout": {"yu-font"},
     # 平台层本就允许向下依赖；这些是 CoreText 与布局的集成断言。
-    "yu-font-macos": {"yu-layout", "yu-projection", "yu-text"},
-    "yu-render": {"yu-layout", "yu-markdown", "yu-projection", "yu-text"},
-    "yu-scene": {"yu-markdown", "yu-projection", "yu-text"},
+    # CoreText shaping 与布局的集成断言。S5 之后布局的输入是视觉文本，
+    # 不再需要投影与 rope。
+    "yu-font-macos": {"yu-layout"},
+    # `yu-render` 的场景用例要一个真的排好字形的块；`yu-text` 给它一份
+    # snapshot 拿 revision。两条都不碰 Markdown——S5 之后场景层的输入是
+    # `SceneGlyph`，不是投影。
+    "yu-render": {"yu-layout", "yu-text"},
     "yu-embedded-math": {"yu-core"},
     # 临时：yu-projection 是 yu-decoration 的 source↔visual 映射的 oracle。
     # 一个已经在产品里跑着的实现比自证性质更强。这条边随 yu-projection

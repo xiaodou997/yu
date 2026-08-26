@@ -17,17 +17,18 @@ use yu_assets::{
 };
 use yu_core::{Revision, TextRange};
 use yu_editor::{
-    BlockKind, CaretAffinity, EditorDocument, EditorDocumentError, ImageSource, LayoutError,
-    ProjectionBias, ShapingProvider, TableResizeCommit, TableResizeTarget, TaskState, ViewportSpan,
-    task_marker,
+    BlockKind, BlockView, CaretAffinity, EditorDocument, EditorDocumentError, ImageSource,
+    LayoutError, ProjectionBias, ShapingProvider, TableLayout, TableResizeCommit,
+    TableResizeTarget, TaskState, ViewportSpan, task_marker,
 };
 use yu_font::GlyphAtlas;
-use yu_layout::ImageIntrinsicSize;
+use yu_layout::{ImageIntrinsicSize, LayoutRect};
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
     EditorDecorationPrimitive, EditorDecorationPrimitiveRole, EmbeddedSvgPrimitive, ImagePrimitive,
-    Point, Primitive, Rect, Rgba8, Scene, SceneBuilder, SceneError, TableSceneStyle,
-    TaskCheckboxPrimitive, TaskCheckboxPrimitiveRole, ViewportBlockGeometry, ViewportSceneInput,
+    OrnamentPrimitive, OrnamentRole, Point, Primitive, Rect, Rgba8, Scene, SceneBuilder,
+    SceneError, SceneGlyph, ViewportBlockContent, ViewportBlockGeometry, ViewportSceneInput,
+    translate_block_rect,
 };
 
 mod workspace;
@@ -36,6 +37,10 @@ pub use workspace::{
     CloseAction, CloseResult, OpenTabResult, TabId, Workspace, WorkspaceCloseRequest,
     WorkspaceError, WorkspaceTab,
 };
+
+/// `BlockKind::TaskListItem` 在视口输入里的标签。见
+/// `yu_markdown::BlockKind::viewport_tag`。
+const TASK_LIST_ITEM_TAG: u8 = 7;
 
 /// A validated scene together with the viewport metadata that produced it.
 #[derive(Clone, Debug, PartialEq)]
@@ -90,14 +95,23 @@ pub fn viewport_block_background(kind: BlockKind) -> Option<Rgba8> {
     }
 }
 
+/// 表格网格的颜色与线宽。产品选色住在这一层，不住在场景层。
+#[derive(Clone, Copy, Debug)]
+struct TableSceneStyle {
+    border_width: f32,
+    border_color: Rgba8,
+    header_fill: Option<Rgba8>,
+    selection_fill: Option<Rgba8>,
+}
+
 #[must_use]
-fn viewport_table_style() -> TableSceneStyle {
-    TableSceneStyle::new(
-        1.0,
-        Rgba8::new(190, 195, 205, 255),
-        Some(Rgba8::new(248, 249, 251, 255)),
-        Some(Rgba8::new(210, 225, 255, 255)),
-    )
+const fn viewport_table_style() -> TableSceneStyle {
+    TableSceneStyle {
+        border_width: 1.0,
+        border_color: Rgba8::new(190, 195, 205, 255),
+        header_fill: Some(Rgba8::new(248, 249, 251, 255)),
+        selection_fill: Some(Rgba8::new(210, 225, 255, 255)),
+    }
 }
 
 #[must_use]
@@ -105,51 +119,176 @@ const fn viewport_block_quote_color() -> Rgba8 {
     Rgba8::new(176, 181, 190, 255)
 }
 
+/// 表格的底色、选中高亮与网格线。
+///
+/// 这段几何原来住在 `yu-scene::append_table`——场景层为此认识「表头」
+/// 「单元格」「分隔线」，一种语法一条全链路（overview-v2 §2.1）。现在它在
+/// 这里算完，交给场景层的只有矩形与一个渲染中立的角色。
+fn append_table_ornaments(
+    ornaments: &mut Vec<OrnamentPrimitive>,
+    table: &TableLayout,
+    origin: Point,
+    style: TableSceneStyle,
+    selection: Option<TextRange>,
+) -> Result<(), ViewportSceneError> {
+    let table_source = table.source_range();
+    if let Some(color) = style.header_fill {
+        for cell in table.cells().iter().copied().filter(|cell| cell.row() == 0) {
+            ornaments.push(OrnamentPrimitive::new(
+                cell.source(),
+                translate_block_rect(cell.bounds(), origin)?,
+                color,
+                OrnamentRole::Background,
+            ));
+        }
+    }
+    if let Some(color) = style.selection_fill {
+        for cell in table.cells().iter().copied() {
+            if selection.is_some_and(|range| ranges_intersect_or_caret(range, cell.source())) {
+                ornaments.push(OrnamentPrimitive::new(
+                    cell.source(),
+                    translate_block_rect(cell.bounds(), origin)?,
+                    color,
+                    OrnamentRole::Fill,
+                ));
+            }
+        }
+    }
+
+    let bounds = table.bounds();
+    let thickness_x = style.border_width.min(bounds.width());
+    let thickness_y = style.border_width.min(bounds.height());
+    if thickness_x <= 0.0 || thickness_y <= 0.0 {
+        return Ok(());
+    }
+    let total_width = bounds.width();
+    let total_height = bounds.height();
+    let mut x = 0.0_f32;
+    for column_width in table.column_widths() {
+        ornaments.push(OrnamentPrimitive::new(
+            table_source,
+            translate_block_rect(LayoutRect::new(x, 0.0, thickness_x, total_height)?, origin)?,
+            style.border_color,
+            OrnamentRole::Border,
+        ));
+        x += *column_width;
+    }
+    ornaments.push(OrnamentPrimitive::new(
+        table_source,
+        translate_block_rect(
+            LayoutRect::new(
+                (total_width - thickness_x).max(0.0),
+                0.0,
+                thickness_x,
+                total_height,
+            )?,
+            origin,
+        )?,
+        style.border_color,
+        OrnamentRole::Border,
+    ));
+
+    let mut y = 0.0_f32;
+    let row_count = table
+        .cells()
+        .iter()
+        .map(|cell| cell.row())
+        .max()
+        .map_or(0, |row| row.saturating_add(1));
+    for _ in 0..row_count {
+        ornaments.push(OrnamentPrimitive::new(
+            table_source,
+            translate_block_rect(LayoutRect::new(0.0, y, total_width, thickness_y)?, origin)?,
+            style.border_color,
+            OrnamentRole::Border,
+        ));
+        y += table.row_height();
+    }
+    ornaments.push(OrnamentPrimitive::new(
+        table_source,
+        translate_block_rect(
+            LayoutRect::new(
+                0.0,
+                (total_height - thickness_y).max(0.0),
+                total_width,
+                thickness_y,
+            )?,
+            origin,
+        )?,
+        style.border_color,
+        OrnamentRole::Border,
+    ));
+    Ok(())
+}
+
+fn ranges_intersect_or_caret(selection: TextRange, cell: TextRange) -> bool {
+    if selection.is_empty() {
+        if cell.is_empty() {
+            return selection.start() == cell.start();
+        }
+        return cell.contains(selection.start());
+    }
+    selection.start() < cell.end() && cell.start() < selection.end()
+}
+
 fn append_task_checkbox(
-    builder: &mut SceneBuilder,
-    layout: &yu_layout::LayoutSnapshot,
-    block_y: f32,
+    ornaments: &mut Vec<OrnamentPrimitive>,
+    layout: &BlockView,
+    origin: Point,
     marker: yu_editor::TaskMarker,
     state: TaskState,
 ) -> Result<(), ViewportSceneError> {
     let caret = layout
         .caret_for_source(marker.range().start(), ProjectionBias::After)
         .map_err(EditorDocumentError::from)?;
-    let line_height = layout.config().line_height();
+    let line_height = layout
+        .lines()
+        .get(caret.line())
+        .map_or_else(|| layout.config().line_height(), |line| line.height());
     let size = line_height * 0.68;
     let x = caret.point().x();
-    let y = block_y + caret.point().y() + (line_height - size) * 0.5;
-    let bounds = Rect::new(x, y, size, size)?;
+    let y = caret.point().y() + (line_height - size) * 0.5;
     let border = match state {
         TaskState::Todo => Rgba8::new(118, 124, 134, 255),
         TaskState::Done => Rgba8::new(38, 111, 219, 255),
     };
-    builder.task_checkbox(TaskCheckboxPrimitive::new(
+    ornaments.push(OrnamentPrimitive::new(
         marker.range(),
-        bounds,
+        translate_block_rect(LayoutRect::new(x, y, size, size)?, origin)?,
         border,
-        TaskCheckboxPrimitiveRole::Border,
-    ))?;
+        OrnamentRole::Border,
+    ));
 
     match state {
         TaskState::Todo => {
             let inset = (size * 0.14).max(0.5).min(size * 0.3);
-            builder.task_checkbox(TaskCheckboxPrimitive::new(
+            ornaments.push(OrnamentPrimitive::new(
                 marker.range(),
-                Rect::new(x + inset, y + inset, size - inset * 2.0, size - inset * 2.0)?,
+                translate_block_rect(
+                    LayoutRect::new(x + inset, y + inset, size - inset * 2.0, size - inset * 2.0)?,
+                    origin,
+                )?,
                 Rgba8::white(),
-                TaskCheckboxPrimitiveRole::Interior,
-            ))?;
+                OrnamentRole::Background,
+            ));
         }
         TaskState::Done => {
             let unit = size / 5.0;
             for (column, row) in [(1.0, 2.4), (1.8, 3.1), (2.7, 2.4), (3.6, 1.5)] {
-                builder.task_checkbox(TaskCheckboxPrimitive::new(
+                ornaments.push(OrnamentPrimitive::new(
                     marker.range(),
-                    Rect::new(x + unit * column, y + unit * row, unit * 0.85, unit * 0.85)?,
+                    translate_block_rect(
+                        LayoutRect::new(
+                            x + unit * column,
+                            y + unit * row,
+                            unit * 0.85,
+                            unit * 0.85,
+                        )?,
+                        origin,
+                    )?,
                     Rgba8::white(),
-                    TaskCheckboxPrimitiveRole::Check,
-                ))?;
+                    OrnamentRole::Mark,
+                ));
             }
         }
     }
@@ -186,11 +325,22 @@ impl EditorDecorationStyle {
     }
 }
 
+/// caret 那一行有多高。
+///
+/// v1 拿的是 `config.line_height()`——标题把行高塞进了 config，所以那个值
+/// 恰好对。v2 的行高住在行盒里（widget 会撑高行），所以要按行问。
+fn caret_line_height(layout: &BlockView, line: usize) -> f32 {
+    layout
+        .lines()
+        .get(line)
+        .map_or_else(|| layout.config().line_height(), |line| line.height())
+}
+
 fn append_editor_decorations(
     builder: &mut SceneBuilder,
     document: &EditorDocument,
     input: &ViewportSceneInput,
-    layouts: &[yu_layout::LayoutSnapshot],
+    layouts: &[BlockView],
     style: EditorDecorationStyle,
 ) -> Result<(), ViewportSceneError> {
     if !style.caret_width.is_finite() || style.caret_width <= 0.0 {
@@ -260,7 +410,7 @@ fn append_editor_decorations(
                     layout_caret,
                     EditorDecorationPrimitiveRole::CompositionCaret,
                     geometry.y(),
-                    layout.config().line_height(),
+                    caret_line_height(layout, layout_caret.line()),
                 ));
             }
             (visual.start(), visual.end(), overlay.replacement_range())
@@ -278,7 +428,7 @@ fn append_editor_decorations(
                     layout_caret,
                     EditorDecorationPrimitiveRole::Caret,
                     geometry.y(),
-                    layout.config().line_height(),
+                    caret_line_height(layout, layout_caret.line()),
                 ));
             }
             if selection.is_empty() {
@@ -397,20 +547,27 @@ impl ViewportSceneFrame {
                 actual: self.revision(),
             });
         }
-        let Some(task) = self.scene.primitives().iter().find_map(|primitive| {
-            let Primitive::TaskCheckbox(task) = primitive else {
+        // 场景层不再有「任务框」这个 primitive，只有渲染中立的装饰
+        // （不变量 E1）。命中判定因此改为：一块 `Border` 装饰，落点在它里面，
+        // 而它的源码属于一个 task 块。块的语法类型由视口输入带着走，不用
+        // 回头去解析文档（不变量 I1）。
+        let Some((task, block)) = self.scene.primitives().iter().find_map(|primitive| {
+            let Primitive::Ornament(ornament) = primitive else {
                 return None;
             };
-            (task.role() == TaskCheckboxPrimitiveRole::Border && task.bounds().contains(point))
-                .then_some(*task)
+            if ornament.role() != OrnamentRole::Border || !ornament.bounds().contains(point) {
+                return None;
+            }
+            let block = self.input.blocks().iter().copied().find(|block| {
+                block.kind() == TASK_LIST_ITEM_TAG
+                    && block.source().start() <= ornament.source().start()
+                    && ornament.source().end() <= block.source().end()
+            })?;
+            Some((*ornament, block))
         }) else {
             return Ok(None);
         };
-        let block = self.input.blocks().iter().copied().find(|block| {
-            block.source().start() <= task.source().start()
-                && task.source().end() <= block.source().end()
-        });
-        Ok(block.map(|block| TaskCheckboxHit {
+        Ok(Some(TaskCheckboxHit {
             revision: self.revision(),
             block_index: block.index(),
             source: task.source(),
@@ -1167,14 +1324,14 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     let document_revision = document.revision();
     if let Some(resize) = table_resize {
         if resize.revision() != document_revision {
-            return Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
-                "table resize and viewport document revisions differ",
+            return Err(EditorDocumentError::Layout(LayoutError::Upstream(
+                "table resize and viewport document revisions differ".into(),
             ))
             .into());
         }
         if matches!(resize.target(), TableResizeTarget::Row { .. }) {
-            return Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
-                "row resize requires variable-row table layout",
+            return Err(EditorDocumentError::Layout(LayoutError::Upstream(
+                "row resize requires variable-row table layout".into(),
             ))
             .into());
         }
@@ -1275,19 +1432,56 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         }
         layouts.push(layout);
     }
-    let layout_refs = layouts.iter().collect::<Vec<_>>();
     let mut builder = SceneBuilder::new(revision, scene_viewport)?;
     // 背景必须是这一帧的第一个 primitive：Metal layer 透明，未触及的像素会
     // 露出下层视图，而 TextKit fallback 删除后下层已不再绘制任何东西
     // （不变量 I5）。放在最前面也保证它位于所有内容之下。
     builder.fill_rect(scene_viewport, background)?;
-    let fills = viewport_snapshot
-        .blocks()
-        .iter()
-        .map(|block| viewport_block_background(block.kind()))
-        .collect::<Vec<_>>();
+    // 每个可见块的装饰、字形与图片，全部搬到文档坐标之后交给场景层。
+    // 「这些装饰是什么语法」到这里为止：场景层只看见矩形与角色。
+    let mut ornaments = Vec::with_capacity(layouts.len());
     let mut images = Vec::with_capacity(layouts.len());
+    let mut glyphs = Vec::with_capacity(layouts.len());
     for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
+        let origin = Point::new(0.0, block.y());
+        let mut block_ornaments = Vec::new();
+        if let Some(table) = layout.table() {
+            append_table_ornaments(
+                &mut block_ornaments,
+                table,
+                origin,
+                viewport_table_style(),
+                selection,
+            )?;
+        }
+        if let Some(quote) = layout.ornaments().quote() {
+            for bounds in quote
+                .bars(layout.height())
+                .map_err(EditorDocumentError::from)?
+            {
+                block_ornaments.push(OrnamentPrimitive::new(
+                    quote.source(),
+                    translate_block_rect(bounds, origin)?,
+                    viewport_block_quote_color(),
+                    OrnamentRole::Bar,
+                ));
+            }
+        }
+        if let BlockKind::TaskListItem { state, .. } = block.kind() {
+            let Some(markdown_block) = document.markdown().blocks().get(block.index()) else {
+                return Err(ViewportSceneError::InvalidTaskMarker {
+                    block: block.index(),
+                });
+            };
+            let Some(marker) = task_marker(&source, markdown_block) else {
+                return Err(ViewportSceneError::InvalidTaskMarker {
+                    block: block.index(),
+                });
+            };
+            append_task_checkbox(&mut block_ornaments, layout, origin, marker, state)?;
+        }
+        ornaments.push(block_ornaments);
+
         let mut block_images = Vec::new();
         for placement in layout.images() {
             let Some(image) = layout
@@ -1302,49 +1496,42 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
             let Some(key) = image_key(image) else {
                 continue;
             };
-            let bounds = placement.bounds();
-            let bounds = Rect::new(
-                bounds.x(),
-                bounds.y() + block.y(),
-                bounds.width(),
-                bounds.height(),
-            )?;
             block_images.push(ImagePrimitive::new(
                 key.fingerprint(),
-                bounds,
+                translate_block_rect(placement.bounds(), origin)?,
                 Rgba8::new(232, 234, 238, 255),
             ));
         }
         images.push(block_images);
+
+        glyphs.push(
+            layout
+                .glyphs()
+                .iter()
+                .copied()
+                .map(|glyph| {
+                    SceneGlyph::new(
+                        glyph.face(),
+                        glyph.glyph(),
+                        glyph.origin(),
+                        glyph.size_scale(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
     }
-    builder.append_viewport_with_decorations(
-        &input,
-        &layout_refs,
-        atlas,
-        font_size,
-        color,
-        &fills,
-        &images,
-        Some(viewport_table_style()),
-        selection,
-        Some(viewport_block_quote_color()),
-    )?;
-    for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
-        let BlockKind::TaskListItem { state, .. } = block.kind() else {
-            continue;
-        };
-        let Some(markdown_block) = document.markdown().blocks().get(block.index()) else {
-            return Err(ViewportSceneError::InvalidTaskMarker {
-                block: block.index(),
-            });
-        };
-        let Some(marker) = task_marker(&source, markdown_block) else {
-            return Err(ViewportSceneError::InvalidTaskMarker {
-                block: block.index(),
-            });
-        };
-        append_task_checkbox(&mut builder, layout, block.y(), marker, state)?;
-    }
+    let contents = viewport_snapshot
+        .blocks()
+        .iter()
+        .enumerate()
+        .map(|(offset, block)| {
+            ViewportBlockContent::new(revision, block.source(), &glyphs[offset])
+                .with_fill(viewport_block_background(block.kind()))
+                .with_ornaments(&ornaments[offset])
+                .with_images(&images[offset])
+        })
+        .collect::<Vec<_>>();
+    builder.append_viewport(&input, &contents, atlas, font_size, color)?;
     for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
         let Some(publication) = embedded_publications.iter().find(|publication| {
             publication.revision() == revision
@@ -1545,7 +1732,7 @@ mod tests {
                 let key = GlyphRasterKey::new(
                     placement.face(),
                     placement.glyph(),
-                    font_size * placement.font_scale(),
+                    font_size * placement.size_scale(),
                 )
                 .expect("glyph key");
                 if atlas.entry(key).is_none() {
@@ -1637,7 +1824,7 @@ mod tests {
         let primitives = frame.scene().scene().primitives();
         let quote_index = primitives
             .iter()
-            .position(|primitive| matches!(primitive, Primitive::LineOrnament(_)))
+            .position(|primitive| matches!(primitive, Primitive::Ornament(ornament) if ornament.role() == OrnamentRole::Bar))
             .expect("blockquote primitive");
         let glyph_index = primitives
             .iter()
@@ -1645,7 +1832,7 @@ mod tests {
             .expect("glyph primitive");
         assert!(quote_index < glyph_index);
 
-        let Primitive::LineOrnament(quote) = primitives[quote_index] else {
+        let Primitive::Ornament(quote) = primitives[quote_index] else {
             unreachable!("located blockquote primitive");
         };
         assert_eq!(
@@ -2131,7 +2318,7 @@ mod tests {
             .primitives()
             .iter()
             .filter_map(|primitive| match primitive {
-                Primitive::TaskCheckbox(task) => Some(*task),
+                Primitive::Ornament(task) => Some(*task),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2157,12 +2344,16 @@ mod tests {
             layers.iter().filter(|layer| layer.source() == done).count(),
             5
         );
-        assert!(layers.iter().any(|layer| {
-            layer.source() == todo && layer.role() == TaskCheckboxPrimitiveRole::Interior
-        }));
-        assert!(layers.iter().any(|layer| {
-            layer.source() == done && layer.role() == TaskCheckboxPrimitiveRole::Check
-        }));
+        assert!(
+            layers.iter().any(|layer| {
+                layer.source() == todo && layer.role() == OrnamentRole::Background
+            })
+        );
+        assert!(
+            layers
+                .iter()
+                .any(|layer| { layer.source() == done && layer.role() == OrnamentRole::Mark })
+        );
         assert!(
             layers
                 .iter()
@@ -2193,7 +2384,7 @@ mod tests {
                 .filter(|primitive| {
                     matches!(
                         primitive,
-                        Primitive::TaskCheckbox(layer) if layer.source() == todo
+                        Primitive::Ornament(layer) if layer.source() == todo
                     )
                 })
                 .count(),
@@ -2230,11 +2421,7 @@ mod tests {
             .primitives()
             .iter()
             .find_map(|primitive| match primitive {
-                Primitive::TaskCheckbox(task)
-                    if task.role() == TaskCheckboxPrimitiveRole::Border =>
-                {
-                    Some(*task)
-                }
+                Primitive::Ornament(task) if task.role() == OrnamentRole::Border => Some(*task),
                 _ => None,
             })
             .expect("todo checkbox border");
@@ -2391,9 +2578,7 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::LineOrnament(_)
-                | Primitive::Table(_)
-                | Primitive::TaskCheckbox(_)
+                | Primitive::Ornament(_)
                 | Primitive::EditorDecoration(_) => None,
             })
             .expect("image primitive");
@@ -2422,9 +2607,7 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::LineOrnament(_)
-                | Primitive::Table(_)
-                | Primitive::TaskCheckbox(_)
+                | Primitive::Ornament(_)
                 | Primitive::EditorDecoration(_) => None,
             })
             .expect("metadata-only image primitive");
@@ -2481,9 +2664,7 @@ mod tests {
             Primitive::Glyph(_)
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
-            | Primitive::LineOrnament(_)
-            | Primitive::Table(_)
-            | Primitive::TaskCheckbox(_)
+            | Primitive::Ornament(_)
             | Primitive::EditorDecoration(_) => {
                 panic!("code block background must precede glyphs")
             }
@@ -2551,19 +2732,19 @@ mod tests {
         assert!(
             primitives[..first_glyph]
                 .iter()
-                .all(|primitive| matches!(primitive, Primitive::Table(_)))
+                .all(|primitive| matches!(primitive, Primitive::Ornament(_)))
         );
         assert!(primitives[..first_glyph].iter().any(|primitive| {
             matches!(
                 primitive,
-                Primitive::Table(table) if table.role() == yu_scene::TablePrimitiveRole::HeaderFill
+                Primitive::Ornament(table) if table.role() == OrnamentRole::Background
             )
         }));
         assert!(primitives[..first_glyph].iter().any(|primitive| {
             matches!(
                 primitive,
-                Primitive::Table(table)
-                    if table.role() == yu_scene::TablePrimitiveRole::SelectionFill
+                Primitive::Ornament(table)
+                    if table.role() == OrnamentRole::Fill
                         && table.source().contains(body_offset)
             )
         }));
@@ -2625,8 +2806,8 @@ mod tests {
         assert!(frame.scene().scene().primitives().iter().any(|primitive| {
             matches!(
                 primitive,
-                Primitive::Table(table)
-                    if table.role() == yu_scene::TablePrimitiveRole::Border
+                Primitive::Ornament(table)
+                    if table.role() == OrnamentRole::Border
                         && (table.bounds().x() - expected_divider).abs() < 0.001
             )
         }));
@@ -2671,14 +2852,16 @@ mod tests {
             &mut RenderPlanBuilder::new(),
         )
         .expect_err("stale table override");
-        assert!(matches!(
-            stale_error,
-            ViewportSceneError::Document(EditorDocumentError::Layout(
-                yu_editor::LayoutError::InvalidTable(
-                    "table resize and viewport document revisions differ"
-                )
-            ))
-        ));
+        let ViewportSceneError::Document(EditorDocumentError::Layout(
+            yu_editor::LayoutError::Upstream(message),
+        )) = stale_error
+        else {
+            panic!("expected a stale table override error, got {stale_error:?}");
+        };
+        assert_eq!(
+            message,
+            "table resize and viewport document revisions differ"
+        );
     }
 
     #[test]

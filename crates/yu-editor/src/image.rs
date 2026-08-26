@@ -21,7 +21,7 @@ use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutPoint, Layo
 use yu_projection::{ProjectionBias, VisualRange};
 
 use crate::blockview::{BlockHit, BlockView};
-use crate::geometry::{map_source_range, source_range_contains};
+use crate::geometry::{map_source_range, source_range_contains, upstream};
 use crate::table::TableLayout;
 use yu_text::ChangeSet;
 
@@ -133,9 +133,12 @@ pub(crate) fn build_image_placements(view: &BlockView) -> Result<Vec<ImagePlacem
     let config = view.config();
     let mut placements = Vec::with_capacity(projection.images().len());
     for image in projection.images().iter().copied() {
-        let visual_start =
-            projection.source_to_visual(image.label().start(), ProjectionBias::Before)?;
-        let visual_end = projection.source_to_visual(image.label().end(), ProjectionBias::After)?;
+        let visual_start = projection
+            .source_to_visual(image.label().start(), ProjectionBias::Before)
+            .map_err(upstream)?;
+        let visual_end = projection
+            .source_to_visual(image.label().end(), ProjectionBias::After)
+            .map_err(upstream)?;
         let visual =
             VisualRange::new(visual_start, visual_end).ok_or(LayoutError::OffsetOverflow)?;
         let caret = view.caret_for_visual(visual.start(), ProjectionBias::Before)?;

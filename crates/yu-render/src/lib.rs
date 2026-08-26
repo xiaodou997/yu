@@ -431,26 +431,13 @@ impl RenderPlanBuilder {
                         fallback: svg.fallback(),
                     });
                 }
-                Primitive::LineOrnament(ornament) => {
+                Primitive::Ornament(ornament) => {
+                    // 装饰的角色留在 retained scene 里给原生的选中与
+                    // Accessibility 用。后端中立的这一层把每一层都落成一个
+                    // 实心矩形——不变量 E3 冻结了指令集，新语法不新增指令。
                     commands.push(RenderCommand::FillRect {
                         bounds: ornament.bounds(),
                         color: ornament.color(),
-                    });
-                }
-                Primitive::Table(table) => {
-                    // Table roles remain available in the retained scene for
-                    // native selection/accessibility consumers. The current
-                    // backend-neutral renderer uses the existing solid-fill
-                    // command until a dedicated table pipeline is needed.
-                    commands.push(RenderCommand::FillRect {
-                        bounds: table.bounds(),
-                        color: table.color(),
-                    });
-                }
-                Primitive::TaskCheckbox(task) => {
-                    commands.push(RenderCommand::FillRect {
-                        bounds: task.bounds(),
-                        color: task.color(),
                     });
                 }
                 Primitive::EditorDecoration(decoration) => {
@@ -534,14 +521,27 @@ mod tests {
         AtlasEntry, FontDatabase, FontFaceId, FontFaceSpec, FontRequest, FontShaper,
         GlyphAtlasConfig, GlyphBitmap, GlyphId, GlyphMetrics, GlyphRasterKey, RasterizedGlyph,
     };
-    use yu_layout::{LayoutConfig, LayoutSnapshot};
-    use yu_projection::Projection;
+    use yu_layout::{
+        BlockLayout, LayoutConfig, LayoutInput, NoLineStyles, NoWidgets, StyledRun,
+        UniformStyleTable,
+    };
     use yu_scene::{
-        EmbeddedSvgPrimitive, GlyphPrimitive, ImagePrimitive, Point, SceneBuilder, SceneError,
-        TablePrimitiveRole, TableSceneStyle, TaskCheckboxPrimitive, TaskCheckboxPrimitiveRole,
-        ViewportBlockGeometry, ViewportSceneInput,
+        EmbeddedSvgPrimitive, GlyphPrimitive, ImagePrimitive, OrnamentPrimitive, OrnamentRole,
+        Point, SceneBuilder, SceneError, SceneGlyph, ViewportBlockContent, ViewportBlockGeometry,
+        ViewportSceneInput,
     };
     use yu_text::TextBuffer;
+
+    /// 一个排好字形的块。
+    ///
+    /// 场景层不认识布局的盒子类型，只认识 [`SceneGlyph`]——它要的是字面、
+    /// 字形 id、位置与字号倍率，别的都不要（不变量 E1、E2）。这里扮演的是
+    /// 上层那个装配者。
+    struct ShapedBlock {
+        revision: Revision,
+        source: TextRange,
+        glyphs: Vec<SceneGlyph>,
+    }
 
     #[derive(Debug)]
     struct FakeUploadError;
@@ -570,11 +570,9 @@ mod tests {
         }
     }
 
-    fn shaped_layout(font_size: f32) -> LayoutSnapshot {
-        let buffer = TextBuffer::new("ab");
+    fn shape_block(text: &str, source: TextRange, font_size: f32) -> ShapedBlock {
+        let buffer = TextBuffer::new(text.to_owned());
         let snapshot = buffer.snapshot();
-        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).expect("range");
-        let projection = Projection::inline(&snapshot, range).expect("projection");
         let mut database = FontDatabase::new();
         database
             .register(FontFaceSpec::new("Test", 0.5))
@@ -584,28 +582,64 @@ mod tests {
             FontRequest::new("Test", font_size).expect("font request"),
         )
         .expect("shaper");
-        LayoutSnapshot::from_projection_with_shaper(
-            &projection,
+        let runs = [StyledRun::new(
+            yu_core::VisualRange::new(
+                yu_core::VisualOffset::ZERO,
+                yu_core::VisualOffset::new(text.len() as u64),
+            )
+            .expect("ordered"),
+            yu_core::StyleId(0),
+        )];
+        let layout = BlockLayout::build_shaped(
+            LayoutInput::new(text, &runs),
             LayoutConfig::new(200.0, 20.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &NoLineStyles,
             &shaper,
         )
-        .expect("layout")
+        .expect("layout");
+        ShapedBlock {
+            revision: snapshot.revision(),
+            source,
+            glyphs: layout
+                .glyphs()
+                .iter()
+                .copied()
+                .map(|glyph| {
+                    SceneGlyph::new(
+                        glyph.face(),
+                        glyph.glyph(),
+                        glyph.origin(),
+                        glyph.size_scale(),
+                    )
+                })
+                .collect(),
+        }
     }
 
-    fn atlas_for_layout(layout: &LayoutSnapshot, font_size: f32) -> GlyphAtlas {
+    fn shaped_layout(font_size: f32) -> ShapedBlock {
+        shape_block(
+            "ab",
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("range"),
+            font_size,
+        )
+    }
+
+    fn atlas_for_layout(layout: &ShapedBlock, font_size: f32) -> GlyphAtlas {
         let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("config"));
         insert_layout_glyphs(&mut atlas, &[layout], font_size);
         atlas
     }
 
-    fn insert_layout_glyphs(atlas: &mut GlyphAtlas, layouts: &[&LayoutSnapshot], font_size: f32) {
+    fn insert_layout_glyphs(atlas: &mut GlyphAtlas, layouts: &[&ShapedBlock], font_size: f32) {
         let mut index = 0_usize;
         for layout in layouts {
-            for placement in layout.glyphs() {
+            for placement in layout.glyphs.iter().copied() {
                 let key = GlyphRasterKey::new(
                     placement.face(),
                     placement.glyph(),
-                    font_size * placement.font_scale(),
+                    font_size * placement.size_scale(),
                 )
                 .expect("key");
                 if atlas.entry(key).is_none() {
@@ -621,28 +655,17 @@ mod tests {
         }
     }
 
-    fn shaped_block_layouts(font_size: f32) -> (LayoutSnapshot, LayoutSnapshot) {
-        let buffer = TextBuffer::new("ab\ncd");
-        let snapshot = buffer.snapshot();
-        let first_range = TextRange::new(ByteOffset::new(0), ByteOffset::new(2)).expect("range");
-        let second_range = TextRange::new(ByteOffset::new(3), ByteOffset::new(5)).expect("range");
-        let first_projection = Projection::inline(&snapshot, first_range).expect("projection");
-        let second_projection = Projection::inline(&snapshot, second_range).expect("projection");
-        let mut database = FontDatabase::new();
-        database
-            .register(FontFaceSpec::new("Test", 0.5))
-            .expect("face");
-        let shaper = FontShaper::new(
-            Arc::new(database),
-            FontRequest::new("Test", font_size).expect("font request"),
-        )
-        .expect("shaper");
-        let config = LayoutConfig::new(200.0, 20.0);
-        let first = LayoutSnapshot::from_projection_with_shaper(&first_projection, config, &shaper)
-            .expect("first layout");
-        let second =
-            LayoutSnapshot::from_projection_with_shaper(&second_projection, config, &shaper)
-                .expect("second layout");
+    fn shaped_block_layouts(font_size: f32) -> (ShapedBlock, ShapedBlock) {
+        let first = shape_block(
+            "ab",
+            TextRange::new(ByteOffset::new(0), ByteOffset::new(2)).expect("range"),
+            font_size,
+        );
+        let second = shape_block(
+            "cd",
+            TextRange::new(ByteOffset::new(3), ByteOffset::new(5)).expect("range"),
+            font_size,
+        );
         (first, second)
     }
 
@@ -784,13 +807,19 @@ mod tests {
     fn layout_scene_render_plan_and_fake_uploader_are_revision_bound() {
         let font_size = 14.0;
         let layout = shaped_layout(font_size);
-        assert_eq!(layout.glyphs().len(), 2);
+        assert_eq!(layout.glyphs.len(), 2);
         let atlas = atlas_for_layout(&layout, font_size);
         let viewport = Rect::new(0.0, 0.0, 200.0, 80.0).expect("viewport");
-        let mut scene_builder = SceneBuilder::new(layout.revision(), viewport).expect("scene");
+        let mut scene_builder = SceneBuilder::new(layout.revision, viewport).expect("scene");
         assert_eq!(
             scene_builder
-                .append_layout(&layout, &atlas, font_size, Rgba8::black())
+                .append_glyphs(
+                    &layout.glyphs,
+                    &atlas,
+                    font_size,
+                    Rgba8::black(),
+                    Point::new(0.0, 0.0)
+                )
                 .expect("append layout"),
             2
         );
@@ -799,7 +828,7 @@ mod tests {
 
         let mut plans = RenderPlanBuilder::new();
         let first = plans.build(&scene, &atlas).expect("first plan");
-        assert_eq!(first.revision(), layout.revision());
+        assert_eq!(first.revision, layout.revision);
         assert_eq!(first.uploads().len(), 1);
         assert_eq!(first.commands().len(), 2);
         let mut uploader = FakeUploader::default();
@@ -816,8 +845,8 @@ mod tests {
         assert_eq!(second.commands().len(), 2);
         match first.commands()[0] {
             RenderCommand::Glyph { origin, .. } => {
-                assert_eq!(origin.x(), layout.glyphs()[0].x());
-                assert_eq!(origin.y(), layout.glyphs()[0].y());
+                assert_eq!(origin.x(), layout.glyphs[0].origin().x());
+                assert_eq!(origin.y(), layout.glyphs[0].origin().y());
             }
             RenderCommand::FillRect { .. }
             | RenderCommand::Image { .. }
@@ -998,61 +1027,13 @@ mod tests {
         );
     }
 
+    /// 装饰的每一层都落成一个实心矩形，顺序就是插入顺序。
+    ///
+    /// 这里不再构造一张表：`yu-scene` 已经不认识表格了（不变量 E1），
+    /// 它只认识「一块 source-backed 的矩形加一个渲染中立的角色」。表格的
+    /// 网格线由 `yu-workspace` 算出来再交进来，那一段的用例住在那里。
     #[test]
-    fn table_scene_primitives_become_solid_fill_commands_without_losing_scene_roles() {
-        let source = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
-        let buffer = TextBuffer::new(source);
-        let snapshot = buffer.snapshot();
-        let markdown = yu_markdown::parse(&snapshot);
-        let block = markdown.blocks().get(0).expect("table block");
-        let projection = yu_projection::BlockProjection::from_block_with_definitions(
-            &snapshot,
-            block,
-            markdown.reference_definitions(),
-        )
-        .expect("table projection");
-        let layout =
-            LayoutSnapshot::from_block_projection(&projection, LayoutConfig::new(20.0, 2.0))
-                .expect("table layout");
-        let table = layout.table().expect("table layout");
-        let selected = table.cells()[2].source();
-        let style = TableSceneStyle::new(
-            1.0,
-            Rgba8::new(150, 155, 165, 255),
-            Some(Rgba8::new(235, 238, 244, 255)),
-            Some(Rgba8::new(210, 225, 255, 255)),
-        );
-        let mut builder = SceneBuilder::new(
-            layout.revision(),
-            Rect::new(0.0, 0.0, 40.0, 20.0).expect("viewport"),
-        )
-        .expect("scene");
-        builder
-            .append_table_with_selection(table, Point::new(3.0, 4.0), style, Some(selected))
-            .expect("table scene");
-        let scene = builder.finish();
-        assert!(scene.primitives().iter().any(|primitive| matches!(
-            primitive,
-            yu_scene::Primitive::Table(table)
-                if table.role() == TablePrimitiveRole::SelectionFill
-        )));
-        let mut plans = RenderPlanBuilder::new();
-        let plan = plans
-            .build(
-                &scene,
-                &GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("atlas")),
-            )
-            .expect("table render plan");
-        assert_eq!(plan.commands().len(), scene.primitives().len());
-        assert!(
-            plan.commands()
-                .iter()
-                .all(|command| matches!(command, RenderCommand::FillRect { .. }))
-        );
-    }
-
-    #[test]
-    fn task_checkbox_layers_lower_to_solid_render_commands_in_order() {
+    fn ornament_layers_lower_to_solid_render_commands_in_order() {
         let revision = Revision::new(13);
         let viewport = Rect::new(0.0, 0.0, 320.0, 200.0).expect("viewport");
         let source = TextRange::new(ByteOffset::new(2), ByteOffset::new(5)).expect("marker");
@@ -1061,19 +1042,19 @@ mod tests {
         let outer_color = Rgba8::new(38, 111, 219, 255);
         let mut scene = SceneBuilder::new(revision, viewport).expect("scene");
         scene
-            .task_checkbox(TaskCheckboxPrimitive::new(
+            .ornament(OrnamentPrimitive::new(
                 source,
                 outer_bounds,
                 outer_color,
-                TaskCheckboxPrimitiveRole::Border,
+                OrnamentRole::Border,
             ))
             .expect("outer");
         scene
-            .task_checkbox(TaskCheckboxPrimitive::new(
+            .ornament(OrnamentPrimitive::new(
                 source,
                 check_bounds,
                 Rgba8::white(),
-                TaskCheckboxPrimitiveRole::Check,
+                OrnamentRole::Mark,
             ))
             .expect("check");
         let scene = scene.finish();
@@ -1101,9 +1082,9 @@ mod tests {
         let layout = shaped_layout(font_size);
         let atlas = atlas_for_layout(&layout, font_size);
         let geometry = yu_scene::ViewportBlockGeometry::new(
-            layout.revision(),
+            layout.revision,
             3,
-            layout.source_range(),
+            layout.source,
             40.0,
             20.0,
             true,
@@ -1111,58 +1092,50 @@ mod tests {
         )
         .expect("geometry");
         let viewport = Rect::new(0.0, 0.0, 200.0, 80.0).expect("viewport");
-        let mut builder = SceneBuilder::new(layout.revision(), viewport).expect("scene");
+        let input = ViewportSceneInput::new(layout.revision, 3..4, 60.0, vec![geometry])
+            .expect("viewport input");
+        let content = ViewportBlockContent::new(layout.revision, layout.source, &layout.glyphs);
+        let mut builder = SceneBuilder::new(layout.revision, viewport).expect("scene");
         assert_eq!(
             builder
-                .append_layout_at_block(geometry, &layout, &atlas, font_size, Rgba8::black())
+                .append_viewport(&input, &[content], &atlas, font_size, Rgba8::black())
                 .expect("append block layout"),
             2
         );
         match builder.finish().primitives()[0] {
             Primitive::Glyph(glyph) => {
-                assert_eq!(glyph.origin().x(), layout.glyphs()[0].x());
-                assert_eq!(glyph.origin().y(), layout.glyphs()[0].y() + 40.0);
+                assert_eq!(glyph.origin().x(), layout.glyphs[0].origin().x());
+                assert_eq!(glyph.origin().y(), layout.glyphs[0].origin().y() + 40.0);
             }
             Primitive::FillRect { .. }
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
-            | Primitive::LineOrnament(_)
-            | Primitive::Table(_)
-            | Primitive::TaskCheckbox(_)
+            | Primitive::Ornament(_)
             | Primitive::EditorDecoration(_) => {
                 panic!("expected glyph primitive")
             }
         }
 
+        // 过期的 revision 与对不上的源码范围都必须整帧拒绝，不能发布出
+        // 前一半（不变量 G3）。
         let mut stale_builder = SceneBuilder::new(Revision::new(9), viewport).expect("scene");
         assert!(matches!(
-            stale_builder.append_layout_at_block(
-                geometry,
-                &layout,
-                &atlas,
-                font_size,
-                Rgba8::black()
-            ),
+            stale_builder.append_viewport(&input, &[content], &atlas, font_size, Rgba8::black()),
             Err(SceneError::ViewportRevisionMismatch { .. })
         ));
         assert!(stale_builder.finish().primitives().is_empty());
 
-        let mismatched = yu_scene::ViewportBlockGeometry::new(
-            layout.revision(),
-            3,
+        let mismatched = ViewportBlockContent::new(
+            layout.revision,
             yu_core::TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(1))
                 .expect("range"),
-            40.0,
-            20.0,
-            true,
-            2,
-        )
-        .expect("geometry");
-        let mut mismatch_builder = SceneBuilder::new(layout.revision(), viewport).expect("scene");
+            &layout.glyphs,
+        );
+        let mut mismatch_builder = SceneBuilder::new(layout.revision, viewport).expect("scene");
         assert_eq!(
-            mismatch_builder.append_layout_at_block(
-                mismatched,
-                &layout,
+            mismatch_builder.append_viewport(
+                &input,
+                &[mismatched],
                 &atlas,
                 font_size,
                 Rgba8::black()
@@ -1176,46 +1149,35 @@ mod tests {
     fn viewport_scene_batch_translates_all_blocks_before_publishing() {
         let font_size = 14.0;
         let (first, second) = shaped_block_layouts(font_size);
-        assert_eq!(first.revision(), second.revision());
-        assert_eq!(first.source_range().start().get(), 0);
-        assert_eq!(second.source_range().start().get(), 3);
+        assert_eq!(first.revision, second.revision);
+        assert_eq!(first.source.start().get(), 0);
+        assert_eq!(second.source.start().get(), 3);
 
         let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("config"));
         insert_layout_glyphs(&mut atlas, &[&first, &second], font_size);
-        let first_geometry = ViewportBlockGeometry::new(
-            first.revision(),
-            0,
-            first.source_range(),
-            0.0,
-            20.0,
-            true,
-            1,
-        )
-        .expect("first geometry");
-        let second_geometry = ViewportBlockGeometry::new(
-            second.revision(),
-            1,
-            second.source_range(),
-            20.0,
-            20.0,
-            true,
-            1,
-        )
-        .expect("second geometry");
+        let first_geometry =
+            ViewportBlockGeometry::new(first.revision, 0, first.source, 0.0, 20.0, true, 1)
+                .expect("first geometry");
+        let second_geometry =
+            ViewportBlockGeometry::new(second.revision, 1, second.source, 20.0, 20.0, true, 1)
+                .expect("second geometry");
         let input = ViewportSceneInput::new(
-            first.revision(),
+            first.revision,
             0..2,
             40.0,
             vec![first_geometry, second_geometry],
         )
         .expect("viewport input");
         let viewport = Rect::new(0.0, 0.0, 200.0, 80.0).expect("viewport");
-        let mut builder = SceneBuilder::new(first.revision(), viewport).expect("scene");
+        let mut builder = SceneBuilder::new(first.revision, viewport).expect("scene");
         assert_eq!(
             builder
                 .append_viewport(
                     &input,
-                    &[&first, &second],
+                    &[
+                        ViewportBlockContent::new(first.revision, first.source, &first.glyphs),
+                        ViewportBlockContent::new(second.revision, second.source, &second.glyphs),
+                    ],
                     &atlas,
                     font_size,
                     Rgba8::black(),
@@ -1233,18 +1195,16 @@ mod tests {
                 Primitive::FillRect { .. }
                 | Primitive::Image(_)
                 | Primitive::EmbeddedSvg(_)
-                | Primitive::LineOrnament(_)
-                | Primitive::Table(_)
-                | Primitive::TaskCheckbox(_)
+                | Primitive::Ornament(_)
                 | Primitive::EditorDecoration(_) => {
                     panic!("expected glyph primitive")
                 }
             })
             .collect::<Vec<_>>();
-        assert_eq!(origins[0].y(), first.glyphs()[0].y());
-        assert_eq!(origins[1].y(), first.glyphs()[1].y());
-        assert_eq!(origins[2].y(), second.glyphs()[0].y() + 20.0);
-        assert_eq!(origins[3].y(), second.glyphs()[1].y() + 20.0);
+        assert_eq!(origins[0].y(), first.glyphs[0].origin().y());
+        assert_eq!(origins[1].y(), first.glyphs[1].origin().y());
+        assert_eq!(origins[2].y(), second.glyphs[0].origin().y() + 20.0);
+        assert_eq!(origins[3].y(), second.glyphs[1].origin().y() + 20.0);
     }
 
     #[test]
@@ -1252,28 +1212,14 @@ mod tests {
         let font_size = 14.0;
         let (first, second) = shaped_block_layouts(font_size);
         let viewport = Rect::new(0.0, 0.0, 200.0, 80.0).expect("viewport");
-        let first_geometry = ViewportBlockGeometry::new(
-            first.revision(),
-            0,
-            first.source_range(),
-            0.0,
-            20.0,
-            true,
-            1,
-        )
-        .expect("first geometry");
-        let second_geometry = ViewportBlockGeometry::new(
-            second.revision(),
-            1,
-            second.source_range(),
-            20.0,
-            20.0,
-            true,
-            1,
-        )
-        .expect("second geometry");
+        let first_geometry =
+            ViewportBlockGeometry::new(first.revision, 0, first.source, 0.0, 20.0, true, 1)
+                .expect("first geometry");
+        let second_geometry =
+            ViewportBlockGeometry::new(second.revision, 1, second.source, 20.0, 20.0, true, 1)
+                .expect("second geometry");
         let input = ViewportSceneInput::new(
-            first.revision(),
+            first.revision,
             0..2,
             40.0,
             vec![first_geometry, second_geometry],
@@ -1282,11 +1228,14 @@ mod tests {
 
         let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("config"));
         insert_layout_glyphs(&mut atlas, &[&first], font_size);
-        let mut missing_builder = SceneBuilder::new(first.revision(), viewport).expect("scene");
+        let mut missing_builder = SceneBuilder::new(first.revision, viewport).expect("scene");
         assert!(matches!(
             missing_builder.append_viewport(
                 &input,
-                &[&first, &second],
+                &[
+                    ViewportBlockContent::new(first.revision, first.source, &first.glyphs),
+                    ViewportBlockContent::new(second.revision, second.source, &second.glyphs),
+                ],
                 &atlas,
                 font_size,
                 Rgba8::black(),
@@ -1295,7 +1244,7 @@ mod tests {
         ));
         assert!(missing_builder.finish().primitives().is_empty());
 
-        let mut limited_builder = SceneBuilder::new(first.revision(), viewport)
+        let mut limited_builder = SceneBuilder::new(first.revision, viewport)
             .expect("scene")
             .with_primitive_limit(3);
         let mut full_atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("config"));
@@ -1303,7 +1252,10 @@ mod tests {
         assert_eq!(
             limited_builder.append_viewport(
                 &input,
-                &[&first, &second],
+                &[
+                    ViewportBlockContent::new(first.revision, first.source, &first.glyphs),
+                    ViewportBlockContent::new(second.revision, second.source, &second.glyphs),
+                ],
                 &full_atlas,
                 font_size,
                 Rgba8::black(),
@@ -1316,7 +1268,10 @@ mod tests {
         assert!(matches!(
             stale_builder.append_viewport(
                 &input,
-                &[&first, &second],
+                &[
+                    ViewportBlockContent::new(first.revision, first.source, &first.glyphs),
+                    ViewportBlockContent::new(second.revision, second.source, &second.glyphs),
+                ],
                 &full_atlas,
                 font_size,
                 Rgba8::black(),
@@ -1326,7 +1281,7 @@ mod tests {
         assert!(stale_builder.finish().primitives().is_empty());
 
         let source_mismatch = ViewportBlockGeometry::new(
-            first.revision(),
+            first.revision,
             0,
             TextRange::new(ByteOffset::new(0), ByteOffset::new(1)).expect("range"),
             0.0,
@@ -1336,17 +1291,20 @@ mod tests {
         )
         .expect("mismatch geometry");
         let mismatch_input = ViewportSceneInput::new(
-            first.revision(),
+            first.revision,
             0..2,
             40.0,
             vec![source_mismatch, second_geometry],
         )
         .expect("mismatch input");
-        let mut mismatch_builder = SceneBuilder::new(first.revision(), viewport).expect("scene");
+        let mut mismatch_builder = SceneBuilder::new(first.revision, viewport).expect("scene");
         assert_eq!(
             mismatch_builder.append_viewport(
                 &mismatch_input,
-                &[&first, &second],
+                &[
+                    ViewportBlockContent::new(first.revision, first.source, &first.glyphs),
+                    ViewportBlockContent::new(second.revision, second.source, &second.glyphs),
+                ],
                 &full_atlas,
                 font_size,
                 Rgba8::black(),
@@ -1363,22 +1321,36 @@ mod tests {
         let viewport = Rect::new(0.0, 0.0, 200.0, 80.0).expect("viewport");
         let empty_atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("config"));
         let mut missing_builder =
-            SceneBuilder::new(layout.revision(), viewport).expect("scene builder");
+            SceneBuilder::new(layout.revision, viewport).expect("scene builder");
         let error = missing_builder
-            .append_layout(&layout, &empty_atlas, font_size, Rgba8::black())
+            .append_glyphs(
+                &layout.glyphs,
+                &empty_atlas,
+                font_size,
+                Rgba8::black(),
+                Point::new(0.0, 0.0),
+            )
             .expect_err("missing atlas entry");
         assert!(matches!(error, SceneError::MissingGlyphAtlas(_)));
         assert!(missing_builder.finish().primitives().is_empty());
 
-        let mut stale_builder = SceneBuilder::new(
-            Revision::new(layout.revision().get().saturating_add(1)),
-            viewport,
-        )
-        .expect("stale scene builder");
+        // Revision 绑定是 `append_viewport` 的事，不是这一层的：`append_glyphs`
+        // 与 `fill_rect` / `image` 一样只是把 primitive 摆进去，手里没有一个
+        // 可以拿来比对的 revision。整帧的过期拒绝见
+        // `viewport_block_layout_is_translated_to_document_space_atomically`。
         let atlas = atlas_for_layout(&layout, font_size);
-        assert!(matches!(
-            stale_builder.append_layout(&layout, &atlas, font_size, Rgba8::black()),
-            Err(SceneError::RevisionMismatch { .. })
-        ));
+        let mut builder = SceneBuilder::new(layout.revision, viewport).expect("scene builder");
+        assert_eq!(
+            builder
+                .append_glyphs(
+                    &layout.glyphs,
+                    &atlas,
+                    font_size,
+                    Rgba8::black(),
+                    Point::new(0.0, 0.0)
+                )
+                .expect("append glyphs"),
+            2
+        );
     }
 }

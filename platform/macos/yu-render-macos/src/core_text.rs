@@ -357,7 +357,7 @@ impl CoreTextViewportFrameBuilder {
                 let key = GlyphRasterKey::new(
                     placement.face(),
                     placement.glyph(),
-                    self.config.font_size() * placement.font_scale(),
+                    self.config.font_size() * placement.size_scale(),
                 )
                 .and_then(|key| key.with_raster_scale(self.config.raster_scale()))
                 .map_err(|_| {

@@ -1678,32 +1678,42 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn layout_consumes_core_text_advances_and_source_clusters() {
+    fn layout_consumes_core_text_advances_and_visual_clusters() {
         let text = "office 羽🙂";
-        let buffer = yu_text::TextBuffer::new(text);
-        let snapshot = buffer.snapshot();
-        let source = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
-            .expect("snapshot range should be valid");
-        let projection = yu_projection::Projection::inline(&snapshot, source)
-            .expect("inline projection should be valid");
         let family = CoreTextFontCatalog::system()
             .expect("CoreText should expose families")
             .families()[0]
             .clone();
         let request = FontRequest::new(family.as_ref(), 16.0).expect("request should be valid");
         let shaper = CoreTextShaper::from_system(request).expect("CoreText should initialize");
-        let layout = yu_layout::LayoutSnapshot::from_projection_with_shaper(
-            &projection,
+        let visual = yu_core::VisualRange::new(
+            yu_core::VisualOffset::ZERO,
+            yu_core::VisualOffset::new(text.len() as u64),
+        )
+        .expect("ordered");
+        let runs = [yu_layout::StyledRun::new(visual, yu_core::StyleId(0))];
+        let layout = yu_layout::BlockLayout::build_shaped(
+            yu_layout::LayoutInput::new(text, &runs),
             yu_layout::LayoutConfig::new(10_000.0, 20.0),
+            &yu_layout::UniformStyleTable::default(),
+            &yu_layout::NoWidgets,
+            &yu_layout::NoLineStyles,
             &shaper,
         )
         .expect("layout should consume CoreText glyph runs");
 
-        assert_eq!(layout.source_range(), source);
+        assert_eq!(layout.visual_len(), visual.end());
         assert!(layout.lines()[0].width() > 0.0);
-        assert!(layout.clusters().iter().all(|cluster| {
-            cluster.source().start() >= source.start() && cluster.source().end() <= source.end()
-        }));
+        // 每个簇都落在这段视觉文本里，而且首尾相接铺满它——少一段就是丢字，
+        // 不 panic 也不报错。
+        assert!(!layout.clusters().is_empty());
+        let mut cursor = yu_core::VisualOffset::ZERO;
+        for cluster in layout.clusters() {
+            assert_eq!(cluster.visual().start(), cursor);
+            cursor = cluster.visual().end();
+        }
+        assert_eq!(cursor, visual.end());
+        assert!(!layout.glyphs().is_empty());
     }
 
     #[cfg(target_os = "macos")]

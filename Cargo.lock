@@ -670,8 +670,6 @@ dependencies = [
  "yu-core",
  "yu-font",
  "yu-layout",
- "yu-projection",
- "yu-text",
 ]
 
 [[package]]
@@ -691,9 +689,6 @@ dependencies = [
  "unicode-segmentation",
  "yu-core",
  "yu-font",
- "yu-markdown",
- "yu-projection",
- "yu-text",
 ]
 
 [[package]]
@@ -725,8 +720,6 @@ dependencies = [
  "yu-core",
  "yu-font",
  "yu-layout",
- "yu-markdown",
- "yu-projection",
  "yu-scene",
  "yu-text",
 ]
@@ -752,9 +745,6 @@ dependencies = [
  "yu-core",
  "yu-font",
  "yu-layout",
- "yu-markdown",
- "yu-projection",
- "yu-text",
 ]
 
 [[package]]

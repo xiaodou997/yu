@@ -21,8 +21,8 @@ use yu_core::{LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
-    AccessibilityTextSnapshot, BlockProjection, CaretAffinity, CaretScrollRequest, CommandResult,
-    EditorCommand, EditorDocumentError, ImageSource, LayoutConfig, LayoutPoint, LayoutSnapshot,
+    AccessibilityTextSnapshot, BlockProjection, BlockView, CaretAffinity, CaretScrollRequest,
+    CommandResult, EditorCommand, EditorDocumentError, ImageSource, LayoutConfig, LayoutPoint,
     Projection, ProjectionBias, SelectionError, SourceSync, TableResizeCommit, TableResizeGesture,
     TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig, ViewportSpan,
     VisualOffset, VisualRunKind,
@@ -1596,7 +1596,7 @@ fn table_resize_accessibility_metadata(
     block_index: u64,
     block_y: f32,
     divider_width: f32,
-    table: &yu_editor::TableLayoutSnapshot,
+    table: &yu_editor::TableLayout,
 ) -> Result<Vec<YuStorageTableResizeAccessibilityDivider>, i32> {
     let column_count =
         u64::try_from(table.column_widths().len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
@@ -1704,7 +1704,7 @@ fn block_caret_from_layout(
     block_index: usize,
     source_utf16: u64,
     affinity: CaretAffinity,
-    layout: &LayoutSnapshot,
+    layout: &BlockView,
     line_height: f32,
     shaped: u8,
 ) -> Result<YuStorageBlockCaret, i32> {
@@ -5644,8 +5644,8 @@ mod tests {
                         .primitives()
                         .iter()
                         .find_map(|primitive| match primitive {
-                            Primitive::TaskCheckbox(task)
-                                if task.role() == yu_scene::TaskCheckboxPrimitiveRole::Border =>
+                            Primitive::Ornament(task)
+                                if task.role() == yu_scene::OrnamentRole::Border =>
                             {
                                 Some(*task)
                             }
@@ -6929,8 +6929,8 @@ mod tests {
                     .primitives()
                     .iter()
                     .filter_map(|primitive| match primitive {
-                        Primitive::Table(table)
-                            if table.role() == yu_scene::TablePrimitiveRole::Border
+                        Primitive::Ornament(table)
+                            if table.role() == yu_scene::OrnamentRole::Border
                                 && table.bounds().x() > 0.0
                                 && table.bounds().x() < 100.0 =>
                         {
@@ -7108,8 +7108,8 @@ mod tests {
                 .any(|primitive| {
                     matches!(
                         primitive,
-                        Primitive::Table(table)
-                            if table.role() == yu_scene::TablePrimitiveRole::Border
+                        Primitive::Ornament(table)
+                            if table.role() == yu_scene::OrnamentRole::Border
                                 && (table.bounds().x() - (divider + 1.0)).abs() < 0.01
                     )
                 })
@@ -7235,8 +7235,8 @@ mod tests {
                 .any(|primitive| {
                     matches!(
                         primitive,
-                        Primitive::Table(table)
-                            if table.role() == yu_scene::TablePrimitiveRole::Border
+                        Primitive::Ornament(table)
+                            if table.role() == yu_scene::OrnamentRole::Border
                                 && (table.bounds().x() - divider).abs() < 0.01
                     )
                 })

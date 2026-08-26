@@ -4,7 +4,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use yu_core::{ByteOffset, LineIndex, Revision, ShapingProvider, TextRange, Utf16Range};
-use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutSnapshot, TableResizeCommit};
+use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError};
+
+use crate::blockview::BlockView;
+use crate::table::TableResizeCommit;
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
 use yu_state::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats};
 use yu_text::{
@@ -284,7 +287,7 @@ impl EditorDocument {
         &mut self,
         index: usize,
         config: LayoutConfig,
-    ) -> Result<&LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<&BlockView, EditorDocumentError> {
         let block =
             self.markdown
                 .blocks()
@@ -317,7 +320,7 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
         shaper: &S,
-    ) -> Result<&LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<&BlockView, EditorDocumentError> {
         let block =
             self.markdown
                 .blocks()
@@ -346,10 +349,14 @@ impl EditorDocument {
         &self,
         index: usize,
         config: LayoutConfig,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<BlockView, EditorDocumentError> {
         let projection = self.block_projection_with_selection_reveal(index)?;
-        LayoutSnapshot::from_block_projection(&projection, config)
-            .map_err(EditorDocumentError::Layout)
+        BlockView::build(
+            &projection,
+            config,
+            &yu_layout::MonospaceMetrics::new(config.default_advance()),
+        )
+        .map_err(EditorDocumentError::Layout)
     }
 
     /// Shaping-aware selection reveal layout. The result is intentionally
@@ -359,10 +366,9 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
         shaper: &S,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<BlockView, EditorDocumentError> {
         let projection = self.block_projection_with_selection_reveal(index)?;
-        LayoutSnapshot::from_block_projection_with_shaper(&projection, config, shaper)
-            .map_err(EditorDocumentError::Layout)
+        BlockView::build_shaped(&projection, config, shaper).map_err(EditorDocumentError::Layout)
     }
 
     /// Returns an owned layout for the current transient visual state.
@@ -373,7 +379,7 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
         shaper: &S,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<BlockView, EditorDocumentError> {
         if self
             .composition_block_range()
             .as_ref()
@@ -394,7 +400,7 @@ impl EditorDocument {
         &mut self,
         index: usize,
         config: LayoutConfig,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<BlockView, EditorDocumentError> {
         if self
             .composition_block_range()
             .as_ref()
@@ -417,7 +423,7 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
         commit: TableResizeCommit,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<BlockView, EditorDocumentError> {
         self.validate_table_resize_commit(index, commit)?;
         let mut layout = self.block_layout(index, config)?.clone();
         layout
@@ -435,7 +441,7 @@ impl EditorDocument {
         config: LayoutConfig,
         shaper: &S,
         commit: TableResizeCommit,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<BlockView, EditorDocumentError> {
         self.validate_table_resize_commit(index, commit)?;
         let mut layout = self
             .block_layout_with_shaper(index, config, shaper)?
@@ -452,13 +458,13 @@ impl EditorDocument {
         commit: TableResizeCommit,
     ) -> Result<(), EditorDocumentError> {
         if commit.block_index() != index {
-            return Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
-                "table resize commit and block index differ",
+            return Err(EditorDocumentError::Layout(LayoutError::Upstream(
+                "table resize commit and block index differ".into(),
             )));
         }
         if commit.revision() != self.revision() {
-            return Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
-                "table resize commit and document revisions differ",
+            return Err(EditorDocumentError::Layout(LayoutError::Upstream(
+                "table resize commit and document revisions differ".into(),
             )));
         }
         Ok(())
@@ -472,10 +478,14 @@ impl EditorDocument {
         &mut self,
         index: usize,
         config: LayoutConfig,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<BlockView, EditorDocumentError> {
         let projection = self.block_projection_for_composition(index)?;
-        LayoutSnapshot::from_block_projection(&projection, config)
-            .map_err(EditorDocumentError::Layout)
+        BlockView::build(
+            &projection,
+            config,
+            &yu_layout::MonospaceMetrics::new(config.default_advance()),
+        )
+        .map_err(EditorDocumentError::Layout)
     }
 
     /// Builds a transient shaped layout with the active IME preedit projected
@@ -485,10 +495,9 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
         shaper: &S,
-    ) -> Result<LayoutSnapshot, EditorDocumentError> {
+    ) -> Result<BlockView, EditorDocumentError> {
         let projection = self.block_projection_for_composition(index)?;
-        LayoutSnapshot::from_block_projection_with_shaper(&projection, config, shaper)
-            .map_err(EditorDocumentError::Layout)
+        BlockView::build_shaped(&projection, config, shaper).map_err(EditorDocumentError::Layout)
     }
 
     fn block_projection_for_composition(
@@ -831,7 +840,7 @@ impl EditorDocument {
                     .block_layout_with_shaper(index, config, shaper)?
                     .clone();
                 apply_image_measurements(&mut block_layout, image_resolver)?;
-                let height = block_layout.block_height();
+                let height = block_layout.height();
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -879,7 +888,7 @@ impl EditorDocument {
                     self.block_layout_with_selection_reveal_and_shaper(index, config, shaper)?;
                 apply_image_measurements(&mut block_layout, image_resolver)?;
                 changed |= layout
-                    .set_block_height(index, block_layout.block_height())
+                    .set_block_height(index, block_layout.height())
                     .map_err(EditorDocumentError::Viewport)?;
             }
 
@@ -892,7 +901,7 @@ impl EditorDocument {
                     .clone();
                 apply_image_measurements(&mut block_layout, image_resolver)?;
                 changed |= layout
-                    .set_block_height(index, block_layout.block_height())
+                    .set_block_height(index, block_layout.height())
                     .map_err(EditorDocumentError::Viewport)?;
             }
             let next = layout
@@ -939,7 +948,7 @@ impl EditorDocument {
                         .block_layout_with_composition_and_shaper(index, config, shaper)?
                         .clone();
                     apply_image_measurements(&mut block_layout, image_resolver)?;
-                    let height = block_layout.block_height();
+                    let height = block_layout.height();
                     changed |= layout
                         .set_block_height(index, height)
                         .map_err(EditorDocumentError::Viewport)?;
@@ -957,7 +966,7 @@ impl EditorDocument {
                     .block_layout_with_shaper(index, config, shaper)?
                     .clone();
                 apply_image_measurements(&mut block_layout, image_resolver)?;
-                let height = block_layout.block_height();
+                let height = block_layout.height();
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -1985,7 +1994,7 @@ impl EditorDocument {
         mut load_layout: F,
     ) -> Result<CommandResult, EditorDocumentError>
     where
-        F: FnMut(&mut Self, usize, LayoutConfig) -> Result<LayoutSnapshot, EditorDocumentError>,
+        F: FnMut(&mut Self, usize, LayoutConfig) -> Result<BlockView, EditorDocumentError>,
     {
         self.history.break_group();
 
@@ -2149,7 +2158,7 @@ impl EditorDocument {
 }
 
 fn apply_image_measurements<F>(
-    layout: &mut LayoutSnapshot,
+    layout: &mut BlockView,
     image_resolver: &F,
 ) -> Result<(), EditorDocumentError>
 where
@@ -2248,7 +2257,7 @@ fn validate_caret_margin(margin: f32) -> Result<(), ViewportError> {
     }
 }
 
-fn navigable_line_count(layout: &LayoutSnapshot, has_following_block: bool) -> usize {
+fn navigable_line_count(layout: &BlockView, has_following_block: bool) -> usize {
     let line_count = layout.lines().len();
     let has_synthetic_trailing_line = layout.lines().last().is_some_and(|line| {
         line.source().is_empty() && line.source().start() == layout.source_range().end()
@@ -2471,13 +2480,13 @@ impl From<SelectionError> for EditorDocumentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::{TableResizeGesture, TableResizeTarget};
     use crate::{EditorKey, KeyModifiers, SourceSync, VisualRunKind};
     use unicode_segmentation::UnicodeSegmentation;
     use yu_core::{
         ByteOffset, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
         TextDirection, TextStyle, Utf16Offset,
     };
-    use yu_layout::{TableResizeGesture, TableResizeTarget};
     use yu_markdown::BlockKind;
     use yu_text::Edit;
 
@@ -2591,12 +2600,14 @@ mod tests {
                 [Edit::new(TextRange::empty(ByteOffset::ZERO), "前")],
             ))
             .expect("source edit");
-        assert!(matches!(
-            document.block_layout_with_table_resize(0, config, commit),
-            Err(EditorDocumentError::Layout(LayoutError::InvalidTable(
-                "table resize commit and document revisions differ"
+        assert_eq!(
+            document
+                .block_layout_with_table_resize(0, config, commit)
+                .err(),
+            Some(EditorDocumentError::Layout(LayoutError::Upstream(
+                "table resize commit and document revisions differ".into()
             )))
-        ));
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
