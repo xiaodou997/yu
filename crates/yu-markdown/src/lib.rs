@@ -18,6 +18,7 @@ use yu_text::{
 
 mod block_sequence;
 mod decorations;
+mod extension;
 mod inline;
 mod reference;
 mod table;
@@ -31,6 +32,10 @@ use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_bloc
 pub use decorations::{
     code_decorations, emphasis_decorations, extension_decoration_sets,
     inline_syntax_decoration_set, inline_syntax_decorations,
+};
+pub use extension::{
+    BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension, ExtensionError,
+    ExtensionOutput, ExtensionSet, MarkerOrnament, SyntaxNode, reveals,
 };
 pub use inline::{
     InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError,
@@ -1028,7 +1033,7 @@ pub fn block_syntax_hidden_ranges(source: &TextSnapshot, block: Block) -> Vec<Te
     }
 }
 
-fn block_line_ranges(source: &TextSnapshot, range: TextRange) -> Vec<TextRange> {
+pub(crate) fn block_line_ranges(source: &TextSnapshot, range: TextRange) -> Vec<TextRange> {
     let Ok(start) = usize::try_from(range.start()) else {
         return Vec::new();
     };

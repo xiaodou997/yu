@@ -246,7 +246,7 @@ fn fingerprint(definitions: &[ReferenceDefinition]) -> u64 {
         })
 }
 
-fn read_range(source: &TextSnapshot, range: TextRange) -> Option<Vec<u8>> {
+pub(crate) fn read_range(source: &TextSnapshot, range: TextRange) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut cursor = source.chunk_cursor(range.start()).ok()?;
     let start = usize::try_from(range.start()).ok()?;
