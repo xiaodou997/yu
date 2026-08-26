@@ -1440,6 +1440,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     // 每个可见块的装饰、字形与图片，全部搬到文档坐标之后交给场景层。
     // 「这些装饰是什么语法」到这里为止：场景层只看见矩形与角色。
     let mut ornaments = Vec::with_capacity(layouts.len());
+    let mut overlays = Vec::with_capacity(layouts.len());
     let mut images = Vec::with_capacity(layouts.len());
     let mut glyphs = Vec::with_capacity(layouts.len());
     for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
@@ -1467,6 +1468,10 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 ));
             }
         }
+        ornaments.push(block_ornaments);
+
+        // 任务框压在文字上面，不是衬在下面。
+        let mut block_overlays = Vec::new();
         if let BlockKind::TaskListItem { state, .. } = block.kind() {
             let Some(markdown_block) = document.markdown().blocks().get(block.index()) else {
                 return Err(ViewportSceneError::InvalidTaskMarker {
@@ -1478,9 +1483,9 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                     block: block.index(),
                 });
             };
-            append_task_checkbox(&mut block_ornaments, layout, origin, marker, state)?;
+            append_task_checkbox(&mut block_overlays, layout, origin, marker, state)?;
         }
-        ornaments.push(block_ornaments);
+        overlays.push(block_overlays);
 
         let mut block_images = Vec::new();
         for placement in layout.images() {
@@ -1529,6 +1534,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 .with_fill(viewport_block_background(block.kind()))
                 .with_ornaments(&ornaments[offset])
                 .with_images(&images[offset])
+                .with_overlays(&overlays[offset])
         })
         .collect::<Vec<_>>();
     builder.append_viewport(&input, &contents, atlas, font_size, color)?;

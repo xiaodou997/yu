@@ -441,9 +441,12 @@ impl SceneGlyph {
 
 /// 一个可见块在这一帧里要画的东西。
 ///
-/// 画家顺序就是字段顺序：底色 → 装饰 → 字形 → 图片。装饰在字形之前，
-/// 所以单元格底色盖不住它自己的文字；图片在字形之后，所以一张就绪的图
-/// 盖得住它替代的那段文本。
+/// 画家顺序就是字段顺序：底色 → 装饰 → 字形 → 图片 → 覆盖层。
+///
+/// 装饰在字形**之前**，所以单元格底色盖不住它自己的文字；图片在字形之后，
+/// 所以一张就绪的图盖得住它替代的那段文本；覆盖层在最后，给那些必须压在
+/// 文字上面的控件（任务框之类）。两个位置都留着不是为了对称——把控件挪到
+/// 文字下面去不会报错，只是画面变了，而那种变化只有真实窗口看得见。
 #[derive(Clone, Copy, Debug)]
 pub struct ViewportBlockContent<'a> {
     revision: Revision,
@@ -452,6 +455,7 @@ pub struct ViewportBlockContent<'a> {
     fill: Option<Rgba8>,
     ornaments: &'a [OrnamentPrimitive],
     images: &'a [ImagePrimitive],
+    overlays: &'a [OrnamentPrimitive],
 }
 
 impl<'a> ViewportBlockContent<'a> {
@@ -464,6 +468,7 @@ impl<'a> ViewportBlockContent<'a> {
             fill: None,
             ornaments: &[],
             images: &[],
+            overlays: &[],
         }
     }
 
@@ -485,6 +490,13 @@ impl<'a> ViewportBlockContent<'a> {
     #[must_use]
     pub const fn with_images(mut self, images: &'a [ImagePrimitive]) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 压在这一块所有内容之上的装饰。
+    #[must_use]
+    pub const fn with_overlays(mut self, overlays: &'a [OrnamentPrimitive]) -> Self {
+        self.overlays = overlays;
         self
     }
 }
@@ -865,6 +877,9 @@ impl SceneBuilder {
                     .map(Primitive::Glyph),
             );
             primitives.extend(content.images.iter().copied().map(Primitive::Image));
+            for overlay in content.overlays {
+                primitives.push(Primitive::Ornament(*overlay));
+            }
         }
         self.commit_primitives(primitives)
     }
