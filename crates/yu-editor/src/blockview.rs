@@ -40,7 +40,7 @@ use yu_projection::{
 use yu_text::{ChangeSet, TextSnapshot};
 
 use crate::blockinput::{BlockLayoutInput, BlockOrnaments};
-use crate::geometry::source_range_contains;
+use crate::geometry::{source_range_contains, upstream};
 use crate::image::{ImagePlacement, build_image_placements, place_images_in_table};
 use crate::table::{TableLayout, TableResizeCommit};
 
@@ -499,7 +499,11 @@ impl BlockView {
         changes: &ChangeSet,
         snapshot: &TextSnapshot,
     ) -> Result<Option<Self>, LayoutError> {
-        let Some(projection) = self.projection.map_through(changes, snapshot)? else {
+        let Some(projection) = self
+            .projection
+            .map_through(changes, snapshot)
+            .map_err(upstream)?
+        else {
             return Ok(None);
         };
         let table = self
@@ -560,7 +564,10 @@ impl BlockView {
         source: ByteOffset,
         bias: ProjectionBias,
     ) -> Result<BlockCaret, LayoutError> {
-        let visual = self.projection().source_to_visual(source, bias)?;
+        let visual = self
+            .projection()
+            .source_to_visual(source, bias)
+            .map_err(upstream)?;
         self.caret_for_visual(visual, bias)
     }
 
@@ -579,7 +586,10 @@ impl BlockView {
             .and_then(|table| table.source_for_visual_hit(self.projection(), visual, bias))
         {
             Some(source) => source,
-            None => self.projection().visual_to_source(visual, bias)?,
+            None => self
+                .projection()
+                .visual_to_source(visual, bias)
+                .map_err(upstream)?,
         };
         let (line, point) = self.point_for_visual(visual, bias)?;
         Ok(BlockCaret {
@@ -592,6 +602,11 @@ impl BlockView {
     }
 
     /// 一个 block 局部坐标点落在哪。
+    ///
+    /// 这里只决定**落在哪个视觉偏移上**；几何位置回头问
+    /// [`BlockView::caret_for_visual`]。两处各写一遍规则，就会「光标画在
+    /// 一处、点击落在另一处」——不 panic、不报错，只是不听话。S5 在 bidi
+    /// 那一刀抓到过一次同样的毛病。
     pub fn hit_test(&self, point: LayoutPoint) -> Result<BlockHit, LayoutError> {
         if !point.is_finite() {
             return Err(LayoutError::InvalidPoint);
@@ -607,12 +622,10 @@ impl BlockView {
         let line = &self.lines[line_index];
         let mut visual = line.visual.start();
         let mut bias = ProjectionBias::Before;
-        let mut x = line.bounds.width();
 
         let content_start = self.content_start(line);
-        if point.x() <= content_start {
-            x = content_start;
-        } else {
+        if point.x() > content_start {
+            let mut inside = false;
             for index in line.clusters.clone() {
                 let cluster = self.clusters[index];
                 if cluster.line_break {
@@ -620,41 +633,28 @@ impl BlockView {
                 }
                 if point.x() < cluster.x + cluster.width / 2.0 {
                     visual = cluster.visual.start();
-                    x = cluster.x;
                     bias = ProjectionBias::Before;
+                    inside = true;
                     break;
                 }
                 visual = cluster.visual.end();
-                x = cluster.x + cluster.width;
                 bias = ProjectionBias::After;
             }
-            // 点在行末之外：落到这一行**内容**的末尾，而不是换行符之后。
-            // bias 取 Before，否则行末的隐藏语法（`**` 的收尾）会把源码
-            // 偏移推到标记外面去，选中就少了一段。
-            if point.x() >= line.bounds.width() {
+            // 落在行末：那个位置是**这一行**的末尾，不是下一行的开头。
+            // 软换行处的两个位置分属 upstream 与 downstream（不变量 H5），
+            // 报成 downstream 会让光标画到下一行去。
+            if !inside && line_index + 1 < self.lines.len() {
                 visual = self.line_content_visual_end(line);
-                x = line.bounds.width();
                 bias = ProjectionBias::Before;
             }
         }
-        let source = match self
-            .table
-            .as_ref()
-            .and_then(|table| table.source_for_visual_hit(self.projection(), visual, bias))
-        {
-            Some(source) => source,
-            None => self.projection().visual_to_source(visual, bias)?,
-        };
-        Ok(BlockHit {
-            caret: BlockCaret {
-                source,
-                visual,
-                line: line_index,
-                point: LayoutPoint::new(x, line.bounds.y()),
-                bias,
-            },
-            image: None,
-        })
+        // 反过来的同一件事：落在行首的那个位置属于**这一行**，不是上一行的
+        // 末尾。两条合起来才让 `hit` 与 `caret` 在软换行的两侧都对得上。
+        if line_index > 0 && visual == line.visual.start() {
+            bias = ProjectionBias::After;
+        }
+        let caret = self.caret_for_visual(visual, bias)?;
+        Ok(BlockHit { caret, image: None })
     }
 
     /// 会话内的表格列宽调整。canonical 源码与缓存布局都不动。
@@ -666,7 +666,7 @@ impl BlockView {
         let table = self
             .table
             .as_ref()
-            .ok_or(LayoutError::InvalidTable("block is not a table"))?
+            .ok_or(LayoutError::Upstream("block is not a table".into()))?
             .resized_columns(index, delta)?;
         self.apply_table_geometry(&table)?;
         self.table = Some(table);
@@ -676,8 +676,8 @@ impl BlockView {
     /// 应用一次表格拖拽的提交结果。
     pub fn apply_table_resize(&mut self, commit: TableResizeCommit) -> Result<(), LayoutError> {
         if commit.revision() != self.revision() {
-            return Err(LayoutError::InvalidTable(
-                "table resize commit is bound to another revision",
+            return Err(LayoutError::Upstream(
+                "table resize commit is bound to another revision".into(),
             ));
         }
         match commit.target() {
@@ -822,8 +822,8 @@ impl BlockView {
     /// 它会被 widget 内部的逐单元格布局取代。
     fn apply_table_geometry(&mut self, table: &TableLayout) -> Result<(), LayoutError> {
         if table.revision() != self.revision() {
-            return Err(LayoutError::InvalidTable(
-                "table and text layout revisions differ",
+            return Err(LayoutError::Upstream(
+                "table and text layout revisions differ".into(),
             ));
         }
         let original = self.clusters.clone();
@@ -835,8 +835,8 @@ impl BlockView {
                     continue;
                 }
                 if targets[index].is_some() {
-                    return Err(LayoutError::InvalidTable(
-                        "a visual cluster belongs to multiple table cells",
+                    return Err(LayoutError::Upstream(
+                        "a visual cluster belongs to multiple table cells".into(),
                     ));
                 }
                 targets[index] = Some((cell.row(), cluster.x, x));
@@ -854,8 +854,8 @@ impl BlockView {
             .zip(targets.iter())
             .any(|(cluster, target)| !cluster.line_break && target.is_none())
         {
-            return Err(LayoutError::InvalidTable(
-                "a table visual cluster has no source cell",
+            return Err(LayoutError::Upstream(
+                "a table visual cluster has no source cell".into(),
             ));
         }
 
@@ -876,8 +876,8 @@ impl BlockView {
                         .then_some((index, target))
                 })
             else {
-                return Err(LayoutError::InvalidTable(
-                    "a shaped table glyph has no visual cluster",
+                return Err(LayoutError::Upstream(
+                    "a shaped table glyph has no visual cluster".into(),
                 ));
             };
             let (row, old_cluster_x, new_cluster_x) = target.expect("target checked above");
@@ -903,8 +903,8 @@ impl BlockView {
         for (row, source) in table.row_sources().iter().copied().enumerate() {
             let start = cluster_start;
             if cluster_start < self.clusters.len() && self.clusters[cluster_start].line() < row {
-                return Err(LayoutError::InvalidTable(
-                    "table cluster lines are not ordered",
+                return Err(LayoutError::Upstream(
+                    "table cluster lines are not ordered".into(),
                 ));
             }
             while cluster_start < self.clusters.len() && self.clusters[cluster_start].line() == row
@@ -919,10 +919,10 @@ impl BlockView {
             let first = row_cells
                 .clone()
                 .next()
-                .ok_or(LayoutError::InvalidTable("table row has no cells"))?;
+                .ok_or(LayoutError::Upstream("table row has no cells".into()))?;
             let last = row_cells
                 .next_back()
-                .ok_or(LayoutError::InvalidTable("table row has no cells"))?;
+                .ok_or(LayoutError::Upstream("table row has no cells".into()))?;
             let visual = VisualRange::new(first.visual().start(), last.visual().end())
                 .ok_or(LayoutError::OffsetOverflow)?;
             lines.push(BlockLine {
@@ -941,8 +941,8 @@ impl BlockView {
             });
         }
         if cluster_start != self.clusters.len() {
-            return Err(LayoutError::InvalidTable(
-                "table cluster lines exceed table rows",
+            return Err(LayoutError::Upstream(
+                "table cluster lines exceed table rows".into(),
             ));
         }
         self.lines = lines;
@@ -993,7 +993,9 @@ fn source_backed_clusters(
             .get()
             .checked_sub(run.visual().start().get())
             .ok_or(LayoutError::OffsetOverflow)?;
-        let source = projection.source_range_for_run_slice(run, local_start, local_end)?;
+        let source = projection
+            .source_range_for_run_slice(run, local_start, local_end)
+            .map_err(upstream)?;
         // 字型取**解释之后**的那个，不是 run 自己声明的那个：标题把每一段
         // 都排成粗体，栅格化必须按实际用的字面来，否则字画得比量出来的窄。
         let style = styles
@@ -1089,7 +1091,9 @@ fn flow_lines(
         let end = if line.index() + 1 == count {
             block.end()
         } else {
-            projection.visual_to_source(line.visual().end(), ProjectionBias::Before)?
+            projection
+                .visual_to_source(line.visual().end(), ProjectionBias::Before)
+                .map_err(upstream)?
         };
         let end = end.max(start).min(block.end());
         lines.push(BlockLine {

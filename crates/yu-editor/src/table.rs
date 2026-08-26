@@ -18,14 +18,13 @@ use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{ByteOffset, ClusterMetrics, Revision, ShapingProvider, TextRange, TextStyle};
 use yu_markdown::{TableAlignment, TableCellRange};
 use yu_projection::{
-    Projection, ProjectionBias, ProjectionError, TableProjection, VisualOffset, VisualRange,
-    VisualRunKind,
+    Projection, ProjectionBias, TableProjection, VisualOffset, VisualRange, VisualRunKind,
 };
 use yu_text::{ChangeSet, TextSnapshot};
 
 use yu_layout::{LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
 
-use crate::geometry::{map_source_range, source_range_contains};
+use crate::geometry::{map_source_range, source_range_contains, upstream};
 
 /// Geometry for one visible GFM table cell. The row index is visual-table
 /// based: `0` is the header and body rows start at `1`; the Markdown
@@ -419,14 +418,18 @@ impl TableLayout {
         let table = projection.table();
         let column_count = table.column_count();
         if column_count == 0 || table.delimiter().len() != column_count {
-            return Err(LayoutError::InvalidTable("table columns are inconsistent"));
+            return Err(LayoutError::Upstream(
+                "table columns are inconsistent".into(),
+            ));
         }
 
         let mut rows = Vec::with_capacity(table.body_row_count().saturating_add(1));
         rows.push(table.header().to_vec());
         rows.extend(table.rows().iter().cloned());
         if rows.iter().any(|row| row.len() != column_count) {
-            return Err(LayoutError::InvalidTable("table body row is inconsistent"));
+            return Err(LayoutError::Upstream(
+                "table body row is inconsistent".into(),
+            ));
         }
 
         let padding = config.default_advance();
@@ -451,7 +454,7 @@ impl TableLayout {
 
         let natural_total = natural_widths.iter().sum::<f32>();
         if !natural_total.is_finite() || natural_total <= 0.0 {
-            return Err(LayoutError::InvalidTable("table width is not finite"));
+            return Err(LayoutError::Upstream("table width is not finite".into()));
         }
         let scale = (config.max_width() / natural_total).min(1.0);
         let column_widths = natural_widths
@@ -568,18 +571,18 @@ impl TableLayout {
     /// the current table layout contract still uses a uniform row height.
     pub fn resized_columns(&self, index: usize, delta: f32) -> Result<Self, LayoutError> {
         if !delta.is_finite() {
-            return Err(LayoutError::InvalidTable(
-                "table column resize delta must be finite",
+            return Err(LayoutError::Upstream(
+                "table column resize delta must be finite".into(),
             ));
         }
         let Some(right_index) = index.checked_add(1) else {
-            return Err(LayoutError::InvalidTable(
-                "table column resize index is out of bounds",
+            return Err(LayoutError::Upstream(
+                "table column resize index is out of bounds".into(),
             ));
         };
         if right_index >= self.column_widths.len() {
-            return Err(LayoutError::InvalidTable(
-                "table column resize index is out of bounds",
+            return Err(LayoutError::Upstream(
+                "table column resize index is out of bounds".into(),
             ));
         }
 
@@ -587,22 +590,22 @@ impl TableLayout {
         let right = self.column_widths[right_index];
         let pair_width = left + right;
         if !left.is_finite() || !right.is_finite() || !pair_width.is_finite() || pair_width <= 0.0 {
-            return Err(LayoutError::InvalidTable(
-                "table column widths are not finite",
+            return Err(LayoutError::Upstream(
+                "table column widths are not finite".into(),
             ));
         }
         let minimum = (self.padding * 2.0).min(pair_width * 0.5).max(f32::EPSILON);
         let requested_left = left + delta;
         if !requested_left.is_finite() {
-            return Err(LayoutError::InvalidTable(
-                "table column resize result is not finite",
+            return Err(LayoutError::Upstream(
+                "table column resize result is not finite".into(),
             ));
         }
         let new_left = requested_left.clamp(minimum, pair_width - minimum);
         let new_right = pair_width - new_left;
         if !new_right.is_finite() || new_right < minimum {
-            return Err(LayoutError::InvalidTable(
-                "table column resize result is invalid",
+            return Err(LayoutError::Upstream(
+                "table column resize result is invalid".into(),
             ));
         }
 
@@ -618,11 +621,13 @@ impl TableLayout {
                 .iter()
                 .any(|width| !width.is_finite() || *width <= 0.0)
         {
-            return Err(LayoutError::InvalidTable("table column widths are invalid"));
+            return Err(LayoutError::Upstream(
+                "table column widths are invalid".into(),
+            ));
         }
         let total_width = column_widths.iter().sum::<f32>();
         if !total_width.is_finite() || total_width <= 0.0 {
-            return Err(LayoutError::InvalidTable("table width is not finite"));
+            return Err(LayoutError::Upstream("table width is not finite".into()));
         }
         let mut starts = Vec::with_capacity(column_widths.len());
         let mut x = self.bounds.x();
@@ -631,45 +636,48 @@ impl TableLayout {
             x += width;
         }
 
-        let cells =
-            self.cells
-                .iter()
-                .copied()
-                .map(|cell| {
-                    let width = column_widths.get(cell.column).copied().ok_or(
-                        LayoutError::InvalidTable("table cell column is out of bounds"),
-                    )?;
-                    let column_x =
-                        starts
-                            .get(cell.column)
-                            .copied()
-                            .ok_or(LayoutError::InvalidTable(
-                                "table cell column is out of bounds",
-                            ))?;
-                    let available = (width - self.padding * 2.0).max(0.0);
-                    let slack = (available - cell.content_width).max(0.0);
-                    let alignment_offset = match cell.alignment {
-                        TableAlignment::Center => slack * 0.5,
-                        TableAlignment::Right => slack,
-                        TableAlignment::Default | TableAlignment::Left => 0.0,
-                    };
-                    Ok(TableCellLayout {
-                        row: cell.row,
-                        column: cell.column,
-                        source: cell.source,
-                        visual: cell.visual,
-                        bounds: LayoutRect::new(
-                            column_x,
-                            cell.bounds.y(),
-                            width,
-                            cell.bounds.height(),
-                        )?,
-                        alignment: cell.alignment,
-                        content_x: column_x + self.padding + alignment_offset,
-                        content_width: cell.content_width,
-                    })
+        let cells = self
+            .cells
+            .iter()
+            .copied()
+            .map(|cell| {
+                let width =
+                    column_widths
+                        .get(cell.column)
+                        .copied()
+                        .ok_or(LayoutError::Upstream(
+                            "table cell column is out of bounds".into(),
+                        ))?;
+                let column_x = starts
+                    .get(cell.column)
+                    .copied()
+                    .ok_or(LayoutError::Upstream(
+                        "table cell column is out of bounds".into(),
+                    ))?;
+                let available = (width - self.padding * 2.0).max(0.0);
+                let slack = (available - cell.content_width).max(0.0);
+                let alignment_offset = match cell.alignment {
+                    TableAlignment::Center => slack * 0.5,
+                    TableAlignment::Right => slack,
+                    TableAlignment::Default | TableAlignment::Left => 0.0,
+                };
+                Ok(TableCellLayout {
+                    row: cell.row,
+                    column: cell.column,
+                    source: cell.source,
+                    visual: cell.visual,
+                    bounds: LayoutRect::new(
+                        column_x,
+                        cell.bounds.y(),
+                        width,
+                        cell.bounds.height(),
+                    )?,
+                    alignment: cell.alignment,
+                    content_x: column_x + self.padding + alignment_offset,
+                    content_width: cell.content_width,
                 })
-                .collect::<Result<Vec<_>, LayoutError>>()?;
+            })
+            .collect::<Result<Vec<_>, LayoutError>>()?;
         let bounds = LayoutRect::new(
             self.bounds.x(),
             self.bounds.y(),
@@ -773,8 +781,8 @@ impl TableLayout {
             return Err(LayoutError::InvalidPoint);
         }
         if !tolerance.is_finite() || tolerance < 0.0 {
-            return Err(LayoutError::InvalidTable(
-                "resize tolerance must be finite and non-negative",
+            return Err(LayoutError::Upstream(
+                "resize tolerance must be finite and non-negative".into(),
             ));
         }
         if point.x() < self.bounds.x() - tolerance
@@ -849,7 +857,7 @@ impl TableLayout {
             .collect::<Result<Vec<_>, LayoutError>>()?;
         snapshot
             .utf16_offset(source_range.start())
-            .map_err(|error| LayoutError::Projection(ProjectionError::SourcePosition(error)))?;
+            .map_err(upstream)?;
         Ok(Self {
             revision: snapshot.revision(),
             source_range,
@@ -885,10 +893,12 @@ where
 {
     let visual_start = projection
         .visual()
-        .source_to_visual(source.start(), ProjectionBias::After)?;
+        .source_to_visual(source.start(), ProjectionBias::After)
+        .map_err(upstream)?;
     let visual_end = projection
         .visual()
-        .source_to_visual(source.end(), ProjectionBias::Before)?;
+        .source_to_visual(source.end(), ProjectionBias::Before)
+        .map_err(upstream)?;
     let visual = VisualRange::new(visual_start, visual_end).ok_or(LayoutError::OffsetOverflow)?;
     let mut width = 0.0_f32;
     for run in projection.visual().runs().iter().copied() {
@@ -909,7 +919,7 @@ where
         if !overlaps {
             continue;
         }
-        let text = projection.visual().text_for_run(run)?;
+        let text = projection.visual().text_for_run(run).map_err(upstream)?;
         let shape_source = projection.visual().shape_source_range_for_run(run);
         width += measure(&text, shape_source, run.style())?;
     }

@@ -1,5 +1,7 @@
 use yu_core::{Revision, ShapingProvider, TextRange};
-use yu_layout::{LayoutConfig, LayoutError, LayoutSnapshot};
+use yu_layout::{LayoutConfig, LayoutError};
+
+use crate::blockview::BlockView;
 use yu_markdown::{Block, BlockKind, MarkdownDocument};
 use yu_projection::BlockProjection;
 use yu_text::{ChangeSet, TextSnapshot};
@@ -91,7 +93,7 @@ impl LayoutKey {
 #[derive(Debug)]
 struct LayoutEntry {
     key: LayoutKey,
-    layout: LayoutSnapshot,
+    layout: BlockView,
 }
 
 impl LayoutCache {
@@ -102,7 +104,7 @@ impl LayoutCache {
         block: Block,
         config: LayoutConfig,
         projection: &BlockProjection,
-    ) -> Result<&LayoutSnapshot, LayoutError> {
+    ) -> Result<&BlockView, LayoutError> {
         let key = LayoutKey::new(block, config, LayoutBackend::Metrics);
         self.prepare(snapshot);
         if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
@@ -110,7 +112,11 @@ impl LayoutCache {
             return Ok(&self.entries[index].layout);
         }
 
-        let layout = LayoutSnapshot::from_block_projection(projection, config)?;
+        let layout = BlockView::build(
+            projection,
+            config,
+            &yu_layout::MonospaceMetrics::new(config.default_advance()),
+        )?;
         Ok(self.insert(key, layout))
     }
 
@@ -122,7 +128,7 @@ impl LayoutCache {
         config: LayoutConfig,
         projection: &BlockProjection,
         shaper: &S,
-    ) -> Result<&LayoutSnapshot, LayoutError> {
+    ) -> Result<&BlockView, LayoutError> {
         let key = LayoutKey::new(block, config, LayoutBackend::Shaped);
         self.prepare(snapshot);
         if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
@@ -130,7 +136,7 @@ impl LayoutCache {
             return Ok(&self.entries[index].layout);
         }
 
-        let layout = LayoutSnapshot::from_block_projection_with_shaper(projection, config, shaper)?;
+        let layout = BlockView::build_shaped(projection, config, shaper)?;
         Ok(self.insert(key, layout))
     }
 
@@ -148,7 +154,7 @@ impl LayoutCache {
         }
     }
 
-    fn insert(&mut self, key: LayoutKey, layout: LayoutSnapshot) -> &LayoutSnapshot {
+    fn insert(&mut self, key: LayoutKey, layout: BlockView) -> &BlockView {
         self.entries.push(LayoutEntry { key, layout });
         self.stats.builds = self.stats.builds.saturating_add(1);
         let index = self.entries.len().saturating_sub(1);

@@ -17,10 +17,10 @@ use std::time::SystemTime;
 
 use yu_core::{ByteOffset, Revision, TextRange, Utf16Range};
 use yu_editor::{
-    BlockProjection, CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay,
-    EditorCommand, EditorDocument, EditorDocumentError, EditorSelection, KeyEvent, KeyRouteResult,
-    LayoutConfig, LayoutSnapshot, Projection, ShapingProvider, ViewportConfig, ViewportSnapshot,
-    ViewportSpan,
+    BlockProjection, BlockView, CaretScrollRequest, CommandResult, CompositionError,
+    CompositionOverlay, EditorCommand, EditorDocument, EditorDocumentError, EditorSelection,
+    KeyEvent, KeyRouteResult, LayoutConfig, MonospaceMetrics, Projection, ShapingProvider,
+    ViewportConfig, ViewportSnapshot, ViewportSpan,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -238,10 +238,14 @@ impl DocumentSession {
     /// a second layout cache. The editor remains the owner of projections and
     /// source; callers receive a revision-bound snapshot that can answer
     /// source↔visual↔point queries without retaining a borrow into the editor.
-    pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<LayoutSnapshot, StorageError> {
-        let projection = self.inline_projection()?;
-        LayoutSnapshot::from_projection(&projection, config)
-            .map_err(|error| StorageError::Editor(EditorDocumentError::Layout(error)))
+    pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<BlockView, StorageError> {
+        let projection = BlockProjection::Inline(self.inline_projection()?);
+        BlockView::build(
+            &projection,
+            config,
+            &MonospaceMetrics::new(config.default_advance()),
+        )
+        .map_err(|error| StorageError::Editor(EditorDocumentError::Layout(error)))
     }
 
     /// Builds the current transient composition over the same full-source
@@ -338,7 +342,7 @@ impl DocumentSession {
         &mut self,
         index: usize,
         config: LayoutConfig,
-    ) -> Result<LayoutSnapshot, StorageError> {
+    ) -> Result<BlockView, StorageError> {
         self.editor
             .block_layout(index, config)
             .cloned()
@@ -352,7 +356,7 @@ impl DocumentSession {
         index: usize,
         config: LayoutConfig,
         shaper: &S,
-    ) -> Result<LayoutSnapshot, StorageError> {
+    ) -> Result<BlockView, StorageError> {
         self.editor
             .block_layout_with_shaper(index, config, shaper)
             .cloned()
@@ -747,7 +751,7 @@ impl DocumentEditorSession {
         self.document.inline_projection_for_visual_state()
     }
 
-    pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<LayoutSnapshot, StorageError> {
+    pub fn inline_layout(&mut self, config: LayoutConfig) -> Result<BlockView, StorageError> {
         self.document.inline_layout(config)
     }
 
@@ -780,7 +784,7 @@ impl DocumentEditorSession {
         &mut self,
         index: usize,
         config: LayoutConfig,
-    ) -> Result<LayoutSnapshot, StorageError> {
+    ) -> Result<BlockView, StorageError> {
         self.document.block_layout(index, config)
     }
 
@@ -789,7 +793,7 @@ impl DocumentEditorSession {
         index: usize,
         config: LayoutConfig,
         shaper: &S,
-    ) -> Result<LayoutSnapshot, StorageError> {
+    ) -> Result<BlockView, StorageError> {
         self.document
             .block_layout_with_shaper(index, config, shaper)
     }

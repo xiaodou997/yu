@@ -34,16 +34,13 @@ pub use blockinput::{
 pub use blockview::{BlockCaret, BlockCluster, BlockGlyph, BlockHit, BlockLine, BlockView};
 pub use command::{CommandResult, EditorCommand, KeyRouteResult, SourceChange, SourceSync};
 pub use document::{EditorDocument, EditorDocumentError};
-pub use image::ImagePlacement as BlockImagePlacement;
+pub use image::ImagePlacement;
 pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
 pub use layout::{LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use projection::{ProjectionCache, ProjectionCacheStats};
 pub use table::{
-    TableCellLayout as TableCellGeometry, TableLayout, TableLayoutHit as TableGeometryHit,
-    TableResizeCommit as TableGeometryResizeCommit,
-    TableResizeGesture as TableGeometryResizeGesture,
-    TableResizeGestureError as TableGeometryResizeGestureError,
-    TableResizeHit as TableGeometryResizeHit, TableResizeTarget as TableGeometryResizeTarget,
+    TableCellLayout, TableLayout, TableLayoutHit, TableResizeCommit, TableResizeGesture,
+    TableResizeGestureError, TableResizeHit, TableResizeTarget,
 };
 pub use viewport::{
     CaretScrollRequest, ViewportBlock, ViewportCaret, ViewportConfig, ViewportError,
@@ -55,11 +52,8 @@ pub use yu_core::{
 };
 // 编辑状态住在 yu-state（S4）。这里再导出，好让平台层与 FFI 的路径不变。
 pub use yu_layout::{
-    BlockQuoteLayout, HeadingLayout, HeightIndex, HeightIndexError, ImageIntrinsicSize,
-    LayoutCaret, LayoutConfig, LayoutError, LayoutHit, LayoutPoint, LayoutSnapshot,
-    MonospaceMetrics, TableCellLayout, TableLayoutHit, TableLayoutSnapshot, TableResizeCommit,
-    TableResizeGesture, TableResizeGestureError, TableResizeHit, TableResizeTarget, VisualCluster,
-    VisualLine,
+    BlockLayout, GlyphBox, HeightIndex, HeightIndexError, ImageIntrinsicSize, LayoutConfig,
+    LayoutError, LayoutPoint, LayoutRect, MonospaceMetrics,
 };
 pub use yu_markdown::{
     Block, BlockKind, ListMarker, MarkdownDocument, TableAlignment, TaskMarker, TaskState,

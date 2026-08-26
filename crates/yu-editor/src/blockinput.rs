@@ -23,6 +23,7 @@
 //! 字符。它们留在 [`BlockOrnaments`] 里，由绘制方拿去画。布局层拿到的是
 //! 「缩进 8.0」，不是「这是二级引用」。
 
+use crate::geometry::upstream;
 use yu_core::{
     ByteOffset, ClusterMetrics, LineStyleId, ShapedText, ShapingProvider, StyleId, TextAttrs,
     TextRange, TextStyle,
@@ -392,9 +393,7 @@ fn derive_text_and_runs(projection: &Projection) -> Result<(String, Vec<StyledRu
         if run.kind() == VisualRunKind::HiddenSyntax {
             continue;
         }
-        let piece = projection
-            .text_for_run(run)
-            .map_err(LayoutError::Projection)?;
+        let piece = projection.text_for_run(run).map_err(upstream)?;
         let len = u64::try_from(piece.len()).map_err(|_| LayoutError::OffsetOverflow)?;
         if run.visual().end().get() - run.visual().start().get() != len {
             return Err(LayoutError::InvalidConfig(
