@@ -17,6 +17,7 @@ mod image;
 mod keymap;
 mod layout;
 mod list;
+mod marks;
 mod projection;
 mod table;
 mod viewport;

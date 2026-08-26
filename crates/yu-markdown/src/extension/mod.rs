@@ -451,6 +451,22 @@ impl BlockDecorations {
             .and_then(|index| self.line_styles.get(index))
     }
 
+    /// 整张字型表。下标就是 [`StyleId`]。
+    ///
+    /// 装配层要把它整体翻成排版属性（标题还要给每一项乘上字号倍率），逐个
+    /// `attrs(StyleId(i))` 试到 `None` 为止是能做，但那等于用「查不到」当
+    /// 终止条件——而查不到本来是个错误。
+    #[must_use]
+    pub fn styles(&self) -> &[TextAttrs] {
+        &self.styles
+    }
+
+    /// 整张行级装饰表。下标就是 [`LineStyleId`]。
+    #[must_use]
+    pub fn line_styles(&self) -> &[BlockOrnament] {
+        &self.line_styles
+    }
+
     /// 这个块上的全部行级装饰，按定序。
     #[must_use]
     pub fn line_ornaments(&self) -> Vec<(TextRange, &BlockOrnament)> {
