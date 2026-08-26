@@ -279,3 +279,34 @@ fn syntax_marks_cover_exactly_the_syntax_characters() {
         );
     }
 }
+
+/// 硬换行的行尾符可以是 `\n`、`\r\n` 或单独的 `\r`。
+///
+/// 只认 `\n` 的话，CRLF 文档里的硬换行整个失效：`HardBreak` 节点不存在，
+/// 两个尾随空格变成可见内容，换行也不再是硬的。不报错，只是画面不对——
+/// 而 Windows 上存的文件全是 CRLF。CommonMark 的 spec 用例只用 `\n`，
+/// 压不住这一条，所以它在这里。
+#[test]
+fn hard_breaks_accept_every_line_ending() {
+    let cases: &[(&str, &[(u32, u32)])] = &[
+        ("a  \nb", &[(1, 4)]),
+        ("a  \r\nb", &[(1, 5)]),
+        ("a  \rb", &[(1, 4)]),
+        ("a\\\nb", &[(1, 3)]),
+        ("a\\\r\nb", &[(1, 4)]),
+        // 一个空格不够，两个才算硬换行。
+        ("a \nb", &[]),
+        ("a \r\nb", &[]),
+    ];
+
+    for (source, expected) in cases {
+        let parsed = parse(*source).expect("短输入");
+        let mut found: Vec<(u32, u32)> = Vec::new();
+        walk(parsed.tree(), 0, 0, &mut |node, from, to, _| {
+            if node.kind() == NodeKind::HardBreak {
+                found.push((from, to));
+            }
+        });
+        assert_eq!(found, expected.to_vec(), "{source:?} 的硬换行范围不对");
+    }
+}

@@ -1,0 +1,665 @@
+//! extension 集合自己的用例。
+//!
+//! `crates/yu-projection/tests/extension_parity.rs` 拿 v1 当 oracle 压住
+//! 「非焦点时隐藏了哪些字节」。这里压它压不到的三件事：
+//!
+//! 1. **焦点态。** 光标碰到语法就露出来。v1 的粒度与这里不同，比对不了。
+//! 2. **id 表。** 装饰指向的 `StyleId` / `LineStyleId` 必须查得到——查不到
+//!    不给默认值，直接 `None`。
+//! 3. **验收本身。** S6 的验收是「新增一种语法的 diff 只落在 `yu-markdown`
+//!    内，且 < 200 行」。这里真的加一种，看它需不需要动别的地方。
+
+use yu_core::{ByteOffset, StyleId, TextAttrs, TextRange, TextStyle};
+use yu_decoration::LineStyleId;
+use yu_markdown::{
+    BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension, ExtensionOutput,
+    ExtensionSet, parse,
+};
+use yu_syntax::{NodeKind, parse as parse_syntax};
+use yu_text::TextBuffer;
+
+use std::sync::{Arc, Mutex};
+
+fn offset(value: u64) -> ByteOffset {
+    ByteOffset::new(value)
+}
+
+fn range(from: u64, to: u64) -> TextRange {
+    TextRange::new(offset(from), offset(to)).expect("测试区间是升序的")
+}
+
+/// 跑一遍注册表，取第一个块的装饰。
+fn decorate_with(
+    extensions: &ExtensionSet,
+    source: &str,
+    active: Option<TextRange>,
+) -> BlockDecorations {
+    let buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let document = parse(&snapshot);
+    let tree = parse_syntax(&snapshot).expect("测试文档很短").into_tree();
+    let block = document.blocks().get(0).expect("至少有一个块");
+    extensions
+        .decorate(&snapshot, &tree, block, active)
+        .expect("装饰产出不该失败")
+}
+
+fn decorate(source: &str, active: Option<TextRange>) -> BlockDecorations {
+    decorate_with(&ExtensionSet::markdown(), source, active)
+}
+
+/// 这个块上被隐藏的 source 区间，升序去重。
+fn hidden(decorations: &BlockDecorations) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<_> = decorations
+        .set()
+        .all()
+        .iter()
+        .filter(|entry| entry.decoration.hides_source())
+        .map(|entry| (entry.range.start().get(), entry.range.end().get()))
+        .collect();
+    ranges.sort_unstable();
+    ranges.dedup();
+    ranges
+}
+
+/// 同上，但把重叠与相邻的区间并起来。
+///
+/// 两个互不感知的 extension 可以盖在同一段 source 上（`- [x]` 就是），
+/// 问「最后看不见哪些字节」时要看并集，不是看谁产了哪一条。
+fn hidden_merged(decorations: &BlockDecorations) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (from, to) in hidden(decorations) {
+        match out.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- 焦点态
+
+#[test]
+fn cursor_inside_emphasis_reveals_its_delimiters() {
+    // `*斜体*`：光标停在内容里，两个 `*` 都要看得见。
+    assert_eq!(hidden(&decorate("*斜体*", None)), vec![(0, 1), (7, 8)]);
+    assert_eq!(hidden(&decorate("*斜体*", Some(range(3, 3)))), Vec::new());
+}
+
+/// 光标停在外边缘不算碰到它。
+///
+/// 用非严格包含的话，两段**相邻**语法之间那一处会让它们一起露出来——用户
+/// 只把光标挪到两段之间，屏幕上凭空多出四个字符。
+///
+/// 语料用 `` `a`*b* `` 而不是 `*a**b*`：后者在 CommonMark 里是**一整段**
+/// 强调（内容是 `a**b`），压不住「两段」这件事。
+#[test]
+fn a_cursor_on_the_outer_edge_does_not_reveal() {
+    let both_hidden = vec![(0, 1), (2, 3), (3, 4), (5, 6)];
+    assert_eq!(hidden(&decorate("`a`*b*", None)), both_hidden);
+    assert_eq!(hidden(&decorate("`a`*b*", Some(range(3, 3)))), both_hidden);
+    // 挪进第一段内部，只有第一段露出来。
+    assert_eq!(
+        hidden(&decorate("`a`*b*", Some(range(1, 1)))),
+        vec![(3, 4), (5, 6)]
+    );
+}
+
+/// 选区按相交算，不按严格包含。
+#[test]
+fn a_selection_reveals_every_span_it_touches() {
+    assert_eq!(hidden(&decorate("`a`*b*", Some(range(0, 6)))), Vec::new());
+}
+
+/// 结构性前缀整块一起露出来：光标在这一行时用户要能看见 `##`。
+#[test]
+fn a_focused_block_reveals_its_structural_prefix() {
+    assert_eq!(hidden(&decorate("## 标题", None)), vec![(0, 3)]);
+    assert_eq!(hidden(&decorate("## 标题", Some(range(4, 4)))), Vec::new());
+
+    assert_eq!(hidden(&decorate("> 引用", None)), vec![(0, 2)]);
+    assert_eq!(hidden(&decorate("> 引用", Some(range(3, 3)))), Vec::new());
+
+    // 列表的标记连替代呈现一起撤掉——否则光标停在一个看不见的 `-` 上，
+    // 用户按退格会删掉一个他没看见的字符。
+    assert_eq!(hidden(&decorate("- 项目", None)), vec![(0, 2)]);
+    let focused = decorate("- 项目", Some(range(3, 3)));
+    assert_eq!(hidden(&focused), Vec::new());
+    assert!(
+        focused.line_ornaments().is_empty(),
+        "焦点列表项不该再画替代标记"
+    );
+}
+
+// ---------------------------------------------------------------- 装饰内容
+
+#[test]
+fn heading_reports_its_level_not_its_font_size() {
+    let decorations = decorate("### 三级", None);
+    let ornaments = decorations.line_ornaments();
+    assert_eq!(ornaments.len(), 1);
+    assert_eq!(ornaments[0].1, &BlockOrnament::Heading { level: 3 });
+}
+
+/// 续行的 `>` 嵌在 `Paragraph` 里，不是 `Blockquote` 的直接子节点。按标记
+/// 个数数层会把 `> a\n> b` 报成两层。
+#[test]
+fn quote_depth_counts_nesting_not_marks() {
+    let one = decorate("> a\n> b", None);
+    assert_eq!(
+        one.line_ornaments()[0].1,
+        &BlockOrnament::QuoteBar { depth: 1 }
+    );
+    assert_eq!(hidden(&one), vec![(0, 2), (4, 6)], "两行的前缀都要隐藏");
+
+    let two = decorate("> > 两层", None);
+    assert_eq!(
+        two.line_ornaments()[0].1,
+        &BlockOrnament::QuoteBar { depth: 2 }
+    );
+}
+
+#[test]
+fn ordered_lists_keep_their_number_bullets_get_a_dot() {
+    let bullet = decorate("- 项目", None);
+    let BlockOrnament::Marker(marker) = bullet.line_ornaments()[0].1 else {
+        panic!("列表项该有一个标记装饰");
+    };
+    assert_eq!(marker.text(), "\u{2022}");
+    assert_eq!(marker.indent(), 0);
+
+    let ordered = decorate("1. 有序", None);
+    let BlockOrnament::Marker(marker) = ordered.line_ornaments()[0].1 else {
+        panic!("列表项该有一个标记装饰");
+    };
+    assert_eq!(marker.text(), "1.", "有序列表的编号是给人看的，原样搬过去");
+
+    let indented = decorate("  - 缩进项", None);
+    let BlockOrnament::Marker(marker) = indented.line_ornaments()[0].1 else {
+        panic!("列表项该有一个标记装饰");
+    };
+    assert_eq!(marker.indent(), 2);
+    assert_eq!(
+        hidden(&indented),
+        vec![(0, 4)],
+        "行首缩进也是语法：缩进量单独报给上一层，留在视觉文本里就缩进两次"
+    );
+}
+
+/// 代码块的内容不解析行内语法。这件事由树的形状保证，不靠任何人记得判断。
+#[test]
+fn code_content_keeps_its_asterisks() {
+    let fenced = decorate("```\nlet x = *y;\n```", None);
+    assert_eq!(
+        hidden(&fenced),
+        vec![(0, 4), (16, 19)],
+        "只有两条围栏该消失，代码里的 `*` 一个都不能动"
+    );
+
+    // 空代码块没有 `CodeText`，开围栏后面那个换行符仍然要拿掉——留着它
+    // 画面上就是一个空行。
+    assert_eq!(hidden(&decorate("```\n```", None)), vec![(0, 4), (4, 7)]);
+}
+
+/// 硬换行拿掉的是换行符**前面**那一小段，换行符本身留着——布局按它强制换行。
+#[test]
+fn hard_breaks_hide_the_marker_not_the_newline() {
+    assert_eq!(hidden(&decorate("行尾  \n第二行", None)), vec![(6, 8)]);
+    assert_eq!(hidden(&decorate("行尾\\\n第二行", None)), vec![(6, 7)]);
+    // 软换行没有东西要拿掉：行尾的空格是内容。
+    assert_eq!(hidden(&decorate("行尾\n第二行", None)), Vec::new());
+}
+
+/// 任务项画成 `- ☐ 待办`，普通列表项画成 `• 项目`。
+///
+/// `- ` 前缀归 `list.rs` 管，而它按**块类型**只认 `ListItem`，认不到
+/// `TaskListItem`——两个 extension 的定义域不相交，谁也不需要知道对方存在
+/// （不变量 D6）。让 list 去问「有没有 task」才是相互感知。
+#[test]
+fn a_task_item_keeps_its_dash_a_plain_item_gets_a_bullet() {
+    let task = decorate("- [ ] 待办", None);
+    assert_eq!(
+        hidden_merged(&task),
+        vec![(2, 5)],
+        "只有 `[ ]` 消失，`- ` 原样留着"
+    );
+    assert!(
+        task.line_ornaments().is_empty(),
+        "任务项不该有替代标记——有的话 `- ` 旁边会再多一个 `•`"
+    );
+
+    let plain = decorate("- 项目", None);
+    assert_eq!(hidden_merged(&plain), vec![(0, 2)], "`- ` 换成替代标记");
+    let BlockOrnament::Marker(marker) = plain.line_ornaments()[0].1 else {
+        panic!("普通列表项该有一个标记装饰");
+    };
+    assert_eq!(marker.text(), "\u{2022}");
+}
+
+/// `[x]` 在树里还会被解析成一个 shortcut `Link`，于是 link 与 task 两个
+/// extension 都往同一段 source 上盖隐藏。它们互不感知（不变量 D6），
+/// 结果靠取并集收敛——这条用例钉住「并集恰好是整个 `[x]`」，不多不少。
+#[test]
+fn task_and_link_overlap_on_a_checked_box_without_fighting() {
+    assert_eq!(hidden_merged(&decorate("- [x] 完成", None)), vec![(2, 5)]);
+    assert_eq!(hidden_merged(&decorate("- [ ] 待办", None)), vec![(2, 5)]);
+    // link 确实也插了一手：`[x]` 的两个 `LinkMark` 各自成一条装饰。
+    assert_eq!(
+        hidden(&decorate("- [x] 完成", None)),
+        vec![(2, 3), (2, 5), (4, 5)]
+    );
+}
+
+/// 复选框永远不露出来，焦点块也不例外。
+///
+/// 让它在光标经过时闪出一个 `[ ]`，用户会以为凭空多了两个字符。
+#[test]
+fn a_focused_task_still_hides_its_checkbox() {
+    assert_eq!(
+        hidden_merged(&decorate("- [ ] 待办", Some(range(8, 8)))),
+        vec![(2, 5)]
+    );
+}
+
+// ---------------------------------------------------------------- id 表
+
+/// 查不到的 id 返回 `None`，不给默认值。
+///
+/// 「装饰产出与样式表脱节」的 bug 应该响。给个默认字型的话，它只会画得不对
+/// ——而画得不对是这个项目最难发现的一类失败。
+#[test]
+fn unknown_ids_resolve_to_none_instead_of_a_default() {
+    let decorations = decorate("*斜体*", None);
+    assert_eq!(
+        decorations.attrs(StyleId(0)),
+        Some(TextAttrs::new(TextStyle::Emphasis))
+    );
+    assert_eq!(decorations.attrs(StyleId(9)), None);
+    assert_eq!(decorations.ornament(LineStyleId(9)), None);
+}
+
+/// 每一条装饰指向的 id 都必须查得到。产出与表脱节是静默的。
+#[test]
+fn every_emitted_id_resolves() {
+    for source in [
+        "# 标题",
+        "## 二级 *斜体*",
+        "> 引用",
+        "- 项目",
+        "1. 有序",
+        "- [ ] 待办",
+        "```rust\nlet x = 1;\n```",
+        "*a* **b** `c` [d](e) ![f](g) <http://h.i>",
+    ] {
+        let decorations = decorate(source, None);
+        for entry in decorations.set().all() {
+            match entry.decoration {
+                yu_decoration::Decoration::Mark { style } => assert!(
+                    decorations.attrs(style).is_some(),
+                    "{source:?} 的 {style:?} 查不到字型"
+                ),
+                yu_decoration::Decoration::Line { style } => assert!(
+                    decorations.ornament(style).is_some(),
+                    "{source:?} 的 {style:?} 查不到行级装饰"
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 装饰不得越出块。装饰是按块缓存的，越界会变成「改了这一块，另一块的样子
+/// 也变了」——而按块缓存正好会把这件事藏起来。
+#[test]
+fn decorations_stay_inside_their_block() {
+    let source = "# 标题\n\n> 引用\n\n- 项目\n\n*斜体*\n";
+    let buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let document = parse(&snapshot);
+    let tree = parse_syntax(&snapshot).expect("测试文档很短").into_tree();
+    let extensions = ExtensionSet::markdown();
+
+    for block in document.blocks().iter() {
+        let decorations = extensions
+            .decorate(&snapshot, &tree, block, None)
+            .expect("装饰产出不该失败");
+        for entry in decorations.set().all() {
+            assert!(
+                entry.range.start() >= block.range().start()
+                    && entry.range.end() <= block.range().end(),
+                "{:?} 的装饰 {:?} 越出了块 {:?}",
+                block.kind(),
+                entry.range,
+                block.range()
+            );
+        }
+    }
+}
+
+// ------------------------------------------------------- S6 的验收本身
+
+/// `==高亮==`：验收里点名的那种新语法。
+///
+/// 它只认识自己，只产出自己的装饰，拿不到别的 extension 的产出——所以整个
+/// diff 就是这一个类型加注册表里一行。**这个文件之外一行都不用改。**
+///
+/// lezer 不认识 `==`，树里只有一个 `Paragraph`。所以它自己扫段落文本，
+/// 这正是「新增一种语法」最不利的形状：连解析器都帮不上忙，也仍然不需要
+/// 动 `yu-markdown` 之外的任何东西。
+struct Highlight;
+
+impl Extension for Highlight {
+    fn name(&self) -> &'static str {
+        "highlight"
+    }
+
+    fn decorate(&self, cx: &BlockContext<'_>, out: &mut ExtensionOutput) {
+        for node in cx.nodes().filter(|node| node.kind() == NodeKind::Paragraph) {
+            let Some(text) = cx.text(node.range()) else {
+                continue;
+            };
+            let base = node.range().start().get();
+            let mut marks = text.match_indices("==").map(|(index, _)| index as u64);
+            while let (Some(open), Some(close)) = (marks.next(), marks.next()) {
+                let style = out.style(TextAttrs::new(TextStyle::Code));
+                if let Some(content) = TextRange::new(
+                    ByteOffset::new(base + open + 2),
+                    ByteOffset::new(base + close),
+                ) {
+                    out.mark(content, style);
+                }
+                if let Some(opening) = TextRange::new(
+                    ByteOffset::new(base + open),
+                    ByteOffset::new(base + open + 2),
+                ) {
+                    out.replace(opening);
+                }
+                if let Some(closing) = TextRange::new(
+                    ByteOffset::new(base + close),
+                    ByteOffset::new(base + close + 2),
+                ) {
+                    out.replace(closing);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_new_syntax_needs_nothing_outside_its_own_extension() {
+    let extensions = ExtensionSet::empty().with(Highlight);
+    let decorations = decorate_with(&extensions, "==高亮==", None);
+
+    assert_eq!(
+        hidden(&decorations),
+        vec![(0, 2), (8, 10)],
+        "两对 `==` 从视觉文本里消失，中间的内容留下"
+    );
+
+    // 单独跑一个 extension 时它的 id 从 0 开始——局部 id 空间。
+    assert_eq!(
+        decorations.attrs(StyleId(0)),
+        Some(TextAttrs::new(TextStyle::Code))
+    );
+    assert!(
+        !decorations.set().all().is_empty(),
+        "新语法应当产出装饰，且不需要注册表之外的任何改动"
+    );
+}
+
+/// 注册顺序只决定 id 怎么分，不决定装饰怎么定序（不变量 D6）。
+///
+/// 同**一组** extension 换个顺序注册，产出的隐藏区间必须一模一样。换了顺序
+/// 就跟着变的话，那是 extension 之间在相互感知，而且是静默的那种：斜体会变成
+/// 等宽，不报错。
+#[test]
+fn registration_order_does_not_change_what_gets_hidden() {
+    let source = "*a* `b` *c* `d`";
+    let forward = decorate_with(
+        &ExtensionSet::empty().with(HidesEmphasis).with(HidesCode),
+        source,
+        None,
+    );
+    let backward = decorate_with(
+        &ExtensionSet::empty().with(HidesCode).with(HidesEmphasis),
+        source,
+        None,
+    );
+    assert_eq!(hidden(&forward), hidden(&backward));
+    assert_eq!(
+        forward.set().all().len(),
+        backward.set().all().len(),
+        "定序由 order_key 全序钉死，条数不该随注册顺序变"
+    );
+
+    let ranges = hidden(&forward);
+    assert_eq!(
+        ranges,
+        vec![
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7),
+            (8, 9),
+            (10, 11),
+            (12, 13),
+            (14, 15)
+        ]
+    );
+}
+
+/// 上一条用例的两个 extension。各自只认识一种定界符。
+struct HidesEmphasis;
+
+impl Extension for HidesEmphasis {
+    fn name(&self) -> &'static str {
+        "hides-emphasis"
+    }
+
+    fn decorate(&self, cx: &BlockContext<'_>, out: &mut ExtensionOutput) {
+        hide_pairs(cx, out, NodeKind::Emphasis, NodeKind::EmphasisMark);
+    }
+}
+
+struct HidesCode;
+
+impl Extension for HidesCode {
+    fn name(&self) -> &'static str {
+        "hides-code"
+    }
+
+    fn decorate(&self, cx: &BlockContext<'_>, out: &mut ExtensionOutput) {
+        hide_pairs(cx, out, NodeKind::InlineCode, NodeKind::CodeMark);
+    }
+}
+
+fn hide_pairs(cx: &BlockContext<'_>, out: &mut ExtensionOutput, wanted: NodeKind, mark: NodeKind) {
+    for node in cx.nodes().filter(|node| node.kind() == wanted) {
+        let Some(span) = DelimitedSpan::of(node, |kind| kind == mark) else {
+            continue;
+        };
+        out.replace(span.opening);
+        out.replace(span.closing);
+    }
+}
+
+// ------------------------------------------------- 变异验证补上的守护
+
+/// 一个只做记录的 extension，用来看 `BlockContext` 到底给了什么。
+///
+/// 状态放在 `Arc` 里：注册表会取走 extension 的所有权，不共享就读不回来。
+#[derive(Clone, Default)]
+struct Recorder {
+    root: Arc<Mutex<Option<NodeKind>>>,
+    seen: Arc<Mutex<Vec<(NodeKind, u64, u64)>>>,
+}
+
+impl Extension for Recorder {
+    fn name(&self) -> &'static str {
+        "recorder"
+    }
+
+    fn decorate(&self, cx: &BlockContext<'_>, _out: &mut ExtensionOutput) {
+        *self.root.lock().expect("测试里不会中毒") = Some(cx.syntax().kind());
+        let mut seen = self.seen.lock().expect("测试里不会中毒");
+        for node in cx.nodes() {
+            seen.push((
+                node.kind(),
+                node.range().start().get(),
+                node.range().end().get(),
+            ));
+        }
+    }
+}
+
+/// 跑一个 extension，返回（它看到的根节点，它看到的全部节点，块的 range）。
+fn record(extension: impl Extension + 'static, source: &str, block_index: usize) -> TextRange {
+    let buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let document = parse(&snapshot);
+    let tree = parse_syntax(&snapshot).expect("测试文档很短").into_tree();
+    let block = document.blocks().get(block_index).expect("块存在");
+    ExtensionSet::empty()
+        .with(extension)
+        .decorate(&snapshot, &tree, block, None)
+        .expect("装饰产出不该失败");
+    block.range()
+}
+
+/// 块在语法树里必须定位到**它自己**那个节点，不能一路退到 `Document`。
+///
+/// 块的 range 带着行尾的换行符，语法节点不带（`# 标题\n` 的块是 0..10，
+/// `AtxHeading1` 只有 0..9）。不修剪就包不住，于是每个块都退到根，`nodes()`
+/// 再把整篇文档裁一遍——结果仍然对，只是每个块都要走整篇，长文档是
+/// O(块数 × 文档长度)。**唯一的症状是慢**，所以只能这样断言着。
+#[test]
+fn a_block_locates_its_own_syntax_node_not_the_document_root() {
+    let source = "# 标题\n\n> 引用\n\n- 项目\n\n```\n代码\n```\n";
+    for (index, expected) in [
+        (0, NodeKind::AtxHeading1),
+        (2, NodeKind::Blockquote),
+        (4, NodeKind::ListItem),
+        (6, NodeKind::FencedCode),
+    ] {
+        let recorder = Recorder::default();
+        record(recorder.clone(), source, index);
+        let root = *recorder.root.lock().expect("测试里不会中毒");
+        assert_eq!(
+            root,
+            Some(expected),
+            "第 {index} 个块该定位到 {expected:?}，退到 {root:?} 说明修剪没生效"
+        );
+    }
+}
+
+/// `nodes()` 只给完整落在块内的节点。
+///
+/// 漏裁的后果是装饰跨到邻块上；装饰按块缓存，那会变成「改了这一块，另一块的
+/// 样子也变了」。
+#[test]
+fn nodes_never_leave_the_block() {
+    let source = "# 标题\n\n段落 *斜体*\n\n- 项目\n";
+    for index in 0..5 {
+        let recorder = Recorder::default();
+        let range = record(recorder.clone(), source, index);
+        for (kind, from, to) in recorder
+            .seen
+            .lock()
+            .expect("测试里不会中毒")
+            .iter()
+            .copied()
+        {
+            assert!(
+                from >= range.start().get() && to <= range.end().get(),
+                "第 {index} 个块（{range:?}）拿到了块外的 {kind:?} {from}..{to}"
+            );
+        }
+    }
+}
+
+/// 一个不守规矩的 extension 产出块外的装饰时，注册表要把它拦下来。
+///
+/// 这是 `nodes()` 之外的第二道防线。两道防线互相遮蔽——单独去掉任何一道，
+/// 另一道都会把后果兜住，所以必须各有一条用例直接压着自己那一道。
+struct OutOfBounds;
+
+impl Extension for OutOfBounds {
+    fn name(&self) -> &'static str {
+        "out-of-bounds"
+    }
+
+    fn decorate(&self, cx: &BlockContext<'_>, out: &mut ExtensionOutput) {
+        // 故意越界：从文档开头盖到块的末尾。
+        if let Some(range) = TextRange::new(ByteOffset::new(0), cx.range().end()) {
+            out.replace(range);
+        }
+        // 块内的这一条必须留下，否则分不清是拦住了还是整个丢了。
+        out.replace(cx.range());
+    }
+}
+
+#[test]
+fn the_registry_drops_decorations_that_leave_their_block() {
+    let source = "# 标题\n\n段落\n";
+    let buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let document = parse(&snapshot);
+    let tree = parse_syntax(&snapshot).expect("测试文档很短").into_tree();
+    let block = document.blocks().get(2).expect("第三个块存在");
+    assert!(block.range().start().get() > 0, "这个块不从文档开头起");
+
+    let decorations = ExtensionSet::empty()
+        .with(OutOfBounds)
+        .decorate(&snapshot, &tree, block, None)
+        .expect("装饰产出不该失败");
+
+    assert_eq!(
+        hidden(&decorations),
+        vec![(block.range().start().get(), block.range().end().get())],
+        "越界那一条要被拦下，块内那一条要留着"
+    );
+}
+
+/// 硬换行的行尾符可能是 `\r\n`，要按两个字节算。
+///
+/// 按一个字节算的话 `\r` 会留在视觉文本里：一个看不见但占位的字符。
+#[test]
+fn a_crlf_hard_break_hides_both_ending_bytes() {
+    assert_eq!(hidden(&decorate("行尾  \r\n第二行", None)), vec![(6, 8)]);
+    assert_eq!(hidden(&decorate("行尾\\\r\n第二行", None)), vec![(6, 7)]);
+}
+
+/// 链接正文按**正文**字型排，不继承外层。
+///
+/// 不显式说出来的话，装配层的「窄的赢」会让外层的 `Strong` 赢，
+/// `**[文字](url)**` 里的链接正文就变粗了——画面变了，但不报错。
+#[test]
+fn link_text_does_not_inherit_the_surrounding_style() {
+    let decorations = decorate("**[文字](目标)**", None);
+    let marks: Vec<_> = decorations
+        .set()
+        .all()
+        .iter()
+        .filter_map(|entry| match entry.decoration {
+            yu_decoration::Decoration::Mark { style } => {
+                decorations.attrs(style).map(|attrs| (entry.range, attrs))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let link_text = range(3, 9);
+    assert!(
+        marks
+            .iter()
+            .any(|(covered, attrs)| *covered == link_text
+                && *attrs == TextAttrs::new(TextStyle::Plain)),
+        "链接正文该有一条自己的 Plain mark，实际是 {marks:?}"
+    );
+    assert!(
+        marks
+            .iter()
+            .any(|(_, attrs)| *attrs == TextAttrs::new(TextStyle::Strong)),
+        "外层的 Strong 仍然在，只是盖不住链接正文"
+    );
+}

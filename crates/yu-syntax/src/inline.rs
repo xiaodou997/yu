@@ -516,19 +516,37 @@ fn parse_emphasis(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u3
 }
 
 fn parse_hard_break(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u32> {
-    if next == b'\\' && cx.byte(start + 1) == Some(b'\n') {
-        return Some(cx.append_element(Element::leaf(NodeKind::HardBreak, start, start + 2)));
+    if next == b'\\'
+        && let Some(end) = line_ending_at(cx, start + 1)
+    {
+        return Some(cx.append_element(Element::leaf(NodeKind::HardBreak, start, end)));
     }
     if next == b' ' {
         let mut pos = start + 1;
         while cx.byte(pos) == Some(b' ') {
             pos += 1;
         }
-        if cx.byte(pos) == Some(b'\n') && pos >= start + 2 {
-            return Some(cx.append_element(Element::leaf(NodeKind::HardBreak, start, pos + 1)));
+        if pos >= start + 2
+            && let Some(end) = line_ending_at(cx, pos)
+        {
+            return Some(cx.append_element(Element::leaf(NodeKind::HardBreak, start, end)));
         }
     }
     None
+}
+
+/// `pos` 处是不是一个行尾符；是的话返回它之后的位置。
+///
+/// CommonMark 的 line ending 是 `\n`、`\r\n` 或单独的 `\r`。只认 `\n` 的话，
+/// CRLF 文档里的硬换行整个失效——两个尾随空格变成可见内容，换行也不再是硬的。
+/// 这件事不报错，只是画面不对，而 Windows 上存的文件全是 CRLF。
+fn line_ending_at(cx: &InlineContext<'_>, pos: u32) -> Option<u32> {
+    match cx.byte(pos)? {
+        b'\n' => Some(pos + 1),
+        b'\r' if cx.byte(pos + 1) == Some(b'\n') => Some(pos + 2),
+        b'\r' => Some(pos + 1),
+        _ => None,
+    }
 }
 
 fn parse_link_start(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u32> {
