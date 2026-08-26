@@ -23,9 +23,9 @@
 //!
 //! 登记表与 `yu-projection/tests/extension_parity.rs` 是同一批差异的两种
 //! 表现：那边比「隐藏了哪些字节」，这边比「隐藏之后排出了什么」。一条差异
-//! 在那边登记了，这边通常也会有。**下一刀切换消费者时，这张表就是「画面
-//! 预期会变哪些地方」的清单**——S5 那种「前后截图只应有零处不同」的验收法
-//! 在那一刀不成立，因为它本来就该变。
+//! 在那边登记了，这边通常也会有。**切换消费者那一刀，这张表就是「画面预期
+//! 会变哪些地方」的清单**——S5 那种「前后截图只应有零处不同」的验收法在那一
+//! 刀不成立，因为它本来就该变。
 
 use yu_core::{ClusterMetrics, TextAttrs, TextStyle};
 use yu_editor::{BlockLayoutInput, BlockOrnaments};
@@ -137,13 +137,12 @@ fn derive_both(source: &str, index: usize) -> Option<(Derived, Derived)> {
     Some((describe(&ours), describe(&theirs)))
 }
 
-/// 差异的归属。没有「extension 错」这一类——一条都没有。
+/// 差异的归属。只剩一类——没有「extension 错」，「还没做的语法」也随表格
+/// extension 落地清空了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cause {
     /// v1 判错，extension 对。删掉 v1 时一起消失。
     ProjectionBug,
-    /// extension 还没做这种语法。做完之后这一行要删。
-    Pending,
 }
 
 struct Divergence {
@@ -211,16 +210,6 @@ const DIVERGENCES: &[Divergence] = &[
         cause: Cause::ProjectionBug,
         why: "autolink 内部不解析行内语法。v1 在 URL 里找到一对 `*` 并隐藏，\
               于是**地址少掉两个字符**",
-    },
-    Divergence {
-        source: "a | b\n--- | ---\n1 | 2",
-        extension: "a | b\n--- | ---\n1 | 2",
-        projection: "ab12",
-        cause: Cause::Pending,
-        why: "表格还没有对应的 extension。v1 那条把分隔行、竖线、以及单元格\
-              之间的空白**全部**拿掉，只留下四个单元格的内容首尾相接——\
-              几何由另一套 `TableLayoutSnapshot` 负责，视觉文本本身不成句。\
-              第 3 节的对照表说它终局是一个 block widget",
     },
 ];
 
@@ -327,8 +316,7 @@ fn divergence_causes_stay_accounted_for() {
             .count()
     };
     assert_eq!(count(Cause::ProjectionBug), 7, "v1 判错的条数变了");
-    assert_eq!(count(Cause::Pending), 1, "还没做的语法条数变了");
-    assert_eq!(DIVERGENCES.len(), 8);
+    assert_eq!(DIVERGENCES.len(), 7);
 }
 
 // ------------------------------------------------------ 只有新那条说得出的事

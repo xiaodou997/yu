@@ -12,8 +12,8 @@
 use yu_core::{ByteOffset, StyleId, TextAttrs, TextRange, TextStyle};
 use yu_decoration::LineStyleId;
 use yu_markdown::{
-    BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension, ExtensionOutput,
-    ExtensionSet, parse,
+    BlockAnnotation, BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension,
+    ExtensionOutput, ExtensionSet, parse,
 };
 use yu_syntax::{NodeKind, parse as parse_syntax};
 use yu_text::TextBuffer;
@@ -695,4 +695,124 @@ fn a_backward_space_run_that_crosses_the_read_window_is_still_one_run() {
             "{spaces} 个空格加收尾 `#` 没有整段隐藏"
         );
     }
+}
+
+// ------------------------------------------------------------------ 语义标注
+
+/// 这个块上的图片标注。
+fn images(
+    decorations: &BlockDecorations,
+) -> Vec<(TextRange, TextRange, Option<TextRange>, Option<TextRange>)> {
+    decorations
+        .annotations()
+        .iter()
+        .map(|annotation| match annotation {
+            BlockAnnotation::Image {
+                source,
+                label,
+                destination,
+                reference,
+            } => (*source, *label, *destination, *reference),
+        })
+        .collect()
+}
+
+/// 行内式图片：整段、替代文字、目标各自的区间。
+///
+/// 画图片盒子的那一层认的就是这三样。它们**不在** `DecorationSet` 里，
+/// 因为这里没有任何视觉效果被装饰改掉——理由写在 `BlockAnnotation` 上。
+#[test]
+fn an_inline_image_is_annotated_with_its_label_and_destination() {
+    let decorations = decorate("![替代](图片)", None);
+    assert_eq!(
+        images(&decorations),
+        vec![(range(0, 17), range(2, 8), Some(range(10, 16)), None)]
+    );
+}
+
+/// 引用式图片给的是标签，不是目标：目标要查 definition 才知道，而那是
+/// 上一层的事（不变量 C6）。
+#[test]
+fn a_reference_image_is_annotated_with_its_label_instead() {
+    let decorations = decorate("![替代][引用]", None);
+    let annotated = images(&decorations);
+    assert_eq!(annotated.len(), 1, "一张图，实际是 {annotated:?}");
+    let (_, _, destination, reference) = annotated[0];
+    assert_eq!(destination, None);
+    assert!(reference.is_some(), "引用式必须给出标签");
+}
+
+/// shortcut 形式 `![替代]` 没有 `LinkLabel` 节点，标签就是替代文字本身。
+#[test]
+fn a_shortcut_image_falls_back_to_its_own_label() {
+    let decorations = decorate("![替代]", None);
+    let annotated = images(&decorations);
+    assert_eq!(annotated.len(), 1, "一张图，实际是 {annotated:?}");
+    let (_, label, destination, reference) = annotated[0];
+    assert_eq!(destination, None);
+    assert_eq!(reference, Some(label));
+}
+
+/// 表格的网格由 `BlockOrnament::Table` 带上来。
+///
+/// 它是**块级**的，所以走 `Decoration::Line` 那条已有的通道，不走
+/// `BlockAnnotation`——后者是给行内语法（图片）准备的。
+#[test]
+fn a_table_carries_its_grid_as_a_block_ornament() {
+    let decorations = decorate("a | b\n--- | ---\n1 | 2", None);
+    let table = decorations
+        .line_ornaments()
+        .into_iter()
+        .find_map(|(_, ornament)| match ornament {
+            BlockOrnament::Table(table) => Some(table),
+            _ => None,
+        })
+        .expect("表格块必须带上它的网格");
+    assert_eq!(table.column_count(), 2);
+    assert_eq!(table.body_row_count(), 1);
+}
+
+/// 竖线、单元格之间的空白、以及整行分隔行都不进视觉文本。
+///
+/// 取的是「单元格之间」而不是「竖线本身」：对齐的空格数量随内容变，逐个
+/// 列举竖线会把它们留在视觉文本里，画面上是一排歪掉的单元格。
+#[test]
+fn a_table_hides_everything_that_is_not_cell_content() {
+    let decorations = decorate("a | b\n--- | ---\n1 | 2", None);
+    // `(5, 6)` 是表头那一行的行尾换行符，`(6, 16)` 是整行分隔行。两段相邻
+    // 但分别产出——`hidden` 不合并，比对的是「谁产了什么」。
+    assert_eq!(
+        hidden(&decorations),
+        vec![(1, 4), (5, 6), (6, 16), (17, 20)]
+    );
+}
+
+/// 不是表格的段落一条表格装饰都不产。
+///
+/// `--- | ---` 这一行是表格的身份证明，缺了它整块就是普通段落。少了这条
+/// 用例，「凡是含竖线的段落都当表格排」这种错法不会被任何断言抓住。
+#[test]
+fn a_paragraph_with_pipes_but_no_delimiter_row_is_not_a_table() {
+    let decorations = decorate("a | b\nc | d", None);
+    assert!(hidden(&decorations).is_empty(), "普通段落不该藏任何字节");
+    assert!(
+        decorations
+            .line_ornaments()
+            .iter()
+            .all(|(_, ornament)| !matches!(ornament, BlockOrnament::Table(_))),
+        "普通段落不该带表格网格"
+    );
+}
+
+/// 光标进出表格不改变它的排法。
+///
+/// 行内语法的定界符碰到光标要露出来，竖线不用：竖线不是一段被藏起来的
+/// 文字，而是整个块换了一种排法。跟着焦点变的话，表格会在光标进出时变成
+/// 一堆文字又变回去。
+#[test]
+fn a_table_does_not_reveal_its_pipes_under_the_caret() {
+    let source = "a | b\n--- | ---\n1 | 2";
+    let focused = decorate(source, Some(range(0, 1)));
+    let unfocused = decorate(source, None);
+    assert_eq!(hidden(&focused), hidden(&unfocused));
 }

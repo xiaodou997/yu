@@ -725,6 +725,9 @@ impl DecorationDraft {
                         indent: found.indent(),
                     });
                 }
+                // 表格的网格不进 `BlockLayoutInput`：它排的是文字流，而
+                // 表格的几何由 `TableLayout` 另算一遍再把簇搬进单元格。
+                BlockOrnament::Table(_) => {}
             }
         }
 
