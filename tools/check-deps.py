@@ -53,9 +53,6 @@ ALLOWED: dict[str, set[str]] = {
     # yu-core（坐标）与 yu-text（ChangeSet，`map` 的输入）。它**不**依赖
     # yu-syntax：装饰由 yu-markdown 的 extension 产出，中枢只承载结果。
     "yu-decoration": {"yu-core", "yu-text"},
-    # yu-projection 是 v1 的实现，S4 结束时删除。在那之前两者并存，
-    # 由 yu-decoration 的差分测试逐点比对。
-    "yu-projection": {"yu-core", "yu-markdown", "yu-text"},
     # yu-state 收编辑状态（S4）：history / selection / caret 绑定 / composition。
     #
     # 第 4.2 节把它画在 yu-markdown 之后，但这一轮搬进去的四个模块只用到
@@ -72,16 +69,13 @@ ALLOWED: dict[str, set[str]] = {
     "yu-render": {"yu-assets", "yu-core", "yu-font", "yu-scene"},
     # 7 层及以上：编辑状态、持久化、工作区。
     # yu-editor 是「允许认识 Markdown」的那一层（不变量 E1 的禁止清单里没有
-    # 它）。S6 让它同时读得懂两种装饰来源：v1 的 Projection 与 yu-markdown 的
-    # extension 产出，后者的类型（Decoration / DecorationSet）住在
-    # yu-decoration，所以多了这条边。它是**向下**的，不是临时的——
-    # Projection 删掉之后留下的正是这一条。
+    # 它）。它读 yu-markdown 的 extension 产出，而那些产出的类型
+    # （Decoration / DecorationSet）住在 yu-decoration。
     "yu-editor": {
         "yu-core",
         "yu-decoration",
         "yu-layout",
         "yu-markdown",
-        "yu-projection",
         "yu-state",
         # 语法树按 Revision 缓存在 EditorDocument 里（yu-editor/src/decorations.rs
         # 的模块文档写了为什么不放 MarkdownDocument）。S6 换消费者那一刀之前
@@ -162,15 +156,6 @@ ALLOWED_DEV: dict[str, set[str]] = {
     # `SceneGlyph`，不是投影。
     "yu-render": {"yu-layout", "yu-text"},
     "yu-embedded-math": {"yu-core"},
-    # 临时：yu-projection 是 yu-decoration 的 source↔visual 映射的 oracle。
-    # 一个已经在产品里跑着的实现比自证性质更强。这条边随 yu-projection
-    # 在 S4 末尾被删除而消失。
-    "yu-decoration": {"yu-projection"},
-    # 临时：反过来的同一件事。tests/decoration_parity.rs 比对两条产出隐藏
-    # 区间的路——v1 的行内扫描器（本 crate）与 yu-syntax 的标记节点范围。
-    # 用例住在 yu-projection 而不是 yu-markdown，因为断言的主体是 v1 的行为，
-    # 而 v1 就在这里；这两条边都随 yu-projection 一起消失。
-    "yu-projection": {"yu-decoration", "yu-syntax"},
 }
 
 

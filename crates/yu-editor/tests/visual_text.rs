@@ -2,9 +2,10 @@
 //!
 //! # 它压的是哪三件事
 //!
-//! `DecorationSet` 的双向映射本身已经有 oracle：
-//! `crates/yu-decoration/tests/projection_differential.rs` 拿 v1 的
-//! `Projection` 逐点比过。这里压的是 `VisualText` **加在它上面**的三样：
+//! `DecorationSet` 的双向映射本身另有守护：`yu-decoration` 的 `hidden.rs`
+//! 里有一份不走树的线性参照实现，树的下降与它逐点一致（S4 时期还拿 v1 的
+//! `Projection` 逐点比过，那条差分随 v1 一起删了）。这里压的是 `VisualText`
+//! **加在它上面**的三样：
 //!
 //! 1. **换原点。** 装饰集合的视觉偏移是整篇文档的，块的视觉文本从 0 开始。
 //!    差一个常量，而算错这个常量的表现是「点第二个块，光标落在第一个块里」。
