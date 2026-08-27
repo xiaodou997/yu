@@ -20,7 +20,10 @@ use yu_text::{Edit, TextBuffer, Transaction};
 struct Step {
     text: String,
     incremental: Tree,
+    /// 从这一步产出的新树重新取的 fragment。
     fragments: Vec<TreeFragment>,
+    /// 这一步实际喂给解析器的那一批：上一批平移过来的，没重新 `from_tree`。
+    chained: Vec<TreeFragment>,
     reparsed_bytes: u32,
 }
 
@@ -38,6 +41,7 @@ fn apply(
     Step {
         text: snapshot.as_str().to_owned(),
         fragments: TreeFragment::from_tree(parsed.tree()),
+        chained: moved,
         reparsed_bytes: parsed.reparsed_bytes(),
         incremental: parsed.into_tree(),
     }
@@ -133,6 +137,59 @@ fn incremental_matches_full_parse_through_random_edits() {
             .into_tree();
         assert_trees_equal(&step.incremental, &full, &step.text, step_index);
         fragments = step.fragments;
+    }
+}
+
+/// 同一组随机编辑，但 fragment **一路链下去**，中途不从新树重取。
+///
+/// 上一条每一步都 `from_tree`，于是解析器永远只看到一个「干净」的 fragment
+/// ——`from`/`to` 覆盖整篇、两个 open 标记都是 false。真实编辑器里不总是这样：
+/// 连着几次编辑而中间没人要过树时（批量替换、连续粘贴），第二次
+/// `apply_changes` 拿到的就是一批**已经带着洞和标记**的 fragment。
+///
+/// 这条路上的 bug 只在链式调用下才出现，见 `src/fragment.rs` 模块文档里那条
+/// 与上游的分歧。
+#[test]
+fn chained_fragments_match_full_parse_through_random_edits() {
+    let mut seed = 0x4348_4149_4e45_4421_u64;
+    let mut model = String::from(
+        "# Yu\n\nparagraph\n\n```rust\nfn main() {}\n```\n\n> quote\n> more\n\n- a\n- b\n\n[r]: /url\n\nsee [r]\n",
+    );
+    let mut buffer = TextBuffer::new(model.clone());
+    let mut fragments = {
+        let parsed = parse(&buffer.snapshot()).expect("初始文档不会超长");
+        TreeFragment::from_tree(parsed.tree())
+    };
+
+    for step_index in 0..1_000 {
+        let boundaries = char_boundaries(&model);
+        let first = random_index(&mut seed, boundaries.len());
+        let second = random_index(&mut seed, boundaries.len());
+        let (low, high) = if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let start = boundaries[low];
+        let mut end = boundaries[high];
+        if model.len() > 8_192 && start == end {
+            end = model.len();
+        }
+        let insert = INSERTIONS[random_index(&mut seed, INSERTIONS.len())];
+
+        let step = apply(&mut buffer, &fragments, range_of(start, end), insert);
+        model.replace_range(start..end, insert);
+        assert_eq!(
+            step.text, model,
+            "第 {step_index} 步：缓冲区与模型文本不一致"
+        );
+
+        let full = parse(step.text.as_str())
+            .expect("测试文档不会超长")
+            .into_tree();
+        assert_trees_equal(&step.incremental, &full, &step.text, step_index);
+        // **不**从新树重取——这正是这条测试与上一条的唯一区别。
+        fragments = step.chained;
     }
 }
 
@@ -270,6 +327,52 @@ fn the_rescan_bound_does_not_grow_with_the_document() {
         "文档大了 16 倍，单字符编辑的重扫字节数从 {small} 涨到 {large}——\
          说明复用没生效，退化成了全量重扫"
     );
+}
+
+/// **上一次编辑留下的洞，下一次 `apply_changes` 之后必须仍然是「开」的。**
+///
+/// 连着编辑两次而中间不解析时才走到这条路：第一次切出来的 fragment 带着
+/// `open_end`，第二次 `apply_changes` 若照上游那样无条件重写标记，那个洞的边界
+/// 就被说成了「文档末尾」，紧挨着它的块会被原样复用。分歧的说明写在
+/// `src/fragment.rs` 的模块文档里。
+///
+/// 语料把后果做成可见的：`X` 插在空行上，让上一个段落把这一行吃成延续行。复用
+/// 错了的话那个段落会在洞的位置断成两个——树的形状变了，不 panic 也不报错。
+#[test]
+fn chained_edits_keep_earlier_holes_open() {
+    let mut source = String::new();
+    for index in 0..8 {
+        source.push_str(&format!("Filler paragraph {index} with some text.\n\n"));
+    }
+    let tail = source.len();
+    source.push_str("Target paragraph.\n\n## Heading\n\nTrailing paragraph.\n");
+    // 空行的那个换行符。插进去之后 `Target paragraph.` 把这一行吃成延续行。
+    let blank = tail + "Target paragraph.\n".len();
+
+    let mut buffer = TextBuffer::new(source.clone());
+    let mut fragments = {
+        let parsed = parse(&buffer.snapshot()).expect("测试文档不会超长");
+        TreeFragment::from_tree(parsed.tree())
+    };
+
+    // 两次编辑之间**不**重新解析，fragment 直接往下链。第二次落在第一次前面，
+    // 且与它、与文档开头都隔着超过 `MIN_GAP`，好让洞两侧都留下 fragment。
+    for (step, offset) in [blank, 150].into_iter().enumerate() {
+        let transaction = Transaction::new(
+            buffer.revision(),
+            [Edit::new(range_of(offset, offset), "X")],
+        );
+        let applied = buffer.apply(&transaction).expect("编辑应当合法");
+        fragments = TreeFragment::apply_change_set(&fragments, applied.change_set());
+        let snapshot = applied.result_snapshot();
+        let incremental = parse_with_fragments(snapshot, &fragments)
+            .expect("测试文档不会超长")
+            .into_tree();
+        let full = parse(snapshot.as_str())
+            .expect("测试文档不会超长")
+            .into_tree();
+        assert_trees_equal(&incremental, &full, snapshot.as_str(), step);
+    }
 }
 
 // ---------------------------------------------------------------------------

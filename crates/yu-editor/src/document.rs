@@ -3429,6 +3429,55 @@ mod tests {
             })
     }
 
+    /// **J1 走完整条产品链路**：`apply_transaction` 之后再渲染一次，只重扫被
+    /// 改的那个块。
+    ///
+    /// `decorations.rs` 里那几条直接驱动 `DecorationCache`，压的是缓存自己；
+    /// 这一条压的是**接线**——`shift_through` 有没有真的把 `ChangeSet` 交给
+    /// 复用来源。接线断了不会报错，只会让每次敲键都整篇重解析。
+    #[test]
+    fn an_edit_through_the_document_rescans_only_the_block_it_touched() {
+        /// 一次单字符编辑允许重扫的字节数。实测约 60（就是被改的那个块）。
+        /// 判据是它必须小到让「退化成全量」一定越界：这份语料有三万多字节。
+        const BUDGET: u64 = 256;
+
+        let mut source = String::new();
+        for index in 0..512 {
+            source.push_str(&format!(
+                "## Section {index}\n\nParagraph {index} with *emphasis*.\n\n"
+            ));
+        }
+        let mut document = EditorDocument::new(source.clone());
+        document.visual_text().expect("初次渲染");
+        let full = document.decoration_cache_stats().reparsed_bytes();
+        assert!(
+            full > 10_000,
+            "第一次是全量，只读了 {full} 字节——语料太小，证明不了什么"
+        );
+
+        // 语料全是 ASCII，文档正中间一定是字符边界。
+        let middle = (source.len() / 2) as u64;
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(source_range(middle, middle), "X")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("编辑应当成功");
+        document.visual_text().expect("编辑后再渲染一次");
+
+        assert_eq!(
+            document.decoration_cache_stats().parses(),
+            2,
+            "两次渲染各解析一次"
+        );
+        let rescanned = document.decoration_cache_stats().reparsed_bytes() - full;
+        assert!(
+            rescanned <= BUDGET,
+            "改一个字符重扫了 {rescanned} 字节，超出上界 {BUDGET}（全量是 {full}）"
+        );
+    }
+
     #[test]
     fn decoration_cache_reuses_and_remaps_unaffected_blocks() {
         let source = "prefix **羽🙂** suffix";
