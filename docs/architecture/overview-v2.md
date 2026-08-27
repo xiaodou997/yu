@@ -392,7 +392,7 @@ ropey 2.x 是全字节索引的重写。`insert` / `remove` / `slice` /
 | `yu-core` | 332 | **已完成**：收敛坐标类型，视觉坐标带空间参数。现 1,308 行 |
 | `yu-text` | 3,201 | **已完成**：底层换 ropey，保留 Snapshot/Transaction 包装。现 1,573 行 |
 | `yu-markdown` | 6,026 | **进行中**：`yu-syntax`（lezer 移植，S3 已完成，4,104 行）已建立；`yu-markdown` 收敛为 extensions 是 S6 |
-| `yu-projection` | 3,775 | **删除**：由 `yu-decoration` 取代 |
+| `yu-projection` | 3,775 | **已删除**（S6）：由 `yu-decoration` + `yu-editor::VisualText` 取代 |
 | `yu-editor` | 9,127 | **拆分**：编辑状态入 `yu-state`，语法相关行为入 `yu-markdown` extension |
 | `yu-layout` | 4,559 | **重写**：只接受 StyledRun/Widget/LineStyle，补 UAX #14 / #9 |
 | `yu-scene` | 2,003 | **精简**：移除全部 Markdown 专属 primitive |
@@ -602,7 +602,8 @@ CommonMark 规范用例与 comrak，不是扫描器——拿扫描器当 oracle 
 oracle 回答，所以先把 `yu-syntax → yu-markdown → yu-decoration` 这条链端到端
 接通一次，与 v1 逐点比对，再去做剩下的宽度。
 
-已完成的两块：
+已完成的两块（**下面这两条差分随 `yu-projection` 一起在 S6 删掉了**，
+它们证明过的事写在这里，用例本身留在 git 里）：
 
 - **映射的差分**（`crates/yu-decoration/tests/projection_differential.rs`）。
   隐藏区间从真实 Projection 里取，原样喂给 `DecorationSet`，两边输入完全
@@ -860,9 +861,10 @@ S5 结束时留给它的入口是清楚的：`yu-editor::BlockLayoutInput` 现�
 dev-dep 在用它。表格与图片的 widget 化、`BlockView::hit_test` 的 bidi 也在
 同一次换源里落地，理由见 S5 的「已登记的四个未做项」。
 
-**进行中。** 三刀落地：`yu-markdown` 成为 extension 集合；`BlockLayoutInput`
-多一条从 `DecorationSet` 派生的路；消费者换完——`BlockView` 现在向装饰问
-源码区间，`yu-projection` 在产品链路上只剩差分测试在用。
+**进行中。** 四刀落地：`yu-markdown` 成为 extension 集合；`BlockLayoutInput`
+多一条从 `DecorationSet` 派生的路；消费者换完，`BlockView` 向装饰问源码
+区间；`yu-projection` 删除。剩下的是 widget 化、增量解析、hit_test 的 bidi，
+以及把 `block_sequence` 与语法树的块结构合并。
 
 #### 第一刀：extension 集合，建在 `yu-syntax` 上
 
@@ -1074,11 +1076,34 @@ D6 禁止的相互感知。
 - **簇的源码区间两端取不同的 bias。** 起点 `After`、终点 `Before`：一个簇不该
   把它两边被隐藏的语法也吞进来，否则选中一个字会连带选中它旁边的 `*`。
 
+#### 第四刀：删 `yu-projection`
+
+3,775 行 v1 投影，连同它的三条差分（`extension_parity` / `decoration_parity` /
+`projection_differential`）、`BlockLayoutInput` 里吃 `Projection` 的那条派生
+路、以及三条临时 dev-dep 一起消失。第 2.4 节那条反向依赖（`yu-font` →
+`yu-projection`）的最后一点痕迹也没了。
+
+**删掉的是三个 oracle，得说清楚剩下什么。** 每条差分都是「拿一个在产品里
+跑着的实现比对新实现」，删掉 v1 就删掉了比对的对象：
+
+| 原来压的事 | 现在压它的是 |
+| --- | --- |
+| `DecorationSet` 的 source↔visual 映射对不对 | `yu-decoration/src/hidden.rs` 里不走树的**线性参照实现**，树的下降与它逐点一致——两份独立的推理互相校验 |
+| extension 隐藏了哪些字节 | CommonMark 官方用例（`yu-syntax`，643/652 逐字节，不变量 C7）+ `extension_decorations.rs` 逐条钉死的用例 |
+| 两条派生路排出了什么 | `block_layout_input.rs`：语料原样留着，断言换成自洽性质（样式段无缝铺满、视觉文本等于源码减隐藏、每个 id 查得到） |
+
+**丢掉的覆盖面要写下来，不能假装还在。** 三条差分是逐字节、逐偏移、逐 bias
+的比对，换上来的自洽性质抓不住「隐藏错了字节」——它们抓的是越界、崩、
+id 脱节。真正的替代是上表第二行：CommonMark 用例压的是解析，而隐藏区间现在
+**由树的形状导出**，不再有一层独立的判断可以单独出错。
+
+两处只为测试活着的代码顺手归位：`yu-markdown::decorations`（S4 提前落地的
+一小块产出器）在产品链路上已经没有调用者，搬进了它唯一的使用者
+`tests/extension_merge.rs`——那三个函数的实际身份是「给 `merge` 喂真实交错
+输入的夹具」，留在产品里只会是一段没人调用的公开 API。
+
 #### 还没做的
 
-- **`yu-projection` 还在。** 产品链路上已经没有使用者，剩下三条差分测试
-  （`extension_parity` / `decoration_parity` / `projection_differential`）与
-  两条临时 dev-dep。删它是下一刀。
 - **增量解析没接上。** `DecorationCache` 每换一个 Revision 整篇重解析一次。
   `yu-syntax` 那边 `parse_with_fragments` 已经在了，缺的是这里把 fragment
   传下去。

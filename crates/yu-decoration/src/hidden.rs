@@ -29,7 +29,7 @@
 //!
 //! 两段相邻（中间零个可见字节）的隐藏区间落在**同一个视觉偏移**上。不合并的
 //! 话，`visual_to_source(v, After)` 得沿着后继一路找「还有没有下一段也贴在这个
-//! 位置」——`yu-projection` 现在就是这么做的，一个 `for` 循环挂在热路径上。
+//! 位置」——v1 的 `yu-projection` 就是这么做的，一个 `for` 循环挂在热路径上。
 //! 合并之后这件事在构造期一次做完，查询里不再有这个循环。
 
 use std::sync::Arc;
@@ -84,7 +84,7 @@ enum NodeKind {
     Internal(Box<[Arc<Node>]>),
 }
 
-/// 查询时的偏好。对应 `yu-projection::ProjectionBias`。
+/// 查询时的偏好。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Bias {
     /// 落在隐藏区间上时，解析到它**之前**的 source 位置。

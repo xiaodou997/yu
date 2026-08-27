@@ -17,7 +17,6 @@ use yu_text::{
 };
 
 mod block_sequence;
-mod decorations;
 mod extension;
 mod inline;
 mod reference;
@@ -29,10 +28,6 @@ pub use block_sequence::{
     RetainedBlockStats, TaskState,
 };
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
-pub use decorations::{
-    code_decorations, emphasis_decorations, extension_decoration_sets,
-    inline_syntax_decoration_set, inline_syntax_decorations,
-};
 pub use extension::{
     BlockAnnotation, BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension,
     ExtensionError, ExtensionOutput, ExtensionSet, ImageSpan, MarkerOrnament, SyntaxNode, reveals,

@@ -12,11 +12,17 @@
 //! `StyleId(3)` 不是「加粗」，只是一个上层会解释的标识；`Replace` 不知道
 //! 自己盖住的是 `##` 还是别的什么。
 //!
-//! # 与 `yu-projection` 的关系
+//! # 映射曾经有一个 oracle
 //!
-//! `yu-projection` 是 v1 的实现，S4 结束时删除。在那之前两者并存，由
-//! `tests/projection_differential.rs` 在真实文档上逐点比对——一个已经在
-//! 产品里跑着的实现是比自证性质更强的 oracle，S3 的解析器就没有这个条件。
+//! v1 的 `yu-projection` 是一份已经在产品里跑着的 source↔visual 实现。
+//! S4 建这个 crate 时拿它当 oracle 逐点比对过（`projection_differential.rs`,
+//! 76 份真实 Markdown × 每个偏移 × 两种 bias），S6 换完消费者之后它连同那条
+//! 差分一起删掉了。
+//!
+//! **留下的是什么。** 「O(log n) 的树下降」由 `hidden.rs` 里的线性参照实现
+//! 逐点压着——两份独立的推理互相校验，比 round-trip 那种自证性质强。
+//! 「哪些字节该被隐藏」现在由 `yu-markdown` 的 extension 回答，它的 oracle
+//! 是 CommonMark 的官方用例（不变量 C7）。
 
 mod decoration;
 mod hidden;

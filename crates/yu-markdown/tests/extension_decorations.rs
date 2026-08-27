@@ -1,7 +1,8 @@
 //! extension 集合自己的用例。
 //!
-//! `crates/yu-projection/tests/extension_parity.rs` 拿 v1 当 oracle 压住
-//! 「非焦点时隐藏了哪些字节」。这里压它压不到的三件事：
+//! S6 前半段有一条差分（`yu-projection/tests/extension_parity.rs`）拿 v1 当
+//! oracle 压住「非焦点时隐藏了哪些字节」，v1 删掉之后它没了，语料搬到了本
+//! 文件末尾。这里压的是那条差分压不到的三件事，加上语料的结构性性质：
 //!
 //! 1. **焦点态。** 光标碰到语法就露出来。v1 的粒度与这里不同，比对不了。
 //! 2. **id 表。** 装饰指向的 `StyleId` / `LineStyleId` 必须查得到——查不到
@@ -816,4 +817,168 @@ fn a_table_does_not_reveal_its_pipes_under_the_caret() {
     let focused = decorate(source, Some(range(0, 1)));
     let unfocused = decorate(source, None);
     assert_eq!(hidden(&focused), hidden(&unfocused));
+}
+
+// ---------------------------------------------------------------- 语料扫一遍
+
+/// `extension_parity.rs` 的 48 份语料，原样搬过来。
+///
+/// 那条差分拿 v1 的 `BlockProjection` 当 oracle，逐字节比对「隐藏了哪些
+/// 字节」，12 条登记差异全部是 v1 判错。**v1 删掉之后那个 oracle 就没有
+/// 了**，语料留下来，断言换成下面这些自洽性质。
+///
+/// 它压不住「隐藏错了字节」——那件事现在的 oracle 是 CommonMark 官方用例
+/// （`yu-syntax/tests/commonmark_spec.rs`，不变量 C7）加上面那些逐条钉死
+/// 的用例。它压得住的是**越界与崩**：装饰跨到邻块上、id 指向表外、视觉
+/// 文本与隐藏区间对不上。这三样都不 panic，只是画错。
+const CORPUS: &[&str] = &[
+    "# 标题\n",
+    "> 引用\n",
+    "- 项目\n",
+    "段落\n",
+    "*斜体*\n",
+    "```rust\nlet x = 1;\n```\n",
+    "```\n未闭合\n",
+    "```\n```\n",
+    "# 标题\n段落\n",
+    "- 项目\n\n段落\n",
+    "# 标题",
+    "## 二级 *斜体* 标题",
+    "# 标题 #",
+    "#   多空格",
+    "> 引用一层",
+    "> > 引用两层",
+    "> a\n> b",
+    "1. 有序",
+    "1) 圆括号",
+    "  - 缩进项",
+    "- a\n- b",
+    "- [ ] 待办",
+    "- [x] 完成",
+    "普通段落 *斜体* 与 **粗体** 与 `代码`",
+    "[文字](目标)",
+    "[a][b]",
+    "![替代](图片)",
+    "<http://a.com>",
+    "行尾硬换行  \n第二行",
+    "行尾\\\n第二行",
+    "中文 *强调* 与 emoji 🙂",
+    "***both***",
+    "***a***b",
+    "**a*b***",
+    "    indented *em*\n",
+    "a\n\n    code *em*\n",
+    "\tcode *em*\n",
+    "~~~\nfenced *em*\n~~~\n",
+    "``a `b` c``",
+    "<!-- comment *em* -->",
+    "<http://a.com/*b*>",
+    "autolink <http://a.com/b>",
+    "*a* <http://x.y> *b*",
+    "[link *em*](/uri)",
+    "![img](/uri)",
+    "line *em*  \nnext",
+    "a | b\n--- | ---\n1 | 2",
+    "",
+];
+
+/// 整份文档逐块产一遍装饰。
+fn decorate_every_block(source: &str) -> Vec<(TextRange, BlockDecorations)> {
+    let buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let document = parse(&snapshot);
+    let tree = parse_syntax(&snapshot).expect("测试文档很短").into_tree();
+    let extensions = ExtensionSet::markdown();
+    document
+        .blocks()
+        .iter()
+        .map(|block| {
+            (
+                block.range(),
+                extensions
+                    .decorate(&snapshot, &tree, block, None)
+                    .expect("装饰产出不该失败"),
+            )
+        })
+        .collect()
+}
+
+/// 一条装饰都不许越出它那个块。
+///
+/// 越界的后果是「改了这一块，另一块的样子也变了」——而装饰是按块缓存的，
+/// 缓存会把它藏起来，直到某次编辑碰巧让两块一起重建才露出来。
+#[test]
+fn no_decoration_leaves_its_block_across_the_corpus() {
+    for source in CORPUS {
+        for (range, decorations) in decorate_every_block(source) {
+            for entry in decorations.set().all() {
+                assert!(
+                    entry.range.start() >= range.start() && entry.range.end() <= range.end(),
+                    "{source:?} 的块 {range:?} 产出了越界装饰 {:?}",
+                    entry.range
+                );
+            }
+        }
+    }
+}
+
+/// 每条装饰指向的 id 都必须查得到。
+#[test]
+fn every_id_resolves_across_the_corpus() {
+    for source in CORPUS {
+        for (_, decorations) in decorate_every_block(source) {
+            for entry in decorations.set().all() {
+                match entry.decoration {
+                    yu_decoration::Decoration::Mark { style } => assert!(
+                        decorations.attrs(style).is_some(),
+                        "{source:?} 的 {style:?} 查不到"
+                    ),
+                    yu_decoration::Decoration::Line { style } => assert!(
+                        decorations.ornament(style).is_some(),
+                        "{source:?} 的 {style:?} 查不到"
+                    ),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// 视觉长度必须等于块长度减去被隐藏的字节，重叠只算一次。
+///
+/// 「哪些字节被隐藏」与「隐藏之后有多长」是两套算术：前者是装饰列表，后者
+/// 是 `DecorationSet` 的映射索引。对不上的表现是画面比光标少几个字。
+#[test]
+fn the_visual_length_matches_the_hidden_bytes_across_the_corpus() {
+    for source in CORPUS {
+        for (range, decorations) in decorate_every_block(source) {
+            let set = decorations.set();
+            let visible = set
+                .source_to_visual(range.end())
+                .get()
+                .saturating_sub(set.source_to_visual(range.start()).get());
+            let mut spans: Vec<(u64, u64)> = set
+                .all()
+                .iter()
+                .filter(|entry| entry.decoration.hides_source())
+                .map(|entry| (entry.range.start().get(), entry.range.end().get()))
+                .filter(|(from, to)| from < to)
+                .collect();
+            spans.sort_unstable();
+            let mut hidden = 0_u64;
+            let mut cursor = range.start().get();
+            for (from, to) in spans {
+                let from = from.max(cursor);
+                if from < to {
+                    hidden += to - from;
+                    cursor = to;
+                }
+            }
+            assert_eq!(
+                range.len().saturating_sub(hidden),
+                visible,
+                "{source:?} 的块 {range:?} 视觉长度对不上"
+            );
+        }
+    }
 }

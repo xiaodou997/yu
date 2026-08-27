@@ -14,13 +14,96 @@
 //! `DecorationSet::new` 是它的 oracle。
 //!
 //! 不变量 D6，以及 `docs/architecture/overview-v2.md` 第 5.2 节第 4 条。
+//!
+//! # 产出器住在这个文件里
+//!
+//! 它们此前是 `yu-markdown::decorations` 的公开函数——S4 为了把
+//! `yu-syntax → yu-decoration` 这条链路端到端接通一次而提前落地的一小块。
+//! S6 之后产品链路上的产出器是 `ExtensionSet`，这三个函数就只剩这条测试
+//! 一个使用者了。留在产品里的话它是一段没人调用的公开 API；搬进来它就是
+//! 它实际的身份：一组给 `merge` 喂真实交错输入的夹具。
 
-use yu_core::{ByteOffset, Revision, VisualOffset};
-use yu_decoration::{Bias, DecorationSet};
-use yu_markdown::{
-    code_decorations, emphasis_decorations, extension_decoration_sets, inline_syntax_decoration_set,
-};
-use yu_syntax::parse;
+use yu_core::{ByteOffset, Revision, TextRange, VisualOffset};
+use yu_decoration::{Bias, Decoration, DecorationRange, DecorationSet};
+use yu_syntax::{NodeKind, Tree, parse};
+
+fn inline_syntax_decorations(tree: &Tree) -> Vec<DecorationRange> {
+    let mut out = Vec::new();
+    collect(tree, 0, hides, &mut out);
+    out
+}
+
+/// 只隐藏强调的定界符。**一个 extension 的产出。**
+fn emphasis_decorations(tree: &Tree) -> Vec<DecorationRange> {
+    let mut out = Vec::new();
+    collect(
+        tree,
+        0,
+        |kind| matches!(kind, NodeKind::EmphasisMark),
+        &mut out,
+    );
+    out
+}
+
+/// 只隐藏行内代码与围栏的定界符。**另一个 extension 的产出。**
+fn code_decorations(tree: &Tree) -> Vec<DecorationRange> {
+    let mut out = Vec::new();
+    collect(tree, 0, |kind| matches!(kind, NodeKind::CodeMark), &mut out);
+    out
+}
+
+/// 两个 extension 各自的产出，各装进一个绑定 revision 的集合。
+///
+/// 交给 `DecorationSet::merge` 就该得到与 `inline_syntax_decoration_set`
+/// 相同的结果。
+fn extension_decoration_sets(
+    revision: Revision,
+    source_len: ByteOffset,
+    tree: &Tree,
+) -> Vec<DecorationSet> {
+    vec![
+        DecorationSet::new(revision, source_len, emphasis_decorations(tree)),
+        DecorationSet::new(revision, source_len, code_decorations(tree)),
+    ]
+}
+
+/// 一次性产出，装进一个绑定 revision 的集合。
+fn inline_syntax_decoration_set(
+    revision: Revision,
+    source_len: ByteOffset,
+    tree: &Tree,
+) -> DecorationSet {
+    DecorationSet::new(revision, source_len, inline_syntax_decorations(tree))
+}
+
+fn collect(
+    tree: &Tree,
+    from: u32,
+    hides: impl Fn(NodeKind) -> bool + Copy,
+    out: &mut Vec<DecorationRange>,
+) {
+    if hides(tree.kind())
+        && let Some(range) = TextRange::new(
+            ByteOffset::from(from),
+            ByteOffset::from(from + tree.len_bytes()),
+        )
+    {
+        out.push(DecorationRange::new(range, Decoration::Replace));
+        // 标记节点没有子节点，也不该有——继续下降只会重复覆盖。
+        return;
+    }
+    for index in 0..tree.child_count() {
+        let Some((child, position)) = tree.child(index) else {
+            break;
+        };
+        collect(child, from + position, hides, out);
+    }
+}
+
+/// 哪些节点算「可以整段隐藏的语法字符」。只列强调与代码的定界符。
+const fn hides(kind: NodeKind) -> bool {
+    matches!(kind, NodeKind::EmphasisMark | NodeKind::CodeMark)
+}
 
 /// 挑的都是强调与代码交错、或定界符彼此相邻的写法。
 const DOCUMENTS: &[&str] = &[
@@ -133,4 +216,50 @@ fn the_corpus_actually_interleaves_the_two_extensions() {
         "只有 {interleaved} 份语料让两个 extension 的区间相邻，\
          跨集合的相邻合并没有被覆盖"
     );
+}
+
+/// 夹具本身的前提：产出必须升序且不重叠。
+///
+/// 树的遍历顺序是否保证这一点并不显然，而 `merge` 的输入靠它。这条不在
+/// 测 `merge`，它守的是「上面那些断言比的是有效输入」。
+#[test]
+fn the_fixture_produces_ordered_disjoint_ranges() {
+    for source in DOCUMENTS {
+        let parsed = parse(*source).expect("测试文档很短");
+        let found: Vec<_> = inline_syntax_decorations(parsed.tree())
+            .into_iter()
+            .map(|entry| (entry.range.start().get(), entry.range.end().get()))
+            .collect();
+        for pair in found.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].0,
+                "{source:?} 的产出不是升序不重叠的：{found:?}"
+            );
+        }
+    }
+}
+
+/// 不成对的定界符不产生标记节点，因此也不该被隐藏——否则用户打下第一个
+/// `*` 的瞬间它就消失了。
+#[test]
+fn unmatched_delimiters_stay_visible() {
+    for source in ["*a", "a`b"] {
+        let parsed = parse(source).expect("测试文档很短");
+        assert!(
+            inline_syntax_decorations(parsed.tree()).is_empty(),
+            "{source:?} 里的定界符没有配对，不该被隐藏"
+        );
+    }
+}
+
+/// 块级标记不在这一批里：它们由各自的 extension 管，行为是替换而不是隐藏。
+#[test]
+fn block_prefixes_are_not_hidden_here() {
+    for source in ["# title\n", "> quote\n", "- item\n"] {
+        let parsed = parse(source).expect("测试文档很短");
+        assert!(
+            inline_syntax_decorations(parsed.tree()).is_empty(),
+            "{source:?} 的块级前缀不该由行内标记的产出器隐藏"
+        );
+    }
 }

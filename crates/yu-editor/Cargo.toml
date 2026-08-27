@@ -13,7 +13,6 @@ yu-core = { path = "../yu-core" }
 yu-decoration = { path = "../yu-decoration" }
 yu-layout = { path = "../yu-layout" }
 yu-markdown = { path = "../yu-markdown" }
-yu-projection = { path = "../yu-projection" }
 yu-state = { path = "../yu-state" }
 yu-syntax = { path = "../yu-syntax" }
 yu-text = { path = "../yu-text" }

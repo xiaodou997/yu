@@ -1,4 +1,4 @@
-//! 从 `Projection` 派生 `yu-layout` 的输入。
+//! 从 `DecorationSet` 派生 `yu-layout` 的输入。
 //!
 //! # 为什么这个模块住在 `yu-editor`
 //!
@@ -12,9 +12,6 @@
 //! ——E1 的禁止清单里没有它，`tools/check-deps.py` 也已登记
 //! `yu-editor → yu-markdown`。
 //!
-//! 这一轮仍然从 v1 的 `Projection` 派生，只是派生的地方从 `yu-layout` 换到
-//! 这里。用 `DecorationSet` 取代 `Projection` 是 S6 的事。
-//!
 //! # 什么进布局，什么不进
 //!
 //! 进布局的只有**几何**：字号倍率、行高倍率、缩进、widget 的盒子。
@@ -23,7 +20,6 @@
 //! 字符。它们留在 [`BlockOrnaments`] 里，由绘制方拿去画。布局层拿到的是
 //! 「缩进 8.0」，不是「这是二级引用」。
 
-use crate::geometry::upstream;
 use crate::marks::{Mark, flatten};
 use yu_core::{
     ByteOffset, ClusterMetrics, LineStyleId, ShapedText, ShapingProvider, StyleId, TextAttrs,
@@ -36,26 +32,17 @@ use yu_layout::{
     StyleTable, StyledRun,
 };
 use yu_markdown::{BlockDecorations, BlockOrnament};
-use yu_projection::{LeadingMarker, Projection, VisualRunKind};
 
 use crate::visual::VisualText;
-
-/// v1 那条路用到的四种字型，`StyleId` 就是它们在表里的下标。
-///
-/// 顺序与 [`TextStyle`] 一一对应，不是随便排的：id 的含义由**这一层**定，
-/// 布局层查表拿到的只有 [`TextAttrs`]。
-///
-/// `DecorationSet` 那条路的 id 数量由 extension 决定，不是四个——所以
-/// [`BlockStyleTable`] 是变长的，这个常量只管 v1 那条。
-const STYLE_COUNT: usize = 4;
 
 /// 整块只有一段行级样式，id 固定。
 const BLOCK_LINE_STYLE: LineStyleId = LineStyleId(0);
 
 /// `StyleId` → [`TextAttrs`]。
 ///
-/// 表由产出装饰的这一层填。查不到的 id 是错误而不是默认字型：一个「装饰
-/// 产出与样式表脱节」的 bug 应该响，不应该只是画得不对。
+/// 表由产出装饰的这一层填，长度由 extension 登记了多少种字型决定。查不到的
+/// id 是错误而不是默认字型：一个「装饰产出与样式表脱节」的 bug 应该响，
+/// 不应该只是画得不对。
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockStyleTable {
     attrs: Vec<TextAttrs>,
@@ -237,106 +224,7 @@ pub struct BlockLayoutInput {
 }
 
 impl BlockLayoutInput {
-    /// 按度量派生。列表标记的宽度也用同一份度量量出来。
-    pub fn derive<M: ClusterMetrics>(
-        projection: &Projection,
-        config: LayoutConfig,
-        metrics: &M,
-    ) -> Result<Self, LayoutError> {
-        let marker = projection
-            .leading_marker()
-            .map(|marker| measure_marker(marker, metrics))
-            .transpose()?;
-        Self::assemble(projection, config, marker)
-    }
-
-    /// 按 shaping 后端派生。标记的宽度取 shaper 给的推进量，字形一并留下。
-    pub fn derive_shaped<S: ShapingProvider>(
-        projection: &Projection,
-        config: LayoutConfig,
-        shaper: &S,
-    ) -> Result<Self, LayoutError> {
-        let marker = projection
-            .leading_marker()
-            .map(|marker| shape_marker(marker, shaper))
-            .transpose()?;
-        Self::assemble(projection, config, marker)
-    }
-
-    fn assemble(
-        projection: &Projection,
-        config: LayoutConfig,
-        marker: Option<MarkerDraft>,
-    ) -> Result<Self, LayoutError> {
-        let heading = projection
-            .heading()
-            .map(|heading| heading_metrics(heading.level()))
-            .transpose()?;
-        let quote = projection
-            .block_quote()
-            .map(|quote| block_quote_metrics(quote.depth(), config))
-            .transpose()?;
-
-        let quote_gutter = quote.map_or(0.0, |quote| quote.gutter);
-        let marker_gutter = marker.as_ref().map_or(0.0, |marker| {
-            marker.advance + config.default_advance() * (f32::from(marker.indent) + 1.0)
-        });
-        let indent = quote_gutter + marker_gutter;
-
-        let (text, runs) = derive_text_and_runs(projection)?;
-        let visual_len =
-            VisualOffset::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
-        let visual = yu_projection::VisualRange::new(VisualOffset::ZERO, visual_len).ok_or(
-            LayoutError::InvalidConfig("visual text length must be a valid range"),
-        )?;
-
-        let font_scale = heading.map_or(1.0, |heading| heading.font_scale);
-        let styles = BlockStyleTable {
-            attrs: style_attrs(font_scale, heading.is_some())?.to_vec(),
-        };
-        let line_styles = BlockLineStyleTable {
-            attrs: LineAttrs::new(
-                indent,
-                heading.map_or(1.0, |heading| heading.line_height_scale),
-            )?,
-        };
-
-        Ok(Self {
-            text,
-            runs,
-            lines: vec![LineSpan::new(visual, BLOCK_LINE_STYLE)],
-            styles,
-            line_styles,
-            ornaments: BlockOrnaments {
-                heading: heading.map(|heading| HeadingOrnament {
-                    source: projection.source_range(),
-                    level: heading.level,
-                    font_scale: heading.font_scale,
-                    line_height_scale: heading.line_height_scale,
-                }),
-                marker: marker.map(|marker| MarkerOrnament {
-                    source: marker.source,
-                    text: marker.text,
-                    x: quote_gutter + f32::from(marker.indent) * config.default_advance(),
-                    advance: marker.advance,
-                    shaped: marker.shaped,
-                }),
-                quote: quote.map(|quote| BlockQuoteOrnament {
-                    source: projection.source_range(),
-                    depth: quote.depth,
-                    unit: quote.unit,
-                    bar_width: quote.bar_width,
-                }),
-            },
-        })
-    }
-
     /// 从 `yu-markdown` 的 extension 产出派生。
-    ///
-    /// 与 [`BlockLayoutInput::derive`] 是同一件事的两个来源：那条读 v1 的
-    /// `Projection`，这条读 `DecorationSet`。两条并存，靠
-    /// `tests/blockinput_differential.rs` 守着——`Projection` 还在产品里跑
-    /// 着，删它之前它就是 oracle。
     ///
     /// `visual` 必须是同一份装饰投影出来的（[`VisualText`] 与
     /// `decorations` 同 range 同 Revision）：视觉文本从那边来，样式段在这边
@@ -360,7 +248,7 @@ impl BlockLayoutInput {
         draft.assemble(config, marker)
     }
 
-    /// 按 shaping 后端派生。与 [`BlockLayoutInput::derive_shaped`] 对应。
+    /// 按 shaping 后端派生。列表标记的字形一并留下。
     ///
     /// # Errors
     ///
@@ -406,71 +294,6 @@ impl BlockLayoutInput {
     }
 }
 
-/// `StyleId` 的含义在这里定死：下标就是 [`TextStyle`] 的判别式。
-///
-/// 标题把每一段都排成粗体（v1 的 `HeadingClusterMetrics` 也是这么做的），
-/// 所以标题块的四个 id 指向同一种字型、同一个倍率。
-fn style_attrs(font_scale: f32, heading: bool) -> Result<[TextAttrs; STYLE_COUNT], LayoutError> {
-    let mut attrs = [TextAttrs::default(); STYLE_COUNT];
-    for (index, style) in [
-        TextStyle::Plain,
-        TextStyle::Emphasis,
-        TextStyle::Strong,
-        TextStyle::Code,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let style = if heading { TextStyle::Strong } else { style };
-        attrs[index] = TextAttrs::new(style)
-            .with_size_scale(font_scale)
-            .ok_or(LayoutError::InvalidMetrics(font_scale.to_bits()))?;
-    }
-    Ok(attrs)
-}
-
-/// [`TextStyle`] → [`StyleId`]。与 [`style_attrs`] 的下标必须一致。
-#[must_use]
-pub const fn style_id(style: TextStyle) -> StyleId {
-    match style {
-        TextStyle::Plain => StyleId(0),
-        TextStyle::Emphasis => StyleId(1),
-        TextStyle::Strong => StyleId(2),
-        TextStyle::Code => StyleId(3),
-    }
-}
-
-/// 视觉文本与样式区间。
-///
-/// 隐藏的语法不进视觉文本；其余每个 run 原样变成一段 [`StyledRun`]。
-/// run 必须无缝铺满——漏掉半段会画出少了几个字的一行，既不 panic 也不报错。
-fn derive_text_and_runs(projection: &Projection) -> Result<(String, Vec<StyledRun>), LayoutError> {
-    let mut text = String::new();
-    let mut runs = Vec::new();
-    for run in projection.runs().iter().copied() {
-        if run.kind() == VisualRunKind::HiddenSyntax {
-            continue;
-        }
-        let piece = projection.text_for_run(run).map_err(upstream)?;
-        let len = u64::try_from(piece.len()).map_err(|_| LayoutError::OffsetOverflow)?;
-        if run.visual().end().get() - run.visual().start().get() != len {
-            return Err(LayoutError::InvalidConfig(
-                "visual run length must equal its text length",
-            ));
-        }
-        let tiled = u64::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
-        if tiled != run.visual().start().get() {
-            return Err(LayoutError::RunsNotContiguous {
-                expected: VisualOffset::new(tiled),
-                found: run.visual().start(),
-            });
-        }
-        text.push_str(&piece);
-        runs.push(StyledRun::new(run.visual(), style_id(run.style())));
-    }
-    Ok((text, runs))
-}
-
 struct MarkerDraft {
     source: TextRange,
     text: String,
@@ -479,15 +302,6 @@ struct MarkerDraft {
     shaped: Option<ShapedText>,
 }
 
-fn measure_marker<M: ClusterMetrics>(
-    marker: &LeadingMarker,
-    metrics: &M,
-) -> Result<MarkerDraft, LayoutError> {
-    measure_marker_parts(marker.source(), marker.text(), marker.indent(), metrics)
-}
-
-/// [`DecorationDraft`] 那条路的入口。量法与 v1 那条**共用**下面这一个函数
-/// ——差分要比的是「派生出了什么标记」，不是「同一段算术抄了两遍」。
 fn measure_marker_text<M: ClusterMetrics>(
     marker: &MarkerOrnamentSource,
     metrics: &M,
@@ -518,13 +332,6 @@ fn measure_marker_parts<M: ClusterMetrics>(
         advance,
         shaped: None,
     })
-}
-
-fn shape_marker<S: ShapingProvider>(
-    marker: &LeadingMarker,
-    shaper: &S,
-) -> Result<MarkerDraft, LayoutError> {
-    shape_marker_parts(marker.source(), marker.text(), marker.indent(), shaper)
 }
 
 fn shape_marker_text<S: ShapingProvider>(
@@ -743,7 +550,7 @@ impl DecorationDraft {
 
         let visual_len =
             VisualOffset::try_from(self.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
-        let visual = yu_projection::VisualRange::new(VisualOffset::ZERO, visual_len).ok_or(
+        let visual = VisualRange::new(VisualOffset::ZERO, visual_len).ok_or(
             LayoutError::InvalidConfig("visual text length must be a valid range"),
         )?;
 
@@ -890,80 +697,4 @@ fn splice_composition(
         );
     }
     Ok(spliced)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{BlockLayoutInput, style_id};
-    use yu_core::{ClusterMetrics, StyleId, TextStyle};
-    use yu_layout::{LayoutConfig, StyleTable};
-    use yu_projection::BlockProjection;
-    use yu_text::TextBuffer;
-
-    /// 一份能分辨字型的度量。`MonospaceMetrics` 分辨不了——用它做断言，
-    /// 「标题排成粗体」这条规则去掉之后一条用例都不会红。
-    struct StyleSensitive;
-
-    impl ClusterMetrics for StyleSensitive {
-        fn advance(&self, _cluster: &str, style: TextStyle) -> f32 {
-            match style {
-                TextStyle::Plain => 1.0,
-                TextStyle::Emphasis => 2.0,
-                TextStyle::Strong => 4.0,
-                TextStyle::Code => 8.0,
-            }
-        }
-    }
-
-    fn input_for(source: &str, config: LayoutConfig) -> BlockLayoutInput {
-        let buffer = TextBuffer::new(source.to_owned());
-        let snapshot = buffer.snapshot();
-        let markdown = yu_markdown::parse(&snapshot);
-        let block = markdown.blocks().get(0).expect("至少一个块");
-        let projection = BlockProjection::from_block_with_definitions(
-            &snapshot,
-            block,
-            markdown.reference_definitions(),
-        )
-        .expect("块投影");
-        BlockLayoutInput::derive(projection.visual(), config, &StyleSensitive).expect("派生输入")
-    }
-
-    /// 标题把整段排成粗体，字号倍率按级别走。v1 的
-    /// `HeadingClusterMetrics` 也是这么做的——它把传进来的字型整个丢掉，
-    /// 一律按 `Strong` 量。
-    #[test]
-    fn a_heading_renders_every_run_bold_at_its_level_scale() {
-        let config = LayoutConfig::new(400.0, 10.0);
-        let input = input_for("## h2 *em* `code`\n", config);
-        for id in [StyleId(0), StyleId(1), StyleId(2), StyleId(3)] {
-            let attrs = input.styles().attrs(id).expect("表里有这个 id");
-            assert_eq!(attrs.style(), TextStyle::Strong, "{id:?} 的字型");
-            assert_eq!(attrs.size_scale(), 1.7, "{id:?} 的字号倍率");
-        }
-
-        // 普通段落不动字型，各段各自查各自那一项。
-        let plain = input_for("plain *em* `code`\n", config);
-        for style in [
-            TextStyle::Plain,
-            TextStyle::Emphasis,
-            TextStyle::Strong,
-            TextStyle::Code,
-        ] {
-            let attrs = plain
-                .styles()
-                .attrs(style_id(style))
-                .expect("表里有这个 id");
-            assert_eq!(attrs.style(), style);
-            assert_eq!(attrs.size_scale(), 1.0);
-        }
-    }
-
-    /// 表里没有的 id 返回 `None`，布局层据此报错而不是按默认字型排。
-    #[test]
-    fn an_unknown_style_id_is_absent_not_defaulted() {
-        let input = input_for("plain\n", LayoutConfig::new(400.0, 10.0));
-        assert!(input.styles().attrs(StyleId(4)).is_none());
-        assert!(input.styles().attrs(StyleId(u32::MAX)).is_none());
-    }
 }

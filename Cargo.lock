@@ -617,7 +617,6 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "yu-core",
- "yu-projection",
  "yu-text",
 ]
 
@@ -630,7 +629,6 @@ dependencies = [
  "yu-decoration",
  "yu-layout",
  "yu-markdown",
- "yu-projection",
  "yu-state",
  "yu-syntax",
  "yu-text",
@@ -699,17 +697,6 @@ version = "0.1.0"
 dependencies = [
  "yu-core",
  "yu-decoration",
- "yu-syntax",
- "yu-text",
-]
-
-[[package]]
-name = "yu-projection"
-version = "0.1.0"
-dependencies = [
- "yu-core",
- "yu-decoration",
- "yu-markdown",
  "yu-syntax",
  "yu-text",
 ]
