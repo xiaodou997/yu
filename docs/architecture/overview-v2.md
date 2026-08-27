@@ -861,10 +861,11 @@ S5 结束时留给它的入口是清楚的：`yu-editor::BlockLayoutInput` 现�
 dev-dep 在用它。表格与图片的 widget 化、`BlockView::hit_test` 的 bidi 也在
 同一次换源里落地，理由见 S5 的「已登记的四个未做项」。
 
-**进行中。** 五刀落地：`yu-markdown` 成为 extension 集合；`BlockLayoutInput`
+**进行中。** 六刀落地：`yu-markdown` 成为 extension 集合；`BlockLayoutInput`
 多一条从 `DecorationSet` 派生的路；消费者换完，`BlockView` 向装饰问源码
-区间；`yu-projection` 删除；增量解析接上。剩下的是 widget 化、hit_test 的
-bidi，以及把 `block_sequence` 与语法树的块结构合并。
+区间；`yu-projection` 删除；增量解析接上；`hit_test` 的 bidi 与
+`BlockLayout::hit` 合流。剩下的是 widget 化，以及把 `block_sequence` 与语法树
+的块结构合并。
 
 #### 第一刀：extension 集合，建在 `yu-syntax` 上
 
@@ -1145,10 +1146,38 @@ fragment 从那棵树现取；只有树落后于编辑（连着编辑几次都�
 全量树」第一次跑就红了，再在 `yu-syntax` 层收敛成两次编辑的最小复现。要是只
 断言「重扫字节数够小」，它会原样活下来：它让复用**变多**，字节数只会更好看。
 
+#### 第六刀：`hit_test` 的 bidi，与守着它的那条性质
+
+`BlockView::hit_test` 一直照搬 v1 的做法：按 x 从左到右扫簇，「过了中点算下
+一个」。那条规则默认 **x 随逻辑顺序单调递增**——bidi 重排之后不成立。
+`abc مرحبا def` 里点在阿拉伯语那一段上，光标最远会停到十个像素以外的另一个
+位置。S5 登记过这一项，源码映射收敛成一套之后两条就能合流：文字流那一路
+现在交给 `BlockLayout::hit`，它枚举这一行所有 caret 位置取最近的一个，与
+`BlockLayout::caret` 用同一条规则。
+
+表格不走那条路：它的簇已经被搬进单元格了，文字流的 x 对不上网格的 x。那一路
+仍然是按 x 扫描，与 `table_point_for_visual` 配对。
+
+##### 守着它的那条性质本来是自证的
+
+`hit_test_lands_on_a_caret_position` 断的是「`hit_test` 给的点等于
+`caret_for_visual(hit.visual, hit.bias)` 给的点」。而 `hit_test` 的返回值**本来
+就是拿后者算出来的**——比的是同一次计算的两遍读法。它一直全绿，而 bidi 行里
+差着十个像素。这是「共用代码路径的差分是自证的」在本阶段的第二个实例。
+
+换成的判据来自 `hit_test` 之外：**这一行上所有够得着的 caret 位置里，没有哪个
+比它给的那个更靠近点击处**。候选由簇的两端经 `caret_for_visual` 得出，与被测
+的那条路无关。语料加了三条 RTL/混排。
+
 #### 还没做的
 
-- **`BlockView::hit_test` 的 bidi** 仍然是 v1 的按 x 扫描（S5 登记的未做项）。
-  源码映射换完之后它与 `BlockLayout::hit` 可以合流，但那是独立的一刀。
+- **窄到放不下的表格，列会重叠。** 上面那条性质是这么发现的：列宽按
+  `max_width / natural_total` 整体压缩，而单元格里的内容没有跟着重排，于是后
+  一列的内容压在前一列上（`| long header | x |` 排在 12pt 宽里，第二列的
+  content_x 是 11.75，而第一列的内容铺到 24）。表格的命中测试也因此过不了
+  「最近的 caret」那条，只由一条弱一些的性质守着（不跑到别的行去、偏移落在
+  这一行的视觉区间里）。**随 widget 化一起解决**：那时单元格有自己的布局，
+  「放不下怎么办」才有地方回答。
 - **表格与图片没有 widget 化。** 第 3 节的对照表说它们终局是 widget，那要求
   `BlockLayout` 能问 `WidgetRegistry` 要尺寸（§5.3），而它现在拿的是
   `NoWidgets`。
