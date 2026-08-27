@@ -17,9 +17,9 @@ use yu_assets::{
 };
 use yu_core::{Revision, TextRange};
 use yu_editor::{
-    Bias, BlockAnnotation, BlockKind, BlockView, CaretAffinity, EditorDocument,
-    EditorDocumentError, ImageSpan, LayoutError, ShapingProvider, TableLayout, TableResizeCommit,
-    TableResizeTarget, TaskState, ViewportSpan, task_marker,
+    Bias, BlockKind, BlockView, BlockWidget, CaretAffinity, EditorDocument, EditorDocumentError,
+    ImageSpan, LayoutError, ShapingProvider, TableLayout, TableResizeCommit, TableResizeTarget,
+    TaskState, ViewportSpan, task_marker,
 };
 use yu_font::GlyphAtlas;
 use yu_layout::{ImageIntrinsicSize, LayoutRect};
@@ -1406,23 +1406,13 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
 
     let mut layouts = Vec::with_capacity(viewport_snapshot.blocks().len());
     for block in viewport_snapshot.blocks() {
-        let mut layout =
-            document.block_layout_for_visual_state_with_shaper(block.index(), config, shaper)?;
-        let measurements = layout
-            .decorations()
-            .annotations()
-            .iter()
-            .copied()
-            .map(|BlockAnnotation::Image(image)| image)
-            .filter_map(|image| {
-                image_key(image)?;
-                let size = intrinsic_size(image)?;
-                Some((image.source(), size))
-            })
-            .collect::<Vec<_>>();
-        layout
-            .apply_image_intrinsic_sizes(&measurements)
-            .map_err(EditorDocumentError::from)?;
+        let sizes = document.block_image_sizes(block.index(), &intrinsic_size)?;
+        let mut layout = document.block_layout_for_visual_state_with_shaper_and_images(
+            block.index(),
+            config,
+            shaper,
+            &sizes,
+        )?;
         if let Some(resize) = table_resize.filter(|resize| resize.block_index() == block.index()) {
             layout
                 .apply_table_resize(resize)
@@ -1489,10 +1479,10 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         for placement in layout.images() {
             let Some(image) = layout
                 .decorations()
-                .annotations()
+                .widgets()
                 .iter()
                 .copied()
-                .map(|BlockAnnotation::Image(image)| image)
+                .map(|BlockWidget::Image(image)| image)
                 .find(|image| image.source() == placement.source())
             else {
                 continue;
@@ -2548,10 +2538,10 @@ mod tests {
         let source = document
             .block_decorations(0)
             .expect("image decorations")
-            .annotations()
+            .widgets()
             .iter()
             .copied()
-            .map(|BlockAnnotation::Image(image)| image.source())
+            .map(|BlockWidget::Image(image)| image.source())
             .next()
             .expect("这个块上有一张图");
         let mut cache = yu_assets::ImageCache::new();

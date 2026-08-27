@@ -1,34 +1,33 @@
-//! Markdown 图片的几何。
+//! Markdown 图片排出来的盒子。
 //!
-//! # 为什么它住在 `yu-editor`
+//! # 它现在只是一次查表
 //!
-//! 它此前住在 `yu-layout`：布局层为了给图片划一个盒子，必须先知道
-//! 「哪一段是 alt 文本」——那是 Markdown 的语法知识，不变量 E1 禁止的。
+//! 图片是 widget（第 3 节的对照表）：整段 `![替代](目标)` 由
+//! `Decoration::Widget` 覆盖，盒子由 `BlockLayout` 连同文字一起排，尺寸由
+//! [`crate::widget::BlockWidgets`] 给。这里做的是把排好的 [`WidgetBox`] 与
+//! 它的语义（哪一段 source、替代文字在哪）接回来，好让绘制方与命中测试
+//! 拿到一样东西。
 //!
-//! # 为什么它还不是 widget
+//! 此前这里自己划盒子：按替代文字排出来的那几个簇取包围盒，再在资源解码
+//! 之后就地改尺寸。那套「排完再改」是 widget 还没到位时的替身——盒子撑高
+//! 一行的后果得由调用方自己补（`BlockView::height` 曾经要把图片的下沿并进
+//! 块高），而 widget 在排的时候就把行撑高了。
 //!
-//! overview-v2 §5.3 说图片在 v2 里是 widget。真做成 widget 要求 alt 标签
-//! 那几个字节从视觉文本里**消失**（`Decoration::Replace`），否则图片盒子
-//! 会把标签挤到一边，然后两样都画出来。而 v1 的 `Projection` 表达不了
-//! 「这一段隐藏但仍可被光标穿越」——它的隐藏 run 是给语法标记用的。
-//!
-//! 给一个 S6 就要删掉的 v1 类型加这个能力不划算。图片在 S6 随
-//! `DecorationSet` 一起变成 widget，那时 `apply_intrinsic_size` 这套
-//! 「解码后改尺寸再重排」正好就是不变量 D7 的 placeholder → ready → 重排。
+//! [`WidgetBox`]: yu_layout::WidgetBox
 
 use yu_core::{TextRange, VisualRange};
 use yu_decoration::Bias;
-use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
-use yu_markdown::{BlockAnnotation, ImageSpan};
+use yu_layout::{LayoutError, LayoutPoint, LayoutRect};
+use yu_markdown::BlockWidget;
 
 use crate::blockview::{BlockHit, BlockView, shift_range};
-use crate::geometry::{source_range_contains, upstream};
+use crate::geometry::source_range_contains;
 use crate::table::TableLayout;
 
 /// 一张图片占的位置。
 ///
-/// 图片指向的资源由 workspace 那一层解析；这里只决定它盖住 alt 标签的哪一段
-/// 几何。图片本身不进 source（不变量 A2），`source` 指的是那段 Markdown。
+/// 图片指向的资源由 workspace 那一层解析；这里只有几何。图片本身不进
+/// source（不变量 A2），`source` 指的是那段 Markdown。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ImagePlacement {
     source: TextRange,
@@ -49,6 +48,10 @@ impl ImagePlacement {
         self.label
     }
 
+    /// 盒子锚在视觉字节流的哪一点。
+    ///
+    /// 它是**空**区间：widget 覆盖的那段 source 在视觉文本里不占位，
+    /// 整段 `![替代](目标)` 塌到同一个视觉偏移上。
     #[must_use]
     pub const fn visual(self) -> VisualRange {
         self.visual
@@ -94,22 +97,6 @@ impl ImagePlacement {
         )
     }
 
-    /// 解码后的尺寸到位：宽度受剩余行宽限制，高度保持解码时的长宽比。
-    pub(crate) fn apply_intrinsic_size(
-        &mut self,
-        size: ImageIntrinsicSize,
-        config: LayoutConfig,
-    ) -> Result<(), LayoutError> {
-        let intrinsic_width = size.width() as f32;
-        let intrinsic_height = size.height() as f32;
-        let available_width = (config.max_width() - self.bounds.x()).max(1.0);
-        let scale = (available_width / intrinsic_width).min(1.0);
-        let width = (intrinsic_width * scale).max(1.0);
-        let height = (intrinsic_height * scale).max(config.line_height());
-        self.bounds = LayoutRect::new(self.bounds.x(), self.bounds.y(), width, height)?;
-        Ok(())
-    }
-
     pub(crate) fn shifted(self, delta: i64) -> Result<Self, LayoutError> {
         Ok(Self {
             source: shift_range(self.source, delta)?,
@@ -119,70 +106,25 @@ impl ImagePlacement {
     }
 }
 
-/// 按 alt 标签排出来的位置划图片盒子。
+/// 把排好的 widget 盒接回它那段 Markdown。
 ///
-/// 算法照搬 v1：盒子横跨标签那几个簇，宽度至少 4 个行高，右边不超出可用
-/// 宽度。标签本身仍然在视觉文本里可编辑（不变量 I5：不支持的语法按源码
-/// 画出来，永不白屏）。
+/// 顺序与 [`yu_layout::BlockLayout::widgets`] 一致，也就是与装饰集合里的
+/// widget 一一对应、同序。查不到的 id 是错误：`BlockLayout` 已经因为
+/// 同一个 id 报过一次 `UnknownWidget`，这里再查不到说明两张表分叉了。
 pub(crate) fn build_image_placements(view: &BlockView) -> Result<Vec<ImagePlacement>, LayoutError> {
-    let text = view.visual();
-    let config = view.config();
-    let annotated: Vec<ImageSpan> = view
-        .decorations()
-        .annotations()
-        .iter()
-        .map(|annotation| {
-            let BlockAnnotation::Image(image) = annotation;
-            *image
-        })
-        .collect();
-    let mut placements = Vec::with_capacity(annotated.len());
-    for image in annotated {
-        let visual_start = text
-            .source_to_visual(image.label().start(), Bias::Before)
-            .map_err(upstream)?;
-        let visual_end = text
-            .source_to_visual(image.label().end(), Bias::After)
-            .map_err(upstream)?;
-        let visual = VisualRange::new(visual_start, visual_end.max(visual_start))
-            .ok_or(LayoutError::OffsetOverflow)?;
-        let caret = view.caret_for_visual(visual.start(), Bias::Before)?;
-        let line = view
-            .lines()
-            .get(caret.line())
-            .ok_or(LayoutError::OffsetOverflow)?;
-        let mut left = f32::INFINITY;
-        let mut right = 0.0_f32;
-        let mut found = false;
-        for index in line.cluster_range() {
-            let cluster = view.clusters()[index];
-            if cluster.is_line_break() {
-                continue;
-            }
-            let overlaps = if visual.is_empty() {
-                cluster.visual().start() == visual.start()
-            } else {
-                cluster.visual().start() < visual.end() && visual.start() < cluster.visual().end()
-            };
-            if overlaps {
-                found = true;
-                left = left.min(cluster.x());
-                right = right.max(cluster.x() + cluster.width());
-            }
-        }
-        if !found {
-            left = caret.point().x();
-            right = caret.point().x();
-        }
-        let minimum_width = config.line_height() * 4.0;
-        let remaining = (config.max_width() - left).max(config.line_height());
-        let width = (right - left).max(minimum_width).min(remaining);
+    let decorations = view.decorations();
+    let boxes = view.layout().widgets();
+    let mut placements = Vec::with_capacity(boxes.len());
+    for placed in boxes {
+        let Some(BlockWidget::Image(image)) = decorations.widget(placed.widget()) else {
+            return Err(LayoutError::UnknownWidget(placed.widget()));
+        };
         placements.push(ImagePlacement {
             source: image.source(),
             label: image.label(),
-            visual,
-            line: caret.line(),
-            bounds: LayoutRect::new(left.max(0.0), line.y(), width, config.line_height())?,
+            visual: VisualRange::empty(placed.visual()),
+            line: placed.line(),
+            bounds: placed.bounds(),
         });
     }
     Ok(placements)

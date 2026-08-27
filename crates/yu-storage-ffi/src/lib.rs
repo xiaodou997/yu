@@ -3724,14 +3724,14 @@ fn image_utf16_range(source: &TextSnapshot, range: Option<TextRange>) -> Result<
     Ok((start, end))
 }
 
-/// 一个块上的全部图片标注。
+/// 一个块上的全部图片。
 #[cfg(target_os = "macos")]
 fn block_images(decorations: &yu_editor::BlockDecorations) -> Vec<ImageSpan> {
     decorations
-        .annotations()
+        .widgets()
         .iter()
         .copied()
-        .map(|yu_editor::BlockAnnotation::Image(image)| image)
+        .map(|yu_editor::BlockWidget::Image(image)| image)
         .collect()
 }
 

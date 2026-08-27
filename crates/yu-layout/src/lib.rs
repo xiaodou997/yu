@@ -187,6 +187,8 @@ pub enum LayoutError {
     InvalidWidgetSize,
     /// widget 没有按 `(from, side)` 升序给出（不变量 D6 的定序）。
     WidgetsOutOfOrder,
+    /// widget 的锚点不在任何一个簇的起点上，也不在视觉末尾。
+    WidgetNotAnchored,
     /// 行样式表里没有这个 id。
     UnknownLineStyle(LineStyleId),
     /// 行级属性里有非有限或非正的值。
@@ -403,6 +405,9 @@ impl fmt::Display for LayoutError {
             Self::WidgetsOutOfOrder => {
                 formatter.write_str("widgets must be ordered by (offset, side)")
             }
+            Self::WidgetNotAnchored => {
+                formatter.write_str("every widget must be anchored on a cluster start")
+            }
             Self::UnknownLineStyle(style) => {
                 write!(formatter, "line style table has no entry for {style:?}")
             }
@@ -435,6 +440,7 @@ impl Error for LayoutError {
             | Self::InvalidWidgetBaseline
             | Self::InvalidWidgetSize
             | Self::WidgetsOutOfOrder
+            | Self::WidgetNotAnchored
             | Self::UnknownLineStyle(_)
             | Self::InvalidLineStyle
             | Self::LineStylesOutOfOrder => None,

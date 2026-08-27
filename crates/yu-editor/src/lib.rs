@@ -22,6 +22,7 @@ mod marks;
 mod table;
 mod viewport;
 mod visual;
+mod widget;
 
 pub use accessibility::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
@@ -39,7 +40,7 @@ pub use decorations::{DecorationCache, DecorationCacheStats, DecorationError};
 pub use document::{EditorDocument, EditorDocumentError};
 pub use image::ImagePlacement;
 pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
-pub use layout::{LayoutBackend, LayoutCache, LayoutCacheStats};
+pub use layout::{BlockLayoutSource, LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use table::{
     TableCellLayout, TableLayout, TableLayoutHit, TableResizeCommit, TableResizeGesture,
     TableResizeGestureError, TableResizeHit, TableResizeTarget,
@@ -49,6 +50,7 @@ pub use viewport::{
     ViewportLayout, ViewportRange, ViewportSnapshot, ViewportSpan, ViewportStats,
 };
 pub use visual::{VisualText, VisualTextError};
+pub use widget::ImageSize;
 pub use yu_core::{
     CaretAffinity, ClusterMetrics, NativeCaretPosition, ShapedText, ShapingProvider,
     SourceCaretPosition, TextStyle,
@@ -61,7 +63,7 @@ pub use yu_layout::{
     LayoutError, LayoutPoint, LayoutRect, MonospaceMetrics,
 };
 pub use yu_markdown::{
-    Block, BlockAnnotation, BlockDecorations, BlockKind, BlockOrnament, ImageSpan, ListMarker,
+    Block, BlockDecorations, BlockKind, BlockOrnament, BlockWidget, ImageSpan, ListMarker,
     MarkdownDocument, TableAlignment, TableBlock, TaskMarker, TaskState, list_marker, task_marker,
 };
 pub use yu_state::{

@@ -159,6 +159,17 @@ pub struct WidgetConstraints {
 }
 
 impl WidgetConstraints {
+    /// 量一个 widget 的约束。两个值都来自 [`LayoutConfig`]，所以布局之外
+    /// 的调用方（比如判断「资源到位之后要不要重排」的缓存）也能造出与
+    /// 布局里那一份**同样**的约束，不必自己猜。
+    #[must_use]
+    pub const fn new(available_width: f32, line_height: f32) -> Self {
+        Self {
+            available_width,
+            line_height,
+        }
+    }
+
     /// 一整行的可用宽度。widget 拿到的是**整块**的宽度，不是当前行的剩余
     /// 宽度：剩余宽度取决于它排在哪，而「排在哪」要等它的宽度定了才知道。
     #[must_use]
@@ -696,6 +707,7 @@ pub struct CaretBox {
     visual: VisualOffset,
     line: usize,
     point: LayoutPoint,
+    widget_affinity: Option<CaretAffinity>,
 }
 
 impl CaretBox {
@@ -712,6 +724,20 @@ impl CaretBox {
     #[must_use]
     pub const fn point(self) -> LayoutPoint {
         self.point
+    }
+
+    /// 这个位置落在 widget 的哪一侧，没有 widget 参与就是 `None`。
+    ///
+    /// widget **有宽度**，所以同一个视觉偏移在它两侧是两个不同的 x：
+    /// 「图片前面」与「图片后面」。行内其余位置的两侧是同一个 x——被隐藏的
+    /// 语法在字节流里塌成一个点——落在哪一侧由行的规则（不变量 H5）决定，
+    /// 与这里无关。
+    ///
+    /// [`BlockLayout::hit`] 因此要把它带出来：点在图片右边时选的是右沿，
+    /// 而调用方光看视觉偏移分不出是哪一沿，会把光标画回图片左边。
+    #[must_use]
+    pub const fn widget_affinity(self) -> Option<CaretAffinity> {
+        self.widget_affinity
     }
 }
 
@@ -1003,6 +1029,13 @@ impl BlockLayout {
             visual_len,
             &mut cursor,
         )?;
+        // 每一个 widget 都必须落地。锚点只在**簇的起点**与视觉末尾被查看，
+        // 锚在别处（比如一个 grapheme 内部）的那个会被 `place_widgets_at`
+        // 的 `while` 静静跳过，连同排在它后面的每一个 widget 一起——症状是
+        // 画面上少了一张图，不 panic、不报错。
+        if next_widget != input.widgets().len() {
+            return Err(LayoutError::WidgetNotAnchored);
+        }
 
         if layout.lines.is_empty() || !last_was_break {
             layout.push_line(&cursor, visual_len)?;
@@ -1165,6 +1198,20 @@ impl BlockLayout {
                 inside = Some(cluster);
             }
         }
+        // widget 夹在 `before` 与 `after` 之间，两侧的 x 差着它的宽度。
+        // 落在哪一侧只有 affinity 说得出来。
+        if let Some((left, right)) = self.widget_edges(line, visual) {
+            let x = match affinity {
+                CaretAffinity::Upstream => left,
+                CaretAffinity::Downstream => right,
+            };
+            return Ok(CaretBox {
+                visual,
+                line: line_index,
+                point: LayoutPoint::new(x, line.bounds.y()),
+                widget_affinity: Some(affinity),
+            });
+        }
         let x = match (before, after, inside) {
             (None, None, None) => self.content_start(line),
             _ => caret_x(before, after, inside),
@@ -1173,7 +1220,28 @@ impl BlockLayout {
             visual,
             line: line_index,
             point: LayoutPoint::new(x, line.bounds.y()),
+            widget_affinity: None,
         })
+    }
+
+    /// 锚在 `visual` 上的那些 widget 的左右外沿。一个都没有就是 `None`。
+    ///
+    /// 同一个偏移上可以摞着好几个 widget（`![a](x)![b](y)` 两段都塌在这
+    /// 一点上）。取最外面那两条边：中间的缝隙不对应任何一个源码位置。
+    fn widget_edges(&self, line: &LineBox, visual: VisualOffset) -> Option<(f32, f32)> {
+        let mut edges: Option<(f32, f32)> = None;
+        for index in line.widgets.clone() {
+            let placed = self.widgets[index];
+            if placed.visual != visual {
+                continue;
+            }
+            let (left, right) = (placed.bounds.x(), placed.bounds.x() + placed.bounds.width());
+            edges = Some(match edges {
+                Some((known_left, known_right)) => (known_left.min(left), known_right.max(right)),
+                None => (left, right),
+            });
+        }
+        edges
     }
 
     /// 一行内容的起点 x，也就是它的行级缩进。
@@ -1194,28 +1262,34 @@ impl BlockLayout {
         let line_index = self.line_for_y(point.y());
         let line = &self.lines[line_index];
         let target = point.x().clamp(0.0, line.bounds.width());
-        let mut best: Option<(f32, f32, VisualOffset)> = None;
-        for (x, offset) in self.caret_positions(line) {
-            let distance = (x - target).abs();
+        let mut best: Option<(f32, CaretPosition)> = None;
+        for position in self.caret_positions(line) {
+            let distance = (position.x - target).abs();
             // 打平时取更靠右那个，与 v1 的「过了中点算下一个」一致。
             let better = match best {
                 None => true,
-                Some((best_distance, best_x, _)) => {
-                    distance < best_distance || (distance == best_distance && x > best_x)
+                Some((best_distance, best_position)) => {
+                    distance < best_distance
+                        || (distance == best_distance && position.x > best_position.x)
                 }
             };
             if better {
-                best = Some((distance, x, offset));
+                best = Some((distance, position));
             }
         }
-        let (x, visual) = best.map_or_else(
-            || (self.content_start(line), line.visual.start()),
-            |(_, x, offset)| (x, offset),
+        let position = best.map_or_else(
+            || CaretPosition {
+                x: self.content_start(line),
+                visual: line.visual.start(),
+                widget_affinity: None,
+            },
+            |(_, position)| position,
         );
         Ok(CaretBox {
-            visual,
+            visual: position.visual,
             line: line_index,
-            point: LayoutPoint::new(x, line.bounds.y()),
+            point: LayoutPoint::new(position.x, line.bounds.y()),
+            widget_affinity: position.widget_affinity,
         })
     }
 
@@ -1224,17 +1298,18 @@ impl BlockLayout {
     /// 与 [`BlockLayout::caret`] 用同一条规则（[`caret_x`]），所以
     /// `caret(hit(p).visual())` 一定回到 `hit(p)` 的位置。两处各写一遍规则
     /// 就会在方向变化处对不上。
-    fn caret_positions(&self, line: &LineBox) -> Vec<(f32, VisualOffset)> {
+    fn caret_positions(&self, line: &LineBox) -> Vec<CaretPosition> {
         let mut positions = Vec::new();
         let mut before: Option<ClusterBox> = None;
         for index in line.clusters.clone() {
             let cluster = self.clusters[index];
             if !cluster.line_break {
                 let matching = before.filter(|prev| prev.visual.end() == cluster.visual.start());
-                positions.push((
-                    caret_x(matching, Some(cluster), None),
-                    cluster.visual.start(),
-                ));
+                positions.push(CaretPosition {
+                    x: caret_x(matching, Some(cluster), None),
+                    visual: cluster.visual.start(),
+                    widget_affinity: None,
+                });
             }
             before = Some(cluster);
         }
@@ -1246,7 +1321,35 @@ impl BlockLayout {
             .map(|index| self.clusters[index])
             .rfind(|cluster| !cluster.line_break)
         {
-            positions.push((caret_x(Some(last), None, None), last.visual.end()));
+            positions.push(CaretPosition {
+                x: caret_x(Some(last), None, None),
+                visual: last.visual.end(),
+                widget_affinity: None,
+            });
+        }
+        // widget 的两沿。一行上只有一个 widget、周围一个簇都没有时（整段就
+        // 是一张图），上面两个循环一个位置都产不出来——点在图片右边会一路
+        // 退到行首，光标跳到图片左边去。
+        let mut anchors: Vec<VisualOffset> = line
+            .widgets
+            .clone()
+            .map(|index| self.widgets[index].visual)
+            .collect();
+        anchors.dedup();
+        for anchor in anchors {
+            let Some((left, right)) = self.widget_edges(line, anchor) else {
+                continue;
+            };
+            positions.push(CaretPosition {
+                x: left,
+                visual: anchor,
+                widget_affinity: Some(CaretAffinity::Upstream),
+            });
+            positions.push(CaretPosition {
+                x: right,
+                visual: anchor,
+                widget_affinity: Some(CaretAffinity::Downstream),
+            });
         }
         positions
     }
@@ -1698,6 +1801,14 @@ fn segment_starts(text: &str, measured: &[Measured]) -> Result<Vec<usize>, Layou
 /// 两侧方向相同时两个位置重合，选谁都一样。方向不同时按 UAX #9 §3.4 取
 /// **层级更低**的那一侧，也就是更接近段落基准方向的那一段。这样边界两侧的
 /// 两个几何位置分别归属两个不同的偏移，点得到也画得出。
+/// 一行上一个可以停光标的位置。
+#[derive(Clone, Copy)]
+struct CaretPosition {
+    x: f32,
+    visual: VisualOffset,
+    widget_affinity: Option<CaretAffinity>,
+}
+
 fn caret_x(
     before: Option<ClusterBox>,
     after: Option<ClusterBox>,
@@ -2723,6 +2834,97 @@ mod tests {
         );
     }
 
+    /// 锚点必须落在某个簇的起点或视觉末尾上。
+    ///
+    /// 落在别处的那个 widget 会被 `place_widgets_at` 的 `while` 静静跳过，
+    /// 连同排在它后面的每一个 widget 一起——画面上少了一张图，不 panic、
+    /// 不报错。这里用一个组合字符簇的中间那个字节：那是既能过
+    /// `validate_widgets`（它只查 char 边界）又落不到任何簇起点上的位置。
+    #[test]
+    fn a_widget_anchored_off_every_cluster_start_is_rejected() {
+        // 组合重音跟着 'a' 合成一个簇，簇的起点只有 0 与 3。
+        let text = "a\u{301}b";
+        let table = Widgets {
+            entries: vec![(WidgetId(1), 1.0, 1.0, 1.0, true)],
+        };
+        let inside = [WidgetSpan::new(
+            VisualOffset::new(1),
+            WidgetId(1),
+            WidgetSide::Before,
+        )];
+        assert_eq!(
+            build_widgets(text, 80.0, &inside, &table),
+            Err(LayoutError::WidgetNotAnchored)
+        );
+        let on_a_cluster = [WidgetSpan::new(
+            VisualOffset::new(3),
+            WidgetId(1),
+            WidgetSide::Before,
+        )];
+        assert!(build_widgets(text, 80.0, &on_a_cluster, &table).is_ok());
+    }
+
+    /// widget 有宽度，所以它两侧是两个不同的 x，而视觉偏移只有一个。
+    ///
+    /// 「图片前面」与「图片后面」由 affinity 分。分不出来的话，点在图片右边
+    /// 光标会画回它左边去——不报错，只是不听话。
+    #[test]
+    fn a_widget_has_a_caret_position_on_each_side() {
+        let text = "ab";
+        let table = Widgets {
+            entries: vec![(WidgetId(1), 3.0, 1.0, 1.0, true)],
+        };
+        let spans = [WidgetSpan::new(
+            VisualOffset::new(1),
+            WidgetId(1),
+            WidgetSide::Before,
+        )];
+        let layout = build_widgets(text, 80.0, &spans, &table).expect("布局");
+        let visual = VisualOffset::new(1);
+        let before = layout
+            .caret(visual, CaretAffinity::Upstream)
+            .expect("caret");
+        let after = layout
+            .caret(visual, CaretAffinity::Downstream)
+            .expect("caret");
+        assert_eq!(before.point().x(), 1.0, "'a' 的后沿，也是盒子的左沿");
+        assert_eq!(after.point().x(), 4.0, "盒子的右沿，也是 'b' 的前沿");
+        assert_eq!(before.widget_affinity(), Some(CaretAffinity::Upstream));
+        assert_eq!(after.widget_affinity(), Some(CaretAffinity::Downstream));
+
+        // 点在盒子右半边要落到右沿，而且要说得出「落在右侧」——调用方光看
+        // 视觉偏移分不出是哪一沿。
+        let hit = layout.hit(LayoutPoint::new(3.5, 0.0)).expect("hit");
+        assert_eq!(hit.visual(), visual);
+        assert_eq!(hit.point().x(), 4.0);
+        assert_eq!(hit.widget_affinity(), Some(CaretAffinity::Downstream));
+    }
+
+    /// 整块就是一个 widget 时，两侧的位置仍然点得到。
+    ///
+    /// 一张图自成一段就是这个形状：视觉文本是空的，一个簇都没有。少了
+    /// widget 那两个候选位置，`hit` 会一路退到行首——点图片右边，光标跳到
+    /// 图片左边。
+    #[test]
+    fn a_line_holding_only_a_widget_is_still_hittable_on_both_sides() {
+        let table = Widgets {
+            entries: vec![(WidgetId(1), 6.0, 1.0, 1.0, true)],
+        };
+        let spans = [WidgetSpan::new(
+            VisualOffset::ZERO,
+            WidgetId(1),
+            WidgetSide::Before,
+        )];
+        let layout = build_widgets("", 80.0, &spans, &table).expect("布局");
+        assert_eq!(layout.clusters().len(), 0);
+        let right = layout.hit(LayoutPoint::new(5.0, 0.0)).expect("hit");
+        assert_eq!(right.point().x(), 6.0);
+        assert_eq!(right.widget_affinity(), Some(CaretAffinity::Downstream));
+        let left = layout.hit(LayoutPoint::new(1.0, 0.0)).expect("hit");
+        assert_eq!(left.point().x(), 0.0);
+        assert_eq!(left.widget_affinity(), Some(CaretAffinity::Upstream));
+    }
+
     /// widget 的基线必须落在盒子里。越界会让它挂到别的行上去。
     #[test]
     fn widget_baseline_must_lie_inside_the_box() {
@@ -3138,7 +3340,8 @@ mod tests {
         ] {
             let layout = build_with(text, width, BaseDirection::Auto);
             for line in layout.lines() {
-                for (x, offset) in layout.caret_positions(line) {
+                for position in layout.caret_positions(line) {
+                    let (x, offset) = (position.x, position.visual);
                     let hit = layout.hit(LayoutPoint::new(x, line.y())).expect("hit");
                     assert_eq!(
                         hit.point(),

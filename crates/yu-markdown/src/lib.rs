@@ -29,7 +29,7 @@ pub use block_sequence::{
 };
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
 pub use extension::{
-    BlockAnnotation, BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension,
+    BlockContext, BlockDecorations, BlockOrnament, BlockWidget, DelimitedSpan, Extension,
     ExtensionError, ExtensionOutput, ExtensionSet, ImageSpan, MarkerOrnament, SyntaxNode, reveals,
 };
 pub use inline::{

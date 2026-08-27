@@ -22,7 +22,7 @@ use yu_core::{
 use yu_decoration::Bias;
 use yu_markdown::{TableAlignment, TableBlock, TableCellRange};
 
-use yu_layout::{LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
+use yu_layout::{LayoutConfig, LayoutError, LayoutPoint, LayoutRect, WidgetBox};
 
 use crate::blockinput::BlockLayoutInput;
 use crate::blockview::shift_range;
@@ -401,6 +401,7 @@ impl TableLayout {
         table: &TableBlock,
         visual: &VisualText,
         input: &BlockLayoutInput,
+        widgets: &[WidgetBox],
         config: LayoutConfig,
         mut measure: F,
     ) -> Result<Self, LayoutError>
@@ -432,7 +433,7 @@ impl TableLayout {
             for (column, cell) in row.iter().copied().enumerate() {
                 let source_range = table_cell_range(cell)?;
                 let (cell_visual, content_width) =
-                    measure_cell_content(visual, input, source_range, &mut measure)?;
+                    measure_cell_content(visual, input, widgets, source_range, &mut measure)?;
                 if !content_width.is_finite() || content_width < 0.0 {
                     return Err(LayoutError::InvalidMetrics(content_width.to_bits()));
                 }
@@ -866,9 +867,14 @@ fn table_cell_range(range: TableCellRange) -> Result<TextRange, LayoutError> {
 ///
 /// 内容从**已经排好的样式段**里切：单元格的两端各问一次映射，落在这一段
 /// 里的样式段按视觉偏移裁一刀，就是这一格实际画出来的文字与它的字型。
+///
+/// 锚在这一段里的 widget 也算宽度。它在视觉字节流里不占位，样式段一个字节
+/// 都切不到它——不算的话，一格里只有一张图的那一列会被压成一条缝，而
+/// 图片照样按自己的宽度画出去，压在下一列上。
 fn measure_cell_content<F>(
     text: &VisualText,
     input: &BlockLayoutInput,
+    widgets: &[WidgetBox],
     source: TextRange,
     measure: &mut F,
 ) -> Result<(VisualRange, f32), LayoutError>
@@ -909,6 +915,11 @@ where
         )
         .ok_or(LayoutError::OffsetOverflow)?;
         width += measure(slice, shape_source, style)?;
+    }
+    for placed in widgets {
+        if visual.start() <= placed.visual() && placed.visual() <= visual.end() {
+            width += placed.bounds().width();
+        }
     }
     Ok((visual, width))
 }

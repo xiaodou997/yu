@@ -40,7 +40,7 @@
 use core::error::Error;
 use core::fmt;
 
-use yu_core::{ByteOffset, Revision, StyleId, TextAttrs, TextRange};
+use yu_core::{ByteOffset, Revision, StyleId, TextAttrs, TextRange, WidgetId, WidgetSide};
 use yu_decoration::{Decoration, DecorationRange, DecorationSet, LineStyleId, MergeError};
 use yu_syntax::{NodeKind, Tree};
 use yu_text::TextSnapshot;
@@ -337,24 +337,19 @@ impl MarkerOrnament {
     }
 }
 
-/// 还没 widget 化的语法留给上一层的语义标注。
+/// 一个视觉物件的语义，由 [`Decoration::Widget`] 的 [`WidgetId`] 指着。
 ///
-/// 第 3 节的对照表说图片终局是一个 block widget：那时它由
-/// [`Decoration::Widget`] 表达，被替代的 source 从视觉文本里消失，盒子尺寸
-/// 由 `WidgetRegistry` 给（§5.3）。在那之前 alt 文本仍然原样排在视觉文本
-/// 里，而画图片盒子的那一层需要知道「这一段是一张图、它的 alt 在哪」。
+/// 它与 [`BlockOrnament`] 是同一种东西的两条通道：都是「语义，不是几何」，
+/// 都由上一层翻译成排版参数。分开是因为它们在布局里的身份不同——
+/// [`BlockOrnament`] 描述**一段文字怎么排**（缩进、字号倍率），而 widget
+/// **不是文字**：它在视觉字节流里不占位，在行里占一个盒子，尺寸由
+/// `WidgetMeasure` 给（§5.3）。
 ///
-/// 那件事**装饰表达不了**：这里没有任何视觉效果被装饰改掉——不隐藏、不换
-/// 字型、不加行级样式。硬塞一条 [`Decoration::Widget`] 进去会让「这条装饰
-/// 改了什么」不再有统一答案（不变量 D1 说装饰是视觉表现的唯一来源，反过来
-/// 也意味着集合里的每一条都得真的改了点什么）。
-///
-/// 所以它单独走一条通道。表格不在这里——表格是块级的，走
-/// [`BlockOrnament::Table`]，因为 [`Decoration::Line`] 本来就是「作用于
-/// 整块」的那条。
+/// 盒子多大不在这里。图片的固有尺寸要等资源解码，那是 workspace 那一层的
+/// 事；这里只说「这一段是一张图，它的替代文字与目标各在哪」。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockAnnotation {
-    /// 一张图片。
+pub enum BlockWidget {
+    /// 一张图片。它替代掉整段 `![替代](目标)`。
     Image(ImageSpan),
 }
 
@@ -428,8 +423,8 @@ impl ImageSpan {
     }
 }
 
-impl BlockAnnotation {
-    /// 整条标注平移 `delta` 个字节。越界返回 `None`。
+impl BlockWidget {
+    /// 整个 widget 平移 `delta` 个字节。越界返回 `None`。
     #[must_use]
     fn shifted(self, delta: i64) -> Option<Self> {
         let Self::Image(image) = self;
@@ -465,7 +460,7 @@ pub struct ExtensionOutput {
     ranges: Vec<DecorationRange>,
     styles: Vec<TextAttrs>,
     line_styles: Vec<BlockOrnament>,
-    annotations: Vec<BlockAnnotation>,
+    widgets: Vec<BlockWidget>,
 }
 
 impl ExtensionOutput {
@@ -480,6 +475,19 @@ impl ExtensionOutput {
                 self.styles.len() - 1
             });
         StyleId(u32::try_from(index).unwrap_or(u32::MAX))
+    }
+
+    /// 登记一个视觉物件，拿到它的局部 id。相同的物件只占一个号。
+    pub fn widget(&mut self, widget: BlockWidget) -> WidgetId {
+        let index = self
+            .widgets
+            .iter()
+            .position(|existing| *existing == widget)
+            .unwrap_or_else(|| {
+                self.widgets.push(widget);
+                self.widgets.len() - 1
+            });
+        WidgetId(u32::try_from(index).unwrap_or(u32::MAX))
     }
 
     /// 登记一种行级装饰，拿到它的局部 id。
@@ -528,9 +536,15 @@ impl ExtensionOutput {
             .push(DecorationRange::new(range, Decoration::Line { style }));
     }
 
-    /// 记一条语义标注。它不进 [`DecorationSet`]，理由见 [`BlockAnnotation`]。
-    pub fn annotate(&mut self, annotation: BlockAnnotation) {
-        self.annotations.push(annotation);
+    /// 在这段 source 上放一个视觉物件。
+    ///
+    /// range 非空时被覆盖的 source 一并从视觉文本里消失（第 5.1 节），空
+    /// range 是纯插入，`side` 说它落在光标的哪一侧。
+    pub fn place_widget(&mut self, range: TextRange, widget: WidgetId, side: WidgetSide) {
+        self.ranges.push(DecorationRange::new(
+            range,
+            Decoration::Widget { widget, side },
+        ));
     }
 
     #[must_use]
@@ -539,16 +553,20 @@ impl ExtensionOutput {
     }
 
     /// 把局部 id 平移到全局 id 空间。
-    fn rebased(self, style_base: u32, line_style_base: u32) -> Vec<DecorationRange> {
+    fn rebased(self, base: IdBase) -> Vec<DecorationRange> {
         self.ranges
             .into_iter()
             .map(|mut entry| {
                 entry.decoration = match entry.decoration {
                     Decoration::Mark { style } => Decoration::Mark {
-                        style: StyleId(style.0.saturating_add(style_base)),
+                        style: StyleId(style.0.saturating_add(base.style)),
                     },
                     Decoration::Line { style } => Decoration::Line {
-                        style: LineStyleId(style.0.saturating_add(line_style_base)),
+                        style: LineStyleId(style.0.saturating_add(base.line_style)),
+                    },
+                    Decoration::Widget { widget, side } => Decoration::Widget {
+                        widget: WidgetId(widget.0.saturating_add(base.widget)),
+                        side,
                     },
                     other => other,
                 };
@@ -556,6 +574,16 @@ impl ExtensionOutput {
             })
             .collect()
     }
+}
+
+/// 一个 extension 的局部 id 在全局 id 空间里的起点。
+///
+/// 三张表各自独立编号，所以三个基址也各自独立。
+#[derive(Clone, Copy, Debug)]
+struct IdBase {
+    style: u32,
+    line_style: u32,
+    widget: u32,
 }
 
 /// 一种 Markdown 语法的装饰产出器。
@@ -577,7 +605,7 @@ pub struct BlockDecorations {
     set: DecorationSet,
     styles: Vec<TextAttrs>,
     line_styles: Vec<BlockOrnament>,
-    annotations: Vec<BlockAnnotation>,
+    widgets: Vec<BlockWidget>,
 }
 
 impl BlockDecorations {
@@ -615,6 +643,16 @@ impl BlockDecorations {
             .and_then(|index| self.line_styles.get(index))
     }
 
+    /// 查不到的 id 返回 `None`，理由同 [`BlockDecorations::attrs`]。布局层
+    /// 对同一件事报的是 `LayoutError::UnknownWidget`。
+    #[must_use]
+    pub fn widget(&self, widget: WidgetId) -> Option<BlockWidget> {
+        usize::try_from(widget.0)
+            .ok()
+            .and_then(|index| self.widgets.get(index))
+            .copied()
+    }
+
     /// 整张字型表。下标就是 [`StyleId`]。
     ///
     /// 装配层要把它整体翻成排版属性（标题还要给每一项乘上字号倍率），逐个
@@ -631,10 +669,10 @@ impl BlockDecorations {
         &self.line_styles
     }
 
-    /// 这个块上的语义标注，按 extension 的注册顺序、每家内部按 source 顺序。
+    /// 整张视觉物件表。下标就是 [`WidgetId`]。
     #[must_use]
-    pub fn annotations(&self) -> &[BlockAnnotation] {
-        &self.annotations
+    pub fn widgets(&self) -> &[BlockWidget] {
+        &self.widgets
     }
 
     /// 整份装饰平移 `delta` 个字节，绑到 `revision` 这一版源码上。
@@ -676,11 +714,11 @@ impl BlockDecorations {
                 .map(|ornament| ornament.shifted(delta))
                 .collect::<Option<Vec<_>>>()
                 .ok_or(ExtensionError::ShiftOutOfBounds)?,
-            annotations: self
-                .annotations
+            widgets: self
+                .widgets
                 .iter()
                 .copied()
-                .map(|annotation| annotation.shifted(delta))
+                .map(|widget| widget.shifted(delta))
                 .collect::<Option<Vec<_>>>()
                 .ok_or(ExtensionError::ShiftOutOfBounds)?,
         })
@@ -710,7 +748,7 @@ impl fmt::Debug for BlockDecorations {
             .field("decorations", &self.set.all())
             .field("styles", &self.styles)
             .field("line_styles", &self.line_styles)
-            .field("annotations", &self.annotations)
+            .field("widgets", &self.widgets)
             .finish()
     }
 }
@@ -830,14 +868,11 @@ impl ExtensionSet {
         let mut sets = Vec::with_capacity(self.extensions.len());
         let mut styles = Vec::new();
         let mut line_styles = Vec::new();
-        let mut annotations = Vec::new();
+        let mut widgets = Vec::new();
         let bounds = block.range();
         for extension in &self.extensions {
             let mut out = ExtensionOutput::default();
             extension.decorate(&cx, &mut out);
-            // 标注在装饰之前收：一个只产标注、不产装饰的 extension 下面那句
-            // `continue` 会把它整个跳过。
-            annotations.append(&mut out.annotations);
             // 兜底：装饰不得越出这个块。`BlockContext::nodes` 已经把块外的
             // 节点滤掉了，所以正常情况下这里一条都不该滤掉；留着它是因为
             // extension 也可以自己造区间（列表标记就是），而越界的后果是
@@ -848,16 +883,16 @@ impl ExtensionSet {
             if out.ranges.is_empty() {
                 continue;
             }
-            let style_base = u32::try_from(styles.len()).map_err(|_| ExtensionError::IdOverflow)?;
-            let line_style_base =
-                u32::try_from(line_styles.len()).map_err(|_| ExtensionError::IdOverflow)?;
+            let base = IdBase {
+                style: u32::try_from(styles.len()).map_err(|_| ExtensionError::IdOverflow)?,
+                line_style: u32::try_from(line_styles.len())
+                    .map_err(|_| ExtensionError::IdOverflow)?,
+                widget: u32::try_from(widgets.len()).map_err(|_| ExtensionError::IdOverflow)?,
+            };
             styles.extend(out.styles.iter().copied());
             line_styles.extend(out.line_styles.iter().cloned());
-            sets.push(DecorationSet::new(
-                revision,
-                source_len,
-                out.rebased(style_base, line_style_base),
-            ));
+            widgets.extend(out.widgets.iter().copied());
+            sets.push(DecorationSet::new(revision, source_len, out.rebased(base)));
         }
         let set = DecorationSet::merge(revision, source_len, sets.iter())?;
         Ok(BlockDecorations {
@@ -865,7 +900,7 @@ impl ExtensionSet {
             set,
             styles,
             line_styles,
-            annotations,
+            widgets,
         })
     }
 }
