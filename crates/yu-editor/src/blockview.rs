@@ -629,8 +629,21 @@ impl BlockView {
     ///
     /// 这里只决定**落在哪个视觉偏移上**；几何位置回头问
     /// [`BlockView::caret_for_visual`]。两处各写一遍规则，就会「光标画在
-    /// 一处、点击落在另一处」——不 panic、不报错，只是不听话。S5 在 bidi
-    /// 那一刀抓到过一次同样的毛病。
+    /// 一处、点击落在另一处」——不 panic、不报错，只是不听话。
+    ///
+    /// # 文字流那条路交给 `BlockLayout::hit`
+    ///
+    /// 它枚举这一行**所有 caret 位置**取离点击处最近的一个，用的是与
+    /// [`BlockLayout`] 画 caret 同一条规则。这里曾经自己按 x 从左到右扫簇、
+    /// 「过了中点算下一个」——那条规则默认 x 随逻辑顺序单调递增，**bidi
+    /// 重排之后不成立**：`abc مرحبا def` 里点在阿拉伯语段落上，光标会跳到
+    /// 十个像素以外的另一个位置。S5 登记过这一项，源码映射收敛成一套之后
+    /// 两条就能合流。
+    ///
+    /// 表格不走那条路：它的簇已经被搬进单元格了（见
+    /// [`BlockView::apply_table_geometry`]），文字流的 x 对不上网格的 x。
+    /// 表格那条与 [`BlockView::table_point_for_visual`] 配对，两处必须
+    /// 走同一份簇。
     pub fn hit_test(&self, point: LayoutPoint) -> Result<BlockHit, LayoutError> {
         if !point.is_finite() {
             return Err(LayoutError::InvalidPoint);
@@ -643,42 +656,60 @@ impl BlockView {
             return Ok(image.hit(point));
         }
         let line_index = self.line_for_y(point.y());
-        let line = &self.lines[line_index];
-        let mut visual = line.visual.start();
-        let mut bias = Bias::Before;
-
-        let content_start = self.content_start(line);
-        if point.x() > content_start {
-            let mut inside = false;
-            for index in line.clusters.clone() {
-                let cluster = self.clusters[index];
-                if cluster.line_break {
-                    continue;
-                }
-                if point.x() < cluster.x + cluster.width / 2.0 {
-                    visual = cluster.visual.start();
-                    bias = Bias::Before;
-                    inside = true;
-                    break;
-                }
-                visual = cluster.visual.end();
-                bias = Bias::After;
-            }
-            // 落在行末：那个位置是**这一行**的末尾，不是下一行的开头。
-            // 软换行处的两个位置分属 upstream 与 downstream（不变量 H5），
-            // 报成 downstream 会让光标画到下一行去。
-            if !inside && line_index + 1 < self.lines.len() {
-                visual = self.line_content_visual_end(line);
-                bias = Bias::Before;
-            }
-        }
-        // 反过来的同一件事：落在行首的那个位置属于**这一行**，不是上一行的
-        // 末尾。两条合起来才让 `hit` 与 `caret` 在软换行的两侧都对得上。
-        if line_index > 0 && visual == line.visual.start() {
-            bias = Bias::After;
-        }
+        let visual = if self.table.is_some() {
+            self.table_visual_for_point(line_index, point)
+        } else {
+            self.layout.hit(point)?.visual()
+        };
+        let bias = self.hit_bias(line_index, visual);
         let caret = self.caret_for_visual(visual, bias)?;
         Ok(BlockHit { caret, image: None })
+    }
+
+    /// 表格里的点落在哪个视觉偏移上：按网格里的簇从左往右扫。
+    ///
+    /// 表格是 LTR 网格，不重排，所以「过了中点算下一个」在这里成立。表格
+    /// 真正 widget 化之后这段会被 widget 内部的逐单元格命中测试取代。
+    fn table_visual_for_point(&self, line_index: usize, point: LayoutPoint) -> VisualOffset {
+        let line = &self.lines[line_index];
+        // 点在内容左边时循环第一轮就返回第一个簇的起点，而网格行的第一个簇
+        // 起点就是这一行的视觉起点（空单元格不占视觉字节），所以不需要单独
+        // 一条「落在行首」的分支——原来那条是从文字流那一路带过来的。
+        let mut visual = line.visual.start();
+        for index in line.clusters.clone() {
+            let cluster = self.clusters[index];
+            if cluster.line_break {
+                continue;
+            }
+            if point.x() < cluster.x + cluster.width / 2.0 {
+                return cluster.visual.start();
+            }
+            visual = cluster.visual.end();
+        }
+        visual
+    }
+
+    /// 落在软换行两侧的那个位置归哪一行（不变量 H5）。
+    ///
+    /// 行首那个位置属于**这一行**，不是上一行的末尾；行末那个位置属于这一
+    /// 行，不是下一行的开头。报错一边，光标就画到另一行去——不 panic、
+    /// 不报错，只是不听话。
+    ///
+    /// 只有最后一行的内容末尾之后才是 `After`：那里没有「下一行的行首」可
+    /// 以抢这个位置。空行没有内容末尾，留在 `Before`。
+    fn hit_bias(&self, line_index: usize, visual: VisualOffset) -> Bias {
+        let line = &self.lines[line_index];
+        if line_index > 0 && visual == line.visual.start() {
+            return Bias::After;
+        }
+        if line_index + 1 < self.lines.len() {
+            return Bias::Before;
+        }
+        if visual > line.visual.start() && visual == self.line_content_visual_end(line) {
+            Bias::After
+        } else {
+            Bias::Before
+        }
     }
 
     /// 会话内的表格列宽调整。canonical 源码与缓存布局都不动。
@@ -730,26 +761,6 @@ impl BlockView {
             place_images_in_table(&mut self.images, &table)?;
         }
         Ok(())
-    }
-
-    /// 一行内容的起点 x：点在它左边时 caret 停在这里。
-    ///
-    /// 它必须与 [`BlockView::point_for_visual`] 在行首给出的位置一致——
-    /// 两处各写一遍规则，就会「光标画在一处、点击落在另一处」。表格行的
-    /// 内容从单元格的 padding 之后开始，普通行从行级缩进之后开始。
-    fn content_start(&self, line: &BlockLine) -> f32 {
-        if self.table.is_some() {
-            return line
-                .clusters
-                .clone()
-                .map(|index| self.clusters[index])
-                .find(|cluster| !cluster.line_break)
-                .map_or(0.0, |cluster| cluster.x);
-        }
-        self.layout
-            .lines()
-            .get(line.index)
-            .map_or(0.0, yu_layout::LineBox::indent)
     }
 
     /// 一行里最后一个**文字**簇的视觉末尾。换行符不算内容。

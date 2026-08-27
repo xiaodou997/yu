@@ -47,6 +47,9 @@ const CORPUS: &[&str] = &[
     "text with `code` and **strong**\n",
     "中文 *强调* 混排\n",
     "one two three four five six seven eight nine\n",
+    "مرحبا بالعالم\n",
+    "abc مرحبا def\n",
+    "שלום *hello* עולם\n",
 ];
 
 const WIDTHS: &[f32] = &[12.0, 40.0, 160.0];
@@ -78,6 +81,24 @@ fn view(source: &str, width: f32) -> Option<BlockView> {
         )
         .expect("BlockView"),
     )
+}
+
+/// 一行里的簇是不是按 x 递增排的。
+///
+/// 文字流不保证（bidi 会重排），表格网格本该保证——列不重叠的时候。
+fn x_ascending(view: &BlockView, clusters: std::ops::Range<usize>) -> bool {
+    let mut previous = f32::NEG_INFINITY;
+    for index in clusters {
+        let cluster = view.clusters()[index];
+        if cluster.is_line_break() {
+            continue;
+        }
+        if cluster.x() < previous {
+            return false;
+        }
+        previous = cluster.x();
+    }
+    true
 }
 
 /// 派生出来的视觉文本必须与装饰投影说的一样长，样式区间必须无缝铺满它。
@@ -171,46 +192,242 @@ fn lines_tile_the_block_source() {
     }
 }
 
-/// caret 与 hit-test 说的是同一件事。
+/// **点一下，光标停在离手指最近的那个 caret 上。**
 ///
-/// 两处各写一遍规则，就会「点一下，光标跳到别处」——不 panic，不报错，
-/// 只是不听话。S5 在 bidi 那一刀抓到过一次同样的毛病。
+/// 这条曾经写成「`hit_test` 给的点等于 `caret_for_visual(hit.visual, hit.bias)`
+/// 给的点」——那是**自证的**：`hit_test` 的返回值本来就是拿后者算出来的，
+/// 比的是同一次计算的两遍读法。它全绿的时候 `hit_test` 在 bidi 行里最远能
+/// 差十个像素。
+///
+/// 真正的判据必须来自 `hit_test` **之外**：这一行上所有够得着的 caret 位置
+/// 里，没有哪个比它给的那个更靠近点击处。落差不 panic、不报错，只是点一下
+/// 光标跳到别处。
 #[test]
-fn hit_test_lands_on_a_caret_position() {
+fn hit_test_lands_on_the_nearest_caret() {
     for source in CORPUS {
         for width in WIDTHS {
             let Some(view) = view(source, *width) else {
                 continue;
             };
+            // 表格走的是另一条路（网格，不是文字流），而它现在过不了这一
+            // 条——登记在 overview 第 8 节 S6 的「还没做的」里。表格的命中
+            // 测试由下面那条弱一些的性质守着。
+            if view.table().is_some() {
+                continue;
+            }
             let at = format!("语料 {source:?} 宽度 {width}");
             for line in view.lines() {
                 let y = line.y() + line.height() * 0.5;
-                let mut xs = vec![0.0_f32, line.width(), line.width() + 3.0];
+                // 这一行上够得着的 caret 位置。取簇的两端而不是 `hit_test`
+                // 自己的输出——判据不能来自被测的那条路。
+                let mut carets: Vec<f32> = Vec::new();
                 for index in line.cluster_range() {
                     let cluster = view.clusters()[index];
-                    xs.push(cluster.x());
-                    xs.push(cluster.x() + cluster.width() * 0.25);
-                    xs.push(cluster.x() + cluster.width() * 0.75);
-                    xs.push(cluster.x() + cluster.width());
+                    for (visual, bias) in [
+                        (cluster.visual().start(), Bias::After),
+                        (cluster.visual().end(), Bias::Before),
+                    ] {
+                        if let Ok(caret) = view.caret_for_visual(visual, bias)
+                            && caret.line() == line.index()
+                        {
+                            carets.push(caret.point().x());
+                        }
+                    }
                 }
-                for x in xs {
-                    let point = LayoutPoint::new(x, y);
+                if carets.is_empty() {
+                    continue;
+                }
+
+                let mut probes = carets.clone();
+                probes.push(0.0);
+                probes.push(line.width());
+                probes.push(line.width() + 3.0);
+                for x in probes {
                     let hit = view
-                        .hit_test(point)
+                        .hit_test(LayoutPoint::new(x, y))
                         .unwrap_or_else(|error| panic!("{at} 的 hit: {error}"));
                     if hit.image().is_some() {
                         continue;
                     }
-                    let caret = view
-                        .caret_for_visual(hit.visual(), hit.bias())
-                        .unwrap_or_else(|error| panic!("{at} 的 caret: {error}"));
-                    assert_eq!(
-                        caret.point(),
-                        hit.point(),
-                        "{at} x={x} 的 hit 与 caret 对不上"
+                    let got = (hit.point().x() - x).abs();
+                    let nearest = carets
+                        .iter()
+                        .map(|caret| (caret - x).abs())
+                        .fold(f32::INFINITY, f32::min);
+                    assert!(
+                        got <= nearest + 0.001,
+                        "{at} 行 {} x={x}：光标停在 {}（差 {got}），\
+                         而最近的 caret 只差 {nearest}",
+                        line.index(),
+                        hit.point().x()
                     );
                 }
             }
+        }
+    }
+}
+
+/// 表格里点一下，光标停在**点到的那一行**上，而且落在那一行的视觉区间里。
+///
+/// 比不上上面那条「最近的 caret」——表格现在过不了它，理由见上面的注释与
+/// overview 的登记。这一条压的是不会跑到别的行去、不会给出这一行以外的
+/// 偏移；那两样错了就是「点第三行选中了第一行」。
+#[test]
+fn a_table_hit_stays_on_the_row_it_landed_in() {
+    for source in CORPUS {
+        for width in WIDTHS {
+            let Some(view) = view(source, *width) else {
+                continue;
+            };
+            if view.table().is_none() {
+                continue;
+            }
+            let at = format!("语料 {source:?} 宽度 {width}");
+            for line in view.lines() {
+                let y = line.y() + line.height() * 0.5;
+                for x in [
+                    0.0_f32,
+                    line.width() * 0.5,
+                    line.width(),
+                    line.width() + 3.0,
+                ] {
+                    let hit = view
+                        .hit_test(LayoutPoint::new(x, y))
+                        .unwrap_or_else(|error| panic!("{at} 的 hit: {error}"));
+                    if hit.image().is_some() {
+                        continue;
+                    }
+                    assert_eq!(
+                        hit.line(),
+                        line.index(),
+                        "{at} 在第 {} 行 x={x} 点击，光标跑到了第 {} 行",
+                        line.index(),
+                        hit.line()
+                    );
+                    assert!(
+                        hit.visual() >= line.visual().start()
+                            && hit.visual() <= line.visual().end(),
+                        "{at} 第 {} 行 x={x} 的偏移 {:?} 不在这一行的视觉区间 {:?} 里",
+                        line.index(),
+                        hit.visual(),
+                        line.visual()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 点在一个字的左半边，光标停在它**前面**。
+///
+/// 表格那一路仍然是「过了中点算下一个」的按 x 扫描——这一条把那句话钉住。
+/// 只断左半边：右半边落在单元格的最后一个字上时会跨到下一格去，那是表格几何
+/// 的事，见上面登记的那一条。
+#[test]
+fn a_click_on_the_left_half_of_a_glyph_lands_before_it() {
+    for source in CORPUS {
+        for width in WIDTHS {
+            let Some(view) = view(source, *width) else {
+                continue;
+            };
+            if view.table().is_none() {
+                continue;
+            }
+            let at = format!("语料 {source:?} 宽度 {width}");
+            for line in view.lines() {
+                // 按 x 扫描的前提是一行里的簇 x 递增。窄到放不下的表格里列会
+                // 重叠，前提不成立——那一条登记在 overview 第 8 节 S6 的
+                // 「还没做的」里，随 widget 化一起解决。
+                if !x_ascending(&view, line.cluster_range()) {
+                    continue;
+                }
+                let y = line.y() + line.height() * 0.5;
+                for index in line.cluster_range() {
+                    let cluster = view.clusters()[index];
+                    if cluster.is_line_break() || cluster.width() <= 0.0 {
+                        continue;
+                    }
+                    let x = cluster.x() + cluster.width() * 0.25;
+                    let hit = view
+                        .hit_test(LayoutPoint::new(x, y))
+                        .unwrap_or_else(|error| panic!("{at} 的 hit: {error}"));
+                    if hit.image().is_some() {
+                        continue;
+                    }
+                    assert_eq!(
+                        hit.visual(),
+                        cluster.visual().start(),
+                        "{at} 点在簇 {index}（x={}，宽 {}）的左四分之一处，\
+                         光标却停在 {:?}",
+                        cluster.x(),
+                        cluster.width(),
+                        hit.visual()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 点在图片盒子里，命中的是那张图，不是它下面的 alt 文本。
+///
+/// 图片还没 widget 化，alt 文本仍然排在视觉文本里、图片盒子画在它上面。
+/// 少了这一条优先级，点图片会变成在 alt 文本里放光标——不报错，只是点不动图。
+#[test]
+fn a_click_inside_an_image_hits_the_image() {
+    for source in ["![alt text](/img.png)\n", "before ![alt](/i.png) after\n"] {
+        for width in WIDTHS {
+            let Some(view) = view(source, *width) else {
+                continue;
+            };
+            let at = format!("语料 {source:?} 宽度 {width}");
+            assert!(!view.images().is_empty(), "{at} 应该有图片盒子");
+            for image in view.images() {
+                let bounds = image.bounds();
+                let point = LayoutPoint::new(
+                    bounds.x() + bounds.width() * 0.5,
+                    bounds.y() + bounds.height() * 0.5,
+                );
+                let hit = view
+                    .hit_test(point)
+                    .unwrap_or_else(|error| panic!("{at} 的 hit: {error}"));
+                assert!(
+                    hit.image().is_some(),
+                    "{at} 点在图片盒子正中，命中的却不是图片"
+                );
+            }
+        }
+    }
+}
+
+/// 整块都被藏起来时，点它落在**块首**。
+///
+/// 空的围栏代码块（```` ```\n``` ````）视觉上什么都没有：两条围栏都藏了。
+/// 落在块首意味着光标还在这个块里；落在块尾就是下一个块的开头，点这个块会
+/// 选中下一个——不 panic、不报错，只是点不进去。
+///
+/// 这一条钉的是**现状**：块首不见得是最理想的答案（真正「在代码块里面」是
+/// 两条围栏之间），但块尾一定更差。改它是另一件事。
+#[test]
+fn a_fully_hidden_block_is_hit_at_its_start() {
+    let source = "```\n```\n";
+    for width in WIDTHS {
+        let Some(view) = view(source, *width) else {
+            continue;
+        };
+        let block = view.source_range();
+        for x in [0.0_f32, 4.0, 40.0] {
+            let hit = view
+                .hit_test(LayoutPoint::new(x, 1.0))
+                .expect("空围栏块的 hit");
+            assert_eq!(
+                hit.source(),
+                block.start(),
+                "宽度 {width} x={x}：点空围栏块落在了 {}，而块是 {}..{}",
+                hit.source().get(),
+                block.start().get(),
+                block.end().get()
+            );
         }
     }
 }
