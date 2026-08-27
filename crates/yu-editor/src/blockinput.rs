@@ -218,6 +218,14 @@ pub struct BlockLayoutInput {
     text: String,
     runs: Vec<StyledRun>,
     widgets: Vec<WidgetSpan>,
+    /// 每个 widget 覆盖的那段 source，与 `widgets` 同序、等长。
+    ///
+    /// 布局层不要它（不变量 E1：那一层不认识源码坐标），**分派 widget 的
+    /// 人要**：widget 的视觉锚点是它覆盖的 source 塌下去的那**一个点**，而
+    /// 表格里相邻两格的视觉区间首尾相接——同一个点同时是上一格的末尾、
+    /// 下一格的开头，还可能是中间某个空格子的起止。按视觉偏移分派会让一张
+    /// 图被好几个格子同时认领，画好几遍。归属只有 source 说得清。
+    widget_sources: Vec<TextRange>,
     lines: Vec<LineSpan>,
     styles: BlockStyleTable,
     line_styles: BlockLineStyleTable,
@@ -282,6 +290,67 @@ impl BlockLayoutInput {
         &self.widgets
     }
 
+    /// 覆盖的 source 落在 `source` 里的那些 widget。
+    ///
+    /// 按 source 分派而不是按视觉锚点，理由见 [`BlockLayoutInput`] 的
+    /// `widget_sources` 字段。
+    pub(crate) fn widgets_in(&self, source: TextRange) -> impl Iterator<Item = WidgetSpan> + '_ {
+        self.widgets
+            .iter()
+            .zip(self.widget_sources.iter())
+            .filter(move |(_, covered)| {
+                covered.start() >= source.start() && covered.end() <= source.end()
+            })
+            .map(|(widget, _)| *widget)
+    }
+
+    /// 切出一段视觉区间，做成一份**零基**的排版输入。
+    ///
+    /// 表格的单元格用它：每一格按自己那一列的宽度排一次，而 [`BlockLayout`]
+    /// 排的是一条从零开始的视觉字节流。此前表格是把整块排成一条线性流、再
+    /// 把簇搬进格子——那条流按整块宽度断行，格子里放不下的内容不会重排，
+    /// 于是后一列的内容压在前一列上。
+    ///
+    /// # Errors
+    ///
+    /// 区间越界或落在字符中间。
+    pub(crate) fn slice(
+        &self,
+        visual: VisualRange,
+        source: TextRange,
+    ) -> Result<BlockLayoutSlice, LayoutError> {
+        let (from, to) = (
+            usize::try_from(visual.start().get()).map_err(|_| LayoutError::OffsetOverflow)?,
+            usize::try_from(visual.end().get()).map_err(|_| LayoutError::OffsetOverflow)?,
+        );
+        let text = self
+            .text
+            .get(from..to)
+            .ok_or(LayoutError::RunNotOnCharBoundary)?
+            .to_owned();
+        let rebase = |offset: VisualOffset| -> VisualOffset {
+            VisualOffset::new(offset.get().saturating_sub(visual.start().get()))
+        };
+        let mut runs = Vec::new();
+        for run in &self.runs {
+            let start = run.visual().start().max(visual.start());
+            let end = run.visual().end().min(visual.end());
+            if start >= end {
+                continue;
+            }
+            push_run(&mut runs, rebase(start), rebase(end), run.style())?;
+        }
+        let widgets = self
+            .widgets_in(source)
+            .map(|widget| WidgetSpan::new(rebase(widget.visual()), widget.widget(), widget.side()))
+            .collect();
+        Ok(BlockLayoutSlice {
+            text,
+            runs,
+            widgets,
+        })
+    }
+
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
@@ -300,6 +369,21 @@ impl BlockLayoutInput {
     #[must_use]
     pub const fn ornaments(&self) -> &BlockOrnaments {
         &self.ornaments
+    }
+}
+
+/// [`BlockLayoutInput`] 的一段，视觉偏移从零开始。
+///
+/// 它拥有自己的文本，所以借出去的 [`LayoutInput`] 与它同生命周期。
+pub(crate) struct BlockLayoutSlice {
+    text: String,
+    runs: Vec<StyledRun>,
+    widgets: Vec<WidgetSpan>,
+}
+
+impl BlockLayoutSlice {
+    pub(crate) fn layout_input(&self) -> LayoutInput<'_> {
+        LayoutInput::new(&self.text, &self.runs).with_widgets(&self.widgets)
     }
 }
 
@@ -448,6 +532,7 @@ struct DecorationDraft {
     text: String,
     runs: Vec<StyledRun>,
     widgets: Vec<WidgetSpan>,
+    widget_sources: Vec<TextRange>,
     styles: Vec<TextAttrs>,
     source_range: TextRange,
     heading: Option<u8>,
@@ -507,6 +592,7 @@ impl DecorationDraft {
         // source 塌下去的那个视觉偏移。两端问同一个映射会得到同一个数，
         // 取起点。
         let mut widgets = Vec::new();
+        let mut widget_sources = Vec::new();
         for entry in decorations.set().all() {
             let Decoration::Widget { widget, side } = entry.decoration else {
                 continue;
@@ -516,6 +602,7 @@ impl DecorationDraft {
                 widget,
                 side,
             ));
+            widget_sources.push(entry.range);
         }
 
         let (runs, widgets) = match visual.composition_visual() {
@@ -552,6 +639,7 @@ impl DecorationDraft {
             text: visual.text().to_owned(),
             runs,
             widgets,
+            widget_sources,
             styles,
             source_range: bounds,
             heading,
@@ -607,6 +695,7 @@ impl DecorationDraft {
             text: self.text,
             runs: self.runs,
             widgets: self.widgets,
+            widget_sources: self.widget_sources,
             lines: vec![LineSpan::new(visual, BLOCK_LINE_STYLE)],
             styles: BlockStyleTable { attrs },
             line_styles: BlockLineStyleTable {
