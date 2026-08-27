@@ -15,13 +15,12 @@
 //!
 //! [`WidgetBox`]: yu_layout::WidgetBox
 
-use yu_core::{TextRange, VisualRange};
+use yu_core::{TextRange, VisualOffset, VisualRange};
 use yu_decoration::Bias;
 use yu_layout::{LayoutError, LayoutPoint, LayoutRect};
 use yu_markdown::BlockWidget;
 
 use crate::blockview::{BlockHit, BlockView, shift_range};
-use crate::geometry::source_range_contains;
 use crate::table::TableLayout;
 
 /// 一张图片占的位置。
@@ -130,29 +129,44 @@ pub(crate) fn build_image_placements(view: &BlockView) -> Result<Vec<ImagePlacem
     Ok(placements)
 }
 
-/// 表格块里的图片跟着单元格走。
-pub(crate) fn place_images_in_table(
-    images: &mut [ImagePlacement],
+/// 表格块里的图片盒子来自**格内**的那一份布局。
+///
+/// 此前是排完之后把文字流里的盒子按源码区间挪进格子、再按格宽裁一刀。
+/// 现在每一格自己排一次，widget 在格内就按那一列的宽度量过了——盒子不需要
+/// 事后裁，位置也不需要事后挪。
+pub(crate) fn build_table_image_placements(
+    view: &BlockView,
     table: &TableLayout,
-) -> Result<(), LayoutError> {
-    for image in images {
-        let Some(cell) = table
-            .cells()
-            .iter()
-            .copied()
-            .find(|cell| source_range_contains(cell.source(), image.source))
-        else {
-            continue;
+) -> Result<Vec<ImagePlacement>, LayoutError> {
+    let decorations = view.decorations();
+    let mut placements = Vec::new();
+    for (index, cell) in table.cells().iter().copied().enumerate() {
+        let Some(layout) = table.cell_layouts().get(index) else {
+            return Err(LayoutError::Upstream("table cell has no layout".into()));
         };
-        let available = (cell.bounds().x() + cell.bounds().width() - cell.content_x()).max(1.0);
-        let width = image.bounds.width().min(available).max(1.0);
-        image.line = cell.row();
-        image.bounds = LayoutRect::new(
-            cell.content_x(),
-            cell.bounds().y(),
-            width,
-            image.bounds.height().min(cell.bounds().height()),
-        )?;
+        for placed in layout.widgets() {
+            let Some(BlockWidget::Image(image)) = decorations.widget(placed.widget()) else {
+                return Err(LayoutError::UnknownWidget(placed.widget()));
+            };
+            let visual = VisualOffset::new(
+                placed
+                    .visual()
+                    .get()
+                    .saturating_add(cell.visual().start().get()),
+            );
+            placements.push(ImagePlacement {
+                source: image.source(),
+                label: image.label(),
+                visual: VisualRange::empty(visual),
+                line: cell.row(),
+                bounds: LayoutRect::new(
+                    cell.content_x() + placed.bounds().x(),
+                    cell.bounds().y() + placed.bounds().y(),
+                    placed.bounds().width(),
+                    placed.bounds().height(),
+                )?,
+            });
+        }
     }
-    Ok(())
+    Ok(placements)
 }

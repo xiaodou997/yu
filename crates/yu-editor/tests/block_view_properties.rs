@@ -83,27 +83,6 @@ fn view(source: &str, width: f32) -> Option<BlockView> {
     )
 }
 
-/// 一行里的簇是不是按 x 递增排的。
-///
-/// 文字流不保证（bidi 会重排），表格网格本该保证——列不重叠的时候。
-fn x_ascending(view: &BlockView, clusters: std::ops::Range<usize>) -> bool {
-    let mut previous = f32::NEG_INFINITY;
-    for index in clusters {
-        let cluster = view.clusters()[index];
-        if cluster.is_line_break() {
-            continue;
-        }
-        if cluster.x() < previous {
-            return false;
-        }
-        previous = cluster.x();
-    }
-    true
-}
-
-/// 派生出来的视觉文本必须与装饰投影说的一样长，样式区间必须无缝铺满它。
-///
-/// 漏掉半段会画出少了几个字的一行，既不 panic 也不报错。
 #[test]
 fn the_derived_input_tiles_the_visual_text() {
     let config = LayoutConfig::new(160.0, 10.0).with_default_advance(2.0);
@@ -209,9 +188,11 @@ fn hit_test_lands_on_the_nearest_caret() {
             let Some(view) = view(source, *width) else {
                 continue;
             };
-            // 表格走的是另一条路（网格，不是文字流），而它现在过不了这一
-            // 条——登记在 overview 第 8 节 S6 的「还没做的」里。表格的命中
-            // 测试由下面那条弱一些的性质守着。
+            // 表格不走这一条。一条 `BlockLine` 在表格里是一个**网格行**，
+            // 上面的 caret 位置分处几个格子、几个 y；「这一行上最近的
+            // caret」在那里不是对的判据——点在第二列，欧氏距离可能把它判给
+            // 第一列里换行后更靠近的那个位置，而正确答案是留在第二列。
+            // 表格由下面那条按**格**算的性质守着，严格程度一样。
             if view.table().is_some() {
                 continue;
             }
@@ -220,7 +201,7 @@ fn hit_test_lands_on_the_nearest_caret() {
                 let y = line.y() + line.height() * 0.5;
                 // 这一行上够得着的 caret 位置。取簇的两端而不是 `hit_test`
                 // 自己的输出——判据不能来自被测的那条路。
-                let mut carets: Vec<f32> = Vec::new();
+                let mut carets: Vec<LayoutPoint> = Vec::new();
                 for index in line.cluster_range() {
                     let cluster = view.clusters()[index];
                     for (visual, bias) in [
@@ -230,7 +211,7 @@ fn hit_test_lands_on_the_nearest_caret() {
                         if let Ok(caret) = view.caret_for_visual(visual, bias)
                             && caret.line() == line.index()
                         {
-                            carets.push(caret.point().x());
+                            carets.push(caret.point());
                         }
                     }
                 }
@@ -238,7 +219,7 @@ fn hit_test_lands_on_the_nearest_caret() {
                     continue;
                 }
 
-                let mut probes = carets.clone();
+                let mut probes: Vec<f32> = carets.iter().map(|caret| caret.x()).collect();
                 probes.push(0.0);
                 probes.push(line.width());
                 probes.push(line.width() + 3.0);
@@ -252,7 +233,7 @@ fn hit_test_lands_on_the_nearest_caret() {
                     let got = (hit.point().x() - x).abs();
                     let nearest = carets
                         .iter()
-                        .map(|caret| (caret - x).abs())
+                        .map(|caret| (caret.x() - x).abs())
                         .fold(f32::INFINITY, f32::min);
                     assert!(
                         got <= nearest + 0.001,
@@ -267,62 +248,108 @@ fn hit_test_lands_on_the_nearest_caret() {
     }
 }
 
-/// 表格里点一下，光标停在**点到的那一行**上，而且落在那一行的视觉区间里。
+/// 表格里点一下，光标停在**点到的那一格**里离点击处最近的 caret 上。
 ///
-/// 比不上上面那条「最近的 caret」——表格现在过不了它，理由见上面的注释与
-/// overview 的登记。这一条压的是不会跑到别的行去、不会给出这一行以外的
-/// 偏移；那两样错了就是「点第三行选中了第一行」。
+/// 与文字流那条是同一句话，只是定义域从「一行」换成「一格」——表格的一行
+/// 是一个网格行，上面的位置分处几个格子。此前这里只压得住「不跑到别的行
+/// 去」，因为每一格没有自己的布局，命中走的是一段手写的按 x 扫描。现在
+/// 每一格有自己的 `BlockLayout`，命中就是它的 `hit`。
 #[test]
-fn a_table_hit_stays_on_the_row_it_landed_in() {
+fn a_table_hit_lands_on_the_nearest_caret_inside_its_cell() {
+    let mut checked = 0_usize;
     for source in CORPUS {
         for width in WIDTHS {
             let Some(view) = view(source, *width) else {
                 continue;
             };
-            if view.table().is_none() {
+            let Some(table) = view.table() else {
                 continue;
-            }
+            };
             let at = format!("语料 {source:?} 宽度 {width}");
-            for line in view.lines() {
-                let y = line.y() + line.height() * 0.5;
-                for x in [
-                    0.0_f32,
-                    line.width() * 0.5,
-                    line.width(),
-                    line.width() + 3.0,
+            for cell in table.cells() {
+                // 这一格里够得着的 caret 位置。判据来自簇的两端经
+                // `caret_for_visual`，与被测的 `hit_test` 无关。
+                let mut carets: Vec<LayoutPoint> = Vec::new();
+                for cluster in view.clusters() {
+                    if cluster.source().start() < cell.source().start()
+                        || cluster.source().end() > cell.source().end()
+                    {
+                        continue;
+                    }
+                    for (visual, bias) in [
+                        (cluster.visual().start(), Bias::After),
+                        (cluster.visual().end(), Bias::Before),
+                    ] {
+                        if let Ok(caret) = view.caret_for_visual(visual, bias) {
+                            carets.push(caret.point());
+                        }
+                    }
+                }
+                if carets.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                let bounds = cell.bounds();
+                let mut probes: Vec<LayoutPoint> = carets.clone();
+                for (x, y) in [
+                    (bounds.x() + 0.1, bounds.y() + 0.1),
+                    (
+                        bounds.x() + bounds.width() * 0.5,
+                        bounds.y() + bounds.height() * 0.5,
+                    ),
+                    (
+                        bounds.x() + bounds.width() - 0.1,
+                        bounds.y() + bounds.height() - 0.1,
+                    ),
                 ] {
+                    probes.push(LayoutPoint::new(x, y));
+                }
+                for probe in probes {
+                    // 探针夹回这一格里：格外的点归别的格，那是另一条性质。
+                    let point = LayoutPoint::new(
+                        probe
+                            .x()
+                            .clamp(bounds.x() + 0.1, bounds.x() + bounds.width() - 0.1),
+                        probe
+                            .y()
+                            .clamp(bounds.y() + 0.1, bounds.y() + bounds.height() - 0.1),
+                    );
                     let hit = view
-                        .hit_test(LayoutPoint::new(x, y))
+                        .hit_test(point)
                         .unwrap_or_else(|error| panic!("{at} 的 hit: {error}"));
                     if hit.image().is_some() {
                         continue;
                     }
-                    assert_eq!(
-                        hit.line(),
-                        line.index(),
-                        "{at} 在第 {} 行 x={x} 点击，光标跑到了第 {} 行",
-                        line.index(),
-                        hit.line()
-                    );
+                    let distance = |caret: LayoutPoint| {
+                        ((caret.x() - point.x()).powi(2) + (caret.y() - point.y()).powi(2)).sqrt()
+                    };
+                    let got = distance(hit.point());
+                    let nearest = carets
+                        .iter()
+                        .copied()
+                        .map(distance)
+                        .fold(f32::INFINITY, f32::min);
                     assert!(
-                        hit.visual() >= line.visual().start()
-                            && hit.visual() <= line.visual().end(),
-                        "{at} 第 {} 行 x={x} 的偏移 {:?} 不在这一行的视觉区间 {:?} 里",
-                        line.index(),
-                        hit.visual(),
-                        line.visual()
+                        got <= nearest + 0.001,
+                        "{at} 第 {} 行第 {} 列，点 ({}, {})：光标停在 {:?}（差 {got}），\
+                         而这一格里最近的 caret 只差 {nearest}",
+                        cell.row(),
+                        cell.column(),
+                        point.x(),
+                        point.y(),
+                        hit.point()
                     );
                 }
             }
         }
     }
+    assert!(checked > 0, "语料里要有表格单元格才算压住了什么");
 }
 
 /// 点在一个字的左半边，光标停在它**前面**。
 ///
-/// 表格那一路仍然是「过了中点算下一个」的按 x 扫描——这一条把那句话钉住。
-/// 只断左半边：右半边落在单元格的最后一个字上时会跨到下一格去，那是表格几何
-/// 的事，见上面登记的那一条。
+/// 只断左半边：右半边落在一格的最后一个字上时，「下一个位置」是下一格的
+/// 开头——那是对的，但它不再是这一格里的位置，这条断言说不了。
 #[test]
 fn a_click_on_the_left_half_of_a_glyph_lands_before_it() {
     for source in CORPUS {
@@ -335,18 +362,16 @@ fn a_click_on_the_left_half_of_a_glyph_lands_before_it() {
             }
             let at = format!("语料 {source:?} 宽度 {width}");
             for line in view.lines() {
-                // 按 x 扫描的前提是一行里的簇 x 递增。窄到放不下的表格里列会
-                // 重叠，前提不成立——那一条登记在 overview 第 8 节 S6 的
-                // 「还没做的」里，随 widget 化一起解决。
-                if !x_ascending(&view, line.cluster_range()) {
-                    continue;
-                }
-                let y = line.y() + line.height() * 0.5;
+                // 探针的 y 取**这个簇自己那一行**，不是网格行的中线：格子里
+                // 的内容会换行，网格行的中线可能落在另一行文字上。此前这里
+                // 靠「一行里的簇 x 递增」跳过窄表格——列重叠时那个前提不
+                // 成立——而列重叠正是这一刀修掉的东西，跳过等于不压。
                 for index in line.cluster_range() {
                     let cluster = view.clusters()[index];
                     if cluster.is_line_break() || cluster.width() <= 0.0 {
                         continue;
                     }
+                    let y = cluster.y() + view.config().line_height() * 0.5;
                     let x = cluster.x() + cluster.width() * 0.25;
                     let hit = view
                         .hit_test(LayoutPoint::new(x, y))
@@ -739,5 +764,48 @@ fn a_preedit_pushes_a_later_image_anchor_along() {
         view.layout().widgets()[0].visual().get(),
         anchor.get() + 1,
         "preedit 长了一个字节，它后面的 widget 锚点也要挪一个字节"
+    );
+}
+
+/// 表格格子里的图片要排出一个落在**那一格**里的盒子。
+///
+/// 上面那条只压得住「列被撑宽了」——它走的是 `measure_cell_content`，直接
+/// 读整块的 widget 锚点，不经过格子的切片。切片忘了带 widget 的话列照样撑
+/// 宽，而格内一张图都排不出来：`images()` 是空的，图整个不画，不报错。
+#[test]
+fn an_image_in_a_cell_gets_a_box_inside_that_cell() {
+    let buffer = TextBuffer::new("| a | ![i](/x.png) |\n| --- | --- |\n| 1 | 2 |\n".to_owned());
+    let snapshot = buffer.snapshot();
+    let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
+    let view = BlockView::build(
+        &visual,
+        &decorations,
+        LayoutConfig::new(400.0, LINE_HEIGHT),
+        &MonospaceMetrics::new(1.0),
+    )
+    .expect("排版");
+    let table = view.table().expect("这个块是一张表");
+    assert_eq!(view.images().len(), 1, "格子里那张图要有盒子");
+
+    let placement = view.images()[0];
+    let cell = table
+        .cells()
+        .iter()
+        .copied()
+        .find(|cell| {
+            cell.source().start() <= placement.source().start()
+                && placement.source().end() <= cell.source().end()
+        })
+        .expect("盒子要属于某一格");
+    let (bounds, cell_bounds) = (placement.bounds(), cell.bounds());
+    assert!(
+        bounds.x() >= cell_bounds.x() - 0.001
+            && bounds.x() + bounds.width() <= cell_bounds.x() + cell_bounds.width() + 0.001,
+        "图片盒子 {bounds:?} 横向越出了单元格 {cell_bounds:?}"
+    );
+    assert!(
+        bounds.y() >= cell_bounds.y() - 0.001
+            && bounds.y() + bounds.height() <= cell_bounds.y() + cell_bounds.height() + 0.001,
+        "图片盒子 {bounds:?} 纵向越出了单元格 {cell_bounds:?}"
     );
 }

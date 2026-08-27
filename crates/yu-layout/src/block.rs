@@ -708,6 +708,7 @@ pub struct CaretBox {
     line: usize,
     point: LayoutPoint,
     widget_affinity: Option<CaretAffinity>,
+    line_affinity: CaretAffinity,
 }
 
 impl CaretBox {
@@ -738,6 +739,16 @@ impl CaretBox {
     #[must_use]
     pub const fn widget_affinity(self) -> Option<CaretAffinity> {
         self.widget_affinity
+    }
+
+    /// 让 [`BlockLayout::caret`] 落回**这一行**的那个 affinity。
+    ///
+    /// 软换行边界上的一个视觉偏移在两行各有一个位置，`caret` 靠 affinity
+    /// 选。[`BlockLayout::hit`] 已经决定了是哪一行，把这个值带出来，调用方
+    /// 才不用再猜一遍——猜错就是「点第二行，光标画在第一行末尾」。
+    #[must_use]
+    pub const fn line_affinity(self) -> CaretAffinity {
+        self.line_affinity
     }
 }
 
@@ -1210,6 +1221,7 @@ impl BlockLayout {
                 line: line_index,
                 point: LayoutPoint::new(x, line.bounds.y()),
                 widget_affinity: Some(affinity),
+                line_affinity: affinity,
             });
         }
         let x = match (before, after, inside) {
@@ -1221,6 +1233,7 @@ impl BlockLayout {
             line: line_index,
             point: LayoutPoint::new(x, line.bounds.y()),
             widget_affinity: None,
+            line_affinity: affinity,
         })
     }
 
@@ -1285,11 +1298,20 @@ impl BlockLayout {
             },
             |(_, position)| position,
         );
+        // 让 `caret` 落回**这一行**的那个 affinity。软换行边界上的偏移在
+        // 两行各有一个位置，而 `hit` 已经按 y 决定了是哪一行。
+        let line_affinity =
+            if self.line_for_visual(position.visual, CaretAffinity::Upstream) == line_index {
+                CaretAffinity::Upstream
+            } else {
+                CaretAffinity::Downstream
+            };
         Ok(CaretBox {
             visual: position.visual,
             line: line_index,
             point: LayoutPoint::new(position.x, line.bounds.y()),
             widget_affinity: position.widget_affinity,
+            line_affinity,
         })
     }
 

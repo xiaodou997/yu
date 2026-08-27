@@ -1611,7 +1611,10 @@ fn table_resize_accessibility_metadata(
         return Err(YU_STORAGE_INVALID_SELECTION);
     }
     // 大约半个行高，并夹在 8–16 之间：一次调整要看得见，但不能一步跳过整列。
-    let adjust_step = (table.row_height() * 0.5).clamp(8.0, 16.0);
+    // 行高不是常数（格内换行会撑高一行），取表头那一行——它是最稳定的那个，
+    // 而这里要的只是一个手感常数，不是几何。
+    let row_height = table.rows().first().map_or(0.0, |row| row.height());
+    let adjust_step = (row_height * 0.5).clamp(8.0, 16.0);
     let divider_count = table.column_widths().len().saturating_sub(1);
     let mut x = bounds.x();
     let mut dividers = Vec::with_capacity(divider_count);

@@ -195,21 +195,18 @@ fn append_table_ornaments(
         OrnamentRole::Border,
     ));
 
-    let mut y = 0.0_f32;
-    let row_count = table
-        .cells()
-        .iter()
-        .map(|cell| cell.row())
-        .max()
-        .map_or(0, |row| row.saturating_add(1));
-    for _ in 0..row_count {
+    // 行高不是常数：一格里的内容换行之后那一行更高，横线要按每一行自己的
+    // 上沿画。按 `行号 × 常数行高` 画的话，越往下越对不上格子。
+    for row in table.rows() {
         ornaments.push(OrnamentPrimitive::new(
             table_source,
-            translate_block_rect(LayoutRect::new(0.0, y, total_width, thickness_y)?, origin)?,
+            translate_block_rect(
+                LayoutRect::new(0.0, row.y(), total_width, thickness_y)?,
+                origin,
+            )?,
             style.border_color,
             OrnamentRole::Border,
         ));
-        y += table.row_height();
     }
     ornaments.push(OrnamentPrimitive::new(
         table_source,
@@ -2535,6 +2532,84 @@ mod tests {
         }));
         assert_eq!(frame.plan().embedded_uploads().len(), 1);
         assert_eq!(frame.plan().embedded_uploads()[0].source(), source_range);
+    }
+
+    /// 网格的横线画在**每一行自己的上沿**，不是按常数行高等距排。
+    ///
+    /// 行高不是常数：一格里的内容换行之后那一行更高。按 `行号 × 常数行高`
+    /// 画的话，越往下横线与格子错得越开——不 panic、不报错，只是画歪。
+    #[test]
+    fn table_grid_lines_follow_each_row_top() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 400.0);
+        // 中间那一行的一格长到必须换行，于是它比上下两行都高。**要三行**：
+        // 只有两行时，第一行的高度恰好等于到第二行的间距，「按第一行的高度
+        // 等距画」与「按每行自己的上沿画」画出来一样，压不住。
+        let mut document = EditorDocument::new(
+            "| a | b |\n| --- | --- |\n| 这一格的内容长到必须换行才放得下 | x |\n| c | d |\n",
+        );
+        // 宽度窄到列必须压缩：压缩之后长的那一格放不下，只能换行。
+        let config = LayoutConfig::new(10.0, 20.0);
+        document
+            .set_viewport_config(ViewportConfig::new(config, 20.0, 0.0))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+
+        // 参照必须来自**场景走的那一条路**：场景按 shaper 排，而
+        // `block_layout` 按 `MonospaceMetrics` 排，两者断行不同，行高也就
+        // 不同。拿后者当判据会得到一条假红。
+        let laid_out = document
+            .block_layout_for_visual_state_with_shaper(0, config, &shaper)
+            .expect("block layout");
+        let table = laid_out.table().expect("这个块是一张表");
+        let rows: Vec<(f32, f32)> = table
+            .rows()
+            .iter()
+            .map(|row| (row.y(), row.height()))
+            .collect();
+        let total_width = table.bounds().width();
+        assert!(
+            rows.iter()
+                .any(|(_, height)| *height > config.line_height()),
+            "语料要造出一行比 line_height 高的行，实际是 {rows:?}"
+        );
+
+        let frame = assemble_viewport_scene_with_images(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 160.0, 400.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+            &[],
+        )
+        .expect("scene frame");
+        // 横线是「宽度等于整张表、高度等于线宽」的那些 Border。
+        let mut tops: Vec<f32> = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Ornament(ornament)
+                    if ornament.role() == OrnamentRole::Border
+                        && (ornament.bounds().width() - total_width).abs() < 0.001 =>
+                {
+                    Some(ornament.bounds().y())
+                }
+                _ => None,
+            })
+            .collect();
+        tops.sort_by(f32::total_cmp);
+        tops.dedup_by(|a, b| (*a - *b).abs() < 0.001);
+
+        for (y, _) in &rows {
+            assert!(
+                tops.iter().any(|top| (top - y).abs() < 0.001),
+                "第 {y} 行的上沿没有横线，横线在 {tops:?}，行是 {rows:?}"
+            );
+        }
     }
 
     /// 目标解析不出来的图片画一个空框，不是什么都不画。

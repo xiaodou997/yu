@@ -39,8 +39,8 @@ use yu_markdown::{BlockDecorations, BlockOrnament};
 use yu_text::{ChangeSet, TextSnapshot};
 
 use crate::blockinput::{BlockLayoutInput, BlockOrnaments};
-use crate::geometry::{source_range_contains, upstream};
-use crate::image::{ImagePlacement, build_image_placements, place_images_in_table};
+use crate::geometry::upstream;
+use crate::image::{ImagePlacement, build_image_placements, build_table_image_placements};
 use crate::table::{TableLayout, TableResizeCommit};
 use crate::visual::VisualText;
 use crate::widget::{BlockWidgets, ImageSize, constraints_of};
@@ -52,6 +52,7 @@ pub struct BlockCluster {
     visual: VisualRange,
     line: usize,
     x: f32,
+    y: f32,
     width: f32,
     style: TextStyle,
     line_break: bool,
@@ -76,6 +77,17 @@ impl BlockCluster {
     #[must_use]
     pub const fn x(self) -> f32 {
         self.x
+    }
+
+    /// 簇所在那条**文字行**的上沿，在 block 局部坐标里。
+    ///
+    /// 它不总是 `lines()[line()].y()`：表格的一条 [`BlockLine`] 是一个网格
+    /// 行，而格子里的内容可以换行——第二行的簇与第一行同属一个网格行，y
+    /// 却差一个行高。少了这个字段，格内换行之后光标与选中高亮会画在这一格
+    /// 的第一行上，不报错，只是画错。
+    #[must_use]
+    pub const fn y(self) -> f32 {
+        self.y
     }
 
     #[must_use]
@@ -371,9 +383,9 @@ impl BlockView {
                     table,
                     visual,
                     &input,
-                    layout.widgets(),
+                    &widgets,
                     config,
-                    |text, source, style| crate::table::measure_with(text, source, style, metrics),
+                    &crate::table::MetricsCells(metrics),
                 )
             })
             .transpose()?;
@@ -414,9 +426,9 @@ impl BlockView {
                     table,
                     visual,
                     &input,
-                    layout.widgets(),
+                    &widgets,
                     config,
-                    |text, source, style| crate::table::shape_with(text, source, style, shaper),
+                    &crate::table::ShapedCells(shaper),
                 )
             })
             .transpose()?;
@@ -693,46 +705,71 @@ impl BlockView {
             return Ok(image.hit(point));
         }
         let line_index = self.line_for_y(point.y());
-        let (visual, widget_side) = if self.table.is_some() {
-            (self.table_visual_for_point(line_index, point), None)
-        } else {
-            let hit = self.layout.hit(point)?;
-            (hit.visual(), hit.widget_affinity())
+        // 有两处的「落在哪一侧」行的规则（不变量 H5）分不出来，因为那两处
+        // 的两个位置**不在同一个 x 上**，而 H5 管的是软换行的两侧（同一个
+        // x）：widget 的左右两沿差着整个盒子的宽度，相邻两格的交界差着一整
+        // 段被隐藏的竖线与空白。这两处由下面那一层直接给出。
+        let (visual, forced) = match self.table.as_ref() {
+            Some(table) => self.table_visual_for_point(table, point)?,
+            None => {
+                let hit = self.layout.hit(point)?;
+                (hit.visual(), widget_bias(hit.widget_affinity()))
+            }
         };
-        // 落在 widget 两侧的那两个位置是**同一个视觉偏移**上的两个 x，行的
-        // 规则（不变量 H5）分不出来——它管的是软换行的两侧，那里两个位置
-        // 的 x 相同。点在图片右边而按行的规则取到 `Before`，光标会画回图片
-        // 左边去：不报错，只是不听话。
-        let bias = match widget_side {
-            Some(CaretAffinity::Upstream) => Bias::Before,
-            Some(CaretAffinity::Downstream) => Bias::After,
-            None => self.hit_bias(line_index, visual),
-        };
+        let bias = forced.unwrap_or_else(|| self.hit_bias(line_index, visual));
         let caret = self.caret_for_visual(visual, bias)?;
         Ok(BlockHit { caret, image: None })
     }
 
-    /// 表格里的点落在哪个视觉偏移上：按网格里的簇从左往右扫。
+    /// 表格里的点落在哪个视觉偏移上：找到格子，再问那一格自己的布局。
     ///
-    /// 表格是 LTR 网格，不重排，所以「过了中点算下一个」在这里成立。表格
-    /// 真正 widget 化之后这段会被 widget 内部的逐单元格命中测试取代。
-    fn table_visual_for_point(&self, line_index: usize, point: LayoutPoint) -> VisualOffset {
-        let line = &self.lines[line_index];
-        // 点在内容左边时循环第一轮就返回第一个簇的起点，而网格行的第一个簇
-        // 起点就是这一行的视觉起点（空单元格不占视觉字节），所以不需要单独
-        // 一条「落在行首」的分支——原来那条是从文字流那一路带过来的。
-        let mut visual = line.visual.start();
-        for index in line.clusters.clone() {
-            let cluster = self.clusters[index];
-            if cluster.line_break {
-                continue;
+    /// 此前这里是一段手写的「按 x 从左往右扫、过了中点算下一个」——那是
+    /// 文字流那一路在第六刀丢掉的规则，表格这边留了一份。两份规则会分叉，
+    /// 而分叉的表现是「光标画在一处、点击落在另一处」。现在每一格有自己的
+    /// [`BlockLayout`]，命中就是它的 `hit`，与画 caret 用的是同一条规则。
+    fn table_visual_for_point(
+        &self,
+        table: &TableLayout,
+        point: LayoutPoint,
+    ) -> Result<(VisualOffset, Option<Bias>), LayoutError> {
+        let Some((cell, layout)) = table.cell_at(point) else {
+            return Ok((self.visual_len(), None));
+        };
+        let local = LayoutPoint::new(
+            point.x() - cell.content_x(),
+            (point.y() - cell.bounds().y()).max(0.0),
+        );
+        let hit = layout.hit(local)?;
+        let visual = VisualOffset::new(
+            hit.visual()
+                .get()
+                .saturating_add(cell.visual().start().get()),
+        );
+        // 三条规则按这个顺序：widget 的哪一沿最具体，其次是格子的边界，
+        // 最后是格**内**的软换行。
+        //
+        // 相邻两格的内容在视觉字节流里是**紧挨着**的（中间的竖线与空白全被
+        // 隐藏了），所以「上一格的末尾」与「下一格的开头」是同一个偏移。
+        // 分开它们的只有 bias：`Before` 解析到上一格内容的末尾，`After`
+        // 解析到下一格内容的开头。点在哪一格是这里唯一知道的事——猜错就是
+        // 「点第二列，光标停在第一列」。
+        //
+        // 格**内**的软换行是另一回事：那两个位置属于同一格，由格子自己的
+        // 布局说了算（不变量 H5）。这里一律 `Before` 的话，点在第二行会把
+        // 光标画到第一行的末尾去。
+        let bias = widget_bias(hit.widget_affinity()).unwrap_or_else(|| {
+            if hit.visual() == VisualOffset::ZERO {
+                Bias::After
+            } else if hit.visual() == layout.visual_len() {
+                Bias::Before
+            } else {
+                match hit.line_affinity() {
+                    CaretAffinity::Upstream => Bias::Before,
+                    CaretAffinity::Downstream => Bias::After,
+                }
             }
-            if point.x() < cluster.x + cluster.width / 2.0 {
-                return cluster.visual.start();
-            }
-            visual = cluster.visual.end();
-        }
-        visual
+        });
+        Ok((visual, Some(bias)))
     }
 
     /// 落在软换行两侧的那个位置归哪一行（不变量 H5）。
@@ -837,47 +874,45 @@ impl BlockView {
             Bias::Before => CaretAffinity::Upstream,
             Bias::After => CaretAffinity::Downstream,
         };
-        if self.table.is_some() {
-            return self.table_point_for_visual(visual, bias);
+        if let Some(table) = self.table.as_ref() {
+            return self.table_point_for_visual(table, visual, bias);
         }
         let caret = self.layout.caret(visual, affinity)?;
         Ok((caret.line(), caret.point()))
     }
 
-    /// 表格里的 caret 位置来自网格，不是文字流。
+    /// 表格里的 caret 位置来自那一格自己的布局。
     ///
-    /// 文字流那条路（`BlockLayout::caret`）问的是排在文字流里的簇，而表格
-    /// 的簇已经被搬进单元格了。两处必须走同一份簇，否则光标画在一个地方、
-    /// 点击落在另一个地方。
+    /// 与 [`BlockView::table_visual_for_point`] 是同一份布局的两个方向。
+    /// 两处走同一份，「光标画在一处、点击落在另一处」才不可能发生。
     fn table_point_for_visual(
         &self,
+        table: &TableLayout,
         visual: VisualOffset,
         bias: Bias,
     ) -> Result<(usize, LayoutPoint), LayoutError> {
-        let line_index = self.line_for_visual(visual, bias);
-        let line = &self.lines[line_index];
-        for index in line.clusters.clone() {
-            let cluster = self.clusters[index];
-            if visual <= cluster.visual.start() {
-                return Ok((line_index, LayoutPoint::new(cluster.x, line.bounds.y())));
-            }
-            if visual < cluster.visual.end() {
-                let x = match bias {
-                    Bias::Before => cluster.x,
-                    Bias::After => cluster.x + cluster.width,
-                };
-                return Ok((line_index, LayoutPoint::new(x, line.bounds.y())));
-            }
-            if visual == cluster.visual.end() {
-                return Ok((
-                    line_index,
-                    LayoutPoint::new(cluster.x + cluster.width, line.bounds.y()),
-                ));
-            }
-        }
+        let affinity = match bias {
+            Bias::Before => CaretAffinity::Upstream,
+            Bias::After => CaretAffinity::Downstream,
+        };
+        let Some((cell, layout)) = table.cell_for_visual(visual, bias) else {
+            let line = self.line_for_visual(visual, bias);
+            let bounds = self.lines[line].bounds;
+            return Ok((line, LayoutPoint::new(bounds.width(), bounds.y())));
+        };
+        let local = VisualOffset::new(
+            visual
+                .get()
+                .saturating_sub(cell.visual().start().get())
+                .min(layout.visual_len().get()),
+        );
+        let caret = layout.caret(local, affinity)?;
         Ok((
-            line_index,
-            LayoutPoint::new(line.bounds.width(), line.bounds.y()),
+            cell.row(),
+            LayoutPoint::new(
+                cell.content_x() + caret.point().x(),
+                cell.bounds().y() + caret.point().y(),
+            ),
         ))
     }
 
@@ -893,145 +928,153 @@ impl BlockView {
         self.lines.len().saturating_sub(1)
     }
 
-    /// 把文字流的簇、字形与行搬进表格网格。
+    /// 用表格各格自己排出来的几何取代文字流那一份。
     ///
-    /// 这段算法原样来自 v1 的 `LayoutSnapshot::apply_table_geometry`。它在
-    /// 真实窗口里跑过，重写不会更对。S6 让表格变成真正的 block widget 时
-    /// 它会被 widget 内部的逐单元格布局取代。
+    /// 此前这里做的是**搬运**：整块排成一条线性流，再把排好的簇按源码区间
+    /// 分派进格子、逐个改 x。那条流按整块宽度断行，格子里放不下的内容不会
+    /// 重排，于是后一列的内容压在前一列上。现在每一格有自己的
+    /// [`BlockLayout`]（零基），这里只把它平移到格子的位置上。
+    ///
+    /// 一条 [`BlockLine`] 仍然是**一个网格行**，不是一条文字行：同一条文字
+    /// 行跨越几个格子时，它在视觉字节流里不是连续的一段，而 `BlockLine` 的
+    /// `visual` 必须是。格内换行体现为这一行更高，簇各自带着自己的 `y`。
     fn apply_table_geometry(&mut self, table: &TableLayout) -> Result<(), LayoutError> {
         if table.revision() != self.revision() {
             return Err(LayoutError::Upstream(
                 "table and text layout revisions differ".into(),
             ));
         }
-        let original = self.clusters.clone();
-        let mut targets = vec![None; self.clusters.len()];
-        for cell in table.cells().iter().copied() {
-            let mut x = cell.content_x();
-            for (index, cluster) in original.iter().copied().enumerate() {
-                if cluster.line_break || !source_range_contains(cell.source(), cluster.source()) {
-                    continue;
+        let styles = self.input.styles();
+        let mut clusters = Vec::new();
+        let mut glyphs = Vec::new();
+        let mut lines: Vec<BlockLine> = Vec::with_capacity(table.rows().len());
+        let mut row_start = 0_usize;
+        let mut current_row: Option<usize> = None;
+
+        for (index, cell) in table.cells().iter().copied().enumerate() {
+            let layout = table
+                .cell_layouts()
+                .get(index)
+                .ok_or(LayoutError::Upstream("table cell has no layout".into()))?;
+            if current_row != Some(cell.row()) {
+                if let Some(row) = current_row {
+                    lines.push(self.table_line(table, row, row_start..clusters.len())?);
+                    row_start = clusters.len();
                 }
-                if targets[index].is_some() {
-                    return Err(LayoutError::Upstream(
-                        "a visual cluster belongs to multiple table cells".into(),
-                    ));
-                }
-                targets[index] = Some((cell.row(), cluster.x, x));
-                self.clusters[index] = BlockCluster {
+                current_row = Some(cell.row());
+            }
+            let origin = LayoutPoint::new(cell.content_x(), cell.bounds().y());
+            let base = cell.visual().start();
+            let first_cluster = clusters.len();
+            for cluster in layout.clusters() {
+                let line = layout
+                    .lines()
+                    .get(cluster.line())
+                    .ok_or(LayoutError::Upstream(
+                        "table cell cluster has no line".into(),
+                    ))?;
+                let visual = shift_visual(cluster.visual(), base)?;
+                let start = self
+                    .visual
+                    .visual_to_source(visual.start(), Bias::After)
+                    .map_err(upstream)?;
+                let end = self
+                    .visual
+                    .visual_to_source(visual.end(), Bias::Before)
+                    .map_err(upstream)?;
+                let style = styles
+                    .attrs(cluster.style())
+                    .ok_or(LayoutError::UnknownStyle(cluster.style()))?
+                    .style();
+                clusters.push(BlockCluster {
+                    source: TextRange::new(start, end.max(start))
+                        .ok_or(LayoutError::OffsetOverflow)?,
+                    visual,
                     line: cell.row(),
-                    x,
-                    ..cluster
-                };
-                x += cluster.width;
+                    x: origin.x() + cluster.x(),
+                    y: origin.y() + line.bounds().y(),
+                    width: cluster.width(),
+                    style,
+                    line_break: cluster.is_line_break(),
+                });
+            }
+            for glyph in layout.glyphs() {
+                let visual = shift_visual(glyph.visual(), base)?;
+                let cluster = clusters[first_cluster..]
+                    .iter()
+                    .find(|cluster| cluster.visual == visual)
+                    .ok_or(LayoutError::Shaping(
+                        "a shaped table glyph has no visual cluster".into(),
+                    ))?;
+                let point = LayoutPoint::new(
+                    origin.x() + glyph.origin().x(),
+                    origin.y() + glyph.origin().y(),
+                );
+                if !point.is_finite() {
+                    return Err(LayoutError::InvalidPoint);
+                }
+                glyphs.push(BlockGlyph {
+                    face: glyph.face(),
+                    glyph: glyph.glyph(),
+                    source: cluster.source,
+                    visual,
+                    line: cell.row(),
+                    origin: point,
+                    style: cluster.style,
+                    size_scale: glyph.size_scale(),
+                });
             }
         }
-        if self
-            .clusters
-            .iter()
-            .zip(targets.iter())
-            .any(|(cluster, target)| !cluster.line_break && target.is_none())
-        {
-            return Err(LayoutError::Upstream(
-                "a table visual cluster has no source cell".into(),
-            ));
+        if let Some(row) = current_row {
+            lines.push(self.table_line(table, row, row_start..clusters.len())?);
         }
 
-        let mut used = vec![false; self.clusters.len()];
-        for glyph_index in 0..self.glyphs.len() {
-            let original_glyph = self.glyphs[glyph_index];
-            let Some((index, target)) = self
-                .clusters
-                .iter()
-                .copied()
-                .zip(targets.iter().copied())
-                .enumerate()
-                .find_map(|(index, (cluster, target))| {
-                    (!used[index]
-                        && target.is_some()
-                        && cluster.source == original_glyph.source
-                        && cluster.visual == original_glyph.visual)
-                        .then_some((index, target))
-                })
-            else {
-                return Err(LayoutError::Upstream(
-                    "a shaped table glyph has no visual cluster".into(),
-                ));
-            };
-            let (row, old_cluster_x, new_cluster_x) = target.expect("target checked above");
-            used[index] = true;
-            let old_baseline = self.baseline_for_flow_line(original_glyph.line);
-            let y_offset = original_glyph.origin.y() - old_baseline;
-            let x_offset = original_glyph.origin.x() - old_cluster_x;
-            if !x_offset.is_finite() || !y_offset.is_finite() {
-                return Err(LayoutError::InvalidPoint);
-            }
-            let new_baseline = table.row_height() * (row as f32 + 1.0);
-            self.glyphs[glyph_index] = BlockGlyph {
-                line: row,
-                origin: LayoutPoint::new(new_cluster_x + x_offset, new_baseline + y_offset),
-                ..original_glyph
-            };
-        }
-
-        place_images_in_table(&mut self.images, table)?;
-
-        let mut lines = Vec::with_capacity(table.row_sources().len());
-        let mut cluster_start = 0;
-        for (row, source) in table.row_sources().iter().copied().enumerate() {
-            let start = cluster_start;
-            if cluster_start < self.clusters.len() && self.clusters[cluster_start].line() < row {
-                return Err(LayoutError::Upstream(
-                    "table cluster lines are not ordered".into(),
-                ));
-            }
-            while cluster_start < self.clusters.len() && self.clusters[cluster_start].line() == row
-            {
-                cluster_start += 1;
-            }
-            let mut row_cells = table
-                .cells()
-                .iter()
-                .copied()
-                .filter(|cell| cell.row() == row);
-            let first = row_cells
-                .clone()
-                .next()
-                .ok_or(LayoutError::Upstream("table row has no cells".into()))?;
-            let last = row_cells
-                .next_back()
-                .ok_or(LayoutError::Upstream("table row has no cells".into()))?;
-            let visual = VisualRange::new(first.visual().start(), last.visual().end())
-                .ok_or(LayoutError::OffsetOverflow)?;
-            lines.push(BlockLine {
-                index: row,
-                source,
-                visual,
-                bounds: LayoutRect::new(
-                    0.0,
-                    first.bounds().y(),
-                    table.bounds().width(),
-                    table.row_height(),
-                )?,
-                baseline: table.row_height(),
-                style: None,
-                clusters: start..cluster_start,
-            });
-        }
-        if cluster_start != self.clusters.len() {
-            return Err(LayoutError::Upstream(
-                "table cluster lines exceed table rows".into(),
-            ));
-        }
+        self.clusters = clusters;
+        self.glyphs = glyphs;
         self.lines = lines;
+        self.images = build_table_image_placements(self, table)?;
         Ok(())
     }
 
-    fn baseline_for_flow_line(&self, index: usize) -> f32 {
-        self.layout
-            .lines()
-            .get(index)
-            .map_or(0.0, |line| line.bounds().y() + line.baseline())
+    /// 一个网格行对应的那条 [`BlockLine`]。
+    fn table_line(
+        &self,
+        table: &TableLayout,
+        row: usize,
+        clusters: Range<usize>,
+    ) -> Result<BlockLine, LayoutError> {
+        let geometry = table
+            .rows()
+            .get(row)
+            .copied()
+            .ok_or(LayoutError::Upstream("table row has no geometry".into()))?;
+        let mut row_cells = table
+            .cells()
+            .iter()
+            .copied()
+            .filter(|cell| cell.row() == row);
+        let first = row_cells
+            .clone()
+            .next()
+            .ok_or(LayoutError::Upstream("table row has no cells".into()))?;
+        let last = row_cells
+            .next_back()
+            .ok_or(LayoutError::Upstream("table row has no cells".into()))?;
+        let source = table
+            .row_sources()
+            .get(row)
+            .copied()
+            .ok_or(LayoutError::Upstream("table row has no source".into()))?;
+        Ok(BlockLine {
+            index: row,
+            source,
+            visual: VisualRange::new(first.visual().start(), last.visual().end())
+                .ok_or(LayoutError::OffsetOverflow)?,
+            bounds: LayoutRect::new(0.0, geometry.y(), table.bounds().width(), geometry.height())?,
+            baseline: self.config.line_height(),
+            style: None,
+            clusters,
+        })
     }
 }
 
@@ -1060,11 +1103,16 @@ fn source_backed_clusters(
             .attrs(cluster.style())
             .ok_or(LayoutError::UnknownStyle(cluster.style()))?
             .style();
+        let y = layout
+            .lines()
+            .get(cluster.line())
+            .map_or(0.0, |line| line.bounds().y());
         clusters.push(BlockCluster {
             source,
             visual: cluster.visual(),
             line: cluster.line(),
             x: cluster.x(),
+            y,
             width: cluster.width(),
             style,
             line_break: cluster.is_line_break(),
@@ -1174,6 +1222,26 @@ fn table_of(decorations: &BlockDecorations) -> Option<&yu_markdown::TableBlock> 
             BlockOrnament::Table(table) => Some(table),
             _ => None,
         })
+}
+
+/// widget 的哪一沿翻成 bias。没有 widget 参与就是 `None`。
+const fn widget_bias(affinity: Option<CaretAffinity>) -> Option<Bias> {
+    match affinity {
+        Some(CaretAffinity::Upstream) => Some(Bias::Before),
+        Some(CaretAffinity::Downstream) => Some(Bias::After),
+        None => None,
+    }
+}
+
+/// 一段零基的视觉区间平移到块空间里的 `base` 上。
+fn shift_visual(range: VisualRange, base: VisualOffset) -> Result<VisualRange, LayoutError> {
+    let shift = |offset: VisualOffset| -> Option<VisualOffset> {
+        offset.get().checked_add(base.get()).map(VisualOffset::new)
+    };
+    shift(range.start())
+        .zip(shift(range.end()))
+        .and_then(|(start, end)| VisualRange::new(start, end))
+        .ok_or(LayoutError::OffsetOverflow)
 }
 
 /// 一段源码区间平移 `delta` 个字节。

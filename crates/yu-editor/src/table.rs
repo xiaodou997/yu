@@ -8,9 +8,30 @@
 //! `TableLayout` 与 `yu-scene::TablePrimitive` 是同一种泄漏，按
 //! overview-v2 §3 的对照表处理，不按 grep 处理。
 //!
-//! 搬过来时算法一个字没改：v1 在真实窗口里跑过，重写它不会更对，只会
-//! 更容易错。它在 S6 随 `DecorationSet` 变成一个真正的 block widget，
-//! 那时列宽算法会成为 widget measurer 的内部实现。
+//! # 每一格自己排一次
+//!
+//! 从 v1 搬过来时算法一个字没改：整块排成一条线性文字流，再把排好的簇搬进
+//! 格子。那条流按**整块**的宽度断行，所以格子里放不下的内容不会重排——
+//! `| long header | x |` 排在 12pt 宽里，第二列的 content_x 是 11.75，而第
+//! 一列的内容一路铺到 24，后一列的内容压在前一列上。
+//!
+//! 现在每一格按**自己那一列的宽度**排一次 [`BlockLayout`]：断行、bidi、
+//! widget 都是同一套，只是零基。行高是那一行各格高度的最大值，不再是常数。
+//! caret 与命中测试也随之交给 `BlockLayout`——表格此前各有一份手写的按 x
+//! 扫描，与文字流那一份是两套规则。
+//!
+//! # 为什么表格不是 `Decoration::Widget`
+//!
+//! 第 3 节的对照表把表格列在「一个 block widget」那一格。**它不能是**，
+//! 至少不能是图片那种：非空 range 的 `Decoration::Widget` 会隐藏它覆盖的
+//! source（`Decoration::hides_source`），而整张表的单元格内容一旦从视觉字节
+//! 流里消失，光标就进不了任何一格——不变量 A2 说编辑走的是源码，而源码位置
+//! 要靠视觉偏移找回来。图片可以，因为图片本来就没有「内部位置」。
+//!
+//! 对照表真正要解决的是 §2.1 那条泄漏（一种语法一条全链路），而那件事已经
+//! 做完了：`yu-scene` 里没有 `TablePrimitive`（网格现在是渲染中立的
+//! `OrnamentPrimitive`），FFI 里没有表格几何，`yu-layout` 里没有 `table.rs`。
+//! 剩下的是几何，而几何要的是**内部布局**，不是换一种装饰变体。
 
 use std::{error::Error, fmt};
 
@@ -22,7 +43,13 @@ use yu_core::{
 use yu_decoration::Bias;
 use yu_markdown::{TableAlignment, TableBlock, TableCellRange};
 
-use yu_layout::{LayoutConfig, LayoutError, LayoutPoint, LayoutRect, WidgetBox};
+use yu_layout::{
+    BlockLayout, LayoutConfig, LayoutError, LayoutInput, LayoutPoint, LayoutRect, NoLineStyles,
+};
+
+use crate::blockinput::BlockStyleTable;
+use crate::widget::BlockWidgets;
+use yu_layout::WidgetMeasure;
 
 use crate::blockinput::BlockLayoutInput;
 use crate::blockview::shift_range;
@@ -380,10 +407,97 @@ pub struct TableLayout {
     delimiter_source: Option<TextRange>,
     column_widths: Vec<f32>,
     padding: f32,
-    row_height: f32,
+    /// 每一行的 y 与高。**行高不再是常数**：一格里的内容换行之后，那一行
+    /// 就比 `line_height` 高。
+    rows: Vec<TableRowGeometry>,
     bounds: LayoutRect,
     cells: Vec<TableCellLayout>,
+    /// 每一格自己那一份布局，与 `cells` 同序、等长。零基视觉空间。
+    cell_layouts: Vec<BlockLayout>,
     row_sources: Vec<TextRange>,
+}
+
+/// 一行在表格局部坐标里的位置与高度。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TableRowGeometry {
+    y: f32,
+    height: f32,
+}
+
+impl TableRowGeometry {
+    #[must_use]
+    pub const fn y(self) -> f32 {
+        self.y
+    }
+
+    #[must_use]
+    pub const fn height(self) -> f32 {
+        self.height
+    }
+}
+
+/// 给一格排一次版。度量与 shaping 两条路各一个实现。
+///
+/// 两条路只在「一段文字有多宽 / 排成什么字形」上分开，断行、bidi、widget
+/// 摆放全部由 [`BlockLayout`] 一份代码做——共用代码路径的差分是自证的，
+/// 所以这里只留一个可替换的点。
+pub(crate) trait CellBackend {
+    fn layout(
+        &self,
+        input: LayoutInput<'_>,
+        config: LayoutConfig,
+        styles: &BlockStyleTable,
+        widgets: &BlockWidgets<'_>,
+    ) -> Result<BlockLayout, LayoutError>;
+
+    /// 一段文字不断行时有多宽。列的自然宽度由它累加。
+    fn advance(&self, text: &str, source: TextRange, style: TextStyle) -> Result<f32, LayoutError>;
+}
+
+/// 按 [`ClusterMetrics`] 排。
+pub(crate) struct MetricsCells<'a, M>(pub(crate) &'a M);
+
+impl<M: ClusterMetrics> CellBackend for MetricsCells<'_, M> {
+    fn layout(
+        &self,
+        input: LayoutInput<'_>,
+        config: LayoutConfig,
+        styles: &BlockStyleTable,
+        widgets: &BlockWidgets<'_>,
+    ) -> Result<BlockLayout, LayoutError> {
+        BlockLayout::build_all(input, config, styles, widgets, &NoLineStyles, self.0)
+    }
+
+    fn advance(
+        &self,
+        text: &str,
+        _source: TextRange,
+        style: TextStyle,
+    ) -> Result<f32, LayoutError> {
+        measure_text(text, self.0, style)
+    }
+}
+
+/// 按 [`ShapingProvider`] 排。
+pub(crate) struct ShapedCells<'a, S>(pub(crate) &'a S);
+
+impl<S: ShapingProvider> CellBackend for ShapedCells<'_, S> {
+    fn layout(
+        &self,
+        input: LayoutInput<'_>,
+        config: LayoutConfig,
+        styles: &BlockStyleTable,
+        widgets: &BlockWidgets<'_>,
+    ) -> Result<BlockLayout, LayoutError> {
+        BlockLayout::build_shaped(input, config, styles, widgets, &NoLineStyles, self.0)
+    }
+
+    fn advance(&self, text: &str, source: TextRange, style: TextStyle) -> Result<f32, LayoutError> {
+        self.0
+            .shape(text, source, style)
+            .map(|shaped| shaped.advance())
+            .map_err(|error| LayoutError::Shaping(error.to_string()))
+    }
 }
 
 impl TableLayout {
@@ -397,17 +511,14 @@ impl TableLayout {
     /// # Errors
     ///
     /// 网格的行列对不上、度量非有限值、视觉偏移越界。
-    pub fn from_table<F>(
+    pub(crate) fn from_table<B: CellBackend>(
         table: &TableBlock,
         visual: &VisualText,
         input: &BlockLayoutInput,
-        widgets: &[WidgetBox],
+        widgets: &BlockWidgets<'_>,
         config: LayoutConfig,
-        mut measure: F,
-    ) -> Result<Self, LayoutError>
-    where
-        F: FnMut(&str, TextRange, TextStyle) -> Result<f32, LayoutError>,
-    {
+        backend: &B,
+    ) -> Result<Self, LayoutError> {
         config.validate()?;
         let column_count = table.column_count();
         if column_count == 0 || table.delimiter().len() != column_count {
@@ -425,6 +536,7 @@ impl TableLayout {
             ));
         }
 
+        // 第一步：每一格不断行有多宽，列取那一列的最大值。
         let padding = config.default_advance();
         let mut natural_widths = vec![padding * 2.0; column_count];
         let mut measured_rows = Vec::with_capacity(rows.len());
@@ -433,7 +545,7 @@ impl TableLayout {
             for (column, cell) in row.iter().copied().enumerate() {
                 let source_range = table_cell_range(cell)?;
                 let (cell_visual, content_width) =
-                    measure_cell_content(visual, input, widgets, source_range, &mut measure)?;
+                    measure_cell_content(visual, input, widgets, config, source_range, backend)?;
                 if !content_width.is_finite() || content_width < 0.0 {
                     return Err(LayoutError::InvalidMetrics(content_width.to_bits()));
                 }
@@ -455,40 +567,62 @@ impl TableLayout {
             .map(|width| width * scale)
             .collect::<Vec<_>>();
         let total_width = column_widths.iter().sum::<f32>();
-        let row_height = config.line_height();
-        let row_count = rows.len();
-        let total_height = row_height * row_count as f32;
-        let bounds = LayoutRect::new(0.0, 0.0, total_width, total_height)?;
 
+        // 第二步：每一格按**自己那一列**的最终宽度排一次。压缩过的列在这里
+        // 断行，所以内容不会铺出格子外面去。
         let alignments = table.alignments();
+        let row_count = rows.len();
         let mut cells = Vec::with_capacity(row_count.saturating_mul(column_count));
-        for (row, measured_cells) in measured_rows.iter().enumerate() {
-            let y = row_height * row as f32;
+        let mut cell_layouts = Vec::with_capacity(cells.capacity());
+        let mut geometry = Vec::with_capacity(row_count);
+        let mut y = 0.0_f32;
+        for measured_cells in &measured_rows {
             let mut x = 0.0_f32;
-            for (column, (source, visual, content_width)) in
+            let mut height = config.line_height();
+            let first_cell = cells.len();
+            for (column, (source, cell_visual, content_width)) in
                 measured_cells.iter().copied().enumerate()
             {
                 let width = column_widths[column];
-                let available = (width - padding * 2.0).max(0.0);
+                let available = (width - padding * 2.0).max(config.default_advance());
                 let slack = (available - content_width).max(0.0);
                 let alignment_offset = match alignments[column] {
                     TableAlignment::Center => slack * 0.5,
                     TableAlignment::Right => slack,
                     TableAlignment::Default | TableAlignment::Left => 0.0,
                 };
+                let slice = input.slice(cell_visual, source)?;
+                let layout = backend.layout(
+                    slice.layout_input(),
+                    LayoutConfig::new(available, config.line_height()),
+                    input.styles(),
+                    widgets,
+                )?;
+                height = height.max(layout.height());
                 cells.push(TableCellLayout {
-                    row,
+                    row: geometry.len(),
                     column,
                     source,
-                    visual,
-                    bounds: LayoutRect::new(x, y, width, row_height)?,
+                    visual: cell_visual,
+                    // 高度先记这一行的下限，整行量完再统一补齐。
+                    bounds: LayoutRect::new(x, y, width, config.line_height())?,
                     alignment: alignments[column],
                     content_x: x + padding + alignment_offset,
                     content_width,
                 });
+                cell_layouts.push(layout);
                 x += width;
             }
+            if !height.is_finite() {
+                return Err(LayoutError::InvalidMetrics(height.to_bits()));
+            }
+            for cell in &mut cells[first_cell..] {
+                cell.bounds = LayoutRect::new(cell.bounds.x(), y, cell.bounds.width(), height)?;
+            }
+            geometry.push(TableRowGeometry { y, height });
+            y += height;
         }
+        let bounds = LayoutRect::new(0.0, 0.0, total_width, y)?;
 
         let row_sources = (0..row_count)
             .map(|row| {
@@ -509,9 +643,10 @@ impl TableLayout {
                 .transpose()?,
             column_widths,
             padding,
-            row_height,
+            rows: geometry,
             bounds,
             cells,
+            cell_layouts,
             row_sources,
         })
     }
@@ -536,9 +671,18 @@ impl TableLayout {
         &self.column_widths
     }
 
+    /// 每一行的 y 与高。**行高不是常数**——一格里的内容换行之后那一行更高。
     #[must_use]
-    pub const fn row_height(&self) -> f32 {
-        self.row_height
+    pub fn rows(&self) -> &[TableRowGeometry] {
+        &self.rows
+    }
+
+    /// 每一格自己那一份布局，与 [`TableLayout::cells`] 同序、等长。
+    ///
+    /// 视觉偏移是**零基**的：加上那一格的 `visual().start()` 才是块空间。
+    #[must_use]
+    pub fn cell_layouts(&self) -> &[BlockLayout] {
+        &self.cell_layouts
     }
 
     #[must_use]
@@ -554,6 +698,68 @@ impl TableLayout {
     #[must_use]
     pub fn row_sources(&self) -> &[TextRange] {
         &self.row_sources
+    }
+
+    /// `point` 落在第几行。表格外的点夹到最近的一行。
+    #[must_use]
+    pub fn row_at(&self, y: f32) -> usize {
+        for (index, row) in self.rows.iter().enumerate() {
+            if y < row.y + row.height {
+                return index;
+            }
+        }
+        self.rows.len().saturating_sub(1)
+    }
+
+    /// `point` 落在哪一格，连同那一格的布局。
+    ///
+    /// 表格外的点夹到最近的一格：点在网格右边要落到那一行的最后一格里，
+    /// 落空的话光标会跳到整块的末尾去。
+    #[must_use]
+    pub(crate) fn cell_at(&self, point: LayoutPoint) -> Option<(TableCellLayout, &BlockLayout)> {
+        let row = self.row_at(point.y() - self.bounds.y());
+        let mut best: Option<usize> = None;
+        for (index, cell) in self.cells.iter().enumerate() {
+            if cell.row != row {
+                continue;
+            }
+            let inside =
+                point.x() >= cell.bounds.x() && point.x() < cell.bounds.x() + cell.bounds.width();
+            if inside {
+                best = Some(index);
+                break;
+            }
+            // 夹到最近的一格：越过右边缘就一路记到最后一格。
+            if best.is_none() || point.x() >= cell.bounds.x() {
+                best = Some(index);
+            }
+        }
+        let index = best?;
+        Some((self.cells[index], self.cell_layouts.get(index)?))
+    }
+
+    /// 视觉偏移落在哪一格，连同那一格的布局。
+    ///
+    /// 空单元格的视觉区间是空的，几格可以塌在同一个偏移上。`bias` 决定取
+    /// 哪一边：`Before` 取塌在这里的第一格，`After` 取最后一格。
+    #[must_use]
+    pub(crate) fn cell_for_visual(
+        &self,
+        visual: VisualOffset,
+        bias: Bias,
+    ) -> Option<(TableCellLayout, &BlockLayout)> {
+        let mut found: Option<usize> = None;
+        for (index, cell) in self.cells.iter().enumerate() {
+            if cell.visual.start() > visual || visual > cell.visual.end() {
+                continue;
+            }
+            match bias {
+                Bias::Before if found.is_some() => {}
+                _ => found = Some(index),
+            }
+        }
+        let index = found?;
+        Some((self.cells[index], self.cell_layouts.get(index)?))
     }
 
     /// Returns a copy with one internal column divider moved by `delta`.
@@ -684,9 +890,10 @@ impl TableLayout {
             delimiter_source: self.delimiter_source,
             column_widths,
             padding: self.padding,
-            row_height: self.row_height,
+            rows: self.rows.clone(),
             bounds,
             cells,
+            cell_layouts: self.cell_layouts.clone(),
             row_sources: self.row_sources.clone(),
         })
     }
@@ -737,8 +944,7 @@ impl TableLayout {
         {
             return Ok(None);
         }
-        let row = ((point.y() - self.bounds.y()) / self.row_height).floor() as usize;
-        let row = row.min(self.cells.len().saturating_sub(1));
+        let row = self.row_at(point.y() - self.bounds.y());
         let column = self
             .cells
             .iter()
@@ -806,9 +1012,9 @@ impl TableLayout {
             }
         }
 
-        let row_count = self.row_sources.len();
-        for row in 0..row_count.saturating_sub(1) {
-            let y = self.bounds.y() + self.row_height * (row.saturating_add(1) as f32);
+        for row in 0..self.rows.len().saturating_sub(1) {
+            let geometry = self.rows[row];
+            let y = self.bounds.y() + geometry.y + geometry.height;
             if (point.y() - y).abs() <= tolerance
                 && point.x() >= self.bounds.x()
                 && point.x() <= self.bounds.x() + self.bounds.width()
@@ -835,8 +1041,9 @@ impl TableLayout {
                 .transpose()?,
             column_widths: self.column_widths.clone(),
             padding: self.padding,
-            row_height: self.row_height,
+            rows: self.rows.clone(),
             bounds: self.bounds,
+            cell_layouts: self.cell_layouts.clone(),
             cells: self
                 .cells
                 .iter()
@@ -871,16 +1078,14 @@ fn table_cell_range(range: TableCellRange) -> Result<TextRange, LayoutError> {
 /// 锚在这一段里的 widget 也算宽度。它在视觉字节流里不占位，样式段一个字节
 /// 都切不到它——不算的话，一格里只有一张图的那一列会被压成一条缝，而
 /// 图片照样按自己的宽度画出去，压在下一列上。
-fn measure_cell_content<F>(
+fn measure_cell_content<B: CellBackend>(
     text: &VisualText,
     input: &BlockLayoutInput,
-    widgets: &[WidgetBox],
+    widgets: &BlockWidgets<'_>,
+    config: LayoutConfig,
     source: TextRange,
-    measure: &mut F,
-) -> Result<(VisualRange, f32), LayoutError>
-where
-    F: FnMut(&str, TextRange, TextStyle) -> Result<f32, LayoutError>,
-{
+    backend: &B,
+) -> Result<(VisualRange, f32), LayoutError> {
     let visual_start = text
         .source_to_visual(source.start(), Bias::After)
         .map_err(upstream)?;
@@ -914,37 +1119,19 @@ where
             text.visual_to_source(to, Bias::Before).map_err(upstream)?,
         )
         .ok_or(LayoutError::OffsetOverflow)?;
-        width += measure(slice, shape_source, style)?;
+        width += backend.advance(slice, shape_source, style)?;
     }
-    for placed in widgets {
-        if visual.start() <= placed.visual() && placed.visual() <= visual.end() {
-            width += placed.bounds().width();
-        }
+    // 锚在这一段里的 widget 也算宽度：它在视觉字节流里不占位，样式段一个
+    // 字节都切不到它。不算的话，一格里只有一张图的那一列会被压成一条缝，
+    // 而图片照样按自己的宽度画出去，压在下一列上。
+    let constraints = crate::widget::constraints_of(config);
+    for span in input.widgets_in(source) {
+        let measurement = widgets
+            .measure(span.widget(), constraints)
+            .ok_or(LayoutError::UnknownWidget(span.widget()))?;
+        width += measurement.metrics().size().width();
     }
     Ok((visual, width))
-}
-
-/// 按度量量一段文字。`from_table` 的度量后端之一。
-pub(crate) fn measure_with<M: ClusterMetrics>(
-    text: &str,
-    _source: TextRange,
-    style: TextStyle,
-    metrics: &M,
-) -> Result<f32, LayoutError> {
-    measure_text(text, metrics, style)
-}
-
-/// 按 shaping 后端量一段文字。`from_table` 的另一个度量后端。
-pub(crate) fn shape_with<S: ShapingProvider>(
-    text: &str,
-    source: TextRange,
-    style: TextStyle,
-    shaper: &S,
-) -> Result<f32, LayoutError> {
-    shaper
-        .shape(text, source, style)
-        .map(|shaped| shaped.advance())
-        .map_err(|error| LayoutError::Shaping(error.to_string()))
 }
 
 fn measure_text<M: ClusterMetrics>(
