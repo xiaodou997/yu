@@ -14,6 +14,45 @@
 //! 只比第 1 条是不够的。`foo` 在文档顶层是 Paragraph，在 `> ` 里面是
 //! Blockquote 的孩子——字节一样，树不一样。这正是「静默地做错事」的典型：
 //! 复用一个上下文不符的子树不会 panic，只会让某个块的类型悄悄错掉。
+//!
+//! # 与上游的分歧之二：`open_end` 是沿用的，不是每次重写的
+//!
+//! （分歧之一是上游 `FragmentCursor` 压根不读 `open_start`，说明写在
+//! `FragmentCursor::move_to` 里。）
+//!
+//! 上游 `@lezer/common` 切 fragment 时无条件写 `openStart: cI > 0` 与
+//! `openEnd: !!nextC`——**只看这一次的改动，把传进来的 fragment 已经带着的
+//! 标记丢掉**。
+//!
+//! 每次编辑之后都重新 `from_tree` 时这不要紧：那时标记本来就都是 `false`。
+//! 但连着编辑两次而中间没有重新解析（批量替换、连续粘贴，或者编辑器那边没
+//! 人要过树）时，第二次 [`TreeFragment::apply_changes`] 会把**上一次编辑留下
+//! 的那个洞**的边界说成「文档末尾」，于是紧挨着洞的那个块被原样复用。
+//!
+//! 复现见 `tests/incremental.rs` 的 `chained_edits_keep_earlier_holes_open`：
+//! 先在一个空行处插入 `X`，让上一个段落把这一行吃成延续行；再在它前面某处插
+//! 一个字符，中途不解析。第二次解析会把那个段落从洞的位置一刀两断，得到两个
+//! 段落而不是一个——不 panic、不报错，正是不变量 C3 要防的那种静默出错。
+//!
+//! ## 为什么只有 `open_end` 要沿用
+//!
+//! 起点那一端照上游写就是对的，**沿用与否不可能有区别**：
+//!
+//! - 上游写出 `open_start == false` 只有一处：`cI == 0` 那一轮。而那一轮
+//!   `pos == 0`、`offset == 0`，于是切出来的 `from == candidate.from`。
+//!   （另一条路是整段原样保留，`from` 与标记一起继承，同样不破坏下面这条。）
+//! - 于是有不变量：**`open_start == false` 的 fragment 必然 `from == 0`**，
+//!   基例是 [`TreeFragment::from_tree`] 造的那一个。
+//! - 沿用与不沿用只在 `pos < candidate.from` 且 `candidate.open_start == false`
+//!   时给出不同答案，而按上一条那要求 `pos < 0`。不存在。
+//!
+//! 终点那一端没有这个保护，因为右边的哨兵是 `u32::MAX`——没有 fragment 的
+//! `to` 能等于它，所以「终点来自 fragment 自己」与「终点来自一次改动」是两种
+//! 都会发生的情形。不对称就是从这里来的。
+//!
+//! 这不是推理出来就算数的：`open_start` 沿用与否的两种写法，
+//! `chained_fragments_match_full_parse_through_random_edits` 的 1,000 步随机
+//! 链式编辑分不出来——与上面的证明一致。所以那一端**不改**。
 
 use crate::block::BlockContext;
 use crate::input::Input;
@@ -98,8 +137,15 @@ impl TreeFragment {
                             to: u32::try_from(to.max(0)).unwrap_or(0),
                             tree: candidate.tree.clone(),
                             offset: candidate.offset + offset,
+                            // `open_start` 照上游写：`change_index > 0`。
+                            //
+                            // `open_end` **要沿用传进来的标记**——终点还是
+                            // fragment 自己的终点时，它开不开由上一轮决定，
+                            // 不由这一轮有没有改动决定。两端为什么不对称，
+                            // 以及不沿用会错成什么样，见模块文档。
                             open_start: change_index > 0,
-                            open_end: change.is_some(),
+                            open_end: (next_pos <= candidate.to && change.is_some())
+                                || (candidate.to <= next_pos && candidate.open_end),
                         });
                     }
                     if let Some(cut) = cut {

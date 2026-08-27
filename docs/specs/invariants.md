@@ -342,6 +342,12 @@ surrogate 中间位置不得穿过 ABI。
 **J1.** 编辑只重解析受影响范围，只重建变化的 decoration，
 只 layout 变化的 block，只提交 damage region。
 
+「只重解析受影响范围」的**可断言量是重扫的字节数**，不是耗时：同样的输入
+永远给同样的答案，退化时一定是真的退化。两层各有门禁——`yu_syntax::Parse`
+的 `reparsed_bytes`（`crates/yu-syntax/tests/incremental.rs`），与
+`DecorationCacheStats::reparsed_bytes`（`crates/yu-editor/src/decorations.rs`
+与 `document.rs`，压的是产品链路上那条接线）。
+
 **J2.** 不 layout 整份文档。按 block height index 以 O(log n)
 定位可见范围，只处理 viewport + overscan。
 

@@ -861,10 +861,10 @@ S5 结束时留给它的入口是清楚的：`yu-editor::BlockLayoutInput` 现�
 dev-dep 在用它。表格与图片的 widget 化、`BlockView::hit_test` 的 bidi 也在
 同一次换源里落地，理由见 S5 的「已登记的四个未做项」。
 
-**进行中。** 四刀落地：`yu-markdown` 成为 extension 集合；`BlockLayoutInput`
+**进行中。** 五刀落地：`yu-markdown` 成为 extension 集合；`BlockLayoutInput`
 多一条从 `DecorationSet` 派生的路；消费者换完，`BlockView` 向装饰问源码
-区间；`yu-projection` 删除。剩下的是 widget 化、增量解析、hit_test 的 bidi，
-以及把 `block_sequence` 与语法树的块结构合并。
+区间；`yu-projection` 删除；增量解析接上。剩下的是 widget 化、hit_test 的
+bidi，以及把 `block_sequence` 与语法树的块结构合并。
 
 #### 第一刀：extension 集合，建在 `yu-syntax` 上
 
@@ -1102,11 +1102,51 @@ id 脱节。真正的替代是上表第二行：CommonMark 用例压的是解析
 `tests/extension_merge.rs`——那三个函数的实际身份是「给 `merge` 喂真实交错
 输入的夹具」，留在产品里只会是一段没人调用的公开 API。
 
+#### 第五刀：增量解析接上，J1 有了可断言量
+
+`DecorationCache` 此前每换一个 Revision 就整篇重解析一次。`yu-syntax` 的
+`parse_with_fragments` 早就在了，缺的只是把 fragment 传下去。这一刀补上三处：
+
+- `shift_through`（一次编辑之后把没被碰到的块整体平移的那个方法）多做一件事：
+  把 `ChangeSet` 应用到上一棵树的 `TreeFragment` 上。
+- `tree()` 拿对得上这一版 Revision 的 fragment 调 `parse_with_fragments`。
+- `DecorationCacheStats` 多一个 `reparsed_bytes`。**不变量 J1 在编辑器这一层
+  的可断言量就是它**：512 个块（三万多字节）的文档里改一个字符，重扫 ~60 字节。
+
+**复用的来源有两个，按新鲜程度取。** 树正好在这次编辑的基准 Revision 上时，
+fragment 从那棵树现取；只有树落后于编辑（连着编辑几次都没人要过树，比如批量
+替换）时，才拿上一批 fragment 接着往下平移。两个都对不上基准 Revision 时**不
+猜**——丢掉 fragment，下一次整篇重解析。多扫一遍是慢，猜错是树悄悄不对。
+
+##### 接上去才发现的：上游 `apply_changes` 会把洞的边界说成文档末尾
+
+`TreeFragment` 的 `open_start` / `open_end` 记的是「这一端是被改动切出来的，
+不是文档的自然边界」。上游 `@lezer/common` 每次切 fragment 时**无条件重写**这两
+个标记（`openStart: cI > 0`、`openEnd: !!nextC`）——只看这一次的改动，把传进来
+的 fragment 已经带着的标记丢掉。
+
+每次编辑之后都重新 `from_tree` 时这不要紧：那时标记本来就都是 false。**而链式
+调用恰恰是这一刀新引入的用法。** 连着编辑两次而中间没人要过树时，第二次
+`apply_changes` 会把上一次留下的那个洞的边界说成「文档末尾」，于是紧挨着洞的
+那个块被原样复用。
+
+后果可见但不报错：在空行处插一个 `X`，上一个段落会把这一行吃成延续行；再在它
+前面插一个字符，第二次解析就把那个段落从洞的位置一刀两断，得到两个段落而不是
+一个。这是本阶段第二例「静默地做错事」（第一例是 preedit 的无符号平移量饱和
+到 0）。
+
+修法是让**每一端的 openness 跟它自己那个来源走**：边界由这次改动切出来的就是
+开的，边界还是 fragment 原来的端点就沿用原来的标记，两者重合时取并。这是与上游
+的第二处分歧（第一处是 `move_to` 不判 `open_start`），说明写在
+`crates/yu-syntax/src/fragment.rs` 的模块文档里，回归测试是
+`incremental.rs::chained_edits_keep_earlier_holes_open`——它在修复前确实是红的。
+
+**这个 bug 是等价性差分找出来的，不是字节数门禁。** 编辑器层「增量树必须等于
+全量树」第一次跑就红了，再在 `yu-syntax` 层收敛成两次编辑的最小复现。要是只
+断言「重扫字节数够小」，它会原样活下来：它让复用**变多**，字节数只会更好看。
+
 #### 还没做的
 
-- **增量解析没接上。** `DecorationCache` 每换一个 Revision 整篇重解析一次。
-  `yu-syntax` 那边 `parse_with_fragments` 已经在了，缺的是这里把 fragment
-  传下去。
 - **`BlockView::hit_test` 的 bidi** 仍然是 v1 的按 x 扫描（S5 登记的未做项）。
   源码映射换完之后它与 `BlockLayout::hit` 可以合流，但那是独立的一刀。
 - **表格与图片没有 widget 化。** 第 3 节的对照表说它们终局是 widget，那要求
