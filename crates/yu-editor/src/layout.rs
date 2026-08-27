@@ -3,6 +3,7 @@ use yu_layout::{LayoutConfig, LayoutError};
 
 use crate::blockview::BlockView;
 use crate::visual::VisualText;
+use crate::widget::ImageSize;
 use yu_markdown::{Block, BlockDecorations, BlockKind, MarkdownDocument};
 use yu_text::{ChangeSet, TextSnapshot};
 
@@ -90,6 +91,33 @@ impl LayoutKey {
     }
 }
 
+/// 排一个块要的那一份产出：装饰、它投影出来的视觉文本、已经解码到位的图片。
+///
+/// 三样凑成一个参数而不是三个：它们必须来自**同一次**产出（同 range 同
+/// Revision），分开传就多三次拿错的机会——而拿错的表现是「画面少了几个
+/// 字」，`BlockLayoutInput` 要到排版时才拒绝。
+#[derive(Clone, Copy)]
+pub struct BlockLayoutSource<'a> {
+    visual: &'a VisualText,
+    decorations: &'a BlockDecorations,
+    sizes: &'a [ImageSize],
+}
+
+impl<'a> BlockLayoutSource<'a> {
+    #[must_use]
+    pub const fn new(
+        visual: &'a VisualText,
+        decorations: &'a BlockDecorations,
+        sizes: &'a [ImageSize],
+    ) -> Self {
+        Self {
+            visual,
+            decorations,
+            sizes,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LayoutEntry {
     key: LayoutKey,
@@ -98,26 +126,31 @@ struct LayoutEntry {
 
 impl LayoutCache {
     /// 缓存里有就取，没有就按这份装饰排一份。
+    ///
+    /// `sizes` 是已经解码到位的图片。缓存**不按它建键**：图片就绪与否不是
+    /// 块的身份，而且那样会让不关心图片的调用方（命中测试）每次都另建一份。
+    /// 命中之后由 [`BlockView::needs_widget_rebuild`] 判要不要重排——那是
+    /// 不变量 D7 的「资源就绪后触发受影响 block 重新 layout」。
     pub fn get_or_build_block(
         &mut self,
         snapshot: &TextSnapshot,
         block: Block,
         config: LayoutConfig,
-        visual: &VisualText,
-        decorations: &BlockDecorations,
+        source: BlockLayoutSource<'_>,
     ) -> Result<&BlockView, LayoutError> {
         let key = LayoutKey::new(block, config, LayoutBackend::Metrics);
         self.prepare(snapshot);
-        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+        if let Some(index) = self.reusable(key, source.sizes) {
             self.stats.hits = self.stats.hits.saturating_add(1);
             return Ok(&self.entries[index].layout);
         }
 
-        let layout = BlockView::build(
-            visual,
-            decorations,
+        let layout = BlockView::build_with_images(
+            source.visual,
+            source.decorations,
             config,
             &yu_layout::MonospaceMetrics::new(config.default_advance()),
+            source.sizes,
         )?;
         Ok(self.insert(key, layout))
     }
@@ -128,19 +161,39 @@ impl LayoutCache {
         snapshot: &TextSnapshot,
         block: Block,
         config: LayoutConfig,
-        visual: &VisualText,
-        decorations: &BlockDecorations,
+        source: BlockLayoutSource<'_>,
         shaper: &S,
     ) -> Result<&BlockView, LayoutError> {
         let key = LayoutKey::new(block, config, LayoutBackend::Shaped);
         self.prepare(snapshot);
-        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+        if let Some(index) = self.reusable(key, source.sizes) {
             self.stats.hits = self.stats.hits.saturating_add(1);
             return Ok(&self.entries[index].layout);
         }
 
-        let layout = BlockView::build_shaped(visual, decorations, config, shaper)?;
+        let layout = BlockView::build_shaped_with_images(
+            source.visual,
+            source.decorations,
+            config,
+            shaper,
+            source.sizes,
+        )?;
         Ok(self.insert(key, layout))
+    }
+
+    /// 这个键上有没有一份还能用的布局。
+    ///
+    /// 还欠着 placeholder、而这一批尺寸里正好有它要的那一张时不能用：那份
+    /// 布局把图片排成了一个四行宽的空盒子，直接返回就是「图片解码完了画面
+    /// 不变」——不报错，只是永远看不到图。
+    fn reusable(&mut self, key: LayoutKey, sizes: &[ImageSize]) -> Option<usize> {
+        let index = self.entries.iter().position(|entry| entry.key == key)?;
+        if self.entries[index].layout.needs_widget_rebuild(sizes) {
+            self.entries.remove(index);
+            self.stats.invalidated = self.stats.invalidated.saturating_add(1);
+            return None;
+        }
+        Some(index)
     }
 
     fn prepare(&mut self, snapshot: &TextSnapshot) {

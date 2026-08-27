@@ -1,14 +1,25 @@
 //! `![替代文字](目标)` 与它的引用形式。
 //!
-//! 图片的**几何**（盒子多大、排在哪一行）不在这里，它要 `LayoutConfig`
-//! 才算得出来。这里只说「这一段是一张图，它的替代文字与目标各在哪」。
+//! 图片是一个 widget（第 3 节的对照表）：不聚焦时整段 `![替代](目标)` 由
+//! [`Decoration::Widget`] 覆盖，从视觉文本里消失，位置上留一个盒子。盒子
+//! **多大**不在这里——那要资源解码后的固有尺寸与 `LayoutConfig`，是
+//! `yu-editor` 与 workspace 的事。这里只说「这一段是一张图，它的替代文字
+//! 与目标各在哪」。
+//!
+//! # 光标进来时 widget 让位
+//!
+//! 与行内语法的定界符同一条规则（[`reveals`]）：光标碰到这一段时整段源码
+//! 原样露出来，可编辑。不变量 D7 要求 widget 的资源失败时「保留可编辑的
+//! 源码回退」——回退就是这一条，不是第二套呈现。
+//!
+//! [`Decoration::Widget`]: yu_decoration::Decoration::Widget
 
-use yu_core::{TextAttrs, TextRange, TextStyle};
+use yu_core::{TextAttrs, TextRange, TextStyle, WidgetSide};
 use yu_syntax::NodeKind;
 
 use super::SyntaxNode;
 use super::{
-    BlockAnnotation, BlockContext, DelimitedSpan, Extension, ExtensionOutput, ImageSpan, reveals,
+    BlockContext, BlockWidget, DelimitedSpan, Extension, ExtensionOutput, ImageSpan, reveals,
 };
 
 pub struct Image;
@@ -26,28 +37,26 @@ impl Extension for Image {
             let Some(span) = DelimitedSpan::of(node, |kind| kind == NodeKind::LinkMark) else {
                 continue;
             };
-            // 与链接同一个理由：替代文字按正文字型排，不继承外层。
-            let style = out.style(TextAttrs::new(TextStyle::Plain));
-            out.mark(span.content, style);
-            if !reveals(cx.active(), node.range()) {
-                out.replace(span.opening);
-                out.replace(span.closing);
+            if reveals(cx.active(), node.range()) {
+                // 与链接同一个理由：替代文字按正文字型排，不继承外层。
+                let style = out.style(TextAttrs::new(TextStyle::Plain));
+                out.mark(span.content, style);
+                continue;
             }
-            // 图片盒子画在替代文字上面，而画它的那一层要先知道「这一段是
-            // 一张图」。装饰说不出这句话——上面三条改的是字型与可见性，
-            // 没有一条是「这里有张图」。理由见 `BlockAnnotation`。
             let destination = child_range(node, NodeKind::Url);
             // 引用式的标签：`![替代][引用]` 取 `LinkLabel`，shortcut
             // `![替代]` 没有 `LinkLabel`，标签就是替代文字本身。
             let reference = destination
                 .is_none()
                 .then(|| child_range(node, NodeKind::LinkLabel).unwrap_or(span.content));
-            out.annotate(BlockAnnotation::Image(ImageSpan::new(
+            let widget = out.widget(BlockWidget::Image(ImageSpan::new(
                 node.range(),
                 span.content,
                 destination,
                 reference,
             )));
+            // 非空 range 的 widget 覆盖并隐藏这一段，`side` 没有歧义。
+            out.place_widget(node.range(), widget, WidgetSide::Before);
         }
     }
 }

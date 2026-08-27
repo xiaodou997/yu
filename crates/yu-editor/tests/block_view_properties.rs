@@ -369,10 +369,11 @@ fn a_click_on_the_left_half_of_a_glyph_lands_before_it() {
     }
 }
 
-/// 点在图片盒子里，命中的是那张图，不是它下面的 alt 文本。
+/// 点在图片盒子里，命中的是那张图。
 ///
-/// 图片还没 widget 化，alt 文本仍然排在视觉文本里、图片盒子画在它上面。
-/// 少了这一条优先级，点图片会变成在 alt 文本里放光标——不报错，只是点不动图。
+/// 图片是一个 widget，盒子在行里占宽度，而它覆盖的 source 一个字节都不进
+/// 视觉文本。少了这一条优先级，点图片会变成把光标放到盒子的某一沿上——
+/// 不报错，只是点不动图。
 #[test]
 fn a_click_inside_an_image_hits_the_image() {
     for source in ["![alt text](/img.png)\n", "before ![alt](/i.png) after\n"] {
@@ -470,6 +471,8 @@ fn every_source_boundary_has_a_caret_inside_the_block() {
 /// 块高盖得住每一条行与每一张图片。
 ///
 /// 盖不住就是「可滚动范围来自另一套几何」——长文档尾部滚不到，不报错。
+/// 图片那一条现在是**导出**的：盒子在行里排，行高把它算进去了。它留着是
+/// 因为表格里的图片仍然是排完之后另摆的（`place_images_in_table`）。
 #[test]
 fn the_block_height_covers_every_line_and_image() {
     for source in CORPUS {
@@ -573,4 +576,168 @@ fn a_prefix_edit_shifts_the_source_ranges_and_keeps_the_geometry() {
             "簇的源码该整体后移"
         );
     }
+}
+
+// -------------------------------------------------------------- 图片 widget
+
+/// 资源没就绪时给一个 placeholder 盒子，排版照常完成（不变量 D7）。
+///
+/// 「照常完成」是这条不变量的全部内容：解码是异步的，排版不能等它。欠着谁
+/// 由 `pending_widgets` 报出来。
+#[test]
+fn an_unresolved_image_gets_a_placeholder_box() {
+    let (view, _) = image_view(&[]);
+    assert_eq!(view.images().len(), 1);
+    assert_eq!(
+        view.layout().pending_widgets().len(),
+        1,
+        "还没解码的图片必须报在 pending 里"
+    );
+    let bounds = view.images()[0].bounds();
+    assert_eq!(bounds.height(), LINE_HEIGHT);
+    assert_eq!(bounds.width(), LINE_HEIGHT * 4.0);
+}
+
+/// 解码后的尺寸到位：盒子按长宽比缩进可用宽度，行跟着长高。
+///
+/// 行不跟着长高的话，图片会压在下一行上——此前正是这样，块高要在
+/// `BlockView::height` 里另取一次 max 才盖得住。
+#[test]
+fn a_ready_image_keeps_its_ratio_and_lifts_its_line() {
+    let (placeholder, _) = image_view(&[]);
+    let (view, source) = image_view(&[]);
+    let ready = image_view(&[(
+        source,
+        yu_editor::ImageIntrinsicSize::new(200, 100).expect("固有尺寸"),
+    )])
+    .0;
+    assert!(view.layout().pending_widgets().len() == 1);
+    assert!(ready.layout().pending_widgets().is_empty());
+
+    let bounds = ready.images()[0].bounds();
+    // 可用宽度 40，固有 200×100 → 缩到 40×20。
+    assert_eq!(bounds.width(), 40.0);
+    assert_eq!(bounds.height(), 20.0);
+    assert!(
+        ready.lines()[0].height() >= bounds.height(),
+        "图片那一行必须容得下它"
+    );
+    assert!(
+        ready.height() > placeholder.height(),
+        "块高跟着行走，不必另取一次 max"
+    );
+}
+
+/// 光标进到图片里，widget 让位，源码原样排出来可编辑（不变量 D7 的回退）。
+#[test]
+fn a_focused_image_lays_out_its_source_instead_of_a_box() {
+    let buffer = TextBuffer::new(IMAGE_SOURCE.to_owned());
+    let snapshot = buffer.snapshot();
+    let markdown = yu_markdown::parse(&snapshot);
+    let block = markdown.blocks().get(0).expect("一个块");
+    let tree = parse_syntax(&snapshot).expect("短文档").into_tree();
+    let active = TextRange::new(ByteOffset::new(5), ByteOffset::new(5)).expect("升序");
+    let decorations = ExtensionSet::markdown()
+        .decorate(&snapshot, &tree, block, Some(active))
+        .expect("装饰");
+    let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
+    let view = BlockView::build(
+        &visual,
+        &decorations,
+        LayoutConfig::new(40.0, LINE_HEIGHT),
+        &MonospaceMetrics::new(1.0),
+    )
+    .expect("排版");
+    assert!(view.images().is_empty(), "露出源码时不排盒子");
+    assert!(
+        view.visual().text().starts_with("![alt]"),
+        "整段源码进视觉文本，实际是 {:?}",
+        view.visual().text()
+    );
+}
+
+const IMAGE_SOURCE: &str = "![alt](/img.png)\n";
+const LINE_HEIGHT: f32 = 10.0;
+
+/// 一张图自成一段，按给定的固有尺寸表排一遍。返回它与那张图的源码区间。
+fn image_view(sizes: &[yu_editor::ImageSize]) -> (BlockView, TextRange) {
+    let buffer = TextBuffer::new(IMAGE_SOURCE.to_owned());
+    let snapshot = buffer.snapshot();
+    let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
+    let yu_editor::BlockWidget::Image(image) = decorations
+        .widgets()
+        .first()
+        .copied()
+        .expect("这个块上有一张图");
+    let view = BlockView::build_with_images(
+        &visual,
+        &decorations,
+        LayoutConfig::new(40.0, LINE_HEIGHT),
+        &MonospaceMetrics::new(1.0),
+        sizes,
+    )
+    .expect("排版");
+    (view, image.source())
+}
+
+/// 单元格里的图片要把列撑开。
+///
+/// widget 在视觉字节流里不占位，按样式段切出来的单元格内容一个字节都切不到
+/// 它。不算的话，一格里只有一张图的那一列会被压成一条缝，而图片照样按自己
+/// 的宽度画出去，压在下一列上——不报错，只是画错。
+#[test]
+fn an_image_in_a_cell_widens_its_column() {
+    let with_image = table_column_widths("| a | ![i](/x.png) |\n| --- | --- |\n| 1 | 2 |\n");
+    let without = table_column_widths("| a |  |\n| --- | --- |\n| 1 | 2 |\n");
+    assert!(
+        with_image[1] > without[1],
+        "有图那一列要更宽：{with_image:?} vs {without:?}"
+    );
+}
+
+fn table_column_widths(source: &str) -> Vec<f32> {
+    let buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
+    let view = BlockView::build(
+        &visual,
+        &decorations,
+        LayoutConfig::new(400.0, LINE_HEIGHT),
+        &MonospaceMetrics::new(1.0),
+    )
+    .expect("排版");
+    view.table()
+        .expect("这个块是一张表")
+        .column_widths()
+        .to_vec()
+}
+
+/// preedit 之后的 widget 锚点跟着往后挪。
+///
+/// 样式段与 widget 锚点都排在 canonical 视觉空间里，再由 preedit 整体让位。
+/// widget 忘了让位的话，图片会画在 preedit 里那几个字的中间——不报错。
+#[test]
+fn a_preedit_pushes_a_later_image_anchor_along() {
+    let source = "ab ![alt](/x.png)\n";
+    let buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
+    let config = LayoutConfig::new(400.0, LINE_HEIGHT);
+    let plain =
+        BlockView::build(&visual, &decorations, config, &MonospaceMetrics::new(1.0)).expect("排版");
+    let anchor = plain.layout().widgets()[0].visual();
+
+    // 把 "ab" 换成三个字节的 preedit：锚点要往后挪一个字节。
+    let replacement = TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("升序");
+    let composed = visual
+        .with_composition(replacement, "abc", TextRange::empty(ByteOffset::ZERO))
+        .expect("preedit");
+    let view = BlockView::build(&composed, &decorations, config, &MonospaceMetrics::new(1.0))
+        .expect("排版");
+    assert_eq!(
+        view.layout().widgets()[0].visual().get(),
+        anchor.get() + 1,
+        "preedit 长了一个字节，它后面的 widget 锚点也要挪一个字节"
+    );
 }

@@ -14,12 +14,13 @@ use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
 };
 
+use crate::widget::ImageSize;
 use crate::{
-    CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay, DecorationCache,
-    DecorationCacheStats, DecorationError, EditorCommand, EditorSelection, KeyEvent,
-    KeyRouteResult, LayoutBackend, LayoutCache, LayoutCacheStats, LayoutPoint, SelectionError,
-    SourceChange, ViewportCaret, ViewportConfig, ViewportError, ViewportLayout, ViewportSnapshot,
-    ViewportSpan, ViewportStats, VisualText, VisualTextError,
+    BlockLayoutSource, CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay,
+    DecorationCache, DecorationCacheStats, DecorationError, EditorCommand, EditorSelection,
+    KeyEvent, KeyRouteResult, LayoutBackend, LayoutCache, LayoutCacheStats, LayoutPoint,
+    SelectionError, SourceChange, ViewportCaret, ViewportConfig, ViewportError, ViewportLayout,
+    ViewportSnapshot, ViewportSpan, ViewportStats, VisualText, VisualTextError,
     command::{
         next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
         previous_word_boundary,
@@ -29,7 +30,7 @@ use crate::{
     list::ListLinePrefix,
 };
 use yu_decoration::Bias;
-use yu_markdown::{BlockAnnotation, BlockDecorations, ImageSpan};
+use yu_markdown::{BlockDecorations, BlockWidget, ImageSpan};
 
 /// The canonical source and transient composition state owned by one editor.
 ///
@@ -305,6 +306,20 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
     ) -> Result<&BlockView, EditorDocumentError> {
+        self.block_layout_with_images(index, config, &[])
+    }
+
+    /// [`Self::block_layout`] 加上已经解码到位的图片尺寸。
+    ///
+    /// 没列进来的图片画 placeholder（不变量 D7），所以不关心图片的调用方
+    /// 传一张空表即可——那不会把缓存里带尺寸的那一份挤掉，判据见
+    /// [`BlockView::needs_widget_rebuild`]。
+    pub fn block_layout_with_images(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        sizes: &[ImageSize],
+    ) -> Result<&BlockView, EditorDocumentError> {
         let block = self.block_at(index)?;
         let snapshot = self.snapshot();
         let decorations = self
@@ -313,7 +328,12 @@ impl EditorDocument {
             .clone();
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
         self.layouts
-            .get_or_build_block(&snapshot, block, config, &visual, &decorations)
+            .get_or_build_block(
+                &snapshot,
+                block,
+                config,
+                BlockLayoutSource::new(&visual, &decorations, sizes),
+            )
             .map_err(EditorDocumentError::Layout)
     }
 
@@ -328,6 +348,35 @@ impl EditorDocument {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<&BlockView, EditorDocumentError> {
+        self.block_layout_with_shaper_and_images(index, config, shaper, &[])
+    }
+
+    /// 一个块上已经解码到位的图片。
+    ///
+    /// 装饰先建出来才知道这个块上有哪几张图，所以它与排版是两步。只看这个
+    /// 块，不扫整篇文档——viewport 查询不该因为要问图片而变成一次全文扫描。
+    pub fn block_image_sizes<F>(
+        &mut self,
+        index: usize,
+        image_resolver: &F,
+    ) -> Result<Vec<ImageSize>, EditorDocumentError>
+    where
+        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
+    {
+        let block = self.block_at(index)?;
+        let snapshot = self.snapshot();
+        let decorations = self.decorations.get_or_build_block(&snapshot, block)?;
+        Ok(image_sizes(decorations, image_resolver))
+    }
+
+    /// [`Self::block_layout_with_shaper`] 加上已经解码到位的图片尺寸。
+    pub fn block_layout_with_shaper_and_images<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+        sizes: &[ImageSize],
+    ) -> Result<&BlockView, EditorDocumentError> {
         let block = self.block_at(index)?;
         let snapshot = self.snapshot();
         let decorations = self
@@ -336,7 +385,13 @@ impl EditorDocument {
             .clone();
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
         self.layouts
-            .get_or_build_block_with_shaper(&snapshot, block, config, &visual, &decorations, shaper)
+            .get_or_build_block_with_shaper(
+                &snapshot,
+                block,
+                config,
+                BlockLayoutSource::new(&visual, &decorations, sizes),
+                shaper,
+            )
             .map_err(EditorDocumentError::Layout)
     }
 
@@ -359,6 +414,21 @@ impl EditorDocument {
         .map_err(EditorDocumentError::Layout)
     }
 
+    /// [`Self::block_layout_with_selection_reveal_and_shaper`] 加上图片尺寸。
+    pub fn block_layout_with_selection_reveal_and_shaper_and_images<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+        sizes: &[ImageSize],
+    ) -> Result<BlockView, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let decorations = self.block_decorations_with_selection_reveal(index)?;
+        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
+        BlockView::build_shaped_with_images(&visual, &decorations, config, shaper, sizes)
+            .map_err(EditorDocumentError::Layout)
+    }
+
     /// Shaping-aware selection reveal layout. The result is intentionally
     /// transient because moving a caret does not change source Revision.
     pub fn block_layout_with_selection_reveal_and_shaper<S: ShapingProvider>(
@@ -367,11 +437,7 @@ impl EditorDocument {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<BlockView, EditorDocumentError> {
-        let snapshot = self.snapshot();
-        let decorations = self.block_decorations_with_selection_reveal(index)?;
-        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
-        BlockView::build_shaped(&visual, &decorations, config, shaper)
-            .map_err(EditorDocumentError::Layout)
+        self.block_layout_with_selection_reveal_and_shaper_and_images(index, config, shaper, &[])
     }
 
     /// Returns an owned layout for the current transient visual state.
@@ -383,16 +449,29 @@ impl EditorDocument {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<BlockView, EditorDocumentError> {
+        self.block_layout_for_visual_state_with_shaper_and_images(index, config, shaper, &[])
+    }
+
+    /// [`Self::block_layout_for_visual_state_with_shaper`] 加上图片尺寸。
+    pub fn block_layout_for_visual_state_with_shaper_and_images<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+        sizes: &[ImageSize],
+    ) -> Result<BlockView, EditorDocumentError> {
         if self
             .composition_block_range()
             .as_ref()
             .is_some_and(|span| span.contains(&index))
         {
-            self.block_layout_with_composition_and_shaper(index, config, shaper)
+            self.block_layout_with_composition_and_shaper_and_images(index, config, shaper, sizes)
         } else if self.selection_reveal_block_index() == Some(index) {
-            self.block_layout_with_selection_reveal_and_shaper(index, config, shaper)
+            self.block_layout_with_selection_reveal_and_shaper_and_images(
+                index, config, shaper, sizes,
+            )
         } else {
-            self.block_layout_with_shaper(index, config, shaper)
+            self.block_layout_with_shaper_and_images(index, config, shaper, sizes)
                 .cloned()
         }
     }
@@ -500,8 +579,19 @@ impl EditorDocument {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<BlockView, EditorDocumentError> {
+        self.block_layout_with_composition_and_shaper_and_images(index, config, shaper, &[])
+    }
+
+    /// [`Self::block_layout_with_composition_and_shaper`] 加上图片尺寸。
+    pub fn block_layout_with_composition_and_shaper_and_images<S: ShapingProvider>(
+        &mut self,
+        index: usize,
+        config: LayoutConfig,
+        shaper: &S,
+        sizes: &[ImageSize],
+    ) -> Result<BlockView, EditorDocumentError> {
         let (visual, decorations) = self.block_visual_for_composition(index)?;
-        BlockView::build_shaped(&visual, &decorations, config, shaper)
+        BlockView::build_shaped_with_images(&visual, &decorations, config, shaper, sizes)
             .map_err(EditorDocumentError::Layout)
     }
 
@@ -835,11 +925,10 @@ impl EditorDocument {
         for _ in 0..8 {
             let mut changed = false;
             for index in range.start()..range.end() {
-                let mut block_layout = self
-                    .block_layout_with_shaper(index, config, shaper)?
-                    .clone();
-                apply_image_measurements(&mut block_layout, image_resolver)?;
-                let height = block_layout.height();
+                let sizes = self.block_image_sizes(index, image_resolver)?;
+                let height = self
+                    .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
+                    .height();
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -883,9 +972,10 @@ impl EditorDocument {
             // syntax may rewrap, so measure it first to keep every later block
             // y-coordinate consistent with the retained scene.
             if let Some(index) = reveal_block {
-                let mut block_layout =
-                    self.block_layout_with_selection_reveal_and_shaper(index, config, shaper)?;
-                apply_image_measurements(&mut block_layout, image_resolver)?;
+                let sizes = self.block_image_sizes(index, image_resolver)?;
+                let block_layout = self.block_layout_with_selection_reveal_and_shaper_and_images(
+                    index, config, shaper, &sizes,
+                )?;
                 changed |= layout
                     .set_block_height(index, block_layout.height())
                     .map_err(EditorDocumentError::Viewport)?;
@@ -895,12 +985,12 @@ impl EditorDocument {
                 if reveal_block == Some(index) {
                     continue;
                 }
-                let mut block_layout = self
-                    .block_layout_with_shaper(index, config, shaper)?
-                    .clone();
-                apply_image_measurements(&mut block_layout, image_resolver)?;
+                let sizes = self.block_image_sizes(index, image_resolver)?;
+                let height = self
+                    .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
+                    .height();
                 changed |= layout
-                    .set_block_height(index, block_layout.height())
+                    .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
             }
             let next = layout
@@ -943,11 +1033,12 @@ impl EditorDocument {
             // measure the affected span before measuring the visible window.
             if let Some(span) = composition_span.as_ref() {
                 for index in span.clone() {
-                    let mut block_layout = self
-                        .block_layout_with_composition_and_shaper(index, config, shaper)?
-                        .clone();
-                    apply_image_measurements(&mut block_layout, image_resolver)?;
-                    let height = block_layout.height();
+                    let sizes = self.block_image_sizes(index, image_resolver)?;
+                    let height = self
+                        .block_layout_with_composition_and_shaper_and_images(
+                            index, config, shaper, &sizes,
+                        )?
+                        .height();
                     changed |= layout
                         .set_block_height(index, height)
                         .map_err(EditorDocumentError::Viewport)?;
@@ -961,11 +1052,10 @@ impl EditorDocument {
                 {
                     continue;
                 }
-                let mut block_layout = self
-                    .block_layout_with_shaper(index, config, shaper)?
-                    .clone();
-                apply_image_measurements(&mut block_layout, image_resolver)?;
-                let height = block_layout.height();
+                let sizes = self.block_image_sizes(index, image_resolver)?;
+                let height = self
+                    .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
+                    .height();
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -2151,26 +2241,21 @@ impl EditorDocument {
     }
 }
 
-fn apply_image_measurements<F>(
-    layout: &mut BlockView,
-    image_resolver: &F,
-) -> Result<(), EditorDocumentError>
+/// 这个块上已经解码到位的图片。
+///
+/// 没解出来的不进表——widget 会给它一个 placeholder 盒子（不变量 D7），
+/// 而不是让整块排版失败。
+pub fn image_sizes<F>(decorations: &BlockDecorations, image_resolver: &F) -> Vec<ImageSize>
 where
     F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
 {
-    let measurements = layout
-        .decorations()
-        .annotations()
+    decorations
+        .widgets()
         .iter()
         .copied()
-        .filter_map(|annotation| {
-            let BlockAnnotation::Image(image) = annotation;
-            image_resolver(image).map(|size| (image.source(), size))
-        })
-        .collect::<Vec<_>>();
-    layout
-        .apply_image_intrinsic_sizes(&measurements)
-        .map_err(EditorDocumentError::Layout)
+        .map(|BlockWidget::Image(image)| image)
+        .filter_map(|image| image_resolver(image).map(|size| (image.source(), size)))
+        .collect()
 }
 
 fn source_change_from_applied(
@@ -4086,6 +4171,63 @@ prefix **羽🙂** suffix
         assert_eq!(metrics_again.blocks()[0].height(), 1.0);
     }
 
+    /// 资源就绪之后受影响的块重排一次（不变量 D7 的后半句）。
+    ///
+    /// 缓存不按图片建键：图片就绪与否不是块的身份。命中之后由
+    /// `needs_widget_rebuild` 判——判错的方向只有一个坏处大：判「不用重排」
+    /// 时图片解码完了画面不变，不报错，只是永远看不到图。
+    #[test]
+    fn a_ready_image_rebuilds_the_cached_layout() {
+        let mut document = EditorDocument::new("![alt](image.png)");
+        let config = LayoutConfig::new(80.0, 10.0);
+        let placeholder = document
+            .block_layout(0, config)
+            .expect("placeholder layout")
+            .images()[0]
+            .bounds();
+        assert_eq!(document.layout_cache_stats().builds(), 1);
+
+        let intrinsic = ImageIntrinsicSize::new(200, 100).expect("image dimensions");
+        let sizes = document
+            .block_image_sizes(0, &|_| Some(intrinsic))
+            .expect("image sizes");
+        let ready = document
+            .block_layout_with_images(0, config, &sizes)
+            .expect("ready layout")
+            .images()[0]
+            .bounds();
+        assert_eq!(document.layout_cache_stats().builds(), 2, "就绪要重排一次");
+        assert_ne!(placeholder.height(), ready.height());
+        assert_eq!(ready.height(), 40.0);
+    }
+
+    /// 不带尺寸表的调用方不会把带尺寸的那一份挤掉。
+    ///
+    /// 命中测试、Accessibility 与纯度量排版都不关心图片解码没有，传的是空
+    /// 表。按尺寸表建键的话它们每帧都会把就绪的那一份换成 placeholder，
+    /// 然后下一帧再换回来——图片一直在闪，而两份都是「对的」。
+    #[test]
+    fn a_query_without_image_sizes_keeps_the_ready_layout() {
+        let mut document = EditorDocument::new("![alt](image.png)");
+        let config = LayoutConfig::new(80.0, 10.0);
+        let intrinsic = ImageIntrinsicSize::new(200, 100).expect("image dimensions");
+        let sizes = document
+            .block_image_sizes(0, &|_| Some(intrinsic))
+            .expect("image sizes");
+        document
+            .block_layout_with_images(0, config, &sizes)
+            .expect("ready layout");
+        let builds = document.layout_cache_stats().builds();
+
+        let again = document
+            .block_layout(0, config)
+            .expect("layout without sizes")
+            .images()[0]
+            .bounds();
+        assert_eq!(document.layout_cache_stats().builds(), builds);
+        assert_eq!(again.height(), 40.0);
+    }
+
     #[test]
     fn ready_image_intrinsic_height_updates_block_index_and_content_height() {
         let mut document = EditorDocument::new("![alt](image.png)\n\ntext");
@@ -4110,8 +4252,12 @@ prefix **羽🙂** suffix
                 |_| Some(intrinsic),
             )
             .expect("ready image viewport should measure");
-        assert_eq!(ready.blocks()[0].height(), 40.0);
-        assert_eq!(ready.blocks()[1].y(), 40.0);
+        // 40 是图片那一行（200×100 缩到 80 宽就是 40 高），10 是块尾那个
+        // 换行符自己的行。图片 widget 化之前这里是 40：图片是排完之后另贴
+        // 上去的盒子，行不知道它有多高，块高只能取 `max(行盒累加, 图片下
+        // 沿)`——于是图片压在块尾那一行上面。
+        assert_eq!(ready.blocks()[0].height(), 50.0);
+        assert_eq!(ready.blocks()[1].y(), 50.0);
         assert!(ready.content_height() > placeholder.content_height());
         assert!(ready.content_height() >= ready.blocks()[1].y() + ready.blocks()[1].height());
     }

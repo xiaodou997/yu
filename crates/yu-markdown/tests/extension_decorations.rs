@@ -10,11 +10,11 @@
 //! 3. **验收本身。** S6 的验收是「新增一种语法的 diff 只落在 `yu-markdown`
 //!    内，且 < 200 行」。这里真的加一种，看它需不需要动别的地方。
 
-use yu_core::{ByteOffset, StyleId, TextAttrs, TextRange, TextStyle};
+use yu_core::{ByteOffset, StyleId, TextAttrs, TextRange, TextStyle, WidgetId, WidgetSide};
 use yu_decoration::LineStyleId;
 use yu_markdown::{
-    BlockAnnotation, BlockContext, BlockDecorations, BlockOrnament, DelimitedSpan, Extension,
-    ExtensionOutput, ExtensionSet, parse,
+    BlockContext, BlockDecorations, BlockOrnament, BlockWidget, DelimitedSpan, Extension,
+    ExtensionOutput, ExtensionSet, ImageSpan, parse,
 };
 use yu_syntax::{NodeKind, parse as parse_syntax};
 use yu_text::TextBuffer;
@@ -698,17 +698,17 @@ fn a_backward_space_run_that_crosses_the_read_window_is_still_one_run() {
     }
 }
 
-// ------------------------------------------------------------------ 语义标注
+// -------------------------------------------------------------- 视觉物件
 
-/// 这个块上的图片标注。
+/// 这个块上的图片。
 fn images(
     decorations: &BlockDecorations,
 ) -> Vec<(TextRange, TextRange, Option<TextRange>, Option<TextRange>)> {
     decorations
-        .annotations()
+        .widgets()
         .iter()
-        .map(|annotation| {
-            let BlockAnnotation::Image(image) = annotation;
+        .copied()
+        .map(|BlockWidget::Image(image)| {
             (
                 image.source(),
                 image.label(),
@@ -719,10 +719,111 @@ fn images(
         .collect()
 }
 
+/// 这个块上每一条 widget 装饰：覆盖的 source 区间与它指向的那个物件。
+fn widgets(decorations: &BlockDecorations) -> Vec<(TextRange, BlockWidget)> {
+    decorations
+        .set()
+        .all()
+        .iter()
+        .filter_map(|entry| match entry.decoration {
+            yu_decoration::Decoration::Widget { widget, .. } => {
+                decorations.widget(widget).map(|found| (entry.range, found))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// 图片是一个 widget：整段 `![替代](目标)` 从视觉文本里消失，位置上留一个
+/// 盒子。
+///
+/// 此前替代文字留在视觉文本里，图片盒子画在它上面——盒子有多宽由排出来的
+/// 那几个簇说了算，于是同一张图在替代文字长短不同时宽度不一样，而两样都
+/// 画出来。
+#[test]
+fn an_image_is_one_widget_over_its_whole_markup() {
+    let decorations = decorate("![替代](图片)", None);
+    assert_eq!(
+        hidden(&decorations),
+        vec![(0, 17)],
+        "整段进 widget，一个字节都不留在视觉文本里"
+    );
+    let placed = widgets(&decorations);
+    assert_eq!(placed.len(), 1, "一张图一个 widget，实际是 {placed:?}");
+    assert_eq!(placed[0].0, range(0, 17));
+    let BlockWidget::Image(image) = placed[0].1;
+    assert_eq!(image.source(), range(0, 17));
+    assert_eq!(image.label(), range(2, 8));
+}
+
+/// 光标进来时 widget 让位，源码原样露出来。
+///
+/// 不变量 D7 要求 widget 有「可编辑的源码回退」。回退就是这一条：和行内
+/// 语法的定界符同一条规则，不是第二套呈现。盒子不让位的话，用户没法改自己
+/// 写的那个 URL——图片压在上面。
+#[test]
+fn a_focused_image_gives_its_source_back_instead_of_a_widget() {
+    let decorations = decorate("![替代](图片)", Some(range(5, 5)));
+    assert!(hidden(&decorations).is_empty(), "整段源码都要看得见");
+    assert!(widgets(&decorations).is_empty(), "露出源码时不再排盒子");
+}
+
+/// 图片之外的一个也产 widget 的 extension，用来考 widget id 的平移。
+///
+/// 它盖在块的头一个字节上。产的同样是 `BlockWidget::Image`——这个枚举现在
+/// 只有一个变体，而这里考的是**id 怎么分**，不是它是什么。
+struct Stamp;
+
+impl Extension for Stamp {
+    fn name(&self) -> &'static str {
+        "stamp"
+    }
+
+    fn decorate(&self, cx: &BlockContext<'_>, out: &mut ExtensionOutput) {
+        let start = cx.range().start();
+        let Some(head) = TextRange::new(start, ByteOffset::new(start.get().saturating_add(1)))
+        else {
+            return;
+        };
+        let widget = out.widget(BlockWidget::Image(ImageSpan::new(head, head, None, None)));
+        out.place_widget(head, widget, WidgetSide::Before);
+    }
+}
+
+/// widget 的 id 与样式 id 一样是**局部**的，合并时整体平移。
+///
+/// 共用一个全局编号的话，`WidgetId(0)` 是谁的就取决于谁先跑——那正是 D6
+/// 禁止的相互感知，而且是静默的那种：换个注册顺序，图片会画成另一个物件。
+#[test]
+fn widget_ids_are_rebased_per_extension() {
+    let decorations = decorate_with(&ExtensionSet::markdown().with(Stamp), "![替代](图片)", None);
+    let BlockWidget::Image(image) = decorations
+        .widget(WidgetId(0))
+        .expect("图片的 widget 排在前面，它是注册表里更早的那一个");
+    assert_eq!(image.source(), range(0, 17));
+    let BlockWidget::Image(stamp) = decorations
+        .widget(WidgetId(1))
+        .expect("后注册的 extension 的局部 0 号被平移成 1 号");
+    assert_eq!(stamp.source(), range(0, 1));
+    assert_eq!(decorations.widgets().len(), 2);
+
+    // **装饰指的是哪一个**才是 id 平移真正管的事。只查表查不出来：表是按
+    // 注册顺序拼的，平不平移都一样长、一样序。不平移的话两条装饰都指向
+    // 0 号，图片与图章会画成同一个物件——不报错。
+    let placed = widgets(&decorations);
+    assert_eq!(
+        placed,
+        vec![
+            (range(0, 1), BlockWidget::Image(stamp)),
+            (range(0, 17), BlockWidget::Image(image)),
+        ]
+    );
+}
+
 /// 行内式图片：整段、替代文字、目标各自的区间。
 ///
-/// 画图片盒子的那一层认的就是这三样。它们**不在** `DecorationSet` 里，
-/// 因为这里没有任何视觉效果被装饰改掉——理由写在 `BlockAnnotation` 上。
+/// 画图片盒子的那一层认的就是这三样，由 `Decoration::Widget` 的
+/// `WidgetId` 指着。
 #[test]
 fn an_inline_image_is_annotated_with_its_label_and_destination() {
     let decorations = decorate("![替代](图片)", None);
@@ -758,7 +859,7 @@ fn a_shortcut_image_falls_back_to_its_own_label() {
 /// 表格的网格由 `BlockOrnament::Table` 带上来。
 ///
 /// 它是**块级**的，所以走 `Decoration::Line` 那条已有的通道，不走
-/// `BlockAnnotation`——后者是给行内语法（图片）准备的。
+/// widget——表格的 widget 化还没做，见 overview 第 8 节 S6。
 #[test]
 fn a_table_carries_its_grid_as_a_block_ornament() {
     let decorations = decorate("a | b\n--- | ---\n1 | 2", None);
@@ -937,7 +1038,11 @@ fn every_id_resolves_across_the_corpus() {
                         decorations.ornament(style).is_some(),
                         "{source:?} 的 {style:?} 查不到"
                     ),
-                    _ => {}
+                    yu_decoration::Decoration::Widget { widget, .. } => assert!(
+                        decorations.widget(widget).is_some(),
+                        "{source:?} 的 {widget:?} 查不到"
+                    ),
+                    yu_decoration::Decoration::Replace => {}
                 }
             }
         }

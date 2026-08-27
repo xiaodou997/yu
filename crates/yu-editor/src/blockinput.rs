@@ -29,7 +29,7 @@ use yu_core::{VisualOffset, VisualRange};
 use yu_decoration::Decoration;
 use yu_layout::{
     LayoutConfig, LayoutError, LayoutInput, LayoutRect, LineAttrs, LineSpan, LineStyleTable,
-    StyleTable, StyledRun,
+    StyleTable, StyledRun, WidgetSpan,
 };
 use yu_markdown::{BlockDecorations, BlockOrnament};
 
@@ -217,6 +217,7 @@ impl BlockOrnaments {
 pub struct BlockLayoutInput {
     text: String,
     runs: Vec<StyledRun>,
+    widgets: Vec<WidgetSpan>,
     lines: Vec<LineSpan>,
     styles: BlockStyleTable,
     line_styles: BlockLineStyleTable,
@@ -270,7 +271,15 @@ impl BlockLayoutInput {
 
     #[must_use]
     pub fn layout_input(&self) -> LayoutInput<'_> {
-        LayoutInput::new(&self.text, &self.runs).with_line_styles(&self.lines)
+        LayoutInput::new(&self.text, &self.runs)
+            .with_widgets(&self.widgets)
+            .with_line_styles(&self.lines)
+    }
+
+    /// 这个块上的 widget 锚点，按 `(visual, side)` 升序。
+    #[must_use]
+    pub fn widgets(&self) -> &[WidgetSpan] {
+        &self.widgets
     }
 
     #[must_use]
@@ -438,6 +447,7 @@ fn block_quote_metrics(depth: u8, config: LayoutConfig) -> Result<BlockQuoteMetr
 struct DecorationDraft {
     text: String,
     runs: Vec<StyledRun>,
+    widgets: Vec<WidgetSpan>,
     styles: Vec<TextAttrs>,
     source_range: TextRange,
     heading: Option<u8>,
@@ -493,9 +503,27 @@ impl DecorationDraft {
             let end = visual.canonical_source_to_visual(segment.end());
             push_run(&mut runs, start, end, style)?;
         }
-        let runs = match visual.composition_visual() {
-            Some(span) => splice_composition(runs, visual, span, plain)?,
-            None => runs,
+        // widget 在视觉字节流里不占位，所以它只有一个锚点：被覆盖的那段
+        // source 塌下去的那个视觉偏移。两端问同一个映射会得到同一个数，
+        // 取起点。
+        let mut widgets = Vec::new();
+        for entry in decorations.set().all() {
+            let Decoration::Widget { widget, side } = entry.decoration else {
+                continue;
+            };
+            widgets.push(WidgetSpan::new(
+                visual.canonical_source_to_visual(entry.range.start()),
+                widget,
+                side,
+            ));
+        }
+
+        let (runs, widgets) = match visual.composition_visual() {
+            Some(span) => (
+                splice_composition(runs, visual, span, plain)?,
+                shift_widgets(widgets, visual, span)?,
+            ),
+            None => (runs, widgets),
         };
 
         let mut heading = None;
@@ -523,6 +551,7 @@ impl DecorationDraft {
         Ok(Self {
             text: visual.text().to_owned(),
             runs,
+            widgets,
             styles,
             source_range: bounds,
             heading,
@@ -577,6 +606,7 @@ impl DecorationDraft {
         Ok(BlockLayoutInput {
             text: self.text,
             runs: self.runs,
+            widgets: self.widgets,
             lines: vec![LineSpan::new(visual, BLOCK_LINE_STYLE)],
             styles: BlockStyleTable { attrs },
             line_styles: BlockLineStyleTable {
@@ -652,18 +682,9 @@ fn splice_composition(
     span: VisualRange,
     plain: StyleId,
 ) -> Result<Vec<StyledRun>, LayoutError> {
-    let replacement = visual
-        .composition_range()
-        .ok_or(LayoutError::Upstream("preedit 区间缺失".into()))?;
-    let old_start = visual.canonical_source_to_visual(replacement.start());
-    let old_end = visual.canonical_source_to_visual(replacement.end());
-    let shift = |offset: VisualOffset| -> Result<VisualOffset, LayoutError> {
-        let moved =
-            i128::from(offset.get()) + i128::from(span.end().get()) - i128::from(old_end.get());
-        u64::try_from(moved)
-            .map(VisualOffset::new)
-            .map_err(|_| LayoutError::OffsetOverflow)
-    };
+    let composition = CompositionShift::read(visual, span)?;
+    let (old_start, old_end) = (composition.old_start, composition.old_end);
+    let shift = |offset: VisualOffset| composition.shift(offset);
 
     let mut spliced: Vec<StyledRun> = Vec::with_capacity(runs.len().saturating_add(1));
     for run in runs {
@@ -697,4 +718,68 @@ fn splice_composition(
         );
     }
     Ok(spliced)
+}
+
+/// preedit 把 canonical 视觉空间里的一段换成了另一段。
+///
+/// 样式段与 widget 锚点都排在 canonical 空间里，然后由这一层整体让位——
+/// 两处各写一遍这个平移，就会在「preedit 前面还是后面」的边界上分叉，而
+/// 分叉的表现是 preedit 旁边的字型或图片盒子偏几个字节，不报错。
+#[derive(Clone, Copy)]
+struct CompositionShift {
+    old_start: VisualOffset,
+    old_end: VisualOffset,
+    span: VisualRange,
+}
+
+impl CompositionShift {
+    fn read(visual: &VisualText, span: VisualRange) -> Result<Self, LayoutError> {
+        let replacement = visual
+            .composition_range()
+            .ok_or(LayoutError::Upstream("preedit 区间缺失".into()))?;
+        Ok(Self {
+            old_start: visual.canonical_source_to_visual(replacement.start()),
+            old_end: visual.canonical_source_to_visual(replacement.end()),
+            span,
+        })
+    }
+
+    /// preedit **之后**的一个偏移挪到它的新位置。
+    ///
+    /// 平移量可以是负数（三个字的 preedit 换成一个字符），所以中间那一步
+    /// 走 `i128`——用无符号数算会在那种情况下饱和到 0，之后每个位置都差
+    /// 几个字节，不 panic、不报错。
+    fn shift(self, offset: VisualOffset) -> Result<VisualOffset, LayoutError> {
+        let moved = i128::from(offset.get()) + i128::from(self.span.end().get())
+            - i128::from(self.old_end.get());
+        u64::try_from(moved)
+            .map(VisualOffset::new)
+            .map_err(|_| LayoutError::OffsetOverflow)
+    }
+}
+
+/// 把 widget 锚点叠进 preedit。
+///
+/// preedit 盖住锚点时锚点落到 preedit 的起点：widget 覆盖的那段 source 正在
+/// 被替换，它没有别的地方可去。丢掉它也是一种选择，但那会让「装饰集合里的
+/// widget 与排出来的盒子一一对应」不再成立。
+fn shift_widgets(
+    widgets: Vec<WidgetSpan>,
+    visual: &VisualText,
+    span: VisualRange,
+) -> Result<Vec<WidgetSpan>, LayoutError> {
+    let composition = CompositionShift::read(visual, span)?;
+    widgets
+        .into_iter()
+        .map(|widget| {
+            let anchor = if widget.visual() <= composition.old_start {
+                widget.visual()
+            } else if widget.visual() >= composition.old_end {
+                composition.shift(widget.visual())?
+            } else {
+                composition.span.start()
+            };
+            Ok(WidgetSpan::new(anchor, widget.widget(), widget.side()))
+        })
+        .collect()
 }

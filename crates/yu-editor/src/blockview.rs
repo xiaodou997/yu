@@ -33,7 +33,7 @@ use yu_core::{
 use yu_decoration::Bias;
 use yu_layout::{
     BlockLayout, HeightIndex, HeightIndexError, LayoutConfig, LayoutError, LayoutPoint, LayoutRect,
-    NoWidgets, StyleTable,
+    StyleTable, WidgetMeasure,
 };
 use yu_markdown::{BlockDecorations, BlockOrnament};
 use yu_text::{ChangeSet, TextSnapshot};
@@ -43,6 +43,7 @@ use crate::geometry::{source_range_contains, upstream};
 use crate::image::{ImagePlacement, build_image_placements, place_images_in_table};
 use crate::table::{TableLayout, TableResizeCommit};
 use crate::visual::VisualText;
+use crate::widget::{BlockWidgets, ImageSize, constraints_of};
 
 /// 一个视觉簇：视觉几何加上它对应的源码。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -329,56 +330,94 @@ pub struct BlockView {
 }
 
 impl BlockView {
-    /// 按度量排。列表标记只算宽度，不产字形。
+    /// 按度量排，图片一律画 placeholder。
     ///
-    /// `visual` 必须是 `decorations` 投影出来的那一份——preedit 可以已经叠
-    /// 在上面。两者对不上时 [`BlockLayoutInput`] 会拒绝。
+    /// 命中测试、Accessibility、纯度量排版走这一条：它们不关心图片解码没有。
     pub fn build<M: ClusterMetrics>(
         visual: &VisualText,
         decorations: &BlockDecorations,
         config: LayoutConfig,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
+        Self::build_with_images(visual, decorations, config, metrics, &[])
+    }
+
+    /// 按度量排。列表标记只算宽度，不产字形。
+    ///
+    /// `visual` 必须是 `decorations` 投影出来的那一份——preedit 可以已经叠
+    /// 在上面。两者对不上时 [`BlockLayoutInput`] 会拒绝。
+    ///
+    /// `sizes` 是已经解码到位的图片，没列进来的画 placeholder（不变量 D7）。
+    pub fn build_with_images<M: ClusterMetrics>(
+        visual: &VisualText,
+        decorations: &BlockDecorations,
+        config: LayoutConfig,
+        metrics: &M,
+        sizes: &[ImageSize],
+    ) -> Result<Self, LayoutError> {
         let input = BlockLayoutInput::from_decorations(decorations, visual, config, metrics)?;
+        let widgets = BlockWidgets::new(decorations.widgets(), sizes);
         let layout = BlockLayout::build_all(
             input.layout_input(),
             config,
             input.styles(),
-            &NoWidgets,
+            &widgets,
             input.line_styles(),
             metrics,
         )?;
         let table = table_of(decorations)
             .map(|table| {
-                TableLayout::from_table(table, visual, &input, config, |text, source, style| {
-                    crate::table::measure_with(text, source, style, metrics)
-                })
+                TableLayout::from_table(
+                    table,
+                    visual,
+                    &input,
+                    layout.widgets(),
+                    config,
+                    |text, source, style| crate::table::measure_with(text, source, style, metrics),
+                )
             })
             .transpose()?;
         Self::assemble(visual, decorations, config, input, layout, table)
     }
 
-    /// 按 shaping 后端排。列表标记的字形一并进字形流。
+    /// 按 shaping 后端排，图片一律画 placeholder。
     pub fn build_shaped<S: ShapingProvider>(
         visual: &VisualText,
         decorations: &BlockDecorations,
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<Self, LayoutError> {
+        Self::build_shaped_with_images(visual, decorations, config, shaper, &[])
+    }
+
+    /// 按 shaping 后端排。列表标记的字形一并进字形流。
+    pub fn build_shaped_with_images<S: ShapingProvider>(
+        visual: &VisualText,
+        decorations: &BlockDecorations,
+        config: LayoutConfig,
+        shaper: &S,
+        sizes: &[ImageSize],
+    ) -> Result<Self, LayoutError> {
         let input = BlockLayoutInput::from_decorations_shaped(decorations, visual, config, shaper)?;
+        let widgets = BlockWidgets::new(decorations.widgets(), sizes);
         let layout = BlockLayout::build_shaped(
             input.layout_input(),
             config,
             input.styles(),
-            &NoWidgets,
+            &widgets,
             input.line_styles(),
             shaper,
         )?;
         let table = table_of(decorations)
             .map(|table| {
-                TableLayout::from_table(table, visual, &input, config, |text, source, style| {
-                    crate::table::shape_with(text, source, style, shaper)
-                })
+                TableLayout::from_table(
+                    table,
+                    visual,
+                    &input,
+                    layout.widgets(),
+                    config,
+                    |text, source, style| crate::table::shape_with(text, source, style, shaper),
+                )
             })
             .transpose()?;
         Self::assemble(visual, decorations, config, input, layout, table)
@@ -485,18 +524,16 @@ impl BlockView {
 
     /// 块的高度。
     ///
-    /// 表格块按网格算；其余按行盒累加，再让已经就绪的图片把它撑开——一张
-    /// 解码后的图片可以比它那一行高，可滚动范围必须算上它，否则长文档尾部
-    /// 滚不到。那个 bug 不报错。
+    /// 表格块按网格算；其余按行盒累加。图片不需要在这里单独补一次：一张
+    /// 解码后的图片撑高的是它所在的那**一行**，而行高本来就进了累加
+    /// （`BlockLayout::height`）。此前图片是排完之后另贴上去的盒子，行不
+    /// 知道它有多高，可滚动范围因此要在这里补一次 max——那个补丁随
+    /// widget 化一起没了。
     #[must_use]
     pub fn height(&self) -> f32 {
-        let base = self
-            .table
+        self.table
             .as_ref()
-            .map_or_else(|| self.layout.height(), |table| table.bounds().height());
-        self.images.iter().fold(base, |height, image| {
-            height.max(image.bounds().y() + image.bounds().height())
-        })
+            .map_or_else(|| self.layout.height(), |table| table.bounds().height())
     }
 
     /// 每条视觉行的高度，给视口的高度索引用。
@@ -656,12 +693,21 @@ impl BlockView {
             return Ok(image.hit(point));
         }
         let line_index = self.line_for_y(point.y());
-        let visual = if self.table.is_some() {
-            self.table_visual_for_point(line_index, point)
+        let (visual, widget_side) = if self.table.is_some() {
+            (self.table_visual_for_point(line_index, point), None)
         } else {
-            self.layout.hit(point)?.visual()
+            let hit = self.layout.hit(point)?;
+            (hit.visual(), hit.widget_affinity())
         };
-        let bias = self.hit_bias(line_index, visual);
+        // 落在 widget 两侧的那两个位置是**同一个视觉偏移**上的两个 x，行的
+        // 规则（不变量 H5）分不出来——它管的是软换行的两侧，那里两个位置
+        // 的 x 相同。点在图片右边而按行的规则取到 `Before`，光标会画回图片
+        // 左边去：不报错，只是不听话。
+        let bias = match widget_side {
+            Some(CaretAffinity::Upstream) => Bias::Before,
+            Some(CaretAffinity::Downstream) => Bias::After,
+            None => self.hit_bias(line_index, visual),
+        };
         let caret = self.caret_for_visual(visual, bias)?;
         Ok(BlockHit { caret, image: None })
     }
@@ -743,24 +789,21 @@ impl BlockView {
         }
     }
 
-    /// 解码后的图片尺寸到位，重算受影响的图片盒子（不变量 D7）。
-    pub fn apply_image_intrinsic_sizes(
-        &mut self,
-        sizes: &[(TextRange, yu_layout::ImageIntrinsicSize)],
-    ) -> Result<(), LayoutError> {
-        for image in &mut self.images {
-            if let Some((_, size)) = sizes
-                .iter()
-                .copied()
-                .find(|(source, _)| *source == image.source())
-            {
-                image.apply_intrinsic_size(size, self.config)?;
-            }
-        }
-        if let Some(table) = self.table.clone() {
-            place_images_in_table(&mut self.images, &table)?;
-        }
-        Ok(())
+    /// 这份排好的布局是不是欠着一个现在能量出来的 widget。
+    ///
+    /// 不变量 D7 的后半句：资源就绪之后受影响的块要重排一次。判据是「**还
+    /// 在画 placeholder** 的那些 widget 里，有没有哪一个现在量得出真尺寸」
+    /// ——只朝一个方向走，所以一个不带尺寸表的调用方（命中测试）不会把带
+    /// 尺寸的那一份挤掉。
+    #[must_use]
+    pub fn needs_widget_rebuild(&self, sizes: &[ImageSize]) -> bool {
+        let constraints = constraints_of(self.config);
+        let widgets = BlockWidgets::new(self.decorations.widgets(), sizes);
+        self.layout
+            .pending_widgets()
+            .into_iter()
+            .filter_map(|widget| widgets.measure(widget, constraints))
+            .any(|measurement| measurement.is_ready())
     }
 
     /// 一行里最后一个**文字**簇的视觉末尾。换行符不算内容。
