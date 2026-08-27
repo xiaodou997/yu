@@ -119,6 +119,13 @@ const fn viewport_block_quote_color() -> Rgba8 {
     Rgba8::new(176, 181, 190, 255)
 }
 
+/// 目标解析不出来的图片那个空框。
+///
+/// 比未解码图片的浅灰再深一点：那一种是「还在加载」，这一种是「加载不了」。
+const fn viewport_broken_image_color() -> Rgba8 {
+    Rgba8::new(198, 203, 212, 255)
+}
+
 /// 表格的底色、选中高亮与网格线。
 ///
 /// 这段几何原来住在 `yu-scene::append_table`——场景层为此认识「表头」
@@ -1456,8 +1463,6 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 ));
             }
         }
-        ornaments.push(block_ornaments);
-
         // 任务框压在文字上面，不是衬在下面。
         let mut block_overlays = Vec::new();
         if let BlockKind::TaskListItem { state, .. } = block.kind() {
@@ -1488,6 +1493,16 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 continue;
             };
             let Some(key) = image_key(image) else {
+                // 目标解析不出来（引用式而没有 definition）。widget 已经在
+                // 行里占了一个盒子，这里什么都不画的话那块就是**白的**——
+                // 用户看不出那里有过一张图，而替代文字已经进 widget 了。
+                // 画一个空框，让「这里有一张画不出来的图」看得见。
+                block_ornaments.push(OrnamentPrimitive::new(
+                    image.source(),
+                    translate_block_rect(placement.bounds(), origin)?,
+                    viewport_broken_image_color(),
+                    OrnamentRole::Border,
+                ));
                 continue;
             };
             block_images.push(ImagePrimitive::new(
@@ -1496,6 +1511,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 Rgba8::new(232, 234, 238, 255),
             ));
         }
+        ornaments.push(block_ornaments);
         images.push(block_images);
 
         glyphs.push(
@@ -2519,6 +2535,56 @@ mod tests {
         }));
         assert_eq!(frame.plan().embedded_uploads().len(), 1);
         assert_eq!(frame.plan().embedded_uploads()[0].source(), source_range);
+    }
+
+    /// 目标解析不出来的图片画一个空框，不是什么都不画。
+    ///
+    /// 替代文字已经进了 widget（S6 第七刀），这里什么都不画的话那一块就是
+    /// 白的——用户看不出那里有过一张图。真实窗口比对抓到的就是这个：布局
+    /// 上占着位置，画面上一个像素都没有。
+    #[test]
+    fn an_image_with_no_resolvable_target_still_draws_a_box() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 160.0);
+        let mut document = EditorDocument::new("![alt][undefined]");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene_with_images(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+            &[],
+        )
+        .expect("scene frame");
+        let images = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter(|primitive| matches!(primitive, Primitive::Image(_)))
+            .count();
+        assert_eq!(images, 0, "没有目标就没有图可画");
+        let boxes = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter(|primitive| {
+                matches!(primitive, Primitive::Ornament(ornament)
+                    if ornament.role() == OrnamentRole::Border
+                        && ornament.bounds().width() > 0.0)
+            })
+            .count();
+        assert!(boxes >= 1, "画不出来的图要留一个空框");
     }
 
     #[test]
