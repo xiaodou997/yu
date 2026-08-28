@@ -251,6 +251,14 @@ fn syntax_marks_cover_exactly_the_syntax_characters() {
             ],
         ),
         ("title\n=====\n", &[(NodeKind::HeaderMark, "=====")]),
+        (
+            "- [x] done\n",
+            &[(NodeKind::ListMark, "-"), (NodeKind::TaskMarker, "[x]")],
+        ),
+        (
+            "1. [ ] todo\n",
+            &[(NodeKind::ListMark, "1."), (NodeKind::TaskMarker, "[ ]")],
+        ),
     ];
 
     for (source, expected) in cases {
@@ -268,6 +276,7 @@ fn syntax_marks_cover_exactly_the_syntax_characters() {
                     | NodeKind::CodeInfo
                     | NodeKind::LinkTitle
                     | NodeKind::Url
+                    | NodeKind::TaskMarker
             ) {
                 found.push((node.kind(), &source[from as usize..to as usize]));
             }
@@ -309,4 +318,60 @@ fn hard_breaks_accept_every_line_ending() {
         });
         assert_eq!(found, expected.to_vec(), "{source:?} 的硬换行范围不对");
     }
+}
+
+/// 任务项的 `[x]` 只有一个身份：`TaskMarker`。
+///
+/// 在这一刀之前 `[x]` 会被行内解析器认成一个 shortcut `Link`——`[` 与 `]`
+/// 是 `LinkMark`，中间是链接文字。于是 link 与 task 两个互不感知的
+/// extension 盖在同一段 source 上，靠取并集恰好收敛到同一个区间。**恰好**
+/// 是关键词：并集收敛不是一条被保证的性质，改动其中任何一边都会让它散架，
+/// 而散架的样子是「画面上多出或少掉两个方括号」，不报错。
+///
+/// 现在 `[x]` 在 `TaskMarker` 里，行内解析从它之后才开始，`Link` 根本产不
+/// 出来。这条断言压的就是「产不出来」。
+#[test]
+fn a_task_marker_is_not_also_a_shortcut_link() {
+    for source in ["- [x] done\n", "- [ ] todo\n", "1. [X] 大写\n"] {
+        let parsed = parse(source).expect("短输入");
+        let mut kinds: Vec<NodeKind> = Vec::new();
+        walk(parsed.tree(), 0, 0, &mut |node, _, _, _| {
+            kinds.push(node.kind());
+        });
+        assert!(
+            !kinds.contains(&NodeKind::Link),
+            "{source:?} 里的任务标记又被认成了链接：{kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&NodeKind::LinkMark),
+            "{source:?} 里的任务标记又被认成了链接：{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&NodeKind::TaskMarker),
+            "{source:?} 没有产出任务标记：{kinds:?}"
+        );
+    }
+}
+
+/// 任务项内容里的行内语法照常解析，位置照常是绝对的。
+///
+/// 行内解析的输入是 `content[3..]`，起点跟着挪了 3 个字节。挪漏了不会
+/// panic：节点仍然合法，只是整段往左偏三个字节，装饰跟着盖错地方。
+#[test]
+fn inline_syntax_inside_a_task_keeps_absolute_positions() {
+    let source = "- [ ] *强调* 与 `代码`\n";
+    let parsed = parse(source).expect("短输入");
+    let mut spans: Vec<(NodeKind, &str)> = Vec::new();
+    walk(parsed.tree(), 0, 0, &mut |node, from, to, _| {
+        if matches!(node.kind(), NodeKind::Emphasis | NodeKind::InlineCode) {
+            spans.push((node.kind(), &source[from as usize..to as usize]));
+        }
+    });
+    assert_eq!(
+        spans,
+        vec![
+            (NodeKind::Emphasis, "*强调*"),
+            (NodeKind::InlineCode, "`代码`"),
+        ]
+    );
 }

@@ -156,6 +156,43 @@ fn commonmark_spec_pass_rate() {
     );
 }
 
+/// GFM 的任务项在 `yu-syntax` 里是无条件开着的，而 CommonMark 不认识它。
+///
+/// 这两件事目前不打架，理由只有一个：**652 条用例里一条任务项都没有**。
+/// 上面那个 643 的棘轮因此完全没有被 GFM 扩展动过。
+///
+/// 但这是一条运气好的事实，不是一条被保证的性质——规范换版加进一条
+/// `- [ ] foo`，棘轮会静静地掉一格，而提交里看到的只是「基线从 643 调到
+/// 642」。所以把这条事实钉成断言：将来它不成立时，红的是这条测试，
+/// 而不是那个数字。
+#[test]
+fn tasklist_syntax_is_absent_from_the_spec() {
+    let examples = load_examples();
+    let hits: Vec<usize> = examples
+        .iter()
+        .filter(|example| contains_task_marker(&example.markdown))
+        .map(|example| example.number)
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "规范用例里出现了任务项标记：{hits:?}\n\
+         `yu-syntax` 无条件解析 GFM 任务项，这些用例的期望输出是按 CommonMark \
+         写的，两者会打架。要么把它们登记进 deviations() 与不变量第 F 节，\
+         要么让任务项变成可配置的。不要只调 RAW_PASS_BASELINE。"
+    );
+}
+
+/// 用例文本里有没有 `[ ]` / `[x]` / `[X]`。
+///
+/// 判据比解析器宽：解析器还要求它在列表项的第一个内容块开头（见
+/// `block.rs::starts_task`）。宽一点是有意的——这条断言要在任务项**可能**
+/// 被触发之前就红，而不是在恰好触发时才红。
+fn contains_task_marker(markdown: &str) -> bool {
+    markdown.as_bytes().windows(3).any(|window| {
+        window[0] == b'[' && matches!(window[1], b' ' | b'x' | b'X') && window[2] == b']'
+    })
+}
+
 /// 已登记的有意偏差：用例号 -> 不变量第 F 节的编号。
 ///
 /// 这张表与 `docs/specs/invariants.md` 第 F 节一一对应。往里加一行之前必须

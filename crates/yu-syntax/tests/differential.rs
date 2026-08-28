@@ -107,6 +107,66 @@ fn corpus_files_match_comrak() {
     }
 }
 
+/// 任务项是 GFM 扩展，一条 CommonMark 规范用例都覆盖不到（
+/// `commonmark_spec.rs::tasklist_syntax_is_absent_from_the_spec` 压着这一条），
+/// 所以它的判据只有 cmark-gfm。
+///
+/// 这份语料是手写的，专挑上游 `@lezer/markdown` 与 cmark-gfm 判得不一样的
+/// 地方：`block.rs` 在两处**离开了上游、跟着 cmark-gfm 走**，理由写在
+/// `is_task_marker` 与 `starts_task` 的文档里。手写它们，是因为随机生成器
+/// 走不到这些形状——它只会生成写得好好的任务项。
+#[test]
+fn task_lists_match_comrak() {
+    const CASES: &[&str] = &[
+        // 基本形状。
+        "- [x] 已完成\n- [ ] 待办\n",
+        "- [X] 大写也算\n",
+        "1. [ ] 有序列表里也有\n",
+        "* [ ] *强调* 与 [链接](/u)\n",
+        "> - [x] 引用块里\n",
+        "- [ ] 外层\n  - [x] 内层\n",
+        // 偏差一：`]` 后面什么都没有。上游不认，cmark-gfm 认。
+        "- [x]\n",
+        "- [ ]\n",
+        "- [x]\n  续行\n",
+        // 偏差二：列表项里第二个段落打头的 `[ ]`。上游认，cmark-gfm 不认。
+        "- 先有内容\n\n  [ ] 这不是任务项\n",
+        "- 先有内容\n\n  [x] 这也不是\n",
+        // 不是任务项的近似形状。
+        "- [x]紧贴着\n",
+        "- [y] 不是状态字符\n",
+        "- [] 空的\n",
+        "[ ] 不在列表里\n",
+        "- > [ ] 引用块把它挡住了\n",
+        // 标记与正文之间的空白，以及松散列表。
+        "-   [ ]   多空格\n",
+        "- [ ]\t制表符\n",
+        "- [ ] 松散\n\n- [x] 也松散\n",
+        "- [ ] 第一段\n\n  第二段\n",
+        // Setext 下划线赢过任务项：`- [x] a` 后面跟一行 `===` 是一个标题，
+        // 而标题的正文里 `[x]` 又变回一个 shortcut link 候选。
+        "- [ ] a\n  ===\n",
+        "- [x] a\n  ---\n",
+        "- [x]\n  ---\n",
+        // `> - [ ] a\n>   ===` 本该也在这里，但它踩到一个**与任务项无关的**
+        // 已有缺口：Setext 下划线那一行的容器标记在树里没有节点，于是引用块里
+        // 的 `>` 变成了标题正文。`> foo\n> ===` 一样，规范用例里没有这个形状。
+        // 登记在 overview 第九刀的「还没做的」，不在这一刀里修——它落在
+        // Setext 那条线上，正是要等块身份合并的那一件事。
+        // 引用定义与任务项互斥：`]` 后面跟 `:` 就不是任务项了。
+        "- [ ]: /u\n",
+        "- [ ] a\n  [b]: /u\n",
+    ];
+    for source in CASES {
+        let ours = render_html(source);
+        let theirs = comrak::markdown_to_html(source, &comrak_options());
+        assert_eq!(
+            ours, theirs,
+            "任务项与 comrak 不一致\n--- markdown ---\n{source}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 结构差分：任意输入
 // ---------------------------------------------------------------------------
@@ -255,6 +315,11 @@ fn rebuild(tree: &Tree, from: u32, source: &str) -> String {
 fn comrak_options() -> comrak::Options<'static> {
     let mut options = comrak::Options::default();
     options.render.r#unsafe = true;
+    // GFM 的任务项在 `yu-syntax` 里是无条件开着的（见 `block.rs` 的
+    // `is_task_marker`），所以对照方也要开——否则 `- [x] a` 这一类输入
+    // 的差分比的是「开了扩展的 Yu」与「没开扩展的 comrak」，一定不一致，
+    // 而这种不一致什么都证明不了。
+    options.extension.tasklist = true;
     options
 }
 
