@@ -690,11 +690,9 @@ fn image_view(sizes: &[yu_editor::ImageSize]) -> (BlockView, TextRange) {
     let buffer = TextBuffer::new(IMAGE_SOURCE.to_owned());
     let snapshot = buffer.snapshot();
     let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
-    let yu_editor::BlockWidget::Image(image) = decorations
-        .widgets()
-        .first()
-        .copied()
-        .expect("这个块上有一张图");
+    let Some(yu_editor::BlockWidget::Image(image)) = decorations.widgets().first().copied() else {
+        panic!("这个块上有一张图");
+    };
     let view = BlockView::build_with_images(
         &visual,
         &decorations,
@@ -808,4 +806,140 @@ fn an_image_in_a_cell_gets_a_box_inside_that_cell() {
             && bounds.y() + bounds.height() <= cell_bounds.y() + cell_bounds.height() + 0.001,
         "图片盒子 {bounds:?} 纵向越出了单元格 {cell_bounds:?}"
     );
+}
+
+// ---------------------------------------------------------- 复选框 widget
+
+/// 复选框在行里**占位**，不压在正文上。
+///
+/// 这是它从 `Decoration::Replace` 换成 `Decoration::Widget` 的全部理由。
+/// `Replace` 让 `[x]` 的视觉宽度变成零，整段塌成一个点，而方框是画在那个点
+/// 上的一个**有宽度**的覆盖物——于是它盖住正文的第一个字。截图一眼就看得
+/// 见，而当时所有断言都是绿的：盒子在、几何自洽、id 查得到。
+///
+/// 判据因此是**几何**而不是「有没有一个 widget」：框右沿之后才允许有簇。
+#[test]
+fn a_checkbox_reserves_its_own_box_instead_of_sitting_on_the_text() {
+    let view = view("- [x] 待办", 200.0).expect("一个任务项块");
+    let boxes = view.checkboxes();
+    assert_eq!(boxes.len(), 1, "一个任务项一个复选框，实际是 {boxes:?}");
+    let bounds = boxes[0].bounds();
+    assert!(bounds.width() > 0.0, "复选框必须有宽度，否则它没有占位");
+    assert_eq!(bounds.width(), bounds.height(), "复选框是正方形");
+    // 边长钉死在这里，与图片的 placeholder 宽度同一个待遇：常数没有断言
+    // 就等于没有约定，下一个人改它不会有任何东西变红。
+    assert_eq!(bounds.width(), 10.0 * 0.68, "复选框是 0.68 个行高");
+
+    let right = bounds.x() + bounds.width();
+    for cluster in view.clusters() {
+        assert!(
+            cluster.x() >= right || cluster.x() + cluster.width() <= bounds.x(),
+            "簇 {:?} 落在复选框 {bounds:?} 里，方框会压在字上",
+            cluster.source()
+        );
+    }
+}
+
+/// 勾没勾上、盖住哪三个字节，都由装饰带过来。
+#[test]
+fn a_checkbox_carries_its_state_and_the_three_bytes_it_covers() {
+    let todo = view("- [ ] 待办", 200.0).expect("块");
+    assert_eq!(todo.checkboxes()[0].state(), yu_markdown::TaskState::Todo);
+    assert_eq!(
+        todo.checkboxes()[0].source(),
+        TextRange::new(ByteOffset::new(2), ByteOffset::new(5)).expect("区间")
+    );
+
+    let done = view("- [X] 完成", 200.0).expect("块");
+    assert_eq!(done.checkboxes()[0].state(), yu_markdown::TaskState::Done);
+
+    let plain = view("- 项目", 200.0).expect("块");
+    assert!(plain.checkboxes().is_empty(), "普通列表项没有复选框");
+}
+
+/// 复选框永远是 `Ready`，一次都不进 `pending_widgets`（不变量 D7）。
+///
+/// 报成 `Placeholder` 不会画错，只会让 `LayoutCache` 永远认为「还欠着一个
+/// 资源」——于是每一帧重排一次这个块。这种退化不报错，只是慢。
+#[test]
+fn a_checkbox_never_waits_for_a_resource() {
+    let view = view("- [x] 待办", 200.0).expect("块");
+    assert!(
+        view.layout().pending_widgets().is_empty(),
+        "复选框的尺寸只依赖行高，没有要等的东西"
+    );
+}
+
+/// 点在复选框上落到它的两沿，不落进它里面。
+///
+/// 与图片走的是**同一条**规则（`PlacedWidget::hit`）：盒子有宽度，两沿差着
+/// 整个盒子，只有排它的人知道点落在哪一沿。抄第二遍就会分叉，而分叉的表现
+/// 是「光标画在一处、点击落在另一处」。
+#[test]
+fn clicking_a_checkbox_lands_on_one_of_its_edges() {
+    let view = view("- [x] 待办", 200.0).expect("块");
+    let bounds = view.checkboxes()[0].bounds();
+    let y = bounds.y() + bounds.height() * 0.5;
+
+    let left = view
+        .hit_test(yu_layout::LayoutPoint::new(
+            bounds.x() + bounds.width() * 0.25,
+            y,
+        ))
+        .expect("命中");
+    let right = view
+        .hit_test(yu_layout::LayoutPoint::new(
+            bounds.x() + bounds.width() * 0.75,
+            y,
+        ))
+        .expect("命中");
+    assert_eq!(left.source(), view.checkboxes()[0].source().start());
+    assert_eq!(right.source(), view.checkboxes()[0].source().end());
+    // 两沿的答案来自 `BlockLayout::hit` 的 `widget_affinity`（第七刀），
+    // 不来自图片那条命中快路——复选框**不**在那条路上。串进去不只是多余：
+    // `image()` 会把一次复选框点击报成「点在一张图上」，而 FFI 照着它给
+    // 平台一个图片区间。
+    assert_eq!(left.image(), None, "复选框不是图片");
+    assert_eq!(right.image(), None, "复选框不是图片");
+}
+
+/// 块整体平移时复选框跟着走。
+///
+/// 缓存把一个块的排版结果按 `delta` 平移复用（编辑发生在它前面时）。漏平移
+/// 一种 widget 不会 panic：盒子还在、几何还自洽，只是它指着**平移前**的那
+/// 三个字节。表现是点一下复选框，改的是另一处的源码。
+#[test]
+fn a_prefix_edit_moves_the_checkbox_with_its_block() {
+    let source = "para\n\n- [x] 待办\n";
+    let mut buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let (decorations, visual) = decorate(&snapshot, 2).expect("任务项那个块");
+    let config = LayoutConfig::new(200.0, 10.0).with_default_advance(2.0);
+    let view = BlockView::build(
+        &visual,
+        &decorations,
+        config,
+        &MonospaceMetrics::new(config.default_advance()),
+    )
+    .expect("BlockView");
+    let before = view.checkboxes().first().copied().expect("有一个复选框");
+
+    let transaction = yu_text::Transaction::new(
+        snapshot.revision(),
+        [yu_text::Edit::new(TextRange::empty(ByteOffset::ZERO), "xx")],
+    );
+    let applied = buffer.apply(&transaction).expect("插入");
+    let after_snapshot = applied.result_snapshot().clone();
+    let mapped = view
+        .map_through(applied.change_set(), &after_snapshot)
+        .expect("重映射")
+        .expect("块仍然存在");
+    let after = mapped.checkboxes().first().copied().expect("还是有一个");
+
+    assert_eq!(
+        after.source().start().get(),
+        before.source().start().get() + 2
+    );
+    assert_eq!(after.source().end().get(), before.source().end().get() + 2);
+    assert_eq!(after.bounds(), before.bounds(), "块外的编辑不该动几何");
 }
