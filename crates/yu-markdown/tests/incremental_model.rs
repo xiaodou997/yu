@@ -221,3 +221,100 @@ fn container_marker_edit_matches_full_parse() {
         source.replacen("- ", "1. ", 1)
     );
 }
+
+// ------------------------------------------------------------ 跟着文档的树
+
+/// 增量解析出来的树必须与全量解析的逐节点相同（不变量 C3 在这一层的形状）。
+///
+/// `yu-syntax` 的差分测试压的是 `parse_with_fragments` 本身；这里压的是**接
+/// 线**——fragment 是不是真的取自上一版文档的树、`ChangeSet` 有没有真的交给
+/// 它。接错的后果不是崩，是树悄悄不对：复用了一段本不该复用的字节，而画面上
+/// 只是某一块的语法没被藏掉。
+#[test]
+fn the_documents_tree_survives_incremental_edits() {
+    let source = "# 标题\n\n段落一\n\n- [ ] 待办\n\n```rust\nfn main() {}\n```\n\n> 引用\n";
+    for offset in [0_u64, 4, 12, 22, 34, 48] {
+        for insert in ["x", "\n", "`", "> ", "- "] {
+            let mut buffer = TextBuffer::new(source.to_owned());
+            let document = yu_markdown::parse(&buffer.snapshot());
+            let offset = offset.min(buffer.snapshot().len_bytes().get());
+            let Some(range) = TextRange::new(ByteOffset::new(offset), ByteOffset::new(offset))
+            else {
+                continue;
+            };
+            let transaction = Transaction::new(buffer.revision(), [Edit::new(range, insert)]);
+            let Ok(applied) = buffer.apply(&transaction) else {
+                continue;
+            };
+            let incremental = yu_markdown::parse_incremental(
+                &document,
+                applied.result_snapshot(),
+                applied.change_set(),
+            )
+            .expect("增量解析");
+            let full = yu_markdown::parse(applied.result_snapshot());
+            assert_eq!(
+                incremental.document().tree(),
+                full.tree(),
+                "在 {offset} 处插入 {insert:?} 之后，增量的树与全量不一致"
+            );
+        }
+    }
+}
+
+/// **J1 的可断言量**：一次单字符编辑重扫的字节数与文档大小无关。
+///
+/// 这条从 `yu-editor::DecorationCache` 搬过来——树跟着文档走之后，接线在这里。
+///
+/// 只断言「小于某个上界」是不够的：把上界定得足够大，退化成全量重扫也能过。
+/// 所以同时断言它**不随文档增长**——文档大 8 倍，重扫的字节数不许跟着涨。
+#[test]
+fn one_edit_rescans_a_bounded_number_of_bytes() {
+    /// 上限留到 256 是给块大小的余量。判据是它必须小到让「复用失效」一定越界
+    /// ——最小的那份文档全量重扫就有三千多字节。
+    const BUDGET: u32 = 256;
+
+    fn many_blocks(blocks: usize) -> String {
+        let mut source = String::new();
+        for index in 0..blocks {
+            source.push_str(&format!(
+                "## Section {index}\n\nParagraph {index} with *emphasis* and `code`.\n\n"
+            ));
+        }
+        source
+    }
+
+    let rescanned = |blocks: usize| -> u32 {
+        let source = many_blocks(blocks);
+        let mut buffer = TextBuffer::new(source.clone());
+        let document = yu_markdown::parse(&buffer.snapshot());
+        let middle = source
+            .char_indices()
+            .map(|(index, _)| index)
+            .nth(source.len() / 2)
+            .expect("文档够长");
+        let at = ByteOffset::new(middle as u64);
+        let range = TextRange::new(at, at).expect("空区间");
+        let applied = buffer
+            .apply(&Transaction::new(
+                buffer.revision(),
+                [Edit::new(range, "X")],
+            ))
+            .expect("插入");
+        yu_markdown::parse_incremental(&document, applied.result_snapshot(), applied.change_set())
+            .expect("增量解析")
+            .document()
+            .reparsed_bytes()
+    };
+
+    let small = rescanned(64);
+    let large = rescanned(512);
+    assert!(
+        small <= BUDGET && large <= BUDGET,
+        "单字符编辑重扫了 {small} / {large} 字节，超出上界 {BUDGET}"
+    );
+    assert!(
+        large <= small.saturating_mul(2),
+        "文档大 8 倍，重扫字节数从 {small} 涨到 {large}——复用没接上"
+    );
+}
