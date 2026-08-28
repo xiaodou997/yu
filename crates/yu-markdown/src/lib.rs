@@ -11,6 +11,7 @@ use std::fmt;
 use std::iter::Peekable;
 
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, TextRange};
+use yu_syntax::{Tree, TreeFragment};
 use yu_text::{
     AnchorMapError, ChangeSet, ChunkCursor, SnapshotRetentionStats, TextSnapshot,
     retained_snapshot_stats,
@@ -91,6 +92,21 @@ impl ListMarker {
 }
 
 /// A lossless block view of one immutable text revision.
+///
+/// # 一个 Revision 一棵树，跟着这份文档走
+///
+/// 语法树此前住在 `yu-editor::DecorationCache` 里，那里的模块文档给过两条
+/// 理由：`MarkdownDocument` 是每次重建的值类型，装不下增量解析要的「上一版
+/// 的树」；而只要块序列的调用方会被迫付解析的钱。
+///
+/// **第一条经不起复查**：[`parse_incremental`] 手上就有上一版
+/// `MarkdownDocument`，上一棵树跟着它走即可——与从缓存里取 `TreeFragment`
+/// 是同一件事，只是取的地方换了。第二条仍然成立，代价量过了（1 MiB 的单字符
+/// 编辑，块序列增量 250 µs、语法树增量 331 µs），而在交互路径上这笔钱早就
+/// 付了：编辑之后要出画面，出画面就要装饰，装饰就要树。
+///
+/// 搬过来是为了下一刀：块的 kind 要改由树给，而分类发生在解析块的时候。
+/// 树在另一个 crate 的另一个缓存里的话，那件事做不成。
 #[derive(Clone, Debug)]
 pub struct MarkdownDocument {
     revision: Revision,
@@ -98,12 +114,46 @@ pub struct MarkdownDocument {
     source: TextSnapshot,
     blocks: BlockSequence,
     references: ReferenceDefinitionIndex,
+    /// 语法树。`None` **只有一种成因**：源码超过 4 GiB，`yu-syntax` 明确
+    /// 拒绝（`ParseError::SourceTooLarge`，位置是 32 位的）。那种文档今天
+    /// 也一样什么都渲染不出来——装饰这一步就失败了——所以这里不为它另建一
+    /// 条降级路径，只把「没有树」如实说出来。
+    ///
+    /// 做成 `Option` 而不是让 [`parse`] 返回 `Result`，是因为后者会传染到
+    /// 九十多个调用方，换来的只是把一个 4 GiB 的边角情形提前几微秒报出来。
+    tree: Option<Tree>,
+    /// 这一版解析实际重新扫描过的源码字节数（不变量 J1 的可断言量）。
+    reparsed_bytes: u32,
 }
 
 impl MarkdownDocument {
+    /// 这一版的语法树，根节点是 `Document`。
+    ///
+    /// 整篇只解析一次，各家共用——每个 extension 自己再解析一遍会让「同一份
+    /// 源码在两个 extension 眼里不一样」成为可能（不变量 D6）。
+    #[must_use]
+    pub const fn tree(&self) -> Option<&Tree> {
+        self.tree.as_ref()
+    }
+
+    /// 这一版解析实际重新扫描过的源码字节数。
+    ///
+    /// 不变量 J1「编辑只重解析受影响范围」的**可断言量**。选它而不是耗时，
+    /// 是因为它对同样的输入永远给同样的答案。
+    #[must_use]
+    pub const fn reparsed_bytes(&self) -> u32 {
+        self.reparsed_bytes
+    }
+
     #[must_use]
     pub fn revision(&self) -> Revision {
         self.revision
+    }
+
+    /// 这一版的源码快照。
+    #[must_use]
+    pub const fn source(&self) -> &TextSnapshot {
+        &self.source
     }
 
     #[must_use]
@@ -167,6 +217,10 @@ impl MarkdownDocument {
 }
 
 impl PartialEq for MarkdownDocument {
+    /// **不比树，也不比重扫字节数。** 树是同一份源码的另一种读法——源码与块
+    /// 相等而树不等，那是解析器坏了，不是两份文档不同；拿它进等价判断只会让
+    /// 「增量等于全量」这条差分自己证自己。重扫字节数更明显：它是**怎么算出
+    /// 来的**，不是**算出了什么**。
     fn eq(&self, other: &Self) -> bool {
         self.revision == other.revision
             && self.source_len == other.source_len
@@ -523,12 +577,27 @@ fn is_markdown_space(character: char) -> bool {
 #[must_use]
 pub fn parse(snapshot: &TextSnapshot) -> MarkdownDocument {
     let blocks = BlockSequence::from_records(BlockParser::new(snapshot, 0).collect());
+    let (tree, reparsed_bytes) = parse_tree(snapshot, &[]);
     MarkdownDocument {
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
         source: snapshot.clone(),
         references: ReferenceDefinitionIndex::from_blocks(snapshot, &blocks),
         blocks,
+        tree,
+        reparsed_bytes,
+    }
+}
+
+/// 解析语法树，超长时给 `None`。
+///
+/// 传空 fragment 切片等价于全量解析（`yu_syntax::parse_with_fragments` 的
+/// 契约），所以全量与增量两条路共用这一个函数——两条路各写一遍，迟早有一条
+/// 忘了统计重扫字节数，而那个数是不变量 J1 的可断言量。
+fn parse_tree(snapshot: &TextSnapshot, fragments: &[TreeFragment]) -> (Option<Tree>, u32) {
+    match yu_syntax::parse_with_fragments(snapshot, fragments) {
+        Ok(parsed) => (Some(parsed.tree().clone()), parsed.reparsed_bytes()),
+        Err(_) => (None, 0),
     }
 }
 
@@ -559,6 +628,9 @@ pub fn parse_incremental(
             source: snapshot.clone(),
             blocks: previous.blocks.clone(),
             references: ReferenceDefinitionIndex::from_blocks(snapshot, &previous.blocks),
+            // 一个字节都没改，树整棵搬过来，一次都不重扫。
+            tree: previous.tree.clone(),
+            reparsed_bytes: 0,
         };
         return Ok(IncrementalParse {
             reparsed_range: TextRange::empty(snapshot.len_bytes()),
@@ -652,12 +724,24 @@ pub fn parse_incremental(
             suffix_delta,
         ),
     );
+    // 树的增量复用来源是**上一版文档自己的树**。此前它在
+    // `yu-editor::DecorationCache` 里，那一层要自己攒一批 `TreeFragment`
+    // 并跨编辑接力（「连着编辑好几次都没人要过树」）；树跟着文档走之后
+    // 那件事不存在了——每次编辑都解析，上一棵树永远正好在基准 Revision 上。
+    let fragments = previous
+        .tree
+        .as_ref()
+        .map(|tree| TreeFragment::apply_change_set(&TreeFragment::from_tree(tree), changes))
+        .unwrap_or_default();
+    let (tree, reparsed_bytes) = parse_tree(snapshot, &fragments);
     let document = MarkdownDocument {
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
         source: snapshot.clone(),
         references: ReferenceDefinitionIndex::from_blocks(snapshot, &blocks),
         blocks,
+        tree,
+        reparsed_bytes,
     };
     let reparsed_range = TextRange::new(new_start, scanned_end)
         .expect("the scanner cannot finish before its reparse boundary");

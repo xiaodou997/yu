@@ -155,7 +155,9 @@ impl EditorDocument {
         // 是整个 `self`。`Block` 是 `Copy` 的小结构，这一份拷贝比克隆整个
         // `MarkdownDocument` 便宜得多——后者每次查询都要复制一遍块存储。
         let blocks: Vec<_> = self.markdown.blocks().iter().collect();
-        let set = self.decorations.document_set(&snapshot, &blocks, active)?;
+        let set = self
+            .decorations
+            .document_set(&self.markdown, &blocks, active)?;
         Ok(VisualText::new(&snapshot, range, set)?)
     }
 
@@ -174,8 +176,7 @@ impl EditorDocument {
         index: usize,
     ) -> Result<&BlockDecorations, EditorDocumentError> {
         let block = self.block_at(index)?;
-        let snapshot = self.snapshot();
-        Ok(self.decorations.get_or_build_block(&snapshot, block)?)
+        Ok(self.decorations.get_or_build_block(&self.markdown, block)?)
     }
 
     /// 焦点块那一份：光标碰到的行内语法露出来。
@@ -191,9 +192,10 @@ impl EditorDocument {
         index: usize,
     ) -> Result<BlockDecorations, EditorDocumentError> {
         let block = self.block_at(index)?;
-        let snapshot = self.snapshot();
         let active = self.selection.ordered_range();
-        Ok(self.decorations.decorate(&snapshot, block, Some(active))?)
+        Ok(self
+            .decorations
+            .decorate(&self.markdown, block, Some(active))?)
     }
 
     /// 一个块的视觉字节流。
@@ -232,13 +234,16 @@ impl EditorDocument {
         }
         let index = self.block_index_for_source(self.selection.focus())?;
         let block = self.markdown.blocks().get(index)?;
-        let snapshot = self.snapshot();
         let active = self.selection.ordered_range();
-        let canonical = hidden_bytes(self.decorations.get_or_build_block(&snapshot, block).ok()?);
+        let canonical = hidden_bytes(
+            self.decorations
+                .get_or_build_block(&self.markdown, block)
+                .ok()?,
+        );
         let revealed = hidden_bytes(
             &self
                 .decorations
-                .decorate(&snapshot, block, Some(active))
+                .decorate(&self.markdown, block, Some(active))
                 .ok()?,
         );
         (revealed < canonical).then_some(index)
@@ -324,7 +329,7 @@ impl EditorDocument {
         let snapshot = self.snapshot();
         let decorations = self
             .decorations
-            .get_or_build_block(&snapshot, block)?
+            .get_or_build_block(&self.markdown, block)?
             .clone();
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
         self.layouts
@@ -364,8 +369,7 @@ impl EditorDocument {
         F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
     {
         let block = self.block_at(index)?;
-        let snapshot = self.snapshot();
-        let decorations = self.decorations.get_or_build_block(&snapshot, block)?;
+        let decorations = self.decorations.get_or_build_block(&self.markdown, block)?;
         Ok(image_sizes(decorations, image_resolver))
     }
 
@@ -381,7 +385,7 @@ impl EditorDocument {
         let snapshot = self.snapshot();
         let decorations = self
             .decorations
-            .get_or_build_block(&snapshot, block)?
+            .get_or_build_block(&self.markdown, block)?
             .clone();
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
         self.layouts
@@ -652,7 +656,7 @@ impl EditorDocument {
         let snapshot = self.snapshot();
         let decorations = self
             .decorations
-            .get_or_build_block(&snapshot, block)?
+            .get_or_build_block(&self.markdown, block)?
             .clone();
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?
             .with_composition(replacement, text, selection)?;
@@ -3517,12 +3521,11 @@ mod tests {
             })
     }
 
-    /// **J1 走完整条产品链路**：`apply_transaction` 之后再渲染一次，只重扫被
-    /// 改的那个块。
+    /// **J1 走完整条产品链路**：`apply_transaction` 之后只重扫被改的那个块。
     ///
-    /// `decorations.rs` 里那几条直接驱动 `DecorationCache`，压的是缓存自己；
-    /// 这一条压的是**接线**——`shift_through` 有没有真的把 `ChangeSet` 交给
-    /// 复用来源。接线断了不会报错，只会让每次敲键都整篇重解析。
+    /// `yu-markdown` 那几条直接驱动 `parse_incremental`，压的是解析器自己；
+    /// 这一条压的是**接线**——`EditorDocument` 有没有真的把上一版文档与
+    /// `ChangeSet` 交给它。接线断了不会报错，只会让每次敲键都整篇重解析。
     #[test]
     fn an_edit_through_the_document_rescans_only_the_block_it_touched() {
         /// 一次单字符编辑允许重扫的字节数。实测约 60（就是被改的那个块）。
@@ -3537,7 +3540,7 @@ mod tests {
         }
         let mut document = EditorDocument::new(source.clone());
         document.visual_text().expect("初次渲染");
-        let full = document.decoration_cache_stats().reparsed_bytes();
+        let full = u64::from(document.markdown().reparsed_bytes());
         assert!(
             full > 10_000,
             "第一次是全量，只读了 {full} 字节——语料太小，证明不了什么"
@@ -3554,12 +3557,7 @@ mod tests {
             .expect("编辑应当成功");
         document.visual_text().expect("编辑后再渲染一次");
 
-        assert_eq!(
-            document.decoration_cache_stats().parses(),
-            2,
-            "两次渲染各解析一次"
-        );
-        let rescanned = document.decoration_cache_stats().reparsed_bytes() - full;
+        let rescanned = u64::from(document.markdown().reparsed_bytes());
         assert!(
             rescanned <= BUDGET,
             "改一个字符重扫了 {rescanned} 字节，超出上界 {BUDGET}（全量是 {full}）"
