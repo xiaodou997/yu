@@ -3734,7 +3734,10 @@ fn block_images(decorations: &yu_editor::BlockDecorations) -> Vec<ImageSpan> {
         .widgets()
         .iter()
         .copied()
-        .map(|yu_editor::BlockWidget::Image(image)| image)
+        .filter_map(|widget| match widget {
+            yu_editor::BlockWidget::Image(image) => Some(image),
+            yu_editor::BlockWidget::Checkbox(_) => None,
+        })
         .collect()
 }
 

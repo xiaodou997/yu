@@ -714,13 +714,14 @@ fn images(
         .widgets()
         .iter()
         .copied()
-        .map(|BlockWidget::Image(image)| {
-            (
+        .filter_map(|widget| match widget {
+            BlockWidget::Image(image) => Some((
                 image.source(),
                 image.label(),
                 image.destination(),
                 image.reference(),
-            )
+            )),
+            BlockWidget::Checkbox(_) => None,
         })
         .collect()
 }
@@ -757,7 +758,9 @@ fn an_image_is_one_widget_over_its_whole_markup() {
     let placed = widgets(&decorations);
     assert_eq!(placed.len(), 1, "一张图一个 widget，实际是 {placed:?}");
     assert_eq!(placed[0].0, range(0, 17));
-    let BlockWidget::Image(image) = placed[0].1;
+    let BlockWidget::Image(image) = placed[0].1 else {
+        panic!("这一段该是一张图，实际是 {:?}", placed[0].1);
+    };
     assert_eq!(image.source(), range(0, 17));
     assert_eq!(image.label(), range(2, 8));
 }
@@ -776,8 +779,8 @@ fn a_focused_image_gives_its_source_back_instead_of_a_widget() {
 
 /// 图片之外的一个也产 widget 的 extension，用来考 widget id 的平移。
 ///
-/// 它盖在块的头一个字节上。产的同样是 `BlockWidget::Image`——这个枚举现在
-/// 只有一个变体，而这里考的是**id 怎么分**，不是它是什么。
+/// 它盖在块的头一个字节上。产的同样是 `BlockWidget::Image`——这里考的是
+/// **id 怎么分**，不是它是什么。
 struct Stamp;
 
 impl Extension for Stamp {
@@ -803,13 +806,13 @@ impl Extension for Stamp {
 #[test]
 fn widget_ids_are_rebased_per_extension() {
     let decorations = decorate_with(&ExtensionSet::markdown().with(Stamp), "![替代](图片)", None);
-    let BlockWidget::Image(image) = decorations
-        .widget(WidgetId(0))
-        .expect("图片的 widget 排在前面，它是注册表里更早的那一个");
+    let Some(BlockWidget::Image(image)) = decorations.widget(WidgetId(0)) else {
+        panic!("图片的 widget 排在前面，它是注册表里更早的那一个");
+    };
     assert_eq!(image.source(), range(0, 17));
-    let BlockWidget::Image(stamp) = decorations
-        .widget(WidgetId(1))
-        .expect("后注册的 extension 的局部 0 号被平移成 1 号");
+    let Some(BlockWidget::Image(stamp)) = decorations.widget(WidgetId(1)) else {
+        panic!("后注册的 extension 的局部 0 号被平移成 1 号");
+    };
     assert_eq!(stamp.source(), range(0, 1));
     assert_eq!(decorations.widgets().len(), 2);
 

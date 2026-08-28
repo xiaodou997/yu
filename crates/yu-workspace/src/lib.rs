@@ -17,9 +17,9 @@ use yu_assets::{
 };
 use yu_core::{Revision, TextRange};
 use yu_editor::{
-    Bias, BlockKind, BlockView, BlockWidget, CaretAffinity, EditorDocument, EditorDocumentError,
-    ImageSpan, LayoutError, ShapingProvider, TableLayout, TableResizeCommit, TableResizeTarget,
-    TaskState, ViewportSpan, task_marker,
+    Bias, BlockKind, BlockView, BlockWidget, CaretAffinity, CheckboxPlacement, EditorDocument,
+    EditorDocumentError, ImageSpan, LayoutError, ShapingProvider, TableLayout, TableResizeCommit,
+    TableResizeTarget, TaskState, ViewportSpan,
 };
 use yu_font::GlyphAtlas;
 use yu_layout::{ImageIntrinsicSize, LayoutRect};
@@ -235,29 +235,30 @@ fn ranges_intersect_or_caret(selection: TextRange, cell: TextRange) -> bool {
     selection.start() < cell.end() && cell.start() < selection.end()
 }
 
+/// 画一个任务项复选框。
+///
+/// 几何**全部**来自排版排出来的那个盒子（`placement.bounds()`）。此前是这里
+/// 自己算：拿标记起点的 caret 当左上角、行高乘 0.68 当边长。那套算法在
+/// `[x]` 是 `Decoration::Replace` 的时候是唯一能做的事——被藏掉的三个字节
+/// 塌成一个点，点上没有宽度可用——代价是方框压在正文的第一个字上。复选框
+/// 成为 widget 之后盒子在排版里占位，画的人不需要、也不许再算第二遍。
 fn append_task_checkbox(
     ornaments: &mut Vec<OrnamentPrimitive>,
-    layout: &BlockView,
     origin: Point,
-    marker: yu_editor::TaskMarker,
-    state: TaskState,
+    placement: CheckboxPlacement,
 ) -> Result<(), ViewportSceneError> {
-    let caret = layout
-        .caret_for_source(marker.range().start(), Bias::After)
-        .map_err(EditorDocumentError::from)?;
-    let line_height = layout
-        .lines()
-        .get(caret.line())
-        .map_or_else(|| layout.config().line_height(), |line| line.height());
-    let size = line_height * 0.68;
-    let x = caret.point().x();
-    let y = caret.point().y() + (line_height - size) * 0.5;
+    let state = placement.state();
+    let source = placement.source();
+    let bounds = placement.bounds();
+    let size = bounds.width().min(bounds.height());
+    let x = bounds.x();
+    let y = bounds.y();
     let border = match state {
         TaskState::Todo => Rgba8::new(118, 124, 134, 255),
         TaskState::Done => Rgba8::new(38, 111, 219, 255),
     };
     ornaments.push(OrnamentPrimitive::new(
-        marker.range(),
+        source,
         translate_block_rect(LayoutRect::new(x, y, size, size)?, origin)?,
         border,
         OrnamentRole::Border,
@@ -267,7 +268,7 @@ fn append_task_checkbox(
         TaskState::Todo => {
             let inset = (size * 0.14).max(0.5).min(size * 0.3);
             ornaments.push(OrnamentPrimitive::new(
-                marker.range(),
+                source,
                 translate_block_rect(
                     LayoutRect::new(x + inset, y + inset, size - inset * 2.0, size - inset * 2.0)?,
                     origin,
@@ -280,7 +281,7 @@ fn append_task_checkbox(
             let unit = size / 5.0;
             for (column, row) in [(1.0, 2.4), (1.8, 3.1), (2.7, 2.4), (3.6, 1.5)] {
                 ornaments.push(OrnamentPrimitive::new(
-                    marker.range(),
+                    source,
                     translate_block_rect(
                         LayoutRect::new(
                             x + unit * column,
@@ -1461,19 +1462,13 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
             }
         }
         // 任务框压在文字上面，不是衬在下面。
+        //
+        // 「这个块有没有复选框」不再问 `BlockKind`，问排出来的盒子——装饰
+        // 产出了 widget，排版给了它位置，画的人照着画。少一次「块类型说有
+        // 而标记问不出来」的错误路径。
         let mut block_overlays = Vec::new();
-        if let BlockKind::TaskListItem { state, .. } = block.kind() {
-            let Some(markdown_block) = document.markdown().blocks().get(block.index()) else {
-                return Err(ViewportSceneError::InvalidTaskMarker {
-                    block: block.index(),
-                });
-            };
-            let Some(marker) = task_marker(&source, markdown_block) else {
-                return Err(ViewportSceneError::InvalidTaskMarker {
-                    block: block.index(),
-                });
-            };
-            append_task_checkbox(&mut block_overlays, layout, origin, marker, state)?;
+        for placement in layout.checkboxes() {
+            append_task_checkbox(&mut block_overlays, origin, *placement)?;
         }
         overlays.push(block_overlays);
 
@@ -1484,7 +1479,10 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 .widgets()
                 .iter()
                 .copied()
-                .map(|BlockWidget::Image(image)| image)
+                .filter_map(|widget| match widget {
+                    BlockWidget::Image(image) => Some(image),
+                    BlockWidget::Checkbox(_) => None,
+                })
                 .find(|image| image.source() == placement.source())
             else {
                 continue;
@@ -1697,8 +1695,17 @@ mod tests {
     use yu_assets::{EmbeddedRenderPayload, EmbeddedRenderRequest, EmbeddedResourceKind};
     use yu_core::{ByteOffset, TextRange, Utf16Offset, Utf16Range};
     use yu_editor::{
-        CaretAffinity, EditorCommand, EditorSelection, LayoutConfig, LayoutPoint,
-        TableResizeGesture, ViewportConfig,
+        CaretAffinity,
+        EditorCommand,
+        EditorSelection,
+        LayoutConfig,
+        LayoutPoint,
+        TableResizeGesture,
+        ViewportConfig,
+        // 复选框的源码区间由 widget 带着走，用例拿 `block_sequence` 那一份
+        // 当参照——**判据不来自被测的那条路**（两份判断由
+        // `yu-markdown/tests/task_identity.rs` 锁在一起）。
+        task_marker,
     };
     use yu_font::{
         FontDatabase, FontFaceSpec, FontRequest, FontShaper, GlyphAtlasConfig, GlyphBitmap,
@@ -2297,6 +2304,68 @@ mod tests {
         assert!(!roles.contains(&EditorDecorationPrimitiveRole::Caret));
     }
 
+    /// 复选框画在**排版给它的那个盒子**里，不是画在一个自己算出来的点上。
+    ///
+    /// 这一条压的是它成为 widget 的全部理由。此前场景层拿标记起点的 caret
+    /// 当左上角、行高乘 0.68 当边长自己算一遍——那是「同一个几何两套实现」，
+    /// 而被隐藏的 `[x]` 塌成一个点，点上没有宽度可用，于是方框压在正文的
+    /// 第一个字上。截图一眼就看得见，当时所有断言都是绿的。
+    ///
+    /// 判据来自 `BlockView::checkboxes()`——排版那一条路，与场景层画的那一条
+    /// 分开。
+    #[test]
+    fn a_checkbox_is_painted_where_layout_put_its_box() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 120.0);
+        let mut document = EditorDocument::new("- [x] done\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let config = document.viewport_config().layout();
+        let placement = document
+            .block_layout_for_visual_state_with_shaper(0, config, &shaper)
+            .expect("block layout")
+            .checkboxes()
+            .first()
+            .copied()
+            .expect("这个块上有一个复选框");
+
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("task scene");
+        let border = frame
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Ornament(ornament) if ornament.role() == OrnamentRole::Border => {
+                    Some(*ornament)
+                }
+                _ => None,
+            })
+            .expect("复选框的边框");
+
+        let bounds = placement.bounds();
+        assert_eq!(border.bounds().width(), bounds.width());
+        assert_eq!(border.bounds().height(), bounds.height());
+        assert_eq!(border.bounds().x(), bounds.x(), "x 必须来自排好的盒子");
+        assert!(bounds.width() > 0.0, "盒子没有宽度就等于没有占位");
+        assert_eq!(border.source(), placement.source());
+    }
+
     #[test]
     fn task_markers_become_source_backed_checkbox_layers() {
         let font_size = 14.0;
@@ -2682,7 +2751,10 @@ mod tests {
             .widgets()
             .iter()
             .copied()
-            .map(|BlockWidget::Image(image)| image.source())
+            .filter_map(|widget| match widget {
+                BlockWidget::Image(image) => Some(image.source()),
+                BlockWidget::Checkbox(_) => None,
+            })
             .next()
             .expect("这个块上有一张图");
         let mut cache = yu_assets::ImageCache::new();

@@ -40,7 +40,10 @@ use yu_text::{ChangeSet, TextSnapshot};
 
 use crate::blockinput::{BlockLayoutInput, BlockOrnaments};
 use crate::geometry::upstream;
-use crate::image::{ImagePlacement, build_image_placements, build_table_image_placements};
+use crate::image::{
+    CheckboxPlacement, ImagePlacement, WidgetPlacements, build_table_widget_placements,
+    build_widget_placements,
+};
 use crate::table::{TableLayout, TableResizeCommit};
 use crate::visual::VisualText;
 use crate::widget::{BlockWidgets, ImageSize, constraints_of};
@@ -337,7 +340,7 @@ pub struct BlockView {
     lines: Vec<BlockLine>,
     clusters: Vec<BlockCluster>,
     glyphs: Vec<BlockGlyph>,
-    images: Vec<ImagePlacement>,
+    widgets: WidgetPlacements,
     table: Option<TableLayout>,
 }
 
@@ -455,10 +458,10 @@ impl BlockView {
             lines,
             clusters,
             glyphs,
-            images: Vec::new(),
+            widgets: WidgetPlacements::default(),
             table,
         };
-        view.images = build_image_placements(&view)?;
+        view.widgets = build_widget_placements(&view)?;
         if let Some(table) = view.table.clone() {
             view.apply_table_geometry(&table)?;
         }
@@ -520,7 +523,13 @@ impl BlockView {
 
     #[must_use]
     pub fn images(&self) -> &[ImagePlacement] {
-        &self.images
+        &self.widgets.images
+    }
+
+    /// 排好的任务项复选框。画它的人按这里的 `bounds` 画，不自己算几何。
+    #[must_use]
+    pub fn checkboxes(&self) -> &[CheckboxPlacement] {
+        &self.widgets.checkboxes
     }
 
     #[must_use]
@@ -622,12 +631,22 @@ impl BlockView {
                 })
             })
             .collect::<Result<Vec<_>, LayoutError>>()?;
-        view.images = view
-            .images
-            .iter()
-            .copied()
-            .map(|image| image.shifted(delta))
-            .collect::<Result<Vec<_>, LayoutError>>()?;
+        view.widgets = WidgetPlacements {
+            images: view
+                .widgets
+                .images
+                .iter()
+                .copied()
+                .map(|image| image.shifted(delta))
+                .collect::<Result<Vec<_>, LayoutError>>()?,
+            checkboxes: view
+                .widgets
+                .checkboxes
+                .iter()
+                .copied()
+                .map(|checkbox| checkbox.shifted(delta))
+                .collect::<Result<Vec<_>, LayoutError>>()?,
+        };
         Ok(Some(view))
     }
 
@@ -697,12 +716,14 @@ impl BlockView {
         if !point.is_finite() {
             return Err(LayoutError::InvalidPoint);
         }
-        if let Some(image) = self
-            .images
-            .iter()
-            .find(|image| image.bounds().contains(point))
+        // 两种 widget 走**同一条**命中规则（`PlacedWidget::hit`）：盒子有
+        // 宽度，落在哪一沿只有排它的人知道。
+        if let Some(placed) = self
+            .widgets
+            .placed()
+            .find(|placed| placed.bounds().contains(point))
         {
-            return Ok(image.hit(point));
+            return Ok(placed.hit(point));
         }
         let line_index = self.line_for_y(point.y());
         // 有两处的「落在哪一侧」行的规则（不变量 H5）分不出来，因为那两处
@@ -1032,7 +1053,7 @@ impl BlockView {
         self.clusters = clusters;
         self.glyphs = glyphs;
         self.lines = lines;
-        self.images = build_table_image_placements(self, table)?;
+        self.widgets = build_table_widget_placements(self, table)?;
         Ok(())
     }
 

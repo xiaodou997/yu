@@ -2253,7 +2253,10 @@ where
         .widgets()
         .iter()
         .copied()
-        .map(|BlockWidget::Image(image)| image)
+        .filter_map(|widget| match widget {
+            BlockWidget::Image(image) => Some(image),
+            BlockWidget::Checkbox(_) => None,
+        })
         .filter_map(|image| image_resolver(image).map(|size| (image.source(), size)))
         .collect()
 }

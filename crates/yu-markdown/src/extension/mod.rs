@@ -46,7 +46,7 @@ use yu_syntax::{NodeKind, Tree};
 use yu_text::TextSnapshot;
 
 use crate::block_line_ranges;
-use crate::block_sequence::Block;
+use crate::block_sequence::{Block, TaskState};
 use crate::reference::read_range;
 use crate::table::TableBlock;
 
@@ -347,10 +347,19 @@ impl MarkerOrnament {
 ///
 /// 盒子多大不在这里。图片的固有尺寸要等资源解码，那是 workspace 那一层的
 /// 事；这里只说「这一段是一张图，它的替代文字与目标各在哪」。
+///
+/// # 什么可以是 widget
+///
+/// 判据是**它有没有内部位置**。图片与复选框都没有——光标不需要停在
+/// `![替代](目标)` 或 `[x]` 的中间，编辑它们走的是整段替换（不变量 B6）。
+/// 表格有：单元格内容一旦从视觉字节流里消失，光标就进不了任何一格，所以
+/// 表格留在 [`BlockOrnament::Table`]（见 `table.rs` 的模块文档）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockWidget {
     /// 一张图片。它替代掉整段 `![替代](目标)`。
     Image(ImageSpan),
+    /// 任务项的复选框。它替代掉 `[x]` / `[ ]` 三个字节。
+    Checkbox(CheckboxSpan),
 }
 
 /// 一张图片在源码里的四段区间。
@@ -427,8 +436,47 @@ impl BlockWidget {
     /// 整个 widget 平移 `delta` 个字节。越界返回 `None`。
     #[must_use]
     fn shifted(self, delta: i64) -> Option<Self> {
-        let Self::Image(image) = self;
-        image.shifted(delta).map(Self::Image)
+        match self {
+            Self::Image(image) => image.shifted(delta).map(Self::Image),
+            Self::Checkbox(checkbox) => checkbox.shifted(delta).map(Self::Checkbox),
+        }
+    }
+}
+
+/// 一个任务项复选框在源码里的位置与状态。
+///
+/// `source` 是 `[x]` / `[ ]` 那三个字节，不含前面的 `- ` ——列表标记是
+/// `list.rs` 与视觉文本的事，复选框只替代方括号本身。勾没勾上是**语义**，
+/// 画成什么样（方框多大、勾什么颜色）是上一层的事。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CheckboxSpan {
+    source: TextRange,
+    state: TaskState,
+}
+
+impl CheckboxSpan {
+    #[must_use]
+    pub const fn new(source: TextRange, state: TaskState) -> Self {
+        Self { source, state }
+    }
+
+    /// `[x]` / `[ ]` 那三个字节。切换状态改的就是它中间那一个（不变量 B6）。
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn state(self) -> TaskState {
+        self.state
+    }
+
+    #[must_use]
+    fn shifted(self, delta: i64) -> Option<Self> {
+        Some(Self {
+            source: shift_range(self.source, delta)?,
+            ..self
+        })
     }
 }
 

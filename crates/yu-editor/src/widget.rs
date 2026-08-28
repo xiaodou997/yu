@@ -25,6 +25,13 @@ use yu_markdown::{BlockWidget, ImageSpan};
 /// 资源没就绪时盒子有几个行高宽。
 const PLACEHOLDER_WIDTH_IN_LINES: f32 = 4.0;
 
+/// 复选框的边长占行高的几成。
+///
+/// 这个数**只有这一处**。它此前住在 `yu-workspace` 的画法里，而盒子多宽是
+/// 排版的事——画的人自己算一遍，等于「同一个几何两套实现」（不变量 E6 说的
+/// 那件事的小号版本）。现在排版按它占位，画的人按排出来的 `bounds` 画。
+const CHECKBOX_SIZE_IN_LINES: f32 = 0.68;
+
 /// 一张已经解码到位的图片：它那段 Markdown，以及解码出来的像素尺寸。
 ///
 /// 按**源码区间**索引而不是按目标 URL：同一个 URL 在一篇文档里可以出现
@@ -46,10 +53,9 @@ impl<'a> BlockWidgets<'a> {
         Self { widgets, sizes }
     }
 
-    fn image(&self, widget: WidgetId) -> Option<ImageSpan> {
+    fn widget(&self, widget: WidgetId) -> Option<BlockWidget> {
         let index = usize::try_from(widget.0).ok()?;
-        let BlockWidget::Image(image) = self.widgets.get(index).copied()?;
-        Some(image)
+        self.widgets.get(index).copied()
     }
 
     fn size_of(&self, image: ImageSpan) -> Option<ImageIntrinsicSize> {
@@ -68,10 +74,15 @@ impl WidgetMeasure for BlockWidgets<'_> {
         widget: WidgetId,
         constraints: WidgetConstraints,
     ) -> Option<WidgetMeasurement> {
-        let image = self.image(widget)?;
-        match self.size_of(image) {
-            Some(size) => intrinsic_metrics(size, constraints).map(WidgetMeasurement::Ready),
-            None => placeholder_metrics(constraints).map(WidgetMeasurement::Placeholder),
+        match self.widget(widget)? {
+            BlockWidget::Image(image) => match self.size_of(image) {
+                Some(size) => intrinsic_metrics(size, constraints).map(WidgetMeasurement::Ready),
+                None => placeholder_metrics(constraints).map(WidgetMeasurement::Placeholder),
+            },
+            // 复选框没有要等的资源，永远是 `Ready`：它的尺寸只依赖行高。
+            // 报成 `Placeholder` 会让 `pending_widgets` 永远不空，而
+            // `LayoutCache` 用那个判断「还欠着谁」，于是每一帧都重排一次。
+            BlockWidget::Checkbox(_) => checkbox_metrics(constraints).map(WidgetMeasurement::Ready),
         }
     }
 }
@@ -91,6 +102,18 @@ fn intrinsic_metrics(
     let width = (intrinsic_width * scale).max(1.0);
     let height = (intrinsic_height * scale).max(constraints.line_height());
     WidgetMetrics::sitting_on_baseline(Size::new(width, height).ok()?).ok()
+}
+
+/// 复选框坐在文字基线上，和一个字形一样。
+///
+/// 此前它是按行盒竖直居中画的（`y + (行高 - 边长) / 2`）。换成坐基线是因为
+/// 它现在**在行里占位**：占位的东西按基线对齐，才不会在行高变化时相对文字
+/// 上下漂。
+fn checkbox_metrics(constraints: WidgetConstraints) -> Option<WidgetMetrics> {
+    let side = (constraints.line_height() * CHECKBOX_SIZE_IN_LINES)
+        .min(constraints.available_width())
+        .max(1.0);
+    WidgetMetrics::sitting_on_baseline(Size::new(side, side).ok()?).ok()
 }
 
 fn placeholder_metrics(constraints: WidgetConstraints) -> Option<WidgetMetrics> {

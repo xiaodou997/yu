@@ -29,8 +29,9 @@ pub use block_sequence::{
 };
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
 pub use extension::{
-    BlockContext, BlockDecorations, BlockOrnament, BlockWidget, DelimitedSpan, Extension,
-    ExtensionError, ExtensionOutput, ExtensionSet, ImageSpan, MarkerOrnament, SyntaxNode, reveals,
+    BlockContext, BlockDecorations, BlockOrnament, BlockWidget, CheckboxSpan, DelimitedSpan,
+    Extension, ExtensionError, ExtensionOutput, ExtensionSet, ImageSpan, MarkerOrnament,
+    SyntaxNode, reveals,
 };
 pub use inline::{
     InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError,
