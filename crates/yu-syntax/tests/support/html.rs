@@ -30,6 +30,9 @@ use std::collections::HashMap;
 use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 use yu_syntax::{NodeKind, Tree};
 
+/// `[x]` / `[ ]` 的字节数。
+const TASK_MARKER_LEN: usize = 3;
+
 /// 一条引用定义。
 struct Reference {
     destination: String,
@@ -245,10 +248,59 @@ impl<'a> Html<'a> {
             NodeKind::HtmlBlock | NodeKind::CommentBlock | NodeKind::ProcessingInstructionBlock => {
                 self.html_block(node);
             }
+            NodeKind::Task => self.task(node, tight),
             // 引用定义不产出任何 HTML。
             NodeKind::LinkReference => {}
             _ => self.inline_children(node),
         }
+    }
+
+    /// GFM 任务项。
+    ///
+    /// CommonMark 的 652 条用例里没有任务项（`tasklist_syntax_is_absent_from_the_spec`
+    /// 压着这一条），所以这段输出的判据只能来自差分的对照方 cmark-gfm，
+    /// 而它有两个自己的习惯，照抄：
+    ///
+    /// - 复选框后面**固定**跟一个空格，而标记后原有的第一个空白被吃掉。
+    ///   `- [ ]   三个空格` 因此输出 `/>` 加三个空格，不是四个也不是一个。
+    /// - 松散列表里复选框放在 `<p>` **外面**。
+    ///
+    /// 正文的首空白不能按块首修剪掉，上一条就是原因。
+    fn task(&mut self, node: Node<'_>, tight: bool) {
+        let checked = self
+            .text(node.from, node.to)
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| *byte != b' ');
+        let mut body_from = node.from + TASK_MARKER_LEN;
+        if matches!(self.text(body_from, body_from + 1), " " | "\t") {
+            body_from += 1;
+        }
+        let body = self.render_task_body(node, body_from);
+        self.out.push_str(if checked {
+            "<input type=\"checkbox\" checked=\"\" disabled=\"\" /> "
+        } else {
+            "<input type=\"checkbox\" disabled=\"\" /> "
+        });
+        if tight {
+            self.out.push_str(&body);
+        } else {
+            self.cr();
+            self.out.push_str("<p>");
+            self.out.push_str(&body);
+            self.out.push_str("</p>\n");
+        }
+    }
+
+    /// 任务项正文：从 `from` 起渲染，**不**丢弃首空白。
+    fn render_task_body(&mut self, node: Node<'_>, from: usize) -> String {
+        let start = self.out.len();
+        self.at_line_start = false;
+        self.block_empty = false;
+        self.pending.clear();
+        self.inline_range(node, from, node.to);
+        self.pending.clear();
+        self.out.split_off(start)
     }
 
     /// 规范：标题正文去掉首尾空白。ATX 的 `#` 与正文之间的空格、setext
@@ -619,7 +671,8 @@ impl<'a> Html<'a> {
             | NodeKind::ListMark
             | NodeKind::Url
             | NodeKind::LinkTitle
-            | NodeKind::LinkLabel => {}
+            | NodeKind::LinkLabel
+            | NodeKind::TaskMarker => {}
             _ => self.inline_range(node, node.from, node.to),
         }
     }
@@ -925,6 +978,7 @@ fn is_mark(kind: NodeKind) -> bool {
             | NodeKind::HeaderMark
             | NodeKind::QuoteMark
             | NodeKind::ListMark
+            | NodeKind::TaskMarker
     )
 }
 

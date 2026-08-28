@@ -107,7 +107,7 @@ pub fn deviation_free_document(seed: u64) -> String {
     let mut reference_count = 0_usize;
 
     for _ in 0..blocks {
-        match rng.below(11) {
+        match rng.below(12) {
             0 => {
                 let level = 1 + rng.below(6);
                 out.push_str(&"#".repeat(level));
@@ -189,6 +189,19 @@ pub fn deviation_free_document(seed: u64) -> String {
                 reference_count += 1;
                 out.push_str(&format!("[{label}]: /target/{label} \"title\"\n\n"));
                 out.push_str(&format!("see [{label}] and [text][{label}].\n"));
+            }
+            11 => {
+                // GFM 任务项。标记后固定一个空格、列表保持紧凑：多余的空白
+                // 与松散列表由 `task_lists_match_comrak` 逐条压着，这里只
+                // 负责让「任务项与别的语法混在一份文档里」被大量样本走到。
+                let items = 1 + rng.below(3);
+                let marker = *rng.pick(&["-", "*", "+"]);
+                for _ in 0..items {
+                    out.push_str(marker);
+                    out.push_str(if rng.chance(2) { " [x] " } else { " [ ] " });
+                    inline(&mut rng, &mut out);
+                    out.push('\n');
+                }
             }
             _ => {
                 out.push_str("<div>\n");

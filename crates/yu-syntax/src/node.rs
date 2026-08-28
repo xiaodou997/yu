@@ -3,14 +3,20 @@
 //! 编号与 `@lezer/markdown` 的 `Type` 枚举一一对应，顺序也保持一致：算法里
 //! 有几处依赖「id 落在某个区间」的判断（`ATXHeading1 - 1 + size`、
 //! `id >= Escape` 表示行内节点），改动顺序会静默地改变解析结果。
+//!
+//! 上游把 `Type` 之外的节点（GFM 的 `Task` / `TaskMarker` 就是）由
+//! `defineNodes` 追加在末尾，「是不是块」靠 `NodeProp` 上的 `block: true`
+//! 标记，不靠编号。这份移植没有 prop 系统，[`NodeKind::is_block`] 是一次
+//! 区间比较，所以追加的块级节点接在**块那一段的末尾**，标记节点接在标记
+//! 那一段的末尾。
 
 /// 一个语法节点的类型。
 ///
 /// 变体分三段，段内顺序不可调整：
 ///
-/// 1. `Document` 与块级节点（`Document` ..= `ProcessingInstructionBlock`）；
+/// 1. `Document` 与块级节点（`Document` ..= `Task`）；
 /// 2. 行内节点（`Escape` ..= `Autolink`）；
-/// 3. 标记节点（`HeaderMark` ..= `Url`），语法字符本身。
+/// 3. 标记节点（`HeaderMark` ..= `TaskMarker`），语法字符本身。
 ///
 /// 第 3 段是不变量 C2「lossless」得以成立的关键：`#`、`>`、`*` 这些字符都有
 /// 自己的节点，装饰阶段据此隐藏语法而不触碰 source。
@@ -42,6 +48,11 @@ pub enum NodeKind {
     Paragraph,
     CommentBlock,
     ProcessingInstructionBlock,
+    /// GFM 任务项的内容，`- [x] 交作业` 里的 `[x] 交作业`。
+    ///
+    /// 它是 `ListItem` 的内容节点，站在普通列表项里 `Paragraph` 的位置上；
+    /// `- ` 本身仍然是 `ListMark`。
+    Task,
 
     // 行内。
     Escape,
@@ -69,6 +80,8 @@ pub enum NodeKind {
     LinkTitle,
     LinkLabel,
     Url,
+    /// GFM 任务项的 `[x]` / `[ ]`，三个字节。
+    TaskMarker,
 }
 
 impl NodeKind {
@@ -97,6 +110,7 @@ impl NodeKind {
             Self::Paragraph => "Paragraph",
             Self::CommentBlock => "CommentBlock",
             Self::ProcessingInstructionBlock => "ProcessingInstructionBlock",
+            Self::Task => "Task",
             Self::Escape => "Escape",
             Self::Entity => "Entity",
             Self::HardBreak => "HardBreak",
@@ -120,16 +134,17 @@ impl NodeKind {
             Self::LinkTitle => "LinkTitle",
             Self::LinkLabel => "LinkLabel",
             Self::Url => "URL",
+            Self::TaskMarker => "TaskMarker",
         }
     }
 
-    /// 块级节点：`Document` 与它到 `ProcessingInstructionBlock` 之间的全部。
+    /// 块级节点：`Document` 与它到 `Task` 之间的全部。
     ///
     /// 增量复用只在块边界上发生（`FragmentCursor::take_nodes`），这个判断决定
     /// 哪些节点可以充当边界。
     #[must_use]
     pub const fn is_block(self) -> bool {
-        (self as u8) <= (Self::ProcessingInstructionBlock as u8)
+        (self as u8) <= (Self::Task as u8)
     }
 
     /// 容器块：可以嵌套其他块，并在每行开头需要跳过自己的标记。
@@ -195,6 +210,9 @@ mod tests {
     fn block_range_covers_exactly_the_block_section() {
         assert!(NodeKind::Document.is_block());
         assert!(NodeKind::ProcessingInstructionBlock.is_block());
+        // 追加的块级节点必须落在区间里，追加的标记节点必须落在区间外。
+        assert!(NodeKind::Task.is_block());
+        assert!(!NodeKind::TaskMarker.is_block());
         assert!(!NodeKind::Escape.is_block());
         assert!(!NodeKind::HeaderMark.is_block());
     }

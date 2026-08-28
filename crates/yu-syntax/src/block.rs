@@ -594,6 +594,29 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle_bytes))
 }
 
+/// `[x]` / `[ ]` 的字节数。
+const TASK_MARKER_LEN: u32 = 3;
+
+/// GFM 任务项的标记：`[ ]`、`[x]`、`[X]`，后面跟空白或行尾。
+///
+/// # 两处相对上游的偏差
+///
+/// 上游的判据是 `/^\[[ xX]\][ \t]/`——`]` 后面**必须**有空白。这里放宽到
+/// 「空白或内容到此为止」，理由是两个互相独立的参照都说上游在这里判错：
+/// cmark-gfm 把 `- [x]` 认成一个已完成的任务项（`tests/differential.rs`
+/// 的 comrak 差分现在压着这一条），Yu 自己 v1 的 `parse_task_marker` 也认。
+/// 上游那条规则会让人在敲出 `- [ ]` 与随后那个空格之间看见复选框闪一下。
+///
+/// 另一处偏差在 [`BlockContext::starts_task`]。
+fn is_task_marker(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    bytes.len() >= TASK_MARKER_LEN as usize
+        && bytes[0] == b'['
+        && matches!(bytes[1], b' ' | b'x' | b'X')
+        && bytes[2] == b']'
+        && matches!(bytes.get(3), None | Some(b' ' | b'\t'))
+}
+
 /// 列表项内容的缩进列号。
 fn get_list_indent(line: &Line, pos: usize) -> usize {
     let indent_after = line.count_indent(pos, line.pos, line.indent);
@@ -962,6 +985,38 @@ impl<'a, I: Input + ?Sized> BlockContext<'a, I> {
         self.input.byte_at(pos)
     }
 
+    /// 这个 leaf block 是不是一个 GFM 任务项的开头。
+    ///
+    /// # 相对上游的第二处偏差：必须是列表项的第一个内容块
+    ///
+    /// 上游只问「最内层的容器是不是 `ListItem`」，于是
+    ///
+    /// ```text
+    /// - foo
+    ///
+    ///   [ ] bar
+    /// ```
+    ///
+    /// 里的第二个段落也成了任务项。cmark-gfm 不这么认，Yu 的 `block_sequence`
+    /// 也不这么认——它按列表项**第一行**去找标记。两边都说上游放宽了。
+    ///
+    /// 这一条不只是「与别人不一样」：产品链路上的复选框是按块画的，而这种
+    /// 段落成不了任务块，于是 `[ ]` 被藏起来、复选框一个都不画，画面上凭空
+    /// 少三个字符。「静默地做错事」，所以按窄的那一边判。
+    ///
+    /// 判据是「这个列表项到现在为止只有它自己的标记」——`ListMark` 由
+    /// [`BlockContext::open_list_item`] 在开项时就加进去，容器标记
+    /// （`QuoteMark`）由 `inject_marks` 插进内容里，两者都不是内容块。
+    fn starts_task(&self, leaf: &LeafBlock) -> bool {
+        self.block().kind == NodeKind::ListItem
+            && self
+                .block()
+                .children
+                .iter()
+                .all(|child| matches!(child.kind(), NodeKind::ListMark | NodeKind::QuoteMark))
+            && is_task_marker(&leaf.content)
+    }
+
     /// 段落式的 leaf block：一直吃到被空行或别的构造打断为止。
     fn parse_leaf_block(&mut self) {
         let start = self.line_start + u32::try_from(self.line.pos).unwrap_or(0);
@@ -975,6 +1030,20 @@ impl<'a, I: Input + ?Sized> BlockContext<'a, I> {
             parsers.push(LeafParser::LinkReference(LinkReferenceParser::new(&leaf)));
         }
         parsers.push(LeafParser::SetextHeading);
+        // 上游把 TaskList 注册在 `after: "SetextHeading"`。
+        //
+        // 这里跟着放在后面，但**换过来是一个等价变异**，不要为它写测试：
+        // 两个位置各自的分派都不看顺序。`leaf_next_line` 里任务项一律返回
+        // false（`[x]` 只可能出现在项的第一行），Setext 照样轮得到；
+        // `leaf_finish` 里 Setext 一律返回 false，任务项照样轮得到。十一份
+        // 「任务项遇上 Setext 下划线」的输入两种顺序逐字节相同，验过。
+        //
+        // 留着上游的顺序是因为它说的是规则本身：`- [x] a` 后面跟一行 `===`
+        // 是一个 Setext 标题，不是任务项。哪天两边的分派不再互斥，这一行
+        // 就是那句话的落点。
+        if self.starts_task(&leaf) {
+            parsers.push(LeafParser::Task);
+        }
 
         while self.next_line() {
             if self.line.pos == self.line.len() {
@@ -1030,6 +1099,7 @@ const BLOCK_PARSER_COUNT: usize = 8;
 enum LeafParser {
     LinkReference(LinkReferenceParser),
     SetextHeading,
+    Task,
 }
 
 impl<I: Input + ?Sized> BlockContext<'_, I> {
@@ -1356,6 +1426,8 @@ impl<I: Input + ?Sized> BlockContext<'_, I> {
                 self.add_leaf_element(leaf, element);
                 true
             }
+            // 任务项不观察后续行：`[x]` 只可能出现在项的第一行。
+            LeafParser::Task => false,
             LeafParser::SetextHeading => {
                 if self.line.depth < self.stack.len() {
                     return false;
@@ -1399,6 +1471,20 @@ impl<I: Input + ?Sized> BlockContext<'_, I> {
                 true
             }
             LeafParser::SetextHeading => false,
+            LeafParser::Task => {
+                let mut children = vec![Element::leaf(
+                    NodeKind::TaskMarker,
+                    leaf.start,
+                    leaf.start + TASK_MARKER_LEN,
+                )];
+                children.extend(parse_inline(
+                    &leaf.content[TASK_MARKER_LEN as usize..],
+                    leaf.start + TASK_MARKER_LEN,
+                ));
+                let to = leaf.start + u32::try_from(leaf.content.len()).unwrap_or(0);
+                self.add_leaf_element(leaf, Element::new(NodeKind::Task, leaf.start, to, children));
+                true
+            }
         }
     }
 }

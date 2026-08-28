@@ -15,7 +15,8 @@
 //!
 //! # 与上游的差异
 //!
-//! 移植不是照抄。以下差异都是有意的，并且都不改变解析结果：
+//! 移植不是照抄。以下差异都是有意的。除了 GFM 任务项那一条，其余都不改变
+//! 解析结果——任务项那一条**会**改变，所以它自己带着一个 oracle：
 //!
 //! - **不支持多 range 解析。** lezer 的 `ranges` / `injectGaps` / `toRelative`
 //!   是给 `parseMixed` 混合语言用的（在一份输入里只解析若干不连续片段）。Yu
@@ -23,8 +24,20 @@
 //! - **树的表示不同**（`Arc` 持久树、无 `TreeBuffer`、无 balance）。
 //! - **不移植 `PartialParse` 的分步 `advance()`。** 那是为了在浏览器主线程上
 //!   切片解析；Yu 的解析跑在不可变 Snapshot 上，不占主线程。
-//! - **不移植 `configure` 扩展机制。** 它服务的是 `yu-markdown` 的 extension，
-//!   在 S6 落地时再建；现在建只会得到一份没有使用者也没有测试的抽象。
+//! - **不移植 `configure` 扩展机制，GFM 的 TaskList 直接内建、无条件开着。**
+//!   上游把任务项做成一份可选的 `MarkdownConfig`；这里没有那套机制，也不为
+//!   它建——`yu-syntax` 只有一个消费者（`yu-markdown`），而它永远要任务项。
+//!   一套唯一的配置是「一直开着」的配置机制，没有第二个取值就没有价值。
+//!
+//!   代价是这一层解析的语法是 CommonMark 的**超集**。它现在不与不变量 C7
+//!   打架，理由是可以验的：652 条规范用例里一条任务项都没有，由
+//!   `tests/commonmark_spec.rs::tasklist_syntax_is_absent_from_the_spec`
+//!   钉住。哪天规范加进一条，红的是那条断言而不是通过率的棘轮。
+//!
+//!   任务项的两条判定规则**离开了上游**（`]` 后面可以什么都没有；必须是
+//!   列表项的第一个内容块），两处都跟着 cmark-gfm 走，理由分别写在
+//!   `block.rs` 的 `is_task_marker` 与 `starts_task` 上，由
+//!   `tests/differential.rs::task_lists_match_comrak` 逐条压着。
 //! - **引用链接的成立与否不在这里判定**（不变量 C6）。parser 只产出候选
 //!   `LinkReference` / `LinkLabel` 节点，是否成立由同 Revision 的 reference
 //!   table 在装饰阶段决定。这一条**修正**了 lezer 自己声明的偏差。

@@ -213,9 +213,9 @@ fn hard_breaks_hide_the_marker_not_the_newline() {
 
 /// 任务项画成 `- ☐ 待办`，普通列表项画成 `• 项目`。
 ///
-/// `- ` 前缀归 `list.rs` 管，而它按**块类型**只认 `ListItem`，认不到
-/// `TaskListItem`——两个 extension 的定义域不相交，谁也不需要知道对方存在
-/// （不变量 D6）。让 list 去问「有没有 task」才是相互感知。
+/// `- ` 前缀归 `list.rs` 管，而它按**列表项的内容节点**划分定义域：内容是
+/// `Paragraph` 的归它，是 `Task` 的归 `task.rs`。两个集合不相交，谁也不需要
+/// 知道对方存在（不变量 D6）。让 list 去问「有没有 task」才是相互感知。
 #[test]
 fn a_task_item_keeps_its_dash_a_plain_item_gets_a_bullet() {
     let task = decorate("- [ ] 待办", None);
@@ -237,18 +237,24 @@ fn a_task_item_keeps_its_dash_a_plain_item_gets_a_bullet() {
     assert_eq!(marker.text(), "\u{2022}");
 }
 
-/// `[x]` 在树里还会被解析成一个 shortcut `Link`，于是 link 与 task 两个
-/// extension 都往同一段 source 上盖隐藏。它们互不感知（不变量 D6），
-/// 结果靠取并集收敛——这条用例钉住「并集恰好是整个 `[x]`」，不多不少。
+/// 复选框只有一条装饰盖着，不是三条叠出来的。
+///
+/// 第九刀之前 `[x]` 会被行内解析器认成一个 shortcut `Link`，于是 link 与
+/// task 两个互不感知的 extension 盖在同一段 source 上，隐藏区间靠取并集
+/// **恰好**收敛到整个 `[x]`：`(2,3) ∪ (2,5) ∪ (4,5) = (2,5)`。
+///
+/// 「恰好」是这条用例存在的理由。并集收敛不是一条被保证的性质——把 link 的
+/// 定界符规则、task 的标记范围、合并时的取并集任何一个动一下，它就散架，
+/// 而散架的样子是画面上多出或少掉两个方括号，不 panic 不报错。
+///
+/// TaskList 进 `yu-syntax` 之后 `[x]` 是一个 `TaskMarker`，行内解析从它
+/// 之后才开始，`Link` 产不出来。所以这里断言的是**逐条**装饰而不是并集：
+/// 并集永远是 (2,5)，只有逐条才看得出重叠回来了没有。
 #[test]
-fn task_and_link_overlap_on_a_checked_box_without_fighting() {
-    assert_eq!(hidden_merged(&decorate("- [x] 完成", None)), vec![(2, 5)]);
-    assert_eq!(hidden_merged(&decorate("- [ ] 待办", None)), vec![(2, 5)]);
-    // link 确实也插了一手：`[x]` 的两个 `LinkMark` 各自成一条装饰。
-    assert_eq!(
-        hidden(&decorate("- [x] 完成", None)),
-        vec![(2, 3), (2, 5), (4, 5)]
-    );
+fn a_checked_box_is_hidden_by_exactly_one_decoration() {
+    assert_eq!(hidden(&decorate("- [x] 完成", None)), vec![(2, 5)]);
+    assert_eq!(hidden(&decorate("- [ ] 待办", None)), vec![(2, 5)]);
+    assert_eq!(hidden(&decorate("1. [X] 大写", None)), vec![(3, 6)]);
 }
 
 /// 复选框永远不露出来，焦点块也不例外。
