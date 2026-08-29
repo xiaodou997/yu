@@ -45,7 +45,6 @@ use yu_decoration::{Decoration, DecorationRange, DecorationSet, LineStyleId, Mer
 use yu_syntax::{NodeKind, Tree};
 use yu_text::TextSnapshot;
 
-use crate::block_line_ranges;
 use crate::block_sequence::{Block, TaskState};
 use crate::reference::read_range;
 use crate::table::TableBlock;
@@ -225,12 +224,19 @@ impl<'a> BlockContext<'a> {
         ByteOffset::new(cursor)
     }
 
-    /// 这个块第一行的起点。列表标记的缩进由它算出来。
+    /// 这个块第一行的行首缩进有多少列。
+    ///
+    /// 「一个块缩进多少」只有这一个算法：从第一行的起点起跳过空格与制表
+    /// 符。列表项按 `ListMark` 的起点减去行首也能算出同一个数，但那要先拿到
+    /// 标记节点——而任务项要缩进却不要标记，两处各算一遍就会分叉。
+    ///
+    /// 超过 255 列的缩进夹在 255 上：那种输入排出来已经在屏幕外了，为它多带
+    /// 一个 `u16` 只会让每个消费者多一次转换。
     #[must_use]
-    pub fn first_line_start(&self) -> ByteOffset {
-        block_line_ranges(self.source, self.range())
-            .first()
-            .map_or_else(|| self.range().start(), |line| line.start())
+    pub fn indent_columns(&self) -> u8 {
+        let line_start = self.range().start();
+        let content_start = self.skip_spaces(line_start);
+        u8::try_from(content_start.get().saturating_sub(line_start.get())).unwrap_or(u8::MAX)
     }
 
     /// 光标所在的区间，只有**焦点块**有。
@@ -258,8 +264,21 @@ pub enum BlockOrnament {
     Heading { level: u8 },
     /// 引用，`depth` 层竖条。
     QuoteBar { depth: u8 },
+    /// 这一块的正文往右让多少列。
+    ///
+    /// 它与 [`BlockOrnament::Marker`] 是**两件事**，此前挤在一个变体里：
+    /// 标记说的是「行首那个 `-` 画成什么」，缩进说的是「这一块整体让多少」。
+    /// 嵌套的任务项要后一件而不要前一件——它的 `- ` 原样留在正文里（见
+    /// `extension/task.rs`），于是在两件事还挤在一起的时候，它**一列都让不
+    /// 出来**：同一层的普通列表项缩进了，任务项贴着左边缘。
+    ///
+    /// `columns` 是**源码里的列数**，不是嵌套层数。翻成像素要
+    /// `LayoutConfig`，那是 `yu-editor` 的事。
+    Indent { columns: u8 },
     /// 列表的行首标记。`text` 不在 source 里（`•` 是 `-` 的替代呈现），
     /// 它替代掉的那段源码由 [`MarkerOrnament::source`] 指着。
+    ///
+    /// 它**不带缩进**——那是 [`BlockOrnament::Indent`]。
     ///
     /// [`MarkerOrnament::source`]: crate::extension::MarkerOrnament::source
     Marker(MarkerOrnament),
@@ -287,6 +306,7 @@ impl BlockOrnament {
     fn shifted(self, delta: i64) -> Option<Self> {
         Some(match self {
             Self::Heading { level } => Self::Heading { level },
+            Self::Indent { columns } => Self::Indent { columns },
             Self::QuoteBar { depth } => Self::QuoteBar { depth },
             Self::Marker(marker) => Self::Marker(MarkerOrnament {
                 source: shift_range(marker.source, delta)?,
@@ -306,16 +326,14 @@ impl BlockOrnament {
 pub struct MarkerOrnament {
     source: TextRange,
     text: String,
-    indent: u8,
 }
 
 impl MarkerOrnament {
     #[must_use]
-    pub fn new(source: TextRange, text: impl Into<String>, indent: u8) -> Self {
+    pub fn new(source: TextRange, text: impl Into<String>) -> Self {
         Self {
             source,
             text: text.into(),
-            indent,
         }
     }
 
@@ -328,12 +346,6 @@ impl MarkerOrnament {
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
-    }
-
-    /// 标记左边空出多少列。
-    #[must_use]
-    pub const fn indent(&self) -> u8 {
-        self.indent
     }
 }
 

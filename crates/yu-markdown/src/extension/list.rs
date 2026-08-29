@@ -52,24 +52,25 @@ impl Extension for List {
             return;
         };
 
-        // 行首缩进也是语法：缩进量由 `MarkerOrnament::indent` 报给上一层去
+        // 行首缩进也是语法：缩进量由 `BlockOrnament::Indent` 报给上一层去
         // 排版，原样留在视觉文本里就会缩进两次。
-        let line_start = cx.first_line_start();
+        // 块从行首开始（块序列铺满源码，不在行中间切），所以「第一行的起点」
+        // 就是块的起点。此前这里调一个 `first_line_start()`，它把整块切成行
+        // 再取第一条的起点——同一个答案，代价是 O(块长度)。**那是变异验证抓
+        // 出来的**：把它换成块的起点，一条用例都不红。
+        let line_start = cx.range().start();
         let content_start = cx.skip_spaces(mark.range().end());
         if let Some(prefix) = TextRange::new(line_start, content_start) {
             out.replace(prefix);
         }
 
-        let indent = mark
-            .range()
-            .start()
-            .get()
-            .saturating_sub(line_start.get())
-            .min(u64::from(u8::MAX)) as u8;
+        let indent = out.line_style(BlockOrnament::Indent {
+            columns: cx.indent_columns(),
+        });
+        out.line(cx.range(), indent);
         let style = out.line_style(BlockOrnament::Marker(MarkerOrnament::new(
             mark.range(),
             marker_text(cx, mark),
-            indent,
         )));
         out.line(cx.range(), style);
     }

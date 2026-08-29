@@ -49,6 +49,30 @@ fn decorate(source: &str, active: Option<TextRange>) -> BlockDecorations {
     decorate_with(&ExtensionSet::markdown(), source, active)
 }
 
+/// 这个块的标记装饰，没有就是 `None`。按**变体**找，不按下标：一个块可以有
+/// 好几条行级装饰（列表项就有缩进与标记两条），按下标断言会在加一条装饰时
+/// 悄悄断在别的东西上。
+fn marker_of(decorations: &BlockDecorations) -> Option<&yu_markdown::MarkerOrnament> {
+    decorations
+        .line_ornaments()
+        .into_iter()
+        .find_map(|(_, ornament)| match ornament {
+            BlockOrnament::Marker(marker) => Some(marker),
+            _ => None,
+        })
+}
+
+/// 这个块往右让多少列，没有缩进装饰就是 `None`。
+fn indent_of(decorations: &BlockDecorations) -> Option<u8> {
+    decorations
+        .line_ornaments()
+        .into_iter()
+        .find_map(|(_, ornament)| match ornament {
+            BlockOrnament::Indent { columns } => Some(*columns),
+            _ => None,
+        })
+}
+
 /// 这个块上被隐藏的 source 区间，升序去重。
 fn hidden(decorations: &BlockDecorations) -> Vec<(u64, u64)> {
     let mut ranges: Vec<_> = decorations
@@ -226,28 +250,50 @@ fn quote_depth_counts_nesting_not_marks() {
 #[test]
 fn ordered_lists_keep_their_number_bullets_get_a_dot() {
     let bullet = decorate("- 项目", None);
-    let BlockOrnament::Marker(marker) = bullet.line_ornaments()[0].1 else {
-        panic!("列表项该有一个标记装饰");
-    };
-    assert_eq!(marker.text(), "\u{2022}");
-    assert_eq!(marker.indent(), 0);
+    assert_eq!(
+        marker_of(&bullet).expect("列表项该有标记").text(),
+        "\u{2022}"
+    );
+    assert_eq!(indent_of(&bullet), Some(0));
 
     let ordered = decorate("1. 有序", None);
-    let BlockOrnament::Marker(marker) = ordered.line_ornaments()[0].1 else {
-        panic!("列表项该有一个标记装饰");
-    };
-    assert_eq!(marker.text(), "1.", "有序列表的编号是给人看的，原样搬过去");
+    assert_eq!(
+        marker_of(&ordered).expect("列表项该有标记").text(),
+        "1.",
+        "有序列表的编号是给人看的，原样搬过去"
+    );
 
     let indented = decorate("  - 缩进项", None);
-    let BlockOrnament::Marker(marker) = indented.line_ornaments()[0].1 else {
-        panic!("列表项该有一个标记装饰");
-    };
-    assert_eq!(marker.indent(), 2);
+    assert_eq!(indent_of(&indented), Some(2));
     assert_eq!(
         hidden(&indented),
         vec![(0, 4)],
         "行首缩进也是语法：缩进量单独报给上一层，留在视觉文本里就缩进两次"
     );
+}
+
+/// 缩进与标记是两件事，分别由两条装饰说。
+///
+/// 任务项要缩进而不要替代标记（它的 `- ` 原样留在正文里）。两件事挤在一个
+/// `MarkerOrnament` 里的时候，嵌套的任务项**一列都让不出来**——同一层的普通
+/// 列表项缩进了，任务项贴着左边缘。
+#[test]
+fn indentation_travels_on_its_own_ornament_so_task_items_get_it_too() {
+    for (source, columns) in [
+        ("- 项目", 0),
+        ("  - 缩进项", 2),
+        ("- [ ] 待办", 0),
+        // 三个空格还是列表项；第四个空格就成缩进代码块了。
+        ("   - [x] 深缩进任务", 3),
+    ] {
+        let decorations = decorate(source, None);
+        assert_eq!(indent_of(&decorations), Some(columns), "source {source:?}");
+    }
+
+    // 焦点块把标记原样露出来，连缩进一起撤掉：正文里那几个空格又回来了，
+    // 再让一次就缩进两回。
+    let focused = decorate("  - 缩进项", Some(range(0, 0)));
+    assert_eq!(indent_of(&focused), None);
 }
 
 /// 代码块的内容不解析行内语法。这件事由树的形状保证，不靠任何人记得判断。
@@ -288,16 +334,16 @@ fn a_task_item_keeps_its_dash_a_plain_item_gets_a_bullet() {
         "只有 `[ ]` 消失，`- ` 原样留着"
     );
     assert!(
-        task.line_ornaments().is_empty(),
+        marker_of(&task).is_none(),
         "任务项不该有替代标记——有的话 `- ` 旁边会再多一个 `•`"
     );
 
     let plain = decorate("- 项目", None);
     assert_eq!(hidden_merged(&plain), vec![(0, 2)], "`- ` 换成替代标记");
-    let BlockOrnament::Marker(marker) = plain.line_ornaments()[0].1 else {
-        panic!("普通列表项该有一个标记装饰");
-    };
-    assert_eq!(marker.text(), "\u{2022}");
+    assert_eq!(
+        marker_of(&plain).expect("普通列表项该有标记").text(),
+        "\u{2022}"
+    );
 }
 
 /// 复选框只有一条装饰盖着，不是三条叠出来的。
@@ -1124,6 +1170,7 @@ fn no_ornament_payload_leaves_its_block_across_the_corpus() {
                     }
                     BlockOrnament::Heading { .. }
                     | BlockOrnament::QuoteBar { .. }
+                    | BlockOrnament::Indent { .. }
                     | BlockOrnament::Table(_) => {}
                 }
             }

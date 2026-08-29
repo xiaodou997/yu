@@ -51,7 +51,7 @@
 use yu_core::WidgetSide;
 use yu_syntax::NodeKind;
 
-use super::{BlockContext, BlockWidget, CheckboxSpan, Extension, ExtensionOutput};
+use super::{BlockContext, BlockOrnament, BlockWidget, CheckboxSpan, Extension, ExtensionOutput};
 use crate::block_sequence::BlockKind;
 use crate::task::checkbox_state;
 
@@ -84,5 +84,11 @@ impl Extension for Task {
         )));
         // 非空 range 的 widget 覆盖并隐藏这一段，`side` 没有歧义。
         out.place_widget(marker.range(), widget, WidgetSide::Before);
+
+        // 缩进：嵌套的任务项要往右让，而它没有标记装饰替它说这句话。
+        let indent = out.line_style(BlockOrnament::Indent {
+            columns: cx.indent_columns(),
+        });
+        out.line(cx.range(), indent);
     }
 }
