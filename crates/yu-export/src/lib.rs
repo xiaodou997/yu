@@ -273,8 +273,8 @@ fn render_block(
             html.push_str("</p>");
             Ok(html)
         }
-        BlockKind::AtxHeading { level } => {
-            let content = heading_content_range(snapshot, block.range());
+        BlockKind::Heading { level } => {
+            let content = yu_markdown::heading_content_range(snapshot, block);
             let mut html = format!("<h{level}>");
             render_inline(snapshot, definitions, content, &mut html)?;
             html.push_str(&format!("</h{level}>"));
@@ -503,30 +503,6 @@ impl InlineRenderer<'_> {
     }
 }
 
-fn heading_content_range(snapshot: &TextSnapshot, range: TextRange) -> TextRange {
-    let source = slice(snapshot, range).expect("parser-owned heading range is valid");
-    let line_end = source.trim_end_matches(['\r', '\n']).len();
-    let bytes = source.as_bytes();
-    let mut index = 0;
-    while index < line_end && bytes[index] == b' ' {
-        index += 1;
-    }
-    while index < line_end && bytes[index] == b'#' {
-        index += 1;
-    }
-    if index < line_end && matches!(bytes[index], b' ' | b'\t') {
-        index += 1;
-        while index < line_end && matches!(bytes[index], b' ' | b'\t') {
-            index += 1;
-        }
-    }
-    TextRange::new(
-        ByteOffset::new(range.start().get() + index as u64),
-        ByteOffset::new(range.start().get() + line_end as u64),
-    )
-    .expect("heading content range is ordered")
-}
-
 fn render_fenced_code(source: &str, marker: char, closed: bool) -> String {
     let mut lines = source.split_inclusive('\n').collect::<Vec<_>>();
     if lines.is_empty() {
@@ -753,6 +729,22 @@ mod tests {
 
     fn whole_range(snapshot: &TextSnapshot) -> TextRange {
         TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).expect("whole range")
+    }
+
+    /// Setext 标题导出成 `<h1>` / `<h2>`，下划线那一行不进正文。
+    ///
+    /// 块的身份由语法树给（`yu-markdown::classify`）之前，`标题\n===` 在块序列
+    /// 里是一个普通段落，这里导出的是 `<p>标题\n===</p>`。
+    #[test]
+    fn setext_headings_export_as_headings_without_their_underline() {
+        for (source, expected) in [
+            ("Setext 一级\n===\n", "<h1>Setext 一级</h1>"),
+            ("Setext 二级\n---\n", "<h2>Setext 二级</h2>"),
+            ("# ATX\n", "<h1>ATX</h1>"),
+        ] {
+            let html = export_html_fragment(source).expect("导出不该失败");
+            assert_eq!(html, expected, "source {source:?}");
+        }
     }
 
     #[test]

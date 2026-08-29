@@ -907,7 +907,7 @@ impl ExtensionSet {
         let cx = BlockContext {
             source,
             block,
-            syntax: SyntaxNode::new(tree, 0).deepest_containing(content_range(source, block)),
+            syntax: block_node(tree, source, block.range()),
             active,
         };
 
@@ -968,7 +968,21 @@ impl fmt::Debug for ExtensionSet {
     }
 }
 
-/// 块的 range 去掉行尾的空白，用来在语法树里定位它。
+/// 一个块在语法树里对应的那个节点。
+///
+/// **这是「块的身份」的唯一一次查询。** 解析时 [`crate::classify`] 用它定
+/// `BlockKind`，装饰时 [`BlockContext::syntax`] 用它定各家 extension 的起点。
+/// 两处各写一遍的话，「同一个块」在两层眼里可以是两个节点——那正是这一刀要
+/// 收掉的那种重复。
+pub(crate) fn block_node<'a>(
+    tree: &'a Tree,
+    source: &TextSnapshot,
+    range: TextRange,
+) -> SyntaxNode<'a> {
+    SyntaxNode::new(tree, 0).deepest_block_containing(content_range(source, range))
+}
+
+/// 块的 range 去掉两头的空白，用来在语法树里定位它。
 ///
 /// **块带着行尾的换行符，语法节点不带。** 拿没修剪的 range 去找「完整包含它
 /// 的最深节点」，几乎每个块都会一路退到 `Document`：`# 标题\n` 的块是 0..10，
@@ -978,12 +992,18 @@ impl fmt::Debug for ExtensionSet {
 /// 节点裁掉——所以这件事不报错、不画错，只是每个块都要遍历整篇文档一遍，
 /// 长文档变成 O(块数 × 文档长度)。这正是「静默地做错事」的一种：唯一的症状
 /// 是慢。
-fn content_range(source: &TextSnapshot, block: Block) -> TextRange {
-    /// 行尾空白最多几个字节。`\r\n` 加几个尾随空格，8 个足够，而读整块只为
-    /// 修剪尾巴对大代码块是浪费。
+///
+/// # 行首的缩进也要去掉
+///
+/// 嵌套列表项的块**带着自己的缩进**（`  - 内` 的块从两个空格开始），而内层
+/// 的 `BulletList` 从 `-` 开始。不修剪行首，「最深的包含者」就会停在**外层**
+/// 的 `ListItem` 上——于是 `  - [x] b` 问不到自己的 `Task` 子节点，一个嵌套
+/// 的任务项会被判成普通列表项，复选框一个都不画。
+fn content_range(source: &TextSnapshot, range: TextRange) -> TextRange {
+    /// 两头的空白各最多看几个字节。`\r\n` 加几个尾随空格，8 个足够，而读整块
+    /// 只为修剪尾巴对大代码块是浪费；行首缩进按窗口分段扫，深嵌套也够。
     const WINDOW: u64 = 8;
 
-    let range = block.range();
     let (start, end) = (range.start().get(), range.end().get());
     // 窗口起点按字节算，可能落在多字节字符中间；`read_window` 会挪到边界。
     // 就地放弃的话这里会静静地退回未修剪的 range，症状只有慢。
@@ -995,7 +1015,44 @@ fn content_range(source: &TextSnapshot, block: Block) -> TextRange {
         .rev()
         .take_while(|byte| matches!(byte, b'\n' | b'\r' | b' ' | b'\t'))
         .count() as u64;
-    TextRange::new(range.start(), ByteOffset::new(end.saturating_sub(trailing))).unwrap_or(range)
+    let trimmed_end = end.saturating_sub(trailing);
+    // 全是空白的块（空行块）修剪完两头会交叉，取块的起点：它与只修剪行尾时
+    // 的答案一样，那种块里本来就没有语法节点。
+    //
+    // **去掉这个夹取是一个等价变异**，验过：交叉之后 `TextRange::new` 给
+    // `None`，`unwrap_or` 退回未修剪的整块 range，而全空白的块在 `classify`
+    // 之前就被 `is_blank` 拦掉了，装饰阶段那种块里又一个节点都查不到，两个
+    // 答案产出的装饰都是空集。留着是因为它说的是意图——「修剪」不该在某些
+    // 输入上悄悄变成「不修剪」。
+    let trimmed_start = leading_content_start(source, start, trimmed_end).min(trimmed_end);
+    TextRange::new(ByteOffset::new(trimmed_start), ByteOffset::new(trimmed_end)).unwrap_or(range)
+}
+
+/// 从 `start` 起跳过 ASCII 空格与制表符，不越过 `end`。
+///
+/// 与 [`BlockContext::skip_spaces`] 是同一件事，但那个要 `BlockContext`
+/// 才调得动，而这里在建 `BlockContext` **之前**就要用。
+fn leading_content_start(source: &TextSnapshot, start: u64, end: u64) -> u64 {
+    let mut cursor = start;
+    while cursor < end {
+        let stop = end.min(cursor.saturating_add(SPACE_WINDOW));
+        let scanned = stop - cursor;
+        let Some((from, bytes)) = read_window(source, cursor, stop) else {
+            break;
+        };
+        if from != cursor {
+            break;
+        }
+        let run = bytes
+            .iter()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count() as u64;
+        cursor += run;
+        if run < scanned {
+            break;
+        }
+    }
+    cursor
 }
 
 /// 光标碰到这一段行内语法时，它的定界符要露出来。

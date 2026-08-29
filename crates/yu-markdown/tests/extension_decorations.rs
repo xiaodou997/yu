@@ -142,6 +142,69 @@ fn heading_reports_its_level_not_its_font_size() {
     assert_eq!(ornaments[0].1, &BlockOrnament::Heading { level: 3 });
 }
 
+/// Setext 的标记是**下面那一整行**，连它前面的换行符一起藏。
+///
+/// 只藏 `===` 的话标题会画成两行，第二行是空的——不报错、不少字，只是画面
+/// 上多一个空行。
+#[test]
+fn setext_headings_hide_the_underline_and_the_newline_before_it() {
+    let one = decorate("标题\n===", None);
+    assert_eq!(
+        one.line_ornaments()[0].1,
+        &BlockOrnament::Heading { level: 1 }
+    );
+    assert_eq!(hidden(&one), vec![(6, 10)], "藏的是 \"\\n===\"");
+
+    let two = decorate("标题\n---", None);
+    assert_eq!(
+        two.line_ornaments()[0].1,
+        &BlockOrnament::Heading { level: 2 }
+    );
+    assert_eq!(hidden(&two), vec![(6, 10)]);
+
+    // 多行正文：只有最后那一行是标记。
+    let multiline = decorate("一\n二\n===", None);
+    assert_eq!(hidden(&multiline), vec![(7, 11)]);
+}
+
+/// 一个块横跨两个树节点时，标题装饰一条都不产，块后半段的行内语法照常产。
+///
+/// `一\n===\n*斜体*` 在行扫描器眼里是**一个**块（它不认得 Setext 下划线），
+/// 在树里是 `SetextHeading1` 加一个 `Paragraph`。两件事各错一次：
+///
+/// - 标题装饰按块里**找得到**标题节点来判定的话，这一块会整块放大——包括
+///   不属于标题的那一段。定义域因此取 `BlockKind`（`crate::classify` 给的是
+///   `Paragraph`）。
+/// - `BlockContext::syntax` 退不到能装下整块的节点的话，块后半段的
+///   `Emphasis` 就不在 `nodes()` 里，`*斜体*` 一条装饰都产不出来——不报错，
+///   只是不斜。
+#[test]
+fn a_block_spanning_two_tree_nodes_has_no_heading_but_keeps_its_inline_syntax() {
+    let decorations = decorate("一\n===\n*斜体*", None);
+    assert!(
+        decorations.line_ornaments().is_empty(),
+        "横跨两个节点的块不是一个标题，一条行级装饰都不该有"
+    );
+    assert_eq!(
+        hidden(&decorations),
+        vec![(8, 9), (15, 16)],
+        "藏的是那两个 `*`，下划线原样留着"
+    );
+}
+
+/// 焦点块把下划线露出来，与 ATX 的 `#` 同一条规则：光标停在一个看不见的
+/// 字符上，用户按退格会删掉他没看见的东西。
+#[test]
+fn a_focused_setext_heading_shows_its_underline() {
+    let focused = decorate("标题\n===", Some(range(0, 0)));
+    assert!(hidden(&focused).is_empty());
+    assert_eq!(
+        focused.line_ornaments()[0].1,
+        &BlockOrnament::Heading { level: 1 },
+        "露出标记不改变它是几级标题"
+    );
+}
+
 /// 续行的 `>` 嵌在 `Paragraph` 里，不是 `Blockquote` 的直接子节点。按标记
 /// 个数数层会把 `> a\n> b` 报成两层。
 #[test]
@@ -951,6 +1014,10 @@ const CORPUS: &[&str] = &[
     "```\n未闭合\n",
     "```\n```\n",
     "# 标题\n段落\n",
+    "标题\n===\n",
+    "标题\n---\n",
+    "一\n二\n===\n段落\n",
+    "一\n===\n*斜体*\n",
     "- 项目\n\n段落\n",
     "# 标题",
     "## 二级 *斜体* 标题",
@@ -989,6 +1056,8 @@ const CORPUS: &[&str] = &[
     "![img](/uri)",
     "line *em*  \nnext",
     "a | b\n--- | ---\n1 | 2",
+    "- 外\n  - 内\n",
+    "- 外\n  - [x] 内\n",
     "",
 ];
 
@@ -1026,6 +1095,48 @@ fn no_decoration_leaves_its_block_across_the_corpus() {
                     entry.range.start() >= range.start() && entry.range.end() <= range.end(),
                     "{source:?} 的块 {range:?} 产出了越界装饰 {:?}",
                     entry.range
+                );
+            }
+        }
+    }
+}
+
+/// 装饰**指向**的 source 区间也不许越出这个块。
+///
+/// 上一条查的是装饰自己盖在哪一段，这一条查的是它的负载指到哪一段——
+/// `MarkerOrnament::source`（`•` 替代掉的那个 `-`）、`ImageSpan` 的四段、
+/// `CheckboxSpan` 的三个字节，编辑与选中走的都是它们（不变量 A2）。
+///
+/// 这条断言是块的身份改由树给之后补的，**第一次跑就抓到一个既有缺陷**：
+/// 嵌套列表项的标记装饰指着**外层**那一项的 `-`。上一条查不到它，因为越界的
+/// 不是装饰的 range，是装饰里带的那个区间。
+#[test]
+fn no_ornament_payload_leaves_its_block_across_the_corpus() {
+    for source in CORPUS {
+        for (range, decorations) in decorate_every_block(source) {
+            let mut payloads = Vec::new();
+            for (_, ornament) in decorations.line_ornaments() {
+                match ornament {
+                    BlockOrnament::Marker(marker) => payloads.push(marker.source()),
+                    BlockOrnament::FencedCode { info, content } => {
+                        payloads.push(*info);
+                        payloads.push(*content);
+                    }
+                    BlockOrnament::Heading { .. }
+                    | BlockOrnament::QuoteBar { .. }
+                    | BlockOrnament::Table(_) => {}
+                }
+            }
+            for widget in decorations.widgets() {
+                match widget {
+                    BlockWidget::Image(image) => payloads.push(image.source()),
+                    BlockWidget::Checkbox(checkbox) => payloads.push(checkbox.source()),
+                }
+            }
+            for payload in payloads {
+                assert!(
+                    payload.start() >= range.start() && payload.end() <= range.end(),
+                    "{source:?} 的块 {range:?} 产出了指向块外的 {payload:?}"
                 );
             }
         }

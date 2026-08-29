@@ -65,24 +65,52 @@ impl<'a> SyntaxNode<'a> {
         Descendants { stack: vec![self] }
     }
 
-    /// 完整包含 `range` 的最深节点。
+    /// 完整包含 `range` 的最深**块级**节点。
     ///
     /// 块的边界由 `block_sequence` 定，语法树的块结构由 `yu-syntax` 定，
     /// 两者不保证逐字节相同。取「最深的完整包含者」是唯一在两边都成立的
     /// 说法：它至少覆盖整个块，且不会把邻块的语法也带进来。
+    ///
+    /// # 为什么停在块级节点上
+    ///
+    /// 下降不设限的话，内容恰好等于某一个标记或行内节点的块会停在那上面：
+    /// `+` 单独一行是一个空列表项，块修剪完两头就是 `ListMark` 那一个字节，
+    /// 于是「这个块是什么」的答案变成 `ListMark`——一个块级问题拿到了一个
+    /// 行内答案。停在块级节点上，答案的值域才与问题对得上。
+    ///
+    /// # 为什么按位置下降，不逐个子节点扫
+    ///
+    /// 这个查询现在每个块都要做一次**两遍**：解析时定块的身份
+    /// （`crate::classify`），装饰时定块的语法节点。逐个子节点扫的话，
+    /// `Document` 下面有多少个块就扫多少次，一篇两万行的文档是
+    /// O(块数²)——不报错、不画错，唯一的症状是慢。
+    ///
+    /// [`TreeCursor::child_ending_after`] 在有序的 `positions` 上二分。
+    /// 兄弟节点不重叠，所以「第一个终点晚于 `from` 的子节点」就是唯一有可能
+    /// 包含 `range` 的那一个：它不包含，后面的更不可能（它们起点更靠后）。
+    ///
+    /// **空 range 是这条推理的例外**：终点正好等于 `from` 的子节点会被
+    /// `child_ending_after` 跳过，而它本来包含得住。空 range 只有全空白的块
+    /// （空行块）会给出来，那种块里一个语法节点都没有，两种答案产出的装饰
+    /// 都是空集。
     #[must_use]
-    pub fn deepest_containing(self, range: TextRange) -> Self {
+    pub fn deepest_block_containing(self, range: TextRange) -> Self {
         let (from, to) = (range.start().get(), range.end().get());
+        let Ok(from_u32) = u32::try_from(from) else {
+            return self;
+        };
+        let mut cursor = self.tree.cursor(self.from);
         let mut best = self;
-        'descend: loop {
-            for child in best.children() {
-                if u64::from(child.start()) <= from && to <= u64::from(child.end()) {
-                    best = child;
-                    continue 'descend;
-                }
+        while cursor.child_ending_after(from_u32) {
+            if u64::from(cursor.from()) > from || to > u64::from(cursor.to()) {
+                break;
             }
-            return best;
+            if !cursor.kind().is_block() {
+                break;
+            }
+            best = Self::new(cursor.tree(), cursor.from());
         }
+        best
     }
 }
 

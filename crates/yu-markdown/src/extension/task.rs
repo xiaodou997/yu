@@ -32,12 +32,17 @@
 //! `TaskListItem`。两个 extension 因此不相交，谁也不需要知道对方存在
 //! （不变量 D6）。
 //!
-//! # 两份判断还没并成一份
+//! # 定义域按 `BlockKind` 取，而它就是树的答案
 //!
-//! `BlockKind::TaskListItem` 与树的 `Task` 是同一个问题的两个实现，它们**不
-//! 完全一致**：`block_sequence` 不下降到引用块里，`> - [x] q` 在它眼里是一个
-//! `BlockQuote`。这里的定义域按 `BlockKind` 取，所以那种块不产装饰。两条路由
-//! `tests/task_identity.rs` 锁在一起。
+//! `BlockKind::TaskListItem` 曾经是一份独立的判断（`task::parse_task_marker`
+//! 扫行首），与树的 `Task` 节点各说各话，由一个 `task_identity.rs` 把两边锁
+//! 在一起。现在块的身份由 [`crate::classify`] 问树要，两份判断合成了一份，
+//! 那个测试文件也就没有可锁的东西了。
+//!
+//! 已登记的那处不一致还在，但它不再是「两份判断」的问题，而是**块边界**的
+//! 问题：`block_sequence` 不下降到容器里，`> - [x] q` 整块是一个
+//! `BlockQuote`，于是引用块里的任务项没有复选框。要收掉它得让块的边界也由树
+//! 定，那是块结构合并的第二刀（overview 的「块结构合并：调查结论」）。
 //!
 //! [`Decoration::Widget`]: yu_decoration::Decoration::Widget
 //! [`hides_source`]: yu_decoration::Decoration::hides_source
@@ -47,7 +52,8 @@ use yu_core::WidgetSide;
 use yu_syntax::NodeKind;
 
 use super::{BlockContext, BlockWidget, CheckboxSpan, Extension, ExtensionOutput};
-use crate::block_sequence::{BlockKind, TaskState};
+use crate::block_sequence::BlockKind;
+use crate::task::checkbox_state;
 
 pub struct Task;
 
@@ -65,7 +71,11 @@ impl Extension for Task {
         };
         // 勾没勾上从**树给的那三个字节**里读，不从 `BlockKind` 里读：区间与
         // 状态出自同一次查询，错不开。
-        let Some(state) = cx.text(marker.range()).as_deref().and_then(checkbox_state) else {
+        let Some(state) = cx
+            .text(marker.range())
+            .as_deref()
+            .and_then(|text| checkbox_state(text.as_bytes()))
+        else {
             return;
         };
         let widget = out.widget(BlockWidget::Checkbox(CheckboxSpan::new(
@@ -74,14 +84,5 @@ impl Extension for Task {
         )));
         // 非空 range 的 widget 覆盖并隐藏这一段，`side` 没有歧义。
         out.place_widget(marker.range(), widget, WidgetSide::Before);
-    }
-}
-
-/// `[x]` / `[X]` 是勾上的，`[ ]` 是没勾的。别的形状不是复选框。
-fn checkbox_state(marker: &str) -> Option<TaskState> {
-    match marker.as_bytes() {
-        [b'[', b' ', b']'] => Some(TaskState::Todo),
-        [b'[', b'x' | b'X', b']'] => Some(TaskState::Done),
-        _ => None,
     }
 }
