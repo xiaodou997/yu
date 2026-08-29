@@ -4381,7 +4381,7 @@ prefix **羽🙂** suffix
                 .get(0)
                 .expect("block exists")
                 .kind(),
-            BlockKind::AtxHeading { level: 1 }
+            BlockKind::Heading { level: 1 }
         );
         assert_eq!(document.decoration_cache_stats().entries(), 0);
         document

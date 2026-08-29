@@ -22,6 +22,18 @@ impl TaskMarker {
     }
 }
 
+/// `[x]` / `[X]` 是勾上的，`[ ]` 是没勾的。别的形状不是复选框。
+///
+/// 这三个字节的读法只有这一处：`extension/task.rs` 按树给的 `TaskMarker`
+/// 区间读，`classify` 按同一个区间读，两处读出来的必须是同一个状态。
+pub(crate) fn checkbox_state(marker: &[u8]) -> Option<TaskState> {
+    match marker {
+        [b'[', b' ', b']'] => Some(TaskState::Todo),
+        [b'[', b'x' | b'X', b']'] => Some(TaskState::Done),
+        _ => None,
+    }
+}
+
 /// Finds the first-line task marker of a list item without materializing the
 /// source snapshot. The grammar intentionally accepts only the GFM-shaped
 /// `[ ]`/`[x]` marker followed by whitespace or the line ending.

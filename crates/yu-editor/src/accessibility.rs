@@ -201,7 +201,7 @@ impl AccessibilitySemanticSnapshot {
                 continue;
             };
             let source_range = block.range();
-            let label_range = semantic_block_label_range(&source, block)?;
+            let label_range = semantic_block_label_range(&source, block);
             let parent = Some(0);
             let semantic_block_node_index = u32::try_from(nodes.len())
                 .map_err(|_| AccessibilityTextError::SemanticNodeOverflow)?;
@@ -449,7 +449,7 @@ fn semantic_block_kind(kind: BlockKind) -> Option<(AccessibilitySemanticKind, u8
     Some(match kind {
         BlockKind::BlankLine | BlockKind::ReferenceDefinition => return None,
         BlockKind::Paragraph => (AccessibilitySemanticKind::Paragraph, 0, 0),
-        BlockKind::AtxHeading { level } => (AccessibilitySemanticKind::Heading, 0, level),
+        BlockKind::Heading { level } => (AccessibilitySemanticKind::Heading, 0, level),
         BlockKind::FencedCodeBlock { .. } => (AccessibilitySemanticKind::CodeBlock, 0, 0),
         BlockKind::BlockQuote { depth } => (AccessibilitySemanticKind::BlockQuote, 0, depth),
         BlockKind::ListItem { ordered, depth, .. } => (
@@ -541,34 +541,14 @@ fn push_semantic_node(
     Ok(())
 }
 
-fn semantic_block_label_range(
-    source: &TextSnapshot,
-    block: Block,
-) -> Result<TextRange, AccessibilityTextError> {
-    let BlockKind::AtxHeading { .. } = block.kind() else {
-        return Ok(block.range());
-    };
-    let text = collect_text(source, block.range())?;
-    let line_end = text.trim_end_matches(['\r', '\n']).len();
-    let bytes = text.as_bytes();
-    let mut index = 0_usize;
-    while index < line_end && bytes[index] == b' ' {
-        index += 1;
-    }
-    while index < line_end && bytes[index] == b'#' {
-        index += 1;
-    }
-    if index < line_end && matches!(bytes[index], b' ' | b'\t') {
-        index += 1;
-        while index < line_end && matches!(bytes[index], b' ' | b'\t') {
-            index += 1;
-        }
-    }
-    TextRange::new(
-        ByteOffset::new(block.range().start().get().saturating_add(index as u64)),
-        ByteOffset::new(block.range().start().get().saturating_add(line_end as u64)),
-    )
-    .ok_or(AccessibilityTextError::InvalidSourceRange(block.range()))
+/// 语义块的标签区间。
+///
+/// 标题只报正文，`#` 前缀与 Setext 的下划线都不进 VoiceOver 的朗读——那是
+/// 语法，不是标题的内容。哪一段是正文由 `yu-markdown` 说（它才认识 Markdown
+/// 语法）；此前这里自己扫了一遍 `#`，于是 Setext 标题会带着一行 `===` 被
+/// 读出来。
+fn semantic_block_label_range(source: &TextSnapshot, block: Block) -> TextRange {
+    yu_markdown::heading_content_range(source, block)
 }
 
 fn source_range_to_utf16(
@@ -857,6 +837,30 @@ mod tests {
         assert_eq!(
             retained_snapshot_stats(&[snapshot]).materialized_buffers(),
             materialized_before
+        );
+    }
+
+    /// Setext 标题报成标题，标签只有正文——`===` 那一行不朗读。
+    ///
+    /// 块的身份由语法树给之前，`标题\n===` 在块序列里是一个普通段落，
+    /// VoiceOver 那边既不是标题，标签也带着下划线。
+    #[test]
+    fn a_setext_heading_reads_as_a_heading_without_its_underline() {
+        let document = EditorDocument::new("Setext 二级\n---\n\n段落\n");
+        let semantic =
+            AccessibilitySemanticSnapshot::from_document(&document).expect("语义树该建得起来");
+        let text = AccessibilityTextSnapshot::from_document(&document).expect("文本快照该建得起来");
+        let heading = semantic
+            .nodes()
+            .iter()
+            .find(|node| node.kind() == AccessibilitySemanticKind::Heading)
+            .copied()
+            .expect("Setext 也是标题");
+        assert_eq!(heading.level(), 2);
+        assert_eq!(
+            text.text_for_range(heading.label_range())
+                .expect("标题的标签"),
+            "Setext 二级"
         );
     }
 

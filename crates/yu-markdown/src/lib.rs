@@ -18,6 +18,7 @@ use yu_text::{
 };
 
 mod block_sequence;
+mod classify;
 mod extension;
 mod inline;
 mod reference;
@@ -29,6 +30,7 @@ pub use block_sequence::{
     RetainedBlockStats, TaskState,
 };
 use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_block_stats};
+use classify::BlockShape;
 pub use extension::{
     BlockContext, BlockDecorations, BlockOrnament, BlockWidget, CheckboxSpan, DelimitedSpan,
     Extension, ExtensionError, ExtensionOutput, ExtensionSet, ImageSpan, MarkerOrnament,
@@ -576,8 +578,10 @@ fn is_markdown_space(character: char) -> bool {
 /// Scans an immutable Snapshot without materializing a contiguous source copy.
 #[must_use]
 pub fn parse(snapshot: &TextSnapshot) -> MarkdownDocument {
-    let blocks = BlockSequence::from_records(BlockParser::new(snapshot, 0).collect());
+    // 树先解析：块的身份由它给（`crate::classify`）。
     let (tree, reparsed_bytes) = parse_tree(snapshot, &[]);
+    let blocks =
+        BlockSequence::from_records(BlockParser::new(snapshot, tree.as_ref(), 0).collect());
     MarkdownDocument {
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
@@ -672,7 +676,20 @@ pub fn parse_incremental(
         .first_starting_at_or_after(latest_changed_end)
         .max(reparse_index);
 
-    let mut parser = BlockParser::new(snapshot, new_start_usize);
+    // 树的增量复用来源是**上一版文档自己的树**。此前它在
+    // `yu-editor::DecorationCache` 里，那一层要自己攒一批 `TreeFragment`
+    // 并跨编辑接力（「连着编辑好几次都没人要过树」）；树跟着文档走之后
+    // 那件事不存在了——每次编辑都解析，上一棵树永远正好在基准 Revision 上。
+    //
+    // 它排在块扫描**之前**：块的身份由树给，扫块时树必须已经在新版上。
+    let fragments = previous
+        .tree
+        .as_ref()
+        .map(|tree| TreeFragment::apply_change_set(&TreeFragment::from_tree(tree), changes))
+        .unwrap_or_default();
+    let (tree, reparsed_bytes) = parse_tree(snapshot, &fragments);
+
+    let mut parser = BlockParser::new(snapshot, tree.as_ref(), new_start_usize);
     let mut middle = Vec::new();
     let mut scanned_end = new_start;
     let mut reused_suffix_start = previous.blocks.len();
@@ -724,16 +741,6 @@ pub fn parse_incremental(
             suffix_delta,
         ),
     );
-    // 树的增量复用来源是**上一版文档自己的树**。此前它在
-    // `yu-editor::DecorationCache` 里，那一层要自己攒一批 `TreeFragment`
-    // 并跨编辑接力（「连着编辑好几次都没人要过树」）；树跟着文档走之后
-    // 那件事不存在了——每次编辑都解析，上一棵树永远正好在基准 Revision 上。
-    let fragments = previous
-        .tree
-        .as_ref()
-        .map(|tree| TreeFragment::apply_change_set(&TreeFragment::from_tree(tree), changes))
-        .unwrap_or_default();
-    let (tree, reparsed_bytes) = parse_tree(snapshot, &fragments);
     let document = MarkdownDocument {
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
@@ -754,15 +761,26 @@ pub fn parse_incremental(
     })
 }
 
+/// 按行走的块扫描器。
+///
+/// 它定**边界**：哪几行属于同一个块、块从哪个字节到哪个字节、铺满整篇源码
+/// （`has_lossless_coverage`）、以及增量复用要的 `BlockState` 与源码哈希。
+///
+/// 它**不定块是什么**——`BlockKind` 由 [`crate::classify`] 问语法树要。行首
+/// 那几个判断（`opening_fence` / `atx_heading_level` / `block_marker` /
+/// `is_reference_definition`）留在这里只为一件事：**这一行要不要另起一个
+/// 块**。它们的答案不再直接变成块的身份。
 struct BlockParser<'a> {
     snapshot: &'a TextSnapshot,
+    tree: Option<&'a Tree>,
     lines: Peekable<LineCursor<'a>>,
 }
 
 impl<'a> BlockParser<'a> {
-    fn new(snapshot: &'a TextSnapshot, start: usize) -> Self {
+    fn new(snapshot: &'a TextSnapshot, tree: Option<&'a Tree>, start: usize) -> Self {
         Self {
             snapshot,
+            tree,
             lines: LineCursor::new(snapshot, start).peekable(),
         }
     }
@@ -777,20 +795,36 @@ impl<'a> BlockParser<'a> {
         reference::is_reference_definition_line(self.snapshot, range)
     }
 
+    /// 一个块：边界在这里定，身份问树。
     fn record(
         &self,
-        kind: BlockKind,
+        shape: BlockShape,
         start: usize,
         end: usize,
         end_state: BlockState,
         source_hash: SourceHash,
     ) -> BlockRecord {
-        let block = block(kind, start, end);
+        let range = block_range(start, end);
+        let kind = classify::classify(self.tree, self.snapshot, range, shape);
         BlockRecord {
-            block,
+            block: Block { kind, range },
             start_state: BlockState::Normal,
             end_state,
             source_hash,
+        }
+    }
+
+    /// 空行块。它不问树：空行在树里没有节点，而「这一行只有空白」是一句
+    /// 词法事实，不是 Markdown 语法的分类。
+    fn blank_record(&self, line: Line) -> BlockRecord {
+        BlockRecord {
+            block: Block {
+                kind: BlockKind::BlankLine,
+                range: block_range(line.start, line.end),
+            },
+            start_state: BlockState::Normal,
+            end_state: BlockState::Normal,
+            source_hash: line.source_hash,
         }
     }
 }
@@ -801,13 +835,7 @@ impl Iterator for BlockParser<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         let line = self.lines.next()?;
         if line.is_blank() {
-            return Some(self.record(
-                BlockKind::BlankLine,
-                line.start,
-                line.end,
-                BlockState::Normal,
-                line.source_hash,
-            ));
+            return Some(self.blank_record(line));
         }
 
         if let Some(fence) = line.opening_fence() {
@@ -836,7 +864,7 @@ impl Iterator for BlockParser<'_> {
                 }
             };
             return Some(self.record(
-                BlockKind::FencedCodeBlock {
+                BlockShape::Fence {
                     marker: fence.marker,
                     closed,
                 },
@@ -847,9 +875,12 @@ impl Iterator for BlockParser<'_> {
             ));
         }
 
-        if let Some(level) = line.atx_heading_level() {
+        // ATX 标题与引用定义各占一行，各自另起一个块。这两条判断只管边界：
+        // 「是不是标题」「是不是一条定义」由树回答，`BlockShape::Plain` 把
+        // 这个问题整个交出去。
+        if line.atx_heading_level().is_some() || self.is_reference_definition(line) {
             return Some(self.record(
-                BlockKind::AtxHeading { level },
+                BlockShape::Plain,
                 line.start,
                 line.end,
                 BlockState::Normal,
@@ -859,16 +890,6 @@ impl Iterator for BlockParser<'_> {
 
         if let Some(marker) = line.block_marker() {
             return Some(self.parse_container(line, marker));
-        }
-
-        if self.is_reference_definition(line) {
-            return Some(self.record(
-                BlockKind::ReferenceDefinition,
-                line.start,
-                line.end,
-                BlockState::Normal,
-                line.source_hash,
-            ));
         }
 
         let block_start = line.start;
@@ -891,7 +912,7 @@ impl Iterator for BlockParser<'_> {
             source_hash = concatenate_hash(source_hash, line.source_hash, line.end - line.start);
         }
         Some(self.record(
-            BlockKind::Paragraph,
+            BlockShape::Plain,
             block_start,
             end,
             BlockState::Normal,
@@ -933,30 +954,23 @@ impl BlockParser<'_> {
             }
         }
 
-        let kind = match marker {
-            LineMarker::BlockQuote { depth } => BlockKind::BlockQuote { depth },
+        // `- [x]` 是不是一个任务项由树回答（`classify`）。这里只把行扫描器
+        // 读到的那部分负载带过去：序号、标记字符、缩进层数。
+        let shape = match marker {
+            LineMarker::BlockQuote { depth } => BlockShape::Quote { depth },
             LineMarker::List {
                 ordered,
                 depth,
                 marker,
                 start,
-            } => match task::parse_task_marker(self.snapshot, line_range(first), ordered) {
-                Some(task) => BlockKind::TaskListItem {
-                    ordered,
-                    depth,
-                    marker,
-                    start,
-                    state: task.state(),
-                },
-                None => BlockKind::ListItem {
-                    ordered,
-                    depth,
-                    marker,
-                    start,
-                },
+            } => BlockShape::List {
+                ordered,
+                depth,
+                marker,
+                start,
             },
         };
-        self.record(kind, block_start, end, BlockState::Normal, source_hash)
+        self.record(shape, block_start, end, BlockState::Normal, source_hash)
     }
 
     fn consume_line(&mut self, end: &mut usize, source_hash: &mut SourceHash) {
@@ -967,14 +981,6 @@ impl BlockParser<'_> {
         *end = line.end;
         *source_hash = concatenate_hash(*source_hash, line.source_hash, line.end - line.start);
     }
-}
-
-fn line_range(line: Line) -> TextRange {
-    TextRange::new(
-        ByteOffset::try_from(line.start).expect("line start must fit u64"),
-        ByteOffset::try_from(line.end).expect("line end must fit u64"),
-    )
-    .expect("line range must be ordered")
 }
 
 /// Returns the parser-owned task marker range for a task-list block.
@@ -1079,6 +1085,50 @@ pub fn list_marker(source: &TextSnapshot, block: Block) -> Option<ListMarker> {
     })
 }
 
+/// 标题的正文区间：不含结构标记的那一段。
+///
+/// ATX 去掉行首的 `#` 前缀（连同它后面的空格），Setext 去掉**下划线那一
+/// 行**。两种拼法在 [`BlockKind::Heading`] 里是同一个变体，所以「正文在哪」
+/// 这个问题也只该有一个答案——导出与可访问性此前各写了一份，两份都只认
+/// ATX，于是 Setext 标题在大纲里会带着一行 `===`。
+///
+/// 不是标题的块返回它自己的整段 range。
+#[must_use]
+pub fn heading_content_range(source: &TextSnapshot, block: Block) -> TextRange {
+    let BlockKind::Heading { level } = block.kind() else {
+        return block.range();
+    };
+    let lines = block_line_ranges(source, block.range());
+    let Some(first) = lines.first().copied() else {
+        return block.range();
+    };
+    if let Some(prefix) = heading_prefix_range(source, first, level) {
+        return TextRange::new(prefix.end(), line_content_end(source, first))
+            .unwrap_or_else(|| block.range());
+    }
+    // Setext：正文是下划线那一行之前的全部，可能不止一行。
+    let content_end = lines
+        .iter()
+        .rev()
+        .nth(1)
+        .map_or_else(|| first.start(), |line| line_content_end(source, *line));
+    TextRange::new(first.start(), content_end).unwrap_or_else(|| block.range())
+}
+
+/// 一行去掉行尾换行符之后的终点。
+fn line_content_end(source: &TextSnapshot, line: TextRange) -> ByteOffset {
+    let Some(cursor) = SourceByteCursor::new(source, line) else {
+        return line.end();
+    };
+    let mut end = line.start();
+    for (position, byte) in cursor {
+        if !matches!(byte, b'\r' | b'\n') {
+            end = ByteOffset::try_from(position.saturating_add(1)).unwrap_or(end);
+        }
+    }
+    end
+}
+
 /// Returns parser-owned block syntax ranges that the visual projection may
 /// hide without re-parsing Markdown in a consumer.
 ///
@@ -1092,7 +1142,10 @@ pub fn list_marker(source: &TextSnapshot, block: Block) -> Option<ListMarker> {
 pub fn block_syntax_hidden_ranges(source: &TextSnapshot, block: Block) -> Vec<TextRange> {
     let lines = block_line_ranges(source, block.range());
     match block.kind() {
-        BlockKind::AtxHeading { level } => lines
+        // Setext 标题在这里是一段**空**的隐藏区间：它的结构标记是下面那一
+        // 整行，不是行首的一段前缀，`heading_prefix_range` 认不出来也不该
+        // 认。下划线由装饰层藏（`extension/heading.rs`）。
+        BlockKind::Heading { level } => lines
             .first()
             .and_then(|line| heading_prefix_range(source, *line, level))
             .into_iter()
@@ -1304,11 +1357,10 @@ impl Iterator for SourceByteCursor<'_> {
     }
 }
 
-fn block(kind: BlockKind, start: usize, end: usize) -> Block {
+fn block_range(start: usize, end: usize) -> TextRange {
     let start = ByteOffset::try_from(start).unwrap_or(ByteOffset::new(u64::MAX));
     let end = ByteOffset::try_from(end).unwrap_or(ByteOffset::new(u64::MAX));
-    let range = TextRange::new(start, end).unwrap_or_else(|| TextRange::empty(start));
-    Block { kind, range }
+    TextRange::new(start, end).unwrap_or_else(|| TextRange::empty(start))
 }
 
 struct LineCursor<'a> {
@@ -1579,7 +1631,7 @@ mod tests {
         assert!(document.has_lossless_coverage());
         assert_eq!(document.source_len().get(), source.len() as u64);
         assert_eq!(document.blocks().len(), 5);
-        assert_eq!(kind_at(&document, 0), BlockKind::AtxHeading { level: 1 });
+        assert_eq!(kind_at(&document, 0), BlockKind::Heading { level: 1 });
         assert_eq!(kind_at(&document, 1), BlockKind::BlankLine);
         assert_eq!(kind_at(&document, 2), BlockKind::Paragraph);
         assert_eq!(
@@ -1628,7 +1680,7 @@ mod tests {
     #[test]
     fn scanner_preserves_phase_one_line_classification_rules() {
         let cases = [
-            ("   # title\n", BlockKind::AtxHeading { level: 1 }),
+            ("   # title\n", BlockKind::Heading { level: 1 }),
             ("    # title\n", BlockKind::Paragraph),
             ("####### title\n", BlockKind::Paragraph),
             ("\u{00a0}\n", BlockKind::BlankLine),
@@ -1766,7 +1818,10 @@ mod tests {
 
     #[test]
     fn list_markers_keep_token_and_prefix_ranges_distinct() {
-        let source = "  - item\n12) ordered\n+\n";
+        // 三个列表项之间必须空一行：序号不是 1 的有序列表、以及没有内容的
+        // `+`，在 CommonMark 里都**打断不了段落**，挨着写的话它们是上一段的
+        // 延续而不是列表项（见 `crate::classify`）。
+        let source = "  - item\n\n12) ordered\n\n+\n";
         let snapshot = TextBuffer::new(source).snapshot();
         let document = parse(&snapshot);
 
@@ -1787,7 +1842,7 @@ mod tests {
             "  - "
         );
 
-        let ordered = list_marker(&snapshot, document.blocks().get(1).expect("ordered list"))
+        let ordered = list_marker(&snapshot, document.blocks().get(2).expect("ordered list"))
             .expect("ordered marker");
         assert!(ordered.ordered());
         assert_eq!(ordered.marker(), ')');
@@ -1804,7 +1859,7 @@ mod tests {
             "12) "
         );
 
-        let empty = list_marker(&snapshot, document.blocks().get(2).expect("empty list"))
+        let empty = list_marker(&snapshot, document.blocks().get(4).expect("empty list"))
             .expect("empty marker");
         assert_eq!(empty.marker_range(), empty.prefix_range());
     }
@@ -1868,6 +1923,137 @@ mod tests {
             "[ ]"
         );
         assert!(document.has_lossless_coverage());
+    }
+
+    /// Setext 标题两边曾经不一致：树认得，行扫描器把它当成一个普通段落。
+    /// 块的身份由树给之后，两种拼法落在同一个变体上。
+    #[test]
+    fn setext_and_atx_headings_are_the_same_kind() {
+        for (source, level) in [
+            ("标题\n===\n", 1),
+            ("标题\n---\n", 2),
+            ("多行\n标题\n===\n", 1),
+            ("# 标题\n", 1),
+            ("## 标题\n", 2),
+        ] {
+            let document = parse(&TextBuffer::new(source).snapshot());
+            assert_eq!(document.blocks().len(), 1, "source {source:?}");
+            assert_eq!(
+                kind_at(&document, 0),
+                BlockKind::Heading { level },
+                "source {source:?}"
+            );
+            assert!(document.has_lossless_coverage());
+        }
+    }
+
+    /// 树的叶子节点横跨两个块时，两个块都不是它。
+    ///
+    /// `foo\n-` 是一个二级 Setext 标题，而 `-` 那一行在行扫描器眼里像一个
+    /// 列表标记，于是它另起了一块。两块都认领这个标题的话，画面上会出现两
+    /// 个放大的行，第二个只有一个 `-`。
+    #[test]
+    fn a_block_that_is_only_a_fragment_of_a_leaf_node_is_a_paragraph() {
+        for source in ["foo\n-\n", "foo\n- \n"] {
+            let document = parse(&TextBuffer::new(source).snapshot());
+            assert_eq!(document.blocks().len(), 2, "source {source:?}");
+            assert_eq!(kind_at(&document, 0), BlockKind::Paragraph, "{source:?}");
+            assert_eq!(kind_at(&document, 1), BlockKind::Paragraph, "{source:?}");
+            assert!(document.has_lossless_coverage());
+        }
+
+        // 容器节点横跨是正常的：块就是容器里的一组行。缩进的任务项因此仍然
+        // 认得出自己的复选框——它的 `Task` 子节点挂在**内层**的 `ListItem`
+        // 上，而外层那个横跨了两个块。
+        let document = parse(&TextBuffer::new("- a\n  - [x] b\n").snapshot());
+        assert_eq!(
+            kind_at(&document, 1),
+            BlockKind::TaskListItem {
+                ordered: false,
+                depth: 1,
+                marker: '-',
+                start: 1,
+                state: TaskState::Done,
+            }
+        );
+    }
+
+    /// 块横跨好几个树块时，树说不出它是什么，按普通段落画。
+    ///
+    /// `- a\n<div>\nx` 在行扫描器眼里是一个块（`<div>` 是列表项的惰性延续），
+    /// 在树里是 `ListItem` 加一个 `HTMLBlock`。退回行扫描器的形状会给整块画
+    /// 一个列表标记，而它的后半段根本不是列表。
+    #[test]
+    fn a_block_spanning_several_tree_blocks_is_a_paragraph() {
+        for source in ["- a\n<div>\nx\n", "> a\n<div>\nx\n"] {
+            let document = parse(&TextBuffer::new(source).snapshot());
+            assert_eq!(document.blocks().len(), 1, "source {source:?}");
+            assert_eq!(kind_at(&document, 0), BlockKind::Paragraph, "{source:?}");
+        }
+    }
+
+    /// 标题行与引用定义行各自另起一个块。
+    ///
+    /// 这两条边界判断是行扫描器的事——树给的是身份，不是边界。去掉它们的话
+    /// `# 标题\n段落` 会变成**一个**块，而那个块横跨两个树块，于是标题不再是
+    /// 标题：块的身份没错，是边界把它吃掉了。
+    #[test]
+    fn a_heading_or_definition_line_starts_its_own_block() {
+        let heading = parse(&TextBuffer::new("# 标题\n段落\n").snapshot());
+        assert_eq!(heading.blocks().len(), 2);
+        assert_eq!(kind_at(&heading, 0), BlockKind::Heading { level: 1 });
+        assert_eq!(kind_at(&heading, 1), BlockKind::Paragraph);
+
+        let definition = parse(&TextBuffer::new("[a]: /x\n段落\n").snapshot());
+        assert_eq!(definition.blocks().len(), 2);
+        assert_eq!(kind_at(&definition, 0), BlockKind::ReferenceDefinition);
+        assert_eq!(kind_at(&definition, 1), BlockKind::Paragraph);
+        assert_eq!(definition.reference_definitions().definitions().len(), 1);
+    }
+
+    /// 打断不了段落的标记行不是它自己那种块。
+    ///
+    /// CommonMark 说序号不是 1 的有序列表不能打断段落，行扫描器不知道这条
+    /// 规则——它看见 `2.` 就另起一块。边界仍然归它，身份归树。
+    #[test]
+    fn markers_that_cannot_interrupt_a_paragraph_are_paragraphs() {
+        let document = parse(&TextBuffer::new("foo\n2. bar\n").snapshot());
+        assert_eq!(document.blocks().len(), 2);
+        assert_eq!(kind_at(&document, 1), BlockKind::Paragraph);
+    }
+
+    /// 引用定义同理：`foo` 后面那一行是段落的延续，不是一条定义。
+    #[test]
+    fn a_definition_line_continuing_a_paragraph_is_not_a_definition() {
+        let snapshot = TextBuffer::new("foo\n[a]: /x\n").snapshot();
+        let document = parse(&snapshot);
+        assert_eq!(document.blocks().len(), 2);
+        assert_eq!(kind_at(&document, 1), BlockKind::Paragraph);
+        assert!(
+            document.reference_definitions().definitions().is_empty(),
+            "段落的延续不该进引用表"
+        );
+    }
+
+    #[test]
+    fn heading_content_range_covers_both_spellings() {
+        for (source, expected) in [
+            ("## 标题\n", "标题"),
+            ("  ###   多空格\n", "多空格"),
+            ("标题\n===\n", "标题"),
+            ("多行\n标题\n---\n", "多行\n标题"),
+            ("段落\n", "段落\n"),
+        ] {
+            let snapshot = TextBuffer::new(source).snapshot();
+            let document = parse(&snapshot);
+            let block = document.blocks().get(0).expect("至少有一个块");
+            let content = heading_content_range(&snapshot, block);
+            assert_eq!(
+                &snapshot.as_str()[content.start().get() as usize..content.end().get() as usize],
+                expected,
+                "source {source:?}"
+            );
+        }
     }
 
     #[test]
@@ -1946,7 +2132,7 @@ mod tests {
 
         assert!(document.has_lossless_coverage());
         assert_eq!(document.blocks().len(), 3);
-        assert_eq!(kind_at(&document, 0), BlockKind::AtxHeading { level: 1 });
+        assert_eq!(kind_at(&document, 0), BlockKind::Heading { level: 1 });
         assert_eq!(kind_at(&document, 1), BlockKind::BlankLine);
         assert_eq!(
             kind_at(&document, 2),

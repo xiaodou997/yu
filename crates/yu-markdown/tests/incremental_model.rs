@@ -2,7 +2,7 @@ use yu_core::{ByteOffset, TextRange};
 use yu_markdown::{MarkdownDocument, parse, parse_incremental};
 use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
-const INSERTIONS: [&str; 14] = [
+const INSERTIONS: [&str; 16] = [
     "羽",
     "🙂",
     "#",
@@ -14,6 +14,11 @@ const INSERTIONS: [&str; 14] = [
     "  - ",
     "\n",
     "\n# title\n",
+    // Setext 的下划线：块的身份由树给之后，它是**唯一一种往回看**的分类
+    // ——插进来会把上一行变成一个标题。增量复用的边界只往回退一个块，这两
+    // 条插入串就是那条推理的用例。
+    "\n===\n",
+    "---\n",
     " ",
     "\r\n",
     "",
@@ -26,7 +31,8 @@ fn incremental_parse_matches_full_parse_through_random_edits() {
 
 fn run_model() {
     let mut seed = 0x5955_4d41_524b_444f_u64;
-    let mut model = String::from("# Yu\n\nparagraph\n\n```rust\nfn main() {}\n```\n\nafter\n");
+    let mut model =
+        String::from("# Yu\n\nparagraph\n\nsetext\n===\n\n```rust\nfn main() {}\n```\n\nafter\n");
     let mut buffer = TextBuffer::new(model.clone());
     let mut document = parse(&buffer.snapshot());
 

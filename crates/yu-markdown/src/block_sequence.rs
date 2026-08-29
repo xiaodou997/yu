@@ -18,7 +18,10 @@ pub enum BlockKind {
     /// A source-backed link definition such as `[project]: /docs`.
     ReferenceDefinition,
     Paragraph,
-    AtxHeading {
+    /// 一个 `level` 级标题。**ATX（`## 标题`）与 Setext（`标题\n===`）都在
+    /// 这里**：拼法只有隐藏区间需要知道，块的身份不带它（见
+    /// `crate::classify`）。
+    Heading {
         level: u8,
     },
     FencedCodeBlock {
@@ -58,7 +61,7 @@ impl BlockKind {
             Self::BlankLine => 0,
             Self::ReferenceDefinition => 1,
             Self::Paragraph => 2,
-            Self::AtxHeading { .. } => 3,
+            Self::Heading { .. } => 3,
             Self::FencedCodeBlock { .. } => 4,
             Self::BlockQuote { .. } => 5,
             Self::ListItem { .. } => 6,
