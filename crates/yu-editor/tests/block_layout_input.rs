@@ -271,6 +271,58 @@ fn a_heading_scales_every_style_in_the_table() {
     assert_eq!(input.ornaments().heading().map(|h| h.level()), Some(2));
 }
 
+/// 嵌套的任务项也要往右让。
+///
+/// 缩进此前挂在**标记装饰**上，而任务项按设计不产标记（`- ` 原样留在正文里，
+/// 这样任务项画成 `- ☐ 待办`、普通项画成 `• 项目`）。于是同一层的普通列表项
+/// 缩进了，任务项贴着左边缘——不报错、不少字，只有画面上看得见。
+///
+/// 断言写成**相对**关系，不写死列宽：要问的是「缩进只有一个来源」。
+#[test]
+fn a_nested_task_item_is_indented_like_a_nested_list_item() {
+    let (top_task, _, _) = derive("- [x] 顶层\n", 0).expect("派生");
+    let (nested_task, _, _) = derive("- 外\n  - [x] 内\n", 1).expect("派生");
+    let (top_item, _, _) = derive("- 外\n- 第二\n", 1).expect("派生");
+    let (nested_item, _, _) = derive("- 外\n  - 内\n", 1).expect("派生");
+
+    assert!(
+        nested_task.indent > top_task.indent,
+        "嵌套的任务项要比顶层的往右让"
+    );
+    assert_eq!(
+        nested_task.indent - top_task.indent,
+        nested_item.indent - top_item.indent,
+        "两种块「多让了多少」是同一个数——缩进只有一个来源"
+    );
+    assert!(nested_task.marker.is_none(), "任务项不该有替代标记");
+
+    let (_, bullet_x, _) = nested_item.marker.expect("嵌套列表项该有标记");
+    assert_eq!(
+        nested_task.indent, bullet_x,
+        "任务项的正文从普通列表项画 `•` 的那一列起，同一层看上去才对齐"
+    );
+}
+
+/// 标记与正文之间空一列。
+///
+/// 这个常数没有断言的时候，把它从几何里拿掉一条用例都不红——**常数没有断言
+/// 就等于没有约定**（第十刀学到的那一条）。拿掉之后 `•项目` 会挤在一起。
+///
+/// `LayoutConfig::new` 的 `default_advance` 默认是 1.0，这里的 `1.0` 就是
+/// 「一列」。
+#[test]
+fn a_list_marker_and_its_text_are_one_column_apart() {
+    for source in ["- 项目", "1. 有序", "  - 缩进项"] {
+        let (derived, _, _) = derive(source, 0).expect("派生");
+        let (_, x, advance) = derived.marker.expect("列表项该有标记");
+        assert_eq!(
+            derived.indent - (x + advance),
+            1.0,
+            "{source:?}：正文该从标记右边一列处起"
+        );
+    }
+}
+
 /// 普通段落各段各排各的字型，倍率是 1。
 #[test]
 fn a_paragraph_keeps_every_style_at_its_own_face() {

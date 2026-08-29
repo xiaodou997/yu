@@ -390,7 +390,6 @@ impl BlockLayoutSlice {
 struct MarkerDraft {
     source: TextRange,
     text: String,
-    indent: u8,
     advance: f32,
     shaped: Option<ShapedText>,
 }
@@ -399,13 +398,12 @@ fn measure_marker_text<M: ClusterMetrics>(
     marker: &MarkerOrnamentSource,
     metrics: &M,
 ) -> Result<MarkerDraft, LayoutError> {
-    measure_marker_parts(marker.source, &marker.text, marker.indent, metrics)
+    measure_marker_parts(marker.source, &marker.text, metrics)
 }
 
 fn measure_marker_parts<M: ClusterMetrics>(
     source: TextRange,
     text: &str,
-    indent: u8,
     metrics: &M,
 ) -> Result<MarkerDraft, LayoutError> {
     use unicode_segmentation::UnicodeSegmentation;
@@ -421,7 +419,6 @@ fn measure_marker_parts<M: ClusterMetrics>(
     Ok(MarkerDraft {
         source,
         text: text.to_owned(),
-        indent,
         advance,
         shaped: None,
     })
@@ -431,13 +428,12 @@ fn shape_marker_text<S: ShapingProvider>(
     marker: &MarkerOrnamentSource,
     shaper: &S,
 ) -> Result<MarkerDraft, LayoutError> {
-    shape_marker_parts(marker.source, &marker.text, marker.indent, shaper)
+    shape_marker_parts(marker.source, &marker.text, shaper)
 }
 
 fn shape_marker_parts<S: ShapingProvider>(
     source: TextRange,
     text: &str,
-    indent: u8,
     shaper: &S,
 ) -> Result<MarkerDraft, LayoutError> {
     let len = u64::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
@@ -460,7 +456,6 @@ fn shape_marker_parts<S: ShapingProvider>(
     Ok(MarkerDraft {
         source,
         text: text.to_owned(),
-        indent,
         advance,
         shaped: Some(shaped),
     })
@@ -537,6 +532,8 @@ struct DecorationDraft {
     source_range: TextRange,
     heading: Option<u8>,
     quote: Option<u8>,
+    /// 这一块的正文往右让多少列。列表项与任务项都有，标记只有列表项有。
+    indent_columns: u8,
     marker: Option<MarkerOrnamentSource>,
 }
 
@@ -544,7 +541,6 @@ struct DecorationDraft {
 struct MarkerOrnamentSource {
     source: TextRange,
     text: String,
-    indent: u8,
 }
 
 impl DecorationDraft {
@@ -615,16 +611,17 @@ impl DecorationDraft {
 
         let mut heading = None;
         let mut quote = None;
+        let mut indent_columns = 0_u8;
         let mut marker = None;
         for (_, ornament) in decorations.line_ornaments() {
             match ornament {
                 BlockOrnament::Heading { level } => heading = Some(*level),
                 BlockOrnament::QuoteBar { depth } => quote = Some(*depth),
+                BlockOrnament::Indent { columns } => indent_columns = *columns,
                 BlockOrnament::Marker(found) => {
                     marker = Some(MarkerOrnamentSource {
                         source: found.source(),
                         text: found.text().to_owned(),
-                        indent: found.indent(),
                     });
                 }
                 // 表格的网格不进文字流的排版输入：`TableLayout` 另算一遍
@@ -644,6 +641,7 @@ impl DecorationDraft {
             source_range: bounds,
             heading,
             quote,
+            indent_columns,
             marker,
         })
     }
@@ -660,10 +658,16 @@ impl DecorationDraft {
             .transpose()?;
 
         let quote_gutter = quote.map_or(0.0, |quote| quote.gutter);
-        let marker_gutter = marker.as_ref().map_or(0.0, |marker| {
-            marker.advance + config.default_advance() * (f32::from(marker.indent) + 1.0)
-        });
-        let indent = quote_gutter + marker_gutter;
+        // 三段相加，各说一件事：引用的竖条让出多少、源码里缩进了几列、
+        // 行首标记本身占多宽（外加它与正文之间那一列）。
+        //
+        // 缩进此前挂在标记上，于是**没有标记的块一列都让不出来**——嵌套的
+        // 任务项贴着左边缘，而同一层的普通列表项缩进了。
+        let column_gutter = config.default_advance() * f32::from(self.indent_columns);
+        let marker_gutter = marker
+            .as_ref()
+            .map_or(0.0, |marker| marker.advance + config.default_advance());
+        let indent = quote_gutter + column_gutter + marker_gutter;
 
         let visual_len =
             VisualOffset::try_from(self.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
@@ -714,7 +718,7 @@ impl DecorationDraft {
                 marker: marker.map(|marker| MarkerOrnament {
                     source: marker.source,
                     text: marker.text,
-                    x: quote_gutter + f32::from(marker.indent) * config.default_advance(),
+                    x: quote_gutter + column_gutter,
                     advance: marker.advance,
                     shaped: marker.shaped,
                 }),
