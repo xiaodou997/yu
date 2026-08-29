@@ -861,12 +861,31 @@ S5 结束时留给它的入口是清楚的：`yu-editor::BlockLayoutInput` 现�
 dev-dep 在用它。表格与图片的 widget 化、`BlockView::hit_test` 的 bidi 也在
 同一次换源里落地，理由见 S5 的「已登记的四个未做项」。
 
-**进行中。** 十刀落地：`yu-markdown` 成为 extension 集合；`BlockLayoutInput`
-多一条从 `DecorationSet` 派生的路；消费者换完，`BlockView` 向装饰问源码
-区间；`yu-projection` 删除；增量解析接上；`hit_test` 的 bidi 与
+**验收已达成。** 十二刀半落地：`yu-markdown` 成为 extension 集合；
+`BlockLayoutInput` 多一条从 `DecorationSet` 派生的路；消费者换完，`BlockView`
+向装饰问源码区间；`yu-projection` 删除；增量解析接上；`hit_test` 的 bidi 与
 `BlockLayout::hit` 合流；图片成为 widget；表格的每一格自己排一次；GFM 的
-TaskList 进 `yu-syntax`；复选框成为 widget。剩下的是把 `block_sequence` 与
-语法树的块结构合并。
+TaskList 进 `yu-syntax`；复选框成为 widget；语法树跟着 `MarkdownDocument`
+走；块的 kind 由树给；缩进独立成一条装饰。
+
+验收那句话现在有数了：`crates/yu-markdown/src/extension/` 下**一种语法一个
+文件，31 到 128 行**（`code_span` 31、`emphasis` 36、`link` 42、`line_break`
+54、`quote` 61、`image` 68、`fenced_code` 80、`list` 94、`task` 94、`table`
+104、`heading` 128），加上注册表里的一行。`syntax.rs`（180 行）是共用的树视图，
+`mod.rs` 是注册表与共用类型，都不是「一种语法」的成本。
+`tests/extension_decorations.rs::a_new_syntax_needs_nothing_outside_its_own_extension`
+真的加了一种（`==高亮==`）来压这句话——**它只在测试文件里**，`yu-markdown`
+本体一行没动。
+
+S6 列的八种语法都在。math 走的是围栏那条路：```` ```math ```` 由
+`BlockOrnament::FencedCode { info, content }` 把语言名与正文带给
+`yu-embedded-math`，端到端有用例
+（`yu-workspace::published_math_is_consumed_by_viewport_scene_and_render_plan`）。
+
+**剩下的两条欠账在同一个闸门后面**：块的**边界**还是行扫描器定的，于是引用块
+里的任务项没有复选框、引用块里的标题也不放大，Setext 下划线的容器标记还会露出
+一个 `>`。切法与代价见下面的「块结构合并：调查结论」——**要有人真的抱怨那几件
+事，才值得付「改嵌套列表里的一个字要重排整个外层项」的代价。**
 
 #### 第一刀：extension 集合，建在 `yu-syntax` 上
 
