@@ -887,6 +887,12 @@ S6 列的八种语法都在。math 走的是围栏那条路：```` ```math ```` 
 一个 `>`。切法与代价见下面的「块结构合并：调查结论」——**要有人真的抱怨那几件
 事，才值得付「改嵌套列表里的一个字要重排整个外层项」的代价。**
 
+> **S7 第一刀之后，这个闸门离「有人抱怨」近了一步。** 大纲只收
+> `BlockKind::Heading` 的块，而容器里的标题不是那个 kind——实测
+> `> # 引用里`、`- # 列表里`、`a\n===\nb` 都产出 **0 条**大纲。在这之前
+> 这几件事只是「画得不够好」；大纲面板上线之后，它们变成面板上**看得见的
+> 缺失**。闸门的条件没变，但触发它的那个抱怨现在有了具体形状。
+
 #### 第一刀：extension 集合，建在 `yu-syntax` 上
 
 `crates/yu-markdown/src/extension/` 是十个 extension 加一张注册表。一种语法
@@ -1986,6 +1992,33 @@ lowercase）**：从「只认 ASCII」走到「认 Unicode 的绝大多数」—
 入口完成：拿 `label_start_utf16` 调 `set_selection_endpoints`，再调
 `macos_shaped_caret_scroll_request`。滚动仍然走 `yu-editor::viewport` 那条
 路，场景层不自己算 y。
+
+##### 已登记：面板上的标题带着行内标记，第三刀再剥
+
+`OutlineItem::label_range` 是**源码**区间，所以 `## **粗** 标题` 在面板上会
+显示成 `**粗** 标题`。
+
+**剥掉行内标记的唯一实现已经存在，而且不在 `yu-markdown`**：它是
+`DecorationSet` 的 `hides_source`（D1「视觉表现的唯一来源是 DecorationSet」），
+`emphasis` extension 已经在藏那两个 `**`。在 Rust 里新写一个
+`strip_inline_markup` 会是第四份答案，必定与装饰分叉——正是这一刀刚修掉的
+那个形状。
+
+但走 DecorationSet 这条路要付一笔新钱。**FFI 上没有任何入口把视觉文本交给
+Swift**（`projection_caret` / `projection_source_selection` /
+`projection_hit_test` 全是坐标映射，`composition_projection` 是 IME），因为
+文档由 Rust 渲染，Swift 从来不需要那些字节，它手上只有 canonical source
+镜像。而大纲面板是 AppKit **自己画字**的——这是第一次有 UI 需要「字」。要
+剥就得新开一个 FFI，而且只能是**回报区间**的那种（「这一段里哪几段被藏
+了」，Swift 拿自己的镜像减掉），不能是把文本拷过去的那种——后者破 C4
+「parser 不复制正文」与整套 range-backed 设计。
+
+**现在只有一个消费者，所以不建。** 触发条件写死在这里：**搜索面板有完全
+一样的需求**（结果那一行也要显示不带语法的文本）。两个消费者到齐时再开那个
+区间 FFI，一次给两个面板用。这与「`EditorState` 什么时候抽」是同一条规矩。
+
+显示源码区间不是一个错的答案——它显示的是源码，是一件真事，没有引入第二份
+定义；而绝大多数标题根本没有行内标记。
 
 ##### UI 还没做，这是一个待决的取舍
 
