@@ -3,7 +3,8 @@ use std::fmt;
 
 use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
 use yu_markdown::{
-    Block, BlockKind, InlineParseError, InlineSpanKind, TaskState, parse_inline_with_definitions,
+    Block, BlockKind, InlineParseError, InlineSpanKind, MarkdownDocument, TaskState,
+    parse_inline_with_definitions,
 };
 use yu_text::{TextPositionError, TextSnapshot};
 
@@ -201,7 +202,7 @@ impl AccessibilitySemanticSnapshot {
                 continue;
             };
             let source_range = block.range();
-            let label_range = semantic_block_label_range(&source, block);
+            let label_range = semantic_block_label_range(document.markdown(), block);
             let parent = Some(0);
             let semantic_block_node_index = u32::try_from(nodes.len())
                 .map_err(|_| AccessibilityTextError::SemanticNodeOverflow)?;
@@ -543,12 +544,12 @@ fn push_semantic_node(
 
 /// 语义块的标签区间。
 ///
-/// 标题只报正文，`#` 前缀与 Setext 的下划线都不进 VoiceOver 的朗读——那是
-/// 语法，不是标题的内容。哪一段是正文由 `yu-markdown` 说（它才认识 Markdown
-/// 语法）；此前这里自己扫了一遍 `#`，于是 Setext 标题会带着一行 `===` 被
-/// 读出来。
-fn semantic_block_label_range(source: &TextSnapshot, block: Block) -> TextRange {
-    yu_markdown::heading_content_range(source, block)
+/// 标题只报正文，`#` 前缀、收尾的 ` ##`、Setext 的下划线都不进 VoiceOver 的
+/// 朗读——那是语法，不是标题的内容。哪一段是正文由 `yu-markdown` 说（它才
+/// 认识 Markdown 语法）；此前这里自己扫了一遍 `#`，于是 Setext 标题会带着
+/// 一行 `===` 被读出来。
+fn semantic_block_label_range(markdown: &MarkdownDocument, block: Block) -> TextRange {
+    yu_markdown::heading_content_range(markdown, block)
 }
 
 fn source_range_to_utf16(

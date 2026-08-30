@@ -12,7 +12,7 @@ use std::fmt;
 
 use yu_core::{ByteOffset, Revision, TextRange};
 use yu_markdown::{
-    Block, BlockKind, InlineDocument, InlineNodeKind, InlineSpan, InlineSpanKind,
+    Block, BlockKind, InlineDocument, InlineNodeKind, InlineSpan, InlineSpanKind, MarkdownDocument,
     ReferenceDefinitionIndex, TableAlignment, TableBlock, TaskState, parse,
     parse_inline_with_definitions, parse_table,
 };
@@ -197,12 +197,7 @@ pub fn export_html_fragment(source: &str) -> Result<String, ExportError> {
     let snapshot = buffer.snapshot();
     let document = parse(&snapshot);
     let mut html = String::new();
-    render_blocks(
-        &snapshot,
-        document.reference_definitions(),
-        document.blocks().iter(),
-        &mut html,
-    )?;
+    render_blocks(&document, document.blocks().iter(), &mut html)?;
     Ok(html)
 }
 
@@ -215,11 +210,11 @@ fn slice(snapshot: &TextSnapshot, range: TextRange) -> Result<&str, ExportError>
 }
 
 fn render_blocks(
-    snapshot: &TextSnapshot,
-    definitions: &ReferenceDefinitionIndex,
+    markdown: &MarkdownDocument,
     blocks: impl IntoIterator<Item = Block>,
     output: &mut String,
 ) -> Result<(), ExportError> {
+    let snapshot = markdown.source();
     let mut blocks = blocks.into_iter().peekable();
     let mut first = true;
     while let Some(block) = blocks.next() {
@@ -234,7 +229,7 @@ fn render_blocks(
             }
             render_list_run(snapshot, &run)?
         } else {
-            render_block(snapshot, definitions, block)?
+            render_block(markdown, block)?
         };
         if fragment.is_empty() {
             continue;
@@ -256,11 +251,9 @@ fn list_signature(kind: BlockKind) -> Option<(bool, u8)> {
     }
 }
 
-fn render_block(
-    snapshot: &TextSnapshot,
-    definitions: &ReferenceDefinitionIndex,
-    block: Block,
-) -> Result<String, ExportError> {
+fn render_block(markdown: &MarkdownDocument, block: Block) -> Result<String, ExportError> {
+    let snapshot = markdown.source();
+    let definitions = markdown.reference_definitions();
     let source = slice(snapshot, block.range())?;
     match block.kind() {
         BlockKind::BlankLine | BlockKind::ReferenceDefinition => Ok(String::new()),
@@ -274,7 +267,7 @@ fn render_block(
             Ok(html)
         }
         BlockKind::Heading { level } => {
-            let content = yu_markdown::heading_content_range(snapshot, block);
+            let content = yu_markdown::heading_content_range(markdown, block);
             let mut html = format!("<h{level}>");
             render_inline(snapshot, definitions, content, &mut html)?;
             html.push_str(&format!("</h{level}>"));
@@ -741,6 +734,27 @@ mod tests {
             ("Setext 一级\n===\n", "<h1>Setext 一级</h1>"),
             ("Setext 二级\n---\n", "<h2>Setext 二级</h2>"),
             ("# ATX\n", "<h1>ATX</h1>"),
+        ] {
+            let html = export_html_fragment(source).expect("导出不该失败");
+            assert_eq!(html, expected, "source {source:?}");
+        }
+    }
+
+    /// ATX 收尾的 `#` 串是语法，不进 `<h2>`（CommonMark 41–44）。
+    ///
+    /// 这一条以前是红的：`heading_content_range` 自己扫行，只认前缀，于是
+    /// `## a ##` 导出成 `<h2>a ##</h2>`——而同一个块在编辑器里显示的是 `a`，
+    /// 因为装饰那一侧问的是语法树。两个答案，三个消费者里两个错。
+    #[test]
+    fn atx_closing_sequences_do_not_reach_the_heading_body() {
+        for (source, expected) in [
+            ("## a ##\n", "<h2>a</h2>"),
+            ("##### foo ##\n", "<h5>foo</h5>"),
+            ("### foo ###     \n", "<h3>foo</h3>"),
+            // 后面还有字就不是收尾串；`#` 前面没空格也不是。
+            ("### foo ### b\n", "<h3>foo ### b</h3>"),
+            ("# foo#\n", "<h1>foo#</h1>"),
+            ("###\n", "<h3></h3>"),
         ] {
             let html = export_html_fragment(source).expect("导出不该失败");
             assert_eq!(html, expected, "source {source:?}");

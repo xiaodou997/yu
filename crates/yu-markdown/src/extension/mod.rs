@@ -52,7 +52,7 @@ use crate::table::TableBlock;
 mod code_span;
 mod emphasis;
 mod fenced_code;
-mod heading;
+pub(crate) mod heading;
 mod image;
 mod line_break;
 mod link;
@@ -104,6 +104,28 @@ pub struct BlockContext<'a> {
 }
 
 impl<'a> BlockContext<'a> {
+    /// 不产装饰的块上下文：没有焦点。
+    ///
+    /// 装饰之外还有几个消费者要问「这个块的某一段在哪」——大纲、导出、
+    /// 可访问性都要标题的正文区间。它们各自扫一遍源码就会与 extension 分叉
+    /// （`heading_content_range` 曾经如此），走同一个上下文才谈得上同一个
+    /// 答案。焦点是「光标在不在这一块」，只有装饰关心，所以这里恒为 `None`。
+    #[must_use]
+    pub(crate) fn for_block(
+        source: &'a TextSnapshot,
+        tree: &'a Tree,
+        references: &'a ReferenceDefinitionIndex,
+        block: Block,
+    ) -> Self {
+        Self {
+            source,
+            block,
+            syntax: block_node(tree, source, block.range()),
+            references,
+            active: None,
+        }
+    }
+
     #[must_use]
     pub const fn source(&self) -> &'a TextSnapshot {
         self.source
@@ -932,11 +954,8 @@ impl ExtensionSet {
         // 逐个块判断，漏一个就是「代码里的星号被吃掉了」；换成语法树之后
         // 这件事由树的形状保证，不再依赖任何人记得判断。
         let cx = BlockContext {
-            source,
-            block,
-            syntax: block_node(tree, source, block.range()),
-            references,
             active,
+            ..BlockContext::for_block(source, tree, references, block)
         };
 
         let source_len = source.len_bytes();
