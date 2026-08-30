@@ -19,8 +19,8 @@ use crate::{
     BlockLayoutSource, CaretScrollRequest, CommandResult, CompositionError, CompositionOverlay,
     DecorationCache, DecorationCacheStats, DecorationError, EditorCommand, EditorSelection,
     KeyEvent, KeyRouteResult, LayoutBackend, LayoutCache, LayoutCacheStats, LayoutPoint,
-    SelectionError, SourceChange, ViewportCaret, ViewportConfig, ViewportError, ViewportLayout,
-    ViewportSnapshot, ViewportSpan, ViewportStats, VisualText, VisualTextError,
+    SearchState, SelectionError, SourceChange, ViewportCaret, ViewportConfig, ViewportError,
+    ViewportLayout, ViewportSnapshot, ViewportSpan, ViewportStats, VisualText, VisualTextError,
     command::{
         next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
         previous_word_boundary,
@@ -49,6 +49,16 @@ pub struct EditorDocument {
     decorations: DecorationCache,
     layouts: LayoutCache,
     viewport: ViewportLayout,
+    /// 当前查询在这一版源码上的全部匹配，没有搜索时是 `None`。
+    ///
+    /// 与 `decorations` / `layouts` / `viewport` 同一堆：都是「视图与缓存」，
+    /// 不是文档状态。抽 `EditorState` 时要挪走的那几个从三个变成四个——
+    /// **但这一刀仍然不抽**，理由与那三个一样：它跟着走，抽不抽都一样。真正
+    /// 逼出 `EditorState` 的是多光标那一刀，那动的是 `selection`。
+    search: Option<SearchState>,
+    /// 查询换过几次。**帧身份要用它**：改查询不推进 Revision、不改几何、
+    /// 不改选区，少了这一项，在搜索框里打字画面会一动不动——不报错。
+    search_generation: u64,
 }
 
 impl EditorDocument {
@@ -75,6 +85,8 @@ impl EditorDocument {
             decorations: DecorationCache::default(),
             layouts: LayoutCache::default(),
             viewport: ViewportLayout::default(),
+            search: None,
+            search_generation: 0,
         }
     }
 
@@ -177,6 +189,41 @@ impl EditorDocument {
     ) -> Result<&BlockDecorations, EditorDocumentError> {
         let block = self.block_at(index)?;
         Ok(self.decorations.get_or_build_block(&self.markdown, block)?)
+    }
+
+    /// 换一份查询，立刻在这一版源码上扫出全部匹配。
+    ///
+    /// 空查询也留下一份状态（0 个匹配），面板要靠它显示「没有结果」；要连
+    /// 高亮一起收掉用 [`Self::clear_search`]。
+    pub fn set_search_query(&mut self, query: &str) {
+        let snapshot = self.snapshot();
+        self.search = Some(SearchState::new(&snapshot, query));
+        self.search_generation = self.search_generation.wrapping_add(1);
+    }
+
+    /// 收掉搜索：不再有匹配，也不再有高亮。
+    pub fn clear_search(&mut self) {
+        if self.search.is_none() {
+            return;
+        }
+        self.search = None;
+        self.search_generation = self.search_generation.wrapping_add(1);
+    }
+
+    /// 当前查询的匹配，没有搜索时是 `None`。
+    #[must_use]
+    pub const fn search(&self) -> Option<&SearchState> {
+        self.search.as_ref()
+    }
+
+    /// 查询换过几次。
+    ///
+    /// **帧身份必须带上它。** 改查询不推进 Revision、不改几何、也不改选区，
+    /// 少了这一项，在搜索框里打字画面一动不动——不报错、不 panic，正是这个
+    /// 项目最危险的失败模式。
+    #[must_use]
+    pub const fn search_generation(&self) -> u64 {
+        self.search_generation
     }
 
     /// 焦点块那一份：光标碰到的行内语法露出来。
@@ -1297,6 +1344,13 @@ impl EditorDocument {
         self.decorations.retain_blocks(incremental.document());
         self.layouts.retain_blocks(incremental.document());
         self.markdown = incremental.into_document();
+        // 匹配是 `(TextSnapshot, query)` 的纯函数，源码变了就得重扫。没有人
+        // 在搜索时这里一分钱不花；有人在搜索时，代价是一次全文子串扫描——
+        // 装饰与布局是增量的，这一个不是，因为一次编辑可以让任意远处的匹配
+        // 出现或消失（`ab` 中间插一个字符）。
+        if let Some(state) = self.search.as_ref() {
+            self.search = Some(SearchState::new(applied.result_snapshot(), state.query()));
+        }
         self.last_source_change = source_change_from_applied(&before_snapshot, &applied)?;
         Ok(applied)
     }

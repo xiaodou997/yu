@@ -40,6 +40,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private let statusLabel = NSTextField(labelWithString: "")
     private let outlinePanel = OutlinePanel()
     private var outlineRevision: UInt64?
+    private let searchPanel = SearchPanel()
+    /// 结果列表是照哪一版画的：Revision 或查询任一变化都要重画。查询本身不
+    /// 推进 Revision，所以两者都要记。
+    private var searchRevision: UInt64?
+    private var searchQuery = ""
+    private weak var sidebarStack: NSStackView?
     private var saveButton: NSButton?
     private var reloadButton: NSButton?
     private var initialState: NativeStorageState
@@ -110,11 +116,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             self.textView.refreshTableResizeAccessibility()
             self.updateStatus()
             self.refreshOutline()
+            // 编辑之后匹配整体重扫过（Rust 侧），结果列表要跟着换。
+            self.refreshSearch()
             self.syncSourceGlyphVisibility()
             self.scheduleVisualSubmit()
         }
         textView.onCaretChange = { [weak self] in
             guard let self else { return }
+            // 「当前命中」是从选区推出来的，所以选区一动，结果列表上高亮的
+            // 那一行也要跟着动。
+            self.searchPanel.highlightRow(matching: self.bridge.selection.range)
             // 光标移动不推进 Revision，但会改变 caret 与选区装饰。Rust 的帧
             // 身份已经把 selection 算在内，平台不需要再显式作废任何东西。
             self.scheduleVisualSubmit()
@@ -237,11 +248,37 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         outlinePanel.onSelect = { [weak self] item in
             self?.textView.navigateToOutlineItem(item)
         }
+        searchPanel.onQueryChange = { [weak self] query in
+            self?.applySearchQuery(query)
+        }
+        searchPanel.onSelect = { [weak self] match in
+            self?.textView.navigateToSearchMatch(match)
+        }
+
+        // 侧栏里两个面板上下叠。用 NSStackView 而不是第二个 NSSplitView：
+        // 后者的 holding priority 会再压过首选高度约束一次（陷阱 26 是它的
+        // 水平版），而这里根本不需要用户拖分隔线。
+        let sidebar = NSStackView(views: [outlinePanel.scrollView, searchPanel.view])
+        sidebar.orientation = .vertical
+        sidebar.spacing = 0.0
+        sidebar.distribution = .fill
+        // 横向宽度**显式钉在侧栏上**。竖直 stack 的 alignment 给不出这件事：
+        // 默认 `.centerX` 让两个面板按各自的固有宽度居中，而 `.width` 是按
+        // 「最宽的那个」对齐——`NSScrollView` 根本没有固有宽度，两种都让查询框
+        // 和结果列表缩成窄窄一条，文字被直接裁断。这条是截图抓出来的，全部
+        // 自动化断言都绿（与陷阱 26「约束给不出 NSSplitView 的初始分栏位置」
+        // 是同一类：布局容器的默认策略与你以为的不是一回事）。
+        sidebar.alignment = .leading
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.setHuggingPriority(NSLayoutConstraint.Priority(249.0), for: .vertical)
+        searchPanel.view.isHidden = true
+        sidebarStack = sidebar
+
         let splitView = NSSplitView()
         splitView.isVertical = true
         splitView.dividerStyle = .thin
         splitView.translatesAutoresizingMaskIntoConstraints = false
-        splitView.addArrangedSubview(outlinePanel.scrollView)
+        splitView.addArrangedSubview(sidebar)
         splitView.addArrangedSubview(scrollView)
         // 面板守住自己的宽度，缩放窗口时让文档吸收——否则拖窗口会把大纲挤没。
         splitView.setHoldingPriority(
@@ -269,8 +306,16 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             splitView.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 10),
             splitView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            outlinePanel.scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 150.0),
-            outlinePanel.scrollView.widthAnchor.constraint(lessThanOrEqualToConstant: 420.0),
+            sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 150.0),
+            sidebar.widthAnchor.constraint(lessThanOrEqualToConstant: 420.0),
+            outlinePanel.scrollView.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
+            searchPanel.view.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
+            // 搜索面板占侧栏下半部的一块固定高度，大纲吃掉剩下的。
+            searchPanel.view.heightAnchor.constraint(greaterThanOrEqualToConstant: 140.0),
+            searchPanel.view.heightAnchor.constraint(
+                lessThanOrEqualTo: sidebar.heightAnchor,
+                multiplier: 0.6
+            ),
         ])
         view = root
         startFileWatcher()
@@ -285,13 +330,120 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         guard force || outlineRevision != revision else { return }
         guard let items = bridge.outlineItemsIfAvailable else { return }
         outlineRevision = revision
-        outlinePanel.reload(items: items, source: bridge.source as NSString)
+        outlinePanel.reload(
+            items: items,
+            source: bridge.source as NSString,
+            // 剥行内标记：区间由 Rust 给（唯一实现在 DecorationSet 里），
+            // 减法在 PanelLabel 里。面板自己不认识 bridge。
+            hidden: { [bridge] item in
+                bridge.blockHiddenSpans(block: item.block, in: item.labelRange)
+            }
+        )
     }
+
+    /// 换一份查询：Rust 立刻重扫，结果列表与高亮跟着走。
+    ///
+    /// 高亮不用平台做任何事——它是场景里的图元，而帧身份带着
+    /// `search_generation`，所以一次重提交就够了。
+    private func applySearchQuery(_ query: String) {
+        guard bridge.setSearchQuery(query) else { return }
+        searchQuery = query
+        searchRevision = nil
+        refreshSearch()
+        scheduleVisualSubmit()
+    }
+
+    /// 结果列表是一份跟着 (Revision, 查询) 走的派生视图。
+    private func refreshSearch(force: Bool = false) {
+        guard !searchPanel.view.isHidden else { return }
+        let revision = bridge.state.revision
+        guard force || searchRevision != revision else { return }
+        guard let matches = bridge.searchMatchesIfAvailable else { return }
+        searchRevision = revision
+        let mirror = bridge.source as NSString
+        let rows = matches.map { match in
+            SearchResults.row(for: match, in: mirror) { [bridge] block, range in
+                // 结果那一行也要剥语法标记，走的是与大纲同一份实现。
+                bridge.blockHiddenSpans(block: block, in: range)
+            }
+        }
+        searchPanel.reload(rows: rows, query: searchQuery)
+        searchPanel.highlightRow(matching: bridge.selection.range)
+    }
+
+    @objc fileprivate func findFromMenu(_ sender: Any?) {
+        if searchPanel.view.isHidden {
+            showSearchPanel()
+        } else {
+            view.window?.makeFirstResponder(searchPanel.focusTarget)
+        }
+    }
+
+    /// 展开搜索面板并把焦点交给查询框。
+    ///
+    /// `updateSidebarVisibility` 不能少：两个面板都收起时整条侧栏也收起了，
+    /// 只把搜索面板的 `isHidden` 翻回来，它仍然在一条隐藏的侧栏里——按 `⌘F`
+    /// 什么也不会出现，而且不报错。
+    private func showSearchPanel() {
+        searchPanel.view.isHidden = false
+        updateSidebarVisibility()
+        refreshSearch(force: true)
+        view.window?.makeFirstResponder(searchPanel.focusTarget)
+    }
+
+    @objc fileprivate func findNextFromMenu(_ sender: Any?) {
+        advanceSearch(forward: true)
+    }
+
+    @objc fileprivate func findPreviousFromMenu(_ sender: Any?) {
+        advanceSearch(forward: false)
+    }
+
+    /// 跳到下一处/上一处命中。
+    ///
+    /// **走的是同一个导航入口**（`DocumentTextView.navigate(toSource:)`）：
+    /// 选中那一段，滚动由随之而来的 `onCaretChange` 交给 viewport 那条路。
+    private func advanceSearch(forward: Bool) {
+        guard let matches = bridge.searchMatchesIfAvailable, !matches.isEmpty else { return }
+        guard let next = SearchResults.next(
+            after: bridge.selection.range,
+            in: matches,
+            forward: forward
+        ) else { return }
+        textView.navigateToSearchMatch(next)
+    }
+
+    @objc fileprivate func toggleSearchFromMenu(_ sender: Any?) {
+        let hidden = !searchPanel.view.isHidden
+        searchPanel.view.isHidden = hidden
+        if hidden {
+            // 收起面板就收掉搜索：留着高亮而看不见结果列表，是「画面上有东西
+            // 但没人说得清它从哪来」。
+            bridge.setSearchQuery(nil)
+            searchQuery = ""
+            searchRevision = nil
+            scheduleVisualSubmit()
+            if view.window?.firstResponder === searchPanel.focusTarget {
+                focusDocument()
+            }
+            updateSidebarVisibility()
+        } else {
+            showSearchPanel()
+        }
+    }
+
+    /// 两个面板都收起来时，整条侧栏也收起来——否则会留下一条空白。
+    private func updateSidebarVisibility() {
+        sidebarStack?.isHidden = outlinePanel.scrollView.isHidden && searchPanel.view.isHidden
+        documentSplitView?.adjustSubviews()
+    }
+
+    var searchIsVisible: Bool { !searchPanel.view.isHidden }
 
     @objc fileprivate func toggleOutlineFromMenu(_ sender: Any?) {
         let hidden = !outlinePanel.scrollView.isHidden
         outlinePanel.scrollView.isHidden = hidden
-        documentSplitView?.adjustSubviews()
+        updateSidebarVisibility()
         if hidden, view.window?.firstResponder === outlinePanel.focusTarget {
             focusDocument()
         }
@@ -523,10 +675,71 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             "面板导航之后视口没有滚动（\(scrollBefore) → \(scrollAfter)）"
         )
 
+        // 7. 搜索高亮真的进了屏幕上那一帧。
+        //    headless 压不住这一条：那里没有 surface，场景根本不提交。判据是
+        //    场景里的矩形条数，不是 `searchMatchesIfAvailable`——后者是被测那
+        //    条路的上游，拿它当参照只能证明「我把它读出来了」。
+        //    先滚回文首：第 6 步把视口滚到了最后一条标题，而场景只画可见范围，
+        //    拿一个不在屏幕上的词去搜会得到一条假红。
+        outlinePanel.clickRowForSelfCheck(0)
+        surfaceCoordinator.revealCaretIfNeeded()
+        let firstNode = try require(outlinePanel.nodeForSelfCheck(row: 0), "取不到第一行")
+        let baseline = try require(surfaceCoordinator.submitNow(), "滚回文首之后的重提交失败")
+        try require(
+            baseline.searchDecorationCount == 0,
+            "还没有查询就画出了 \(baseline.searchDecorationCount) 个搜索矩形"
+        )
+        let needle = String(firstNode.label.prefix(2))
+        try require(!needle.isEmpty, "第一条标题没有文字，这一条压不住任何东西")
+        try require(bridge.setSearchQuery(needle), "设查询失败")
+        try require(
+            !surfaceCoordinator.hasCurrentFrame(),
+            "换查询之后仍被判为当前帧——搜索框里打字画面会一动不动，而且不报错"
+        )
+        let searched = try require(surfaceCoordinator.submitNow(), "换查询之后的重提交失败")
+        try require(
+            searched.searchDecorationCount > 0,
+            "查询「\(needle)」在场景里没有画出任何高亮"
+        )
+
+        // 8. 收掉搜索，矩形必须一起消失。
+        try require(bridge.setSearchQuery(nil), "收掉搜索失败")
+        let cleared = try require(surfaceCoordinator.submitNow(), "收掉搜索之后的重提交失败")
+        try require(
+            cleared.searchDecorationCount == 0,
+            "收掉搜索之后还剩 \(cleared.searchDecorationCount) 个高亮"
+        )
+
+        // 9. 人工验收 D4 里能自动化的那两条：菜单项上的勾，与「收起面板之后
+        //    焦点不能留在面板上」。剩下的（上下键在条目间走）是 AppKit 自己的
+        //    行为，不是这里的逻辑。
+        let outlineItem = NSMenuItem(
+            title: "大纲",
+            action: #selector(toggleOutlineFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        _ = validateMenuItem(outlineItem)
+        try require(outlineItem.state == .on, "面板可见时菜单项上应当有勾")
+        view.window?.makeFirstResponder(outlinePanel.focusTarget)
+        try require(
+            view.window?.firstResponder === outlinePanel.focusTarget,
+            "面板拿不到键盘焦点"
+        )
+        toggleOutlineFromMenu(nil)
+        _ = validateMenuItem(outlineItem)
+        try require(outlineItem.state == .off, "面板收起后菜单项上的勾没有跟着变")
+        try require(
+            view.window?.firstResponder !== outlinePanel.focusTarget,
+            "面板收起了，键盘焦点却还留在它上面"
+        )
+        toggleOutlineFromMenu(nil)
+        try require(outlineIsVisible, "面板没有再展开")
+
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
                 + "caret=\(republished?.caretDecorationCount ?? 0) "
                 + "selection=\(republished?.selectionDecorationCount ?? 0) "
+                + "search=\(searched.searchDecorationCount)→\(cleared.searchDecorationCount) "
                 + "extent=\(Int(documentView.frame.height)) "
                 + "outlineRows=\(outlinePanel.rowCountForSelfCheck) "
                 + "outlineScroll=\(Int(scrollBefore))→\(Int(scrollAfter))"
@@ -560,6 +773,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         if menuItem.action == #selector(toggleOutlineFromMenu(_:)) {
             menuItem.state = outlineIsVisible ? .on : .off
             return true
+        }
+        if menuItem.action == #selector(toggleSearchFromMenu(_:)) {
+            menuItem.state = searchIsVisible ? .on : .off
+            return true
+        }
+        if menuItem.action == #selector(findNextFromMenu(_:)) ||
+            menuItem.action == #selector(findPreviousFromMenu(_:)) {
+            // 没有查询就没有「下一个」。灰掉比按下去什么也不发生要诚实。
+            return !(bridge.searchMatchesIfAvailable ?? []).isEmpty
         }
         return true
     }
@@ -852,6 +1074,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             item.target = controller
             editMenu.addItem(item)
         }
+        editMenu.addItem(.separator())
+        let findItems: [(String, Selector, String, NSEvent.ModifierFlags)] = [
+            ("查找", #selector(DocumentViewController.findFromMenu(_:)), "f", [.command]),
+            ("查找下一个", #selector(DocumentViewController.findNextFromMenu(_:)), "g", [.command]),
+            (
+                "查找上一个",
+                #selector(DocumentViewController.findPreviousFromMenu(_:)),
+                "g",
+                [.command, .shift]
+            ),
+        ]
+        for (title, action, keyEquivalent, modifiers) in findItems {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+            item.keyEquivalentModifierMask = modifiers
+            item.target = controller
+            editMenu.addItem(item)
+        }
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
 
@@ -865,6 +1104,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         outline.keyEquivalentModifierMask = [.command, .option]
         outline.target = controller
         viewMenu.addItem(outline)
+        let searchToggle = NSMenuItem(
+            title: "搜索结果",
+            action: #selector(DocumentViewController.toggleSearchFromMenu(_:)),
+            keyEquivalent: "2"
+        )
+        searchToggle.keyEquivalentModifierMask = [.command, .option]
+        searchToggle.target = controller
+        viewMenu.addItem(searchToggle)
         viewMenuItem.submenu = viewMenu
         mainMenu.addItem(viewMenuItem)
 

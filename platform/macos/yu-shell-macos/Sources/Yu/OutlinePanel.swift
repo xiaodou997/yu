@@ -11,7 +11,8 @@ import YuStorageFFI
 //      层级是错的——self-check 因此拿树的形状反过来核对平表。
 //   2. **跨刷新的身份**。NSOutlineView 按对象身份记展开状态，而每次刷新都会
 //      重建这些对象。展开了哪几条、选中哪一条要靠 `identity` 存活。
-//   3. **label 的折行**。见 `OutlineTree.displayLabel`。
+//   3. **label 的折行**。见 `OutlineTree.displayLabel`。剥行内标记不在这里
+//      ——那是 `PanelLabel` 的事，两个面板共用一份。
 //
 // 导航**不另开 FFI**：拿 `labelRange.location` 走已有的选区入口，滚动交给
 // yu-editor::viewport 那条路（`macosShapedCaretScrollRequest`）。面板不算 y。
@@ -48,14 +49,18 @@ enum OutlineTree {
     /// 孩子前面，一遍扫描就够。查不到父亲的那一条挂成根级——那是 FFI 契约
     /// 被破坏的情形，而根节点的 `parent` 必须是 `UInt32.max` 这一条断言会
     /// 把它照出来，不会静默地混进正常层级里。
-    static func build(items: [NativeOutlineItem], source: NSString) -> [OutlineNode] {
+    static func build(
+        items: [NativeOutlineItem],
+        source: NSString,
+        hidden: (NativeOutlineItem) -> [NSRange]?
+    ) -> [OutlineNode] {
         var roots: [OutlineNode] = []
         var byIndex: [UInt32: OutlineNode] = [:]
         // key 是「父亲的 identity + label」，值是这个 label 在该父亲下出现过
         // 几次。同一层里两条同名标题靠它区分。
         var occurrences: [String: Int] = [:]
         for item in items {
-            let label = displayLabel(item.labelRange, in: source)
+            let label = displayLabel(item.labelRange, in: source, hidden: hidden(item))
             let parent = item.parent == UInt32.max ? nil : byIndex[item.parent]
             let base = (parent?.identity ?? "") + "\u{1F}" + label
             let seen = occurrences[base, default: 0]
@@ -75,24 +80,24 @@ enum OutlineTree {
         return roots
     }
 
-    /// 面板上的一行文字。
+    /// 面板上的一行文字：源码区间减掉被藏起来的那几段，再折行。
     ///
-    /// **这一刀不剥行内标记**：`## **粗** 标题` 显示成 `**粗** 标题`。剥的
-    /// 唯一实现在 `DecorationSet` 里（不变量 D1），而 FFI 上没有任何回报视觉
-    /// 区间的入口；开一个只为一个消费者用的新 FFI 不划算，触发条件是第三刀的
-    /// 搜索面板。理由与触发条件写在 overview 第 8 节 S7
-    /// 「已登记：面板上的标题带着行内标记，第三刀再剥」。显示源码不是错的
-    /// 答案——它显示的是源码，没有引入第二份定义。
+    /// **行内标记这一刀剥掉了**：`## **粗** 标题` 显示成 `粗 标题`。剥的唯一
+    /// 实现在 Rust 的 `DecorationSet` 里（不变量 D1），FFI 只回报区间，减法
+    /// 在 `PanelLabel` 里——那是它的唯一实现，两个面板共用。第二刀留下的触发
+    /// 条件（「搜索面板到齐时再开那个 FFI」）在第三刀到齐了。
+    ///
+    /// `hidden` 为 nil 表示这一版拿不到区间（Revision 撞上了刷新）。那时**显示
+    /// 源码**——那是这一刀之前的行为，是一件真事，不是错的答案。
     ///
     /// 唯一的纯呈现例外是 **Setext 多行标题**：`多行\n标题\n===` 的 label
-    /// 是 `"多行\n标题"`，一行放不下两行字，这里折成一行。
-    static func displayLabel(_ range: NSRange, in source: NSString) -> String {
-        guard range.location >= 0,
-              range.length >= 0,
-              range.location + range.length <= source.length else {
-            return ""
-        }
-        let raw = source.substring(with: range)
+    /// 是 `"多行\n标题"`，一行放不下两行字，这里折成一行。折行只动空白。
+    static func displayLabel(
+        _ range: NSRange,
+        in source: NSString,
+        hidden: [NSRange]?
+    ) -> String {
+        let raw = PanelLabel.stripping(hidden ?? [], from: source, in: range)
         guard raw.contains(where: \.isNewline) else { return raw }
         return raw
             .split(whereSeparator: \.isNewline)
@@ -146,7 +151,11 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
     /// **展开状态与选中行必须活过这一次重建**：每次全量 `reloadData` 都会
     /// 换掉所有节点对象，什么都不做的话，敲一个字符大纲就全折起来、选中行
     /// 也没了。新出现的节点默认展开——刚打的标题应该看得见。
-    func reload(items: [NativeOutlineItem], source: NSString) {
+    func reload(
+        items: [NativeOutlineItem],
+        source: NSString,
+        hidden: (NativeOutlineItem) -> [NSRange]?
+    ) {
         let previouslyKnown = Set(allNodes(of: roots).map(\.identity))
         let previouslyExpanded = Set(
             allNodes(of: roots)
@@ -155,7 +164,7 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
         )
         let previouslySelected = selectedNode?.identity
 
-        roots = OutlineTree.build(items: items, source: source)
+        roots = OutlineTree.build(items: items, source: source, hidden: hidden)
         outlineView.reloadData()
 
         for node in allNodes(of: roots) where !node.children.isEmpty {

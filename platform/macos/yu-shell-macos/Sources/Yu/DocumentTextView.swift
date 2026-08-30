@@ -1049,19 +1049,40 @@ final class DocumentTextView: NSTextView {
         return (Float(max(font.pointSize, 1.0)), Float(width))
     }
 
-    /// 跳到大纲里的一条标题：把光标放到它正文的起点。
+    /// 跳到一个源码位置。**这是「怎么跳到一个源码位置」的唯一实现。**
     ///
     /// **导航不另开 FFI。** 选区走 `setSelectedRange` 那条已有的路，它落到
     /// `yu_storage_session_set_selection_endpoints`；滚动由随之而来的
     /// `onCaretChange` 交给 `macosShapedCaretScrollRequest`，也就是
     /// yu-editor::viewport 那条路。**面板不自己算 y**——它手上只有 UTF-16
     /// 偏移，算 y 就要在平台侧复制一份排版。
-    func navigateToOutlineItem(_ item: NativeOutlineItem) {
+    ///
+    /// 参数是一个 UTF-16 区间而不是某个面板的条目类型：第三刀来了第二个
+    /// 面板（搜索结果），另写一份会立刻产生第二个答案，而这一刀恰好又要动
+    /// 选区（搜索有自己的「跳到下一个」）——那是最容易分叉的地方。
+    /// `length` 为 0 时是把光标放过去，非 0 时是把那一段选中。
+    func navigate(toSource range: NSRange) {
         let length = (string as NSString).length
-        guard item.labelRange.location >= 0, item.labelRange.location <= length else {
+        guard range.location >= 0,
+              range.length >= 0,
+              range.location + range.length <= length else {
             return
         }
-        setSelectedRange(NSRange(location: item.labelRange.location, length: 0))
+        setSelectedRange(range)
+    }
+
+    /// 跳到大纲里的一条标题：把光标放到它正文的起点。
+    func navigateToOutlineItem(_ item: NativeOutlineItem) {
+        navigate(toSource: NSRange(location: item.labelRange.location, length: 0))
+    }
+
+    /// 跳到一处搜索命中：把它**选中**。
+    ///
+    /// 选中而不是只放光标，是因为「当前命中」由选区推出来（Rust 侧
+    /// `SearchState::current` 要求选区恰好等于那一段）——不存第二份下标，
+    /// 就不会有第二个可以对不上的答案。
+    func navigateToSearchMatch(_ match: NativeSearchMatch) {
+        navigate(toSource: match.range)
     }
 
     /// Menu actions use these explicit entry points instead of NSTextView's
