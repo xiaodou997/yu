@@ -438,6 +438,7 @@ typedef struct YuStorageMacosRenderHostSnapshot {
     uint8_t published;
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
+    uint64_t search_decoration_count;
     /* Non-zero when the visible range still has an image or embedded resource
      * that has not settled. The platform schedules one more submit so Rust can
      * drain its worker results; it does not classify resource states itself. */
@@ -467,6 +468,7 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint8_t submitted;
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
+    uint64_t search_decoration_count;
     uint8_t resource_refresh_pending;
     /* Rendered document height for this frame. The scrollable extent must come
      * from here: the platform has no second layout to derive it from (I5). */
@@ -524,6 +526,33 @@ typedef struct YuStorageOutlineItem {
     uint64_t label_start_utf16;
     uint64_t label_end_utf16;
 } YuStorageOutlineItem;
+
+/* 一段被装饰藏起来的 source，UTF-16。
+ *
+ * 面板上的一行文字要不带语法标记（`## **粗** 标题` 显示成 `粗 标题`）。
+ * 「哪几段被藏了」的唯一实现在 Rust 的 DecorationSet 里（不变量 D1），而画字
+ * 的是 AppKit。把视觉文本拷过来会破 C4「parser 不复制正文」与整套 range-backed
+ * 设计，所以交出的是**区间**：平台拿自己的 canonical 镜像按它们减掉。
+ *
+ * 区间升序、不重叠、不相邻。 */
+typedef struct YuStorageHiddenSpan {
+    uint64_t start_utf16;
+    uint64_t end_utf16;
+} YuStorageHiddenSpan;
+
+/* 一处搜索命中。
+ *
+ * block 与 block_*_utf16 让调用方能守住 yu_storage_session_block_hidden_spans
+ * 的那条规则（请求要落在一个块里）：结果面板上那一行未必与块边界对齐，有了
+ * 块的区间，平台可以自己把行裁到块里。匹配跨块时 block 是起点所在的那一块。 */
+typedef struct YuStorageSearchMatch {
+    uint64_t revision;
+    uint64_t block;
+    uint64_t start_utf16;
+    uint64_t end_utf16;
+    uint64_t block_start_utf16;
+    uint64_t block_end_utf16;
+} YuStorageSearchMatch;
 
 typedef struct YuStorageCommandResult {
     uint64_t revision;
@@ -684,6 +713,22 @@ int32_t yu_storage_session_accessibility_semantic_nodes_v2(
 int32_t yu_storage_session_outline_items(
     const YuStorageSession *session, uint64_t expected_revision,
     YuStorageOutlineItem *output, size_t capacity, size_t *written);
+/* 换一份搜索查询，立刻在当前源码上扫出全部匹配。text 传 NULL、text_length
+ * 传 0 表示收掉搜索。不校验 Revision：查询与源码正交。 */
+int32_t yu_storage_session_set_search_query(
+    YuStorageSession *session, const uint8_t *text, size_t text_length);
+/* 拷出当前查询的全部匹配，按文档顺序，互不重叠。两遍协议。
+ * 「跳到下一个」不在这里：那是一次导航，走已有的
+ * yu_storage_session_set_selection_endpoints。 */
+int32_t yu_storage_session_search_matches(
+    const YuStorageSession *session, uint64_t expected_revision,
+    YuStorageSearchMatch *output, size_t capacity, size_t *written);
+/* 一个块里被藏起来的 source 区间，裁到 [start_utf16, end_utf16) 之内。
+ * 两遍协议。请求区间必须整个落在这个块里；跨块的一行要按块问几次。 */
+int32_t yu_storage_session_block_hidden_spans(
+    YuStorageSession *session, uint64_t expected_revision, uint64_t block,
+    uint64_t start_utf16, uint64_t end_utf16,
+    YuStorageHiddenSpan *output, size_t capacity, size_t *written);
 int32_t yu_storage_session_accessibility_line_range(
     const YuStorageSession *session, uint64_t expected_revision, uint64_t line,
     YuStorageAccessibilityRange *output);

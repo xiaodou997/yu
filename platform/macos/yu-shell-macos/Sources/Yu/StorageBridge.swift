@@ -301,6 +301,9 @@ struct NativeMacosRenderHostSnapshot {
     let published: Bool
     let selectionDecorationCount: Int
     let caretDecorationCount: Int
+    /// 这一帧画了几处搜索命中底色。它是「改了查询画面真的跟着变了」在真实
+    /// 窗口里唯一能被证伪的量，而它来自场景，不来自搜索自己那条路。
+    let searchDecorationCount: Int
     let resourceRefreshPending: Bool
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
@@ -323,6 +326,7 @@ struct NativeMacosRenderHostSnapshot {
         published = value.published != 0
         selectionDecorationCount = Int(value.selection_decoration_count)
         caretDecorationCount = Int(value.caret_decoration_count)
+        searchDecorationCount = Int(value.search_decoration_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
     }
 }
@@ -349,6 +353,9 @@ struct NativeMacosRenderHostSurfaceSnapshot {
     let submitted: Bool
     let selectionDecorationCount: Int
     let caretDecorationCount: Int
+    /// 这一帧画了几处搜索命中底色。它是「改了查询画面真的跟着变了」在真实
+    /// 窗口里唯一能被证伪的量，而它来自场景，不来自搜索自己那条路。
+    let searchDecorationCount: Int
     /// Rust 在提交这一帧时给出的结论：可见范围内还有资源没落定。
     /// 平台据此安排一次有界轮询，不自己判断资源状态。
     let resourceRefreshPending: Bool
@@ -378,6 +385,7 @@ struct NativeMacosRenderHostSurfaceSnapshot {
         submitted = value.submitted != 0
         selectionDecorationCount = Int(value.selection_decoration_count)
         caretDecorationCount = Int(value.caret_decoration_count)
+        searchDecorationCount = Int(value.search_decoration_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
         contentHeight = CGFloat(value.content_height)
     }
@@ -509,6 +517,30 @@ struct NativeOutlineItem {
         labelRange = NSRange(
             location: Int(value.label_start_utf16),
             length: Int(value.label_end_utf16 - value.label_start_utf16)
+        )
+    }
+}
+
+/// 一处搜索命中。
+///
+/// `block` 与 `blockRange` 不是给面板显示用的，是给它**守规矩**用的：回报
+/// 隐藏区间的 FFI 只接受落在一个块里的请求，而结果那一行未必与块边界对齐。
+struct NativeSearchMatch: Equatable {
+    let revision: UInt64
+    let block: UInt64
+    let range: NSRange
+    let blockRange: NSRange
+
+    init(_ value: YuStorageSearchMatch) {
+        revision = value.revision
+        block = value.block
+        range = NSRange(
+            location: Int(value.start_utf16),
+            length: Int(value.end_utf16 - value.start_utf16)
+        )
+        blockRange = NSRange(
+            location: Int(value.block_start_utf16),
+            length: Int(value.block_end_utf16 - value.block_start_utf16)
         )
     }
 }
@@ -1151,6 +1183,101 @@ final class StorageBridge {
         }
         guard status == StorageStatus.ok, written == count else { return nil }
         return values.map(NativeOutlineItem.init)
+    }
+
+    /// 一个块里被藏起来的源码区间，裁到 `range` 之内。
+    ///
+    /// 面板上要显示不带语法标记的文字（`## **粗** 标题` → `粗 标题`），而
+    /// 「哪几段被藏了」的唯一实现在 Rust 的 `DecorationSet` 里（不变量 D1）。
+    /// **跨边界的是区间，不是文本**——把视觉文本拷过来会破 C4 与整套
+    /// range-backed 设计，平台手上本来就有 canonical 镜像，减一下就行。
+    ///
+    /// `range` 必须整个落在 `block` 里；跨块的一行要按块问几次。Revision 失配
+    /// 或请求非法时返回 nil，调用方退回显示源码——那不是一个错的答案。
+    func blockHiddenSpans(block: UInt64, in range: NSRange) -> [NSRange]? {
+        guard range.location >= 0, range.length >= 0 else { return nil }
+        let revision = state.revision
+        let start = UInt64(range.location)
+        let end = UInt64(range.location + range.length)
+        var count = 0
+        let countStatus = yu_storage_session_block_hidden_spans(
+            handle,
+            revision,
+            block,
+            start,
+            end,
+            nil,
+            0,
+            &count
+        )
+        guard countStatus == StorageStatus.ok else { return nil }
+        guard count > 0 else { return [] }
+
+        var values = Array(repeating: YuStorageHiddenSpan(), count: count)
+        var written = 0
+        let status = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_block_hidden_spans(
+                handle,
+                revision,
+                block,
+                start,
+                end,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard status == StorageStatus.ok, written == count else { return nil }
+        return values.map {
+            NSRange(
+                location: Int($0.start_utf16),
+                length: Int($0.end_utf16 - $0.start_utf16)
+            )
+        }
+    }
+
+    /// 换一份查询。空串留下一份 0 个匹配的状态；`nil` 收掉搜索与高亮。
+    ///
+    /// 不带 Revision：查询与源码正交，一次外部重载不该把用户刚敲的字丢掉。
+    @discardableResult
+    func setSearchQuery(_ query: String?) -> Bool {
+        guard let query else {
+            return yu_storage_session_set_search_query(handle, nil, 0) == StorageStatus.ok
+        }
+        var bytes = Array(query.utf8)
+        if bytes.isEmpty {
+            // 空串与「收掉」是两件事，所以不能走上面那一支。给一个非 null 的
+            // 指针加 0 长度。
+            return bytes.withUnsafeBufferPointer { buffer in
+                yu_storage_session_set_search_query(handle, buffer.baseAddress, 0)
+            } == StorageStatus.ok
+        }
+        return bytes.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_set_search_query(handle, buffer.baseAddress, buffer.count)
+        } == StorageStatus.ok
+    }
+
+    /// 当前查询的全部匹配，按文档顺序。与大纲同一个两遍协议。
+    var searchMatchesIfAvailable: [NativeSearchMatch]? {
+        let revision = state.revision
+        var count = 0
+        let countStatus = yu_storage_session_search_matches(handle, revision, nil, 0, &count)
+        guard countStatus == StorageStatus.ok else { return nil }
+        guard count > 0 else { return [] }
+
+        var values = Array(repeating: YuStorageSearchMatch(), count: count)
+        var written = 0
+        let status = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_search_matches(
+                handle,
+                revision,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard status == StorageStatus.ok, written == count else { return nil }
+        return values.map(NativeSearchMatch.init)
     }
 
     func accessibilityLineRange(

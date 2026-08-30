@@ -45,6 +45,7 @@ typeset -A checks=(
     macos-table-resize-coordinator      Fixtures/block-projection.md
     macos-task-checkbox                 Fixtures/render-tasks.md
     outline-panel                       Fixtures/outline.md
+    search-panel                        Fixtures/search.md
     selection                           Fixtures/sample.md
     shaped-projection-hit-test          Fixtures/block-projection.md
     shaped-vertical                     Fixtures/block-projection.md
@@ -76,7 +77,9 @@ print -r -- "全部 ${#checks} 个 self-check 通过"
 # 的 NSWindow 与 Metal surface 才会产生「已提交的帧」，headless 覆盖不到
 # 「屏幕上那一帧还算不算数」这个判断。它还压着大纲面板导航之后视口真的滚了
 # ——headless 那边没有 scroll view，`revealCaretIfNeeded` 一进门就返回。
-# 改动帧调度或大纲面板后必须在本地跑一次：
+# 它还压着搜索高亮真的进了屏幕上那一帧——headless 那边没有 surface，
+# 场景根本不提交，`search_decoration_count` 无从谈起。
+# 改动帧调度、大纲面板或搜索后必须在本地跑一次：
 #   "$binary" --launch-window-self-check Fixtures/outline.md
 # fixture 必须有一条落在首屏之外的标题（outline.md 有），否则「选中之后滚了」
 # 这一条会以「视口没有滚动」假红。

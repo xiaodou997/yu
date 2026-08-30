@@ -482,6 +482,11 @@ pub struct YuStorageMacosRenderHostSnapshot {
     /// the submitted surface proves equivalent selection/caret coverage.
     pub selection_decoration_count: u64,
     pub caret_decoration_count: u64,
+    /// 这一帧画了几处搜索命中底色（含「当前命中」那一处）。
+    ///
+    /// 它是**搜索高亮的判据**：真实窗口里唯一能证明「改了查询，画面真的跟着
+    /// 变了」的量，而它来自场景，不来自搜索自己那条路。
+    pub search_decoration_count: u64,
     /// 当前可见范围内还有未落定的图片或内嵌资源，需要再提交一次去收割 worker
     /// 的结果。这个判断此前在平台侧，要三次纯查询往返才能得出。
     pub resource_refresh_pending: u8,
@@ -533,6 +538,8 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub submitted: u8,
     pub selection_decoration_count: u64,
     pub caret_decoration_count: u64,
+    /// 见 [`YuStorageMacosRenderHostSnapshot::search_decoration_count`]。
+    pub search_decoration_count: u64,
     /// 见 [`YuStorageMacosRenderHostSnapshot::resource_refresh_pending`]。
     pub resource_refresh_pending: u8,
     /// 这一帧渲染出来的文档总高度。可滚动范围必须以它为准——平台没有第二套
@@ -619,6 +626,47 @@ pub struct YuStorageOutlineItem {
     /// 标题正文：大纲上显示的就是这一段，不含任何结构标记。
     pub label_start_utf16: u64,
     pub label_end_utf16: u64,
+}
+
+/// 一处搜索命中。
+///
+/// `block` 与 `block_*_utf16` 是**为了让调用方能守住那条规则**：回报隐藏区间
+/// 的 FFI 只接受落在一个块里的请求，而结果面板上那一行（匹配所在的那一行）
+/// 未必与块边界对齐。有了块的区间，平台可以自己把行裁到块里，不必反过来问
+/// 「块边界在哪」——那是上一层的事。
+///
+/// 匹配跨块时 `block` 是**起点所在**的那一块。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageSearchMatch {
+    pub revision: u64,
+    pub block: u64,
+    pub start_utf16: u64,
+    pub end_utf16: u64,
+    pub block_start_utf16: u64,
+    pub block_end_utf16: u64,
+}
+
+/// 一段被装饰藏起来的 source，UTF-16。
+///
+/// # 为什么是「回报区间」而不是「把文字给你」
+///
+/// 面板上的一行文字要不带语法标记（`## **粗** 标题` 显示成 `粗 标题`）。
+/// 「哪几段被藏了」的唯一实现是 `DecorationSet`（不变量 D1），在 Rust 侧；
+/// 而画字的是 AppKit，在平台侧。把视觉文本拷过来是最直接的做法，但那会破
+/// C4「parser 不复制正文」与整套 range-backed 设计——FFI 上至今没有任何入口
+/// 交出正文字节，平台手上只有它自己的 canonical 镜像。
+///
+/// 所以交出的是**区间**：平台拿自己的镜像按这些区间减掉。跨边界的是
+/// 两个 `u64`，不是文本。
+///
+/// 区间升序、不重叠、不相邻——这不是这里另外整理出来的，是
+/// `DecorationSet::hidden_spans()` 本来就保证的形状（映射索引就建在它上面）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageHiddenSpan {
+    pub start_utf16: u64,
+    pub end_utf16: u64,
 }
 
 #[repr(C)]
@@ -936,6 +984,8 @@ impl MacosFrameTableResize {
 /// - `revision`：源码改变。
 /// - `composition_generation`：marked text 更新——它不推进 Revision。
 /// - `selection`：光标与选区装饰改变——它同样不推进 Revision。
+/// - `search_generation`：换了查询——同样不推进 Revision、不改几何、不改选区。
+///   「当前命中」换一个不用单列一项：那是从 `selection` 推出来的。
 /// - `table_resize`：拖动中的列宽覆盖——既不推进 Revision 也不改变几何。
 /// - `geometry`：字号、换行宽度、滚动、surface 尺寸与 backing scale。
 ///
@@ -948,6 +998,7 @@ struct MacosFrameKey {
     revision: u64,
     composition_generation: u64,
     selection: yu_editor::EditorSelection,
+    search_generation: u64,
     table_resize: Option<MacosFrameTableResize>,
     geometry: MacosFrameGeometry,
 }
@@ -974,6 +1025,7 @@ impl MacosFrameKey {
             revision: revision.get(),
             composition_generation: session.session.composition_generation(),
             selection: session.session.selection(),
+            search_generation: session.session.document().editor().search_generation(),
             table_resize,
             geometry,
         }
@@ -1422,6 +1474,158 @@ fn write_outline_items(
     // the native caller supplied writable storage for that many values.
     unsafe {
         ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
+    }
+    YU_STORAGE_OK
+}
+
+/// 一个块里被藏起来的 source 区间，裁到请求区间之后换成 UTF-16。
+///
+/// **判据的分工**：「藏对了没有」不在这里证——那是 `yu-decoration` 的线性
+/// 参照实现与 `extension_decorations.rs` 的 45 条压住的事。这个函数只做两件
+/// 事：裁剪与换算，它们各自的错法（漏掉半段、UTF-16 换错）由本文件末尾的
+/// 用例压住。
+fn block_hidden_spans_output(
+    session: &mut DocumentEditorSession,
+    block: usize,
+    request: TextRange,
+) -> Result<Vec<YuStorageHiddenSpan>, i32> {
+    let snapshot = session.snapshot();
+    let block_range = session
+        .document()
+        .editor()
+        .markdown()
+        .blocks()
+        .get(block)
+        .map(yu_markdown::Block::range)
+        .ok_or(YU_STORAGE_INVALID_SELECTION)?;
+    // 请求区间必须落在这个块里。跨块的问题会逼这一层去回答「块边界在哪」，
+    // 那是上一层的事；而放行的后果是**静默地少藏**——面板上那一行悄悄带回
+    // 语法标记，不报错。调用方跨块就自己按块问几次。
+    if request.start() < block_range.start() || request.end() > block_range.end() {
+        return Err(YU_STORAGE_INVALID_SELECTION);
+    }
+    // 规范装饰，**不带 active**：面板上的标签不能因为光标正好停在那个标题里
+    // 就突然长出 `**`。`block_decorations` 走的正是无露出的那条缓存路径，
+    // 带露出的是隔壁 `block_decorations_for_visual_state`。
+    let decorations = session.block_decorations(block).map_err(storage_status)?;
+    let mut spans = Vec::new();
+    for &(from, to) in decorations.set().hidden_spans() {
+        let start = from.max(request.start());
+        let end = to.min(request.end());
+        if start >= end {
+            continue;
+        }
+        let range = TextRange::new(start, end).ok_or(YU_STORAGE_EDITOR_ERROR)?;
+        let (start_utf16, end_utf16) = source_utf16_range(&snapshot, range)?;
+        spans.push(YuStorageHiddenSpan {
+            start_utf16,
+            end_utf16,
+        });
+    }
+    Ok(spans)
+}
+
+/// 一处匹配 → C ABI 的一条。位置换成 UTF-16，并带上它所在块的区间。
+fn search_match_output(
+    document: &yu_editor::EditorDocument,
+    snapshot: &TextSnapshot,
+    revision: u64,
+    hit: TextRange,
+) -> Result<YuStorageSearchMatch, i32> {
+    let (start_utf16, end_utf16) = source_utf16_range(snapshot, hit)?;
+    let block = document
+        .block_index_for_source(hit.start())
+        .ok_or(YU_STORAGE_EDITOR_ERROR)?;
+    let block_range = document
+        .markdown()
+        .blocks()
+        .get(block)
+        .map(yu_markdown::Block::range)
+        .ok_or(YU_STORAGE_EDITOR_ERROR)?;
+    let (block_start_utf16, block_end_utf16) = source_utf16_range(snapshot, block_range)?;
+    Ok(YuStorageSearchMatch {
+        revision,
+        block: u64::try_from(block).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
+        start_utf16,
+        end_utf16,
+        block_start_utf16,
+        block_end_utf16,
+    })
+}
+
+/// 两遍协议，与 `write_outline_items` 同一个形状：先全部转完再拷，转到一半
+/// 失败就拷了半份出去。
+fn write_search_matches(
+    document: &yu_editor::EditorDocument,
+    snapshot: &TextSnapshot,
+    revision: u64,
+    matches: &[TextRange],
+    output: *mut YuStorageSearchMatch,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` is a caller-owned output pointer checked above.
+    unsafe { *written = matches.len() };
+    if matches.is_empty() {
+        return YU_STORAGE_OK;
+    }
+    if output.is_null() {
+        return if capacity == 0 {
+            YU_STORAGE_OK
+        } else {
+            YU_STORAGE_NULL_POINTER
+        };
+    }
+    if capacity < matches.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    let mut converted = Vec::with_capacity(matches.len());
+    for hit in matches.iter().copied() {
+        match search_match_output(document, snapshot, revision, hit) {
+            Ok(entry) => converted.push(entry),
+            Err(status) => return status,
+        }
+    }
+    // SAFETY: capacity was checked against the number of converted matches,
+    // and the native caller supplied writable storage for that many values.
+    unsafe {
+        ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
+    }
+    YU_STORAGE_OK
+}
+
+/// 两遍协议，与 `write_outline_items` 同一个形状。
+fn write_hidden_spans(
+    spans: &[YuStorageHiddenSpan],
+    output: *mut YuStorageHiddenSpan,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` is a caller-owned output pointer checked above.
+    unsafe { *written = spans.len() };
+    if spans.is_empty() {
+        return YU_STORAGE_OK;
+    }
+    if output.is_null() {
+        return if capacity == 0 {
+            YU_STORAGE_OK
+        } else {
+            YU_STORAGE_NULL_POINTER
+        };
+    }
+    if capacity < spans.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: capacity was checked against the number of spans, and the native
+    // caller supplied writable storage for that many values.
+    unsafe {
+        ptr::copy_nonoverlapping(spans.as_ptr(), output, spans.len());
     }
     YU_STORAGE_OK
 }
@@ -4052,38 +4256,41 @@ fn macos_render_host_config(
             // （不变量 I5）。暗色模式需要平台把实际的 textBackgroundColor
             // 传进来，目前固定为白底。
             .with_background(Rgba8::white())
-            .with_editor_decorations(EditorDecorationStyle::new(
-                Rgba8::new(0, 122, 255, 97),
-                Rgba8::black(),
-                Rgba8::new(0, 122, 255, 255),
-                1.0,
-            )),
+            .with_editor_decorations(
+                EditorDecorationStyle::new(
+                    Rgba8::new(0, 122, 255, 97),
+                    Rgba8::black(),
+                    Rgba8::new(0, 122, 255, 255),
+                    1.0,
+                )
+                // 命中是淡黄、当前命中是橙——两者都要能和半透明的蓝色选区
+                // 叠在一起还分得清（选区画在它们上面）。
+                .with_search(Rgba8::new(255, 214, 10, 120), Rgba8::new(255, 149, 0, 140)),
+            ),
     )
 }
 
 #[cfg(target_os = "macos")]
-fn macos_editor_decoration_counts(scene: &yu_scene::Scene) -> Result<(u64, u64), i32> {
+fn macos_editor_decoration_counts(scene: &yu_scene::Scene) -> Result<(u64, u64, u64), i32> {
     let mut selection = 0_u64;
     let mut caret = 0_u64;
+    let mut search = 0_u64;
     for primitive in scene.primitives() {
         let Primitive::EditorDecoration(decoration) = primitive else {
             continue;
         };
-        match decoration.role() {
-            EditorDecorationPrimitiveRole::Selection => {
-                selection = selection
-                    .checked_add(1)
-                    .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-            }
+        let counter = match decoration.role() {
+            EditorDecorationPrimitiveRole::Selection => &mut selection,
             EditorDecorationPrimitiveRole::Caret
-            | EditorDecorationPrimitiveRole::CompositionCaret => {
-                caret = caret
-                    .checked_add(1)
-                    .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-            }
-        }
+            | EditorDecorationPrimitiveRole::CompositionCaret => &mut caret,
+            EditorDecorationPrimitiveRole::SearchMatch
+            | EditorDecorationPrimitiveRole::SearchCurrent => &mut search,
+        };
+        *counter = counter
+            .checked_add(1)
+            .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     }
-    Ok((selection, caret))
+    Ok((selection, caret, search))
 }
 
 #[cfg(target_os = "macos")]
@@ -4104,7 +4311,7 @@ fn macos_render_host_snapshot(
         .frame_revision()
         .map_or(u64::MAX, |revision| revision.get());
     let frame_serial = state.host.frame_serial().unwrap_or(u64::MAX);
-    let (selection_decoration_count, caret_decoration_count) =
+    let (selection_decoration_count, caret_decoration_count, search_decoration_count) =
         macos_editor_decoration_counts(frame.scene().scene())?;
     Ok(YuStorageMacosRenderHostSnapshot {
         revision: publication.revision().get(),
@@ -4132,6 +4339,7 @@ fn macos_render_host_snapshot(
         published: 1,
         selection_decoration_count,
         caret_decoration_count,
+        search_decoration_count,
         // 调用方在离开 host 借用之后填入；这里没有 session 可查。
         resource_refresh_pending: 0,
     })
@@ -4731,6 +4939,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 submitted: 1,
                 selection_decoration_count: host_snapshot.selection_decoration_count,
                 caret_decoration_count: host_snapshot.caret_decoration_count,
+                search_decoration_count: host_snapshot.search_decoration_count,
                 resource_refresh_pending: host_snapshot.resource_refresh_pending,
                 content_height: host_snapshot.content_height,
             };
@@ -5089,6 +5298,126 @@ pub unsafe extern "C" fn yu_storage_session_outline_items(
         &snapshot,
         outline.revision().get(),
         outline.items(),
+        output,
+        capacity,
+        written,
+    )
+}
+
+/// 一个块里被藏起来的 source 区间，裁到 `[start_utf16, end_utf16)` 之内。
+///
+/// 平台侧拿自己的 canonical 镜像**减掉**这些区间，就得到不带语法标记的那行
+/// 文字。跨边界的是区间，不是文本（见 [`YuStorageHiddenSpan`]）。
+///
+/// 两遍协议：`output` 传 null（`capacity` 为 0）时只把条数写进 `written`。
+///
+/// 请求区间必须整个落在这个块里。跨块的一行（搜索结果那种）要按块问几次：
+/// 让这一层去回答「块边界在哪」是把上一层的职责搬下来。
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable spans when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_block_hidden_spans(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    block: u64,
+    start_utf16: u64,
+    end_utf16: u64,
+    output: *mut YuStorageHiddenSpan,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let Ok(block) = usize::try_from(block) else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let request = match source_range_from_ffi(&session.session, start_utf16, end_utf16) {
+        Ok(range) => range,
+        Err(status) => return status,
+    };
+    match block_hidden_spans_output(&mut session.session, block, request) {
+        Ok(spans) => write_hidden_spans(&spans, output, capacity, written),
+        Err(status) => status,
+    }
+}
+
+/// 换一份搜索查询，立刻在当前这一版源码上扫出全部匹配。
+///
+/// 空查询留下一份 0 个匹配的状态（面板要靠它显示「没有结果」）；
+/// `text` 传 null、`text_length` 传 0 表示**收掉搜索**，高亮一并消失。
+///
+/// **不校验 Revision。** 查询是与源码正交的一件事：文档在这一刻恰好被外部
+/// 改动重载过，正确的行为是在新源码上重扫，而不是把用户刚敲的查询丢掉。
+///
+/// # Safety
+/// `session` must be a live handle. `text` must point at `text_length`
+/// readable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_search_query(
+    session: *mut YuStorageSession,
+    text: *const u8,
+    text_length: usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if text.is_null() && text_length == 0 {
+        session.session.document_mut().editor_mut().clear_search();
+        return YU_STORAGE_OK;
+    }
+    let query = match read_utf8(text, text_length) {
+        Ok(query) => query,
+        Err(status) => return status,
+    };
+    session
+        .session
+        .document_mut()
+        .editor_mut()
+        .set_search_query(query);
+    YU_STORAGE_OK
+}
+
+/// 拷出当前查询在这一版源码上的全部匹配，按文档顺序，互不重叠。
+///
+/// 两遍协议：`output` 传 null（`capacity` 为 0）时只把条数写进 `written`。
+/// 没有搜索时条数是 0。
+///
+/// **「跳到下一个」不在这里。** 它是一次导航，而导航只能有一个实现：平台拿
+/// 这个列表挑出光标之后的那一条，再走已有的
+/// `yu_storage_session_set_selection_endpoints`。另开一个入口会立刻产生第二个
+/// 「怎么跳到一个源码位置」的答案。
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable matches when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_search_matches(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut YuStorageSearchMatch,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let editor = session.session.document().editor();
+    let snapshot = session.session.snapshot();
+    let matches = editor.search().map_or(&[][..], |state| state.matches());
+    write_search_matches(
+        editor,
+        &snapshot,
+        expected_revision,
+        matches,
         output,
         capacity,
         written,
@@ -6296,6 +6625,26 @@ mod tests {
         let moved = capture(geometry);
         assert_eq!(moved.revision, baseline.revision, "选区变化不推进 Revision");
         assert_ne!(baseline, moved, "光标移动必须让帧身份改变");
+
+        // 换查询同样不推进 Revision、不改几何、不改选区。少了这一项，在搜索
+        // 框里打字画面会一动不动——不报错、不 panic。
+        let query = b"a";
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query(raw, query.as_ptr(), query.len()) },
+            YU_STORAGE_OK
+        );
+        let searched = capture(geometry);
+        assert_eq!(searched.revision, moved.revision, "换查询不推进 Revision");
+        assert_eq!(searched.selection, moved.selection, "换查询不改变选区");
+        assert_eq!(searched.geometry, moved.geometry, "换查询不改变几何");
+        assert_ne!(moved, searched, "换查询必须让帧身份改变");
+
+        // 收掉搜索也是一次变化：高亮要消失。
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query(raw, ptr::null(), 0) },
+            YU_STORAGE_OK
+        );
+        assert_ne!(searched, capture(geometry), "收掉搜索必须让帧身份改变");
 
         // 拖动列分隔线既不推进 Revision 也不改变几何。
         let hit =
@@ -8054,6 +8403,309 @@ mod tests {
             unsafe { yu_storage_session_outline_items(raw, 1, ptr::null_mut(), 0, &mut stale) },
             YU_STORAGE_STALE_REVISION
         );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// 回报区间的 FFI：裁剪、UTF-16 换算、光标露出不参与。
+    ///
+    /// **这里不证「藏对了没有」**——那是 `yu-decoration/src/hidden.rs` 的线性
+    /// 参照与 `extension_decorations.rs` 那 45 条压住的事，再证一遍是把同一件
+    /// 事写两份。这条用例只压这个函数自己新加的两步：把区间裁到请求范围里，
+    /// 和把字节换成 UTF-16。
+    ///
+    /// 语料里的 🙂 是特意放的：它在字节里占 4 个、在 UTF-16 里占 2 个，所以
+    /// 「报了字节偏移」与「报了 UTF-16 偏移」给出两组不同的数字。
+    #[test]
+    fn ffi_block_hidden_spans_clip_and_ignore_the_caret() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-hidden-{id}.md"));
+        let source = "# 🙂 **粗** 标题\n\n段落\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        // 标题块是 UTF-16 的 0..14（含行尾换行），字节是 0..22——两组数字不
+        // 一样，正是要压的。
+        let query = |from: u64, to: u64| -> Result<Vec<YuStorageHiddenSpan>, i32> {
+            let mut count = 0;
+            let status = unsafe {
+                yu_storage_session_block_hidden_spans(
+                    raw,
+                    0,
+                    0,
+                    from,
+                    to,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            };
+            if status != YU_STORAGE_OK {
+                return Err(status);
+            }
+            let mut spans = vec![YuStorageHiddenSpan::default(); count];
+            let mut written = 0;
+            let status = unsafe {
+                yu_storage_session_block_hidden_spans(
+                    raw,
+                    0,
+                    0,
+                    from,
+                    to,
+                    spans.as_mut_ptr(),
+                    spans.len(),
+                    &mut written,
+                )
+            };
+            if status != YU_STORAGE_OK {
+                return Err(status);
+            }
+            assert_eq!(written, count, "两遍给出的条数必须一致");
+            Ok(spans)
+        };
+
+        let span = |from: u64, to: u64| YuStorageHiddenSpan {
+            start_utf16: from,
+            end_utf16: to,
+        };
+
+        // 整块：`# ` 与两个 `**`。字节偏移会给出 (0,2)/(7,9)/(12,14)。
+        assert_eq!(
+            query(0, 13).expect("整块"),
+            vec![span(0, 2), span(5, 7), span(8, 10)]
+        );
+
+        // 只问正文那一段：`# ` 整条落在请求之外，不能出现。
+        assert_eq!(query(2, 13).expect("正文"), vec![span(5, 7), span(8, 10)]);
+
+        // 请求切在一条隐藏区间中间：裁一半，不是整条留下也不是整条丢掉。
+        assert_eq!(query(6, 13).expect("裁一半"), vec![span(6, 7), span(8, 10)]);
+
+        // 空请求什么也不藏。
+        assert_eq!(query(6, 6).expect("空请求"), vec![]);
+
+        // 把光标放进 `**粗**` 里——编辑器里那两个 `**` 会露出来，但**面板上的
+        // 标签不能跟着变**。走的必须是规范装饰那条路。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    7,
+                    7,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            query(0, 13).expect("光标在标题里"),
+            vec![span(0, 2), span(5, 7), span(8, 10)],
+            "光标露出不能影响回报的区间"
+        );
+
+        // 跨出块边界要明确拒绝。放行的后果是静默地少藏——面板上那一行悄悄
+        // 带回语法标记，不报错。
+        assert_eq!(query(0, 15), Err(YU_STORAGE_INVALID_SELECTION), "越过块尾");
+        assert_eq!(
+            query(14, 18),
+            Err(YU_STORAGE_INVALID_SELECTION),
+            "整个落在下一个块里"
+        );
+
+        // 数组小了要拒绝，不能拷半份出去。
+        let mut short = vec![YuStorageHiddenSpan::default(); 2];
+        let mut short_written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_block_hidden_spans(
+                    raw,
+                    0,
+                    0,
+                    0,
+                    13,
+                    short.as_mut_ptr(),
+                    short.len(),
+                    &mut short_written,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+
+        // 块下标越界、Revision 失配。
+        //
+        // 这里特意问的是**最后一个块自己的区间**（`段落` 是 UTF-16 的 15..18）。
+        // 拿 0..0 去问是压不住这一条的：那个区间对任何块都跨界，于是上面那道
+        // 「请求要落在块里」的门先挡下来，这道门有没有都一样绿。两道门挡同一
+        // 件事时，里面那道往往没有自己的用例。
+        let mut count = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_block_hidden_spans(
+                    raw,
+                    0,
+                    99,
+                    15,
+                    18,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_block_hidden_spans(
+                    raw,
+                    1,
+                    0,
+                    0,
+                    13,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// 搜索跨 C ABI：两遍协议、UTF-16、块下标与块区间、编辑之后重扫。
+    ///
+    /// 「匹配找得对不对」在 `yu-editor::search` 的用例里；这里压的是 ABI 那
+    /// 一层：位置换算，以及**块的区间**——面板要靠它把一行裁进块里才能去问
+    /// 隐藏区间，报错了会静默地少剥标记。
+    #[test]
+    fn ffi_search_matches_carry_utf16_and_block_bounds() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-search-{id}.md"));
+        // 🙂 让字节偏移与 UTF-16 偏移分开：`目标` 在字节里从 9 起，在 UTF-16
+        // 里从 5 起。
+        let source = "# 🙂 目标\n\n段落里也有目标。\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let matches = |revision: u64| -> Result<Vec<YuStorageSearchMatch>, i32> {
+            let mut count = 0;
+            let status = unsafe {
+                yu_storage_session_search_matches(raw, revision, ptr::null_mut(), 0, &mut count)
+            };
+            if status != YU_STORAGE_OK {
+                return Err(status);
+            }
+            let mut values = vec![YuStorageSearchMatch::default(); count];
+            let mut written = 0;
+            let status = unsafe {
+                yu_storage_session_search_matches(
+                    raw,
+                    revision,
+                    values.as_mut_ptr(),
+                    values.len(),
+                    &mut written,
+                )
+            };
+            if status != YU_STORAGE_OK {
+                return Err(status);
+            }
+            assert_eq!(written, count, "两遍给出的条数必须一致");
+            Ok(values)
+        };
+
+        // 还没有查询：0 条，不是错误。
+        assert_eq!(matches(0).expect("没有查询"), vec![]);
+
+        let query = "目标".as_bytes();
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query(raw, query.as_ptr(), query.len()) },
+            YU_STORAGE_OK
+        );
+        let hits = matches(0).expect("两处命中");
+        assert_eq!(hits.len(), 2);
+
+        // 位置是 UTF-16：标题里的 `目标` 从 5 起（字节是 9）。
+        assert_eq!((hits[0].start_utf16, hits[0].end_utf16), (5, 7));
+        assert_eq!(hits[0].block, 0);
+        assert_eq!(
+            (hits[0].block_start_utf16, hits[0].block_end_utf16),
+            (0, 8),
+            "标题块含行尾换行"
+        );
+
+        // 第二处在段落块里，块下标与块区间都要跟着走。
+        assert!(hits[1].block > hits[0].block, "第二处在后面的块里");
+        assert!(
+            hits[1].block_start_utf16 <= hits[1].start_utf16
+                && hits[1].end_utf16 <= hits[1].block_end_utf16,
+            "匹配必须落在它自己报的那个块里"
+        );
+
+        // 数组小了要拒绝，不能拷半份出去。
+        let mut short = vec![YuStorageSearchMatch::default(); 1];
+        let mut short_written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_search_matches(
+                    raw,
+                    0,
+                    short.as_mut_ptr(),
+                    short.len(),
+                    &mut short_written,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+
+        // 编辑之后必须重扫：在文首插入一个字符会把每一处命中都推后。
+        let insert = "X".as_bytes();
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    0,
+                    0,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_insert_text(raw, 0, insert.as_ptr(), insert.len(), &mut result)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(matches(0), Err(YU_STORAGE_STALE_REVISION), "旧 Revision");
+        let shifted = matches(result.revision).expect("编辑之后");
+        assert_eq!(shifted.len(), 2, "编辑没有丢掉命中");
+        assert_eq!(
+            (shifted[0].start_utf16, shifted[0].end_utf16),
+            (6, 8),
+            "插入一个字符必须把命中整体推后一位——不重扫的话它会停在旧位置"
+        );
+
+        // 收掉搜索。
+        assert_eq!(
+            unsafe { yu_storage_session_set_search_query(raw, ptr::null(), 0) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(matches(result.revision).expect("收掉之后"), vec![]);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

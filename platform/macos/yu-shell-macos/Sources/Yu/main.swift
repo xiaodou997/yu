@@ -54,6 +54,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--outline-panel-self-check")
    CommandLine.arguments.indices.contains(flag + 1) {
     runOutlinePanelSelfCheck(path: CommandLine.arguments[flag + 1])
 }
+if let flag = CommandLine.arguments.firstIndex(of: "--search-panel-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runSearchPanelSelfCheck(path: CommandLine.arguments[flag + 1])
+}
 if let flag = CommandLine.arguments.firstIndex(of: "--accessibility-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runAccessibilitySelfCheck(path: CommandLine.arguments[flag + 1])

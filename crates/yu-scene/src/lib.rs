@@ -339,6 +339,15 @@ pub enum EditorDecorationPrimitiveRole {
     Selection,
     Caret,
     CompositionCaret,
+    /// 一处搜索命中。
+    ///
+    /// 它与 `Selection` 同类，**不是 Decoration**：不变量 D1 管的是文字自己
+    /// 的视觉表现（藏语法、换控件、改字型），而这三个都是**盖在文字上、由
+    /// 非文档状态驱动的矩形**，不改任何字节的样式。装饰的三张表里也没有一张
+    /// 能表达「一段文字底下画一块颜色」。
+    SearchMatch,
+    /// 光标正落在上面的那一处命中。
+    SearchCurrent,
 }
 
 /// One source-backed selection or caret rectangle.

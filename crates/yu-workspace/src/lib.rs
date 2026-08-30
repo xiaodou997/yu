@@ -15,7 +15,7 @@ use yu_assets::{
     EmbeddedRenderPayload, EmbeddedRenderPublication, ImageIntrinsicPublication, ImageKey,
     ImagePublication,
 };
-use yu_core::{Revision, TextRange};
+use yu_core::{Revision, TextRange, VisualRange};
 use yu_editor::{
     Bias, BlockKind, BlockView, BlockWidget, CaretAffinity, CheckboxPlacement, EditorDocument,
     EditorDocumentError, ImageSpan, LayoutError, ShapingProvider, TableLayout, TableResizeCommit,
@@ -311,6 +311,8 @@ pub struct EditorDecorationStyle {
     caret: Rgba8,
     composition_caret: Rgba8,
     caret_width: f32,
+    search_match: Rgba8,
+    search_current: Rgba8,
 }
 
 impl EditorDecorationStyle {
@@ -326,7 +328,19 @@ impl EditorDecorationStyle {
             caret,
             composition_caret,
             caret_width,
+            // 不给搜索高亮编一个默认颜色：全透明等于「没配置就不画」，
+            // 而随手编一个会让平台忘了配也看不出来。
+            search_match: Rgba8::new(0, 0, 0, 0),
+            search_current: Rgba8::new(0, 0, 0, 0),
         }
+    }
+
+    /// 搜索命中与「当前命中」两种底色。
+    #[must_use]
+    pub const fn with_search(mut self, search_match: Rgba8, search_current: Rgba8) -> Self {
+        self.search_match = search_match;
+        self.search_current = search_current;
+        self
     }
 }
 
@@ -339,6 +353,163 @@ fn caret_line_height(layout: &BlockView, line: usize) -> f32 {
         .lines()
         .get(line)
         .map_or_else(|| layout.config().line_height(), |line| line.height())
+}
+
+/// 一段视觉区间在一个块里覆盖的那几行矩形。
+///
+/// 选区与搜索命中是这件事的**两个消费者**，形状完全一样：一段源码 → 视觉
+/// 区间 → 逐行按 cluster 收左右边界 → 一条矩形。抽出来是因为第二个消费者
+/// 到了；在那之前它只是选区那一段循环体，抽了也没多出唯一性。
+///
+/// 高度取**行盒自己的**高度，不是 `config().line_height()`。
+///
+/// 那个基准值只在 v1 里恰好对：标题把行高塞进了 config。v2 的行高住在行盒
+/// 里（`caret_line_height` 的文档写了这件事，caret 一直是对的），于是选区
+/// 与搜索底色在标题、在带 widget 的行上都会画得又矮又靠上——**不报错，只是
+/// 画在文字上方**。这是真实窗口截图抓出来的；在那之前没有任何断言压着它。
+fn append_visual_span_rects(
+    builder: &mut SceneBuilder,
+    layout: &BlockView,
+    block_y: f32,
+    layer_source: TextRange,
+    visual: VisualRange,
+    color: Rgba8,
+    role: EditorDecorationPrimitiveRole,
+) -> Result<(), ViewportSceneError> {
+    if visual.is_empty() {
+        return Ok(());
+    }
+    for line in layout.lines() {
+        let line_start = line.visual().start().max(visual.start());
+        let line_end = line.visual().end().min(visual.end());
+        if line_start >= line_end {
+            continue;
+        }
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        for cluster_index in line.cluster_range() {
+            let cluster = layout.clusters()[cluster_index];
+            if cluster.is_line_break()
+                || cluster.visual().end() <= line_start
+                || cluster.visual().start() >= line_end
+            {
+                continue;
+            }
+            left = left.min(cluster.x());
+            right = right.max(cluster.x() + cluster.width());
+        }
+        if left.is_finite() && right.is_finite() && right > left {
+            builder.editor_decoration(EditorDecorationPrimitive::new(
+                layer_source,
+                Rect::new(left, block_y + line.y(), right - left, line.height())?,
+                color,
+                role,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// 搜索命中的底色。
+///
+/// **这不是装饰**（不变量 D1 管的是文字自己的视觉表现）：它与选区同形状，
+/// 一段源码区间加一份 `BlockLayout` 直接产出场景图元。`DecorationCache` 与
+/// `DecorationSet` 只在坐标映射上被用到，一个字节都不用清。
+///
+/// 搜索底色分成前后两层，中间夹着选区。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchHighlightLayer {
+    /// 选区之下：其余命中。
+    UnderSelection,
+    /// 选区之上、caret 之下：当前命中。
+    OverSelection,
+}
+
+impl SearchHighlightLayer {
+    /// 这一层要不要画这个 role。`None` 表示这个 role 不归搜索管。
+    const fn wants(self, role: EditorDecorationPrimitiveRole) -> Option<bool> {
+        match (self, role) {
+            (Self::UnderSelection, EditorDecorationPrimitiveRole::SearchMatch)
+            | (Self::OverSelection, EditorDecorationPrimitiveRole::SearchCurrent) => Some(true),
+            (Self::UnderSelection, EditorDecorationPrimitiveRole::SearchCurrent)
+            | (Self::OverSelection, EditorDecorationPrimitiveRole::SearchMatch) => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// **分两层发，因为「当前命中」按定义就是选区那一段。**
+///
+/// 普通命中排在选区**之前**：选区是半透明的蓝，压上去两者都还看得见。
+/// 而当前命中排在选区**之后**——把它画在选区下面，半透明的蓝会把橙色调成
+/// 一块说不清的灰（实测 `(255,184,85)` 叠 `(0,122,255,97)` 得到
+/// `(158,160,150)`）。这是真实窗口截图抓出来的：所有断言都绿，画面只是脏。
+/// 它仍然排在 caret **之前**，caret 是最后一层。
+///
+/// **IME 组字期间整个跳过**：那时块的视觉字节流带着 preedit 覆盖层，匹配是
+/// 按 canonical 源码算的，两者对不上。少画几个框好过画在错的位置上。
+fn append_search_highlights(
+    builder: &mut SceneBuilder,
+    document: &EditorDocument,
+    input: &ViewportSceneInput,
+    layouts: &[BlockView],
+    style: EditorDecorationStyle,
+    layer: SearchHighlightLayer,
+) -> Result<(), ViewportSceneError> {
+    if document.composition().is_some() {
+        return Ok(());
+    }
+    let Some(search) = document.search() else {
+        return Ok(());
+    };
+    if search.is_empty() {
+        return Ok(());
+    }
+    let current = search.current(document.selection().ordered_range());
+    for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
+        let block = geometry.source();
+        // 匹配按文档顺序，二分给出「起点 < 块尾」的上界；跨进这个块的那一条
+        // 起点可能更靠前，所以下界给不出来，从头过滤。与
+        // `DecorationSet::in_range` 同一个理由。
+        let upper = search
+            .matches()
+            .partition_point(|hit| hit.start() < block.end());
+        for (index, hit) in search.matches()[..upper].iter().copied().enumerate() {
+            let start = hit.start().max(block.start());
+            let end = hit.end().min(block.end());
+            if start >= end {
+                continue;
+            }
+            let source = TextRange::new(start, end).expect("ordered search intersection");
+            let visual_start = layout
+                .visual()
+                .source_to_visual(start, Bias::Before)
+                .map_err(EditorDocumentError::from)?;
+            let visual_end = layout
+                .visual()
+                .source_to_visual(end, Bias::After)
+                .map_err(EditorDocumentError::from)?;
+            let Some(visual) = VisualRange::new(visual_start, visual_end) else {
+                continue;
+            };
+            let (color, role) = if current == Some(index) {
+                (
+                    style.search_current,
+                    EditorDecorationPrimitiveRole::SearchCurrent,
+                )
+            } else {
+                (
+                    style.search_match,
+                    EditorDecorationPrimitiveRole::SearchMatch,
+                )
+            };
+            if layer.wants(role) != Some(true) {
+                continue;
+            }
+            append_visual_span_rects(builder, layout, geometry.y(), source, visual, color, role)?;
+        }
+    }
+    Ok(())
 }
 
 fn append_editor_decorations(
@@ -380,6 +551,16 @@ fn append_editor_decorations(
         ))?;
         return Ok(());
     }
+
+    // 其余命中在选区之下。
+    append_search_highlights(
+        builder,
+        document,
+        input,
+        layouts,
+        style,
+        SearchHighlightLayer::UnderSelection,
+    )?;
 
     let mut caret = None;
     for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
@@ -455,43 +636,30 @@ fn append_editor_decorations(
             )
         };
 
-        if visual_start >= visual_end {
-            continue;
-        }
-        for line in layout.lines() {
-            let line_start = line.visual().start().max(visual_start);
-            let line_end = line.visual().end().min(visual_end);
-            if line_start >= line_end {
-                continue;
-            }
-            let mut left = f32::INFINITY;
-            let mut right = f32::NEG_INFINITY;
-            for cluster_index in line.cluster_range() {
-                let cluster = layout.clusters()[cluster_index];
-                if cluster.is_line_break()
-                    || cluster.visual().end() <= line_start
-                    || cluster.visual().start() >= line_end
-                {
-                    continue;
-                }
-                left = left.min(cluster.x());
-                right = right.max(cluster.x() + cluster.width());
-            }
-            if left.is_finite() && right.is_finite() && right > left {
-                builder.editor_decoration(EditorDecorationPrimitive::new(
-                    layer_source,
-                    Rect::new(
-                        left,
-                        geometry.y() + line.y(),
-                        right - left,
-                        layout.config().line_height(),
-                    )?,
-                    style.selection,
-                    EditorDecorationPrimitiveRole::Selection,
-                ))?;
-            }
+        // 起点在终点之后是「这个块里没有选区」，不是错误。
+        if let Some(visual) = VisualRange::new(visual_start, visual_end) {
+            append_visual_span_rects(
+                builder,
+                layout,
+                geometry.y(),
+                layer_source,
+                visual,
+                style.selection,
+                EditorDecorationPrimitiveRole::Selection,
+            )?;
         }
     }
+
+    // 当前命中在选区之上、caret 之下。**这个次序是这一层的唯一权威**——
+    // 把它拆到调用方去排，caret 就会被盖住（它在这个函数的末尾才发出）。
+    append_search_highlights(
+        builder,
+        document,
+        input,
+        layouts,
+        style,
+        SearchHighlightLayer::OverSelection,
+    )?;
 
     if let Some((source, caret, role, block_y, line_height)) = caret {
         let color = if role == EditorDecorationPrimitiveRole::CompositionCaret {
@@ -1572,6 +1740,8 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         ))?;
     }
     if let Some(style) = editor_decorations {
+        // 搜索底色的两层夹着选区，次序归 `append_editor_decorations` 排——
+        // caret 是它的末尾一层，拆出来排会把 caret 盖掉。
         append_editor_decorations(&mut builder, document, &input, &layouts, style)?;
     }
     Ok(ViewportSceneFrame {
@@ -3388,5 +3558,224 @@ mod tests {
             .filter(|primitive| matches!(primitive, Primitive::Glyph(_)))
             .count();
         assert!(glyph_count > 0, "scene 中没有任何 glyph primitive");
+    }
+
+    /// 搜索高亮真的进了场景，「当前命中」与其余分得开，跨块的命中两边都画。
+    ///
+    /// 判据来自**场景**，不来自 `SearchState`：后者是被测的那条路的上游，
+    /// 拿它当参照只能证明「我把它读出来了」。
+    #[test]
+    fn search_highlights_reach_the_scene_and_mark_the_current_match() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 400.0);
+        let source = "# alpha\n\nalpha and alpha\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+
+        let style = EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        )
+        .with_search(Rgba8::new(255, 214, 10, 120), Rgba8::new(255, 149, 0, 170));
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 400.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(style);
+
+        let roles = |document: &mut EditorDocument| -> Vec<EditorDecorationPrimitiveRole> {
+            let atlas = atlas_for_document(document, viewport, &shaper, font_size);
+            let mut plans = RenderPlanBuilder::new();
+            let frame =
+                assemble_viewport_render_frame(document, config, &shaper, &atlas, &mut plans)
+                    .expect("frame");
+            frame
+                .scene()
+                .scene()
+                .primitives()
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::EditorDecoration(decoration) => Some(decoration.role()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let count = |roles: &[EditorDecorationPrimitiveRole],
+                     role: EditorDecorationPrimitiveRole| {
+            roles.iter().filter(|found| **found == role).count()
+        };
+
+        // 没有查询：一个搜索矩形都不该有。
+        let baseline = roles(&mut document);
+        assert_eq!(
+            count(&baseline, EditorDecorationPrimitiveRole::SearchMatch),
+            0
+        );
+
+        document.set_search_query("alpha");
+        let searched = roles(&mut document);
+        assert_eq!(
+            count(&searched, EditorDecorationPrimitiveRole::SearchMatch),
+            3,
+            "标题一处、段落两处"
+        );
+        assert_eq!(
+            count(&searched, EditorDecorationPrimitiveRole::SearchCurrent),
+            0,
+            "光标没有落在任何一处命中上"
+        );
+
+        // 把选区放到段落里第二个 `alpha` 上——那一处变成「当前」，其余不变。
+        let second = source.rfind("alpha").expect("最后一处 alpha");
+        let snapshot = document.snapshot();
+        document
+            .set_selection(
+                EditorSelection::range(
+                    &snapshot,
+                    ByteOffset::new(second as u64),
+                    ByteOffset::new((second + "alpha".len()) as u64),
+                    CaretAffinity::Downstream,
+                )
+                .expect("selection"),
+            )
+            .expect("set selection");
+        let current = roles(&mut document);
+        assert_eq!(
+            count(&current, EditorDecorationPrimitiveRole::SearchCurrent),
+            1,
+            "选区恰好落在一处命中上，它必须与其余分得开"
+        );
+        assert_eq!(
+            count(&current, EditorDecorationPrimitiveRole::SearchMatch),
+            2,
+            "另外两处仍然是普通命中"
+        );
+
+        // IME 组字期间整个跳过：那时块的视觉字节流带着 preedit 覆盖层，而匹配
+        // 是按 canonical 源码算的。少画几个框好过画在错的位置上。
+        document
+            .begin_composition(
+                TextRange::empty(ByteOffset::new(9)),
+                "ぁ",
+                yu_core::Utf16Range::new(
+                    yu_core::Utf16Offset::new(1),
+                    yu_core::Utf16Offset::new(1),
+                )
+                .expect("composition selection"),
+            )
+            .expect("begin composition");
+        let composing = roles(&mut document);
+        assert_eq!(
+            count(&composing, EditorDecorationPrimitiveRole::SearchMatch),
+            0,
+            "组字期间不该画搜索高亮"
+        );
+        assert!(document.cancel_composition(), "取消组字");
+
+        // **次序**：其余命中在选区之下，当前命中在选区之上、caret 之下。
+        // 画反了不报错，只是当前那一处被半透明的选区调成一块脏灰——所以这条
+        // 断言落在图元的先后上，那正是被改的那件事。
+        let order = |roles: &[EditorDecorationPrimitiveRole],
+                     role: EditorDecorationPrimitiveRole| {
+            roles.iter().position(|found| *found == role)
+        };
+        let selection_at = order(&current, EditorDecorationPrimitiveRole::Selection)
+            .expect("当前命中那一段是选中的，必须有选区图元");
+        let match_at =
+            order(&current, EditorDecorationPrimitiveRole::SearchMatch).expect("其余命中");
+        let current_at =
+            order(&current, EditorDecorationPrimitiveRole::SearchCurrent).expect("当前命中");
+        let caret_at = order(&current, EditorDecorationPrimitiveRole::Caret).expect("caret");
+        assert!(match_at < selection_at, "其余命中必须画在选区之下");
+        assert!(current_at > selection_at, "当前命中必须画在选区之上");
+        assert!(
+            current_at < caret_at,
+            "caret 必须是最后一层，不能被底色盖住"
+        );
+
+        // 矩形的**高度**必须是行盒自己的高度，不是基准行高。标题那一行更高，
+        // 拿基准值会画出一条又矮又靠上的底色——不报错，只是没盖在字上。
+        // 这一条是真实窗口截图抓出来的；在那之前选区也一直这么画，没有断言。
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &document.snapshot(),
+                    ByteOffset::new(0),
+                    CaretAffinity::Downstream,
+                )
+                .expect("caret"),
+            )
+            .expect("set selection");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let mut plans = RenderPlanBuilder::new();
+        let frame =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("frame");
+        let heading_line_height = document
+            .block_layout_for_visual_state_with_shaper(
+                0,
+                document.viewport_config().layout(),
+                &shaper,
+            )
+            .expect("heading layout")
+            .lines()
+            .first()
+            .expect("heading has a line")
+            .height();
+        let base_line_height = document.viewport_config().layout().line_height();
+        assert!(
+            heading_line_height > base_line_height,
+            "标题那一行必须比基准行高更高，否则这一条压不住任何东西：\
+             {heading_line_height} vs {base_line_height}"
+        );
+        let heading_highlight = frame
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::EditorDecoration(decoration)
+                    if decoration.role() == EditorDecorationPrimitiveRole::SearchMatch
+                        || decoration.role() == EditorDecorationPrimitiveRole::SearchCurrent =>
+                {
+                    Some(*decoration)
+                }
+                _ => None,
+            })
+            .min_by(|a, b| {
+                a.bounds()
+                    .y()
+                    .partial_cmp(&b.bounds().y())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("标题那一处高亮");
+        assert!(
+            (heading_highlight.bounds().height() - heading_line_height).abs() < 0.01,
+            "标题那一处底色高 {}，而那一行是 {heading_line_height}",
+            heading_highlight.bounds().height()
+        );
+
+        // 收掉搜索，矩形必须一起消失。
+        document.clear_search();
+        let cleared = roles(&mut document);
+        assert_eq!(
+            count(&cleared, EditorDecorationPrimitiveRole::SearchMatch),
+            0
+        );
+        assert_eq!(
+            count(&cleared, EditorDecorationPrimitiveRole::SearchCurrent),
+            0
+        );
     }
 }

@@ -739,7 +739,14 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
 
         let items = try unwrapSelfCheck(bridge.outlineItemsIfAvailable)
         precondition(items.count >= 6, "fixture 里的标题太少，压不住层级")
-        panel.reload(items: items, source: bridge.source as NSString)
+        let mirror = bridge.source as NSString
+        let hiddenFor: (NativeOutlineItem) -> [NSRange]? = { item in
+            bridge.blockHiddenSpans(block: item.block, in: item.labelRange)
+        }
+        panel.reload(items: items, source: mirror, hidden: hiddenFor)
+
+        // 0. 「拿镜像减区间」那一步的性质。
+        try checkPanelLabelProperties(items: items, mirror: mirror, hidden: hiddenFor)
 
         // 1. 扁平 → 嵌套。
         var visited: [NativeOutlineItem] = []
@@ -771,12 +778,16 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
             "前序遍历与文档顺序不一致"
         )
 
-        // label 是**源码**区间：这一刀不剥行内标记（触发条件是第三刀的搜索
-        // 面板）。唯一的纯呈现例外是 Setext 多行标题折成一行。
+        // label 是源码区间**减掉被藏的那几段**：第三刀开了回报区间的 FFI，
+        // 行内标记不再显示在面板上。唯一的纯呈现例外是 Setext 折成一行。
         let labels = panel.rootsForSelfCheck.flatMap(allLabelsForSelfCheck)
         precondition(
-            labels.contains("带 **行内标记** 的标题"),
-            "面板应当显示源码区间，实际标签: \(labels)"
+            labels.contains("带 行内标记 的标题"),
+            "强调的 `**` 没有被剥掉，实际标签: \(labels)"
+        )
+        precondition(
+            labels.contains("带 链接 的标题"),
+            "链接的方括号与目标没有被剥掉，实际标签: \(labels)"
         )
         precondition(labels.contains("收尾串"), "ATX 收尾串没有被树剥掉: \(labels)")
         precondition(labels.contains("多行 标题"), "Setext 多行标题没有折成一行: \(labels)")
@@ -838,7 +849,7 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
             },
             "这次编辑应当把每一条的 index 与 block 一起推后"
         )
-        panel.reload(items: refreshed, source: bridge.source as NSString)
+        panel.reload(items: refreshed, source: bridge.source as NSString, hidden: hiddenFor)
 
         precondition(
             panel.expandedIdentitiesForSelfCheck == expandedBefore,
@@ -861,8 +872,297 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
     }
 }
 
+func runSearchPanelSelfCheck(path: String) -> Never {
+    let fileManager = FileManager.default
+    let temporaryURL = fileManager.temporaryDirectory
+        .appendingPathComponent("yu-search-\(UUID().uuidString).md")
+    do {
+        try fileManager.copyItem(at: URL(fileURLWithPath: path), to: temporaryURL)
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+
+        let bridge = try StorageBridge(path: temporaryURL.path)
+        let textView = DocumentTextView(bridge: bridge)
+        let panel = SearchPanel()
+        // 产品里的接线是同一句（DocumentViewController.loadView）。被测的是
+        // `navigateToSearchMatch` 那一份实现，不是这里重写的一份。
+        panel.onSelect = { [weak textView] match in
+            textView?.navigateToSearchMatch(match)
+        }
+
+        let rowsFor: (String) throws -> [SearchResultRow] = { query in
+            precondition(bridge.setSearchQuery(query), "设查询失败")
+            let matches = try unwrapSelfCheck(bridge.searchMatchesIfAvailable)
+            let mirror = bridge.source as NSString
+            let rows = matches.map { match in
+                SearchResults.row(for: match, in: mirror) { block, range in
+                    bridge.blockHiddenSpans(block: block, in: range)
+                }
+            }
+            panel.reload(rows: rows, query: query)
+            return rows
+        }
+
+        // 1. 结果那一行**剥掉了语法标记**，而且没有越出它所在的块。
+        //
+        //    两条都不是自证的：前者的判据是「Markdown 的 `**` 是标记」这件
+        //    人知道的事，后者的判据是 FFI 报的块区间，与算上下文那条路分开。
+        let rows = try rowsFor("标记")
+        precondition(rows.count == 6, "fixture 里应当有六处命中，实际 \(rows.count)")
+        precondition(
+            panel.rowCountForSelfCheck == rows.count,
+            "面板画了 \(panel.rowCountForSelfCheck) 行"
+        )
+        let labels = rows.map(\.label)
+        precondition(
+            labels.allSatisfy { !$0.contains("**") },
+            "结果那一行还带着强调的 `**`: \(labels)"
+        )
+        precondition(
+            labels.contains("搜索的标记测试"),
+            "标题那一处没有剥掉 `**`: \(labels)"
+        )
+        precondition(
+            labels.contains("列表项里的标记"),
+            "列表项的 `- ` 没有被剥掉: \(labels)"
+        )
+        precondition(
+            labels.contains("引用块里的标记"),
+            "引用块的 `> ` 没有被剥掉: \(labels)"
+        )
+        // 同一行上的两处命中是两行结果，显示同一段上下文，但指向不同的位置。
+        // 「按行去重」会让第二处点不到——不报错，只是少一条。
+        let sameLine = rows.filter { $0.label.contains("第二个标记") }
+        precondition(sameLine.count == 2, "同一行上的两处命中应当是两行结果")
+        precondition(
+            sameLine[0].match.range != sameLine[1].match.range,
+            "两行结果指向了同一处命中"
+        )
+        precondition(
+            labels.allSatisfy { !$0.contains(where: \.isNewline) },
+            "结果列表上不能出现换行: \(labels)"
+        )
+        let mirror = bridge.source as NSString
+        for row in rows {
+            let context = SearchResults.contextRange(for: row.match, in: mirror)
+            precondition(
+                context.location >= row.match.blockRange.location
+                    && context.location + context.length
+                        <= row.match.blockRange.location + row.match.blockRange.length,
+                "上下文 \(context) 越出了块 \(row.match.blockRange)——"
+                    + "回报隐藏区间的 FFI 会拒绝它，于是那一行悄悄带回语法标记"
+            )
+            precondition(
+                NSIntersectionRange(context, row.match.range).length == row.match.range.length,
+                "上下文 \(context) 没有盖住命中 \(row.match.range)"
+            )
+        }
+        precondition(panel.countTextForSelfCheck == "6 处匹配", panel.countTextForSelfCheck)
+
+        // 1b. 块比行窄的时候必须裁。
+        //
+        //     **语料造不出这个情形**：块的边界今天是按行划的，所以一行必然落在
+        //     一个块里，删掉那个交集全部用例照样绿。但它不是死代码——理由写在
+        //     `SearchResults.contextRange` 上（AppKit 与块扫描器对「一行」的
+        //     定义不同；「块的边界还没合并」那道闸门一旦打开就更不成立）。
+        //     所以这里手造一条：一行完整，块只覆盖它的后半截。
+        var narrow = YuStorageSearchMatch()
+        narrow.block = 0
+        narrow.start_utf16 = 4
+        narrow.end_utf16 = 6
+        narrow.block_start_utf16 = 3
+        narrow.block_end_utf16 = 7
+        let clipped = SearchResults.contextRange(
+            for: NativeSearchMatch(narrow),
+            in: "abcdefghij" as NSString
+        )
+        precondition(
+            clipped == NSRange(location: 3, length: 4),
+            "块比行窄时没有裁：\(clipped)。不裁的后果是回报隐藏区间的 FFI 拒绝这个"
+                + "请求，那一行悄悄带回语法标记"
+        )
+
+        // 2. 点第 N 行 → 选区落在第 N 处命中。判据来自 bridge.selection，
+        //    与面板走的是两条路。选中而不是只放光标：Rust 侧的「当前命中」
+        //    要求选区恰好等于那一段。
+        for row in 0..<panel.rowCountForSelfCheck {
+            let entry = try unwrapSelfCheck(panel.rowForSelfCheck(row))
+            panel.clickRowForSelfCheck(row)
+            precondition(
+                bridge.selection.range == entry.match.range,
+                "点第 \(row) 行之后选区是 \(bridge.selection.range)，"
+                    + "而那一处命中在 \(entry.match.range)"
+            )
+            // 3. 「当前命中」由选区推出来，所以列表上高亮的必须是同一行。
+            panel.highlightRow(matching: bridge.selection.range)
+            precondition(
+                panel.selectedRowForSelfCheck == row,
+                "选区落在第 \(row) 处命中，列表上高亮的却是第 "
+                    + "\(panel.selectedRowForSelfCheck) 行"
+            )
+        }
+
+        // 4. 「下一个」环回：最后一处之后是第一处。这一条压的是环回那一支，
+        //    普通的「往后走一格」压不住它。
+        let matches = try unwrapSelfCheck(bridge.searchMatchesIfAvailable)
+        let last = try unwrapSelfCheck(matches.last)
+        textView.navigateToSearchMatch(last)
+        let wrapped = try unwrapSelfCheck(
+            SearchResults.next(after: bridge.selection.range, in: matches, forward: true)
+        )
+        precondition(wrapped.range == matches[0].range, "最后一处的下一个应当环回到第一处")
+        // 反向从第一处环回到最后一处。
+        textView.navigateToSearchMatch(matches[0])
+        let wrappedBack = try unwrapSelfCheck(
+            SearchResults.next(after: bridge.selection.range, in: matches, forward: false)
+        )
+        precondition(wrappedBack.range == last.range, "第一处的上一个应当环回到最后一处")
+
+        // 5. 选区离开任何命中之后，列表上不该还有高亮。
+        try bridge.setSelection(NSRange(location: 0, length: 0))
+        panel.highlightRow(matching: bridge.selection.range)
+        precondition(
+            panel.selectedRowForSelfCheck < 0,
+            "光标不在任何命中上，列表却还高亮着第 \(panel.selectedRowForSelfCheck) 行"
+        )
+
+        // 6. 编辑之后必须重扫。在**文首**插入会把每一处命中一起推后——在末尾
+        //    追加是压不住这一条的。
+        let before = try unwrapSelfCheck(bridge.searchMatchesIfAvailable)
+        let head = NSRange(location: 0, length: 0)
+        try bridge.setSelection(head)
+        textView.insertText("新", replacementRange: head)
+        let after = try unwrapSelfCheck(bridge.searchMatchesIfAvailable)
+        precondition(after.count == before.count, "编辑丢掉了命中")
+        precondition(
+            zip(before, after).allSatisfy { $0.range.location + 1 == $1.range.location },
+            "编辑之后命中没有整体推后——不重扫的话它们会停在旧位置"
+        )
+
+        // 7. 查不到东西是 0 行，不是错误。
+        let none = try rowsFor("这四个字一定不在里面")
+        precondition(none.isEmpty, "不该有匹配")
+        precondition(panel.rowCountForSelfCheck == 0, "面板没有清空")
+        precondition(panel.countTextForSelfCheck == "没有匹配", panel.countTextForSelfCheck)
+
+        print(
+            "Yu Search Panel self-check: matches=\(rows.count) "
+                + "labels=\(labels.count); stripping, block-clipped context, "
+                + "navigation, wrap-around and re-scan passed"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Search Panel self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 private func allLabelsForSelfCheck(_ node: OutlineNode) -> [String] {
     [node.label] + node.children.flatMap(allLabelsForSelfCheck)
+}
+
+/// 「拿镜像减区间」那一步的判据。
+///
+/// **「藏对了没有」不在这里证**——那是 `yu-decoration/src/hidden.rs` 的线性
+/// 参照实现与 `extension_decorations.rs` 那 45 条压住的事，Swift 侧再证一遍
+/// 只会得到一份自证的用例。这一层可能错的是别的：UTF-16 偏移、区间重叠、
+/// 逆序、越界。所以判据是**性质**，加上一组手造的畸形输入。
+///
+/// 也**不**拿「大纲面板与搜索面板显示同一个字符串」当判据——两边都从这一份
+/// 定义来，那同样是自证的。
+private func checkPanelLabelProperties(
+    items: [NativeOutlineItem],
+    mirror: NSString,
+    hidden: (NativeOutlineItem) -> [NSRange]?
+) throws {
+    var stripped = 0
+    for item in items {
+        let spans = try unwrapSelfCheck(hidden(item))
+        let raw = mirror.substring(with: item.labelRange)
+        let label = PanelLabel.stripping(spans, from: mirror, in: item.labelRange)
+
+        // 区间本身：升序、不重叠、不越界。FFI 承诺了这个形状，这里反过来核对。
+        precondition(
+            PanelLabel.isWellFormed(spans, within: item.labelRange),
+            "回报的区间不是升序不重叠的：\(spans) 不在 \(item.labelRange) 里"
+        )
+        // 长度：结果恰好少掉藏起来的那些字。少减/多减都在这一条下面。
+        let removed = spans.reduce(0) { $0 + $1.length }
+        precondition(
+            label.utf16.count == item.labelRange.length - removed,
+            "「\(label)」有 \(label.utf16.count) 个 UTF-16 单元，"
+                + "而 \(item.labelRange.length) 减去藏掉的 \(removed) 是 "
+                + "\(item.labelRange.length - removed)"
+        )
+        // 子序列：只允许**删**字节，不允许改写或换顺序。
+        precondition(
+            isSubsequenceForSelfCheck(label, of: raw),
+            "「\(label)」不是「\(raw)」的子序列"
+        )
+        // 拿不到区间（Revision 撞上刷新）时退回**显示源码**。空串会让面板上
+        // 那一行整条消失——不报错，只是空了。
+        if !raw.contains(where: \.isNewline) {
+            precondition(
+                OutlineTree.displayLabel(item.labelRange, in: mirror, hidden: nil) == raw,
+                "拿不到区间时应当显示源码「\(raw)」"
+            )
+        }
+        if removed > 0 { stripped += 1 }
+    }
+    precondition(stripped > 0, "fixture 里没有一条标题带行内标记，这几条压不住任何东西")
+
+    // 手造的畸形输入。它们不可能从 FFI 来（那边有自己的用例），但这一步是
+    // 公开的、两个面板共用，一个错的调用方不该换来一个谁也说不清的字符串。
+    let source = "abcdef" as NSString
+    let whole = NSRange(location: 0, length: 6)
+    precondition(PanelLabel.stripping([], from: source, in: whole) == "abcdef", "空区间")
+    precondition(
+        PanelLabel.stripping([NSRange(location: 0, length: 6)], from: source, in: whole) == "",
+        "整段被藏"
+    )
+    precondition(
+        PanelLabel.stripping(
+            [NSRange(location: 1, length: 2), NSRange(location: 4, length: 1)],
+            from: source,
+            in: whole
+        ) == "adf",
+        "两段各藏一截"
+    )
+    precondition(
+        PanelLabel.stripping([NSRange(location: 6, length: 0)], from: source, in: whole)
+            == "abcdef",
+        "空区间不藏任何东西"
+    )
+    // 下面四种都必须原样返回：显示源码是一件真事，按自相矛盾的区间去减不是。
+    for (name, bad) in [
+        ("逆序", [NSRange(location: 3, length: 1), NSRange(location: 1, length: 1)]),
+        ("重叠", [NSRange(location: 1, length: 3), NSRange(location: 2, length: 2)]),
+        ("越界", [NSRange(location: 4, length: 5)]),
+        ("负长度", [NSRange(location: 2, length: -1)]),
+    ] {
+        precondition(
+            PanelLabel.stripping(bad, from: source, in: whole) == "abcdef",
+            "\(name)的区间必须整段原样返回，实际得到"
+                + "「\(PanelLabel.stripping(bad, from: source, in: whole))」"
+        )
+    }
+    // 请求区间只覆盖一部分镜像时，藏的偏移是**绝对**的，不是相对起点的。
+    precondition(
+        PanelLabel.stripping(
+            [NSRange(location: 3, length: 1)],
+            from: source,
+            in: NSRange(location: 2, length: 4)
+        ) == "cef",
+        "区间偏移必须是镜像里的绝对位置"
+    )
+}
+
+private func isSubsequenceForSelfCheck(_ candidate: String, of source: String) -> Bool {
+    var remaining = Substring(source)
+    for character in candidate {
+        guard let index = remaining.firstIndex(of: character) else { return false }
+        remaining = remaining[remaining.index(after: index)...]
+    }
+    return true
 }
 
 func runAccessibilitySelfCheck(path: String) -> Never {
