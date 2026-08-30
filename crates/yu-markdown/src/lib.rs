@@ -1087,46 +1087,31 @@ pub fn list_marker(source: &TextSnapshot, block: Block) -> Option<ListMarker> {
 
 /// 标题的正文区间：不含结构标记的那一段。
 ///
-/// ATX 去掉行首的 `#` 前缀（连同它后面的空格），Setext 去掉**下划线那一
-/// 行**。两种拼法在 [`BlockKind::Heading`] 里是同一个变体，所以「正文在哪」
-/// 这个问题也只该有一个答案——导出与可访问性此前各写了一份，两份都只认
-/// ATX，于是 Setext 标题在大纲里会带着一行 `===`。
+/// ATX 去掉行首的 `#` 前缀（连同它后面的空格）与收尾的 ` ##`，Setext 去掉
+/// **下划线那一行**。两种拼法在 [`BlockKind::Heading`] 里是同一个变体，所以
+/// 「正文在哪」这个问题也只该有一个答案。
 ///
-/// 不是标题的块返回它自己的整段 range。
+/// **答案由树给，不在这里算。** 它与装饰要藏的那几段是同一件事的两面，一起
+/// 算在 [`extension::heading::anatomy`]；此前这里自己扫行，认得 ATX 前缀却
+/// 不认得收尾的 ` ##`——那条规则只写在 `yu-syntax` 的 `HeaderMark` 里。
+///
+/// 不是标题的块、以及没有语法树的文档（源码超过 4 GiB），返回块自己的整段
+/// range。
 #[must_use]
-pub fn heading_content_range(source: &TextSnapshot, block: Block) -> TextRange {
-    let BlockKind::Heading { level } = block.kind() else {
+pub fn heading_content_range(markdown: &MarkdownDocument, block: Block) -> TextRange {
+    if !matches!(block.kind(), BlockKind::Heading { .. }) {
+        return block.range();
+    }
+    let Some(tree) = markdown.tree() else {
         return block.range();
     };
-    let lines = block_line_ranges(source, block.range());
-    let Some(first) = lines.first().copied() else {
-        return block.range();
-    };
-    if let Some(prefix) = heading_prefix_range(source, first, level) {
-        return TextRange::new(prefix.end(), line_content_end(source, first))
-            .unwrap_or_else(|| block.range());
-    }
-    // Setext：正文是下划线那一行之前的全部，可能不止一行。
-    let content_end = lines
-        .iter()
-        .rev()
-        .nth(1)
-        .map_or_else(|| first.start(), |line| line_content_end(source, *line));
-    TextRange::new(first.start(), content_end).unwrap_or_else(|| block.range())
-}
-
-/// 一行去掉行尾换行符之后的终点。
-fn line_content_end(source: &TextSnapshot, line: TextRange) -> ByteOffset {
-    let Some(cursor) = SourceByteCursor::new(source, line) else {
-        return line.end();
-    };
-    let mut end = line.start();
-    for (position, byte) in cursor {
-        if !matches!(byte, b'\r' | b'\n') {
-            end = ByteOffset::try_from(position.saturating_add(1)).unwrap_or(end);
-        }
-    }
-    end
+    let cx = extension::BlockContext::for_block(
+        markdown.source(),
+        tree,
+        markdown.reference_definitions(),
+        block,
+    );
+    extension::heading::anatomy(&cx).map_or_else(|| block.range(), |anatomy| anatomy.content)
 }
 
 /// Returns parser-owned block syntax ranges that the visual projection may
@@ -2043,11 +2028,24 @@ mod tests {
             ("标题\n===\n", "标题"),
             ("多行\n标题\n---\n", "多行\n标题"),
             ("段落\n", "段落\n"),
+            // 收尾的 `#` 串是语法，不是正文（CommonMark 41–44）。这几条
+            // 此前全错：正文里带着 ` ##` 出去，而同一个块在编辑器里显示的
+            // 是 `a`——装饰问树，这里自己扫行，两个答案。
+            ("## a ##\n", "a"),
+            ("##### foo ##\n", "foo"),
+            ("# foo ##################################\n", "foo"),
+            ("### foo ###     \n", "foo"),
+            // 后面还有字就不是收尾串；`#` 前面没空格也不是。
+            ("### foo ### b\n", "foo ### b"),
+            ("# foo#\n", "foo#"),
+            // 整行都是 `#`：正文是空的，不是那几个 `#`。
+            ("###\n", ""),
+            ("#\n", ""),
         ] {
             let snapshot = TextBuffer::new(source).snapshot();
             let document = parse(&snapshot);
             let block = document.blocks().get(0).expect("至少有一个块");
-            let content = heading_content_range(&snapshot, block);
+            let content = heading_content_range(&document, block);
             assert_eq!(
                 &snapshot.as_str()[content.start().get() as usize..content.end().get() as usize],
                 expected,

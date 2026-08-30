@@ -40,14 +40,14 @@ impl Extension for Heading {
         let BlockKind::Heading { level } = cx.block().kind() else {
             return;
         };
-        let Some(node) = cx.block_node(is_heading) else {
+        let Some(anatomy) = anatomy(cx) else {
             return;
         };
 
         // 焦点块的结构标记整个露出来：光标在这一行时用户要能看见 `##`，也要
         // 能看见 `===`——否则他按退格会删掉一个他没看见的字符。
         if !cx.is_focus() {
-            for range in hidden_ranges(cx, node) {
+            for range in anatomy.hidden {
                 out.replace(range);
             }
         }
@@ -57,18 +57,43 @@ impl Extension for Heading {
     }
 }
 
-/// 标题里不进视觉文本的那几段。
-fn hidden_ranges(cx: &BlockContext<'_>, node: SyntaxNode<'_>) -> Vec<TextRange> {
+/// 一个标题在源码里的解剖：结构标记占哪几段，正文占哪一段。
+///
+/// **装饰要藏的，与大纲、导出、可访问性要读的，是同一件事的两面**——正文
+/// 就是节点范围减去 `hidden`，所以这里一次算出两者，谁也不可能与谁分叉。
+///
+/// 分叉过一次，而且三个消费者一起错：`heading_content_range` 曾经自己扫行，
+/// 认得 ATX 的 `#` 前缀却不认得收尾的 ` ##`（那条规则只写在
+/// `yu-syntax` 的 `HeaderMark` 里）。于是同一个 `## a ##`，编辑器里显示
+/// `a`，导出成 `<h2>a ##</h2>`，VoiceOver 读作「a ##」。不报错、不 panic，
+/// 三条都绿。
+pub(crate) struct HeadingAnatomy {
+    /// 正文：大纲显示的、导出进 `<h2>` 的、VoiceOver 读的那一段。
+    pub(crate) content: TextRange,
+    /// 不进视觉文本的那几段。
+    pub(crate) hidden: Vec<TextRange>,
+}
+
+/// 解剖这个块对应的标题节点，树里找不到标题节点时为 `None`。
+///
+/// **它只问树，不问 [`BlockKind`]**——两者不等价（`a\n===\nb` 在块序列里是
+/// 一个块，树里是 `SetextHeading1` 加一个 `Paragraph`），所以调用方要先自己
+/// 确认这个块真的是标题，理由见本模块「定义域为什么是 `BlockKind`」一节。
+pub(crate) fn anatomy(cx: &BlockContext<'_>) -> Option<HeadingAnatomy> {
+    let node = cx.block_node(is_heading)?;
     let mut marks = node
         .children()
         .filter(|child| child.kind() == NodeKind::HeaderMark);
-    let Some(first) = marks.next() else {
-        return Vec::new();
-    };
+    let first = marks.next()?;
 
     if is_setext(node.kind()) {
-        // 下划线那一行是 Setext 唯一的标记，它在**后面**。
-        return underline_range(cx, node, first).into_iter().collect();
+        // 下划线那一行是 Setext 唯一的标记，它在**后面**，正文是它之前的
+        // 全部（可能不止一行）。
+        let underline = underline_range(cx, node, first)?;
+        return Some(HeadingAnatomy {
+            content: TextRange::new(node.range().start(), underline.start())?,
+            hidden: vec![underline],
+        });
     }
 
     let mut hidden = Vec::new();
@@ -77,14 +102,18 @@ fn hidden_ranges(cx: &BlockContext<'_>, node: SyntaxNode<'_>) -> Vec<TextRange> 
         hidden.push(prefix);
     }
     // 收尾 `#` 连着它前面那个空格一起走。没有收尾标记的标题（绝大多数）
-    // 走不到这里。
+    // 正文一直到节点末尾。
+    let mut content_end = node.range().end();
     if let Some(closing) = marks.next() {
-        let content_end = cx.skip_spaces_back(closing.range().start());
+        content_end = cx.skip_spaces_back(closing.range().start());
         if let Some(suffix) = TextRange::new(content_end, node.range().end()) {
             hidden.push(suffix);
         }
     }
-    hidden
+    Some(HeadingAnatomy {
+        content: TextRange::new(content_start, content_end.max(content_start))?,
+        hidden,
+    })
 }
 
 /// `===` 那一行，连同它前面的换行符与行首缩进。
