@@ -153,6 +153,8 @@ enum {
 
 enum {
     YU_STORAGE_ACCESSIBILITY_PARENT_NONE = UINT32_MAX,
+    /* 大纲里没有上一级标题的那几条（文档的根级标题）。 */
+    YU_STORAGE_OUTLINE_PARENT_NONE = UINT32_MAX,
     YU_STORAGE_ACCESSIBILITY_FLAG_ORDERED = 1 << 0,
     YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE = 1 << 1,
     YU_STORAGE_ACCESSIBILITY_KIND_DOCUMENT = 1,
@@ -503,6 +505,26 @@ typedef struct YuStorageAccessibilityNodeV2 {
     uint64_t action_block;
 } YuStorageAccessibilityNodeV2;
 
+/* 大纲里的一条标题。与 YuStorageAccessibilityNodeV2 是并列的两份派生视图，
+ * 不是一份套着另一份：语义树是扁平的（每个块都挂在 Document 下），大纲的
+ * 全部内容恰恰是标题之间的层级。
+ *
+ * 导航不另开入口：拿 label_start_utf16 调
+ * yu_storage_session_set_selection_endpoints，再调
+ * yu_storage_session_macos_shaped_caret_scroll_request。 */
+typedef struct YuStorageOutlineItem {
+    uint64_t revision;
+    uint32_t index;
+    uint32_t parent;
+    uint8_t level;
+    uint8_t reserved[7];
+    uint64_t block;
+    uint64_t source_start_utf16;
+    uint64_t source_end_utf16;
+    uint64_t label_start_utf16;
+    uint64_t label_end_utf16;
+} YuStorageOutlineItem;
+
 typedef struct YuStorageCommandResult {
     uint64_t revision;
     uint64_t selection_start_utf16;
@@ -658,6 +680,10 @@ int32_t yu_storage_session_accessibility_snapshot(
 int32_t yu_storage_session_accessibility_semantic_nodes_v2(
     const YuStorageSession *session, uint64_t expected_revision,
     YuStorageAccessibilityNodeV2 *output, size_t capacity, size_t *written);
+/* 拷出这一版的大纲。两遍协议：output 传 NULL、capacity 传 0 时只回报条数。 */
+int32_t yu_storage_session_outline_items(
+    const YuStorageSession *session, uint64_t expected_revision,
+    YuStorageOutlineItem *output, size_t capacity, size_t *written);
 int32_t yu_storage_session_accessibility_line_range(
     const YuStorageSession *session, uint64_t expected_revision, uint64_t line,
     YuStorageAccessibilityRange *output);
