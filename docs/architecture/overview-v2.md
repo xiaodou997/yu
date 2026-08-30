@@ -2028,6 +2028,88 @@ Swift**（`projection_caret` / `projection_source_selection` /
 差距从 2.4 倍推到 2.6 倍。这笔钱值不值得付，是产品决定，不是顺手做完就算的
 事——所以这一刀停在 FFI，把决定留给下一刀。
 
+#### 第二刀：大纲面板
+
+决定已经拍了：**面板要做**，代价是上面那条未达成项继续往外走。实际数字比
+预估的高一点：**Swift 产品代码 4,810 → 5,276 行**（`SelfChecks.swift` 从
+905 涨到 1,068，同样不计），从 2.4 倍推到 **2.64 倍**。分布是
+`OutlinePanel.swift` 275、`DocumentWindow.swift` +106、`StorageBridge.swift`
++66、`DocumentTextView.swift` +15、`main.swift` +4。`DocumentWindow` 那 106
+里有约 25 行是真实窗口自检（与 `runFrameSchedulingSelfCheck` 同住，那一份
+按老规矩留在产品文件里）。
+
+##### 面板上只有三件事是真正的逻辑
+
+其余都是 AppKit 样板。三件事各自对应一条守护断言：
+
+1. **平表 → 树**。FFI 给的是带 `parent` 下标的平表，`NSOutlineView` 要
+   parent→children。挂错父亲**不报错、不 panic**，面板照样画得出来，只是
+   层级是错的——这是这个项目最危险的那种失败。
+2. **跨刷新的身份**。`NSOutlineView` 按对象身份记展开状态，而每次刷新都会
+   重建全部节点。身份是**从根到自己的 label 链**（同名兄弟按出现次序区
+   分），不是 `index` 也不是 `block`：在文档最前面插一条标题会把后面每一条
+   的 index 与 block 一起推后，按下标记的话展开状态会整体错位。
+3. **label 的折行**。见下面「显示源码区间」。
+
+##### 导航不另开 FFI
+
+`DocumentTextView::navigateToOutlineItem` 把光标放到 `label_range` 的起点，
+走的是 `setSelectedRange` 那条**已有**的路（落到
+`yu_storage_session_set_selection_endpoints`）；滚动由随之而来的
+`onCaretChange` 交给 `macosShapedCaretScrollRequest`，也就是
+`yu-editor::viewport` 那条路。**面板不自己算 y**——它手上只有 UTF-16 偏移，
+算 y 就要在平台侧复制一份排版，那正是 v2 要拆掉的东西。
+
+##### 判据不能来自被测的那条路
+
+「面板的条数与 FFI 一致」是自证的：面板本来就是照着那个数组画的。
+`--outline-panel-self-check`（headless，`NSOutlineView` 与
+`DocumentTextView` 一样不需要窗口也不需要 run loop）断的是另外四件事：
+
+1. **树的形状**反过来核对平表——每个孩子的 `parent` 等于父节点的 `index`、
+   根节点的 `parent` 必须是 `UInt32.max`、前序遍历恰好给出 0..n-1。「挂错
+   父亲」与「静默地把孩子提成根」都在这条下面。
+2. 点第 N 行之后**光标落在第 N 条标题的正文起点**，判据来自
+   `bridge.selection`，与面板走的是两条路。
+3. 那之后**滚动请求指向那一条的块**。这是两份派生视图的交叉核对：大纲报的
+   `block` 与 viewport 那条路报的 `block_index` 必须是同一个答案。
+4. 在**文档最前面**插一条标题（把每一条的 index 与 block 一起推后）之后
+   刷新，**展开状态与选中行不丢**。在末尾追加字符压不住这一条——那种编辑
+   谁都活得下来。
+
+headless 压不住的只有一条：**滚动真的发生了**。那里没有 scroll view，
+`revealCaretIfNeeded` 一进门就返回。它挂在
+`--launch-window-self-check`（`Fixtures/outline.md`）的第 6 步上，实测
+`0 → 867`。
+
+反向验证做了八个变异，全部变红：挂到上一条而不查 `parent`（1）、
+`displayLabel` 不折行（label 断言）、identity 改回按 index（4）、刷新时不
+恢复展开状态（4）、不恢复选中行（4）、导航落在块首而不是正文起点（2）、
+`OutlineItem::block` 加一（3，隔离出交叉核对那一条）、
+`revealCaretIfNeeded` 忽略 `needsScroll`（真实窗口那一条，选区仍然正确、
+只有滚动变红）。
+
+##### 显示源码区间：这一刀不剥，只折行
+
+`## **粗** 标题` 在面板上显示成 `**粗** 标题`，理由与触发条件见上面「已登
+记：面板上的标题带着行内标记，第三刀再剥」，这一刀没有改变那个判断。唯一
+的纯呈现例外是 **Setext 多行标题**：`多行\n标题\n===` 的 label 是
+`"多行\n标题"`，一行放不下两行字，Swift 侧折成一行。折行只动空白，不动
+任何标记。
+
+##### 顺带记下：约束给不出分栏的初始宽度
+
+`NSSplitView` 给 subview 0 加的 holding priority 压过 `.defaultLow` 的首选
+宽度约束，光靠约束面板会缩到 min。初始位置只能在 `viewDidAppear` 里显式
+`setPosition` 一次；min/max 仍由约束兜住，用户拖动照常。这条是真实窗口截图
+抓出来的——headless 与自动化断言全绿，面板只是「窄了 70 点」。
+
+##### 已登记的闸门没有动
+
+`> # 引用里`、`- # 列表里` 仍然产出 0 条大纲。`Fixtures/outline.md` 里留了
+一条 `> # 容器里的标题`，**没有**给它写断言——写了就等于把这个偏差焊死，
+而它是「块的边界还没合并」那道闸门后面的事。人工验收清单 D3 记着它。
+
 ---
 
 ## 9. 明确不做的事

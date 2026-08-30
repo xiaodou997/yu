@@ -38,6 +38,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private let surfaceHostView = MacosSurfaceHostView()
     private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
+    private let outlinePanel = OutlinePanel()
+    private var outlineRevision: UInt64?
     private var saveButton: NSButton?
     private var reloadButton: NSButton?
     private var initialState: NativeStorageState
@@ -46,6 +48,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private var promptedExternalDisk: DiskState?
     private var surfaceBoundsObserver: NSObjectProtocol?
     private weak var documentScrollView: NSScrollView?
+    private weak var documentSplitView: NSSplitView?
     private var visualPointerAdapterEnabled = false
     private var visualPointerLayoutWidth: CGFloat = -1.0
     /// The source TextKit mirror must have one complete layout pass before
@@ -106,6 +109,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             self.surfaceCoordinator.resetTableResizeAfterDocumentChange()
             self.textView.refreshTableResizeAccessibility()
             self.updateStatus()
+            self.refreshOutline()
             self.syncSourceGlyphVisibility()
             self.scheduleVisualSubmit()
         }
@@ -227,26 +231,73 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         toolbar.addArrangedSubview(reloadButton)
         toolbar.addArrangedSubview(statusLabel)
 
+        // 大纲面板与文档并排。surfaceHostView 仍然直接挂在 root 上、盖在
+        // 文档的 clip view 上方——它的 frame 在 viewDidLayout 里由
+        // scrollView 的 contentView 换算而来，与分栏无关。
+        outlinePanel.onSelect = { [weak self] item in
+            self?.textView.navigateToOutlineItem(item)
+        }
+        let splitView = NSSplitView()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        splitView.addArrangedSubview(outlinePanel.scrollView)
+        splitView.addArrangedSubview(scrollView)
+        // 面板守住自己的宽度，缩放窗口时让文档吸收——否则拖窗口会把大纲挤没。
+        splitView.setHoldingPriority(
+            NSLayoutConstraint.Priority(260.0),
+            forSubviewAt: 0
+        )
+        splitView.setHoldingPriority(
+            NSLayoutConstraint.Priority(250.0),
+            forSubviewAt: 1
+        )
+        documentSplitView = splitView
+
         root.addSubview(toolbar)
-        root.addSubview(scrollView)
+        root.addSubview(splitView)
         // The Rust surface is a visual projection above the TextKit mirror.
         // Its hitTest returns nil, so keyboard, IME, selection and scrolling
         // remain owned by the source view underneath it. The frame is synced
         // to the clip viewport in viewDidLayout, excluding native scrollers.
-        root.addSubview(surfaceHostView, positioned: .above, relativeTo: scrollView)
+        root.addSubview(surfaceHostView, positioned: .above, relativeTo: splitView)
         NSLayoutConstraint.activate([
             toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
             toolbar.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 10),
-            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            splitView.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 10),
+            splitView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            outlinePanel.scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 150.0),
+            outlinePanel.scrollView.widthAnchor.constraint(lessThanOrEqualToConstant: 420.0),
         ])
         view = root
         startFileWatcher()
         updateStatus()
+        refreshOutline()
     }
+
+    /// 大纲是一份跟着 Revision 走的派生视图，Revision 没动就不必重建——
+    /// 光标移动不推进 Revision，不该让整棵树塌一次又展开一次。
+    private func refreshOutline(force: Bool = false) {
+        let revision = bridge.state.revision
+        guard force || outlineRevision != revision else { return }
+        guard let items = bridge.outlineItemsIfAvailable else { return }
+        outlineRevision = revision
+        outlinePanel.reload(items: items, source: bridge.source as NSString)
+    }
+
+    @objc fileprivate func toggleOutlineFromMenu(_ sender: Any?) {
+        let hidden = !outlinePanel.scrollView.isHidden
+        outlinePanel.scrollView.isHidden = hidden
+        documentSplitView?.adjustSubviews()
+        if hidden, view.window?.firstResponder === outlinePanel.focusTarget {
+            focusDocument()
+        }
+    }
+
+    var outlineIsVisible: Bool { !outlinePanel.scrollView.isHidden }
 
     override func viewDidLayout() {
         super.viewDidLayout()
@@ -279,6 +330,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         super.viewDidAppear()
         guard !visualEnhancementsReady else { return }
         visualEnhancementsReady = true
+        // 分栏的初始位置只能显式放一次：NSSplitView 给 subview 0 加的
+        // holding priority 压过 `.defaultLow` 的首选宽度约束，光靠约束面板会
+        // 缩到最小值。之后用户拖动仍然生效，min/max 由上面两条约束兜住。
+        documentSplitView?.setPosition(220.0, ofDividerAt: 0)
         // Defer the first optional projection submit by one main-thread turn
         // so source TextKit focus/IME setup has completed before any native
         // surface callback can run.
@@ -294,6 +349,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         surfaceCoordinator.resetTableResizeAfterDocumentChange()
         textView.refreshTableResizeAccessibility()
         initialState = bridge.state
+        refreshOutline(force: true)
         if initialState.disk == .unchanged {
             promptedExternalDisk = nil
         }
@@ -396,6 +452,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         func require(_ condition: Bool, _ message: String) throws {
             guard condition else { throw Failure(message: message) }
         }
+        func require<T>(_ value: T?, _ message: String) throws -> T {
+            guard let value else { throw Failure(message: message) }
+            return value
+        }
 
         // 1. 真实 surface 上必须先有一帧。
         let snapshot = try surfaceCoordinator.submitNow(force: true)
@@ -436,11 +496,40 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             "可滚动范围 \(documentView.frame.height) 不等于内容高度 \(expectedExtent)"
         )
 
+        // 6. 大纲面板：选中一行必须把文档滚到那条标题。
+        //    headless 压不住这一条——那里没有 scroll view，
+        //    `revealCaretIfNeeded` 一进门就返回。这里是它唯一能被证伪的地方。
+        let items = try require(bridge.outlineItemsIfAvailable, "拿不到大纲")
+        try require(!items.isEmpty, "fixture 里没有标题，这一条压不住任何东西")
+        try require(
+            outlinePanel.rowCountForSelfCheck == items.count,
+            "面板画了 \(outlinePanel.rowCountForSelfCheck) 行，大纲有 \(items.count) 条"
+        )
+        let lastRow = outlinePanel.rowCountForSelfCheck - 1
+        let target = try require(outlinePanel.nodeForSelfCheck(row: lastRow), "取不到最后一行")
+        let scrollBefore = scrollView.contentView.bounds.origin.y
+        outlinePanel.clickRowForSelfCheck(lastRow)
+        try require(
+            bridge.selection.range
+                == NSRange(location: target.item.labelRange.location, length: 0),
+            "选中面板最后一行之后，光标不在 \(target.label) 的正文起点"
+        )
+        // 产品里这一步由 onCaretChange 排在下一个 main-thread turn 上；
+        // self-check 在同一个 turn 里，所以显式跑一次同样那个入口。
+        surfaceCoordinator.revealCaretIfNeeded()
+        let scrollAfter = scrollView.contentView.bounds.origin.y
+        try require(
+            scrollAfter > scrollBefore,
+            "面板导航之后视口没有滚动（\(scrollBefore) → \(scrollAfter)）"
+        )
+
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
                 + "caret=\(republished?.caretDecorationCount ?? 0) "
                 + "selection=\(republished?.selectionDecorationCount ?? 0) "
-                + "extent=\(Int(documentView.frame.height))"
+                + "extent=\(Int(documentView.frame.height)) "
+                + "outlineRows=\(outlinePanel.rowCountForSelfCheck) "
+                + "outlineScroll=\(Int(scrollBefore))→\(Int(scrollAfter))"
         )
     }
 
@@ -467,6 +556,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         }
         if menuItem.action == #selector(selectAllFromMenu(_:)) {
             return textView.string.utf16.count > 0
+        }
+        if menuItem.action == #selector(toggleOutlineFromMenu(_:)) {
+            menuItem.state = outlineIsVisible ? .on : .off
+            return true
         }
         return true
     }
@@ -761,6 +854,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
+
+        let viewMenuItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "显示")
+        let outline = NSMenuItem(
+            title: "大纲",
+            action: #selector(DocumentViewController.toggleOutlineFromMenu(_:)),
+            keyEquivalent: "1"
+        )
+        outline.keyEquivalentModifierMask = [.command, .option]
+        outline.target = controller
+        viewMenu.addItem(outline)
+        viewMenuItem.submenu = viewMenu
+        mainMenu.addItem(viewMenuItem)
 
         NSApp.mainMenu = mainMenu
     }

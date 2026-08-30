@@ -480,6 +480,39 @@ struct NativeAccessibilitySemanticNode {
         actionBlock = value.action_block == UInt64.max ? nil : value.action_block
     }
 }
+
+/// 大纲里的一条标题。与 `NativeAccessibilitySemanticNode` 是并列的两份派生
+/// 视图，不是一份套着另一份：语义树是扁平的（每个块都挂在 Document 下），
+/// 大纲的全部内容恰恰是标题之间的层级。
+///
+/// `parent` 指向同一份快照里的 `index`，不是块下标；`UInt32.max` 表示这是
+/// 一条根级标题。导航要用的是 `block` 与 `labelRange`。
+struct NativeOutlineItem {
+    let revision: UInt64
+    let index: UInt32
+    let parent: UInt32
+    let level: UInt8
+    let block: UInt64
+    let sourceRange: NSRange
+    let labelRange: NSRange
+
+    init(_ value: YuStorageOutlineItem) {
+        revision = value.revision
+        index = value.index
+        parent = value.parent
+        level = value.level
+        block = value.block
+        sourceRange = NSRange(
+            location: Int(value.source_start_utf16),
+            length: Int(value.source_end_utf16 - value.source_start_utf16)
+        )
+        labelRange = NSRange(
+            location: Int(value.label_start_utf16),
+            length: Int(value.label_end_utf16 - value.label_start_utf16)
+        )
+    }
+}
+
 struct NativeComposition {
     let revision: UInt64
     let generation: UInt64
@@ -1085,6 +1118,39 @@ final class StorageBridge {
         }
         guard status == StorageStatus.ok, written == count else { return nil }
         return values.map(NativeAccessibilitySemanticNode.init)
+    }
+
+    /// 这一版的大纲：文档里全部标题，按文档顺序，带层级。
+    ///
+    /// 与语义树同一个两遍协议（空指针 + 0 容量只回报条数）。刷新可能与关闭、
+    /// 重载或外部改动撞在一起，所以 Revision 失配返回 nil 而不是中止进程——
+    /// 面板保留上一版，比让一次刷新杀掉进程好。
+    var outlineItemsIfAvailable: [NativeOutlineItem]? {
+        let revision = state.revision
+        var count = 0
+        let countStatus = yu_storage_session_outline_items(
+            handle,
+            revision,
+            nil,
+            0,
+            &count
+        )
+        guard countStatus == StorageStatus.ok else { return nil }
+        guard count > 0 else { return [] }
+
+        var values = Array(repeating: YuStorageOutlineItem(), count: count)
+        var written = 0
+        let status = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_outline_items(
+                handle,
+                revision,
+                buffer.baseAddress,
+                buffer.count,
+                &written
+            )
+        }
+        guard status == StorageStatus.ok, written == count else { return nil }
+        return values.map(NativeOutlineItem.init)
     }
 
     func accessibilityLineRange(
