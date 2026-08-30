@@ -111,7 +111,13 @@ fn derive(source: &str, index: usize) -> Option<(Derived, BlockLayoutInput, Stri
     let block = document.blocks().get(index)?;
 
     let decorations = ExtensionSet::markdown()
-        .decorate(&snapshot, &tree, block, None)
+        .decorate(
+            &snapshot,
+            &tree,
+            document.reference_definitions(),
+            block,
+            None,
+        )
         .expect("装饰产出不该失败");
     let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
         .expect("视觉文本");

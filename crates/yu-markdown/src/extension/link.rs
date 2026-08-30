@@ -2,8 +2,16 @@
 //!
 //! 三种写法在树里是同一个形状：头两个 `LinkMark` 夹住正文，其余（`](url)`、
 //! `[label]`、autolink 的尖括号与 `Url`）都在正文之外，整段是语法。
-//! 引用式链接不需要 definition 索引——`[a][b]` 的 `LinkLabel` 是语法树给的
-//! 结构，v1 那边则要先查表才知道它是不是一个链接。
+//!
+//! # 引用式的要先查表
+//!
+//! 不变量 C6 规定 parser 只产出**候选**引用：`[文字][标签]` 在树里是一个
+//! `Link` 节点，无论 `标签` 有没有被定义过。查不到定义的候选按 CommonMark
+//! **根本不是链接**，是一段普通文字——定界符原样留着，`[文字][没定义]` 就画
+//! 成 `[文字][没定义]`。
+//!
+//! 这一句此前写的是「引用式链接不需要 definition 索引」，那是错的：不查表就
+//! 把每一个候选都画成链接，画面上是一个哪儿也去不了的链接，不报错。
 
 use yu_core::{TextAttrs, TextStyle};
 use yu_syntax::NodeKind;
@@ -25,6 +33,14 @@ impl Extension for Link {
             let Some(span) = DelimitedSpan::of(node, |kind| kind == NodeKind::LinkMark) else {
                 continue;
             };
+            // 引用式的候选查不到定义就不是链接。行内式与 autolink 给 `None`，
+            // 不查表。
+            if span
+                .reference_label(node)
+                .is_some_and(|label| !cx.resolves(label))
+            {
+                continue;
+            }
             // 链接正文按**正文**字型排，不继承外层。
             //
             // 这一条看起来是多余的（不产出 mark 也会落到默认字型），它压的

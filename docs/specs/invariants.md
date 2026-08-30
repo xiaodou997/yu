@@ -226,7 +226,7 @@ CommonMark 规范用例号。
 | --- | --- | --- | --- | --- |
 | F1 | 引用式链接的**括号配对**不查 reference table。`[a [b]][ref]` 的分组与 CommonMark 不同 | 不变量 C6 的直接后果，见下 | 512, 523, 528, 569, 571 | 不修 |
 | F2 | 制表符不展开。跨越「标记/内容」边界的制表符整个归标记 | 不变量 A1/A3 的直接后果，见下 | 5, 6, 7 | 不修 |
-| F3 | 引用标签只做 simple lowercase，未做 Unicode full case folding。`[ẞ]` 匹配不上 `[SS]:` | 失败的是对照用的参考渲染，不是 parser；v2 的 reference table 还不存在，见下 | 540 | S6 建 reference table 时决定 |
+| F3 | 引用标签只做 simple lowercase，未做 Unicode full case folding。`[ẞ]` 匹配不上 `[SS]:` | 标准库不提供 full folding，为几个字符引入 `yu-markdown` 的第一个外部依赖不划算，见下 | 540 | 接受那个依赖时 |
 
 ### F1 为什么不修
 
@@ -255,7 +255,7 @@ CommonMark 在块解析时把制表符展开成空格再计算缩进，于是一
 > 展开制表符属于**呈现**，不属于解析。真要让这几列显示出来，是 S4 的装饰层
 > 给制表符一个宽度，而不是让 parser 改写源码。
 
-### F3 为什么现在修不了
+### F3 为什么只修了一半
 
 这一条初版写的是「S4 落地时决定」，S4 查下来发现那个说法把三件事混在了
 一起。理清之后是这样：
@@ -277,8 +277,20 @@ full case folding，要为一条规范用例给测试支撑代码引入一个依
 不划算。
 
 真正要决定的事被推到 S6：v2 的 reference table 建在装饰阶段，那时才需要选
-一种归一化。届时若选了 full case folding，参考渲染也要一起改，540 会变绿，
-这一行随之删除，棘轮从 643 上调。
+一种归一化。
+
+**S6 第十三刀选了：`str::to_lowercase`（Unicode simple lowercase），不是 full
+case folding。** 理由是同一条——标准库不提供 full folding，要为几个字符
+（`ẞ`→`ss`、`ﬁ`→`fi`）给 `yu-markdown` 引入它的第一个外部依赖，不划算。
+
+选完之后**这一条缩小了，没有关掉**：
+
+- 已经解决的：`to_ascii_lowercase` 折不到一起的那一大片（`[Ä]` 与 `[ä]`）现在
+  折得到了。引用表也真的接进了装饰阶段——候选引用查不到定义就不是链接、不是
+  图片（C6 落地）。
+- 还没解决的：full folding 的那几个字符。规范用例 540 仍然红，棘轮仍然是
+  643。要动它，得先接受那个依赖，届时参考渲染
+  （`crates/yu-syntax/tests/support/html.rs` 的 `normalize_label`）要一起改。
 
 ---
 

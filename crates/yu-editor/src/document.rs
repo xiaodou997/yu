@@ -3658,14 +3658,19 @@ prefix **羽🙂** suffix
         assert_eq!(hidden_spans(decorations), vec![(0, 3)], "`## ` 整个隐藏");
     }
 
-    /// 引用式链接的装饰不再依赖 definition 索引。
+    /// 改一条 definition 会让引用它的块重算装饰。
     ///
-    /// `yu-syntax` 给的是结构：`[id]` 的 `LinkLabel` 是树上的节点，隐藏区间
-    /// 不需要先查表判断它是不是一个真链接（不变量 C6 说那件事发生在装饰
-    /// 阶段，而「解析目标」才需要索引）。所以改一条 definition 不会让别的块
-    /// 的装饰作废——它只是把块整体挪了一个字节。
+    /// 这条用例此前断言的是反过来的事——「引用式链接的装饰不再依赖
+    /// definition 索引」。那句话与不变量 C6 冲突：parser 只产出**候选**引用，
+    /// `[id]` 成不成立要装饰阶段查表。不查表的话 `[没定义]` 会画成一个哪儿也
+    /// 去不了的链接；查了表而缓存不失效的话，把 definition 改个名之后那个
+    /// 链接还画成链接。
+    ///
+    /// 代价是**每一次 definition 的内容编辑都清一遍装饰缓存**——它不区分
+    /// 「哪些块用到了这条定义」。definition 不常改，先按整清算；真成为热点
+    /// 再按标签建反向索引。
     #[test]
-    fn a_definition_edit_only_shifts_unrelated_blocks() {
+    fn a_definition_edit_rebuilds_the_blocks_that_reference_it() {
         let source = "[id]: /docs
 
 [id]
@@ -3690,12 +3695,59 @@ prefix **羽🙂** suffix
             .expect("definition 编辑应当成功");
 
         let shifted = document.block_decorations(2).expect("平移过的装饰");
+        let shifted_range = shifted.range();
+        let shifted_hidden = hidden_spans(shifted);
         assert_eq!(
-            shifted.range(),
+            shifted_range,
             source_range(paragraph.start().get() + 1, paragraph.end().get() + 1)
         );
-        assert_eq!(document.decoration_cache_stats().builds(), 1);
-        assert_eq!(document.decoration_cache_stats().remapped(), 1);
+        assert_eq!(
+            document.decoration_cache_stats().builds(),
+            2,
+            "标签改了名，`[id]` 不再成立，那一块要重算"
+        );
+        assert!(
+            shifted_hidden.is_empty(),
+            "查不到定义的候选不是链接，定界符原样留着"
+        );
+    }
+
+    /// 与上一条相对：定义**没变**的编辑只把块挪一挪，不重算。
+    ///
+    /// 失效的判据是引用表的**内容指纹**，不是它的位置。折位置的话每敲一个字
+    /// 都要把整篇文档的装饰重算一遍——不报错，只是慢。
+    #[test]
+    fn an_edit_that_leaves_the_definitions_alone_only_shifts_blocks() {
+        let source = "[id]: /docs\n\n[id]\n\n尾巴\n";
+        let mut document = EditorDocument::new(source);
+        let paragraph = document
+            .block_decorations(2)
+            .expect("引用式段落的装饰")
+            .range();
+        assert_eq!(document.decoration_cache_stats().entries(), 1);
+
+        // 改**最后**那一段：定义没动，`[id]` 那一块也没被碰到。挨着块边界
+        // 插入会让那一块整个作废（`shift_through` 的规则），那考的就不是
+        // 引用表了。
+        let tail = source.find("尾巴").expect("尾巴") as u64 + "尾巴".len() as u64;
+        let transaction = Transaction::new(
+            document.revision(),
+            [Edit::new(source_range(tail, tail), "更长")],
+        );
+        document
+            .apply_transaction(&transaction)
+            .expect("编辑应当成功");
+
+        assert_eq!(
+            document.block_decorations(2).expect("平移过的装饰").range(),
+            paragraph,
+            "这一块自己没动"
+        );
+        assert_eq!(
+            document.decoration_cache_stats().builds(),
+            1,
+            "定义没变就不该重算"
+        );
     }
 
     #[test]

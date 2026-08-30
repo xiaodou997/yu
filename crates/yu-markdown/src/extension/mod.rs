@@ -46,7 +46,7 @@ use yu_syntax::{NodeKind, Tree};
 use yu_text::TextSnapshot;
 
 use crate::block_sequence::{Block, TaskState};
-use crate::reference::read_range;
+use crate::reference::{ReferenceDefinitionIndex, read_range};
 use crate::table::TableBlock;
 
 mod code_span;
@@ -99,6 +99,7 @@ pub struct BlockContext<'a> {
     source: &'a TextSnapshot,
     block: Block,
     syntax: SyntaxNode<'a>,
+    references: &'a ReferenceDefinitionIndex,
     active: Option<TextRange>,
 }
 
@@ -237,6 +238,19 @@ impl<'a> BlockContext<'a> {
         let line_start = self.range().start();
         let content_start = self.skip_spaces(line_start);
         u8::try_from(content_start.get().saturating_sub(line_start.get())).unwrap_or(u8::MAX)
+    }
+
+    /// 这个标签查得到定义吗。
+    ///
+    /// 不变量 C6 规定 parser 只产出**候选**引用——`[文字][标签]` 在树里是一个
+    /// `Link` 节点，无论 `标签` 有没有被定义过。成立与否是**这一层**的判断，
+    /// 而判断要一张表。查不到的候选按 CommonMark 根本不是链接（也不是图片），
+    /// 是一段普通文字。
+    ///
+    /// 归一化见 [`crate::reference`]（F3 选的那一种）。
+    #[must_use]
+    pub fn resolves(&self, label: TextRange) -> bool {
+        self.references.lookup(self.source, label).is_some()
     }
 
     /// 光标所在的区间，只有**焦点块**有。
@@ -908,6 +922,7 @@ impl ExtensionSet {
         &self,
         source: &TextSnapshot,
         tree: &Tree,
+        references: &ReferenceDefinitionIndex,
         block: Block,
         active: Option<TextRange>,
     ) -> Result<BlockDecorations, ExtensionError> {
@@ -920,6 +935,7 @@ impl ExtensionSet {
             source,
             block,
             syntax: block_node(tree, source, block.range()),
+            references,
             active,
         };
 

@@ -60,7 +60,13 @@ fn decorate(snapshot: &TextSnapshot, index: usize) -> Option<(BlockDecorations, 
     let block = markdown.blocks().get(index)?;
     let tree = parse_syntax(snapshot).expect("测试文档很短").into_tree();
     let decorations = ExtensionSet::markdown()
-        .decorate(snapshot, &tree, block, None)
+        .decorate(
+            snapshot,
+            &tree,
+            markdown.reference_definitions(),
+            block,
+            None,
+        )
         .expect("装饰产出");
     let visual = VisualText::new(snapshot, decorations.range(), decorations.set().clone())
         .expect("视觉文本");
@@ -663,7 +669,13 @@ fn a_focused_image_lays_out_its_source_instead_of_a_box() {
     let tree = parse_syntax(&snapshot).expect("短文档").into_tree();
     let active = TextRange::new(ByteOffset::new(5), ByteOffset::new(5)).expect("升序");
     let decorations = ExtensionSet::markdown()
-        .decorate(&snapshot, &tree, block, Some(active))
+        .decorate(
+            &snapshot,
+            &tree,
+            markdown.reference_definitions(),
+            block,
+            Some(active),
+        )
         .expect("装饰");
     let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
         .expect("视觉文本");

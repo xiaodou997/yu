@@ -164,6 +164,47 @@ pub struct DelimitedSpan {
 }
 
 impl DelimitedSpan {
+    /// 引用式的标签区间；行内式（`[文字](目标)`、autolink）给 `None`。
+    ///
+    /// 三种引用写法在树里是两个形状：`[文字][标签]` 有 `LinkLabel` 子节点，
+    /// 折叠式 `[文字][]` 与 shortcut `[文字]` 没有（或标签是空的）——后两种
+    /// 的标签**就是正文**。判据是有没有 `Url` 子节点：有就是行内式，与标签
+    /// 无关。
+    ///
+    /// # `LinkLabel` 带着方括号，标签不带
+    ///
+    /// 节点覆盖的是 `[标签]` 六个字节，而引用表里存的是 `标签`。原样交出去
+    /// 的话**每一条完整引用都查不中**——`![替代][标签]` 无论定义在不在都解析
+    /// 不出目标，画面上永远是一个空框。shortcut 那一路恰好不出事：它没有
+    /// `LinkLabel` 节点，落到正文上，而正文本来就不带方括号。
+    ///
+    /// 链接与图片共用这一份。各写各的话，「这一段是不是引用式、标签在哪」会
+    /// 有两个答案，而它决定的是查不查表、查什么——查错的后果是一条写对了的
+    /// 引用被画成普通文字，或者一条不成立的引用被画成链接。都不报错。
+    #[must_use]
+    pub fn reference_label(self, node: SyntaxNode<'_>) -> Option<TextRange> {
+        let child = |kind: NodeKind| {
+            node.children()
+                .find(|child| child.kind() == kind)
+                .map(SyntaxNode::range)
+        };
+        if child(NodeKind::Url).is_some() {
+            return None;
+        }
+        let Some(label) = child(NodeKind::LinkLabel) else {
+            return Some(self.content);
+        };
+        // 去掉两端的方括号。折叠式 `[]` 去完是空的，按 CommonMark 用正文当
+        // 标签；形状不对（短于两个字节）时同样退回正文，而不是交出一段越界
+        // 的区间。
+        let inner = TextRange::new(
+            ByteOffset::new(label.start().get().saturating_add(1)),
+            ByteOffset::new(label.end().get().saturating_sub(1)),
+        )
+        .filter(|inner| !inner.is_empty() && label.len() >= 2);
+        Some(inner.unwrap_or(self.content))
+    }
+
     /// 按「头两个标记子节点」拆分。标记不足两个就不是一段完整的语法。
     #[must_use]
     pub fn of(node: SyntaxNode<'_>, is_mark: impl Fn(NodeKind) -> bool) -> Option<Self> {

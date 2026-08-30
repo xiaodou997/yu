@@ -123,6 +123,19 @@ struct Entry {
 pub struct DecorationCache {
     extensions: ExtensionSet,
     entries: Vec<Entry>,
+    /// 上一次产出装饰时那份引用表的指纹。
+    ///
+    /// 装饰依赖它：`[文字][标签]` 成不成立要查表（不变量 C6）。而条目是按
+    /// **块**留的（range + kind 对得上就复用），一条定义被删掉时，用到它的
+    /// 那个块一个字节都没变——不清掉的话，那个链接会一直画成链接，直到有人
+    /// 碰它所在的那一块。反过来也一样：补上定义之后它还是一段普通文字。
+    ///
+    /// 指纹折的是各条定义的**标签与目标的内容哈希**，不是它们的位置，所以
+    /// 一次只挪动定义的编辑不会白清一遍。
+    ///
+    /// `None` 是「还没产出过装饰」。写成 `Option` 而不是「空表的指纹」，是
+    /// 为了不把那个常数在两个 crate 里各写一遍。
+    references: Option<u64>,
     stats: DecorationCacheStats,
 }
 
@@ -131,6 +144,7 @@ impl Default for DecorationCache {
         Self {
             extensions: ExtensionSet::markdown(),
             entries: Vec::new(),
+            references: None,
             stats: DecorationCacheStats::default(),
         }
     }
@@ -158,6 +172,7 @@ impl DecorationCache {
         block: Block,
     ) -> Result<&BlockDecorations, DecorationError> {
         self.retire_stale(markdown.revision());
+        self.retire_stale_references(markdown);
         if let Some(index) = self
             .entries
             .iter()
@@ -195,9 +210,13 @@ impl DecorationCache {
             .tree()
             .ok_or(DecorationError::Parse(ParseError::SourceTooLarge))?;
         self.stats.parses = self.stats.parses.saturating_add(1);
-        Ok(self
-            .extensions
-            .decorate(markdown.source(), tree, block, active)?)
+        Ok(self.extensions.decorate(
+            markdown.source(),
+            tree,
+            markdown.reference_definitions(),
+            block,
+            active,
+        )?)
     }
 
     /// 整篇文档的装饰集合：每个块的产出合并成一份。
@@ -270,8 +289,27 @@ impl DecorationCache {
         self.stats.invalidated = self.stats.invalidated.saturating_add(invalidated);
     }
 
+    /// 引用表的内容变了就一条都不留。
+    ///
+    /// 那不是某一块的事：每一条候选引用的判断都可能翻面，而条目是按块留的
+    /// （见 [`DecorationCache::references`]）。
+    ///
+    /// 两条路都要过这一道——编辑之后走 [`Self::retain_blocks`]，第一次产装饰
+    /// 走 [`Self::get_or_build_block`]。只放在前者上的话，缓存里会先攒下一批
+    /// 按旧表算的条目；只放在后者上的话，一次「只删了一条定义」的编辑要等到
+    /// 有人来问装饰才生效，而那时 `retain_blocks` 已经把条目按块留下来了。
+    fn retire_stale_references(&mut self, markdown: &MarkdownDocument) {
+        let references = markdown.reference_definitions().fingerprint();
+        if self.references == Some(references) {
+            return;
+        }
+        self.references = Some(references);
+        self.clear();
+    }
+
     /// 只留下仍然对得上一个已解析块的条目。
     pub fn retain_blocks(&mut self, markdown: &MarkdownDocument) {
+        self.retire_stale_references(markdown);
         let before = self.entries.len();
         self.entries.retain(|entry| {
             markdown
