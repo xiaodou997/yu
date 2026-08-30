@@ -41,7 +41,13 @@ fn decorate_with(
     let tree = parse_syntax(&snapshot).expect("测试文档很短").into_tree();
     let block = document.blocks().get(0).expect("至少有一个块");
     extensions
-        .decorate(&snapshot, &tree, block, active)
+        .decorate(
+            &snapshot,
+            &tree,
+            document.reference_definitions(),
+            block,
+            active,
+        )
         .expect("装饰产出不该失败")
 }
 
@@ -437,7 +443,13 @@ fn decorations_stay_inside_their_block() {
 
     for block in document.blocks().iter() {
         let decorations = extensions
-            .decorate(&snapshot, &tree, block, None)
+            .decorate(
+                &snapshot,
+                &tree,
+                document.reference_definitions(),
+                block,
+                None,
+            )
             .expect("装饰产出不该失败");
         for entry in decorations.set().all() {
             assert!(
@@ -637,7 +649,13 @@ fn record(extension: impl Extension + 'static, source: &str, block_index: usize)
     let block = document.blocks().get(block_index).expect("块存在");
     ExtensionSet::empty()
         .with(extension)
-        .decorate(&snapshot, &tree, block, None)
+        .decorate(
+            &snapshot,
+            &tree,
+            document.reference_definitions(),
+            block,
+            None,
+        )
         .expect("装饰产出不该失败");
     block.range()
 }
@@ -726,7 +744,13 @@ fn the_registry_drops_decorations_that_leave_their_block() {
 
     let decorations = ExtensionSet::empty()
         .with(OutOfBounds)
-        .decorate(&snapshot, &tree, block, None)
+        .decorate(
+            &snapshot,
+            &tree,
+            document.reference_definitions(),
+            block,
+            None,
+        )
         .expect("装饰产出不该失败");
 
     assert_eq!(
@@ -951,11 +975,11 @@ fn an_inline_image_is_annotated_with_its_label_and_destination() {
     );
 }
 
-/// 引用式图片给的是标签，不是目标：目标要查 definition 才知道，而那是
-/// 上一层的事（不变量 C6）。
+/// 引用式图片给的是标签，不是目标：解析目标要读源码、要处理相对路径，那是
+/// workspace 那一层的事。**能不能解析**则在这一层判（见下一条）。
 #[test]
 fn a_reference_image_is_annotated_with_its_label_instead() {
-    let decorations = decorate("![替代][引用]", None);
+    let decorations = decorate("![替代][引用]\n\n[引用]: /目标\n", None);
     let annotated = images(&decorations);
     assert_eq!(annotated.len(), 1, "一张图，实际是 {annotated:?}");
     let (_, _, destination, reference) = annotated[0];
@@ -966,12 +990,84 @@ fn a_reference_image_is_annotated_with_its_label_instead() {
 /// shortcut 形式 `![替代]` 没有 `LinkLabel` 节点，标签就是替代文字本身。
 #[test]
 fn a_shortcut_image_falls_back_to_its_own_label() {
-    let decorations = decorate("![替代]", None);
+    let decorations = decorate("![替代]\n\n[替代]: /目标\n", None);
     let annotated = images(&decorations);
     assert_eq!(annotated.len(), 1, "一张图，实际是 {annotated:?}");
     let (_, label, destination, reference) = annotated[0];
     assert_eq!(destination, None);
     assert_eq!(reference, Some(label));
+}
+
+/// 查不到定义的候选引用**根本不是**链接或图片，是一段普通文字。
+///
+/// 不变量 C6 规定 parser 只产出候选：`[文字][标签]` 在树里是一个 `Link`
+/// 节点，无论 `标签` 有没有被定义过。此前两个 extension 都不查表，于是
+/// `[文字][没定义]` 画成一个哪儿也去不了的链接，`![替代][没定义]` 占一个
+/// widget 而 workspace 查不到资源——画面上一个空框（第七刀登记的那条行为
+/// 变化）。
+#[test]
+fn an_unresolved_reference_is_neither_a_link_nor_an_image() {
+    for source in ["[文字][没定义]", "![替代][没定义]", "[没定义]", "![没定义]"] {
+        let decorations = decorate(source, None);
+        assert!(
+            hidden(&decorations).is_empty(),
+            "{source:?} 该整段按源码画，一个字节都不藏"
+        );
+        assert!(
+            decorations.widgets().is_empty(),
+            "{source:?} 不该占一个 widget"
+        );
+    }
+
+    // 同样四种写法，定义补上之后照常成立。
+    for source in [
+        "[文字][标签]\n\n[标签]: /目标\n",
+        "![替代][标签]\n\n[标签]: /目标\n",
+        "[标签]\n\n[标签]: /目标\n",
+        "![标签]\n\n[标签]: /目标\n",
+    ] {
+        let decorations = decorate(source, None);
+        assert!(
+            !hidden(&decorations).is_empty(),
+            "{source:?} 的定界符该藏起来"
+        );
+    }
+}
+
+/// 引用标签的空白要折：首尾去掉，内部连续空白折成一个空格。
+///
+/// CommonMark 的归一化有三条，大小写只是其中一条。**这条是变异验证抓出来
+/// 的**——把折空白那一步整个去掉，一条用例都不红：语料里没有一个标签带空白。
+#[test]
+fn reference_labels_collapse_whitespace() {
+    for source in [
+        // 内部连续空白折成一个。
+        "[文字][多  个   空格]\n\n[多 个 空格]: /目标\n",
+        // 首尾的空白去掉。
+        "[文字][  两端  ]\n\n[两端]: /目标\n",
+        // 换行也算空白（标签可以跨行写）。
+        "[文字][跨\n行]\n\n[跨 行]: /目标\n",
+    ] {
+        let decorations = decorate(source, None);
+        assert!(
+            !hidden(&decorations).is_empty(),
+            "{source:?} 的标签该折到一起"
+        );
+    }
+}
+
+/// 引用标签按 Unicode 折大小写，不是只折 ASCII。
+///
+/// `[Ä]` 与 `[ä]` 在 CommonMark 里是同一个标签。归一化那一步此前用
+/// `to_ascii_lowercase`，折不到一起——症状是一条写对了的引用画成普通文字。
+/// 这是 F3 选的那一种归一化（simple lowercase，不是 full case folding）。
+#[test]
+fn reference_labels_fold_case_beyond_ascii() {
+    let decorations = decorate("[Ärger][GRÜN]\n\n[grün]: /目标\n", None);
+    assert!(
+        !hidden(&decorations).is_empty(),
+        "大小写不同的标签该折到一起"
+    );
 }
 
 /// 表格的网格由 `BlockOrnament::Table` 带上来。
@@ -1121,7 +1217,13 @@ fn decorate_every_block(source: &str) -> Vec<(TextRange, BlockDecorations)> {
             (
                 block.range(),
                 extensions
-                    .decorate(&snapshot, &tree, block, None)
+                    .decorate(
+                        &snapshot,
+                        &tree,
+                        document.reference_definitions(),
+                        block,
+                        None,
+                    )
                     .expect("装饰产出不该失败"),
             )
         })

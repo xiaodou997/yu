@@ -34,7 +34,13 @@ fn block(snapshot: &TextSnapshot, index: usize) -> (BlockDecorations, VisualText
     let block = markdown.blocks().get(index).expect("块存在");
     let tree = parse_syntax(snapshot).expect("测试文档很短").into_tree();
     let decorations = ExtensionSet::markdown()
-        .decorate(snapshot, &tree, block, None)
+        .decorate(
+            snapshot,
+            &tree,
+            markdown.reference_definitions(),
+            block,
+            None,
+        )
         .expect("装饰产出");
     let visual = VisualText::new(snapshot, decorations.range(), decorations.set().clone())
         .expect("视觉文本");

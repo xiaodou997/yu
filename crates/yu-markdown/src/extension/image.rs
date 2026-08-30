@@ -43,12 +43,14 @@ impl Extension for Image {
                 out.mark(span.content, style);
                 continue;
             }
+            // 引用式的候选查不到定义就不是图片（不变量 C6：parser 只产出
+            // 候选）。此前不查表，于是一段解析不出目标的 `![替代][没定义]`
+            // 也占一个 widget，画面上是一个空框——第七刀登记的那条行为变化。
+            let reference = span.reference_label(node);
+            if reference.is_some_and(|label| !cx.resolves(label)) {
+                continue;
+            }
             let destination = child_range(node, NodeKind::Url);
-            // 引用式的标签：`![替代][引用]` 取 `LinkLabel`，shortcut
-            // `![替代]` 没有 `LinkLabel`，标签就是替代文字本身。
-            let reference = destination
-                .is_none()
-                .then(|| child_range(node, NodeKind::LinkLabel).unwrap_or(span.content));
             let widget = out.widget(BlockWidget::Image(ImageSpan::new(
                 node.range(),
                 span.content,

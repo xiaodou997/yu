@@ -1488,10 +1488,16 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 continue;
             };
             let Some(key) = image_key(image) else {
-                // 目标解析不出来（引用式而没有 definition）。widget 已经在
-                // 行里占了一个盒子，这里什么都不画的话那块就是**白的**——
-                // 用户看不出那里有过一张图，而替代文字已经进 widget 了。
-                // 画一个空框，让「这里有一张画不出来的图」看得见。
+                // widget 在行里占了一个盒子，而这一层查不到目标。什么都不画
+                // 的话那块就是**白的**——用户看不出那里有过一张图，而替代
+                // 文字已经进 widget 了。画一个空框，让它看得见。
+                //
+                // **走到这里意味着装饰与这一层看的不是同一份引用表。**
+                // 装饰阶段现在自己查表（不变量 C6），查不到的候选根本不产
+                // widget；而 `DecorationCache` 在引用表的指纹变了的时候整个
+                // 清掉。两道合起来，编辑器自己那条路走不到这一支。留着它是
+                // 因为「什么都不画」比「画错一个框」更难发现——这一支没有
+                // 用例，它守的是别的调用方拿一份对不上的表来渲染。
                 block_ornaments.push(OrnamentPrimitive::new(
                     image.source(),
                     translate_block_rect(placement.bounds(), origin)?,
@@ -2681,13 +2687,14 @@ mod tests {
         }
     }
 
-    /// 目标解析不出来的图片画一个空框，不是什么都不画。
+    /// 查不到定义的引用**根本不是**图片，一个盒子都不占。
     ///
-    /// 替代文字已经进了 widget（S6 第七刀），这里什么都不画的话那一块就是
-    /// 白的——用户看不出那里有过一张图。真实窗口比对抓到的就是这个：布局
-    /// 上占着位置，画面上一个像素都没有。
+    /// 不变量 C6 说 parser 只产出候选引用，成立与否由装饰阶段判定。此前装饰
+    /// 阶段不查表，于是 `![alt][undefined]` 也占一个 widget，而这一层查不到
+    /// `ImageKey`——画面上是一个空框（S6 第七刀登记的那条行为变化）。现在它是
+    /// 一段普通文字。
     #[test]
-    fn an_image_with_no_resolvable_target_still_draws_a_box() {
+    fn an_unresolvable_reference_is_not_an_image_at_all() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
         let viewport = ViewportSpan::new(0.0, 160.0);
@@ -2711,13 +2718,6 @@ mod tests {
             &[],
         )
         .expect("scene frame");
-        let images = frame
-            .scene()
-            .primitives()
-            .iter()
-            .filter(|primitive| matches!(primitive, Primitive::Image(_)))
-            .count();
-        assert_eq!(images, 0, "没有目标就没有图可画");
         let boxes = frame
             .scene()
             .primitives()
@@ -2728,7 +2728,7 @@ mod tests {
                         && ornament.bounds().width() > 0.0)
             })
             .count();
-        assert!(boxes >= 1, "画不出来的图要留一个空框");
+        assert_eq!(boxes, 0, "不成立的引用不该留一个空框");
     }
 
     #[test]
