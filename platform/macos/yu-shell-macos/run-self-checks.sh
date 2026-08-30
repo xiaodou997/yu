@@ -44,6 +44,7 @@ typeset -A checks=(
     document-workflow                   Fixtures/render-surface.md
     macos-table-resize-coordinator      Fixtures/block-projection.md
     macos-task-checkbox                 Fixtures/render-tasks.md
+    outline-panel                       Fixtures/outline.md
     selection                           Fixtures/sample.md
     shaped-projection-hit-test          Fixtures/block-projection.md
     shaped-vertical                     Fixtures/block-projection.md
@@ -73,5 +74,9 @@ print -r -- "全部 ${#checks} 个 self-check 通过"
 # launch-window-self-check 会经由 applicationDidFinishLaunching 真正创建
 # NSWindow，需要可用的窗口服务，因此不在此列。它顺带跑帧调度自检：只有真实
 # 的 NSWindow 与 Metal surface 才会产生「已提交的帧」，headless 覆盖不到
-# 「屏幕上那一帧还算不算数」这个判断。改动帧调度后必须在本地跑一次：
-#   "$binary" --launch-window-self-check Fixtures/block-projection.md
+# 「屏幕上那一帧还算不算数」这个判断。它还压着大纲面板导航之后视口真的滚了
+# ——headless 那边没有 scroll view，`revealCaretIfNeeded` 一进门就返回。
+# 改动帧调度或大纲面板后必须在本地跑一次：
+#   "$binary" --launch-window-self-check Fixtures/outline.md
+# fixture 必须有一条落在首屏之外的标题（outline.md 有），否则「选中之后滚了」
+# 这一条会以「视口没有滚动」假红。

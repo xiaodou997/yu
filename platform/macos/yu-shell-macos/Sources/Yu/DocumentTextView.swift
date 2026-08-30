@@ -1049,6 +1049,21 @@ final class DocumentTextView: NSTextView {
         return (Float(max(font.pointSize, 1.0)), Float(width))
     }
 
+    /// 跳到大纲里的一条标题：把光标放到它正文的起点。
+    ///
+    /// **导航不另开 FFI。** 选区走 `setSelectedRange` 那条已有的路，它落到
+    /// `yu_storage_session_set_selection_endpoints`；滚动由随之而来的
+    /// `onCaretChange` 交给 `macosShapedCaretScrollRequest`，也就是
+    /// yu-editor::viewport 那条路。**面板不自己算 y**——它手上只有 UTF-16
+    /// 偏移，算 y 就要在平台侧复制一份排版。
+    func navigateToOutlineItem(_ item: NativeOutlineItem) {
+        let length = (string as NSString).length
+        guard item.labelRange.location >= 0, item.labelRange.location <= length else {
+            return
+        }
+        setSelectedRange(NSRange(location: item.labelRange.location, length: 0))
+    }
+
     /// Menu actions use these explicit entry points instead of NSTextView's
     /// undo manager. Rust remains the sole owner of history and revision.
     func performUndo() {

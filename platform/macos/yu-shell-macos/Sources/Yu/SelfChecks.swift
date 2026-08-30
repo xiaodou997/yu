@@ -702,6 +702,169 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
     }
 }
 
+/// 大纲面板的 headless self-check。
+///
+/// `NSOutlineView` 与 `DocumentTextView` 一样是纯 AppKit 对象：`main.swift`
+/// 第一行的 `NSApplication.shared` 已经初始化了 AppKit，`reloadData` /
+/// `expandItem` / `selectRowIndexes` 都不需要窗口，也不需要 run loop。真正画
+/// 出来的那一层（宽度、深浅色、焦点环）留给人工验收。
+///
+/// **判据不能来自被测的那条路。**「面板的条数与 FFI 一致」是自证的——面板
+/// 本来就是照着那个数组画的。下面四条各有内容：
+///
+///   1. 扁平 → 嵌套那次转换：断言落在**树的形状**上，反过来核对平表的
+///      `parent` 字段。「挂错父亲」「静默地把孩子提成根」都在这里出。
+///   2. 点第 N 行之后光标落在第 N 条标题的正文起点——判据是
+///      `bridge.selection`，与面板走的是两条路。
+///   3. 那之后 `macosShapedCaretScrollRequest` 指向那一条的块。这一条压住
+///      「面板自己算 y」：滚动必须由 yu-editor::viewport 那条路给出。
+///   4. 编辑之后刷新，展开状态与选中行不丢。纯 Swift 状态逻辑，每次
+///      `reloadData` 全量重建就会丢，而且不报错。
+func runOutlinePanelSelfCheck(path: String) -> Never {
+    let fileManager = FileManager.default
+    let temporaryURL = fileManager.temporaryDirectory
+        .appendingPathComponent("yu-outline-\(UUID().uuidString).md")
+    do {
+        try fileManager.copyItem(at: URL(fileURLWithPath: path), to: temporaryURL)
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+
+        let bridge = try StorageBridge(path: temporaryURL.path)
+        let textView = DocumentTextView(bridge: bridge)
+        let panel = OutlinePanel()
+        // 产品里的接线是同一句（DocumentViewController.loadView）。被测的是
+        // `navigateToOutlineItem` 那一份实现，不是这里重写的一份。
+        panel.onSelect = { [weak textView] item in
+            textView?.navigateToOutlineItem(item)
+        }
+
+        let items = try unwrapSelfCheck(bridge.outlineItemsIfAvailable)
+        precondition(items.count >= 6, "fixture 里的标题太少，压不住层级")
+        panel.reload(items: items, source: bridge.source as NSString)
+
+        // 1. 扁平 → 嵌套。
+        var visited: [NativeOutlineItem] = []
+        func walk(_ nodes: [OutlineNode], parent: OutlineNode?) {
+            for node in nodes {
+                if let parent {
+                    precondition(
+                        node.item.parent == parent.item.index,
+                        "\(node.label) 挂在了 \(parent.label) 下，但平表说它的父亲是 \(node.item.parent)"
+                    )
+                    precondition(
+                        node.item.level > parent.item.level,
+                        "\(node.label) 的级别不比父亲深"
+                    )
+                } else {
+                    precondition(
+                        node.item.parent == UInt32.max,
+                        "\(node.label) 被挂成了根级，但平表给了它一个父亲"
+                    )
+                }
+                visited.append(node.item)
+                walk(node.children, parent: node)
+            }
+        }
+        walk(panel.rootsForSelfCheck, parent: nil)
+        precondition(visited.count == items.count, "转换丢了或多出了条目")
+        precondition(
+            visited.map(\.index) == items.map(\.index),
+            "前序遍历与文档顺序不一致"
+        )
+
+        // label 是**源码**区间：这一刀不剥行内标记（触发条件是第三刀的搜索
+        // 面板）。唯一的纯呈现例外是 Setext 多行标题折成一行。
+        let labels = panel.rootsForSelfCheck.flatMap(allLabelsForSelfCheck)
+        precondition(
+            labels.contains("带 **行内标记** 的标题"),
+            "面板应当显示源码区间，实际标签: \(labels)"
+        )
+        precondition(labels.contains("收尾串"), "ATX 收尾串没有被树剥掉: \(labels)")
+        precondition(labels.contains("多行 标题"), "Setext 多行标题没有折成一行: \(labels)")
+        precondition(
+            labels.allSatisfy { !$0.contains(where: \.isNewline) },
+            "面板上不能出现换行"
+        )
+
+        // 2 / 3. 点每一行 → 选区落在正文起点 → 滚动请求指向那一条的块。
+        let rowCount = panel.rowCountForSelfCheck
+        precondition(rowCount == items.count, "默认应当全部展开")
+        for row in 0..<rowCount {
+            let node = try unwrapSelfCheck(panel.nodeForSelfCheck(row: row))
+            panel.clickRowForSelfCheck(row)
+            precondition(
+                bridge.selection.range
+                    == NSRange(location: node.item.labelRange.location, length: 0),
+                "点第 \(row) 行之后光标不在 \(node.label) 的正文起点"
+            )
+            let request = try bridge.macosShapedCaretScrollRequest(
+                revision: bridge.state.revision,
+                size: 14.0,
+                maxWidth: 500.0,
+                scrollY: 0.0,
+                viewportHeight: 200.0
+            )
+            precondition(
+                request.blockIndex == node.item.block,
+                "滚动请求指向块 \(request.blockIndex)，而 \(node.label) 在块 \(node.item.block)"
+            )
+        }
+
+        // 4. 编辑之后刷新，展开状态与选中行不丢。
+        let collapsible = try unwrapSelfCheck(
+            panel.rootsForSelfCheck.first(where: { !$0.children.isEmpty })
+        )
+        panel.collapseForSelfCheck(identity: collapsible.identity)
+        let selectedRow = rowCount - 1
+        panel.clickRowForSelfCheck(min(selectedRow, panel.rowCountForSelfCheck - 1))
+        let expandedBefore = panel.expandedIdentitiesForSelfCheck
+        let selectedBefore = try unwrapSelfCheck(panel.selectedIdentityForSelfCheck)
+        precondition(!expandedBefore.contains(collapsible.identity))
+
+        // 在**文档最前面**插一条新标题：这会把后面每一条的 index 与 block
+        // 一起推后一位。展开状态与选中行因此不能按下标记，只能按身份记——
+        // 在末尾追加字符是压不住这一条的，那种编辑谁都活得下来。
+        let revisionBefore = bridge.state.revision
+        let head = NSRange(location: 0, length: 0)
+        try bridge.setSelection(head)
+        textView.insertText("# 新的顶层\n\n", replacementRange: head)
+        precondition(bridge.state.revision != revisionBefore, "编辑没有推进 Revision")
+        let refreshed = try unwrapSelfCheck(bridge.outlineItemsIfAvailable)
+        precondition(refreshed.count == items.count + 1, "新标题没有进大纲")
+        let shift = refreshed[1].block - items[0].block
+        precondition(shift > 0, "新标题没有把后面的块推后")
+        precondition(
+            zip(items, refreshed.dropFirst()).allSatisfy {
+                $0.index + 1 == $1.index && $0.block + shift == $1.block
+            },
+            "这次编辑应当把每一条的 index 与 block 一起推后"
+        )
+        panel.reload(items: refreshed, source: bridge.source as NSString)
+
+        precondition(
+            panel.expandedIdentitiesForSelfCheck == expandedBefore,
+            "刷新之后展开状态变了: \(panel.expandedIdentitiesForSelfCheck) != \(expandedBefore)"
+        )
+        precondition(
+            panel.selectedIdentityForSelfCheck == selectedBefore,
+            "刷新之后选中行丢了"
+        )
+
+        print(
+            "Yu Outline Panel self-check: items=\(items.count) rows=\(rowCount) "
+                + "roots=\(panel.rootsForSelfCheck.count); "
+                + "nesting, navigation, viewport-owned scroll and refresh state passed"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu Outline Panel self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+private func allLabelsForSelfCheck(_ node: OutlineNode) -> [String] {
+    [node.label] + node.children.flatMap(allLabelsForSelfCheck)
+}
+
 func runAccessibilitySelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
