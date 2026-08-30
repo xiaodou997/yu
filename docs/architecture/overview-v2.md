@@ -1921,6 +1921,80 @@ lowercase）**：从「只认 ASCII」走到「认 Unicode 的绝大多数」—
 搜索、大纲、多光标、代码块高亮（tree-sitter 上场）、导出（comrak 上场）、
 跨平台第二端。
 
+#### 第一刀：大纲
+
+##### 先回答的那个问题：大纲挂在哪
+
+`AccessibilitySemanticSnapshot` 已经在建一棵文档级的语义树，里面就有 Heading
+节点与 label 区间。所以要先说清楚：**大纲是它的第二个消费者，还是另一份派生
+视图？**
+
+**选了后者：并列的两份派生视图。** 理由不是「语义树里东西太多」，而是三者
+共享的那份「唯一实现」（D4）本来就不在语义树里，在更下面一层——「哪些块是
+标题、几级、正文在哪」由 `BlockKind::Heading` 与
+`yu_markdown::heading_content_range` 定义。语义树自己是它的**第一个**消费
+者，`yu-export` 是第二个，大纲是第三个。三份视图共用同一份定义，D4 要的唯一
+性已经满足；把大纲再叠在语义树上，唯一性一点没多，耦合多了一层。
+
+而两者的定义域是**结构性**地不一样，不只是「语义树多了行内节点」：
+
+| | `AccessibilitySemanticSnapshot` | `OutlineSnapshot` |
+| --- | --- | --- |
+| 形状 | **扁平**：每个块节点的 parent 都是 Document(0) | **层级**：`##` 挂在它上面最近的 `#` 下 |
+| 坐标 | UTF-16，服务 `NSTextInputClient` / AX 的 ABI | 源码坐标，UTF-16 只在 FFI 边界出现一次 |
+| 代价 | 每个非代码块跑一次 `parse_inline_with_definitions` | 只扫块序列，不解析行内 |
+| 导航 | 不需要 | 要块索引 |
+
+把大纲建在语义树上，就得往语义树里塞进块索引与标题嵌套两样只有大纲要的东
+西，还要改掉 `parent` 字段对 VoiceOver 的含义——那是一次 ABI 变更，换来的
+只是大纲少写一个循环。
+
+`OutlineSnapshot` 住在 `yu-editor`，与 `accessibility.rs` 并排：两者是同一
+层的兄弟，不是上下游。它是 `(TextSnapshot, MarkdownDocument)` 的纯函数，
+**一个 `EditorDocument` 的字段都没用到缓存那三个**——所以这一刀没有给
+「`EditorState` 该不该抽」提供新证据，那三个字段照旧不碍事。
+
+##### 顺带收掉的一个分叉：标题的正文有过两个答案
+
+写大纲的探针时（十八个边界输入先打印再断言）抓到 `## a ##` 的正文报成
+`"a ##"`。查下去是一条**三个消费者里两个错**的分叉：
+
+- `extension/heading.rs` 问语法树，`yu-syntax` 把收尾的 `#` 串单独建成一个
+  `HeaderMark` 节点，所以编辑器里 `## a ##` 显示 `a`——**对的**；
+- `heading_content_range` 自己扫行，认得 ATX 前缀与 Setext 下划线，**不认得
+  收尾串**——那条规则（前面要有空格、后面只能是空白、整行都是 `#` 不算）只
+  写在 `yu-syntax` 里。于是导出成 `<h2>a ##</h2>`，VoiceOver 读作「a ##」。
+
+三条都不报错、不 panic，全部自动化断言都绿——`yu-syntax` 的 652 条规范用例
+压不住它，因为那条棘轮走的是 `yu-syntax` 自己的 HTML 渲染器，不经过
+`heading_content_range`。
+
+修法不是给 `heading_content_range` 补一条收尾串的扫描（那会变成第三份实
+现），而是让它**问树**：`extension/heading.rs::anatomy` 一次算出「藏哪几段」
+与「正文在哪」，**正文就是节点范围减去藏的那几段**，两者由构造保证不可能分
+叉。为此 `heading_content_range` 的签名从 `(&TextSnapshot, Block)` 变成
+`(&MarkdownDocument, Block)`——树跟着 `MarkdownDocument` 走（S6 第十一刀），
+拿不到文档就拿不到树。`BlockContext::for_block` 是给装饰之外的消费者用的
+入口：同一个上下文，只是没有焦点。
+
+守护测试三处（`yu-markdown` 的正文区间、`yu-export` 的 `<hN>`、`yu-editor`
+的大纲标签），变异验证过：把正文的终点改回 `node.range().end()`，三条同时红。
+
+##### 导航不另开 FFI
+
+`yu_storage_session_outline_items` 只回报视图。跳转由平台侧组合已有的两个
+入口完成：拿 `label_start_utf16` 调 `set_selection_endpoints`，再调
+`macos_shaped_caret_scroll_request`。滚动仍然走 `yu-editor::viewport` 那条
+路，场景层不自己算 y。
+
+##### UI 还没做，这是一个待决的取舍
+
+派生视图与 FFI 都有测试压着；**大纲面板没有做**。S1 的未达成项「Swift 产品
+代码 < 2,000 行」当前是 4,810 行（`SelfChecks.swift` 的 905 行不计），一个
+带层级、可点击、跟着 Revision 刷新的 outline view 大概再加 200–300 行，把
+差距从 2.4 倍推到 2.6 倍。这笔钱值不值得付，是产品决定，不是顺手做完就算的
+事——所以这一刀停在 FFI，把决定留给下一刀。
+
 ---
 
 ## 9. 明确不做的事

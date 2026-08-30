@@ -23,8 +23,9 @@ use yu_editor::{
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
     AccessibilityTextSnapshot, Bias, BlockOrnament, BlockView, CaretAffinity, CaretScrollRequest,
     CommandResult, EditorCommand, EditorDocumentError, ImageSpan, LayoutConfig, LayoutPoint,
-    SelectionError, SourceSync, TableResizeCommit, TableResizeGesture, TableResizeGestureError,
-    TableResizeHit, TableResizeTarget, ViewportConfig, ViewportSpan, VisualOffset, VisualText,
+    OutlineItem, OutlineSnapshot, SelectionError, SourceSync, TableResizeCommit,
+    TableResizeGesture, TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig,
+    ViewportSpan, VisualOffset, VisualText,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
@@ -172,6 +173,8 @@ pub const YU_STORAGE_CLOSE_RESOLVE_DISCARD: u8 = 2;
 pub const YU_STORAGE_EXTERNAL_CHANGED: u8 = YU_STORAGE_DISK_CHANGED;
 pub const YU_STORAGE_EXTERNAL_MISSING: u8 = YU_STORAGE_DISK_MISSING;
 pub const YU_STORAGE_ACCESSIBILITY_PARENT_NONE: u32 = u32::MAX;
+/// 大纲里没有上一级标题的那几条（文档的根级标题）。
+pub const YU_STORAGE_OUTLINE_PARENT_NONE: u32 = u32::MAX;
 pub const YU_STORAGE_ACCESSIBILITY_NO_RANGE: u64 = u64::MAX;
 pub const YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK: u64 = u64::MAX;
 pub const YU_STORAGE_ACCESSIBILITY_FLAG_ORDERED: u8 = ACCESSIBILITY_SEMANTIC_FLAG_ORDERED;
@@ -585,6 +588,37 @@ pub struct YuStorageAccessibilityNodeV2 {
     /// Markdown block index accepted by `YU_STORAGE_COMMAND_TOGGLE_TASK`, or
     /// `YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK` for non-actionable nodes.
     pub action_block: u64,
+}
+
+/// 大纲里的一条标题。
+///
+/// 它与 [`YuStorageAccessibilityNodeV2`] 是**并列**的两份派生视图，不是一份
+/// 套着另一份：语义树是扁平的（每个块都挂在 Document 下），大纲的全部内容
+/// 恰恰是标题之间的层级。理由写在 `yu-editor/src/outline.rs` 的模块文档。
+///
+/// **导航不另开入口**：拿 `label_start_utf16` 调
+/// `yu_storage_session_set_selection_endpoints`，再调
+/// `yu_storage_session_macos_shaped_caret_scroll_request`。滚动仍然走
+/// viewport 那一条路，平台侧不自己算 y。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageOutlineItem {
+    pub revision: u64,
+    /// 这一条在数组里的下标，也是 `parent` 的取值域。
+    pub index: u32,
+    /// 上一级标题的 `index`，根级标题是 `YU_STORAGE_OUTLINE_PARENT_NONE`。
+    pub parent: u32,
+    /// 标题级别，1..=6。
+    pub level: u8,
+    pub reserved: [u8; 7],
+    /// 这条标题所在的块索引。
+    pub block: u64,
+    /// 标题块的整段源码，含 `#` 前缀或 Setext 的下划线那一行。
+    pub source_start_utf16: u64,
+    pub source_end_utf16: u64,
+    /// 标题正文：大纲上显示的就是这一段，不含任何结构标记。
+    pub label_start_utf16: u64,
+    pub label_end_utf16: u64,
 }
 
 #[repr(C)]
@@ -1320,6 +1354,78 @@ fn write_accessibility_nodes_v2(
     YU_STORAGE_OK
 }
 
+/// 大纲的一条 → C ABI 的一条。位置换成 UTF-16。
+fn outline_item_output(
+    snapshot: &TextSnapshot,
+    revision: u64,
+    item: OutlineItem,
+) -> Result<YuStorageOutlineItem, i32> {
+    let (source_start_utf16, source_end_utf16) = source_utf16_range(snapshot, item.source_range())?;
+    let (label_start_utf16, label_end_utf16) = source_utf16_range(snapshot, item.label_range())?;
+    Ok(YuStorageOutlineItem {
+        revision,
+        index: u32::try_from(item.index()).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
+        parent: item
+            .parent()
+            .map(|parent| u32::try_from(parent).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL))
+            .transpose()?
+            .unwrap_or(YU_STORAGE_OUTLINE_PARENT_NONE),
+        level: item.level(),
+        reserved: [0; 7],
+        block: u64::try_from(item.block()).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
+        source_start_utf16,
+        source_end_utf16,
+        label_start_utf16,
+        label_end_utf16,
+    })
+}
+
+/// 两遍协议：`output` 为空时只回报条数，调用方按它开数组再调一次。
+///
+/// 与 `write_accessibility_nodes_v2` 同一个协议，但那一个不做逐条转换（语义
+/// 树自己就存着 UTF-16），这里要转，所以先全部转完再拷——转到一半失败就
+/// 拷了半份出去，那是「静默地做错事」。
+fn write_outline_items(
+    snapshot: &TextSnapshot,
+    revision: u64,
+    items: &[OutlineItem],
+    output: *mut YuStorageOutlineItem,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: `written` is a caller-owned output pointer checked above.
+    unsafe { *written = items.len() };
+    if items.is_empty() {
+        return YU_STORAGE_OK;
+    }
+    if output.is_null() {
+        return if capacity == 0 {
+            YU_STORAGE_OK
+        } else {
+            YU_STORAGE_NULL_POINTER
+        };
+    }
+    if capacity < items.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    let mut converted = Vec::with_capacity(items.len());
+    for item in items {
+        match outline_item_output(snapshot, revision, *item) {
+            Ok(entry) => converted.push(entry),
+            Err(status) => return status,
+        }
+    }
+    // SAFETY: capacity was checked against the number of converted items, and
+    // the native caller supplied writable storage for that many values.
+    unsafe {
+        ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
+    }
+    YU_STORAGE_OK
+}
+
 fn accessibility_line_range_output(
     session: &DocumentEditorSession,
     expected_revision: u64,
@@ -1547,7 +1653,11 @@ fn affinity_to_ffi(affinity: CaretAffinity) -> u8 {
     }
 }
 
-fn table_source_utf16_range(snapshot: &TextSnapshot, source: TextRange) -> Result<(u64, u64), i32> {
+/// 一段源码区间换成 UTF-16。跨 C ABI 的位置一律是 UTF-16（坐标规范）。
+///
+/// 原名 `table_source_utf16_range`，只有表格用。大纲是第二个消费者，名字里
+/// 的 `table_` 跟着去掉。
+fn source_utf16_range(snapshot: &TextSnapshot, source: TextRange) -> Result<(u64, u64), i32> {
     let start = snapshot
         .utf16_offset(source.start())
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
@@ -1597,7 +1707,7 @@ fn table_resize_accessibility_metadata(
         return Ok(Vec::new());
     }
     let (table_source_start_utf16, table_source_end_utf16) =
-        table_source_utf16_range(snapshot, table.source_range())?;
+        source_utf16_range(snapshot, table.source_range())?;
     let bounds = table.bounds();
     let width = divider_width.max(1.0);
     let y = block_y + bounds.y();
@@ -4952,6 +5062,39 @@ pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_nodes_v2(
     write_accessibility_nodes_v2(snapshot.nodes(), output, capacity, written)
 }
 
+/// 拷出这一版的大纲：文档里全部标题，按文档顺序，带层级。
+///
+/// 两遍协议：`output` 传 null（`capacity` 为 0）时只把条数写进 `written`。
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable items when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_outline_items(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut YuStorageOutlineItem,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let snapshot = session.session.snapshot();
+    let outline = OutlineSnapshot::from_document(session.session.document().editor());
+    write_outline_items(
+        &snapshot,
+        outline.revision().get(),
+        outline.items(),
+        output,
+        capacity,
+        written,
+    )
+}
+
 /// Returns one logical LF-delimited line range from a source-backed
 /// Accessibility snapshot. The line index is zero based and the terminating
 /// LF belongs to the preceding line, matching `AccessibilityTextSnapshot`.
@@ -7814,6 +7957,101 @@ mod tests {
                     &mut stale_count,
                 )
             },
+            YU_STORAGE_STALE_REVISION
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    /// 大纲跨 C ABI：两遍协议、层级、正文不带语法、Revision 校验。
+    ///
+    /// 语料里那条 `## 收尾 ##` 是特意放的：它此前会带着 ` ##` 过 ABI，而
+    /// 编辑器里显示的是 `收尾`。
+    #[test]
+    fn ffi_outline_items_carry_the_heading_hierarchy() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-outline-{id}.md"));
+        let source = "# 一级\n\n段落\n\n## 收尾 ##\n\nSetext\n===\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        // 第一遍：只问条数。
+        let mut count = 0;
+        assert_eq!(
+            unsafe { yu_storage_session_outline_items(raw, 0, ptr::null_mut(), 0, &mut count) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(count, 3, "两条 ATX 加一条 Setext");
+
+        // 数组小了要明确拒绝，不能拷半份出去。
+        let mut short = vec![YuStorageOutlineItem::default(); count - 1];
+        let mut short_written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_outline_items(
+                    raw,
+                    0,
+                    short.as_mut_ptr(),
+                    short.len(),
+                    &mut short_written,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+
+        // 第二遍：拷出来。
+        let mut items = vec![YuStorageOutlineItem::default(); count];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_outline_items(
+                    raw,
+                    0,
+                    items.as_mut_ptr(),
+                    items.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, count);
+
+        let utf16: Vec<u16> = source.encode_utf16().collect();
+        let label = |item: &YuStorageOutlineItem| {
+            let start = usize::try_from(item.label_start_utf16).expect("UTF-16 偏移放得进 usize");
+            let end = usize::try_from(item.label_end_utf16).expect("UTF-16 偏移放得进 usize");
+            String::from_utf16(&utf16[start..end]).expect("正文是合法 UTF-16")
+        };
+
+        assert_eq!(items[0].revision, 0);
+        assert_eq!(items[0].index, 0);
+        assert_eq!(items[0].parent, YU_STORAGE_OUTLINE_PARENT_NONE);
+        assert_eq!(items[0].level, 1);
+        assert_eq!(label(&items[0]), "一级");
+
+        assert_eq!(items[1].parent, 0, "二级标题挂在一级下");
+        assert_eq!(items[1].level, 2);
+        assert_eq!(label(&items[1]), "收尾", "收尾的 `#` 串不是正文");
+
+        assert_eq!(items[2].parent, YU_STORAGE_OUTLINE_PARENT_NONE);
+        assert_eq!(items[2].level, 1);
+        assert_eq!(label(&items[2]), "Setext", "下划线那一行不是正文");
+
+        // source 包着 label。
+        for item in &items {
+            assert!(item.source_start_utf16 <= item.label_start_utf16);
+            assert!(item.label_end_utf16 <= item.source_end_utf16);
+        }
+
+        let mut stale = 0;
+        assert_eq!(
+            unsafe { yu_storage_session_outline_items(raw, 1, ptr::null_mut(), 0, &mut stale) },
             YU_STORAGE_STALE_REVISION
         );
 

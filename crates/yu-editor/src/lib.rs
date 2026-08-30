@@ -19,6 +19,7 @@ mod keymap;
 mod layout;
 mod list;
 mod marks;
+mod outline;
 mod table;
 mod viewport;
 mod visual;
@@ -41,6 +42,7 @@ pub use document::{EditorDocument, EditorDocumentError};
 pub use image::{CheckboxPlacement, ImagePlacement, PlacedWidget};
 pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
 pub use layout::{BlockLayoutSource, LayoutBackend, LayoutCache, LayoutCacheStats};
+pub use outline::{OutlineItem, OutlineSnapshot};
 pub use table::{
     TableCellLayout, TableLayout, TableLayoutHit, TableResizeCommit, TableResizeGesture,
     TableResizeGestureError, TableResizeHit, TableResizeTarget,
