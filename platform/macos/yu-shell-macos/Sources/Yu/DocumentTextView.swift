@@ -203,6 +203,19 @@ final class DocumentTextView: NSTextView {
         applyVisualSelection(visualRange)
     }
 
+    /// 真实窗口 self-check 用：⌥ 点那条路的**坐标→源码**那一步。
+    /// headless 里没有已发布的 viewport 几何，这一步只有真实窗口能被证伪。
+    @discardableResult
+    func addCaretAtVisualPointForSelfCheck(_ point: NSPoint) -> Bool {
+        addCaretAtVisualPoint(point)
+    }
+
+    /// 真实窗口 self-check 用：某个源码偏移的 caret 矩形（document-space），
+    /// 拿来推一个可点的坐标。`shapedVisualOffset(at:)` 收的就是这个空间。
+    func shapedCaretRectForSelfCheck(sourceUTF16: Int) -> NSRect? {
+        rustCaretRect(forSourceUTF16: sourceUTF16)
+    }
+
 
     private func currentCompositionGeneration() -> UInt64? {
         guard bridge.composition.active else { return nil }
@@ -283,6 +296,24 @@ final class DocumentTextView: NSTextView {
             visualRange,
             anchorIsVisualStart: anchor <= visualOffset
         )
+    }
+
+    /// 把一个视口坐标点换成源码偏移，再加一根光标。
+    ///
+    /// 走的是与拖选同一条视觉→源码的路（`projectionSourceSelection`），不是
+    /// AppKit 的 `characterIndexForInsertion`——后者认的是 TextKit 那份可丢弃
+    /// 的镜像，而语法标记被藏起来之后两者的偏移不是同一个（不变量 I6）。
+    private func addCaretAtVisualPoint(_ point: NSPoint) -> Bool {
+        guard !bridge.composition.active else { return false }
+        guard let visualOffset = shapedVisualOffset(at: point) else { return false }
+        guard let source = try? bridge.projectionSourceSelection(
+            revision: bridge.state.revision,
+            visualRange: NSRange(location: visualOffset, length: 0),
+            affinity: 1
+        ) else {
+            return false
+        }
+        return addCaret(atSource: source.sourceRange.location)
     }
 
     private func visualUTF16ForSource(
@@ -390,8 +421,16 @@ final class DocumentTextView: NSTextView {
         }
     }
 
+    /// **这以前是一条从单数推出来的假复数。**
+    ///
+    /// `AXSelectedTextRange`（单数）按定义是一个区间，多光标之后它给的是
+    /// primary——那不是降级，那是另一个属性。复数是这一个，留着从单数推出来的
+    /// 一条就是对 VoiceOver 撒谎：屏幕上有五根光标，读屏只知道一根，而且不报错。
     override func accessibilitySelectedTextRanges() -> [NSValue]? {
-        [NSValue(range: accessibilitySelectedTextRange())]
+        guard let selections = bridge.selectionsIfAvailable else {
+            return [NSValue(range: accessibilitySelectedTextRange())]
+        }
+        return selections.ranges.map { NSValue(range: $0.range) }
     }
 
     /// AppKit asks for these children through Objective-C Accessibility
@@ -574,10 +613,11 @@ final class DocumentTextView: NSTextView {
     }
 
     /// AppKit uses this plural entry point for mouse clicks, drag selection,
-    /// and some TextKit accessibility paths. The Rust editor currently owns a
-    /// single selection, so the first native range is the canonical one; the
-    /// important part is that mouse selection cannot leave Rust at an older
-    /// fixed line while the disposable TextKit mirror moves elsewhere.
+    /// and some TextKit accessibility paths.
+    ///
+    /// **这里以前只把第一条送给 Rust。** 多光标之后全部送过去——`AXSelectedRanges`
+    /// 赋值、以及 AppKit 自己的不连续选区都走这个入口，丢掉其余几条不报错，
+    /// 只是那几根光标从此不存在。归一化（排序、合并）归 Rust 一家做。
     override func setSelectedRanges(
         _ ranges: [NSValue],
         affinity: NSSelectionAffinity,
@@ -592,8 +632,16 @@ final class DocumentTextView: NSTextView {
         )
         synchronizingSelection = false
         guard shouldSync else { return }
-        let range = clampedRange(selectedRange(), length: (string as NSString).length)
-        syncNativeSelectionToRust(range)
+        let length = (string as NSString).length
+        let clamped = ranges.map { clampedRange($0.rangeValue, length: length) }
+        guard !clamped.isEmpty else { return }
+        // 这条路是 **AppKit 发起**的选区变化（鼠标、AX 赋值），primary 只能问
+        // AppKit 自己认哪一条——拖选时 `selectedRange()` 才是光标真正在的地方。
+        // 由 Yu 发起的多光标不走这里，走 `navigate(toSources:primary:)`，那里
+        // primary 是显式给的（`NSTextView` 对不连续选区没有「主」的概念）。
+        let current = clampedRange(selectedRange(), length: length)
+        let primary = clamped.firstIndex(of: current) ?? 0
+        syncNativeSelectionsToRust(clamped, primary: primary)
     }
 
     /// The visual pointer adapter resolves the click/drag point in the
@@ -614,6 +662,16 @@ final class DocumentTextView: NSTextView {
            onTableResizeBegin?(visualPoint(for: event)) == true {
             visualSelectionAnchor = nil
             setTableResizeCursor(active: true)
+            return
+        }
+        // ⌥ 点加一根光标。**必须挡在 super 前面**：`NSTextView` 自己的
+        // ⌥ 拖是矩形选区，放过去会既加不上光标又把选区改掉。
+        if event.buttonNumber == 0,
+           event.clickCount == 1,
+           event.modifierFlags.contains(.option),
+           !event.modifierFlags.contains(.shift),
+           addCaretAtVisualPoint(visualPoint(for: event)) {
+            visualSelectionAnchor = nil
             return
         }
         if applyVisualPointerSelection(
@@ -680,6 +738,17 @@ final class DocumentTextView: NSTextView {
         guard !bridge.composition.active else { return }
         do {
             try bridge.setSelection(range)
+            canonicalRevision = bridge.state.revision
+            postSelectionChanged()
+        } catch {
+            onError?(error)
+        }
+    }
+
+    private func syncNativeSelectionsToRust(_ ranges: [NSRange], primary: Int) {
+        guard !bridge.composition.active else { return }
+        do {
+            try bridge.setSelections(ranges, primary: primary)
             canonicalRevision = bridge.state.revision
             postSelectionChanged()
         } catch {
@@ -1074,6 +1143,54 @@ final class DocumentTextView: NSTextView {
     /// 跳到大纲里的一条标题：把光标放到它正文的起点。
     func navigateToOutlineItem(_ item: NativeOutlineItem) {
         navigate(toSource: NSRange(location: item.labelRange.location, length: 0))
+    }
+
+    /// 跳到一组源码位置，把它们全部选中。
+    ///
+    /// 与单数那个是同一条路（都落到选区入口，滚动都交给 `onCaretChange`），
+    /// 只是一次给 N 段。`primary` 决定滚到哪一处、以及「当前命中」算哪一处。
+    func navigate(toSources ranges: [NSRange], primary: Int) {
+        let length = (string as NSString).length
+        guard !ranges.isEmpty, primary >= 0, primary < ranges.count else { return }
+        for range in ranges {
+            guard range.location >= 0,
+                  range.length >= 0,
+                  range.location + range.length <= length else {
+                return
+            }
+        }
+        // **primary 直接送给 Rust，不经 AppKit 转手。**
+        //
+        // `NSTextView` 对不连续选区没有「主」的概念：`selectedRange()` 在
+        // `setSelectedRanges` 之后给的是它自己挑的那一条，于是 primary 一律
+        // 退回第 0 条——按 ⌥ 加的那根光标不会成为主光标，滚动与「当前命中」
+        // 跟着错，而且不报错。选区的权威在 Rust（不变量 I6），镜像跟着走。
+        syncNativeSelectionsToRust(ranges, primary: primary)
+        synchronizingSelection = true
+        super.setSelectedRanges(
+            ranges.map { NSValue(range: $0) },
+            affinity: .downstream,
+            stillSelecting: false
+        )
+        super.setSelectedRange(ranges[primary])
+        synchronizingSelection = false
+    }
+
+    /// ⌥ 点：在已有的光标之外**再加一根**。
+    ///
+    /// 这是不依赖搜索面板的那个入口，也是唯一能手动造出「重叠、逆序、同一个
+    /// 偏移两次」的路——「选中全部匹配」产出的选区必然有序不重叠，压不住合并。
+    /// 合并本身仍然归 Rust：这里只是把新的一根接在后面送过去。
+    @discardableResult
+    func addCaret(atSource offset: Int) -> Bool {
+        guard !bridge.composition.active else { return false }
+        guard let existing = bridge.selectionsIfAvailable else { return false }
+        let length = (string as NSString).length
+        guard offset >= 0, offset <= length else { return false }
+        var ranges = existing.ranges.map { $0.range }
+        ranges.append(NSRange(location: offset, length: 0))
+        navigate(toSources: ranges, primary: ranges.count - 1)
+        return true
     }
 
     /// 跳到一处搜索命中：把它**选中**。

@@ -240,6 +240,78 @@ impl EditorScenario {
         self
     }
 
+    /// 放一组光标（UTF-8 字节偏移），`primary` 是其中哪一个是主光标。
+    pub fn set_carets(&mut self, offsets: &[usize], primary: usize) -> &mut Self {
+        let ranges: Vec<_> = offsets.iter().map(|offset| (*offset, *offset)).collect();
+        self.set_selections(&ranges, primary)
+    }
+
+    /// 放一组选区（anchor, focus 的 UTF-8 字节偏移）。
+    pub fn set_selections(&mut self, ranges: &[(usize, usize)], primary: usize) -> &mut Self {
+        let snapshot = self.document.snapshot();
+        let selections: Vec<_> = ranges
+            .iter()
+            .map(|(anchor, focus)| {
+                EditorSelection::range(
+                    &snapshot,
+                    ByteOffset::new(*anchor as u64),
+                    ByteOffset::new(*focus as u64),
+                    yu_editor::CaretAffinity::Downstream,
+                )
+                .unwrap_or_else(|error| panic!("invalid test selection: {error}"))
+            })
+            .collect();
+        self.document
+            .set_selections(selections, primary)
+            .unwrap_or_else(|error| panic!("setting test selections failed: {error}"));
+        self
+    }
+
+    /// 全部选区的 `(start, end)`，按文档顺序。
+    #[must_use]
+    pub fn selection_ranges(&self) -> Vec<(u64, u64)> {
+        self.document
+            .selections()
+            .as_slice()
+            .iter()
+            .map(|selection| {
+                let range = selection.ordered_range();
+                (range.start().get(), range.end().get())
+            })
+            .collect()
+    }
+
+    /// 断言全部选区。**这是多光标用例的主判据**：只断 primary 会让「另外几个
+    /// 光标没动」静默通过。
+    pub fn expect_selections(&mut self, expected: &[(u64, u64)]) -> &mut Self {
+        assert_eq!(
+            self.selection_ranges(),
+            expected.to_vec(),
+            "selections differ from expected"
+        );
+        self
+    }
+
+    /// 断言主选区是第几条。
+    pub fn expect_primary_index(&mut self, expected: usize) -> &mut Self {
+        assert_eq!(
+            self.document.selections().primary_index(),
+            expected,
+            "primary index differs"
+        );
+        self
+    }
+
+    #[must_use]
+    pub fn document(&self) -> &EditorDocument {
+        &self.document
+    }
+
+    #[must_use]
+    pub fn document_mut(&mut self) -> &mut EditorDocument {
+        &mut self.document
+    }
+
     fn execute(&mut self, command: EditorCommand, description: &str) -> &mut Self {
         self.document
             .execute(command)

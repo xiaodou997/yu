@@ -18,8 +18,8 @@ use yu_assets::{
 use yu_core::{Revision, TextRange, VisualRange};
 use yu_editor::{
     Bias, BlockKind, BlockView, BlockWidget, CaretAffinity, CheckboxPlacement, EditorDocument,
-    EditorDocumentError, ImageSpan, LayoutError, ShapingProvider, TableLayout, TableResizeCommit,
-    TableResizeTarget, TaskState, ViewportSpan,
+    EditorDocumentError, ImageSpan, LayoutError, Selections, ShapingProvider, TableLayout,
+    TableResizeCommit, TableResizeTarget, TaskState, ViewportSpan,
 };
 use yu_font::GlyphAtlas;
 use yu_layout::{ImageIntrinsicSize, LayoutRect};
@@ -448,6 +448,21 @@ impl SearchHighlightLayer {
 ///
 /// **IME 组字期间整个跳过**：那时块的视觉字节流带着 preedit 覆盖层，匹配是
 /// 按 canonical 源码算的，两者对不上。少画几个框好过画在错的位置上。
+/// 这一段是不是整个落在某一条**非空**选区里。
+///
+/// 选区按起点升序且互不重叠（不变量 B9），所以只用查「起点不晚于它的最后一条」
+/// ——线性扫会让「N 处命中 × N 条选区」在全部选中之后变成 O(N²)。
+fn covered_by_a_selection(selections: &Selections, source: TextRange) -> bool {
+    let ranges = selections.as_slice();
+    let upper =
+        ranges.partition_point(|selection| selection.ordered_range().start() <= source.start());
+    let Some(candidate) = upper.checked_sub(1).and_then(|index| ranges.get(index)) else {
+        return false;
+    };
+    let range = candidate.ordered_range();
+    !range.is_empty() && range.start() <= source.start() && source.end() <= range.end()
+}
+
 fn append_search_highlights(
     builder: &mut SceneBuilder,
     document: &EditorDocument,
@@ -465,7 +480,18 @@ fn append_search_highlights(
     if search.is_empty() {
         return Ok(());
     }
-    let current = search.current(document.selection().ordered_range());
+    // **「当前命中」按 primary 判。**
+    //
+    // `SearchState::current` 仍然收一个区间，理由没变（见 `yu-editor/src/
+    // search.rs` 的模块文档：不存下标，只留一份真相）。多光标之后要收紧到
+    // primary：「选中全部匹配」之后每一条选区都恰好等于一处命中，按「有没有
+    // 某条选区等于它」判会让**每一处**都变成当前命中——那正是那份文档里担心
+    // 的「全选点亮每一个」换了个形状回来。
+    //
+    // primary 不是第二个可以对不上的下标：它是 `Selections` 自己的一部分，
+    // 由导航必然更新的那条路带着走。
+    let selections = document.selections();
+    let current = search.current(document.selections().primary().ordered_range());
     for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
         let block = geometry.source();
         // 匹配按文档顺序，二分给出「起点 < 块尾」的上界；跨进这个块的那一条
@@ -492,6 +518,19 @@ fn append_search_highlights(
             let Some(visual) = VisualRange::new(visual_start, visual_end) else {
                 continue;
             };
+            // **被选区完全盖住的普通命中不画。**
+            //
+            // 第三刀把「其余命中」排在选区之下，理由是「选区是半透明的蓝，
+            // 压上去两者都还看得见」——那句话的前提是**选区与那些命中不是同一
+            // 段**。多光标之后前提没了：「选中全部匹配」让每一处命中同时也是
+            // 一段选区，黄底垫在半透明蓝之下合成出一块脏灰绿（与第三刀在
+            // 当前命中上抓到的 `(158,160,150)` 是同一族颜色）。这是截图抓出来
+            // 的，全部自动化断言都绿。
+            //
+            // 当前命中不受影响：它排在选区**之上**，而且按定义就等于选区那一段。
+            if current != Some(index) && covered_by_a_selection(selections, source) {
+                continue;
+            }
             let (color, role) = if current == Some(index) {
                 (
                     style.search_current,
@@ -512,6 +551,15 @@ fn append_search_highlights(
     Ok(())
 }
 
+/// 一根待发的 caret：位置算完了，但要等搜索的「当前命中」那一层发完才发。
+struct PendingCaret {
+    source: TextRange,
+    caret: yu_editor::BlockCaret,
+    role: EditorDecorationPrimitiveRole,
+    block_y: f32,
+    line_height: f32,
+}
+
 fn append_editor_decorations(
     builder: &mut SceneBuilder,
     document: &EditorDocument,
@@ -524,22 +572,16 @@ fn append_editor_decorations(
             SceneError::InvalidGeometry("editor caret width must be finite and positive").into(),
         );
     }
-    let selection = document.selection();
-    let selection_range = selection.ordered_range();
+    let selections = document.selections();
     let composition = document.composition();
     let composition_blocks = document.composition_block_range();
-    let focus_block = if composition.is_some() {
-        composition_blocks.as_ref().map(|span| span.start)
-    } else {
-        document.block_index_for_source(selection.focus())
-    };
 
     // An empty canonical document intentionally has no Markdown block or text
     // layout. Publish its insertion point directly so the retained frame can
     // still own the visible editor instead of requiring a TextKit glyph pass.
     if input.blocks().is_empty() && document.snapshot().is_empty() && composition.is_none() {
         builder.editor_decoration(EditorDecorationPrimitive::new(
-            TextRange::empty(selection.focus()),
+            TextRange::empty(selections.primary().focus()),
             Rect::new(
                 0.0,
                 0.0,
@@ -562,9 +604,12 @@ fn append_editor_decorations(
         SearchHighlightLayer::UnderSelection,
     )?;
 
-    let mut caret = None;
+    let mut carets: Vec<PendingCaret> = Vec::new();
     for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
-        let (visual_start, visual_end, layer_source) = if let Some(overlay) = composition {
+        if let Some(overlay) = composition {
+            // 组字期间选区已经塌回一条（`EditorDocument::begin_composition`），
+            // 所以这条路仍然是单数的。
+            let focus_block = composition_blocks.as_ref().map(|span| span.start);
             let Some(visual) = layout.visual().composition_selection_visual() else {
                 if focus_block == Some(geometry.index()) {
                     let visual = layout
@@ -574,13 +619,13 @@ fn append_editor_decorations(
                     let layout_caret = layout
                         .caret_for_visual(visual, Bias::After)
                         .map_err(EditorDocumentError::from)?;
-                    caret = Some((
-                        TextRange::empty(overlay.replacement_range().start()),
-                        layout_caret,
-                        EditorDecorationPrimitiveRole::CompositionCaret,
-                        geometry.y(),
-                        layout.config().line_height(),
-                    ));
+                    carets.push(PendingCaret {
+                        source: TextRange::empty(overlay.replacement_range().start()),
+                        caret: layout_caret,
+                        role: EditorDecorationPrimitiveRole::CompositionCaret,
+                        block_y: geometry.y(),
+                        line_height: layout.config().line_height(),
+                    });
                 }
                 continue;
             };
@@ -588,17 +633,33 @@ fn append_editor_decorations(
                 let layout_caret = layout
                     .caret_for_visual(visual.end(), Bias::After)
                     .map_err(EditorDocumentError::from)?;
-                caret = Some((
-                    TextRange::empty(overlay.replacement_range().start()),
-                    layout_caret,
-                    EditorDecorationPrimitiveRole::CompositionCaret,
-                    geometry.y(),
-                    caret_line_height(layout, layout_caret.line()),
-                ));
+                carets.push(PendingCaret {
+                    source: TextRange::empty(overlay.replacement_range().start()),
+                    caret: layout_caret,
+                    role: EditorDecorationPrimitiveRole::CompositionCaret,
+                    block_y: geometry.y(),
+                    line_height: caret_line_height(layout, layout_caret.line()),
+                });
             }
-            (visual.start(), visual.end(), overlay.replacement_range())
-        } else {
-            if focus_block == Some(geometry.index()) {
+            if let Some(visual) = VisualRange::new(visual.start(), visual.end()) {
+                append_visual_span_rects(
+                    builder,
+                    layout,
+                    geometry.y(),
+                    overlay.replacement_range(),
+                    visual,
+                    style.selection,
+                    EditorDecorationPrimitiveRole::Selection,
+                )?;
+            }
+            continue;
+        }
+
+        // **每一条选区各与这个块求一次交，各发各的矩形；每一根落在这个块里的
+        // focus 各发一根 caret。** 只画 primary 的表现是「屏幕上只有一个光标」
+        // ——多光标看上去完全没生效，而不报错。
+        for selection in selections.as_slice() {
+            if document.block_index_for_source(selection.focus()) == Some(geometry.index()) {
                 let bias = match selection.affinity() {
                     CaretAffinity::Upstream => Bias::Before,
                     CaretAffinity::Downstream => Bias::After,
@@ -606,47 +667,44 @@ fn append_editor_decorations(
                 let layout_caret = layout
                     .caret_for_source(selection.focus(), bias)
                     .map_err(EditorDocumentError::from)?;
-                caret = Some((
-                    TextRange::empty(selection.focus()),
-                    layout_caret,
-                    EditorDecorationPrimitiveRole::Caret,
-                    geometry.y(),
-                    caret_line_height(layout, layout_caret.line()),
-                ));
+                carets.push(PendingCaret {
+                    source: TextRange::empty(selection.focus()),
+                    caret: layout_caret,
+                    role: EditorDecorationPrimitiveRole::Caret,
+                    block_y: geometry.y(),
+                    line_height: caret_line_height(layout, layout_caret.line()),
+                });
             }
             if selection.is_empty() {
                 continue;
             }
-            let start = selection_range.start().max(geometry.source().start());
-            let end = selection_range.end().min(geometry.source().end());
+            let range = selection.ordered_range();
+            let start = range.start().max(geometry.source().start());
+            let end = range.end().min(geometry.source().end());
             if start >= end {
                 continue;
             }
             let source = TextRange::new(start, end).expect("ordered selection intersection");
-            (
-                layout
-                    .visual()
-                    .source_to_visual(start, Bias::Before)
-                    .map_err(EditorDocumentError::from)?,
-                layout
-                    .visual()
-                    .source_to_visual(end, Bias::After)
-                    .map_err(EditorDocumentError::from)?,
-                source,
-            )
-        };
-
-        // 起点在终点之后是「这个块里没有选区」，不是错误。
-        if let Some(visual) = VisualRange::new(visual_start, visual_end) {
-            append_visual_span_rects(
-                builder,
-                layout,
-                geometry.y(),
-                layer_source,
-                visual,
-                style.selection,
-                EditorDecorationPrimitiveRole::Selection,
-            )?;
+            let visual_start = layout
+                .visual()
+                .source_to_visual(start, Bias::Before)
+                .map_err(EditorDocumentError::from)?;
+            let visual_end = layout
+                .visual()
+                .source_to_visual(end, Bias::After)
+                .map_err(EditorDocumentError::from)?;
+            // 起点在终点之后是「这个块里没有选区」，不是错误。
+            if let Some(visual) = VisualRange::new(visual_start, visual_end) {
+                append_visual_span_rects(
+                    builder,
+                    layout,
+                    geometry.y(),
+                    source,
+                    visual,
+                    style.selection,
+                    EditorDecorationPrimitiveRole::Selection,
+                )?;
+            }
         }
     }
 
@@ -661,22 +719,22 @@ fn append_editor_decorations(
         SearchHighlightLayer::OverSelection,
     )?;
 
-    if let Some((source, caret, role, block_y, line_height)) = caret {
-        let color = if role == EditorDecorationPrimitiveRole::CompositionCaret {
+    for pending in carets {
+        let color = if pending.role == EditorDecorationPrimitiveRole::CompositionCaret {
             style.composition_caret
         } else {
             style.caret
         };
         builder.editor_decoration(EditorDecorationPrimitive::new(
-            source,
+            pending.source,
             Rect::new(
-                caret.point().x(),
-                block_y + caret.point().y(),
+                pending.caret.point().x(),
+                pending.block_y + pending.caret.point().y(),
                 style.caret_width,
-                line_height,
+                pending.line_height,
             )?,
             color,
-            role,
+            pending.role,
         ))?;
     }
     Ok(())
@@ -3564,6 +3622,137 @@ mod tests {
     ///
     /// 判据来自**场景**，不来自 `SearchState`：后者是被测的那条路的上游，
     /// 拿它当参照只能证明「我把它读出来了」。
+    /// **N 个光标与 N 块选区底色真的进了场景。**
+    ///
+    /// 判据来自**场景里的图元**，不是 `document.selections()`——后者是被测的
+    /// 那条路。只画 primary 的表现是「屏幕上只有一个光标」，多光标看上去完全
+    /// 没生效，而所有编辑器层的断言仍然全绿。
+    #[test]
+    fn every_selection_and_caret_reaches_the_scene() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 400.0);
+        let source = "alpha beta gamma\n\nsecond line here\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+
+        let style = EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        );
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 400.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(style);
+
+        let roles = |document: &mut EditorDocument| -> Vec<EditorDecorationPrimitiveRole> {
+            let atlas = atlas_for_document(document, viewport, &shaper, font_size);
+            let mut plans = RenderPlanBuilder::new();
+            let frame =
+                assemble_viewport_render_frame(document, config, &shaper, &atlas, &mut plans)
+                    .expect("frame");
+            frame
+                .scene()
+                .scene()
+                .primitives()
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::EditorDecoration(decoration) => Some(decoration.role()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let count = |roles: &[EditorDecorationPrimitiveRole],
+                     role: EditorDecorationPrimitiveRole| {
+            roles.iter().filter(|found| **found == role).count()
+        };
+
+        let caret_at = |document: &mut EditorDocument, offsets: &[u64]| {
+            let snapshot = document.snapshot();
+            let carets: Vec<_> = offsets
+                .iter()
+                .map(|offset| {
+                    EditorSelection::cursor(
+                        &snapshot,
+                        ByteOffset::new(*offset),
+                        CaretAffinity::Downstream,
+                    )
+                    .expect("caret")
+                })
+                .collect();
+            document.set_selections(carets, 0).expect("selections");
+        };
+
+        // 一根光标：一根 caret，没有选区底色。
+        caret_at(&mut document, &[1]);
+        let single = roles(&mut document);
+        assert_eq!(count(&single, EditorDecorationPrimitiveRole::Caret), 1);
+        assert_eq!(count(&single, EditorDecorationPrimitiveRole::Selection), 0);
+
+        // 三根光标，两根在第一个块里、一根在第二个块里——**跨块也要各画各的**。
+        let second_block = source.find("second").expect("第二个块") as u64;
+        caret_at(&mut document, &[1, 7, second_block + 2]);
+        let three = roles(&mut document);
+        assert_eq!(
+            count(&three, EditorDecorationPrimitiveRole::Caret),
+            3,
+            "三根光标必须画出三根 caret"
+        );
+
+        // 两段非空选区：两块底色，外加两根 caret（focus 各在自己那一段的末尾）。
+        let snapshot = document.snapshot();
+        let spans: Vec<_> = [(0_u64, 5_u64), (6, 10)]
+            .iter()
+            .map(|(anchor, focus)| {
+                EditorSelection::range(
+                    &snapshot,
+                    ByteOffset::new(*anchor),
+                    ByteOffset::new(*focus),
+                    CaretAffinity::Downstream,
+                )
+                .expect("selection")
+            })
+            .collect();
+        document.set_selections(spans, 0).expect("selections");
+        let selected = roles(&mut document);
+        assert_eq!(
+            count(&selected, EditorDecorationPrimitiveRole::Selection),
+            2,
+            "两段选区必须画出两块底色"
+        );
+        assert_eq!(
+            count(&selected, EditorDecorationPrimitiveRole::Caret),
+            2,
+            "两段选区各有一根 caret"
+        );
+
+        // **caret 仍然是最后一层。** 多光标之后 caret 从「一个 Option」变成
+        // 「一个 Vec」，最容易丢的就是这条次序——丢了不报错，只是光标被底色盖住。
+        let first_selection = selected
+            .iter()
+            .position(|role| *role == EditorDecorationPrimitiveRole::Selection)
+            .expect("选区图元");
+        let first_caret = selected
+            .iter()
+            .position(|role| *role == EditorDecorationPrimitiveRole::Caret)
+            .expect("caret 图元");
+        assert!(
+            first_caret > first_selection,
+            "全部 caret 必须排在全部选区底色之后"
+        );
+    }
+
     #[test]
     fn search_highlights_reach_the_scene_and_mark_the_current_match() {
         let font_size = 14.0;
@@ -3661,6 +3850,83 @@ mod tests {
             2,
             "另外两处仍然是普通命中"
         );
+
+        // **选中全部匹配之后，「当前命中」仍然只有一处。**
+        //
+        // 这条压住的是一个只在多光标下才存在的形状：每一条选区都恰好等于一处
+        // 命中，如果按「有没有**某条**选区等于它」判定，每一处都会变成当前命中
+        // ——正是 `yu-editor/src/search.rs` 模块文档里担心的「全选点亮每一个」
+        // 换了个形状回来。判据必须收紧到 primary。
+        //
+        // 单选区的用例压不住它：那时「任意一条」与「primary」是同一条路。
+        {
+            let snapshot = document.snapshot();
+            let all: Vec<_> = document
+                .search()
+                .expect("查询还在")
+                .matches()
+                .iter()
+                .map(|hit| {
+                    EditorSelection::range(
+                        &snapshot,
+                        hit.start(),
+                        hit.end(),
+                        CaretAffinity::Downstream,
+                    )
+                    .expect("selection")
+                })
+                .collect();
+            let total = all.len();
+            assert!(total >= 2, "语料里至少要有两处命中，否则这条压不住任何东西");
+            let expected = all[1].ordered_range();
+            document.set_selections(all, 1).expect("selections");
+
+            let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+            let mut plans = RenderPlanBuilder::new();
+            let frame =
+                assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                    .expect("frame");
+            let currents: Vec<_> = frame
+                .scene()
+                .scene()
+                .primitives()
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    Primitive::EditorDecoration(decoration)
+                        if decoration.role() == EditorDecorationPrimitiveRole::SearchCurrent =>
+                    {
+                        Some(decoration.source())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                currents.len(),
+                1,
+                "全部选中之后「当前命中」必须仍然只有一处"
+            );
+            // **判据是它指着哪一处，不只是有几处。** 只数条数的话，「按第一条
+            // 选区判」与「按 primary 判」画出来都是一处——只是橙色套在了错的那
+            // 一段上，不报错。
+            assert_eq!(
+                currents[0], expected,
+                "「当前命中」必须是 primary 那一条选区所在的那一处"
+            );
+
+            // **被选区盖住的普通命中不再画黄底。**
+            //
+            // 第三刀让「其余命中」垫在半透明选区之下，前提是两者不是同一段；
+            // 「选中全部匹配」之后前提没了，黄底垫在蓝下面合成出一块脏灰绿。
+            // 这一条是截图抓出来的，在它之前全部断言都绿。
+            let plain = count(
+                &roles(&mut document),
+                EditorDecorationPrimitiveRole::SearchMatch,
+            );
+            assert_eq!(
+                plain, 0,
+                "全部选中之后不该再有垫在选区下面的普通命中底色，实际 {plain} 块"
+            );
+        }
 
         // IME 组字期间整个跳过：那时块的视觉字节流带着 preedit 覆盖层，而匹配
         // 是按 canonical 源码算的。少画几个框好过画在错的位置上。

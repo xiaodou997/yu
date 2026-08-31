@@ -26,8 +26,10 @@ mod caret;
 mod composition;
 mod history;
 mod selection;
+mod selections;
 
 pub use caret::{CaretPositionError, CaretPositionMap};
 pub use composition::{CompositionError, CompositionOverlay};
 pub use history::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats};
 pub use selection::{EditorSelection, SelectionError};
+pub use selections::Selections;

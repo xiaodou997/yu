@@ -44,6 +44,7 @@ typeset -A checks=(
     document-workflow                   Fixtures/render-surface.md
     macos-table-resize-coordinator      Fixtures/block-projection.md
     macos-task-checkbox                 Fixtures/render-tasks.md
+    multi-cursor                        Fixtures/multi-cursor.md
     outline-panel                       Fixtures/outline.md
     search-panel                        Fixtures/search.md
     selection                           Fixtures/sample.md
