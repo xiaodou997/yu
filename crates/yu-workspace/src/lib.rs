@@ -15,7 +15,7 @@ use yu_assets::{
     EmbeddedRenderPayload, EmbeddedRenderPublication, ImageIntrinsicPublication, ImageKey,
     ImagePublication,
 };
-use yu_core::{Revision, TextRange, VisualRange};
+use yu_core::{Revision, TextRange, TextRole, VisualRange};
 use yu_editor::{
     Bias, BlockKind, BlockView, BlockWidget, CaretAffinity, CheckboxPlacement, EditorDocument,
     EditorDocumentError, ImageSpan, LayoutError, Selections, ShapingProvider, TableLayout,
@@ -111,6 +111,44 @@ const fn viewport_table_style() -> TableSceneStyle {
         border_color: Rgba8::new(190, 195, 205, 255),
         header_fill: Some(Rgba8::new(248, 249, 251, 255)),
         selection_fill: Some(Rgba8::new(210, 225, 255, 255)),
+    }
+}
+
+/// 代码高亮的调色板：[`TextRole`] → RGBA。
+///
+/// # 为什么在这一层
+///
+/// 与 `viewport_table_style` / `viewport_block_quote_color` 同一个理由：
+/// **产品选色住在这一层**。装饰产出的是「这是一个关键字」，不是
+/// `#0550AE`——`yu-markdown` 里写死颜色就等于把主题焊进解析层，而
+/// `yu-layout` / `yu-scene` 按不变量 E1 连角色都不该解释。
+///
+/// # 为什么是一份写死的浅色
+///
+/// 整个编辑区现在就是浅色的：`macos_render_host_config` 把背景写死成
+/// `Rgba8::white()`，注释里写着「暗色模式需要平台把实际的
+/// `textBackgroundColor` 传进来」。**那条欠账在第四刀的人工验收记录里已经
+/// 登记**（D2 不通过：深色外观下面板变深而文档区仍是白底）。这里跟着它走，
+/// 不在这一刀里单独给高亮开一条深色路——那会造出「深色的代码配白色的底」。
+///
+/// 底色是 `viewport_block_background` 的 `(245,246,248)`，所以每一种角色都
+/// 按那块底挑的对比度，不是按纯白。
+#[must_use]
+const fn viewport_code_role_color(role: TextRole) -> Option<Rgba8> {
+    match role {
+        // 正文色由这一帧给（`ViewportRenderConfig::color`），不覆盖。
+        TextRole::Plain | TextRole::Variable => None,
+        TextRole::Keyword => Some(Rgba8::new(207, 34, 46, 255)),
+        TextRole::Literal => Some(Rgba8::new(10, 48, 105, 255)),
+        TextRole::Number => Some(Rgba8::new(5, 80, 174, 255)),
+        TextRole::Comment => Some(Rgba8::new(110, 119, 129, 255)),
+        TextRole::Function => Some(Rgba8::new(130, 80, 223, 255)),
+        TextRole::Type => Some(Rgba8::new(149, 63, 25, 255)),
+        TextRole::Constant => Some(Rgba8::new(5, 80, 174, 255)),
+        TextRole::Operator => Some(Rgba8::new(5, 80, 174, 255)),
+        // 括号与分号不着色：全部着上之后代码看着像圣诞树，而它们本来就靠
+        // 形状而不是颜色区分。
+        TextRole::Punctuation => None,
     }
 }
 
@@ -1747,12 +1785,18 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 .iter()
                 .copied()
                 .map(|glyph| {
-                    SceneGlyph::new(
+                    let scene_glyph = SceneGlyph::new(
                         glyph.face(),
                         glyph.glyph(),
                         glyph.origin(),
                         glyph.size_scale(),
-                    )
+                    );
+                    // 「这个字什么颜色」到这里为止：场景层拿到的是 RGBA，
+                    // 不是 `TextRole`。
+                    match viewport_code_role_color(glyph.role()) {
+                        Some(color) => scene_glyph.with_color(color),
+                        None => scene_glyph,
+                    }
                 })
                 .collect::<Vec<_>>(),
         );
@@ -3052,6 +3096,93 @@ mod tests {
         assert_eq!(metadata_image.bounds().width(), 200.0);
         assert_eq!(metadata_image.bounds().height(), 100.0);
         assert!(metadata_only.input().content_height() >= 100.0);
+    }
+
+    /// 高亮真的画到了屏幕上——判据是**场景里的字形颜色**。
+    ///
+    /// 差分的两边只差一个语言名：`\u{60}\u{60}\u{60}rust` 与 `\u{60}\u{60}\u{60}`。文本、几何、
+    /// 字形数量全部相同，所以「颜色变了」不可能来自别的原因。**判据不来自
+    /// 被测的那条路**：这里一次都没问过 `TextRole`，只数场景图元的颜色。
+    #[test]
+    fn code_highlight_reaches_the_scene_as_glyph_colors() {
+        let body = "fn main() {\n    let x: u32 = 1;\n}\n";
+        let highlighted = scene_glyph_colors(&format!(
+            "\u{60}\u{60}\u{60}rust\n{body}\u{60}\u{60}\u{60}\n"
+        ));
+        let plain = scene_glyph_colors(&format!("\u{60}\u{60}\u{60}\n{body}\u{60}\u{60}\u{60}\n"));
+
+        assert_eq!(
+            highlighted.len(),
+            plain.len(),
+            "两边的字形数量必须相同——不同就说明差的不只是颜色"
+        );
+        assert_eq!(distinct(&plain), 1, "没有语言名的代码块只该有一种字形颜色");
+        // 数的是**正文色之外**还有几种。把正文色也算进去的话，「所有角色都
+        // 用同一种颜色」这个变异就是 2 种（黑 + 那一种），照样大于 1——它活过
+        // 一次，正是因为这里少减了正文色那一项。
+        let extra = highlighted
+            .iter()
+            .copied()
+            .filter(|color| *color != Rgba8::black())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            extra.len() >= 2,
+            "关键字、注释、字符串该是不同的颜色，实际只有 {} 种：{extra:?}",
+            extra.len()
+        );
+        // 没被着色的那些字形仍然用这一帧的正文颜色。这半句压的是「颜色覆盖
+        // 漏给了所有字形」——那样两边的颜色集合都会变，上面两条却都还过。
+        assert!(
+            highlighted.contains(&Rgba8::black()),
+            "未着色的字形该保持正文颜色"
+        );
+    }
+
+    fn distinct(colors: &[Rgba8]) -> usize {
+        colors
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// 一份文档排出来的全部字形颜色，按场景顺序。
+    fn scene_glyph_colors(source: &str) -> Vec<Rgba8> {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 200.0);
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(400.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_render_frame(
+            &mut document,
+            ViewportRenderConfig::new(
+                viewport,
+                font_size,
+                Rect::new(0.0, 0.0, 400.0, 200.0).expect("scene viewport"),
+                Rgba8::black(),
+            ),
+            &shaper,
+            &atlas,
+            &mut RenderPlanBuilder::new(),
+        )
+        .expect("frame");
+        frame
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Glyph(glyph) => Some(glyph.color()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

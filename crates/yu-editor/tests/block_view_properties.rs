@@ -955,3 +955,124 @@ fn a_prefix_edit_moves_the_checkbox_with_its_block() {
     assert_eq!(after.source().end().get(), before.source().end().get() + 2);
     assert_eq!(after.bounds(), before.bounds(), "块外的编辑不该动几何");
 }
+
+/// 一个等宽的测试 shaper：一个 grapheme 一个字形，宽度恒为 2。
+///
+/// 高亮的角色只有在**字形**上才看得见（`BlockGlyph`），而
+/// `MonospaceMetrics` 那条路只量宽度、不产字形。用例因此必须走
+/// `build_shaped`。这个 shaper 与 `MonospaceMetrics::new(2.0)` 的度量一致，
+/// 所以它不引入第二套几何。
+#[derive(Clone, Copy, Debug)]
+struct TestShaper;
+
+impl yu_core::ShapingProvider for TestShaper {
+    type Error = &'static str;
+
+    fn shape(
+        &self,
+        text: &str,
+        source: TextRange,
+        style: yu_core::TextStyle,
+    ) -> Result<yu_core::ShapedText, Self::Error> {
+        use unicode_segmentation::UnicodeSegmentation as _;
+        let glyphs = text
+            .grapheme_indices(true)
+            .map(|(start, cluster)| {
+                let from = source.start().get() + start as u64;
+                let to = from + cluster.len() as u64;
+                let range =
+                    TextRange::new(ByteOffset::new(from), ByteOffset::new(to)).expect("升序");
+                yu_core::Glyph::new(yu_core::GlyphId::from_raw(1), range, 2.0, 0.0, 0.0)
+            })
+            .collect();
+        Ok(yu_core::ShapedText::new(
+            source,
+            vec![yu_core::GlyphRun::new(
+                yu_core::FontFaceId::from_raw(1),
+                source,
+                style,
+                yu_core::TextDirection::Ltr,
+                yu_core::Script::Latin,
+                glyphs,
+            )],
+        ))
+    }
+}
+
+fn shaped_view(source: &str, width: f32) -> Option<BlockView> {
+    let buffer = TextBuffer::new(source.to_owned());
+    let snapshot = buffer.snapshot();
+    let (decorations, visual) = decorate(&snapshot, 0)?;
+    let config = LayoutConfig::new(width, 10.0).with_default_advance(2.0);
+    Some(BlockView::build_shaped(&visual, &decorations, config, &TestShaper).expect("BlockView"))
+}
+
+/// 高亮的角色跟着字形一直走到 `BlockGlyph`。
+///
+/// 判据是**字形自己的源码区间**：把 `glyph.source()` 切出来跟 `fn` / `u32`
+/// 比，而不是数「有几个字形带角色」。第四刀在这件事上付过两次——只数条数压
+/// 不住「指错了哪一处」。
+#[test]
+fn code_highlight_roles_reach_the_glyphs() {
+    let source = "```rust\nfn main() {\n    let x: u32 = 1;\n}\n```\n";
+    let view = shaped_view(source, 400.0).expect("代码块有 BlockView");
+    let text_of = |glyph: &yu_editor::BlockGlyph| {
+        let start = usize::try_from(glyph.source().start().get()).expect("短");
+        let end = usize::try_from(glyph.source().end().get()).expect("短");
+        source[start..end].to_owned()
+    };
+    let with_role = |role: yu_core::TextRole| {
+        view.glyphs()
+            .iter()
+            .filter(|glyph| glyph.role() == role)
+            .map(text_of)
+            .collect::<Vec<_>>()
+    };
+    // 等宽度量下一个 ASCII 字符一个字形，所以关键字 `fn` 是两个字形。
+    assert_eq!(
+        with_role(yu_core::TextRole::Keyword),
+        vec!["f", "n", "l", "e", "t"]
+    );
+    assert_eq!(with_role(yu_core::TextRole::Type), vec!["u", "3", "2"]);
+    // 角色不改变字面：代码块里的每一个字形都还是等宽的。
+    for glyph in view.glyphs() {
+        assert_eq!(
+            glyph.style(),
+            yu_core::TextStyle::Code,
+            "{:?} 掉出了等宽字面",
+            text_of(glyph)
+        );
+    }
+}
+
+/// 没有高亮的块，每一个字形都是 `TextRole::Plain`。
+///
+/// 与上一条合起来才说明「角色是加上去的」：只有上一条的话，一个把所有字形
+/// 都标成 `Keyword` 的实现也能过。
+#[test]
+fn blocks_without_highlight_carry_no_role() {
+    for source in [
+        "plain paragraph\n",
+        "# h1 title\n",
+        "```\nfn main() {}\n```\n",
+        // **普通列表项**，不是任务项：只有前者会产出替代标记（`•`），而标记的
+        // 字形不在 source 里、没有任何 Mark 盖着它，是全场唯一一条不查样式表
+        // 就写死角色的路。语料里只放任务项的话那一行根本走不到——「给标记也
+        // 编一个角色」这个变异因此活过一次。
+        "- item one\n",
+        "- [x] done item\n",
+        "text with `code` and **strong**\n",
+    ] {
+        let Some(view) = shaped_view(source, 400.0) else {
+            continue;
+        };
+        assert!(!view.glyphs().is_empty(), "语料 {source:?} 该排出字形");
+        for glyph in view.glyphs() {
+            assert_eq!(
+                glyph.role(),
+                yu_core::TextRole::Plain,
+                "语料 {source:?} 不该有角色"
+            );
+        }
+    }
+}

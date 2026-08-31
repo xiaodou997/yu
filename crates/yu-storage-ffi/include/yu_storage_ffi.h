@@ -439,6 +439,11 @@ typedef struct YuStorageMacosRenderHostSnapshot {
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
     uint64_t search_decoration_count;
+    /* How many glyphs in this frame carry a code-highlight color (a color
+     * other than this frame's body text color). This is the real-window
+     * criterion for syntax highlighting: it is counted from scene primitives,
+     * not from the decoration path that produced it. */
+    uint64_t highlighted_glyph_count;
     /* Non-zero when the visible range still has an image or embedded resource
      * that has not settled. The platform schedules one more submit so Rust can
      * drain its worker results; it does not classify resource states itself. */
@@ -469,6 +474,7 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
     uint64_t search_decoration_count;
+    uint64_t highlighted_glyph_count;
     uint8_t resource_refresh_pending;
     /* Rendered document height for this frame. The scrollable extent must come
      * from here: the platform has no second layout to derive it from (I5). */

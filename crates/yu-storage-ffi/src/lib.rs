@@ -487,6 +487,14 @@ pub struct YuStorageMacosRenderHostSnapshot {
     /// 它是**搜索高亮的判据**：真实窗口里唯一能证明「改了查询，画面真的跟着
     /// 变了」的量，而它来自场景，不来自搜索自己那条路。
     pub search_decoration_count: u64,
+    /// 这一帧有几个字形被上了**代码高亮的颜色**（颜色与这一帧的正文色不同）。
+    ///
+    /// 它是代码高亮在真实窗口里的判据。自动化那几层压得住「角色算对了」与
+    /// 「颜色查对了」，压不住的是**这一帧真的把它们画出去了**——第三刀与第四刀
+    /// 各有一个缺陷是在自动化全绿之后才被真实窗口抓到的，两次都是颜色。
+    ///
+    /// 数的是**场景图元**，不是装饰、不是 `TextRole`：判据不来自被测的那条路。
+    pub highlighted_glyph_count: u64,
     /// 当前可见范围内还有未落定的图片或内嵌资源，需要再提交一次去收割 worker
     /// 的结果。这个判断此前在平台侧，要三次纯查询往返才能得出。
     pub resource_refresh_pending: u8,
@@ -540,6 +548,8 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub caret_decoration_count: u64,
     /// 见 [`YuStorageMacosRenderHostSnapshot::search_decoration_count`]。
     pub search_decoration_count: u64,
+    /// 见 [`YuStorageMacosRenderHostSnapshot::highlighted_glyph_count`]。
+    pub highlighted_glyph_count: u64,
     /// 见 [`YuStorageMacosRenderHostSnapshot::resource_refresh_pending`]。
     pub resource_refresh_pending: u8,
     /// 这一帧渲染出来的文档总高度。可滚动范围必须以它为准——平台没有第二套
@@ -4437,6 +4447,30 @@ fn macos_editor_decoration_counts(scene: &yu_scene::Scene) -> Result<(u64, u64, 
     Ok((selection, caret, search))
 }
 
+/// 这一帧有几个字形的颜色不是正文色。
+///
+/// 「正文色」取这一帧渲染配置里的那个值，不是一个写死的常数：配置换了颜色而
+/// 这里没跟着换，表现会是「整篇文档都被算成高亮」——一个不报错的假绿。
+#[cfg(target_os = "macos")]
+fn macos_highlighted_glyph_count(
+    scene: &yu_scene::Scene,
+    text_color: yu_scene::Rgba8,
+) -> Result<u64, i32> {
+    let mut count = 0_u64;
+    for primitive in scene.primitives() {
+        let Primitive::Glyph(glyph) = primitive else {
+            continue;
+        };
+        if glyph.color() == text_color {
+            continue;
+        }
+        count = count
+            .checked_add(1)
+            .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    }
+    Ok(count)
+}
+
 #[cfg(target_os = "macos")]
 fn macos_render_host_snapshot(
     state: &MacosRenderHostState,
@@ -4457,6 +4491,8 @@ fn macos_render_host_snapshot(
     let frame_serial = state.host.frame_serial().unwrap_or(u64::MAX);
     let (selection_decoration_count, caret_decoration_count, search_decoration_count) =
         macos_editor_decoration_counts(frame.scene().scene())?;
+    let highlighted_glyph_count =
+        macos_highlighted_glyph_count(frame.scene().scene(), config.color())?;
     Ok(YuStorageMacosRenderHostSnapshot {
         revision: publication.revision().get(),
         composition_generation,
@@ -4484,6 +4520,7 @@ fn macos_render_host_snapshot(
         selection_decoration_count,
         caret_decoration_count,
         search_decoration_count,
+        highlighted_glyph_count,
         // 调用方在离开 host 借用之后填入；这里没有 session 可查。
         resource_refresh_pending: 0,
     })
@@ -5084,6 +5121,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 selection_decoration_count: host_snapshot.selection_decoration_count,
                 caret_decoration_count: host_snapshot.caret_decoration_count,
                 search_decoration_count: host_snapshot.search_decoration_count,
+                highlighted_glyph_count: host_snapshot.highlighted_glyph_count,
                 resource_refresh_pending: host_snapshot.resource_refresh_pending,
                 content_height: host_snapshot.content_height,
             };

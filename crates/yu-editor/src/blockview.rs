@@ -28,7 +28,7 @@ use std::ops::Range;
 
 use yu_core::{
     ByteOffset, CaretAffinity, ClusterMetrics, FontFaceId, GlyphId, LineStyleId, Revision,
-    ShapingProvider, TextRange, TextStyle, VisualOffset, VisualRange,
+    ShapingProvider, TextRange, TextRole, TextStyle, VisualOffset, VisualRange,
 };
 use yu_decoration::Bias;
 use yu_layout::{
@@ -119,6 +119,7 @@ pub struct BlockGlyph {
     line: usize,
     origin: LayoutPoint,
     style: TextStyle,
+    role: TextRole,
     size_scale: f32,
 }
 
@@ -157,6 +158,15 @@ impl BlockGlyph {
     #[must_use]
     pub const fn style(self) -> TextStyle {
         self.style
+    }
+
+    /// 这个字形在配色里的角色。解释成 RGBA 是更上面那一层的事。
+    ///
+    /// 与 [`Self::style`] 一样取的是**解释之后**的那个值，不是 `StyleId`：
+    /// 场景层不该拿着一个只有装饰层看得懂的号码。
+    #[must_use]
+    pub const fn role(self) -> TextRole {
+        self.role
     }
 
     /// 相对 shaper 基准字号的倍率。栅格化按它选字号。
@@ -447,7 +457,7 @@ impl BlockView {
         table: Option<TableLayout>,
     ) -> Result<Self, LayoutError> {
         let clusters = source_backed_clusters(visual, &layout, input.styles())?;
-        let glyphs = source_backed_glyphs(&layout, &clusters, input.ornaments())?;
+        let glyphs = source_backed_glyphs(&layout, &clusters, input.ornaments(), input.styles())?;
         let lines = flow_lines(visual, &layout)?;
         let mut view = Self {
             visual: visual.clone(),
@@ -1042,6 +1052,10 @@ impl BlockView {
                     line: cell.row(),
                     origin: point,
                     style: cluster.style,
+                    role: styles
+                        .attrs(glyph.style())
+                        .ok_or(LayoutError::UnknownStyle(glyph.style()))?
+                        .role(),
                     size_scale: glyph.size_scale(),
                 });
             }
@@ -1149,6 +1163,7 @@ fn source_backed_glyphs(
     layout: &BlockLayout,
     clusters: &[BlockCluster],
     ornaments: &BlockOrnaments,
+    styles: &crate::blockinput::BlockStyleTable,
 ) -> Result<Vec<BlockGlyph>, LayoutError> {
     let mut glyphs = Vec::with_capacity(layout.glyphs().len());
     if let Some(marker) = ornaments.marker()
@@ -1173,6 +1188,9 @@ fn source_backed_glyphs(
                     line: 0,
                     origin,
                     style: TextStyle::Plain,
+                    // 列表标记的 `•` 不在 source 里，也没有任何 Mark 盖着它，
+                    // 所以它没有角色可查：用正文颜色。
+                    role: TextRole::Plain,
                     size_scale: 1.0,
                 });
                 x += glyph.advance();
@@ -1194,6 +1212,12 @@ fn source_backed_glyphs(
             line: glyph.line(),
             origin: glyph.origin(),
             style: cluster.style,
+            // 角色问**字形自己的** `StyleId`，不问簇：两者本来同源，但簇的
+            // `style` 是已经解释过的 `TextStyle`，接不住第二样属性。
+            role: styles
+                .attrs(glyph.style())
+                .ok_or(LayoutError::UnknownStyle(glyph.style()))?
+                .role(),
             size_scale: glyph.size_scale(),
         });
     }
