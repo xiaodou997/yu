@@ -1105,7 +1105,13 @@ fn entity_prefix_len(text: &str) -> Option<(usize, String)> {
         .map(|entity| (end, entity.characters.to_owned()))
 }
 
-/// 引用标签的规范化：折叠空白、大小写不敏感。
+/// 引用标签的规范化：折叠空白，再做 Unicode default case fold。
+///
+/// **折大小写这一步必须是 full case folding，不是 `char::to_lowercase`。**
+/// 规范用例 540（`[ẞ]` 配 `[SS]:`）只在这里分得出两者：simple lowercase 把
+/// `ẞ` 折成 `ß`，full fold 折成 `ss`。它曾经是不变量 F3 那条登记的偏差，
+/// S7 第六刀连同产品链路（`yu_markdown::reference::normalized_label`）一起
+/// 换成了 `caseless`——**两处必须是同一个答案**，所以版本走 workspace。
 fn normalize_label(label: &str) -> String {
     let mut out = String::with_capacity(label.len());
     let mut in_space = false;
@@ -1117,10 +1123,10 @@ fn normalize_label(label: &str) -> String {
                 out.push(' ');
             }
             in_space = false;
-            out.extend(ch.to_lowercase());
+            out.push(ch);
         }
     }
-    out
+    caseless::default_case_fold_str(&out)
 }
 
 /// 从每一行开头剥掉最多 `columns` 列的空白，制表符按 4 对齐。

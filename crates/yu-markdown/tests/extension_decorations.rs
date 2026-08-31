@@ -1060,7 +1060,6 @@ fn reference_labels_collapse_whitespace() {
 ///
 /// `[Ä]` 与 `[ä]` 在 CommonMark 里是同一个标签。归一化那一步此前用
 /// `to_ascii_lowercase`，折不到一起——症状是一条写对了的引用画成普通文字。
-/// 这是 F3 选的那一种归一化（simple lowercase，不是 full case folding）。
 #[test]
 fn reference_labels_fold_case_beyond_ascii() {
     let decorations = decorate("[Ärger][GRÜN]\n\n[grün]: /目标\n", None);
@@ -1068,6 +1067,36 @@ fn reference_labels_fold_case_beyond_ascii() {
         !hidden(&decorations).is_empty(),
         "大小写不同的标签该折到一起"
     );
+}
+
+/// 折的是 **full case folding**，不是 simple lowercase（不变量 F3，S7 第六刀
+/// 关掉）。
+///
+/// 两者只在少数几个字符上分得开，而**这一侧的语料里一个都没有**：把
+/// `normalized_label` 从 `caseless::default_case_fold_str` 换回
+/// `str::to_lowercase`，`yu-markdown` 的 116 条用例一条都不红——实测过。
+/// 唯一会红的是 `yu-syntax` 的规范棘轮，而那是**另一份实现**
+/// （`tests/support/html.rs::normalize_label`）。判据不能靠另一条路代劳，
+/// 所以产品链路自己要有这一条。
+///
+/// `ẞ`（U+1E9E）的 simple lowercase 是 `ß`，full fold 是 `ss`；`ﬁ`（U+FB01）
+/// 的 lowercase 还是它自己，full fold 是 `fi`。两条各一个方向。
+#[test]
+fn reference_labels_use_full_case_folding_not_simple_lowercase() {
+    for source in [
+        // 规范用例 540 的形状。
+        "[ẞ]\n\n[SS]: /目标\n",
+        // 反过来写，定义带 `ẞ`。
+        "[文字][SS]\n\n[ẞ]: /目标\n",
+        // 连字：`ﬁ` 只有 full fold 折得开。
+        "[文字][ﬁle]\n\n[file]: /目标\n",
+    ] {
+        let decorations = decorate(source, None);
+        assert!(
+            !hidden(&decorations).is_empty(),
+            "{source:?}：full case folding 该让这两个标签折到一起"
+        );
+    }
 }
 
 /// 表格的网格由 `BlockOrnament::Table` 带上来。

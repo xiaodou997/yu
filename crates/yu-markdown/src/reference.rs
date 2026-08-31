@@ -204,22 +204,27 @@ fn scan_definition(source: &TextSnapshot, range: TextRange) -> Option<Definition
     })
 }
 
-/// 引用标签的归一化。**这是 F3 要选的那一种。**
+/// 引用标签的归一化。CommonMark 的三条规则在这里都做全了。
 ///
-/// CommonMark 的规则有三条：去掉首尾空白、把内部连续空白折成一个空格、做
-/// **Unicode case fold**。这里前两条照做，第三条取 `str::to_lowercase`
-/// （Unicode simple lowercase），不是 full case folding。
+/// 去掉首尾空白、把内部连续空白折成一个空格、做 **Unicode default case
+/// fold**（`caseless::default_case_fold_str`）。第三条曾经是 `str::
+/// to_lowercase`（simple lowercase），差别只在少数几个字符上——`ẞ` fold 成
+/// `ss` 而 lowercase 成 `ß`，`ﬁ` fold 成 `fi`——但那几个字符正是不变量 F3
+/// 登记的那条偏差。**S7 第六刀关掉了它**：`yu-markdown` 因此有了它的第一个
+/// 外部依赖，理由与代价写在 Cargo.toml 与 overview 第 8 节 S7 第六刀。
 ///
-/// # 为什么停在 simple lowercase
+/// # 折出来的东西只是一个查表键
 ///
-/// full fold 与 simple lowercase 只在少数几个字符上不同（`ẞ` fold 成 `ss`
-/// 而 lowercase 成 `ß`，`ﬁ` fold 成 `fi`），标准库不提供，要引入一个依赖。
-/// `yu-markdown` 现在**一个外部依赖都没有**，为这几个字符扩大依赖面不划算
-/// （第 6 节的依赖取舍）。
+/// 返回的字节串进 [`hash_bytes`]，再由 [`ReferenceDefinitionIndex::lookup`]
+/// 逐字节比对。**它从来不映射回源码偏移**，所以 full fold 让 `ẞ` 变成两个
+/// 字节这件事在这里没有任何后果。搜索的「不区分大小写」是另一回事：那条路
+/// 要回报 `TextRange`，折叠必须给得出对齐信息，`caseless` 给不出——两件事
+/// 只是碰巧都需要一份 case folding，见 `yu-editor::search` 的模块文档。
 ///
-/// 但 `to_ascii_lowercase` 是**不够**的：`[Ä]` 与 `[ä]` 在 CommonMark 里是
-/// 同一个标签，按 ASCII 折不到一起。这一步是从「只认 ASCII」走到「认 Unicode
-/// 的绝大多数」，剩下的那几个字符登记在 F3 上。
+/// # 空白按 CommonMark 取，不按 `char::is_whitespace`
+///
+/// 见下面循环里的注释。comrak 在同一处用的是 `char::is_whitespace`
+/// （`comrak::strings::normalize_label`），那是一处已知的、比规范宽的取法。
 fn normalized_label(source: &TextSnapshot, range: TextRange) -> Option<Vec<u8>> {
     let text = String::from_utf8(read_range(source, range)?).ok()?;
     let mut collapsed = String::new();
@@ -240,7 +245,7 @@ fn normalized_label(source: &TextSnapshot, range: TextRange) -> Option<Vec<u8>> 
         }
         collapsed.push(character);
     }
-    Some(collapsed.to_lowercase().into_bytes())
+    Some(caseless::default_case_fold_str(&collapsed).into_bytes())
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {

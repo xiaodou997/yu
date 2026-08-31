@@ -15,6 +15,10 @@ yu-syntax = { path = "../yu-syntax" }
 yu-decoration = { path = "../yu-decoration" }
 # 围栏代码块的着色。tree-sitter 关在那个 crate 里，这里看不见它。
 yu-highlight = { path = "../yu-highlight" }
+# 这个 crate 的**第一个也是唯一一个**外部依赖，接它的理由只有一条：引用标签
+# 的 Unicode full case folding（不变量 F3）。标准库只有 simple lowercase，
+# `ẞ` 折成 `ß` 而不是 `ss`，于是 `[ẞ]` 匹配不上 `[SS]:`。
+caseless = { workspace = true }
 
 [lints]
 workspace = true
