@@ -15,7 +15,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.0
-          components: rustfmt, clippy
+          # llvm-tools 是为了 check-ffi-symbols.py：Windows runner 上没有
+          # nm，llvm-nm 从 rustup 的 sysroot 里拿。
+          components: rustfmt, clippy, llvm-tools
       - run: cargo fmt --all --check
       # 本地 tools/verify.sh 必须能跑到这里的每一条命令。删掉一个 crate 时
       # 曾经打断过一个 CI job 而本地全绿——本地门禁给了它无权给的绿灯。
@@ -26,6 +28,11 @@ jobs:
       # 头文件是手写的，与 Rust 实现之间没有编译期约束：删掉一个
       # extern "C" fn 不会让头文件报错，孤儿声明也不会让构建失败。
       - run: python3 tools/check-ffi-header.py
+      # 上一条读源码，正则不认识 cfg。这一条读产物的符号表——两个整个挂在
+      # cfg(target_os = "macos") 下的函数曾经让头文件在 Windows/Linux 上
+      # 撒谎，而当时全套门禁是绿的：从来没有人在非 macOS 上*链接*过这个
+      # staticlib，只*编译*过。三个平台的覆盖靠的就是上面这个矩阵。
+      - run: python3 tools/check-ffi-symbols.py
       # 字节/字符索引混用不会 panic，只会在某个 emoji 上悄悄切错位置。
       # 不变量 E4 要求 ropey 留在 yu-text 里，这条边界只能靠检查守。
       - run: python3 tools/check-rope-leak.py
