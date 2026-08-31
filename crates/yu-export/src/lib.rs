@@ -2,21 +2,44 @@
 
 //! Source-backed clipboard payloads for Yu.
 //!
-//! Markdown remains the canonical payload. The HTML fragment is generated from
-//! the same selected source range by the current lossless Markdown parser; it
-//! is deliberately conservative for syntax that the parser does not yet
-//! classify instead of pretending that a TextKit projection is semantic HTML.
+//! # Markdown 是正本，HTML 是给别人看的那一份
+//!
+//! 三种表示都从**同一段源码区间**产出：Markdown 与纯文本就是那段字节原样，
+//! HTML 由 comrak 渲染。所以这个 crate 不做投影、不复制正文、不认识排版。
+//!
+//! # 为什么 HTML 走 comrak 而不是自己渲染（S7 第六刀）
+//!
+//! 这里以前有一份自研渲染器，建在 `yu_markdown::BlockKind` 上。它**不是「编辑
+//! 器画成什么样」的另一种说法，而是第三个答案**，而且是三个里最差的一个：
+//! 652 条 CommonMark 规范用例里，按标签间空白归一化之后它只对 163 条
+//! （`html.rs` 643，comrak 652）。逐条看过的分歧分两类——
+//!
+//! - **它自己错**：`[label][missing]` 渲染成 `<p>label</p>`，**把 `[missing]`
+//!   整段吞掉**；链接与图片的 title 一律丢掉。
+//! - **它跟着编辑器一起短**：`***`、缩进代码块、HTML 块在 `BlockKind` 里没有
+//!   变体，编辑器按不变量 I5 画成普通段落源码，它也照着导出。
+//!
+//! **导出的契约是「这段 Markdown 是什么意思」，不是「编辑器把它画成什么样」。**
+//! 剪贴板是给别的 app 的，别的 app 认的是 CommonMark。所以第二类分歧是**有意
+//! 留下的**：那几处「所见 ≠ 所拷」落在编辑器自己欠的账上（`BlockKind` 粗、
+//! 块边界没合并），不由导出去迁就。不变量 F1（括号配对）与 F2（制表符）同理：
+//! **它们是解析的偏差，导出不随它们偏**——这条登记在 invariants 第 F 节。
+//!
+//! # comrak 的开关照抄 Yu 自己的语法集合，不多不少
+//!
+//! [`options`] 只开 `tasklist` 与 `table`，因为 Yu 只有这两样 GFM 扩展。多开
+//! 一样（比如删除线）会让导出认得编辑器不认得的语法，那是反方向的分叉。
+//!
+//! `render.unsafe = true`：另一条路是 `<!-- raw HTML omitted -->`，**静默删掉
+//! 用户自己写在文档里的内容**——那正是这个项目最危险的失败模式。导入侧仍然
+//! 拒绝原始 HTML，这个不对称是有意的：导出的是用户自己的文档，导入的是别人
+//! 的 HTML。
 
 use std::error::Error;
 use std::fmt;
 
-use yu_core::{ByteOffset, Revision, TextRange};
-use yu_markdown::{
-    Block, BlockKind, InlineDocument, InlineNodeKind, InlineSpan, InlineSpanKind, MarkdownDocument,
-    ReferenceDefinitionIndex, TableAlignment, TableBlock, TaskState, parse,
-    parse_inline_with_definitions, parse_table,
-};
-use yu_text::{TextBuffer, TextPositionError, TextSnapshot};
+use yu_core::{Revision, TextRange};
+use yu_text::{TextPositionError, TextSnapshot};
 
 mod html_import;
 
@@ -126,7 +149,6 @@ pub enum ExportError {
         expected: Revision,
     },
     SourcePosition(TextPositionError),
-    InlineParse(yu_markdown::InlineParseError),
 }
 
 impl fmt::Display for ExportError {
@@ -137,9 +159,6 @@ impl fmt::Display for ExportError {
                 "clipboard snapshot revision {snapshot:?} does not match expected {expected:?}"
             ),
             Self::SourcePosition(error) => error.fmt(formatter),
-            Self::InlineParse(error) => {
-                write!(formatter, "cannot parse clipboard inline source: {error}")
-            }
         }
     }
 }
@@ -148,7 +167,6 @@ impl Error for ExportError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SourcePosition(error) => Some(error),
-            Self::InlineParse(error) => Some(error),
             Self::RevisionMismatch { .. } => None,
         }
     }
@@ -157,12 +175,6 @@ impl Error for ExportError {
 impl From<TextPositionError> for ExportError {
     fn from(error: TextPositionError) -> Self {
         Self::SourcePosition(error)
-    }
-}
-
-impl From<yu_markdown::InlineParseError> for ExportError {
-    fn from(error: yu_markdown::InlineParseError) -> Self {
-        Self::InlineParse(error)
     }
 }
 
@@ -180,7 +192,7 @@ pub fn export_clipboard(
     }
     let markdown = slice(snapshot, source_range)?.to_owned();
     let plain_text = markdown.clone();
-    let html = export_html_fragment(&markdown)?;
+    let html = export_html_fragment(&markdown);
     Ok(ClipboardPayload {
         revision: expected_revision,
         source_range,
@@ -190,15 +202,28 @@ pub fn export_clipboard(
     })
 }
 
-/// Exports a source string as an HTML fragment. This helper is useful for
-/// tests and for future non-editor clipboard providers.
-pub fn export_html_fragment(source: &str) -> Result<String, ExportError> {
-    let buffer = TextBuffer::new(source);
-    let snapshot = buffer.snapshot();
-    let document = parse(&snapshot);
-    let mut html = String::new();
-    render_blocks(&document, document.blocks().iter(), &mut html)?;
-    Ok(html)
+/// Exports a source string as an HTML fragment.
+///
+/// 这就是 comrak 那一层薄薄的包装：Yu 这一侧只负责**选项**，不负责渲染。
+/// 选项的取法见模块文档。
+#[must_use]
+pub fn export_html_fragment(source: &str) -> String {
+    comrak::markdown_to_html(source, &options())
+}
+
+/// comrak 的选项。**它必须与 Yu 自己认得的语法集合一致，不多不少。**
+///
+/// - `tasklist`：`yu-syntax` 无条件解析 GFM 任务项（`block.rs::is_task_marker`）。
+/// - `table`：`yu-markdown` 有一个 `table` extension。
+/// - **不开**删除线、autolink 之类：Yu 不认得它们，开了就是导出认得而编辑器
+///   不认得，与「导出别去迁就编辑器」是反方向的同一个错。
+/// - `unsafe`：见模块文档，另一条路会静默删内容。
+fn options() -> comrak::Options<'static> {
+    let mut options = comrak::Options::default();
+    options.render.r#unsafe = true;
+    options.extension.tasklist = true;
+    options.extension.table = true;
+    options
 }
 
 fn slice(snapshot: &TextSnapshot, range: TextRange) -> Result<&str, ExportError> {
@@ -209,560 +234,31 @@ fn slice(snapshot: &TextSnapshot, range: TextRange) -> Result<&str, ExportError>
     Ok(&snapshot.as_str()[start..end])
 }
 
-fn render_blocks(
-    markdown: &MarkdownDocument,
-    blocks: impl IntoIterator<Item = Block>,
-    output: &mut String,
-) -> Result<(), ExportError> {
-    let snapshot = markdown.source();
-    let mut blocks = blocks.into_iter().peekable();
-    let mut first = true;
-    while let Some(block) = blocks.next() {
-        let fragment = if list_signature(block.kind()).is_some() {
-            let mut run = vec![block];
-            while let Some(next) = blocks.peek().copied() {
-                if list_signature(next.kind()).is_some() {
-                    run.push(blocks.next().expect("peeked list block must be available"));
-                } else {
-                    break;
-                }
-            }
-            render_list_run(snapshot, &run)?
-        } else {
-            render_block(markdown, block)?
-        };
-        if fragment.is_empty() {
-            continue;
-        }
-        if !first {
-            output.push('\n');
-        }
-        first = false;
-        output.push_str(&fragment);
-    }
-    Ok(())
-}
-
-fn list_signature(kind: BlockKind) -> Option<(bool, u8)> {
-    match kind {
-        BlockKind::ListItem { ordered, depth, .. }
-        | BlockKind::TaskListItem { ordered, depth, .. } => Some((ordered, depth)),
-        _ => None,
-    }
-}
-
-fn render_block(markdown: &MarkdownDocument, block: Block) -> Result<String, ExportError> {
-    let snapshot = markdown.source();
-    let definitions = markdown.reference_definitions();
-    let source = slice(snapshot, block.range())?;
-    match block.kind() {
-        BlockKind::BlankLine | BlockKind::ReferenceDefinition => Ok(String::new()),
-        BlockKind::Paragraph => {
-            if let Some(table) = parse_table(source) {
-                return render_table(source, &table);
-            }
-            let mut html = String::from("<p>");
-            render_inline(snapshot, definitions, block.range(), &mut html)?;
-            html.push_str("</p>");
-            Ok(html)
-        }
-        BlockKind::Heading { level } => {
-            let content = yu_markdown::heading_content_range(markdown, block);
-            let mut html = format!("<h{level}>");
-            render_inline(snapshot, definitions, content, &mut html)?;
-            html.push_str(&format!("</h{level}>"));
-            Ok(html)
-        }
-        BlockKind::FencedCodeBlock { marker, closed } => {
-            Ok(render_fenced_code(source, marker, closed))
-        }
-        BlockKind::BlockQuote { .. } => {
-            let stripped = strip_blockquote(source);
-            let inner = export_html_fragment(&stripped)?;
-            Ok(format!("<blockquote>{inner}</blockquote>"))
-        }
-        BlockKind::ListItem { .. } | BlockKind::TaskListItem { .. } => {
-            render_list_run(snapshot, &[block])
-        }
-    }
-}
-
-fn render_table(source: &str, table: &TableBlock) -> Result<String, ExportError> {
-    let mut html = String::from("<table><thead><tr>");
-    for (cell, alignment) in table.header().iter().zip(table.alignments()) {
-        html.push_str("<th");
-        html.push_str(table_alignment_attribute(*alignment));
-        html.push('>');
-        render_table_cell(source, *cell, &mut html)?;
-        html.push_str("</th>");
-    }
-    html.push_str("</tr></thead>");
-    if !table.rows().is_empty() {
-        html.push_str("<tbody>");
-        for row in table.rows() {
-            html.push_str("<tr>");
-            for (cell, alignment) in row.iter().zip(table.alignments()) {
-                html.push_str("<td");
-                html.push_str(table_alignment_attribute(*alignment));
-                html.push('>');
-                render_table_cell(source, *cell, &mut html)?;
-                html.push_str("</td>");
-            }
-            html.push_str("</tr>");
-        }
-        html.push_str("</tbody>");
-    }
-    html.push_str("</table>");
-    Ok(html)
-}
-
-fn render_table_cell(
-    source: &str,
-    cell: yu_markdown::TableCellRange,
-    output: &mut String,
-) -> Result<(), ExportError> {
-    let value = &source[cell.start()..cell.end()];
-    let inner = export_html_fragment(value)?;
-    append_tight_fragment_content(&inner, output);
-    Ok(())
-}
-
-fn table_alignment_attribute(alignment: TableAlignment) -> &'static str {
-    match alignment {
-        TableAlignment::Default => "",
-        TableAlignment::Left => " style=\"text-align: left\"",
-        TableAlignment::Center => " style=\"text-align: center\"",
-        TableAlignment::Right => " style=\"text-align: right\"",
-    }
-}
-
-fn render_inline(
-    snapshot: &TextSnapshot,
-    definitions: &ReferenceDefinitionIndex,
-    range: TextRange,
-    output: &mut String,
-) -> Result<(), ExportError> {
-    let inline = parse_inline_with_definitions(snapshot, range, Some(definitions))?;
-    let renderer = InlineRenderer {
-        snapshot,
-        inline: &inline,
-        definitions,
-    };
-    renderer.render_range(range, output)
-}
-
-struct InlineRenderer<'a> {
-    snapshot: &'a TextSnapshot,
-    inline: &'a InlineDocument,
-    definitions: &'a ReferenceDefinitionIndex,
-}
-
-impl InlineRenderer<'_> {
-    fn render_range(&self, range: TextRange, output: &mut String) -> Result<(), ExportError> {
-        let mut cursor = range.start();
-        while cursor < range.end() {
-            let Some(span) = self.next_span(cursor, range.end()) else {
-                self.render_plain(cursor, range.end(), output);
-                break;
-            };
-            if span.source_range().start() > cursor {
-                self.render_plain(cursor, span.source_range().start(), output);
-            }
-            self.render_span(span, output)?;
-            cursor = span.source_range().end();
-        }
-        Ok(())
-    }
-
-    fn next_span(&self, cursor: ByteOffset, end: ByteOffset) -> Option<InlineSpan> {
-        self.inline
-            .spans()
-            .iter()
-            .copied()
-            .filter(|span| {
-                span.source_range().start() >= cursor && span.source_range().end() <= end
-            })
-            .min_by_key(|span| {
-                (
-                    span.source_range().start(),
-                    std::cmp::Reverse(span.source_range().end()),
-                )
-            })
-    }
-
-    fn render_span(&self, span: InlineSpan, output: &mut String) -> Result<(), ExportError> {
-        match span.kind() {
-            InlineSpanKind::Emphasis | InlineSpanKind::Strong => {
-                let (open, close) = if span.kind() == InlineSpanKind::Emphasis {
-                    ("<em>", "</em>")
-                } else {
-                    ("<strong>", "</strong>")
-                };
-                output.push_str(open);
-                self.render_range(span.content(), output)?;
-                output.push_str(close);
-            }
-            InlineSpanKind::CodeSpan => {
-                output.push_str("<code>");
-                self.render_escaped(span.content(), output);
-                output.push_str("</code>");
-            }
-            InlineSpanKind::Link | InlineSpanKind::Autolink => {
-                let destination = span.destination().unwrap_or(span.content());
-                output.push_str("<a href=\"");
-                self.render_attribute(destination, output);
-                output.push_str("\">");
-                self.render_range(span.content(), output)?;
-                output.push_str("</a>");
-            }
-            InlineSpanKind::Image => {
-                output.push_str("<img src=\"");
-                if let Some(destination) = span.destination() {
-                    self.render_attribute(destination, output);
-                }
-                output.push_str("\" alt=\"");
-                self.render_attribute(span.content(), output);
-                output.push_str("\">");
-            }
-            InlineSpanKind::ReferenceLink | InlineSpanKind::ReferenceImage => {
-                let label = span
-                    .reference()
-                    .filter(|range| !range.is_empty())
-                    .unwrap_or(span.content());
-                let Some(definition) = self.definitions.lookup(self.snapshot, label) else {
-                    self.render_plain(span.content().start(), span.content().end(), output);
-                    return Ok(());
-                };
-                if span.kind() == InlineSpanKind::ReferenceImage {
-                    output.push_str("<img src=\"");
-                    self.render_attribute(definition.destination(), output);
-                    output.push_str("\" alt=\"");
-                    self.render_attribute(span.content(), output);
-                    output.push_str("\">");
-                } else {
-                    output.push_str("<a href=\"");
-                    self.render_attribute(definition.destination(), output);
-                    output.push_str("\">");
-                    self.render_range(span.content(), output)?;
-                    output.push_str("</a>");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn render_plain(&self, start: ByteOffset, end: ByteOffset, output: &mut String) {
-        for node in self.inline.nodes() {
-            let node_range = node.range();
-            if node_range.end() <= start || node_range.start() >= end {
-                continue;
-            }
-            let node_start = node_range.start().max(start);
-            let node_end = node_range.end().min(end);
-            match node.kind() {
-                InlineNodeKind::LineBreak { hard } => {
-                    if hard {
-                        output.push_str("<br>\n");
-                    } else {
-                        output.push('\n');
-                    }
-                }
-                InlineNodeKind::Escaped if node_start == node_range.start() => {
-                    let unescaped_start = ByteOffset::new(node_range.start().get() + 1);
-                    let unescaped_range = TextRange::new(unescaped_start, node_range.end())
-                        .expect("escaped node has a scalar after its marker");
-                    self.render_escaped_range(unescaped_range, output);
-                }
-                _ => self.render_escaped_range(
-                    TextRange::new(node_start, node_end).expect("clipped node range is ordered"),
-                    output,
-                ),
-            }
-        }
-    }
-
-    fn render_escaped(&self, range: TextRange, output: &mut String) {
-        self.render_escaped_range(range, output);
-    }
-
-    fn render_escaped_range(&self, range: TextRange, output: &mut String) {
-        let text = slice(self.snapshot, range).expect("parser-owned range is valid");
-        escape_html_text(text, output);
-    }
-
-    fn render_attribute(&self, range: TextRange, output: &mut String) {
-        let text = slice(self.snapshot, range).expect("parser-owned range is valid");
-        escape_html_attribute(text, output);
-    }
-}
-
-fn render_fenced_code(source: &str, marker: char, closed: bool) -> String {
-    let mut lines = source.split_inclusive('\n').collect::<Vec<_>>();
-    if lines.is_empty() {
-        lines.push(source);
-    }
-    let info = lines
-        .first()
-        .map(|line| line.trim_end_matches(['\r', '\n']))
-        .map(|line| line.trim_start_matches([' ', '\t', marker]))
-        .unwrap_or("")
-        .trim();
-    let language = info.split_whitespace().next().unwrap_or("");
-    let body_end = if closed && lines.len() > 1 {
-        lines.len() - 1
-    } else {
-        lines.len()
-    };
-    let body = lines
-        .get(1..body_end)
-        .unwrap_or_default()
-        .iter()
-        .copied()
-        .collect::<String>();
-    let mut output = String::from("<pre><code");
-    if !language.is_empty() {
-        output.push_str(" class=\"language-");
-        escape_html_attribute(language, &mut output);
-        output.push('"');
-    }
-    output.push('>');
-    escape_html_text(&body, &mut output);
-    output.push_str("</code></pre>");
-    output
-}
-
-fn strip_blockquote(source: &str) -> String {
-    source
-        .lines()
-        .map(|line| {
-            let line = line.trim_start_matches([' ', '\t']);
-            let line = line.strip_prefix('>').unwrap_or(line);
-            line.strip_prefix([' ', '\t']).unwrap_or(line)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn render_list_run(snapshot: &TextSnapshot, blocks: &[Block]) -> Result<String, ExportError> {
-    let mut cursor = 0;
-    let mut output = String::new();
-    while cursor < blocks.len() {
-        let (ordered, depth) =
-            list_signature(blocks[cursor].kind()).expect("list run contains only list blocks");
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str(&render_list_level(
-            snapshot,
-            blocks,
-            &mut cursor,
-            depth,
-            ordered,
-        )?);
-    }
-    Ok(output)
-}
-
-fn render_list_level(
-    snapshot: &TextSnapshot,
-    blocks: &[Block],
-    cursor: &mut usize,
-    depth: u8,
-    ordered: bool,
-) -> Result<String, ExportError> {
-    let start = list_start(blocks[*cursor].kind());
-    let mut html = if ordered {
-        if start > 1 {
-            format!("<ol start=\"{start}\">")
-        } else {
-            String::from("<ol>")
-        }
-    } else {
-        String::from("<ul>")
-    };
-
-    while *cursor < blocks.len() {
-        let Some((item_ordered, item_depth)) = list_signature(blocks[*cursor].kind()) else {
-            break;
-        };
-        if item_depth != depth || item_ordered != ordered {
-            break;
-        }
-        let block = blocks[*cursor];
-        *cursor += 1;
-        html.push_str("<li>");
-        let source = slice(snapshot, block.range())?;
-        let (text, task) = list_item_content(source, block);
-        if let Some(state) = task {
-            html.push_str("<input type=\"checkbox\" disabled");
-            if state == TaskState::Done {
-                html.push_str(" checked");
-            }
-            html.push_str("> ");
-        }
-        let inner = export_html_fragment(&text)?;
-        append_tight_fragment_content(&inner, &mut html);
-
-        while *cursor < blocks.len() {
-            let Some((child_ordered, child_depth)) = list_signature(blocks[*cursor].kind()) else {
-                break;
-            };
-            if child_depth <= depth {
-                break;
-            }
-            html.push('\n');
-            html.push_str(&render_list_level(
-                snapshot,
-                blocks,
-                cursor,
-                child_depth,
-                child_ordered,
-            )?);
-        }
-        html.push_str("</li>");
-    }
-
-    html.push_str(if ordered { "</ol>" } else { "</ul>" });
-    Ok(html)
-}
-
-fn list_start(kind: BlockKind) -> u32 {
-    match kind {
-        BlockKind::ListItem { start, .. } | BlockKind::TaskListItem { start, .. } => start,
-        _ => 1,
-    }
-}
-
-fn list_item_content(source: &str, block: Block) -> (String, Option<TaskState>) {
-    let first_line_end = source.find('\n').unwrap_or(source.len());
-    let prefix_end = list_prefix_end(&source[..first_line_end]);
-    let mut text = source[prefix_end..].to_owned();
-    if text.ends_with("\r\n") {
-        text.truncate(text.len().saturating_sub(2));
-    } else if text.ends_with(['\n', '\r']) {
-        text.truncate(text.len().saturating_sub(1));
-    }
-    let mut task = None;
-    if let BlockKind::TaskListItem { state, .. } = block.kind() {
-        task = Some(state);
-        let marker_start = text.find('[').unwrap_or(0);
-        if text[marker_start..].starts_with("[ ]")
-            || text[marker_start..].starts_with("[x]")
-            || text[marker_start..].starts_with("[X]")
-        {
-            text.replace_range(marker_start..marker_start + 3, "");
-            while text.starts_with([' ', '\t']) {
-                text.remove(0);
-            }
-        }
-    }
-    (text, task)
-}
-
-fn append_tight_fragment_content(inner: &str, output: &mut String) {
-    if let Some(content) = inner
-        .strip_prefix("<p>")
-        .and_then(|value| value.strip_suffix("</p>"))
-    {
-        output.push_str(content);
-    } else {
-        output.push_str(inner);
-    }
-}
-
-fn list_prefix_end(line: &str) -> usize {
-    let bytes = line.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() && bytes[index] == b' ' {
-        index += 1;
-    }
-    if index < bytes.len() && matches!(bytes[index], b'-' | b'+' | b'*') {
-        index += 1;
-    } else {
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        if index < bytes.len() && matches!(bytes[index], b'.' | b')') {
-            index += 1;
-        }
-    }
-    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t') {
-        index += 1;
-    }
-    index
-}
-
-fn escape_html_text(text: &str, output: &mut String) {
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            _ => output.push(character),
-        }
-    }
-}
-
-fn escape_html_attribute(text: &str, output: &mut String) {
-    for character in text.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '"' => output.push_str("&quot;"),
-            '\'' => output.push_str("&#39;"),
-            _ => output.push(character),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use yu_core::ByteOffset;
+    use yu_text::TextBuffer;
 
     fn whole_range(snapshot: &TextSnapshot) -> TextRange {
         TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).expect("whole range")
     }
 
-    /// Setext 标题导出成 `<h1>` / `<h2>`，下划线那一行不进正文。
+    /// **这里没有「导出的 HTML 逐字节等于某个字面量」这种断言，是有意的。**
     ///
-    /// 块的身份由语法树给（`yu-markdown::classify`）之前，`标题\n===` 在块序列
-    /// 里是一个普通段落，这里导出的是 `<p>标题\n===</p>`。
-    #[test]
-    fn setext_headings_export_as_headings_without_their_underline() {
-        for (source, expected) in [
-            ("Setext 一级\n===\n", "<h1>Setext 一级</h1>"),
-            ("Setext 二级\n---\n", "<h2>Setext 二级</h2>"),
-            ("# ATX\n", "<h1>ATX</h1>"),
-        ] {
-            let html = export_html_fragment(source).expect("导出不该失败");
-            assert_eq!(html, expected, "source {source:?}");
-        }
-    }
-
-    /// ATX 收尾的 `#` 串是语法，不进 `<h2>`（CommonMark 41–44）。
+    /// S7 第六刀之前有 12 条那样的用例，断的是自研渲染器的输出。渲染换成
+    /// comrak 之后，把它们原地改成 comrak 的新输出就是**在断言一个第三方库的
+    /// 行为**——永远绿，什么都不证明。下面留下来的每一条，判据都在 Yu 自己
+    /// 这一侧：契约（Revision / UTF-8 边界 / 格式映射）、Yu 认得的语法集合、
+    /// 以及自家导入器接不接受。
     ///
-    /// 这一条以前是红的：`heading_content_range` 自己扫行，只认前缀，于是
-    /// `## a ##` 导出成 `<h2>a ##</h2>`——而同一个块在编辑器里显示的是 `a`，
-    /// 因为装饰那一侧问的是语法树。两个答案，三个消费者里两个错。
+    /// 逐字节那件事有人管：CommonMark 的 652 条棘轮
+    /// （`yu-syntax/tests/commonmark_spec.rs`）与 comrak 差分
+    /// （`yu-syntax/tests/differential.rs`）。**那两条走的是 `html.rs`，
+    /// 与这里换掉的渲染器不是同一条路**，所以它们没有因此变成自证。
     #[test]
-    fn atx_closing_sequences_do_not_reach_the_heading_body() {
-        for (source, expected) in [
-            ("## a ##\n", "<h2>a</h2>"),
-            ("##### foo ##\n", "<h5>foo</h5>"),
-            ("### foo ###     \n", "<h3>foo</h3>"),
-            // 后面还有字就不是收尾串；`#` 前面没空格也不是。
-            ("### foo ### b\n", "<h3>foo ### b</h3>"),
-            ("# foo#\n", "<h1>foo#</h1>"),
-            ("###\n", "<h3></h3>"),
-        ] {
-            let html = export_html_fragment(source).expect("导出不该失败");
-            assert_eq!(html, expected, "source {source:?}");
-        }
-    }
-
-    #[test]
-    fn clipboard_payload_keeps_source_and_exports_semantic_html() {
+    fn clipboard_payload_keeps_source_and_derives_html_from_it() {
         let source =
             "# Yu\n\n**羽** [Rust](https://example.com)\n\n- [x] done\n\n```rust\n<&>\n```\n";
         let buffer = TextBuffer::new(source);
@@ -770,20 +266,15 @@ mod tests {
         let payload = export_clipboard(&snapshot, snapshot.revision(), whole_range(&snapshot))
             .expect("clipboard export");
 
+        // 正本是源码原样，一个字节都不重新序列化（不变量 A3）。
         assert_eq!(payload.markdown(), source);
         assert_eq!(payload.plain_text(), source);
+        // HTML 是从同一段源码派生的，语义标签而不是投影出来的样式。
         assert!(payload.html().contains("<h1>Yu</h1>"));
         assert!(payload.html().contains("<strong>羽</strong>"));
-        assert!(
-            payload
-                .html()
-                .contains("<a href=\"https://example.com\">Rust</a>")
-        );
-        assert!(
-            payload
-                .html()
-                .contains("<input type=\"checkbox\" disabled checked>")
-        );
+        assert!(payload.html().contains("href=\"https://example.com\""));
+        assert!(payload.html().contains("type=\"checkbox\""));
+        // 代码块里的 `<&>` 必须是转义过的文本，不是标签。
         assert!(payload.html().contains("&lt;&amp;&gt;"));
     }
 
@@ -810,57 +301,11 @@ mod tests {
             .expect("clipboard export");
         assert_eq!(payload.value(ClipboardFormat::Markdown), "# Yu");
         assert_eq!(payload.value(ClipboardFormat::PlainText), "# Yu");
-        assert_eq!(payload.value(ClipboardFormat::Html), "<h1>Yu</h1>");
-    }
-
-    #[test]
-    fn consecutive_lists_share_containers_and_preserve_ordered_start() {
-        let source = "- one\n- **two**\n\n3. three\n4. four\n";
-        let html = export_html_fragment(source).expect("export list fragment");
-
         assert_eq!(
-            html,
-            "<ul><li>one</li><li><strong>two</strong></li></ul>\n<ol start=\"3\"><li>three</li><li>four</li></ol>"
+            payload.value(ClipboardFormat::Html),
+            payload.html(),
+            "三种格式各自取自己那一份，取错了粘出来是另一种表示，不报错"
         );
-    }
-
-    #[test]
-    fn nested_lists_follow_source_depth_inside_the_parent_item() {
-        let source = "- parent\n  - child\n  - **second**\n- sibling\n";
-        let html = export_html_fragment(source).expect("export nested list fragment");
-
-        assert_eq!(
-            html,
-            "<ul><li>parent\n<ul><li>child</li><li><strong>second</strong></li></ul></li><li>sibling</li></ul>"
-        );
-    }
-
-    #[test]
-    fn gfm_tables_export_header_body_and_alignment_semantics() {
-        let source = "| Name | Count | Note |\n| :--- | ---: | :---: |\n| **Yu** | 2 | `a|b` |\n";
-        let html = export_html_fragment(source).expect("export table fragment");
-
-        assert_eq!(
-            html,
-            "<table><thead><tr><th style=\"text-align: left\">Name</th><th style=\"text-align: right\">Count</th><th style=\"text-align: center\">Note</th></tr></thead><tbody><tr><td style=\"text-align: left\"><strong>Yu</strong></td><td style=\"text-align: right\">2</td><td style=\"text-align: center\"><code>a|b</code></td></tr></tbody></table>"
-        );
-    }
-
-    #[test]
-    fn exported_html_round_trips_through_strict_import_policy() {
-        let source = "# Yu\n\n- [x] done\n\n| A | B |\n| :--- | ---: |\n| 1 | 2 |";
-        let html = export_html_fragment(source).expect("export source fragment");
-
-        assert_eq!(
-            import_html_fragment(&html).expect("Yu HTML should be accepted by its importer"),
-            source
-        );
-    }
-
-    #[test]
-    fn pipe_text_without_a_valid_delimiter_remains_a_paragraph() {
-        let html = export_html_fragment("a | b\nc | d\n").expect("export paragraph fragment");
-        assert_eq!(html, "<p>a | b\nc | d\n</p>");
     }
 
     #[test]
@@ -885,18 +330,46 @@ mod tests {
         ));
     }
 
+    /// comrak 的扩展开关必须与 Yu 自己认得的语法一一对应。
+    ///
+    /// **判据是 Yu 的语法集合，不是 comrak 的输出格式**——两个方向各要一半：
+    /// 开着的那两样必须真的生效（少开一个，任务项与表格会退化成普通文字，
+    /// 不报错），没开的那些必须**不**生效（多开一个，导出认得而编辑器不认得，
+    /// 用户拷出去多一层语义）。
     #[test]
-    fn unresolved_reference_stays_visible_instead_of_creating_a_broken_link() {
-        let source = "[label][missing]";
-        let html = export_html_fragment(source).expect("export unresolved reference");
-        assert!(html.contains("label"));
-        assert!(!html.contains("href"));
-        assert!(!html.contains("[missing]"));
+    fn export_uses_exactly_the_extensions_yu_itself_parses() {
+        // 开着的两样。
+        let tasks = export_html_fragment("- [x] done\n");
+        assert!(
+            tasks.contains("type=\"checkbox\""),
+            "任务项是 Yu 无条件解析的语法，导出必须认得：{tasks}"
+        );
+        let table = export_html_fragment("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        assert!(table.contains("<table>"), "Yu 有 table extension：{table}");
+
+        // 没开的那些。每一条都是 Yu 的解析器里不存在的语法。
+        for (source, forbidden, syntax) in [
+            ("~~删掉~~\n", "<del>", "删除线"),
+            ("www.example.com\n", "<a href", "裸域名 autolink"),
+            ("foo[^1]\n\n[^1]: bar\n", "footnotes", "脚注"),
+        ] {
+            let html = export_html_fragment(source);
+            assert!(
+                !html.contains(forbidden),
+                "{syntax}不在 Yu 的语法集合里，导出不该认得它：{html}"
+            );
+        }
     }
 
+    /// 原始 HTML 原样穿过去，**不能变成 `<!-- raw HTML omitted -->`**。
+    ///
+    /// comrak 的 safe 模式把它换成一条注释，那是**静默删掉用户写在自己文档里
+    /// 的内容**。导入侧照旧拒绝原始 HTML（`html_import` 的标签白名单），这个
+    /// 不对称是有意的，理由在模块文档里。
     #[test]
-    fn escaped_markdown_punctuation_is_plain_html_text() {
-        let html = export_html_fragment(r"\*literal\*").expect("export escaped text");
-        assert_eq!(html, "<p>*literal*</p>");
+    fn raw_html_is_passed_through_instead_of_silently_dropped() {
+        let html = export_html_fragment("<div>raw</div>\n");
+        assert!(html.contains("<div>raw</div>"), "{html}");
+        assert!(!html.contains("omitted"), "{html}");
     }
 }

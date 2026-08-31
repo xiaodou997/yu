@@ -10,6 +10,9 @@ repository.workspace = true
 
 [dependencies]
 yu-core = { path = "../yu-core" }
+# HTML 导出的唯一实现。这里以前有一份自研渲染器，换掉它的理由与代价写在
+# src/lib.rs 的模块文档与 overview 第 8 节 S7 第六刀。
+comrak = { workspace = true }
 yu-markdown = { path = "../yu-markdown" }
 yu-text = { path = "../yu-text" }
 

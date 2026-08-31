@@ -33,6 +33,10 @@ members = [
 # 不报错。comrak 自己用的也是它（`comrak::strings::normalize_label`）。
 [workspace.dependencies]
 caseless = "0.2.2"
+# `comrak`：S7 第六刀之后它**同时**是产品实现（`yu-export` 的 HTML 导出）与
+# 测试 oracle（`yu-syntax` 的 CommonMark 差分）。两处漂到不同版本的话，
+# 「差分绿了」与「导出对了」就不再是同一个 comrak 说的话。
+comrak = { version = "0.54", default-features = false }
 
 [workspace.package]
 version = "0.1.0"

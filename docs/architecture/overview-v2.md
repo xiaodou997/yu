@@ -402,7 +402,7 @@ ropey 2.x 是全字节索引的重写。`insert` / `remove` / `slice` /
 | `yu-embedded-math` | 694 | **保留**：改造为 Widget extension |
 | `yu-storage` | 2,807 | **保留**：`DocumentSession` 是高质量资产，原子保存/冲突检测继续有效 |
 | `yu-workspace` | 3,313 | **精简**：保留 tab/session 生命周期，移除 publication 拼装逻辑 |
-| `yu-export` | 1,849 | **改造**：HTML 生成改用 comrak，保留 Revision-bound 剪贴板契约 |
+| `yu-export` | 1,849 | **改造**：HTML 生成改用 comrak，保留 Revision-bound 剪贴板契约。**S7 第六刀做完**，`src/lib.rs` 902 → 375 |
 | `yu-editor-ffi` | 4,694 | **删除**：渲染循环入 Rust 后不再需要 |
 | `yu-storage-ffi` | 14,340 | **重写**：目标 < 1,000 行，只保留输入/文件/AX 窄接口 |
 | `platform/macos/*` | — | **保留演进** |
@@ -2867,6 +2867,108 @@ comrak 的引用标签归一化用的正是 `caseless::default_case_fold_str`
 `' ' | '\t' | '\n' | '\r'`（`reference.rs` 里写了为什么不用
 `char::is_whitespace`——后者含 U+00A0，会让两个不同的标签折到一起），
 comrak 折的是 `char::is_whitespace`。CommonMark 0.31.2 的定义在两者之间。
+
+##### 三、comrak 住在 `yu-export`，不新建 crate
+
+先查的是**谁调它**：comrak 的唯一消费者是 `yu-export::export_html_fragment`，
+它只被 `export_clipboard` 调，再往上是 `yu-storage-ffi` 的
+`yu_storage_session_copy_selection`。反方向那条 `import_html_fragment`
+（`html_import.rs`，953 行）**comrak 没有对应物**，所以 `yu-export` 这个 crate
+仍然存在，只是薄了一半。
+
+第五刀新建 `yu-highlight` 的两条理由在这里**都不成立**：
+
+| | 第五刀（tree-sitter） | 这一刀（comrak） |
+| --- | --- | --- |
+| 关进去的是什么 | 一个与 Markdown 无关的独立问题 | Markdown → HTML 本身 |
+| 保的是哪条性质 | `yu-markdown` 零外部依赖 | `yu-export` 本来就有三条边，没有这条性质 |
+| 第二个消费者 | 以后可能有（任何要着色的地方） | 没有 |
+
+加上项目自己的规矩「不为还没有第二个消费者的东西先建抽象」，所以 **comrak 直接
+进 `yu-export` 的 `[dependencies]`**。`check-deps.py` 只看 path 边（它的 docstring
+第 12–13 行写着外部 crate 不在此列），管不着，也不需要它管。
+
+代价与收益：`yu-export/src/lib.rs` **902 → 375 行**（其中 138 行是测试），删掉的是
+`render_blocks` / `render_block` / `render_inline` / `InlineRenderer` /
+`render_table*` / `render_list*` / `render_fenced_code` / `escape_html_*` 那一整
+套自研渲染器。`ExportError` 少一个变体（`InlineParse` 没有生产者了），FFI 的
+`YU_STORAGE_EXPORT_ERROR = 17` 因此**退休**——一个没有生产者的状态码是 C ABI
+上的一句谎话。编号不复用。
+
+##### 四、导入侧必须同步放宽，否则 Yu 里 ⌘C 再 ⌘V 会降级成纯文本
+
+这是这一刀最容易漏掉的一半，而且**漏掉不报错**：`html_import` 是一个严格白
+名单，只认「Yu 自己会发的那个子集」。渲染器一换，那个子集就变了。
+
+实测导入器对导出的接受率：**换之前 646/652 条规范用例，换之后 491/652**。
+按被拒原因分下来，属于「Yu 自己现在会发而导入器不认」的正好三项，各放宽一条：
+
+- **`<hr>`**（27 条）：主题分隔线。
+- **`title`**（42 条）：链接与图片的标题，自研渲染器一直是丢掉的。
+- **`align=`**：comrak 用 GFM 的写法，自研渲染器用行内 `style="text-align: …"`。
+  两种**都要认**——只认一种的表现是自己拷出来的表格粘回来丢掉对齐，表格还在。
+
+**原始 HTML（`<div>` / `<script>`）继续拒。这个不对称是有意的**：导出的是用户
+自己的文档（源码里那个 `<div>` 他看得见），导入的是别人的 HTML。所以带原始
+HTML 的文档走不完那一圈，而这是对的——`raw_html_deliberately_does_not_round_trip`
+把它钉住，免得下一个人当成缺口顺手补上。
+
+导出侧对应地取 `render.unsafe = true`：另一条路是 comrak 的
+`<!-- raw HTML omitted -->`，那是**静默删掉用户写在自己文档里的内容**。
+
+##### 五、判据落在哪：删掉 12 条逐字节断言，换成两条不问 comrak 的
+
+`yu-export` 原来有 12 条断言自研渲染器逐字节输出的用例。**把它们原地改成
+comrak 的新输出就是在断言一个第三方库的行为**——永远绿，什么都不证明。
+这一刀是「有 oracle 的时候一定要用，但先想清楚删掉它之后剩下什么」的实例，
+剩下的两条判据都在 Yu 自己这一侧：
+
+1. **`yu_accepts_every_fragment_it_exports`**：判据在 `html_import`（Yu 自己
+   写的、与 comrak 无关的一份实现）。压住的是「⌘C 再 ⌘V 静静降级成纯文本」。
+2. **`export_import_export_is_a_fixed_point`**：导出 → 导入 → 再导出，两次导出
+   逐字节相同。它**比「导入回来等于原文」弱，也正因此才是对的**——`*a*` 与
+   `_a_`、`1)` 与 `1.` 是同一件事，要求原样回来是在要求导入器复刻源码的拼法。
+   不动点要求的是两边对语义的理解一致。
+
+外加两条方向相反的：`export_uses_exactly_the_extensions_yu_itself_parses` 判据
+是 **Yu 的语法集合**（开着的两样必须生效，没开的三样必须不生效），
+`raw_html_is_passed_through_instead_of_silently_dropped` 钉住上面那个不对称。
+
+**语料是手写的，不用 652 条规范用例**：那份语料里有大量原始 HTML，而导入器按
+设计拒绝它。拿它当语料只会逼这条断言去迁就一个不该成立的性质。
+
+##### 六、不动点那条断言当场抓出两个真缺口，都在导入器里
+
+两条都是「静默地做错事」，而且**在这一刀之前那两支永远走不到**——自研渲染器
+既不发 `<br>` 也不发 `<hr>`，所以语料里根本没有这两个形状。这是第五刀那三条
+活下来的变异的同一类：判据没错，是**输入造不出差别**。
+
+1. **`<br />` 后面那个换行没吞掉。** 硬换行回写成 `"  \n"`，而 comrak（还有
+   cmark、marked）发的是 `<br />\n`，两个加起来是一个空行——**一个段落被粘成
+   两个**。不报错、不丢字。
+2. **`<hr>` 被当成 66 级标题。** 块分派那一支写的是「`h` 开头、两个字符」，
+   `hr` 正好是那个形状，`b'r' - b'0'` = 66，于是一条分隔线粘回来是 66 个 `#`。
+   修法不是把 `"hr"` 挪到前面（那只是躲开），是**核对那一位真的在 1..=6**。
+
+两条各配一条具名用例（`a_hard_break_does_not_split_the_paragraph_in_two`、
+`a_thematic_break_is_not_a_heading`），不只靠那条性质。
+
+##### 七、帧身份：**不加**，而且这一刀连「一种状态」都不是
+
+`MacosFrameKey` 的规则是「新增一种**不推进 Revision** 却改变画面的状态」。
+
+- **导出根本不改变画面。** `yu_storage_session_copy_selection` 只读，产出的字节
+  进 NSPasteboard，不进场景。
+- **F3 确实改装饰**（`[ẞ]` 从普通文字变成链接，方括号被藏），但它是
+  `(源码字节, 归一化函数)` 的函数，而归一化函数编译期定死。没有第二个输入。
+  与第五刀高亮同一个理由。
+- **`DecorationCache` 的引用表指纹够，不需要第三道门。** 指纹折的是
+  `label_hash` 与 `destination_hash`，而 `label_hash` 正是 `normalized_label`
+  算出来的。换归一化让指纹整体变一次值，但它**仍然只随源码变**；一个进程里
+  不会有两种归一化，所以不必在指纹里加版本号。
+- **`assemble` 归零那一关这次过得去**：F3 不新增 `TextAttrs` 属性，走的是 link
+  extension 已有的那条路。但判据仍然落下游——真实窗口里 `[ẞ]` 与 `[SS]: /url`
+  并排两行看方括号藏没藏（抄 S6 第十三刀「两行并排才看出来」那个做法）。
 
 ---
 

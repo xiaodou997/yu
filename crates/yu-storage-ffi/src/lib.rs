@@ -81,7 +81,11 @@ pub const YU_STORAGE_STALE_REVISION: i32 = 13;
 pub const YU_STORAGE_INVALID_SELECTION: i32 = 14;
 pub const YU_STORAGE_NO_OVERLAY: i32 = 15;
 pub const YU_STORAGE_STALE_COMPOSITION: i32 = 16;
-pub const YU_STORAGE_EXPORT_ERROR: i32 = 17;
+// 17 曾经是 YU_STORAGE_EXPORT_ERROR。S7 第六刀把 HTML 导出换成 comrak 之后，
+// 导出只剩下 Revision 与 UTF-8 边界两种失败（`ExportError` 的两个变体），
+// 没有任何一条路能产出它——一个没有生产者的状态码是 C ABI 上的一句谎话。
+// **编号退休不复用**：别的平台可能还编译着旧头文件，17 换个含义比留一个空
+// 洞危险得多。
 pub const YU_STORAGE_HTML_IMPORT_REJECTED: i32 = 18;
 pub const YU_STORAGE_CORE_TEXT_UNAVAILABLE: i32 = 19;
 pub const YU_STORAGE_INVALID_VIEWPORT_CONFIG: i32 = 20;
@@ -1139,7 +1143,6 @@ fn status_from_export_error(error: ExportError) -> i32 {
     match error {
         ExportError::RevisionMismatch { .. } => YU_STORAGE_STALE_REVISION,
         ExportError::SourcePosition(_) => YU_STORAGE_INVALID_SELECTION,
-        ExportError::InlineParse(_) => YU_STORAGE_EXPORT_ERROR,
     }
 }
 
@@ -9430,9 +9433,16 @@ mod tests {
             },
             YU_STORAGE_OK
         );
-        assert_eq!(
-            String::from_utf8(html).expect("HTML UTF-8"),
-            "<p><strong>羽</strong></p>"
+        // **判据是「跨了 C ABI 之后还是那一段 HTML」，不是渲染器的逐字节输出。**
+        // 这里以前钉的是 `"<p><strong>羽</strong></p>"` 整串，S7 第六刀把导出
+        // 换成 comrak（它带一个收尾换行）之后就红了——而那次红说明不了任何
+        // 关于 FFI 的事，渲染器的字节归 `yu-export` 自己的用例与 CommonMark
+        // 棘轮管。这一层要压的是长度回报、缓冲区往返与 UTF-8 完整性。
+        let html = String::from_utf8(html).expect("HTML UTF-8");
+        assert_eq!(html.len(), written, "回报的长度与写出的字节数必须一致");
+        assert!(
+            html.contains("<strong>羽</strong>"),
+            "选区那一段的语义要跨得过 C ABI：{html}"
         );
         assert_eq!(
             unsafe {

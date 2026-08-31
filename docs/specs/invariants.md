@@ -96,6 +96,12 @@ position 精确推导，且推导结果与原始字节完全一致。
 **C7.** CommonMark 语义以官方 spec 用例为准，与 comrak 做差分测试。
 任何有意偏差必须在本文 F 节逐条登记，未登记的偏差是 bug。
 
+> **S7 第六刀之后 comrak 同时是产品实现**（`yu-export` 的 HTML 导出）与这里的
+> 测试 oracle。**这没有让差分变成自证**：差分的「我方」是 `yu-syntax` 的树加
+> `tests/support/html.rs`，那条路上一行 comrak 都没有。但两处的版本必须锁在
+> 一起，否则「差分绿了」与「导出对了」不再是同一个 comrak 说的话——版本因此
+> 走根 `Cargo.toml` 的 `[workspace.dependencies]`。
+
 规范用例入库在 `third_party/commonmark/`（CC-BY-SA 4.0，与仓库其余部分的
 许可不同，见该目录 README），由 `crates/yu-syntax/tests/commonmark_spec.rs`
 逐条执行。该测试同时核对用例数与文件校验和——「差分测试通过了但其实用例
@@ -269,6 +275,13 @@ CommonMark 规范用例号。
 | --- | --- | --- | --- | --- |
 | F1 | 引用式链接的**括号配对**不查 reference table。`[a [b]][ref]` 的分组与 CommonMark 不同 | 不变量 C6 的直接后果，见下 | 512, 523, 528, 569, 571 | 不修 |
 | F2 | 制表符不展开。跨越「标记/内容」边界的制表符整个归标记 | 不变量 A1/A3 的直接后果，见下 | 5, 6, 7 | 不修 |
+
+> **F1 与 F2 是解析的偏差，HTML 导出不随它们偏。** S7 第六刀把导出换成 comrak
+> 之后，剪贴板里的 HTML 走的是 CommonMark 的语义，而编辑器画的是 Yu 自己的
+> 解析。这几处「所见 ≠ 所拷」是**有意**的：剪贴板是给别的 app 的，别的 app 认
+> CommonMark。同类还有 `***`、缩进代码块、HTML 块——`BlockKind` 没有这三种
+> 变体，编辑器按 I5 画成普通段落源码，导出按 CommonMark 渲染。理由与代价写在
+> `yu-export` 的模块文档与 overview 第 8 节 S7 第六刀。
 
 ### F1 为什么不修
 
