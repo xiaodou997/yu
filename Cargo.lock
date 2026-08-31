@@ -894,6 +894,7 @@ dependencies = [
 name = "yu-markdown"
 version = "0.1.0"
 dependencies = [
+ "caseless",
  "yu-core",
  "yu-decoration",
  "yu-highlight",
@@ -977,6 +978,7 @@ dependencies = [
 name = "yu-syntax"
 version = "0.1.0"
 dependencies = [
+ "caseless",
  "comrak",
  "entities",
  "percent-encoding",

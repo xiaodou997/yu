@@ -261,14 +261,14 @@ CommonMark 规范用例号。
 未登记的失败用例让测试红，**已登记却通过了的用例同样让测试红**。后一条守的
 是「偏差修好了但登记还留着」——那会让下一个人分不清哪些失败是有意的。
 
-当前口径：CommonMark 0.31.2 的 652 条用例中 **643 条逐字节通过（98.62%）**，
-其余 9 条分属下面三条偏差。
+当前口径：CommonMark 0.31.2 的 652 条用例中 **644 条逐字节通过（98.77%）**，
+其余 8 条分属下面两条偏差。**F3 已经关掉**（S7 第六刀），编号退休不再复用，
+关掉它花了什么写在下面。
 
 | 编号 | 偏差 | 原因 | 规范用例 | 计划 |
 | --- | --- | --- | --- | --- |
 | F1 | 引用式链接的**括号配对**不查 reference table。`[a [b]][ref]` 的分组与 CommonMark 不同 | 不变量 C6 的直接后果，见下 | 512, 523, 528, 569, 571 | 不修 |
 | F2 | 制表符不展开。跨越「标记/内容」边界的制表符整个归标记 | 不变量 A1/A3 的直接后果，见下 | 5, 6, 7 | 不修 |
-| F3 | 引用标签只做 simple lowercase，未做 Unicode full case folding。`[ẞ]` 匹配不上 `[SS]:` | 标准库不提供 full folding，为几个字符引入 `yu-markdown` 的第一个外部依赖不划算，见下 | 540 | 接受那个依赖时 |
 
 ### F1 为什么不修
 
@@ -297,42 +297,45 @@ CommonMark 在块解析时把制表符展开成空格再计算缩进，于是一
 > 展开制表符属于**呈现**，不属于解析。真要让这几列显示出来，是 S4 的装饰层
 > 给制表符一个宽度，而不是让 parser 改写源码。
 
-### F3 为什么只修了一半
+### F3 已经关掉（S7 第六刀），留下的是这条路怎么走完的
 
-这一条初版写的是「S4 落地时决定」，S4 查下来发现那个说法把三件事混在了
-一起。理清之后是这样：
+这一条活了三个阶段，每一阶段都缩小一点，最后在 S7 第六刀关掉。留着这段是
+因为**它每一次没关掉的理由都是同一条**，而那条理由最后是被另一件事付掉的。
 
-1. **让 540 失败的不是 parser，是对照用的参考渲染。**
+1. **S4 查清了让 540 失败的不是 parser，是对照用的参考渲染。**
    `crates/yu-syntax/tests/support/html.rs` 的 `normalize_label` 用
    `char::to_lowercase`（Unicode simple lowercase），而 CommonMark 要求
    full case folding：`ẞ` 的 simple lowercase 是 `ß`，full fold 是 `ss`，
-   所以匹配不上 `[SS]:`。
-2. **`yu-syntax` 的产品链路里根本没有引用标签匹配。** 不变量 C6 规定 parser
-   只产出候选引用，成立与否由装饰阶段判定。所以「引用标签怎么归一化」这个
-   问题在 `yu-syntax` 里没有答案，也不该有。
-3. **`yu-markdown/src/reference.rs` 里那个 `to_ascii_lowercase` 是 v1 扫描器
-   自己的 reference table，与 540 无关。** 它随 v1 一起被 S6 取代。
+   所以匹配不上 `[SS]:`。而 `yu-syntax` 的产品链路里根本没有引用标签匹配
+   （不变量 C6），所以这个问题在那个 crate 里没有答案，也不该有。
 
-于是能做的只有一件事：把参考渲染改成 full case folding。Rust 标准库没有
-full case folding，要为一条规范用例给测试支撑代码引入一个依赖——**决定是
-不引入**，第 6 节的依赖取舍在这里同样适用，为了让一条用例变绿而扩大依赖面
-不划算。
+2. **S6 第十三刀把 reference table 建进装饰阶段，选了 `str::to_lowercase`。**
+   从「只认 ASCII」走到「认 Unicode 的绝大多数」——`[Ä]` 与 `[ä]` 此前折不到
+   一起，那是一条写对了的引用被画成普通文字。剩下 `ẞ`/`ﬁ` 那几个字符。
+   不做 full fold 的理由一直是同一条：标准库不提供，要给 `yu-markdown`
+   引入它的**第一个**外部依赖。
 
-真正要决定的事被推到 S6：v2 的 reference table 建在装饰阶段，那时才需要选
-一种归一化。
+3. **S7 第六刀付了那笔钱，但不是为 F3 付的。** 同一刀把 HTML 导出换成
+   comrak，而 **comrak 自己用的就是 `caseless`**
+   （`comrak::strings::normalize_label`），它已经在 `Cargo.lock` 里。于是
+   `yu-markdown` 直接依赖 `caseless` 这件事，代价从「为几个字符扩大整个
+   依赖面」变成「用一个已经进来的 crate」。
 
-**S6 第十三刀选了：`str::to_lowercase`（Unicode simple lowercase），不是 full
-case folding。** 理由是同一条——标准库不提供 full folding，要为几个字符
-（`ẞ`→`ss`、`ﬁ`→`fi`）给 `yu-markdown` 引入它的第一个外部依赖，不划算。
+关掉它改了两处，**两处必须是同一个答案**，所以版本走 `[workspace.dependencies]`：
 
-选完之后**这一条缩小了，没有关掉**：
+- `crates/yu-markdown/src/reference.rs::normalized_label`——产品链路。
+- `crates/yu-syntax/tests/support/html.rs::normalize_label`——参考渲染，棘轮走它。
 
-- 已经解决的：`to_ascii_lowercase` 折不到一起的那一大片（`[Ä]` 与 `[ä]`）现在
-  折得到了。引用表也真的接进了装饰阶段——候选引用查不到定义就不是链接、不是
-  图片（C6 落地）。
-- 还没解决的：full folding 的那几个字符。规范用例 540 仍然红，棘轮仍然是
-  643。要动它，得先接受那个依赖，届时参考渲染
-  （`crates/yu-syntax/tests/support/html.rs` 的 `normalize_label`）要一起改。
+**产品链路那一侧靠棘轮抓不住。** 把 `reference.rs` 换回 `to_lowercase`，
+`yu-markdown` 的 116 条用例一条都不红（实测），红的只有 `yu-syntax` 的棘轮
+——那是另一份实现。判据不能靠另一条路代劳，所以
+`extension_decorations.rs::reference_labels_use_full_case_folding_not_simple_lowercase`
+在产品链路自己这一侧断，并反向验证过。
+
+**没有一并解决的是搜索的「不区分大小写」**，尽管它一直挂在同一个闸门上。
+两者只是碰巧都需要一份 case folding：F3 折出来的是一个查表键，从不映射回
+源码偏移；搜索要回报 `TextRange`，折叠必须给得出对齐信息，而 `caseless`
+给不出。那条登记的触发条件因此改了，见 `yu-editor::search` 的模块文档。
 
 ---
 

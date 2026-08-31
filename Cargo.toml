@@ -25,6 +25,15 @@ members = [
     "tools/yu-inspect",
 ]
 
+# 外部依赖里需要**两个 crate 用同一个版本**的那些放在这里。
+#
+# `caseless`：F3 的 full case folding。产品链路（`yu-markdown` 的引用表）与
+# 参考渲染（`yu-syntax` 测试里的 `normalize_label`）必须折出同一个答案——
+# 两处各写一个版本号，漂开之后表现是「棘轮绿着而编辑器里那条引用不成立」，
+# 不报错。comrak 自己用的也是它（`comrak::strings::normalize_label`）。
+[workspace.dependencies]
+caseless = "0.2.2"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

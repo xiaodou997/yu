@@ -1854,6 +1854,10 @@ lowercase）**：从「只认 ASCII」走到「认 Unicode 的绝大多数」—
 
 剩下的那几个字符登记在 F3 上，规范用例 540 仍然红，棘轮仍然是 643。
 
+> **S7 第六刀关掉了 F3**：同一刀接 comrak 做导出，而 comrak 自己用的就是
+> `caseless`，于是这个依赖的代价从「为几个字符扩大依赖面」变成「用一个已经
+> 进来的 crate」。棘轮 643 → 644。见 S7 第六刀那一节。
+
 ##### 这一刀的实证
 
 - **10 条变异，9 条被抓，1 条活下来，是真缺口**：把归一化里「折空白」那一步
@@ -2218,6 +2222,13 @@ Swift 侧「拿镜像减区间」，它的判据是**性质**：结果长度等�
 字符变长），要么逐字符折叠——那是这个仓库里的**第二份 case folding**，与已登记
 的 F3（引用标签只做 simple lowercase）同一个形状。**登记，等 F3 接受那个外部
 依赖时一起做。**
+
+> **「同一个形状」这句在 S7 第六刀被推翻了。** 那一刀关掉了 F3，也真的接了那个
+> 外部依赖（`caseless`），而这一条**一步都没走近**：F3 折出来的是一个查表键，
+> 从不映射回源码偏移；搜索要回报 `TextRange`，折叠必须给得出对齐信息，而
+> `caseless::default_case_fold_str` 给不出。缺的从来不是依赖，是那个匹配算法。
+> 触发条件改成它本身：有人要不区分大小写的搜索时再做。新的说明在
+> `yu-editor::search` 的模块文档里。
 
 ##### 判据落在哪
 
@@ -2788,6 +2799,74 @@ Swift 产品代码 **6,356 → 6,415 行**（3.18 → **3.21 倍**），分布�
 
 真正的代价在构建：tree-sitter 加五个 grammar 的冷编译约 **2 分 34 秒**，静态库
 里多出十来个 C 目标文件。
+
+---
+
+#### 第六刀：导出（comrak）+ F3
+
+交接稿对这一刀的判断是「这两件是同一件事」。**查下来只在依赖图上是同一件事**，
+在别的每一处都不是——下面第一节先说清这个，因为它决定了这一刀怎么切。
+
+##### 零、两个前提都不完全成立
+
+**「现有两份 HTML 渲染器，换 comrak 是把两份合成一份外部的」——合不成。**
+三份东西吃的输入根本不是同一种：
+
+| | 输入 | 谁走它 |
+| --- | --- | --- |
+| `yu-syntax/tests/support/html.rs::render` | `(&str, &yu_syntax::Tree)` | 652 条棘轮（`commonmark_spec.rs::render`） |
+| `yu-export` | `yu_markdown::Block` + `InlineDocument` | 剪贴板（`yu-storage-ffi:5372`） |
+| comrak | 一个字符串，它自己解析 | — |
+
+comrak **顶不掉 `html.rs`**：真那么换，`commonmark_spec.rs::render()` 就变成
+`comrak(markdown)`，652/652 全绿，棘轮从 643 跳到 652，而它一个字都不再证明
+`yu-syntax`。**那才是「自己跟自己比」，而且是这一刀唯一真会发生的那一次。**
+所以 `html.rs` 留着不动，能换的只有 `yu-export` 那一份——**Yu 自己写的 HTML
+渲染器从 2 份变成 1 份**，不是「合成一份外部的」。
+
+**「F3 要动就得先接受一个外部依赖，就是它」——依赖是同一个，工作不是。**
+comrak 的引用标签归一化用的正是 `caseless::default_case_fold_str`
+（`comrak::strings::normalize_label`），`caseless` 因此早就在 `Cargo.lock` 里。
+接 comrak 与关 F3 在依赖图上确实是同一个新节点，这是那句判断唯一站得住的地方。
+除此之外两件事的判据、风险面、连改的文件都不重叠——所以这一刀是**两个 commit**，
+见下面第二节。
+
+##### 一、F3：接 `caseless`，`yu-markdown` 的外部依赖 0 → 1
+
+改两处，**两处必须折出同一个答案**，所以版本走 `[workspace.dependencies]`
+（这是仓库里第一条 workspace 依赖，理由写在根 `Cargo.toml` 上）：
+
+- `yu-markdown/src/reference.rs::normalized_label`——产品链路。
+- `yu-syntax/tests/support/html.rs::normalize_label`——参考渲染，棘轮走它。
+
+**「不改变偏移」在 F3 上根本不是约束。** `normalized_label` 产出的是一个
+`Vec<u8>` 查表键，进 `hash_bytes`，由 `ReferenceDefinitionIndex::lookup` 逐字节
+比对，**它从来不映射回源码偏移**。full fold 让 `ẞ` 变成两个字节在这里没有后果。
+
+**所以「搜索区分大小写」那条登记这一刀不还**，尽管它一直挂在同一个闸门上。
+两者只是碰巧都需要一份 case folding，另一半是反的：搜索要回报 `TextRange`，
+折叠必须给得出对齐信息，而 `caseless` 给不出。缺的从来不是依赖，是那个匹配
+算法。触发条件改成它本身，写在 `yu-editor::search` 的模块文档里。
+
+**产品链路那一侧靠棘轮抓不住——这是这一刀量出来的第一件事。** 把
+`reference.rs` 换回 `to_lowercase`，`yu-markdown` 的 116 条用例**一条都不红**；
+红的只有 `yu-syntax` 的棘轮，而那是**另一份实现**。这与第五刀那三条活下来的
+变异是同一类：判据本身没错，是**输入造不出差别**（语料里一个 `ẞ` 都没有）。
+所以产品链路自己要有一条：
+`extension_decorations.rs::reference_labels_use_full_case_folding_not_simple_lowercase`
+——三个方向（`[ẞ]`↔`[SS]:`、反过来、`ﬁ`↔`fi`），反向验证过。
+
+##### 二、「643 → 644 是被谁调的」——结构性地分得开
+
+棘轮走 `commonmark_spec.rs::render()` → `html.rs`，**这条路上一行 comrak 都
+没有**，换 `yu-export` 动不到它一个字节。为了让这句话是可验的而不是推断的，
+这一刀切成两个 commit：**先 F3**（棘轮 643 → 644，`yu-export` 一行不动），
+**再 comrak**（棘轮纹丝不动）。哪一条用例是被真修好的，从 commit 边界就看得出来。
+
+顺带记一处产品链路与 comrak 之间的分歧，不是 bug 但要知道：Yu 折的空白是
+`' ' | '\t' | '\n' | '\r'`（`reference.rs` 里写了为什么不用
+`char::is_whitespace`——后者含 U+00A0，会让两个不同的标签折到一起），
+comrak 折的是 `char::is_whitespace`。CommonMark 0.31.2 的定义在两者之间。
 
 ---
 
