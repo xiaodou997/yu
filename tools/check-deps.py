@@ -45,8 +45,18 @@ ALLOWED: dict[str, set[str]] = {
     "yu-syntax": {"yu-core", "yu-text"},
     # yu-markdown 产出 decoration（第 4.3 节的职责），所以它依赖
     # yu-decoration——那是个不认识 Markdown 的原语，在它下方。
-    "yu-markdown": {"yu-core", "yu-decoration", "yu-syntax", "yu-text"},
+    # yu-markdown -> yu-highlight：围栏代码块的着色。语言名与正文区间本来就
+    # 由 `extension/fenced_code.rs` 算出来（`BlockOrnament::FencedCode`），
+    # 着色是同一个 extension 的第二件事——分成两个 extension 就得把这两段区间
+    # 再算一遍，而不变量 D6 不许 extension 互相感知。
+    "yu-markdown": {"yu-core", "yu-decoration", "yu-highlight", "yu-syntax", "yu-text"},
     "yu-embedded-math": {"yu-assets"},
+    # yu-highlight 是全仓唯一认识 tree-sitter 的地方（overview-v2 第 6.2 节：
+    # tree-sitter 只用于 fenced code 内部）。它只依赖 yu-core 的 `TextRole`，
+    # 拿不到 Markdown 也拿不到装饰——「(语言名, 代码文本) → 带角色的区间」是
+    # 它公开面的全部。放在 1 层而不是并进 yu-markdown，是为了让那个 crate
+    # 继续保持零外部依赖（已登记的 F3 欠账要动的正是它）。
+    "yu-highlight": {"yu-core"},
     # 3 层：装饰中枢。
     #
     # yu-decoration 不认识 Markdown（第 4.3 节的禁止项），所以它只依赖

@@ -13,6 +13,8 @@ yu-core = { path = "../yu-core" }
 yu-text = { path = "../yu-text" }
 yu-syntax = { path = "../yu-syntax" }
 yu-decoration = { path = "../yu-decoration" }
+# 围栏代码块的着色。tree-sitter 关在那个 crate 里，这里看不见它。
+yu-highlight = { path = "../yu-highlight" }
 
 [lints]
 workspace = true

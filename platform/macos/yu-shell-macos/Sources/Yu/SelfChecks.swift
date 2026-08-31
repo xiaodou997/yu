@@ -1367,6 +1367,157 @@ func runAccessibilitySelfCheck(path: String) -> Never {
     }
 }
 
+/// 代码高亮：颜色真的进了这一帧的字形。
+///
+/// # 判据落在哪
+///
+/// **数的是场景图元的颜色**（`highlightedGlyphCount`，由 Rust 在组装这一帧时
+/// 从 `Primitive::Glyph` 数出来），不是 `TextRole`、不是装饰、不是着色器。
+/// 判据不来自被测的那条路。
+///
+/// **主判据是一个差分**：同一段代码，一份带语言名、一份不带，两份文档除此之外
+/// 一个字节都不差。「带语言名的那份高亮字形更多」不可能来自别的原因；而单看
+/// 一个绝对数字压不住「所有字形都被算成高亮」——那种错法数字更大，一样过。
+///
+/// Rust 侧的 `yu-workspace` 用例走的是等宽假 shaper。这里走的是**真的
+/// CoreText**：字形的数量与分段都不同，颜色是不是按 run 正确分配只有这条路
+/// 看得见。
+///
+/// headless 压不住的只有一条：**这一帧真的上了屏**。那要 Metal surface，
+/// 挂在 `--launch-window-self-check` 上。
+func runCodeHighlightSelfCheck(path: String) -> Never {
+    let fileManager = FileManager.default
+    let directory = fileManager.temporaryDirectory
+        .appendingPathComponent("yu-code-highlight-\(UUID().uuidString)")
+    do {
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: directory) }
+
+        let fixture = try String(contentsOfFile: path, encoding: .utf8)
+        precondition(
+            fixture.contains("```rust"),
+            "fixture 必须有一个带语言名的代码块"
+        )
+
+        /// 一份源码渲染成一帧之后带高亮颜色的字形数。
+        func highlightedGlyphs(of source: String, name: String) throws -> Int {
+            let url = directory.appendingPathComponent("\(name).md")
+            try source.write(to: url, atomically: true, encoding: .utf8)
+            let bridge = try StorageBridge(path: url.path)
+            let snapshot = try bridge.macosRenderHostFrame(
+                revision: bridge.state.revision,
+                size: 14.0,
+                maxWidth: 500.0,
+                scrollY: 0.0,
+                viewportHeight: 2_000.0,
+                surfaceGeneration: 0
+            )
+            precondition(snapshot.published, "\(name) 这一帧没有发布")
+            precondition(snapshot.commandCount > 0, "\(name) 这一帧没有任何绘制指令")
+            return snapshot.highlightedGlyphCount
+        }
+
+        // 差分的两边：把每一个语言名去掉，其余一个字节不动。
+        let tagged = fixture
+        let untagged = fixture
+            .replacingOccurrences(of: "```rust", with: "```")
+            .replacingOccurrences(of: "```json", with: "```")
+
+        let withLanguage = try highlightedGlyphs(of: tagged, name: "tagged")
+        let withoutLanguage = try highlightedGlyphs(of: untagged, name: "untagged")
+
+        precondition(
+            withoutLanguage == 0,
+            "去掉语言名之后仍有 \(withoutLanguage) 个字形带着高亮颜色"
+        )
+        precondition(
+            withLanguage > 0,
+            "带语言名的代码块一个高亮字形都没有"
+        )
+
+        // 高亮只覆盖代码块里的一部分字形——全都覆盖说明颜色被无差别地刷上去了，
+        // 而那种错法上面两条都过。fixture 里另有标题与正文，它们必须保持正文色。
+        let plainDocument = try highlightedGlyphs(
+            of: "# 只有正文\n\n一段普通文字，没有代码块。\n",
+            name: "plain"
+        )
+        precondition(
+            plainDocument == 0,
+            "没有代码块的文档里出现了 \(plainDocument) 个高亮字形"
+        )
+
+        // 认不出的语言与带参数的语言名：前者不着色，后者照常着色。
+        // `Language::from_info` 只取第一个词，这一条是它在真实路径上的判据。
+        let unknown = try highlightedGlyphs(
+            of: "```brainfuck\n+++[->+++<]\n```\n",
+            name: "unknown"
+        )
+        precondition(unknown == 0, "认不出的语言不该着色，实际 \(unknown)")
+        let withArguments = try highlightedGlyphs(
+            of: "```rust,ignore\nfn a() { let x = 1; }\n```\n",
+            name: "arguments"
+        )
+        precondition(
+            withArguments > 0,
+            "带参数的语言名没有被认出来"
+        )
+
+        // 在代码块里打字，颜色必须跟着改。
+        //
+        // 判据是**数量的确定变化**，不是「变了就行」：把 `let` 改成 `lets`，
+        // 那三个字形从关键字变回普通标识符，高亮字形数正好少 3。只断「不相等」
+        // 的话，一个每次编辑都把整块颜色清掉的实现也能过。
+        //
+        // 这一条本来在人工验收清单里，但真人按键盘那条路很难把光标准确放进代码
+        // 块（方向键会滚动视口，合成事件又驱动不了 AppKit）。放在这里更强：
+        // 它可复现，而且断的是一个数。
+        let typingURL = directory.appendingPathComponent("typing.md")
+        let typingSource = "```rust\nfn a() { let x = 1; }\n```\n"
+        try typingSource.write(to: typingURL, atomically: true, encoding: .utf8)
+        let typingBridge = try StorageBridge(path: typingURL.path)
+        func renderCount(_ bridge: StorageBridge) throws -> Int {
+            let snapshot = try bridge.macosRenderHostFrame(
+                revision: bridge.state.revision,
+                size: 14.0,
+                maxWidth: 500.0,
+                scrollY: 0.0,
+                viewportHeight: 2_000.0,
+                surfaceGeneration: 0
+            )
+            precondition(snapshot.published, "打字用的这一帧没有发布")
+            return snapshot.highlightedGlyphCount
+        }
+        let beforeTyping = try renderCount(typingBridge)
+        precondition(beforeTyping > 0, "打字前就没有高亮，这一条压不住任何东西")
+        // 光标落在 `let` 之后，插一个 `s`。
+        let mirror = typingBridge.source as NSString
+        let keyword = mirror.range(of: "let")
+        precondition(keyword.location != NSNotFound, "语料里没有 let")
+        try typingBridge.setSelection(NSRange(location: NSMaxRange(keyword), length: 0))
+        _ = try typingBridge.insertText("s")
+        precondition(
+            typingBridge.source.contains("lets x"),
+            "插入没有落在 let 后面：\(typingBridge.source)"
+        )
+        let afterTyping = try renderCount(typingBridge)
+        precondition(
+            afterTyping == beforeTyping - 3,
+            "把 let 改成 lets 之后高亮字形应当少 3 个，"
+                + "实际 \(beforeTyping) → \(afterTyping)"
+        )
+
+        print(
+            "Yu code highlight self-check: highlighted glyphs \(withLanguage) with language, "
+                + "\(withoutLanguage) without; typing let→lets \(beforeTyping)→\(afterTyping); "
+                + "unknown language and plain documents stay uncolored"
+        )
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu code highlight self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
 /// 多光标：一组选区在 Rust↔Swift 边界上的行为。
 ///
 /// # 判据落在哪

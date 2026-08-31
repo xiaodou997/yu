@@ -399,16 +399,29 @@ impl EditorDecorationPrimitive {
     }
 }
 
-/// 一个要画的字形：字面、字形 id、block 局部的基线左端、字号倍率。
+/// 一个要画的字形：字面、字形 id、block 局部的基线左端、字号倍率，以及一个
+/// 可选的颜色覆盖。
 ///
-/// 场景层要的只有这四样。它不认识布局的盒子类型，也不认识源码坐标——
-/// 那些属于上面那层（不变量 E1、E2）。
+/// 场景层要的只有这几样。它不认识布局的盒子类型，也不认识源码坐标——那些属于
+/// 上面那层（不变量 E1、E2）。
+///
+/// # 那个 `Option<Rgba8>`
+///
+/// 一帧本来只有一个正文颜色，由 [`SceneBuilder::append_viewport`] 的 `color`
+/// 参数给（S7 第五刀之前，从装饰到这里没有任何一层带着「这个字什么颜色」）。
+/// 代码块高亮要给**字形本身**上色，而那是不变量 D1 管的事——文字自己的视觉
+/// 表现——所以颜色一路从装饰走下来，到这里才落地。
+///
+/// 写成 `Option` 而不是「每个字形都带一份 `Rgba8`」有两条理由：**没有覆盖**与
+/// **覆盖成正文色**是两件不同的事（前者跟着主题走，后者钉死），而绝大多数
+/// 字形属于前者；另外，`None` 让「上一层忘了传颜色」退化成现状而不是一片黑。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SceneGlyph {
     face: yu_font::FontFaceId,
     glyph: yu_font::GlyphId,
     origin: yu_core::Point<yu_core::Block>,
     size_scale: f32,
+    color: Option<Rgba8>,
 }
 
 impl SceneGlyph {
@@ -424,7 +437,20 @@ impl SceneGlyph {
             glyph,
             origin,
             size_scale,
+            color: None,
         }
+    }
+
+    /// 覆盖这一帧的正文颜色。
+    #[must_use]
+    pub const fn with_color(mut self, color: Rgba8) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    #[must_use]
+    pub const fn color(self) -> Option<Rgba8> {
+        self.color
     }
 
     #[must_use]
@@ -922,7 +948,9 @@ impl SceneBuilder {
                     origin.x() + placement.origin().x(),
                     origin.y() + placement.origin().y(),
                 ),
-                color,
+                // 字形自己带的颜色赢过这一帧的正文颜色。没带就是没带——
+                // 见 [`SceneGlyph`] 上关于这个 `Option` 的那一段。
+                placement.color().unwrap_or(color),
             )?);
         }
         Ok(primitives)

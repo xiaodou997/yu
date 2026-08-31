@@ -854,7 +854,33 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         )
         try require(bridge.setSearchQuery(nil), "收掉搜索失败")
         textView.navigate(toSource: NSRange(location: 0, length: 0))
-        _ = surfaceCoordinator.submitNow()
+        let highlightFrame = try require(
+            surfaceCoordinator.submitNow(),
+            "收掉搜索之后的重提交失败"
+        )
+
+        // 11. **代码高亮真的进了屏幕上那一帧。**
+        //
+        //     headless 的 `--code-highlight-self-check` 数的是 retained frame；
+        //     这一条数的是**真实 Metal surface 提交的那一帧**。第三刀与第四刀
+        //     各有一个缺陷是在自动化全绿、headless 也全绿之后才被真实窗口抓到
+        //     的，两次都是颜色——这一刀改的就是字形颜色。
+        //
+        //     判据是场景图元的颜色数（`highlightedGlyphCount`），不是装饰、
+        //     不是 `TextRole`。fixture 首屏里有一个 ```rust 块（见
+        //     Fixtures/outline.md 里那段说明），没有它这一条会假红。
+        try require(
+            highlightFrame.highlightedGlyphCount > 0,
+            "屏幕上那一帧一个高亮字形都没有——代码块的颜色没走到场景里"
+        )
+        //     不是所有字形都被刷成同一种颜色：正文与标题必须还是正文色。
+        //     只断「大于零」的话，一个把每个字形都上色的实现也能过。
+        let highlighted = highlightFrame.highlightedGlyphCount
+        let commands = Int(highlightFrame.commandCount)
+        try require(
+            highlighted < commands,
+            "这一帧的字形全被算成了高亮（\(highlighted) / \(commands) 条指令）"
+        )
 
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
@@ -865,7 +891,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                 + "multiSelection=\(selectedAll.selectionDecorationCount) "
                 + "extent=\(Int(documentView.frame.height)) "
                 + "outlineRows=\(outlinePanel.rowCountForSelfCheck) "
-                + "outlineScroll=\(Int(scrollBefore))→\(Int(scrollAfter))"
+                + "outlineScroll=\(Int(scrollBefore))→\(Int(scrollAfter)) "
+                + "highlightedGlyphs=\(highlighted)"
         )
     }
 

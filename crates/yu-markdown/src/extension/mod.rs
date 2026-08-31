@@ -898,7 +898,7 @@ impl ExtensionSet {
                 Box::new(quote::Quote),
                 Box::new(list::List),
                 Box::new(task::Task),
-                Box::new(fenced_code::FencedCode),
+                Box::new(fenced_code::FencedCode::default()),
                 Box::new(table::Table),
                 Box::new(emphasis::Emphasis),
                 Box::new(code_span::CodeSpan),

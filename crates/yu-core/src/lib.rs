@@ -18,4 +18,4 @@ pub use shaping::{
     ClusterMetrics, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
     TextDirection,
 };
-pub use style::{LineStyleId, StyleId, TextAttrs, TextStyle, WidgetId, WidgetSide};
+pub use style::{LineStyleId, StyleId, TextAttrs, TextRole, TextStyle, WidgetId, WidgetSide};

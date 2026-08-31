@@ -40,6 +40,7 @@ fi
 typeset -A checks=(
     accessibility                       Fixtures/block-projection.md
     clipboard                           Fixtures/block-projection.md
+    code-highlight                      Fixtures/render-code.md
     document-interaction                Fixtures/composition-cross-block.md
     document-workflow                   Fixtures/render-surface.md
     macos-table-resize-coordinator      Fixtures/block-projection.md
@@ -79,7 +80,9 @@ print -r -- "全部 ${#checks} 个 self-check 通过"
 # 「屏幕上那一帧还算不算数」这个判断。它还压着大纲面板导航之后视口真的滚了
 # ——headless 那边没有 scroll view，`revealCaretIfNeeded` 一进门就返回。
 # 它还压着搜索高亮真的进了屏幕上那一帧——headless 那边没有 surface，
-# 场景根本不提交，`search_decoration_count` 无从谈起。
+# 场景根本不提交，`search_decoration_count` 无从谈起。代码高亮同理：
+# `--code-highlight-self-check` 数的是 retained frame 里的字形颜色，而
+# 「那一帧真的上了屏」只有真实 surface 说得清。
 # 改动帧调度、大纲面板或搜索后必须在本地跑一次：
 #   "$binary" --launch-window-self-check Fixtures/outline.md
 # fixture 必须有一条落在首屏之外的标题（outline.md 有），否则「选中之后滚了」

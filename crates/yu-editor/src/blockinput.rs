@@ -680,6 +680,11 @@ impl DecorationDraft {
         // `yu-markdown`；「1.7 倍字号、排粗体」是呈现，只有这一层有
         // `LayoutConfig` 说得出来。v1 的 `HeadingClusterMetrics` 也是在这一
         // 层把字型整个丢掉，一律按 `Strong` 量。
+        //
+        // **这里是重建，不是修改**：`TextAttrs::new` 从头造一份，所以装饰那边
+        // 每加一样属性都必须在这里显式带过来。配色角色（S7 第五刀）就是这么
+        // 掉过一次的——`assemble` 把它归零，代码块里一个字都不着色，而
+        // `yu-markdown` 那一侧的断言全绿：装饰产出是对的，丢在下一层。
         let font_scale = heading.map_or(1.0, |heading| heading.font_scale);
         let mut attrs = Vec::with_capacity(self.styles.len());
         for base in self.styles {
@@ -691,7 +696,8 @@ impl DecorationDraft {
             attrs.push(
                 TextAttrs::new(style)
                     .with_size_scale(font_scale)
-                    .ok_or(LayoutError::InvalidMetrics(font_scale.to_bits()))?,
+                    .ok_or(LayoutError::InvalidMetrics(font_scale.to_bits()))?
+                    .with_role(base.role()),
             );
         }
 

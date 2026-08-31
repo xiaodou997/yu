@@ -16,6 +16,7 @@ members = [
     "crates/yu-render",
     "crates/yu-assets",
     "crates/yu-embedded-math",
+    "crates/yu-highlight",
     "crates/yu-storage",
     "crates/yu-workspace",
     "platform/macos/yu-font-macos",

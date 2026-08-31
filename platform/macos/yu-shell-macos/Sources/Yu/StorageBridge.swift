@@ -304,6 +304,8 @@ struct NativeMacosRenderHostSnapshot {
     /// 这一帧画了几处搜索命中底色。它是「改了查询画面真的跟着变了」在真实
     /// 窗口里唯一能被证伪的量，而它来自场景，不来自搜索自己那条路。
     let searchDecorationCount: Int
+    /// 这一帧有几个字形带着代码高亮的颜色。见 C 头文件里的说明。
+    let highlightedGlyphCount: Int
     let resourceRefreshPending: Bool
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
@@ -327,6 +329,7 @@ struct NativeMacosRenderHostSnapshot {
         selectionDecorationCount = Int(value.selection_decoration_count)
         caretDecorationCount = Int(value.caret_decoration_count)
         searchDecorationCount = Int(value.search_decoration_count)
+        highlightedGlyphCount = Int(value.highlighted_glyph_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
     }
 }
@@ -356,6 +359,8 @@ struct NativeMacosRenderHostSurfaceSnapshot {
     /// 这一帧画了几处搜索命中底色。它是「改了查询画面真的跟着变了」在真实
     /// 窗口里唯一能被证伪的量，而它来自场景，不来自搜索自己那条路。
     let searchDecorationCount: Int
+    /// 这一帧有几个字形带着代码高亮的颜色。见 C 头文件里的说明。
+    let highlightedGlyphCount: Int
     /// Rust 在提交这一帧时给出的结论：可见范围内还有资源没落定。
     /// 平台据此安排一次有界轮询，不自己判断资源状态。
     let resourceRefreshPending: Bool
@@ -386,6 +391,7 @@ struct NativeMacosRenderHostSurfaceSnapshot {
         selectionDecorationCount = Int(value.selection_decoration_count)
         caretDecorationCount = Int(value.caret_decoration_count)
         searchDecorationCount = Int(value.search_decoration_count)
+        highlightedGlyphCount = Int(value.highlighted_glyph_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
         contentHeight = CGFloat(value.content_height)
     }

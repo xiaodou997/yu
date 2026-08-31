@@ -10,6 +10,12 @@ workspace_dir="$shell_dir/../../.."
 rust_output="$shell_dir/.rust"
 library="$rust_output/libyu_storage_ffi.a"
 
+# tree-sitter 的 grammar 是 C，由 `cc` crate 编译进这个 .a（S7 第五刀）。
+# `cc` 默认按**主机 SDK** 的部署目标编译，而 Package.swift 声明的是
+# .macOS(.v14)，于是每一个 grammar 的 .o 都会让链接器抛一条
+# 「built for newer 'macOS' version」。它只是警告，但每次构建刷十几行，
+# 真正的警告会淹在里面。两边对齐到同一个版本就没有了。
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 cargo build --manifest-path "$workspace_dir/Cargo.toml" -p yu-storage-ffi >&2
 mkdir -p "$rust_output"
 cp "$workspace_dir/target/debug/libyu_storage_ffi.a" "$library"

@@ -2518,6 +2518,279 @@ Swift 产品代码 **6,061 → 6,356 行**（3.03 → **3.18 倍**），分布�
 
 ---
 
+#### 第五刀：代码块高亮（tree-sitter）
+
+五个设计问题在开工前各查了一遍代码。**交接稿给的四条「已核实事实」里有三条要
+修正**，先说这三条——它们各自省掉或改变了一整块工作。
+
+##### 查代码推翻的三个前提
+
+**一、语言标签已经在了。** 交接稿说「`BlockKind::FencedCodeBlock { marker,
+closed }` 不带语言标签」，对；但由此推出的两个候选答案（补进 `BlockKind` /
+另开一条查询）**都不需要**。`extension/fenced_code.rs` 早就算出了语言名与正文
+的区间，并且作为 `BlockOrnament::FencedCode { info, content }` 发出来了
+（`extension/mod.rs:331-337`），消费者是 `yu-storage-ffi::fenced_code_of`——
+KaTeX / Mermaid 那条路按语言名决定这个块渲染成什么。着色是同一个块上的第三个
+消费者，不是第一个。
+
+`BlockKind` 保持不动另有一条独立理由：它是 `Copy + Hash`，而且是
+`DecorationCache` 复用条目的键之一（`decorations.rs:177`）。
+
+**二、`tools/check-deps.py` 不检查外部依赖。** 它的 docstring 第 12–13 行写着
+「外部 crate（ropey、comrak…）不在此列，那是选型问题，不是分层问题」，
+`parse()` 的正则只收 `path = "` 且名字以 `yu-` 开头的行。全仓也没有第二处外部
+依赖门禁。白名单最后确实改了，但**是因为多了一个 crate，不是因为多了一个外部
+crate**。
+
+**三、tree-sitter 不是「这条线上的第一个外部依赖」。** `yu-layout` 有三个
+（unicode-segmentation / linebreak / bidi），`yu-editor` 有 unicode-segmentation，
+`yu-text` 有 ropey，`yu-syntax` 有 unicode-general-category。**零外部依赖的只有
+`yu-markdown` 一个**——F3 那条欠账说的正是它。
+
+##### 一、颜色从哪一层进来：D1 的判据自己指着装饰这条路
+
+交接稿最贵的那条事实成立：从装饰到场景批次，**没有任何一层带着「这个字什么
+颜色」**，一帧只有一个正文色，由 `SceneBuilder::append_viewport` 的 `color`
+参数一次性发给所有字形（`yu-scene/src/lib.rs:894`）。
+
+但「像第三刀那样绕开装饰」这个选项**被 D1 自己的判据排除了**。第三刀刚给 D1
+划的那条边界原文是：
+
+> 判据是「文档的字节流变了它会不会变」：藏 `##` 会跟着源码变，所以是装饰；
+> 一块选区底色只跟着选区变，所以不是。
+
+代码高亮跟着字节流变，改的是文字自己的视觉表现。**它在 D1 里面。** 第三刀划出去
+的是「非文档状态驱动的矩形」，不是「改颜色」——这一刀是那条边界第一次被反方向
+用到。
+
+「另开一张表」也被排除了，理由在代码里：`yu-editor::marks::winner_over` 是
+**最窄的 Mark 赢，而且只赢一个**（`marks.rs:87-97`），Mark 不叠加。代码块整段
+有一条 `Code` 的 Mark，token 的 Mark 更窄会把它整个盖掉——所以 token 那份属性
+必须**同时**带着字型与颜色，也就是必须是同一张表的同一个值。第二张表解决不了
+这件事，只会多一份「谁盖谁」的规则。
+
+选法：**`TextAttrs` 加一个 `role: TextRole`，不是 `Rgba8`。**
+
+- 产品选色不下沉到 `yu-markdown`。仓库已有的规矩写在
+  `yu-workspace/src/lib.rs:97`：「产品选色住在这一层，不住在场景层」，
+  `EditorDecorationStyle` 的搜索底色也是从平台传进来的。写死颜色等于把主题焊进
+  解析层。
+- `yu-layout` 拿到的仍然是「等宽、1.0 倍、Keyword 角色」，拿不到「这是 Rust 的
+  `fn`」——不变量 E1 在这一层的落法不变。
+
+**这一刀便宜的原因是样式身份本来就没丢**：`GlyphBox` 一直带着 `StyleId`
+（`yu-layout/src/block.rs:576`），`BlockGlyph` 带着已经解释过的 `TextStyle` 与
+自己的 source（`blockview.rs:114-123`）。丢掉它的只有 `yu-workspace` 转
+`SceneGlyph` 的那一步。所以颜色不需要新开一条通路，只要**不丢**：
+`BlockGlyph` 多一个 `role`，`SceneGlyph` 多一个 `Option<Rgba8>`，
+`collect_glyphs` 里 `placement.color().unwrap_or(color)`。
+
+`Option` 不是「每个字形都带一份颜色」：**没有覆盖**与**覆盖成正文色**是两件不同
+的事，前者跟着主题走；而 `None` 让「上一层忘了传颜色」退化成现状，不是一片黑。
+
+##### 二、两棵树怎么共存：**不共存——第二棵树活不过一次 `decorate()`**
+
+`yu_highlight::Highlighter::spans` 里建树、遍历、丢掉。跨调用留下来的只有结果。
+于是「谁拥有第二棵树、跟着谁失效」这个问题没有内容：它不存在到下一次。
+
+**tree-sitter 自己的增量解析没有用上**，这是有意的：两套增量要两份「什么变了」
+的答案，而块级那一份已经在 `DecorationCache` 里了（按 range + kind 复用、
+`shift_through` 平移）。
+
+但**留一条 memo 是必须的，而且这件事是量出来的**。加了一个探针数
+`DecorationCacheStats::parses`：光标停在代码块里时，`block_layout_for_visual_state`
+每个可见块都问一次 `selection_reveal_block_index()`，而它走的是未缓存的
+`DecorationCache::decorate`（`document.rs:308`）。实测 5 个可见块的稳态一帧要跑
+**5 次**未缓存产出，真实窗口二三十个可见块就是二三十次。而着色的代价（M1 Max，
+release）：
+
+| 代码块 | parse + highlight |
+| --- | --- |
+| ~12 行 / 260 B | 59 µs |
+| ~100 行 / 2.2 KB | 428 µs |
+| ~1000 行 / 21 KB | 3.4 ms |
+
+外加 **query 编译 19–28 ms/语言**——那个必须只做一次（`OnceLock`），做在调用里
+就是把这条路的代价整个颠倒过来。
+
+所以 `yu-highlight` 带一条 memo：`(语言, 代码文本)` 精确比较。**它不是
+`DecorationCache` 的第三道失效门。** 那两道（Revision + range/kind、引用表指纹）
+是**正确性**的门，漏掉一次就画出一份对不上源码的东西；这一条是**代价**的门，
+键就是内容本身，所以陈旧条目在定义上不存在——没有任何「什么时候该清」要回答。
+
+**只有一条**，因为一帧里被反复问的只有焦点块那一个；其余块走 `DecorationCache`
+自己的条目，各问一次。第二条要等「一帧里有两个块反复被问」真的出现。
+
+**已登记的欠账**：单个代码块大到一次全量 parse 在编辑时看得见（按上表 ~1000 行
+起，因为编辑推进 Revision，memo 必然落空）。那时才谈得上保留树、用 tree-sitter
+自己的增量——那是第三份「什么变了」，要有人真的抱怨才值得付。
+
+##### 三、语言标签：不动 `BlockKind`，也不另开 extension
+
+着色写进 `fenced_code.rs` **自己**，因为**不变量 D6 不许 extension 互相感知**：
+另开一个 extension 读不到这里的 `BlockOrnament`，就得把 info 与 content 两段区间
+再算一遍。两份实现会在下一次改动时分叉，分叉的表现是颜色盖到围栏上。同一个文件
+里它们是两个局部变量。
+
+`Language::from_info` 只取 info string 的第一个词：CommonMark 允许
+```` ```rust,ignore ````、```` ```js title=a.js ````。大小写只在 ASCII 上折叠
+——语言名都是 ASCII，用不着仓库里的第二份 case folding（F3 那条欠账正是那件事）。
+
+##### 四、外部依赖与分层：新建 `yu-highlight`，与 F3/comrak **不是**同一件事
+
+交接稿把这条写成一个要验证的问题而不是判断，验证结果是**不同形状**：
+
+| | F3（引用标签的 case folding） | 这一刀 |
+| --- | --- | --- |
+| 要动的逻辑在哪 | `yu-markdown` 自己的标签比较里 | 一个与 Markdown 无关的独立问题 |
+| 能不能装进一个 crate | 不能，它必然是 `yu-markdown` 的直接依赖 | 能 |
+| 对 `yu-markdown` 的外部依赖数 | 0 → 1 | 仍然 0 |
+
+`yu-highlight` 住在 1 层（只依赖 `yu-core`），是全仓唯一认识 tree-sitter 的地方，
+对外只有一句话：`(语言名, 代码文本) → Vec<RoleSpan>`。`yu-markdown → yu-highlight`
+是一条 **workspace 边**，`check-deps.py` 管得着。
+
+`RoleSpan` 有意**不用 `TextRange`** 装它的两个偏移：那是文档坐标的类型，拿它装
+局部偏移正是 `ShapingProvider::shape` 那条已登记糊涂账的形状（它的 range 参数是
+零基局部空间，看类型看不出来）。用裸 `usize` 逼调用方把「加上正文起点」这一次
+换算显式写出来。
+
+**着色用 `tree-sitter-highlight`，不自己拿 `Query` 拼。** 它的
+`HighlightEvent` 是一个栈，栈顶就是最里面那一层 capture——按查询文件里的先后
+再判一遍优先级会是第二份实现，而它正是这件事的参照实现（Helix / Neovim 生态用
+的就是它）。`#match?` / `#eq?` 这类文本谓词也归它：忽略谓词的后果是
+`((identifier) @constant (#match? "^[A-Z]"))` 把**所有**标识符染成常数。
+
+新增的构建要求要登记：grammar crate 走 `cc` 编译 C，CI 三个平台
+（`ci.yml:11` 含 windows-latest）都要有 C 编译器。另外
+`build-rust-ffi.sh` 现在显式 `export MACOSX_DEPLOYMENT_TARGET=14.0`——`cc` 默认
+按主机 SDK 的部署目标编译，而 `Package.swift` 声明的是 `.macOS(.v14)`，不对齐
+的话每次链接刷十几行 "built for newer 'macOS' version"，真正的警告会淹在里面。
+
+##### 五、帧身份：**不加**，这是三刀里第一次答案是「不加」
+
+`MacosFrameKey` 的规则是「新增一种**不推进 Revision** 却改变画面的状态」。高亮是
+`(源码字节, 语言)` 的纯函数，没有第二个输入：没有开关、没有主题切换、没有异步。
+源码变了 Revision 就变了。`search_generation`（换查询）与选区**条数**漏掉，是
+因为它们真的能脱离 Revision 变化；高亮不能。
+
+反过来说清楚什么时候会变：如果以后高亮变成异步（大文件后台着色），它就会长出
+`resource_refresh_pending` 那种形状（`SurfaceHost.swift:768` 的有界轮询），
+那时才需要一个 generation。
+
+##### 这一刀查出来的真缺口：`assemble` 把角色归零
+
+`yu-markdown` 那一侧的断言全绿（装饰产出是对的），`yu-editor` 的字形上一个角色
+都没有。查下去是 `blockinput.rs::DecorationDraft::assemble`：它给标题算字号倍率
+时**从头重建**每一份 `TextAttrs`——
+
+```rust
+TextAttrs::new(style).with_size_scale(font_scale)
+```
+
+——新造的那份自然没有角色。表现是**代码块里一个字都不着色，而且不报错**：装饰对、
+布局对、场景对，就是颜色没了。
+
+这个缺口只有**跨层**的用例抓得住：`yu-markdown` 的用例断在装饰上（绿），
+`yu-workspace` 的用例断在场景上（红，但它离缺口三层远）。抓住它的是
+`block_view_properties.rs::code_highlight_roles_reach_the_glyphs`——判据是
+**字形自己的 source 区间**切出来的文本等于 `fn` / `u32`，不是「有几个字形带
+角色」。那一行现在写着为什么它是重建而不是修改。
+
+##### 判据落在哪
+
+四层，每一层的判据都来自它下游的产出，不来自被测的那条路：
+
+- `yu-highlight/tests/languages.rs`：**每一条断言都把 `code[span]` 切出来跟一个
+  字面量比**。每一种登记的语言各带一条 `(角色, 文本)` 期望，而不是共用一条
+  「有注释就算过」——**JSON 没有注释**，共用判据会逼语料去迁就判据。外加结构
+  性质（有序、不重叠、非空、不越界、落在字符边界上）、三条降级（认不出语言 /
+  空 / 语法错的代码）、以及两条 memo 的用例：**用过的着色器与全新的必须给出同一
+  个答案**，**同一段文本换一种语言必须换一个答案**。
+- `yu-markdown/tests/code_highlight.rs`：区间搬到源码坐标之后指对了没有。
+  **每一条高亮 Mark 都必须带着 `TextStyle::Code`**（`winner_over` 那条陷阱的
+  断言）；高亮不许碰围栏那两行，判据是同一个 extension 的另一样产出
+  （`BlockOrnament::FencedCode` 的正文区间）；光标停在块里不改变任何东西。
+- `yu-editor/tests/block_view_properties.rs`：角色到了字形上，判据是字形的
+  source；**外加一条反面**——没有高亮的块每一个字形都是 `Plain`，否则一个把所有
+  字形都标成 `Keyword` 的实现也能过前一条。
+- `yu-workspace`：判据是**场景图元的颜色**，一次都没问过 `TextRole`。主判据是
+  一个差分：同一段代码一份带语言名一份不带，两份文档除此之外一个字节都不差。
+- `--code-highlight-self-check`（headless，`Fixtures/render-code.md`）：同一个
+  差分，但走**真的 CoreText**——字形的数量与分段都不同，颜色是不是按 run 正确
+  分配只有这条路看得见。
+- `--launch-window-self-check` 第 11 步：**真实 Metal surface 提交的那一帧**里
+  数出的高亮字形数（实测 `highlightedGlyphs=8`）。上限那半句
+  （`highlighted < commandCount`）压的是「所有字形都被刷成同一种颜色」——那种
+  错法只断「大于零」是过得去的。
+
+**「在代码块里打字，颜色跟着改」原本写在人工验收清单里，收尾时挪成了自动化**：
+`--code-highlight-self-check` 把 `let` 改成 `lets`，断**高亮字形正好少 3 个**
+（实测 7→4）。理由有两条：真人按键盘那条路把光标准确放进代码块不可靠（方向键
+会滚动视口，合成点击驱动不了 AppKit）；而「少 3 个」这个数比「变了」强——一个
+每次编辑都把整块颜色清掉的实现能过后者，过不了前者。
+
+##### 反向验证
+
+Rust 侧 20 个变异、Swift/FFI 侧 4 个，全部变红。**三个活下来过，逐个分类，
+三个都是缺口，没有一个是等价变异**：
+
+- **「取 capture 栈的**栈底**而不是栈顶」活了一次。** 判据落在了被改的那条路
+  上，但**语料压不住它**：那几份代码里的 capture 几乎都只有一层，栈底与栈顶
+  是同一个值。补了一条专门造两层结构的用例（模板串 / f-string / `"$HOME"`：
+  外层是整段字符串，里面套着定界符与被插进去的名字），并且先断「同一段代码里
+  确实存在外层的字符串角色」——否则语料退化成一层，用例自己就废了。
+- **「memo 的键里没有代码文本」活了一次，也是语料的问题。** 第一版的两份 Rust
+  语料是 `fn a() { let x = 1; }` 与 `fn b() { let y = 2; }`——标识符都是一个
+  字符，两份的 `RoleSpan` **逐个字节完全相同**，拿上一份的答案回报比出来一样。
+  换成长度与角色都不同的三份之后变红。**这与第四刀「当前命中」活两次是同一类
+  错**：判据在路上，但输入造不出差别。
+- **「给列表标记的字形也编一个角色」活了一次。** 那是全场唯一一条不查样式表、
+  直接写死角色的路（标记的 `•` 不在 source 里，没有任何 Mark 盖着它），而反面
+  用例的语料里只有**任务项**——任务项按设计不换替代标记，所以根本没有标记字形。
+  加一条普通列表项之后变红。
+- **「调色板给所有角色同一种颜色」活了一次。** 场景层的判据是「颜色种类 > 1」，
+  而正文色也算一种：全部刷成红色时是「黑 + 红」两种，照样过。改成**数正文色
+  之外还有几种**（≥ 2）之后变红。
+
+**一条一般式留着**：`macos_highlighted_glyph_count` 拿 `config.color()` 比而不是
+写死黑色——当前配置里那两个值相同，任何用例都分不开。留着它并把理由写在那一行
+上：配置换了颜色而这里没跟着换，表现是「整篇文档都被算成高亮」，那是一个不报错
+的假绿。
+
+##### 已登记
+
+- **深色模式不在这一刀里。** 调色板是一份写死的浅色，与
+  `viewport_block_background` 挑同一块底。整个编辑区现在就是浅色的：
+  `macos_render_host_config` 把背景写死成 `Rgba8::white()`，第四刀的人工验收
+  记录里 D2 已经登记了这条（深色外观下面板变深而文档区仍是白底）。这一刀跟着它
+  走——单独给高亮开一条深色路会造出「深色的代码配白色的底」。
+- **每个 `StyledRun` 单独 shape**（`yu-layout/src/block.rs:1710`），token 化把
+  一个代码块的 1 次 shaping 变成 N 次。连字不跨 run 边界，等宽编程字体里
+  `->`/`!=` 这类连字如果被 token 边界劈开会画成两个字形。实测语料里没有出现，
+  因为这些符号本来就是一个 token。
+- **内嵌语言不下钻**（Rust 文档注释里的 ```` ```rust ````、JS 模板串里的 SQL）：
+  `injection_callback` 一律给 `None`。少的是内嵌那一段的颜色。
+- **括号与分号不着色**：全部着上之后代码看着像圣诞树，而它们本来就靠形状区分。
+- **五种语言**：bash / javascript / json / python / rust，含常见别名。加一种是
+  三处（枚举变体、别名、grammar），`tests/languages.rs` 要求每一个变体都真的着
+  上色，所以漏掉后两处的任何一处都会红。
+
+##### 代价
+
+Rust 侧新增 `crates/yu-highlight`（一个 crate，397 行含文档）加两份用例
+（288 + 258 行）。
+Swift 产品代码 **6,356 → 6,415 行**（3.18 → **3.21 倍**），分布是
+`DocumentWindow.swift` +53（第 11 步）、`StorageBridge.swift` +6（两个镜像字段）。
+`SelfChecks.swift` 1,511 → 1,690（不计）。**这一刀是 S7 里 Swift 侧最便宜的
+一刀**——高亮没有新 UI，它是既有那条「装饰 → 布局 → 场景」的路上多带了一样
+东西。
+
+真正的代价在构建：tree-sitter 加五个 grammar 的冷编译约 **2 分 34 秒**，静态库
+里多出十来个 C 目标文件。
+
+---
+
 ---
 
 ## 9. 明确不做的事
