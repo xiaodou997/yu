@@ -302,6 +302,7 @@ fn ensure_allowed_tag(name: &str) -> Result<(), HtmlImportError> {
             | "tr"
             | "th"
             | "td"
+            | "hr"
     ) {
         Ok(())
     } else {
@@ -310,13 +311,18 @@ fn ensure_allowed_tag(name: &str) -> Result<(), HtmlImportError> {
 }
 
 fn validate_attributes(name: &str, attributes: &[Attribute]) -> Result<(), HtmlImportError> {
+    // S7 第六刀放宽了三处，全部是**因为 Yu 自己的导出现在会发出它们**：
+    // comrak 带链接与图片的 `title`，用 GFM 的 `align=` 而不是行内 style，
+    // 并且把主题分隔线渲染成 `<hr />`。不放宽的表现不是报错，是 Yu 里 ⌘C 再
+    // ⌘V 静静降级成纯文本。**原始 HTML（`<div>`/`<script>`）继续拒**：导出的
+    // 是用户自己的文档，导入的是别人的 HTML，这个不对称是有意的。
     let allowed = match name {
-        "a" => &["href"][..],
-        "img" => &["src", "alt"],
+        "a" => &["href", "title"][..],
+        "img" => &["src", "alt", "title"],
         "ol" => &["start"],
         "code" => &["class"],
         "input" => &["type", "disabled", "checked"],
-        "th" | "td" => &["style"],
+        "th" | "td" => &["style", "align"],
         _ => &[][..],
     };
     for attribute in attributes {
@@ -338,16 +344,14 @@ fn validate_attributes(name: &str, attributes: &[Attribute]) -> Result<(), HtmlI
             "only disabled checkbox inputs are allowed",
         ));
     }
+    // CommonMark 允许 `0.` 起头的有序列表，comrak 因此会发 `start="0"`。
+    // 这里以前要求严格为正，于是 Yu 自己导出的那一份粘不回来。
     if name == "ol"
         && let Some(value) = attribute(attributes, "start")
-        && value
-            .parse::<u64>()
-            .ok()
-            .filter(|number| *number > 0)
-            .is_none()
+        && value.parse::<u64>().is_err()
     {
         return Err(HtmlImportError::InvalidStructure(
-            "ordered list start must be a positive integer",
+            "ordered list start must be a non-negative integer",
         ));
     }
     if name == "code"
@@ -358,16 +362,27 @@ fn validate_attributes(name: &str, attributes: &[Attribute]) -> Result<(), HtmlI
             "code class must use language-*",
         ));
     }
-    if matches!(name, "th" | "td")
-        && let Some(value) = attribute(attributes, "style")
-        && !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "text-align: left" | "text-align: center" | "text-align: right"
-        )
-    {
-        return Err(HtmlImportError::InvalidStructure(
-            "table alignment style is not allowlisted",
-        ));
+    if matches!(name, "th" | "td") {
+        if let Some(value) = attribute(attributes, "style")
+            && !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "text-align: left" | "text-align: center" | "text-align: right"
+            )
+        {
+            return Err(HtmlImportError::InvalidStructure(
+                "table alignment style is not allowlisted",
+            ));
+        }
+        if let Some(value) = attribute(attributes, "align")
+            && !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "left" | "center" | "right"
+            )
+        {
+            return Err(HtmlImportError::InvalidStructure(
+                "table alignment attribute is not allowlisted",
+            ));
+        }
     }
     Ok(())
 }
@@ -477,13 +492,22 @@ fn is_block_tag(name: &str) -> bool {
             | "ul"
             | "ol"
             | "table"
+            | "hr"
     )
 }
 
 fn render_block(element: &Element) -> Result<String, HtmlImportError> {
     match element.name.as_str() {
         "p" => render_inline_nodes(&element.children),
-        name if name.starts_with('h') && name.len() == 2 => {
+        // **必须核对那一位是 1..=6，不能只看「`h` 开头、两个字符」。**
+        // `hr` 正好是那个形状：`b'r' - b'0'` = 66，于是一条主题分隔线被粘成
+        // 一个 66 级标题（66 个 `#`）——不 panic、不报错。S7 第六刀给导入器
+        // 加 `<hr>` 时由 `export_import_export_is_a_fixed_point` 抓到，
+        // 在此之前 Yu 的导出器不发 `<hr>`，这一支永远走不到。
+        name if matches!(name.as_bytes(), [b'h', level] if level.is_ascii_digit()
+            && *level != b'0'
+            && *level <= b'6') =>
+        {
             let level = name.as_bytes()[1] - b'0';
             Ok(format!(
                 "{} {}",
@@ -502,6 +526,11 @@ fn render_block(element: &Element) -> Result<String, HtmlImportError> {
         "pre" => render_pre(element),
         "ul" | "ol" => render_list(element),
         "table" => render_table(element),
+        // 主题分隔线回写成 `---`。**它紧跟在一个段落后面就是 Setext 二级
+        // 标题**，所以这里只发标记本身，块与块之间的那个空行由
+        // `render_roots` 统一插——`join("\n\n")`，那个空行正是把两者分开的
+        // 东西。少了它不报错，只是一条分隔线变成了上一段的下划线。
+        "hr" => Ok("---".to_owned()),
         _ => Err(HtmlImportError::InvalidStructure(
             "unsupported block structure",
         )),
@@ -510,9 +539,24 @@ fn render_block(element: &Element) -> Result<String, HtmlImportError> {
 
 fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
     let mut output = String::new();
+    // `<br />` 后面紧跟的那一个换行是 HTML 的排版空白，不是内容。
+    //
+    // 几乎每个 Markdown 渲染器（comrak、cmark、marked）都发 `<br />\n`，而
+    // 硬换行本身要回写成 `"  \n"`——两个加起来是一个空行，于是**一个段落被
+    // 粘成了两个**。不报错、不丢字，只是多了一次分段。S7 第六刀由
+    // `export_import_export_is_a_fixed_point` 抓出来：在此之前 Yu 自己的
+    // 导出器不发 `<br>`，语料里也就没有这个形状。
+    let mut after_hard_break = false;
     for node in nodes {
         match node {
-            Node::Text(text) => escape_markdown_text(text, &mut output),
+            Node::Text(text) => {
+                let text = if after_hard_break {
+                    text.strip_prefix('\n').unwrap_or(text)
+                } else {
+                    text.as_str()
+                };
+                escape_markdown_text(text, &mut output);
+            }
             Node::Element(element) => match element.name.as_str() {
                 "strong" => {
                     output.push_str("**");
@@ -535,6 +579,7 @@ fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
                     output.push_str(&render_inline_nodes(&element.children)?);
                     output.push_str("](");
                     escape_destination(href, &mut output);
+                    push_title(attribute(&element.attributes, "title"), &mut output);
                     output.push(')');
                 }
                 "img" => {
@@ -545,6 +590,7 @@ fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
                     escape_markdown_text(alt, &mut output);
                     output.push_str("](");
                     escape_destination(src, &mut output);
+                    push_title(attribute(&element.attributes, "title"), &mut output);
                     output.push(')');
                 }
                 "br" => output.push_str("  \n"),
@@ -555,8 +601,27 @@ fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
                 }
             },
         }
+        after_hard_break = matches!(node, Node::Element(element) if element.name == "br");
     }
     Ok(output)
+}
+
+/// `[文字](/目标 "标题")` 的那一半。
+///
+/// 双引号与反斜杠要转义——不转的话一个带引号的 title 会把 Markdown 的目标
+/// 括号提前关掉，粘回来的是一段坏掉的源码，而且**导入这一侧不报错**。
+fn push_title(title: Option<&str>, output: &mut String) {
+    let Some(title) = title else {
+        return;
+    };
+    output.push_str(" \"");
+    for character in title.chars() {
+        if matches!(character, '"' | '\\') {
+            output.push('\\');
+        }
+        output.push(character);
+    }
+    output.push('"');
 }
 
 fn render_pre(element: &Element) -> Result<String, HtmlImportError> {
@@ -787,7 +852,20 @@ fn render_table_row(row: &[ImportedTableCell]) -> String {
         .join(" | ")
 }
 
+/// 对齐有两种写法，**必须两种都认**：行内 `style="text-align: …"` 是 Yu 自研
+/// 渲染器发过的那一种（S7 第六刀之前），GFM 的 `align="…"` 是 comrak 发的那
+/// 一种。只认一种的表现是自己拷出来的表格粘回来丢掉对齐——不报错。
 fn table_cell_alignment(element: &Element) -> Result<TableAlignment, HtmlImportError> {
+    if let Some(align) = attribute(&element.attributes, "align") {
+        return match align.trim().to_ascii_lowercase().as_str() {
+            "left" => Ok(TableAlignment::Left),
+            "center" => Ok(TableAlignment::Center),
+            "right" => Ok(TableAlignment::Right),
+            _ => Err(HtmlImportError::InvalidStructure(
+                "table cell alignment is not supported",
+            )),
+        };
+    }
     let Some(style) = attribute(&element.attributes, "style") else {
         return Ok(TableAlignment::Default);
     };
@@ -876,6 +954,88 @@ fn max_backtick_run(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `<br />` 后面那个换行是排版空白，不是内容。
+    ///
+    /// 几乎每个渲染器都发 `<br />\n`，而硬换行本身要回写成 `"  \n"`；两个
+    /// 加起来是一个空行，于是**一个段落被粘成两个**。不报错、不丢字。
+    ///
+    /// 反向验证：把 `after_hard_break` 那一段去掉，这条与
+    /// `export_import_pair.rs::export_import_export_is_a_fixed_point` 同时红。
+    #[test]
+    fn a_hard_break_does_not_split_the_paragraph_in_two() {
+        let markdown = import_html_fragment("<p>第一行<br />\n第二行</p>")
+            .expect("硬换行是 Yu 自己会导出的形状");
+        assert_eq!(markdown, "第一行  \n第二行");
+        assert!(
+            !markdown.contains("\n\n"),
+            "多出来的空行会把一个段落分成两个：{markdown:?}"
+        );
+    }
+
+    /// `<hr>` 不是标题。
+    ///
+    /// 块分派那一支以前写的是「`h` 开头、两个字符」——`hr` 正好是那个形状，
+    /// `b'r' - b'0'` = 66，于是一条主题分隔线被粘成 66 个 `#`。不 panic、
+    /// 不报错。这一支在 S7 第六刀给导入器加 `<hr>` 之前永远走不到。
+    ///
+    /// 反向验证：把 `render_block` 里那条 `1..=6` 的核对换回
+    /// `name.starts_with('h') && name.len() == 2`，这条红。
+    #[test]
+    fn a_thematic_break_is_not_a_heading() {
+        assert_eq!(
+            import_html_fragment("<p>上</p><hr /><p>下</p>").expect("hr 在白名单里"),
+            "上\n\n---\n\n下"
+        );
+        // 真正的标题仍然要认得，六级到头。
+        assert_eq!(
+            import_html_fragment("<h6>六</h6>").expect("h6"),
+            "###### 六"
+        );
+        assert!(
+            import_html_fragment("<h7>七</h7>").is_err(),
+            "h7 不是标题，也不在白名单里"
+        );
+    }
+
+    /// 链接与图片的 `title` 要带回来，而且**引号要转义**。
+    ///
+    /// 不转的话一个带引号的 title 会把 Markdown 的目标括号提前关掉，粘回来
+    /// 是一段坏掉的源码，导入这一侧一声不响。
+    #[test]
+    fn link_and_image_titles_survive_with_escaped_quotes() {
+        assert_eq!(
+            import_html_fragment(r#"<p><a href="/u" title="标题">文字</a></p>"#).expect("title"),
+            r#"[文字](/u "标题")"#
+        );
+        assert_eq!(
+            import_html_fragment(
+                r#"<p><img src="/a.png" alt="替代" title="带&quot;引号&quot;"></p>"#
+            )
+            .expect("image title"),
+            "![替代](/a.png \"带\\\"引号\\\"\")"
+        );
+    }
+
+    /// 表格对齐有两种写法，两种都要认。
+    ///
+    /// `align="left"` 是 comrak（GFM）发的那一种，`style="text-align: left"`
+    /// 是 Yu 自研渲染器发过的那一种。只认一种的表现是自己拷出来的表格粘回来
+    /// **丢掉对齐**——表格还在，不报错。
+    #[test]
+    fn table_alignment_is_read_from_both_gfm_and_inline_style() {
+        for cell_attribute in [r#"align="right""#, r#"style="text-align: right""#] {
+            let html = format!(
+                "<table><thead><tr><th {cell_attribute}>a</th></tr></thead>\
+                 <tbody><tr><td {cell_attribute}>1</td></tr></tbody></table>"
+            );
+            let markdown = import_html_fragment(&html).expect("两种写法都该认");
+            assert!(
+                markdown.contains("---:"),
+                "{cell_attribute} 的右对齐丢了：{markdown}"
+            );
+        }
+    }
 
     #[test]
     fn imports_allowlisted_semantic_fragment() {

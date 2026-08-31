@@ -22,7 +22,7 @@ workspace = true
 # 参考渲染的引用标签归一化要与产品链路（`yu-markdown::reference`）折出同一
 # 个答案，所以版本走 workspace，不在这里单独写。
 caseless = { workspace = true }
-comrak = { version = "0.54", default-features = false }
+comrak = { workspace = true }
 entities = "1.0"
 percent-encoding = "2.3"
 serde_json = "1"
