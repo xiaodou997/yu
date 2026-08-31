@@ -2299,6 +2299,223 @@ Swift 产品代码 **5,276 → 6,061 行**（2.64 → **3.03 倍**），分布�
 +9、`main.swift` +4。`SelfChecks.swift` 1,068 → 1,368（不计）。
 S1 那条未达成项继续往外走，这笔钱是显式拍过的。
 
+#### 第四刀：多光标
+
+四个设计问题在开工前各查了一遍代码。**这一刀没有预写的建议方案**——前三刀那些
+是上一个会话查过代码之后写的，凭印象编出来的建议会让人把未经验证的判断当成
+已验证的。
+
+##### 先说查代码推翻的一个预期：事务层已经是多光标就绪的
+
+`yu-text` 的 `Transaction::new` 收的就是**一组** `Edit`；`prepare` 先排序、
+再 `validate_edits`、产出**一份** inverse。于是「三个光标同时打一个字」是一个
+Transaction、一次 `history.record`，连续输入照样并进同一个 group——**`history.rs`
+一行都没改**。原本预期要给它加「一次命令 N 条 edit」的概念，不用。
+
+`source_change_from_applied` 也已经取全部 change 的**并集**，Swift 镜像的增量
+同步对 N 条边本来就是对的（偏保守，不会漏）。
+
+但同一处给出一条硬约束：`validate_edits` 不但拒绝重叠，还拒绝两个**空** edit
+落在同一个偏移。两个相邻光标各按一次退格就会撞到同一点。**「不重叠」不是洁癖，
+是一条不满足就直接报 `OverlappingEdits` 的前置条件。**
+
+##### 一、一组选区：`Selections` 新类型，不是裸 `Vec + primary`
+
+`Selections { revision, ranges: Vec<EditorSelection>, primary }` 住在 `yu-state`，
+元素仍是 `EditorSelection`（那 130 行一个字没动，`Copy`/`Hash` 都还在）。三条
+理由：
+
+1. **不变式要有一个执法点。** 裸 `Vec` 会把「谁负责合并」散到 `EditorDocument`
+   里那几十处赋值上，每一处都要记得合并一次。
+2. **`revision` 不能有 N 份。** `EditorSelection` 自带 revision，`Vec` 就是 N 份
+   必须相等的值 = N−1 个可以对不上的机会。这里只存一份。
+3. **映射之后必须合并，而合并只能有一个地方。** `ChangeSet::map_anchor` 逐个偏移
+   独立映射，两个不同偏移**可以映射到同一个**（删掉它们之间的文字）。
+   `Selections::map_through` 是全仓唯一的收敛点。
+
+不变式：至少一个 / 同一 revision / 有序 / 互不重叠 / primary 在界内。「互不重叠」
+比 `validate_edits` 严一点：相邻两条 `prev.end() <= next.start()`，等号成立时两条
+都必须非空。**这半句是这条规则的全部重量**——`aa` 在 `aaaa` 里的两处匹配就是
+`0..2` 与 `2..4`，并掉等于把「选中全部匹配」变成「全选」；而一个停在选区边界上
+的**空**光标要并进去，否则打字会把同一个位置插两次。
+
+`preferred_x` 不进 `yu-state`：它是 f32 视觉列，而那个 crate 的模块文档把边界
+画在「一个布局或投影类型都没有」。代价见下面第三条。
+
+##### 二、`EditorState` 仍然不抽，但理由必须换掉
+
+前三刀的理由是「那几个缓存字段跟着走」。这一刀动的是 `selections`，那是真的文档
+状态，旧理由不成立了。
+
+新理由是**这一刀没有给它带来第二个消费者，而拆开会让借用变难而不是变容易**：
+`selection_reveal_block_index` / `selection_reveal_range` /
+`block_decorations_with_selection_reveal` 三个函数同时要读 `selections` 和
+`&mut decorations`，拆成两半之后它们只能改成收两个参数的自由函数，或者仍然挂在
+`EditorDocument` 上——后者等于没拆。真正让人想抽的是「几十处 `self.selection = …`
+的重复」，而那个重复的解药是 `Selections`，不是把结构体切两半。
+
+**而且这一刀真正的风险是把两件事叠在一起**：那几十处赋值正是本刀要逐条重写的
+地方，同时搬家会让变异验证分不清「红是因为多光标改错了，还是因为搬家搬错了」。
+
+**触发条件改写**：原条件是「那三个缓存字段碍事了」。新条件是——**出现第二个需要
+「一份完整可复制的编辑状态」的消费者时**（协作编辑的快照，或第七刀跨平台第二端
+要在两个 host 之间传状态）。缓存字段的多少不再是判据，第三刀与第四刀都证明了它
+跟着走不碍事。
+
+##### 三、哪些一次全改，哪些留 primary 降级
+
+判据：**这条路上「多个」是有意义的吗？** 没有意义的是 primary，有意义但这一刀
+不做的是欠账。
+
+**一次全改**（做不到就是静默出错）：编辑之后的映射、insert/delete/newline 的 N 条
+edit、场景层的 N 块选区底色与 N 根 caret、`MacosFrameKey`、
+`accessibilitySelectedTextRanges`、Swift 的 `setSelectedRanges`。
+
+**primary 降级，且不是欠账**（平台 ABI 或问题本身就是单数）：
+`AXSelectedTextRange`（复数是另一个属性，不是降级）、
+`macos_shaped_caret_scroll_request`（滚到刚动过的那一根）、`SearchState::current`
+的入参、行内语法露出（`visual_text_with_reveal` 收的就是一个 `Option<TextRange>`，
+N 个块同时露出是装饰层的接口变更，与多光标无关）、表格单元格导航。
+
+**primary 降级，是欠账，写在代码上**：
+
+- **IME**：`CompositionOverlay` 是一个 preedit 覆盖一个区间，`NSTextInputClient`
+  也只给一个 marked range。`begin_composition` 塌回 primary。**塌是必须的**——留着
+  N 条而只有一条在组字，屏幕上会有几根不动的假光标，提交之后还会被映射到莫名其妙
+  的位置。还债条件写在 `begin_composition` 上：要让 commit 把已确定的文字在其余
+  每一处也插一遍，H1/H2/H6 三条不变量都要重过一遍。
+- **纵向移动的粘滞列**：N>1 时每个光标用自己**当前**的 x，不吃粘滞列。代价是连按
+  ↓ 穿过一行短行会左漂；N=1 时行为完全不变。还债条件：做「⌥⌘↑ 在上方加光标」时
+  本来就要按光标存列，那时建 `Cursor { selection, preferred_x }`。
+- **列表类编辑**（Enter 的续行与空项退出、空列表项退格、缩进/反缩进）：N>1 时
+  Enter 只插普通换行，缩进只作用在 primary 那一行。理由不是省事——**这四条改的
+  都是「整行」，而两个光标可以停在同一行上**，「空项退出列表」删的是
+  `line.content_range()`，两个光标同一行就产出一对完全重叠的 edit，整条
+  Transaction 被拒，表现是「按一下 Enter 什么都没发生」。理由与还债条件写在
+  `insert_plain_newlines` 上。
+
+##### 四、入口：两个，各自压住对方压不住的东西
+
+- **`⌘⇧L` 选中全部匹配**：`SearchState::matches()` 给的就是有序、互不重叠的一组，
+  恰好是 `Selections` 要的形状。**但它压不住合并**——这条路产出的选区必然合法。
+- **⌥ 点加一根光标**：走 `setSelectedRanges` 那条已有的路。**它才压得住合并**，
+  也是人工验收里唯一能手动构造多光标的形状。
+
+导航泛化成 `navigate(toSources:primary:)`，单数那个退化成一行转发。
+
+##### 落点是算出来的，不是映射出来的——这一刀查出来的真缺口
+
+第一版让编辑之后的落点走 `map_through`。在 `aaaa` 里选中两处 `aa` 再打一个字，
+两根光标并成了一根：`map_anchor` 在两条 edit 首尾相接时，把前一条的**终点**
+（选区终点按 `Affinity::After` 映射）一路推到后一条替换之后，于是两条选区映射
+之后重叠，`Selections` 合并掉。**源码是对的，屏幕上却只剩一根光标，不报错。**
+而「选中全部匹配再替换」正是这一刀最主要的用法。
+
+修法不是改 `map_anchor` 的端点语义（那会动到所有 anchor 的映射），而是
+`apply_selection_edits` 里**根本不必去猜**：这些 edit 是这条命令自己造的，第 i 条
+之前的累计位移直接加得出来。`map_through` 仍然跑，它服务的是外来的 Transaction
+（undo/redo、缩进、任务勾选）。
+
+##### 帧身份：整组比较，不要摘要
+
+`MacosFrameKey.selection` → `selections: Vec<EditorSelection>`，类型从 `Copy` 退成
+`Clone`。把 N 条哈希成一个 u64 能保住 `Copy`，代价是碰撞——而碰撞的表现正是这个
+类型的文档明令要防的那件事：**静默跳过一帧**。一次 `Vec` 分配换掉一个不报错的
+漏画，这笔账不用算。
+
+守护断言分两条：**位置变**（原有的光标移动）与**根数变**（新增）。只比 primary
+的话，从一根变三根会被判为等价——按下「选中全部匹配」，画面一动不动。
+
+##### 第三刀留下的四处
+
+- **`SearchState::current` 签名不改**，场景层改传 primary 的区间。模块文档那条
+  「不存下标」的理由**不推翻，反而更强**：全部选中之后每一条选区都恰好等于一处
+  命中，按「有没有某条选区等于它」判会让**每一处**都变成当前命中——正是那份文档
+  担心的「全选点亮每一个」换了个形状回来。primary 不是第二个可以对不上的下标，
+  它是 `Selections` 自己的一部分。
+- **场景层两处**：选区与 caret 都改成遍历，caret 收集成 `Vec` 在末尾统一发——
+  次序（其余命中 → 选区 → 当前命中 → caret）仍是这一层的唯一权威。
+- **`SearchResults.next(after:)`** 游标改成 primary，与上面同源。
+- **`DocumentWindow` 四处** `bridge.selection.range` 全部按 primary，并补了一条
+  「面板导航之后选区只有一条」的断言。
+
+##### 顺带记下：`NSTextView` 对不连续选区没有「主」的概念
+
+第一版让 `navigate(toSources:primary:)` 把 primary 摆进 AppKit 镜像、再由
+`setSelectedRanges` 从 `selectedRange()` 认回来。**认不回来**：AppKit 转手一次
+之后 primary 一律退回第 0 条，⌥ 加的那根不会成为主光标，滚动与「当前命中」跟着
+错。选区的权威在 Rust（不变量 I6），primary 直接送过去，镜像跟着走。
+
+##### 判据落在哪
+
+- `Selections` 的单元用例：性质（有序、不重叠、非空、primary 跟着合并走）+ 手造
+  畸形输入（逆序、重叠、同偏移两个空选区、越界）。
+- `yu-editor/tests/multi_cursor.rs`：**「N 条 edit 真的都生效了」的判据是 canonical
+  source**，不是选区；「另外几个光标也动了」的判据是全部选区，不是主选区。
+- `yu-workspace`：**判据来自场景里的图元条数**，不是 `document.selections()`。
+- `yu-storage-ffi`：两遍协议、边界上的归一化、方向保留、帧身份两条。
+- `--multi-cursor-self-check`（headless，`Fixtures/multi-cursor.md`）。
+- `--launch-window-self-check` 第 10 步：⌥ 点的**坐标→源码**那一步（headless 没有
+  已发布的 viewport 几何）、N 根 caret 真的进了屏幕上那一帧。
+
+##### 反向验证
+
+Rust 侧 25 个变异、Swift 侧 7 个，全部变红。**五个活下来过，逐个分类**：
+
+- **「不滤掉空 edit」活了一次，它是缺口。** 一条零效果的 edit（`[0,0)` 换成 `""`）
+  **照样推进 Revision**——`TextBuffer::apply` 不认「这条什么都没改」。不滤的后果是
+  在文首按一次退格，文档变脏、压进一条什么都不做的 undo，而源码一个字节没变。
+  这个契约在多光标之前就有（`delete_range` 开头那句 `if range.is_empty()`），
+  **一直没有断言**。补了一条直接断 Revision 的。
+- **「当前命中按任意一条选区判」活了两次。** 第一次是判据没落在被改的那条路上
+  （用例只有一条选区，「任意」与「primary」是同一条）。补上多选区之后**又活了
+  一次**——因为 `current` 是一个 `Option<usize>`，改法只是让它指错一处，条数仍然
+  是 1。第三版把判据换成**那一处的 source 区间**才压住。「只数条数」与「数对了
+  哪一个」是两回事。
+- **「`set_selections` 接受空集合」活下来，它是死代码。** 那道门与
+  `Selections::new` 挡的是同一件事，而里面那道先挡住了。按规矩删掉——保留就是
+  给同一条规则留第二个答案，而且它永远不会被单独证伪。
+- **Swift 的「`setSelectedRanges` 只送第一条」活下来，是缺口。**
+  `navigate(toSources:primary:)` 改成直接送 Rust 之后，那个 override 的复数分支
+  就没人走了；它真正的消费者是 **AppKit 与 AX**（给 `AXSelectedTextRanges` 赋值）。
+  补了一条直接调它的 self-check 步骤。
+- **Swift 的「⌥ 点不经投影」活下来，是缺口。** 断言只要求「多了一根、位置不同」，
+  而把坐标→源码换成常数 0 也满足——⌥ 点到哪里光标都跑到文首。改成断**落点离
+  点击处不超过 1 个 UTF-16 单位**；精确的边界归属归
+  `--shaped-projection-hit-test-self-check`，不在这一步重证。
+
+##### 截图抓出来的一件事：被选区盖住的命中变成脏灰绿
+
+自动化断言全绿、真实窗口 self-check 也全绿之后，人工验收的截图抓出一个缺陷——
+**与第三刀抓到的是同一族颜色**：
+
+「选中全部匹配」之后，每一处命中同时也是一段选区。第三刀把「其余命中」排在选区
+**之下**，理由是「选区是半透明的蓝，压上去两者都还看得见」——**那句话的前提是
+选区与那些命中不是同一段**。多光标之后前提没了：黄底垫在半透明蓝之下合成出一块
+脏灰绿，与第三刀在当前命中上实测到的 `(158,160,150)` 同一族。屏幕上两处选中的
+文字一处褐橙、一处灰绿，没有一处看着像「选中」。
+
+修法不是再排一次次序，而是**被选区完全盖住的普通命中干脆不画**：选区已经说明了
+「这一段是命中，而且被选中了」。当前命中不受影响——它排在选区之上，而且按定义
+就等于选区那一段，所以「哪一根是主光标」仍然看得出来。
+
+判据落在场景图元的条数上（`SearchMatch` 必须为 0），而查这一条要**两条选区都
+恰好落在命中上**，单选区的用例造不出这个形状。
+
+顺带确认了人工验收新加的 C12：三根光标分别落在标题块、段落块与列表项里时，
+三块底色与三根 caret 的高度**各自跟着自己那一行的行盒**，不是同一个基准行高。
+
+##### 代价
+
+Swift 产品代码 **6,061 → 6,356 行**（3.03 → **3.18 倍**），分布是
+`DocumentTextView.swift` +117、`DocumentWindow.swift` +109、
+`StorageBridge.swift` +65、`main.swift` +4。`SelfChecks.swift` 1,368 → 1,511
+（不计）。Rust 侧新增 `yu-state/src/selections.rs`（一个类型加它的性质用例）与
+`yu-editor/tests/multi_cursor.rs`。
+
+比前两刀便宜得多，原因写在上面：**事务层与 history 一行都没改**，Swift 侧也没有
+新面板——多光标是既有那几条路各自从「一个」变成「一组」，不是一块新 UI。
+
 ---
 
 ---

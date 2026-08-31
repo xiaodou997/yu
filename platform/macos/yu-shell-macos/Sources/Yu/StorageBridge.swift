@@ -1093,6 +1093,41 @@ final class StorageBridge {
         NativeSelection(selectionEndpoints)
     }
 
+    /// 全部选区，按文档顺序，外加主选区的下标。
+    ///
+    /// `selection` 给的是 primary，两条路各自回答自己的问题：AX 的单数属性、
+    /// 滚动、「当前命中」按定义只说得出一个位置，走 `selection`；要画几根光标、
+    /// 要知道是不是多光标，走这里。
+    var selectionsIfAvailable: (ranges: [NativeSelection], primary: Int)? {
+        let revision = state.revision
+        var count = 0
+        var primary = 0
+        let countStatus = yu_storage_session_selections(
+            handle,
+            revision,
+            nil,
+            0,
+            &count,
+            &primary
+        )
+        guard countStatus == StorageStatus.ok, count > 0 else { return nil }
+
+        var values = Array(repeating: YuStorageSelectionEndpoints(), count: count)
+        var written = 0
+        let status = values.withUnsafeMutableBufferPointer { buffer in
+            yu_storage_session_selections(
+                handle,
+                revision,
+                buffer.baseAddress,
+                buffer.count,
+                &written,
+                &primary
+            )
+        }
+        guard status == StorageStatus.ok, written == count, primary < count else { return nil }
+        return (values.map { NativeSelection(NativeSelectionEndpoints($0)) }, primary)
+    }
+
     var selectionEndpoints: NativeSelectionEndpoints {
         var value = YuStorageSelectionEndpoints()
         let status = yu_storage_session_selection_endpoints(handle, &value)
@@ -1345,6 +1380,36 @@ final class StorageBridge {
             focusUTF16,
             affinity
         )
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    /// 换一组选区。
+    ///
+    /// **不在这里排序、不在这里合并。** 归一化归 Rust 的 `Selections` 一家做
+    /// ——平台这边送逆序的、重叠的、同一个偏移两次的都行（⌥ 点在一段选区里就是
+    /// 最后那种）。自己先排一遍就是仓库里的第二份合并实现，而两份合并必定分叉。
+    func setSelections(_ ranges: [NSRange], primary: Int, affinity: UInt8 = 1) throws {
+        guard !ranges.isEmpty, primary >= 0, primary < ranges.count else {
+            throw BridgeError.operation(StorageStatus.invalidSelection)
+        }
+        let current = state.revision
+        let entries = ranges.map { range in
+            YuStorageSelectionEndpoints(
+                revision: current,
+                anchor_utf16: UInt64(range.location),
+                focus_utf16: UInt64(range.location + range.length),
+                affinity: affinity
+            )
+        }
+        let status = entries.withUnsafeBufferPointer { buffer in
+            yu_storage_session_set_selections(
+                handle,
+                current,
+                buffer.baseAddress,
+                buffer.count,
+                primary
+            )
+        }
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
     }
 

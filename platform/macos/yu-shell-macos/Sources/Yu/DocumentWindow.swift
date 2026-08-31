@@ -413,6 +413,22 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         textView.navigateToSearchMatch(next)
     }
 
+    /// 把当前查询的**每一处**匹配都选中，一处一根光标。
+    ///
+    /// 这是多光标的主入口：匹配已经是有序、互不重叠的一组
+    /// （`SearchState::matches`），恰好就是 `Selections` 要的形状。primary 取
+    /// **当前那一处**——光标本来在哪，替换之后就还在哪，滚动也不会跳。
+    @objc fileprivate func selectAllMatchesFromMenu(_ sender: Any?) {
+        guard let matches = bridge.searchMatchesIfAvailable, !matches.isEmpty else { return }
+        let ranges = matches.map { $0.range }
+        let cursor = bridge.selection.range
+        let primary = ranges.firstIndex(where: { $0 == cursor })
+            ?? ranges.firstIndex(where: { $0.location >= cursor.location })
+            ?? 0
+        textView.navigate(toSources: ranges, primary: primary)
+        view.window?.makeFirstResponder(textView)
+    }
+
     @objc fileprivate func toggleSearchFromMenu(_ sender: Any?) {
         let hidden = !searchPanel.view.isHidden
         searchPanel.view.isHidden = hidden
@@ -735,11 +751,118 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         toggleOutlineFromMenu(nil)
         try require(outlineIsVisible, "面板没有再展开")
 
+        // 10. **多光标真的进了屏幕上那一帧。**
+        //
+        //     headless 压不住这一条，理由与第 7 步同：那里没有 surface，场景
+        //     根本不提交。判据是场景里的 **caret 矩形条数**，不是
+        //     `selectionsIfAvailable`——后者是被测那条路的上游。
+        //
+        //     只画 primary 的表现是「按下选中全部匹配，屏幕上还是一根光标」：
+        //     选区在 Rust 里是对的，编辑也是对的，就是看不见——不报错。
+        outlinePanel.clickRowForSelfCheck(0)
+        surfaceCoordinator.revealCaretIfNeeded()
+        let oneCaret = try require(surfaceCoordinator.submitNow(force: true), "单光标帧提交失败")
+        try require(
+            oneCaret.caretDecorationCount == 1,
+            "单光标时画了 \(oneCaret.caretDecorationCount) 根 caret"
+        )
+
+        //     ⌥ 点：headless 只能调 `addCaret(atSource:)`，**坐标→源码那一步
+        //     只有这里能被证伪**（它要已发布的 viewport 几何）。落点取第一条
+        //     标题正文里第三个字符的 caret 矩形——「偏移换不出坐标」与「坐标
+        //     换不回偏移」都会让这一条红。
+        let caretStart = bridge.selection.range.location
+        let optionTarget = caretStart + 2
+        let caretRect = try require(
+            textView.shapedCaretRectForSelfCheck(sourceUTF16: optionTarget),
+            "拿不到偏移 \(optionTarget) 的 caret 矩形"
+        )
+        let nextRect = try require(
+            textView.shapedCaretRectForSelfCheck(sourceUTF16: optionTarget + 1),
+            "拿不到偏移 \(optionTarget + 1) 的 caret 矩形"
+        )
+        //     落点取那个字符格子的**靠左四分之一处**，不是格子的左边界：命中
+        //     测试落在两个 caret 位置的正中间时归哪一边是没有定义的，正好点在
+        //     边界上会时对时错。
+        let optionPoint = NSPoint(
+            x: caretRect.origin.x + (nextRect.origin.x - caretRect.origin.x) * 0.25,
+            y: caretRect.origin.y + caretRect.height * 0.5
+        )
+        try require(
+            textView.addCaretAtVisualPointForSelfCheck(optionPoint),
+            "⌥ 点没有加上光标——坐标换不成源码偏移"
+        )
+        let added = try require(bridge.selectionsIfAvailable, "拿不到选区")
+        try require(
+            added.ranges.count == 2,
+            "⌥ 点之后应当有两根光标，实际 \(added.ranges.count) 根：\(added.ranges.map { $0.range })"
+        )
+        //     **判据是它落在点的那个位置附近，不只是「多了一根」。**
+        //
+        //     只断「两根位置不同」的话，把坐标→源码那一步换成常数 0 也能过
+        //     ——⌥ 点到哪里光标都跑到文首，而且不报错。
+        //
+        //     容差是 1 个 UTF-16 单位，而不是精确相等：点正好落在两个 caret
+        //     位置之间时归哪一边没有定义，**精确的边界归属是
+        //     `--shaped-projection-hit-test-self-check` 的职责**，这一步只证明
+        //     这条路真的走通了。
+        let addedLocations = added.ranges.map { $0.range.location }.sorted()
+        try require(
+            addedLocations.first == caretStart,
+            "原来那根光标不该动：\(addedLocations)"
+        )
+        let landed = try require(addedLocations.last, "没有第二根光标")
+        try require(
+            abs(landed - optionTarget) <= 1,
+            "⌥ 点落在 \(landed)，离点的位置 \(optionTarget) 太远——坐标没有真的换成源码偏移"
+        )
+        try require(
+            !surfaceCoordinator.hasCurrentFrame(),
+            "加一根光标之后仍被判为当前帧——画面会一动不动，而且不报错"
+        )
+        let twoCarets = try require(surfaceCoordinator.submitNow(), "双光标帧提交失败")
+        try require(
+            twoCarets.caretDecorationCount == 2,
+            "两根光标只画出了 \(twoCarets.caretDecorationCount) 根 caret"
+        )
+
+        //     选中全部匹配：N 段选区底色都要进帧。
+        //     第 7 步那个 needle 取自第一条标题，未必重复。这里要的是一个
+        //     **至少两处、而且都落在文首这一屏里**的查询：场景只画可见范围，
+        //     拿散在全文的匹配去数矩形会得到一条假红（第 7 步踩过同一个坑）。
+        let multiNeedle = "层级一"
+        try require(bridge.setSearchQuery(multiNeedle), "设查询失败")
+        let allMatches = try require(bridge.searchMatchesIfAvailable, "拿不到匹配")
+        try require(
+            allMatches.count >= 2,
+            "fixture 里「\(multiNeedle)」不足两处，这一条压不住任何东西"
+        )
+        selectAllMatchesFromMenu(nil)
+
+        //     两个判据分开：**Rust 侧真的选中了 N 条**（选区那条路），
+        //     与**画面上真的出现了 N 块底色**（场景那条路）。前者证明命令干活
+        //     了，后者证明干的活看得见——只画 primary 的话前者绿、后者红。
+        let everything = try require(bridge.selectionsIfAvailable, "拿不到选区")
+        try require(
+            everything.ranges.count == allMatches.count,
+            "选中全部匹配之后只有 \(everything.ranges.count) 条选区，匹配有 \(allMatches.count) 处"
+        )
+        let selectedAll = try require(surfaceCoordinator.submitNow(), "全部选中之后的重提交失败")
+        try require(
+            selectedAll.selectionDecorationCount >= allMatches.count,
+            "\(allMatches.count) 处匹配只画出了 \(selectedAll.selectionDecorationCount) 块选区底色"
+        )
+        try require(bridge.setSearchQuery(nil), "收掉搜索失败")
+        textView.navigate(toSource: NSRange(location: 0, length: 0))
+        _ = surfaceCoordinator.submitNow()
+
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
                 + "caret=\(republished?.caretDecorationCount ?? 0) "
                 + "selection=\(republished?.selectionDecorationCount ?? 0) "
                 + "search=\(searched.searchDecorationCount)→\(cleared.searchDecorationCount) "
+                + "carets=\(oneCaret.caretDecorationCount)→\(twoCarets.caretDecorationCount) "
+                + "multiSelection=\(selectedAll.selectionDecorationCount) "
                 + "extent=\(Int(documentView.frame.height)) "
                 + "outlineRows=\(outlinePanel.rowCountForSelfCheck) "
                 + "outlineScroll=\(Int(scrollBefore))→\(Int(scrollAfter))"
@@ -779,8 +902,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             return true
         }
         if menuItem.action == #selector(findNextFromMenu(_:)) ||
-            menuItem.action == #selector(findPreviousFromMenu(_:)) {
-            // 没有查询就没有「下一个」。灰掉比按下去什么也不发生要诚实。
+            menuItem.action == #selector(findPreviousFromMenu(_:)) ||
+            menuItem.action == #selector(selectAllMatchesFromMenu(_:)) {
+            // 没有查询就没有「下一个」，也没有「全部匹配」。灰掉比按下去什么
+            // 也不发生要诚实。
             return !(bridge.searchMatchesIfAvailable ?? []).isEmpty
         }
         return true
@@ -1082,6 +1207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 "查找上一个",
                 #selector(DocumentViewController.findPreviousFromMenu(_:)),
                 "g",
+                [.command, .shift]
+            ),
+            (
+                "选中全部匹配",
+                #selector(DocumentViewController.selectAllMatchesFromMenu(_:)),
+                "l",
                 [.command, .shift]
             ),
         ]

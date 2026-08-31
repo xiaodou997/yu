@@ -1366,3 +1366,174 @@ func runAccessibilitySelfCheck(path: String) -> Never {
         exit(EXIT_FAILURE)
     }
 }
+
+/// 多光标：一组选区在 Rust↔Swift 边界上的行为。
+///
+/// # 判据落在哪
+///
+/// - **「N 根光标真的都在编辑」的判据是 canonical source**，不是选区数组。
+///   两条路分开：选区是命令的输入，源码是 `TextBuffer` 的输出。数选区的条数
+///   只能证明「设进去了」，证不了「用上了」。
+/// - **「⌥ 点加了一根」的判据是 Rust 归一化之后的那一组**，不是 Swift 这边
+///   拼出来的数组——后者是被测的那条路。
+/// - **AX 复数属性单独断**：它以前是从单数推出来的一条假复数，改错了不报错，
+///   只是读屏少认几根光标。
+///
+/// headless 压不住的只有一条：**⌥ 点的坐标→源码那一步**，它要已发布的
+/// viewport 几何。那一条挂在 `--launch-window-self-check` 上。
+func runMultiCursorSelfCheck(path: String) -> Never {
+    let fileManager = FileManager.default
+    let temporaryURL = fileManager.temporaryDirectory
+        .appendingPathComponent("yu-multi-cursor-\(UUID().uuidString).md")
+    do {
+        try fileManager.copyItem(at: URL(fileURLWithPath: path), to: temporaryURL)
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+
+        let bridge = try StorageBridge(path: temporaryURL.path)
+        let textView = DocumentTextView(bridge: bridge)
+        textView.refreshFromRust()
+
+        let selections: () throws -> (ranges: [NSRange], primary: Int) = {
+            let value = try unwrapSelfCheck(bridge.selectionsIfAvailable)
+            return (value.ranges.map { $0.range }, value.primary)
+        }
+
+        // 1. 开门就是一条选区。「一个光标都没有」在这个模型里不存在。
+        let initial = try selections()
+        precondition(initial.ranges.count == 1, "初始应当只有一条选区")
+        precondition(initial.primary == 0, "初始 primary 必须是 0")
+
+        // 2. **⌥ 点加一根光标。** 判据是 Rust 归一化之后那一组，不是这边送进去
+        //    的数组。走的是产品里同一个入口 `addCaret(atSource:)`。
+        let mirror = bridge.source as NSString
+        let firstTarget = mirror.range(of: "alpha").location
+        let secondTarget = mirror.range(of: "gamma").location
+        textView.navigate(toSource: NSRange(location: firstTarget, length: 0))
+        precondition(textView.addCaret(atSource: secondTarget), "加光标失败")
+        let two = try selections()
+        precondition(
+            two.ranges == [
+                NSRange(location: firstTarget, length: 0),
+                NSRange(location: secondTarget, length: 0),
+            ],
+            "两根光标的位置不对: \(two.ranges)"
+        )
+        precondition(two.primary == 1, "primary 必须是刚加的那一根")
+
+        // 3. **重叠的输入要被归一化掉，而且归一化在 Rust 侧。**
+        //    在同一个偏移上再点一次 ⌥：光标数不变，不是变成三根。这条压住的是
+        //    「Swift 侧自己先排一遍」那种第二份合并实现。
+        precondition(textView.addCaret(atSource: secondTarget), "重复加光标不应失败")
+        let afterDuplicate = try selections()
+        precondition(
+            afterDuplicate.ranges.count == 2,
+            "同一个偏移点两次不该变成三根光标"
+        )
+
+        // 3b. **AppKit 递过来的一组区间要整组送给 Rust。**
+        //
+        //     `setSelectedRanges` 是 **AppKit 发起**那条路（鼠标、以及 AX 给
+        //     `AXSelectedTextRanges` 赋值）。Yu 自己发起的多光标走
+        //     `navigate(toSources:primary:)`，**不经过这个 override**——所以
+        //     上面那几条压不住它。只送第一条的表现是：读屏或辅助工具设了三段
+        //     选区，Rust 只收到一段，另外两段悄悄消失。
+        let appKitRanges = [
+            NSValue(range: NSRange(location: firstTarget, length: 0)),
+            NSValue(range: NSRange(location: secondTarget, length: 0)),
+        ]
+        textView.setSelectedRanges(appKitRanges, affinity: .downstream, stillSelecting: false)
+        let fromAppKit = try selections()
+        precondition(
+            fromAppKit.ranges.count == 2,
+            "AppKit 递过来两段，Rust 只收到 \(fromAppKit.ranges.count) 段"
+        )
+        //     这条路上的 primary 只能问 AppKit 自己认哪一条（`NSTextView` 对
+        //     不连续选区没有「主」的概念），所以下一条断言之前先用显式入口把
+        //     primary 摆回来。
+        textView.navigate(
+            toSources: [
+                NSRange(location: firstTarget, length: 0),
+                NSRange(location: secondTarget, length: 0),
+            ],
+            primary: 1
+        )
+
+        // 4. **AX 的复数属性报的是真复数。**
+        //    它以前是 `[单数]`——屏幕上有两根光标，读屏只知道一根，不报错。
+        let axRanges = (textView.accessibilitySelectedTextRanges() ?? []).map { $0.rangeValue }
+        precondition(axRanges.count == 2, "AXSelectedTextRanges 报了 \(axRanges.count) 条")
+        // 单数属性给的是 primary——那不是降级，那是另一个属性。
+        precondition(
+            textView.accessibilitySelectedTextRange()
+                == NSRange(location: secondTarget, length: 0),
+            "AXSelectedTextRange 必须是 primary"
+        )
+
+        // 5. **两根光标真的都在编辑。判据是源码。**
+        //    只断选区条数的话，「除了 primary 谁都没插进去」会静默通过。
+        let before = bridge.source
+        _ = try bridge.insertText("X")
+        let after = bridge.source
+        // 期望值按**偏移**精确构造，不用 `replacingOccurrences`——后者会把
+        // fixture 里别处的同名词一起换掉，于是这条断言压不住「插错了地方」。
+        // 从后往前插，前一次插入才不会推移后一个偏移。
+        let expected = NSMutableString(string: before)
+        expected.insert("X", at: secondTarget)
+        expected.insert("X", at: firstTarget)
+        precondition(
+            after == expected as String,
+            "两处都要插上 X，实际: \(after)"
+        )
+        // 落点：各自停在自己插进去的那个字后面。
+        let landed = try selections()
+        precondition(landed.ranges.count == 2, "编辑之后仍然是两根光标")
+        precondition(
+            landed.ranges.allSatisfy { $0.length == 0 },
+            "插入之后每一条都该是光标"
+        )
+
+        // 6. **一次 undo 收回两处。** 一条命令一个 Transaction，所以 history 里
+        //    只有一条。改成「一个光标一个 Transaction」的话这里会红：撤销只
+        //    收回一处，源码剩一半——不报错，只是撤销撤不干净。
+        _ = try bridge.executeCommand(8)  // Undo。`Command` 是 DocumentTextView 的私有枚举。
+        precondition(bridge.source == before, "一次 undo 必须把两处一起收回")
+
+        // 7. **选中全部匹配。** 匹配已经是有序、互不重叠的一组，恰好是
+        //    `Selections` 要的形状。相邻的两处不能被并掉。
+        precondition(bridge.setSearchQuery("aa"), "设查询失败")
+        let matches = try unwrapSelfCheck(bridge.searchMatchesIfAvailable)
+        precondition(matches.count >= 2, "fixture 里 `aa` 至少要有两处，压不住就白写")
+        textView.navigate(toSources: matches.map { $0.range }, primary: 0)
+        let selected = try selections()
+        precondition(
+            selected.ranges == matches.map { $0.range },
+            "全部匹配没有一一对上: \(selected.ranges) vs \(matches.map { $0.range })"
+        )
+
+        // 8. **塌回一条。** 单数入口仍然是「平台送来一个选区」那条路。
+        textView.navigate(toSource: NSRange(location: 0, length: 0))
+        let collapsed = try selections()
+        precondition(collapsed.ranges.count == 1, "单数导航必须塌回一条")
+
+        // 9. **组字期间只剩一条。** `CompositionOverlay` 是一个 preedit 覆盖一个
+        //    区间；留着 N 条会在屏幕上留下几根不动的假光标。这是一笔登记在案的
+        //    降级，理由与还债条件写在 `EditorDocument::begin_composition` 上。
+        textView.navigate(toSources: matches.map { $0.range }, primary: 0)
+        let beforeComposition = try selections()
+        precondition(beforeComposition.ranges.count >= 2, "组字前应当是多光标")
+        try bridge.beginComposition(
+            replacementRange: NSRange(location: 0, length: 0),
+            preedit: "n",
+            selection: NSRange(location: 1, length: 0)
+        )
+        let composing = try selections()
+        precondition(composing.ranges.count == 1, "组字期间必须只剩一条选区")
+        try bridge.cancelComposition()
+
+        print("Yu multi-cursor self-check: carets=2 matches=\(matches.count)")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu multi-cursor self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}

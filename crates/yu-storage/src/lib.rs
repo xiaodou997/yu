@@ -19,8 +19,8 @@ use yu_core::{Revision, TextRange, Utf16Range};
 use yu_editor::{
     BlockDecorations, BlockView, CaretScrollRequest, CommandResult, CompositionError,
     CompositionOverlay, EditorCommand, EditorDocument, EditorDocumentError, EditorSelection,
-    KeyEvent, KeyRouteResult, LayoutConfig, ShapingProvider, ViewportConfig, ViewportSnapshot,
-    ViewportSpan, VisualText,
+    KeyEvent, KeyRouteResult, LayoutConfig, Selections, ShapingProvider, ViewportConfig,
+    ViewportSnapshot, ViewportSpan, VisualText,
 };
 use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 
@@ -200,10 +200,16 @@ impl DocumentSession {
         &mut self.editor
     }
 
-    /// Returns the canonical source selection owned by the editor.
+    /// 主选区。多光标之后这是 primary，全部选区用 [`Self::selections`]。
     #[must_use]
     pub fn selection(&self) -> EditorSelection {
         self.editor.selection()
+    }
+
+    /// 全部选区，按文档顺序，互不重叠，至少一条。
+    #[must_use]
+    pub fn selections(&self) -> &Selections {
+        self.editor.selections()
     }
 
     /// 整篇文档的视觉字节流：装饰应用之后长什么样，以及它到源码的映射。
@@ -345,6 +351,17 @@ impl DocumentSession {
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), StorageError> {
         self.editor
             .set_selection(selection)
+            .map_err(|error| StorageError::Editor(EditorDocumentError::Selection(error)))
+    }
+
+    /// 换一组选区。归一化归 `Selections` 一家做。
+    pub fn set_selections(
+        &mut self,
+        ranges: impl IntoIterator<Item = EditorSelection>,
+        primary: usize,
+    ) -> Result<(), StorageError> {
+        self.editor
+            .set_selections(ranges, primary)
             .map_err(|error| StorageError::Editor(EditorDocumentError::Selection(error)))
     }
 
@@ -712,6 +729,11 @@ impl DocumentEditorSession {
         self.document.selection()
     }
 
+    #[must_use]
+    pub fn selections(&self) -> &Selections {
+        self.document.selections()
+    }
+
     /// 整篇文档的视觉字节流，来自同一个持有源码/Revision/选区/历史的会话。
     ///
     /// # Errors
@@ -821,6 +843,14 @@ impl DocumentEditorSession {
 
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), StorageError> {
         self.document.set_selection(selection)
+    }
+
+    pub fn set_selections(
+        &mut self,
+        ranges: impl IntoIterator<Item = EditorSelection>,
+        primary: usize,
+    ) -> Result<(), StorageError> {
+        self.document.set_selections(ranges, primary)
     }
 
     /// Measures the current visible block window without creating a second

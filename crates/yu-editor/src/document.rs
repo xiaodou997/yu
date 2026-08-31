@@ -9,7 +9,7 @@ use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError};
 use crate::blockview::BlockView;
 use crate::table::TableResizeCommit;
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
-use yu_state::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats};
+use yu_state::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats, Selections};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
 };
@@ -42,7 +42,7 @@ pub struct EditorDocument {
     buffer: TextBuffer,
     markdown: MarkdownDocument,
     composition: Option<CompositionOverlay>,
-    selection: EditorSelection,
+    selections: Selections,
     preferred_x: Option<PreferredCaretX>,
     last_source_change: Option<SourceChange>,
     history: EditorHistory,
@@ -78,7 +78,7 @@ impl EditorDocument {
             buffer,
             markdown,
             composition: None,
-            selection,
+            selections: Selections::single(selection),
             preferred_x: None,
             last_source_change: None,
             history: EditorHistory::default(),
@@ -115,10 +115,28 @@ impl EditorDocument {
         self.composition.as_ref()
     }
 
-    /// Returns the current source selection and caret endpoints.
+    /// 主选区的端点。
+    ///
+    /// **多光标之后这个方法的语义是「primary」。** 保留它是刻意的：凡是仍然
+    /// 调用它的地方，就是显式选了 primary 降级那条路，`grep` 一遍就数得出来。
+    /// 要全部选区用 [`Self::selections`]。
     #[must_use]
-    pub const fn selection(&self) -> EditorSelection {
-        self.selection
+    pub fn selection(&self) -> EditorSelection {
+        self.selections.primary()
+    }
+
+    /// 全部选区，按文档顺序，互不重叠，至少一条。
+    #[must_use]
+    pub fn selections(&self) -> &Selections {
+        &self.selections
+    }
+
+    /// 塌回一条选区。
+    ///
+    /// 命令层的绝大多数路径走这里：左右移动、列表编辑、composition 提交之后
+    /// 的落点，它们的答案本来就只有一个位置。
+    fn set_single_selection(&mut self, selection: EditorSelection) {
+        self.selections = Selections::single(selection);
     }
 
     /// Returns the bounded undo/redo depth for the current editor session.
@@ -239,7 +257,7 @@ impl EditorDocument {
         index: usize,
     ) -> Result<BlockDecorations, EditorDocumentError> {
         let block = self.block_at(index)?;
-        let active = self.selection.ordered_range();
+        let active = self.selection().ordered_range();
         Ok(self
             .decorations
             .decorate(&self.markdown, block, Some(active))?)
@@ -279,9 +297,9 @@ impl EditorDocument {
         if self.composition.is_some() {
             return None;
         }
-        let index = self.block_index_for_source(self.selection.focus())?;
+        let index = self.block_index_for_source(self.selection().focus())?;
         let block = self.markdown.blocks().get(index)?;
-        let active = self.selection.ordered_range();
+        let active = self.selection().ordered_range();
         let canonical = hidden_bytes(
             self.decorations
                 .get_or_build_block(&self.markdown, block)
@@ -297,12 +315,12 @@ impl EditorDocument {
     }
 
     fn selection_reveal_range(&mut self) -> TextRange {
-        let selection = self.selection.ordered_range();
+        let selection = self.selection().ordered_range();
         let Some(index) = self.selection_reveal_block_index() else {
-            return TextRange::empty(self.selection.focus());
+            return TextRange::empty(self.selection().focus());
         };
         let Some(block) = self.markdown.blocks().get(index) else {
-            return TextRange::empty(self.selection.focus());
+            return TextRange::empty(self.selection().focus());
         };
         if selection.is_empty() {
             return selection;
@@ -311,7 +329,7 @@ impl EditorDocument {
             selection.start().max(block.range().start()),
             selection.end().min(block.range().end()),
         )
-        .unwrap_or_else(|| TextRange::empty(self.selection.focus()))
+        .unwrap_or_else(|| TextRange::empty(self.selection().focus()))
     }
 
     /// Returns the parser-owned block containing a canonical source offset.
@@ -1138,7 +1156,7 @@ impl EditorDocument {
         layout
             .sync(&self.markdown)
             .map_err(EditorDocumentError::Viewport)?;
-        let focus = self.selection.focus();
+        let focus = self.selection().focus();
         let Some(block_index) = self.block_index_for_offset(focus) else {
             return Ok(self.empty_caret_scroll_request(viewport, margin));
         };
@@ -1186,7 +1204,7 @@ impl EditorDocument {
         layout
             .sync(&self.markdown)
             .map_err(EditorDocumentError::Viewport)?;
-        let focus = self.selection.focus();
+        let focus = self.selection().focus();
         let Some(block_index) = self.block_index_for_offset(focus) else {
             return Ok(self.empty_caret_scroll_request(viewport, margin));
         };
@@ -1279,10 +1297,35 @@ impl EditorDocument {
         )
     }
 
-    /// Replaces the selection after checking that it belongs to this revision.
+    /// 换一条选区（其余的丢掉）。
+    ///
+    /// 这是「平台送来一个选区」的入口，塌成一条是对的：鼠标单击、AX 赋值、
+    /// 面板导航，每一个都只说得出一个位置。多光标走 [`Self::set_selections`]。
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), SelectionError> {
         selection.utf16_range(&self.snapshot())?;
-        self.selection = selection;
+        self.set_single_selection(selection);
+        self.preferred_x = None;
+        self.history.break_group();
+        Ok(())
+    }
+
+    /// 换一组选区。
+    ///
+    /// 归一化（排序、合并、定位 primary）由 [`Selections::new`] 一家做，这里
+    /// 不重复一遍——两份合并必定分叉，而分叉的表现是「有时候打字没反应」：
+    /// 重叠的选区产出的 Transaction 会被 `validate_edits` 拒掉。
+    ///
+    /// # Errors
+    ///
+    /// 输入为空、`primary` 越界、某一条不属于当前 revision，或端点不合法。
+    pub fn set_selections(
+        &mut self,
+        ranges: impl IntoIterator<Item = EditorSelection>,
+        primary: usize,
+    ) -> Result<(), SelectionError> {
+        let snapshot = self.snapshot();
+        let selections = Selections::new(&snapshot, ranges, primary)?;
+        self.selections = selections;
         self.preferred_x = None;
         self.history.break_group();
         Ok(())
@@ -1322,8 +1365,12 @@ impl EditorDocument {
             applied.result_snapshot(),
             applied.change_set(),
         )?;
-        self.selection = self
-            .selection
+        // **整组一起映射，然后重新归一化。** 两个不同的偏移可以映射到同一个
+        // 偏移（删掉它们之间的文字），不合并就会留下一对重叠的选区，而下一次
+        // 插入会被 `validate_edits` 拒掉——用户看到的是「打字突然没反应」。
+        // 收敛点只有 `Selections::map_through` 一个。
+        self.selections = self
+            .selections
             .map_through(applied.change_set(), applied.result_snapshot())?;
         // 改一条 reference definition 曾经要把所有缓存整表作废：v1 的投影
         // 先查表才知道 `[id]` 是不是一个链接。换成语法树之后 `[id]` 的
@@ -1356,6 +1403,23 @@ impl EditorDocument {
     }
 
     /// Starts or replaces the transient composition overlay.
+    /// 开一段 IME 组字。
+    ///
+    /// # 多光标塌成一条，这是一笔登记在案的欠账
+    ///
+    /// `CompositionOverlay` 是**一个** preedit 覆盖**一个** `replacement_range`
+    /// （见 `yu_state::CompositionOverlay`），而 `NSTextInputClient` 也只交出
+    /// 一个 marked range——单数是平台 ABI 与这个类型共同的形状，不是这里偷懒。
+    ///
+    /// 所以开始组字时先把选区塌回 primary。**塌是必须的，不是可选的**：留着
+    /// N 条选区而只有一条真的在组字，屏幕上会有几根不动的假光标，提交之后它们
+    /// 还会被 `map_through` 搬到莫名其妙的位置——不报错、不 panic。
+    ///
+    /// **还债条件**：要做「三个光标一起打中文」，就得让 commit 把已确定的文字
+    /// 在其余每一处也插一遍，而那个 Transaction 覆盖的是 overlay 从没验证过的
+    /// N−1 个区间。不变量 H1（overlay 不写 canonical source）、H2（只有 commit
+    /// 产生永久 Transaction）、H6（携带 expected Revision 与 generation）三条
+    /// 都要重新过一遍。**这一刀不做。**
     pub fn begin_composition(
         &mut self,
         replacement_range: TextRange,
@@ -1365,6 +1429,9 @@ impl EditorDocument {
         self.validate_source_range(replacement_range)?;
         self.history.break_group();
         self.preferred_x = None;
+        if self.selections.is_multiple() {
+            self.selections = self.selections.collapsed_to_primary();
+        }
         self.composition = Some(CompositionOverlay::new(
             self.revision(),
             replacement_range,
@@ -1419,11 +1486,11 @@ impl EditorDocument {
                     .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
             )
             .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
-        self.selection = EditorSelection::cursor(
+        self.set_single_selection(EditorSelection::cursor(
             applied.result_snapshot(),
             cursor_offset,
             crate::CaretAffinity::Downstream,
-        )?;
+        )?);
         self.composition = None;
         self.preferred_x = None;
         self.last_source_change = None;
@@ -1456,12 +1523,14 @@ impl EditorDocument {
         self.preferred_x = None;
         self.last_source_change = None;
         let snapshot = self.snapshot();
-        self.selection = EditorSelection::cursor(
-            &snapshot,
-            snapshot.len_bytes(),
-            crate::CaretAffinity::Downstream,
-        )
-        .expect("the end of a reset source is a valid caret");
+        self.set_single_selection(
+            EditorSelection::cursor(
+                &snapshot,
+                snapshot.len_bytes(),
+                crate::CaretAffinity::Downstream,
+            )
+            .expect("the end of a reset source is a valid caret"),
+        );
         Ok(())
     }
 
@@ -1522,17 +1591,22 @@ impl EditorDocument {
         let snapshot = self.snapshot();
         match command {
             EditorCommand::InsertText(text) => !text.is_empty(),
-            EditorCommand::DeleteBackward | EditorCommand::MoveLeft => {
-                !self.selection.is_empty() || self.selection.focus() > ByteOffset::ZERO
-            }
-            EditorCommand::MoveWordLeft => {
-                !self.selection.is_empty() || self.selection.focus() > ByteOffset::ZERO
-            }
-            EditorCommand::DeleteForward | EditorCommand::MoveRight => {
-                !self.selection.is_empty() || self.selection.focus() < snapshot.len_bytes()
-            }
-            EditorCommand::MoveWordRight => {
-                !self.selection.is_empty() || self.selection.focus() < snapshot.len_bytes()
+            // **判据是「有没有哪一条动得了」，不是 primary 动不动得了。**
+            // 按 primary 判会让「primary 停在文档开头、别的光标在中间」这一
+            // 局面下整条退格菜单项变灰——另外几个光标明明删得动。
+            EditorCommand::DeleteBackward
+            | EditorCommand::MoveLeft
+            | EditorCommand::MoveWordLeft => self
+                .selections
+                .as_slice()
+                .iter()
+                .any(|selection| !selection.is_empty() || selection.focus() > ByteOffset::ZERO),
+            EditorCommand::DeleteForward
+            | EditorCommand::MoveRight
+            | EditorCommand::MoveWordRight => {
+                self.selections.as_slice().iter().any(|selection| {
+                    !selection.is_empty() || selection.focus() < snapshot.len_bytes()
+                })
             }
             EditorCommand::MoveUp | EditorCommand::MoveUpExtend => {
                 self.vertical_command_available(VerticalDirection::Up)
@@ -1712,11 +1786,14 @@ impl EditorDocument {
     /// unchecked. Pressing Enter on an empty list item exits the list by
     /// removing that line's prefix while preserving its line ending.
     pub fn insert_newline(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        if self.selections.is_multiple() {
+            return self.insert_plain_newlines();
+        }
         let snapshot = self.snapshot();
-        let selection_range = self.selection.ordered_range();
+        let selection_range = self.selection().ordered_range();
         let line = source_line(&snapshot, selection_range.start())?;
-        if self.selection.is_empty() {
-            let caret = self.selection.focus();
+        if self.selection().is_empty() {
+            let caret = self.selection().focus();
             let relative = byte_distance(line.start, caret)?;
             if relative <= line.content.len()
                 && let Some(prefix) = self.list_prefix(&line)
@@ -1734,11 +1811,11 @@ impl EditorDocument {
                     );
                     let applied =
                         self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-                    self.selection = EditorSelection::cursor(
+                    self.set_single_selection(EditorSelection::cursor(
                         applied.result_snapshot(),
                         line.start,
                         crate::CaretAffinity::Downstream,
-                    )?;
+                    )?);
                     return Ok(self.command_result(true));
                 }
 
@@ -1758,11 +1835,11 @@ impl EditorDocument {
                 );
                 let applied =
                     self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-                self.selection = EditorSelection::cursor(
+                self.set_single_selection(EditorSelection::cursor(
                     applied.result_snapshot(),
                     offset,
                     crate::CaretAffinity::Downstream,
-                )?;
+                )?);
                 return Ok(self.command_result(true));
             }
         }
@@ -1780,18 +1857,56 @@ impl EditorDocument {
             [yu_text::Edit::new(selection_range, insertion.as_str())],
         );
         let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-        self.selection = EditorSelection::cursor(
+        self.set_single_selection(EditorSelection::cursor(
             applied.result_snapshot(),
             offset,
             crate::CaretAffinity::Downstream,
-        )?;
+        )?);
         Ok(self.command_result(true))
     }
 
+    /// N>1 时的 Enter：每一条选区各插一个换行，不续行、不退出列表。
+    ///
+    /// # 列表类编辑是 primary 降级，这是一笔登记在案的欠账
+    ///
+    /// 涉及四条：Enter 的列表续行与空项退出（[`Self::insert_newline`]）、空列表
+    /// 项的退格（`delete_empty_list_prefix`）、缩进与反缩进
+    /// （[`Self::indent_list`] / [`Self::outdent_list`]）。
+    ///
+    /// 理由不是省事：**这四条改的都是「整行」，而两个光标可以停在同一行上。**
+    /// 「空项退出列表」删的是 `line.content_range()`，两个光标在同一行就产出
+    /// 一对完全重叠的 edit，`yu_text::validate_edits` 会拒掉整条 Transaction
+    /// ——表现是「按一下 Enter 什么都没发生」。要做对就得先按行去重，那是另一
+    /// 层（「一条命令要影响哪些行」）该回答的事。
+    ///
+    /// 所以：N>1 时 Enter 只插普通换行（就是这个函数，每一条
+    /// 选区各插一个，不续行、不退出列表），缩进/反缩进只作用在 primary 那一行。
+    /// N=1 时行为与多光标之前完全一样。
+    ///
+    /// **还债条件**：有人真的在多光标下编辑列表并抱怨。那时先给「一条命令影响
+    /// 哪些行」建一个去重的入口，四条一起改。
+    ///
+    /// # 行尾符按每一条选区自己那一行取
+    ///
+    /// 不是整篇取一次——一篇文档里两种行尾混着是合法的，CRLF 的那几行要保持
+    /// CRLF。
+    fn insert_plain_newlines(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let mut edits = Vec::with_capacity(self.selections.len());
+        for selection in self.selections.as_slice() {
+            let range = selection.ordered_range();
+            let line = source_line(&snapshot, range.start())?;
+            edits.push((range, Arc::<str>::from(line.insertion_terminator())));
+        }
+        self.apply_selection_edits(edits, HistoryGroup::ListEditing, CollapseTo::End)
+    }
+
     /// Indents the current list item by two source spaces.
+    ///
+    /// **primary 那一行。** 理由见 [`Self::insert_plain_newlines`] 上那段说明。
     pub fn indent_list(&mut self) -> Result<CommandResult, EditorDocumentError> {
         let snapshot = self.snapshot();
-        let line = source_line(&snapshot, self.selection.focus())?;
+        let line = source_line(&snapshot, self.selection().focus())?;
         if self.list_prefix(&line).is_none() {
             return Ok(self.command_result(false));
         }
@@ -1804,9 +1919,11 @@ impl EditorDocument {
     }
 
     /// Removes up to two leading source spaces from the current list item.
+    ///
+    /// **primary 那一行。** 理由见 [`Self::insert_plain_newlines`] 上那段说明。
     pub fn outdent_list(&mut self) -> Result<CommandResult, EditorDocumentError> {
         let snapshot = self.snapshot();
-        let line = source_line(&snapshot, self.selection.focus())?;
+        let line = source_line(&snapshot, self.selection().focus())?;
         if self.list_prefix(&line).is_none() {
             return Ok(self.command_result(false));
         }
@@ -1834,54 +1951,128 @@ impl EditorDocument {
         Ok(self.command_result(true))
     }
 
+    /// 在每一条选区处插入同一段文字。
+    ///
+    /// **一条命令一个 Transaction、N 条 edit。** `Transaction` 本来就收一组
+    /// 互不重叠的 edit，排序、原子提交、一份 inverse 全部由它做
+    /// （`yu_text::Transaction::prepare`）——所以 **undo 分组一个字都不用改**：
+    /// 三个光标同时打一个字仍然是一次 `history.record`，连续输入照样并进同一
+    /// 个 group。这是查代码时推翻的一个预期，值得写在这里。
     fn insert_text(&mut self, text: Arc<str>) -> Result<CommandResult, EditorDocumentError> {
         if text.is_empty() {
             return Ok(self.command_result(false));
         }
-        let range = self.selection.ordered_range();
-        let offset = range
-            .start()
-            .checked_add(
-                u64::try_from(text.len())
-                    .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
-            )
-            .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
-        let transaction = Transaction::new(
-            self.revision(),
-            [yu_text::Edit::new(range, Arc::clone(&text))],
+        let edits: Vec<_> = self
+            .selections
+            .as_slice()
+            .iter()
+            .map(|selection| (selection.ordered_range(), Arc::clone(&text)))
+            .collect();
+        self.apply_selection_edits(edits, HistoryGroup::Typing, CollapseTo::End)
+    }
+
+    /// 应用一组「一条选区一个替换」的编辑，并把每一条选区落到它自己那一处。
+    ///
+    /// `edits` 与当前选区**一一对应、同序**；替换为空且区间为空的那几条是空操作
+    /// （文档开头的光标按退格就是），它们不进 Transaction 但仍然占一个落点。
+    ///
+    /// # 落点是算出来的，不是映射出来的
+    ///
+    /// 这是这一刀查出来的一个真缺口。`ChangeSet::map_anchor` 在两条 edit 首尾
+    /// 相接时，会把前一条的**终点**（选区的终点按 `Affinity::After` 映射）一路
+    /// 推到后一条替换之后：在 `aaaa` 里选中两处 `aa` 再打一个字，两条选区映射
+    /// 之后重叠，`Selections` 把它们并成一条——源码是对的，屏幕上却只剩一根
+    /// 光标。**不报错、不 panic**，而「选中全部匹配再替换」正是这一刀最主要的
+    /// 用法。
+    ///
+    /// 修法不是去改 `map_anchor` 的端点语义（那会动到所有 anchor 的映射），
+    /// 而是**这里根本不必去猜**：这些 edit 是这条命令自己造的，第 i 条之前的
+    /// 累计位移直接加得出来。`map_through` 仍然跑（`apply_transaction_core`
+    /// 里那一次，它服务的是外来的 Transaction：undo/redo、缩进、任务勾选），
+    /// 这里只是随后把答案换成精确的那一份。
+    fn apply_selection_edits(
+        &mut self,
+        edits: Vec<(TextRange, Arc<str>)>,
+        group: HistoryGroup,
+        to: CollapseTo,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        debug_assert_eq!(
+            edits.len(),
+            self.selections.len(),
+            "每一条选区必须恰好产出一个替换"
         );
-        let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::Typing)?;
-        self.selection = EditorSelection::cursor(
-            applied.result_snapshot(),
-            offset,
-            crate::CaretAffinity::Downstream,
-        )?;
+        let mut targets = Vec::with_capacity(edits.len());
+        let mut delta = 0_i128;
+        for (range, replacement) in &edits {
+            let start = i128::from(range.start().get()) + delta;
+            let inserted = i128::try_from(replacement.len())
+                .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+            delta += inserted - i128::from(range.len());
+            targets.push(match to {
+                CollapseTo::Start => start,
+                CollapseTo::End => start + inserted,
+            });
+        }
+
+        let applied: Vec<_> = edits
+            .iter()
+            .filter(|(range, replacement)| !(range.is_empty() && replacement.is_empty()))
+            .map(|(range, replacement)| yu_text::Edit::new(*range, Arc::clone(replacement)))
+            .collect();
+        if applied.is_empty() {
+            return Ok(self.command_result(false));
+        }
+
+        let primary = self.selections.primary_index();
+        let transaction = Transaction::new(self.revision(), applied);
+        self.apply_transaction_with_group(&transaction, group)?;
+
+        let snapshot = self.snapshot();
+        let mut collapsed = Vec::with_capacity(targets.len());
+        for target in targets {
+            let offset = u64::try_from(target)
+                .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?;
+            collapsed.push(EditorSelection::cursor(
+                &snapshot,
+                ByteOffset::new(offset),
+                crate::CaretAffinity::Downstream,
+            )?);
+        }
+        self.selections = Selections::new(&snapshot, collapsed, primary)?;
         Ok(self.command_result(true))
     }
 
     fn delete_backward(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        if self.selection.is_empty()
+        // 空列表项的退格（删掉整条标记）**只在单光标下走**，见
+        // `insert_plain_newlines` 上那段说明：它删的是整行的内容，两个
+        // 光标停在同一行上会产出一对重叠的 edit，整条命令因此失败。
+        if !self.selections.is_multiple()
+            && self.selection().is_empty()
             && let Some(result) = self.delete_empty_list_prefix()?
         {
             return Ok(result);
         }
-        let range = if self.selection.is_empty() {
-            let start = previous_grapheme_boundary(&self.snapshot(), self.selection.focus())?;
-            TextRange::new(start, self.selection.focus())
-                .expect("previous grapheme boundary must precede caret")
-        } else {
-            self.selection.ordered_range()
-        };
-        self.delete_range(range, HistoryGroup::Deletion)
+        let snapshot = self.snapshot();
+        let mut ranges = Vec::with_capacity(self.selections.len());
+        for selection in self.selections.as_slice() {
+            ranges.push(if selection.is_empty() {
+                let start = previous_grapheme_boundary(&snapshot, selection.focus())?;
+                TextRange::new(start, selection.focus())
+                    .expect("previous grapheme boundary must precede caret")
+            } else {
+                selection.ordered_range()
+            });
+        }
+        self.delete_ranges(ranges, HistoryGroup::Deletion)
     }
 
     fn delete_empty_list_prefix(&mut self) -> Result<Option<CommandResult>, EditorDocumentError> {
         let snapshot = self.snapshot();
-        let line = source_line(&snapshot, self.selection.focus())?;
+        let line = source_line(&snapshot, self.selection().focus())?;
         let Some(prefix) = self.list_prefix(&line) else {
             return Ok(None);
         };
-        let relative = byte_distance(line.start, self.selection.focus())?;
+        let relative = byte_distance(line.start, self.selection().focus())?;
         if relative < prefix.content_start
             || !prefix.is_empty_item(&line.content)
             || !line
@@ -1896,71 +2087,103 @@ impl EditorDocument {
             [yu_text::Edit::new(line.content_range(), "")],
         );
         let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-        self.selection = EditorSelection::cursor(
+        self.set_single_selection(EditorSelection::cursor(
             applied.result_snapshot(),
             line.start,
             crate::CaretAffinity::Downstream,
-        )?;
+        )?);
         Ok(Some(self.command_result(true)))
     }
 
     fn delete_forward(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        let range = if self.selection.is_empty() {
-            let end = next_grapheme_boundary(&self.snapshot(), self.selection.focus())?;
-            TextRange::new(self.selection.focus(), end)
-                .expect("next grapheme boundary must follow caret")
-        } else {
-            self.selection.ordered_range()
-        };
-        self.delete_range(range, HistoryGroup::Deletion)
+        let snapshot = self.snapshot();
+        let mut ranges = Vec::with_capacity(self.selections.len());
+        for selection in self.selections.as_slice() {
+            ranges.push(if selection.is_empty() {
+                let end = next_grapheme_boundary(&snapshot, selection.focus())?;
+                TextRange::new(selection.focus(), end)
+                    .expect("next grapheme boundary must follow caret")
+            } else {
+                selection.ordered_range()
+            });
+        }
+        self.delete_ranges(ranges, HistoryGroup::Deletion)
     }
 
-    fn delete_range(
+    /// 一次删掉 N 段。
+    ///
+    /// **空区间不进 Transaction**（由 [`Self::apply_selection_edits`] 滤掉）。
+    /// 文档开头的光标按退格产出的就是一个空区间，而两个空 edit 落在同一个偏移
+    /// 会被 `yu_text` 的 `validate_edits` 当成重叠拒掉——整条 Transaction 因此
+    /// 失败，表现是「另外几个光标也删不动」，不报错、不 panic。
+    fn delete_ranges(
         &mut self,
-        range: TextRange,
+        ranges: Vec<TextRange>,
         group: HistoryGroup,
     ) -> Result<CommandResult, EditorDocumentError> {
-        if range.is_empty() {
-            return Ok(self.command_result(false));
-        }
-        let transaction = Transaction::new(
-            self.revision(),
-            [yu_text::Edit::new(range, Arc::<str>::from(""))],
-        );
-        let applied = self.apply_transaction_with_group(&transaction, group)?;
-        self.selection = EditorSelection::cursor(
-            applied.result_snapshot(),
-            range.start(),
-            crate::CaretAffinity::Downstream,
-        )?;
-        Ok(self.command_result(true))
+        let edits = ranges
+            .into_iter()
+            .map(|range| (range, Arc::<str>::from("")))
+            .collect();
+        self.apply_selection_edits(edits, group, CollapseTo::Start)
     }
 
     fn move_left(&mut self) -> Result<CommandResult, EditorDocumentError> {
         self.history.break_group();
-        let target = if self.selection.is_empty() {
-            previous_grapheme_boundary(&self.snapshot(), self.selection.focus())?
-        } else {
-            self.selection.ordered_range().start()
-        };
-        self.selection =
-            EditorSelection::cursor(&self.snapshot(), target, crate::CaretAffinity::Downstream)?;
+        self.move_horizontal(false)
+    }
+
+    /// 每一条选区各走一步。
+    ///
+    /// 走完之后归一化：两个相邻的光标向左走会撞到同一个偏移，不合并的话下一次
+    /// 插入会被 `validate_edits` 拒掉。收敛点仍然只有 `Selections` 一个。
+    fn move_horizontal(&mut self, forward: bool) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let primary = self.selections.primary_index();
+        let mut targets = Vec::with_capacity(self.selections.len());
+        for selection in self.selections.as_slice() {
+            let target = if selection.is_empty() {
+                if forward {
+                    next_grapheme_boundary(&snapshot, selection.focus())?
+                } else {
+                    previous_grapheme_boundary(&snapshot, selection.focus())?
+                }
+            } else if forward {
+                selection.ordered_range().end()
+            } else {
+                selection.ordered_range().start()
+            };
+            targets.push(EditorSelection::cursor(
+                &snapshot,
+                target,
+                crate::CaretAffinity::Downstream,
+            )?);
+        }
+        self.selections = Selections::new(&snapshot, targets, primary)?;
         Ok(self.command_result(false))
     }
 
+    /// 表格里跳到上一个/下一个单元格。
+    ///
+    /// **primary 降级。** 「下一个单元格」是相对一个位置说的，N 个光标散在
+    /// 不同的表里就没有第二个答案可选。落点是一个光标，所以这条命令顺带把
+    /// 选区塌回一条——那正是该有的行为。
     fn move_table_cell(&mut self, previous: bool) -> Result<CommandResult, EditorDocumentError> {
         self.history.break_group();
         let Some(target) = self.table_cell_navigation_target(previous) else {
             return Ok(self.command_result(false));
         };
-        self.selection =
-            EditorSelection::cursor(&self.snapshot(), target, crate::CaretAffinity::Downstream)?;
+        self.set_single_selection(EditorSelection::cursor(
+            &self.snapshot(),
+            target,
+            crate::CaretAffinity::Downstream,
+        )?);
         self.preferred_x = None;
         Ok(self.command_result(false))
     }
 
     fn table_cell_navigation_target(&self, previous: bool) -> Option<ByteOffset> {
-        let focus = self.selection.focus();
+        let focus = self.selection().focus();
         let block_index = self.block_index_for_offset(focus)?;
         let block = self.markdown.blocks().get(block_index)?;
         let snapshot = self.snapshot();
@@ -1977,114 +2200,88 @@ impl EditorDocument {
 
     fn move_right(&mut self) -> Result<CommandResult, EditorDocumentError> {
         self.history.break_group();
-        let target = if self.selection.is_empty() {
-            next_grapheme_boundary(&self.snapshot(), self.selection.focus())?
-        } else {
-            self.selection.ordered_range().end()
-        };
-        self.selection =
-            EditorSelection::cursor(&self.snapshot(), target, crate::CaretAffinity::Downstream)?;
-        Ok(self.command_result(false))
+        self.move_horizontal(true)
     }
 
     fn move_word_left(&mut self) -> Result<CommandResult, EditorDocumentError> {
         self.history.break_group();
-        if !self.selection.is_empty() {
-            let target = self.selection.ordered_range().start();
-            self.selection = EditorSelection::cursor(
-                &self.snapshot(),
-                target,
-                crate::CaretAffinity::Downstream,
-            )?;
-            return Ok(self.command_result(false));
-        }
-
-        let snapshot = self.snapshot();
-        let line_index = snapshot.line_index(self.selection.focus())?;
-        let line = source_line(&snapshot, self.selection.focus())?;
-        let relative = byte_distance(line.start, self.selection.focus())?.min(line.content.len());
-        let local_target = previous_word_boundary(&line.content, relative);
-        if local_target < relative {
-            let target =
-                line.start
-                    .checked_add(u64::try_from(local_target).map_err(|_| {
-                        EditorDocumentError::Selection(SelectionError::InvalidRange)
-                    })?)
-                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
-            self.selection =
-                EditorSelection::cursor(&snapshot, target, crate::CaretAffinity::Downstream)?;
-            return Ok(self.command_result(false));
-        }
-
-        let target =
-            if line_index.get() == 0 {
-                line.start
-            } else {
-                let previous_line = source_line(
-                    &snapshot,
-                    snapshot.line_start(LineIndex::new(line_index.get() - 1))?,
-                )?;
-                let local_target =
-                    previous_word_boundary(&previous_line.content, previous_line.content.len());
-                previous_line
-                    .start
-                    .checked_add(u64::try_from(local_target).map_err(|_| {
-                        EditorDocumentError::Selection(SelectionError::InvalidRange)
-                    })?)
-                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?
-            };
-        self.selection =
-            EditorSelection::cursor(&snapshot, target, crate::CaretAffinity::Downstream)?;
-        Ok(self.command_result(false))
+        self.move_word(false)
     }
 
     fn move_word_right(&mut self) -> Result<CommandResult, EditorDocumentError> {
         self.history.break_group();
-        if !self.selection.is_empty() {
-            let target = self.selection.ordered_range().end();
-            self.selection = EditorSelection::cursor(
-                &self.snapshot(),
+        self.move_word(true)
+    }
+
+    /// 每一条选区各走一个词。
+    ///
+    /// 与左右移动同形：非空选区先塌到那一头，空光标才真的走。落点由
+    /// [`Self::word_target`] 一家算，两个方向共用同一份行/词边界处理。
+    fn move_word(&mut self, forward: bool) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let primary = self.selections.primary_index();
+        let mut targets = Vec::with_capacity(self.selections.len());
+        for selection in self.selections.as_slice() {
+            let target = if !selection.is_empty() {
+                let range = selection.ordered_range();
+                if forward { range.end() } else { range.start() }
+            } else {
+                Self::word_target(&snapshot, selection.focus(), forward)?
+            };
+            targets.push(EditorSelection::cursor(
+                &snapshot,
                 target,
                 crate::CaretAffinity::Downstream,
-            )?;
-            return Ok(self.command_result(false));
+            )?);
+        }
+        self.selections = Selections::new(&snapshot, targets, primary)?;
+        Ok(self.command_result(false))
+    }
+
+    /// 一个光标按词移动的落点：先在本行里找，找不到就跨到相邻那一行。
+    fn word_target(
+        snapshot: &TextSnapshot,
+        focus: ByteOffset,
+        forward: bool,
+    ) -> Result<ByteOffset, EditorDocumentError> {
+        let line_index = snapshot.line_index(focus)?;
+        let line = source_line(snapshot, focus)?;
+        let relative = byte_distance(line.start, focus)?.min(line.content.len());
+        let local_target = if forward {
+            next_word_boundary(&line.content, relative)
+        } else {
+            previous_word_boundary(&line.content, relative)
+        };
+        let moved_within_line = if forward {
+            local_target > relative
+        } else {
+            local_target < relative
+        };
+        if moved_within_line {
+            return offset_plus(line.start, local_target);
         }
 
-        let snapshot = self.snapshot();
-        let line_index = snapshot.line_index(self.selection.focus())?;
-        let line = source_line(&snapshot, self.selection.focus())?;
-        let relative = byte_distance(line.start, self.selection.focus())?.min(line.content.len());
-        let local_target = next_word_boundary(&line.content, relative);
-        if local_target > relative {
-            let target =
-                line.start
-                    .checked_add(u64::try_from(local_target).map_err(|_| {
-                        EditorDocumentError::Selection(SelectionError::InvalidRange)
-                    })?)
-                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
-            self.selection =
-                EditorSelection::cursor(&snapshot, target, crate::CaretAffinity::Downstream)?;
-            return Ok(self.command_result(false));
-        }
-
-        let next_index = line_index.get().saturating_add(1);
-        let target =
+        if forward {
+            let next_index = line_index.get().saturating_add(1);
             if next_index < snapshot.summary().line_count() {
                 let next_line =
-                    source_line(&snapshot, snapshot.line_start(LineIndex::new(next_index))?)?;
+                    source_line(snapshot, snapshot.line_start(LineIndex::new(next_index))?)?;
                 let local_target = next_word_boundary(&next_line.content, 0);
-                next_line
-                    .start
-                    .checked_add(u64::try_from(local_target).map_err(|_| {
-                        EditorDocumentError::Selection(SelectionError::InvalidRange)
-                    })?)
-                    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?
+                offset_plus(next_line.start, local_target)
             } else {
-                snapshot.len_bytes()
-            };
-        self.selection =
-            EditorSelection::cursor(&snapshot, target, crate::CaretAffinity::Downstream)?;
-        Ok(self.command_result(false))
+                Ok(snapshot.len_bytes())
+            }
+        } else if line_index.get() == 0 {
+            Ok(line.start)
+        } else {
+            let previous_line = source_line(
+                snapshot,
+                snapshot.line_start(LineIndex::new(line_index.get() - 1))?,
+            )?;
+            let local_target =
+                previous_word_boundary(&previous_line.content, previous_line.content.len());
+            offset_plus(previous_line.start, local_target)
+        }
     }
 
     fn move_up(&mut self, extend: bool) -> Result<CommandResult, EditorDocumentError> {
@@ -2140,32 +2337,112 @@ impl EditorDocument {
     {
         self.history.break_group();
 
-        if !extend && !self.selection.is_empty() {
-            let target = match direction {
-                VerticalDirection::Up => self.selection.ordered_range().start(),
-                VerticalDirection::Down => self.selection.ordered_range().end(),
-            };
-            self.selection = EditorSelection::cursor(
-                &self.snapshot(),
-                target,
-                crate::CaretAffinity::Downstream,
-            )?;
+        // 不扩展时，非空选区先塌到那一头——每一条各塌各的。
+        if !extend && self.selections.as_slice().iter().any(|s| !s.is_empty()) {
+            let snapshot = self.snapshot();
+            let primary = self.selections.primary_index();
+            let mut collapsed = Vec::with_capacity(self.selections.len());
+            for selection in self.selections.as_slice() {
+                let range = selection.ordered_range();
+                let target = match direction {
+                    VerticalDirection::Up => range.start(),
+                    VerticalDirection::Down => range.end(),
+                };
+                collapsed.push(EditorSelection::cursor(
+                    &snapshot,
+                    target,
+                    crate::CaretAffinity::Downstream,
+                )?);
+            }
+            self.selections = Selections::new(&snapshot, collapsed, primary)?;
             self.preferred_x = None;
             return Ok(self.command_result(false));
         }
 
-        let source = self.snapshot();
-        let focus = self.selection.focus();
-        let anchor = self.selection.anchor();
-        let Some(block_index) = self.block_index_for_offset(focus) else {
-            self.preferred_x = None;
-            return Ok(self.command_result(false));
+        // **多光标不吃粘滞列。** `preferred_x` 是一个 f32 视觉列，而它按
+        // `yu-state` 的模块文档进不了 `Selections`——那个 crate 的依赖只有
+        // `yu-core` 与 `yu-text`，一个布局或投影类型都没有。N>1 时每个光标
+        // 用自己**当前**的 x，代价是连按 ↓ 穿过一行短行会左漂；N=1 时行为与
+        // 多光标之前完全一样（那条路上 `sticky` 就是原来的 `preferred_x`）。
+        //
+        // 还债条件：做「⌥⌘↑ 在上方加一个光标」时本来就要按光标存列，那时把
+        // `Cursor { selection, preferred_x }` 建起来，这一段跟着删。
+        let multiple = self.selections.is_multiple();
+        let sticky = if multiple {
+            None
+        } else {
+            self.preferred_x.map(PreferredCaretX::value)
         };
-        let projection_bias = match self.selection.affinity() {
+
+        let source = self.snapshot();
+        let primary = self.selections.primary_index();
+        let selections: Vec<_> = self.selections.as_slice().to_vec();
+        let mut moved = Vec::with_capacity(selections.len());
+        let mut primary_x = None;
+        let mut any_moved = false;
+        for (index, selection) in selections.iter().copied().enumerate() {
+            match self.move_one_vertically(
+                selection,
+                direction,
+                extend,
+                config,
+                sticky,
+                &source,
+                &mut load_layout,
+            )? {
+                Some((next, x)) => {
+                    if index == primary {
+                        primary_x = Some(x);
+                    }
+                    moved.push(next);
+                    any_moved = true;
+                }
+                // 走不动的那一条留在原地。单光标时这等价于原来的
+                // 「`return Ok(command_result(false))`」；多光标时它是必须的
+                // ——文档最后一行上的光标按 ↓ 不动，不能把别的光标也拖住。
+                None => moved.push(selection),
+            }
+        }
+        // 一条都没动就什么都不改，**包括 `preferred_x`**：在最后一行按 ↓ 之后
+        // 再按 ↑ 仍然要回到原来那一列，多光标之前就是这个行为。
+        if !any_moved {
+            return Ok(self.command_result(false));
+        }
+        self.selections = Selections::new(&source, moved, primary)?;
+        self.preferred_x = if multiple {
+            None
+        } else {
+            primary_x.map(PreferredCaretX::new)
+        };
+        Ok(self.command_result(false))
+    }
+
+    /// 一条选区纵向走一步。`None` 表示这个方向上没有可去的地方。
+    ///
+    /// 返回的第二项是这一步用的目标 x，调用方拿它更新粘滞列。
+    #[allow(clippy::too_many_arguments)]
+    fn move_one_vertically<F>(
+        &mut self,
+        selection: EditorSelection,
+        direction: VerticalDirection,
+        extend: bool,
+        config: LayoutConfig,
+        sticky: Option<f32>,
+        source: &TextSnapshot,
+        load_layout: &mut F,
+    ) -> Result<Option<(EditorSelection, f32)>, EditorDocumentError>
+    where
+        F: FnMut(&mut Self, usize, LayoutConfig) -> Result<BlockView, EditorDocumentError>,
+    {
+        let focus = selection.focus();
+        let anchor = selection.anchor();
+        let Some(block_index) = self.block_index_for_offset(focus) else {
+            return Ok(None);
+        };
+        let projection_bias = match selection.affinity() {
             crate::CaretAffinity::Upstream => Bias::Before,
             crate::CaretAffinity::Downstream => Bias::After,
         };
-        let preferred_x = self.preferred_x.map(PreferredCaretX::value);
         let block_count = self.markdown.blocks().len();
         let (current_x, target_block) = {
             let layout = load_layout(self, block_index, config)?;
@@ -2189,29 +2466,28 @@ impl EditorDocument {
             (caret.point().x(), target_block)
         };
         let Some((target_block, target_line)) = target_block else {
-            return Ok(self.command_result(false));
+            return Ok(None);
         };
-        let desired_x = preferred_x.unwrap_or(current_x);
+        let desired_x = sticky.unwrap_or(current_x);
         let (target, target_width) = {
             let layout = load_layout(self, target_block, config)?;
             let target_line_index = target_line.unwrap_or_else(|| {
                 navigable_line_count(&layout, target_block + 1 < block_count).saturating_sub(1)
             });
             let Some(target_line) = layout.lines().get(target_line_index) else {
-                return Ok(self.command_result(false));
+                return Ok(None);
             };
             let hit = layout.hit_test(LayoutPoint::new(desired_x, target_line.y()))?;
             (hit.source(), target_line.width())
         };
 
         let affinity = vertical_hit_affinity(desired_x, target_width);
-        self.selection = if extend {
-            EditorSelection::range(&source, anchor, target, affinity)?
+        let next = if extend {
+            EditorSelection::range(source, anchor, target, affinity)?
         } else {
-            EditorSelection::cursor(&source, target, affinity)?
+            EditorSelection::cursor(source, target, affinity)?
         };
-        self.preferred_x = Some(PreferredCaretX::new(desired_x));
-        Ok(self.command_result(false))
+        Ok(Some((next, desired_x)))
     }
 
     fn block_index_for_offset(&self, offset: ByteOffset) -> Option<usize> {
@@ -2232,29 +2508,40 @@ impl EditorDocument {
     }
 
     fn selection_projection_bias(&self) -> Bias {
-        match self.selection.affinity() {
+        match self.selection().affinity() {
             crate::CaretAffinity::Upstream => Bias::Before,
             crate::CaretAffinity::Downstream => Bias::After,
         }
     }
 
+    /// 有没有哪一条选区在这个方向上动得了。判据与 [`Self::command_available`]
+    /// 的横向那几条同形。
     fn vertical_command_available(&self, direction: VerticalDirection) -> bool {
-        if !self.selection.is_empty() {
+        self.selections
+            .as_slice()
+            .iter()
+            .any(|selection| self.vertical_available_for(*selection, direction))
+    }
+
+    fn vertical_available_for(
+        &self,
+        selection: EditorSelection,
+        direction: VerticalDirection,
+    ) -> bool {
+        if !selection.is_empty() {
             return true;
         }
-        let Some(block_index) = self.block_index_for_offset(self.selection.focus()) else {
+        let Some(block_index) = self.block_index_for_offset(selection.focus()) else {
             return false;
         };
         let Some(block) = self.markdown.blocks().get(block_index) else {
             return false;
         };
         match direction {
-            VerticalDirection::Up => {
-                block_index > 0 || self.selection.focus() > block.range().start()
-            }
+            VerticalDirection::Up => block_index > 0 || selection.focus() > block.range().start(),
             VerticalDirection::Down => {
                 block_index.saturating_add(1) < self.markdown.blocks().len()
-                    || self.selection.focus() < block.range().end()
+                    || selection.focus() < block.range().end()
             }
         }
     }
@@ -2262,7 +2549,7 @@ impl EditorDocument {
     fn command_result(&self, changed: bool) -> CommandResult {
         CommandResult::with_source_change(
             self.revision(),
-            self.selection,
+            self.selection(),
             changed,
             self.last_source_change,
         )
@@ -2295,7 +2582,7 @@ impl EditorDocument {
     }
 
     fn current_list_line(&self) -> Option<SourceLine> {
-        source_line(&self.snapshot(), self.selection.focus()).ok()
+        source_line(&self.snapshot(), self.selection().focus()).ok()
     }
 }
 
@@ -2317,6 +2604,16 @@ where
         })
         .filter_map(|image| image_resolver(image).map(|size| (image.source(), size)))
         .collect()
+}
+
+/// `base + delta`，越界当成非法区间。这个加法在词移动里出现四次，
+/// 各写一遍就是四份溢出处理。
+fn offset_plus(base: ByteOffset, delta: usize) -> Result<ByteOffset, EditorDocumentError> {
+    base.checked_add(
+        u64::try_from(delta)
+            .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
+    )
+    .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))
 }
 
 fn source_change_from_applied(
@@ -2353,6 +2650,13 @@ struct SourceLine {
     content_end: yu_core::ByteOffset,
     content: String,
     terminator: String,
+}
+
+/// 编辑之后每一条选区塌到哪一头。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollapseTo {
+    Start,
+    End,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

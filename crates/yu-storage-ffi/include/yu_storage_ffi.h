@@ -741,6 +741,18 @@ int32_t yu_storage_session_selection_endpoints(
 int32_t yu_storage_session_set_selection_endpoints(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t anchor_utf16, uint64_t focus_utf16, uint8_t affinity);
+/* 全部选区的端点，按文档顺序，外加主选区的下标。两遍协议：output 传 NULL
+ * （capacity 为 0）时只把条数写进 written。单数入口
+ * yu_storage_session_selection_endpoints 仍然留着，它给的是 primary。 */
+int32_t yu_storage_session_selections(
+    const YuStorageSession *session, uint64_t expected_revision,
+    YuStorageSelectionEndpoints *output, size_t capacity, size_t *written,
+    size_t *primary);
+/* 换一组选区。归一化（排序、合并、定位 primary）在 Rust 侧一家做：平台送来的
+ * 可以是逆序、重叠、同一个偏移两次。count 为 0 是错误——永远至少有一条选区。 */
+int32_t yu_storage_session_set_selections(
+    YuStorageSession *session, uint64_t expected_revision,
+    const YuStorageSelectionEndpoints *ranges, size_t count, size_t primary);
 int32_t yu_storage_session_execute_command(YuStorageSession *session,
                                             uint8_t command, uint64_t block,
                                             YuStorageCommandResult *output);

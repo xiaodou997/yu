@@ -72,5 +72,5 @@ pub use yu_markdown::{
 };
 pub use yu_state::{
     CaretPositionError, CaretPositionMap, CompositionError, CompositionOverlay, EditorSelection,
-    HistoryStats, SelectionError,
+    HistoryStats, SelectionError, Selections,
 };

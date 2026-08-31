@@ -983,7 +983,9 @@ impl MacosFrameTableResize {
 ///
 /// - `revision`：源码改变。
 /// - `composition_generation`：marked text 更新——它不推进 Revision。
-/// - `selection`：光标与选区装饰改变——它同样不推进 Revision。
+/// - `selections`：光标与选区装饰改变——它同样不推进 Revision。**条数变化也在
+///   内**：从一根光标变成三根既不推进 Revision 也不改几何，少了它的表现是
+///   「按下全部选中，画面一动不动」。
 /// - `search_generation`：换了查询——同样不推进 Revision、不改几何、不改选区。
 ///   「当前命中」换一个不用单列一项：那是从 `selection` 推出来的。
 /// - `table_resize`：拖动中的列宽覆盖——既不推进 Revision 也不改变几何。
@@ -992,12 +994,18 @@ impl MacosFrameTableResize {
 /// 这个列表就是「帧内容取决于什么」的完整定义。新增一种不推进 Revision 的
 /// 可视状态时必须同时加进来，否则它的变化会被静默跳过——本项目最危险的失败
 /// 模式正是这种不报错的漏画。
+///
+/// # 为什么是整组比较，不是一个摘要
+///
+/// 把 N 条选区哈希成一个 u64 会让 `MacosFrameKey` 继续是 `Copy` 的，代价是
+/// 碰撞——而碰撞的表现正是这个类型的文档明令要防的那件事：**静默跳过一帧**。
+/// 一次 `Vec` 分配（N 是光标数）换掉一个不报错的漏画，这笔账不用算。
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct MacosFrameKey {
     revision: u64,
     composition_generation: u64,
-    selection: yu_editor::EditorSelection,
+    selections: Vec<yu_editor::EditorSelection>,
     search_generation: u64,
     table_resize: Option<MacosFrameTableResize>,
     geometry: MacosFrameGeometry,
@@ -1024,7 +1032,7 @@ impl MacosFrameKey {
         Self {
             revision: revision.get(),
             composition_generation: session.session.composition_generation(),
-            selection: session.session.selection(),
+            selections: session.session.selections().as_slice().to_vec(),
             search_generation: session.session.document().editor().search_generation(),
             table_resize,
             geometry,
@@ -2377,6 +2385,142 @@ pub unsafe extern "C" fn yu_storage_session_set_selection_endpoints(
     session
         .session
         .set_selection(selection)
+        .map_or_else(storage_status, |_| YU_STORAGE_OK)
+}
+
+/// 全部选区的端点，按文档顺序，外加主选区的下标。
+///
+/// 两遍协议（与 `outline_items` / `block_hidden_spans` 同一个）：`output` 传
+/// null（`capacity` 为 0）时只把条数写进 `written`。
+///
+/// **单数入口 `yu_storage_session_selection_endpoints` 仍然留着**，它给的是
+/// primary：AX 的 `AXSelectedTextRange`、滚动、「当前命中」这些按定义就只说
+/// 得出一个位置的地方走那一个。复数走这里。
+///
+/// # Safety
+/// `session` must be a live handle. `written` 与 `primary` must be writable;
+/// `output` must provide `capacity` writable entries when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_selections(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    output: *mut YuStorageSelectionEndpoints,
+    capacity: usize,
+    written: *mut usize,
+    primary: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() || primary.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let selections = session.session.selections();
+    let ranges = selections.as_slice();
+    // SAFETY: both output pointers were checked above and belong to the caller.
+    unsafe {
+        *written = ranges.len();
+        *primary = selections.primary_index();
+    }
+    if output.is_null() {
+        return if capacity == 0 {
+            YU_STORAGE_OK
+        } else {
+            YU_STORAGE_NULL_POINTER
+        };
+    }
+    if capacity < ranges.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    let snapshot = session.session.snapshot();
+    let revision = session.session.revision().get();
+    let mut converted = Vec::with_capacity(ranges.len());
+    for selection in ranges {
+        let anchor_utf16 = match snapshot.utf16_offset(selection.anchor()) {
+            Ok(offset) => offset.get(),
+            Err(error) => {
+                return status_from_editor_error(EditorDocumentError::Selection(error.into()));
+            }
+        };
+        let focus_utf16 = match snapshot.utf16_offset(selection.focus()) {
+            Ok(offset) => offset.get(),
+            Err(error) => {
+                return status_from_editor_error(EditorDocumentError::Selection(error.into()));
+            }
+        };
+        converted.push(YuStorageSelectionEndpoints {
+            revision,
+            anchor_utf16,
+            focus_utf16,
+            affinity: match selection.affinity() {
+                CaretAffinity::Upstream => YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                CaretAffinity::Downstream => YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+            },
+        });
+    }
+    // SAFETY: capacity was checked against the converted length, and the
+    // native caller supplied writable storage for that many values.
+    unsafe {
+        ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
+    }
+    YU_STORAGE_OK
+}
+
+/// 换一组选区。
+///
+/// 归一化（排序、合并、定位 primary）在 Rust 侧一家做——平台送来的可以是逆序
+/// 的、重叠的、同一个偏移两次（⌥ 点在一段选区里就是），**这里不拒绝它们，
+/// 归一化掉**。让平台先自己排一遍就是第二份合并实现，而两份合并必定分叉。
+///
+/// `count` 为 0 是错误：[`yu_editor::Selections`] 永远至少有一条选区，
+/// 「一个光标都没有」在这个模型里不存在。要塌回一条走单数那个入口。**这条规则
+/// 由 `Selections` 一家执行**，这一层不重复一遍。
+///
+/// # Safety
+/// `session` must be live. `ranges` must provide `count` readable entries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_selections(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    ranges: *const YuStorageSelectionEndpoints,
+    count: usize,
+    primary: usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if ranges.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // **「至少一条」与「primary 在界内」不在这里再挡一遍。**
+    //
+    // 这两条是 `Selections::new` 的不变式，它已经挡住了（`count == 0` 与
+    // `primary >= count` 都产出 `InvalidRange`，映射成同一个状态码）。写第二道
+    // 只是给同一条规则加第二个答案，而且它永远不会被单独证伪——变异验证里把它
+    // 改成 `if false` 之后全部用例照绿，正是这个意思。
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    // SAFETY: `ranges` is non-null and the caller guarantees `count` entries.
+    let entries = unsafe { std::slice::from_raw_parts(ranges, count) };
+    let mut selections = Vec::with_capacity(count);
+    for entry in entries {
+        match selection_endpoints_from_ffi(
+            &session.session,
+            entry.anchor_utf16,
+            entry.focus_utf16,
+            entry.affinity,
+        ) {
+            Ok(selection) => selections.push(selection),
+            Err(status) => return status,
+        }
+    }
+    session
+        .session
+        .set_selections(selections, primary)
         .map_or_else(storage_status, |_| YU_STORAGE_OK)
 }
 
@@ -4966,9 +5110,9 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
 /// 判断按给定几何提交的下一帧是否与已在屏幕上的帧完全等价。
 ///
 /// 等价的完整定义见 [`MacosFrameKey`]：Revision、composition generation、
-/// selection、表格 resize 覆盖与几何全部不变才算等价。其中前四项里有三项
-/// 不推进 Revision，只比 Revision 会把光标移动、preedit 更新与列宽拖动
-/// 全部静默跳过。
+/// 全部选区、查询代数、表格 resize 覆盖与几何全部不变才算等价。其中有四项
+/// 不推进 Revision，只比 Revision 会把光标移动、加一根光标、preedit 更新、
+/// 换查询与列宽拖动全部静默跳过。
 ///
 /// 这个判断此前在平台侧：Swift 每帧先查 Revision、再查 composition
 /// generation，才能组装出比较用的键，一次提交因此产生多次纯查询往返。状态在
@@ -5011,7 +5155,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_frame_is_current(
         let key = MacosFrameKey::capture(session, geometry);
         let current = session.macos_render_host.as_ref().is_some_and(|state| {
             // 没有 surface 时不能声称当前帧有效：内容还没有真正上屏。
-            state.surface.is_some() && state.last_frame_key == Some(key)
+            state.surface.is_some() && state.last_frame_key.as_ref() == Some(&key)
         });
         // SAFETY: `out_current` was checked above and belongs to the caller.
         unsafe { *out_current = u8::from(current) };
@@ -6241,6 +6385,144 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
+    /// 复数选区在 FFI 边界上的往返：两遍协议、归一化、primary 的下标。
+    ///
+    /// **归一化在 Rust 侧一家做。** 平台送来逆序、重叠、同一偏移两次的输入
+    /// （⌥ 点在一段选区里就是最后这种），这里不拒绝，收敛掉。让平台先自己排
+    /// 一遍就是第二份合并实现，而两份合并必定分叉。
+    #[test]
+    fn ffi_selections_round_trip_and_normalize() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-selections-{id}.md"));
+        fs::write(&path, "alpha beta gamma\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+
+        let endpoint = |anchor: u64, focus: u64| YuStorageSelectionEndpoints {
+            revision: 0,
+            anchor_utf16: anchor,
+            focus_utf16: focus,
+            affinity: YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+        };
+        let read = |raw: *mut YuStorageSession| -> (Vec<(u64, u64)>, usize) {
+            let mut written = 0;
+            let mut primary = usize::MAX;
+            // 第一遍：只问条数。
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_selections(
+                        raw,
+                        0,
+                        ptr::null_mut(),
+                        0,
+                        &mut written,
+                        &mut primary,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            let mut buffer = vec![YuStorageSelectionEndpoints::default(); written];
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_selections(
+                        raw,
+                        0,
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                        &mut written,
+                        &mut primary,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            (
+                buffer
+                    .iter()
+                    .map(|entry| (entry.anchor_utf16, entry.focus_utf16))
+                    .collect(),
+                primary,
+            )
+        };
+
+        // 开门就是一条选区——`Selections` 永远至少有一条。
+        assert_eq!(read(raw), (vec![(0, 0)], 0));
+
+        // 逆序 + 重叠 + 一个停在选区边界上的空光标，一起送进去。
+        let messy = [
+            endpoint(11, 16),
+            endpoint(6, 6),
+            endpoint(2, 0),
+            endpoint(0, 4),
+        ];
+        assert_eq!(
+            unsafe { yu_storage_session_set_selections(raw, 0, messy.as_ptr(), messy.len(), 1) },
+            YU_STORAGE_OK
+        );
+        let (ranges, primary) = read(raw);
+        assert_eq!(
+            ranges,
+            // 端点保留方向，所以并出来的那一条是 anchor=4、focus=0：两条都不是
+            // primary 时方向归靠前的那一条，而它（输入的 `endpoint(2, 0)`）是
+            // 反向的。这条规则本身值得断言——丢掉方向的表现是拖选到一半松手，
+            // 选区突然翻个个儿。
+            vec![(4, 0), (6, 6), (11, 16)],
+            "`0..2` 与 `0..4` 要并成一条；`6` 那个光标不与任何一条相接"
+        );
+        assert_eq!(primary, 1, "primary 是输入里的 `6`，排序之后在中间");
+
+        // 数组小了要明确拒绝，不能拷半份出去。
+        let mut short = vec![YuStorageSelectionEndpoints::default(); 2];
+        let mut written = 0;
+        let mut primary_out = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_selections(
+                    raw,
+                    0,
+                    short.as_mut_ptr(),
+                    short.len(),
+                    &mut written,
+                    &mut primary_out,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+
+        // 一条都不给是错误：「一个光标都没有」在这个模型里不存在。
+        assert_eq!(
+            unsafe { yu_storage_session_set_selections(raw, 0, messy.as_ptr(), 0, 0) },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        // primary 越界同样是错误。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selections(raw, 0, messy.as_ptr(), messy.len(), messy.len())
+            },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        // Revision 失配不得触碰选区。
+        assert_eq!(
+            unsafe { yu_storage_session_set_selections(raw, 99, messy.as_ptr(), messy.len(), 0) },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(read(raw).0, vec![(4, 0), (6, 6), (11, 16)]);
+
+        // **单数入口给的是 primary。** 两条路各自回答自己的问题。
+        let mut single = YuStorageSelectionEndpoints::default();
+        assert_eq!(
+            unsafe { yu_storage_session_selection_endpoints(raw, &mut single) },
+            YU_STORAGE_OK
+        );
+        assert_eq!((single.anchor_utf16, single.focus_utf16), (6, 6));
+
+        unsafe { yu_storage_session_destroy(raw) };
+        let _ = fs::remove_file(&path);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_render_host_config_tracks_document_scroll_origin() {
@@ -6626,6 +6908,58 @@ mod tests {
         assert_eq!(moved.revision, baseline.revision, "选区变化不推进 Revision");
         assert_ne!(baseline, moved, "光标移动必须让帧身份改变");
 
+        // **加一根光标同样不推进 Revision、不改几何。**
+        //
+        // 帧身份里的选区从「一个」变成「一组」之后，最容易漏的就是**条数**：
+        // 只比 primary 的话，从一根光标变成三根会被判为等价——按下「选中全部
+        // 匹配」，画面一动不动，不报错、不 panic。这一条与上面那条光标移动
+        // 是两回事：那条改的是位置，这条改的是根数。
+        let two_carets = [
+            YuStorageSelectionEndpoints {
+                revision: 0,
+                anchor_utf16: 2,
+                focus_utf16: 2,
+                affinity: YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+            },
+            YuStorageSelectionEndpoints {
+                revision: 0,
+                anchor_utf16: 5,
+                focus_utf16: 5,
+                affinity: YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selections(raw, 0, two_carets.as_ptr(), two_carets.len(), 0)
+            },
+            YU_STORAGE_OK
+        );
+        let two = capture(geometry);
+        assert_eq!(two.revision, moved.revision, "加一根光标不推进 Revision");
+        assert_eq!(two.geometry, moved.geometry, "加一根光标不改变几何");
+        assert_eq!(
+            two.selections[0], moved.selections[0],
+            "primary 那一条没有动——只比它的话这一步会被判为等价"
+        );
+        assert_ne!(moved, two, "光标根数变化必须让帧身份改变");
+
+        // 收回一根同样是一次变化。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    2,
+                    2,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let back_to_one = capture(geometry);
+        assert_ne!(two, back_to_one, "收回一根光标必须让帧身份改变");
+        assert_eq!(back_to_one, moved, "回到同一个状态必须给出同一个身份");
+
         // 换查询同样不推进 Revision、不改几何、不改选区。少了这一项，在搜索
         // 框里打字画面会一动不动——不报错、不 panic。
         let query = b"a";
@@ -6635,7 +6969,7 @@ mod tests {
         );
         let searched = capture(geometry);
         assert_eq!(searched.revision, moved.revision, "换查询不推进 Revision");
-        assert_eq!(searched.selection, moved.selection, "换查询不改变选区");
+        assert_eq!(searched.selections, moved.selections, "换查询不改变选区");
         assert_eq!(searched.geometry, moved.geometry, "换查询不改变几何");
         assert_ne!(moved, searched, "换查询必须让帧身份改变");
 

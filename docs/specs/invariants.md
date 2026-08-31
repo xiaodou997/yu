@@ -52,6 +52,24 @@ task 状态切换、加粗、插入链接）本质都是对 source 的 replaceme
 **B8.** dirty 是当前 Revision 与 `saved_revision` 的比较。
 Undo 回到相同字节也不能绕过显式保存边界。
 
+**B9.** **选区是一组，不是一个。** `Selections` 恒满足：至少一条、全体同一
+Revision、按起点升序、互不重叠（相邻两条 `prev.end() <= next.start()`，等号成立
+时两条都必须非空）、`primary` 在界内。归一化（排序、合并、定位 primary）只有
+`Selections` 一个实现，平台侧与命令层都不得自己先排一遍。
+
+> 「互不重叠」比 `yu_text::validate_edits` 严一点，这是有意的。相邻的两段**非空**
+> 选区必须留着——`aa` 在 `aaaa` 里的两处匹配就是 `0..2` 与 `2..4`，并掉等于把
+> 「选中全部匹配」变成「全选」；而一个停在选区边界上的**空**光标要并进去，
+> 否则打字会把同一个位置插两次。
+
+**B10.** **一条命令一个 Transaction。** N 条选区产出 N 条 edit，一次提交、一份
+inverse、一次 `history.record`。因此 undo 分组与光标有几根无关。
+
+**B11.** **命令自己造的 edit，落点自己算。** 编辑后的选区位置由这条命令的累计
+位移推出，不经 `map_anchor`——两条 edit 首尾相接时，前一条的终点会被
+`Affinity::After` 推到后一条替换之后，两条选区因此重叠并被合并。`map_through`
+只服务外来的 Transaction（undo/redo、缩进、任务勾选）。
+
 ---
 
 ## C. Parsing
@@ -370,6 +388,14 @@ surrogate 中间位置不得穿过 ABI。
 
 **I6.** 平台的文本 mirror（如 `NSTextInputClient` 所需）不是第二真源，
 不拥有 history、dirty 或 selection 的最终权威，可随时丢弃重建。
+
+> 这条在多光标上有一个具体后果：**`NSTextView` 对不连续选区没有「主」的概念**，
+> `selectedRange()` 转手一次之后 primary 一律退回第 0 条。由 Yu 发起的多光标
+> 必须把 `primary` 直接送给 Rust，不能让 AppKit 转手再认回来。
+
+**I7.** **AX 的单数与复数是两个属性，不是一个的降级。**
+`AXSelectedTextRange` 给 primary，`AXSelectedTextRanges` 给全部。后者不得从前者
+推出来——屏幕上有五根光标而读屏只知道一根，不报错。
 
 ---
 
