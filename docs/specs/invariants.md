@@ -424,6 +424,23 @@ surrogate 中间位置不得穿过 ABI。
 `AXSelectedTextRange` 给 primary，`AXSelectedTextRanges` 给全部。后者不得从前者
 推出来——屏幕上有五根光标而读屏只知道一根，不报错。
 
+**I8.** **C 头文件是无条件的，所以每个 `pub extern "C" fn` 也必须是无条件的。**
+平台差异写在**函数体里**（`#[cfg(not(target_os = ...))]` 早退一个状态码），
+不写在函数上。一个挂着 cfg 的 extern 函数在别的平台上根本没有符号，而头文件
+仍然声明它——链接时 unresolved symbol。
+
+由两条机制不同的检查强制，两条都要：
+
+1. `tools/check-ffi-header.py` 第 4 条读**源码的属性**：便携，不用编译，在开发
+   机上立刻红。它兜不住 `cfg_attr`、宏生成的 extern、被 cfg 掉的外层 mod。
+2. `tools/check-ffi-symbols.py` 读**产物的符号表**：判断由 rustc 与归档器做出。
+   它只覆盖**当前这个平台**（本仓交叉编译不了：tree-sitter 的 grammar 是 C，
+   交叉要目标平台的 C 编译器），三个平台的覆盖来自 CI 的 rust 矩阵。
+
+这一条是 S7 第七刀补的，起因是一次**全套门禁绿着的谎话**：两个 `macos_*` 函数
+整个挂在 `#[cfg(target_os = "macos")]` 下，而 `cargo test --workspace` 在三个
+平台都绿——因为从来没有人在非 macOS 上*链接*过那个 staticlib，只*编译*过。
+
 ---
 
 ## J. 性能

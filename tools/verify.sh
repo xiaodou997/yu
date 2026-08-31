@@ -38,6 +38,15 @@ python3 tools/check-deps.py
 step "FFI 头文件一致性"
 python3 tools/check-ffi-header.py
 
+# 上一条读源码，这一条读**产物的符号表**。两条判据的机制不同，是有意的：
+# 源码那条在开发机上立刻红，产物这条兜住它兜不住的（cfg_attr、宏生成的
+# extern、被 cfg 掉的外层 mod）。
+#
+# 它只证明**当前这个平台**——这台机器交叉编译不了（tree-sitter 的 grammar
+# 是 C，交叉要目标平台的 C 编译器）。三个平台的覆盖来自 CI 的 rust 矩阵。
+step "FFI 符号在本平台的产物里都在"
+python3 tools/check-ffi-symbols.py
+
 step "ropey 未逃逸出 yu-text"
 python3 tools/check-rope-leak.py
 

@@ -3661,7 +3661,6 @@ fn macos_table_resize_hit_at_point(
 ///
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
-#[cfg(target_os = "macos")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yu_storage_session_macos_task_checkbox_hit_test(
     session: *mut YuStorageSession,
@@ -3678,70 +3677,80 @@ pub unsafe extern "C" fn yu_storage_session_macos_task_checkbox_hit_test(
     }
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = YuStorageTaskCheckboxHit::default() };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    if !point_x.is_finite() || !point_y.is_finite() {
-        return YU_STORAGE_EDITOR_ERROR;
-    }
-    if session.session.composition().is_some() {
-        return YU_STORAGE_INVALID_STATE;
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (session, expected_revision, point_x, point_y);
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
     }
 
-    let hit = {
-        let state = match session.macos_render_host.as_ref() {
-            Some(state) => state,
-            None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
-        };
-        let publication = match state.builder.last_publication() {
-            Some(publication) => publication,
-            None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
-        };
-        if publication.revision().get() != expected_revision
-            || state.host.frame_revision() != Some(publication.revision())
-            || state.host.frame_serial() != Some(publication.serial())
-        {
-            return YU_STORAGE_STALE_REVISION;
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(&session.session, expected_revision) {
+            return status;
         }
-        match publication
-            .frame()
-            .scene()
-            .task_checkbox_hit_test(publication.revision(), Point::new(point_x, point_y))
-        {
-            Ok(Some(hit)) => hit,
-            Ok(None) => return YU_STORAGE_INVALID_SELECTION,
-            Err(_) => return YU_STORAGE_STALE_REVISION,
+        if !point_x.is_finite() || !point_y.is_finite() {
+            return YU_STORAGE_EDITOR_ERROR;
         }
-    };
+        if session.session.composition().is_some() {
+            return YU_STORAGE_INVALID_STATE;
+        }
 
-    let source = session.session.snapshot();
-    let marker_start_utf16 = match source.utf16_offset(hit.source().start()) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let marker_end_utf16 = match source.utf16_offset(hit.source().end()) {
-        Ok(offset) => offset.get(),
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let block_index = match u64::try_from(hit.block_index()) {
-        Ok(index) => index,
-        Err(_) => return YU_STORAGE_INVALID_SELECTION,
-    };
-    let bounds = hit.bounds();
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe {
-        *output = YuStorageTaskCheckboxHit {
-            revision: hit.revision().get(),
-            block_index,
-            marker_start_utf16,
-            marker_end_utf16,
-            x: bounds.x(),
-            y: bounds.y(),
-            width: bounds.width(),
-            height: bounds.height(),
+        let hit = {
+            let state = match session.macos_render_host.as_ref() {
+                Some(state) => state,
+                None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+            };
+            let publication = match state.builder.last_publication() {
+                Some(publication) => publication,
+                None => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+            };
+            if publication.revision().get() != expected_revision
+                || state.host.frame_revision() != Some(publication.revision())
+                || state.host.frame_serial() != Some(publication.serial())
+            {
+                return YU_STORAGE_STALE_REVISION;
+            }
+            match publication
+                .frame()
+                .scene()
+                .task_checkbox_hit_test(publication.revision(), Point::new(point_x, point_y))
+            {
+                Ok(Some(hit)) => hit,
+                Ok(None) => return YU_STORAGE_INVALID_SELECTION,
+                Err(_) => return YU_STORAGE_STALE_REVISION,
+            }
         };
+
+        let source = session.session.snapshot();
+        let marker_start_utf16 = match source.utf16_offset(hit.source().start()) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let marker_end_utf16 = match source.utf16_offset(hit.source().end()) {
+            Ok(offset) => offset.get(),
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let block_index = match u64::try_from(hit.block_index()) {
+            Ok(index) => index,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let bounds = hit.bounds();
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe {
+            *output = YuStorageTaskCheckboxHit {
+                revision: hit.revision().get(),
+                block_index,
+                marker_start_utf16,
+                marker_end_utf16,
+                x: bounds.x(),
+                y: bounds.y(),
+                width: bounds.width(),
+                height: bounds.height(),
+            };
+        }
+        YU_STORAGE_OK
     }
-    YU_STORAGE_OK
 }
 
 /// 用一个文档坐标点探测或开始一次表格分隔线拖动。
@@ -3756,7 +3765,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_task_checkbox_hit_test(
 ///
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
-#[cfg(target_os = "macos")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yu_storage_session_macos_table_resize_at_point(
     session: *mut YuStorageSession,
@@ -3778,45 +3786,65 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_at_point(
     }
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = YuStorageTableResizeHit::default() };
-    if !matches!(
-        action,
-        YU_STORAGE_TABLE_RESIZE_PROBE | YU_STORAGE_TABLE_RESIZE_BEGIN
-    ) {
-        return YU_STORAGE_INVALID_COMMAND;
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            action,
+            size,
+            max_width,
+            point_x,
+            point_y,
+            tolerance,
+            pointer_position,
+        );
+        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
     }
-    if action == YU_STORAGE_TABLE_RESIZE_BEGIN && !pointer_position.is_finite() {
-        return YU_STORAGE_INVALID_SELECTION;
-    }
-    let (block_index, hit) = match macos_table_resize_hit_at_point(
-        session,
-        expected_revision,
-        size,
-        max_width,
-        point_x,
-        point_y,
-        tolerance,
-    ) {
-        Ok(value) => value,
-        Err(status) => return status,
-    };
-    let metadata = if action == YU_STORAGE_TABLE_RESIZE_BEGIN {
-        match begin_table_resize_session(session, block_index, hit, pointer_position) {
+
+    #[cfg(target_os = "macos")]
+    {
+        if !matches!(
+            action,
+            YU_STORAGE_TABLE_RESIZE_PROBE | YU_STORAGE_TABLE_RESIZE_BEGIN
+        ) {
+            return YU_STORAGE_INVALID_COMMAND;
+        }
+        if action == YU_STORAGE_TABLE_RESIZE_BEGIN && !pointer_position.is_finite() {
+            return YU_STORAGE_INVALID_SELECTION;
+        }
+        let (block_index, hit) = match macos_table_resize_hit_at_point(
+            session,
+            expected_revision,
+            size,
+            max_width,
+            point_x,
+            point_y,
+            tolerance,
+        ) {
             Ok(value) => value,
             Err(status) => return status,
-        }
-    } else {
-        let block_index = match u64::try_from(block_index) {
-            Ok(value) => value,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
         };
-        match table_resize_hit_metadata(session.session.revision().get(), block_index, hit) {
-            Ok(value) => value,
-            Err(status) => return status,
-        }
-    };
-    // SAFETY: output was checked for null and belongs to the caller.
-    unsafe { *output = metadata };
-    YU_STORAGE_OK
+        let metadata = if action == YU_STORAGE_TABLE_RESIZE_BEGIN {
+            match begin_table_resize_session(session, block_index, hit, pointer_position) {
+                Ok(value) => value,
+                Err(status) => return status,
+            }
+        } else {
+            let block_index = match u64::try_from(block_index) {
+                Ok(value) => value,
+                Err(_) => return YU_STORAGE_INVALID_SELECTION,
+            };
+            match table_resize_hit_metadata(session.session.revision().get(), block_index, hit) {
+                Ok(value) => value,
+                Err(status) => return status,
+            }
+        };
+        // SAFETY: output was checked for null and belongs to the caller.
+        unsafe { *output = metadata };
+        YU_STORAGE_OK
+    }
 }
 
 /// 推进一次表格分隔线拖动。

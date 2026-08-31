@@ -2972,6 +2972,368 @@ comrak 的新输出就是在断言一个第三方库的行为**——永远绿�
 
 ---
 
+#### 第七刀：跨平台第二端（Windows）
+
+S7 最大的一件，也是第 9 节那两条约束（「不追求一份代码三端渲染」「不为跨平台
+预先抽象尚无第二实现的接口」）第一次同时生效的地方。后一条是说：**这一刀正是
+建那个抽象的时刻**。
+
+##### 零、三个前提被查代码推翻
+
+**1. 「三个 seam 已经存在」——其中一个是死的，而产品链路上真正那个不在名单里。**
+
+`yu-font/src/lib.rs:486` 的 `TextShaper` **全仓零消费者**。除了 `yu-font` 自己
+与 `yu-font-macos`（1025 行 impl 它，然后在自己的 `ShapingProvider::shape` 里
+1042/1058 转调一次），没有任何地方以 `&dyn TextShaper` 或 `impl TextShaper`
+取参。
+
+真正的插口是 `yu-core/src/shaping.rs:251` 的 `ShapingProvider`：
+`yu-layout::measure`（block.rs:1709）、`yu-workspace` 的全部 `publish_*` /
+`assemble_*`（lib.rs:1334 起一律 `<S: ShapingProvider>`）、`yu-editor::document`
+那十几个 `_with_shaper` 都取它。
+
+同一个形状的第二例：`yu-font/src/lib.rs:222` 的 `FontDatabase` 也只有测试在用
+（`yu-workspace/src/lib.rs:1998`、`yu-render/src/lib.rs:576`、
+`yu-layout/tests/font_backend_contract.rs:21`，三处全在测试里）。真实的
+`FontFaceId` 由平台的 `FaceTable` 铸（`yu-font-macos/src/lib.rs:403`）。
+
+> **「只有一个真实现的接口等于还没被证明」这句要再收紧一格：**
+> `ShapingProvider` 今天有六个实现，五个是 mock。**只有一类实现的接口同样
+> 没被证明**——五个 mock 全都一 grapheme 一 glyph，轻松满足契约，因此什么
+> 都没压住。
+
+**2. 「85 处 cfg」不是散落的分支，是半个 crate。**
+
+`crates/yu-storage-ffi/Cargo.toml` 把 `yu-font` / `yu-font-macos` / `yu-render` /
+`yu-render-macos` / `yu-workspace` / `yu-markdown` / `yu-embedded-math`
+**整个**放在 `[target.'cfg(target_os = "macos")'.dependencies]` 下。Windows 上
+这个 crate 连 `RenderPlan`、`ViewportRenderConfig`、`Rgba8` 这些类型都拿不到。
+不是「加几个 cfg」的活，是依赖图要改。
+
+**3. 「CI 三平台跑 core，所以 Windows 上今天是绿的」——这句话证明的比看上去少。**
+
+49 个 extern 函数里有 **2 个整个挂在 `#[cfg(target_os = "macos")]` 下**
+（`yu_storage_session_macos_task_checkbox_hit_test`、
+`yu_storage_session_macos_table_resize_at_point`），而
+`include/yu_storage_ffi.h` 无条件声明全部 49 个。**今天在 Windows 上链接这个
+staticlib 会 unresolved symbol，而全套门禁是绿的**——`check-ffi-header.py`
+对源码文本做正则（第 32 行），正则不认识 cfg；`cargo test --workspace` 只
+*编译*这个 crate，从来没有*链接*过它。
+
+这是「静默地做错事」的一个新实例，也是这一刀的第一次切分（见第六节）。
+
+##### 一、seam 不是三个，契约也不写在 trait 上
+
+**`ShapingProvider` 的契约写在调用方里，比类型说的严格得多。**
+`crates/yu-layout/src/block.rs:1717-1731` 与 1774：
+
+```text
+// 字形必须按逻辑顺序、无缝、不越界地铺满这个 run。缺一段
+// 就是丢字，重一段就是重画——两样都不 panic。
+if from != cursor || to > text.len() { ... }
+...
+if cursor != text.len() { ... }
+```
+
+意思是：一个 run 的全部 `Glyph::source` 必须构成 `[0, len)` 的**有序划分**
+——首尾相接、不重叠、不留缝。等价于**一簇一形**。
+
+而 `yu-core/src/shaping.rs:105` 上 `GlyphRun` 的文档只说「source ranges are
+ordered and may span multiple code points when a shaping engine forms a
+ligature or cluster」，**一个字都没说不许一簇多形**。类型上看不出来的东西，
+正是第二个实现会撞的东西。已登记的「`ShapingProvider::shape` 的 range 是零基
+局部空间」（`block.rs:1708` 的 `local_range`）只是这一类里的一个。
+
+CoreText 怎么满足它的：`yu-font-macos/src/lib.rs:1259-1266` 拿
+`CTRunGetStringIndices`，每个字形的终点取「后面第一个严格更大的 index，没有就
+取 run 末尾」。1:1 与连字（多字符→一形）成立；一簇多形（天城文、部分 emoji
+序列）会让两个字形拿到同一起点，第二个在 `from != cursor` 上**硬失败**。同文件
+1253 行还把 `CTRunStatus::NonMonotonic` 与 `RightToLeft` 直接拒掉。
+
+**DirectWrite 那一侧还没查，只有 API 语义，要用一次 spike 钉死，不许当已验证
+事实用。** 三条待验：
+
+1. `IDWriteTextAnalyzer::GetGlyphs` 给的 `clusterMap` 是**文本 → 字形**，与
+   CoreText 的**字形 → 文本**方向相反，要先反过来；而且它的索引单位是
+   UTF-16 code unit，`Glyph::source` 是 UTF-8 字节。
+   `yu-font-macos/src/lib.rs:1336` 的 `Utf16Map` 是第一份换算表——**它跟平台
+   无关，该提到 `yu-font`**。
+2. `CTLine` 顺手做的三件事 DirectWrite 不做：script 分段、bidi、字体 fallback
+   分段。`shape_with_core_text`（同文件 1129）拿到的是**已经分好**的 `CTRun`。
+   seam 的输入输出还表达得了，但这是 `yu-font-windows` 里凭空多出来的一大块。
+   E5（断行归共享 Rust）在这里帮了大忙：Yu 不用 `IDWriteTextLayout`，只用底层
+   analyzer，两端职责一样。
+3. 栅格化对得上（`CreateAlphaTexture` 的 `ALIASED_1x1` 是单通道，正是
+   `GlyphBitmap` 要的），**但 ClearType 的 3x1 子像素表达不了**——第二端只能
+   灰度反锯齿。这是外观决定，要显式拍。
+
+**第五条：两个 seam 之间有一条谁都没写的约定。**
+`FontFaceId` 由 **shaper** 铸（`yu-font-macos/src/lib.rs:617 face_id` →
+`FaceTable`），由 **rasterizer** 消费（`GlyphRasterKey::new`,
+`yu-font/src/raster.rs:52`）。两者**必须共用同一张表**——macOS 靠
+`CoreTextShaper::rasterizer()`（同文件 599）返回一个共享
+`Arc<Mutex<FaceTable>>` 的对象保证。**这个「必须配对」在任何 trait 上都没有
+表达。** 第二端照着 trait 各写一个、各自铸 id，表现是**屏幕上画出来的字全是
+别的字**——不 panic、不报错。
+
+要在第二端落地前写进类型。两个办法，选后者：`ShapingProvider` 长出
+`type Rasterizer: GlyphRasterizer`；或者把 `FaceTable` 提到 `yu-font` 成为唯一
+实现，平台只提供「face 引用 → 原生 face」。后者更好，因为 CoreText 那个
+`run_sample`（`yu-font-macos/src/lib.rs:1166`，「私有 UI 字体的名字无法反过来
+创建字体」）是 CoreText 独有的补丁，DirectWrite 可以直接留 `IDWriteFontFace`
+——这条不该被推进共享 seam。
+
+**`RenderUploader` 不是「够不够」，是「太窄」。** `yu-render/src/lib.rs:491`
+只有一个 `upload_alpha_page`。真正后端要干的事全在 `yu-render-macos` 里，而
+其中一大半**一个原生指针都没有**：
+
+| 位置 | 内容 |
+| --- | --- |
+| `yu-render-macos/src/lib.rs:2575` `MetalFrameConsumer` | Revision 闸门（文档自己写着「no native pointers」） |
+| `:1838` `requires_full_clear` | 滚动/resize/surface 重建要不要整体重绘，纯函数 |
+| `:2645-2911` `build_native_commands` | `RenderCommand` → 平铺指令（约 265 行） |
+| `:2912` / `:2971` / `:2985` | damage 构造与剔除 |
+| `:834` `MetalSurfaceConfig` | 逻辑尺寸 → drawable 像素取整 |
+| `core_text.rs:108` `CoreTextViewportFrameBuilder` | 462 行，**macOS-only 的只有两处**：字段类型 `CoreTextShaper`，和 `:337` 里的 `self.shaper.rasterizer()` |
+
+留在平台层，第二端要抄第二遍。抄错的表现是「滚动之后字形互相重叠」（那正是
+`:1832` 注释里记的那次）、「damage 剔多了一块不刷新」——都不报错。**这是这一刀
+最大的一块纯搬运，而且它在 macOS 上就能验证完。**
+
+##### 二、那 85 处 cfg 与 12 个 `macos_*`：两类东西混在一个前缀下
+
+**8 个是「需要一个原生 shaper 才能回答的几何问题」，ABI 一个字节都不带平台**
+（`move_vertical` 2572、`projection_hit_test` 3178、`composition_shaped_caret`
+3379、`task_checkbox_hit_test` 3666、`table_resize_at_point` 3761、
+`source_caret` 3970、`table_resize_accessibility_dividers` 4030、
+`shaped_caret_scroll_request` 5237）。macOS 只出现在一个地方——
+`core_text_system_ui_layout`（lib.rs:2138），八个生产调用点全指向它。
+
+**抽成平台中立的**，去掉 `macos_` 前缀；`YU_STORAGE_CORE_TEXT_UNAVAILABLE = 19`
+改名 `YU_STORAGE_SHAPER_UNAVAILABLE`，**编号不动**（19 已经在 ABI 上；这与第六刀
+「17 退休、编号不复用」是同一条规矩的正面用法）。`core_text_system_ui_layout`
+变成一个平台 hook。
+
+**4 个是 render host，只有 1 个跟着走。** `render_host_surface_submit`（4957）
+与 `..._detach`（5214）的参数里有 `view: *mut c_void`——两端指 NSView 与 HWND，
+两套线程规则。**保留 `macos_` 前缀，Windows 另开 `windows_` 一份**：这是 S1 那条
+「参数形状不同的一族不合并」（本节 S1 「函数数量目标的修正（第二次）」）的第二次
+应用。`frame_is_current`（5165）一个平台字节都没有，跟前面 8 个走；
+`render_host_frame`（4878）跟 seam 提升一起定。
+
+**`MacosFrameKey`（lib.rs:1015）是平台中立的，名字撒谎。** 六个字段
+（revision / composition_generation / selections / search_generation /
+table_resize / geometry）没有一个是 macOS 概念；`MacosFrameGeometry`（:925）
+七个字段在 Windows 上一字不改（DXGI swapchain 尺寸 + DPI scale）。它叫 `Macos`
+只因为它住在 cfg 底下。
+
+**改名 `FrameKey` 并提到 `yu-workspace`**——它是「一帧的内容取决于什么」的定义，
+那是工作区的事，不是 C ABI 的事。这条还解掉一个真问题：它的文档（:1017）写着
+「新增一种不推进 Revision 的可视状态时必须同时加进来，否则静默跳过」，而它现在
+住在一个 Windows 上根本不编译的块里——**第二端加了一种可视状态，第一端不会红**。
+第二个理由见下一节（TSF 的通知需要同一份定义）。
+
+##### 三、Windows 壳用 Rust，S1 那条未达成项不合并
+
+6,415 行 Swift 拆开是决定的依据：
+
+| 文件 | 行 | 性质 |
+| --- | --- | --- |
+| `StorageBridge.swift` | 1,801 | **纯 C ABI 搬运**（文件头自己写着「不做任何决策」） |
+| `DocumentTextView.swift` | 1,536 | `NSTextInputClient` + AX 宿主 + 指针 |
+| `DocumentWindow.swift` | 1,278 | 窗口/菜单/controller |
+| `SurfaceHost.swift` | 806 | Metal surface 宿主 |
+| 三个面板 + `Accessibility.swift` | 843 | AppKit 控件 + 少量中立逻辑 |
+| `PanelLabel.swift` | 75 | **纯中立逻辑** |
+| `main.swift` | 76 | 分发 |
+
+**选 Rust + `windows-rs`，不引入第三种语言。** 三条理由：
+
+1. **那 1,801 行在 Windows 上是零。** 壳是 Rust 就没有 C ABI、没有错误码映射、
+   没有结构体镜像。
+2. **GPU 后端不需要第二语言。** Metal 是 ObjC，所以 `yu-render-macos` 带着 841 +
+   172 行 `.m`；Direct3D/DXGI 是 COM，`windows-rs` 直接给绑定。
+3. **中立逻辑有地方落。** `PanelLabel`、`OutlinePanel` 的平表→树与身份链、
+   `FrameKey`——第二端各写一份必定分叉。Rust 壳让「唯一实现」对它们仍然成立，
+   而不是「Rust 一份 + 两个壳各一份」。
+
+**唯一真正贵的地方**：`ITextStoreACP` 的 COM 实现要在 Rust 里用 `#[implement]`
+手写，比 C#/WinUI3 的 `CoreTextEditContext` 麻烦得多。**`CoreTextEditContext`
+能不能在非 WinUI 的桌面进程里用，我不知道**——这是第一刀之后那个 spike 的第二
+件事，答案是否定的话重新考虑 C#。
+
+**S1 那条未达成项不变成两条，也不变成一条合计。** `Swift 产品代码 < 2,000 行`
+度量的是「跨 ABI 的搬运 + 平台控件」；Windows 壳是 Rust 的话，同一个数字度量的
+是**另一样东西**。两个含义不同的数加起来说不出任何事。第二端另立一条**职责
+指标**——这与 S1 自己那次「从行数改成函数数量与职责」是同一个动作：
+
+> **Windows 壳里不含任何可以住在 Rust 共享层的逻辑。** 判据是一份清单：每一个
+> 不是「调用 Win32/TSF/UIA/D3D」的函数，都要说出它为什么不能住在 Rust。
+
+顺带记一条这一刀会检验的预测：**如果 Rust 壳明显小于 6,415 行，那就是
+「Swift 壳为什么 3.21 倍」的答案**——大头是 C ABI 的搬运，不是 UI。
+
+##### 四、IME 与 AX：UTF-16 契约是中立的，TSF 要三样加法
+
+**FFI 上那些 UTF-16 偏移**是**真的**平台中立。三条证据：
+
+1. 它们是 **canonical source 的**偏移，不是屏幕上那串。判据在
+   `DocumentTextView.swift:1058` 的 `firstRect(forCharacterRange:)`：它把
+   `range.location` 直接当 `sourceUTF16` 喂给 `bridge.macosSourceCaret`（:1101）。
+2. `docs/specs/coordinates.md:12` 给 `Utf16Offset` 写的用途原文就是
+   「AppKit/**TSF** 等原生桥接」。TSF 的 ACP 也是 UTF-16 code unit——**同一个
+   单位、同一个原点**。
+3. composition 那一族（2691 / 2765 / 2811 / 2850 / 2879）跨的是
+   `replacement_start/end_utf16` + preedit UTF-8 字节 + preedit 内部的
+   `selection_start/end_utf16`。这既是 `setMarkedText:selectedRange:
+   replacementRange:` 的三件套，**也是 TSF 一次 composition 的三件套**。
+
+**但「中立」不等于「够用」。TSF 要三样今天没有的，三样都是加法：**
+
+1. **`GetTextExt` 要一个区间的外接矩形**，Yu 今天只给得出一**点**的 caret 矩形
+   （`macos_source_caret` 3970）。macOS 的 `firstRect` 只要首矩形所以够。
+   **这是第二端第一个真要新开的 FFI**，落在 I3 的「输入事件」类里。
+   **别做成「返回 N 个矩形」**——那会造出第二份行分割的答案；只回 union。
+2. **TSF 是推模型，`NSTextInputClient` 是拉模型。** TSF 要求应用主动调
+   `OnTextChange` / `OnSelectionChange` / `OnLayoutChange`；Yu 今天 49 个 FFI 全是
+   同步 pull。**但这不需要新 FFI**：壳自己比较 revision / composition_generation /
+   selections / 几何就算得出该发哪条通知——**那正是 `MacosFrameKey` 已经在做的
+   事**。它的第二个消费者是 TSF 的通知，不是画面。
+3. **锁协议。** TIP 在 `OnLockGranted` 里连串调 `GetText`/`SetText`/`GetSelection`。
+   Yu 的 session 是单线程同步、每次调用自带 `expected_revision`——**比 TSF 要求的
+   更严**，锁内的一串调用天然满足。真风险在反面：`SetText` 在锁里推进 Revision 而
+   TIP 手上的 ACP 是进锁时的。**这是壳的事不是 FFI 的事**，但它是 Windows 壳里
+   最容易静默做错的一段，判据要单独写。
+
+**AX：结构对得上，映射不同，没有新债。** `YuStorageAccessibilityNodeV2`
+（lib.rs:592）那份数据，VoiceOver 装配成扁平树、UI Automation 装配成
+`IRawElementProviderFragment` 树 + `ITextProvider`——同一份数据两种装配，就像
+大纲与语义树是并列的两份派生视图。`accessibility_line_range`（5619）按**源码
+逻辑行**（`yu-editor/src/accessibility.rs:428`），`AXLineForIndex` 与 UIA 的
+`TextUnit::Line` 都建得上去。
+
+**I7 在 Windows 上退化成「只有复数」**：UIA 的 `ITextProvider::GetSelection`
+返回的本来就是数组，单数那一侧不存在。不是新债，是同一条不变量在另一边的样子,
+要在 `invariants.md` 补一句。
+
+**「整篇文档的视觉字节流」那条欠账**在第二端上不变坏，但第一次有了判据。它今天
+安全的理由（`DocumentTextView.swift:282-298`：视觉 UTF-16 只在拖选时内部往返，
+从不进 AppKit 的 text store）在 Windows 上同形——`GetACPFromPoint` 的反面同样
+只在壳内往返。于是可以断：**同一份文档、同一个点击序列，两端算出的 source 选区
+必须逐字节相同**，而两条路真的分开（CoreText 排的 vs DirectWrite 排的）。
+**但它压不住「视觉字节流的定义变了」**——那要两端同时错。这条欠账仍然欠着，
+只是从「没有任何自动判据」变成「有一条弱的」。别当结掉。
+
+##### 五、判据：三类 self-check 三种做法，parity 门禁不放宽
+
+14 个 self-check 不是一类东西：
+
+- **(a) 穿过 FFI 去证 Rust 行为的**（`shaped-vertical` 449、`code-highlight` 1388、
+  `selection` 98、`undo` 131；里面的 `NSRange`/`NSString` 只是 UTF-16 偏移算术）。
+  **拆成两半**：「Rust 行为」在 Rust 已经有更好的判据；「搬运没搬错」变成
+  `yu-storage-ffi` 自己的 ABI 往返测试（那里已有 38 条，**22 条平台中立、
+  Windows 上今天就跑**）。两端共用，不分叉。
+- **(b) 壳里的中立逻辑**（`outline-panel` 723 的平表→树与身份链、
+  `PanelLabel.stripping`、`search-panel` 875 的减法与上下文裁剪）。
+  **把逻辑挪进 Rust，不是把断言挪进 Rust。** 挪完之后壳里剩下「把一棵树喂给
+  `NSOutlineView` / `TreeView`」，那本来就该各写各的。
+- **(c) 真正平台绑定的**（`clipboard`、`document-workflow`、
+  `document-interaction`、`accessibility`、`multi-cursor`、
+  `macos-task-checkbox`、`macos-table-resize-coordinator`、
+  `shaped-projection-hit-test`）。**两端各写一份是对的**——被测的东西不同
+  （Windows 剪贴板是 `CF_HTML`，不是 UTI）。但要求两份**断言同一组性质**，
+  性质写在一份共享规格里，不是各写各的清单。
+
+**`check-ci-parity.py` 不放宽**（它守的是一次真实事故）。做法是让 `verify.sh`
+**知道**那条 Windows 命令并显式跳过并说明为什么——字符串出现，parity 过，退出码
+仍由实际执行决定。
+
+**但这会让「verify.sh 在 macOS 上全绿」不再等于「CI 会绿」，那正是 parity 存在
+的理由的另一半。** 所以要加第二条门禁 `tools/check-platform-parity.py`：每个
+`platform/<os>/` 下的壳都有对应的 CI job；**两端 self-check 名单的对称差为空**
+（允许显式登记的例外，每条写理由）。这与 `check-ffi-header.py` 的双向校验是同
+一个手法——单向检查会让「两边都有」退化成「至少一边有」。
+
+##### 六、切六次，第一次是「让 C ABI 不再撒谎」
+
+前三次不需要 Windows 机器，全在 macOS 上验证完。
+
+| 刀 | 内容 | 判据 |
+| --- | --- | --- |
+| **a** | 让 C ABI 在非 macOS 上不再撒谎 | 编译产物的符号表 |
+| **b** | 写下 shaping 契约；删掉零消费者的 `TextShaper`；`Utf16Map` 提到 `yu-font`；把「shaper 与 rasterizer 共用 face 表」写进类型 | 一套 conformance 测试，CoreTextShaper 与全部 mock 都跑 |
+| **c** | 把中立逻辑从平台层提上来（`MetalFrameConsumer` / `requires_full_clear` / `build_native_*` / `MetalSurfaceConfig` → `yu-render`；`CoreTextViewportFrameBuilder` → 泛型 → `yu-workspace`；`MacosFrameKey` → `FrameKey`；8 个 FFI 去前缀） | 纯重构：14 个 self-check 不变、**真实窗口截图差分逐字节为 0** |
+| **d** | `yu-font-windows`：DirectWrite 的 `ShapingProvider` + `GlyphRasterizer` | 刀 b 那套 conformance 在 Windows CI 上跑。**不需要窗口、GPU、壳** |
+| **e** | `yu-render-windows`：D3D 后端 | headless 的「`RenderPlan` → 平铺指令」比对（刀 c 提上来之后两端共用，是真差分不是自证）+ 一个真实窗口 smoke |
+| **f** | Windows 壳（窗口 + TSF + UIA） | self-check + `check-platform-parity.py` |
+
+刀 c 可能还要拆成 c1（render 那半）与 c2（FFI 命名那半）两次提交，好让「哪次
+改动动了画面」从 commit 边界看得出来——与第六刀分成两个 commit 同一个理由。
+刀 d 之前先做 spike：clusterMap 反转对不对得上划分契约、`CoreTextEditContext`
+能不能在桌面进程里用（后者决定刀 f 的语言，早知道早好）。
+
+##### 刀 a：让 C ABI 在非 macOS 上不再撒谎 —— 已完成
+
+**改的**：`yu_storage_session_macos_task_checkbox_hit_test` 与
+`yu_storage_session_macos_table_resize_at_point` 从「整个函数挂 cfg」改成与
+其余 10 个 `macos_*` 同形——函数无条件存在，`#[cfg(not(target_os = "macos"))]`
+早退 `YU_STORAGE_CORE_TEXT_UNAVAILABLE`。**头文件是无条件的，实现也必须是；
+平台差异写在函数体里，不写在函数上。**
+
+**两条门禁，机制不同，这是有意的：**
+
+1. `check-ffi-header.py` 新增第 4 条：**没有一个 `pub extern "C" fn` 挂在 cfg
+   下**。便携——不需要编译、不需要交叉工具链，在开发机上立刻红。
+2. 新建 `tools/check-ffi-symbols.py`：**头文件声明的每个函数在当前平台的产物里
+   都必须有符号**。判断由 rustc 与归档器做出，不由字符串匹配做出。
+
+**为什么要两条**：这台机器**交叉编译不了**——tree-sitter 的 grammar 是 C，走
+`cc`，交叉需要目标平台的 C 编译器；本地
+`cargo build --target x86_64-unknown-linux-gnu` 以
+`failed to find tool "x86_64-linux-gnu-gcc"` 失败（实测）。所以符号那条本地只
+证明 macOS 这一半，**三个平台的覆盖来自 CI 的 rust 矩阵**（ci.yml 的 job 本来
+就在三个平台各跑一遍）。源码那条补上开发机上的即时反馈，符号那条兜住它兜不住的
+（`cfg_attr`、宏生成的 extern、被 cfg 掉的外层 mod）。
+
+CI 的 toolchain 加了 `llvm-tools` component：Windows runner 上没有 `nm`，
+`llvm-nm` 从 rustup 的 sysroot 里拿。**门禁找不到读符号表的工具就失败，不降级**
+——一条会自己跳过的门禁等于没有门禁，那正是这一刀要修的失败模式。
+
+**macOS 侧可证明没动**：把两个函数体里新加的那对包装花括号与 cfg 属性去掉之后，
+与 `HEAD` 的版本**逐字符相同**（去空白比较）。能测的那个平台上这是纯机械改动。
+
+**非 macOS 侧有一处行为差异，是有意的**：`table_resize_at_point` 原来在做任何
+平台相关的事之前先校验 `action` 字节，现在那一步进了 macOS 分支，于是非 macOS
+上一个非法 action 得到的是 `CORE_TEXT_UNAVAILABLE` 而不是 `INVALID_COMMAND`。
+这与其余 10 个 `macos_*` 一致——**没有 shaper 的平台上，「用不了」比「参数不对」
+更真**，而且先答后者会让调用方以为换个参数就能成。
+
+**新增不变量 I8**（`docs/specs/invariants.md`）：条文就是「头文件是无条件的，
+所以每个 `pub extern "C" fn` 也必须是无条件的」，连同两条检查各自覆盖什么、
+兜不住什么。
+
+**反向验证，两条各做一次，变异的形状不同：**
+
+- 把 `#[cfg(target_os = "macos")]` 加回 `task_checkbox_hit_test`：
+  `check-ffi-header.py` 第 4 条红，**而原来那三条在同一个变异下仍然全绿**
+  ——这正是第 4 条要证明的事。
+- 把 `#[cfg(target_os = "windows")]` 加上去（于是它在本机真的不存在）：
+  `check-ffi-symbols.py` 红，报的正是那一个函数名。这个形状才是 CI 的
+  Windows/Linux job 在这一刀之前会看到的东西。
+
+**两个踩到的小坑，都会让门禁假绿或假红，记下来：**
+
+1. cargo 报的 `target.name` 是 **lib 名**（`yu_storage_ffi`，下划线），不是包名。
+   按包名比会一个产物都匹配不到，而「匹配不到」看起来像「符号全没了」。要按
+   `kind` + `package_id` 认——只按 `kind` 会挑到 tree-sitter-highlight 的
+   staticlib。
+2. **`nm` 的退出码不能当致命。** rustc 把 std / compiler_builtins 的目标文件一并
+   归档进 staticlib，Xcode 的 `nm` 读不动它们（`Unknown attribute kind`，
+   rustc 的 LLVM 比 Xcode 的新），于是退出码非零而符号照样打出来。判据取
+   stdout：读不到只会让比对少符号从而**变红**，方向是安全的。本机 rustup 的
+   sysroot 里**没有** `llvm-nm`（只有 rust-lld / rust-objcopy），所以 CI 的
+   toolchain 显式加了 `llvm-tools` component——Windows runner 上没有 `nm`。
+
 ---
 
 ## 9. 明确不做的事
