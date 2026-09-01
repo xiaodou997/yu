@@ -17,13 +17,17 @@ use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{ByteOffset, ClusterMetrics, TextRange, TextStyle};
 
+mod face;
 mod raster;
+mod utf16;
 
+pub use face::{FaceTable, FaceTableError, SharedFaceTable};
 pub use raster::{
     AtlasEntry, AtlasError, AtlasRect, FontMetricKey, FontMetricsCache, FontMetricsSnapshot,
     GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphMetrics, GlyphRasterKey, GlyphRasterizer,
     RasterDataError, RasterizedGlyph,
 };
+pub use utf16::Utf16Map;
 pub use yu_core::{
     FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider, TextDirection,
 };
@@ -481,12 +485,6 @@ impl fmt::Display for FontError {
 
 impl Error for FontError {}
 
-/// A shaping backend. Native CoreText/DirectWrite/Fontconfig implementations
-/// can replace [`MockShaper`] without changing layout-facing data types.
-pub trait TextShaper: Send + Sync {
-    fn shape(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, ShapeError>;
-}
-
 /// Deterministic one-glyph-per-grapheme shaper used before native shaping.
 #[derive(Clone, Debug)]
 pub struct MockShaper {
@@ -505,10 +503,15 @@ impl MockShaper {
     pub fn database(&self) -> &Arc<FontDatabase> {
         &self.database
     }
-}
 
-impl TextShaper for MockShaper {
-    fn shape(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, ShapeError> {
+    /// 一个 grapheme 一个字形，`ShapeRequest` 说什么就是什么。
+    ///
+    /// 这里曾经是 `impl TextShaper`。那个 trait 全仓零消费者——没有任何地方
+    /// 以 `&dyn TextShaper` 或 `impl TextShaper` 取参，唯一的实现者们只是
+    /// 各自转调一次自己的固有方法。S7 第七刀删掉了它：**产品链路上的插口是
+    /// `yu_core::ShapingProvider`**，一个多出来的 trait 只会让第二端以为
+    /// 有两个要实现的契约。
+    pub fn shape(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, ShapeError> {
         if request.text.is_empty() {
             return Ok(ShapedText::new(request.source, Vec::new()));
         }
@@ -611,12 +614,6 @@ impl FontShaper {
     #[must_use]
     pub fn request(&self) -> &FontRequest {
         &self.request
-    }
-}
-
-impl TextShaper for FontShaper {
-    fn shape(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, ShapeError> {
-        self.backend.shape(request)
     }
 }
 
@@ -750,6 +747,24 @@ mod tests {
         assert_eq!(shaped.runs()[1].face(), fallback);
         assert_eq!(shaped.runs()[1].glyphs()[0].source().start().get(), 1);
         assert_eq!(shaped.runs()[1].glyphs()[0].source().len(), 4);
+    }
+
+    /// `FontShaper` 是六个 `ShapingProvider` 实现之一。它是个 mock（一
+    /// grapheme 一形），但它是**唯一一个在 CI 三个平台上都跑得到**的：另外
+    /// 四个 mock 各自埋在别的 crate 的用例里，唯一的真后端只在 macOS 上。
+    #[test]
+    fn the_fallback_shaper_conforms_to_the_shaping_contract() {
+        let mut database = FontDatabase::new();
+        database
+            .register(FontFaceSpec::new("Everything", 1.0))
+            .expect("覆盖全字符集的 face 应该注册得上");
+        let shaper = FontShaper::new(
+            Arc::new(database),
+            FontRequest::new("Everything", 12.0).expect("request should be valid"),
+        )
+        .expect("shaper should build");
+        let violations = yu_core::shaping_conformance::audit(&shaper);
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]

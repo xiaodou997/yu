@@ -999,6 +999,12 @@ impl yu_core::ShapingProvider for TestShaper {
     }
 }
 
+#[test]
+fn the_test_shaper_conforms_to_the_shaping_contract() {
+    let violations = yu_core::shaping_conformance::audit(&TestShaper);
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
 fn shaped_view(source: &str, width: f32) -> Option<BlockView> {
     let buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();

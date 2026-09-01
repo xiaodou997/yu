@@ -5,6 +5,7 @@
 mod geometry;
 mod position;
 mod shaping;
+pub mod shaping_conformance;
 mod style;
 
 pub use geometry::{
