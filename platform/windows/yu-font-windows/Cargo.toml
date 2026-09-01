@@ -1,0 +1,28 @@
+[package]
+name = "yu-font-windows"
+description = "Windows DirectWrite font/shaping adapter for Yu Editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+yu-core = { path = "../../../crates/yu-core" }
+yu-font = { path = "../../../crates/yu-font" }
+
+# 这条边现在还没有消费者——DirectWrite 的调用在刀 d 的后半。留着它有一个具体
+# 用处：它证明**开发机（macOS）能给 Windows 目标做类型检查**
+# （`cargo check -p yu-font-windows --target x86_64-pc-windows-msvc`，实测通过）。
+# 这台机器交叉编译不了、也没有 DirectWrite，那条 check 是本机能给出的判据上限，
+# 而它成立与否取决于这个依赖能不能解析。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Gdi",
+] }
+
+[lints]
+workspace = true

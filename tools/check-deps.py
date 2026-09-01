@@ -108,6 +108,9 @@ ALLOWED: dict[str, set[str]] = {
     },
     # 平台层：可以向下依赖，但不得被任何 core crate 依赖。
     "yu-font-macos": {"yu-core", "yu-font"},
+    # 第二端的字体后端。与 yu-font-macos 同层同形——它们各自实现同一组
+    # trait，互相不认识，也不许有人把它们放进同一个依赖里。
+    "yu-font-windows": {"yu-core", "yu-font"},
     "yu-render-macos": {
         "yu-assets",
         "yu-core",
