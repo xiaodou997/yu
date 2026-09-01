@@ -333,6 +333,32 @@ pub trait GlyphRasterizer: Send + Sync {
     fn rasterize(&self, key: GlyphRasterKey) -> Result<RasterizedGlyph, Self::Error>;
 }
 
+/// 一个能交出栅格化器的 shaper——而且交出来的那个与它共用同一张 face 表。
+///
+/// E7 的配套条款是「`FontFaceId` 由 shaper 铸、由 rasterizer 消费，两者必须
+/// 共用同一张 [`SharedFaceTable`](crate::SharedFaceTable)」。
+/// [`ShapingProvider`](yu_core::ShapingProvider) 上表达不出这一条——它只知道
+/// 排版。这个 trait 就是那条配对写进类型的样子：**拿到 shaper 的人只能从它
+/// 这里要栅格化器**，不能自己另建一个。各铸各的不 panic、不报错，表现是屏幕
+/// 上画出来的字全是别的字。
+///
+/// 它同时是「视口帧准备」那一层泛型化的条件：
+/// `yu_workspace::ViewportFrameBuilder` 要走一遍可见字形把它们栅格化进 CPU
+/// atlas，那段逻辑与平台无关，缺的只是「从 shaper 拿栅格化器」这一步。
+pub trait RasterizingShaper: yu_core::ShapingProvider {
+    type Rasterizer: GlyphRasterizer;
+
+    /// 这个 shaper 排版时用的字体请求。
+    ///
+    /// 字号是 [`GlyphRasterKey`] 的一部分，上层要用它核对「视口字号与 shaper
+    /// 字号一致」——不一致时 atlas 里的字形与排出来的度量属于两个字号，画面
+    /// 不报错只是糊。
+    fn font_request(&self) -> &crate::FontRequest;
+
+    /// 交出一个与本 shaper 共用同一张 face 表的栅格化器。
+    fn rasterizer(&self) -> Self::Rasterizer;
+}
+
 /// A small metrics cache keyed by stable face id and point size.
 #[derive(Clone, Debug, Default)]
 pub struct FontMetricsCache {

@@ -45,11 +45,11 @@ REGISTERED: dict[str, str] = {
     "crates/yu-storage-ffi/src/lib.rs:YuStorageTableResizeAccessibilityDivider": (
         "Document 逻辑坐标，AX 分隔线几何随 C ABI 平铺"
     ),
-    "platform/macos/yu-render-macos/src/lib.rs:NativeDrawCommand": (
-        "Document 逻辑坐标，绘制指令平铺给 Metal 桥"
+    "crates/yu-render/src/backend.rs:DrawCommand": (
+        "Document 逻辑坐标，绘制指令平铺给平台后端桥（macOS 的 Metal、Windows 的 D3D）"
     ),
-    "platform/macos/yu-render-macos/src/lib.rs:NativeDamageRect": (
-        "Document 逻辑坐标，scissor 由 ObjC 侧乘 backing scale 转成 Device"
+    "crates/yu-render/src/backend.rs:DamageRect": (
+        "Document 逻辑坐标，scissor 由后端侧乘 backing scale 转成 Device"
     ),
     "crates/yu-font/src/raster.rs:AtlasRect": (
         "atlas 页内的整数纹理坐标，不是视觉坐标，也不是 f32"

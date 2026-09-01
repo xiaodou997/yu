@@ -7,6 +7,11 @@
 //! window, GPU device, texture, command encoder or event loop. A future
 //! Metal/wgpu backend can consume [`AtlasPageUpload`] through
 //! [`RenderUploader`] without changing scene or editor contracts.
+//!
+//! [`backend`] 里是**后端共用的那一半**：plan 翻译成平铺绘制指令、damage
+//! 裁剪、surface 像素取整、Revision 闸门。它们同样一个原生指针都没有。
+
+mod backend;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -17,6 +22,12 @@ use yu_assets::{EmbeddedRenderPayload, EmbeddedRenderPublication};
 use yu_core::Revision;
 use yu_font::{AtlasError, GlyphAtlas, GlyphRasterKey};
 use yu_scene::{Point, Primitive, Rect, Rgba8, Scene};
+
+pub use backend::{
+    BackendError, DRAW_FILL_RECT, DRAW_GLYPH, DRAW_IMAGE, DamageRect, DrawCommand, FrameConsumer,
+    IMAGE_KIND_REGULAR, SurfaceConfig, build_damage_rects, build_draw_commands, cull_draw_commands,
+    embedded_image_kind, requires_full_clear,
+};
 
 /// A page upload containing owned alpha pixels ready for a backend texture.
 #[derive(Clone, Debug, PartialEq, Eq)]

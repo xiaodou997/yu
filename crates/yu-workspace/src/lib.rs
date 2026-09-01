@@ -31,8 +31,10 @@ use yu_scene::{
     translate_block_rect,
 };
 
+mod frame_builder;
 mod workspace;
 
+pub use frame_builder::{ViewportFrameBuildError, ViewportFrameBuilder};
 pub use workspace::{
     CloseAction, CloseResult, OpenTabResult, TabId, Workspace, WorkspaceCloseRequest,
     WorkspaceError, WorkspaceTab,
