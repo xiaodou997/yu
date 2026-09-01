@@ -58,6 +58,21 @@ final class MacosSurfaceHostView: NSView {
         super.layout()
         onGeometryChange?()
     }
+
+    /// 切换深浅色。
+    ///
+    /// **文档区不会自己跟着变**：侧栏那几个面板用的是 AppKit 的语义色，外观
+    /// 一换就自动重绘；文档区是 Rust 画的一帧，而换外观**既不推进 Revision
+    /// 也不改几何**——不主动重提交的话，`frameIsCurrent` 会判它与屏幕上那一帧
+    /// 等价而整段跳过。表现是「面板变深了，正文还是白的」，一直到你碰一下
+    /// 文档为止。
+    ///
+    /// 走 `onGeometryChange` 这条既有的路而不是另开一条：它的语义本来就是
+    /// 「平台这一侧有什么变了，重新问一次 Rust」，而外观正是那样一件事。
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onGeometryChange?()
+    }
 }
 struct TableResizePointerSession: Equatable {
     let revision: UInt64
@@ -215,8 +230,25 @@ final class MacosSurfaceHostCoordinator {
             viewportHeight: Float(geometry.viewportHeight),
             surfaceWidth: Double(geometry.surfaceWidth),
             surfaceHeight: Double(geometry.surfaceHeight),
-            scale: Double(geometry.scale)
+            scale: Double(geometry.scale),
+            appearance: currentAppearance
         )
+    }
+
+    /// 当前系统外观，送给 Rust 的那一个字节。
+    ///
+    /// **只有平台知道这件事**，而选出哪一套颜色是 `yu-workspace` 的事：进去的
+    /// 是一个事实，出来的是一整套颜色。平台这一侧不许出现任何颜色字面量，
+    /// 否则第二端要把同一套配色再挑一遍，而两端挑出来的一定会漂开。
+    ///
+    /// 取 surface view 的 `effectiveAppearance` 而不是 `NSApp` 的：窗口可以
+    /// 单独指定外观（`NSWindow.appearance`），按 app 取会在那种窗口上画错。
+    private var currentAppearance: UInt8 {
+        guard let surfaceView else { return UInt8(YU_STORAGE_APPEARANCE_LIGHT) }
+        let match = surfaceView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
+        return match == .darkAqua
+            ? UInt8(YU_STORAGE_APPEARANCE_DARK)
+            : UInt8(YU_STORAGE_APPEARANCE_LIGHT)
     }
 
     private var currentFrameGeometry: FrameGeometry? {
@@ -757,6 +789,7 @@ final class MacosSurfaceHostCoordinator {
             surfaceWidth: Double(geometry.surfaceWidth),
             surfaceHeight: Double(geometry.surfaceHeight),
             scale: Double(geometry.scale),
+            appearance: currentAppearance,
             view: rawView
         )
         isAttached = true

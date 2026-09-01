@@ -12,6 +12,8 @@
 
 use yu_editor::{EditorSelection, TableResizeCommit, TableResizeTarget};
 
+use crate::Appearance;
+
 /// 平台提供的一帧几何。
 ///
 /// 这些值只有平台知道（view bounds、滚动位置、backing scale），因此必须由
@@ -109,6 +111,9 @@ impl FrameTableResize {
 /// - `search_generation`：换了查询——同样不推进 Revision、不改几何、不改选区。
 ///   「当前命中」换一个不用单列一项：那是从 `selection` 推出来的。
 /// - `table_resize`：拖动中的列宽覆盖——既不推进 Revision 也不改变几何。
+/// - `appearance`：系统外观。切深浅**既不推进 Revision 也不改几何**，少了它
+///   的表现是「切到深色，侧栏面板变深了而文档区一动不动」——面板走 AppKit 的
+///   语义色自动跟，文档区由这一帧画，而这一帧被判成了「与屏幕上那一帧等价」。
 /// - `geometry`：字号、换行宽度、滚动、surface 尺寸与 backing scale。
 ///
 /// 这个列表就是「帧内容取决于什么」的完整定义。新增一种不推进 Revision 的
@@ -127,6 +132,7 @@ pub struct FrameKey {
     selections: Vec<EditorSelection>,
     search_generation: u64,
     table_resize: Option<FrameTableResize>,
+    appearance: Appearance,
     geometry: FrameGeometry,
 }
 
@@ -143,6 +149,7 @@ impl FrameKey {
         selections: Vec<EditorSelection>,
         search_generation: u64,
         table_resize: Option<FrameTableResize>,
+        appearance: Appearance,
         geometry: FrameGeometry,
     ) -> Self {
         Self {
@@ -151,6 +158,7 @@ impl FrameKey {
             selections,
             search_generation,
             table_resize,
+            appearance,
             geometry,
         }
     }
@@ -206,8 +214,16 @@ mod tests {
     #[test]
     fn the_same_state_captures_an_equal_key_twice() {
         let selections = Vec::new();
-        let first = FrameKey::new(7, 3, selections.clone(), 2, None, geometry());
-        let second = FrameKey::new(7, 3, selections, 2, None, geometry());
+        let first = FrameKey::new(
+            7,
+            3,
+            selections.clone(),
+            2,
+            None,
+            Appearance::Light,
+            geometry(),
+        );
+        let second = FrameKey::new(7, 3, selections, 2, None, Appearance::Light, geometry());
         assert_eq!(first, second);
     }
 
@@ -217,16 +233,16 @@ mod tests {
     /// 静默跳过——画面一动不动，而且不报错。
     #[test]
     fn each_visual_state_that_does_not_advance_the_revision_still_changes_the_key() {
-        let base = FrameKey::new(7, 3, Vec::new(), 2, None, geometry());
+        let base = FrameKey::new(7, 3, Vec::new(), 2, None, Appearance::Light, geometry());
 
         assert_ne!(
             base,
-            FrameKey::new(7, 4, Vec::new(), 2, None, geometry()),
+            FrameKey::new(7, 4, Vec::new(), 2, None, Appearance::Light, geometry()),
             "composition generation"
         );
         assert_ne!(
             base,
-            FrameKey::new(7, 3, Vec::new(), 5, None, geometry()),
+            FrameKey::new(7, 3, Vec::new(), 5, None, Appearance::Light, geometry()),
             "search generation"
         );
         assert_ne!(
@@ -237,10 +253,16 @@ mod tests {
                 Vec::new(),
                 2,
                 None,
+                Appearance::Light,
                 FrameGeometry::new(16.0, 720.0, 40.0, 480.0, 1440.0, 960.0, 2.0)
                     .expect("scrolled geometry"),
             ),
             "geometry"
+        );
+        assert_ne!(
+            base,
+            FrameKey::new(7, 3, Vec::new(), 2, None, Appearance::Dark, geometry()),
+            "外观：切深浅既不推进 Revision 也不改几何，少了它文档区不会重画"
         );
     }
 }

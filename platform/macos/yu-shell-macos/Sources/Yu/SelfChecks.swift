@@ -640,7 +640,8 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
             maxWidth: maxWidth,
             scrollY: 0.0,
             viewportHeight: 1_000.0,
-            surfaceGeneration: 0
+            surfaceGeneration: 0,
+            appearance: UInt8(YU_STORAGE_APPEARANCE_LIGHT)
         )
         // 用 Rust 自己的 point→source 映射找出待办那一行的纵坐标，再沿这一行
         // 向右找出 checkbox 的可命中点。此前是把整份 RenderPlan 取过 ABI 再从
@@ -1436,7 +1437,8 @@ func runCodeHighlightSelfCheck(path: String) -> Never {
                 maxWidth: 500.0,
                 scrollY: 0.0,
                 viewportHeight: 2_000.0,
-                surfaceGeneration: 0
+                surfaceGeneration: 0,
+            appearance: UInt8(YU_STORAGE_APPEARANCE_LIGHT)
             )
             precondition(snapshot.published, "\(name) 这一帧没有发布")
             precondition(snapshot.commandCount > 0, "\(name) 这一帧没有任何绘制指令")
@@ -1508,7 +1510,8 @@ func runCodeHighlightSelfCheck(path: String) -> Never {
                 maxWidth: 500.0,
                 scrollY: 0.0,
                 viewportHeight: 2_000.0,
-                surfaceGeneration: 0
+                surfaceGeneration: 0,
+            appearance: UInt8(YU_STORAGE_APPEARANCE_LIGHT)
             )
             precondition(snapshot.published, "打字用的这一帧没有发布")
             return snapshot.highlightedGlyphCount

@@ -94,6 +94,16 @@ enum {
     YU_STORAGE_TABLE_ALIGNMENT_RIGHT = 3,
 };
 
+/* System appearance. The platform sends one byte per frame; the colors are
+ * chosen in yu-workspace, not here — what crosses is a fact, what comes back
+ * is a whole palette. Unknown values are treated as light rather than
+ * rejected: refusing a frame over an unrecognised enum would blank the
+ * window, and a light frame is at least readable (invariant I5). */
+enum {
+    YU_STORAGE_APPEARANCE_LIGHT = 0,
+    YU_STORAGE_APPEARANCE_DARK = 1,
+};
+
 /* Clipboard payload format for yu_storage_session_copy_selection. */
 enum {
     YU_STORAGE_CLIPBOARD_TEXT = 0,
@@ -664,7 +674,8 @@ int32_t yu_storage_session_shaped_caret_scroll_request(
 int32_t yu_storage_session_macos_render_host_frame(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
-    uint64_t surface_generation, YuStorageMacosRenderHostSnapshot *snapshot);
+    uint64_t surface_generation, uint8_t appearance,
+    YuStorageMacosRenderHostSnapshot *snapshot);
 /* Geometry the platform supplies for one frame submission. Only AppKit knows
  * these values (view bounds, clip view scroll offset, backing scale); every
  * other decision stays in Rust. */
@@ -683,11 +694,12 @@ typedef struct YuStorageFrameGeometry {
  * Revision, so the generation participates in the comparison. */
 int32_t yu_storage_session_frame_is_current(
     YuStorageSession *session, const YuStorageFrameGeometry *geometry,
-    uint8_t *out_current);
+    uint8_t appearance, uint8_t *out_current);
 int32_t yu_storage_session_macos_render_host_surface_submit(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
-    double surface_width, double surface_height, double scale, void *view,
+    double surface_width, double surface_height, double scale,
+    uint8_t appearance, void *view,
     YuStorageMacosRenderHostSurfaceSnapshot *snapshot);
 int32_t yu_storage_session_macos_render_host_surface_detach(
     YuStorageSession *session);

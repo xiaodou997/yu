@@ -92,10 +92,88 @@ impl TaskCheckboxHit {
 /// one parser block. The scene crate receives only the resulting color, so
 /// Markdown semantics stay at this editor-to-scene integration boundary.
 #[must_use]
-pub fn viewport_block_background(kind: BlockKind) -> Option<Rgba8> {
+pub fn viewport_block_background(appearance: Appearance, kind: BlockKind) -> Option<Rgba8> {
     match kind {
-        BlockKind::FencedCodeBlock { .. } => Some(Rgba8::new(245, 246, 248, 255)),
+        BlockKind::FencedCodeBlock { .. } => Some(match appearance {
+            Appearance::Light => Rgba8::new(245, 246, 248, 255),
+            Appearance::Dark => Rgba8::new(34, 38, 45, 255),
+        }),
         _ => None,
+    }
+}
+
+/// 系统外观。**这是平台知道而 Rust 不知道的一件事**，与几何同类：
+/// AppKit 的 `effectiveAppearance`、Windows 的 `AppsUseLightTheme`。
+///
+/// # 为什么它必须跨 ABI 进来，而不是让平台直接送一份颜色
+///
+/// 「产品选色住在 `yu-workspace`」这条在别处已经写了三遍
+/// （[`viewport_code_role_color`]、`viewport_table_style`、
+/// `EditorDecorationStyle` 的文档）。让平台送颜色等于把主题选择挪到壳里，
+/// 于是第二端要把同一套配色再挑一遍，而两端挑出来的**一定会漂开**——那正是
+/// 「唯一实现」这条规矩要防的东西。进来的是**一个事实**（现在是深还是浅），
+/// 出去的是一整套颜色。
+///
+/// # 它必须进 [`FrameKey`]
+///
+/// 换外观**既不推进 Revision 也不改变几何**——它正是 `FrameKey` 那份文档说的
+/// 「新增一种不推进 Revision 的可视状态时必须同时加进来，否则静默跳过」。
+/// 漏掉的表现是：切到深色，面板变深了而文档区一动不动，直到你碰一下文档。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Appearance {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    /// 编辑区背景。
+    ///
+    /// 删除 TextKit fallback 之后 Rust surface 是唯一渲染路径（不变量 I5），
+    /// 背景必须由这一帧自己画出来：Metal layer 是透明的，未触及的像素会露出
+    /// 下层视图，而下层视图已经不再绘制任何东西。
+    #[must_use]
+    pub const fn background(self) -> Rgba8 {
+        match self {
+            Self::Light => Rgba8::white(),
+            // 不用纯黑：macOS 深色下的文本背景也不是纯黑，纯黑配浅字会过冲。
+            Self::Dark => Rgba8::new(30, 30, 32, 255),
+        }
+    }
+
+    /// 正文色。
+    #[must_use]
+    pub const fn text(self) -> Rgba8 {
+        match self {
+            Self::Light => Rgba8::black(),
+            Self::Dark => Rgba8::new(233, 233, 236, 255),
+        }
+    }
+
+    /// 选区、caret 与搜索高亮。
+    ///
+    /// 选区是半透明的，**两种外观下都要压得住底下的字**：浅色下 97/255 的蓝
+    /// 压在白底上，深色下同一个 alpha 压在深底上会几乎看不见，所以深色那一份
+    /// 提了亮度也提了 alpha。搜索的两种命中同理——它们要与半透明选区叠在一起
+    /// 还分得清（选区画在它们上面）。
+    #[must_use]
+    pub const fn editor_decorations(self) -> EditorDecorationStyle {
+        match self {
+            Self::Light => EditorDecorationStyle::new(
+                Rgba8::new(0, 122, 255, 97),
+                Rgba8::black(),
+                Rgba8::new(0, 122, 255, 255),
+                1.0,
+            )
+            .with_search(Rgba8::new(255, 214, 10, 120), Rgba8::new(255, 149, 0, 140)),
+            Self::Dark => EditorDecorationStyle::new(
+                Rgba8::new(10, 132, 255, 130),
+                Rgba8::new(233, 233, 236, 255),
+                Rgba8::new(10, 132, 255, 255),
+                1.0,
+            )
+            .with_search(Rgba8::new(255, 214, 10, 90), Rgba8::new(255, 159, 10, 130)),
+        }
     }
 }
 
@@ -109,12 +187,20 @@ struct TableSceneStyle {
 }
 
 #[must_use]
-const fn viewport_table_style() -> TableSceneStyle {
-    TableSceneStyle {
-        border_width: 1.0,
-        border_color: Rgba8::new(190, 195, 205, 255),
-        header_fill: Some(Rgba8::new(248, 249, 251, 255)),
-        selection_fill: Some(Rgba8::new(210, 225, 255, 255)),
+const fn viewport_table_style(appearance: Appearance) -> TableSceneStyle {
+    match appearance {
+        Appearance::Light => TableSceneStyle {
+            border_width: 1.0,
+            border_color: Rgba8::new(190, 195, 205, 255),
+            header_fill: Some(Rgba8::new(248, 249, 251, 255)),
+            selection_fill: Some(Rgba8::new(210, 225, 255, 255)),
+        },
+        Appearance::Dark => TableSceneStyle {
+            border_width: 1.0,
+            border_color: Rgba8::new(75, 81, 92, 255),
+            header_fill: Some(Rgba8::new(40, 44, 52, 255)),
+            selection_fill: Some(Rgba8::new(38, 66, 110, 255)),
+        },
     }
 }
 
@@ -127,18 +213,26 @@ const fn viewport_table_style() -> TableSceneStyle {
 /// `#0550AE`——`yu-markdown` 里写死颜色就等于把主题焊进解析层，而
 /// `yu-layout` / `yu-scene` 按不变量 E1 连角色都不该解释。
 ///
-/// # 为什么是一份写死的浅色
+/// # 两份，按外观选
 ///
-/// 整个编辑区现在就是浅色的：`macos_render_host_config` 把背景写死成
-/// `Rgba8::white()`，注释里写着「暗色模式需要平台把实际的
-/// `textBackgroundColor` 传进来」。**那条欠账在第四刀的人工验收记录里已经
-/// 登记**（D2 不通过：深色外观下面板变深而文档区仍是白底）。这里跟着它走，
-/// 不在这一刀里单独给高亮开一条深色路——那会造出「深色的代码配白色的底」。
+/// 第五刀那时这里只有一份写死的浅色，理由是「整个编辑区就是浅色的」——
+/// `macos_render_host_config` 把背景写死成 `Rgba8::white()`，单独给高亮开一条
+/// 深色路会造出「深色的代码配白色的底」。**那条理由现在不成立了**：背景跟着
+/// [`Appearance`] 走，这里也就跟着走。
 ///
-/// 底色是 `viewport_block_background` 的 `(245,246,248)`，所以每一种角色都
-/// 按那块底挑的对比度，不是按纯白。
+/// 每一份都按**自己那块底**挑对比度（浅色 `(245,246,248)`、深色
+/// `(34,38,45)`），不是按纯白或纯黑，也**不是把另一份反相**——反相出来的颜色
+/// 在深底上要么发糊要么刺眼。
 #[must_use]
-const fn viewport_code_role_color(role: TextRole) -> Option<Rgba8> {
+const fn viewport_code_role_color(appearance: Appearance, role: TextRole) -> Option<Rgba8> {
+    match appearance {
+        Appearance::Light => light_code_role_color(role),
+        Appearance::Dark => dark_code_role_color(role),
+    }
+}
+
+#[must_use]
+const fn light_code_role_color(role: TextRole) -> Option<Rgba8> {
     match role {
         // 正文色由这一帧给（`ViewportRenderConfig::color`），不覆盖。
         TextRole::Plain | TextRole::Variable => None,
@@ -156,16 +250,43 @@ const fn viewport_code_role_color(role: TextRole) -> Option<Rgba8> {
     }
 }
 
+/// 深色那一份**不是把浅色那份反相**。
+///
+/// 反相出来的颜色在深底上要么发糊（低明度的红蓝）要么刺眼（高饱和的紫）。
+/// 这一份按深色底 `(34,38,45)` 重新挑，取舍与浅色那份一样：正文色由这一帧
+/// 给（不覆盖），括号与分号不着色。
 #[must_use]
-const fn viewport_block_quote_color() -> Rgba8 {
-    Rgba8::new(176, 181, 190, 255)
+const fn dark_code_role_color(role: TextRole) -> Option<Rgba8> {
+    match role {
+        TextRole::Plain | TextRole::Variable => None,
+        TextRole::Keyword => Some(Rgba8::new(255, 123, 114, 255)),
+        TextRole::Literal => Some(Rgba8::new(165, 214, 255, 255)),
+        TextRole::Number => Some(Rgba8::new(121, 192, 255, 255)),
+        TextRole::Comment => Some(Rgba8::new(139, 148, 158, 255)),
+        TextRole::Function => Some(Rgba8::new(210, 168, 255, 255)),
+        TextRole::Type => Some(Rgba8::new(255, 166, 87, 255)),
+        TextRole::Constant => Some(Rgba8::new(121, 192, 255, 255)),
+        TextRole::Operator => Some(Rgba8::new(121, 192, 255, 255)),
+        TextRole::Punctuation => None,
+    }
+}
+
+#[must_use]
+const fn viewport_block_quote_color(appearance: Appearance) -> Rgba8 {
+    match appearance {
+        Appearance::Light => Rgba8::new(176, 181, 190, 255),
+        Appearance::Dark => Rgba8::new(90, 97, 108, 255),
+    }
 }
 
 /// 目标解析不出来的图片那个空框。
 ///
 /// 比未解码图片的浅灰再深一点：那一种是「还在加载」，这一种是「加载不了」。
-const fn viewport_broken_image_color() -> Rgba8 {
-    Rgba8::new(198, 203, 212, 255)
+const fn viewport_broken_image_color(appearance: Appearance) -> Rgba8 {
+    match appearance {
+        Appearance::Light => Rgba8::new(198, 203, 212, 255),
+        Appearance::Dark => Rgba8::new(72, 78, 88, 255),
+    }
 }
 
 /// 表格的底色、选中高亮与网格线。
@@ -907,6 +1028,9 @@ pub struct ViewportRenderConfig {
     color: Rgba8,
     table_resize: Option<TableResizeCommit>,
     editor_decorations: Option<EditorDecorationStyle>,
+    /// 系统外观。见 [`Appearance`]——**它必须同时进 [`FrameKey`]**，
+    /// 否则换外观时画面静默不动。
+    appearance: Appearance,
 }
 
 impl ViewportRenderConfig {
@@ -926,7 +1050,21 @@ impl ViewportRenderConfig {
             color,
             table_resize: None,
             editor_decorations: None,
+            appearance: Appearance::Light,
         }
+    }
+
+    /// 换一份系统外观。默认是浅色——**默认值不能是「跟随系统」**，那要一个
+    /// Rust 拿不到的事实；平台不说的时候只能是一个确定的值。
+    #[must_use]
+    pub const fn with_appearance(mut self, appearance: Appearance) -> Self {
+        self.appearance = appearance;
+        self
+    }
+
+    #[must_use]
+    pub const fn appearance(self) -> Appearance {
+        self.appearance
     }
 
     /// Returns a copy that carries one caller-owned, session-only table
@@ -1564,6 +1702,8 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: Sh
         &[],
         table_resize,
         None,
+        // 这些兼容入口同样不带外观配置，与上面那行白底是同一句话。
+        Appearance::Light,
     )
 }
 
@@ -1588,6 +1728,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     embedded_publications: &[EmbeddedRenderPublication],
     table_resize: Option<TableResizeCommit>,
     editor_decorations: Option<EditorDecorationStyle>,
+    appearance: Appearance,
 ) -> Result<ViewportSceneFrame, ViewportSceneError> {
     let source = document.snapshot();
     let definitions = document.markdown().reference_definitions().clone();
@@ -1712,7 +1853,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 &mut block_ornaments,
                 table,
                 origin,
-                viewport_table_style(),
+                viewport_table_style(appearance),
                 selection,
             )?;
         }
@@ -1724,7 +1865,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 block_ornaments.push(OrnamentPrimitive::new(
                     quote.source(),
                     translate_block_rect(bounds, origin)?,
-                    viewport_block_quote_color(),
+                    viewport_block_quote_color(appearance),
                     OrnamentRole::Bar,
                 ));
             }
@@ -1769,7 +1910,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 block_ornaments.push(OrnamentPrimitive::new(
                     image.source(),
                     translate_block_rect(placement.bounds(), origin)?,
-                    viewport_broken_image_color(),
+                    viewport_broken_image_color(appearance),
                     OrnamentRole::Border,
                 ));
                 continue;
@@ -1797,7 +1938,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                     );
                     // 「这个字什么颜色」到这里为止：场景层拿到的是 RGBA，
                     // 不是 `TextRole`。
-                    match viewport_code_role_color(glyph.role()) {
+                    match viewport_code_role_color(appearance, glyph.role()) {
                         Some(color) => scene_glyph.with_color(color),
                         None => scene_glyph,
                     }
@@ -1811,7 +1952,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         .enumerate()
         .map(|(offset, block)| {
             ViewportBlockContent::new(revision, block.source(), &glyphs[offset])
-                .with_fill(viewport_block_background(block.kind()))
+                .with_fill(viewport_block_background(appearance, block.kind()))
                 .with_ornaments(&ornaments[offset])
                 .with_images(&images[offset])
                 .with_overlays(&overlays[offset])
@@ -1958,6 +2099,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded<
         embedded_publications,
         config.table_resize(),
         config.editor_decorations(),
+        config.appearance(),
     )?;
     if scene.revision() != document.revision() {
         return Err(ViewportFrameError::Stale {
@@ -2137,7 +2279,7 @@ mod tests {
             TextRange::new(ByteOffset::ZERO, ByteOffset::new(source.len() as u64))
                 .expect("source range")
         );
-        assert_eq!(quote.color(), viewport_block_quote_color());
+        assert_eq!(quote.color(), viewport_block_quote_color(Appearance::Light));
         assert_eq!(
             quote.bounds().height(),
             frame.scene().input().blocks()[0].height()
@@ -3151,6 +3293,126 @@ mod tests {
     }
 
     /// 一份文档排出来的全部字形颜色，按场景顺序。
+    /// **深色下文档区真的变深，而且不是只换了背景。**
+    ///
+    /// 判据取的是**场景层实际发出去的那一帧**，不是配置里存了什么枚举——
+    /// 存进去而没有人读，两者在任何「配置断言」下都一样。
+    ///
+    /// 三件事一起断，少任何一件都会让一个真实的缺陷溜过去：
+    ///
+    /// 1. **背景真的换了**：只改正文色的话画面是「白底浅灰字」，几乎看不见；
+    /// 2. **正文色真的换了**：只改背景的话是「深底黑字」，同样看不见；
+    /// 3. **代码高亮跟着换**：那份调色板以前写死成浅色，理由是「整个编辑区
+    ///    就是浅色的」。那条理由现在不成立了，漏掉它的表现是深底上一片按白底
+    ///    挑的深红深蓝。
+    #[test]
+    fn dark_appearance_repaints_the_document_area_not_just_the_background() {
+        let body = "fn main() {\n    let x: u32 = 1;\n}\n";
+        let source = format!("\u{60}\u{60}\u{60}rust\n{body}\u{60}\u{60}\u{60}\n");
+
+        let light = scene_appearance_probe(&source, Appearance::Light);
+        let dark = scene_appearance_probe(&source, Appearance::Dark);
+
+        assert_ne!(light.background, dark.background, "背景必须跟着外观换");
+        assert_ne!(light.text, dark.text, "正文色必须跟着外观换");
+        // 深色的背景要真的比浅色暗，而不只是「不一样」。
+        assert!(
+            luminance(dark.background) < luminance(light.background),
+            "深色的背景 {:?} 不比浅色的 {:?} 暗",
+            dark.background,
+            light.background
+        );
+        assert!(
+            luminance(dark.text) > luminance(dark.background),
+            "深色下正文比背景还暗，读不了"
+        );
+        assert_ne!(
+            light.code_colors, dark.code_colors,
+            "代码高亮那份调色板必须跟着外观换——它以前写死成浅色"
+        );
+        assert!(
+            dark.code_colors.len() > 1,
+            "深色下代码块要么没着色要么只剩一种颜色"
+        );
+    }
+
+    struct AppearanceProbe {
+        background: Rgba8,
+        text: Rgba8,
+        code_colors: std::collections::BTreeSet<[u8; 4]>,
+    }
+
+    /// 一次装配之后从**场景**里读回背景、正文色与代码块里的着色。
+    fn scene_appearance_probe(source: &str, appearance: Appearance) -> AppearanceProbe {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 200.0);
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(400.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 400.0, 200.0).expect("scene viewport"),
+            appearance.text(),
+        )
+        .with_background(appearance.background())
+        .with_appearance(appearance);
+        let frame = assemble_viewport_render_frame(
+            &mut document,
+            config,
+            &shaper,
+            &atlas,
+            &mut RenderPlanBuilder::new(),
+        )
+        .expect("frame");
+
+        // 背景是这一帧铺的第一块矩形——`assemble` 一进门就 `fill_rect`。
+        let background = frame
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::FillRect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("这一帧必须自己画背景（不变量 I5）");
+        let glyph_colors: Vec<Rgba8> = frame
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Glyph(glyph) => Some(glyph.color()),
+                _ => None,
+            })
+            .collect();
+        let text = appearance.text();
+        let code_colors = glyph_colors
+            .iter()
+            .filter(|color| **color != text)
+            .map(|color| [color.red(), color.green(), color.blue(), color.alpha()])
+            .collect();
+        AppearanceProbe {
+            background,
+            text,
+            code_colors,
+        }
+    }
+
+    fn luminance(color: Rgba8) -> f32 {
+        0.2126 * f32::from(color.red())
+            + 0.7152 * f32::from(color.green())
+            + 0.0722 * f32::from(color.blue())
+    }
+
     fn scene_glyph_colors(source: &str) -> Vec<Rgba8> {
         let font_size = 14.0;
         let shaper = shaper(font_size);
