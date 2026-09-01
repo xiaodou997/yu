@@ -7727,6 +7727,38 @@ mod tests {
     /// 变成了发布，失败模式也随之变了——发布错了不会报错，只会让整份文档按
     /// 错误的行高与换行宽度排版。因此这里直接断言发布后的配置内容。
     ///
+    /// 产品链路上，一份 CoreText 排不出来的文档必须仍然能出几何。
+    ///
+    /// 这一条守的是不变量 I5 在 shaping 上的落法。**它的判据必须在 FFI 这一层**
+    /// ——`ShapingProvider` 的 `Err` 以前一路传成 `LayoutError::Shaping` →
+    /// `EditorDocumentError::Layout` → 这里的 `storage_status`，于是平台侧收到
+    /// 一个错误码，那一屏什么都不画。`yu-layout` 自己的用例证明得了「排不出来
+    /// 的簇变成替代字形」，证明不了「这条错误码不再出现」。
+    ///
+    /// 语料是希伯来文，S7 第七刀 spike 实测 CoreText 连单独排一个字符都拒。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_caret_geometry_survives_a_script_core_text_refuses() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-unshapable-{id}.md"));
+        fs::write(&path, "\u{05e9}\u{05dc}\u{05d5}\u{05dd}\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        // SAFETY: `raw` is a live session handle owned by this test.
+        let session = unsafe { raw.as_mut() }.expect("session");
+
+        let caret = macos_shaped_caret(session, 0, None, 0, 0, 14.0, 500.0)
+            .expect("排不出来的脚本不该让 FFI 返回错误码");
+        assert!(caret.caret_height > 0.0, "caret 必须有高度，否则等于没画");
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     /// 「已对齐就跳过」不是优化：`set_viewport_config` 会重建 `ViewportLayout`
     /// 并丢掉缓存的 block 高度，那是 J2 定位可见范围的依据。
     #[cfg(target_os = "macos")]

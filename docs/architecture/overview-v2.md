@@ -3262,6 +3262,7 @@ table_resize / geometry）没有一个是 macOS 概念；`MacosFrameGeometry`（
 | --- | --- | --- |
 | **a** | 让 C ABI 在非 macOS 上不再撒谎 | 编译产物的符号表 |
 | ~~**b**~~ **已完成** | 写下 shaping 契约；删掉零消费者的 `TextShaper`；`Utf16Map` 提到 `yu-font`；把「shaper 与 rasterizer 共用 face 表」写进类型 | 一套 conformance 测试，CoreTextShaper 与全部 mock 都跑 |
+| ~~**b2**~~ **已完成**（**表外插的一刀**，刀 b 的 spike 查出来的） | 排不出来的簇画替代字形，不让整个块失败 | 判据落在洞出现的那一层：`yu-storage-ffi` 的那个错误码不再出现 |
 | **c** | 把中立逻辑从平台层提上来（`MetalFrameConsumer` / `requires_full_clear` / `build_native_*` / `MetalSurfaceConfig` → `yu-render`；`CoreTextViewportFrameBuilder` → 泛型 → `yu-workspace`；`MacosFrameKey` → `FrameKey`；8 个 FFI 去前缀） | 纯重构：14 个 self-check 不变、**真实窗口截图差分逐字节为 0** |
 | **d** | `yu-font-windows`：DirectWrite 的 `ShapingProvider` + `GlyphRasterizer` | 刀 b 那套 conformance 在 Windows CI 上跑。**不需要窗口、GPU、壳** |
 | **e** | `yu-render-windows`：D3D 后端 | headless 的「`RenderPlan` → 平铺指令」比对（刀 c 提上来之后两端共用，是真差分不是自证）+ 一个真实窗口 smoke |
@@ -3580,6 +3581,95 @@ impl，多出来的 39 行几乎全是新用例与那几段「为什么」。
    `utf16_byte_offset`（局部字符串上）。三者算的是同一件事，形状不同。
    合并要跨 `yu-font` / `yu-text` 两条依赖边（`yu-font` 不许依赖 `yu-text`），
    **不在这一刀的范围里**，记下来。
+
+##### 刀 b2：排不出来的簇画替代字形 —— 已完成
+
+**这一刀不在原来的六刀表里。** 它是刀 b 的 spike 查出来的：`ShapingProvider`
+的 `Err` 在产品链路上没有降级，一路传成 `LayoutError::Shaping` →
+`EditorDocumentError::Layout` → `assemble_viewport_scene_*` 的 `?`。于是
+**Yu 打不开含希伯来文、阿拉伯文或天城文的文档**——不是画错，是那一整屏发不
+出来。与 I5「永不白屏、永远可编辑」直接冲突。
+
+插在刀 c 之前而不是留到刀 d，有一条不是「它是缺陷」的理由：**DirectWrite 的
+拒绝集合和 CoreText 不一样**（CoreText 拒 RTL，DirectWrite 不拒但会给一簇多形，
+而契约现在要求那种情况报错）。降级路在第二端落地之前建好，刀 d 直接用；
+不建，刀 d 会在 Windows 上重演同一个洞，而那时候排查成本高得多。
+
+**做之前先做了一次实验，结论改了设计。** 原本的方案是「排不出来就逐簇重试」。
+拿真 CoreText 实测：
+
+| 输入 | 整段 | 逐 char |
+| --- | --- | --- |
+| `שלום` | Err（Rtl） | 四个字符**单独也全拒** |
+| `مرحبا` | Err（Rtl） | 五个字符**单独也全拒** |
+| `हिन्दी` | Err（非单调） | 辅音 `ह`/`न`/`द` 单独可以，元音符号 `ि`/`ी` 与 virama 单独**不行** |
+| `aאb` | Err（Rtl） | `a` ✓、`א` ✗、`b` ✓ |
+| `U+FFFD` | **Ok，一个字形** | — |
+
+于是：**逐簇重试救不回这些脚本本身，但救得回同一个 run 里排得出来的那些簇。**
+降级因此是两级的——整段失败 → 逐簇重试 → 仍然失败的才换替代字形。少了第一级，
+一份中文文档里夹一个希伯来词会让**整段**变成豆腐块。
+
+**为什么不是「退回 `MonospaceMetrics` 那条路」**：查了代码，那条路的
+`measure` 给每个簇 `glyph: None`——它只量宽度不产字形。退到那里等于画一片
+空白，换一种方式违反同一条不变量。
+
+**降级住在 `yu-layout::measure_shaped`，不在后端里。** 契约（E7）说的是
+「后端做不到就报错」，不变量 I5 说的是「永不白屏」——两条合起来的意思就是
+**决定排不出来的东西画成什么，是布局层的事，不是后端的事**。后端一个字都
+没改。
+
+**契约违约不走这条路。** 后端说「排好了」却给出不铺满、有空隙、越界的字形是
+bug 不是「排不了」，那条继续返回 `Err`。两者混在一起会让一个坏后端悄悄退化成
+一屏替代字形——那正是这个项目最危险的失败模式。变异 N4 压的就是这一条。
+
+**降级必须看得见**：`BlockLayout::substituted_clusters()` 报出替换了几个簇。
+没有这个数，「一整屏豆腐块」与「一整屏正常文字」在任何断言下都一样。
+
+**判据分三层，每一层证明的东西不同：**
+
+| 层 | 用例 | 它证明什么 |
+| --- | --- | --- |
+| `yu-layout` | 三条（合成的拒绝后端） | 替换的粒度对不对、计数准不准、连替代字形都排不出来时仍然报错 |
+| `yu-font-macos` | `scripts_core_text_refuses_still_produce_glyphs` | **真的 CoreText 真的拒了**（先断 `shape` 返回 `Err`，否则这条用例什么都没证明），而布局仍产出与簇数一样多的字形，**且每一个都栅格化得出来** |
+| `yu-storage-ffi` | `ffi_caret_geometry_survives_a_script_core_text_refuses` | **那个错误码不再出现**——平台侧收到的是几何不是失败 |
+
+第三层是必须的：`yu-layout` 自己的用例证明得了「簇变成了替代字形」，证明不了
+「产品链路上那条 `?` 不再触发」。**判据要落在洞出现的那一层。**
+
+**五个变异全部变红**，其中 N1（把降级去掉，即修之前的行为）在三个 crate 上
+各红一次：`yu-layout` 的三条、`yu-font-macos` 那条、`yu-storage-ffi` 那条。
+
+| 变异 | 谁变红 |
+| --- | --- |
+| N1 排不出来就报错（修之前的行为） | 三个 crate 的五条 |
+| N2 不逐簇重试，整段全换 | `a`/`b` 的字形 id 变成 `0xfffd` |
+| N3 降级不计数 | 「降级看得见」那条 |
+| N4 契约违约也当成「排不出来」吞掉 | `glyph_ranges_must_tile_the_run` |
+| N5 替代字形排不出来时伪造一个 id | `a_backend_that_refuses_everything_is_still_an_error` |
+
+**没有加 headless self-check。** 理由是判据已经落在洞出现的那一层
+（`yu-storage-ffi`），而 Swift 壳在这条路上只是搬运——`StorageBridge` 转发一个
+几何结构体，与文字是什么脚本无关。**加一条只会把同一件事再穿一次管子。**
+真实窗口那一头由人工验收补（见 manual-acceptance 的记录）。
+
+**这不等于支持了 RTL 与印度系文字**，画出来的是一串替代字形。真正支持要让
+契约允许「run 内字形按视觉序、source 逆序」，那会牵动 tiling 门、caret 映射
+与命中测试。**登记在案，触发条件是有人真的要用这些文字写文档。**
+
+**真实窗口验收拿到了这一刀最硬的那个判据**（详见 manual-acceptance 的记录）：
+同一份含希伯来文的文档，**旧版正文区 0 个墨色像素**——整个文档区纯白，连三行
+纯中文的对照组都没画出来，因为失败的是**整帧**而不是那一个块；新版 41,096 个，
+七行全在。而 `混排：a א b` 那一行画成 `a � b`——**只有中间那个字符变成替代
+字形**，这是第二级降级（逐簇重试）在屏幕上看得见的产出。正常语料
+（`render-code.md` / `sample.md`）文档区跨刀 0 像素差。
+
+**代价**：Swift 产品代码一行没动。`yu-layout/src/block.rs` 的 `measure_shaped`
+拆成四个函数（`replacement_glyph` / `measured_from_shaped` / `visual_range` /
+`substitute_run` + 主循环），`block.rs` **+392 −86**（含三条新用例与那个故意
+拒绝的 mock），`yu-font-macos` +69、`yu-storage-ffi` +32，两处都是纯用例。
+运行时代价只在失败路径上：一次额外的替代字形 shaping + 每簇一次重试，
+结果进 `LayoutCache`，每个块每次失效才付一遍。
 
 ---
 

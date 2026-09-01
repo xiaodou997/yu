@@ -51,8 +51,9 @@ use std::ops::Range;
 use unicode_bidi::{BidiInfo, Level};
 use unicode_segmentation::UnicodeSegmentation;
 use yu_core::{
-    ByteOffset, CaretAffinity, ClusterMetrics, FontFaceId, GlyphId, LineStyleId, ShapingProvider,
-    Size, StyleId, TextAttrs, TextRange, VisualOffset, VisualRange, WidgetId, WidgetSide,
+    ByteOffset, CaretAffinity, ClusterMetrics, FontFaceId, GlyphId, LineStyleId, ShapedText,
+    ShapingProvider, Size, StyleId, TextAttrs, TextRange, VisualOffset, VisualRange, WidgetId,
+    WidgetSide,
 };
 
 use crate::{BaseDirection, LayoutConfig, LayoutError, LayoutPoint, LayoutRect};
@@ -764,6 +765,8 @@ pub struct BlockLayout {
     glyphs: Vec<GlyphBox>,
     /// 行级样式按视觉区间排好的解释结果，行首落在哪一段就用哪一段。
     line_attrs: Vec<(VisualRange, LineStyleId, LineAttrs)>,
+    /// 后端排不出来、换成了替代字形的簇数。见 [`BlockLayout::substituted_clusters`]。
+    substituted: u32,
 }
 
 /// 重排时行内待摆放的一样东西。
@@ -912,8 +915,8 @@ impl BlockLayout {
         S: ShapingProvider,
     {
         let (visual_len, bidi) = Self::prepare(input, config)?;
-        let measured = measure_shaped(input, styles, shaper, &bidi)?;
-        Self::assemble(
+        let (measured, substituted) = measure_shaped(input, styles, shaper, &bidi)?;
+        let mut layout = Self::assemble(
             input,
             config,
             widgets,
@@ -921,7 +924,9 @@ impl BlockLayout {
             &bidi,
             visual_len,
             measured,
-        )
+        )?;
+        layout.substituted = substituted;
+        Ok(layout)
     }
 
     fn prepare<'a>(
@@ -966,6 +971,7 @@ impl BlockLayout {
             widgets: Vec::new(),
             glyphs: Vec::new(),
             line_attrs,
+            substituted: 0,
         };
         let mut cursor = layout.start_line(0, VisualOffset::ZERO, 0, 0);
         let mut last_was_break = false;
@@ -1139,6 +1145,17 @@ impl BlockLayout {
     #[must_use]
     pub fn glyphs(&self) -> &[GlyphBox] {
         &self.glyphs
+    }
+
+    /// 这个块里有多少个簇是后端排不出来、换成了替代字形的。
+    ///
+    /// **降级必须看得见。** 「排不出来就画替代字形」如果不留痕迹，一整屏
+    /// 豆腐块与一整屏正常文字在任何断言下都一样——那正是这个项目最危险的
+    /// 失败模式。判据落在这个数上：正常语料必须是 0，降级语料必须正好等于
+    /// 排不出来的簇数。
+    #[must_use]
+    pub const fn substituted_clusters(&self) -> u32 {
+        self.substituted
     }
 
     /// 还画着 placeholder 的 widget。
@@ -1683,13 +1700,243 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
 ///
 /// run 的文本交给 shaper 时带的是一个**零基局部空间**的 range，返回的字形
 /// range 按这个空间读。布局层没有源码坐标，也不该有（不变量 D4）。
+/// 排不出来的簇画什么。
+///
+/// **不是「重试」**：S7 第七刀 b 之后那一刀实测过，单独排一个希伯来字符、
+/// 一个阿拉伯字符、一个天城文元音符号，CoreText 照样拒——逐簇重试救不回
+/// 这些脚本本身。但它**救得回同一个 run 里排得出来的那些簇**：`aאb` 三个
+/// 字符里 `a` 与 `b` 单独都排得出来。所以降级是两级的：整段失败 → 逐簇
+/// 重试 → 仍然失败的那些簇换成替代字形。
+const REPLACEMENT_CLUSTER: &str = "\u{fffd}";
+
+/// 替代字形的身份与推进量。
+#[derive(Clone, Copy)]
+struct Replacement {
+    face: FontFaceId,
+    glyph: GlyphId,
+    advance: f32,
+}
+
+fn replacement_glyph<S: ShapingProvider>(
+    shaper: &S,
+    attrs: TextAttrs,
+) -> Result<Replacement, LayoutError> {
+    let local = local_range(REPLACEMENT_CLUSTER.len())?;
+    let shaped = shaper
+        .shape_scaled(
+            REPLACEMENT_CLUSTER,
+            local,
+            attrs.style(),
+            attrs.size_scale(),
+        )
+        .map_err(|error| LayoutError::Shaping(error.to_string()))?;
+    let glyph = shaped
+        .runs()
+        .iter()
+        .flat_map(|run| run.glyphs().iter().map(|glyph| (run.face(), glyph)))
+        .next()
+        .ok_or_else(|| LayoutError::Shaping("replacement glyph shaped to nothing".into()))?;
+    let advance = shaped.advance();
+    if !advance.is_finite() || advance < 0.0 {
+        return Err(LayoutError::InvalidMetrics(advance.to_bits()));
+    }
+    Ok(Replacement {
+        face: glyph.0,
+        glyph: glyph.1.id(),
+        advance,
+    })
+}
+
+/// 把一段排好的文本变成 `Measured`。
+///
+/// `piece` 是 run 里的一段（整段，或降级时的一个簇），`piece_start` 是它在
+/// run 里的字节起点，`run_start` 是 run 在视觉文本里的起点。三者相加才是
+/// 视觉偏移与 bidi 等级的下标。
+///
+/// 契约的校验都在这里，两条路共用一份——共用代码路径的差分是自证的。
+#[allow(clippy::too_many_arguments)]
+fn measured_from_shaped(
+    shaped: &ShapedText,
+    piece: &str,
+    piece_start: usize,
+    run_start: usize,
+    style: StyleId,
+    attrs: TextAttrs,
+    bidi: &BidiInfo<'_>,
+    out: &mut Vec<Measured>,
+) -> Result<(), LayoutError> {
+    let local = local_range(piece.len())?;
+    if shaped.source() != local {
+        return Err(LayoutError::Shaping(
+            "shaper returned a range different from the requested run".into(),
+        ));
+    }
+    let base = run_start + piece_start;
+    let mut cursor = 0_usize;
+    for glyph_run in shaped.runs() {
+        for glyph in glyph_run.glyphs() {
+            let from = usize::try_from(glyph.source().start().get())
+                .map_err(|_| LayoutError::OffsetOverflow)?;
+            let to = usize::try_from(glyph.source().end().get())
+                .map_err(|_| LayoutError::OffsetOverflow)?;
+            // 字形必须按逻辑顺序、无缝、不越界地铺满这个 run。缺一段
+            // 就是丢字，重一段就是重画——两样都不 panic。
+            if from != cursor || to > piece.len() {
+                return Err(LayoutError::Shaping(
+                    "glyph ranges must tile the run in logical order".into(),
+                ));
+            }
+            // 空区间**过得了**上面那道门（`from != cursor` 对它恒不成立），
+            // 而它是「一簇多形」被反转成一形一区间时最自然的填法：多出来
+            // 的字形贴在簇尾拿一个零长度区间。放进来的后果不是画错，是
+            // 下面 `bidi.levels[base + from]` 在 run 末尾**越界 panic**
+            // （S7 第七刀 spike 实测），落在中间则凭空多算一段 advance。
+            // 契约里这是 C4，见 `yu_core::ShapingProvider`。
+            if to == from {
+                return Err(LayoutError::Shaping(
+                    "glyph source ranges must not be empty".into(),
+                ));
+            }
+            if !piece.is_char_boundary(from) || !piece.is_char_boundary(to) {
+                return Err(LayoutError::RunNotOnCharBoundary);
+            }
+            cursor = to;
+            let cluster_text = &piece[from..to];
+            let mandatory_break =
+                !cluster_text.is_empty() && cluster_text.chars().all(is_mandatory_break_char);
+            let advance = if mandatory_break {
+                0.0
+            } else {
+                glyph.advance()
+            };
+            if !advance.is_finite() || advance < 0.0 {
+                return Err(LayoutError::InvalidMetrics(advance.to_bits()));
+            }
+            if !glyph.x_offset().is_finite() || !glyph.y_offset().is_finite() {
+                return Err(LayoutError::Shaping("glyph offsets must be finite".into()));
+            }
+            out.push(Measured {
+                visual: visual_range(base + from, base + to)?,
+                style,
+                advance,
+                // 强制换行符不进字形流：它没有可画的形状，画出来是一个
+                // 豆腐块。它仍然是一个簇，仍然占视觉字节。
+                glyph: (!mandatory_break).then_some(GlyphRecord {
+                    face: glyph_run.face(),
+                    glyph: glyph.id(),
+                    x_offset: glyph.x_offset(),
+                    y_offset: glyph.y_offset(),
+                    size_scale: attrs.size_scale(),
+                }),
+                mandatory_break,
+                space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
+                level: bidi.levels[base + from].number(),
+            });
+        }
+    }
+    if cursor != piece.len() {
+        return Err(LayoutError::Shaping(
+            "glyph ranges must tile the run in logical order".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn visual_range(from: usize, to: usize) -> Result<VisualRange, LayoutError> {
+    let start = VisualOffset::try_from(from).map_err(|_| LayoutError::OffsetOverflow)?;
+    let end = VisualOffset::try_from(to).map_err(|_| LayoutError::OffsetOverflow)?;
+    VisualRange::new(start, end).ok_or(LayoutError::OffsetOverflow)
+}
+
+/// 整段排不出来时逐簇重来，返回换成替代字形的簇数。
+///
+/// **单独排一个簇的结果与整段排的结果可以不同**（连字与上下文成形都没了）。
+/// 这只在整段已经失败之后才发生，所以正常路径上量不出差别；但它是这条
+/// 降级路的一笔代价，写在这里免得以后被当成 bug。
+fn substitute_run<S: ShapingProvider>(
+    shaper: &S,
+    text: &str,
+    run_start: usize,
+    style: StyleId,
+    attrs: TextAttrs,
+    bidi: &BidiInfo<'_>,
+    out: &mut Vec<Measured>,
+) -> Result<u32, LayoutError> {
+    let replacement = replacement_glyph(shaper, attrs)?;
+    let mut substituted = 0_u32;
+    for (local, cluster_text) in text.grapheme_indices(true) {
+        let mut scratch = Vec::new();
+        let shaped = local_range(cluster_text.len()).ok().and_then(|range| {
+            shaper
+                .shape_scaled(cluster_text, range, attrs.style(), attrs.size_scale())
+                .ok()
+        });
+        let recovered = shaped.is_some_and(|shaped| {
+            measured_from_shaped(
+                &shaped,
+                cluster_text,
+                local,
+                run_start,
+                style,
+                attrs,
+                bidi,
+                &mut scratch,
+            )
+            .is_ok()
+        });
+        if recovered {
+            out.append(&mut scratch);
+            continue;
+        }
+        let base = run_start + local;
+        let mandatory_break = cluster_text.chars().all(is_mandatory_break_char);
+        // 强制换行本来就不进字形流（`glyph: None`），它没有被「换成替代字形」
+        // ——把它算进去会让这个判据虚高，而这个数正是「降级看得见」那条断言
+        // 依据的东西。
+        if !mandatory_break {
+            substituted = substituted.saturating_add(1);
+        }
+        out.push(Measured {
+            visual: visual_range(base, base + cluster_text.len())?,
+            style,
+            advance: if mandatory_break {
+                0.0
+            } else {
+                replacement.advance
+            },
+            glyph: (!mandatory_break).then_some(GlyphRecord {
+                face: replacement.face,
+                glyph: replacement.glyph,
+                x_offset: 0.0,
+                y_offset: 0.0,
+                size_scale: attrs.size_scale(),
+            }),
+            mandatory_break,
+            space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
+            level: bidi.levels[base].number(),
+        });
+    }
+    Ok(substituted)
+}
+
+/// 返回度量结果与「换成了替代字形的簇数」。
+///
+/// **shaper 返回 `Err` 不再往上传。** 契约（`yu_core::ShapingProvider`）允许
+/// 后端说「我排不了」，而不变量 I5 要求「永不白屏、永远可编辑」——两条合起来
+/// 的意思就是：**决定排不出来的东西画成什么，是布局层的事，不是后端的事。**
+/// 在这之前 `Err` 一路传成 `?`，一份含希伯来文的文档整屏发不出来。
+///
+/// **契约违约仍然是错误。** 后端说「排好了」却给出不铺满、有空隙、越界的
+/// 字形，那是 bug 不是「排不了」——那条继续返回 `Err`，由 conformance 套件
+/// 与这里一起压着。两者混在一起会让一个坏后端悄悄退化成一屏替代字形。
 fn measure_shaped<T: StyleTable, S: ShapingProvider>(
     input: LayoutInput<'_>,
     styles: &T,
     shaper: &S,
     bidi: &BidiInfo<'_>,
-) -> Result<Vec<Measured>, LayoutError> {
+) -> Result<(Vec<Measured>, u32), LayoutError> {
     let mut measured = Vec::new();
+    let mut substituted = 0_u32;
     for run in input.runs() {
         let attrs = styles
             .attrs(run.style())
@@ -1706,89 +1953,31 @@ fn measure_shaped<T: StyleTable, S: ShapingProvider>(
             continue;
         }
         let local = local_range(text.len())?;
-        let shaped = shaper
-            .shape_scaled(text, local, attrs.style(), attrs.size_scale())
-            .map_err(|error| LayoutError::Shaping(error.to_string()))?;
-        if shaped.source() != local {
-            return Err(LayoutError::Shaping(
-                "shaper returned a range different from the requested run".into(),
-            ));
-        }
-        let mut cursor = 0_usize;
-        for glyph_run in shaped.runs() {
-            for glyph in glyph_run.glyphs() {
-                let from = usize::try_from(glyph.source().start().get())
-                    .map_err(|_| LayoutError::OffsetOverflow)?;
-                let to = usize::try_from(glyph.source().end().get())
-                    .map_err(|_| LayoutError::OffsetOverflow)?;
-                // 字形必须按逻辑顺序、无缝、不越界地铺满这个 run。缺一段
-                // 就是丢字，重一段就是重画——两样都不 panic。
-                if from != cursor || to > text.len() {
-                    return Err(LayoutError::Shaping(
-                        "glyph ranges must tile the run in logical order".into(),
-                    ));
-                }
-                // 空区间**过得了**上面那道门（`from != cursor` 对它恒不成立），
-                // 而它是「一簇多形」被反转成一形一区间时最自然的填法：多出来
-                // 的字形贴在簇尾拿一个零长度区间。放进来的后果不是画错，是
-                // 下面 `bidi.levels[start + from]` 在 run 末尾**越界 panic**
-                // （S7 第七刀 spike 实测），落在中间则凭空多算一段 advance。
-                // 契约里这是 C4，见 `yu_core::ShapingProvider`。
-                if to == from {
-                    return Err(LayoutError::Shaping(
-                        "glyph source ranges must not be empty".into(),
-                    ));
-                }
-                if !text.is_char_boundary(from) || !text.is_char_boundary(to) {
-                    return Err(LayoutError::RunNotOnCharBoundary);
-                }
-                cursor = to;
-                let cluster_text = &text[from..to];
-                let mandatory_break =
-                    !cluster_text.is_empty() && cluster_text.chars().all(is_mandatory_break_char);
-                let advance = if mandatory_break {
-                    0.0
-                } else {
-                    glyph.advance()
-                };
-                if !advance.is_finite() || advance < 0.0 {
-                    return Err(LayoutError::InvalidMetrics(advance.to_bits()));
-                }
-                if !glyph.x_offset().is_finite() || !glyph.y_offset().is_finite() {
-                    return Err(LayoutError::Shaping("glyph offsets must be finite".into()));
-                }
-                let visual_start = VisualOffset::try_from(start + from)
-                    .map_err(|_| LayoutError::OffsetOverflow)?;
-                let visual_end =
-                    VisualOffset::try_from(start + to).map_err(|_| LayoutError::OffsetOverflow)?;
-                let visual = VisualRange::new(visual_start, visual_end)
-                    .ok_or(LayoutError::OffsetOverflow)?;
-                measured.push(Measured {
-                    visual,
-                    style: run.style(),
-                    advance,
-                    // 强制换行符不进字形流：它没有可画的形状，画出来是一个
-                    // 豆腐块。它仍然是一个簇，仍然占视觉字节。
-                    glyph: (!mandatory_break).then_some(GlyphRecord {
-                        face: glyph_run.face(),
-                        glyph: glyph.id(),
-                        x_offset: glyph.x_offset(),
-                        y_offset: glyph.y_offset(),
-                        size_scale: attrs.size_scale(),
-                    }),
-                    mandatory_break,
-                    space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
-                    level: bidi.levels[start + from].number(),
-                });
+        match shaper.shape_scaled(text, local, attrs.style(), attrs.size_scale()) {
+            Ok(shaped) => measured_from_shaped(
+                &shaped,
+                text,
+                0,
+                start,
+                run.style(),
+                attrs,
+                bidi,
+                &mut measured,
+            )?,
+            Err(_) => {
+                substituted = substituted.saturating_add(substitute_run(
+                    shaper,
+                    text,
+                    start,
+                    run.style(),
+                    attrs,
+                    bidi,
+                    &mut measured,
+                )?);
             }
         }
-        if cursor != text.len() {
-            return Err(LayoutError::Shaping(
-                "glyph ranges must tile the run in logical order".into(),
-            ));
-        }
     }
-    Ok(measured)
+    Ok((measured, substituted))
 }
 
 /// shaping 的零基局部空间。见 [`BlockLayout::build_shaped`]。
@@ -2256,6 +2445,131 @@ mod tests {
     fn the_test_shaper_conforms_to_the_shaping_contract() {
         let violations = yu_core::shaping_conformance::audit(&TestShaper::new(1.0));
         assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// 一个「凡是含某个字符的文本就报错」的后端，用来压降级那条路。
+    /// 其余文本一 `char` 一形，字形 id 就是那个 `char` 的码位。
+    struct Refusing(char);
+
+    impl ShapingProvider for Refusing {
+        type Error = String;
+
+        fn shape(
+            &self,
+            text: &str,
+            source: TextRange,
+            style: TextStyle,
+        ) -> Result<ShapedText, Self::Error> {
+            if text.contains(self.0) {
+                return Err(format!("排不了 {:?}", self.0));
+            }
+            let glyphs = text
+                .char_indices()
+                .map(|(offset, character)| {
+                    let from = source.start().get() + offset as u64;
+                    let to = from + character.len_utf8() as u64;
+                    Ok(Glyph::new(
+                        GlyphId::from_raw(character as u32),
+                        TextRange::new(ByteOffset::new(from), ByteOffset::new(to)).ok_or("有序")?,
+                        1.0,
+                        0.0,
+                        0.0,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Self::Error>>()?;
+            Ok(ShapedText::new(
+                source,
+                vec![GlyphRun::new(
+                    FontFaceId::from_raw(1),
+                    source,
+                    style,
+                    TextDirection::Ltr,
+                    Script::Latin,
+                    glyphs,
+                )],
+            ))
+        }
+    }
+
+    /// 排不出来的文本必须画成替代字形，而不是让整个块失败。
+    ///
+    /// 这一条压的是不变量 I5 的「永不白屏、永远可编辑」。在它之前，
+    /// `ShapingProvider` 的 `Err` 一路传成 `?`，一份含希伯来文的文档
+    /// **整屏发不出来**——不是画错，是不出现。
+    ///
+    /// **判据落在三样上，缺一不可**：布局成功、字形数等于簇数（画得出来）、
+    /// `substituted_clusters` 正好等于排不出来的那几簇（降级看得见）。
+    /// 只断前两样的话，一个「把整段都换成豆腐块」的实现也会绿。
+    #[test]
+    fn unshapable_clusters_become_replacement_glyphs_instead_of_failing() {
+        let text = "a\u{05d0}b";
+        let layout = BlockLayout::build_shaped(
+            LayoutInput::new(text, &plain(text)),
+            LayoutConfig::new(80.0, 4.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &NoLineStyles,
+            &Refusing('\u{05d0}'),
+        )
+        .expect("排不出来的簇不该让整个块失败");
+
+        assert_eq!(layout.clusters().len(), 3);
+        assert_eq!(layout.glyphs().len(), 3, "三个簇都要画得出来");
+        assert_eq!(layout.substituted_clusters(), 1, "只有那一个簇该被替换");
+        // 排得出来的两个簇保留**自己的**字形，不跟着一起变豆腐。
+        let ids: Vec<u32> = layout
+            .glyphs()
+            .iter()
+            .map(|glyph| glyph.glyph().get())
+            .collect();
+        assert_eq!(ids, vec!['a' as u32, 0xfffd, 'b' as u32]);
+    }
+
+    /// 正常语料一个都不该被替换——这条是上一条的反面，防止「无脑全替换」。
+    #[test]
+    fn a_shapable_run_substitutes_nothing() {
+        let text = "abc";
+        let layout = BlockLayout::build_shaped(
+            LayoutInput::new(text, &plain(text)),
+            LayoutConfig::new(80.0, 4.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &NoLineStyles,
+            &Refusing('\u{05d0}'),
+        )
+        .expect("布局");
+        assert_eq!(layout.substituted_clusters(), 0);
+        assert_eq!(layout.glyphs().len(), 3);
+    }
+
+    /// 连替代字形都排不出来时没有第二条退路，只能报错——**不许伪造一个
+    /// 字形 id**，那画出来是别的字。
+    #[test]
+    fn a_backend_that_refuses_everything_is_still_an_error() {
+        struct RefusesEverything;
+        impl ShapingProvider for RefusesEverything {
+            type Error = String;
+            fn shape(
+                &self,
+                _text: &str,
+                _source: TextRange,
+                _style: TextStyle,
+            ) -> Result<ShapedText, Self::Error> {
+                Err("什么都排不了".to_owned())
+            }
+        }
+        let text = "abc";
+        assert!(matches!(
+            BlockLayout::build_shaped(
+                LayoutInput::new(text, &plain(text)),
+                LayoutConfig::new(80.0, 4.0),
+                &UniformStyleTable::default(),
+                &NoWidgets,
+                &NoLineStyles,
+                &RefusesEverything,
+            ),
+            Err(LayoutError::Shaping(_))
+        ));
     }
 
     /// 空区间**过得了**下面那道 tiling 门，所以要单独钉一条。

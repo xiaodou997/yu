@@ -1722,6 +1722,75 @@ mod tests {
         }
     }
 
+    /// CoreText 拒掉的脚本仍然画得出来。
+    ///
+    /// 实测（S7 第七刀 spike）CoreText 在 `CTRunStatus` 那一步就拒掉希伯来、
+    /// 阿拉伯与天城文，**连单独排一个字符也拒**。在布局层长出替代字形那条路
+    /// 之前，这些文档不是画错而是**整屏发不出来**——`Err` 一路传成 `?`。
+    ///
+    /// 判据跨两个 crate：CoreText 真的拒了（`shape_request` 返回 `Err`），
+    /// 而布局仍然产出与簇数一样多的字形。**只断布局成功证明不了什么**——
+    /// 一个不拒的后端也会让它绿。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scripts_core_text_refuses_still_produce_glyphs() {
+        let request = FontRequest::new("System UI", 16.0).expect("request should be valid");
+        let shaper =
+            CoreTextShaper::from_system_ui(request.clone()).expect("CoreText should initialize");
+        for text in [
+            "\u{05e9}\u{05dc}\u{05d5}\u{05dd}",
+            "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}",
+            "\u{0939}\u{093f}\u{0928}\u{094d}\u{0926}\u{0940}",
+        ] {
+            let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(text.len() as u64))
+                .expect("source range should be valid");
+            assert!(
+                ShapingProvider::shape(&shaper, text, source, TextStyle::Plain).is_err(),
+                "CoreText 本来就拒 {text:?}——它不拒的话这条用例什么都没证明"
+            );
+
+            let visual = yu_core::VisualRange::new(
+                yu_core::VisualOffset::ZERO,
+                yu_core::VisualOffset::new(text.len() as u64),
+            )
+            .expect("ordered");
+            let runs = [yu_layout::StyledRun::new(visual, yu_core::StyleId(0))];
+            let layout = yu_layout::BlockLayout::build_shaped(
+                yu_layout::LayoutInput::new(text, &runs),
+                yu_layout::LayoutConfig::new(10_000.0, 20.0),
+                &yu_layout::UniformStyleTable::default(),
+                &yu_layout::NoWidgets,
+                &yu_layout::NoLineStyles,
+                &shaper,
+            )
+            .expect("排不出来的脚本不该让整个块失败");
+
+            assert!(!layout.clusters().is_empty());
+            assert_eq!(
+                layout.glyphs().len(),
+                layout.clusters().len(),
+                "{text:?} 的每一个簇都要画得出来"
+            );
+            assert!(
+                layout.substituted_clusters() > 0,
+                "{text:?} 应该有簇被替换，否则这条用例走的不是降级那条路"
+            );
+
+            // 「画得出来」要一直验到栅格化。替代字形的 face 是 CoreText 为
+            // U+FFFD 选的那一个——铸 id 的是 shaper，消费 id 的是 rasterizer，
+            // 两者共用一张表（`yu_font::SharedFaceTable`）。这一步失败的表现
+            // 是「布局有字形而屏幕上仍然什么都没有」。
+            let rasterizer = shaper.rasterizer();
+            for glyph in layout.glyphs() {
+                let key = GlyphRasterKey::new(glyph.face(), glyph.glyph(), 16.0)
+                    .expect("glyph key should be valid");
+                rasterizer
+                    .rasterize(key)
+                    .unwrap_or_else(|error| panic!("{text:?} 的替代字形画不出来：{error}"));
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn layout_consumes_core_text_advances_and_visual_clusters() {
