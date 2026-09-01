@@ -318,6 +318,49 @@ CommonMark 规范用例号。
 > 变体，编辑器按 I5 画成普通段落源码，导出按 CommonMark 渲染。理由与代价写在
 > `yu-export` 的模块文档与 overview 第 8 节 S7 第六刀。
 
+> **剪贴板的 HTML 是一份写给陌生人的独立文档，不是一段片段**（S7 第七刀 c 的
+> G 节验收补）。它必须自己声明编码：`public.html` / `text/html` 这个类型只承载
+> 字节，收件方拿不到声明就只能猜，而系统的传统编码在中文环境下是 GBK——实测
+> 不带声明时中文粘进 TextEdit 全是乱码，而 ASCII 完好。声明加在剪贴板那一层
+> （`ClipboardPayload::html`），`export_html_fragment` 仍然是一段不带编码的片段。
+>
+> **反方向（导入）在同一次验收里翻了一次案，记在这里。** 原来的登记是「导出
+> 照原样发原始 HTML，导入按白名单拒绝原始 HTML（那是别人的 HTML）」，由
+> `raw_html_deliberately_does_not_round_trip` 钉住并写着「别当成缺口顺手补上」。
+> G 节实测下来，这条理由在**信封**上不成立，只在**语义**上成立：
+>
+> - 每一个真实浏览器发的剪贴板 HTML 都带 `<div>` / `<span>` / `style` / 注释
+>   （Chrome 对一个连一个 `div` 都没有的页面，也会把词间空白包成
+>   `<span> </span>`、给每个块挂二十来条声明的 `style`）；
+> - 于是「拒绝信封」在实践上等于**拒绝每一次浏览器粘贴**。
+>
+> 现在的规矩分三档：**语义标签**照常翻译；**信封与纯呈现**
+> （`html`/`head`/`body`/`div`/`span`/注释/`<!doctype>`）穿透，`head` 连内容
+> 一起丢；**其余标签继续拒**（`<b>`、`<article>`、`<script>`——「那是别人的
+> HTML」这一半没有变）。属性同理**默认忽略**（输出是 Markdown，被忽略的属性
+> 没有地方可去），只拒一小份「忽略了会让输出**静默出错**」的名单：
+> `colspan`/`rowspan`（表格少画几列）、`reversed`/`type`（有序列表编号反了）、
+> `hidden`（看不见的文字变成正文）。
+>
+> **代价是登记在案的**：用户自己写在 Markdown 里的 `<div>raw</div>` 经 HTML
+> 这条路导入时被拍平成 `raw`。Yu 分不出「用户写的 div」与「浏览器的 div」，
+> 而后者是唯一真实的输入来源。`presentational_containers_are_flattened_not_rejected`
+> 钉住这个代价，`semantic_raw_html_deliberately_does_not_round_trip` 钉住没有
+> 变的那一半。Yu → Yu 不走这条路（剪贴板上有 canonical 的 Markdown flavor）。
+>
+> **同一次验收还查出一件更根本的事**：平台侧取剪贴板的顺序原来是
+> 「Markdown > 纯文本 > HTML」，而**任何真实剪贴板都带纯文本**——于是整条 HTML
+> 导入路径在生产里**一次都没有被走到过**，白名单、用例、fixture 全都在为一条
+> 不可达的分支服务。顺序改成 **Markdown > HTML > 纯文本**：纯文本按定义是同一
+> 份内容丢掉结构之后的样子，两者都在时取纯文本等于每次都主动选那份更少的。
+> 回退没有变（策略拒绝时返回 `nil` 落回纯文本），只是现在真的会走到。
+>
+> **一处已知的粗糙，不修**：Chrome 拷贝时会把词间的普通空格换成不换行空格
+> （U+00A0），粘进来的段落因此夹着看不见的 NBSP，搜索匹配不上。不改写它——
+> 导入器的职责是翻译结构不是重写文本，而悄悄换回空格会连着毁掉网页作者故意
+> 写的那些。`a_real_browser_clipboard_payload_imports_to_markdown` 把它断言
+> 出来，让它看得见。
+
 ### F1 为什么不修
 
 CommonMark 的行内解析发生在**全部块解析结束之后**，因此它做 `]` 配对时已经

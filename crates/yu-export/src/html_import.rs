@@ -1,9 +1,41 @@
 //! Strict, opt-in HTML-to-Markdown paste policy.
 //!
-//! This parser is intentionally not a browser HTML parser. It accepts only
-//! the semantic subset Yu itself emits (plus equivalent safe markup), rejects
-//! unknown tags/attributes, and returns Markdown source. Native adapters can
-//! fall back to plain text whenever this policy rejects a fragment.
+//! This parser is intentionally not a browser HTML parser. It accepts only the
+//! semantic subset Yu itself emits (plus equivalent safe markup) and returns
+//! Markdown source. Native adapters can fall back to plain text whenever this
+//! policy rejects a fragment.
+//!
+//! # 信封不是内容
+//!
+//! 剪贴板上的 HTML 从来不是干净的语义片段——发它的那一方要把选区塞进一个
+//! **信封**里：文档骨架（`<!doctype>` / `<html>` / `<head>` / `<body>`）、
+//! 编码声明、片段标记注释（`<!--StartFragment-->`），以及**纯呈现**的容器
+//! （`<div>` / `<span>`）与属性（`style` / `class`）。信封不携带任何文档语义。
+//!
+//! **S7 第七刀 c 的 G 节验收实测**：Chrome 对一个连一个 `<div>` 都没有的纯
+//! 语义页面，产出的仍然是
+//! `<meta charset='utf-8'><h2 style="…20 条声明…">…<span> </span><strong>…`。
+//! 于是「拒绝信封」在实践上等于**拒绝每一个真实来源**——这个导入器上线以来
+//! 从没有接住过一次浏览器粘贴，而那正是它存在的理由。
+//!
+//! 所以策略分三档，不是两档：
+//!
+//! 1. **语义标签**（[`ensure_allowed_tag`] 的名单）照常翻译；
+//! 2. **信封与纯呈现**（`html` / `body` / `div` / `span`）**穿透**，
+//!    `head` 连同内容整个丢掉（里面是 `<title>` / `<style>` / `<link>`，
+//!    那些文本不是正文）；
+//! 3. **其余标签继续拒**——带语义的（`<b>`、`<article>`）与带行为的
+//!    （`<script>`、`<iframe>`）都在这一档，「那是别人的 HTML」这条没有变。
+//!
+//! 属性同理：**默认忽略**，因为输出是 Markdown——一个被忽略的属性**没有地方
+//! 可去**，它带不进任何东西。继续拒的只有一小份名单：忽略了会让输出**静默
+//! 出错**的那些（`colspan` / `rowspan` 让表格少画几列、`reversed` 让有序列表
+//! 反过来、`hidden` 让本来看不见的文字变成正文）。判据是「忽略它会不会让
+//! 结果悄悄变错」，不是「我认不认得它」。
+//!
+//! **代价是登记在案的**：`<div>raw</div>` 这种用户自己写在 Markdown 里的原始
+//! HTML，现在导入时会被拍平成 `raw`。分不出「用户写的 div」与「浏览器的 div」
+//! ——而后者是唯一真实的输入来源。理由与取舍写在 `invariants.md` 的 F 节。
 
 use std::error::Error;
 use std::fmt;
@@ -84,7 +116,35 @@ pub fn import_html_fragment(html: &str) -> Result<String, HtmlImportError> {
     }
     let mut roots = parse_document(html)?;
     strip_encoding_declaration(&mut roots);
+    flatten_envelope(&mut roots);
     render_roots(&roots)
+}
+
+/// 拆掉信封：纯呈现的容器换成它的孩子，`<head>` 连同内容一起丢掉。
+///
+/// **`head` 与其余几个不是一回事**：`div` / `span` / `html` / `body` 里装的
+/// 是正文，穿透就对了；`head` 里装的是 `<title>` / `<style>` / `<link>`
+/// ——**穿透会让页面标题和一整段 CSS 变成正文**，不报错，只是粘出来多了一堆
+/// 谁也没写过的字。所以它整个丢。
+fn flatten_envelope(nodes: &mut Vec<Node>) {
+    let mut flattened = Vec::with_capacity(nodes.len());
+    for node in nodes.drain(..) {
+        match node {
+            Node::Element(mut element) if is_envelope_tag(&element.name) => {
+                if element.name == "head" {
+                    continue;
+                }
+                flatten_envelope(&mut element.children);
+                flattened.extend(element.children);
+            }
+            Node::Element(mut element) => {
+                flatten_envelope(&mut element.children);
+                flattened.push(Node::Element(element));
+            }
+            text => flattened.push(text),
+        }
+    }
+    *nodes = flattened;
 }
 
 /// 摘掉顶层的 `<meta charset=...>`。
@@ -107,8 +167,28 @@ fn parse_document(html: &str) -> Result<Vec<Node>, HtmlImportError> {
 
     while position < html.len() {
         if html.as_bytes()[position] == b'<' {
+            // 注释是信封的一部分：CF_HTML 风格的 `<!--StartFragment-->` /
+            // `<!--EndFragment-->` 是每个浏览器都发的片段标记。以前这里直接
+            // 判 `Malformed`，于是整段被拒。跳过它，不产出任何节点。
             if html[position..].starts_with("<!--") {
-                return Err(HtmlImportError::Malformed);
+                let end = html[position..]
+                    .find("-->")
+                    .ok_or(HtmlImportError::Malformed)?;
+                position += end + "-->".len();
+                continue;
+            }
+            // `<!doctype html>` 同理，是文档骨架不是内容。
+            if html[position..].len() > 2
+                && html.as_bytes()[position + 1] == b'!'
+                && html[position + 2..]
+                    .to_ascii_lowercase()
+                    .starts_with("doctype")
+            {
+                let end = html[position..]
+                    .find('>')
+                    .ok_or(HtmlImportError::Malformed)?;
+                position += end + 1;
+                continue;
             }
             if html.as_bytes().get(position + 1) == Some(&b'/') {
                 let (name, next) = parse_close_tag(html, position)?;
@@ -234,10 +314,12 @@ fn parse_open_tag(
             }
             position += 1;
             decode_entities(&body[value_start..value_end])?
-        } else if matches!(attribute.as_str(), "checked" | "disabled") {
-            String::new()
         } else {
-            return Err(HtmlImportError::Malformed);
+            // 没有 `=` 的布尔属性。以前只放行 `checked` / `disabled`，其余
+            // 一律 `Malformed`——而浏览器发的 `hidden` / `draggable` /
+            // `contenteditable` 都是这个形状，于是**整段被判成格式错误**，
+            // 连「这是个我不认得的属性」都说不出来。
+            String::new()
         };
         if attributes
             .iter()
@@ -284,8 +366,14 @@ fn skip_ascii_whitespace(value: &str, mut position: usize) -> usize {
     position
 }
 
+/// HTML 的空元素：没有闭合标签，也不可能有孩子。
+///
+/// **`hr` 以前不在这里**，而这一支从没被走到过：Yu 自己的导出器发的是自闭合
+/// 的 `<hr />`，`self_closing` 那条路先接住了它。浏览器发的是
+/// `<hr style="…">`——于是解析器一直等它的 `</hr>`，等到文件末尾报
+/// 「`expected </hr>` 但读到 EOF」。**整段被判成格式错误，而错的是解析器。**
 fn is_void_tag(name: &str) -> bool {
-    matches!(name, "br" | "img" | "input" | "meta")
+    matches!(name, "br" | "img" | "input" | "meta" | "hr")
 }
 
 fn ensure_allowed_tag(name: &str) -> Result<(), HtmlImportError> {
@@ -317,33 +405,52 @@ fn ensure_allowed_tag(name: &str) -> Result<(), HtmlImportError> {
             | "td"
             | "hr"
             | "meta"
-    ) {
+    ) || is_envelope_tag(name)
+    {
         Ok(())
     } else {
         Err(HtmlImportError::UnsupportedTag(name.to_owned()))
     }
 }
 
+/// 信封与纯呈现的容器：解析时接受，渲染前拿掉。
+///
+/// `html` / `body` 是文档骨架，`div` / `span` 按 HTML 规范的定义就是**没有
+/// 语义**的块/行内容器。`head` 也在这里，但它与其余几个不同——见
+/// [`flatten_envelope`]。
+fn is_envelope_tag(name: &str) -> bool {
+    matches!(name, "html" | "head" | "body" | "div" | "span")
+}
+
+/// 忽略了就会让输出**静默出错**的属性。这是唯一还要拒的一档。
+///
+/// 判据不是「我认不认得它」——认不得的属性绝大多数是呈现
+/// （`style` / `class` / `id` / `target` / `data-*`），而输出是 Markdown，
+/// **一个被忽略的属性没有地方可去**。真正要拒的是那些「忽略掉之后结果悄悄
+/// 变错」的：
+///
+/// - `colspan` / `rowspan`：Markdown 表格没有合并单元格，忽略掉会**少画几列**
+///   且行与行对不上；
+/// - `reversed` / `type`（在 `<ol>` 上）：有序列表的编号方式变了，忽略掉会
+///   **把倒序列表画成正序**；
+/// - `hidden`：本来看不见的内容会**变成正文**。
+fn meaning_changing_attribute(tag: &str, attribute: &str) -> bool {
+    if attribute == "hidden" {
+        return true;
+    }
+    match tag {
+        "th" | "td" => matches!(attribute, "colspan" | "rowspan"),
+        "ol" => matches!(attribute, "reversed" | "type"),
+        _ => false,
+    }
+}
+
 fn validate_attributes(name: &str, attributes: &[Attribute]) -> Result<(), HtmlImportError> {
-    // S7 第六刀放宽了三处，全部是**因为 Yu 自己的导出现在会发出它们**：
-    // comrak 带链接与图片的 `title`，用 GFM 的 `align=` 而不是行内 style，
-    // 并且把主题分隔线渲染成 `<hr />`。不放宽的表现不是报错，是 Yu 里 ⌘C 再
-    // ⌘V 静静降级成纯文本。**原始 HTML（`<div>`/`<script>`）继续拒**：导出的
-    // 是用户自己的文档，导入的是别人的 HTML，这个不对称是有意的。
-    let allowed = match name {
-        "a" => &["href", "title"][..],
-        "img" => &["src", "alt", "title"],
-        "ol" => &["start"],
-        "code" => &["class"],
-        "input" => &["type", "disabled", "checked"],
-        // 编码声明只认 charset。`http-equiv` / `content` 那种写法带着一个
-        // 完整的 MIME 串，认它就等于开始解析 HTTP 头——那不是这个模块的事。
-        "meta" => &["charset"],
-        "th" | "td" => &["style", "align"],
-        _ => &[][..],
-    };
+    // 未知属性**忽略**，见模块文档的「信封不是内容」。下面这一段仍然逐条
+    // 校验**我们真的会读的那些**——放宽的是「认不认得」，不是「读进来的值
+    // 对不对」。
     for attribute in attributes {
-        if !allowed.contains(&attribute.name.as_str()) {
+        if meaning_changing_attribute(name, &attribute.name) {
             return Err(HtmlImportError::UnsupportedAttribute {
                 tag: name.to_owned(),
                 attribute: attribute.name.clone(),
@@ -380,16 +487,8 @@ fn validate_attributes(name: &str, attributes: &[Attribute]) -> Result<(), HtmlI
         ));
     }
     if matches!(name, "th" | "td") {
-        if let Some(value) = attribute(attributes, "style")
-            && !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "text-align: left" | "text-align: center" | "text-align: right"
-            )
-        {
-            return Err(HtmlImportError::InvalidStructure(
-                "table alignment style is not allowlisted",
-            ));
-        }
+        // 行内 `style` 的校验归 `table_cell_alignment`——它要从一串声明里挑出
+        // `text-align`，在这里再判一遍整串就是第二份实现。
         if let Some(value) = attribute(attributes, "align")
             && !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -886,14 +985,29 @@ fn table_cell_alignment(element: &Element) -> Result<TableAlignment, HtmlImportE
     let Some(style) = attribute(&element.attributes, "style") else {
         return Ok(TableAlignment::Default);
     };
-    match style.trim().to_ascii_lowercase().as_str() {
-        "text-align: left" => Ok(TableAlignment::Left),
-        "text-align: center" => Ok(TableAlignment::Center),
-        "text-align: right" => Ok(TableAlignment::Right),
-        _ => Err(HtmlImportError::InvalidStructure(
-            "table cell alignment is not supported",
-        )),
+    // **从一串声明里挑出 `text-align`，不要求整个 style 恰好等于它。**
+    // 以前是整串比较，于是浏览器发的
+    // `style="text-align: center; color: rgb(0,0,0); font-family: …"`
+    // 会让整张表被拒。实测（S7 第七刀 c 的 G 节验收）Chrome 给每个单元格挂
+    // 的正是这种二十来条声明的 style。
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        if !property.trim().eq_ignore_ascii_case("text-align") {
+            continue;
+        }
+        return match value.trim().to_ascii_lowercase().as_str() {
+            "left" | "start" => Ok(TableAlignment::Left),
+            "center" => Ok(TableAlignment::Center),
+            "right" | "end" => Ok(TableAlignment::Right),
+            // 认得这条属性但读不懂它的值，才是真的没法表达。
+            _ => Err(HtmlImportError::InvalidStructure(
+                "table cell alignment is not supported",
+            )),
+        };
     }
+    Ok(TableAlignment::Default)
 }
 
 fn table_alignment_marker(alignment: TableAlignment) -> String {
@@ -1104,10 +1218,40 @@ mod tests {
             import_html_fragment("<a href=\"javascript:alert(1)\">x</a>"),
             Err(HtmlImportError::UnsafeUrl(url)) if url == "javascript:alert(1)"
         ));
+        // **带语义的未知标签继续拒**——「那是别人的 HTML」这条没有变，变的
+        // 只是「信封不算别人的 HTML」。
         assert!(matches!(
-            import_html_fragment("<p class=\"injected\">x</p>"),
+            import_html_fragment("<p>段落里有 <b>标签</b></p>"),
+            Err(HtmlImportError::UnsupportedTag(tag)) if tag == "b"
+        ));
+        // 纯呈现的属性忽略：输出是 Markdown，被忽略的属性没有地方可去。
+        assert_eq!(
+            import_html_fragment("<p class=\"injected\" onclick=\"alert(1)\">x</p>"),
+            Ok("x".to_owned())
+        );
+    }
+
+    /// 忽略了会让输出**静默出错**的属性，仍然拒。
+    ///
+    /// 这一档才是「未知属性一律忽略」与「未知属性一律拒」之间那条真正的线：
+    /// 判据是**忽略它会不会让结果悄悄变错**。少了这一条，一张带合并单元格的
+    /// 表格会粘成一张少几列、行与行对不上的表——不报错。
+    #[test]
+    fn attributes_that_would_silently_change_the_result_are_still_rejected() {
+        let merged = "<table><thead><tr><th>a</th><th>b</th></tr></thead>\
+<tbody><tr><td colspan=\"2\">x</td></tr></tbody></table>";
+        assert!(matches!(
+            import_html_fragment(merged),
             Err(HtmlImportError::UnsupportedAttribute { tag, attribute })
-                if tag == "p" && attribute == "class"
+                if tag == "td" && attribute == "colspan"
+        ));
+        assert!(matches!(
+            import_html_fragment("<ol reversed><li>a</li></ol>"),
+            Err(HtmlImportError::UnsupportedAttribute { attribute, .. }) if attribute == "reversed"
+        ));
+        assert!(matches!(
+            import_html_fragment("<p hidden>看不见的字</p>"),
+            Err(HtmlImportError::UnsupportedAttribute { attribute, .. }) if attribute == "hidden"
         ));
     }
 
@@ -1149,13 +1293,12 @@ mod tests {
             import_html_fragment("<p>羽<meta charset=\"utf-8\"></p>"),
             Err(HtmlImportError::InvalidStructure(_))
         ));
-        // 只认 charset：`http-equiv` 那种写法带着一个完整的 MIME 串，认它就
-        // 等于开始解析 HTTP 头。
-        assert!(matches!(
+        // 另一种写编码的方式同样是信封，同样摘掉。
+        assert_eq!(
             import_html_fragment(
-                "<meta http-equiv=\"content-type\" content=\"text/html\"><p>羽</p>"
+                "<meta http-equiv=\"content-type\" content=\"text/html; charset=utf-8\"><p>羽</p>"
             ),
-            Err(HtmlImportError::UnsupportedAttribute { .. })
-        ));
+            Ok("羽".to_owned())
+        );
     }
 }

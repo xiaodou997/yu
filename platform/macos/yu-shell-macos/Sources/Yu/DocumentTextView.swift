@@ -1240,17 +1240,33 @@ final class DocumentTextView: NSTextView {
         }
     }
 
+    /// 粘贴时按「信息量从多到少」取剪贴板上的一种表示。
+    ///
+    /// 顺序是 **canonical Markdown > HTML > 纯文本**。
+    ///
+    /// **HTML 必须排在纯文本前面**，这一条 S7 第七刀 c 的 G 节验收之前反着：
+    /// 原来是 Markdown > 纯文本 > HTML。而**任何真实的剪贴板都带纯文本**
+    /// ——浏览器、邮件、文档编辑器无一例外——于是 `importHTML` 这条路在生产里
+    /// **一次都没有被走到过**。整个 HTML 导入策略（连同它的白名单、它的用例、
+    /// 它的 fixture）都在为一条不可达的分支服务，而没有任何断言看得出来：
+    /// self-check 的每一条都是自己往私有剪贴板上摆格式，摆的组合恰好都没有
+    /// 「纯文本与可用 HTML 同时在」这一种。
+    ///
+    /// 纯文本按定义是同一份内容**丢掉结构之后**的样子。两者都在时取纯文本，
+    /// 等于每次都主动选那份更少的。
+    ///
+    /// 回退没有变，只是现在真的会走到：`importHTML` 在策略拒绝时返回 `nil`
+    /// （不是抛错），于是接不住的 HTML 仍然落回纯文本。
     private func sourceFromPasteboard(_ pasteboard: NSPasteboard = .general) throws -> String? {
         if let markdown = pasteboard.string(forType: .yuMarkdown) {
             return markdown
         }
-        if let plain = pasteboard.string(forType: .string) {
-            return plain
+        if let html = pasteboard.string(forType: .yuHTML),
+            let imported = try bridge.importHTML(html)
+        {
+            return imported
         }
-        guard let html = pasteboard.string(forType: .yuHTML) else {
-            return nil
-        }
-        return try bridge.importHTML(html)
+        return pasteboard.string(forType: .string)
     }
 
     private func apply(_ result: NativeCommandResult) {
