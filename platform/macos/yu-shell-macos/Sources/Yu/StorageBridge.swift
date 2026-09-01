@@ -964,7 +964,8 @@ final class StorageBridge {
         maxWidth: Float,
         scrollY: Float,
         viewportHeight: Float,
-        surfaceGeneration: UInt64
+        surfaceGeneration: UInt64,
+        appearance: UInt8
     ) throws -> NativeMacosRenderHostSnapshot {
         var value = YuStorageMacosRenderHostSnapshot()
         let status = yu_storage_session_macos_render_host_frame(
@@ -975,6 +976,7 @@ final class StorageBridge {
             scrollY,
             viewportHeight,
             surfaceGeneration,
+            appearance,
             &value
         )
         guard status == StorageStatus.ok else {
@@ -992,6 +994,7 @@ final class StorageBridge {
         surfaceWidth: Double,
         surfaceHeight: Double,
         scale: Double,
+        appearance: UInt8,
         view: UnsafeMutableRawPointer
     ) throws -> NativeMacosRenderHostSurfaceSnapshot {
         var value = YuStorageMacosRenderHostSurfaceSnapshot()
@@ -1005,6 +1008,7 @@ final class StorageBridge {
             surfaceWidth,
             surfaceHeight,
             scale,
+            appearance,
             view,
             &value
         )
@@ -1030,7 +1034,8 @@ final class StorageBridge {
         viewportHeight: Float,
         surfaceWidth: Double,
         surfaceHeight: Double,
-        scale: Double
+        scale: Double,
+        appearance: UInt8
     ) -> Bool {
         var geometry = YuStorageFrameGeometry(
             size: size,
@@ -1042,7 +1047,7 @@ final class StorageBridge {
             scale: scale
         )
         var current: UInt8 = 0
-        let status = yu_storage_session_frame_is_current(handle, &geometry, &current)
+        let status = yu_storage_session_frame_is_current(handle, &geometry, appearance, &current)
         guard status == StorageStatus.ok else { return false }
         return current != 0
     }

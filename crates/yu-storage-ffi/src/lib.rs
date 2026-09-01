@@ -35,11 +35,9 @@ use yu_storage::{
 use yu_text::{EditError, TextSnapshot};
 
 #[cfg(target_os = "macos")]
-use yu_scene::{EditorDecorationPrimitiveRole, Point, Primitive, Rect, Rgba8};
+use yu_scene::{EditorDecorationPrimitiveRole, Point, Primitive, Rect};
 #[cfg(target_os = "macos")]
-use yu_workspace::{
-    EditorDecorationStyle, FrameGeometry, FrameKey, FrameTableResize, ViewportRenderConfig,
-};
+use yu_workspace::{Appearance, FrameGeometry, FrameKey, FrameTableResize, ViewportRenderConfig};
 
 #[cfg(target_os = "macos")]
 use yu_assets::{
@@ -103,6 +101,11 @@ pub const YU_STORAGE_TABLE_ALIGNMENT_RIGHT: u8 = 3;
 
 pub const YU_STORAGE_TABLE_RESIZE_NONE: u8 = 0;
 /// `yu_storage_session_copy_selection` 的输出格式。
+/// 系统外观。平台每帧送一个字节进来，颜色由 `yu-workspace` 挑
+/// （见 `yu_workspace::Appearance`）。
+pub const YU_STORAGE_APPEARANCE_LIGHT: u8 = 0;
+pub const YU_STORAGE_APPEARANCE_DARK: u8 = 1;
+
 pub const YU_STORAGE_CLIPBOARD_TEXT: u8 = 0;
 pub const YU_STORAGE_CLIPBOARD_HTML: u8 = 1;
 
@@ -918,6 +921,19 @@ struct MacosRenderHostState {
     last_frame_key: Option<FrameKey>,
 }
 
+/// 平台送来的外观字节。**未知值按浅色处理，不报错。**
+///
+/// 理由：外观不是一个操作，是一帧的属性。为一个认不得的枚举值拒绝整帧提交，
+/// 表现是「系统换了个新外观之后 Yu 一片空白」——而按浅色画出来至少是可读的
+/// （不变量 I5 的同一条精神：永不白屏）。
+#[cfg(target_os = "macos")]
+const fn appearance_from_raw(raw: u8) -> Appearance {
+    match raw {
+        YU_STORAGE_APPEARANCE_DARK => Appearance::Dark,
+        _ => Appearance::Light,
+    }
+}
+
 /// 把平台送过来的一帧几何翻成工作区那份定义。
 ///
 /// 这一步留在 FFI，因为 `YuStorageFrameGeometry` 是 C 结构体；校验规则本身
@@ -942,7 +958,11 @@ fn frame_geometry(request: &YuStorageFrameGeometry) -> Result<FrameGeometry, i32
 /// 容易出错的地方：只要有一项不对称，就会出现「明明变了却判为等价」或
 /// 「明明没变却每帧重画」。
 #[cfg(target_os = "macos")]
-fn frame_key(session: &YuStorageSession, geometry: FrameGeometry) -> FrameKey {
+fn frame_key(
+    session: &YuStorageSession,
+    appearance: Appearance,
+    geometry: FrameGeometry,
+) -> FrameKey {
     let revision = session.session.revision();
     // 与 `macos_render_host_frame` 使用同一条过滤规则：只有匹配当前
     // Revision 的列覆盖会进入渲染配置，其余不影响画面，也就不该影响身份。
@@ -959,6 +979,7 @@ fn frame_key(session: &YuStorageSession, geometry: FrameGeometry) -> FrameKey {
         session.session.selections().as_slice().to_vec(),
         session.session.document().editor().search_generation(),
         table_resize,
+        appearance,
         geometry,
     )
 }
@@ -4335,28 +4356,24 @@ fn macos_render_host_config(
     max_width: f32,
     viewport_height: f32,
     raster_scale: f32,
+    appearance: Appearance,
 ) -> Result<ViewportRenderConfig, i32> {
     let scene_height = viewport_height.max(1.0);
     let scene_viewport = Rect::new(0.0, viewport.scroll_y(), max_width, scene_height)
         .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    // **这里一个颜色字面量都没有了。** 平台送进来的是「现在是深还是浅」这个
+    // 事实，颜色由 `yu-workspace` 挑——「产品选色住在那一层」这条以前在三处
+    // 文档里写着，而背景与这几个装饰色是它唯一的例外。第二端因此不必把同一套
+    // 配色再挑一遍（挑出来的一定会漂开）。
     Ok(
-        ViewportRenderConfig::new(viewport, size, scene_viewport, Rgba8::black())
+        ViewportRenderConfig::new(viewport, size, scene_viewport, appearance.text())
             .with_raster_scale(raster_scale)
             // Rust surface 是唯一渲染路径，背景必须由这一帧自己画出来
-            // （不变量 I5）。暗色模式需要平台把实际的 textBackgroundColor
-            // 传进来，目前固定为白底。
-            .with_background(Rgba8::white())
-            .with_editor_decorations(
-                EditorDecorationStyle::new(
-                    Rgba8::new(0, 122, 255, 97),
-                    Rgba8::black(),
-                    Rgba8::new(0, 122, 255, 255),
-                    1.0,
-                )
-                // 命中是淡黄、当前命中是橙——两者都要能和半透明的蓝色选区
-                // 叠在一起还分得清（选区画在它们上面）。
-                .with_search(Rgba8::new(255, 214, 10, 120), Rgba8::new(255, 149, 0, 140)),
-            ),
+            // （不变量 I5）：Metal layer 是透明的，未触及的像素会露出下层视图，
+            // 而下层视图已经不再绘制任何东西。
+            .with_background(appearance.background())
+            .with_editor_decorations(appearance.editor_decorations())
+            .with_appearance(appearance),
     )
 }
 
@@ -4479,6 +4496,10 @@ struct MacosFrameRequest {
     surface_generation: u64,
     /// backing scale：字形按它取样，后端再除回逻辑坐标。
     raster_scale: f32,
+    /// 系统外观。**只有平台知道**（AppKit 的 `effectiveAppearance`），
+    /// 而选出哪一套颜色是 `yu-workspace` 的事——进来的是一个事实，
+    /// 出去的是一整套颜色。
+    appearance: Appearance,
 }
 
 #[cfg(target_os = "macos")]
@@ -4494,6 +4515,7 @@ fn macos_render_host_frame(
         viewport_height,
         surface_generation,
         raster_scale,
+        appearance,
     } = request;
     validate_revision(&session.session, expected_revision)?;
     if !size.is_finite()
@@ -4544,8 +4566,14 @@ fn macos_render_host_frame(
         None => None,
     };
     let viewport = ViewportSpan::new(scroll_y, viewport_height);
-    let config =
-        macos_render_host_config(viewport, size, max_width, viewport_height, raster_scale)?;
+    let config = macos_render_host_config(
+        viewport,
+        size,
+        max_width,
+        viewport_height,
+        raster_scale,
+        appearance,
+    )?;
     let config = table_resize.map_or(config, |commit| config.with_table_resize(commit));
     if session
         .macos_render_host
@@ -4816,6 +4844,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
     scroll_y: f32,
     viewport_height: f32,
     surface_generation: u64,
+    appearance: u8,
     snapshot: *mut YuStorageMacosRenderHostSnapshot,
 ) -> i32 {
     let Some(session) = (unsafe { session.as_mut() }) else {
@@ -4855,6 +4884,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
                 viewport_height,
                 surface_generation,
                 raster_scale: 1.0,
+                appearance: appearance_from_raw(appearance),
             },
         ) {
             Ok(value) => value,
@@ -4897,6 +4927,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
     surface_width: f64,
     surface_height: f64,
     scale: f64,
+    appearance: u8,
     view: *mut c_void,
     snapshot: *mut YuStorageMacosRenderHostSurfaceSnapshot,
 ) -> i32 {
@@ -4964,6 +4995,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 viewport_height,
                 surface_generation,
                 raster_scale: scale as f32,
+                appearance: appearance_from_raw(appearance),
             },
         ) {
             Ok(snapshot) => snapshot,
@@ -5072,7 +5104,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             surface_height,
             scale,
         }) {
-            let key = frame_key(session, geometry);
+            let key = frame_key(session, appearance_from_raw(appearance), geometry);
             if let Some(state) = session.macos_render_host.as_mut() {
                 state.last_frame_key = Some(key);
             }
@@ -5098,6 +5130,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
 pub unsafe extern "C" fn yu_storage_session_frame_is_current(
     session: *mut YuStorageSession,
     geometry: *const YuStorageFrameGeometry,
+    appearance: u8,
     out_current: *mut u8,
 ) -> i32 {
     let Some(session) = (unsafe { session.as_mut() }) else {
@@ -5126,7 +5159,7 @@ pub unsafe extern "C" fn yu_storage_session_frame_is_current(
             Ok(geometry) => geometry,
             Err(status) => return status,
         };
-        let key = frame_key(session, geometry);
+        let key = frame_key(session, appearance_from_raw(appearance), geometry);
         let current = session.macos_render_host.as_ref().is_some_and(|state| {
             // 没有 surface 时不能声称当前帧有效：内容还没有真正上屏。
             state.surface.is_some() && state.last_frame_key.as_ref() == Some(&key)
@@ -6217,7 +6250,15 @@ mod tests {
         assert_eq!(
             unsafe {
                 yu_storage_session_macos_render_host_frame(
-                    raw, 0, 14.0, 500.0, 0.0, 240.0, 0, &mut frame,
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    &mut frame,
                 )
             },
             YU_STORAGE_OK
@@ -6493,11 +6534,37 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// 认不得的外观字节按浅色画，**不拒整帧**。
+    ///
+    /// 这条是反向验证时活下来的一个变异逼出来的：把 `_ => Light` 改成
+    /// `_ => Dark` 之后全套用例照样绿。没有它，未来系统多一种外观时的行为
+    /// 由一行没人读过的 `match` 决定——而两种可能的错法差别很大：拒整帧是
+    /// 一片空白（违反 I5「永不白屏」），认成深色是白底上的浅字。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unknown_appearance_byte_falls_back_to_light() {
+        assert_eq!(
+            appearance_from_raw(YU_STORAGE_APPEARANCE_LIGHT),
+            Appearance::Light
+        );
+        assert_eq!(
+            appearance_from_raw(YU_STORAGE_APPEARANCE_DARK),
+            Appearance::Dark
+        );
+        for raw in [2u8, 7, 255] {
+            assert_eq!(
+                appearance_from_raw(raw),
+                Appearance::Light,
+                "认不得的外观字节 {raw} 必须按浅色画，而不是拒整帧或猜成深色"
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_render_host_config_tracks_document_scroll_origin() {
         let viewport = ViewportSpan::new(137.5, 240.0);
-        let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0, 2.0)
+        let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0, 2.0, Appearance::Light)
             .expect("valid macOS render host config");
 
         assert_eq!(config.viewport().scroll_y(), 137.5);
@@ -6538,7 +6605,14 @@ mod tests {
         };
         let mut current = 1_u8;
         assert_eq!(
-            unsafe { yu_storage_session_frame_is_current(raw, &geometry, &mut current) },
+            unsafe {
+                yu_storage_session_frame_is_current(
+                    raw,
+                    &geometry,
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    &mut current,
+                )
+            },
             YU_STORAGE_OK
         );
         assert_eq!(current, 0, "尚未提交任何帧时不得判为当前");
@@ -6560,7 +6634,14 @@ mod tests {
         ] {
             let mut out = 1_u8;
             assert_eq!(
-                unsafe { yu_storage_session_frame_is_current(raw, &invalid, &mut out) },
+                unsafe {
+                    yu_storage_session_frame_is_current(
+                        raw,
+                        &invalid,
+                        YU_STORAGE_APPEARANCE_LIGHT,
+                        &mut out,
+                    )
+                },
                 YU_STORAGE_EDITOR_ERROR
             );
             assert_eq!(out, 0);
@@ -6569,7 +6650,14 @@ mod tests {
         // 空指针必须返回明确状态，不得写入半成品输出。
         let mut out = 1_u8;
         assert_eq!(
-            unsafe { yu_storage_session_frame_is_current(raw, std::ptr::null(), &mut out) },
+            unsafe {
+                yu_storage_session_frame_is_current(
+                    raw,
+                    std::ptr::null(),
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    &mut out,
+                )
+            },
             YU_STORAGE_NULL_POINTER
         );
         assert_eq!(out, 0);
@@ -6851,7 +6939,7 @@ mod tests {
             // SAFETY: `raw` is a live session handle and no other borrow is
             // outstanding at this point.
             let session = unsafe { raw.as_ref() }.expect("session");
-            frame_key(session, geometry)
+            frame_key(session, Appearance::Light, geometry)
         };
 
         let baseline = capture(geometry);
@@ -7597,7 +7685,15 @@ mod tests {
             assert_eq!(
                 unsafe {
                     yu_storage_session_macos_render_host_frame(
-                        raw, 0, 14.0, 500.0, 0.0, 240.0, 0, &mut frame,
+                        raw,
+                        0,
+                        14.0,
+                        500.0,
+                        0.0,
+                        240.0,
+                        0,
+                        YU_STORAGE_APPEARANCE_LIGHT,
+                        &mut frame,
                     )
                 },
                 YU_STORAGE_OK
@@ -7731,8 +7827,9 @@ mod tests {
     fn macos_render_host_config_rejects_invalid_raster_scale() {
         let viewport = ViewportSpan::new(0.0, 240.0);
         for invalid in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
-            let config = macos_render_host_config(viewport, 14.0, 500.0, 240.0, invalid)
-                .expect("config should still build");
+            let config =
+                macos_render_host_config(viewport, 14.0, 500.0, 240.0, invalid, Appearance::Light)
+                    .expect("config should still build");
             assert_eq!(
                 config.raster_scale(),
                 1.0,
@@ -7762,7 +7859,15 @@ mod tests {
         assert_eq!(
             unsafe {
                 yu_storage_session_macos_render_host_frame(
-                    raw, 0, 14.0, 500.0, 0.0, 240.0, 0, &mut first,
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    &mut first,
                 )
             },
             YU_STORAGE_OK
@@ -7938,6 +8043,7 @@ mod tests {
                     0.0,
                     240.0,
                     0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
                     &mut transient,
                 )
             },
@@ -8065,6 +8171,7 @@ mod tests {
                     0.0,
                     240.0,
                     0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
                     &mut canonical_frame,
                 )
             },
@@ -8115,7 +8222,15 @@ mod tests {
         assert_eq!(
             unsafe {
                 yu_storage_session_macos_render_host_frame(
-                    raw, 0, 14.0, 500.0, 0.0, 240.0, 0, &mut first,
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    &mut first,
                 )
             },
             YU_STORAGE_OK
@@ -8144,6 +8259,7 @@ mod tests {
                     0.0,
                     240.0,
                     0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
                     &mut repeated,
                 )
             },
@@ -8186,6 +8302,7 @@ mod tests {
                     0.0,
                     240.0,
                     0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
                     &mut cross_block,
                 )
             },
@@ -8212,6 +8329,7 @@ mod tests {
                     0.0,
                     240.0,
                     0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
                     &mut after_cancel,
                 )
             },
@@ -8233,6 +8351,7 @@ mod tests {
                     12.0,
                     180.0,
                     1,
+                    YU_STORAGE_APPEARANCE_LIGHT,
                     &mut resized,
                 )
             },
@@ -8254,6 +8373,7 @@ mod tests {
                     0.0,
                     240.0,
                     0,
+                    YU_STORAGE_APPEARANCE_LIGHT,
                     &mut regressed_generation,
                 )
             },
@@ -8273,7 +8393,15 @@ mod tests {
         assert_eq!(
             unsafe {
                 yu_storage_session_macos_render_host_frame(
-                    raw, 0, 14.0, 500.0, 0.0, 240.0, 1, &mut stale,
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    1,
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    &mut stale,
                 )
             },
             YU_STORAGE_STALE_REVISION
@@ -8284,7 +8412,15 @@ mod tests {
         assert_eq!(
             unsafe {
                 yu_storage_session_macos_render_host_frame(
-                    raw, 1, 14.0, 500.0, 0.0, 240.0, 1, &mut next,
+                    raw,
+                    1,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    1,
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    &mut next,
                 )
             },
             YU_STORAGE_OK
