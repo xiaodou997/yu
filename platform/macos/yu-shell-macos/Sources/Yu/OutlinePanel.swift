@@ -15,7 +15,7 @@ import YuStorageFFI
 //      ——那是 `PanelLabel` 的事，两个面板共用一份。
 //
 // 导航**不另开 FFI**：拿 `labelRange.location` 走已有的选区入口，滚动交给
-// yu-editor::viewport 那条路（`macosShapedCaretScrollRequest`）。面板不算 y。
+// yu-editor::viewport 那条路（`shapedCaretScrollRequest`）。面板不算 y。
 
 /// 平表转成树之后的一个节点。
 ///

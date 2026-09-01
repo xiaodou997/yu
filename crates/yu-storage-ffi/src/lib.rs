@@ -37,7 +37,9 @@ use yu_text::{EditError, TextSnapshot};
 #[cfg(target_os = "macos")]
 use yu_scene::{EditorDecorationPrimitiveRole, Point, Primitive, Rect, Rgba8};
 #[cfg(target_os = "macos")]
-use yu_workspace::{EditorDecorationStyle, ViewportRenderConfig};
+use yu_workspace::{
+    EditorDecorationStyle, FrameGeometry, FrameKey, FrameTableResize, ViewportRenderConfig,
+};
 
 #[cfg(target_os = "macos")]
 use yu_assets::{
@@ -88,7 +90,7 @@ pub const YU_STORAGE_STALE_COMPOSITION: i32 = 16;
 // **编号退休不复用**：别的平台可能还编译着旧头文件，17 换个含义比留一个空
 // 洞危险得多。
 pub const YU_STORAGE_HTML_IMPORT_REJECTED: i32 = 18;
-pub const YU_STORAGE_CORE_TEXT_UNAVAILABLE: i32 = 19;
+pub const YU_STORAGE_SHAPER_UNAVAILABLE: i32 = 19;
 pub const YU_STORAGE_INVALID_VIEWPORT_CONFIG: i32 = 20;
 pub const YU_STORAGE_RENDER_HOST_UNAVAILABLE: i32 = 21;
 
@@ -107,7 +109,7 @@ pub const YU_STORAGE_CLIPBOARD_HTML: u8 = 1;
 pub const YU_STORAGE_TABLE_RESIZE_COLUMN: u8 = 1;
 pub const YU_STORAGE_TABLE_RESIZE_ROW: u8 = 2;
 
-/// `yu_storage_session_macos_table_resize_at_point` 的动作。
+/// `yu_storage_session_table_resize_at_point` 的动作。
 pub const YU_STORAGE_TABLE_RESIZE_PROBE: u8 = 0;
 pub const YU_STORAGE_TABLE_RESIZE_BEGIN: u8 = 1;
 
@@ -620,7 +622,7 @@ pub struct YuStorageAccessibilityNodeV2 {
 ///
 /// **导航不另开入口**：拿 `label_start_utf16` 调
 /// `yu_storage_session_set_selection_endpoints`，再调
-/// `yu_storage_session_macos_shaped_caret_scroll_request`。滚动仍然走
+/// `yu_storage_session_shaped_caret_scroll_request`。滚动仍然走
 /// viewport 那一条路，平台侧不自己算 y。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -913,148 +915,53 @@ struct MacosRenderHostState {
     /// 这个判断此前在 Swift：平台每帧都要先查 Revision 和 composition
     /// generation 才能组装出比较用的键，一次提交因此产生七八次 FFI 往返。
     /// 状态在 Rust，决策就该在 Rust。
-    last_frame_key: Option<MacosFrameKey>,
+    last_frame_key: Option<FrameKey>,
 }
 
-/// 平台提供的一帧几何。
+/// 把平台送过来的一帧几何翻成工作区那份定义。
 ///
-/// 这些值只有 AppKit 知道（view bounds、clip view 滚动位置、backing scale），
-/// 因此必须由平台传入；其余判断全部留在 Rust。用位模式比较而不是浮点相等，
-/// 避免 NaN 让「相同几何」永远判为不同而每帧重画。
+/// 这一步留在 FFI，因为 `YuStorageFrameGeometry` 是 C 结构体；校验规则本身
+/// 归 [`FrameGeometry`]，两端共用。
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MacosFrameGeometry {
-    size_bits: u32,
-    max_width_bits: u32,
-    scroll_y_bits: u32,
-    viewport_height_bits: u32,
-    surface_width_bits: u64,
-    surface_height_bits: u64,
-    scale_bits: u64,
+fn frame_geometry(request: &YuStorageFrameGeometry) -> Result<FrameGeometry, i32> {
+    FrameGeometry::new(
+        request.size,
+        request.max_width,
+        request.scroll_y,
+        request.viewport_height,
+        request.surface_width,
+        request.surface_height,
+        request.scale,
+    )
+    .ok_or(YU_STORAGE_EDITOR_ERROR)
 }
 
+/// 用当前会话状态与平台几何组装帧身份。
+///
+/// 提交路径与 `frame_is_current` 共用这一个函数。两边各写一份是这个判断最
+/// 容易出错的地方：只要有一项不对称，就会出现「明明变了却判为等价」或
+/// 「明明没变却每帧重画」。
 #[cfg(target_os = "macos")]
-impl MacosFrameGeometry {
-    fn from_request(request: &YuStorageFrameGeometry) -> Result<Self, i32> {
-        let finite32 = |value: f32, positive: bool| {
-            value.is_finite() && (if positive { value > 0.0 } else { value >= 0.0 })
-        };
-        let finite64 = |value: f64| value.is_finite() && value > 0.0;
-        if !finite32(request.size, true)
-            || !finite32(request.max_width, true)
-            || !finite32(request.scroll_y, false)
-            || !finite32(request.viewport_height, true)
-            || !finite64(request.surface_width)
-            || !finite64(request.surface_height)
-            || !finite64(request.scale)
-        {
-            return Err(YU_STORAGE_EDITOR_ERROR);
-        }
-        Ok(Self {
-            size_bits: request.size.to_bits(),
-            max_width_bits: request.max_width.to_bits(),
-            scroll_y_bits: request.scroll_y.to_bits(),
-            viewport_height_bits: request.viewport_height.to_bits(),
-            surface_width_bits: request.surface_width.to_bits(),
-            surface_height_bits: request.surface_height.to_bits(),
-            scale_bits: request.scale.to_bits(),
+fn frame_key(session: &YuStorageSession, geometry: FrameGeometry) -> FrameKey {
+    let revision = session.session.revision();
+    // 与 `macos_render_host_frame` 使用同一条过滤规则：只有匹配当前
+    // Revision 的列覆盖会进入渲染配置，其余不影响画面，也就不该影响身份。
+    let table_resize = session
+        .table_resize_override
+        .filter(|commit| {
+            commit.revision() == revision
+                && matches!(commit.target(), TableResizeTarget::Column { .. })
         })
-    }
+        .map(FrameTableResize::capture);
+    FrameKey::new(
+        revision.get(),
+        session.session.composition_generation(),
+        session.session.selections().as_slice().to_vec(),
+        session.session.document().editor().search_generation(),
+        table_resize,
+        geometry,
+    )
 }
-
-/// 表格 resize 的有效覆盖，作为帧身份的一部分。
-///
-/// 拖动分隔线既不推进 Revision 也不改变几何，但整张表的列宽都会变。少了这一项，
-/// 一次拖动会被判为「与屏幕上的帧等价」而整段被跳过。
-///
-/// 与几何同理用位模式比较：`TableResizeCommit` 携带 f32，直接用 `PartialEq`
-/// 会让任何 NaN 与自身不等，从而每帧重画。
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MacosFrameTableResize {
-    revision: u64,
-    block_index: usize,
-    target: TableResizeTarget,
-    initial_position_bits: u32,
-    final_position_bits: u32,
-}
-
-#[cfg(target_os = "macos")]
-impl MacosFrameTableResize {
-    fn capture(commit: TableResizeCommit) -> Self {
-        Self {
-            revision: commit.revision().get(),
-            block_index: commit.block_index(),
-            target: commit.target(),
-            initial_position_bits: commit.initial_position().to_bits(),
-            final_position_bits: commit.final_position().to_bits(),
-        }
-    }
-}
-
-/// 一帧的完整身份：Rust 拥有的可视状态 + 平台提供的几何。
-///
-/// 全部一起比较，任何一项变化都要重画：
-///
-/// - `revision`：源码改变。
-/// - `composition_generation`：marked text 更新——它不推进 Revision。
-/// - `selections`：光标与选区装饰改变——它同样不推进 Revision。**条数变化也在
-///   内**：从一根光标变成三根既不推进 Revision 也不改几何，少了它的表现是
-///   「按下全部选中，画面一动不动」。
-/// - `search_generation`：换了查询——同样不推进 Revision、不改几何、不改选区。
-///   「当前命中」换一个不用单列一项：那是从 `selection` 推出来的。
-/// - `table_resize`：拖动中的列宽覆盖——既不推进 Revision 也不改变几何。
-/// - `geometry`：字号、换行宽度、滚动、surface 尺寸与 backing scale。
-///
-/// 这个列表就是「帧内容取决于什么」的完整定义。新增一种不推进 Revision 的
-/// 可视状态时必须同时加进来，否则它的变化会被静默跳过——本项目最危险的失败
-/// 模式正是这种不报错的漏画。
-///
-/// # 为什么是整组比较，不是一个摘要
-///
-/// 把 N 条选区哈希成一个 u64 会让 `MacosFrameKey` 继续是 `Copy` 的，代价是
-/// 碰撞——而碰撞的表现正是这个类型的文档明令要防的那件事：**静默跳过一帧**。
-/// 一次 `Vec` 分配（N 是光标数）换掉一个不报错的漏画，这笔账不用算。
-#[cfg(target_os = "macos")]
-#[derive(Clone, Debug, PartialEq)]
-struct MacosFrameKey {
-    revision: u64,
-    composition_generation: u64,
-    selections: Vec<yu_editor::EditorSelection>,
-    search_generation: u64,
-    table_resize: Option<MacosFrameTableResize>,
-    geometry: MacosFrameGeometry,
-}
-
-#[cfg(target_os = "macos")]
-impl MacosFrameKey {
-    /// 用当前会话状态与平台几何组装帧身份。
-    ///
-    /// 提交路径与 `frame_is_current` 共用这一个构造函数。两边各写一份是这个
-    /// 判断最容易出错的地方：只要有一项不对称，就会出现「明明变了却判为等价」
-    /// 或「明明没变却每帧重画」。
-    fn capture(session: &YuStorageSession, geometry: MacosFrameGeometry) -> Self {
-        let revision = session.session.revision();
-        // 与 `macos_render_host_frame` 使用同一条过滤规则：只有匹配当前
-        // Revision 的列覆盖会进入渲染配置，其余不影响画面，也就不该影响身份。
-        let table_resize = session
-            .table_resize_override
-            .filter(|commit| {
-                commit.revision() == revision
-                    && matches!(commit.target(), TableResizeTarget::Column { .. })
-            })
-            .map(MacosFrameTableResize::capture);
-        Self {
-            revision: revision.get(),
-            composition_generation: session.session.composition_generation(),
-            selections: session.session.selections().as_slice().to_vec(),
-            search_generation: session.session.document().editor().search_generation(),
-            table_resize,
-            geometry,
-        }
-    }
-}
-
 #[cfg(target_os = "macos")]
 struct MacosPersistentSurfaceState {
     surface: MetalSurface,
@@ -2143,13 +2050,12 @@ fn core_text_system_ui_layout(
     if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
         return Err(YU_STORAGE_EDITOR_ERROR);
     }
-    let request =
-        FontRequest::new("System UI", size).map_err(|_| YU_STORAGE_CORE_TEXT_UNAVAILABLE)?;
+    let request = FontRequest::new("System UI", size).map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
     let shaper =
-        CoreTextShaper::from_system_ui(request).map_err(|_| YU_STORAGE_CORE_TEXT_UNAVAILABLE)?;
+        CoreTextShaper::from_system_ui(request).map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
     let metrics = shaper
         .viewport_metrics("M中🙂e\u{301}")
-        .map_err(|_| YU_STORAGE_CORE_TEXT_UNAVAILABLE)?;
+        .map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
     let config = LayoutConfig::new(max_width, metrics.line_height())
         .with_default_advance(metrics.default_advance());
     Ok((shaper, metrics, config))
@@ -2562,15 +2468,15 @@ pub unsafe extern "C" fn yu_storage_session_execute_command(
     command_result_output(&session.session, result, output)
 }
 
-/// Executes one vertical caret command against the current macOS shaped
+/// Executes one vertical caret command against the current shaped
 /// block layouts. The command result still uses the ordinary source/selection
-/// contract; CoreText is only a caller-owned layout provider for this query.
+/// contract; the platform shaper is only a layout provider for this query.
 /// The host must have published matching viewport metrics first.
 ///
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_move_vertical(
+pub unsafe extern "C" fn yu_storage_session_move_vertical(
     session: *mut YuStorageSession,
     expected_revision: u64,
     command: u8,
@@ -2590,7 +2496,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_move_vertical(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (session, expected_revision, command, size, max_width);
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -3166,7 +3072,7 @@ pub unsafe extern "C" fn yu_storage_session_projection_source_selection(
     YU_STORAGE_OK
 }
 
-/// Resolves a document-space point through the current CoreText-shaped block
+/// Resolves a document-space point through the current shaped block
 /// layout. The endpoint is Revision-bound and uses the same published
 /// viewport metrics as the native surface; it never asks the Swift/AppKit
 /// mirror to approximate glyph positions. The returned `x`/`y` are snapped
@@ -3176,7 +3082,7 @@ pub unsafe extern "C" fn yu_storage_session_projection_source_selection(
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
+pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
     session: *mut YuStorageSession,
     expected_revision: u64,
     point_x: f32,
@@ -3204,7 +3110,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_projection_hit_test(
             size,
             max_width,
         );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -3368,7 +3274,7 @@ pub unsafe extern "C" fn yu_storage_session_composition_projection(
     YU_STORAGE_OK
 }
 
-/// Resolves the active marked-text caret through an uncached CoreText-shaped
+/// Resolves the active marked-text caret through an uncached shaped
 /// composition layout. Canonical source and Revision remain unchanged; the
 /// expected generation guards the transient preedit. Caret geometry is local
 /// to the owning parser block, while visual UTF-16 ranges use the full
@@ -3377,7 +3283,7 @@ pub unsafe extern "C" fn yu_storage_session_composition_projection(
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_composition_shaped_caret(
+pub unsafe extern "C" fn yu_storage_session_composition_shaped_caret(
     session: *mut YuStorageSession,
     expected_revision: u64,
     expected_generation: u64,
@@ -3407,7 +3313,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_composition_shaped_caret(
             size,
             max_width,
         );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -3655,7 +3561,7 @@ fn macos_table_resize_hit_at_point(
 }
 
 /// Resolves a document-space point against task checkbox geometry from the
-/// current persistent macOS render-host publication. This function never
+/// current persistent render-host publication. This function never
 /// reparses Markdown, rebuilds layout or mutates the editor. A native caller
 /// may pass the returned block to the existing `ToggleTask` command only while
 /// the returned Revision is still current.
@@ -3663,7 +3569,7 @@ fn macos_table_resize_hit_at_point(
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_task_checkbox_hit_test(
+pub unsafe extern "C" fn yu_storage_session_task_checkbox_hit_test(
     session: *mut YuStorageSession,
     expected_revision: u64,
     point_x: f32,
@@ -3682,7 +3588,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_task_checkbox_hit_test(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (session, expected_revision, point_x, point_y);
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -3767,7 +3673,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_task_checkbox_hit_test(
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_table_resize_at_point(
+pub unsafe extern "C" fn yu_storage_session_table_resize_at_point(
     session: *mut YuStorageSession,
     expected_revision: u64,
     action: u8,
@@ -3801,7 +3707,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_at_point(
             tolerance,
             pointer_position,
         );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -3996,7 +3902,7 @@ fn macos_shaped_caret(
 /// # Safety
 /// `session` must be live and `output` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_source_caret(
+pub unsafe extern "C" fn yu_storage_session_source_caret(
     session: *mut YuStorageSession,
     expected_revision: u64,
     source_utf16: u64,
@@ -4024,7 +3930,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_source_caret(
             size,
             max_width,
         );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -4056,7 +3962,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_source_caret(
 /// `session` must be live; `written` must be writable; `dividers` must point to
 /// `capacity` writable values when `capacity > 0`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_table_resize_accessibility_dividers(
+pub unsafe extern "C" fn yu_storage_session_table_resize_accessibility_dividers(
     session: *mut YuStorageSession,
     expected_revision: u64,
     size: f32,
@@ -4091,7 +3997,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_table_resize_accessibility_div
             dividers,
             capacity,
         );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -4414,7 +4320,7 @@ fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange,
 fn macos_render_host_error_status(error: &CoreTextViewportFrameError) -> i32 {
     match error {
         CoreTextViewportFrameError::InvalidConfig(_) => YU_STORAGE_INVALID_VIEWPORT_CONFIG,
-        CoreTextViewportFrameError::Raster(_) => YU_STORAGE_CORE_TEXT_UNAVAILABLE,
+        CoreTextViewportFrameError::Raster(_) => YU_STORAGE_SHAPER_UNAVAILABLE,
         CoreTextViewportFrameError::Document(error) => status_from_editor_error(error.clone()),
         CoreTextViewportFrameError::Atlas(_) | CoreTextViewportFrameError::Publish(_) => {
             YU_STORAGE_RENDER_HOST_UNAVAILABLE
@@ -4617,7 +4523,7 @@ fn macos_render_host_frame(
             .builder
             .shaper()
             .viewport_metrics("M中🙂e\u{301}")
-            .map_err(|_| YU_STORAGE_CORE_TEXT_UNAVAILABLE)?;
+            .map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
         (metrics, None)
     };
     macos_publish_viewport_config(session, max_width, metrics)?;
@@ -4932,7 +4838,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
             viewport_height,
             surface_generation,
         );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -5017,7 +4923,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             scale,
             view,
         );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -5157,7 +5063,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             };
         }
         // 记录这一帧的身份，供 `frame_is_current` 判断后续提交是否等价。
-        if let Ok(geometry) = MacosFrameGeometry::from_request(&YuStorageFrameGeometry {
+        if let Ok(geometry) = frame_geometry(&YuStorageFrameGeometry {
             size,
             max_width,
             scroll_y,
@@ -5166,7 +5072,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             surface_height,
             scale,
         }) {
-            let key = MacosFrameKey::capture(session, geometry);
+            let key = frame_key(session, geometry);
             if let Some(state) = session.macos_render_host.as_mut() {
                 state.last_frame_key = Some(key);
             }
@@ -5177,7 +5083,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
 
 /// 判断按给定几何提交的下一帧是否与已在屏幕上的帧完全等价。
 ///
-/// 等价的完整定义见 [`MacosFrameKey`]：Revision、composition generation、
+/// 等价的完整定义见 [`FrameKey`]：Revision、composition generation、
 /// 全部选区、查询代数、表格 resize 覆盖与几何全部不变才算等价。其中有四项
 /// 不推进 Revision，只比 Revision 会把光标移动、加一根光标、preedit 更新、
 /// 换查询与列宽拖动全部静默跳过。
@@ -5189,7 +5095,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
 /// # Safety
 /// `session`、`geometry` 与 `out_current` 必须是调用方拥有的有效指针。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_frame_is_current(
+pub unsafe extern "C" fn yu_storage_session_frame_is_current(
     session: *mut YuStorageSession,
     geometry: *const YuStorageFrameGeometry,
     out_current: *mut u8,
@@ -5211,16 +5117,16 @@ pub unsafe extern "C" fn yu_storage_session_macos_frame_is_current(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (session, geometry);
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
     {
-        let geometry = match MacosFrameGeometry::from_request(geometry) {
+        let geometry = match frame_geometry(geometry) {
             Ok(geometry) => geometry,
             Err(status) => return status,
         };
-        let key = MacosFrameKey::capture(session, geometry);
+        let key = frame_key(session, geometry);
         let current = session.macos_render_host.as_ref().is_some_and(|state| {
             // 没有 surface 时不能声称当前帧有效：内容还没有真正上屏。
             state.surface.is_some() && state.last_frame_key.as_ref() == Some(&key)
@@ -5253,7 +5159,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
     YU_STORAGE_OK
 }
 
-/// Resolves the current focus caret through the macOS CoreText-shaped
+/// Resolves the current focus caret through the shaped
 /// viewport policy. `caret_y` is document-space, while `current_scroll_y` and
 /// `target_scroll_y` are absolute document scroll offsets. The native host
 /// must apply the target only when the returned Revision still matches.
@@ -5261,7 +5167,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
 /// # Safety
 /// `session` must be a live handle and `output` must be writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_macos_shaped_caret_scroll_request(
+pub unsafe extern "C" fn yu_storage_session_shaped_caret_scroll_request(
     session: *mut YuStorageSession,
     expected_revision: u64,
     size: f32,
@@ -5289,7 +5195,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_shaped_caret_scroll_request(
             scroll_y,
             viewport_height,
         );
-        return YU_STORAGE_CORE_TEXT_UNAVAILABLE;
+        return YU_STORAGE_SHAPER_UNAVAILABLE;
     }
 
     #[cfg(target_os = "macos")]
@@ -6189,7 +6095,7 @@ mod tests {
         let mut result = YuStorageCommandResult::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_move_vertical(
+                yu_storage_session_move_vertical(
                     raw,
                     0,
                     YU_STORAGE_COMMAND_MOVE_DOWN,
@@ -6206,7 +6112,7 @@ mod tests {
 
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_move_vertical(
+                yu_storage_session_move_vertical(
                     raw,
                     0,
                     YU_STORAGE_COMMAND_MOVE_DOWN,
@@ -6229,7 +6135,7 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_move_vertical(
+                yu_storage_session_move_vertical(
                     raw,
                     0,
                     YU_STORAGE_COMMAND_MOVE_UP,
@@ -6263,9 +6169,7 @@ mod tests {
         let mut hit = YuStorageProjectionHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_projection_hit_test(
-                    raw, 0, 0.0, 0.0, 14.0, 500.0, &mut hit,
-                )
+                yu_storage_session_projection_hit_test(raw, 0, 0.0, 0.0, 14.0, 500.0, &mut hit)
             },
             YU_STORAGE_OK
         );
@@ -6284,9 +6188,7 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_projection_hit_test(
-                    raw, 0, 0.0, 0.0, 14.0, 500.0, &mut hit,
-                )
+                yu_storage_session_projection_hit_test(raw, 0, 0.0, 0.0, 14.0, 500.0, &mut hit)
             },
             YU_STORAGE_STALE_REVISION
         );
@@ -6350,7 +6252,7 @@ mod tests {
         let mut hit = YuStorageTaskCheckboxHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
+                yu_storage_session_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
             },
             YU_STORAGE_OK
         );
@@ -6369,7 +6271,7 @@ mod tests {
         };
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_task_checkbox_hit_test(
+                yu_storage_session_task_checkbox_hit_test(
                     raw,
                     0,
                     bounds.right() + 2.0,
@@ -6387,7 +6289,7 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
+                yu_storage_session_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
             },
             YU_STORAGE_INVALID_STATE
         );
@@ -6425,7 +6327,7 @@ mod tests {
         };
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
+                yu_storage_session_task_checkbox_hit_test(raw, 0, point_x, point_y, &mut hit)
             },
             YU_STORAGE_STALE_REVISION
         );
@@ -6636,7 +6538,7 @@ mod tests {
         };
         let mut current = 1_u8;
         assert_eq!(
-            unsafe { yu_storage_session_macos_frame_is_current(raw, &geometry, &mut current) },
+            unsafe { yu_storage_session_frame_is_current(raw, &geometry, &mut current) },
             YU_STORAGE_OK
         );
         assert_eq!(current, 0, "尚未提交任何帧时不得判为当前");
@@ -6658,7 +6560,7 @@ mod tests {
         ] {
             let mut out = 1_u8;
             assert_eq!(
-                unsafe { yu_storage_session_macos_frame_is_current(raw, &invalid, &mut out) },
+                unsafe { yu_storage_session_frame_is_current(raw, &invalid, &mut out) },
                 YU_STORAGE_EDITOR_ERROR
             );
             assert_eq!(out, 0);
@@ -6667,7 +6569,7 @@ mod tests {
         // 空指针必须返回明确状态，不得写入半成品输出。
         let mut out = 1_u8;
         assert_eq!(
-            unsafe { yu_storage_session_macos_frame_is_current(raw, std::ptr::null(), &mut out) },
+            unsafe { yu_storage_session_frame_is_current(raw, std::ptr::null(), &mut out) },
             YU_STORAGE_NULL_POINTER
         );
         assert_eq!(out, 0);
@@ -6710,7 +6612,7 @@ mod tests {
     /// preedit 不更新、拖动中的列宽不动。三者都表现为「编辑器卡住了」，却没有
     /// 任何日志或错误码可查，正是本项目最危险的失败模式。
     ///
-    /// 反向验证：把 `selection` 从 `MacosFrameKey` 去掉，第二段断言失败；
+    /// 反向验证：把 `selection` 从 `FrameKey` 去掉，第二段断言失败；
     /// 把 `table_resize` 去掉，第三段断言失败。
     /// 未知的剪贴板格式必须被拒绝，且不得留下长度。
     ///
@@ -6817,7 +6719,7 @@ mod tests {
         for step in 0_u16..400 {
             let x = f32::from(step) * 0.5;
             let status = unsafe {
-                yu_storage_session_macos_table_resize_at_point(
+                yu_storage_session_table_resize_at_point(
                     raw,
                     0,
                     YU_STORAGE_TABLE_RESIZE_PROBE,
@@ -6857,7 +6759,7 @@ mod tests {
         let mut rejected = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_at_point(
+                yu_storage_session_table_resize_at_point(
                     raw,
                     0,
                     9,
@@ -6890,7 +6792,7 @@ mod tests {
         let mut begun = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_at_point(
+                yu_storage_session_table_resize_at_point(
                     raw,
                     0,
                     YU_STORAGE_TABLE_RESIZE_BEGIN,
@@ -6944,12 +6846,12 @@ mod tests {
             surface_height: 240.0,
             scale: 2.0,
         };
-        let geometry = MacosFrameGeometry::from_request(&request).expect("几何合法");
-        let capture = |geometry: MacosFrameGeometry| {
+        let geometry = frame_geometry(&request).expect("几何合法");
+        let capture = |geometry: FrameGeometry| {
             // SAFETY: `raw` is a live session handle and no other borrow is
             // outstanding at this point.
             let session = unsafe { raw.as_ref() }.expect("session");
-            MacosFrameKey::capture(session, geometry)
+            frame_key(session, geometry)
         };
 
         let baseline = capture(geometry);
@@ -6973,7 +6875,11 @@ mod tests {
             YU_STORAGE_OK
         );
         let moved = capture(geometry);
-        assert_eq!(moved.revision, baseline.revision, "选区变化不推进 Revision");
+        assert_eq!(
+            moved.revision(),
+            baseline.revision(),
+            "选区变化不推进 Revision"
+        );
         assert_ne!(baseline, moved, "光标移动必须让帧身份改变");
 
         // **加一根光标同样不推进 Revision、不改几何。**
@@ -7003,10 +6909,15 @@ mod tests {
             YU_STORAGE_OK
         );
         let two = capture(geometry);
-        assert_eq!(two.revision, moved.revision, "加一根光标不推进 Revision");
-        assert_eq!(two.geometry, moved.geometry, "加一根光标不改变几何");
         assert_eq!(
-            two.selections[0], moved.selections[0],
+            two.revision(),
+            moved.revision(),
+            "加一根光标不推进 Revision"
+        );
+        assert_eq!(two.geometry(), moved.geometry(), "加一根光标不改变几何");
+        assert_eq!(
+            two.selections()[0],
+            moved.selections()[0],
             "primary 那一条没有动——只比它的话这一步会被判为等价"
         );
         assert_ne!(moved, two, "光标根数变化必须让帧身份改变");
@@ -7036,9 +6947,17 @@ mod tests {
             YU_STORAGE_OK
         );
         let searched = capture(geometry);
-        assert_eq!(searched.revision, moved.revision, "换查询不推进 Revision");
-        assert_eq!(searched.selections, moved.selections, "换查询不改变选区");
-        assert_eq!(searched.geometry, moved.geometry, "换查询不改变几何");
+        assert_eq!(
+            searched.revision(),
+            moved.revision(),
+            "换查询不推进 Revision"
+        );
+        assert_eq!(
+            searched.selections(),
+            moved.selections(),
+            "换查询不改变选区"
+        );
+        assert_eq!(searched.geometry(), moved.geometry(), "换查询不改变几何");
         assert_ne!(moved, searched, "换查询必须让帧身份改变");
 
         // 收掉搜索也是一次变化：高亮要消失。
@@ -7066,8 +6985,8 @@ mod tests {
             YU_STORAGE_OK
         );
         let dragged = capture(geometry);
-        assert_eq!(dragged.revision, moved.revision, "拖动不推进 Revision");
-        assert_eq!(dragged.geometry, moved.geometry, "拖动不改变平台几何");
+        assert_eq!(dragged.revision(), moved.revision(), "拖动不推进 Revision");
+        assert_eq!(dragged.geometry(), moved.geometry(), "拖动不改变平台几何");
         assert_ne!(moved, dragged, "列宽覆盖变化必须让帧身份改变");
 
         // 再拖一格：同一个 gesture 内的位移同样必须被看见。
@@ -7086,7 +7005,7 @@ mod tests {
         assert_ne!(dragged, capture(geometry), "同一手势内的位移必须被看见");
 
         // 几何本身仍然参与比较。
-        let scrolled = MacosFrameGeometry::from_request(&YuStorageFrameGeometry {
+        let scrolled = frame_geometry(&YuStorageFrameGeometry {
             scroll_y: 40.0,
             ..request
         })
@@ -7309,7 +7228,7 @@ mod tests {
         let mut caret = YuStorageBlockCaret::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_source_caret(
+                yu_storage_session_source_caret(
                     raw,
                     0,
                     source_utf16,
@@ -7332,7 +7251,7 @@ mod tests {
         let mut first = YuStorageBlockCaret::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_source_caret(
+                yu_storage_session_source_caret(
                     raw,
                     0,
                     0,
@@ -7351,7 +7270,7 @@ mod tests {
         let mut rejected = YuStorageBlockCaret::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_source_caret(
+                yu_storage_session_source_caret(
                     raw,
                     0,
                     out_of_range,
@@ -7373,7 +7292,7 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_source_caret(
+                yu_storage_session_source_caret(
                     raw,
                     0,
                     source_utf16,
@@ -7876,7 +7795,7 @@ mod tests {
         let mut accessibility_required = 0;
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_accessibility_dividers(
+                yu_storage_session_table_resize_accessibility_dividers(
                     raw,
                     0,
                     14.0,
@@ -7896,7 +7815,7 @@ mod tests {
         let mut accessibility_written = accessibility_required;
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_accessibility_dividers(
+                yu_storage_session_table_resize_accessibility_dividers(
                     raw,
                     0,
                     14.0,
@@ -7926,7 +7845,7 @@ mod tests {
         let mut document_hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_at_point(
+                yu_storage_session_table_resize_at_point(
                     raw,
                     0,
                     YU_STORAGE_TABLE_RESIZE_PROBE,
@@ -7947,7 +7866,7 @@ mod tests {
         let mut document_begin = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_at_point(
+                yu_storage_session_table_resize_at_point(
                     raw,
                     0,
                     YU_STORAGE_TABLE_RESIZE_BEGIN,
@@ -7978,7 +7897,7 @@ mod tests {
         let mut hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_at_point(
+                yu_storage_session_table_resize_at_point(
                     raw,
                     0,
                     YU_STORAGE_TABLE_RESIZE_BEGIN,
@@ -8065,7 +7984,7 @@ mod tests {
         let mut effective_required = 0;
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_accessibility_dividers(
+                yu_storage_session_table_resize_accessibility_dividers(
                     raw,
                     0,
                     14.0,
@@ -8084,7 +8003,7 @@ mod tests {
         let mut effective_written = effective_required;
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_accessibility_dividers(
+                yu_storage_session_table_resize_accessibility_dividers(
                     raw,
                     0,
                     14.0,
@@ -8107,7 +8026,7 @@ mod tests {
         let mut effective_hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_table_resize_at_point(
+                yu_storage_session_table_resize_at_point(
                     raw,
                     0,
                     YU_STORAGE_TABLE_RESIZE_PROBE,
@@ -8417,7 +8336,7 @@ mod tests {
         let mut request = YuStorageCaretScrollRequest::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_shaped_caret_scroll_request(
+                yu_storage_session_shaped_caret_scroll_request(
                     raw,
                     0,
                     14.0,
@@ -8444,7 +8363,7 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_shaped_caret_scroll_request(
+                yu_storage_session_shaped_caret_scroll_request(
                     raw,
                     0,
                     14.0,
@@ -8495,7 +8414,7 @@ mod tests {
         let mut caret = YuStorageCompositionShapedCaret::default();
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_composition_shaped_caret(
+                yu_storage_session_composition_shaped_caret(
                     raw,
                     0,
                     1,
@@ -8528,7 +8447,7 @@ mod tests {
         };
         assert_eq!(
             unsafe {
-                yu_storage_session_macos_composition_shaped_caret(
+                yu_storage_session_composition_shaped_caret(
                     raw,
                     0,
                     2,

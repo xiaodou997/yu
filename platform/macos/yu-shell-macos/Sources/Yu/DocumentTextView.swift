@@ -248,7 +248,7 @@ final class DocumentTextView: NSTextView {
         guard point.x.isFinite,
               point.y.isFinite,
               let (size, width) = visualLayoutMetrics(),
-              let hit = try? bridge.macosProjectionHitTest(
+              let hit = try? bridge.projectionHitTest(
                   revision: bridge.state.revision,
                   point: CGPoint(x: point.x, y: point.y),
                   size: size,
@@ -1084,7 +1084,7 @@ final class DocumentTextView: NSTextView {
         let revision = bridge.state.revision
         let offset = UInt64(sourceUTF16)
         if bridge.composition.active {
-            guard let caret = try? bridge.macosCompositionShapedCaret(
+            guard let caret = try? bridge.compositionShapedCaret(
                 revision: revision,
                 generation: bridge.composition.generation,
                 sourceUTF16: offset,
@@ -1096,7 +1096,7 @@ final class DocumentTextView: NSTextView {
             }
             return NSRect(origin: caret.point, size: caret.size)
         }
-        guard let caret = try? bridge.macosSourceCaret(
+        guard let caret = try? bridge.sourceCaret(
             revision: revision,
             sourceUTF16: offset,
             affinity: 0,
@@ -1122,7 +1122,7 @@ final class DocumentTextView: NSTextView {
     ///
     /// **导航不另开 FFI。** 选区走 `setSelectedRange` 那条已有的路，它落到
     /// `yu_storage_session_set_selection_endpoints`；滚动由随之而来的
-    /// `onCaretChange` 交给 `macosShapedCaretScrollRequest`，也就是
+    /// `onCaretChange` 交给 `shapedCaretScrollRequest`，也就是
     /// yu-editor::viewport 那条路。**面板不自己算 y**——它手上只有 UTF-16
     /// 偏移，算 y 就要在平台侧复制一份排版。
     ///

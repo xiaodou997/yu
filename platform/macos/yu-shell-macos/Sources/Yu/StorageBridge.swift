@@ -793,14 +793,14 @@ final class StorageBridge {
         return NativeProjectionSourceSelection(value)
     }
 
-    func macosProjectionHitTest(
+    func projectionHitTest(
         revision: UInt64,
         point: CGPoint,
         size: Float,
         maxWidth: Float
     ) throws -> NativeProjectionHit {
         var value = YuStorageProjectionHit()
-        let status = yu_storage_session_macos_projection_hit_test(
+        let status = yu_storage_session_projection_hit_test(
             handle,
             revision,
             Float(point.x),
@@ -817,7 +817,7 @@ final class StorageBridge {
 
     /// 用一个文档坐标点探测或开始一次分隔线拖动。
     /// `pointerPosition` 只对 `.begin` 有意义。
-    func macosTableResizeAtDocumentPoint(
+    func tableResizeAtDocumentPoint(
         revision: UInt64,
         action: UInt8,
         size: Float,
@@ -827,7 +827,7 @@ final class StorageBridge {
         pointerPosition: Float = 0.0
     ) throws -> YuStorageTableResizeHit {
         var value = YuStorageTableResizeHit()
-        let status = yu_storage_session_macos_table_resize_at_point(
+        let status = yu_storage_session_table_resize_at_point(
             handle,
             revision,
             action,
@@ -845,12 +845,12 @@ final class StorageBridge {
         return value
     }
 
-    func macosTaskCheckboxHitTest(
+    func taskCheckboxHitTest(
         revision: UInt64,
         point: CGPoint
     ) throws -> NativeTaskCheckboxHit {
         var value = YuStorageTaskCheckboxHit()
-        let status = yu_storage_session_macos_task_checkbox_hit_test(
+        let status = yu_storage_session_task_checkbox_hit_test(
             handle,
             revision,
             Float(point.x),
@@ -886,7 +886,7 @@ final class StorageBridge {
 
     /// 不需要调用方指定 block 的 caret 几何查询。平台不解析 Markdown，
     /// 无法知道某个 source offset 属于哪个 block（不变量 I1）。
-    func macosSourceCaret(
+    func sourceCaret(
         revision: UInt64,
         sourceUTF16: UInt64,
         affinity: UInt8,
@@ -894,7 +894,7 @@ final class StorageBridge {
         maxWidth: Float
     ) throws -> NativeBlockCaret {
         var value = YuStorageBlockCaret()
-        let status = yu_storage_session_macos_source_caret(
+        let status = yu_storage_session_source_caret(
             handle,
             revision,
             sourceUTF16,
@@ -909,7 +909,7 @@ final class StorageBridge {
         return NativeBlockCaret(value)
     }
 
-    func macosTableResizeAccessibilityDividers(
+    func tableResizeAccessibilityDividers(
         revision: UInt64,
         size: Float,
         maxWidth: Float,
@@ -917,7 +917,7 @@ final class StorageBridge {
         viewportHeight: Float
     ) throws -> [NativeTableResizeAccessibilityDivider] {
         var required = 0
-        let sizeStatus = yu_storage_session_macos_table_resize_accessibility_dividers(
+        let sizeStatus = yu_storage_session_table_resize_accessibility_dividers(
             handle,
             revision,
             size,
@@ -937,7 +937,7 @@ final class StorageBridge {
         )
         var written = required
         let fillStatus = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_macos_table_resize_accessibility_dividers(
+            yu_storage_session_table_resize_accessibility_dividers(
                 handle,
                 revision,
                 size,
@@ -1023,7 +1023,7 @@ final class StorageBridge {
     ///
     /// 查询失败一律按「不是当前帧」处理：多提交一帧只是浪费一次绘制，
     /// 少提交一帧则是画面停在旧内容上，而且没有任何报错。
-    func macosFrameIsCurrent(
+    func frameIsCurrent(
         size: Float,
         maxWidth: Float,
         scrollY: Float,
@@ -1042,7 +1042,7 @@ final class StorageBridge {
             scale: scale
         )
         var current: UInt8 = 0
-        let status = yu_storage_session_macos_frame_is_current(handle, &geometry, &current)
+        let status = yu_storage_session_frame_is_current(handle, &geometry, &current)
         guard status == StorageStatus.ok else { return false }
         return current != 0
     }
@@ -1054,7 +1054,7 @@ final class StorageBridge {
         }
     }
 
-    func macosShapedCaretScrollRequest(
+    func shapedCaretScrollRequest(
         revision: UInt64,
         size: Float,
         maxWidth: Float,
@@ -1062,7 +1062,7 @@ final class StorageBridge {
         viewportHeight: Float
     ) throws -> NativeCaretScrollRequest {
         var value = YuStorageCaretScrollRequest()
-        let status = yu_storage_session_macos_shaped_caret_scroll_request(
+        let status = yu_storage_session_shaped_caret_scroll_request(
             handle,
             revision,
             size,
@@ -1449,7 +1449,7 @@ final class StorageBridge {
         maxWidth: Float
     ) throws -> NativeCommandResult {
         var result = YuStorageCommandResult()
-        let status = yu_storage_session_macos_move_vertical(
+        let status = yu_storage_session_move_vertical(
             handle,
             state.revision,
             command,
@@ -1556,7 +1556,7 @@ final class StorageBridge {
         return NativeCompositionProjection(value)
     }
 
-    func macosCompositionShapedCaret(
+    func compositionShapedCaret(
         revision: UInt64,
         generation: UInt64,
         sourceUTF16: UInt64,
@@ -1565,7 +1565,7 @@ final class StorageBridge {
         maxWidth: Float
     ) throws -> NativeCompositionShapedCaret {
         var value = YuStorageCompositionShapedCaret()
-        let status = yu_storage_session_macos_composition_shaped_caret(
+        let status = yu_storage_session_composition_shaped_caret(
             handle,
             revision,
             generation,

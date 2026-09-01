@@ -366,7 +366,7 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
             max(textView.bounds.width - 2.0 * textView.textContainerOrigin.x, 1.0)
         )
 
-        let hit = try bridge.macosProjectionHitTest(
+        let hit = try bridge.projectionHitTest(
             revision: revision,
             point: CGPoint(x: 0.0, y: 0.0),
             size: size,
@@ -392,7 +392,7 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
         let sourceEndUTF16 = UInt64(sourceEnd.location + sourceEnd.length)
         // 由 Rust 自己定位所属块：平台不需要先拿到 viewport 的块列表再挑一个，
         // 那等于把布局几何搬到平台侧（不变量 I3）。
-        let endCaret = try bridge.macosSourceCaret(
+        let endCaret = try bridge.sourceCaret(
             revision: revision,
             sourceUTF16: sourceEndUTF16,
             affinity: 0,
@@ -420,7 +420,7 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
 
         var staleRejected = false
         do {
-            _ = try bridge.macosProjectionHitTest(
+            _ = try bridge.projectionHitTest(
                 revision: revision + 1,
                 point: CGPoint(x: 0.0, y: 0.0),
                 size: size,
@@ -553,7 +553,7 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         precondition(accessibilityDivider.rect.height > 0.0)
         let tableY = accessibilityDivider.rect.midY
         let dividerPoint = NSPoint(x: accessibilityDivider.rect.midX, y: tableY)
-        let nearest = try bridge.macosTableResizeAtDocumentPoint(
+        let nearest = try bridge.tableResizeAtDocumentPoint(
             revision: revision,
             action: UInt8(YU_STORAGE_TABLE_RESIZE_PROBE),
             size: size,
@@ -625,7 +625,7 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         var taskLineY: CGFloat?
         for step in 0..<200 {
             let y = CGFloat(step) * 2.0
-            guard let hit = try? bridge.macosProjectionHitTest(
+            guard let hit = try? bridge.projectionHitTest(
                 revision: revision,
                 point: CGPoint(x: 1.0, y: y),
                 size: size,
@@ -646,7 +646,7 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         outer: for dy in stride(from: -8.0, through: 24.0, by: 2.0) {
             for dx in stride(from: 0.0, through: 48.0, by: 2.0) {
                 let probe = NSPoint(x: dx, y: taskLineY + dy)
-                if let hit = try? bridge.macosTaskCheckboxHitTest(
+                if let hit = try? bridge.taskCheckboxHitTest(
                     revision: revision,
                     point: probe
                 ) {
@@ -667,7 +667,7 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         textView.onDocumentChange = { documentChanges += 1 }
         textView.onTaskCheckboxPress = { [weak textView] point in
             guard let textView,
-                  let hit = try? bridge.macosTaskCheckboxHitTest(
+                  let hit = try? bridge.taskCheckboxHitTest(
                       revision: bridge.state.revision,
                       point: point
                   ) else {
@@ -682,7 +682,7 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         precondition(bridge.source != sourceBefore)
         precondition(bridge.source.contains("- [x] todo"))
         do {
-            _ = try bridge.macosTaskCheckboxHitTest(revision: revision, point: point)
+            _ = try bridge.taskCheckboxHitTest(revision: revision, point: point)
             preconditionFailure("stale task checkbox publication was accepted")
         } catch BridgeError.operation(let status) {
             precondition(status == StorageStatus.staleRevision)
@@ -716,7 +716,7 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
 ///      `parent` 字段。「挂错父亲」「静默地把孩子提成根」都在这里出。
 ///   2. 点第 N 行之后光标落在第 N 条标题的正文起点——判据是
 ///      `bridge.selection`，与面板走的是两条路。
-///   3. 那之后 `macosShapedCaretScrollRequest` 指向那一条的块。这一条压住
+///   3. 那之后 `shapedCaretScrollRequest` 指向那一条的块。这一条压住
 ///      「面板自己算 y」：滚动必须由 yu-editor::viewport 那条路给出。
 ///   4. 编辑之后刷新，展开状态与选中行不丢。纯 Swift 状态逻辑，每次
 ///      `reloadData` 全量重建就会丢，而且不报错。
@@ -807,7 +807,7 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
                     == NSRange(location: node.item.labelRange.location, length: 0),
                 "点第 \(row) 行之后光标不在 \(node.label) 的正文起点"
             )
-            let request = try bridge.macosShapedCaretScrollRequest(
+            let request = try bridge.shapedCaretScrollRequest(
                 revision: bridge.state.revision,
                 size: 14.0,
                 maxWidth: 500.0,
