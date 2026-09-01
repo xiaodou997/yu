@@ -50,6 +50,9 @@ pub const MARKDOWN_MIME: &str = "text/markdown";
 pub const MARKDOWN_UTI: &str = "net.daringfireball.markdown";
 pub const PLAIN_TEXT_MIME: &str = "text/plain;charset=utf-8";
 pub const PLAIN_TEXT_UTI: &str = "public.utf8-plain-text";
+/// 剪贴板 HTML 的编码声明。见 [`ClipboardPayload::html`] 上写的理由。
+pub const HTML_CHARSET_DECLARATION: &str = "<meta charset=\"utf-8\">";
+
 pub const HTML_MIME: &str = "text/html";
 pub const HTML_UTI: &str = "public.html";
 
@@ -124,7 +127,19 @@ impl ClipboardPayload {
         &self.plain_text
     }
 
-    /// Conservative semantic HTML fragment generated from the same source.
+    /// Conservative semantic HTML generated from the same source, prefixed
+    /// with an explicit encoding declaration.
+    ///
+    /// **那句 `<meta charset="utf-8">` 不是装饰。** `public.html` /
+    /// `text/html` 这个剪贴板类型只承载字节，不承载编码；收件方拿不到声明
+    /// 就只能猜，而系统的传统编码在中文环境下是 GBK。实测（S7 第七刀 c 的
+    /// G 节验收）：不带声明时 `剪贴板验收` 粘进 TextEdit 显示成
+    /// `錒?创鏉块獙鏀`，ASCII 部分却完好——**是解码错了不是内容坏了**。
+    /// Chrome 自己发的剪贴板 HTML 第一个标签也正是 `<meta charset='utf-8'>`。
+    ///
+    /// 声明加在**剪贴板这一层**而不是 [`export_html_fragment`] 里：后者的
+    /// 职责是「一段片段」，片段不带编码；剪贴板是「交给一个不认识的消费者
+    /// 的独立文档」，那才是要声明的地方。
     #[must_use]
     pub fn html(&self) -> &str {
         &self.html
@@ -192,7 +207,10 @@ pub fn export_clipboard(
     }
     let markdown = slice(snapshot, source_range)?.to_owned();
     let plain_text = markdown.clone();
-    let html = export_html_fragment(&markdown);
+    let html = format!(
+        "{HTML_CHARSET_DECLARATION}{}",
+        export_html_fragment(&markdown)
+    );
     Ok(ClipboardPayload {
         revision: expected_revision,
         source_range,
@@ -276,6 +294,58 @@ mod tests {
         assert!(payload.html().contains("type=\"checkbox\""));
         // 代码块里的 `<&>` 必须是转义过的文本，不是标签。
         assert!(payload.html().contains("&lt;&amp;&gt;"));
+    }
+
+    /// 剪贴板发出去的 HTML 必须自己说出编码。
+    ///
+    /// `public.html` / `text/html` 这个类型只承载字节。收件方拿不到声明就只能
+    /// 猜，而系统的传统编码在中文环境下是 GBK——**实测**（S7 第七刀 c 的 G 节
+    /// 验收）不带声明时 `剪贴板验收` 粘进 TextEdit 显示成 `錒?创鏉块獙鏀`，
+    /// 而 ASCII 部分完好。
+    ///
+    /// **这一条压不住的东西正是它存在的理由所在**：`yu-export` 别的断言问的
+    /// 都是「HTML 对不对」，而那些字节一直是对的；平台侧的 clipboard
+    /// self-check 问的是「Yu 自己认不认得」，而 Yu 走的是 canonical 的
+    /// Markdown flavor，根本不经过这条路。**没有一条判据问过「别的 app 会用
+    /// 什么编码读它」。**
+    #[test]
+    fn clipboard_html_declares_its_own_encoding() {
+        let buffer = TextBuffer::new("# 剪贴板验收\n");
+        let snapshot = buffer.snapshot();
+        let payload = export_clipboard(&snapshot, snapshot.revision(), whole_range(&snapshot))
+            .expect("clipboard export");
+
+        assert!(
+            payload.html().starts_with(HTML_CHARSET_DECLARATION),
+            "剪贴板 HTML 的第一件事必须是声明编码：{}",
+            payload.html()
+        );
+        // 声明是**前缀**，不是替换：正文一个字节都没少。
+        assert!(payload.html().contains("<h1>剪贴板验收</h1>"));
+
+        // 片段那一层不带声明——它的职责是「一段片段」，不是「一份独立文档」。
+        assert!(!export_html_fragment("# 剪贴板验收\n").contains("charset"));
+    }
+
+    /// 加了声明之后，自家导入器仍然接得住自家剪贴板。
+    ///
+    /// 第六刀把「逐字节断言 comrak 的输出」换成了两条判据，其中一条就是
+    /// 「自家导入器接得住自家导出」。声明是新加进这条路的第一个标签，
+    /// 它必须被当成信封而不是内容——否则 Yu 发出去的 HTML 自己都收不回来。
+    #[test]
+    fn the_encoding_declaration_does_not_break_our_own_importer() {
+        let source = "# Yu\n\n**羽** [Rust](https://example.com \"标题\")\n\n- [x] done\n";
+        let buffer = TextBuffer::new(source);
+        let snapshot = buffer.snapshot();
+        let payload = export_clipboard(&snapshot, snapshot.revision(), whole_range(&snapshot))
+            .expect("clipboard export");
+
+        let imported = import_html_fragment(payload.html()).expect("自家导入器接得住自家剪贴板");
+        assert_eq!(
+            export_html_fragment(&imported),
+            export_html_fragment(source),
+            "带声明的剪贴板 HTML 导回来之后仍然是同一个不动点"
+        );
     }
 
     #[test]

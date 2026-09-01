@@ -82,8 +82,21 @@ pub fn import_html_fragment(html: &str) -> Result<String, HtmlImportError> {
     if html.len() > MAX_HTML_BYTES {
         return Err(HtmlImportError::TooLarge);
     }
-    let roots = parse_document(html)?;
+    let mut roots = parse_document(html)?;
+    strip_encoding_declaration(&mut roots);
     render_roots(&roots)
+}
+
+/// 摘掉顶层的 `<meta charset=...>`。
+///
+/// 它是**信封不是内容**：剪贴板的 `public.html` 只承载字节，编码要靠这一句
+/// 声明（Yu 自己发的、Chrome 发的，第一个标签都是它）。不摘掉的话它会以
+/// 「块之间冒出一个行内元素」的形状让整段被拒——于是 Yu 接不住自己发出去的
+/// 剪贴板 HTML。
+///
+/// 只摘顶层是有意的：嵌在 `<p>` 里的 `<meta>` 不是编码声明，继续拒。
+fn strip_encoding_declaration(roots: &mut Vec<Node>) {
+    roots.retain(|node| !matches!(node, Node::Element(element) if element.name == "meta"));
 }
 
 fn parse_document(html: &str) -> Result<Vec<Node>, HtmlImportError> {
@@ -272,7 +285,7 @@ fn skip_ascii_whitespace(value: &str, mut position: usize) -> usize {
 }
 
 fn is_void_tag(name: &str) -> bool {
-    matches!(name, "br" | "img" | "input")
+    matches!(name, "br" | "img" | "input" | "meta")
 }
 
 fn ensure_allowed_tag(name: &str) -> Result<(), HtmlImportError> {
@@ -303,6 +316,7 @@ fn ensure_allowed_tag(name: &str) -> Result<(), HtmlImportError> {
             | "th"
             | "td"
             | "hr"
+            | "meta"
     ) {
         Ok(())
     } else {
@@ -322,6 +336,9 @@ fn validate_attributes(name: &str, attributes: &[Attribute]) -> Result<(), HtmlI
         "ol" => &["start"],
         "code" => &["class"],
         "input" => &["type", "disabled", "checked"],
+        // 编码声明只认 charset。`http-equiv` / `content` 那种写法带着一个
+        // 完整的 MIME 串，认它就等于开始解析 HTTP 头——那不是这个模块的事。
+        "meta" => &["charset"],
         "th" | "td" => &["style", "align"],
         _ => &[][..],
     };
@@ -1108,6 +1125,37 @@ mod tests {
         assert!(matches!(
             import_html_fragment("<table><tbody><tr><td>x</td></tr></tbody></table>"),
             Err(HtmlImportError::InvalidStructure("table is missing thead"))
+        ));
+    }
+
+    /// 顶层的编码声明是信封，摘掉；嵌在内容里的 `<meta>` 不是，继续拒。
+    ///
+    /// 这两半必须一起断言：只写前一半的话，把 `strip_encoding_declaration`
+    /// 写成「递归摘掉所有 meta」也能全绿，而那等于在正文里给一个未知标签
+    /// 开了后门。
+    #[test]
+    fn a_top_level_encoding_declaration_is_an_envelope_not_content() {
+        assert_eq!(
+            import_html_fragment("<meta charset=\"utf-8\"><p>羽</p>"),
+            Ok("羽".to_owned())
+        );
+        // Chrome 发的是单引号那种写法。
+        assert_eq!(
+            import_html_fragment("<meta charset='utf-8'><h2>标题</h2>"),
+            Ok("## 标题".to_owned())
+        );
+        // 嵌在段落里的不是编码声明。
+        assert!(matches!(
+            import_html_fragment("<p>羽<meta charset=\"utf-8\"></p>"),
+            Err(HtmlImportError::InvalidStructure(_))
+        ));
+        // 只认 charset：`http-equiv` 那种写法带着一个完整的 MIME 串，认它就
+        // 等于开始解析 HTTP 头。
+        assert!(matches!(
+            import_html_fragment(
+                "<meta http-equiv=\"content-type\" content=\"text/html\"><p>羽</p>"
+            ),
+            Err(HtmlImportError::UnsupportedAttribute { .. })
         ));
     }
 }
