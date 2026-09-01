@@ -3264,7 +3264,7 @@ table_resize / geometry）没有一个是 macOS 概念；`MacosFrameGeometry`（
 | ~~**b**~~ **已完成** | 写下 shaping 契约；删掉零消费者的 `TextShaper`；`Utf16Map` 提到 `yu-font`；把「shaper 与 rasterizer 共用 face 表」写进类型 | 一套 conformance 测试，CoreTextShaper 与全部 mock 都跑 |
 | ~~**b2**~~ **已完成**（**表外插的一刀**，刀 b 的 spike 查出来的） | 排不出来的簇画替代字形，不让整个块失败 | 判据落在洞出现的那一层：`yu-storage-ffi` 的那个错误码不再出现 |
 | ~~**c**~~ **已完成** | 把中立逻辑从平台层提上来（`MetalFrameConsumer` / `requires_full_clear` / `build_native_*` / `MetalSurfaceConfig` → `yu-render`；`CoreTextViewportFrameBuilder` → 泛型 → `yu-workspace`；`MacosFrameKey` → `FrameKey`；9 个 FFI 去前缀） | 纯重构：14 个 self-check 不变、**真实窗口截图差分逐字节为 0** |
-| **d** | `yu-font-windows`：DirectWrite 的 `ShapingProvider` + `GlyphRasterizer` | 刀 b 那套 conformance 在 Windows CI 上跑。**不需要窗口、GPU、壳** |
+| **d** | `yu-font-windows`：DirectWrite 的 `ShapingProvider` + `GlyphRasterizer`。**拆成 d1（翻译层，已完成）与 d2（COM 调用）** | 刀 b 那套 conformance 在 Windows CI 上跑。**不需要窗口、GPU、壳**——但也因此是第一刀判据不在开发机上的 |
 | **e** | `yu-render-windows`：D3D 后端 | headless 的「`RenderPlan` → 平铺指令」比对（刀 c 提上来之后两端共用，是真差分不是自证）+ 一个真实窗口 smoke |
 | **f** | Windows 壳（窗口 + TSF + UIA） | self-check + `check-platform-parity.py` |
 
@@ -3852,6 +3852,49 @@ macOS 的**叠加式滚动条**淡入淡出。判据是同一个二进制拍两�
 **一处已知的粗糙，不修**：Chrome 会把词间的普通空格换成不换行空格（U+00A0），
 粘进来的段落因此夹着看不见的 NBSP。不改写它——导入器的职责是翻译结构不是重写
 文本。用例把它断言出来，让它看得见。
+
+##### 刀 d1：`yu-font-windows` 的翻译层 —— 已完成
+
+**这一刀第一次遇到「判据不在开发机上」。** 前面每一刀都能在本机关掉自己的
+判据：`verify.sh` 十步、14 个 self-check、真实窗口截图差分。刀 d 不能——开发机
+是 macOS，**交叉编译不了、也没有 DirectWrite**。
+
+先把本机的判据上限量出来，因为它决定这一刀能切到哪里：
+
+| 手段 | 覆盖什么 | 实测 |
+| --- | --- | --- |
+| `cargo test -p yu-font-windows` | 翻译层的纯函数 | 12 条全过 |
+| `cargo check --target x86_64-pc-windows-msvc` | 类型与签名 | **通过**，`windows` crate 能解析 |
+| `cargo build -p yu-font-windows` | 非 Windows 上也编译得过 | 通过 |
+| 真的调用 DirectWrite | —— | **给不出** |
+
+**于是按刀 b 的教训切**：那一刀把 `cluster_spans` 从 `shape_run` 里抽出来，
+理由是「真实 CoreText 造不出让两种取法分开的输入，判据必须落在纯函数上」。
+这一刀更极端——**开发机上根本没有那个后端**。所以翻译逻辑全部挤进纯函数层，
+COM 调用留给 d2。
+
+**`cluster.rs`：方向是反的，而一簇多形没有第三条路。**
+CoreText 的 `CTRunGetStringIndices` 是字形 → 文本；DirectWrite 的 `clusterMap`
+是文本 → 字形，索引单位是 UTF-16 code unit。一簇多形时后续那些字形在
+`clusterMap` 里**根本不出现**，spike 实测过的三种凑法分别赔掉重画、越界 panic、
+丢字形——契约 E7 因此要求报错。六条用例，含一条**一般式**：任何 `Ok` 的结果，
+区间必须首尾相接、非空、末尾正好等于文本长度。
+
+**`run.rs`：平铺数组 → `GlyphRun`。**
+六条用例，其中 **C8 那条用非零基址造**——布局层今天永远传零基，漏掉「把
+`source.start()` 加回去」在产品链路上一点差别都没有。UTF-16 → UTF-8 交给
+`yu_font::Utf16Map`（刀 b 从 `yu-font-macos` 提上来的，正是为了这一天）：
+代理对低位不是字节边界，落在那里必须失败而不是就近取整。
+
+**两层分开是因为它们各自会错得不一样**：反转错了是字形与文本对不上，换算错了
+是把一个字符劈成两半。数组长度对不上也在这一层报——按最短的截断不报错，它产出
+一个「合法」的 run 只是少几个字形，而 `yu-layout` 的 tiling 门会把它报成
+「run 没铺满」，**排查方向指向布局层**。
+
+**d2 要先解决的不是代码，是判据。** `ci.yml` 的 rust 矩阵已含 `windows-latest`
+并跑 `cargo test --workspace`，所以路是现成的，但要推上去才拿得到红绿。
+**不要硬写只过类型检查的 COM 代码**——那是几百行没有任何断言执行过的东西，
+而「全套门禁绿着的谎话」正是刀 a 刚修掉的失败模式。
 
 ---
 
