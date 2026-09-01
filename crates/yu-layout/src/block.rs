@@ -1728,6 +1728,17 @@ fn measure_shaped<T: StyleTable, S: ShapingProvider>(
                         "glyph ranges must tile the run in logical order".into(),
                     ));
                 }
+                // 空区间**过得了**上面那道门（`from != cursor` 对它恒不成立），
+                // 而它是「一簇多形」被反转成一形一区间时最自然的填法：多出来
+                // 的字形贴在簇尾拿一个零长度区间。放进来的后果不是画错，是
+                // 下面 `bidi.levels[start + from]` 在 run 末尾**越界 panic**
+                // （S7 第七刀 spike 实测），落在中间则凭空多算一段 advance。
+                // 契约里这是 C4，见 `yu_core::ShapingProvider`。
+                if to == from {
+                    return Err(LayoutError::Shaping(
+                        "glyph source ranges must not be empty".into(),
+                    ));
+                }
                 if !text.is_char_boundary(from) || !text.is_char_boundary(to) {
                     return Err(LayoutError::RunNotOnCharBoundary);
                 }
@@ -2042,9 +2053,12 @@ mod tests {
                         },
                         str::len,
                     );
+                // 契约 C8：字形区间是 `source.start()` **加上**局部偏移。
+                // 布局层今天总是传零基 range（`local_range`），所以少加这一下
+                // 在产品链路上看不出来——压它的是 conformance 套件。
                 let range = TextRange::new(
-                    ByteOffset::new(cursor as u64),
-                    ByteOffset::new((cursor + len) as u64),
+                    ByteOffset::new(source.start().get() + cursor as u64),
+                    ByteOffset::new(source.start().get() + (cursor + len) as u64),
                 )
                 .ok_or("有序")?;
                 glyphs.push(Glyph::new(
@@ -2188,45 +2202,95 @@ mod tests {
         assert_eq!(layout.glyphs()[1].size_scale(), 2.0);
     }
 
+    /// 按 `ranges` 逐个产字形，不管文本实际是什么。**故意违约的 mock**，
+    /// 用来压那些真实后端造不出来的输入。
+    struct Ranges(&'static [(u64, u64)]);
+
+    impl ShapingProvider for Ranges {
+        type Error = String;
+
+        fn shape(
+            &self,
+            _text: &str,
+            source: TextRange,
+            style: TextStyle,
+        ) -> Result<ShapedText, Self::Error> {
+            let glyphs = self
+                .0
+                .iter()
+                .map(|(from, to)| {
+                    let range = TextRange::new(ByteOffset::new(*from), ByteOffset::new(*to))
+                        .ok_or("有序")?;
+                    Ok(Glyph::new(GlyphId::from_raw(1), range, 1.0, 0.0, 0.0))
+                })
+                .collect::<Result<Vec<_>, Self::Error>>()?;
+            Ok(ShapedText::new(
+                source,
+                vec![GlyphRun::new(
+                    FontFaceId::from_raw(1),
+                    source,
+                    style,
+                    TextDirection::Ltr,
+                    Script::Latin,
+                    glyphs,
+                )],
+            ))
+        }
+    }
+
+    fn shaped_with(text: &str, ranges: &'static [(u64, u64)]) -> Result<BlockLayout, LayoutError> {
+        BlockLayout::build_shaped(
+            LayoutInput::new(text, &plain(text)),
+            LayoutConfig::new(80.0, 4.0),
+            &UniformStyleTable::default(),
+            &NoWidgets,
+            &NoLineStyles,
+            &Ranges(ranges),
+        )
+    }
+
+    /// 布局层自己那个 mock 也得守契约——否则整个 `block.rs` 的用例都建在
+    /// 一个不合规的后端上，而「布局能不能消费一个合规后端」正是这些用例
+    /// 要证明的事。
+    #[test]
+    fn the_test_shaper_conforms_to_the_shaping_contract() {
+        let violations = yu_core::shaping_conformance::audit(&TestShaper::new(1.0));
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// 空区间**过得了**下面那道 tiling 门，所以要单独钉一条。
+    ///
+    /// 它不是想出来的坏输入：DirectWrite 的 `clusterMap` 反转在「一簇多形」
+    /// 上最自然的填法就是给多出来的字形一个贴在簇尾的零长度区间
+    /// （S7 第七刀的 spike）。修之前的表现分两种，**都不是「画错一点」**：
+    ///
+    /// - 落在 run 末尾：`bidi.levels[start + from]` 越界 **panic**
+    ///   （实测 `index out of bounds: the len is 3 but the index is 3`）；
+    /// - 落在中间：多出一个零长度的 cluster，advance 照算，行宽凭空变宽。
+    ///
+    /// 两个位置都要钉——只钉末尾那种会让中间那种继续溜过去，而中间那种不
+    /// panic，最难发现。
+    #[test]
+    fn empty_glyph_ranges_are_rejected() {
+        let text = "abc";
+        for ranges in [
+            &[(0, 1), (1, 1), (1, 3)][..],
+            &[(0, 0), (0, 3)][..],
+            &[(0, 1), (1, 3), (3, 3)][..],
+        ] {
+            assert!(
+                matches!(shaped_with(text, ranges), Err(LayoutError::Shaping(_))),
+                "{ranges:?} 里有空区间，应该被拒绝"
+            );
+        }
+    }
+
     /// 字形没铺满 run 就是丢字或重画，两样都不 panic。
     ///
     /// 三种坏法各钉一条：中间缺一段（丢字）、区间回退（重画）、末尾短一截。
     /// 只钉最后一种会让「总长对得上但中间有缝」溜过去。
     #[test]
     fn glyph_ranges_must_tile_the_run() {
-        /// 按 `ranges` 逐个产字形，不管文本实际是什么。
-        struct Ranges(&'static [(u64, u64)]);
-        impl ShapingProvider for Ranges {
-            type Error = String;
-
-            fn shape(
-                &self,
-                _text: &str,
-                source: TextRange,
-                style: TextStyle,
-            ) -> Result<ShapedText, Self::Error> {
-                let glyphs = self
-                    .0
-                    .iter()
-                    .map(|(from, to)| {
-                        let range = TextRange::new(ByteOffset::new(*from), ByteOffset::new(*to))
-                            .ok_or("有序")?;
-                        Ok(Glyph::new(GlyphId::from_raw(1), range, 1.0, 0.0, 0.0))
-                    })
-                    .collect::<Result<Vec<_>, Self::Error>>()?;
-                Ok(ShapedText::new(
-                    source,
-                    vec![GlyphRun::new(
-                        FontFaceId::from_raw(1),
-                        source,
-                        style,
-                        TextDirection::Ltr,
-                        Script::Latin,
-                        glyphs,
-                    )],
-                ))
-            }
-        }
         let text = "abc";
         for ranges in [
             &[(0, 1), (2, 3)][..],
@@ -2235,17 +2299,7 @@ mod tests {
             &[(0, 1), (1, 2), (2, 4)][..],
         ] {
             assert!(
-                matches!(
-                    BlockLayout::build_shaped(
-                        LayoutInput::new(text, &plain(text)),
-                        LayoutConfig::new(80.0, 4.0),
-                        &UniformStyleTable::default(),
-                        &NoWidgets,
-                        &NoLineStyles,
-                        &Ranges(ranges),
-                    ),
-                    Err(LayoutError::Shaping(_))
-                ),
+                matches!(shaped_with(text, ranges), Err(LayoutError::Shaping(_))),
                 "{ranges:?} 应该被拒绝"
             );
         }

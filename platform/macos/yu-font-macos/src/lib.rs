@@ -4,8 +4,6 @@
 //! than exposing `CTFontRef` to the editor core. `CoreTextShaper` keeps the
 //! CoreText objects on the platform side while exporting owned glyph runs.
 
-#[cfg(target_os = "macos")]
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 #[cfg(target_os = "macos")]
@@ -32,9 +30,9 @@ use yu_font::{
     AtlasError, FontMetricsCache, FontSlant, FontWeight, Glyph, GlyphAtlas, GlyphAtlasConfig,
     GlyphBitmap, GlyphId, GlyphMetrics, GlyphRun,
 };
-use yu_font::{
-    FontRequest, ShapeError, ShapeRequest, ShapedText, ShapingProvider, TextDirection, TextShaper,
-};
+use yu_font::{FontRequest, ShapeError, ShapeRequest, ShapedText, ShapingProvider, TextDirection};
+#[cfg(target_os = "macos")]
+use yu_font::{SharedFaceTable, Utf16Map};
 
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{
@@ -86,6 +84,9 @@ pub enum CoreTextShapeError {
     FontUnavailable,
     MissingRunFont,
     NonMonotonicGlyphIndices,
+    /// 一簇多形：两个字形指着同一个文本起点。契约（`yu_core::ShapingProvider`
+    /// 的 C3 + C4）要的是一簇一形，做不到就报错，不许拿空区间或重复起点凑数。
+    MultiGlyphCluster,
     FaceIdOverflow,
     FaceTablePoisoned,
     InvalidViewportMetrics,
@@ -114,6 +115,9 @@ impl fmt::Display for CoreTextShapeError {
             Self::MissingRunFont => formatter.write_str("CoreText glyph run did not expose a font"),
             Self::NonMonotonicGlyphIndices => {
                 formatter.write_str("CoreText returned non-monotonic glyph string indices")
+            }
+            Self::MultiGlyphCluster => {
+                formatter.write_str("CoreText returned more than one glyph for a cluster")
             }
             Self::FaceIdOverflow => formatter.write_str("CoreText face id table overflowed"),
             Self::FaceTablePoisoned => formatter.write_str("CoreText face id table was poisoned"),
@@ -398,51 +402,18 @@ struct FaceEntry {
     slant: FontSlant,
 }
 
+/// 这个进程里唯一的那张 face 表。
+///
+/// 表本身是 `yu_font::SharedFaceTable`（唯一实现，见那里的模块文档：id 由
+/// shaper 铸、由 rasterizer 消费，两者共用一张表**是类型的一部分**）。
+/// **单例是 macOS 这一侧的选择**，不是 yu-font 强制的：它让两个独立构造出来
+/// 的 `CoreTextShaper` 对同一个 face 给同一个 id，而缓存与 atlas 都按那个 id
+/// 建键——换一个 id 就是整张 atlas 白建一遍。
 #[cfg(target_os = "macos")]
-#[derive(Debug, Default)]
-struct FaceTable {
-    next: u32,
-    ids: BTreeMap<String, FontFaceId>,
-    entries: Vec<FaceEntry>,
-}
+fn shared_face_table() -> SharedFaceTable<FaceEntry> {
+    static TABLE: OnceLock<SharedFaceTable<FaceEntry>> = OnceLock::new();
 
-#[cfg(target_os = "macos")]
-impl FaceTable {
-    fn id_for(
-        &mut self,
-        postscript_name: &str,
-        sample: &str,
-        weight: FontWeight,
-        slant: FontSlant,
-    ) -> Result<FontFaceId, CoreTextShapeError> {
-        if let Some(face) = self.ids.get(postscript_name) {
-            return Ok(*face);
-        }
-        let face = FontFaceId::from_raw(self.next);
-        self.next = self
-            .next
-            .checked_add(1)
-            .ok_or(CoreTextShapeError::FaceIdOverflow)?;
-        self.entries.push(FaceEntry {
-            postscript_name: postscript_name.to_owned(),
-            sample: sample.to_owned(),
-            weight,
-            slant,
-        });
-        self.ids.insert(postscript_name.to_owned(), face);
-        Ok(face)
-    }
-
-    fn entry_for(&self, face: FontFaceId) -> Option<&FaceEntry> {
-        self.entries.get(usize::try_from(face.get()).ok()?)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn shared_face_table() -> Arc<Mutex<FaceTable>> {
-    static TABLE: OnceLock<Arc<Mutex<FaceTable>>> = OnceLock::new();
-
-    Arc::clone(TABLE.get_or_init(|| Arc::new(Mutex::new(FaceTable::default()))))
+    TABLE.get_or_init(SharedFaceTable::new).clone()
 }
 
 /// A CoreText-backed implementation of both the platform-independent shaping
@@ -456,7 +427,7 @@ pub struct CoreTextShaper {
     request: FontRequest,
     font_source: CoreTextFontSource,
     #[cfg(target_os = "macos")]
-    faces: Arc<Mutex<FaceTable>>,
+    faces: SharedFaceTable<FaceEntry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,7 +463,7 @@ impl Clone for CoreTextShaper {
             request: self.request.clone(),
             font_source: self.font_source,
             #[cfg(target_os = "macos")]
-            faces: Arc::clone(&self.faces),
+            faces: self.faces.clone(),
         }
     }
 }
@@ -556,7 +527,7 @@ impl CoreTextShaper {
             .ok_or(CoreTextShapeError::InvalidViewportMetrics)?;
             let request = ShapeRequest::new(sample, source, TextStyle::Plain, self.request.clone())
                 .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
-            let shaped = self.shape_request(&request)?;
+            let shaped = self.shape_native(&request)?;
             let grapheme_count = sample.graphemes(true).count();
             let Some(run) = shaped.runs().first() else {
                 return Err(CoreTextShapeError::InvalidViewportMetrics);
@@ -600,7 +571,7 @@ impl CoreTextShaper {
         #[cfg(target_os = "macos")]
         {
             CoreTextGlyphRasterizer::with_faces(
-                Arc::clone(&self.faces),
+                &self.faces,
                 self.font_source,
                 Arc::from(self.request.family()),
             )
@@ -622,12 +593,33 @@ impl CoreTextShaper {
         slant: FontSlant,
     ) -> Result<FontFaceId, CoreTextShapeError> {
         self.faces
-            .lock()
-            .map_err(|_| CoreTextShapeError::FaceTablePoisoned)?
-            .id_for(postscript_name, sample, weight, slant)
+            .id_for(postscript_name, || FaceEntry {
+                postscript_name: postscript_name.to_owned(),
+                sample: sample.to_owned(),
+                weight,
+                slant,
+            })
+            .map_err(|error| match error {
+                yu_font::FaceTableError::IdOverflow => CoreTextShapeError::FaceIdOverflow,
+                yu_font::FaceTableError::Poisoned => CoreTextShapeError::FaceTablePoisoned,
+            })
     }
 
-    fn shape_request(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, CoreTextShapeError> {
+    /// 排一个完整的 `ShapeRequest`（调用方自己指定 font 与 style）。
+    ///
+    /// 这里曾经是 `impl TextShaper`——一个全仓零消费者的 trait，S7 第七刀
+    /// 删掉了它。产品链路上的插口只有 `yu_core::ShapingProvider`（下面那个
+    /// impl），它转调这个方法。
+    ///
+    /// **名字不叫 `shape`**：那样这个类型上会同时有一个固有 `shape` 和一个
+    /// trait `shape`，固有的那个优先，于是在具体类型上写
+    /// `shaper.shape(text, source, style)` 会撞出一条莫名其妙的编译错误。
+    pub fn shape_request(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, ShapeError> {
+        self.shape_native(request)
+            .map_err(|error| ShapeError::Backend(Arc::from(error.to_string())))
+    }
+
+    fn shape_native(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, CoreTextShapeError> {
         #[cfg(target_os = "macos")]
         {
             shape_with_core_text(self, request)
@@ -650,7 +642,7 @@ impl CoreTextShaper {
 #[derive(Debug)]
 pub struct CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
-    faces: Arc<Mutex<FaceTable>>,
+    faces: SharedFaceTable<FaceEntry>,
     font_source: CoreTextFontSource,
     /// base font 的 family，用于重放 shaping 时的 fallback 选择。
     requested_family: Arc<str>,
@@ -664,7 +656,7 @@ impl Clone for CoreTextGlyphRasterizer {
     fn clone(&self) -> Self {
         Self {
             #[cfg(target_os = "macos")]
-            faces: Arc::clone(&self.faces),
+            faces: self.faces.clone(),
             font_source: self.font_source,
             requested_family: Arc::clone(&self.requested_family),
             #[cfg(target_os = "macos")]
@@ -678,12 +670,12 @@ impl Clone for CoreTextGlyphRasterizer {
 impl CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
     fn with_faces(
-        faces: Arc<Mutex<FaceTable>>,
+        faces: &SharedFaceTable<FaceEntry>,
         font_source: CoreTextFontSource,
         requested_family: Arc<str>,
     ) -> Self {
         Self {
-            faces,
+            faces: faces.clone(),
             font_source,
             requested_family,
             metrics: Arc::new(Mutex::new(FontMetricsCache::new())),
@@ -843,10 +835,8 @@ impl CoreTextGlyphRasterizer {
     ) -> Result<CFRetained<CTFont>, CoreTextRasterError> {
         let entry = self
             .faces
-            .lock()
+            .with_entry(face, Clone::clone)
             .map_err(|_| CoreTextRasterError::FaceTablePoisoned)?
-            .entry_for(face)
-            .cloned()
             .ok_or(CoreTextRasterError::UnknownFace(face))?;
 
         // 复用 shaping 侧构造 base font 的同一个函数：两条路径各写一遍迟早
@@ -1022,13 +1012,6 @@ fn raster_dimension(value: f64) -> Result<u32, CoreTextRasterError> {
     Ok(value.ceil() as u32)
 }
 
-impl TextShaper for CoreTextShaper {
-    fn shape(&self, request: &ShapeRequest<'_>) -> Result<ShapedText, ShapeError> {
-        self.shape_request(request)
-            .map_err(|error| ShapeError::Backend(Arc::from(error.to_string())))
-    }
-}
-
 impl ShapingProvider for CoreTextShaper {
     type Error = ShapeError;
 
@@ -1039,7 +1022,7 @@ impl ShapingProvider for CoreTextShaper {
         style: TextStyle,
     ) -> Result<ShapedText, Self::Error> {
         let request = ShapeRequest::new(text, source, style, self.request.clone())?;
-        <Self as TextShaper>::shape(self, &request)
+        self.shape_request(&request)
     }
 
     fn shape_scaled(
@@ -1055,7 +1038,7 @@ impl ShapingProvider for CoreTextShaper {
             .with_weight(self.request.weight())
             .with_slant(self.request.slant());
         let request = ShapeRequest::new(text, source, style, font)?;
-        <Self as TextShaper>::shape(self, &request)
+        self.shape_request(&request)
     }
 }
 
@@ -1202,7 +1185,9 @@ fn shape_run(
     let run_end = run_start
         .checked_add(run_length)
         .ok_or(CoreTextShapeError::InvalidCoreTextRange)?;
-    let source = map.range(run_start, run_end, request.source())?;
+    let source = map
+        .range(run_start, run_end, request.source())
+        .ok_or(CoreTextShapeError::InvalidCoreTextRange)?;
 
     let attributes = unsafe { run.attributes() };
     let attributes: &CFDictionary<CFString, CTFont> = unsafe { attributes.cast_unchecked() };
@@ -1252,23 +1237,20 @@ fn shape_run(
     }
 
     let status = unsafe { run.status() };
-    if status.intersects(CTRunStatus::RightToLeft | CTRunStatus::NonMonotonic) {
+    // 两个状态位分开报。以前它们共用 `NonMonotonicGlyphIndices`，于是希伯来文
+    // 得到的诊断是「非单调」——名字撒谎，行为没错，但排查时会往错的方向找。
+    if status.contains(CTRunStatus::RightToLeft) {
+        return Err(CoreTextShapeError::UnsupportedDirection(TextDirection::Rtl));
+    }
+    if status.contains(CTRunStatus::NonMonotonic) {
         return Err(CoreTextShapeError::NonMonotonicGlyphIndices);
     }
 
-    let mut previous_index = None;
     let mut starts = Vec::with_capacity(glyph_count);
     for index in indices {
-        let index = cf_index_to_usize(index)?;
-        if index < run_start || index >= run_end {
-            return Err(CoreTextShapeError::InvalidCoreTextRange);
-        }
-        if previous_index.is_some_and(|previous| index < previous) {
-            return Err(CoreTextShapeError::NonMonotonicGlyphIndices);
-        }
-        previous_index = Some(index);
-        starts.push(index);
+        starts.push(cf_index_to_usize(index)?);
     }
+    let spans = cluster_spans(&starts, run_start, run_end)?;
 
     // CTRun 的 positions 是相对整条 CTLine 的绝对坐标，而 `Glyph::x_offset`
     // 的契约是「相对按 advance 累加出的笔位的微调」（kerning、mark
@@ -1285,13 +1267,10 @@ fn shape_run(
     let mut glyphs = Vec::with_capacity(glyph_count);
     let mut pen_x = 0.0_f32;
     for (index, raw_glyph) in raw_glyphs.into_iter().enumerate() {
-        let start = starts[index];
-        let end = starts[index + 1..]
-            .iter()
-            .copied()
-            .find(|candidate| *candidate > start)
-            .unwrap_or(run_end);
-        let glyph_source = map.range(start, end, request.source())?;
+        let (start, end) = spans[index];
+        let glyph_source = map
+            .range(start, end, request.source())
+            .ok_or(CoreTextShapeError::InvalidCoreTextRange)?;
         let advance = advances[index].width as f32;
         let position_x = positions[index].x as f32;
         let position_y = positions[index].y as f32;
@@ -1326,66 +1305,61 @@ fn shape_run(
     ))
 }
 
+/// 把 CoreText 的「每个字形的起始 UTF-16 下标」翻成契约要的
+/// 「每个字形一个非空、首尾相接、铺满 run 的区间」。
+///
+/// **这是 `shape_run` 里唯一一段真逻辑**，其余都是把 CoreText 的数组抄进
+/// owned 结构。抽出来是为了它能被单独测：一簇多形与非单调在 macOS 上要么
+/// 被 `CTRunStatus` 先挡掉、要么根本造不出语料（S7 第七刀 spike 拿 35 个
+/// 语料实测，两个字形同一个起点一次都没出现过），于是留在 `shape_run` 里
+/// 的分支**没有任何输入能触发**，也就没有反向验证的手段。
+///
+/// 第二端会一字不差地要写同一件事：DirectWrite 的 `clusterMap` 反过来就是
+/// 这张表，而它的一簇多形是**常态**不是例外。
+///
+/// 三条规则，每一条对应契约上的一条：
+///
+/// - 起点必须落在 `[run_start, run_end)` 里——越界就是 CoreText 给了一个
+///   不属于这个 run 的下标；
+/// - 起点必须严格递增。**相等就是一簇多形**：契约要一簇一形，而三种凑法
+///   （重复起点 / 空区间 / 并成一形）分别是重画、panic、丢字形，所以这里
+///   报错而不是挑一种（`yu_core::ShapingProvider` 的「做不到就报错」）；
+/// - 每个区间的终点是下一个起点，最后一个到 `run_end`。
+#[cfg(target_os = "macos")]
+fn cluster_spans(
+    starts: &[usize],
+    run_start: usize,
+    run_end: usize,
+) -> Result<Vec<(usize, usize)>, CoreTextShapeError> {
+    if run_start >= run_end {
+        return Err(CoreTextShapeError::InvalidCoreTextRange);
+    }
+    let mut spans = Vec::with_capacity(starts.len());
+    for (index, start) in starts.iter().copied().enumerate() {
+        if start < run_start || start >= run_end {
+            return Err(CoreTextShapeError::InvalidCoreTextRange);
+        }
+        let end = match starts.get(index + 1) {
+            Some(next) if *next < start => {
+                return Err(CoreTextShapeError::NonMonotonicGlyphIndices);
+            }
+            Some(next) if *next == start => {
+                return Err(CoreTextShapeError::MultiGlyphCluster);
+            }
+            Some(next) => *next,
+            None => run_end,
+        };
+        spans.push((start, end));
+    }
+    if spans.first().map(|span| span.0) != Some(run_start) {
+        return Err(CoreTextShapeError::InvalidCoreTextRange);
+    }
+    Ok(spans)
+}
+
 #[cfg(target_os = "macos")]
 fn cf_index_to_usize(index: isize) -> Result<usize, CoreTextShapeError> {
     usize::try_from(index).map_err(|_| CoreTextShapeError::InvalidCoreTextRange)
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug)]
-struct Utf16Map {
-    boundaries: Vec<Option<usize>>,
-}
-
-#[cfg(target_os = "macos")]
-impl Utf16Map {
-    fn new(text: &str) -> Self {
-        let mut boundaries = vec![Some(0)];
-        for character in text.chars() {
-            let byte_end = boundaries
-                .last()
-                .and_then(|boundary| *boundary)
-                .unwrap_or(0_usize)
-                .saturating_add(character.len_utf8());
-            if character.len_utf16() == 2 {
-                boundaries.push(None);
-            }
-            boundaries.push(Some(byte_end));
-        }
-        Self { boundaries }
-    }
-
-    fn range(
-        &self,
-        start: usize,
-        end: usize,
-        source: TextRange,
-    ) -> Result<TextRange, CoreTextShapeError> {
-        let start = self
-            .boundaries
-            .get(start)
-            .and_then(|boundary| *boundary)
-            .ok_or(CoreTextShapeError::InvalidCoreTextRange)?;
-        let end = self
-            .boundaries
-            .get(end)
-            .and_then(|boundary| *boundary)
-            .ok_or(CoreTextShapeError::InvalidCoreTextRange)?;
-        if start > end || end > usize::try_from(source.len()).unwrap_or(usize::MAX) {
-            return Err(CoreTextShapeError::InvalidCoreTextRange);
-        }
-        let source_start = source
-            .start()
-            .checked_add(
-                u64::try_from(start).map_err(|_| CoreTextShapeError::InvalidCoreTextRange)?,
-            )
-            .ok_or(CoreTextShapeError::InvalidCoreTextRange)?;
-        let source_end = source
-            .start()
-            .checked_add(u64::try_from(end).map_err(|_| CoreTextShapeError::InvalidCoreTextRange)?)
-            .ok_or(CoreTextShapeError::InvalidCoreTextRange)?;
-        TextRange::new(source_start, source_end).ok_or(CoreTextShapeError::InvalidCoreTextRange)
-    }
 }
 
 #[cfg(test)]
@@ -1437,7 +1411,9 @@ mod tests {
         .expect("source range should be valid");
         let shape_request =
             ShapeRequest::new(text, source, TextStyle::Plain, request).expect("request");
-        let shaped = TextShaper::shape(&shaper, &shape_request).expect("CoreText should shape");
+        let shaped = shaper
+            .shape_request(&shape_request)
+            .expect("CoreText should shape");
 
         assert_eq!(shaped.source(), source);
         assert!(shaped.advance().is_finite());
@@ -1473,7 +1449,9 @@ mod tests {
         .expect("source range should be valid");
         let request = ShapeRequest::new(sample, source, TextStyle::Plain, request)
             .expect("request should be valid");
-        let shaped = TextShaper::shape(&shaper, &request).expect("CoreText should shape");
+        let shaped = shaper
+            .shape_request(&request)
+            .expect("CoreText should shape");
         let expected = shaped.advance() / sample.graphemes(true).count() as f32;
         assert!((metrics.default_advance() - expected).abs() < 0.001);
         assert!(metrics.line_height() > 0.0);
@@ -1655,25 +1633,93 @@ mod tests {
         assert!(metrics.default_advance().is_finite() && metrics.default_advance() > 0.0);
     }
 
+    /// `cluster_spans` 的正反两面。判据全在合成输入上——真实 CoreText 造不出
+    /// 这里一半的形状，那正是把它抽出来的理由。
     #[cfg(target_os = "macos")]
     #[test]
-    fn utf16_map_only_accepts_scalar_boundaries() {
-        let text = "a🙂e";
-        let source = TextRange::new(
-            ByteOffset::ZERO,
-            ByteOffset::new(u64::try_from(text.len()).expect("test text should fit")),
-        )
-        .expect("source range should be valid");
-        let map = Utf16Map::new(text);
-
+    fn cluster_spans_tile_the_run_and_refuse_to_fake_a_multi_glyph_cluster() {
+        // 一形一簇：区间首尾相接，最后一个到 run 末尾。
         assert_eq!(
-            map.range(1, 3, source).expect("emoji range"),
-            TextRange::new(ByteOffset::new(1), ByteOffset::new(5),).expect("expected source range")
+            cluster_spans(&[0, 1, 2], 0, 3),
+            Ok(vec![(0, 1), (1, 2), (2, 3)])
+        );
+        // 连字（多字符一形）：区间跨过去，仍然铺满。
+        assert_eq!(cluster_spans(&[0, 2], 0, 5), Ok(vec![(0, 2), (2, 5)]));
+        // 代理对：起点跳两格。
+        assert_eq!(cluster_spans(&[0, 2], 0, 3), Ok(vec![(0, 2), (2, 3)]));
+
+        // 一簇多形：两个字形同一个起点。**这是第二端的常态**，而三种凑法
+        // 分别是重画、panic、丢字形，所以只能报错。
+        assert_eq!(
+            cluster_spans(&[0, 0, 1], 0, 2),
+            Err(CoreTextShapeError::MultiGlyphCluster)
         );
         assert_eq!(
-            map.range(2, 3, source),
+            cluster_spans(&[0, 1, 1], 0, 2),
+            Err(CoreTextShapeError::MultiGlyphCluster)
+        );
+        // 回退（重排后的字形顺序）。
+        assert_eq!(
+            cluster_spans(&[1, 0], 0, 2),
+            Err(CoreTextShapeError::NonMonotonicGlyphIndices)
+        );
+        // 起点不在 run 里 / 首个起点不是 run 的起点：两样都不许猜。
+        assert_eq!(
+            cluster_spans(&[0, 5], 0, 3),
             Err(CoreTextShapeError::InvalidCoreTextRange)
         );
+        assert_eq!(
+            cluster_spans(&[1, 2], 0, 3),
+            Err(CoreTextShapeError::InvalidCoreTextRange)
+        );
+        assert_eq!(
+            cluster_spans(&[], 0, 3),
+            Err(CoreTextShapeError::InvalidCoreTextRange)
+        );
+    }
+
+    /// CoreText 过一遍 `ShapingProvider` 的契约（`yu_core::shaping_conformance`）。
+    ///
+    /// **这是六个实现里唯一一个真后端**，所以它是这套契约唯一一次跟真实的
+    /// fallback、连字、簇合并对上账的机会。语料里 RTL 与印度系是
+    /// `Coverage::Optional`——CoreText 在 `CTRunStatus` 那一步就拒了它们
+    /// （S7 第七刀 spike 的实测），而**拒绝是合规的**，伪造区间才不是。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_text_conforms_to_the_shaping_contract() {
+        let request = FontRequest::new("System UI", 13.0).expect("request should be valid");
+        let shaper = CoreTextShaper::from_system_ui(request).expect("CoreText should initialize");
+        let violations = yu_core::shaping_conformance::audit(&shaper);
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    /// shaper 铸的 id 必须能被**它自己的** rasterizer 解回同一个 face。
+    ///
+    /// 这一条压的是 `yu_font::SharedFaceTable` 那段模块文档：id 由 shaper 铸、
+    /// 由 rasterizer 消费，两者共用一张表。各铸各的不 panic、不报错，表现是
+    /// 屏幕上画出来的字全是别的字——所以判据必须是**跨这两个对象**的，
+    /// 只问 shaper 或只问 rasterizer 都证明不了配对。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_rasterizer_resolves_the_faces_its_shaper_minted() {
+        let request = FontRequest::new("System UI", 13.0).expect("request should be valid");
+        let shaper = CoreTextShaper::from_system_ui(request).expect("CoreText should initialize");
+        let rasterizer = shaper.rasterizer();
+        // 拉丁与 CJK 一定落到两个不同的 face 上，于是这条不是「只有一个 face
+        // 时怎么都对」。
+        let text = "a\u{4e2d}";
+        let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(text.len() as u64))
+            .expect("source range should be valid");
+        let shaped = ShapingProvider::shape(&shaper, text, source, TextStyle::Plain)
+            .expect("CoreText should shape");
+        let faces: Vec<_> = shaped.runs().iter().map(GlyphRun::face).collect();
+        assert!(faces.len() >= 2, "拉丁与 CJK 应该分成两个 run：{faces:?}");
+        for face in faces {
+            let key = FontMetricKey::new(face, 13.0).expect("metric key");
+            rasterizer
+                .font_metrics(key)
+                .unwrap_or_else(|error| panic!("rasterizer 认不出 shaper 铸的 {face:?}：{error}"));
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1727,7 +1773,9 @@ mod tests {
             .expect("source range should be valid");
         let shape_request =
             ShapeRequest::new("A", source, TextStyle::Plain, request).expect("request");
-        let shaped = TextShaper::shape(&shaper, &shape_request).expect("CoreText should shape");
+        let shaped = shaper
+            .shape_request(&shape_request)
+            .expect("CoreText should shape");
         let run = shaped.runs().first().expect("shaped run");
         let glyph = run.glyphs().first().expect("shaped glyph");
         let rasterizer = shaper.rasterizer();
@@ -1773,8 +1821,9 @@ mod tests {
             .expect("source range should be valid");
         let shape_request =
             ShapeRequest::new("A", source, TextStyle::Plain, request).expect("request");
-        let shaped =
-            TextShaper::shape(&first_shaper, &shape_request).expect("CoreText should shape");
+        let shaped = first_shaper
+            .shape_request(&shape_request)
+            .expect("CoreText should shape");
         let glyph = shaped
             .runs()
             .first()

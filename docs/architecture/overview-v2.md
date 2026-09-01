@@ -3261,7 +3261,7 @@ table_resize / geometry）没有一个是 macOS 概念；`MacosFrameGeometry`（
 | 刀 | 内容 | 判据 |
 | --- | --- | --- |
 | **a** | 让 C ABI 在非 macOS 上不再撒谎 | 编译产物的符号表 |
-| **b** | 写下 shaping 契约；删掉零消费者的 `TextShaper`；`Utf16Map` 提到 `yu-font`；把「shaper 与 rasterizer 共用 face 表」写进类型 | 一套 conformance 测试，CoreTextShaper 与全部 mock 都跑 |
+| ~~**b**~~ **已完成** | 写下 shaping 契约；删掉零消费者的 `TextShaper`；`Utf16Map` 提到 `yu-font`；把「shaper 与 rasterizer 共用 face 表」写进类型 | 一套 conformance 测试，CoreTextShaper 与全部 mock 都跑 |
 | **c** | 把中立逻辑从平台层提上来（`MetalFrameConsumer` / `requires_full_clear` / `build_native_*` / `MetalSurfaceConfig` → `yu-render`；`CoreTextViewportFrameBuilder` → 泛型 → `yu-workspace`；`MacosFrameKey` → `FrameKey`；8 个 FFI 去前缀） | 纯重构：14 个 self-check 不变、**真实窗口截图差分逐字节为 0** |
 | **d** | `yu-font-windows`：DirectWrite 的 `ShapingProvider` + `GlyphRasterizer` | 刀 b 那套 conformance 在 Windows CI 上跑。**不需要窗口、GPU、壳** |
 | **e** | `yu-render-windows`：D3D 后端 | headless 的「`RenderPlan` → 平铺指令」比对（刀 c 提上来之后两端共用，是真差分不是自证）+ 一个真实窗口 smoke |
@@ -3333,6 +3333,253 @@ CI 的 toolchain 加了 `llvm-tools` component：Windows runner 上没有 `nm`�
    stdout：读不到只会让比对少符号从而**变红**，方向是安全的。本机 rustup 的
    sysroot 里**没有** `llvm-nm`（只有 rust-lld / rust-objcopy），所以 CI 的
    toolchain 显式加了 `llvm-tools` component——Windows runner 上没有 `nm`。
+
+##### 刀 b 之前的 spike：两个问题，答案都不是原来假设的那个
+
+不写生产代码。DirectWrite / TSF 那一侧的每一条都来自公开文档与第三方实现，
+**仍然未在本仓库核实**；标着「实测」的几条是在本机跑出来的。
+
+**问题一：`IDWriteTextAnalyzer` 的 clusterMap 反转能不能满足「字形铺满 run」
+那个契约？——能，但代价必须显式选，而且这一问在 macOS 上先炸出了一个今天
+就活着的缺口。**
+
+*(1) clusterMap 的语义*
+
+`GetGlyphs` 的 `clusterMap` 是 `UINT16[textLength]`，索引单位是 UTF-16 code
+unit。官方文档对它只有一句话：「contains the mapping from character ranges to
+glyph ranges」——方向是**文本 → 字形**，与 `CTRunGetStringIndices`（字形 →
+文本）相反，而这句话没说清 `clusterMap[i]` 到底装的是什么。
+
+实际语义要从实现里读。HarfBuzz 2.6.4 的 DirectWrite shaper
+（`src/hb-directwrite.cc`）把它当 `log_clusters` 用，反转时先让每个字形取
+「映射到它的最小文本下标」，再把**没有任何文本映射到的字形沿用前一个字形的值**：
+
+```c
+for (unsigned int i = 1; i < glyphCount; i++)
+  if (vis_clusters[i] == (uint32_t) -1)
+    vis_clusters[i] = vis_clusters[i - 1];
+```
+
+也就是 `clusterMap[i]` = 文本位置 i 所属那一簇的**首个字形下标**；一簇多形时
+后续那些字形在 clusterMap 里根本不出现。另有一条路：
+`DWRITE_SHAPING_GLYPH_PROPERTIES` 带 `isClusterStart : 1`，直接给出字形侧的
+簇边界，反转不必只靠 clusterMap。
+
+*(2) 把反转跑一遍*（合成 clusterMap，喂给 `block.rs:1717-1731` 那道门的独立
+复刻——判据不走被测那条路）
+
+三种「多余字形拿什么区间」的策略 × 五种形状：
+
+| 形状 | repeat（HarfBuzz 式） | empty-at-end | merge-cluster |
+| --- | --- | --- | --- |
+| 1:1　`[0,1,2]` → 3 形 | 过 | 过 | 过 |
+| N:1 连字　`[0,0]` → 1 形 | 过 | 过 | 过 |
+| 1:N　`[0]` → 2 形 | **红** `from=0 cursor=1` | 过，产出 `(0,1),(1,1)` | 过，**丢一形** |
+| 中间 1:N　`[0,1,3]` → 4 形 | **红** | 过 | 过，**丢一形** |
+| M:N　`[0,0]` → 3 形 | **红** | 过 | 过，**丢两形** |
+
+**反转本身是机械的、无歧义的；不机械的是一簇多形时那三条路各自赔掉什么**
+——硬失败 / 空区间 / 少画字形。契约今天一条都没说，所以第二端可以合法地选
+中间那条，而中间那条是——
+
+*(3) 空区间那条路会怎样（实测）*
+
+`empty-at-end` 通过了 tiling 那道门的**字面检查**（`from != cursor` 对空区间
+恒不成立），然后：
+
+- 空区间落在 run **末尾**：`crates/yu-layout/src/block.rs:1770` 的
+  `bidi.levels[start + from]` 越界，**panic**（实测
+  `index out of bounds: the len is 2 but the index is 2`）。
+- 空区间落在**中间**：不 panic，产出一个零长度的 cluster，advance 照算
+  ——行宽多出那一段。
+
+**这是这次 spike 抓到的真缺口，而且它与第二端无关，今天就在整仓活着**：
+一个满足了 `block.rs` 明文契约的 shaper 能让布局 panic，而 I4 说 panic 不得
+穿过 ABI。所以刀 b 要做的不只是「把契约抄到 trait 上」——**契约本身漏了一条**。
+
+*(4) 顺带查清了一件更硬的事：那道门在 macOS 上今天没有任何输入能触发*
+
+拿 35 个语料在本机跑真的 `CoreTextShaper`：**`dupStart`（两个字形同一个起点）
+一次都没出现过**。会出现它的脚本全部在更早一步就被拒了——
+`yu-font-macos/src/lib.rs:1253` 的 `CTRunStatus::{NonMonotonic, RightToLeft}`。
+实测被拒的有：天城文（`क्षि` / `हिन्दी`）、泰米尔、卡纳达、僧伽罗、马拉雅拉姆、
+奥里亚、孟加拉、泰文的 SARA AM（`ำ`）、缅甸文、**阿拉伯文与希伯来文**。
+过得去的（一簇一形）有：拉丁与组合记号、CJK、藏文、老挝文、高棉文、
+泰卢固文、古吉拉特文、爪哇文、韩文 jamo、emoji ZWJ 家庭、区域指示旗、
+tag 序列旗。
+
+两条推论：
+
+- `from != cursor` 这道硬失败**没有任何真实输入能触发它**。它不是死代码
+  （第二端会触发），但它今天**没有反向验证的手段**——这是「只有一类实现的
+  接口等于还没被证明」的最强形态。conformance 套件必须用一个**故意违约的
+  mock** 来压它，指望语料是压不住的。
+- **Yu 今天渲染不了 RTL 与印度系文字，而且不是画错，是整屏发不出来。**
+  `ShapingProvider::shape` 的 `Err` 一路传成 `LayoutError::Shaping` →
+  `EditorDocumentError::Layout` → `assemble_viewport_scene_*` 的 `?`
+  （`yu-workspace/src/lib.rs`，链路上没有任何降级分支；
+  `yu-editor/src/layout.rs:140/166` 与 `document.rs:441` 也只是 `Result`）。
+  **这与 I5「永不白屏、永远可编辑」冲突**——I5 说的是「尚未支持的语法按普通
+  段落源码文本绘制」，而这里连源码文本都画不出来。**登记，刀 b 不修**：修它
+  要回答「一个块 shape 不了时画什么」，那是渲染降级的问题，不是 seam 契约的
+  问题。
+- 一条诊断上的小事：`CTRunStatus::RightToLeft` 与 `NonMonotonic` 共用错误变体
+  `NonMonotonicGlyphIndices`，于是希伯来文报的是「非单调」。名字撒谎，不影响
+  行为。
+
+**问题二：`CoreTextEditContext` 能不能在非 WinUI 的桌面进程里用？——不能。
+刀 f 的语言因此不由 IME 决定，Rust + `windows-rs` 的选择成立。**
+
+- `CoreTextServicesManager` 的类文档原话：「This object is associated with an
+  application's UI thread (**the thread that CoreWindow runs on**)」，取实例的
+  唯一入口是 `GetForCurrentView()`。截至最新一版 WinRT 参考（moniker
+  `winrt-28000`，2025-11-21 更新），这个类**只有** `GetForCurrentView()` 与
+  `CreateEditContext()` 两个方法——**没有 HWND / WindowId 形态的 interop 静态
+  方法**（`IDataTransferManagerInterop::GetForWindow` 那种模式在这里不存在）。
+- Win32 桌面进程没有 `CoreWindow`；WinUI 3 桌面同样没有。微软在
+  `microsoft/WindowsAppSDK` Discussion #3226 里的答复是「`GetForCurrentView()`
+  挂在 CoreWindow 上，而 CoreWindow 在桌面环境里根本不存在」，并明确
+  「there is no support for what you want to do」。
+  `microsoft/microsoft-ui-xaml` Issue #4239 记的是同一件事的表现：
+  `RPC_E_WRONG_THREAD`。
+- 所以**换成 C#/WinUI3 并不能换到 `CoreTextEditContext`**——WinUI 3 桌面的
+  `TextBox` 自己走的也是 TSF。参照物：WPF 的
+  `System.Windows.Documents.TextStore` 是一份**托管的 `ITextStoreACP` 手写
+  实现**。托管语言省不掉这份实现。
+- Rust 这一侧机械上可行：`windows-rs` 生成了
+  `Win32::UI::TextServices::ITextStoreACP` 与配套的 `ITextStoreACP_Impl`
+  trait（26 个必须实现的方法），`#[implement]` 宏就是干这个的。
+
+**于是「唯一真正贵的地方」那句要改一个字**：贵的不是「Rust 比 C# 麻烦」，
+而是 **`ITextStoreACP` 那 26 个方法两种语言都得手写**。三条选 Rust 的理由
+（1,801 行搬运归零、GPU 不需要第二语言、中立逻辑有地方落）没有被动摇，
+反而少了唯一那条反对理由。
+
+##### 刀 b：写下 shaping 契约 —— 已完成
+
+**这一刀最重要的产出不是抽象，是一个缺口。** 计划里它是「为第二端把契约
+写下来」，做下去发现契约本身漏了一条，而漏掉的那条今天就能让布局 panic
+（见上面 spike 的第 (3) 条）。
+
+**十条契约写在 `yu_core::ShapingProvider` 的文档上，可执行的那一份是
+`yu_core::shaping_conformance`。** 条文见那里，这里只说三件容易搞错的：
+
+1. **「一簇一形」= C3（铺满）+ C4（非空）**，缺一不可。C3 单独并不排除空
+   区间——`from != cursor` 对它恒不成立。
+2. **覆盖面不是契约的一部分。** 一个只排得了拉丁文的后端仍然合规，它对别的
+   输入返回 `Err`。语料因此分两档：`Required`（拒了就是不合规）与 `Optional`
+   （拒了没事，排出来就要守全部条款）。不分档的话，CoreText 会因为拒掉希伯来
+   文而被判成不合规；只有 `Required` 一档的话，「永远返回 `Err`」也能通过。
+3. **C8（基址）在产品链路上永远看不出来。** 布局层总是传零基 range
+   （`block.rs` 的 `local_range`），所以「后端有没有把 `source.start()` 加回
+   去」在真实调用里没有差别——`yu-layout` 自己那个 `TestShaper` 就一直没加。
+   套件用第二个基址再问一遍来压它。**这条顺带结掉了一条已登记的遗留**
+   （「`ShapingProvider` 的 range 参数是一个零基局部空间」）：调用方今天确实
+   传零基，但**契约不依赖它**。
+
+**套件放在 `yu-core` 而不是 `yu-font`。** 六个实现散在六个 crate
+（`yu-core` / `yu-font` / `yu-layout` / `yu-editor` / `yu-bench` /
+`yu-font-macos`），只有 0 层是它们全都已经依赖的。放 `yu-font` 会逼
+`yu-editor` 与 `yu-bench` 各加一条**产品**依赖边——为了测试脚手架去改依赖图，
+方向是反的。它是普通 API 不是 `#[cfg(test)]`：跨 crate 看不见别人的 test
+配置。
+
+**六个实现全部接上了，一个不落**，包括 bench 那个（bench 量的是真
+`EditorDocument` 的代价，用一个不合规的 shaper 量出来的数不作数）。
+
+**这一刀改了三处行为，不只是搬运：**
+
+1. **`yu-layout` 现在拒空区间**（新的 `LayoutError::Shaping("glyph source
+   ranges must not be empty")`）。修之前：落在 run 末尾 **panic**，落在中间
+   多算一段 advance。守护测试三条，**中间那种排在最前**——它不 panic，是三条
+   里最容易溜过去的那一种。
+2. **`shape_run` 里那段翻译抽成了纯函数 `cluster_spans`**，并且**一簇多形
+   现在报 `MultiGlyphCluster` 而不是靠 `find(> start)` 悄悄跳过**。
+   抽出来的理由就是第七刀 spike 的第 (4) 条：那段逻辑**没有任何真实输入能
+   触发**，留在 `shape_run` 里就没有反向验证的手段。抽出来之后它是
+   `(&[usize], run_start, run_end) -> Result<Vec<(usize, usize)>, _>`，
+   合成输入随便造。**第二端会一字不差地要写同一件事**——DirectWrite 的
+   `clusterMap` 反过来就是这张表，而它的一簇多形是常态不是例外。
+3. **RTL 不再借用「非单调」那个错误名。** `CTRunStatus::RightToLeft` 与
+   `NonMonotonic` 以前共用一个变体，于是希伯来文报的是「非单调」。行为没错，
+   排查会往错的方向找。
+
+**搬家三件：**
+
+- **`TextShaper` 删掉。** 全仓零消费者——没有任何地方以 `&dyn TextShaper` 或
+  `impl TextShaper` 取参，三个实现者只是各自转调一次自己的固有方法。
+  `MockShaper::shape` 与 `CoreTextShaper::shape` 变成固有方法，`ShapeRequest`
+  留着（两个消费者）。**一个多出来的 trait 会让第二端以为有两个契约要实现。**
+- **`Utf16Map` → `yu-font`**，错误类型从 `CoreTextShapeError` 换成 `Option`
+  （调用方各自映射自己的错误）。它跟平台无关：DirectWrite 的 `clusterMap`
+  同样以 UTF-16 code unit 为索引单位。用例跟着搬，并且比原来多——代理对低位
+  必须是 `None` 而不是就近取整，那是「把一个字符劈成两半而不报错」。
+- **`FaceTable` → `yu-font`，泛型化成 `FaceTable<T>` + `SharedFaceTable<T>`。**
+  `T` 是平台自己的 face 描述：macOS 存 PostScript 名**加触发它的样本字符**
+  （私有 UI 字体的名字无法反向创建字体，栅格化要重放同一次 fallback），
+  那是 CoreText 独有的补丁，没进共享 seam；DirectWrite 可以直接存
+  `IDWriteFontFace`。**进程单例留在 macOS 侧**（`OnceLock`）——那是平台的选择，
+  不是 `yu-font` 强制的。
+
+**「共用同一张 face 表」写进类型写到了什么程度：**`SharedFaceTable` 是拿到一张
+表的唯一方式，后端的 rasterizer 只能由它构造（macOS 侧 `with_faces` 是私有的，
+唯一调用点是 `CoreTextShaper::rasterizer()`）。**这挡不住谁去新建第二张表**
+——`SharedFaceTable::new()` 是公开的——但它把「共用」变成默认路径，把「不共用」
+变成一句要显式写出来的话。`yu-font` 那条用例把后果钉在纸面上：两张表的 0 号
+face 是两个不同的字体而 id 一模一样，拿 A 的 id 去查 B 会**查到 B 里同号的那
+一个**，不报错。
+
+> **想过但没做：把表的身份编进 `FontFaceId` 的高位**，于是拿错表的 id 会得到
+> `None` 而不是一个错误的 face。它确实把静默错渲染变成响亮报错，代价是
+> `GlyphRasterKey`、atlas、`FontDatabase` 三处都假设 id 是稠密小整数。
+> **登记，不做**：触发条件是「真的出现了第二张表」，而现在连第二端都还没有。
+
+**判据分工**（避免写出一堆自证的用例）：
+
+- **「CoreText 排得对不对」不归这一刀**，那是 `yu-font-macos` 已有的那几条
+  （x_offset 相对笔位、face 跨脚本对得上、栅格化朝向）。
+- **这一刀的新判据是「契约本身」**，它有正反两面，两面都写了：合规的 mock
+  必须过（`a_conforming_backend_passes`），四种典型违约必须被抓住（空区间、
+  重复簇首、忽略基址、拒掉 `Required` 语料）。**只写正面那半，一个什么都不
+  检查的 `audit` 也会全绿。**
+- **不要拿「两个后端排出同样的字形」当判据**——那要等第二端，而且两边都从
+  同一份契约来时那也是自证的。
+
+**八个变异全部变红：**
+
+| 变异 | 谁变红 |
+| --- | --- |
+| M1 一簇多形不再报错（**第七刀指定的那条**：end 取下一个 index 不管大小） | `cluster_spans` 用例 |
+| M2 布局层不再拒空区间 | `empty_glyph_ranges_are_rejected`（中间那种断言失败，末尾那种直接 panic） |
+| M3 `Utf16Map` 对代理对中间就近取整 | `the_low_half_of_a_surrogate_pair_has_no_byte_boundary` |
+| M4 `FaceTable` 每次都铸新 id | `the_same_key_keeps_the_same_id` |
+| M5 `SharedFaceTable` 克隆时另建一张表 | `two_tables_mint_colliding_ids_for_different_faces` |
+| M6 CoreText 忽略请求的基址 | CoreText 的 conformance（C8） |
+| M7 CoreText 的 run 一律报 `Plain` | CoreText 的 conformance（C7） |
+| M8 契约自己不再查空区间 | `an_empty_glyph_range_is_a_violation` |
+
+**没有一个活下来**，这一刀因此没有「一般式 / 死代码 / 就是缺口」的分类要做。
+值得注意的是 M1：**它就是交接稿指定的那条变异，而在抽出 `cluster_spans` 之前
+它是抓不住的**——原来那个 `find(> start)` 与「取下一个」在 macOS 上产出完全
+相同的结果，因为真实的 CoreText 造不出让两者分开的输入。**把判据从「跑一遍
+真后端」挪到「跑一遍纯函数」是这一刀能有反向验证的前提。**
+
+**实际代价**：Swift 产品代码**一行没动**（这一刀在 C ABI 以下）。
+`yu-font` 多两个模块（`utf16.rs` **140** 行、`face.rs` **232** 行），`yu-core`
+多一个（`shaping_conformance.rs` **667** 行，其中 257 行是它自己的正反用例）。
+`yu-font-macos` **1,799 → 1,838**：搬走两块、抽出一个纯函数、删掉一个 trait
+impl，多出来的 39 行几乎全是新用例与那几段「为什么」。
+
+**没有做、已登记的两条：**
+
+1. **shape 失败时产品上画什么。** `Err` 今天一路传成 `?`，那一整屏发不出来，
+   于是 Yu 渲染不了 RTL 与印度系文字。**这与 I5 冲突**，见 spike 那一节。
+   修它要回答「一个块 shape 不了时画什么」，那是渲染降级，不是 seam 契约。
+2. **UTF-16 换算现在有三份实现**：`yu_font::Utf16Map`（批量边界表）、
+   `yu-text` 的 `byte_offset_for_utf16`（文档快照上）、`yu-storage-ffi` 的
+   `utf16_byte_offset`（局部字符串上）。三者算的是同一件事，形状不同。
+   合并要跨 `yu-font` / `yu-text` 两条依赖边（`yu-font` 不许依赖 `yu-text`），
+   **不在这一刀的范围里**，记下来。
 
 ---
 

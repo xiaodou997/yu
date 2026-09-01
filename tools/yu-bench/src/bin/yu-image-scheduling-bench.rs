@@ -179,3 +179,16 @@ fn image_fixture(blocks: usize) -> String {
     }
     source
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BenchShaper;
+
+    /// bench 用的 shaper 也要合规：它排出来的东西喂给的是真的
+    /// `EditorDocument`，一个不合规的 shaper 量出来的代价不作数。
+    #[test]
+    fn the_bench_shaper_conforms_to_the_shaping_contract() {
+        let violations = yu_core::shaping_conformance::audit(&BenchShaper);
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+}

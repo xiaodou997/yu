@@ -3117,6 +3117,12 @@ mod tests {
     }
 
     #[test]
+    fn the_wide_shaper_conforms_to_the_shaping_contract() {
+        let violations = yu_core::shaping_conformance::audit(&WideShaper);
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
     fn composition_lives_in_document_and_commits_once() {
         let mut document = EditorDocument::new("输入: ");
         document

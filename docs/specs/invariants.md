@@ -256,6 +256,34 @@ shaping 与栅格化属于平台。平台后端不得决定断行位置。
 backing scale。两次都不 panic、不报错，只是画错，都要靠真实窗口才发现——
 和字节/字符索引混用属于同一类失败模式。
 
+**E7.** **shaping 的产出契约写在 `yu_core::ShapingProvider` 上，由
+`yu_core::shaping_conformance` 强制，每一个实现都要跑。**
+
+十条条文见那个 trait 的文档。核心是两条合起来的那一条：**一簇一形**——一个 run
+的全部 `Glyph::source` 必须首尾相接、不重叠、**非空**地铺满该 run。
+
+- 「铺满」少了「非空」不成立：`from != cursor` 对空区间恒不成立，于是空区间
+  过得了那道门，然后在 run 末尾让布局层**越界 panic**，落在中间则凭空多算
+  一段 advance。这一条是 S7 第七刀 spike 抓出来的，此前整仓都活着。
+- **后端做不到就返回 `Err`，不许伪造区间。** 一簇多形有三种凑法（重复起点 /
+  空区间 / 并成一形），分别是重画、panic、丢字形，没有一种是对的。
+
+**这一条为什么必须是可执行的**：`ShapingProvider` 今天有六个实现，五个是
+mock，全都一 grapheme 一 glyph——**只有一类实现的接口等于还没被证明**。而契约
+以前只存在于调用方（`yu-layout/src/block.rs` 的 tiling 门）里，类型上一个字
+都看不出来；第二端照着类型写就会撞上。
+
+**语料压不住的那半要靠故意违约的 mock。** 实测（S7 第七刀 spike，35 个语料）：
+真实的 CoreText 从来没产出过两个字形同一个起点——会出现它的脚本全部先被
+`CTRunStatus` 拒了。所以「一簇多形」这一条**没有任何真实输入能触发**，
+反向验证只能靠合成输入（`yu-font-macos` 的 `cluster_spans` 用例、
+`yu-layout` 的 `Ranges` mock、`yu-core` 自己那几条）。
+
+**配套的一条：`FontFaceId` 由 shaper 铸、由 rasterizer 消费，两者必须共用
+同一张 `yu_font::SharedFaceTable`。** 各铸各的不 panic、不报错，表现是**屏幕
+上画出来的字全是别的字**。这条以前只存在于 macOS 的一个方法上
+（`CoreTextShaper::rasterizer()`），现在住在类型里。
+
 ---
 
 ## F. 已登记的规范偏差
