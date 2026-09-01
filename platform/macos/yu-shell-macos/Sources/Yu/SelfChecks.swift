@@ -51,6 +51,26 @@ func runClipboardSelfCheck(path: String) -> Never {
         let plainFallback = try textView.sourceFromPasteboardForSelfCheck(pasteboard)
         precondition(plainFallback == "plain fallback")
 
+        // **纯文本与可用 HTML 同时在时取 HTML。**
+        //
+        // 这一种组合以前一条断言都没有，而它正是**每一个真实剪贴板**的形状
+        // ——浏览器、邮件、文档编辑器都同时放两种。缺了它，「Markdown > 纯文本
+        // > HTML」这个顺序绿了很久，而 HTML 导入在生产里一次都没走到过
+        // （S7 第七刀 c 的 G 节验收查出来的）。
+        //
+        // 判据要看得出「取的是哪一份」：纯文本那一份**故意不是** HTML 那一份
+        // 的降级文本，否则两条路产出同一个字符串，断言什么都证明不了。
+        pasteboard.clearContents()
+        precondition(pasteboard.setString("只有纯文本会看到这一行", forType: .string))
+        precondition(
+            pasteboard.setString(
+                "<h2>来自 HTML</h2>",
+                forType: .yuHTML
+            )
+        )
+        let preferHTML = try textView.sourceFromPasteboardForSelfCheck(pasteboard)
+        precondition(preferHTML == "## 来自 HTML", "纯文本与可用 HTML 同时在时必须取 HTML")
+
         pasteboard.clearContents()
         precondition(pasteboard.setString("**canonical**", forType: .yuMarkdown))
         precondition(pasteboard.setString("<p>derived</p>", forType: .yuHTML))
@@ -63,7 +83,13 @@ func runClipboardSelfCheck(path: String) -> Never {
         let fixtureCases: [(name: String, accepted: Bool)] = [
             ("semantic-mail", true),
             ("rich-table", true),
-            ("browser-wrapper", false),
+            // S7 第七刀 c 的 G 节验收之后翻案：浏览器的信封
+            // （<html>/<head>/<body>/<!--StartFragment-->/<div>）不再算
+            // 「别人的 HTML」，拆掉信封之后里面那段语义要接得住。以前这里
+            // 断言的是「被拒」，而那条断言绿着的同时，Yu 从来没有接住过一次
+            // 真实的浏览器粘贴。
+            ("browser-wrapper", true),
+            // 带行为的标签继续拒——变的是信封，不是这一条。
             ("unsafe", false),
         ]
         for fixture in fixtureCases {

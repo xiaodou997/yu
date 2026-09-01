@@ -104,18 +104,86 @@ fn export_import_export_is_a_fixed_point() {
     }
 }
 
-/// 原始 HTML 是这对里**有意**的那处不对称，钉住它免得被当成缺口顺手补上。
+/// 带语义的原始 HTML 仍然是这对里**有意**的那处不对称。
 ///
 /// 导出照原样发（另一条路是 comrak 的 `<!-- raw HTML omitted -->`，那是静默
 /// 删掉用户自己写的内容）；导入拒绝（那是别人的 HTML）。所以带原始 HTML 的
 /// 文档**走不完这一圈**，而这是对的。
 #[test]
-fn raw_html_deliberately_does_not_round_trip() {
-    for source in ["<div>raw</div>\n", "段落里有 <b>标签</b>\n"] {
+fn semantic_raw_html_deliberately_does_not_round_trip() {
+    for source in [
+        "段落里有 <b>标签</b>\n",
+        "<article>整块</article>\n",
+        "<iframe src=\"https://example.com\"></iframe>\n",
+    ] {
         let html = export_html_fragment(source);
         assert!(
             import_html_fragment(&html).is_err(),
             "{source:?} 的原始 HTML 不该被导入策略接受：{html}"
         );
     }
+}
+
+/// **纯呈现的容器不再拒，而是拍平——这是 S7 第七刀 c 的 G 节验收之后翻的案。**
+///
+/// 原来这条与上面那条是同一个用例，`<div>raw</div>` 也在名单里，理由是
+/// 「那是别人的 HTML」。G 节实测下来这条理由在 `<div>` 上不成立：
+/// **每一个真实浏览器发的剪贴板 HTML 都带 `<div>` / `<span>`**（Chrome 对一个
+/// 连一个 `div` 都没有的页面也会把词间空白包成 `<span> </span>`），于是
+/// 「拒绝 `<div>`」在实践上等于**拒绝每一次浏览器粘贴**——这个导入器上线以来
+/// 从没有接住过一次，而那正是它存在的理由。
+///
+/// **代价是真的，写在这里**：用户自己写在 Markdown 里的 `<div>raw</div>`
+/// 现在导入时被拍平成 `raw`。Yu 分不出「用户写的 div」与「浏览器的 div」
+/// ——而后者是唯一真实的输入来源。**这条用例钉的就是这个代价**，免得下一个人
+/// 把它当成缺口再翻回去。
+///
+/// 注意 Yu → Yu 不走这条路：剪贴板上有 canonical 的 Markdown flavor，
+/// 平台侧的偏好顺序是 Markdown > 纯文本 > HTML（`--clipboard-self-check`）。
+#[test]
+fn presentational_containers_are_flattened_not_rejected() {
+    assert_eq!(
+        import_html_fragment(&export_html_fragment("<div>raw</div>\n")),
+        Ok("raw\n".to_owned())
+    );
+    assert_eq!(
+        import_html_fragment("<div><p>一段</p></div>"),
+        Ok("一段".to_owned())
+    );
+    assert_eq!(
+        import_html_fragment("<p>词<span> </span>之间</p>"),
+        Ok("词 之间".to_owned())
+    );
+}
+
+/// **判据来自一次真实的浏览器拷贝，不是我编的一段 HTML。**
+///
+/// `corpus/chrome-clipboard.html` 是 Chrome 138 在 macOS 26.5 上，对一个
+/// 连一个 `<div>` 都没有的纯语义页面（一个 `<h2>`、一个带 `<strong>` 与
+/// `<a>` 的 `<p>`、一个两项的 `<ul>`）按 ⌘A ⌘C 之后放在 `public.html` 上的
+/// **原样字节**（S7 第七刀 c 的 G 节验收采集）。
+///
+/// 它一次性含着三样以前各自能让整段被拒的东西：开头的 `<meta charset>`、
+/// 每个块元素上二十来条声明的 `style`、以及把词间空白包起来的
+/// `<span> </span>`。**这三样都不是我造的语料想出来的**——正是因为造不出来，
+/// 这个导入器上线以来从没有接住过一次浏览器粘贴。
+#[test]
+fn a_real_browser_clipboard_payload_imports_to_markdown() {
+    let html = include_str!("corpus/chrome-clipboard.html");
+    let markdown = import_html_fragment(html).expect("真实浏览器载荷必须接得住");
+
+    // `\u{a0}` 是**不换行空格**，不是普通空格：源码页面那几处写的是 U+0020，
+    // 是 Chrome 在拷贝时把它们换成了 NBSP（它要保住渲染出来的空白，好粘进
+    // 别的富文本编辑器）。
+    //
+    // **不改写它，而是在这里点名。** 导入器的职责是翻译结构，不是重写文本；
+    // 把 NBSP 悄悄换回空格会连着毁掉网页作者**故意**写的那些（数字与单位之
+    // 间的 `&nbsp;`）。代价是粘进来的段落里夹着看不见的 NBSP——搜索匹配不上，
+    // 已登记在 invariants 的 F 节。这条断言的价值正是**让它看得见**。
+    assert_eq!(
+        markdown,
+        "## 网页里的标题\n\n\
+         一段带\u{a0}**粗体**\u{a0}与\u{a0}[链接 A](https://example.com/a)\u{a0}的文字。\n\n\
+         - 第一项\n- 第二项\u{a0}*斜体*"
+    );
 }
