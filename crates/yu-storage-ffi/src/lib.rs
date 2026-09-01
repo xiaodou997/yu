@@ -54,14 +54,15 @@ use yu_font::FontRequest;
 use yu_font::GlyphAtlasConfig;
 #[cfg(target_os = "macos")]
 use yu_font_macos::{CoreTextShaper, CoreTextViewportMetrics};
+#[cfg(target_os = "macos")]
+use yu_render::SurfaceConfig;
 #[cfg(all(target_os = "macos", test))]
 use yu_render_macos::MacosEmbeddedSvgRasterizer;
 #[cfg(target_os = "macos")]
 use yu_render_macos::{
     CoreTextViewportFrameBuilder, CoreTextViewportFrameError, MacosImageDecodeError,
     MacosImageDecodeWorker, MetalAtlas, MetalDevice, MetalFrameRenderer, MetalImageAtlas,
-    MetalSurface, MetalSurfaceConfig, MetalUploader, MetalViewAttachmentOwned,
-    MetalViewportHostSession,
+    MetalSurface, MetalUploader, MetalViewAttachmentOwned, MetalViewportHostSession,
 };
 
 pub const YU_STORAGE_OK: i32 = 0;
@@ -4413,13 +4414,11 @@ fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange,
 fn macos_render_host_error_status(error: &CoreTextViewportFrameError) -> i32 {
     match error {
         CoreTextViewportFrameError::InvalidConfig(_) => YU_STORAGE_INVALID_VIEWPORT_CONFIG,
-        CoreTextViewportFrameError::Font(_) | CoreTextViewportFrameError::Raster(_) => {
-            YU_STORAGE_CORE_TEXT_UNAVAILABLE
-        }
+        CoreTextViewportFrameError::Raster(_) => YU_STORAGE_CORE_TEXT_UNAVAILABLE,
         CoreTextViewportFrameError::Document(error) => status_from_editor_error(error.clone()),
-        CoreTextViewportFrameError::Atlas(_)
-        | CoreTextViewportFrameError::Publish(_)
-        | CoreTextViewportFrameError::Host(_) => YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+        CoreTextViewportFrameError::Atlas(_) | CoreTextViewportFrameError::Publish(_) => {
+            YU_STORAGE_RENDER_HOST_UNAVAILABLE
+        }
     }
 }
 
@@ -4848,7 +4847,7 @@ fn macos_render_host_surface_prepare(
     surface_height: f64,
     scale: f64,
 ) -> Result<u64, i32> {
-    let config = MetalSurfaceConfig::new(surface_width, surface_height, scale)
+    let config = SurfaceConfig::new(surface_width, surface_height, scale)
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     let state = session
         .macos_render_host

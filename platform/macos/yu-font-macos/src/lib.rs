@@ -1042,6 +1042,22 @@ impl ShapingProvider for CoreTextShaper {
     }
 }
 
+/// CoreText 侧把 E7 的配套条款接上：栅格化器只能从 shaper 这里要。
+///
+/// `rasterizer()` 走的是 `CoreTextGlyphRasterizer::with_faces`（私有），唯一
+/// 的调用点就是这里，所以「共用同一张 face 表」是默认路径而不是一句约定。
+impl yu_font::RasterizingShaper for CoreTextShaper {
+    type Rasterizer = CoreTextGlyphRasterizer;
+
+    fn font_request(&self) -> &FontRequest {
+        &self.request
+    }
+
+    fn rasterizer(&self) -> Self::Rasterizer {
+        Self::rasterizer(self)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn style_font_request(request: &FontRequest, style: TextStyle) -> FontRequest {
     match style {

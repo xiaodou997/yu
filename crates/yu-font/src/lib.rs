@@ -25,7 +25,7 @@ pub use face::{FaceTable, FaceTableError, SharedFaceTable};
 pub use raster::{
     AtlasEntry, AtlasError, AtlasRect, FontMetricKey, FontMetricsCache, FontMetricsSnapshot,
     GlyphAtlas, GlyphAtlasConfig, GlyphBitmap, GlyphMetrics, GlyphRasterKey, GlyphRasterizer,
-    RasterDataError, RasterizedGlyph,
+    RasterDataError, RasterizedGlyph, RasterizingShaper,
 };
 pub use utf16::Utf16Map;
 pub use yu_core::{
