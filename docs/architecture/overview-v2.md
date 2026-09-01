@@ -3119,7 +3119,7 @@ CoreText 怎么满足它的：`yu-font-macos/src/lib.rs:1259-1266` 拿
 两套线程规则。**保留 `macos_` 前缀，Windows 另开 `windows_` 一份**：这是 S1 那条
 「参数形状不同的一族不合并」（本节 S1 「函数数量目标的修正（第二次）」）的第二次
 应用。`frame_is_current`（5165）一个平台字节都没有，跟前面 8 个走；
-`render_host_frame`（4878）跟 seam 提升一起定。
+`render_host_frame`（4878）跟 seam 提升一起定——**刀 c 定了：前缀留着**，理由见那一节。
 
 **`MacosFrameKey`（lib.rs:1015）是平台中立的，名字撒谎。** 六个字段
 （revision / composition_generation / selections / search_generation /
@@ -3263,7 +3263,7 @@ table_resize / geometry）没有一个是 macOS 概念；`MacosFrameGeometry`（
 | **a** | 让 C ABI 在非 macOS 上不再撒谎 | 编译产物的符号表 |
 | ~~**b**~~ **已完成** | 写下 shaping 契约；删掉零消费者的 `TextShaper`；`Utf16Map` 提到 `yu-font`；把「shaper 与 rasterizer 共用 face 表」写进类型 | 一套 conformance 测试，CoreTextShaper 与全部 mock 都跑 |
 | ~~**b2**~~ **已完成**（**表外插的一刀**，刀 b 的 spike 查出来的） | 排不出来的簇画替代字形，不让整个块失败 | 判据落在洞出现的那一层：`yu-storage-ffi` 的那个错误码不再出现 |
-| **c** | 把中立逻辑从平台层提上来（`MetalFrameConsumer` / `requires_full_clear` / `build_native_*` / `MetalSurfaceConfig` → `yu-render`；`CoreTextViewportFrameBuilder` → 泛型 → `yu-workspace`；`MacosFrameKey` → `FrameKey`；8 个 FFI 去前缀） | 纯重构：14 个 self-check 不变、**真实窗口截图差分逐字节为 0** |
+| ~~**c**~~ **已完成** | 把中立逻辑从平台层提上来（`MetalFrameConsumer` / `requires_full_clear` / `build_native_*` / `MetalSurfaceConfig` → `yu-render`；`CoreTextViewportFrameBuilder` → 泛型 → `yu-workspace`；`MacosFrameKey` → `FrameKey`；9 个 FFI 去前缀） | 纯重构：14 个 self-check 不变、**真实窗口截图差分逐字节为 0** |
 | **d** | `yu-font-windows`：DirectWrite 的 `ShapingProvider` + `GlyphRasterizer` | 刀 b 那套 conformance 在 Windows CI 上跑。**不需要窗口、GPU、壳** |
 | **e** | `yu-render-windows`：D3D 后端 | headless 的「`RenderPlan` → 平铺指令」比对（刀 c 提上来之后两端共用，是真差分不是自证）+ 一个真实窗口 smoke |
 | **f** | Windows 壳（窗口 + TSF + UIA） | self-check + `check-platform-parity.py` |
@@ -3670,6 +3670,119 @@ bug 不是「排不了」，那条继续返回 `Err`。两者混在一起会让�
 拒绝的 mock），`yu-font-macos` +69、`yu-storage-ffi` +32，两处都是纯用例。
 运行时代价只在失败路径上：一次额外的替代字形 shaping + 每簇一次重试，
 结果进 `LayoutCache`，每个块每次失效才付一遍。
+
+##### 刀 c：把中立逻辑从平台层提上来 —— 已完成
+
+**这一刀是纯重构，判据因此不在测试里，在两张图之间。** 两个 commit：c1 是
+render 那半（画面可能受影响），c2 是 FFI 命名那半（画面不可能受影响）——分开是
+为了让「哪次改动动了画面」从 commit 边界就看得出来，与第六刀分成两个 commit
+同一个理由。
+
+**搬的判据是「有没有原生指针」，不是「在哪个目录里」。** 搬走的每一段换成
+Direct3D 之后每一行都成立；留下的每一段都真的需要一个 device / queue /
+drawable / texture。
+
+###### c1：render 那半
+
+| 搬到 | 内容 |
+| --- | --- |
+| `yu_render::backend` | `SurfaceConfig`（逻辑尺寸 → drawable 像素取整）、`FrameConsumer`（Revision 闸门）、`requires_full_clear`、`DrawCommand` / `DamageRect` 两个 `#[repr(C)]` 平铺结构、`build_draw_commands` / `build_damage_rects` / `cull_draw_commands` |
+| `yu_workspace::ViewportFrameBuilder<S>` | 原 `CoreTextViewportFrameBuilder` 的全部准备逻辑 |
+| `yu_font::RasterizingShaper` | 「shaper 交出来的栅格化器与它共用同一张 face 表」 |
+
+四件事值得单独说：
+
+1. **`MetalRenderError` 没有合并，加了一条 `From<BackendError>`。** 平台错误是
+   中立错误的**超集**——那一侧还有 device / drawable / encoder / pipeline 的
+   失败。两个类型合并会把「Metal 起不来」和「render plan 不合法」搅成一个，
+   而第二端根本没有前者。Display 文本按变体一一对应，没有第二份措辞。
+2. **`FrameConsumer` 不再认识 `ViewportRenderFrame`。** 那是 `yu-workspace` 的
+   类型，而闸门要住在 `yu-render`——依赖方向不允许。原来的 `validate` /
+   `commit` 只是 `*_revision` 的转调，删掉，调用方自己 `frame.revision()`。
+   **少一个包装不是省事，是少一条「有两个契约要实现」的暗示**（与刀 b 删掉
+   `TextShaper` 同一个理由）。
+3. **泛型化缺的那一步是 `self.shaper.rasterizer()`。** 462 行里 macOS-only 的
+   只有两处：字段类型与这一行。为它加 `yu_font::RasterizingShaper`——这顺带把
+   **E7 的配套条款第一次写进了类型**：`FontFaceId` 由 shaper 铸、由 rasterizer
+   消费，两者必须共用同一张 face 表。刀 b 把「共用」做成了默认路径
+   （`SharedFaceTable` 是拿到表的唯一方式），这一刀把「从哪儿要栅格化器」也
+   收进了 trait：**拿到 shaper 的人只能从它这里要**。
+4. **两个零消费者顺手删掉**：builder 的 `from_system_ui` 与 `publish_and_submit`
+   （全仓没有调用点）。删完之后 `CoreTextViewportFrameError` 的 `Font` 与 `Host`
+   两个变体没有了生产者——**一个没有生产者的变体是一句谎话**，与第六刀
+   `YU_STORAGE_EXPORT_ERROR = 17` 退休同一条规矩。
+
+**`core_text.rs` 462 → 106 行，只剩两个类型别名与那条真 CoreText 的集成测试。**
+那条测试留在平台层是有理由的：`yu-workspace` 的用例只能用 mock 后端，而
+「真 CoreText 排出来的字形真的栅格化得进 atlas」只有在这一层问得出来。
+
+**新用例四条，判据都刻意不落在被搬的那条路上：**
+
+- 「可见字形只栅格化一次」断的是**后端被问了几次**，不是 atlas 里有几个字形。
+  少了 `atlas.entry(key).is_none()` 那道门，后者一模一样而前者每帧都在涨。
+- 「字号必须与 shaper 一致」压的是**构造与 `update_config` 是同一份检查**。
+  两处各写一遍是最容易漂开的地方，漏掉后一处不报错，只是画面糊。
+- 「拒绝一切的栅格化器把自己的错误原样带上去」——不悄悄少画一个字形。
+- 发布序号跨 builder 重建仍然接着走。
+
+###### c2：FFI 命名那半
+
+**9 个函数去掉 `macos_` 前缀**（表里的 8 个 + `frame_is_current`），
+`YU_STORAGE_CORE_TEXT_UNAVAILABLE = 19` 改名 `YU_STORAGE_SHAPER_UNAVAILABLE`，
+**编号不动**。Swift 那一侧的包装方法名跟着去掉 `macos` 前缀——C 符号不再挂着
+平台名，包装还挂着就是第二份说法。
+
+**`render_host_frame` 不跟着走，前缀留着。** 六刀表把它记成「跟 seam 提升一起
+定」，提完之后答案是**不去前缀**，理由与 `frame_is_current` 正好相反：
+
+- `frame_is_current` 只读 session 状态与平台送来的几何，一个平台对象都不碰；
+- `render_host_frame` 驱动的 `MacosRenderHostState` **整个是平台的**
+  （`MetalSurface` + `MetalViewportHostSession` + macOS 的图片资源状态）。
+  给它去前缀等于让 C ABI 再撒一次谎——第二端调不了这个函数，而名字说它能。
+  **那正是刀 a 修的那个失败模式的反方向。**
+
+它的中立那一半是 `FrameKey`，而这一刀把 `FrameKey` 提上去了。Windows 会另开
+`windows_render_host_frame`，与 `render_host_surface_submit` / `_detach` 同一条
+规矩（参数形状不同的一族不合并）。
+
+**`MacosFrameKey` → `yu_workspace::FrameKey`**（连同 `FrameGeometry` 与
+`FrameTableResize`）。这条解掉的真问题是：它的文档写着「新增一种不推进
+Revision 的可视状态时必须同时加进来，否则静默跳过」，而这句话原来住在一个
+**Windows 上根本不编译的块**里——第二端加了一种可视状态，第一端不会红。
+它的第二个消费者也已经排着队：TSF 是推模型，壳必须自己算出该发
+`OnTextChange` / `OnSelectionChange` / `OnLayoutChange` 中的哪一条，那正是这个
+键已经在做的事。
+
+`FrameGeometry` 的校验（有限、该为正的为正、滚动可以是 0）跟着搬，FFI 只留
+「C 结构体 → `FrameGeometry`」那一次翻译。`yu-workspace` 补三条用例，其中一条
+压的是**位模式比较**那条理由：同一份状态两次组装必须相等，否则每帧重画。
+
+###### 判据：两张图之间
+
+`verify.sh --clean` 十步全绿，**14 个 self-check 一个不少、一个不改**。
+
+真实窗口截图差分（Apple M1 Max、macOS 26.5、浅色、900×652 逻辑 / 1800×1304
+物理）：`sample.md` 与 `render-code.md` 各拍新旧两版，**整张图逐字节 0 差异**
+——不只是文档区，是包括标题栏在内的每一个像素。
+
+**这一刀量出了一个交接稿里没有的噪声源，而它长得完全像一次真的回归**：
+第一轮 `sample.md` 报出 **24,594 个不同像素，落在行 162–1282**——正正好在文档
+区里。按列一分布，全部集中在**第 1772–1793 列**，右边缘 22 像素宽的一条：
+macOS 的**叠加式滚动条**淡入淡出。判据是同一个二进制拍两次——旧版自己的两张图
+差的是**同一批 24,594 个像素**。
+
+> **原来的噪声底不够用了。** 交接稿说「文档区（行 47–1256）才是判据」，那是因为
+> 此前唯一的噪声源（半透明标题栏、底边圆角）都在文档区之外。滚动条不是——它
+> **横跨整个文档区的行范围**，只是被挤在最右边 22 列里。**行范围挡不住它，
+> 只有列范围能。** 下一刀要么把判据收成「行 47–1256 且列 < 1770」，要么像这一刀
+> 一样每个二进制多拍一张来把噪声钉死。
+
+**实际代价**：`yu-render-macos` **4,469 → 3,035 行**（`lib.rs` 4,007 → 2,929，
+`core_text.rs` 462 → 106）。`yu-render` 多一个模块（`backend.rs` 1,139 行，
+其中约 540 行是搬过来的用例），`yu-workspace` 多两个（`frame_builder.rs`、
+`frame_key.rs`）。**Swift 产品代码只有改名，行数不变。**
+`tools/check-geometry.py` 的两条例外登记跟着搬到新路径——它反向检查，留旧条目
+会红。
 
 ---
 

@@ -284,6 +284,13 @@ mock，全都一 grapheme 一 glyph——**只有一类实现的接口等于还�
 上画出来的字全是别的字**。这条以前只存在于 macOS 的一个方法上
 （`CoreTextShaper::rasterizer()`），现在住在类型里。
 
+两步走到位的：刀 b 把「共用」做成默认路径（`SharedFaceTable` 是拿到一张表的
+唯一方式，后端的 rasterizer 只能由它构造）；刀 c 补上「从哪儿要栅格化器」
+——`yu_font::RasterizingShaper` 要求 shaper 自己交出与它配对的那一个，于是
+**拿到 shaper 的人不需要、也没有第二条路去要**。它同时是把视口帧准备
+（`yu_workspace::ViewportFrameBuilder`）泛型化的条件：那 462 行里唯一跟平台
+有关的就是这一步。
+
 ---
 
 ## F. 已登记的规范偏差
@@ -487,6 +494,12 @@ surrogate 中间位置不得穿过 ABI。
 这一条是 S7 第七刀补的，起因是一次**全套门禁绿着的谎话**：两个 `macos_*` 函数
 整个挂在 `#[cfg(target_os = "macos")]` 下，而 `cargo test --workspace` 在三个
 平台都绿——因为从来没有人在非 macOS 上*链接*过那个 staticlib，只*编译*过。
+
+> **反方向同样是撒谎，刀 c 用到了这一条：** 一个函数**无条件存在**，但它驱动的
+> 状态整个是平台的（`macos_render_host_frame` 背后是 `MetalSurface` +
+> `MetalViewportHostSession`），那么给它一个平台中立的名字就等于让 ABI 说了
+> 一句它兑现不了的话——第二端调不了，而名字说它能。**名字要跟着「谁答得上来」
+> 走，不跟着「参数里有没有原生指针」走。** 前缀该留的留着，Windows 另开一份。
 
 ---
 

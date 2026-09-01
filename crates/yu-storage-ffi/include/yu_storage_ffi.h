@@ -24,7 +24,7 @@ enum {
     YU_STORAGE_STALE_COMPOSITION = 16,
     /* 17 退休：S7 第六刀之后导出没有第三种失败了。编号不复用。 */
     YU_STORAGE_HTML_IMPORT_REJECTED = 18,
-    YU_STORAGE_CORE_TEXT_UNAVAILABLE = 19,
+    YU_STORAGE_SHAPER_UNAVAILABLE = 19,
     YU_STORAGE_INVALID_VIEWPORT_CONFIG = 20,
     YU_STORAGE_RENDER_HOST_UNAVAILABLE = 21,
     YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE = 22,
@@ -107,7 +107,7 @@ enum {
     YU_STORAGE_TABLE_RESIZE_ROW = 2,
 };
 
-/* Actions for yu_storage_session_macos_table_resize_at_point. */
+/* Actions for yu_storage_session_table_resize_at_point. */
 enum {
     YU_STORAGE_TABLE_RESIZE_PROBE = 0,
     YU_STORAGE_TABLE_RESIZE_BEGIN = 1,
@@ -263,7 +263,7 @@ typedef struct YuStorageCompositionProjection {
 } YuStorageCompositionProjection;
 
 
-/* Revision/generation-bound CoreText-shaped caret geometry for the active
+/* Revision/generation-bound shaped caret geometry for the active
  * marked-text projection. caret_x/caret_y are local to block_index; visual
  * UTF-16 ranges remain in the full transient projected stream. */
 typedef struct YuStorageCompositionShapedCaret {
@@ -290,7 +290,7 @@ typedef struct YuStorageCompositionShapedCaret {
 
 
 
-/* One source-backed task checkbox from the currently published macOS retained
+/* One source-backed task checkbox from the currently published retained
  * frame. Bounds use document-space scene coordinates; the marker range is the
  * exact parser-owned [ ]/[x] source range. */
 typedef struct YuStorageTaskCheckboxHit {
@@ -519,7 +519,7 @@ typedef struct YuStorageAccessibilityNodeV2 {
  *
  * 导航不另开入口：拿 label_start_utf16 调
  * yu_storage_session_set_selection_endpoints，再调
- * yu_storage_session_macos_shaped_caret_scroll_request。 */
+ * yu_storage_session_shaped_caret_scroll_request。 */
 typedef struct YuStorageOutlineItem {
     uint64_t revision;
     uint32_t index;
@@ -602,17 +602,18 @@ int32_t yu_storage_session_projection_source_selection(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t visual_start_utf16, uint64_t visual_end_utf16,
     uint8_t affinity, YuStorageProjectionSourceSelection *output);
-/* Revision-bound macOS CoreText-shaped point hit-test. point_x/point_y are
- * document-space coordinates; returned x/y are snapped document-space caret
- * coordinates. The native TextKit mirror is not consulted. */
-int32_t yu_storage_session_macos_projection_hit_test(
+/* Revision-bound shaped point hit-test. point_x/point_y are document-space
+ * coordinates; returned x/y are snapped document-space caret coordinates.
+ * Answering it needs a native shaper, not a native platform: the ABI carries
+ * no platform bytes. The native text mirror is not consulted. */
+int32_t yu_storage_session_projection_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     float point_x, float point_y, float size, float max_width,
     YuStorageProjectionHit *output);
 int32_t yu_storage_session_composition_projection(
     YuStorageSession *session, uint64_t expected_revision,
     YuStorageCompositionProjection *output);
-int32_t yu_storage_session_macos_composition_shaped_caret(
+int32_t yu_storage_session_composition_shaped_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t expected_generation, uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageCompositionShapedCaret *output);
@@ -629,21 +630,21 @@ int32_t yu_storage_session_table_resize_action(
  * read-only probe (hover) and the gesture start differed only by
  * `pointer_position`; they are two uses of one hit test. PROBE never mutates
  * session state and never reads `pointer_position`. */
-int32_t yu_storage_session_macos_table_resize_at_point(
+int32_t yu_storage_session_table_resize_at_point(
     YuStorageSession *session, uint64_t expected_revision, uint8_t action,
     float size, float max_width, float point_x, float point_y,
     float tolerance, float pointer_position, YuStorageTableResizeHit *output);
 /* Resolves a document-space point against the exact task checkbox geometry in
- * the current persistent macOS render-host publication. It is read-only and
+ * the current persistent render-host publication. It is read-only and
  * rejects stale revisions, active composition and points outside a checkbox. */
-int32_t yu_storage_session_macos_task_checkbox_hit_test(
+int32_t yu_storage_session_task_checkbox_hit_test(
     YuStorageSession *session, uint64_t expected_revision,
     float point_x, float point_y, YuStorageTaskCheckboxHit *output);
 /* Resolves a source caret's shaped geometry without the caller naming a
  * block. The platform needs this for IME candidate-window placement: only the
  * Rust layout knows where the caret is on screen, because TextKit lays out
  * canonical source while the screen shows the projection. */
-int32_t yu_storage_session_macos_source_caret(
+int32_t yu_storage_session_source_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageBlockCaret *output);
@@ -651,12 +652,12 @@ int32_t yu_storage_session_macos_source_caret(
  * dividers. The first call may use null output/zero capacity to query count;
  * an existing session-only column preview is reflected, but no resize session
  * is opened and source remains unchanged. */
-int32_t yu_storage_session_macos_table_resize_accessibility_dividers(
+int32_t yu_storage_session_table_resize_accessibility_dividers(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
     YuStorageTableResizeAccessibilityDivider *dividers, size_t capacity,
     size_t *written);
-int32_t yu_storage_session_macos_shaped_caret_scroll_request(
+int32_t yu_storage_session_shaped_caret_scroll_request(
     YuStorageSession *session, uint64_t expected_revision, float size,
     float max_width, float scroll_y, float viewport_height,
     YuStorageCaretScrollRequest *output);
@@ -680,7 +681,7 @@ typedef struct YuStorageFrameGeometry {
  * equivalent to the frame already on screen. Revision, composition generation
  * and geometry must all match; marked-text updates do not advance the
  * Revision, so the generation participates in the comparison. */
-int32_t yu_storage_session_macos_frame_is_current(
+int32_t yu_storage_session_frame_is_current(
     YuStorageSession *session, const YuStorageFrameGeometry *geometry,
     uint8_t *out_current);
 int32_t yu_storage_session_macos_render_host_surface_submit(
@@ -762,7 +763,7 @@ int32_t yu_storage_session_set_selections(
 int32_t yu_storage_session_execute_command(YuStorageSession *session,
                                             uint8_t command, uint64_t block,
                                             YuStorageCommandResult *output);
-int32_t yu_storage_session_macos_move_vertical(
+int32_t yu_storage_session_move_vertical(
     YuStorageSession *session, uint64_t expected_revision, uint8_t command,
     float size, float max_width, YuStorageCommandResult *output);
 int32_t yu_storage_session_command_available(const YuStorageSession *session,

@@ -6,7 +6,7 @@ import YuStorageFFI
 
 // Metal surface 的 AppKit 宿主与帧提交调度。
 //
-// 「这一帧和屏幕上那一帧是不是同一帧」由 Rust 判断（`macosFrameIsCurrent`），
+// 「这一帧和屏幕上那一帧是不是同一帧」由 Rust 判断（`frameIsCurrent`），
 // 平台只负责把 AppKit 才知道的几何递过去。metrics 计算与资源刷新判断仍在
 // 本文件，属于 S1 帧调度迁移的后续步骤，见
 // docs/architecture/overview-v2.md 第 8 节。
@@ -208,7 +208,7 @@ final class MacosSurfaceHostCoordinator {
     /// 把平台几何递给 Rust 的适配器。`FrameGeometry` 是本协调器的内部形状，
     /// 不应该出现在 bridge 的签名里。
     private func frameIsCurrent(_ geometry: FrameGeometry) -> Bool {
-        bridge.macosFrameIsCurrent(
+        bridge.frameIsCurrent(
             size: Float(geometry.size),
             maxWidth: Float(geometry.maxWidth),
             scrollY: Float(geometry.scrollY),
@@ -327,7 +327,7 @@ final class MacosSurfaceHostCoordinator {
         let revision = bridge.state.revision
         let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
         do {
-            let hit = try bridge.macosTableResizeAtDocumentPoint(
+            let hit = try bridge.tableResizeAtDocumentPoint(
                 revision: revision,
                 action: UInt8(YU_STORAGE_TABLE_RESIZE_PROBE),
                 size: geometry.size,
@@ -353,7 +353,7 @@ final class MacosSurfaceHostCoordinator {
             return nil
         }
         do {
-            let hit = try bridge.macosTaskCheckboxHitTest(
+            let hit = try bridge.taskCheckboxHitTest(
                 revision: revision,
                 point: CGPoint(x: point.x, y: point.y)
             )
@@ -385,7 +385,7 @@ final class MacosSurfaceHostCoordinator {
             return []
         }
         do {
-            return try bridge.macosTableResizeAccessibilityDividers(
+            return try bridge.tableResizeAccessibilityDividers(
                 revision: bridge.state.revision,
                 size: geometry.size,
                 maxWidth: geometry.maxWidth,
@@ -471,7 +471,7 @@ final class MacosSurfaceHostCoordinator {
         let revision = bridge.state.revision
         let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
         do {
-            let hit = try bridge.macosTableResizeAtDocumentPoint(
+            let hit = try bridge.tableResizeAtDocumentPoint(
                 revision: revision,
                 action: UInt8(YU_STORAGE_TABLE_RESIZE_PROBE),
                 size: geometry.size,
@@ -486,7 +486,7 @@ final class MacosSurfaceHostCoordinator {
                 return false
             }
             let pointerPosition = Float(point.x)
-            let begun = try bridge.macosTableResizeAtDocumentPoint(
+            let begun = try bridge.tableResizeAtDocumentPoint(
                 revision: revision,
                 action: UInt8(YU_STORAGE_TABLE_RESIZE_BEGIN),
                 size: geometry.size,
@@ -654,7 +654,7 @@ final class MacosSurfaceHostCoordinator {
         let viewportHeight = max(viewportBounds.height, 1.0)
         let currentScrollY = max(viewportBounds.origin.y, 0.0)
         do {
-            let request = try bridge.macosShapedCaretScrollRequest(
+            let request = try bridge.shapedCaretScrollRequest(
                 revision: revision,
                 size: Float(size),
                 maxWidth: Float(maxWidth),

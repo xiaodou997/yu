@@ -32,9 +32,11 @@ use yu_scene::{
 };
 
 mod frame_builder;
+mod frame_key;
 mod workspace;
 
 pub use frame_builder::{ViewportFrameBuildError, ViewportFrameBuilder};
+pub use frame_key::{FrameGeometry, FrameKey, FrameTableResize};
 pub use workspace::{
     CloseAction, CloseResult, OpenTabResult, TabId, Workspace, WorkspaceCloseRequest,
     WorkspaceError, WorkspaceTab,
