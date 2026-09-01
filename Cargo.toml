@@ -21,6 +21,7 @@ members = [
     "crates/yu-workspace",
     "platform/macos/yu-font-macos",
     "platform/macos/yu-render-macos",
+    "platform/windows/yu-font-windows",
     "tools/yu-bench",
     "tools/yu-inspect",
 ]
