@@ -3923,6 +3923,24 @@ overview 早先预判「那两条 panel self-check 的断言会自然落到 Rust
 > 分布，并单独报一个「文档区内不同像素」的数，退出码由它决定。
 > `diff.py` 只按行归并，而两次收紧判据都是因为**行范围不够**。
 
+###### 顺带查出来的一件事：刀 a 那个失败模式在依赖上还有一份
+
+删掉 `block_hidden_spans_output` 与 `search_match_output` 之后回头数了一遍：
+`yu-storage-ffi` 里对 macOS-only crate 的**无条件**路径引用从 **2 处降到 0 处**
+——那两处正是这两个函数里的 `yu_markdown::Block::range`，而 `yu-markdown` 在
+`Cargo.toml` 里挂在 `[target.'cfg(target_os = "macos")'.dependencies]` 下。
+**这是副产品，不是这一刀有意修的。**
+
+**它与刀 a 修的是同一族**（「C ABI 在非 macOS 上撒谎」），换到了依赖这一侧，
+而刀 a 建的两条门禁都盖不住它：`check-ffi-header.py` 第 4 条查的是 extern 函数
+的属性，`check-ffi-symbols.py` 只读**当前平台**的符号表。
+
+**没有在这一刀补第三条门禁**（这一刀的判据是两张图，加一条新门禁会让边界变糊），
+触发条件登记在交接稿里。**也没有声称「以前 Windows 上是红的」**——本机给不出
+那个判据：`cargo check -p yu-storage-ffi --target x86_64-pc-windows-msvc` 在
+tree-sitter 的 C grammar 就停了（`cc` 没有 msvc 工具链，刀 a 记过的机器限制）。
+源码事实是硬的，执行判据要等 CI 的 windows job。
+
 ###### 实际代价
 
 `yu-editor` 多两个文件（`panel.rs` 428 行、`tests/panel.rs` 304 行）；
