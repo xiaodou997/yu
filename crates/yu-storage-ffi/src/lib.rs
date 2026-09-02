@@ -24,15 +24,20 @@ use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
-    AccessibilityTextSnapshot, Bias, BlockView, CaretAffinity, CaretScrollRequest, CommandResult,
-    EditorCommand, EditorDocumentError, OutlineTree, SearchResults, SelectionError, SourceSync,
-    TableResizeCommit, TableResizeGesture, TableResizeGestureError, TableResizeHit,
-    TableResizeTarget, VisualOffset, VisualText,
+    AccessibilityTextSnapshot, Bias, CaretAffinity, CommandResult, EditorCommand,
+    EditorDocumentError, OutlineTree, SearchResults, SelectionError, SourceSync, TableResizeCommit,
+    TableResizeGesture, TableResizeGestureError, TableResizeTarget, VisualOffset, VisualText,
 };
 #[cfg(target_os = "macos")]
 use yu_editor::{
-    BlockOrnament, ImageSpan, LayoutConfig, LayoutPoint, ViewportConfig, ViewportSpan,
+    BlockOrnament, BlockView, CaretScrollRequest, ImageSpan, TableResizeHit, ViewportConfig,
+    ViewportSpan,
 };
+// `begin_table_resize_for_test` 在非 macOS 上也跑（表格排版是中立的），所以这两个
+// 类型在 test 构建里到处都要。**`cfg(macos)` 是错的**：clippy 看 lib target 说
+// 它们 unused，看不见 lib test target。
+#[cfg(any(target_os = "macos", test))]
+use yu_editor::{LayoutConfig, LayoutPoint};
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, DiskState, DocumentEditorSession, ExternalFileState,
@@ -1864,7 +1869,9 @@ fn table_resize_commit_metadata(
     })
 }
 
-#[cfg(target_os = "macos")]
+// 产品链路上只有 macOS 那半调它，但 `begin_table_resize_for_test` 在任何平台的
+// test 构建里都调——表格排版本身是中立的。
+#[cfg(any(target_os = "macos", test))]
 fn begin_table_resize_session(
     session: &mut YuStorageSession,
     block_index: usize,
@@ -5715,6 +5722,7 @@ pub unsafe extern "C" fn yu_storage_session_close_resolve(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use yu_core::ByteOffset;
 
     use super::*;
