@@ -30,14 +30,13 @@ use yu_editor::{
 };
 #[cfg(target_os = "macos")]
 use yu_editor::{
-    BlockOrnament, BlockView, CaretScrollRequest, ImageSpan, TableResizeHit, ViewportConfig,
-    ViewportSpan,
+    BlockOrnament, BlockView, CaretScrollRequest, ImageSpan, ViewportConfig, ViewportSpan,
 };
 // `begin_table_resize_for_test` 在非 macOS 上也跑（表格排版是中立的），所以这两个
 // 类型在 test 构建里到处都要。**`cfg(macos)` 是错的**：clippy 看 lib target 说
 // 它们 unused，看不见 lib test target。
 #[cfg(any(target_os = "macos", test))]
-use yu_editor::{LayoutConfig, LayoutPoint};
+use yu_editor::{LayoutConfig, LayoutPoint, TableResizeHit};
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, DiskState, DocumentEditorSession, ExternalFileState,
@@ -1754,7 +1753,8 @@ fn source_utf16_range(snapshot: &TextSnapshot, source: TextRange) -> Result<(u64
     Ok((start, end))
 }
 
-#[cfg(target_os = "macos")]
+// 存在面跟着它唯一的调用方 `begin_table_resize_session` 走。
+#[cfg(any(target_os = "macos", test))]
 fn table_resize_hit_metadata(
     revision: u64,
     block_index: u64,
