@@ -441,6 +441,15 @@ impl AccessibilityTextSnapshot {
 fn semantic_block_kind(kind: BlockKind) -> Option<(AccessibilitySemanticKind, u8, u8)> {
     Some(match kind {
         BlockKind::BlankLine | BlockKind::ReferenceDefinition => return None,
+        // 分隔线与 HTML 块按源码画（不变量 I5），所以在语义树上它们**就是**
+        // 一段文本。分隔线该不该有自己的语义角色，等到它真的画成一条线那一刀
+        // 再问——那时它才不是文本。
+        BlockKind::ThematicBreak | BlockKind::HtmlBlock => {
+            (AccessibilitySemanticKind::Paragraph, 0, 0)
+        }
+        // 缩进代码块**就是**代码块，与围栏在语义上没有区别——区别只在拼法上，
+        // 而拼法不进语义树，与 Setext 不进 `Heading` 是同一条规矩。
+        BlockKind::IndentedCode => (AccessibilitySemanticKind::CodeBlock, 0, 0),
         BlockKind::Paragraph => (AccessibilitySemanticKind::Paragraph, 0, 0),
         BlockKind::Heading { level } => (AccessibilitySemanticKind::Heading, 0, level),
         BlockKind::FencedCodeBlock { .. } => (AccessibilitySemanticKind::CodeBlock, 0, 0),

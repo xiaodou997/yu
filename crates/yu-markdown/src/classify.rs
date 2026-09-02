@@ -160,6 +160,14 @@ pub(crate) fn classify(
             },
         },
         (NodeKind::LinkReference, _) => BlockKind::ReferenceDefinition,
+        // 这三种此前都落进下面那个 `_ => Paragraph`，于是 `---` 画成字面的三个
+        // 减号、缩进代码与 HTML 块混在段落里被行内语法解析一遍。它们与上面几种
+        // 的区别只有一点：**没有行首结构**，所以行扫描器给的形状一律是
+        // `Plain`，分类完全由树做。
+        (NodeKind::HorizontalRule, BlockShape::Plain) => BlockKind::ThematicBreak,
+        // `NodeKind::CodeBlock` 是缩进代码；围栏是 `FencedCode`，在上面。
+        (NodeKind::CodeBlock, BlockShape::Plain) => BlockKind::IndentedCode,
+        (NodeKind::HtmlBlock, BlockShape::Plain) => BlockKind::HtmlBlock,
         // 块横跨了好几个树块，树说不出它是什么。`- a\n<div>\nx` 就是一个：
         // 行扫描器把 `<div>` 当成列表项的惰性延续收进同一个块，树把它拆成
         // `ListItem` 与一个 `HTMLBlock`，谁也装不下这个块，于是落到
@@ -236,6 +244,78 @@ mod tests {
         assert_eq!(
             classify(None, &snapshot, range, BlockShape::Quote { depth: 1 }),
             BlockKind::BlockQuote { depth: 1 }
+        );
+    }
+
+    /// 三种「没有行首结构、只有树分得出来」的块。
+    ///
+    /// 它们此前一律落进 `_ => Paragraph`，于是 `---` 画成字面的三个减号。
+    /// 判据落在 `classify` 上而不是画面上：这一刀只让它们**说得出自己是谁**，
+    /// 怎么画是下一刀的事。
+    #[test]
+    fn the_tree_tells_the_three_shapes_that_have_no_line_prefix_apart() {
+        for (source, expected) in [
+            ("---\n", BlockKind::ThematicBreak),
+            ("***\n", BlockKind::ThematicBreak),
+            ("___\n", BlockKind::ThematicBreak),
+            ("    code\n", BlockKind::IndentedCode),
+            ("\tcode\n", BlockKind::IndentedCode),
+            ("<div>x</div>\n", BlockKind::HtmlBlock),
+        ] {
+            let snapshot = TextBuffer::new(source).snapshot();
+            let parse = yu_syntax::parse(&snapshot).expect("解析得出树");
+            let tree = parse.tree();
+            let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).expect("整篇一块");
+            assert_eq!(
+                classify(Some(tree), &snapshot, range, BlockShape::Plain),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// **拼法不进块的身份**：`---` / `***` / `___` 是同一个变体，与 Setext 和
+    /// ATX 落在同一个 `Heading` 是同一条规矩。上面那条用例已经压住了它，这里
+    /// 记下理由。
+    ///
+    /// 而**缩进代码与围栏是两个变体**：围栏带着 `marker` 与 `closed` 两样负载，
+    /// 缩进代码一样都没有。合成一个变体会让每个消费者去匹配一个对另一半没有
+    /// 意义的字段。
+    #[test]
+    fn an_indented_code_block_is_not_a_fenced_one() {
+        let snapshot = TextBuffer::new("    code\n").snapshot();
+        let parse = yu_syntax::parse(&snapshot).expect("解析得出树");
+        let tree = parse.tree();
+        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).expect("整篇一块");
+        let kind = classify(Some(tree), &snapshot, range, BlockShape::Plain);
+        assert_eq!(kind, BlockKind::IndentedCode);
+        assert_ne!(
+            kind.viewport_tag(),
+            BlockKind::FencedCodeBlock {
+                marker: '`',
+                closed: true
+            }
+            .viewport_tag()
+        );
+    }
+
+    /// 叶子节点横跨块边界时这个块只是它的一个片段，退回 `Paragraph`。
+    ///
+    /// **缩进代码块是唯一能跨空行的那种**（`NodeKind::spans_blank_lines`），
+    /// 所以它是这条既有规则第一个真正撞上的形状：中间夹一个空行时，行扫描器
+    /// 切成三块而树只有一个 `CodeBlock`。三块谁也不完整，都退回段落。
+    /// **这不是缺陷，是那条规则在起作用**——认领半个代码块会让画面上出现两段
+    /// 各画一半的代码。
+    #[test]
+    fn a_fragment_of_an_indented_code_block_is_nobody() {
+        let source = "    a\n\n    b\n";
+        let snapshot = TextBuffer::new(source).snapshot();
+        let parse = yu_syntax::parse(&snapshot).expect("解析得出树");
+        let tree = parse.tree();
+        let first = TextRange::new(ByteOffset::ZERO, ByteOffset::new(6)).expect("第一行");
+        assert_eq!(
+            classify(Some(tree), &snapshot, first, BlockShape::Plain),
+            BlockKind::Paragraph
         );
     }
 }
