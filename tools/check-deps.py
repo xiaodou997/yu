@@ -184,13 +184,13 @@ def crate_manifests() -> list[Path]:
 
 def parse(manifest: Path) -> tuple[str, set[str], set[str]]:
     """返回 (crate 名, 产物 path 依赖, 测试 path 依赖)。"""
-    name_match = re.search(r"^name = \"([^\"]+)\"", manifest.read_text(), re.M)
+    name_match = re.search(r"^name = \"([^\"]+)\"", manifest.read_text(encoding="utf-8"), re.M)
     if name_match is None:
         raise SystemExit(f"{manifest} 缺少 [package] name")
     section = None
     normal: set[str] = set()
     dev: set[str] = set()
-    for line in manifest.read_text().split("\n"):
+    for line in manifest.read_text(encoding="utf-8").split("\n"):
         header = re.match(r"^\[([^\]]+)\]", line)
         if header is not None:
             section = header.group(1)

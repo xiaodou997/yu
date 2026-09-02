@@ -15,6 +15,11 @@
 
 from __future__ import annotations
 
+# 每一处 read_text 都显式写 encoding="utf-8"。**这不是洁癖**：Windows 的
+# Python 默认按系统代码页（cp1252）解码，而这个仓库的脚本与注释是中文的，
+# 于是 CI 的 windows job 在这里 UnicodeDecodeError 崩掉——而 macOS/Linux 上
+# 默认就是 UTF-8，永远看不见。它藏在更外面几层红的后面：windows job 此前
+# 从来没跑到过这一步。
 import re
 import sys
 from pathlib import Path
@@ -28,7 +33,7 @@ def ci_commands() -> list[tuple[str, str]]:
     """返回 [(工作流文件名, 命令)]。"""
     found: list[tuple[str, str]] = []
     for workflow in sorted(WORKFLOWS.glob("*.yml")):
-        for line in workflow.read_text().split("\n"):
+        for line in workflow.read_text(encoding="utf-8").split("\n"):
             match = re.match(r"\s*-\s+run:\s+(.+?)\s*$", line)
             if match is not None:
                 found.append((workflow.name, match.group(1)))
@@ -39,7 +44,7 @@ def main() -> int:
     if not VERIFY.is_file():
         print(f"找不到 {VERIFY}", file=sys.stderr)
         return 1
-    verify = VERIFY.read_text()
+    verify = VERIFY.read_text(encoding="utf-8")
 
     missing = [
         (workflow, command)

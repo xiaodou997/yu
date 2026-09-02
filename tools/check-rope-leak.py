@@ -96,7 +96,7 @@ def main() -> int:
                     f"Yu 的坐标是字节，char index 一旦可用就迟早会被用（不变量 E4）。"
                 )
 
-    adapter_text = (ROOT / ADAPTER).read_text()
+    adapter_text = (ROOT / ADAPTER).read_text(encoding="utf-8")
     for number, line in enumerate(adapter_text.split("\n"), start=1):
         if UNQUALIFIED_PUB.search(line) is not None:
             problems.append(
