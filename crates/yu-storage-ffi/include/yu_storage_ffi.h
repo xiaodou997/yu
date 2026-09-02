@@ -541,33 +541,34 @@ typedef struct YuStorageOutlineItem {
     uint64_t source_end_utf16;
     uint64_t label_start_utf16;
     uint64_t label_end_utf16;
+    /* 直接孩子的条数。这份表按文档顺序，也就是前序，所以「前序 + 直接孩子
+     * 数」足以无歧义地还原整棵树——壳里因此没有一次查表，也没有「父亲查不到
+     * 怎么办」那一支。parent 留着，两者互为对方的参照。 */
+    uint64_t child_count;
+    /* 面板上显示的那一行文字，在同一次调用拷出的 UTF-8 缓冲里的位置。
+     * 它不是 label_*_utf16 那一段源码：行内标记已经减掉，Setext 的两行也已经
+     * 折成一行。 */
+    uint64_t display_utf8_offset;
+    uint64_t display_utf8_length;
+    /* 跨刷新的身份，同一个缓冲里的位置。展开状态与选中行按它记，不按下标记
+     * ——在文首插一条标题会把每一条的 index 与 block 一起推后。 */
+    uint64_t identity_utf8_offset;
+    uint64_t identity_utf8_length;
 } YuStorageOutlineItem;
 
-/* 一段被装饰藏起来的 source，UTF-16。
+/* 结果面板上的一行：一处命中，加上它显示成的那行字。
  *
- * 面板上的一行文字要不带语法标记（`## **粗** 标题` 显示成 `粗 标题`）。
- * 「哪几段被藏了」的唯一实现在 Rust 的 DecorationSet 里（不变量 D1），而画字
- * 的是 AppKit。把视觉文本拷过来会破 C4「parser 不复制正文」与整套 range-backed
- * 设计，所以交出的是**区间**：平台拿自己的 canonical 镜像按它们减掉。
- *
- * 区间升序、不重叠、不相邻。 */
-typedef struct YuStorageHiddenSpan {
-    uint64_t start_utf16;
-    uint64_t end_utf16;
-} YuStorageHiddenSpan;
-
-/* 一处搜索命中。
- *
- * block 与 block_*_utf16 让调用方能守住 yu_storage_session_block_hidden_spans
- * 的那条规则（请求要落在一个块里）：结果面板上那一行未必与块边界对齐，有了
- * 块的区间，平台可以自己把行裁到块里。匹配跨块时 block 是起点所在的那一块。 */
+ * 这里原来还有 block 与 block_*_utf16 三个字段，它们存在的唯一理由是让壳自己
+ * 把「命中所在的那一行」裁进块里，好满足 yu_storage_session_block_hidden_spans
+ * 的前置条件。裁剪与减法都挪进 Rust（yu_editor::SearchResults）之后，那个入口
+ * 与这三个字段一起没有了消费者。 */
 typedef struct YuStorageSearchMatch {
     uint64_t revision;
-    uint64_t block;
     uint64_t start_utf16;
     uint64_t end_utf16;
-    uint64_t block_start_utf16;
-    uint64_t block_end_utf16;
+    /* 面板上显示的那一行文字，在同一次调用拷出的 UTF-8 缓冲里的位置。 */
+    uint64_t display_utf8_offset;
+    uint64_t display_utf8_length;
 } YuStorageSearchMatch;
 
 typedef struct YuStorageCommandResult {
@@ -728,26 +729,39 @@ int32_t yu_storage_session_accessibility_snapshot(
 int32_t yu_storage_session_accessibility_semantic_nodes_v2(
     const YuStorageSession *session, uint64_t expected_revision,
     YuStorageAccessibilityNodeV2 *output, size_t capacity, size_t *written);
-/* 拷出这一版的大纲。两遍协议：output 传 NULL、capacity 传 0 时只回报条数。 */
+/* 拷出这一版的大纲：全部标题，按文档顺序（也就是前序），带层级、面板上那一行
+ * 文字、跨刷新的身份。
+ *
+ * 两遍协议，两个缓冲区一起：items 与 text 都传 NULL（两个容量都为 0）时只把
+ * 两个长度写进 item_count 与 text_length。条目里的 display_utf8_offset /
+ * identity_utf8_offset 指进 text，所以它们必须出自同一次调用——分成两个入口
+ * 就有了两个可以对不上的答案，而对不上的表现是面板上那一行显示成别人的字。
+ *
+ * 交出的是文字而不是区间：一条标题的标签是一次派生的、有界的、绑在同一个
+ * Revision 上的显示串，与 yu_storage_session_copy_source_range 交出选区字节
+ * 同类。「跨边界的是区间不是文本」那条规矩针对的是整篇文档的视觉字节流，
+ * 那条欠账仍然欠着。 */
 int32_t yu_storage_session_outline_items(
-    const YuStorageSession *session, uint64_t expected_revision,
-    YuStorageOutlineItem *output, size_t capacity, size_t *written);
+    YuStorageSession *session, uint64_t expected_revision,
+    YuStorageOutlineItem *items, size_t item_capacity, size_t *item_count,
+    uint8_t *text, size_t text_capacity, size_t *text_length);
 /* 换一份搜索查询，立刻在当前源码上扫出全部匹配。text 传 NULL、text_length
  * 传 0 表示收掉搜索。不校验 Revision：查询与源码正交。 */
 int32_t yu_storage_session_set_search_query(
     YuStorageSession *session, const uint8_t *text, size_t text_length);
-/* 拷出当前查询的全部匹配，按文档顺序，互不重叠。两遍协议。
+/* 拷出当前查询的全部结果行，按文档顺序，互不重叠。两遍协议，两个缓冲区一起，
+ * 与 yu_storage_session_outline_items 同形。没有搜索时两个长度都是 0。
+ *
+ * 「命中所在的那一行显示成什么字」由 Rust 算：取那一行、裁进它所在的块、减掉
+ * 被藏起来的区间。裁进块里不是可选的——不裁的后果不是画错，是那一行悄悄带回
+ * 语法标记。
+ *
  * 「跳到下一个」不在这里：那是一次导航，走已有的
  * yu_storage_session_set_selection_endpoints。 */
 int32_t yu_storage_session_search_matches(
-    const YuStorageSession *session, uint64_t expected_revision,
-    YuStorageSearchMatch *output, size_t capacity, size_t *written);
-/* 一个块里被藏起来的 source 区间，裁到 [start_utf16, end_utf16) 之内。
- * 两遍协议。请求区间必须整个落在这个块里；跨块的一行要按块问几次。 */
-int32_t yu_storage_session_block_hidden_spans(
-    YuStorageSession *session, uint64_t expected_revision, uint64_t block,
-    uint64_t start_utf16, uint64_t end_utf16,
-    YuStorageHiddenSpan *output, size_t capacity, size_t *written);
+    YuStorageSession *session, uint64_t expected_revision,
+    YuStorageSearchMatch *items, size_t item_capacity, size_t *item_count,
+    uint8_t *text, size_t text_capacity, size_t *text_length);
 int32_t yu_storage_session_accessibility_line_range(
     const YuStorageSession *session, uint64_t expected_revision, uint64_t line,
     YuStorageAccessibilityRange *output);

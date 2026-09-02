@@ -2,39 +2,39 @@ import AppKit
 import Foundation
 import YuStorageFFI
 
-// 大纲面板：把 yu_storage_session_outline_items 的平表画成一列可点的标题。
+// 大纲面板：把 yu_storage_session_outline_items 交下来的一棵树喂给
+// NSOutlineView。
 //
-// 这里只有三件事是真正的 Swift 逻辑，其余都是 AppKit 样板：
+// **这里只剩 AppKit。** 平表→树、跨刷新的身份链、label 的减法与折行原来都
+// 住在这个文件里，第七刀 c 的第三块把它们挪进了 `yu-editor::OutlineTree`：
+// 没有一样需要 AppKit，而第二端照写第二遍的表现是同一条标题在两端显示得不
+// 一样、展开状态在一端活得下来在另一端活不下来——都不报错。
 //
-//   1. **平表 → 树**。FFI 给的是带 `parent` 下标的平表，NSOutlineView 要
-//      parent→children。挂错父亲不报错、不 panic，面板照样画得出来，只是
-//      层级是错的——self-check 因此拿树的形状反过来核对平表。
-//   2. **跨刷新的身份**。NSOutlineView 按对象身份记展开状态，而每次刷新都会
-//      重建这些对象。展开了哪几条、选中哪一条要靠 `identity` 存活。
-//   3. **label 的折行**。见 `OutlineTree.displayLabel`。剥行内标记不在这里
-//      ——那是 `PanelLabel` 的事，两个面板共用一份。
+// 剩下的两件事是真正的 AppKit 事实：
+//
+//   1. **NSOutlineView 要 parent→children 的对象图**，而 C ABI 只能交出平表。
+//      还原那棵树在这里，但**它没有决策**：表是前序的，每一条带着自己直接
+//      孩子的条数，一次栈式扫描就够，没有查表也没有「父亲查不到怎么办」。
+//   2. **它按对象身份记展开状态**，而每次刷新都会重建这些对象。展开了哪几
+//      条、选中哪一条要靠 Rust 给的 `identity` 存活。
 //
 // 导航**不另开 FFI**：拿 `labelRange.location` 走已有的选区入口，滚动交给
 // yu-editor::viewport 那条路（`shapedCaretScrollRequest`）。面板不算 y。
 
-/// 平表转成树之后的一个节点。
+/// 树上的一个节点。
 ///
 /// 引用类型是 NSOutlineView 的要求（它按对象身份认 item），不是设计偏好。
 final class OutlineNode {
     let item: NativeOutlineItem
-    /// 面板上显示的那一行文字，见 `OutlineTree.displayLabel`。
-    let label: String
-    /// 跨刷新的身份：从根到自己的 label 链，同名兄弟按出现次序区分。
-    ///
-    /// 不用 `index`：插入一条标题会把它后面所有条目的 index 推后一位，
-    /// 展开状态会整体错位。也不用 `block`：同样会被前面的块推移。
-    let identity: String
     private(set) var children: [OutlineNode] = []
 
-    fileprivate init(item: NativeOutlineItem, label: String, identity: String) {
+    /// 面板上显示的那一行文字。
+    var label: String { item.label }
+    /// 跨刷新的身份。
+    var identity: String { item.identity }
+
+    fileprivate init(item: NativeOutlineItem) {
         self.item = item
-        self.label = label
-        self.identity = identity
     }
 
     fileprivate func append(_ child: OutlineNode) {
@@ -43,67 +43,30 @@ final class OutlineNode {
 }
 
 enum OutlineTree {
-    /// 平表 → 树。
+    /// 前序的平表 → 对象图。
     ///
-    /// 标题按文档顺序排列，`parent` 又只指向上一级标题，所以父亲一定排在
-    /// 孩子前面，一遍扫描就够。查不到父亲的那一条挂成根级——那是 FFI 契约
-    /// 被破坏的情形，而根节点的 `parent` 必须是 `UInt32.max` 这一条断言会
-    /// 把它照出来，不会静默地混进正常层级里。
-    static func build(
-        items: [NativeOutlineItem],
-        source: NSString,
-        hidden: (NativeOutlineItem) -> [NSRange]?
-    ) -> [OutlineNode] {
+    /// 每一条带着自己**直接**孩子的条数，所以扫一遍就够：栈顶那个还欠孩子
+    /// 就挂上去，欠满了就弹掉。层级由 Rust 定，这里一个判断都不做——原来那
+    /// 份按 `parent` 查表的写法有一支「查不到父亲就挂成根级」，那是 FFI 契约
+    /// 被破坏时的猜测，现在不需要猜了。
+    static func build(items: [NativeOutlineItem]) -> [OutlineNode] {
         var roots: [OutlineNode] = []
-        var byIndex: [UInt32: OutlineNode] = [:]
-        // key 是「父亲的 identity + label」，值是这个 label 在该父亲下出现过
-        // 几次。同一层里两条同名标题靠它区分。
-        var occurrences: [String: Int] = [:]
+        // 栈里存 (节点, 还欠几个直接孩子)。
+        var stack: [(node: OutlineNode, remaining: Int)] = []
         for item in items {
-            let label = displayLabel(item.labelRange, in: source, hidden: hidden(item))
-            let parent = item.parent == UInt32.max ? nil : byIndex[item.parent]
-            let base = (parent?.identity ?? "") + "\u{1F}" + label
-            let seen = occurrences[base, default: 0]
-            occurrences[base] = seen + 1
-            let node = OutlineNode(
-                item: item,
-                label: label,
-                identity: base + "\u{1F}\(seen)"
-            )
-            byIndex[item.index] = node
-            if let parent {
-                parent.append(node)
+            while let top = stack.last, top.remaining == 0 {
+                stack.removeLast()
+            }
+            let node = OutlineNode(item: item)
+            if let parent = stack.last {
+                parent.node.append(node)
+                stack[stack.count - 1].remaining -= 1
             } else {
                 roots.append(node)
             }
+            stack.append((node, item.childCount))
         }
         return roots
-    }
-
-    /// 面板上的一行文字：源码区间减掉被藏起来的那几段，再折行。
-    ///
-    /// **行内标记这一刀剥掉了**：`## **粗** 标题` 显示成 `粗 标题`。剥的唯一
-    /// 实现在 Rust 的 `DecorationSet` 里（不变量 D1），FFI 只回报区间，减法
-    /// 在 `PanelLabel` 里——那是它的唯一实现，两个面板共用。第二刀留下的触发
-    /// 条件（「搜索面板到齐时再开那个 FFI」）在第三刀到齐了。
-    ///
-    /// `hidden` 为 nil 表示这一版拿不到区间（Revision 撞上了刷新）。那时**显示
-    /// 源码**——那是这一刀之前的行为，是一件真事，不是错的答案。
-    ///
-    /// 唯一的纯呈现例外是 **Setext 多行标题**：`多行\n标题\n===` 的 label
-    /// 是 `"多行\n标题"`，一行放不下两行字，这里折成一行。折行只动空白。
-    static func displayLabel(
-        _ range: NSRange,
-        in source: NSString,
-        hidden: [NSRange]?
-    ) -> String {
-        let raw = PanelLabel.stripping(hidden ?? [], from: source, in: range)
-        guard raw.contains(where: \.isNewline) else { return raw }
-        return raw
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
     }
 }
 
@@ -151,11 +114,7 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
     /// **展开状态与选中行必须活过这一次重建**：每次全量 `reloadData` 都会
     /// 换掉所有节点对象，什么都不做的话，敲一个字符大纲就全折起来、选中行
     /// 也没了。新出现的节点默认展开——刚打的标题应该看得见。
-    func reload(
-        items: [NativeOutlineItem],
-        source: NSString,
-        hidden: (NativeOutlineItem) -> [NSRange]?
-    ) {
+    func reload(items: [NativeOutlineItem]) {
         let previouslyKnown = Set(allNodes(of: roots).map(\.identity))
         let previouslyExpanded = Set(
             allNodes(of: roots)
@@ -164,7 +123,7 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
         )
         let previouslySelected = selectedNode?.identity
 
-        roots = OutlineTree.build(items: items, source: source, hidden: hidden)
+        roots = OutlineTree.build(items: items)
         outlineView.reloadData()
 
         for node in allNodes(of: roots) where !node.children.isEmpty {

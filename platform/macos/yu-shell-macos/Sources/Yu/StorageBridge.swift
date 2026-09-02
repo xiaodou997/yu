@@ -501,6 +501,11 @@ struct NativeAccessibilitySemanticNode {
 ///
 /// `parent` 指向同一份快照里的 `index`，不是块下标；`UInt32.max` 表示这是
 /// 一条根级标题。导航要用的是 `block` 与 `labelRange`。
+///
+/// **`label`、`identity`、`childCount` 都是 Rust 算好的**（`OutlineTree`）：
+/// 剥语法标记、折行、身份链、树的形状，没有一样需要 AppKit。壳里照写第二遍
+/// 的表现是同一条标题在两端显示得不一样、展开状态在一端活得下来在另一端活
+/// 不下来——都不报错。
 struct NativeOutlineItem {
     let revision: UInt64
     let index: UInt32
@@ -509,8 +514,14 @@ struct NativeOutlineItem {
     let block: UInt64
     let sourceRange: NSRange
     let labelRange: NSRange
+    /// 面板上显示的那一行文字。
+    let label: String
+    /// 跨刷新的身份：展开状态与选中行按它记。
+    let identity: String
+    /// 直接孩子的条数。这份表是前序，两者合起来还原整棵树。
+    let childCount: Int
 
-    init(_ value: YuStorageOutlineItem) {
+    init(_ value: YuStorageOutlineItem, text: [UInt8]) {
         revision = value.revision
         index = value.index
         parent = value.parent
@@ -524,31 +535,55 @@ struct NativeOutlineItem {
             location: Int(value.label_start_utf16),
             length: Int(value.label_end_utf16 - value.label_start_utf16)
         )
+        label = decodePanelText(
+            text,
+            offset: value.display_utf8_offset,
+            length: value.display_utf8_length
+        )
+        identity = decodePanelText(
+            text,
+            offset: value.identity_utf8_offset,
+            length: value.identity_utf8_length
+        )
+        childCount = Int(value.child_count)
     }
 }
 
-/// 一处搜索命中。
+/// 结果面板上的一行：一处命中，加上它显示成的那行字。
 ///
-/// `block` 与 `blockRange` 不是给面板显示用的，是给它**守规矩**用的：回报
-/// 隐藏区间的 FFI 只接受落在一个块里的请求，而结果那一行未必与块边界对齐。
+/// **上下文裁剪与剥标记都在 Rust**（`SearchResults`）。原来这里还有 `block`
+/// 与 `blockRange`，它们唯一的用处是让壳把「命中所在的那一行」裁进块里——
+/// 那一步挪走之后它们没有了消费者，跟着从 ABI 上退休。
 struct NativeSearchMatch: Equatable {
     let revision: UInt64
-    let block: UInt64
     let range: NSRange
-    let blockRange: NSRange
+    /// 面板上显示的那一行文字。
+    let label: String
 
-    init(_ value: YuStorageSearchMatch) {
+    init(_ value: YuStorageSearchMatch, text: [UInt8]) {
         revision = value.revision
-        block = value.block
         range = NSRange(
             location: Int(value.start_utf16),
             length: Int(value.end_utf16 - value.start_utf16)
         )
-        blockRange = NSRange(
-            location: Int(value.block_start_utf16),
-            length: Int(value.block_end_utf16 - value.block_start_utf16)
+        label = decodePanelText(
+            text,
+            offset: value.display_utf8_offset,
+            length: value.display_utf8_length
         )
     }
+}
+
+/// 从一次调用拷出的那段 UTF-8 里取一片。
+///
+/// 越界或不是合法 UTF-8 时给空串：那是「这一版拿不到」，面板上少一行字，
+/// 而不是一个谁也说不清的字符串。两样都不该发生——同一次调用给的偏移与文本
+/// 必然对得上，这里守的是别人日后把它们拆成两个入口。
+private func decodePanelText(_ text: [UInt8], offset: UInt64, length: UInt64) -> String {
+    let start = Int(offset)
+    let end = start + Int(length)
+    guard start >= 0, end >= start, end <= text.count else { return "" }
+    return String(decoding: text[start..<end], as: UTF8.self)
 }
 
 struct NativeComposition {
@@ -1198,88 +1233,52 @@ final class StorageBridge {
         return values.map(NativeAccessibilitySemanticNode.init)
     }
 
-    /// 这一版的大纲：文档里全部标题，按文档顺序，带层级。
+    /// 这一版的大纲：文档里全部标题，按文档顺序（也就是前序），带层级、
+    /// 面板上那一行文字、跨刷新的身份。
     ///
-    /// 与语义树同一个两遍协议（空指针 + 0 容量只回报条数）。刷新可能与关闭、
-    /// 重载或外部改动撞在一起，所以 Revision 失配返回 nil 而不是中止进程——
-    /// 面板保留上一版，比让一次刷新杀掉进程好。
+    /// 两遍协议，**两个缓冲区一起**：条目里的偏移指进同一次调用拷出的那段
+    /// UTF-8，分成两个入口就有了两个可以对不上的答案。刷新可能与关闭、重载
+    /// 或外部改动撞在一起，所以 Revision 失配返回 nil 而不是中止进程——面板
+    /// 保留上一版，比让一次刷新杀掉进程好。
     var outlineItemsIfAvailable: [NativeOutlineItem]? {
         let revision = state.revision
         var count = 0
+        var textLength = 0
         let countStatus = yu_storage_session_outline_items(
             handle,
             revision,
             nil,
             0,
-            &count
+            &count,
+            nil,
+            0,
+            &textLength
         )
         guard countStatus == StorageStatus.ok else { return nil }
         guard count > 0 else { return [] }
 
         var values = Array(repeating: YuStorageOutlineItem(), count: count)
+        var text = [UInt8](repeating: 0, count: textLength)
         var written = 0
+        var textWritten = 0
         let status = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_outline_items(
-                handle,
-                revision,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
+            text.withUnsafeMutableBufferPointer { textBuffer in
+                yu_storage_session_outline_items(
+                    handle,
+                    revision,
+                    buffer.baseAddress,
+                    buffer.count,
+                    &written,
+                    textBuffer.baseAddress,
+                    textBuffer.count,
+                    &textWritten
+                )
+            }
         }
-        guard status == StorageStatus.ok, written == count else { return nil }
-        return values.map(NativeOutlineItem.init)
-    }
-
-    /// 一个块里被藏起来的源码区间，裁到 `range` 之内。
-    ///
-    /// 面板上要显示不带语法标记的文字（`## **粗** 标题` → `粗 标题`），而
-    /// 「哪几段被藏了」的唯一实现在 Rust 的 `DecorationSet` 里（不变量 D1）。
-    /// **跨边界的是区间，不是文本**——把视觉文本拷过来会破 C4 与整套
-    /// range-backed 设计，平台手上本来就有 canonical 镜像，减一下就行。
-    ///
-    /// `range` 必须整个落在 `block` 里；跨块的一行要按块问几次。Revision 失配
-    /// 或请求非法时返回 nil，调用方退回显示源码——那不是一个错的答案。
-    func blockHiddenSpans(block: UInt64, in range: NSRange) -> [NSRange]? {
-        guard range.location >= 0, range.length >= 0 else { return nil }
-        let revision = state.revision
-        let start = UInt64(range.location)
-        let end = UInt64(range.location + range.length)
-        var count = 0
-        let countStatus = yu_storage_session_block_hidden_spans(
-            handle,
-            revision,
-            block,
-            start,
-            end,
-            nil,
-            0,
-            &count
-        )
-        guard countStatus == StorageStatus.ok else { return nil }
-        guard count > 0 else { return [] }
-
-        var values = Array(repeating: YuStorageHiddenSpan(), count: count)
-        var written = 0
-        let status = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_block_hidden_spans(
-                handle,
-                revision,
-                block,
-                start,
-                end,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
+        guard status == StorageStatus.ok, written == count, textWritten == textLength else {
+            return nil
         }
-        guard status == StorageStatus.ok, written == count else { return nil }
-        return values.map {
-            NSRange(
-                location: Int($0.start_utf16),
-                length: Int($0.end_utf16 - $0.start_utf16)
-            )
-        }
+        return values.map { NativeOutlineItem($0, text: text) }
     }
 
     /// 换一份查询。空串留下一份 0 个匹配的状态；`nil` 收掉搜索与高亮。
@@ -1303,27 +1302,46 @@ final class StorageBridge {
         } == StorageStatus.ok
     }
 
-    /// 当前查询的全部匹配，按文档顺序。与大纲同一个两遍协议。
+    /// 当前查询的全部结果行，按文档顺序。与大纲同一个两遍协议。
     var searchMatchesIfAvailable: [NativeSearchMatch]? {
         let revision = state.revision
         var count = 0
-        let countStatus = yu_storage_session_search_matches(handle, revision, nil, 0, &count)
+        var textLength = 0
+        let countStatus = yu_storage_session_search_matches(
+            handle,
+            revision,
+            nil,
+            0,
+            &count,
+            nil,
+            0,
+            &textLength
+        )
         guard countStatus == StorageStatus.ok else { return nil }
         guard count > 0 else { return [] }
 
         var values = Array(repeating: YuStorageSearchMatch(), count: count)
+        var text = [UInt8](repeating: 0, count: textLength)
         var written = 0
+        var textWritten = 0
         let status = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_search_matches(
-                handle,
-                revision,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
+            text.withUnsafeMutableBufferPointer { textBuffer in
+                yu_storage_session_search_matches(
+                    handle,
+                    revision,
+                    buffer.baseAddress,
+                    buffer.count,
+                    &written,
+                    textBuffer.baseAddress,
+                    textBuffer.count,
+                    &textWritten
+                )
+            }
         }
-        guard status == StorageStatus.ok, written == count else { return nil }
-        return values.map(NativeSearchMatch.init)
+        guard status == StorageStatus.ok, written == count, textWritten == textLength else {
+            return nil
+        }
+        return values.map { NativeSearchMatch($0, text: text) }
     }
 
     func accessibilityLineRange(

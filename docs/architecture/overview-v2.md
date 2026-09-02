@@ -3239,6 +3239,7 @@ table_resize / geometry）没有一个是 macOS 概念；`MacosFrameGeometry`（
   `PanelLabel.stripping`、`search-panel` 875 的减法与上下文裁剪）。
   **把逻辑挪进 Rust，不是把断言挪进 Rust。** 挪完之后壳里剩下「把一棵树喂给
   `NSOutlineView` / `TreeView`」，那本来就该各写各的。
+  **已完成，见下面「刀 c 的第三块」。**
 - **(c) 真正平台绑定的**（`clipboard`、`document-workflow`、
   `document-interaction`、`accessibility`、`multi-cursor`、
   `macos-task-checkbox`、`macos-table-resize-coordinator`、
@@ -3265,7 +3266,7 @@ table_resize / geometry）没有一个是 macOS 概念；`MacosFrameGeometry`（
 | **a** | 让 C ABI 在非 macOS 上不再撒谎 | 编译产物的符号表 |
 | ~~**b**~~ **已完成** | 写下 shaping 契约；删掉零消费者的 `TextShaper`；`Utf16Map` 提到 `yu-font`；把「shaper 与 rasterizer 共用 face 表」写进类型 | 一套 conformance 测试，CoreTextShaper 与全部 mock 都跑 |
 | ~~**b2**~~ **已完成**（**表外插的一刀**，刀 b 的 spike 查出来的） | 排不出来的簇画替代字形，不让整个块失败 | 判据落在洞出现的那一层：`yu-storage-ffi` 的那个错误码不再出现 |
-| ~~**c**~~ **已完成** | 把中立逻辑从平台层提上来（`MetalFrameConsumer` / `requires_full_clear` / `build_native_*` / `MetalSurfaceConfig` → `yu-render`；`CoreTextViewportFrameBuilder` → 泛型 → `yu-workspace`；`MacosFrameKey` → `FrameKey`；9 个 FFI 去前缀） | 纯重构：14 个 self-check 不变、**真实窗口截图差分逐字节为 0** |
+| ~~**c**~~ **已完成**（三块：c1 render、c2 FFI 命名、c3 面板） | 把中立逻辑从平台层提上来（`MetalFrameConsumer` / `requires_full_clear` / `build_native_*` / `MetalSurfaceConfig` → `yu-render`；`CoreTextViewportFrameBuilder` → 泛型 → `yu-workspace`；`MacosFrameKey` → `FrameKey`；9 个 FFI 去前缀；**面板的平表→树与身份链、`PanelLabel.stripping`、搜索的上下文裁剪 → `yu-editor::panel`**） | 纯重构：14 个 self-check 不变、**真实窗口截图差分逐字节为 0** |
 | **d** | `yu-font-windows`：DirectWrite 的 `ShapingProvider` + `GlyphRasterizer`。**拆成 d1（翻译层，已完成）与 d2（COM 调用）** | 刀 b 那套 conformance 在 Windows CI 上跑。**不需要窗口、GPU、壳**——但也因此是第一刀判据不在开发机上的 |
 | **e** | `yu-render-windows`：D3D 后端 | headless 的「`RenderPlan` → 平铺指令」比对（刀 c 提上来之后两端共用，是真差分不是自证）+ 一个真实窗口 smoke |
 | **f** | Windows 壳（窗口 + TSF + UIA） | self-check + `check-platform-parity.py` |
@@ -3785,6 +3786,153 @@ macOS 的**叠加式滚动条**淡入淡出。判据是同一个二进制拍两�
 `frame_key.rs`）。**Swift 产品代码只有改名，行数不变。**
 `tools/check-geometry.py` 的两条例外登记跟着搬到新路径——它反向检查，留旧条目
 会红。
+
+###### c3：面板那一半 —— 已完成
+
+**这是刀 c 的第三块，也是 macOS 侧的最后一件。** 上面「五、判据」的 (b) 点名
+的三样——`OutlinePanel` 的平表→树与身份链、`PanelLabel.stripping`、
+`SearchPanel` 的减法与上下文裁剪——全部挪进 `yu-editor::panel`
+（`OutlineTree` / `SearchResults`）。判据与 c1/c2 一样是两张图。
+
+**搬的判据是「有没有 AppKit」，不是「在哪个目录里」**（与 c1 的「有没有原生
+指针」同形）。搬走的每一段换成 `TreeView` 之后每一行都成立；留下的每一段都
+真的在跟 `NSOutlineView` / `NSTableView` 说话。
+
+| 搬到 | 内容 |
+| --- | --- |
+| `yu_editor::OutlineTree` | 平表→树（改成**前序 + 直接孩子数**）、身份链、每一行的文字 |
+| `yu_editor::SearchResults` | 上下文裁剪（命中所在的那一行 ∩ 它所在的块）、每一行的文字 |
+| `yu_text::TextSnapshot::line_range` | 「一行从哪到哪」 |
+
+五件事值得单独说：
+
+1. **`PanelLabel.stripping` 没有被翻译成 Rust——它在 Rust 里本来就有一份。**
+   `yu-editor::visual` 的 `read_visible`（「`range` 里没被隐藏的那些字节，按源码
+   顺序拼起来」）与它是同一个函数，而那才是编辑器画字走的那条路。所以这一块
+   **没有新写减法**，只是把 `read_visible` 提成 `pub(crate)` 拿来用。
+   **这是「唯一实现」这条规矩第一次以这种方式兑现**：搬一段平台逻辑上来的时候
+   发现上面已经有了，于是搬运变成了删除。面板的标签从此按定义等于「编辑器里
+   那一段显示成什么」，而不是「另一段碰巧算出同样结果的代码」。
+
+2. **平台侧那一支「区间自相矛盾就整段原样返回」删掉了，它是死代码不是防线。**
+   它存在的理由是：区间从**另一次 FFI 调用**来，中间隔着一个 C ABI，壳没法
+   相信它。挪到产生者旁边之后那种输入不再表达得出来
+   （`DecorationSet::hidden_spans()` 由构造保证升序不重叠）。同理消失的还有
+   「拿不到区间时退回显示源码」——那是 Revision 撞上刷新的产物，一次调用里
+   不存在这件事。
+
+3. **「一行」原来有两个定义，这一刀少掉一个。** 平台侧用
+   `NSString.lineRange(for:)`，它认 `\r` 与 `U+2028/2029`；这个仓库的行只认 LF
+   （`ropey_backend` 的 `LineType::LF`），块扫描器也是。两个定义都算得出「一
+   行」，只在含那些字符的文档上分岔，不报错。挪上来之后统一走
+   `TextSnapshot::line_range`——**它同时把 `yu-editor` 里 AX 那份行查询也收编
+   了**（`AccessibilityTextView::range_for_line` 原来自己按
+   `line_start(n)` / `line_start(n+1)` 拼）。
+   `SearchResults::context_range` 里那个「裁进块里」因此**少了一条理由**
+   （AppKit 与块扫描器对一行的定义不同），但**少的正是不该存在的那一条**；
+   另一条理由（「块的边界还没合并」那道闸门）仍然成立，那个交集继续留着，
+   由一条手造用例压着——语料造不出它。
+
+4. **平表→树的形状改了：从「按 `parent` 查表」改成「前序 + 直接孩子数」。**
+   原来那份在壳里有一支「查不到父亲就挂成根级」，那是 FFI 契约被破坏时的猜测。
+   层级由 Rust 定之后不必猜了：这份表按文档顺序排，而就近挂靠使文档顺序恰好
+   是前序、一条标题的后代恰好连续，于是一次栈式扫描就还原得出整棵树，**壳里
+   一次查表都没有**。`parent` 字段留着——它与 `child_count` 互为对方的参照，
+   self-check 按前者核对壳按后者挂出来的树。
+
+5. **`SearchResults.next`（跳到下一个/上一个的环回）留在壳里，登记。**
+   它是这一列数组上的算术，一个字节都不问文档要；而这一刀挪的三样各自**减掉**
+   了一个 FFI 入口，挪它却要**新开**一个。**触发条件**：刀 f 写 Windows 壳时
+   真要写第二份的那一刻挪，判据现成（`SearchState::current` 已经在 Rust 侧
+   定义了「当前命中」，`next` 是它的邻居）。
+
+###### C ABI：交出的从区间变成文字，函数从 49 个减到 48 个
+
+`yu_storage_session_block_hidden_spans` **退休**，`YuStorageHiddenSpan` 跟着
+删掉。`yu_storage_session_outline_items` 与 `yu_storage_session_search_matches`
+各长出一个文本缓冲：
+
+```text
+int32_t yu_storage_session_outline_items(
+    YuStorageSession *session, uint64_t expected_revision,
+    YuStorageOutlineItem *items, size_t item_capacity, size_t *item_count,
+    uint8_t *text, size_t text_capacity, size_t *text_length);
+```
+
+**两遍协议，两个缓冲区一起。** 条目里的 `display_utf8_offset` /
+`identity_utf8_offset` 指进同一次调用拷出来的那段 UTF-8——**分成两个入口就有
+两个可以对不上的答案**，而对不上的表现是面板上那一行显示成别人的字。
+
+**这推翻了 `YuStorageHiddenSpan` 上写着的那条理由，要说清楚为什么。** 那里写
+的是「把视觉文本拷过来会破 C4『parser 不复制正文』与整套 range-backed 设计」。
+两件事：
+
+- **C4 说的是 parser 不把正文复制进节点**，说的不是 FFI。而
+  `yu_storage_session_copy_source_range` 与 `copy_selection` 早就在交出正文
+  字节了——那句「FFI 上至今没有任何入口交出正文字节」在写下的时候就已经不准。
+- **真正该防的是「整篇文档的视觉字节流」**：那会造出第二份可以与 canonical
+  漂开的文档。**那条欠账仍然欠着**（见上面「四、IME 与 AX」），这一刀一个字
+  都没动它。一条标题的标签不是那件事：它是一次派生的、有界的、绑在同一个
+  Revision 上的显示串。
+
+换来的是**减法只有一份实现**。原来那份住在壳里，第二端必须照写第二遍，而分叉
+的表现是同一条标题在两端显示得不一样——不报错。
+
+`YuStorageSearchMatch` 顺带**瘦掉三个字段**（`block` / `block_start_utf16` /
+`block_end_utf16`）。它们存在的唯一理由是让壳自己把一行裁进块里，好满足
+`block_hidden_spans` 的前置条件；那个入口没有了，这三个数也就没有了消费者。
+与第六刀退休 `YU_STORAGE_EXPORT_ERROR = 17` 同一条规矩。
+
+###### 断言跟着逻辑走：14 个 self-check 还是 14 个，但内容换了一半
+
+overview 早先预判「那两条 panel self-check 的断言会自然落到 Rust 层」，这一刀
+兑现了。**数量不变**（`check-platform-parity.py` 将来要比的是名单，不是内容），
+但两条 self-check 里那些**中立性质**——剥标记、折行、身份链、上下文不越块、
+子序列、长度守恒——搬进了 `crates/yu-editor/tests/panel.rs`（14 条）与
+`panel.rs` 自己的单元用例（6 条）。留在壳里的都是壳自己的事：
+
+| 留在 self-check 里 | 为什么它不是自证的 |
+| --- | --- |
+| 还原出来的树 vs 平表的 `parent` | 壳按 `child_count` 挂，判据按 `parent` 核对 |
+| 点第 N 行 → `bridge.selection` | 判据与面板走的是两条路 |
+| 滚动请求指向那一条的块 | 压住「面板自己算 y」 |
+| 展开状态与选中行活过一次文首插入 | 纯 Swift 状态逻辑，丢了不报错 |
+| 计数标签、高亮往返、环回、重扫 | 壳自己的逻辑 |
+| 三条端到端的标签断言 | 真 fixture 经过真 ABI 进真 bundle，只有这里问得出来 |
+
+**「大纲面板与搜索面板显示同一个字符串」仍然不是判据**——两边都从同一份定义
+来，那从来就是自证的，挪进 Rust 之后更是。
+
+###### 判据：两张图之间（第三次）
+
+`verify.sh` 十步全绿。**14 个 self-check 一个不少，全过。**
+
+真实窗口截图差分（Apple M1 Max、macOS 26.5、浅色、900×652 逻辑 / 1800×1304
+物理）：`outline.md` 与 `sample.md` 各拍新旧两版，**整张图逐字节 0 差异**
+——不只是文档区，是包括标题栏在内的每一个像素。选 `outline.md` 而不是刀 c 用的
+`render-code.md` 是有理由的：**侧栏默认就开着**，那份 fixture 的大纲里正好有
+`**行内标记**`、`[链接](...)`、ATX 收尾串与 Setext 多行标题——被搬走的那段
+代码画出来的东西全在图上。
+
+噪声底按刀 c 的做法量：每个二进制拍两张。旧版 `outline.md` 那一对差 562 px
+（行 0-43 与 1257-1303，列 0-37 与 1766-1799——**全在文档区之外**，文档区里
+是 0），其余三对全是逐字节 0。跨版本比的是噪声状态相同的两张。
+
+> 顺带把「行 47–1256 且列 1–1769」这条判据做成了工具（`regiondiff.py`，与
+> `shoot.py` / `diff.py` 一起放在 `~/yu-shot-tools/`）：它同时按行、按列归并
+> 分布，并单独报一个「文档区内不同像素」的数，退出码由它决定。
+> `diff.py` 只按行归并，而两次收紧判据都是因为**行范围不够**。
+
+###### 实际代价
+
+`yu-editor` 多两个文件（`panel.rs` 428 行、`tests/panel.rs` 304 行）；
+`yu-text` 多一个方法。**Swift 产品代码 6,469 → 6,313 行**，`PanelLabel.swift`
+整个删掉，`OutlinePanel.swift` 284 → 243、`SearchPanel.swift` 302 → 255；
+`StorageBridge.swift` 反而 +18（两个缓冲区的两遍协议比一个长）。
+`SelfChecks.swift` 1,719 → 1,567。
+
+**行数不是这一刀的收获，性质才是**：剩下的面板代码里没有一行是「算」，全是
+「跟 AppKit 说话」。第二端要写的那一份，从此只有后者。
 
 ##### 刀 c 的尾巴：G 节验收捅出来的剪贴板三条 —— 已完成
 

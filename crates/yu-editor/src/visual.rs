@@ -558,7 +558,7 @@ fn validate_selection(text: &str, selection: TextRange) -> Result<(), VisualText
 /// 字节被藏了」在这条路上仍然只有一个答案（不变量 D4）。自己再数一遍会得到
 /// 第二个实现——哪怕今天结果一样，它会在下一次改动时分叉，而分叉的表现是
 /// 画面比光标少几个字。
-fn read_visible(
+pub(crate) fn read_visible(
     source: &TextSnapshot,
     range: TextRange,
     set: &DecorationSet,

@@ -23,9 +23,9 @@ use yu_editor::{
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
     AccessibilityTextSnapshot, Bias, BlockOrnament, BlockView, CaretAffinity, CaretScrollRequest,
     CommandResult, EditorCommand, EditorDocumentError, ImageSpan, LayoutConfig, LayoutPoint,
-    OutlineItem, OutlineSnapshot, SelectionError, SourceSync, TableResizeCommit,
-    TableResizeGesture, TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig,
-    ViewportSpan, VisualOffset, VisualText,
+    OutlineTree, SearchResults, SelectionError, SourceSync, TableResizeCommit, TableResizeGesture,
+    TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig, ViewportSpan,
+    VisualOffset, VisualText,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
@@ -627,6 +627,11 @@ pub struct YuStorageAccessibilityNodeV2 {
 /// `yu_storage_session_set_selection_endpoints`，再调
 /// `yu_storage_session_shaped_caret_scroll_request`。滚动仍然走
 /// viewport 那一条路，平台侧不自己算 y。
+///
+/// **树的形状与那两串文字都由 Rust 给**（`yu_editor::OutlineTree`）。这份表
+/// 按文档顺序排，也就是前序；`child_count` 是直接孩子的条数。两者合起来足以
+/// 无歧义地还原整棵树，壳里因此没有一次查表、也没有「父亲查不到怎么办」
+/// 那一支。`parent` 留着，它与 `child_count` 互为对方的参照。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct YuStorageOutlineItem {
@@ -646,47 +651,35 @@ pub struct YuStorageOutlineItem {
     /// 标题正文：大纲上显示的就是这一段，不含任何结构标记。
     pub label_start_utf16: u64,
     pub label_end_utf16: u64,
+    /// **直接**孩子的条数。
+    pub child_count: u64,
+    /// 面板上显示的那一行文字，在同一次调用拷出的 UTF-8 缓冲里的位置。
+    ///
+    /// 它不是 `label_*_utf16` 那一段源码：行内标记已经减掉，Setext 的两行
+    /// 也已经折成一行。
+    pub display_utf8_offset: u64,
+    pub display_utf8_length: u64,
+    /// 跨刷新的身份，同一个缓冲里的位置。展开状态与选中行按它记。
+    pub identity_utf8_offset: u64,
+    pub identity_utf8_length: u64,
 }
 
-/// 一处搜索命中。
+/// 结果面板上的一行：一处命中，加上它显示成的那行字。
 ///
-/// `block` 与 `block_*_utf16` 是**为了让调用方能守住那条规则**：回报隐藏区间
-/// 的 FFI 只接受落在一个块里的请求，而结果面板上那一行（匹配所在的那一行）
-/// 未必与块边界对齐。有了块的区间，平台可以自己把行裁到块里，不必反过来问
-/// 「块边界在哪」——那是上一层的事。
-///
-/// 匹配跨块时 `block` 是**起点所在**的那一块。
+/// **原来这里还有 `block` 与 `block_*_utf16` 三个字段**，它们存在的唯一理由
+/// 是让壳自己把「命中所在的那一行」裁进块里，好满足回报隐藏区间那个入口的
+/// 前置条件。裁剪与减法都挪进 Rust 之后（`yu_editor::SearchResults`），
+/// 那个入口没有了，这三个字段也就没有了消费者——留着就是三个没人用得上的
+/// 数，与第六刀退休 `YU_STORAGE_EXPORT_ERROR = 17` 同一条规矩。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct YuStorageSearchMatch {
     pub revision: u64,
-    pub block: u64,
     pub start_utf16: u64,
     pub end_utf16: u64,
-    pub block_start_utf16: u64,
-    pub block_end_utf16: u64,
-}
-
-/// 一段被装饰藏起来的 source，UTF-16。
-///
-/// # 为什么是「回报区间」而不是「把文字给你」
-///
-/// 面板上的一行文字要不带语法标记（`## **粗** 标题` 显示成 `粗 标题`）。
-/// 「哪几段被藏了」的唯一实现是 `DecorationSet`（不变量 D1），在 Rust 侧；
-/// 而画字的是 AppKit，在平台侧。把视觉文本拷过来是最直接的做法，但那会破
-/// C4「parser 不复制正文」与整套 range-backed 设计——FFI 上至今没有任何入口
-/// 交出正文字节，平台手上只有它自己的 canonical 镜像。
-///
-/// 所以交出的是**区间**：平台拿自己的镜像按这些区间减掉。跨边界的是
-/// 两个 `u64`，不是文本。
-///
-/// 区间升序、不重叠、不相邻——这不是这里另外整理出来的，是
-/// `DecorationSet::hidden_spans()` 本来就保证的形状（映射索引就建在它上面）。
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct YuStorageHiddenSpan {
-    pub start_utf16: u64,
-    pub end_utf16: u64,
+    /// 面板上显示的那一行文字，在同一次调用拷出的 UTF-8 缓冲里的位置。
+    pub display_utf8_offset: u64,
+    pub display_utf8_length: u64,
 }
 
 #[repr(C)]
@@ -1356,228 +1349,155 @@ fn write_accessibility_nodes_v2(
     YU_STORAGE_OK
 }
 
-/// 大纲的一条 → C ABI 的一条。位置换成 UTF-16。
-fn outline_item_output(
-    snapshot: &TextSnapshot,
-    revision: u64,
-    item: OutlineItem,
-) -> Result<YuStorageOutlineItem, i32> {
-    let (source_start_utf16, source_end_utf16) = source_utf16_range(snapshot, item.source_range())?;
-    let (label_start_utf16, label_end_utf16) = source_utf16_range(snapshot, item.label_range())?;
-    Ok(YuStorageOutlineItem {
-        revision,
-        index: u32::try_from(item.index()).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
-        parent: item
-            .parent()
-            .map(|parent| u32::try_from(parent).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL))
-            .transpose()?
-            .unwrap_or(YU_STORAGE_OUTLINE_PARENT_NONE),
-        level: item.level(),
-        reserved: [0; 7],
-        block: u64::try_from(item.block()).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
-        source_start_utf16,
-        source_end_utf16,
-        label_start_utf16,
-        label_end_utf16,
-    })
+/// 一次两遍协议的两个去处：定长条目一段，UTF-8 文本一段。
+///
+/// **它们必须出自同一次计算**——条目里的 `*_utf8_offset` 指进的正是这一次
+/// 拷出来的那段文本。分成两个入口就有了两个可以对不上的答案（面板上那一行
+/// 会显示成别人的字，不报错），所以两个缓冲区在一次调用里一起交出去。
+struct PanelOutput<T> {
+    items: *mut T,
+    item_capacity: usize,
+    item_count: *mut usize,
+    text: *mut u8,
+    text_capacity: usize,
+    text_length: *mut usize,
 }
 
-/// 两遍协议：`output` 为空时只回报条数，调用方按它开数组再调一次。
+impl<T> PanelOutput<T> {
+    /// 只问长度的那一遍：两个指针都是 null、两个容量都是 0。
+    const fn is_measuring(&self) -> bool {
+        self.items.is_null() && self.text.is_null()
+    }
+}
+
+/// 两遍协议：两个指针都传 null（容量都为 0）时只回报两个长度。
 ///
-/// 与 `write_accessibility_nodes_v2` 同一个协议，但那一个不做逐条转换（语义
-/// 树自己就存着 UTF-16），这里要转，所以先全部转完再拷——转到一半失败就
-/// 拷了半份出去，那是「静默地做错事」。
-fn write_outline_items(
-    snapshot: &TextSnapshot,
-    revision: u64,
-    items: &[OutlineItem],
-    output: *mut YuStorageOutlineItem,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    if written.is_null() {
+/// 与 `write_accessibility_nodes_v2` 同一个协议，多了一段文本。先把条目全部
+/// 转完再拷——转到一半失败就拷了半份出去，那是「静默地做错事」；调用方在这
+/// 一层已经拿到 `Vec` 与 `String`，所以拷贝本身不会失败。
+fn write_panel_rows<T: Copy>(rows: &[T], text: &str, output: &PanelOutput<T>) -> i32 {
+    if output.item_count.is_null() || output.text_length.is_null() {
         return YU_STORAGE_NULL_POINTER;
     }
-    // SAFETY: `written` is a caller-owned output pointer checked above.
-    unsafe { *written = items.len() };
-    if items.is_empty() {
-        return YU_STORAGE_OK;
+    // SAFETY: both are caller-owned output pointers checked above.
+    unsafe {
+        *output.item_count = rows.len();
+        *output.text_length = text.len();
     }
-    if output.is_null() {
-        return if capacity == 0 {
+    if output.is_measuring() {
+        return if output.item_capacity == 0 && output.text_capacity == 0 {
             YU_STORAGE_OK
         } else {
             YU_STORAGE_NULL_POINTER
         };
     }
-    if capacity < items.len() {
+    if output.items.is_null() || output.text.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if output.item_capacity < rows.len() || output.text_capacity < text.len() {
         return YU_STORAGE_BUFFER_TOO_SMALL;
     }
-    let mut converted = Vec::with_capacity(items.len());
-    for item in items {
-        match outline_item_output(snapshot, revision, *item) {
-            Ok(entry) => converted.push(entry),
-            Err(status) => return status,
-        }
-    }
-    // SAFETY: capacity was checked against the number of converted items, and
-    // the native caller supplied writable storage for that many values.
+    // SAFETY: both capacities were checked above, and the native caller
+    // supplied writable storage for that many bytes and items.
     unsafe {
-        ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
+        if !rows.is_empty() {
+            ptr::copy_nonoverlapping(rows.as_ptr(), output.items, rows.len());
+        }
+        if !text.is_empty() {
+            ptr::copy_nonoverlapping(text.as_ptr(), output.text, text.len());
+        }
     }
     YU_STORAGE_OK
 }
 
-/// 一个块里被藏起来的 source 区间，裁到请求区间之后换成 UTF-16。
+/// 面板那一层的错误 → 状态码。
 ///
-/// **判据的分工**：「藏对了没有」不在这里证——那是 `yu-decoration` 的线性
-/// 参照实现与 `extension_decorations.rs` 的 45 条压住的事。这个函数只做两件
-/// 事：裁剪与换算，它们各自的错法（漏掉半段、UTF-16 换错）由本文件末尾的
-/// 用例压住。
-fn block_hidden_spans_output(
+/// 都是「这一版拿不到」：调用方保留上一版比中止好，与 Revision 失配同一种
+/// 处置。
+const fn panel_status(_error: &yu_editor::PanelError) -> i32 {
+    YU_STORAGE_EDITOR_ERROR
+}
+
+/// 把一段字符追加进文本缓冲，回报它落在哪儿。
+fn push_display(text: &mut String, piece: &str) -> (u64, u64) {
+    let offset = text.len() as u64;
+    text.push_str(piece);
+    (offset, piece.len() as u64)
+}
+
+/// 这一版大纲的全部行 + 它们那两串文字。
+///
+/// **树的形状、面板上那一行文字、跨刷新的身份都在 `yu-editor` 算**
+/// （`OutlineTree`）。这里只做一件事：换算 UTF-16 偏移，把字符串摊进一段
+/// 连续缓冲。
+fn outline_rows_output(
     session: &mut DocumentEditorSession,
-    block: usize,
-    request: TextRange,
-) -> Result<Vec<YuStorageHiddenSpan>, i32> {
+) -> Result<(Vec<YuStorageOutlineItem>, String), i32> {
     let snapshot = session.snapshot();
-    let block_range = session
-        .document()
-        .editor()
-        .markdown()
-        .blocks()
-        .get(block)
-        .map(yu_markdown::Block::range)
-        .ok_or(YU_STORAGE_INVALID_SELECTION)?;
-    // 请求区间必须落在这个块里。跨块的问题会逼这一层去回答「块边界在哪」，
-    // 那是上一层的事；而放行的后果是**静默地少藏**——面板上那一行悄悄带回
-    // 语法标记，不报错。调用方跨块就自己按块问几次。
-    if request.start() < block_range.start() || request.end() > block_range.end() {
-        return Err(YU_STORAGE_INVALID_SELECTION);
-    }
-    // 规范装饰，**不带 active**：面板上的标签不能因为光标正好停在那个标题里
-    // 就突然长出 `**`。`block_decorations` 走的正是无露出的那条缓存路径，
-    // 带露出的是隔壁 `block_decorations_for_visual_state`。
-    let decorations = session.block_decorations(block).map_err(storage_status)?;
-    let mut spans = Vec::new();
-    for &(from, to) in decorations.set().hidden_spans() {
-        let start = from.max(request.start());
-        let end = to.min(request.end());
-        if start >= end {
-            continue;
-        }
-        let range = TextRange::new(start, end).ok_or(YU_STORAGE_EDITOR_ERROR)?;
-        let (start_utf16, end_utf16) = source_utf16_range(&snapshot, range)?;
-        spans.push(YuStorageHiddenSpan {
-            start_utf16,
-            end_utf16,
+    let tree = OutlineTree::build(session.document_mut().editor_mut())
+        .map_err(|error| panel_status(&error))?;
+    let revision = tree.revision().get();
+    let mut items = Vec::with_capacity(tree.rows().len());
+    let mut text = String::new();
+    for row in tree.rows() {
+        let item = row.item();
+        let (source_start_utf16, source_end_utf16) =
+            source_utf16_range(&snapshot, item.source_range())?;
+        let (label_start_utf16, label_end_utf16) =
+            source_utf16_range(&snapshot, item.label_range())?;
+        let (display_utf8_offset, display_utf8_length) = push_display(&mut text, row.label());
+        let (identity_utf8_offset, identity_utf8_length) = push_display(&mut text, row.identity());
+        items.push(YuStorageOutlineItem {
+            revision,
+            index: u32::try_from(item.index()).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
+            parent: item
+                .parent()
+                .map(|parent| u32::try_from(parent).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL))
+                .transpose()?
+                .unwrap_or(YU_STORAGE_OUTLINE_PARENT_NONE),
+            level: item.level(),
+            reserved: [0; 7],
+            block: u64::try_from(item.block()).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
+            source_start_utf16,
+            source_end_utf16,
+            label_start_utf16,
+            label_end_utf16,
+            child_count: u64::try_from(row.child_count())
+                .map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
+            display_utf8_offset,
+            display_utf8_length,
+            identity_utf8_offset,
+            identity_utf8_length,
         });
     }
-    Ok(spans)
+    Ok((items, text))
 }
 
-/// 一处匹配 → C ABI 的一条。位置换成 UTF-16，并带上它所在块的区间。
-fn search_match_output(
-    document: &yu_editor::EditorDocument,
-    snapshot: &TextSnapshot,
+/// 当前查询这一版的全部结果行 + 它们那串文字。
+///
+/// 上下文裁剪（命中所在的那一行 ∩ 它所在的块）与减法都在 `yu-editor`
+/// （`SearchResults`）。这里只换算 UTF-16 偏移。
+fn search_rows_output(
+    session: &mut DocumentEditorSession,
     revision: u64,
-    hit: TextRange,
-) -> Result<YuStorageSearchMatch, i32> {
-    let (start_utf16, end_utf16) = source_utf16_range(snapshot, hit)?;
-    let block = document
-        .block_index_for_source(hit.start())
-        .ok_or(YU_STORAGE_EDITOR_ERROR)?;
-    let block_range = document
-        .markdown()
-        .blocks()
-        .get(block)
-        .map(yu_markdown::Block::range)
-        .ok_or(YU_STORAGE_EDITOR_ERROR)?;
-    let (block_start_utf16, block_end_utf16) = source_utf16_range(snapshot, block_range)?;
-    Ok(YuStorageSearchMatch {
-        revision,
-        block: u64::try_from(block).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
-        start_utf16,
-        end_utf16,
-        block_start_utf16,
-        block_end_utf16,
-    })
-}
-
-/// 两遍协议，与 `write_outline_items` 同一个形状：先全部转完再拷，转到一半
-/// 失败就拷了半份出去。
-fn write_search_matches(
-    document: &yu_editor::EditorDocument,
-    snapshot: &TextSnapshot,
-    revision: u64,
-    matches: &[TextRange],
-    output: *mut YuStorageSearchMatch,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    if written.is_null() {
-        return YU_STORAGE_NULL_POINTER;
+) -> Result<(Vec<YuStorageSearchMatch>, String), i32> {
+    let snapshot = session.snapshot();
+    let results = SearchResults::build(session.document_mut().editor_mut())
+        .map_err(|error| panel_status(&error))?;
+    let mut items = Vec::with_capacity(results.rows().len());
+    let mut text = String::new();
+    for row in results.rows() {
+        let (start_utf16, end_utf16) = source_utf16_range(&snapshot, row.hit())?;
+        let (display_utf8_offset, display_utf8_length) = push_display(&mut text, row.label());
+        items.push(YuStorageSearchMatch {
+            revision,
+            start_utf16,
+            end_utf16,
+            display_utf8_offset,
+            display_utf8_length,
+        });
     }
-    // SAFETY: `written` is a caller-owned output pointer checked above.
-    unsafe { *written = matches.len() };
-    if matches.is_empty() {
-        return YU_STORAGE_OK;
-    }
-    if output.is_null() {
-        return if capacity == 0 {
-            YU_STORAGE_OK
-        } else {
-            YU_STORAGE_NULL_POINTER
-        };
-    }
-    if capacity < matches.len() {
-        return YU_STORAGE_BUFFER_TOO_SMALL;
-    }
-    let mut converted = Vec::with_capacity(matches.len());
-    for hit in matches.iter().copied() {
-        match search_match_output(document, snapshot, revision, hit) {
-            Ok(entry) => converted.push(entry),
-            Err(status) => return status,
-        }
-    }
-    // SAFETY: capacity was checked against the number of converted matches,
-    // and the native caller supplied writable storage for that many values.
-    unsafe {
-        ptr::copy_nonoverlapping(converted.as_ptr(), output, converted.len());
-    }
-    YU_STORAGE_OK
-}
-
-/// 两遍协议，与 `write_outline_items` 同一个形状。
-fn write_hidden_spans(
-    spans: &[YuStorageHiddenSpan],
-    output: *mut YuStorageHiddenSpan,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    if written.is_null() {
-        return YU_STORAGE_NULL_POINTER;
-    }
-    // SAFETY: `written` is a caller-owned output pointer checked above.
-    unsafe { *written = spans.len() };
-    if spans.is_empty() {
-        return YU_STORAGE_OK;
-    }
-    if output.is_null() {
-        return if capacity == 0 {
-            YU_STORAGE_OK
-        } else {
-            YU_STORAGE_NULL_POINTER
-        };
-    }
-    if capacity < spans.len() {
-        return YU_STORAGE_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: capacity was checked against the number of spans, and the native
-    // caller supplied writable storage for that many values.
-    unsafe {
-        ptr::copy_nonoverlapping(spans.as_ptr(), output, spans.len());
-    }
-    YU_STORAGE_OK
+    Ok((items, text))
 }
 
 fn accessibility_line_range_output(
@@ -5422,62 +5342,40 @@ pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_nodes_v2(
     write_accessibility_nodes_v2(snapshot.nodes(), output, capacity, written)
 }
 
-/// 拷出这一版的大纲：文档里全部标题，按文档顺序，带层级。
+/// 拷出这一版的大纲：文档里全部标题，按文档顺序（也就是前序），带层级、
+/// 面板上那一行文字、跨刷新的身份。
 ///
-/// 两遍协议：`output` 传 null（`capacity` 为 0）时只把条数写进 `written`。
+/// **两遍协议，两个缓冲区一起**：`items` 与 `text` 都传 null（两个容量都为
+/// 0）时只把两个长度写进 `item_count` 与 `text_length`。条目里的
+/// `display_utf8_offset` / `identity_utf8_offset` 指进 `text`，所以它们必须
+/// 出自同一次调用。
+///
+/// # 为什么这一版交出的是**文字**，上一版交出的是区间
+///
+/// 上一版由平台拿自己的 canonical 镜像减掉隐藏区间，理由写在那时的
+/// `YuStorageHiddenSpan` 上：「跨边界的是区间，不是文本」。**那条理由针对的
+/// 是把整篇文档的视觉字节流搬过去**（那会造出第二份可以与 canonical 漂开的
+/// 文档，也正是至今仍然登记着的那条欠账）。一条标题的标签不是那件事：它是
+/// 一次派生的、有界的、绑在同一个 Revision 上的显示串，与
+/// `yu_storage_session_copy_source_range` 交出选区字节是同一类。
+///
+/// 换来的是**减法只有一份实现**。上一版那份住在壳里，第二端必须照写第二遍，
+/// 而分叉的表现是同一条标题在两端显示得不一样——不报错。
 ///
 /// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable items when non-null.
+/// `session` must be a live handle. `item_count` and `text_length` must be
+/// writable; when non-null, `items` must provide `item_capacity` writable
+/// items and `text` must provide `text_capacity` writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yu_storage_session_outline_items(
-    session: *const YuStorageSession,
-    expected_revision: u64,
-    output: *mut YuStorageOutlineItem,
-    capacity: usize,
-    written: *mut usize,
-) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
-        return YU_STORAGE_NULL_POINTER;
-    };
-    if let Err(status) = validate_revision(&session.session, expected_revision) {
-        return status;
-    }
-    let snapshot = session.session.snapshot();
-    let outline = OutlineSnapshot::from_document(session.session.document().editor());
-    write_outline_items(
-        &snapshot,
-        outline.revision().get(),
-        outline.items(),
-        output,
-        capacity,
-        written,
-    )
-}
-
-/// 一个块里被藏起来的 source 区间，裁到 `[start_utf16, end_utf16)` 之内。
-///
-/// 平台侧拿自己的 canonical 镜像**减掉**这些区间，就得到不带语法标记的那行
-/// 文字。跨边界的是区间，不是文本（见 [`YuStorageHiddenSpan`]）。
-///
-/// 两遍协议：`output` 传 null（`capacity` 为 0）时只把条数写进 `written`。
-///
-/// 请求区间必须整个落在这个块里。跨块的一行（搜索结果那种）要按块问几次：
-/// 让这一层去回答「块边界在哪」是把上一层的职责搬下来。
-///
-/// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable spans when non-null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn yu_storage_session_block_hidden_spans(
     session: *mut YuStorageSession,
     expected_revision: u64,
-    block: u64,
-    start_utf16: u64,
-    end_utf16: u64,
-    output: *mut YuStorageHiddenSpan,
-    capacity: usize,
-    written: *mut usize,
+    items: *mut YuStorageOutlineItem,
+    item_capacity: usize,
+    item_count: *mut usize,
+    text: *mut u8,
+    text_capacity: usize,
+    text_length: *mut usize,
 ) -> i32 {
     let Some(session) = (unsafe { session.as_mut() }) else {
         return YU_STORAGE_NULL_POINTER;
@@ -5485,17 +5383,22 @@ pub unsafe extern "C" fn yu_storage_session_block_hidden_spans(
     if let Err(status) = validate_revision(&session.session, expected_revision) {
         return status;
     }
-    let Ok(block) = usize::try_from(block) else {
-        return YU_STORAGE_INVALID_SELECTION;
-    };
-    let request = match source_range_from_ffi(&session.session, start_utf16, end_utf16) {
-        Ok(range) => range,
+    let (rows, display) = match outline_rows_output(&mut session.session) {
+        Ok(output) => output,
         Err(status) => return status,
     };
-    match block_hidden_spans_output(&mut session.session, block, request) {
-        Ok(spans) => write_hidden_spans(&spans, output, capacity, written),
-        Err(status) => status,
-    }
+    write_panel_rows(
+        &rows,
+        &display,
+        &PanelOutput {
+            items,
+            item_capacity,
+            item_count,
+            text,
+            text_capacity,
+            text_length,
+        },
+    )
 }
 
 /// 换一份搜索查询，立刻在当前这一版源码上扫出全部匹配。
@@ -5534,10 +5437,14 @@ pub unsafe extern "C" fn yu_storage_session_set_search_query(
     YU_STORAGE_OK
 }
 
-/// 拷出当前查询在这一版源码上的全部匹配，按文档顺序，互不重叠。
+/// 拷出当前查询在这一版源码上的全部结果行，按文档顺序，互不重叠。
 ///
-/// 两遍协议：`output` 传 null（`capacity` 为 0）时只把条数写进 `written`。
-/// 没有搜索时条数是 0。
+/// **两遍协议，两个缓冲区一起**，与 `yu_storage_session_outline_items` 同形。
+/// 没有搜索时两个长度都是 0。
+///
+/// 「命中所在的那一行显示成什么字」由 Rust 算（`yu_editor::SearchResults`）：
+/// 取那一行、裁进它所在的块、减掉被藏起来的区间。**裁进块里不是可选的**
+/// ——不裁的后果不是画错，是那一行悄悄带回语法标记。
 ///
 /// **「跳到下一个」不在这里。** 它是一次导航，而导航只能有一个实现：平台拿
 /// 这个列表挑出光标之后的那一条，再走已有的
@@ -5545,33 +5452,41 @@ pub unsafe extern "C" fn yu_storage_session_set_search_query(
 /// 「怎么跳到一个源码位置」的答案。
 ///
 /// # Safety
-/// `session` must be a live handle. `written` must be writable; `output` must
-/// provide `capacity` writable matches when non-null.
+/// `session` must be a live handle. `item_count` and `text_length` must be
+/// writable; when non-null, `items` must provide `item_capacity` writable
+/// items and `text` must provide `text_capacity` writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yu_storage_session_search_matches(
-    session: *const YuStorageSession,
+    session: *mut YuStorageSession,
     expected_revision: u64,
-    output: *mut YuStorageSearchMatch,
-    capacity: usize,
-    written: *mut usize,
+    items: *mut YuStorageSearchMatch,
+    item_capacity: usize,
+    item_count: *mut usize,
+    text: *mut u8,
+    text_capacity: usize,
+    text_length: *mut usize,
 ) -> i32 {
-    let Some(session) = (unsafe { session.as_ref() }) else {
+    let Some(session) = (unsafe { session.as_mut() }) else {
         return YU_STORAGE_NULL_POINTER;
     };
     if let Err(status) = validate_revision(&session.session, expected_revision) {
         return status;
     }
-    let editor = session.session.document().editor();
-    let snapshot = session.session.snapshot();
-    let matches = editor.search().map_or(&[][..], |state| state.matches());
-    write_search_matches(
-        editor,
-        &snapshot,
-        expected_revision,
-        matches,
-        output,
-        capacity,
-        written,
+    let (rows, display) = match search_rows_output(&mut session.session, expected_revision) {
+        Ok(output) => output,
+        Err(status) => return status,
+    };
+    write_panel_rows(
+        &rows,
+        &display,
+        &PanelOutput {
+            items,
+            item_capacity,
+            item_count,
+            text,
+            text_capacity,
+            text_length,
+        },
     )
 }
 
@@ -5790,9 +5705,23 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    /// 临时文件名里的那一段。
+    ///
+    /// **进程内的计数器不够**：`$TMPDIR` 是同机共享的，同时跑两个这个测试
+    /// 二进制（一轮被杀而 `cargo test` 的子进程没死，就会发生）就必然撞名，
+    /// 表现是十几条用例一起炸在 `fs::remove_file` 的 `NotFound` 上——看上去
+    /// 完全像一次真的回归。加上 pid 就根治了。
+    fn temp_id() -> String {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     #[test]
     fn status_and_state_contracts_are_stable() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-{id}.md"));
         fs::write(&path, "羽 日本語 🙂\n").expect("fixture");
         let editor_session = DocumentEditorSession::open(&path).expect("open");
@@ -5876,7 +5805,7 @@ mod tests {
 
     #[test]
     fn ffi_snapshot_queries_are_two_call_safe() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-query-{id}.md"));
         fs::write(&path, "# 羽\n日本語 🙂\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -5911,7 +5840,7 @@ mod tests {
 
     #[test]
     fn ffi_selection_endpoints_preserve_visual_drag_direction() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-selection-endpoints-{id}.md"));
         let source = "alpha 日本語";
         fs::write(&path, source).expect("fixture");
@@ -5973,7 +5902,7 @@ mod tests {
 
     #[test]
     fn ffi_projection_is_source_backed_and_revision_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-projection-{id}.md"));
         fs::write(&path, "**羽** [链接](https://example.com) 🙂\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -6034,7 +5963,7 @@ mod tests {
 
     #[test]
     fn ffi_projected_mirror_tracks_selection_bound_delimiter_reveal() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-reveal-{id}.md"));
         let source = "before **strong** after";
         fs::write(&path, source).expect("fixture");
@@ -6100,7 +6029,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_shaped_vertical_command_preserves_revision_and_selection_contract() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-shaped-vertical-{id}.md"));
         let source = "abcdefghij\nxy\n1234567890";
         fs::write(&path, source).expect("fixture");
@@ -6187,7 +6116,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_shaped_projection_hit_test_is_revision_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path =
             std::env::temp_dir().join(format!("yu-storage-ffi-shaped-projection-hit-test-{id}.md"));
         let source = "before **粗体** after\nnext";
@@ -6235,7 +6164,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_task_checkbox_hit_uses_current_published_frame_and_canonical_command() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-task-hit-{id}.md"));
         let source = "- [ ] todo\nparagraph\n- [x] done\n";
         fs::write(&path, source).expect("fixture");
@@ -6403,7 +6332,7 @@ mod tests {
     /// 一遍就是第二份合并实现，而两份合并必定分叉。
     #[test]
     fn ffi_selections_round_trip_and_normalize() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-selections-{id}.md"));
         fs::write(&path, "alpha beta gamma\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -6584,7 +6513,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_frame_is_current_requires_a_submitted_frame() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-frame-current-{id}.md"));
         fs::write(&path, "# \u{6807}\u{9898}\n\nbody\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -6708,7 +6637,7 @@ mod tests {
     /// ——粘贴出来是 HTML 标签或反过来，没有任何报错。
     #[test]
     fn ffi_copy_selection_rejects_unknown_formats() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-clipboard-format-{id}.md"));
         fs::write(&path, "**\u{7fbd}** plain\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -6791,7 +6720,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_table_resize_probe_does_not_open_a_gesture() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-resize-probe-{id}.md"));
         fs::write(&path, "| A | B |\n| --- | :---: |\n| 1 | 2 |\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -6915,7 +6844,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_frame_key_notices_state_that_does_not_advance_revision() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-frame-key-{id}.md"));
         fs::write(&path, "| A | B |\n| --- | :---: |\n| 1 | 2 |\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -7111,7 +7040,7 @@ mod tests {
     /// 都不报错。
     #[test]
     fn ffi_table_resize_action_rejects_unknown_actions() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-resize-action-{id}.md"));
         fs::write(&path, "| A | B |\n| --- | :---: |\n| 1 | 2 |\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -7173,7 +7102,7 @@ mod tests {
 
     #[test]
     fn ffi_table_resize_gesture_lifecycle_is_revision_bound_and_source_neutral() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-table-gesture-{id}.md"));
         let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
         fs::write(&path, source).expect("fixture");
@@ -7299,7 +7228,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_source_caret_resolves_owning_block_and_is_revision_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-source-caret-{id}.md"));
         let source = "# 标题\n\nParagraph **粗体** and 日本語🙂\n";
         fs::write(&path, source).expect("fixture");
@@ -7399,7 +7328,7 @@ mod tests {
 
     #[test]
     fn ffi_composition_projection_is_generation_bound_and_preserves_source() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path =
             std::env::temp_dir().join(format!("yu-storage-ffi-composition-projection-{id}.md"));
         let source = "before **x** after";
@@ -7522,7 +7451,7 @@ mod tests {
 
     #[test]
     fn ffi_projection_visual_mirror_maps_caret_and_selection_back_to_source() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-visual-mirror-{id}.md"));
         let source = "before **粗体** after\n日本🙂";
         fs::write(&path, source).expect("fixture");
@@ -7672,7 +7601,7 @@ mod tests {
     #[test]
     fn ffi_frame_reports_pending_resources_for_the_visible_range() {
         fn frame_pending(source: &str, name: &str) -> u8 {
-            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let id = temp_id();
             let path = std::env::temp_dir().join(format!("yu-storage-ffi-{name}-{id}.md"));
             fs::write(&path, source).expect("fixture");
             let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -7753,7 +7682,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_caret_geometry_survives_a_script_core_text_refuses() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-unshapable-{id}.md"));
         fs::write(&path, "\u{05e9}\u{05dc}\u{05d5}\u{05dd}\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -7778,7 +7707,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_viewport_config_is_published_by_rust_and_kept_when_aligned() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-viewport-config-{id}.md"));
         fs::write(&path, "# \u{6807}\u{9898}\n\nparagraph\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -7841,7 +7770,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_table_resize_preview_reaches_retained_render_host_frame() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-table-resize-{id}.md"));
         let source = "| A | B |\n| --- | :---: |\n| 1 | 2 |\n";
         fs::write(&path, source).expect("fixture");
@@ -8208,7 +8137,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_render_host_reuses_state_across_viewport_events() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-host-{id}.md"));
         fs::write(&path, "# 羽🙂\n\nparagraph 日本語 **bold**\n\n- [ ] task\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -8437,7 +8366,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_shaped_caret_scroll_request_is_revision_bound_and_document_space() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-caret-scroll-{id}.md"));
         let source =
             "# one\n\nparagraph one\n\n# two\n\nparagraph two\n\n# three\n\nparagraph three\n";
@@ -8520,7 +8449,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ffi_macos_composition_shaped_caret_is_generation_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path =
             std::env::temp_dir().join(format!("yu-storage-ffi-composition-shaped-caret-{id}.md"));
         let source = "before **x** after";
@@ -8604,7 +8533,7 @@ mod tests {
 
     #[test]
     fn ffi_accessibility_snapshot_and_line_ranges_are_revision_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-ax-{id}.md"));
         fs::write(&path, "# 羽\n日本語 🙂\n").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -8699,7 +8628,7 @@ mod tests {
 
     #[test]
     fn ffi_accessibility_semantic_nodes_are_revision_bound_and_source_backed() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-semantic-ax-{id}.md"));
         fs::write(
             &path,
@@ -8802,15 +8731,16 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
-    /// 大纲跨 C ABI：两遍协议、层级、正文不带语法、Revision 校验。
+    /// 拉一版大纲跨 C ABI：两遍协议的两个缓冲区一起、层级、面板上那一行
+    /// 文字、身份。
     ///
-    /// 语料里那条 `## 收尾 ##` 是特意放的：它此前会带着 ` ##` 过 ABI，而
-    /// 编辑器里显示的是 `收尾`。
+    /// 语料里三样都是特意放的：`## 收尾 ##` 的收尾串由**树**剥掉、`**粗**`
+    /// 由**装饰**剥掉、`🙂` 让字节偏移与 UTF-16 偏移给出两组不同的数字。
     #[test]
-    fn ffi_outline_items_carry_the_heading_hierarchy() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    fn ffi_outline_items_carry_the_hierarchy_and_the_panel_line() {
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-outline-{id}.md"));
-        let source = "# 一级\n\n段落\n\n## 收尾 ##\n\nSetext\n===\n";
+        let source = "# 🙂 **粗** 一级\n\n段落\n\n## 收尾 ##\n\nSetext\n===\n";
         fs::write(&path, source).expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
         let mut raw = ptr::null_mut();
@@ -8819,17 +8749,32 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        // 第一遍：只问条数。
+        // 第一遍：只问两个长度。两个指针都是 null、两个容量都是 0。
         let mut count = 0;
+        let mut text_length = 0;
         assert_eq!(
-            unsafe { yu_storage_session_outline_items(raw, 0, ptr::null_mut(), 0, &mut count) },
+            unsafe {
+                yu_storage_session_outline_items(
+                    raw,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                    ptr::null_mut(),
+                    0,
+                    &mut text_length,
+                )
+            },
             YU_STORAGE_OK
         );
         assert_eq!(count, 3, "两条 ATX 加一条 Setext");
+        assert!(text_length > 0, "每一条都有 label 与 identity");
 
-        // 数组小了要明确拒绝，不能拷半份出去。
+        // 条目数组小了要明确拒绝，不能拷半份出去。
         let mut short = vec![YuStorageOutlineItem::default(); count - 1];
+        let mut short_text = vec![0u8; text_length];
         let mut short_written = 0;
+        let mut short_text_written = 0;
         assert_eq!(
             unsafe {
                 yu_storage_session_outline_items(
@@ -8838,14 +8783,20 @@ mod tests {
                     short.as_mut_ptr(),
                     short.len(),
                     &mut short_written,
+                    short_text.as_mut_ptr(),
+                    short_text.len(),
+                    &mut short_text_written,
                 )
             },
             YU_STORAGE_BUFFER_TOO_SMALL
         );
 
-        // 第二遍：拷出来。
+        // **文本缓冲小了也要拒绝。** 两个容量各挡各的：只检查条目那一个的话，
+        // 文本会被拷成半截 UTF-8，面板上那一行显示成乱码——不报错。
         let mut items = vec![YuStorageOutlineItem::default(); count];
+        let mut tiny_text = vec![0u8; text_length - 1];
         let mut written = 0;
+        let mut tiny_written = 0;
         assert_eq!(
             unsafe {
                 yu_storage_session_outline_items(
@@ -8854,14 +8805,70 @@ mod tests {
                     items.as_mut_ptr(),
                     items.len(),
                     &mut written,
+                    tiny_text.as_mut_ptr(),
+                    tiny_text.len(),
+                    &mut tiny_written,
                 )
             },
-            YU_STORAGE_OK
+            YU_STORAGE_BUFFER_TOO_SMALL
         );
-        assert_eq!(written, count);
 
+        // 第二遍：拷出来。
+        let read = |revision: u64| -> Result<(Vec<YuStorageOutlineItem>, String), i32> {
+            let mut count = 0;
+            let mut text_length = 0;
+            let status = unsafe {
+                yu_storage_session_outline_items(
+                    raw,
+                    revision,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                    ptr::null_mut(),
+                    0,
+                    &mut text_length,
+                )
+            };
+            if status != YU_STORAGE_OK {
+                return Err(status);
+            }
+            let mut items = vec![YuStorageOutlineItem::default(); count];
+            let mut text = vec![0u8; text_length];
+            let mut written = 0;
+            let mut text_written = 0;
+            let status = unsafe {
+                yu_storage_session_outline_items(
+                    raw,
+                    revision,
+                    items.as_mut_ptr(),
+                    items.len(),
+                    &mut written,
+                    text.as_mut_ptr(),
+                    text.len(),
+                    &mut text_written,
+                )
+            };
+            if status != YU_STORAGE_OK {
+                return Err(status);
+            }
+            assert_eq!(written, count, "两遍给出的条数必须一致");
+            assert_eq!(text_written, text_length, "两遍给出的文本长度必须一致");
+            Ok((items, String::from_utf8(text).expect("文本是合法 UTF-8")))
+        };
+
+        let (items, text) = read(0).expect("拷出来");
+        let piece = |offset: u64, length: u64| {
+            let start = usize::try_from(offset).expect("偏移放得进 usize");
+            let end = start + usize::try_from(length).expect("长度放得进 usize");
+            text[start..end].to_owned()
+        };
+        let display =
+            |item: &YuStorageOutlineItem| piece(item.display_utf8_offset, item.display_utf8_length);
+        let identity = |item: &YuStorageOutlineItem| {
+            piece(item.identity_utf8_offset, item.identity_utf8_length)
+        };
         let utf16: Vec<u16> = source.encode_utf16().collect();
-        let label = |item: &YuStorageOutlineItem| {
+        let label_source = |item: &YuStorageOutlineItem| {
             let start = usize::try_from(item.label_start_utf16).expect("UTF-16 偏移放得进 usize");
             let end = usize::try_from(item.label_end_utf16).expect("UTF-16 偏移放得进 usize");
             String::from_utf16(&utf16[start..end]).expect("正文是合法 UTF-16")
@@ -8871,15 +8878,34 @@ mod tests {
         assert_eq!(items[0].index, 0);
         assert_eq!(items[0].parent, YU_STORAGE_OUTLINE_PARENT_NONE);
         assert_eq!(items[0].level, 1);
-        assert_eq!(label(&items[0]), "一级");
+        assert_eq!(items[0].child_count, 1, "二级标题是它的直接孩子");
+        assert_eq!(
+            label_source(&items[0]),
+            "🙂 **粗** 一级",
+            "正文区间不剥装饰"
+        );
+        assert_eq!(display(&items[0]), "🙂 粗 一级", "面板上那一行剥掉了 `**`");
 
         assert_eq!(items[1].parent, 0, "二级标题挂在一级下");
         assert_eq!(items[1].level, 2);
-        assert_eq!(label(&items[1]), "收尾", "收尾的 `#` 串不是正文");
+        assert_eq!(items[1].child_count, 0);
+        assert_eq!(display(&items[1]), "收尾", "收尾的 `#` 串不是正文");
 
         assert_eq!(items[2].parent, YU_STORAGE_OUTLINE_PARENT_NONE);
-        assert_eq!(items[2].level, 1);
-        assert_eq!(label(&items[2]), "Setext", "下划线那一行不是正文");
+        assert_eq!(items[2].child_count, 0);
+        assert_eq!(display(&items[2]), "Setext", "下划线那一行不是正文");
+
+        // 身份两两不同，而且每一条都不是空的——空身份会让展开状态整片合并。
+        let identities: Vec<String> = items.iter().map(identity).collect();
+        assert!(identities.iter().all(|value| !value.is_empty()));
+        assert_eq!(
+            identities
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            identities.len(),
+            "{identities:?}"
+        );
 
         // source 包着 label。
         for item in &items {
@@ -8887,100 +8913,8 @@ mod tests {
             assert!(item.label_end_utf16 <= item.source_end_utf16);
         }
 
-        let mut stale = 0;
-        assert_eq!(
-            unsafe { yu_storage_session_outline_items(raw, 1, ptr::null_mut(), 0, &mut stale) },
-            YU_STORAGE_STALE_REVISION
-        );
-
-        unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).expect("cleanup");
-    }
-
-    /// 回报区间的 FFI：裁剪、UTF-16 换算、光标露出不参与。
-    ///
-    /// **这里不证「藏对了没有」**——那是 `yu-decoration/src/hidden.rs` 的线性
-    /// 参照与 `extension_decorations.rs` 那 45 条压住的事，再证一遍是把同一件
-    /// 事写两份。这条用例只压这个函数自己新加的两步：把区间裁到请求范围里，
-    /// 和把字节换成 UTF-16。
-    ///
-    /// 语料里的 🙂 是特意放的：它在字节里占 4 个、在 UTF-16 里占 2 个，所以
-    /// 「报了字节偏移」与「报了 UTF-16 偏移」给出两组不同的数字。
-    #[test]
-    fn ffi_block_hidden_spans_clip_and_ignore_the_caret() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("yu-storage-ffi-hidden-{id}.md"));
-        let source = "# 🙂 **粗** 标题\n\n段落\n";
-        fs::write(&path, source).expect("fixture");
-        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
-        let mut raw = ptr::null_mut();
-        assert_eq!(
-            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
-            YU_STORAGE_OK
-        );
-
-        // 标题块是 UTF-16 的 0..14（含行尾换行），字节是 0..22——两组数字不
-        // 一样，正是要压的。
-        let query = |from: u64, to: u64| -> Result<Vec<YuStorageHiddenSpan>, i32> {
-            let mut count = 0;
-            let status = unsafe {
-                yu_storage_session_block_hidden_spans(
-                    raw,
-                    0,
-                    0,
-                    from,
-                    to,
-                    ptr::null_mut(),
-                    0,
-                    &mut count,
-                )
-            };
-            if status != YU_STORAGE_OK {
-                return Err(status);
-            }
-            let mut spans = vec![YuStorageHiddenSpan::default(); count];
-            let mut written = 0;
-            let status = unsafe {
-                yu_storage_session_block_hidden_spans(
-                    raw,
-                    0,
-                    0,
-                    from,
-                    to,
-                    spans.as_mut_ptr(),
-                    spans.len(),
-                    &mut written,
-                )
-            };
-            if status != YU_STORAGE_OK {
-                return Err(status);
-            }
-            assert_eq!(written, count, "两遍给出的条数必须一致");
-            Ok(spans)
-        };
-
-        let span = |from: u64, to: u64| YuStorageHiddenSpan {
-            start_utf16: from,
-            end_utf16: to,
-        };
-
-        // 整块：`# ` 与两个 `**`。字节偏移会给出 (0,2)/(7,9)/(12,14)。
-        assert_eq!(
-            query(0, 13).expect("整块"),
-            vec![span(0, 2), span(5, 7), span(8, 10)]
-        );
-
-        // 只问正文那一段：`# ` 整条落在请求之外，不能出现。
-        assert_eq!(query(2, 13).expect("正文"), vec![span(5, 7), span(8, 10)]);
-
-        // 请求切在一条隐藏区间中间：裁一半，不是整条留下也不是整条丢掉。
-        assert_eq!(query(6, 13).expect("裁一半"), vec![span(6, 7), span(8, 10)]);
-
-        // 空请求什么也不藏。
-        assert_eq!(query(6, 6).expect("空请求"), vec![]);
-
-        // 把光标放进 `**粗**` 里——编辑器里那两个 `**` 会露出来，但**面板上的
-        // 标签不能跟着变**。走的必须是规范装饰那条路。
+        // **把光标放进 `**粗**` 里**——编辑器里那两个 `**` 会露出来，但面板上
+        // 的标签不能跟着变。这条压的是「走的是规范装饰那条路」。
         assert_eq!(
             unsafe {
                 yu_storage_session_set_selection_endpoints(
@@ -8993,94 +8927,36 @@ mod tests {
             },
             YU_STORAGE_OK
         );
+        let (revealed, revealed_text) = read(0).expect("光标在标题里");
+        let revealed_display = {
+            let start = usize::try_from(revealed[0].display_utf8_offset).expect("偏移放得进 usize");
+            let end =
+                start + usize::try_from(revealed[0].display_utf8_length).expect("长度放得进 usize");
+            revealed_text[start..end].to_owned()
+        };
         assert_eq!(
-            query(0, 13).expect("光标在标题里"),
-            vec![span(0, 2), span(5, 7), span(8, 10)],
-            "光标露出不能影响回报的区间"
+            revealed_display, "🙂 粗 一级",
+            "光标露出不能影响面板上的标签"
         );
 
-        // 跨出块边界要明确拒绝。放行的后果是静默地少藏——面板上那一行悄悄
-        // 带回语法标记，不报错。
-        assert_eq!(query(0, 15), Err(YU_STORAGE_INVALID_SELECTION), "越过块尾");
-        assert_eq!(
-            query(14, 18),
-            Err(YU_STORAGE_INVALID_SELECTION),
-            "整个落在下一个块里"
-        );
-
-        // 数组小了要拒绝，不能拷半份出去。
-        let mut short = vec![YuStorageHiddenSpan::default(); 2];
-        let mut short_written = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_block_hidden_spans(
-                    raw,
-                    0,
-                    0,
-                    0,
-                    13,
-                    short.as_mut_ptr(),
-                    short.len(),
-                    &mut short_written,
-                )
-            },
-            YU_STORAGE_BUFFER_TOO_SMALL
-        );
-
-        // 块下标越界、Revision 失配。
-        //
-        // 这里特意问的是**最后一个块自己的区间**（`段落` 是 UTF-16 的 15..18）。
-        // 拿 0..0 去问是压不住这一条的：那个区间对任何块都跨界，于是上面那道
-        // 「请求要落在块里」的门先挡下来，这道门有没有都一样绿。两道门挡同一
-        // 件事时，里面那道往往没有自己的用例。
-        let mut count = 0;
-        assert_eq!(
-            unsafe {
-                yu_storage_session_block_hidden_spans(
-                    raw,
-                    0,
-                    99,
-                    15,
-                    18,
-                    ptr::null_mut(),
-                    0,
-                    &mut count,
-                )
-            },
-            YU_STORAGE_INVALID_SELECTION
-        );
-        assert_eq!(
-            unsafe {
-                yu_storage_session_block_hidden_spans(
-                    raw,
-                    1,
-                    0,
-                    0,
-                    13,
-                    ptr::null_mut(),
-                    0,
-                    &mut count,
-                )
-            },
-            YU_STORAGE_STALE_REVISION
-        );
+        assert_eq!(read(1), Err(YU_STORAGE_STALE_REVISION));
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }
 
-    /// 搜索跨 C ABI：两遍协议、UTF-16、块下标与块区间、编辑之后重扫。
+    /// 搜索跨 C ABI：两遍协议、UTF-16、结果那一行显示成什么、编辑之后重扫。
     ///
-    /// 「匹配找得对不对」在 `yu-editor::search` 的用例里；这里压的是 ABI 那
-    /// 一层：位置换算，以及**块的区间**——面板要靠它把一行裁进块里才能去问
-    /// 隐藏区间，报错了会静默地少剥标记。
+    /// 「匹配找得对不对」在 `yu-editor::search` 的用例里，「那一行剥干净没有」
+    /// 在 `yu-editor` 的 `panel` 用例里；这里压的是 ABI 那一层：位置换算与
+    /// 两个缓冲区的对齐。
     #[test]
-    fn ffi_search_matches_carry_utf16_and_block_bounds() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    fn ffi_search_matches_carry_utf16_and_the_panel_line() {
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-search-{id}.md"));
         // 🙂 让字节偏移与 UTF-16 偏移分开：`目标` 在字节里从 9 起，在 UTF-16
         // 里从 5 起。
-        let source = "# 🙂 目标\n\n段落里也有目标。\n";
+        let source = "# 🙂 目标\n\n段落里也有**目标**。\n";
         fs::write(&path, source).expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
         let mut raw = ptr::null_mut();
@@ -9089,16 +8965,28 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        let matches = |revision: u64| -> Result<Vec<YuStorageSearchMatch>, i32> {
+        let matches = |revision: u64| -> Result<(Vec<YuStorageSearchMatch>, String), i32> {
             let mut count = 0;
+            let mut text_length = 0;
             let status = unsafe {
-                yu_storage_session_search_matches(raw, revision, ptr::null_mut(), 0, &mut count)
+                yu_storage_session_search_matches(
+                    raw,
+                    revision,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                    ptr::null_mut(),
+                    0,
+                    &mut text_length,
+                )
             };
             if status != YU_STORAGE_OK {
                 return Err(status);
             }
             let mut values = vec![YuStorageSearchMatch::default(); count];
+            let mut text = vec![0u8; text_length];
             let mut written = 0;
+            let mut text_written = 0;
             let status = unsafe {
                 yu_storage_session_search_matches(
                     raw,
@@ -9106,46 +8994,47 @@ mod tests {
                     values.as_mut_ptr(),
                     values.len(),
                     &mut written,
+                    text.as_mut_ptr(),
+                    text.len(),
+                    &mut text_written,
                 )
             };
             if status != YU_STORAGE_OK {
                 return Err(status);
             }
             assert_eq!(written, count, "两遍给出的条数必须一致");
-            Ok(values)
+            assert_eq!(text_written, text_length, "两遍给出的文本长度必须一致");
+            Ok((values, String::from_utf8(text).expect("文本是合法 UTF-8")))
         };
 
         // 还没有查询：0 条，不是错误。
-        assert_eq!(matches(0).expect("没有查询"), vec![]);
+        assert_eq!(matches(0).expect("没有查询"), (vec![], String::new()));
 
         let query = "目标".as_bytes();
         assert_eq!(
             unsafe { yu_storage_session_set_search_query(raw, query.as_ptr(), query.len()) },
             YU_STORAGE_OK
         );
-        let hits = matches(0).expect("两处命中");
+        let (hits, text) = matches(0).expect("两处命中");
         assert_eq!(hits.len(), 2);
+        let display = |hit: &YuStorageSearchMatch| {
+            let start = usize::try_from(hit.display_utf8_offset).expect("偏移放得进 usize");
+            let end = start + usize::try_from(hit.display_utf8_length).expect("长度放得进 usize");
+            text[start..end].to_owned()
+        };
 
         // 位置是 UTF-16：标题里的 `目标` 从 5 起（字节是 9）。
         assert_eq!((hits[0].start_utf16, hits[0].end_utf16), (5, 7));
-        assert_eq!(hits[0].block, 0);
-        assert_eq!(
-            (hits[0].block_start_utf16, hits[0].block_end_utf16),
-            (0, 8),
-            "标题块含行尾换行"
-        );
+        assert_eq!(display(&hits[0]), "🙂 目标", "标题那一行");
+        // 第二处在段落里，行尾的换行被收掉，`**` 被剥掉。
+        assert!(hits[1].start_utf16 > hits[0].end_utf16);
+        assert_eq!(display(&hits[1]), "段落里也有目标。");
 
-        // 第二处在段落块里，块下标与块区间都要跟着走。
-        assert!(hits[1].block > hits[0].block, "第二处在后面的块里");
-        assert!(
-            hits[1].block_start_utf16 <= hits[1].start_utf16
-                && hits[1].end_utf16 <= hits[1].block_end_utf16,
-            "匹配必须落在它自己报的那个块里"
-        );
-
-        // 数组小了要拒绝，不能拷半份出去。
+        // 条目数组小了要拒绝，不能拷半份出去。
         let mut short = vec![YuStorageSearchMatch::default(); 1];
+        let mut short_text = vec![0u8; 1024];
         let mut short_written = 0;
+        let mut short_text_written = 0;
         assert_eq!(
             unsafe {
                 yu_storage_session_search_matches(
@@ -9154,6 +9043,9 @@ mod tests {
                     short.as_mut_ptr(),
                     short.len(),
                     &mut short_written,
+                    short_text.as_mut_ptr(),
+                    short_text.len(),
+                    &mut short_text_written,
                 )
             },
             YU_STORAGE_BUFFER_TOO_SMALL
@@ -9181,7 +9073,7 @@ mod tests {
             YU_STORAGE_OK
         );
         assert_eq!(matches(0), Err(YU_STORAGE_STALE_REVISION), "旧 Revision");
-        let shifted = matches(result.revision).expect("编辑之后");
+        let (shifted, _) = matches(result.revision).expect("编辑之后");
         assert_eq!(shifted.len(), 2, "编辑没有丢掉命中");
         assert_eq!(
             (shifted[0].start_utf16, shifted[0].end_utf16),
@@ -9194,7 +9086,10 @@ mod tests {
             unsafe { yu_storage_session_set_search_query(raw, ptr::null(), 0) },
             YU_STORAGE_OK
         );
-        assert_eq!(matches(result.revision).expect("收掉之后"), vec![]);
+        assert_eq!(
+            matches(result.revision).expect("收掉之后"),
+            (vec![], String::new())
+        );
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
@@ -9202,7 +9097,7 @@ mod tests {
 
     #[test]
     fn unified_ffi_command_and_composition_share_revision() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-editor-{id}.md"));
         fs::write(&path, "输入: ").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -9361,7 +9256,7 @@ mod tests {
 
     #[test]
     fn unified_ffi_insert_text_is_revision_bound_and_returns_range_sync() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-insert-{id}.md"));
         fs::write(&path, "a").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -9423,7 +9318,7 @@ mod tests {
 
     #[test]
     fn unified_ffi_copy_selection_is_revision_bound_and_utf8_owned() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-copy-{id}.md"));
         fs::write(&path, "A🙂日本語Z").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
@@ -9496,7 +9391,7 @@ mod tests {
 
     #[test]
     fn unified_ffi_html_selection_is_source_revision_bound() {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-html-{id}.md"));
         fs::write(&path, "**羽**").expect("fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();

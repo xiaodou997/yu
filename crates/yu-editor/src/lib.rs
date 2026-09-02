@@ -20,6 +20,7 @@ mod layout;
 mod list;
 mod marks;
 mod outline;
+mod panel;
 mod search;
 mod table;
 mod viewport;
@@ -44,6 +45,7 @@ pub use image::{CheckboxPlacement, ImagePlacement, PlacedWidget};
 pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
 pub use layout::{BlockLayoutSource, LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use outline::{OutlineItem, OutlineSnapshot};
+pub use panel::{OutlineRow, OutlineTree, PanelError, SearchResults, SearchRow};
 pub use search::SearchState;
 pub use table::{
     TableCellLayout, TableLayout, TableLayoutHit, TableResizeCommit, TableResizeGesture,
