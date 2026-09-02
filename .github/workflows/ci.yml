@@ -7,6 +7,13 @@ on:
 jobs:
   rust:
     strategy:
+      # fail-fast 关掉：矩阵存在的全部理由是「三个平台各说各的话」，而默认的
+      # fail-fast 会在第一个红的时候取消其余两个——于是三平台矩阵退化成
+      # 「最快红的那一个」。真实后果：ubuntu 因为一处 macOS-only 依赖被无条件
+      # 引用而编译失败时，windows job 一步都没跑过，而 windows 正是这个矩阵
+      # 唯一的存在理由（刀 d/e/f 的判据全在它身上）。修一层露一层，一次只能
+      # 看见一层。
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -46,8 +53,18 @@ jobs:
   # 「本地绿 = CI 绿」这个前提失效。它找到的每个失败都要被最小化后写进
   # crates/yu-syntax/tests/corpus/，从此由确定性的 cargo test 永久看守。
   # 只跑一个平台：解析器没有平台相关行为，跑三份只是烧三倍时间。
+  #
+  # **跑 macOS 而不是 ubuntu**：`tools/fuzz.sh` 与仓库里其余 6 个脚本一样是
+  # zsh（用了 `${0:A:h:h}` 这类 zsh 专有修饰符），而 ubuntu runner 上没有 zsh
+  # ——这条 job 长期以 `exit 127` 红着，而本地 `verify.sh --fuzz` 一直是绿的。
+  # 选平台等于选解释器：`tools/` 是开发机（macOS）的工具，让 CI 用同一个
+  # 解释器跑，「本地绿 = CI 绿」这个前提才成立。
+  #
+  # `check-ci-parity.py` 守的是「CI 的每条命令都在 verify.sh 里出现」——
+  # `tools/fuzz.sh 120` 这个字符串一直对得上，**它守不住那条命令在那个
+  # runner 上能不能执行**。这是 parity 的盲区，记在这里。
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
