@@ -47,6 +47,16 @@ python3 tools/check-ffi-header.py
 step "FFI 符号在本平台的产物里都在"
 python3 tools/check-ffi-symbols.py
 
+# 第三条 FFI 门禁，机制与前两条又不同：读 Cargo.toml 的条件依赖段 + 源码里
+# 的引用位置。前两条都盖不住这一类——第一条查的是 extern 函数挂没挂 cfg，
+# 不是函数体里引用了谁；第二条在 macOS 上跑，而 macOS 正是那些依赖存在的那个
+# 平台，它永远绿。
+#
+# 它守的是一次真实事故：两个无条件函数引用了挂在 cfg(macos) 下的 yu-markdown，
+# CI 的 ubuntu job 编译失败，而这里十步全绿。
+step "条件依赖未被无条件代码引用"
+python3 tools/check-cfg-deps.py
+
 step "ropey 未逃逸出 yu-text"
 python3 tools/check-rope-leak.py
 

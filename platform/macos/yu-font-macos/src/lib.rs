@@ -1182,6 +1182,7 @@ fn run_sample(request: &ShapeRequest<'_>, source: TextRange) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "macos")]
 fn shape_run(
     shaper: &CoreTextShaper,
     request: &ShapeRequest<'_>,
