@@ -40,6 +40,12 @@ jobs:
       # 撒谎，而当时全套门禁是绿的：从来没有人在非 macOS 上*链接*过这个
       # staticlib，只*编译*过。三个平台的覆盖靠的就是上面这个矩阵。
       - run: python3 tools/check-ffi-symbols.py
+      # 第三条 FFI 门禁：读 Cargo.toml 的条件依赖段 + 源码里的引用位置。
+      # 前两条盖不住这一类——上一条查的是 extern 函数挂没挂 cfg，不是函数体里
+      # 引用了谁；再上一条读符号表，而它在 macOS 上永远绿，因为 macOS 正是那些
+      # 依赖存在的平台。它守的是一次真实事故：两个无条件函数引用了挂在
+      # cfg(macos) 下的 yu-markdown，这个 job 在 ubuntu 上编译失败而本地全绿。
+      - run: python3 tools/check-cfg-deps.py
       # 字节/字符索引混用不会 panic，只会在某个 emoji 上悄悄切错位置。
       # 不变量 E4 要求 ropey 留在 yu-text 里，这条边界只能靠检查守。
       - run: python3 tools/check-rope-leak.py

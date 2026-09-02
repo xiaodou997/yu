@@ -3936,10 +3936,63 @@ overview 早先预判「那两条 panel self-check 的断言会自然落到 Rust
 的属性，`check-ffi-symbols.py` 只读**当前平台**的符号表。
 
 **没有在这一刀补第三条门禁**（这一刀的判据是两张图，加一条新门禁会让边界变糊），
-触发条件登记在交接稿里。**也没有声称「以前 Windows 上是红的」**——本机给不出
-那个判据：`cargo check -p yu-storage-ffi --target x86_64-pc-windows-msvc` 在
-tree-sitter 的 C grammar 就停了（`cc` 没有 msvc 工具链，刀 a 记过的机器限制）。
-源码事实是硬的，执行判据要等 CI 的 windows job。
+触发条件登记在交接稿里。
+
+> **更正（同日，推上去之后）：** 上面这段原本还写着「没有声称以前 Windows 上是
+> 红的，本机给不出那个判据」。**CI 早就给过了，是没去看**——上一轮 push
+> （`2df9a4a`）的 `rust (ubuntu-latest)` job 就是
+> `error[E0433]: cannot find module or crate yu_markdown` 挂掉的，行号正是
+> `lib.rs:1449` 与 `1493`，就是这两处。**登记的触发条件在登记之前就已经满足
+> 了**，于是门禁当场就建了：`tools/check-cfg-deps.py`，见下一节。
+>
+> 本机确实给不出那个判据（`cargo check -p yu-storage-ffi --target
+> x86_64-pc-windows-msvc` 在 tree-sitter 的 C grammar 就停了，`cc` 没有 msvc
+> 工具链）——**但「本机给不出」不等于「没有判据」，CI 就是判据，去看它。**
+> 这是这一天最贵的一条教训：`main` 与 `origin/main` 同步、工作树干净、本地十步
+> 全绿，同时 CI 已经红了至少两轮。
+
+###### 第三条 FFI 门禁：`tools/check-cfg-deps.py`
+
+**条件依赖不得被无条件代码引用。** `Cargo.toml` 里
+`[target.'cfg(...)'.dependencies]` 段下的 crate 只在那个 cfg 成立的平台上存在，
+无条件代码引用它们在别的平台上就是 `E0433` —— 而开发机上一切正常。
+
+**三条 FFI 门禁的机制两两不同，这是有意的**（与不变量 I8 同一条思路）：
+
+| 门禁 | 读什么 | 盖不住什么 |
+| --- | --- | --- |
+| `check-ffi-header.py` | 源码的**属性**（extern 函数挂没挂 cfg） | 函数**体里**引用了谁 |
+| `check-ffi-symbols.py` | 产物的**符号表** | 只覆盖当前平台，而 macOS 正是这些依赖存在的平台，它永远绿 |
+| `check-cfg-deps.py` | **Cargo.toml 的依赖段 + 源码的引用位置** | —— |
+
+判据分两半，因为真实代码几乎不写全路径：先收集条件依赖的 crate 名，再收集
+**只在 `#[cfg(...)]` 下 `use` 进来的名字**（同一个名字若也有无条件 import 就不
+算——从无条件依赖里条件 import 是常见写法，为的是别在另一个平台上报
+`unused_imports`），然后判断每一行在不在某个 cfg 的管辖区里。管辖区按缩进与
+花括号定界，**嵌在函数体里的 cfg 块也算**——刀 a 定的写法正是「平台差异写在
+函数体里，不写在函数上」。
+
+**宁可漏报不误报**：漏报由 CI 的三平台矩阵兜住，误报会让人学会忽略这条门禁。
+实测对 `yu-font-macos` 的 33 个 rustc 错误点报出 13 个，**误报 0 个**，而 13 个
+足以把人领到那一个出问题的函数上。
+
+**反向验证**：把它放到 `2df9a4a`（c3 之前）上跑，精确报出
+`yu-storage-ffi/src/lib.rs:1449` 与 `:1493` —— 正是 CI 那两条 `E0433` 的行号。
+
+###### 它第一次跑就抓出第二个破损：`yu-font-macos` 在非 macOS 上编译不过
+
+**`shape_run` 少了一个 `#[cfg(target_os = "macos")]`。** 那个文件里其余每一个
+CoreText 函数都挂着它，只有这一个漏了，于是它在非 macOS 上引用一批被 cfg 掉的
+名字，`cargo check -p yu-font-macos --target x86_64-pc-windows-msvc` 报 23 个
+错误。修复是**一行**。
+
+**为什么它藏了这么久**：CI 的 ubuntu job 每次都先在 `yu-storage-ffi` 上挂掉，
+编译顺序让它没走到这里；而 windows job 又被 fail-fast 连坐取消。
+**三层红叠在一起，每次只看得见最外面那层。**
+
+> 这个 crate 恰好是本机**能**交叉检查的（它不带 tree-sitter，只有
+> `yu-core` + `yu-font` 加条件的 objc2），所以判据是硬的：修之前 23 个错误，
+> 修之后 `Finished`，而 macOS 上编译结果一个字节不变（那条 cfg 在 macOS 上成立）。
 
 ###### 实际代价
 
