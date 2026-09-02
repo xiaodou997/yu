@@ -330,15 +330,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         guard force || outlineRevision != revision else { return }
         guard let items = bridge.outlineItemsIfAvailable else { return }
         outlineRevision = revision
-        outlinePanel.reload(
-            items: items,
-            source: bridge.source as NSString,
-            // 剥行内标记：区间由 Rust 给（唯一实现在 DecorationSet 里），
-            // 减法在 PanelLabel 里。面板自己不认识 bridge。
-            hidden: { [bridge] item in
-                bridge.blockHiddenSpans(block: item.block, in: item.labelRange)
-            }
-        )
+        // 树的形状、每一行的文字与身份都由 Rust 给（`OutlineTree`）；面板
+        // 只是把它喂给 NSOutlineView。
+        outlinePanel.reload(items: items)
     }
 
     /// 换一份查询：Rust 立刻重扫，结果列表与高亮跟着走。
@@ -360,14 +354,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         guard force || searchRevision != revision else { return }
         guard let matches = bridge.searchMatchesIfAvailable else { return }
         searchRevision = revision
-        let mirror = bridge.source as NSString
-        let rows = matches.map { match in
-            SearchResults.row(for: match, in: mirror) { [bridge] block, range in
-                // 结果那一行也要剥语法标记，走的是与大纲同一份实现。
-                bridge.blockHiddenSpans(block: block, in: range)
-            }
-        }
-        searchPanel.reload(rows: rows, query: searchQuery)
+        // 每一行显示成什么字由 Rust 给（`SearchResults`），走的是与大纲
+        // 同一份实现。
+        searchPanel.reload(rows: matches, query: searchQuery)
         searchPanel.highlightRow(matching: bridge.selection.range)
     }
 

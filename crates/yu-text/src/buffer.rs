@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use yu_core::{ByteOffset, LineIndex, Revision, Utf16Offset};
+use yu_core::{ByteOffset, LineIndex, Revision, TextRange, Utf16Offset};
 
 use crate::storage::{Storage, StorageSnapshot};
 use crate::{
@@ -160,6 +160,29 @@ impl TextSnapshot {
             .expect("a validated line index must have a source offset");
         ByteOffset::try_from(byte)
             .map_err(|_| TextPositionError::LineOutOfBounds { line, line_count })
+    }
+
+    /// 一整行的区间，**含它末尾那个 LF**（最后一行没有）。
+    ///
+    /// 「一行从哪到哪」原本有两份算法：`yu-editor` 的 AX 行查询自己按
+    /// `line_start(n)` / `line_start(n+1)` 拼，面板的上下文裁剪在平台侧按
+    /// `NSString.lineRange(for:)` 拼——而后者认 `\r` 与 `U+2028/2029`，
+    /// 这个仓库的行只认 LF（`storage::ropey_backend` 的 `LineType::LF`）。
+    /// 两个定义都算得出「一行」，只有在含那些字符的文档上才分岔，不报错。
+    /// 这里是它的唯一实现。
+    ///
+    /// # Errors
+    ///
+    /// 行号越界。
+    pub fn line_range(&self, line: LineIndex) -> Result<TextRange, TextPositionError> {
+        let start = self.line_start(line)?;
+        let next = LineIndex::new(line.get().saturating_add(1));
+        let end = if next.get() < self.summary().line_count() {
+            self.line_start(next)?
+        } else {
+            self.len_bytes()
+        };
+        Ok(TextRange::new(start, end).expect("line starts are ordered"))
     }
 
     fn validate_byte_offset(&self, offset: ByteOffset) -> Result<usize, TextPositionError> {

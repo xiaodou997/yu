@@ -424,17 +424,9 @@ impl AccessibilityTextSnapshot {
         &self,
         line: LineIndex,
     ) -> Result<AccessibilityTextRange, AccessibilityTextError> {
-        let start = self.source.line_start(line)?;
-        let line_count = self.source.summary().line_count();
-        let end = if line.get().saturating_add(1) < line_count {
-            self.source
-                .line_start(LineIndex::new(line.get().saturating_add(1)))?
-        } else {
-            self.source.len_bytes()
-        };
-        self.range_for_source(
-            TextRange::new(start, end).expect("ordered line boundaries must form a range"),
-        )
+        // 「一行从哪到哪」的唯一实现在 `TextSnapshot::line_range`——面板的
+        // 上下文裁剪是它的第二个消费者。
+        self.range_for_source(self.source.line_range(line)?)
     }
 
     fn validate_revision(&self, actual: Revision) -> Result<(), AccessibilityTextError> {
