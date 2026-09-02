@@ -1382,6 +1382,8 @@ fn cf_index_to_usize(index: isize) -> Result<usize, CoreTextShapeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 只有那三个 #[cfg(target_os = "macos")] 的 shaping 测试用得上。
+    #[cfg(target_os = "macos")]
     use yu_core::{ByteOffset, TextRange};
 
     #[test]
