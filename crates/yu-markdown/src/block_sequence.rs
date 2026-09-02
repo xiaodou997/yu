@@ -50,6 +50,23 @@ pub enum BlockKind {
         start: u32,
         state: TaskState,
     },
+    /// `---` / `***` / `___`。
+    ///
+    /// 这三种都只是**拼法**，与 Setext 的下划线不进 `Heading` 同一条规矩：
+    /// 画出来的是一条线，写的时候用哪个字符不改变它是什么。
+    ThematicBreak,
+    /// 四空格（或一个制表符）缩进的代码块。
+    ///
+    /// 与 [`Self::FencedCodeBlock`] **分开**，不是同一个变体加一个字段：围栏
+    /// 带着 `marker` 与 `closed` 两样负载，缩进代码一样都没有；而围栏的信息
+    /// 语言标记来自围栏那一行，缩进代码根本没有那一行。合成一个变体会让每个
+    /// 消费者都去匹配一个对另一半没有意义的字段。
+    IndentedCode,
+    /// `<div>` 这类块级 HTML。
+    ///
+    /// 它进 `BlockKind` **不等于 Yu 要渲染 HTML**——恰恰相反，认出它才能明确
+    /// 地按源码画（不变量 I5），而不是让它混在段落里被行内语法解析一遍。
+    HtmlBlock,
 }
 
 impl BlockKind {
@@ -66,6 +83,9 @@ impl BlockKind {
             Self::BlockQuote { .. } => 5,
             Self::ListItem { .. } => 6,
             Self::TaskListItem { .. } => 7,
+            Self::ThematicBreak => 8,
+            Self::IndentedCode => 9,
+            Self::HtmlBlock => 10,
         }
     }
 }

@@ -1139,7 +1139,14 @@ pub fn block_syntax_hidden_ranges(source: &TextSnapshot, block: Block) -> Vec<Te
             .iter()
             .filter_map(|line| blockquote_prefix_range(source, *line))
             .collect(),
-        BlockKind::BlankLine
+        // 这三种一个字节都不藏，理由各不相同：分隔线的 `---` 三个字符**就是
+        // 它的全部内容**，藏掉之后那个块是空的；缩进代码的四个空格是内容的一
+        // 部分（CommonMark 只剥第一层，剩下的缩进要照原样显示）；HTML 块整个
+        // 按源码画（不变量 I5）。
+        BlockKind::ThematicBreak
+        | BlockKind::IndentedCode
+        | BlockKind::HtmlBlock
+        | BlockKind::BlankLine
         | BlockKind::ReferenceDefinition
         | BlockKind::Paragraph
         | BlockKind::FencedCodeBlock { .. }
@@ -1666,7 +1673,11 @@ mod tests {
     fn scanner_preserves_phase_one_line_classification_rules() {
         let cases = [
             ("   # title\n", BlockKind::Heading { level: 1 }),
-            ("    # title\n", BlockKind::Paragraph),
+            // 四个空格就不是标题了——CommonMark 说那是**缩进代码块**，`#` 是
+            // 字面字符。这一条以前写的是 `Paragraph`，因为 `BlockKind` 没有
+            // 缩进代码这个变体；它要压的「三个空格是标题、四个不是」一直成立，
+            // 只是当时说不出第四个空格之后那是什么。
+            ("    # title\n", BlockKind::IndentedCode),
             ("####### title\n", BlockKind::Paragraph),
             ("\u{00a0}\n", BlockKind::BlankLine),
             (
@@ -2098,11 +2109,17 @@ mod tests {
         );
     }
 
+    /// 四空格缩进的引用定义**不是**引用定义。
+    ///
+    /// 它是一个缩进代码块，`[id]: /docs` 是里面的字面文本。这一条原来叫
+    /// `..._remains_literal_paragraph_text` 并断言 `Paragraph`——那时
+    /// `BlockKind` 没有缩进代码这个变体，只能说「反正不是引用定义」。它要压的
+    /// 那件事没变，现在说得更准。
     #[test]
-    fn four_space_indented_definition_remains_literal_paragraph_text() {
+    fn four_space_indented_definition_is_an_indented_code_block() {
         let document = parse(&TextBuffer::new("    [id]: /docs\n").snapshot());
         assert_eq!(document.blocks().len(), 1);
-        assert_eq!(kind_at(&document, 0), BlockKind::Paragraph);
+        assert_eq!(kind_at(&document, 0), BlockKind::IndentedCode);
         assert!(document.reference_definitions().definitions().is_empty());
     }
 
