@@ -17,6 +17,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+#[cfg(target_os = "macos")]
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
@@ -27,10 +28,12 @@ use yu_assets::{
 };
 use yu_core::Revision;
 use yu_render::{
-    AtlasPageUpload, BackendError, DamageRect, DrawCommand, EmbeddedSvgUpload, FrameConsumer,
-    IMAGE_KIND_REGULAR, RenderPlan, RenderUploader, SurfaceConfig, build_damage_rects,
-    build_draw_commands, cull_draw_commands, embedded_image_kind, requires_full_clear,
+    AtlasPageUpload, BackendError, EmbeddedSvgUpload, FrameConsumer, RenderPlan, RenderUploader,
+    SurfaceConfig, build_damage_rects, build_draw_commands, cull_draw_commands,
+    requires_full_clear,
 };
+#[cfg(target_os = "macos")]
+use yu_render::{DamageRect, DrawCommand, IMAGE_KIND_REGULAR, embedded_image_kind};
 use yu_scene::Rgba8;
 use yu_workspace::{
     ViewportFrameCache, ViewportFrameError, ViewportFramePublication, ViewportRenderFrame,
@@ -602,6 +605,7 @@ impl Drop for MacosImageDecodeWorker {
     }
 }
 
+#[cfg(target_os = "macos")]
 const METAL_SHADER_SOURCE: &str = include_str!("../native/yu_shaders.metal");
 
 #[cfg(target_os = "macos")]

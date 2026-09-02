@@ -16,16 +16,22 @@ use std::ptr;
 #[cfg(target_os = "macos")]
 use std::collections::{BTreeMap, HashSet};
 
+#[cfg(target_os = "macos")]
 use yu_assets::ImageKey;
-use yu_core::{LineIndex, Revision, TextRange, Utf16Offset, Utf16Range};
+#[cfg(target_os = "macos")]
+use yu_core::Revision;
+use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
     ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
     AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
-    AccessibilityTextSnapshot, Bias, BlockOrnament, BlockView, CaretAffinity, CaretScrollRequest,
-    CommandResult, EditorCommand, EditorDocumentError, ImageSpan, LayoutConfig, LayoutPoint,
-    OutlineTree, SearchResults, SelectionError, SourceSync, TableResizeCommit, TableResizeGesture,
-    TableResizeGestureError, TableResizeHit, TableResizeTarget, ViewportConfig, ViewportSpan,
-    VisualOffset, VisualText,
+    AccessibilityTextSnapshot, Bias, BlockView, CaretAffinity, CaretScrollRequest, CommandResult,
+    EditorCommand, EditorDocumentError, OutlineTree, SearchResults, SelectionError, SourceSync,
+    TableResizeCommit, TableResizeGesture, TableResizeGestureError, TableResizeHit,
+    TableResizeTarget, VisualOffset, VisualText,
+};
+#[cfg(target_os = "macos")]
+use yu_editor::{
+    BlockOrnament, ImageSpan, LayoutConfig, LayoutPoint, ViewportConfig, ViewportSpan,
 };
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
@@ -1743,6 +1749,7 @@ fn source_utf16_range(snapshot: &TextSnapshot, source: TextRange) -> Result<(u64
     Ok((start, end))
 }
 
+#[cfg(target_os = "macos")]
 fn table_resize_hit_metadata(
     revision: u64,
     block_index: u64,
@@ -1767,6 +1774,7 @@ fn table_resize_hit_metadata(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn table_resize_accessibility_metadata(
     snapshot: &TextSnapshot,
     revision: u64,
@@ -1856,6 +1864,7 @@ fn table_resize_commit_metadata(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn begin_table_resize_session(
     session: &mut YuStorageSession,
     block_index: usize,
@@ -1879,6 +1888,7 @@ fn begin_table_resize_session(
     Ok(metadata)
 }
 
+#[cfg(target_os = "macos")]
 fn block_caret_from_layout(
     session: &DocumentEditorSession,
     block_index: usize,
@@ -2002,6 +2012,7 @@ fn core_text_system_ui_layout(
     Ok((shaper, metrics, config))
 }
 
+#[cfg(target_os = "macos")]
 fn caret_scroll_request_metadata(
     session: &DocumentEditorSession,
     request: CaretScrollRequest,
@@ -2144,6 +2155,7 @@ fn composition_projection_metadata(
     Ok((metadata, projected))
 }
 
+#[cfg(target_os = "macos")]
 fn composition_active_visual_caret(
     projection: &VisualText,
     selection_start_utf16: u64,
@@ -2437,7 +2449,7 @@ pub unsafe extern "C" fn yu_storage_session_move_vertical(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (session, expected_revision, command, size, max_width);
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -3051,7 +3063,7 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
             size,
             max_width,
         );
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -3254,7 +3266,7 @@ pub unsafe extern "C" fn yu_storage_session_composition_shaped_caret(
             size,
             max_width,
         );
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -3529,7 +3541,7 @@ pub unsafe extern "C" fn yu_storage_session_task_checkbox_hit_test(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (session, expected_revision, point_x, point_y);
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -3648,7 +3660,7 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_at_point(
             tolerance,
             pointer_position,
         );
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -3871,7 +3883,7 @@ pub unsafe extern "C" fn yu_storage_session_source_caret(
             size,
             max_width,
         );
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -3938,7 +3950,7 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_accessibility_dividers(
             dividers,
             capacity,
         );
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -4056,6 +4068,7 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_accessibility_dividers(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn image_utf16_range(source: &TextSnapshot, range: Option<TextRange>) -> Result<(u64, u64), i32> {
     let Some(range) = range else {
         return Ok((
@@ -4786,8 +4799,9 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
             scroll_y,
             viewport_height,
             surface_generation,
+            appearance,
         );
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -4872,9 +4886,10 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             surface_width,
             surface_height,
             scale,
+            appearance,
             view,
         );
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -5069,8 +5084,8 @@ pub unsafe extern "C" fn yu_storage_session_frame_is_current(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (session, geometry);
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        let _ = (session, geometry, appearance);
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]
@@ -5103,6 +5118,9 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
     let Some(session) = (unsafe { session.as_mut() }) else {
         return YU_STORAGE_NULL_POINTER;
     };
+    // 句柄仍然要校验（null 是错误），但非 macOS 上没有 render host 可解绑。
+    #[cfg(not(target_os = "macos"))]
+    let _ = session;
     #[cfg(target_os = "macos")]
     if let Some(state) = session.macos_render_host.as_mut() {
         state.surface.take();
@@ -5148,7 +5166,7 @@ pub unsafe extern "C" fn yu_storage_session_shaped_caret_scroll_request(
             scroll_y,
             viewport_height,
         );
-        return YU_STORAGE_SHAPER_UNAVAILABLE;
+        YU_STORAGE_SHAPER_UNAVAILABLE
     }
 
     #[cfg(target_os = "macos")]

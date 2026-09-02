@@ -33,7 +33,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # 允许定义几何原语的地方。
-CORE = Path("crates/yu-core/src/geometry.rs")
+# 与 rust_files() 一样用 `/` 分隔的仓库相对路径字符串，不用 Path——
+# 判据里一旦出现路径分隔符，它就不再是平台中立的。
+CORE = "crates/yu-core/src/geometry.rs"
 
 # 登记在册的例外。key 是 `文件:结构体名`，value 必须说清它是什么单位——
 # 说不出来就说明这个结构体自己也不知道自己是什么，那正是要拦的东西。
@@ -66,15 +68,23 @@ STRUCT = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)")
 FIELD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:\s*f32\s*,")
 
 
-def rust_files() -> list[Path]:
-    found: list[Path] = []
+def rust_files() -> list[str]:
+    """仓库相对路径，**一律用 `/` 分隔**。
+
+    例外表里的键是手写的 `crates/yu-render/src/backend.rs:DamageRect`，而
+    `PurePath` 在 Windows 上打印成 `crates\\yu-render\\...`——于是每一条登记
+    的例外都查不到，CI 的 windows job 报出 7 条「新违规」加 2 条「登记了却不
+    存在」。**判据里出现路径分隔符时它就不是平台中立的**，这是这个仓库第一次
+    踩到。
+    """
+    found: list[str] = []
     for base in ("crates", "platform", "tools"):
         for path in sorted((ROOT / base).rglob("*.rs")):
-            found.append(path.relative_to(ROOT))
+            found.append(path.relative_to(ROOT).as_posix())
     return found
 
 
-def scan(path: Path) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+def scan(path: str) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     """返回 (散装四元组, 重名几何类型)。"""
     quadruples: list[tuple[int, str]] = []
     reserved: list[tuple[int, str]] = []
