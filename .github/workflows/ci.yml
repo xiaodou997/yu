@@ -17,6 +17,14 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    # Windows runner 的 Python 默认按系统代码页（cp1252）读写，而这个仓库的
+    # 门禁脚本连同它们印出来的字都是中文的：先是 read_text 解码崩，改成显式
+    # encoding 之后换成 print 编码崩。PEP 540 的 UTF-8 模式一次解决两头。
+    #
+    # 脚本里那些显式的 encoding="utf-8" 留着，两者不冲突：这里管的是这个
+    # runner 的默认值，那里管的是脚本自己在任何机器上都成立。
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
