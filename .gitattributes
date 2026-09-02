@@ -1,0 +1,24 @@
+# 行尾归一化：**仓库里与工作树里都用 LF**。
+#
+# 起因是一条真实的 CI 红：Windows runner 的 checkout 默认按 `core.autocrlf`
+# 把文本转成 CRLF，于是 `cargo fmt --all --check` 对**每一个** `.rs` 文件报
+# `Incorrect newline style`——代码一个字节没错，格式检查却全红。
+#
+# 它躲了很久才被看见：这个矩阵的 windows job 此前每次都被别的 job 的失败
+# fail-fast 连坐取消，一步都没跑到过。
+#
+# `eol=lf` 比 `text=auto` 单独用更强：后者只保证**仓库里**是 LF，签出时仍然
+# 按平台转；前者要求工作树里也是 LF。rustfmt 检查的是工作树。
+* text=auto eol=lf
+
+# 二进制：一个字节都不许动。截图比对的判据是逐字节相等（见交接稿「工具」），
+# 任何行尾转换都会让它变成一堆假差异。
+*.png binary
+*.bmp binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
