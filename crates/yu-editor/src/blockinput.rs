@@ -184,12 +184,55 @@ impl BlockQuoteOrnament {
     }
 }
 
+/// 分隔线画的那条横线。
+///
+/// 与 [`BlockQuoteOrnament`] 同一个形状，理由也同一条：块高要等布局排完才
+/// 知道，所以这里只留参数，矩形由 [`ThematicBreakOrnament::bounds`] 现算。
+///
+/// **它在不在这里，等于线画不画。** `yu-markdown` 只在块没有焦点时才产出
+/// `BlockOrnament::ThematicBreak`（光标进来时 `---` 要露出来给人改，线再画
+/// 上去就成了删除线），所以焦点块的这个字段是 `None`。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThematicBreakOrnament {
+    source: TextRange,
+    x: f32,
+    width: f32,
+    thickness: f32,
+}
+
+impl ThematicBreakOrnament {
+    #[must_use]
+    pub const fn source(self) -> TextRange {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn thickness(self) -> f32 {
+        self.thickness
+    }
+
+    /// 横线的矩形，竖直方向居中于块高。
+    ///
+    /// 居中而不是贴着上沿或下沿：这一块的视觉文本只剩一个换行符，画出来就是
+    /// 一个空行，线贴边的话会紧挨着上一块或下一块的文字，看上去像那一块的
+    /// 下划线。
+    ///
+    /// # Errors
+    ///
+    /// 几何参数不合法（宽或高非有限）。
+    pub fn bounds(self, height: f32) -> Result<LayoutRect, LayoutError> {
+        let y = ((height - self.thickness) * 0.5).max(0.0);
+        Ok(LayoutRect::new(self.x, y, self.width, self.thickness)?)
+    }
+}
+
 /// 一个块上「长什么样」的那部分装饰。布局层看不见它们。
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BlockOrnaments {
     heading: Option<HeadingOrnament>,
     marker: Option<MarkerOrnament>,
     quote: Option<BlockQuoteOrnament>,
+    rule: Option<ThematicBreakOrnament>,
 }
 
 impl BlockOrnaments {
@@ -206,6 +249,12 @@ impl BlockOrnaments {
     #[must_use]
     pub const fn quote(&self) -> Option<BlockQuoteOrnament> {
         self.quote
+    }
+
+    /// 分隔线那条横线。不是分隔线、或者光标正落在这一块里，都是 `None`。
+    #[must_use]
+    pub const fn rule(&self) -> Option<ThematicBreakOrnament> {
+        self.rule
     }
 }
 
@@ -517,6 +566,40 @@ fn block_quote_metrics(depth: u8, config: LayoutConfig) -> Result<BlockQuoteMetr
     })
 }
 
+/// 分隔线那条横线有多粗：一个逻辑像素。
+///
+/// **不跟着行高缩放**，与引用竖条（`line_height * 0.12`）走的是两条路。竖条
+/// 标示一整段引文的范围，是那段文字的一部分，跟着它一起大；横线是一道界线，
+/// 与表格网格线（`yu_workspace::viewport_table_style` 的 `border_width`）同类
+/// ——界线的粗细是一个常数，跟字号一起长会变成一条黑杠。
+///
+/// **它是一个整数，这一点有用**：后端画的是「这个矩形覆盖到的物理像素」，
+/// 非整数的粗细会让同一条线在不同的纵坐标零头上占不同的像素行数。对齐那一半
+/// 在 `yu-workspace`（那里才有绝对坐标），这一半在这里。
+const THEMATIC_BREAK_THICKNESS: f32 = 1.0;
+
+/// 分隔线那条横线的几何。
+///
+/// 宽度是**正文那一栏**减掉这一块自己的缩进，不是视口宽度——后者会让线比正文
+/// 长出一截，右边悬空。今天分隔线不会出现在容器里（`indent` 恒为 0），减这一
+/// 下是为了「块的边界由树定」之后它跟着正文走，而不是那时才发现算错了。
+fn thematic_break_metrics(
+    source: TextRange,
+    indent: f32,
+    config: LayoutConfig,
+) -> Result<ThematicBreakOrnament, LayoutError> {
+    let width = config.max_width() - indent;
+    if !width.is_finite() || width <= 0.0 {
+        return Err(LayoutError::InvalidMetrics(width.to_bits()));
+    }
+    Ok(ThematicBreakOrnament {
+        source,
+        x: indent,
+        width,
+        thickness: THEMATIC_BREAK_THICKNESS,
+    })
+}
+
 /// 从 [`BlockDecorations`] 读出来的中间件。
 ///
 /// 它只负责「装饰说了什么」：视觉文本、样式段、三种装饰的**语义值**。
@@ -535,6 +618,9 @@ struct DecorationDraft {
     /// 这一块的正文往右让多少列。列表项与任务项都有，标记只有列表项有。
     indent_columns: u8,
     marker: Option<MarkerOrnamentSource>,
+    /// 这一块要画一条分隔线。**没有负载**：`BlockOrnament::ThematicBreak`
+    /// 不带拼法也不带几何，画在哪由 [`DecorationDraft::assemble`] 现算。
+    rule: bool,
 }
 
 /// 列表标记的语义值，还没量过宽度。
@@ -613,6 +699,7 @@ impl DecorationDraft {
         let mut quote = None;
         let mut indent_columns = 0_u8;
         let mut marker = None;
+        let mut rule = false;
         for (_, ornament) in decorations.line_ornaments() {
             match ornament {
                 BlockOrnament::Heading { level } => heading = Some(*level),
@@ -624,6 +711,10 @@ impl DecorationDraft {
                         text: found.text().to_owned(),
                     });
                 }
+                // 分隔线**不改变排版**：它那一块的视觉文本只剩一个换行符，
+                // 排出来是一个空行，线画在那一行里。所以它进的是 ornaments，
+                // 一个字节都不进 `LayoutInput`。
+                BlockOrnament::ThematicBreak => rule = true,
                 // 表格的网格不进文字流的排版输入：`TableLayout` 另算一遍
                 // 几何，再把排好的簇搬进单元格。围栏代码块的语言名与正文
                 // 也不进：它们是给嵌入渲染（KaTeX / Mermaid）看的语义，
@@ -643,6 +734,7 @@ impl DecorationDraft {
             quote,
             indent_columns,
             marker,
+            rule,
         })
     }
 
@@ -668,6 +760,10 @@ impl DecorationDraft {
             .as_ref()
             .map_or(0.0, |marker| marker.advance + config.default_advance());
         let indent = quote_gutter + column_gutter + marker_gutter;
+        let rule = self
+            .rule
+            .then(|| thematic_break_metrics(self.source_range, indent, config))
+            .transpose()?;
 
         let visual_len =
             VisualOffset::try_from(self.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
@@ -734,6 +830,7 @@ impl DecorationDraft {
                     unit: quote.unit,
                     bar_width: quote.bar_width,
                 }),
+                rule,
             },
         })
     }

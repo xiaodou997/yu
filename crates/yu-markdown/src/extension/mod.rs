@@ -54,6 +54,7 @@ mod emphasis;
 mod fenced_code;
 pub(crate) mod heading;
 mod image;
+mod indented_code;
 mod line_break;
 mod link;
 mod list;
@@ -61,6 +62,7 @@ mod quote;
 mod syntax;
 mod table;
 mod task;
+mod thematic_break;
 
 pub use syntax::{DelimitedSpan, SyntaxNode};
 
@@ -334,6 +336,16 @@ pub enum BlockOrnament {
         /// 围栏之间的正文。
         content: TextRange,
     },
+    /// `---` / `***` / `___` 要画的那条横线。
+    ///
+    /// **不带拼法**，与 `BlockKind::ThematicBreak` 同一条规矩：三种写法画出来
+    /// 是同一条线。**也不带几何**——粗细、多长、什么颜色要 `LayoutConfig` 与
+    /// 主题，那是上面两层的事。
+    ///
+    /// 它**只在这个块没有焦点时产出**，与那三个字符被藏起来是同一个条件的两
+    /// 面：光标落进来时用户要看得见自己写的 `---`，而那一行既画着线又写着字
+    /// 就成了一条删除线。理由写在 `extension/thematic_break.rs` 的模块文档里。
+    ThematicBreak,
 }
 
 impl BlockOrnament {
@@ -353,6 +365,7 @@ impl BlockOrnament {
                 info: shift_range(info, delta)?,
                 content: shift_range(content, delta)?,
             },
+            Self::ThematicBreak => Self::ThematicBreak,
         })
     }
 }
@@ -899,6 +912,8 @@ impl ExtensionSet {
                 Box::new(list::List),
                 Box::new(task::Task),
                 Box::new(fenced_code::FencedCode::default()),
+                Box::new(indented_code::IndentedCode),
+                Box::new(thematic_break::ThematicBreak),
                 Box::new(table::Table),
                 Box::new(emphasis::Emphasis),
                 Box::new(code_span::CodeSpan),

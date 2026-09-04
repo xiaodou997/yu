@@ -35,7 +35,7 @@ pub use accessibility::{
 };
 pub use blockinput::{
     BlockLayoutInput, BlockLineStyleTable, BlockOrnaments, BlockQuoteOrnament, BlockStyleTable,
-    HeadingOrnament, MarkerOrnament,
+    HeadingOrnament, MarkerOrnament, ThematicBreakOrnament,
 };
 pub use blockview::{BlockCaret, BlockCluster, BlockGlyph, BlockHit, BlockLine, BlockView};
 pub use command::{CommandResult, EditorCommand, KeyRouteResult, SourceChange, SourceSync};

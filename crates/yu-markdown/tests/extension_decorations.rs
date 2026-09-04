@@ -11,7 +11,7 @@
 //!    内，且 < 200 行」。这里真的加一种，看它需不需要动别的地方。
 
 use yu_core::{ByteOffset, StyleId, TextAttrs, TextRange, TextStyle, WidgetId, WidgetSide};
-use yu_decoration::LineStyleId;
+use yu_decoration::{Decoration, LineStyleId};
 use yu_markdown::{
     BlockContext, BlockDecorations, BlockOrnament, BlockWidget, DelimitedSpan, Extension,
     ExtensionOutput, ExtensionSet, ImageSpan, parse,
@@ -77,6 +77,35 @@ fn indent_of(decorations: &BlockDecorations) -> Option<u8> {
             BlockOrnament::Indent { columns } => Some(*columns),
             _ => None,
         })
+}
+
+/// 这个块带不带一条分隔线装饰。
+///
+/// 按变体找，理由与 [`marker_of`] 那一条相同。
+fn has_rule(decorations: &BlockDecorations) -> bool {
+    decorations
+        .line_ornaments()
+        .iter()
+        .any(|(_, ornament)| matches!(ornament, BlockOrnament::ThematicBreak))
+}
+
+/// 这个块上排等宽的那几段 source。
+///
+/// 判据取的是 Mark 指向的**字型**，不是 `BlockKind`——「这一块是代码」与
+/// 「这些字节排等宽」是两件事，后者才是画出来的那一件。
+fn code_marks(decorations: &BlockDecorations) -> Vec<(u64, u64)> {
+    decorations
+        .set()
+        .all()
+        .iter()
+        .filter_map(|entry| match entry.decoration {
+            Decoration::Mark { style } => decorations
+                .attrs(style)
+                .filter(|attrs| attrs.style() == TextStyle::Code)
+                .map(|_| (entry.range.start().get(), entry.range.end().get())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 这个块上被隐藏的 source 区间，升序去重。
@@ -1163,6 +1192,131 @@ fn a_table_does_not_reveal_its_pipes_under_the_caret() {
     assert_eq!(hidden(&focused), hidden(&unfocused));
 }
 
+// ---------------------------------------------------------------- 分隔线与缩进代码
+
+/// `---` 的三个字符不进视觉文本，块上带一条分隔线装饰。
+///
+/// **行尾那个换行符留着。** 藏掉整块的话视觉文本是空的，而块高由排版从视觉
+/// 文本算；留下 `\n` 之后这一块与一个空行逐字节同形（`BlankLine` 块的视觉
+/// 文本就是 `"\n"`），高度是一行，线画在那一行的正中。
+#[test]
+fn a_thematic_break_hides_its_characters_and_carries_a_rule() {
+    let decorations = decorate("---\n", None);
+    assert_eq!(hidden(&decorations), vec![(0, 3)]);
+    assert!(has_rule(&decorations), "分隔线块必须带上那条横线");
+}
+
+/// 三种拼法产出的是同一条装饰。
+///
+/// 与 ATX 和 Setext 落在同一个 `BlockKind::Heading` 是同一条规矩：**拼法不进
+/// 语义**。少了这条用例，「按写法分成三个变体」这种错法一条断言都不会红——
+/// 三种照样画得出线，只是下游多了两个它不关心的分支。
+#[test]
+fn three_spellings_of_a_thematic_break_produce_the_same_ornament() {
+    for source in ["---\n", "***\n", "___\n"] {
+        let decorations = decorate(source, None);
+        assert_eq!(hidden(&decorations), vec![(0, 3)], "{source:?}");
+        assert_eq!(
+            decorations.line_styles(),
+            [BlockOrnament::ThematicBreak],
+            "{source:?}"
+        );
+    }
+}
+
+/// 光标进这一块：`---` 露出来，线不画。
+///
+/// **只做一半都是缺陷。** 只露源码不撤线，那条线正好穿过三个减号，画面上是
+/// 一条删除线；只撤线不露源码，用户按退格会删掉一个他看不见的字符（与
+/// `heading.rs` 露出 `#` 同一条理由）。所以两样由同一个条件带着走。
+#[test]
+fn a_focused_thematic_break_shows_its_source_and_draws_no_rule() {
+    let decorations = decorate("---\n", Some(range(1, 1)));
+    assert!(hidden(&decorations).is_empty(), "焦点块要露出那三个减号");
+    assert!(!has_rule(&decorations), "露着源码就不该再画线");
+}
+
+/// Setext 标题下面那一行 `---` 不是分隔线。
+///
+/// 两者在源码上一模一样，分得开它们的只有树：`标题\n---\n` 整块是一个
+/// `SetextHeading2`，那三个减号是它的 `HeaderMark`。这条挡的是「自己扫一遍
+/// 文本找 `^---$`」那种实现——那种写法会把每一个二级标题的下划线藏掉**再画
+/// 一条线**，而 heading 那一侧的断言全绿。
+#[test]
+fn a_setext_underline_is_not_a_thematic_break() {
+    let decorations = decorate("标题\n---\n", None);
+    assert!(!has_rule(&decorations), "Setext 的下划线不是分隔线");
+    assert_eq!(
+        decorations.line_styles(),
+        [BlockOrnament::Heading { level: 2 }]
+    );
+}
+
+/// 块里有一个 `HorizontalRule` 节点，不等于这个块是分隔线。
+///
+/// **这条钉的是定义域。** `- a\n***\n` 在行扫描器眼里是**一个**块，在树里是
+/// `BulletList` 加一个 `HorizontalRule`，谁也装不下它，于是 `classify` 退回
+/// `Paragraph`（按源码原样画，不变量 I5）。而 [`BlockContext::block_node`] 在
+/// 块自己的节点对不上时会**往块内找**——所以不问 `BlockKind` 直接问节点的话，
+/// 这一块会被藏掉正中间那三个星号，再横着画一条线穿过整块。
+///
+/// 上面那条 Setext 用例挡不住这种写法（Setext 块里根本没有 `HorizontalRule`
+/// 节点），这一条才挡得住。
+#[test]
+fn a_rule_node_inside_a_paragraph_block_is_not_a_thematic_break() {
+    let decorations = decorate("- a\n***\n", None);
+    assert!(
+        !has_rule(&decorations),
+        "退回 Paragraph 的块不该画线，哪怕它里面有一个 HorizontalRule 节点"
+    );
+    assert!(
+        hidden(&decorations)
+            .iter()
+            .all(|(from, to)| !(*from == 4 && *to == 7)),
+        "那三个星号不该被藏起来：{:?}",
+        hidden(&decorations)
+    );
+}
+
+/// 缩进代码块整块排等宽。
+///
+/// 区间是**整个块**，包括行首那四个空格与行尾的换行符，与围栏那一条
+/// （`fenced_code.rs` 里的 `out.mark(cx.range(), ..)`）同一个形状。四个空格
+/// 留在画面上，理由写在 `indented_code.rs` 的模块文档里。
+#[test]
+fn an_indented_code_block_is_monospaced_across_its_whole_block() {
+    assert_eq!(code_marks(&decorate("    code\n", None)), vec![(0, 9)]);
+    assert_eq!(code_marks(&decorate("\tcode\n", None)), vec![(0, 6)]);
+}
+
+/// 缩进代码块里的 `*` 不当强调解析。
+///
+/// 这件事**不需要任何人判断**：树里 `CodeBlock` 的内容是一个 `CodeText`
+/// 叶子，遍历不到就产不出装饰——与围栏那一条是同一句话。少了这条用例，
+/// 「等宽字体里静静少掉两个星号」这种错法没有人看着。
+#[test]
+fn an_indented_code_block_does_not_hide_inline_markers() {
+    assert!(hidden(&decorate("    a *b* c\n", None)).is_empty());
+}
+
+/// 跨了空行的缩进代码块**不排等宽**，这是现状，也是那条规则在起作用。
+///
+/// `    a\n\n    b\n` 在行扫描器眼里是三块、在树里是一个 `CodeBlock`，三块谁
+/// 也不完整，于是 `classify` 全部退回 `Paragraph`（「叶子节点横跨块边界即
+/// 片段」）。认领半个代码块会画出三段各排一半的代码。**要改的是块的边界，
+/// 不是这个 extension**——那件事登记在闸门后面。
+#[test]
+fn an_indented_code_block_that_spans_a_blank_line_stays_plain() {
+    let blocks = decorate_every_block("    a\n\n    b\n");
+    assert_eq!(blocks.len(), 3, "行扫描器把它切成三块");
+    for (range, decorations) in &blocks {
+        assert!(
+            code_marks(decorations).is_empty(),
+            "{range:?}：三块都退回了 Paragraph，一块都不该排等宽"
+        );
+    }
+}
+
 // ---------------------------------------------------------------- 语料扫一遍
 
 /// `extension_parity.rs` 的 48 份语料，原样搬过来。
@@ -1232,6 +1386,13 @@ const CORPUS: &[&str] = &[
     "a | b\n--- | ---\n1 | 2",
     "- 外\n  - 内\n",
     "- 外\n  - [x] 内\n",
+    "---\n",
+    "***\n",
+    "___\n",
+    "  ***\n",
+    "- a\n***\n",
+    "- ***\n",
+    "段落\n\n---\n\n段落\n",
     "",
 ];
 
@@ -1305,6 +1466,7 @@ fn no_ornament_payload_leaves_its_block_across_the_corpus() {
                     BlockOrnament::Heading { .. }
                     | BlockOrnament::QuoteBar { .. }
                     | BlockOrnament::Indent { .. }
+                    | BlockOrnament::ThematicBreak
                     | BlockOrnament::Table(_) => {}
                 }
             }
