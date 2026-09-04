@@ -94,7 +94,10 @@ impl TaskCheckboxHit {
 #[must_use]
 pub fn viewport_block_background(appearance: Appearance, kind: BlockKind) -> Option<Rgba8> {
     match kind {
-        BlockKind::FencedCodeBlock { .. } => Some(match appearance {
+        // 缩进代码与围栏共用这一块底色，而不是各挑一种。它们是同一种东西的
+        // 两种拼法（`BlockKind` 把它们分成两个变体是为了负载不同，不是为了
+        // 长得不同），两块底色不一样的话，同一份文档里换个写法就换个颜色。
+        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode => Some(match appearance {
             Appearance::Light => Rgba8::new(245, 246, 248, 255),
             Appearance::Dark => Rgba8::new(34, 38, 45, 255),
         }),
@@ -268,6 +271,45 @@ const fn dark_code_role_color(role: TextRole) -> Option<Rgba8> {
         TextRole::Constant => Some(Rgba8::new(121, 192, 255, 255)),
         TextRole::Operator => Some(Rgba8::new(121, 192, 255, 255)),
         TextRole::Punctuation => None,
+    }
+}
+
+/// 把横线对齐到整逻辑像素。
+///
+/// **不这么做的表现是三条线粗细不一样。** 块的纵坐标是一路累加出来的浮点数，
+/// 半个像素的零头很常见；后端画的是「这个矩形覆盖到的物理像素」，于是同一条
+/// 一点宽的线落在 `y = k` 上占 2 个物理像素、落在 `y = k + 0.25` 上占 3 个。
+/// 实测（900×652 逻辑 / 1800×1304 物理）三条只有拼法不同的分隔线各自落在不同
+/// 的零头上，第一条比另外两条**粗 50%**——而「三条线一模一样」正是「拼法不进
+/// 语义」这句话在画面上的样子。一条断言都看不住它，只有真实窗口看得见。
+///
+/// **只有横线做这件事。** 引用竖条与表格网格线有同一个毛病，但这一刀的截图
+/// 判据是「除了分隔线与缩进代码那几行，别的一个像素都不许动」——顺手把它们
+/// 一起对齐会让判据说不清是哪一半动了画面。登记在案。
+///
+/// 它**不是**保证：这里对齐的是文档坐标，滚动位移如果带零头，落到设备上仍然
+/// 带零头。今天的位移由 `ViewportSpan` 给，产品链路上是整数。
+fn snap_rule_to_pixel_grid(rect: Rect) -> Result<Rect, ViewportSceneError> {
+    // 只动纵坐标：粗细已经是整数（`THEMATIC_BREAK_THICKNESS`），横向铺满
+    // 正文栏，两端本来就落在别人定的边界上。
+    Ok(Rect::new(
+        rect.x(),
+        rect.y().round(),
+        rect.width(),
+        rect.height(),
+    )?)
+}
+
+/// 分隔线那条横线的颜色。
+///
+/// 比引用竖条淡一档：竖条标示一整段引文的范围，读者要能一眼看出它管到哪里；
+/// 横线只是一道分隔，画得和正文一样重就喧宾夺主。深色那一份同样不是把浅色
+/// 反相，理由与 [`dark_code_role_color`] 那一条相同。
+#[must_use]
+const fn viewport_thematic_break_color(appearance: Appearance) -> Rgba8 {
+    match appearance {
+        Appearance::Light => Rgba8::new(214, 218, 224, 255),
+        Appearance::Dark => Rgba8::new(70, 76, 86, 255),
     }
 }
 
@@ -1870,6 +1912,27 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 ));
             }
         }
+        // 分隔线那条横线。角色用既有的 `Border`——场景层的词汇是**渲染中立**
+        // 的（overview-v2 §2.1），一条线就是一条线，不管它属于表格、任务框还
+        // 是分隔线。为它新开一个角色就是「一种语法一条全链路」那种泄漏的第一
+        // 步，而后端对两者做的事一模一样：落成一个实心矩形。
+        //
+        // 「这一块是不是分隔线」不问 `BlockKind`，问排出来的装饰——与复选框
+        // 那一条同一个理由：装饰产出了它、排版给了它位置，画的人照着画。光标
+        // 进这一块时 `yu-markdown` 就不产这条装饰了（`---` 要露出来给人改），
+        // 于是「露出源码」与「不画线」由同一个事实带着走，不是两处各判一次。
+        if let Some(rule) = layout.ornaments().rule() {
+            block_ornaments.push(OrnamentPrimitive::new(
+                rule.source(),
+                snap_rule_to_pixel_grid(translate_block_rect(
+                    rule.bounds(layout.height())
+                        .map_err(EditorDocumentError::from)?,
+                    origin,
+                )?)?,
+                viewport_thematic_break_color(appearance),
+                OrnamentRole::Border,
+            ));
+        }
         // 任务框压在文字上面，不是衬在下面。
         //
         // 「这个块有没有复选框」不再问 `BlockKind`，问排出来的盒子——装饰
@@ -2293,6 +2356,164 @@ mod tests {
         };
         assert_eq!(bounds, quote.bounds());
         assert_eq!(color, quote.color());
+    }
+
+    /// 分隔线在这一帧里是一条 source-backed 的横线，横跨正文栏，衬在字形
+    /// 底下。
+    ///
+    /// 三件事一起断，少任何一件都会放过一个真实缺陷：**角色**（用既有的
+    /// `Border` 而不是新开一个——场景层的词汇是渲染中立的）、**几何**（横跨
+    /// 那一栏；只断「有一条 Ornament」的话，一条 1×1 的线也会绿）、
+    /// **source**（指着这一块，选中与命中才认得出它）。
+    #[test]
+    fn thematic_break_lowers_to_a_source_backed_rule_across_the_text_column() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 120.0);
+        let source = "para\n\n---\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("scene frame");
+
+        let primitives = frame.scene().primitives();
+        let rule = primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Ornament(ornament) if ornament.role() == OrnamentRole::Border => {
+                    Some(*ornament)
+                }
+                _ => None,
+            })
+            .expect("分隔线必须在这一帧里");
+        assert_eq!(
+            rule.source(),
+            TextRange::new(ByteOffset::new(6), ByteOffset::new(10)).expect("source range"),
+            "横线指着 `---\n` 那一块"
+        );
+        assert_eq!(
+            rule.color(),
+            viewport_thematic_break_color(Appearance::Light)
+        );
+        assert_eq!(rule.bounds().x(), 0.0);
+        assert_eq!(rule.bounds().width(), 240.0, "横跨正文那一栏");
+        assert!(
+            rule.bounds().height() <= 2.0,
+            "一道分隔，不是一块底色：{:?}",
+            rule.bounds()
+        );
+        // 线在这一块自己的行盒里：块从 y 起，高一行。
+        let block = frame.input().blocks()[2];
+        assert!(
+            rule.bounds().y() > block.y() && rule.bounds().bottom() < block.y() + block.height(),
+            "线要落在分隔线那一块里：{:?} vs {}..{}",
+            rule.bounds(),
+            block.y(),
+            block.y() + block.height()
+        );
+    }
+
+    /// 横线落在整逻辑像素上，不管块的纵坐标带着多少零头。
+    ///
+    /// 这条钉的是「三条只有拼法不同的线画出来一模一样」。它是真实窗口抓出来
+    /// 的：块的 y 是累加出来的浮点数，同一条一点宽的线在 `y = k` 上占 2 个
+    /// 物理像素、在 `y = k + 0.25` 上占 3 个，第一条比另外两条粗 50%。
+    /// 判据写成「零头不同的几个 y 归到同一批整数」，不写死某一个 y——写死的话
+    /// 换个字号这条用例就自己作废了。
+    #[test]
+    fn a_rule_is_snapped_to_whole_pixels_whatever_fraction_its_block_lands_on() {
+        for (y, snapped) in [
+            (100.0_f32, 100.0_f32),
+            (100.25, 100.0),
+            (100.49, 100.0),
+            (100.5, 101.0),
+            (100.75, 101.0),
+        ] {
+            let rect = snap_rule_to_pixel_grid(Rect::new(0.0, y, 240.0, 1.0).expect("rule rect"))
+                .expect("snap");
+            assert_eq!(rect.y(), snapped, "y = {y}");
+            assert_eq!(rect.height(), 1.0, "粗细不该被对齐动过");
+            assert_eq!(rect.x(), 0.0);
+            assert_eq!(rect.width(), 240.0);
+        }
+    }
+
+    /// 缩进代码块与围栏共用同一块底色。
+    ///
+    /// 两块底色一旦各挑一种，同一份文档里换个写法就换个颜色——而它们是同一
+    /// 种东西的两种拼法。判据取的是**场景层实际发出的那一帧**里那块 fill，
+    /// 不是配置里存了什么。
+    #[test]
+    fn an_indented_code_block_shares_the_fenced_code_background() {
+        assert_eq!(
+            viewport_block_background(Appearance::Light, BlockKind::IndentedCode),
+            viewport_block_background(
+                Appearance::Light,
+                BlockKind::FencedCodeBlock {
+                    marker: '`',
+                    closed: true,
+                },
+            ),
+        );
+        assert_eq!(
+            viewport_block_background(Appearance::Dark, BlockKind::IndentedCode),
+            viewport_block_background(
+                Appearance::Dark,
+                BlockKind::FencedCodeBlock {
+                    marker: '`',
+                    closed: true,
+                },
+            ),
+        );
+
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 160.0);
+        let mut document = EditorDocument::new("para\n\n    code\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("scene frame");
+
+        let background = viewport_block_background(Appearance::Light, BlockKind::IndentedCode)
+            .expect("缩进代码块有底色");
+        // 第一个 `FillRect` 是整帧背景（不变量 I5），代码块那一块排在它后面。
+        assert!(
+            frame.scene().primitives().iter().any(|primitive| matches!(
+                primitive,
+                Primitive::FillRect { color, .. } if *color == background
+            )),
+            "缩进代码块的底色必须真的进了这一帧"
+        );
     }
 
     #[test]

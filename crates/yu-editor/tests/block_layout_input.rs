@@ -23,7 +23,7 @@
 //!   外层加粗——这两条差分时期就是单独写的，因为「两边一起错」也会绿。
 
 use yu_core::{ClusterMetrics, StyleId, TextAttrs, TextStyle};
-use yu_editor::{BlockLayoutInput, BlockOrnaments, VisualText};
+use yu_editor::{BlockLayoutInput, BlockOrnaments, ThematicBreakOrnament, VisualText};
 use yu_layout::{LayoutConfig, LineStyleTable, StyleTable};
 use yu_markdown::{ExtensionSet, parse};
 use yu_syntax::parse as parse_syntax;
@@ -55,9 +55,16 @@ struct Derived {
     quote: Option<u8>,
     /// （标记文本，画在哪，占多宽）。
     marker: Option<(String, f32, f32)>,
+    /// 分隔线那条横线。不是分隔线就是 `None`。
+    rule: Option<ThematicBreakOrnament>,
 }
 
-type Ornaments = (Option<u8>, Option<u8>, Option<(String, f32, f32)>);
+type Ornaments = (
+    Option<u8>,
+    Option<u8>,
+    Option<(String, f32, f32)>,
+    Option<ThematicBreakOrnament>,
+);
 
 fn ornaments_of(ornaments: &BlockOrnaments) -> Ornaments {
     (
@@ -66,6 +73,7 @@ fn ornaments_of(ornaments: &BlockOrnaments) -> Ornaments {
         ornaments
             .marker()
             .map(|marker| (marker.text().to_owned(), marker.x(), marker.advance())),
+        ornaments.rule(),
     )
 }
 
@@ -89,7 +97,7 @@ fn describe(input: &BlockLayoutInput) -> Derived {
         .line_styles()
         .attrs(yu_core::LineStyleId(0))
         .expect("整块共用的那一段行级样式");
-    let (heading, quote, marker) = ornaments_of(input.ornaments());
+    let (heading, quote, marker, rule) = ornaments_of(input.ornaments());
     Derived {
         text: input.text().to_owned(),
         runs,
@@ -98,6 +106,7 @@ fn describe(input: &BlockLayoutInput) -> Derived {
         heading,
         quote,
         marker,
+        rule,
     }
 }
 
@@ -189,6 +198,7 @@ const DOCUMENTS: &[&str] = &[
     "<http://a.com/*b*>",
     "行尾硬换行  \n第二行",
     "a | b\n--- | ---\n1 | 2",
+    "---\n",
 ];
 
 /// 视觉文本恰好是源码减去被隐藏的字节。
@@ -307,6 +317,73 @@ fn a_nested_task_item_is_indented_like_a_nested_list_item() {
         nested_task.indent, bullet_x,
         "任务项的正文从普通列表项画 `•` 的那一列起，同一层看上去才对齐"
     );
+}
+
+/// 分隔线：横线横跨正文那一栏，竖直居中于块高。
+///
+/// **三个数各自说一件事，写死它们是有意的。** 常数没有断言就等于没有约定
+/// （第十刀学到的那一条）：x 写错线会悬空、宽度写错线会比正文长出一截、
+/// 居中改成贴边线会紧挨着上一块的文字看上去像那一块的下划线——三种错法都
+/// 不 panic、不报错，只有画面上看得见。
+///
+/// `LayoutConfig::new(400.0, 10.0)`：正文栏宽 400，行高 10，于是粗细是
+/// `clamp(10 × 0.06, 1, 2) = 1`。
+#[test]
+fn a_thematic_break_draws_a_centered_rule_across_the_text_column() {
+    let (derived, _, _) = derive("---\n", 0).expect("派生");
+    let rule = derived.rule.expect("分隔线块要带上那条横线");
+    assert_eq!(rule.thickness(), 1.0);
+
+    let bounds = rule.bounds(10.0).expect("矩形");
+    assert_eq!(bounds.x(), 0.0, "线从正文那一栏的左沿起");
+    assert_eq!(bounds.width(), 400.0, "横跨整栏");
+    assert_eq!(bounds.height(), 1.0);
+    assert_eq!(bounds.y(), 4.5, "竖直居中于块高");
+}
+
+/// 分隔线不改变排版：它那一块排出来就是一个空行。
+///
+/// 线是**装饰**，一个字节都不进 `LayoutInput`。这条钉住的是那句话的下半段
+/// ——把线做成一段占位文字也能画出来，代价是光标能走进一个 source 里没有的
+/// 位置。
+#[test]
+fn a_thematic_break_lays_out_as_a_blank_line() {
+    let (derived, input, _) = derive("---\n", 0).expect("派生");
+    assert_eq!(derived.text, "\n", "三个减号不进视觉文本，换行符留着");
+    assert_eq!(derived.indent, 0.0);
+    assert!(input.layout_input().widgets().is_empty());
+}
+
+/// 光标进这一块，线就没了。
+///
+/// `derive` 一律不给焦点，所以这一条自己造一个焦点块。它压的是「露出源码」
+/// 与「不画线」由**同一个事实**带着走：`yu-markdown` 不产那条装饰，这一层
+/// 自然就没有可画的东西，不需要在这里再判一次焦点。
+#[test]
+fn a_focused_thematic_break_carries_no_rule() {
+    let config = LayoutConfig::new(400.0, 10.0);
+    let buffer = TextBuffer::new("---\n".to_owned());
+    let snapshot = buffer.snapshot();
+    let document = parse(&snapshot);
+    let tree = parse_syntax(&snapshot).expect("测试文档很短").into_tree();
+    let block = document.blocks().get(0).expect("一个块");
+    let active = yu_core::TextRange::new(yu_core::ByteOffset::new(1), yu_core::ByteOffset::new(1))
+        .expect("空区间");
+    let decorations = ExtensionSet::markdown()
+        .decorate(
+            &snapshot,
+            &tree,
+            document.reference_definitions(),
+            block,
+            Some(active),
+        )
+        .expect("装饰产出不该失败");
+    let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("视觉文本");
+    let input = BlockLayoutInput::from_decorations(&decorations, &visual, config, &StyleSensitive)
+        .expect("从装饰派生");
+    assert_eq!(input.text(), "---\n", "焦点块按源码排");
+    assert!(input.ornaments().rule().is_none(), "露着源码就不画线");
 }
 
 /// 标记与正文之间空一列。
