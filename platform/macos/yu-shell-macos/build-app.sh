@@ -17,7 +17,9 @@ app_dir="$shell_dir/.build/Yu.app"
 contents_dir="$app_dir/Contents"
 
 mkdir -p "$contents_dir/MacOS"
+mkdir -p "$contents_dir/Resources"
 cp "$binary_dir/Yu" "$contents_dir/MacOS/Yu"
 cp "$shell_dir/AppBundle/Info.plist" "$contents_dir/Info.plist"
+cp -R "$shell_dir/AppBundle/Resources/." "$contents_dir/Resources/"
 codesign --force --sign - "$app_dir" >&2
 print -r -- "$app_dir"

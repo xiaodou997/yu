@@ -335,3 +335,13 @@ Revision 且恢复原文；Rust `CompositionOverlay` 是唯一 transient source/
 无路径启动时会弹出文件选择器。窗口中的 `DocumentTextView` 可以接收普通字符和系统
 `NSTextInputClient` marked text，但它只是 Rust canonical source 的可丢弃镜像，不拥有独立
 source、dirty 或 history。
+
+## 品牌与图片资源
+
+品牌素材统一放在 `Assets/branding/`，保留主标 SVG/1024px PNG 和 16/24/32/64px
+光学修正版。`AppBundle/Resources/Yu.png` 使用主标 1024px 透明 PNG，并由
+`AppBundle/Info.plist` 的 `CFBundleIconFile` 接入生成的 `Yu.app`，因此 Finder、Dock
+和 Launchpad 会显示 Yu 标志。
+
+`Fixtures/assets/yu-logo.png` 与 `Fixtures/assets/yu-mark.png` 分别使用主标和 64px
+光学修正版，供 `render-images.md` / `render-images-plan.md` 的图片资源测试使用。
