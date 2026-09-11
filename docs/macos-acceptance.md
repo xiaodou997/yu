@@ -200,7 +200,9 @@ GPU submit/complete 各 14 次，`worker_fallback` 为 0。这不是 Instruments
 
 ### 后续长文档与延迟资源自动验证
 
-新增可重复的真实窗口回归入口和 Instruments 模式。延迟资源通知、pending
-retained reuse、窗口关闭/重开通过；324 KB 长文档的末行导航失败，CPU 采样也
-确认辅助功能分隔条查询仍会在主线程排版。具体复现、硬件与数据见
-[macOS 自动窗口回归记录](macos-render-regression.md)。这些发现不计为性能验收通过。
+新增可重复的真实窗口回归入口和 Instruments 模式。首次检查中，延迟资源通知、
+pending retained reuse、窗口关闭/重开通过，324 KB 长文档的末行导航失败。
+后续已修复高度状态传递、缩放几何同步和导航跟随实测高度，长文档与资源窗口
+回归均通过。CPU 采样发现的主线程辅助功能排版成本仍待后续优化。具体复现、
+硬件与修复后的证据见 [macOS 自动窗口回归记录](macos-render-regression.md)。
+这些通过项不等于连续触控板性能或完整人工验收通过。

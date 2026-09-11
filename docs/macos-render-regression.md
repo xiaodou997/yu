@@ -1,5 +1,8 @@
 # macOS 自动窗口回归与性能采样
 
+当前状态：下文首次发现的长文档末行问题已修复，最终窗口回归通过。
+历史失败与 Instruments 数据仍保留，修复后的结果见文末；连续触控板性能尚未验收。
+
 ## 运行入口
 
 在正常 macOS 图形会话中运行，使用 Xcode 与本仓库的 debug app：
@@ -100,3 +103,45 @@ Instruments CPU 采样中，主线程共约 16.271s 样本权重，
 新增入口后的基线检查：app 构建成功，原有 Dark Aqua 真实窗口 self-check 通过；
 `yu-render-macos` 10 项通过、2 项原有 ignored，metrics 统计测试 3 项通过。
 这里的通过不覆盖上表明确失败的长文档末行用例。
+
+## 布局一致性修复后的复测
+
+最终证据保存在 `.notes/macos-layout-consistency-20260911-accepted/`，硬件、
+macOS 和 Xcode 与上文相同，2x / 60Hz。长文档和资源场景均以退出码 0 结束。
+
+此次修复包含：
+
+1. `EditorRenderSnapshot` 携带已测量的 viewport 块高度，后台不再从默认估算
+   重新开始。publication 返回自己的高度状态，主线程在接收验证通过后采用；
+   不共享可变 EditorDocument，也不接收 worker 中带字体 face ID 的 layout cache。
+2. 文档身份、Revision、选区、composition 和 viewport 配置共同保护高度状态
+   的接收，host 原有 request/surface/binding/resource generation 校验仍保留。
+   编辑和 reset_source 会更新身份，避免新文档重用初始 Revision 时接收旧结果。
+3. 单独改变 overscan 不再清空已测高度。捕获会复制标量高度索引，开销随块数
+   增长；这并非零成本，也不等于完成所有长文档性能优化。
+4. coordinator 只缓存正文 inset，从当前 surface 推导排版宽度；surface 同时
+   跟随 clip view 的最终 frame/bounds 更新，避免 NSScrollView 在 controller
+   布局回调后才完成 resize 时留下旧尺寸。
+5. 后台实测高度改变导航目标后，继续完成同一次 caret reveal。后续滚动、
+   选区/Revision 变化和 detach 取消旧意图；普通布局回调不再新建导航请求。
+   提交过程中若 AppKit 几何改变，等待当前尺寸的新帧，不返回旧尺寸结果。
+
+末行判据同时检查已提交帧中的 caret 和完整 caret 矩形是否位于 viewport，
+允许 0.5pt 取整误差。原先把 `needsScroll=false` 当作必须条件，会把 AppKit
+对 0.24pt 的像素取整误判为失败；旧缺陷的 `caretDecorationCount=0` 仍无法通过。
+
+最终窗口结果：
+
+- 长文档：324,245 字节，12 次定位、4 次 resize，宽度断言、末行可见、后续
+  滚动取消导航、detach/rebind、关闭后重开并回到顶部均通过。
+- 资源：图片 14 秒、Math 16 秒延迟，pending retained reuse、idle completion、
+  图片高度改变 1 次，以及无正常 pending 重试定时器均通过。
+- 原有 Dark Aqua 窗口检查通过，包含搜索、caret、多光标、大纲与 resize。
+- 最终二进制的 14 项 shell self-check 全部通过，包含表格、剪贴板和输入协议。
+- Rust 回归：`yu-editor` 102/102、`yu-storage-ffi` 48/48、`yu-workspace` 46/46。
+  新增测试覆盖高度往返传递、过期/跨文档/不同视觉状态拒绝、overscan 保留测量。
+
+实现分别提交为 `1a06fa6`（布局测量传递）与 `5c9875f`（窗口几何与导航恢复）。
+
+此次完成的是定位与渲染正确性修复。主线程辅助功能查询的排版成本仍需后续分析，
+不能据此将真实触控板 p95、IME、VoiceOver 或跨显示器人工验收标记为完成。
