@@ -1034,11 +1034,21 @@ impl MacosFrameBuildWorker {
                         break;
                     }
                     let MacosFrameBuildJob { input, config } = job;
+                    let preparation_start = std::time::Instant::now();
                     let result = builder
                         .update_config(config)
                         .and_then(|_| builder.publish_owned(input))
                         .map_err(|error| error.to_string());
+                    if std::env::var_os("YU_RENDER_TIMING").is_some() {
+                        println!(
+                            "yu-render-metric event=preparation duration_ms={:.6}",
+                            preparation_start.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                     if worker_cancelled.load(Ordering::Acquire) {
+                        if std::env::var_os("YU_RENDER_TIMING").is_some() {
+                            println!("yu-render-metric event=stale_publication");
+                        }
                         break;
                     }
                     if results.send(result).is_err() {
@@ -4648,6 +4658,7 @@ fn macos_render_host_frame(
     request: MacosFrameRequest,
     allow_background: bool,
 ) -> Result<YuStorageMacosRenderHostSnapshot, i32> {
+    let capture_start = std::time::Instant::now();
     // Capture before draining workers; a completion racing this build must
     // remain dirty so the following presentation cannot skip its publication.
     let resource_generation = yu_render_macos::resource_completion_generation();
@@ -4817,6 +4828,12 @@ fn macos_render_host_frame(
     } else {
         None
     };
+    if allow_background && std::env::var_os("YU_RENDER_TIMING").is_some() {
+        println!(
+            "yu-render-metric event=input_capture duration_ms={:.6}",
+            capture_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let requested_build = frame_key(
         session,
         appearance,
@@ -4903,6 +4920,9 @@ fn macos_render_host_frame(
                 {
                     (output.publication, Some(output.atlas))
                 } else {
+                    if std::env::var_os("YU_RENDER_TIMING").is_some() {
+                        println!("yu-render-metric event=stale_publication");
+                    }
                     state.frame_worker_request = None;
                     worker.submit(MacosFrameBuildJob {
                         input: ViewportFrameBuildInput {
@@ -5510,6 +5530,15 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             }
         }
         let image_sync_elapsed = timing_start.elapsed();
+        if timing_enabled {
+            println!(
+                "yu-render-metric event=image_upload duration_ms={:.6}",
+                image_sync_elapsed
+                    .saturating_sub(frame_build_elapsed)
+                    .as_secs_f64()
+                    * 1000.0
+            );
+        }
         let submission = match state.host.submit_with_images_at(
             &mut surface_state.renderer,
             &surface_state.surface,

@@ -2647,8 +2647,15 @@ impl MetalFrameRenderer {
     ) -> Result<MetalFrameSubmission, MetalRenderError> {
         self.frame_consumer
             .validate_revision(current_revision, frame.revision())?;
+        let upload_start = std::time::Instant::now();
         let uploaded_pages = atlas.sync_plan(uploader, frame.plan())?;
         let uploaded_embedded = images.sync_embedded_plan(uploader, frame.plan())?;
+        if std::env::var_os("YU_RENDER_TIMING").is_some() {
+            println!(
+                "yu-render-metric event=atlas_upload duration_ms={:.6}",
+                upload_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         self.render_plan_with_images_at(
             surface,
             frame.plan(),

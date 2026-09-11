@@ -377,3 +377,32 @@ changing the system appearance; this is useful for checking that the Rust
 surface and sidebar update together.
 For a reliable direct launch that terminates an older development instance first,
 run `./run-dark-self-check.sh [fixture.md]`.
+
+### Instruments 与真实呈现时间
+
+先运行 `build-app.sh`，在正常图形会话执行：
+
+```sh
+platform/macos/yu-shell-macos/record-instruments.sh /path/to/long.md .notes/scroll-run-01 30s
+```
+
+窗口打开后用触控板连续滚动。输出目录必须尚不存在，包含 `render.trace`、
+`render.log`、`environment.txt` 和 `summary.json`。记录构建/fixture hash、硬件和
+系统版本；窗口尺寸、backing scale 和屏幕最大刷新率写入 surface/live-scroll 事件。
+用 Instruments 打开 `.trace` 检查 GPU 队列、drawable 等待与主线程活动。
+
+`summary.json` 分别统计 bounds→request、后台 preparation、atlas/image upload、
+主线程 Metal encode/submit 和整个 Swift submit attempt；后者包含 busy/跳过帧，
+**不作为帧率**。连续滚动帧间隔来自 `MTLDrawable.presentedTime`，仅统计同一
+surface、同一已结束滚动手势内的呈现，不把闲置时间或不同窗口拼接，也不剔除长帧。
+没有滚动样本时 percentile 为 `null`，不能据此宣称达标。
+
+加入第四参数 `--self-check` 可录制现有真实窗口协议自检：
+
+```sh
+platform/macos/yu-shell-macos/record-instruments.sh \
+  platform/macos/yu-shell-macos/Fixtures/outline.md .notes/window-smoke-01 30s --self-check
+```
+
+这用于验证测量入口、首帧、resize 与 detach/rebind，不替代长文档触控板、
+60Hz/ProMotion、慢图片/Math、IME 或人工视觉回归。Instruments 自身也有测量开销。

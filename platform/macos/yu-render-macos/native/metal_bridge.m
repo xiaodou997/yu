@@ -1,6 +1,8 @@
 #import <Metal/Metal.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>
+#include <stdio.h>
 
 #include <dispatch/dispatch.h>
 #include <stddef.h>
@@ -8,6 +10,20 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdatomic.h>
+
+static BOOL yu_render_timing_enabled(void) {
+    static dispatch_once_t once;
+    static BOOL enabled;
+    dispatch_once(&once, ^{ enabled = getenv("YU_RENDER_TIMING") != NULL; });
+    return enabled;
+}
+
+static void yu_render_metric(const char *event, void *surface, double duration_ms) {
+    if (!yu_render_timing_enabled()) return;
+    fprintf(stdout, "yu-render-metric event=%s surface=%p time_s=%.9f duration_ms=%.6f\n",
+        event, surface, CACurrentMediaTime(), duration_ms);
+    fflush(stdout);
+}
 
 void yu_metal_notify_resource_completion(void) {
     static atomic_bool pending = false;
@@ -66,7 +82,9 @@ void yu_metal_notify_resource_completion(void) {
     }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
         @autoreleasepool {
+            CFTimeInterval acquisitionStart = yu_render_timing_enabled() ? CACurrentMediaTime() : 0;
             id<CAMetalDrawable> drawable = [[self acquireDrawable] retain];
+            yu_render_metric("drawable_acquire", self, (CACurrentMediaTime() - acquisitionStart) * 1000);
             @synchronized (self) {
                 acquisitionPending = NO;
                 if (acquisitionEnabled && acquisitionGeneration == generation) {
@@ -866,6 +884,7 @@ int yu_metal_render_plan(
         return 0;
     }
 
+    CFTimeInterval encodeStart = yu_render_timing_enabled() ? CACurrentMediaTime() : 0;
     YuMetalPipeline *pipeline = (YuMetalPipeline *)pipeline_ptr;
     YuMetalRenderTarget *target = (YuMetalRenderTarget *)target_ptr;
     if (target->in_flight == NULL
@@ -873,11 +892,13 @@ int yu_metal_render_plan(
         // A previous command buffer still owns the available GPU slot.  The
         // caller will submit the newest request on the next display-link
         // tick; never wait on AppKit's main thread here.
+        yu_render_metric("gpu_busy", layer_ptr, 0);
         return 2;
     }
     id<CAMetalDrawable> drawable = [(YuMetalLayer *)layer_ptr takeReadyDrawable];
     if (drawable == nil) {
         dispatch_semaphore_signal(target->in_flight);
+        yu_render_metric("drawable_unavailable", layer_ptr, 0);
         return 2;
     }
     if (drawable.texture.width != target->width || drawable.texture.height != target->height) {
@@ -1026,6 +1047,13 @@ int yu_metal_render_plan(
          destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
+    if (yu_render_timing_enabled()) {
+        [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+            fprintf(stdout, "yu-render-metric event=present surface=%p time_s=%.9f\n",
+                layer_ptr, presented.presentedTime);
+            fflush(stdout);
+        }];
+    }
     [command_buffer presentDrawable:drawable];
     dispatch_semaphore_t in_flight = target->in_flight;
     // The semaphore is captured independently of `target`; this keeps the
@@ -1033,10 +1061,13 @@ int yu_metal_render_plan(
     // after the command has been committed.
     dispatch_retain(in_flight);
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull _) {
+        yu_render_metric("gpu_complete", layer_ptr, 0);
         dispatch_semaphore_signal(in_flight);
         dispatch_release(in_flight);
     }];
+    yu_render_metric("gpu_submit", layer_ptr, 0);
     [command_buffer commit];
+    yu_render_metric("metal_encode_submit", layer_ptr, (CACurrentMediaTime() - encodeStart) * 1000);
     return 1;
 }
 

@@ -229,6 +229,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             object: scrollView.contentView,
             queue: .main
         ) { [weak self] _ in
+            self?.surfaceCoordinator.noteBoundsEvent()
             self?.scheduleVisualSubmit()
             self?.syncSourceGlyphVisibility()
             self?.textView.refreshTableResizeAccessibility()
