@@ -39,6 +39,7 @@ use yu_markdown::{BlockDecorations, BlockWidget, ImageSpan};
 /// cannot accidentally commit preedit text through a separate shadow buffer.
 #[derive(Debug)]
 pub struct EditorDocument {
+    render_identity: Arc<()>,
     buffer: TextBuffer,
     markdown: MarkdownDocument,
     composition: Option<CompositionOverlay>,
@@ -66,12 +67,24 @@ pub struct EditorDocument {
 /// belongs to the preparation worker.
 #[derive(Clone, Debug)]
 pub struct EditorRenderSnapshot {
+    identity: Arc<()>,
     source: TextSnapshot,
-    viewport: ViewportConfig,
+    viewport: ViewportLayout,
     selections: Selections,
     composition: Option<CompositionOverlay>,
     search_query: Option<String>,
     search_generation: u64,
+}
+
+/// Owned block heights used by one prepared frame, with no shaper or mutable
+/// editor attached. Only the originating document/visual state may adopt it.
+#[derive(Clone, Debug)]
+pub struct EditorRenderLayout {
+    identity: Arc<()>,
+    revision: Revision,
+    viewport: ViewportLayout,
+    selections: Selections,
+    composition: Option<CompositionOverlay>,
 }
 
 impl EditorRenderSnapshot {
@@ -85,7 +98,8 @@ impl EditorRenderSnapshot {
             self.source.as_str(),
             self.source.revision(),
         ));
-        document.set_viewport_config(self.viewport)?;
+        document.render_identity = self.identity;
+        document.viewport = self.viewport;
         document.selections = self.selections;
         document.composition = self.composition;
         if let Some(query) = self.search_query {
@@ -110,6 +124,7 @@ impl EditorDocument {
         )
         .expect("offset zero is always a valid caret");
         Self {
+            render_identity: Arc::new(()),
             buffer,
             markdown,
             composition: None,
@@ -141,8 +156,9 @@ impl EditorDocument {
     #[must_use]
     pub fn capture_render_snapshot(&self) -> EditorRenderSnapshot {
         EditorRenderSnapshot {
+            identity: Arc::clone(&self.render_identity),
             source: self.snapshot(),
-            viewport: self.viewport_config(),
+            viewport: self.viewport.clone(),
             selections: self.selections.clone(),
             composition: self.composition.clone(),
             search_query: self.search().map(|search| search.query().to_owned()),
@@ -156,6 +172,40 @@ impl EditorDocument {
         self.capture_render_snapshot().into_document()
     }
 
+    /// Called on the preparation worker after the final scene is built.
+    #[must_use]
+    pub fn into_render_layout(self) -> EditorRenderLayout {
+        EditorRenderLayout {
+            identity: self.render_identity,
+            revision: self.buffer.revision(),
+            viewport: self.viewport,
+            selections: self.selections,
+            composition: self.composition,
+        }
+    }
+
+    /// The host also validates request/surface/resource generations. This local
+    /// check prevents cross-document, stale-revision and changed-view adoption.
+    #[must_use]
+    pub fn accepts_render_layout(&self, layout: &EditorRenderLayout) -> bool {
+        Arc::ptr_eq(&self.render_identity, &layout.identity)
+            && self.revision() == layout.revision
+            && self.viewport_config() == layout.viewport.config()
+            && self.selections == layout.selections
+            && self.composition == layout.composition
+    }
+
+    /// Adopt only numerical viewport measurements, never worker layout caches
+    /// containing shaper-owned face identifiers, source, selection or history.
+    #[must_use]
+    pub fn adopt_render_layout(&mut self, layout: EditorRenderLayout) -> bool {
+        if !self.accepts_render_layout(&layout) {
+            return false;
+        }
+        self.viewport = layout.viewport;
+        true
+    }
+
     fn new_with_buffer(buffer: TextBuffer) -> Self {
         let snapshot = buffer.snapshot();
         let selection = EditorSelection::cursor(
@@ -165,6 +215,7 @@ impl EditorDocument {
         )
         .expect("offset zero is always a valid caret");
         Self {
+            render_identity: Arc::new(()),
             buffer,
             markdown: yu_markdown::parse(&snapshot),
             composition: None,
@@ -827,6 +878,11 @@ impl EditorDocument {
         Ok(())
     }
 
+    /// Overscan changes which blocks are requested, not their measured heights.
+    pub fn set_viewport_overscan(&mut self, overscan: f32) -> Result<(), ViewportError> {
+        self.viewport.set_overscan(overscan)
+    }
+
     #[must_use]
     pub fn viewport_config(&self) -> ViewportConfig {
         self.viewport.config()
@@ -1438,6 +1494,9 @@ impl EditorDocument {
         self.preferred_x = None;
         let before_snapshot = self.snapshot();
         let applied = self.buffer.apply(transaction)?;
+        if before_snapshot.revision() != applied.result_snapshot().revision() {
+            self.render_identity = Arc::new(());
+        }
         let incremental = yu_markdown::parse_incremental(
             &self.markdown,
             applied.result_snapshot(),
@@ -1592,6 +1651,7 @@ impl EditorDocument {
         if self.composition.is_some() {
             return Err(EditorDocumentError::CompositionActive);
         }
+        self.render_identity = Arc::new(());
         self.buffer = TextBuffer::new(source);
         self.markdown = yu_markdown::parse(&self.buffer.snapshot());
         self.decorations.clear();
@@ -4935,6 +4995,144 @@ prefix **羽🙂** suffix
             .expect("reset should work after cancellation");
         assert_eq!(document.revision(), Revision::INITIAL);
         assert_eq!(document.snapshot().as_str(), "new");
+    }
+
+    #[test]
+    fn overscan_changes_preserve_measured_block_heights() {
+        let mut document = EditorDocument::new("a long wrapped paragraph\n\nsecond paragraph");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(12.0, 10.0),
+                10.0,
+                0.0,
+            ))
+            .unwrap();
+        document
+            .visible_blocks_with_shaper(ViewportSpan::new(0.0, 60.0), &WideShaper)
+            .unwrap();
+        let heights = document.viewport.height_index().clone();
+        let stats = document.viewport_stats();
+        document.set_viewport_overscan(120.0).unwrap();
+        assert_eq!(document.viewport.height_index(), &heights);
+        assert_eq!(document.viewport_stats(), stats);
+        assert_eq!(document.viewport_config().overscan(), 120.0);
+        assert!(document.set_viewport_overscan(f32::NAN).is_err());
+        assert_eq!(document.viewport_config().overscan(), 120.0);
+        assert_eq!(document.viewport.height_index(), &heights);
+    }
+
+    #[test]
+    fn render_layout_preserves_prefix_heights_and_returns_worker_measurements() {
+        let source = format!(
+            "{}tail",
+            "a long wrapped paragraph with many words\n\n".repeat(20)
+        );
+        let mut owner = EditorDocument::new(&source);
+        owner
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(12.0, 10.0),
+                10.0,
+                0.0,
+            ))
+            .unwrap();
+        owner
+            .visible_blocks_with_shaper(ViewportSpan::new(0.0, 60.0), &WideShaper)
+            .unwrap();
+        let tail = ByteOffset::new((source.len() - 4) as u64);
+        owner
+            .set_selection(
+                EditorSelection::cursor(&owner.snapshot(), tail, crate::CaretAffinity::Downstream)
+                    .unwrap(),
+            )
+            .unwrap();
+        let expected = owner
+            .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 60.0), 0.0, &WideShaper)
+            .unwrap();
+        let mut worker = owner.capture_render_snapshot().into_document().unwrap();
+        let copied = worker
+            .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 60.0), 0.0, &WideShaper)
+            .unwrap();
+        assert_eq!(
+            copied.caret().y(),
+            expected.caret().y(),
+            "capturing must not reset previously measured prefixes"
+        );
+        worker
+            .visible_blocks_with_shaper(
+                ViewportSpan::new(expected.caret().y() - 30.0, 60.0),
+                &WideShaper,
+            )
+            .unwrap();
+        let measured = worker
+            .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 60.0), 0.0, &WideShaper)
+            .unwrap();
+        assert!(measured.caret().y() > expected.caret().y());
+        let owner_builds = owner.layout_cache_stats().builds();
+        assert!(owner.adopt_render_layout(worker.into_render_layout()));
+        assert_eq!(
+            owner.layout_cache_stats().builds(),
+            owner_builds,
+            "adoption cannot shape on the owner"
+        );
+        let adopted = owner
+            .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 60.0), 0.0, &WideShaper)
+            .unwrap();
+        assert_eq!(adopted.caret().y(), measured.caret().y());
+    }
+
+    #[test]
+    fn render_layout_rejects_other_documents_edits_and_changed_visual_state() {
+        let mut owner = EditorDocument::new("alpha beta");
+        owner
+            .visible_blocks_with_shaper(ViewportSpan::new(0.0, 60.0), &WideShaper)
+            .unwrap();
+        let layout = owner
+            .capture_render_snapshot()
+            .into_document()
+            .unwrap()
+            .into_render_layout();
+        let before = owner.viewport_stats();
+        let foreign = EditorDocument::new("alpha beta").into_render_layout();
+        assert!(!owner.adopt_render_layout(foreign));
+        assert_eq!(owner.viewport_stats(), before);
+        let original_selection = owner.selection();
+        owner
+            .set_selection(
+                EditorSelection::cursor(
+                    &owner.snapshot(),
+                    ByteOffset::new(3),
+                    crate::CaretAffinity::Downstream,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(!owner.adopt_render_layout(layout.clone()));
+        owner.set_selection(original_selection).unwrap();
+        owner
+            .begin_composition(source_range(0, 0), "preedit", utf16_range(0, 0))
+            .unwrap();
+        assert!(!owner.adopt_render_layout(layout.clone()));
+        assert!(owner.cancel_composition());
+        let config = owner.viewport_config();
+        owner
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(40.0, 10.0),
+                10.0,
+                0.0,
+            ))
+            .unwrap();
+        assert!(!owner.adopt_render_layout(layout.clone()));
+        owner.set_viewport_config(config).unwrap();
+        owner
+            .execute(EditorCommand::insert_text("changed"))
+            .unwrap();
+        assert!(!owner.adopt_render_layout(layout.clone()));
+        owner.reset_source("alpha beta").unwrap();
+        owner.set_selection(original_selection).unwrap();
+        assert!(
+            !owner.adopt_render_layout(layout),
+            "reset to Revision::INITIAL must invalidate old source identity"
+        );
     }
 
     #[test]

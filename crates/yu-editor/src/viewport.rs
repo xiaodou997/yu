@@ -406,7 +406,7 @@ impl ViewportStats {
 /// Unmeasured blocks use `estimated_block_height`. Visible blocks are measured
 /// by `EditorDocument` on demand and update the Fenwick index without laying
 /// out the rest of the document.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ViewportLayout {
     config: ViewportConfig,
     backend: LayoutBackend,
@@ -447,6 +447,17 @@ impl ViewportLayout {
     #[must_use]
     pub const fn config(&self) -> ViewportConfig {
         self.config
+    }
+
+    pub(crate) fn set_overscan(&mut self, overscan: f32) -> Result<(), ViewportError> {
+        let config = ViewportConfig::new(
+            self.config.layout(),
+            self.config.estimated_block_height(),
+            overscan,
+        );
+        config.validate()?;
+        self.config = config;
+        Ok(())
     }
 
     #[must_use]
