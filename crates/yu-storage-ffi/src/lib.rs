@@ -6596,6 +6596,28 @@ pub unsafe extern "C" fn yu_storage_session_accessibility_line_for_position(
 /// `session` must be null or a live handle and `output` must be writable when
 /// non-null.
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_revision(
+    session: *const YuStorageSession,
+    output: *mut u64,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe { *output = 0 };
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    // This query reads only canonical in-memory state; it must not inspect disk.
+    unsafe { *output = session.session.revision().get() };
+    YU_STORAGE_OK
+}
+
+/// Reads document state including an explicit disk fingerprint comparison.
+/// Use `yu_storage_session_revision` for high-frequency geometry/input queries.
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn yu_storage_session_state(
     session: *const YuStorageSession,
     output: *mut YuStorageState,
@@ -10545,6 +10567,78 @@ mod tests {
             (vec![], String::new())
         );
 
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn revision_query_survives_disk_failure_and_preserves_save_conflicts() {
+        let path = std::env::temp_dir().join(format!("yu-revision-query-{}.md", temp_id()));
+        fs::write(&path, "original").expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let mut revision = 99;
+        assert_eq!(
+            unsafe { yu_storage_session_revision(raw, &mut revision) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(revision, 0);
+        let mut command = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe { yu_storage_session_insert_text(raw, revision, b"x".as_ptr(), 1, &mut command) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_revision(raw, &mut revision) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(revision, command.revision);
+        assert_eq!(revision, 1);
+
+        // A directory in place of the file makes full disk inspection fail.
+        // Revision must still report the live edited document, never a cache.
+        fs::remove_file(&path).expect("remove fixture");
+        fs::create_dir(&path).expect("unreadable as document");
+        let mut state = YuStorageState::default();
+        assert_ne!(
+            unsafe { yu_storage_session_state(raw, &mut state) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_revision(raw, &mut revision) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(revision, 1);
+        fs::remove_dir(&path).expect("remove temporary directory");
+        fs::write(&path, "external change").expect("external edit");
+        assert_eq!(
+            unsafe { yu_storage_session_state(raw, &mut state) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(state.disk_state, YU_STORAGE_DISK_CHANGED);
+        let mut written = 0;
+        let mut changed = 0;
+        assert_eq!(
+            unsafe { yu_storage_session_save(raw, &mut revision, &mut written, &mut changed) },
+            YU_STORAGE_EXTERNAL_CHANGE
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("external content"),
+            "external change"
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_revision(raw, ptr::null_mut()) },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_revision(ptr::null(), &mut revision) },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(revision, 0);
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }

@@ -382,7 +382,7 @@ func runDocumentInteractionSelfCheck(path: String) -> Never {
 func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
         let textView = DocumentTextView(bridge: bridge)
@@ -475,7 +475,7 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
 func runShapedVerticalSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
         let firstLineEnd = (bridge.source as NSString).range(of: "\n").location
@@ -499,7 +499,7 @@ func runShapedVerticalSelfCheck(path: String) -> Never {
         )
         precondition(second.revision == revision)
         precondition(second.selection.location > first.selection.location)
-        precondition(bridge.state.revision == revision)
+        precondition(bridge.revision == revision)
         print(
             "Yu Shaped Vertical self-check: CoreText line movement preserved "
                 + "Revision=\(revision), focus=\(second.selection.location)"
@@ -544,7 +544,7 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         precondition(!pointerState.isActive)
 
         let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
 
@@ -631,7 +631,7 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
 func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let size: Float = 14.0
         let maxWidth: Float = 500.0
         _ = try bridge.macosRenderHostFrame(
@@ -695,7 +695,7 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         textView.onTaskCheckboxPress = { [weak textView] point in
             guard let textView,
                   let hit = try? bridge.taskCheckboxHitTest(
-                      revision: bridge.state.revision,
+                      revision: bridge.revision,
                       point: point
                   ) else {
                 return false
@@ -705,7 +705,7 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         let sourceBefore = bridge.source
         precondition(textView.pressTaskCheckboxForSelfCheck(at: point))
         precondition(documentChanges == 1)
-        precondition(bridge.state.revision == revision + 1)
+        precondition(bridge.revision == revision + 1)
         precondition(bridge.source != sourceBefore)
         precondition(bridge.source.contains("- [x] todo"))
         do {
@@ -833,7 +833,7 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
                 "点第 \(row) 行之后光标不在 \(node.label) 的正文起点"
             )
             let request = try bridge.shapedCaretScrollRequest(
-                revision: bridge.state.revision,
+                revision: bridge.revision,
                 size: 14.0,
                 maxWidth: 500.0,
                 scrollY: 0.0,
@@ -859,11 +859,11 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
         // 在**文档最前面**插一条新标题：这会把后面每一条的 index 与 block
         // 一起推后一位。展开状态与选中行因此不能按下标记，只能按身份记——
         // 在末尾追加字符是压不住这一条的，那种编辑谁都活得下来。
-        let revisionBefore = bridge.state.revision
+        let revisionBefore = bridge.revision
         let head = NSRange(location: 0, length: 0)
         try bridge.setSelection(head)
         textView.insertText("# 新的顶层\n\n", replacementRange: head)
-        precondition(bridge.state.revision != revisionBefore, "编辑没有推进 Revision")
+        precondition(bridge.revision != revisionBefore, "编辑没有推进 Revision")
         let refreshed = try unwrapSelfCheck(bridge.outlineItemsIfAvailable)
         precondition(refreshed.count == items.count + 1, "新标题没有进大纲")
         let shift = refreshed[1].block - items[0].block
@@ -1044,7 +1044,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
     do {
         let bridge = try StorageBridge(path: path)
         let textView = DocumentTextView(bridge: bridge)
-        let initialRevision = bridge.state.revision
+        let initialRevision = bridge.revision
         let initialChildren = (textView.accessibilityChildren ?? [])
             .compactMap { $0 as? YuAccessibilitySemanticElement }
 
@@ -1155,7 +1155,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
            let actionBlock = task.node.actionBlock {
             let beforeDone = beforeValue.boolValue
             precondition(task.accessibilityPerformPress())
-            actionRevision = bridge.state.revision
+            actionRevision = bridge.revision
             precondition(actionRevision != initialRevision)
             precondition(task.accessibilityLabel == nil)
             textView.refreshFromRust()
@@ -1180,7 +1180,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
         // descriptors from CoreText geometry, while this self-check injects
         // one scalar descriptor to verify AppKit role/action/lifecycle
         // behavior without requiring a window or VoiceOver session.
-        let splitterRevision = bridge.state.revision
+        let splitterRevision = bridge.revision
         let splitterDescriptor = NativeTableResizeAccessibilityDivider(
             revision: splitterRevision,
             blockIndex: 0,
@@ -1192,7 +1192,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
         )
         var splitterActions: [Int] = []
         textView.tableResizeAccessibilityProvider = {
-            bridge.state.revision == splitterRevision ? [splitterDescriptor] : []
+            bridge.revision == splitterRevision ? [splitterDescriptor] : []
         }
         textView.tableResizeAccessibilityFrameProvider = { _ in
             NSRect(x: 1.0, y: 2.0, width: 3.0, height: 20.0)
@@ -1227,7 +1227,7 @@ func runAccessibilitySelfCheck(path: String) -> Never {
             precondition(staleCandidate.accessibilityLabel == nil)
         }
         textView.refreshFromRust()
-        let nextRevision = bridge.state.revision
+        let nextRevision = bridge.revision
         precondition(!splitter.accessibilityPerformIncrement())
         precondition((textView.accessibilitySplitters ?? []).isEmpty)
         let nextChildren = (textView.accessibilityChildren ?? [])
@@ -1280,7 +1280,7 @@ func runCodeHighlightSelfCheck(path: String) -> Never {
             try source.write(to: url, atomically: true, encoding: .utf8)
             let bridge = try StorageBridge(path: url.path)
             let snapshot = try bridge.macosRenderHostFrame(
-                revision: bridge.state.revision,
+                revision: bridge.revision,
                 size: 14.0,
                 maxWidth: 500.0,
                 scrollY: 0.0,
@@ -1353,7 +1353,7 @@ func runCodeHighlightSelfCheck(path: String) -> Never {
         let typingBridge = try StorageBridge(path: typingURL.path)
         func renderCount(_ bridge: StorageBridge) throws -> Int {
             let snapshot = try bridge.macosRenderHostFrame(
-                revision: bridge.state.revision,
+                revision: bridge.revision,
                 size: 14.0,
                 maxWidth: 500.0,
                 scrollY: 0.0,

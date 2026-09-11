@@ -73,7 +73,7 @@ final class DocumentTextView: NSTextView {
     init(bridge: StorageBridge) {
         self.bridge = bridge
         canonicalSource = bridge.source
-        canonicalRevision = bridge.state.revision
+        canonicalRevision = bridge.revision
         // NSTextView's frame-only convenience initializer dynamically
         // dispatches to `init(frame:textContainer:)` on subclasses. Because
         // this view owns its bridge and is not storyboard-decoded, construct
@@ -162,7 +162,7 @@ final class DocumentTextView: NSTextView {
 
     func refreshFromRust() {
         canonicalSource = bridge.source
-        canonicalRevision = bridge.state.revision
+        canonicalRevision = bridge.revision
         semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
         synchronizeProjection()
@@ -219,7 +219,7 @@ final class DocumentTextView: NSTextView {
 
     private func currentCompositionGeneration() -> UInt64? {
         guard bridge.composition.active else { return nil }
-        return try? bridge.compositionProjection(revision: bridge.state.revision).generation
+        return try? bridge.compositionProjection(revision: bridge.revision).generation
     }
 
     private func visualPoint(for event: NSEvent) -> NSPoint {
@@ -249,12 +249,12 @@ final class DocumentTextView: NSTextView {
               point.y.isFinite,
               let (size, width) = visualLayoutMetrics(),
               let hit = try? bridge.projectionHitTest(
-                  revision: bridge.state.revision,
+                  revision: bridge.revision,
                   point: CGPoint(x: point.x, y: point.y),
                   size: size,
                   maxWidth: width
               ),
-              hit.revision == bridge.state.revision,
+              hit.revision == bridge.revision,
               hit.point.x.isFinite,
               hit.point.y.isFinite,
               let visualOffset = Int(exactly: hit.visualUTF16),
@@ -307,7 +307,7 @@ final class DocumentTextView: NSTextView {
         guard !bridge.composition.active else { return false }
         guard let visualOffset = shapedVisualOffset(at: point) else { return false }
         guard let source = try? bridge.projectionSourceSelection(
-            revision: bridge.state.revision,
+            revision: bridge.revision,
             visualRange: NSRange(location: visualOffset, length: 0),
             affinity: 1
         ) else {
@@ -320,7 +320,7 @@ final class DocumentTextView: NSTextView {
         _ sourceUTF16: UInt64,
         affinity: UInt8
     ) -> Int? {
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         guard let caret = try? bridge.projectionCaret(
             revision: revision,
             sourceUTF16: sourceUTF16,
@@ -346,7 +346,7 @@ final class DocumentTextView: NSTextView {
         }
         do {
             let source = try bridge.projectionSourceSelection(
-                revision: bridge.state.revision,
+                revision: bridge.revision,
                 visualRange: visualRange,
                 affinity: 1
             )
@@ -365,7 +365,7 @@ final class DocumentTextView: NSTextView {
             } else {
                 try bridge.setSelection(source.sourceRange, affinity: source.affinity)
             }
-            canonicalRevision = bridge.state.revision
+            canonicalRevision = bridge.revision
             synchronizingSelection = true
             super.setSelectedRange(source.sourceRange)
             synchronizingSelection = false
@@ -520,7 +520,7 @@ final class DocumentTextView: NSTextView {
 
     func toggleTaskAccessibilityNode(_ node: NativeAccessibilitySemanticNode) -> Bool {
         guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem,
-              node.revision == bridge.state.revision,
+              node.revision == bridge.revision,
               let block = node.actionBlock else {
             return false
         }
@@ -528,7 +528,7 @@ final class DocumentTextView: NSTextView {
     }
 
     private func toggleTask(block: UInt64, revision: UInt64) -> Bool {
-        guard revision == bridge.state.revision,
+        guard revision == bridge.revision,
               !bridge.composition.active,
               bridge.commandAvailable(Command.toggleTask, block: block) else {
             return false
@@ -738,7 +738,7 @@ final class DocumentTextView: NSTextView {
         guard !bridge.composition.active else { return }
         do {
             try bridge.setSelection(range)
-            canonicalRevision = bridge.state.revision
+            canonicalRevision = bridge.revision
             postSelectionChanged()
         } catch {
             onError?(error)
@@ -749,7 +749,7 @@ final class DocumentTextView: NSTextView {
         guard !bridge.composition.active else { return }
         do {
             try bridge.setSelections(ranges, primary: primary)
-            canonicalRevision = bridge.state.revision
+            canonicalRevision = bridge.revision
             postSelectionChanged()
         } catch {
             onError?(error)
@@ -763,7 +763,7 @@ final class DocumentTextView: NSTextView {
             if bridge.composition.active {
                 try bridge.commitComposition(text)
                 canonicalSource = bridge.source
-                canonicalRevision = bridge.state.revision
+                canonicalRevision = bridge.revision
             } else {
                 let target = replacementRange.location == NSNotFound
                     ? bridge.selection.range
@@ -786,7 +786,7 @@ final class DocumentTextView: NSTextView {
     override func copy(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
-            let revision = bridge.state.revision
+            let revision = bridge.revision
             let text = bridge.copySelection()
             guard !text.isEmpty else { return }
             let html = try bridge.copySelectionHTML(revision: revision)
@@ -799,7 +799,7 @@ final class DocumentTextView: NSTextView {
     override func cut(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
-            let revision = bridge.state.revision
+            let revision = bridge.revision
             let selected = bridge.copySelection()
             guard !selected.isEmpty else { return }
             let html = try bridge.copySelectionHTML(revision: revision)
@@ -848,7 +848,7 @@ final class DocumentTextView: NSTextView {
     /// workflow smoke test never changes the user's global clipboard.
     func copyToPasteboardForSelfCheck(_ pasteboard: NSPasteboard) throws {
         try finishCompositionForClipboard()
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let text = bridge.copySelection()
         guard !text.isEmpty else { return }
         let html = try bridge.copySelectionHTML(revision: revision)
@@ -1081,7 +1081,7 @@ final class DocumentTextView: NSTextView {
               let (size, width) = visualLayoutMetrics() else {
             return nil
         }
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let offset = UInt64(sourceUTF16)
         if bridge.composition.active {
             guard let caret = try? bridge.compositionShapedCaret(
@@ -1364,7 +1364,7 @@ final class DocumentTextView: NSTextView {
     }
 
     func accessibilityFrameForSemanticRange(_ range: NSRange) -> NSRect {
-        guard canonicalRevision == bridge.state.revision,
+        guard canonicalRevision == bridge.revision,
               !bridge.composition.active,
               range.location >= 0,
               range.length >= 0,
@@ -1388,7 +1388,7 @@ final class DocumentTextView: NSTextView {
     func accessibilityFrameForTableResizeDescriptor(
         _ descriptor: NativeTableResizeAccessibilityDivider
     ) -> NSRect {
-        guard descriptor.revision == bridge.state.revision,
+        guard descriptor.revision == bridge.revision,
               !bridge.composition.active else {
             return .zero
         }
@@ -1400,7 +1400,7 @@ final class DocumentTextView: NSTextView {
         _ descriptor: NativeTableResizeAccessibilityDivider,
         direction: Int
     ) -> Bool {
-        guard descriptor.revision == bridge.state.revision,
+        guard descriptor.revision == bridge.revision,
               descriptor.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
               descriptor.columnCount >= 2,
               descriptor.index < descriptor.columnCount - 1,
@@ -1421,7 +1421,7 @@ final class DocumentTextView: NSTextView {
     /// become discoverable by VoiceOver.
     func refreshTableResizeAccessibility(postNotification: Bool = false) {
         let descriptors = (tableResizeAccessibilityProvider?() ?? []).filter {
-            $0.revision == bridge.state.revision
+            $0.revision == bridge.revision
                 && $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
                 && $0.columnCount >= 2
                 && $0.index < $0.columnCount - 1
@@ -1494,7 +1494,7 @@ final class DocumentTextView: NSTextView {
 
     private func rebuildTableResizeAccessibilityTree() {
         let descriptors = (tableResizeAccessibilityProvider?() ?? []).filter {
-            $0.revision == bridge.state.revision
+            $0.revision == bridge.revision
                 && $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
                 && $0.columnCount >= 2
                 && $0.index < $0.columnCount - 1

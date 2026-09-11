@@ -531,7 +531,7 @@ final class MacosSurfaceHostCoordinator {
         }
         if surfaceView?.window != nil && !isAttached { return false }
         if let session = tableResizePointerState.session,
-           session.revision == bridge.state.revision {
+           session.revision == bridge.revision {
             return session.kind == YU_STORAGE_TABLE_RESIZE_COLUMN
         }
         guard !bridge.composition.active,
@@ -540,7 +540,7 @@ final class MacosSurfaceHostCoordinator {
               let geometry = visualDecorationGeometry() else {
             return false
         }
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
         do {
             return try bridge.tableResizeHover(
@@ -561,7 +561,7 @@ final class MacosSurfaceHostCoordinator {
     /// is currently visible. The coordinator returns metadata only; canonical
     /// mutation stays in `DocumentTextView`'s existing command path.
     func taskCheckboxHit(at point: NSPoint) -> NativeTaskCheckboxHit? {
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         guard !bridge.composition.active,
               point.x.isFinite,
               point.y.isFinite,
@@ -605,7 +605,7 @@ final class MacosSurfaceHostCoordinator {
         }
         do {
             return try bridge.tableResizeAccessibilityDividers(
-                revision: bridge.state.revision,
+                revision: bridge.revision,
                 size: geometry.size,
                 maxWidth: geometry.maxWidth,
                 scrollY: geometry.scrollY,
@@ -623,7 +623,7 @@ final class MacosSurfaceHostCoordinator {
     func tableResizeAccessibilityFrame(
         for descriptor: NativeTableResizeAccessibilityDivider
     ) -> NSRect {
-        guard descriptor.revision == bridge.state.revision,
+        guard descriptor.revision == bridge.revision,
               !bridge.composition.active,
               let surfaceView,
               let window = surfaceView.window,
@@ -646,7 +646,7 @@ final class MacosSurfaceHostCoordinator {
         _ descriptor: NativeTableResizeAccessibilityDivider,
         direction: Int
     ) -> Bool {
-        guard descriptor.revision == bridge.state.revision,
+        guard descriptor.revision == bridge.revision,
               descriptor.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN),
               descriptor.columnCount >= 2,
               descriptor.index < descriptor.columnCount - 1,
@@ -687,7 +687,7 @@ final class MacosSurfaceHostCoordinator {
               let geometry = visualDecorationGeometry() else {
             return false
         }
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
         do {
             let hit = try bridge.tableResizeAtDocumentPoint(
@@ -740,7 +740,7 @@ final class MacosSurfaceHostCoordinator {
     /// even though the ordinary geometry submit key has not changed.
     @discardableResult
     func updateTableResize(at point: NSPoint) -> Bool {
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         guard let session = tableResizePointerState.session,
               session.revision == revision,
               point.x.isFinite,
@@ -775,7 +775,7 @@ final class MacosSurfaceHostCoordinator {
     /// the retained frame shows the committed divider immediately.
     @discardableResult
     func finishTableResize() -> Bool {
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         guard tableResizePointerState.acceptsUpdate(revision: revision) else {
             return false
         }
@@ -800,7 +800,7 @@ final class MacosSurfaceHostCoordinator {
     /// preview that Rust intentionally keeps for the current frame.
     @discardableResult
     func cancelTableResize() -> Bool {
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         guard tableResizePointerState.acceptsUpdate(revision: revision) else {
             return false
         }
@@ -889,7 +889,7 @@ final class MacosSurfaceHostCoordinator {
               surfaceView.bounds.height > 0.0 else {
             return false
         }
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let size = max(fontSize, 1.0)
         let maxWidth = layoutWidth(for: surfaceView)
         let viewportBounds = scrollView.contentView.bounds
@@ -1038,7 +1038,7 @@ final class MacosSurfaceHostCoordinator {
             return lastSnapshot
         }
 
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         let rawView = Unmanaged.passUnretained(surfaceView).toOpaque()
         let snapshot: NativeMacosRenderHostSurfaceSnapshot
         do {
@@ -1140,7 +1140,7 @@ final class MacosSurfaceHostCoordinator {
 
     private func clearTableResizeState() {
         _ = try? bridge.tableResizeAction(
-            revision: bridge.state.revision,
+            revision: bridge.revision,
             action: UInt8(YU_STORAGE_TABLE_RESIZE_CANCEL)
         )
         tableResizePointerState.reset()
