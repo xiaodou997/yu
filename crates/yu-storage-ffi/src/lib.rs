@@ -4738,11 +4738,9 @@ fn macos_render_host_frame(
     if published_viewport.overscan() < viewport_height {
         session
             .session
-            .set_viewport_config(ViewportConfig::new(
-                published_viewport.layout(),
-                published_viewport.estimated_block_height(),
-                viewport_height,
-            ))
+            .document_mut()
+            .editor_mut()
+            .set_viewport_overscan(viewport_height)
             .map_err(|_| YU_STORAGE_INVALID_VIEWPORT_CONFIG)?;
     }
 
@@ -5127,6 +5125,11 @@ fn macos_render_host_background_frame(
         .as_ref()
         .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     if !ticket.accepts(current)
+        || !session
+            .session
+            .document()
+            .editor()
+            .accepts_render_layout(&output.layout)
         || ticket.request.generation() != state.frame_request_generation
         || output.request != ticket.request
         || output.publication.revision() != revision
@@ -5200,6 +5203,17 @@ fn macos_render_host_background_frame(
     state.prepared_build = Some(key);
     state.builder.replace_atlas(output.atlas);
     state.resource_completion_generation = ticket.resource_generation;
+    // Install the measurements used by the accepted frame before AppKit asks
+    // for caret/hit-test geometry. Rejected worker outputs never reach here.
+    let adopted = session
+        .session
+        .document_mut()
+        .editor_mut()
+        .adopt_render_layout(output.layout);
+    debug_assert!(
+        adopted,
+        "layout was validated before publication acceptance"
+    );
     let visible = output
         .viewport_blocks
         .iter()
@@ -9113,10 +9127,10 @@ mod tests {
                 .session
                 .document()
                 .editor()
-                .viewport_stats()
-                .measured(),
+                .layout_cache_stats()
+                .builds(),
             0,
-            "production frame preparation must not measure the owner's viewport"
+            "worker measurements must be adopted without building owner layouts"
         );
         let first_generation = session
             .macos_render_host

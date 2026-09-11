@@ -40,7 +40,7 @@ pub use blockinput::{
 pub use blockview::{BlockCaret, BlockCluster, BlockGlyph, BlockHit, BlockLine, BlockView};
 pub use command::{CommandResult, EditorCommand, KeyRouteResult, SourceChange, SourceSync};
 pub use decorations::{DecorationCache, DecorationCacheStats, DecorationError};
-pub use document::{EditorDocument, EditorDocumentError, EditorRenderSnapshot};
+pub use document::{EditorDocument, EditorDocumentError, EditorRenderLayout, EditorRenderSnapshot};
 pub use image::{CheckboxPlacement, ImagePlacement, PlacedWidget};
 pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
 pub use layout::{BlockLayoutSource, LayoutBackend, LayoutCache, LayoutCacheStats};

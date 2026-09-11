@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 
 use yu_assets::{ImageIntrinsicPublication, ImagePublication, ImageRequestPriority};
-use yu_editor::{EditorDocument, EditorDocumentError, EditorRenderSnapshot};
+use yu_editor::{EditorDocument, EditorDocumentError, EditorRenderLayout, EditorRenderSnapshot};
 use yu_font::{
     AtlasError, GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer, RasterizingShaper,
 };
@@ -39,6 +39,7 @@ pub struct ViewportFrameBuildInput {
 /// presentation.
 #[derive(Debug)]
 pub struct ViewportFrameBuildOutput {
+    pub layout: EditorRenderLayout,
     pub request: FrameBuildRequest,
     pub publication: ViewportFramePublication,
     /// CPU glyph atlas state produced alongside the publication.  The main
@@ -237,6 +238,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             })
             .collect();
         Ok(ViewportFrameBuildOutput {
+            layout: document.into_render_layout(),
             request,
             publication,
             atlas: self.atlas.clone(),
