@@ -1001,6 +1001,128 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         )
     }
 
+    /// Scripted real-window protocol checks. These never synthesize live-scroll
+    /// boundaries, so their presents cannot be counted as trackpad acceptance.
+    @MainActor
+    func runRenderRegressionSelfCheck(resources: Bool, reopened: Bool = false) async throws {
+        struct Failure: LocalizedError {
+            let message: String
+            var errorDescription: String? { message }
+        }
+        func require(_ condition: Bool, _ message: String) throws {
+            if !condition { throw Failure(message: message) }
+        }
+        func submit() async throws -> NativeMacosRenderHostSurfaceSnapshot {
+            let deadline = Date().addingTimeInterval(20)
+            repeat {
+                if let frame = try surfaceCoordinator.submitNow(), frame.submitted { return frame }
+                try await Task.sleep(nanoseconds: 10_000_000)
+            } while Date() < deadline
+            throw Failure(message: "Timed out waiting for scripted frame")
+        }
+        guard let scroll = documentScrollView, let document = scroll.documentView,
+              let window = view.window else { throw Failure(message: "Missing real window") }
+        func scrollTo(_ y: CGFloat) {
+            scroll.contentView.setBoundsOrigin(NSPoint(x: 0, y: max(0, y)))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+        let first = try await submit()
+        try require(abs(scroll.contentView.bounds.minY) < 1, "Document did not open at top")
+        try require(first.commandCount > 0, "Empty first frame")
+        print("Yu render regression environment: window=\(window.frame.size) scale=\(window.backingScaleFactor) max_fps=\(window.screen?.maximumFramesPerSecond ?? 0)")
+        if reopened {
+            print("Yu render regression self-check: reopened=true top=true submitted=true")
+            return
+        }
+        if resources {
+            try require(first.resourceRefreshPending && !first.resourceRetryPending,
+                        "Fixture did not start with in-flight resources")
+            try require(first.imageRequestCount > 0 && first.imageResourceCount == 0,
+                        "Image was not observed as pending")
+            // Small movements remain in the original coverage while both workers
+            // are delayed. A full publication here would hide the polling bug.
+            for y in [CGFloat(20), 40, 20, 0] {
+                scrollTo(y)
+                let frame = try await submit()
+                try require(frame.frameSerial == first.frameSerial && frame.presentationReused,
+                            "Pending resources rebuilt a covered scroll frame")
+            }
+            let deadline = Date().addingTimeInterval(40)
+            var previousHeight = first.contentHeight
+            var heightChanges = 0
+            var ready: NativeMacosRenderHostSurfaceSnapshot?
+            // Observe only the coordinator's last submitted snapshot. No submit,
+            // resource query or bounds event is allowed to wake the idle window.
+            repeat {
+                try await Task.sleep(nanoseconds: 30_000_000)
+                if let frame = surfaceCoordinator.lastSnapshot {
+                    if abs(frame.contentHeight - previousHeight) > 0.5 {
+                        heightChanges += 1
+                        previousHeight = frame.contentHeight
+                    }
+                    if !frame.resourceRefreshPending && frame.imageResourceCount > 0 {
+                        ready = frame
+                        break
+                    }
+                }
+            } while Date() < deadline
+            guard let ready else { throw Failure(message: "Idle completion notification did not publish resources") }
+            try require(ready.imageFailureCount == 0 && ready.frameSerial > first.frameSerial,
+                        "Completed resources did not replace placeholder publication")
+            try require(heightChanges == 1, "Image geometry changed \(heightChanges) times instead of once")
+            try await Task.sleep(nanoseconds: 800_000_000)
+            try require(surfaceCoordinator.lastSnapshot?.frameSerial == ready.frameSerial,
+                        "Settled idle resources kept publishing frames")
+            print("Yu render regression self-check: resources=true pending_retained=true idle_completion=true height_changes=\(heightChanges) images=\(ready.imageResourceCount)")
+            return
+        }
+        try require(bridge.source.utf8.count >= 100_000, "Long fixture is less than 100 KB")
+        try require(first.contentHeight > scroll.contentView.bounds.height * 30,
+                    "Long fixture has insufficient scroll extent")
+        let original = window.frame
+        var generation = first.surfaceGeneration
+        for step in 1...12 {
+            if step % 3 == 0 {
+                var frame = original
+                frame.size.width += step % 2 == 0 ? 96 : -80
+                frame.size.height += 32
+                window.setFrame(frame, display: true)
+                window.contentView?.layoutSubtreeIfNeeded()
+            }
+            let range = max(0, document.frame.height - scroll.contentView.bounds.height)
+            scrollTo(range * CGFloat(step) / 12)
+            let frame = try await submit()
+            try require(frame.commandCount > 0 && frame.revision == bridge.state.revision,
+                        "Long scroll submitted an empty or stale frame")
+            try require(abs(document.frame.height - max(frame.contentHeight, scroll.contentView.bounds.height)) < 1,
+                        "Scroll extent disagrees with accepted publication")
+            if step % 3 == 0 {
+                try require(frame.surfaceGeneration > generation, "Resize did not advance surface generation")
+            }
+            generation = frame.surfaceGeneration
+        }
+        window.setFrame(original, display: true)
+        window.contentView?.layoutSubtreeIfNeeded()
+        let tail = (bridge.source as NSString).range(of: "YU_END_OF_DOCUMENT")
+        try require(tail.location != NSNotFound, "Missing final-line marker")
+        textView.navigate(toSource: NSRange(location: tail.location, length: 0))
+        surfaceCoordinator.revealCaretIfNeeded()
+        let last = try await submit()
+        let caret = try bridge.shapedCaretScrollRequest(
+            revision: bridge.state.revision, size: Float(textView.font?.pointSize ?? 16),
+            maxWidth: Float(max(textView.bounds.width - 2 * textView.textContainerOrigin.x, 1)),
+            scrollY: Float(scroll.contentView.bounds.minY),
+            viewportHeight: Float(scroll.contentView.bounds.height))
+        let finalLineVisible = !caret.needsScroll && last.caretDecorationCount > 0
+        let finalLineFailure = "Final line cannot be brought into the viewport: carets=\(last.caretDecorationCount) needsScroll=\(caret.needsScroll) caretY=\(caret.caretPoint.y) currentY=\(scroll.contentView.bounds.minY) targetY=\(caret.targetScrollY) height=\(last.contentHeight) viewport=\(scroll.contentView.bounds.height)"
+        surfaceCoordinator.detach()
+        try require(!surfaceCoordinator.hasCurrentFrame(), "Detach kept old frame current")
+        let rebound = try await submit()
+        try require(rebound.frameSerial > last.frameSerial, "Rebind used old publication")
+        print("Yu render regression self-check: long=true steps=12 resize=4 final_line=\(finalLineVisible) rebind=true bytes=\(bridge.source.utf8.count)")
+        try require(finalLineVisible, finalLineFailure)
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         let state = bridge.state
         if menuItem.action == #selector(saveFromMenu(_:)) {
@@ -1271,10 +1393,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var controller: DocumentViewController?
     private var launchSelfCheck = false
     private var darkModeSelfCheck = false
+    private var renderRegression = false
+    private var resourceRegression = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let path: String
-        launchSelfCheck = CommandLine.arguments.contains("--launch-window-self-check")
+        renderRegression = CommandLine.arguments.contains("--render-regression-self-check")
+        resourceRegression = CommandLine.arguments.contains("--resource-latency-self-check")
+        launchSelfCheck = CommandLine.arguments.contains("--launch-window-self-check") || renderRegression || resourceRegression
         darkModeSelfCheck = CommandLine.arguments.contains("--dark-mode-self-check")
         if let argument = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
             path = URL(fileURLWithPath: argument).path
@@ -1358,7 +1484,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     print("Yu launch self-check: window appeared and remained stable")
                     Task { @MainActor in
                         do {
-                            try await controller.runFrameSchedulingSelfCheck()
+                            if self.renderRegression || self.resourceRegression {
+                                var longRegressionError: Error?
+                                do {
+                                    try await controller.runRenderRegressionSelfCheck(resources: self.resourceRegression)
+                                } catch {
+                                    if !self.renderRegression { throw error }
+                                    longRegressionError = error
+                                }
+                                if self.renderRegression {
+                                    // Exercise the actual window-close delegate, then a
+                                    // fresh session/window (not just layer reattachment).
+                                    window.performClose(nil)
+                                    let next = DocumentViewController(bridge: try StorageBridge(path: path))
+                                    let reopened = NSWindow(contentViewController: next)
+                                    reopened.setContentSize(NSSize(width: 900, height: 620))
+                                    reopened.delegate = self
+                                    reopened.isReleasedWhenClosed = false
+                                    self.controller = next
+                                    self.window = reopened
+                                    reopened.makeKeyAndOrderFront(nil)
+                                    next.focusDocument()
+                                    try await Task.sleep(nanoseconds: 500_000_000)
+                                    try await next.runRenderRegressionSelfCheck(resources: false, reopened: true)
+                                }
+                                if let error = longRegressionError { throw error }
+                            } else {
+                                try await controller.runFrameSchedulingSelfCheck()
+                            }
                         } catch {
                             fputs("Yu frame scheduling self-check failed: \(error)\n", stderr)
                             exit(EXIT_FAILURE)
@@ -1397,7 +1550,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return .terminateNow
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !renderRegression }
 
     private func installMainMenu(for controller: DocumentViewController) {
         let mainMenu = NSMenu()
