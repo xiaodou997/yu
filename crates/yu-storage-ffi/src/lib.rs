@@ -810,6 +810,17 @@ impl MacosEmbeddedResourceState {
             .spawn(move || {
                 let renderer = MathRenderer::default();
                 while let Ok(request) = receiver.recv() {
+                    #[cfg(debug_assertions)]
+                    if let Some(delay) = std::env::var("YU_TEST_MATH_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|delay| *delay > 0 && *delay <= 30_000)
+                    {
+                        if request.kind() == EmbeddedResourceKind::Math {
+                            println!("yu-render-test resource=math delay_ms={delay}");
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                    }
                     let result = renderer.render(&request);
                     if sender.send((request, result)).is_err() {
                         break;

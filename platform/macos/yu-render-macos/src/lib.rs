@@ -575,6 +575,16 @@ impl fmt::Debug for MacosImageDecodeWorker {
 impl MacosImageDecodeWorker {
     pub fn new() -> Result<Self, MacosImageDecodeError> {
         Self::with_decoder(|job| {
+            // Deterministic real-window notification checks; absent in release.
+            #[cfg(debug_assertions)]
+            if let Some(delay) = std::env::var("YU_TEST_IMAGE_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|delay| *delay > 0 && *delay <= 30_000)
+            {
+                println!("yu-render-test resource=image delay_ms={delay}");
+                thread::sleep(std::time::Duration::from_millis(delay));
+            }
             MacosImageDecoder::new().decode_request(&job.request, &job.document_path)
         })
     }

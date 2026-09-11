@@ -222,6 +222,7 @@ final class MacosSurfaceHostCoordinator {
             forName: Notification.Name("YuRenderResourceCompleted"), object: nil, queue: .main
         ) { [weak self] _ in
             guard let self, self.isAttached, self.imageRefreshNeeded else { return }
+            self.recordMetric("resource_notification")
             self.cancelImageResourceRefresh()
             self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: true)
         }
@@ -503,6 +504,7 @@ final class MacosSurfaceHostCoordinator {
                 return
             }
             self.imageRefreshTask = nil
+            self.recordMetric("resource_retry")
             // Join the existing wake-up rather than bypassing the scheduler.
             // Polling must not replenish its own bounded retry budget.
             self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: false)
