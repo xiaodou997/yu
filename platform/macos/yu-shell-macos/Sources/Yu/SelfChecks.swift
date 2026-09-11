@@ -563,7 +563,7 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
             scrollView: scrollView,
             fontSize: CGFloat(size)
         )
-        coordinator.setContentWidth(CGFloat(maxWidth))
+        coordinator.setHorizontalContentInset(max(surfaceView.bounds.width - CGFloat(maxWidth), 0))
         // 分隔线的位置由 Rust 自己的 Accessibility 描述符给出。平台不需要先取
         // viewport 的块列表、再逐块找出哪个是表格——那是把布局几何搬到平台侧
         // （不变量 I3）。这条路径同时就是 VoiceOver 用的那一条。
