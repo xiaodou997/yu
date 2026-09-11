@@ -5670,6 +5670,12 @@ pub unsafe extern "C" fn yu_storage_session_frame_is_current(
                 == yu_render_macos::resource_completion_generation()
                 && macos_pending_resource_allows_retained_reuse(state.resource_retry_pending)
                 && state.surface.is_some()
+                // Resource completion may publish a new frame without changing
+                // FrameKey. If Metal is busy, the old on-screen key must not
+                // cause Swift to skip the retry for this newer publication.
+                && state.host.last_submission().is_some_and(|submission| {
+                    Some(submission.frame_serial()) == state.host.frame_serial()
+                })
                 && state.last_frame_key.as_ref() == Some(&key)
         });
         // SAFETY: `out_current` was checked above and belongs to the caller.
