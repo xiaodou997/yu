@@ -197,3 +197,10 @@ Xcode 26.6；窗口 surface 为 900×692pt、2x，检查包含扩大后恢复及
 GPU submit/complete 各 14 次，`worker_fallback` 为 0。这不是 Instruments
 长文档连续滚动验收；Swift submit attempt 最大仍有 42.638ms，协调器其他
 主线程工作及长文档整体开销仍需后续性能分析，不能只用 Metal 段计时宣称达标。
+
+### 后续长文档与延迟资源自动验证
+
+新增可重复的真实窗口回归入口和 Instruments 模式。延迟资源通知、pending
+retained reuse、窗口关闭/重开通过；324 KB 长文档的末行导航失败，CPU 采样也
+确认辅助功能分隔条查询仍会在主线程排版。具体复现、硬件与数据见
+[macOS 自动窗口回归记录](macos-render-regression.md)。这些发现不计为性能验收通过。
