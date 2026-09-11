@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import os
 import UniformTypeIdentifiers
 import YuStorageFFI
 
@@ -78,6 +79,13 @@ struct TableResizePointerSession: Equatable {
     let revision: UInt64
     let kind: UInt8
 }
+
+struct ScrollSchedulerMetrics: Equatable {
+    fileprivate(set) var requested: UInt64 = 0
+    fileprivate(set) var coalesced: UInt64 = 0
+    fileprivate(set) var followUps: UInt64 = 0
+    fileprivate(set) var overBudget: UInt64 = 0
+}
 /// Keeps the native pointer route explicit and headless-testable. Rust owns
 /// the geometry preview; this state only answers whether subsequent mouse
 /// events belong to the active divider gesture and when a revision invalidates
@@ -127,7 +135,12 @@ struct TableResizePointerState {
 /// the view leaves its window.
 final class MacosSurfaceHostCoordinator {
     private static let maxImageRefreshAttempts = 40
-    private static let imageRefreshDelay: DispatchTimeInterval = .milliseconds(50)
+    private static let imageRefreshInitialDelayMilliseconds = 20
+    private static let imageRefreshMaximumDelayMilliseconds = 250
+    private static let renderLog = Logger(
+        subsystem: "io.github.xiaodou.yu",
+        category: "render"
+    )
 
     /// 一帧里只有 AppKit 知道的那部分。
     ///
@@ -149,12 +162,34 @@ final class MacosSurfaceHostCoordinator {
     private var fontSize: CGFloat
     private var contentWidth: CGFloat?
     private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
-    private var submitScheduled = false
+    private var frameWakeGate = FrameWakeGate()
+    private var pendingSubmitIntent = FrameSubmitIntent()
+    private var presentationRetry: DispatchWorkItem?
+    private var resourceCompletionObserver: NSObjectProtocol?
     private var scheduleToken: UInt64 = 0
+    /// Latest content request; distinct from the pending wake-up ticket so
+    /// continuous input cannot postpone an already scheduled frame.
+    private var submitRequestGeneration: UInt64 = 0
     private var imageRefreshTask: DispatchWorkItem?
     private var imageRefreshAttempts = 0
     private var imageRefreshNeeded = false
     private var tableResizePointerState = TableResizePointerState()
+    private var liveScrollDepth = 0
+    private var pendingSubmitWorkItem: DispatchWorkItem?
+    /// Main-thread reentrancy guard. FFI submission is currently synchronous;
+    /// keeping this explicit prevents a future display-linked callback from
+    /// accidentally starting a second submission before the first completes.
+    private var submitInFlight = false
+    private var displayLinkWakeRequested = false
+    private lazy var displayLinkPacer = DisplayLinkPacer { [weak self] in
+        guard let self, self.isLiveScrolling, self.displayLinkWakeRequested else { return }
+        self.displayLinkWakeRequested = false
+        self.enqueueSubmit(immediate: true, force: false, resetRefreshBudget: false)
+    }
+    private(set) var scrollMetrics = ScrollSchedulerMetrics()
+    private var appliedContentHeight: CGFloat?
+    private var isApplyingContentExtent = false
+    private(set) var lastSubmitDurationMilliseconds: Double = 0.0
 
     var onError: ((Error) -> Void)?
     var onSurfaceStateChange: (() -> Void)?
@@ -163,6 +198,19 @@ final class MacosSurfaceHostCoordinator {
     init(bridge: StorageBridge, fontSize: CGFloat = 16.0) {
         self.bridge = bridge
         self.fontSize = max(fontSize, 1.0)
+        resourceCompletionObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name("YuRenderResourceCompleted"), object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.isAttached, self.imageRefreshNeeded else { return }
+            self.cancelImageResourceRefresh()
+            self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: true)
+        }
+    }
+
+    deinit {
+        if let resourceCompletionObserver {
+            NotificationCenter.default.removeObserver(resourceCompletionObserver)
+        }
     }
 
     func bind(
@@ -175,15 +223,48 @@ final class MacosSurfaceHostCoordinator {
         }
         cancelImageResourceRefresh()
         scheduleToken &+= 1
+        submitRequestGeneration &+= 1
         self.surfaceView = surfaceView
+        frameWakeGate.invalidate()
+        pendingSubmitIntent = FrameSubmitIntent()
         self.scrollView = scrollView
         self.fontSize = max(fontSize, 1.0)
         contentWidth = nil
         lastSnapshot = nil
         imageRefreshNeeded = false
         tableResizePointerState.reset()
+        liveScrollDepth = 0
+        pendingSubmitWorkItem?.cancel()
+        pendingSubmitWorkItem = nil
+        submitInFlight = false
+        appliedContentHeight = nil
+        isApplyingContentExtent = false
         isAttached = false
         surfaceView.setNativeContentVisible(false)
+    }
+
+    var isLiveScrolling: Bool { liveScrollDepth > 0 }
+
+    /// AppKit emits several bounds changes for one trackpad gesture.  Keep the
+    /// state explicit so the scheduler can use a frame-paced, latest-only path
+    /// during the gesture without changing caret or edit submission semantics.
+    func beginLiveScroll() {
+        if liveScrollDepth == 0 {
+            scrollMetrics = ScrollSchedulerMetrics()
+            displayLinkPacer.start()
+        }
+        liveScrollDepth += 1
+    }
+
+    func endLiveScroll() {
+        liveScrollDepth = max(liveScrollDepth - 1, 0)
+        guard !isLiveScrolling else { return }
+        displayLinkPacer.stop()
+        displayLinkWakeRequested = false
+        let metrics = scrollMetrics
+        Self.renderLog.debug("live scroll settled requests=\(metrics.requested, privacy: .public) coalesced=\(metrics.coalesced, privacy: .public)")
+        Self.renderLog.debug("live scroll followUps=\(metrics.followUps, privacy: .public) overBudget=\(metrics.overBudget, privacy: .public)")
+        scheduleSubmit(immediate: true)
     }
 
     func setFontSize(_ fontSize: CGFloat) {
@@ -275,16 +356,71 @@ final class MacosSurfaceHostCoordinator {
         max(contentWidth ?? surfaceView.bounds.width, 1.0)
     }
 
-    func scheduleSubmit() {
-        imageRefreshAttempts = 0
-        guard !submitScheduled else { return }
-        submitScheduled = true
+    /// Match the coalescing cadence to the active display. A fixed 16ms delay
+    /// artificially caps ProMotion windows at 60Hz; the bounds callback still
+    /// remains latest-only, so this only changes when we sample the latest
+    /// presentation state.
+    private var liveScrollFrameInterval: DispatchTimeInterval {
+        let frames = max(surfaceView?.window?.screen?.maximumFramesPerSecond ?? 60, 1)
+        let seconds = 1.0 / Double(frames)
+        let nanoseconds = Int((seconds * 1_000_000_000.0).rounded())
+        return .nanoseconds(max(1, nanoseconds))
+    }
+
+    func scheduleSubmit(immediate: Bool = false) {
+        enqueueSubmit(immediate: immediate, force: false, resetRefreshBudget: true)
+    }
+
+    private func enqueueSubmit(immediate: Bool, force: Bool, resetRefreshBudget: Bool) {
+        if resetRefreshBudget { imageRefreshAttempts = 0 }
+        pendingSubmitIntent.merge(force: force)
+        scrollMetrics.requested &+= 1
+        if pendingSubmitWorkItem != nil {
+            scrollMetrics.coalesced &+= 1
+        }
+        submitRequestGeneration &+= 1
+        // While submitting, only record dirty state. Completion schedules a
+        // single follow-up; never spin a nested main-loop wake-up here.
+        guard !submitInFlight else { return }
+        guard let ticket = frameWakeGate.request(immediate: immediate) else { return }
+        pendingSubmitWorkItem?.cancel()
         let token = scheduleToken
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.scheduleToken == token else { return }
-            self.submitScheduled = false
+        let delay: DispatchTimeInterval
+        if isLiveScrolling {
+            displayLinkWakeRequested = true
+        }
+        if immediate || !isLiveScrolling {
+            delay = .milliseconds(0)
+        } else {
+            // Keep the main thread from attempting a synchronous Rust/Metal
+            // submission for every fractional trackpad bounds update.  The
+            // latest bounds are read when this work item runs.
+            delay = liveScrollFrameInterval
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.scheduleToken == token,
+                  self.frameWakeGate.consume(ticket) else { return }
+            let requestGeneration = self.submitRequestGeneration
+            self.pendingSubmitWorkItem = nil
+            guard !self.submitInFlight else {
+                // The active submission will schedule a latest-only follow-up
+                // once it has returned to the main run loop.
+                self.enqueueSubmit(immediate: false, force: false, resetRefreshBudget: false)
+                return
+            }
+            self.submitInFlight = true
+            defer {
+                self.submitInFlight = false
+                if self.scheduleToken == token,
+                   self.submitRequestGeneration != requestGeneration,
+                   self.isAttached {
+                    self.scrollMetrics.followUps &+= 1
+                    self.enqueueSubmit(immediate: !self.isLiveScrolling, force: false, resetRefreshBudget: false)
+                }
+            }
             do {
-                _ = try self.submitNow()
+                _ = try self.submitNow(force: self.pendingSubmitIntent.takeForce())
             } catch {
                 self.clearTableResizeState()
                 self.imageRefreshNeeded = false
@@ -294,6 +430,10 @@ final class MacosSurfaceHostCoordinator {
                 self.onError?(error)
             }
         }
+        pendingSubmitWorkItem = workItem
+        if !(isLiveScrolling && !immediate && displayLinkPacer.isRunning) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
     }
 
     private func cancelImageResourceRefresh() {
@@ -302,13 +442,11 @@ final class MacosSurfaceHostCoordinator {
         imageRefreshAttempts = 0
     }
 
-    /// Polls only while the current viewport has an image resource that is
-    /// pending, failed, or otherwise unproven. The Rust worker is deliberately
-    /// asynchronous and has no callback into AppKit, so a short bounded poll
-    /// is the smallest safe bridge. Every attempt invalidates the submit key
-    /// to force Rust to drain worker results and republish the frame.
+    /// Bounded backoff for failed resources. In-flight workers wake this host
+    /// through completion notifications and do not need a polling timer.
     private func scheduleImageResourceRefresh() {
         guard imageRefreshNeeded,
+              lastSnapshot?.resourceRetryPending == true,
               isAttached,
               imageRefreshTask == nil,
               imageRefreshAttempts < Self.maxImageRefreshAttempts else {
@@ -316,6 +454,11 @@ final class MacosSurfaceHostCoordinator {
         }
         let token = scheduleToken
         imageRefreshAttempts += 1
+        let exponent = min(imageRefreshAttempts - 1, 4)
+        let delayMilliseconds = min(
+            Self.imageRefreshInitialDelayMilliseconds * (1 << exponent),
+            Self.imageRefreshMaximumDelayMilliseconds
+        )
         let task = DispatchWorkItem { [weak self] in
             guard let self,
                   self.scheduleToken == token,
@@ -323,22 +466,15 @@ final class MacosSurfaceHostCoordinator {
                 return
             }
             self.imageRefreshTask = nil
-            do {
-                // 强制提交：几何与编辑状态都没变，Rust 会判为「当前帧」，
-                // 但这次提交的目的正是让它去收割 worker 的结果并重新发布。
-                // 这个 force 是资源刷新判断仍留在平台侧的直接后果，随该判断
-                // 一起移入 Rust 后即可消失。
-                _ = try self.submitNow(force: true)
-            } catch {
-                self.imageRefreshNeeded = false
-                self.cancelImageResourceRefresh()
-                self.surfaceView?.setNativeContentVisible(false)
-                self.onSurfaceStateChange?()
-                self.onError?(error)
-            }
+            // Join the existing wake-up rather than bypassing the scheduler.
+            // Polling must not replenish its own bounded retry budget.
+            self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: false)
         }
         imageRefreshTask = task
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.imageRefreshDelay, execute: task)
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(delayMilliseconds),
+            execute: task
+        )
     }
 
     /// Resolves the current document-space point against the same shaped
@@ -736,6 +872,16 @@ final class MacosSurfaceHostCoordinator {
         }
         // 内容比视口短时仍然占满视口，否则 clip view 会露出背景。
         let target = max(contentHeight, scrollView.contentView.bounds.height)
+        let extentChanged = appliedContentHeight.map {
+            abs($0 - target) > 0.5
+        } ?? true
+        let frameChanged = abs(documentView.frame.height - target) > 0.5
+        guard extentChanged || frameChanged else { return }
+        guard !isApplyingContentExtent else { return }
+        isApplyingContentExtent = true
+        defer {
+            isApplyingContentExtent = false
+        }
         if let textView = documentView as? NSTextView {
             textView.minSize = NSSize(width: 0.0, height: target)
             textView.maxSize = NSSize(
@@ -743,7 +889,6 @@ final class MacosSurfaceHostCoordinator {
                 height: target
             )
         }
-        guard abs(documentView.frame.height - target) > 0.5 else { return }
         // 改变可滚动范围不得移动视口。AppKit 在 document view 变高时会自行调整
         // clip view 的 bounds origin——首帧就会把长文档直接滚到底部，用户打开
         // 文件看到的是最后一屏，而且没有任何报错。滚动位置是用户的状态，
@@ -756,6 +901,7 @@ final class MacosSurfaceHostCoordinator {
             scrollView.contentView.setBoundsOrigin(origin)
             scrollView.reflectScrolledClipView(scrollView.contentView)
         }
+        appliedContentHeight = target
     }
 
     /// 提交一帧。
@@ -765,6 +911,18 @@ final class MacosSurfaceHostCoordinator {
     /// 判定「与屏幕上的帧等价」。资源刷新判断移入 Rust 后这个参数即可删除。
     @discardableResult
     func submitNow(force: Bool = false) throws -> NativeMacosRenderHostSurfaceSnapshot? {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        defer {
+            let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+            let milliseconds = Double(elapsed) / 1_000_000.0
+            lastSubmitDurationMilliseconds = milliseconds
+            if milliseconds > 16.7 {
+                scrollMetrics.overBudget &+= 1
+                Self.renderLog.warning(
+                    "frame submit exceeded display budget: \(milliseconds, privacy: .public) ms liveScroll=\(self.isLiveScrolling, privacy: .public)"
+                )
+            }
+        }
         guard let surfaceView,
               let geometry = currentFrameGeometry else {
             return nil
@@ -780,18 +938,39 @@ final class MacosSurfaceHostCoordinator {
 
         let revision = bridge.state.revision
         let rawView = Unmanaged.passUnretained(surfaceView).toOpaque()
-        let snapshot = try bridge.macosRenderHostSurfaceSubmit(
-            revision: revision,
-            size: Float(geometry.size),
-            maxWidth: Float(geometry.maxWidth),
-            scrollY: Float(geometry.scrollY),
-            viewportHeight: Float(geometry.viewportHeight),
-            surfaceWidth: Double(geometry.surfaceWidth),
-            surfaceHeight: Double(geometry.surfaceHeight),
-            scale: Double(geometry.scale),
-            appearance: currentAppearance,
-            view: rawView
-        )
+        let snapshot: NativeMacosRenderHostSurfaceSnapshot
+        do {
+            snapshot = try bridge.macosRenderHostSurfaceSubmit(
+                revision: revision,
+                size: Float(geometry.size),
+                maxWidth: Float(geometry.maxWidth),
+                scrollY: Float(geometry.scrollY),
+                viewportHeight: Float(geometry.viewportHeight),
+                surfaceWidth: Double(geometry.surfaceWidth),
+                surfaceHeight: Double(geometry.surfaceHeight),
+                scale: Double(geometry.scale),
+                appearance: currentAppearance,
+                view: rawView
+            )
+        } catch BridgeError.operation(let status) where status == YU_STORAGE_RENDER_BUSY {
+            // The Rust surface exists even when its first presentation is busy.
+            // Keep lifecycle ownership so closing the window still detaches it.
+            isAttached = true
+            pendingSubmitIntent.merge(force: force)
+            if presentationRetry == nil {
+                let token = scheduleToken
+                let retry = DispatchWorkItem { [weak self] in
+                    guard let self, self.scheduleToken == token else { return }
+                    self.presentationRetry = nil
+                    self.enqueueSubmit(immediate: false, force: false, resetRefreshBudget: false)
+                }
+                presentationRetry = retry
+                DispatchQueue.main.asyncAfter(deadline: .now() + liveScrollFrameInterval, execute: retry)
+            }
+            return nil
+        }
+        presentationRetry?.cancel()
+        presentationRetry = nil
         isAttached = true
         lastSnapshot = snapshot
         applyContentHeight(snapshot.contentHeight)
@@ -810,8 +989,17 @@ final class MacosSurfaceHostCoordinator {
     }
 
     func detach() {
+        presentationRetry?.cancel()
+        presentationRetry = nil
         scheduleToken &+= 1
-        submitScheduled = false
+        submitRequestGeneration &+= 1
+        frameWakeGate.invalidate()
+        displayLinkPacer.stop()
+        displayLinkWakeRequested = false
+        pendingSubmitIntent = FrameSubmitIntent()
+        pendingSubmitWorkItem?.cancel()
+        pendingSubmitWorkItem = nil
+        submitInFlight = false
         cancelImageResourceRefresh()
         clearTableResizeState()
         if isAttached {

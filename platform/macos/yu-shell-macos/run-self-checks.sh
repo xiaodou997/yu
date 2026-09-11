@@ -17,6 +17,14 @@ set -euo pipefail
 host_dir="${0:A:h}"
 cd "$host_dir"
 
+# Scheduler gate is intentionally headless and independent of the window
+# service. Run it on every self-check pass so burst starvation/regression is
+# caught even when a real AppKit window is unavailable.
+swiftc -module-cache-path /tmp/yu-scroll-swift-cache \
+    Sources/Yu/FrameWakeGate.swift Tests/FrameWakeGateChecks.swift \
+    -o /tmp/yu-frame-wake-checks
+/tmp/yu-frame-wake-checks >/dev/null
+
 # --build 是增量构建。删除一个 C 类型或 FFI 函数后，SwiftPM 可能不会重编引用
 # 它的文件，本地因此看到「构建通过」而 CI 的干净检出会失败。改动 FFI 边界后
 # 用 --clean-build 验证。

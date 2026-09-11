@@ -1931,6 +1931,46 @@ lowercase）**：从「只认 ASCII」走到「认 Unicode 的绝大多数」—
 搜索、大纲、多光标、代码块高亮（tree-sitter 上场）、导出（comrak 上场）、
 跨平台第二端。
 
+#### macOS 基础体验跟进：构建帧与呈现滚动分离
+
+S7 的面板功能完成后，真实窗口验收暴露出一个不属于 Markdown 语义的产品缺口：
+当前 `NSScrollView` 的每次 bounds 变化都会同步触发可见块 layout、CoreText
+shaping、字形栅格化和 Metal 提交。滚动位置因此被错误地当成「重新构建整帧」的
+信号，AppKit 主线程会出现 beachball，画面也表现为整页切换。
+
+`yu-workspace` 现在提供 `FrameBuildKey` 与 `FramePresentationState` 两个边界：
+前者描述需要重新准备内容的状态，后者描述 retained frame 的 camera/presentation
+状态。严格的旧 `FrameKey` 比较暂时保留，以兼容现有 host 提交流程；后续 macOS
+surface 应使用 coverage + presentation offset，在 coverage 内滚动只做 GPU crop/
+blit，超出 coverage 才重新准备视口。平台调度器必须采用 latest-only、Revision
+校验和非阻塞 drawable 策略，不能在 bounds 回调里同步构建整帧。
+
+Metal 已接入保留目标的滚动重叠区复制：只有已成功提交的 RenderPlan、背景、字形
+atlas 与图片 generation 全部一致，且 surface generation/尺寸不变、位移对齐物理
+像素并小于视口高度时，才通过独立 scratch texture 复制重叠区，仅清理和重绘暴露
+条带。复制、条带重绘与 present 在同一个 command buffer 中提交，准备失败不会
+发布半移动的目标；分数像素位移、resize、资源变化等情况保守完整重绘。
+scratch texture 按需分配并随 render target 释放。本路径仍会进行 CPU command
+转换/比较，不代表 display-linked 异步构帧、非阻塞 drawable 或帧率目标已经完成；
+真实窗口的残影检查、GPU 验证和滚动 p95 测量仍是后续验收项。
+
+当前 Swift host 的 live-scroll 唤醒优先使用 `CVDisplayLink`，display-link 线程只
+投递主线程工作；创建失败时回退到读取活动屏幕
+`maximumFramesPerSecond` 的有界定时器，因此 60Hz 使用约 16.7ms，ProMotion
+显示器可按更短间隔采样最新 viewport。提交本身仍在主线程同步执行，不等同于
+后台构帧。
+调度使用独立的 FrameWakeGate ticket 与内容 request generation：普通 bounds
+burst 只更新最新请求，不重置已排定的唤醒时刻，避免 debounce 在连续输入时
+饿死呈现。immediate 请求可以提前唤醒；detach/bind 使旧 ticket 失效。当前
+submit 仍同步执行，本门禁不代表后台构帧或 GPU command buffer in-flight 限流。
+图片刷新轮询也进入同一个 enqueue 路径，不再直接调用 submitNow；force 意图
+在滚动合并期间保留，在提交开始时消费，bind/detach 时清除。轮询和内部追帧
+不得重置自身重试预算。正常 worker 完成通过合并的主线程通知唤醒；失败资源仍
+保留有界指数退避重试（20ms 起、250ms 封顶）。
+协调器还记录 requested/coalesced/followUps/overBudget 四项计数，便于在 Instruments
+或现场日志中区分输入 burst 合并、追帧不足与单帧超预算；计数只在主线程更新，
+不会引入跨线程共享状态。
+
 #### 第一刀：大纲
 
 ##### 先回答的那个问题：大纲挂在哪

@@ -564,6 +564,18 @@ surrogate 中间位置不得穿过 ABI。
 **J1.** 编辑只重解析受影响范围，只重建变化的 decoration，
 只 layout 变化的 block，只提交 damage region。
 
+**J0.** retained viewport 的内容构建身份与滚动呈现身份必须分离。滚动位置改变
+可以改变 presentation，但在已发布 frame 的 coverage 内不得强制重新解析、layout、
+字形栅格化或重建整份 RenderPlan。超出 coverage 时只允许提交最新的 Revision-bound
+请求；过期 frame 必须整体丢弃。
+GPU 重叠区复制只能复用上次成功提交且内容/资源身份相同的像素，要求 surface
+generation 不变和物理像素对齐。复制与暴露区清理/重绘必须原子提交，不能发布
+中间状态；无法安全复用时完整重绘，不得将旧字形平移到不对应的内容位置。
+平台调度器同时最多允许一个 in-flight submit；提交期间到达的新滚动请求只能
+保留最新 generation，并在当前提交返回后追帧，禁止重入 FFI 或并行提交 Metal。
+live-scroll 的唤醒优先由 `CVDisplayLink` 驱动：display-link 线程只能投递主线程
+工作，不能直接访问 AppKit、Rust FFI 或 Metal；创建失败时允许回退到有界定时器。
+
 「只重解析受影响范围」的**可断言量是重扫的字节数**，不是耗时：同样的输入
 永远给同样的答案，退化时一定是真的退化。两层各有门禁——`yu_syntax::Parse`
 的 `reparsed_bytes`（`crates/yu-syntax/tests/incremental.rs`），与

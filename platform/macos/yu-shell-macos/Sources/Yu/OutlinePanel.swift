@@ -88,11 +88,15 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
         outlineView.addTableColumn(column)
         outlineView.outlineTableColumn = column
         outlineView.headerView = nil
-        outlineView.rowSizeStyle = .default
-        outlineView.indentationPerLevel = 14.0
+        outlineView.rowSizeStyle = .medium
+        outlineView.rowHeight = 30.0
+        outlineView.indentationPerLevel = 16.0
         outlineView.usesAutomaticRowHeights = false
         outlineView.style = .plain
-        outlineView.backgroundColor = .controlBackgroundColor
+        outlineView.backgroundColor = .clear
+        outlineView.enclosingScrollView?.drawsBackground = false
+        outlineView.selectionHighlightStyle = .regular
+        outlineView.usesAlternatingRowBackgroundColors = false
         outlineView.dataSource = self
         outlineView.delegate = self
         outlineView.setAccessibilityLabel("文档大纲")
@@ -101,8 +105,7 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = true
-        scrollView.backgroundColor = .controlBackgroundColor
+        scrollView.drawsBackground = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
     }
 
@@ -182,23 +185,53 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
     ) -> NSView? {
         guard let node = item as? OutlineNode else { return nil }
         let identifier = NSUserInterfaceItemIdentifier("outline-cell")
-        let field: NSTextField
+        let cell: NSTableCellView
         if let reused = outlineView.makeView(withIdentifier: identifier, owner: self)
-            as? NSTextField {
-            field = reused
+            as? NSTableCellView {
+            cell = reused
         } else {
-            field = NSTextField(labelWithString: "")
-            field.identifier = identifier
+            cell = NSTableCellView()
+            cell.identifier = identifier
+            let icon = NSImageView()
+            icon.imageScaling = .scaleProportionallyUpOrDown
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            icon.setAccessibilityElement(false)
+            let field = NSTextField(labelWithString: "")
             field.lineBreakMode = .byTruncatingTail
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.setAccessibilityElement(false)
+            cell.addSubview(icon)
+            cell.addSubview(field)
+            cell.imageView = icon
+            cell.textField = field
+            NSLayoutConstraint.activate([
+                icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2.0),
+                icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                icon.widthAnchor.constraint(equalToConstant: 15.0),
+                icon.heightAnchor.constraint(equalToConstant: 15.0),
+                field.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7.0),
+                field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8.0),
+                field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
         }
-        field.stringValue = node.label
-        field.toolTip = node.label
+        cell.textField?.stringValue = node.label
+        cell.textField?.toolTip = node.label
         // 级别只改字重，不改字号：面板是一列索引，不是文档的缩微图。
-        field.font = NSFont.systemFont(
+        cell.textField?.font = NSFont.systemFont(
             ofSize: NSFont.systemFontSize,
             weight: node.item.level <= 1 ? .semibold : .regular
         )
-        return field
+        cell.textField?.textColor = .labelColor
+        cell.imageView?.image = NSImage(
+            systemSymbolName: node.children.isEmpty ? "doc.text" : "chevron.right",
+            accessibilityDescription: node.children.isEmpty ? "标题" : "可展开标题"
+        )
+        cell.imageView?.contentTintColor = .secondaryLabelColor
+        return cell
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
+        YuSidebarRowView()
     }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
