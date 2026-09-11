@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import QuartzCore
 import os
 import UniformTypeIdentifiers
 import YuStorageFFI
@@ -135,6 +136,23 @@ struct TableResizePointerState {
 /// the already validated synchronous FFI submit protocol and detaches before
 /// the view leaves its window.
 final class MacosSurfaceHostCoordinator {
+    private static let timingEnabled = ProcessInfo.processInfo.environment["YU_RENDER_TIMING"] != nil
+    private var pendingBoundsEventTime: CFTimeInterval?
+
+    private func recordMetric(_ event: String, fields: String = "") {
+        guard Self.timingEnabled else { return }
+        let identity = surfaceView?.layer.map {
+            "0x" + String(UInt(bitPattern: Unmanaged.passUnretained($0).toOpaque()), radix: 16)
+        } ?? "unknown"
+        fputs("yu-render-metric event=\(event) surface=\(identity) time_s=\(CACurrentMediaTime()) \(fields)\n", stdout)
+        fflush(stdout)
+    }
+
+    func noteBoundsEvent() {
+        guard Self.timingEnabled else { return }
+        pendingBoundsEventTime = pendingBoundsEventTime ?? CACurrentMediaTime()
+    }
+
     private static let maxImageRefreshAttempts = 40
     private static let imageRefreshInitialDelayMilliseconds = 20
     private static let imageRefreshMaximumDelayMilliseconds = 250
@@ -188,7 +206,7 @@ final class MacosSurfaceHostCoordinator {
         self.enqueueSubmit(immediate: true, force: false, resetRefreshBudget: false)
     }
     private(set) var scrollMetrics = ScrollSchedulerMetrics()
-    private var liveFrameDurationsMilliseconds: [Double] = []
+    private var liveSubmitDurationsMilliseconds: [Double] = []
     private var appliedContentHeight: CGFloat?
     private var isApplyingContentExtent = false
     private(set) var lastSubmitDurationMilliseconds: Double = 0.0
@@ -252,8 +270,9 @@ final class MacosSurfaceHostCoordinator {
     /// during the gesture without changing caret or edit submission semantics.
     func beginLiveScroll() {
         if liveScrollDepth == 0 {
+            recordMetric("live_begin", fields: "max_fps=\(surfaceView?.window?.screen?.maximumFramesPerSecond ?? 0) scale=\(surfaceView?.window?.backingScaleFactor ?? 0) width=\(surfaceView?.window?.frame.width ?? 0) height=\(surfaceView?.window?.frame.height ?? 0)")
             scrollMetrics = ScrollSchedulerMetrics()
-            liveFrameDurationsMilliseconds.removeAll(keepingCapacity: true)
+            liveSubmitDurationsMilliseconds.removeAll(keepingCapacity: true)
             displayLinkPacer.start()
         }
         liveScrollDepth += 1
@@ -262,14 +281,15 @@ final class MacosSurfaceHostCoordinator {
     func endLiveScroll() {
         liveScrollDepth = max(liveScrollDepth - 1, 0)
         guard !isLiveScrolling else { return }
+        recordMetric("live_end")
         displayLinkPacer.stop()
         displayLinkWakeRequested = false
         let metrics = scrollMetrics
         Self.renderLog.debug("live scroll settled requests=\(metrics.requested, privacy: .public) coalesced=\(metrics.coalesced, privacy: .public)")
         Self.renderLog.debug("live scroll followUps=\(metrics.followUps, privacy: .public) overBudget=\(metrics.overBudget, privacy: .public)")
         Self.renderLog.debug("live scroll renderBusy=\(metrics.busy, privacy: .public)")
-        if !liveFrameDurationsMilliseconds.isEmpty {
-            let sorted = liveFrameDurationsMilliseconds.sorted()
+        if !liveSubmitDurationsMilliseconds.isEmpty {
+            let sorted = liveSubmitDurationsMilliseconds.sorted()
             let percentile: (Double) -> Double = { fraction in
                 let index = min(
                     sorted.count - 1,
@@ -278,7 +298,7 @@ final class MacosSurfaceHostCoordinator {
                 return sorted[index]
             }
             Self.renderLog.info(
-                "live scroll frame timing samples=\(sorted.count, privacy: .public) p50=\(percentile(0.50), privacy: .public)ms p95=\(percentile(0.95), privacy: .public)ms p99=\(percentile(0.99), privacy: .public)ms"
+                "live scroll submit-attempt timing samples=\(sorted.count, privacy: .public) p50=\(percentile(0.50), privacy: .public)ms p95=\(percentile(0.95), privacy: .public)ms p99=\(percentile(0.99), privacy: .public)ms"
             )
         }
         scheduleSubmit(immediate: true)
@@ -929,15 +949,20 @@ final class MacosSurfaceHostCoordinator {
     @discardableResult
     func submitNow(force: Bool = false) throws -> NativeMacosRenderHostSurfaceSnapshot? {
         let startedAt = DispatchTime.now().uptimeNanoseconds
+        if let boundsTime = pendingBoundsEventTime {
+            pendingBoundsEventTime = nil
+            recordMetric("bounds_to_request", fields: "duration_ms=\((CACurrentMediaTime() - boundsTime) * 1000)")
+        }
         defer {
             let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
             let milliseconds = Double(elapsed) / 1_000_000.0
             lastSubmitDurationMilliseconds = milliseconds
+            recordMetric("submit_attempt", fields: "duration_ms=\(milliseconds)")
             if isLiveScrolling {
-                if liveFrameDurationsMilliseconds.count == 4096 {
-                    liveFrameDurationsMilliseconds.removeFirst()
+                if liveSubmitDurationsMilliseconds.count == 4096 {
+                    liveSubmitDurationsMilliseconds.removeFirst()
                 }
-                liveFrameDurationsMilliseconds.append(milliseconds)
+                liveSubmitDurationsMilliseconds.append(milliseconds)
             }
             if milliseconds > 16.7 {
                 scrollMetrics.overBudget &+= 1
@@ -980,6 +1005,7 @@ final class MacosSurfaceHostCoordinator {
             // Keep lifecycle ownership so closing the window still detaches it.
             isAttached = true
             scrollMetrics.busy &+= 1
+            recordMetric("render_busy")
             pendingSubmitIntent.merge(force: force)
             if presentationRetry == nil {
                 let token = scheduleToken
@@ -996,6 +1022,9 @@ final class MacosSurfaceHostCoordinator {
         presentationRetry?.cancel()
         presentationRetry = nil
         isAttached = true
+        if lastSnapshot == nil {
+            recordMetric("surface_ready", fields: "max_fps=\(surfaceView.window?.screen?.maximumFramesPerSecond ?? 0) scale=\(geometry.scale) width=\(surfaceView.window?.frame.width ?? 0) height=\(surfaceView.window?.frame.height ?? 0)")
+        }
         lastSnapshot = snapshot
         applyContentHeight(snapshot.contentHeight)
         // 「还有资源没落定吗」由 Rust 在提交这一帧时一并回答。平台此前要为此
@@ -1013,6 +1042,8 @@ final class MacosSurfaceHostCoordinator {
     }
 
     func detach() {
+        if isLiveScrolling { recordMetric("live_end") }
+        pendingBoundsEventTime = nil
         presentationRetry?.cancel()
         presentationRetry = nil
         scheduleToken &+= 1
