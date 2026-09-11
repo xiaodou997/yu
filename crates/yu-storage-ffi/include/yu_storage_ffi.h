@@ -648,7 +648,7 @@ int32_t yu_storage_session_table_resize_action(
     YuStorageSession *session, uint64_t expected_revision, uint8_t action,
     float pointer_position, YuStorageTableResizeCommit *output);
 /* Probes or begins a table divider drag from one document-space point. The
- * read-only probe (hover) and the gesture start differed only by
+ * read-only full probe and the gesture start differ only by
  * `pointer_position`; they are two uses of one hit test. PROBE never mutates
  * session state and never reads `pointer_position`. */
 int32_t yu_storage_session_table_resize_at_point(
@@ -669,6 +669,13 @@ int32_t yu_storage_session_source_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
     float size, float max_width, YuStorageBlockCaret *output);
+/* Read-only column hover. Attached windows use submitted geometry; stale
+ * geometry returns OK with *output == 0. Does not start a resize gesture. */
+int32_t yu_storage_session_table_resize_hover(
+    YuStorageSession *session, uint64_t expected_revision,
+    float size, float max_width, float scroll_y, float viewport_height,
+    float point_x, float point_y, float tolerance, uint8_t *output);
+
 /* Returns read-only, document-space descriptors for visible table column
  * dividers. The first call may use null output/zero capacity to query count;
  * an existing session-only column preview is reflected, but no resize session

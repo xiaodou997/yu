@@ -886,6 +886,19 @@ final class StorageBridge {
         return value
     }
 
+    func tableResizeHover(
+        revision: UInt64, size: Float, maxWidth: Float,
+        scrollY: Float, viewportHeight: Float, point: CGPoint, tolerance: Float
+    ) throws -> Bool {
+        var hit: UInt8 = 0
+        let status = yu_storage_session_table_resize_hover(
+            handle, revision, size, maxWidth, scrollY, viewportHeight,
+            Float(point.x), Float(point.y), tolerance, &hit
+        )
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return hit != 0
+    }
+
     func taskCheckboxHitTest(
         revision: UInt64,
         point: CGPoint

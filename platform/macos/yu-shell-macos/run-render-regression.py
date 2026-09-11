@@ -83,7 +83,7 @@ def main():
     spec.loader.exec_module(metrics)
     results = {}
     for name, flag, markers, delays in [
-        ("long", "--render-regression-self-check", ["long=true", "reopened=true", "ax_frame_resize=true"], {}),
+        ("long", "--render-regression-self-check", ["long=true", "reopened=true", "ax_frame_resize=true", "hover_frame=true"], {}),
         ("resources", "--resource-latency-self-check", ["idle_completion=true", "resource=image delay_ms=14000", "resource=math delay_ms=16000"],
          {"YU_TEST_IMAGE_DELAY_MS": "14000", "YU_TEST_MATH_DELAY_MS": "16000"}),
     ]:
@@ -108,8 +108,11 @@ def main():
         ax_queries = summary["counts"].get("ax_frame_query", 0)
         ax_frames = summary["counts"].get("ax_frame_geometry", 0)
         ax_fallbacks = summary["counts"].get("ax_layout_fallback", 0)
+        hover_fallbacks = summary["counts"].get("hover_layout_fallback", 0)
+        hover_queries = summary["counts"].get("hover_frame_query", 0)
         passed = (code == 0 and not missing and (name != "resources" or retries == 0)
-                  and ax_queries > 0 and ax_frames > 0 and ax_fallbacks == 0)
+                  and ax_queries > 0 and ax_frames > 0 and ax_fallbacks == 0
+                  and hover_fallbacks == 0 and (name != "long" or hover_queries >= 100))
         summary.update({"exit_code": code, "passed": passed, "missing_markers": missing,
                         "mode": "scripted-regression", "delay_injection_ms": delays})
         (output / f"{name}-summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))

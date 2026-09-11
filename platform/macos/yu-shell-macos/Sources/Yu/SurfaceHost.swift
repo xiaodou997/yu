@@ -520,11 +520,16 @@ final class MacosSurfaceHostCoordinator {
         )
     }
 
-    /// Resolves the current document-space point against the same shaped
-    /// table geometry used by the pointer begin path. Hover is intentionally
+    /// Resolves the current document-space point against submitted table
+    /// geometry. Hover is intentionally
     /// read-only: it never opens a Rust resize session and silently falls
     /// back to the normal arrow when metrics or the Revision are stale.
     func tableResizeHover(at point: NSPoint) -> Bool {
+        let start = DispatchTime.now().uptimeNanoseconds
+        defer {
+            recordMetric("hover_query", fields: "duration_ms=\(Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)")
+        }
+        if surfaceView?.window != nil && !isAttached { return false }
         if let session = tableResizePointerState.session,
            session.revision == bridge.state.revision {
             return session.kind == YU_STORAGE_TABLE_RESIZE_COLUMN
@@ -538,15 +543,15 @@ final class MacosSurfaceHostCoordinator {
         let revision = bridge.state.revision
         let tolerance = Float(max(CGFloat(6.0), fontSize * 0.4))
         do {
-            let hit = try bridge.tableResizeAtDocumentPoint(
+            return try bridge.tableResizeHover(
                 revision: revision,
-                action: UInt8(YU_STORAGE_TABLE_RESIZE_PROBE),
                 size: geometry.size,
                 maxWidth: geometry.maxWidth,
+                scrollY: geometry.scrollY,
+                viewportHeight: geometry.viewportHeight,
                 point: CGPoint(x: point.x, y: point.y),
                 tolerance: tolerance
             )
-            return hit.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
         } catch {
             return false
         }

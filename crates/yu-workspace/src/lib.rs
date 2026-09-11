@@ -114,6 +114,29 @@ impl ViewportTableGeometry {
     pub const fn adjust_step(&self) -> f32 {
         self.adjust_step
     }
+
+    /// Column-only hover uses the same inclusive divider tolerance and strict
+    /// vertical table extent as TableLayout::resize_hit_test.
+    #[must_use]
+    pub fn column_resize_hover(&self, x: f32, y: f32, tolerance: f32) -> bool {
+        if !x.is_finite()
+            || !y.is_finite()
+            || !tolerance.is_finite()
+            || tolerance < 0.0
+            || y < self.bounds.y()
+            || y > self.bounds.y() + self.bounds.height()
+        {
+            return false;
+        }
+        let mut divider = self.bounds.x();
+        self.column_widths
+            .iter()
+            .take(self.column_widths.len().saturating_sub(1))
+            .any(|width| {
+                divider += width;
+                (x - divider).abs() <= tolerance
+            })
+    }
 }
 
 /// A parser- and Revision-bound task checkbox target from one published scene.
@@ -3912,12 +3935,47 @@ mod tests {
             .clone();
         let table = canonical.table().expect("table metadata");
         let divider = table.bounds().x() + table.column_widths()[0];
+        let hover_geometry =
+            ViewportTableGeometry::from_layout(0, 137.0, table).expect("document-space hover geometry");
+        for tolerance in [0.0, 6.4] {
+            for x in [
+                divider - tolerance - 0.01,
+                divider - tolerance,
+                divider,
+                divider + tolerance,
+                divider + tolerance + 0.01,
+                -100.0,
+                340.0,
+            ] {
+                for y in [
+                    -0.01,
+                    0.0,
+                    table.bounds().height() * 0.5,
+                    table.bounds().height(),
+                    table.bounds().height() + 0.01,
+                ] {
+                    let canonical_hit = table
+                        .resize_hit_test(LayoutPoint::new(x, y), tolerance)
+                        .expect("valid point")
+                        .is_some_and(|hit| {
+                            matches!(hit.target(), yu_editor::TableResizeTarget::Column { .. })
+                        });
+                    assert_eq!(
+                        hover_geometry.column_resize_hover(x, y + 137.0, tolerance),
+                        canonical_hit,
+                        "x={x} y={y} tolerance={tolerance}"
+                    );
+                }
+            }
+        }
+        assert!(!hover_geometry.column_resize_hover(f32::NAN, 137.0, 6.4));
+        assert!(!hover_geometry.column_resize_hover(divider, 137.0, -1.0));
         let hit = table
             .resize_hit_test(LayoutPoint::new(divider, 0.5), 0.0)
             .expect("divider hit-test")
             .expect("column divider");
-        let mut gesture = TableResizeGesture::begin(canonical.revision(), 0, hit, divider)
-            .expect("resize gesture");
+        let mut gesture =
+            TableResizeGesture::begin(canonical.revision(), 0, hit, divider).expect("resize gesture");
         gesture
             .update(canonical.revision(), divider + 1.0)
             .expect("resize update");
@@ -3945,10 +4003,7 @@ mod tests {
         assert_eq!(geometry.block_index(), 0);
         assert_eq!(geometry.source(), table.source_range());
         assert_eq!(geometry.column_widths().len(), 2);
-        assert!(
-            (geometry.bounds().x() + geometry.column_widths()[0] - expected_divider).abs()
-                < 0.001
-        );
+        assert!((geometry.bounds().x() + geometry.column_widths()[0] - expected_divider).abs() < 0.001);
         assert!((geometry.bounds().height() - table.bounds().height()).abs() < 0.001);
         assert!((8.0..=16.0).contains(&geometry.adjust_step()));
         assert!(frame.scene().scene().primitives().iter().any(|primitive| {
