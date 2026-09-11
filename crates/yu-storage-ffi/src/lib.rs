@@ -4829,6 +4829,15 @@ fn macos_frame_needs_resource_refresh(
     Ok((pending, retry))
 }
 
+/// A pending resource that is still waiting for a worker completion does not
+/// invalidate a retained presentation.  A retryable failure does: the next
+/// build must advance the retry clock and re-submit the request.  Completion
+/// generations are checked by the caller, so a worker result that arrived
+/// since the last build already makes the retained frame ineligible.
+const fn macos_pending_resource_allows_retained_reuse(resource_retry_pending: bool) -> bool {
+    !resource_retry_pending
+}
+
 /// 一个资源的状态是否意味着「还要再取一次」。
 ///
 /// 图片与内嵌资源的状态码在 READY / PENDING / FAILED / UNKNOWN 上取值相同，
@@ -4878,6 +4887,12 @@ fn pending_resources_wait_for_notifications_not_retry_timers() {
         YU_STORAGE_IMAGE_RESOURCE_UNKNOWN,
         0
     ));
+}
+
+#[test]
+fn pending_resources_allow_retained_reuse_until_completion_arrives() {
+    assert!(macos_pending_resource_allows_retained_reuse(false));
+    assert!(!macos_pending_resource_allows_retained_reuse(true));
 }
 
 #[cfg(target_os = "macos")]
@@ -5112,9 +5127,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             session.macos_render_host.as_ref().is_some_and(|state| {
                 state.resource_completion_generation
                     == yu_render_macos::resource_completion_generation()
-                    && (!state.resource_refresh_pending
-                        || (!state.image_resources.in_flight.is_empty()
-                            && matches!(state.image_resources.worker.has_completed(), Ok(false))))
+                    && macos_pending_resource_allows_retained_reuse(state.resource_retry_pending)
                     && state.last_frame_key.as_ref().is_some_and(|last| {
                         last.build() == requested.build()
                             && presentation_viewport.is_some_and(|viewport| {
