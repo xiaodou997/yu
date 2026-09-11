@@ -28,6 +28,8 @@ enum {
     YU_STORAGE_INVALID_VIEWPORT_CONFIG = 20,
     YU_STORAGE_RENDER_HOST_UNAVAILABLE = 21,
     YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE = 22,
+    /* Temporary presentation backpressure; retry the latest geometry later. */
+    YU_STORAGE_RENDER_BUSY = 23,
 };
 
 enum {
@@ -461,6 +463,7 @@ typedef struct YuStorageMacosRenderHostSnapshot {
      * that has not settled. The platform schedules one more submit so Rust can
      * drain its worker results; it does not classify resource states itself. */
     uint8_t resource_refresh_pending;
+    uint8_t resource_retry_pending;
 } YuStorageMacosRenderHostSnapshot;
 
 typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
@@ -484,11 +487,15 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t image_overscan_candidate_count;
     uint64_t image_retry_count;
     uint8_t submitted;
+    /* Non-zero when the existing retained frame was presented at a new scroll
+     * origin without rebuilding Markdown layout or glyphs. */
+    uint8_t presentation_reused;
     uint64_t selection_decoration_count;
     uint64_t caret_decoration_count;
     uint64_t search_decoration_count;
     uint64_t highlighted_glyph_count;
     uint8_t resource_refresh_pending;
+    uint8_t resource_retry_pending;
     /* Rendered document height for this frame. The scrollable extent must come
      * from here: the platform has no second layout to derive it from (I5). */
     float content_height;

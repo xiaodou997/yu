@@ -20,7 +20,27 @@ use std::ptr::NonNull;
 #[cfg(target_os = "macos")]
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+
+/// Coalesced main-thread wake only; no document or Swift pointer crosses threads.
+pub fn notify_resource_completion() {
+    RESOURCE_COMPLETION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    #[cfg(target_os = "macos")]
+    unsafe {
+        native::yu_metal_notify_resource_completion()
+    };
+}
+
+static RESOURCE_COMPLETION_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn resource_completion_generation() -> u64 {
+    RESOURCE_COMPLETION_GENERATION.load(Ordering::Acquire)
+}
 
 use yu_assets::{
     DecodedImage, ImageDecodeError, ImageLocation, ImageLocationError, ImagePublication,
@@ -29,8 +49,8 @@ use yu_assets::{
 use yu_core::Revision;
 use yu_render::{
     AtlasPageUpload, BackendError, EmbeddedSvgUpload, FrameConsumer, RenderPlan, RenderUploader,
-    SurfaceConfig, build_damage_rects, build_draw_commands, cull_draw_commands,
-    requires_full_clear,
+    SurfaceConfig, build_damage_rects, build_draw_commands_at_viewport, cull_draw_commands,
+    requires_full_clear, scroll_exposed_damage,
 };
 #[cfg(target_os = "macos")]
 use yu_render::{DamageRect, DrawCommand, IMAGE_KIND_REGULAR, embedded_image_kind};
@@ -52,6 +72,7 @@ mod native {
     use super::{DamageRect, DrawCommand, NativeImageTextureBinding, NativeTextureBinding};
 
     unsafe extern "C" {
+        pub fn yu_metal_notify_resource_completion();
         pub fn yu_metal_create_device(
             out_device: *mut *mut c_void,
             out_registry_id: *mut u64,
@@ -91,6 +112,8 @@ mod native {
             pixel_height: f64,
             scale: f64,
         ) -> i32;
+        #[cfg(test)]
+        pub fn yu_metal_nonblocking_acquisition_probe() -> i32;
         pub fn yu_metal_upload_alpha_texture(
             device: *mut c_void,
             width: u32,
@@ -158,6 +181,11 @@ mod native {
             viewport_height: f32,
             scale: f32,
             full_clear: i32,
+            scroll_pixels: i32,
+            clear_red: f32,
+            clear_green: f32,
+            clear_blue: f32,
+            clear_alpha: f32,
             commands: *const DrawCommand,
             command_count: usize,
             damage: *const DamageRect,
@@ -534,7 +562,8 @@ struct DecodeJob {
 pub struct MacosImageDecodeWorker {
     sender: Option<Sender<DecodeJob>>,
     receiver: Receiver<MacosImageDecodeResult>,
-    join: Option<JoinHandle<()>>,
+    ready: std::cell::RefCell<Option<MacosImageDecodeResult>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for MacosImageDecodeWorker {
@@ -545,30 +574,45 @@ impl fmt::Debug for MacosImageDecodeWorker {
 
 impl MacosImageDecodeWorker {
     pub fn new() -> Result<Self, MacosImageDecodeError> {
+        Self::with_decoder(|job| {
+            MacosImageDecoder::new().decode_request(&job.request, &job.document_path)
+        })
+    }
+
+    fn with_decoder(
+        decode: impl Fn(DecodeJob) -> Result<DecodedImage, MacosImageDecodeError> + Send + 'static,
+    ) -> Result<Self, MacosImageDecodeError> {
         let (sender, jobs) = mpsc::channel::<DecodeJob>();
         let (results, receiver) = mpsc::channel::<MacosImageDecodeResult>();
-        let join = thread::Builder::new()
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        thread::Builder::new()
             .name("yu-imageio".to_owned())
             .spawn(move || {
-                let decoder = MacosImageDecoder::new();
                 while let Ok(job) = jobs.recv() {
-                    let result = decoder.decode_request(&job.request, &job.document_path);
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let request = job.request.clone();
+                    let result = decode(job);
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
                     if results
-                        .send(MacosImageDecodeResult {
-                            request: job.request,
-                            result,
-                        })
+                        .send(MacosImageDecodeResult { request, result })
                         .is_err()
                     {
                         break;
                     }
+                    notify_resource_completion();
                 }
             })
             .map_err(|_| MacosImageDecodeError::WorkerClosed)?;
         Ok(Self {
             sender: Some(sender),
             receiver,
-            join: Some(join),
+            ready: std::cell::RefCell::new(None),
+            cancelled,
         })
     }
 
@@ -588,20 +632,35 @@ impl MacosImageDecodeWorker {
     }
 
     pub fn try_recv(&self) -> Result<Option<MacosImageDecodeResult>, MacosImageDecodeError> {
+        if let Some(result) = self.ready.borrow_mut().take() {
+            return Ok(Some(result));
+        }
         match self.receiver.try_recv() {
             Ok(result) => Ok(Some(result)),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(MacosImageDecodeError::WorkerClosed),
         }
     }
+
+    /// Checks readiness without losing the result or changing cache state.
+    /// Only the owner thread may inspect/drain this receiver.
+    pub fn has_completed(&self) -> Result<bool, MacosImageDecodeError> {
+        if self.ready.borrow().is_some() {
+            return Ok(true);
+        }
+        let result = self.try_recv()?;
+        let ready = result.is_some();
+        *self.ready.borrow_mut() = result;
+        Ok(ready)
+    }
 }
 
 impl Drop for MacosImageDecodeWorker {
     fn drop(&mut self) {
+        // Native decoding cannot be interrupted. It owns its inputs and exits
+        // after returning; never wait for file I/O while closing an AppKit view.
+        self.cancelled.store(true, Ordering::Release);
         self.sender.take();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
     }
 }
 
@@ -1743,14 +1802,49 @@ pub struct MetalFrameRenderer {
     target: Option<MetalRenderTarget>,
     needs_full_clear: bool,
     last_surface_generation: Option<u64>,
-    /// 上一帧提交时的 render plan viewport。
-    ///
-    /// damage 描述的是**内容**的变化，无法表达 viewport 自身的位移：滚动时
-    /// 每个 block 的内容都没变，damage 因此可能是空的，但屏幕上所有字形的
-    /// 位置都变了。沿用局部重绘会把旧字形留在 retained target 上，表现为
-    /// 滚动后字形互相重叠。
+    /// Last successfully submitted presentation viewport. Content damage does
+    /// not describe camera movement: a move needs either a validated GPU copy
+    /// plus exposed-strip redraw, or a full clear. Never apply content damage
+    /// alone to a moved viewport.
     last_viewport: Option<yu_scene::Rect>,
+    last_content: Option<RetainedContent>,
     frame_consumer: FrameConsumer,
+}
+
+// A viewport delta alone cannot authorize reuse: resources may have completed
+// without a source revision change. Keep the exact successfully submitted state.
+struct RetainedContent {
+    plan: RenderPlan,
+    background: Rgba8,
+    glyphs: BTreeMap<u32, AtlasPageIdentity>,
+    images: BTreeMap<u64, ImageTextureIdentity>,
+    embedded: BTreeMap<(u64, u32), ImageTextureIdentity>,
+}
+
+fn retained_scroll_pixels(
+    previous: yu_scene::Rect,
+    current: yu_scene::Rect,
+    scale: f64,
+) -> Option<i32> {
+    if previous.x() != current.x()
+        || previous.width() != current.width()
+        || previous.height() != current.height()
+        || !scale.is_finite()
+        || scale <= 0.0
+    {
+        return None;
+    }
+    let delta = f64::from(current.y() - previous.y()) * scale;
+    // Fractional shifts require resampling, so fall back to a clean redraw.
+    if !delta.is_finite()
+        || delta == 0.0
+        || delta.fract() != 0.0
+        || delta.abs() >= f64::from(current.height()) * scale
+        || delta.abs() > f64::from(i32::MAX)
+    {
+        return None;
+    }
+    Some(delta as i32)
 }
 
 /// Owned scalar result from one host-level frame submission.
@@ -2093,6 +2187,21 @@ impl MetalViewportHostSession {
         atlas: &mut MetalAtlas,
         images: &mut MetalImageAtlas,
     ) -> Result<MetalViewportHostSubmission, MetalViewportHostError> {
+        self.submit_with_images_at(renderer, surface, uploader, atlas, images, None)
+    }
+
+    /// Submits the retained frame at an alternate presentation viewport.  The
+    /// caller must validate that the viewport lies inside the frame's retained
+    /// coverage before using this scroll-only path.
+    pub fn submit_with_images_at(
+        &mut self,
+        renderer: &mut MetalFrameRenderer,
+        surface: &MetalSurface,
+        uploader: &mut MetalUploader,
+        atlas: &mut MetalAtlas,
+        images: &mut MetalImageAtlas,
+        presentation_viewport: Option<yu_scene::Rect>,
+    ) -> Result<MetalViewportHostSubmission, MetalViewportHostError> {
         self.validate_surface_generation(surface.generation())?;
         let frame = self.frame_cache.get(self.current_revision).ok_or(
             MetalViewportHostError::NoCurrentFrame {
@@ -2104,13 +2213,14 @@ impl MetalViewportHostSession {
             .ok_or(MetalViewportHostError::NoCurrentFrame {
                 revision: self.current_revision,
             })?;
-        let result = renderer.submit_viewport_frame_with_images(
+        let result = renderer.submit_viewport_frame_with_images_at(
             surface,
             self.current_revision,
             frame,
             uploader,
             atlas,
             images,
+            presentation_viewport,
         )?;
         let submission = MetalViewportHostSubmission {
             revision: result.revision(),
@@ -2161,6 +2271,7 @@ impl MetalFrameRenderer {
             needs_full_clear: true,
             last_surface_generation: None,
             last_viewport: None,
+            last_content: None,
             frame_consumer: FrameConsumer::new(),
         })
     }
@@ -2253,6 +2364,29 @@ impl MetalFrameRenderer {
         atlas: &MetalAtlas,
         images: &MetalImageAtlas,
     ) -> Result<(), MetalRenderError> {
+        self.render_plan_with_images_at(
+            surface,
+            plan,
+            atlas,
+            images,
+            plan.viewport(),
+            Rgba8::new(0, 0, 0, 0),
+        )
+    }
+
+    /// Presents a retained plan at a new document-space viewport.  The plan
+    /// remains immutable; only command translation and the camera viewport
+    /// change.  This is the cheap path used while a scroll remains inside the
+    /// publication's overscan coverage.
+    pub fn render_plan_with_images_at(
+        &mut self,
+        surface: &MetalSurface,
+        plan: &RenderPlan,
+        atlas: &MetalAtlas,
+        images: &MetalImageAtlas,
+        presentation_viewport: yu_scene::Rect,
+        clear_color: Rgba8,
+    ) -> Result<(), MetalRenderError> {
         if self.queue.device().registry_id() != surface.device().registry_id()
             || self.pipeline.device().registry_id() != surface.device().registry_id()
         {
@@ -2260,22 +2394,54 @@ impl MetalFrameRenderer {
         }
 
         let recreated_target = self.ensure_target(surface)?;
-        let viewport = plan.viewport();
-        let all_commands = build_draw_commands(
+        let viewport = presentation_viewport;
+        let all_commands = build_draw_commands_at_viewport(
             plan,
+            viewport,
             &atlas.page_sizes(),
             &images.resource_sizes(),
             &images.embedded_resource_sizes(),
         )?;
-        let damage = build_damage_rects(plan)?;
-        let full_clear = requires_full_clear(
-            recreated_target,
-            self.needs_full_clear,
-            self.last_viewport,
-            viewport,
-            self.last_surface_generation,
-            surface.generation(),
-        );
+        let resources_match = self.last_content.as_ref().is_some_and(|last| {
+            last.background == clear_color
+                && last.glyphs == atlas.fingerprints
+                && last.images == images.identities
+                && last.embedded == images.embedded_identities
+        });
+        let content_matches = resources_match
+            && self
+                .last_content
+                .as_ref()
+                .is_some_and(|last| last.plan == *plan);
+        let scroll_pixels = if content_matches
+            && !recreated_target
+            && !self.needs_full_clear
+            && self.last_surface_generation == Some(surface.generation())
+            && f64::from(viewport.width()) * surface.config().scale()
+                == f64::from(surface.config().pixel_width())
+            && f64::from(viewport.height()) * surface.config().scale()
+                == f64::from(surface.config().pixel_height())
+        {
+            self.last_viewport.and_then(|previous| {
+                retained_scroll_pixels(previous, viewport, surface.config().scale())
+            })
+        } else {
+            None
+        };
+        let damage = if scroll_pixels.is_some() {
+            scroll_exposed_damage(self.last_viewport.expect("retained viewport"), viewport)?
+        } else {
+            build_damage_rects(plan)?
+        };
+        let full_clear = scroll_pixels.is_none()
+            && (requires_full_clear(
+                recreated_target,
+                self.needs_full_clear,
+                self.last_viewport,
+                viewport,
+                self.last_surface_generation,
+                surface.generation(),
+            ) || !resources_match);
         let scale = surface.config().scale() as f32;
         if !scale.is_finite() || scale <= 0.0 {
             return Err(MetalRenderError::InvalidRenderCommand(
@@ -2320,6 +2486,11 @@ impl MetalFrameRenderer {
                     viewport_height,
                     scale,
                     i32::from(full_clear),
+                    scroll_pixels.unwrap_or(0),
+                    f32::from(clear_color.red()) / 255.0,
+                    f32::from(clear_color.green()) / 255.0,
+                    f32::from(clear_color.blue()) / 255.0,
+                    f32::from(clear_color.alpha()) / 255.0,
                     commands.as_ptr(),
                     commands.len(),
                     damage.as_ptr(),
@@ -2335,6 +2506,15 @@ impl MetalFrameRenderer {
                     self.needs_full_clear = false;
                     self.last_surface_generation = Some(surface.generation());
                     self.last_viewport = Some(viewport);
+                    if !content_matches {
+                        self.last_content = Some(RetainedContent {
+                            plan: plan.clone(),
+                            background: clear_color,
+                            glyphs: atlas.fingerprints.clone(),
+                            images: images.identities.clone(),
+                            embedded: images.embedded_identities.clone(),
+                        });
+                    }
                     Ok(())
                 }
                 2 => Err(MetalRenderError::DrawableUnavailable),
@@ -2362,6 +2542,7 @@ impl MetalFrameRenderer {
                 viewport_height,
                 scale,
                 full_clear,
+                clear_color,
                 commands,
                 damage,
             );
@@ -2394,7 +2575,14 @@ impl MetalFrameRenderer {
     ) -> Result<(), MetalRenderError> {
         self.frame_consumer
             .validate_revision(current_revision, frame.revision())?;
-        self.render_plan_with_images(surface, frame.plan(), atlas, images)?;
+        self.render_plan_with_images_at(
+            surface,
+            frame.plan(),
+            atlas,
+            images,
+            frame.plan().viewport(),
+            frame.scene().background(),
+        )?;
         self.frame_consumer
             .commit_revision(current_revision, frame.revision())?;
         Ok(())
@@ -2434,11 +2622,41 @@ impl MetalFrameRenderer {
         atlas: &mut MetalAtlas,
         images: &mut MetalImageAtlas,
     ) -> Result<MetalFrameSubmission, MetalRenderError> {
+        self.submit_viewport_frame_with_images_at(
+            surface,
+            current_revision,
+            frame,
+            uploader,
+            atlas,
+            images,
+            None,
+        )
+    }
+
+    /// Uploads and presents a retained frame at an alternate viewport.  The
+    /// frame remains revision-bound; only the camera origin changes.
+    pub fn submit_viewport_frame_with_images_at(
+        &mut self,
+        surface: &MetalSurface,
+        current_revision: Revision,
+        frame: &ViewportRenderFrame,
+        uploader: &mut MetalUploader,
+        atlas: &mut MetalAtlas,
+        images: &mut MetalImageAtlas,
+        presentation_viewport: Option<yu_scene::Rect>,
+    ) -> Result<MetalFrameSubmission, MetalRenderError> {
         self.frame_consumer
             .validate_revision(current_revision, frame.revision())?;
         let uploaded_pages = atlas.sync_plan(uploader, frame.plan())?;
         let uploaded_embedded = images.sync_embedded_plan(uploader, frame.plan())?;
-        self.render_plan_with_images(surface, frame.plan(), atlas, images)?;
+        self.render_plan_with_images_at(
+            surface,
+            frame.plan(),
+            atlas,
+            images,
+            presentation_viewport.unwrap_or_else(|| frame.plan().viewport()),
+            frame.scene().background(),
+        )?;
         self.frame_consumer
             .commit_revision(current_revision, frame.revision())?;
         Ok(MetalFrameSubmission {
@@ -2461,7 +2679,146 @@ impl MetalFrameRenderer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropping_image_worker_does_not_wait_for_decode_or_run_queued_jobs() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_calls = Arc::clone(&calls);
+        let worker = MacosImageDecodeWorker::with_decoder(move |_| {
+            worker_calls.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            Err(MacosImageDecodeError::NativeDecodeFailed)
+        })
+        .unwrap();
+        let request = ImageRequest::new(
+            Revision::INITIAL,
+            yu_core::TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(1))
+                .unwrap(),
+            "test.png".to_owned(),
+        )
+        .unwrap();
+        worker.submit(request.clone(), "/tmp/test.md").unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        worker.submit(request, "/tmp/test.md").unwrap();
+        let owner = thread::spawn(move || {
+            drop(worker);
+            finished_tx.send(()).unwrap();
+        });
+        let dropped = finished_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Always release the fake decoder, including when Drop regresses to join.
+        resume_tx.send(()).unwrap();
+        owner.join().unwrap();
+        assert!(dropped.is_ok(), "closing the owner waited for decoding");
+        assert!(
+            matches!(
+                entered_rx.recv_timeout(std::time::Duration::from_secs(2)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "worker did not exit or started a queued decode"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn image_completion_probe_preserves_results_and_order() {
+        use super::*;
+        let (sender, receiver) = mpsc::channel();
+        let worker = MacosImageDecodeWorker {
+            sender: None,
+            receiver,
+            ready: std::cell::RefCell::new(None),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(!worker.has_completed().unwrap());
+        for destination in ["first.png", "second.png"] {
+            sender
+                .send(MacosImageDecodeResult {
+                    request: ImageRequest::new(
+                        yu_core::Revision::INITIAL,
+                        yu_core::TextRange::new(
+                            yu_core::ByteOffset::ZERO,
+                            yu_core::ByteOffset::new(1),
+                        )
+                        .unwrap(),
+                        destination.to_owned(),
+                    )
+                    .unwrap(),
+                    result: Err(MacosImageDecodeError::NativeDecodeFailed),
+                })
+                .unwrap();
+        }
+        assert!(worker.has_completed().unwrap());
+        assert!(worker.has_completed().unwrap());
+        assert_eq!(
+            worker
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .request()
+                .key()
+                .destination(),
+            "first.png"
+        );
+        assert_eq!(
+            worker
+                .try_recv()
+                .unwrap()
+                .unwrap()
+                .request()
+                .key()
+                .destination(),
+            "second.png"
+        );
+        assert!(!worker.has_completed().unwrap());
+        drop(sender);
+        assert!(matches!(
+            worker.has_completed(),
+            Err(MacosImageDecodeError::WorkerClosed)
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn blocked_drawable_acquisition_does_not_block_requests_or_detach() {
+        assert_eq!(
+            unsafe { super::native::yu_metal_nonblocking_acquisition_probe() },
+            1
+        );
+    }
     use super::*;
+
+    #[test]
+    fn retained_scroll_requires_pixel_alignment_and_overlap() {
+        use yu_scene::Rect;
+        let original = Rect::new(0.0, 0.0, 100.0, 200.0).unwrap();
+        for (y, scale, expected) in [
+            (20.0, 1.0, Some(20)),
+            (-20.0, 2.0, Some(-40)),
+            (0.5, 2.0, Some(1)),
+            (0.5, 1.0, None),
+            (0.0, 1.0, None),
+            (200.0, 1.0, None),
+            (-201.0, 2.0, None),
+            (1.0, 0.0, None),
+            (1.0, f64::NAN, None),
+        ] {
+            assert_eq!(
+                retained_scroll_pixels(original, Rect::new(0.0, y, 100.0, 200.0).unwrap(), scale),
+                expected
+            );
+        }
+        assert_eq!(
+            retained_scroll_pixels(original, Rect::new(1.0, 1.0, 100.0, 200.0).unwrap(), 1.0),
+            None
+        );
+        assert_eq!(
+            retained_scroll_pixels(original, Rect::new(0.0, 1.0, 100.0, 201.0).unwrap(), 1.0),
+            None
+        );
+    }
 
     #[test]
     fn viewport_host_session_tracks_revision_generation_and_frame_serial() {
@@ -2730,6 +3087,23 @@ mod tests {
             result,
             Ok(()) | Err(MetalRenderError::DrawableUnavailable)
         ));
+        // Exercise repeated retained presentations in both directions. This
+        // native smoke check validates submission, not pixel correctness.
+        for y in [8.0, 16.0, 8.0, 0.0] {
+            let viewport = plan.viewport();
+            let result = frame_renderer.render_plan_with_images_at(
+                &surface,
+                plan,
+                &gpu_atlas,
+                &MetalImageAtlas::new(),
+                Rect::new(viewport.x(), y, viewport.width(), viewport.height()).unwrap(),
+                Rgba8::new(0, 0, 0, 0),
+            );
+            assert!(matches!(
+                result,
+                Ok(()) | Err(MetalRenderError::DrawableUnavailable)
+            ));
+        }
         let result = frame_renderer.present_clear(&surface, Rgba8::new(12, 24, 48, 255));
         assert!(matches!(
             result,

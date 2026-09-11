@@ -36,7 +36,10 @@ mod frame_key;
 mod workspace;
 
 pub use frame_builder::{ViewportFrameBuildError, ViewportFrameBuilder};
-pub use frame_key::{FrameGeometry, FrameKey, FrameTableResize};
+pub use frame_key::{
+    FrameBuildGeometry, FrameBuildKey, FrameBuildRequest, FrameGeometry, FrameKey,
+    FramePresentationState, FrameTableResize,
+};
 pub use workspace::{
     CloseAction, CloseResult, OpenTabResult, TabId, Workspace, WorkspaceCloseRequest,
     WorkspaceError, WorkspaceTab,
@@ -51,6 +54,7 @@ const TASK_LIST_ITEM_TAG: u8 = 7;
 pub struct ViewportSceneFrame {
     input: ViewportSceneInput,
     scene: Scene,
+    background: Rgba8,
 }
 
 /// A parser- and Revision-bound task checkbox target from one published scene.
@@ -959,6 +963,11 @@ impl ViewportSceneFrame {
     #[must_use]
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    #[must_use]
+    pub const fn background(&self) -> Rgba8 {
+        self.background
     }
 
     #[must_use]
@@ -2057,6 +2066,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     Ok(ViewportSceneFrame {
         input,
         scene: builder.finish(),
+        background,
     })
 }
 
