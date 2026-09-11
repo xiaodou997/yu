@@ -102,6 +102,60 @@ impl EditorDocument {
         self.buffer.snapshot()
     }
 
+    /// Builds an independent document for background render preparation.
+    ///
+    /// The canonical editor keeps mutable incremental caches and history and
+    /// therefore must remain on its owner thread.  A render clone preserves
+    /// only the source revision and visual state that affect a frame; layout
+    /// and decoration caches are intentionally rebuilt in the worker.
+    pub fn clone_for_render(&self) -> Result<Self, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let mut clone = Self::new_with_buffer(TextBuffer::from_text_at_revision(
+            snapshot.as_str(),
+            snapshot.revision(),
+        ));
+        clone.set_viewport_config(self.viewport_config())?;
+        clone.set_selections(
+            self.selections.as_slice().iter().copied(),
+            self.selections.primary_index(),
+        )?;
+        if let Some(search) = self.search() {
+            clone.set_search_query(search.query());
+        }
+        if let Some(composition) = self.composition() {
+            clone.begin_composition(
+                composition.replacement_range(),
+                composition.text(),
+                composition.selection_utf16(),
+            )?;
+        }
+        Ok(clone)
+    }
+
+    fn new_with_buffer(buffer: TextBuffer) -> Self {
+        let snapshot = buffer.snapshot();
+        let selection = EditorSelection::cursor(
+            &snapshot,
+            yu_core::ByteOffset::ZERO,
+            crate::CaretAffinity::Downstream,
+        )
+        .expect("offset zero is always a valid caret");
+        Self {
+            buffer,
+            markdown: yu_markdown::parse(&snapshot),
+            composition: None,
+            selections: Selections::single(selection),
+            preferred_x: None,
+            last_source_change: None,
+            history: EditorHistory::default(),
+            decorations: DecorationCache::default(),
+            layouts: LayoutCache::default(),
+            viewport: ViewportLayout::default(),
+            search: None,
+            search_generation: 0,
+        }
+    }
+
     /// Returns the incremental Markdown block document for the current
     /// source revision.
     #[must_use]
@@ -4857,5 +4911,30 @@ prefix **羽🙂** suffix
             .expect("reset should work after cancellation");
         assert_eq!(document.revision(), Revision::INITIAL);
         assert_eq!(document.snapshot().as_str(), "new");
+    }
+
+    #[test]
+    fn render_clone_preserves_revision_visual_state_without_history() {
+        let mut document = EditorDocument::new("alpha beta");
+        document
+            .execute(EditorCommand::insert_text("!"))
+            .expect("edit should succeed");
+        let snapshot = document.snapshot();
+        let selection = EditorSelection::range(
+            &snapshot,
+            ByteOffset::new(0),
+            ByteOffset::new(5),
+            crate::CaretAffinity::Downstream,
+        )
+        .expect("selection");
+        document.set_selection(selection).expect("selection update");
+        document.set_search_query("alpha");
+
+        let clone = document.clone_for_render().expect("render clone");
+        assert_eq!(clone.snapshot().as_str(), document.snapshot().as_str());
+        assert_eq!(clone.revision(), document.revision());
+        assert_eq!(clone.selections(), document.selections());
+        assert_eq!(clone.search().map(|search| search.query()), Some("alpha"));
+        assert_eq!(clone.history_stats().undo_entries(), 0);
     }
 }

@@ -215,6 +215,18 @@ impl TextBuffer {
         }
     }
 
+    /// Creates an independent render-side buffer while preserving the source
+    /// revision carried by the snapshot.  The storage is rebuilt from owned
+    /// text; callers use this only for worker-side preparation, never as a
+    /// replacement for the canonical editing buffer.
+    #[must_use]
+    pub fn from_text_at_revision(text: impl Into<String>, revision: Revision) -> Self {
+        Self {
+            revision,
+            storage: Storage::new(text.into()),
+        }
+    }
+
     #[must_use]
     pub fn revision(&self) -> Revision {
         self.revision

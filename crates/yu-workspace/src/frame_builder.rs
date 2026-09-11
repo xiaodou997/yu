@@ -19,8 +19,29 @@ use yu_font::{
 use yu_render::RenderPlanBuilder;
 
 use crate::{
-    ViewportFramePublication, ViewportFramePublisher, ViewportPublishError, ViewportRenderConfig,
+    FrameBuildRequest, ViewportFramePublication, ViewportFramePublisher, ViewportPublishError,
+    ViewportRenderConfig,
 };
+
+/// Owned input for a frame preparation job.  The editor clone is detached from
+/// the canonical session, so the job can run without borrowing AppKit or the
+/// live document owner.
+#[derive(Debug)]
+pub struct ViewportFrameBuildInput {
+    pub request: FrameBuildRequest,
+    pub document: EditorDocument,
+    pub image_publications: Vec<ImagePublication>,
+    pub image_intrinsics: Vec<ImageIntrinsicPublication>,
+}
+
+/// Result returned by a background preparation job.  The request is carried
+/// beside the publication so the owner can reject stale work before upload or
+/// presentation.
+#[derive(Debug)]
+pub struct ViewportFrameBuildOutput {
+    pub request: FrameBuildRequest,
+    pub publication: ViewportFramePublication,
+}
 
 /// 准备一帧时可能出现的错误。
 ///
@@ -165,6 +186,28 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
                 image_intrinsics,
             )
             .map_err(ViewportFrameBuildError::Publish)
+    }
+
+    /// Consumes an owned worker input and publishes one revision-bound frame.
+    pub fn publish_owned(
+        &mut self,
+        input: ViewportFrameBuildInput,
+    ) -> Result<ViewportFrameBuildOutput, BuildError<S>> {
+        let ViewportFrameBuildInput {
+            request,
+            mut document,
+            image_publications,
+            image_intrinsics,
+        } = input;
+        let publication = self.publish_with_images_and_intrinsics(
+            &mut document,
+            &image_publications,
+            &image_intrinsics,
+        )?;
+        Ok(ViewportFrameBuildOutput {
+            request,
+            publication,
+        })
     }
 
     /// 当前视口/overscan 窗口里的块下标。图片资源调度器用它，好让屏幕外的
