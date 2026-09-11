@@ -35,7 +35,10 @@ mod frame_builder;
 mod frame_key;
 mod workspace;
 
-pub use frame_builder::{ViewportFrameBuildError, ViewportFrameBuilder};
+pub use frame_builder::{
+    ViewportFrameBuildError, ViewportFrameBuildInput, ViewportFrameBuildOutput,
+    ViewportFrameBuilder,
+};
 pub use frame_key::{
     FrameBuildGeometry, FrameBuildKey, FrameBuildRequest, FrameGeometry, FrameKey,
     FramePresentationState, FrameTableResize,
