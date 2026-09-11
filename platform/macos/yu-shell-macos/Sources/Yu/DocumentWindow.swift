@@ -399,7 +399,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// 大纲是一份跟着 Revision 走的派生视图，Revision 没动就不必重建——
     /// 光标移动不推进 Revision，不该让整棵树塌一次又展开一次。
     private func refreshOutline(force: Bool = false) {
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         guard force || outlineRevision != revision else { return }
         guard let items = bridge.outlineItemsIfAvailable else { return }
         outlineRevision = revision
@@ -423,7 +423,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// 结果列表是一份跟着 (Revision, 查询) 走的派生视图。
     private func refreshSearch(force: Bool = false) {
         guard !searchPanel.view.isHidden else { return }
-        let revision = bridge.state.revision
+        let revision = bridge.revision
         guard force || searchRevision != revision else { return }
         guard let matches = bridge.searchMatchesIfAvailable else { return }
         searchRevision = revision
@@ -715,7 +715,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         try require(sourceLength > 4, "fixture 太短，无法移动光标")
         let before = bridge.selection
         try bridge.setSelection(NSRange(location: 3, length: 0))
-        try require(bridge.state.revision == before.revision, "移动光标不应推进 Revision")
+        try require(bridge.revision == before.revision, "移动光标不应推进 Revision")
         try require(
             !surfaceCoordinator.hasCurrentFrame(),
             "光标移动后仍被判为当前帧——caret 会停在原处且不会报错"
@@ -1114,7 +1114,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         try require(surfaceCoordinator.lastSnapshot?.frameSerial == first.frameSerial
                     && !surfaceCoordinator.tableResizeActiveForSelfCheck,
                     "Read-only hover opened a gesture or changed publication")
-        try require(divider.revision == bridge.state.revision && divider.rect.height > 0,
+        try require(divider.revision == bridge.revision && divider.rect.height > 0,
                     "Invalid submitted table accessibility geometry")
         try require(surfaceCoordinator.adjustTableResizeAccessibility(divider, direction: 1),
                     "Table accessibility increment failed")
@@ -1148,7 +1148,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             let range = max(0, document.frame.height - scroll.contentView.bounds.height)
             scrollTo(range * CGFloat(step) / 12)
             let frame = try await submit()
-            try require(frame.commandCount > 0 && frame.revision == bridge.state.revision,
+            try require(frame.commandCount > 0 && frame.revision == bridge.revision,
                         "Long scroll submitted an empty or stale frame")
             let expectedWidth = scroll.contentView.bounds.width - 2 * textView.textContainerOrigin.x
             try require(abs(CGFloat(surfaceCoordinator.visualDecorationGeometry()?.maxWidth ?? 0) - expectedWidth) < 1,
@@ -1168,7 +1168,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         surfaceCoordinator.revealCaretIfNeeded()
         let last = try await submit()
         let caret = try bridge.shapedCaretScrollRequest(
-            revision: bridge.state.revision, size: Float(textView.font?.pointSize ?? 16),
+            revision: bridge.revision, size: Float(textView.font?.pointSize ?? 16),
             maxWidth: Float(max(textView.bounds.width - 2 * textView.textContainerOrigin.x, 1)),
             scrollY: Float(scroll.contentView.bounds.minY),
             viewportHeight: Float(scroll.contentView.bounds.height))
@@ -1527,7 +1527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             controller.configureToolbar(toolbar)
             installMainMenu(for: controller)
             controller.focusDocument()
-            print("Yu document host opened path=\(bridge.path) revision=\(bridge.state.revision)")
+            print("Yu document host opened path=\(bridge.path) revision=\(bridge.revision)")
             if launchSelfCheck {
                 // Give AppKit one complete appearance/layout turn. This is a
                 // real window smoke test: source fallback must become visible

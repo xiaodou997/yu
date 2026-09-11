@@ -841,6 +841,10 @@ int32_t yu_storage_session_cancel_composition(YuStorageSession *session,
                                               uint64_t expected_revision,
                                               uint64_t expected_generation);
 
+/* In-memory canonical Revision; no disk access or cached fallback. */
+int32_t yu_storage_session_revision(const YuStorageSession *session,
+                                    uint64_t *output);
+/* Full state includes external disk fingerprint comparison. */
 int32_t yu_storage_session_state(const YuStorageSession *session,
                                  YuStorageState *output);
 int32_t yu_storage_session_save(YuStorageSession *session,

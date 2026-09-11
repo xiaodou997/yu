@@ -1144,6 +1144,14 @@ final class StorageBridge {
         return cachedState
     }
 
+    /// The live canonical Revision, without the full state's disk inspection.
+    var revision: UInt64 {
+        var value: UInt64 = 0
+        let status = yu_storage_session_revision(handle, &value)
+        precondition(status == StorageStatus.ok, "Rust revision query failed: \(status)")
+        return value
+    }
+
     private func readState() throws -> NativeStorageState {
         var value = YuStorageState()
         let status = yu_storage_session_state(handle, &value)
@@ -1165,7 +1173,7 @@ final class StorageBridge {
     /// 滚动、「当前命中」按定义只说得出一个位置，走 `selection`；要画几根光标、
     /// 要知道是不是多光标，走这里。
     var selectionsIfAvailable: (ranges: [NativeSelection], primary: Int)? {
-        let revision = state.revision
+        let revision = self.revision
         var count = 0
         var primary = 0
         let countStatus = yu_storage_session_selections(
@@ -1226,7 +1234,7 @@ final class StorageBridge {
     /// query establishes the source-backed child-element contract without
     /// retaining a second document model in AppKit.
     var accessibilitySemanticNodesIfAvailable: [NativeAccessibilitySemanticNode]? {
-        let revision = state.revision
+        let revision = self.revision
         // count/fill 的长度查询形式：空指针 + 0 容量只回填数量。
         var count = 0
         let countStatus = yu_storage_session_accessibility_semantic_nodes_v2(
@@ -1261,7 +1269,7 @@ final class StorageBridge {
     /// 或外部改动撞在一起，所以 Revision 失配返回 nil 而不是中止进程——面板
     /// 保留上一版，比让一次刷新杀掉进程好。
     var outlineItemsIfAvailable: [NativeOutlineItem]? {
-        let revision = state.revision
+        let revision = self.revision
         var count = 0
         var textLength = 0
         let countStatus = yu_storage_session_outline_items(
@@ -1324,7 +1332,7 @@ final class StorageBridge {
 
     /// 当前查询的全部结果行，按文档顺序。与大纲同一个两遍协议。
     var searchMatchesIfAvailable: [NativeSearchMatch]? {
-        let revision = state.revision
+        let revision = self.revision
         var count = 0
         var textLength = 0
         let countStatus = yu_storage_session_search_matches(
@@ -1441,7 +1449,7 @@ final class StorageBridge {
         guard !ranges.isEmpty, primary >= 0, primary < ranges.count else {
             throw BridgeError.operation(StorageStatus.invalidSelection)
         }
-        let current = state.revision
+        let current = revision
         let entries = ranges.map { range in
             YuStorageSelectionEndpoints(
                 revision: current,
@@ -1463,7 +1471,7 @@ final class StorageBridge {
     }
 
     func insertText(_ text: String) throws -> NativeCommandResult {
-        let current = state.revision
+        let current = revision
         let bytes = Array(text.utf8)
         var result = YuStorageCommandResult()
         let status = bytes.withUnsafeBufferPointer { buffer in
@@ -1494,7 +1502,7 @@ final class StorageBridge {
         var result = YuStorageCommandResult()
         let status = yu_storage_session_move_vertical(
             handle,
-            state.revision,
+            revision,
             command,
             size,
             maxWidth,
@@ -1516,7 +1524,7 @@ final class StorageBridge {
     }
 
     func beginComposition(replacementRange: NSRange, preedit: String, selection: NSRange) throws {
-        let current = state.revision
+        let current = revision
         let bytes = Array(preedit.utf8)
         let status = bytes.withUnsafeBufferPointer { buffer in
             yu_storage_session_begin_composition(
@@ -1653,7 +1661,7 @@ final class StorageBridge {
     }
 
     func copySelection() -> String {
-        let current = state.revision
+        let current = revision
         return copyBytes { output, capacity, written in
             yu_storage_session_copy_selection(
                 handle,
