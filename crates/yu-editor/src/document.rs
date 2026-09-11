@@ -61,6 +61,41 @@ pub struct EditorDocument {
     search_generation: u64,
 }
 
+/// Immutable render input. Capturing it neither flattens source storage nor
+/// parses Markdown, lays out blocks, or copies edit history. Reconstitution
+/// belongs to the preparation worker.
+#[derive(Clone, Debug)]
+pub struct EditorRenderSnapshot {
+    source: TextSnapshot,
+    viewport: ViewportConfig,
+    selections: Selections,
+    composition: Option<CompositionOverlay>,
+    search_query: Option<String>,
+    search_generation: u64,
+}
+
+impl EditorRenderSnapshot {
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.source.revision()
+    }
+
+    pub fn into_document(self) -> Result<EditorDocument, EditorDocumentError> {
+        let mut document = EditorDocument::new_with_buffer(TextBuffer::from_text_at_revision(
+            self.source.as_str(),
+            self.source.revision(),
+        ));
+        document.set_viewport_config(self.viewport)?;
+        document.selections = self.selections;
+        document.composition = self.composition;
+        if let Some(query) = self.search_query {
+            document.set_search_query(&query);
+        }
+        document.search_generation = self.search_generation;
+        Ok(document)
+    }
+}
+
 impl EditorDocument {
     /// Creates a document at the initial revision.
     #[must_use]
@@ -102,34 +137,23 @@ impl EditorDocument {
         self.buffer.snapshot()
     }
 
-    /// Builds an independent document for background render preparation.
-    ///
-    /// The canonical editor keeps mutable incremental caches and history and
-    /// therefore must remain on its owner thread.  A render clone preserves
-    /// only the source revision and visual state that affect a frame; layout
-    /// and decoration caches are intentionally rebuilt in the worker.
+    /// Captures only owned source storage and revision-bound visual state.
+    #[must_use]
+    pub fn capture_render_snapshot(&self) -> EditorRenderSnapshot {
+        EditorRenderSnapshot {
+            source: self.snapshot(),
+            viewport: self.viewport_config(),
+            selections: self.selections.clone(),
+            composition: self.composition.clone(),
+            search_query: self.search().map(|search| search.query().to_owned()),
+            search_generation: self.search_generation,
+        }
+    }
+
+    /// Synchronous convenience for diagnostic callers. The render worker uses
+    /// `capture_render_snapshot` and reconstructs the document off-thread.
     pub fn clone_for_render(&self) -> Result<Self, EditorDocumentError> {
-        let snapshot = self.snapshot();
-        let mut clone = Self::new_with_buffer(TextBuffer::from_text_at_revision(
-            snapshot.as_str(),
-            snapshot.revision(),
-        ));
-        clone.set_viewport_config(self.viewport_config())?;
-        clone.set_selections(
-            self.selections.as_slice().iter().copied(),
-            self.selections.primary_index(),
-        )?;
-        if let Some(search) = self.search() {
-            clone.set_search_query(search.query());
-        }
-        if let Some(composition) = self.composition() {
-            clone.begin_composition(
-                composition.replacement_range(),
-                composition.text(),
-                composition.selection_utf16(),
-            )?;
-        }
-        Ok(clone)
+        self.capture_render_snapshot().into_document()
     }
 
     fn new_with_buffer(buffer: TextBuffer) -> Self {
@@ -4911,6 +4935,44 @@ prefix **羽🙂** suffix
             .expect("reset should work after cancellation");
         assert_eq!(document.revision(), Revision::INITIAL);
         assert_eq!(document.snapshot().as_str(), "new");
+    }
+
+    #[test]
+    fn immutable_render_input_survives_owner_edits_and_rebuilds_on_worker() {
+        let mut document = EditorDocument::new("alpha beta 👨‍👩‍👧‍👦");
+        document.set_search_query("alpha");
+        document.set_search_query("beta");
+        document
+            .begin_composition(source_range(0, 5), "日本🙂", utf16_range(2, 2))
+            .unwrap();
+        let expected_source = document.snapshot().as_str().to_owned();
+        let expected_selections = document.selections().clone();
+        let expected_composition = document.composition().cloned();
+        let expected_search_generation = document.search_generation;
+        let viewport_before = document.viewport_stats();
+        let layout_before = document.layout_cache_stats();
+        let input = document.capture_render_snapshot();
+        assert_eq!(document.viewport_stats(), viewport_before);
+        assert_eq!(document.layout_cache_stats(), layout_before);
+        assert!(document.cancel_composition());
+        document
+            .execute(EditorCommand::insert_text("changed"))
+            .unwrap();
+        drop(document);
+        let owner_thread = std::thread::current().id();
+        let rebuilt = std::thread::spawn(move || {
+            assert_ne!(std::thread::current().id(), owner_thread);
+            input.into_document().unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(rebuilt.snapshot().as_str(), expected_source);
+        assert_eq!(rebuilt.revision(), Revision::INITIAL);
+        assert_eq!(rebuilt.selections(), &expected_selections);
+        assert_eq!(rebuilt.composition(), expected_composition.as_ref());
+        assert_eq!(rebuilt.search_generation, expected_search_generation);
+        assert_eq!(rebuilt.search().unwrap().query(), "beta");
+        assert_eq!(rebuilt.history_stats().undo_entries(), 0);
     }
 
     #[test]
