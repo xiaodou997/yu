@@ -149,6 +149,9 @@ final class MacosSurfaceHostCoordinator {
     }
 
     func noteBoundsEvent() {
+        if !isApplyingCaretReveal && !isApplyingContentExtent {
+            pendingCaretReveal = nil
+        }
         guard Self.timingEnabled else { return }
         pendingBoundsEventTime = pendingBoundsEventTime ?? CACurrentMediaTime()
     }
@@ -165,7 +168,7 @@ final class MacosSurfaceHostCoordinator {
     ///
     /// 这里刻意不含 Revision、composition generation 或 selection：它们是 Rust
     /// 的状态，平台把它们复制过来只会多出一份可能过期的副本。
-    private struct FrameGeometry {
+    private struct FrameGeometry: Equatable {
         let size: CGFloat
         let maxWidth: CGFloat
         let scrollY: CGFloat
@@ -179,7 +182,7 @@ final class MacosSurfaceHostCoordinator {
     private weak var surfaceView: MacosSurfaceHostView?
     private weak var scrollView: NSScrollView?
     private var fontSize: CGFloat
-    private var contentWidth: CGFloat?
+    private var horizontalContentInset: CGFloat = 0
     private(set) var lastSnapshot: NativeMacosRenderHostSurfaceSnapshot?
     private var frameWakeGate = FrameWakeGate()
     private var pendingSubmitIntent = FrameSubmitIntent()
@@ -209,6 +212,8 @@ final class MacosSurfaceHostCoordinator {
     private var liveSubmitDurationsMilliseconds: [Double] = []
     private var appliedContentHeight: CGFloat?
     private var isApplyingContentExtent = false
+    private var pendingCaretReveal: NativeSelectionEndpoints?
+    private var isApplyingCaretReveal = false
     private(set) var lastSubmitDurationMilliseconds: Double = 0.0
 
     var onError: ((Error) -> Void)?
@@ -250,7 +255,7 @@ final class MacosSurfaceHostCoordinator {
         pendingSubmitIntent = FrameSubmitIntent()
         self.scrollView = scrollView
         self.fontSize = max(fontSize, 1.0)
-        contentWidth = nil
+        horizontalContentInset = 0
         lastSnapshot = nil
         imageRefreshNeeded = false
         tableResizePointerState.reset()
@@ -270,6 +275,7 @@ final class MacosSurfaceHostCoordinator {
     /// state explicit so the scheduler can use a frame-paced, latest-only path
     /// during the gesture without changing caret or edit submission semantics.
     func beginLiveScroll() {
+        pendingCaretReveal = nil
         if liveScrollDepth == 0 {
             recordMetric("live_begin", fields: "max_fps=\(surfaceView?.window?.screen?.maximumFramesPerSecond ?? 0) scale=\(surfaceView?.window?.backingScaleFactor ?? 0) width=\(surfaceView?.window?.frame.width ?? 0) height=\(surfaceView?.window?.frame.height ?? 0)")
             scrollMetrics = ScrollSchedulerMetrics()
@@ -312,17 +318,15 @@ final class MacosSurfaceHostCoordinator {
         scheduleSubmit()
     }
 
-    /// Publishes the text content width used by the source TextKit mirror.
-    /// The transparent surface may span the full clip viewport, while native
-    /// text insets reduce the actual wrapping width. Keeping this value in
-    /// the coordinator makes metrics, shaped hit-testing and render layout
-    /// share one width contract.
-    func setContentWidth(_ width: CGFloat) {
-        let next = max(width, 1.0)
-        if let current = contentWidth, abs(current - next) <= 0.5 {
+    /// Retain the text inset, not a width captured during an AppKit layout
+    /// callback. Every query derives wrapping width from the current surface,
+    /// even while NSTextView is still resizing to match its clip view.
+    func setHorizontalContentInset(_ inset: CGFloat) {
+        let next = max(inset, 0.0)
+        if abs(horizontalContentInset - next) <= 0.5 {
             return
         }
-        contentWidth = next
+        horizontalContentInset = next
         scheduleSubmit()
     }
 
@@ -391,7 +395,7 @@ final class MacosSurfaceHostCoordinator {
     }
 
     private func layoutWidth(for surfaceView: MacosSurfaceHostView) -> CGFloat {
-        max(contentWidth ?? surfaceView.bounds.width, 1.0)
+        max(surfaceView.bounds.width - horizontalContentInset, 1.0)
     }
 
     /// Match the coalescing cadence to the active display. A fixed 16ms delay
@@ -848,11 +852,34 @@ final class MacosSurfaceHostCoordinator {
     /// AppKit invent document geometry. A stale or unavailable request is
     /// ignored so a transient surface race cannot interrupt editing.
     func revealCaretIfNeeded() {
+        guard !isLiveScrolling else { return }
+        pendingCaretReveal = bridge.selectionEndpoints
+        _ = continueCaretReveal()
+    }
+
+    func refineCaretRevealIfNeeded() {
+        _ = continueCaretReveal()
+    }
+
+    /// A navigation target can move while previously estimated blocks are
+    /// measured. Keep that intent until an accepted frame contains the caret;
+    /// ordinary user scrolling and detach cancel it immediately.
+    @discardableResult
+    private func continueCaretReveal() -> Bool {
+        guard let pending = pendingCaretReveal else { return false }
+        let current = bridge.selectionEndpoints
+        guard pending.revision == current.revision,
+              pending.focusUTF16 == current.focusUTF16,
+              pending.anchorUTF16 == current.anchorUTF16,
+              pending.affinity == current.affinity else {
+            pendingCaretReveal = nil
+            return false
+        }
         guard let surfaceView,
               let scrollView,
               surfaceView.bounds.width > 0.0,
               surfaceView.bounds.height > 0.0 else {
-            return
+            return false
         }
         let revision = bridge.state.revision
         let size = max(fontSize, 1.0)
@@ -871,26 +898,43 @@ final class MacosSurfaceHostCoordinator {
             guard request.revision == revision,
                   request.currentScrollY.isFinite,
                   request.targetScrollY.isFinite,
-                  request.targetScrollY >= 0.0,
-                  request.needsScroll else {
-                return
+                  request.targetScrollY >= 0.0 else {
+                pendingCaretReveal = nil
+                return false
+            }
+            if !request.needsScroll {
+                if hasCurrentFrame(), (lastSnapshot?.caretDecorationCount ?? 0) > 0 {
+                    pendingCaretReveal = nil
+                }
+                return false
             }
             let nativeMaxScrollY = max(
                 (scrollView.documentView?.bounds.height ?? 0.0) - viewportHeight,
                 0.0
             )
             let targetScrollY = min(max(request.targetScrollY, 0.0), nativeMaxScrollY)
-            guard abs(targetScrollY - currentScrollY) > 0.5 else { return }
+            guard abs(targetScrollY - currentScrollY) > 0.5 else {
+                // AppKit rounds clip origins to backing pixels. A subpixel
+                // difference is settled once this frame contains the caret.
+                if hasCurrentFrame(), (lastSnapshot?.caretDecorationCount ?? 0) > 0 {
+                    pendingCaretReveal = nil
+                }
+                return false
+            }
             var origin = viewportBounds.origin
             origin.y = targetScrollY
+            isApplyingCaretReveal = true
+            defer { isApplyingCaretReveal = false }
             scrollView.contentView.setBoundsOrigin(origin)
             scrollView.reflectScrolledClipView(scrollView.contentView)
             scheduleSubmit()
+            return true
         } catch {
             // Caret reveal is an enhancement to the source TextKit view. The
             // source mirror remains interactive if shaped metrics are stale,
             // unavailable, or temporarily racing a document edit.
         }
+        return false
     }
 
     /// 让可滚动范围等于 Rust 这一帧渲染出来的内容高度。
@@ -1040,10 +1084,23 @@ final class MacosSurfaceHostCoordinator {
         } else {
             cancelImageResourceRefresh()
         }
+        if currentFrameGeometry != geometry {
+            // Applying content extent may finish AppKit layout and resize the
+            // clip/surface. This submission belongs to the previous geometry.
+            recordMetric("geometry_changed_during_submit")
+            scheduleSubmit()
+            return nil
+        }
+        if continueCaretReveal() {
+            // The submitted frame was valid for the old camera. A newly
+            // refined navigation target must get its own latest presentation.
+            return nil
+        }
         return snapshot
     }
 
     func detach() {
+        pendingCaretReveal = nil
         if isLiveScrolling { recordMetric("live_end") }
         pendingBoundsEventTime = nil
         presentationRetry?.cancel()

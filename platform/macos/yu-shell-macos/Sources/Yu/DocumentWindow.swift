@@ -54,6 +54,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private var externalCheckWorkItem: DispatchWorkItem?
     private var promptedExternalDisk: DiskState?
     private var surfaceBoundsObserver: NSObjectProtocol?
+    private var surfaceFrameObserver: NSObjectProtocol?
     private var scrollLifecycleObservers: [NSObjectProtocol] = []
     private weak var documentScrollView: NSScrollView?
     private weak var documentSplitView: NSSplitView?
@@ -92,6 +93,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     deinit {
         if let surfaceBoundsObserver {
             NotificationCenter.default.removeObserver(surfaceBoundsObserver)
+        }
+        if let surfaceFrameObserver {
+            NotificationCenter.default.removeObserver(surfaceFrameObserver)
         }
         for observer in scrollLifecycleObservers {
             NotificationCenter.default.removeObserver(observer)
@@ -229,10 +233,22 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             object: scrollView.contentView,
             queue: .main
         ) { [weak self] _ in
+            self?.syncSurfaceGeometry()
             self?.surfaceCoordinator.noteBoundsEvent()
             self?.scheduleVisualSubmit()
             self?.syncSourceGlyphVisibility()
             self?.textView.refreshTableResizeAccessibility()
+        }
+
+        // NSScrollView can finish resizing its clip view after the controller's
+        // viewDidLayout callback. Follow that final frame, not the earlier size.
+        scrollView.contentView.postsFrameChangedNotifications = true
+        surfaceFrameObserver = NotificationCenter.default.addObserver(
+            forName: NSView.frameDidChangeNotification,
+            object: scrollView.contentView, queue: .main
+        ) { [weak self] _ in
+            self?.syncSurfaceGeometry()
+            self?.scheduleVisualSubmit()
         }
 
         let notifications: [(Notification.Name, () -> Void)] = [
@@ -515,31 +531,33 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     var outlineIsVisible: Bool { !outlinePanel.scrollView.isHidden }
 
-    override func viewDidLayout() {
-        super.viewDidLayout()
+    private func syncSurfaceGeometry() {
         guard let scrollView = documentScrollView else { return }
         let viewportFrame = view.convert(scrollView.contentView.frame, from: scrollView)
+        if visualEnhancementsReady {
+            surfaceCoordinator.setHorizontalContentInset(2.0 * textView.textContainerOrigin.x)
+        }
         if surfaceHostView.frame != viewportFrame {
             surfaceHostView.frame = viewportFrame
         }
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        syncSurfaceGeometry()
         guard visualEnhancementsReady else {
             // Keep the native source mirror fully visible during the first
             // layout. The enhancement layer is enabled from viewDidAppear,
             // after AppKit has a real window/clip geometry to report.
             return
         }
-        let visualWidth = max(
-            textView.bounds.width - 2.0 * textView.textContainerOrigin.x,
-            1.0
-        )
-        surfaceCoordinator.setContentWidth(visualWidth)
         textView.refreshTableResizeAccessibility()
         // 指针命中测试直接走 Rust layout，不需要预先建立任何 TextKit 镜像，
         // 因而也没有「适配器未就绪」这个状态。
         syncSourceGlyphVisibility()
         textView.refreshTableResizeAccessibility()
         surfaceCoordinator.scheduleSubmit()
-        surfaceCoordinator.revealCaretIfNeeded()
+        surfaceCoordinator.refineCaretRevealIfNeeded()
     }
 
     override func viewDidAppear() {
@@ -1094,6 +1112,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             let frame = try await submit()
             try require(frame.commandCount > 0 && frame.revision == bridge.state.revision,
                         "Long scroll submitted an empty or stale frame")
+            let expectedWidth = scroll.contentView.bounds.width - 2 * textView.textContainerOrigin.x
+            try require(abs(CGFloat(surfaceCoordinator.visualDecorationGeometry()?.maxWidth ?? 0) - expectedWidth) < 1,
+                        "Render geometry kept a stale pre-resize content width: step=\(step) expected=\(expectedWidth) actual=\(surfaceCoordinator.visualDecorationGeometry()?.maxWidth ?? 0) surface=\(surfaceHostView.bounds.width) clip=\(scroll.contentView.bounds.width) inset=\(textView.textContainerOrigin.x)")
             try require(abs(document.frame.height - max(frame.contentHeight, scroll.contentView.bounds.height)) < 1,
                         "Scroll extent disagrees with accepted publication")
             if step % 3 == 0 {
@@ -1113,13 +1134,26 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             maxWidth: Float(max(textView.bounds.width - 2 * textView.textContainerOrigin.x, 1)),
             scrollY: Float(scroll.contentView.bounds.minY),
             viewportHeight: Float(scroll.contentView.bounds.height))
-        let finalLineVisible = !caret.needsScroll && last.caretDecorationCount > 0
+        // A fractional Rust target may round to a backing pixel in AppKit.
+        // Test visibility itself, not exact equality with that scroll target.
+        let finalLineVisible = caret.caretPoint.y >= scroll.contentView.bounds.minY - 0.5
+            && caret.caretPoint.y + caret.caretHeight <= scroll.contentView.bounds.maxY + 0.5
+            && last.caretDecorationCount > 0
         let finalLineFailure = "Final line cannot be brought into the viewport: carets=\(last.caretDecorationCount) needsScroll=\(caret.needsScroll) caretY=\(caret.caretPoint.y) currentY=\(scroll.contentView.bounds.minY) targetY=\(caret.targetScrollY) height=\(last.contentHeight) viewport=\(scroll.contentView.bounds.height)"
+        // A later scroll wins over a still-pending navigation. Use bounds
+        // events without manufacturing live-scroll performance samples.
+        scrollTo(0)
+        surfaceCoordinator.revealCaretIfNeeded()
+        scrollTo(0)
+        _ = try await submit()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try require(abs(scroll.contentView.bounds.minY) < 1,
+                    "Pending caret navigation pulled back a later scroll")
         surfaceCoordinator.detach()
         try require(!surfaceCoordinator.hasCurrentFrame(), "Detach kept old frame current")
         let rebound = try await submit()
         try require(rebound.frameSerial > last.frameSerial, "Rebind used old publication")
-        print("Yu render regression self-check: long=true steps=12 resize=4 final_line=\(finalLineVisible) rebind=true bytes=\(bridge.source.utf8.count)")
+        print("Yu render regression self-check: long=true steps=12 resize=4 final_line=\(finalLineVisible) scroll_cancels_navigation=true rebind=true bytes=\(bridge.source.utf8.count)")
         try require(finalLineVisible, finalLineFailure)
     }
 
