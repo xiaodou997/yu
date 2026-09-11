@@ -366,6 +366,11 @@ For a real-window phase breakdown, launch the app with `YU_RENDER_TIMING=1`.
 The Rust bridge then prints `build`, `image-sync`, `total`, and `reused` for
 each submitted frame; keep this disabled for normal use.
 
+For a repeatable production-surface timing smoke pass, run
+`./run-render-bench.sh [fixture.md]`. It launches the real window self-check
+with `YU_RENDER_TIMING=1` and preserves the per-frame timing stream. Use
+Instruments for the final continuous-scroll p95 and GPU wait measurements.
+
 Use `--dark-mode-self-check --launch-window-self-check` with a fixture to force
 a single window into Dark Aqua and assert the effective appearance, without
 changing the system appearance; this is useful for checking that the Rust

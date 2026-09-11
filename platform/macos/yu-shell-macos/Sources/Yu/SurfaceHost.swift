@@ -85,6 +85,7 @@ struct ScrollSchedulerMetrics: Equatable {
     fileprivate(set) var coalesced: UInt64 = 0
     fileprivate(set) var followUps: UInt64 = 0
     fileprivate(set) var overBudget: UInt64 = 0
+    fileprivate(set) var busy: UInt64 = 0
 }
 /// Keeps the native pointer route explicit and headless-testable. Rust owns
 /// the geometry preview; this state only answers whether subsequent mouse
@@ -187,6 +188,7 @@ final class MacosSurfaceHostCoordinator {
         self.enqueueSubmit(immediate: true, force: false, resetRefreshBudget: false)
     }
     private(set) var scrollMetrics = ScrollSchedulerMetrics()
+    private var liveFrameDurationsMilliseconds: [Double] = []
     private var appliedContentHeight: CGFloat?
     private var isApplyingContentExtent = false
     private(set) var lastSubmitDurationMilliseconds: Double = 0.0
@@ -251,6 +253,7 @@ final class MacosSurfaceHostCoordinator {
     func beginLiveScroll() {
         if liveScrollDepth == 0 {
             scrollMetrics = ScrollSchedulerMetrics()
+            liveFrameDurationsMilliseconds.removeAll(keepingCapacity: true)
             displayLinkPacer.start()
         }
         liveScrollDepth += 1
@@ -264,6 +267,20 @@ final class MacosSurfaceHostCoordinator {
         let metrics = scrollMetrics
         Self.renderLog.debug("live scroll settled requests=\(metrics.requested, privacy: .public) coalesced=\(metrics.coalesced, privacy: .public)")
         Self.renderLog.debug("live scroll followUps=\(metrics.followUps, privacy: .public) overBudget=\(metrics.overBudget, privacy: .public)")
+        Self.renderLog.debug("live scroll renderBusy=\(metrics.busy, privacy: .public)")
+        if !liveFrameDurationsMilliseconds.isEmpty {
+            let sorted = liveFrameDurationsMilliseconds.sorted()
+            let percentile: (Double) -> Double = { fraction in
+                let index = min(
+                    sorted.count - 1,
+                    Int((Double(sorted.count - 1) * fraction).rounded())
+                )
+                return sorted[index]
+            }
+            Self.renderLog.info(
+                "live scroll frame timing samples=\(sorted.count, privacy: .public) p50=\(percentile(0.50), privacy: .public)ms p95=\(percentile(0.95), privacy: .public)ms p99=\(percentile(0.99), privacy: .public)ms"
+            )
+        }
         scheduleSubmit(immediate: true)
     }
 
@@ -916,6 +933,12 @@ final class MacosSurfaceHostCoordinator {
             let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
             let milliseconds = Double(elapsed) / 1_000_000.0
             lastSubmitDurationMilliseconds = milliseconds
+            if isLiveScrolling {
+                if liveFrameDurationsMilliseconds.count == 4096 {
+                    liveFrameDurationsMilliseconds.removeFirst()
+                }
+                liveFrameDurationsMilliseconds.append(milliseconds)
+            }
             if milliseconds > 16.7 {
                 scrollMetrics.overBudget &+= 1
                 Self.renderLog.warning(
@@ -956,6 +979,7 @@ final class MacosSurfaceHostCoordinator {
             // The Rust surface exists even when its first presentation is busy.
             // Keep lifecycle ownership so closing the window still detaches it.
             isAttached = true
+            scrollMetrics.busy &+= 1
             pendingSubmitIntent.merge(force: force)
             if presentationRetry == nil {
                 let token = scheduleToken
