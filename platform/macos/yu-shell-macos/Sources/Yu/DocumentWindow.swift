@@ -978,6 +978,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                 restored.surfaceGeneration > resizedFrame.surfaceGeneration,
                 "restoring window size did not advance surface generation"
             )
+            surfaceCoordinator.detach()
+            try require(!surfaceCoordinator.hasCurrentFrame(), "detach retained a current frame")
+            let rebound = try require(await submit(), "reattachment after resize failed")
+            try require(rebound.submitted, "reattachment did not submit")
+            try require(rebound.frameSerial > restored.frameSerial, "reattachment reused a stale publication serial")
+            try require(surfaceCoordinator.hasCurrentFrame(), "reattachment did not restore current frame")
         }
 
         print(
