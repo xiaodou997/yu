@@ -186,3 +186,47 @@ bounds-to-request p95 287.840ms，仍有明显长尾；这些分布覆盖脚本�
 yu_storage_session_table_resize_at_point`（包含子调用约 1.753s），仍触发可见块
 排版。另有启动/选区同步成本，需分别定位。此次不扩展修改这些路径。
 真实手势 p95 ≤ 16.7ms、残影、VoiceOver 交互、IME 和跨显示器验收仍未完成。
+
+## 表格悬停复用已提交几何（2026-09-11）
+
+`tableResizeHover` 现在调用独立的只读 Rust hover 查询，从已提交 frame 的
+`ViewportTableGeometry` 判断列分隔线。与 AX 枚举共用 publication 有效性校验，
+但不构造 AX 描述符或转换 source UTF-16，也不创建 CoreText shaper。原有完整
+PROBE / BEGIN / UPDATE / FINISH 路径保留，用于实际拖动操作；无窗口协议检查
+保留同步 hover fallback。窗口初始未附着或 detach 后返回普通光标。
+
+证据目录 `.notes/macos-hover-frame-20260911-a/`：Apple M1 Max / Mac13,1，
+macOS 26.5 / 25F71、Xcode 26.6 / 17F113，debug，2x / 60Hz；窗口尺寸与 fixture
+同上，binary SHA 和完整运行环境已记录。
+
+- Rust 46 项 workspace 与 48 项 FFI 检查通过。几何检查与原 TableLayout
+  命中测试逐点比较，覆盖容差边界、上下边界及非零文档偏移；FFI 验证命中、
+  未命中、过期 Revision 与非有限坐标，并检查失败输出清零。
+- 长文档及延迟资源真实窗口检查通过。新增连续 100 次悬停不启动手势或改变
+  publication、表格范围外不命中、未提交新列宽不命中、列宽提交后跟随新位置、
+  detach 后不命中的断言。14 项协议 self-check 和 Dark Aqua 窗口检查通过。
+- 长文档共 104 次 `hover_frame_query`，`hover_layout_fallback=0`；两组场景
+  `ax_layout_fallback` 也均为 0。runner 要求长文档至少 100 次帧悬停查询，且
+  两组场景均无 hover 同步回退。
+- 无 Instruments 的完整 Swift `hover_query` 共 105 个样本（含 detach 的提前
+  返回），p50 1.668ms / p95 1.780ms / p99 1.789ms。计时包含 bridge 状态读取，
+  不包含外层 metric 输出；开启 timing，故不作为正式交互性能验收。
+
+连续触控板帧间隔仍无样本，后台 preparation 的脚本 p95 633.858ms 也仍有长尾。
+本次只消除悬停查询中的同步排版，不据此宣称整体滚动达到 16.7ms。
+
+Instruments 第一份 `.notes/macos-hover-instruments-20260911-a/` 的应用自检完成，
+但 xctrace 保存退出码为 1，导出报 `Document Missing Template Error`；该 trace
+不作为采样证据。重录的 `.notes/macos-hover-instruments-20260911-b/` 以退出码 0
+保存，CPU XML 成功导出，二进制与上述自动回归一致。
+
+有效 trace 主线程累计样本权重 15.711s，悬停包含子调用权重 250ms，AX 刷新
+147ms；同时包含各自入口与 `visible_blocks_with_shaper` 的样本均为 0。通用
+`table_resize_at_point` 仍有 68ms 样本，用于实际列宽操作，未宣称所有主线程
+表格排版都已移除。脚本比旧 trace 多了 100 次主动 hover，不作为受控提速倍率。
+
+悬停剩余样本中，247ms 包含 `yu_storage_session_state`，242ms 包含
+`current_fingerprint`。代码确认 Swift 获取 `bridge.state.revision` 会连带执行
+`disk_state → current_fingerprint → fs::read`。下一项应将高频 Revision 查询
+与磁盘外部修改检测分离，保留保存/重新加载时的冲突校验；本次尚未修改这部分。
+上述 inclusive 样本相互包含，不能相加，也不是单次查询时长。
