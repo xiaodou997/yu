@@ -4918,7 +4918,22 @@ fn macos_render_host_frame(
                 return Err(YU_STORAGE_RENDER_BUSY);
             }
         } else {
-            return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+            // Worker creation is an optimization boundary, not a reason to
+            // lose the document surface.  If the thread cannot be started,
+            // publish the owned snapshot synchronously and keep the same
+            // publication/atlas validation path.
+            let mut document = document;
+            (
+                state
+                    .builder
+                    .publish_with_images_and_intrinsics(
+                        &mut document,
+                        &image_publications,
+                        &image_intrinsics,
+                    )
+                    .map_err(|error| macos_render_host_error_status(&error))?,
+                None,
+            )
         }
     } else {
         let document = session.session.document_mut().editor_mut();
