@@ -44,16 +44,17 @@ Yu 的技术本质是：
 
 v2 重构分 7 个阶段推进，每个阶段结束时 app 必须可运行、CI 必须全绿。
 阶段定义与验收标准见[架构总览 v2 第 8 节](docs/architecture/overview-v2.md)。
+macOS 基础体验的真实窗口验收记录见 [macOS acceptance](docs/macos-acceptance.md)。
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | S1 | 拆炸弹：删除 TextKit fallback 与诊断桥，帧调度移入 Rust，app 转正 | 已完成（Swift 行数目标未达成，见第 8 节） |
 | S2 | 地基：坐标收敛、`yu-text` 换 ropey、CI 强制依赖方向 | 已完成 |
 | S3 | 解析器：移植 lezer-markdown 算法，建立 CommonMark spec 差分测试 | 已完成 |
-| S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 未开始 |
-| S5 | 布局重写：UAX #14 断行、UAX #9 bidi、widget 盒模型 | 未开始 |
-| S6 | 语义 extension 化：每种语法收敛为一个 extension | 未开始 |
-| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 未开始 |
+| S4 | 中枢：`yu-decoration`（RangeSet + Decoration）与 `yu-state` | 已完成 |
+| S5 | 布局重写：UAX #14 断行、UAX #9 bidi、widget 盒模型 | 已完成 |
+| S6 | 语义 extension 化：每种语法收敛为一个 extension | 已完成 |
+| S7 | 产品面：搜索、大纲、多光标、代码高亮、导出、第二平台 | 进行中（macOS 基础壳与 retained 滚动已接入；真实窗口性能验收待完成） |
 
 ## 仓库结构
 

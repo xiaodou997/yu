@@ -345,3 +345,30 @@ source、dirty 或 history。
 
 `Fixtures/assets/yu-logo.png` 与 `Fixtures/assets/yu-mark.png` 分别使用主标和 64px
 光学修正版，供 `render-images.md` / `render-images-plan.md` 的图片资源测试使用。
+# Scroll scheduler regression check
+
+Run from the repository root (no window server or Rust FFI required):
+
+```sh
+swiftc -module-cache-path /tmp/yu-scroll-swift-cache \
+  platform/macos/yu-shell-macos/Sources/Yu/FrameWakeGate.swift \
+  platform/macos/yu-shell-macos/Tests/FrameWakeGateChecks.swift \
+  -o /tmp/yu-frame-wake-checks
+/tmp/yu-frame-wake-checks
+```
+
+Checks continuous-input starvation, immediate promotion, duplicate callbacks,
+and detach/rebind invalidation. This is a scheduler correctness test, not a
+frame-rate benchmark. `run-scroll-bench.sh` measures CPU storage/parser work;
+it does not open a window or measure Metal presentation latency.
+
+For a real-window phase breakdown, launch the app with `YU_RENDER_TIMING=1`.
+The Rust bridge then prints `build`, `image-sync`, `total`, and `reused` for
+each submitted frame; keep this disabled for normal use.
+
+Use `--dark-mode-self-check --launch-window-self-check` with a fixture to force
+a single window into Dark Aqua and assert the effective appearance, without
+changing the system appearance; this is useful for checking that the Rust
+surface and sidebar update together.
+For a reliable direct launch that terminates an older development instance first,
+run `./run-dark-self-check.sh [fixture.md]`.

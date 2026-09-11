@@ -38,6 +38,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private let surfaceHostView = MacosSurfaceHostView()
     private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
+    private let statusDetailLabel = NSTextField(labelWithString: "")
     private let outlinePanel = OutlinePanel()
     private var outlineRevision: UInt64?
     private let searchPanel = SearchPanel()
@@ -46,13 +47,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private var searchRevision: UInt64?
     private var searchQuery = ""
     private weak var sidebarStack: NSStackView?
-    private var saveButton: NSButton?
-    private var reloadButton: NSButton?
+    private weak var sidebarContainer: NSView?
+    private weak var windowToolbar: NSToolbar?
     private var initialState: NativeStorageState
     private var fileWatcher: NativeFileWatcher?
     private var externalCheckWorkItem: DispatchWorkItem?
     private var promptedExternalDisk: DiskState?
     private var surfaceBoundsObserver: NSObjectProtocol?
+    private var scrollLifecycleObservers: [NSObjectProtocol] = []
     private weak var documentScrollView: NSScrollView?
     private weak var documentSplitView: NSSplitView?
     private var visualPointerAdapterEnabled = false
@@ -91,6 +93,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         if let surfaceBoundsObserver {
             NotificationCenter.default.removeObserver(surfaceBoundsObserver)
         }
+        for observer in scrollLifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
         surfaceCoordinator.detach()
     }
 
@@ -100,6 +105,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.verticalScrollElasticity = .automatic
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .textBackgroundColor
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         surfaceHostView.translatesAutoresizingMaskIntoConstraints = true
         surfaceHostView.autoresizingMask = []
@@ -225,22 +234,51 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             self?.textView.refreshTableResizeAccessibility()
         }
 
+        let notifications: [(Notification.Name, () -> Void)] = [
+            (NSScrollView.willStartLiveScrollNotification, { [weak self] in
+                self?.surfaceCoordinator.beginLiveScroll()
+            }),
+            (NSScrollView.didLiveScrollNotification, { [weak self] in
+                self?.scheduleVisualSubmit()
+            }),
+            (NSScrollView.didEndLiveScrollNotification, { [weak self] in
+                self?.surfaceCoordinator.endLiveScroll()
+                self?.scheduleVisualSubmit()
+            }),
+        ]
+        scrollLifecycleObservers = notifications.map { name, handler in
+            NotificationCenter.default.addObserver(
+                forName: name,
+                object: scrollView,
+                queue: .main
+            ) { _ in handler() }
+        }
+
         statusLabel.setAccessibilityElement(true)
         statusLabel.setAccessibilityLabel("文档状态")
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        statusLabel.textColor = .secondaryLabelColor
 
-        let toolbar = NSStackView()
-        toolbar.orientation = .horizontal
-        toolbar.alignment = .centerY
-        toolbar.spacing = 10
-        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        statusDetailLabel.font = NSFont.monospacedDigitSystemFont(
+            ofSize: NSFont.smallSystemFontSize,
+            weight: .regular
+        )
+        statusDetailLabel.textColor = .secondaryLabelColor
+        statusDetailLabel.alignment = .right
+        statusDetailLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusDetailLabel.setAccessibilityElement(true)
+        statusDetailLabel.setAccessibilityLabel("文档编码")
 
-        let saveButton = NSButton(title: "保存", target: self, action: #selector(save))
-        let reloadButton = NSButton(title: "重新加载", target: self, action: #selector(reload))
-        self.saveButton = saveButton
-        self.reloadButton = reloadButton
-        toolbar.addArrangedSubview(saveButton)
-        toolbar.addArrangedSubview(reloadButton)
-        toolbar.addArrangedSubview(statusLabel)
+        let statusBar = YuStatusBarView(frame: .zero)
+        statusBar.addSubview(statusLabel)
+        statusBar.addSubview(statusDetailLabel)
+        NSLayoutConstraint.activate([
+            statusLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 12.0),
+            statusLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+            statusDetailLabel.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -12.0),
+            statusDetailLabel.centerYAnchor.constraint(equalTo: statusBar.centerYAnchor),
+        ])
 
         // 大纲面板与文档并排。surfaceHostView 仍然直接挂在 root 上、盖在
         // 文档的 clip view 上方——它的 frame 在 viewDidLayout 里由
@@ -258,7 +296,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // 侧栏里两个面板上下叠。用 NSStackView 而不是第二个 NSSplitView：
         // 后者的 holding priority 会再压过首选高度约束一次（陷阱 26 是它的
         // 水平版），而这里根本不需要用户拖分隔线。
-        let sidebar = NSStackView(views: [outlinePanel.scrollView, searchPanel.view])
+        let sidebarHeader = YuSidebarHeaderView(
+            documentName: URL(fileURLWithPath: bridge.path).lastPathComponent
+        )
+        let sidebar = NSStackView(views: [sidebarHeader, outlinePanel.scrollView, searchPanel.view])
         sidebar.orientation = .vertical
         sidebar.spacing = 0.0
         sidebar.distribution = .fill
@@ -274,11 +315,25 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         searchPanel.view.isHidden = true
         sidebarStack = sidebar
 
+        let sidebarContainer = NSVisualEffectView()
+        sidebarContainer.material = .sidebar
+        sidebarContainer.blendingMode = .withinWindow
+        sidebarContainer.state = .active
+        sidebarContainer.translatesAutoresizingMaskIntoConstraints = false
+        sidebarContainer.addSubview(sidebar)
+        NSLayoutConstraint.activate([
+            sidebar.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
+            sidebar.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
+            sidebar.topAnchor.constraint(equalTo: sidebarContainer.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: sidebarContainer.bottomAnchor),
+        ])
+        self.sidebarContainer = sidebarContainer
+
         let splitView = NSSplitView()
         splitView.isVertical = true
         splitView.dividerStyle = .thin
         splitView.translatesAutoresizingMaskIntoConstraints = false
-        splitView.addArrangedSubview(sidebar)
+        splitView.addArrangedSubview(sidebarContainer)
         splitView.addArrangedSubview(scrollView)
         // 面板守住自己的宽度，缩放窗口时让文档吸收——否则拖窗口会把大纲挤没。
         splitView.setHoldingPriority(
@@ -291,23 +346,24 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         )
         documentSplitView = splitView
 
-        root.addSubview(toolbar)
         root.addSubview(splitView)
+        root.addSubview(statusBar)
         // The Rust surface is a visual projection above the TextKit mirror.
         // Its hitTest returns nil, so keyboard, IME, selection and scrolling
         // remain owned by the source view underneath it. The frame is synced
         // to the clip viewport in viewDidLayout, excluding native scrollers.
         root.addSubview(surfaceHostView, positioned: .above, relativeTo: splitView)
         NSLayoutConstraint.activate([
-            toolbar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
-            toolbar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
-            toolbar.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
             splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            splitView.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 10),
-            splitView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 150.0),
-            sidebar.widthAnchor.constraint(lessThanOrEqualToConstant: 420.0),
+            splitView.topAnchor.constraint(equalTo: root.topAnchor),
+            splitView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            statusBar.heightAnchor.constraint(equalToConstant: 28.0),
+            sidebarContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 200.0),
+            sidebarContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 360.0),
             outlinePanel.scrollView.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
             searchPanel.view.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
             // 搜索面板占侧栏下半部的一块固定高度，大纲吃掉剩下的。
@@ -439,7 +495,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     /// 两个面板都收起来时，整条侧栏也收起来——否则会留下一条空白。
     private func updateSidebarVisibility() {
-        sidebarStack?.isHidden = outlinePanel.scrollView.isHidden && searchPanel.view.isHidden
+        let hidden = outlinePanel.scrollView.isHidden && searchPanel.view.isHidden
+        sidebarStack?.isHidden = hidden
+        sidebarContainer?.isHidden = hidden
         documentSplitView?.adjustSubviews()
     }
 
@@ -601,7 +659,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// 这条路径：它需要真实的 NSWindow 与 Metal surface 才会有「已提交的帧」。
     ///
     /// 反向验证：把 `MacosFrameKey` 的 `selection` 去掉，第 3 步失败。
-    func runFrameSchedulingSelfCheck() throws {
+    @MainActor
+    func runFrameSchedulingSelfCheck() async throws {
         struct Failure: LocalizedError {
             let message: String
             var errorDescription: String? { message }
@@ -613,9 +672,19 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             guard let value else { throw Failure(message: message) }
             return value
         }
+        func submit(force: Bool = false) async throws -> NativeMacosRenderHostSurfaceSnapshot? {
+            let deadline = Date().addingTimeInterval(3)
+            repeat {
+                if let snapshot = try surfaceCoordinator.submitNow(force: force) {
+                    return snapshot
+                }
+                try await Task.sleep(nanoseconds: 8_000_000)
+            } while Date() < deadline
+            throw Failure(message: "Timed out waiting for drawable presentation")
+        }
 
         // 1. 真实 surface 上必须先有一帧。
-        let snapshot = try surfaceCoordinator.submitNow(force: true)
+        let snapshot = try await submit(force: true)
         try require(snapshot?.submitted == true, "首帧未提交")
         try require((snapshot?.commandCount ?? 0) > 0, "首帧没有任何绘制指令")
 
@@ -634,7 +703,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         )
 
         // 4. 重新提交之后必须再次等价。
-        let republished = try surfaceCoordinator.submitNow()
+        let republished = try await submit()
         try require(republished?.submitted == true, "光标移动后的重提交失败")
         try require(surfaceCoordinator.hasCurrentFrame(), "重提交后未恢复为当前帧")
 
@@ -652,6 +721,24 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             abs(documentView.frame.height - expectedExtent) <= 0.5,
             "可滚动范围 \(documentView.frame.height) 不等于内容高度 \(expectedExtent)"
         )
+
+        // 小幅滚动应当复用已发布的 retained coverage，只改变呈现视口，
+        // 而不是再次触发完整 Markdown/CoreText frame build。
+        let scrollRange = max(documentView.frame.height - scrollView.contentView.bounds.height, 0.0)
+        if scrollRange > 1.0 {
+            var origin = scrollView.contentView.bounds.origin
+            origin.y = min(scrollRange, max(20.0, scrollView.contentView.bounds.height * 0.25))
+            scrollView.contentView.setBoundsOrigin(origin)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            let retained = try require(
+                await submit(),
+                "retained scroll frame 提交失败"
+            )
+            try require(
+                retained.presentationReused,
+                "coverage 内滚动没有复用 retained frame"
+            )
+        }
 
         // 6. 大纲面板：选中一行必须把文档滚到那条标题。
         //    headless 压不住这一条——那里没有 scroll view，
@@ -689,7 +776,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         outlinePanel.clickRowForSelfCheck(0)
         surfaceCoordinator.revealCaretIfNeeded()
         let firstNode = try require(outlinePanel.nodeForSelfCheck(row: 0), "取不到第一行")
-        let baseline = try require(surfaceCoordinator.submitNow(), "滚回文首之后的重提交失败")
+        let baseline = try require(await submit(), "滚回文首之后的重提交失败")
         try require(
             baseline.searchDecorationCount == 0,
             "还没有查询就画出了 \(baseline.searchDecorationCount) 个搜索矩形"
@@ -701,7 +788,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             !surfaceCoordinator.hasCurrentFrame(),
             "换查询之后仍被判为当前帧——搜索框里打字画面会一动不动，而且不报错"
         )
-        let searched = try require(surfaceCoordinator.submitNow(), "换查询之后的重提交失败")
+        let searched = try require(await submit(), "换查询之后的重提交失败")
         try require(
             searched.searchDecorationCount > 0,
             "查询「\(needle)」在场景里没有画出任何高亮"
@@ -709,7 +796,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
         // 8. 收掉搜索，矩形必须一起消失。
         try require(bridge.setSearchQuery(nil), "收掉搜索失败")
-        let cleared = try require(surfaceCoordinator.submitNow(), "收掉搜索之后的重提交失败")
+        let cleared = try require(await submit(), "收掉搜索之后的重提交失败")
         try require(
             cleared.searchDecorationCount == 0,
             "收掉搜索之后还剩 \(cleared.searchDecorationCount) 个高亮"
@@ -750,7 +837,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         //     选区在 Rust 里是对的，编辑也是对的，就是看不见——不报错。
         outlinePanel.clickRowForSelfCheck(0)
         surfaceCoordinator.revealCaretIfNeeded()
-        let oneCaret = try require(surfaceCoordinator.submitNow(force: true), "单光标帧提交失败")
+        let oneCaret = try require(await submit(force: true), "单光标帧提交失败")
         try require(
             oneCaret.caretDecorationCount == 1,
             "单光标时画了 \(oneCaret.caretDecorationCount) 根 caret"
@@ -809,7 +896,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             !surfaceCoordinator.hasCurrentFrame(),
             "加一根光标之后仍被判为当前帧——画面会一动不动，而且不报错"
         )
-        let twoCarets = try require(surfaceCoordinator.submitNow(), "双光标帧提交失败")
+        let twoCarets = try require(await submit(), "双光标帧提交失败")
         try require(
             twoCarets.caretDecorationCount == 2,
             "两根光标只画出了 \(twoCarets.caretDecorationCount) 根 caret"
@@ -836,7 +923,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             everything.ranges.count == allMatches.count,
             "选中全部匹配之后只有 \(everything.ranges.count) 条选区，匹配有 \(allMatches.count) 处"
         )
-        let selectedAll = try require(surfaceCoordinator.submitNow(), "全部选中之后的重提交失败")
+        let selectedAll = try require(await submit(), "全部选中之后的重提交失败")
         try require(
             selectedAll.selectionDecorationCount >= allMatches.count,
             "\(allMatches.count) 处匹配只画出了 \(selectedAll.selectionDecorationCount) 块选区底色"
@@ -844,7 +931,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         try require(bridge.setSearchQuery(nil), "收掉搜索失败")
         textView.navigate(toSource: NSRange(location: 0, length: 0))
         let highlightFrame = try require(
-            surfaceCoordinator.submitNow(),
+            await submit(),
             "收掉搜索之后的重提交失败"
         )
 
@@ -870,6 +957,28 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             highlighted < commands,
             "这一帧的字形全被算成了高亮（\(highlighted) / \(commands) 条指令）"
         )
+
+        if let window = textView.window {
+            let original = window.frame
+            var resized = original
+            resized.size.width += 80
+            resized.size.height += 40
+            window.setFrame(resized, display: true)
+            window.contentView?.layoutSubtreeIfNeeded()
+            let resizedFrame = try require(await submit(), "resize presentation failed")
+            try require(resizedFrame.submitted, "resize did not submit")
+            try require(
+                resizedFrame.surfaceGeneration > highlightFrame.surfaceGeneration,
+                "resize did not advance surface generation"
+            )
+            window.setFrame(original, display: true)
+            window.contentView?.layoutSubtreeIfNeeded()
+            let restored = try require(await submit(), "restored presentation failed")
+            try require(
+                restored.surfaceGeneration > resizedFrame.surfaceGeneration,
+                "restoring window size did not advance surface generation"
+            )
+        }
 
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
@@ -1038,23 +1147,128 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         let status = "\(dirty) · Rev \(state.revision) · \(state.disk.label) · \(bom)"
         statusLabel.stringValue = status
         statusLabel.setAccessibilityValue(status)
-        saveButton?.isEnabled = state.dirty
-        reloadButton?.isEnabled = !state.dirty && state.disk != .unchanged
+        statusDetailLabel.stringValue = "\((bridge.source as NSString).length) 字符"
+        statusDetailLabel.setAccessibilityValue(statusDetailLabel.stringValue)
+        windowToolbar?.items.first(where: { $0.itemIdentifier == .yuSave })?.isEnabled = state.dirty
+        windowToolbar?.items.first(where: { $0.itemIdentifier == .yuReload })?.isEnabled =
+            !state.dirty && state.disk != .unchanged
     }
 
     private func show(_ error: Error) {
         let alert = NSAlert(error: error)
         alert.runModal()
     }
+
+    func configureToolbar(_ toolbar: NSToolbar) {
+        windowToolbar = toolbar
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        updateStatus()
+        toolbar.validateVisibleItems()
+    }
 }
+
+private extension NSToolbarItem.Identifier {
+    static let yuSave = Self("yu.save")
+    static let yuReload = Self("yu.reload")
+    static let yuOutline = Self("yu.outline")
+    static let yuSearch = Self("yu.search")
+}
+
+extension DocumentViewController: NSToolbarDelegate, NSToolbarItemValidation {
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        let state = bridge.state
+        switch item.itemIdentifier {
+        case .yuSave: return state.dirty
+        case .yuReload: return !state.dirty && state.disk != .unchanged
+        default: return true
+        }
+    }
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.yuSave, .yuReload, .flexibleSpace, .yuOutline, .yuSearch]
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.yuSave, .yuReload, .flexibleSpace, .yuOutline, .yuSearch]
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        let item: NSToolbarItem
+        switch itemIdentifier {
+        case .yuSave:
+            item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "保存"
+            item.paletteLabel = "保存"
+            item.toolTip = "保存 Markdown 文档（⌘S）"
+            item.image = NSImage(
+                systemSymbolName: "square.and.arrow.down",
+                accessibilityDescription: "保存"
+            )
+            item.target = self
+            item.action = #selector(saveFromMenu(_:))
+        case .yuReload:
+            item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "重新加载"
+            item.paletteLabel = "重新加载"
+            item.toolTip = "重新加载磁盘上的 Markdown 文档"
+            item.image = NSImage(
+                systemSymbolName: "arrow.clockwise",
+                accessibilityDescription: "重新加载"
+            )
+            item.target = self
+            item.action = #selector(reloadFromMenu(_:))
+        case .yuOutline:
+            item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "大纲"
+            item.paletteLabel = "大纲"
+            item.toolTip = "显示或隐藏文档大纲（⌥⌘1）"
+            item.image = NSImage(
+                systemSymbolName: "sidebar.left",
+                accessibilityDescription: "大纲"
+            )
+            item.target = self
+            item.action = #selector(toggleOutlineFromMenu(_:))
+        case .yuSearch:
+            item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "搜索"
+            item.paletteLabel = "搜索"
+            item.toolTip = "打开搜索（⌘F）"
+            item.image = NSImage(
+                systemSymbolName: "magnifyingglass",
+                accessibilityDescription: "搜索"
+            )
+            item.target = self
+            item.action = #selector(findFromMenu(_:))
+        default:
+            return nil
+        }
+        // The delegate creates items after the initial status pass. Initialize
+        // enablement here as well so clean documents never expose an active
+        // Save/Reload button during the first window turn.
+        if itemIdentifier == .yuSave {
+            item.isEnabled = bridge.state.dirty
+        } else if itemIdentifier == .yuReload {
+            item.isEnabled = !bridge.state.dirty && bridge.state.disk != .unchanged
+        }
+        return item
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     private var controller: DocumentViewController?
     private var launchSelfCheck = false
+    private var darkModeSelfCheck = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let path: String
         launchSelfCheck = CommandLine.arguments.contains("--launch-window-self-check")
+        darkModeSelfCheck = CommandLine.arguments.contains("--dark-mode-self-check")
         if let argument = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
             path = URL(fileURLWithPath: argument).path
         } else {
@@ -1084,7 +1298,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             )
             window.setContentSize(NSSize(width: 900, height: 620))
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.toolbarStyle = .unifiedCompact
+            window.titlebarAppearsTransparent = false
+            window.titleVisibility = .visible
             window.title = URL(fileURLWithPath: bridge.path).lastPathComponent
+            if darkModeSelfCheck {
+                window.appearance = NSAppearance(named: .darkAqua)
+            }
             window.center()
             window.delegate = self
             window.isReleasedWhenClosed = false
@@ -1092,6 +1312,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.activate(ignoringOtherApps: true)
             self.controller = controller
             self.window = window
+            let toolbar = NSToolbar(identifier: NSToolbar.Identifier("yu.document"))
+            toolbar.delegate = controller
+            window.toolbar = toolbar
+            controller.configureToolbar(toolbar)
             installMainMenu(for: controller)
             controller.focusDocument()
             print("Yu document host opened path=\(bridge.path) revision=\(bridge.state.revision)")
@@ -1104,14 +1328,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         fputs("Yu launch self-check failed: window is not visible\n", stderr)
                         exit(EXIT_FAILURE)
                     }
-                    print("Yu launch self-check: window appeared and remained stable")
-                    do {
-                        try controller.runFrameSchedulingSelfCheck()
-                    } catch {
-                        fputs("Yu frame scheduling self-check failed: \(error)\n", stderr)
+                    if self.darkModeSelfCheck,
+                       window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua {
+                        fputs("Yu dark-mode self-check failed: window is not Dark Aqua\n", stderr)
                         exit(EXIT_FAILURE)
                     }
-                    NSApp.terminate(nil)
+                    if let toolbar = window.toolbar {
+                        // Exercise AppKit's repeated validation, not just the
+                        // initial manual enabled assignment during creation.
+                        toolbar.validateVisibleItems()
+                        let saveEnabled = toolbar.items.first {
+                            $0.itemIdentifier == .yuSave
+                        }?.isEnabled ?? true
+                        let reloadEnabled = toolbar.items.first {
+                            $0.itemIdentifier == .yuReload
+                        }?.isEnabled ?? true
+                        guard !saveEnabled, !reloadEnabled else {
+                            fputs("Yu toolbar self-check failed: clean document exposes Save/Reload\n", stderr)
+                            exit(EXIT_FAILURE)
+                        }
+                    }
+                    print("Yu launch self-check: window appeared and remained stable")
+                    Task { @MainActor in
+                        do {
+                            try await controller.runFrameSchedulingSelfCheck()
+                        } catch {
+                            fputs("Yu frame scheduling self-check failed: \(error)\n", stderr)
+                            exit(EXIT_FAILURE)
+                        }
+                        NSApp.terminate(nil)
+                    }
                 }
             }
         } catch {

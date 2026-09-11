@@ -104,9 +104,12 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         column.resizingMask = .autoresizingMask
         tableView.addTableColumn(column)
         tableView.headerView = nil
-        tableView.rowSizeStyle = .default
+        tableView.rowSizeStyle = .medium
+        tableView.rowHeight = 30.0
         tableView.style = .plain
-        tableView.backgroundColor = .controlBackgroundColor
+        tableView.backgroundColor = .clear
+        tableView.selectionHighlightStyle = .regular
+        tableView.usesAlternatingRowBackgroundColors = false
         tableView.dataSource = self
         tableView.delegate = self
         tableView.setAccessibilityLabel("搜索结果")
@@ -118,8 +121,7 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = true
-        scrollView.backgroundColor = .controlBackgroundColor
+        scrollView.drawsBackground = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         view.translatesAutoresizingMaskIntoConstraints = false

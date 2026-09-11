@@ -12,16 +12,16 @@ use yu_markdown::{
 };
 use yu_text::{Edit, TextBuffer, Transaction, retained_snapshot_stats};
 
-const SECTION: &str = "# Yu\n\nA paragraph with **strong text**, 中文 and emoji 🙂.\n\n```rust\nfn main() {}\n```\n\n";
+const SCROLL_SECTION: &str = "# Scroll fixture\n\nA long paragraph with **emphasis**, [links](https://example.com), 中文 and emoji 🙂.\n\n> A quote kept in the retained frame.\n\n- [ ] pending task\n- [x] completed task\n\n| Name | Value |\n| --- | ---: |\n| alpha | 1 |\n| beta | 2 |\n\n```rust\nfn retained_scroll_frame() { println!(\"hello\"); }\n```\n\n![fixture image](fixture.png)\n\n";
 const INSERTIONS: [&str; 6] = ["羽", "Yu", "🙂", "e\u{301}", "\n", "**"];
 
 fn main() -> Result<(), Box<dyn Error>> {
     let configuration = Configuration::from_arguments()?;
-    let source = fixture(configuration.size_mib);
+    let source = scroll_fixture(configuration.size_mib);
     let (random_script, expected_random_result) =
         random_edit_script(&source, configuration.random_edits);
 
-    println!("Yu storage workload");
+    println!("Yu macOS scroll fixture workload");
     println!("document bytes: {}", source.len());
     println!("timing iterations: {}", configuration.iterations);
     println!("random edits: {}", configuration.random_edits);
@@ -245,7 +245,13 @@ fn run_storage(
         median(&mut coordinate_samples)
     );
     println!("  first contiguous view: {materialize_time:?}");
-    println!("  full block scan median: {:?}", median(&mut parse_samples));
+    let full_block_median = median(&mut parse_samples);
+    println!("  full block scan median: {full_block_median:?}");
+    if full_block_median > Duration::from_micros(16_700) {
+        println!(
+            "  warning: full block scan exceeds one 60Hz frame budget; use retained coverage for scroll"
+        );
+    }
     for measurement in incremental_measurements {
         println!(
             "  incremental {} median: {:?} (reparsed-bytes={} reused-prefix={} reused-suffix={} shared-blocks={} segments={})",
@@ -560,10 +566,13 @@ fn positive_number(value: &str, argument: &str) -> Result<usize, Box<dyn Error>>
     Ok(parsed)
 }
 
-fn fixture(size_mib: usize) -> String {
-    let requested_bytes = size_mib.saturating_mul(1024 * 1024);
-    let repetitions = requested_bytes.div_ceil(SECTION.len());
-    SECTION.repeat(repetitions)
+fn scroll_fixture(size_mib: usize) -> String {
+    let target = size_mib.max(1) * 1024 * 1024;
+    let mut source = String::with_capacity(target);
+    while source.len() < target {
+        source.push_str(SCROLL_SECTION);
+    }
+    source
 }
 
 fn nearest_char_boundary(text: &str, mut candidate: usize) -> usize {

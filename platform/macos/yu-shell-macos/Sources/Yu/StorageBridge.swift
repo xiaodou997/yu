@@ -307,6 +307,7 @@ struct NativeMacosRenderHostSnapshot {
     /// 这一帧有几个字形带着代码高亮的颜色。见 C 头文件里的说明。
     let highlightedGlyphCount: Int
     let resourceRefreshPending: Bool
+    let resourceRetryPending: Bool
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
         revision = value.revision
@@ -331,6 +332,7 @@ struct NativeMacosRenderHostSnapshot {
         searchDecorationCount = Int(value.search_decoration_count)
         highlightedGlyphCount = Int(value.highlighted_glyph_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
+        resourceRetryPending = value.resource_retry_pending != 0
     }
 }
 struct NativeMacosRenderHostSurfaceSnapshot {
@@ -354,6 +356,7 @@ struct NativeMacosRenderHostSurfaceSnapshot {
     let imageOverscanCandidateCount: Int
     let imageRetryCount: Int
     let submitted: Bool
+    let presentationReused: Bool
     let selectionDecorationCount: Int
     let caretDecorationCount: Int
     /// 这一帧画了几处搜索命中底色。它是「改了查询画面真的跟着变了」在真实
@@ -364,6 +367,7 @@ struct NativeMacosRenderHostSurfaceSnapshot {
     /// Rust 在提交这一帧时给出的结论：可见范围内还有资源没落定。
     /// 平台据此安排一次有界轮询，不自己判断资源状态。
     let resourceRefreshPending: Bool
+    let resourceRetryPending: Bool
     /// 这一帧渲染出来的文档总高度，可滚动范围的唯一依据。
     let contentHeight: CGFloat
 
@@ -388,11 +392,13 @@ struct NativeMacosRenderHostSurfaceSnapshot {
         imageOverscanCandidateCount = Int(value.image_overscan_candidate_count)
         imageRetryCount = Int(value.image_retry_count)
         submitted = value.submitted != 0
+        presentationReused = value.presentation_reused != 0
         selectionDecorationCount = Int(value.selection_decoration_count)
         caretDecorationCount = Int(value.caret_decoration_count)
         searchDecorationCount = Int(value.search_decoration_count)
         highlightedGlyphCount = Int(value.highlighted_glyph_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
+        resourceRetryPending = value.resource_retry_pending != 0
         contentHeight = CGFloat(value.content_height)
     }
 }
