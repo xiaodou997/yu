@@ -41,6 +41,10 @@ pub struct ViewportFrameBuildInput {
 pub struct ViewportFrameBuildOutput {
     pub request: FrameBuildRequest,
     pub publication: ViewportFramePublication,
+    /// CPU glyph atlas state produced alongside the publication.  The main
+    /// thread adopts it before GPU upload so plan page references always point
+    /// at the pixels that were prepared by the worker.
+    pub atlas: GlyphAtlas,
 }
 
 /// 准备一帧时可能出现的错误。
@@ -207,6 +211,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         Ok(ViewportFrameBuildOutput {
             request,
             publication,
+            atlas: self.atlas.clone(),
         })
     }
 
@@ -274,6 +279,13 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     #[must_use]
     pub fn atlas(&self) -> &GlyphAtlas {
         &self.atlas
+    }
+
+    /// Replace the CPU atlas with the state returned by an owned worker build.
+    /// The publication and atlas are a matched pair; keeping this operation on
+    /// the builder makes that pairing explicit at the publication boundary.
+    pub fn replace_atlas(&mut self, atlas: GlyphAtlas) {
+        self.atlas = atlas;
     }
 
     #[must_use]
