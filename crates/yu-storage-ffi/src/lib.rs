@@ -2110,44 +2110,15 @@ fn macos_published_table_dividers(
     viewport_height: f32,
 ) -> Option<Result<Vec<YuStorageTableResizeAccessibilityDivider>, i32>> {
     let state = session.macos_render_host.as_ref()?;
-    let surface = state.surface.as_ref()?;
+    state.surface.as_ref()?;
     if std::env::var_os("YU_RENDER_TIMING").is_some() {
         println!("yu-render-metric event=ax_frame_query");
     }
-    let pending = Some(Ok(Vec::new()));
-    if session.session.document().editor().composition().is_some() {
-        return pending;
-    }
-    let config = surface.surface.config();
-    let Some(geometry) = FrameGeometry::new(
-        size,
-        max_width,
-        scroll_y,
-        viewport_height,
-        config.logical_width(),
-        config.logical_height(),
-        config.scale(),
-    ) else {
-        return pending;
+    let Some(frame) =
+        macos_matching_submitted_frame(session, size, max_width, scroll_y, viewport_height)
+    else {
+        return Some(Ok(Vec::new()));
     };
-    let requested = frame_key(session, state.builder.config().appearance(), geometry);
-    if state.prepared_build.as_ref() != Some(requested.build())
-        || state.host.surface_generation() != surface.surface.generation()
-        || !state
-            .host
-            .last_submission()
-            .is_some_and(|submission| Some(submission.frame_serial()) == state.host.frame_serial())
-    {
-        return pending;
-    }
-    let Some(frame) = state.host.frame_handle() else {
-        return pending;
-    };
-    if frame.plan().viewport().y() != scroll_y
-        && !macos_frame_covers_viewport(&frame, scroll_y, viewport_height)
-    {
-        return pending;
-    }
     if std::env::var_os("YU_RENDER_TIMING").is_some() {
         println!(
             "yu-render-metric event=ax_frame_geometry tables={}",
@@ -2155,7 +2126,7 @@ fn macos_published_table_dividers(
         );
     }
     if frame.scene().tables().is_empty() {
-        return pending;
+        return Some(Ok(Vec::new()));
     }
     let source = session.session.snapshot();
     let divider_width = (state.metrics.default_advance() * 0.25).max(1.0);
@@ -2172,6 +2143,53 @@ fn macos_published_table_dividers(
         }
     }
     Some(Ok(encoded))
+}
+
+/// Validates the exact publication used by read-only window geometry queries.
+#[cfg(target_os = "macos")]
+fn macos_matching_submitted_frame(
+    session: &YuStorageSession,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+) -> Option<std::sync::Arc<yu_workspace::ViewportRenderFrame>> {
+    let state = session.macos_render_host.as_ref()?;
+    let surface = state.surface.as_ref()?;
+    if session.session.document().editor().composition().is_some() {
+        return None;
+    }
+    let config = surface.surface.config();
+    let Some(geometry) = FrameGeometry::new(
+        size,
+        max_width,
+        scroll_y,
+        viewport_height,
+        config.logical_width(),
+        config.logical_height(),
+        config.scale(),
+    ) else {
+        return None;
+    };
+    let requested = frame_key(session, state.builder.config().appearance(), geometry);
+    if state.prepared_build.as_ref() != Some(requested.build())
+        || state.host.surface_generation() != surface.surface.generation()
+        || !state
+            .host
+            .last_submission()
+            .is_some_and(|submission| Some(submission.frame_serial()) == state.host.frame_serial())
+    {
+        return None;
+    }
+    let Some(frame) = state.host.frame_handle() else {
+        return None;
+    };
+    if frame.plan().viewport().y() != scroll_y
+        && !macos_frame_covers_viewport(&frame, scroll_y, viewport_height)
+    {
+        return None;
+    }
+    Some(frame)
 }
 
 fn table_resize_commit_metadata(
@@ -4040,6 +4058,109 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_at_point(
         };
         // SAFETY: output was checked for null and belongs to the caller.
         unsafe { *output = metadata };
+        YU_STORAGE_OK
+    }
+}
+
+/// Read-only column hover against the submitted frame. Attached windows never
+/// shape text here; stale/unavailable geometry reports no hit. Headless callers
+/// retain the synchronous probe for protocol checks.
+///
+/// # Safety
+/// `session` must be live and `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_resize_hover(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+    point_x: f32,
+    point_y: f32,
+    tolerance: f32,
+    output: *mut u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe { *output = 0 };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            session,
+            expected_revision,
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            point_x,
+            point_y,
+            tolerance,
+        );
+        YU_STORAGE_SHAPER_UNAVAILABLE
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(status) = validate_revision(&session.session, expected_revision) {
+            return status;
+        }
+        if !size.is_finite()
+            || size <= 0.0
+            || !max_width.is_finite()
+            || max_width <= 0.0
+            || !scroll_y.is_finite()
+            || scroll_y < 0.0
+            || !viewport_height.is_finite()
+            || viewport_height <= 0.0
+            || !point_x.is_finite()
+            || !point_y.is_finite()
+            || !tolerance.is_finite()
+            || tolerance < 0.0
+        {
+            return YU_STORAGE_EDITOR_ERROR;
+        }
+        if session.session.document().editor().composition().is_some() {
+            return YU_STORAGE_OK;
+        }
+        let hit = if session
+            .macos_render_host
+            .as_ref()
+            .is_some_and(|state| state.surface.is_some())
+        {
+            if std::env::var_os("YU_RENDER_TIMING").is_some() {
+                println!("yu-render-metric event=hover_frame_query");
+            }
+            macos_matching_submitted_frame(session, size, max_width, scroll_y, viewport_height)
+                .is_some_and(|frame| {
+                    frame
+                        .scene()
+                        .tables()
+                        .iter()
+                        .any(|table| table.column_resize_hover(point_x, point_y, tolerance))
+                })
+        } else {
+            if std::env::var_os("YU_RENDER_TIMING").is_some() {
+                println!("yu-render-metric event=hover_layout_fallback");
+            }
+            match macos_table_resize_hit_at_point(
+                session,
+                expected_revision,
+                size,
+                max_width,
+                point_x,
+                point_y,
+                tolerance,
+            ) {
+                Ok((_, hit)) => matches!(hit.target(), TableResizeTarget::Column { .. }),
+                Err(YU_STORAGE_INVALID_SELECTION) => false,
+                Err(status) => return status,
+            }
+        };
+        unsafe { *output = u8::from(hit) };
         YU_STORAGE_OK
     }
 }
@@ -8879,6 +9000,19 @@ mod tests {
         assert!(accessibility_divider.height > 0.0);
         assert_eq!(state.session.snapshot().as_str(), source);
         let point_y = metrics.line_height() * 0.5;
+        let mut hover = 9;
+        for (revision, x, expected_status, expected_hit) in [
+            (0, divider, YU_STORAGE_OK, 1),
+            (0, 600.0, YU_STORAGE_OK, 0),
+            (1, divider, YU_STORAGE_STALE_REVISION, 0),
+            (0, f32::NAN, YU_STORAGE_EDITOR_ERROR, 0),
+        ] {
+            assert_eq!(unsafe {
+                yu_storage_session_table_resize_hover(raw, revision, 14.0, 500.0,
+                    0.0, 240.0, x, point_y, 0.2, &mut hover)
+            }, expected_status);
+            assert_eq!(hover, expected_hit);
+        }
         let mut document_hit = YuStorageTableResizeHit::default();
         assert_eq!(
             unsafe {

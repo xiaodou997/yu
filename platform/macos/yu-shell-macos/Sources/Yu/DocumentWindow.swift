@@ -1101,12 +1101,27 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             throw Failure(message: "Submitted first frame has no table accessibility geometry")
         }
         let sourceBeforeResize = bridge.source
+        let hoverPoint = NSPoint(x: divider.rect.minX, y: divider.rect.midY)
+        for _ in 0..<100 {
+            try require(surfaceCoordinator.tableResizeHover(at: hoverPoint),
+                        "Submitted divider did not produce column hover")
+        }
+        try require(!surfaceCoordinator.tableResizeHover(at:
+                        NSPoint(x: hoverPoint.x + 10, y: hoverPoint.y))
+                    && !surfaceCoordinator.tableResizeHover(at:
+                        NSPoint(x: hoverPoint.x, y: divider.rect.maxY + 1)),
+                    "Hover escaped divider tolerance or vertical table extent")
+        try require(surfaceCoordinator.lastSnapshot?.frameSerial == first.frameSerial
+                    && !surfaceCoordinator.tableResizeActiveForSelfCheck,
+                    "Read-only hover opened a gesture or changed publication")
         try require(divider.revision == bridge.state.revision && divider.rect.height > 0,
                     "Invalid submitted table accessibility geometry")
         try require(surfaceCoordinator.adjustTableResizeAccessibility(divider, direction: 1),
                     "Table accessibility increment failed")
         try require(surfaceCoordinator.tableResizeAccessibilityDividers().isEmpty,
                     "Unsubmitted table resize exposed stale accessibility geometry")
+        try require(!surfaceCoordinator.tableResizeHover(at: hoverPoint),
+                    "Unsubmitted resize exposed stale hover geometry")
         _ = try await submit()
         guard let adjusted = surfaceCoordinator.tableResizeAccessibilityDividers().first else {
             throw Failure(message: "Resized frame lost table accessibility geometry")
@@ -1116,6 +1131,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                     && bridge.source == sourceBeforeResize,
                     "Table accessibility geometry did not follow submitted resize")
         print("Yu render regression self-check: ax_frame_resize=true")
+        try require(surfaceCoordinator.tableResizeHover(at:
+                        NSPoint(x: adjusted.rect.minX, y: adjusted.rect.midY)),
+                    "Hover did not follow resized publication")
+        print("Yu render regression self-check: hover_frame=true")
         let original = window.frame
         var generation = first.surfaceGeneration
         for step in 1...12 {
@@ -1172,6 +1191,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         try require(!surfaceCoordinator.hasCurrentFrame(), "Detach kept old frame current")
         try require(surfaceCoordinator.tableResizeAccessibilityDividers().isEmpty,
                     "Detach kept old table accessibility geometry")
+        try require(!surfaceCoordinator.tableResizeHover(at: hoverPoint),
+                    "Detach kept old hover geometry")
         let rebound = try await submit()
         try require(rebound.frameSerial > last.frameSerial, "Rebind used old publication")
         print("Yu render regression self-check: long=true steps=12 resize=4 final_line=\(finalLineVisible) scroll_cancels_navigation=true rebind=true bytes=\(bridge.source.utf8.count)")
