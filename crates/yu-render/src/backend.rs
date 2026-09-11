@@ -197,6 +197,42 @@ pub fn requires_full_clear(
         || last_surface_generation != Some(surface_generation)
 }
 
+/// Returns the newly exposed strips after moving a retained viewport from
+/// `previous` to `current`. Coordinates are local to `current` and are ready
+/// to feed the damage culler. Zero movement returns no strips; horizontal
+/// movement, resize, and non-finite deltas are rejected.
+pub fn scroll_exposed_damage(
+    previous: yu_scene::Rect,
+    current: yu_scene::Rect,
+) -> Result<Vec<DamageRect>, BackendError> {
+    if previous.x() != current.x()
+        || previous.width() != current.width()
+        || previous.height() != current.height()
+        || !previous.y().is_finite()
+        || !current.y().is_finite()
+    {
+        return Err(BackendError::InvalidDamageRect(
+            "scroll damage requires equal finite viewport sizes",
+        ));
+    }
+    let delta = current.y() - previous.y();
+    if !delta.is_finite() {
+        return Err(BackendError::InvalidDamageRect("non-finite scroll delta"));
+    }
+    if delta == 0.0 {
+        return Ok(Vec::new());
+    }
+    let height = current.height();
+    let amount = delta.abs().min(height);
+    let y = if delta > 0.0 { height - amount } else { 0.0 };
+    Ok(vec![DamageRect {
+        x: 0.0,
+        y,
+        width: current.width(),
+        height: amount,
+    }])
+}
+
 /// 帧的 Revision 闸门：后端提交成功之后，不许一帧更旧的悄悄顶上去。
 ///
 /// 它没有任何原生指针，也不认识 `yu-workspace` 的帧类型——调用方自己把帧的
@@ -260,7 +296,25 @@ pub fn build_draw_commands(
     image_sizes: &BTreeMap<u64, (u32, u32)>,
     embedded_image_sizes: &BTreeMap<(u64, u32), (u32, u32)>,
 ) -> Result<Vec<DrawCommand>, BackendError> {
-    let viewport = plan.viewport();
+    build_draw_commands_at_viewport(
+        plan,
+        plan.viewport(),
+        page_sizes,
+        image_sizes,
+        embedded_image_sizes,
+    )
+}
+
+/// Flattens a retained plan at a new presentation viewport without rebuilding
+/// the scene.  The plan's primitives remain in document space; only the camera
+/// origin used by the backend-neutral command array changes.
+pub fn build_draw_commands_at_viewport(
+    plan: &RenderPlan,
+    viewport: yu_scene::Rect,
+    page_sizes: &BTreeMap<u32, (u32, u32)>,
+    image_sizes: &BTreeMap<u64, (u32, u32)>,
+    embedded_image_sizes: &BTreeMap<(u64, u32), (u32, u32)>,
+) -> Result<Vec<DrawCommand>, BackendError> {
     // 栅格化缩放：逻辑坐标 → 物理像素。方向进类型，反方向只能走 `unscale`。
     let raster = Scale::<Document, Device>::new(plan.raster_scale()).map_err(|_| {
         BackendError::InvalidRenderCommand("render plan raster scale must be finite and positive")
@@ -713,6 +767,43 @@ mod tests {
     }
 
     #[test]
+    fn retained_plan_can_be_presented_at_a_new_scroll_origin() {
+        use std::collections::BTreeMap;
+
+        use yu_core::Revision;
+        use yu_scene::{Rect, SceneBuilder};
+
+        let original = Rect::new(0.0, 100.0, 200.0, 80.0).expect("original viewport");
+        let mut scene = SceneBuilder::new(Revision::INITIAL, original).expect("scene");
+        scene
+            .fill_rect(
+                Rect::new(12.0, 140.0, 30.0, 10.0).expect("document rect"),
+                Rgba8::white(),
+            )
+            .expect("fill");
+        let atlas = yu_font::GlyphAtlas::new(
+            yu_font::GlyphAtlasConfig::new(16, 16, 1).expect("atlas config"),
+        );
+        let plan = RenderPlanBuilder::new()
+            .build(&scene.finish(), &atlas)
+            .expect("plan");
+        let moved = Rect::new(0.0, 120.0, 200.0, 80.0).expect("moved viewport");
+
+        let commands = build_draw_commands_at_viewport(
+            &plan,
+            moved,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("commands");
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].x, 12.0);
+        assert_eq!(commands[0].y, 20.0);
+    }
+
+    #[test]
     fn image_draw_command_uses_placeholder_until_resource_is_ready() {
         use std::collections::BTreeMap;
 
@@ -1135,5 +1226,35 @@ mod tests {
             embedded_image_kind(EmbeddedResourceKind::Math.tag()),
             embedded_image_kind(EmbeddedResourceKind::Mermaid.tag())
         );
+    }
+
+    #[test]
+    fn scroll_damage_is_the_newly_exposed_strip() {
+        let old = Rect::new(0.0, 0.0, 100.0, 200.0).unwrap();
+        let down = Rect::new(0.0, 20.0, 100.0, 200.0).unwrap();
+        let damage = scroll_exposed_damage(old, down).unwrap();
+        assert_eq!(
+            damage,
+            vec![DamageRect {
+                x: 0.0,
+                y: 180.0,
+                width: 100.0,
+                height: 20.0
+            }]
+        );
+        let up = Rect::new(0.0, -10.0, 100.0, 200.0).unwrap();
+        assert_eq!(
+            scroll_exposed_damage(old, up).unwrap(),
+            vec![DamageRect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 10.0
+            }]
+        );
+        let huge = Rect::new(0.0, 300.0, 100.0, 200.0).unwrap();
+        assert_eq!(scroll_exposed_damage(old, huge).unwrap()[0].height, 200.0);
+        let mismatched = Rect::new(0.0, 0.0, 80.0, 200.0).unwrap();
+        assert!(scroll_exposed_damage(old, mismatched).is_err());
     }
 }

@@ -103,6 +103,42 @@ pub const YU_STORAGE_INVALID_VIEWPORT_CONFIG: i32 = 20;
 pub const YU_STORAGE_RENDER_HOST_UNAVAILABLE: i32 = 21;
 
 pub const YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE: i32 = 22;
+/// Temporary presentation backpressure; retry the latest geometry later.
+pub const YU_STORAGE_RENDER_BUSY: i32 = 23;
+
+#[cfg(target_os = "macos")]
+fn macos_surface_submit_error_status(error: yu_render_macos::MetalViewportHostError) -> i32 {
+    match error {
+        yu_render_macos::MetalViewportHostError::Render(
+            yu_render_macos::MetalRenderError::DrawableUnavailable,
+        ) => YU_STORAGE_RENDER_BUSY,
+        _ => YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn drawable_backpressure_is_retryable_but_render_failures_are_not() {
+    use yu_render_macos::{MetalRenderError, MetalViewportHostError};
+    assert_eq!(
+        macos_surface_submit_error_status(MetalViewportHostError::Render(
+            MetalRenderError::DrawableUnavailable,
+        )),
+        YU_STORAGE_RENDER_BUSY
+    );
+    assert_eq!(
+        macos_surface_submit_error_status(MetalViewportHostError::Render(
+            MetalRenderError::CommandBufferUnavailable,
+        )),
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    );
+    assert_eq!(
+        macos_surface_submit_error_status(MetalViewportHostError::NoCurrentFrame {
+            revision: Revision::INITIAL,
+        }),
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    );
+}
 
 pub const YU_STORAGE_TABLE_ALIGNMENT_DEFAULT: u8 = 0;
 pub const YU_STORAGE_TABLE_ALIGNMENT_LEFT: u8 = 1;
@@ -518,6 +554,7 @@ pub struct YuStorageMacosRenderHostSnapshot {
     /// 当前可见范围内还有未落定的图片或内嵌资源，需要再提交一次去收割 worker
     /// 的结果。这个判断此前在平台侧，要三次纯查询往返才能得出。
     pub resource_refresh_pending: u8,
+    pub resource_retry_pending: u8,
 }
 
 /// 平台在一次帧提交中提供的几何。
@@ -564,6 +601,9 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub image_overscan_candidate_count: u64,
     pub image_retry_count: u64,
     pub submitted: u8,
+    /// Non-zero when the existing retained frame was presented at a new
+    /// scroll origin without rebuilding Markdown layout or glyphs.
+    pub presentation_reused: u8,
     pub selection_decoration_count: u64,
     pub caret_decoration_count: u64,
     /// 见 [`YuStorageMacosRenderHostSnapshot::search_decoration_count`]。
@@ -572,6 +612,7 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     pub highlighted_glyph_count: u64,
     /// 见 [`YuStorageMacosRenderHostSnapshot::resource_refresh_pending`]。
     pub resource_refresh_pending: u8,
+    pub resource_retry_pending: u8,
     /// 这一帧渲染出来的文档总高度。可滚动范围必须以它为准——平台没有第二套
     /// 布局可以推导这个值（不变量 I5）。
     pub content_height: f32,
@@ -738,15 +779,40 @@ struct MacosImageResourceState {
 #[cfg(target_os = "macos")]
 struct MacosEmbeddedResourceState {
     cache: EmbeddedResourceCache,
-    renderer: Box<dyn EmbeddedRenderer>,
+    jobs: std::sync::mpsc::Sender<EmbeddedRenderRequest>,
+    results: std::sync::mpsc::Receiver<EmbeddedWorkerResult>,
 }
+
+#[cfg(target_os = "macos")]
+type EmbeddedWorkerResult = (
+    EmbeddedRenderRequest,
+    Result<yu_assets::EmbeddedRenderPayload, yu_assets::EmbeddedRenderError>,
+);
 
 #[cfg(target_os = "macos")]
 impl MacosEmbeddedResourceState {
     fn new() -> Self {
+        let (jobs, receiver) = std::sync::mpsc::channel::<EmbeddedRenderRequest>();
+        let (sender, results) = std::sync::mpsc::channel();
+        // Failure to spawn disconnects the channel; requests then fail through
+        // the cache's normal worker-error path. Dropping the owner never joins
+        // a potentially slow render on the AppKit thread.
+        let _ = std::thread::Builder::new()
+            .name("yu-math".into())
+            .spawn(move || {
+                let renderer = MathRenderer::default();
+                while let Ok(request) = receiver.recv() {
+                    let result = renderer.render(&request);
+                    if sender.send((request, result)).is_err() {
+                        break;
+                    }
+                    yu_render_macos::notify_resource_completion();
+                }
+            });
         Self {
             cache: EmbeddedResourceCache::new(),
-            renderer: Box::new(MathRenderer::default()),
+            jobs,
+            results,
         }
     }
 
@@ -755,13 +821,22 @@ impl MacosEmbeddedResourceState {
         request: EmbeddedRenderRequest,
         revision: Revision,
     ) -> Result<EmbeddedRequestResult, i32> {
+        while let Ok((completed, result)) = self.results.try_recv() {
+            match self.cache.complete(completed, revision, result) {
+                Ok(_) | Err(yu_assets::EmbeddedCacheError::StaleRevision { .. }) => {}
+                Err(_) => return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE),
+            }
+        }
         let _ = self.cache.request(request.clone());
-        while self
-            .cache
-            .render_pending(revision, self.renderer.as_ref())
-            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
-            .is_some()
-        {}
+        while let Some(job) = self.cache.pending() {
+            if let Err(error) = self.jobs.send(job) {
+                let _ = self.cache.complete(
+                    error.0,
+                    revision,
+                    Err(yu_assets::EmbeddedRenderError::Worker),
+                );
+            }
+        }
         Ok(self.cache.request(request))
     }
 
@@ -922,6 +997,9 @@ struct MacosRenderHostState {
     /// generation 才能组装出比较用的键，一次提交因此产生七八次 FFI 往返。
     /// 状态在 Rust，决策就该在 Rust。
     last_frame_key: Option<FrameKey>,
+    resource_refresh_pending: bool,
+    resource_retry_pending: bool,
+    resource_completion_generation: u64,
 }
 
 /// 平台送来的外观字节。**未知值按浅色处理，不报错。**
@@ -985,6 +1063,24 @@ fn frame_key(
         appearance,
         geometry,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_frame_covers_viewport(
+    frame: &yu_workspace::ViewportRenderFrame,
+    scroll_y: f32,
+    viewport_height: f32,
+) -> bool {
+    let blocks = frame.scene().input().blocks();
+    let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
+        return false;
+    };
+    let coverage_top = first.y();
+    let coverage_bottom = last.y() + last.height();
+    let requested_bottom = scroll_y + viewport_height;
+    scroll_y >= coverage_top - 0.5
+        && requested_bottom <= coverage_bottom + 0.5
+        && coverage_bottom >= coverage_top
 }
 #[cfg(target_os = "macos")]
 struct MacosPersistentSurfaceState {
@@ -4415,7 +4511,8 @@ fn macos_render_host_snapshot(
         search_decoration_count,
         highlighted_glyph_count,
         // 调用方在离开 host 借用之后填入；这里没有 session 可查。
-        resource_refresh_pending: 0,
+        resource_refresh_pending: u8::from(state.resource_refresh_pending),
+        resource_retry_pending: u8::from(state.resource_retry_pending),
     })
 }
 
@@ -4447,6 +4544,9 @@ fn macos_render_host_frame(
     session: &mut YuStorageSession,
     request: MacosFrameRequest,
 ) -> Result<YuStorageMacosRenderHostSnapshot, i32> {
+    // Capture before draining workers; a completion racing this build must
+    // remain dirty so the following presentation cannot skip its publication.
+    let resource_generation = yu_render_macos::resource_completion_generation();
     let MacosFrameRequest {
         expected_revision,
         size,
@@ -4489,6 +4589,20 @@ fn macos_render_host_frame(
         (metrics, None)
     };
     macos_publish_viewport_config(session, max_width, metrics)?;
+    // Keep at least one viewport of already-shaped content around the active
+    // camera.  Scroll-only presentations can then reuse the retained frame
+    // instead of synchronously rebuilding every block for each wheel sample.
+    let published_viewport = session.session.viewport_config();
+    if published_viewport.overscan() < viewport_height {
+        session
+            .session
+            .set_viewport_config(ViewportConfig::new(
+                published_viewport.layout(),
+                published_viewport.estimated_block_height(),
+                viewport_height,
+            ))
+            .map_err(|_| YU_STORAGE_INVALID_VIEWPORT_CONFIG)?;
+    }
 
     let revision = session.session.revision();
     let table_resize = match session.table_resize_override {
@@ -4548,6 +4662,9 @@ fn macos_render_host_frame(
             image_resources,
             // 重建 host 后没有可复用的帧，下一次提交必须真正执行。
             last_frame_key: None,
+            resource_refresh_pending: false,
+            resource_retry_pending: false,
+            resource_completion_generation: resource_generation,
         });
     }
 
@@ -4562,6 +4679,7 @@ fn macos_render_host_frame(
             .map_err(|error| macos_render_host_error_status(&error))?;
     }
     let document_path = session.session.path().to_path_buf();
+    let layout_timing_start = std::time::Instant::now();
     let viewport_blocks = {
         let state = session
             .macos_render_host
@@ -4573,6 +4691,7 @@ fn macos_render_host_frame(
             .viewport_image_blocks(document)
             .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
     };
+    let layout_elapsed = layout_timing_start.elapsed();
     let image_requests = macos_image_requests(session, &viewport_blocks)?;
     let state = session
         .macos_render_host
@@ -4601,6 +4720,7 @@ fn macos_render_host_frame(
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    let publish_timing_start = std::time::Instant::now();
     let publication = {
         let document = session.session.document_mut().editor_mut();
         state
@@ -4608,6 +4728,7 @@ fn macos_render_host_frame(
             .publish_with_images_and_intrinsics(document, &image_publications, &image_intrinsics)
             .map_err(|error| macos_render_host_error_status(&error))?
     };
+    let publish_elapsed = publish_timing_start.elapsed();
     state
         .host
         .accept_publication(publication)
@@ -4618,10 +4739,20 @@ fn macos_render_host_frame(
         .iter()
         .map(|&(index, _)| index)
         .collect::<Vec<_>>();
-    snapshot.resource_refresh_pending = u8::from(macos_frame_needs_resource_refresh(
-        session,
-        &visible_blocks,
-    )?);
+    let (pending, retry) = macos_frame_needs_resource_refresh(session, &visible_blocks)?;
+    snapshot.resource_refresh_pending = u8::from(pending);
+    snapshot.resource_retry_pending = u8::from(retry);
+    if let Some(state) = session.macos_render_host.as_mut() {
+        state.resource_refresh_pending = snapshot.resource_refresh_pending != 0;
+        state.resource_retry_pending = retry;
+        state.resource_completion_generation = resource_generation;
+    }
+    if std::env::var_os("YU_RENDER_TIMING").is_some() {
+        eprintln!(
+            "yu-render phases layout={:?} publish={:?}",
+            layout_elapsed, publish_elapsed
+        );
+    }
     Ok(snapshot)
 }
 
@@ -4638,7 +4769,7 @@ fn macos_render_host_frame(
 fn macos_frame_needs_resource_refresh(
     session: &mut YuStorageSession,
     visible_blocks: &[usize],
-) -> Result<bool, i32> {
+) -> Result<(bool, bool), i32> {
     let source = session.session.snapshot();
     let revision = source.revision();
     let definitions = session
@@ -4649,6 +4780,7 @@ fn macos_frame_needs_resource_refresh(
         .reference_definitions()
         .clone();
     let mut pending = false;
+    let mut retry = false;
     for &block_index in visible_blocks {
         let decorations = session
             .session
@@ -4664,6 +4796,7 @@ fn macos_frame_needs_resource_refresh(
             );
             if macos_resource_status_needs_refresh(status, fingerprint) {
                 pending = true;
+                retry |= macos_resource_status_needs_retry(status, fingerprint);
             }
         }
         let Some((info, content_range)) = fenced_code_of(&decorations) else {
@@ -4690,9 +4823,10 @@ fn macos_frame_needs_resource_refresh(
         let fingerprint = embedded_resource_fingerprint(&source, decorations.range(), kind);
         if macos_resource_status_needs_refresh(status, fingerprint) {
             pending = true;
+            retry |= macos_resource_status_needs_retry(status, fingerprint);
         }
     }
-    Ok(pending)
+    Ok((pending, retry))
 }
 
 /// 一个资源的状态是否意味着「还要再取一次」。
@@ -4711,6 +4845,39 @@ const fn macos_resource_status_needs_refresh(status: u8, fingerprint: u64) -> bo
         YU_STORAGE_IMAGE_RESOURCE_UNKNOWN => fingerprint != 0,
         _ => true,
     }
+}
+
+#[cfg(target_os = "macos")]
+const fn macos_resource_status_needs_retry(status: u8, fingerprint: u64) -> bool {
+    status != YU_STORAGE_IMAGE_RESOURCE_PENDING
+        && macos_resource_status_needs_refresh(status, fingerprint)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn pending_resources_wait_for_notifications_not_retry_timers() {
+    assert!(macos_resource_status_needs_refresh(
+        YU_STORAGE_IMAGE_RESOURCE_PENDING,
+        1
+    ));
+    assert!(!macos_resource_status_needs_retry(
+        YU_STORAGE_IMAGE_RESOURCE_PENDING,
+        1
+    ));
+    assert!(macos_resource_status_needs_retry(
+        YU_STORAGE_IMAGE_RESOURCE_FAILED,
+        1
+    ));
+    for status in [
+        YU_STORAGE_IMAGE_RESOURCE_READY,
+        YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED,
+    ] {
+        assert!(!macos_resource_status_needs_retry(status, 1));
+    }
+    assert!(!macos_resource_status_needs_retry(
+        YU_STORAGE_IMAGE_RESOURCE_UNKNOWN,
+        0
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -4902,6 +5069,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
     #[cfg(target_os = "macos")]
     {
         use std::ptr::NonNull;
+        let timing_enabled = std::env::var_os("YU_RENDER_TIMING").is_some();
+        let timing_start = std::time::Instant::now();
 
         let Some(view) = NonNull::new(view) else {
             return YU_STORAGE_NULL_POINTER;
@@ -4927,22 +5096,76 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
         } else {
             0
         };
-        let host_snapshot = match macos_render_host_frame(
-            session,
-            MacosFrameRequest {
-                expected_revision,
-                size,
-                max_width,
-                scroll_y,
-                viewport_height,
-                surface_generation,
-                raster_scale: scale as f32,
-                appearance: appearance_from_raw(appearance),
-            },
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(status) => return status,
+        let requested_geometry = FrameGeometry::new(
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            surface_width,
+            surface_height,
+            scale,
+        );
+        let requested_key = requested_geometry
+            .map(|geometry| frame_key(session, appearance_from_raw(appearance), geometry));
+        let presentation_viewport = Rect::new(0.0, scroll_y, max_width, viewport_height).ok();
+        let can_reuse = requested_key.as_ref().is_some_and(|requested| {
+            session.macos_render_host.as_ref().is_some_and(|state| {
+                state.resource_completion_generation
+                    == yu_render_macos::resource_completion_generation()
+                    && (!state.resource_refresh_pending
+                        || (!state.image_resources.in_flight.is_empty()
+                            && matches!(state.image_resources.worker.has_completed(), Ok(false))))
+                    && state.last_frame_key.as_ref().is_some_and(|last| {
+                        last.build() == requested.build()
+                            && presentation_viewport.is_some_and(|viewport| {
+                                state.host.frame_handle().is_some_and(|frame| {
+                                    macos_frame_covers_viewport(
+                                        frame.as_ref(),
+                                        viewport.y(),
+                                        viewport.height(),
+                                    )
+                                })
+                            })
+                    })
+            })
+        });
+        let (host_snapshot, retained_presentation_viewport) = if can_reuse {
+            let Some(state) = session.macos_render_host.as_mut() else {
+                return YU_STORAGE_RENDER_HOST_UNAVAILABLE;
+            };
+            if state
+                .host
+                .sync_surface_generation(surface_generation)
+                .is_err()
+            {
+                return YU_STORAGE_RENDER_HOST_UNAVAILABLE;
+            }
+            let snapshot =
+                match macos_render_host_snapshot(state, session.session.composition_generation()) {
+                    Ok(snapshot) => snapshot,
+                    Err(status) => return status,
+                };
+            (snapshot, presentation_viewport)
+        } else {
+            let snapshot = match macos_render_host_frame(
+                session,
+                MacosFrameRequest {
+                    expected_revision,
+                    size,
+                    max_width,
+                    scroll_y,
+                    viewport_height,
+                    surface_generation,
+                    raster_scale: scale as f32,
+                    appearance: appearance_from_raw(appearance),
+                },
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(status) => return status,
+            };
+            (snapshot, None)
         };
+        let frame_build_elapsed = timing_start.elapsed();
         let surface_missing_after_frame = session
             .macos_render_host
             .as_ref()
@@ -4992,16 +5215,28 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
             }
         }
-        let submission = match state.host.submit_with_images(
+        let image_sync_elapsed = timing_start.elapsed();
+        let submission = match state.host.submit_with_images_at(
             &mut surface_state.renderer,
             &surface_state.surface,
             &mut surface_state.uploader,
             &mut surface_state.atlas,
             &mut surface_state.image_atlas,
+            retained_presentation_viewport,
         ) {
             Ok(submission) => submission,
-            Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+            Err(error) => return macos_surface_submit_error_status(error),
         };
+        if timing_enabled {
+            let total = timing_start.elapsed();
+            eprintln!(
+                "yu-render timing build={:?} image-sync={:?} total={:?} reused={}",
+                frame_build_elapsed,
+                image_sync_elapsed.saturating_sub(frame_build_elapsed),
+                total,
+                retained_presentation_viewport.is_some()
+            );
+        }
         // SAFETY: `snapshot` is a caller-owned output pointer checked above.
         unsafe {
             *snapshot = YuStorageMacosRenderHostSurfaceSnapshot {
@@ -5028,11 +5263,13 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                     .unwrap_or(u64::MAX),
                 image_retry_count,
                 submitted: 1,
+                presentation_reused: u8::from(retained_presentation_viewport.is_some()),
                 selection_decoration_count: host_snapshot.selection_decoration_count,
                 caret_decoration_count: host_snapshot.caret_decoration_count,
                 search_decoration_count: host_snapshot.search_decoration_count,
                 highlighted_glyph_count: host_snapshot.highlighted_glyph_count,
                 resource_refresh_pending: host_snapshot.resource_refresh_pending,
+                resource_retry_pending: host_snapshot.resource_retry_pending,
                 content_height: host_snapshot.content_height,
             };
         }
@@ -5104,7 +5341,11 @@ pub unsafe extern "C" fn yu_storage_session_frame_is_current(
         let key = frame_key(session, appearance_from_raw(appearance), geometry);
         let current = session.macos_render_host.as_ref().is_some_and(|state| {
             // 没有 surface 时不能声称当前帧有效：内容还没有真正上屏。
-            state.surface.is_some() && state.last_frame_key.as_ref() == Some(&key)
+            state.resource_completion_generation
+                == yu_render_macos::resource_completion_generation()
+                && !state.resource_refresh_pending
+                && state.surface.is_some()
+                && state.last_frame_key.as_ref() == Some(&key)
         });
         // SAFETY: `out_current` was checked above and belongs to the caller.
         unsafe { *out_current = u8::from(current) };
@@ -5774,7 +6015,62 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn embedded_query_returns_pending_until_worker_completes() {
+        let (jobs, queued) = std::sync::mpsc::channel();
+        let (completed, results) = std::sync::mpsc::channel();
+        let mut state = MacosEmbeddedResourceState {
+            cache: EmbeddedResourceCache::new(),
+            jobs,
+            results,
+        };
+        let request = EmbeddedRenderRequest::new(
+            Revision::INITIAL,
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(3)).unwrap(),
+            EmbeddedResourceKind::Math,
+            "x^2",
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .status_for(request.clone(), Revision::INITIAL)
+                .unwrap(),
+            YU_STORAGE_EMBEDDED_RESOURCE_PENDING
+        );
+        let job = queued.try_recv().unwrap();
+        assert_eq!(
+            state
+                .status_for(request.clone(), Revision::INITIAL)
+                .unwrap(),
+            YU_STORAGE_EMBEDDED_RESOURCE_PENDING
+        );
+        assert!(queued.try_recv().is_err(), "duplicate job while in flight");
+        let payload = MathRenderer::default().render(&job);
+        completed.send((job, payload)).unwrap();
+        assert_eq!(
+            state.status_for(request, Revision::INITIAL).unwrap(),
+            YU_STORAGE_EMBEDDED_RESOURCE_READY
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_embedded_state_defaults_to_math_and_keeps_mermaid_unsupported() {
+        fn settled(state: &mut MacosEmbeddedResourceState, request: EmbeddedRenderRequest) -> u8 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let status = state
+                    .status_for(request.clone(), Revision::INITIAL)
+                    .expect("status");
+                if status != YU_STORAGE_EMBEDDED_RESOURCE_PENDING {
+                    return status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         let mut state = MacosEmbeddedResourceState::new();
         let request = EmbeddedRenderRequest::new(
             Revision::INITIAL,
@@ -5784,9 +6080,7 @@ mod tests {
         )
         .expect("request");
         assert_eq!(
-            state
-                .status_for(request.clone(), Revision::INITIAL)
-                .expect("status"),
+            settled(&mut state, request.clone()),
             YU_STORAGE_EMBEDDED_RESOURCE_READY
         );
         let publication = state
@@ -5812,9 +6106,7 @@ mod tests {
         )
         .expect("request");
         assert_eq!(
-            state
-                .status_for(mermaid, Revision::INITIAL)
-                .expect("status"),
+            settled(&mut state, mermaid),
             YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
         );
     }
@@ -7654,6 +7946,19 @@ mod tests {
                 YU_STORAGE_OK
             );
             assert_eq!(frame.published, 1);
+            let session = unsafe { &*raw };
+            let host = session.macos_render_host.as_ref().expect("render host");
+            assert_eq!(
+                host.resource_refresh_pending,
+                frame.resource_refresh_pending != 0
+            );
+            let retained =
+                macos_render_host_snapshot(host, session.session.composition_generation())
+                    .expect("retained snapshot");
+            assert_eq!(
+                retained.resource_refresh_pending,
+                frame.resource_refresh_pending
+            );
             unsafe { yu_storage_session_destroy(raw) };
             fs::remove_file(path).expect("cleanup");
             frame.resource_refresh_pending

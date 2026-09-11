@@ -7,6 +7,132 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <math.h>
+#include <stdatomic.h>
+
+void yu_metal_notify_resource_completion(void) {
+    static atomic_bool pending = false;
+    if (atomic_exchange(&pending, true)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        atomic_store(&pending, false);
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"YuRenderResourceCompleted" object:nil];
+    });
+}
+
+// Only the acquisition worker may wait in CAMetalLayer. The main thread
+// exchanges owned drawables under a short lock that never encloses Metal calls.
+@interface YuMetalLayer : CAMetalLayer {
+    id<CAMetalDrawable> readyDrawable;
+    BOOL acquisitionPending;
+    BOOL acquisitionEnabled;
+    uint64_t acquisitionGeneration;
+}
+- (id<CAMetalDrawable>)takeReadyDrawable;
+- (void)setAcquisitionEnabled:(BOOL)enabled;
+- (void)invalidateReadyDrawable;
+@end
+
+@implementation YuMetalLayer
+- (id<CAMetalDrawable>)acquireDrawable {
+    return [super nextDrawable];
+}
+- (void)invalidateReadyDrawable {
+    id<CAMetalDrawable> previous;
+    @synchronized (self) {
+        acquisitionGeneration += 1;
+        previous = readyDrawable;
+        readyDrawable = nil;
+    }
+    [previous release];
+}
+- (void)setAcquisitionEnabled:(BOOL)enabled {
+    @synchronized (self) {
+        acquisitionEnabled = enabled;
+    }
+    [self invalidateReadyDrawable];
+}
+- (id<CAMetalDrawable>)takeReadyDrawable {
+    uint64_t generation;
+    @synchronized (self) {
+        if (!acquisitionEnabled) return nil;
+        if (readyDrawable != nil) {
+            id<CAMetalDrawable> drawable = readyDrawable;
+            readyDrawable = nil;
+            return [drawable autorelease];
+        }
+        if (acquisitionPending) return nil;
+        acquisitionPending = YES;
+        generation = acquisitionGeneration;
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        @autoreleasepool {
+            id<CAMetalDrawable> drawable = [[self acquireDrawable] retain];
+            @synchronized (self) {
+                acquisitionPending = NO;
+                if (acquisitionEnabled && acquisitionGeneration == generation) {
+                    readyDrawable = drawable;
+                    drawable = nil;
+                }
+            }
+            [drawable release];
+        }
+    });
+    return nil;
+}
+- (void)dealloc {
+    [readyDrawable release];
+    [super dealloc];
+}
+@end
+
+// Deterministic probe: hold acquisition until the caller has exercised the
+// non-blocking path. No window, GPU or compositor timing is needed.
+@interface YuMetalBlockedProbeLayer : YuMetalLayer {
+@public
+    dispatch_semaphore_t entered;
+    dispatch_semaphore_t resume;
+    dispatch_semaphore_t finished;
+}
+@end
+@implementation YuMetalBlockedProbeLayer
+- (id<CAMetalDrawable>)acquireDrawable {
+    dispatch_semaphore_signal(entered);
+    dispatch_semaphore_wait(resume, DISPATCH_TIME_FOREVER);
+    dispatch_semaphore_signal(finished);
+    return nil;
+}
+- (void)dealloc {
+    dispatch_release(entered);
+    dispatch_release(resume);
+    dispatch_release(finished);
+    [super dealloc];
+}
+@end
+
+int yu_metal_nonblocking_acquisition_probe(void) {
+    @autoreleasepool {
+        YuMetalBlockedProbeLayer *layer = [[YuMetalBlockedProbeLayer alloc] init];
+        layer->entered = dispatch_semaphore_create(0);
+        layer->resume = dispatch_semaphore_create(0);
+        layer->finished = dispatch_semaphore_create(0);
+        [layer setAcquisitionEnabled:YES];
+        BOOL passed = [layer takeReadyDrawable] == nil;
+        long started = dispatch_semaphore_wait(layer->entered,
+            dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        passed = passed && started == 0;
+        for (int index = 0; index < 1000 && started == 0; index += 1) {
+            passed = passed && [layer takeReadyDrawable] == nil;
+        }
+        [layer invalidateReadyDrawable];
+        [layer setAcquisitionEnabled:NO];
+        passed = passed && [layer takeReadyDrawable] == nil;
+        dispatch_semaphore_signal(layer->resume);
+        long completed = dispatch_semaphore_wait(layer->finished,
+            dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        [layer release];
+        return passed && completed == 0;
+    }
+}
 
 typedef struct {
     uint32_t kind;
@@ -68,6 +194,12 @@ typedef struct {
 
 typedef struct {
     id<MTLTexture> texture;
+    id<MTLTexture> scroll_scratch;
+    // At most two render command buffers may be waiting for the GPU.  The
+    // render host is called from AppKit's main thread, so this gate must be
+    // checked with DISPATCH_TIME_NOW: a scroll burst drops a stale frame
+    // instead of waiting for an older drawable/command buffer to complete.
+    dispatch_semaphore_t in_flight;
     NSUInteger width;
     NSUInteger height;
 } YuMetalRenderTarget;
@@ -116,14 +248,20 @@ int yu_metal_create_layer(
     if (device_ptr == NULL || out_layer == NULL || pixel_width <= 0.0 || pixel_height <= 0.0 || scale <= 0.0) {
         return 0;
     }
-    CAMetalLayer *layer = [CAMetalLayer layer];
+    YuMetalLayer *layer = [YuMetalLayer layer];
     if (layer == nil) {
         return 0;
     }
     [layer retain];
     layer.device = (id<MTLDevice>)device_ptr;
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    layer.framebufferOnly = YES;
+    // The retained target is copied into this texture by a blit encoder.
+    layer.framebufferOnly = NO;
+    // Bound drawable acquisition waits. This timeout is not a non-blocking API.
+    layer.allowsNextDrawableTimeout = YES;
+    // Limit GPU queue pressure separately below. GPU completion does not imply
+    // that the compositor has released a drawable; nextDrawable may still wait.
+    layer.maximumDrawableCount = 3;
     // The product keeps a TextKit source mirror underneath this projection.
     // Transparent untouched pixels let that mirror remain the input and
     // accessibility fallback while Rust contributes only its glyph coverage.
@@ -156,6 +294,7 @@ int yu_metal_attach_layer_to_view(
     [metal_layer retain];
     [view setWantsLayer:YES];
     [view setLayer:metal_layer];
+    [(YuMetalLayer *)metal_layer setAcquisitionEnabled:YES];
 
     attachment->view = view;
     attachment->previous_layer = previous_layer;
@@ -169,6 +308,7 @@ void yu_metal_detach_layer_from_view(void *attachment_ptr) {
         return;
     }
     YuMetalViewAttachment *attachment = (YuMetalViewAttachment *)attachment_ptr;
+    [(YuMetalLayer *)attachment->metal_layer setAcquisitionEnabled:NO];
     if (attachment->view.layer == attachment->metal_layer) {
         [attachment->view setLayer:attachment->previous_layer];
     }
@@ -267,6 +407,7 @@ int yu_metal_resize_layer(
     CAMetalLayer *layer = (CAMetalLayer *)layer_ptr;
     layer.contentsScale = scale;
     layer.drawableSize = CGSizeMake(pixel_width, pixel_height);
+    [(YuMetalLayer *)layer invalidateReadyDrawable];
     return 1;
 }
 
@@ -374,6 +515,12 @@ int yu_metal_create_render_target(
         return 0;
     }
     target->texture = texture;
+    target->in_flight = dispatch_semaphore_create(2);
+    if (target->in_flight == NULL) {
+        [texture release];
+        free(target);
+        return 0;
+    }
     target->width = width;
     target->height = height;
     *out_target = (void *)target;
@@ -386,6 +533,8 @@ void yu_metal_release_render_target(void *target_ptr) {
     }
     YuMetalRenderTarget *target = (YuMetalRenderTarget *)target_ptr;
     [target->texture release];
+    [target->scroll_scratch release];
+    dispatch_release(target->in_flight);
     free(target);
 }
 
@@ -412,7 +561,7 @@ int yu_metal_clear_and_present(
     if (queue_ptr == NULL || layer_ptr == NULL) {
         return 0;
     }
-    id<CAMetalDrawable> drawable = [(CAMetalLayer *)layer_ptr nextDrawable];
+    id<CAMetalDrawable> drawable = [(YuMetalLayer *)layer_ptr takeReadyDrawable];
     if (drawable == nil) {
         return 2;
     }
@@ -668,7 +817,8 @@ static int yu_metal_encode_command(
 static void yu_metal_encode_clear_rect(
     id<MTLRenderCommandEncoder> encoder,
     YuMetalPipeline *pipeline,
-    YuMetalDamageRect damage
+    YuMetalDamageRect damage,
+    YuMetalPrimitiveUniforms background
 ) {
     YuMetalVertex vertices[6] = {
         {damage.x, damage.y, 0.0f, 0.0f},
@@ -678,10 +828,9 @@ static void yu_metal_encode_clear_rect(
         {damage.x + damage.width, damage.y + damage.height, 0.0f, 0.0f},
         {damage.x, damage.y + damage.height, 0.0f, 0.0f},
     };
-    YuMetalPrimitiveUniforms primitive = {0.0f, 0.0f, 0.0f, 0.0f};
     [encoder setRenderPipelineState:pipeline->clear_pipeline];
     [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
-    [encoder setFragmentBytes:&primitive length:sizeof(primitive) atIndex:0];
+    [encoder setFragmentBytes:&background length:sizeof(background) atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 }
 
@@ -694,6 +843,11 @@ int yu_metal_render_plan(
     float viewport_height,
     float scale,
     int full_clear,
+    int32_t scroll_pixels,
+    float clear_red,
+    float clear_green,
+    float clear_blue,
+    float clear_alpha,
     const YuMetalDrawCommand *commands,
     size_t command_count,
     const YuMetalDamageRect *damage,
@@ -714,30 +868,82 @@ int yu_metal_render_plan(
 
     YuMetalPipeline *pipeline = (YuMetalPipeline *)pipeline_ptr;
     YuMetalRenderTarget *target = (YuMetalRenderTarget *)target_ptr;
-    id<CAMetalDrawable> drawable = [(CAMetalLayer *)layer_ptr nextDrawable];
+    if (target->in_flight == NULL
+        || dispatch_semaphore_wait(target->in_flight, DISPATCH_TIME_NOW) != 0) {
+        // A previous command buffer still owns the available GPU slot.  The
+        // caller will submit the newest request on the next display-link
+        // tick; never wait on AppKit's main thread here.
+        return 2;
+    }
+    id<CAMetalDrawable> drawable = [(YuMetalLayer *)layer_ptr takeReadyDrawable];
     if (drawable == nil) {
+        dispatch_semaphore_signal(target->in_flight);
         return 2;
     }
     if (drawable.texture.width != target->width || drawable.texture.height != target->height) {
-        return 6;
+        dispatch_semaphore_signal(target->in_flight);
+        // A resize may race acquisition even when its generation is current.
+        // Discard this drawable and request the new dimensions on the next tick.
+        return 2;
     }
     id<MTLCommandBuffer> command_buffer = [(id<MTLCommandQueue>)queue_ptr commandBuffer];
     if (command_buffer == nil) {
+        dispatch_semaphore_signal(target->in_flight);
         return 3;
+    }
+
+    // Encode the move in the same buffer as the redraw. Failed preparation
+    // never commits a half-scrolled target. Scratch avoids overlapping copies.
+    if (scroll_pixels != 0) {
+        NSUInteger amount = (NSUInteger)llabs((long long)scroll_pixels);
+        if (full_clear || amount >= target->height) {
+            dispatch_semaphore_signal(target->in_flight);
+            return 0;
+        }
+        if (target->scroll_scratch == nil) {
+            MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:target->texture.pixelFormat
+                width:target->width height:target->height mipmapped:NO];
+            descriptor.storageMode = MTLStorageModePrivate;
+            target->scroll_scratch = [target->texture.device newTextureWithDescriptor:descriptor];
+            if (target->scroll_scratch == nil) {
+                dispatch_semaphore_signal(target->in_flight);
+                return 0;
+            }
+        }
+        id<MTLBlitCommandEncoder> move = [command_buffer blitCommandEncoder];
+        if (move == nil) {
+            dispatch_semaphore_signal(target->in_flight);
+            return 7;
+        }
+        MTLSize overlap = MTLSizeMake(target->width, target->height - amount, 1);
+        NSUInteger source_y = scroll_pixels > 0 ? amount : 0;
+        NSUInteger destination_y = scroll_pixels > 0 ? 0 : amount;
+        [move copyFromTexture:target->texture sourceSlice:0 sourceLevel:0
+            sourceOrigin:MTLOriginMake(0, source_y, 0) sourceSize:overlap
+            toTexture:target->scroll_scratch destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [move copyFromTexture:target->scroll_scratch sourceSlice:0 sourceLevel:0
+            sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:overlap
+            toTexture:target->texture destinationSlice:0 destinationLevel:0
+            destinationOrigin:MTLOriginMake(0, destination_y, 0)];
+        [move endEncoding];
     }
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     if (pass == nil) {
+        dispatch_semaphore_signal(target->in_flight);
         return 4;
     }
     MTLRenderPassColorAttachmentDescriptor *color = pass.colorAttachments[0];
     color.texture = target->texture;
     color.loadAction = full_clear ? MTLLoadActionClear : MTLLoadActionLoad;
     color.storeAction = MTLStoreActionStore;
-    color.clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    color.clearColor = MTLClearColorMake(clear_red, clear_green, clear_blue, clear_alpha);
     id<MTLRenderCommandEncoder> encoder =
         [command_buffer renderCommandEncoderWithDescriptor:pass];
     if (encoder == nil) {
+        dispatch_semaphore_signal(target->in_flight);
         return 4;
     }
 
@@ -767,6 +973,7 @@ int yu_metal_render_plan(
                     image_textures,
                     image_texture_count)) {
                 [encoder endEncoding];
+                dispatch_semaphore_signal(target->in_flight);
                 return 5;
             }
         }
@@ -783,7 +990,8 @@ int yu_metal_render_plan(
                 continue;
             }
             [encoder setScissorRect:scissor];
-            yu_metal_encode_clear_rect(encoder, pipeline, damage_rect);
+            YuMetalPrimitiveUniforms background = {clear_red, clear_green, clear_blue, clear_alpha};
+            yu_metal_encode_clear_rect(encoder, pipeline, damage_rect, background);
             for (size_t index = 0; index < command_count; index += 1) {
                 if (!yu_metal_encode_command(
                         encoder,
@@ -794,6 +1002,7 @@ int yu_metal_render_plan(
                         image_textures,
                         image_texture_count)) {
                     [encoder endEncoding];
+                    dispatch_semaphore_signal(target->in_flight);
                     return 5;
                 }
             }
@@ -803,6 +1012,7 @@ int yu_metal_render_plan(
     [encoder endEncoding];
     id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
     if (blit == nil) {
+        dispatch_semaphore_signal(target->in_flight);
         return 7;
     }
     MTLSize copy_size = MTLSizeMake(target->width, target->height, 1);
@@ -817,6 +1027,15 @@ int yu_metal_render_plan(
         destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
     [command_buffer presentDrawable:drawable];
+    dispatch_semaphore_t in_flight = target->in_flight;
+    // The semaphore is captured independently of `target`; this keeps the
+    // completion callback valid even if the Rust target wrapper is dropped
+    // after the command has been committed.
+    dispatch_retain(in_flight);
+    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull _) {
+        dispatch_semaphore_signal(in_flight);
+        dispatch_release(in_flight);
+    }];
     [command_buffer commit];
     return 1;
 }

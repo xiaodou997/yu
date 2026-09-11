@@ -30,6 +30,98 @@ pub struct FrameGeometry {
     scale_bits: u64,
 }
 
+/// Geometry that changes the contents of a rendered frame rather than merely
+/// moving the camera over it.  Scroll position intentionally does not belong
+/// here: a retained publication can be presented at another scroll offset as
+/// long as that offset stays inside its coverage range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameBuildGeometry {
+    size_bits: u32,
+    max_width_bits: u32,
+    viewport_height_bits: u32,
+    surface_width_bits: u64,
+    surface_height_bits: u64,
+    scale_bits: u64,
+}
+
+impl FrameGeometry {
+    #[must_use]
+    pub const fn build_geometry(self) -> FrameBuildGeometry {
+        FrameBuildGeometry {
+            size_bits: self.size_bits,
+            max_width_bits: self.max_width_bits,
+            viewport_height_bits: self.viewport_height_bits,
+            surface_width_bits: self.surface_width_bits,
+            surface_height_bits: self.surface_height_bits,
+            scale_bits: self.scale_bits,
+        }
+    }
+
+    #[must_use]
+    pub fn scroll_y(self) -> f32 {
+        f32::from_bits(self.scroll_y_bits)
+    }
+
+    #[must_use]
+    pub fn viewport_height(self) -> f32 {
+        f32::from_bits(self.viewport_height_bits)
+    }
+}
+
+/// The camera/presentation part of a retained frame.  It is separate from
+/// [`FrameBuildGeometry`] so a scroll gesture can reuse an already shaped and
+/// rasterized publication without rebuilding Markdown layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramePresentationState {
+    scroll_y_bits: u32,
+    coverage_top_bits: u32,
+    coverage_bottom_bits: u32,
+}
+
+impl FramePresentationState {
+    #[must_use]
+    pub fn new(scroll_y: f32, coverage_top: f32, coverage_bottom: f32) -> Option<Self> {
+        if !scroll_y.is_finite()
+            || scroll_y < 0.0
+            || !coverage_top.is_finite()
+            || coverage_top < 0.0
+            || !coverage_bottom.is_finite()
+            || coverage_bottom < coverage_top
+            || scroll_y < coverage_top
+            || scroll_y > coverage_bottom
+        {
+            return None;
+        }
+        Some(Self {
+            scroll_y_bits: scroll_y.to_bits(),
+            coverage_top_bits: coverage_top.to_bits(),
+            coverage_bottom_bits: coverage_bottom.to_bits(),
+        })
+    }
+
+    #[must_use]
+    pub fn scroll_y(self) -> f32 {
+        f32::from_bits(self.scroll_y_bits)
+    }
+
+    #[must_use]
+    pub fn coverage_top(self) -> f32 {
+        f32::from_bits(self.coverage_top_bits)
+    }
+
+    #[must_use]
+    pub fn coverage_bottom(self) -> f32 {
+        f32::from_bits(self.coverage_bottom_bits)
+    }
+
+    #[must_use]
+    pub fn covers(self, scroll_y: f32) -> bool {
+        scroll_y.is_finite()
+            && scroll_y >= self.coverage_top()
+            && scroll_y <= self.coverage_bottom()
+    }
+}
+
 impl FrameGeometry {
     /// 校验并记下一帧的几何。任何一项不是有限值（或该为正却不为正）就拒绝。
     ///
@@ -99,7 +191,7 @@ impl FrameTableResize {
     }
 }
 
-/// 一帧的完整身份：Rust 拥有的可视状态 + 平台提供的几何。
+/// 一帧的完整身份：内容构建身份 + 平台提供的呈现几何。
 ///
 /// 全部一起比较，任何一项变化都要重画：
 ///
@@ -116,6 +208,9 @@ impl FrameTableResize {
 ///   语义色自动跟，文档区由这一帧画，而这一帧被判成了「与屏幕上那一帧等价」。
 /// - `geometry`：字号、换行宽度、滚动、surface 尺寸与 backing scale。
 ///
+/// `FrameBuildKey` 已经把不影响内容的 scroll origin 从构建身份中分离出来；
+/// `FrameKey` 暂时保留完整的 presentation 比较，以兼容当前严格 host 提交路径。
+///
 /// 这个列表就是「帧内容取决于什么」的完整定义。新增一种不推进 Revision 的
 /// 可视状态时必须同时加进来，否则它的变化会被静默跳过——本项目最危险的失败
 /// 模式正是这种不报错的漏画。
@@ -126,22 +221,53 @@ impl FrameTableResize {
 /// ——而碰撞的表现正是这个类型的文档明令要防的那件事：**静默跳过一帧**。
 /// 一次 `Vec` 分配（N 是光标数）换掉一个不报错的漏画，这笔账不用算。
 #[derive(Clone, Debug, PartialEq)]
-pub struct FrameKey {
+pub struct FrameBuildKey {
     revision: u64,
     composition_generation: u64,
     selections: Vec<EditorSelection>,
     search_generation: u64,
     table_resize: Option<FrameTableResize>,
     appearance: Appearance,
-    geometry: FrameGeometry,
+    geometry: FrameBuildGeometry,
 }
 
-impl FrameKey {
-    /// 组装一帧的身份。
+/// Ticket carried by a background frame-build job. The key is immutable and
+/// the generation is owned by the platform scheduler; both must match before
+/// a completed plan may be published.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameBuildRequest {
+    key: FrameBuildKey,
+    generation: u64,
+}
+
+impl FrameBuildRequest {
+    #[must_use]
+    pub fn new(key: FrameBuildKey, generation: u64) -> Self {
+        Self { key, generation }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &FrameBuildKey {
+        &self.key
+    }
+
+    /// Returns true only when the scheduler still wants this exact result.
+    #[must_use]
+    pub fn accepts(&self, current_key: &FrameBuildKey, current_generation: u64) -> bool {
+        self.generation == current_generation && &self.key == current_key
+    }
+}
+
+impl FrameBuildKey {
+    /// 组装一份需要重新准备内容的身份。滚动位置不在其中。
     ///
-    /// 提交路径与「这一帧是不是当前帧」共用这一个构造函数。两边各写一份是这个
-    /// 判断最容易出错的地方：只要有一项不对称，就会出现「明明变了却判为等价」
-    /// 或「明明没变却每帧重画」。
+    /// 这份 key 供 retained frame builder 使用；当前 `FrameKey` 仍把
+    /// presentation 也带上，用于严格判断屏幕上的帧是否已经跟随滚动。
     #[must_use]
     pub fn new(
         revision: u64,
@@ -159,8 +285,62 @@ impl FrameKey {
             search_generation,
             table_resize,
             appearance,
-            geometry,
+            geometry: geometry.build_geometry(),
         }
+    }
+
+    #[must_use]
+    pub const fn geometry(&self) -> FrameBuildGeometry {
+        self.geometry
+    }
+}
+
+/// 一帧的完整身份：内容构建身份 + 屏幕呈现身份。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FrameKey {
+    build: FrameBuildKey,
+    presentation: FramePresentationState,
+}
+
+impl FrameKey {
+    /// 组装一帧的身份。
+    #[must_use]
+    pub fn new(
+        revision: u64,
+        composition_generation: u64,
+        selections: Vec<EditorSelection>,
+        search_generation: u64,
+        table_resize: Option<FrameTableResize>,
+        appearance: Appearance,
+        geometry: FrameGeometry,
+    ) -> Self {
+        let scroll_y = geometry.scroll_y();
+        let viewport_height = geometry.viewport_height();
+        let presentation =
+            FramePresentationState::new(scroll_y, scroll_y, scroll_y + viewport_height)
+                .expect("validated frame geometry must produce a presentation state");
+        Self {
+            build: FrameBuildKey::new(
+                revision,
+                composition_generation,
+                selections,
+                search_generation,
+                table_resize,
+                appearance,
+                geometry,
+            ),
+            presentation,
+        }
+    }
+
+    #[must_use]
+    pub const fn build(&self) -> &FrameBuildKey {
+        &self.build
+    }
+
+    #[must_use]
+    pub const fn presentation(&self) -> FramePresentationState {
+        self.presentation
     }
 
     /// 这一帧建立在哪个 Revision 上。
@@ -169,19 +349,31 @@ impl FrameKey {
     /// 这个类型的全部意义：四项可视状态都不推进 Revision。
     #[must_use]
     pub const fn revision(&self) -> u64 {
-        self.revision
+        self.build.revision
     }
 
     /// 平台送来的那一份几何。同上：用例要能说「变的不是几何」。
     #[must_use]
     pub const fn geometry(&self) -> FrameGeometry {
-        self.geometry
+        // `FrameKey` is retained for the strict host equality path.  The
+        // original full geometry is reconstructed only for callers that still
+        // need it; new retained-frame code should use `build()` and
+        // `presentation()` instead.
+        FrameGeometry {
+            size_bits: self.build.geometry.size_bits,
+            max_width_bits: self.build.geometry.max_width_bits,
+            scroll_y_bits: self.presentation.scroll_y_bits,
+            viewport_height_bits: self.build.geometry.viewport_height_bits,
+            surface_width_bits: self.build.geometry.surface_width_bits,
+            surface_height_bits: self.build.geometry.surface_height_bits,
+            scale_bits: self.build.geometry.scale_bits,
+        }
     }
 
     /// 这一帧的全部选区。同上：用例要能说「变的不是选区」。
     #[must_use]
     pub fn selections(&self) -> &[EditorSelection] {
-        &self.selections
+        &self.build.selections
     }
 }
 
@@ -264,5 +456,34 @@ mod tests {
             FrameKey::new(7, 3, Vec::new(), 2, None, Appearance::Dark, geometry()),
             "外观：切深浅既不推进 Revision 也不改几何，少了它文档区不会重画"
         );
+    }
+
+    #[test]
+    fn build_key_can_be_reused_while_presentation_moves_inside_coverage() {
+        let top =
+            FrameGeometry::new(16.0, 720.0, 0.0, 480.0, 1440.0, 960.0, 2.0).expect("top geometry");
+        let scrolled = FrameGeometry::new(16.0, 720.0, 120.0, 480.0, 1440.0, 960.0, 2.0)
+            .expect("scrolled geometry");
+        let first = FrameKey::new(7, 3, Vec::new(), 2, None, Appearance::Light, top);
+        let second = FrameKey::new(7, 3, Vec::new(), 2, None, Appearance::Light, scrolled);
+
+        assert_eq!(first.build(), second.build());
+        assert_ne!(first.presentation(), second.presentation());
+
+        let coverage = FramePresentationState::new(240.0, 0.0, 720.0).expect("coverage");
+        assert!(coverage.covers(0.0));
+        assert!(coverage.covers(720.0));
+        assert!(!coverage.covers(721.0));
+
+        let request = FrameBuildRequest::new(first.build().clone(), 9);
+        assert!(request.accepts(second.build(), 9));
+        assert!(!request.accepts(second.build(), 10));
+    }
+
+    #[test]
+    fn presentation_state_rejects_offsets_outside_coverage() {
+        assert!(FramePresentationState::new(1.0, 2.0, 10.0).is_none());
+        assert!(FramePresentationState::new(11.0, 0.0, 10.0).is_none());
+        assert!(FramePresentationState::new(f32::NAN, 0.0, 10.0).is_none());
     }
 }
