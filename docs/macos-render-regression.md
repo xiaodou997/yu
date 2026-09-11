@@ -230,3 +230,44 @@ Instruments 第一份 `.notes/macos-hover-instruments-20260911-a/` 的应用自�
 `disk_state → current_fingerprint → fs::read`。下一项应将高频 Revision 查询
 与磁盘外部修改检测分离，保留保存/重新加载时的冲突校验；本次尚未修改这部分。
 上述 inclusive 样本相互包含，不能相加，也不是单次查询时长。
+
+## 高频 Revision 查询不再检查磁盘（2026-09-11）
+
+新增 `yu_storage_session_revision`，只读取 canonical session 的内存 Revision。
+Swift 的 `bridge.revision` 每次通过此接口读取，不复用可能过期的完整状态缓存。
+渲染、hover、AX 几何、选区、输入、composition 和面板查询中单独使用 Revision
+的位置均已迁移。`bridge.state` 与保存、重新加载、关闭时的磁盘冲突逻辑不变，
+状态栏/菜单需要完整状态时仍会检查磁盘；本次不是移除外部修改检测。
+
+自动证据位于 `.notes/macos-revision-query-20260911-a/`。机器与前述相同：
+Apple M1 Max / Mac13,1，macOS 26.5 / 25F71，Xcode 26.6 / 17F113，debug，
+2x / 60Hz，窗口与长文档/延迟资源 fixture 同前，环境和 binary SHA 已保存。
+
+- 49 项 FFI 测试通过。新增测试验证编辑后立即读到新 Revision；将磁盘文件
+  替换成目录导致完整状态检查失败时仍能读取最新内存 Revision；恢复为外部
+  修改内容后，完整状态报告 Changed，保存拒绝覆盖，磁盘原内容保持不变。
+- 14 项协议 self-check、长文档、延迟资源和 Dark Aqua 窗口检查全部通过。
+- 长文档 133 个 hover 样本：p50 0.003750ms / p95 0.050459ms / p99 0.057ms。
+  上一版同 fixture 的 p95 为 1.780ms，但运行中的实际鼠标事件数不同，不作为
+  受控提速倍率。hover / AX 同步排版 fallback 均为 0。
+- Swift submit attempt p95 1.550625ms / p99 24.790542ms；Metal encode/submit
+  p95 0.592583ms。后台 preparation p95 622.687708ms，仍有长尾。
+
+测量流程注意：`run-dark-self-check.sh` 当前使用 `pkill -f`，会匹配 xctrace
+命令行中包含的应用路径。必须等 Instruments 保存和导出完全结束后，才能运行
+深色自检；仅等目标应用退出还不够。本轮第一份 `macos-revision-instruments-20260911-a`
+在保存期间因此被终止（xctrace_exit=1），不能作为 CPU 证据。之前 hover 第一份
+保存失败也发生在相同的并发脚本顺序中。
+
+串行重录 `.notes/macos-revision-instruments-20260911-b/` 成功，xctrace_exit=0，
+CPU XML 可导出，`cpu-summary.json` 保留线程权重、完整主线程 inclusive 排名和
+路径交叉计数。binary SHA 与自动回归一致。主线程样本权重为 14.663s；hover、
+submitNow、AX 刷新各自调用链中，`yu_storage_session_state`、`current_fingerprint`
+与 `visible_blocks_with_shaper` 的交叉样本均为 0。hover 本身采样到 1ms，
+submitNow 包含子调用 535ms；不应将采样未命中解释为绝对零耗时。
+
+完整状态函数仍有 64ms、磁盘指纹读取仍有 66ms 主线程样本，属于其他调用链。
+说明本次移除了高频路径中的连带检查，而非删除磁盘检查。初始化/选区同步链
+仍有约 3.9s inclusive 样本，两个 frame worker 分别约 6.459s / 0.386s，
+需要后续单独分析，不能根据这些重叠权重直接推导连续滚动帧率。
+真实触控板 p95 ≤ 16.7ms、IME、VoiceOver 与跨显示器验收仍未完成。
