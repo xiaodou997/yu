@@ -56,7 +56,8 @@ use yu_scene::{EditorDecorationPrimitiveRole, Point, Primitive, Rect};
 #[cfg(target_os = "macos")]
 use yu_workspace::{
     Appearance, FrameBuildRequest, FrameGeometry, FrameKey, FrameTableResize,
-    ViewportFrameBuildInput, ViewportFrameBuildOutput, ViewportRenderConfig,
+    ViewportFrameBuildInput, ViewportFrameBuildOutput, ViewportFramePublication,
+    ViewportRenderConfig,
 };
 
 #[cfg(target_os = "macos")]
@@ -1082,6 +1083,8 @@ impl Drop for MacosFrameBuildWorker {
 struct MacosRenderHostState {
     builder: CoreTextViewportFrameBuilder,
     host: MetalViewportHostSession,
+    // Accepted publication is authoritative for both worker and synchronous builds.
+    last_publication: Option<ViewportFramePublication>,
     size: f32,
     surface: Option<MacosPersistentSurfaceState>,
     image_resources: MacosImageResourceState,
@@ -4562,8 +4565,8 @@ fn macos_render_host_snapshot(
     composition_generation: u64,
 ) -> Result<YuStorageMacosRenderHostSnapshot, i32> {
     let publication = state
-        .builder
-        .last_publication()
+        .last_publication
+        .as_ref()
         .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     let frame = publication.frame();
     let plan = frame.plan();
@@ -4741,7 +4744,7 @@ fn macos_render_host_frame(
         let initial_serial = session
             .macos_render_host
             .as_ref()
-            .and_then(|state| state.builder.last_publication())
+            .and_then(|state| state.last_publication.as_ref())
             .map_or(0, |publication| publication.serial());
         let shaper = shaper.ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
         let worker = MacosFrameBuildWorker::new(shaper.clone(), config, initial_serial).ok();
@@ -4760,6 +4763,7 @@ fn macos_render_host_frame(
         session.macos_render_host = Some(MacosRenderHostState {
             builder,
             host: MetalViewportHostSession::new(revision, surface_generation),
+            last_publication: None,
             size,
             surface,
             image_resources,
@@ -4832,8 +4836,8 @@ fn macos_render_host_frame(
         .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     if allow_background && state.frame_worker.is_none() {
         let initial_serial = state
-            .builder
-            .last_publication()
+            .last_publication
+            .as_ref()
             .map_or(0, |publication| publication.serial());
         state.frame_worker =
             MacosFrameBuildWorker::new(state.builder.shaper().clone(), config, initial_serial).ok();
@@ -4875,8 +4879,8 @@ fn macos_render_host_frame(
             state.frame_worker.take();
             state.frame_worker_request = None;
             let initial_serial = state
-                .builder
-                .last_publication()
+                .last_publication
+                .as_ref()
                 .map_or(0, |publication| publication.serial());
             state.frame_worker =
                 MacosFrameBuildWorker::new(state.builder.shaper().clone(), config, initial_serial)
@@ -4950,13 +4954,14 @@ fn macos_render_host_frame(
         )
     };
     let publish_elapsed = publish_timing_start.elapsed();
+    state
+        .host
+        .accept_publication(publication.clone())
+        .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    state.last_publication = Some(publication);
     if let Some(atlas) = worker_atlas {
         state.builder.replace_atlas(atlas);
     }
-    state
-        .host
-        .accept_publication(publication)
-        .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     let mut snapshot = macos_render_host_snapshot(state, session.session.composition_generation())?;
     // 在离开 host 的可变借用之后再问：这一帧的可见资源是否已经全部落定。
     let visible_blocks = viewport_blocks
@@ -5211,8 +5216,6 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
             max_width,
             scroll_y,
             viewport_height,
-            surface_width,
-            surface_height,
             surface_generation,
             appearance,
         );
@@ -5645,6 +5648,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
         state.frame_worker.take();
         state.frame_worker_request = None;
         state.surface.take();
+        state.host = MetalViewportHostSession::new(session.session.revision(), 0);
         // 记录的帧已经随 surface 一起消失，不能留下来让下一次绑定误判等价。
         state.last_frame_key = None;
     }
@@ -8736,6 +8740,109 @@ mod tests {
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn background_frame_snapshot_uses_accepted_publication() {
+        let path = std::env::temp_dir().join(format!("yu-background-host-{}.md", temp_id()));
+        fs::write(&path, "# Background frame\n\nHello 羽🙂\n").unwrap();
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let session = unsafe { raw.as_mut() }.unwrap();
+        let request = MacosFrameRequest {
+            expected_revision: 0,
+            size: 16.0,
+            max_width: 500.0,
+            scroll_y: 0.0,
+            viewport_height: 240.0,
+            surface_width: 500.0,
+            surface_height: 240.0,
+            surface_generation: 0,
+            raster_scale: 2.0,
+            appearance: Appearance::Light,
+        };
+        assert_eq!(
+            macos_render_host_frame(session, request, true),
+            Err(YU_STORAGE_RENDER_BUSY)
+        );
+        fn finish(
+            session: &mut YuStorageSession,
+            request: MacosFrameRequest,
+        ) -> YuStorageMacosRenderHostSnapshot {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match macos_render_host_frame(session, request, true) {
+                    Ok(snapshot) => return snapshot,
+                    Err(YU_STORAGE_RENDER_BUSY) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    result => {
+                        panic!("background publication did not become observable: {result:?}")
+                    }
+                }
+            }
+        }
+        let snapshot = finish(session, request);
+        let state = session.macos_render_host.as_ref().unwrap();
+        assert!(
+            state.builder.last_publication().is_none(),
+            "must exercise the worker, not synchronous fallback"
+        );
+        assert_eq!(snapshot.frame_revision, 0);
+        assert_eq!(snapshot.frame_serial, state.host.frame_serial().unwrap());
+        assert!(snapshot.command_count > 0);
+        assert!(snapshot.atlas_page_count > 0);
+        assert!(snapshot.content_height > 0.0);
+
+        // Supersede a pending same-revision resize, forcing worker replacement.
+        let resizing = MacosFrameRequest {
+            max_width: 520.0,
+            surface_width: 520.0,
+            surface_generation: 1,
+            ..request
+        };
+        assert_eq!(
+            macos_render_host_frame(session, resizing, true),
+            Err(YU_STORAGE_RENDER_BUSY)
+        );
+        let resized = finish(
+            session,
+            MacosFrameRequest {
+                max_width: 540.0,
+                surface_width: 540.0,
+                surface_generation: 2,
+                ..request
+            },
+        );
+        assert!(resized.frame_serial > snapshot.frame_serial);
+        assert_eq!(resized.surface_generation, 2);
+        assert_eq!(resized.viewport_width, 540.0);
+
+        // A new attachment starts at generation zero, independent of the old resize history.
+        assert_eq!(
+            unsafe { yu_storage_session_macos_render_host_surface_detach(raw) },
+            YU_STORAGE_OK
+        );
+        let session = unsafe { raw.as_mut() }.unwrap();
+        assert!(
+            session
+                .macos_render_host
+                .as_ref()
+                .unwrap()
+                .frame_worker
+                .is_none()
+        );
+        let rebound = finish(session, request);
+        assert!(rebound.frame_serial > resized.frame_serial);
+        assert_eq!(rebound.surface_generation, 0);
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).unwrap();
     }
 
     #[cfg(target_os = "macos")]
