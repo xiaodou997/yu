@@ -110,7 +110,13 @@ surface 提交现在先捕获 owned document snapshot，由 worker 生成 public
 同步 atlas、获取 drawable、编码并提交 Metal。worker 创建失败时保留同步 owned
 publication 作为恢复路径，detach 会取消并释放 worker，下一次绑定重新创建。
 
-本次交互式启动仍观察到窗口正文为空、状态为 `Native surface inactive`
-（Rust status 21）；因此本记录不把它算作真实窗口提交成功，也不宣称连续滚动
-p95 已达标。需要在可用 Metal surface 的目标机器上继续完成 drawable/backpressure
-和 Instruments 测量。
+后续定位确认 `Native surface inactive`（Rust status 21）是后台接入的代码回归，
+不是目标机器缺少 Metal：host 已接收 worker publication，但 snapshot 仍读取
+主线程 builder 中不存在的 publication。现统一从 host 已接收的 publication
+读取元数据，worker 重建从同一发布序号继续，detach 重置旧 surface generation。
+新增实际走 worker 的回归测试，修复前复现 `Err(21)`，修复后覆盖后台首帧、
+同 Revision 请求替换、resize 后 detach/rebind，并通过。
+
+修复后的 `run-dark-self-check.sh` 在正常图形会话中退出码 0：首帧、retained
+滚动、搜索 `1→0`、caret `1→2`、多选区、大纲导航 `156→1190`、代码高亮及
+两次窗口 resize 提交通过。此结果仍不是连续触控板滚动 p95 或完整人工验收。
