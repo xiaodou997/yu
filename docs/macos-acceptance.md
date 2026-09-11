@@ -120,3 +120,38 @@ publication 作为恢复路径，detach 会取消并释放 worker，下一次绑
 修复后的 `run-dark-self-check.sh` 在正常图形会话中退出码 0：首帧、retained
 滚动、搜索 `1→0`、caret `1→2`、多选区、大纲导航 `156→1190`、代码高亮及
 两次窗口 resize 提交通过。此结果仍不是连续触控板滚动 p95 或完整人工验收。
+
+### Instruments 入口实测（2026-09-11）
+
+`record-instruments.sh ... 30s --self-check` 已在 Apple M1 Max（Mac13,1）、
+macOS 26.5 / Xcode 26.6 上成功生成 Metal System Trace。原始数据位于本地
+`.notes/macos-instruments-20260911-smoke/`（不提交 trace 二进制）。debug app 自检完成，
+覆盖首帧、滚动定位、搜索、多光标、resize 与 detach/rebind。
+
+- 实际 drawable 呈现 14 次，GPU submit/complete 各 14 次；按 surface 观测的最大
+  in-flight 为 1，GPU busy 为 0。
+- drawable 尚未就绪 16 次；Swift render busy 51 次，包含后台准备等待，不能当作
+  GPU backpressure 次数。stale publication 为 0。
+- 后台 preparation：11 个样本，p50 23.037ms、p95 37.124ms。
+- 主线程 Metal encode/submit：14 个样本，p50 0.188ms、p95 1.180ms。
+- glyph/embedded atlas upload：30 个样本，p95 0.319ms。
+- drawable acquisition：14 个样本，p95 0.915ms，运行在 acquisition worker。
+- Swift submit attempt p95 38.362ms，包含整个协调器调用及 Instruments 开销，
+  不能替代实际呈现间隔；主线程仍有输入准备与 publication 后续工作，尚未完成性能收尾。
+- 此轮没有连续触控板 live-scroll 手势，因此呈现间隔样本为 0、p95 为 null。
+  **连续滚动 p95 ≤ 16.7ms 尚未验收。**
+
+统计程序按真正的 `MTLDrawable.presentedTime` 排序，按 surface 与已结束手势分组，
+不把 busy/跳过调用当作呈现，不拼接闲置间隔，也不剔除长帧。独立测试覆盖乱序回调、
+不同窗口、闲置间隔与无样本行为。
+
+本轮回归汇总：`yu-storage-ffi` 44/44、`yu-workspace` 45/45、
+`yu-render-macos` 10/10（另 2 项原有 ignored），指标统计测试 3/3。
+在正常权限的 macOS 会话重跑 `run-self-checks.sh`，全部 14 项通过，包含此前
+在受限会话失败的 clipboard/document-workflow。这仍不替代外部应用剪贴板和
+真实 IME/VoiceOver 的人工矩阵。
+
+后台 publication 现在可在 drawable busy 期间复用；只有 GPU 真正提交过当前
+publication 的序号，才能被判定为 current。资源完成即使不改变 FrameKey，也不会
+因沿用旧的 on-screen key 而丢失提交重试。worker 输出携带独立可消费的 atlas 页，
+丢弃旧输出不会使下一帧缺页；接收后台结果还检查最新滚动位置的 coverage。
