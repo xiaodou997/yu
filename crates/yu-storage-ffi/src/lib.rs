@@ -12,6 +12,13 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
+#[cfg(target_os = "macos")]
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+#[cfg(target_os = "macos")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(target_os = "macos")]
 use std::collections::{BTreeMap, HashSet};
@@ -47,7 +54,10 @@ use yu_text::{EditError, TextSnapshot};
 #[cfg(target_os = "macos")]
 use yu_scene::{EditorDecorationPrimitiveRole, Point, Primitive, Rect};
 #[cfg(target_os = "macos")]
-use yu_workspace::{Appearance, FrameGeometry, FrameKey, FrameTableResize, ViewportRenderConfig};
+use yu_workspace::{
+    Appearance, FrameBuildRequest, FrameGeometry, FrameKey, FrameTableResize,
+    ViewportFrameBuildInput, ViewportFrameBuildOutput, ViewportRenderConfig,
+};
 
 #[cfg(target_os = "macos")]
 use yu_assets::{
@@ -985,6 +995,90 @@ impl MacosImageResourceState {
 }
 
 #[cfg(target_os = "macos")]
+struct MacosFrameBuildJob {
+    input: ViewportFrameBuildInput,
+    config: ViewportRenderConfig,
+}
+
+#[cfg(target_os = "macos")]
+struct MacosFrameBuildWorker {
+    sender: Option<Sender<MacosFrameBuildJob>>,
+    receiver: Receiver<Result<ViewportFrameBuildOutput, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosFrameBuildWorker {
+    fn new(
+        shaper: CoreTextShaper,
+        config: ViewportRenderConfig,
+        initial_serial: u64,
+    ) -> Result<Self, i32> {
+        let (sender, jobs) = mpsc::channel::<MacosFrameBuildJob>();
+        let (results, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let mut builder = CoreTextViewportFrameBuilder::with_shaper_and_initial_serial(
+            shaper,
+            config,
+            GlyphAtlasConfig::default(),
+            initial_serial,
+        )
+        .map_err(|error| macos_render_host_error_status(&error))?;
+        std::thread::Builder::new()
+            .name("yu-frame-build".to_owned())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let MacosFrameBuildJob { input, config } = job;
+                    let result = builder
+                        .update_config(config)
+                        .and_then(|_| builder.publish_owned(input))
+                        .map_err(|error| error.to_string());
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if results.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+        Ok(Self {
+            sender: Some(sender),
+            receiver,
+            cancelled,
+        })
+    }
+
+    fn submit(&self, job: MacosFrameBuildJob) -> Result<(), i32> {
+        self.sender
+            .as_ref()
+            .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
+            .send(job)
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)
+    }
+
+    fn try_recv(&self) -> Result<Option<Result<ViewportFrameBuildOutput, String>>, i32> {
+        match self.receiver.try_recv() {
+            Ok(result) => Ok(Some(result)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosFrameBuildWorker {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.sender.take();
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct MacosRenderHostState {
     builder: CoreTextViewportFrameBuilder,
     host: MetalViewportHostSession,
@@ -1000,6 +1094,8 @@ struct MacosRenderHostState {
     resource_refresh_pending: bool,
     resource_retry_pending: bool,
     resource_completion_generation: u64,
+    frame_worker: Option<MacosFrameBuildWorker>,
+    frame_worker_request: Option<FrameBuildRequest>,
 }
 
 /// 平台送来的外观字节。**未知值按浅色处理，不报错。**
@@ -4530,6 +4626,8 @@ struct MacosFrameRequest {
     max_width: f32,
     scroll_y: f32,
     viewport_height: f32,
+    surface_width: f64,
+    surface_height: f64,
     surface_generation: u64,
     /// backing scale：字形按它取样，后端再除回逻辑坐标。
     raster_scale: f32,
@@ -4543,6 +4641,7 @@ struct MacosFrameRequest {
 fn macos_render_host_frame(
     session: &mut YuStorageSession,
     request: MacosFrameRequest,
+    allow_background: bool,
 ) -> Result<YuStorageMacosRenderHostSnapshot, i32> {
     // Capture before draining workers; a completion racing this build must
     // remain dirty so the following presentation cannot skip its publication.
@@ -4553,6 +4652,8 @@ fn macos_render_host_frame(
         max_width,
         scroll_y,
         viewport_height,
+        surface_width,
+        surface_height,
         surface_generation,
         raster_scale,
         appearance,
@@ -4642,8 +4743,10 @@ fn macos_render_host_frame(
             .as_ref()
             .and_then(|state| state.builder.last_publication())
             .map_or(0, |publication| publication.serial());
+        let shaper = shaper.ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+        let worker = MacosFrameBuildWorker::new(shaper.clone(), config, initial_serial).ok();
         let builder = CoreTextViewportFrameBuilder::with_shaper_and_initial_serial(
-            shaper.ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+            shaper,
             config,
             GlyphAtlasConfig::default(),
             initial_serial,
@@ -4665,6 +4768,8 @@ fn macos_render_host_frame(
             resource_refresh_pending: false,
             resource_retry_pending: false,
             resource_completion_generation: resource_generation,
+            frame_worker: worker,
+            frame_worker_request: None,
         });
     }
 
@@ -4693,10 +4798,46 @@ fn macos_render_host_frame(
     };
     let layout_elapsed = layout_timing_start.elapsed();
     let image_requests = macos_image_requests(session, &viewport_blocks)?;
+    let render_document = if allow_background {
+        Some(
+            session
+                .session
+                .document()
+                .editor()
+                .clone_for_render()
+                .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?,
+        )
+    } else {
+        None
+    };
+    let requested_build = frame_key(
+        session,
+        appearance,
+        FrameGeometry::new(
+            size,
+            max_width,
+            scroll_y,
+            viewport_height,
+            f64::from(surface_width),
+            f64::from(surface_height),
+            f64::from(raster_scale),
+        )
+        .ok_or(YU_STORAGE_EDITOR_ERROR)?,
+    )
+    .build()
+    .clone();
     let state = session
         .macos_render_host
         .as_mut()
         .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    if allow_background && state.frame_worker.is_none() {
+        let initial_serial = state
+            .builder
+            .last_publication()
+            .map_or(0, |publication| publication.serial());
+        state.frame_worker =
+            MacosFrameBuildWorker::new(state.builder.shaper().clone(), config, initial_serial).ok();
+    }
     state
         .host
         .advance_revision(revision)
@@ -4721,14 +4862,82 @@ fn macos_render_host_frame(
         .cloned()
         .collect::<Vec<_>>();
     let publish_timing_start = std::time::Instant::now();
-    let publication = {
+    let (publication, worker_atlas) = if let Some(document) = render_document {
+        let request = FrameBuildRequest::new(requested_build, resource_generation);
+        // A newer request supersedes both queued and running work. Drop the
+        // worker before enqueueing it so an old completion cannot occupy the
+        // channel and force the latest request through stale retries.
+        if state
+            .frame_worker_request
+            .as_ref()
+            .is_some_and(|pending| pending != &request)
+        {
+            state.frame_worker.take();
+            state.frame_worker_request = None;
+            let initial_serial = state
+                .builder
+                .last_publication()
+                .map_or(0, |publication| publication.serial());
+            state.frame_worker =
+                MacosFrameBuildWorker::new(state.builder.shaper().clone(), config, initial_serial)
+                    .ok();
+        }
+        if let Some(worker) = state.frame_worker.as_ref() {
+            if let Some(result) = worker.try_recv()? {
+                state.frame_worker_request = None;
+                let output = result.map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+                if output.request.accepts(request.key(), request.generation()) {
+                    (output.publication, Some(output.atlas))
+                } else {
+                    state.frame_worker_request = None;
+                    worker.submit(MacosFrameBuildJob {
+                        input: ViewportFrameBuildInput {
+                            request: request.clone(),
+                            document,
+                            image_publications,
+                            image_intrinsics,
+                        },
+                        config,
+                    })?;
+                    state.frame_worker_request = Some(request);
+                    return Err(YU_STORAGE_RENDER_BUSY);
+                }
+            } else {
+                if state.frame_worker_request.as_ref() != Some(&request) {
+                    worker.submit(MacosFrameBuildJob {
+                        input: ViewportFrameBuildInput {
+                            request: request.clone(),
+                            document,
+                            image_publications,
+                            image_intrinsics,
+                        },
+                        config,
+                    })?;
+                    state.frame_worker_request = Some(request);
+                }
+                return Err(YU_STORAGE_RENDER_BUSY);
+            }
+        } else {
+            return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE);
+        }
+    } else {
         let document = session.session.document_mut().editor_mut();
-        state
-            .builder
-            .publish_with_images_and_intrinsics(document, &image_publications, &image_intrinsics)
-            .map_err(|error| macos_render_host_error_status(&error))?
+        (
+            state
+                .builder
+                .publish_with_images_and_intrinsics(
+                    document,
+                    &image_publications,
+                    &image_intrinsics,
+                )
+                .map_err(|error| macos_render_host_error_status(&error))?,
+            None,
+        )
     };
     let publish_elapsed = publish_timing_start.elapsed();
+    if let Some(atlas) = worker_atlas {
+        state.builder.replace_atlas(atlas);
+    }
     state
         .host
         .accept_publication(publication)
@@ -4987,6 +5196,8 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
             max_width,
             scroll_y,
             viewport_height,
+            surface_width,
+            surface_height,
             surface_generation,
             appearance,
         );
@@ -5005,10 +5216,13 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_frame(
                 max_width,
                 scroll_y,
                 viewport_height,
+                surface_width: 1.0,
+                surface_height: 1.0,
                 surface_generation,
                 raster_scale: 1.0,
                 appearance: appearance_from_raw(appearance),
             },
+            false,
         ) {
             Ok(value) => value,
             Err(status) => return status,
@@ -5168,12 +5382,38 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                     max_width,
                     scroll_y,
                     viewport_height,
+                    surface_width,
+                    surface_height,
                     surface_generation,
                     raster_scale: scale as f32,
                     appearance: appearance_from_raw(appearance),
                 },
+                true,
             ) {
                 Ok(snapshot) => snapshot,
+                Err(YU_STORAGE_RENDER_BUSY) => {
+                    // The worker owns the CPU preparation, so the first call
+                    // can return before a surface exists.  Attach the current
+                    // surface before returning busy; otherwise every retry
+                    // would keep seeing an unbound host and could never reach
+                    // Metal submission.
+                    let surface_missing = session
+                        .macos_render_host
+                        .as_ref()
+                        .is_none_or(|state| state.surface.is_none());
+                    if surface_missing
+                        && let Err(status) = macos_render_host_surface_prepare(
+                            session,
+                            view,
+                            surface_width,
+                            surface_height,
+                            scale,
+                        )
+                    {
+                        return status;
+                    }
+                    return YU_STORAGE_RENDER_BUSY;
+                }
                 Err(status) => return status,
             };
             (snapshot, None)
@@ -5384,6 +5624,11 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
     let _ = session;
     #[cfg(target_os = "macos")]
     if let Some(state) = session.macos_render_host.as_mut() {
+        // Dropping the worker flips its cancellation flag and releases queued
+        // owned documents.  The next surface submission recreates it from the
+        // builder's owned shaper.
+        state.frame_worker.take();
+        state.frame_worker_request = None;
         state.surface.take();
         // 记录的帧已经随 surface 一起消失，不能留下来让下一次绑定误判等价。
         state.last_frame_key = None;
