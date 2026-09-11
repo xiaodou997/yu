@@ -2026,18 +2026,33 @@ fn table_resize_accessibility_metadata(
     divider_width: f32,
     table: &yu_editor::TableLayout,
 ) -> Result<Vec<YuStorageTableResizeAccessibilityDivider>, i32> {
+    let geometry = yu_workspace::ViewportTableGeometry::from_layout(
+        usize::try_from(block_index).map_err(|_| YU_STORAGE_INVALID_SELECTION)?,
+        block_y,
+        table,
+    )
+    .map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
+    table_resize_frame_geometry_metadata(snapshot, revision, divider_width, &geometry)
+}
+
+#[cfg(target_os = "macos")]
+fn table_resize_frame_geometry_metadata(
+    snapshot: &TextSnapshot,
+    revision: u64,
+    divider_width: f32,
+    table: &yu_workspace::ViewportTableGeometry,
+) -> Result<Vec<YuStorageTableResizeAccessibilityDivider>, i32> {
     let column_count =
         u64::try_from(table.column_widths().len()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
     if column_count < 2 {
         return Ok(Vec::new());
     }
     let (table_source_start_utf16, table_source_end_utf16) =
-        source_utf16_range(snapshot, table.source_range())?;
+        source_utf16_range(snapshot, table.source())?;
     let bounds = table.bounds();
     let width = divider_width.max(1.0);
-    let y = block_y + bounds.y();
-    if !block_y.is_finite()
-        || !divider_width.is_finite()
+    let y = bounds.y();
+    if !divider_width.is_finite()
         || divider_width <= 0.0
         || !y.is_finite()
         || !bounds.height().is_finite()
@@ -2048,8 +2063,9 @@ fn table_resize_accessibility_metadata(
     // 大约半个行高，并夹在 8–16 之间：一次调整要看得见，但不能一步跳过整列。
     // 行高不是常数（格内换行会撑高一行），取表头那一行——它是最稳定的那个，
     // 而这里要的只是一个手感常数，不是几何。
-    let row_height = table.rows().first().map_or(0.0, |row| row.height());
-    let adjust_step = (row_height * 0.5).clamp(8.0, 16.0);
+    let adjust_step = table.adjust_step();
+    let block_index =
+        u64::try_from(table.block_index()).map_err(|_| YU_STORAGE_INVALID_SELECTION)?;
     let divider_count = table.column_widths().len().saturating_sub(1);
     let mut x = bounds.x();
     let mut dividers = Vec::with_capacity(divider_count);
@@ -2080,6 +2096,82 @@ fn table_resize_accessibility_metadata(
         });
     }
     Ok(dividers)
+}
+
+/// Attached windows never rebuild layout for AX enumeration. An unavailable
+/// or stale publication yields no descriptors until the next surface update.
+/// Standalone/headless callers retain the existing synchronous query below.
+#[cfg(target_os = "macos")]
+fn macos_published_table_dividers(
+    session: &YuStorageSession,
+    size: f32,
+    max_width: f32,
+    scroll_y: f32,
+    viewport_height: f32,
+) -> Option<Result<Vec<YuStorageTableResizeAccessibilityDivider>, i32>> {
+    let state = session.macos_render_host.as_ref()?;
+    let surface = state.surface.as_ref()?;
+    if std::env::var_os("YU_RENDER_TIMING").is_some() {
+        println!("yu-render-metric event=ax_frame_query");
+    }
+    let pending = Some(Ok(Vec::new()));
+    if session.session.document().editor().composition().is_some() {
+        return pending;
+    }
+    let config = surface.surface.config();
+    let Some(geometry) = FrameGeometry::new(
+        size,
+        max_width,
+        scroll_y,
+        viewport_height,
+        config.logical_width(),
+        config.logical_height(),
+        config.scale(),
+    ) else {
+        return pending;
+    };
+    let requested = frame_key(session, state.builder.config().appearance(), geometry);
+    if state.prepared_build.as_ref() != Some(requested.build())
+        || state.host.surface_generation() != surface.surface.generation()
+        || !state
+            .host
+            .last_submission()
+            .is_some_and(|submission| Some(submission.frame_serial()) == state.host.frame_serial())
+    {
+        return pending;
+    }
+    let Some(frame) = state.host.frame_handle() else {
+        return pending;
+    };
+    if frame.plan().viewport().y() != scroll_y
+        && !macos_frame_covers_viewport(&frame, scroll_y, viewport_height)
+    {
+        return pending;
+    }
+    if std::env::var_os("YU_RENDER_TIMING").is_some() {
+        println!(
+            "yu-render-metric event=ax_frame_geometry tables={}",
+            frame.scene().tables().len()
+        );
+    }
+    if frame.scene().tables().is_empty() {
+        return pending;
+    }
+    let source = session.session.snapshot();
+    let divider_width = (state.metrics.default_advance() * 0.25).max(1.0);
+    let mut encoded = Vec::new();
+    for table in frame.scene().tables() {
+        match table_resize_frame_geometry_metadata(
+            &source,
+            frame.revision().get(),
+            divider_width,
+            table,
+        ) {
+            Ok(metadata) => encoded.extend(metadata),
+            Err(status) => return Some(Err(status)),
+        }
+    }
+    Some(Ok(encoded))
 }
 
 fn table_resize_commit_metadata(
@@ -4213,6 +4305,28 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_accessibility_dividers(
             || viewport_height <= 0.0
         {
             return YU_STORAGE_EDITOR_ERROR;
+        }
+        if let Some(result) =
+            macos_published_table_dividers(session, size, max_width, scroll_y, viewport_height)
+        {
+            let encoded = match result {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+            unsafe { *written = encoded.len() };
+            if capacity == 0 && dividers.is_null() {
+                return YU_STORAGE_OK;
+            }
+            if encoded.len() > capacity {
+                return YU_STORAGE_BUFFER_TOO_SMALL;
+            }
+            if !encoded.is_empty() {
+                unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), dividers, encoded.len()) };
+            }
+            return YU_STORAGE_OK;
+        }
+        if std::env::var_os("YU_RENDER_TIMING").is_some() {
+            println!("yu-render-metric event=ax_layout_fallback");
         }
         let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
             Ok(layout) => layout,

@@ -972,6 +972,7 @@ final class StorageBridge {
         guard sizeStatus == StorageStatus.ok else {
             throw BridgeError.operation(sizeStatus)
         }
+        if required == 0 { return [] }
         var values = Array(
             repeating: YuStorageTableResizeAccessibilityDivider(),
             count: required

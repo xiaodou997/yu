@@ -1097,6 +1097,25 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         try require(bridge.source.utf8.count >= 100_000, "Long fixture is less than 100 KB")
         try require(first.contentHeight > scroll.contentView.bounds.height * 30,
                     "Long fixture has insufficient scroll extent")
+        guard let divider = surfaceCoordinator.tableResizeAccessibilityDividers().first else {
+            throw Failure(message: "Submitted first frame has no table accessibility geometry")
+        }
+        let sourceBeforeResize = bridge.source
+        try require(divider.revision == bridge.state.revision && divider.rect.height > 0,
+                    "Invalid submitted table accessibility geometry")
+        try require(surfaceCoordinator.adjustTableResizeAccessibility(divider, direction: 1),
+                    "Table accessibility increment failed")
+        try require(surfaceCoordinator.tableResizeAccessibilityDividers().isEmpty,
+                    "Unsubmitted table resize exposed stale accessibility geometry")
+        _ = try await submit()
+        guard let adjusted = surfaceCoordinator.tableResizeAccessibilityDividers().first else {
+            throw Failure(message: "Resized frame lost table accessibility geometry")
+        }
+        try require(abs(adjusted.rect.midX - divider.rect.midX - divider.adjustStep) < 0.5
+                    && adjusted.tableSourceRange == divider.tableSourceRange
+                    && bridge.source == sourceBeforeResize,
+                    "Table accessibility geometry did not follow submitted resize")
+        print("Yu render regression self-check: ax_frame_resize=true")
         let original = window.frame
         var generation = first.surfaceGeneration
         for step in 1...12 {
@@ -1151,6 +1170,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                     "Pending caret navigation pulled back a later scroll")
         surfaceCoordinator.detach()
         try require(!surfaceCoordinator.hasCurrentFrame(), "Detach kept old frame current")
+        try require(surfaceCoordinator.tableResizeAccessibilityDividers().isEmpty,
+                    "Detach kept old table accessibility geometry")
         let rebound = try await submit()
         try require(rebound.frameSerial > last.frameSerial, "Rebind used old publication")
         print("Yu render regression self-check: long=true steps=12 resize=4 final_line=\(finalLineVisible) scroll_cancels_navigation=true rebind=true bytes=\(bridge.source.utf8.count)")

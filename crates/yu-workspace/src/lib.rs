@@ -58,6 +58,62 @@ pub struct ViewportSceneFrame {
     input: ViewportSceneInput,
     scene: Scene,
     background: Rgba8,
+    tables: Vec<ViewportTableGeometry>,
+}
+
+/// Immutable table geometry from the exact layouts used to draw a frame.
+/// Contains no shaper, glyph cache or platform accessibility objects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewportTableGeometry {
+    block_index: usize,
+    source: yu_core::TextRange,
+    bounds: Rect,
+    column_widths: Vec<f32>,
+    adjust_step: f32,
+}
+
+impl ViewportTableGeometry {
+    pub fn from_layout(
+        block_index: usize,
+        block_y: f32,
+        table: &TableLayout,
+    ) -> Result<Self, SceneError> {
+        let bounds = table.bounds();
+        Ok(Self {
+            block_index,
+            source: table.source_range(),
+            bounds: Rect::new(
+                bounds.x(),
+                block_y + bounds.y(),
+                bounds.width(),
+                bounds.height(),
+            )?,
+            column_widths: table.column_widths().to_vec(),
+            adjust_step: (table.rows().first().map_or(0.0, |row| row.height()) * 0.5)
+                .clamp(8.0, 16.0),
+        })
+    }
+
+    #[must_use]
+    pub const fn block_index(&self) -> usize {
+        self.block_index
+    }
+    #[must_use]
+    pub const fn source(&self) -> yu_core::TextRange {
+        self.source
+    }
+    #[must_use]
+    pub const fn bounds(&self) -> Rect {
+        self.bounds
+    }
+    #[must_use]
+    pub fn column_widths(&self) -> &[f32] {
+        &self.column_widths
+    }
+    #[must_use]
+    pub const fn adjust_step(&self) -> f32 {
+        self.adjust_step
+    }
 }
 
 /// A parser- and Revision-bound task checkbox target from one published scene.
@@ -953,6 +1009,10 @@ fn append_editor_decorations(
 }
 
 impl ViewportSceneFrame {
+    #[must_use]
+    pub fn tables(&self) -> &[ViewportTableGeometry] {
+        &self.tables
+    }
     #[must_use]
     pub fn revision(&self) -> Revision {
         self.scene.revision()
@@ -1899,10 +1959,16 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     let mut overlays = Vec::with_capacity(layouts.len());
     let mut images = Vec::with_capacity(layouts.len());
     let mut glyphs = Vec::with_capacity(layouts.len());
+    let mut tables = Vec::new();
     for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
         let origin = Point::new(0.0, block.y());
         let mut block_ornaments = Vec::new();
         if let Some(table) = layout.table() {
+            tables.push(ViewportTableGeometry::from_layout(
+                block.index(),
+                block.y(),
+                table,
+            )?);
             append_table_ornaments(
                 &mut block_ornaments,
                 table,
@@ -2070,6 +2136,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         input,
         scene: builder.finish(),
         background,
+        tables,
     })
 }
 
@@ -3872,6 +3939,18 @@ mod tests {
         .expect("transient table render frame");
 
         let expected_divider = divider + 1.0;
+        let geometry = frame.scene().tables();
+        assert_eq!(geometry.len(), 1);
+        let geometry = &geometry[0];
+        assert_eq!(geometry.block_index(), 0);
+        assert_eq!(geometry.source(), table.source_range());
+        assert_eq!(geometry.column_widths().len(), 2);
+        assert!(
+            (geometry.bounds().x() + geometry.column_widths()[0] - expected_divider).abs()
+                < 0.001
+        );
+        assert!((geometry.bounds().height() - table.bounds().height()).abs() < 0.001);
+        assert!((8.0..=16.0).contains(&geometry.adjust_step()));
         assert!(frame.scene().scene().primitives().iter().any(|primitive| {
             matches!(
                 primitive,

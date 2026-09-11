@@ -586,11 +586,14 @@ final class MacosSurfaceHostCoordinator {
         }
     }
 
-    /// Returns the visible, read-only divider descriptors from the same
-    /// document-space CoreText layout used by hover and begin. Callers project
+    /// Returns read-only divider descriptors from the submitted frame's
+    /// document-space table geometry. Callers project
     /// these into ephemeral native Accessibility elements; the descriptors
     /// never retain a Rust layout or open a resize gesture.
     func tableResizeAccessibilityDividers() -> [NativeTableResizeAccessibilityDivider] {
+        // Initial window layout must not invoke the headless shaping fallback
+        // before its production render host has been attached.
+        if surfaceView?.window != nil && !isAttached { return [] }
         guard !bridge.composition.active,
               let geometry = visualDecorationGeometry() else {
             return []
