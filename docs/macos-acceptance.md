@@ -100,3 +100,17 @@ ImageIO 调用返回后退出，未开始的任务不再解码。阻塞解码测
 
 Headless self-check 的 clipboard/document-workflow 仍依赖系统 NSPasteboard；在
 受限自动化环境中会因 pasteboard 权限失败，不能替代交互式 macOS 验收。
+
+## 2026-09-11 后台准备边界记录
+
+当前开发机为 Apple Silicon macOS 26.5，Xcode 26.6。Rust `yu-storage-ffi`
+43 个单元测试、workspace frame-builder 4 个测试均通过，debug app 已重新链接。
+surface 提交现在先捕获 owned document snapshot，由 worker 生成 publication 与
+匹配的 CPU glyph atlas；主线程校验 `FrameBuildRequest` 的 key/generation 后再
+同步 atlas、获取 drawable、编码并提交 Metal。worker 创建失败时保留同步 owned
+publication 作为恢复路径，detach 会取消并释放 worker，下一次绑定重新创建。
+
+本次交互式启动仍观察到窗口正文为空、状态为 `Native surface inactive`
+（Rust status 21）；因此本记录不把它算作真实窗口提交成功，也不宣称连续滚动
+p95 已达标。需要在可用 Metal surface 的目标机器上继续完成 drawable/backpressure
+和 Instruments 测量。
