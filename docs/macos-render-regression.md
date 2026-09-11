@@ -145,3 +145,44 @@ macOS 和 Xcode 与上文相同，2x / 60Hz。长文档和资源场景均以退�
 
 此次完成的是定位与渲染正确性修复。主线程辅助功能查询的排版成本仍需后续分析，
 不能据此将真实触控板 p95、IME、VoiceOver 或跨显示器人工验收标记为完成。
+
+## 表格辅助功能几何复用（2026-09-11）
+
+表格列分隔符描述现在从已提交 frame 的纯几何快照生成。快照在 scene assembly
+使用最终 table layout（含列宽 override）时捕获，不携带 CoreText 或 glyph cache。
+附着窗口的查询校验 build key、surface generation、已提交 serial 与 viewport
+coverage；未提交、过期或 composition 状态返回空，等待新帧触发刷新，不同步排版。
+无窗口协议调用保留原路径；Swift 数量查询为零时不再发起第二次填充调用。
+
+最终自动证据：`.notes/macos-ax-frame-20260911-accepted/`。机器为 Apple M1 Max
+（Mac13,1），macOS 26.5 / 25F71，Xcode 26.6 / 17F113，debug build，2x / 60Hz，
+重开窗口内容尺寸 900×620pt；长文档仍包含 12 次定位和 4 次 resize。
+
+- 长文档和延迟图片/Math 均通过，原有末行、导航取消、关闭重开检查保持通过。
+- 新增真实窗口检查：表格 AX increment 后新帧列分隔符移动一个 adjustStep，
+  Markdown 源码与表格 source range 不变；新列宽尚未提交与 detach 后均无旧描述符。
+- 长文档查询 95 次，匹配已提交几何 42 次；资源查询 16 次，匹配 11 次。
+  两者 `ax_layout_fallback` 均为 0。runner 已将无回退、有帧命中纳入通过条件。
+- `yu-workspace` 46/46（含最终绘制与表格元数据一致性断言）、`yu-storage-ffi`
+  48/48、14 项 shell self-check 与 Dark Aqua 真实窗口 self-check 均通过。
+
+Instruments 证据：`.notes/macos-ax-instruments-20260911-a/`，含 trace、导出的
+`time-profile.xml` 与 `cpu-summary.json`。xctrace 退出码 0，长文档关闭重开完成。
+该 trace 使用相同生产实现、添加最终两个失效断言之前的二进制；两组 binary SHA
+分别保留在各自 environment 文件中。
+
+此次主线程样本权重 15.668s，`refreshTableResizeAccessibility` 包含子调用权重
+146ms；同时包含该函数与 `visible_blocks_with_shaper` 的样本为 0。日志记录
+90 次帧查询、41 次几何命中、0 次同步回退。这支持指定 AX 排版路径已移除，
+不代表查询绝对零耗时。旧 trace 的 4.887s 包含布局一致性修复前的行为，且本次
+新增列宽操作，因此不把两次采样当作受控的整体提速倍率。
+
+最终无 Instruments 的脚本样本中，Swift submit attempt p95 6.697ms / p99
+26.891ms，Metal encode/submit p95 1.126ms。后台 preparation p95 722.914ms，
+bounds-to-request p95 287.840ms，仍有明显长尾；这些分布覆盖脚本导航和 resize，
+不能代替连续触控板帧间隔。观测到的 GPU in-flight 最大值为 1。
+
+下一项有采样证据的主线程路径是 `mouseMoved → tableResizeHover →
+yu_storage_session_table_resize_at_point`（包含子调用约 1.753s），仍触发可见块
+排版。另有启动/选区同步成本，需分别定位。此次不扩展修改这些路径。
+真实手势 p95 ≤ 16.7ms、残影、VoiceOver 交互、IME 和跨显示器验收仍未完成。
