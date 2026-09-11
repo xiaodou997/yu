@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 
 use yu_assets::{ImageIntrinsicPublication, ImagePublication, ImageRequestPriority};
-use yu_editor::{EditorDocument, EditorDocumentError};
+use yu_editor::{EditorDocument, EditorDocumentError, EditorRenderSnapshot};
 use yu_font::{
     AtlasError, GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer, RasterizingShaper,
 };
@@ -23,13 +23,13 @@ use crate::{
     ViewportRenderConfig,
 };
 
-/// Owned input for a frame preparation job.  The editor clone is detached from
-/// the canonical session, so the job can run without borrowing AppKit or the
-/// live document owner.
+/// Immutable source and visual state for a frame preparation job. Document
+/// reconstruction and visibility discovery happen in `publish_owned`, on the
+/// worker; capture never borrows AppKit or shares a mutable editor.
 #[derive(Debug)]
 pub struct ViewportFrameBuildInput {
     pub request: FrameBuildRequest,
-    pub document: EditorDocument,
+    pub document: EditorRenderSnapshot,
     pub image_publications: Vec<ImagePublication>,
     pub image_intrinsics: Vec<ImageIntrinsicPublication>,
 }
@@ -45,6 +45,11 @@ pub struct ViewportFrameBuildOutput {
     /// thread adopts it before GPU upload so plan page references always point
     /// at the pixels that were prepared by the worker.
     pub atlas: GlyphAtlas,
+    /// Visibility was computed by the worker using the same shaper/config.
+    pub viewport_blocks: Vec<(usize, ImageRequestPriority)>,
+    /// Resource payloads used by this exact publication, for owner validation.
+    pub image_publications: Vec<ImagePublication>,
+    pub image_intrinsics: Vec<ImageIntrinsicPublication>,
 }
 
 /// 准备一帧时可能出现的错误。
@@ -199,10 +204,11 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     ) -> Result<ViewportFrameBuildOutput, BuildError<S>> {
         let ViewportFrameBuildInput {
             request,
-            mut document,
+            document,
             image_publications,
             image_intrinsics,
         } = input;
+        let mut document = document.into_document()?;
         // Worker outputs may be dropped or superseded before reaching the GPU.
         // Every owned publication carries the pages it needs; the GPU atlas
         // deduplicates by fingerprint only after receiving the payload.
@@ -212,10 +218,31 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             &image_publications,
             &image_intrinsics,
         )?;
+        let viewport = self.config.viewport();
+        let viewport_blocks = publication
+            .frame()
+            .scene()
+            .input()
+            .blocks()
+            .iter()
+            .map(|block| {
+                let priority = if block.y() + block.height() > viewport.scroll_y()
+                    && block.y() < viewport.scroll_y() + viewport.height()
+                {
+                    ImageRequestPriority::Visible
+                } else {
+                    ImageRequestPriority::Overscan
+                };
+                (block.index(), priority)
+            })
+            .collect();
         Ok(ViewportFrameBuildOutput {
             request,
             publication,
             atlas: self.atlas.clone(),
+            viewport_blocks,
+            image_publications,
+            image_intrinsics,
         })
     }
 
@@ -310,6 +337,12 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     #[must_use]
     pub fn last_publication(&self) -> Option<&ViewportFramePublication> {
         self.publisher.last_publication()
+    }
+
+    /// A diagnostic publisher and worker may take turns using the same host.
+    /// Start after its accepted serial without discarding CPU atlas contents.
+    pub fn ensure_publication_serial(&mut self, serial: u64) {
+        self.publisher.next_serial = self.publisher.next_serial.max(serial);
     }
 
     fn rasterize_visible_glyphs(
@@ -514,6 +547,24 @@ mod tests {
     }
 
     #[test]
+    fn publication_serial_floor_survives_diagnostic_worker_handoffs() {
+        let mut builder = ViewportFrameBuilder::with_shaper_and_initial_serial(
+            CountingShaper::new(14.0, false),
+            config(14.0),
+            GlyphAtlasConfig::default(),
+            10,
+        )
+        .unwrap();
+        let mut document = document("hello");
+        builder.ensure_publication_serial(3);
+        assert_eq!(builder.publish(&mut document).unwrap().serial(), 11);
+        builder.ensure_publication_serial(20);
+        assert_eq!(builder.publish(&mut document).unwrap().serial(), 21);
+        builder.ensure_publication_serial(4);
+        assert_eq!(builder.publish(&mut document).unwrap().serial(), 22);
+    }
+
+    #[test]
     fn dropped_owned_publication_does_not_consume_gpu_uploads() {
         let shaper = CountingShaper::new(14.0, false);
         let counter = Arc::clone(&shaper.calls);
@@ -536,7 +587,7 @@ mod tests {
             );
             ViewportFrameBuildInput {
                 request: FrameBuildRequest::new(key, generation),
-                document,
+                document: document.capture_render_snapshot(),
                 image_publications: vec![],
                 image_intrinsics: vec![],
             }
