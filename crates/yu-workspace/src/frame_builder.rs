@@ -203,6 +203,10 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             image_publications,
             image_intrinsics,
         } = input;
+        // Worker outputs may be dropped or superseded before reaching the GPU.
+        // Every owned publication carries the pages it needs; the GPU atlas
+        // deduplicates by fingerprint only after receiving the payload.
+        self.render_plans.reset();
         let publication = self.publish_with_images_and_intrinsics(
             &mut document,
             &image_publications,
@@ -507,6 +511,45 @@ mod tests {
             Rect::new(0.0, 0.0, 240.0, 200.0).expect("scene viewport"),
             Rgba8::black(),
         )
+    }
+
+    #[test]
+    fn dropped_owned_publication_does_not_consume_gpu_uploads() {
+        let shaper = CountingShaper::new(14.0, false);
+        let counter = Arc::clone(&shaper.calls);
+        let mut builder = ViewportFrameBuilder::with_shaper(
+            shaper,
+            config(14.0).with_raster_scale(2.0),
+            GlyphAtlasConfig::default(),
+        )
+        .unwrap();
+        let make_input = |generation| {
+            let document = document("hello");
+            let key = crate::FrameBuildKey::new(
+                document.revision().get(),
+                0,
+                vec![document.selection()],
+                0,
+                None,
+                crate::Appearance::Light,
+                crate::FrameGeometry::new(14.0, 240.0, 0.0, 200.0, 240.0, 200.0, 2.0).unwrap(),
+            );
+            ViewportFrameBuildInput {
+                request: FrameBuildRequest::new(key, generation),
+                document,
+                image_publications: vec![],
+                image_intrinsics: vec![],
+            }
+        };
+        let dropped = builder.publish_owned(make_input(1)).unwrap();
+        let pages = dropped.publication.frame().plan().uploads().to_vec();
+        assert!(!pages.is_empty());
+        let raster_calls = counter.load(Ordering::SeqCst);
+        drop(dropped); // The consumer never saw these page payloads.
+        let delivered = builder.publish_owned(make_input(2)).unwrap();
+        assert_eq!(delivered.publication.frame().plan().uploads(), pages);
+        assert_eq!(counter.load(Ordering::SeqCst), raster_calls);
+        assert_eq!(delivered.atlas.raster_scale(), 2.0);
     }
 
     #[test]

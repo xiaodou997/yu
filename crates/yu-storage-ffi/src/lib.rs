@@ -55,7 +55,7 @@ use yu_text::{EditError, TextSnapshot};
 use yu_scene::{EditorDecorationPrimitiveRole, Point, Primitive, Rect};
 #[cfg(target_os = "macos")]
 use yu_workspace::{
-    Appearance, FrameBuildRequest, FrameGeometry, FrameKey, FrameTableResize,
+    Appearance, FrameBuildKey, FrameBuildRequest, FrameGeometry, FrameKey, FrameTableResize,
     ViewportFrameBuildInput, ViewportFrameBuildOutput, ViewportFramePublication,
     ViewportRenderConfig,
 };
@@ -1094,6 +1094,8 @@ struct MacosRenderHostState {
     /// generation 才能组装出比较用的键，一次提交因此产生七八次 FFI 往返。
     /// 状态在 Rust，决策就该在 Rust。
     last_frame_key: Option<FrameKey>,
+    /// CPU publication identity, even while drawable submission is busy.
+    prepared_build: Option<FrameBuildKey>,
     resource_refresh_pending: bool,
     resource_retry_pending: bool,
     resource_completion_generation: u64,
@@ -4769,6 +4771,7 @@ fn macos_render_host_frame(
             image_resources,
             // 重建 host 后没有可复用的帧，下一次提交必须真正执行。
             last_frame_key: None,
+            prepared_build: None,
             resource_refresh_pending: false,
             resource_retry_pending: false,
             resource_completion_generation: resource_generation,
@@ -4867,7 +4870,7 @@ fn macos_render_host_frame(
         .collect::<Vec<_>>();
     let publish_timing_start = std::time::Instant::now();
     let (publication, worker_atlas) = if let Some(document) = render_document {
-        let request = FrameBuildRequest::new(requested_build, resource_generation);
+        let request = FrameBuildRequest::new(requested_build.clone(), resource_generation);
         // A newer request supersedes both queued and running work. Drop the
         // worker before enqueueing it so an old completion cannot occupy the
         // channel and force the latest request through stale retries.
@@ -4890,7 +4893,14 @@ fn macos_render_host_frame(
             if let Some(result) = worker.try_recv()? {
                 state.frame_worker_request = None;
                 let output = result.map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-                if output.request.accepts(request.key(), request.generation()) {
+                if output.request.accepts(request.key(), request.generation())
+                    && (output.publication.frame().plan().viewport().y() == scroll_y
+                        || macos_frame_covers_viewport(
+                            output.publication.frame(),
+                            scroll_y,
+                            viewport_height,
+                        ))
+                {
                     (output.publication, Some(output.atlas))
                 } else {
                     state.frame_worker_request = None;
@@ -4959,6 +4969,7 @@ fn macos_render_host_frame(
         .accept_publication(publication.clone())
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
     state.last_publication = Some(publication);
+    state.prepared_build = Some(requested_build);
     if let Some(atlas) = worker_atlas {
         state.builder.replace_atlas(atlas);
     }
@@ -5122,6 +5133,24 @@ fn pending_resources_wait_for_notifications_not_retry_timers() {
 fn pending_resources_allow_retained_reuse_until_completion_arrives() {
     assert!(macos_pending_resource_allows_retained_reuse(false));
     assert!(!macos_pending_resource_allows_retained_reuse(true));
+}
+
+#[cfg(target_os = "macos")]
+fn macos_can_reuse_prepared_frame(
+    state: &MacosRenderHostState,
+    requested: &FrameKey,
+    viewport: Rect,
+    surface_generation: u64,
+    resource_generation: u64,
+) -> bool {
+    state.resource_completion_generation == resource_generation
+        && state.host.surface_generation() == surface_generation
+        && macos_pending_resource_allows_retained_reuse(state.resource_retry_pending)
+        && state.prepared_build.as_ref() == Some(requested.build())
+        && state.host.frame_handle().is_some_and(|frame| {
+            frame.plan().viewport() == viewport
+                || macos_frame_covers_viewport(frame.as_ref(), viewport.y(), viewport.height())
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -5357,21 +5386,15 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
         let presentation_viewport = Rect::new(0.0, scroll_y, max_width, viewport_height).ok();
         let can_reuse = requested_key.as_ref().is_some_and(|requested| {
             session.macos_render_host.as_ref().is_some_and(|state| {
-                state.resource_completion_generation
-                    == yu_render_macos::resource_completion_generation()
-                    && macos_pending_resource_allows_retained_reuse(state.resource_retry_pending)
-                    && state.last_frame_key.as_ref().is_some_and(|last| {
-                        last.build() == requested.build()
-                            && presentation_viewport.is_some_and(|viewport| {
-                                state.host.frame_handle().is_some_and(|frame| {
-                                    macos_frame_covers_viewport(
-                                        frame.as_ref(),
-                                        viewport.y(),
-                                        viewport.height(),
-                                    )
-                                })
-                            })
-                    })
+                presentation_viewport.is_some_and(|viewport| {
+                    macos_can_reuse_prepared_frame(
+                        state,
+                        requested,
+                        viewport,
+                        surface_generation,
+                        yu_render_macos::resource_completion_generation(),
+                    )
+                })
             })
         });
         let (host_snapshot, retained_presentation_viewport) = if can_reuse {
@@ -5493,7 +5516,9 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             &mut surface_state.uploader,
             &mut surface_state.atlas,
             &mut surface_state.image_atlas,
-            retained_presentation_viewport,
+            // A worker may have prepared the frame at an earlier scroll origin.
+            // Coverage was validated above; encode using the current camera.
+            presentation_viewport,
         ) {
             Ok(submission) => submission,
             Err(error) => return macos_surface_submit_error_status(error),
@@ -5614,7 +5639,7 @@ pub unsafe extern "C" fn yu_storage_session_frame_is_current(
             // 没有 surface 时不能声称当前帧有效：内容还没有真正上屏。
             state.resource_completion_generation
                 == yu_render_macos::resource_completion_generation()
-                && !state.resource_refresh_pending
+                && macos_pending_resource_allows_retained_reuse(state.resource_retry_pending)
                 && state.surface.is_some()
                 && state.last_frame_key.as_ref() == Some(&key)
         });
@@ -5651,6 +5676,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_detach(
         state.host = MetalViewportHostSession::new(session.session.revision(), 0);
         // 记录的帧已经随 surface 一起消失，不能留下来让下一次绑定误判等价。
         state.last_frame_key = None;
+        state.prepared_build = None;
     }
     YU_STORAGE_OK
 }
@@ -8746,7 +8772,11 @@ mod tests {
     #[test]
     fn background_frame_snapshot_uses_accepted_publication() {
         let path = std::env::temp_dir().join(format!("yu-background-host-{}.md", temp_id()));
-        fs::write(&path, "# Background frame\n\nHello 羽🙂\n").unwrap();
+        fs::write(
+            &path,
+            format!("# Background frame\n\n{}", "Hello 羽🙂\n\n".repeat(100)),
+        )
+        .unwrap();
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
         let mut raw = ptr::null_mut();
         assert_eq!(
@@ -8799,6 +8829,49 @@ mod tests {
         assert!(snapshot.atlas_page_count > 0);
         assert!(snapshot.content_height > 0.0);
 
+        // No drawable has been submitted, but a complete CPU frame is available.
+        let key = frame_key(
+            session,
+            Appearance::Light,
+            FrameGeometry::new(16.0, 500.0, 0.0, 240.0, 500.0, 240.0, 2.0).unwrap(),
+        );
+        let state = session.macos_render_host.as_mut().unwrap();
+        assert!(state.last_frame_key.is_none());
+        state.resource_refresh_pending = true;
+        let viewport = Rect::new(0.0, 0.0, 500.0, 240.0).unwrap();
+        let resource_generation = state.resource_completion_generation;
+        assert!(macos_can_reuse_prepared_frame(
+            state,
+            &key,
+            viewport,
+            0,
+            resource_generation
+        ));
+        assert!(!macos_can_reuse_prepared_frame(
+            state,
+            &key,
+            viewport,
+            1,
+            resource_generation
+        ));
+        assert!(!macos_can_reuse_prepared_frame(
+            state,
+            &key,
+            viewport,
+            0,
+            resource_generation.wrapping_add(1)
+        ));
+        state.resource_retry_pending = true;
+        assert!(!macos_can_reuse_prepared_frame(
+            state,
+            &key,
+            viewport,
+            0,
+            resource_generation
+        ));
+        state.resource_retry_pending = false;
+        state.resource_refresh_pending = false;
+
         // Supersede a pending same-revision resize, forcing worker replacement.
         let resizing = MacosFrameRequest {
             max_width: 520.0,
@@ -8840,6 +8913,30 @@ mod tests {
         let rebound = finish(session, request);
         assert!(rebound.frame_serial > resized.frame_serial);
         assert_eq!(rebound.surface_generation, 0);
+
+        // Scroll is deliberately absent from FrameBuildKey. A pending result
+        // still must cover the latest camera before it may replace the frame.
+        assert_eq!(
+            macos_render_host_frame(session, request, true),
+            Err(YU_STORAGE_RENDER_BUSY)
+        );
+        let scrolled = finish(
+            session,
+            MacosFrameRequest {
+                scroll_y: 1500.0,
+                ..request
+            },
+        );
+        let frame = session
+            .macos_render_host
+            .as_ref()
+            .unwrap()
+            .host
+            .frame_handle()
+            .unwrap();
+        assert_eq!(scrolled.scroll_y, 1500.0);
+        assert_eq!(frame.plan().viewport().y(), 1500.0);
+        assert!(macos_frame_covers_viewport(frame.as_ref(), 1500.0, 240.0));
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).unwrap();
