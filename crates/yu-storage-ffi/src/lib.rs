@@ -1056,10 +1056,17 @@ type MacosFrameBuildWorker = LatestWorker<MacosFrameBuildJob, MacosFrameBuildRes
 #[cfg(target_os = "macos")]
 fn macos_new_frame_worker() -> Option<MacosFrameBuildWorker> {
     let mut builder: Option<CoreTextViewportFrameBuilder> = None;
+    let mut document: Option<yu_editor::EditorDocument> = None;
     let mut serial = 0;
     LatestWorker::new(move |job: MacosFrameBuildJob, cancellation| {
         let MacosFrameBuildJob {
-            input,
+            input:
+                ViewportFrameBuildInput {
+                    request,
+                    document: snapshot,
+                    image_publications,
+                    image_intrinsics,
+                },
             config,
             ticket,
             minimum_serial,
@@ -1098,9 +1105,25 @@ fn macos_new_frame_worker() -> Option<MacosFrameBuildWorker> {
             if cancellation.is_cancelled() {
                 return Err(YU_STORAGE_RENDER_BUSY);
             }
+            let reused = document
+                .as_ref()
+                .is_some_and(|document| snapshot.can_reuse_worker_document(document));
+            let mut owned_document = if reused {
+                document.take().ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
+            } else {
+                snapshot
+                    .into_document()
+                    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?
+            };
             let output = builder
-                .publish_owned(input)
+                .publish_owned_document(
+                    request,
+                    &mut owned_document,
+                    image_publications,
+                    image_intrinsics,
+                )
                 .map_err(|error| macos_render_host_error_status(&error))?;
+            document = Some(owned_document);
             serial = output.publication.serial();
             Ok(output)
         })();
