@@ -46,6 +46,14 @@ class MetricsChecks(unittest.TestCase):
         self.assertEqual(result["presented_frame_interval_ms"]["samples"], 0)
         self.assertIsNone(result["presented_frame_interval_ms"]["p95"])
 
+    def test_cancelled_preparation_is_reported_separately(self):
+        result = metrics.summarize([
+            "yu-render-metric event=preparation_cancelled",
+            "yu-render-metric event=render_busy",
+        ])
+        self.assertEqual(result["counts"]["preparation_cancelled"], 1)
+        self.assertEqual(result["counts"]["render_busy"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
