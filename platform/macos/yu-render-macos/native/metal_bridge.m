@@ -147,8 +147,20 @@ int yu_metal_nonblocking_acquisition_probe(void) {
         dispatch_semaphore_signal(layer->resume);
         long completed = dispatch_semaphore_wait(layer->finished,
             dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        // Re-enable the same layer after the blocked worker has returned. A
+        // new generation must be able to start a fresh acquisition; the old
+        // worker's completion must not leave acquisitionPending stuck.
+        [layer setAcquisitionEnabled:YES];
+        passed = passed && [layer takeReadyDrawable] == nil;
+        long rebound_started = dispatch_semaphore_wait(layer->entered,
+            dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        passed = passed && rebound_started == 0;
+        [layer setAcquisitionEnabled:NO];
+        dispatch_semaphore_signal(layer->resume);
+        long rebound_completed = dispatch_semaphore_wait(layer->finished,
+            dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
         [layer release];
-        return passed && completed == 0;
+        return passed && completed == 0 && rebound_completed == 0;
     }
 }
 
