@@ -26,7 +26,7 @@ def summarize(lines):
         if "event" in event:
             events.append(event)
     counts = collections.Counter(event["event"] for event in events)
-    for name in ("drawable_unavailable", "gpu_busy", "render_busy", "stale_publication", "gpu_submit", "gpu_complete", "present"):
+    for name in ("drawable_unavailable", "gpu_busy", "render_busy", "preparation_cancelled", "stale_publication", "gpu_submit", "gpu_complete", "present"):
         counts.setdefault(name, 0)
     stages = collections.defaultdict(list)
     presents = collections.defaultdict(list)
