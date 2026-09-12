@@ -20,6 +20,9 @@ Instruments 未采样到 AX 刷新调用链中的可见块排版。完整证据�
 普通滚动 preparation 中位数约 15.6ms，窗口 resize 的重新排版仍保留；延迟资源
 场景图片完成后的单次高度变化检查通过。真实触控板 p95 仍未完成。
 
+同日继续：Metal acquisition probe 已补充 detach/disable 后重新 enable 的生命周期
+断言，确保旧 worker 返回不会卡住下一次 acquisition；yu-render-macos 测试通过。
+
 本轮在真实 macOS 窗口中完成了以下检查：
 
 - [x] 原生 toolbar：保存、重新加载、大纲、搜索图标和辅助功能描述。

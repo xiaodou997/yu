@@ -302,3 +302,12 @@ macOS 26.5 / 25F71，Xcode 26.6 / 17F113，debug，2x / 60Hz）。
 
 这项修复降低了普通滚动的 CPU 准备开销，但 resize 仍会触发必要的布局重算，
 后台 preparation 长尾和真实触控板连续滚动 p95 ≤ 16.7ms 尚未验收。
+
+## drawable acquisition 生命周期自动覆盖（2026-09-12）
+
+补充了确定性 Metal probe：第一次 acquisition 被阻塞时，主线程请求保持立即
+返回；detach/disable 会推进 acquisition generation、丢弃旧 ready drawable；
+旧 worker 返回后重新 enable 同一 layer，必须能启动新 acquisition，不能留下
+`acquisitionPending` 卡住。`yu-render-macos` 12 项测试通过（10 passed，2 项
+原有 ignored）。这只验证 ownership/generation 协议，不代替真实窗口关闭和
+系统 compositor backpressure 验收。
