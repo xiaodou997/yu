@@ -271,3 +271,34 @@ submitNow 包含子调用 535ms；不应将采样未命中解释为绝对零耗�
 仍有约 3.9s inclusive 样本，两个 frame worker 分别约 6.459s / 0.386s，
 需要后续单独分析，不能根据这些重叠权重直接推导连续滚动帧率。
 真实触控板 p95 ≤ 16.7ms、IME、VoiceOver 与跨显示器验收仍未完成。
+
+## worker 文档布局缓存复用（2026-09-12）
+
+后台 worker 现在在同一个 worker 生命周期内保留自己的 `EditorDocument`。当新
+快照的文档身份、Revision、viewport layout 配置、选区、composition 和搜索状态
+都匹配时，复用该 worker 文档的 Markdown/decorations/layout cache；滚动位置和
+当前 publication 仍由新请求驱动。源码、视觉状态或布局配置变化时重新从 owned
+`EditorRenderSnapshot` 构建。这个文档只属于 worker，未跨线程共享主线程
+`EditorDocument`，也没有把 shaper-owned layout cache 传回主线程。
+
+分段计时已加入 `preparation_visibility`、`preparation_glyph_loop` 和
+`preparation_publication`。证据目录：
+`.notes/macos-prep-breakdown-20260912-b/` 与
+`.notes/macos-worker-document-cache-20260912-a/`（Apple M1 Max / Mac13,1，
+macOS 26.5 / 25F71，Xcode 26.6 / 17F113，debug，2x / 60Hz）。
+
+- 长文档真实窗口检查通过，包含末行、resize、导航取消、detach/rebind 和重开。
+  资源场景也通过，图片完成后高度变化仍为一次，pending retained reuse 保持。
+- 未缓存复用前，长文档 preparation p50/p95 约 219/672ms，visibility
+  p50/p95 约 179/604ms。复用后 preparation p50/p95 约 15.6/646ms，visibility
+  p50/p95 约 1.34/600ms；正常滚动请求的中位数显著下降。
+- 复用后的长文档日志中，约 600ms 的样本全部对应窗口宽度改变后的重新排版；
+  普通同配置滚动 visibility 约 0.6–1.5ms。publication 约 10ms，glyph loop
+  约 1–12ms。资源场景 preparation p50/p95 约 12.1/47.1ms，完成通知后的
+  重排没有被缓存错误跳过。
+- 长文档与资源场景 `stale_publication`、drawable、GPU 和 AX 协议检查仍符合
+  原有通过条件；资源场景中的一次 stale publication 是完成通知与请求 generation
+  竞争时按设计丢弃旧结果。
+
+这项修复降低了普通滚动的 CPU 准备开销，但 resize 仍会触发必要的布局重算，
+后台 preparation 长尾和真实触控板连续滚动 p95 ≤ 16.7ms 尚未验收。
