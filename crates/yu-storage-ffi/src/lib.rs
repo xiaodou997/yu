@@ -4777,7 +4777,12 @@ fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange,
 #[cfg(target_os = "macos")]
 fn macos_render_host_error_status(error: &CoreTextViewportFrameError) -> i32 {
     match error {
-        CoreTextViewportFrameError::Cancelled => YU_STORAGE_RENDER_BUSY,
+        CoreTextViewportFrameError::Cancelled => {
+            if std::env::var_os("YU_RENDER_TIMING").is_some() {
+                println!("yu-render-metric event=preparation_cancelled");
+            }
+            YU_STORAGE_RENDER_BUSY
+        }
         CoreTextViewportFrameError::InvalidConfig(_) => YU_STORAGE_INVALID_VIEWPORT_CONFIG,
         CoreTextViewportFrameError::Raster(_) => YU_STORAGE_SHAPER_UNAVAILABLE,
         CoreTextViewportFrameError::Document(error) => status_from_editor_error(error.clone()),
