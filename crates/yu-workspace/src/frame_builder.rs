@@ -184,7 +184,15 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         image_publications: &[ImagePublication],
         image_intrinsics: &[ImageIntrinsicPublication],
     ) -> Result<ViewportFramePublication, BuildError<S>> {
+        let raster_start = std::time::Instant::now();
         self.rasterize_visible_glyphs(document)?;
+        if std::env::var_os("YU_RENDER_TIMING").is_some() {
+            println!(
+                "yu-render-metric event=preparation_rasterization duration_ms={:.6}",
+                raster_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let publish_start = std::time::Instant::now();
         self.publisher
             .publish_with_images_and_intrinsics(
                 document,
@@ -196,6 +204,14 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
                 image_intrinsics,
             )
             .map_err(ViewportFrameBuildError::Publish)
+            .inspect(|_| {
+                if std::env::var_os("YU_RENDER_TIMING").is_some() {
+                    println!(
+                        "yu-render-metric event=preparation_publication duration_ms={:.6}",
+                        publish_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            })
     }
 
     /// Consumes an owned worker input and publishes one revision-bound frame.
@@ -210,12 +226,25 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             image_intrinsics,
         } = input;
         let mut document = document.into_document()?;
+        self.publish_owned_document(request, &mut document, image_publications, image_intrinsics)
+    }
+
+    /// Publishes using a document retained by the same worker between jobs.
+    /// The document never crosses the worker boundary; this only avoids
+    /// reparsing and rebuilding its layout cache for a scroll-only request.
+    pub fn publish_owned_document(
+        &mut self,
+        request: FrameBuildRequest,
+        document: &mut EditorDocument,
+        image_publications: Vec<ImagePublication>,
+        image_intrinsics: Vec<ImageIntrinsicPublication>,
+    ) -> Result<ViewportFrameBuildOutput, BuildError<S>> {
         // Worker outputs may be dropped or superseded before reaching the GPU.
         // Every owned publication carries the pages it needs; the GPU atlas
         // deduplicates by fingerprint only after receiving the payload.
         self.render_plans.reset();
         let publication = self.publish_with_images_and_intrinsics(
-            &mut document,
+            document,
             &image_publications,
             &image_intrinsics,
         )?;
@@ -238,7 +267,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             })
             .collect();
         Ok(ViewportFrameBuildOutput {
-            layout: document.into_render_layout(),
+            layout: document.render_layout(),
             request,
             publication,
             atlas: self.atlas.clone(),
@@ -351,8 +380,17 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         &mut self,
         document: &mut EditorDocument,
     ) -> Result<(), BuildError<S>> {
+        let visibility_start = std::time::Instant::now();
         let viewport = document
             .visible_blocks_with_visual_state_and_shaper(self.config.viewport(), &self.shaper)?;
+        if std::env::var_os("YU_RENDER_TIMING").is_some() {
+            println!(
+                "yu-render-metric event=preparation_visibility duration_ms={:.6} blocks={}",
+                visibility_start.elapsed().as_secs_f64() * 1000.0,
+                viewport.blocks().len()
+            );
+        }
+        let glyph_start = std::time::Instant::now();
         let layout_config = document.viewport_config().layout();
         let rasterizer = self.shaper.rasterizer();
         for block in viewport.blocks() {
@@ -386,6 +424,12 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
                     )?;
                 }
             }
+        }
+        if std::env::var_os("YU_RENDER_TIMING").is_some() {
+            println!(
+                "yu-render-metric event=preparation_glyph_loop duration_ms={:.6}",
+                glyph_start.elapsed().as_secs_f64() * 1000.0
+            );
         }
         Ok(())
     }

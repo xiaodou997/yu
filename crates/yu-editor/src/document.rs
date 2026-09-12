@@ -108,6 +108,21 @@ impl EditorRenderSnapshot {
         document.search_generation = self.search_generation;
         Ok(document)
     }
+
+    /// Returns whether a worker-owned document can keep its parsed Markdown,
+    /// decorations and shaped block layout cache for this snapshot. Viewport
+    /// scroll/height measurements may differ; the worker updates those while
+    /// retaining the expensive source layout state.
+    #[must_use]
+    pub fn can_reuse_worker_document(&self, document: &EditorDocument) -> bool {
+        Arc::ptr_eq(&self.identity, &document.render_identity)
+            && self.revision() == document.revision()
+            && self.viewport.config() == document.viewport_config()
+            && self.selections == document.selections
+            && self.composition == document.composition
+            && self.search_query.as_deref() == document.search.as_ref().map(|search| search.query())
+            && self.search_generation == document.search_generation
+    }
 }
 
 impl EditorDocument {
@@ -181,6 +196,19 @@ impl EditorDocument {
             viewport: self.viewport,
             selections: self.selections,
             composition: self.composition,
+        }
+    }
+
+    /// Copies only the numerical layout state for a publication while keeping
+    /// this worker-owned document alive for the next scroll request.
+    #[must_use]
+    pub fn render_layout(&self) -> EditorRenderLayout {
+        EditorRenderLayout {
+            identity: Arc::clone(&self.render_identity),
+            revision: self.buffer.revision(),
+            viewport: self.viewport.clone(),
+            selections: self.selections.clone(),
+            composition: self.composition.clone(),
         }
     }
 
