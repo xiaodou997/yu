@@ -59,6 +59,7 @@ pub struct ViewportFrameBuildOutput {
 /// 交给调用方映射（平台侧的状态码表是唯一知道该怎么翻译它的地方）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ViewportFrameBuildError<E> {
+    Cancelled,
     InvalidConfig(&'static str),
     Document(EditorDocumentError),
     Raster(E),
@@ -69,6 +70,7 @@ pub enum ViewportFrameBuildError<E> {
 impl<E: fmt::Display> fmt::Display for ViewportFrameBuildError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("viewport preparation cancelled"),
             Self::InvalidConfig(message) => formatter.write_str(message),
             Self::Document(error) => error.fmt(formatter),
             Self::Raster(error) => error.fmt(formatter),
@@ -85,6 +87,7 @@ impl<E: Error + 'static> Error for ViewportFrameBuildError<E> {
             Self::Raster(error) => Some(error),
             Self::Atlas(error) => Some(error),
             Self::Publish(error) => Some(error),
+            Self::Cancelled => None,
             Self::InvalidConfig(_) => None,
         }
     }
@@ -92,7 +95,10 @@ impl<E: Error + 'static> Error for ViewportFrameBuildError<E> {
 
 impl<E> From<EditorDocumentError> for ViewportFrameBuildError<E> {
     fn from(error: EditorDocumentError) -> Self {
-        Self::Document(error)
+        match error {
+            EditorDocumentError::Cancelled => Self::Cancelled,
+            error => Self::Document(error),
+        }
     }
 }
 
@@ -184,8 +190,26 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         image_publications: &[ImagePublication],
         image_intrinsics: &[ImageIntrinsicPublication],
     ) -> Result<ViewportFramePublication, BuildError<S>> {
+        self.publish_with_images_and_intrinsics_cancelable(
+            document,
+            image_publications,
+            image_intrinsics,
+            &mut || false,
+        )
+    }
+
+    pub fn publish_with_images_and_intrinsics_cancelable<C>(
+        &mut self,
+        document: &mut EditorDocument,
+        image_publications: &[ImagePublication],
+        image_intrinsics: &[ImageIntrinsicPublication],
+        should_cancel: &mut C,
+    ) -> Result<ViewportFramePublication, BuildError<S>>
+    where
+        C: FnMut() -> bool,
+    {
         let raster_start = std::time::Instant::now();
-        self.rasterize_visible_glyphs(document)?;
+        self.rasterize_visible_glyphs_cancelable(document, should_cancel)?;
         if std::env::var_os("YU_RENDER_TIMING").is_some() {
             println!(
                 "yu-render-metric event=preparation_rasterization duration_ms={:.6}",
@@ -239,14 +263,35 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         image_publications: Vec<ImagePublication>,
         image_intrinsics: Vec<ImageIntrinsicPublication>,
     ) -> Result<ViewportFrameBuildOutput, BuildError<S>> {
+        self.publish_owned_document_cancelable(
+            request,
+            document,
+            image_publications,
+            image_intrinsics,
+            &mut || false,
+        )
+    }
+
+    pub fn publish_owned_document_cancelable<C>(
+        &mut self,
+        request: FrameBuildRequest,
+        document: &mut EditorDocument,
+        image_publications: Vec<ImagePublication>,
+        image_intrinsics: Vec<ImageIntrinsicPublication>,
+        should_cancel: &mut C,
+    ) -> Result<ViewportFrameBuildOutput, BuildError<S>>
+    where
+        C: FnMut() -> bool,
+    {
         // Worker outputs may be dropped or superseded before reaching the GPU.
         // Every owned publication carries the pages it needs; the GPU atlas
         // deduplicates by fingerprint only after receiving the payload.
         self.render_plans.reset();
-        let publication = self.publish_with_images_and_intrinsics(
+        let publication = self.publish_with_images_and_intrinsics_cancelable(
             document,
             &image_publications,
             &image_intrinsics,
+            should_cancel,
         )?;
         let viewport = self.config.viewport();
         let viewport_blocks = publication
@@ -376,13 +421,20 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         self.publisher.next_serial = self.publisher.next_serial.max(serial);
     }
 
-    fn rasterize_visible_glyphs(
+    fn rasterize_visible_glyphs_cancelable<C>(
         &mut self,
         document: &mut EditorDocument,
-    ) -> Result<(), BuildError<S>> {
+        should_cancel: &mut C,
+    ) -> Result<(), BuildError<S>>
+    where
+        C: FnMut() -> bool,
+    {
         let visibility_start = std::time::Instant::now();
-        let viewport = document
-            .visible_blocks_with_visual_state_and_shaper(self.config.viewport(), &self.shaper)?;
+        let viewport = document.visible_blocks_with_visual_state_and_shaper_cancelable(
+            self.config.viewport(),
+            &self.shaper,
+            &mut *should_cancel,
+        )?;
         if std::env::var_os("YU_RENDER_TIMING").is_some() {
             println!(
                 "yu-render-metric event=preparation_visibility duration_ms={:.6} blocks={}",
@@ -394,6 +446,9 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         let layout_config = document.viewport_config().layout();
         let rasterizer = self.shaper.rasterizer();
         for block in viewport.blocks() {
+            if should_cancel() {
+                return Err(ViewportFrameBuildError::Cancelled);
+            }
             let layout = document.block_layout_for_visual_state_with_shaper(
                 block.index(),
                 layout_config,
@@ -590,6 +645,22 @@ mod tests {
             Rect::new(0.0, 0.0, 240.0, 200.0).expect("scene viewport"),
             Rgba8::black(),
         )
+    }
+
+    #[test]
+    fn cancelled_worker_measurement_stops_before_layout_cache_work() {
+        let shaper = CountingShaper::new(14.0, false);
+        let mut document = document("first paragraph\n\nsecond paragraph");
+        let result = document.visible_blocks_with_visual_state_and_shaper_cancelable(
+            ViewportSpan::new(0.0, 200.0),
+            &shaper,
+            || true,
+        );
+        assert!(matches!(
+            result,
+            Err(yu_editor::EditorDocumentError::Cancelled)
+        ));
+        assert_eq!(document.layout_cache_stats().builds(), 0);
     }
 
     #[test]

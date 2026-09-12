@@ -1116,11 +1116,12 @@ fn macos_new_frame_worker() -> Option<MacosFrameBuildWorker> {
                     .map_err(|_| YU_STORAGE_EDITOR_ERROR)?
             };
             let output = builder
-                .publish_owned_document(
+                .publish_owned_document_cancelable(
                     request,
                     &mut owned_document,
                     image_publications,
                     image_intrinsics,
+                    &mut || cancellation.is_cancelled(),
                 )
                 .map_err(|error| macos_render_host_error_status(&error))?;
             document = Some(owned_document);
@@ -4776,6 +4777,7 @@ fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange,
 #[cfg(target_os = "macos")]
 fn macos_render_host_error_status(error: &CoreTextViewportFrameError) -> i32 {
     match error {
+        CoreTextViewportFrameError::Cancelled => YU_STORAGE_RENDER_BUSY,
         CoreTextViewportFrameError::InvalidConfig(_) => YU_STORAGE_INVALID_VIEWPORT_CONFIG,
         CoreTextViewportFrameError::Raster(_) => YU_STORAGE_SHAPER_UNAVAILABLE,
         CoreTextViewportFrameError::Document(error) => status_from_editor_error(error.clone()),
