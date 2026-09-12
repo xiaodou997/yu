@@ -3109,6 +3109,28 @@ impl From<SelectionError> for EditorDocumentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_snapshot_reuse_is_bound_to_worker_document_identity_and_revision() {
+        let document = EditorDocument::new("worker cache");
+        let snapshot = document.capture_render_snapshot();
+        let worker = snapshot
+            .clone()
+            .into_document()
+            .expect("snapshot should reconstruct a worker document");
+        assert!(snapshot.can_reuse_worker_document(&worker));
+
+        let mut edited = document;
+        edited
+            .apply_transaction(&Transaction::new(
+                edited.revision(),
+                [Edit::new(TextRange::empty(ByteOffset::ZERO), "x")],
+            ))
+            .expect("edit should apply");
+        let edited_snapshot = edited.capture_render_snapshot();
+        assert!(!snapshot.can_reuse_worker_document(&edited));
+        assert!(!edited_snapshot.can_reuse_worker_document(&worker));
+    }
     use crate::table::{TableResizeGesture, TableResizeTarget};
     use crate::{EditorKey, KeyModifiers, SourceSync};
     use unicode_segmentation::UnicodeSegmentation;
