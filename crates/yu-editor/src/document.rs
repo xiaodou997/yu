@@ -1032,6 +1032,38 @@ impl EditorDocument {
         )
     }
 
+    /// Cancellable worker variant for ordinary shaped viewport preparation.
+    /// Cancellation is checked between block layouts and never mutates the
+    /// canonical document; composition/selection-reveal paths retain their
+    /// existing atomic measurement behavior.
+    pub fn visible_blocks_with_visual_state_and_shaper_cancelable<S, C>(
+        &mut self,
+        viewport: ViewportSpan,
+        shaper: &S,
+        mut should_cancel: C,
+    ) -> Result<ViewportSnapshot, EditorDocumentError>
+    where
+        S: ShapingProvider,
+        C: FnMut() -> bool,
+    {
+        if should_cancel() {
+            return Err(EditorDocumentError::Cancelled);
+        }
+        if self.composition.is_some() || self.selection_reveal_block_index().is_some() {
+            return self.visible_blocks_with_visual_state_and_shaper(viewport, shaper);
+        }
+        let mut layout = std::mem::take(&mut self.viewport);
+        let result = self.measure_visible_blocks_with_shaper_and_images_cancelable(
+            &mut layout,
+            viewport,
+            shaper,
+            &|_| None,
+            &mut should_cancel,
+        );
+        self.viewport = layout;
+        result
+    }
+
     /// Image-aware variant of
     /// [`Self::visible_blocks_with_visual_state_and_shaper`].
     pub fn visible_blocks_with_visual_state_and_shaper_and_image_resolver<S, F>(
@@ -1146,6 +1178,28 @@ impl EditorDocument {
         S: ShapingProvider,
         F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
     {
+        self.measure_visible_blocks_with_shaper_and_images_cancelable(
+            layout,
+            viewport,
+            shaper,
+            image_resolver,
+            &mut || false,
+        )
+    }
+
+    fn measure_visible_blocks_with_shaper_and_images_cancelable<S, F, C>(
+        &mut self,
+        layout: &mut ViewportLayout,
+        viewport: ViewportSpan,
+        shaper: &S,
+        image_resolver: &F,
+        should_cancel: &mut C,
+    ) -> Result<ViewportSnapshot, EditorDocumentError>
+    where
+        S: ShapingProvider,
+        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
+        C: FnMut() -> bool,
+    {
         layout
             .set_backend(LayoutBackend::Shaped)
             .map_err(EditorDocumentError::Viewport)?;
@@ -1156,6 +1210,9 @@ impl EditorDocument {
         for _ in 0..8 {
             let mut changed = false;
             for index in range.start()..range.end() {
+                if should_cancel() {
+                    return Err(EditorDocumentError::Cancelled);
+                }
                 let sizes = self.block_image_sizes(index, image_resolver)?;
                 let height = self
                     .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
@@ -2980,6 +3037,8 @@ fn byte_distance(
 /// Errors raised while coordinating canonical edits and composition state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorDocumentError {
+    /// A worker request was superseded during viewport measurement.
+    Cancelled,
     Composition(CompositionError),
     Edit(EditError),
     Layout(LayoutError),
@@ -3005,6 +3064,7 @@ pub enum EditorDocumentError {
 impl fmt::Display for EditorDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("viewport preparation cancelled"),
             Self::Composition(error) => error.fmt(formatter),
             Self::Edit(error) => error.fmt(formatter),
             Self::Layout(error) => error.fmt(formatter),
@@ -3047,7 +3107,8 @@ impl Error for EditorDocumentError {
             Self::BlockOutOfBounds { .. }
             | Self::BlockNotTaskList { .. }
             | Self::CompositionNotActive
-            | Self::CompositionActive => None,
+            | Self::CompositionActive
+            | Self::Cancelled => None,
         }
     }
 }
