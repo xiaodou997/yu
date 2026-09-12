@@ -303,6 +303,21 @@ macOS 26.5 / 25F71，Xcode 26.6 / 17F113，debug，2x / 60Hz）。
 这项修复降低了普通滚动的 CPU 准备开销，但 resize 仍会触发必要的布局重算，
 后台 preparation 长尾和真实触控板连续滚动 p95 ≤ 16.7ms 尚未验收。
 
+## superseded viewport preparation cancellation（2026-09-12）
+
+普通 shaped viewport 的后台测量现在在每个 block 布局之间检查 request
+generation。旧请求被新请求取代时，worker 返回 `Cancelled`，由 FFI 映射为
+`YU_STORAGE_RENDER_BUSY`；host 保留当前可见帧，只继续处理 mailbox 中的最新请求。
+取消发生在 publication 之前，因此被取消的结果不会改变当前 frame，也不会进入
+主线程的 atlas 或 Metal 提交流程。composition 和 selection-reveal 仍使用原有的
+原子测量路径，避免在中间状态暴露部分布局。
+
+本次验证：`yu-workspace` 47 项测试通过，`yu-storage-ffi` 49 项测试通过，macOS
+app build 通过；长文档真实窗口脚本回归通过，未出现 stale publication。该次脚本
+记录在 `.notes/macos-cancellable-resize-20260912-a/`：preparation p50
+14.562ms、visibility p50 1.372ms、publication p50 9.882ms。p95 仍被显式窗口
+resize 的必要重排拉长到约 637ms，不能作为连续触控板滚动 p95 ≤ 16.7ms 的证明。
+
 ## drawable acquisition 生命周期自动覆盖（2026-09-12）
 
 补充了确定性 Metal probe：第一次 acquisition 被阻塞时，主线程请求保持立即

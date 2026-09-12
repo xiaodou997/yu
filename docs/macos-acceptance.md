@@ -229,3 +229,11 @@ pending retained reuse、窗口关闭/重开通过，324 KB 长文档的末行�
 回归均通过。CPU 采样发现的主线程辅助功能排版成本仍待后续优化。具体复现、
 硬件与修复后的证据见 [macOS 自动窗口回归记录](macos-render-regression.md)。
 这些通过项不等于连续触控板性能或完整人工验收通过。
+
+### 2026-09-12 后台测量取消
+
+普通 shaped viewport 准备阶段已接入协作式取消：每个 block 布局完成后检查最新
+request generation，过期请求以 `YU_STORAGE_RENDER_BUSY` 结束，host 保留当前画面
+并只接续最新请求。composition 与 selection-reveal 保持原子路径。workspace 47 项、
+FFI 49 项自动测试及 macOS app build 均通过；人工触控板、IME、VoiceOver 和真实
+硬件 p95 仍按计划留到最终验收。
