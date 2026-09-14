@@ -28,9 +28,12 @@ def fixtures(directory):
     source += "YU_END_OF_DOCUMENT\n"
     (directory / "long.md").write_text(source, encoding="utf-8")
     # A deterministic, small RGBA fixture; ImageIO still performs the decode.
+    # 高度取 64：正文行高 = line_height × 1.6 ≈ 32pt，32px 高的图占位与就绪
+    # 都落在同一行高里、几何不变，「图片就绪引起一次几何变化」这条断言无从
+    # 判读；64px 高（两行）就绪后块高才真正变化。
     def chunk(kind, data):
         return struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind + data))
-    width, height = 320, 32
+    width, height = 320, 64
     pixels = b"".join(b"\0" + bytes([30, 130, 220, 255]) * width for _ in range(height))
     png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!2I5B", width, height, 8, 6, 0, 0, 0))
     png += chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b"")

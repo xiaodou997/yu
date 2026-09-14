@@ -649,36 +649,33 @@ func runMacosTaskCheckboxSelfCheck(path: String) -> Never {
         let sourceString = bridge.source as NSString
         let markerRange = sourceString.range(of: "- [ ] todo")
         precondition(markerRange.location != NSNotFound)
-        var taskLineY: CGFloat?
-        for step in 0..<200 {
+        // 边界 bias 会让空块/段尾命中共享边界（即 markerRange 的起点），所以
+        // 「第一个映射进 marker 区间的 y」可能是空块顶而不是待办行本身——M3
+        // 行高 1.6 + 块间距把两者拉开了 ~68pt，固定探测窗够不着。对每个候选 y
+        // 实际探测 checkbox，第一个真正命中的才是待办行；探测本身才是判据，
+        // 投影命中只负责把扫描范围圈到这一行附近。
+        var found: (point: NSPoint, hit: NativeTaskCheckboxHit)?
+        outer: for step in 0..<200 {
             let y = CGFloat(step) * 2.0
             guard let hit = try? bridge.projectionHitTest(
                 revision: revision,
                 point: CGPoint(x: 1.0, y: y),
                 size: size,
                 maxWidth: maxWidth
-            ) else { continue }
-            if hit.sourceUTF16 >= UInt64(markerRange.location),
-               hit.sourceUTF16 <= UInt64(NSMaxRange(markerRange)) {
-                taskLineY = y
-                break
-            }
-        }
-        guard let taskLineY else {
-            throw BridgeError.operation(StorageStatus.invalidSelection)
-        }
-        // 在这一行附近扫描出一个真正命中 checkbox 的点。平台已经拿不到任何
-        // 绘制几何，只能像用户点击那样去试——这正是这条路径该被测的样子。
-        var found: (point: NSPoint, hit: NativeTaskCheckboxHit)?
-        outer: for dy in stride(from: -8.0, through: 24.0, by: 2.0) {
-            for dx in stride(from: 0.0, through: 48.0, by: 2.0) {
-                let probe = NSPoint(x: dx, y: taskLineY + dy)
-                if let hit = try? bridge.taskCheckboxHitTest(
-                    revision: revision,
-                    point: probe
-                ) {
-                    found = (probe, hit)
-                    break outer
+            ), hit.sourceUTF16 >= UInt64(markerRange.location),
+               hit.sourceUTF16 <= UInt64(NSMaxRange(markerRange)) else { continue }
+            // 在这一行附近扫描出一个真正命中 checkbox 的点。平台已经拿不到任何
+            // 绘制几何，只能像用户点击那样去试——这正是这条路径该被测的样子。
+            for dy in stride(from: -8.0, through: 24.0, by: 2.0) {
+                for dx in stride(from: 0.0, through: 48.0, by: 2.0) {
+                    let probe = NSPoint(x: dx, y: y + dy)
+                    if let hit = try? bridge.taskCheckboxHitTest(
+                        revision: revision,
+                        point: probe
+                    ) {
+                        found = (probe, hit)
+                        break outer
+                    }
                 }
             }
         }
@@ -774,6 +771,16 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
         let items = try unwrapSelfCheck(bridge.outlineItemsIfAvailable)
         precondition(items.count >= 6, "fixture 里的标题太少，压不住层级")
         panel.reload(items: items)
+
+        // 视觉结构：行高 30、每级缩进 14（设计稿数值；改设计时与 token 同步改）。
+        let metrics = panel.rowMetricsForSelfCheck
+        precondition(metrics.height == 30.0, "大纲行高应是 30，实际 \(metrics.height)")
+        precondition(metrics.indent == 14.0, "大纲每级缩进应是 14，实际 \(metrics.indent)")
+        // 区头计数跟着这一版 reload 走。
+        precondition(
+            panel.sectionHeaderCountForSelfCheck == items.count,
+            "区头计数应是 \(items.count)，实际 \(panel.sectionHeaderCountForSelfCheck)"
+        )
 
         // 1. 平表 → NSOutlineView 眼里的那棵树。
         var visited: [NativeOutlineItem] = []
@@ -877,6 +884,11 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
         panel.reload(items: refreshed)
 
         precondition(
+            panel.sectionHeaderCountForSelfCheck == refreshed.count,
+            "刷新之后区头计数没跟上：\(panel.sectionHeaderCountForSelfCheck) != \(refreshed.count)"
+        )
+
+        precondition(
             panel.expandedIdentitiesForSelfCheck == expandedBefore,
             "刷新之后展开状态变了: \(panel.expandedIdentitiesForSelfCheck) != \(expandedBefore)"
         )
@@ -930,6 +942,11 @@ func runSearchPanelSelfCheck(path: String) -> Never {
         // 1. 端到端：真 fixture 经过真 ABI，结果那一行不带语法标记。
         let rows = try rowsFor("标记")
         precondition(rows.count == 6, "fixture 里应当有六处命中，实际 \(rows.count)")
+        // 视觉结构：结果行高与大纲同款 30（设计稿数值；改设计时同步这里）。
+        precondition(
+            panel.rowHeightForSelfCheck == 30.0,
+            "搜索结果行高应是 30，实际 \(panel.rowHeightForSelfCheck)"
+        )
         precondition(
             panel.rowCountForSelfCheck == rows.count,
             "面板画了 \(panel.rowCountForSelfCheck) 行"

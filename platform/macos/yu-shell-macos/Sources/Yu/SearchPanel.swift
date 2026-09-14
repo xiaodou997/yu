@@ -70,8 +70,13 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     }()
 
     private let separator: NSBox = {
+        // 用 custom box 而不是 .separator：填充色可以走 token（稿 --line
+        // #dfe4ea / 深色白 14%）。NSBox 的 fillColor 收动态 NSColor，
+        // 深浅色切换时自己重绘；layer 背景色那条路会把 cgColor 快照死。
         let box = NSBox()
-        box.boxType = .separator
+        box.boxType = .custom
+        box.borderWidth = 0
+        box.fillColor = YuVisualTokens.divider
         box.translatesAutoresizingMaskIntoConstraints = false
         return box
     }()
@@ -96,16 +101,18 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         field.sendsWholeSearchString = false
         field.sendsSearchStringImmediately = true
 
-        countLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
-        countLabel.textColor = .secondaryLabelColor
+        // 计数是弱提示：11pt 次要色里最弱的一档，不与结果行抢层级。
+        countLabel.font = NSFont.systemFont(ofSize: YuVisualTokens.countFontSize)
+        countLabel.textColor = .tertiaryLabelColor
         countLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("search"))
         column.resizingMask = .autoresizingMask
         tableView.addTableColumn(column)
         tableView.headerView = nil
-        tableView.rowSizeStyle = .medium
-        tableView.rowHeight = 30.0
+        // 与大纲同款：.custom 才认 rowHeight（.medium 恒为 17）。
+        tableView.rowSizeStyle = .custom
+        tableView.rowHeight = YuVisualTokens.sidebarRowHeight
         tableView.style = .plain
         tableView.backgroundColor = .clear
         tableView.selectionHighlightStyle = .regular
@@ -133,6 +140,7 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
             separator.topAnchor.constraint(equalTo: view.topAnchor),
             separator.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            separator.heightAnchor.constraint(equalToConstant: 1.0),
             field.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 6.0),
             field.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 6.0),
             field.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -6.0),
@@ -228,6 +236,12 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         return cell
     }
 
+    /// 结果行与大纲共用同一款行视图：hover 水洗、accentSoft 圆角 7 选中，
+    /// 两个面板摆在一起时不该各长各的。
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        YuSidebarRowView()
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !restoringSelection else { return }
         let row = tableView.selectedRow
@@ -241,6 +255,9 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     // 所以这里只交出 NSTableView 眼里的行，断言写在 SelfChecks.swift。
 
     var rowCountForSelfCheck: Int { tableView.numberOfRows }
+
+    /// 行高是视觉结构的一部分：断言写设计稿数值，与大纲同款。
+    var rowHeightForSelfCheck: CGFloat { tableView.rowHeight }
 
     func rowForSelfCheck(_ row: Int) -> NativeSearchMatch? {
         rows.indices.contains(row) ? rows[row] : nil

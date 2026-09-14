@@ -237,3 +237,47 @@ request generation，过期请求以 `YU_STORAGE_RENDER_BUSY` 结束，host 保�
 并只接续最新请求。composition 与 selection-reveal 保持原子路径。workspace 47 项、
 FFI 49 项自动测试及 macOS app build 均通过；人工触控板、IME、VoiceOver 和真实
 硬件 p95 仍按计划留到最终验收。
+
+### 2026-09-14 M7 集成验收
+
+三个确定性失败项全部修复，全量验收电池通过：
+
+1. **task-checkbox self-check（operation(14)）**：M3 行高 1.6 + 块间距把
+   空块顶到 checkbox 约 68pt，固定 ±24pt 探测窗够不着。检查改为对每个投影
+   候选 y 直接探测 checkbox，第一个真正命中者才是待办行（投影命中只负责圈
+   范围，checkbox 探测才是判据），不再依赖「空块顶 + 探测窗」的旧几何假设。
+2. **long case "Table accessibility increment failed"**：实为产品 bug——
+   `measure_visible_blocks_with_selection_reveal_and_images` 对非 reveal 块
+   把裸 `BlockView::height()` 直接 `set_block_height`，漏了
+   `block_box_height` 盒模型包装（reveal 块自身与同函数外的正常/
+   composition/caret 路径都包了）。光标落在标题内时帧构建走这条路径，
+   帧内几何整体缺块间距，AX 描述符与 begin 手势的重新实测几何错位约
+   37pt，命中落到上方段落。已补上包装，与全部其他测量路径一致。
+3. **resources case "Image geometry changed 0 times"**：正文行高 =
+   `line_height × 1.6` ≈ 32pt，fixture 图片 32px 高，占位与就绪都落在同
+   一行高里、几何本就不变。fixture `latency.png` 32→64px，恢复「就绪引起
+   一次几何变化」断言的判别力（断言处已加注释说明 fixture 约束）。
+
+深色完整性：Rust `Theme` 浅/深两张表逐 token 齐全（含新
+`link_color`/`inline_code_background`），`theme_tables_pin_every_product_color`
+钉住；Swift `YuVisualTokens` 8 个颜色 token 全部 `dual()` 双变体，
+dark self-check 的动态解析亮度断言压住单外观回退。
+
+电池结果：`cargo test --workspace` 全绿（yu-storage-ffi 两个 worker 时序
+用例在全量串行负载下各抖动过一次，单独重跑均稳定通过，与本次改动无关）；
+`cargo fmt --all --check`、`cargo clippy --workspace`（无新增警告）、
+check-geometry/deps/ffi-header/ffi-symbols/ci-parity/cfg-deps 全 PASS；
+`run-self-checks.sh` 14/14；`run-dark-self-check.sh` 通过；
+`run-macos-acceptance.sh` 退出码 0；`run-render-regression.py`
+long/resources 全 PASS（`.notes/macos-render-regression-20260914-m7d/`）。
+
+`yu-workspace` 的 `every_parser_block_kind_produces_renderable_glyphs`
+fixture 视口 900→2400pt：盒模型修复后 9 块总高超 900pt，视口加高只为让
+全部 block kind 同屏，断言意图不变。
+
+视觉冒烟：新增 `--dark-mode` 显式外观开关（默认仍跟随系统，不参与
+self-check）；亮色与暗色各开一次 `Fixtures/sample.md`，进程稳定无崩溃。
+截图时会话处于锁屏，WindowServer 拒绝窗口捕获（`screencapture -l`
+报 could not create image from window），本轮无截图产物；真窗口渲染由
+launch-window/dark 两条真实窗口自检覆盖。连续触控板 p95 与人工
+IME/VoiceOver 矩阵仍待后续。

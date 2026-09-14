@@ -74,6 +74,9 @@ enum OutlineTree {
 /// 选中回调；它不认识 StorageBridge，也不认识窗口。
 final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     let scrollView = NSScrollView()
+    /// 区头（「大纲」+ 条目计数）。面板自己持有：计数是 reload 的派生物，
+    /// 放进面板里才不会在窗口另存一份可以对不上的状态。
+    let sectionHeader = YuSidebarSectionHeader(title: "大纲")
     private let outlineView = NSOutlineView()
     private var roots: [OutlineNode] = []
     /// 点了某一条之后要做的事。程序化恢复选中时不触发（见 `restoringSelection`）。
@@ -88,9 +91,11 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
         outlineView.addTableColumn(column)
         outlineView.outlineTableColumn = column
         outlineView.headerView = nil
-        outlineView.rowSizeStyle = .medium
-        outlineView.rowHeight = 30.0
-        outlineView.indentationPerLevel = 16.0
+        // rowSizeStyle 必须是 .custom：.medium 会接管 rowHeight（读出来恒为
+        // 17），这里以前的 32 实际从未生效。行高与缩进走 token（稿 30 / 14）。
+        outlineView.rowSizeStyle = .custom
+        outlineView.rowHeight = YuVisualTokens.sidebarRowHeight
+        outlineView.indentationPerLevel = YuVisualTokens.sidebarIndent
         outlineView.usesAutomaticRowHeights = false
         outlineView.style = .plain
         outlineView.backgroundColor = .clear
@@ -128,6 +133,8 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
 
         roots = OutlineTree.build(items: items)
         outlineView.reloadData()
+        // 区头计数跟着这一版大纲走。
+        sectionHeader.count = items.count
 
         for node in allNodes(of: roots) where !node.children.isEmpty {
             if previouslyExpanded.contains(node.identity)
@@ -207,8 +214,8 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
             NSLayoutConstraint.activate([
                 icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2.0),
                 icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                icon.widthAnchor.constraint(equalToConstant: 15.0),
-                icon.heightAnchor.constraint(equalToConstant: 15.0),
+                icon.widthAnchor.constraint(equalToConstant: 16.0),
+                icon.heightAnchor.constraint(equalToConstant: 16.0),
                 field.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7.0),
                 field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8.0),
                 field.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
@@ -216,17 +223,47 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
         }
         cell.textField?.stringValue = node.label
         cell.textField?.toolTip = node.label
-        // 级别只改字重，不改字号：面板是一列索引，不是文档的缩微图。
+        // 级别只改字重与颜色，不改字号：面板是一列索引，不是文档的缩微图。
+        // H1 用 semibold 撑住层级，H4 以下降为次要色。
         cell.textField?.font = NSFont.systemFont(
-            ofSize: NSFont.systemFontSize,
+            ofSize: YuVisualTokens.sidebarItemFontSize,
             weight: node.item.level <= 1 ? .semibold : .regular
         )
-        cell.textField?.textColor = .labelColor
+        cell.textField?.textColor = node.item.level >= 4
+            ? .secondaryLabelColor
+            : .labelColor
+        // 图标按层级区分语义：H1 大号 text.alignleft，H2/H3 缩进类变体，
+        // H4-H6 小号 doc。字号用 symbol configuration 控，格子固定 16×16。
+        let symbol: String
+        let symbolSize: CGFloat
+        switch node.item.level {
+        case 1:
+            symbol = "text.alignleft"
+            symbolSize = 15
+        case 2:
+            symbol = "list.bullet.indent"
+            symbolSize = 14
+        case 3:
+            symbol = "text.indent"
+            symbolSize = 13
+        default:
+            symbol = "doc.text"
+            symbolSize = 11
+        }
         cell.imageView?.image = NSImage(
-            systemSymbolName: node.children.isEmpty ? "doc.text" : "chevron.right",
-            accessibilityDescription: node.children.isEmpty ? "标题" : "可展开标题"
+            systemSymbolName: symbol,
+            accessibilityDescription: "标题"
+        )?.withSymbolConfiguration(
+            NSImage.SymbolConfiguration(pointSize: symbolSize, weight: .regular)
         )
-        cell.imageView?.contentTintColor = .secondaryLabelColor
+        switch node.item.level {
+        case 1:
+            cell.imageView?.contentTintColor = YuVisualTokens.accent
+        case 2, 3:
+            cell.imageView?.contentTintColor = .secondaryLabelColor
+        default:
+            cell.imageView?.contentTintColor = .tertiaryLabelColor
+        }
         return cell
     }
 
@@ -247,6 +284,14 @@ final class OutlinePanel: NSObject, NSOutlineViewDataSource, NSOutlineViewDelega
     var rootsForSelfCheck: [OutlineNode] { roots }
 
     var rowCountForSelfCheck: Int { outlineView.numberOfRows }
+
+    /// 行高与缩进是视觉结构的一部分：断言写设计稿数值，将来改设计时
+    /// 改 token 的同时改这里。
+    var rowMetricsForSelfCheck: (height: CGFloat, indent: CGFloat) {
+        (outlineView.rowHeight, outlineView.indentationPerLevel)
+    }
+
+    var sectionHeaderCountForSelfCheck: Int { sectionHeader.count }
 
     func nodeForSelfCheck(row: Int) -> OutlineNode? {
         outlineView.item(atRow: row) as? OutlineNode
