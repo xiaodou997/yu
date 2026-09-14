@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Yu · Markdown workspace prototype</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="window">
+  <header class="titlebar">
+    <div class="traffic"><i class="red"></i><i class="yellow"></i><i class="green"></i></div>
+    <div class="tab active"><span class="doc-icon">M↓</span><span id="tabTitle">关于 Yu.md</span><b>×</b></div>
+    <div class="window-actions"><button title="新建">＋</button><button title="侧栏" id="toggleRail">◧</button><button title="搜索" id="focusSearch">⌕</button></div>
+  </header>
+  <main class="workspace">
+    <aside class="rail"><button class="rail-btn selected">▣</button><button class="rail-btn">☷</button><button class="rail-btn">⌕</button><div class="rail-spacer"></div><button class="rail-btn">⚙</button></aside>
+    <aside class="sidebar" id="sidebar">
+      <div class="workspace-head"><div><strong>yu-workspace</strong><small>Markdown 文档</small></div><div class="head-actions"><button>＋</button><button>⌁</button></div></div>
+      <label class="search"><span>⌕</span><input id="search" placeholder="搜索文件" /></label>
+      <nav id="tree">
+        <div class="folder open"><button class="folder-row"><span class="chevron">⌄</span><span>▰</span><strong>文档</strong></button><div class="children">
+          <button class="file selected" data-title="关于 Yu.md"><span>▤</span>关于 Yu.md</button>
+          <button class="file" data-title="快速开始.md"><span>▤</span>快速开始.md</button>
+          <button class="file" data-title="设计原则.md"><span>▤</span>设计原则.md</button>
+        </div></div>
+        <div class="folder"><button class="folder-row"><span class="chevron">›</span><span>▰</span><strong>草稿</strong></button><div class="children hidden"><button class="file"><span>▤</span>新想法.md</button></div></div>
+        <div class="folder open"><button class="folder-row"><span class="chevron">⌄</span><span>▰</span><strong>资源</strong></button><div class="children"><button class="file"><span>▧</span>封面图片.png</button><button class="file"><span>▧</span>品牌色板.png</button></div></div>
+      </nav>
+      <div class="sidebar-footer"><span>3 个文件夹</span><span>⌘K 快速打开</span></div>
+    </aside>
+    <section class="content" id="content"><article class="paper">
+      <div class="eyebrow">关于 Yu</div><h1>一个窗口，装下所有想法</h1>
+      <p class="lead">Yu 是一款温和、现代的 Markdown 编辑器。每个文件都作为标签页在同一个窗口里打开，让写作回到安静、专注的画布。</p>
+      <div class="callout"><span>✦</span><p><b>所见即所得。</b> 写下 Markdown，立即看到清晰、舒服的最终排版。</p></div>
+      <h2>它能做什么</h2><ul class="feature-list"><li><b>标签页</b><span>多文件同窗，<kbd>⌘</kbd><kbd>Tab</kbd> 快速切换</span></li><li><b>文件树</b><span>原地新建、重命名与整理文档</span></li><li><b>漂亮排版</b><span>代码高亮、表格、数学公式和图片</span></li></ul>
+      <h2>代码与公式</h2><p>行内代码 <code>const app = createApp()</code> 和块级代码都保持清晰的阅读节奏：</p><pre><code><span class="kw">func</span> <span class="fn">openDocument</span>(_ url: URL) {
+  <span class="kw">let</span> document = workspace.open(url)
+  editor.present(document)
+}</code></pre>
+      <blockquote>好工具应该让内容成为主角，而不是让界面抢走注意力。</blockquote>
+      <h2>适合谁</h2><table><thead><tr><th>你是</th><th>你想要</th><th>Yu 帮你</th></tr></thead><tbody><tr><td>内容创作者</td><td>专注写作，减少排版时间</td><td>所见即所得的 Markdown</td></tr><tr><td>开发者</td><td>管理技术文档和代码</td><td>代码高亮与文件树</td></tr></tbody></table>
+    </article></section>
+  </main>
+  <footer class="status"><span>✓ 已保存</span><span>657 字</span><span class="grow"></span><span>⌘ 富文本</span><span>☼ 浅色</span><span>中</span></footer>
+</div><script src="app.js"></script>
+</body></html>

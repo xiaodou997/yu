@@ -1,0 +1,5 @@
+const sidebar=document.querySelector('#sidebar'), tree=document.querySelector('#tree'), search=document.querySelector('#search');
+document.querySelector('#toggleRail').onclick=()=>sidebar.classList.toggle('collapsed');
+document.querySelector('#focusSearch').onclick=()=>{sidebar.classList.remove('collapsed');search.focus()};
+tree.addEventListener('click',e=>{const folder=e.target.closest('.folder-row');if(folder){folder.parentElement.classList.toggle('open');folder.parentElement.querySelector('.children').classList.toggle('hidden');folder.querySelector('.chevron').textContent=folder.parentElement.classList.contains('open')?'⌄':'›'}const file=e.target.closest('.file');if(file){document.querySelectorAll('.file').forEach(x=>x.classList.remove('selected'));file.classList.add('selected');document.querySelector('#tabTitle').textContent=file.dataset.title}});
+search.addEventListener('input',()=>{const q=search.value.toLowerCase();document.querySelectorAll('.file').forEach(f=>f.style.display=f.textContent.toLowerCase().includes(q)?'flex':'none')});
