@@ -15,14 +15,17 @@ use yu_assets::{
     EmbeddedRenderPayload, EmbeddedRenderPublication, ImageIntrinsicPublication, ImageKey,
     ImagePublication,
 };
-use yu_core::{Revision, TextRange, TextRole, VisualRange};
+use yu_core::{Revision, TextRange, TextRole, TextStyle, VisualRange};
 use yu_editor::{
-    Bias, BlockKind, BlockView, BlockWidget, CaretAffinity, CheckboxPlacement, EditorDocument,
-    EditorDocumentError, ImageSpan, LayoutError, Selections, ShapingProvider, TableLayout,
-    TableResizeCommit, TableResizeTarget, TaskState, ViewportSpan,
+    Bias, BlockCluster, BlockKind, BlockView, BlockWidget, CaretAffinity, CheckboxPlacement,
+    EditorDocument, EditorDocumentError, ImageSpan, LayoutError, Selections, ShapingProvider,
+    TableLayout, TableResizeCommit, TableResizeTarget, TaskState, ViewportSpan,
+    layout_tokens::{
+        code_block_background_rect, content_origin_y, is_code_block, quote_block_background_rect,
+    },
 };
 use yu_font::GlyphAtlas;
-use yu_layout::{ImageIntrinsicSize, LayoutRect};
+use yu_layout::{ImageIntrinsicSize, LayoutPoint, LayoutRect};
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
 use yu_scene::{
     EditorDecorationPrimitive, EditorDecorationPrimitiveRole, EmbeddedSvgPrimitive, ImagePrimitive,
@@ -177,16 +180,21 @@ impl TaskCheckboxHit {
 /// Returns the optional background used by the product visual projection for
 /// one parser block. The scene crate receives only the resulting color, so
 /// Markdown semantics stay at this editor-to-scene integration boundary.
+///
+/// 数值住在 [`Theme`]，这里只做 `BlockKind` → token 的映射。这个自由函数留着
+/// 是因为 `yu-markdown` 的文档指着它（`extension/indented_code.rs`），
+/// 名字与签名不许动。
 #[must_use]
 pub fn viewport_block_background(appearance: Appearance, kind: BlockKind) -> Option<Rgba8> {
+    let theme = appearance.theme();
     match kind {
         // 缩进代码与围栏共用这一块底色，而不是各挑一种。它们是同一种东西的
         // 两种拼法（`BlockKind` 把它们分成两个变体是为了负载不同，不是为了
         // 长得不同），两块底色不一样的话，同一份文档里换个写法就换个颜色。
-        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode => Some(match appearance {
-            Appearance::Light => Rgba8::new(245, 246, 248, 255),
-            Appearance::Dark => Rgba8::new(34, 38, 45, 255),
-        }),
+        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode => {
+            Some(theme.code_block_background())
+        }
+        BlockKind::BlockQuote { .. } => Some(theme.quote_block_background()),
         _ => None,
     }
 }
@@ -197,11 +205,10 @@ pub fn viewport_block_background(appearance: Appearance, kind: BlockKind) -> Opt
 /// # 为什么它必须跨 ABI 进来，而不是让平台直接送一份颜色
 ///
 /// 「产品选色住在 `yu-workspace`」这条在别处已经写了三遍
-/// （[`viewport_code_role_color`]、`viewport_table_style`、
-/// `EditorDecorationStyle` 的文档）。让平台送颜色等于把主题选择挪到壳里，
+/// （[`Theme`]、`EditorDecorationStyle` 的文档）。让平台送颜色等于把主题选择挪到壳里，
 /// 于是第二端要把同一套配色再挑一遍，而两端挑出来的**一定会漂开**——那正是
 /// 「唯一实现」这条规矩要防的东西。进来的是**一个事实**（现在是深还是浅），
-/// 出去的是一整套颜色。
+/// 出去的是一整套颜色：那个「一整套」就是 [`Theme`]。
 ///
 /// # 它必须进 [`FrameKey`]
 ///
@@ -216,30 +223,38 @@ pub enum Appearance {
 }
 
 impl Appearance {
-    /// 编辑区背景。
+    /// 这一外观对应的整张主题表。
+    ///
+    /// 「一个事实进来、一整套颜色出去」的门开在这里，且只在这里：
+    /// `Appearance` 是跨 ABI 进来的唯一视觉事实，[`Theme`] 是它在本 crate 的
+    /// 唯一解释。新增加任何产品颜色，先进 [`Theme::light`] / [`Theme::dark`]，
+    /// 再经这一道门选表——绕开 `Theme` 另挑颜色等于开了第二份实现，两端一定
+    /// 漂开（理由见这个 enum 的文档）。
+    #[must_use]
+    pub const fn theme(self) -> Theme {
+        match self {
+            Self::Light => Theme::light(),
+            Self::Dark => Theme::dark(),
+        }
+    }
+
+    /// 编辑区背景。数值住在 [`Theme`]，这里只是委托。
     ///
     /// 删除 TextKit fallback 之后 Rust surface 是唯一渲染路径（不变量 I5），
     /// 背景必须由这一帧自己画出来：Metal layer 是透明的，未触及的像素会露出
     /// 下层视图，而下层视图已经不再绘制任何东西。
     #[must_use]
     pub const fn background(self) -> Rgba8 {
-        match self {
-            Self::Light => Rgba8::white(),
-            // 不用纯黑：macOS 深色下的文本背景也不是纯黑，纯黑配浅字会过冲。
-            Self::Dark => Rgba8::new(30, 30, 32, 255),
-        }
+        self.theme().background()
     }
 
-    /// 正文色。
+    /// 正文色。数值住在 [`Theme`]，这里只是委托。
     #[must_use]
     pub const fn text(self) -> Rgba8 {
-        match self {
-            Self::Light => Rgba8::black(),
-            Self::Dark => Rgba8::new(233, 233, 236, 255),
-        }
+        self.theme().text()
     }
 
-    /// 选区、caret 与搜索高亮。
+    /// 选区、caret 与搜索高亮。数值住在 [`Theme`]，这里只是委托。
     ///
     /// 选区是半透明的，**两种外观下都要压得住底下的字**：浅色下 97/255 的蓝
     /// 压在白底上，深色下同一个 alpha 压在深底上会几乎看不见，所以深色那一份
@@ -247,117 +262,543 @@ impl Appearance {
     /// 还分得清（选区画在它们上面）。
     #[must_use]
     pub const fn editor_decorations(self) -> EditorDecorationStyle {
-        match self {
-            Self::Light => EditorDecorationStyle::new(
+        self.theme().editor_decorations()
+    }
+}
+
+/// 产品主题表：一种外观下的全部产品选色，外加一排排版 token。
+///
+/// # 为什么收成一张表
+///
+/// M1 之前颜色散成一排自由函数与 `Appearance` 方法：每加一个颜色多一个函数，
+/// 「这一套颜色配不配」只能人肉对照。收成一张表之后，**两种外观就是
+/// [`Theme::light`] / [`Theme::dark`] 两个构造函数**，一张表一眼看完；
+/// M3/M4 改视觉只动这两个函数，diff 就是设计稿。
+///
+/// # 数值的纪律
+///
+/// 这里每一个数值都是现状的**原文搬迁**，M1 不改任何一个像素。深色代码
+/// 高亮按自己的底重新挑过、不是浅色反相（理由在 [`CodeRolePalette::dark`]）；
+/// 深色选区提了 alpha（理由在 `editor_decorations` 字段）。改数值是后续
+/// 里程碑的事，各带自己的截图判据；`theme_tables_pin_every_product_color`
+/// 那个用例把现状值逐个点名，改动会留下刻意的 diff。
+///
+/// # 排版 token 为什么也在这里
+///
+/// 底部 `body_font_size` 起那排字段是 **M3/M4 的登记表**。依赖方向卡死了
+/// 它们的消费者：`yu-editor` 不依赖这一 crate（是反过来），所以这些字段只
+/// 可能由本 crate 自己读；要把它们送进排版链路，得走 `yu-editor` 已有的
+/// config 门，而不是指望 `yu-editor` 反向引用 `Theme`。圆角那一组（M4）已
+/// 拆实接线——块背景、行内 chip、图片各取一个常量；其余字段仍是中性预留位，
+/// 接了线却不改值才算本事。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Theme {
+    /// 编辑区背景。深色那份不用纯黑：macOS 深色下的文本背景也不是纯黑，纯黑
+    /// 配浅字会过冲。
+    background: Rgba8,
+    /// 正文色。
+    text: Rgba8,
+    /// 选区、caret 与搜索高亮。两种外观各自的取值理由见 [`Appearance`] 上
+    /// `editor_decorations` 的委托注释。
+    editor_decorations: EditorDecorationStyle,
+    /// 代码块（围栏与缩进共用）的底色。两块拼法是同一种东西，底色必须同一张
+    /// （理由在 [`viewport_block_background`]）。
+    code_block_background: Rgba8,
+    /// 引用块底色。
+    quote_block_background: Rgba8,
+    /// 引用竖条。比分隔线重一档：竖条标示一整段引文的范围，读者要能一眼看出
+    /// 它管到哪里；横线只是一道分隔。
+    quote_bar: Rgba8,
+    /// 表格网格的颜色与线宽。
+    table: TableSceneStyle,
+    /// 代码高亮的调色板：[`TextRole`] → RGBA。
+    ///
+    /// # 为什么在这一层
+    ///
+    /// 与表格、引用竖条同一个理由：**产品选色住在这一层**。装饰产出的是
+    /// 「这是一个关键字」，不是 `#0550AE`——`yu-markdown` 里写死颜色就等于把
+    /// 主题焊进解析层，而 `yu-layout` / `yu-scene` 按不变量 E1 连角色都不该
+    /// 解释。
+    ///
+    /// 每一份都按**自己那块底**挑对比度（浅色 `(241,244,248)`、深色
+    /// `(34,38,45)`），不是按纯白或纯黑，也**不是把另一份反相**——反相出来
+    /// 的颜色在深底上要么发糊要么刺眼。
+    code_palette: CodeRolePalette,
+    /// 分隔线那条横线的颜色。比引用竖条淡一档，与 `quote_bar` 那一条互为
+    /// 正反：横线画得和正文一样重就喧宾夺主。深色那份同样不是把浅色反相，
+    /// 理由与 [`CodeRolePalette::dark`] 相同。
+    thematic_break: Rgba8,
+    /// 目标解析不出来的图片那个空框。比图片 fallback 再深一点：那一种是
+    /// 「还在加载」，这一种是「加载不了」。
+    broken_image: Rgba8,
+    /// 已排进版面的图片在像素就绪前落在 primitive 上的 fallback 色。
+    image_fallback: Rgba8,
+    /// 任务框「待办」态的边框。两种外观共用同一个中性灰。
+    task_todo_border: Rgba8,
+    /// 任务框「完成」态的边框。两种外观共用同一个产品蓝。
+    task_done_border: Rgba8,
+    /// 任务框里的白：待办态的框心、完成态的对勾。压在两种底上都还认得出来。
+    task_checkbox_fill: Rgba8,
+    /// 链接文字的颜色。下划线取它的 80% alpha，不再单开 token——两处要一起
+    /// 换色，分两个 token 只会漂开。
+    link_color: Rgba8,
+    /// 行内代码 chip 的底色。比代码块底色略浅一档（行内 chip 小，对比度需求
+    /// 低一档），深色那份贴近代码块深色但略抬一点，免得 chip 和代码块糊成一片。
+    inline_code_background: Rgba8,
+
+    // ---- 排版 token ----
+    //
+    // 数值的纪律见结构体文档；消费者只有本 crate（`yu-editor` 不依赖这一层）。
+    /// 正文字号。
+    body_font_size: f32,
+    /// 行高倍率。现状的行高由平台经 viewport config 给绝对值。
+    line_height_ratio: f32,
+    /// 标题字号倍率。现状的分级倍率住在 `yu-editor` 的 `BlockStyleTable`。
+    heading_scale: f32,
+    /// 块间额外间距。0.0 = 现状块与块之间不加任何额外间距。
+    block_spacing: f32,
+    /// 圆角半径按用途拆实：块背景最显眼，取 8；行内 chip 小，取 5；图片与块
+    /// 背景同档，取 8。一个 token 一个用途常量——三处换角各自独立，不共享
+    /// 「那个圆角」。
+    block_corner_radius: f32,
+    /// 行内代码 chip 的圆角半径。
+    inline_chip_corner_radius: f32,
+    /// 图片圆角半径。
+    image_corner_radius: f32,
+    /// 内容列宽上限。
+    content_column_limit: f32,
+}
+
+impl Theme {
+    /// 浅色表。数值即 M1 之前的现状，逐一点名在
+    /// `theme_tables_pin_every_product_color` 用例里。
+    #[must_use]
+    pub const fn light() -> Self {
+        Self {
+            background: Rgba8::new(248, 249, 251, 255),
+            text: Rgba8::new(32, 36, 43, 255),
+            editor_decorations: EditorDecorationStyle::new(
                 Rgba8::new(0, 122, 255, 97),
                 Rgba8::black(),
                 Rgba8::new(0, 122, 255, 255),
                 1.0,
             )
             .with_search(Rgba8::new(255, 214, 10, 120), Rgba8::new(255, 149, 0, 140)),
-            Self::Dark => EditorDecorationStyle::new(
+            code_block_background: Rgba8::new(241, 244, 248, 255),
+            quote_block_background: Rgba8::new(239, 246, 255, 255),
+            quote_bar: Rgba8::new(176, 181, 190, 255),
+            table: TableSceneStyle {
+                border_width: 1.0,
+                border_color: Rgba8::new(190, 195, 205, 255),
+                header_fill: Some(Rgba8::new(248, 249, 251, 255)),
+                selection_fill: Some(Rgba8::new(210, 225, 255, 255)),
+            },
+            code_palette: CodeRolePalette::light(),
+            thematic_break: Rgba8::new(214, 218, 224, 255),
+            broken_image: Rgba8::new(198, 203, 212, 255),
+            image_fallback: Rgba8::new(232, 234, 238, 255),
+            task_todo_border: Rgba8::new(118, 124, 134, 255),
+            task_done_border: Rgba8::new(38, 111, 219, 255),
+            task_checkbox_fill: Rgba8::white(),
+            link_color: Rgba8::new(40, 120, 212, 255),
+            inline_code_background: Rgba8::new(241, 244, 247, 255),
+            body_font_size: 17.0,
+            line_height_ratio: 1.0,
+            heading_scale: 1.0,
+            block_spacing: 0.0,
+            block_corner_radius: 8.0,
+            inline_chip_corner_radius: 5.0,
+            image_corner_radius: 8.0,
+            content_column_limit: 860.0,
+        }
+    }
+
+    /// 深色表。深色的取舍（代码高亮不是反相、选区提了 alpha）写在
+    /// [`CodeRolePalette::dark`] 与 `editor_decorations` 字段的文档里。
+    #[must_use]
+    pub const fn dark() -> Self {
+        Self {
+            background: Rgba8::new(30, 30, 32, 255),
+            text: Rgba8::new(233, 233, 236, 255),
+            editor_decorations: EditorDecorationStyle::new(
                 Rgba8::new(10, 132, 255, 130),
                 Rgba8::new(233, 233, 236, 255),
                 Rgba8::new(10, 132, 255, 255),
                 1.0,
             )
             .with_search(Rgba8::new(255, 214, 10, 90), Rgba8::new(255, 159, 10, 130)),
+            code_block_background: Rgba8::new(34, 38, 45, 255),
+            quote_block_background: Rgba8::new(36, 45, 58, 255),
+            quote_bar: Rgba8::new(90, 97, 108, 255),
+            table: TableSceneStyle {
+                border_width: 1.0,
+                border_color: Rgba8::new(75, 81, 92, 255),
+                header_fill: Some(Rgba8::new(40, 44, 52, 255)),
+                selection_fill: Some(Rgba8::new(38, 66, 110, 255)),
+            },
+            code_palette: CodeRolePalette::dark(),
+            thematic_break: Rgba8::new(70, 76, 86, 255),
+            broken_image: Rgba8::new(72, 78, 88, 255),
+            image_fallback: Rgba8::new(232, 234, 238, 255),
+            task_todo_border: Rgba8::new(118, 124, 134, 255),
+            task_done_border: Rgba8::new(38, 111, 219, 255),
+            task_checkbox_fill: Rgba8::white(),
+            link_color: Rgba8::new(106, 176, 255, 255),
+            inline_code_background: Rgba8::new(42, 46, 53, 255),
+            body_font_size: 17.0,
+            line_height_ratio: 1.0,
+            heading_scale: 1.0,
+            block_spacing: 0.0,
+            block_corner_radius: 8.0,
+            inline_chip_corner_radius: 5.0,
+            image_corner_radius: 8.0,
+            content_column_limit: 860.0,
         }
     }
-}
 
-/// 表格网格的颜色与线宽。产品选色住在这一层，不住在场景层。
-#[derive(Clone, Copy, Debug)]
-struct TableSceneStyle {
-    border_width: f32,
-    border_color: Rgba8,
-    header_fill: Option<Rgba8>,
-    selection_fill: Option<Rgba8>,
-}
-
-#[must_use]
-const fn viewport_table_style(appearance: Appearance) -> TableSceneStyle {
-    match appearance {
-        Appearance::Light => TableSceneStyle {
-            border_width: 1.0,
-            border_color: Rgba8::new(190, 195, 205, 255),
-            header_fill: Some(Rgba8::new(248, 249, 251, 255)),
-            selection_fill: Some(Rgba8::new(210, 225, 255, 255)),
-        },
-        Appearance::Dark => TableSceneStyle {
-            border_width: 1.0,
-            border_color: Rgba8::new(75, 81, 92, 255),
-            header_fill: Some(Rgba8::new(40, 44, 52, 255)),
-            selection_fill: Some(Rgba8::new(38, 66, 110, 255)),
-        },
+    /// 编辑区背景。
+    #[must_use]
+    pub const fn background(self) -> Rgba8 {
+        self.background
     }
+
+    /// 正文色。
+    #[must_use]
+    pub const fn text(self) -> Rgba8 {
+        self.text
+    }
+
+    /// 选区、caret 与搜索高亮。
+    #[must_use]
+    pub const fn editor_decorations(self) -> EditorDecorationStyle {
+        self.editor_decorations
+    }
+
+    /// 代码块（围栏与缩进共用）的底色。
+    #[must_use]
+    pub const fn code_block_background(self) -> Rgba8 {
+        self.code_block_background
+    }
+
+    /// 引用块底色。
+    #[must_use]
+    pub const fn quote_block_background(self) -> Rgba8 {
+        self.quote_block_background
+    }
+
+    /// 引用竖条。
+    #[must_use]
+    pub const fn quote_bar(self) -> Rgba8 {
+        self.quote_bar
+    }
+
+    /// 表格网格的颜色与线宽。
+    #[must_use]
+    pub const fn table(self) -> TableSceneStyle {
+        self.table
+    }
+
+    /// 代码高亮调色板。
+    #[must_use]
+    pub const fn code_palette(self) -> CodeRolePalette {
+        self.code_palette
+    }
+
+    /// 单个 [`TextRole`] 的颜色；不着色的角色返回 `None`（用正文色）。
+    ///
+    /// `Link` 在调色板**之前**拦截：链接色住在 Theme（`link_color` 字段），
+    /// 不经 [`CodeRolePalette`]——链接不是代码角色，调色板那份表里没有它。
+    #[must_use]
+    pub const fn code_role_color(self, role: TextRole) -> Option<Rgba8> {
+        match role {
+            TextRole::Link => Some(self.link_color),
+            role => self.code_palette.color(role),
+        }
+    }
+
+    /// 分隔线那条横线的颜色。
+    #[must_use]
+    pub const fn thematic_break(self) -> Rgba8 {
+        self.thematic_break
+    }
+
+    /// 目标解析不出来的图片那个空框。
+    #[must_use]
+    pub const fn broken_image(self) -> Rgba8 {
+        self.broken_image
+    }
+
+    /// 图片像素就绪前的 fallback 色。
+    #[must_use]
+    pub const fn image_fallback(self) -> Rgba8 {
+        self.image_fallback
+    }
+
+    /// 任务框「待办」态的边框。
+    #[must_use]
+    pub const fn task_todo_border(self) -> Rgba8 {
+        self.task_todo_border
+    }
+
+    /// 任务框「完成」态的边框。
+    #[must_use]
+    pub const fn task_done_border(self) -> Rgba8 {
+        self.task_done_border
+    }
+
+    /// 任务框的框心/对勾白。
+    #[must_use]
+    pub const fn task_checkbox_fill(self) -> Rgba8 {
+        self.task_checkbox_fill
+    }
+
+    /// 链接文字的颜色。下划线取它的 80% alpha（
+    /// [`link_underline_color`]），换链接色两处一起换。
+    #[must_use]
+    pub const fn link_color(self) -> Rgba8 {
+        self.link_color
+    }
+
+    /// 行内代码 chip 的底色。
+    #[must_use]
+    pub const fn inline_code_background(self) -> Rgba8 {
+        self.inline_code_background
+    }
+
+    /// 正文字号（预留位，当前无调用点）。
+    #[must_use]
+    pub const fn body_font_size(self) -> f32 {
+        self.body_font_size
+    }
+
+    /// 行高倍率（预留位，当前无调用点）。
+    #[must_use]
+    pub const fn line_height_ratio(self) -> f32 {
+        self.line_height_ratio
+    }
+
+    /// 标题字号倍率（预留位，当前无调用点）。
+    #[must_use]
+    pub const fn heading_scale(self) -> f32 {
+        self.heading_scale
+    }
+
+    /// 块间额外间距（预留位，当前无调用点）。
+    #[must_use]
+    pub const fn block_spacing(self) -> f32 {
+        self.block_spacing
+    }
+
+    /// 块背景（代码块/引用块）的圆角半径。
+    #[must_use]
+    pub const fn block_corner_radius(self) -> f32 {
+        self.block_corner_radius
+    }
+
+    /// 行内代码 chip 的圆角半径。
+    #[must_use]
+    pub const fn inline_chip_corner_radius(self) -> f32 {
+        self.inline_chip_corner_radius
+    }
+
+    /// 图片圆角半径。
+    #[must_use]
+    pub const fn image_corner_radius(self) -> f32 {
+        self.image_corner_radius
+    }
+
+    /// 内容列宽上限（预留位，当前无调用点）。
+    #[must_use]
+    pub const fn content_column_limit(self) -> f32 {
+        self.content_column_limit
+    }
+}
+
+/// 链接下划线的颜色：链接色压到 80% alpha。压在链接文字底下、不抢正文的
+/// 阅读优先级——全 alpha 的下划线在浅底上比字还重。
+#[must_use]
+const fn link_underline_color(link: Rgba8) -> Rgba8 {
+    Rgba8::new(
+        link.red(),
+        link.green(),
+        link.blue(),
+        (link.alpha() as u16 * 4 / 5) as u8,
+    )
 }
 
 /// 代码高亮的调色板：[`TextRole`] → RGBA。
-///
-/// # 为什么在这一层
-///
-/// 与 `viewport_table_style` / `viewport_block_quote_color` 同一个理由：
-/// **产品选色住在这一层**。装饰产出的是「这是一个关键字」，不是
-/// `#0550AE`——`yu-markdown` 里写死颜色就等于把主题焊进解析层，而
-/// `yu-layout` / `yu-scene` 按不变量 E1 连角色都不该解释。
 ///
 /// # 两份，按外观选
 ///
 /// 第五刀那时这里只有一份写死的浅色，理由是「整个编辑区就是浅色的」——
 /// `macos_render_host_config` 把背景写死成 `Rgba8::white()`，单独给高亮开一条
 /// 深色路会造出「深色的代码配白色的底」。**那条理由现在不成立了**：背景跟着
-/// [`Appearance`] 走，这里也就跟着走。
-///
-/// 每一份都按**自己那块底**挑对比度（浅色 `(245,246,248)`、深色
-/// `(34,38,45)`），不是按纯白或纯黑，也**不是把另一份反相**——反相出来的颜色
-/// 在深底上要么发糊要么刺眼。
+/// [`Appearance`] 走，这里也就跟着走，两份各是 [`Theme::light`] /
+/// [`Theme::dark`] 的一个字段。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CodeRolePalette {
+    keyword: Rgba8,
+    literal: Rgba8,
+    number: Rgba8,
+    comment: Rgba8,
+    function: Rgba8,
+    type_name: Rgba8,
+    constant: Rgba8,
+    operator: Rgba8,
+}
+
+impl CodeRolePalette {
+    /// 浅色那一份，按浅底 `(241,244,248)` 挑对比度。
+    #[must_use]
+    pub const fn light() -> Self {
+        Self {
+            keyword: Rgba8::new(207, 34, 46, 255),
+            literal: Rgba8::new(10, 48, 105, 255),
+            number: Rgba8::new(5, 80, 174, 255),
+            comment: Rgba8::new(110, 119, 129, 255),
+            function: Rgba8::new(130, 80, 223, 255),
+            type_name: Rgba8::new(149, 63, 25, 255),
+            constant: Rgba8::new(5, 80, 174, 255),
+            operator: Rgba8::new(5, 80, 174, 255),
+        }
+    }
+
+    /// 深色那一份**不是把浅色那份反相**。
+    ///
+    /// 反相出来的颜色在深底上要么发糊（低明度的红蓝）要么刺眼（高饱和的紫）。
+    /// 这一份按深色底 `(34,38,45)` 重新挑，取舍与浅色那份一样：正文色由这一帧
+    /// 给（不覆盖），括号与分号不着色。
+    #[must_use]
+    pub const fn dark() -> Self {
+        Self {
+            keyword: Rgba8::new(255, 123, 114, 255),
+            literal: Rgba8::new(165, 214, 255, 255),
+            number: Rgba8::new(121, 192, 255, 255),
+            comment: Rgba8::new(139, 148, 158, 255),
+            function: Rgba8::new(210, 168, 255, 255),
+            type_name: Rgba8::new(255, 166, 87, 255),
+            constant: Rgba8::new(121, 192, 255, 255),
+            operator: Rgba8::new(121, 192, 255, 255),
+        }
+    }
+
+    /// 关键字。
+    #[must_use]
+    pub const fn keyword(self) -> Rgba8 {
+        self.keyword
+    }
+
+    /// 字符串与字符字面量。
+    #[must_use]
+    pub const fn literal(self) -> Rgba8 {
+        self.literal
+    }
+
+    /// 数字字面量。
+    #[must_use]
+    pub const fn number(self) -> Rgba8 {
+        self.number
+    }
+
+    /// 注释。
+    #[must_use]
+    pub const fn comment(self) -> Rgba8 {
+        self.comment
+    }
+
+    /// 函数名与宏名。
+    #[must_use]
+    pub const fn function(self) -> Rgba8 {
+        self.function
+    }
+
+    /// 类型名（`TextRole::Type`，`type` 是关键字，字段名用 `type_name`）。
+    #[must_use]
+    pub const fn type_name(self) -> Rgba8 {
+        self.type_name
+    }
+
+    /// 常量与内置值。
+    #[must_use]
+    pub const fn constant(self) -> Rgba8 {
+        self.constant
+    }
+
+    /// 运算符。
+    #[must_use]
+    pub const fn operator(self) -> Rgba8 {
+        self.operator
+    }
+
+    /// 角色 → 颜色。`Plain` / `Variable` / `Punctuation` 返回 `None`：
+    /// 不着色，正文色由这一帧给（`ViewportRenderConfig::color`）。
+    ///
+    /// `Link` 也返回 `None`：链接色住在 [`Theme`]，由 `Theme::code_role_color`
+    /// 在调色板之前拦截。调色板不认识链接——它只服务代码高亮。
+    ///
+    /// 括号与分号不着色：全部着上之后代码看着像圣诞树，而它们本来就靠形状
+    /// 而不是颜色区分。
+    #[must_use]
+    pub const fn color(self, role: TextRole) -> Option<Rgba8> {
+        match role {
+            TextRole::Plain | TextRole::Variable | TextRole::Punctuation | TextRole::Link => None,
+            TextRole::Keyword => Some(self.keyword),
+            TextRole::Literal => Some(self.literal),
+            TextRole::Number => Some(self.number),
+            TextRole::Comment => Some(self.comment),
+            TextRole::Function => Some(self.function),
+            TextRole::Type => Some(self.type_name),
+            TextRole::Constant => Some(self.constant),
+            TextRole::Operator => Some(self.operator),
+        }
+    }
+}
+
+/// 表格网格的颜色与线宽。产品选色住在这一层，不住在场景层；[`Theme`] 按外观
+/// 收了两份，这个 struct 是那两张表共用的形状。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TableSceneStyle {
+    border_width: f32,
+    border_color: Rgba8,
+    header_fill: Option<Rgba8>,
+    selection_fill: Option<Rgba8>,
+}
+
+impl TableSceneStyle {
+    /// 网格线宽。线宽与颜色分开存：几何归线宽，选色归颜色。
+    #[must_use]
+    pub const fn border_width(self) -> f32 {
+        self.border_width
+    }
+
+    /// 网格线颜色。
+    #[must_use]
+    pub const fn border_color(self) -> Rgba8 {
+        self.border_color
+    }
+
+    /// 表头底色。`None` = 不画。
+    #[must_use]
+    pub const fn header_fill(self) -> Option<Rgba8> {
+        self.header_fill
+    }
+
+    /// 选中格的底色。`None` = 不画。
+    #[must_use]
+    pub const fn selection_fill(self) -> Option<Rgba8> {
+        self.selection_fill
+    }
+}
+
+#[must_use]
+const fn viewport_table_style(appearance: Appearance) -> TableSceneStyle {
+    appearance.theme().table()
+}
+
+/// 代码高亮的调色板：[`TextRole`] → RGBA。数值住在 [`Theme`]，这里只是委托。
 #[must_use]
 const fn viewport_code_role_color(appearance: Appearance, role: TextRole) -> Option<Rgba8> {
-    match appearance {
-        Appearance::Light => light_code_role_color(role),
-        Appearance::Dark => dark_code_role_color(role),
-    }
-}
-
-#[must_use]
-const fn light_code_role_color(role: TextRole) -> Option<Rgba8> {
-    match role {
-        // 正文色由这一帧给（`ViewportRenderConfig::color`），不覆盖。
-        TextRole::Plain | TextRole::Variable => None,
-        TextRole::Keyword => Some(Rgba8::new(207, 34, 46, 255)),
-        TextRole::Literal => Some(Rgba8::new(10, 48, 105, 255)),
-        TextRole::Number => Some(Rgba8::new(5, 80, 174, 255)),
-        TextRole::Comment => Some(Rgba8::new(110, 119, 129, 255)),
-        TextRole::Function => Some(Rgba8::new(130, 80, 223, 255)),
-        TextRole::Type => Some(Rgba8::new(149, 63, 25, 255)),
-        TextRole::Constant => Some(Rgba8::new(5, 80, 174, 255)),
-        TextRole::Operator => Some(Rgba8::new(5, 80, 174, 255)),
-        // 括号与分号不着色：全部着上之后代码看着像圣诞树，而它们本来就靠
-        // 形状而不是颜色区分。
-        TextRole::Punctuation => None,
-    }
-}
-
-/// 深色那一份**不是把浅色那份反相**。
-///
-/// 反相出来的颜色在深底上要么发糊（低明度的红蓝）要么刺眼（高饱和的紫）。
-/// 这一份按深色底 `(34,38,45)` 重新挑，取舍与浅色那份一样：正文色由这一帧
-/// 给（不覆盖），括号与分号不着色。
-#[must_use]
-const fn dark_code_role_color(role: TextRole) -> Option<Rgba8> {
-    match role {
-        TextRole::Plain | TextRole::Variable => None,
-        TextRole::Keyword => Some(Rgba8::new(255, 123, 114, 255)),
-        TextRole::Literal => Some(Rgba8::new(165, 214, 255, 255)),
-        TextRole::Number => Some(Rgba8::new(121, 192, 255, 255)),
-        TextRole::Comment => Some(Rgba8::new(139, 148, 158, 255)),
-        TextRole::Function => Some(Rgba8::new(210, 168, 255, 255)),
-        TextRole::Type => Some(Rgba8::new(255, 166, 87, 255)),
-        TextRole::Constant => Some(Rgba8::new(121, 192, 255, 255)),
-        TextRole::Operator => Some(Rgba8::new(121, 192, 255, 255)),
-        TextRole::Punctuation => None,
-    }
+    appearance.theme().code_role_color(role)
 }
 
 /// 把横线对齐到整逻辑像素。
@@ -386,35 +827,22 @@ fn snap_rule_to_pixel_grid(rect: Rect) -> Result<Rect, ViewportSceneError> {
     )?)
 }
 
-/// 分隔线那条横线的颜色。
-///
-/// 比引用竖条淡一档：竖条标示一整段引文的范围，读者要能一眼看出它管到哪里；
-/// 横线只是一道分隔，画得和正文一样重就喧宾夺主。深色那一份同样不是把浅色
-/// 反相，理由与 [`dark_code_role_color`] 那一条相同。
+/// 分隔线那条横线的颜色。数值住在 [`Theme`]，这里只是委托。
 #[must_use]
 const fn viewport_thematic_break_color(appearance: Appearance) -> Rgba8 {
-    match appearance {
-        Appearance::Light => Rgba8::new(214, 218, 224, 255),
-        Appearance::Dark => Rgba8::new(70, 76, 86, 255),
-    }
+    appearance.theme().thematic_break()
 }
 
+/// 引用竖条的颜色。数值住在 [`Theme`]，这里只是委托。
 #[must_use]
 const fn viewport_block_quote_color(appearance: Appearance) -> Rgba8 {
-    match appearance {
-        Appearance::Light => Rgba8::new(176, 181, 190, 255),
-        Appearance::Dark => Rgba8::new(90, 97, 108, 255),
-    }
+    appearance.theme().quote_bar()
 }
 
-/// 目标解析不出来的图片那个空框。
-///
-/// 比未解码图片的浅灰再深一点：那一种是「还在加载」，这一种是「加载不了」。
+/// 目标解析不出来的图片那个空框。数值住在 [`Theme`]，这里只是委托。
+#[must_use]
 const fn viewport_broken_image_color(appearance: Appearance) -> Rgba8 {
-    match appearance {
-        Appearance::Light => Rgba8::new(198, 203, 212, 255),
-        Appearance::Dark => Rgba8::new(72, 78, 88, 255),
-    }
+    appearance.theme().broken_image()
 }
 
 /// 表格的底色、选中高亮与网格线。
@@ -533,11 +961,16 @@ fn ranges_intersect_or_caret(selection: TextRange, cell: TextRange) -> bool {
 /// `[x]` 是 `Decoration::Replace` 的时候是唯一能做的事——被藏掉的三个字节
 /// 塌成一个点，点上没有宽度可用——代价是方框压在正文的第一个字上。复选框
 /// 成为 widget 之后盒子在排版里占位，画的人不需要、也不许再算第二遍。
+///
+/// 颜色来自 [`Theme`]：边框两态各一个 token，框心/对勾是同一个白。三种颜色
+/// 两种外观共用——现状如此，M1 不替深色另挑一套。
 fn append_task_checkbox(
     ornaments: &mut Vec<OrnamentPrimitive>,
     origin: Point,
+    appearance: Appearance,
     placement: CheckboxPlacement,
 ) -> Result<(), ViewportSceneError> {
+    let theme = appearance.theme();
     let state = placement.state();
     let source = placement.source();
     let bounds = placement.bounds();
@@ -545,8 +978,8 @@ fn append_task_checkbox(
     let x = bounds.x();
     let y = bounds.y();
     let border = match state {
-        TaskState::Todo => Rgba8::new(118, 124, 134, 255),
-        TaskState::Done => Rgba8::new(38, 111, 219, 255),
+        TaskState::Todo => theme.task_todo_border(),
+        TaskState::Done => theme.task_done_border(),
     };
     ornaments.push(OrnamentPrimitive::new(
         source,
@@ -564,7 +997,7 @@ fn append_task_checkbox(
                     LayoutRect::new(x + inset, y + inset, size - inset * 2.0, size - inset * 2.0)?,
                     origin,
                 )?,
-                Rgba8::white(),
+                theme.task_checkbox_fill(),
                 OrnamentRole::Background,
             ));
         }
@@ -582,7 +1015,7 @@ fn append_task_checkbox(
                         )?,
                         origin,
                     )?,
-                    Rgba8::white(),
+                    theme.task_checkbox_fill(),
                     OrnamentRole::Mark,
                 ));
             }
@@ -658,10 +1091,16 @@ fn caret_line_height(layout: &BlockView, line: usize) -> f32 {
 /// 里（`caret_line_height` 的文档写了这件事，caret 一直是对的），于是选区
 /// 与搜索底色在标题、在带 widget 的行上都会画得又矮又靠上——**不报错，只是
 /// 画在文字上方**。这是真实窗口截图抓出来的；在那之前没有任何断言压着它。
+///
+/// `origin_y` 是 `content_origin_y(kind)`：代码块的内容在盒里从上内边距起排，
+/// 块局部坐标折进文档坐标时所有消费方补同一个数（
+/// `EditorDocument::block_box_height` 的反向）。
+#[allow(clippy::too_many_arguments)]
 fn append_visual_span_rects(
     builder: &mut SceneBuilder,
     layout: &BlockView,
     block_y: f32,
+    origin_y: f32,
     layer_source: TextRange,
     visual: VisualRange,
     color: Rgba8,
@@ -692,12 +1131,180 @@ fn append_visual_span_rects(
         if left.is_finite() && right.is_finite() && right > left {
             builder.editor_decoration(EditorDecorationPrimitive::new(
                 layer_source,
-                Rect::new(left, block_y + line.y(), right - left, line.height())?,
+                Rect::new(
+                    left,
+                    block_y + origin_y + line.y(),
+                    right - left,
+                    line.height(),
+                )?,
                 color,
                 role,
             ))?;
         }
     }
+    Ok(())
+}
+
+/// 行内代码 chip 的水平/垂直外扩（pt）。垂直外扩 3pt、水平 7pt：chip 比
+/// 行盒矮一截、比文字宽一圈，Typora 那一路的行内代码衬底比例。
+const INLINE_CODE_CHIP_PADDING_X: f32 = 7.0;
+const INLINE_CODE_CHIP_PADDING_Y: f32 = 3.0;
+
+/// 链接下划线的粗细（pt）。压在基线下面 1pt 处——再往下就离开字了。
+const LINK_UNDERLINE_THICKNESS: f32 = 1.0;
+
+/// 行内 chip 与链接下划线共用的簇分组：把块里满足 `keep` 的簇按「同一行盒 +
+/// x 首尾相接」分组，每组给出 `(行下标, 左缘, 右缘)`。
+///
+/// 与 `append_visual_span_rects` 同为「逐行矩形」思路，但那里按一段源码区间
+/// 收簇，这里按**样式/角色**收：行内代码与链接不是源码区间说了算——嵌套里
+/// 最内层赢家才带着那个样式，同一段源码可能一半在行内代码里、一半不在。
+/// 行盒换行或 x 出现空隙（两段独立的行内代码之间）就断开；空隙容差给半个点，
+/// 同 run 相邻簇的坐标是累加浮点，零头容不下第二个分组。
+fn grouped_cluster_spans(
+    layout: &BlockView,
+    keep: impl Fn(BlockCluster) -> bool,
+) -> Vec<(usize, f32, f32)> {
+    const GAP_TOLERANCE: f32 = 0.5;
+    let mut spans: Vec<(usize, f32, f32)> = Vec::new();
+    for cluster in layout.clusters().iter().copied() {
+        if cluster.is_line_break() || !keep(cluster) {
+            continue;
+        }
+        let right = cluster.x() + cluster.width();
+        match spans.last_mut() {
+            Some(span) if span.0 == cluster.line() && cluster.x() <= span.2 + GAP_TOLERANCE => {
+                span.2 = span.2.max(right);
+            }
+            _ => spans.push((cluster.line(), cluster.x(), right)),
+        }
+    }
+    spans
+}
+
+/// 行内代码 chip：一行里连续的 `Code` 簇垫一块圆角矩形，衬在字形底下。
+///
+/// **代码块不画**——块里每个簇都是 `Code`，chip 会逐行盖在代码块背景上，
+/// 多此一举还难看；chip 是行内代码的待遇，代码块有它自己的背景。
+fn append_inline_code_chips(
+    builder: &mut SceneBuilder,
+    layout: &BlockView,
+    kind: BlockKind,
+    block_y: f32,
+    origin_y: f32,
+    appearance: Appearance,
+) -> Result<(), ViewportSceneError> {
+    if is_code_block(kind) {
+        return Ok(());
+    }
+    let theme = appearance.theme();
+    for (line_index, left, right) in
+        grouped_cluster_spans(layout, |cluster| cluster.style() == TextStyle::Code)
+    {
+        let Some(line) = layout.lines().get(line_index) else {
+            continue;
+        };
+        builder.rounded_fill_rect(
+            Rect::new(
+                left - INLINE_CODE_CHIP_PADDING_X,
+                block_y + origin_y + line.y() - INLINE_CODE_CHIP_PADDING_Y,
+                right - left + 2.0 * INLINE_CODE_CHIP_PADDING_X,
+                line.height() + 2.0 * INLINE_CODE_CHIP_PADDING_Y,
+            )?,
+            theme.inline_chip_corner_radius(),
+            theme.inline_code_background(),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// 链接下划线：链接簇下方 1pt 横线，链接色压到 80% alpha（
+/// [`link_underline_color`]），衬在字形底下、与 chip 同层。
+///
+/// y 取行盒基线 + 1pt：行盒知道基线，这一层不需要字体度量。跨行的链接一段
+/// 一行，断行处自然分成两条——与选区矩形的待遇一致。
+///
+/// 链接身份按**字形**的 `TextRole::Link` 认（簇不背角色），再把字形映射回
+/// 簇取 x 边界——同视觉簇的字形与一一对应，映射丢不了边界。
+fn append_link_underlines(
+    builder: &mut SceneBuilder,
+    layout: &BlockView,
+    block_y: f32,
+    origin_y: f32,
+    appearance: Appearance,
+) -> Result<(), ViewportSceneError> {
+    let link_visuals = layout
+        .glyphs()
+        .iter()
+        .copied()
+        .filter(|glyph| glyph.role() == TextRole::Link)
+        .map(|glyph| glyph.visual())
+        .collect::<Vec<_>>();
+    if link_visuals.is_empty() {
+        return Ok(());
+    }
+    let color = link_underline_color(appearance.theme().link_color());
+    for (line_index, left, right) in
+        grouped_cluster_spans(layout, |cluster| link_visuals.contains(&cluster.visual()))
+    {
+        let Some(line) = layout.lines().get(line_index) else {
+            continue;
+        };
+        builder.fill_rect(
+            Rect::new(
+                left,
+                block_y + origin_y + line.y() + line.baseline() + 1.0,
+                right - left,
+                LINK_UNDERLINE_THICKNESS,
+            )?,
+            color,
+        )?;
+    }
+    Ok(())
+}
+
+/// 块背景（代码灰底、引用蓝底）：内容列宽 ×（内容高 + 2×垂直内边距），块空间
+/// x 从 0（列左缘）起——水平内边距已由断行收窄 + 内容右移让出来（
+/// `layout_tokens::box_layout_config`），按 M3 的 helper 原样画就是「文字离
+/// 背景边正好一个内边距」。圆角、无阴影；色经 [`viewport_block_background`]
+/// 选，`BlockKind` → token 的映射仍住在那一处。
+///
+/// 不再走 `ViewportBlockContent::with_fill` 那条「铺满视口宽的直角矩形」老路：
+/// 几何住在场景层，而内容列几何（列宽、内边距、内容高）只有这一层拼得出来。
+/// damage 走 `RoundedFillRect` 的 `damage_bounds`（无阴影时退化为几何 bounds）。
+///
+/// `origin` 是这一块左上角在文档里的位置。
+fn append_block_background(
+    builder: &mut SceneBuilder,
+    kind: BlockKind,
+    layout: &BlockView,
+    column_width: f32,
+    origin: Point,
+    appearance: Appearance,
+) -> Result<(), ViewportSceneError> {
+    let Some(color) = viewport_block_background(appearance, kind) else {
+        return Ok(());
+    };
+    // 引用块没有垂直内边距、代码块上下各 5pt——两个 helper 同一刀交付，
+    // 几何口径见 `layout_tokens`。
+    let background = if is_code_block(kind) {
+        code_block_background_rect(column_width, layout.height())
+    } else {
+        quote_block_background_rect(column_width, layout.height())
+    }
+    .map_err(EditorDocumentError::from)?;
+    // 内容高为零的退化块（空的引用）不衬底：高非正是几何错误，跳过这一块
+    // 比整帧失败便宜。
+    if background.height() <= 0.0 {
+        return Ok(());
+    }
+    builder.rounded_fill_rect(
+        translate_block_rect(background, origin)?,
+        appearance.theme().block_corner_radius(),
+        color,
+        None,
+    )?;
     Ok(())
 }
 
@@ -759,6 +1366,7 @@ fn append_search_highlights(
     document: &EditorDocument,
     input: &ViewportSceneInput,
     layouts: &[BlockView],
+    content_origins: &[f32],
     style: EditorDecorationStyle,
     layer: SearchHighlightLayer,
 ) -> Result<(), ViewportSceneError> {
@@ -783,7 +1391,13 @@ fn append_search_highlights(
     // 由导航必然更新的那条路带着走。
     let selections = document.selections();
     let current = search.current(document.selections().primary().ordered_range());
-    for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
+    for ((geometry, layout), origin_y) in input
+        .blocks()
+        .iter()
+        .copied()
+        .zip(layouts.iter())
+        .zip(content_origins.iter().copied())
+    {
         let block = geometry.source();
         // 匹配按文档顺序，二分给出「起点 < 块尾」的上界；跨进这个块的那一条
         // 起点可能更靠前，所以下界给不出来，从头过滤。与
@@ -836,7 +1450,16 @@ fn append_search_highlights(
             if layer.wants(role) != Some(true) {
                 continue;
             }
-            append_visual_span_rects(builder, layout, geometry.y(), source, visual, color, role)?;
+            append_visual_span_rects(
+                builder,
+                layout,
+                geometry.y(),
+                origin_y,
+                source,
+                visual,
+                color,
+                role,
+            )?;
         }
     }
     Ok(())
@@ -856,6 +1479,7 @@ fn append_editor_decorations(
     document: &EditorDocument,
     input: &ViewportSceneInput,
     layouts: &[BlockView],
+    content_origins: &[f32],
     style: EditorDecorationStyle,
 ) -> Result<(), ViewportSceneError> {
     if !style.caret_width.is_finite() || style.caret_width <= 0.0 {
@@ -891,12 +1515,19 @@ fn append_editor_decorations(
         document,
         input,
         layouts,
+        content_origins,
         style,
         SearchHighlightLayer::UnderSelection,
     )?;
 
     let mut carets: Vec<PendingCaret> = Vec::new();
-    for (geometry, layout) in input.blocks().iter().copied().zip(layouts.iter()) {
+    for ((geometry, layout), origin_y) in input
+        .blocks()
+        .iter()
+        .copied()
+        .zip(layouts.iter())
+        .zip(content_origins.iter().copied())
+    {
         if let Some(overlay) = composition {
             // 组字期间选区已经塌回一条（`EditorDocument::begin_composition`），
             // 所以这条路仍然是单数的。
@@ -914,7 +1545,7 @@ fn append_editor_decorations(
                         source: TextRange::empty(overlay.replacement_range().start()),
                         caret: layout_caret,
                         role: EditorDecorationPrimitiveRole::CompositionCaret,
-                        block_y: geometry.y(),
+                        block_y: geometry.y() + origin_y,
                         line_height: layout.config().line_height(),
                     });
                 }
@@ -928,7 +1559,7 @@ fn append_editor_decorations(
                     source: TextRange::empty(overlay.replacement_range().start()),
                     caret: layout_caret,
                     role: EditorDecorationPrimitiveRole::CompositionCaret,
-                    block_y: geometry.y(),
+                    block_y: geometry.y() + origin_y,
                     line_height: caret_line_height(layout, layout_caret.line()),
                 });
             }
@@ -937,6 +1568,7 @@ fn append_editor_decorations(
                     builder,
                     layout,
                     geometry.y(),
+                    origin_y,
                     overlay.replacement_range(),
                     visual,
                     style.selection,
@@ -962,7 +1594,7 @@ fn append_editor_decorations(
                     source: TextRange::empty(selection.focus()),
                     caret: layout_caret,
                     role: EditorDecorationPrimitiveRole::Caret,
-                    block_y: geometry.y(),
+                    block_y: geometry.y() + origin_y,
                     line_height: caret_line_height(layout, layout_caret.line()),
                 });
             }
@@ -990,6 +1622,7 @@ fn append_editor_decorations(
                     builder,
                     layout,
                     geometry.y(),
+                    origin_y,
                     source,
                     visual,
                     style.selection,
@@ -1006,6 +1639,7 @@ fn append_editor_decorations(
         document,
         input,
         layouts,
+        content_origins,
         style,
         SearchHighlightLayer::OverSelection,
     )?;
@@ -1976,6 +2610,15 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     // 露出下层视图，而 TextKit fallback 删除后下层已不再绘制任何东西
     // （不变量 I5）。放在最前面也保证它位于所有内容之下。
     builder.fill_rect(scene_viewport, background)?;
+    // 每个可见块的内容原点（`content_origin_y`）：代码块的内容在盒里从上内
+    // 边距起排，glyph/caret/选区/搜索高亮把块局部坐标折进文档坐标时都要补这
+    // 同一个数——与 `EditorDocument::block_box_height` 折块高时加在内容上方
+    // 的那 5pt 互为反向。
+    let content_origins = viewport_snapshot
+        .blocks()
+        .iter()
+        .map(|block| content_origin_y(block.kind()))
+        .collect::<Vec<_>>();
     // 每个可见块的装饰、字形与图片，全部搬到文档坐标之后交给场景层。
     // 「这些装饰是什么语法」到这里为止：场景层只看见矩形与角色。
     let mut ornaments = Vec::with_capacity(layouts.len());
@@ -1983,9 +2626,35 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     let mut images = Vec::with_capacity(layouts.len());
     let mut glyphs = Vec::with_capacity(layouts.len());
     let mut tables = Vec::new();
-    for (block, layout) in viewport_snapshot.blocks().iter().zip(layouts.iter()) {
+    for ((block, layout), content_origin) in viewport_snapshot
+        .blocks()
+        .iter()
+        .zip(layouts.iter())
+        .zip(content_origins.iter().copied())
+    {
         let origin = Point::new(0.0, block.y());
         let mut block_ornaments = Vec::new();
+        // 块背景（代码灰底、引用蓝底）：列宽圆角矩形，衬在这一块所有内容底下。
+        // 先于装饰发出——画家顺序上背景必须在引用竖条、表格网格之下。
+        append_block_background(
+            &mut builder,
+            block.kind(),
+            layout,
+            config.max_width(),
+            origin,
+            appearance,
+        )?;
+        // 行内代码 chip 与链接下划线同样衬在字形底下；chip 必须在代码块背景
+        // 之上（引用块里的行内代码压在引用蓝底上），所以排在块背景之后。
+        append_inline_code_chips(
+            &mut builder,
+            layout,
+            block.kind(),
+            block.y(),
+            content_origin,
+            appearance,
+        )?;
+        append_link_underlines(&mut builder, layout, block.y(), content_origin, appearance)?;
         if let Some(table) = layout.table() {
             tables.push(ViewportTableGeometry::from_layout(
                 block.index(),
@@ -2041,7 +2710,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         // 而标记问不出来」的错误路径。
         let mut block_overlays = Vec::new();
         for placement in layout.checkboxes() {
-            append_task_checkbox(&mut block_overlays, origin, *placement)?;
+            append_task_checkbox(&mut block_overlays, origin, appearance, *placement)?;
         }
         overlays.push(block_overlays);
 
@@ -2079,11 +2748,15 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                 ));
                 continue;
             };
-            block_images.push(ImagePrimitive::new(
-                key.fingerprint(),
-                translate_block_rect(placement.bounds(), origin)?,
-                Rgba8::new(232, 234, 238, 255),
-            ));
+            block_images.push(
+                ImagePrimitive::new(
+                    key.fingerprint(),
+                    translate_block_rect(placement.bounds(), origin)?,
+                    appearance.theme().image_fallback(),
+                )
+                // 产品选角住在 Theme（M4）：图片与块背景同档的 8pt 圆角。
+                .with_corner_radius(appearance.theme().image_corner_radius()),
+            );
         }
         ornaments.push(block_ornaments);
         images.push(block_images);
@@ -2097,7 +2770,11 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                     let scene_glyph = SceneGlyph::new(
                         glyph.face(),
                         glyph.glyph(),
-                        glyph.origin(),
+                        // 内容原点折进字形位置：代码块里第一行文字的基线比
+                        // 盒顶低一个上内边距（`block_box_height` 折块高时把它
+                        // 加在了内容上方）。漏掉它，代码块里的字整体上移 5pt，
+                        // 不报错。
+                        LayoutPoint::new(glyph.origin().x(), glyph.origin().y() + content_origin),
                         glyph.size_scale(),
                     );
                     // 「这个字什么颜色」到这里为止：场景层拿到的是 RGBA，
@@ -2116,7 +2793,6 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         .enumerate()
         .map(|(offset, block)| {
             ViewportBlockContent::new(revision, block.source(), &glyphs[offset])
-                .with_fill(viewport_block_background(appearance, block.kind()))
                 .with_ornaments(&ornaments[offset])
                 .with_images(&images[offset])
                 .with_overlays(&overlays[offset])
@@ -2153,7 +2829,14 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     if let Some(style) = editor_decorations {
         // 搜索底色的两层夹着选区，次序归 `append_editor_decorations` 排——
         // caret 是它的末尾一层，拆出来排会把 caret 盖掉。
-        append_editor_decorations(&mut builder, document, &input, &layouts, style)?;
+        append_editor_decorations(
+            &mut builder,
+            document,
+            &input,
+            &layouts,
+            &content_origins,
+            style,
+        )?;
     }
     Ok(ViewportSceneFrame {
         input,
@@ -2472,7 +3155,9 @@ mod tests {
     fn thematic_break_lowers_to_a_source_backed_rule_across_the_text_column() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportSpan::new(0.0, 120.0);
+        // 正文行高 1.6（M3 起）之后这一块之前的内容超过 120pt——视口放大到
+        // 240，分隔线块才进得了可见范围。这是测试视口的问题，不是产品的问题。
+        let viewport = ViewportSpan::new(0.0, 240.0);
         let source = "para\n\n---\n";
         let mut document = EditorDocument::new(source);
         document
@@ -2488,7 +3173,7 @@ mod tests {
             viewport,
             &shaper,
             font_size,
-            Rect::new(0.0, 0.0, 240.0, 120.0).expect("scene viewport"),
+            Rect::new(0.0, 0.0, 240.0, 240.0).expect("scene viewport"),
             &atlas,
             Rgba8::black(),
         )
@@ -2556,6 +3241,188 @@ mod tests {
         }
     }
 
+    /// M1 的判据：两张主题表的每一个数值都是现状的原文搬迁。
+    ///
+    /// 把两种外观的全部产品颜色逐个点名——M3/M4 改视觉时，这里留下的 diff
+    /// 就是设计稿，而不是「什么时候动的数值」。
+    #[test]
+    fn theme_tables_pin_every_product_color() {
+        let light = Theme::light();
+        assert_eq!(light.background(), Rgba8::new(248, 249, 251, 255));
+        assert_eq!(light.text(), Rgba8::new(32, 36, 43, 255));
+        assert_eq!(
+            light.editor_decorations(),
+            EditorDecorationStyle::new(
+                Rgba8::new(0, 122, 255, 97),
+                Rgba8::black(),
+                Rgba8::new(0, 122, 255, 255),
+                1.0,
+            )
+            .with_search(Rgba8::new(255, 214, 10, 120), Rgba8::new(255, 149, 0, 140))
+        );
+        assert_eq!(
+            light.code_block_background(),
+            Rgba8::new(241, 244, 248, 255)
+        );
+        assert_eq!(
+            light.quote_block_background(),
+            Rgba8::new(239, 246, 255, 255)
+        );
+        assert_eq!(light.quote_bar(), Rgba8::new(176, 181, 190, 255));
+        assert_eq!(light.table().border_width(), 1.0);
+        assert_eq!(light.table().border_color(), Rgba8::new(190, 195, 205, 255));
+        assert_eq!(
+            light.table().header_fill(),
+            Some(Rgba8::new(248, 249, 251, 255))
+        );
+        assert_eq!(
+            light.table().selection_fill(),
+            Some(Rgba8::new(210, 225, 255, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Keyword),
+            Some(Rgba8::new(207, 34, 46, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Literal),
+            Some(Rgba8::new(10, 48, 105, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Number),
+            Some(Rgba8::new(5, 80, 174, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Comment),
+            Some(Rgba8::new(110, 119, 129, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Function),
+            Some(Rgba8::new(130, 80, 223, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Type),
+            Some(Rgba8::new(149, 63, 25, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Constant),
+            Some(Rgba8::new(5, 80, 174, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Operator),
+            Some(Rgba8::new(5, 80, 174, 255))
+        );
+        assert_eq!(light.code_role_color(TextRole::Plain), None);
+        assert_eq!(light.code_role_color(TextRole::Variable), None);
+        assert_eq!(light.code_role_color(TextRole::Punctuation), None);
+        // 链接色在调色板之前由 Theme 拦截，不经代码高亮那份表。
+        assert_eq!(
+            light.code_role_color(TextRole::Link),
+            Some(Rgba8::new(40, 120, 212, 255))
+        );
+        assert_eq!(light.thematic_break(), Rgba8::new(214, 218, 224, 255));
+        assert_eq!(light.broken_image(), Rgba8::new(198, 203, 212, 255));
+        assert_eq!(light.image_fallback(), Rgba8::new(232, 234, 238, 255));
+        assert_eq!(light.task_todo_border(), Rgba8::new(118, 124, 134, 255));
+        assert_eq!(light.task_done_border(), Rgba8::new(38, 111, 219, 255));
+        assert_eq!(light.task_checkbox_fill(), Rgba8::white());
+        assert_eq!(light.link_color(), Rgba8::new(40, 120, 212, 255));
+        assert_eq!(
+            light.inline_code_background(),
+            Rgba8::new(241, 244, 247, 255)
+        );
+
+        let dark = Theme::dark();
+        assert_eq!(dark.background(), Rgba8::new(30, 30, 32, 255));
+        assert_eq!(dark.text(), Rgba8::new(233, 233, 236, 255));
+        assert_eq!(
+            dark.editor_decorations(),
+            EditorDecorationStyle::new(
+                Rgba8::new(10, 132, 255, 130),
+                Rgba8::new(233, 233, 236, 255),
+                Rgba8::new(10, 132, 255, 255),
+                1.0,
+            )
+            .with_search(Rgba8::new(255, 214, 10, 90), Rgba8::new(255, 159, 10, 130))
+        );
+        assert_eq!(dark.code_block_background(), Rgba8::new(34, 38, 45, 255));
+        assert_eq!(dark.quote_block_background(), Rgba8::new(36, 45, 58, 255));
+        assert_eq!(dark.quote_bar(), Rgba8::new(90, 97, 108, 255));
+        assert_eq!(dark.table().border_width(), 1.0);
+        assert_eq!(dark.table().border_color(), Rgba8::new(75, 81, 92, 255));
+        assert_eq!(
+            dark.table().header_fill(),
+            Some(Rgba8::new(40, 44, 52, 255))
+        );
+        assert_eq!(
+            dark.table().selection_fill(),
+            Some(Rgba8::new(38, 66, 110, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Keyword),
+            Some(Rgba8::new(255, 123, 114, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Literal),
+            Some(Rgba8::new(165, 214, 255, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Number),
+            Some(Rgba8::new(121, 192, 255, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Comment),
+            Some(Rgba8::new(139, 148, 158, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Function),
+            Some(Rgba8::new(210, 168, 255, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Type),
+            Some(Rgba8::new(255, 166, 87, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Constant),
+            Some(Rgba8::new(121, 192, 255, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Operator),
+            Some(Rgba8::new(121, 192, 255, 255))
+        );
+        assert_eq!(dark.code_role_color(TextRole::Plain), None);
+        assert_eq!(dark.code_role_color(TextRole::Variable), None);
+        assert_eq!(dark.code_role_color(TextRole::Punctuation), None);
+        assert_eq!(
+            dark.code_role_color(TextRole::Link),
+            Some(Rgba8::new(106, 176, 255, 255))
+        );
+        assert_eq!(dark.thematic_break(), Rgba8::new(70, 76, 86, 255));
+        assert_eq!(dark.broken_image(), Rgba8::new(72, 78, 88, 255));
+        assert_eq!(dark.image_fallback(), Rgba8::new(232, 234, 238, 255));
+        assert_eq!(dark.task_todo_border(), Rgba8::new(118, 124, 134, 255));
+        assert_eq!(dark.task_done_border(), Rgba8::new(38, 111, 219, 255));
+        assert_eq!(dark.task_checkbox_fill(), Rgba8::white());
+        assert_eq!(dark.link_color(), Rgba8::new(106, 176, 255, 255));
+        assert_eq!(dark.inline_code_background(), Rgba8::new(42, 46, 53, 255));
+
+        // 跨 ABI 进来的事实与表之间只隔 theme() 这一道门，门必须选对表。
+        assert_eq!(Appearance::Light.theme(), light);
+        assert_eq!(Appearance::Dark.theme(), dark);
+
+        // 圆角 token（M4）已拆实接线：块背景、行内 chip、图片各一个用途常量，
+        // 两种外观共用同一份。其余排版字段仍是「不改变现状」的中性预留位。
+        for theme in [light, dark] {
+            assert_eq!(theme.body_font_size(), 17.0);
+            assert_eq!(theme.line_height_ratio(), 1.0);
+            assert_eq!(theme.heading_scale(), 1.0);
+            assert_eq!(theme.block_spacing(), 0.0);
+            assert_eq!(theme.block_corner_radius(), 8.0);
+            assert_eq!(theme.inline_chip_corner_radius(), 5.0);
+            assert_eq!(theme.image_corner_radius(), 8.0);
+            assert_eq!(theme.content_column_limit(), 860.0);
+        }
+    }
+
     /// 缩进代码块与围栏共用同一块底色。
     ///
     /// 两块底色一旦各挑一种，同一份文档里换个写法就换个颜色——而它们是同一
@@ -2609,11 +3476,14 @@ mod tests {
 
         let background = viewport_block_background(Appearance::Light, BlockKind::IndentedCode)
             .expect("缩进代码块有底色");
-        // 第一个 `FillRect` 是整帧背景（不变量 I5），代码块那一块排在它后面。
+        // 第一个 `FillRect` 是整帧背景（不变量 I5），代码块那一块排在它后面——
+        // M4 起块背景是列宽圆角矩形（`RoundedFillRect`），不再是铺满视口的
+        // 直角 `FillRect`。
         assert!(
             frame.scene().primitives().iter().any(|primitive| matches!(
                 primitive,
-                Primitive::FillRect { color, .. } if *color == background
+                Primitive::RoundedFillRect { color, radius, shadow: None, .. }
+                    if *color == background && *radius == Theme::light().block_corner_radius()
             )),
             "缩进代码块的底色必须真的进了这一帧"
         );
@@ -3528,6 +4398,7 @@ mod tests {
             .find_map(|primitive| match primitive {
                 Primitive::Image(image) => Some(*image),
                 Primitive::FillRect { .. }
+                | Primitive::RoundedFillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
                 | Primitive::Ornament(_)
@@ -3536,6 +4407,8 @@ mod tests {
             .expect("image primitive");
         assert_eq!(image.bounds().width(), 200.0);
         assert_eq!(image.bounds().height(), 100.0);
+        // M4：图片圆角住在 Theme，与块背景同档（8pt）。
+        assert_eq!(image.corner_radius(), Theme::light().image_corner_radius());
         assert!(frame.input().content_height() >= 100.0);
 
         let metadata_only = assemble_viewport_scene_with_images_and_intrinsics(
@@ -3557,6 +4430,7 @@ mod tests {
             .find_map(|primitive| match primitive {
                 Primitive::Image(image) => Some(*image),
                 Primitive::FillRect { .. }
+                | Primitive::RoundedFillRect { .. }
                 | Primitive::Glyph(_)
                 | Primitive::EmbeddedSvg(_)
                 | Primitive::Ornament(_)
@@ -3812,25 +4686,44 @@ mod tests {
         let Some((first, rest)) = primitives.split_first() else {
             panic!("code block scene should carry its own fill");
         };
+        // M4 起块背景是**列宽圆角矩形**：宽 = 内容列宽（断行宽度 + 两侧水平
+        // 内边距），高 = 内容高 + 上下内边距，块从 y=0 起画。
         match first {
-            Primitive::FillRect { bounds, color } => {
-                assert_eq!(*color, Rgba8::new(245, 246, 248, 255));
+            Primitive::RoundedFillRect {
+                bounds,
+                radius,
+                color,
+                shadow,
+            } => {
+                assert!(shadow.is_none(), "块背景不带阴影");
+                assert_eq!(*color, Rgba8::new(241, 244, 248, 255));
                 assert_eq!(bounds.x(), 0.0);
                 assert_eq!(bounds.y(), 0.0);
                 assert_eq!(bounds.width(), 240.0);
                 assert!(bounds.height() > 0.0);
+                assert_eq!(*radius, Theme::light().block_corner_radius());
             }
             Primitive::Glyph(_)
             | Primitive::Image(_)
+            | Primitive::FillRect { .. }
             | Primitive::EmbeddedSvg(_)
             | Primitive::Ornament(_)
             | Primitive::EditorDecoration(_) => {
                 panic!("code block background must precede glyphs")
             }
         }
+        // 内容原点折进了字形位置：代码块第一行的基线比块顶低一个上内边距。
+        let first_glyph = rest
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::Glyph(glyph) => Some(*glyph),
+                _ => None,
+            })
+            .expect("code block scene carries glyphs");
         assert!(
-            rest.iter()
-                .any(|primitive| matches!(primitive, Primitive::Glyph(_)))
+            first_glyph.origin().y() >= content_origin_y(BlockKind::IndentedCode),
+            "代码块字形必须下移内容原点，实际 y = {}",
+            first_glyph.origin().y()
         );
         assert!(matches!(
             frame.plan().commands().first(),
@@ -3842,6 +4735,318 @@ mod tests {
                 .commands()
                 .iter()
                 .any(|command| matches!(command, yu_render::RenderCommand::Glyph { .. }))
+        );
+    }
+
+    /// 行内代码 chip：连续 `Code` 簇垫一块圆角矩形（外扩 3pt 垂直 / 7pt 水平、
+    /// radius 5、Theme 的 chip 色），衬在字形底下；两块不相邻的行内代码是两块
+    /// chip；代码块里**不**画 chip。
+    #[test]
+    fn inline_code_spans_become_rounded_chips_under_glyphs() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 160.0);
+        let mut document = EditorDocument::new("para `one` mid `two` tail\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("chip frame");
+
+        let theme = Theme::light();
+        let chips = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::RoundedFillRect {
+                    bounds,
+                    radius,
+                    color,
+                    ..
+                } if *color == theme.inline_code_background() => Some((*bounds, *radius)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chips.len(), 2, "两段行内代码 = 两块 chip：{chips:?}");
+        for (bounds, radius) in chips {
+            assert_eq!(radius, theme.inline_chip_corner_radius());
+            // mock shaper 每个 grapheme 7pt 宽：3 字 + 2×7pt 水平外扩 = 35。
+            assert_eq!(bounds.width(), 3.0 * 7.0 + 2.0 * INLINE_CODE_CHIP_PADDING_X);
+            // 行盒 32pt（20 × 1.6）+ 2×3pt 垂直外扩。
+            assert_eq!(bounds.height(), 32.0 + 2.0 * INLINE_CODE_CHIP_PADDING_Y);
+        }
+        // chip 衬在字形底下：第一个 chip 的位置在第一个 glyph 之前。
+        let first_chip = frame
+            .scene()
+            .primitives()
+            .iter()
+            .position(|primitive| {
+                matches!(
+                    primitive,
+                    Primitive::RoundedFillRect { color, .. }
+                        if *color == theme.inline_code_background()
+                )
+            })
+            .expect("chip primitive");
+        let first_glyph = frame
+            .scene()
+            .primitives()
+            .iter()
+            .position(|primitive| matches!(primitive, Primitive::Glyph(_)))
+            .expect("glyph primitive");
+        assert!(first_chip < first_glyph);
+
+        // 代码块里没有 chip：每个簇都是 `Code`，chip 只服务行内代码。
+        let mut code_document = EditorDocument::new("```\nbody\n```\n");
+        code_document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut code_document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut code_document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("code frame");
+        assert!(
+            frame.scene().primitives().iter().all(|primitive| !matches!(
+                primitive,
+                Primitive::RoundedFillRect { color, .. }
+                    if *color == theme.inline_code_background()
+            )),
+            "代码块里不该有行内代码 chip"
+        );
+    }
+
+    /// 链接文字：`TextRole::Link` 着 Theme 的链接色，run 下方压一条 1pt、
+    /// 80% alpha 的下划线，都在字形底下。未解析的引用式链接不是链接，两样都没有。
+    #[test]
+    fn link_text_is_colored_and_underlined_below_the_glyphs() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 160.0);
+        let mut document = EditorDocument::new("see [text](url) here\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("link frame");
+
+        let theme = Theme::light();
+        // 链接字形着链接色。
+        assert!(
+            frame.scene().primitives().iter().any(|primitive| matches!(
+                primitive,
+                Primitive::Glyph(glyph) if glyph.color() == theme.link_color()
+            )),
+            "链接文字该着链接色 {:?}",
+            theme.link_color()
+        );
+        // 下划线：1pt 高、链接色 80% alpha、宽 = 4 个 grapheme × 7pt。
+        let underlines = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::FillRect { bounds, color } => Some((*bounds, *color)),
+                _ => None,
+            })
+            .filter(|(_, color)| *color == link_underline_color(theme.link_color()))
+            .collect::<Vec<_>>();
+        assert_eq!(underlines.len(), 1, "一段链接 = 一条下划线：{underlines:?}");
+        let (bounds, color) = underlines[0];
+        assert_eq!(
+            color.alpha(),
+            (theme.link_color().alpha() as u16 * 4 / 5) as u8
+        );
+        assert_eq!(bounds.height(), LINK_UNDERLINE_THICKNESS);
+        assert_eq!(bounds.width(), 4.0 * 7.0);
+        // 下划线在字形底下：它的位置在第一个链接 glyph 之前。
+        let underline_index = frame
+            .scene()
+            .primitives()
+            .iter()
+            .position(|primitive| {
+                matches!(
+                    primitive,
+                    Primitive::FillRect { color, .. }
+                        if *color == link_underline_color(theme.link_color())
+                )
+            })
+            .expect("underline primitive");
+        let first_link_glyph = frame
+            .scene()
+            .primitives()
+            .iter()
+            .position(|primitive| {
+                matches!(
+                    primitive,
+                    Primitive::Glyph(glyph) if glyph.color() == theme.link_color()
+                )
+            })
+            .expect("link glyph");
+        assert!(underline_index < first_link_glyph);
+    }
+
+    /// 引用块背景：列宽圆角矩形，**高就是内容高**——折进块高贡献的段间距不属于
+    /// 背景。这一点正是老 `with_fill`（铺满视口、高含间距）做不到、换
+    /// `RoundedFillRect` 的原因。
+    #[test]
+    fn quote_background_covers_the_column_at_content_height() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 200.0);
+        let mut document = EditorDocument::new("> quoted\n\npara\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 200.0).expect("scene viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("quote frame");
+
+        let theme = Theme::light();
+        let background = frame
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::RoundedFillRect {
+                    bounds,
+                    radius,
+                    color,
+                    shadow: None,
+                } if *color == theme.quote_block_background() => Some((*bounds, *radius)),
+                _ => None,
+            })
+            .expect("引用块背景");
+        let (bounds, radius) = background;
+        assert_eq!(radius, theme.block_corner_radius());
+        assert_eq!(bounds.x(), 0.0);
+        assert_eq!(bounds.y(), 0.0);
+        assert_eq!(bounds.width(), 240.0, "背景铺满内容列");
+        // 内容两个行盒（文字行 + 块尾换行符行盒）2 × 32pt（20 × 1.6）；
+        // 引用块高里还折着到段落的缝（0.6 行），那一段不属于背景。
+        assert_eq!(bounds.height(), 2.0 * 32.0, "引用背景没有垂直内边距");
+        let quote_block = frame.input().blocks()[0];
+        assert!(
+            quote_block.height() > bounds.height(),
+            "折进块高的段间距不该画进背景"
+        );
+    }
+
+    /// 代码块里的 caret 吃内容原点：块局部坐标（caret 点）折进文档坐标时补
+    /// `content_origin_y`——与 `EditorDocument::caret_scroll_request` 的换算
+    /// 是同一个数，两边对不上时滚动目标与画出来的光标就差 5pt。
+    #[test]
+    fn caret_in_a_code_block_sits_below_the_top_padding() {
+        let font_size = 14.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 160.0);
+        let mut document = EditorDocument::new("```\nbody\n```\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 20.0),
+                20.0,
+                0.0,
+            ))
+            .expect("viewport config");
+        // 光标落在代码第一行的行首（源码偏移 4）。
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &document.snapshot(),
+                    ByteOffset::new(4),
+                    CaretAffinity::Downstream,
+                )
+                .expect("caret selection"),
+            )
+            .expect("set selection");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 160.0).expect("scene viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        ));
+        let frame = assemble_viewport_render_frame(
+            &mut document,
+            config,
+            &shaper,
+            &atlas,
+            &mut RenderPlanBuilder::new(),
+        )
+        .expect("code caret frame");
+        let caret = frame
+            .scene()
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::EditorDecoration(decoration)
+                    if decoration.role() == EditorDecorationPrimitiveRole::Caret =>
+                {
+                    Some(*decoration)
+                }
+                _ => None,
+            })
+            .expect("caret decoration");
+        // 块 y（0）+ 内容原点（5）+ 行内偏移（0）。
+        assert_eq!(
+            caret.bounds().y(),
+            content_origin_y(BlockKind::IndentedCode)
         );
     }
 
@@ -3935,8 +5140,8 @@ mod tests {
             .clone();
         let table = canonical.table().expect("table metadata");
         let divider = table.bounds().x() + table.column_widths()[0];
-        let hover_geometry =
-            ViewportTableGeometry::from_layout(0, 137.0, table).expect("document-space hover geometry");
+        let hover_geometry = ViewportTableGeometry::from_layout(0, 137.0, table)
+            .expect("document-space hover geometry");
         for tolerance in [0.0, 6.4] {
             for x in [
                 divider - tolerance - 0.01,
@@ -3974,8 +5179,8 @@ mod tests {
             .resize_hit_test(LayoutPoint::new(divider, 0.5), 0.0)
             .expect("divider hit-test")
             .expect("column divider");
-        let mut gesture =
-            TableResizeGesture::begin(canonical.revision(), 0, hit, divider).expect("resize gesture");
+        let mut gesture = TableResizeGesture::begin(canonical.revision(), 0, hit, divider)
+            .expect("resize gesture");
         gesture
             .update(canonical.revision(), divider + 1.0)
             .expect("resize update");
@@ -4003,7 +5208,9 @@ mod tests {
         assert_eq!(geometry.block_index(), 0);
         assert_eq!(geometry.source(), table.source_range());
         assert_eq!(geometry.column_widths().len(), 2);
-        assert!((geometry.bounds().x() + geometry.column_widths()[0] - expected_divider).abs() < 0.001);
+        assert!(
+            (geometry.bounds().x() + geometry.column_widths()[0] - expected_divider).abs() < 0.001
+        );
         assert!((geometry.bounds().height() - table.bounds().height()).abs() < 0.001);
         assert!((8.0..=16.0).contains(&geometry.adjust_step()));
         assert!(frame.scene().scene().primitives().iter().any(|primitive| {
@@ -4300,7 +5507,10 @@ mod tests {
     fn every_parser_block_kind_produces_renderable_glyphs() {
         let font_size = 14.0;
         let shaper = shaper(font_size);
-        let viewport = ViewportSpan::new(0.0, 900.0);
+        // 盒模型折进块高（段间距/内边距）之后 9 块总高超 900pt；视口取 2400
+        // 只为让全部 block kind 同屏，好让这条「每个 kind 都画得出」的断言
+        // 真正覆盖它声称的范围。
+        let viewport = ViewportSpan::new(0.0, 2400.0);
         let source = concat!(
             "# heading\n",
             "\n",
@@ -4335,7 +5545,7 @@ mod tests {
             viewport,
             &shaper,
             font_size,
-            Rect::new(0.0, 0.0, 240.0, 900.0).expect("scene viewport"),
+            Rect::new(0.0, 0.0, 240.0, 2400.0).expect("scene viewport"),
             &atlas,
             Rgba8::black(),
         )

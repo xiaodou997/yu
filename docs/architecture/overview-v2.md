@@ -146,7 +146,8 @@ v2:  每种 Markdown 语法 →  一组 Decoration（数据），进入同一个
                     └───────────────────┬──────────────────────────┘
                                         │ Rust → Rust，无 C ABI
    ┌────────────────────────────────────▼───────────────────────────────────┐
-   │ yu-render     RenderPlan：Glyph / FillRect / Texture / Quad（永久冻结）  │
+   │ yu-render     RenderPlan：FillRect / RoundedFillRect / Glyph / Image /  │
+   │               EmbeddedSvg（变体集合冻结，见 invariants.md E3）          │
    │ yu-scene      retained primitives + damage 追踪                         │
    │ yu-layout     行盒 / widget 盒 / UAX#14 断行 / UAX#9 bidi / hit-test    │
    │               输入只有 StyledRun + Widget + LineStyle                   │
@@ -789,7 +790,8 @@ UAX #9 bidi、CJK 禁则、widget 盒模型（intrinsic size + baseline 对齐�
 `BlockView` 在拿到结果之后向 `Projection` 问源码区间，自己不算。
 
 `yu-scene` 的输入是 `SceneGlyph`（字面 / 字形 id / block 局部原点 / 字号
-倍率）与 `ViewportBlockContent`（底色 → 装饰 → 字形 → 图片 → 覆盖层）。
+倍率）与 `ViewportBlockContent`（装饰 → 字形 → 图片 → 覆盖层；块背景是列宽
+圆角矩形，几何只有拼装的上一层知道，由它自己发 `RoundedFillRect`）。
 它不认识布局的盒子类型，也不认识源码坐标。
 
 #### 这一轮的实证

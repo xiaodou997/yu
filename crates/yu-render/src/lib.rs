@@ -24,10 +24,10 @@ use yu_font::{AtlasError, GlyphAtlas, GlyphRasterKey};
 use yu_scene::{Point, Primitive, Rect, Rgba8, Scene};
 
 pub use backend::{
-    BackendError, DRAW_FILL_RECT, DRAW_GLYPH, DRAW_IMAGE, DamageRect, DrawCommand, FrameConsumer,
-    IMAGE_KIND_REGULAR, SurfaceConfig, build_damage_rects, build_draw_commands,
-    build_draw_commands_at_viewport, cull_draw_commands, embedded_image_kind, requires_full_clear,
-    scroll_exposed_damage,
+    BackendError, DRAW_FILL_RECT, DRAW_GLYPH, DRAW_IMAGE, DRAW_ROUNDED_FILL_RECT, DamageRect,
+    DrawCommand, FrameConsumer, IMAGE_KIND_REGULAR, SurfaceConfig, build_damage_rects,
+    build_draw_commands, build_draw_commands_at_viewport, cull_draw_commands, embedded_image_kind,
+    requires_full_clear, scroll_exposed_damage,
 };
 
 /// A page upload containing owned alpha pixels ready for a backend texture.
@@ -125,6 +125,15 @@ pub enum RenderCommand {
         bounds: Rect,
         color: Rgba8,
     },
+    /// 圆角矩形填充，可带软阴影。阴影会画到 `bounds` 之外（外扩量见
+    /// [`yu_scene::Shadow::outset`]）；后端 lower 时把绘制 quad 外扩到同一
+    /// 范围，damage 已由 scene 侧按同一公式外扩。
+    RoundedFillRect {
+        bounds: Rect,
+        radius: f32,
+        color: Rgba8,
+        shadow: Option<yu_scene::Shadow>,
+    },
     Glyph {
         page: Option<u32>,
         rect: yu_font::AtlasRect,
@@ -139,6 +148,8 @@ pub enum RenderCommand {
         resource: u64,
         bounds: Rect,
         fallback: Rgba8,
+        /// 四角裁剪圆角（逻辑像素）。0 = 直角，即不带圆角的行为。
+        corner_radius: f32,
     },
     /// A published SVG resource reference. The markup itself is carried by
     /// [`EmbeddedSvgUpload`], while this copyable command stays small enough
@@ -355,6 +366,19 @@ impl RenderPlanBuilder {
                 Primitive::FillRect { bounds, color } => {
                     commands.push(RenderCommand::FillRect { bounds, color });
                 }
+                Primitive::RoundedFillRect {
+                    bounds,
+                    radius,
+                    color,
+                    shadow,
+                } => {
+                    commands.push(RenderCommand::RoundedFillRect {
+                        bounds,
+                        radius,
+                        color,
+                        shadow,
+                    });
+                }
                 Primitive::Glyph(glyph) => {
                     let key = glyph.key();
                     let entry = atlas
@@ -403,6 +427,7 @@ impl RenderPlanBuilder {
                         resource: image.resource(),
                         bounds: image.bounds(),
                         fallback: image.fallback(),
+                        corner_radius: image.corner_radius(),
                     });
                 }
                 Primitive::EmbeddedSvg(svg) => {
@@ -905,6 +930,7 @@ mod tests {
                 assert_eq!(origin.y(), layout.glyphs[0].origin().y());
             }
             RenderCommand::FillRect { .. }
+            | RenderCommand::RoundedFillRect { .. }
             | RenderCommand::Image { .. }
             | RenderCommand::EmbeddedSvg { .. } => {
                 panic!("expected glyph command")
@@ -933,6 +959,34 @@ mod tests {
                 resource: 0xfeed_beef,
                 bounds,
                 fallback,
+                corner_radius: 0.0,
+            }]
+        );
+    }
+
+    /// 圆角矩形图元原样穿过 plan：几何、半径、阴影都不在 render 层改写
+    /// （外扩发生在 lower 与 damage 两处，公式同源）。
+    #[test]
+    fn rounded_fill_rect_primitive_passes_through_plan_with_shadow() {
+        let revision = Revision::new(7);
+        let viewport = Rect::new(0.0, 0.0, 320.0, 200.0).expect("viewport");
+        let bounds = Rect::new(24.0, 32.0, 120.0, 80.0).expect("bounds");
+        let shadow = yu_scene::Shadow::new(2.0, 4.0, 6.0, Rgba8::new(0, 0, 0, 90)).expect("shadow");
+        let mut scene = SceneBuilder::new(revision, viewport).expect("scene");
+        scene
+            .rounded_fill_rect(bounds, 8.0, Rgba8::new(241, 244, 248, 255), Some(shadow))
+            .expect("rounded fill");
+        let scene = scene.finish();
+        let mut plans = RenderPlanBuilder::new();
+        let atlas = GlyphAtlas::new(GlyphAtlasConfig::new(32, 32, 1).expect("atlas config"));
+        let plan = plans.build(&scene, &atlas).expect("rounded plan");
+        assert_eq!(
+            plan.commands(),
+            &[RenderCommand::RoundedFillRect {
+                bounds,
+                radius: 8.0,
+                color: Rgba8::new(241, 244, 248, 255),
+                shadow: Some(shadow),
             }]
         );
     }
@@ -1164,6 +1218,7 @@ mod tests {
                 assert_eq!(glyph.origin().y(), layout.glyphs[0].origin().y() + 40.0);
             }
             Primitive::FillRect { .. }
+            | Primitive::RoundedFillRect { .. }
             | Primitive::Image(_)
             | Primitive::EmbeddedSvg(_)
             | Primitive::Ornament(_)
@@ -1249,6 +1304,7 @@ mod tests {
             .map(|primitive| match primitive {
                 Primitive::Glyph(glyph) => glyph.origin(),
                 Primitive::FillRect { .. }
+                | Primitive::RoundedFillRect { .. }
                 | Primitive::Image(_)
                 | Primitive::EmbeddedSvg(_)
                 | Primitive::Ornament(_)

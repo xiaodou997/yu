@@ -389,12 +389,22 @@ impl CoreTextFontResolver {
 ///
 /// 因此这里额外记住触发该 face 的样本文本，栅格化时用与 shaping 完全相同的
 /// fallback 机制（`CTFontCreateForString`）重新选中同一个字体。
+///
+/// 还要记住 base font 的**族与字号倍率**：M4 起 `Code` 样式换成等宽族 +
+/// 0.92 倍字号（`style_font_request`），而 raster key 里的 size 是不带这个
+/// 倍率的基准字号——重建时先乘回来，族不对则 cascade 从错的 base 出发，
+/// PostScript 校验会把整帧判成 `FaceMismatch`。
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug)]
 struct FaceEntry {
     postscript_name: String,
     /// 触发该 face 的样本文本。base font 自身对应空串。
     sample: String,
+    /// base font 的族。Plain 是请求的族，Code 是等宽族。
+    family: Arc<str>,
+    /// base font 字号相对请求字号的倍率（Code 是 0.92，其余 1.0）。raster key
+    /// 的 size 乘它才是 shaping 时那个字号。
+    size_factor: f32,
     /// base font 的字重与斜体。face 身份也取决于它们：同一个样本字符在
     /// Bold 与 Regular 的 base 下会 cascade 到不同的 face
     /// （`.PingFangUIDisplaySC-Bold` 与 `-Regular`）。
@@ -570,11 +580,7 @@ impl CoreTextShaper {
     pub fn rasterizer(&self) -> CoreTextGlyphRasterizer {
         #[cfg(target_os = "macos")]
         {
-            CoreTextGlyphRasterizer::with_faces(
-                &self.faces,
-                self.font_source,
-                Arc::from(self.request.family()),
-            )
+            CoreTextGlyphRasterizer::with_faces(&self.faces, self.font_source)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -589,15 +595,19 @@ impl CoreTextShaper {
         &self,
         postscript_name: &str,
         sample: &str,
-        weight: FontWeight,
-        slant: FontSlant,
+        styled: &FontRequest,
+        request_size: f32,
     ) -> Result<FontFaceId, CoreTextShapeError> {
         self.faces
             .id_for(postscript_name, || FaceEntry {
                 postscript_name: postscript_name.to_owned(),
                 sample: sample.to_owned(),
-                weight,
-                slant,
+                family: Arc::from(styled.family()),
+                // raster key 的 size 是不带样式倍率的请求字号，乘回 shaping 时
+                // 的那个（Code 是 0.92 倍）两边才一致。
+                size_factor: styled.size() / request_size,
+                weight: styled.weight(),
+                slant: styled.slant(),
             })
             .map_err(|error| match error {
                 yu_font::FaceTableError::IdOverflow => CoreTextShapeError::FaceIdOverflow,
@@ -644,8 +654,6 @@ pub struct CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
     faces: SharedFaceTable<FaceEntry>,
     font_source: CoreTextFontSource,
-    /// base font 的 family，用于重放 shaping 时的 fallback 选择。
-    requested_family: Arc<str>,
     #[cfg(target_os = "macos")]
     metrics: Arc<Mutex<FontMetricsCache>>,
     #[cfg(target_os = "macos")]
@@ -658,7 +666,6 @@ impl Clone for CoreTextGlyphRasterizer {
             #[cfg(target_os = "macos")]
             faces: self.faces.clone(),
             font_source: self.font_source,
-            requested_family: Arc::clone(&self.requested_family),
             #[cfg(target_os = "macos")]
             metrics: Arc::clone(&self.metrics),
             #[cfg(target_os = "macos")]
@@ -669,15 +676,10 @@ impl Clone for CoreTextGlyphRasterizer {
 
 impl CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
-    fn with_faces(
-        faces: &SharedFaceTable<FaceEntry>,
-        font_source: CoreTextFontSource,
-        requested_family: Arc<str>,
-    ) -> Self {
+    fn with_faces(faces: &SharedFaceTable<FaceEntry>, font_source: CoreTextFontSource) -> Self {
         Self {
             faces: faces.clone(),
             font_source,
-            requested_family,
             metrics: Arc::new(Mutex::new(FontMetricsCache::new())),
             atlas: Arc::new(Mutex::new(GlyphAtlas::new(GlyphAtlasConfig::default()))),
         }
@@ -687,7 +689,6 @@ impl CoreTextGlyphRasterizer {
     fn unsupported() -> Self {
         Self {
             font_source: CoreTextFontSource::RequestedFamily,
-            requested_family: Arc::from(""),
         }
     }
 
@@ -844,7 +845,9 @@ impl CoreTextGlyphRasterizer {
         //
         // size 必须是**逻辑**尺寸，栅格倍率只进变换矩阵——否则会选到另一个
         // optical size 变体（PingFang UI Text ↔ Display），glyph id 随之失配。
-        let request = FontRequest::new(&*self.requested_family, size)
+        // 族与字号倍率取 face 自己的那一份（Code 是等宽族 + 0.92）：raster key
+        // 的 size 是不带倍率的基准字号。
+        let request = FontRequest::new(&*entry.family, size * entry.size_factor)
             .map_err(|_| CoreTextRasterError::FontUnavailable)?
             .with_weight(entry.weight)
             .with_slant(entry.slant);
@@ -1059,11 +1062,49 @@ impl yu_font::RasterizingShaper for CoreTextShaper {
 }
 
 #[cfg(target_os = "macos")]
+/// 代码字面量的字号倍率：等宽字面偏宽，0.92 让行内代码不显比正文大——
+/// Typora 系主题的同一条取舍。行内 chip 与代码块同待遇。
+const CODE_FONT_SIZE_SCALE: f32 = 0.92;
+
+#[cfg(target_os = "macos")]
+/// 代码字面量的等宽族：SF Mono 优先，缺失时落 Menlo（系统自带）。
+///
+/// `CTFontCreateWithName` 对未知名**不返回 null 而静默回退默认字体**，所以
+/// 「族在不在」只能用「解析出来的族名是不是请求的族名」来判。探测每个进程
+/// 做一次：shaping 每次 run 都走这里，不值得每段文字探一遍。
+fn mono_family() -> &'static str {
+    static FAMILY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    FAMILY.get_or_init(|| {
+        ["SF Mono", "Menlo"]
+            .into_iter()
+            .find(|candidate| family_available(candidate))
+            .unwrap_or("Menlo")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn family_available(family: &str) -> bool {
+    let name = CFString::from_str(family);
+    let font = unsafe { CTFont::with_name(&name, 12.0, std::ptr::null()) };
+    let resolved = unsafe { font.family_name() }.to_string();
+    resolved == family
+}
+
+#[cfg(target_os = "macos")]
 fn style_font_request(request: &FontRequest, style: TextStyle) -> FontRequest {
     match style {
         TextStyle::Strong => request.clone().with_weight(FontWeight::Bold),
         TextStyle::Emphasis => request.clone().with_slant(FontSlant::Italic),
-        TextStyle::Plain | TextStyle::Code => request.clone(),
+        TextStyle::Plain => request.clone(),
+        // 等宽族 + 0.92 倍字号。family 是探测出的非空常量、size 来自已校验的
+        // 请求——构造不会失败；万一走了不可能路径，落回原体请求比 panic 掉
+        // 整段 shaping 便宜，画面只会在代码字面处露馅。
+        TextStyle::Code => FontRequest::new(mono_family(), request.size() * CODE_FONT_SIZE_SCALE)
+            .map(|mono| {
+                mono.with_weight(request.weight())
+                    .with_slant(request.slant())
+            })
+            .unwrap_or_else(|_| request.clone()),
     }
 }
 
@@ -1220,7 +1261,7 @@ fn shape_run(
     // 私有 UI 字体的名字无法反过来创建字体。
     let sample = run_sample(request, source);
     let styled = style_font_request(request.font(), request.style());
-    let face_id = shaper.face_id(&postscript_name, &sample, styled.weight(), styled.slant())?;
+    let face_id = shaper.face_id(&postscript_name, &sample, &styled, request.font().size())?;
 
     let cf_range = CFRange {
         location: 0,
@@ -1532,6 +1573,77 @@ mod tests {
                 "{text:?} rasterized {height}px tall, not taller than Latin {latin}px — \
                  CJK/emoji 很可能被拉丁字体解释了"
             );
+        }
+    }
+
+    /// `Code` 样式请求等宽族 + 0.92 倍字号（M4）：行内代码与代码块同字体同待遇。
+    /// 族名不钉死哪一个——`mono_family` 探测 SF Mono、缺失落 Menlo，用例只钉
+    /// 「请求的就是探测出的那一个」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn code_style_requests_the_mono_family_at_a_reduced_size() {
+        let size = 16.0_f32;
+        let shaper =
+            CoreTextShaper::from_system(FontRequest::new("Helvetica", size).expect("request"))
+                .expect("shaper");
+        let plain = style_font_request(shaper.request(), TextStyle::Plain);
+        assert_eq!(plain.family(), shaper.request().family());
+        assert_eq!(plain.size(), size);
+
+        let code = style_font_request(shaper.request(), TextStyle::Code);
+        assert_eq!(code.family(), mono_family(), "Code 请求等宽族");
+        assert!(
+            (code.size() - size * CODE_FONT_SIZE_SCALE).abs() < 1e-4,
+            "Code 字号 = 0.92×，实际 {}",
+            code.size()
+        );
+    }
+
+    /// 探测出的等宽族真的解析得到：cascade 不把它替换成别的族。替换了的话
+    /// shaping 与栅格化会各自拿到不同的 face，`FaceMismatch` 把整帧判死。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mono_family_resolves_without_a_fallback() {
+        let size = 14.0_f32;
+        let shaper =
+            CoreTextShaper::from_system(FontRequest::new("Helvetica", size).expect("request"))
+                .expect("shaper");
+        let resolved = shaper
+            .catalog()
+            .resolver()
+            .resolve(&style_font_request(shaper.request(), TextStyle::Code), "x")
+            .expect("等宽族该解析得到");
+        assert_eq!(resolved.family(), mono_family());
+    }
+
+    /// 等宽 shaping 的 face 在栅格化时按**同族同倍率**重建：混进一个 CJK 字，
+    /// cascade 会选出等宽族之外的 fallback face——重放不一致在那里暴露成
+    /// `FaceMismatch`，而不是默默画错字形。raster key 的 size 是不带 0.92 的
+    /// 基准字号，这条同时压着倍率回乘那条路。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn code_glyph_rasterization_replays_the_mono_face() {
+        let size = 16.0_f32;
+        let shaper =
+            CoreTextShaper::from_system(FontRequest::new("Helvetica", size).expect("request"))
+                .expect("shaper");
+        let rasterizer = shaper.rasterizer();
+        let text = "x中";
+        let source = TextRange::new(
+            ByteOffset::ZERO,
+            ByteOffset::new(u64::try_from(text.len()).expect("len fits")),
+        )
+        .expect("source range");
+        let shaped = ShapingProvider::shape(&shaper, text, source, TextStyle::Code)
+            .expect("等宽 shaping 该成功");
+        assert!(!shaped.runs().is_empty());
+        for run in shaped.runs() {
+            for glyph in run.glyphs() {
+                let key = GlyphRasterKey::new(run.face(), glyph.id(), size).expect("raster key");
+                rasterizer
+                    .rasterize(key)
+                    .unwrap_or_else(|error| panic!("等宽字形栅格化失败：{error}"));
+            }
         }
     }
 

@@ -22,7 +22,11 @@
 //! - **正面钉住的规则。** 标题的字号倍率盖在整张样式表上、链接正文不继承
 //!   外层加粗——这两条差分时期就是单独写的，因为「两边一起错」也会绿。
 
-use yu_core::{ClusterMetrics, StyleId, TextAttrs, TextStyle};
+use yu_core::{ClusterMetrics, StyleId, TextAttrs, TextRole, TextStyle};
+use yu_editor::layout_tokens::{
+    CODE_BLOCK_PADDING_X, LINE_HEIGHT_BODY, LINE_HEIGHT_CODE, LINE_HEIGHT_HEADING_1_2,
+    LINE_HEIGHT_HEADING_3_6, QUOTE_BLOCK_PADDING_X,
+};
 use yu_editor::{BlockLayoutInput, BlockOrnaments, ThematicBreakOrnament, VisualText};
 use yu_layout::{LayoutConfig, LineStyleTable, StyleTable};
 use yu_markdown::{ExtensionSet, parse};
@@ -130,8 +134,14 @@ fn derive(source: &str, index: usize) -> Option<(Derived, BlockLayoutInput, Stri
         .expect("装饰产出不该失败");
     let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
         .expect("视觉文本");
-    let input = BlockLayoutInput::from_decorations(&decorations, &visual, config, &StyleSensitive)
-        .expect("从装饰派生");
+    let input = BlockLayoutInput::from_decorations(
+        block.kind(),
+        &decorations,
+        &visual,
+        config,
+        &StyleSensitive,
+    )
+    .expect("从装饰派生");
     let expected = visible_source(source, &decorations);
     Some((describe(&input), input, expected))
 }
@@ -271,9 +281,12 @@ fn an_empty_block_derives_an_empty_input() {
 
 /// 标题的字号倍率盖在**整张**样式表上，不靠 heading 产一条覆盖全块的 Mark。
 ///
-/// 「几级标题」是语义，归 `yu-markdown`；「1.7 倍、排粗体」是呈现，只有这一
+/// 「几级标题」是语义，归 `yu-markdown`；「1.6 倍、排粗体」是呈现，只有这一
 /// 层有 `LayoutConfig` 说得出来。让 extension 产一条 `Strong` 的 Mark 也能
 /// work，但那等于把呈现决定塞回刚划清界限的那一层。
+///
+/// 倍率本身（h2 = 1.6）住在 `layout_tokens::HEADING_FONT_SCALE`，那里的注释
+/// 讲为什么是这个数。
 #[test]
 fn a_heading_scales_every_style_in_the_table() {
     let (_, input, _) = derive("## h2 *em* `code`", 0).expect("派生");
@@ -282,7 +295,11 @@ fn a_heading_scales_every_style_in_the_table() {
     for run in layout.runs() {
         let attrs = input.styles().attrs(run.style()).expect("查得到");
         assert_eq!(attrs.style(), TextStyle::Strong, "标题一律排粗体");
-        assert_eq!(attrs.size_scale(), 1.7, "二级标题的字号倍率");
+        assert_eq!(
+            attrs.size_scale(),
+            yu_editor::layout_tokens::HEADING_FONT_SCALE[1],
+            "二级标题的字号倍率"
+        );
     }
     assert_eq!(input.ornaments().heading().map(|h| h.level()), Some(2));
 }
@@ -354,6 +371,71 @@ fn a_thematic_break_lays_out_as_a_blank_line() {
     assert!(input.layout_input().widgets().is_empty());
 }
 
+/// 块级盒模型的水平内边距：代码块与引用块收窄断行宽度、内容右移；
+/// 行高倍率按块类给（正文 1.6、代码 1.65、标题 1.3/1.25）。
+///
+/// 内边距的数值住在 `layout_tokens`，这里钉的是「收窄与右移是同一个数」——
+/// 两个数分叉的表现是文字溢出背景盒或短一截，不报错。
+#[test]
+fn code_and_quote_blocks_shrink_the_wrap_width_by_their_padding() {
+    // derive 的配置是 `LayoutConfig::new(400.0, 10.0)`。
+    let (code, input, _) = derive("```rust\nlet x = 1;\n```", 0).expect("代码块");
+    assert_eq!(
+        input.layout_config().max_width(),
+        400.0 - 2.0 * CODE_BLOCK_PADDING_X,
+        "代码块断行宽度收窄两个水平内边距"
+    );
+    assert_eq!(code.indent, CODE_BLOCK_PADDING_X, "代码内容右移一个内边距");
+    assert_eq!(code.line_height_scale, LINE_HEIGHT_CODE);
+
+    // 缩进代码与围栏是同一种盒模型待遇。
+    let (indented, input, _) = derive("    let x = 1;\n", 0).expect("缩进代码块");
+    assert_eq!(
+        input.layout_config().max_width(),
+        400.0 - 2.0 * CODE_BLOCK_PADDING_X
+    );
+    assert_eq!(indented.indent, CODE_BLOCK_PADDING_X);
+    assert_eq!(indented.line_height_scale, LINE_HEIGHT_CODE);
+
+    let (quote, input, _) = derive("> quoted\n", 0).expect("引用块");
+    assert_eq!(
+        input.layout_config().max_width(),
+        400.0 - 2.0 * QUOTE_BLOCK_PADDING_X,
+        "引用块断行宽度收窄两个水平内边距"
+    );
+    assert!(
+        quote.indent > QUOTE_BLOCK_PADDING_X,
+        "引用内容的缩进 = 内边距 + 竖条 gutter：{}",
+        quote.indent
+    );
+    assert_eq!(quote.line_height_scale, LINE_HEIGHT_BODY);
+
+    let (item, input, _) = derive("- 项目\n", 0).expect("列表项");
+    assert_eq!(input.layout_config().max_width(), 400.0, "列表项不收窄");
+    assert_eq!(item.line_height_scale, LINE_HEIGHT_BODY);
+
+    let (paragraph, input, _) = derive("plain\n", 0).expect("段落");
+    assert_eq!(input.layout_config().max_width(), 400.0, "段落不收窄");
+    assert_eq!(paragraph.indent, 0.0);
+    assert_eq!(
+        paragraph.line_height_scale, LINE_HEIGHT_BODY,
+        "正文行高 1.6"
+    );
+
+    let (h1, _, _) = derive("# h1\n", 0).expect("h1");
+    assert_eq!(h1.line_height_scale, LINE_HEIGHT_HEADING_1_2);
+    let (h2, _, _) = derive("## h2\n", 0).expect("h2");
+    assert_eq!(h2.line_height_scale, LINE_HEIGHT_HEADING_1_2);
+    for level in 3..=6 {
+        let marks = "#".repeat(level);
+        let (heading, _, _) = derive(&format!("{marks} h{level}\n"), 0).expect("h3–h6");
+        assert_eq!(
+            heading.line_height_scale, LINE_HEIGHT_HEADING_3_6,
+            "h{level} 的行高倍率"
+        );
+    }
+}
+
 /// 光标进这一块，线就没了。
 ///
 /// `derive` 一律不给焦点，所以这一条自己造一个焦点块。它压的是「露出源码」
@@ -380,8 +462,14 @@ fn a_focused_thematic_break_carries_no_rule() {
         .expect("装饰产出不该失败");
     let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
         .expect("视觉文本");
-    let input = BlockLayoutInput::from_decorations(&decorations, &visual, config, &StyleSensitive)
-        .expect("从装饰派生");
+    let input = BlockLayoutInput::from_decorations(
+        block.kind(),
+        &decorations,
+        &visual,
+        config,
+        &StyleSensitive,
+    )
+    .expect("从装饰派生");
     assert_eq!(input.text(), "---\n", "焦点块按源码排");
     assert!(input.ornaments().rule().is_none(), "露着源码就不画线");
 }
@@ -421,14 +509,21 @@ fn a_paragraph_keeps_every_style_at_its_own_face() {
 }
 
 /// 嵌套时窄的赢：`**[文字](目标)**` 里链接正文排正文字型，不继承外层加粗。
+///
+/// 链接正文同时带着 `TextRole::Link`（颜色与下划线由 `yu-workspace` 的
+/// Theme 解释）——「正文字型」说的是 `TextStyle`，角色是另一维，两样都要钉。
 #[test]
 fn link_text_inside_bold_is_not_bold() {
     let (derived, _, _) = derive("**[文字](目标)**", 0).expect("派生");
     assert_eq!(derived.text, "文字");
     assert_eq!(
         derived.runs,
-        vec![(0, 6, TextAttrs::new(TextStyle::Plain))],
-        "整段链接正文都是正文字型"
+        vec![(
+            0,
+            6,
+            TextAttrs::new(TextStyle::Plain).with_role(TextRole::Link)
+        )],
+        "整段链接正文都是正文字型 + 链接角色"
     );
 }
 

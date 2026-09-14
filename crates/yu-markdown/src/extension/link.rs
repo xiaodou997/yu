@@ -13,7 +13,7 @@
 //! 这一句此前写的是「引用式链接不需要 definition 索引」，那是错的：不查表就
 //! 把每一个候选都画成链接，画面上是一个哪儿也去不了的链接，不报错。
 
-use yu_core::{TextAttrs, TextStyle};
+use yu_core::{TextAttrs, TextRole, TextStyle};
 use yu_syntax::NodeKind;
 
 use super::{BlockContext, DelimitedSpan, Extension, ExtensionOutput, reveals};
@@ -41,13 +41,15 @@ impl Extension for Link {
             {
                 continue;
             }
-            // 链接正文按**正文**字型排，不继承外层。
+            // 链接正文按**正文**字型排，不继承外层；同时标上 `TextRole::Link`——
+            // 颜色与下划线由 `yu-workspace` 的 Theme 解释，链接在代码块之外，
+            // 不着代码高亮调色板的色。
             //
             // 这一条看起来是多余的（不产出 mark 也会落到默认字型），它压的
             // 是嵌套：`**[文字](url)**` 里最内层是链接，v1 的 `style_for`
             // 取最内层，于是链接正文不是粗的。不显式说出来的话，装配层的
             // 「窄的赢」会让外层的 Strong 赢，画面就变了——而这种变化不报错。
-            let style = out.style(TextAttrs::new(TextStyle::Plain));
+            let style = out.style(TextAttrs::new(TextStyle::Plain).with_role(TextRole::Link));
             out.mark(span.content, style);
             if !reveals(cx.active(), node.range()) {
                 out.replace(span.opening);

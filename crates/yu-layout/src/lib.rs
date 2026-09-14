@@ -77,6 +77,15 @@ impl LayoutConfig {
         self
     }
 
+    /// Returns a copy with a different wrap width. 块级盒模型按块类收窄断行
+    /// 宽度时用（代码块/引用块的水平内边距）：布局输入从调用方的 config 派生
+    /// 一份收窄副本，其余字段原样保留。
+    #[must_use]
+    pub const fn with_max_width(mut self, max_width: f32) -> Self {
+        self.max_width = max_width;
+        self
+    }
+
     #[must_use]
     pub const fn max_width(self) -> f32 {
         self.max_width

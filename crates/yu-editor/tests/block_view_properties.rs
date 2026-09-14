@@ -17,8 +17,8 @@
 use yu_core::{ByteOffset, TextRange, VisualOffset};
 use yu_decoration::Bias;
 use yu_editor::{
-    BlockDecorations, BlockLayoutInput, BlockView, LayoutConfig, LayoutPoint, MonospaceMetrics,
-    VisualText,
+    BlockDecorations, BlockKind, BlockLayoutInput, BlockView, LayoutConfig, LayoutPoint,
+    MonospaceMetrics, VisualText,
 };
 use yu_markdown::ExtensionSet;
 use yu_syntax::parse as parse_syntax;
@@ -55,7 +55,10 @@ const CORPUS: &[&str] = &[
 const WIDTHS: &[f32] = &[12.0, 40.0, 160.0];
 
 /// 第 `index` 个块的装饰与它的视觉文本。
-fn decorate(snapshot: &TextSnapshot, index: usize) -> Option<(BlockDecorations, VisualText)> {
+fn decorate(
+    snapshot: &TextSnapshot,
+    index: usize,
+) -> Option<(BlockDecorations, VisualText, BlockKind)> {
     let markdown = yu_markdown::parse(snapshot);
     let block = markdown.blocks().get(index)?;
     let tree = parse_syntax(snapshot).expect("测试文档很短").into_tree();
@@ -70,16 +73,17 @@ fn decorate(snapshot: &TextSnapshot, index: usize) -> Option<(BlockDecorations, 
         .expect("装饰产出");
     let visual = VisualText::new(snapshot, decorations.range(), decorations.set().clone())
         .expect("视觉文本");
-    Some((decorations, visual))
+    Some((decorations, visual, block.kind()))
 }
 
 fn view(source: &str, width: f32) -> Option<BlockView> {
     let buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
-    let (decorations, visual) = decorate(&snapshot, 0)?;
+    let (decorations, visual, kind) = decorate(&snapshot, 0)?;
     let config = LayoutConfig::new(width, 10.0).with_default_advance(2.0);
     Some(
         BlockView::build(
+            kind,
             &visual,
             &decorations,
             config,
@@ -96,11 +100,12 @@ fn the_derived_input_tiles_the_visual_text() {
     for source in CORPUS {
         let buffer = TextBuffer::new((*source).to_owned());
         let snapshot = buffer.snapshot();
-        let Some((decorations, visual)) = decorate(&snapshot, 0) else {
+        let Some((decorations, visual, kind)) = decorate(&snapshot, 0) else {
             continue;
         };
-        let input = BlockLayoutInput::from_decorations(&decorations, &visual, config, &metrics)
-            .expect("派生输入");
+        let input =
+            BlockLayoutInput::from_decorations(kind, &decorations, &visual, config, &metrics)
+                .expect("派生输入");
         assert_eq!(
             VisualOffset::try_from(input.text().len()).expect("短"),
             visual.visual_len(),
@@ -569,9 +574,10 @@ fn a_prefix_edit_shifts_the_source_ranges_and_keeps_the_geometry() {
     let source = "first\n\nsecond paragraph\n";
     let mut buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
-    let (decorations, visual) = decorate(&snapshot, 2).expect("第三个块");
+    let (decorations, visual, kind) = decorate(&snapshot, 2).expect("第三个块");
     let config = LayoutConfig::new(160.0, 10.0).with_default_advance(2.0);
     let view = BlockView::build(
+        kind,
         &visual,
         &decorations,
         config,
@@ -680,6 +686,7 @@ fn a_focused_image_lays_out_its_source_instead_of_a_box() {
     let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
         .expect("视觉文本");
     let view = BlockView::build(
+        block.kind(),
         &visual,
         &decorations,
         LayoutConfig::new(40.0, LINE_HEIGHT),
@@ -701,11 +708,12 @@ const LINE_HEIGHT: f32 = 10.0;
 fn image_view(sizes: &[yu_editor::ImageSize]) -> (BlockView, TextRange) {
     let buffer = TextBuffer::new(IMAGE_SOURCE.to_owned());
     let snapshot = buffer.snapshot();
-    let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("一个块");
     let Some(yu_editor::BlockWidget::Image(image)) = decorations.widgets().first().copied() else {
         panic!("这个块上有一张图");
     };
     let view = BlockView::build_with_images(
+        kind,
         &visual,
         &decorations,
         LayoutConfig::new(40.0, LINE_HEIGHT),
@@ -734,8 +742,9 @@ fn an_image_in_a_cell_widens_its_column() {
 fn table_column_widths(source: &str) -> Vec<f32> {
     let buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
-    let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("一个块");
     let view = BlockView::build(
+        kind,
         &visual,
         &decorations,
         LayoutConfig::new(400.0, LINE_HEIGHT),
@@ -757,10 +766,16 @@ fn a_preedit_pushes_a_later_image_anchor_along() {
     let source = "ab ![alt](/x.png)\n";
     let buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
-    let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("一个块");
     let config = LayoutConfig::new(400.0, LINE_HEIGHT);
-    let plain =
-        BlockView::build(&visual, &decorations, config, &MonospaceMetrics::new(1.0)).expect("排版");
+    let plain = BlockView::build(
+        kind,
+        &visual,
+        &decorations,
+        config,
+        &MonospaceMetrics::new(1.0),
+    )
+    .expect("排版");
     let anchor = plain.layout().widgets()[0].visual();
 
     // 把 "ab" 换成三个字节的 preedit：锚点要往后挪一个字节。
@@ -768,8 +783,14 @@ fn a_preedit_pushes_a_later_image_anchor_along() {
     let composed = visual
         .with_composition(replacement, "abc", TextRange::empty(ByteOffset::ZERO))
         .expect("preedit");
-    let view = BlockView::build(&composed, &decorations, config, &MonospaceMetrics::new(1.0))
-        .expect("排版");
+    let view = BlockView::build(
+        kind,
+        &composed,
+        &decorations,
+        config,
+        &MonospaceMetrics::new(1.0),
+    )
+    .expect("排版");
     assert_eq!(
         view.layout().widgets()[0].visual().get(),
         anchor.get() + 1,
@@ -786,8 +807,9 @@ fn a_preedit_pushes_a_later_image_anchor_along() {
 fn an_image_in_a_cell_gets_a_box_inside_that_cell() {
     let buffer = TextBuffer::new("| a | ![i](/x.png) |\n| --- | --- |\n| 1 | 2 |\n".to_owned());
     let snapshot = buffer.snapshot();
-    let (decorations, visual) = decorate(&snapshot, 0).expect("一个块");
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("一个块");
     let view = BlockView::build(
+        kind,
         &visual,
         &decorations,
         LayoutConfig::new(400.0, LINE_HEIGHT),
@@ -925,9 +947,10 @@ fn a_prefix_edit_moves_the_checkbox_with_its_block() {
     let source = "para\n\n- [x] 待办\n";
     let mut buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
-    let (decorations, visual) = decorate(&snapshot, 2).expect("任务项那个块");
+    let (decorations, visual, kind) = decorate(&snapshot, 2).expect("任务项那个块");
     let config = LayoutConfig::new(200.0, 10.0).with_default_advance(2.0);
     let view = BlockView::build(
+        kind,
         &visual,
         &decorations,
         config,
@@ -1008,9 +1031,12 @@ fn the_test_shaper_conforms_to_the_shaping_contract() {
 fn shaped_view(source: &str, width: f32) -> Option<BlockView> {
     let buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
-    let (decorations, visual) = decorate(&snapshot, 0)?;
+    let (decorations, visual, kind) = decorate(&snapshot, 0)?;
     let config = LayoutConfig::new(width, 10.0).with_default_advance(2.0);
-    Some(BlockView::build_shaped(&visual, &decorations, config, &TestShaper).expect("BlockView"))
+    Some(
+        BlockView::build_shaped(kind, &visual, &decorations, config, &TestShaper)
+            .expect("BlockView"),
+    )
 }
 
 /// 高亮的角色跟着字形一直走到 `BlockGlyph`。

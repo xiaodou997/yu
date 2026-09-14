@@ -7,6 +7,7 @@ use yu_core::{ByteOffset, LineIndex, Revision, ShapingProvider, TextRange, Utf16
 use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError};
 
 use crate::blockview::BlockView;
+use crate::layout_tokens::{LINE_HEIGHT_BODY, collapsed_block_gap, content_origin_y};
 use crate::table::TableResizeCommit;
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
 use yu_state::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats, Selections};
@@ -628,10 +629,12 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
     ) -> Result<BlockView, EditorDocumentError> {
+        let kind = self.block_at(index)?.kind();
         let snapshot = self.snapshot();
         let decorations = self.block_decorations_with_selection_reveal(index)?;
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
         BlockView::build(
+            kind,
             &visual,
             &decorations,
             config,
@@ -648,10 +651,11 @@ impl EditorDocument {
         shaper: &S,
         sizes: &[ImageSize],
     ) -> Result<BlockView, EditorDocumentError> {
+        let kind = self.block_at(index)?.kind();
         let snapshot = self.snapshot();
         let decorations = self.block_decorations_with_selection_reveal(index)?;
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
-        BlockView::build_shaped_with_images(&visual, &decorations, config, shaper, sizes)
+        BlockView::build_shaped_with_images(kind, &visual, &decorations, config, shaper, sizes)
             .map_err(EditorDocumentError::Layout)
     }
 
@@ -787,8 +791,10 @@ impl EditorDocument {
         index: usize,
         config: LayoutConfig,
     ) -> Result<BlockView, EditorDocumentError> {
+        let kind = self.block_at(index)?.kind();
         let (visual, decorations) = self.block_visual_for_composition(index)?;
         BlockView::build(
+            kind,
             &visual,
             &decorations,
             config,
@@ -816,8 +822,9 @@ impl EditorDocument {
         shaper: &S,
         sizes: &[ImageSize],
     ) -> Result<BlockView, EditorDocumentError> {
+        let kind = self.block_at(index)?.kind();
         let (visual, decorations) = self.block_visual_for_composition(index)?;
-        BlockView::build_shaped_with_images(&visual, &decorations, config, shaper, sizes)
+        BlockView::build_shaped_with_images(kind, &visual, &decorations, config, shaper, sizes)
             .map_err(EditorDocumentError::Layout)
     }
 
@@ -1133,6 +1140,38 @@ impl EditorDocument {
         result
     }
 
+    /// 把块级盒模型折进这一块的高度贡献：上内边距 + 内容高 + 下内边距 + 折给
+    /// 下一块的间距。
+    ///
+    /// 间距按 `collapsed_block_gap` 取 `max(after(本块), before(下一块))`，
+    /// **整条缝折在本块（缝的上块）的贡献里**，而不是上下各一半：折一半需要
+    /// 每个消费方都按块给内容加一个原点偏移，而这条路的约定是「高度索引的
+    /// 结构不动、调用方零感知」——折在上块，下一块的内容正好顶到自己的盒顶，
+    /// 前缀和自动把缝算进每一块的原点，光标、滚动、AX、绘制的数学全部照旧
+    /// 一致（Revision 也不推进）。
+    ///
+    /// 代码块的垂直内边距（上下各 `CODE_BLOCK_PADDING_Y`，共 10pt）对称地排
+    /// 在内容两侧：内容在盒里的起点是 `content_origin_y(kind)`，消费内容局部
+    /// 坐标（caret、选中、hit）换算文档坐标时加上同一个数；背景矩形由
+    /// `code_block_background_rect` 从盒顶画到内容高 + 10pt。
+    ///
+    /// 文档首块的段前、文档末块的段后都不计入：没有相邻块就没有缝，页面顶/底
+    /// 的留白是视口 padding 的事。段前间距经由「上块的 after」仍然生效——缝取
+    /// 两半的 max，本来就是较大那一侧的值。
+    fn block_box_height(&self, index: usize, content_height: f32, config: LayoutConfig) -> f32 {
+        let blocks = self.markdown.blocks();
+        let Some(kind) = blocks.get(index).map(|block| block.kind()) else {
+            return content_height;
+        };
+        let gap_below = blocks
+            .get(index + 1)
+            .map_or(0.0, |next| collapsed_block_gap(kind, next.kind()));
+        let origin = content_origin_y(kind);
+        // 间距表以「一行正文高」（line_height × 正文行高倍率）为单位，乘回
+        // 实际行高得到这份配置下的间距。
+        content_height + 2.0 * origin + gap_below * LINE_HEIGHT_BODY * config.line_height()
+    }
+
     fn measure_visible_blocks(
         &mut self,
         layout: &mut ViewportLayout,
@@ -1149,7 +1188,11 @@ impl EditorDocument {
             let mut changed = false;
             for index in range.start()..range.end() {
                 let line_count = self.block_layout(index, config)?.lines().len();
-                let height = config.line_height() * (line_count as f32);
+                let height = self.block_box_height(
+                    index,
+                    config.line_height() * (line_count as f32),
+                    config,
+                );
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -1214,9 +1257,10 @@ impl EditorDocument {
                     return Err(EditorDocumentError::Cancelled);
                 }
                 let sizes = self.block_image_sizes(index, image_resolver)?;
-                let height = self
+                let content_height = self
                     .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
                     .height();
+                let height = self.block_box_height(index, content_height, config);
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -1264,8 +1308,9 @@ impl EditorDocument {
                 let block_layout = self.block_layout_with_selection_reveal_and_shaper_and_images(
                     index, config, shaper, &sizes,
                 )?;
+                let height = self.block_box_height(index, block_layout.height(), config);
                 changed |= layout
-                    .set_block_height(index, block_layout.height())
+                    .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
             }
 
@@ -1274,9 +1319,10 @@ impl EditorDocument {
                     continue;
                 }
                 let sizes = self.block_image_sizes(index, image_resolver)?;
-                let height = self
+                let content_height = self
                     .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
                     .height();
+                let height = self.block_box_height(index, content_height, config);
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -1322,11 +1368,12 @@ impl EditorDocument {
             if let Some(span) = composition_span.as_ref() {
                 for index in span.clone() {
                     let sizes = self.block_image_sizes(index, image_resolver)?;
-                    let height = self
+                    let content_height = self
                         .block_layout_with_composition_and_shaper_and_images(
                             index, config, shaper, &sizes,
                         )?
                         .height();
+                    let height = self.block_box_height(index, content_height, config);
                     changed |= layout
                         .set_block_height(index, height)
                         .map_err(EditorDocumentError::Viewport)?;
@@ -1341,9 +1388,10 @@ impl EditorDocument {
                     continue;
                 }
                 let sizes = self.block_image_sizes(index, image_resolver)?;
-                let height = self
+                let content_height = self
                     .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
                     .height();
+                let height = self.block_box_height(index, content_height, config);
                 changed |= layout
                     .set_block_height(index, height)
                     .map_err(EditorDocumentError::Viewport)?;
@@ -1390,7 +1438,11 @@ impl EditorDocument {
                 block_layout.lines().len(),
             )
         };
-        let height = config.line_height() * line_count.max(1) as f32;
+        let height = self.block_box_height(
+            block_index,
+            config.line_height() * line_count.max(1) as f32,
+            config,
+        );
         layout
             .set_block_height(block_index, height)
             .map_err(EditorDocumentError::Viewport)?;
@@ -1439,7 +1491,11 @@ impl EditorDocument {
                 block_layout.lines().len(),
             )
         };
-        let height = config.line_height() * line_count.max(1) as f32;
+        let height = self.block_box_height(
+            block_index,
+            config.line_height() * line_count.max(1) as f32,
+            config,
+        );
         layout
             .set_block_height(block_index, height)
             .map_err(EditorDocumentError::Viewport)?;
@@ -1465,7 +1521,15 @@ impl EditorDocument {
         position: CaretLayoutPosition,
     ) -> Result<CaretScrollRequest, EditorDocumentError> {
         let effective_margin = margin.min(viewport.height() / 2.0);
-        let document_y = layout.height_index().prefix_height(position.block) + position.y;
+        // `position.y` 是内容局部坐标；代码块的内容在盒里从上内边距起排
+        // （`block_box_height` 折块高时把那 5pt 加在了内容上方），换算成文档
+        // 坐标要补回同一个起点，否则代码块里的光标/滚动目标整体上移 5pt。
+        let origin = self
+            .markdown
+            .blocks()
+            .get(position.block)
+            .map_or(0.0, |block| content_origin_y(block.kind()));
+        let document_y = layout.height_index().prefix_height(position.block) + origin + position.y;
         let caret_bottom = document_y + position.height;
         let visible_top = viewport.scroll_y() + effective_margin;
         let visible_bottom = viewport.scroll_y() + viewport.height() - effective_margin;
@@ -4828,13 +4892,114 @@ prefix **羽🙂** suffix
         let shaped = document
             .visible_blocks_with_shaper(ViewportSpan::new(0.0, 2.0), &WideShaper)
             .expect("shaped viewport should measure");
-        assert_eq!(shaped.blocks()[0].height(), 2.0);
-        assert_eq!(shaped.content_height(), 2.0);
+        // 正文行高倍率 1.6（layout_tokens::LINE_HEIGHT_BODY）：两行各
+        // 1.0 × 1.6 = 3.2。metrics 路径的行数估算不含行高倍率，那是已知且
+        // 有意的——估计值只用于未测量的块，可见块总会被 shaped 路径覆盖。
+        assert_eq!(shaped.blocks()[0].height(), 3.2);
+        assert_eq!(shaped.content_height(), 3.2);
 
         let metrics_again = document
             .visible_blocks(ViewportSpan::new(0.0, 2.0))
             .expect("metrics viewport should remeasure after backend switch");
         assert_eq!(metrics_again.blocks()[0].height(), 1.0);
+    }
+
+    /// 块间距折进块高贡献：缝 = max(after(上块), before(下块))，整条折在缝
+    /// **上块**的高度里。前缀和自动衔接——每块顶在上块底上，缝藏在高度中，
+    /// 光标/滚动/AX 消费的数学不变。间距表以正文行高（line_height × 1.6）为
+    /// 单位，这里 line_height = 1.0，于是一「行」间距 = 1.6。
+    ///
+    /// 块的视觉文本带尾部换行符，排成「内容 + 一个空行」——内容按行数算时
+    /// 要带上那一行。
+    #[test]
+    fn block_spacing_folds_into_viewport_heights() {
+        let mut document = EditorDocument::new("# title\n\nparagraph\n");
+        document
+            .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
+            .expect("viewport config should be valid");
+
+        let snapshot = document
+            .visible_blocks(ViewportSpan::new(0.0, 100.0))
+            .expect("viewport should measure");
+        let blocks = snapshot.blocks();
+        assert_eq!(blocks.len(), 3, "标题、空行、段落三块");
+        assert_eq!(blocks[0].kind(), BlockKind::Heading { level: 1 });
+
+        // h1 段后 0.45 行，空行段前 0：缝取 0.45 行 × 正文行高。
+        // 标题内容 2 行（"title" + 尾部换行那一行）。
+        let gap = 0.45 * LINE_HEIGHT_BODY;
+        assert_eq!(blocks[0].height(), 2.0 + gap, "标题内容 2 行 + 折进来的缝");
+        // 空行块自己 2 行（换行符自己占一行，与段落块的尾行同理）；它到下一段
+        // 没有缝（两边都是 0）。
+        assert_eq!(blocks[1].height(), 2.0);
+        // 前缀和衔接：每块的原点就是上块的底。
+        assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
+        assert_eq!(blocks[2].y(), blocks[1].y() + blocks[1].height());
+        // 文档末块的段后不进高——页面底的留白是视口 padding 的事。
+        assert_eq!(blocks[2].height(), 2.0, "段落内容 2 行");
+    }
+
+    /// 列表内连续 item 之间间距为 0；item 的段前段后只在列表边界上起作用。
+    #[test]
+    fn list_item_spacing_only_applies_at_list_boundaries() {
+        let mut document = EditorDocument::new("- one\n- two\n\nafter\n");
+        document
+            .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
+            .expect("viewport config should be valid");
+
+        let snapshot = document
+            .visible_blocks(ViewportSpan::new(0.0, 100.0))
+            .expect("viewport should measure");
+        let blocks = snapshot.blocks();
+        assert_eq!(blocks.len(), 4, "两个 item、空行、段落");
+
+        // 紧凑列表：item 挨着 item，没有缝。内容各 2 行。
+        assert_eq!(blocks[0].height(), 2.0);
+        assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
+        // 列表边界：第二个 item 下面是空行，缝 = after(item) = 0.4 行。
+        let boundary = 0.4 * LINE_HEIGHT_BODY;
+        assert_eq!(blocks[1].height(), 2.0 + boundary);
+        assert_eq!(blocks[2].y(), blocks[1].y() + blocks[1].height());
+        assert_eq!(blocks[2].height(), 2.0, "空行块 2 行（换行符占一行）");
+    }
+
+    /// 代码块的垂直内边距（上下各 `CODE_BLOCK_PADDING_Y`，共 10pt）对称地折
+    /// 进块高：5pt + 内容 + 5pt + 到下一块的间距。内容在盒里的起点是
+    /// `content_origin_y`——caret/选中换算文档坐标时补同一个数。
+    #[test]
+    fn code_block_vertical_padding_folds_into_viewport_heights() {
+        let mut document = EditorDocument::new("```\nbody\n```\n\ntail\n");
+        document
+            .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
+            .expect("viewport config should be valid");
+
+        let snapshot = document
+            .visible_blocks(ViewportSpan::new(0.0, 100.0))
+            .expect("viewport should measure");
+        let blocks = snapshot.blocks();
+        assert!(matches!(
+            blocks[0].kind(),
+            BlockKind::FencedCodeBlock { .. }
+        ));
+        let origin = content_origin_y(blocks[0].kind());
+        assert_eq!(origin, 5.0);
+        // 上内边距 + 内容 2 行 + 下内边距 + 到空行的缝（after(代码) 0.6 行）。
+        let gap = 0.6 * LINE_HEIGHT_BODY;
+        assert_eq!(
+            blocks[0].height(),
+            origin + 2.0 + origin + gap,
+            "5pt + 2 行内容 + 5pt + 折进来的缝"
+        );
+        assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
+
+        // 内容原点折进 caret 的文档坐标：光标落在代码第一个字符上时，y = 前缀
+        // （0）+ 上内边距 + 行内偏移（0）。漏掉原点光标整体上移 5pt，不报错。
+        set_caret(&mut document, 4);
+        let request = document
+            .caret_scroll_request(ViewportSpan::new(0.0, 100.0), 0.0)
+            .expect("caret scroll request should resolve");
+        assert_eq!(request.caret().block(), 0);
+        assert_eq!(request.caret().y(), origin);
     }
 
     /// 资源就绪之后受影响的块重排一次（不变量 D7 的后半句）。
@@ -4908,7 +5073,8 @@ prefix **羽🙂** suffix
         let placeholder = document
             .visible_blocks_with_shaper(ViewportSpan::new(0.0, 100.0), &WideShaper)
             .expect("placeholder viewport should measure");
-        assert_eq!(placeholder.blocks()[0].height(), 20.0);
+        // 16 = 占位那一行（行高 10 × 正文倍率 1.6），块尾换行符一行同高。
+        assert_eq!(placeholder.blocks()[0].height(), 32.0);
 
         let intrinsic = ImageIntrinsicSize::new(200, 100).expect("image dimensions");
         let ready = document
@@ -4918,12 +5084,12 @@ prefix **羽🙂** suffix
                 |_| Some(intrinsic),
             )
             .expect("ready image viewport should measure");
-        // 40 是图片那一行（200×100 缩到 80 宽就是 40 高），10 是块尾那个
-        // 换行符自己的行。图片 widget 化之前这里是 40：图片是排完之后另贴
-        // 上去的盒子，行不知道它有多高，块高只能取 `max(行盒累加, 图片下
-        // 沿)`——于是图片压在块尾那一行上面。
-        assert_eq!(ready.blocks()[0].height(), 50.0);
-        assert_eq!(ready.blocks()[1].y(), 50.0);
+        // 56 = 40 + 16：40 是图片那一行（200×100 缩到 80 宽就是 40 高），16
+        // 是块尾那个换行符自己的行（10 × 正文行高倍率 1.6）。图片 widget 化
+        // 之前这里是 50：图片是排完之后另贴上去的盒子，行不知道它有多高，块
+        // 高只能取 `max(行盒累加, 图片下沿)`——于是图片压在块尾那一行上面。
+        assert_eq!(ready.blocks()[0].height(), 56.0);
+        assert_eq!(ready.blocks()[1].y(), 56.0);
         assert!(ready.content_height() > placeholder.content_height());
         assert!(ready.content_height() >= ready.blocks()[1].y() + ready.blocks()[1].height());
     }

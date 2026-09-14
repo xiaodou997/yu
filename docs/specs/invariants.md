@@ -223,8 +223,16 @@ decoration 就必须认识 `Decoration` 这个类型。
 ——而不是一个中间层。
 
 **E3.** `yu-render::RenderCommand` 的变体集合冻结为
-`Glyph` / `FillRect` / `Texture` / `Quad`。
-新增语法**不得**新增 RenderCommand 变体。
+`FillRect` / `RoundedFillRect` / `Glyph` / `Image` / `EmbeddedSvg`。
+新增语法**不得**新增 RenderCommand 变体——语法差异收敛为
+`OrnamentPrimitive` 等渲染中立图元，由现有变体 lower。
+
+本条初版写的是 `Glyph` / `FillRect` / `Texture` / `Quad`；`Image` 与
+`EmbeddedSvg` 随资源切片进来后条文未跟上（已经漂移过一次）。M2
+（macOS 视觉重构）新增 `RoundedFillRect`：它是**渲染能力**扩展（圆角 +
+软阴影底座，供行内代码 chip、圆角代码块背景、引用块、圆角图片使用），
+不是语法驱动的变体——发不发这个图元由上层视觉决定，与文档内容无关。
+变体本身仍冻结：后续里程碑只能复用它，不能为它新增孪生变体。
 
 **E4.** `yu-text` 不得让 ropey 的类型或索引逃逸出 crate 边界；
 对外只暴露 `ByteOffset`。

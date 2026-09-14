@@ -35,7 +35,7 @@ use yu_layout::{
     BlockLayout, HeightIndex, HeightIndexError, LayoutConfig, LayoutError, LayoutPoint, LayoutRect,
     StyleTable, WidgetMeasure,
 };
-use yu_markdown::{BlockDecorations, BlockOrnament};
+use yu_markdown::{BlockDecorations, BlockKind, BlockOrnament};
 use yu_text::{ChangeSet, TextSnapshot};
 
 use crate::blockinput::{BlockLayoutInput, BlockOrnaments};
@@ -358,13 +358,17 @@ impl BlockView {
     /// 按度量排，图片一律画 placeholder。
     ///
     /// 命中测试、Accessibility、纯度量排版走这一条：它们不关心图片解码没有。
+    ///
+    /// `kind` 是这一块在块序里的身份（盒模型待遇按块类取，见
+    /// `layout_tokens`），必须与 `decorations` 是同一块的产出。
     pub fn build<M: ClusterMetrics>(
+        kind: BlockKind,
         visual: &VisualText,
         decorations: &BlockDecorations,
         config: LayoutConfig,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
-        Self::build_with_images(visual, decorations, config, metrics, &[])
+        Self::build_with_images(kind, visual, decorations, config, metrics, &[])
     }
 
     /// 按度量排。列表标记只算宽度，不产字形。
@@ -374,17 +378,19 @@ impl BlockView {
     ///
     /// `sizes` 是已经解码到位的图片，没列进来的画 placeholder（不变量 D7）。
     pub fn build_with_images<M: ClusterMetrics>(
+        kind: BlockKind,
         visual: &VisualText,
         decorations: &BlockDecorations,
         config: LayoutConfig,
         metrics: &M,
         sizes: &[ImageSize],
     ) -> Result<Self, LayoutError> {
-        let input = BlockLayoutInput::from_decorations(decorations, visual, config, metrics)?;
+        let input = BlockLayoutInput::from_decorations(kind, decorations, visual, config, metrics)?;
+        let layout_config = input.layout_config();
         let widgets = BlockWidgets::new(decorations.widgets(), sizes);
         let layout = BlockLayout::build_all(
             input.layout_input(),
-            config,
+            layout_config,
             input.styles(),
             &widgets,
             input.line_styles(),
@@ -397,37 +403,41 @@ impl BlockView {
                     visual,
                     &input,
                     &widgets,
-                    config,
+                    layout_config,
                     &crate::table::MetricsCells(metrics),
                 )
             })
             .transpose()?;
-        Self::assemble(visual, decorations, config, input, layout, table)
+        Self::assemble(visual, decorations, layout_config, input, layout, table)
     }
 
     /// 按 shaping 后端排，图片一律画 placeholder。
     pub fn build_shaped<S: ShapingProvider>(
+        kind: BlockKind,
         visual: &VisualText,
         decorations: &BlockDecorations,
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<Self, LayoutError> {
-        Self::build_shaped_with_images(visual, decorations, config, shaper, &[])
+        Self::build_shaped_with_images(kind, visual, decorations, config, shaper, &[])
     }
 
     /// 按 shaping 后端排。列表标记的字形一并进字形流。
     pub fn build_shaped_with_images<S: ShapingProvider>(
+        kind: BlockKind,
         visual: &VisualText,
         decorations: &BlockDecorations,
         config: LayoutConfig,
         shaper: &S,
         sizes: &[ImageSize],
     ) -> Result<Self, LayoutError> {
-        let input = BlockLayoutInput::from_decorations_shaped(decorations, visual, config, shaper)?;
+        let input =
+            BlockLayoutInput::from_decorations_shaped(kind, decorations, visual, config, shaper)?;
+        let layout_config = input.layout_config();
         let widgets = BlockWidgets::new(decorations.widgets(), sizes);
         let layout = BlockLayout::build_shaped(
             input.layout_input(),
-            config,
+            layout_config,
             input.styles(),
             &widgets,
             input.line_styles(),
@@ -440,12 +450,12 @@ impl BlockView {
                     visual,
                     &input,
                     &widgets,
-                    config,
+                    layout_config,
                     &crate::table::ShapedCells(shaper),
                 )
             })
             .transpose()?;
-        Self::assemble(visual, decorations, config, input, layout, table)
+        Self::assemble(visual, decorations, layout_config, input, layout, table)
     }
 
     fn assemble(
@@ -553,9 +563,13 @@ impl BlockView {
         self.input.ornaments()
     }
 
-    /// 块的高度。
+    /// 块的内容高（文字行盒累加；表格按网格）。
     ///
-    /// 表格块按网格算；其余按行盒累加。图片不需要在这里单独补一次：一张
+    /// **不含**块级盒模型的两样东西——块间距（段前/段后）与代码块的垂直内
+    /// 边距：它们取决于相邻块/块类，折在 `EditorDocument::block_box_height`
+    /// 贡献给视口高度索引的那一份里。消费块高（光标揭示、滚动、AX、绘制）
+    /// 一律走视口快照的 `ViewportBlock::height`，那里的数学已经把间距算进去；
+    /// 这里只是「这一块的内容排出来多高」。图片不需要在这里单独补一次：一张
     /// 解码后的图片撑高的是它所在的那**一行**，而行高本来就进了累加
     /// （`BlockLayout::height`）。此前图片是排完之后另贴上去的盒子，行不
     /// 知道它有多高，可滚动范围因此要在这里补一次 max——那个补丁随

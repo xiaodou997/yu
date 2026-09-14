@@ -136,6 +136,100 @@ impl GlyphPrimitive {
     }
 }
 
+/// 圆角矩形的软阴影参数。
+///
+/// `blur` 就是 fragment shader 高斯衰减的 σ（逻辑像素）：阴影浓度按
+/// `exp(-d² / 2σ²)` 衰减，d 是到圆角矩形边缘的带符号距离。`offset_x` /
+/// `offset_y` 把阴影整体平移（正值向右 / 向下）。`blur` 为 0 时按无阴影
+/// 处理——σ = 0 的高斯没有定义，硬边投影不是这个结构要表达的东西。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shadow {
+    offset_x: f32,
+    offset_y: f32,
+    blur: f32,
+    color: Rgba8,
+}
+
+impl Shadow {
+    /// 高斯 σ 之外仍把阴影算作「到达」的距离，以 σ 的倍数计。
+    ///
+    /// 取 3σ：该处衰减到 e⁻⁹ ≈ 1.2e-4，8-bit 颜色下不可见。**这一份常数
+    /// 同时决定 scene damage 的外扩与 Metal 绘制 quad 的外扩**，两边必须
+    /// 一致：damage 大于实际绘制范围会擦掉没有命令重绘的像素，小于则留下
+    /// 阴影残影。
+    pub const EXTENT_SIGMAS: f32 = 3.0;
+
+    pub fn new(offset_x: f32, offset_y: f32, blur: f32, color: Rgba8) -> Result<Self, SceneError> {
+        if !offset_x.is_finite() || !offset_y.is_finite() {
+            return Err(SceneError::InvalidGeometry(
+                "shadow offset must contain finite coordinates",
+            ));
+        }
+        if !blur.is_finite() || blur < 0.0 {
+            return Err(SceneError::InvalidGeometry(
+                "shadow blur must be finite and non-negative",
+            ));
+        }
+        Ok(Self {
+            offset_x,
+            offset_y,
+            blur,
+            color,
+        })
+    }
+
+    #[must_use]
+    pub const fn offset_x(self) -> f32 {
+        self.offset_x
+    }
+
+    #[must_use]
+    pub const fn offset_y(self) -> f32 {
+        self.offset_y
+    }
+
+    #[must_use]
+    pub const fn blur(self) -> f32 {
+        self.blur
+    }
+
+    #[must_use]
+    pub const fn color(self) -> Rgba8 {
+        self.color
+    }
+
+    /// 阴影在几何 bounds 之外四边各自的最大延伸（左、上、右、下，逻辑像素）。
+    ///
+    /// 衰减 σ = blur，超过 `EXTENT_SIGMAS` × σ 截断；offset 再把阴影整体
+    /// 平移，所以四边不对称——阴影向左最多探出 `extent - min(0, ox)`，向右
+    /// 最多探出 `extent + max(0, ox)`，上下同理。blur 为 0 时不画阴影
+    /// （见 [`Shadow`]），外扩为零。
+    #[must_use]
+    pub fn outset(&self) -> (f32, f32, f32, f32) {
+        if self.blur == 0.0 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let extent = Self::EXTENT_SIGMAS * self.blur;
+        (
+            extent - self.offset_x.min(0.0),
+            extent - self.offset_y.min(0.0),
+            extent + self.offset_x.max(0.0),
+            extent + self.offset_y.max(0.0),
+        )
+    }
+
+    /// 把几何 bounds 外扩到阴影的最大到达范围。
+    pub fn expand_bounds(&self, bounds: Rect) -> Result<Rect, SceneError> {
+        let (left, top, right, bottom) = self.outset();
+        Ok(Rect::new(
+            bounds.x() - left,
+            bounds.y() - top,
+            bounds.width() + left + right,
+            bounds.height() + top + bottom,
+        )?)
+    }
+}
+
 /// A source-independent image draw operation.
 ///
 /// `resource` is a stable `yu-assets::ImageKey::fingerprint()` supplied by
@@ -147,6 +241,7 @@ pub struct ImagePrimitive {
     resource: u64,
     bounds: Rect,
     fallback: Rgba8,
+    corner_radius: f32,
 }
 
 impl ImagePrimitive {
@@ -156,7 +251,19 @@ impl ImagePrimitive {
             resource,
             bounds,
             fallback,
+            // 默认 0 = 直角，即 M2 之前的行为；圆角图片由调用方显式开启。
+            corner_radius: 0.0,
         }
+    }
+
+    /// 图片四角的裁剪圆角（逻辑像素）。0 = 直角（现状）。
+    ///
+    /// 取负或非有限值在渲染后端被拒绝；scene 层不重复校验，与 `radius` 在
+    /// `RoundedFillRect` 上的处理一致。
+    #[must_use]
+    pub const fn with_corner_radius(mut self, corner_radius: f32) -> Self {
+        self.corner_radius = corner_radius;
+        self
     }
 
     #[must_use]
@@ -172,6 +279,11 @@ impl ImagePrimitive {
     #[must_use]
     pub const fn fallback(self) -> Rgba8 {
         self.fallback
+    }
+
+    #[must_use]
+    pub const fn corner_radius(self) -> f32 {
+        self.corner_radius
     }
 }
 
@@ -476,18 +588,22 @@ impl SceneGlyph {
 
 /// 一个可见块在这一帧里要画的东西。
 ///
-/// 画家顺序就是字段顺序：底色 → 装饰 → 字形 → 图片 → 覆盖层。
+/// 画家顺序就是字段顺序：装饰 → 字形 → 图片 → 覆盖层。
 ///
-/// 装饰在字形**之前**，所以单元格底色盖不住它自己的文字；图片在字形之后，
+/// 装饰在字形**之前**，所以引用竖条、表格网格衬在文字底下；图片在字形之后，
 /// 所以一张就绪的图盖得住它替代的那段文本；覆盖层在最后，给那些必须压在
 /// 文字上面的控件（任务框之类）。两个位置都留着不是为了对称——把控件挪到
 /// 文字下面去不会报错，只是画面变了，而那种变化只有真实窗口看得见。
+///
+/// 块背景（代码灰底、引用蓝底）**不在**这里：它曾经是 `with_fill` 一块铺满
+/// 视口宽的直角矩形，M4 起改成列宽圆角矩形，几何只有拼装的上一层知道（
+/// `layout_tokens` 的 helper + 布局配置），由 `yu-workspace` 直接发
+/// `RoundedFillRect`。
 #[derive(Clone, Copy, Debug)]
 pub struct ViewportBlockContent<'a> {
     revision: Revision,
     source: TextRange,
     glyphs: &'a [SceneGlyph],
-    fill: Option<Rgba8>,
     ornaments: &'a [OrnamentPrimitive],
     images: &'a [ImagePrimitive],
     overlays: &'a [OrnamentPrimitive],
@@ -500,18 +616,10 @@ impl<'a> ViewportBlockContent<'a> {
             revision,
             source,
             glyphs,
-            fill: None,
             ornaments: &[],
             images: &[],
             overlays: &[],
         }
-    }
-
-    /// 整块的底色。铺满视口宽度，衬在所有内容底下。
-    #[must_use]
-    pub const fn with_fill(mut self, fill: Option<Rgba8>) -> Self {
-        self.fill = fill;
-        self
     }
 
     /// 已经搬到文档坐标的装饰矩形。
@@ -539,7 +647,21 @@ impl<'a> ViewportBlockContent<'a> {
 /// One retained scene primitive. Insertion order is the painter's order.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Primitive {
-    FillRect { bounds: Rect, color: Rgba8 },
+    FillRect {
+        bounds: Rect,
+        color: Rgba8,
+    },
+    /// 圆角矩形填充，可带软阴影。
+    ///
+    /// M2 交付的底座能力，供给行内代码 chip、圆角代码块背景、引用块与圆角
+    /// 图片背景。`bounds()` 只报几何矩形；阴影会画到它之外——外扩量见
+    /// [`Shadow::outset`]，damage 必须走 [`Primitive::damage_bounds`]。
+    RoundedFillRect {
+        bounds: Rect,
+        radius: f32,
+        color: Rgba8,
+        shadow: Option<Shadow>,
+    },
     Glyph(GlyphPrimitive),
     Image(ImagePrimitive),
     EmbeddedSvg(EmbeddedSvgPrimitive),
@@ -548,15 +670,34 @@ pub enum Primitive {
 }
 
 impl Primitive {
+    /// 几何 bounds。注意 [`Primitive::RoundedFillRect`] 的阴影会画到这个
+    /// 矩形之外（外扩量见 [`Shadow::outset`]）：参与 damage 的调用方必须改用
+    /// [`Primitive::damage_bounds`]，否则 retained target 会留下阴影残影。
     #[must_use]
     pub fn bounds(self) -> Rect {
         match self {
             Self::FillRect { bounds, .. } => bounds,
+            Self::RoundedFillRect { bounds, .. } => bounds,
             Self::Glyph(glyph) => glyph.bounds(),
             Self::Image(image) => image.bounds(),
             Self::EmbeddedSvg(svg) => svg.bounds(),
             Self::Ornament(ornament) => ornament.bounds(),
             Self::EditorDecoration(decoration) => decoration.bounds(),
+        }
+    }
+
+    /// 参与 damage 的 bounds：几何 bounds 外扩阴影的最大到达范围。
+    ///
+    /// 除 `RoundedFillRect` 外的图元没有 bounds 之外的绘制，damage_bounds
+    /// 等于 `bounds()`。
+    pub fn damage_bounds(self) -> Result<Rect, SceneError> {
+        match self {
+            Self::RoundedFillRect {
+                bounds,
+                shadow: Some(shadow),
+                ..
+            } => shadow.expand_bounds(bounds),
+            _ => Ok(self.bounds()),
         }
     }
 }
@@ -795,15 +936,39 @@ impl SceneBuilder {
                 height: svg.height(),
             });
         }
+        if let Primitive::RoundedFillRect { radius, .. } = primitive
+            && (!radius.is_finite() || radius < 0.0)
+        {
+            // 半径是裸字段，构造入口收在这里；shadow 本身由 Shadow::new 校验过。
+            return Err(SceneError::InvalidGeometry(
+                "corner radius must be finite and non-negative",
+            ));
+        }
         let index =
             u32::try_from(self.primitives.len()).map_err(|_| SceneError::PrimitiveLimitExceeded)?;
         self.primitives.push(primitive);
-        self.damage.add(primitive.bounds())?;
+        // damage 用 damage_bounds：阴影画在几何 bounds 之外，漏掉会留残影。
+        self.damage.add(primitive.damage_bounds()?)?;
         Ok(index)
     }
 
     pub fn fill_rect(&mut self, bounds: Rect, color: Rgba8) -> Result<u32, SceneError> {
         self.push(Primitive::FillRect { bounds, color })
+    }
+
+    pub fn rounded_fill_rect(
+        &mut self,
+        bounds: Rect,
+        radius: f32,
+        color: Rgba8,
+        shadow: Option<Shadow>,
+    ) -> Result<u32, SceneError> {
+        self.push(Primitive::RoundedFillRect {
+            bounds,
+            radius,
+            color,
+            shadow,
+        })
     }
 
     pub fn glyph(&mut self, glyph: GlyphPrimitive) -> Result<u32, SceneError> {
@@ -848,9 +1013,10 @@ impl SceneBuilder {
 
     /// 一帧里所有可见块，一次事务提交。
     ///
-    /// 每个块的内容由调用方装配好（[`ViewportBlockContent`]）：底色、装饰、
-    /// 字形、图片。**这一层不知道那些装饰是什么语法**——它只按画家顺序摆
-    /// 矩形和字形（不变量 E1）。
+    /// 每个块的内容由调用方装配好（[`ViewportBlockContent`]）：装饰、字形、
+    /// 图片。**这一层不知道那些装饰是什么语法**——它只按画家顺序摆
+    /// 矩形和字形（不变量 E1）。块背景由调用方自己发 `RoundedFillRect`，
+    /// 不进这条路（见 [`ViewportBlockContent`] 的文档）。
     ///
     /// revision、源码范围、atlas 查表、几何与 primitive 预算全部在改动场景
     /// 之前校验完；一个过期或半成品的视口不可能只发布出它的前一半。
@@ -892,17 +1058,6 @@ impl SceneBuilder {
                 return Err(SceneError::ViewportSourceMismatch);
             }
             let origin = Point::new(0.0, geometry.y());
-            if let Some(fill) = content.fill {
-                primitives.push(Primitive::FillRect {
-                    bounds: Rect::new(
-                        self.viewport.x(),
-                        geometry.y(),
-                        self.viewport.width(),
-                        geometry.height(),
-                    )?,
-                    color: fill,
-                });
-            }
             for ornament in content.ornaments {
                 primitives.push(Primitive::Ornament(*ornament));
             }
@@ -975,7 +1130,8 @@ impl SceneBuilder {
 
         let mut damage = self.damage.clone();
         for primitive in &primitives {
-            damage.add(primitive.bounds())?;
+            // 与 push 同一条不变量：damage 覆盖阴影外扩，不只几何 bounds。
+            damage.add(primitive.damage_bounds()?)?;
         }
         let count = primitives.len();
         self.primitives.extend(primitives);
@@ -1111,6 +1267,142 @@ mod tests {
         );
         assert_eq!(scene.damage().rects().len(), 1);
         assert_eq!(scene.revision(), revision);
+    }
+
+    /// 阴影外扩公式是 damage 与 Metal quad 共用的唯一依据，逐边钉死：
+    /// 每边先外扩 3σ（σ = blur），再按 offset 的符号一边加一边抵消。
+    #[test]
+    fn shadow_outset_grows_with_blur_and_shifts_with_offset() {
+        let shadow = Shadow::new(4.0, -2.0, 10.0, Rgba8::black()).expect("shadow");
+        assert_eq!(
+            shadow.outset(),
+            (30.0 - 0.0, 30.0 + 2.0, 30.0 + 4.0, 30.0 - 0.0)
+        );
+
+        // offset 反号时加减速对调：正 offset 扩张右/下、负 offset 扩张左/上。
+        let flipped = Shadow::new(-4.0, 2.0, 10.0, Rgba8::black()).expect("shadow");
+        assert_eq!(
+            flipped.outset(),
+            (30.0 + 4.0, 30.0 - 0.0, 30.0 - 0.0, 30.0 + 2.0)
+        );
+
+        // offset 为零时四边对称；blur 为零时没有外扩。
+        let centered = Shadow::new(0.0, 0.0, 10.0, Rgba8::black()).expect("shadow");
+        assert_eq!(centered.outset(), (30.0, 30.0, 30.0, 30.0));
+        let plain = Shadow::new(3.0, 3.0, 0.0, Rgba8::black()).expect("shadow");
+        assert_eq!(plain.outset(), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn shadow_rejects_non_finite_offset_and_negative_blur() {
+        assert_eq!(
+            Shadow::new(f32::NAN, 0.0, 4.0, Rgba8::black()),
+            Err(SceneError::InvalidGeometry(
+                "shadow offset must contain finite coordinates"
+            ))
+        );
+        assert_eq!(
+            Shadow::new(0.0, f32::INFINITY, 4.0, Rgba8::black()),
+            Err(SceneError::InvalidGeometry(
+                "shadow offset must contain finite coordinates"
+            ))
+        );
+        assert_eq!(
+            Shadow::new(0.0, 0.0, -1.0, Rgba8::black()),
+            Err(SceneError::InvalidGeometry(
+                "shadow blur must be finite and non-negative"
+            ))
+        );
+    }
+
+    /// `bounds()` 只报几何矩形，damage 必须覆盖阴影探出的部分——否则 retained
+    /// target 里旧阴影没人擦、新阴影没人画。两边读的是同一份 outset 公式。
+    #[test]
+    fn rounded_fill_rect_damage_bounds_cover_shadow_extent() {
+        let bounds = Rect::new(40.0, 50.0, 20.0, 10.0).expect("bounds");
+        let shadow = Shadow::new(4.0, -2.0, 10.0, Rgba8::new(0, 0, 0, 128)).expect("shadow");
+        let primitive = Primitive::RoundedFillRect {
+            bounds,
+            radius: 6.0,
+            color: Rgba8::white(),
+            shadow: Some(shadow),
+        };
+
+        assert_eq!(primitive.bounds(), bounds);
+        let damage = primitive.damage_bounds().expect("damage bounds");
+        assert_eq!(damage.x(), 40.0 - 30.0);
+        assert_eq!(damage.y(), 50.0 - 32.0);
+        assert_eq!(damage.right(), 60.0 + 34.0);
+        assert_eq!(damage.bottom(), 60.0 + 30.0);
+
+        // 无阴影时 damage_bounds 退化为几何 bounds。
+        let plain = Primitive::RoundedFillRect {
+            bounds,
+            radius: 6.0,
+            color: Rgba8::white(),
+            shadow: None,
+        };
+        assert_eq!(plain.damage_bounds().expect("damage bounds"), bounds);
+    }
+
+    #[test]
+    fn scene_expands_damage_for_shadow_and_rejects_invalid_radius() {
+        let revision = Revision::new(9);
+        let viewport = Rect::new(0.0, 0.0, 200.0, 100.0).expect("viewport");
+        let shadow = Shadow::new(4.0, -2.0, 10.0, Rgba8::new(0, 0, 0, 128)).expect("shadow");
+        let mut builder = SceneBuilder::new(revision, viewport).expect("builder");
+        builder
+            .rounded_fill_rect(
+                Rect::new(40.0, 50.0, 20.0, 10.0).expect("bounds"),
+                6.0,
+                Rgba8::white(),
+                Some(shadow),
+            )
+            .expect("rounded fill");
+
+        let damage = builder.finish().damage().bounds().expect("damage");
+        assert_eq!(damage.x(), 10.0);
+        assert_eq!(damage.y(), 18.0);
+        assert_eq!(damage.right(), 94.0);
+        assert_eq!(damage.bottom(), 90.0);
+
+        let mut invalid = SceneBuilder::new(revision, viewport).expect("builder");
+        assert_eq!(
+            invalid.rounded_fill_rect(
+                Rect::new(0.0, 0.0, 10.0, 10.0).expect("bounds"),
+                f32::NAN,
+                Rgba8::white(),
+                None,
+            ),
+            Err(SceneError::InvalidGeometry(
+                "corner radius must be finite and non-negative"
+            ))
+        );
+        let mut negative = SceneBuilder::new(revision, viewport).expect("builder");
+        assert_eq!(
+            negative.rounded_fill_rect(
+                Rect::new(0.0, 0.0, 10.0, 10.0).expect("bounds"),
+                -2.0,
+                Rgba8::white(),
+                None,
+            ),
+            Err(SceneError::InvalidGeometry(
+                "corner radius must be finite and non-negative"
+            ))
+        );
+    }
+
+    /// 图片圆角默认 0（M2 之前的行为），with_corner_radius 只是改写默认值。
+    #[test]
+    fn image_corner_radius_defaults_to_square_corners() {
+        let bounds = Rect::new(4.0, 0.0, 32.0, 10.0).expect("image bounds");
+        let square = ImagePrimitive::new(42, bounds, Rgba8::new(232, 234, 238, 255));
+        assert_eq!(square.corner_radius(), 0.0);
+        let rounded = square.with_corner_radius(8.0);
+        assert_eq!(rounded.corner_radius(), 8.0);
+        assert_eq!(square.corner_radius(), 0.0, "builder 不改写原值");
+        assert_eq!(rounded.resource(), 42);
+        assert_eq!(rounded.bounds(), bounds);
     }
 
     #[test]
