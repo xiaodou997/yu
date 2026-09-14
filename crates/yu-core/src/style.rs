@@ -103,6 +103,9 @@ pub enum TextRole {
     Operator,
     /// 括号、分号、逗号。
     Punctuation,
+    /// 链接文字。颜色与下划线住在 `yu-workspace` 的 Theme，不由语法高亮调色板
+    /// 供色——它不是代码角色，链接在段落、标题、引用里都有。
+    Link,
 }
 
 /// 一个 [`StyleId`] 解释之后的排版属性。

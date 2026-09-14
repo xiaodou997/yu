@@ -181,6 +181,17 @@ typedef struct {
     uint32_t page;
     uint64_t resource;
     uint32_t image_kind;
+    // 与 crates/yu-render/src/backend.rs 的 DrawCommand 末尾逐字段对应，
+    // 两侧同改：这是静态链接的内部 ABI，没有头文件替你查。
+    float radius;
+    float rect_offset_x;
+    float rect_offset_y;
+    float rect_width;
+    float rect_height;
+    float shadow_offset_x;
+    float shadow_offset_y;
+    float shadow_blur;
+    uint32_t shadow_color;
 } YuMetalDrawCommand;
 
 typedef struct {
@@ -219,6 +230,7 @@ typedef struct {
     id<MTLRenderPipelineState> solid_pipeline;
     id<MTLRenderPipelineState> glyph_pipeline;
     id<MTLRenderPipelineState> image_pipeline;
+    id<MTLRenderPipelineState> rounded_pipeline;
     id<MTLSamplerState> sampler;
 } YuMetalPipeline;
 
@@ -254,6 +266,57 @@ typedef struct {
     float blue;
     float alpha;
 } YuMetalPrimitiveUniforms;
+
+// 圆角矩形：一个外扩 quad 承载填充 + 阴影，字段语义见 Rust 侧 DrawCommand
+// 注释与 yu_shaders.metal 的 YuRoundedUniforms。逻辑像素。
+typedef struct {
+    float quad_width;
+    float quad_height;
+    float rect_offset_x;
+    float rect_offset_y;
+    float rect_width;
+    float rect_height;
+    float radius;
+    float shadow_blur;
+    float shadow_offset_x;
+    float shadow_offset_y;
+    float shadow_red;
+    float shadow_green;
+    float shadow_blue;
+    float shadow_alpha;
+    float fill_red;
+    float fill_green;
+    float fill_blue;
+    float fill_alpha;
+} YuMetalRoundedUniforms;
+
+// 图片：颜色乘子 + quad 尺寸 + 裁剪圆角。逻辑像素。
+typedef struct {
+    float red;
+    float green;
+    float blue;
+    float alpha;
+    float width;
+    float height;
+    float radius;
+    float padding;
+} YuMetalImageUniforms;
+
+// 布局断言：YuMetalDrawCommand 与 crates/yu-render 的 DrawCommand 是两边
+// 手写同步的内部 ABI，Rust 侧有同值的单元测试（draw_command_layout_matches_
+// metal_bridge），这里在编译期把 C 侧钉死——任一边漂移都会在构建时炸。
+_Static_assert(sizeof(YuMetalDrawCommand) == 104,
+    "YuMetalDrawCommand must stay in sync with yu-render DrawCommand");
+_Static_assert(offsetof(YuMetalDrawCommand, resource) == 56,
+    "DrawCommand field order drifted");
+_Static_assert(offsetof(YuMetalDrawCommand, radius) == 68,
+    "DrawCommand field order drifted");
+_Static_assert(offsetof(YuMetalDrawCommand, shadow_color) == 100,
+    "DrawCommand field order drifted");
+_Static_assert(sizeof(YuMetalRoundedUniforms) == 72,
+    "YuMetalRoundedUniforms must match yu_shaders.metal");
+_Static_assert(sizeof(YuMetalImageUniforms) == 32,
+    "YuMetalImageUniforms must match yu_shaders.metal");
 
 int yu_metal_create_device(void **out_device, uint64_t *out_registry_id) {
     if (out_device == NULL || out_registry_id == NULL) {
@@ -649,11 +712,13 @@ int yu_metal_create_pipeline(
     id<MTLFunction> solid = [library newFunctionWithName:@"yu_solid_fragment"];
     id<MTLFunction> glyph = [library newFunctionWithName:@"yu_glyph_fragment"];
     id<MTLFunction> image = [library newFunctionWithName:@"yu_image_fragment"];
-    if (vertex == nil || solid == nil || glyph == nil || image == nil) {
+    id<MTLFunction> rounded = [library newFunctionWithName:@"yu_rounded_fragment"];
+    if (vertex == nil || solid == nil || glyph == nil || image == nil || rounded == nil) {
         [vertex release];
         [solid release];
         [glyph release];
         [image release];
+        [rounded release];
         [library release];
         return 0;
     }
@@ -685,6 +750,8 @@ int yu_metal_create_pipeline(
     glyph_descriptor.fragmentFunction = glyph;
     MTLRenderPipelineDescriptor *image_descriptor = [solid_descriptor copy];
     image_descriptor.fragmentFunction = image;
+    MTLRenderPipelineDescriptor *rounded_descriptor = [solid_descriptor copy];
+    rounded_descriptor.fragmentFunction = rounded;
     MTLRenderPipelineDescriptor *clear_descriptor = [solid_descriptor copy];
     clear_descriptor.colorAttachments[0].blendingEnabled = NO;
 
@@ -697,6 +764,8 @@ int yu_metal_create_pipeline(
         [device newRenderPipelineStateWithDescriptor:glyph_descriptor error:&pipeline_error];
     id<MTLRenderPipelineState> image_pipeline =
         [device newRenderPipelineStateWithDescriptor:image_descriptor error:&pipeline_error];
+    id<MTLRenderPipelineState> rounded_pipeline =
+        [device newRenderPipelineStateWithDescriptor:rounded_descriptor error:&pipeline_error];
 
     MTLSamplerDescriptor *sampler_descriptor = [[MTLSamplerDescriptor alloc] init];
     sampler_descriptor.minFilter = MTLSamplerMinMagFilterLinear;
@@ -708,6 +777,7 @@ int yu_metal_create_pipeline(
     [sampler_descriptor release];
     [clear_descriptor release];
     [image_descriptor release];
+    [rounded_descriptor release];
     [glyph_descriptor release];
     [solid_descriptor release];
     [vertex_descriptor release];
@@ -715,14 +785,16 @@ int yu_metal_create_pipeline(
     [solid release];
     [glyph release];
     [image release];
+    [rounded release];
     [library release];
 
     if (clear_pipeline == nil || solid_pipeline == nil || glyph_pipeline == nil
-        || image_pipeline == nil || sampler == nil) {
+        || image_pipeline == nil || rounded_pipeline == nil || sampler == nil) {
         [clear_pipeline release];
         [solid_pipeline release];
         [glyph_pipeline release];
         [image_pipeline release];
+        [rounded_pipeline release];
         [sampler release];
         return 0;
     }
@@ -732,6 +804,8 @@ int yu_metal_create_pipeline(
         [clear_pipeline release];
         [solid_pipeline release];
         [glyph_pipeline release];
+        [image_pipeline release];
+        [rounded_pipeline release];
         [sampler release];
         return 0;
     }
@@ -739,6 +813,7 @@ int yu_metal_create_pipeline(
     pipeline->solid_pipeline = solid_pipeline;
     pipeline->glyph_pipeline = glyph_pipeline;
     pipeline->image_pipeline = image_pipeline;
+    pipeline->rounded_pipeline = rounded_pipeline;
     pipeline->sampler = sampler;
     *out_pipeline = (void *)pipeline;
     return 1;
@@ -796,13 +871,6 @@ static int yu_metal_encode_command(
         {command.x + command.width, command.y + command.height, command.u1, command.v1},
         {command.x, command.y + command.height, command.u0, command.v1},
     };
-    YuMetalPrimitiveUniforms primitive = {
-        command.red,
-        command.green,
-        command.blue,
-        command.alpha,
-    };
-
     if (command.kind == 0) {
         [encoder setRenderPipelineState:pipeline->solid_pipeline];
     } else if (command.kind == 1) {
@@ -834,12 +902,60 @@ static int yu_metal_encode_command(
         [encoder setRenderPipelineState:pipeline->image_pipeline];
         [encoder setFragmentTexture:(id<MTLTexture>)texture_ptr atIndex:0];
         [encoder setFragmentSamplerState:pipeline->sampler atIndex:0];
+    } else if (command.kind == 3) {
+        // 圆角矩形：纯着色器绘制，无纹理；quad 外扩与几何偏移已随命令带来。
+        [encoder setRenderPipelineState:pipeline->rounded_pipeline];
     } else {
         return 0;
     }
 
     [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
-    [encoder setFragmentBytes:&primitive length:sizeof(primitive) atIndex:0];
+    // fragment uniform 按 kind 区分布局：solid/glyph 是颜色四元组，image 多
+    // 带 quad 尺寸与裁剪圆角，rounded 是填充 + 阴影的完整参数块。
+    if (command.kind == 3) {
+        // shadow_color 是打包 RGBA8（大端 [r,g,b,a]），在此归一化。
+        YuMetalRoundedUniforms rounded = {
+            command.width,
+            command.height,
+            command.rect_offset_x,
+            command.rect_offset_y,
+            command.rect_width,
+            command.rect_height,
+            command.radius,
+            command.shadow_blur,
+            command.shadow_offset_x,
+            command.shadow_offset_y,
+            (float)((command.shadow_color >> 24) & 0xffu) / 255.0f,
+            (float)((command.shadow_color >> 16) & 0xffu) / 255.0f,
+            (float)((command.shadow_color >> 8) & 0xffu) / 255.0f,
+            (float)(command.shadow_color & 0xffu) / 255.0f,
+            command.red,
+            command.green,
+            command.blue,
+            command.alpha,
+        };
+        [encoder setFragmentBytes:&rounded length:sizeof(rounded) atIndex:0];
+    } else if (command.kind == 2) {
+        YuMetalImageUniforms image = {
+            command.red,
+            command.green,
+            command.blue,
+            command.alpha,
+            command.width,
+            command.height,
+            command.radius,
+            0.0f,
+        };
+        [encoder setFragmentBytes:&image length:sizeof(image) atIndex:0];
+    } else {
+        YuMetalPrimitiveUniforms primitive = {
+            command.red,
+            command.green,
+            command.blue,
+            command.alpha,
+        };
+        [encoder setFragmentBytes:&primitive length:sizeof(primitive) atIndex:0];
+    }
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
     return 1;
 }
@@ -1092,6 +1208,7 @@ void yu_metal_release_pipeline(void *pipeline_ptr) {
     [pipeline->solid_pipeline release];
     [pipeline->glyph_pipeline release];
     [pipeline->image_pipeline release];
+    [pipeline->rounded_pipeline release];
     [pipeline->sampler release];
     free(pipeline);
 }

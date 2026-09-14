@@ -10,7 +10,9 @@
 //! 3. **验收本身。** S6 的验收是「新增一种语法的 diff 只落在 `yu-markdown`
 //!    内，且 < 200 行」。这里真的加一种，看它需不需要动别的地方。
 
-use yu_core::{ByteOffset, StyleId, TextAttrs, TextRange, TextStyle, WidgetId, WidgetSide};
+use yu_core::{
+    ByteOffset, StyleId, TextAttrs, TextRange, TextRole, TextStyle, WidgetId, WidgetSide,
+};
 use yu_decoration::{Decoration, LineStyleId};
 use yu_markdown::{
     BlockContext, BlockDecorations, BlockOrnament, BlockWidget, DelimitedSpan, Extension,
@@ -798,7 +800,8 @@ fn a_crlf_hard_break_hides_both_ending_bytes() {
     assert_eq!(hidden(&decorate("行尾\\\r\n第二行", None)), vec![(6, 7)]);
 }
 
-/// 链接正文按**正文**字型排，不继承外层。
+/// 链接正文按**正文**字型排，不继承外层；同时标上 `TextRole::Link`——
+/// 颜色与下划线由 `yu-workspace` 的 Theme 经这个角色解释。
 ///
 /// 不显式说出来的话，装配层的「窄的赢」会让外层的 `Strong` 赢，
 /// `**[文字](url)**` 里的链接正文就变粗了——画面变了，但不报错。
@@ -819,11 +822,9 @@ fn link_text_does_not_inherit_the_surrounding_style() {
 
     let link_text = range(3, 9);
     assert!(
-        marks
-            .iter()
-            .any(|(covered, attrs)| *covered == link_text
-                && *attrs == TextAttrs::new(TextStyle::Plain)),
-        "链接正文该有一条自己的 Plain mark，实际是 {marks:?}"
+        marks.iter().any(|(covered, attrs)| *covered == link_text
+            && *attrs == TextAttrs::new(TextStyle::Plain).with_role(TextRole::Link)),
+        "链接正文该有一条自己的 Plain+Link mark，实际是 {marks:?}"
     );
     assert!(
         marks

@@ -2807,6 +2807,31 @@ mod tests {
     }
     use super::*;
 
+    /// DrawCommand 是 Rust ↔ ObjC 两边手写同步的 ABI（没有头文件兜底），
+    /// 这里把布局钉死：改字段顺序或类型必须连带改 metal_bridge.m 的
+    /// YuMetalDrawCommand，并让本测试一起更新。
+    #[test]
+    fn draw_command_layout_matches_metal_bridge() {
+        use std::mem::{offset_of, size_of};
+
+        use yu_render::DrawCommand;
+
+        assert_eq!(size_of::<DrawCommand>(), 104);
+        assert_eq!(offset_of!(DrawCommand, kind), 0);
+        assert_eq!(offset_of!(DrawCommand, x), 4);
+        assert_eq!(offset_of!(DrawCommand, resource), 56);
+        assert_eq!(offset_of!(DrawCommand, image_kind), 64);
+        assert_eq!(offset_of!(DrawCommand, radius), 68);
+        assert_eq!(offset_of!(DrawCommand, rect_offset_x), 72);
+        assert_eq!(offset_of!(DrawCommand, rect_offset_y), 76);
+        assert_eq!(offset_of!(DrawCommand, rect_width), 80);
+        assert_eq!(offset_of!(DrawCommand, rect_height), 84);
+        assert_eq!(offset_of!(DrawCommand, shadow_offset_x), 88);
+        assert_eq!(offset_of!(DrawCommand, shadow_offset_y), 92);
+        assert_eq!(offset_of!(DrawCommand, shadow_blur), 96);
+        assert_eq!(offset_of!(DrawCommand, shadow_color), 100);
+    }
+
     #[test]
     fn retained_scroll_requires_pixel_alignment_and_overlap() {
         use yu_scene::Rect;
@@ -3095,6 +3120,52 @@ mod tests {
         let mut frame_renderer = MetalFrameRenderer::new(device).expect("command queue/pipeline");
         let result =
             frame_renderer.render_plan_with_images(&surface, &image_plan, &gpu_atlas, &image_atlas);
+        assert!(matches!(
+            result,
+            Ok(()) | Err(MetalRenderError::DrawableUnavailable)
+        ));
+        // M2 冒烟：带阴影的圆角矩形与圆角图片走真实 Metal 提交（本测试只
+        // 验证提交不失败，不判像素；像素正确性靠 SDF 公式的单元测试钉住）。
+        let mut rounded_scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 320.0, 180.0).expect("rounded viewport"),
+        )
+        .expect("rounded scene");
+        rounded_scene
+            .rounded_fill_rect(
+                Rect::new(24.0, 96.0, 120.0, 48.0).expect("rounded bounds"),
+                10.0,
+                Rgba8::new(240, 244, 248, 255),
+                Some(
+                    yu_scene::Shadow::new(2.0, 4.0, 8.0, Rgba8::new(0, 0, 0, 110))
+                        .expect("rounded shadow"),
+                ),
+            )
+            .expect("rounded fill primitive");
+        rounded_scene
+            .image(
+                ImagePrimitive::new(
+                    publication.key().fingerprint(),
+                    Rect::new(160.0, 96.0, 128.0, 64.0).expect("rounded image bounds"),
+                    Rgba8::new(230, 232, 236, 255),
+                )
+                .with_corner_radius(12.0),
+            )
+            .expect("rounded image primitive");
+        let rounded_plan = RenderPlanBuilder::new()
+            .build(
+                &rounded_scene.finish(),
+                &yu_font::GlyphAtlas::new(
+                    GlyphAtlasConfig::new(16, 16, 1).expect("rounded atlas config"),
+                ),
+            )
+            .expect("rounded render plan");
+        let result = frame_renderer.render_plan_with_images(
+            &surface,
+            &rounded_plan,
+            &gpu_atlas,
+            &image_atlas,
+        );
         assert!(matches!(
             result,
             Ok(()) | Err(MetalRenderError::DrawableUnavailable)

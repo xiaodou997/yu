@@ -20,6 +20,10 @@
 //! 字符。它们留在 [`BlockOrnaments`] 里，由绘制方拿去画。布局层拿到的是
 //! 「缩进 8.0」，不是「这是二级引用」。
 
+use crate::layout_tokens::{
+    LINE_HEIGHT_BODY, LINE_HEIGHT_CODE, box_content_inset_x, box_layout_config, heading_font_scale,
+    heading_line_height_scale, is_code_block,
+};
 use crate::marks::{Mark, flatten};
 use yu_core::{
     ByteOffset, ClusterMetrics, LineStyleId, ShapedText, ShapingProvider, StyleId, TextAttrs,
@@ -31,7 +35,7 @@ use yu_layout::{
     LayoutConfig, LayoutError, LayoutInput, LayoutRect, LineAttrs, LineSpan, LineStyleTable,
     StyleTable, StyledRun, WidgetSpan,
 };
-use yu_markdown::{BlockDecorations, BlockOrnament};
+use yu_markdown::{BlockDecorations, BlockKind, BlockOrnament};
 
 use crate::visual::VisualText;
 
@@ -279,6 +283,10 @@ pub struct BlockLayoutInput {
     styles: BlockStyleTable,
     line_styles: BlockLineStyleTable,
     ornaments: BlockOrnaments,
+    /// 这一块**生效的**布局配置：代码块/引用块已在 `box_layout_config` 里
+    /// 按水平内边距收窄过断行宽度。排版必须用它而不是调用方那份原始 config
+    /// ——两份对不上，断行就按旧宽度算，长行会溢出背景盒。
+    config: LayoutConfig,
 }
 
 impl BlockLayoutInput {
@@ -288,22 +296,27 @@ impl BlockLayoutInput {
     /// `decorations` 同 range 同 Revision）：视觉文本从那边来，样式段在这边
     /// 算，两者对不上就是「画面少了几个字」。
     ///
+    /// `kind` 是这一块在块序里的身份（段前段后间距、内边距、行高倍率都按
+    /// 块类取，见 `layout_tokens`）；布局层不认识 Markdown，这份翻译只能发生
+    /// 在这一层。
+    ///
     /// # Errors
     ///
     /// 装饰指向的 id 查不到、几何参数不合法、视觉偏移溢出。
     pub fn from_decorations<M: ClusterMetrics>(
+        kind: BlockKind,
         decorations: &BlockDecorations,
         visual: &VisualText,
         config: LayoutConfig,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
-        let draft = DecorationDraft::read(decorations, visual)?;
+        let draft = DecorationDraft::read(kind, decorations, visual)?;
         let marker = draft
             .marker
             .as_ref()
             .map(|marker| measure_marker_text(marker, metrics))
             .transpose()?;
-        draft.assemble(config, marker)
+        draft.assemble(box_layout_config(kind, config), marker)
     }
 
     /// 按 shaping 后端派生。列表标记的字形一并留下。
@@ -312,18 +325,19 @@ impl BlockLayoutInput {
     ///
     /// 同 [`BlockLayoutInput::from_decorations`]，外加 shaping 失败。
     pub fn from_decorations_shaped<S: ShapingProvider>(
+        kind: BlockKind,
         decorations: &BlockDecorations,
         visual: &VisualText,
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<Self, LayoutError> {
-        let draft = DecorationDraft::read(decorations, visual)?;
+        let draft = DecorationDraft::read(kind, decorations, visual)?;
         let marker = draft
             .marker
             .as_ref()
             .map(|marker| shape_marker_text(marker, shaper))
             .transpose()?;
-        draft.assemble(config, marker)
+        draft.assemble(box_layout_config(kind, config), marker)
     }
 
     #[must_use]
@@ -331,6 +345,12 @@ impl BlockLayoutInput {
         LayoutInput::new(&self.text, &self.runs)
             .with_widgets(&self.widgets)
             .with_line_styles(&self.lines)
+    }
+
+    /// 这一块生效的布局配置（断行宽度已按块类内边距收窄，见字段文档）。
+    #[must_use]
+    pub const fn layout_config(&self) -> LayoutConfig {
+        self.config
     }
 
     /// 这个块上的 widget 锚点，按 `(visual, side)` 升序。
@@ -518,18 +538,14 @@ struct HeadingMetrics {
 }
 
 fn heading_metrics(level: u8) -> Result<HeadingMetrics, LayoutError> {
-    let (font_scale, line_height_scale) = match level {
-        1 => (2.0, 2.2),
-        2 => (1.7, 1.9),
-        3 => (1.45, 1.65),
-        4 => (1.25, 1.4),
-        5 => (1.1, 1.2),
-        6 => (1.0, 1.1),
-        _ => {
-            return Err(LayoutError::InvalidConfig(
-                "heading level must be between one and six",
-            ));
-        }
+    // 字号与行高倍率都住在 `layout_tokens`（Typora 标杆值），这里只做
+    // level → 倍率的翻译；排版上标题一律按 Strong 出字型（见 assemble）。
+    let (Some(font_scale), Some(line_height_scale)) =
+        (heading_font_scale(level), heading_line_height_scale(level))
+    else {
+        return Err(LayoutError::InvalidConfig(
+            "heading level must be between one and six",
+        ));
     };
     Ok(HeadingMetrics {
         level,
@@ -607,6 +623,10 @@ fn thematic_break_metrics(
 /// 走的是与 v1 那条路**同一批**函数——差分要比的是「派生出了什么」，不是
 /// 「同一段算术抄了两遍」。
 struct DecorationDraft {
+    /// 这一块在块序里的身份。决定盒模型待遇：代码块/引用块的内边距、代码块
+    /// 的行高倍率（见 `layout_tokens`）。布局层不认识 Markdown，这份翻译只
+    /// 能发生在这一层。
+    kind: BlockKind,
     text: String,
     runs: Vec<StyledRun>,
     widgets: Vec<WidgetSpan>,
@@ -630,7 +650,11 @@ struct MarkerOrnamentSource {
 }
 
 impl DecorationDraft {
-    fn read(decorations: &BlockDecorations, visual: &VisualText) -> Result<Self, LayoutError> {
+    fn read(
+        kind: BlockKind,
+        decorations: &BlockDecorations,
+        visual: &VisualText,
+    ) -> Result<Self, LayoutError> {
         let bounds = decorations.range();
         if bounds != visual.source_range() || decorations.revision() != visual.revision() {
             return Err(LayoutError::Upstream("视觉文本与装饰不是同一份产出".into()));
@@ -724,6 +748,7 @@ impl DecorationDraft {
         }
 
         Ok(Self {
+            kind,
             text: visual.text().to_owned(),
             runs,
             widgets,
@@ -743,6 +768,7 @@ impl DecorationDraft {
         config: LayoutConfig,
         marker: Option<MarkerDraft>,
     ) -> Result<BlockLayoutInput, LayoutError> {
+        let kind = self.kind;
         let heading = self.heading.map(heading_metrics).transpose()?;
         let quote = self
             .quote
@@ -750,16 +776,19 @@ impl DecorationDraft {
             .transpose()?;
 
         let quote_gutter = quote.map_or(0.0, |quote| quote.gutter);
-        // 三段相加，各说一件事：引用的竖条让出多少、源码里缩进了几列、
-        // 行首标记本身占多宽（外加它与正文之间那一列）。
+        // 四段相加，各说一件事：块级盒模型的水平内边距（代码块/引用块，见
+        // `layout_tokens::box_content_inset_x`——断行宽度已在
+        // `box_layout_config` 里同步收窄）、引用的竖条让出多少、源码里缩进
+        // 了几列、行首标记本身占多宽（外加它与正文之间那一列）。
         //
         // 缩进此前挂在标记上，于是**没有标记的块一列都让不出来**——嵌套的
         // 任务项贴着左边缘，而同一层的普通列表项缩进了。
+        let box_inset = box_content_inset_x(kind);
         let column_gutter = config.default_advance() * f32::from(self.indent_columns);
         let marker_gutter = marker
             .as_ref()
             .map_or(0.0, |marker| marker.advance + config.default_advance());
-        let indent = quote_gutter + column_gutter + marker_gutter;
+        let indent = box_inset + quote_gutter + column_gutter + marker_gutter;
         let rule = self
             .rule
             .then(|| thematic_break_metrics(self.source_range, indent, config))
@@ -797,6 +826,17 @@ impl DecorationDraft {
             );
         }
 
+        // 行高倍率按块类给：标题按级别（h1/h2 1.3，h3–h6 1.25），代码块
+        // 1.65，其余一律正文 1.6（段落、引用、列表同待遇，见
+        // `layout_tokens`——这是 Typora 标杆值，不再默认 1.0）。
+        let line_height_scale = if let Some(heading) = heading {
+            heading.line_height_scale
+        } else if is_code_block(kind) {
+            LINE_HEIGHT_CODE
+        } else {
+            LINE_HEIGHT_BODY
+        };
+
         Ok(BlockLayoutInput {
             text: self.text,
             runs: self.runs,
@@ -805,10 +845,7 @@ impl DecorationDraft {
             lines: vec![LineSpan::new(visual, BLOCK_LINE_STYLE)],
             styles: BlockStyleTable { attrs },
             line_styles: BlockLineStyleTable {
-                attrs: LineAttrs::new(
-                    indent,
-                    heading.map_or(1.0, |heading| heading.line_height_scale),
-                )?,
+                attrs: LineAttrs::new(indent, line_height_scale)?,
             },
             ornaments: BlockOrnaments {
                 heading: heading.map(|heading| HeadingOrnament {
@@ -832,6 +869,7 @@ impl DecorationDraft {
                 }),
                 rule,
             },
+            config,
         })
     }
 }

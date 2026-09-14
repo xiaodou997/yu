@@ -146,6 +146,7 @@ impl LayoutCache {
         }
 
         let layout = BlockView::build_with_images(
+            block.kind(),
             source.visual,
             source.decorations,
             config,
@@ -172,6 +173,7 @@ impl LayoutCache {
         }
 
         let layout = BlockView::build_shaped_with_images(
+            block.kind(),
             source.visual,
             source.decorations,
             config,

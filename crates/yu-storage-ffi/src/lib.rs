@@ -35,6 +35,7 @@ use yu_editor::{
 #[cfg(target_os = "macos")]
 use yu_editor::{
     BlockOrnament, BlockView, CaretScrollRequest, ImageSpan, ViewportConfig, ViewportSpan,
+    layout_tokens::content_origin_y,
 };
 // `begin_table_resize_for_test` 在非 macOS 上也跑（表格排版是中立的），所以这两个
 // 类型在 test 构建里到处都要。**`cfg(macos)` 是错的**：clippy 看 lib target 说
@@ -3510,7 +3511,10 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
         if layout.lines().is_empty() {
             return YU_STORAGE_INVALID_SELECTION;
         }
-        let local_y = (query_y - block.y()).max(0.0);
+        // 块局部 y：文档 y 减块起点，再减内容原点——代码块的内容在盒里从上
+        // 内边距起排（`content_origin_y`，与折块高时加在内容上方的那 5pt 互为
+        // 反向）。漏减的表现是点击代码块落到上一行，不报错。
+        let local_y = (query_y - block.y() - content_origin_y(block.kind())).max(0.0);
         let hit = match layout.hit_test(LayoutPoint::new(point_x, local_y)) {
             Ok(hit) => hit,
             Err(_) => return YU_STORAGE_INVALID_SELECTION,
@@ -3547,7 +3551,10 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
                 Err(status) => return status,
             };
         let point = hit.point();
-        let document_y = block.y() + point.y();
+        // 折回文档坐标要补回内容原点：local_y 进 hit_test 时减过它（代码块的
+        // 内容在盒里从上内边距起排），这里不补，返回的 caret y 比画出来的
+        // 光标高 5pt。
+        let document_y = block.y() + content_origin_y(block.kind()) + point.y();
         if !point.x().is_finite() || !document_y.is_finite() {
             return YU_STORAGE_EDITOR_ERROR;
         }
@@ -7324,6 +7331,75 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
+    /// 代码块内的点击吃内容原点：文档 y 进 hit_test 时减去 `content_origin_y`，
+    /// 返回的 caret y 再加回来。判据取**同族参照**：点击同一行内文字的两个
+    /// 不同高度（差一个行高减 5pt），映射必须落在同一 caret——source、line、
+    /// 返回的 y 三者一致；漏掉原点的表现是偏下那个点越进行下沿落进块尾换行
+    /// 的空行盒，不报错。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_macos_projection_hit_test_includes_the_code_content_origin() {
+        let id = temp_id();
+        let path = std::env::temp_dir().join(format!("yu-storage-ffi-macos-code-hit-{id}.md"));
+        let source = "```\nbody\n```\n\npara\n";
+        fs::write(&path, source).expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        // 光标放在段落里：代码块不被揭示，内容就是 "body\n" 两行盒
+        // （文字行 + 块尾换行行盒）。
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    14,
+                    14,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        let code_line = metrics.line_height() * yu_editor::layout_tokens::LINE_HEIGHT_CODE;
+        // x 点在 'o' 上（内容内第二个字符）：行首的第一个字符带隐藏围栏的
+        // 边界 bias，点它会映射到源码 0——那不是这一刀要测的东西。
+        let probe = |y: f32| {
+            let mut hit = YuStorageProjectionHit::default();
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_projection_hit_test(raw, 0, 24.0, y, 14.0, 500.0, &mut hit)
+                },
+                YU_STORAGE_OK
+            );
+            hit
+        };
+        let upper = probe(5.0 + 2.0);
+        let lower = probe(5.0 + code_line - 3.0);
+        assert_eq!(upper.source_utf16, 5, "靠上的点击落在 body 行内");
+        assert_eq!(lower.source_utf16, 5, "贴行下沿的点击仍在 body 行内");
+        assert_eq!(upper.line, 0);
+        assert_eq!(lower.line, 0, "漏内容原点时这个点会落进块尾空行盒");
+        // 同一 caret 的返回 y 一致，且含内容原点：块局部 caret 顶 0 + 原点 5。
+        assert!(
+            (upper.y - lower.y).abs() < 0.01,
+            "同一 caret 的返回 y 必须一致：upper={} lower={}",
+            upper.y,
+            lower.y
+        );
+        assert!(
+            (upper.y - 5.0).abs() < 0.01,
+            "返回的 caret y 必须含内容原点（5pt）：{}",
+            upper.y
+        );
+
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_task_checkbox_hit_uses_current_published_frame_and_canonical_command() {
@@ -9059,10 +9135,14 @@ mod tests {
             (1, divider, YU_STORAGE_STALE_REVISION, 0),
             (0, f32::NAN, YU_STORAGE_EDITOR_ERROR, 0),
         ] {
-            assert_eq!(unsafe {
-                yu_storage_session_table_resize_hover(raw, revision, 14.0, 500.0,
-                    0.0, 240.0, x, point_y, 0.2, &mut hover)
-            }, expected_status);
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_table_resize_hover(
+                        raw, revision, 14.0, 500.0, 0.0, 240.0, x, point_y, 0.2, &mut hover,
+                    )
+                },
+                expected_status
+            );
             assert_eq!(hover, expected_hit);
         }
         let mut document_hit = YuStorageTableResizeHit::default();
@@ -10619,7 +10699,9 @@ mod tests {
         assert_eq!(revision, 0);
         let mut command = YuStorageCommandResult::default();
         assert_eq!(
-            unsafe { yu_storage_session_insert_text(raw, revision, b"x".as_ptr(), 1, &mut command) },
+            unsafe {
+                yu_storage_session_insert_text(raw, revision, b"x".as_ptr(), 1, &mut command)
+            },
             YU_STORAGE_OK
         );
         assert_eq!(

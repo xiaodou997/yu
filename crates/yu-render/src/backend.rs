@@ -63,6 +63,11 @@ impl Error for BackendError {}
 pub const DRAW_FILL_RECT: u32 = 0;
 pub const DRAW_GLYPH: u32 = 1;
 pub const DRAW_IMAGE: u32 = 2;
+/// 圆角矩形填充，可带软阴影。x/y/width/height 是**外扩后的绘制 quad**
+/// （带阴影时），几何矩形在 quad 内的位置与尺寸见 rect_offset_* /
+/// rect_width / rect_height；u0..v1 恒为 0,0,1,1，fragment 用 uv 在整 quad
+/// 上定位。u0..v1 与 shadow_* 槽位语义按 kind 区分，见各字段注释。
+pub const DRAW_ROUNDED_FILL_RECT: u32 = 3;
 pub const IMAGE_KIND_REGULAR: u32 = 0;
 const IMAGE_KIND_EMBEDDED_SVG_BASE: u32 = 1;
 
@@ -89,6 +94,25 @@ pub struct DrawCommand {
     pub page: u32,
     pub resource: u64,
     pub image_kind: u32,
+    /// 角半径（逻辑像素）。DRAW_ROUNDED_FILL_RECT 的填充圆角；
+    /// DRAW_IMAGE 的裁剪圆角。其余 kind 恒为 0。
+    pub radius: f32,
+    /// 几何矩形左上角相对绘制 quad 左上角的偏移（逻辑像素）。
+    /// 仅 DRAW_ROUNDED_FILL_RECT 使用；quad 不外扩时（无阴影）恒为 0。
+    /// fragment 以 `uv * quad_size - rect_offset` 还原几何坐标系。
+    pub rect_offset_x: f32,
+    pub rect_offset_y: f32,
+    /// 几何矩形的尺寸（逻辑像素）。仅 DRAW_ROUNDED_FILL_RECT 使用。
+    pub rect_width: f32,
+    pub rect_height: f32,
+    /// 阴影平移（逻辑像素）。仅 DRAW_ROUNDED_FILL_RECT 使用，无阴影恒为 0。
+    pub shadow_offset_x: f32,
+    pub shadow_offset_y: f32,
+    /// 高斯衰减的 σ（逻辑像素）。0 = 无阴影（shader 跳过阴影分支）。
+    pub shadow_blur: f32,
+    /// 打包的 RGBA8（大端 [r,g,b,a]，即 `yu_scene::Rgba8::packed()`）。
+    /// alpha 字节为 0 视为无阴影。仅 DRAW_ROUNDED_FILL_RECT 使用。
+    pub shadow_color: u32,
 }
 
 #[repr(C)]
@@ -359,6 +383,94 @@ pub fn build_draw_commands_at_viewport(
                     page: u32::MAX,
                     resource: 0,
                     image_kind: IMAGE_KIND_REGULAR,
+                    radius: 0.0,
+                    rect_offset_x: 0.0,
+                    rect_offset_y: 0.0,
+                    rect_width: 0.0,
+                    rect_height: 0.0,
+                    shadow_offset_x: 0.0,
+                    shadow_offset_y: 0.0,
+                    shadow_blur: 0.0,
+                    shadow_color: 0,
+                });
+            }
+            RenderCommand::RoundedFillRect {
+                bounds,
+                radius,
+                color,
+                shadow,
+            } => {
+                if !bounds.x().is_finite()
+                    || !bounds.y().is_finite()
+                    || !bounds.width().is_finite()
+                    || !bounds.height().is_finite()
+                {
+                    return Err(BackendError::InvalidRenderCommand(
+                        "rounded fill rectangle geometry is not finite",
+                    ));
+                }
+                if !radius.is_finite() || radius < 0.0 {
+                    return Err(BackendError::InvalidRenderCommand(
+                        "corner radius must be finite and non-negative",
+                    ));
+                }
+                if bounds.width() == 0.0 || bounds.height() == 0.0 {
+                    continue;
+                }
+                let x = bounds.x() - viewport.x();
+                let y = bounds.y() - viewport.y();
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(BackendError::InvalidRenderCommand(
+                        "rounded fill rectangle position is not finite",
+                    ));
+                }
+                // 绘制 quad 外扩到阴影最大到达范围，与 scene damage 共用
+                // `Shadow::outset` 的同一份公式（3σ + offset）——两边差一条边，
+                // damage 就会擦掉没有任何命令重绘的像素，或留下旧阴影残影。
+                let (left, top, right, bottom) = shadow
+                    .as_ref()
+                    .map_or((0.0, 0.0, 0.0, 0.0), yu_scene::Shadow::outset);
+                let quad_x = x - left;
+                let quad_y = y - top;
+                let quad_width = bounds.width() + left + right;
+                let quad_height = bounds.height() + top + bottom;
+                if !quad_x.is_finite()
+                    || !quad_y.is_finite()
+                    || !quad_width.is_finite()
+                    || !quad_height.is_finite()
+                {
+                    return Err(BackendError::InvalidRenderCommand(
+                        "rounded fill rectangle shadow extent is not finite",
+                    ));
+                }
+                commands.push(DrawCommand {
+                    kind: DRAW_ROUNDED_FILL_RECT,
+                    x: quad_x,
+                    y: quad_y,
+                    width: quad_width,
+                    height: quad_height,
+                    // kind 3 的 uv 语义是「铺满整个 quad」：fragment 以
+                    // uv * quad_size - rect_offset 还原几何坐标系。
+                    u0: 0.0,
+                    v0: 0.0,
+                    u1: 1.0,
+                    v1: 1.0,
+                    red: normalized_channel(color.red()),
+                    green: normalized_channel(color.green()),
+                    blue: normalized_channel(color.blue()),
+                    alpha: normalized_channel(color.alpha()),
+                    page: u32::MAX,
+                    resource: 0,
+                    image_kind: IMAGE_KIND_REGULAR,
+                    radius,
+                    rect_offset_x: left,
+                    rect_offset_y: top,
+                    rect_width: bounds.width(),
+                    rect_height: bounds.height(),
+                    shadow_offset_x: shadow.map_or(0.0, yu_scene::Shadow::offset_x),
+                    shadow_offset_y: shadow.map_or(0.0, yu_scene::Shadow::offset_y),
+                    shadow_blur: shadow.map_or(0.0, yu_scene::Shadow::blur),
+                    shadow_color: shadow.map_or(0, |shadow| shadow.color().packed()),
                 });
             }
             RenderCommand::Glyph {
@@ -436,12 +548,22 @@ pub fn build_draw_commands_at_viewport(
                     page,
                     resource: 0,
                     image_kind: IMAGE_KIND_REGULAR,
+                    radius: 0.0,
+                    rect_offset_x: 0.0,
+                    rect_offset_y: 0.0,
+                    rect_width: 0.0,
+                    rect_height: 0.0,
+                    shadow_offset_x: 0.0,
+                    shadow_offset_y: 0.0,
+                    shadow_blur: 0.0,
+                    shadow_color: 0,
                 });
             }
             RenderCommand::Image {
                 resource,
                 bounds,
                 fallback,
+                corner_radius,
             } => {
                 if !bounds.x().is_finite()
                     || !bounds.y().is_finite()
@@ -450,6 +572,11 @@ pub fn build_draw_commands_at_viewport(
                 {
                     return Err(BackendError::InvalidRenderCommand(
                         "image geometry is not finite",
+                    ));
+                }
+                if !corner_radius.is_finite() || corner_radius < 0.0 {
+                    return Err(BackendError::InvalidRenderCommand(
+                        "image corner radius must be finite and non-negative",
                     ));
                 }
                 if bounds.width() == 0.0 || bounds.height() == 0.0 {
@@ -480,6 +607,17 @@ pub fn build_draw_commands_at_viewport(
                         page: u32::MAX,
                         resource,
                         image_kind: IMAGE_KIND_REGULAR,
+                        // 圆角图片的裁剪半径；0 = 直角（现状），shader 在
+                        // radius <= 0 时跳过 SDF 分支，输出与 M2 前逐位一致。
+                        radius: corner_radius,
+                        rect_offset_x: 0.0,
+                        rect_offset_y: 0.0,
+                        rect_width: 0.0,
+                        rect_height: 0.0,
+                        shadow_offset_x: 0.0,
+                        shadow_offset_y: 0.0,
+                        shadow_blur: 0.0,
+                        shadow_color: 0,
                     });
                 } else {
                     commands.push(DrawCommand {
@@ -499,6 +637,15 @@ pub fn build_draw_commands_at_viewport(
                         page: u32::MAX,
                         resource: 0,
                         image_kind: IMAGE_KIND_REGULAR,
+                        radius: 0.0,
+                        rect_offset_x: 0.0,
+                        rect_offset_y: 0.0,
+                        rect_width: 0.0,
+                        rect_height: 0.0,
+                        shadow_offset_x: 0.0,
+                        shadow_offset_y: 0.0,
+                        shadow_blur: 0.0,
+                        shadow_color: 0,
                     });
                 }
             }
@@ -546,6 +693,15 @@ pub fn build_draw_commands_at_viewport(
                         page: u32::MAX,
                         resource,
                         image_kind: embedded_image_kind(kind),
+                        radius: 0.0,
+                        rect_offset_x: 0.0,
+                        rect_offset_y: 0.0,
+                        rect_width: 0.0,
+                        rect_height: 0.0,
+                        shadow_offset_x: 0.0,
+                        shadow_offset_y: 0.0,
+                        shadow_blur: 0.0,
+                        shadow_color: 0,
                     });
                 } else {
                     commands.push(DrawCommand {
@@ -565,6 +721,15 @@ pub fn build_draw_commands_at_viewport(
                         page: u32::MAX,
                         resource: 0,
                         image_kind: IMAGE_KIND_REGULAR,
+                        radius: 0.0,
+                        rect_offset_x: 0.0,
+                        rect_offset_y: 0.0,
+                        rect_width: 0.0,
+                        rect_height: 0.0,
+                        shadow_offset_x: 0.0,
+                        shadow_offset_y: 0.0,
+                        shadow_blur: 0.0,
+                        shadow_color: 0,
                     });
                 }
             }
@@ -631,6 +796,10 @@ pub fn build_damage_rects(plan: &RenderPlan) -> Result<Vec<DamageRect>, BackendE
 /// same coordinate space used by `build_damage_rects` and the native scissor
 /// ABI. Painter order is preserved, and a command is kept once even when it
 /// intersects multiple damage regions.
+///
+/// DRAW_ROUNDED_FILL_RECT 的 x/y/width/height 是**外扩后的 quad**（覆盖阴影
+/// 到达范围），scene damage 用 `Shadow::outset` 的同一份公式外扩——两边天然
+/// 对齐，这里不需要为阴影特判。
 pub fn cull_draw_commands(commands: Vec<DrawCommand>, damage: &[DamageRect]) -> Vec<DrawCommand> {
     commands
         .into_iter()
@@ -845,6 +1014,288 @@ mod tests {
         assert_eq!(image[0].u1, 1.0);
     }
 
+    /// 无阴影的圆角矩形：quad 就是几何 bounds，阴影槽位全 0，uv 语义为
+    ///「铺满整个 quad」（fragment 用 rect_offset + uv × quad_size 定位）。
+    #[test]
+    fn rounded_fill_rect_without_shadow_lowers_to_plain_quad() {
+        use std::collections::BTreeMap;
+
+        use yu_core::Revision;
+        use yu_scene::{Rect, SceneBuilder};
+
+        let bounds = Rect::new(12.0, 20.0, 40.0, 16.0).expect("bounds");
+        let mut scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 120.0, 80.0).expect("viewport"),
+        )
+        .expect("scene");
+        scene
+            .rounded_fill_rect(bounds, 6.0, Rgba8::new(10, 20, 30, 255), None)
+            .expect("rounded fill");
+        let plan = RenderPlanBuilder::new()
+            .build(
+                &scene.finish(),
+                &yu_font::GlyphAtlas::new(
+                    yu_font::GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"),
+                ),
+            )
+            .expect("plan");
+
+        let commands =
+            build_draw_commands(&plan, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
+                .expect("commands");
+        assert_eq!(commands.len(), 1);
+        let command = &commands[0];
+        assert_eq!(command.kind, DRAW_ROUNDED_FILL_RECT);
+        assert_eq!(command.x, 12.0);
+        assert_eq!(command.y, 20.0);
+        assert_eq!(command.width, 40.0);
+        assert_eq!(command.height, 16.0);
+        assert_eq!(
+            (command.u0, command.v0, command.u1, command.v1),
+            (0.0, 0.0, 1.0, 1.0)
+        );
+        assert_eq!(command.radius, 6.0);
+        assert_eq!((command.rect_offset_x, command.rect_offset_y), (0.0, 0.0));
+        assert_eq!((command.rect_width, command.rect_height), (40.0, 16.0));
+        assert_eq!(
+            (
+                command.shadow_offset_x,
+                command.shadow_offset_y,
+                command.shadow_blur,
+                command.shadow_color
+            ),
+            (0.0, 0.0, 0.0, 0)
+        );
+        assert_eq!(command.red, normalized_channel(10));
+    }
+
+    /// 带阴影时 quad 外扩到阴影最大到达范围，与 scene damage 共用
+    /// `Shadow::outset` 的同一份公式；几何矩形在 quad 内的位置与尺寸必须
+    /// 原样带过去，fragment 靠它们重建几何坐标系。
+    #[test]
+    fn rounded_fill_rect_with_shadow_expands_quad_like_damage() {
+        use std::collections::BTreeMap;
+
+        use yu_core::Revision;
+        use yu_scene::{Rect, SceneBuilder, Shadow};
+
+        let bounds = Rect::new(40.0, 50.0, 20.0, 10.0).expect("bounds");
+        let shadow = Shadow::new(4.0, -2.0, 10.0, Rgba8::new(1, 2, 3, 128)).expect("shadow");
+        let mut scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 200.0, 100.0).expect("viewport"),
+        )
+        .expect("scene");
+        scene
+            .rounded_fill_rect(bounds, 6.0, Rgba8::white(), Some(shadow))
+            .expect("rounded fill");
+        let scene = scene.finish();
+        let plan = RenderPlanBuilder::new()
+            .build(
+                &scene,
+                &yu_font::GlyphAtlas::new(
+                    yu_font::GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"),
+                ),
+            )
+            .expect("plan");
+
+        // scene damage 已按同一公式外扩（yu-scene 的测试钉死了 outset 本身）。
+        let damage = build_damage_rects(&plan).expect("damage");
+        assert_eq!(damage.len(), 1);
+        assert_eq!(
+            (
+                damage[0].x,
+                damage[0].y,
+                damage[0].x + damage[0].width,
+                damage[0].y + damage[0].height
+            ),
+            (10.0, 18.0, 94.0, 90.0)
+        );
+
+        let commands =
+            build_draw_commands(&plan, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
+                .expect("commands");
+        assert_eq!(commands.len(), 1);
+        let command = &commands[0];
+        // quad = bounds 外扩 (left 30, top 32, right 34, bottom 30)。
+        assert_eq!(command.kind, DRAW_ROUNDED_FILL_RECT);
+        assert_eq!(
+            (
+                command.x,
+                command.y,
+                command.x + command.width,
+                command.y + command.height
+            ),
+            (10.0, 18.0, 94.0, 90.0)
+        );
+        // 几何矩形在 quad 内的偏移就是左/上外扩量。
+        assert_eq!((command.rect_offset_x, command.rect_offset_y), (30.0, 32.0));
+        assert_eq!((command.rect_width, command.rect_height), (20.0, 10.0));
+        assert_eq!(
+            (command.shadow_offset_x, command.shadow_offset_y),
+            (4.0, -2.0)
+        );
+        assert_eq!(command.shadow_blur, 10.0);
+        assert_eq!(command.shadow_color, Rgba8::new(1, 2, 3, 128).packed());
+    }
+
+    /// 关键回归：只与阴影外扩区相交、与几何 bounds 不相交的 damage 必须保留
+    /// 命令——否则阴影区被清掉之后没有人重绘，屏幕上留下一块残影。
+    #[test]
+    fn damage_culling_keeps_shadowed_command_for_shadow_only_damage() {
+        let command = DrawCommand {
+            kind: DRAW_ROUNDED_FILL_RECT,
+            // 几何 bounds 是 (40, 50) 20x10；阴影向左探 30、向上探 32。
+            x: 10.0,
+            y: 18.0,
+            width: 84.0,
+            height: 72.0,
+            u0: 0.0,
+            v0: 0.0,
+            u1: 1.0,
+            v1: 1.0,
+            red: 1.0,
+            green: 1.0,
+            blue: 1.0,
+            alpha: 1.0,
+            page: u32::MAX,
+            resource: 0,
+            image_kind: IMAGE_KIND_REGULAR,
+            radius: 6.0,
+            rect_offset_x: 30.0,
+            rect_offset_y: 32.0,
+            rect_width: 20.0,
+            rect_height: 10.0,
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
+            shadow_blur: 10.0,
+            shadow_color: 0x0000_0080,
+        };
+        // 只碰阴影区（几何 bounds 的左边之外），不碰几何矩形本身。
+        let shadow_only = [DamageRect {
+            x: 20.0,
+            y: 30.0,
+            width: 15.0,
+            height: 15.0,
+        }];
+        let culled = cull_draw_commands(vec![command], &shadow_only);
+        assert_eq!(culled.len(), 1, "阴影区的 damage 必须保留带阴影的命令");
+
+        // 离外扩后的 quad 还差 1px 的 damage 则必须剔除。
+        let disjoint = [DamageRect {
+            x: 9.0,
+            y: 17.0,
+            width: 1.0,
+            height: 1.0,
+        }];
+        assert!(cull_draw_commands(vec![command], &disjoint).is_empty());
+    }
+
+    /// 图片圆角随命令直通 Metal；半径非法在 lower 层拒绝，与 fill 路径的
+    /// 几何校验同一层收口。
+    #[test]
+    fn image_draw_command_carries_corner_radius() {
+        use std::collections::BTreeMap;
+
+        use yu_core::Revision;
+        use yu_scene::{ImagePrimitive, Rect, SceneBuilder};
+
+        let bounds = Rect::new(4.0, 6.0, 32.0, 24.0).expect("image bounds");
+        let mut scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 120.0, 80.0).expect("viewport"),
+        )
+        .expect("scene");
+        scene
+            .image(ImagePrimitive::new(7, bounds, Rgba8::white()).with_corner_radius(8.0))
+            .expect("image");
+        let plan = RenderPlanBuilder::new()
+            .build(
+                &scene.finish(),
+                &yu_font::GlyphAtlas::new(
+                    yu_font::GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"),
+                ),
+            )
+            .expect("plan");
+
+        let mut ready = BTreeMap::new();
+        ready.insert(7, (2, 2));
+        let commands = build_draw_commands(&plan, &BTreeMap::new(), &ready, &BTreeMap::new())
+            .expect("commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].kind, DRAW_IMAGE);
+        assert_eq!(commands[0].radius, 8.0);
+        assert_eq!(commands[0].u1, 1.0);
+
+        let mut bad_scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 120.0, 80.0).expect("viewport"),
+        )
+        .expect("scene");
+        bad_scene
+            .image(ImagePrimitive::new(7, bounds, Rgba8::white()).with_corner_radius(-1.0))
+            .expect("image");
+        let bad_plan = RenderPlanBuilder::new()
+            .build(
+                &bad_scene.finish(),
+                &yu_font::GlyphAtlas::new(
+                    yu_font::GlyphAtlasConfig::new(8, 8, 1).expect("atlas config"),
+                ),
+            )
+            .expect("plan");
+        assert_eq!(
+            build_draw_commands(&bad_plan, &BTreeMap::new(), &ready, &BTreeMap::new())
+                .expect_err("negative corner radius"),
+            BackendError::InvalidRenderCommand(
+                "image corner radius must be finite and non-negative"
+            )
+        );
+    }
+
+    /// 非法半径与外扩溢出的阴影在 **scene 层**就被拒绝，到不了 lower 层——
+    /// 校验在装配时收口，而不是渲染时。lower 层保留同语义的防御性检查，因为
+    /// `DrawCommand` 这条 ABI 边界不假定 plan 的来源。
+    #[test]
+    fn rounded_fill_rect_rejects_invalid_geometry_at_scene_level() {
+        use yu_core::Revision;
+        use yu_scene::{Rect, SceneBuilder, SceneError, Shadow};
+
+        let push = |radius: f32, shadow: Option<Shadow>| {
+            let mut scene = SceneBuilder::new(
+                Revision::INITIAL,
+                Rect::new(0.0, 0.0, 120.0, 80.0).expect("viewport"),
+            )
+            .expect("scene");
+            scene.rounded_fill_rect(
+                Rect::new(4.0, 6.0, 32.0, 24.0).expect("bounds"),
+                radius,
+                Rgba8::white(),
+                shadow,
+            )
+        };
+
+        assert_eq!(
+            push(f32::NAN, None),
+            Err(SceneError::InvalidGeometry(
+                "corner radius must be finite and non-negative"
+            ))
+        );
+        assert_eq!(
+            push(-1.0, None),
+            Err(SceneError::InvalidGeometry(
+                "corner radius must be finite and non-negative"
+            ))
+        );
+        // blur 本身是合法有限值，但 3σ 外扩让矩形尺寸溢出 f32——damage
+        // 构造必须报错，而不是把非有限矩形塞进 DamageSet。
+        let huge = Shadow::new(0.0, 0.0, 1.0e38, Rgba8::black()).expect("shadow");
+        assert!(matches!(
+            push(0.0, Some(huge)),
+            Err(SceneError::Geometry(_))
+        ));
+    }
+
     #[test]
     fn draw_command_conversion_rejects_missing_atlas_page() {
         use std::collections::BTreeMap;
@@ -933,6 +1384,15 @@ mod tests {
                 page: u32::MAX,
                 resource: 0,
                 image_kind: IMAGE_KIND_REGULAR,
+                radius: 0.0,
+                rect_offset_x: 0.0,
+                rect_offset_y: 0.0,
+                rect_width: 0.0,
+                rect_height: 0.0,
+                shadow_offset_x: 0.0,
+                shadow_offset_y: 0.0,
+                shadow_blur: 0.0,
+                shadow_color: 0,
             },
             DrawCommand {
                 kind: DRAW_GLYPH,
@@ -951,6 +1411,15 @@ mod tests {
                 page: 2,
                 resource: 0,
                 image_kind: IMAGE_KIND_REGULAR,
+                radius: 0.0,
+                rect_offset_x: 0.0,
+                rect_offset_y: 0.0,
+                rect_width: 0.0,
+                rect_height: 0.0,
+                shadow_offset_x: 0.0,
+                shadow_offset_y: 0.0,
+                shadow_blur: 0.0,
+                shadow_color: 0,
             },
             DrawCommand {
                 kind: DRAW_FILL_RECT,
@@ -969,6 +1438,15 @@ mod tests {
                 page: u32::MAX,
                 resource: 0,
                 image_kind: IMAGE_KIND_REGULAR,
+                radius: 0.0,
+                rect_offset_x: 0.0,
+                rect_offset_y: 0.0,
+                rect_width: 0.0,
+                rect_height: 0.0,
+                shadow_offset_x: 0.0,
+                shadow_offset_y: 0.0,
+                shadow_blur: 0.0,
+                shadow_color: 0,
             },
         ];
         let damage = [DamageRect {
@@ -1003,6 +1481,15 @@ mod tests {
             page: u32::MAX,
             resource: 0,
             image_kind: IMAGE_KIND_REGULAR,
+            radius: 0.0,
+            rect_offset_x: 0.0,
+            rect_offset_y: 0.0,
+            rect_width: 0.0,
+            rect_height: 0.0,
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
+            shadow_blur: 0.0,
+            shadow_color: 0,
         };
         let damage = [
             DamageRect {

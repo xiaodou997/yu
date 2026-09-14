@@ -69,7 +69,7 @@ crates/yu-state         EditorState、Transaction 应用、History、Facet
 crates/yu-decoration    ★ RangeSet<Decoration>、source↔visual 映射
 crates/yu-layout        行盒、widget 盒、UAX#14 断行、UAX#9 bidi、hit-test
 crates/yu-scene         retained primitives 与 damage 追踪
-crates/yu-render        后端中立 RenderPlan：Glyph / FillRect / Texture / Quad
+crates/yu-render        后端中立 RenderPlan：FillRect / RoundedFillRect / Glyph / Image / EmbeddedSvg（变体集合冻结，见 invariants.md E3）
 crates/yu-font          字体解析、shaping、栅格化契约（只依赖 yu-core）
 crates/yu-assets        图片/嵌入资源的异步调度、LRU 与内存预算
 crates/yu-storage       UTF-8 Markdown 文档会话、原子保存、外部变更检测
