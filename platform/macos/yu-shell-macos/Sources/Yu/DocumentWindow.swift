@@ -48,6 +48,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private var searchQuery = ""
     private weak var sidebarStack: NSStackView?
     private weak var sidebarContainer: NSView?
+    private weak var railView: YuSidebarRailView?
     private weak var windowToolbar: NSToolbar?
     private var initialState: NativeStorageState
     private var fileWatcher: NativeFileWatcher?
@@ -112,7 +113,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         scrollView.scrollerStyle = .overlay
         scrollView.verticalScrollElasticity = .automatic
         scrollView.drawsBackground = true
-        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.backgroundColor = YuVisualTokens.canvas
+        scrollView.contentView.backgroundColor = YuVisualTokens.canvas
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         surfaceHostView.translatesAutoresizingMaskIntoConstraints = true
         surfaceHostView.autoresizingMask = []
@@ -195,6 +197,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // NSTextView created with the designated initializer can retain a
         // zero-sized document view while AX still exposes its source value.
         textView.frame = NSRect(x: 0, y: 0, width: 900, height: 620)
+        // 初始 inset 与 updateReadingColumnInsets 的算法同源（token）：窗口
+        // 第一次布局前，占位值也要是「窄窗 gutter 48、顶部 56」的形状。
+        textView.textContainerInset = NSSize(
+            width: YuVisualTokens.readingColumnMinGutter,
+            height: YuVisualTokens.readingColumnTopInset
+        )
         textView.autoresizingMask = [.width]
         textView.textContainer?.containerSize = NSSize(
             width: scrollView.contentSize.width,
@@ -274,11 +282,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         statusLabel.setAccessibilityElement(true)
         statusLabel.setAccessibilityLabel("文档状态")
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        statusLabel.font = NSFont.systemFont(ofSize: YuVisualTokens.statusBarFontSize)
         statusLabel.textColor = .secondaryLabelColor
 
         statusDetailLabel.font = NSFont.monospacedDigitSystemFont(
-            ofSize: NSFont.smallSystemFontSize,
+            ofSize: YuVisualTokens.statusBarFontSize,
             weight: .regular
         )
         statusDetailLabel.textColor = .secondaryLabelColor
@@ -316,7 +324,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         let sidebarHeader = YuSidebarHeaderView(
             documentName: URL(fileURLWithPath: bridge.path).lastPathComponent
         )
-        let sidebar = NSStackView(views: [sidebarHeader, outlinePanel.scrollView, searchPanel.view])
+        let sidebar = NSStackView(views: [
+            sidebarHeader,
+            outlinePanel.sectionHeader,
+            outlinePanel.scrollView,
+            searchPanel.view,
+        ])
         sidebar.orientation = .vertical
         sidebar.spacing = 0.0
         sidebar.distribution = .fill
@@ -346,11 +359,20 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         ])
         self.sidebarContainer = sidebarContainer
 
+        let rail = YuSidebarRailView()
+        rail.onSelect = { [weak self] mode in
+            self?.selectRailMode(mode)
+        }
+        railView = rail
+        let navigation = NSStackView(views: [rail, sidebarContainer])
+        navigation.orientation = .horizontal
+        navigation.spacing = 0
+        navigation.translatesAutoresizingMaskIntoConstraints = false
         let splitView = NSSplitView()
         splitView.isVertical = true
         splitView.dividerStyle = .thin
         splitView.translatesAutoresizingMaskIntoConstraints = false
-        splitView.addArrangedSubview(sidebarContainer)
+        splitView.addArrangedSubview(navigation)
         splitView.addArrangedSubview(scrollView)
         // 面板守住自己的宽度，缩放窗口时让文档吸收——否则拖窗口会把大纲挤没。
         splitView.setHoldingPriority(
@@ -378,9 +400,13 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            statusBar.heightAnchor.constraint(equalToConstant: 28.0),
-            sidebarContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 200.0),
+            statusBar.heightAnchor.constraint(equalToConstant: YuVisualTokens.statusBarHeight),
+            // 「侧栏内容 ≥ 设计宽度」钉在容器上而不是 navigation 上：隐藏的
+            // 视图不参与 Auto Layout，「文档」模式（整条侧栏收起）只剩 rail。
+            // 钉在 navigation 上会在两个面板都收起时留下一段空白侧栏。
+            sidebarContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: YuVisualTokens.sidebarWidth),
             sidebarContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 360.0),
+            outlinePanel.sectionHeader.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
             outlinePanel.scrollView.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
             searchPanel.view.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
             // 搜索面板占侧栏下半部的一块固定高度，大纲吃掉剩下的。
@@ -391,6 +417,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             ),
         ])
         view = root
+        // 初始显隐：大纲开、搜索关 → rail 选中「大纲」。之后的每次显隐突变都
+        // 经 updateSidebarVisibility 同步，这里只补初始一拍。
+        syncRailSelection()
         startFileWatcher()
         updateStatus()
         refreshOutline()
@@ -441,16 +470,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         }
     }
 
-    /// 展开搜索面板并把焦点交给查询框。
+    /// 展开搜索面板并把焦点交给查询框（焦点在 `setSearchPanelHidden(false)`
+    /// 里给，这里不再重复）。
     ///
     /// `updateSidebarVisibility` 不能少：两个面板都收起时整条侧栏也收起了，
     /// 只把搜索面板的 `isHidden` 翻回来，它仍然在一条隐藏的侧栏里——按 `⌘F`
     /// 什么也不会出现，而且不报错。
     private func showSearchPanel() {
-        searchPanel.view.isHidden = false
-        updateSidebarVisibility()
-        refreshSearch(force: true)
-        view.window?.makeFirstResponder(searchPanel.focusTarget)
+        setSearchPanelHidden(false)
     }
 
     @objc fileprivate func findNextFromMenu(_ sender: Any?) {
@@ -492,7 +519,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     @objc fileprivate func toggleSearchFromMenu(_ sender: Any?) {
-        let hidden = !searchPanel.view.isHidden
+        setSearchPanelHidden(!searchPanel.view.isHidden)
+    }
+
+    /// 搜索面板的显隐只有这一条写路径：菜单 `⌥⌘2`、rail 的「搜索」、
+    /// `⌘F` 展开，都从这里走，收起的清理（撤查询、撤高亮、还焦点）不另写。
+    private func setSearchPanelHidden(_ hidden: Bool) {
         searchPanel.view.isHidden = hidden
         if hidden {
             // 收起面板就收掉搜索：留着高亮而看不见结果列表，是「画面上有东西
@@ -504,10 +536,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             if view.window?.firstResponder === searchPanel.focusTarget {
                 focusDocument()
             }
-            updateSidebarVisibility()
         } else {
-            showSearchPanel()
+            refreshSearch(force: true)
+            view.window?.makeFirstResponder(searchPanel.focusTarget)
         }
+        updateSidebarVisibility()
     }
 
     /// 两个面板都收起来时，整条侧栏也收起来——否则会留下一条空白。
@@ -516,13 +549,50 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         sidebarStack?.isHidden = hidden
         sidebarContainer?.isHidden = hidden
         documentSplitView?.adjustSubviews()
+        syncRailSelection()
+    }
+
+    /// rail 的选中态由两个面板的实际显隐**推导**，不另存一份：rail 按钮、
+    /// 菜单快捷键（⌥⌘1 / ⌥⌘2 / ⌘F）走同一套显隐逻辑，推导就不会有「按钮
+    /// 说选中、面板没显示」的两个答案。两个面板同时可见的叠加态没有对应
+    /// 的 rail 模式，选中态置空。
+    private func syncRailSelection() {
+        let outlineVisible = !outlinePanel.scrollView.isHidden
+        let searchVisible = !searchPanel.view.isHidden
+        railView?.selection =
+            !outlineVisible && !searchVisible ? .documents
+            : outlineVisible && !searchVisible ? .outline
+            : searchVisible && !outlineVisible ? .search
+            : nil
+    }
+
+    /// rail 的三个模式按钮是排他的：「文档」藏起整条侧栏，「大纲」/「搜索」
+    /// 只亮对应面板。面板的显隐仍走上面的 setter，rail 自己不碰面板状态。
+    private func selectRailMode(_ mode: YuSidebarRailView.Mode) {
+        switch mode {
+        case .documents:
+            setOutlinePanelHidden(true)
+            setSearchPanelHidden(true)
+        case .outline:
+            setSearchPanelHidden(true)
+            setOutlinePanelHidden(false)
+        case .search:
+            setOutlinePanelHidden(true)
+            setSearchPanelHidden(false)
+        }
     }
 
     var searchIsVisible: Bool { !searchPanel.view.isHidden }
 
     @objc fileprivate func toggleOutlineFromMenu(_ sender: Any?) {
-        let hidden = !outlinePanel.scrollView.isHidden
+        setOutlinePanelHidden(!outlinePanel.scrollView.isHidden)
+    }
+
+    /// 大纲面板的显隐只有这一条写路径（rail 的「文档」/「搜索」与菜单
+    /// `⌥⌘1` 共用）：区头与列表同生同灭，显隐不分开写。
+    private func setOutlinePanelHidden(_ hidden: Bool) {
         outlinePanel.scrollView.isHidden = hidden
+        outlinePanel.sectionHeader.isHidden = hidden
         updateSidebarVisibility()
         if hidden, view.window?.firstResponder === outlinePanel.focusTarget {
             focusDocument()
@@ -544,6 +614,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     override func viewDidLayout() {
         super.viewDidLayout()
+        updateReadingColumnInsets()
         syncSurfaceGeometry()
         guard visualEnhancementsReady else {
             // Keep the native source mirror fully visible during the first
@@ -560,6 +631,23 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         surfaceCoordinator.refineCaretRevealIfNeeded()
     }
 
+    /// Keeps the source mirror and retained surface on the same Typora-like
+    /// reading column: wide windows center a capped column (860), while narrow
+    /// windows retain a comfortable minimum gutter (48).
+    private func updateReadingColumnInsets() {
+        guard let scrollView = documentScrollView else { return }
+        let width = scrollView.contentView.bounds.width
+        let gutter = max(
+            YuVisualTokens.readingColumnMinGutter,
+            (width - YuVisualTokens.readingColumnMaxWidth) * 0.5
+        )
+        let next = NSSize(width: gutter, height: YuVisualTokens.readingColumnTopInset)
+        if textView.textContainerInset != next {
+            textView.textContainerInset = next
+            textView.needsLayout = true
+        }
+    }
+
     override func viewDidAppear() {
         super.viewDidAppear()
         guard !visualEnhancementsReady else { return }
@@ -567,7 +655,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // 分栏的初始位置只能显式放一次：NSSplitView 给 subview 0 加的
         // holding priority 压过 `.defaultLow` 的首选宽度约束，光靠约束面板会
         // 缩到最小值。之后用户拖动仍然生效，min/max 由上面两条约束兜住。
-        documentSplitView?.setPosition(220.0, ofDividerAt: 0)
+        documentSplitView?.setPosition(YuVisualTokens.sidebarWidth, ofDividerAt: 0)
         // Defer the first optional projection submit by one main-thread turn
         // so source TextKit focus/IME setup has completed before any native
         // surface callback can run.
@@ -1087,6 +1175,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             guard let ready else { throw Failure(message: "Idle completion notification did not publish resources") }
             try require(ready.imageFailureCount == 0 && ready.frameSerial > first.frameSerial,
                         "Completed resources did not replace placeholder publication")
+            // 这条断言要求 fixture 图片的内在高度**高过正文行高**（行高 =
+            // line_height × 1.6 ≈ 32pt）：占位与就绪都占同一行时几何本就不
+            // 变，计数无从判读。fixture 的 latency.png 因此取 64px 高。
             try require(heightChanges == 1, "Image geometry changed \(heightChanges) times instead of once")
             try await Task.sleep(nanoseconds: 800_000_000)
             try require(surfaceCoordinator.lastSnapshot?.frameSerial == ready.frameSerial,
@@ -1390,12 +1481,14 @@ extension DocumentViewController: NSToolbarDelegate, NSToolbarItemValidation {
         default: return true
         }
     }
+    // 分组：保存/重新加载是左侧一组（固定间距分开），大纲/搜索靠右成组，
+    // 中间弹性空间顶开。图标统一 outline 风格 SF Symbols（无 .fill 变体）。
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.yuSave, .yuReload, .flexibleSpace, .yuOutline, .yuSearch]
+        [.yuSave, .yuReload, .flexibleSpace, .yuOutline, .yuSearch, .space]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.yuSave, .yuReload, .flexibleSpace, .yuOutline, .yuSearch]
+        [.yuSave, .space, .yuReload, .flexibleSpace, .yuOutline, .yuSearch]
     }
 
     func toolbar(
@@ -1469,6 +1562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var controller: DocumentViewController?
     private var launchSelfCheck = false
     private var darkModeSelfCheck = false
+    private var forceDarkMode = false
     private var renderRegression = false
     private var resourceRegression = false
 
@@ -1478,6 +1572,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         resourceRegression = CommandLine.arguments.contains("--resource-latency-self-check")
         launchSelfCheck = CommandLine.arguments.contains("--launch-window-self-check") || renderRegression || resourceRegression
         darkModeSelfCheck = CommandLine.arguments.contains("--dark-mode-self-check")
+        // 冒烟/截图用的显式外观开关：默认跟随系统，不参与 self-check。
+        forceDarkMode = CommandLine.arguments.contains("--dark-mode")
         if let argument = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
             path = URL(fileURLWithPath: argument).path
         } else {
@@ -1511,7 +1607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.titlebarAppearsTransparent = false
             window.titleVisibility = .visible
             window.title = URL(fileURLWithPath: bridge.path).lastPathComponent
-            if darkModeSelfCheck {
+            if darkModeSelfCheck || forceDarkMode {
                 window.appearance = NSAppearance(named: .darkAqua)
             }
             window.center()
@@ -1541,6 +1637,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                        window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua {
                         fputs("Yu dark-mode self-check failed: window is not Dark Aqua\n", stderr)
                         exit(EXIT_FAILURE)
+                    }
+                    if self.darkModeSelfCheck {
+                        // 视觉 token 必须是真动态：darkAqua 下解析出来仍要深、
+                        // aqua 下仍要浅，否则侧栏/rail/状态栏在深色模式下保持
+                        // 浅色（cgColor/layer 把颜色快照死的那类回归，截图才
+                        // 看得见，自动化必须替人眼先挡一道）。
+                        let dark = NSAppearance(named: .darkAqua)!
+                        let light = NSAppearance(named: .aqua)!
+                        func luma(_ token: NSColor, _ appearance: NSAppearance) -> Double {
+                            Double(
+                                YuVisualTokens.luminanceForSelfCheck(of: token, appearance: appearance)
+                                    ?? 0
+                            )
+                        }
+                        guard luma(YuVisualTokens.canvas, dark) < 0.5,
+                              luma(YuVisualTokens.railCanvas, dark) < 0.5,
+                              luma(YuVisualTokens.railSelection, dark) < 0.5,
+                              luma(YuVisualTokens.accentSoft, dark) < 0.6,
+                              luma(YuVisualTokens.canvas, light) > 0.9,
+                              luma(YuVisualTokens.railSelection, light) > 0.9 else {
+                            fputs(
+                                "Yu dark-mode self-check failed: visual tokens did not resolve for appearance\n",
+                                stderr
+                            )
+                            exit(EXIT_FAILURE)
+                        }
                     }
                     if let toolbar = window.toolbar {
                         // Exercise AppKit's repeated validation, not just the

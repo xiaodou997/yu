@@ -94,9 +94,19 @@ final class DocumentTextView: NSTextView {
         importsGraphics = false
         allowsUndo = false
         usesFindBar = true
-        font = NSFont.systemFont(ofSize: 16)
-        textColor = NSColor.textColor
-        backgroundColor = NSColor.textBackgroundColor
+        font = NSFont.systemFont(ofSize: 17)
+        textColor = NSColor(calibratedRed: 0.13, green: 0.15, blue: 0.18, alpha: 1)
+        insertionPointColor = YuVisualTokens.accent
+        backgroundColor = YuVisualTokens.canvas
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 5
+        paragraph.paragraphSpacing = 10
+        paragraph.lineBreakMode = .byWordWrapping
+        typingAttributes = [
+            .font: font as Any,
+            .foregroundColor: textColor as Any,
+            .paragraphStyle: paragraph,
+        ]
         setAccessibilityElement(true)
         setAccessibilityRole(.textArea)
         setAccessibilityLabel("Yu Markdown 文档")
