@@ -1717,9 +1717,9 @@ mod tests {
 
     #[test]
     fn scroll_damage_is_the_newly_exposed_strip() {
-        let old = Rect::new(0.0, 0.0, 100.0, 200.0).unwrap();
-        let down = Rect::new(0.0, 20.0, 100.0, 200.0).unwrap();
-        let damage = scroll_exposed_damage(old, down).unwrap();
+        let old = Rect::new(0.0, 0.0, 100.0, 200.0).expect("valid viewport rectangle");
+        let down = Rect::new(0.0, 20.0, 100.0, 200.0).expect("valid viewport rectangle");
+        let damage = scroll_exposed_damage(old, down).expect("valid scroll damage");
         assert_eq!(
             damage,
             vec![DamageRect {
@@ -1729,9 +1729,9 @@ mod tests {
                 height: 20.0
             }]
         );
-        let up = Rect::new(0.0, -10.0, 100.0, 200.0).unwrap();
+        let up = Rect::new(0.0, -10.0, 100.0, 200.0).expect("valid viewport rectangle");
         assert_eq!(
-            scroll_exposed_damage(old, up).unwrap(),
+            scroll_exposed_damage(old, up).expect("valid scroll damage"),
             vec![DamageRect {
                 x: 0.0,
                 y: 0.0,
@@ -1739,9 +1739,12 @@ mod tests {
                 height: 10.0
             }]
         );
-        let huge = Rect::new(0.0, 300.0, 100.0, 200.0).unwrap();
-        assert_eq!(scroll_exposed_damage(old, huge).unwrap()[0].height, 200.0);
-        let mismatched = Rect::new(0.0, 0.0, 80.0, 200.0).unwrap();
+        let huge = Rect::new(0.0, 300.0, 100.0, 200.0).expect("valid viewport rectangle");
+        assert_eq!(
+            scroll_exposed_damage(old, huge).expect("valid scroll damage")[0].height,
+            200.0
+        );
+        let mismatched = Rect::new(0.0, 0.0, 80.0, 200.0).expect("valid viewport rectangle");
         assert!(scroll_exposed_damage(old, mismatched).is_err());
     }
 }

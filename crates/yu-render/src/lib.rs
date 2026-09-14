@@ -839,19 +839,26 @@ mod tests {
 
     #[test]
     fn repeated_glyphs_do_not_repeat_page_hashing() {
-        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(16, 16, 1).unwrap());
+        let mut atlas =
+            GlyphAtlas::new(GlyphAtlasConfig::new(16, 16, 1).expect("valid atlas configuration"));
         let entry = make_glyph(&mut atlas, 1, 2, 3);
-        let mut scene =
-            SceneBuilder::new(Revision::INITIAL, Rect::new(0.0, 0.0, 80.0, 40.0).unwrap()).unwrap();
+        let mut scene = SceneBuilder::new(
+            Revision::INITIAL,
+            Rect::new(0.0, 0.0, 80.0, 40.0).expect("valid viewport"),
+        )
+        .expect("valid scene");
         for _ in 0..256 {
             scene
-                .glyph(GlyphPrimitive::new(entry, Point::new(4.0, 20.0), Rgba8::white()).unwrap())
-                .unwrap();
+                .glyph(
+                    GlyphPrimitive::new(entry, Point::new(4.0, 20.0), Rgba8::white())
+                        .expect("valid glyph"),
+                )
+                .expect("append glyph to scene");
         }
         let scene = scene.finish();
         let mut plans = RenderPlanBuilder::new();
         for expected_uploads in [1, 0] {
-            let plan = plans.build(&scene, &atlas).unwrap();
+            let plan = plans.build(&scene, &atlas).expect("build render plan");
             assert_eq!(plan.commands().len(), 256);
             assert_eq!(plan.uploads().len(), expected_uploads);
             assert_eq!(plans.last_hashed_pages, 1);
