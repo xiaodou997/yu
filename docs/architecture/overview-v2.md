@@ -1,5 +1,7 @@
 # Yu 架构总览 v2
 
+> Mac 客户端重构以 [mac-native-v3.md](mac-native-v3.md) 为准。本文中 Rust 独立文字断行、平台文字回放和旧输入宿主等实施约束已被替代；源码、事务和安全保存要求继续有效。
+
 ## 0. 这份文档的位置
 
 本文取代 `docs/architecture/overview.md`（v1）。v1 文档与 `docs/adr/` 下的 183 篇 ADR

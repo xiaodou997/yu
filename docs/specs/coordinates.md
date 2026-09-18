@@ -89,6 +89,11 @@ CaretAffinity::Upstream    → preceding visual line end
 CaretAffinity::Downstream  → following visual line start
 ```
 
+同一视觉行内的双向文字交界也可能有两个位置：Downstream 选择较低嵌入层级的主位置，
+Upstream 选择另一位置。两者直接取已排版簇的边界，不重新排列文字。命中结果的
+`boundary_affinity` 必须传回源码/光标查询；不能只保存 offset 并强制 Downstream。
+软换行先按 affinity 选择行，行内双向边界再选择位置；行边界没有相邻的两侧簇时不产生次位置。
+
 macOS TextKit 会把硬行末规范化为 LF 后 offset + upstream affinity。因此 point hit test 返回的是
 canonical caret position，不保证恢复一个具有相同几何但非独立可导航的 LF 前 offset。
 
@@ -154,3 +159,19 @@ mouse/AX range ──► UTF-16 + expected Revision
 写回不是文本编辑，不推进 source Revision；过期 Revision、越界、surrogate 中间位置或未知
 affinity 直接拒绝，平台层必须重新查询当前 selection。`NSSelectionAffinity` 与
 `CaretAffinity` 在 ABI 中使用显式 upstream/downstream 映射，不能依赖枚举的原始整数值。
+
+## Literal replacement atoms
+
+`Decoration::Substitute` carries an immutable scalar or static literal. A multi-scalar
+replacement (for example `&fjlig;` → `fj`) is one source atom; its visual UTF-8 length
+comes from the same value consumed by `VisualText`. A visual offset inside the atom
+maps to the source start/end according to `Bias::Before`/`After`; no character-count
+adjustment is permitted in the platform host.
+
+Cluster source coverage excludes neighboring hidden syntax, but includes a complete
+replacement when a cluster boundary falls inside it. `VisualText::source_coverage`
+composes the existing mapping queries for this distinction. Both ordinary/table
+clusters and projected table grapheme editing use it, so the two displayed glyphs
+of `&fjlig;` cannot produce an empty source deletion or absorb adjacent `**` markers.
+IME preedit retains its separate transient mapping semantics and never becomes a
+canonical replacement decoration.
