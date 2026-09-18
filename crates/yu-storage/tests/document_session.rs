@@ -15,6 +15,53 @@ use yu_storage::{
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn source_mode_save_preserves_bom_crlf_and_shared_undo() {
+    let path = TestPath::new("source-mode");
+    let body = "# 标题\r\n\r\n| a | b |\r\n| - | - |\r\n| x | y |\r\n";
+    let original = format!("\u{feff}{body}").into_bytes();
+    fs::write(path.as_path(), &original).expect("fixture");
+    let mut session = DocumentSession::open(path.as_path()).expect("open");
+    session
+        .editor_mut()
+        .set_source_mode(true)
+        .expect("source mode");
+    session.save().expect("unchanged save");
+    assert_eq!(fs::read(path.as_path()).expect("read"), original);
+    let caret = place_caret_at_end(&session.editor().snapshot());
+    session
+        .editor_mut()
+        .set_selection(caret)
+        .expect("selection");
+    session
+        .editor_mut()
+        .execute(EditorCommand::insert_text("新增🙂"))
+        .expect("edit");
+    session
+        .editor_mut()
+        .set_source_mode(false)
+        .expect("preview");
+    session.editor_mut().undo().expect("undo");
+    session.save().expect("save after undo");
+    assert_eq!(fs::read(path.as_path()).expect("read"), original);
+    session
+        .editor_mut()
+        .set_source_mode(true)
+        .expect("source mode");
+    session.editor_mut().redo().expect("redo");
+    session.save().expect("save source edit");
+    let reopened = DocumentSession::open(path.as_path()).expect("reopen");
+    assert_eq!(
+        reopened.editor().snapshot().as_str(),
+        format!("{body}新增🙂")
+    );
+    assert!(
+        fs::read(path.as_path())
+            .expect("read")
+            .starts_with(&[0xef, 0xbb, 0xbf])
+    );
+}
+
 /// 把光标移到文末。
 ///
 /// 新文档的光标落在文首——打开文件应该看到开头。需要「在末尾追加」这个前提的
@@ -638,4 +685,315 @@ fn unified_session_close_uses_same_dirty_and_external_state() {
             .expect("discard should close the unified session"),
         CloseTransition::Closed
     );
+}
+
+#[test]
+fn nested_table_tab_row_edit_undo_and_save_preserve_untouched_bytes() {
+    use yu_core::ByteOffset;
+    use yu_editor::{EditorKey, KeyEvent, KeyModifiers, KeyRouteResult};
+    for (intro, prefix) in [
+        ("", ""),
+        ("", "> "),
+        ("", "> > "),
+        ("- intro\n\n", "  "),
+        ("- intro\n\n", "  > "),
+    ] {
+        for newline in ["\n", "\r\n"] {
+            for final_newline in [false, true] {
+                let original = format!(
+                    "{intro}{prefix}| A | B |\n{prefix}| :--- | ---: |\n{prefix}| left | right |{}",
+                    if final_newline { "\n" } else { "" }
+                )
+                .replace('\n', newline);
+                let path = TestPath::new("nested-table-tab");
+                fs::write(path.as_path(), bom_bytes(&original)).expect("fixture");
+                let mut session = DocumentEditorSession::open(path.as_path()).expect("open");
+                let start = original.find("right").expect("last cell");
+                let caret = EditorSelection::cursor(
+                    &session.snapshot(),
+                    ByteOffset::new(start as u64),
+                    CaretAffinity::Downstream,
+                )
+                .expect("caret");
+                session.set_selection(caret).expect("selection");
+                assert!(
+                    matches!(session.route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE)).expect("append row"), KeyRouteResult::Executed(result) if result.changed()),
+                    "{prefix:?}"
+                );
+                let added = format!(
+                    "{original}{}{prefix}|  |  |{}",
+                    if final_newline { "" } else { newline },
+                    if final_newline { newline } else { "" }
+                );
+                assert_eq!(session.snapshot().as_str(), added, "{prefix:?}");
+                session
+                    .execute(EditorCommand::insert_text("羽|sample"))
+                    .expect("first cell");
+                let first_edit = session.snapshot().as_str().to_string();
+                assert!(
+                    matches!(session.route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE)).expect("next cell"), KeyRouteResult::Executed(result) if !result.changed())
+                );
+                session
+                    .execute(EditorCommand::insert_text("👨‍👩‍👧‍👦"))
+                    .expect("second cell");
+                let edited = session.snapshot().as_str().to_string();
+                assert_eq!(edited, added.replacen("|  |  |", r"|羽\|sample  |👨‍👩‍👧‍👦  |", 1));
+                for expected in [&first_edit, &added, &original] {
+                    session.execute(EditorCommand::undo()).expect("undo");
+                    assert_eq!(session.snapshot().as_str(), expected);
+                }
+                for expected in [&added, &first_edit, &edited] {
+                    session.execute(EditorCommand::redo()).expect("redo");
+                    assert_eq!(session.snapshot().as_str(), expected);
+                }
+                session.save().expect("atomic save");
+                assert_eq!(fs::read(path.as_path()).expect("disk"), bom_bytes(&edited));
+                let mut reopened = DocumentEditorSession::open(path.as_path()).expect("reopen");
+                assert_eq!(reopened.snapshot().as_str(), edited);
+                let focus = edited.find("👨‍👩‍👧‍👦").expect("emoji cell");
+                let caret = EditorSelection::cursor(
+                    &reopened.snapshot(),
+                    ByteOffset::new(focus as u64),
+                    CaretAffinity::Downstream,
+                )
+                .expect("caret");
+                reopened.set_selection(caret).expect("selection");
+                assert!(
+                    matches!(reopened.route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::SHIFT)).expect("previous cell"), KeyRouteResult::Executed(result) if !result.changed())
+                );
+                assert_eq!(
+                    reopened.selection().focus().get() as usize,
+                    edited.find('羽').expect("first cell")
+                );
+                assert_eq!(reopened.snapshot().as_str(), edited);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_grid_paste_save_undo_resave_preserves_bom_and_surrounding_source() {
+    use yu_core::ByteOffset;
+    for prefix in ["", "> ", "> > "] {
+        for newline in ["\n", "\r\n"] {
+            for bom in [false, true] {
+                let original = format!(
+                    "unchanged  *before*{newline}{newline}{prefix}| H | V |{newline}{prefix}| :--- | ---: |{newline}{prefix}| x | y |{newline}{newline}unchanged `after`"
+                );
+                let bytes = |text: &str| {
+                    if bom {
+                        bom_bytes(text)
+                    } else {
+                        text.as_bytes().to_vec()
+                    }
+                };
+                let path = TestPath::new("nested-grid-history-save");
+                fs::write(path.as_path(), bytes(&original)).expect("fixture");
+                let mut session = DocumentEditorSession::open(path.as_path()).expect("open");
+                let at = ByteOffset::new(original.find(" x ").expect("cell") as u64 + 1);
+                session
+                    .execute(EditorCommand::SelectTableCells {
+                        anchor: at,
+                        focus: at,
+                    })
+                    .expect("select grid");
+                session
+                    .execute(EditorCommand::PasteTsv("\"first\nsecond\"\t中文🪶".into()))
+                    .expect("paste grid");
+                let expected = original.replace(" x | y ", " first<br>second | 中文🪶 ");
+                assert_eq!(session.snapshot().as_str(), expected);
+                session.save().expect("save pasted grid");
+                assert_eq!(fs::read(path.as_path()).expect("disk"), bytes(&expected));
+                assert_eq!(
+                    DocumentEditorSession::open(path.as_path())
+                        .expect("reopen edited")
+                        .snapshot()
+                        .as_str(),
+                    expected
+                );
+                session
+                    .execute(EditorCommand::Undo)
+                    .expect("undo after save");
+                assert_eq!(session.snapshot().as_str(), original);
+                session.save().expect("save undo");
+                assert_eq!(
+                    fs::read(path.as_path()).expect("disk undo"),
+                    bytes(&original)
+                );
+                session
+                    .execute(EditorCommand::Redo)
+                    .expect("redo after save");
+                assert_eq!(session.snapshot().as_str(), expected);
+                session.save().expect("save redo");
+                assert_eq!(
+                    fs::read(path.as_path()).expect("disk redo"),
+                    bytes(&expected)
+                );
+                let reopened = DocumentEditorSession::open(path.as_path()).expect("reopen redo");
+                assert_eq!(reopened.snapshot().as_str(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn save_as_preserves_history_bom_and_original_and_requires_overwrite_consent() {
+    let original = TestPath::new("save-as-original");
+    let destination = TestPath::new("save-as-destination");
+    let initial = bom_bytes("# 中文\r\n");
+    fs::write(original.as_path(), &initial).expect("original");
+    fs::write(destination.as_path(), b"other document").expect("destination");
+    let mut session = DocumentEditorSession::open(original.as_path()).expect("open");
+    session
+        .set_selection(place_caret_at_end(&session.snapshot()))
+        .expect("caret");
+    session
+        .execute(EditorCommand::insert_text("🙂"))
+        .expect("edit");
+    let revision = session.revision();
+    let selection = session.selection();
+    assert!(matches!(
+        session.save_as(destination.as_path(), false),
+        Err(StorageError::ExternalChange { .. })
+    ));
+    assert_eq!(session.path(), original.as_path());
+    assert!(session.is_dirty());
+    assert_eq!(
+        fs::read(destination.as_path()).expect("read"),
+        b"other document"
+    );
+    session
+        .save_as(destination.as_path(), true)
+        .expect("confirmed overwrite");
+    assert_eq!(session.path(), destination.as_path());
+    assert_eq!(session.revision(), revision);
+    assert_eq!(session.selection(), selection);
+    assert!(!session.is_dirty());
+    assert_eq!(
+        fs::read(original.as_path()).expect("read original"),
+        initial
+    );
+    assert_eq!(
+        fs::read(destination.as_path()).expect("read copy"),
+        bom_bytes("# 中文\r\n🙂")
+    );
+    session
+        .execute(EditorCommand::Undo)
+        .expect("undo after save as");
+    assert_eq!(session.snapshot().as_str(), "# 中文\r\n");
+    session
+        .execute(EditorCommand::Redo)
+        .expect("redo after save as");
+    assert_eq!(session.snapshot().as_str(), "# 中文\r\n🙂");
+}
+
+#[test]
+fn failed_save_as_keeps_identity_and_current_path_cannot_bypass_conflict() {
+    let original = TestPath::new("save-as-failure");
+    fs::write(original.as_path(), b"base").expect("original");
+    let mut session = DocumentEditorSession::open(original.as_path()).expect("open");
+    session
+        .execute(EditorCommand::insert_text("edit"))
+        .expect("edit");
+    let source = session.snapshot().as_str().to_owned();
+    let missing = original.as_path().join("missing").join("copy.md");
+    assert!(session.save_as(missing, false).is_err());
+    assert_eq!(session.path(), original.as_path());
+    assert_eq!(session.snapshot().as_str(), source);
+    assert!(session.is_dirty());
+    fs::write(original.as_path(), b"external").expect("external");
+    assert!(matches!(
+        session.save_as(original.as_path(), true),
+        Err(StorageError::ExternalChange { .. })
+    ));
+    assert_eq!(fs::read(original.as_path()).expect("read"), b"external");
+}
+
+#[test]
+fn recovery_preserves_original_disk_baseline_after_external_edit_and_deletion() {
+    let target = TestPath::new("recover-conflict");
+    let root = TestDirectory::new("recover-conflict-store");
+    let store = RecoveryStore::new(root.as_path());
+    fs::write(target.as_path(), bom_bytes("base\r\n")).expect("base");
+    let mut session = DocumentEditorSession::open(target.as_path()).expect("open");
+    session
+        .execute(EditorCommand::insert_text("本地🙂"))
+        .expect("local");
+    session.write_recovery(&store).expect("backup");
+    fs::write(target.as_path(), b"external").expect("external");
+    let record = store.read(target.as_path()).expect("read").expect("record");
+    let mut recovered = DocumentEditorSession::recover(record);
+    assert!(recovered.is_dirty());
+    assert_eq!(recovered.bom(), Utf8Bom::Present);
+    assert_eq!(recovered.snapshot().as_str(), "本地🙂base\r\n");
+    assert_eq!(recovered.disk_state().expect("state"), DiskState::Changed);
+    assert!(matches!(
+        recovered.save(),
+        Err(StorageError::ExternalChange { .. })
+    ));
+    assert_eq!(fs::read(target.as_path()).expect("read"), b"external");
+    fs::remove_file(target.as_path()).expect("delete");
+    assert!(matches!(
+        recovered.save(),
+        Err(StorageError::ExternalChange {
+            state: ExternalFileState::Missing,
+            ..
+        })
+    ));
+    let copy = TestPath::new("recover-save-copy");
+    recovered
+        .save_as(copy.as_path(), false)
+        .expect("save recovered copy");
+    assert_eq!(
+        fs::read(copy.as_path()).expect("read"),
+        bom_bytes("本地🙂base\r\n")
+    );
+    assert!(!target.as_path().exists());
+}
+
+#[test]
+fn unsaved_recovery_stays_dirty_even_with_revision_zero_and_saves_to_new_destination() {
+    let draft = TestPath::new("recover-new-draft");
+    let copy = TestPath::new("recover-new-copy");
+    let root = TestDirectory::new("recover-new-store");
+    let store = RecoveryStore::new(root.as_path());
+    let session = DocumentEditorSession::new(draft.as_path(), "");
+    session.write_recovery(&store).expect("record empty draft");
+    let mut recovered =
+        DocumentEditorSession::recover(store.read(draft.as_path()).expect("read").expect("record"));
+    assert!(recovered.is_dirty());
+    assert!(!draft.as_path().exists());
+    recovered
+        .save_as(copy.as_path(), false)
+        .expect("save empty new document");
+    assert!(!recovered.is_dirty());
+    assert_eq!(fs::read(copy.as_path()).expect("copy"), b"");
+}
+
+#[test]
+fn cancelled_multi_window_quit_reopens_clean_and_discarded_sessions() {
+    let path = TestPath::new("quit-clean");
+    fs::write(path.as_path(), b"clean").expect("file");
+    let mut clean = DocumentEditorSession::open(path.as_path()).expect("open");
+    let draft = TestPath::new("quit-dirty");
+    let mut dirty = DocumentEditorSession::new(draft.as_path(), "unsaved");
+    assert_eq!(
+        clean.close_request().expect("request"),
+        CloseRequest::CloseNow
+    );
+    assert!(matches!(
+        dirty.close_request().expect("request"),
+        CloseRequest::Prompt(_)
+    ));
+    dirty.discard_close().expect("provisional discard");
+    clean.abort_close();
+    dirty.abort_close();
+    assert_eq!(clean.close_state(), CloseState::Open);
+    assert_eq!(dirty.close_state(), CloseState::Open);
+    assert_eq!(dirty.snapshot().as_str(), "unsaved");
+    assert!(matches!(
+        dirty.close_request().expect("request again"),
+        CloseRequest::Prompt(_)
+    ));
+    assert!(!draft.as_path().exists());
 }

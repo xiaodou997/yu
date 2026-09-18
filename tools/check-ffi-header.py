@@ -6,11 +6,12 @@
 的孤儿声明也不会让任何构建失败。S1 期间就因此漏下了 3 个函数声明和 7 个类型
 定义。本脚本把这层约束补上，由 CI 执行。
 
-检查四件事：
+检查五件事：
   1. 每个 `pub extern "C" fn` 都在头文件里有声明；
   2. 头文件里没有已无实现的函数声明；
   3. 头文件里没有已无实现的 `YuStorage*` 类型定义；
-  4. 没有一个 `pub extern "C" fn` 挂在 cfg 下面。
+  4. 没有一个 `pub extern "C" fn` 挂在 cfg 下面；
+  5. 共享主题及阅读几何别名的 C 字段顺序、类型和数组长度与 Rust 一致。
 
 第 4 条是 S7 第七刀补的，起因是前三条**全绿而头文件在撒谎**：
 `yu_storage_session_macos_task_checkbox_hit_test` 与
@@ -68,6 +69,54 @@ def conditionally_compiled(source: str) -> list[tuple[str, str]]:
     return found
 
 
+def shared_theme_layout_problems(header: str, source: str) -> list[str]:
+    """Compare ordered C fields with the repr(C) theme structs aliased by FFI.
+
+    Fail closed for unsupported declarations instead of accepting a matching
+    type name while Rust writes a larger value into Swift's stack allocation.
+    """
+    theme = (ROOT / "crates/yu-core/src/theme.rs").read_text(encoding="utf-8")
+    problems = []
+    if not re.search(r"#\[repr\(u32\)\]\s*(?:#\[[^\n]*\]\s*)*pub enum ThemeFont", theme):
+        problems.append("ThemeFont must retain repr(u32) for the shared theme ABI")
+    for name in ["ThemeSpec", "ReadingGeometry"]:
+        alias = "YuStorage" + name
+        if not re.search(rf"#\[repr\(C\)\]\s*(?:#\[[^\n]*\]\s*)*pub struct {name}", theme):
+            problems.append(f"{name} must retain repr(C) for the shared ABI")
+        if not re.search(rf"pub type {alias} = yu_core::{name};", source):
+            problems.append(f"Review shared struct mapping for {alias}")
+            continue
+        rust = re.search(rf"pub struct {name}\s*\{{([^{{}}]*)\}}", theme)
+        c = re.search(rf"typedef struct\s*\{{([^{{}}]*)\}}\s*{alias};", header)
+        if not rust or not c:
+            problems.append(f"Missing shared struct declaration: {alias}")
+            continue
+        expected = []
+        actual = []
+        types = {"f32": "float", "u32": "uint32_t", "ThemeFont": "uint32_t"}
+        for field, kind in re.findall(r"pub (\w+): ([^,]+),", rust[1]):
+            array = re.fullmatch(r"\[(\w+);\s*(\d+)\]", kind)
+            base, count = (array[1], array[2]) if array else (kind, "")
+            expected.append((field, types.get(base, "UNSUPPORTED:" + base), count))
+        for declaration in c[1].split(";"):
+            if not declaration.strip():
+                continue
+            parts = declaration.strip().split(None, 1)
+            if len(parts) != 2:
+                problems.append(f"Unsupported C field in {alias}: {declaration}")
+                continue
+            kind, names = parts
+            for field in names.split(","):
+                parsed = re.fullmatch(r"(\w+)(?:\[(\d+)\])?", field.strip())
+                if not parsed:
+                    problems.append(f"Unsupported C field in {alias}: {field}")
+                    continue
+                actual.append((parsed[1], kind, parsed[2] or ""))
+        if actual != expected:
+            problems.append(f"{alias} field order/types differ: C={actual!r}; Rust={expected!r}")
+    return problems
+
+
 def main() -> int:
     header = HEADER.read_text(encoding="utf-8")
     source = SOURCE.read_text(encoding="utf-8")
@@ -80,7 +129,7 @@ def main() -> int:
     source_types = set(re.findall(r"pub (?:struct|enum|union) (YuStorage[A-Za-z0-9]+)", source))
     source_types |= set(re.findall(r"\b(YuStorage[A-Za-z0-9]+)\b", source))
 
-    problems: list[str] = []
+    problems: list[str] = shared_theme_layout_problems(header, source)
 
     for name, attributes in conditionally_compiled(source):
         problems.append(f"这个 extern 函数挂在 cfg 下，头文件却无条件声明它: {name} ({attributes})")

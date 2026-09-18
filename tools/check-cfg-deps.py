@@ -92,6 +92,15 @@ def guarded_lines(lines: list[str]) -> set[int]:
     非属性、非文档注释开始；结束由花括号配平决定，没有花括号的（`use`、单行
     语句）到第一个以 `;` 结尾的行为止。
     """
+    # An inner cfg applies to the entire source module, including imported
+    # native types used inside function bodies.
+    for line in lines:
+        head = line.strip()
+        if re.match(r'^#!\[cfg\b', line):
+            return set(range(len(lines)))
+        if not head or head.startswith(("//", "#![")):
+            continue
+        break
     guarded: set[int] = set()
     for index, line in enumerate(lines):
         if not CFG_ATTRIBUTE.match(line.strip()):

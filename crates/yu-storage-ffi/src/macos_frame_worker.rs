@@ -104,6 +104,9 @@ impl<I: Send + 'static, O: Send + 'static> LatestWorker<I, O> {
                         mailbox.ready.replace((generation, output))
                     };
                     drop(previous);
+                    // The publication is visible before the main-thread wake.
+                    #[cfg(target_os = "macos")]
+                    yu_render_macos::notify_frame_work_ready();
                 }
             })?;
         Ok(Self { shared })
@@ -170,27 +173,35 @@ mod tests {
         let (entered, entered_rx) = mpsc::channel();
         let (resume, resume_rx) = mpsc::channel();
         let worker = LatestWorker::new(move |job, cancel| {
-            entered.send((job, std::thread::current().id())).unwrap();
+            entered
+                .send((job, std::thread::current().id()))
+                .expect("valid frame worker fixture");
             if job == 1 {
-                resume_rx.recv().unwrap();
+                resume_rx.recv().expect("valid frame worker fixture");
                 assert!(cancel.is_cancelled());
             }
             job
         })
-        .unwrap();
-        worker.submit(1, 1).unwrap();
-        let (_, thread) = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        .expect("valid frame worker fixture");
+        worker.submit(1, 1).expect("valid frame worker fixture");
+        let (_, thread) = entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("valid frame worker fixture");
         for job in 2..=1000 {
-            worker.submit(job, job).unwrap();
+            worker.submit(job, job).expect("valid frame worker fixture");
         }
         assert!(entered_rx.try_recv().is_err(), "no parallel builds");
-        resume.send(()).unwrap();
-        let (job, next_thread) = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        resume.send(()).expect("valid frame worker fixture");
+        let (job, next_thread) = entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("valid frame worker fixture");
         assert_eq!(job, 1000);
         assert_eq!(thread, next_thread);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if let Some((generation, result)) = worker.try_take().unwrap() {
+            if let Some((generation, result)) =
+                worker.try_take().expect("valid frame worker fixture")
+            {
                 assert_eq!((generation, result), (1000, 1000));
                 break;
             }
@@ -205,30 +216,52 @@ mod tests {
         let (entered, entered_rx) = mpsc::channel();
         let (resume, resume_rx) = mpsc::channel();
         let worker = LatestWorker::new(move |job, cancel| {
-            entered.send(job).unwrap();
+            entered.send(job).expect("valid frame worker fixture");
             if job == 1 {
-                resume_rx.recv().unwrap();
+                resume_rx.recv().expect("valid frame worker fixture");
                 assert!(cancel.is_cancelled());
             }
             job
         })
-        .unwrap();
-        worker.submit(1, 1).unwrap();
-        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
-        worker.submit(2, 2).unwrap();
+        .expect("valid frame worker fixture");
+        worker.submit(1, 1).expect("valid frame worker fixture");
+        assert_eq!(
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("valid frame worker fixture"),
+            1
+        );
+        worker.submit(2, 2).expect("valid frame worker fixture");
         worker.invalidate();
-        worker.submit(3, 3).unwrap(); // a new binding uses a new ticket
-        resume.send(()).unwrap();
-        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
+        worker.submit(3, 3).expect("valid frame worker fixture"); // a new binding uses a new ticket
+        resume.send(()).expect("valid frame worker fixture");
+        assert_eq!(
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("valid frame worker fixture"),
+            3
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         // Wait for a delivered result without consuming it: detach must clear
         // the ready slot as well as the queued/running old-binding work.
-        while worker.shared.mailbox.lock().unwrap().ready.is_none() {
+        while worker
+            .shared
+            .mailbox
+            .lock()
+            .expect("valid frame worker fixture")
+            .ready
+            .is_none()
+        {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
         worker.invalidate();
-        assert!(worker.try_take().unwrap().is_none());
+        assert!(
+            worker
+                .try_take()
+                .expect("valid frame worker fixture")
+                .is_none()
+        );
         assert!(entered_rx.try_recv().is_err());
     }
 
@@ -238,22 +271,26 @@ mod tests {
         let (resume, resume_rx) = mpsc::channel();
         let (finished, finished_rx) = mpsc::channel();
         let worker = LatestWorker::new(move |(), cancel| {
-            entered.send(()).unwrap();
-            resume_rx.recv().unwrap();
+            entered.send(()).expect("valid frame worker fixture");
+            resume_rx.recv().expect("valid frame worker fixture");
             assert!(cancel.is_cancelled());
-            finished.send(()).unwrap();
+            finished.send(()).expect("valid frame worker fixture");
         })
-        .unwrap();
-        worker.submit(1, ()).unwrap();
-        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        .expect("valid frame worker fixture");
+        worker.submit(1, ()).expect("valid frame worker fixture");
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("valid frame worker fixture");
         let (dropped, dropped_rx) = mpsc::channel();
         std::thread::spawn(move || {
             drop(worker);
-            dropped.send(()).unwrap();
+            dropped.send(()).expect("valid frame worker fixture");
         });
         let result = dropped_rx.recv_timeout(Duration::from_secs(2));
-        resume.send(()).unwrap();
+        resume.send(()).expect("valid frame worker fixture");
         assert!(result.is_ok(), "owner waited for preparation");
-        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("valid frame worker fixture");
     }
 }

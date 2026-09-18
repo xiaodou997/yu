@@ -35,7 +35,6 @@ use yu_editor::{
 #[cfg(target_os = "macos")]
 use yu_editor::{
     BlockOrnament, BlockView, CaretScrollRequest, ImageSpan, ViewportConfig, ViewportSpan,
-    layout_tokens::content_origin_y,
 };
 // `begin_table_resize_for_test` 在非 macOS 上也跑（表格排版是中立的），所以这两个
 // 类型在 test 构建里到处都要。**`cfg(macos)` 是错的**：clippy 看 lib target 说
@@ -45,7 +44,7 @@ use yu_editor::{LayoutConfig, LayoutPoint, TableResizeHit};
 use yu_export::{ExportError, export_clipboard, import_html_fragment};
 use yu_storage::{
     ClosePrompt, CloseRequest, CloseState, DiskState, DocumentEditorSession, ExternalFileState,
-    SaveOutcome, StorageError, Utf8Bom,
+    RecoveryRecord, RecoveryStore, SaveOutcome, StorageError, Utf8Bom,
 };
 use yu_text::{EditError, TextSnapshot};
 
@@ -114,6 +113,8 @@ pub const YU_STORAGE_RENDER_HOST_UNAVAILABLE: i32 = 21;
 pub const YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE: i32 = 22;
 /// Temporary presentation backpressure; retry the latest geometry later.
 pub const YU_STORAGE_RENDER_BUSY: i32 = 23;
+pub const YU_STORAGE_INVALID_TABLE_PASTE: i32 = 24;
+pub const YU_STORAGE_INVALID_RECOVERY: i32 = 25;
 
 #[cfg(target_os = "macos")]
 fn macos_surface_submit_error_status(error: yu_render_macos::MetalViewportHostError) -> i32 {
@@ -160,9 +161,12 @@ pub const YU_STORAGE_TABLE_RESIZE_NONE: u8 = 0;
 /// （见 `yu_workspace::Appearance`）。
 pub const YU_STORAGE_APPEARANCE_LIGHT: u8 = 0;
 pub const YU_STORAGE_APPEARANCE_DARK: u8 = 1;
+pub const YU_STORAGE_THEME_YU_LIGHT: u8 = 2;
+pub const YU_STORAGE_THEME_YU_DARK: u8 = 3;
 
 pub const YU_STORAGE_CLIPBOARD_TEXT: u8 = 0;
 pub const YU_STORAGE_CLIPBOARD_HTML: u8 = 1;
+pub const YU_STORAGE_CLIPBOARD_MARKDOWN: u8 = 2;
 
 pub const YU_STORAGE_TABLE_RESIZE_COLUMN: u8 = 1;
 pub const YU_STORAGE_TABLE_RESIZE_ROW: u8 = 2;
@@ -195,6 +199,30 @@ pub const YU_STORAGE_COMMAND_MOVE_UP: u8 = 13;
 pub const YU_STORAGE_COMMAND_MOVE_DOWN: u8 = 14;
 pub const YU_STORAGE_COMMAND_MOVE_UP_EXTEND: u8 = 15;
 pub const YU_STORAGE_COMMAND_MOVE_DOWN_EXTEND: u8 = 16;
+pub const YU_STORAGE_COMMAND_MOVE_LEFT_EXTEND: u8 = 17;
+pub const YU_STORAGE_COMMAND_MOVE_RIGHT_EXTEND: u8 = 18;
+pub const YU_STORAGE_COMMAND_MOVE_WORD_LEFT_EXTEND: u8 = 19;
+pub const YU_STORAGE_COMMAND_MOVE_WORD_RIGHT_EXTEND: u8 = 20;
+pub const YU_STORAGE_COMMAND_MOVE_DOCUMENT_START: u8 = 21;
+pub const YU_STORAGE_COMMAND_MOVE_DOCUMENT_END: u8 = 22;
+pub const YU_STORAGE_COMMAND_MOVE_DOCUMENT_START_EXTEND: u8 = 23;
+pub const YU_STORAGE_COMMAND_MOVE_DOCUMENT_END_EXTEND: u8 = 24;
+pub const YU_STORAGE_COMMAND_TABLE_NEXT: u8 = 25;
+pub const YU_STORAGE_COMMAND_TABLE_PREVIOUS: u8 = 26;
+pub const YU_STORAGE_COMMAND_DELETE_SELECTIONS: u8 = 27;
+pub const YU_STORAGE_COMMAND_TABLE_INSERT_ROW_BEFORE: u8 = 28;
+pub const YU_STORAGE_COMMAND_TABLE_INSERT_ROW_AFTER: u8 = 29;
+pub const YU_STORAGE_COMMAND_TABLE_DELETE_ROW: u8 = 30;
+pub const YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_BEFORE: u8 = 31;
+pub const YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_AFTER: u8 = 32;
+pub const YU_STORAGE_COMMAND_TABLE_DELETE_COLUMN: u8 = 33;
+pub const YU_STORAGE_COMMAND_TABLE_ALIGN_LEFT: u8 = 34;
+pub const YU_STORAGE_COMMAND_TABLE_ALIGN_CENTER: u8 = 35;
+pub const YU_STORAGE_COMMAND_TABLE_ALIGN_RIGHT: u8 = 36;
+pub const YU_STORAGE_COMMAND_TABLE_ALIGN_DEFAULT: u8 = 37;
+pub const YU_STORAGE_COMMAND_DELETE_WORD_BACKWARD: u8 = 38;
+pub const YU_STORAGE_COMMAND_DELETE_WORD_FORWARD: u8 = 39;
+
 pub const YU_STORAGE_SOURCE_SYNC_NONE: u8 = 0;
 pub const YU_STORAGE_SOURCE_SYNC_RANGE: u8 = 1;
 pub const YU_STORAGE_SOURCE_SYNC_FULL: u8 = 2;
@@ -235,6 +263,7 @@ pub const YU_STORAGE_CLOSE_ALREADY_CLOSED: u8 = 2;
 pub const YU_STORAGE_CLOSE_RESOLVE_CANCEL: u8 = 0;
 pub const YU_STORAGE_CLOSE_RESOLVE_SAVE: u8 = 1;
 pub const YU_STORAGE_CLOSE_RESOLVE_DISCARD: u8 = 2;
+pub const YU_STORAGE_CLOSE_RESOLVE_ABORT: u8 = 3;
 pub const YU_STORAGE_EXTERNAL_CHANGED: u8 = YU_STORAGE_DISK_CHANGED;
 pub const YU_STORAGE_EXTERNAL_MISSING: u8 = YU_STORAGE_DISK_MISSING;
 pub const YU_STORAGE_ACCESSIBILITY_PARENT_NONE: u32 = u32::MAX;
@@ -564,6 +593,7 @@ pub struct YuStorageMacosRenderHostSnapshot {
     /// 的结果。这个判断此前在平台侧，要三次纯查询往返才能得出。
     pub resource_refresh_pending: u8,
     pub resource_retry_pending: u8,
+    pub layout_pending: u8,
 }
 
 /// 平台在一次帧提交中提供的几何。
@@ -622,6 +652,7 @@ pub struct YuStorageMacosRenderHostSurfaceSnapshot {
     /// 见 [`YuStorageMacosRenderHostSnapshot::resource_refresh_pending`]。
     pub resource_refresh_pending: u8,
     pub resource_retry_pending: u8,
+    pub layout_pending: u8,
     /// 这一帧渲染出来的文档总高度。可滚动范围必须以它为准——平台没有第二套
     /// 布局可以推导这个值（不变量 I5）。
     pub content_height: f32,
@@ -692,6 +723,17 @@ pub struct YuStorageAccessibilityNodeV2 {
 /// 按文档顺序排，也就是前序；`child_count` 是直接孩子的条数。两者合起来足以
 /// 无歧义地还原整棵树，壳里因此没有一次查表、也没有「父亲查不到怎么办」
 /// 那一支。`parent` 留着，它与 `child_count` 互为对方的参照。
+/// Font traits in UTF-16 coordinates of the displayed outline label.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YuStorageOutlineStyleRun {
+    pub start_utf16: u64,
+    pub end_utf16: u64,
+    /// Bits: 1 = bold, 2 = italic, 4 = code. Other bits are zero.
+    pub traits: u8,
+    pub reserved: [u8; 7],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct YuStorageOutlineItem {
@@ -722,6 +764,9 @@ pub struct YuStorageOutlineItem {
     /// 跨刷新的身份，同一个缓冲里的位置。展开状态与选中行按它记。
     pub identity_utf8_offset: u64,
     pub identity_utf8_length: u64,
+    /// Slice of the style-run buffer for this displayed label.
+    pub style_offset: u64,
+    pub style_count: u64,
 }
 
 /// 结果面板上的一行：一处命中，加上它显示成的那行字。
@@ -816,11 +861,10 @@ impl MacosEmbeddedResourceState {
                         .ok()
                         .and_then(|value| value.parse::<u64>().ok())
                         .filter(|delay| *delay > 0 && *delay <= 30_000)
+                        && request.kind() == EmbeddedResourceKind::Math
                     {
-                        if request.kind() == EmbeddedResourceKind::Math {
-                            println!("yu-render-test resource=math delay_ms={delay}");
-                            std::thread::sleep(std::time::Duration::from_millis(delay));
-                        }
+                        println!("yu-render-test resource=math delay_ms={delay}");
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
                     }
                     let result = renderer.render(&request);
                     if sender.send((request, result)).is_err() {
@@ -917,11 +961,39 @@ impl MacosImageResourceState {
         })
     }
 
+    /// Geometry identity is document-local. Bitmap completions elsewhere in
+    /// the process must not invalidate this document's caret/layout snapshot.
+    fn geometry_version(&self, revision: Revision) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut sizes = BTreeMap::new();
+        for (key, image) in &self.intrinsics {
+            if image.revision() == revision {
+                let dimensions = image.dimensions();
+                sizes.insert(*key, (dimensions.width(), dimensions.height()));
+            }
+        }
+        for (key, image) in &self.publications {
+            if image.revision() == revision {
+                sizes.insert(
+                    *key,
+                    (image.dimensions().width(), image.dimensions().height()),
+                );
+            }
+        }
+        if sizes.is_empty() {
+            return 0;
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        sizes.hash(&mut hash);
+        hash.finish()
+    }
+
     fn sync(
         &mut self,
         plan: ImageRequestPlan,
         revision: yu_core::Revision,
         document_path: PathBuf,
+        max_pixel_dimension: u32,
     ) -> Result<(), i32> {
         let stats = plan.stats();
         self.visible_request_count = stats.unique_count();
@@ -959,6 +1031,7 @@ impl MacosImageResourceState {
         self.publications.clear();
         self.intrinsics.clear();
         for request in plan.into_requests() {
+            let request = request.with_max_pixel_dimension(max_pixel_dimension);
             let request_for_metadata = request.clone();
             if self.in_flight.contains(request.key()) {
                 if let Some(intrinsic) = self.cache.intrinsic_publication(&request_for_metadata) {
@@ -1040,6 +1113,7 @@ impl MacosFrameTicket {
 #[cfg(target_os = "macos")]
 struct MacosFrameBuildJob {
     input: ViewportFrameBuildInput,
+    shaper: CoreTextShaper,
     config: ViewportRenderConfig,
     ticket: MacosFrameTicket,
     minimum_serial: u64,
@@ -1055,12 +1129,13 @@ struct MacosFrameBuildResult {
 type MacosFrameBuildWorker = LatestWorker<MacosFrameBuildJob, MacosFrameBuildResult>;
 
 #[cfg(target_os = "macos")]
-fn macos_new_frame_worker() -> Option<MacosFrameBuildWorker> {
+fn macos_new_frame_worker(initial_serial: u64) -> Option<MacosFrameBuildWorker> {
     let mut builder: Option<CoreTextViewportFrameBuilder> = None;
-    let mut document: Option<yu_editor::EditorDocument> = None;
-    let mut serial = 0;
+    let mut document: Option<yu_editor::LayoutContext> = None;
+    let mut serial = initial_serial;
     LatestWorker::new(move |job: MacosFrameBuildJob, cancellation| {
         let MacosFrameBuildJob {
+            shaper,
             input:
                 ViewportFrameBuildInput {
                     request,
@@ -1075,17 +1150,13 @@ fn macos_new_frame_worker() -> Option<MacosFrameBuildWorker> {
         debug_assert_eq!(cancellation.generation(), ticket.request.generation());
         let start = std::time::Instant::now();
         let output = (|| {
-            let rebuild = minimum_serial > serial
-                || builder.as_ref().is_none_or(|builder| {
-                    builder.config().font_size() != config.font_size()
-                        || builder.config().raster_scale() != config.raster_scale()
-                });
+            let rebuild = builder.as_ref().is_none_or(|builder| {
+                builder.config().font_size() != config.font_size()
+                    || builder.config().raster_scale() != config.raster_scale()
+                    || builder.config().appearance() != config.appearance()
+            });
             serial = serial.max(minimum_serial);
             if rebuild {
-                let (shaper, _, _) = core_text_system_ui_layout(
-                    config.font_size(),
-                    config.scene_viewport().width(),
-                )?;
                 if cancellation.is_cancelled() {
                     return Err(YU_STORAGE_RENDER_BUSY);
                 }
@@ -1100,6 +1171,9 @@ fn macos_new_frame_worker() -> Option<MacosFrameBuildWorker> {
                 );
             }
             let builder = builder.as_mut().ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+            // Cancellation can occur after raising the local serial floor but before
+            // replacing the builder. Enforce the accepted floor on every job.
+            builder.ensure_publication_serial(minimum_serial);
             builder
                 .update_config(config)
                 .map_err(|error| macos_render_host_error_status(&error))?;
@@ -1108,14 +1182,57 @@ fn macos_new_frame_worker() -> Option<MacosFrameBuildWorker> {
             }
             let reused = document
                 .as_ref()
-                .is_some_and(|document| snapshot.can_reuse_worker_document(document));
+                .is_some_and(|document| snapshot.can_reuse_layout_context(document));
             let mut owned_document = if reused {
-                document.take().ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?
+                let mut retained = document.take().ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+                snapshot.merge_into_layout_context(&mut retained);
+                retained
             } else {
-                snapshot
-                    .into_document()
-                    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?
+                snapshot.into_layout_context()
             };
+            // Active input and the current viewport always precede distant work.
+            let focus = owned_document.selection().focus();
+            yu_workspace::prepare_layout_snapshot_with_resources_cancelable(
+                &mut owned_document,
+                yu_editor::LayoutQuery::Source(focus),
+                builder.shaper(),
+                &image_publications,
+                &image_intrinsics,
+                config.table_resize(),
+                &mut || cancellation.is_cancelled(),
+            )
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+            yu_workspace::prepare_layout_snapshot_with_resources_cancelable(
+                &mut owned_document,
+                config.viewport(),
+                builder.shaper(),
+                &image_publications,
+                &image_intrinsics,
+                config.table_resize(),
+                &mut || cancellation.is_cancelled(),
+            )
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+            // A changed input/width gets its visible publication first. Distant
+            // measurement resumes on the next job with the same visual input.
+            let measured = if reused { yu_workspace::measure_background_paragraphs_with_resources(
+                &mut owned_document,
+                builder.shaper(),
+                &image_publications,
+                &image_intrinsics,
+                config.table_resize(),
+                &mut || cancellation.is_cancelled(),
+            )
+            .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)? } else { 0 };
+            if std::env::var_os("YU_RENDER_TIMING").is_some() {
+                println!(
+                    "yu-render-metric event=layout_batch measured={} remaining={} cached_paragraphs={} evicted_paragraphs={}",
+                    measured,
+                    owned_document.viewport_stats().entries()
+                        - owned_document.viewport_stats().measured(),
+                    owned_document.layout_cache_stats().entries(),
+                    owned_document.layout_cache_stats().evicted(),
+                );
+            }
             let output = builder
                 .publish_owned_document_cancelable(
                     request,
@@ -1124,8 +1241,9 @@ fn macos_new_frame_worker() -> Option<MacosFrameBuildWorker> {
                     image_intrinsics,
                     &mut || cancellation.is_cancelled(),
                 )
-                .map_err(|error| macos_render_host_error_status(&error))?;
+                .map_err(|error| macos_render_host_error_status(&error));
             document = Some(owned_document);
+            let output = output?;
             serial = output.publication.serial();
             Ok(output)
         })();
@@ -1159,6 +1277,7 @@ struct MacosRenderHostState {
     prepared_build: Option<FrameBuildKey>,
     resource_refresh_pending: bool,
     resource_retry_pending: bool,
+    layout_pending: bool,
     resource_completion_generation: u64,
     frame_worker: Option<MacosFrameBuildWorker>,
     frame_worker_request: Option<MacosFrameTicket>,
@@ -1178,6 +1297,8 @@ struct MacosRenderHostState {
 const fn appearance_from_raw(raw: u8) -> Appearance {
     match raw {
         YU_STORAGE_APPEARANCE_DARK => Appearance::Dark,
+        YU_STORAGE_THEME_YU_LIGHT => Appearance::YuLight,
+        YU_STORAGE_THEME_YU_DARK => Appearance::YuDark,
         _ => Appearance::Light,
     }
 }
@@ -1230,6 +1351,47 @@ fn frame_key(
         appearance,
         geometry,
     )
+    .with_table_columns(session.session.selections().table_columns())
+    .with_table_width_generation(session.session.document().editor().table_width_generation())
+    .with_source_mode(session.session.document().editor().source_mode())
+}
+
+/// Switch the canonical editor's projection without editing the source.
+/// # Safety
+/// A live session; call on the AppKit main thread when attached to a surface.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_source_mode(
+    session: *mut YuStorageSession,
+    enabled: u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if enabled > 1 {
+        return YU_STORAGE_EDITOR_ERROR;
+    }
+    if session.session.document().editor().source_mode() == (enabled != 0) {
+        return YU_STORAGE_OK;
+    }
+    if session
+        .session
+        .document_mut()
+        .editor_mut()
+        .set_source_mode(enabled != 0)
+        .is_err()
+    {
+        return YU_STORAGE_EDITOR_ERROR;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(state) = session.macos_render_host.as_mut() {
+        if let Some(worker) = state.frame_worker.as_ref() {
+            worker.invalidate();
+        }
+        state.frame_worker_request = None;
+        state.last_frame_key = None;
+        state.prepared_build = None;
+    }
+    YU_STORAGE_OK
 }
 
 #[cfg(target_os = "macos")]
@@ -1279,7 +1441,110 @@ pub struct YuStorageSession {
     #[cfg(target_os = "macos")]
     macos_render_host: Option<MacosRenderHostState>,
     #[cfg(target_os = "macos")]
+    shader_library: Option<Vec<u8>>,
+    #[cfg(target_os = "macos")]
     macos_embedded_resources: MacosEmbeddedResourceState,
+}
+
+/// Set the compiled library before attaching a native surface. No runtime compiler.
+/// # Safety
+/// The session must be live and the UTF-8 path readable for `length` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_shader_library(
+    session: *mut YuStorageSession,
+    path: *const u8,
+    length: usize,
+) -> i32 {
+    if session.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let path = match read_utf8(path, length) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let session = unsafe { &mut *session };
+        if session
+            .macos_render_host
+            .as_ref()
+            .is_some_and(|host| host.surface.is_some())
+        {
+            return YU_STORAGE_RENDER_HOST_UNAVAILABLE;
+        }
+        let library = match std::fs::read(path) {
+            Ok(bytes) if bytes.starts_with(b"MTLB") => bytes,
+            _ => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+        };
+        session.shader_library = Some(library);
+        YU_STORAGE_OK
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
+/// Release derived CPU/GPU caches on memory pressure. Source/history are retained.
+/// # Safety
+/// A live session, called on the AppKit main thread if a surface exists.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_trim_render_caches(
+    session: *mut YuStorageSession,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(state) = session.macos_render_host.as_mut() {
+            let config = state.builder.config();
+            let (shaper, _, _) = match core_text_layout(
+                config.font_size(),
+                config.scene_viewport().width(),
+                config.appearance().theme_id(),
+            ) {
+                Ok(result) => result,
+                Err(status) => return status,
+            };
+            let serial = state
+                .last_publication
+                .as_ref()
+                .map_or(0, |publication| publication.serial());
+            let builder = match CoreTextViewportFrameBuilder::with_shaper_and_initial_serial(
+                shaper,
+                config,
+                GlyphAtlasConfig::default(),
+                serial,
+            ) {
+                Ok(builder) => builder,
+                Err(_) => return YU_STORAGE_RENDER_HOST_UNAVAILABLE,
+            };
+            if let Some(worker) = state.frame_worker.take() {
+                worker.invalidate();
+            }
+            state.frame_worker = macos_new_frame_worker(serial);
+            state.frame_worker_request = None;
+            state.builder = builder;
+            state.last_publication = None;
+            state.last_frame_key = None;
+            state.prepared_build = None;
+            state.host = MetalViewportHostSession::new(
+                session.session.revision(),
+                state.host.surface_generation(),
+            );
+            state.image_resources.cache.clear_decoded();
+            state.image_resources.publications.clear();
+            if let Some(surface) = state.surface.as_mut() {
+                surface.atlas = MetalAtlas::new();
+                surface.image_atlas = MetalImageAtlas::new();
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = session;
+    YU_STORAGE_OK
 }
 
 fn read_utf8<'a>(pointer: *const u8, length: usize) -> Result<&'a str, i32> {
@@ -1378,6 +1643,7 @@ fn status_from_editor_error(error: EditorDocumentError) -> i32 {
             YU_STORAGE_STALE_REVISION
         }
         EditorDocumentError::CompositionNotActive => YU_STORAGE_NO_OVERLAY,
+        EditorDocumentError::InvalidTablePaste => YU_STORAGE_INVALID_TABLE_PASTE,
         EditorDocumentError::Selection(_) | EditorDocumentError::Composition(_) => {
             YU_STORAGE_INVALID_SELECTION
         }
@@ -1705,13 +1971,21 @@ fn push_display(text: &mut String, piece: &str) -> (u64, u64) {
 /// 连续缓冲。
 fn outline_rows_output(
     session: &mut DocumentEditorSession,
-) -> Result<(Vec<YuStorageOutlineItem>, String), i32> {
+) -> Result<
+    (
+        Vec<YuStorageOutlineItem>,
+        String,
+        Vec<YuStorageOutlineStyleRun>,
+    ),
+    i32,
+> {
     let snapshot = session.snapshot();
     let tree = OutlineTree::build(session.document_mut().editor_mut())
         .map_err(|error| panel_status(&error))?;
     let revision = tree.revision().get();
     let mut items = Vec::with_capacity(tree.rows().len());
     let mut text = String::new();
+    let mut runs = Vec::new();
     for row in tree.rows() {
         let item = row.item();
         let (source_start_utf16, source_end_utf16) =
@@ -1720,6 +1994,25 @@ fn outline_rows_output(
             source_utf16_range(&snapshot, item.label_range())?;
         let (display_utf8_offset, display_utf8_length) = push_display(&mut text, row.label());
         let (identity_utf8_offset, identity_utf8_length) = push_display(&mut text, row.identity());
+        let style_offset = runs.len() as u64;
+        let mut byte_offset = 0;
+        let mut utf16_offset = 0;
+        for run in row.label_runs() {
+            utf16_offset += row.label()[byte_offset..run.range.start]
+                .encode_utf16()
+                .count() as u64;
+            let start_utf16 = utf16_offset;
+            utf16_offset += row.label()[run.range.clone()].encode_utf16().count() as u64;
+            byte_offset = run.range.end;
+            runs.push(YuStorageOutlineStyleRun {
+                start_utf16,
+                end_utf16: utf16_offset,
+                traits: u8::from(run.style.is_strong())
+                    | (u8::from(run.style.is_emphasis()) << 1)
+                    | (u8::from(run.style.is_code()) << 2),
+                reserved: [0; 7],
+            });
+        }
         items.push(YuStorageOutlineItem {
             revision,
             index: u32::try_from(item.index()).map_err(|_| YU_STORAGE_BUFFER_TOO_SMALL)?,
@@ -1741,9 +2034,11 @@ fn outline_rows_output(
             display_utf8_length,
             identity_utf8_offset,
             identity_utf8_length,
+            style_offset,
+            style_count: runs.len() as u64 - style_offset,
         });
     }
-    Ok((items, text))
+    Ok((items, text, runs))
 }
 
 /// 当前查询这一版的全部结果行 + 它们那串文字。
@@ -1837,6 +2132,9 @@ fn command_from_ffi(command: u8, block: u64) -> Result<EditorCommand, i32> {
     match command {
         YU_STORAGE_COMMAND_DELETE_BACKWARD => Ok(EditorCommand::DeleteBackward),
         YU_STORAGE_COMMAND_DELETE_FORWARD => Ok(EditorCommand::DeleteForward),
+        YU_STORAGE_COMMAND_DELETE_WORD_BACKWARD => Ok(EditorCommand::DeleteWordBackward),
+        YU_STORAGE_COMMAND_DELETE_WORD_FORWARD => Ok(EditorCommand::DeleteWordForward),
+        YU_STORAGE_COMMAND_DELETE_SELECTIONS => Ok(EditorCommand::DeleteSelections),
         YU_STORAGE_COMMAND_MOVE_LEFT => Ok(EditorCommand::MoveLeft),
         YU_STORAGE_COMMAND_MOVE_RIGHT => Ok(EditorCommand::MoveRight),
         YU_STORAGE_COMMAND_INSERT_NEWLINE => Ok(EditorCommand::insert_newline()),
@@ -1853,6 +2151,71 @@ fn command_from_ffi(command: u8, block: u64) -> Result<EditorCommand, i32> {
         YU_STORAGE_COMMAND_MOVE_DOWN => Ok(EditorCommand::move_down()),
         YU_STORAGE_COMMAND_MOVE_UP_EXTEND => Ok(EditorCommand::move_up_extend()),
         YU_STORAGE_COMMAND_MOVE_DOWN_EXTEND => Ok(EditorCommand::move_down_extend()),
+        YU_STORAGE_COMMAND_MOVE_LEFT_EXTEND => Ok(EditorCommand::ExtendHorizontal {
+            forward: false,
+            word: false,
+        }),
+        YU_STORAGE_COMMAND_MOVE_RIGHT_EXTEND => Ok(EditorCommand::ExtendHorizontal {
+            forward: true,
+            word: false,
+        }),
+        YU_STORAGE_COMMAND_MOVE_WORD_LEFT_EXTEND => Ok(EditorCommand::ExtendHorizontal {
+            forward: false,
+            word: true,
+        }),
+        YU_STORAGE_COMMAND_MOVE_WORD_RIGHT_EXTEND => Ok(EditorCommand::ExtendHorizontal {
+            forward: true,
+            word: true,
+        }),
+        YU_STORAGE_COMMAND_MOVE_DOCUMENT_START => Ok(EditorCommand::MoveDocumentBoundary {
+            end: false,
+            extend: false,
+        }),
+        YU_STORAGE_COMMAND_MOVE_DOCUMENT_END => Ok(EditorCommand::MoveDocumentBoundary {
+            end: true,
+            extend: false,
+        }),
+        YU_STORAGE_COMMAND_MOVE_DOCUMENT_START_EXTEND => Ok(EditorCommand::MoveDocumentBoundary {
+            end: false,
+            extend: true,
+        }),
+        YU_STORAGE_COMMAND_MOVE_DOCUMENT_END_EXTEND => Ok(EditorCommand::MoveDocumentBoundary {
+            end: true,
+            extend: true,
+        }),
+        YU_STORAGE_COMMAND_TABLE_INSERT_ROW_BEFORE => Ok(EditorCommand::EditTable(
+            yu_editor::TableEdit::InsertRowBefore,
+        )),
+        YU_STORAGE_COMMAND_TABLE_INSERT_ROW_AFTER => Ok(EditorCommand::EditTable(
+            yu_editor::TableEdit::InsertRowAfter,
+        )),
+        YU_STORAGE_COMMAND_TABLE_DELETE_ROW => {
+            Ok(EditorCommand::EditTable(yu_editor::TableEdit::DeleteRow))
+        }
+        YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_BEFORE => Ok(EditorCommand::EditTable(
+            yu_editor::TableEdit::InsertColumnBefore,
+        )),
+        YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_AFTER => Ok(EditorCommand::EditTable(
+            yu_editor::TableEdit::InsertColumnAfter,
+        )),
+        YU_STORAGE_COMMAND_TABLE_DELETE_COLUMN => {
+            Ok(EditorCommand::EditTable(yu_editor::TableEdit::DeleteColumn))
+        }
+        YU_STORAGE_COMMAND_TABLE_ALIGN_LEFT => {
+            Ok(EditorCommand::EditTable(yu_editor::TableEdit::AlignLeft))
+        }
+        YU_STORAGE_COMMAND_TABLE_ALIGN_CENTER => {
+            Ok(EditorCommand::EditTable(yu_editor::TableEdit::AlignCenter))
+        }
+        YU_STORAGE_COMMAND_TABLE_ALIGN_RIGHT => {
+            Ok(EditorCommand::EditTable(yu_editor::TableEdit::AlignRight))
+        }
+        YU_STORAGE_COMMAND_TABLE_ALIGN_DEFAULT => {
+            Ok(EditorCommand::EditTable(yu_editor::TableEdit::AlignDefault))
+        }
+        YU_STORAGE_COMMAND_TABLE_NEXT => Ok(EditorCommand::MoveTableCellNext),
+        YU_STORAGE_COMMAND_TABLE_PREVIOUS => Ok(EditorCommand::MoveTableCellPrevious),
+
         _ => Err(YU_STORAGE_INVALID_COMMAND),
     }
 }
@@ -2185,7 +2548,7 @@ fn macos_matching_submitted_frame(
         return None;
     }
     let config = surface.surface.config();
-    let Some(geometry) = FrameGeometry::new(
+    let geometry = FrameGeometry::new(
         size,
         max_width,
         scroll_y,
@@ -2193,9 +2556,7 @@ fn macos_matching_submitted_frame(
         config.logical_width(),
         config.logical_height(),
         config.scale(),
-    ) else {
-        return None;
-    };
+    )?;
     let requested = frame_key(session, state.builder.config().appearance(), geometry);
     if state.prepared_build.as_ref() != Some(requested.build())
         || state.host.surface_generation() != surface.surface.generation()
@@ -2206,9 +2567,7 @@ fn macos_matching_submitted_frame(
     {
         return None;
     }
-    let Some(frame) = state.host.frame_handle() else {
-        return None;
-    };
+    let frame = state.host.frame_handle()?;
     if frame.plan().viewport().y() != scroll_y
         && !macos_frame_covers_viewport(&frame, scroll_y, viewport_height)
     {
@@ -2275,7 +2634,7 @@ fn block_caret_from_layout(
     source_utf16: u64,
     affinity: CaretAffinity,
     layout: &BlockView,
-    line_height: f32,
+    _line_height: f32,
     shaped: u8,
 ) -> Result<YuStorageBlockCaret, i32> {
     if layout.revision() != session.revision() {
@@ -2306,6 +2665,7 @@ fn block_caret_from_layout(
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
         .get();
     let point = caret.point();
+    let line_height = layout.caret_line_height(caret);
     if !point.x().is_finite()
         || !point.y().is_finite()
         || !line_height.is_finite()
@@ -2352,9 +2712,22 @@ fn macos_publish_viewport_config(
     session: &mut YuStorageSession,
     max_width: f32,
     metrics: CoreTextViewportMetrics,
+    theme: yu_core::ThemeId,
 ) -> Result<(), i32> {
+    let resource_geometry = session.macos_render_host.as_ref().map_or(0, |state| {
+        state
+            .image_resources
+            .geometry_version(session.session.revision())
+    });
+    session
+        .session
+        .document_mut()
+        .editor_mut()
+        .set_resource_geometry_version(resource_geometry);
     let published = session.session.viewport_config().layout();
-    if (published.max_width() - max_width).abs() <= MACOS_VIEWPORT_CONFIG_TOLERANCE
+    if published.theme() == theme
+        && published.base_direction() == yu_core::BaseDirection::Ltr
+        && (published.max_width() - max_width).abs() <= MACOS_VIEWPORT_CONFIG_TOLERANCE
         && (published.line_height() - metrics.line_height()).abs()
             <= MACOS_VIEWPORT_CONFIG_TOLERANCE
         && (published.default_advance() - metrics.default_advance()).abs()
@@ -2363,6 +2736,8 @@ fn macos_publish_viewport_config(
         return Ok(());
     }
     let layout = LayoutConfig::new(max_width, metrics.line_height())
+        .with_theme(theme)
+        .with_base_direction(yu_core::BaseDirection::Ltr)
         .with_default_advance(metrics.default_advance());
     // estimated_block_height 取一个行高、overscan 取 0，与平台此前送回来的
     // 值一致。这两项是策略而不是平台信息，因此现在由 Rust 决定。
@@ -2374,20 +2749,64 @@ fn macos_publish_viewport_config(
 }
 
 #[cfg(target_os = "macos")]
-fn core_text_system_ui_layout(
+fn macos_query_text_layout(
+    session: &YuStorageSession,
     size: f32,
     max_width: f32,
+    theme: yu_core::ThemeId,
 ) -> Result<(CoreTextShaper, CoreTextViewportMetrics, LayoutConfig), i32> {
     if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
         return Err(YU_STORAGE_EDITOR_ERROR);
     }
-    let request = FontRequest::new("System UI", size).map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
-    let shaper =
-        CoreTextShaper::from_system_ui(request).map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
+    if let Some(state) = session
+        .macos_render_host
+        .as_ref()
+        .filter(|state| state.builder.config().appearance().theme_id() == theme)
+    {
+        let shaper = state
+            .builder
+            .shaper()
+            .resized(size)
+            .map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
+        let metrics = if state.size == size {
+            state.metrics
+        } else {
+            shaper
+                .viewport_metrics("M中🙂e\u{301}")
+                .map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?
+        };
+        let config = LayoutConfig::new(max_width, metrics.line_height())
+            .with_theme(theme)
+            .with_base_direction(yu_core::BaseDirection::Ltr)
+            .with_default_advance(metrics.default_advance());
+        return Ok((shaper, metrics, config));
+    }
+    core_text_layout(size, max_width, theme)
+}
+
+#[cfg(target_os = "macos")]
+fn core_text_layout(
+    size: f32,
+    max_width: f32,
+    theme: yu_core::ThemeId,
+) -> Result<(CoreTextShaper, CoreTextViewportMetrics, LayoutConfig), i32> {
+    if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
+        return Err(YU_STORAGE_EDITOR_ERROR);
+    }
+    let request = FontRequest::new(theme.spec().body_font.family().unwrap_or("System UI"), size)
+        .map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
+    let shaper = if theme.spec().body_font == yu_core::ThemeFont::SystemUi {
+        CoreTextShaper::from_system_ui(request)
+    } else {
+        CoreTextShaper::from_system(request)
+    }
+    .map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
     let metrics = shaper
         .viewport_metrics("M中🙂e\u{301}")
         .map_err(|_| YU_STORAGE_SHAPER_UNAVAILABLE)?;
     let config = LayoutConfig::new(max_width, metrics.line_height())
+        .with_theme(theme)
+        .with_base_direction(yu_core::BaseDirection::Ltr)
         .with_default_advance(metrics.default_advance());
     Ok((shaper, metrics, config))
 }
@@ -2641,6 +3060,63 @@ pub unsafe extern "C" fn yu_storage_session_set_selection_endpoints(
         .map_or_else(storage_status, |_| YU_STORAGE_OK)
 }
 
+/// Select an inclusive rectangular cell region through canonical source offsets.
+/// # Safety
+/// `session` must be a live handle. No source mutation is performed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_select_table_cells(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    anchor_utf16: u64,
+    focus_utf16: u64,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let endpoints = match selection_endpoints_from_ffi(
+        &session.session,
+        anchor_utf16,
+        focus_utf16,
+        YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+    ) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    session
+        .session
+        .execute(EditorCommand::SelectTableCells {
+            anchor: endpoints.anchor(),
+            focus: endpoints.focus(),
+        })
+        .map_or_else(storage_status, |_| YU_STORAGE_OK)
+}
+
+/// Zero means text selection; a positive value is the selected cell column count.
+/// # Safety
+/// `session` must be live and `columns` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_table_selection_columns(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    columns: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if columns.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    // SAFETY: caller supplies a writable output, checked non-null above.
+    unsafe { *columns = session.session.selections().table_columns().unwrap_or(0) };
+    YU_STORAGE_OK
+}
+
 /// 全部选区的端点，按文档顺序，外加主选区的下标。
 ///
 /// 两遍协议（与 `outline_items` / `block_hidden_spans` 同一个）：`output` 传
@@ -2844,11 +3320,21 @@ pub unsafe extern "C" fn yu_storage_session_move_vertical(
             YU_STORAGE_COMMAND_MOVE_DOWN_EXTEND => (false, true),
             _ => return YU_STORAGE_INVALID_COMMAND,
         };
-        let (shaper, metrics, config) = match core_text_system_ui_layout(size, max_width) {
+        let (shaper, metrics, config) = match macos_query_text_layout(
+            session,
+            size,
+            max_width,
+            session.session.viewport_config().layout().theme(),
+        ) {
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+        if let Err(status) = macos_publish_viewport_config(
+            session,
+            max_width,
+            metrics,
+            session.session.viewport_config().layout().theme(),
+        ) {
             return status;
         }
         let result = match session
@@ -2888,6 +3374,120 @@ pub unsafe extern "C" fn yu_storage_session_insert_text(
         Err(status) => return status,
     };
     let result = match session.session.execute(EditorCommand::insert_text(text)) {
+        Ok(result) => result,
+        Err(error) => return storage_status(error),
+    };
+    command_result_output(&session.session, result, output)
+}
+
+pub const YU_STORAGE_PASTE_PLAIN_TEXT: u8 = 0;
+pub const YU_STORAGE_PASTE_TABULAR_TEXT: u8 = 1;
+
+/// Paste external text, retaining its explicit tabular/ordinary representation.
+/// # Safety
+/// Session must be live, text readable for text_length bytes, output writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_paste_text(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    text: *const u8,
+    text_length: usize,
+    format: u8,
+    output: *mut YuStorageCommandResult,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if !matches!(
+        format,
+        YU_STORAGE_PASTE_PLAIN_TEXT | YU_STORAGE_PASTE_TABULAR_TEXT
+    ) {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let text = match read_utf8(text, text_length) {
+        Ok(text) => text,
+        Err(status) => return status,
+    };
+    let command = EditorCommand::PasteClipboardText {
+        text: text.into(),
+        tabular: format == YU_STORAGE_PASTE_TABULAR_TEXT,
+    };
+    match session.session.execute(command) {
+        Ok(result) => command_result_output(&session.session, result, output),
+        Err(error) => storage_status(error),
+    }
+}
+
+/// Paste UTF-8 fragments stored contiguously in `text`. Each cumulative end
+/// offset must be on a UTF-8 boundary; the final end must equal text_length.
+/// Validation completes before executing the single atomic editor command.
+///
+/// # Safety
+/// `session` must be live. `text` must provide `text_length` readable bytes,
+/// `ends` must provide `count` readable size_t entries, and `output` must be
+/// writable. Empty buffers may be null.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_paste_fragments(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    text: *const u8,
+    text_length: usize,
+    ends: *const usize,
+    count: usize,
+    columns: usize,
+    output: *mut YuStorageCommandResult,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() || (count > 0 && ends.is_null()) {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if count > isize::MAX as usize / std::mem::size_of::<usize>() {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let text = match read_utf8(text, text_length) {
+        Ok(text) => text,
+        Err(status) => return status,
+    };
+    let ends = if count == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the caller provides count readable entries; null and size
+        // checks above satisfy slice construction requirements.
+        unsafe { std::slice::from_raw_parts(ends, count) }
+    };
+    let mut fragments = Vec::with_capacity(count);
+    let mut start = 0;
+    for &end in ends {
+        let Some(fragment) = text.get(start..end) else {
+            return YU_STORAGE_INVALID_SELECTION;
+        };
+        fragments.push(std::sync::Arc::from(fragment));
+        start = end;
+    }
+    if start != text.len() {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    let command = if columns == 0 {
+        EditorCommand::PasteFragments(fragments)
+    } else {
+        EditorCommand::PasteTableGrid {
+            columns,
+            cells: fragments,
+        }
+    };
+    let result = match session.session.execute(command) {
         Ok(result) => result,
         Err(error) => return storage_status(error),
     };
@@ -3157,19 +3757,238 @@ pub unsafe extern "C" fn yu_storage_session_open(
         Ok(session) => session,
         Err(error) => return status_from_error(error),
     };
-    let session = Box::new(YuStorageSession {
+    let session = new_storage_session(session);
+    // SAFETY: the pointer is transferred to the native caller as an opaque
+    // handle and is reclaimed only by `yu_storage_session_destroy`.
+    unsafe { *output = Box::into_raw(session) };
+    YU_STORAGE_OK
+}
+
+fn new_storage_session(session: DocumentEditorSession) -> Box<YuStorageSession> {
+    Box::new(YuStorageSession {
         session,
         table_resize_gesture: None,
         table_resize_override: None,
         #[cfg(target_os = "macos")]
         macos_render_host: None,
         #[cfg(target_os = "macos")]
+        shader_library: None,
+        #[cfg(target_os = "macos")]
         macos_embedded_resources: MacosEmbeddedResourceState::new(),
-    });
-    // SAFETY: the pointer is transferred to the native caller as an opaque
-    // handle and is reclaimed only by `yu_storage_session_destroy`.
-    unsafe { *output = Box::into_raw(session) };
+    })
+}
+
+/// Creates an unsaved editor without creating a document file.
+/// # Safety
+/// `path` must contain readable UTF-8 bytes; `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_create(
+    path: *const u8,
+    path_length: usize,
+    output: *mut *mut YuStorageSession,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe { *output = ptr::null_mut() };
+    let path = match read_utf8(path, path_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    unsafe { *output = Box::into_raw(new_storage_session(DocumentEditorSession::new(path, ""))) };
     YU_STORAGE_OK
+}
+
+/// Restores source and the pre-crash disk baseline. Does not write the target.
+/// # Safety
+/// `path` must contain readable UTF-8 bytes; `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_open_recovery(
+    path: *const u8,
+    path_length: usize,
+    output: *mut *mut YuStorageSession,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe { *output = ptr::null_mut() };
+    let path = match read_utf8(path, path_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let record = match RecoveryRecord::read(&path) {
+        Ok(record) => record,
+        Err(_) => return YU_STORAGE_INVALID_RECOVERY,
+    };
+    unsafe { *output = Box::into_raw(new_storage_session(DocumentEditorSession::recover(record))) };
+    YU_STORAGE_OK
+}
+
+/// Reads discovery metadata without interpreting the envelope in Swift.
+/// # Safety
+/// Input bytes must be readable; outputs follow the standard count/fill contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_recovery_copy_target(
+    path: *const u8,
+    path_length: usize,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let path = match read_utf8(path, path_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let record = match RecoveryRecord::read(&path) {
+        Ok(record) => record,
+        Err(_) => return YU_STORAGE_INVALID_RECOVERY,
+    };
+    let Some(target) = record.target_path().to_str() else {
+        return YU_STORAGE_INVALID_PATH;
+    };
+    write_bytes(target.as_bytes(), output, capacity, written)
+}
+
+/// Writes (action 0) or clears (action 1) this session's recovery record.
+/// # Safety
+/// `session` must be live and root must contain readable UTF-8 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_recovery(
+    session: *const YuStorageSession,
+    root: *const u8,
+    root_length: usize,
+    action: u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let root = match read_utf8(root, root_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let store = RecoveryStore::new(root);
+    let result = match action {
+        0 => session.session.write_recovery(&store).map(|_| ()),
+        1 => store.clear(session.session.path()),
+        _ => return YU_STORAGE_INVALID_COMMAND,
+    };
+    result.map_or(YU_STORAGE_IO_ERROR, |()| YU_STORAGE_OK)
+}
+
+/// Resolves a recovery envelope path without opening or parsing a document.
+/// # Safety
+/// Readable root/target UTF-8 bytes and standard count/fill output pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_recovery_copy_path(
+    root: *const u8,
+    root_length: usize,
+    target: *const u8,
+    target_length: usize,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let root = match read_utf8(root, root_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let target = match read_utf8(target, target_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    let path = match RecoveryStore::new(root).path_for(&target) {
+        Ok(path) => path,
+        Err(_) => return YU_STORAGE_INVALID_PATH,
+    };
+    let Some(path) = path.to_str() else {
+        return YU_STORAGE_INVALID_PATH;
+    };
+    write_bytes(path.as_bytes(), output, capacity, written)
+}
+
+/// Save As keeps the canonical document and history; invalidates path-relative resources.
+/// # Safety
+/// Live session, called on the host thread; readable destination path bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_save_as(
+    session: *mut YuStorageSession,
+    path: *const u8,
+    path_length: usize,
+    replace_existing: u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if replace_existing > 1 {
+        return YU_STORAGE_INVALID_COMMAND;
+    }
+    if session.session.composition().is_some() {
+        return YU_STORAGE_INVALID_STATE;
+    }
+    let path = match read_utf8(path, path_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    if let Err(error) = session.session.save_as(path, replace_existing != 0) {
+        return status_from_error(error);
+    }
+    session.table_resize_gesture = None;
+    session.table_resize_override = None;
+    #[cfg(target_os = "macos")]
+    {
+        session.macos_render_host = None;
+        session.macos_embedded_resources = MacosEmbeddedResourceState::new();
+    }
+    YU_STORAGE_OK
+}
+
+/// Configure application-owned column metadata storage for this session.
+/// Malformed or stale cache entries are ignored by the store; I/O errors surface.
+/// # Safety
+/// `session` must be live; `root` must name readable UTF-8 bytes for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_table_width_store(
+    session: *mut YuStorageSession,
+    root: *const u8,
+    root_length: usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let root = match read_utf8(root, root_length) {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        Ok(_) => return YU_STORAGE_INVALID_PATH,
+        Err(status) => return status,
+    };
+    match session.session.document_mut().set_table_width_store(root) {
+        Ok(_) => YU_STORAGE_OK,
+        Err(error) => status_from_error(error),
+    }
+}
+
+/// Persist committed column widths independently from text dirty state.
+/// Dirty source is deferred until the next successful save.
+/// # Safety
+/// `session` must be null or a live session handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_persist_table_widths(
+    session: *mut YuStorageSession,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    match session.session.document().persist_table_widths() {
+        Ok(yu_storage::TableWidthStoreOutcome::Stale) => YU_STORAGE_EXTERNAL_CHANGE,
+        Ok(_) => YU_STORAGE_OK,
+        Err(error) => status_from_error(error),
+    }
 }
 
 /// # Safety
@@ -3405,6 +4224,46 @@ pub unsafe extern "C" fn yu_storage_session_projection_source_selection(
     YU_STORAGE_OK
 }
 
+#[cfg(target_os = "macos")]
+fn macos_query_layout_snapshot(
+    session: &mut YuStorageSession,
+    query: impl Into<yu_editor::LayoutQuery>,
+    shaper: &CoreTextShaper,
+) -> Result<std::sync::Arc<yu_editor::LayoutSnapshot>, i32> {
+    let (images, intrinsics) = session
+        .macos_render_host
+        .as_ref()
+        .map(|state| {
+            (
+                state
+                    .image_resources
+                    .publications
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state
+                    .image_resources
+                    .intrinsics
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default();
+    let resize = session
+        .table_resize_override
+        .filter(|resize| resize.revision() == session.session.revision());
+    yu_workspace::prepare_layout_snapshot_with_resources(
+        session.session.document_mut().editor_mut(),
+        query,
+        shaper,
+        &images,
+        &intrinsics,
+        resize,
+    )
+    .map_err(status_from_editor_error)
+}
+
 /// Resolves a document-space point through the current shaped block
 /// layout. The endpoint is Revision-bound and uses the same published
 /// viewport metrics as the native surface; it never asks the Swift/AppKit
@@ -3460,65 +4319,35 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
         {
             return YU_STORAGE_EDITOR_ERROR;
         }
-        let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
+        let (shaper, metrics, _layout_config) = match macos_query_text_layout(
+            session,
+            size,
+            max_width,
+            session.session.viewport_config().layout().theme(),
+        ) {
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+        if let Err(status) = macos_publish_viewport_config(
+            session,
+            max_width,
+            metrics,
+            session.session.viewport_config().layout().theme(),
+        ) {
             return status;
         }
 
         let query_y = point_y.max(0.0);
         let viewport = ViewportSpan::new(query_y, metrics.line_height());
-        let snapshot = {
-            let document = session.session.document_mut().editor_mut();
-            match document.visible_blocks_with_visual_state_and_shaper(viewport, &shaper) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return status_from_editor_error(error),
-            }
+        let snapshot = match macos_query_layout_snapshot(session, viewport, &shaper) {
+            Ok(snapshot) => snapshot,
+            Err(status) => return status,
         };
-        let mut selected = None;
-        let mut best_distance = f32::INFINITY;
-        for block in snapshot.blocks() {
-            let top = block.y();
-            let bottom = top + block.height();
-            let distance = if query_y < top {
-                top - query_y
-            } else if query_y > bottom {
-                query_y - bottom
-            } else {
-                0.0
-            };
-            if distance < best_distance {
-                best_distance = distance;
-                selected = Some(*block);
-            }
-        }
-        let Some(block) = selected else {
-            return YU_STORAGE_INVALID_SELECTION;
+        let (placed, hit) = match snapshot.hit_test(LayoutPoint::new(point_x, query_y)) {
+            Ok(Some(hit)) => hit,
+            _ => return YU_STORAGE_INVALID_SELECTION,
         };
-        let layout = {
-            let document = session.session.document_mut().editor_mut();
-            match document.block_layout_for_visual_state_with_shaper(
-                block.index(),
-                layout_config,
-                &shaper,
-            ) {
-                Ok(layout) => layout,
-                Err(error) => return status_from_editor_error(error),
-            }
-        };
-        if layout.lines().is_empty() {
-            return YU_STORAGE_INVALID_SELECTION;
-        }
-        // 块局部 y：文档 y 减块起点，再减内容原点——代码块的内容在盒里从上
-        // 内边距起排（`content_origin_y`，与折块高时加在内容上方的那 5pt 互为
-        // 反向）。漏减的表现是点击代码块落到上一行，不报错。
-        let local_y = (query_y - block.y() - content_origin_y(block.kind())).max(0.0);
-        let hit = match layout.hit_test(LayoutPoint::new(point_x, local_y)) {
-            Ok(hit) => hit,
-            Err(_) => return YU_STORAGE_INVALID_SELECTION,
-        };
+        let block = placed.metadata();
         let projection = match session.session.visual_text_for_visual_state() {
             Ok(projection) => projection,
             Err(error) => return storage_status(error),
@@ -3554,7 +4383,7 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
         // 折回文档坐标要补回内容原点：local_y 进 hit_test 时减过它（代码块的
         // 内容在盒里从上内边距起排），这里不补，返回的 caret y 比画出来的
         // 光标高 5pt。
-        let document_y = block.y() + content_origin_y(block.kind()) + point.y();
+        let document_y = placed.document_point(point).y();
         if !point.x().is_finite() || !document_y.is_finite() {
             return YU_STORAGE_EDITOR_ERROR;
         }
@@ -3613,10 +4442,10 @@ pub unsafe extern "C" fn yu_storage_session_composition_projection(
     YU_STORAGE_OK
 }
 
-/// Resolves the active marked-text caret through an uncached shaped
-/// composition layout. Canonical source and Revision remain unchanged; the
-/// expected generation guards the transient preedit. Caret geometry is local
-/// to the owning parser block, while visual UTF-16 ranges use the full
+/// Resolves the active marked-text caret through the immutable shaped
+/// composition snapshot. Canonical source and Revision remain unchanged; the
+/// expected generation guards the transient preedit. Caret geometry is in
+/// document content coordinates, while visual UTF-16 ranges use the full
 /// transient projected stream.
 ///
 /// # Safety
@@ -3669,11 +4498,21 @@ pub unsafe extern "C" fn yu_storage_session_composition_shaped_caret(
         if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
             return YU_STORAGE_EDITOR_ERROR;
         }
-        let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
+        let (shaper, metrics, _layout_config) = match macos_query_text_layout(
+            session,
+            size,
+            max_width,
+            session.session.viewport_config().layout().theme(),
+        ) {
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+        if let Err(status) = macos_publish_viewport_config(
+            session,
+            max_width,
+            metrics,
+            session.session.viewport_config().layout().theme(),
+        ) {
             return status;
         }
 
@@ -3706,15 +4545,14 @@ pub unsafe extern "C" fn yu_storage_session_composition_shaped_caret(
             Ok(projection) => projection,
             Err(status) => return status,
         };
-        let layout = match session
-            .session
-            .document_mut()
-            .editor_mut()
-            .block_layout_with_composition_and_shaper(block_index, layout_config, &shaper)
-        {
-            Ok(layout) => layout,
-            Err(error) => return status_from_editor_error(error),
+        let geometry = match macos_query_layout_snapshot(session, replacement.start(), &shaper) {
+            Ok(snapshot) => snapshot,
+            Err(status) => return status,
         };
+        let Some(placed) = geometry.block(block_index) else {
+            return YU_STORAGE_INVALID_SELECTION;
+        };
+        let layout = placed.layout();
         if layout.lines().is_empty() {
             return YU_STORAGE_INVALID_SELECTION;
         }
@@ -3761,8 +4599,8 @@ pub unsafe extern "C" fn yu_storage_session_composition_shaped_caret(
                 Ok(replacement) => replacement,
                 Err(status) => return status,
             };
-        let point = caret.point();
-        let line_height = metrics.line_height();
+        let point = placed.document_point(caret.point());
+        let line_height = layout.caret_line_height(caret);
         if !point.x().is_finite()
             || !point.y().is_finite()
             || !line_height.is_finite()
@@ -3825,73 +4663,32 @@ fn macos_table_resize_hit_at_point(
     {
         return Err(YU_STORAGE_EDITOR_ERROR);
     }
-    let (shaper, metrics, layout_config) = core_text_system_ui_layout(size, max_width)?;
-    macos_publish_viewport_config(session, max_width, metrics)?;
+    let (shaper, metrics, _layout_config) = macos_query_text_layout(
+        session,
+        size,
+        max_width,
+        session.session.viewport_config().layout().theme(),
+    )?;
+    macos_publish_viewport_config(
+        session,
+        max_width,
+        metrics,
+        session.session.viewport_config().layout().theme(),
+    )?;
 
     let query_y = point_y.max(0.0);
     let viewport = ViewportSpan::new(query_y, metrics.line_height());
-    let snapshot = {
-        let document = session.session.document_mut().editor_mut();
-        document
-            .visible_blocks_with_shaper(viewport, &shaper)
-            .map_err(status_from_editor_error)?
-    };
-    let mut selected = None;
-    let mut best_distance = f32::INFINITY;
-    for block in snapshot.blocks() {
-        let top = block.y();
-        let bottom = top + block.height();
-        let distance = if query_y < top {
-            top - query_y
-        } else if query_y > bottom {
-            query_y - bottom
-        } else {
-            0.0
-        };
-        if distance < best_distance {
-            best_distance = distance;
-            selected = Some(*block);
-        }
-    }
-    let Some(block) = selected else {
-        return Err(YU_STORAGE_INVALID_SELECTION);
-    };
-    let table_resize = match session.table_resize_override {
-        Some(commit) if commit.revision().get() == expected_revision => {
-            if matches!(commit.target(), TableResizeTarget::Column { .. }) {
-                Some(commit)
-            } else {
-                None
-            }
-        }
-        Some(_) => {
-            session.table_resize_override = None;
-            None
-        }
-        None => None,
-    };
-    let layout = {
-        let document = session.session.document_mut().editor_mut();
-        let layout = if let Some(commit) =
-            table_resize.filter(|commit| commit.block_index() == block.index())
-        {
-            document.block_layout_with_table_resize_and_shaper(
-                block.index(),
-                layout_config,
-                &shaper,
-                commit,
-            )
-        } else {
-            document
-                .block_layout_with_shaper(block.index(), layout_config, &shaper)
-                .cloned()
-        };
-        layout.map_err(status_from_editor_error)?
-    };
+    let snapshot = macos_query_layout_snapshot(session, viewport, &shaper)?;
+    let (placed, _) = snapshot
+        .hit_test(LayoutPoint::new(point_x, query_y))
+        .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
+        .ok_or(YU_STORAGE_INVALID_SELECTION)?;
+    let block = placed.metadata();
+    let layout = placed.layout();
     let Some(table) = layout.table() else {
         return Err(YU_STORAGE_INVALID_SELECTION);
     };
-    let local_y = query_y - block.y();
+    let local_y = placed.local_point(LayoutPoint::new(point_x, query_y)).y();
     let hit = table
         .resize_hit_test(LayoutPoint::new(point_x, local_y), tolerance)
         .map_err(|_| YU_STORAGE_INVALID_SELECTION)?
@@ -4203,10 +5000,9 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_hover(
 /// 允许的「输入事件」这一类——一个带 action 的入口就够了。
 ///
 /// - `UPDATE`：把 `pointer_position` 送进手势，返回本帧要用的临时几何。
-/// - `FINISH`：结束手势，最终几何作为 session 级覆盖保留给后续帧。
+/// - `FINISH`：结束手势，将最终列宽确认为文档呈现状态。
 ///   不产生任何 Markdown transaction。
-/// - `CANCEL`：结束手势并清除覆盖。没有手势时返回 OK——它同时用于清掉
-///   finish 之后仍然保留的那份预览。
+/// - `CANCEL`：结束手势并清除活动覆盖；已确认的文档列宽不受影响。
 ///
 /// `pointer_position` 只在 `UPDATE` 下被读取。`output` 三种 action 都必须可写：
 /// 失败路径先把它清零，不留半成品（不变量 I4）。
@@ -4279,10 +5075,74 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_action(
         Ok(metadata) => metadata,
         Err(status) => return status,
     };
-    session.table_resize_override = Some(commit);
+    if action == YU_STORAGE_TABLE_RESIZE_FINISH
+        && matches!(commit.target(), TableResizeTarget::Column { .. })
+    {
+        if let Err(status) = confirm_session_table_widths(session, commit) {
+            return status;
+        }
+        session.table_resize_override = None;
+    } else {
+        session.table_resize_override = Some(commit);
+    }
     // SAFETY: output was checked for null and belongs to the caller.
     unsafe { *output = metadata };
     YU_STORAGE_OK
+}
+
+/// Capture final geometry in the document, separate from the active gesture.
+fn confirm_session_table_widths(
+    session: &mut YuStorageSession,
+    commit: TableResizeCommit,
+) -> Result<(), i32> {
+    let config = session.session.viewport_config().layout();
+    #[cfg(target_os = "macos")]
+    let shaper = {
+        let size = session
+            .macos_render_host
+            .as_ref()
+            .map_or(16.0, |host| host.size);
+        core_text_layout(size, config.max_width(), config.theme())?.0
+    };
+    let editor = session.session.document_mut().editor_mut();
+    let published = editor
+        .current_layout_snapshot()
+        .filter(|snapshot| snapshot.revision() == commit.revision())
+        .and_then(|snapshot| {
+            snapshot
+                .block(commit.block_index())
+                .map(|block| block.layout().clone())
+        });
+    let mut layout = if let Some(layout) = published {
+        layout
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            editor
+                .block_layout_for_visual_state_with_shaper(commit.block_index(), config, &shaper)
+                .map_err(status_from_editor_error)?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            editor
+                .block_layout_for_visual_state(commit.block_index(), config)
+                .map_err(status_from_editor_error)?
+        }
+    };
+    #[cfg(target_os = "macos")]
+    layout
+        .apply_table_resize_with_shaper(commit, &shaper)
+        .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    #[cfg(not(target_os = "macos"))]
+    layout
+        .apply_table_resize(commit)
+        .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    editor
+        .confirm_table_column_widths(
+            commit.block_index(),
+            layout.table().ok_or(YU_STORAGE_EDITOR_ERROR)?,
+        )
+        .map_err(status_from_editor_error)
 }
 
 /// Shared body for the block-scoped and source-scoped caret queries.
@@ -4304,7 +5164,18 @@ fn macos_shaped_caret(
 ) -> Result<YuStorageBlockCaret, i32> {
     validate_revision(&session.session, expected_revision)?;
     let affinity = caret_affinity_from_ffi(affinity)?;
-    let (shaper, metrics, config) = core_text_system_ui_layout(size, max_width)?;
+    let (shaper, metrics, _config) = macos_query_text_layout(
+        session,
+        size,
+        max_width,
+        session.session.viewport_config().layout().theme(),
+    )?;
+    macos_publish_viewport_config(
+        session,
+        max_width,
+        metrics,
+        session.session.viewport_config().layout().theme(),
+    )?;
     let snapshot = session.session.snapshot();
     let Ok(offset) = snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) else {
         return Err(YU_STORAGE_INVALID_SELECTION);
@@ -4319,19 +5190,22 @@ fn macos_shaped_caret(
             .block_index_for_source(offset)
             .ok_or(YU_STORAGE_INVALID_SELECTION)?,
     };
-    let layout = session
-        .session
-        .block_layout_with_shaper(block_index, config, &shaper)
-        .map_err(storage_status)?;
-    block_caret_from_layout(
+    let snapshot = macos_query_layout_snapshot(session, offset, &shaper)?;
+    let placed = snapshot
+        .block(block_index)
+        .ok_or(YU_STORAGE_INVALID_SELECTION)?;
+    let layout = placed.layout();
+    let mut metadata = block_caret_from_layout(
         &session.session,
         block_index,
         source_utf16,
         affinity,
-        &layout,
+        layout,
         metrics.line_height(),
         1,
-    )
+    )?;
+    metadata.caret_y += placed.content_y();
+    Ok(metadata)
 }
 
 /// Resolves a source caret's shaped geometry without the caller naming a block.
@@ -4480,68 +5354,38 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_accessibility_dividers(
         if std::env::var_os("YU_RENDER_TIMING").is_some() {
             println!("yu-render-metric event=ax_layout_fallback");
         }
-        let (shaper, metrics, layout_config) = match core_text_system_ui_layout(size, max_width) {
+        let (shaper, metrics, _layout_config) = match macos_query_text_layout(
+            session,
+            size,
+            max_width,
+            session.session.viewport_config().layout().theme(),
+        ) {
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+        if let Err(status) = macos_publish_viewport_config(
+            session,
+            max_width,
+            metrics,
+            session.session.viewport_config().layout().theme(),
+        ) {
             return status;
         }
 
         let viewport = ViewportSpan::new(scroll_y, viewport_height);
-        let viewport_snapshot = {
-            let document = session.session.document_mut().editor_mut();
-            if document.composition().is_some() {
-                return YU_STORAGE_OK;
-            }
-            match document.visible_blocks_with_shaper(viewport, &shaper) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return status_from_editor_error(error),
-            }
+        if session.session.composition().is_some() {
+            return YU_STORAGE_OK;
+        }
+        let geometry = match macos_query_layout_snapshot(session, viewport, &shaper) {
+            Ok(snapshot) => snapshot,
+            Err(status) => return status,
         };
-        let source = session.session.snapshot();
+        let source = geometry.source();
         let divider_width = (metrics.default_advance() * 0.25).max(1.0);
-        // Accessibility actions keep a session-only table preview alive after
-        // each increment/decrement. Reuse that override here so the next
-        // descriptor enumeration exposes the effective divider position
-        // instead of resetting VoiceOver to the canonical layout.
-        let table_resize = match session.table_resize_override {
-            Some(commit) if commit.revision() == viewport_snapshot.revision() => {
-                if matches!(commit.target(), TableResizeTarget::Column { .. }) {
-                    Some(commit)
-                } else {
-                    None
-                }
-            }
-            Some(_) => {
-                session.table_resize_override = None;
-                None
-            }
-            None => None,
-        };
         let mut encoded = Vec::new();
-        for block in viewport_snapshot.blocks() {
-            let layout = {
-                let document = session.session.document_mut().editor_mut();
-                let layout = if let Some(commit) =
-                    table_resize.filter(|commit| commit.block_index() == block.index())
-                {
-                    document.block_layout_with_table_resize_and_shaper(
-                        block.index(),
-                        layout_config,
-                        &shaper,
-                        commit,
-                    )
-                } else {
-                    document
-                        .block_layout_with_shaper(block.index(), layout_config, &shaper)
-                        .cloned()
-                };
-                match layout {
-                    Ok(layout) => layout,
-                    Err(error) => return status_from_editor_error(error),
-                }
-            };
+        for placed in geometry.blocks() {
+            let block = placed.metadata();
+            let layout = placed.layout();
             let Some(table) = layout.table() else {
                 continue;
             };
@@ -4550,10 +5394,10 @@ pub unsafe extern "C" fn yu_storage_session_table_resize_accessibility_dividers(
                 Err(_) => return YU_STORAGE_INVALID_SELECTION,
             };
             let metadata = match table_resize_accessibility_metadata(
-                &source,
-                viewport_snapshot.revision().get(),
+                source,
+                geometry.revision().get(),
                 block_index,
-                block.y(),
+                placed.content_y(),
                 divider_width,
                 table,
             ) {
@@ -4783,6 +5627,7 @@ fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange,
 
 #[cfg(target_os = "macos")]
 fn macos_render_host_error_status(error: &CoreTextViewportFrameError) -> i32 {
+    eprintln!("yu-native-frame: {error}");
     match error {
         CoreTextViewportFrameError::Cancelled => {
             if std::env::var_os("YU_RENDER_TIMING").is_some() {
@@ -4927,6 +5772,7 @@ fn macos_render_host_snapshot(
         // 调用方在离开 host 借用之后填入；这里没有 session 可查。
         resource_refresh_pending: u8::from(state.resource_refresh_pending),
         resource_retry_pending: u8::from(state.resource_retry_pending),
+        layout_pending: u8::from(state.layout_pending),
     })
 }
 
@@ -4990,10 +5836,13 @@ fn macos_render_host_frame(
         return Err(YU_STORAGE_EDITOR_ERROR);
     }
     let rebuild = session.macos_render_host.as_ref().is_none_or(|state| {
-        (state.size - size).abs() > 0.001 || state.builder.config().raster_scale() != raster_scale
+        (state.size - size).abs() > 0.001
+            || state.builder.config().raster_scale() != raster_scale
+            || state.builder.config().appearance() != appearance
     });
     let (metrics, shaper) = if rebuild {
-        let (shaper, metrics, _layout_config) = core_text_system_ui_layout(size, max_width)?;
+        let (shaper, metrics, _layout_config) =
+            macos_query_text_layout(session, size, max_width, appearance.theme_id())?;
         (metrics, Some(shaper))
     } else {
         let state = session
@@ -5002,7 +5851,7 @@ fn macos_render_host_frame(
             .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
         (state.metrics, None)
     };
-    macos_publish_viewport_config(session, max_width, metrics)?;
+    macos_publish_viewport_config(session, max_width, metrics, appearance.theme_id())?;
     // Keep at least one viewport of already-shaped content around the active
     // camera.  Scroll-only presentations can then reuse the retained frame
     // instead of synchronously rebuilding every block for each wheel sample.
@@ -5082,7 +5931,7 @@ fn macos_render_host_frame(
             None => (
                 None,
                 MacosImageResourceState::new()?,
-                macos_new_frame_worker(),
+                macos_new_frame_worker(0),
                 0,
                 0,
                 None,
@@ -5100,6 +5949,7 @@ fn macos_render_host_frame(
             prepared_build: None,
             resource_refresh_pending: false,
             resource_retry_pending: false,
+            layout_pending: false,
             resource_completion_generation: resource_generation,
             frame_worker: worker,
             frame_worker_request: None,
@@ -5159,8 +6009,8 @@ fn macos_render_host_frame(
             max_width,
             scroll_y,
             viewport_height,
-            f64::from(surface_width),
-            f64::from(surface_height),
+            surface_width,
+            surface_height,
             f64::from(raster_scale),
         )
         .ok_or(YU_STORAGE_EDITOR_ERROR)?,
@@ -5179,9 +6029,12 @@ fn macos_render_host_frame(
         .host
         .sync_surface_generation(surface_generation)
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-    state
-        .image_resources
-        .sync(image_requests, revision, document_path)?;
+    state.image_resources.sync(
+        image_requests,
+        revision,
+        document_path,
+        (surface_width as f32 * raster_scale).ceil() as u32,
+    )?;
     let image_publications = state
         .image_resources
         .publications
@@ -5197,6 +6050,7 @@ fn macos_render_host_frame(
     let publish_timing_start = std::time::Instant::now();
     let publication = {
         let document = session.session.document_mut().editor_mut();
+        document.set_resource_geometry_version(state.image_resources.geometry_version(revision));
         state
             .builder
             .publish_with_images_and_intrinsics(document, &image_publications, &image_intrinsics)
@@ -5301,16 +6155,21 @@ fn macos_render_host_background_frame(
         };
         let plan = macos_image_requests(session, &visible)?;
         let document_path = session.session.path().to_path_buf();
-        let document = session
-            .session
-            .document()
-            .editor()
-            .capture_render_snapshot();
         let state = session
             .macos_render_host
             .as_mut()
             .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-        state.image_resources.sync(plan, revision, document_path)?;
+        state.image_resources.sync(
+            plan,
+            revision,
+            document_path,
+            (state.builder.config().scene_viewport().width()
+                * state.builder.config().raster_scale())
+            .ceil() as u32,
+        )?;
+        let editor = session.session.document_mut().editor_mut();
+        editor.set_resource_geometry_version(state.image_resources.geometry_version(revision));
+        let document = editor.capture_render_snapshot();
         state.frame_request_generation = state
             .frame_request_generation
             .checked_add(1)
@@ -5345,6 +6204,7 @@ fn macos_render_host_background_frame(
                     ticket.request.generation(),
                     MacosFrameBuildJob {
                         input,
+                        shaper: state.builder.shaper().clone(),
                         config,
                         ticket,
                         minimum_serial: state
@@ -5401,7 +6261,7 @@ fn macos_render_host_background_frame(
             .session
             .document()
             .editor()
-            .accepts_render_layout(&output.layout)
+            .accepts_layout_snapshot(&output.layout)
         || ticket.request.generation() != state.frame_request_generation
         || output.request != ticket.request
         || output.publication.revision() != revision
@@ -5425,6 +6285,14 @@ fn macos_render_host_background_frame(
         return Err(YU_STORAGE_RENDER_BUSY);
     }
     state.frame_worker_request = None;
+    if !session
+        .session
+        .document_mut()
+        .editor_mut()
+        .integrate_layout_measurements(&output.layout)
+    {
+        return Err(YU_STORAGE_RENDER_BUSY);
+    }
     // Visible block discovery was done by the worker. Keep this small result
     // so subsequent resource notifications can be collected without layout.
     state.visible_blocks = output.viewport_blocks.clone();
@@ -5435,7 +6303,13 @@ fn macos_render_host_background_frame(
         .macos_render_host
         .as_mut()
         .ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-    state.image_resources.sync(plan, revision, path)?;
+    state.image_resources.sync(
+        plan,
+        revision,
+        path,
+        (state.builder.config().scene_viewport().width() * state.builder.config().raster_scale())
+            .ceil() as u32,
+    )?;
     let images = state
         .image_resources
         .publications
@@ -5471,6 +6345,7 @@ fn macos_render_host_background_frame(
         .host
         .accept_publication(output.publication.clone())
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+    state.layout_pending = output.layout.layout_pending();
     state.last_publication = Some(output.publication);
     state.prepared_build = Some(key);
     state.builder.replace_atlas(output.atlas);
@@ -5481,7 +6356,7 @@ fn macos_render_host_background_frame(
         .session
         .document_mut()
         .editor_mut()
-        .adopt_render_layout(output.layout);
+        .adopt_layout_snapshot(output.layout);
     debug_assert!(
         adopted,
         "layout was validated before publication acceptance"
@@ -5651,6 +6526,11 @@ fn macos_can_reuse_prepared_frame(
     state.resource_completion_generation == resource_generation
         && state.host.surface_generation() == surface_generation
         && macos_pending_resource_allows_retained_reuse(state.resource_retry_pending)
+        && (!state.layout_pending
+            || state
+                .last_frame_key
+                .as_ref()
+                .is_some_and(|previous| previous != requested))
         && state.prepared_build.as_ref() == Some(requested.build())
         && state.host.frame_handle().is_some_and(|frame| {
             frame.plan().viewport() == viewport
@@ -5692,7 +6572,11 @@ fn macos_render_host_surface_prepare(
     // main thread, and the adapter explicitly drops the attachment first.
     let attachment = unsafe { surface.attach_to_view_owned(view) }
         .map_err(|_| YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
-    let renderer = match MetalFrameRenderer::new(device.clone()) {
+    let renderer_result = match session.shader_library.as_deref() {
+        Some(library) => MetalFrameRenderer::with_library(device.clone(), library),
+        None => MetalFrameRenderer::new(device.clone()),
+    };
+    let renderer = match renderer_result {
         Ok(renderer) => renderer,
         Err(_) => {
             drop(attachment);
@@ -6032,7 +6916,15 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
             &mut surface_state.image_atlas,
             // A worker may have prepared the frame at an earlier scroll origin.
             // Coverage was validated above; encode using the current camera.
-            presentation_viewport,
+            // Geometry is shared with AppKit's input view. The paragraph's x=0
+            // is the reading column, not the surface's left edge.
+            Rect::new(
+                -((surface_width as f32 - max_width) * 0.5),
+                scroll_y - resolved_theme_spec(appearance).top,
+                surface_width as f32,
+                surface_height as f32,
+            )
+            .ok(),
         ) {
             Ok(submission) => submission,
             Err(error) => return macos_surface_submit_error_status(error),
@@ -6080,6 +6972,7 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
                 highlighted_glyph_count: host_snapshot.highlighted_glyph_count,
                 resource_refresh_pending: host_snapshot.resource_refresh_pending,
                 resource_retry_pending: host_snapshot.resource_retry_pending,
+                layout_pending: host_snapshot.layout_pending,
                 content_height: host_snapshot.content_height,
             };
         }
@@ -6102,7 +6995,42 @@ pub unsafe extern "C" fn yu_storage_session_macos_render_host_surface_submit(
     }
 }
 
-/// 判断按给定几何提交的下一帧是否与已在屏幕上的帧完全等价。
+/// Returns the latest drawable's CoreAnimation presentation time, or zero
+/// while the current source/geometry has no matching presented submission.
+/// # Safety
+/// Same live-session and readable/writable pointer contract as frame_is_current.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_frame_presentation_time(
+    session: *mut YuStorageSession,
+    geometry: *const YuStorageFrameGeometry,
+    appearance: u8,
+    out_time: *mut f64,
+) -> i32 {
+    if out_time.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    unsafe { *out_time = 0.0 };
+    let mut current = 0_u8;
+    let status =
+        unsafe { yu_storage_session_frame_is_current(session, geometry, appearance, &mut current) };
+    if status != YU_STORAGE_OK {
+        return status;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let time = unsafe { &*session }
+            .macos_render_host
+            .as_ref()
+            .and_then(|host| host.surface.as_ref())
+            .map_or(0.0, |surface| surface.surface.latest_presentation_time());
+        unsafe {
+            *out_time = if current != 0 { time } else { 0.0 };
+        }
+    }
+    status
+}
+
+/// 判断按给定几何提交的下一帧是否与最近成功提交的帧完全等价。
 ///
 /// 等价的完整定义见 [`FrameKey`]：Revision、composition generation、
 /// 全部选区、查询代数、表格 resize 覆盖与几何全部不变才算等价。其中有四项
@@ -6163,6 +7091,22 @@ pub unsafe extern "C" fn yu_storage_session_frame_is_current(
                 })
                 && state.last_frame_key.as_ref() == Some(&key)
         });
+        if !current
+            && std::env::var_os("YU_RENDER_TIMING").is_some()
+            && let Some(state) = session.macos_render_host.as_ref()
+        {
+            println!(
+                "yu-render-metric event=frame_not_current key={} serial={} retry={} resource={}",
+                state.last_frame_key.as_ref() == Some(&key),
+                state
+                    .host
+                    .last_submission()
+                    .is_some_and(|s| Some(s.frame_serial()) == state.host.frame_serial()),
+                state.resource_retry_pending,
+                state.resource_completion_generation
+                    == yu_render_macos::resource_completion_generation()
+            );
+        }
         // SAFETY: `out_current` was checked above and belongs to the caller.
         unsafe { *out_current = u8::from(current) };
         YU_STORAGE_OK
@@ -6255,17 +7199,38 @@ pub unsafe extern "C" fn yu_storage_session_shaped_caret_scroll_request(
         if !size.is_finite() || size <= 0.0 || !max_width.is_finite() || max_width <= 0.0 {
             return YU_STORAGE_EDITOR_ERROR;
         }
-        let (shaper, metrics, _layout_config) = match core_text_system_ui_layout(size, max_width) {
+        let (shaper, metrics, _layout_config) = match macos_query_text_layout(
+            session,
+            size,
+            max_width,
+            session.session.viewport_config().layout().theme(),
+        ) {
             Ok(layout) => layout,
             Err(status) => return status,
         };
-        if let Err(status) = macos_publish_viewport_config(session, max_width, metrics) {
+        if let Err(status) = macos_publish_viewport_config(
+            session,
+            max_width,
+            metrics,
+            session.session.viewport_config().layout().theme(),
+        ) {
             return status;
         }
         // 露出光标时在视口边缘留出的余量。此前由平台传入，而平台算的正是
         // `max(line_height, 4.0)`——一个 Rust 自己就知道的值。为了拿到它，
         // 平台必须先查一次字体度量，于是每次光标移动多一次纯往返。
         let margin = metrics.line_height().max(4.0);
+        let focus = session
+            .session
+            .composition()
+            .map_or(session.session.selection().focus(), |overlay| {
+                overlay.replacement_range().start()
+            });
+        if session.session.block_count() > 0
+            && let Err(status) = macos_query_layout_snapshot(session, focus, &shaper)
+        {
+            return status;
+        }
         let request = match session.session.caret_scroll_request_with_shaper(
             ViewportSpan::new(scroll_y, viewport_height),
             margin,
@@ -6338,7 +7303,7 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
     };
     if !matches!(
         format,
-        YU_STORAGE_CLIPBOARD_TEXT | YU_STORAGE_CLIPBOARD_HTML
+        YU_STORAGE_CLIPBOARD_TEXT | YU_STORAGE_CLIPBOARD_HTML | YU_STORAGE_CLIPBOARD_MARKDOWN
     ) {
         if !written.is_null() {
             // SAFETY: `written` was checked above and belongs to the caller.
@@ -6351,7 +7316,80 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
     }
     let range = session.session.selection().ordered_range();
     let snapshot = session.session.snapshot();
-    if format == YU_STORAGE_CLIPBOARD_TEXT {
+    let columns = session.session.selections().table_columns();
+    if columns.is_some() && format == YU_STORAGE_CLIPBOARD_TEXT {
+        return match session.session.document().editor().copy_table_tsv() {
+            Ok(Some(text)) => write_bytes(text.as_bytes(), output, capacity, written),
+            Ok(None) => YU_STORAGE_INVALID_SELECTION,
+            Err(_) => YU_STORAGE_INVALID_SELECTION,
+        };
+    }
+    if session.session.selections().is_multiple() || columns.is_some() {
+        // Copy and cut operate on the same normalized selection set. Empty
+        // carets contribute no text; fragments retain source order, regardless
+        // of which selection is primary. Newlines separate disjoint fragments.
+        let mut fragments = Vec::new();
+        for selection in session.session.selections().as_slice() {
+            let range = selection.ordered_range();
+            if range.is_empty() && columns.is_none() {
+                continue;
+            }
+            if format != YU_STORAGE_CLIPBOARD_HTML {
+                let Some(text) = snapshot
+                    .as_str()
+                    .get(range.start().get() as usize..range.end().get() as usize)
+                else {
+                    return YU_STORAGE_INVALID_SELECTION;
+                };
+                fragments.push(text.to_owned());
+            } else if columns.is_some() {
+                let Some(text) = snapshot
+                    .as_str()
+                    .get(range.start().get() as usize..range.end().get() as usize)
+                else {
+                    return YU_STORAGE_INVALID_SELECTION;
+                };
+                fragments.push(yu_export::export_html_fragment(text));
+            } else {
+                match export_clipboard(&snapshot, session.session.revision(), range) {
+                    Ok(payload) => fragments.push(payload.html().to_owned()),
+                    Err(error) => return status_from_export_error(error),
+                }
+            }
+        }
+        if let Some(columns) = columns {
+            let rows: Vec<_> = fragments.chunks(columns).collect();
+            let payload = match format {
+                YU_STORAGE_CLIPBOARD_HTML => format!(
+                    "<table>{}</table>",
+                    rows.iter()
+                        .map(|row| format!(
+                            "<tr>{}</tr>",
+                            row.iter()
+                                .map(|cell| format!("<td>{cell}</td>"))
+                                .collect::<String>()
+                        ))
+                        .collect::<String>()
+                ),
+                YU_STORAGE_CLIPBOARD_MARKDOWN => {
+                    let mut lines: Vec<String> = rows
+                        .iter()
+                        .map(|row| format!("| {} |", row.join(" | ")))
+                        .collect();
+                    lines.insert(1, format!("| {} |", vec!["---"; columns].join(" | ")));
+                    lines.join("\n")
+                }
+                _ => rows
+                    .iter()
+                    .map(|row| row.join("\t"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            return write_bytes(payload.as_bytes(), output, capacity, written);
+        }
+        return write_bytes(fragments.join("\n").as_bytes(), output, capacity, written);
+    }
+    if format != YU_STORAGE_CLIPBOARD_HTML {
         return write_snapshot_range(&snapshot, range, output, capacity, written);
     }
     let payload = match export_clipboard(&snapshot, session.session.revision(), range) {
@@ -6461,7 +7499,9 @@ pub unsafe extern "C" fn yu_storage_session_accessibility_semantic_nodes_v2(
 /// # Safety
 /// `session` must be a live handle. `item_count` and `text_length` must be
 /// writable; when non-null, `items` must provide `item_capacity` writable
-/// items and `text` must provide `text_capacity` writable bytes.
+/// items, `text` must provide `text_capacity` writable bytes, and `styles`
+/// must provide `style_capacity` writable runs. All three counts must be writable.
+/// Query with all three payload pointers null and capacities zero.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yu_storage_session_outline_items(
     session: *mut YuStorageSession,
@@ -6472,6 +7512,9 @@ pub unsafe extern "C" fn yu_storage_session_outline_items(
     text: *mut u8,
     text_capacity: usize,
     text_length: *mut usize,
+    styles: *mut YuStorageOutlineStyleRun,
+    style_capacity: usize,
+    style_count: *mut usize,
 ) -> i32 {
     let Some(session) = (unsafe { session.as_mut() }) else {
         return YU_STORAGE_NULL_POINTER;
@@ -6479,11 +7522,37 @@ pub unsafe extern "C" fn yu_storage_session_outline_items(
     if let Err(status) = validate_revision(&session.session, expected_revision) {
         return status;
     }
-    let (rows, display) = match outline_rows_output(&mut session.session) {
+    let (rows, display, runs) = match outline_rows_output(&mut session.session) {
         Ok(output) => output,
         Err(status) => return status,
     };
-    write_panel_rows(
+    if style_count.is_null() || item_count.is_null() || text_length.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    // SAFETY: count pointers are caller-owned writable outputs checked above.
+    unsafe {
+        *style_count = runs.len();
+        *item_count = rows.len();
+        *text_length = display.len();
+    }
+    let measuring = items.is_null()
+        && text.is_null()
+        && styles.is_null()
+        && item_capacity == 0
+        && text_capacity == 0
+        && style_capacity == 0;
+    if !measuring {
+        if items.is_null() || text.is_null() {
+            return YU_STORAGE_NULL_POINTER;
+        }
+        if styles.is_null() && (!runs.is_empty() || style_capacity != 0) {
+            return YU_STORAGE_NULL_POINTER;
+        }
+        if style_capacity < runs.len() {
+            return YU_STORAGE_BUFFER_TOO_SMALL;
+        }
+    }
+    let status = write_panel_rows(
         &rows,
         &display,
         &PanelOutput {
@@ -6494,7 +7563,14 @@ pub unsafe extern "C" fn yu_storage_session_outline_items(
             text_capacity,
             text_length,
         },
-    )
+    );
+    if status == YU_STORAGE_OK && !measuring && !runs.is_empty() {
+        // SAFETY: capacity was checked before any payload was copied.
+        unsafe {
+            ptr::copy_nonoverlapping(runs.as_ptr(), styles, runs.len());
+        }
+    }
+    status
 }
 
 /// 换一份搜索查询，立刻在当前这一版源码上扫出全部匹配。
@@ -6797,6 +7873,10 @@ pub unsafe extern "C" fn yu_storage_session_close_resolve(
         return YU_STORAGE_NULL_POINTER;
     };
     match action {
+        YU_STORAGE_CLOSE_RESOLVE_ABORT => {
+            session.session.abort_close();
+            YU_STORAGE_OK
+        }
         YU_STORAGE_CLOSE_RESOLVE_CANCEL => session
             .session
             .cancel_close()
@@ -6811,6 +7891,64 @@ pub unsafe extern "C" fn yu_storage_session_close_resolve(
             .map_or(YU_STORAGE_INVALID_STATE, |_| YU_STORAGE_OK),
         _ => YU_STORAGE_INVALID_COMMAND,
     }
+}
+
+/// Resolved native theme; this value is also consumed by Rust layout/painting.
+fn resolved_theme_spec(value: u8) -> yu_core::ThemeSpec {
+    match value {
+        YU_STORAGE_APPEARANCE_DARK => yu_core::ThemeSpec::NIGHT,
+        YU_STORAGE_THEME_YU_LIGHT => yu_core::ThemeSpec::YU_LIGHT,
+        YU_STORAGE_THEME_YU_DARK => yu_core::ThemeSpec::YU_DARK,
+        _ => yu_core::ThemeSpec::GITHUB,
+    }
+}
+
+pub type YuStorageThemeSpec = yu_core::ThemeSpec;
+pub type YuStorageReadingGeometry = yu_core::ReadingGeometry;
+
+/// # Safety
+/// `output` must be writable for one ThemeSpec.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_theme_spec(
+    appearance: u8,
+    output: *mut YuStorageThemeSpec,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let theme = resolved_theme_spec(appearance);
+    unsafe {
+        *output = theme;
+    }
+    YU_STORAGE_OK
+}
+
+/// # Safety
+/// `output` must be writable for one ReadingGeometry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_reading_geometry(
+    appearance: u8,
+    width: f32,
+    window_width: f32,
+    scroll_y: f32,
+    output: *mut YuStorageReadingGeometry,
+) -> i32 {
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if !width.is_finite()
+        || width <= 0.0
+        || !window_width.is_finite()
+        || window_width <= 0.0
+        || !scroll_y.is_finite()
+    {
+        return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
+    }
+    unsafe {
+        let theme = resolved_theme_spec(appearance);
+        *output = theme.reading_geometry(width, window_width, scroll_y);
+    }
+    YU_STORAGE_OK
 }
 
 #[cfg(test)]
@@ -6839,6 +7977,225 @@ mod tests {
     }
 
     #[test]
+    fn file_lifecycle_ffi_preserves_recovery_baseline_and_save_as_history() {
+        let directory = std::env::temp_dir().join(format!("yu-file-lifecycle-{}", temp_id()));
+        fs::create_dir_all(&directory).expect("directory");
+        let draft = directory.join("draft.md");
+        let saved = directory.join("saved.md");
+        let root = directory.join("recovery");
+        let draft_bytes = draft.to_str().expect("path").as_bytes();
+        let saved_bytes = saved.to_str().expect("path").as_bytes();
+        let root_bytes = root.to_str().expect("path").as_bytes();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_create(draft_bytes.as_ptr(), draft_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert!(!draft.exists());
+        let session = unsafe { &mut *raw };
+        session
+            .session
+            .execute(EditorCommand::insert_text("中文🙂\r\n"))
+            .expect("edit");
+        assert_eq!(
+            unsafe { yu_storage_session_recovery(raw, root_bytes.as_ptr(), root_bytes.len(), 0) },
+            YU_STORAGE_OK
+        );
+        let record_path = RecoveryStore::new(&root).path_for(&draft).expect("path");
+        let record_bytes = record_path.to_str().expect("path").as_bytes();
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_recovery_copy_target(
+                    record_bytes.as_ptr(),
+                    record_bytes.len(),
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut target = vec![0; required];
+        assert_eq!(
+            unsafe {
+                yu_storage_recovery_copy_target(
+                    record_bytes.as_ptr(),
+                    record_bytes.len(),
+                    target.as_mut_ptr(),
+                    target.len(),
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(target, draft_bytes);
+        let mut recovered = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_open_recovery(
+                    record_bytes.as_ptr(),
+                    record_bytes.len(),
+                    &mut recovered,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { &*recovered }.session.snapshot().as_str(),
+            "中文🙂\r\n"
+        );
+        assert!(unsafe { &*recovered }.session.is_dirty());
+        assert_eq!(
+            unsafe { yu_storage_session_save_as(raw, saved_bytes.as_ptr(), saved_bytes.len(), 0) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(fs::read(&saved).expect("read"), "中文🙂\r\n".as_bytes());
+        assert!(!draft.exists());
+        let original = unsafe { &mut *raw };
+        original
+            .session
+            .execute(EditorCommand::Undo)
+            .expect("history survived");
+        assert_eq!(original.session.snapshot().as_str(), "");
+        assert_eq!(
+            unsafe {
+                yu_storage_session_save_as(recovered, saved_bytes.as_ptr(), saved_bytes.len(), 0)
+            },
+            YU_STORAGE_EXTERNAL_CHANGE
+        );
+        assert_eq!(unsafe { &*recovered }.session.path(), &draft);
+        let mut request = YuStorageCloseRequest::default();
+        assert_eq!(
+            unsafe { yu_storage_session_request_close(recovered, &mut request) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_close_resolve(recovered, YU_STORAGE_CLOSE_RESOLVE_DISCARD)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_close_resolve(recovered, YU_STORAGE_CLOSE_RESOLVE_ABORT) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_request_close(recovered, &mut request) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(request.result, YU_STORAGE_CLOSE_PROMPT);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_recovery(recovered, root_bytes.as_ptr(), root_bytes.len(), 1)
+            },
+            YU_STORAGE_OK
+        );
+        assert!(!record_path.exists());
+        unsafe {
+            yu_storage_session_destroy(raw);
+            yu_storage_session_destroy(recovered);
+        }
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn file_lifecycle_ffi_rejects_null_invalid_actions_and_corrupt_recovery() {
+        assert_eq!(
+            unsafe { yu_storage_session_create(ptr::null(), 0, ptr::null_mut()) },
+            YU_STORAGE_NULL_POINTER
+        );
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_create(ptr::null(), 0, &mut raw) },
+            YU_STORAGE_INVALID_PATH
+        );
+        assert!(raw.is_null());
+        assert_eq!(
+            unsafe { yu_storage_session_save_as(raw, ptr::null(), 0, 0) },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_recovery(raw, ptr::null(), 0, 0) },
+            YU_STORAGE_NULL_POINTER
+        );
+        let path = std::env::temp_dir().join(format!("yu-bad-recovery-{}", temp_id()));
+        fs::write(&path, b"not a recovery file").expect("corrupt file");
+        let bytes = path.to_str().expect("path").as_bytes();
+        assert_eq!(
+            unsafe { yu_storage_session_open_recovery(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_INVALID_RECOVERY
+        );
+        assert!(raw.is_null());
+        assert_eq!(fs::read(&path).expect("preserved"), b"not a recovery file");
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn ffi_table_width_store_restores_a_new_session() {
+        let directory = std::env::temp_dir().join(format!("yu-ffi-widths-{}", temp_id()));
+        fs::create_dir_all(&directory).expect("directory");
+        let path = directory.join("document.md");
+        let source = "| A | B |\n| --- | --- |\n| one | two |\n";
+        fs::write(&path, source).expect("source");
+        let root = directory.join("state");
+        let root_bytes = root.to_string_lossy().as_bytes().to_vec();
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_table_width_store(raw, root_bytes.as_ptr(), root_bytes.len())
+            },
+            YU_STORAGE_OK
+        );
+        let editor = unsafe { &mut *raw }.session.document_mut().editor_mut();
+        let mut layout = editor
+            .block_layout_for_visual_state(0, LayoutConfig::new(500.0, 16.0))
+            .expect("layout");
+        layout.apply_table_column_resize(0, -50.0).expect("resize");
+        editor
+            .confirm_table_column_widths(0, layout.table().expect("table"))
+            .expect("confirm");
+        let records = editor.table_column_width_records();
+        assert_eq!(
+            unsafe { yu_storage_session_persist_table_widths(raw) },
+            YU_STORAGE_OK
+        );
+        unsafe { yu_storage_session_destroy(raw) };
+        raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_table_width_store(raw, root_bytes.as_ptr(), root_bytes.len())
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { &*raw }
+                .session
+                .document()
+                .editor()
+                .table_column_width_records(),
+            records
+        );
+        assert!(!unsafe { &*raw }.session.document().is_dirty());
+        assert_eq!(fs::read_to_string(path).expect("source unchanged"), source);
+        unsafe { yu_storage_session_destroy(raw) };
+        assert_eq!(
+            unsafe { yu_storage_session_persist_table_widths(ptr::null_mut()) },
+            YU_STORAGE_NULL_POINTER
+        );
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn status_and_state_contracts_are_stable() {
         let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-{id}.md"));
@@ -6850,6 +8207,8 @@ mod tests {
             table_resize_override: None,
             #[cfg(target_os = "macos")]
             macos_render_host: None,
+            #[cfg(target_os = "macos")]
+            shader_library: None,
             #[cfg(target_os = "macos")]
             macos_embedded_resources: MacosEmbeddedResourceState::new(),
         };
@@ -6877,29 +8236,34 @@ mod tests {
         };
         let request = EmbeddedRenderRequest::new(
             Revision::INITIAL,
-            TextRange::new(ByteOffset::ZERO, ByteOffset::new(3)).unwrap(),
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(3))
+                .expect("valid FFI session fixture"),
             EmbeddedResourceKind::Math,
             "x^2",
         )
-        .unwrap();
+        .expect("valid FFI session fixture");
         assert_eq!(
             state
                 .status_for(request.clone(), Revision::INITIAL)
-                .unwrap(),
+                .expect("valid FFI session fixture"),
             YU_STORAGE_EMBEDDED_RESOURCE_PENDING
         );
-        let job = queued.try_recv().unwrap();
+        let job = queued.try_recv().expect("valid FFI session fixture");
         assert_eq!(
             state
                 .status_for(request.clone(), Revision::INITIAL)
-                .unwrap(),
+                .expect("valid FFI session fixture"),
             YU_STORAGE_EMBEDDED_RESOURCE_PENDING
         );
         assert!(queued.try_recv().is_err(), "duplicate job while in flight");
         let payload = MathRenderer::default().render(&job);
-        completed.send((job, payload)).unwrap();
+        completed
+            .send((job, payload))
+            .expect("valid FFI session fixture");
         assert_eq!(
-            state.status_for(request, Revision::INITIAL).unwrap(),
+            state
+                .status_for(request, Revision::INITIAL)
+                .expect("valid FFI session fixture"),
             YU_STORAGE_EMBEDDED_RESOURCE_READY
         );
     }
@@ -7363,7 +8727,8 @@ mod tests {
             },
             YU_STORAGE_OK
         );
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        let (_, metrics, _) =
+            core_text_layout(14.0, 500.0, yu_core::ThemeId::Github).expect("CoreText");
         let code_line = metrics.line_height() * yu_editor::layout_tokens::LINE_HEIGHT_CODE;
         // x 点在 'o' 上（内容内第二个字符）：行首的第一个字符带隐藏围栏的
         // 边界 bias，点它会映射到源码 0——那不是这一刀要测的东西。
@@ -7371,19 +8736,19 @@ mod tests {
             let mut hit = YuStorageProjectionHit::default();
             assert_eq!(
                 unsafe {
-                    yu_storage_session_projection_hit_test(raw, 0, 24.0, y, 14.0, 500.0, &mut hit)
+                    yu_storage_session_projection_hit_test(raw, 0, 18.0, y, 14.0, 500.0, &mut hit)
                 },
                 YU_STORAGE_OK
             );
             hit
         };
-        let upper = probe(5.0 + 2.0);
-        let lower = probe(5.0 + code_line - 3.0);
+        let upper = probe(7.875 + 2.0);
+        let lower = probe(7.875 + code_line - 3.0);
         assert_eq!(upper.source_utf16, 5, "靠上的点击落在 body 行内");
         assert_eq!(lower.source_utf16, 5, "贴行下沿的点击仍在 body 行内");
         assert_eq!(upper.line, 0);
         assert_eq!(lower.line, 0, "漏内容原点时这个点会落进块尾空行盒");
-        // 同一 caret 的返回 y 一致，且含内容原点：块局部 caret 顶 0 + 原点 5。
+        // 同一 caret 的返回 y 一致，且含内容原点：块局部 caret 顶 0 + 原点 7.875。
         assert!(
             (upper.y - lower.y).abs() < 0.01,
             "同一 caret 的返回 y 必须一致：upper={} lower={}",
@@ -7391,8 +8756,8 @@ mod tests {
             lower.y
         );
         assert!(
-            (upper.y - 5.0).abs() < 0.01,
-            "返回的 caret y 必须含内容原点（5pt）：{}",
+            (upper.y - 7.875).abs() < 0.01,
+            "返回的 caret y 必须含内容原点（(8 + 1) × 14/16 = 7.875pt）：{}",
             upper.y
         );
 
@@ -7564,6 +8929,130 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_nested_task_click_undo_redo_save_and_reopen_preserves_source() {
+        for prefix in ["- > - [ ] ", "> 3. > - [ ] ", "3. > 7. > - [ ] "] {
+            let source = format!("{prefix}todo 中文\n\nend\n");
+            let marker = source.find("[ ]").expect("checkbox") as u64;
+            for appearance in [YU_STORAGE_APPEARANCE_LIGHT, YU_STORAGE_APPEARANCE_DARK] {
+                let path = std::env::temp_dir().join(format!("yu-nested-task-{}.md", temp_id()));
+                fs::write(&path, &source).expect("fixture");
+                let bytes = path.to_string_lossy().as_bytes().to_vec();
+                let mut raw = ptr::null_mut();
+                assert_eq!(
+                    unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+                    YU_STORAGE_OK
+                );
+                let mut frame = YuStorageMacosRenderHostSnapshot::default();
+                assert_eq!(
+                    unsafe {
+                        yu_storage_session_macos_render_host_frame(
+                            raw, 0, 16.0, 600.0, 0.0, 800.0, 0, appearance, &mut frame,
+                        )
+                    },
+                    YU_STORAGE_OK
+                );
+                let bounds = unsafe { raw.as_ref() }
+                    .expect("session")
+                    .macos_render_host
+                    .as_ref()
+                    .and_then(|host| host.builder.last_publication())
+                    .expect("publication")
+                    .frame()
+                    .scene()
+                    .scene()
+                    .primitives()
+                    .iter()
+                    .find_map(|primitive| match primitive {
+                        Primitive::Ornament(task)
+                            if task.role() == yu_scene::OrnamentRole::Border
+                                && task.source().start().get() == marker
+                                && task.source().end().get() == marker + 3 =>
+                        {
+                            Some(task.bounds())
+                        }
+                        _ => None,
+                    })
+                    .expect("painted checkbox");
+                let mut hit = YuStorageTaskCheckboxHit::default();
+                assert_eq!(
+                    unsafe {
+                        yu_storage_session_task_checkbox_hit_test(
+                            raw,
+                            0,
+                            bounds.x() + bounds.width() * 0.5,
+                            bounds.y() + bounds.height() * 0.5,
+                            &mut hit,
+                        )
+                    },
+                    YU_STORAGE_OK
+                );
+                assert_eq!(
+                    (hit.marker_start_utf16, hit.marker_end_utf16),
+                    (marker, marker + 3)
+                );
+                for (command, expected) in [
+                    (
+                        YU_STORAGE_COMMAND_TOGGLE_TASK,
+                        source.replacen("[ ]", "[x]", 1),
+                    ),
+                    (YU_STORAGE_COMMAND_UNDO, source.clone()),
+                    (YU_STORAGE_COMMAND_REDO, source.replacen("[ ]", "[x]", 1)),
+                ] {
+                    let mut result = YuStorageCommandResult::default();
+                    assert_eq!(
+                        unsafe {
+                            yu_storage_session_execute_command(
+                                raw,
+                                command,
+                                hit.block_index,
+                                &mut result,
+                            )
+                        },
+                        YU_STORAGE_OK
+                    );
+                    assert_ne!(result.changed, 0);
+                    assert_eq!(
+                        unsafe { raw.as_ref() }
+                            .expect("session")
+                            .session
+                            .snapshot()
+                            .as_str(),
+                        expected
+                    );
+                }
+                let mut revision = 0;
+                let mut written = 0;
+                let mut changed = 0;
+                assert_eq!(
+                    unsafe {
+                        yu_storage_session_save(raw, &mut revision, &mut written, &mut changed)
+                    },
+                    YU_STORAGE_OK
+                );
+                let expected = source.replacen("[ ]", "[x]", 1);
+                assert_eq!(fs::read_to_string(&path).expect("saved"), expected);
+                unsafe { yu_storage_session_destroy(raw) };
+                raw = ptr::null_mut();
+                assert_eq!(
+                    unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+                    YU_STORAGE_OK
+                );
+                assert_eq!(
+                    unsafe { raw.as_ref() }
+                        .expect("reopened")
+                        .session
+                        .snapshot()
+                        .as_str(),
+                    expected
+                );
+                unsafe { yu_storage_session_destroy(raw) };
+                fs::remove_file(path).expect("cleanup");
+            }
+        }
+    }
+
     /// 复数选区在 FFI 边界上的往返：两遍协议、归一化、primary 的下标。
     ///
     /// **归一化在 Rust 侧一家做。** 平台送来逆序、重叠、同一偏移两次的输入
@@ -7719,7 +9208,15 @@ mod tests {
             appearance_from_raw(YU_STORAGE_APPEARANCE_DARK),
             Appearance::Dark
         );
-        for raw in [2u8, 7, 255] {
+        assert_eq!(
+            appearance_from_raw(YU_STORAGE_THEME_YU_LIGHT),
+            Appearance::YuLight
+        );
+        assert_eq!(
+            appearance_from_raw(YU_STORAGE_THEME_YU_DARK),
+            Appearance::YuDark
+        );
+        for raw in [4u8, 7, 255] {
             assert_eq!(
                 appearance_from_raw(raw),
                 Appearance::Light,
@@ -7784,6 +9281,33 @@ mod tests {
             YU_STORAGE_OK
         );
         assert_eq!(current, 0, "尚未提交任何帧时不得判为当前");
+        let mut presented_at = 123.0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_frame_presentation_time(
+                    raw,
+                    &geometry,
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    &mut presented_at,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            presented_at, 0.0,
+            "No submission must not expose a timestamp"
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_frame_presentation_time(
+                    raw,
+                    &geometry,
+                    YU_STORAGE_APPEARANCE_LIGHT,
+                    ptr::null_mut(),
+                )
+            },
+            YU_STORAGE_NULL_POINTER
+        );
 
         // 非法几何必须被拒绝，而不是当作"不同"从而每帧重画。
         for invalid in [
@@ -7813,6 +9337,19 @@ mod tests {
                 YU_STORAGE_EDITOR_ERROR
             );
             assert_eq!(out, 0);
+            let mut presented_at = 123.0;
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_frame_presentation_time(
+                        raw,
+                        &invalid,
+                        YU_STORAGE_APPEARANCE_LIGHT,
+                        &mut presented_at,
+                    )
+                },
+                YU_STORAGE_EDITOR_ERROR
+            );
+            assert_eq!(presented_at, 0.0);
         }
 
         // 空指针必须返回明确状态，不得写入半成品输出。
@@ -7929,7 +9466,7 @@ mod tests {
         );
         assert!(text_len > 0 && html_len > text_len, "两种表示必须不同");
 
-        for unknown in [2_u8, 255] {
+        for unknown in [3_u8, 255] {
             let mut written = 99;
             assert_eq!(
                 unsafe {
@@ -7969,31 +9506,70 @@ mod tests {
             YU_STORAGE_OK
         );
 
-        // 先探出一个真实存在的分隔线位置。
+        // Use the published divider geometry, including the first figure's
+        // margin; y=1 belongs to the reading-column whitespace, not the table.
+        let mut dividers = [YuStorageTableResizeAccessibilityDivider::default(); 8];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_accessibility_dividers(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    dividers.as_mut_ptr(),
+                    dividers.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let geometry = dividers[..written]
+            .iter()
+            .find(|d| d.kind == YU_STORAGE_TABLE_RESIZE_COLUMN)
+            .expect("column geometry");
+        let divider = geometry.x;
+        let point_y = geometry.y + geometry.height * 0.5;
+        let mut empty_hover = 9;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_hover(
+                    raw,
+                    0,
+                    14.0,
+                    500.0,
+                    0.0,
+                    240.0,
+                    divider,
+                    1.0,
+                    0.4,
+                    &mut empty_hover,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(empty_hover, 0, "figure top margin must not resize a column");
         let mut probe = YuStorageTableResizeHit::default();
-        let mut divider = None;
-        for step in 0_u16..400 {
-            let x = f32::from(step) * 0.5;
-            let status = unsafe {
+        assert_eq!(
+            unsafe {
                 yu_storage_session_table_resize_at_point(
                     raw,
                     0,
                     YU_STORAGE_TABLE_RESIZE_PROBE,
                     14.0,
                     500.0,
-                    x,
-                    1.0,
+                    divider,
+                    point_y,
                     0.4,
                     0.0,
                     &mut probe,
                 )
-            };
-            if status == YU_STORAGE_OK {
-                divider = Some(x);
-                break;
-            }
-        }
-        let divider = divider.expect("a column divider must be reachable");
+            },
+            YU_STORAGE_OK
+        );
+
         assert_eq!(probe.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
 
         // 探测不得开出手势：紧接着的 UPDATE 必须报「没有手势」。
@@ -8022,7 +9598,7 @@ mod tests {
                     14.0,
                     500.0,
                     divider,
-                    1.0,
+                    point_y,
                     0.4,
                     divider,
                     &mut rejected,
@@ -8055,7 +9631,7 @@ mod tests {
                     14.0,
                     500.0,
                     divider,
-                    1.0,
+                    point_y,
                     0.4,
                     divider,
                     &mut begun,
@@ -8225,7 +9801,7 @@ mod tests {
 
         // 拖动列分隔线既不推进 Revision 也不改变几何。
         let hit =
-            begin_table_resize_for_test(raw, 0, 3.1, 0.5, 0.2, 3.1).expect("begin table resize");
+            begin_table_resize_for_test(raw, 0, 10.1, 0.5, 0.2, 3.1).expect("begin table resize");
         assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
         let mut preview = YuStorageTableResizeCommit::default();
         assert_eq!(
@@ -8272,6 +9848,98 @@ mod tests {
         fs::remove_file(path).expect("cleanup");
     }
 
+    #[test]
+    fn ffi_table_resize_finish_preserves_widths_after_edit() {
+        let path = std::env::temp_dir().join(format!("yu-confirmed-widths-{}.md", temp_id()));
+        let source = "| A | B |\n| --- | --- |\n| value | other |\n";
+        fs::write(&path, source).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        // The native host normally supplies the same layout policy at BEGIN.
+        let config = LayoutConfig::new(500.0, 16.0).with_default_advance(8.0);
+        let session = unsafe { raw.as_mut() }.expect("live session");
+        let editor = session.session.document_mut().editor_mut();
+        editor
+            .set_viewport_config(yu_editor::ViewportConfig::new(config, 16.0, 0.0))
+            .expect("viewport");
+        let layout = editor
+            .block_layout_for_visual_state(0, config)
+            .expect("layout");
+        let table = layout.table().expect("table");
+        let x = table.bounds().x() + table.column_widths()[0];
+        let hit = table
+            .resize_hit_test(LayoutPoint::new(x, table.bounds().y() + 1.0), 1.0)
+            .expect("hit")
+            .expect("divider");
+        begin_table_resize_session(session, 0, hit, x).expect("begin");
+        let mut result = YuStorageTableResizeCommit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_UPDATE,
+                    x - 60.0,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_table_resize_action(
+                    raw,
+                    0,
+                    YU_STORAGE_TABLE_RESIZE_FINISH,
+                    0.0,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let session = unsafe { raw.as_mut() }.expect("live session");
+        assert!(session.table_resize_override.is_none());
+        let editor = session.session.document_mut().editor_mut();
+        assert_eq!(editor.table_width_generation(), 1);
+        let before = editor
+            .block_layout_for_visual_state(0, config)
+            .expect("confirmed")
+            .table()
+            .expect("table")
+            .column_widths()
+            .to_vec();
+        editor
+            .execute(yu_editor::EditorCommand::SelectTableCells {
+                anchor: ByteOffset::new(source.find("value").expect("cell") as u64),
+                focus: ByteOffset::new(source.find("value").expect("cell") as u64),
+            })
+            .expect("select");
+        editor
+            .execute(yu_editor::EditorCommand::PasteTsv(
+                "longer cell text".into(),
+            ))
+            .expect("edit");
+        let layout = editor
+            .block_layout_for_visual_state(0, config)
+            .expect("after edit");
+        for (a, b) in layout
+            .table()
+            .expect("table")
+            .column_widths()
+            .iter()
+            .zip(&before)
+        {
+            assert!((a - b).abs() < 0.001);
+        }
+        assert_eq!(editor.table_width_generation(), 1);
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     /// 未知的 action 必须被拒绝，且不得触碰手势状态。
     ///
     /// 三个动作合成一个入口之后，「传错 action 会发生什么」成了一个新的失败面。
@@ -8290,7 +9958,7 @@ mod tests {
         );
 
         let hit =
-            begin_table_resize_for_test(raw, 0, 3.1, 0.5, 0.2, 3.1).expect("begin table resize");
+            begin_table_resize_for_test(raw, 0, 10.1, 0.5, 0.2, 3.1).expect("begin table resize");
         assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
         let mut preview = YuStorageTableResizeCommit::default();
         assert_eq!(
@@ -8305,7 +9973,7 @@ mod tests {
             },
             YU_STORAGE_OK
         );
-        assert_eq!(preview.final_position, 4.0);
+        assert_eq!(preview.final_position, 11.0);
 
         for unknown in [3_u8, 255] {
             let mut out = preview;
@@ -8333,7 +10001,7 @@ mod tests {
             },
             YU_STORAGE_OK
         );
-        assert_eq!(preview.final_position, 5.0);
+        assert_eq!(preview.final_position, 12.0);
 
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
@@ -8353,14 +10021,14 @@ mod tests {
         );
 
         let hit =
-            begin_table_resize_for_test(raw, 0, 3.1, 0.5, 0.2, 3.1).expect("begin table resize");
+            begin_table_resize_for_test(raw, 0, 10.1, 0.5, 0.2, 3.1).expect("begin table resize");
         assert_eq!(hit.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
         assert_eq!(hit.index, 0);
-        assert_eq!(hit.position, 3.0);
+        assert_eq!(hit.position, 10.0);
 
         // 已有手势时不得再开一个。
         assert_eq!(
-            begin_table_resize_for_test(raw, 0, 3.1, 0.5, 0.2, 3.1),
+            begin_table_resize_for_test(raw, 0, 10.1, 0.5, 0.2, 3.1),
             Err(YU_STORAGE_INVALID_STATE)
         );
 
@@ -8381,8 +10049,8 @@ mod tests {
         assert_eq!(preview.block_index, 0);
         assert_eq!(preview.kind, YU_STORAGE_TABLE_RESIZE_COLUMN);
         assert_eq!(preview.index, 0);
-        assert_eq!(preview.initial_position, 3.0);
-        assert_eq!(preview.final_position, 4.0);
+        assert_eq!(preview.initial_position, 10.0);
+        assert_eq!(preview.final_position, 11.0);
         assert_eq!(preview.delta, 1.0);
 
         let mut committed = YuStorageTableResizeCommit::default();
@@ -8456,6 +10124,881 @@ mod tests {
             YU_STORAGE_OK
         );
 
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn document_resource_geometry_tracks_sizes_not_bitmap_pixels() {
+        let revision = Revision::new(7);
+        let source =
+            TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(10)).expect("range");
+        let mut cache = yu_assets::ImageCache::new();
+        let mut publish = |width, byte| {
+            cache
+                .publish_decoded(
+                    yu_assets::ImageRequest::new(revision, source, "image.png").expect("request"),
+                    revision,
+                    yu_assets::DecodedImage::new(width, 3, vec![byte; width as usize * 3 * 4])
+                        .expect("pixels"),
+                )
+                .expect("publication")
+        };
+        let first = publish(2, 255);
+        let key = first.key().fingerprint();
+        let mut resources = MacosImageResourceState::new().expect("resources");
+        assert_eq!(resources.geometry_version(revision), 0);
+        resources
+            .intrinsics
+            .insert(key, first.intrinsic_publication());
+        let intrinsic_version = resources.geometry_version(revision);
+        assert_ne!(intrinsic_version, 0);
+        resources.publications.insert(key, publish(2, 0));
+        assert_eq!(
+            resources.geometry_version(revision),
+            intrinsic_version,
+            "pixel replacement with unchanged size is decoration-only"
+        );
+        let resized = publish(4, 255);
+        resources.publications.insert(key, resized.clone());
+        let resized_version = resources.geometry_version(revision);
+        assert_ne!(resized_version, intrinsic_version);
+        resources
+            .intrinsics
+            .insert(key, resized.intrinsic_publication());
+        resources.publications.clear();
+        assert_eq!(
+            resources.geometry_version(revision),
+            resized_version,
+            "bitmap eviction preserves known dimensions"
+        );
+        assert_eq!(
+            resources.geometry_version(Revision::new(8)),
+            0,
+            "stale revisions must not affect current geometry"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_list_markers_have_geometry_and_preserve_source_carets() {
+        let source =
+            "# Heading\n\n- first\n  - child\n    - deep\n\n> - quoted\n\n1. ordered\n\nend\n";
+        for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+            for zoom in [0.75, 1.0, 1.5] {
+                let (shaper, _, config) =
+                    core_text_layout(16.0 * zoom, 500.0, theme).expect("native font");
+                let mut document = yu_editor::EditorDocument::new(source);
+                document
+                    .set_viewport_config(yu_editor::ViewportConfig::new(config, 16.0 * zoom, 0.0))
+                    .expect("config");
+                let snapshot = document
+                    .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &shaper)
+                    .expect("snapshot");
+                let mut kinds = Vec::new();
+                let mut ordered = 0;
+                for block in snapshot.blocks() {
+                    let layout = block.layout();
+                    let Some(marker) = layout.ornaments().marker() else {
+                        continue;
+                    };
+                    if let Some(shape) = marker.shape() {
+                        kinds.push(shape.kind);
+                        let bounds = layout.marker_bounds().expect("geometry").expect("shape");
+                        assert!(bounds.width() >= 3.0 * zoom);
+                        assert_eq!(bounds.width(), bounds.height());
+                        assert!(
+                            layout
+                                .glyphs()
+                                .iter()
+                                .all(|glyph| glyph.source() != marker.source()),
+                            "a geometric marker must not leave a second bullet glyph"
+                        );
+                        let first = layout
+                            .clusters()
+                            .iter()
+                            .find(|cluster| !cluster.visual().is_empty())
+                            .expect("body");
+                        let caret = layout
+                            .caret_for_source(first.source().start(), Bias::After)
+                            .expect("body caret");
+                        assert!(
+                            bounds.x() + bounds.width() < caret.point().x(),
+                            "marker stays in gutter"
+                        );
+                        // Hidden Markdown prefixes share the first visual boundary;
+                        // an interior text boundary has one exact source position.
+                        let interior = layout
+                            .caret_for_source(first.source().end(), Bias::After)
+                            .expect("interior caret");
+                        assert_eq!(
+                            layout.hit_test(interior.point()).expect("hit").source(),
+                            interior.source()
+                        );
+                    } else {
+                        ordered += 1;
+                        assert!(marker.shaped().is_some(), "numbered marker remains text");
+                    }
+                }
+                assert_eq!(ordered, 1);
+                assert_eq!(kinds.len(), 4);
+                if theme == yu_core::ThemeId::Github {
+                    assert!(kinds.contains(&yu_editor::MarkerShapeKind::Disc));
+                    assert!(kinds.contains(&yu_editor::MarkerShapeKind::Circle));
+                    assert!(kinds.contains(&yu_editor::MarkerShapeKind::Square));
+                } else {
+                    assert!(
+                        kinds
+                            .iter()
+                            .all(|kind| *kind == yu_editor::MarkerShapeKind::Square)
+                    );
+                }
+                assert_eq!(document.snapshot().as_str(), source);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_mixed_quote_list_ancestry_positions_text_and_borders() {
+        for (prefix, github_x, night_x, github_bars, night_bars) in [
+            ("- > ", 49.0, 62.0, vec![30.0], vec![30.0]),
+            ("> - ", 49.0, 92.0, vec![0.0], vec![30.0]),
+            ("> - > ", 68.0, 124.0, vec![0.0, 49.0], vec![30.0, 92.0]),
+            ("- > - > ", 98.0, 124.0, vec![30.0, 79.0], vec![30.0, 92.0]),
+            ("> > - ", 68.0, 154.0, vec![0.0, 19.0], vec![30.0, 92.0]),
+        ] {
+            let source = format!("{prefix}first word\n\nend\n");
+            for (theme, x, bars) in [
+                (yu_core::ThemeId::Github, github_x, &github_bars),
+                (yu_core::ThemeId::Night, night_x, &night_bars),
+            ] {
+                for zoom in [0.75, 1.0, 1.5] {
+                    let (shaper, _, config) =
+                        core_text_layout(16.0 * zoom, 600.0, theme).expect("font");
+                    let mut document = yu_editor::EditorDocument::new(source.clone());
+                    document
+                        .set_selection(
+                            yu_editor::EditorSelection::cursor(
+                                &document.snapshot(),
+                                yu_core::ByteOffset::new(source.len() as u64),
+                                yu_editor::CaretAffinity::Downstream,
+                            )
+                            .expect("selection"),
+                        )
+                        .expect("EOF");
+                    document
+                        .set_viewport_config(yu_editor::ViewportConfig::new(
+                            config,
+                            16.0 * zoom,
+                            0.0,
+                        ))
+                        .expect("config");
+                    let snapshot = document
+                        .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &shaper)
+                        .expect("snapshot");
+                    let first = snapshot
+                        .block_for_source(yu_core::ByteOffset::new(prefix.len() as u64))
+                        .expect("body");
+                    let markers: Vec<_> = first.layout().ornaments().markers().collect();
+                    assert_eq!(
+                        markers.len(),
+                        prefix.matches('-').count(),
+                        "all list ancestors must render"
+                    );
+                    for marker in markers {
+                        assert_eq!(
+                            &source[marker.source().start().get() as usize
+                                ..marker.source().end().get() as usize],
+                            "-"
+                        );
+                    }
+                    let offset = yu_core::ByteOffset::new(prefix.len() as u64);
+                    let placed = snapshot.block_for_source(offset).expect("text");
+                    let caret = placed
+                        .layout()
+                        .caret_for_source(offset, Bias::After)
+                        .expect("caret");
+                    assert!(
+                        (caret.point().x() - x * zoom).abs() < 0.001,
+                        "{prefix:?} {theme:?} {zoom}: {} expected {}",
+                        caret.point().x(),
+                        x * zoom
+                    );
+                    let actual: Vec<_> = snapshot
+                        .containers()
+                        .iter()
+                        .filter_map(|c| c.quote_bar)
+                        .collect();
+                    assert_eq!(actual.len(), bars.len());
+                    for (bar, expected) in actual.iter().zip(bars) {
+                        assert!(
+                            (bar.x() - expected * zoom).abs() < 0.001,
+                            "{prefix:?} {theme:?}: bar={bar:?}"
+                        );
+                    }
+                    let interior = placed
+                        .layout()
+                        .caret_for_source(yu_core::ByteOffset::new(offset.get() + 2), Bias::After)
+                        .expect("interior");
+                    assert_eq!(
+                        placed
+                            .layout()
+                            .hit_test(interior.point())
+                            .expect("hit")
+                            .source(),
+                        interior.source()
+                    );
+                    assert_eq!(document.snapshot().as_str(), source);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_ordered_ancestor_markers_keep_distinct_numbers_and_sources() {
+        let source = "3. > 7. first\n1. > 9. second\n\nend\n";
+        for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+            for zoom in [0.75, 1.0, 1.5] {
+                let (shaper, _, config) =
+                    core_text_layout(16.0 * zoom, 600.0, theme).expect("font");
+                let mut document = yu_editor::EditorDocument::new(source);
+                document
+                    .set_selection(
+                        yu_editor::EditorSelection::cursor(
+                            &document.snapshot(),
+                            yu_core::ByteOffset::new(source.len() as u64),
+                            yu_editor::CaretAffinity::Downstream,
+                        )
+                        .expect("selection"),
+                    )
+                    .expect("EOF");
+                document
+                    .set_viewport_config(yu_editor::ViewportConfig::new(config, 16.0 * zoom, 0.0))
+                    .expect("config");
+                let snapshot = document
+                    .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &shaper)
+                    .expect("snapshot");
+                for (word, labels, spellings) in [
+                    ("first", ["3.", "7."], ["3.", "7."]),
+                    ("second", ["4.", "9."], ["1.", "9."]),
+                ] {
+                    let offset = yu_core::ByteOffset::new(source.find(word).expect("word") as u64);
+                    let layout = snapshot.block_for_source(offset).expect("block").layout();
+                    let markers: Vec<_> = layout.ornaments().markers().collect();
+                    assert_eq!(markers.len(), 2);
+                    assert!(markers[0].x() + markers[0].advance() < markers[1].x());
+                    for ((marker, label), spelling) in markers.iter().zip(labels).zip(spellings) {
+                        assert_eq!(marker.text(), label);
+                        assert_eq!(
+                            &source[marker.source().start().get() as usize
+                                ..marker.source().end().get() as usize],
+                            spelling
+                        );
+                        assert!(
+                            layout
+                                .glyphs()
+                                .iter()
+                                .any(|glyph| glyph.source() == marker.source())
+                        );
+                    }
+                    let caret = layout
+                        .caret_for_source(yu_core::ByteOffset::new(offset.get() + 2), Bias::After)
+                        .expect("caret");
+                    assert_eq!(
+                        layout.hit_test(caret.point()).expect("hit").source(),
+                        caret.source()
+                    );
+                }
+                assert_eq!(document.snapshot().as_str(), source);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_bidi_code_backgrounds_preserve_plain_text_and_source_hits() {
+        for text in [
+            "`abc א`בג def דהו xyz",
+            "אב`ג def ד`הו xyz",
+            "שלום `abc עו`לם def",
+            "hello `مرحبا world أ`هلا",
+            "`é אב`ג 👨‍👩‍👧‍👦 end",
+        ] {
+            let source = format!("{text}\n\nend\n");
+            for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+                for zoom in [0.75, 1.0, 1.5] {
+                    for width in [120.0, 600.0] {
+                        let (shaper, _, config) =
+                            core_text_layout(16.0 * zoom, width, theme).expect("font");
+                        let mut document = yu_editor::EditorDocument::new(source.clone());
+                        document
+                            .set_selection(
+                                yu_editor::EditorSelection::cursor(
+                                    &document.snapshot(),
+                                    yu_core::ByteOffset::new(source.len() as u64),
+                                    yu_editor::CaretAffinity::Downstream,
+                                )
+                                .expect("caret"),
+                            )
+                            .expect("selection");
+                        document
+                            .set_viewport_config(yu_editor::ViewportConfig::new(
+                                config,
+                                16.0 * zoom,
+                                0.0,
+                            ))
+                            .expect("config");
+                        let snapshot = document
+                            .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &shaper)
+                            .expect("snapshot");
+                        let layout = snapshot
+                            .block_for_source(yu_core::ByteOffset::ZERO)
+                            .expect("paragraph")
+                            .layout();
+                        let boxes = layout.inline_boxes().expect("inline boxes");
+                        assert!(!boxes.is_empty());
+                        if width == 600.0 && text.starts_with(['א', 'ש']) {
+                            let last_latin = layout
+                                .clusters()
+                                .iter()
+                                .filter(|cluster| !cluster.is_line_break())
+                                .max_by(|a, b| (a.x() + a.width()).total_cmp(&(b.x() + b.width())))
+                                .expect("rightmost cluster");
+                            assert_eq!(
+                                &source[last_latin.source().start().get() as usize
+                                    ..last_latin.source().end().get() as usize],
+                                if text.starts_with('א') { "z" } else { "f" },
+                                "Reference prose has an LTR paragraph even when it starts with Hebrew"
+                            );
+                        }
+                        for cluster in layout.clusters() {
+                            if cluster.is_line_break() || cluster.width() <= 0.001 {
+                                continue;
+                            }
+                            let line = &layout.lines()[cluster.line()];
+                            let fragments: Vec<_> = boxes
+                                .iter()
+                                .filter(|f| {
+                                    f.bounds.y() < line.y() + line.height()
+                                        && f.bounds.bottom() > line.y()
+                                })
+                                .collect();
+                            if cluster.style() != yu_core::TextStyle::Code {
+                                for f in fragments {
+                                    let overlap =
+                                        f.bounds.right().min(cluster.x() + cluster.width())
+                                            - f.bounds.x().max(cluster.x());
+                                    assert!(
+                                        overlap <= 0.01,
+                                        "{text:?} {theme:?} zoom={zoom} width={width}: background crosses {:?}",
+                                        cluster.source()
+                                    );
+                                }
+                            }
+                            let hit = layout
+                                .hit_test(yu_core::Point::new(
+                                    cluster.x() + cluster.width() * 0.25,
+                                    line.y() + line.height() * 0.5,
+                                ))
+                                .expect("hit");
+                            // Hidden delimiters and a bidi seam may map one
+                            // physical edge to another logical source boundary.
+                            // The canonical caret must remain near the clicked
+                            // grapheme (including code padding) and round-trip.
+                            let padding = (theme.inline_padding().0 + theme.inline_border()) * zoom;
+                            let clicked_x = cluster.x() + cluster.width() * 0.25;
+                            assert!(
+                                (hit.point().x() - clicked_x).abs()
+                                    <= cluster.width() * 0.5 + padding + 0.01,
+                                "{text:?}: hit {:?} too far from cluster {cluster:?}",
+                                hit.point()
+                            );
+                            assert_eq!(
+                                layout
+                                    .visual()
+                                    .visual_to_source(hit.visual(), hit.bias())
+                                    .expect("canonical source"),
+                                hit.source()
+                            );
+                            let caret = layout
+                                .caret_for_source(hit.source(), hit.bias())
+                                .expect("source caret");
+                            assert!(
+                                (caret.point().x() - hit.point().x()).abs() < 0.01
+                                    && (caret.point().y() - hit.point().y()).abs() < 0.01
+                            );
+                        }
+                        assert_eq!(document.snapshot().as_str(), source);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_nested_task_keeps_ancestor_markers_and_checkbox_source_geometry() {
+        for (prefix, labels) in [
+            ("- > - [ ] ", vec!["•"]),
+            ("> 3. > - [ ] ", vec!["3."]),
+            ("3. > 7. > - [ ] ", vec!["3.", "7."]),
+        ] {
+            let source = format!("{prefix}todo 中文\n\nend\n");
+            for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+                for zoom in [0.75, 1.0, 1.5] {
+                    let (shaper, _, config) =
+                        core_text_layout(16.0 * zoom, 600.0, theme).expect("font");
+                    let mut document = yu_editor::EditorDocument::new(source.clone());
+                    document
+                        .set_viewport_config(yu_editor::ViewportConfig::new(
+                            config,
+                            16.0 * zoom,
+                            0.0,
+                        ))
+                        .expect("config");
+                    for focus in [source.len(), prefix.len() + 2] {
+                        document
+                            .set_selection(
+                                yu_editor::EditorSelection::cursor(
+                                    &document.snapshot(),
+                                    yu_core::ByteOffset::new(focus as u64),
+                                    yu_editor::CaretAffinity::Downstream,
+                                )
+                                .expect("caret"),
+                            )
+                            .expect("selection");
+                        let snapshot = document
+                            .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &shaper)
+                            .expect("layout");
+                        let layout = snapshot
+                            .block_for_source(yu_core::ByteOffset::new(prefix.len() as u64))
+                            .expect("task")
+                            .layout();
+                        assert_eq!(layout.checkboxes().len(), 1, "{prefix}");
+                        let checkbox = layout.checkboxes()[0];
+                        assert_eq!(
+                            &source[checkbox.source().start().get() as usize
+                                ..checkbox.source().end().get() as usize],
+                            "[ ]"
+                        );
+                        let markers: Vec<_> = layout.ornaments().markers().collect();
+                        assert_eq!(markers.len(), labels.len(), "{prefix} {theme:?}");
+                        assert!(
+                            (checkbox.bounds().width() - theme.task_checkbox_size() * zoom).abs()
+                                < 0.001
+                        );
+                        if focus == source.len() {
+                            let expected_x = match (prefix, theme) {
+                                ("- > - [ ] ", yu_core::ThemeId::Github) => 79.0,
+                                ("- > - [ ] ", yu_core::ThemeId::Night) => 92.0,
+                                ("> 3. > - [ ] ", yu_core::ThemeId::Github) => 98.0,
+                                ("> 3. > - [ ] ", yu_core::ThemeId::Night) => 154.0,
+                                (_, yu_core::ThemeId::Github) => 128.0,
+                                (_, yu_core::ThemeId::Night) => 154.0,
+                                (_, yu_core::ThemeId::YuLight | yu_core::ThemeId::YuDark) => {
+                                    unreachable!("this fixture records classic-theme geometry")
+                                }
+                            };
+                            let start = layout
+                                .caret_for_source(
+                                    yu_core::ByteOffset::new(prefix.len() as u64),
+                                    Bias::After,
+                                )
+                                .expect("task text");
+                            assert!(
+                                (start.point().x() - expected_x * zoom).abs() < 0.001,
+                                "{prefix} {theme:?}: {:?}",
+                                start.point()
+                            );
+                            assert!(
+                                (checkbox.bounds().x() - (expected_x - 20.8) * zoom).abs() < 0.001
+                            );
+                        }
+                        assert!(
+                            layout.ornaments().marker().is_none(),
+                            "checkbox owns the innermost gutter"
+                        );
+                        for (marker, label) in markers.iter().zip(&labels) {
+                            if *label != "•" {
+                                assert_eq!(marker.text(), *label);
+                            }
+                            assert!(marker.x() + marker.advance() < checkbox.bounds().x());
+                        }
+                        if focus == source.len() {
+                            assert!(!layout.visual().text().contains('>'));
+                        }
+                        assert!(!layout.visual().text().contains('-'));
+                        let caret = layout
+                            .caret_for_source(
+                                yu_core::ByteOffset::new((prefix.len() + 2) as u64),
+                                Bias::After,
+                            )
+                            .expect("caret");
+                        assert_eq!(
+                            layout.hit_test(caret.point()).expect("hit").source(),
+                            caret.source()
+                        );
+                    }
+                    assert_eq!(document.snapshot().as_str(), source);
+                    document.toggle_task(0).expect("toggle");
+                    assert_eq!(
+                        document.snapshot().as_str(),
+                        source.replacen("[ ]", "[x]", 1)
+                    );
+                    document.undo().expect("undo");
+                    assert_eq!(document.snapshot().as_str(), source);
+                    document.redo().expect("redo");
+                    assert_eq!(
+                        document.snapshot().as_str(),
+                        source.replacen("[ ]", "[x]", 1)
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_list_contained_quote_margins_override_theme_root_margins() {
+        let source = "- intro\n\n  > quoted text\n\n  tail\n\nend\n";
+        for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+            for zoom in [0.75, 1.0, 1.5] {
+                let (shaper, _, config) =
+                    core_text_layout(16.0 * zoom, 600.0, theme).expect("font");
+                let mut document = yu_editor::EditorDocument::new(source);
+                document
+                    .set_viewport_config(yu_editor::ViewportConfig::new(config, 16.0 * zoom, 0.0))
+                    .expect("config");
+                let snapshot = document
+                    .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &shaper)
+                    .expect("snapshot");
+                let block = |text| {
+                    snapshot
+                        .block_for_source(yu_core::ByteOffset::new(
+                            source.find(text).expect("source") as u64,
+                        ))
+                        .expect("block")
+                };
+                let bar = snapshot
+                    .containers()
+                    .iter()
+                    .find_map(|c| c.quote_bar)
+                    .expect("bar");
+                let intro = block("intro");
+                assert!(
+                    (bar.y() - intro.content_y() - intro.layout().height() - 16.0 * zoom).abs()
+                        < 0.001,
+                    "{theme:?} before"
+                );
+                assert!(
+                    (block("tail").content_y() - bar.bottom() - 16.0 * zoom).abs() < 0.001,
+                    "{theme:?} after"
+                );
+                assert!((bar.x() - 30.0 * zoom).abs() < 0.001);
+                assert_eq!(document.snapshot().as_str(), source);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_quote_boxes_share_theme_margins_borders_and_carets() {
+        for (theme, margin, padding, border, before, after) in [
+            (yu_core::ThemeId::Github, 0.0, 15.0, 4.0, 12.8, 12.8),
+            (yu_core::ThemeId::Night, 30.0, 30.0, 2.0, 35.0, 30.0),
+        ] {
+            for zoom in [0.75, 1.0, 1.5] {
+                for source in [
+                    "> quoted text\n\nafter\n",
+                    "before\n\n> quoted text\n\nafter\n",
+                ] {
+                    let (shaper, _, config) =
+                        core_text_layout(16.0 * zoom, 600.0, theme).expect("font");
+                    let mut document = yu_editor::EditorDocument::new(source);
+                    // Match the reference's inactive quote; a caret on `>` reveals source syntax.
+                    document
+                        .set_selection(
+                            yu_editor::EditorSelection::cursor(
+                                &document.snapshot(),
+                                yu_core::ByteOffset::new(source.len() as u64),
+                                yu_editor::CaretAffinity::Downstream,
+                            )
+                            .expect("selection"),
+                        )
+                        .expect("caret at EOF");
+                    document
+                        .set_viewport_config(yu_editor::ViewportConfig::new(
+                            config,
+                            16.0 * zoom,
+                            0.0,
+                        ))
+                        .expect("config");
+                    let snapshot = document
+                        .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &shaper)
+                        .expect("snapshot");
+                    let quote = snapshot
+                        .containers()
+                        .iter()
+                        .find(|c| c.quote_bar.is_some())
+                        .expect("quote");
+                    let bar = quote.quote_bar.expect("bar");
+                    assert!((bar.x() - margin * zoom).abs() < 0.001);
+                    assert!((bar.width() - border * zoom).abs() < 0.001);
+                    let offset =
+                        yu_core::ByteOffset::new((source.find("quoted").expect("text") + 2) as u64);
+                    let placed = snapshot.block_for_source(offset).expect("quote block");
+                    assert!((bar.y() - placed.content_y()).abs() < 0.001);
+                    let left = placed
+                        .layout()
+                        .caret_for_source(
+                            yu_core::ByteOffset::new(source.find("quoted").expect("text") as u64),
+                            Bias::After,
+                        )
+                        .expect("text start")
+                        .point()
+                        .x();
+                    assert!(
+                        (left - (margin + border + padding) * zoom).abs() < 0.001,
+                        "{theme:?} {zoom} {source:?}: left={left}"
+                    );
+                    let caret = placed
+                        .layout()
+                        .caret_for_source(offset, Bias::After)
+                        .expect("caret");
+                    assert_eq!(
+                        placed
+                            .layout()
+                            .hit_test(caret.point())
+                            .expect("hit")
+                            .source(),
+                        offset
+                    );
+                    let preceding_height = if source.starts_with("before") {
+                        snapshot.blocks()[0].layout().height()
+                    } else {
+                        0.0
+                    };
+                    assert!((bar.y() - preceding_height - before * zoom).abs() < 0.001);
+                    let next = snapshot
+                        .block_for_source(yu_core::ByteOffset::new(
+                            source.find("after").expect("after") as u64,
+                        ))
+                        .expect("next");
+                    assert!((next.content_y() - bar.bottom() - after * zoom).abs() < 0.001);
+                    assert_eq!(document.snapshot().as_str(), source);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_mode_coretext_keeps_literal_line_geometry_and_hits() {
+        let source = "# Heading\n\n- **item**\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n| - | - |\n| x | y |";
+        let (shaper, _, config) =
+            core_text_layout(16.0, 760.0, yu_core::ThemeId::YuLight).expect("font");
+        let mut doc = yu_editor::EditorDocument::new(source);
+        doc.set_viewport_config(yu_editor::ViewportConfig::new(config, 16.0, 0.0))
+            .expect("config");
+        doc.set_source_mode(true).expect("source mode");
+        let snapshot = doc
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 4000.0), &shaper)
+            .expect("layout");
+        let mut offset = 0;
+        let mut previous_y: Option<f32> = None;
+        let first = snapshot
+            .block_for_source(yu_core::ByteOffset::ZERO)
+            .expect("first line");
+        let xs: Vec<_> = (0..=9)
+            .map(|i| {
+                first
+                    .layout()
+                    .caret_for_source(yu_core::ByteOffset::new(i), Bias::After)
+                    .expect("ASCII caret")
+                    .point()
+                    .x()
+            })
+            .collect();
+        let advance = xs[1] - xs[0];
+        for pair in xs.windows(2) {
+            assert!(
+                (pair[1] - pair[0] - advance).abs() < 0.05,
+                "source font must be monospaced"
+            );
+        }
+        for line in source.split('\n') {
+            let at = yu_core::ByteOffset::new(offset as u64);
+            let block = snapshot.block_for_source(at).expect("line block");
+            let caret = block
+                .layout()
+                .caret_for_source(at, Bias::After)
+                .expect("line caret");
+            let y = block.content_y() + caret.point().y();
+            if let Some(previous) = previous_y {
+                assert!(
+                    (y - previous - 26.0_f32).abs() < 0.05,
+                    "line {line:?}: y={y} previous={previous}"
+                );
+            }
+            assert!(
+                caret.point().x().abs() < 0.05,
+                "source line has Markdown indentation: {line}"
+            );
+            if !line.is_empty() {
+                assert_eq!(
+                    block
+                        .layout()
+                        .hit_test(caret.point())
+                        .expect("hit")
+                        .source(),
+                    at
+                );
+            }
+            previous_y = Some(y);
+            offset += line.len() + 1;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_theme_line_struts_preserve_fractional_advance() {
+        let source = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu
+";
+        for (theme, heights) in [
+            (yu_core::ThemeId::Github, [19.2, 25.6, 38.4]),
+            (yu_core::ThemeId::Night, [19.5, 26.0, 39.0]),
+        ] {
+            for (zoom, expected) in [0.75, 1.0, 1.5].into_iter().zip(heights) {
+                let (shaper, _, config) =
+                    core_text_layout(16.0 * zoom, 150.0 * zoom, theme).expect("font");
+                let mut document = yu_editor::EditorDocument::new(source);
+                document
+                    .set_viewport_config(yu_editor::ViewportConfig::new(config, 16.0 * zoom, 0.0))
+                    .expect("config");
+                let snapshot = document
+                    .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &shaper)
+                    .expect("snapshot");
+                let layout = snapshot.blocks()[0].layout();
+                assert!(
+                    layout.lines().len() >= 8,
+                    "exercise cumulative line advance"
+                );
+                for (index, line) in layout.lines().iter().enumerate() {
+                    assert!((line.bounds().height() - expected).abs() < 0.001);
+                    assert!((line.bounds().y() - index as f32 * expected).abs() < 0.001);
+                }
+                for cluster in layout
+                    .clusters()
+                    .iter()
+                    .filter(|cluster| !cluster.visual().is_empty())
+                {
+                    let caret = layout
+                        .caret_for_source(cluster.source().start(), Bias::After)
+                        .expect("caret");
+                    assert_eq!(
+                        layout.hit_test(caret.point()).expect("hit").source(),
+                        caret.source()
+                    );
+                }
+                assert_eq!(document.snapshot().as_str(), source);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_queries_share_painted_code_and_heading_geometry() {
+        let path = std::env::temp_dir().join(format!("yu-shared-geometry-{}.md", temp_id()));
+        let source = "# Heading\n\nparagraph above\n\n```swift\nlet value = 1\n```\n";
+        fs::write(&path, source).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let offset = source.find("value").expect("code") + 2;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    offset as u64,
+                    offset as u64,
+                    YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let session = unsafe { &mut *raw };
+        let (shaper, metrics, _) =
+            core_text_layout(16.0, 500.0, yu_core::ThemeId::Github).expect("CoreText");
+        macos_publish_viewport_config(session, 500.0, metrics, yu_core::ThemeId::Github)
+            .expect("config");
+        let geometry = macos_query_layout_snapshot(session, ViewportSpan::new(0.0, 800.0), &shaper)
+            .expect("frame geometry");
+        let placed = geometry
+            .block_for_source(yu_core::ByteOffset::new(offset as u64))
+            .expect("code");
+        let native = placed
+            .layout()
+            .caret_for_source(yu_core::ByteOffset::new(offset as u64), Bias::After)
+            .expect("code caret");
+        let point = placed.document_point(native.point());
+        // A notification from another document is not a geometry change here.
+        yu_render_macos::notify_resource_completion();
+        let mut caret = YuStorageBlockCaret::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_source_caret(raw, 0, offset as u64, 1, 16.0, 500.0, &mut caret)
+            },
+            YU_STORAGE_OK
+        );
+        assert!(
+            (caret.caret_y - point.y()).abs() < 0.01,
+            "must include preceding blocks and code padding"
+        );
+        assert!((caret.caret_x - point.x()).abs() < 0.01);
+        assert!((caret.caret_height - placed.caret_height(native)).abs() < 0.01);
+        let mut hit = YuStorageProjectionHit::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_projection_hit_test(
+                    raw,
+                    0,
+                    point.x(),
+                    point.y() + caret.caret_height * 0.25,
+                    16.0,
+                    500.0,
+                    &mut hit,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(hit.source_utf16, offset as u64);
+        let session = unsafe { &mut *raw };
+        let current = session
+            .session
+            .document()
+            .editor()
+            .current_layout_snapshot()
+            .expect("retained geometry");
+        assert!(std::sync::Arc::ptr_eq(&geometry, &current));
+        // The heading caret uses its own native line, not the body strut.
+        let heading = geometry.block(0).expect("heading");
+        let heading_caret = heading
+            .layout()
+            .caret_for_source(yu_core::ByteOffset::new(4), Bias::After)
+            .expect("heading caret");
+        assert_eq!(
+            unsafe { yu_storage_session_source_caret(raw, 0, 4, 1, 16.0, 500.0, &mut caret) },
+            YU_STORAGE_OK
+        );
+        assert!((caret.caret_height - heading.caret_height(heading_caret)).abs() < 0.01);
+        assert!(caret.caret_height > metrics.line_height());
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }
@@ -8970,9 +11513,11 @@ mod tests {
         );
         // SAFETY: `raw` is a live session handle owned by this test.
         let session = unsafe { raw.as_mut() }.expect("session");
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        let (_, metrics, _) =
+            core_text_layout(14.0, 500.0, yu_core::ThemeId::Github).expect("CoreText");
 
-        macos_publish_viewport_config(session, 500.0, metrics).expect("publish");
+        macos_publish_viewport_config(session, 500.0, metrics, yu_core::ThemeId::Github)
+            .expect("publish");
         let published = session.session.viewport_config().layout();
         assert!((published.max_width() - 500.0).abs() <= f32::EPSILON);
         assert!((published.line_height() - metrics.line_height()).abs() <= f32::EPSILON);
@@ -8981,7 +11526,8 @@ mod tests {
         // 用一个可辨认的 estimated_block_height 观察「跳过」是否真的发生。
         let marked = ViewportConfig::new(published, 987.0, 0.0);
         session.session.set_viewport_config(marked).expect("marked");
-        macos_publish_viewport_config(session, 500.0, metrics).expect("republish");
+        macos_publish_viewport_config(session, 500.0, metrics, yu_core::ThemeId::Github)
+            .expect("republish");
         assert!(
             (session.session.viewport_config().estimated_block_height() - 987.0).abs()
                 <= f32::EPSILON,
@@ -8989,7 +11535,8 @@ mod tests {
         );
 
         // 换行宽度变化必须真正重新发布。
-        macos_publish_viewport_config(session, 640.0, metrics).expect("publish width");
+        macos_publish_viewport_config(session, 640.0, metrics, yu_core::ThemeId::Github)
+            .expect("publish width");
         assert!(
             (session.session.viewport_config().layout().max_width() - 640.0).abs() <= f32::EPSILON,
             "宽度变化必须重新发布配置"
@@ -9034,7 +11581,8 @@ mod tests {
         );
         // 这些断言用行高做几何基准；配置的发布已经由 Rust 自己完成，
         // 这里只是取同一份度量来算期望值。
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        let (_, metrics, _) =
+            core_text_layout(14.0, 500.0, yu_core::ThemeId::Github).expect("CoreText");
 
         let mut first = YuStorageMacosRenderHostSnapshot::default();
         assert_eq!(
@@ -9069,9 +11617,9 @@ mod tests {
                         Primitive::Ornament(table)
                             if table.role() == yu_scene::OrnamentRole::Border
                                 && table.bounds().x() > 0.0
-                                && table.bounds().x() < 100.0 =>
+                                && table.bounds().x() < 499.0 =>
                         {
-                            Some(table.bounds().x())
+                            Some(table.bounds().x() + table.bounds().width() * 0.5)
                         }
                         _ => None,
                     })
@@ -9127,7 +11675,7 @@ mod tests {
         assert!((accessibility_divider.x - divider).abs() < 0.01);
         assert!(accessibility_divider.height > 0.0);
         assert_eq!(state.session.snapshot().as_str(), source);
-        let point_y = metrics.line_height() * 0.5;
+        let point_y = accessibility_divider.y + metrics.line_height() * 0.5;
         let mut hover = 9;
         for (revision, x, expected_status, expected_hit) in [
             (0, divider, YU_STORAGE_OK, 1),
@@ -9265,7 +11813,7 @@ mod tests {
                         primitive,
                         Primitive::Ornament(table)
                             if table.role() == yu_scene::OrnamentRole::Border
-                                && (table.bounds().x() - (divider + 1.0)).abs() < 0.01
+                                && (table.bounds().x() + table.bounds().width() * 0.5 - (divider + 1.0)).abs() < 0.01
                     )
                 })
         );
@@ -9393,7 +11941,7 @@ mod tests {
                         primitive,
                         Primitive::Ornament(table)
                             if table.role() == yu_scene::OrnamentRole::Border
-                                && (table.bounds().x() - divider).abs() < 0.01
+                                && (table.bounds().x() + table.bounds().width() * 0.5 - divider).abs() < 0.01
                     )
                 })
         );
@@ -9414,7 +11962,8 @@ mod tests {
                 0,
                 None,
                 Appearance::Light,
-                FrameGeometry::new(16.0, 500.0, 0.0, 240.0, 500.0, 240.0, 2.0).unwrap(),
+                FrameGeometry::new(16.0, 500.0, 0.0, 240.0, 500.0, 240.0, 2.0)
+                    .expect("valid FFI session fixture"),
             )
         };
         let ticket = MacosFrameTicket {
@@ -9460,14 +12009,14 @@ mod tests {
             &path,
             format!("# Background frame\n\n{}", "Hello 羽🙂\n\n".repeat(100)),
         )
-        .unwrap();
+        .expect("valid FFI session fixture");
         let path_bytes = path.to_string_lossy().as_bytes().to_vec();
         let mut raw = ptr::null_mut();
         assert_eq!(
             unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
             YU_STORAGE_OK
         );
-        let session = unsafe { raw.as_mut() }.unwrap();
+        let session = unsafe { raw.as_mut() }.expect("valid FFI session fixture");
         let request = MacosFrameRequest {
             expected_revision: 0,
             size: 16.0,
@@ -9515,16 +12064,25 @@ mod tests {
         let first_generation = session
             .macos_render_host
             .as_ref()
-            .unwrap()
+            .expect("valid FFI session fixture")
             .frame_request_generation;
 
-        let state = session.macos_render_host.as_ref().unwrap();
+        let state = session
+            .macos_render_host
+            .as_ref()
+            .expect("valid FFI session fixture");
         assert!(
             state.builder.last_publication().is_none(),
             "must exercise the worker, not synchronous fallback"
         );
         assert_eq!(snapshot.frame_revision, 0);
-        assert_eq!(snapshot.frame_serial, state.host.frame_serial().unwrap());
+        assert_eq!(
+            snapshot.frame_serial,
+            state
+                .host
+                .frame_serial()
+                .expect("valid FFI session fixture")
+        );
         assert!(snapshot.command_count > 0);
         assert!(snapshot.atlas_page_count > 0);
         assert!(snapshot.content_height > 0.0);
@@ -9533,20 +12091,22 @@ mod tests {
         let key = frame_key(
             session,
             Appearance::Light,
-            FrameGeometry::new(16.0, 500.0, 0.0, 240.0, 500.0, 240.0, 2.0).unwrap(),
+            FrameGeometry::new(16.0, 500.0, 0.0, 240.0, 500.0, 240.0, 2.0)
+                .expect("valid FFI session fixture"),
         );
-        let state = session.macos_render_host.as_mut().unwrap();
+        let state = session
+            .macos_render_host
+            .as_mut()
+            .expect("valid FFI session fixture");
         assert!(state.last_frame_key.is_none());
         state.resource_refresh_pending = true;
-        let viewport = Rect::new(0.0, 0.0, 500.0, 240.0).unwrap();
+        let viewport = Rect::new(0.0, 0.0, 500.0, 240.0).expect("valid FFI session fixture");
         let resource_generation = state.resource_completion_generation;
-        assert!(macos_can_reuse_prepared_frame(
-            state,
-            &key,
-            viewport,
-            0,
-            resource_generation
-        ));
+        assert_eq!(
+            macos_can_reuse_prepared_frame(state, &key, viewport, 0, resource_generation),
+            !state.layout_pending,
+            "pending layout requires another bounded batch"
+        );
         assert!(!macos_can_reuse_prepared_frame(
             state,
             &key,
@@ -9612,7 +12172,7 @@ mod tests {
         let pending_generation = session
             .macos_render_host
             .as_ref()
-            .unwrap()
+            .expect("valid FFI session fixture")
             .frame_request_generation;
         let replacement = MacosFrameRequest {
             surface_generation: 4,
@@ -9622,10 +12182,17 @@ mod tests {
             macos_render_host_frame(session, replacement, true),
             Err(YU_STORAGE_RENDER_BUSY)
         );
-        let state = session.macos_render_host.as_ref().unwrap();
+        let state = session
+            .macos_render_host
+            .as_ref()
+            .expect("valid FFI session fixture");
         assert!(state.frame_request_generation > pending_generation);
         assert_eq!(
-            state.last_publication.as_ref().unwrap().serial(),
+            state
+                .last_publication
+                .as_ref()
+                .expect("valid FFI session fixture")
+                .serial(),
             resized.frame_serial
         );
         assert_eq!(state.host.frame_serial(), Some(resized.frame_serial));
@@ -9638,12 +12205,12 @@ mod tests {
             unsafe { yu_storage_session_macos_render_host_surface_detach(raw) },
             YU_STORAGE_OK
         );
-        let session = unsafe { raw.as_mut() }.unwrap();
+        let session = unsafe { raw.as_mut() }.expect("valid FFI session fixture");
         assert!(
             session
                 .macos_render_host
                 .as_ref()
-                .unwrap()
+                .expect("valid FFI session fixture")
                 .frame_worker_request
                 .is_none()
         );
@@ -9654,7 +12221,7 @@ mod tests {
             session
                 .macos_render_host
                 .as_ref()
-                .unwrap()
+                .expect("valid FFI session fixture")
                 .frame_request_generation
                 > first_generation
         );
@@ -9662,7 +12229,7 @@ mod tests {
             session
                 .macos_render_host
                 .as_ref()
-                .unwrap()
+                .expect("valid FFI session fixture")
                 .binding_generation,
             1
         );
@@ -9683,10 +12250,10 @@ mod tests {
         let frame = session
             .macos_render_host
             .as_ref()
-            .unwrap()
+            .expect("valid FFI session fixture")
             .host
             .frame_handle()
-            .unwrap();
+            .expect("valid FFI session fixture");
         assert_eq!(scrolled.scroll_y, 1500.0);
         assert_eq!(frame.plan().viewport().y(), 1500.0);
         assert!(macos_frame_covers_viewport(frame.as_ref(), 1500.0, 240.0));
@@ -9701,15 +12268,79 @@ mod tests {
             },
             false,
         )
-        .unwrap();
+        .expect("valid FFI session fixture");
         assert!(diagnostic.frame_serial > scrolled.frame_serial);
         let resumed = finish(session, request);
         assert!(resumed.frame_serial > diagnostic.frame_serial);
+        let mut progressive = resumed;
+        for _ in 0..1000 {
+            if progressive.layout_pending == 0 {
+                break;
+            }
+            let next = finish(session, request);
+            assert!(next.frame_serial > progressive.frame_serial);
+            progressive = next;
+        }
+        assert_eq!(
+            progressive.layout_pending, 0,
+            "bounded background batches must converge"
+        );
+
+        for enabled in [1, 0, 0] {
+            assert_eq!(
+                unsafe { yu_storage_session_set_source_mode(session, enabled) },
+                YU_STORAGE_OK
+            );
+            assert!(
+                session
+                    .macos_render_host
+                    .as_ref()
+                    .expect("host")
+                    .frame_worker
+                    .is_some(),
+                "mode switch must retain its worker"
+            );
+            let mut frame = finish(session, request);
+            for _ in 0..1000 {
+                if frame.layout_pending == 0 {
+                    break;
+                }
+                frame = finish(session, request);
+            }
+            assert_eq!(frame.layout_pending, 0, "mode switch must converge");
+        }
+        let before_trim = session
+            .macos_render_host
+            .as_ref()
+            .expect("host")
+            .last_publication
+            .as_ref()
+            .expect("frame")
+            .serial();
+        assert_eq!(
+            unsafe { yu_storage_session_trim_render_caches(session) },
+            YU_STORAGE_OK
+        );
+        assert!(
+            session
+                .macos_render_host
+                .as_ref()
+                .expect("host")
+                .frame_worker
+                .is_some(),
+            "memory pressure must not disable future background work"
+        );
+        let after_trim = finish(session, request);
+        assert!(
+            after_trim.frame_serial > before_trim,
+            "cache trim must preserve publication ordering"
+        );
+
         assert_eq!(
             session
                 .macos_render_host
                 .as_ref()
-                .unwrap()
+                .expect("valid FFI session fixture")
                 .builder
                 .config()
                 .raster_scale(),
@@ -9717,7 +12348,7 @@ mod tests {
         );
 
         unsafe { yu_storage_session_destroy(raw) };
-        fs::remove_file(path).unwrap();
+        fs::remove_file(path).expect("valid FFI session fixture");
     }
 
     #[cfg(target_os = "macos")]
@@ -9965,7 +12596,8 @@ mod tests {
         );
         // 这些断言用行高做几何基准；配置的发布已经由 Rust 自己完成，
         // 这里只是取同一份度量来算期望值。
-        let (_, metrics, _) = core_text_system_ui_layout(14.0, 500.0).expect("CoreText");
+        let (_, metrics, _) =
+            core_text_layout(14.0, 500.0, yu_core::ThemeId::Github).expect("CoreText");
 
         let source_utf16 = source.encode_utf16().count() as u64;
         assert_eq!(
@@ -10338,6 +12970,7 @@ mod tests {
         // 第一遍：只问两个长度。两个指针都是 null、两个容量都是 0。
         let mut count = 0;
         let mut text_length = 0;
+        let mut run_count = 0;
         assert_eq!(
             unsafe {
                 yu_storage_session_outline_items(
@@ -10349,6 +12982,9 @@ mod tests {
                     ptr::null_mut(),
                     0,
                     &mut text_length,
+                    ptr::null_mut(),
+                    0,
+                    &mut run_count,
                 )
             },
             YU_STORAGE_OK
@@ -10357,6 +12993,7 @@ mod tests {
         assert!(text_length > 0, "每一条都有 label 与 identity");
 
         // 条目数组小了要明确拒绝，不能拷半份出去。
+        let mut runs = vec![YuStorageOutlineStyleRun::default(); run_count];
         let mut short = vec![YuStorageOutlineItem::default(); count - 1];
         let mut short_text = vec![0u8; text_length];
         let mut short_written = 0;
@@ -10372,6 +13009,9 @@ mod tests {
                     short_text.as_mut_ptr(),
                     short_text.len(),
                     &mut short_text_written,
+                    runs.as_mut_ptr(),
+                    runs.len(),
+                    &mut run_count,
                 )
             },
             YU_STORAGE_BUFFER_TOO_SMALL
@@ -10380,6 +13020,7 @@ mod tests {
         // **文本缓冲小了也要拒绝。** 两个容量各挡各的：只检查条目那一个的话，
         // 文本会被拷成半截 UTF-8，面板上那一行显示成乱码——不报错。
         let mut items = vec![YuStorageOutlineItem::default(); count];
+        let mut runs = vec![YuStorageOutlineStyleRun::default(); run_count];
         let mut tiny_text = vec![0u8; text_length - 1];
         let mut written = 0;
         let mut tiny_written = 0;
@@ -10394,15 +13035,70 @@ mod tests {
                     tiny_text.as_mut_ptr(),
                     tiny_text.len(),
                     &mut tiny_written,
+                    runs.as_mut_ptr(),
+                    runs.len(),
+                    &mut run_count,
                 )
             },
             YU_STORAGE_BUFFER_TOO_SMALL
+        );
+
+        // A short style buffer must not modify either of the other payloads.
+        let mut guard_text = vec![77u8; text_length];
+        let original_items = items.clone();
+        let mut short_styles = vec![YuStorageOutlineStyleRun::default(); run_count - 1];
+        let mut style_written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_outline_items(
+                    raw,
+                    0,
+                    items.as_mut_ptr(),
+                    items.len(),
+                    &mut written,
+                    guard_text.as_mut_ptr(),
+                    guard_text.len(),
+                    &mut tiny_written,
+                    short_styles.as_mut_ptr(),
+                    short_styles.len(),
+                    &mut style_written,
+                )
+            },
+            YU_STORAGE_BUFFER_TOO_SMALL
+        );
+        assert_eq!(items, original_items);
+        assert!(guard_text.iter().all(|byte| *byte == 77));
+        assert!(
+            short_styles
+                .iter()
+                .all(|run| *run == YuStorageOutlineStyleRun::default())
+        );
+        assert_eq!(style_written, run_count);
+        // A mixed measure/write request is invalid, even with enough style capacity.
+        assert_eq!(
+            unsafe {
+                yu_storage_session_outline_items(
+                    raw,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut written,
+                    ptr::null_mut(),
+                    0,
+                    &mut tiny_written,
+                    runs.as_mut_ptr(),
+                    runs.len(),
+                    &mut style_written,
+                )
+            },
+            YU_STORAGE_NULL_POINTER
         );
 
         // 第二遍：拷出来。
         let read = |revision: u64| -> Result<(Vec<YuStorageOutlineItem>, String), i32> {
             let mut count = 0;
             let mut text_length = 0;
+            let mut run_count = 0;
             let status = unsafe {
                 yu_storage_session_outline_items(
                     raw,
@@ -10413,12 +13109,16 @@ mod tests {
                     ptr::null_mut(),
                     0,
                     &mut text_length,
+                    ptr::null_mut(),
+                    0,
+                    &mut run_count,
                 )
             };
             if status != YU_STORAGE_OK {
                 return Err(status);
             }
             let mut items = vec![YuStorageOutlineItem::default(); count];
+            let mut runs = vec![YuStorageOutlineStyleRun::default(); run_count];
             let mut text = vec![0u8; text_length];
             let mut written = 0;
             let mut text_written = 0;
@@ -10432,6 +13132,9 @@ mod tests {
                     text.as_mut_ptr(),
                     text.len(),
                     &mut text_written,
+                    runs.as_mut_ptr(),
+                    runs.len(),
+                    &mut run_count,
                 )
             };
             if status != YU_STORAGE_OK {
@@ -10439,6 +13142,16 @@ mod tests {
             }
             assert_eq!(written, count, "两遍给出的条数必须一致");
             assert_eq!(text_written, text_length, "两遍给出的文本长度必须一致");
+            if revision == 0 {
+                let first = &items[0];
+                let slice = &runs[first.style_offset as usize
+                    ..(first.style_offset + first.style_count) as usize];
+                assert!(
+                    slice
+                        .iter()
+                        .any(|run| run.start_utf16 == 3 && run.end_utf16 == 4 && run.traits == 1)
+                );
+            }
             Ok((items, String::from_utf8(text).expect("文本是合法 UTF-8")))
         };
 
@@ -10756,6 +13469,67 @@ mod tests {
     }
 
     #[test]
+    fn ffi_word_deletion_round_trips_source_and_history() {
+        for (command, at, expected) in [
+            (YU_STORAGE_COMMAND_DELETE_WORD_BACKWARD, 5, " beta"),
+            (YU_STORAGE_COMMAND_DELETE_WORD_FORWARD, 6, "alpha "),
+        ] {
+            let path = std::env::temp_dir().join(format!("yu-word-delete-{}.md", temp_id()));
+            fs::write(&path, "alpha beta").expect("fixture");
+            let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+            let mut raw = ptr::null_mut();
+            assert_eq!(
+                unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+                YU_STORAGE_OK
+            );
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_set_selection_endpoints(
+                        raw,
+                        0,
+                        at,
+                        at,
+                        YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            let mut result = YuStorageCommandResult::default();
+            assert_eq!(
+                unsafe { yu_storage_session_execute_command(raw, command, 0, &mut result) },
+                YU_STORAGE_OK
+            );
+            assert_eq!(result.revision, 1);
+            assert_eq!(
+                unsafe { &*raw }
+                    .session
+                    .document()
+                    .editor()
+                    .snapshot()
+                    .as_str(),
+                expected
+            );
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_execute_command(raw, YU_STORAGE_COMMAND_UNDO, 0, &mut result)
+                },
+                YU_STORAGE_OK
+            );
+            assert_eq!(
+                unsafe { &*raw }
+                    .session
+                    .document()
+                    .editor()
+                    .snapshot()
+                    .as_str(),
+                "alpha beta"
+            );
+            unsafe { yu_storage_session_destroy(raw) };
+            fs::remove_file(path).expect("cleanup");
+        }
+    }
+
+    #[test]
     fn unified_ffi_command_and_composition_share_revision() {
         let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-editor-{id}.md"));
@@ -10910,6 +13684,201 @@ mod tests {
             YU_STORAGE_OK
         );
 
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn clipboard_text_ffi_rejects_invalid_inputs_before_mutation() {
+        let path = std::env::temp_dir().join(format!("yu-tsv-paste-{}.md", temp_id()));
+        fs::write(&path, "").expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let mut result = YuStorageCommandResult::default();
+        for (text, revision, format, status) in [
+            ("a\tb", 0, 9, YU_STORAGE_INVALID_COMMAND),
+            ("a\tb", 99, 1, YU_STORAGE_STALE_REVISION),
+            ("\"unclosed", 0, 1, YU_STORAGE_INVALID_TABLE_PASTE),
+        ] {
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_paste_text(
+                        raw,
+                        revision,
+                        text.as_ptr(),
+                        text.len(),
+                        format,
+                        &mut result,
+                    )
+                },
+                status
+            );
+            assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), "");
+            assert_eq!(unsafe { &*raw }.session.revision().get(), 0);
+        }
+        let text = "\" a\nb \"\tx";
+        assert_eq!(
+            unsafe {
+                yu_storage_session_paste_text(raw, 0, text.as_ptr(), text.len(), 1, ptr::null_mut())
+            },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_paste_text(raw, 0, text.as_ptr(), text.len(), 1, &mut result)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { &*raw }.session.snapshot().as_str(),
+            "| &#32;a<br>b&#32; | x |\n| --- | --- |"
+        );
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn fragment_paste_ffi_validates_all_offsets_before_mutating() {
+        let path = std::env::temp_dir().join(format!("yu-fragment-paste-{}.md", temp_id()));
+        fs::write(&path, "original").expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let text = "羽a";
+        let mut result = YuStorageCommandResult::default();
+        for ends in [vec![1, 4], vec![3, 2, 4], vec![3], vec![5], vec![]] {
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_paste_fragments(
+                        raw,
+                        0,
+                        text.as_ptr(),
+                        text.len(),
+                        ends.as_ptr(),
+                        ends.len(),
+                        0,
+                        &mut result,
+                    )
+                },
+                YU_STORAGE_INVALID_SELECTION
+            );
+            assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), "original");
+        }
+        let ends = [3, 4];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_paste_fragments(
+                    raw,
+                    99,
+                    text.as_ptr(),
+                    text.len(),
+                    ends.as_ptr(),
+                    2,
+                    0,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_paste_fragments(
+                    raw,
+                    0,
+                    text.as_ptr(),
+                    text.len(),
+                    ends.as_ptr(),
+                    2,
+                    0,
+                    ptr::null_mut(),
+                )
+            },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_paste_fragments(
+                    raw,
+                    0,
+                    text.as_ptr(),
+                    text.len(),
+                    ptr::null(),
+                    2,
+                    0,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_paste_fragments(
+                    raw,
+                    0,
+                    text.as_ptr(),
+                    text.len(),
+                    ends.as_ptr(),
+                    2,
+                    0,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { &*raw }.session.snapshot().as_str(),
+            "羽\naoriginal"
+        );
+        let revision = unsafe { &*raw }.session.revision().get();
+        let before = unsafe { &*raw }.session.snapshot().as_str().to_owned();
+        for columns in [3, usize::MAX] {
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_paste_fragments(
+                        raw,
+                        revision,
+                        text.as_ptr(),
+                        text.len(),
+                        ends.as_ptr(),
+                        2,
+                        columns,
+                        &mut result,
+                    )
+                },
+                YU_STORAGE_INVALID_TABLE_PASTE
+            );
+            assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), before);
+            assert_eq!(unsafe { &*raw }.session.revision().get(), revision);
+        }
+        assert_eq!(
+            unsafe {
+                yu_storage_session_paste_fragments(
+                    raw,
+                    revision,
+                    text.as_ptr(),
+                    text.len(),
+                    ends.as_ptr(),
+                    2,
+                    2,
+                    &mut result,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(
+            unsafe { &*raw }
+                .session
+                .snapshot()
+                .as_str()
+                .contains("| 羽 | a |\n| --- | --- |")
+        );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");
     }
