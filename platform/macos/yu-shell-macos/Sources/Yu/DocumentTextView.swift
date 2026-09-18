@@ -2,23 +2,73 @@ import AppKit
 import Darwin
 import Foundation
 import UniformTypeIdentifiers
+import QuartzCore
 import YuStorageFFI
 
 // `NSTextInputClient` 与 Accessibility 宿主。它不绘制任何像素——
 // Rust surface 是唯一渲染路径（不变量 I5）——只负责把原生输入事件
 // 转成 Rust command，并把 OS 的几何查询转给 Rust layout。
 
-/// The native source mirror is deliberately a view cache, never a second
-/// document model. Rust owns canonical source, revision, selection and
-/// composition generation; this TextKit object only projects those values for
-/// AppKit's NSTextInputClient callbacks. The visual pointer adapter asks
-/// Rust's CoreText-shaped block layout for the visual boundary, then maps that
-/// boundary back to canonical source ranges. The disposable TextKit visual
-/// mirror remains a geometry and input/IME/accessibility host.
-final class DocumentTextView: NSTextView {
+/// Native input host. Rust owns source, selection, transactions and composition.
+/// The UTF-16 string is an input-context cache only; it has no TextKit storage,
+/// layout manager or text container. All visible geometry comes from Rust's
+/// CoreText paragraph layouts, also consumed by the Metal surface.
+final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
+    var font: NSFont? = NSFont(name: "Open Sans", size: CGFloat(NativeTheme.spec().body_size))
+    var isEditable = true
+    var isSelectable = true
+    var contentInsets = NSSize(width: 30, height: 30)
+    var contentOrigin: NSPoint { NSPoint(x: contentInsets.width, y: contentInsets.height) }
+    private(set) var string = ""
+    private var nativeSelection = NSRange(location: 0, length: 0)
+    private var discardingComposition = false
+    private(set) var selectedRanges: [NSValue] = []
+    override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+    override var undoManager: UndoManager? { nil }
+    func selectedRange() -> NSRange { nativeSelection }
+    private static let traceNativeEvents = ProcessInfo.processInfo.environment["YU_NATIVE_INPUT_TRACE"] == "1"
+        && Bundle.main.bundleIdentifier?.hasPrefix("io.github.xiaodou997.yu.editing-check.") == true
+
+    private func traceNativeEvent(_ kind: String, _ fields: [String: Any] = [:]) {
+        guard Self.traceNativeEvents else { return }
+        var record = fields
+        record["event"] = kind
+        record["input_source"] = String(describing: inputContext?.selectedKeyboardInputSource)
+        record["context_active"] = NSTextInputContext.current === inputContext
+        record["time"] = CACurrentMediaTime()
+        if let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]),
+           let value = String(data: data, encoding: .utf8) {
+            print("Yu native input: \(value)")
+            fflush(stdout)
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        traceNativeEvent("keyDown", ["key_code": event.keyCode, "characters": event.characters ?? "", "flags": event.modifierFlags.rawValue])
+        // Handle cancellation before an input source consumes Escape and leaves
+        // an empty/unmarked Rust overlay that would disable the undo menu.
+        if event.keyCode == 53, bridge.composition.active {
+            cancelInputComposition()
+            return
+        }
+        let handled = inputContext?.handleEvent(event) == true
+        traceNativeEvent("inputContext", ["key_code": event.keyCode, "handled": handled])
+        if handled { return }
+        interpretKeyEvents([event])
+    }
+    func characterIndex(for point: NSPoint) -> Int {
+        guard let window else { return NSNotFound }
+        let local = convert(window.convertPoint(fromScreen: point), from: nil)
+        let content = NSPoint(x: local.x - contentOrigin.x, y: local.y - contentOrigin.y)
+        guard let visual = shapedVisualHit(at: content),
+              let source = try? bridge.projectionSourceSelection(revision: bridge.revision, visualRange: NSRange(location: visual.offset, length: 0), affinity: visual.affinity) else { return NSNotFound }
+        return source.sourceRange.location
+    }
     private enum Command {
         static let deleteBackward: UInt8 = 1
         static let deleteForward: UInt8 = 2
+        static let deleteSelections: UInt8 = 27
         static let moveLeft: UInt8 = 3
         static let moveRight: UInt8 = 4
         static let insertNewline: UInt8 = 5
@@ -51,6 +101,9 @@ final class DocumentTextView: NSTextView {
     private var synchronizingSelection = false
     private var visualCompositionGeneration: UInt64?
     private var visualSelectionAnchor: Int?
+    private var pointerSourceAnchor: (source: Int, revision: UInt64)?
+    private var pointerUnitAnchor: (range: NSRange, paragraph: Bool, revision: UInt64)?
+    private var tableSelectionAnchor: (source: Int, revision: UInt64)?
     private var tableResizeTrackingArea: NSTrackingArea?
     private var tableResizeCursorActive = false
     private var taskCheckboxPointerConsumed = false
@@ -74,54 +127,13 @@ final class DocumentTextView: NSTextView {
         self.bridge = bridge
         canonicalSource = bridge.source
         canonicalRevision = bridge.revision
-        // NSTextView's frame-only convenience initializer dynamically
-        // dispatches to `init(frame:textContainer:)` on subclasses. Because
-        // this view owns its bridge and is not storyboard-decoded, construct
-        // the TextKit chain explicitly and call the designated initializer.
-        // A nil text container can leave a source-backed mirror readable via
-        // AX while providing no drawable storage/layout for the native view.
-        let textStorage = NSTextStorage()
-        let layoutManager = NSLayoutManager()
-        let textContainer = NSTextContainer(
-            size: NSSize(width: 900, height: CGFloat.greatestFiniteMagnitude)
-        )
-        layoutManager.addTextContainer(textContainer)
-        textStorage.addLayoutManager(layoutManager)
-        super.init(frame: .zero, textContainer: textContainer)
-        isEditable = true
-        isSelectable = true
-        isRichText = false
-        importsGraphics = false
-        allowsUndo = false
-        usesFindBar = true
-        font = NSFont.systemFont(ofSize: 17)
-        textColor = NSColor(calibratedRed: 0.13, green: 0.15, blue: 0.18, alpha: 1)
-        insertionPointColor = YuVisualTokens.accent
-        backgroundColor = YuVisualTokens.canvas
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 5
-        paragraph.paragraphSpacing = 10
-        paragraph.lineBreakMode = .byWordWrapping
-        typingAttributes = [
-            .font: font as Any,
-            .foregroundColor: textColor as Any,
-            .paragraphStyle: paragraph,
-        ]
+        super.init(frame: .zero)
         setAccessibilityElement(true)
         setAccessibilityRole(.textArea)
         setAccessibilityLabel("Yu Markdown 文档")
         setAccessibilityIdentifier("yu-document-text")
         headingRotorDelegate = YuAccessibilityRotorDelegate(owner: self, kind: .heading)
         linkRotorDelegate = YuAccessibilityRotorDelegate(owner: self, kind: .link)
-        minSize = NSSize(width: 0, height: 0)
-        maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        // 可滚动范围由 Rust 这一帧的内容高度决定（见
-        // `MacosSurfaceHostCoordinator.applyContentHeight`）。这个视图不绘制
-        // 任何像素，它自己的 TextKit 排版高度不该成为第二个滚动范围来源——
-        // 两套高度不一致时长文档尾部滚不到，而且它是在窗口出现之后异步长出来
-        // 的，会把视口一起拖走。
-        isVerticallyResizable = false
-        isHorizontallyResizable = false
         autoresizingMask = [.width]
         semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
         rebuildSemanticAccessibilityTree()
@@ -173,31 +185,10 @@ final class DocumentTextView: NSTextView {
     func refreshFromRust() {
         canonicalSource = bridge.source
         canonicalRevision = bridge.revision
-        semanticNodes = bridge.accessibilitySemanticNodesIfAvailable ?? []
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
         synchronizeProjection()
         postAccessibilityRefresh()
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     @discardableResult
     func applyVisualPointerSelectionForSelfCheck(
@@ -221,7 +212,7 @@ final class DocumentTextView: NSTextView {
     }
 
     /// 真实窗口 self-check 用：某个源码偏移的 caret 矩形（document-space），
-    /// 拿来推一个可点的坐标。`shapedVisualOffset(at:)` 收的就是这个空间。
+    /// 拿来推一个可点的坐标。`shapedVisualHit(at:)` 收的就是这个空间。
     func shapedCaretRectForSelfCheck(sourceUTF16: Int) -> NSRect? {
         rustCaretRect(forSourceUTF16: sourceUTF16)
     }
@@ -235,8 +226,8 @@ final class DocumentTextView: NSTextView {
     private func visualPoint(for event: NSEvent) -> NSPoint {
         let local = convert(event.locationInWindow, from: nil)
         return NSPoint(
-            x: local.x - textContainerOrigin.x,
-            y: local.y - textContainerOrigin.y
+            x: local.x - contentOrigin.x,
+            y: local.y - contentOrigin.y
         )
     }
 
@@ -248,13 +239,13 @@ final class DocumentTextView: NSTextView {
     }
 
     /// Resolves a visual document point through the Rust CoreText-shaped
-    /// block layout. TextKit remains the input/IME/accessibility host, but it
-    /// must not guess glyph boundaries for production pointer selection.
+    /// snapshot. The native input/IME/accessibility host applies coordinate
+    /// transforms without guessing glyph boundaries.
     /// 命中测试完全由 Rust layout 完成。此处不再用 TextKit 布局出的
     /// visual 长度做上界校验——那等于用第二套布局系统验证第一套，
     /// 而第二套布局系统本身就是要消除的对象（不变量 I5、E1）。
     /// Rust 返回的 visualUTF16 已绑定同一 Revision，越界由 Rust 侧拒绝。
-    private func shapedVisualOffset(at point: NSPoint) -> Int? {
+    private func shapedVisualHit(at point: NSPoint) -> (offset: Int, source: Int, affinity: UInt8)? {
         guard point.x.isFinite,
               point.y.isFinite,
               let (size, width) = visualLayoutMetrics(),
@@ -267,11 +258,12 @@ final class DocumentTextView: NSTextView {
               hit.revision == bridge.revision,
               hit.point.x.isFinite,
               hit.point.y.isFinite,
+              let sourceOffset = Int(exactly: hit.sourceUTF16),
               let visualOffset = Int(exactly: hit.visualUTF16),
               visualOffset >= 0 else {
             return nil
         }
-        return visualOffset
+        return (visualOffset, sourceOffset, hit.affinity)
     }
 
     @discardableResult
@@ -279,33 +271,19 @@ final class DocumentTextView: NSTextView {
         at point: NSPoint,
         extending: Bool
     ) -> Bool {
-        guard !bridge.composition.active else { return false }
-        guard let visualOffset = shapedVisualOffset(at: point) else {
-            // Rust 端对 Revision 与已发布的 viewport metrics 有意严格。
-            // 几何过期时放弃本次指针选区，等下一帧重试。
-            return false
-        }
+        guard !bridge.composition.active, let hit = shapedVisualHit(at: point) else { return false }
         if !extending || visualSelectionAnchor == nil {
-            if extending {
-                let endpoints = bridge.selectionEndpoints
-                let sourceUTF16 = endpoints.anchorUTF16
-                visualSelectionAnchor = visualUTF16ForSource(
-                    sourceUTF16,
-                    affinity: endpoints.affinity
-                ) ?? visualOffset
-            } else {
-                visualSelectionAnchor = visualOffset
-            }
+            let source = extending ? Int(bridge.selectionEndpoints.anchorUTF16) : hit.source
+            pointerSourceAnchor = (source, bridge.revision)
+            visualSelectionAnchor = hit.offset
         }
-        guard let anchor = visualSelectionAnchor else { return false }
-        let visualRange = NSRange(
-            location: min(anchor, visualOffset),
-            length: abs(visualOffset - anchor)
-        )
-        return applyVisualSelection(
-            visualRange,
-            anchorIsVisualStart: anchor <= visualOffset
-        )
+        guard let anchor = pointerSourceAnchor, anchor.revision == bridge.revision else { return false }
+        do {
+            try bridge.setSelectionEndpoints(anchorUTF16: UInt64(anchor.source), focusUTF16: UInt64(hit.source), affinity: hit.affinity)
+            synchronizeProjection()
+            postSelectionChanged()
+            return true
+        } catch { return false }
     }
 
     /// 把一个视口坐标点换成源码偏移，再加一根光标。
@@ -315,15 +293,8 @@ final class DocumentTextView: NSTextView {
     /// 的镜像，而语法标记被藏起来之后两者的偏移不是同一个（不变量 I6）。
     private func addCaretAtVisualPoint(_ point: NSPoint) -> Bool {
         guard !bridge.composition.active else { return false }
-        guard let visualOffset = shapedVisualOffset(at: point) else { return false }
-        guard let source = try? bridge.projectionSourceSelection(
-            revision: bridge.revision,
-            visualRange: NSRange(location: visualOffset, length: 0),
-            affinity: 1
-        ) else {
-            return false
-        }
-        return addCaret(atSource: source.sourceRange.location)
+        guard let hit = shapedVisualHit(at: point) else { return false }
+        return addCaret(atSource: hit.source, affinity: hit.affinity)
     }
 
     private func visualUTF16ForSource(
@@ -347,7 +318,8 @@ final class DocumentTextView: NSTextView {
     @discardableResult
     private func applyVisualSelection(
         _ visualRange: NSRange,
-        anchorIsVisualStart: Bool? = nil
+        anchorIsVisualStart: Bool? = nil,
+        affinity: UInt8 = 1
     ) -> Bool {
         guard !bridge.composition.active,
               visualRange.location >= 0,
@@ -358,7 +330,7 @@ final class DocumentTextView: NSTextView {
             let source = try bridge.projectionSourceSelection(
                 revision: bridge.revision,
                 visualRange: visualRange,
-                affinity: 1
+                affinity: affinity
             )
             if let anchorIsVisualStart {
                 let anchorUTF16 = anchorIsVisualStart
@@ -377,24 +349,19 @@ final class DocumentTextView: NSTextView {
             }
             canonicalRevision = bridge.revision
             synchronizingSelection = true
-            super.setSelectedRange(source.sourceRange)
+            nativeSelection = source.sourceRange
             synchronizingSelection = false
             postSelectionChanged()
             return true
         } catch {
             synchronizingSelection = false
-            // A stale visual point is an expected race with source editing;
-            // let the caller fall back to AppKit's source hit-test instead of
-            // interrupting typing with a modal error.
+            // A stale point must not mutate the current source selection.
             return false
         }
     }
 
-    // These queries deliberately read a fresh Rust snapshot instead of
-    // trusting TextKit's disposable projection. TextKit remains the source
-    // mirror and AppKit fallback surface; source text, UTF-16 length,
-    // selection and logical line ranges remain Revision-bound Rust data.
-    override func accessibilityValue() -> String? {
+    // Accessibility reads revision-bound source and geometry from the same session.
+    override func accessibilityValue() -> Any? {
         bridge.copySourceIfAvailable ?? canonicalSource
     }
 
@@ -612,11 +579,11 @@ final class DocumentTextView: NSTextView {
         return source.rangeOfComposedCharacterSequence(at: index)
     }
 
-    override func setSelectedRange(_ charRange: NSRange) {
+    @objc func setSelectedRange(_ charRange: NSRange) {
         let range = clampedRange(charRange, length: (string as NSString).length)
         let shouldSync = !synchronizingSelection
         synchronizingSelection = true
-        super.setSelectedRange(range)
+        nativeSelection = range
         synchronizingSelection = false
         guard shouldSync else { return }
         syncNativeSelectionToRust(range)
@@ -628,18 +595,14 @@ final class DocumentTextView: NSTextView {
     /// **这里以前只把第一条送给 Rust。** 多光标之后全部送过去——`AXSelectedRanges`
     /// 赋值、以及 AppKit 自己的不连续选区都走这个入口，丢掉其余几条不报错，
     /// 只是那几根光标从此不存在。归一化（排序、合并）归 Rust 一家做。
-    override func setSelectedRanges(
+    @objc func setSelectedRanges(
         _ ranges: [NSValue],
         affinity: NSSelectionAffinity,
         stillSelecting: Bool
     ) {
         let shouldSync = !synchronizingSelection
         synchronizingSelection = true
-        super.setSelectedRanges(
-            ranges,
-            affinity: affinity,
-            stillSelecting: stillSelecting
-        )
+        selectedRanges = ranges
         synchronizingSelection = false
         guard shouldSync else { return }
         let length = (string as NSString).length
@@ -654,11 +617,134 @@ final class DocumentTextView: NSTextView {
         syncNativeSelectionsToRust(clamped, primary: primary)
     }
 
-    /// The visual pointer adapter resolves the click/drag point in the
-    /// projected stream, then lets Rust convert that visual range into the
-    /// canonical source selection. If the projected mirror is stale or
-    /// unavailable, AppKit's source hit-test remains the safe fallback.
+    func makeTableMenu() -> NSMenu {
+        let menu = NSMenu(title: "表格")
+        let items: [(String, Int)] = [
+            ("在上方插入正文行", Int(YU_STORAGE_COMMAND_TABLE_INSERT_ROW_BEFORE)),
+            ("在下方插入正文行", Int(YU_STORAGE_COMMAND_TABLE_INSERT_ROW_AFTER)),
+            ("删除正文行", Int(YU_STORAGE_COMMAND_TABLE_DELETE_ROW)),
+            ("在左侧插入列", Int(YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_BEFORE)),
+            ("在右侧插入列", Int(YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_AFTER)),
+            ("删除列", Int(YU_STORAGE_COMMAND_TABLE_DELETE_COLUMN)),
+            ("列左对齐", Int(YU_STORAGE_COMMAND_TABLE_ALIGN_LEFT)),
+            ("列居中", Int(YU_STORAGE_COMMAND_TABLE_ALIGN_CENTER)),
+            ("列右对齐", Int(YU_STORAGE_COMMAND_TABLE_ALIGN_RIGHT)),
+            ("列默认对齐", Int(YU_STORAGE_COMMAND_TABLE_ALIGN_DEFAULT)),
+        ]
+        for (index, entry) in items.enumerated() {
+            if index == 3 || index == 6 { menu.addItem(.separator()) }
+            let item = NSMenuItem(title: entry.0, action: #selector(editTableFromMenu(_:)), keyEquivalent: "")
+            item.tag = entry.1
+            item.toolTip = "按住 ⇧⌥ 拖动，可选择矩形单元格区域。"
+            item.target = self
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard menuItem.action == #selector(editTableFromMenu(_:)),
+              let command = UInt8(exactly: menuItem.tag) else { return false }
+        return isEditable && bridge.commandAvailable(command)
+    }
+
+    @objc func editTableFromMenu(_ sender: NSMenuItem) {
+        guard isEditable, let command = UInt8(exactly: sender.tag) else { return }
+        _ = routeCommand(command)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        window?.makeFirstResponder(self)
+        guard applyVisualPointerSelection(at: visualPoint(for: event), extending: false) else {
+            return super.menu(for: event)
+        }
+        let menu = makeTableMenu()
+        return menu.items.contains(where: { validateMenuItem($0) }) ? menu : super.menu(for: event)
+    }
+
+    /// Option-Shift drag selects whole cells. Source coordinates come from the
+    /// same retained CoreText geometry used by ordinary pointer selection.
+    @discardableResult
+    func selectTableCellsAtVisualPoint(_ point: NSPoint, starting: Bool) -> Bool {
+        guard !bridge.composition.active, let hit = shapedVisualHit(at: point) else { return false }
+        // Keep the hit's source identity: empty cells may share one visual
+        // offset, so a second visual-to-source conversion loses the cell.
+        let anchor = starting ? (source: hit.source, revision: bridge.revision) : tableSelectionAnchor
+        guard let anchor, anchor.revision == bridge.revision else { return false }
+        do {
+            try bridge.selectTableCells(anchor: anchor.source, focus: hit.source, revision: anchor.revision)
+            tableSelectionAnchor = anchor
+            visualSelectionAnchor = nil
+            synchronizeProjection()
+            postSelectionChanged()
+            return true
+        } catch { return false }
+    }
+
+    /// AppKit defines native word boundaries; Rust still validates and owns
+    /// the resulting source selection. Only the clicked source paragraph is
+    /// materialized; this is neither a text-layout mirror nor Markdown parsing.
+    private func pointerUnit(at sourceOffset: Int, paragraph: Bool) -> NSRange? {
+        let source = canonicalSource as NSString
+        guard source.length > 0, sourceOffset >= 0, sourceOffset <= source.length else { return nil }
+        let point = source.rangeOfComposedCharacterSequence(at: min(sourceOffset, source.length - 1)).location
+        let context = source.paragraphRange(for: NSRange(location: point, length: 0))
+        if paragraph { return context }
+        let text = NSAttributedString(string: source.substring(with: context))
+        let word = text.doubleClick(at: point - context.location)
+        guard word.location != NSNotFound, word.length > 0 else { return nil }
+        return NSRange(location: context.location + word.location, length: word.length)
+    }
+
+    private func clickedCharacterOffset(near sourceOffset: Int, point: NSPoint) -> Int {
+        let source = canonicalSource as NSString
+        // Hit testing returns an insertion boundary. A click in the right half
+        // of the last glyph of a word must still select that word, not the
+        // following space. Compare the neighboring graphemes' Rust caret boxes.
+        for index in [sourceOffset - 1, sourceOffset] where index >= 0 && index < source.length {
+            let range = source.rangeOfComposedCharacterSequence(at: index)
+            guard let start = rustCaretRect(forSourceUTF16: range.location),
+                  let end = rustCaretRect(forSourceUTF16: NSMaxRange(range)),
+                  abs(start.minY - end.minY) < 1 else { continue }
+            let left = min(start.minX, end.minX), right = max(start.minX, end.minX)
+            if right > left, point.x >= left, point.x < right,
+               point.y >= start.minY, point.y <= max(start.maxY, end.maxY) { return range.location }
+        }
+        return sourceOffset
+    }
+
+    @discardableResult
+    private func selectPointerUnit(at point: NSPoint, clickCount: Int? = nil) -> Bool {
+        guard !bridge.composition.active, let hit = shapedVisualHit(at: point) else { return false }
+        let paragraph = clickCount.map { $0 >= 3 } ?? pointerUnitAnchor?.paragraph ?? false
+        let character = clickedCharacterOffset(near: hit.source, point: point)
+        guard let unit = pointerUnit(at: character, paragraph: paragraph) else { return false }
+        if clickCount != nil { pointerUnitAnchor = (unit, paragraph, bridge.revision) }
+        guard let anchor = pointerUnitAnchor, anchor.revision == bridge.revision else { return false }
+        do {
+            let backward = hit.source < anchor.range.location
+            try bridge.setSelectionEndpoints(
+                anchorUTF16: UInt64(backward ? NSMaxRange(anchor.range) : anchor.range.location),
+                focusUTF16: UInt64(backward ? unit.location : max(NSMaxRange(anchor.range), NSMaxRange(unit))),
+                affinity: hit.affinity)
+            visualSelectionAnchor = nil
+            synchronizeProjection()
+            postSelectionChanged()
+            return true
+        } catch { return false }
+    }
+
+    /// Pointer events use the same CoreText paragraph geometry as Metal.
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        tableSelectionAnchor = nil
+        pointerUnitAnchor = nil
+        if event.buttonNumber == 0, event.clickCount >= 2,
+           !event.modifierFlags.contains(.option),
+           selectPointerUnit(at: visualPoint(for: event), clickCount: event.clickCount) { return }
+        if event.buttonNumber == 0,
+           event.modifierFlags.contains([.option, .shift]),
+           selectTableCellsAtVisualPoint(visualPoint(for: event), starting: true) { return }
         if event.buttonNumber == 0,
            event.clickCount == 1,
            !event.modifierFlags.contains(.shift),
@@ -668,11 +754,19 @@ final class DocumentTextView: NSTextView {
             return
         }
         taskCheckboxPointerConsumed = false
-        if event.buttonNumber == 0,
-           onTableResizeBegin?(visualPoint(for: event)) == true {
-            visualSelectionAnchor = nil
-            setTableResizeCursor(active: true)
-            return
+        if event.buttonNumber == 0 {
+            let point = visualPoint(for: event)
+            let began = onTableResizeBegin?(point) == true
+            if Self.traceNativeEvents {
+                let dividers = (tableResizeAccessibilityProvider?() ?? []).map { ["x": $0.rect.origin.x, "y": $0.rect.origin.y, "width": $0.rect.width, "height": $0.rect.height] }
+                traceNativeEvent("resizeProbe", ["x": point.x, "y": point.y, "began": began,
+                    "layout_width": visualLayoutMetrics()?.1 ?? 0, "dividers": dividers])
+            }
+            if began {
+                visualSelectionAnchor = nil
+                setTableResizeCursor(active: true)
+                return
+            }
         }
         // ⌥ 点加一根光标。**必须挡在 super 前面**：`NSTextView` 自己的
         // ⌥ 拖是矩形选区，放过去会既加不上光标又把选区改掉。
@@ -695,7 +789,16 @@ final class DocumentTextView: NSTextView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        autoscroll(with: event)
+        if tableSelectionAnchor != nil {
+            _ = selectTableCellsAtVisualPoint(visualPoint(for: event), starting: false)
+            return
+        }
         if taskCheckboxPointerConsumed {
+            return
+        }
+        if pointerUnitAnchor != nil {
+            _ = selectPointerUnit(at: visualPoint(for: event))
             return
         }
         if onTableResizeUpdate?(visualPoint(for: event)) == true {
@@ -712,7 +815,11 @@ final class DocumentTextView: NSTextView {
         super.mouseDragged(with: event)
     }
 
+    func finishTableCellSelection() { tableSelectionAnchor = nil }
+
     override func mouseUp(with event: NSEvent) {
+        if pointerUnitAnchor != nil { pointerUnitAnchor = nil; return }
+        if tableSelectionAnchor != nil { finishTableCellSelection(); return }
         if taskCheckboxPointerConsumed {
             taskCheckboxPointerConsumed = false
             return
@@ -733,15 +840,6 @@ final class DocumentTextView: NSTextView {
     /// insertion point at the revision-bound visual caret while retaining the
     /// TextKit view as the input/IME/Accessibility owner.
     /// caret 由 Rust retained decoration 绘制。TextKit 不贡献像素。
-    override func drawInsertionPoint(
-        in rect: NSRect,
-        color: NSColor,
-        turnedOn: Bool
-    ) {}
-
-    /// Rust surface 是唯一渲染路径（不变量 I5）。本视图仍然是
-    /// `NSTextInputClient` 与 Accessibility 的宿主，但不绘制任何像素：
-    /// 没有 fallback 路径，也就不需要判断「该不该画」。
     override func draw(_ rect: NSRect) {}
 
     private func syncNativeSelectionToRust(_ range: NSRange) {
@@ -755,10 +853,10 @@ final class DocumentTextView: NSTextView {
         }
     }
 
-    private func syncNativeSelectionsToRust(_ ranges: [NSRange], primary: Int) {
+    private func syncNativeSelectionsToRust(_ ranges: [NSRange], primary: Int, affinities: [UInt8]? = nil) {
         guard !bridge.composition.active else { return }
         do {
-            try bridge.setSelections(ranges, primary: primary)
+            try bridge.setSelections(ranges, primary: primary, affinities: affinities)
             canonicalRevision = bridge.revision
             postSelectionChanged()
         } catch {
@@ -766,7 +864,18 @@ final class DocumentTextView: NSTextView {
         }
     }
 
-    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+    private static let traceInput = ProcessInfo.processInfo.environment["YU_RENDER_TIMING"] != nil
+
+    @objc func insertText(_ insertString: Any, replacementRange: NSRange) {
+        traceNativeEvent("insertText", ["text": stringValue(insertString)])
+        var phaseStart = Self.traceInput ? CACurrentMediaTime() : 0
+        func phase(_ name: String) {
+            guard Self.traceInput else { return }
+            let now = CACurrentMediaTime()
+            print("yu-render-metric event=input_phase phase=\(name) time_s=\(now) duration_ms=\((now - phaseStart) * 1000)")
+            phaseStart = now
+        }
+        guard !discardingComposition else { return }
         let text = stringValue(insertString)
         guard !text.isEmpty || bridge.composition.active else { return }
         do {
@@ -782,23 +891,28 @@ final class DocumentTextView: NSTextView {
                     try bridge.setSelection(target)
                 }
                 let result = try bridge.insertText(text)
+                phase("rust_command")
                 apply(result)
+                phase("source_cache")
             }
             nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
             synchronizeProjection()
+            phase("projection")
             postAccessibilityRefresh()
+            phase("accessibility")
             onDocumentChange?()
+            phase("document_observers")
         } catch {
             onError?(error)
         }
     }
 
-    override func copy(_ sender: Any?) {
+    @objc func copy(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
             let revision = bridge.revision
             let text = bridge.copySelection()
-            guard !text.isEmpty else { return }
+            guard !text.isEmpty || bridge.tableSelectionColumns > 0 else { return }
             let html = try bridge.copySelectionHTML(revision: revision)
             try publishSourceToPasteboard(text, html: html)
         } catch {
@@ -806,16 +920,40 @@ final class DocumentTextView: NSTextView {
         }
     }
 
-    override func cut(_ sender: Any?) {
+    @objc func cut(_ sender: Any?) {
+        do {
+            guard try cutToPasteboard(.general) else { return }
+            postAccessibilityRefresh()
+            onDocumentChange?()
+        } catch {
+            onError?(error)
+        }
+    }
+
+    /// Publish every selected source fragment before deleting any of them.
+    /// The private-board check uses this same production operation.
+    @discardableResult
+    private func cutToPasteboard(_ pasteboard: NSPasteboard) throws -> Bool {
+        try finishCompositionForClipboard()
+        let revision = bridge.revision
+        let selected = bridge.copySelection()
+        guard !selected.isEmpty || bridge.tableSelectionColumns > 0 else { return false }
+        let html = try bridge.copySelectionHTML(revision: revision)
+        try publishSourceToPasteboard(selected, html: html, to: pasteboard)
+        guard bridge.commandAvailable(Command.deleteSelections) else { return false }
+        apply(try bridge.executeCommand(Command.deleteSelections))
+        synchronizeProjection()
+        return true
+    }
+
+    func cutToPasteboardForSelfCheck(_ pasteboard: NSPasteboard) throws {
+        try cutToPasteboard(pasteboard)
+    }
+
+    @objc func paste(_ sender: Any?) {
         do {
             try finishCompositionForClipboard()
-            let revision = bridge.revision
-            let selected = bridge.copySelection()
-            guard !selected.isEmpty else { return }
-            let html = try bridge.copySelectionHTML(revision: revision)
-            try publishSourceToPasteboard(selected, html: html)
-            guard bridge.commandAvailable(Command.deleteBackward) else { return }
-            apply(try bridge.executeCommand(Command.deleteBackward))
+            guard try pasteSourceFromPasteboard(.general) else { return }
             synchronizeProjection()
             postAccessibilityRefresh()
             onDocumentChange?()
@@ -824,24 +962,14 @@ final class DocumentTextView: NSTextView {
         }
     }
 
-    override func paste(_ sender: Any?) {
-        do {
-            try finishCompositionForClipboard()
-            guard let text = try sourceFromPasteboard(), !text.isEmpty else {
-                return
-            }
-            apply(try bridge.insertText(text))
-            synchronizeProjection()
-            postAccessibilityRefresh()
-            onDocumentChange?()
-        } catch {
-            onError?(error)
-        }
+    var hasSourceSelection: Bool {
+        bridge.tableSelectionColumns > 0 || bridge.commandAvailable(Command.deleteSelections)
     }
 
     var hasSourceOnPasteboard: Bool {
         let pasteboard = NSPasteboard.general
-        return pasteboard.string(forType: .yuMarkdown) != nil
+        return pasteboard.data(forType: .yuFragments) != nil
+            || pasteboard.string(forType: .yuMarkdown) != nil
             || pasteboard.string(forType: .string) != nil
             || pasteboard.string(forType: .yuHTML) != nil
     }
@@ -860,7 +988,7 @@ final class DocumentTextView: NSTextView {
         try finishCompositionForClipboard()
         let revision = bridge.revision
         let text = bridge.copySelection()
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty || bridge.tableSelectionColumns > 0 else { return }
         let html = try bridge.copySelectionHTML(revision: revision)
         try publishSourceToPasteboard(text, html: html, to: pasteboard)
     }
@@ -870,10 +998,7 @@ final class DocumentTextView: NSTextView {
     /// intentionally omitted because this is a headless check.
     func pasteFromPasteboardForSelfCheck(_ pasteboard: NSPasteboard) throws {
         try finishCompositionForClipboard()
-        guard let text = try sourceFromPasteboard(pasteboard), !text.isEmpty else {
-            return
-        }
-        apply(try bridge.insertText(text))
+        guard try pasteSourceFromPasteboard(pasteboard) else { return }
         synchronizeProjection()
     }
 
@@ -889,14 +1014,28 @@ final class DocumentTextView: NSTextView {
         }
     }
 
-    override func setMarkedText(
+    @objc func setMarkedText(
         _ markedText: Any,
         selectedRange: NSRange,
         replacementRange: NSRange
     ) {
+        guard !discardingComposition else { return }
         let text = stringValue(markedText)
+        traceNativeEvent("setMarkedText", ["text": text])
         do {
             let active = bridge.composition
+            // Deleting the last preedit character ends the conversion. Keeping
+            // a zero-length Rust overlay would block pointer input and undo
+            // even after the system no longer displays marked text.
+            if text.isEmpty {
+                if active.active { try bridge.cancelComposition() }
+                nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
+                synchronizeProjection()
+                postAccessibilityRefresh()
+                onDocumentChange?()
+                onCaretChange?()
+                return
+            }
             let target = active.active
                 ? active.replacementRange
                 : (replacementRange.location == NSNotFound ? bridge.selection.range : replacementRange)
@@ -917,38 +1056,54 @@ final class DocumentTextView: NSTextView {
             synchronizeProjection()
             postAccessibilityRefresh()
             onDocumentChange?()
+            onCaretChange?()
         } catch {
             onError?(error)
         }
     }
 
-    override func unmarkText() {
+    @objc func unmarkText() {
         // AppKit's unmark is a presentation transition. The Rust overlay must
         // stay alive because some input sources deliver insertText afterwards.
         synchronizeProjection()
         nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
     }
 
-    override func hasMarkedText() -> Bool {
+    @objc func hasMarkedText() -> Bool {
         bridge.composition.active && nativeMarkedRange.location != NSNotFound
     }
 
-    override func markedRange() -> NSRange {
+    @objc func markedRange() -> NSRange {
         return nativeMarkedRange
     }
 
-    override func attributedSubstring(
+    @objc func attributedSubstring(
         forProposedRange proposedRange: NSRange,
         actualRange: NSRangePointer?
     ) -> NSAttributedString? {
         let range = clampedRange(proposedRange, length: (string as NSString).length)
         actualRange?.pointee = range
         guard range.location != NSNotFound else { return nil }
-        return textStorage?.attributedSubstring(from: range)
+        return NSAttributedString(string: (string as NSString).substring(with: range))
     }
 
-    override func validAttributesForMarkedText() -> [NSAttributedString.Key] {
+    @objc func validAttributesForMarkedText() -> [NSAttributedString.Key] {
         [.font, .foregroundColor, .underlineStyle]
+    }
+
+    private func cancelInputComposition() {
+        guard bridge.composition.active else { return }
+        discardingComposition = true
+        defer { discardingComposition = false }
+        do {
+            try bridge.cancelComposition()
+            nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
+            inputContext?.discardMarkedText()
+            synchronizeProjection()
+            postAccessibilityRefresh()
+            onDocumentChange?()
+            onCaretChange?()
+        } catch { onError?(error) }
     }
 
     override func doCommand(by selector: Selector) {
@@ -958,15 +1113,7 @@ final class DocumentTextView: NSTextView {
                 setTableResizeCursor(active: false)
                 return
             }
-            do {
-                if bridge.composition.active {
-                    try bridge.cancelComposition()
-                    nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
-                    synchronizeProjection()
-                    postAccessibilityRefresh()
-                    onDocumentChange?()
-                }
-            } catch { onError?(error) }
+            cancelInputComposition()
             return
         }
         if name == "undo:" {
@@ -978,6 +1125,25 @@ final class DocumentTextView: NSTextView {
             return
         }
 
+        if name == "deleteWordBackward:" || name == "deleteWordForward:" {
+            routeCommand(UInt8(name == "deleteWordBackward:"
+                ? YU_STORAGE_COMMAND_DELETE_WORD_BACKWARD : YU_STORAGE_COMMAND_DELETE_WORD_FORWARD))
+            return
+        }
+        let motions: [String: UInt8] = [
+            "moveLeftAndModifySelection:": 17, "moveRightAndModifySelection:": 18,
+            "moveWordLeftAndModifySelection:": 19, "moveWordRightAndModifySelection:": 20,
+            "moveToBeginningOfDocument:": 21, "moveToEndOfDocument:": 22,
+            "moveToBeginningOfDocumentAndModifySelection:": 23, "moveToEndOfDocumentAndModifySelection:": 24
+        ]
+        if let command = motions[name] { routeCommand(command); return }
+        if name == "insertTab:" || name == "insertBacktab:" {
+            let previous = name == "insertBacktab:"
+            if routeCommand(previous ? 26 : 25) { return }
+            if routeCommand(previous ? Command.outdentList : Command.indentList) { return }
+            if !previous { insertText("\t", replacementRange: NSRange(location: NSNotFound, length: 0)) }
+            return
+        }
         let command: UInt8?
         switch selector {
         case #selector(NSResponder.deleteBackward(_:)): command = Command.deleteBackward
@@ -1005,6 +1171,10 @@ final class DocumentTextView: NSTextView {
     /// Rust history. The menu actions below call the same method, so there
     /// is still only one undo/redo implementation.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // AppKit probes the whole view tree for key equivalents, including
+        // this surface while a search field owns the keyboard. Rust history
+        // must only receive shortcuts from the active document input host.
+        guard window?.firstResponder === self else { return false }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let isCommandZ = modifiers.contains(.command)
             && !modifiers.contains(.option)
@@ -1027,21 +1197,11 @@ final class DocumentTextView: NSTextView {
         guard bridge.commandAvailable(command) else { return false }
         do {
             let result: NativeCommandResult
-            if isVertical, let (size, width) = visualLayoutMetrics() {
-                do {
-                    result = try bridge.executeShapedVerticalCommand(
-                        command,
-                        size: size,
-                        maxWidth: width
-                    )
-                } catch BridgeError.operation(let status)
-                    where status == StorageStatus.invalidViewport {
-                    // A key can arrive before the first surface/layout
-                    // publication. Preserve editing availability by falling
-                    // back to Rust's ordinary metrics command; the next
-                    // command will retry the shaped path after preparation.
-                    result = try bridge.executeCommand(command)
-                }
+            if isVertical {
+                guard let (size, width) = visualLayoutMetrics() else { return false }
+                result = try bridge.executeShapedVerticalCommand(
+                    command, size: size, maxWidth: width
+                )
             } else {
                 result = try bridge.executeCommand(command)
             }
@@ -1056,26 +1216,20 @@ final class DocumentTextView: NSTextView {
         }
     }
 
-    /// IME 候选窗定位。
-    ///
-    /// 必须用 Rust 几何：NSTextView 的默认实现基于 TextKit 布局，而 TextKit
-    /// 排的是 canonical source，屏幕上显示的却是 Rust 的投影结果（未聚焦的
-    /// Markdown 语法被隐藏），两者的字符位置并不对应。沿用默认实现会让候选窗
-    /// 偏离真实插入点，违反不变量 H3（OS 查询的 caret rect 必须与当前编辑
-    /// 状态一致）。
-    ///
-    /// 几何不可用时回退到默认实现：候选窗位置略偏，好过不显示。
-    override func firstRect(
+    /// IME 插入点来自当前 Rust 布局快照，包含语法显隐与预编辑投影。
+    /// 阅读列、视图和屏幕坐标在这里各转换一次；几何不可用时返回空矩形。
+    @objc func firstRect(
         forCharacterRange range: NSRange,
         actualRange: NSRangePointer?
     ) -> NSRect {
         guard let caretRect = rustCaretRect(forSourceUTF16: range.location) else {
-            return super.firstRect(forCharacterRange: range, actualRange: actualRange)
+            actualRange?.pointee = NSRange(location: NSNotFound, length: 0)
+            return .zero
         }
         actualRange?.pointee = NSRange(location: range.location, length: 0)
         let viewRect = NSRect(
-            x: caretRect.origin.x + textContainerOrigin.x,
-            y: caretRect.origin.y + textContainerOrigin.y,
+            x: caretRect.origin.x + contentOrigin.x,
+            y: caretRect.origin.y + contentOrigin.y,
             width: max(caretRect.width, 1.0),
             height: caretRect.height
         )
@@ -1093,12 +1247,14 @@ final class DocumentTextView: NSTextView {
         }
         let revision = bridge.revision
         let offset = UInt64(sourceUTF16)
+        let selection = bridge.selectionEndpoints
+        let affinity: UInt8 = selection.focusUTF16 == offset ? selection.affinity : 0
         if bridge.composition.active {
             guard let caret = try? bridge.compositionShapedCaret(
                 revision: revision,
                 generation: bridge.composition.generation,
                 sourceUTF16: offset,
-                affinity: 0,
+                affinity: affinity,
                 size: size,
                 maxWidth: width
             ), caret.revision == revision else {
@@ -1109,7 +1265,7 @@ final class DocumentTextView: NSTextView {
         guard let caret = try? bridge.sourceCaret(
             revision: revision,
             sourceUTF16: offset,
-            affinity: 0,
+            affinity: affinity,
             size: size,
             maxWidth: width
         ), caret.revision == revision else {
@@ -1123,7 +1279,7 @@ final class DocumentTextView: NSTextView {
 
     private func visualLayoutMetrics() -> (Float, Float)? {
         guard let font, bounds.width.isFinite, bounds.width > 0.0 else { return nil }
-        let width = max(bounds.width - 2.0 * textContainerOrigin.x, 1.0)
+        let width = max(bounds.width - 2.0 * contentOrigin.x, 1.0)
         guard width.isFinite, width > 0.0 else { return nil }
         return (Float(max(font.pointSize, 1.0)), Float(width))
     }
@@ -1159,7 +1315,7 @@ final class DocumentTextView: NSTextView {
     ///
     /// 与单数那个是同一条路（都落到选区入口，滚动都交给 `onCaretChange`），
     /// 只是一次给 N 段。`primary` 决定滚到哪一处、以及「当前命中」算哪一处。
-    func navigate(toSources ranges: [NSRange], primary: Int) {
+    func navigate(toSources ranges: [NSRange], primary: Int, affinities: [UInt8]? = nil) {
         let length = (string as NSString).length
         guard !ranges.isEmpty, primary >= 0, primary < ranges.count else { return }
         for range in ranges {
@@ -1175,14 +1331,10 @@ final class DocumentTextView: NSTextView {
         // `setSelectedRanges` 之后给的是它自己挑的那一条，于是 primary 一律
         // 退回第 0 条——按 ⌥ 加的那根光标不会成为主光标，滚动与「当前命中」
         // 跟着错，而且不报错。选区的权威在 Rust（不变量 I6），镜像跟着走。
-        syncNativeSelectionsToRust(ranges, primary: primary)
+        syncNativeSelectionsToRust(ranges, primary: primary, affinities: affinities)
         synchronizingSelection = true
-        super.setSelectedRanges(
-            ranges.map { NSValue(range: $0) },
-            affinity: .downstream,
-            stillSelecting: false
-        )
-        super.setSelectedRange(ranges[primary])
+        selectedRanges = ranges.map { NSValue(range: $0) }
+        nativeSelection = ranges[primary]
         synchronizingSelection = false
     }
 
@@ -1192,14 +1344,14 @@ final class DocumentTextView: NSTextView {
     /// 偏移两次」的路——「选中全部匹配」产出的选区必然有序不重叠，压不住合并。
     /// 合并本身仍然归 Rust：这里只是把新的一根接在后面送过去。
     @discardableResult
-    func addCaret(atSource offset: Int) -> Bool {
+    func addCaret(atSource offset: Int, affinity: UInt8 = 1) -> Bool {
         guard !bridge.composition.active else { return false }
         guard let existing = bridge.selectionsIfAvailable else { return false }
         let length = (string as NSString).length
         guard offset >= 0, offset <= length else { return false }
         var ranges = existing.ranges.map { $0.range }
         ranges.append(NSRange(location: offset, length: 0))
-        navigate(toSources: ranges, primary: ranges.count - 1)
+        navigate(toSources: ranges, primary: ranges.count - 1, affinities: existing.ranges.map { $0.affinity } + [affinity])
         return true
     }
 
@@ -1230,6 +1382,24 @@ final class DocumentTextView: NSTextView {
         !bridge.composition.active && bridge.commandAvailable(Command.redo)
     }
 
+    /// Explicit Save/Close commits the currently visible preedit once. Autosave
+    /// never calls this: it must not select or terminate an IME candidate.
+    func finishCompositionForFileOperation() throws {
+        let composition = bridge.composition
+        guard composition.active else { return }
+        let text = bridge.copyComposition(composition)
+        discardingComposition = true
+        defer { discardingComposition = false }
+        try bridge.commitComposition(text)
+        inputContext?.discardMarkedText()
+        canonicalSource = bridge.source
+        canonicalRevision = bridge.revision
+        nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
+        synchronizeProjection()
+        postAccessibilityRefresh()
+        onDocumentChange?()
+    }
+
     private func finishCompositionForClipboard() throws {
         guard bridge.composition.active else { return }
         try bridge.cancelComposition()
@@ -1242,12 +1412,53 @@ final class DocumentTextView: NSTextView {
         html: String,
         to pasteboard: NSPasteboard = .general
     ) throws {
+        let markdown = try bridge.copySelectionMarkdown(revision: bridge.revision)
+        let fragments = try bridge.copySelectionFragments(revision: bridge.revision)
+        let payload = try JSONEncoder().encode(SourceFragments(version: 1, fragments: fragments, columns: bridge.tableSelectionColumns))
         pasteboard.clearContents()
-        guard pasteboard.setString(source, forType: .string),
-              pasteboard.setString(source, forType: .yuMarkdown),
+        if bridge.tableSelectionColumns > 0 {
+            guard pasteboard.setString(source, forType: .tabularText) else { throw BridgeError.clipboard }
+        }
+        guard pasteboard.setData(payload, forType: .yuFragments),
+              pasteboard.setString(source, forType: .string),
+              pasteboard.setString(markdown, forType: .yuMarkdown),
               pasteboard.setString(html, forType: .yuHTML) else {
             throw BridgeError.clipboard
         }
+    }
+
+    private struct SourceFragments: Codable {
+        let version: Int
+        let fragments: [String]
+        let columns: Int?
+    }
+
+    /// Preserve clipboard representation. Rust owns grid recognition, TSV
+    /// decoding and the source edit; Swift never splits cells or parses Markdown.
+    private func pasteSourceFromPasteboard(_ pasteboard: NSPasteboard) throws -> Bool {
+        if let data = pasteboard.data(forType: .yuFragments),
+           let payload = try? JSONDecoder().decode(SourceFragments.self, from: data),
+           payload.version == 1, !payload.fragments.isEmpty {
+            let columns = payload.columns ?? 0
+            guard columns >= 0 else { throw BridgeError.operation(24) }
+            apply(try bridge.pasteFragments(payload.fragments, columns: columns))
+            return true
+        }
+        if let markdown = pasteboard.string(forType: .yuMarkdown) {
+            apply(try bridge.pasteFragments([markdown]))
+            return true
+        }
+        if let html = pasteboard.string(forType: .yuHTML), let imported = try bridge.importHTML(html) {
+            apply(try bridge.pasteFragments([imported]))
+            return true
+        }
+        if let tabular = pasteboard.string(forType: .tabularText) {
+            apply(try bridge.pasteClipboardText(tabular, tabular: true))
+            return true
+        }
+        guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return false }
+        apply(try bridge.pasteClipboardText(text, tabular: false))
+        return true
     }
 
     /// 粘贴时按「信息量从多到少」取剪贴板上的一种表示。
@@ -1331,7 +1542,7 @@ final class DocumentTextView: NSTextView {
         }
         synchronizingSelection = true
         string = projected
-        selectedRange = clampedRange(selection, length: (string as NSString).length)
+        nativeSelection = clampedRange(selection, length: (string as NSString).length)
         synchronizingSelection = false
         needsDisplay = true
     }
@@ -1374,24 +1585,10 @@ final class DocumentTextView: NSTextView {
     }
 
     func accessibilityFrameForSemanticRange(_ range: NSRange) -> NSRect {
-        guard canonicalRevision == bridge.revision,
-              !bridge.composition.active,
-              range.location >= 0,
-              range.length >= 0,
-              NSMaxRange(range) <= (string as NSString).length,
-              let container = textContainer,
-              let layoutManager,
-              let window else {
-            return .zero
-        }
-        let glyphRange = layoutManager.glyphRange(
-            forCharacterRange: range,
-            actualCharacterRange: nil
-        )
-        guard glyphRange.location != NSNotFound else { return .zero }
-        let local = layoutManager
-            .boundingRect(forGlyphRange: glyphRange, in: container)
-            .offsetBy(dx: textContainerOrigin.x, dy: textContainerOrigin.y)
+        guard let window, range.location != NSNotFound,
+              let first = rustCaretRect(forSourceUTF16: range.location),
+              let last = rustCaretRect(forSourceUTF16: NSMaxRange(range)) else { return .zero }
+        let local = first.union(last).offsetBy(dx: contentOrigin.x, dy: contentOrigin.y)
         return window.convertToScreen(convert(local, to: nil))
     }
 

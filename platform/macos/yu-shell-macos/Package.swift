@@ -1,4 +1,4 @@
-// swift-tools-version: 5.10
+// swift-tools-version: 6.4
 
 import Foundation
 import PackageDescription
@@ -9,7 +9,7 @@ let packageDirectory = URL(fileURLWithPath: #filePath)
 
 let package = Package(
     name: "YuShellMacOS",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v26)],
     products: [
         .executable(name: "Yu", targets: ["Yu"]),
     ],
@@ -21,6 +21,10 @@ let package = Package(
                 .unsafeFlags([
                     "-L\(packageDirectory)/.rust",
                     "-lyu_storage_ffi",
+                    // SwiftBuild's linker driver otherwise infers SDK from
+                    // the deployment triple. Preflight pins the actual SDK 27.
+                    "-Xlinker", "-platform_version", "-Xlinker", "macos",
+                    "-Xlinker", "26.0", "-Xlinker", "27.0",
                 ])
             ]
         ),
@@ -29,5 +33,7 @@ let package = Package(
             path: "Sources/YuStorageFFI",
             publicHeadersPath: "include"
         ),
-    ]
+    ],
+    // Toolchain and platform upgrade; strict-concurrency migration is separate.
+    swiftLanguageModes: [.v5]
 )

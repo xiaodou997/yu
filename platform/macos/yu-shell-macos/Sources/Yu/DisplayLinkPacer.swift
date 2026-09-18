@@ -1,41 +1,46 @@
-import CoreVideo
-import Foundation
+import AppKit
+import QuartzCore
 
-/// Main-thread wake-up pacer for live presentation. CVDisplayLink invokes its
-/// callback on a private thread; the callback only hops to the main queue and
-/// never touches AppKit, Rust FFI, or Metal directly.
-final class DisplayLinkPacer {
-    private var link: CVDisplayLink?
+/// A view-bound display link follows the window's display and refresh rate.
+/// It only runs during live scrolling; no background polling or thread hops.
+final class DisplayLinkPacer: NSObject {
+    private var link: CADisplayLink?
+    private weak var view: NSView?
     private let callback: () -> Void
+    private let traceCycles: Bool
     private(set) var isRunning = false
 
-    init(callback: @escaping () -> Void) {
+    init(traceCycles: Bool = false, callback: @escaping () -> Void) {
+        self.traceCycles = traceCycles
         self.callback = callback
+        super.init()
     }
 
-    func start() {
-        guard link == nil else { return }
-        var created: CVDisplayLink?
-        guard CVDisplayLinkCreateWithActiveCGDisplays(&created) == kCVReturnSuccess,
-              let created else { return }
-        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        let status = CVDisplayLinkSetOutputCallback(created, { _, _, _, _, _, context in
-            guard let context else { return kCVReturnSuccess }
-            let pacer = Unmanaged<DisplayLinkPacer>.fromOpaque(context).takeUnretainedValue()
-            DispatchQueue.main.async { [weak pacer] in pacer?.callback() }
-            return kCVReturnSuccess
-        }, context)
-        guard status == kCVReturnSuccess, CVDisplayLinkStart(created) == kCVReturnSuccess else {
-            return
-        }
+    func start(view: NSView) {
+        guard link == nil, view.window != nil else { return }
+        self.view = view
+        let created = view.displayLink(target: self, selector: #selector(tick(_:)))
+        created.add(to: .main, forMode: .common)
         link = created
         isRunning = true
     }
 
+    @objc private func tick(_ sender: CADisplayLink) {
+        guard let window = view?.window,
+              window.occlusionState.contains(.visible), !window.isMiniaturized else {
+            stop()
+            return
+        }
+        if traceCycles {
+            print("yu-render-metric event=display_cycle time_s=\(CACurrentMediaTime()) timestamp_s=\(sender.timestamp) target_s=\(sender.targetTimestamp)")
+        }
+        callback()
+    }
+
     func stop() {
-        guard let link else { return }
-        CVDisplayLinkStop(link)
-        self.link = nil
+        link?.invalidate()
+        link = nil
+        view = nil
         isRunning = false
     }
 

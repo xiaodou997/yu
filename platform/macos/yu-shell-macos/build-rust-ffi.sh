@@ -7,18 +7,24 @@ set -euo pipefail
 
 shell_dir="${0:A:h}"
 workspace_dir="$shell_dir/../../.."
+python3 "$workspace_dir/tools/check-ffi-header.py" >&2
 rust_output="$shell_dir/.rust"
 library="$rust_output/libyu_storage_ffi.a"
 
-# tree-sitter 的 grammar 是 C，由 `cc` crate 编译进这个 .a（S7 第五刀）。
-# `cc` 默认按**主机 SDK** 的部署目标编译，而 Package.swift 声明的是
-# .macOS(.v14)，于是每一个 grammar 的 .o 都会让链接器抛一条
-# 「built for newer 'macOS' version」。它只是警告，但每次构建刷十几行，
-# 真正的警告会淹在里面。两边对齐到同一个版本就没有了。
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
-cargo build --manifest-path "$workspace_dir/Cargo.toml" -p yu-storage-ffi >&2
+source "$shell_dir/toolchain.sh"
+profile="debug"
+for option in "$@"; do
+    case "$option" in
+        --release) profile="release" ;;
+        *) print -r -- "Unknown build option: $option" >&2; exit 2 ;;
+    esac
+done
+typeset -a profile_args
+[[ "$profile" == "release" ]] && profile_args+=(--release)
 mkdir -p "$rust_output"
-cp "$workspace_dir/target/debug/libyu_storage_ffi.a" "$library"
+cargo build --locked --manifest-path "$workspace_dir/Cargo.toml" -p yu-storage-ffi \
+    --target aarch64-apple-darwin "${profile_args[@]}" >&2
+cp "$workspace_dir/target/aarch64-apple-darwin/$profile/libyu_storage_ffi.a" "$library"
 
 # Package.swift 通过 `.unsafeFlags(["-L…", "-lyu_storage_ffi"])` 链接这个静态
 # 库，而 SwiftPM **不把它当作构建依赖跟踪**：.a 更新后 `swift build` 仍然认为
@@ -31,7 +37,9 @@ stamp="$rust_output/.library-hash"
 current="$(shasum -a 256 "$library" | cut -d' ' -f1)"
 if [[ ! -f "$stamp" || "$(cat "$stamp")" != "$current" ]]; then
     print -r -- "Rust 静态库已变化，强制重新链接" >&2
-    rm -f "$shell_dir"/.build/*/debug/Yu(N)
+    rm -f "$shell_dir"/.build/**/debug/Yu(N) "$shell_dir"/.build/**/release/Yu(N) \
+        "$shell_dir"/.build/out/Products/Debug/Yu(N) \
+        "$shell_dir"/.build/out/Products/Release/Yu(N)
     print -r -- "$current" > "$stamp"
 fi
 

@@ -11,6 +11,7 @@ extension NSPasteboard.PasteboardType {
     /// The de-facto Markdown pasteboard UTI used by macOS Markdown editors.
     /// The payload is always the canonical source selected in Rust, never the
     /// TextKit projection (which may contain a transient IME overlay).
+    static let yuFragments = NSPasteboard.PasteboardType("app.yu.source-fragments.v1")
     static let yuMarkdown = NSPasteboard.PasteboardType("net.daringfireball.markdown")
     /// Semantic HTML generated from the same Rust-owned source selection.
     static let yuHTML = NSPasteboard.PasteboardType(UTType.html.identifier)
@@ -244,7 +245,8 @@ struct NativeTableResizeAccessibilityDivider: Equatable {
         index = value.index
         columnCount = value.column_count
         rect = CGRect(
-            x: CGFloat(value.x),
+            // FFI x is the divider line, not the left edge of its hit rectangle.
+            x: CGFloat(value.x - value.width / 2),
             y: CGFloat(value.y),
             width: CGFloat(value.width),
             height: CGFloat(value.height)
@@ -308,6 +310,7 @@ struct NativeMacosRenderHostSnapshot {
     let highlightedGlyphCount: Int
     let resourceRefreshPending: Bool
     let resourceRetryPending: Bool
+    let layoutPending: Bool
 
     init(_ value: YuStorageMacosRenderHostSnapshot) {
         revision = value.revision
@@ -333,6 +336,7 @@ struct NativeMacosRenderHostSnapshot {
         highlightedGlyphCount = Int(value.highlighted_glyph_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
         resourceRetryPending = value.resource_retry_pending != 0
+        layoutPending = value.layout_pending != 0
     }
 }
 struct NativeMacosRenderHostSurfaceSnapshot {
@@ -368,6 +372,7 @@ struct NativeMacosRenderHostSurfaceSnapshot {
     /// 平台据此安排一次有界轮询，不自己判断资源状态。
     let resourceRefreshPending: Bool
     let resourceRetryPending: Bool
+    let layoutPending: Bool
     /// 这一帧渲染出来的文档总高度，可滚动范围的唯一依据。
     let contentHeight: CGFloat
 
@@ -399,6 +404,7 @@ struct NativeMacosRenderHostSurfaceSnapshot {
         highlightedGlyphCount = Int(value.highlighted_glyph_count)
         resourceRefreshPending = value.resource_refresh_pending != 0
         resourceRetryPending = value.resource_retry_pending != 0
+        layoutPending = value.layout_pending != 0
         contentHeight = CGFloat(value.content_height)
     }
 }
@@ -512,6 +518,11 @@ struct NativeAccessibilitySemanticNode {
 /// 剥语法标记、折行、身份链、树的形状，没有一样需要 AppKit。壳里照写第二遍
 /// 的表现是同一条标题在两端显示得不一样、展开状态在一端活得下来在另一端活
 /// 不下来——都不报错。
+struct NativeOutlineStyleRun {
+    let range: NSRange
+    let traits: UInt8
+}
+
 struct NativeOutlineItem {
     let revision: UInt64
     let index: UInt32
@@ -527,7 +538,16 @@ struct NativeOutlineItem {
     /// 直接孩子的条数。这份表是前序，两者合起来还原整棵树。
     let childCount: Int
 
-    init(_ value: YuStorageOutlineItem, text: [UInt8]) {
+    let styleRuns: [NativeOutlineStyleRun]
+
+    init(_ value: YuStorageOutlineItem, text: [UInt8], styles: [YuStorageOutlineStyleRun]) {
+        let offset = Int(value.style_offset)
+        let end = offset + Int(value.style_count)
+        styleRuns = styles[offset..<end].map {
+            NativeOutlineStyleRun(range: NSRange(location: Int($0.start_utf16),
+                                                 length: Int($0.end_utf16 - $0.start_utf16)),
+                                  traits: $0.traits)
+        }
         revision = value.revision
         index = value.index
         parent = value.parent
@@ -717,15 +737,23 @@ struct NativeCommandResult {
 }
 final class StorageBridge {
     private var handle: OpaquePointer
-    private let openedPath: String
+    private var openedPath: String
     private var cachedSource: String
+    private var accessibilityNodeCapacity = 1
     private var cachedState: NativeStorageState
+    private(set) var presentationStorageError: Error?
 
-    init(path: String) throws {
+    enum OpenMode { case existing, untitled, recovery }
+
+    init(path: String, mode: OpenMode = .existing) throws {
         var created: OpaquePointer?
         let bytes = Array(path.utf8)
         let status = bytes.withUnsafeBufferPointer { buffer in
-            yu_storage_session_open(buffer.baseAddress, buffer.count, &created)
+            switch mode {
+            case .existing: return yu_storage_session_open(buffer.baseAddress, buffer.count, &created)
+            case .untitled: return yu_storage_session_create(buffer.baseAddress, buffer.count, &created)
+            case .recovery: return yu_storage_session_open_recovery(buffer.baseAddress, buffer.count, &created)
+            }
         }
         guard status == StorageStatus.ok, let created else {
             throw BridgeError.open(status)
@@ -740,6 +768,18 @@ final class StorageBridge {
         // mismatch now becomes a normal launch error instead of a later
         // `precondition` abort while AppKit is laying out the first window.
         do {
+            guard let library = Bundle.main.url(forResource: "yu_shaders", withExtension: "metallib") else {
+                throw NSError(domain: "Yu.Renderer", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "应用缺少 yu_shaders.metallib，请重新构建完整应用包。"])
+            }
+            let libraryPath = Array(library.path.utf8)
+            let libraryStatus = libraryPath.withUnsafeBufferPointer {
+                yu_storage_session_set_shader_library(created, $0.baseAddress, $0.count)
+            }
+            guard libraryStatus == StorageStatus.ok else {
+                throw NSError(domain: "Yu.Renderer", code: Int(libraryStatus),
+                    userInfo: [NSLocalizedDescriptionKey: "无法加载应用的 Metal 着色器库。"])
+            }
             cachedSource = try copyBytesThrowing { output, capacity, written in
                 yu_storage_session_copy_source(
                     created,
@@ -749,9 +789,51 @@ final class StorageBridge {
                 )
             }
             cachedState = try readState()
+            openedPath = try copyBytesThrowing { output, capacity, written in
+                yu_storage_session_copy_path(created, output, capacity, written)
+            }
         } catch {
             yu_storage_session_destroy(created)
             throw error
+        }
+        do {
+            try configureTableWidthStore()
+        } catch {
+            // Presentation-cache I/O must not prevent opening the Markdown file.
+            presentationStorageError = PresentationStorageError(underlying: error)
+        }
+    }
+
+    private struct PresentationStorageError: LocalizedError {
+        let underlying: Error
+        var errorDescription: String? { "无法保存或恢复表格列宽：\(underlying.localizedDescription)" }
+    }
+
+    private func configureTableWidthStore() throws {
+        let root: URL
+        if let override = ProcessInfo.processInfo.environment["YU_PRESENTATION_STATE_DIR"], !override.isEmpty {
+            root = URL(fileURLWithPath: override, isDirectory: true)
+        } else if CommandLine.arguments.contains(where: { $0.hasSuffix("-self-check") }) {
+            root = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "yu-presentation-self-check-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true
+            )
+        } else {
+            guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            root = support.appendingPathComponent("Yu/TableWidths", isDirectory: true)
+        }
+        let bytes = Array(root.path.utf8)
+        let status = bytes.withUnsafeBufferPointer {
+            yu_storage_session_set_table_width_store(handle, $0.baseAddress, $0.count)
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    func persistTableWidths() throws {
+        let status = yu_storage_session_persist_table_widths(handle)
+        guard status == StorageStatus.ok else {
+            throw PresentationStorageError(underlying: BridgeError.operation(status))
         }
     }
 
@@ -1090,8 +1172,14 @@ final class StorageBridge {
         surfaceWidth: Double,
         surfaceHeight: Double,
         scale: Double,
-        appearance: UInt8
+        appearance: UInt8,
+        requirePresented: Bool = false
     ) -> Bool {
+        if requirePresented {
+            return framePresentationTime(size: size, maxWidth: maxWidth, scrollY: scrollY,
+                viewportHeight: viewportHeight, surfaceWidth: surfaceWidth,
+                surfaceHeight: surfaceHeight, scale: scale, appearance: appearance) != nil
+        }
         var geometry = YuStorageFrameGeometry(
             size: size,
             max_width: maxWidth,
@@ -1105,6 +1193,30 @@ final class StorageBridge {
         let status = yu_storage_session_frame_is_current(handle, &geometry, appearance, &current)
         guard status == StorageStatus.ok else { return false }
         return current != 0
+    }
+
+    func framePresentationTime(size: Float, maxWidth: Float, scrollY: Float,
+        viewportHeight: Float, surfaceWidth: Double, surfaceHeight: Double,
+        scale: Double, appearance: UInt8) -> Double? {
+        var geometry = YuStorageFrameGeometry(size: size, max_width: maxWidth,
+            scroll_y: scrollY, viewport_height: viewportHeight, surface_width: surfaceWidth,
+            surface_height: surfaceHeight, scale: scale)
+        var time = 0.0
+        let status = yu_storage_session_frame_presentation_time(handle, &geometry, appearance, &time)
+        return status == StorageStatus.ok && time.isFinite && time > 0 ? time : nil
+    }
+
+    func trimRenderCaches() throws {
+        let status = yu_storage_session_trim_render_caches(handle)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    private(set) var sourceMode = false
+
+    func setSourceMode(_ enabled: Bool) throws {
+        let status = yu_storage_session_set_source_mode(handle, enabled ? 1 : 0)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        sourceMode = enabled
     }
 
     func macosRenderHostSurfaceDetach() throws {
@@ -1229,36 +1341,28 @@ final class StorageBridge {
         return NativeAccessibilitySnapshot(value)
     }
 
-    /// Returns an owned semantic tree for the current Rust revision. The
-    /// current host still exposes one NSTextView Accessibility element; this
-    /// query establishes the source-backed child-element contract without
-    /// retaining a second document model in AppKit.
+    /// Revision-bound semantic metadata. Reuse only the last required capacity,
+    /// not a second tree: the normal fill call constructs the Rust snapshot once.
+    /// Growth reports the required count before writing and permits one retry.
     var accessibilitySemanticNodesIfAvailable: [NativeAccessibilitySemanticNode]? {
         let revision = self.revision
-        // count/fill 的长度查询形式：空指针 + 0 容量只回填数量。
-        var count = 0
-        let countStatus = yu_storage_session_accessibility_semantic_nodes_v2(
-            handle,
-            revision,
-            nil,
-            0,
-            &count
-        )
-        guard countStatus == StorageStatus.ok else { return nil }
-
-        var values = Array(repeating: YuStorageAccessibilityNodeV2(), count: count)
+        var values = Array(repeating: YuStorageAccessibilityNodeV2(), count: accessibilityNodeCapacity)
         var written = 0
-        let status = values.withUnsafeMutableBufferPointer { buffer in
-            yu_storage_session_accessibility_semantic_nodes_v2(
-                handle,
-                revision,
-                buffer.baseAddress,
-                buffer.count,
-                &written
-            )
+        func fill() -> Int32 {
+            values.withUnsafeMutableBufferPointer { buffer in
+                yu_storage_session_accessibility_semantic_nodes_v2(
+                    handle, revision, buffer.baseAddress, buffer.count, &written
+                )
+            }
         }
-        guard status == StorageStatus.ok, written == count else { return nil }
-        return values.map(NativeAccessibilitySemanticNode.init)
+        var status = fill()
+        if status == Int32(YU_STORAGE_BUFFER_TOO_SMALL), written > values.count {
+            values = Array(repeating: YuStorageAccessibilityNodeV2(), count: written)
+            status = fill()
+        }
+        guard status == StorageStatus.ok, written >= 0, written <= values.count else { return nil }
+        accessibilityNodeCapacity = max(written, 1)
+        return values.prefix(written).map(NativeAccessibilitySemanticNode.init)
     }
 
     /// 这一版的大纲：文档里全部标题，按文档顺序（也就是前序），带层级、
@@ -1272,6 +1376,7 @@ final class StorageBridge {
         let revision = self.revision
         var count = 0
         var textLength = 0
+        var styleCount = 0
         let countStatus = yu_storage_session_outline_items(
             handle,
             revision,
@@ -1280,7 +1385,7 @@ final class StorageBridge {
             &count,
             nil,
             0,
-            &textLength
+            &textLength, nil, 0, &styleCount
         )
         guard countStatus == StorageStatus.ok else { return nil }
         guard count > 0 else { return [] }
@@ -1289,24 +1394,29 @@ final class StorageBridge {
         var text = [UInt8](repeating: 0, count: textLength)
         var written = 0
         var textWritten = 0
+        var styles = Array(repeating: YuStorageOutlineStyleRun(), count: styleCount)
+        var stylesWritten = 0
         let status = values.withUnsafeMutableBufferPointer { buffer in
             text.withUnsafeMutableBufferPointer { textBuffer in
-                yu_storage_session_outline_items(
-                    handle,
-                    revision,
-                    buffer.baseAddress,
-                    buffer.count,
-                    &written,
-                    textBuffer.baseAddress,
-                    textBuffer.count,
-                    &textWritten
-                )
+                styles.withUnsafeMutableBufferPointer { styleBuffer in
+                    yu_storage_session_outline_items(
+                        handle,
+                        revision,
+                        buffer.baseAddress,
+                        buffer.count,
+                        &written,
+                        textBuffer.baseAddress,
+                        textBuffer.count,
+                        &textWritten,
+                        styleBuffer.baseAddress, styleBuffer.count, &stylesWritten
+                    )
+                }
             }
         }
-        guard status == StorageStatus.ok, written == count, textWritten == textLength else {
+        guard status == StorageStatus.ok, written == count, textWritten == textLength, stylesWritten == styleCount else {
             return nil
         }
-        return values.map { NativeOutlineItem($0, text: text) }
+        return values.map { NativeOutlineItem($0, text: text, styles: styles) }
     }
 
     /// 换一份查询。空串留下一份 0 个匹配的状态；`nil` 收掉搜索与高亮。
@@ -1445,17 +1555,18 @@ final class StorageBridge {
     /// **不在这里排序、不在这里合并。** 归一化归 Rust 的 `Selections` 一家做
     /// ——平台这边送逆序的、重叠的、同一个偏移两次的都行（⌥ 点在一段选区里就是
     /// 最后那种）。自己先排一遍就是仓库里的第二份合并实现，而两份合并必定分叉。
-    func setSelections(_ ranges: [NSRange], primary: Int, affinity: UInt8 = 1) throws {
-        guard !ranges.isEmpty, primary >= 0, primary < ranges.count else {
+    func setSelections(_ ranges: [NSRange], primary: Int, affinity: UInt8 = 1, affinities: [UInt8]? = nil) throws {
+        guard !ranges.isEmpty, primary >= 0, primary < ranges.count,
+              affinities == nil || affinities?.count == ranges.count else {
             throw BridgeError.operation(StorageStatus.invalidSelection)
         }
         let current = revision
-        let entries = ranges.map { range in
+        let entries = ranges.enumerated().map { index, range in
             YuStorageSelectionEndpoints(
                 revision: current,
                 anchor_utf16: UInt64(range.location),
                 focus_utf16: UInt64(range.location + range.length),
-                affinity: affinity
+                affinity: affinities?[index] ?? affinity
             )
         }
         let status = entries.withUnsafeBufferPointer { buffer in
@@ -1485,6 +1596,67 @@ final class StorageBridge {
         }
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
         return NativeCommandResult(result)
+    }
+
+    func pasteClipboardText(_ text: String, tabular: Bool) throws -> NativeCommandResult {
+        let bytes = Array(text.utf8)
+        var result = YuStorageCommandResult()
+        let status = bytes.withUnsafeBufferPointer { buffer in
+            yu_storage_session_paste_text(handle, revision, buffer.baseAddress, buffer.count,
+                UInt8(tabular ? YU_STORAGE_PASTE_TABULAR_TEXT : YU_STORAGE_PASTE_PLAIN_TEXT), &result)
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return NativeCommandResult(result)
+    }
+
+    func pasteFragments(_ fragments: [String], columns: Int = 0) throws -> NativeCommandResult {
+        var bytes: [UInt8] = []
+        var ends: [Int] = []
+        for fragment in fragments {
+            bytes.append(contentsOf: fragment.utf8)
+            ends.append(bytes.count)
+        }
+        var result = YuStorageCommandResult()
+        let status = bytes.withUnsafeBufferPointer { text in
+            ends.withUnsafeBufferPointer { offsets in
+                yu_storage_session_paste_fragments(
+                    handle, revision, text.baseAddress, text.count,
+                    offsets.baseAddress, offsets.count, columns, &result
+                )
+            }
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return NativeCommandResult(result)
+    }
+
+    var tableSelectionColumns: Int {
+        var columns = 0
+        let status = yu_storage_session_table_selection_columns(handle, revision, &columns)
+        return status == StorageStatus.ok ? columns : 0
+    }
+
+    func selectTableCells(anchor: Int, focus: Int, revision: UInt64) throws {
+        guard anchor >= 0, focus >= 0 else { throw BridgeError.clipboard }
+        let status = yu_storage_session_select_table_cells(handle, revision, UInt64(anchor), UInt64(focus))
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    func copySelectionMarkdown(revision: UInt64) throws -> String {
+        try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_selection(handle, revision, UInt8(YU_STORAGE_CLIPBOARD_MARKDOWN), output, capacity, written)
+        }
+    }
+
+    func copySelectionFragments(revision: UInt64) throws -> [String] {
+        guard let selections = selectionsIfAvailable else { throw BridgeError.clipboard }
+        let cells = tableSelectionColumns > 0
+        return try selections.ranges.filter { cells || $0.range.length > 0 }.map { selection in
+            guard selection.revision == revision,
+                  let source = copySourceRangeIfAvailable(selection.range, revision: revision) else {
+                throw BridgeError.clipboard
+            }
+            return source
+        }
     }
 
     func executeCommand(_ command: UInt8, block: UInt64 = 0) throws -> NativeCommandResult {
@@ -1734,6 +1906,74 @@ final class StorageBridge {
         return String(decoding: bytes.prefix(written), as: UTF8.self)
     }
 
+    func saveAs(_ url: URL, replaceExisting: Bool) throws {
+        let bytes = Array(url.path.utf8)
+        let status = bytes.withUnsafeBufferPointer {
+            yu_storage_session_save_as(handle, $0.baseAddress, $0.count, replaceExisting ? 1 : 0)
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        openedPath = path
+    }
+
+    func writeRecovery(in root: URL) throws {
+        try recoveryAction(0, root: root)
+    }
+
+    func clearRecovery(in root: URL) throws {
+        try recoveryAction(1, root: root)
+    }
+
+    private func recoveryAction(_ action: UInt8, root: URL) throws {
+        let bytes = Array(root.path.utf8)
+        let status = bytes.withUnsafeBufferPointer {
+            yu_storage_session_recovery(handle, $0.baseAddress, $0.count, action)
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    func recoveryURL(in root: URL) throws -> URL {
+        try Self.recoveryURL(for: URL(fileURLWithPath: path), in: root)
+    }
+
+    static func recoveryURL(for target: URL, in root: URL) throws -> URL {
+        let rootBytes = Array(root.path.utf8)
+        let targetBytes = Array(target.path.utf8)
+        return try rootBytes.withUnsafeBufferPointer { rootBuffer in
+            try targetBytes.withUnsafeBufferPointer { targetBuffer in
+                var count = 0
+                let measured = yu_storage_recovery_copy_path(rootBuffer.baseAddress, rootBuffer.count,
+                    targetBuffer.baseAddress, targetBuffer.count, nil, 0, &count)
+                guard measured == StorageStatus.ok, count > 0 else { throw BridgeError.operation(measured) }
+                var bytes = [UInt8](repeating: 0, count: count)
+                let status = bytes.withUnsafeMutableBufferPointer {
+                    yu_storage_recovery_copy_path(rootBuffer.baseAddress, rootBuffer.count,
+                        targetBuffer.baseAddress, targetBuffer.count, $0.baseAddress, $0.count, &count)
+                }
+                guard status == StorageStatus.ok, count > 0, count <= bytes.count else { throw BridgeError.operation(status) }
+                return URL(fileURLWithPath: String(decoding: bytes.prefix(count), as: UTF8.self))
+            }
+        }
+    }
+
+    static func recoveryTarget(at record: URL) throws -> URL {
+        let path = Array(record.path.utf8)
+        return try path.withUnsafeBufferPointer { buffer in
+            var length = 0
+            let measured = yu_storage_recovery_copy_target(buffer.baseAddress, buffer.count, nil, 0, &length)
+            guard measured == StorageStatus.ok, length > 0 else { throw BridgeError.operation(measured) }
+            var bytes = [UInt8](repeating: 0, count: length)
+            let status = bytes.withUnsafeMutableBufferPointer {
+                yu_storage_recovery_copy_target(buffer.baseAddress, buffer.count, $0.baseAddress, $0.count, &length)
+            }
+            guard status == StorageStatus.ok, length > 0, length <= bytes.count else { throw BridgeError.operation(status) }
+            return URL(fileURLWithPath: String(decoding: bytes.prefix(length), as: UTF8.self))
+        }
+    }
+
+    func abortClose() {
+        _ = yu_storage_session_close_resolve(handle, UInt8(YU_STORAGE_CLOSE_RESOLVE_ABORT))
+    }
+
     func save() throws {
         var revision: UInt64 = 0
         var bytes: Int = 0
@@ -1842,6 +2082,7 @@ enum BridgeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .open(let status): return "无法打开 Markdown 文件（Rust status \(status)）"
+        case .operation(24): return "无法粘贴表格：行列数量、目标区域或单元格内容不合法。文档未修改。"
         case .operation(let status): return "文档操作失败（Rust status \(status)）"
         case .clipboard: return "无法访问 macOS 剪贴板"
         case .watcher(let status):
