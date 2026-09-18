@@ -90,4 +90,9 @@ else
     platform/macos/yu-shell-macos/run-self-checks.sh --build
 fi
 
+if [[ "${1:-}" == "--release" ]]; then
+    step "macOS arm64 release"
+    platform/macos/yu-shell-macos/build-app.sh --release
+fi
+
 printf "\n\033[1;32m✓ 全部验证通过\033[0m\n"

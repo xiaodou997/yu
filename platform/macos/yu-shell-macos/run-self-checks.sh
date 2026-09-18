@@ -30,14 +30,12 @@ swiftc -module-cache-path /tmp/yu-scroll-swift-cache \
 # 用 --clean-build 验证。
 if [[ "${1:-}" == "--clean-build" ]]; then
     rm -rf .build
-    ./build-rust-ffi.sh >/dev/null
-    swift build >/dev/null
+    ./build-app.sh >/dev/null
 elif [[ "${1:-}" == "--build" ]]; then
-    ./build-rust-ffi.sh >/dev/null
-    swift build >/dev/null
+    ./build-app.sh >/dev/null
 fi
 
-binary="$(swift build --show-bin-path 2>/dev/null)/Yu"
+binary="$host_dir/.build/Yu.app/Contents/MacOS/Yu"
 if [[ ! -x "$binary" ]]; then
     print -r -- "未找到可执行文件 $binary，请先运行 $0 --build" >&2
     exit 1

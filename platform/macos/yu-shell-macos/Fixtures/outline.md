@@ -45,3 +45,9 @@ Setext 的 label 里有换行，面板上折成一行。
 ### 越级回来
 
 最后一段。
+
+אבג def דהו xyz
+
+> | Table P1 A | Table P1 B |
+> | :--- | ---: |
+> | Table P1 left | Table P1 right |
