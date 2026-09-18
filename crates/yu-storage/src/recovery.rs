@@ -7,10 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use yu_core::Revision;
 
-use super::{DocumentSession, Utf8Bom, fnv1a};
+use super::{DocumentSession, FileFingerprint, Utf8Bom, fnv1a};
+use std::time::{Duration, UNIX_EPOCH};
 
-const MAGIC: &[u8; 8] = b"YURECOV1";
-const FORMAT_VERSION: u16 = 1;
+const MAGIC: &[u8; 8] = b"YURECOV2";
+const FORMAT_VERSION: u16 = 2;
 const CHECKSUM_BYTES: usize = std::mem::size_of::<u64>();
 const MAX_RECOVERY_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TARGET_PATH_BYTES: u64 = 1024 * 1024;
@@ -55,6 +56,8 @@ impl RecoveryStore {
 
         let record = RecoveryRecord {
             target_path: session.path().to_path_buf(),
+            storage_path: session.storage_path.clone(),
+            expected_file: session.expected_file.clone(),
             source: session.editor().snapshot().as_str().to_owned(),
             revision: session.revision(),
             saved_revision: session.saved_revision(),
@@ -124,6 +127,8 @@ impl RecoveryStore {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryRecord {
     target_path: PathBuf,
+    storage_path: PathBuf,
+    expected_file: Option<FileFingerprint>,
     source: String,
     revision: Revision,
     saved_revision: Revision,
@@ -131,6 +136,36 @@ pub struct RecoveryRecord {
 }
 
 impl RecoveryRecord {
+    /// Read one bounded, checksummed envelope discovered by a native host.
+    pub fn read(path: &Path) -> Result<Self, RecoveryError> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| RecoveryError::io("stat recovery", path.to_path_buf(), error))?;
+        if metadata.len() > MAX_RECOVERY_FILE_BYTES {
+            return Err(RecoveryError::TooLarge {
+                path: path.to_path_buf(),
+                bytes: metadata.len(),
+            });
+        }
+        let bytes = fs::read(path)
+            .map_err(|error| RecoveryError::io("read recovery", path.to_path_buf(), error))?;
+        decode(path, &bytes)
+    }
+
+    pub(crate) fn into_document(self) -> DocumentSession {
+        let editor = yu_editor::EditorDocument::new(self.source);
+        let saved_revision = editor.revision();
+        DocumentSession {
+            path: self.target_path,
+            storage_path: self.storage_path,
+            editor,
+            bom: self.bom,
+            saved_revision,
+            expected_file: self.expected_file,
+            recovered_dirty: true,
+            table_width_store: None,
+        }
+    }
+
     #[must_use]
     pub fn target_path(&self) -> &Path {
         &self.target_path
@@ -268,6 +303,13 @@ fn target_text(target: &Path) -> Result<&str, RecoveryError> {
 fn encode(record: &RecoveryRecord) -> Result<Vec<u8>, RecoveryError> {
     let target = target_text(&record.target_path)?.as_bytes();
     let source = record.source.as_bytes();
+    let storage = target_text(&record.storage_path)?.as_bytes();
+    if storage.len() as u64 > MAX_TARGET_PATH_BYTES {
+        return Err(RecoveryError::TooLarge {
+            path: record.storage_path.clone(),
+            bytes: storage.len() as u64,
+        });
+    }
     let target_len = u64::try_from(target.len()).map_err(|_| RecoveryError::TooLarge {
         path: record.target_path.clone(),
         bytes: target.len() as u64,
@@ -282,13 +324,13 @@ fn encode(record: &RecoveryRecord) -> Result<Vec<u8>, RecoveryError> {
             bytes: target_len,
         });
     }
-    let payload_len =
-        target_len
-            .checked_add(source_len)
-            .ok_or_else(|| RecoveryError::TooLarge {
-                path: record.target_path.clone(),
-                bytes: u64::MAX,
-            })?;
+    let payload_len = target_len
+        .checked_add(source_len)
+        .and_then(|length| length.checked_add(storage.len() as u64))
+        .ok_or_else(|| RecoveryError::TooLarge {
+            path: record.target_path.clone(),
+            bytes: u64::MAX,
+        })?;
     if payload_len > MAX_RECOVERY_FILE_BYTES {
         return Err(RecoveryError::TooLarge {
             path: record.target_path.clone(),
@@ -316,7 +358,29 @@ fn encode(record: &RecoveryRecord) -> Result<Vec<u8>, RecoveryError> {
     bytes.extend_from_slice(&record.saved_revision.get().to_le_bytes());
     bytes.extend_from_slice(&target_len.to_le_bytes());
     bytes.extend_from_slice(&source_len.to_le_bytes());
+    bytes.extend_from_slice(&(storage.len() as u64).to_le_bytes());
+    match &record.expected_file {
+        None => bytes.push(0),
+        Some(fingerprint) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&fingerprint.length.to_le_bytes());
+            bytes.extend_from_slice(&fingerprint.content_hash.to_le_bytes());
+            match fingerprint.modified {
+                None => bytes.push(0),
+                Some(time) => {
+                    let (sign, duration) = match time.duration_since(UNIX_EPOCH) {
+                        Ok(duration) => (1, duration),
+                        Err(error) => (2, error.duration()),
+                    };
+                    bytes.push(sign);
+                    bytes.extend_from_slice(&duration.as_secs().to_le_bytes());
+                    bytes.extend_from_slice(&duration.subsec_nanos().to_le_bytes());
+                }
+            }
+        }
+    }
     bytes.extend_from_slice(target);
+    bytes.extend_from_slice(storage);
     bytes.extend_from_slice(source);
     bytes.extend_from_slice(&fnv1a(&bytes).to_le_bytes());
     Ok(bytes)
@@ -386,6 +450,57 @@ fn decode(path: &Path, bytes: &[u8]) -> Result<RecoveryRecord, RecoveryError> {
     let source_len = take(bytes, &mut cursor, 8)
         .and_then(read_u64)
         .ok_or_else(|| invalid_format(path, "missing source length"))?;
+    let storage_len = take(bytes, &mut cursor, 8)
+        .and_then(read_u64)
+        .ok_or_else(|| invalid_format(path, "missing storage path length"))?;
+    if storage_len > MAX_TARGET_PATH_BYTES {
+        return Err(invalid_format(path, "storage path too long"));
+    }
+    let expected_file = match take(bytes, &mut cursor, 1) {
+        Some([0]) => None,
+        Some([1]) => {
+            let length = take(bytes, &mut cursor, 8)
+                .and_then(read_u64)
+                .ok_or_else(|| invalid_format(path, "missing disk length"))?;
+            let content_hash = take(bytes, &mut cursor, 8)
+                .and_then(read_u64)
+                .ok_or_else(|| invalid_format(path, "missing disk hash"))?;
+            let sign = take(bytes, &mut cursor, 1)
+                .and_then(|b| b.first().copied())
+                .ok_or_else(|| invalid_format(path, "missing modification time flag"))?;
+            let modified = match sign {
+                0 => None,
+                1 | 2 => {
+                    let seconds = take(bytes, &mut cursor, 8)
+                        .and_then(read_u64)
+                        .ok_or_else(|| invalid_format(path, "missing time seconds"))?;
+                    let nanos = take(bytes, &mut cursor, 4)
+                        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                        .map(u32::from_le_bytes)
+                        .ok_or_else(|| invalid_format(path, "missing time nanos"))?;
+                    if nanos >= 1_000_000_000 {
+                        return Err(invalid_format(path, "invalid time nanos"));
+                    }
+                    let duration = Duration::new(seconds, nanos);
+                    Some(
+                        if sign == 1 {
+                            UNIX_EPOCH.checked_add(duration)
+                        } else {
+                            UNIX_EPOCH.checked_sub(duration)
+                        }
+                        .ok_or_else(|| invalid_format(path, "time out of range"))?,
+                    )
+                }
+                _ => return Err(invalid_format(path, "invalid modification time flag")),
+            };
+            Some(FileFingerprint {
+                length,
+                modified,
+                content_hash,
+            })
+        }
+        _ => return Err(invalid_format(path, "invalid disk fingerprint flag")),
+    };
     if target_len > MAX_TARGET_PATH_BYTES {
         return Err(RecoveryError::TooLarge {
             path: path.to_path_buf(),
@@ -394,6 +509,7 @@ fn decode(path: &Path, bytes: &[u8]) -> Result<RecoveryRecord, RecoveryError> {
     }
     let payload_len = target_len
         .checked_add(source_len)
+        .and_then(|length| length.checked_add(storage_len))
         .ok_or_else(|| invalid_format(path, "payload length overflow"))?;
     if payload_len > MAX_RECOVERY_FILE_BYTES {
         return Err(RecoveryError::TooLarge {
@@ -418,6 +534,15 @@ fn decode(path: &Path, bytes: &[u8]) -> Result<RecoveryRecord, RecoveryError> {
         usize::try_from(source_len).map_err(|_| invalid_format(path, "source length overflow"))?;
     let target_bytes = take(bytes, &mut cursor, target_len)
         .ok_or_else(|| invalid_format(path, "missing target path"))?;
+    let storage_bytes = take(
+        bytes,
+        &mut cursor,
+        usize::try_from(storage_len)
+            .map_err(|_| invalid_format(path, "storage length overflow"))?,
+    )
+    .ok_or_else(|| invalid_format(path, "missing storage path"))?;
+    let storage = String::from_utf8(storage_bytes.to_vec())
+        .map_err(|_| invalid_format(path, "storage path is not UTF-8"))?;
     let source_bytes = take(bytes, &mut cursor, source_len)
         .ok_or_else(|| invalid_format(path, "missing source"))?;
     let target = String::from_utf8(target_bytes.to_vec())
@@ -426,6 +551,8 @@ fn decode(path: &Path, bytes: &[u8]) -> Result<RecoveryRecord, RecoveryError> {
         .map_err(|_| invalid_format(path, "source is not UTF-8"))?;
     Ok(RecoveryRecord {
         target_path: PathBuf::from(target),
+        storage_path: PathBuf::from(storage),
+        expected_file,
         source,
         revision,
         saved_revision,

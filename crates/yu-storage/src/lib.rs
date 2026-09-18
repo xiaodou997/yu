@@ -27,13 +27,16 @@ use yu_text::{AppliedTransaction, TextSnapshot, Transaction};
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 mod close;
+mod document_lifecycle;
 mod recovery;
+mod table_width_store;
 mod watch;
 
 pub use close::{
     ClosePrompt, CloseRequest, CloseState, CloseStateError, CloseStateMachine, CloseTransition,
 };
 pub use recovery::{RecoveryError, RecoveryOutcome, RecoveryRecord, RecoveryStore};
+pub use table_width_store::{TableWidthStore, TableWidthStoreOutcome};
 pub use watch::{FileWatchCheck, FileWatchDebouncer, FileWatchEvent, FileWatchReason};
 
 /// Whether a loaded UTF-8 file contained the standard UTF-8 BOM.
@@ -113,6 +116,8 @@ pub struct DocumentSession {
     bom: Utf8Bom,
     saved_revision: Revision,
     expected_file: Option<FileFingerprint>,
+    recovered_dirty: bool,
+    table_width_store: Option<TableWidthStore>,
 }
 
 impl fmt::Debug for DocumentSession {
@@ -152,6 +157,8 @@ impl DocumentSession {
             bom,
             saved_revision,
             expected_file: Some(fingerprint),
+            recovered_dirty: false,
+            table_width_store: None,
         })
     }
 
@@ -170,6 +177,8 @@ impl DocumentSession {
             bom: Utf8Bom::Absent,
             saved_revision,
             expected_file: None,
+            recovered_dirty: false,
+            table_width_store: None,
         }
     }
 
@@ -451,7 +460,9 @@ impl DocumentSession {
     /// the persisted boundary.
     #[must_use]
     pub fn is_dirty(&self) -> bool {
-        self.expected_file.is_none() || self.revision() != self.saved_revision
+        self.recovered_dirty
+            || self.expected_file.is_none()
+            || self.revision() != self.saved_revision
     }
 
     /// Compares the current path with the fingerprint captured on open/save.
@@ -570,6 +581,23 @@ impl DocumentSession {
         self.editor.cancel_composition()
     }
 
+    /// Attach application-owned presentation storage and restore matching state.
+    pub fn set_table_width_store(
+        &mut self,
+        root: impl Into<PathBuf>,
+    ) -> Result<TableWidthStoreOutcome, StorageError> {
+        let store = TableWidthStore::new(root);
+        self.table_width_store = Some(store.clone());
+        store.restore(self)
+    }
+
+    pub fn persist_table_widths(&self) -> Result<TableWidthStoreOutcome, StorageError> {
+        match &self.table_width_store {
+            Some(store) => store.write(self),
+            None => Ok(TableWidthStoreOutcome::Unchanged),
+        }
+    }
+
     /// Saves the canonical source via a same-directory temporary file and
     /// atomic rename. A changed/missing target is never overwritten.
     pub fn save(&mut self) -> Result<SaveOutcome, StorageError> {
@@ -591,17 +619,20 @@ impl DocumentSession {
         }
 
         if !self.is_dirty() {
+            self.persist_table_widths()?;
             return Ok(SaveOutcome::Unchanged {
                 revision: self.revision(),
             });
         }
 
         let bytes = serialize_source(self.editor.snapshot().as_str(), self.bom);
-        atomic_replace(&self.storage_path, &bytes)?;
+        atomic_replace(&self.storage_path, &bytes, self.expected_file.as_ref())?;
         let metadata = fs::metadata(&self.storage_path)
             .map_err(|source| StorageError::io("stat", &self.storage_path, source))?;
         self.expected_file = Some(FileFingerprint::from_bytes(&bytes, &metadata));
         self.saved_revision = self.revision();
+        self.recovered_dirty = false;
+        self.persist_table_widths()?;
         Ok(SaveOutcome::Saved {
             revision: self.saved_revision,
             bytes_written: bytes.len(),
@@ -630,6 +661,10 @@ impl DocumentSession {
         self.bom = bom;
         self.saved_revision = self.editor.revision();
         self.expected_file = Some(fingerprint);
+        self.recovered_dirty = false;
+        if let Some(store) = self.table_width_store.clone() {
+            store.restore(self)?;
+        }
         Ok(ReloadOutcome {
             revision: self.saved_revision,
             bom,
@@ -1033,7 +1068,11 @@ fn serialize_source(source: &str, bom: Utf8Bom) -> Vec<u8> {
     bytes
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+fn atomic_replace(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<&FileFingerprint>,
+) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -1061,6 +1100,19 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     if let Some(permissions) = existing_permissions {
         fs::set_permissions(&temp_path, permissions)
             .map_err(|source| StorageError::io("set temporary permissions", &temp_path, source))?;
+    }
+    // Recheck after staging, before replacement. This also protects a new
+    // destination that appeared while the temporary file was being written.
+    let current = current_fingerprint(path)?;
+    if current.as_ref() != expected {
+        return Err(StorageError::ExternalChange {
+            path: path.to_path_buf(),
+            state: if current.is_none() {
+                ExternalFileState::Missing
+            } else {
+                ExternalFileState::Changed
+            },
+        });
     }
     fs::rename(&temp_path, path)
         .map_err(|source| StorageError::io("atomic rename", path, source))?;

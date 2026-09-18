@@ -30,6 +30,8 @@ enum {
     YU_STORAGE_TABLE_RESIZE_NOT_ACTIVE = 22,
     /* Temporary presentation backpressure; retry the latest geometry later. */
     YU_STORAGE_RENDER_BUSY = 23,
+    YU_STORAGE_INVALID_TABLE_PASTE = 24,
+    YU_STORAGE_INVALID_RECOVERY = 25,
 };
 
 enum {
@@ -54,6 +56,30 @@ enum {
     YU_STORAGE_COMMAND_MOVE_DOWN = 14,
     YU_STORAGE_COMMAND_MOVE_UP_EXTEND = 15,
     YU_STORAGE_COMMAND_MOVE_DOWN_EXTEND = 16,
+    YU_STORAGE_COMMAND_MOVE_LEFT_EXTEND = 17,
+    YU_STORAGE_COMMAND_MOVE_RIGHT_EXTEND = 18,
+    YU_STORAGE_COMMAND_MOVE_WORD_LEFT_EXTEND = 19,
+    YU_STORAGE_COMMAND_MOVE_WORD_RIGHT_EXTEND = 20,
+    YU_STORAGE_COMMAND_MOVE_DOCUMENT_START = 21,
+    YU_STORAGE_COMMAND_MOVE_DOCUMENT_END = 22,
+    YU_STORAGE_COMMAND_MOVE_DOCUMENT_START_EXTEND = 23,
+    YU_STORAGE_COMMAND_MOVE_DOCUMENT_END_EXTEND = 24,
+    YU_STORAGE_COMMAND_TABLE_NEXT = 25,
+    YU_STORAGE_COMMAND_TABLE_PREVIOUS = 26,
+    YU_STORAGE_COMMAND_DELETE_SELECTIONS = 27,
+    YU_STORAGE_COMMAND_TABLE_INSERT_ROW_BEFORE = 28,
+    YU_STORAGE_COMMAND_TABLE_INSERT_ROW_AFTER = 29,
+    YU_STORAGE_COMMAND_TABLE_DELETE_ROW = 30,
+    YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_BEFORE = 31,
+    YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_AFTER = 32,
+    YU_STORAGE_COMMAND_TABLE_DELETE_COLUMN = 33,
+    YU_STORAGE_COMMAND_TABLE_ALIGN_LEFT = 34,
+    YU_STORAGE_COMMAND_TABLE_ALIGN_CENTER = 35,
+    YU_STORAGE_COMMAND_TABLE_ALIGN_RIGHT = 36,
+    YU_STORAGE_COMMAND_TABLE_ALIGN_DEFAULT = 37,
+    YU_STORAGE_COMMAND_DELETE_WORD_BACKWARD = 38,
+    YU_STORAGE_COMMAND_DELETE_WORD_FORWARD = 39,
+
 };
 
 enum {
@@ -107,12 +133,15 @@ enum {
 enum {
     YU_STORAGE_APPEARANCE_LIGHT = 0,
     YU_STORAGE_APPEARANCE_DARK = 1,
+    YU_STORAGE_THEME_YU_LIGHT = 2,
+    YU_STORAGE_THEME_YU_DARK = 3,
 };
 
 /* Clipboard payload format for yu_storage_session_copy_selection. */
 enum {
     YU_STORAGE_CLIPBOARD_TEXT = 0,
     YU_STORAGE_CLIPBOARD_HTML = 1,
+    YU_STORAGE_CLIPBOARD_MARKDOWN = 2,
 };
 
 /* Which axis a table divider belongs to. */
@@ -164,6 +193,7 @@ enum {
     YU_STORAGE_CLOSE_RESOLVE_CANCEL = 0,
     YU_STORAGE_CLOSE_RESOLVE_SAVE = 1,
     YU_STORAGE_CLOSE_RESOLVE_DISCARD = 2,
+    YU_STORAGE_CLOSE_RESOLVE_ABORT = 3,
 };
 
 enum {
@@ -279,7 +309,7 @@ typedef struct YuStorageCompositionProjection {
 
 
 /* Revision/generation-bound shaped caret geometry for the active
- * marked-text projection. caret_x/caret_y are local to block_index; visual
+ * marked-text projection. caret_x/caret_y use document content coordinates; visual
  * UTF-16 ranges remain in the full transient projected stream. */
 typedef struct YuStorageCompositionShapedCaret {
     uint64_t revision;
@@ -367,7 +397,9 @@ typedef struct YuStorageTableResizeCommit {
 
 
 
-/* Revision-bound source caret resolved through one block-local layout. */
+/* Revision-bound source caret from the shared layout snapshot.
+ * caret_x/caret_y use document content coordinates, excluding reading-column
+ * padding; caret_height is the actual shaped line height. */
 typedef struct YuStorageBlockCaret {
     uint64_t revision;
     uint64_t source_utf16;
@@ -464,6 +496,7 @@ typedef struct YuStorageMacosRenderHostSnapshot {
      * drain its worker results; it does not classify resource states itself. */
     uint8_t resource_refresh_pending;
     uint8_t resource_retry_pending;
+    uint8_t layout_pending;
 } YuStorageMacosRenderHostSnapshot;
 
 typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
@@ -496,6 +529,7 @@ typedef struct YuStorageMacosRenderHostSurfaceSnapshot {
     uint64_t highlighted_glyph_count;
     uint8_t resource_refresh_pending;
     uint8_t resource_retry_pending;
+    uint8_t layout_pending;
     /* Rendered document height for this frame. The scrollable extent must come
      * from here: the platform has no second layout to derive it from (I5). */
     float content_height;
@@ -540,6 +574,14 @@ typedef struct YuStorageAccessibilityNodeV2 {
  * 导航不另开入口：拿 label_start_utf16 调
  * yu_storage_session_set_selection_endpoints，再调
  * yu_storage_session_shaped_caret_scroll_request。 */
+/* Label-relative UTF-16 runs; traits: bold=1, italic=2, code=4. */
+typedef struct YuStorageOutlineStyleRun {
+    uint64_t start_utf16;
+    uint64_t end_utf16;
+    uint8_t traits;
+    uint8_t reserved[7];
+} YuStorageOutlineStyleRun;
+
 typedef struct YuStorageOutlineItem {
     uint64_t revision;
     uint32_t index;
@@ -564,6 +606,8 @@ typedef struct YuStorageOutlineItem {
      * ——在文首插一条标题会把每一条的 index 与 block 一起推后。 */
     uint64_t identity_utf8_offset;
     uint64_t identity_utf8_length;
+    uint64_t style_offset;
+    uint64_t style_count;
 } YuStorageOutlineItem;
 
 /* 结果面板上的一行：一处命中，加上它显示成的那行字。
@@ -605,8 +649,24 @@ typedef struct YuStorageCompositionState {
     uint8_t active;
 } YuStorageCompositionState;
 
+/* Configure the compiled Metal library before a surface is attached. */
+int32_t yu_storage_session_trim_render_caches(YuStorageSession *session);
+int32_t yu_storage_session_set_shader_library(YuStorageSession *session, const uint8_t *path, size_t length);
+int32_t yu_storage_session_set_source_mode(YuStorageSession *session, uint8_t enabled);
+
+/* Document lifecycle: create does not write a file; recovery restores the original disk baseline. */
+int32_t yu_storage_session_create(const uint8_t *path, size_t path_length, YuStorageSession **output);
+int32_t yu_storage_session_open_recovery(const uint8_t *path, size_t path_length, YuStorageSession **output);
+int32_t yu_storage_recovery_copy_target(const uint8_t *path, size_t path_length, uint8_t *output, size_t capacity, size_t *written);
+/* action: 0 write current recovery, 1 clear current recovery. */
+int32_t yu_storage_session_recovery(const YuStorageSession *session, const uint8_t *root, size_t root_length, uint8_t action);
+int32_t yu_storage_recovery_copy_path(const uint8_t *root, size_t root_length, const uint8_t *target, size_t target_length, uint8_t *output, size_t capacity, size_t *written);
+int32_t yu_storage_session_save_as(YuStorageSession *session, const uint8_t *path, size_t path_length, uint8_t replace_existing);
+
 int32_t yu_storage_session_open(const uint8_t *path, size_t path_length,
                                 YuStorageSession **output);
+int32_t yu_storage_session_set_table_width_store(YuStorageSession *session, const uint8_t *root, size_t root_length);
+int32_t yu_storage_session_persist_table_widths(YuStorageSession *session);
 void yu_storage_session_destroy(YuStorageSession *session);
 
 int32_t yu_storage_session_copy_path(const YuStorageSession *session,
@@ -663,8 +723,8 @@ int32_t yu_storage_session_task_checkbox_hit_test(
     float point_x, float point_y, YuStorageTaskCheckboxHit *output);
 /* Resolves a source caret's shaped geometry without the caller naming a
  * block. The platform needs this for IME candidate-window placement: only the
- * Rust layout knows where the caret is on screen, because TextKit lays out
- * canonical source while the screen shows the projection. */
+ * shared layout snapshot supplies the document-space caret. The native view
+ * applies reading-column and screen transforms exactly once. */
 int32_t yu_storage_session_source_caret(
     YuStorageSession *session, uint64_t expected_revision,
     uint64_t source_utf16, uint8_t affinity,
@@ -710,6 +770,11 @@ typedef struct YuStorageFrameGeometry {
  * equivalent to the frame already on screen. Revision, composition generation
  * and geometry must all match; marked-text updates do not advance the
  * Revision, so the generation participates in the comparison. */
+/* Actual CoreAnimation monotonic time; zero until the current source/geometry
+ * has a matching presented submission. */
+int32_t yu_storage_session_frame_presentation_time(
+    YuStorageSession *session, const YuStorageFrameGeometry *geometry,
+    uint8_t appearance, double *out_time);
 int32_t yu_storage_session_frame_is_current(
     YuStorageSession *session, const YuStorageFrameGeometry *geometry,
     uint8_t appearance, uint8_t *out_current);
@@ -761,7 +826,8 @@ int32_t yu_storage_session_accessibility_semantic_nodes_v2(
 int32_t yu_storage_session_outline_items(
     YuStorageSession *session, uint64_t expected_revision,
     YuStorageOutlineItem *items, size_t item_capacity, size_t *item_count,
-    uint8_t *text, size_t text_capacity, size_t *text_length);
+    uint8_t *text, size_t text_capacity, size_t *text_length,
+    YuStorageOutlineStyleRun *styles, size_t style_capacity, size_t *style_count);
 /* 换一份搜索查询，立刻在当前源码上扫出全部匹配。text 传 NULL、text_length
  * 传 0 表示收掉搜索。不校验 Revision：查询与源码正交。 */
 int32_t yu_storage_session_set_search_query(
@@ -794,6 +860,11 @@ int32_t yu_storage_session_set_selection_endpoints(
 /* 全部选区的端点，按文档顺序，外加主选区的下标。两遍协议：output 传 NULL
  * （capacity 为 0）时只把条数写进 written。单数入口
  * yu_storage_session_selection_endpoints 仍然留着，它给的是 primary。 */
+int32_t yu_storage_session_select_table_cells(
+    YuStorageSession *session, uint64_t expected_revision,
+    uint64_t anchor_utf16, uint64_t focus_utf16);
+int32_t yu_storage_session_table_selection_columns(
+    const YuStorageSession *session, uint64_t expected_revision, size_t *columns);
 int32_t yu_storage_session_selections(
     const YuStorageSession *session, uint64_t expected_revision,
     YuStorageSelectionEndpoints *output, size_t capacity, size_t *written,
@@ -816,6 +887,18 @@ int32_t yu_storage_session_insert_text(YuStorageSession *session,
                                         uint64_t expected_revision,
                                         const uint8_t *text, size_t text_length,
                                         YuStorageCommandResult *output);
+enum { YU_STORAGE_PASTE_PLAIN_TEXT = 0, YU_STORAGE_PASTE_TABULAR_TEXT = 1 };
+int32_t yu_storage_session_paste_text(
+    YuStorageSession *session, uint64_t expected_revision,
+    const uint8_t *text, size_t text_length, uint8_t format,
+    YuStorageCommandResult *output);
+/* Concatenated UTF-8 with cumulative fragment end offsets, including the
+ * final text_length. columns=0 distributes source fragments; columns>0 pastes
+ * a row-major table grid. All offsets are validated before the atomic paste. */
+int32_t yu_storage_session_paste_fragments(
+    YuStorageSession *session, uint64_t expected_revision,
+    const uint8_t *text, size_t text_length, const size_t *ends, size_t count, size_t columns,
+    YuStorageCommandResult *output);
 int32_t yu_storage_session_composition(
     const YuStorageSession *session, YuStorageCompositionState *output);
 int32_t yu_storage_session_copy_composition(
@@ -863,5 +946,32 @@ int32_t yu_storage_session_request_close(YuStorageSession *session,
  * negotiation and reports whether the user must be asked. */
 int32_t yu_storage_session_close_resolve(YuStorageSession *session,
                                           uint8_t action);
+
+
+/* Resolved sRGB colors are packed as 0xRRGGBBAA. All lengths are points. */
+typedef struct {
+    uint32_t body_font, heading_font, code_font, heading_bold[6];
+    float heading_letter_spacing[6];
+    float heading_margin_before[6], heading_margin_after[6], paragraph_margin_before;
+    float body_size, body_line_ratio;
+    float heading_sizes[6], heading_lines[6];
+    float paragraph_margin, code_size_ratio, code_block_size_ratio, code_line_ratio;
+    float code_padding_left, code_padding_right, code_padding_top, code_padding_bottom;
+    float code_border_width;
+    uint32_t code_border_color;
+    float code_margin_before, code_margin_after;
+    float table_padding_x, table_padding_y, quote_padding;
+    float quote_padding_right, quote_margin_left, quote_margin_before, quote_margin_after;
+    uint32_t quote_border_color;
+    float quote_border_width, list_indent;
+    float gutter, top, bottom, column_width, sidebar_width;
+    float block_radius, inline_radius;
+    uint32_t background, text, strong_text, sidebar, code_background, inline_background, border, table_border, table_header, table_stripe, link;
+} YuStorageThemeSpec;
+typedef struct {
+    float origin_x, origin_y, content_width, camera_x, camera_y, bottom;
+} YuStorageReadingGeometry;
+int32_t yu_storage_theme_spec(uint8_t appearance, YuStorageThemeSpec *output);
+int32_t yu_storage_reading_geometry(uint8_t appearance, float width, float window_width, float scroll_y, YuStorageReadingGeometry *output);
 
 #endif
