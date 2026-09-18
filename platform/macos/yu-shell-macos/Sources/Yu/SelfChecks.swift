@@ -14,8 +14,216 @@ import YuStorageFFI
 // 调用入口（顶层 CommandLine 分发）必须留在 main.swift——Swift 只允许
 // main.swift 含有顶层可执行语句。
 
+private func checkTableProjectedGrapheme() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-grapheme-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    for (atom, lower, upper) in [("\\*\u{0301}", 0, 3), ("&#32;\u{0301}", 0, 6), ("<br>\u{0301}", 4, 5)] {
+        for forward in [false, true] {
+            let source = "| H |\n| --- |\n| a\(atom)z |"
+            try source.write(to: path, atomically: true, encoding: .utf8)
+            let bridge = try StorageBridge(path: path.path)
+            let view = DocumentTextView(bridge: bridge)
+            let base = (source as NSString).range(of: atom).location
+            let from = base + (forward ? lower : upper)
+            view.navigate(toSource: NSRange(location: from, length: 0))
+            view.doCommand(by: forward ? #selector(NSResponder.moveRight(_:)) : #selector(NSResponder.moveLeft(_:)))
+            precondition(bridge.selection.range == NSRange(location: base + (forward ? upper : lower), length: 0))
+            view.navigate(toSource: NSRange(location: from, length: 0))
+            view.doCommand(by: forward ? #selector(NSResponder.deleteForward(_:)) : #selector(NSResponder.deleteBackward(_:)))
+            let expected = (source as NSString).replacingCharacters(in: NSRange(location: base + lower, length: upper - lower), with: "")
+            precondition(bridge.source == expected, "projected combining sequence split")
+            view.performUndo()
+            precondition(bridge.source == source)
+        }
+    }
+    print("Yu projected table grapheme self-check: escape/entity combining sequences, BR boundary, both arrows/deletion directions and undo passed")
+}
+
+private func checkCellSelectionClipboard() throws {
+    try checkTableProjectedGrapheme()
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-cell-selection-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let source = "| A | B |\n| --- | --- |\n|  | 🪶 |\n"
+    try source.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    let ns = source as NSString
+    try bridge.selectTableCells(anchor: ns.range(of: "A").location, focus: ns.range(of: "🪶").location, revision: bridge.revision)
+    precondition(bridge.tableSelectionColumns == 2 && bridge.selectionsIfAvailable?.ranges.count == 4)
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .string) == "A\tB\n\t🪶")
+    precondition(board.string(forType: .yuMarkdown) == source.trimmingCharacters(in: .newlines))
+    let html = board.string(forType: .yuHTML) ?? ""
+    precondition(html.components(separatedBy: "<td>").count == 5 && html.contains("<td></td>"))
+    view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+    let cleared = "|  |  |\n| --- | --- |\n|  |  |\n"
+    precondition(bridge.source == cleared, "clearing empty cells must not backspace delimiters")
+    view.performUndo()
+    precondition(bridge.source == source && bridge.tableSelectionColumns == 2)
+    view.performRedo()
+    precondition(bridge.source == cleared)
+    let positions = bridge.selectionsIfAvailable!.ranges
+    try bridge.selectTableCells(anchor: positions.first!.range.location, focus: positions.last!.range.location, revision: bridge.revision)
+    try view.pasteFromPasteboardForSelfCheck(board)
+    // Empty cells own the start of their existing padding. Paste inserts there
+    // without rewriting the two existing spaces (undo above restores exact source).
+    let pasted = "|A  |B  |\n| --- | --- |\n|  |🪶  |\n"
+    precondition(bridge.source == pasted, "empty copied fragment lost its cell")
+    view.performUndo()
+    precondition(bridge.source == cleared && bridge.tableSelectionColumns == 2)
+    view.performRedo()
+    precondition(bridge.source == pasted)
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == pasted)
+    // The clipboard carries its own dimensions; a one-cell destination expands
+    // instead of joining the four source fragments into one malformed cell.
+    let targetPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-grid-target-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: targetPath) }
+    let targetSource = "> | H |\r\n> | :--- |\r\n> | z |"
+    try targetSource.write(to: targetPath, atomically: true, encoding: .utf8)
+    let target = try StorageBridge(path: targetPath.path)
+    let targetView = DocumentTextView(bridge: target)
+    let z = (targetSource as NSString).range(of: "z").location
+    try target.selectTableCells(anchor: z, focus: z, revision: target.revision)
+    try targetView.pasteFromPasteboardForSelfCheck(board)
+    let expanded = "> | H |  |\r\n> | :--- | --- |\r\n> | A | B |\r\n> |  | 🪶 |"
+    precondition(target.source == expanded, "grid must expand destination rows and columns")
+    precondition(target.tableSelectionColumns == 2 && target.selectionsIfAvailable?.ranges.count == 4)
+    targetView.performUndo()
+    precondition(target.source == targetSource && target.tableSelectionColumns == 1)
+    targetView.performRedo()
+    precondition(target.source == expanded && target.tableSelectionColumns == 2)
+    try target.save()
+    let targetReopened = try StorageBridge(path: targetPath.path)
+    precondition(targetReopened.source == expanded)
+    let invalidBefore = target.source
+    do {
+        _ = try target.pasteFragments(["one"], columns: 2)
+        preconditionFailure("partial grid row accepted")
+    } catch BridgeError.operation(let status) {
+        precondition(status == 24 && target.source == invalidBefore)
+    }
+    let plainPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-grid-plain-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: plainPath) }
+    try "".write(to: plainPath, atomically: true, encoding: .utf8)
+    let plain = try StorageBridge(path: plainPath.path)
+    let plainView = DocumentTextView(bridge: plain)
+    try plainView.pasteFromPasteboardForSelfCheck(board)
+    precondition(plain.source == source.trimmingCharacters(in: .newlines), "grid pasted outside a table must remain Markdown")
+    plainView.performUndo()
+    precondition(plain.source.isEmpty)
+    print("Yu grid paste clipboard self-check: dimensioned copy, quoted CRLF growth, save/reopen, undo/redo, invalid shape and ordinary-document paste passed")
+    let externalBoard = NSPasteboard.withUniqueName()
+    defer { externalBoard.releaseGlobally() }
+    // No private fragments: these paths exercise external Markdown and accepted
+    // HTML followed by the same source parser and grid transaction in Rust.
+    let externalMarkdown = "| **A** | B |\n| :---: | ---: |\n| x | 🪶 |\n"
+    let externalHTML = "<table><thead><tr><th><strong>A</strong></th><th>B</th></tr></thead><tbody><tr><td>x</td><td>🪶</td></tr></tbody></table>"
+    let externalExpected = "> | H |  |\r\n> | :--- | --- |\r\n> | **A** | B |\r\n> | x | 🪶 |"
+    let directHTML = "<table><tr><td><strong>A</strong></td><td>B</td></tr><tr><td>x</td><td>🪶</td></tr></table>"
+    let bodyOnlyHTML = "<table><tbody><tr><td><strong>A</strong></td><td>B</td></tr><tr><td>x</td><td>🪶</td></tr></tbody></table>"
+    for (format, content) in [(NSPasteboard.PasteboardType.yuMarkdown, externalMarkdown), (.yuHTML, externalHTML), (.yuHTML, directHTML), (.yuHTML, bodyOnlyHTML)] {
+        targetView.performUndo()
+        precondition(target.source == targetSource)
+        externalBoard.clearContents()
+        precondition(externalBoard.setString("plain fallback must not win", forType: .string))
+        precondition(externalBoard.setString(content, forType: format))
+        try targetView.pasteFromPasteboardForSelfCheck(externalBoard)
+        precondition(target.source == externalExpected, "external table was flattened or its delimiter pasted into a cell")
+        precondition(target.tableSelectionColumns == 2 && target.selectionsIfAvailable?.ranges.count == 4)
+        try target.save()
+        let externalReopened = try StorageBridge(path: targetPath.path)
+        precondition(externalReopened.source == externalExpected)
+        targetView.performUndo()
+        precondition(target.source == targetSource)
+        targetView.performRedo()
+        precondition(target.source == externalExpected)
+    }
+    print("Yu external table clipboard self-check: Markdown and thead/direct-tr/tbody HTML precedence, grid growth, CRLF preservation, save/reopen and undo/redo passed")
+    targetView.performUndo()
+    precondition(target.source == targetSource)
+    externalBoard.clearContents()
+    precondition(externalBoard.setString("fallback must not win", forType: .string))
+    precondition(externalBoard.setString("<table><tr><td><p><strong>first<br>second</strong></p><p>third</p></td><td>&lt;br&gt;<br>end</td></tr></table>", forType: .yuHTML))
+    try targetView.pasteFromPasteboardForSelfCheck(externalBoard)
+    let multilineHTMLExpected = "> | H |  |\r\n> | :--- | --- |\r\n> | **first<br>second**<br><br>third | \\<br\\><br>end |"
+    precondition(target.source == multilineHTMLExpected, "HTML multiline table fell back or split rows")
+    let breakStart = (target.source as NSString).range(of: "<br>").location
+    targetView.navigate(toSource: NSRange(location: breakStart, length: 0))
+    targetView.doCommand(by: #selector(NSResponder.moveRight(_:)))
+    precondition(target.selection.range == NSRange(location: breakStart + 4, length: 0))
+    targetView.doCommand(by: #selector(NSResponder.moveLeft(_:)))
+    precondition(target.selection.range == NSRange(location: breakStart, length: 0))
+    targetView.doCommand(by: #selector(NSResponder.moveRightAndModifySelection(_:)))
+    precondition(target.selection.range == NSRange(location: breakStart, length: 4))
+    try target.save()
+    let multilineHTMLReopened = try StorageBridge(path: targetPath.path)
+    precondition(multilineHTMLReopened.source == multilineHTMLExpected)
+    targetView.performUndo()
+    precondition(target.source == targetSource)
+    targetView.performRedo()
+    precondition(target.source == multilineHTMLExpected)
+    targetView.performUndo()
+    precondition(target.source == targetSource)
+    externalBoard.clearContents()
+    precondition(externalBoard.setString("fallback", forType: .string))
+    precondition(externalBoard.setString("\" first\r\nsecond \"\t\"a\tb\"\r\n\"<br>\"\t\" \"", forType: .tabularText))
+    try targetView.pasteFromPasteboardForSelfCheck(externalBoard)
+    let tsvExpected = "> | H |  |\r\n> | :--- | --- |\r\n> | &#32;first<br>second&#32; | a&#9;b |\r\n> | \\<br\\> | &#32; |"
+    precondition(target.source == tsvExpected, "TSV field boundaries or literal data lost")
+    try targetView.copyToPasteboardForSelfCheck(externalBoard)
+    let visibleTSV = "\" first\nsecond \"\t\"a\tb\"\n<br>\t "
+    precondition(externalBoard.string(forType: .string) == visibleTSV)
+    precondition(externalBoard.string(forType: .tabularText) == visibleTSV)
+    // Exercise the external representation alone, without private fragments,
+    // Markdown or HTML masking a broken visible-text roundtrip.
+    externalBoard.clearContents()
+    precondition(externalBoard.setString(visibleTSV, forType: .tabularText))
+    try targetView.pasteFromPasteboardForSelfCheck(externalBoard)
+    precondition(target.source == tsvExpected, "TSV copy/paste changed cell data")
+    precondition(target.tableSelectionColumns == 2 && target.selectionsIfAvailable?.ranges.count == 4)
+    try target.save()
+    let tsvReopened = try StorageBridge(path: targetPath.path)
+    precondition(tsvReopened.source == tsvExpected)
+    targetView.performUndo()
+    precondition(target.source == targetSource)
+    targetView.performRedo()
+    precondition(target.source == tsvExpected)
+    targetView.performUndo()
+    externalBoard.clearContents()
+    precondition(externalBoard.setString("a\tb", forType: .string))
+    try targetView.pasteFromPasteboardForSelfCheck(externalBoard)
+    precondition(target.source == "> | H |  |\r\n> | :--- | --- |\r\n> | a | b |")
+    try plainView.pasteFromPasteboardForSelfCheck(externalBoard)
+    precondition(plain.source == "a\tb", "ordinary document tabs must remain source")
+    plainView.performUndo()
+    targetView.performUndo()
+    externalBoard.clearContents()
+    precondition(externalBoard.setString("\"unclosed", forType: .tabularText))
+    do {
+        try targetView.pasteFromPasteboardForSelfCheck(externalBoard)
+        preconditionFailure("malformed TSV accepted")
+    } catch BridgeError.operation(let status) {
+        precondition(status == 24 && target.source == targetSource)
+    }
+    print("Yu TSV clipboard self-check: quoted multiline/tab/space/literal fields, explicit format precedence, plain-text context, rejection, save and history passed")
+    // A single empty cell is a real selection and can be copied without text.
+    let empty = (pasted as NSString).range(of: "|  |").location + 1
+    try bridge.selectTableCells(anchor: empty, focus: empty, revision: bridge.revision)
+    precondition(view.hasSourceSelection && bridge.tableSelectionColumns == 1)
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .yuMarkdown) == "|  |\n| --- |")
+    view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+    precondition(bridge.source == pasted)
+    print("Yu rectangular cell clipboard self-check: empty cells, TSV/Markdown/HTML, clear, paste, history and save/reopen passed")
+}
+
 func runClipboardSelfCheck(path: String) -> Never {
     do {
+        try checkCellSelectionClipboard()
         let bridge = try StorageBridge(path: path)
         let textView = DocumentTextView(bridge: bridge)
         let pasteboard = NSPasteboard.withUniqueName()
@@ -110,6 +318,68 @@ func runClipboardSelfCheck(path: String) -> Never {
             }
         }
 
+        // Disjoint table cells plus an empty primary caret: copy/cut must
+        // publish all deleted content and never backspace the empty caret.
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("yu-table-cut-\(UUID().uuidString).md")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let original = "| A | B |\n| --- | --- |\n| 中文 | 🪶 |\n\noutside\n"
+        try original.write(to: temporary, atomically: true, encoding: .utf8)
+        let cutBridge = try StorageBridge(path: temporary.path)
+        let cutView = DocumentTextView(bridge: cutBridge)
+        let ns = original as NSString
+        let first = ns.range(of: "中文")
+        let second = ns.range(of: "🪶")
+        let empty = NSRange(location: ns.range(of: "outside").location + 3, length: 0)
+        try cutBridge.setSelections([first, second, empty], primary: 2)
+        precondition(cutView.hasSourceSelection)
+        try cutView.copyToPasteboardForSelfCheck(pasteboard)
+        precondition(pasteboard.string(forType: .yuMarkdown) == "中文\n🪶")
+        let copiedHTML = pasteboard.string(forType: .yuHTML) ?? ""
+        precondition(copiedHTML.contains("中文") && copiedHTML.contains("🪶"))
+        try cutView.cutToPasteboardForSelfCheck(pasteboard)
+        precondition(pasteboard.string(forType: .string) == "中文\n🪶")
+        let cutSource = original.replacingOccurrences(of: "中文", with: "").replacingOccurrences(of: "🪶", with: "")
+        precondition(cutBridge.source == cutSource)
+        _ = try cutBridge.executeCommand(8)
+        precondition(cutBridge.source == original)
+        precondition(cutBridge.selectionsIfAvailable?.ranges.count == 3)
+        precondition(cutBridge.selectionsIfAvailable?.primary == 2)
+        _ = try cutBridge.executeCommand(9)
+        precondition(cutBridge.source == cutSource)
+        precondition(!cutView.hasSourceSelection)
+        // Reuse the actual copied envelope, selecting two header cells. The
+        // empty source caret was omitted, so the two fragments map one-to-one.
+        _ = try cutBridge.executeCommand(8)
+        let headerA = ns.range(of: "A")
+        let headerB = ns.range(of: "B")
+        try cutBridge.setSelections([headerA, headerB], primary: 1)
+        try cutView.pasteFromPasteboardForSelfCheck(pasteboard)
+        let distributed = original.replacingOccurrences(of: "| A | B |", with: "| 中文 | 🪶 |")
+        precondition(cutBridge.source == distributed)
+        precondition(cutBridge.selectionsIfAvailable?.ranges.count == 2)
+        precondition(cutBridge.selectionsIfAvailable?.primary == 1)
+        _ = try cutBridge.insertText("!")
+        _ = try cutBridge.executeCommand(8)
+        precondition(cutBridge.source == distributed, "undo typing must preserve paste")
+        _ = try cutBridge.executeCommand(8)
+        precondition(cutBridge.source == original, "one undo restores both pasted cells")
+        precondition(cutBridge.selectionsIfAvailable?.ranges.map { $0.range } == [headerA, headerB])
+        _ = try cutBridge.executeCommand(9)
+        precondition(cutBridge.source == distributed)
+        try cutBridge.save()
+        let reopened = try StorageBridge(path: temporary.path)
+        precondition(reopened.source == distributed)
+        // An invalid custom payload must not suppress usable plain text.
+        pasteboard.clearContents()
+        precondition(pasteboard.setData(Data("invalid".utf8), forType: .yuFragments))
+        precondition(pasteboard.setString("fallback", forType: .string))
+        try cutBridge.setSelections([NSRange(location: 0, length: 0)], primary: 0)
+        try cutView.pasteFromPasteboardForSelfCheck(pasteboard)
+        precondition(cutBridge.source == "fallback" + distributed)
+        print("Yu fragment paste self-check: per-cell distribution, primary selection, atomic undo/redo, save/reopen and malformed-envelope fallback passed")
+
+        print("Yu multi-selection clipboard self-check: all selected table cells copied/cut, empty primary preserved, undo/redo passed")
+
         print(
             "Yu Clipboard self-check: Markdown > plain text > strict HTML fallback; "
                 + "fixtures=\(fixtureCases.count)"
@@ -172,6 +442,28 @@ func runUndoSelfCheck(path: String) -> Never {
 
         textView.performRedo()
         precondition(bridge.source == original + "x")
+        let committedRevision = bridge.revision
+        textView.setMarkedText("ceshi", selectedRange: NSRange(location: 5, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        precondition(bridge.composition.active && bridge.source == original + "x")
+        guard let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, characters: "\u{1b}", charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) else {
+            preconditionFailure("Escape event")
+        }
+        textView.keyDown(with: escape)
+        precondition(!bridge.composition.active && !textView.hasMarkedText())
+        precondition(bridge.revision == committedRevision && bridge.source == original + "x")
+        textView.performUndo()
+        precondition(bridge.source == original, "Cancelled IME must not strand undo behind an empty overlay")
+        textView.performRedo()
+        precondition(bridge.source == original + "x")
+        textView.setMarkedText("y", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        textView.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+        precondition(!bridge.composition.active && !textView.hasMarkedText(), "Deleting the final preedit character must release the overlay")
+        precondition(bridge.source == original + "x")
+        textView.performUndo()
+        precondition(bridge.source == original, "Empty preedit blocked undo")
+        textView.performRedo()
+        precondition(bridge.source == original + "x")
         print("Yu Undo self-check: Rust history routes undo and redo through the native host")
         exit(EXIT_SUCCESS)
     } catch {
@@ -185,12 +477,53 @@ func runUndoSelfCheck(path: String) -> Never {
 /// clipboard payload/paste, save, and a fresh session reopening the exact
 /// bytes. The input fixture is copied to a temporary path so the repository
 /// file is never modified.
+private func checkTableMenuEditing() throws {
+    let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("yu-table-menu-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let original = "> | A | B | C |\r\n> | --- | --- | --- |\r\n> | 中文 | middle | 🪶 |\r\n"
+    try original.write(to: temporary, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: temporary.path)
+    let view = DocumentTextView(bridge: bridge)
+    let menu = view.makeTableMenu()
+    let items = menu.items.filter { !$0.isSeparatorItem }
+    precondition(items.count == 10)
+    for item in items {
+        let cell = (original as NSString).range(of: "middle")
+        try bridge.setSelection(NSRange(location: cell.location, length: 0))
+        view.refreshFromRust()
+        let available = view.validateMenuItem(item)
+        precondition(NSApp.sendAction(item.action!, to: item.target, from: item), "native menu target missing")
+        let edited = bridge.source
+        if item.tag == Int(YU_STORAGE_COMMAND_TABLE_ALIGN_DEFAULT) {
+            precondition(!available && edited == original, "default alignment must be a no-op")
+            continue
+        }
+        precondition(available && edited != original, "menu command was not connected")
+        precondition(edited.contains("中文") && edited.contains("🪶") || item.tag == Int(YU_STORAGE_COMMAND_TABLE_DELETE_ROW))
+        try bridge.save()
+        let reopened = try StorageBridge(path: temporary.path)
+        precondition(reopened.source == edited)
+        view.performUndo()
+        precondition(bridge.source == original)
+        view.performRedo()
+        precondition(bridge.source == edited)
+        view.performUndo()
+        precondition(bridge.source == original)
+    }
+    try bridge.setSelection((original as NSString).range(of: "B"))
+    let deleteRow = items.first { $0.tag == Int(YU_STORAGE_COMMAND_TABLE_DELETE_ROW) }!
+    let above = items.first { $0.tag == Int(YU_STORAGE_COMMAND_TABLE_INSERT_ROW_BEFORE) }!
+    precondition(!view.validateMenuItem(deleteRow) && !view.validateMenuItem(above))
+    print("Yu table menu self-check: 10 native menu actions, validation, CRLF quote source, undo/redo and save/reopen passed")
+}
+
 func runDocumentWorkflowSelfCheck(path: String) -> Never {
     let fileManager = FileManager.default
     let sourceURL = URL(fileURLWithPath: path)
     let temporaryURL = fileManager.temporaryDirectory
         .appendingPathComponent("yu-workflow-\(UUID().uuidString).md")
     do {
+        try checkTableMenuEditing()
         try fileManager.copyItem(at: sourceURL, to: temporaryURL)
         defer { try? fileManager.removeItem(at: temporaryURL) }
 
@@ -389,7 +722,7 @@ func runShapedProjectionHitTestSelfCheck(path: String) -> Never {
         textView.frame = NSRect(x: 0.0, y: 0.0, width: CGFloat(maxWidth), height: 600.0)
         textView.font = NSFont.systemFont(ofSize: CGFloat(size))
         let pointerWidth = Float(
-            max(textView.bounds.width - 2.0 * textView.textContainerOrigin.x, 1.0)
+            max(textView.bounds.width - 2.0 * textView.contentOrigin.x, 1.0)
         )
 
         let hit = try bridge.projectionHitTest(
@@ -564,11 +897,18 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
             fontSize: CGFloat(size)
         )
         coordinator.setHorizontalContentInset(max(surfaceView.bounds.width - CGFloat(maxWidth), 0))
-        // 分隔线的位置由 Rust 自己的 Accessibility 描述符给出。平台不需要先取
-        // viewport 的块列表、再逐块找出哪个是表格——那是把布局几何搬到平台侧
-        // （不变量 I3）。这条路径同时就是 VoiceOver 用的那一条。
+        // Production AX queries wait for an attached, submitted surface even
+        // before NSWindow exists. Headless gesture tests obtain their fixture
+        // geometry explicitly from Rust; real-window tests cover published AX.
+        precondition(coordinator.tableResizeAccessibilityDividers().isEmpty)
+        func headlessDividers() throws -> [NativeTableResizeAccessibilityDivider] {
+            try bridge.tableResizeAccessibilityDividers(
+                revision: bridge.revision, size: size, maxWidth: maxWidth,
+                scrollY: 0, viewportHeight: 1000
+            )
+        }
         let sourceBeforeResize = bridge.source
-        let accessibilityDividers = coordinator.tableResizeAccessibilityDividers()
+        let accessibilityDividers = try headlessDividers()
         guard let accessibilityDivider = accessibilityDividers.first(where: {
             $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN)
         }) else {
@@ -606,7 +946,13 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         precondition(!coordinator.tableResizeActiveForSelfCheck)
         precondition(bridge.source == sourceBeforeResize)
 
-        precondition(coordinator.beginTableResize(at: dividerPoint))
+        // Probe before any accessibility query can refresh the layout.
+        let resumedResize = coordinator.beginTableResize(at: dividerPoint)
+        if !resumedResize {
+            let dividers = try headlessDividers()
+            fputs("Table resize restart failed: original=\(accessibilityDivider.rect) current=\(dividers.map { $0.rect }) point=\(dividerPoint)\n", stderr)
+        }
+        precondition(resumedResize)
         precondition(coordinator.cancelTableResize())
         precondition(!coordinator.tableResizeActiveForSelfCheck)
 
@@ -616,10 +962,11 @@ func runMacosTableResizeCoordinatorSelfCheck(path: String) -> Never {
         precondition(!coordinator.tableResizeActiveForSelfCheck)
         precondition(!coordinator.updateTableResize(at: dividerPoint))
         coordinator.detach()
+        precondition(coordinator.tableResizeAccessibilityDividers().isEmpty)
         print(
             "Yu macOS table resize coordinator self-check: document-space CoreText hit, "
                 + "Accessibility divider descriptor, mouse update/finish/cancel, stale revision reset "
-                + "and headless surface fallback are valid"
+                + "and deferred pre-surface Accessibility are valid"
         )
         exit(EXIT_SUCCESS)
     } catch {
@@ -759,6 +1106,11 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
         try fileManager.copyItem(at: URL(fileURLWithPath: path), to: temporaryURL)
         defer { try? fileManager.removeItem(at: temporaryURL) }
 
+        // Exercise wrapping at the product's supported 180pt sidebar minimum.
+        let outlineSource = try String(contentsOf: temporaryURL, encoding: .utf8)
+        try (outlineSource + "\n# Native paragraph acceptance 原生段落验收\n\n# 😀 *斜体* **粗体**\n\n# **&amp;** *&NotEqualTilde;* &#x1F600;\n")
+            .write(to: temporaryURL, atomically: true, encoding: .utf8)
+
         let bridge = try StorageBridge(path: temporaryURL.path)
         let textView = DocumentTextView(bridge: bridge)
         let panel = OutlinePanel()
@@ -770,17 +1122,70 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
 
         let items = try unwrapSelfCheck(bridge.outlineItemsIfAvailable)
         precondition(items.count >= 6, "fixture 里的标题太少，压不住层级")
+        let entityHeading = try unwrapSelfCheck(items.first { $0.label == "& ≂\u{338} 😀" })
+        precondition(entityHeading.styleRuns.contains { $0.range == NSRange(location: 0, length: 1) && $0.traits == 1 })
+        precondition(entityHeading.styleRuns.contains { $0.range == NSRange(location: 2, length: 2) && $0.traits == 2 })
+        let styled = try unwrapSelfCheck(items.first { $0.label == "😀 斜体 粗体" })
+        let italicRange = (styled.label as NSString).range(of: "斜体")
+        let boldRange = (styled.label as NSString).range(of: "粗体")
+        precondition(italicRange.location == 3, "emoji must occupy two UTF-16 units")
+        precondition(styled.styleRuns.contains { $0.range == italicRange && $0.traits == 2 })
+        precondition(styled.styleRuns.contains { $0.range == boldRange && $0.traits == 1 })
+        for dark in [false, true] {
+            let label = panel.attributedLabelForSelfCheck(styled, dark: dark)
+            let italic = try unwrapSelfCheck(label.attribute(.font, at: italicRange.location, effectiveRange: nil) as? NSFont)
+            let bold = try unwrapSelfCheck(label.attribute(.font, at: boldRange.location, effectiveRange: nil) as? NSFont)
+            precondition(NSFontManager.shared.traits(of: italic).contains(.italicFontMask))
+            precondition(NSFontManager.shared.traits(of: bold).contains(.boldFontMask))
+            precondition(label.string == styled.label, "native styling must preserve the Rust label")
+            let activeLabel = panel.attributedLabelForSelfCheck(styled, dark: dark, active: true)
+            let activeItalic = try unwrapSelfCheck(activeLabel.attribute(.font, at: italicRange.location, effectiveRange: nil) as? NSFont)
+            let activePlain = try unwrapSelfCheck(activeLabel.attribute(.font, at: 2, effectiveRange: nil) as? NSFont)
+            precondition(NSFontManager.shared.traits(of: activeItalic).contains([.boldFontMask, .italicFontMask]))
+            precondition(NSFontManager.shared.traits(of: activePlain).contains(.boldFontMask))
+            precondition(activeLabel.string == styled.label)
+        }
         panel.reload(items: items)
+        // Reload/expansion notifications must never become navigation commands.
+        var reloadNavigations = 0
+        let navigate = panel.onSelect
+        panel.onSelect = { _ in reloadNavigations += 1 }
+        panel.clickRowForSelfCheck(panel.rowCountForSelfCheck - 1)
+        reloadNavigations = 0
+        for _ in 0..<20 { panel.reload(items: items) }
+        precondition(reloadNavigations == 0, "outline reload must not navigate")
+        let selectedBeforeHighlight = panel.selectedIdentityForSelfCheck
+        for item in items { panel.highlightHeading(containing: item.labelRange.location) }
+        precondition(reloadNavigations == 0, "caret highlight must not navigate")
+        precondition(panel.selectedIdentityForSelfCheck == selectedBeforeHighlight, "caret highlight must not alter outline selection")
+        panel.onSelect = navigate
 
         // 视觉结构：行高 30、每级缩进 14（设计稿数值；改设计时与 token 同步改）。
         let metrics = panel.rowMetricsForSelfCheck
-        precondition(metrics.height == 30.0, "大纲行高应是 30，实际 \(metrics.height)")
+        precondition(metrics.height == 24.0, "大纲行高应是 24，实际 \(metrics.height)")
         precondition(metrics.indent == 14.0, "大纲每级缩进应是 14，实际 \(metrics.indent)")
         // 区头计数跟着这一版 reload 走。
         precondition(
             panel.sectionHeaderCountForSelfCheck == items.count,
             "区头计数应是 \(items.count)，实际 \(panel.sectionHeaderCountForSelfCheck)"
         )
+
+        // Real native row rectangles must reflow without losing selection or navigating.
+        let selectedBeforeResize = panel.selectedIdentityForSelfCheck
+        var resizeNavigations = 0
+        panel.onSelect = { _ in resizeNavigations += 1 }
+        for dark in [false, true] {
+            let wide = panel.rowHeightsForSelfCheck(width: 400, dark: dark)
+            let narrow = panel.rowHeightsForSelfCheck(width: 180, dark: dark)
+            FileHandle.standardError.write(Data("Outline reflow dark=\(dark) wide=\(wide) narrow=\(narrow)\n".utf8))
+            precondition(zip(narrow, wide).allSatisfy { $0 >= $1 }, "narrow outline must not lose lines")
+            precondition(zip(narrow, wide).contains { $0 > $1 }, "long outline labels must wrap")
+            let restored = panel.rowHeightsForSelfCheck(width: 400, dark: dark)
+            precondition(restored == wide, "outline resize must restore row geometry")
+            precondition(panel.selectedIdentityForSelfCheck == selectedBeforeResize, "outline resize lost selection")
+        }
+        precondition(resizeNavigations == 0, "outline resize must not navigate")
+        panel.onSelect = navigate
 
         // 1. 平表 → NSOutlineView 眼里的那棵树。
         var visited: [NativeOutlineItem] = []
@@ -856,6 +1261,39 @@ func runOutlinePanelSelfCheck(path: String) -> Never {
         let collapsible = try unwrapSelfCheck(
             panel.rootsForSelfCheck.first(where: { !$0.children.isEmpty })
         )
+        // A selected descendant disappearing must not move the source caret.
+        // Restoring visibility must use the original focus without another edit.
+        let child = try unwrapSelfCheck(collapsible.children.first)
+        let childRow = try unwrapSelfCheck((0..<panel.rowCountForSelfCheck).first {
+            panel.nodeForSelfCheck(row: $0)?.identity == child.identity
+        })
+        panel.clickRowForSelfCheck(childRow)
+        let selectionBeforeCollapse = bridge.selection.range
+        var hierarchyNavigations = 0
+        panel.onSelect = { item in
+            hierarchyNavigations += 1
+            navigate?(item)
+        }
+        for dark in [false, true] {
+            _ = panel.rowHeightsForSelfCheck(width: 240, dark: dark)
+            panel.highlightHeading(containing: child.item.labelRange.location)
+            precondition(panel.activeIdentityForSelfCheck == child.identity)
+            panel.collapseForSelfCheck(identity: collapsible.identity)
+            FileHandle.standardError.write(Data("Outline collapsed dark=\(dark) active=\(String(describing: panel.activeIdentityForSelfCheck)) expected=\(collapsible.identity) navigations=\(hierarchyNavigations)\n".utf8))
+            precondition(panel.activeIdentityForSelfCheck == collapsible.identity,
+                         "hidden active heading must highlight its visible ancestor")
+            panel.reload(items: items)
+            precondition(panel.activeIdentityForSelfCheck == collapsible.identity,
+                         "reload must retain the collapsed active ancestor")
+            panel.expandForSelfCheck(identity: collapsible.identity)
+            FileHandle.standardError.write(Data("Outline expanded dark=\(dark) active=\(String(describing: panel.activeIdentityForSelfCheck)) expected=\(child.identity) navigations=\(hierarchyNavigations)\n".utf8))
+            precondition(panel.activeIdentityForSelfCheck == child.identity,
+                         "expansion must restore the original active descendant")
+        }
+        precondition(hierarchyNavigations == 0, "outline collapse/expand must not navigate")
+        precondition(bridge.selection.range == selectionBeforeCollapse,
+                     "outline hierarchy changes must preserve the source caret")
+        panel.onSelect = navigate
         panel.collapseForSelfCheck(identity: collapsible.identity)
         let selectedRow = rowCount - 1
         panel.clickRowForSelfCheck(min(selectedRow, panel.rowCountForSelfCheck - 1))
@@ -944,8 +1382,8 @@ func runSearchPanelSelfCheck(path: String) -> Never {
         precondition(rows.count == 6, "fixture 里应当有六处命中，实际 \(rows.count)")
         // 视觉结构：结果行高与大纲同款 30（设计稿数值；改设计时同步这里）。
         precondition(
-            panel.rowHeightForSelfCheck == 30.0,
-            "搜索结果行高应是 30，实际 \(panel.rowHeightForSelfCheck)"
+            panel.rowHeightForSelfCheck == 24.0,
+            "搜索结果行高应是 24，实际 \(panel.rowHeightForSelfCheck)"
         )
         precondition(
             panel.rowCountForSelfCheck == rows.count,
@@ -1252,6 +1690,28 @@ func runAccessibilitySelfCheck(path: String) -> Never {
         precondition(nextRevision != actionRevision)
         precondition(nextChildren.allSatisfy { $0.node.revision == nextRevision })
         print("Yu Accessibility self-check: refreshed revision=\(nextRevision)")
+        // Exercise capacity reuse across stable size, growth and shrinkage.
+        // Every result must contain exactly this revision's nodes, not unused
+        // zero-filled slots or stale metadata left over from the larger tree.
+        for source in ["plain", String(repeating: "# 标题\n\n**内容** [链接](https://example.com)\n\n", count: 20), "small"] {
+            try bridge.setSelection(NSRange(location: 0, length: (bridge.source as NSString).length))
+            _ = try bridge.insertText(source)
+            textView.refreshFromRust()
+            guard let nodes = bridge.accessibilitySemanticNodesIfAvailable else {
+                preconditionFailure("Semantic capacity query failed")
+            }
+            precondition(nodes.allSatisfy { $0.revision == bridge.revision })
+            precondition(nodes.enumerated().allSatisfy { Int($0.element.index) == $0.offset })
+            if source == "plain" || source == "small" {
+                precondition(nodes.count == 2)
+                precondition(bridge.copySourceRangeIfAvailable(nodes[1].labelRange, revision: bridge.revision) == source)
+            } else {
+                precondition(nodes.count > 40)
+            }
+            let children = (textView.accessibilityChildren ?? []).compactMap { $0 as? YuAccessibilitySemanticElement }
+            precondition(validate(children, parent: textView, revision: bridge.revision) == nodes.count - 1)
+        }
+        print("Yu Accessibility self-check: capacity grow/shrink and revision checks passed")
         exit(EXIT_SUCCESS)
     } catch {
         fputs("Yu Accessibility self-check failed: \(error)\n", stderr)

@@ -1,4 +1,6 @@
 import AppKit
+import ScreenCaptureKit
+import CryptoKit
 import Darwin
 import Foundation
 import UniformTypeIdentifiers
@@ -32,9 +34,20 @@ final class NativeFileWatcher {
         source.cancel()
     }
 }
-final class DocumentViewController: NSViewController, NSMenuItemValidation {
+final class DocumentViewController: NSViewController, NSMenuItemValidation, NSToolbarDelegate {
     private let bridge: StorageBridge
+    let persistence: NativeDocumentPersistence
+    var documentURL: URL { URL(fileURLWithPath: bridge.path) }
+    var onValidateSaveDestination: ((URL) throws -> Void)?
+    var onDocumentURLChange: (() -> Void)?
+    // Inject user decisions in lifecycle checks; production uses native panels.
+    var savePanelDecision: ((NSSavePanel) -> URL?)?
+    var closeAlertDecision: ((NSAlert) -> NSApplication.ModalResponse)?
+    var externalAlertDecision: ((NSAlert) -> NSApplication.ModalResponse)?
+    var fileErrorPresenter: ((Error) -> Void)?
+    func withFileInputForSelfCheck(_ action: (DocumentTextView) -> Void) { action(textView) }
     private lazy var textView = DocumentTextView(bridge: bridge)
+    func makeTableMenu() -> NSMenu { textView.makeTableMenu() }
     private let surfaceHostView = MacosSurfaceHostView()
     private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
@@ -48,8 +61,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private var searchQuery = ""
     private weak var sidebarStack: NSStackView?
     private weak var sidebarContainer: NSView?
-    private weak var railView: YuSidebarRailView?
-    private weak var windowToolbar: NSToolbar?
+    private lazy var filePanel = FilePanel(directory: persistence.isUntitled
+        ? (FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser)
+        : documentURL.deletingLastPathComponent())
+    private let sidebarTabs = NSSegmentedControl()
+    private let splitController = NSSplitViewController()
+    private var sidebarItem: NSSplitViewItem?
+    private let findAccessory = NSSplitViewItemAccessoryViewController()
+    private var sidebarHidden = false
+    var onOpenDocument: ((URL) -> Void)?
     private var initialState: NativeStorageState
     private var fileWatcher: NativeFileWatcher?
     private var externalCheckWorkItem: DispatchWorkItem?
@@ -59,32 +79,42 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     private var scrollLifecycleObservers: [NSObjectProtocol] = []
     private weak var documentScrollView: NSScrollView?
     private weak var documentSplitView: NSSplitView?
+    private var chromeTopConstraint: NSLayoutConstraint?
+    private var memoryPressure: DispatchSourceMemoryPressure?
     private var visualPointerAdapterEnabled = false
     private var visualPointerLayoutWidth: CGFloat = -1.0
-    /// The source TextKit mirror must have one complete layout pass before
-    /// optional Rust projection/surface work is allowed to run. This keeps
-    /// opening a document on the primary editing path independent from the
-    /// enhancement layer's first drawable/metrics publication.
+    /// Native input geometry is enabled once the view has a valid reading column.
     private var visualEnhancementsReady = false
-    /// True only when the current decoration sibling came from the same Rust
-    /// shaped frame that may become the primary visual surface. TextKit
-    /// projected decorations are a fallback overlay and must never hide the
-    /// source mirror or leave a stale Metal frame visible underneath it.
+    private var isCapturingVisualAcceptance = false
+    private var tracksSidebarWidth = false
+    private var readingZoom: CGFloat = 1
+    private var preferredSidebarWidth: CGFloat = {
+        let saved = UserDefaults.standard.double(forKey: "Yu.sidebarWidth")
+        return (180...400).contains(saved) ? CGFloat(saved) : 240
+    }()
 
-    init(bridge: StorageBridge) {
+    init(bridge: StorageBridge, recovered: Bool = false) {
         self.bridge = bridge
+        self.persistence = NativeDocumentPersistence(bridge: bridge, recovered: recovered)
         self.surfaceCoordinator = MacosSurfaceHostCoordinator(bridge: bridge)
         self.initialState = bridge.state
         super.init(nibName: nil, bundle: nil)
+        persistence.onChange = { [weak self] in
+            guard let self, self.isViewLoaded else { return }
+            self.initialState = self.bridge.state
+            self.updateStatus()
+        }
         surfaceCoordinator.onSurfaceStateChange = { [weak self] in
             self?.textView.refreshTableResizeAccessibility()
             self?.syncSourceGlyphVisibility()
         }
+        surfaceCoordinator.onPresentationStorageError = { [weak self] error in
+            self?.show(error)
+        }
         surfaceCoordinator.onError = { [weak self] error in
-            // The source TextKit mirror remains usable when a machine has no
-            // Metal drawable; surface lifecycle failure is diagnostic, not a
-            // reason to interrupt editing with a modal alert.
-            self?.statusLabel.toolTip = "Native surface inactive: \(error.localizedDescription)"
+            // Report an unavailable surface without pretending a fallback rendered it.
+            self?.statusLabel.stringValue = "文档暂时无法显示"
+            self?.statusLabel.toolTip = error.localizedDescription
         }
     }
 
@@ -101,6 +131,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         for observer in scrollLifecycleObservers {
             NotificationCenter.default.removeObserver(observer)
         }
+        memoryPressure?.cancel()
         surfaceCoordinator.detach()
     }
 
@@ -110,6 +141,13 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
+        // The seamless shell and reading geometry already own all top/bottom
+        // insets. AppKit's extra titlebar inset would create false overflow.
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        // Reserve the native scroller's width in the reading viewport, as in
+        // the fixed Typora reference. All input and Metal geometry use this
+        // same clip view; no compensating offset is added to the text.
         scrollView.scrollerStyle = .overlay
         scrollView.verticalScrollElasticity = .automatic
         scrollView.drawsBackground = true
@@ -123,10 +161,11 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
         textView.isEditable = true
         textView.isSelectable = true
-        textView.usesFindBar = true
         textView.onDocumentChange = { [weak self] in
             guard let self else { return }
+            self.view.window?.invalidateRestorableState()
             self.initialState = self.bridge.state
+            self.persistence.documentChanged()
             self.surfaceCoordinator.resetTableResizeAfterDocumentChange()
             self.textView.refreshTableResizeAccessibility()
             self.updateStatus()
@@ -140,7 +179,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             guard let self else { return }
             // 「当前命中」是从选区推出来的，所以选区一动，结果列表上高亮的
             // 那一行也要跟着动。
+            self.view.window?.invalidateRestorableState()
             self.searchPanel.highlightRow(matching: self.bridge.selection.range)
+            self.outlinePanel.highlightHeading(containing: Int(self.bridge.selectionEndpoints.focusUTF16))
             // 光标移动不推进 Revision，但会改变 caret 与选区装饰。Rust 的帧
             // 身份已经把 selection 算在内，平台不需要再显式作废任何东西。
             self.scheduleVisualSubmit()
@@ -149,7 +190,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             // same main-thread turn has finished, while retaining the Rust
             // Revision captured by the coordinator's query.
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.visualEnhancementsReady else { return }
+                guard let self, self.visualEnhancementsReady, !self.isCapturingVisualAcceptance else { return }
                 self.surfaceCoordinator.revealCaretIfNeeded()
             }
         }
@@ -191,24 +232,17 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             )
         }
         scrollView.documentView = textView
-        // `DocumentTextView` is created before the window has a laid-out
-        // content size. Give the scroll view a real initial document frame
-        // and let its text container track the viewport width; otherwise an
-        // NSTextView created with the designated initializer can retain a
-        // zero-sized document view while AX still exposes its source value.
+        // NSView does not track the clip width like NSTextView. Keep its
+        // initial frame usable; updateReadingColumnInsets owns the final width.
         textView.frame = NSRect(x: 0, y: 0, width: 900, height: 620)
         // 初始 inset 与 updateReadingColumnInsets 的算法同源（token）：窗口
-        // 第一次布局前，占位值也要是「窄窗 gutter 48、顶部 56」的形状。
-        textView.textContainerInset = NSSize(
+        // 第一次布局前，占位值也要是「窄窗边距 30pt、顶部 30pt」的形状。
+        textView.contentInsets = NSSize(
             width: YuVisualTokens.readingColumnMinGutter,
             height: YuVisualTokens.readingColumnTopInset
         )
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.containerSize = NSSize(
-            width: scrollView.contentSize.width,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.textContainer?.widthTracksTextView = true
+        textView.autoresizingMask = []
+
 
         surfaceCoordinator.bind(
             surfaceView: surfaceHostView,
@@ -231,6 +265,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             }
         }
         surfaceHostView.onGeometryChange = { [weak self] in
+            self?.updateReadingColumnInsets()
             self?.scheduleVisualSubmit()
             self?.syncSourceGlyphVisibility()
             self?.textView.refreshTableResizeAccessibility()
@@ -243,6 +278,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         ) { [weak self] _ in
             self?.syncSurfaceGeometry()
             self?.surfaceCoordinator.noteBoundsEvent()
+            self?.textView.inputContext?.invalidateCharacterCoordinates()
             self?.scheduleVisualSubmit()
             self?.syncSourceGlyphVisibility()
             self?.textView.refreshTableResizeAccessibility()
@@ -255,6 +291,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             forName: NSView.frameDidChangeNotification,
             object: scrollView.contentView, queue: .main
         ) { [weak self] _ in
+            self?.updateReadingColumnInsets()
             self?.syncSurfaceGeometry()
             self?.scheduleVisualSubmit()
         }
@@ -267,6 +304,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
                 self?.scheduleVisualSubmit()
             }),
             (NSScrollView.didEndLiveScrollNotification, { [weak self] in
+                self?.view.window?.invalidateRestorableState()
                 self?.surfaceCoordinator.endLiveScroll()
                 self?.scheduleVisualSubmit()
             }),
@@ -293,9 +331,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         statusDetailLabel.alignment = .right
         statusDetailLabel.translatesAutoresizingMaskIntoConstraints = false
         statusDetailLabel.setAccessibilityElement(true)
-        statusDetailLabel.setAccessibilityLabel("文档编码")
+        statusDetailLabel.setAccessibilityLabel("字数")
 
-        let statusBar = YuStatusBarView(frame: .zero)
+        let statusBar = YuStatusBarView()
         statusBar.addSubview(statusLabel)
         statusBar.addSubview(statusDetailLabel)
         NSLayoutConstraint.activate([
@@ -321,15 +359,30 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // 侧栏里两个面板上下叠。用 NSStackView 而不是第二个 NSSplitView：
         // 后者的 holding priority 会再压过首选高度约束一次（陷阱 26 是它的
         // 水平版），而这里根本不需要用户拖分隔线。
-        let sidebarHeader = YuSidebarHeaderView(
-            documentName: URL(fileURLWithPath: bridge.path).lastPathComponent
-        )
-        let sidebar = NSStackView(views: [
-            sidebarHeader,
-            outlinePanel.sectionHeader,
-            outlinePanel.scrollView,
-            searchPanel.view,
+        sidebarTabs.segmentCount = 2
+        sidebarTabs.setLabel("文件", forSegment: 0)
+        sidebarTabs.setLabel("大纲", forSegment: 1)
+        sidebarTabs.selectedSegment = 1
+        sidebarTabs.segmentStyle = .automatic
+        sidebarTabs.segmentDistribution = .fillEqually
+        sidebarTabs.toolTip = "切换文件或大纲"
+        sidebarTabs.target = self
+        sidebarTabs.action = #selector(selectSidebarTab(_:))
+        sidebarTabs.translatesAutoresizingMaskIntoConstraints = false
+        sidebarTabs.setAccessibilityLabel("侧栏内容")
+        let sidebarHeader = NSView()
+        sidebarHeader.translatesAutoresizingMaskIntoConstraints = false
+        sidebarHeader.addSubview(sidebarTabs)
+        NSLayoutConstraint.activate([
+            sidebarTabs.topAnchor.constraint(equalTo: sidebarHeader.topAnchor, constant: 8),
+            sidebarTabs.bottomAnchor.constraint(equalTo: sidebarHeader.bottomAnchor, constant: -8),
+            sidebarTabs.leadingAnchor.constraint(equalTo: sidebarHeader.leadingAnchor, constant: 12),
+            sidebarTabs.trailingAnchor.constraint(equalTo: sidebarHeader.trailingAnchor, constant: -12),
+            sidebarTabs.centerYAnchor.constraint(equalTo: sidebarHeader.centerYAnchor)
         ])
+        filePanel.onOpen = { [weak self] url in self?.onOpenDocument?(url) }
+        filePanel.view.isHidden = true
+        let sidebar = NSStackView(views: [sidebarHeader, outlinePanel.scrollView, filePanel.view])
         sidebar.orientation = .vertical
         sidebar.spacing = 0.0
         sidebar.distribution = .fill
@@ -345,58 +398,71 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         searchPanel.view.isHidden = true
         sidebarStack = sidebar
 
-        let sidebarContainer = NSVisualEffectView()
-        sidebarContainer.material = .sidebar
-        sidebarContainer.blendingMode = .withinWindow
-        sidebarContainer.state = .active
+        let sidebarContainer = NSView()
         sidebarContainer.translatesAutoresizingMaskIntoConstraints = false
         sidebarContainer.addSubview(sidebar)
         NSLayoutConstraint.activate([
             sidebar.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
             sidebar.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
-            sidebar.topAnchor.constraint(equalTo: sidebarContainer.topAnchor),
+            sidebar.topAnchor.constraint(equalTo: sidebarContainer.safeAreaLayoutGuide.topAnchor),
             sidebar.bottomAnchor.constraint(equalTo: sidebarContainer.bottomAnchor),
         ])
         self.sidebarContainer = sidebarContainer
 
-        let rail = YuSidebarRailView()
-        rail.onSelect = { [weak self] mode in
-            self?.selectRailMode(mode)
-        }
-        railView = rail
-        let navigation = NSStackView(views: [rail, sidebarContainer])
-        navigation.orientation = .horizontal
-        navigation.spacing = 0
-        navigation.translatesAutoresizingMaskIntoConstraints = false
-        let splitView = NSSplitView()
+        let editor = NSView()
+        editor.addSubview(scrollView)
+        let sidebarController = NSViewController()
+        sidebarController.view = sidebarContainer
+        let editorController = NSViewController()
+        editorController.view = editor
+        addChild(splitController)
+        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarController)
+        sidebarItem.minimumThickness = 180
+        sidebarItem.maximumThickness = 400
+        sidebarItem.canCollapse = true
+        self.sidebarItem = sidebarItem
+        let editorItem = NSSplitViewItem(viewController: editorController)
+        editorItem.automaticallyAdjustsSafeAreaInsets = true
+        findAccessory.view = searchPanel.view
+        findAccessory.isHidden = true
+        editorItem.addTopAlignedAccessoryViewController(findAccessory)
+        searchPanel.onClose = { [weak self] in self?.setSearchPanelHidden(true) }
+        searchPanel.onNext = { [weak self] forward in self?.advanceSearch(forward: forward) }
+        splitController.addSplitViewItem(sidebarItem)
+        splitController.addSplitViewItem(editorItem)
+        let splitView = splitController.splitView
         splitView.isVertical = true
-        splitView.dividerStyle = .thin
-        splitView.translatesAutoresizingMaskIntoConstraints = false
-        splitView.addArrangedSubview(navigation)
-        splitView.addArrangedSubview(scrollView)
-        // 面板守住自己的宽度，缩放窗口时让文档吸收——否则拖窗口会把大纲挤没。
-        splitView.setHoldingPriority(
-            NSLayoutConstraint.Priority(260.0),
-            forSubviewAt: 0
-        )
-        splitView.setHoldingPriority(
-            NSLayoutConstraint.Priority(250.0),
-            forSubviewAt: 1
-        )
+        // Keep the controller's complete hierarchy attached. Modern AppKit
+        // owns accessory/safe-area layout around the split view itself.
+        let splitHost = splitController.view
+        splitHost.translatesAutoresizingMaskIntoConstraints = false
         documentSplitView = splitView
+        scrollLifecycleObservers.append(NotificationCenter.default.addObserver(
+            forName: NSSplitView.didResizeSubviewsNotification, object: splitView, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.tracksSidebarWidth, !self.sidebarHidden, !self.isCapturingVisualAcceptance,
+                  let width = self.sidebarContainer?.frame.width, width >= 180, width <= 400 else { return }
+            self.preferredSidebarWidth = width
+            self.view.window?.invalidateRestorableState()
+            if !CommandLine.arguments.contains(where: { $0.hasSuffix("-self-check") }) {
+                UserDefaults.standard.set(Double(width), forKey: "Yu.sidebarWidth")
+            }
+        })
 
-        root.addSubview(splitView)
+        root.addSubview(splitHost)
         root.addSubview(statusBar)
-        // The Rust surface is a visual projection above the TextKit mirror.
+        // The Rust surface is a visual projection above the native input host.
         // Its hitTest returns nil, so keyboard, IME, selection and scrolling
-        // remain owned by the source view underneath it. The frame is synced
+        // remain owned by the input view underneath it. The frame is synced
         // to the clip viewport in viewDidLayout, excluding native scrollers.
-        root.addSubview(surfaceHostView, positioned: .above, relativeTo: splitView)
+        root.addSubview(surfaceHostView, positioned: .above, relativeTo: splitHost)
+        let chromeTop = splitHost.topAnchor.constraint(equalTo: root.topAnchor, constant: 0)
+        chromeTopConstraint = chromeTop
         NSLayoutConstraint.activate([
-            splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            splitView.topAnchor.constraint(equalTo: root.topAnchor),
-            splitView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            splitHost.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            splitHost.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            chromeTop,
+            splitHost.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             statusBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
@@ -404,22 +470,33 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             // 「侧栏内容 ≥ 设计宽度」钉在容器上而不是 navigation 上：隐藏的
             // 视图不参与 Auto Layout，「文档」模式（整条侧栏收起）只剩 rail。
             // 钉在 navigation 上会在两个面板都收起时留下一段空白侧栏。
-            sidebarContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: YuVisualTokens.sidebarWidth),
-            sidebarContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 360.0),
-            outlinePanel.sectionHeader.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
+            sidebarContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 180),
+            sidebarContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 400),
+            sidebarHeader.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
             outlinePanel.scrollView.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
-            searchPanel.view.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
-            // 搜索面板占侧栏下半部的一块固定高度，大纲吃掉剩下的。
-            searchPanel.view.heightAnchor.constraint(greaterThanOrEqualToConstant: 140.0),
-            searchPanel.view.heightAnchor.constraint(
-                lessThanOrEqualTo: sidebar.heightAnchor,
-                multiplier: 0.6
-            ),
+            filePanel.view.widthAnchor.constraint(equalTo: sidebar.widthAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: editor.safeAreaLayoutGuide.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: editor.safeAreaLayoutGuide.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: editor.safeAreaLayoutGuide.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: editor.safeAreaLayoutGuide.bottomAnchor),
         ])
         view = root
         // 初始显隐：大纲开、搜索关 → rail 选中「大纲」。之后的每次显隐突变都
         // 经 updateSidebarVisibility 同步，这里只补初始一拍。
-        syncRailSelection()
+        updateSidebarVisibility()
+        scrollLifecycleObservers.append(NotificationCenter.default.addObserver(
+            forName: NativeTheme.didChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.documentScrollView?.backgroundColor = YuVisualTokens.canvas
+            self.documentScrollView?.contentView.backgroundColor = YuVisualTokens.canvas
+            self.view.needsLayout = true
+            self.scheduleVisualSubmit()
+        })
+        let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+        pressure.setEventHandler { [weak self] in self?.surfaceCoordinator.releaseRebuildableCaches() }
+        pressure.resume()
+        memoryPressure = pressure
         startFileWatcher()
         updateStatus()
         refreshOutline()
@@ -435,6 +512,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         // 树的形状、每一行的文字与身份都由 Rust 给（`OutlineTree`）；面板
         // 只是把它喂给 NSOutlineView。
         outlinePanel.reload(items: items)
+        outlinePanel.highlightHeading(containing: Int(bridge.selectionEndpoints.focusUTF16))
     }
 
     /// 换一份查询：Rust 立刻重扫，结果列表与高亮跟着走。
@@ -525,6 +603,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     /// 搜索面板的显隐只有这一条写路径：菜单 `⌥⌘2`、rail 的「搜索」、
     /// `⌘F` 展开，都从这里走，收起的清理（撤查询、撤高亮、还焦点）不另写。
     private func setSearchPanelHidden(_ hidden: Bool) {
+        findAccessory.isHidden = hidden
         searchPanel.view.isHidden = hidden
         if hidden {
             // 收起面板就收掉搜索：留着高亮而看不见结果列表，是「画面上有东西
@@ -533,9 +612,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             searchQuery = ""
             searchRevision = nil
             scheduleVisualSubmit()
-            if view.window?.firstResponder === searchPanel.focusTarget {
-                focusDocument()
-            }
+            focusDocument()
         } else {
             refreshSearch(force: true)
             view.window?.makeFirstResponder(searchPanel.focusTarget)
@@ -543,73 +620,50 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         updateSidebarVisibility()
     }
 
-    /// 两个面板都收起来时，整条侧栏也收起来——否则会留下一条空白。
     private func updateSidebarVisibility() {
-        let hidden = outlinePanel.scrollView.isHidden && searchPanel.view.isHidden
-        sidebarStack?.isHidden = hidden
-        sidebarContainer?.isHidden = hidden
+        view.window?.invalidateRestorableState()
+        sidebarItem?.isCollapsed = sidebarHidden
+        outlinePanel.scrollView.isHidden = sidebarTabs.selectedSegment != 1
+        filePanel.view.isHidden = sidebarTabs.selectedSegment != 0
         documentSplitView?.adjustSubviews()
-        syncRailSelection()
     }
 
-    /// rail 的选中态由两个面板的实际显隐**推导**，不另存一份：rail 按钮、
-    /// 菜单快捷键（⌥⌘1 / ⌥⌘2 / ⌘F）走同一套显隐逻辑，推导就不会有「按钮
-    /// 说选中、面板没显示」的两个答案。两个面板同时可见的叠加态没有对应
-    /// 的 rail 模式，选中态置空。
-    private func syncRailSelection() {
-        let outlineVisible = !outlinePanel.scrollView.isHidden
-        let searchVisible = !searchPanel.view.isHidden
-        railView?.selection =
-            !outlineVisible && !searchVisible ? .documents
-            : outlineVisible && !searchVisible ? .outline
-            : searchVisible && !outlineVisible ? .search
-            : nil
-    }
-
-    /// rail 的三个模式按钮是排他的：「文档」藏起整条侧栏，「大纲」/「搜索」
-    /// 只亮对应面板。面板的显隐仍走上面的 setter，rail 自己不碰面板状态。
-    private func selectRailMode(_ mode: YuSidebarRailView.Mode) {
-        switch mode {
-        case .documents:
-            setOutlinePanelHidden(true)
-            setSearchPanelHidden(true)
-        case .outline:
-            setSearchPanelHidden(true)
-            setOutlinePanelHidden(false)
-        case .search:
-            setOutlinePanelHidden(true)
-            setSearchPanelHidden(false)
-        }
+    @objc private func selectSidebarTab(_ sender: Any?) {
+        sidebarHidden = false
+        updateSidebarVisibility()
     }
 
     var searchIsVisible: Bool { !searchPanel.view.isHidden }
 
     @objc fileprivate func toggleOutlineFromMenu(_ sender: Any?) {
-        setOutlinePanelHidden(!outlinePanel.scrollView.isHidden)
+        setOutlinePanelHidden(outlineIsVisible)
     }
 
     /// 大纲面板的显隐只有这一条写路径（rail 的「文档」/「搜索」与菜单
     /// `⌥⌘1` 共用）：区头与列表同生同灭，显隐不分开写。
     private func setOutlinePanelHidden(_ hidden: Bool) {
-        outlinePanel.scrollView.isHidden = hidden
-        outlinePanel.sectionHeader.isHidden = hidden
+        sidebarHidden = hidden
+        if !hidden { sidebarTabs.selectedSegment = 1 }
         updateSidebarVisibility()
-        if hidden, view.window?.firstResponder === outlinePanel.focusTarget {
-            focusDocument()
-        }
+        if hidden { focusDocument() }
     }
 
-    var outlineIsVisible: Bool { !outlinePanel.scrollView.isHidden }
+    var outlineIsVisible: Bool { !sidebarHidden && sidebarTabs.selectedSegment == 1 }
 
     private func syncSurfaceGeometry() {
         guard let scrollView = documentScrollView else { return }
         let viewportFrame = view.convert(scrollView.contentView.frame, from: scrollView)
         if visualEnhancementsReady {
-            surfaceCoordinator.setHorizontalContentInset(2.0 * textView.textContainerOrigin.x)
+            surfaceCoordinator.setHorizontalContentInset(2.0 * textView.contentOrigin.x)
         }
         if surfaceHostView.frame != viewportFrame {
             surfaceHostView.frame = viewportFrame
         }
+    }
+
+    override func viewWillLayout() {
+        chromeTopConstraint?.constant = 0
+        super.viewWillLayout()
     }
 
     override func viewDidLayout() {
@@ -617,9 +671,8 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         updateReadingColumnInsets()
         syncSurfaceGeometry()
         guard visualEnhancementsReady else {
-            // Keep the native source mirror fully visible during the first
-            // layout. The enhancement layer is enabled from viewDidAppear,
-            // after AppKit has a real window/clip geometry to report.
+            // Surface submission starts in viewDidAppear, once AppKit has a
+            // real window and clip geometry to report.
             return
         }
         textView.refreshTableResizeAccessibility()
@@ -631,19 +684,17 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         surfaceCoordinator.refineCaretRevealIfNeeded()
     }
 
-    /// Keeps the source mirror and retained surface on the same Typora-like
-    /// reading column: wide windows center a capped column (860), while narrow
-    /// windows retain a comfortable minimum gutter (48).
+    /// The native input host and surface share the resolved theme's column.
     private func updateReadingColumnInsets() {
-        guard let scrollView = documentScrollView else { return }
+        guard isViewLoaded, let scrollView = documentScrollView else { return }
         let width = scrollView.contentView.bounds.width
-        let gutter = max(
-            YuVisualTokens.readingColumnMinGutter,
-            (width - YuVisualTokens.readingColumnMaxWidth) * 0.5
-        )
-        let next = NSSize(width: gutter, height: YuVisualTokens.readingColumnTopInset)
-        if textView.textContainerInset != next {
-            textView.textContainerInset = next
+        if width > 0, abs(textView.frame.width - width) > 0.01 {
+            textView.setFrameSize(NSSize(width: width, height: textView.frame.height))
+        }
+        let geometry = NativeTheme.reading(width: width, windowWidth: view.window?.frame.width ?? view.bounds.width, dark: surfaceHostView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        let next = NSSize(width: CGFloat(geometry.origin_x), height: CGFloat(geometry.origin_y))
+        if textView.contentInsets != next {
+            textView.contentInsets = next
             textView.needsLayout = true
         }
     }
@@ -652,10 +703,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         super.viewDidAppear()
         guard !visualEnhancementsReady else { return }
         visualEnhancementsReady = true
+        if let error = bridge.presentationStorageError {
+            show(error)
+        }
         // 分栏的初始位置只能显式放一次：NSSplitView 给 subview 0 加的
         // holding priority 压过 `.defaultLow` 的首选宽度约束，光靠约束面板会
         // 缩到最小值。之后用户拖动仍然生效，min/max 由上面两条约束兜住。
-        documentSplitView?.setPosition(YuVisualTokens.sidebarWidth, ofDividerAt: 0)
+        documentSplitView?.setPosition(preferredSidebarWidth, ofDividerAt: 0)
+        tracksSidebarWidth = true
+        installToolbar()
         // Defer the first optional projection submit by one main-thread turn
         // so source TextKit focus/IME setup has completed before any native
         // surface callback can run.
@@ -664,6 +720,159 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             self.view.needsLayout = true
             self.scheduleVisualSubmit()
         }
+    }
+
+    private func installToolbar() {
+        guard let window = view.window, window.toolbar == nil else { return }
+        let toolbar = NSToolbar(identifier: "Yu.document")
+        toolbar.delegate = self
+        toolbar.allowsUserCustomization = true
+        toolbar.autosavesConfiguration = true
+        toolbar.displayMode = .iconOnly
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+        window.autorecalculatesKeyViewLoop = true
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [NSToolbarItem.Identifier("yu.sidebar"), .flexibleSpace,
+         NSToolbarItem.Identifier("yu.find"), NSToolbarItem.Identifier("yu.source"), NSToolbarItem.Identifier("yu.more")]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar) + [.space]
+    }
+
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier,
+                 willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        if identifier.rawValue == "yu.more" {
+            let item = NSMenuToolbarItem(itemIdentifier: identifier)
+            item.label = "阅读主题"
+            item.image = NSImage(systemSymbolName: "ellipsis.circle", accessibilityDescription: "更多")
+            let menu = NSMenu(title: "阅读主题")
+            for (index, title) in ["Yu · 跟随系统", "Github", "Night"].enumerated() {
+                let action = NSMenuItem(title: title, action: #selector(selectReadingTheme(_:)), keyEquivalent: "")
+                action.target = self
+                action.tag = index
+                menu.addItem(action)
+            }
+            item.menu = menu
+            return item
+        }
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.target = self
+        if identifier.rawValue == "yu.sidebar" {
+            item.label = "侧栏"
+            item.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: item.label)
+            item.action = #selector(toggleSidebarToolbar(_:))
+        } else if identifier.rawValue == "yu.find" {
+            item.label = "查找"
+            item.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: item.label)
+            item.action = #selector(toggleSearchFromMenu(_:))
+        } else if identifier.rawValue == "yu.source" {
+            item.label = bridge.sourceMode ? "即时预览" : "源码模式"
+            item.toolTip = "切换 Markdown 源码与即时预览"
+            item.image = NSImage(systemSymbolName: bridge.sourceMode ? "doc.richtext" : "chevron.left.forwardslash.chevron.right", accessibilityDescription: item.label)
+            item.action = #selector(toggleSourceMode(_:))
+        } else { return nil }
+        return item
+    }
+
+    @objc fileprivate func toggleSourceMode(_ sender: Any?) {
+        guard !textView.hasMarkedText() else { NSSound.beep(); return }
+        do { try setSourceMode(!bridge.sourceMode) } catch { show(error) }
+    }
+
+    private func setSourceMode(_ enabled: Bool) throws {
+        surfaceCoordinator.retainPositionForPresentationChange()
+        try bridge.setSourceMode(enabled)
+        surfaceCoordinator.resetTableResizeAfterDocumentChange()
+        textView.refreshFromRust()
+        textView.refreshTableResizeAccessibility()
+        refreshOutline(force: true)
+        view.needsLayout = true
+        for item in view.window?.toolbar?.items ?? [] where item.itemIdentifier.rawValue == "yu.source" {
+            item.label = enabled ? "即时预览" : "源码模式"
+            item.image = NSImage(systemSymbolName: enabled ? "doc.richtext" : "chevron.left.forwardslash.chevron.right", accessibilityDescription: item.label)
+        }
+        scheduleVisualSubmit()
+        view.window?.invalidateRestorableState()
+        focusDocument()
+    }
+
+    @objc private func toggleSidebarToolbar(_ sender: Any?) {
+        sidebarHidden.toggle()
+        updateSidebarVisibility()
+        focusDocument()
+    }
+
+    @objc private func selectReadingTheme(_ sender: NSMenuItem) {
+        NativeTheme.selection = NativeTheme.Selection(rawValue: sender.tag) ?? .yu
+        NotificationCenter.default.post(name: NativeTheme.didChange, object: nil)
+    }
+
+    @objc fileprivate func zoomInFromMenu(_ sender: Any?) { setReadingZoom(readingZoom + 0.125) }
+    @objc fileprivate func zoomOutFromMenu(_ sender: Any?) { setReadingZoom(readingZoom - 0.125) }
+    @objc fileprivate func resetZoomFromMenu(_ sender: Any?) { setReadingZoom(1) }
+
+    private func setReadingZoom(_ zoom: CGFloat) {
+        guard zoom.isFinite else { return }
+        let next = min(3, max(0.5, zoom))
+        guard abs(next - readingZoom) > 0.001 else { return }
+        surfaceCoordinator.retainPositionForPresentationChange()
+        readingZoom = next
+        let theme = NativeTheme.spec(dark: view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        let size = CGFloat(theme.body_size) * next
+        textView.font = NativeTheme.font(identity: theme.body_font, size: size)
+        surfaceCoordinator.setFontSize(size)
+        textView.refreshTableResizeAccessibility()
+        view.needsLayout = true
+        scheduleVisualSubmit()
+        view.window?.invalidateRestorableState()
+    }
+
+    func encodeWindowState(to coder: NSCoder) {
+        coder.encode(bridge.path as NSString, forKey: "Yu.documentPath")
+        coder.encode(sidebarHidden, forKey: "Yu.sidebarHidden")
+        coder.encode(sidebarTabs.selectedSegment, forKey: "Yu.sidebarPanel")
+        coder.encode(bridge.sourceMode, forKey: "Yu.sourceMode")
+        coder.encode(Double(preferredSidebarWidth), forKey: "Yu.sidebarWidth")
+        coder.encode(Double(readingZoom), forKey: "Yu.readingZoom")
+        let selection = bridge.selectionEndpoints
+        coder.encode(Int64(selection.anchorUTF16), forKey: "Yu.selectionAnchor")
+        coder.encode(Int64(selection.focusUTF16), forKey: "Yu.selectionFocus")
+        coder.encode(Int(selection.affinity), forKey: "Yu.selectionAffinity")
+        surfaceCoordinator.encodeReadingPosition(to: coder)
+    }
+
+    func restoreWindowState(from coder: NSCoder) {
+        _ = view
+        if coder.containsValue(forKey: "Yu.readingZoom") {
+            setReadingZoom(CGFloat(coder.decodeDouble(forKey: "Yu.readingZoom")))
+        }
+        if coder.containsValue(forKey: "Yu.sidebarWidth") {
+            let width = coder.decodeDouble(forKey: "Yu.sidebarWidth")
+            if width.isFinite && (180...400).contains(width) { preferredSidebarWidth = width }
+        }
+        sidebarHidden = coder.decodeBool(forKey: "Yu.sidebarHidden")
+        sidebarTabs.selectedSegment = min(1, max(0, coder.decodeInteger(forKey: "Yu.sidebarPanel")))
+        updateSidebarVisibility()
+        if coder.containsValue(forKey: "Yu.sourceMode") {
+            do { try setSourceMode(coder.decodeBool(forKey: "Yu.sourceMode")) } catch { show(error) }
+        }
+        if coder.containsValue(forKey: "Yu.selectionAnchor"), coder.containsValue(forKey: "Yu.selectionFocus") {
+            let anchor = coder.decodeInt64(forKey: "Yu.selectionAnchor")
+            let focus = coder.decodeInt64(forKey: "Yu.selectionFocus")
+            let affinity = coder.decodeInteger(forKey: "Yu.selectionAffinity")
+            let count = (bridge.source as NSString).length
+            if anchor >= 0 && focus >= 0 && anchor <= count && focus <= count && (0...1).contains(affinity) {
+                try? bridge.setSelectionEndpoints(anchorUTF16: UInt64(anchor), focusUTF16: UInt64(focus), affinity: UInt8(affinity))
+                textView.refreshFromRust()
+            }
+        }
+        if visualEnhancementsReady { documentSplitView?.setPosition(preferredSidebarWidth, ofDividerAt: 0) }
+        view.layoutSubtreeIfNeeded()
+        surfaceCoordinator.restoreReadingPosition(from: coder)
     }
 
     func refreshFromRust() {
@@ -704,11 +913,60 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
 
-    @objc private func save() {
+    @discardableResult
+    fileprivate func saveDocument() -> Bool {
         do {
-            try bridge.save()
-            refreshFromRust()
-        } catch { show(error) }
+            try textView.finishCompositionForFileOperation()
+            if persistence.isUntitled { return chooseSaveDestination() }
+            try persistence.save()
+            updateStatus()
+            return true
+        } catch { show(error); return false }
+    }
+
+    @objc private func save() { _ = saveDocument() }
+
+    @objc fileprivate func saveAsFromMenu(_ sender: Any?) {
+        do { try textView.finishCompositionForFileOperation() }
+        catch { show(error); return }
+        _ = chooseSaveDestination()
+    }
+
+    @discardableResult
+    private func chooseSaveDestination() -> Bool {
+        let panel = NSSavePanel()
+        panel.title = persistence.isUntitled ? "保存文档" : "另存为"
+        panel.nameFieldStringValue = persistence.isUntitled ? "未命名.md" : documentURL.lastPathComponent
+        if !persistence.isUntitled { panel.directoryURL = documentURL.deletingLastPathComponent() }
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText, .plainText]
+        panel.canCreateDirectories = true
+        let destination: URL?
+        if let savePanelDecision { destination = savePanelDecision(panel) }
+        else { destination = panel.runModal() == .OK ? panel.url : nil }
+        guard let url = destination else { return false }
+        do {
+            try saveDocumentAs(to: url, replaceExisting: true)
+            return true
+        } catch { show(error); return false }
+    }
+
+    /// NSSavePanel supplies overwrite consent; programmatic checks pass it
+    /// explicitly. The AppDelegate rejects destinations owned by other windows.
+    func saveDocumentAs(to url: URL, replaceExisting: Bool) throws {
+        try onValidateSaveDestination?(url)
+        try textView.finishCompositionForFileOperation()
+        surfaceCoordinator.detach()
+        defer { scheduleVisualSubmit() }
+        try persistence.saveAs(url, replaceExisting: replaceExisting)
+        view.window?.representedURL = documentURL
+        view.window?.title = documentURL.lastPathComponent
+        view.window?.identifier = NSUserInterfaceItemIdentifier(bridge.path)
+        view.window?.invalidateRestorableState()
+        fileWatcher = nil
+        filePanel.setDirectory(documentURL.deletingLastPathComponent())
+        startFileWatcher()
+        refreshFromRust()
+        onDocumentURLChange?()
     }
 
     @objc private func reload() {
@@ -731,31 +989,328 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     @objc fileprivate func copyFromMenu(_ sender: Any?) {
-        textView.copy(sender)
+        if let field = view.window?.firstResponder as? NSTextView { field.copy(sender) }
+        else { textView.copy(sender) }
     }
 
     @objc fileprivate func cutFromMenu(_ sender: Any?) {
-        textView.cut(sender)
+        if let field = view.window?.firstResponder as? NSTextView { field.cut(sender) }
+        else { textView.cut(sender) }
     }
 
     @objc fileprivate func undoFromMenu(_ sender: Any?) {
-        textView.performUndo()
+        if let field = view.window?.firstResponder as? NSTextView { field.undoManager?.undo() }
+        else { textView.performUndo() }
     }
 
     @objc fileprivate func redoFromMenu(_ sender: Any?) {
-        textView.performRedo()
+        if let field = view.window?.firstResponder as? NSTextView { field.undoManager?.redo() }
+        else { textView.performRedo() }
     }
 
     @objc fileprivate func pasteFromMenu(_ sender: Any?) {
-        textView.paste(sender)
+        if let field = view.window?.firstResponder as? NSTextView { field.paste(sender) }
+        else { textView.paste(sender) }
     }
 
     @objc fileprivate func selectAllFromMenu(_ sender: Any?) {
-        textView.selectAll(sender)
+        if let field = view.window?.firstResponder as? NSTextView { field.selectAll(sender) }
+        else { textView.selectAll(sender) }
     }
 
     func focusDocument() {
         _ = view.window?.makeFirstResponder(textView)
+    }
+
+    @MainActor
+    func runWindowStateSelfCheck() async throws {
+        func require(_ value: Bool, _ message: String) throws {
+            if !value { throw NSError(domain: "YuWindowState", code: 1, userInfo: [NSLocalizedDescriptionKey: message]) }
+        }
+        func settle(_ controller: DocumentViewController) async throws {
+            let deadline = Date().addingTimeInterval(25)
+            while Date() < deadline {
+                controller.view.layoutSubtreeIfNeeded()
+                _ = try controller.surfaceCoordinator.submitNow()
+                if controller.surfaceCoordinator.hasCurrentFrame(requirePresented: true),
+                   controller.surfaceCoordinator.lastSnapshot?.layoutPending == false { return }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            throw NSError(domain: "YuWindowState", code: 2, userInfo: [NSLocalizedDescriptionKey: "Window did not settle: source=\(controller.bridge.sourceMode) current=\(controller.surfaceCoordinator.hasCurrentFrame()) presented=\(controller.surfaceCoordinator.hasCurrentFrame(requirePresented: true)) pending=\(String(describing: controller.surfaceCoordinator.lastSnapshot?.layoutPending)) clip=\(controller.documentScrollView?.contentView.bounds ?? .zero) window=\(controller.view.window != nil)"])
+        }
+        let original = bridge.source
+        let disk = try Data(contentsOf: URL(fileURLWithPath: bridge.path))
+        let range = (original as NSString).range(of: "恢复")
+        try require(range.location != NSNotFound, "Restoration fixture needs 恢复")
+        for sourceMode in [false, true] {
+            print("Yu restoration stage: original mode=\(sourceMode)"); fflush(stdout)
+            try setSourceMode(sourceMode)
+            sidebarHidden = false
+            sidebarTabs.selectedSegment = 0
+            updateSidebarVisibility()
+            documentSplitView?.setPosition(278, ofDividerAt: 0)
+            try bridge.setSelectionEndpoints(anchorUTF16: UInt64(NSMaxRange(range)), focusUTF16: UInt64(range.location))
+            textView.refreshFromRust()
+            try await settle(self)
+            guard let scroll = documentScrollView else { throw CocoaError(.coderInvalidValue) }
+            let maximum = max(0, textView.frame.height - scroll.contentView.bounds.height)
+            scroll.contentView.setBoundsOrigin(NSPoint(x: 0, y: maximum * 0.5))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            try await settle(self)
+            let archive = NSKeyedArchiver(requiringSecureCoding: true)
+            encodeWindowState(to: archive)
+            archive.finishEncoding()
+            let data = archive.encodedData
+            let expected = try NSKeyedUnarchiver(forReadingFrom: data)
+            let source = expected.decodeInt64(forKey: "Yu.readingSource")
+            let offset = expected.decodeDouble(forKey: "Yu.readingOffset")
+            expected.finishDecoding()
+            try require(source > 0, "Archive lost scrolled source anchor")
+
+            let restored = DocumentViewController(bridge: try StorageBridge(path: bridge.path))
+            print("Yu restoration stage: decode before attach"); fflush(stdout)
+            // Decode before attaching a window: AppKit may restore before geometry exists.
+            let decoder = try NSKeyedUnarchiver(forReadingFrom: data)
+            restored.restoreWindowState(from: decoder)
+            decoder.finishDecoding()
+            let window = NSWindow(contentViewController: restored)
+            window.styleMask = [.titled, .closable, .resizable, .fullSizeContentView]
+            window.setContentSize(NSSize(width: 1040, height: 720))
+            window.isReleasedWhenClosed = false
+            window.isRestorable = false
+            window.appearance = view.window?.appearance
+            window.makeKeyAndOrderFront(nil)
+            defer { restored.detachSurfaceHost(); window.close() }
+            try await settle(restored)
+            try require(restored.bridge.sourceMode == sourceMode, "Source mode was not restored")
+            try require(!restored.sidebarHidden && restored.sidebarTabs.selectedSegment == 0, "Sidebar panel was not restored")
+            try require(abs((restored.sidebarContainer?.frame.width ?? 0) - 278) < 1, "Sidebar width was overwritten during initial layout")
+            let selection = restored.bridge.selectionEndpoints
+            try require(selection.anchorUTF16 == UInt64(NSMaxRange(range)) && selection.focusUTF16 == UInt64(range.location), "Backward selection was not restored")
+            let width = Float(max(restored.textView.bounds.width - 2 * restored.textView.contentOrigin.x, 1))
+            let caret = try restored.bridge.sourceCaret(revision: restored.bridge.revision, sourceUTF16: UInt64(source), affinity: 0, size: 16, maxWidth: width)
+            let top = Double(restored.textView.contentOrigin.y)
+            let actual = Double(restored.documentScrollView?.contentView.bounds.minY ?? 0)
+            try require(abs(Double(caret.point.y) + offset + top - actual) < 1, "Source anchor drifted after width change: actual=\(actual) target=\(Double(caret.point.y) + offset + top)")
+
+            restored.setSearchPanelHidden(false)
+            restored.view.layoutSubtreeIfNeeded()
+            let field = restored.searchPanel.focusTarget as? NSControl
+            try require(window.firstResponder === field?.currentEditor() || window.firstResponder === restored.searchPanel.focusTarget, "Find field did not receive keyboard focus")
+            restored.setSearchPanelHidden(true)
+            try require(window.firstResponder === restored.textView, "Closing Find did not restore editor focus")
+            try require(restored.textView.accessibilityNumberOfCharacters() == (original as NSString).length, "AX character count diverged")
+            try require(restored.textView.accessibilitySelectedText() == "恢复", "AX selected text diverged")
+            try require((restored.textView.accessibilityValue() as? String) == original, "AX value diverged from source")
+            try require(restored.bridge.source == original && bridge.source == original, "Window restoration changed document bytes")
+            print("Yu window state self-check: mode=\(sourceMode ? "source" : "preview") secureArchive=true preAttachDecode=true sidebar=278 backwardSelection=true sourceAnchor=within-1pt findFocus=true axValue=true")
+        }
+        try require(try Data(contentsOf: URL(fileURLWithPath: bridge.path)) == disk, "Restoration wrote the file")
+        print("Yu window state self-check passed: disk unchanged; real VoiceOver and OS relaunch remain separate acceptance")
+    }
+
+    @MainActor
+    func runPresentationLatencySelfCheck(zoom: Bool, redraw: Bool = false) async throws {
+        func require(_ condition: Bool, _ message: String) throws {
+            if !condition { throw NSError(domain: "YuPresentationLatency", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]) }
+        }
+        guard let window = view.window else { throw CocoaError(.coderInvalidValue) }
+        let original = bridge.source
+        let originalBytes = try Data(contentsOf: URL(fileURLWithPath: bridge.path))
+        let anchor = (original as NSString).range(of: "Latency anchor: ")
+        try require(anchor.location != NSNotFound, "Missing benchmark anchor")
+        sidebarHidden = true
+        updateSidebarVisibility()
+        window.appearance = NSAppearance(named: .aqua)
+        window.setContentSize(NSSize(width: 1200, height: 800))
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        focusDocument()
+        textView.font = NSFont.systemFont(ofSize: 16)
+        surfaceCoordinator.setFontSize(16)
+        textView.navigate(toSource: NSRange(location: NSMaxRange(anchor), length: 0))
+        view.layoutSubtreeIfNeeded()
+        let deadline = CACurrentMediaTime() + 90
+        while CACurrentMediaTime() < deadline {
+            if surfaceCoordinator.currentPresentationTime() != nil,
+               surfaceCoordinator.lastSnapshot?.layoutPending == false { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        try require(surfaceCoordinator.currentPresentationTime() != nil
+            && surfaceCoordinator.lastSnapshot?.layoutPending == false, "Initial layout did not settle")
+        func active() -> Bool {
+            NSApp.isActive && !NSApp.isHidden && window.isKeyWindow
+                && window.isVisible && window.occlusionState.contains(.visible)
+        }
+        // Long initial measurement can outlast foreground ownership. Establish
+        // the test's input context immediately before sampling, not 30s earlier.
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        focusDocument()
+        let focusDeadline = CACurrentMediaTime() + 3
+        while !active(), CACurrentMediaTime() < focusDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try require(active(), "Benchmark window is not active and visible")
+        try require(bridge.source == original, "Source changed before sampling: \(bridge.source.prefix(100))")
+        textView.navigate(toSource: NSRange(location: NSMaxRange(anchor), length: 0))
+        // Diagnostic-only display-cycle observation; clean benchmarks do not
+        // start a continuous display link or change the production scheduler.
+        let cycleTrace = DisplayLinkPacer(traceCycles: true) {}
+        if ProcessInfo.processInfo.environment["YU_RENDER_TIMING"] != nil {
+            cycleTrace.start(view: surfaceHostView)
+        }
+        defer { cycleTrace.stop() }
+        var samples = [[String: Any]]()
+        func sample(_ kind: String, index: Int, action: () throws -> Void) async throws {
+            let activeBefore = active()
+            let started = CACurrentMediaTime()
+            try action()
+            let actionEnd = CACurrentMediaTime()
+            let revision = bridge.revision
+            let timeout = started + 20
+            var presented: Double?
+            while CACurrentMediaTime() < timeout {
+                if let time = surfaceCoordinator.currentPresentationTime(), time >= started {
+                    presented = time; break
+                }
+                // Observe the production scheduler; do not force extra frames.
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            guard let presented else {
+                throw NSError(domain: "YuPresentationLatency", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "No matching drawable presentation: \(kind) \(index)"])
+            }
+            let sample: [String: Any] = ["kind": kind, "index": index, "revision": revision,
+                "start_time_s": started, "presented_time_s": presented,
+                "action_ms": (actionEnd - started) * 1000,
+                "presented_ms": (presented - started) * 1000,
+                "observed_ms": (CACurrentMediaTime() - started) * 1000,
+                "active_before": activeBefore, "active_after": active(),
+                "app_active": NSApp.isActive, "key_window": window.isKeyWindow,
+                "visible": window.isVisible, "unoccluded": window.occlusionState.contains(.visible),
+                "frame_serial": surfaceCoordinator.lastSnapshot?.frameSerial ?? 0]
+            samples.append(sample)
+            let encoded = try JSONSerialization.data(withJSONObject: sample, options: [.sortedKeys])
+            print("Yu latency sample: \(String(decoding: encoded, as: UTF8.self))"); fflush(stdout)
+        }
+        if redraw {
+            let revision = bridge.revision
+            for index in 0..<24 {
+                try await sample("redraw", index: index) {
+                    _ = try surfaceCoordinator.submitNow(force: true)
+                }
+                try require(bridge.revision == revision && bridge.source == original,
+                    "Retained redraw changed source or revision")
+            }
+        } else if zoom {
+            let sizes: [CGFloat] = [18, 14, 20, 16]
+            for index in 0..<24 {
+                try await sample("zoom", index: index) {
+                    let size = sizes[index % sizes.count]
+                    textView.font = NSFont.systemFont(ofSize: size)
+                    surfaceCoordinator.setFontSize(size)
+                }
+                try require(bridge.source == original, "Zoom changed source")
+            }
+        } else {
+            let values = ["羽", "e\u{301}", "🙂", "abc"]
+            for index in 0..<24 {
+                let inserted = values[index % values.count]
+                let target = bridge.selection.range
+                try require(target == NSRange(location: NSMaxRange(anchor), length: 0), "Input selection moved: \(target)")
+                try await sample("insert", index: index) {
+                    textView.insertText(inserted, replacementRange: NSRange(location: NSNotFound, length: 0))
+                }
+                let expected = (original as NSString).replacingCharacters(in: NSRange(location: NSMaxRange(anchor), length: 0), with: inserted)
+                try require(bridge.source == expected, "Insert source mismatch: actual=\(bridge.source.prefix(100)) expected=\(expected.prefix(100))")
+                try await sample("undo", index: index) { textView.performUndo() }
+                try require(bridge.source == original, "Undo source mismatch")
+            }
+        }
+        try bridge.save()
+        try require(try Data(contentsOf: URL(fileURLWithPath: bridge.path)) == originalBytes, "Saved bytes changed")
+        let result: [String: Any] = ["mode": redraw ? "redraw" : (zoom ? "zoom" : "input"), "samples": samples,
+            "source_bytes": originalBytes.count, "font_size_pt": 16, "theme": NativeTheme.selection.rawValue,
+            "content_width_pt": window.contentView?.bounds.width ?? 0,
+            "content_height_pt": window.contentView?.bounds.height ?? 0,
+            "display_max_fps": window.screen?.maximumFramesPerSecond ?? 0,
+            "backing_scale": window.backingScaleFactor, "source_and_save_correct": true,
+            "measurement": "Scripted input/zoom/retained redraw to matching drawable presentedTime; redraw is a control, not editing latency"]
+        let encoded = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+        if let path = ProcessInfo.processInfo.environment["YU_LATENCY_RESULT_PATH"] {
+            // Native timing callbacks also write stdout. Keep the structured
+            // record atomic rather than interleaving a long JSON line.
+            try encoded.write(to: URL(fileURLWithPath: path), options: .atomic)
+            print("Yu presentation latency result written")
+        } else {
+            print("Yu presentation latency result: \(String(decoding: encoded, as: UTF8.self))")
+        }
+    }
+
+    @MainActor
+    func runIdleResourceSelfCheck() async throws {
+        func cpuSeconds() -> Double {
+            var usage = rusage()
+            getrusage(RUSAGE_SELF, &usage)
+            return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
+                + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
+        }
+        func footprint() throws -> UInt64 {
+            var info = task_vm_info_data_t()
+            var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+            let result = withUnsafeMutablePointer(to: &info) { pointer in
+                pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                    task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+                }
+            }
+            guard result == KERN_SUCCESS else { throw NSError(domain: NSMachErrorDomain, code: Int(result)) }
+            return info.phys_footprint
+        }
+        let layoutStarted = ProcessInfo.processInfo.systemUptime
+        let deadline = Date().addingTimeInterval(90)
+        while Date() < deadline {
+            _ = try surfaceCoordinator.submitNow()
+            if surfaceCoordinator.hasCurrentFrame(requirePresented: true), surfaceCoordinator.lastSnapshot?.layoutPending == false { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        guard surfaceCoordinator.hasCurrentFrame(requirePresented: true), surfaceCoordinator.lastSnapshot?.layoutPending == false else {
+            throw NSError(domain: "YuIdleCheck", code: 1, userInfo: [NSLocalizedDescriptionKey: "Initial document layout did not settle"])
+        }
+        let layoutSeconds = ProcessInfo.processInfo.systemUptime - layoutStarted
+        // Hiding is deterministic and avoids activating another user app.
+        // Record this narrower scenario rather than calling it visible-idle.
+        NSApp.hide(nil)
+        try await Task.sleep(nanoseconds: 5_000_000_000)
+        let startCPU = cpuSeconds()
+        let startTime = ProcessInfo.processInfo.systemUptime
+        let startSerial = surfaceCoordinator.lastSnapshot?.frameSerial ?? 0
+        var samples: [UInt64] = [try footprint()]
+        var activationSamples = [["active": NSApp.isActive, "key": view.window?.isKeyWindow ?? false,
+                                  "visible": view.window?.isVisible ?? false, "hidden": NSApp.isHidden]]
+        var remainedInactive = !NSApp.isActive && !(view.window?.isKeyWindow ?? true)
+        // isVisible describes window ordering; an application-hidden window
+        // can retain that flag. NSApp.isHidden is the authoritative condition.
+        var remainedHidden = NSApp.isHidden
+        for _ in 0..<6 {
+            try await Task.sleep(nanoseconds: 10_000_000_000)
+            samples.append(try footprint())
+            activationSamples.append(["active": NSApp.isActive, "key": view.window?.isKeyWindow ?? false,
+                                      "visible": view.window?.isVisible ?? false, "hidden": NSApp.isHidden])
+            remainedInactive = remainedInactive && !NSApp.isActive && !(view.window?.isKeyWindow ?? true)
+            remainedHidden = remainedHidden && NSApp.isHidden
+        }
+        let wall = ProcessInfo.processInfo.systemUptime - startTime
+        let cpu = (cpuSeconds() - startCPU) / wall * 100
+        let result: [String: Any] = ["source_bytes": bridge.source.utf8.count, "wall_seconds": wall,
+            "scenario": "hidden-inactive", "initial_layout_seconds": layoutSeconds, "activation_samples": activationSamples,
+            "cpu_percent_one_core": cpu, "physical_footprint_bytes": samples,
+            "remained_inactive": remainedInactive, "remained_hidden": remainedHidden, "window_visible": view.window?.isVisible ?? false,
+            "start_frame_serial": startSerial, "end_frame_serial": surfaceCoordinator.lastSnapshot?.frameSerial ?? 0,
+            "cpu_target_passed": remainedInactive && cpu <= 0.5]
+        let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+        print("Yu idle resource measurement: \(String(decoding: data, as: UTF8.self))")
     }
 
     /// 真实窗口下的帧调度自检。
@@ -782,12 +1337,54 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         func submit(force: Bool = false) async throws -> NativeMacosRenderHostSurfaceSnapshot? {
             let deadline = Date().addingTimeInterval(3)
             repeat {
+                // A scheduled UI submission may win the drawable before this
+                // task resumes. Accept that exact current, submitted frame;
+                // forcing another draw can otherwise starve this waiter.
+                if surfaceCoordinator.hasCurrentFrame(),
+                   let published = surfaceCoordinator.lastSnapshot {
+                    return published
+                }
                 if let snapshot = try surfaceCoordinator.submitNow(force: force) {
                     return snapshot
                 }
                 try await Task.sleep(nanoseconds: 8_000_000)
             } while Date() < deadline
-            throw Failure(message: "Timed out waiting for drawable presentation")
+            throw Failure(message: "Timed out waiting for drawable presentation; root=\(view.bounds) split=\(documentSplitView?.frame ?? .zero) clip=\(documentScrollView?.contentView.bounds ?? .zero) surface=\(surfaceHostView.frame) visible=\(view.window?.occlusionState.contains(.visible) ?? false)")
+        }
+
+        // Stage Manager can report an active/key window while its compositor
+        // image is still a thumbnail. Wait for native pixels, never resize them.
+        func captureEditingImage() async throws -> CGImage {
+            guard let window = view.window else { throw Failure(message: "编辑截图没有窗口") }
+            let deadline = Date().addingTimeInterval(5)
+            var detail = "compositor returned no image"
+            var lastResubmit = Date()
+            var resubmits = 0
+            repeat {
+                if !NSApp.isActive || !window.isKeyWindow {
+                    window.makeKeyAndOrderFront(nil)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                guard surfaceCoordinator.hasCurrentFrame(requirePresented: true) else {
+                    detail = "latest document frame has not been presented"
+                    if resubmits < 3, Date().timeIntervalSince(lastResubmit) >= 1 {
+                        _ = try surfaceCoordinator.submitNow(force: true)
+                        resubmits += 1
+                        lastResubmit = Date()
+                    }
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    continue
+                }
+                if NSApp.isActive, window.isVisible, !window.isMiniaturized,
+                   let image = try? await NativeWindowCapture.image(window) {
+                    let width = Int((window.frame.width * window.backingScaleFactor).rounded())
+                    let height = Int((window.frame.height * window.backingScaleFactor).rounded())
+                    if image.width == width && image.height == height { return image }
+                    detail = "pixels \(image.width)×\(image.height), expected \(width)×\(height)"
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            } while Date() < deadline
+            throw Failure(message: "编辑原尺寸截图超时：\(detail)")
         }
 
         // 1. 真实 surface 上必须先有一帧。
@@ -797,6 +1394,43 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
         // 2. 状态没变时必须判为等价，否则每一次布局回调都会整帧重画。
         try require(surfaceCoordinator.hasCurrentFrame(), "刚提交的帧未被判为当前帧")
+
+        // Exercise the actual toolbar target and shared frame invalidation.
+        let modeSource = bridge.source
+        let modeRevision = bridge.revision
+        let modeSelection = bridge.selection.range
+        toggleSourceMode(nil)
+        try require(bridge.sourceMode, "源码模式入口未切换; marked=\(textView.hasMarkedText()) composition=\(bridge.composition.active)")
+        try require(!surfaceCoordinator.hasCurrentFrame(), "源码模式仍复用预览帧")
+        let literalFrame = try await submit(force: true)
+        try require(literalFrame?.submitted == true && (literalFrame?.commandCount ?? 0) > 0,
+                    "源码帧未提交")
+        let literalStart = try require(textView.shapedCaretRectForSelfCheck(sourceUTF16: 0), "缺少源码行首几何")
+        let afterMarker = try require(textView.shapedCaretRectForSelfCheck(sourceUTF16: 1), "缺少源码标记后几何")
+        try require(afterMarker.minX > literalStart.minX + 1 && abs(literalStart.height - 26) < 0.5,
+                    "源码首字符仍隐藏或沿用标题行高: \(literalStart) → \(afterMarker)")
+        var literalRange = NSRange(location: NSNotFound, length: 0)
+        let literalScreen = textView.firstRect(forCharacterRange: NSRange(location: 1, length: 0), actualRange: &literalRange)
+        let literalWindow = try require(textView.window, "源码输入没有窗口")
+        let literalLocal = textView.convert(literalWindow.convertFromScreen(literalScreen), from: nil)
+        try require(literalRange.location == 1 && abs(literalLocal.minX - afterMarker.minX - textView.contentOrigin.x) < 0.5
+                    && abs(literalLocal.minY - afterMarker.minY - textView.contentOrigin.y) < 0.5,
+                    "源码候选框未使用绘制几何")
+        try require(bridge.source == modeSource && bridge.revision == modeRevision && bridge.selection.range == modeSelection,
+                    "源码切换改变了文档或选区")
+        if let directory = ProcessInfo.processInfo.environment["YU_SOURCE_MODE_CAPTURE_DIR"] {
+            let image = try await captureEditingImage()
+            let url = URL(fileURLWithPath: directory)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            let name = view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? "source-dark.png" : "source-light.png"
+            let png = try require(NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]), "源码截图编码失败")
+            try png.write(to: url.appendingPathComponent(name), options: .atomic)
+        }
+        toggleSourceMode(nil)
+        _ = try await submit(force: true)
+        try require(!bridge.sourceMode && bridge.source == modeSource && bridge.revision == modeRevision,
+                    "返回预览改变了源码")
+        print("Yu source mode window self-check: toolbar toggle, literal glyphs, frame invalidation and unchanged source/selection passed")
 
         // 3. 光标移动不推进 Revision，但必须让帧失效。
         let sourceLength = bridge.source.utf16.count
@@ -814,20 +1448,47 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         try require(republished?.submitted == true, "光标移动后的重提交失败")
         try require(surfaceCoordinator.hasCurrentFrame(), "重提交后未恢复为当前帧")
 
-        // 5. 可滚动范围必须等于 Rust 这一帧的内容高度。
-        //    它此前来自 document view 自己的 TextKit 排版，两套布局高度不同，
-        //    长文档的尾部因此滚不到——没有报错，只是滚不下去。
+        // Native candidate rectangles must apply document -> view -> screen
+        // conversion once, including a caret in a later paragraph.
+        let inputWidth = textView.bounds.width
+        let viewportWidth = documentScrollView?.contentView.bounds.width ?? 0
+        try require(abs(inputWidth - viewportWidth) < 0.5,
+                    "输入宿主宽度 \(inputWidth) 与阅读视口 \(viewportWidth) 不一致")
+        let candidateOffset = max(sourceLength - 1, 0)
+        let candidate = try require(
+            textView.shapedCaretRectForSelfCheck(sourceUTF16: candidateOffset),
+            "缺少文档尾部光标几何"
+        )
+        var actualRange = NSRange(location: NSNotFound, length: 0)
+        let screenRect = textView.firstRect(
+            forCharacterRange: NSRange(location: candidateOffset, length: 0),
+            actualRange: &actualRange
+        )
+        let nativeWindow = try require(textView.window, "缺少输入窗口")
+        let returnedRect = textView.convert(nativeWindow.convertFromScreen(screenRect), from: nil)
+        try require(actualRange.location == candidateOffset, "输入法矩形返回了错误源码范围")
+        try require(abs(returnedRect.minY - candidate.minY - textView.contentOrigin.y) < 0.5,
+                    "输入法矩形的文档原点或滚动转换不一致")
+        try require(abs(returnedRect.minX - candidate.minX - textView.contentOrigin.x) < 0.5,
+                    "输入法矩形的阅读列转换不一致")
+        try require(abs(returnedRect.height - candidate.height) < 0.5, "输入法矩形丢失真实行高")
+
+        // 5. 滚动范围包含 Rust 文档高度及阅读区上下留白。
+        //    留白属于同一坐标转换，必须能够滚到，不能把它裁在 document view 外。
         let contentHeight = republished?.contentHeight ?? 0.0
         try require(contentHeight > 0.0, "帧未报告内容高度")
         guard let scrollView = documentScrollView,
               let documentView = scrollView.documentView else {
             throw Failure(message: "没有可滚动的 document view")
         }
-        let expectedExtent = max(contentHeight, scrollView.contentView.bounds.height)
+        let theme = NativeTheme.spec(dark: documentView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        let expectedExtent = max(contentHeight + CGFloat(theme.top + theme.bottom), scrollView.contentView.bounds.height)
         try require(
             abs(documentView.frame.height - expectedExtent) <= 0.5,
-            "可滚动范围 \(documentView.frame.height) 不等于内容高度 \(expectedExtent)"
+            "可滚动范围 \(documentView.frame.height) 不等于正文与留白的总高度 \(expectedExtent)"
         )
+
+        try verifyScrollExtentForSelfCheck(scrollView)
 
         // 小幅滚动应当复用已发布的 retained coverage，只改变呈现视口，
         // 而不是再次触发完整 Markdown/CoreText frame build。
@@ -1093,6 +1754,404 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             try require(surfaceCoordinator.hasCurrentFrame(), "reattachment did not restore current frame")
         }
 
+        try await surfaceCoordinator.verifyLayoutCoordinatorForSelfCheck()
+        let bidiRange = (bridge.source as NSString).range(of: "אבג def דהו xyz")
+        if bidiRange.location != NSNotFound {
+            let originalSource = bridge.source
+            let savedSelection = bridge.selectionEndpoints
+            let width = Float(max(textView.bounds.width - 2 * textView.contentOrigin.x, 1))
+            let size = Float(textView.font?.pointSize ?? 16)
+            let offset = UInt64(bidiRange.location + 3)
+            var positions: [CGFloat] = []
+            for affinity: UInt8 in [0, 1] {
+                let caret = try bridge.sourceCaret(revision: bridge.revision,
+                    sourceUTF16: offset, affinity: affinity, size: size, maxWidth: width)
+                positions.append(caret.point.x)
+                let point = NSPoint(x: caret.point.x, y: caret.point.y + caret.height / 2)
+                let hit = try bridge.projectionHitTest(revision: bridge.revision,
+                    point: point, size: size, maxWidth: width)
+                try require(textView.applyVisualPointerSelectionForSelfCheck(at: point), "双向边界点击失败")
+                let selection = bridge.selectionEndpoints
+                try require(selection.focusUTF16 == hit.sourceUTF16 && selection.affinity == hit.affinity,
+                    "输入宿主丢失双向命中的源码位置或 affinity")
+                var actual = NSRange(location: NSNotFound, length: 0)
+                let rect = textView.firstRect(forCharacterRange: NSRange(location: Int(selection.focusUTF16), length: 0), actualRange: &actual)
+                let local = textView.convert(nativeWindow.convertFromScreen(rect), from: nil)
+                try require(abs(local.minX - textView.contentOrigin.x - hit.point.x) < 0.5,
+                    "双向边界候选框没有保留选择的 affinity")
+                try require(actual.location == Int(selection.focusUTF16), "双向候选框源码范围不一致")
+                textView.navigate(toSources: [NSRange(location: 0, length: 0)], primary: 0, affinities: [1])
+                try require(textView.addCaretAtVisualPointForSelfCheck(point), "双向边界添加光标失败")
+                let selections = try require(bridge.selectionsIfAvailable, "缺少多光标状态")
+                try require(selections.ranges.contains { $0.range.location == Int(hit.sourceUTF16) && $0.affinity == hit.affinity },
+                    "新光标没有保留双向边界 affinity")
+                try require(selections.ranges.contains { $0.range.location == 0 && $0.affinity == 1 },
+                    "添加双向光标改变了已有光标 affinity")
+            }
+            try require(abs(positions[0] - positions[1]) > 1, "语料没有覆盖双向边界的两个位置")
+            try require(bridge.source == originalSource, "双向指针检查修改了源码")
+            try bridge.setSelectionEndpoints(anchorUTF16: savedSelection.anchorUTF16,
+                focusUTF16: savedSelection.focusUTF16, affinity: savedSelection.affinity)
+            textView.refreshFromRust()
+            print("Yu bidi pointer self-check: primary/secondary hit, source affinity, candidate rectangle and multicaret preserved")
+        }
+
+        if bridge.source.contains("Table P1 right") {
+            let original = bridge.source
+            let originalFont = textView.font
+            let baseSize = originalFont?.pointSize ?? 16
+            for zoom: CGFloat in [0.75, 1.0, 1.5] {
+                let size = baseSize * zoom
+                textView.font = NSFont(name: originalFont?.fontName ?? "Open Sans", size: size)
+                surfaceCoordinator.setFontSize(size)
+                let last = (bridge.source as NSString).range(of: "Table P1 right")
+                textView.navigate(toSource: NSRange(location: last.location, length: 0))
+                _ = try await submit(force: true)
+                let dividers = surfaceCoordinator.tableResizeAccessibilityDividers()
+                let divider = try require(dividers.first { $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN) }, "缺少嵌套表格列分隔线")
+                let point = NSPoint(x: divider.rect.midX, y: divider.rect.midY)
+                try require(surfaceCoordinator.beginTableResize(at: point), "表格拖拽未开始")
+                try require(surfaceCoordinator.updateTableResize(at: NSPoint(x: point.x + 18 * zoom, y: point.y)), "表格拖拽未更新")
+                try require(surfaceCoordinator.finishTableResize(), "表格拖拽未完成")
+                _ = try await submit(force: true)
+                let resized = try require(surfaceCoordinator.tableResizeAccessibilityDividers().first {
+                    $0.blockIndex == divider.blockIndex && $0.index == divider.index && $0.kind == divider.kind
+                }, "拖拽后缺少同一列分隔线")
+                try require(resized.rect.midX > divider.rect.midX + 0.5, "拖拽未改变实际发布的列宽几何")
+                try require(bridge.source == original, "调整列宽改变了源码")
+                if view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua {
+                    try bridge.save()
+                    let reopenedWidths = try StorageBridge(path: bridge.path)
+                    try require(reopenedWidths.presentationStorageError == nil, "重新打开列宽存储失败")
+                    let reopenedSelection = bridge.selectionEndpoints
+                    try reopenedWidths.setSelectionEndpoints(anchorUTF16: reopenedSelection.anchorUTF16,
+                        focusUTF16: reopenedSelection.focusUTF16, affinity: reopenedSelection.affinity)
+                    let reopenedWidth = Float(max(textView.bounds.width - 2 * textView.contentOrigin.x, 1))
+                    let reopenedCaret = try reopenedWidths.sourceCaret(revision: reopenedWidths.revision,
+                        sourceUTF16: UInt64(last.location), affinity: 1, size: Float(size), maxWidth: reopenedWidth)
+                    let reopenedDividers = try reopenedWidths.tableResizeAccessibilityDividers(
+                        revision: reopenedWidths.revision, size: Float(size), maxWidth: reopenedWidth,
+                        scrollY: Float(max(reopenedCaret.point.y - 100, 0)), viewportHeight: 400)
+                    let restoredDivider = try require(reopenedDividers.first {
+                        $0.tableSourceRange == resized.tableSourceRange && $0.index == resized.index && $0.kind == resized.kind
+                    }, "重新打开后缺少同一列分隔线")
+                    try require(abs(restoredDivider.rect.midX - resized.rect.midX) <= 1,
+                        "重新打开后列宽几何变化超过 1pt")
+                    let restoredHit = try reopenedWidths.tableResizeAtDocumentPoint(
+                        revision: reopenedWidths.revision,
+                        action: UInt8(YU_STORAGE_TABLE_RESIZE_PROBE),
+                        size: Float(size),
+                        maxWidth: reopenedWidth,
+                        point: CGPoint(x: resized.rect.midX, y: reopenedCaret.point.y + reopenedCaret.height / 2),
+                        tolerance: 1
+                    )
+                    try require(restoredHit.kind == resized.kind && restoredHit.index == resized.index
+                        && abs(CGFloat(restoredHit.position) - resized.rect.midX) <= 1,
+                        "重新打开后未恢复实际列分隔线位置")
+                    try require(reopenedWidths.source == original, "列宽重开改写源码")
+                    print("Yu table width persistence self-check: native reopen and divider hit passed zoom=\(zoom)")
+                }
+                textView.doCommand(by: #selector(NSResponder.insertTab(_:)))
+                let appended = bridge.source
+                try require(appended != original && appended.hasPrefix(original), "末格 Tab 未追加行或改写旧源码")
+                let emptyFirstSource = bridge.selectionEndpoints.focusUTF16
+                textView.doCommand(by: #selector(NSResponder.insertTab(_:)))
+                let emptyLastSource = bridge.selectionEndpoints.focusUTF16
+                _ = try await submit(force: true)
+                let emptyWidth = Float(max(textView.bounds.width - 2 * textView.contentOrigin.x, 1))
+                let emptyHeader = (appended as NSString).range(of: "Table P1 A")
+                let emptyFrom = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(emptyHeader.location), affinity: 1, size: Float(size), maxWidth: emptyWidth)
+                let emptyTo = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: emptyLastSource, affinity: 1, size: Float(size), maxWidth: emptyWidth)
+                try require(textView.selectTableCellsAtVisualPoint(NSPoint(x: emptyFrom.point.x + 1, y: emptyFrom.point.y + 1), starting: true), "空格子拖选起点失败")
+                _ = try await submit(force: true)
+                try require(textView.selectTableCellsAtVisualPoint(NSPoint(x: emptyTo.point.x + 1, y: emptyTo.point.y + 1), starting: false), "空格子拖选终点失败")
+                textView.finishTableCellSelection()
+                let emptySelectionFrame = try await submit(force: true)
+                try require(bridge.tableSelectionColumns == 2 && bridge.selectionsIfAvailable?.ranges.count == 6, "空单元格丢失源码身份")
+                try require(emptySelectionFrame?.selectionDecorationCount == 6, "空单元格缺少整格高亮")
+                if let directory = ProcessInfo.processInfo.environment["YU_CELL_SELECTION_CAPTURE_DIR"] {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    guard let window = view.window else {
+                        throw Failure(message: "矩形选区采集失败：测试视图未绑定窗口")
+                    }
+                    let image = try await captureEditingImage()
+                    guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+                        throw Failure(message: "矩形选区采集失败：PNG 编码失败")
+                    }
+                    let folder = URL(fileURLWithPath: directory, isDirectory: true)
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                    let dark = window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    let name = "\(dark ? "night" : "github")-zoom-\(zoom)"
+                    try png.write(to: folder.appendingPathComponent(name + ".png"))
+                    try appended.write(to: folder.appendingPathComponent(name + ".md"), atomically: true, encoding: .utf8)
+                    let metadata: [String: Any] = ["selected_cells": 6, "empty_cells": 2, "columns": 2,
+                        "scale": window.backingScaleFactor, "width_pt": window.frame.width, "height_pt": window.frame.height,
+                        "pixel_width": image.width, "pixel_height": image.height, "zoom": zoom, "reference_comparison": false]
+                    try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys]).write(to: folder.appendingPathComponent(name + ".json"))
+                }
+                textView.navigate(toSource: NSRange(location: Int(emptyFirstSource), length: 0))
+                textView.insertText("羽|🪶", replacementRange: NSRange(location: NSNotFound, length: 0))
+                let firstEdited = bridge.source
+                textView.doCommand(by: #selector(NSResponder.insertTab(_:)))
+                let pasteboard = NSPasteboard.withUniqueName()
+                defer { pasteboard.releaseGlobally() }
+                try require(pasteboard.setString(#"👨‍👩‍👧‍👦\|tail"#, forType: .yuMarkdown), "无法设置表格粘贴语料")
+                try textView.pasteFromPasteboardForSelfCheck(pasteboard)
+                let edited = bridge.source
+                try require(edited == appended.replacingOccurrences(of: "|  |  |", with: #"|羽\|🪶  |👨‍👩‍👧‍👦\|tail  |"#), "新增单元格编辑结果不一致")
+                let editedFrame = try await submit(force: true)
+                try require(editedFrame?.submitted == true && (editedFrame?.commandCount ?? 0) > 0,
+                    "新增表格行未提交绘制")
+                let inputWidth = Float(max(textView.bounds.width - 2 * textView.contentOrigin.x, 1))
+                let oldRowCaret = try bridge.sourceCaret(revision: bridge.revision,
+                    sourceUTF16: UInt64(last.location), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                let newRowOffset = UInt64((edited as NSString).range(of: "羽").location)
+                let newRowCaret = try bridge.sourceCaret(revision: bridge.revision,
+                    sourceUTF16: newRowOffset, affinity: 1, size: Float(size), maxWidth: inputWidth)
+                try require(newRowCaret.point.y > oldRowCaret.point.y + size * 0.5,
+                    "新增单元格没有排在原行下方")
+                for fragment in [#"羽\|🪶"#, #"👨‍👩‍👧‍👦\|tail"#] {
+                    let fragmentRange = (edited as NSString).range(of: fragment)
+                    let escapeOffset = (fragment as NSString).range(of: #"\|"#).location
+                    let from = UInt64(fragmentRange.location + escapeOffset)
+                    let beforePipe = try bridge.projectionCaret(revision: bridge.revision, sourceUTF16: from, affinity: 1)
+                    let afterPipe = try bridge.projectionCaret(revision: bridge.revision, sourceUTF16: from + 2, affinity: 1)
+                    try require(afterPipe.visualUTF16 == beforePipe.visualUTF16 + 1,
+                        "转义管道符没有投影成单个可见字符")
+                }
+                textView.doCommand(by: #selector(NSResponder.insertBacktab(_:)))
+                try require(bridge.selectionEndpoints.focusUTF16 == UInt64((edited as NSString).range(of: "羽").location), "Shift-Tab 未返回第一格")
+                for expected in [firstEdited, appended, original] {
+                    textView.performUndo()
+                    try require(bridge.source == expected, "表格连续撤销未逐步恢复源码")
+                }
+                for expected in [appended, firstEdited, edited] {
+                    textView.performRedo()
+                    try require(bridge.source == expected, "表格连续重做结果不一致")
+                }
+                try bridge.save()
+                let reopened = try StorageBridge(path: bridge.path)
+                try require(reopened.source == edited, "表格保存重新打开不一致")
+                for _ in 0..<3 { textView.performUndo() }
+                try require(bridge.source == original, "表格自检未恢复原文")
+                // Exercise the real native menu action on the visible surface.
+                textView.navigate(toSource: NSRange(location: last.location, length: 0))
+                let tableMenu = textView.makeTableMenu()
+                let insertColumn = try require(tableMenu.items.first {
+                    $0.tag == Int(YU_STORAGE_COMMAND_TABLE_INSERT_COLUMN_AFTER)
+                }, "缺少新增列菜单")
+                try require(textView.validateMenuItem(insertColumn), "新增列菜单不可用")
+                textView.editTableFromMenu(insertColumn)
+                try require(bridge.source != original, "新增列菜单未修改源码")
+                let columnFrame = try await submit(force: true)
+                try require(columnFrame?.submitted == true, "新增列没有提交实际帧")
+                let newDividers = surfaceCoordinator.tableResizeAccessibilityDividers().filter {
+                    $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN) && $0.blockIndex == divider.blockIndex
+                }
+                try require(newDividers.count > dividers.filter {
+                    $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN) && $0.blockIndex == divider.blockIndex
+                }.count, "新增列未增加统一表格几何中的分隔线")
+                textView.performUndo()
+                try require(bridge.source == original, "菜单新增列撤销未恢复原文")
+                _ = try await submit(force: true)
+                let restoredDivider = try require(surfaceCoordinator.tableResizeAccessibilityDividers().first {
+                    $0.blockIndex == divider.blockIndex && $0.index == divider.index && $0.kind == divider.kind
+                }, "结构撤销后缺少列分隔线")
+                try require(abs(restoredDivider.rect.midX - resized.rect.midX) <= 1,
+                    "结构撤销丢失已确认列宽")
+                let header = (original as NSString).range(of: "Table P1 A")
+                let firstCell = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(header.location), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                let lastCell = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(last.location), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                try require(textView.selectTableCellsAtVisualPoint(NSPoint(x: firstCell.point.x + 1, y: firstCell.point.y + 1), starting: true), "矩形选区起点失败")
+                _ = try await submit(force: true)
+                try require(textView.selectTableCellsAtVisualPoint(NSPoint(x: lastCell.point.x + 1, y: lastCell.point.y + 1), starting: false), "矩形选区终点失败")
+                textView.finishTableCellSelection()
+                let cellFrame = try await submit(force: true)
+                try require(bridge.tableSelectionColumns == 2 && bridge.selectionsIfAvailable?.ranges.count == 4, "矩形选区未覆盖四个单元格")
+                try require(cellFrame?.selectionDecorationCount == 4 && cellFrame?.caretDecorationCount == 0, "矩形选区未绘制整格高亮或残留插入光标")
+                let gridBoard = NSPasteboard.withUniqueName()
+                defer { gridBoard.releaseGlobally() }
+                try textView.copyToPasteboardForSelfCheck(gridBoard)
+                textView.navigate(toSource: NSRange(location: last.location, length: 0))
+                try textView.pasteFromPasteboardForSelfCheck(gridBoard)
+                let pastedGridFrame = try await submit(force: true)
+                try require(bridge.source != original && bridge.tableSelectionColumns == 2, "网格粘贴未扩展表格或保留选区")
+                try require(pastedGridFrame?.submitted == true && pastedGridFrame?.selectionDecorationCount == 4, "网格粘贴未提交四格高亮")
+                let gridDividers = surfaceCoordinator.tableResizeAccessibilityDividers().filter {
+                    $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN) && $0.blockIndex == divider.blockIndex
+                }
+                try require(gridDividers.count > dividers.filter {
+                    $0.kind == UInt8(YU_STORAGE_TABLE_RESIZE_COLUMN) && $0.blockIndex == divider.blockIndex
+                }.count, "网格粘贴未产生新列几何")
+                textView.performUndo()
+                try require(bridge.source == original, "网格粘贴撤销未恢复原文")
+                _ = try await submit(force: true)
+                guard let externalMarkdown = gridBoard.string(forType: .yuMarkdown) else {
+                    throw Failure(message: "缺少外部 Markdown 表格表示")
+                }
+                gridBoard.clearContents()
+                try require(gridBoard.setString(externalMarkdown, forType: .yuMarkdown), "无法设置外部 Markdown 剪贴板")
+                textView.navigate(toSource: NSRange(location: last.location, length: 0))
+                try textView.pasteFromPasteboardForSelfCheck(gridBoard)
+                let externalGridFrame = try await submit(force: true)
+                try require(bridge.source != original && bridge.tableSelectionColumns == 2, "外部 Markdown 表格未形成网格编辑")
+                try require(externalGridFrame?.submitted == true && externalGridFrame?.selectionDecorationCount == 4, "外部表格未提交四格高亮")
+                textView.performUndo()
+                try require(bridge.source == original, "外部 Markdown 表格撤销未恢复原文")
+                _ = try await submit(force: true)
+                gridBoard.clearContents()
+                try require(gridBoard.setString("BR_P1_FIRST<br>BR_P1_SECOND", forType: .yuMarkdown), "换行测试剪贴板失败")
+                textView.navigate(toSource: NSRange(location: last.location, length: 0))
+                try textView.pasteFromPasteboardForSelfCheck(gridBoard)
+                let breakSource = bridge.source
+                let breakFirst = (breakSource as NSString).range(of: "BR_P1_FIRST").location
+                let breakSecond = (breakSource as NSString).range(of: "BR_P1_SECOND").location
+                textView.navigate(toSource: NSRange(location: breakSecond, length: 0))
+                let breakFrame = try await submit(force: true)
+                try require(breakFrame?.submitted == true, "多行单元格未提交绘制")
+                let firstBreakCaret = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(breakFirst), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                let secondBreakCaret = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(breakSecond), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                let firstBreakEnd = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(breakFirst + "BR_P1_FIRST".utf16.count), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                let secondBreakEnd = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(breakSecond + "BR_P1_SECOND".utf16.count), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                print("Yu BR diagnostic size=\(size) first=\(firstBreakCaret.point)→\(firstBreakEnd.point) second=\(secondBreakCaret.point)→\(secondBreakEnd.point)")
+                try require(secondBreakCaret.point.y > firstBreakCaret.point.y + size * 0.5, "CoreText 未将 br 排为下一行")
+                try require(firstBreakCaret.point.x > secondBreakCaret.point.x + size * 0.5, "右对齐表格的短行未逐行靠右 size=\(size) first=\(firstBreakCaret.point) second=\(secondBreakCaret.point)")
+                let breakHit = try bridge.projectionHitTest(revision: bridge.revision, point: CGPoint(x: secondBreakCaret.point.x + 0.1, y: secondBreakCaret.point.y + 1), size: Float(size), maxWidth: inputWidth)
+                try require(breakHit.sourceUTF16 == UInt64(breakSecond), "多行单元格点击没有返回第二行源码")
+                // Bring the full last cell into view, then restore the second-line
+                // caret so capture includes wrapped trailing text and bottom border.
+                textView.navigate(toSource: NSRange(location: (breakSource as NSString).length, length: 0))
+                _ = try await submit(force: true)
+                textView.navigate(toSource: NSRange(location: breakSecond, length: 0))
+                _ = try await submit(force: true)
+                if let directory = ProcessInfo.processInfo.environment["YU_CELL_SELECTION_CAPTURE_DIR"] {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    guard let window = view.window else { throw Failure(message: "编辑截图没有窗口") }
+                    let image = try await captureEditingImage()
+                    guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+                        throw Failure(message: "多行单元格原尺寸截图失败")
+                    }
+                    let folder = URL(fileURLWithPath: directory, isDirectory: true)
+                    let dark = window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    let name = "break-\(dark ? "night" : "github")-zoom-\(zoom)"
+                    try png.write(to: folder.appendingPathComponent(name + ".png"))
+                    try breakSource.write(to: folder.appendingPathComponent(name + ".md"), atomically: true, encoding: .utf8)
+                    let metadata: [String: Any] = ["scale": window.backingScaleFactor, "width_pt": window.frame.width, "height_pt": window.frame.height,
+                        "pixel_width": image.width, "pixel_height": image.height, "zoom": zoom, "reference_comparison": false,
+                        "first_line_y": firstBreakCaret.point.y, "second_line_y": secondBreakCaret.point.y, "second_line_source_utf16": breakSecond,
+                        "first_line_x": firstBreakCaret.point.x, "second_line_x": secondBreakCaret.point.x]
+                    try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys]).write(to: folder.appendingPathComponent(name + ".json"))
+                }
+                try bridge.save()
+                let breakReopened = try StorageBridge(path: bridge.path)
+                try require(breakReopened.source == breakSource, "br 保存重开源码不一致")
+                textView.performUndo()
+                try require(bridge.source == original, "br 粘贴撤销未恢复原文")
+                _ = try await submit(force: true)
+                gridBoard.clearContents()
+                try require(gridBoard.setString("\" TSVFIRST\nTSVSECOND \"\t\"a\tb\"", forType: .tabularText), "TSV 剪贴板失败")
+                textView.navigate(toSource: NSRange(location: last.location, length: 0))
+                try textView.pasteFromPasteboardForSelfCheck(gridBoard)
+                let tsvSource = bridge.source
+                try require(tsvSource.contains("&#32;TSVFIRST<br>TSVSECOND&#32;") && tsvSource.contains("a&#9;b"), "TSV 单元格编码失败")
+                let tsvFirst = (tsvSource as NSString).range(of: "TSVFIRST").location
+                let tsvSecond = (tsvSource as NSString).range(of: "TSVSECOND").location
+                textView.navigate(toSource: NSRange(location: tsvSecond, length: 0))
+                let tsvFrame = try await submit(force: true)
+                try require(tsvFrame?.submitted == true, "TSV 未提交绘制")
+                let firstTSVCaret = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(tsvFirst), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                let secondTSVCaret = try bridge.sourceCaret(revision: bridge.revision, sourceUTF16: UInt64(tsvSecond), affinity: 1, size: Float(size), maxWidth: inputWidth)
+                try require(secondTSVCaret.point.y > firstTSVCaret.point.y + size * 0.5, "TSV 多行几何失败")
+                let tsvHit = try bridge.projectionHitTest(revision: bridge.revision, point: CGPoint(x: secondTSVCaret.point.x + 0.1, y: secondTSVCaret.point.y + 1), size: Float(size), maxWidth: inputWidth)
+                try require(tsvHit.sourceUTF16 == UInt64(tsvSecond), "TSV 第二行点击源码偏移错误")
+                if let directory = ProcessInfo.processInfo.environment["YU_CELL_SELECTION_CAPTURE_DIR"] {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    guard let window = view.window else { throw Failure(message: "编辑截图没有窗口") }
+                    let image = try await captureEditingImage()
+                    guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+                        throw Failure(message: "TSV 原尺寸截图失败")
+                    }
+                    let folder = URL(fileURLWithPath: directory, isDirectory: true)
+                    let dark = window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                    let name = "tsv-\(dark ? "night" : "github")-zoom-\(zoom)"
+                    try png.write(to: folder.appendingPathComponent(name + ".png"))
+                    try tsvSource.write(to: folder.appendingPathComponent(name + ".md"), atomically: true, encoding: .utf8)
+                    let metadata: [String: Any] = ["scale": window.backingScaleFactor, "width_pt": window.frame.width, "height_pt": window.frame.height,
+                        "pixel_width": image.width, "pixel_height": image.height, "zoom": zoom, "reference_comparison": false,
+                        "first_line_y": firstTSVCaret.point.y, "second_line_y": secondTSVCaret.point.y, "second_line_source_utf16": tsvSecond]
+                    try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys]).write(to: folder.appendingPathComponent(name + ".json"))
+                }
+                try bridge.save()
+                let tsvReopened = try StorageBridge(path: bridge.path)
+                try require(tsvReopened.source == tsvSource, "TSV 保存重开不一致")
+                textView.performUndo()
+                try require(bridge.source == original, "TSV 撤销未恢复原文")
+                _ = try await submit(force: true)
+                textView.navigate(toSource: NSRange(location: last.location, length: 0))
+                try bridge.save()
+                textView.refreshFromRust()
+                _ = try await submit(force: true)
+                // Each zoom tests the same starting proportions. Text undo now
+                // intentionally retains confirmed widths, so reset the gesture
+                // explicitly instead of relying on the former width-loss bug.
+                let finalDivider = try require(surfaceCoordinator.tableResizeAccessibilityDividers().first {
+                    $0.blockIndex == divider.blockIndex && $0.index == divider.index && $0.kind == divider.kind
+                }, "缩放测试结束后缺少列分隔线")
+                try require(abs(finalDivider.rect.midX - resized.rect.midX) <= 1,
+                    "连续编辑撤销后丢失已确认列宽 size=\(size) expected=\(resized.rect) actual=\(finalDivider.rect) viewport=\(textView.bounds.width)")
+                let finalPoint = NSPoint(x: finalDivider.rect.midX, y: finalDivider.rect.midY)
+                try require(surfaceCoordinator.beginTableResize(at: finalPoint), "还原测试列宽未开始")
+                try require(surfaceCoordinator.updateTableResize(at: NSPoint(x: divider.rect.midX, y: finalPoint.y)), "还原测试列宽未更新")
+                try require(surfaceCoordinator.finishTableResize(), "还原测试列宽未完成")
+                _ = try await submit(force: true)
+                let resetDivider = try require(surfaceCoordinator.tableResizeAccessibilityDividers().first {
+                    $0.blockIndex == divider.blockIndex && $0.index == divider.index && $0.kind == divider.kind
+                }, "还原测试列宽后缺少分隔线")
+                try require(abs(resetDivider.rect.midX - divider.rect.midX) <= 1,
+                    "缩放测试未恢复起始列宽")
+            }
+            textView.font = originalFont
+            surfaceCoordinator.setFontSize(baseSize)
+            _ = try await submit(force: true)
+            print("Yu table editing self-check: nested Tab/Shift-Tab, append, Unicode edit, undo/redo, resize and save/reopen passed at 3 zooms")
+            print("Yu rectangular cell window self-check: shared pointer geometry, 4/6 cell highlights including empty cells and no text carets passed at 3 zooms")
+            print("Yu HTML break window self-check: CoreText multiline cells, second-line hit/source mapping, save/reopen and undo passed at 3 zooms")
+            print("Yu external Markdown table window self-check: external clipboard representation, grid growth, submitted four-cell highlight and undo passed at 3 zooms")
+            print("Yu grid paste window self-check: copied rectangle, single-cell target growth, submitted selection/column geometry and undo passed at 3 zooms")
+            print("Yu table menu window self-check: native column action, submitted geometry and undo passed at 3 zooms")
+            print("Yu table literal input self-check: typed pipe, escaped Markdown paste and single-character projection passed at 3 zooms")
+        }
+
+        // Validate navigation after a real menu target/action round trip, not
+        // merely whether its two panels became visible. Run after initial layout.
+        let savedSidebar = sidebarTabs.selectedSegment
+        let savedSidebarHidden = sidebarHidden
+        let savedEndpoints = bridge.selectionEndpoints
+        let sidebarAction = try require(sidebarTabs.action, "侧栏菜单缺少 action")
+        for index in [0, 1, 0, 1] {
+            sidebarTabs.selectedSegment = index
+            try require(NSApp.sendAction(sidebarAction, to: sidebarTabs.target, from: sidebarTabs),
+                "侧栏菜单 action 未送达")
+            try require(filePanel.view.isHidden == (index != 0)
+                && outlinePanel.scrollView.isHidden == (index != 1), "侧栏标题菜单未切换对应面板")
+            if index == 1 {
+                for row in [0, outlinePanel.rowCountForSelfCheck - 1] {
+                    let node = try require(outlinePanel.nodeForSelfCheck(row: row), "切换后缺少大纲行")
+                    outlinePanel.clickRowForSelfCheck(row)
+                    try require(bridge.selection.range == NSRange(location: node.item.labelRange.location, length: 0),
+                        "切换后大纲导航错误 row=\(row) expected=\(node.item.labelRange.location) actual=\(bridge.selection.range)")
+                }
+            }
+        }
+        sidebarTabs.selectedSegment = savedSidebar
+        sidebarHidden = savedSidebarHidden
+        updateSidebarVisibility()
+        try bridge.setSelectionEndpoints(anchorUTF16: savedEndpoints.anchorUTF16,
+            focusUTF16: savedEndpoints.focusUTF16, affinity: savedEndpoints.affinity)
+        textView.refreshFromRust()
+        _ = try await submit(force: true)
+        print("Yu sidebar navigation self-check: native menu dispatch, repeated file/outline switching and first/last heading navigation passed")
+
         print(
             "Yu frame scheduling self-check: commands=\(snapshot?.commandCount ?? 0) "
                 + "caret=\(republished?.caretDecorationCount ?? 0) "
@@ -1109,7 +2168,321 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
 
     /// Scripted real-window protocol checks. These never synthesize live-scroll
     /// boundaries, so their presents cannot be counted as trackpad acceptance.
+    /// A submitted command buffer is insufficient evidence that the document
+    /// reached the compositor. The fixed visual fixture must have visible ink
+    /// inside the editor, excluding sidebar, title and status text.
+    private func captureContainsDocumentInk(_ image: CGImage, dark: Bool) -> Bool {
+        let bitmap = NSBitmapImageRep(cgImage: image)
+        let packed = NativeTheme.spec(dark: dark).background
+        // NSBitmapImageRep.colorAt exposes calibrated components. Convert the
+        // expected framebuffer components through the same space before comparing.
+        let expected = NSColor(calibratedRed: CGFloat((packed >> 24) & 255) / 255,
+                               green: CGFloat((packed >> 16) & 255) / 255,
+                               blue: CGFloat((packed >> 8) & 255) / 255, alpha: 1).usingColorSpace(.sRGB)!
+        let background = [expected.redComponent, expected.greenComponent, expected.blueComponent]
+        guard let window = view.window, let scroll = textView.enclosingScrollView else { return false }
+        let scale = window.backingScaleFactor
+        let surface = surfaceHostView.convert(surfaceHostView.bounds, to: nil)
+        let startX = max(0, Int(((surface.minX + textView.contentOrigin.x) * scale).rounded(.up)))
+        let endX = min(image.width, Int(((surface.maxX - textView.contentOrigin.x) * scale).rounded(.down)))
+        let top = window.frame.height - surface.maxY + max(0, textView.contentOrigin.y - scroll.contentView.bounds.origin.y)
+        let startY = max(0, Int((top * scale).rounded(.up)))
+        let endY = min(image.height, Int(((window.frame.height - surface.minY - 1) * scale).rounded(.down)))
+        guard startX < endX, startY < endY else { return false }
+        // Ink alone accepts an entire stale white canvas as "ink" in Night.
+        // The reading-column margin must already show the requested theme.
+        let marginX = max(Int((surface.minX + 2) * scale), startX - Int(4 * scale))
+        var matchingBackground = 0
+        var backgroundSamples = 0
+        for y in stride(from: startY, to: endY, by: 8) {
+            guard let color = bitmap.colorAt(x: marginX, y: y)?.usingColorSpace(.sRGB) else { continue }
+            backgroundSamples += 1
+            let difference = abs(color.redComponent - background[0]) + abs(color.greenComponent - background[1]) + abs(color.blueComponent - background[2])
+            if difference < 0.1 { matchingBackground += 1 }
+        }
+        guard backgroundSamples > 0, matchingBackground * 5 >= backgroundSamples * 4 else { return false }
+        var inkSamples = 0
+        for y in stride(from: startY, to: endY, by: 4) {
+            for x in stride(from: startX, to: endX, by: 4) {
+                guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                let difference = abs(color.redComponent - background[0]) + abs(color.greenComponent - background[1]) + abs(color.blueComponent - background[2])
+                if difference > 0.35 { inkSamples += 1 }
+                if inkSamples >= 40 { return true }
+            }
+        }
+        return false
+    }
+
     @MainActor
+    /// Captures the real compositor result, including Metal, never an NSView
+    /// cache that could silently omit the document surface.
+    func runLayoutCoordinatorSelfCheck() async throws {
+        try await surfaceCoordinator.verifyLayoutCoordinatorForSelfCheck()
+    }
+
+    private func verifyScrollExtentForSelfCheck(_ scroll: NSScrollView) throws {
+        struct Failure: LocalizedError {
+            let message: String
+            var errorDescription: String? { message }
+        }
+        let insets = scroll.contentInsets
+        guard !scroll.automaticallyAdjustsContentInsets,
+              insets.top == 0, insets.bottom == 0, insets.left == 0, insets.right == 0 else {
+            throw Failure(message: "AppKit added scroll insets outside the shared reading geometry")
+        }
+        let overflow = textView.frame.height - scroll.contentView.bounds.height
+        let hidden = scroll.verticalScroller?.isHidden ?? true
+        if overflow <= 0.01 && !hidden {
+            throw Failure(message: "Fitting document retained a vertical scroller: overflow=\(overflow)")
+        }
+        if overflow > 1 && hidden {
+            throw Failure(message: "Overflowing document lost its vertical scroller: overflow=\(overflow)")
+        }
+        guard abs(textView.bounds.width - scroll.contentView.bounds.width) < 0.5 else {
+            throw Failure(message: "Document width did not follow native scroller visibility")
+        }
+    }
+
+    func captureVisualAcceptance(to directory: URL) async throws {
+        struct Failure: LocalizedError {
+            let message: String
+            var errorDescription: String? { message }
+        }
+        guard let window = view.window, let scroll = documentScrollView else {
+            throw Failure(message: "Visual acceptance requires a real window")
+        }
+        func digest(_ data: Data) -> String {
+            SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        guard let executable = Bundle.main.executableURL else {
+            throw Failure(message: "Capture requires an identifiable application executable")
+        }
+        let sourceAtStart = bridge.source
+        let revisionAtStart = bridge.revision
+        let executableDigest = digest(try Data(contentsOf: executable, options: .mappedIfSafe))
+        let sourceDigest = digest(Data(sourceAtStart.utf8))
+        var fontDigests: [String: String] = [:]
+        if let fonts = Bundle.main.resourceURL?.appendingPathComponent("Fonts") {
+            for url in try FileManager.default.contentsOfDirectory(at: fonts, includingPropertiesForKeys: nil)
+                where ["ttf", "otf"].contains(url.pathExtension.lowercased()) {
+                fontDigests[url.lastPathComponent] = digest(try Data(contentsOf: url, options: .mappedIfSafe))
+            }
+        }
+        let captureStartedAt = ISO8601DateFormatter().string(from: Date())
+        let captureFraction = Double(ProcessInfo.processInfo.environment["YU_VISUAL_SCROLL_FRACTION"] ?? "0") ?? -1
+        guard captureFraction.isFinite, (0...1).contains(captureFraction) else {
+            throw Failure(message: "YU_VISUAL_SCROLL_FRACTION must be between 0 and 1")
+        }
+        isCapturingVisualAcceptance = true
+        defer { isCapturingVisualAcceptance = false }
+        let activationDeadline = Date().addingTimeInterval(45)
+        while (!NSApp.isActive || !window.isKeyWindow), Date() < activationDeadline {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard NSApp.isActive, window.isKeyWindow else {
+            throw Failure(message: "Activate the Yu window before capture; background Stage Manager thumbnails are not acceptance screenshots")
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try bridge.setSelection(NSRange(location: (bridge.source as NSString).length, length: 0), affinity: 1)
+        textView.refreshFromRust()
+        outlinePanel.highlightHeading(containing: Int(bridge.selectionEndpoints.focusUTF16))
+        // Calibration may match an explicitly measured reference sidebar width;
+        // ordinary windows keep the product default. Record the actual geometry.
+        let captureSidebarWidth: CGFloat
+        if let value = ProcessInfo.processInfo.environment["YU_VISUAL_SIDEBAR_WIDTH"] {
+            guard let width = Double(value), width.isFinite, (180...400).contains(width) else {
+                throw Failure(message: "Capture sidebar width must be between 180 and 400pt")
+            }
+            captureSidebarWidth = CGFloat(width)
+        } else {
+            captureSidebarWidth = YuVisualTokens.sidebarWidth
+        }
+        var cases: [[String: Any]] = []
+        for size in [NSSize(width: 900, height: 620), NSSize(width: 1200, height: 800), NSSize(width: 1600, height: 1000)] {
+            for dark in [false, true] {
+                let themeName: String
+                switch NativeTheme.selection {
+                case .yu: themeName = dark ? "yu-dark" : "yu-light"
+                case .github: themeName = "github"
+                case .night: themeName = "night"
+                }
+                let appearanceName = dark ? "dark" : "light"
+                for sidebar in [true, false] {
+                    sidebarHidden = !sidebar
+                    updateSidebarVisibility()
+                    window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+                    window.setFrame(NSRect(origin: window.frame.origin, size: size), display: true)
+                    view.layoutSubtreeIfNeeded()
+                    if sidebar {
+                        documentSplitView?.setPosition(captureSidebarWidth, ofDividerAt: 0)
+                        view.layoutSubtreeIfNeeded()
+                    }
+                    updateReadingColumnInsets()
+                    syncSurfaceGeometry()
+                    guard abs(textView.bounds.width - scroll.contentView.bounds.width) < 0.5 else {
+                        throw Failure(message: "Input and painted viewport widths diverged after resize")
+                    }
+                    surfaceCoordinator.noteBoundsEvent()
+                    scroll.contentView.setBoundsOrigin(.zero)
+                    surfaceCoordinator.scheduleSubmit()
+                    let deadline = Date().addingTimeInterval(20)
+                    while (surfaceHostView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua) != dark, Date() < deadline {
+                        try await Task.sleep(nanoseconds: 20_000_000)
+                    }
+                    guard (surfaceHostView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua) == dark else {
+                        throw Failure(message: "Surface appearance did not reach requested theme")
+                    }
+                    // A drawable submitted before the window becomes visible can
+                    // complete with presentedTime == 0. Submission deduplication
+                    // must not leave this acceptance wait stuck on that drawable.
+                    // Retry a bounded number of times; success still requires an
+                    // actual presentation callback for the latest frame.
+                    var presentationRetries = 0
+                    var nextPresentationRetry = Date().addingTimeInterval(1)
+                    // A presented viewport may still use estimated heights for
+                    // offscreen blocks. Acceptance manifests must wait for the
+                    // progressive layout as well as the visible drawable.
+                    while (!surfaceCoordinator.hasCurrentFrame(requirePresented: true)
+                        || surfaceCoordinator.lastSnapshot?.layoutPending != false), Date() < deadline {
+                        let retryPresentation = surfaceCoordinator.hasCurrentFrame()
+                            && presentationRetries < 3 && Date() >= nextPresentationRetry
+                        _ = try surfaceCoordinator.submitNow(force: retryPresentation)
+                        if retryPresentation {
+                            presentationRetries += 1
+                            nextPresentationRetry = Date().addingTimeInterval(1)
+                        }
+                        try await Task.sleep(nanoseconds: 20_000_000)
+                    }
+                    guard surfaceCoordinator.hasCurrentFrame(requirePresented: true),
+                          surfaceCoordinator.lastSnapshot?.layoutPending == false,
+                          surfaceCoordinator.lastSnapshot?.commandCount ?? 0 > 0 else {
+                        throw Failure(message: "No current native frame for visual capture: submitted=\(surfaceCoordinator.hasCurrentFrame()) presented=\(surfaceCoordinator.hasCurrentFrame(requirePresented: true)) layoutPending=\(String(describing: surfaceCoordinator.lastSnapshot?.layoutPending)) commands=\(surfaceCoordinator.lastSnapshot?.commandCount ?? 0) active=\(NSApp.isActive) visible=\(window.isVisible)")
+                    }
+                    let captureScrollY = max(0, textView.frame.height - scroll.contentView.bounds.height) * captureFraction
+                    scroll.contentView.setBoundsOrigin(NSPoint(x: 0, y: captureScrollY))
+                    surfaceCoordinator.scheduleSubmit()
+                    let scrollDeadline = Date().addingTimeInterval(20)
+                    while (!surfaceCoordinator.hasCurrentFrame(requirePresented: true)
+                        || surfaceCoordinator.lastSnapshot?.layoutPending != false), Date() < scrollDeadline {
+                        _ = try surfaceCoordinator.submitNow()
+                        try await Task.sleep(nanoseconds: 20_000_000)
+                    }
+                    guard surfaceCoordinator.hasCurrentFrame(requirePresented: true),
+                          surfaceCoordinator.lastSnapshot?.layoutPending == false else {
+                        throw Failure(message: "No current native frame at requested scroll position")
+                    }
+                    var captured: CGImage?
+                    var rejected: CGImage?
+                    let captureDeadline = Date().addingTimeInterval(5)
+                    let expectedWidth = Int((window.frame.width * window.backingScaleFactor).rounded())
+                    let expectedHeight = Int((window.frame.height * window.backingScaleFactor).rounded())
+                    var captureFailure = "capture unavailable"
+                    while Date() < captureDeadline {
+                        try await Task.sleep(nanoseconds: 100_000_000)
+                        guard surfaceCoordinator.hasCurrentFrame(requirePresented: true),
+                              surfaceCoordinator.lastSnapshot?.layoutPending == false else {
+                            _ = try surfaceCoordinator.submitNow()
+                            captureFailure = "latest geometry/theme has not presented or layout remains pending"; continue
+                        }
+                        guard NSApp.isActive else { captureFailure = "application inactive"; continue }
+                        let image: CGImage
+                        do {
+                            image = try await NativeWindowCapture.image(window)
+                        } catch {
+                            captureFailure = error.localizedDescription
+                            continue
+                        }
+                        guard image.width == expectedWidth, image.height == expectedHeight else {
+                            captureFailure = "received \(image.width)×\(image.height) pixels"; continue
+                        }
+                        guard captureContainsDocumentInk(image, dark: dark) else {
+                            rejected = image
+                            captureFailure = "canvas theme or document ink mismatch"; continue
+                        }
+                        captured = image
+                        break
+                    }
+                    guard let image = captured else {
+                        if let rejected, let png = NSBitmapImageRep(cgImage: rejected).representation(using: .png, properties: [:]) {
+                            let name = "rejected-\(Int(size.width))x\(Int(size.height))-\(themeName)-chrome-\(appearanceName)-sidebar-\(sidebar ? "on" : "off").png"
+                            try png.write(to: directory.appendingPathComponent(name), options: .atomic)
+                        }
+                        throw Failure(message: "Full-window capture failed: \(captureFailure); expected \(expectedWidth)×\(expectedHeight) pixels")
+                    }
+                    let bitmap = NSBitmapImageRep(cgImage: image)
+                    guard let png = bitmap.representation(using: .png, properties: [:]) else {
+                        throw Failure(message: "Screenshot PNG encoding failed")
+                    }
+                    guard abs(scroll.contentView.bounds.origin.y - captureScrollY) < 0.5 else {
+                        throw Failure(message: "Screenshot scroll origin changed during capture")
+                    }
+                    try verifyScrollExtentForSelfCheck(scroll)
+                    let name = "\(Int(size.width))x\(Int(size.height))-\(themeName)-chrome-\(appearanceName)-sidebar-\(sidebar ? "on" : "off")-\(Int(window.backingScaleFactor))x"
+                    guard bridge.revision == revisionAtStart, bridge.source == sourceAtStart else {
+                        throw Failure(message: "Document changed during visual acceptance capture")
+                    }
+                    let screenshotURL = directory.appendingPathComponent(name + ".png")
+                    guard !FileManager.default.fileExists(atPath: screenshotURL.path) else {
+                        throw Failure(message: "Refusing to overwrite an existing acceptance screenshot: \(name)")
+                    }
+                    try png.write(to: screenshotURL, options: .atomic)
+                    let theme = NativeTheme.spec(dark: dark)
+                    let screenNumber = window.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+                    let displayID = CGDirectDisplayID(screenNumber?.uint32Value ?? 0)
+                    guard let displayMode = CGDisplayCopyDisplayMode(displayID) else {
+                        throw Failure(message: "Cannot identify capture display mode")
+                    }
+                    cases.append(["case": name, "window_width": window.frame.width,
+                        "png_sha256": digest(png), "theme": themeName,
+                        "chrome_appearance": appearanceName,
+                        "resolved_theme": NativeTheme.resolved(dark: dark),
+                        "font_size_pt": textView.font?.pointSize ?? CGFloat(theme.body_size),
+                        "declared_body_font": NativeTheme.font(identity: theme.body_font, size: CGFloat(theme.body_size)).fontName,
+                        "declared_heading_font": NativeTheme.font(identity: theme.heading_font, size: CGFloat(theme.body_size)).fontName,
+                        "declared_code_font": NativeTheme.font(identity: theme.code_font, size: CGFloat(theme.body_size)).fontName,
+                        "display_id": displayID,
+                        "display_pixel_width": displayMode.pixelWidth,
+                        "display_pixel_height": displayMode.pixelHeight,
+                        "display_mode_width": displayMode.width,
+                        "display_mode_height": displayMode.height,
+                        "display_point_width": window.screen?.frame.width ?? 0,
+                        "display_point_height": window.screen?.frame.height ?? 0,
+                        "window_height": window.frame.height, "pixel_width": image.width,
+                        "pixel_height": image.height, "scale": window.backingScaleFactor,
+                        "titlebar_height": window.frame.height - window.contentLayoutRect.height,
+                        "surface_left": surfaceHostView.convert(surfaceHostView.bounds, to: nil).minX,
+                        "reading_window_x": surfaceHostView.convert(surfaceHostView.bounds, to: nil).minX + textView.contentOrigin.x,
+                        "surface_top": window.frame.height - surfaceHostView.convert(surfaceHostView.bounds, to: nil).maxY,
+                        "sidebar_width": sidebar ? (sidebarContainer?.frame.width ?? 0) : 0,
+                        "clip_height": scroll.contentView.bounds.height,
+                        "document_height": textView.frame.height,
+                        "scroll_inset_top": scroll.contentInsets.top,
+                        "scroll_inset_bottom": scroll.contentInsets.bottom,
+                        "scroller_hidden": scroll.verticalScroller?.isHidden ?? true,
+                        "scroller_knob": scroll.verticalScroller?.knobProportion ?? 0,
+                        "reading_y": textView.contentOrigin.y,
+                        "reading_x": textView.contentOrigin.x,
+                        "reading_width": scroll.contentView.bounds.width - textView.contentOrigin.x * 2,
+                        "scroll_y": scroll.contentView.bounds.origin.y, "scroll_fraction": captureFraction,
+                        "source_revision": bridge.revision, "status": "captured-uncompared"])
+                }
+            }
+        }
+        guard digest(try Data(contentsOf: executable, options: .mappedIfSafe)) == executableDigest else {
+            throw Failure(message: "Application executable changed during visual acceptance capture")
+        }
+        let manifest = try JSONSerialization.data(withJSONObject: ["schema_version": 3, "cases": cases,
+            "app_sha256": executableDigest, "source_sha256": sourceDigest,
+            "source_filename": URL(fileURLWithPath: bridge.path).lastPathComponent,
+            "font_resources_sha256": fontDigests,
+            "os_version": ProcessInfo.processInfo.operatingSystemVersionString,
+            "capture_started_at": captureStartedAt,
+            "capture_finished_at": ISO8601DateFormatter().string(from: Date()),
+            "capture_method": "ScreenCaptureKit/SCScreenshotManager",
+            "visual_acceptance_passed": false, "note": "Yu regression baseline; review clipping, spacing and interaction separately"], options: [.prettyPrinted, .sortedKeys])
+        try manifest.write(to: directory.appendingPathComponent("manifest.json"), options: .atomic)
+    }
+
     func runRenderRegressionSelfCheck(resources: Bool, reopened: Bool = false) async throws {
         struct Failure: LocalizedError {
             let message: String
@@ -1241,10 +2614,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             let frame = try await submit()
             try require(frame.commandCount > 0 && frame.revision == bridge.revision,
                         "Long scroll submitted an empty or stale frame")
-            let expectedWidth = scroll.contentView.bounds.width - 2 * textView.textContainerOrigin.x
+            let expectedWidth = scroll.contentView.bounds.width - 2 * textView.contentOrigin.x
             try require(abs(CGFloat(surfaceCoordinator.visualDecorationGeometry()?.maxWidth ?? 0) - expectedWidth) < 1,
-                        "Render geometry kept a stale pre-resize content width: step=\(step) expected=\(expectedWidth) actual=\(surfaceCoordinator.visualDecorationGeometry()?.maxWidth ?? 0) surface=\(surfaceHostView.bounds.width) clip=\(scroll.contentView.bounds.width) inset=\(textView.textContainerOrigin.x)")
-            try require(abs(document.frame.height - max(frame.contentHeight, scroll.contentView.bounds.height)) < 1,
+                        "Render geometry kept a stale pre-resize content width: step=\(step) expected=\(expectedWidth) actual=\(surfaceCoordinator.visualDecorationGeometry()?.maxWidth ?? 0) surface=\(surfaceHostView.bounds.width) clip=\(scroll.contentView.bounds.width) inset=\(textView.contentOrigin.x)")
+            let extentTheme = NativeTheme.spec(dark: document.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+            let expectedExtent = max(frame.contentHeight + CGFloat(extentTheme.top + extentTheme.bottom), scroll.contentView.bounds.height)
+            try require(abs(document.frame.height - expectedExtent) < 1,
                         "Scroll extent disagrees with accepted publication")
             if step % 3 == 0 {
                 try require(frame.surfaceGeneration > generation, "Resize did not advance surface generation")
@@ -1260,7 +2635,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         let last = try await submit()
         let caret = try bridge.shapedCaretScrollRequest(
             revision: bridge.revision, size: Float(textView.font?.pointSize ?? 16),
-            maxWidth: Float(max(textView.bounds.width - 2 * textView.textContainerOrigin.x, 1)),
+            maxWidth: Float(max(textView.bounds.width - 2 * textView.contentOrigin.x, 1)),
             scrollY: Float(scroll.contentView.bounds.minY),
             viewportHeight: Float(scroll.contentView.bounds.height))
         // A fractional Rust target may round to a backing pixel in AppKit.
@@ -1291,9 +2666,21 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if let field = view.window?.firstResponder as? NSTextView {
+            if menuItem.action == #selector(undoFromMenu(_:)) { return field.undoManager?.canUndo ?? false }
+            if menuItem.action == #selector(redoFromMenu(_:)) { return field.undoManager?.canRedo ?? false }
+            let nativeActions: [Selector: String] = [
+                #selector(copyFromMenu(_:)): "copy:", #selector(cutFromMenu(_:)): "cut:",
+                #selector(pasteFromMenu(_:)): "paste:", #selector(selectAllFromMenu(_:)): "selectAll:"
+            ]
+            if let action = menuItem.action.flatMap({ nativeActions[$0] }) {
+                let nativeItem = NSMenuItem(title: menuItem.title, action: NSSelectorFromString(action), keyEquivalent: "")
+                return field.validateUserInterfaceItem(nativeItem)
+            }
+        }
         let state = bridge.state
         if menuItem.action == #selector(saveFromMenu(_:)) {
-            return state.dirty
+            return state.dirty || persistence.isUntitled || bridge.composition.active
         }
         if menuItem.action == #selector(reloadFromMenu(_:)) {
             return !state.dirty && state.disk != .unchanged
@@ -1306,7 +2693,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         }
         if menuItem.action == #selector(copyFromMenu(_:)) ||
             menuItem.action == #selector(cutFromMenu(_:)) {
-            return textView.selectedRange().length > 0
+            return textView.hasSourceSelection
         }
         if menuItem.action == #selector(pasteFromMenu(_:)) {
             return textView.hasSourceOnPasteboard
@@ -1314,6 +2701,9 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         if menuItem.action == #selector(selectAllFromMenu(_:)) {
             return textView.string.utf16.count > 0
         }
+        if menuItem.action == #selector(zoomInFromMenu(_:)) { return readingZoom < 3 }
+        if menuItem.action == #selector(zoomOutFromMenu(_:)) { return readingZoom > 0.5 }
+        if menuItem.action == #selector(resetZoomFromMenu(_:)) { return abs(readingZoom - 1) > 0.001 }
         if menuItem.action == #selector(toggleOutlineFromMenu(_:)) {
             menuItem.state = outlineIsVisible ? .on : .off
             return true
@@ -1321,6 +2711,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         if menuItem.action == #selector(toggleSearchFromMenu(_:)) {
             menuItem.state = searchIsVisible ? .on : .off
             return true
+        }
+        if menuItem.action == #selector(toggleSourceMode(_:)) {
+            menuItem.state = bridge.sourceMode ? .on : .off
+            return !textView.hasMarkedText()
         }
         if menuItem.action == #selector(findNextFromMenu(_:)) ||
             menuItem.action == #selector(findPreviousFromMenu(_:)) ||
@@ -1333,51 +2727,68 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     func requestClose() -> Bool {
+        persistence.suspend()
         do {
+            try textView.finishCompositionForFileOperation()
+            try? persistence.flushRecovery()
             let request = try bridge.requestClose()
             switch request.result {
-            case 0:
-                return true
+            case 0: return true
             case 1:
+                if persistence.isPristineUntitled {
+                    try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_DISCARD))
+                    return true
+                }
                 return prompt(request)
             default:
+                persistence.cancelClose()
                 return false
             }
         } catch {
+            persistence.cancelClose()
             show(error)
             return false
         }
     }
 
+    func cancelCloseRequest() { persistence.cancelClose() }
+
+    func finalizeCloseRequest() throws { try persistence.finalizeClose() }
+
     private func prompt(_ request: YuStorageCloseRequest) -> Bool {
+        let conflict = request.close_state >= 3
         let alert = NSAlert()
-        alert.alertStyle = request.close_state >= 3 ? .warning : .informational
-        alert.messageText = request.close_state >= 3 ? "文件已被外部修改" : "保存更改？"
-        alert.informativeText = request.close_state >= 3
-            ? "保存会覆盖外部版本；请选择丢弃本地修改或取消。"
-            : "这个 Markdown 文档有未保存更改。"
-        alert.addButton(withTitle: request.close_state >= 3 ? "丢弃本地修改" : "保存")
+        alert.alertStyle = conflict ? .warning : .informational
+        alert.messageText = conflict ? "文件已被外部修改" : "要保存对“\(view.window?.title ?? "未命名")”的更改吗？"
+        alert.informativeText = conflict
+            ? "磁盘版本不会被覆盖。可以将本地内容保存为副本，或丢弃本地修改。"
+            : "可以保存、丢弃这次修改，或取消关闭。"
+        alert.addButton(withTitle: conflict ? "保存副本…" : "保存")
+        alert.addButton(withTitle: "不保存")
         alert.addButton(withTitle: "取消")
-        let response = alert.runModal()
+        let response = closeAlertDecision?(alert) ?? alert.runModal()
         do {
             if response == .alertFirstButtonReturn {
-                if request.close_state >= 3 {
-                    try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_DISCARD))
-                } else {
-                    try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_SAVE))
-                }
+                let saved = conflict ? chooseSaveDestination() : saveDocument()
+                guard saved else { persistence.cancelClose(); return false }
+                try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_SAVE))
                 return true
             }
-            try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_CANCEL))
+            if response == .alertSecondButtonReturn {
+                try bridge.resolveClose(UInt8(YU_STORAGE_CLOSE_RESOLVE_DISCARD))
+                return true
+            }
+            persistence.cancelClose()
             return false
         } catch {
+            persistence.cancelClose()
             show(error)
             return false
         }
     }
 
     private func startFileWatcher() {
-        guard fileWatcher == nil else { return }
+        guard fileWatcher == nil, !persistence.isUntitled else { return }
         let directory = URL(fileURLWithPath: bridge.path).deletingLastPathComponent()
         do {
             fileWatcher = try NativeFileWatcher(directory: directory) { [weak self] in
@@ -1403,6 +2814,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
     }
 
     private func checkExternalState() {
+        guard !persistence.suspended, !persistence.isUntitled else { return }
         let state = bridge.state
         initialState = state
         updateStatus()
@@ -1418,7 +2830,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         alert.messageText = state.disk == .missing ? "文件已被删除或移动" : "文件已被外部修改"
         if state.dirty {
             alert.informativeText =
-                "Rust session 已确认磁盘版本变化。本地有未保存修改，Yu 不会自动覆盖或重载。请保存或关闭窗口处理冲突。"
+                "文件已在其他应用中修改。本地更改仍保留，请保存副本或关闭窗口处理冲突。"
             alert.addButton(withTitle: "知道了")
         } else {
             alert.informativeText =
@@ -1426,7 +2838,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
             alert.addButton(withTitle: "重新加载")
             alert.addButton(withTitle: "稍后")
         }
-        let response = alert.runModal()
+        let response = externalAlertDecision?(alert) ?? alert.runModal()
         guard !state.dirty, response == .alertFirstButtonReturn else { return }
         do {
             try bridge.reload()
@@ -1441,120 +2853,20 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation {
         let dirty = state.dirty ? "● 未保存" : "已保存"
         let bom = state.bom ? "UTF-8 BOM" : "UTF-8"
         let status = "\(dirty) · Rev \(state.revision) · \(state.disk.label) · \(bom)"
-        statusLabel.stringValue = status
+        statusLabel.stringValue = persistence.notice ?? ""
+        statusLabel.toolTip = persistence.notice ?? status
+        view.window?.isDocumentEdited = state.dirty
         statusLabel.setAccessibilityValue(status)
         statusDetailLabel.stringValue = "\((bridge.source as NSString).length) 字符"
         statusDetailLabel.setAccessibilityValue(statusDetailLabel.stringValue)
-        windowToolbar?.items.first(where: { $0.itemIdentifier == .yuSave })?.isEnabled = state.dirty
-        windowToolbar?.items.first(where: { $0.itemIdentifier == .yuReload })?.isEnabled =
-            !state.dirty && state.disk != .unchanged
     }
 
     private func show(_ error: Error) {
+        if let fileErrorPresenter { fileErrorPresenter(error); return }
         let alert = NSAlert(error: error)
         alert.runModal()
     }
 
-    func configureToolbar(_ toolbar: NSToolbar) {
-        windowToolbar = toolbar
-        toolbar.delegate = self
-        toolbar.displayMode = .iconOnly
-        toolbar.allowsUserCustomization = false
-        updateStatus()
-        toolbar.validateVisibleItems()
-    }
-}
-
-private extension NSToolbarItem.Identifier {
-    static let yuSave = Self("yu.save")
-    static let yuReload = Self("yu.reload")
-    static let yuOutline = Self("yu.outline")
-    static let yuSearch = Self("yu.search")
-}
-
-extension DocumentViewController: NSToolbarDelegate, NSToolbarItemValidation {
-    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
-        let state = bridge.state
-        switch item.itemIdentifier {
-        case .yuSave: return state.dirty
-        case .yuReload: return !state.dirty && state.disk != .unchanged
-        default: return true
-        }
-    }
-    // 分组：保存/重新加载是左侧一组（固定间距分开），大纲/搜索靠右成组，
-    // 中间弹性空间顶开。图标统一 outline 风格 SF Symbols（无 .fill 变体）。
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.yuSave, .yuReload, .flexibleSpace, .yuOutline, .yuSearch, .space]
-    }
-
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.yuSave, .space, .yuReload, .flexibleSpace, .yuOutline, .yuSearch]
-    }
-
-    func toolbar(
-        _ toolbar: NSToolbar,
-        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
-        willBeInsertedIntoToolbar flag: Bool
-    ) -> NSToolbarItem? {
-        let item: NSToolbarItem
-        switch itemIdentifier {
-        case .yuSave:
-            item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "保存"
-            item.paletteLabel = "保存"
-            item.toolTip = "保存 Markdown 文档（⌘S）"
-            item.image = NSImage(
-                systemSymbolName: "square.and.arrow.down",
-                accessibilityDescription: "保存"
-            )
-            item.target = self
-            item.action = #selector(saveFromMenu(_:))
-        case .yuReload:
-            item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "重新加载"
-            item.paletteLabel = "重新加载"
-            item.toolTip = "重新加载磁盘上的 Markdown 文档"
-            item.image = NSImage(
-                systemSymbolName: "arrow.clockwise",
-                accessibilityDescription: "重新加载"
-            )
-            item.target = self
-            item.action = #selector(reloadFromMenu(_:))
-        case .yuOutline:
-            item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "大纲"
-            item.paletteLabel = "大纲"
-            item.toolTip = "显示或隐藏文档大纲（⌥⌘1）"
-            item.image = NSImage(
-                systemSymbolName: "sidebar.left",
-                accessibilityDescription: "大纲"
-            )
-            item.target = self
-            item.action = #selector(toggleOutlineFromMenu(_:))
-        case .yuSearch:
-            item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = "搜索"
-            item.paletteLabel = "搜索"
-            item.toolTip = "打开搜索（⌘F）"
-            item.image = NSImage(
-                systemSymbolName: "magnifyingglass",
-                accessibilityDescription: "搜索"
-            )
-            item.target = self
-            item.action = #selector(findFromMenu(_:))
-        default:
-            return nil
-        }
-        // The delegate creates items after the initial status pass. Initialize
-        // enablement here as well so clean documents never expose an active
-        // Save/Reload button during the first window turn.
-        if itemIdentifier == .yuSave {
-            item.isEnabled = bridge.state.dirty
-        } else if itemIdentifier == .yuReload {
-            item.isEnabled = !bridge.state.dirty && bridge.state.disk != .unchanged
-        }
-        return item
-    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
@@ -1565,69 +2877,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var forceDarkMode = false
     private var renderRegression = false
     private var resourceRegression = false
+    private var documents: [NSWindow: DocumentViewController] = [:]
+    private var consideredRecoveryFiles = Set<URL>()
+    private var recoveryAlertDecision: ((NSAlert) -> NSApplication.ModalResponse)?
+    private var documentErrorPresenter: ((Error) -> Void)?
+    private var configureDocumentForCheck: ((DocumentViewController) -> Void)?
+    private var lifecycleSelfCheck: String? {
+        ["--document-lifecycle-self-check", "--document-recovery-writer-self-check",
+         "--document-recovery-reader-self-check", "--document-recent-reader-self-check"]
+            .first { CommandLine.arguments.contains($0) }
+    }
+    private var isolatedLifecycleCheck: Bool {
+        lifecycleSelfCheck != nil && Bundle.main.bundleIdentifier?.hasPrefix("io.github.xiaodou997.yu.lifecycle-check.") == true
+            && ProcessInfo.processInfo.environment["YU_DOCUMENT_STATE_DIR"] != nil
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let path: String
         renderRegression = CommandLine.arguments.contains("--render-regression-self-check")
         resourceRegression = CommandLine.arguments.contains("--resource-latency-self-check")
-        launchSelfCheck = CommandLine.arguments.contains("--launch-window-self-check") || renderRegression || resourceRegression
+        launchSelfCheck = CommandLine.arguments.contains("--launch-window-self-check") || CommandLine.arguments.contains("--layout-coordinator-self-check") || CommandLine.arguments.contains("--window-state-self-check") || CommandLine.arguments.contains("--idle-resource-self-check") || CommandLine.arguments.contains("--presentation-latency-self-check") || CommandLine.arguments.contains("--zoom-latency-self-check") || CommandLine.arguments.contains("--redraw-latency-self-check") || renderRegression || resourceRegression || lifecycleSelfCheck != nil
         darkModeSelfCheck = CommandLine.arguments.contains("--dark-mode-self-check")
         // 冒烟/截图用的显式外观开关：默认跟随系统，不参与 self-check。
         forceDarkMode = CommandLine.arguments.contains("--dark-mode")
         if let argument = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") }) {
             path = URL(fileURLWithPath: argument).path
         } else {
-            let panel = NSOpenPanel()
-            // `.md` is not consistently classified as `UTType.text` by
-            // Finder (especially for files created by scripts). Include the
-            // Markdown declaration explicitly while retaining ordinary text
-            // files in the first-stage host.
-            var contentTypes: [UTType] = [.text, .plainText]
-            if let markdown = UTType(filenameExtension: "md") {
-                contentTypes.append(markdown)
-            }
-            panel.allowedContentTypes = contentTypes
-            panel.canChooseDirectories = false
-            guard panel.runModal() == .OK, let url = panel.url else {
-                NSApp.terminate(nil)
+            recoverPendingDocuments()
+            if let restored = documents.keys.first {
+                restored.makeKeyAndOrderFront(nil)
                 return
             }
-            path = url.path
+            newDocument(nil)
+            return
         }
 
+        if !launchSelfCheck && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil {
+            _ = openDocument(at: URL(fileURLWithPath: path))
+            recoverPendingDocuments()
+            if documents.isEmpty { newDocument(nil) }
+            return
+        }
         do {
             let bridge = try StorageBridge(path: path)
-            let controller = DocumentViewController(bridge: bridge)
-            let window = NSWindow(
-                contentViewController: controller
-            )
-            window.setContentSize(NSSize(width: 900, height: 620))
-            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-            window.toolbarStyle = .unifiedCompact
-            window.titlebarAppearsTransparent = false
-            window.titleVisibility = .visible
-            window.title = URL(fileURLWithPath: bridge.path).lastPathComponent
-            if darkModeSelfCheck || forceDarkMode {
-                window.appearance = NSAppearance(named: .darkAqua)
+            let window = presentDocument(bridge: bridge)
+            guard let controller = documents[window] else { throw CocoaError(.coderInvalidValue) }
+            if !launchSelfCheck && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil {
+                DispatchQueue.main.async { [weak self] in self?.recoverPendingDocuments() }
             }
-            window.center()
-            window.delegate = self
-            window.isReleasedWhenClosed = false
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            self.controller = controller
-            self.window = window
-            let toolbar = NSToolbar(identifier: NSToolbar.Identifier("yu.document"))
-            toolbar.delegate = controller
-            window.toolbar = toolbar
-            controller.configureToolbar(toolbar)
-            installMainMenu(for: controller)
-            controller.focusDocument()
+            if let output = ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] {
+                Task { @MainActor in
+                    do {
+                        try await controller.captureVisualAcceptance(to: URL(fileURLWithPath: output))
+                        print("Yu visual capture: actual screenshots written; Yu baseline review pending")
+                        NSApp.terminate(nil)
+                    } catch {
+                        fputs("Yu visual capture failed: \(error)\n", stderr)
+                        exit(EXIT_FAILURE)
+                    }
+                }
+            }
             print("Yu document host opened path=\(bridge.path) revision=\(bridge.revision)")
             if launchSelfCheck {
                 // Give AppKit one complete appearance/layout turn. This is a
-                // real window smoke test: source fallback must become visible
-                // before optional Rust surface work is allowed to run.
+                // real window smoke test: the native host must be visible
+                // before asynchronous surface preparation is exercised.
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) {
                     guard window.isVisible else {
                         fputs("Yu launch self-check failed: window is not visible\n", stderr)
@@ -1652,11 +2966,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             )
                         }
                         guard luma(YuVisualTokens.canvas, dark) < 0.5,
-                              luma(YuVisualTokens.railCanvas, dark) < 0.5,
-                              luma(YuVisualTokens.railSelection, dark) < 0.5,
                               luma(YuVisualTokens.accentSoft, dark) < 0.6,
-                              luma(YuVisualTokens.canvas, light) > 0.9,
-                              luma(YuVisualTokens.railSelection, light) > 0.9 else {
+                              luma(YuVisualTokens.canvas, light) > 0.9 else {
                             fputs(
                                 "Yu dark-mode self-check failed: visual tokens did not resolve for appearance\n",
                                 stderr
@@ -1664,25 +2975,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             exit(EXIT_FAILURE)
                         }
                     }
-                    if let toolbar = window.toolbar {
-                        // Exercise AppKit's repeated validation, not just the
-                        // initial manual enabled assignment during creation.
-                        toolbar.validateVisibleItems()
-                        let saveEnabled = toolbar.items.first {
-                            $0.itemIdentifier == .yuSave
-                        }?.isEnabled ?? true
-                        let reloadEnabled = toolbar.items.first {
-                            $0.itemIdentifier == .yuReload
-                        }?.isEnabled ?? true
-                        guard !saveEnabled, !reloadEnabled else {
-                            fputs("Yu toolbar self-check failed: clean document exposes Save/Reload\n", stderr)
-                            exit(EXIT_FAILURE)
-                        }
+                    let saveItem = NSMenuItem(title: "保存", action: #selector(DocumentViewController.saveFromMenu(_:)), keyEquivalent: "s")
+                    let reloadItem = NSMenuItem(title: "重新加载", action: #selector(DocumentViewController.reloadFromMenu(_:)), keyEquivalent: "")
+                    guard window.toolbar != nil,
+                          window.titleVisibility == .visible,
+                          window.representedURL?.standardizedFileURL == URL(fileURLWithPath: bridge.path).standardizedFileURL,
+                          !controller.validateMenuItem(saveItem),
+                          !controller.validateMenuItem(reloadItem) else {
+                        let state = bridge.state
+                        fputs("Yu window self-check failed: clean document chrome or menu validation toolbar=\(window.toolbar != nil) dirty=\(state.dirty) revision=\(state.revision) saved=\(state.savedRevision) disk=\(state.disk) save=\(controller.validateMenuItem(saveItem)) reload=\(controller.validateMenuItem(reloadItem))\n", stderr)
+                        exit(EXIT_FAILURE)
                     }
                     print("Yu launch self-check: window appeared and remained stable")
                     Task { @MainActor in
                         do {
-                            if self.renderRegression || self.resourceRegression {
+                            if let mode = self.lifecycleSelfCheck {
+                                try await self.runDocumentLifecycleCheck(mode: mode)
+                                if mode == "--document-recovery-writer-self-check" { return }
+                            } else if CommandLine.arguments.contains("--window-state-self-check") {
+                                try await controller.runWindowStateSelfCheck()
+                            } else if CommandLine.arguments.contains("--idle-resource-self-check") {
+                                try await controller.runIdleResourceSelfCheck()
+                            } else if CommandLine.arguments.contains("--presentation-latency-self-check") || CommandLine.arguments.contains("--zoom-latency-self-check") || CommandLine.arguments.contains("--redraw-latency-self-check") {
+                                try await controller.runPresentationLatencySelfCheck(zoom: CommandLine.arguments.contains("--zoom-latency-self-check"), redraw: CommandLine.arguments.contains("--redraw-latency-self-check"))
+                            } else if self.renderRegression || self.resourceRegression {
                                 var longRegressionError: Error?
                                 do {
                                     try await controller.runRenderRegressionSelfCheck(resources: self.resourceRegression)
@@ -1707,6 +3023,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                     try await next.runRenderRegressionSelfCheck(resources: false, reopened: true)
                                 }
                                 if let error = longRegressionError { throw error }
+                            } else if CommandLine.arguments.contains("--layout-coordinator-self-check") {
+                                try await controller.runLayoutCoordinatorSelfCheck()
                             } else {
                                 try await controller.runFrameSchedulingSelfCheck()
                             }
@@ -1729,28 +3047,293 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        let shouldClose = controller?.requestClose() ?? true
-        if shouldClose {
-            controller?.detachSurfaceHost()
+    private func identity(_ url: URL) -> URL { url.standardizedFileURL.resolvingSymlinksInPath() }
+
+    private func existingWindow(for url: URL) -> NSWindow? {
+        documents.first { identity($0.value.documentURL) == identity(url) }?.key
+    }
+
+    @discardableResult
+    private func presentDocument(bridge: StorageBridge, recovered: Bool = false) -> NSWindow {
+        let controller = DocumentViewController(bridge: bridge, recovered: recovered)
+        configureDocumentForCheck?(controller)
+        let window = NSWindow(contentViewController: controller)
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+        window.setContentSize(NSSize(width: 900, height: 620))
+        window.titleVisibility = .visible
+        window.title = controller.persistence.isUntitled ? "未命名" : controller.documentURL.lastPathComponent
+        window.representedURL = controller.persistence.isUntitled ? nil : controller.documentURL
+        window.toolbarStyle = .unified
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.backgroundColor = YuVisualTokens.canvas
+        if darkModeSelfCheck || forceDarkMode { window.appearance = NSAppearance(named: .darkAqua) }
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        window.isRestorable = !launchSelfCheck && !controller.persistence.isUntitled
+            && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil
+        window.restorationClass = NativeWindowRestorer.self
+        window.identifier = NSUserInterfaceItemIdentifier(bridge.path)
+        controller.onOpenDocument = { [weak self] next in _ = self?.openDocument(at: next) }
+        controller.onValidateSaveDestination = { [weak self, weak window, weak controller] destination in
+            guard let self, let controller else { throw CocoaError(.userCancelled) }
+            if let existing = self.existingWindow(for: destination), existing !== window {
+                throw NSError(domain: "Yu.Document", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "这个文件已在另一个 Yu 窗口中打开，请选择其他位置。"])
+            }
+            if self.identity(destination) != self.identity(controller.documentURL),
+               try self.pendingRecovery(for: destination) != nil {
+                throw NSError(domain: "Yu.Document", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "这个位置有未处理的恢复副本。请先从“恢复未保存的文档”处理，或选择其他位置。"])
+            }
         }
-        return shouldClose
+        controller.onDocumentURLChange = { [weak self, weak window, weak controller] in
+            guard let self, let window, let controller else { return }
+            window.isRestorable = !self.launchSelfCheck && ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil
+            self.noteRecentDocument(controller.documentURL)
+        }
+        documents[window] = controller
+        self.window = window
+        self.controller = controller
+        if !controller.persistence.isUntitled { noteRecentDocument(controller.documentURL) }
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        installMainMenu(for: controller)
+        controller.focusDocument()
+        return window
+    }
+
+    private func noteRecentDocument(_ url: URL) {
+        guard (!launchSelfCheck || isolatedLifecycleCheck), ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil else { return }
+        NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        installMainMenu(for: controller)
+    }
+
+    private func pendingRecovery(for url: URL) throws -> URL? {
+        let locations = NativeDocumentLocations.current
+        let exact = try StorageBridge.recoveryURL(for: identity(url), in: locations.recovery)
+        if FileManager.default.fileExists(atPath: exact.path) { return exact }
+        // Older user-facing aliases can refer to the same canonical file.
+        for record in try locations.recoveryFiles() {
+            if let target = try? StorageBridge.recoveryTarget(at: record), identity(target) == identity(url) {
+                return record
+            }
+        }
+        return nil
+    }
+
+    private func recoveryResponse(for target: URL) -> NSApplication.ModalResponse {
+        let alert = NSAlert()
+        alert.messageText = "恢复未保存的文档？"
+        alert.informativeText = "\(NativeDocumentLocations.current.isDraft(target) ? "未命名文档" : target.path)\n恢复不会立即覆盖磁盘文件；确认内容后请手动保存。"
+        alert.addButton(withTitle: "恢复")
+        alert.addButton(withTitle: "丢弃恢复副本")
+        alert.addButton(withTitle: "稍后")
+        return recoveryAlertDecision?(alert) ?? alert.runModal()
+    }
+
+    @discardableResult
+    func openDocument(at url: URL) -> NSWindow? {
+        if let existing = existingWindow(for: url) {
+            existing.makeKeyAndOrderFront(nil)
+            documents[existing]?.focusDocument()
+            return existing
+        }
+        do {
+            if let record = try pendingRecovery(for: url) {
+                consideredRecoveryFiles.insert(record)
+                if let target = try? StorageBridge.recoveryTarget(at: record), identity(target) == identity(url) {
+                    switch recoveryResponse(for: target) {
+                    case .alertFirstButtonReturn:
+                        return presentDocument(bridge: try StorageBridge(path: record.path, mode: .recovery), recovered: true)
+                    case .alertSecondButtonReturn:
+                        try FileManager.default.removeItem(at: record)
+                    default: return nil // Do not overwrite a deferred checkpoint with a fresh session.
+                    }
+                } else {
+                    let alert = NSAlert()
+                    alert.messageText = "这个文档的恢复副本无法读取"
+                    alert.informativeText = "可以保留损坏副本用于后续检查，再打开磁盘文件。副本不会被删除。"
+                    alert.addButton(withTitle: "保留副本并打开")
+                    alert.addButton(withTitle: "取消")
+                    guard (recoveryAlertDecision?(alert) ?? alert.runModal()) == .alertFirstButtonReturn else { return nil }
+                    let archive = NativeDocumentLocations.current.recovery.appendingPathComponent("Invalid", isDirectory: true)
+                    try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                    try FileManager.default.moveItem(at: record, to: archive.appendingPathComponent(UUID().uuidString + "-" + record.lastPathComponent))
+                }
+            }
+            return presentDocument(bridge: try StorageBridge(path: identity(url).path))
+        } catch {
+            if let documentErrorPresenter { documentErrorPresenter(error) }
+            else { NSAlert(error: error).runModal() }
+            return nil
+        }
+    }
+
+    @objc private func newDocument(_ sender: Any?) {
+        do {
+            let draft = try NativeDocumentLocations.current.newDraftURL()
+            presentDocument(bridge: try StorageBridge(path: draft.path, mode: .untitled))
+        } catch { NSAlert(error: error).runModal() }
+    }
+
+    @objc private func openRecentDocument(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        _ = openDocument(at: url)
+    }
+
+    @objc private func clearRecentDocuments(_ sender: Any?) {
+        NSDocumentController.shared.clearRecentDocuments(sender)
+        installMainMenu(for: controller)
+    }
+
+    @objc private func toggleAutosave(_ sender: Any?) {
+        NativeDocumentPersistence.autosaveEnabled.toggle()
+        for controller in documents.values { controller.persistence.documentChanged() }
+        installMainMenu(for: controller)
+    }
+
+    @objc private func recoverDocuments(_ sender: Any?) {
+        consideredRecoveryFiles.removeAll()
+        recoverPendingDocuments()
+    }
+
+    private func recoverPendingDocuments() {
+        guard (!launchSelfCheck || isolatedLifecycleCheck), ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil else { return }
+        do {
+            for record in try NativeDocumentLocations.current.recoveryFiles() where !consideredRecoveryFiles.contains(record) {
+                consideredRecoveryFiles.insert(record)
+                do {
+                    let target = try StorageBridge.recoveryTarget(at: record)
+                    if let existing = existingWindow(for: target), documents[existing]?.persistence.bridge.state.dirty == true {
+                        let alert = NSAlert()
+                        alert.messageText = "恢复副本已保留"
+                        alert.informativeText = "“\(existing.title)”当前有未保存修改。请先处理该窗口，再从“文件 → 恢复未保存的文档”打开恢复副本。"
+                        _ = recoveryAlertDecision?(alert) ?? alert.runModal()
+                        continue
+                    }
+                    switch recoveryResponse(for: target) {
+                    case .alertFirstButtonReturn:
+                        // Read successfully before replacing a clean window.
+                        let bridge = try StorageBridge(path: record.path, mode: .recovery)
+                        if let existing = existingWindow(for: target) {
+                            documents[existing]?.persistence.suspend()
+                            existing.close()
+                        }
+                        let window = presentDocument(bridge: bridge, recovered: true)
+                        try documents[window]?.persistence.flushRecovery()
+                    case .alertSecondButtonReturn:
+                        try FileManager.default.removeItem(at: record)
+                    default: break
+                    }
+                } catch {
+                    let alert = NSAlert(error: error)
+                    alert.messageText = "无法读取恢复副本"
+                    alert.informativeText = "恢复文件已保留：\(record.path)\n\(error.localizedDescription)"
+                    if let documentErrorPresenter { documentErrorPresenter(error) }
+                    else { alert.runModal() }
+                }
+            }
+        } catch {
+            if let documentErrorPresenter { documentErrorPresenter(error) }
+            else { NSAlert(error: error).runModal() }
+        }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls { _ = openDocument(at: url) }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { newDocument(nil) }
+        return true
+    }
+
+    func applicationWillResignActive(_ notification: Notification) {
+        guard !launchSelfCheck else { return }
+        for controller in documents.values where !controller.persistence.suspended {
+            controller.persistence.checkpoint(allowAutosave: false)
+        }
+    }
+
+    @objc private func openFromMenu(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls { openDocument(at: url) }
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              let controller = documents[window] else { return }
+        self.window = window
+        self.controller = controller
+        installMainMenu(for: controller)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard let controller = documents[sender] else { return true }
+        guard controller.requestClose() else { return false }
+        do { try controller.finalizeCloseRequest() }
+        catch {
+            controller.cancelCloseRequest()
+            NSAlert(error: error).runModal()
+            return false
+        }
+        controller.detachSurfaceHost()
+        return true
+    }
+
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
+
+    func window(_ window: NSWindow, willEncodeRestorableState state: NSCoder) {
+        documents[window]?.encodeWindowState(to: state)
+    }
+
+    func window(_ window: NSWindow, didDecodeRestorableState state: NSCoder) {
+        documents[window]?.restoreWindowState(from: state)
     }
 
     func windowWillClose(_ notification: Notification) {
-        controller?.detachSurfaceHost()
+        guard let window = notification.object as? NSWindow else { return }
+        let closed = documents.removeValue(forKey: window)
+        closed?.persistence.suspend()
+        closed?.detachSurfaceHost()
+        if self.window === window {
+            self.window = documents.keys.first
+            self.controller = self.window.flatMap { documents[$0] }
+            installMainMenu(for: self.controller)
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let controller else { return .terminateNow }
-        guard controller.requestClose() else { return .terminateCancel }
-        controller.detachSurfaceHost()
+        let controllers = Array(documents.values)
+        for controller in controllers {
+            controller.persistence.suspend()
+            try? controller.persistence.flushRecovery()
+        }
+        for controller in controllers {
+            if !controller.requestClose() {
+                for item in controllers { item.cancelCloseRequest() }
+                return .terminateCancel
+            }
+        }
+        do {
+            for controller in controllers { try controller.finalizeCloseRequest() }
+        } catch {
+            for controller in controllers { controller.cancelCloseRequest() }
+            NSAlert(error: error).runModal()
+            return .terminateCancel
+        }
+        for controller in controllers { controller.detachSurfaceHost() }
         return .terminateNow
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !renderRegression }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    private func installMainMenu(for controller: DocumentViewController) {
+    private func installMainMenu(for controller: DocumentViewController?) {
         let mainMenu = NSMenu()
 
         let appMenuItem = NSMenuItem()
@@ -1773,6 +3356,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let fileMenuItem = NSMenuItem()
         let fileMenu = NSMenu(title: "文件")
+        fileMenu.addItem(withTitle: "新建", action: #selector(newDocument(_:)), keyEquivalent: "n").target = self
+        fileMenu.addItem(withTitle: "打开…", action: #selector(openFromMenu(_:)), keyEquivalent: "o").target = self
         let save = NSMenuItem(
             title: "保存",
             action: #selector(DocumentViewController.saveFromMenu(_:)),
@@ -1780,6 +3365,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
         save.target = controller
         fileMenu.addItem(save)
+        let saveAs = NSMenuItem(title: "另存为…", action: #selector(DocumentViewController.saveAsFromMenu(_:)), keyEquivalent: "s")
+        saveAs.keyEquivalentModifierMask = [.command, .shift]
+        saveAs.target = controller
+        fileMenu.addItem(saveAs)
+        let recent = NSMenu(title: "最近打开")
+        for url in NSDocumentController.shared.recentDocumentURLs {
+            let item = NSMenuItem(title: url.lastPathComponent, action: #selector(openRecentDocument(_:)), keyEquivalent: "")
+            item.representedObject = url
+            item.toolTip = url.path
+            item.target = self
+            recent.addItem(item)
+        }
+        recent.addItem(.separator())
+        recent.addItem(withTitle: "清除菜单", action: #selector(clearRecentDocuments(_:)), keyEquivalent: "").target = self
+        let recentItem = NSMenuItem(title: "最近打开", action: nil, keyEquivalent: "")
+        recentItem.submenu = recent
+        fileMenu.addItem(recentItem)
+        let autosave = NSMenuItem(title: "自动保存", action: #selector(toggleAutosave(_:)), keyEquivalent: "")
+        autosave.target = self
+        autosave.state = NativeDocumentPersistence.autosaveEnabled ? .on : .off
+        fileMenu.addItem(autosave)
+        fileMenu.addItem(withTitle: "恢复未保存的文档…", action: #selector(recoverDocuments(_:)), keyEquivalent: "").target = self
         let reload = NSMenuItem(
             title: "重新加载",
             action: #selector(DocumentViewController.reloadFromMenu(_:)),
@@ -1845,8 +3452,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
 
+        let tableMenuItem = NSMenuItem()
+        tableMenuItem.submenu = controller?.makeTableMenu() ?? NSMenu(title: "表格")
+        mainMenu.addItem(tableMenuItem)
+
         let viewMenuItem = NSMenuItem()
         let viewMenu = NSMenu(title: "显示")
+        let sourceMode = NSMenuItem(title: "源码模式", action: #selector(DocumentViewController.toggleSourceMode(_:)), keyEquivalent: "m")
+        sourceMode.keyEquivalentModifierMask = [.command, .shift]
+        sourceMode.target = controller
+        viewMenu.addItem(sourceMode)
         let outline = NSMenuItem(
             title: "大纲",
             action: #selector(DocumentViewController.toggleOutlineFromMenu(_:)),
@@ -1863,9 +3478,400 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         searchToggle.keyEquivalentModifierMask = [.command, .option]
         searchToggle.target = controller
         viewMenu.addItem(searchToggle)
+        viewMenu.addItem(.separator())
+        for (title, action, key) in [
+            ("放大", #selector(DocumentViewController.zoomInFromMenu(_:)), "+"),
+            ("缩小", #selector(DocumentViewController.zoomOutFromMenu(_:)), "-"),
+            ("实际大小", #selector(DocumentViewController.resetZoomFromMenu(_:)), "0")
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.target = controller
+            viewMenu.addItem(item)
+        }
         viewMenuItem.submenu = viewMenu
         mainMenu.addItem(viewMenuItem)
 
         NSApp.mainMenu = mainMenu
+    }
+}
+
+/// Restore native UI state, never a second serialized document.
+final class NativeWindowRestorer: NSObject, NSWindowRestoration {
+    static func restoreWindow(withIdentifier identifier: NSUserInterfaceItemIdentifier,
+                              state: NSCoder, completionHandler: @escaping (NSWindow?, Error?) -> Void) {
+        // Automation has explicit fixtures and must not inherit or overwrite
+        // the user's saved windows (including mode and scroll position).
+        guard !CommandLine.arguments.contains(where: { $0.hasSuffix("-self-check") }),
+              ProcessInfo.processInfo.environment["YU_VISUAL_CAPTURE_DIR"] == nil else {
+            completionHandler(nil, nil)
+            return
+        }
+        guard let path = state.decodeObject(of: NSString.self, forKey: "Yu.documentPath") as String?,
+              let delegate = NSApp.delegate as? AppDelegate else {
+            completionHandler(nil, CocoaError(.fileReadCorruptFile))
+            return
+        }
+        guard FileManager.default.fileExists(atPath: path),
+              let window = delegate.openDocument(at: URL(fileURLWithPath: path)) else {
+            completionHandler(nil, CocoaError(.fileReadNoSuchFile))
+            return
+        }
+        completionHandler(window, nil)
+    }
+}
+
+@MainActor
+private enum NativeWindowCapture {
+    static func image(_ window: NSWindow) async throws -> CGImage {
+        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+        guard let target = content.windows.first(where: { $0.windowID == CGWindowID(window.windowNumber) }) else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        let filter = SCContentFilter(desktopIndependentWindow: target)
+        let configuration = SCStreamConfiguration()
+        configuration.width = Int((window.frame.width * window.backingScaleFactor).rounded())
+        configuration.height = Int((window.frame.height * window.backingScaleFactor).rounded())
+        configuration.showsCursor = false
+        configuration.capturesAudio = false
+        configuration.ignoreShadowsSingleWindow = true
+        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+    }
+}
+
+// Runs only in a separately identified test bundle, with an isolated state
+// directory. Native panels receive injected user decisions; file/session/menu
+// actions and the autosave scheduler are the production implementations.
+extension AppDelegate {
+    @MainActor
+    private func runDocumentLifecycleCheck(mode: String) async throws {
+        func require(_ value: Bool, _ message: String) throws {
+            if !value { throw NSError(domain: "Yu.DocumentCheck", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]) }
+        }
+        try require(isolatedLifecycleCheck, "Use the isolated lifecycle test runner")
+        guard let initialWindow = window, let initial = documents[initialWindow],
+              let resultPath = ProcessInfo.processInfo.environment["YU_DOCUMENT_CHECK_RESULT"] else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        let locations = NativeDocumentLocations.current
+        try locations.prepare()
+        let files = locations.root.appendingPathComponent("Files", isDirectory: true)
+        try FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
+        var errors = [String]()
+        configureDocumentForCheck = { controller in
+            controller.closeAlertDecision = { _ in .alertThirdButtonReturn }
+            controller.externalAlertDecision = { _ in .alertSecondButtonReturn }
+            controller.fileErrorPresenter = { errors.append($0.localizedDescription) }
+        }
+        configureDocumentForCheck?(initial)
+        documentErrorPresenter = { errors.append($0.localizedDescription) }
+        NativeDocumentPersistence.autosaveEnabled = false
+        var checks = [String]()
+        func record(_ name: String) { checks.append(name); print("Yu file lifecycle: \(name)"); fflush(stdout) }
+        func insert(_ text: String, into controller: DocumentViewController) {
+            controller.withFileInputForSelfCheck {
+                $0.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            }
+        }
+        func fixture(_ name: String, _ text: String) throws -> (NSWindow, DocumentViewController) {
+            let url = files.appendingPathComponent(name)
+            try Data(text.utf8).write(to: url, options: .atomic)
+            let next = presentDocument(bridge: try StorageBridge(path: url.path))
+            return (next, documents[next]!)
+        }
+        func finishResult(_ extra: [String: Any] = [:]) throws {
+            var result: [String: Any] = ["mode": mode, "checks": checks, "passed": true,
+                "bundle_id": Bundle.main.bundleIdentifier ?? "", "state_root": locations.root.path]
+            for (key, value) in extra { result[key] = value }
+            try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+                .write(to: URL(fileURLWithPath: resultPath), options: .atomic)
+        }
+
+        if mode == "--document-recent-reader-self-check" {
+            let recent = NSDocumentController.shared.recentDocumentURLs.map(identity)
+            try require(recent.contains(identity(files.appendingPathComponent("close-conflict-copy.md"))), "Recent Save As destination did not survive process exit")
+            record("recent document persisted across processes")
+            clearRecentDocuments(nil)
+            try require(NSDocumentController.shared.recentDocumentURLs.isEmpty, "Clear Recent Documents did not clear native storage")
+            record("native recent-document clearing")
+            try finishResult()
+            return
+        }
+
+        if mode == "--document-recovery-writer-self-check" {
+            try require(initial.persistence.bridge.source == "原稿\r\n", "Incorrect crash fixture")
+            insert("本地新增🙂\r\n", into: initial)
+            try initial.persistence.flushRecovery()
+            newDocument(nil)
+            guard let draftWindow = window, let draft = documents[draftWindow] else { throw CocoaError(.coderInvalidValue) }
+            insert("未命名恢复中文🙂\n", into: draft)
+            try draft.persistence.flushRecovery()
+            let (_, deleted) = try fixture("deleted.md", "将被删除\r\n")
+            insert("本地", into: deleted)
+            try deleted.persistence.flushRecovery()
+            try require(!FileManager.default.fileExists(atPath: draft.documentURL.path), "Untitled checkpoint created a user document")
+            record("three crash checkpoints persisted before SIGKILL")
+            try finishResult(["named_path": initial.documentURL.path, "draft_path": draft.documentURL.path,
+                "deleted_path": deleted.documentURL.path])
+            // The runner kills this live process after observing the atomic
+            // ready record. Do not terminate gracefully or clear recovery here.
+            return
+        }
+
+        if mode == "--document-recovery-reader-self-check" {
+            let recordsBefore = try locations.recoveryFiles()
+            try require(recordsBefore.count == 4, "Expected three valid records and one corrupt record")
+            recoveryAlertDecision = { _ in .alertThirdButtonReturn }
+            recoverDocuments(nil)
+            try require(documents.count == 1 && (try locations.recoveryFiles()).count == 4, "Later must retain recovery without opening documents")
+            record("defer recovery preserves every record")
+            recoveryAlertDecision = { _ in .alertFirstButtonReturn }
+            recoverDocuments(nil)
+            let restored = documents.values.filter { $0.persistence.needsRecoveryReview }
+            try require(restored.count == 3, "Valid recovery was blocked by another corrupt record")
+            for controller in restored {
+                let bridge = controller.persistence.bridge
+                try require(bridge.state.dirty, "Recovered source must remain unsaved")
+                controller.persistence.checkpoint(allowAutosave: true)
+                if controller.persistence.isUntitled {
+                    try require(bridge.source == "未命名恢复中文🙂\n", "Untitled recovery source mismatch")
+                    try require(!FileManager.default.fileExists(atPath: controller.documentURL.path), "Recovered draft autosaved to an internal file")
+                } else if controller.documentURL.lastPathComponent == "deleted.md" {
+                    try require(bridge.source == "本地将被删除\r\n" && bridge.state.disk == .missing, "Deleted-file recovery mismatch")
+                    try require(!FileManager.default.fileExists(atPath: controller.documentURL.path), "Recovery recreated a deleted original")
+                } else {
+                    try require(bridge.source == "本地新增🙂\r\n原稿\r\n" && bridge.state.bom, "Named recovery lost source or BOM")
+                    try require(bridge.state.disk == .changed, "Recovery lost pre-crash disk fingerprint")
+                    try require(try Data(contentsOf: controller.documentURL) == Data("外部版本\r\n".utf8), "Recovery overwrote external changes")
+                }
+            }
+            try require(!errors.isEmpty, "Corrupt recovery was not reported")
+            record("SIGKILL recovery: named, untitled, deleted, BOM and external conflict")
+            record("recovered documents require manual save; corrupt record retained")
+            if let draft = restored.first(where: { $0.persistence.isUntitled }) {
+                let destination = files.appendingPathComponent("recovered-draft.md")
+                try draft.saveDocumentAs(to: destination, replaceExisting: false)
+                try require(try Data(contentsOf: destination) == Data("未命名恢复中文🙂\n".utf8), "Recovered draft Save As mismatch")
+                try require(!draft.persistence.needsRecoveryReview, "Manual save did not resume normal persistence")
+            }
+            let (discardWindow, discard) = try fixture("discard-recovery.md", "磁盘保留")
+            insert("恢复副本", into: discard)
+            try discard.persistence.flushRecovery()
+            let discardRecord = try discard.persistence.bridge.recoveryURL(in: locations.recovery)
+            discard.persistence.suspend()
+            discardWindow.close() // Simulate an orphaned checkpoint, not user discard.
+            recoveryAlertDecision = { alert in
+                alert.informativeText.contains("discard-recovery.md") ? .alertSecondButtonReturn : .alertThirdButtonReturn
+            }
+            recoverDocuments(nil)
+            try require(!FileManager.default.fileExists(atPath: discardRecord.path), "Discard did not remove recovery envelope")
+            try require(try Data(contentsOf: files.appendingPathComponent("discard-recovery.md")) == Data("磁盘保留".utf8), "Discard changed the original document")
+            record("explicit discard removes only the selected recovery record")
+            for controller in documents.values { controller.closeAlertDecision = { _ in .alertSecondButtonReturn } }
+            try finishResult(["reported_recovery_errors": errors.count])
+            return
+        }
+
+        // New, initial save cancellation, overwrite consent and history.
+        newDocument(nil)
+        guard let draftWindow = window, let draft = documents[draftWindow] else { throw CocoaError(.coderInvalidValue) }
+        let draftPath = draft.documentURL
+        try require(draftWindow.title == "未命名" && draftWindow.representedURL == nil, "New-document chrome is not untitled")
+        insert("# 草稿\r\n正文🙂", into: draft)
+        draft.savePanelDecision = { _ in nil }
+        try require(!draft.saveDocument() && draft.persistence.isUntitled, "Cancelled first save lost untitled state")
+        try require(!FileManager.default.fileExists(atPath: draftPath.path), "New created a backing Markdown file")
+        let first = files.appendingPathComponent("first.md")
+        draft.savePanelDecision = { _ in first }
+        try require(draft.saveDocument(), "First save failed")
+        let expected = Data("# 草稿\r\n正文🙂".utf8)
+        try require(try Data(contentsOf: first) == expected, "First save bytes mismatch")
+        try require(draftWindow.representedURL == first && draftWindow.title == "first.md", "First save did not retarget window")
+        record("new, cancelled Save panel, first save and document identity")
+        let renamed = files.appendingPathComponent("renamed.md")
+        try Data("existing target".utf8).write(to: renamed)
+        let revision = draft.persistence.bridge.revision
+        do { try draft.saveDocumentAs(to: renamed, replaceExisting: false); throw CocoaError(.coderInvalidValue) }
+        catch BridgeError.operation(let status) { try require(status == StorageStatus.externalChange, "Unexpected overwrite refusal") }
+        try require(draft.documentURL == first, "Rejected overwrite changed window path")
+        draft.savePanelDecision = { _ in renamed }
+        draft.saveAsFromMenu(nil)
+        try require(draft.documentURL == renamed && draft.persistence.bridge.revision == revision, "Save As changed revision or failed identity change")
+        try require(try Data(contentsOf: first) == expected && Data(contentsOf: renamed) == expected, "Save As changed original or output bytes")
+        draft.withFileInputForSelfCheck { $0.performUndo() }
+        try require(draft.persistence.bridge.source.isEmpty, "Save As discarded undo history")
+        draft.withFileInputForSelfCheck { $0.performRedo() }
+        try require(draft.persistence.bridge.source == "# 草稿\r\n正文🙂", "Save As discarded redo history")
+        try require(draft.saveDocument(), "Save after redo failed")
+        record("Save As overwrite consent, original bytes and shared undo/redo")
+
+        let originalURL = initial.documentURL
+        let originalBytes = try Data(contentsOf: originalURL)
+        insert("新增", into: initial)
+        try initial.saveDocumentAs(to: files.appendingPathComponent("bom-copy.md"), replaceExisting: false)
+        try require(try Data(contentsOf: originalURL) == originalBytes, "BOM Save As modified original")
+        try require(try Data(contentsOf: initial.documentURL) == Data([0xef, 0xbb, 0xbf]) + Data("新增原稿\r\n".utf8), "BOM/CRLF was not preserved")
+        let alias = files.appendingPathComponent("alias.md")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: renamed)
+        let count = documents.count
+        try require(openDocument(at: alias) === draftWindow && documents.count == count, "Alias opened a duplicate session")
+        do { try initial.saveDocumentAs(to: renamed, replaceExisting: true); throw CocoaError(.coderInvalidValue) }
+        catch let error as NSError { try require(error.domain == "Yu.Document", "Save As did not reject another window's target") }
+        draftWindow.makeKeyAndOrderFront(nil)
+        let fileMenu = NSApp.mainMenu?.items.first(where: { $0.submenu?.title == "文件" })?.submenu
+        try require((fileMenu?.items.first(where: { $0.title == "保存" })?.target as? DocumentViewController) === draft, "Save menu targets the wrong window")
+        let recentMenu = fileMenu?.items.first(where: { $0.title == "最近打开" })?.submenu
+        guard let recentItem = recentMenu?.items.first(where: { ($0.representedObject as? URL).map(identity) == identity(renamed) }) else { throw CocoaError(.coderInvalidValue) }
+        openRecentDocument(recentItem)
+        try require(documents.count == count, "Open Recent duplicated a window")
+        record("BOM/CRLF, canonical-path deduplication, active menu and Open Recent")
+
+        // A deferred checkpoint must survive both Open and Save As attempts.
+        let (deferredWindow, deferred) = try fixture("deferred.md", "磁盘原文")
+        insert("待恢复", into: deferred)
+        try deferred.persistence.flushRecovery()
+        let deferredURL = deferred.documentURL
+        let deferredRecord = try deferred.persistence.bridge.recoveryURL(in: locations.recovery)
+        let deferredBytes = try Data(contentsOf: deferredRecord)
+        deferred.persistence.suspend()
+        deferredWindow.close()
+        recoveryAlertDecision = { _ in .alertThirdButtonReturn }
+        try require(openDocument(at: deferredURL) == nil, "Later opened a session that could replace recovery")
+        do { try initial.saveDocumentAs(to: deferredURL, replaceExisting: true); throw CocoaError(.coderInvalidValue) }
+        catch let error as NSError { try require(error.domain == "Yu.Document" && error.code == 2, "Save As did not protect a pending checkpoint") }
+        try require(try Data(contentsOf: deferredRecord) == deferredBytes, "Deferred checkpoint was changed")
+        try require(try Data(contentsOf: deferredURL) == Data("磁盘原文".utf8), "Deferred target was overwritten")
+        recoveryAlertDecision = { _ in .alertFirstButtonReturn }
+        guard let restoredWindow = openDocument(at: deferredURL), let restored = documents[restoredWindow] else { throw CocoaError(.coderInvalidValue) }
+        try require(restored.persistence.needsRecoveryReview && restored.persistence.bridge.source == "待恢复磁盘原文", "Open did not restore pending source")
+        restored.closeAlertDecision = { _ in .alertSecondButtonReturn }
+        restoredWindow.performClose(nil)
+        record("deferred recovery survives Open and Save As, then restores original edits")
+
+        // Corrupt records are archived byte-for-byte before a new session may checkpoint.
+        let corruptBytes = Data("invalid recovery envelope".utf8)
+        try corruptBytes.write(to: deferredRecord, options: .atomic)
+        guard let cleanWindow = openDocument(at: deferredURL), let clean = documents[cleanWindow] else { throw CocoaError(.coderInvalidValue) }
+        try require(clean.persistence.bridge.source == "磁盘原文", "Corrupt recovery replaced disk source")
+        let archive = locations.recovery.appendingPathComponent("Invalid", isDirectory: true)
+        let archived = try FileManager.default.contentsOfDirectory(at: archive, includingPropertiesForKeys: nil)
+        try require(try archived.contains { try Data(contentsOf: $0) == corruptBytes }, "Corrupt recovery was not preserved")
+        cleanWindow.performClose(nil)
+        recoveryAlertDecision = nil
+        record("corrupt checkpoint retained in archive before opening disk document")
+
+        // Exercise the real debounce, then conflicts and marked-text protection.
+        let (_, automatic) = try fixture("automatic.md", "基线")
+        NativeDocumentPersistence.autosaveEnabled = true
+        insert("自动保存", into: automatic)
+        let deadline = Date().addingTimeInterval(4)
+        while automatic.persistence.bridge.state.dirty && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        try require(!automatic.persistence.bridge.state.dirty, "Debounced autosave did not run")
+        try require(try Data(contentsOf: automatic.documentURL) == Data("自动保存基线".utf8), "Autosave bytes mismatch")
+        NativeDocumentPersistence.autosaveEnabled = false
+        insert("保留", into: automatic)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        try require(automatic.persistence.bridge.state.dirty, "Disabled autosave wrote the document")
+        try require(try Data(contentsOf: automatic.documentURL) == Data("自动保存基线".utf8), "Disabled autosave changed disk")
+        let recoveryPath = try automatic.persistence.bridge.recoveryURL(in: locations.recovery)
+        try require(FileManager.default.fileExists(atPath: recoveryPath.path), "Disabled autosave stopped crash checkpoints")
+        try Data("external".utf8).write(to: automatic.documentURL, options: .atomic)
+        automatic.persistence.checkpoint(allowAutosave: true)
+        try require(automatic.persistence.bridge.state.dirty && automatic.persistence.notice != nil, "Conflict did not retain dirty state and notice")
+        try require(try Data(contentsOf: automatic.documentURL) == Data("external".utf8), "Autosave overwrote external data")
+        try automatic.saveDocumentAs(to: files.appendingPathComponent("conflict-copy.md"), replaceExisting: false)
+        record("real autosave debounce, disabled-save recovery and external-change protection")
+
+        let (_, composition) = try fixture("composition.md", "base")
+        insert("已提交", into: composition)
+        composition.withFileInputForSelfCheck { $0.setMarkedText("候选", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0)) }
+        composition.persistence.checkpoint(allowAutosave: true)
+        try require(composition.persistence.bridge.composition.active, "Autosave committed the IME overlay")
+        try require(try Data(contentsOf: composition.documentURL) == Data("base".utf8), "Autosave wrote during preedit")
+        let compositionRecord = try composition.persistence.bridge.recoveryURL(in: locations.recovery)
+        let backup = try StorageBridge(path: compositionRecord.path, mode: .recovery)
+        try require(backup.source == "已提交base", "Recovery included uncommitted preedit")
+        try require(composition.saveDocument(), "Explicit composition Save failed")
+        try require(composition.persistence.bridge.source == "已提交候选base", "Explicit save did not commit visible preedit once")
+        composition.withFileInputForSelfCheck { $0.performUndo() }
+        try require(composition.persistence.bridge.source == "已提交base", "Composition save lost atomic undo")
+        composition.withFileInputForSelfCheck { $0.performRedo() }
+        try require(composition.saveDocument(), "Composition redo Save failed")
+        record("autosave leaves preedit alone; explicit Save commits once with undo")
+
+        insert("未保存", into: draft)
+        try draft.persistence.flushRecovery()
+        let beforeFailedSave = draft.documentURL
+        do { try draft.saveDocumentAs(to: files.appendingPathComponent("missing/sub/copy.md"), replaceExisting: false); throw CocoaError(.coderInvalidValue) }
+        catch BridgeError.operation { }
+        try require(draft.documentURL == beforeFailedSave && draft.persistence.bridge.state.dirty, "Failed Save As lost identity or edits")
+        try require(FileManager.default.fileExists(atPath: (try draft.persistence.bridge.recoveryURL(in: locations.recovery)).path), "Failed save lost recovery")
+        try require(draft.saveDocument(), "Save failed after recoverable destination error")
+        record("failed Save As retains source, identity, dirty state and checkpoint")
+
+        // Exercise Save / Cancel / Save Copy through the actual window delegate.
+        let (closingWindow, closing) = try fixture("closing.md", "原文")
+        insert("保存关闭", into: closing)
+        closing.closeAlertDecision = { _ in .alertThirdButtonReturn }
+        closingWindow.performClose(nil)
+        try require(documents[closingWindow] != nil && closing.persistence.bridge.state.closeState == 0, "Cancel closed the window or left a pending close")
+        closing.closeAlertDecision = { _ in .alertFirstButtonReturn }
+        closingWindow.performClose(nil)
+        try require(documents[closingWindow] == nil, "Save did not close the window")
+        try require(try Data(contentsOf: closing.documentURL) == Data("保存关闭原文".utf8), "Save on close lost edits")
+        newDocument(nil)
+        let unsavedWindow = window!
+        let unsaved = documents[unsavedWindow]!
+        insert("首次关闭保存", into: unsaved)
+        unsaved.closeAlertDecision = { _ in .alertFirstButtonReturn }
+        unsaved.savePanelDecision = { _ in nil }
+        unsavedWindow.performClose(nil)
+        try require(documents[unsavedWindow] != nil && unsaved.persistence.bridge.state.closeState == 0, "Cancelled first Save closed the draft")
+        let closeDestination = files.appendingPathComponent("saved-on-close.md")
+        unsaved.savePanelDecision = { _ in closeDestination }
+        unsavedWindow.performClose(nil)
+        try require(documents[unsavedWindow] == nil && (try Data(contentsOf: closeDestination)) == Data("首次关闭保存".utf8), "First Save on close failed")
+        let (conflictWindow, conflict) = try fixture("close-conflict.md", "基线")
+        insert("本地", into: conflict)
+        try Data("外部内容".utf8).write(to: conflict.documentURL, options: .atomic)
+        let conflictOriginal = conflict.documentURL
+        let conflictCopy = files.appendingPathComponent("close-conflict-copy.md")
+        conflict.closeAlertDecision = { _ in .alertFirstButtonReturn }
+        conflict.savePanelDecision = { _ in conflictCopy }
+        conflictWindow.performClose(nil)
+        try require(documents[conflictWindow] == nil, "Save Copy did not resolve close conflict")
+        try require(try Data(contentsOf: conflictOriginal) == Data("外部内容".utf8) && Data(contentsOf: conflictCopy) == Data("本地基线".utf8), "Conflict close changed external bytes or lost local source")
+        record("window close Cancel, Save, first-save cancellation and conflict Save Copy")
+
+        newDocument(nil)
+        let quitA = documents[window!]!
+        insert("退出甲", into: quitA)
+        try quitA.persistence.flushRecovery()
+        newDocument(nil)
+        let quitB = documents[window!]!
+        insert("退出乙", into: quitB)
+        try quitB.persistence.flushRecovery()
+        let recordA = try quitA.persistence.bridge.recoveryURL(in: locations.recovery)
+        let recordB = try quitB.persistence.bridge.recoveryURL(in: locations.recovery)
+        var decisions = 0
+        for controller in documents.values {
+            controller.closeAlertDecision = { _ in
+                decisions += 1
+                return decisions == 1 ? .alertSecondButtonReturn : .alertThirdButtonReturn
+            }
+        }
+        try require(applicationShouldTerminate(NSApp) == .terminateCancel && decisions == 2, "Aggregate quit cancellation failed")
+        try require(documents.values.allSatisfy { $0.persistence.bridge.state.closeState == 0 }, "Cancelled quit left a closed session")
+        try require(FileManager.default.fileExists(atPath: recordA.path) && FileManager.default.fileExists(atPath: recordB.path), "Provisional discard deleted recovery before quit was approved")
+        record("multi-window quit cancellation rolls back all close states and keeps backups")
+        for controller in documents.values { controller.closeAlertDecision = { _ in .alertSecondButtonReturn } }
+        for window in Array(documents.keys) { window.performClose(nil) }
+        try require(documents.isEmpty && !applicationShouldTerminateAfterLastWindowClosed(NSApp), "Last-window close terminated the application")
+        try require(!FileManager.default.fileExists(atPath: recordA.path) && !FileManager.default.fileExists(atPath: recordB.path), "Approved discard left recoverable drafts")
+        newDocument(nil)
+        try require(documents.count == 1 && documents.values.first?.persistence.isPristineUntitled == true, "New failed after closing all windows")
+        record("approved discard cleanup and New with no existing windows")
+        try require(errors.isEmpty, "Unexpected file errors: \(errors)")
+        try finishResult(["recent_target": conflictCopy.path])
     }
 }

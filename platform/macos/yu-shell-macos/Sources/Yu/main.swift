@@ -14,6 +14,11 @@ import YuStorageFFI
 //   Accessibility.swift     AppKit Accessibility 元素
 
 let app = NSApplication.shared
+if CommandLine.arguments.contains("--presentation-latency-self-check") || CommandLine.arguments.contains("--zoom-latency-self-check") || CommandLine.arguments.contains("--redraw-latency-self-check") {
+    // Benchmark-only process override; do not mutate the user's saved theme.
+    UserDefaults.standard.setVolatileDomain(["Yu.readingTheme": 0], forName: UserDefaults.argumentDomain)
+}
+NativeTheme.registerFonts()
 if let flag = CommandLine.arguments.firstIndex(of: "--selection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runSelectionSelfCheck(path: CommandLine.arguments[flag + 1])

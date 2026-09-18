@@ -88,6 +88,8 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
     private var rows: [NativeSearchMatch] = []
 
     /// 查询框里的字变了。防抖交给调用方——这里每敲一个字符都发一次。
+    var onClose: (() -> Void)?
+    var onNext: ((Bool) -> Void)?
     var onQueryChange: ((String) -> Void)?
     /// 点了某一行。程序化恢复选中时不触发。
     var onSelect: ((NativeSearchMatch) -> Void)?
@@ -132,27 +134,46 @@ final class SearchPanel: NSObject, NSTableViewDataSource, NSTableViewDelegate,
         scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         view.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(separator)
-        view.addSubview(field)
-        view.addSubview(countLabel)
-        view.addSubview(scrollView)
+        let previous = NSButton(image: NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "上一个")!, target: self, action: #selector(previousMatch(_:)))
+        let next = NSButton(image: NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "下一个")!, target: self, action: #selector(nextMatch(_:)))
+        let close = NSButton(title: "完成", target: self, action: #selector(closeFind(_:)))
+        for button in [previous, next, close] { button.bezelStyle = .rounded; button.controlSize = .small }
+        let stack = NSStackView(views: [field, countLabel, previous, next, close])
+        stack.orientation = .horizontal
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        view.addSubview(stack)
         NSLayoutConstraint.activate([
-            separator.topAnchor.constraint(equalTo: view.topAnchor),
-            separator.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            separator.heightAnchor.constraint(equalToConstant: 1.0),
-            field.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 6.0),
-            field.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 6.0),
-            field.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -6.0),
-            countLabel.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 4.0),
-            countLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8.0),
-            countLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -6.0),
-            scrollView.topAnchor.constraint(equalTo: countLabel.bottomAnchor, constant: 4.0),
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            view.heightAnchor.constraint(equalToConstant: 38),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            field.widthAnchor.constraint(greaterThanOrEqualToConstant: 120)
         ])
+
     }
+
+    @objc private func previousMatch(_ sender: Any?) { onNext?(false) }
+    @objc private func nextMatch(_ sender: Any?) { onNext?(true) }
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        // Let the input source consume Escape/Return while composing a query.
+        // Once composition is finished these keys operate the find accessory.
+        guard !textView.hasMarkedText() else { return false }
+        switch NSStringFromSelector(commandSelector) {
+        case "cancelOperation:", "cancel:":
+            onClose?()
+            return true
+        case "insertNewline:":
+            onNext?(!(NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false))
+            return true
+        default:
+            return false
+        }
+    }
+
+    @objc private func closeFind(_ sender: Any?) { onClose?() }
 
     /// 面板要不要接受键盘焦点由窗口决定；这里只把查询框交出去。
     var focusTarget: NSView { field }
