@@ -6,3 +6,6 @@
 *.xcuserstate
 /.notes/
 __pycache__/
+
+# Local validation evidence, screenshots and isolated test application bundles.
+/artifacts/
