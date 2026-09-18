@@ -35,9 +35,9 @@ impl ViewportBlockGeometry {
                 "viewport block y must be finite and non-negative",
             ));
         }
-        if !height.is_finite() || height <= 0.0 {
+        if !height.is_finite() || height < 0.0 {
             return Err(SceneError::InvalidViewportInput(
-                "viewport block height must be finite and positive",
+                "viewport block height must be finite and non-negative",
             ));
         }
         let bottom = y + height;

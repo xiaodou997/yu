@@ -20,7 +20,10 @@ impl Extension for CodeSpan {
             let Some(span) = DelimitedSpan::of(node, |kind| kind == NodeKind::CodeMark) else {
                 continue;
             };
-            let style = out.style(TextAttrs::new(TextStyle::Code));
+            let style = out.style(
+                TextAttrs::new(TextStyle::Code)
+                    .with_inline_box_id(Some(node.range().start().get())),
+            );
             out.mark(span.content, style);
             if !reveals(cx.active(), node.range()) {
                 out.replace(span.opening);

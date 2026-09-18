@@ -296,6 +296,13 @@ impl ShapedText {
 pub trait ShapingProvider {
     type Error: fmt::Display;
 
+    /// Production native backends expose complete paragraph layout. Providers
+    /// used by deterministic metrics tests may keep the reference line engine.
+    /// A native provider error is propagated, never retried through that engine.
+    fn paragraph_provider(&self) -> Option<&dyn crate::ParagraphLayoutProvider> {
+        None
+    }
+
     fn shape(
         &self,
         text: &str,

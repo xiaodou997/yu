@@ -115,6 +115,12 @@ pub fn command_for_key(event: KeyEvent) -> Option<EditorCommand> {
         }
         (EditorKey::Tab, KeyModifiers::NONE) => Some(EditorCommand::indent_list()),
         (EditorKey::Tab, KeyModifiers::SHIFT) => Some(EditorCommand::outdent_list()),
+        (EditorKey::Backspace, KeyModifiers::OPTION | KeyModifiers::CONTROL) => {
+            Some(EditorCommand::DeleteWordBackward)
+        }
+        (EditorKey::Delete, KeyModifiers::OPTION | KeyModifiers::CONTROL) => {
+            Some(EditorCommand::DeleteWordForward)
+        }
         (EditorKey::Backspace, KeyModifiers::NONE) => Some(EditorCommand::DeleteBackward),
         (EditorKey::Delete, KeyModifiers::NONE) => Some(EditorCommand::DeleteForward),
         (EditorKey::Left, KeyModifiers::NONE) => Some(EditorCommand::MoveLeft),
@@ -139,6 +145,20 @@ mod tests {
 
     fn event(key: EditorKey, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(key, modifiers)
+    }
+
+    #[test]
+    fn word_delete_shortcuts_route_both_directions() {
+        for modifier in [KeyModifiers::OPTION, KeyModifiers::CONTROL] {
+            assert_eq!(
+                command_for_key(event(EditorKey::Backspace, modifier)),
+                Some(EditorCommand::DeleteWordBackward)
+            );
+            assert_eq!(
+                command_for_key(event(EditorKey::Delete, modifier)),
+                Some(EditorCommand::DeleteWordForward)
+            );
+        }
     }
 
     #[test]

@@ -38,6 +38,7 @@ fn block(snapshot: &TextSnapshot, index: usize) -> (BlockDecorations, VisualText
             snapshot,
             &tree,
             markdown.reference_definitions(),
+            markdown.presentation(),
             block,
             None,
         )
@@ -348,4 +349,404 @@ fn a_preedit_selection_off_a_char_boundary_is_rejected() {
         visual.with_composition(range(1, 2), "日", range(1, 1)),
         Err(VisualTextError::CompositionSelectionNotUtf8Boundary { .. })
     ));
+}
+
+#[test]
+fn replacement_text_and_geometry_share_normalized_atoms() {
+    use yu_decoration::{Decoration, DecorationRange, DecorationSet};
+    let snapshot = TextBuffer::new("a<br>z").snapshot();
+    let set = DecorationSet::new(
+        snapshot.revision(),
+        snapshot.len_bytes(),
+        [DecorationRange::new(
+            range(1, 5),
+            Decoration::Substitute { text: '\n'.into() },
+        )],
+    );
+    let visual = VisualText::new(&snapshot, range(0, 6), set.clone()).expect("projection");
+    assert_eq!(visual.text(), "a\nz");
+    assert_eq!(visual.visual_len().get(), set.visual_len().get());
+    for bias in [Bias::Before, Bias::After] {
+        assert_eq!(
+            visual
+                .visual_to_source(yu_core::VisualOffset::new(1), bias)
+                .expect("before break"),
+            offset(1)
+        );
+        assert_eq!(
+            visual
+                .visual_to_source(yu_core::VisualOffset::new(2), bias)
+                .expect("after break"),
+            offset(5)
+        );
+    }
+    for from in 0..=6 {
+        for to in from..=6 {
+            let sliced = VisualText::new(&snapshot, range(from, to), set.clone()).expect("slice");
+            assert_eq!(
+                sliced.text().len() as u64,
+                set.source_to_visual(offset(to)).get() - set.source_to_visual(offset(from)).get(),
+                "slice {from}..{to}"
+            );
+        }
+    }
+    let composed = visual
+        .with_composition(range(1, 5), "中文", range(0, 0))
+        .expect("preedit over atom");
+    assert_eq!(composed.text(), "a中文z");
+    assert_eq!(snapshot.as_str(), "a<br>z");
+    assert_eq!(
+        composed
+            .visual_to_source(yu_core::VisualOffset::new(7), Bias::After)
+            .expect("after preedit"),
+        offset(5)
+    );
+}
+
+#[test]
+fn unicode_substitutions_expand_without_moving_source_boundaries() {
+    use yu_decoration::{Decoration, DecorationRange, DecorationSet};
+    let snapshot = TextBuffer::new("AxZ").snapshot();
+    let set = DecorationSet::new(
+        snapshot.revision(),
+        snapshot.len_bytes(),
+        [DecorationRange::new(
+            range(1, 2),
+            Decoration::Substitute {
+                text: '🪶'.into()
+            },
+        )],
+    );
+    let visual = VisualText::new(&snapshot, range(0, 3), set).expect("Unicode atom");
+    assert_eq!(visual.text(), "A🪶Z");
+    assert_eq!(
+        visual
+            .source_to_visual(offset(2), Bias::After)
+            .expect("after atom")
+            .get(),
+        5
+    );
+    assert_eq!(
+        visual
+            .visual_to_source(yu_core::VisualOffset::new(5), Bias::After)
+            .expect("source edge"),
+        offset(2)
+    );
+}
+
+#[test]
+fn native_document_projects_plain_html_break_tags_but_preserves_code_and_escapes() {
+    use yu_editor::EditorDocument;
+    use yu_layout::LayoutConfig;
+    for (source, expected) in [
+        ("a<br>b", "a\nb"),
+        ("a<BR />b<br/>c", "a\nb\nc"),
+        ("a`<br>`b", "a<br>b"),
+        (r"a\<br>b", "a<br>b"),
+        ("a<br class=\"x\">b", "a<br class=\"x\">b"),
+        ("a</br>b", "a</br>b"),
+    ] {
+        let mut document = EditorDocument::new(source);
+        let layout = document
+            .block_layout(0, LayoutConfig::new(400.0, 16.0))
+            .expect("native layout");
+        assert_eq!(layout.visual().text(), expected, "source={source:?}");
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+}
+
+#[test]
+fn table_breaks_raise_cell_height_and_keep_caret_rows_distinct() {
+    use yu_editor::EditorDocument;
+    use yu_layout::LayoutConfig;
+    for prefix in ["", "> ", "> > "] {
+        for zoom in [0.75, 1.0, 1.5] {
+            let source = format!(
+                "{prefix}| H | V |\n{prefix}| --- | --- |\n{prefix}| first<br>second | x |\n"
+            );
+            let mut document = EditorDocument::new(source.clone());
+            let layout = document
+                .block_layout(0, LayoutConfig::new(500.0 * zoom, 16.0 * zoom))
+                .expect("table layout");
+            assert!(layout.visual().text().contains("first\nsecond"));
+            let from = layout
+                .caret_for_source(
+                    offset(source.find("first").expect("first") as u64),
+                    Bias::After,
+                )
+                .expect("first caret");
+            let to = layout
+                .caret_for_source(
+                    offset(source.find("second").expect("second") as u64),
+                    Bias::After,
+                )
+                .expect("second caret");
+            assert!(to.point().y() > from.point().y() + 8.0 * zoom);
+            let tall = layout
+                .table()
+                .expect("table")
+                .cells()
+                .iter()
+                .find(|cell| cell.row() == 1)
+                .expect("body cell")
+                .bounds()
+                .height();
+            let plain = source.replace("<br>", " ");
+            let mut plain = EditorDocument::new(plain);
+            let plain = plain
+                .block_layout(0, LayoutConfig::new(500.0 * zoom, 16.0 * zoom))
+                .expect("single line");
+            let short = plain
+                .table()
+                .expect("table")
+                .cells()
+                .iter()
+                .find(|cell| cell.row() == 1)
+                .expect("body cell")
+                .bounds()
+                .height();
+            assert!(tall > short + 8.0 * zoom);
+        }
+    }
+}
+
+#[test]
+fn table_break_deletion_removes_one_atom_and_undo_restores_source() {
+    use yu_editor::{CaretAffinity, EditorCommand, EditorDocument, EditorSelection};
+    for prefix in ["", "> "] {
+        for tag in ["<br>", "<BR />", "<br/>", "&#32;", "&#9;", "&#x2003;"] {
+            for backward in [false, true] {
+                let source = format!("{prefix}| H |\n{prefix}| --- |\n{prefix}| a{tag}b |\n");
+                let mut document = EditorDocument::new(source.clone());
+                let at = source.find(tag).expect("tag") + if backward { tag.len() } else { 0 };
+                let selection = EditorSelection::cursor(
+                    &document.snapshot(),
+                    offset(at as u64),
+                    CaretAffinity::Downstream,
+                )
+                .expect("caret");
+                document.set_selection(selection).expect("selection");
+                document
+                    .execute(if backward {
+                        EditorCommand::DeleteBackward
+                    } else {
+                        EditorCommand::DeleteForward
+                    })
+                    .expect("delete atom");
+                assert_eq!(document.snapshot().as_str(), source.replace(tag, ""));
+                document.execute(EditorCommand::Undo).expect("undo");
+                assert_eq!(document.snapshot().as_str(), source);
+            }
+        }
+    }
+}
+
+#[test]
+fn table_arrow_steps_and_shift_selection_keep_projection_atoms_whole() {
+    use yu_editor::{CaretAffinity, EditorCommand, EditorDocument, EditorSelection};
+    for prefix in ["", "> ", "> > "] {
+        let atoms = [
+            "<br>",
+            "<br>",
+            "&#32;",
+            "&#x2003;",
+            "&amp;",
+            "&NotEqualTilde;",
+            "&fjlig;",
+            "\\|",
+            "👨‍👩‍👧‍👦",
+        ];
+        let source = format!(
+            "{prefix}| H |\n{prefix}| --- |\n{prefix}| a{}z |",
+            atoms.concat()
+        );
+        let mut document = EditorDocument::new(source.clone());
+        let start = source.find("<br>").expect("first atom");
+        let cursor = EditorSelection::cursor(
+            &document.snapshot(),
+            offset(start as u64),
+            CaretAffinity::Downstream,
+        )
+        .expect("cursor");
+        document.set_selection(cursor).expect("selection");
+        let mut at = start;
+        for atom in atoms {
+            document.execute(EditorCommand::MoveRight).expect("right");
+            at += atom.len();
+            assert_eq!(document.selection().focus(), offset(at as u64));
+        }
+        for atom in atoms.into_iter().rev() {
+            document.execute(EditorCommand::MoveLeft).expect("left");
+            at -= atom.len();
+            assert_eq!(document.selection().focus(), offset(at as u64));
+        }
+        document
+            .execute(EditorCommand::ExtendHorizontal {
+                forward: true,
+                word: false,
+            })
+            .expect("select break");
+        let selected = document.selection().ordered_range();
+        assert_eq!(selected.start(), offset(start as u64));
+        assert_eq!(selected.end(), offset((start + 4) as u64));
+        document
+            .execute(EditorCommand::DeleteSelections)
+            .expect("delete selected break");
+        assert_eq!(document.snapshot().as_str(), source.replacen("<br>", "", 1));
+        document.execute(EditorCommand::Undo).expect("undo");
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+}
+
+#[test]
+fn projected_table_graphemes_combine_after_escapes_but_not_after_line_breaks() {
+    use yu_editor::{CaretAffinity, EditorCommand, EditorDocument, EditorSelection};
+    for (text, start_delta, end_delta) in [
+        ("\\*\u{301}", 0, 4),
+        ("&#32;\u{301}", 0, 7),
+        ("<br>\u{301}", 4, 6),
+        ("&amp;", 0, 5),
+        ("&NotEqualTilde;", 0, 15),
+        ("&fjlig;", 0, 7),
+    ] {
+        for forward in [false, true] {
+            let source = format!("| H |\n| --- |\n| a{text}z |");
+            let base = source.find(text).expect("text");
+            let from = base + if forward { start_delta } else { end_delta };
+            let mut document = EditorDocument::new(source.clone());
+            let cursor = EditorSelection::cursor(
+                &document.snapshot(),
+                offset(from as u64),
+                CaretAffinity::Downstream,
+            )
+            .expect("cursor");
+            document.set_selection(cursor).expect("selection");
+            document
+                .execute(if forward {
+                    EditorCommand::MoveRight
+                } else {
+                    EditorCommand::MoveLeft
+                })
+                .expect("move");
+            assert_eq!(
+                document.selection().focus(),
+                offset((base + if forward { end_delta } else { start_delta }) as u64),
+                "{text} forward={forward}"
+            );
+            document.set_selection(cursor).expect("reset");
+            document
+                .execute(if forward {
+                    EditorCommand::DeleteForward
+                } else {
+                    EditorCommand::DeleteBackward
+                })
+                .expect("delete");
+            let mut expected = source.clone();
+            expected.replace_range(base + start_delta..base + end_delta, "");
+            assert_eq!(document.snapshot().as_str(), expected);
+            document.execute(EditorCommand::Undo).expect("undo");
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+    }
+}
+
+#[test]
+fn ordinary_escaped_punctuation_projects_without_changing_source() {
+    for (source, expected) in [
+        (r"literal \<br\> \& \*word\*", "literal <br> & *word*"),
+        (r"中文 \[文字\] \\ 🪶", "中文 [文字] \\ 🪶"),
+        (r"`\*code\*` and \*text\*", r"\*code\* and *text*"),
+        (r"unknown \q", r"unknown \q"),
+    ] {
+        let snapshot = TextBuffer::new(source).snapshot();
+        let (_, visual) = block(&snapshot, 0);
+        assert_eq!(visual.text(), expected, "source={source:?}");
+        assert_eq!(snapshot.as_str(), source);
+    }
+}
+
+#[test]
+fn escaped_punctuation_reveals_only_when_the_source_selection_touches_it() {
+    let snapshot = TextBuffer::new(r"a\*b").snapshot();
+    let markdown = yu_markdown::parse(&snapshot);
+    let tree = parse_syntax(&snapshot)
+        .expect("valid escape fixture")
+        .into_tree();
+    for (active, expected) in [(range(0, 0), "a*b"), (range(2, 2), r"a\*b")] {
+        let decorations = ExtensionSet::markdown()
+            .decorate(
+                &snapshot,
+                &tree,
+                markdown.reference_definitions(),
+                markdown.presentation(),
+                markdown.blocks().get(0).expect("valid escape fixture"),
+                Some(active),
+            )
+            .expect("valid escape fixture");
+        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+            .expect("valid escape fixture");
+        assert_eq!(visual.text(), expected);
+        assert_eq!(snapshot.as_str(), r"a\*b");
+    }
+}
+
+#[test]
+fn character_references_use_canonical_projection_and_preserve_source() {
+    for (source, expected) in [
+        ("# **A &amp; B**", "A & B"),
+        ("&copy; &#169; &#x1F600; &NotEqualTilde;", "© © 😀 ≂\u{338}"),
+        ("&CounterClockwiseContourIntegral;", "∳"),
+        ("&#0; &#xD800; &#1114112;", "� � �"),
+        (
+            r"\&amp; `&amp;` &unknown; &amp",
+            "&amp; &amp; &unknown; &amp",
+        ),
+        ("```\n&amp;\n```", "&amp;\n"),
+        ("[&amp;](target)", "&"),
+        (
+            "| &amp; | &NotEqualTilde; |\n| --- | --- |\n| &#32; | &#x1F600; |",
+            "&≂\u{338} 😀",
+        ),
+    ] {
+        let snapshot = TextBuffer::new(source).snapshot();
+        let (_, visual) = block(&snapshot, 0);
+        assert_eq!(visual.text(), expected, "{source}");
+        assert_eq!(snapshot.as_str(), source);
+    }
+}
+
+#[test]
+fn multi_scalar_reference_has_atomic_source_edges_and_reveals_for_editing() {
+    let source = "甲&NotEqualTilde;😀";
+    let snapshot = TextBuffer::new(source).snapshot();
+    let (decorations, visual) = block(&snapshot, 0);
+    assert_eq!(visual.text(), "甲≂\u{338}😀");
+    let set = decorations.set();
+    // The internal combining-mark boundary must never map inside the entity.
+    assert_eq!(
+        set.visual_to_source(yu_core::VisualOffset::new(6), Bias::Before),
+        offset(3)
+    );
+    assert_eq!(
+        set.visual_to_source(yu_core::VisualOffset::new(6), Bias::After),
+        offset(18)
+    );
+    assert_eq!(set.source_to_visual(offset(18)).get(), 8);
+    let markdown = yu_markdown::parse(&snapshot);
+    let tree = parse_syntax(&snapshot)
+        .expect("valid entity fixture")
+        .into_tree();
+    let decorations = ExtensionSet::markdown()
+        .decorate(
+            &snapshot,
+            &tree,
+            markdown.reference_definitions(),
+            markdown.presentation(),
+            markdown.blocks().get(0).expect("valid entity fixture"),
+            Some(range(5, 5)),
+        )
+        .expect("valid entity fixture");
+    let revealed = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())
+        .expect("valid entity fixture");
+    assert_eq!(revealed.text(), source);
 }

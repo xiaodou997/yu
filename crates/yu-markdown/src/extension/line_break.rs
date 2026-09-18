@@ -27,7 +27,20 @@ impl Extension for LineBreak {
                 out.replace(prefix);
             }
         }
+        for range in html_break_ranges(cx) {
+            out.substitute(range, '\n');
+        }
     }
+}
+
+pub(crate) fn html_break_ranges(cx: &BlockContext<'_>) -> Vec<TextRange> {
+    cx.nodes()
+        .filter(|node| node.kind() == NodeKind::HtmlTag)
+        .filter_map(|node| {
+            let bytes = read_range(cx.source(), node.range())?;
+            is_plain_break_tag(&bytes).then_some(node.range())
+        })
+        .collect()
 }
 
 /// 硬换行节点里除去行尾符本身的那一段。
@@ -51,4 +64,21 @@ fn break_prefix(cx: &BlockContext<'_>, range: TextRange) -> Option<TextRange> {
         return None;
     }
     TextRange::new(range.start(), ending_start).filter(|prefix| !prefix.is_empty())
+}
+
+// Interpret only the break tag itself. Attributes and unknown HTML remain
+// source-editable; no script, CSS, or general HTML layout is evaluated here.
+fn is_plain_break_tag(bytes: &[u8]) -> bool {
+    let Ok(tag) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some(inner) = tag.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
+        return false;
+    };
+    let inner = inner.trim_end_matches(char::is_whitespace);
+    let name = inner
+        .strip_suffix('/')
+        .unwrap_or(inner)
+        .trim_end_matches(char::is_whitespace);
+    name.eq_ignore_ascii_case("br")
 }

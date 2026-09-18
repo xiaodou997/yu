@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::hash::Hasher;
+use std::sync::{Arc, OnceLock};
 
 use super::{FontFaceId, GlyphId};
 
@@ -196,9 +197,10 @@ impl GlyphMetrics {
     }
 }
 
-/// Owned, single-channel glyph coverage pixels.
+/// Owned glyph coverage or premultiplied RGBA pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlyphBitmap {
+    color: bool,
     width: u32,
     height: u32,
     stride: u32,
@@ -206,6 +208,26 @@ pub struct GlyphBitmap {
 }
 
 impl GlyphBitmap {
+    pub fn new_rgba(
+        width: u32,
+        height: u32,
+        stride: u32,
+        pixels: impl Into<Arc<[u8]>>,
+    ) -> Result<Self, RasterDataError> {
+        if width.checked_mul(4).is_none_or(|bytes| stride < bytes) {
+            return Err(RasterDataError::InvalidBitmap(
+                "RGBA stride is smaller than pixel width",
+            ));
+        }
+        let mut result = Self::new(width, height, stride, pixels)?;
+        result.color = true;
+        Ok(result)
+    }
+
+    #[must_use]
+    pub const fn is_color(&self) -> bool {
+        self.color
+    }
     pub fn new(
         width: u32,
         height: u32,
@@ -228,6 +250,7 @@ impl GlyphBitmap {
             ));
         }
         Ok(Self {
+            color: false,
             width,
             height,
             stride,
@@ -391,7 +414,7 @@ impl FontMetricsCache {
     }
 }
 
-/// A rectangle in a single-channel atlas page.
+/// A rectangle in a premultiplied RGBA atlas page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AtlasRect {
     x: u32,
@@ -425,6 +448,7 @@ impl AtlasRect {
 /// Placement and metrics for one atlas entry.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AtlasEntry {
+    color: bool,
     key: GlyphRasterKey,
     page: Option<u32>,
     rect: AtlasRect,
@@ -432,6 +456,10 @@ pub struct AtlasEntry {
 }
 
 impl AtlasEntry {
+    #[must_use]
+    pub const fn is_color(self) -> bool {
+        self.color
+    }
     #[must_use]
     pub const fn key(self) -> GlyphRasterKey {
         self.key
@@ -538,7 +566,8 @@ impl Error for AtlasError {}
 
 #[derive(Clone, Debug)]
 struct AtlasPage {
-    pixels: Vec<u8>,
+    pixels: Arc<Vec<u8>>,
+    fingerprint: OnceLock<u64>,
     next_x: u32,
     next_y: u32,
     row_height: u32,
@@ -551,11 +580,12 @@ impl AtlasPage {
             .and_then(|width| {
                 usize::try_from(config.page_height)
                     .ok()
-                    .and_then(|height| width.checked_mul(height))
+                    .and_then(|height| width.checked_mul(height)?.checked_mul(4))
             })
             .ok_or(AtlasError::CapacityExceeded)?;
         Ok(Self {
-            pixels: vec![0; len],
+            pixels: Arc::new(vec![0; len]),
+            fingerprint: OnceLock::new(),
             next_x: 0,
             next_y: 0,
             row_height: 0,
@@ -590,43 +620,37 @@ impl AtlasPage {
         rect: AtlasRect,
         bitmap: &GlyphBitmap,
     ) -> Result<(), AtlasError> {
-        let page_width =
-            usize::try_from(config.page_width).map_err(|_| AtlasError::CapacityExceeded)?;
-        let rect_x = usize::try_from(rect.x).map_err(|_| AtlasError::CapacityExceeded)?;
-        let rect_y = usize::try_from(rect.y).map_err(|_| AtlasError::CapacityExceeded)?;
-        let width = usize::try_from(rect.width).map_err(|_| AtlasError::CapacityExceeded)?;
-        let height = usize::try_from(rect.height).map_err(|_| AtlasError::CapacityExceeded)?;
-        let stride = usize::try_from(bitmap.stride()).map_err(|_| AtlasError::CapacityExceeded)?;
-        for row in 0..height {
-            let source_start = row
-                .checked_mul(stride)
-                .ok_or(AtlasError::CapacityExceeded)?;
-            let target_start = rect_y
-                .checked_add(row)
-                .and_then(|y| y.checked_mul(page_width))
-                .and_then(|row_start| row_start.checked_add(rect_x))
-                .ok_or(AtlasError::CapacityExceeded)?;
-            let source = bitmap
-                .pixels()
-                .get(
-                    source_start
-                        ..source_start
-                            .checked_add(width)
+        self.fingerprint.take();
+        let pixels = Arc::make_mut(&mut self.pixels);
+        for row in 0..rect.height as usize {
+            for column in 0..rect.width as usize {
+                let source =
+                    row * bitmap.stride as usize + column * if bitmap.color { 4 } else { 1 };
+                let target = ((rect.y as usize + row) * config.page_width as usize
+                    + rect.x as usize
+                    + column)
+                    * 4;
+                let destination = pixels
+                    .get_mut(target..target + 4)
+                    .ok_or(AtlasError::CapacityExceeded)?;
+                if bitmap.color {
+                    destination.copy_from_slice(
+                        bitmap
+                            .pixels
+                            .get(source..source + 4)
                             .ok_or(AtlasError::CapacityExceeded)?,
-                )
-                .ok_or(AtlasError::InvalidBitmap(RasterDataError::InvalidBitmap(
-                    "source row is out of bounds",
-                )))?;
-            let target = self
-                .pixels
-                .get_mut(
-                    target_start
-                        ..target_start
-                            .checked_add(width)
+                    );
+                } else {
+                    // White premultiplied coverage can be tinted by the theme;
+                    // native color glyphs keep their RGB values in the same atlas.
+                    destination.fill(
+                        *bitmap
+                            .pixels
+                            .get(source)
                             .ok_or(AtlasError::CapacityExceeded)?,
-                )
-                .ok_or(AtlasError::CapacityExceeded)?;
-            target.copy_from_slice(source);
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -726,6 +750,26 @@ impl GlyphAtlas {
             .ok_or(AtlasError::PageIndexOutOfBounds)
     }
 
+    /// Stable content identity shared by unchanged atlas snapshots. Only a
+    /// pixel mutation invalidates it; frame publication must not scan several
+    /// megabytes of unchanged glyph pixels on every input/scroll.
+    pub fn page_fingerprint(&self, page: u32) -> Result<u64, AtlasError> {
+        let entry = self
+            .pages
+            .get(usize::try_from(page).map_err(|_| AtlasError::PageIndexOutOfBounds)?)
+            .ok_or(AtlasError::PageIndexOutOfBounds)?;
+        Ok(*entry.fingerprint.get_or_init(|| {
+            // Runtime GPU deduplication only, never a persisted file format.
+            // Hash the byte slice in bulk instead of a serial multiply per byte.
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            hash.write_u32(page);
+            hash.write_u32(self.config.page_width);
+            hash.write_u32(self.config.page_height);
+            hash.write(entry.pixels.as_slice());
+            hash.finish()
+        }))
+    }
+
     pub fn insert(&mut self, glyph: RasterizedGlyph) -> Result<AtlasEntry, AtlasError> {
         if let Some(entry) = self.entries.get(&glyph.key()).copied() {
             return Ok(entry);
@@ -739,6 +783,7 @@ impl GlyphAtlas {
         }
         let rect = if bitmap.is_empty() {
             AtlasEntry {
+                color: bitmap.is_color(),
                 key: glyph.key(),
                 page: None,
                 rect: AtlasRect {
@@ -782,6 +827,7 @@ impl GlyphAtlas {
             }
             let (page, rect) = placement.ok_or(AtlasError::CapacityExceeded)?;
             AtlasEntry {
+                color: bitmap.is_color(),
                 key: glyph.key(),
                 page: Some(page),
                 rect,
@@ -843,6 +889,60 @@ mod tests {
             Err(RasterDataError::InvalidSize(0.0_f32.to_bits()))
         );
         assert!(GlyphBitmap::new(2, 2, 1, vec![0; 4]).is_err());
+    }
+
+    #[test]
+    fn page_content_identity_survives_clones_and_changes_only_with_pixels() {
+        let config = GlyphAtlasConfig::new(8, 8, 1).expect("config");
+        let mut atlas = GlyphAtlas::new(config);
+        atlas.insert(glyph(1, 1, 1)).expect("first glyph");
+        let initial = atlas.page_fingerprint(0).expect("identity");
+        let frozen = atlas.clone();
+        atlas.insert(glyph(2, 1, 1)).expect("new pixels");
+        let changed = atlas.page_fingerprint(0).expect("new identity");
+        assert_ne!(initial, changed);
+        assert_eq!(
+            frozen.page_fingerprint(0).expect("frozen identity"),
+            initial
+        );
+        atlas.insert(glyph(2, 1, 1)).expect("cache hit");
+        atlas.insert(glyph(3, 0, 0)).expect("empty glyph");
+        assert_eq!(
+            atlas.page_fingerprint(0).expect("unchanged pixels"),
+            changed
+        );
+        let mut independent = GlyphAtlas::new(config);
+        independent.insert(glyph(1, 1, 1)).expect("same content");
+        assert_eq!(
+            independent.page_fingerprint(0).expect("content identity"),
+            initial
+        );
+        assert!(atlas.page_fingerprint(99).is_err());
+    }
+
+    #[test]
+    fn atlas_preserves_color_and_snapshot_pixels() {
+        let mut atlas = GlyphAtlas::new(GlyphAtlasConfig::new(8, 8, 1).expect("config"));
+        atlas.insert(glyph(128, 1, 1)).expect("coverage glyph");
+        let frozen = atlas.clone();
+        assert_eq!(&frozen.page_pixels(0).expect("page")[..4], &[128; 4]);
+        let colored = RasterizedGlyph::new(
+            key(129, 12.0),
+            GlyphMetrics::new(0.0, 10.0, 8.0).expect("metrics"),
+            GlyphBitmap::new_rgba(1, 1, 4, vec![80, 20, 10, 128]).expect("RGBA"),
+        );
+        let entry = atlas.insert(colored).expect("color glyph");
+        assert!(entry.is_color());
+        let offset = ((entry.rect().y() * 8 + entry.rect().x()) * 4) as usize;
+        assert_eq!(
+            &atlas.page_pixels(0).expect("page")[offset..offset + 4],
+            &[80, 20, 10, 128]
+        );
+        assert_eq!(
+            &frozen.page_pixels(0).expect("snapshot")[offset..offset + 4],
+            &[0; 4]
+        );
+        assert!(GlyphBitmap::new_rgba(2, 1, 7, vec![0; 7]).is_err());
     }
 
     #[test]

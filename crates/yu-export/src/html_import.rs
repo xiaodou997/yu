@@ -654,6 +654,10 @@ fn render_block(element: &Element) -> Result<String, HtmlImportError> {
 }
 
 fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
+    render_inline_content(nodes, false)
+}
+
+fn render_inline_content(nodes: &[Node], table_cell: bool) -> Result<String, HtmlImportError> {
     let mut output = String::new();
     // `<br />` 后面紧跟的那一个换行是 HTML 的排版空白，不是内容。
     //
@@ -676,12 +680,12 @@ fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
             Node::Element(element) => match element.name.as_str() {
                 "strong" => {
                     output.push_str("**");
-                    output.push_str(&render_inline_nodes(&element.children)?);
+                    output.push_str(&render_inline_content(&element.children, table_cell)?);
                     output.push_str("**");
                 }
                 "em" => {
                     output.push('*');
-                    output.push_str(&render_inline_nodes(&element.children)?);
+                    output.push_str(&render_inline_content(&element.children, table_cell)?);
                     output.push('*');
                 }
                 "code" => {
@@ -692,7 +696,7 @@ fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
                     let href = attribute(&element.attributes, "href")
                         .ok_or(HtmlImportError::InvalidStructure("link is missing href"))?;
                     output.push('[');
-                    output.push_str(&render_inline_nodes(&element.children)?);
+                    output.push_str(&render_inline_content(&element.children, table_cell)?);
                     output.push_str("](");
                     escape_destination(href, &mut output);
                     push_title(attribute(&element.attributes, "title"), &mut output);
@@ -709,7 +713,7 @@ fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
                     push_title(attribute(&element.attributes, "title"), &mut output);
                     output.push(')');
                 }
-                "br" => output.push_str("  \n"),
+                "br" => output.push_str(if table_cell { "<br>" } else { "  \n" }),
                 _ => {
                     return Err(HtmlImportError::InvalidStructure(
                         "block element is not valid inline content",
@@ -880,17 +884,24 @@ fn render_table(element: &Element) -> Result<String, HtmlImportError> {
                         "table has duplicate thead",
                     ));
                 }
-                header = Some(read_table_section(section, "th")?);
+                header = Some(read_table_section(section)?);
             }
-            "tbody" => rows.extend(read_table_section(section, "td")?),
+            "tbody" => rows.extend(read_table_section(section)?),
+            "tr" => rows.push(read_table_row(section)?),
             _ => {
                 return Err(HtmlImportError::InvalidStructure(
-                    "table requires thead/tbody",
+                    "table requires thead, tbody or tr",
                 ));
             }
         }
     }
-    let header = header.ok_or(HtmlImportError::InvalidStructure("table is missing thead"))?;
+    // Pipe tables have one required header row. A plain HTML grid has none;
+    // promote its first row, keeping every source cell and its order.
+    let header = match header {
+        Some(header) => header,
+        None if !rows.is_empty() => vec![rows.remove(0)],
+        None => return Err(HtmlImportError::InvalidStructure("table has no rows")),
+    };
     if header.len() != 1 || header[0].is_empty() {
         return Err(HtmlImportError::InvalidStructure(
             "table requires one header row",
@@ -917,10 +928,7 @@ fn render_table(element: &Element) -> Result<String, HtmlImportError> {
         .join("\n"))
 }
 
-fn read_table_section(
-    section: &Element,
-    cell_name: &str,
-) -> Result<Vec<Vec<ImportedTableCell>>, HtmlImportError> {
+fn read_table_section(section: &Element) -> Result<Vec<Vec<ImportedTableCell>>, HtmlImportError> {
     let mut rows = Vec::new();
     for child in &section.children {
         let Node::Element(row) = child else {
@@ -936,29 +944,72 @@ fn read_table_section(
                 "table section requires tr",
             ));
         }
-        let mut cells = Vec::new();
-        for cell in &row.children {
-            let Node::Element(cell) = cell else {
-                if matches!(cell, Node::Text(text) if text.trim().is_empty()) {
-                    continue;
-                }
-                return Err(HtmlImportError::InvalidStructure(
-                    "table row has invalid children",
-                ));
-            };
-            if cell.name != cell_name {
-                return Err(HtmlImportError::InvalidStructure(
-                    "table cell kind mismatch",
-                ));
-            }
-            cells.push(ImportedTableCell {
-                markdown: render_inline_nodes(&cell.children)?,
-                alignment: table_cell_alignment(cell)?,
-            });
-        }
-        rows.push(cells);
+        rows.push(read_table_row(row)?);
     }
     Ok(rows)
+}
+
+fn read_table_row(row: &Element) -> Result<Vec<ImportedTableCell>, HtmlImportError> {
+    let mut cells = Vec::new();
+    for cell in &row.children {
+        let Node::Element(cell) = cell else {
+            if matches!(cell, Node::Text(text) if text.trim().is_empty()) {
+                continue;
+            }
+            return Err(HtmlImportError::InvalidStructure(
+                "table row has invalid children",
+            ));
+        };
+        if !matches!(cell.name.as_str(), "th" | "td") {
+            return Err(HtmlImportError::InvalidStructure(
+                "table cell kind mismatch",
+            ));
+        }
+        cells.push(ImportedTableCell {
+            markdown: render_table_cell(&cell.children)?,
+            alignment: table_cell_alignment(cell)?,
+        });
+    }
+    if cells.is_empty() {
+        return Err(HtmlImportError::InvalidStructure("table row has no cells"));
+    }
+    Ok(cells)
+}
+
+/// HTML exported from a copied cell has a paragraph wrapper. Keep paragraph
+/// boundaries within the cell instead of emitting physical Markdown row breaks.
+fn render_table_cell(nodes: &[Node]) -> Result<String, HtmlImportError> {
+    let mut pieces = Vec::new();
+    let mut inline = Vec::new();
+    for node in nodes {
+        if let Node::Element(element) = node
+            && element.name == "p"
+        {
+            if !inline.is_empty() {
+                let text = render_inline_content(&inline, true)?;
+                if !text.trim().is_empty() {
+                    pieces.push(text);
+                }
+                inline.clear();
+            }
+            pieces.push(render_inline_content(&element.children, true)?);
+        } else {
+            inline.push(node.clone());
+        }
+    }
+    if !inline.is_empty() {
+        let text = render_inline_content(&inline, true)?;
+        if pieces.is_empty() || !text.trim().is_empty() {
+            pieces.push(text);
+        }
+    }
+    let result = pieces.join("<br><br>");
+    if result.contains(['\r', '\n']) {
+        return Err(HtmlImportError::InvalidStructure(
+            "physical newline in table cell",
+        ));
+    }
+    Ok(result)
 }
 
 fn render_table_row(row: &[ImportedTableCell]) -> String {
@@ -1038,7 +1089,7 @@ fn escape_markdown_text(value: &str, output: &mut String) {
     for character in value.chars() {
         if matches!(
             character,
-            '\\' | '*' | '_' | '`' | '[' | ']' | '#' | '!' | '|' | '~'
+            '\\' | '*' | '_' | '`' | '[' | ']' | '#' | '!' | '|' | '~' | '<' | '>' | '&'
         ) {
             output.push('\\');
         }
@@ -1194,7 +1245,7 @@ mod tests {
 
         assert_eq!(
             import_html_fragment(html).expect("text should import"),
-            "2 < 3 & \\*x\\*"
+            "2 \\< 3 \\& \\*x\\*"
         );
     }
 
@@ -1256,6 +1307,67 @@ mod tests {
     }
 
     #[test]
+    fn imports_plain_and_sectioned_clipboard_grids_in_source_order() {
+        let row = "<tr><td align=\"right\">A</td><th>B</th></tr>";
+        let body = "<tr><td>x|y</td><td><strong>羽</strong></td></tr>";
+        for html in [
+            format!("<table>{row}{body}</table>"),
+            format!("<table><tbody>{row}{body}</tbody></table>"),
+            format!("<table><thead>{row}</thead><tbody>{body}</tbody></table>"),
+            format!("<table>{row}<tbody>{body}</tbody></table>"),
+        ] {
+            assert_eq!(
+                import_html_fragment(&html).expect("plain grid"),
+                "| A | B |\n| ---: | --- |\n| x\\|y | **羽** |"
+            );
+        }
+        assert_eq!(
+            import_html_fragment("<table><tr><td></td></tr></table>").expect("empty cell"),
+            "|  |\n| --- |"
+        );
+    }
+
+    #[test]
+    fn plain_grids_reject_ragged_empty_and_invalid_rows() {
+        for html in [
+            "<table><tr><td>A</td><td>B</td></tr><tr><td>x</td></tr></table>",
+            "<table><tr></tr></table>",
+            "<table><tr>text<td>x</td></tr></table>",
+            "<table><tbody><td>x</td></tbody></table>",
+            "<table><tr><td colspan=\"2\">x</td></tr></table>",
+        ] {
+            assert!(import_html_fragment(html).is_err(), "{html}");
+        }
+    }
+
+    #[test]
+    fn table_breaks_and_paragraphs_remain_inside_cells() {
+        let html = "<table><tr><td><p><strong>first<br>second</strong></p><p>third</p></td><td><br>x<br><br></td></tr></table>";
+        let markdown = import_html_fragment(html).expect("multiline cells");
+        assert_eq!(
+            markdown,
+            "| **first<br>second**<br><br>third | <br>x<br><br> |\n| --- | --- |"
+        );
+        let parsed = yu_markdown::parse_table(&markdown).expect("valid table");
+        assert_eq!(parsed.column_count(), 2);
+        assert_eq!(parsed.visible_row_count(), 1);
+        assert_eq!(
+            import_html_fragment("<p>a<br>b</p>").expect("ordinary break"),
+            "a  \nb"
+        );
+        let literal = import_html_fragment("<table><tr><td>&lt;br&gt;<br>next</td></tr></table>")
+            .expect("literal");
+        assert_eq!(literal, "| \\<br\\><br>next |\n| --- |");
+        let exported = crate::export_html_fragment(&literal);
+        assert!(exported.contains("&lt;br&gt;<br>next"));
+        let own_cell = crate::export_html_fragment("first<br>second");
+        let imported =
+            import_html_fragment(&format!("<table><tr><td>{own_cell}</td></tr></table>"))
+                .expect("own cell HTML");
+        assert_eq!(imported, "| first<br>second |\n| --- |");
+    }
+
+    #[test]
     fn rejects_malformed_structure_and_entities() {
         assert!(matches!(
             import_html_fragment("<p>x</div>"),
@@ -1267,8 +1379,8 @@ mod tests {
             Err(HtmlImportError::InvalidEntity)
         ));
         assert!(matches!(
-            import_html_fragment("<table><tbody><tr><td>x</td></tr></tbody></table>"),
-            Err(HtmlImportError::InvalidStructure("table is missing thead"))
+            import_html_fragment("<table><tbody></tbody></table>"),
+            Err(HtmlImportError::InvalidStructure("table has no rows"))
         ));
     }
 

@@ -47,6 +47,7 @@ fn decorate_with(
             &snapshot,
             &tree,
             document.reference_definitions(),
+            document.presentation(),
             block,
             active,
         )
@@ -228,29 +229,17 @@ fn setext_headings_hide_the_underline_and_the_newline_before_it() {
     assert_eq!(hidden(&multiline), vec![(7, 11)]);
 }
 
-/// 一个块横跨两个树节点时，标题装饰一条都不产，块后半段的行内语法照常产。
-///
-/// `一\n===\n*斜体*` 在行扫描器眼里是**一个**块（它不认得 Setext 下划线），
-/// 在树里是 `SetextHeading1` 加一个 `Paragraph`。两件事各错一次：
-///
-/// - 标题装饰按块里**找得到**标题节点来判定的话，这一块会整块放大——包括
-///   不属于标题的那一段。定义域因此取 `BlockKind`（`crate::classify` 给的是
-///   `Paragraph`）。
-/// - `BlockContext::syntax` 退不到能装下整块的节点的话，块后半段的
-///   `Emphasis` 就不在 `nodes()` 里，`*斜体*` 一条装饰都产不出来——不报错，
-///   只是不斜。
+/// A Setext heading and the following paragraph keep distinct decorations.
 #[test]
-fn a_block_spanning_two_tree_nodes_has_no_heading_but_keeps_its_inline_syntax() {
-    let decorations = decorate("一\n===\n*斜体*", None);
-    assert!(
-        decorations.line_ornaments().is_empty(),
-        "横跨两个节点的块不是一个标题，一条行级装饰都不该有"
-    );
+fn adjacent_heading_and_paragraph_keep_their_own_decorations() {
+    let blocks = decorate_every_block("一\n===\n*斜体*");
+    assert_eq!(blocks.len(), 2);
     assert_eq!(
-        hidden(&decorations),
-        vec![(8, 9), (15, 16)],
-        "藏的是那两个 `*`，下划线原样留着"
+        blocks[0].1.line_ornaments()[0].1,
+        &BlockOrnament::Heading { level: 1 }
     );
+    assert!(blocks[1].1.line_ornaments().is_empty());
+    assert_eq!(hidden(&blocks[1].1), vec![(8, 9), (15, 16)]);
 }
 
 /// 焦点块把下划线露出来，与 ATX 的 `#` 同一条规则：光标停在一个看不见的
@@ -273,14 +262,20 @@ fn quote_depth_counts_nesting_not_marks() {
     let one = decorate("> a\n> b", None);
     assert_eq!(
         one.line_ornaments()[0].1,
-        &BlockOrnament::QuoteBar { depth: 1 }
+        &BlockOrnament::QuoteBar {
+            depth: 1,
+            outside_list: 1
+        }
     );
     assert_eq!(hidden(&one), vec![(0, 2), (4, 6)], "两行的前缀都要隐藏");
 
     let two = decorate("> > 两层", None);
     assert_eq!(
         two.line_ornaments()[0].1,
-        &BlockOrnament::QuoteBar { depth: 2 }
+        &BlockOrnament::QuoteBar {
+            depth: 2,
+            outside_list: 2
+        }
     );
 }
 
@@ -301,12 +296,39 @@ fn ordered_lists_keep_their_number_bullets_get_a_dot() {
     );
 
     let indented = decorate("  - 缩进项", None);
-    assert_eq!(indent_of(&indented), Some(2));
+    assert_eq!(indent_of(&indented), Some(0));
     assert_eq!(
         hidden(&indented),
         vec![(0, 4)],
         "行首缩进也是语法：缩进量单独报给上一层，留在视觉文本里就缩进两次"
     );
+}
+
+#[test]
+fn repeated_ordered_markers_render_sequential_numbers_without_changing_source() {
+    let source = "3. first\n   1. child\n   1. next child\n1. second\n1. third\n";
+    let snapshot = TextBuffer::new(source).snapshot();
+    let document = parse(&snapshot);
+    let tree = parse_syntax(&snapshot).expect("syntax").into_tree();
+    let extensions = ExtensionSet::markdown();
+    let mut numbers = Vec::new();
+    for block in document.blocks().iter() {
+        let decorations = extensions
+            .decorate(
+                &snapshot,
+                &tree,
+                document.reference_definitions(),
+                document.presentation(),
+                block,
+                None,
+            )
+            .expect("decorations");
+        if let Some(marker) = marker_of(&decorations) {
+            numbers.push(marker.text().to_owned());
+        }
+    }
+    assert_eq!(numbers, ["3.", "1.", "2.", "4.", "5."]);
+    assert_eq!(snapshot.as_str(), source);
 }
 
 /// 缩进与标记是两件事，分别由两条装饰说。
@@ -318,10 +340,10 @@ fn ordered_lists_keep_their_number_bullets_get_a_dot() {
 fn indentation_travels_on_its_own_ornament_so_task_items_get_it_too() {
     for (source, columns) in [
         ("- 项目", 0),
-        ("  - 缩进项", 2),
+        ("  - 缩进项", 0),
         ("- [ ] 待办", 0),
         // 三个空格还是列表项；第四个空格就成缩进代码块了。
-        ("   - [x] 深缩进任务", 3),
+        ("   - [x] 深缩进任务", 0),
     ] {
         let decorations = decorate(source, None);
         assert_eq!(indent_of(&decorations), Some(columns), "source {source:?}");
@@ -363,12 +385,12 @@ fn hard_breaks_hide_the_marker_not_the_newline() {
 /// `Paragraph` 的归它，是 `Task` 的归 `task.rs`。两个集合不相交，谁也不需要
 /// 知道对方存在（不变量 D6）。让 list 去问「有没有 task」才是相互感知。
 #[test]
-fn a_task_item_keeps_its_dash_a_plain_item_gets_a_bullet() {
+fn a_task_item_replaces_its_prefix_with_one_checkbox() {
     let task = decorate("- [ ] 待办", None);
     assert_eq!(
         hidden_merged(&task),
-        vec![(2, 5)],
-        "只有 `[ ]` 消失，`- ` 原样留着"
+        vec![(0, 6)],
+        "列表前缀与分隔空格由复选框占位统一替代"
     );
     assert!(
         marker_of(&task).is_none(),
@@ -398,9 +420,18 @@ fn a_task_item_keeps_its_dash_a_plain_item_gets_a_bullet() {
 /// 并集永远是 (2,5)，只有逐条才看得出重叠回来了没有。
 #[test]
 fn a_checked_box_is_hidden_by_exactly_one_decoration() {
-    assert_eq!(hidden(&decorate("- [x] 完成", None)), vec![(2, 5)]);
-    assert_eq!(hidden(&decorate("- [ ] 待办", None)), vec![(2, 5)]);
-    assert_eq!(hidden(&decorate("1. [X] 大写", None)), vec![(3, 6)]);
+    assert_eq!(
+        hidden(&decorate("- [x] 完成", None)),
+        vec![(0, 2), (2, 5), (5, 6)]
+    );
+    assert_eq!(
+        hidden(&decorate("- [ ] 待办", None)),
+        vec![(0, 2), (2, 5), (5, 6)]
+    );
+    assert_eq!(
+        hidden(&decorate("1. [X] 大写", None)),
+        vec![(0, 3), (3, 6), (6, 7)]
+    );
 }
 
 /// 复选框永远不露出来，焦点块也不例外。
@@ -410,7 +441,7 @@ fn a_checked_box_is_hidden_by_exactly_one_decoration() {
 fn a_focused_task_still_hides_its_checkbox() {
     assert_eq!(
         hidden_merged(&decorate("- [ ] 待办", Some(range(8, 8)))),
-        vec![(2, 5)]
+        vec![(0, 6)]
     );
 }
 
@@ -478,6 +509,7 @@ fn decorations_stay_inside_their_block() {
                 &snapshot,
                 &tree,
                 document.reference_definitions(),
+                document.presentation(),
                 block,
                 None,
             )
@@ -684,6 +716,7 @@ fn record(extension: impl Extension + 'static, source: &str, block_index: usize)
             &snapshot,
             &tree,
             document.reference_definitions(),
+            document.presentation(),
             block,
             None,
         )
@@ -779,6 +812,7 @@ fn the_registry_drops_decorations_that_leave_their_block() {
             &snapshot,
             &tree,
             document.reference_definitions(),
+            document.presentation(),
             block,
             None,
         )
@@ -1300,22 +1334,12 @@ fn an_indented_code_block_does_not_hide_inline_markers() {
     assert!(hidden(&decorate("    a *b* c\n", None)).is_empty());
 }
 
-/// 跨了空行的缩进代码块**不排等宽**，这是现状，也是那条规则在起作用。
-///
-/// `    a\n\n    b\n` 在行扫描器眼里是三块、在树里是一个 `CodeBlock`，三块谁
-/// 也不完整，于是 `classify` 全部退回 `Paragraph`（「叶子节点横跨块边界即
-/// 片段」）。认领半个代码块会画出三段各排一半的代码。**要改的是块的边界，
-/// 不是这个 extension**——那件事登记在闸门后面。
+/// An indented code leaf owns its internal blank lines.
 #[test]
-fn an_indented_code_block_that_spans_a_blank_line_stays_plain() {
+fn indented_code_preserves_internal_blank_lines_in_one_code_block() {
     let blocks = decorate_every_block("    a\n\n    b\n");
-    assert_eq!(blocks.len(), 3, "行扫描器把它切成三块");
-    for (range, decorations) in &blocks {
-        assert!(
-            code_marks(decorations).is_empty(),
-            "{range:?}：三块都退回了 Paragraph，一块都不该排等宽"
-        );
-    }
+    assert_eq!(blocks.len(), 1);
+    assert!(!code_marks(&blocks[0].1).is_empty());
 }
 
 // ---------------------------------------------------------------- 语料扫一遍
@@ -1415,6 +1439,7 @@ fn decorate_every_block(source: &str) -> Vec<(TextRange, BlockDecorations)> {
                         &snapshot,
                         &tree,
                         document.reference_definitions(),
+                        document.presentation(),
                         block,
                         None,
                     )
@@ -1506,7 +1531,8 @@ fn every_id_resolves_across_the_corpus() {
                         decorations.widget(widget).is_some(),
                         "{source:?} 的 {widget:?} 查不到"
                     ),
-                    yu_decoration::Decoration::Replace => {}
+                    yu_decoration::Decoration::Replace
+                    | yu_decoration::Decoration::Substitute { .. } => {}
                 }
             }
         }

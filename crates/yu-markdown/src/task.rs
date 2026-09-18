@@ -44,38 +44,37 @@ pub(crate) fn parse_task_marker(
 ) -> Option<TaskMarker> {
     let mut cursor = TaskByteCursor::new(source, range)?;
     let mut current = cursor.next()?;
-    let mut leading_spaces = 0_usize;
-    while current.1 == b' ' {
-        leading_spaces = leading_spaces.saturating_add(1);
-        if leading_spaces > 3 {
-            return None;
-        }
-        current = cursor.next()?;
-    }
-
-    if ordered {
-        if !current.1.is_ascii_digit() {
-            return None;
-        }
-        while current.1.is_ascii_digit() {
+    // The caller validated the task leaf. Its first source line may include
+    // several alternating list and quote ancestors. Walk each prefix without
+    // copying the source; the final list marker must match the leaf's kind.
+    loop {
+        while matches!(current.1, b' ' | b'\t' | b'>') {
             current = cursor.next()?;
         }
-        if !matches!(current.1, b'.' | b')') {
+        let current_ordered = current.1.is_ascii_digit();
+        if current_ordered {
+            while current.1.is_ascii_digit() {
+                current = cursor.next()?;
+            }
+            if !matches!(current.1, b'.' | b')') {
+                return None;
+            }
+        } else if !matches!(current.1, b'-' | b'+' | b'*') {
             return None;
         }
-    } else if !matches!(current.1, b'-' | b'+' | b'*') {
-        return None;
-    }
-
-    current = cursor.next()?;
-    if !matches!(current.1, b' ' | b'\t') {
-        return None;
-    }
-    while matches!(current.1, b' ' | b'\t') {
         current = cursor.next()?;
-    }
-    if current.1 != b'[' {
-        return None;
+        if !matches!(current.1, b' ' | b'\t') {
+            return None;
+        }
+        while matches!(current.1, b' ' | b'\t') {
+            current = cursor.next()?;
+        }
+        if current.1 == b'[' {
+            if current_ordered != ordered {
+                return None;
+            }
+            break;
+        }
     }
     let marker_start = current.0;
     let state = match cursor.next()?.1 {

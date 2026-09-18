@@ -138,12 +138,22 @@ impl Error for ImageKeyError {}
 /// A source-backed request handed to an asynchronous decoder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageRequest {
+    max_pixel_dimension: u32,
     revision: Revision,
     source: TextRange,
     key: ImageKey,
 }
 
 impl ImageRequest {
+    #[must_use]
+    pub fn with_max_pixel_dimension(mut self, dimension: u32) -> Self {
+        self.max_pixel_dimension = dimension.clamp(1, 4096);
+        self
+    }
+    #[must_use]
+    pub const fn max_pixel_dimension(&self) -> u32 {
+        self.max_pixel_dimension
+    }
     pub fn new(
         revision: Revision,
         source: TextRange,
@@ -153,6 +163,7 @@ impl ImageRequest {
             revision,
             source,
             key: ImageKey::new(destination)?,
+            max_pixel_dimension: 4096,
         })
     }
 
@@ -330,6 +341,7 @@ impl ImageRequestPlan {
 /// Owned decoded RGBA8 image data ready for a platform texture uploader.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedImage {
+    intrinsic: ImageDimensions,
     width: u32,
     height: u32,
     pixels: Arc<[u8]>,
@@ -371,12 +383,12 @@ impl ImageDimensions {
 impl DecodedImage {
     #[must_use]
     pub const fn dimensions(&self) -> ImageDimensions {
-        // DecodedImage validates dimensions during construction, so this is
-        // infallible and keeps the metadata handoff allocation-free.
-        ImageDimensions {
-            width: self.width,
-            height: self.height,
-        }
+        self.intrinsic
+    }
+    #[must_use]
+    pub fn with_intrinsic(mut self, dimensions: ImageDimensions) -> Self {
+        self.intrinsic = dimensions;
+        self
     }
 }
 
@@ -408,6 +420,7 @@ impl DecodedImage {
         Ok(Self {
             width,
             height,
+            intrinsic: ImageDimensions { width, height },
             pixels,
         })
     }
@@ -650,6 +663,7 @@ pub enum ImageCacheError {
     Decode(ImageDecodeError),
     GenerationOverflow,
     InvalidCapacity,
+    DecodedImageTooLarge,
 }
 
 impl fmt::Display for ImageCacheError {
@@ -664,6 +678,9 @@ impl fmt::Display for ImageCacheError {
             Self::Decode(error) => error.fmt(formatter),
             Self::GenerationOverflow => formatter.write_str("image generation overflowed"),
             Self::InvalidCapacity => formatter.write_str("image cache capacity must be positive"),
+            Self::DecodedImageTooLarge => {
+                formatter.write_str("decoded image exceeds cache byte budget")
+            }
         }
     }
 }
@@ -672,7 +689,10 @@ impl Error for ImageCacheError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Decode(error) => Some(error),
-            Self::StaleRevision { .. } | Self::GenerationOverflow | Self::InvalidCapacity => None,
+            Self::StaleRevision { .. }
+            | Self::GenerationOverflow
+            | Self::InvalidCapacity
+            | Self::DecodedImageTooLarge => None,
         }
     }
 }
@@ -713,6 +733,7 @@ pub struct ImageCache {
     next_generation: u64,
     next_access: u64,
     capacity: usize,
+    byte_capacity: usize,
     evictions: u64,
     metadata_capacity: usize,
     metadata_evictions: u64,
@@ -728,6 +749,7 @@ impl Default for ImageCache {
 
 impl ImageCache {
     pub const DEFAULT_CAPACITY: usize = 64;
+    pub const DEFAULT_BYTE_CAPACITY: usize = 128 * 1024 * 1024;
     pub const DEFAULT_METADATA_CAPACITY: usize = 256;
 
     #[must_use]
@@ -746,12 +768,35 @@ impl ImageCache {
             next_generation: 0,
             next_access: 0,
             capacity: capacity.max(1),
+            byte_capacity: Self::DEFAULT_BYTE_CAPACITY,
             evictions: 0,
             metadata_capacity: capacity.max(Self::DEFAULT_METADATA_CAPACITY),
             metadata_evictions: 0,
             retry_policy: ImageRetryPolicy::default(),
             retry_tick: 0,
         }
+    }
+
+    /// Decoded pixel payloads, excluding references held by an active frame.
+    #[must_use]
+    pub fn decoded_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|entry| entry.image.pixels().len())
+            .sum()
+    }
+
+    pub fn set_byte_capacity(&mut self, bytes: usize) -> Result<usize, ImageCacheError> {
+        if bytes == 0 {
+            return Err(ImageCacheError::InvalidCapacity);
+        }
+        self.byte_capacity = bytes;
+        Ok(self.trim_to_capacity())
+    }
+
+    /// Keep lightweight intrinsic metadata while releasing decoded pixels.
+    pub fn clear_decoded(&mut self) {
+        self.entries.clear();
     }
 
     #[must_use]
@@ -817,6 +862,18 @@ impl ImageCache {
             }
         }
         let access_tick = self.next_access_tick();
+        // A larger viewport may need a higher-resolution decode. Preserve
+        // intrinsic metadata so replacing pixels does not move document blocks.
+        if self.entries.get(request.key()).is_some_and(|entry| {
+            let decoded = entry.image.width().max(entry.image.height());
+            let natural = entry.image.dimensions();
+            decoded
+                < request
+                    .max_pixel_dimension()
+                    .min(natural.width().max(natural.height()))
+        }) {
+            self.entries.remove(request.key());
+        }
         if let Some(entry) = self.entries.get_mut(request.key()) {
             entry.last_used = access_tick;
             return ImageRequestResult::Ready(ImagePublication {
@@ -858,6 +915,10 @@ impl ImageCache {
                 expected: current_revision,
                 actual: request.revision,
             });
+        }
+        if image.pixels().len() > self.byte_capacity {
+            let _ = self.record_failure(request, current_revision, ImageFailureKind::Decode);
+            return Err(ImageCacheError::DecodedImageTooLarge);
         }
         self.next_generation = self
             .next_generation
@@ -993,7 +1054,7 @@ impl ImageCache {
 
     fn trim_to_capacity(&mut self) -> usize {
         let mut evicted = 0;
-        while self.entries.len() > self.capacity {
+        while self.entries.len() > self.capacity || self.decoded_bytes() > self.byte_capacity {
             let Some(key) = self
                 .entries
                 .iter()
@@ -1031,6 +1092,72 @@ impl ImageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_byte_budget_evicts_lru_and_retains_intrinsic_metadata() {
+        let mut cache = ImageCache::new();
+        cache.set_byte_capacity(8).expect("valid test setup");
+        let source = TextRange::empty(yu_core::ByteOffset::ZERO);
+        let a = request(0, source, "a.png");
+        let b = request(0, source, "b.png");
+        cache
+            .publish_decoded(a.clone(), Revision::INITIAL, decoded(1))
+            .expect("valid test setup");
+        cache
+            .publish_decoded(b.clone(), Revision::INITIAL, decoded(2))
+            .expect("valid test setup");
+        assert_eq!(cache.decoded_bytes(), 8);
+        assert_eq!(cache.eviction_count(), 1);
+        assert!(cache.intrinsic_publication(&a).is_some());
+        assert!(matches!(
+            cache.request(b.clone()),
+            ImageRequestResult::Ready(_)
+        ));
+        cache.clear_decoded();
+        assert_eq!(cache.decoded_bytes(), 0);
+        assert!(cache.intrinsic_publication(&b).is_some());
+    }
+
+    #[test]
+    fn thumbnail_metadata_and_resize_requests_preserve_natural_dimensions() {
+        let mut cache = ImageCache::new();
+        let source = TextRange::empty(yu_core::ByteOffset::ZERO);
+        let small = request(0, source, "photo.png").with_max_pixel_dimension(2);
+        let thumbnail =
+            decoded(3).with_intrinsic(ImageDimensions::new(4000, 2000).expect("valid test setup"));
+        let publication = cache
+            .publish_decoded(small.clone(), Revision::INITIAL, thumbnail)
+            .expect("valid test setup");
+        assert_eq!(
+            publication.dimensions(),
+            ImageDimensions::new(4000, 2000).expect("valid test setup")
+        );
+        assert_eq!(publication.image().pixels().len(), 8);
+        assert!(matches!(
+            cache.request(small.clone()),
+            ImageRequestResult::Ready(_)
+        ));
+        assert!(matches!(
+            cache.request(small.with_max_pixel_dimension(4)),
+            ImageRequestResult::Pending
+        ));
+    }
+
+    #[test]
+    fn oversized_decoded_image_is_a_failure_not_an_endless_cache_miss() {
+        let mut cache = ImageCache::new();
+        cache.set_byte_capacity(4).expect("valid test setup");
+        let image = request(0, TextRange::empty(yu_core::ByteOffset::ZERO), "large.png");
+        assert_eq!(
+            cache.publish_decoded(image.clone(), Revision::INITIAL, decoded(1)),
+            Err(ImageCacheError::DecodedImageTooLarge)
+        );
+        assert_eq!(cache.decoded_bytes(), 0);
+        assert!(matches!(
+            cache.request(image),
+            ImageRequestResult::Failed(_)
+        ));
+    }
 
     #[test]
     fn relative_locations_resolve_from_document_parent() {

@@ -357,8 +357,8 @@ fn parse_entity(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u32>
     if next != b'&' {
         return None;
     }
-    // 上游取 30 个 code unit；实体名与数字实体都是 ASCII，按字节等价。
-    let rest = cx.slice(start + 1, start + 31);
+    // Longest HTML name has 31 ASCII characters, followed by a semicolon.
+    let rest = cx.slice(start + 1, start + 33);
     let length = match_entity(rest)?;
     let length = u32::try_from(length).ok()?;
     Some(cx.append_element(Element::leaf(NodeKind::Entity, start, start + 1 + length)))

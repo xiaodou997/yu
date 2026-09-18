@@ -67,6 +67,7 @@ fn decorate(
             snapshot,
             &tree,
             markdown.reference_definitions(),
+            markdown.presentation(),
             block,
             None,
         )
@@ -679,6 +680,7 @@ fn a_focused_image_lays_out_its_source_instead_of_a_box() {
             &snapshot,
             &tree,
             markdown.reference_definitions(),
+            markdown.presentation(),
             block,
             Some(active),
         )
@@ -862,7 +864,16 @@ fn a_checkbox_reserves_its_own_box_instead_of_sitting_on_the_text() {
     assert_eq!(bounds.width(), bounds.height(), "复选框是正方形");
     // 边长钉死在这里，与图片的 placeholder 宽度同一个待遇：常数没有断言
     // 就等于没有约定，下一个人改它不会有任何东西变红。
-    assert_eq!(bounds.width(), 10.0 * 0.68, "复选框是 0.68 个行高");
+    assert_eq!(
+        bounds.width(),
+        12.0 * (10.0 / 16.0),
+        "Github checkbox scales from 12pt at 16pt text"
+    );
+    assert_eq!(
+        boxes[0].placed().bounds().width(),
+        13.0,
+        "inline advance includes the 1.3em task gutter"
+    );
 
     let right = bounds.x() + bounds.width();
     for cluster in view.clusters() {
@@ -912,7 +923,9 @@ fn a_checkbox_never_waits_for_a_resource() {
 #[test]
 fn clicking_a_checkbox_lands_on_one_of_its_edges() {
     let view = view("- [x] 待办", 200.0).expect("块");
-    let bounds = view.checkboxes()[0].bounds();
+    // Caret edges span the inline object, including its trailing text gap.
+    // Checkbox activation separately uses the painted square in bounds().
+    let bounds = view.checkboxes()[0].placed().bounds();
     let y = bounds.y() + bounds.height() * 0.5;
 
     let left = view
@@ -929,7 +942,7 @@ fn clicking_a_checkbox_lands_on_one_of_its_edges() {
         .expect("命中");
     assert_eq!(left.source(), view.checkboxes()[0].source().start());
     assert_eq!(right.source(), view.checkboxes()[0].source().end());
-    // 两沿的答案来自 `BlockLayout::hit` 的 `widget_affinity`（第七刀），
+    // 两沿的答案来自 `BlockLayout::hit` 的 `boundary_affinity`（第七刀），
     // 不来自图片那条命中快路——复选框**不**在那条路上。串进去不只是多余：
     // `image()` 会把一次复选框点击报成「点在一张图上」，而 FFI 照着它给
     // 平台一个图片区间。
@@ -1104,6 +1117,809 @@ fn blocks_without_highlight_carry_no_role() {
                 glyph.role(),
                 yu_core::TextRole::Plain,
                 "语料 {source:?} 不该有角色"
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_tables_use_container_width_and_source_backed_hit_geometry() {
+    for source in [
+        "> | long heading repeated | second heading |\n> | --- | --- |\n> | alpha | beta |\n",
+        "- item\n\n  | long heading repeated | second heading |\n  | --- | --- |\n  | alpha | beta |\n",
+    ] {
+        let snapshot = TextBuffer::new(source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let mut found = false;
+        for index in 0..markdown.blocks().len() {
+            let (decorations, visual, kind) =
+                decorate(&snapshot, index).expect("container regression fixture");
+            let config = LayoutConfig::new(100.0, 16.0).with_default_advance(8.0);
+            let block = BlockView::build(
+                kind,
+                &visual,
+                &decorations,
+                config,
+                &MonospaceMetrics::new(8.0),
+            )
+            .expect("container regression fixture");
+            if let Some(table) = block.table() {
+                let expected = if source.starts_with('>') { 19.0 } else { 30.0 };
+                assert_eq!(table.bounds().x(), expected);
+                assert!(table.bounds().right() <= 100.01);
+                for cell in table.cells() {
+                    assert!(cell.bounds().x() >= expected);
+                    assert!(cell.content_x() >= cell.bounds().x());
+                    let caret = block
+                        .caret_for_source(cell.source().start(), Bias::After)
+                        .expect("container regression fixture");
+                    let hit = block
+                        .hit_test(caret.point())
+                        .expect("container regression fixture");
+                    assert_eq!(hit.source(), cell.source().start());
+                }
+                let cell = table.cells().last().expect("container regression fixture");
+                let active = ExtensionSet::markdown()
+                    .decorate(
+                        &snapshot,
+                        &parse_syntax(&snapshot)
+                            .expect("container regression fixture")
+                            .into_tree(),
+                        markdown.reference_definitions(),
+                        markdown.presentation(),
+                        markdown
+                            .blocks()
+                            .get(index)
+                            .expect("container regression fixture"),
+                        Some(cell.source()),
+                    )
+                    .expect("container regression fixture");
+                let active_visual =
+                    VisualText::new(&snapshot, active.range(), active.set().clone())
+                        .expect("container regression fixture");
+                let focused = BlockView::build(
+                    kind,
+                    &active_visual,
+                    &active,
+                    config,
+                    &MonospaceMetrics::new(8.0),
+                )
+                .expect("container regression fixture");
+                assert_eq!(
+                    focused
+                        .table()
+                        .expect("container regression fixture")
+                        .bounds(),
+                    table.bounds(),
+                    "focus must not move the table"
+                );
+                assert_eq!(snapshot.as_str(), source);
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "missing table: {source}");
+    }
+}
+
+#[test]
+fn nested_images_fit_the_content_column() {
+    let source = "> ![wide](wide.png)\n";
+    let snapshot = TextBuffer::new(source).snapshot();
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("container regression fixture");
+    let image = decorations
+        .widgets()
+        .iter()
+        .find_map(|widget| match widget {
+            yu_markdown::BlockWidget::Image(image) => Some(image.source()),
+            _ => None,
+        })
+        .expect("container regression fixture");
+    let config = LayoutConfig::new(100.0, 16.0);
+    let block = BlockView::build_with_images(
+        kind,
+        &visual,
+        &decorations,
+        config,
+        &MonospaceMetrics::new(8.0),
+        &[(
+            image,
+            yu_layout::ImageIntrinsicSize::new(1000, 500).expect("container regression fixture"),
+        )],
+    )
+    .expect("container regression fixture");
+    assert!(!block.images().is_empty());
+    for image in block.images() {
+        assert!(image.bounds().x() >= 19.0);
+        assert!(image.bounds().right() <= 100.01);
+    }
+}
+
+#[test]
+fn table_padding_and_resize_reflow_share_caret_and_hit_geometry() {
+    let source = "| alpha beta gamma delta | second column |\n| --- | --- |\n| one two three four five | value |\n";
+    let snapshot = TextBuffer::new(source).snapshot();
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("table fixture");
+    for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+        let config = LayoutConfig::new(500.0, 16.0)
+            .with_default_advance(8.0)
+            .with_theme(theme);
+        let mut block = BlockView::build(
+            kind,
+            &visual,
+            &decorations,
+            config,
+            &MonospaceMetrics::new(8.0),
+        )
+        .expect("table layout");
+        let before = block.height();
+        let table = block.table().expect("table");
+        let first = table.cells()[0];
+        assert_eq!(
+            first.content_y() - first.bounds().y(),
+            theme.spec().table_padding_y + yu_core::ThemeSpec::TABLE_BORDER_WIDTH
+        );
+        assert!(
+            first.bounds().height()
+                >= (16.0 * theme.spec().body_line_ratio).floor()
+                    + 2.0 * theme.spec().table_padding_y
+        );
+        assert_eq!(block.clusters()[0].style(), yu_core::TextStyle::Strong);
+        block
+            .apply_table_column_resize(0, -180.0)
+            .expect("resize and reflow");
+        assert!(
+            block.height() > before,
+            "narrowing must increase wrapped row height"
+        );
+        for cell in block.table().expect("resized table").cells() {
+            let caret = block
+                .caret_for_source(cell.source().start(), Bias::After)
+                .expect("caret");
+            assert!(caret.point().y() >= cell.content_y());
+            assert_eq!(
+                block.hit_test(caret.point()).expect("hit").source(),
+                cell.source().start()
+            );
+            let padding_hit = block
+                .hit_test(LayoutPoint::new(cell.content_x(), cell.bounds().y() + 1.0))
+                .expect("padding hit");
+            assert_eq!(padding_hit.source(), cell.source().start());
+        }
+        assert_eq!(snapshot.as_str(), source);
+    }
+}
+
+#[test]
+fn code_box_edges_are_asymmetric_theme_scaled_and_counted_once() {
+    let source = "```\nabcdefghijklmnopqrstuvwxyz\n```\n";
+    let snapshot = TextBuffer::new(source).snapshot();
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("code fixture");
+    for (theme, edges) in [
+        (yu_core::ThemeId::Github, [13.0, 9.0, 9.0, 7.0]),
+        (yu_core::ThemeId::Night, [34.0, 14.0, 10.0, 10.0]),
+    ] {
+        for zoom in [1.0, 1.5, 2.0] {
+            let config = LayoutConfig::new(400.0, 16.0 * zoom).with_theme(theme);
+            let input = BlockLayoutInput::from_decorations(
+                kind,
+                &decorations,
+                &visual,
+                config,
+                &MonospaceMetrics::new(8.0),
+            )
+            .expect("input");
+            assert_eq!(input.content_left(), edges[0] * zoom);
+            assert_eq!(
+                input.available_width(),
+                400.0 - (edges[0] + edges[1]) * zoom
+            );
+            let block = BlockView::build(
+                kind,
+                &visual,
+                &decorations,
+                config,
+                &MonospaceMetrics::new(8.0),
+            )
+            .expect("code layout");
+            let background =
+                yu_editor::layout_tokens::code_block_background_rect(400.0, block.height(), config)
+                    .expect("background");
+            let top = yu_editor::layout_tokens::content_origin_y(kind, config);
+            assert_eq!(top, edges[2] * zoom);
+            assert!(
+                (background.height() - block.height() - top - edges[3] * zoom).abs() < 0.0001,
+                "vertical edge sum must agree within f32 rounding"
+            );
+            let caret = block
+                .caret_for_source(ByteOffset::new(4), Bias::After)
+                .expect("caret");
+            assert_eq!(caret.point().x(), edges[0] * zoom);
+            // The first visible edge also maps to the hidden opening fence;
+            // use an interior boundary for the source round-trip assertion.
+            let interior = block
+                .caret_for_source(ByteOffset::new(5), Bias::After)
+                .expect("interior caret");
+            assert_eq!(
+                block.hit_test(interior.point()).expect("hit").source(),
+                ByteOffset::new(5)
+            );
+        }
+    }
+}
+
+#[test]
+fn first_heading_margin_is_shared_by_snapshot_paint_and_source_queries() {
+    for (theme, expected) in [
+        (yu_core::ThemeId::Github, 16.0),
+        (yu_core::ThemeId::Night, 80.0),
+    ] {
+        let source = "# heading\n\nbody\n";
+        let mut document = yu_editor::EditorDocument::new(source);
+        document
+            .set_viewport_config(yu_editor::ViewportConfig::new(
+                LayoutConfig::new(600.0, 16.0).with_theme(theme),
+                16.0,
+                0.0,
+            ))
+            .expect("viewport");
+        let snapshot = document
+            .prepare_layout_snapshot(yu_editor::ViewportSpan::new(0.0, 500.0), &TestShaper)
+            .expect("snapshot");
+        let first = &snapshot.blocks()[0];
+        assert_eq!(first.content_y(), expected);
+        let caret = first
+            .layout()
+            .caret_for_source(ByteOffset::new(4), Bias::After)
+            .expect("caret");
+        let point = first.document_point(caret.point());
+        assert_eq!(first.local_point(point), caret.point());
+        let queried = document
+            .layout_snapshot_for_source(ByteOffset::new(4), &TestShaper)
+            .expect("source geometry");
+        assert_eq!(queried.blocks()[0].content_y(), expected);
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+}
+
+#[test]
+fn collapsed_table_borders_participate_once_in_cell_boxes_at_every_zoom() {
+    let source = "| a | b |\n| --- | --- |\n| c | d |\n";
+    let snapshot = TextBuffer::new(source).snapshot();
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("table");
+    for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+        for zoom in [0.75, 1.0, 1.5] {
+            let config = LayoutConfig::new(500.0, 16.0 * zoom)
+                .with_default_advance(8.0 * zoom)
+                .with_theme(theme);
+            let block = BlockView::build(
+                kind,
+                &visual,
+                &decorations,
+                config,
+                &MonospaceMetrics::new(8.0 * zoom),
+            )
+            .expect("layout");
+            let table = block.table().expect("table");
+            assert_eq!(table.border_width(), zoom);
+            let cells = table.cells();
+            let padding = theme.spec().table_padding_x * zoom;
+            assert!((cells[0].content_x() - cells[0].bounds().x() - padding - zoom).abs() < 0.001);
+            assert!(
+                (cells[1].content_x() - cells[1].bounds().x() - padding - zoom * 0.5).abs() < 0.001
+            );
+            let content = 16.0 * zoom * theme.spec().body_line_ratio;
+            let expected = 2.0 * (content + 2.0 * theme.spec().table_padding_y * zoom) + 3.0 * zoom;
+            assert!(
+                (table.bounds().height() - expected).abs() < 0.001,
+                "shared horizontal borders counted once: {} vs {expected}",
+                table.bounds().height()
+            );
+            assert!((table.bounds().width() - 500.0).abs() < 0.001);
+            for cell in cells {
+                let caret = block
+                    .caret_for_source(cell.source().start(), Bias::After)
+                    .expect("caret");
+                assert_eq!(
+                    block.hit_test(caret.point()).expect("hit").source(),
+                    cell.source().start()
+                );
+            }
+        }
+    }
+    assert_eq!(snapshot.as_str(), source);
+}
+
+#[test]
+fn table_figure_margins_share_snapshot_geometry_at_every_zoom() {
+    for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+        for zoom in [0.75, 1.0, 1.5] {
+            for heading in [false, true] {
+                let source = format!(
+                    "{}| a | b |\n| --- | --- |\n| c | d |\n\nafter\n",
+                    if heading { "# Title\n\n" } else { "" }
+                );
+                let mut document = yu_editor::EditorDocument::new(source.clone());
+                let config = LayoutConfig::new(600.0, 16.0 * zoom).with_theme(theme);
+                document
+                    .set_viewport_config(yu_editor::ViewportConfig::new(config, 16.0, 0.0))
+                    .expect("config");
+                let snapshot = document
+                    .prepare_layout_snapshot(yu_editor::ViewportSpan::new(0.0, 1000.0), &TestShaper)
+                    .expect("snapshot");
+                let table = snapshot
+                    .blocks()
+                    .iter()
+                    .find(|b| b.layout().table().is_some())
+                    .expect("table");
+                let figure_margin = yu_core::ThemeSpec::TABLE_MARGIN_EM * 16.0 * zoom;
+                if heading {
+                    let title = &snapshot.blocks()[0];
+                    let bottom = title.content_y()
+                        + title.layout().height()
+                        + yu_editor::layout_tokens::content_bottom_inset(
+                            title.metadata().kind(),
+                            config,
+                        );
+                    let expected_gap =
+                        figure_margin.max(theme.spec().heading_margin_after[0] * 16.0 * zoom);
+                    assert!((table.content_y() - bottom - expected_gap).abs() < 0.001);
+                } else {
+                    assert!((table.content_y() - figure_margin).abs() < 0.001);
+                }
+                let after = snapshot
+                    .blocks()
+                    .iter()
+                    .find(|b| {
+                        b.metadata().source().start().get() as usize
+                            == source.find("after").expect("after offset")
+                    })
+                    .expect("after block");
+                let expected_gap =
+                    figure_margin.max(theme.spec().paragraph_margin_before * 16.0 * zoom);
+                assert!(
+                    (after.content_y()
+                        - table.content_y()
+                        - table.layout().height()
+                        - expected_gap)
+                        .abs()
+                        < 0.001
+                );
+                assert_eq!(document.snapshot().as_str(), source);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_table_resize_after_paste_and_history_keeps_source_and_hit_geometry() {
+    use yu_editor::{EditorCommand, EditorDocument};
+    for prefix in ["> ", "> > "] {
+        for ending in ["\n", "\r\n"] {
+            let source =
+                format!("{prefix}| H | V |{ending}{prefix}| --- | --- |{ending}{prefix}| x | y |");
+            let mut document = EditorDocument::new(source.clone());
+            let at = ByteOffset::new(source.find('x').expect("cell") as u64);
+            document
+                .execute(EditorCommand::SelectTableCells {
+                    anchor: at,
+                    focus: at,
+                })
+                .expect("select");
+            let mut versions = vec![source.clone()];
+            for value in [
+                "long words wrapping across the column\t中文🪶",
+                "\"first\nsecond\"\t\\*literal\\*",
+            ] {
+                document
+                    .execute(EditorCommand::PasteTsv(value.into()))
+                    .expect("paste");
+                versions.push(document.snapshot().as_str().to_owned());
+                for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+                    for zoom in [0.75, 1.0, 1.5] {
+                        let mut layout = document
+                            .block_layout(
+                                0,
+                                LayoutConfig::new(500.0 * zoom, 16.0 * zoom).with_theme(theme),
+                            )
+                            .expect("layout")
+                            .clone();
+                        layout
+                            .apply_table_column_resize(0, -40.0 * zoom)
+                            .expect("resize");
+                        for cell in layout.table().expect("table").cells() {
+                            let caret = layout
+                                .caret_for_source(cell.source().start(), Bias::After)
+                                .expect("caret");
+                            assert_eq!(
+                                layout.hit_test(caret.point()).expect("hit").source(),
+                                cell.source().start()
+                            );
+                        }
+                        assert_eq!(
+                            document.snapshot().as_str(),
+                            versions.last().expect("version")
+                        );
+                    }
+                }
+            }
+            for expected in versions[..versions.len() - 1].iter().rev() {
+                document.execute(EditorCommand::Undo).expect("undo");
+                assert_eq!(document.snapshot().as_str(), expected);
+            }
+            for expected in &versions[1..] {
+                document.execute(EditorCommand::Redo).expect("redo");
+                assert_eq!(document.snapshot().as_str(), expected);
+            }
+            let reopened = EditorDocument::new(document.snapshot().as_str());
+            assert_eq!(
+                reopened.snapshot().as_str(),
+                versions.last().expect("last version")
+            );
+        }
+    }
+}
+
+#[test]
+fn table_resize_commit_is_an_absolute_divider_not_a_repeatable_delta() {
+    use yu_editor::TableResizeGesture;
+    for (prefix, shaped) in ["", "> ", "> > "]
+        .into_iter()
+        .flat_map(|prefix| [false, true].map(|shaped| (prefix, shaped)))
+    {
+        let source = format!(
+            "{prefix}| alpha beta gamma | second |\n{prefix}| --- | --- |\n{prefix}| value | other |"
+        );
+        let snapshot = TextBuffer::new(source).snapshot();
+        let (decorations, visual, kind) = decorate(&snapshot, 0).expect("table");
+        let config = LayoutConfig::new(500.0, 16.0);
+        let mut layout = if shaped {
+            BlockView::build_shaped(kind, &visual, &decorations, config, &TestShaper)
+        } else {
+            BlockView::build(
+                kind,
+                &visual,
+                &decorations,
+                config,
+                &MonospaceMetrics::new(8.0),
+            )
+        }
+        .expect("layout");
+        let apply = |layout: &mut BlockView, commit| {
+            if shaped {
+                layout.apply_table_resize_with_shaper(commit, &TestShaper)
+            } else {
+                layout.apply_table_resize(commit)
+            }
+        };
+        let original = layout.clone();
+        let table = layout.table().expect("table");
+        let x = table.bounds().x() + table.column_widths()[0];
+        let point = LayoutPoint::new(x, table.bounds().y() + 10.0);
+        let hit = table
+            .resize_hit_test(point, 1.0)
+            .expect("hit test")
+            .expect("divider");
+        let mut gesture =
+            TableResizeGesture::begin(snapshot.revision(), 0, hit, x).expect("gesture");
+        gesture
+            .update(snapshot.revision(), x - 40.0)
+            .expect("update");
+        let commit = gesture.finish(snapshot.revision()).expect("finish");
+        apply(&mut layout, commit).expect("first apply");
+        let widths = layout.table().expect("table").column_widths().to_vec();
+        apply(&mut layout, commit).expect("repeat apply");
+        assert_eq!(layout.table().expect("table").column_widths(), widths);
+        let table = layout.table().expect("table");
+        let next_x = table.bounds().x() + widths[0];
+        let hit = table
+            .resize_hit_test(LayoutPoint::new(next_x, table.bounds().y() + 10.0), 1.0)
+            .expect("hit test")
+            .expect("divider");
+        let mut second =
+            TableResizeGesture::begin(snapshot.revision(), 0, hit, next_x).expect("second gesture");
+        second
+            .update(snapshot.revision(), next_x + 15.0)
+            .expect("update second");
+        let second = second.finish(snapshot.revision()).expect("finish second");
+        apply(&mut layout, second).expect("live layout");
+        let mut rebuilt = original;
+        apply(&mut rebuilt, second).expect("rebuilt layout");
+        assert_eq!(
+            layout.table().expect("table").column_widths(),
+            rebuilt.table().expect("table").column_widths()
+        );
+    }
+}
+
+#[test]
+fn confirmed_table_widths_follow_text_transactions_and_worker_snapshots() {
+    use yu_editor::{CaretAffinity, EditorCommand, EditorDocument, EditorSelection};
+    let original = "> | Header | Other |\n> | --- | --- |\n> | value | text |\n";
+    let mut document = EditorDocument::new(original);
+    let config = LayoutConfig::new(500.0, 16.0);
+    let mut resized = document
+        .block_layout_for_visual_state_with_shaper(0, config, &TestShaper)
+        .expect("layout");
+    resized.apply_table_column_resize(0, -60.0).expect("resize");
+    let widths = resized.table().expect("table").column_widths().to_vec();
+    document
+        .confirm_table_column_widths(0, resized.table().expect("table"))
+        .expect("confirm");
+    assert_eq!(document.snapshot().as_str(), original);
+    let at = original.find("value").expect("cell");
+    let selection = EditorSelection::cursor(
+        &document.snapshot(),
+        ByteOffset::new(at as u64),
+        CaretAffinity::Downstream,
+    )
+    .expect("cursor");
+    document.set_selection(selection).expect("select");
+    document
+        .execute(EditorCommand::insert_text("long 中文 content "))
+        .expect("edit");
+    let edited = document.snapshot().as_str().to_owned();
+    for (command, expected) in [
+        (None, edited.as_str()),
+        (Some(EditorCommand::Undo), original),
+        (Some(EditorCommand::Redo), edited.as_str()),
+    ] {
+        if let Some(command) = command {
+            document.execute(command).expect("history");
+        }
+        assert_eq!(document.snapshot().as_str(), expected);
+        let mut worker = document.capture_render_snapshot().into_layout_context();
+        for actual in [
+            document
+                .block_layout_for_visual_state_with_shaper(0, config, &TestShaper)
+                .expect("foreground"),
+            worker
+                .block_layout_for_visual_state_with_shaper(0, config, &TestShaper)
+                .expect("worker"),
+        ] {
+            for (a, b) in actual
+                .table()
+                .expect("table")
+                .column_widths()
+                .iter()
+                .zip(&widths)
+            {
+                assert!((a - b).abs() < 0.001);
+            }
+        }
+    }
+    let selection = EditorSelection::cursor(
+        &document.snapshot(),
+        ByteOffset::ZERO,
+        CaretAffinity::Downstream,
+    )
+    .expect("start");
+    document.set_selection(selection).expect("select start");
+    document
+        .execute(EditorCommand::insert_text("Intro\n\n"))
+        .expect("insert before table");
+    let at = document.snapshot().as_str().find("Header").expect("header");
+    let index = document
+        .block_index_for_source(ByteOffset::new(at as u64))
+        .expect("table index");
+    let layout = document
+        .block_layout_for_visual_state_with_shaper(index, config, &TestShaper)
+        .expect("shifted layout");
+    for (a, b) in layout
+        .table()
+        .expect("table")
+        .column_widths()
+        .iter()
+        .zip(&widths)
+    {
+        assert!((a - b).abs() < 0.001);
+    }
+}
+
+#[test]
+fn confirmed_widths_survive_column_alignment_and_its_history() {
+    use yu_editor::{CaretAffinity, EditorCommand, EditorDocument, EditorSelection, TableEdit};
+    for prefix in ["", "> "] {
+        for (outer, target) in [false, true]
+            .into_iter()
+            .flat_map(|outer| ["value", "text"].map(|target| (outer, target)))
+        {
+            let (left, right) = if outer { ("| ", " |") } else { ("", "") };
+            let source = format!(
+                "{prefix}{left}H | B{right}\n{prefix}{left}--- | ---{right}\n{prefix}{left}value | text{right}\n"
+            );
+            let mut document = EditorDocument::new(source.clone());
+            let config = LayoutConfig::new(500.0, 16.0);
+            let mut layout = document
+                .block_layout_for_visual_state_with_shaper(0, config, &TestShaper)
+                .expect("layout");
+            layout.apply_table_column_resize(0, -40.0).expect("resize");
+            let widths = layout.table().expect("table").column_widths().to_vec();
+            document
+                .confirm_table_column_widths(0, layout.table().expect("table"))
+                .expect("confirm");
+            let at = ByteOffset::new(source.find(target).expect("cell") as u64);
+            let selection =
+                EditorSelection::cursor(&document.snapshot(), at, CaretAffinity::Downstream)
+                    .expect("caret");
+            document.set_selection(selection).expect("select");
+            for command in [
+                EditorCommand::EditTable(TableEdit::AlignRight),
+                EditorCommand::Undo,
+                EditorCommand::Redo,
+            ] {
+                document.execute(command).expect("alignment history");
+                let layout = document
+                    .block_layout_for_visual_state_with_shaper(0, config, &TestShaper)
+                    .expect("layout after command");
+                for (actual, expected) in layout
+                    .table()
+                    .expect("table")
+                    .column_widths()
+                    .iter()
+                    .zip(&widths)
+                {
+                    assert!(
+                        (actual - expected).abs() < 0.001,
+                        "prefix={prefix:?} outer={outer}: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn confirmed_widths_are_independent_across_tables_themes_and_zoom() {
+    use yu_editor::{CaretAffinity, EditorCommand, EditorDocument, EditorSelection};
+    let source = "| First long | B |\n| --- | --- |\n| one | two |\n\n> | Second | D |\n> | --- | --- |\n> | three | four |\n";
+    let mut document = EditorDocument::new(source);
+    let mut ratios = Vec::new();
+    for (header, delta) in [("First", -40.0), ("Second", 40.0)] {
+        let at = ByteOffset::new(source.find(header).expect("header") as u64);
+        let index = document.block_index_for_source(at).expect("table block");
+        let mut layout = document
+            .block_layout_for_visual_state_with_shaper(
+                index,
+                LayoutConfig::new(500.0, 16.0),
+                &TestShaper,
+            )
+            .expect("layout");
+        layout.apply_table_column_resize(0, delta).expect("resize");
+        let table = layout.table().expect("table");
+        ratios.push(table.column_widths()[0] / table.bounds().width());
+        document
+            .confirm_table_column_widths(index, table)
+            .expect("confirm");
+    }
+    assert_eq!(document.table_width_generation(), 2);
+    let before = document.capture_render_snapshot();
+    let at = ByteOffset::new(source.find("one").expect("cell") as u64);
+    document
+        .set_selection(
+            EditorSelection::cursor(&document.snapshot(), at, CaretAffinity::Downstream)
+                .expect("caret"),
+        )
+        .expect("select");
+    document
+        .execute(EditorCommand::insert_text("longer 中文 "))
+        .expect("edit first table");
+    let mut worker = document.capture_render_snapshot().into_layout_context();
+    assert!(!before.can_reuse_layout_context(&worker));
+    for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+        for zoom in [0.75, 1.0, 1.5] {
+            let config = LayoutConfig::new(500.0 * zoom, 16.0 * zoom).with_theme(theme);
+            for (n, header) in ["First", "Second"].into_iter().enumerate() {
+                let at = ByteOffset::new(
+                    document.snapshot().as_str().find(header).expect("header") as u64,
+                );
+                let index = document.block_index_for_source(at).expect("index");
+                for layout in [
+                    document
+                        .block_layout_for_visual_state_with_shaper(index, config, &TestShaper)
+                        .expect("foreground"),
+                    worker
+                        .block_layout_for_visual_state_with_shaper(index, config, &TestShaper)
+                        .expect("worker"),
+                ] {
+                    let table = layout.table().expect("table");
+                    assert!(
+                        (table.column_widths()[0] / table.bounds().width() - ratios[n]).abs()
+                            < 0.00001
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn every_glyph_of_multi_scalar_entities_covers_the_source_atom_without_markers() {
+    for source in ["**&fjlig;**", "| H |\n| --- |\n| **&fjlig;** |"] {
+        let view = view(source, 300.0).expect("entity view");
+        let start = source.find("&fjlig;").expect("entity") as u64;
+        let atom =
+            TextRange::new(ByteOffset::new(start), ByteOffset::new(start + 7)).expect("atom");
+        let clusters: Vec<_> = view
+            .clusters()
+            .iter()
+            .filter(|cluster| {
+                cluster.source().start() >= atom.start() && cluster.source().end() <= atom.end()
+            })
+            .collect();
+        assert_eq!(clusters.len(), 2, "{source}");
+        assert!(
+            clusters.iter().all(|cluster| cluster.source() == atom),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn code_line_advance_keeps_night_absolute_body_height() {
+    let source = "```\nfirst\nsecond\nthird\n```\n";
+    let snapshot = TextBuffer::new(source).snapshot();
+    let (decorations, visual, kind) = decorate(&snapshot, 0).expect("code");
+    for (theme, expected) in [
+        (yu_core::ThemeId::Github, 23.04),
+        (yu_core::ThemeId::Night, 26.0),
+    ] {
+        for zoom in [0.75, 1.0, 1.5] {
+            let config = LayoutConfig::new(600.0, 16.0 * zoom).with_theme(theme);
+            let block = BlockView::build(
+                kind,
+                &visual,
+                &decorations,
+                config,
+                &MonospaceMetrics::new(8.0),
+            )
+            .expect("layout");
+            let first = block
+                .caret_for_source(ByteOffset::new(4), Bias::After)
+                .expect("first");
+            let second = block
+                .caret_for_source(ByteOffset::new(10), Bias::After)
+                .expect("second");
+            let third = block
+                .caret_for_source(ByteOffset::new(17), Bias::After)
+                .expect("third");
+            for advance in [
+                second.point().y() - first.point().y(),
+                third.point().y() - second.point().y(),
+            ] {
+                assert!(
+                    (advance - expected * zoom).abs() < 0.001,
+                    "{theme:?} zoom={zoom} advance={advance}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn night_block_code_and_inline_code_keep_distinct_font_sizes() {
+    for zoom in [0.75, 1.0, 1.5] {
+        for (source, start, ratio) in [("```\nab\n```\n", 4, 0.9), ("`ab`\n", 1, 0.875)] {
+            let snapshot = TextBuffer::new(source).snapshot();
+            let (decorations, visual, kind) = decorate(&snapshot, 0).expect("code");
+            let block = BlockView::build(
+                kind,
+                &visual,
+                &decorations,
+                LayoutConfig::new(600.0, 16.0 * zoom).with_theme(yu_core::ThemeId::Night),
+                &MonospaceMetrics::new(8.0 * zoom),
+            )
+            .expect("layout");
+            let a = block
+                .caret_for_source(ByteOffset::new(start), Bias::After)
+                .expect("a");
+            let b = block
+                .caret_for_source(ByteOffset::new(start + 1), Bias::After)
+                .expect("b");
+            assert!(
+                (b.point().x() - a.point().x() - 8.0 * zoom * ratio).abs() < 0.001,
+                "{source:?} at {zoom}: {}",
+                b.point().x() - a.point().x()
             );
         }
     }

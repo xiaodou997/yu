@@ -59,6 +59,7 @@ pub enum Language {
     Json,
     Python,
     Rust,
+    Swift,
 }
 
 impl Language {
@@ -69,6 +70,7 @@ impl Language {
         Self::Json,
         Self::Python,
         Self::Rust,
+        Self::Swift,
     ];
 
     /// 围栏上的 info string 认到哪一种语言。
@@ -95,6 +97,7 @@ impl Language {
             "json" | "jsonc" => Self::Json,
             "python" | "py" | "python3" => Self::Python,
             "rust" | "rs" => Self::Rust,
+            "swift" => Self::Swift,
             _ => return None,
         })
     }
@@ -108,6 +111,7 @@ impl Language {
             Self::Json => "json",
             Self::Python => "python",
             Self::Rust => "rust",
+            Self::Swift => "swift",
         }
     }
 
@@ -125,6 +129,7 @@ impl Language {
             }};
         }
         match self {
+            Self::Swift => cell!(SWIFT, tree_sitter_swift::LANGUAGE, &swift_highlights(), ""),
             Self::Bash => cell!(
                 BASH,
                 tree_sitter_bash::LANGUAGE,
@@ -159,14 +164,25 @@ impl Language {
     }
 }
 
+/// Keep Swift binding definitions colored independently from uses and calls.
+/// These query changes affect syntax colors only, never font style or source.
+fn swift_highlights() -> String {
+    // @spell is editor metadata; it otherwise masks the comment color.
+    let mut query = tree_sitter_swift::HIGHLIGHTS_QUERY
+        .replace("@spell", "")
+        .replace("@function.call", "@variable");
+    query.push_str("\n(property_declaration (pattern (simple_identifier) @variable.definition))\n");
+    query
+}
+
 /// capture 名到 [`TextRole`] 的对照表。
 ///
 /// 下标就是 `tree_sitter_highlight::Highlight` 里的那个数，所以两列必须一一
 /// 对齐——[`ROLES`] 与这张表长度不等会在 [`role_of`] 里被断言拦住。
 ///
 /// `configure` 按**最长的点分前缀**匹配，所以 `@keyword.function` 会落到
-/// `keyword` 上；点后面那一级不是各家 grammar 的公共词汇，收进来只会让语言
-/// 之间不一致。
+/// `keyword` 上。需要独立颜色的声明绑定显式登记 `variable.definition`；
+/// 其余语言特有后缀仍归入通用角色。
 const CAPTURES: &[&str] = &[
     "comment",
     "string",
@@ -178,6 +194,7 @@ const CAPTURES: &[&str] = &[
     "constructor",
     "constant",
     "variable",
+    "variable.definition",
     "property",
     "operator",
     "punctuation",
@@ -198,6 +215,7 @@ const ROLES: &[TextRole] = &[
     TextRole::Type,
     TextRole::Constant,
     TextRole::Variable,
+    TextRole::Definition,
     TextRole::Variable,
     TextRole::Operator,
     TextRole::Punctuation,

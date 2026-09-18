@@ -1,12 +1,13 @@
 //! 不可变的装饰集合。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use yu_core::{Affinity, ByteOffset, Revision, TextAnchor, VisualOffset};
 use yu_text::{AnchorMapError, ChangeSet};
 
 use crate::decoration::{Decoration, DecorationRange};
-use crate::hidden::{Bias, HiddenIndex};
+use crate::hidden::{Bias, ProjectionIndex};
 
 /// `map` 失败的原因。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +70,13 @@ impl core::error::Error for MergeError {}
 /// 一份 revision 的全部装饰。
 ///
 /// 不可变、可克隆（克隆是 `Arc` 克隆）、可安全并发读取——不变量 D2。
+/// One normalized source atom, shared by the mapper and visual text reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProjectionSpan {
+    pub range: yu_core::TextRange,
+    pub replacement: Option<crate::ReplacementText>,
+}
+
 #[derive(Clone)]
 pub struct DecorationSet {
     revision: Revision,
@@ -78,7 +86,8 @@ pub struct DecorationSet {
     /// 会隐藏 source 的那些装饰合并之后的区间：升序、不重叠、不相邻。
     hidden_spans: Arc<[(ByteOffset, ByteOffset)]>,
     /// 由 `hidden_spans` 建出来的映射索引。
-    hidden: HiddenIndex,
+    hidden: ProjectionIndex,
+    projection_spans: Arc<[ProjectionSpan]>,
 }
 
 impl DecorationSet {
@@ -99,7 +108,18 @@ impl DecorationSet {
         ranges.sort_by_key(DecorationRange::order_key);
 
         let hidden = merge_hidden(&ranges);
-        let index = HiddenIndex::build(&hidden, source_len.get());
+        let projection_spans = normalized_projection(&ranges, &hidden);
+        let index = ProjectionIndex::build_projected(
+            projection_spans.iter().map(|span| {
+                (
+                    span.range.start().get(),
+                    span.range.end().get(),
+                    span.replacement
+                        .map_or(0, |character| character.len_utf8() as u64),
+                )
+            }),
+            source_len.get(),
+        );
         Self {
             revision,
             source_len,
@@ -109,6 +129,7 @@ impl DecorationSet {
                 .map(|&(from, to)| (ByteOffset::new(from), ByteOffset::new(to)))
                 .collect(),
             hidden: index,
+            projection_spans: projection_spans.into(),
         }
     }
 
@@ -189,13 +210,19 @@ impl DecorationSet {
 
     /// 被藏起来的 source 区间，升序、不重叠、不相邻。
     ///
-    /// 这是**映射索引的原料**，不是另算一遍：`source_to_visual` 的那棵树
+    /// 这是**映射索引的原料**，不是另算一遍：`source_to_visual` 的索引
     /// 就建在这份数据上。想拼出视觉文本的调用方（`yu-editor::VisualText`）
     /// 必须用它，自己再遍历一遍 [`DecorationSet::all`] 去数「哪些字节被
     /// 藏了」就是第二个实现——不变量 D4 说那件事只能有一个实现。
     #[must_use]
     pub fn hidden_spans(&self) -> &[(ByteOffset, ByteOffset)] {
         &self.hidden_spans
+    }
+
+    /// Normalized, nonoverlapping atoms used by the mapping index itself.
+    #[must_use]
+    pub fn projection_spans(&self) -> &[ProjectionSpan] {
+        &self.projection_spans
     }
 
     /// 与 `from..=to` 相接或相交的装饰，按定序返回。
@@ -275,6 +302,20 @@ impl DecorationSet {
         }
         let mut mapped = Vec::with_capacity(self.ranges.len());
         for entry in self.ranges.iter() {
+            if matches!(entry.decoration, Decoration::Substitute { .. })
+                && changes.changes().iter().any(|change| {
+                    let old = change.old_range();
+                    if old.is_empty() {
+                        entry.range.start() < old.start() && old.start() < entry.range.end()
+                    } else {
+                        old.start() < entry.range.end() && entry.range.start() < old.end()
+                    }
+                })
+            {
+                // The source spelling changed; only reparsing can reconstruct
+                // this atom. Never carry a stale substitute across an inner edit.
+                continue;
+            }
             let start = changes
                 .map_anchor(TextAnchor::new(
                     self.revision,
@@ -320,7 +361,10 @@ impl DecorationSet {
 fn merge_hidden(ranges: &[DecorationRange]) -> Vec<(u64, u64)> {
     let mut merged: Vec<(u64, u64)> = Vec::new();
     for entry in ranges {
-        if !entry.decoration.hides_source() || entry.range.is_empty() {
+        if !entry.decoration.hides_source()
+            || matches!(entry.decoration, Decoration::Substitute { .. })
+            || entry.range.is_empty()
+        {
             continue;
         }
         let (from, to) = (entry.range.start().get(), entry.range.end().get());
@@ -330,6 +374,53 @@ fn merge_hidden(ranges: &[DecorationRange]) -> Vec<(u64, u64)> {
         }
     }
     merged
+}
+
+// Hidden source takes precedence over substitutions (e.g. hidden code syntax).
+// Conflicting substitutions choose descending priority, then the total order
+// key. The result is independent of extension/merge order.
+fn normalized_projection(ranges: &[DecorationRange], hidden: &[(u64, u64)]) -> Vec<ProjectionSpan> {
+    let mut atoms: BTreeMap<u64, ProjectionSpan> = hidden
+        .iter()
+        .map(|&(from, to)| {
+            (
+                from,
+                ProjectionSpan {
+                    range: yu_core::TextRange::new(ByteOffset::new(from), ByteOffset::new(to))
+                        .expect("normalized range"),
+                    replacement: None,
+                },
+            )
+        })
+        .collect();
+    let mut substitutions: Vec<_> = ranges
+        .iter()
+        .filter(|entry| {
+            matches!(entry.decoration, Decoration::Substitute { .. }) && !entry.range.is_empty()
+        })
+        .collect();
+    substitutions.sort_by_key(|entry| std::cmp::Reverse((entry.priority, entry.order_key())));
+    for entry in substitutions {
+        let from = entry.range.start().get();
+        let to = entry.range.end().get();
+        if atoms
+            .range(..to)
+            .next_back()
+            .is_some_and(|(_, span)| span.range.end().get() > from)
+        {
+            continue;
+        }
+        if let Decoration::Substitute { text } = entry.decoration {
+            atoms.insert(
+                from,
+                ProjectionSpan {
+                    range: entry.range,
+                    replacement: Some(text),
+                },
+            );
+        }
+    }
+    atoms.into_values().collect()
 }
 
 /// 一次改动之后的文档长度。
@@ -347,7 +438,7 @@ const _: fn(Decoration) -> bool = Decoration::hides_source;
 /// 不变量 D2：装饰集合不可变、与 Revision 绑定，**可安全并发读取**。
 ///
 /// 「可安全并发读取」在 Rust 里就是 `Send + Sync`，而它是由字段推导出来的，
-/// 不是声明出来的——今天成立不代表明天成立。往树里塞一个 `Rc` 或 `Cell`
+/// 不是声明出来的——今天成立不代表明天成立。往索引里塞一个 `Rc` 或 `Cell`
 /// 做缓存，编译照过、测试全绿，只有把集合发给后台任务的那一刻才炸，而那
 /// 条路径此刻还不存在（S4 只建数据结构，G1 的后台快照读取要到后面才接）。
 /// 这一行让它在编译期就失败。
@@ -702,5 +793,64 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].range, range(4, 10));
         assert_eq!(found[1].range, range(12, 14));
+    }
+
+    #[test]
+    fn substitutions_share_one_normalized_mapping_and_resolve_overlap() {
+        let newline =
+            DecorationRange::new(range(1, 5), Decoration::Substitute { text: '\n'.into() });
+        let emoji = DecorationRange::new(
+            range(5, 7),
+            Decoration::Substitute {
+                text: '🪶'.into()
+            },
+        );
+        let entries = vec![newline, emoji, replace(7, 9)];
+        let forward = set(10, entries.clone());
+        let backward = set(10, entries.into_iter().rev().collect());
+        assert_eq!(forward.projection_spans(), backward.projection_spans());
+        assert_eq!(forward.visual_len().get(), 7);
+        assert_eq!(forward.source_to_visual(ByteOffset::new(5)).get(), 2);
+        assert_eq!(forward.visual_to_source(visual(6), Bias::Before).get(), 7);
+        assert_eq!(forward.visual_to_source(visual(6), Bias::After).get(), 9);
+        let suppressed = set(10, vec![newline, replace(0, 6)]);
+        assert!(
+            suppressed
+                .projection_spans()
+                .iter()
+                .all(|span| span.replacement.is_none())
+        );
+        let high = DecorationRange::new(range(2, 4), Decoration::Substitute { text: 'x'.into() })
+            .with_priority(10);
+        for entries in [vec![newline, high], vec![high, newline]] {
+            let resolved = set(10, entries);
+            assert_eq!(resolved.projection_spans().len(), 1);
+            assert_eq!(resolved.projection_spans()[0].replacement, Some('x'.into()));
+        }
+    }
+
+    #[test]
+    fn editing_a_substitution_invalidates_it_but_boundary_typing_does_not() {
+        let entry = DecorationRange::new(range(1, 5), Decoration::Substitute { text: '\n'.into() });
+        let original = set(6, vec![entry]);
+        for changes in [
+            change_set("a<br>z", 2, 0, "x"),
+            change_set("a<br>z", 2, 1, ""),
+            change_set("a<br>z", 1, 4, "x"),
+        ] {
+            let mapped = original.map(&changes).expect("map changed spelling");
+            assert!(mapped.projection_spans().is_empty());
+        }
+        for at in [0, 1, 5, 6] {
+            let mapped = original
+                .map(&change_set("a<br>z", at, 0, "x"))
+                .expect("map boundary typing");
+            assert_eq!(mapped.projection_spans().len(), 1);
+            assert_eq!(mapped.projection_spans()[0].replacement, Some('\n'.into()));
+            assert_eq!(
+                mapped.projection_spans()[0].range,
+                if at <= 1 { range(2, 6) } else { range(1, 5) }
+            );
+        }
     }
 }

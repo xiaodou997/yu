@@ -408,6 +408,7 @@ impl ViewportStats {
 /// out the rest of the document.
 #[derive(Clone, Debug, Default)]
 pub struct ViewportLayout {
+    geometry_generation: u64,
     config: ViewportConfig,
     backend: LayoutBackend,
     entries: Vec<ViewportEntry>,
@@ -419,6 +420,7 @@ pub struct ViewportLayout {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ViewportKey {
+    context_key: u64,
     range: TextRange,
     kind: BlockKind,
 }
@@ -431,9 +433,65 @@ struct ViewportEntry {
 }
 
 impl ViewportLayout {
+    /// Merge independent measurements without replacing already measured owner
+    /// paragraphs. Same revision, width and backend are required.
+    pub(crate) fn merge_missing(&mut self, other: &Self) -> Result<(), ViewportError> {
+        if self.revision != other.revision
+            || self.config != other.config
+            || self.backend != other.backend
+        {
+            return Ok(());
+        }
+        for (index, entry) in other.entries.iter().enumerate() {
+            if entry.measured
+                && self
+                    .entries
+                    .get(index)
+                    .is_some_and(|own| own.key == entry.key && !own.measured)
+            {
+                self.set_block_height(index, entry.height)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Retain old geometry as estimates during a resize. The visible window is
+    /// remeasured first; distant prefixes no longer collapse to one-line guesses.
+    pub(crate) fn reconfigure(&mut self, config: ViewportConfig) -> Result<(), ViewportError> {
+        config.validate()?;
+        if self.config.layout() != config.layout() {
+            for entry in &mut self.entries {
+                entry.measured = false;
+            }
+            self.geometry_generation = self.geometry_generation.wrapping_add(1);
+        }
+        self.config = config;
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_block_measurement(&mut self, index: usize) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.measured = false;
+            self.geometry_generation = self.geometry_generation.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn unmeasured_sources(&self, limit: usize) -> Vec<yu_core::ByteOffset> {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.measured)
+            .take(limit)
+            .map(|entry| entry.key.range.start())
+            .collect()
+    }
+
+    pub fn geometry_generation(&self) -> u64 {
+        self.geometry_generation
+    }
     pub fn new(config: ViewportConfig) -> Result<Self, ViewportError> {
         config.validate()?;
         Ok(Self {
+            geometry_generation: 0,
             config,
             backend: LayoutBackend::Metrics,
             entries: Vec::new(),
@@ -510,7 +568,10 @@ impl ViewportLayout {
                 .iter()
                 .zip(markdown.blocks())
                 .all(|(entry, block)| {
-                    entry.key.range == block.range() && entry.key.kind == block.kind()
+                    entry.key.range == block.range()
+                        && entry.key.kind == block.kind()
+                        && entry.key.context_key
+                            == markdown.presentation().context_key(block.range())
                 })
         {
             return Ok(());
@@ -538,6 +599,7 @@ impl ViewportLayout {
         let mut entries = Vec::with_capacity(markdown.blocks().len());
         for block in markdown.blocks() {
             let key = ViewportKey {
+                context_key: markdown.presentation().context_key(block.range()),
                 range: block.range(),
                 kind: block.kind(),
             };
@@ -586,6 +648,7 @@ impl ViewportLayout {
         let mut entries = Vec::with_capacity(markdown.blocks().len());
         for block in markdown.blocks() {
             let key = ViewportKey {
+                context_key: markdown.presentation().context_key(block.range()),
                 range: block.range(),
                 kind: block.kind(),
             };
@@ -662,6 +725,7 @@ impl ViewportLayout {
             let range = map_range(entry.key.range, changes)?;
             mapped.push(ViewportEntry {
                 key: ViewportKey {
+                    context_key: entry.key.context_key,
                     range,
                     kind: entry.key.kind,
                 },
@@ -682,6 +746,7 @@ impl ViewportLayout {
 
     /// Clears all block estimates and measured heights.
     pub fn clear(&mut self) {
+        self.geometry_generation = self.geometry_generation.wrapping_add(1);
         self.invalidated = self.invalidated.saturating_add(self.entries.len() as u64);
         self.entries.clear();
         self.heights = HeightIndex::default();
@@ -732,6 +797,9 @@ impl ViewportLayout {
         self.heights.set(index, height)?;
         entry.height = height;
         entry.measured = true;
+        if changed {
+            self.geometry_generation = self.geometry_generation.wrapping_add(1);
+        }
         Ok(changed)
     }
 
@@ -782,6 +850,7 @@ impl ViewportLayout {
     }
 
     fn rebuild_index(&mut self) -> Result<(), ViewportError> {
+        self.geometry_generation = self.geometry_generation.wrapping_add(1);
         self.heights = HeightIndex::new(self.entries.iter().map(|entry| entry.height))?;
         Ok(())
     }

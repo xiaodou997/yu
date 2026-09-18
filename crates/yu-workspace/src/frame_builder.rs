@@ -12,7 +12,9 @@ use std::error::Error;
 use std::fmt;
 
 use yu_assets::{ImageIntrinsicPublication, ImagePublication, ImageRequestPriority};
-use yu_editor::{EditorDocument, EditorDocumentError, EditorRenderLayout, EditorRenderSnapshot};
+#[cfg(test)]
+use yu_editor::EditorDocument;
+use yu_editor::{EditorDocumentError, EditorRenderSnapshot, LayoutContext, LayoutSnapshot};
 use yu_font::{
     AtlasError, GlyphAtlas, GlyphAtlasConfig, GlyphRasterKey, GlyphRasterizer, RasterizingShaper,
 };
@@ -23,8 +25,8 @@ use crate::{
     ViewportRenderConfig,
 };
 
-/// Immutable source and visual state for a frame preparation job. Document
-/// reconstruction and visibility discovery happen in `publish_owned`, on the
+/// Immutable source and visual state for a frame preparation job. Layout-context
+/// preparation and visibility discovery happen in `publish_owned`, on the
 /// worker; capture never borrows AppKit or shares a mutable editor.
 #[derive(Debug)]
 pub struct ViewportFrameBuildInput {
@@ -39,7 +41,7 @@ pub struct ViewportFrameBuildInput {
 /// presentation.
 #[derive(Debug)]
 pub struct ViewportFrameBuildOutput {
-    pub layout: EditorRenderLayout,
+    pub layout: std::sync::Arc<LayoutSnapshot>,
     pub request: FrameBuildRequest,
     pub publication: ViewportFramePublication,
     /// CPU glyph atlas state produced alongside the publication.  The main
@@ -168,7 +170,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     /// 准备并发布当前文档的视口。
     pub fn publish(
         &mut self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
     ) -> Result<ViewportFramePublication, BuildError<S>> {
         self.publish_with_images(document, &[])
     }
@@ -177,7 +179,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     /// 布局/场景计算的只有尺寸。
     pub fn publish_with_images(
         &mut self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
         image_publications: &[ImagePublication],
     ) -> Result<ViewportFramePublication, BuildError<S>> {
         self.publish_with_images_and_intrinsics(document, image_publications, &[])
@@ -186,7 +188,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     /// 用已就绪的像素、以及像素被淘汰之后仍然留着的固有尺寸准备一帧。
     pub fn publish_with_images_and_intrinsics(
         &mut self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
         image_publications: &[ImagePublication],
         image_intrinsics: &[ImageIntrinsicPublication],
     ) -> Result<ViewportFramePublication, BuildError<S>> {
@@ -200,7 +202,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
 
     pub fn publish_with_images_and_intrinsics_cancelable<C>(
         &mut self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
         image_publications: &[ImagePublication],
         image_intrinsics: &[ImageIntrinsicPublication],
         should_cancel: &mut C,
@@ -209,7 +211,12 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         C: FnMut() -> bool,
     {
         let raster_start = std::time::Instant::now();
-        self.rasterize_visible_glyphs_cancelable(document, should_cancel)?;
+        self.rasterize_visible_glyphs_cancelable(
+            document,
+            image_publications,
+            image_intrinsics,
+            should_cancel,
+        )?;
         if std::env::var_os("YU_RENDER_TIMING").is_some() {
             println!(
                 "yu-render-metric event=preparation_rasterization duration_ms={:.6}",
@@ -249,7 +256,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             image_publications,
             image_intrinsics,
         } = input;
-        let mut document = document.into_document()?;
+        let mut document = document.into_layout_context();
         self.publish_owned_document(request, &mut document, image_publications, image_intrinsics)
     }
 
@@ -259,7 +266,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     pub fn publish_owned_document(
         &mut self,
         request: FrameBuildRequest,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
         image_publications: Vec<ImagePublication>,
         image_intrinsics: Vec<ImageIntrinsicPublication>,
     ) -> Result<ViewportFrameBuildOutput, BuildError<S>> {
@@ -275,7 +282,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     pub fn publish_owned_document_cancelable<C>(
         &mut self,
         request: FrameBuildRequest,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
         image_publications: Vec<ImagePublication>,
         image_intrinsics: Vec<ImageIntrinsicPublication>,
         should_cancel: &mut C,
@@ -312,7 +319,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             })
             .collect();
         Ok(ViewportFrameBuildOutput {
-            layout: document.render_layout(),
+            layout: publication.layout_snapshot(),
             request,
             publication,
             atlas: self.atlas.clone(),
@@ -326,7 +333,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     /// 图片不进 解码队列。
     pub fn visible_block_indices(
         &self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
     ) -> Result<Vec<usize>, EditorDocumentError> {
         Ok(self
             .viewport_image_blocks(document)?
@@ -339,7 +346,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     /// 文档空间几何，所以调度器不会另建一份 HeightIndex，也不会扫全文。
     pub fn viewport_image_blocks(
         &self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
     ) -> Result<Vec<(usize, ImageRequestPriority)>, EditorDocumentError> {
         let snapshot = document
             .visible_blocks_with_visual_state_and_shaper(self.config.viewport(), &self.shaper)?;
@@ -423,18 +430,28 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
 
     fn rasterize_visible_glyphs_cancelable<C>(
         &mut self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
+        images: &[ImagePublication],
+        intrinsics: &[ImageIntrinsicPublication],
         should_cancel: &mut C,
     ) -> Result<(), BuildError<S>>
     where
         C: FnMut() -> bool,
     {
+        if should_cancel() {
+            return Err(ViewportFrameBuildError::Cancelled);
+        }
         let visibility_start = std::time::Instant::now();
-        let viewport = document.visible_blocks_with_visual_state_and_shaper_cancelable(
+        let snapshot = crate::prepare_layout_snapshot_with_resources_cancelable(
+            document,
             self.config.viewport(),
             &self.shaper,
-            &mut *should_cancel,
+            images,
+            intrinsics,
+            self.config.table_resize(),
+            should_cancel,
         )?;
+        let viewport = snapshot.viewport();
         if std::env::var_os("YU_RENDER_TIMING").is_some() {
             println!(
                 "yu-render-metric event=preparation_visibility duration_ms={:.6} blocks={}",
@@ -443,17 +460,12 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             );
         }
         let glyph_start = std::time::Instant::now();
-        let layout_config = document.viewport_config().layout();
         let rasterizer = self.shaper.rasterizer();
-        for block in viewport.blocks() {
+        for block in snapshot.blocks() {
             if should_cancel() {
                 return Err(ViewportFrameBuildError::Cancelled);
             }
-            let layout = document.block_layout_for_visual_state_with_shaper(
-                block.index(),
-                layout_config,
-                &self.shaper,
-            )?;
+            let layout = block.layout();
             for placement in layout.glyphs() {
                 // 按物理像素取样：Retina 上 raster_scale 是 backing scale，
                 // 后端会把 atlas 矩形除回逻辑坐标。否则 1x 纹理会被拉伸到 2x
@@ -563,6 +575,7 @@ mod tests {
     struct CountingShaper {
         inner: FontShaper,
         calls: Arc<AtomicUsize>,
+        shape_calls: Arc<AtomicUsize>,
         fail: bool,
     }
 
@@ -579,6 +592,7 @@ mod tests {
                 )
                 .expect("shaper"),
                 calls: Arc::new(AtomicUsize::new(0)),
+                shape_calls: Arc::new(AtomicUsize::new(0)),
                 fail,
             }
         }
@@ -597,6 +611,7 @@ mod tests {
             source: TextRange,
             style: TextStyle,
         ) -> Result<ShapedText, Self::Error> {
+            self.shape_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.shape(text, source, style)
         }
 
@@ -607,6 +622,7 @@ mod tests {
             style: TextStyle,
             scale: f32,
         ) -> Result<ShapedText, Self::Error> {
+            self.shape_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.shape_scaled(text, source, style, scale)
         }
     }
@@ -648,6 +664,58 @@ mod tests {
     }
 
     #[test]
+    fn painting_search_and_repeated_queries_share_one_geometry_without_reshaping() {
+        let shaper = CountingShaper::new(14.0, false);
+        let calls = Arc::clone(&shaper.shape_calls);
+        // Keep both paragraphs inside coverage, including the first-heading margin.
+        let viewport = ViewportRenderConfig::new(
+            ViewportSpan::new(0.0, 400.0),
+            14.0,
+            Rect::new(0.0, 0.0, 240.0, 400.0).expect("scene viewport"),
+            Rgba8::black(),
+        );
+        let mut builder =
+            ViewportFrameBuilder::with_shaper(shaper, viewport, GlyphAtlasConfig::default())
+                .expect("builder");
+        let mut owner = document("# Active heading\n\nsecond paragraph with **strong** text");
+        let first = builder.publish(&mut owner).expect("first frame");
+        let geometry = first.layout_snapshot();
+        let count = calls.load(Ordering::SeqCst);
+        assert!(count > 0);
+        owner.set_search_query("second");
+        let next = builder.publish(&mut owner).expect("search paint");
+        assert!(Arc::ptr_eq(&geometry, &next.layout_snapshot()));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            count,
+            "paint-only changes must not shape an active heading again"
+        );
+        let source = yu_core::ByteOffset::new(
+            owner.snapshot().as_str().find("second").expect("paragraph") as u64,
+        );
+        assert!(
+            geometry.block_for_source(source).is_some(),
+            "query must target published coverage"
+        );
+        let frozen = owner
+            .layout_snapshot_for_source(source, &builder.shaper)
+            .expect("native query");
+        assert!(Arc::ptr_eq(&geometry, &frozen));
+        let block = frozen.block_for_source(source).expect("source block");
+        let caret = block
+            .layout()
+            .caret_for_source(source, yu_editor::Bias::After)
+            .expect("caret");
+        let point = block.document_point(caret.point());
+        let (_, hit) = frozen
+            .hit_test(point)
+            .expect("hit test")
+            .expect("visible text");
+        assert_eq!(hit.source(), source);
+        assert_eq!(calls.load(Ordering::SeqCst), count);
+    }
+
+    #[test]
     fn cancelled_worker_measurement_stops_before_layout_cache_work() {
         let shaper = CountingShaper::new(14.0, false);
         let mut document = document("first paragraph\n\nsecond paragraph");
@@ -671,14 +739,32 @@ mod tests {
             GlyphAtlasConfig::default(),
             10,
         )
-        .unwrap();
+        .expect("valid frame publication fixture");
         let mut document = document("hello");
         builder.ensure_publication_serial(3);
-        assert_eq!(builder.publish(&mut document).unwrap().serial(), 11);
+        assert_eq!(
+            builder
+                .publish(&mut document)
+                .expect("valid frame publication fixture")
+                .serial(),
+            11
+        );
         builder.ensure_publication_serial(20);
-        assert_eq!(builder.publish(&mut document).unwrap().serial(), 21);
+        assert_eq!(
+            builder
+                .publish(&mut document)
+                .expect("valid frame publication fixture")
+                .serial(),
+            21
+        );
         builder.ensure_publication_serial(4);
-        assert_eq!(builder.publish(&mut document).unwrap().serial(), 22);
+        assert_eq!(
+            builder
+                .publish(&mut document)
+                .expect("valid frame publication fixture")
+                .serial(),
+            22
+        );
     }
 
     #[test]
@@ -690,7 +776,7 @@ mod tests {
             config(14.0).with_raster_scale(2.0),
             GlyphAtlasConfig::default(),
         )
-        .unwrap();
+        .expect("valid frame publication fixture");
         let make_input = |generation| {
             let document = document("hello");
             let key = crate::FrameBuildKey::new(
@@ -700,7 +786,8 @@ mod tests {
                 0,
                 None,
                 crate::Appearance::Light,
-                crate::FrameGeometry::new(14.0, 240.0, 0.0, 200.0, 240.0, 200.0, 2.0).unwrap(),
+                crate::FrameGeometry::new(14.0, 240.0, 0.0, 200.0, 240.0, 200.0, 2.0)
+                    .expect("valid frame publication fixture"),
             );
             ViewportFrameBuildInput {
                 request: FrameBuildRequest::new(key, generation),
@@ -709,12 +796,16 @@ mod tests {
                 image_intrinsics: vec![],
             }
         };
-        let dropped = builder.publish_owned(make_input(1)).unwrap();
+        let dropped = builder
+            .publish_owned(make_input(1))
+            .expect("valid frame publication fixture");
         let pages = dropped.publication.frame().plan().uploads().to_vec();
         assert!(!pages.is_empty());
         let raster_calls = counter.load(Ordering::SeqCst);
         drop(dropped); // The consumer never saw these page payloads.
-        let delivered = builder.publish_owned(make_input(2)).unwrap();
+        let delivered = builder
+            .publish_owned(make_input(2))
+            .expect("valid frame publication fixture");
         assert_eq!(delivered.publication.frame().plan().uploads(), pages);
         assert_eq!(counter.load(Ordering::SeqCst), raster_calls);
         assert_eq!(delivered.atlas.raster_scale(), 2.0);

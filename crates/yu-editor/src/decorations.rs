@@ -111,6 +111,7 @@ impl DecorationCacheStats {
 }
 
 struct Entry {
+    context_key: u64,
     range: TextRange,
     kind: BlockKind,
     decorations: BlockDecorations,
@@ -173,16 +174,18 @@ impl DecorationCache {
     ) -> Result<&BlockDecorations, DecorationError> {
         self.retire_stale(markdown.revision());
         self.retire_stale_references(markdown);
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.range == block.range() && entry.kind == block.kind())
-        {
+        let context_key = markdown.presentation().context_key(block.range());
+        if let Some(index) = self.entries.iter().position(|entry| {
+            entry.range == block.range()
+                && entry.kind == block.kind()
+                && entry.context_key == context_key
+        }) {
             self.stats.hits = self.stats.hits.saturating_add(1);
             return Ok(&self.entries[index].decorations);
         }
         let decorations = self.decorate(markdown, block, None)?;
         self.entries.push(Entry {
+            context_key,
             range: block.range(),
             kind: block.kind(),
             decorations,
@@ -206,6 +209,18 @@ impl DecorationCache {
         block: Block,
         active: Option<TextRange>,
     ) -> Result<BlockDecorations, DecorationError> {
+        if markdown.source_mode() {
+            return Ok(BlockDecorations::source(markdown.source(), block));
+        }
+        self.decorate_semantic(markdown, block, active)
+    }
+
+    pub fn decorate_semantic(
+        &mut self,
+        markdown: &MarkdownDocument,
+        block: Block,
+        active: Option<TextRange>,
+    ) -> Result<BlockDecorations, DecorationError> {
         let tree = markdown
             .tree()
             .ok_or(DecorationError::Parse(ParseError::SourceTooLarge))?;
@@ -214,6 +229,7 @@ impl DecorationCache {
             markdown.source(),
             tree,
             markdown.reference_definitions(),
+            markdown.semantic_presentation(),
             block,
             active,
         )?)
@@ -271,6 +287,7 @@ impl DecorationCache {
                     let decorations = entry.decorations.shifted(delta, revision, len).ok()?;
                     let range = decorations.range();
                     Some(Entry {
+                        context_key: entry.context_key,
                         range,
                         kind: entry.kind,
                         decorations,
@@ -311,11 +328,16 @@ impl DecorationCache {
     pub fn retain_blocks(&mut self, markdown: &MarkdownDocument) {
         self.retire_stale_references(markdown);
         let before = self.entries.len();
+        let blocks = markdown.blocks();
         self.entries.retain(|entry| {
-            markdown
-                .blocks()
-                .iter()
-                .any(|block| block.range() == entry.range && block.kind() == entry.kind)
+            blocks
+                .block_index_for_offset(entry.range.start())
+                .and_then(|index| blocks.get(index))
+                .is_some_and(|block| {
+                    block.range() == entry.range
+                        && block.kind() == entry.kind
+                        && entry.context_key == markdown.presentation().context_key(block.range())
+                })
         });
         let dropped = before.saturating_sub(self.entries.len());
         self.stats.invalidated = self.stats.invalidated.saturating_add(dropped as u64);

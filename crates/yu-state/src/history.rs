@@ -1,3 +1,4 @@
+use crate::Selections;
 use yu_core::Revision;
 use yu_text::{AppliedTransaction, Transaction};
 
@@ -8,6 +9,7 @@ pub enum HistoryGroup {
     Typing,
     Deletion,
     ListEditing,
+    TableEditing,
     Composition,
     External,
 }
@@ -16,11 +18,42 @@ pub enum HistoryGroup {
 pub struct HistoryEntry {
     transaction: Transaction,
     group: u64,
+    selections: Option<(Selections, Selections)>,
+    presentation: Option<u64>,
 }
 
 impl HistoryEntry {
     pub fn new(transaction: Transaction, group: u64) -> Self {
-        Self { transaction, group }
+        Self {
+            transaction,
+            group,
+            selections: None,
+            presentation: None,
+        }
+    }
+
+    /// Opaque presentation checkpoint owned by the editor, never document text.
+    pub fn target_presentation(&self) -> Option<u64> {
+        self.presentation
+    }
+
+    /// Replay callers capture the current presentation before creating an inverse.
+    pub fn with_presentation(mut self, token: u64) -> Self {
+        self.presentation = Some(token);
+        self
+    }
+
+    pub fn target_selections(&self) -> Option<&Selections> {
+        self.selections.as_ref().map(|(target, _)| target)
+    }
+
+    pub fn inverse(&self, transaction: Transaction) -> Self {
+        let mut inverse = Self::new(transaction, self.group);
+        inverse.selections = self
+            .selections
+            .as_ref()
+            .map(|(target, reverse)| (reverse.clone(), target.clone()));
+        inverse
     }
 
     pub fn transaction_for(&self, revision: Revision) -> Transaction {
@@ -69,6 +102,36 @@ impl EditorHistory {
         self.undo
             .push(HistoryEntry::new(applied.inverse().clone(), group));
         Self::trim(self.limit, &mut self.undo);
+    }
+
+    pub fn record_presentation(&mut self, token: u64) {
+        if let Some(entry) = self.undo.last_mut() {
+            entry.presentation = Some(token);
+        }
+    }
+
+    pub fn presentation_tokens(&self) -> impl Iterator<Item = u64> + '_ {
+        self.undo
+            .iter()
+            .chain(&self.redo)
+            .filter_map(|entry| entry.presentation)
+    }
+
+    pub fn record_selections(&mut self, before: Selections, after: Selections) {
+        if let Some(entry) = self.undo.last_mut() {
+            entry.selections = Some((before, after));
+        }
+    }
+
+    pub fn finish_selection(&mut self, after: Selections) {
+        if let Some((_, reverse)) = self
+            .undo
+            .last_mut()
+            .and_then(|entry| entry.selections.as_mut())
+            && reverse.revision() == after.revision()
+        {
+            *reverse = after;
+        }
     }
 
     pub fn break_group(&mut self) {

@@ -11,16 +11,46 @@ use crate::{EditorSelection, SelectionError};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorCommand {
     InsertText(Arc<str>),
+    /// Paste preserved source fragments in normalized selection order.
+    PasteFragments(Vec<Arc<str>>),
+    /// Decode literal tab-separated clipboard data and paste one grid transaction.
+    PasteTsv(Arc<str>),
+    PasteClipboardText {
+        text: Arc<str>,
+        tabular: bool,
+    },
+    /// Row-major Markdown cells, pasted as one source-preserving table edit.
+    PasteTableGrid {
+        columns: usize,
+        cells: Vec<Arc<str>>,
+    },
     DeleteBackward,
     DeleteForward,
+    DeleteWordBackward,
+    DeleteWordForward,
+    /// Delete selected source only; empty carets never act as backspace.
+    DeleteSelections,
     MoveLeft,
     MoveRight,
     MoveWordLeft,
     MoveWordRight,
+    ExtendHorizontal {
+        forward: bool,
+        word: bool,
+    },
+    MoveDocumentBoundary {
+        end: bool,
+        extend: bool,
+    },
     MoveUp,
     MoveDown,
     MoveUpExtend,
     MoveDownExtend,
+    SelectTableCells {
+        anchor: ByteOffset,
+        focus: ByteOffset,
+    },
+    EditTable(TableEdit),
     MoveTableCellNext,
     MoveTableCellPrevious,
     InsertNewline,
@@ -28,7 +58,24 @@ pub enum EditorCommand {
     OutdentList,
     Undo,
     Redo,
-    ToggleTask { block: usize },
+    ToggleTask {
+        block: usize,
+    },
+}
+
+/// Structural edits relative to the primary cell. Other source remains intact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableEdit {
+    InsertRowBefore,
+    InsertRowAfter,
+    DeleteRow,
+    InsertColumnBefore,
+    InsertColumnAfter,
+    DeleteColumn,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignDefault,
 }
 
 /// A source replacement range in native UTF-16 coordinates.

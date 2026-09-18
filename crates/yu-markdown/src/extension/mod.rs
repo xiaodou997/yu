@@ -49,18 +49,21 @@ use crate::block_sequence::{Block, TaskState};
 use crate::reference::{ReferenceDefinitionIndex, read_range};
 use crate::table::TableBlock;
 
+mod code_controls;
 mod code_span;
 mod emphasis;
+pub(crate) mod entity;
+mod escape;
 mod fenced_code;
 pub(crate) mod heading;
 mod image;
 mod indented_code;
-mod line_break;
+pub(crate) mod line_break;
 mod link;
 mod list;
 mod quote;
 mod syntax;
-mod table;
+pub(crate) mod table;
 mod task;
 mod thematic_break;
 
@@ -101,7 +104,9 @@ pub struct BlockContext<'a> {
     source: &'a TextSnapshot,
     block: Block,
     syntax: SyntaxNode<'a>,
+    flow: Vec<SyntaxNode<'a>>,
     references: &'a ReferenceDefinitionIndex,
+    presentation: &'a crate::PresentationTree,
     active: Option<TextRange>,
 }
 
@@ -117,13 +122,23 @@ impl<'a> BlockContext<'a> {
         source: &'a TextSnapshot,
         tree: &'a Tree,
         references: &'a ReferenceDefinitionIndex,
+        presentation: &'a crate::PresentationTree,
         block: Block,
     ) -> Self {
         Self {
             source,
             block,
             syntax: block_node(tree, source, block.range()),
+            flow: SyntaxNode::new(tree, 0)
+                .flow_path(block.range().start().get() as u32)
+                .into_iter()
+                .filter(|node| {
+                    (node.start() as u64) < block.range().end().get()
+                        && block.range().start().get() < node.end() as u64
+                })
+                .collect(),
             references,
+            presentation,
             active: None,
         }
     }
@@ -161,7 +176,7 @@ impl<'a> BlockContext<'a> {
     pub fn nodes(&self) -> impl Iterator<Item = SyntaxNode<'a>> + use<'a> {
         let (from, to) = (self.range().start().get(), self.range().end().get());
         self.syntax
-            .descendants()
+            .descendants_in(self.range())
             .filter(move |node| from <= u64::from(node.start()) && u64::from(node.end()) <= to)
     }
 
@@ -170,10 +185,89 @@ impl<'a> BlockContext<'a> {
     /// 先看包含块的那个节点，再在块内按前序找第一个——两头都找是因为块与
     /// 语法节点的边界不保证对齐：块通常带着行尾的换行符，节点通常不带。
     pub fn block_node(&self, wanted: impl Fn(NodeKind) -> bool) -> Option<SyntaxNode<'a>> {
+        if let Some(node) = self.flow.iter().rev().find(|node| wanted(node.kind())) {
+            return Some(*node);
+        }
         if wanted(self.syntax.kind()) {
             return Some(self.syntax);
         }
         self.nodes().find(|node| wanted(node.kind()))
+    }
+
+    pub fn quote_depth(&self) -> u8 {
+        self.flow
+            .iter()
+            .filter(|node| node.kind() == NodeKind::Blockquote)
+            .count()
+            .min(255) as u8
+    }
+
+    /// Quotes preceding the first list ancestor retain their outside margins.
+    pub fn quote_depth_outside_lists(&self) -> u8 {
+        self.flow
+            .iter()
+            .take_while(|node| node.kind() != NodeKind::ListItem)
+            .filter(|node| node.kind() == NodeKind::Blockquote)
+            .count()
+            .min(255) as u8
+    }
+
+    pub fn quote_depth_before_list_item(&self) -> u8 {
+        let end = self
+            .flow
+            .iter()
+            .rposition(|node| node.kind() == NodeKind::ListItem)
+            .unwrap_or(0);
+        self.flow[..end]
+            .iter()
+            .filter(|node| node.kind() == NodeKind::Blockquote)
+            .count()
+            .min(255) as u8
+    }
+
+    pub(crate) fn list_marker_ancestors(&self) -> Vec<(SyntaxNode<'a>, u8, u8)> {
+        let (mut quotes, mut lists) = (0_u8, 0_u8);
+        let mut result = Vec::new();
+        for node in &self.flow {
+            match node.kind() {
+                NodeKind::Blockquote => quotes = quotes.saturating_add(1),
+                NodeKind::ListItem => {
+                    lists = lists.saturating_add(1);
+                    result.push((*node, quotes, lists));
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
+    pub(crate) fn ordered_number_for_item(&self, range: TextRange) -> Option<u64> {
+        self.presentation
+            .path_for_range(self.range())
+            .into_iter()
+            .find_map(|id| {
+                let node = &self.presentation.nodes()[id];
+                (node.kind == crate::PresentationKind::ListItem
+                    && node.source.start() == range.start())
+                .then_some(node.item_number)
+                .flatten()
+            })
+    }
+
+    pub fn ordered_number(&self) -> Option<u64> {
+        self.presentation
+            .path_for_range(self.range())
+            .into_iter()
+            .rev()
+            .find_map(|id| self.presentation.nodes()[id].item_number)
+    }
+
+    pub fn list_depth(&self) -> u8 {
+        self.flow
+            .iter()
+            .filter(|node| node.kind() == NodeKind::ListItem)
+            .count()
+            .min(255) as u8
     }
 
     /// 读一段源码。
@@ -301,7 +395,7 @@ pub enum BlockOrnament {
     /// ATX 标题，1..=6 级。
     Heading { level: u8 },
     /// 引用，`depth` 层竖条。
-    QuoteBar { depth: u8 },
+    QuoteBar { depth: u8, outside_list: u8 },
     /// 这一块的正文往右让多少列。
     ///
     /// 它与 [`BlockOrnament::Marker`] 是**两件事**，此前挤在一个变体里：
@@ -355,8 +449,15 @@ impl BlockOrnament {
         Some(match self {
             Self::Heading { level } => Self::Heading { level },
             Self::Indent { columns } => Self::Indent { columns },
-            Self::QuoteBar { depth } => Self::QuoteBar { depth },
+            Self::QuoteBar {
+                depth,
+                outside_list,
+            } => Self::QuoteBar {
+                depth,
+                outside_list,
+            },
             Self::Marker(marker) => Self::Marker(MarkerOrnament {
+                quote_depth: marker.quote_depth,
                 source: shift_range(marker.source, delta)?,
                 ..marker
             }),
@@ -373,6 +474,8 @@ impl BlockOrnament {
 /// 列表标记的替代呈现。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkerOrnament {
+    quote_depth: u8,
+    list_depth: u8,
     source: TextRange,
     text: String,
 }
@@ -381,9 +484,28 @@ impl MarkerOrnament {
     #[must_use]
     pub fn new(source: TextRange, text: impl Into<String>) -> Self {
         Self {
+            quote_depth: 0,
+            list_depth: 1,
             source,
             text: text.into(),
         }
+    }
+
+    #[must_use]
+    pub const fn with_quote_depth(mut self, depth: u8) -> Self {
+        self.quote_depth = depth;
+        self
+    }
+    pub const fn quote_depth(&self) -> u8 {
+        self.quote_depth
+    }
+    #[must_use]
+    pub const fn with_list_depth(mut self, depth: u8) -> Self {
+        self.list_depth = depth;
+        self
+    }
+    pub const fn list_depth(&self) -> u8 {
+        self.list_depth
     }
 
     /// 被替代掉的那段源码。选中与编辑仍然走它（不变量 A2）。
@@ -621,6 +743,19 @@ impl ExtensionOutput {
             .push(DecorationRange::new(range, Decoration::Replace));
     }
 
+    /// Substitute one parser-owned source atom without adding a second mapping.
+    pub fn substitute(&mut self, range: TextRange, character: char) {
+        self.substitute_text(range, character.into());
+    }
+
+    /// Preserve one source atom for a possibly multi-scalar display literal.
+    pub fn substitute_text(&mut self, range: TextRange, text: yu_decoration::ReplacementText) {
+        if !range.is_empty() && text.len_utf8() > 0 {
+            self.ranges
+                .push(DecorationRange::new(range, Decoration::Substitute { text }));
+        }
+    }
+
     /// 给这段 source 换一种字型。
     pub fn mark(&mut self, range: TextRange, style: StyleId) {
         self.mark_with_priority(range, style, 0);
@@ -718,6 +853,27 @@ pub struct BlockDecorations {
 }
 
 impl BlockDecorations {
+    /// Literal projection: no Markdown substitutions, widgets or ornaments.
+    pub fn source(snapshot: &TextSnapshot, block: Block) -> Self {
+        Self {
+            range: block.range(),
+            set: DecorationSet::new(
+                snapshot.revision(),
+                snapshot.len_bytes(),
+                vec![DecorationRange {
+                    range: block.range(),
+                    decoration: Decoration::Mark { style: StyleId(0) },
+                    priority: 0,
+                }],
+            ),
+            styles: vec![
+                TextAttrs::new(yu_core::TextStyle::default())
+                    .with_font(yu_core::ThemeFont::SystemMono),
+            ],
+            line_styles: Vec::new(),
+            widgets: Vec::new(),
+        }
+    }
     /// 这份装饰覆盖的块。
     #[must_use]
     pub const fn range(&self) -> TextRange {
@@ -913,6 +1069,7 @@ impl ExtensionSet {
                 Box::new(task::Task),
                 Box::new(fenced_code::FencedCode::default()),
                 Box::new(indented_code::IndentedCode),
+                Box::new(code_controls::CodeControls),
                 Box::new(thematic_break::ThematicBreak),
                 Box::new(table::Table),
                 Box::new(emphasis::Emphasis),
@@ -920,6 +1077,8 @@ impl ExtensionSet {
                 Box::new(link::Link),
                 Box::new(image::Image),
                 Box::new(line_break::LineBreak),
+                Box::new(escape::Escape),
+                Box::new(entity::Entity),
             ],
         }
     }
@@ -960,6 +1119,7 @@ impl ExtensionSet {
         source: &TextSnapshot,
         tree: &Tree,
         references: &ReferenceDefinitionIndex,
+        presentation: &crate::PresentationTree,
         block: Block,
         active: Option<TextRange>,
     ) -> Result<BlockDecorations, ExtensionError> {
@@ -970,7 +1130,7 @@ impl ExtensionSet {
         // 这件事由树的形状保证，不再依赖任何人记得判断。
         let cx = BlockContext {
             active,
-            ..BlockContext::for_block(source, tree, references, block)
+            ..BlockContext::for_block(source, tree, references, presentation, block)
         };
 
         let source_len = source.len_bytes();
@@ -980,6 +1140,15 @@ impl ExtensionSet {
         let mut line_styles = Vec::new();
         let mut widgets = Vec::new();
         let bounds = block.range();
+        if block.kind() == crate::BlockKind::BlankLine && !bounds.is_empty() {
+            // Source separators have no display characters. An active empty
+            // paragraph gets its caret line from layout, not a rendered newline.
+            sets.push(DecorationSet::new(
+                revision,
+                source_len,
+                [DecorationRange::new(bounds, Decoration::Replace)],
+            ));
+        }
         for extension in &self.extensions {
             let mut out = ExtensionOutput::default();
             extension.decorate(&cx, &mut out);

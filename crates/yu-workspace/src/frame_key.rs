@@ -223,8 +223,11 @@ impl FrameTableResize {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameBuildKey {
     revision: u64,
+    source_mode: bool,
     composition_generation: u64,
     selections: Vec<EditorSelection>,
+    table_columns: Option<usize>,
+    table_width_generation: u64,
     search_generation: u64,
     table_resize: Option<FrameTableResize>,
     appearance: Appearance,
@@ -280,8 +283,11 @@ impl FrameBuildKey {
     ) -> Self {
         Self {
             revision,
+            source_mode: false,
             composition_generation,
             selections,
+            table_columns: None,
+            table_width_generation: 0,
             search_generation,
             table_resize,
             appearance,
@@ -303,6 +309,24 @@ pub struct FrameKey {
 }
 
 impl FrameKey {
+    #[must_use]
+    pub fn with_source_mode(mut self, enabled: bool) -> Self {
+        self.build.source_mode = enabled;
+        self
+    }
+    /// Confirmed widths alter geometry without changing Markdown revision.
+    #[must_use]
+    pub fn with_table_width_generation(mut self, generation: u64) -> Self {
+        self.build.table_width_generation = generation;
+        self
+    }
+
+    #[must_use]
+    pub fn with_table_columns(mut self, columns: Option<usize>) -> Self {
+        self.build.table_columns = columns;
+        self
+    }
+
     /// 组装一帧的身份。
     #[must_use]
     pub fn new(
@@ -404,6 +428,15 @@ mod tests {
     /// 都与自身不等，于是「没变」永远判不出来。而 `FrameGeometry::new` 已经
     /// 拒了 NaN，所以这条压的是另一半——位模式没有把相等判坏。
     #[test]
+    fn cell_selection_identity_invalidates_an_equal_text_selection_frame() {
+        let text = FrameKey::new(7, 3, Vec::new(), 2, None, Appearance::Light, geometry());
+        let cells = text.clone().with_table_columns(Some(2));
+        assert_ne!(text, cells);
+        assert_ne!(text.build(), cells.build());
+        assert_eq!(text.presentation(), cells.presentation());
+    }
+
+    #[test]
     fn the_same_state_captures_an_equal_key_twice() {
         let selections = Vec::new();
         let first = FrameKey::new(
@@ -478,6 +511,17 @@ mod tests {
         let request = FrameBuildRequest::new(first.build().clone(), 9);
         assert!(request.accepts(second.build(), 9));
         assert!(!request.accepts(second.build(), 10));
+    }
+
+    #[test]
+    fn confirmed_width_change_rejects_old_background_result_without_source_edit() {
+        let old = FrameKey::new(7, 0, Vec::new(), 0, None, Appearance::Light, geometry());
+        let new = old.clone().with_table_width_generation(1);
+        assert_ne!(old, new);
+        assert_ne!(old.build(), new.build());
+        let request = FrameBuildRequest::new(old.build().clone(), 4);
+        assert!(!request.accepts(new.build(), 4));
+        assert_eq!(old.presentation(), new.presentation());
     }
 
     #[test]

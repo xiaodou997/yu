@@ -51,9 +51,25 @@ pub struct Selections {
     revision: Revision,
     ranges: Vec<EditorSelection>,
     primary: usize,
+    table_columns: Option<usize>,
 }
 
 impl Selections {
+    /// Explicit cell-selection identity. Empty source ranges still represent
+    /// selected cells, not insertion carets. Geometry remains outside yu-state.
+    #[must_use]
+    pub const fn table_columns(&self) -> Option<usize> {
+        self.table_columns
+    }
+
+    pub fn with_table_columns(mut self, columns: usize) -> Result<Self, SelectionError> {
+        if columns == 0 || !self.ranges.len().is_multiple_of(columns) {
+            return Err(SelectionError::InvalidRange);
+        }
+        self.table_columns = Some(columns);
+        Ok(self)
+    }
+
     /// 一条选区的那一份。多光标之前的全部行为都从这里过。
     #[must_use]
     pub fn single(selection: EditorSelection) -> Self {
@@ -61,6 +77,7 @@ impl Selections {
             revision: selection.revision(),
             ranges: vec![selection],
             primary: 0,
+            table_columns: None,
         }
     }
 
@@ -138,6 +155,7 @@ impl Selections {
             revision: snapshot.revision(),
             ranges: merged.into_iter().map(|(selection, _)| selection).collect(),
             primary,
+            table_columns: None,
         })
     }
 

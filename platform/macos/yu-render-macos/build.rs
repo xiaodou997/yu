@@ -11,8 +11,36 @@ fn main() {
     if !target.ends_with("-apple-darwin") {
         return;
     }
+    let architecture = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        other => panic!("unsupported macOS architecture: {other:?}"),
+    };
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must provide OUT_DIR"));
+    let air = out_dir.join("yu_shaders.air");
+    let library = out_dir.join("yu_shaders.metallib");
+    run(
+        Command::new("xcrun")
+            .args([
+                "--sdk",
+                "macosx",
+                "metal",
+                "-c",
+                "-mmacosx-version-min=26.0",
+                "native/yu_shaders.metal",
+                "-o",
+            ])
+            .arg(&air),
+        "compile Metal shader IR",
+    );
+    run(
+        Command::new("xcrun")
+            .args(["--sdk", "macosx", "metallib"])
+            .arg(&air)
+            .arg("-o")
+            .arg(&library),
+        "link Metal library",
+    );
     let metal_object = out_dir.join("yu_metal_bridge.o");
     let image_object = out_dir.join("yu_image_bridge.o");
     let archive = out_dir.join("libyu_metal_bridge.a");
@@ -22,10 +50,12 @@ fn main() {
     run(
         Command::new("clang")
             .args([
+                "-arch",
+                architecture,
                 "-fno-objc-arc",
                 "-fblocks",
                 "-fmodules",
-                "-mmacosx-version-min=14.0",
+                "-mmacosx-version-min=26.0",
                 "-c",
             ])
             .arg(format!(
@@ -40,9 +70,11 @@ fn main() {
     run(
         Command::new("clang")
             .args([
+                "-arch",
+                architecture,
                 "-fno-objc-arc",
                 "-fmodules",
-                "-mmacosx-version-min=14.0",
+                "-mmacosx-version-min=26.0",
                 "-c",
             ])
             .arg(format!(

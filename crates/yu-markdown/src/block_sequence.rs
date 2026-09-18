@@ -106,10 +106,8 @@ pub enum BlockState {
     },
 }
 
-/// A root-level lossless CST node that refers to source without owning or
-/// normalizing its text. Container nodes currently use `BlockKind` metadata
-/// and source ranges; a nested child arena is intentionally deferred until a
-/// second consumer needs stable node identity.
+/// A lossless layout leaf with its source span. Full container ancestry lives
+/// in `PresentationTree`; this compact record remains the incremental index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Block {
     pub(crate) kind: BlockKind,

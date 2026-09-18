@@ -21,9 +21,11 @@ mod block_sequence;
 mod classify;
 mod extension;
 mod inline;
+mod presentation;
 mod reference;
 mod table;
 mod task;
+pub use presentation::{PresentationKind, PresentationNode, PresentationTree};
 
 pub use block_sequence::{
     Block, BlockCompactionPolicy, BlockKind, BlockSequence, BlockState, BlockStorageStats,
@@ -43,7 +45,7 @@ pub use inline::{
 pub use reference::{ReferenceDefinition, ReferenceDefinitionIndex};
 pub use table::{
     TableAlignment, TableBlock, TableCellAddress, TableCellRange, TableRowRange, parse_table,
-    parse_table_in_snapshot,
+    parse_table_in_snapshot, quote_table_cell_input,
 };
 pub use task::TaskMarker;
 
@@ -115,6 +117,8 @@ pub struct MarkdownDocument {
     source_len: ByteOffset,
     source: TextSnapshot,
     blocks: BlockSequence,
+    source_blocks: Option<BlockSequence>,
+    source_presentation: PresentationTree,
     references: ReferenceDefinitionIndex,
     /// 语法树。`None` **只有一种成因**：源码超过 4 GiB，`yu-syntax` 明确
     /// 拒绝（`ParseError::SourceTooLarge`，位置是 32 位的）。那种文档今天
@@ -124,11 +128,51 @@ pub struct MarkdownDocument {
     /// 做成 `Option` 而不是让 [`parse`] 返回 `Result`，是因为后者会传染到
     /// 九十多个调用方，换来的只是把一个 4 GiB 的边角情形提前几微秒报出来。
     tree: Option<Tree>,
+    presentation: std::sync::Arc<PresentationTree>,
     /// 这一版解析实际重新扫描过的源码字节数（不变量 J1 的可断言量）。
     reparsed_bytes: u32,
 }
 
 impl MarkdownDocument {
+    pub fn presentation(&self) -> &PresentationTree {
+        if self.source_mode() {
+            &self.source_presentation
+        } else {
+            &self.presentation
+        }
+    }
+
+    pub fn source_mode(&self) -> bool {
+        self.source_blocks.is_some()
+    }
+
+    pub fn semantic_presentation(&self) -> &PresentationTree {
+        &self.presentation
+    }
+
+    /// Canonical semantic blocks remain available for parsing and the outline.
+    pub fn semantic_blocks(&self) -> &BlockSequence {
+        &self.blocks
+    }
+
+    pub fn set_source_mode(&mut self, enabled: bool) {
+        self.source_blocks = enabled.then(|| {
+            BlockSequence::from_records(
+                self.blocks
+                    .resolved_records_from(0)
+                    .map(|record| block_sequence::BlockRecord {
+                        block: Block {
+                            kind: BlockKind::Paragraph,
+                            range: record.block.range(),
+                        },
+                        start_state: record.start_state,
+                        end_state: record.end_state,
+                        source_hash: record.source_hash,
+                    })
+                    .collect(),
+            )
+        });
+    }
     /// 这一版的语法树，根节点是 `Document`。
     ///
     /// 整篇只解析一次，各家共用——每个 extension 自己再解析一遍会让「同一份
@@ -165,7 +209,7 @@ impl MarkdownDocument {
 
     #[must_use]
     pub fn blocks(&self) -> &BlockSequence {
-        &self.blocks
+        self.source_blocks.as_ref().unwrap_or(&self.blocks)
     }
 
     /// Returns the source-backed link definitions for this document revision.
@@ -227,6 +271,7 @@ impl PartialEq for MarkdownDocument {
         self.revision == other.revision
             && self.source_len == other.source_len
             && self.blocks == other.blocks
+            && self.source_mode() == other.source_mode()
             && self.references == other.references
     }
 }
@@ -587,7 +632,10 @@ pub fn parse(snapshot: &TextSnapshot) -> MarkdownDocument {
         source_len: snapshot.len_bytes(),
         source: snapshot.clone(),
         references: ReferenceDefinitionIndex::from_blocks(snapshot, &blocks),
+        presentation: std::sync::Arc::new(PresentationTree::from_syntax(tree.as_ref(), snapshot)),
         blocks,
+        source_blocks: None,
+        source_presentation: PresentationTree::default(),
         tree,
         reparsed_bytes,
     }
@@ -612,6 +660,16 @@ pub fn parse_incremental(
     snapshot: &TextSnapshot,
     changes: &ChangeSet,
 ) -> Result<IncrementalParse, IncrementalParseError> {
+    let mut parsed = parse_incremental_semantic(previous, snapshot, changes)?;
+    parsed.document.set_source_mode(previous.source_mode());
+    Ok(parsed)
+}
+
+fn parse_incremental_semantic(
+    previous: &MarkdownDocument,
+    snapshot: &TextSnapshot,
+    changes: &ChangeSet,
+) -> Result<IncrementalParse, IncrementalParseError> {
     if previous.revision != changes.before() {
         return Err(IncrementalParseError::PreviousRevision {
             document: previous.revision,
@@ -631,9 +689,12 @@ pub fn parse_incremental(
             source_len: snapshot.len_bytes(),
             source: snapshot.clone(),
             blocks: previous.blocks.clone(),
+            source_blocks: None,
+            source_presentation: PresentationTree::default(),
             references: ReferenceDefinitionIndex::from_blocks(snapshot, &previous.blocks),
             // 一个字节都没改，树整棵搬过来，一次都不重扫。
             tree: previous.tree.clone(),
+            presentation: previous.presentation.clone(),
             reparsed_bytes: 0,
         };
         return Ok(IncrementalParse {
@@ -746,7 +807,10 @@ pub fn parse_incremental(
         source_len: snapshot.len_bytes(),
         source: snapshot.clone(),
         references: ReferenceDefinitionIndex::from_blocks(snapshot, &blocks),
+        presentation: std::sync::Arc::new(PresentationTree::from_syntax(tree.as_ref(), snapshot)),
         blocks,
+        source_blocks: None,
+        source_presentation: PresentationTree::default(),
         tree,
         reparsed_bytes,
     };
@@ -836,6 +900,48 @@ impl Iterator for BlockParser<'_> {
         let line = self.lines.next()?;
         if line.is_blank() {
             return Some(self.blank_record(line));
+        }
+
+        if let Some(tree) = self.tree {
+            let path = SyntaxNode::new(tree, 0).flow_path(line.start as u32);
+            let leaf = path.last().expect("root path");
+            if leaf.start() as usize >= line.end
+                || (leaf.kind().is_block_context() && (leaf.start() as usize) < line.start)
+            {
+                // A container can retain trailing quote/list continuation
+                // markers after its last semantic child. They are source
+                // separators, not another paragraph of that container.
+                return Some(self.blank_record(line));
+            }
+            let mut end = line.end;
+            let mut hash = line.source_hash;
+            // A cache/layout unit follows a semantic leaf, including its line
+            // prefixes. A container's siblings never become one paragraph.
+            while self
+                .lines
+                .peek()
+                .is_some_and(|next| next.start < leaf.end() as usize)
+            {
+                self.consume_line(&mut end, &mut hash);
+            }
+            let range = block_range(line.start, end);
+            let kind = classify::presentation_kind(&path, self.snapshot, range);
+            let end_state = match kind {
+                BlockKind::FencedCodeBlock {
+                    marker,
+                    closed: false,
+                } => BlockState::Fenced {
+                    marker,
+                    minimum: line.opening_fence().map_or(3, |fence| fence.count),
+                },
+                _ => BlockState::Normal,
+            };
+            return Some(BlockRecord {
+                block: Block { kind, range },
+                start_state: BlockState::Normal,
+                end_state,
+                source_hash: hash,
+            });
         }
 
         if let Some(fence) = line.opening_fence() {
@@ -1085,6 +1191,70 @@ pub fn list_marker(source: &TextSnapshot, block: Block) -> Option<ListMarker> {
     })
 }
 
+/// Returns the same source-backed table metadata used by visual presentation,
+/// including parser-owned quote/list prefixes. Consumers must not independently
+/// reparse the raw block: container syntax is outside the table's cells.
+#[must_use]
+pub fn table_for_block(markdown: &MarkdownDocument, block: Block) -> Option<TableBlock> {
+    if markdown.source_mode() {
+        return None;
+    }
+    if !matches!(
+        block.kind(),
+        BlockKind::Paragraph | BlockKind::BlockQuote { .. } | BlockKind::ListItem { .. }
+    ) {
+        return None;
+    }
+    let tree = markdown.tree()?;
+    let cx = extension::BlockContext::for_block(
+        markdown.source(),
+        tree,
+        markdown.reference_definitions(),
+        markdown.presentation(),
+        block,
+    );
+    extension::table::container_table(&cx)
+}
+
+/// Expand a single-character deletion to the source atom hidden by table
+/// projection. Other syntax and code spans retain their source edit behavior.
+#[must_use]
+pub fn table_atom_deletion_range(
+    markdown: &MarkdownDocument,
+    block: Block,
+    range: TextRange,
+) -> TextRange {
+    let Some(tree) = markdown.tree() else {
+        return range;
+    };
+    let cx = extension::BlockContext::for_block(
+        markdown.source(),
+        tree,
+        markdown.reference_definitions(),
+        markdown.presentation(),
+        block,
+    );
+    let Some(table) = table_for_block(markdown, block) else {
+        return range;
+    };
+    extension::table::escape_ranges(&cx, &table)
+        .into_iter()
+        .chain(extension::line_break::html_break_ranges(&cx))
+        .chain(
+            extension::entity::atoms(&cx)
+                .into_iter()
+                .map(|(range, _)| range),
+        )
+        .fold(range, |range, atom| {
+            if atom.start() < range.end() && range.start() < atom.end() && !range.is_empty() {
+                TextRange::new(range.start().min(atom.start()), range.end().max(atom.end()))
+                    .expect("union of overlapping ranges")
+            } else {
+                range
+            }
+        })
+}
+
 /// 标题的正文区间：不含结构标记的那一段。
 ///
 /// ATX 去掉行首的 `#` 前缀（连同它后面的空格）与收尾的 ` ##`，Setext 去掉
@@ -1109,6 +1279,7 @@ pub fn heading_content_range(markdown: &MarkdownDocument, block: Block) -> TextR
         markdown.source(),
         tree,
         markdown.reference_definitions(),
+        markdown.presentation(),
         block,
     );
     extension::heading::anatomy(&cx).map_or_else(|| block.range(), |anatomy| anatomy.content)
@@ -1943,18 +2114,13 @@ mod tests {
         }
     }
 
-    /// 树的叶子节点横跨两个块时，两个块都不是它。
-    ///
-    /// `foo\n-` 是一个二级 Setext 标题，而 `-` 那一行在行扫描器眼里像一个
-    /// 列表标记，于是它另起了一块。两块都认领这个标题的话，画面上会出现两
-    /// 个放大的行，第二个只有一个 `-`。
+    /// Semantic leaves remain complete even when a source line resembles a marker.
     #[test]
-    fn a_block_that_is_only_a_fragment_of_a_leaf_node_is_a_paragraph() {
+    fn semantic_leaves_are_not_fragmented_by_marker_like_lines() {
         for source in ["foo\n-\n", "foo\n- \n"] {
             let document = parse(&TextBuffer::new(source).snapshot());
-            assert_eq!(document.blocks().len(), 2, "source {source:?}");
-            assert_eq!(kind_at(&document, 0), BlockKind::Paragraph, "{source:?}");
-            assert_eq!(kind_at(&document, 1), BlockKind::Paragraph, "{source:?}");
+            assert_eq!(document.blocks().len(), 1, "source {source:?}");
+            assert_eq!(kind_at(&document, 0), BlockKind::Heading { level: 2 });
             assert!(document.has_lossless_coverage());
         }
 
@@ -1974,17 +2140,17 @@ mod tests {
         );
     }
 
-    /// 块横跨好几个树块时，树说不出它是什么，按普通段落画。
-    ///
-    /// `- a\n<div>\nx` 在行扫描器眼里是一个块（`<div>` 是列表项的惰性延续），
-    /// 在树里是 `ListItem` 加一个 `HTMLBlock`。退回行扫描器的形状会给整块画
-    /// 一个列表标记，而它的后半段根本不是列表。
     #[test]
-    fn a_block_spanning_several_tree_blocks_is_a_paragraph() {
+    fn adjacent_semantic_leaves_keep_their_own_block_identity() {
         for source in ["- a\n<div>\nx\n", "> a\n<div>\nx\n"] {
             let document = parse(&TextBuffer::new(source).snapshot());
-            assert_eq!(document.blocks().len(), 1, "source {source:?}");
-            assert_eq!(kind_at(&document, 0), BlockKind::Paragraph, "{source:?}");
+            assert_eq!(document.blocks().len(), 2, "source {source:?}");
+            assert!(matches!(
+                kind_at(&document, 0),
+                BlockKind::ListItem { .. } | BlockKind::BlockQuote { .. }
+            ));
+            assert_eq!(kind_at(&document, 1), BlockKind::HtmlBlock);
+            assert!(document.has_lossless_coverage());
         }
     }
 
@@ -2014,8 +2180,8 @@ mod tests {
     #[test]
     fn markers_that_cannot_interrupt_a_paragraph_are_paragraphs() {
         let document = parse(&TextBuffer::new("foo\n2. bar\n").snapshot());
-        assert_eq!(document.blocks().len(), 2);
-        assert_eq!(kind_at(&document, 1), BlockKind::Paragraph);
+        assert_eq!(document.blocks().len(), 1);
+        assert_eq!(kind_at(&document, 0), BlockKind::Paragraph);
     }
 
     /// 引用定义同理：`foo` 后面那一行是段落的延续，不是一条定义。
@@ -2023,8 +2189,8 @@ mod tests {
     fn a_definition_line_continuing_a_paragraph_is_not_a_definition() {
         let snapshot = TextBuffer::new("foo\n[a]: /x\n").snapshot();
         let document = parse(&snapshot);
-        assert_eq!(document.blocks().len(), 2);
-        assert_eq!(kind_at(&document, 1), BlockKind::Paragraph);
+        assert_eq!(document.blocks().len(), 1);
+        assert_eq!(kind_at(&document, 0), BlockKind::Paragraph);
         assert!(
             document.reference_definitions().definitions().is_empty(),
             "段落的延续不该进引用表"

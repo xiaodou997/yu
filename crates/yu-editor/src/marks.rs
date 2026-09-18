@@ -1,30 +1,10 @@
-//! 把重叠的 `Decoration::Mark` 压平成不重叠的样式段。
-//!
-//! # 为什么需要压平
-//!
-//! `DecorationSet` 允许 Mark 重叠且**应该**允许——`**[文字](url)**` 里外层
-//! 是加粗、内层是链接，两条 Mark 盖在一起是这件事的忠实表达。但
-//! `yu-layout::StyledRun` 要求无缝铺满且不重叠：一个视觉字节只能有一种字型。
-//!
-//! 中间这一步就在这里。它是**产品决定**，不是数据结构的性质，所以住在
-//! `yu-editor`（允许认识 Markdown 的那一层），不住在 `yu-decoration`。
-//!
-//! # 谁赢
-//!
-//! 1. **优先级高的赢**（`DecorationRange::priority`）；
-//! 2. 同优先级，**窄的赢**。
-//!
-//! 第二条就是 v1 `Projection::style_for` 的「取最内层」。它也是 link 与
-//! image 那条「正文显式排 `Plain`」之所以有效的原因：链接正文比外层的加粗窄，
-//! 所以赢。不显式说出来的话链接正文会继承外层，画面变了而不报错。
-//!
-//! 宽窄相同又同优先级时按 `StyleId` 定序——这一条不是为了「对」，是为了
-//! **确定**：两个 extension 在同一段 source 上盖了同样宽的 Mark 时，结果不
-//! 能取决于谁先跑（不变量 D6）。
+//! Compose overlapping font traits while preserving the most specific
+//! box attributes and non-plain role at the winning decoration priority.
+//! The legacy winner-only helper remains solely as a partition test oracle.
 
 use std::collections::BTreeSet;
 
-use yu_core::{ByteOffset, StyleId, TextRange};
+use yu_core::{ByteOffset, StyleId, TextAttrs, TextRange, TextRole};
 
 /// 一段 source 上胜出的样式。`None` 表示这一段没有任何 Mark 盖着。
 pub(crate) type StyleSegment = (TextRange, Option<StyleId>);
@@ -42,6 +22,7 @@ pub(crate) struct Mark {
 /// 产出**无缝铺满** `bounds`：没有 Mark 盖着的地方给一段 `None`。漏掉那些
 /// 空档会让视觉文本少掉几个字——既不 panic 也不报错，正是这个项目最怕的
 /// 那类失败。
+#[cfg(test)]
 pub(crate) fn flatten(bounds: TextRange, marks: &[Mark]) -> Vec<StyleSegment> {
     if bounds.is_empty() {
         return Vec::new();
@@ -79,6 +60,71 @@ pub(crate) fn flatten(bounds: TextRange, marks: &[Mark]) -> Vec<StyleSegment> {
         }
     }
     segments
+}
+
+/// Preserve the most specific box/size attributes while inheriting font traits
+/// and the most specific non-plain semantic role at the winning priority.
+pub(crate) fn flatten_composed(
+    bounds: TextRange,
+    marks: &[Mark],
+    styles: &mut Vec<TextAttrs>,
+) -> Vec<StyleSegment> {
+    let mut cuts = BTreeSet::from([bounds.start().get(), bounds.end().get()]);
+    for mark in marks {
+        for edge in [mark.range.start().get(), mark.range.end().get()] {
+            if bounds.start().get() < edge && edge < bounds.end().get() {
+                cuts.insert(edge);
+            }
+        }
+    }
+    let cuts: Vec<_> = cuts.into_iter().collect();
+    let mut result = Vec::new();
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let winner = winner_over(marks, from, to);
+        let composed = winner
+            .and_then(|id| styles.get(id.0 as usize).copied())
+            .map(|base| {
+                let priority = marks
+                    .iter()
+                    .filter(|m| m.range.start().get() <= from && to <= m.range.end().get())
+                    .map(|m| m.priority)
+                    .max()
+                    .unwrap_or(0);
+                let mut candidates: Vec<_> = marks
+                    .iter()
+                    .filter(|m| {
+                        m.priority == priority
+                            && m.range.start().get() <= from
+                            && to <= m.range.end().get()
+                    })
+                    .collect();
+                candidates.sort_by_key(|m| (m.range.len(), m.style.0));
+                let mut style = base.style();
+                let mut role = TextRole::Plain;
+                for mark in candidates {
+                    if let Some(attrs) = styles.get(mark.style.0 as usize) {
+                        style = style.union(attrs.style());
+                        if role == TextRole::Plain {
+                            role = attrs.role();
+                        }
+                    }
+                }
+                let attrs = base.with_style(style).with_role(role);
+                let index = styles
+                    .iter()
+                    .position(|entry| *entry == attrs)
+                    .unwrap_or_else(|| {
+                        styles.push(attrs);
+                        styles.len() - 1
+                    });
+                StyleId(u32::try_from(index).expect("style table exceeds addressable memory"))
+            });
+        if let Some(range) = TextRange::new(ByteOffset::new(from), ByteOffset::new(to)) {
+            result.push((range, composed));
+        }
+    }
+    result
 }
 
 /// `from..to` 上胜出的 Mark。`from..to` 保证不跨任何 Mark 的边界。
@@ -194,5 +240,76 @@ mod tests {
     #[test]
     fn an_empty_range_yields_nothing() {
         assert_eq!(flat((5, 5), &[]), Vec::new());
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::*;
+    use yu_core::TextStyle;
+
+    fn range(start: u64, end: u64) -> TextRange {
+        TextRange::new(ByteOffset::new(start), ByteOffset::new(end)).expect("range")
+    }
+
+    #[test]
+    fn inherited_traits_split_a_continuous_link_at_outer_boundaries() {
+        let styles = vec![
+            TextAttrs::new(TextStyle::Plain).with_role(TextRole::Link),
+            TextAttrs::new(TextStyle::Strong),
+        ];
+        let marks = [
+            Mark {
+                range: range(0, 6),
+                style: StyleId(0),
+                priority: 0,
+            },
+            Mark {
+                range: range(3, 6),
+                style: StyleId(1),
+                priority: 0,
+            },
+        ];
+        let mut forward = styles.clone();
+        let result = flatten_composed(range(0, 6), &marks, &mut forward);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, range(0, 3));
+        assert_eq!(result[1].0, range(3, 6));
+        let attrs: Vec<_> = result
+            .iter()
+            .map(|(_, id)| forward[id.expect("style").0 as usize])
+            .collect();
+        assert_eq!(attrs[0], styles[0]);
+        assert_eq!(attrs[1], styles[1].with_role(TextRole::Link));
+        let mut reverse = styles;
+        let reversed = flatten_composed(range(0, 6), &[marks[1], marks[0]], &mut reverse);
+        assert_eq!(result, reversed);
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn explicit_priority_prevents_lower_priority_trait_leaks() {
+        let mut styles = vec![
+            TextAttrs::new(TextStyle::Strong),
+            TextAttrs::new(TextStyle::Emphasis),
+        ];
+        let marks = [
+            Mark {
+                range: range(0, 6),
+                style: StyleId(0),
+                priority: 1,
+            },
+            Mark {
+                range: range(2, 4),
+                style: StyleId(1),
+                priority: 0,
+            },
+        ];
+        let result = flatten_composed(range(0, 6), &marks, &mut styles);
+        assert!(
+            result
+                .iter()
+                .all(|(_, id)| styles[id.expect("style").0 as usize].style() == TextStyle::Strong)
+        );
     }
 }

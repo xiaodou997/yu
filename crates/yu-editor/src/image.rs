@@ -194,8 +194,15 @@ impl CheckboxPlacement {
     }
 
     #[must_use]
-    pub const fn bounds(self) -> LayoutRect {
-        self.placed.bounds()
+    pub fn bounds(self) -> LayoutRect {
+        let bounds = self.placed.bounds();
+        LayoutRect::new(
+            bounds.x(),
+            bounds.y(),
+            bounds.height().min(bounds.width()),
+            bounds.height(),
+        )
+        .expect("measured checkbox bounds")
     }
 
     pub(crate) fn shifted(self, delta: i64) -> Result<Self, LayoutError> {
@@ -218,10 +225,10 @@ impl WidgetPlacements {
     ///
     /// **只有图片。** 第一版把复选框也串了进来，变异验证说那是死代码：去掉
     /// 之后全部用例照绿——因为 `BlockLayout::hit` 本来就带着
-    /// `widget_affinity`（第七刀），落在盒子哪一沿的答案两条路一样。
+    /// `boundary_affinity`（第七刀），落在盒子哪一沿的答案两条路一样。
     ///
     /// 图片需要这一道，是因为它的盒子**可以比行高**：`line_for_y` 会把落在
-    /// 图片下半部的点算到下一行去。复选框只有 0.68 个行高，撑不出这种情况。
+    /// 图片下半部的点算到下一行去。复选框高度不超过正文行高，撑不出这种情况。
     ///
     /// 而串进来不只是多余：[`BlockHit::image`] 会因此把一次复选框点击报成
     /// 「点在一张图上」，FFI 那一层照着它给平台一个图片区间。多余的代码顺手

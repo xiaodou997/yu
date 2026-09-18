@@ -341,11 +341,14 @@ impl FontRequest {
     }
 
     fn for_style(&self, style: TextStyle) -> Self {
-        match style {
-            TextStyle::Strong => self.clone().with_weight(FontWeight::Bold),
-            TextStyle::Emphasis => self.clone().with_slant(FontSlant::Italic),
-            TextStyle::Plain | TextStyle::Code => self.clone(),
+        let mut request = self.clone();
+        if style.is_strong() {
+            request = request.with_weight(FontWeight::Bold);
         }
+        if style.is_emphasis() {
+            request = request.with_slant(FontSlant::Italic);
+        }
+        request
     }
 }
 

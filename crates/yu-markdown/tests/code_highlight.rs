@@ -24,6 +24,7 @@ fn decorate(source: &str) -> BlockDecorations {
             &snapshot,
             &tree,
             document.reference_definitions(),
+            document.presentation(),
             block,
             None,
         )
@@ -234,6 +235,7 @@ fn moving_the_caret_inside_a_code_block_changes_nothing() {
             &snapshot,
             &tree,
             document.reference_definitions(),
+            document.presentation(),
             block,
             None,
         )
@@ -245,6 +247,7 @@ fn moving_the_caret_inside_a_code_block_changes_nothing() {
                 &snapshot,
                 &tree,
                 document.reference_definitions(),
+                document.presentation(),
                 block,
                 Some(active),
             )

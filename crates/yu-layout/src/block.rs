@@ -356,13 +356,14 @@ impl LineSpan {
 
 /// 一个 [`LineStyleId`] 解释之后的行级属性。
 ///
-/// 只有影响**几何**的两项在这里。背景色、前缀装饰的样子这些是画的事：
+/// 这里只包含影响几何的缩进、行高及字体行盒对齐规则。背景色、前缀装饰是绘制属性：
 /// [`LineBox`] 会把它的 [`LineStyleId`] 原样带出去，由上层拿同一张表去画。
 /// 让布局层认识「引用条是什么颜色」既没必要，也正是 E1 要挡的那种泄漏。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LineAttrs {
     indent: f32,
     line_height_scale: f32,
+    font_strut_mode: yu_core::FontStrutMode,
 }
 
 impl LineAttrs {
@@ -378,7 +379,14 @@ impl LineAttrs {
         Ok(Self {
             indent,
             line_height_scale,
+            font_strut_mode: yu_core::FontStrutMode::RunMetrics,
         })
+    }
+
+    #[must_use]
+    pub const fn with_font_struts(mut self, mode: yu_core::FontStrutMode) -> Self {
+        self.font_strut_mode = mode;
+        self
     }
 
     /// 内容从行左边缘往右让开多少。
@@ -399,6 +407,7 @@ impl Default for LineAttrs {
         Self {
             indent: 0.0,
             line_height_scale: 1.0,
+            font_strut_mode: yu_core::FontStrutMode::RunMetrics,
         }
     }
 }
@@ -622,6 +631,7 @@ impl GlyphBox {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LineBox {
     index: usize,
+    alignment_offset: f32,
     /// 内容起点 x，也就是这一行的行级缩进。空行上 caret 与 hit-test 只能
     /// 问它——问不到就把光标停在块的左边缘。
     indent: f32,
@@ -708,7 +718,7 @@ pub struct CaretBox {
     visual: VisualOffset,
     line: usize,
     point: LayoutPoint,
-    widget_affinity: Option<CaretAffinity>,
+    boundary_affinity: Option<CaretAffinity>,
     line_affinity: CaretAffinity,
 }
 
@@ -728,18 +738,13 @@ impl CaretBox {
         self.point
     }
 
-    /// 这个位置落在 widget 的哪一侧，没有 widget 参与就是 `None`。
-    ///
-    /// widget **有宽度**，所以同一个视觉偏移在它两侧是两个不同的 x：
-    /// 「图片前面」与「图片后面」。行内其余位置的两侧是同一个 x——被隐藏的
-    /// 语法在字节流里塌成一个点——落在哪一侧由行的规则（不变量 H5）决定，
-    /// 与这里无关。
-    ///
-    /// [`BlockLayout::hit`] 因此要把它带出来：点在图片右边时选的是右沿，
-    /// 而调用方光看视觉偏移分不出是哪一沿，会把光标画回图片左边。
+    /// Explicit affinity for an object edge or a split bidi boundary.
+    /// For bidi boundaries Downstream selects the primary (lower-level) edge,
+    /// while Upstream selects the other edge. Callers must preserve this
+    /// value instead of inferring a side from the source offset alone.
     #[must_use]
-    pub const fn widget_affinity(self) -> Option<CaretAffinity> {
-        self.widget_affinity
+    pub const fn boundary_affinity(self) -> Option<CaretAffinity> {
+        self.boundary_affinity
     }
 
     /// 让 [`BlockLayout::caret`] 落回**这一行**的那个 affinity。
@@ -756,6 +761,7 @@ impl CaretBox {
 /// 一个块布局好的样子。只有视觉坐标，没有源码坐标。
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockLayout {
+    inline_boxes: Vec<yu_core::InlineBoxFragment>,
     config: LayoutConfig,
     visual_len: VisualOffset,
     lines: Vec<LineBox>,
@@ -819,6 +825,8 @@ struct Measured {
     advance: f32,
     /// shaping 那条路上这个簇画出来是哪个字形。按度量排时是 `None`。
     glyph: Option<GlyphRecord>,
+    inline_before: f32,
+    inline_after: f32,
     /// 这个 grapheme 本身就是一个强制换行（UAX #14 的 BK / CR / LF / NL）。
     mandatory_break: bool,
     /// 全是空白。行尾的空白不参与「排不下」的判断，它们悬在行外。
@@ -840,7 +848,78 @@ fn is_mandatory_break_char(value: char) -> bool {
     )
 }
 
+/// Horizontal placement within each already-wrapped visual line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineAlignment {
+    Left,
+    Center,
+    Right,
+}
+
 impl BlockLayout {
+    /// Translate final line geometry together: glyphs, clusters, inline boxes,
+    /// objects and caret origins. Does not reshape or independently rewrap text.
+    pub fn align_lines(mut self, alignment: LineAlignment) -> Result<Self, LayoutError> {
+        let factor = match alignment {
+            LineAlignment::Left => 0.0,
+            LineAlignment::Center => 0.5,
+            LineAlignment::Right => 1.0,
+        };
+        if self.lines.is_empty() {
+            return Ok(self);
+        }
+        let shifts: Vec<_> = self
+            .lines
+            .iter()
+            .map(|line| {
+                (self.config.max_width() - (line.bounds.width() - line.alignment_offset)).max(0.0)
+                    * factor
+                    - line.alignment_offset
+            })
+            .collect();
+        for cluster in &mut self.clusters {
+            cluster.x += shifts[cluster.line];
+        }
+        for glyph in &mut self.glyphs {
+            glyph.origin =
+                LayoutPoint::new(glyph.origin.x() + shifts[glyph.line], glyph.origin.y());
+        }
+        for widget in &mut self.widgets {
+            let rect = widget.bounds;
+            widget.bounds = LayoutRect::new(
+                rect.x() + shifts[widget.line],
+                rect.y(),
+                rect.width(),
+                rect.height(),
+            )?;
+        }
+        for fragment in &mut self.inline_boxes {
+            let line = self
+                .lines
+                .partition_point(|line| line.visual.end() <= fragment.range.start())
+                .min(self.lines.len().saturating_sub(1));
+            let rect = fragment.bounds;
+            fragment.bounds = yu_core::Rect::new(
+                rect.x() + shifts[line],
+                rect.y(),
+                rect.width(),
+                rect.height(),
+            )?;
+        }
+        for (line, shift) in self.lines.iter_mut().zip(shifts) {
+            line.indent += shift;
+            line.alignment_offset += shift;
+            // Width includes leading alignment space, just as it includes indent;
+            // hit testing clamps against this rightmost extent.
+            line.bounds = LayoutRect::new(
+                0.0,
+                line.bounds.y(),
+                line.bounds.width() + shift,
+                line.bounds.height(),
+            )?;
+        }
+        Ok(self)
+    }
     /// 按 [`LayoutConfig`] 与调用方的度量把输入排成视觉行。
     pub fn build<T: StyleTable, M: ClusterMetrics>(
         input: LayoutInput<'_>,
@@ -883,7 +962,7 @@ impl BlockLayout {
             input,
             config,
             widgets,
-            line_styles,
+            (styles, line_styles),
             &bidi,
             visual_len,
             measured,
@@ -914,19 +993,162 @@ impl BlockLayout {
         L: LineStyleTable,
         S: ShapingProvider,
     {
+        if let Some(provider) = shaper.paragraph_provider() {
+            return Self::build_native(input, config, styles, widgets, line_styles, provider);
+        }
         let (visual_len, bidi) = Self::prepare(input, config)?;
         let (measured, substituted) = measure_shaped(input, styles, shaper, &bidi)?;
         let mut layout = Self::assemble(
             input,
             config,
             widgets,
-            line_styles,
+            (styles, line_styles),
             &bidi,
             visual_len,
             measured,
         )?;
         layout.substituted = substituted;
         Ok(layout)
+    }
+
+    fn build_native<T: StyleTable, W: WidgetMeasure, L: LineStyleTable>(
+        input: LayoutInput<'_>,
+        config: LayoutConfig,
+        styles: &T,
+        widgets: &W,
+        line_styles: &L,
+        provider: &dyn yu_core::ParagraphLayoutProvider,
+    ) -> Result<Self, LayoutError> {
+        config.validate()?;
+        let visual_len =
+            VisualOffset::try_from(input.text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
+        validate_runs(input, visual_len)?;
+        validate_widgets(input, visual_len)?;
+        let line_attrs = resolve_line_styles(input, line_styles)?;
+        let attrs = line_attrs
+            .first()
+            .map_or(LineAttrs::default(), |entry| entry.2);
+        let sizes = measure_widgets(input, config, widgets)?;
+        let request = yu_core::ParagraphInput {
+            font_strut_mode: attrs.font_strut_mode,
+            text: input.text,
+            base_direction: config.base_direction(),
+            width: config.max_width(),
+            indent: attrs.indent(),
+            line_height: config.line_height() * attrs.line_height_scale(),
+            runs: input
+                .runs
+                .iter()
+                .map(|run| {
+                    Ok(yu_core::ParagraphRun {
+                        range: run.visual,
+                        style: run.style,
+                        attrs: styles
+                            .attrs(run.style)
+                            .ok_or(LayoutError::UnknownStyle(run.style))?,
+                    })
+                })
+                .collect::<Result<_, LayoutError>>()?,
+            objects: input
+                .widgets
+                .iter()
+                .zip(&sizes)
+                .map(|(span, measurement)| {
+                    let metrics = measurement.metrics();
+                    yu_core::ParagraphObject {
+                        offset: span.visual,
+                        id: span.widget,
+                        side: span.side,
+                        size: metrics.size(),
+                        baseline: metrics.baseline(),
+                        ready: measurement.is_ready(),
+                    }
+                })
+                .collect(),
+        };
+        let native = provider.layout(&request).map_err(LayoutError::Shaping)?;
+        let mut result = Self {
+            config,
+            visual_len,
+            lines: Vec::new(),
+            clusters: Vec::new(),
+            widgets: Vec::new(),
+            glyphs: Vec::new(),
+            inline_boxes: Vec::new(),
+            line_attrs,
+            substituted: 0,
+        };
+        for (index, line) in native.lines.iter().enumerate() {
+            let cluster_start = result.clusters.len();
+            let widget_start = result.widgets.len();
+            let start = native
+                .clusters
+                .partition_point(|cluster| cluster.line < index);
+            let end = native
+                .clusters
+                .partition_point(|cluster| cluster.line <= index);
+            for cluster in &native.clusters[start..end] {
+                result.clusters.push(ClusterBox {
+                    visual: cluster.range,
+                    line: index,
+                    style: cluster.style,
+                    x: cluster.leading.min(cluster.trailing),
+                    width: (cluster.trailing - cluster.leading).abs(),
+                    line_break: cluster.line_break,
+                    level: u8::from(cluster.leading > cluster.trailing),
+                });
+            }
+            let start = native.objects.partition_point(|object| object.line < index);
+            let end = native
+                .objects
+                .partition_point(|object| object.line <= index);
+            for object in &native.objects[start..end] {
+                let value = request
+                    .objects
+                    .get(object.index)
+                    .ok_or(LayoutError::WidgetNotAnchored)?;
+                result.widgets.push(WidgetBox {
+                    widget: value.id,
+                    visual: value.offset,
+                    side: value.side,
+                    line: index,
+                    bounds: LayoutRect::new(
+                        object.x,
+                        object.y,
+                        value.size.width(),
+                        value.size.height(),
+                    )?,
+                    baseline: value.baseline,
+                    ready: value.ready,
+                });
+            }
+            result.lines.push(LineBox {
+                index,
+                alignment_offset: 0.0,
+                indent: request.indent,
+                visual: line.range,
+                bounds: line.bounds,
+                baseline: line.baseline,
+                style: result.line_attrs.first().map(|entry| entry.1),
+                clusters: cluster_start..result.clusters.len(),
+                widgets: widget_start..result.widgets.len(),
+            });
+        }
+        result.inline_boxes = native.inline_boxes.clone();
+        result.glyphs = native
+            .glyphs
+            .iter()
+            .map(|glyph| GlyphBox {
+                face: glyph.face,
+                glyph: glyph.glyph,
+                visual: glyph.range,
+                line: glyph.line,
+                origin: LayoutPoint::new(glyph.x, glyph.y),
+                style: glyph.style,
+                size_scale: glyph.size_scale,
+            })
+            .collect();
+        Ok(result)
     }
 
     fn prepare<'a>(
@@ -946,11 +1168,11 @@ impl BlockLayout {
 
     /// 断行、摆 widget、重排、放字形。两条度量路径共用这一段——共用代码
     /// 路径的差分是自证的，所以它只写一遍。
-    fn assemble<W, L>(
+    fn assemble<W, L, T>(
         input: LayoutInput<'_>,
         config: LayoutConfig,
         widgets: &W,
-        line_styles: &L,
+        style_tables: (&T, &L),
         bidi: &BidiInfo<'_>,
         visual_len: VisualOffset,
         measured: Vec<Measured>,
@@ -958,7 +1180,9 @@ impl BlockLayout {
     where
         W: WidgetMeasure,
         L: LineStyleTable,
+        T: StyleTable,
     {
+        let (styles, line_styles) = style_tables;
         let segment_starts = segment_starts(input.text, &measured)?;
         let sizes = measure_widgets(input, config, widgets)?;
         let line_attrs = resolve_line_styles(input, line_styles)?;
@@ -970,6 +1194,7 @@ impl BlockLayout {
             clusters: Vec::new(),
             widgets: Vec::new(),
             glyphs: Vec::new(),
+            inline_boxes: Vec::new(),
             line_attrs,
             substituted: 0,
         };
@@ -1067,8 +1292,89 @@ impl BlockLayout {
             )?;
         }
         layout.reorder_for_bidi(input.text(), bidi)?;
+        // Widths include the box edges for wrapping; carets and glyphs refer
+        // to the text edges, including when logical start is physically right.
+        for (cluster, item) in layout.clusters.iter_mut().zip(&measured) {
+            cluster.x += if cluster.level % 2 == 0 {
+                item.inline_before
+            } else {
+                item.inline_after
+            };
+            cluster.width -= item.inline_before + item.inline_after;
+        }
+        layout.resolve_inline_boxes(styles, &measured)?;
         layout.place_glyphs(&measured)?;
         Ok(layout)
+    }
+
+    #[must_use]
+    pub fn inline_boxes(&self) -> &[yu_core::InlineBoxFragment] {
+        &self.inline_boxes
+    }
+
+    fn resolve_inline_boxes<T: StyleTable>(
+        &mut self,
+        styles: &T,
+        measured: &[Measured],
+    ) -> Result<(), LayoutError> {
+        let mut fragments: std::collections::BTreeMap<(u64, usize), yu_core::InlineBoxFragment> =
+            std::collections::BTreeMap::new();
+        for (cluster, item) in self.clusters.iter().zip(measured) {
+            let attrs = styles
+                .attrs(cluster.style)
+                .ok_or(LayoutError::UnknownStyle(cluster.style))?;
+            let Some(id) = attrs.inline_box_id().filter(|_| attrs.inline_inset() > 0.0) else {
+                continue;
+            };
+            if cluster.line_break {
+                continue;
+            }
+            let rtl = cluster.level % 2 != 0;
+            let left = if rtl {
+                item.inline_after
+            } else {
+                item.inline_before
+            };
+            let right = if rtl {
+                item.inline_before
+            } else {
+                item.inline_after
+            };
+            let line = &self.lines[cluster.line];
+            let font_height = self.config.line_height() * attrs.size_scale();
+            let bounds = yu_core::Rect::new(
+                cluster.x - left,
+                line.bounds.y() + line.baseline - font_height * 0.8 - attrs.inline_inset_y(),
+                cluster.width + left + right,
+                font_height + 2.0 * attrs.inline_inset_y(),
+            )?;
+            let fragment =
+                fragments
+                    .entry((id, cluster.line))
+                    .or_insert(yu_core::InlineBoxFragment {
+                        id,
+                        range: cluster.visual,
+                        bounds,
+                        left_edge: false,
+                        right_edge: false,
+                    });
+            let x = fragment.bounds.x().min(bounds.x());
+            let y = fragment.bounds.y().min(bounds.y());
+            let end_x =
+                (fragment.bounds.x() + fragment.bounds.width()).max(bounds.x() + bounds.width());
+            let end_y =
+                (fragment.bounds.y() + fragment.bounds.height()).max(bounds.y() + bounds.height());
+            fragment.bounds = yu_core::Rect::new(x, y, end_x - x, end_y - y)?;
+            fragment.range = VisualRange::new(
+                fragment.range.start().min(cluster.visual.start()),
+                fragment.range.end().max(cluster.visual.end()),
+            )
+            .ok_or(LayoutError::OffsetOverflow)?;
+            fragment.left_edge |= left > 0.0;
+            fragment.right_edge |= right > 0.0;
+        }
+        self.inline_boxes = fragments.into_values().collect();
+        Ok(())
     }
 
     /// 字形跟着它的簇走。位置在重排**之后**才算——重排改的就是簇的 x，
@@ -1190,14 +1496,9 @@ impl BlockLayout {
     /// 落在一个 grapheme **内部**的偏移不是合法的 caret 位置，返回该 grapheme
     /// 前进方向上的起点。
     ///
-    /// # 方向变化处只给一个位置
-    ///
-    /// 方向变化处的一个视觉偏移在几何上对应**两个**位置：前一段的后沿与
-    /// 后一段的前沿。这里按 UAX #9 §3.4 的做法取**层级更低**（更接近段落
-    /// 基准方向）的那一侧。于是边界两侧的两个几何位置分别归属两个不同的
-    /// 偏移，都够得着；代价是同一个偏移的另一个位置画不出来。要两个都给，
-    /// caret 得再带一个方向参数，那是独立的一件事，见 overview-v2 §8 S5 的
-    /// 登记。
+    /// At a split bidi boundary Downstream selects the lower-level primary
+    /// edge and Upstream selects the secondary edge. Both positions use the
+    /// same immutable cluster geometry as hit testing.
     pub fn caret(
         &self,
         visual: VisualOffset,
@@ -1237,19 +1538,23 @@ impl BlockLayout {
                 visual,
                 line: line_index,
                 point: LayoutPoint::new(x, line.bounds.y()),
-                widget_affinity: Some(affinity),
+                boundary_affinity: Some(affinity),
                 line_affinity: affinity,
             });
         }
+        let secondary = secondary_caret_x(before, after);
         let x = match (before, after, inside) {
             (None, None, None) => self.content_start(line),
+            _ if affinity == CaretAffinity::Upstream && secondary.is_some() => {
+                secondary.expect("checked secondary boundary")
+            }
             _ => caret_x(before, after, inside),
         };
         Ok(CaretBox {
             visual,
             line: line_index,
             point: LayoutPoint::new(x, line.bounds.y()),
-            widget_affinity: None,
+            boundary_affinity: secondary.map(|_| affinity),
             line_affinity: affinity,
         })
     }
@@ -1301,6 +1606,10 @@ impl BlockLayout {
                 Some((best_distance, best_position)) => {
                     distance < best_distance
                         || (distance == best_distance && position.x > best_position.x)
+                        || (distance == best_distance
+                            && position.x == best_position.x
+                            && position.boundary_affinity.is_some()
+                            && best_position.boundary_affinity.is_none())
                 }
             };
             if better {
@@ -1311,7 +1620,7 @@ impl BlockLayout {
             || CaretPosition {
                 x: self.content_start(line),
                 visual: line.visual.start(),
-                widget_affinity: None,
+                boundary_affinity: None,
             },
             |(_, position)| position,
         );
@@ -1327,8 +1636,8 @@ impl BlockLayout {
             visual: position.visual,
             line: line_index,
             point: LayoutPoint::new(position.x, line.bounds.y()),
-            widget_affinity: position.widget_affinity,
-            line_affinity,
+            boundary_affinity: position.boundary_affinity,
+            line_affinity: position.boundary_affinity.unwrap_or(line_affinity),
         })
     }
 
@@ -1344,11 +1653,19 @@ impl BlockLayout {
             let cluster = self.clusters[index];
             if !cluster.line_break {
                 let matching = before.filter(|prev| prev.visual.end() == cluster.visual.start());
+                let secondary = secondary_caret_x(matching, Some(cluster));
                 positions.push(CaretPosition {
                     x: caret_x(matching, Some(cluster), None),
                     visual: cluster.visual.start(),
-                    widget_affinity: None,
+                    boundary_affinity: secondary.map(|_| CaretAffinity::Downstream),
                 });
+                if let Some(x) = secondary {
+                    positions.push(CaretPosition {
+                        x,
+                        visual: cluster.visual.start(),
+                        boundary_affinity: Some(CaretAffinity::Upstream),
+                    });
+                }
             }
             before = Some(cluster);
         }
@@ -1363,7 +1680,7 @@ impl BlockLayout {
             positions.push(CaretPosition {
                 x: caret_x(Some(last), None, None),
                 visual: last.visual.end(),
-                widget_affinity: None,
+                boundary_affinity: None,
             });
         }
         // widget 的两沿。一行上只有一个 widget、周围一个簇都没有时（整段就
@@ -1382,12 +1699,12 @@ impl BlockLayout {
             positions.push(CaretPosition {
                 x: left,
                 visual: anchor,
-                widget_affinity: Some(CaretAffinity::Upstream),
+                boundary_affinity: Some(CaretAffinity::Upstream),
             });
             positions.push(CaretPosition {
                 x: right,
                 visual: anchor,
-                widget_affinity: Some(CaretAffinity::Downstream),
+                boundary_affinity: Some(CaretAffinity::Downstream),
             });
         }
         positions
@@ -1608,6 +1925,7 @@ impl BlockLayout {
         }
         self.lines.push(LineBox {
             index: cursor.index,
+            alignment_offset: 0.0,
             indent: cursor.indent,
             visual,
             bounds: LayoutRect::new(0.0, y, cursor.width, height)?,
@@ -1673,7 +1991,9 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
             let advance = if mandatory_break {
                 0.0
             } else {
-                metrics.advance(cluster_text, attrs.style()) * attrs.size_scale()
+                (metrics.advance(cluster_text, attrs.style()) * attrs.size_scale()
+                    + attrs.letter_spacing())
+                .max(0.0)
             };
             if !advance.is_finite() || advance < 0.0 {
                 return Err(LayoutError::InvalidMetrics(advance.to_bits()));
@@ -1683,12 +2003,15 @@ fn measure<T: StyleTable, M: ClusterMetrics>(
                 style: run.style(),
                 advance,
                 glyph: None,
+                inline_before: 0.0,
+                inline_after: 0.0,
                 mandatory_break,
                 space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
                 level: bidi.levels[start + local].number(),
             });
         }
     }
+    apply_inline_insets(&mut measured, styles)?;
     Ok(measured)
 }
 
@@ -1828,6 +2151,8 @@ fn measured_from_shaped(
                     y_offset: glyph.y_offset(),
                     size_scale: attrs.size_scale(),
                 }),
+                inline_before: 0.0,
+                inline_after: 0.0,
                 mandatory_break,
                 space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
                 level: bidi.levels[base + from].number(),
@@ -1911,6 +2236,8 @@ fn substitute_run<S: ShapingProvider>(
                 y_offset: 0.0,
                 size_scale: attrs.size_scale(),
             }),
+            inline_before: 0.0,
+            inline_after: 0.0,
             mandatory_break,
             space: !mandatory_break && cluster_text.chars().all(char::is_whitespace),
             level: bidi.levels[base].number(),
@@ -1977,7 +2304,36 @@ fn measure_shaped<T: StyleTable, S: ShapingProvider>(
             }
         }
     }
+    apply_inline_insets(&mut measured, styles)?;
     Ok((measured, substituted))
+}
+
+fn apply_inline_insets<T: StyleTable>(
+    measured: &mut [Measured],
+    styles: &T,
+) -> Result<(), LayoutError> {
+    let mut spans = std::collections::BTreeMap::new();
+    for (index, cluster) in measured.iter().enumerate() {
+        let attrs = styles
+            .attrs(cluster.style)
+            .ok_or(LayoutError::UnknownStyle(cluster.style))?;
+        if cluster.mandatory_break {
+            continue;
+        }
+        if let Some(id) = attrs.inline_box_id().filter(|_| attrs.inline_inset() > 0.0) {
+            let entry = spans
+                .entry(id)
+                .or_insert((index, index, attrs.inline_inset()));
+            entry.1 = index;
+        }
+    }
+    for (_, (first, last, inset)) in spans {
+        measured[first].advance += inset;
+        measured[first].inline_before = inset;
+        measured[last].advance += inset;
+        measured[last].inline_after = inset;
+    }
+    Ok(())
 }
 
 /// shaping 的零基局部空间。见 [`BlockLayout::build_shaped`]。
@@ -2028,7 +2384,21 @@ fn segment_starts(text: &str, measured: &[Measured]) -> Result<Vec<usize>, Layou
 struct CaretPosition {
     x: f32,
     visual: VisualOffset,
-    widget_affinity: Option<CaretAffinity>,
+    boundary_affinity: Option<CaretAffinity>,
+}
+
+fn secondary_caret_x(before: Option<ClusterBox>, after: Option<ClusterBox>) -> Option<f32> {
+    let (before, after) = (before?, after?);
+    if before.level % 2 == after.level % 2
+        || (before.trailing_x() - after.leading_x()).abs() <= 0.001
+    {
+        return None;
+    }
+    Some(if before.level <= after.level {
+        after.leading_x()
+    } else {
+        before.trailing_x()
+    })
 }
 
 fn caret_x(
@@ -3279,15 +3649,15 @@ mod tests {
             .expect("caret");
         assert_eq!(before.point().x(), 1.0, "'a' 的后沿，也是盒子的左沿");
         assert_eq!(after.point().x(), 4.0, "盒子的右沿，也是 'b' 的前沿");
-        assert_eq!(before.widget_affinity(), Some(CaretAffinity::Upstream));
-        assert_eq!(after.widget_affinity(), Some(CaretAffinity::Downstream));
+        assert_eq!(before.boundary_affinity(), Some(CaretAffinity::Upstream));
+        assert_eq!(after.boundary_affinity(), Some(CaretAffinity::Downstream));
 
         // 点在盒子右半边要落到右沿，而且要说得出「落在右侧」——调用方光看
         // 视觉偏移分不出是哪一沿。
         let hit = layout.hit(LayoutPoint::new(3.5, 0.0)).expect("hit");
         assert_eq!(hit.visual(), visual);
         assert_eq!(hit.point().x(), 4.0);
-        assert_eq!(hit.widget_affinity(), Some(CaretAffinity::Downstream));
+        assert_eq!(hit.boundary_affinity(), Some(CaretAffinity::Downstream));
     }
 
     /// 整块就是一个 widget 时，两侧的位置仍然点得到。
@@ -3309,10 +3679,10 @@ mod tests {
         assert_eq!(layout.clusters().len(), 0);
         let right = layout.hit(LayoutPoint::new(5.0, 0.0)).expect("hit");
         assert_eq!(right.point().x(), 6.0);
-        assert_eq!(right.widget_affinity(), Some(CaretAffinity::Downstream));
+        assert_eq!(right.boundary_affinity(), Some(CaretAffinity::Downstream));
         let left = layout.hit(LayoutPoint::new(1.0, 0.0)).expect("hit");
         assert_eq!(left.point().x(), 0.0);
-        assert_eq!(left.widget_affinity(), Some(CaretAffinity::Upstream));
+        assert_eq!(left.boundary_affinity(), Some(CaretAffinity::Upstream));
     }
 
     /// widget 的基线必须落在盒子里。越界会让它挂到别的行上去。
@@ -3649,7 +4019,7 @@ mod tests {
                 let hit = layout.hit(LayoutPoint::new(x, 0.0)).expect("hit");
                 assert_eq!(hit.point().x(), x, "命中点应当落在那条边上");
                 let caret = layout
-                    .caret(hit.visual(), CaretAffinity::Downstream)
+                    .caret(hit.visual(), hit.line_affinity())
                     .expect("caret");
                 assert_eq!(
                     caret.point(),
@@ -3694,6 +4064,28 @@ mod tests {
                 .point(),
             LayoutPoint::new(8.0, 0.0)
         );
+    }
+
+    #[test]
+    fn bidi_boundary_exposes_both_edges_with_round_trip_affinity() {
+        let layout = build_with("abc שלום def", 80.0, BaseDirection::Auto);
+        for (offset, primary, secondary) in [(4, 4.0, 8.0), (12, 8.0, 4.0)] {
+            for (affinity, x) in [
+                (CaretAffinity::Downstream, primary),
+                (CaretAffinity::Upstream, secondary),
+            ] {
+                let caret = layout
+                    .caret(VisualOffset::new(offset), affinity)
+                    .expect("caret");
+                assert_eq!(caret.point().x(), x);
+                assert_eq!(caret.boundary_affinity(), Some(affinity));
+                let hit = layout.hit(caret.point()).expect("hit");
+                let restored = layout
+                    .caret(hit.visual(), hit.line_affinity())
+                    .expect("restored");
+                assert_eq!(restored.point(), caret.point());
+            }
+        }
     }
 
     /// RTL 行的行首 caret 在**右**边缘。这是「前进方向上的起点」与
@@ -3769,5 +4161,48 @@ mod tests {
             .caret(VisualOffset::new(3), CaretAffinity::Downstream)
             .expect("caret");
         assert_eq!(boundary.point(), LayoutPoint::new(1.0, 0.0));
+    }
+
+    #[test]
+    fn multiline_alignment_moves_carets_and_hit_testing_per_line_without_drift() {
+        use super::LineAlignment;
+        let text = "a\nlong";
+        let base = build(text, &plain(text), 10.0).expect("layout");
+        let right = base
+            .clone()
+            .align_lines(LineAlignment::Right)
+            .expect("align");
+        let first = right
+            .caret(VisualOffset::new(0), CaretAffinity::Downstream)
+            .expect("first");
+        let second = right
+            .caret(VisualOffset::new(2), CaretAffinity::Downstream)
+            .expect("second");
+        assert_eq!(first.point().x(), 9.0);
+        assert_eq!(second.point().x(), 6.0);
+        assert_eq!(
+            right
+                .hit(LayoutPoint::new(9.0, first.point().y()))
+                .expect("hit")
+                .visual(),
+            VisualOffset::new(0)
+        );
+        let centered = right.align_lines(LineAlignment::Center).expect("center");
+        assert_eq!(
+            centered
+                .caret(VisualOffset::new(0), CaretAffinity::Downstream)
+                .expect("caret")
+                .point()
+                .x(),
+            4.5
+        );
+        let twice = centered
+            .clone()
+            .align_lines(LineAlignment::Center)
+            .expect("center twice");
+        assert_eq!(centered.clusters(), twice.clusters());
+        let reset = twice.align_lines(LineAlignment::Left).expect("left");
+        assert_eq!(base.clusters(), reset.clusters());
+        assert_eq!(base.lines(), reset.lines());
     }
 }

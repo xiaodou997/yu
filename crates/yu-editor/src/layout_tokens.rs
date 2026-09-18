@@ -21,50 +21,61 @@
 use yu_layout::{LayoutConfig, LayoutError, LayoutRect};
 use yu_markdown::BlockKind;
 
-/// 代码块（围栏与缩进共用）水平内边距，单位 pt。
-///
-/// 用途有两处，必须同源：断行宽度收窄为「列宽 − 2×本值」（
-/// [`box_layout_config`]），背景矩形从内容盒每侧外扩本值（
-/// [`code_block_background_rect`]）。M4 的背景填充按后者画。
-pub const CODE_BLOCK_PADDING_X: f32 = 14.0;
-
-/// 代码块（围栏与缩进共用）垂直内边距，**每侧** 5pt、上下共 10pt（照抄
-/// Typora 的上下对称）。这 10pt 不计入代码文字的行盒，而是一次性折进块高
-/// 贡献（见 `EditorDocument::block_box_height`）；背景矩形因此比内容高 10pt，
-/// 文字在背景里垂直居中。
-pub const CODE_BLOCK_PADDING_Y: f32 = 5.0;
-
-/// 引用块水平内边距，单位 pt（照抄 Typora）。待遇与代码块相同：收窄断行宽度、
-/// 内容右移、背景矩形每侧外扩（[`quote_block_background_rect`]）。
-pub const QUOTE_BLOCK_PADDING_X: f32 = 12.0;
+/// Resolved code box edges in logical points at the current zoom.
+#[derive(Clone, Copy, Debug)]
+pub struct CodeInsets {
+    pub left: f32,
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+impl CodeInsets {
+    pub fn new(config: LayoutConfig) -> Self {
+        let spec = config.theme().spec();
+        let zoom = config.line_height() / spec.body_size;
+        Self {
+            left: (spec.code_padding_left + spec.code_border_width) * zoom,
+            right: (spec.code_padding_right + spec.code_border_width) * zoom,
+            top: (spec.code_padding_top + spec.code_border_width) * zoom,
+            bottom: (spec.code_padding_bottom + spec.code_border_width) * zoom,
+        }
+    }
+}
 
 /// 正文行高倍率：段落、引用块、列表项共用。
 ///
 /// Typora 正文 16–17px 配行高 1.6。它同时也是块间距表的「一行」的定义：
 /// `BLOCK_SPACING_*` 里的 `1.0` = 一行正文高 = `line_height × 1.6`。
-pub const LINE_HEIGHT_BODY: f32 = 1.6;
+pub const LINE_HEIGHT_BODY: f32 = yu_core::ThemeSpec::GITHUB.body_line_ratio;
+
+/// Resolve theme line height after zoom without accumulating per-line rounding.
+/// Current fingerprinted Typora references retain fractional line heights.
+/// Keep exact integers stable against floating-point multiplication error.
+#[must_use]
+pub fn resolved_line_height(config: LayoutConfig, scale: f32) -> f32 {
+    let height = config.line_height() * scale;
+    // Ratios such as Night H2's 1.875 / 1.63 must resolve to 30pt,
+    // not 29pt because f32 multiplication landed one ULP below an integer.
+    let nearest = height.round();
+    let stable = if (height - nearest).abs() <= height.abs() * f32::EPSILON * 2.0 {
+        nearest
+    } else {
+        height
+    };
+    stable.max(1.0)
+}
 
 /// 代码块行高倍率。代码字号更小（等宽），行高反而略松：1.65 让长代码块不
 /// 那么压迫，也是 Typora 系主题的常见取值。
-pub const LINE_HEIGHT_CODE: f32 = 1.65;
-
-/// 一、二级标题的行高倍率。大字号标题的行盒按正文字号推会过高，1.3 压到
-/// 接近「字号 + 一点喘息」，h1/h2 共用。
-pub const LINE_HEIGHT_HEADING_1_2: f32 = 1.3;
-
-/// 三至六级标题的行高倍率。字号更接近正文，行盒可以略紧，1.25 统一四档
-/// （h3–h6 的字号差由 [`heading_font_scale`] 体现，行高不再分档）。
-pub const LINE_HEIGHT_HEADING_3_6: f32 = 1.25;
+pub const LINE_HEIGHT_CODE: f32 =
+    yu_core::ThemeSpec::GITHUB.code_line_ratio * yu_core::ThemeSpec::GITHUB.code_block_size_ratio;
 
 /// 标题字号倍率，按下标 0..6 对应 h1..h6（正文 = 1.0）。
 ///
 /// h1 是正文的两倍；h2 起逐级收缩，h5/h6 已经只比正文大一点点——再往下
 /// 就分不清是标题还是加粗段落了。排版上标题一律按 `Strong` 出字型
 /// （`heading` extension 的语义，组装时统一替换，见 `blockinput.rs`）。
-pub const HEADING_FONT_SCALE: [f32; 6] = [2.0, 1.6, 1.35, 1.2, 1.05, 1.05];
-
-/// h1/h2 的 [`HEADING_FONT_SCALE`] 下标（含）。
-const HEADING_LARGE_MAX_LEVEL: u8 = 2;
+pub const HEADING_FONT_SCALE: [f32; 6] = yu_core::ThemeSpec::GITHUB.heading_sizes;
 
 /// 标题字号倍率。`level` 必须在 1..=6，越界返回 `None`——调用方把它当
 /// 配置错误处理，而不是默默落回正文。
@@ -76,18 +87,13 @@ pub fn heading_font_scale(level: u8) -> Option<f32> {
     Some(HEADING_FONT_SCALE[usize::from(level - 1)])
 }
 
-/// 标题行高倍率：h1/h2 用 [`LINE_HEIGHT_HEADING_1_2`]，h3–h6 用
-/// [`LINE_HEIGHT_HEADING_3_6`]。`level` 越界返回 `None`。
+/// Per-heading line ratio from the resolved native theme.
 #[must_use]
 pub fn heading_line_height_scale(level: u8) -> Option<f32> {
     if !(1..=6).contains(&level) {
         return None;
     }
-    Some(if level <= HEADING_LARGE_MAX_LEVEL {
-        LINE_HEIGHT_HEADING_1_2
-    } else {
-        LINE_HEIGHT_HEADING_3_6
-    })
+    Some(yu_core::ThemeSpec::GITHUB.heading_lines[usize::from(level - 1)])
 }
 
 /// 这一块是不是代码块（围栏或缩进）。两种拼法是同一种东西——盒模型的
@@ -101,13 +107,28 @@ pub const fn is_code_block(kind: BlockKind) -> bool {
     )
 }
 
-/// 这一块是不是列表项（含任务项）。间距折叠用它识别「列表内连续 item」。
-#[must_use]
-pub const fn is_list_item(kind: BlockKind) -> bool {
-    matches!(
-        kind,
-        BlockKind::ListItem { .. } | BlockKind::TaskListItem { .. }
-    )
+/// Shared container advances for paragraphs and published container borders.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContainerMetrics {
+    pub list_indent: f32,
+    pub quote_indent: f32,
+    pub quote_border: f32,
+    pub quote_margin_left: f32,
+}
+impl ContainerMetrics {
+    pub fn new(config: LayoutConfig) -> Self {
+        let theme = config.theme().spec();
+        let zoom = config.line_height() / theme.body_size;
+        Self {
+            list_indent: theme.list_indent * zoom,
+            quote_indent: (theme.quote_margin_left
+                + theme.quote_padding
+                + theme.quote_border_width)
+                * zoom,
+            quote_margin_left: theme.quote_margin_left * zoom,
+            quote_border: theme.quote_border_width * zoom,
+        }
+    }
 }
 
 /// 块的段前/段后间距，单位是「一行正文高」（`line_height × LINE_HEIGHT_BODY`）
@@ -126,129 +147,145 @@ const fn spacing(before: f32, after: f32) -> BlockSpacing {
     BlockSpacing { before, after }
 }
 
-/// 按块类取段前/段后间距（正文行高的倍数）。
-///
-/// 取值的锚是 Typora 系主题在 16px 正文、行高 1.6（一行 ≈ 25.6px）下的
-/// em 间距，换算成「行」的倍数：
-///
-/// | 块类                | 段前/段后（行） | ≈ px（@25.6px/行） | 对应 Typora 的 em 值  |
-/// |--------------------|----------------|--------------------|-----------------------|
-/// | h1                 | 0.90 / 0.45    | 23 / 12            | 1.4em / 0.75em        |
-/// | h2                 | 0.75 / 0.40    | 19 / 10            | 1.2em / 0.6em         |
-/// | h3                 | 0.65 / 0.35    | 17 / 9             | 1.0em / 0.55em        |
-/// | h4                 | 0.55 / 0.30    | 14 / 8             | 0.9em / 0.5em         |
-/// | h5                 | 0.50 / 0.25    | 13 / 6             | 0.8em / 0.4em          |
-/// | h6                 | 0.45 / 0.20    | 12 / 5             | 0.7em / 0.3em         |
-/// | 代码块（两种拼法）  | 0.60 / 0.60    | 15 / 15            | 约 1em                |
-/// | 引用块             | 0.60 / 0.60    | 15 / 15            | 约 1em                |
-/// | 列表项（列表边界用）| 0.40 / 0.40    | 10 / 10            | 约 0.65em             |
-/// | 分隔线             | 0.80 / 0.80    | 20 / 20            | 约 1.25em             |
-///
-/// **Paragraph 是 0/0，这是有意设计**：源码空行本身是一块、有高（一行），
-/// 已经提供了段落分隔；再给 Paragraph 加 margin 就是双倍间距。结构性块
-/// （标题/代码/引用/分隔线/列表）的间距照常在空行之上叠加——空行给「一行」，
-/// margin 给「结构感」，两者不冲突。
+/// Resolved block margins in body-line units. CSS rem/em values are
+/// interpreted once here; source separator lines never contribute margins.
 #[must_use]
-pub const fn block_spacing(kind: BlockKind) -> BlockSpacing {
+pub fn block_spacing(kind: BlockKind, theme: yu_core::ThemeId) -> BlockSpacing {
+    let spec = theme.spec();
+    let body = spec.body_line_ratio;
     match kind {
-        BlockKind::Heading { level } => match level {
-            1 => spacing(0.9, 0.45),
-            2 => spacing(0.75, 0.4),
-            3 => spacing(0.65, 0.35),
-            4 => spacing(0.55, 0.3),
-            5 => spacing(0.5, 0.25),
-            // h6 与防御性兜底（level 已由解析器约束在 1..=6）。
-            _ => spacing(0.45, 0.2),
-        },
-        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode => spacing(0.6, 0.6),
-        BlockKind::BlockQuote { .. } => spacing(0.6, 0.6),
-        BlockKind::ListItem { .. } | BlockKind::TaskListItem { .. } => spacing(0.4, 0.4),
-        BlockKind::ThematicBreak => spacing(0.8, 0.8),
-        BlockKind::Paragraph
-        | BlockKind::BlankLine
-        | BlockKind::ReferenceDefinition
-        | BlockKind::HtmlBlock => spacing(0.0, 0.0),
+        BlockKind::Heading { level } => {
+            let index = usize::from(level.clamp(1, 6) - 1);
+            spacing(
+                spec.heading_margin_before[index] / body,
+                spec.heading_margin_after[index] / body,
+            )
+        }
+        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode => spacing(
+            spec.code_margin_before / spec.body_size / body,
+            spec.code_margin_after / spec.body_size / body,
+        ),
+        BlockKind::BlankLine | BlockKind::ReferenceDefinition | BlockKind::HtmlBlock => {
+            spacing(0.0, 0.0)
+        }
+        _ => spacing(
+            spec.paragraph_margin_before / body,
+            spec.paragraph_margin / body,
+        ),
     }
 }
 
-/// 相邻两块折叠后的间距（正文行高的倍数）：`max(after(上块), before(下块))`。
-///
-/// 唯一的特例：**列表内连续 item 之间间距为 0**——item 与 item 直接相邻
-/// 时不产生间距（紧凑列表的 item 一行接一行）；item 的段前/段后只在列表
-/// 边界上起作用（与相邻的非 item 块之间）。
-///
-/// 返回值折进块高时的约定见 `EditorDocument::block_box_height`：整条缝折在
-/// **上块**的高度贡献里，高度索引的数学自动一致（光标/滚动/AX 全部消费
-/// 高度，不需要任何调用方知道缝的存在）。
+/// Collapse standalone block margins. Container-aware list spacing is resolved
+/// from PresentationTree by LayoutContext, never from two BlockKind tags.
 #[must_use]
-pub fn collapsed_block_gap(upper: BlockKind, lower: BlockKind) -> f32 {
-    if is_list_item(upper) && is_list_item(lower) {
-        return 0.0;
-    }
-    block_spacing(upper).after.max(block_spacing(lower).before)
+pub fn collapsed_block_gap(upper: BlockKind, lower: BlockKind, theme: yu_core::ThemeId) -> f32 {
+    block_spacing(upper, theme)
+        .after
+        .max(block_spacing(lower, theme).before)
 }
 
-/// 这一块内容的水平内边距（pt）：代码块与引用块的内容让出内边距排布，
-/// 背景矩形从内容盒外扩同一数值，视觉上就是「文字离背景边一个内边距」。
+/// Resolve quote margin specificity and first/last-child overrides from ancestry.
+/// Values are unscaled logical points, independent of paragraph line struts.
+pub(crate) fn quote_margin(
+    tree: &yu_markdown::PresentationTree,
+    id: usize,
+    theme: yu_core::ThemeId,
+    after: bool,
+) -> f32 {
+    use yu_markdown::PresentationKind;
+    let node = &tree.nodes()[id];
+    if let Some(parent) = node.parent.map(|id| &tree.nodes()[id]) {
+        if !after
+            && matches!(
+                parent.kind,
+                PresentationKind::Quote | PresentationKind::ListItem
+            )
+            && parent.children.first() == Some(&id)
+        {
+            return 0.0;
+        }
+        if after && parent.kind == PresentationKind::Quote && parent.children.last() == Some(&id) {
+            return 0.0;
+        }
+    }
+    let mut parent = node.parent;
+    while let Some(id) = parent {
+        let node = &tree.nodes()[id];
+        if node.kind == PresentationKind::ListItem {
+            return theme.spec().body_size;
+        }
+        parent = node.parent;
+    }
+    if after {
+        theme.spec().quote_margin_after
+    } else {
+        theme.spec().quote_margin_before
+    }
+}
+
+/// Left padding is an indent; the layout width already excludes right padding.
 #[must_use]
-pub const fn box_content_inset_x(kind: BlockKind) -> f32 {
+pub fn box_content_inset_x(kind: BlockKind, config: LayoutConfig) -> f32 {
     if is_code_block(kind) {
-        CODE_BLOCK_PADDING_X
-    } else if matches!(kind, BlockKind::BlockQuote { .. }) {
-        QUOTE_BLOCK_PADDING_X
+        CodeInsets::new(config)
+            .left
+            .min((config.max_width() - 1.0).max(0.0))
     } else {
         0.0
     }
 }
 
-/// 按块类收窄断行宽度：列宽两侧各让出一个水平内边距，内容从收窄后的
-/// 左边缘排起（`blockinput.rs` 把 [`box_content_inset_x`] 加进缩进）。
-/// 非代码/引用块原样返回。
-///
-/// 极窄的列（测试夹具、缩到极限的视口）放不下两个内边距：这时内边距让位，
-/// 断行宽度至少留 1 个单位——`LayoutConfig` 要求宽度有限且为正，让到零或
-/// 负数会把一个排版决定变成校验错误。
+/// LayoutConfig width is the right edge, not text width: left padding is
+/// subtracted by the paragraph's indent. Subtracting both edges here double
+/// counts the left padding and causes premature wrapping.
 #[must_use]
 pub fn box_layout_config(kind: BlockKind, config: LayoutConfig) -> LayoutConfig {
-    let inset = box_content_inset_x(kind);
-    if inset == 0.0 {
-        return config;
-    }
-    config.with_max_width((config.max_width() - 2.0 * inset).max(1.0))
+    let right = if is_code_block(kind) {
+        CodeInsets::new(config).right
+    } else if matches!(kind, BlockKind::BlockQuote { .. }) {
+        let spec = config.theme().spec();
+        spec.quote_padding_right * config.line_height() / spec.body_size
+    } else {
+        0.0
+    };
+    config.with_max_width((config.max_width() - right).max(1.0))
 }
 
-/// 代码块背景矩形（块内容坐标系，即与 `BlockLine::bounds` 同一空间）。
-///
-/// `column_width` 是**布局列宽**（`LayoutConfig::max_width`，未收窄的那一份），
-/// `content_height` 是代码内容高（行盒累加，`BlockView::height`）。返回矩形
-/// 铺满整列、上下各扩出 [`CODE_BLOCK_PADDING_Y`]：
-///
-/// - 水平：断行宽度收窄为「列宽 − 2×内边距」、内容右移一个内边距（见
-///   [`box_layout_config`]），于是文字离背景左右边正好各 14pt——
-///   「内容宽 + 2×水平内边距 = 列宽」是同一件事的两个算法。
-/// - 垂直：块内容在这个矩形里从 [`content_origin_y`]（上内边距）起排，
-///   上下对称。块贡献给视口的高度里还折着段间距（见
-///   `EditorDocument::block_box_height`），那一段**不属于背景**——调用方
-///   （M4）按 [`content_origin_y`] 平移内容、按本矩形画 `RoundedFillRect`。
-///
-/// # Errors
-///
-/// 几何参数非有限，或矩形越出 `Block` 空间的约束（宽/高须为正）。
+/// Include the enclosing quote's right inset for every kind of descendant leaf.
+#[must_use]
+pub fn box_layout_config_with_quote(
+    kind: BlockKind,
+    config: LayoutConfig,
+    in_quote: bool,
+) -> LayoutConfig {
+    let layout = box_layout_config(kind, config);
+    if in_quote && !matches!(kind, BlockKind::BlockQuote { .. }) {
+        let spec = config.theme().spec();
+        layout.with_max_width(
+            (layout.max_width() - spec.quote_padding_right * config.line_height() / spec.body_size)
+                .max(1.0),
+        )
+    } else {
+        layout
+    }
+}
+
+/// Paint the same asymmetric vertical box used by the height index and caret.
 pub fn code_block_background_rect(
     column_width: f32,
     content_height: f32,
+    config: LayoutConfig,
 ) -> Result<LayoutRect, LayoutError> {
+    let edges = CodeInsets::new(config);
     Ok(LayoutRect::new(
         0.0,
         0.0,
         column_width,
-        content_height + 2.0 * CODE_BLOCK_PADDING_Y,
+        content_height + edges.top + edges.bottom,
     )?)
 }
 
-/// 引用块背景矩形（块内容坐标系），规则与 [`code_block_background_rect`] 的水
-/// 平部分相同：铺满整列（内容因 [`QUOTE_BLOCK_PADDING_X`] 收窄 + 右移，离背
-/// 景边各 12pt），高度就是内容高——引用块没有垂直内边距。
+/// Quote background spans the content column without vertical padding.
 ///
 /// # Errors
 ///
@@ -260,17 +297,23 @@ pub fn quote_block_background_rect(
     Ok(LayoutRect::new(0.0, 0.0, column_width, content_height)?)
 }
 
-/// 块内容在**块盒**里的纵向起点：代码块从上内边距起排（上下对称的另一半在
-/// 块高贡献里），其余块从 0 起排。
-///
-/// 消费块几何的两方要拿同一个数：把内容坐标（glyph/caret/选中/hit 的局部
-/// y）换算成文档坐标时加上它（`EditorDocument::block_box_height` 的反向），
-/// 画背景时按 [`code_block_background_rect`] 从 0 起画。漏掉它的表现是代码
-/// 块里光标/选中整体上移 5pt，不报错。
+/// Shared top inset for painting, queries and document-to-local transforms.
 #[must_use]
-pub const fn content_origin_y(kind: BlockKind) -> f32 {
+pub fn content_origin_y(kind: BlockKind, config: LayoutConfig) -> f32 {
     if is_code_block(kind) {
-        CODE_BLOCK_PADDING_Y
+        CodeInsets::new(config).top
+    } else {
+        0.0
+    }
+}
+
+#[must_use]
+pub fn content_bottom_inset(kind: BlockKind, config: LayoutConfig) -> f32 {
+    if is_code_block(kind) {
+        CodeInsets::new(config).bottom
+    } else if let BlockKind::Heading { level } = kind {
+        config.theme().heading_border(level).0 * config.line_height()
+            / config.theme().spec().body_size
     } else {
         0.0
     }
@@ -280,18 +323,47 @@ pub const fn content_origin_y(kind: BlockKind) -> f32 {
 mod tests {
     use super::*;
 
-    /// Paragraph 的 0 间距是**有意设计**：源码空行本身是一块、有高，已经提供
-    /// 段落分隔，再加 margin 就是双倍间距。这个 0 被拿掉（或手滑改成非 0）
-    /// 时没有任何一条别的用例会红——常数没有断言就等于没有约定。
     #[test]
-    fn paragraph_has_no_margins_by_design() {
+    fn theme_struts_preserve_fractional_heights_and_margins() {
+        let config = LayoutConfig::new(800.0, 16.0);
+        assert_eq!(resolved_line_height(config, 1.6), 25.6);
+        assert_eq!(resolved_line_height(config, 1.625), 26.0);
+        for (theme, expected) in [
+            (
+                yu_core::ThemeSpec::GITHUB,
+                [43.2, 34.3, 34.32, 28.0, 22.4, 22.4],
+            ),
+            (
+                yu_core::ThemeSpec::NIGHT,
+                [44.0, 30.0, 24.0, 22.0, 20.0, 16.0],
+            ),
+        ] {
+            for (index, expected) in expected.into_iter().enumerate() {
+                let actual = resolved_line_height(
+                    config,
+                    theme.heading_sizes[index] * theme.heading_lines[index],
+                );
+                assert!((actual - expected).abs() < 0.00001);
+            }
+        }
+        // Layout struts do not change the rem-based paragraph margin.
+        let margin = block_spacing(BlockKind::Paragraph, yu_core::ThemeId::Github).after;
+        assert!((margin * 1.6 * 16.0 - 12.8).abs() < 0.001);
+    }
+
+    /// Source separators and semantic paragraph margins have different roles.
+    #[test]
+    fn source_separators_have_no_margin_but_paragraphs_do() {
+        assert_eq!(
+            block_spacing(BlockKind::Paragraph, yu_core::ThemeId::Github),
+            spacing(0.5, 0.5)
+        );
         for kind in [
-            BlockKind::Paragraph,
             BlockKind::BlankLine,
             BlockKind::ReferenceDefinition,
             BlockKind::HtmlBlock,
         ] {
-            let spacing = block_spacing(kind);
+            let spacing = block_spacing(kind, yu_core::ThemeId::Github);
             assert_eq!(
                 (spacing.before, spacing.after),
                 (0.0, 0.0),
@@ -300,17 +372,36 @@ mod tests {
         }
     }
 
-    /// 标题的段前段后随级别递减：h1 大、h6 小。
     #[test]
-    fn heading_spacing_shrinks_with_level() {
-        for level in 2..=6_u8 {
-            let upper = block_spacing(BlockKind::Heading { level: level - 1 });
-            let lower = block_spacing(BlockKind::Heading { level });
+    fn headings_use_each_themes_declared_margins() {
+        for level in 1..=6 {
+            let kind = BlockKind::Heading { level };
+            let github = block_spacing(kind, yu_core::ThemeId::Github);
+            assert_eq!(github, spacing(1.0 / 1.6, 1.0 / 1.6));
+            let night = block_spacing(kind, yu_core::ThemeId::Night);
+            assert_eq!(night.before, if level == 1 { 5.0 / 1.625 } else { 0.0 });
+            assert_eq!(night.after * 1.625, if level == 6 { 0.75 } else { 1.5 });
+        }
+    }
+
+    #[test]
+    fn code_margins_collapse_with_neighbors_instead_of_adding() {
+        for (theme, before, after) in [
+            (yu_core::ThemeId::Github, 15.0, 15.0),
+            (yu_core::ThemeId::Night, 24.0, 20.0),
+        ] {
+            let scale = theme.spec().body_size * theme.spec().body_line_ratio;
             assert!(
-                upper.before > lower.before && upper.after > lower.after,
-                "h{} 的间距要比 h{} 大",
-                level - 1,
-                level
+                (collapsed_block_gap(BlockKind::Paragraph, BlockKind::IndentedCode, theme) * scale
+                    - before)
+                    .abs()
+                    < 0.001
+            );
+            assert!(
+                (collapsed_block_gap(BlockKind::IndentedCode, BlockKind::Paragraph, theme) * scale
+                    - after)
+                    .abs()
+                    < 0.001
             );
         }
     }
@@ -321,72 +412,39 @@ mod tests {
         let heading = BlockKind::Heading { level: 1 };
         // after(上块) 更大。
         assert_eq!(
-            collapsed_block_gap(heading, BlockKind::Paragraph),
-            block_spacing(heading).after
+            collapsed_block_gap(heading, BlockKind::Paragraph, yu_core::ThemeId::Github),
+            block_spacing(heading, yu_core::ThemeId::Github)
+                .after
+                .max(block_spacing(BlockKind::Paragraph, yu_core::ThemeId::Github).before)
         );
         // before(下块) 更大。
         let heading2 = BlockKind::Heading { level: 2 };
         assert_eq!(
-            collapsed_block_gap(BlockKind::Paragraph, heading2),
-            block_spacing(heading2).before
+            collapsed_block_gap(BlockKind::Paragraph, heading2, yu_core::ThemeId::Github),
+            block_spacing(heading2, yu_core::ThemeId::Github).before
         );
         // 两个非零中间取 max 而不是平均。
         let h4 = BlockKind::Heading { level: 4 };
         let code = BlockKind::IndentedCode;
-        let (after_h4, before_code) = (block_spacing(h4).after, block_spacing(code).before);
+        let (after_h4, before_code) = (
+            block_spacing(h4, yu_core::ThemeId::Github).after,
+            block_spacing(code, yu_core::ThemeId::Github).before,
+        );
         assert_eq!(
-            collapsed_block_gap(h4, code),
+            collapsed_block_gap(h4, code, yu_core::ThemeId::Github),
             after_h4.max(before_code),
             "缝 = max(after(上), before(下))"
         );
     }
 
-    /// 列表内连续 item 之间间距为 0，只有列表边界算间距。
-    #[test]
-    fn consecutive_list_items_have_no_gap() {
-        let item = BlockKind::ListItem {
-            ordered: false,
-            depth: 0,
-            marker: '-',
-            start: 0,
-        };
-        let task = BlockKind::TaskListItem {
-            ordered: false,
-            depth: 0,
-            marker: '-',
-            start: 1,
-            state: yu_markdown::TaskState::Todo,
-        };
-        assert_eq!(
-            collapsed_block_gap(item, item),
-            0.0,
-            "item 挨着 item 没有缝"
-        );
-        assert_eq!(
-            collapsed_block_gap(item, task),
-            0.0,
-            "普通项挨着任务项也没有缝"
-        );
-        // 列表边界：与非 item 块之间按表取间距。
-        assert_eq!(
-            collapsed_block_gap(item, BlockKind::Paragraph),
-            block_spacing(item).after
-        );
-        assert_eq!(
-            collapsed_block_gap(BlockKind::Paragraph, item),
-            block_spacing(item).before
-        );
-    }
-
-    /// 代码块背景铺满整列：断行宽度收窄 + 内容右移让文字离背景左右边各 14pt，
-    /// 上下各扩 5pt。M4 的背景填充按这三个数画，写死它们是有意的。
     #[test]
     fn code_background_rect_covers_the_column_with_vertical_padding() {
-        let rect = code_block_background_rect(400.0, 16.0).expect("矩形");
+        let rect =
+            code_block_background_rect(400.0, 16.0, LayoutConfig::new(400.0, 16.0)).expect("矩形");
         assert_eq!(rect.x(), 0.0);
         assert_eq!(rect.y(), 0.0);
         assert_eq!(rect.width(), 400.0, "背景铺满整列");
-        assert_eq!(rect.height(), 16.0 + 2.0 * CODE_BLOCK_PADDING_Y);
+        assert_eq!(rect.height(), 16.0 + 9.0 + 7.0);
     }
 
     #[test]
@@ -406,10 +464,19 @@ mod tests {
             },
             BlockKind::IndentedCode,
         ] {
-            assert_eq!(content_origin_y(code), CODE_BLOCK_PADDING_Y);
+            assert_eq!(content_origin_y(code, LayoutConfig::new(400.0, 16.0)), 9.0);
         }
-        assert_eq!(content_origin_y(BlockKind::Paragraph), 0.0);
-        assert_eq!(content_origin_y(BlockKind::BlockQuote { depth: 1 }), 0.0);
+        assert_eq!(
+            content_origin_y(BlockKind::Paragraph, LayoutConfig::new(400.0, 16.0)),
+            0.0
+        );
+        assert_eq!(
+            content_origin_y(
+                BlockKind::BlockQuote { depth: 1 },
+                LayoutConfig::new(400.0, 16.0)
+            ),
+            0.0
+        );
     }
 
     /// 断行宽度只按代码块/引用块收窄，其余块类原样；极窄列下内边距让位。
@@ -425,13 +492,13 @@ mod tests {
         ] {
             assert_eq!(
                 box_layout_config(code, config).max_width(),
-                400.0 - 2.0 * CODE_BLOCK_PADDING_X,
+                400.0 - 9.0 * 10.0 / 16.0,
                 "{code:?} 的断行宽度收窄两个水平内边距"
             );
         }
         assert_eq!(
             box_layout_config(BlockKind::BlockQuote { depth: 1 }, config).max_width(),
-            400.0 - 2.0 * QUOTE_BLOCK_PADDING_X
+            400.0 - 15.0 * 10.0 / 16.0
         );
         assert_eq!(
             box_layout_config(BlockKind::Paragraph, config).max_width(),
@@ -439,7 +506,7 @@ mod tests {
             "段落不收窄"
         );
         // 列宽放不下两个内边距时至少留 1 个单位断行，而不是让 config 校验炸掉。
-        let narrow = LayoutConfig::new(12.0, 10.0);
+        let narrow = LayoutConfig::new(4.0, 10.0);
         assert_eq!(
             box_layout_config(BlockKind::IndentedCode, narrow).max_width(),
             1.0
@@ -448,22 +515,19 @@ mod tests {
 
     #[test]
     fn heading_scales_cover_six_levels_and_reject_the_rest() {
-        assert_eq!(heading_font_scale(1), Some(2.0));
-        assert_eq!(heading_font_scale(2), Some(1.6));
-        assert_eq!(heading_font_scale(3), Some(1.35));
-        assert_eq!(heading_font_scale(4), Some(1.2));
-        assert_eq!(heading_font_scale(5), Some(1.05));
-        assert_eq!(heading_font_scale(6), Some(1.05));
+        for (level, size, line) in [
+            (1, 2.25, 1.2),
+            (2, 1.75, 1.225),
+            (3, 1.5, 1.43),
+            (4, 1.25, 1.4),
+            (5, 1.0, 1.4),
+            (6, 1.0, 1.4),
+        ] {
+            assert_eq!(heading_font_scale(level), Some(size));
+            assert_eq!(heading_line_height_scale(level), Some(line));
+        }
         assert_eq!(heading_font_scale(0), None);
         assert_eq!(heading_font_scale(7), None);
-        assert_eq!(heading_line_height_scale(1), Some(LINE_HEIGHT_HEADING_1_2));
-        assert_eq!(heading_line_height_scale(2), Some(LINE_HEIGHT_HEADING_1_2));
-        for level in 3..=6 {
-            assert_eq!(
-                heading_line_height_scale(level),
-                Some(LINE_HEIGHT_HEADING_3_6)
-            );
-        }
         assert_eq!(heading_line_height_scale(7), None);
     }
 }

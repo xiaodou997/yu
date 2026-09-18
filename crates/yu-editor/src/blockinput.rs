@@ -21,10 +21,9 @@
 //! 「缩进 8.0」，不是「这是二级引用」。
 
 use crate::layout_tokens::{
-    LINE_HEIGHT_BODY, LINE_HEIGHT_CODE, box_content_inset_x, box_layout_config, heading_font_scale,
-    heading_line_height_scale, is_code_block,
+    ContainerMetrics, box_content_inset_x, box_layout_config_with_quote, is_code_block,
 };
-use crate::marks::{Mark, flatten};
+use crate::marks::{Mark, flatten_composed};
 use yu_core::{
     ByteOffset, ClusterMetrics, LineStyleId, ShapedText, ShapingProvider, StyleId, TextAttrs,
     TextRange, TextStyle,
@@ -117,14 +116,41 @@ impl HeadingOrnament {
 /// 替代掉的那段源码，选中与编辑仍然走那一段（不变量 A2）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkerOrnament {
+    quoted: bool,
     source: TextRange,
     text: String,
     x: f32,
     advance: f32,
     shaped: Option<ShapedText>,
+    shape: Option<MarkerShape>,
+}
+
+/// Geometric list marker, expressed relative to the first text baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerShapeKind {
+    Disc,
+    Circle,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkerShape {
+    pub kind: MarkerShapeKind,
+    pub size: f32,
+    pub baseline_offset: f32,
+    pub before_text: f32,
+    pub stroke: f32,
 }
 
 impl MarkerOrnament {
+    pub const fn is_quoted(&self) -> bool {
+        self.quoted
+    }
+    #[must_use]
+    pub const fn shape(&self) -> Option<MarkerShape> {
+        self.shape
+    }
+
     #[must_use]
     pub const fn source(&self) -> TextRange {
         self.source
@@ -146,23 +172,19 @@ impl MarkerOrnament {
         self.advance
     }
 
-    /// shaping 那条路上排好的字形。按度量派生时是 `None`。
+    /// 文字型标记排好的字形。纯度量或几何型标记为 `None`。
     #[must_use]
     pub const fn shaped(&self) -> Option<&ShapedText> {
         self.shaped.as_ref()
     }
 }
 
-/// 引用的竖条。
-///
-/// 竖条贯穿整块，而块高要等布局排完才知道，所以这里只留参数，矩形由
-/// [`BlockQuoteOrnament::bars`] 现算。
+/// Paragraph quote semantics. Continuous border geometry belongs to the
+/// containing node in LayoutSnapshot, not to this individual paragraph.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BlockQuoteOrnament {
     source: TextRange,
     depth: u8,
-    unit: f32,
-    bar_width: f32,
 }
 
 impl BlockQuoteOrnament {
@@ -174,17 +196,6 @@ impl BlockQuoteOrnament {
     #[must_use]
     pub const fn depth(self) -> u8 {
         self.depth
-    }
-
-    /// 每一层引用竖条的矩形，从外到内。
-    pub fn bars(self, height: f32) -> Result<Vec<LayoutRect>, LayoutError> {
-        let mut bars = Vec::with_capacity(usize::from(self.depth));
-        for level in 0..self.depth {
-            let unit_start = f32::from(level) * self.unit;
-            let x = unit_start + (self.unit - self.bar_width) * 0.25;
-            bars.push(LayoutRect::new(x, 0.0, self.bar_width, height)?);
-        }
-        Ok(bars)
     }
 }
 
@@ -235,6 +246,7 @@ impl ThematicBreakOrnament {
 pub struct BlockOrnaments {
     heading: Option<HeadingOrnament>,
     marker: Option<MarkerOrnament>,
+    ancestors: Vec<MarkerOrnament>,
     quote: Option<BlockQuoteOrnament>,
     rule: Option<ThematicBreakOrnament>,
 }
@@ -248,6 +260,9 @@ impl BlockOrnaments {
     #[must_use]
     pub const fn marker(&self) -> Option<&MarkerOrnament> {
         self.marker.as_ref()
+    }
+    pub fn markers(&self) -> impl Iterator<Item = &MarkerOrnament> {
+        self.ancestors.iter().chain(self.marker.iter())
     }
 
     #[must_use]
@@ -287,6 +302,8 @@ pub struct BlockLayoutInput {
     /// 按水平内边距收窄过断行宽度。排版必须用它而不是调用方那份原始 config
     /// ——两份对不上，断行就按旧宽度算，长行会溢出背景盒。
     config: LayoutConfig,
+    content_left: f32,
+    container_left: f32,
 }
 
 impl BlockLayoutInput {
@@ -310,13 +327,19 @@ impl BlockLayoutInput {
         config: LayoutConfig,
         metrics: &M,
     ) -> Result<Self, LayoutError> {
-        let draft = DecorationDraft::read(kind, decorations, visual)?;
+        let draft = DecorationDraft::read(kind, decorations, visual, config)?;
         let marker = draft
             .marker
             .as_ref()
             .map(|marker| measure_marker_text(marker, metrics))
             .transpose()?;
-        draft.assemble(box_layout_config(kind, config), marker)
+        let config = box_layout_config_with_quote(kind, config, draft.quote.is_some());
+        let ancestors = draft
+            .ancestors
+            .iter()
+            .map(|marker| measure_marker_text(marker, metrics))
+            .collect::<Result<Vec<_>, _>>()?;
+        draft.assemble(config, marker, ancestors)
     }
 
     /// 按 shaping 后端派生。列表标记的字形一并留下。
@@ -331,13 +354,19 @@ impl BlockLayoutInput {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<Self, LayoutError> {
-        let draft = DecorationDraft::read(kind, decorations, visual)?;
+        let draft = DecorationDraft::read(kind, decorations, visual, config)?;
         let marker = draft
             .marker
             .as_ref()
-            .map(|marker| shape_marker_text(marker, shaper))
+            .map(|marker| shape_marker_text(marker, config, shaper))
             .transpose()?;
-        draft.assemble(box_layout_config(kind, config), marker)
+        let config = box_layout_config_with_quote(kind, config, draft.quote.is_some());
+        let ancestors = draft
+            .ancestors
+            .iter()
+            .map(|marker| shape_marker_text(marker, config, shaper))
+            .collect::<Result<Vec<_>, _>>()?;
+        draft.assemble(config, marker, ancestors)
     }
 
     #[must_use]
@@ -351,6 +380,23 @@ impl BlockLayoutInput {
     #[must_use]
     pub const fn layout_config(&self) -> LayoutConfig {
         self.config
+    }
+
+    /// Horizontal content bounds shared by text, tables and embedded resources.
+    #[must_use]
+    pub const fn content_left(&self) -> f32 {
+        self.content_left
+    }
+
+    #[must_use]
+    pub fn available_width(&self) -> f32 {
+        (self.config.max_width() - self.content_left).max(1.0)
+    }
+
+    /// Outer box origin, before the block's own padding.
+    #[must_use]
+    pub const fn container_left(&self) -> f32 {
+        self.container_left
     }
 
     /// 这个块上的 widget 锚点，按 `(visual, side)` 升序。
@@ -457,10 +503,12 @@ impl BlockLayoutSlice {
 }
 
 struct MarkerDraft {
+    gap: f32,
     source: TextRange,
     text: String,
     advance: f32,
     shaped: Option<ShapedText>,
+    shape: Option<MarkerShape>,
 }
 
 fn measure_marker_text<M: ClusterMetrics>(
@@ -485,18 +533,79 @@ fn measure_marker_parts<M: ClusterMetrics>(
         }
         advance += width;
     }
+    let gap = metrics.advance(" ", TextStyle::Plain);
+    if !gap.is_finite() || gap < 0.0 {
+        return Err(LayoutError::InvalidMetrics(gap.to_bits()));
+    }
     Ok(MarkerDraft {
+        gap,
         source,
         text: text.to_owned(),
         advance,
         shaped: None,
+        shape: None,
     })
 }
 
 fn shape_marker_text<S: ShapingProvider>(
     marker: &MarkerOrnamentSource,
+    config: LayoutConfig,
     shaper: &S,
 ) -> Result<MarkerDraft, LayoutError> {
+    let kind = match marker.text.as_str() {
+        "•" => Some(MarkerShapeKind::Disc),
+        "◦" => Some(MarkerShapeKind::Circle),
+        "▪" => Some(MarkerShapeKind::Square),
+        _ => None,
+    };
+    if let (Some(kind), Some(provider)) = (kind, shaper.paragraph_provider()) {
+        let paragraph = provider
+            .layout(&yu_core::ParagraphInput {
+                font_strut_mode: yu_core::FontStrutMode::RunMetrics,
+                text: "M",
+                base_direction: config.base_direction(),
+                width: 10000.0,
+                indent: 0.0,
+                line_height: crate::layout_tokens::resolved_line_height(
+                    config,
+                    config.theme().spec().body_line_ratio,
+                ),
+                runs: vec![yu_core::ParagraphRun {
+                    range: yu_core::VisualRange::new(
+                        yu_core::VisualOffset::ZERO,
+                        yu_core::VisualOffset::new(1),
+                    )
+                    .ok_or(LayoutError::OffsetOverflow)?,
+                    style: StyleId(0),
+                    attrs: TextAttrs::default().with_font(config.theme().spec().body_font),
+                }],
+                objects: vec![],
+            })
+            .map_err(LayoutError::Shaping)?;
+        let ascent = paragraph
+            .lines
+            .first()
+            .ok_or_else(|| LayoutError::Shaping("marker metrics have no line".into()))?
+            .font_ascent;
+        let zoom = config.line_height() / config.theme().spec().body_size;
+        let ascent = (ascent / zoom).round();
+        let two_thirds = (ascent * 2.0 / 3.0).floor();
+        let size = ((two_thirds + 1.0) / 2.0).floor().max(1.0) * zoom;
+        return Ok(MarkerDraft {
+            gap: 0.0,
+            source: marker.source,
+            text: marker.text.clone(),
+            advance: size,
+            shaped: None,
+            shape: Some(MarkerShape {
+                kind,
+                size,
+                baseline_offset: ((3.0 * (ascent - two_thirds) / 2.0).floor() - ascent) * zoom,
+                before_text: (ascent + 1.0) * zoom,
+                stroke: zoom,
+            }),
+        });
+    }
     shape_marker_parts(marker.source, &marker.text, shaper)
 }
 
@@ -522,11 +631,25 @@ fn shape_marker_parts<S: ShapingProvider>(
     if !advance.is_finite() || advance < 0.0 {
         return Err(LayoutError::InvalidMetrics(advance.to_bits()));
     }
+    let gap = shaper
+        .shape(
+            " ",
+            TextRange::new(ByteOffset::ZERO, ByteOffset::new(1))
+                .ok_or(LayoutError::OffsetOverflow)?,
+            TextStyle::Plain,
+        )
+        .map_err(|error| LayoutError::Shaping(error.to_string()))?
+        .advance();
+    if !gap.is_finite() || gap < 0.0 {
+        return Err(LayoutError::InvalidMetrics(gap.to_bits()));
+    }
     Ok(MarkerDraft {
+        gap,
         source,
         text: text.to_owned(),
         advance,
         shaped: Some(shaped),
+        shape: None,
     })
 }
 
@@ -537,16 +660,14 @@ struct HeadingMetrics {
     line_height_scale: f32,
 }
 
-fn heading_metrics(level: u8) -> Result<HeadingMetrics, LayoutError> {
-    // 字号与行高倍率都住在 `layout_tokens`（Typora 标杆值），这里只做
-    // level → 倍率的翻译；排版上标题一律按 Strong 出字型（见 assemble）。
-    let (Some(font_scale), Some(line_height_scale)) =
-        (heading_font_scale(level), heading_line_height_scale(level))
-    else {
+fn heading_metrics(level: u8, theme: yu_core::ThemeSpec) -> Result<HeadingMetrics, LayoutError> {
+    if !(1..=6).contains(&level) {
         return Err(LayoutError::InvalidConfig(
             "heading level must be between one and six",
         ));
-    };
+    }
+    let font_scale = theme.heading_sizes[usize::from(level - 1)];
+    let line_height_scale = theme.heading_lines[usize::from(level - 1)];
     Ok(HeadingMetrics {
         level,
         font_scale,
@@ -557,29 +678,27 @@ fn heading_metrics(level: u8) -> Result<HeadingMetrics, LayoutError> {
 #[derive(Clone, Copy)]
 struct BlockQuoteMetrics {
     depth: u8,
-    unit: f32,
-    bar_width: f32,
     gutter: f32,
 }
 
-fn block_quote_metrics(depth: u8, config: LayoutConfig) -> Result<BlockQuoteMetrics, LayoutError> {
+fn block_quote_metrics(
+    depth: u8,
+    outside_list: u8,
+    config: LayoutConfig,
+) -> Result<BlockQuoteMetrics, LayoutError> {
     if depth == 0 {
         return Err(LayoutError::InvalidConfig(
             "blockquote depth must be positive",
         ));
     }
-    let bar_width = (config.line_height() * 0.12).clamp(1.0, 3.0);
-    let unit = (config.default_advance() * 2.0).max(bar_width + config.default_advance());
-    let gutter = unit * f32::from(depth);
+    let unit = ContainerMetrics::new(config).quote_indent;
+    let gutter = unit * f32::from(depth)
+        - ContainerMetrics::new(config).quote_margin_left
+            * f32::from(depth.saturating_sub(outside_list));
     if !unit.is_finite() || !gutter.is_finite() {
         return Err(LayoutError::InvalidMetrics(gutter.to_bits()));
     }
-    Ok(BlockQuoteMetrics {
-        depth,
-        unit,
-        bar_width,
-        gutter,
-    })
+    Ok(BlockQuoteMetrics { depth, gutter })
 }
 
 /// 分隔线那条横线有多粗：一个逻辑像素。
@@ -634,10 +753,11 @@ struct DecorationDraft {
     styles: Vec<TextAttrs>,
     source_range: TextRange,
     heading: Option<u8>,
-    quote: Option<u8>,
+    quote: Option<(u8, u8)>,
     /// 这一块的正文往右让多少列。列表项与任务项都有，标记只有列表项有。
     indent_columns: u8,
     marker: Option<MarkerOrnamentSource>,
+    ancestors: Vec<MarkerOrnamentSource>,
     /// 这一块要画一条分隔线。**没有负载**：`BlockOrnament::ThematicBreak`
     /// 不带拼法也不带几何，画在哪由 [`DecorationDraft::assemble`] 现算。
     rule: bool,
@@ -645,6 +765,8 @@ struct DecorationDraft {
 
 /// 列表标记的语义值，还没量过宽度。
 struct MarkerOrnamentSource {
+    list_depth: u8,
+    quote_depth: u8,
     source: TextRange,
     text: String,
 }
@@ -654,6 +776,7 @@ impl DecorationDraft {
         kind: BlockKind,
         decorations: &BlockDecorations,
         visual: &VisualText,
+        config: LayoutConfig,
     ) -> Result<Self, LayoutError> {
         let bounds = decorations.range();
         if bounds != visual.source_range() || decorations.revision() != visual.revision() {
@@ -688,7 +811,7 @@ impl DecorationDraft {
         // 一段的两端各问一次映射，中间被隐藏的字节自然就没了：隐藏区间的
         // 视觉宽度是零。自己再切一遍「可见片段」是把 D4 那条映射重写一遍。
         let mut runs: Vec<StyledRun> = Vec::new();
-        for (segment, style) in flatten(bounds, &marks) {
+        for (segment, style) in flatten_composed(bounds, &marks, &mut styles) {
             let style = style.unwrap_or(plain);
             let start = visual.canonical_source_to_visual(segment.start());
             let end = visual.canonical_source_to_visual(segment.end());
@@ -723,16 +846,32 @@ impl DecorationDraft {
         let mut quote = None;
         let mut indent_columns = 0_u8;
         let mut marker = None;
+        let mut ancestors = Vec::new();
         let mut rule = false;
         for (_, ornament) in decorations.line_ornaments() {
             match ornament {
                 BlockOrnament::Heading { level } => heading = Some(*level),
-                BlockOrnament::QuoteBar { depth } => quote = Some(*depth),
+                BlockOrnament::QuoteBar {
+                    depth,
+                    outside_list,
+                } => quote = Some((*depth, *outside_list)),
                 BlockOrnament::Indent { columns } => indent_columns = *columns,
                 BlockOrnament::Marker(found) => {
+                    if let Some(previous) = marker.take() {
+                        ancestors.push(previous);
+                    }
                     marker = Some(MarkerOrnamentSource {
+                        list_depth: found.list_depth(),
+                        quote_depth: found.quote_depth(),
                         source: found.source(),
-                        text: found.text().to_owned(),
+                        text: if found.text() == "•" {
+                            config
+                                .theme()
+                                .unordered_marker(found.list_depth())
+                                .to_owned()
+                        } else {
+                            found.text().to_owned()
+                        },
                     });
                 }
                 // 分隔线**不改变排版**：它那一块的视觉文本只剩一个换行符，
@@ -747,6 +886,14 @@ impl DecorationDraft {
             }
         }
 
+        // A checkbox owns the innermost list gutter. All emitted text/shape
+        // markers belong to ancestors and must not add another body gutter.
+        if matches!(kind, BlockKind::TaskListItem { .. })
+            && let Some(previous) = marker.take()
+        {
+            ancestors.push(previous);
+        }
+
         Ok(Self {
             kind,
             text: visual.text().to_owned(),
@@ -759,6 +906,7 @@ impl DecorationDraft {
             quote,
             indent_columns,
             marker,
+            ancestors,
             rule,
         })
     }
@@ -767,15 +915,29 @@ impl DecorationDraft {
         self,
         config: LayoutConfig,
         marker: Option<MarkerDraft>,
+        ancestors: Vec<MarkerDraft>,
     ) -> Result<BlockLayoutInput, LayoutError> {
         let kind = self.kind;
-        let heading = self.heading.map(heading_metrics).transpose()?;
+        let theme = config.theme().spec();
+        let heading = self
+            .heading
+            .map(|level| heading_metrics(level, theme))
+            .transpose()?;
         let quote = self
             .quote
-            .map(|depth| block_quote_metrics(depth, config))
+            .map(|(depth, outside_list)| block_quote_metrics(depth, outside_list, config))
             .transpose()?;
 
         let quote_gutter = quote.map_or(0.0, |quote| quote.gutter);
+        let marker_quote_gutter = self.marker.as_ref().map_or(0.0, |marker| {
+            let metrics = ContainerMetrics::new(config);
+            let outside = self
+                .quote
+                .map_or(0, |(_, outside)| outside)
+                .min(marker.quote_depth);
+            f32::from(marker.quote_depth) * metrics.quote_indent
+                - f32::from(marker.quote_depth - outside) * metrics.quote_margin_left
+        });
         // 四段相加，各说一件事：块级盒模型的水平内边距（代码块/引用块，见
         // `layout_tokens::box_content_inset_x`——断行宽度已在
         // `box_layout_config` 里同步收窄）、引用的竖条让出多少、源码里缩进
@@ -783,12 +945,18 @@ impl DecorationDraft {
         //
         // 缩进此前挂在标记上，于是**没有标记的块一列都让不出来**——嵌套的
         // 任务项贴着左边缘，而同一层的普通列表项缩进了。
-        let box_inset = box_content_inset_x(kind);
-        let column_gutter = config.default_advance() * f32::from(self.indent_columns);
+        let box_inset = box_content_inset_x(kind, config);
+        let list_unit = ContainerMetrics::new(config).list_indent;
+        let column_gutter = list_unit * f32::from(self.indent_columns) / 2.0;
         let marker_gutter = marker
             .as_ref()
-            .map_or(0.0, |marker| marker.advance + config.default_advance());
-        let indent = box_inset + quote_gutter + column_gutter + marker_gutter;
+            .map_or(0.0, |marker| list_unit.max(marker.advance + marker.gap));
+        let task_gutter = if matches!(kind, BlockKind::TaskListItem { .. }) {
+            (list_unit - config.line_height() * yu_core::ThemeSpec::TASK_MARKER_ADVANCE_EM).max(0.0)
+        } else {
+            0.0
+        };
+        let indent = box_inset + quote_gutter + column_gutter + marker_gutter + task_gutter;
         let rule = self
             .rule
             .then(|| thematic_break_metrics(self.source_range, indent, config))
@@ -811,16 +979,68 @@ impl DecorationDraft {
         // 掉过一次的——`assemble` 把它归零，代码块里一个字都不着色，而
         // `yu-markdown` 那一侧的断言全绿：装饰产出是对的，丢在下一层。
         let font_scale = heading.map_or(1.0, |heading| heading.font_scale);
+        let literal_monospace = self
+            .styles
+            .iter()
+            .any(|style| style.font() == yu_core::ThemeFont::SystemMono);
         let mut attrs = Vec::with_capacity(self.styles.len());
         for base in self.styles {
-            let style = if heading.is_some() {
-                TextStyle::Strong
+            let style = if let Some(heading) = heading {
+                if theme.heading_bold[usize::from(heading.level - 1)] != 0 {
+                    base.style().union(TextStyle::Strong)
+                } else {
+                    base.style()
+                }
             } else {
                 base.style()
             };
+            let font = if base.font() != yu_core::ThemeFont::Inherit {
+                base.font()
+            } else if style.is_code() {
+                theme.code_font
+            } else if heading.is_some() {
+                theme.heading_font
+            } else {
+                theme.body_font
+            };
             attrs.push(
                 TextAttrs::new(style)
-                    .with_size_scale(font_scale)
+                    .with_inline_box_id(base.inline_box_id())
+                    .with_inline_inset(if base.inline_box_id().is_some() && !is_code_block(kind) {
+                        (config.theme().inline_padding().0 + config.theme().inline_border())
+                            * config.line_height()
+                            / theme.body_size
+                    } else {
+                        0.0
+                    })
+                    .ok_or(LayoutError::InvalidMetrics(config.line_height().to_bits()))?
+                    .with_inline_inset_y(
+                        if base.inline_box_id().is_some() && !is_code_block(kind) {
+                            (config.theme().inline_padding().1 + config.theme().inline_border())
+                                * config.line_height()
+                                / theme.body_size
+                        } else {
+                            0.0
+                        },
+                    )
+                    .ok_or(LayoutError::InvalidMetrics(config.line_height().to_bits()))?
+                    .with_font(font)
+                    .with_letter_spacing(heading.map_or(0.0, |h| {
+                        theme.heading_letter_spacing[usize::from(h.level - 1)]
+                            * config.line_height()
+                            / theme.body_size
+                    }))
+                    .ok_or(LayoutError::InvalidMetrics(config.line_height().to_bits()))?
+                    .with_size_scale(
+                        font_scale
+                            * if is_code_block(kind) && base.style().is_code() {
+                                theme.code_block_size_ratio
+                            } else if base.style().is_code() {
+                                config.theme().inline_code_size_ratio(heading.is_some())
+                            } else {
+                                1.0
+                            },
+                    )
                     .ok_or(LayoutError::InvalidMetrics(font_scale.to_bits()))?
                     .with_role(base.role()),
             );
@@ -830,14 +1050,54 @@ impl DecorationDraft {
         // 1.65，其余一律正文 1.6（段落、引用、列表同待遇，见
         // `layout_tokens`——这是 Typora 标杆值，不再默认 1.0）。
         let line_height_scale = if let Some(heading) = heading {
-            heading.line_height_scale
+            heading.line_height_scale * heading.font_scale
         } else if is_code_block(kind) {
-            LINE_HEIGHT_CODE
+            theme.code_line_ratio * theme.code_block_size_ratio
         } else {
-            LINE_HEIGHT_BODY
+            theme.body_line_ratio
         };
 
+        let line_height_scale =
+            crate::layout_tokens::resolved_line_height(config, line_height_scale)
+                / config.line_height();
+
+        let ancestor_ornaments = ancestors
+            .into_iter()
+            .zip(&self.ancestors)
+            .map(|(marker, source)| {
+                let metrics = ContainerMetrics::new(config);
+                let outside = self
+                    .quote
+                    .map_or(0, |(_, outside)| outside)
+                    .min(source.quote_depth);
+                let quotes = f32::from(source.quote_depth) * metrics.quote_indent
+                    - f32::from(source.quote_depth - outside) * metrics.quote_margin_left;
+                let gutter = list_unit.max(marker.advance + marker.gap);
+                MarkerOrnament {
+                    quoted: source.quote_depth > 0,
+                    source: marker.source,
+                    text: marker.text,
+                    x: box_inset
+                        + quotes
+                        + list_unit * f32::from(source.list_depth.saturating_sub(1))
+                        + gutter
+                        - marker
+                            .shape
+                            .map_or(marker.advance + marker.gap, |shape| shape.before_text),
+                    advance: marker.advance,
+                    shaped: marker.shaped,
+                    shape: marker.shape,
+                }
+            })
+            .collect();
+        let primary_quoted = self
+            .marker
+            .as_ref()
+            .is_some_and(|marker| marker.quote_depth > 0);
+
         Ok(BlockLayoutInput {
+            content_left: indent,
+            container_left: (indent - box_inset).max(0.0),
             text: self.text,
             runs: self.runs,
             widgets: self.widgets,
@@ -845,7 +1105,19 @@ impl DecorationDraft {
             lines: vec![LineSpan::new(visual, BLOCK_LINE_STYLE)],
             styles: BlockStyleTable { attrs },
             line_styles: BlockLineStyleTable {
-                attrs: LineAttrs::new(indent, line_height_scale)?,
+                attrs: LineAttrs::new(indent, line_height_scale)?.with_font_struts(
+                    if literal_monospace {
+                        yu_core::FontStrutMode::BaseFont
+                    } else if heading.is_some() {
+                        yu_core::FontStrutMode::DeclaredFonts
+                    } else if !is_code_block(kind) {
+                        // Body text shares a baseline across independently sized
+                        // inline font struts; their union may exceed line-height.
+                        config.theme().body_font_struts()
+                    } else {
+                        config.theme().code_font_struts()
+                    },
+                ),
             },
             ornaments: BlockOrnaments {
                 heading: heading.map(|heading| HeadingOrnament {
@@ -854,18 +1126,22 @@ impl DecorationDraft {
                     font_scale: heading.font_scale,
                     line_height_scale: heading.line_height_scale,
                 }),
+                ancestors: ancestor_ornaments,
                 marker: marker.map(|marker| MarkerOrnament {
+                    quoted: primary_quoted,
                     source: marker.source,
                     text: marker.text,
-                    x: quote_gutter + column_gutter,
+                    x: box_inset + marker_quote_gutter + column_gutter + marker_gutter
+                        - marker
+                            .shape
+                            .map_or(marker.advance + marker.gap, |shape| shape.before_text),
                     advance: marker.advance,
                     shaped: marker.shaped,
+                    shape: marker.shape,
                 }),
                 quote: quote.map(|quote| BlockQuoteOrnament {
                     source: self.source_range,
                     depth: quote.depth,
-                    unit: quote.unit,
-                    bar_width: quote.bar_width,
                 }),
                 rule,
             },
