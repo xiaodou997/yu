@@ -15,7 +15,7 @@ jobs:
       # 看见一层。
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [xcode-27, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     # Windows runner 的 Python 默认按系统代码页（cp1252）读写，而这个仓库的
     # 门禁脚本连同它们印出来的字都是中文的：先是 read_text 解码崩，改成显式
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.97.0
+          toolchain: 1.98.1
           # llvm-tools 是为了 check-ffi-symbols.py：Windows runner 上没有
           # nm，llvm-nm 从 rustup 的 sysroot 里拿。
           components: rustfmt, clippy, llvm-tools
@@ -78,22 +78,23 @@ jobs:
   # `tools/fuzz.sh 120` 这个字符串一直对得上，**它守不住那条命令在那个
   # runner 上能不能执行**。这是 parity 的盲区，记在这里。
   fuzz:
-    runs-on: macos-latest
+    runs-on: ${{ vars.YU_MACOS_RUNNER || 'xcode-27' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.97.0
+          toolchain: 1.98.1
       - run: tools/fuzz.sh 120
 
   # v1 时期产品壳与它的 self-check 从未进入 CI，因而没有反馈回路，
   # self-check 代码无节制地长到了 3800 行。v2 起它们必须每次提交都跑。
   macos-shell:
-    runs-on: macos-latest
+    runs-on: ${{ vars.YU_MACOS_RUNNER || 'xcode-27' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.97.0
+          toolchain: 1.98.1
       - run: platform/macos/yu-shell-macos/run-self-checks.sh --build
+      - run: platform/macos/yu-shell-macos/build-app.sh --release
 

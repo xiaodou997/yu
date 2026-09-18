@@ -70,7 +70,10 @@ def main():
     binary = HERE / ".build/Yu.app/Contents/MacOS/Yu"
     if not binary.is_file():
         parser.error("Build Yu.app before running this check")
-    environment = {"mode": "scripted-regression", "build": "debug", "binary": str(binary),
+    manifest = json.loads((HERE / ".build/build-manifest.json").read_text())
+    if manifest["app_sha256"] != hashlib.sha256(binary.read_bytes()).hexdigest():
+        parser.error("Build manifest does not match the executable")
+    environment = {"mode": "scripted-regression", "build": manifest["configuration"], "binary": str(binary),
                    "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
     for key, command in {
         "macos": ["sw_vers"], "hardware": ["sysctl", "-n", "hw.model", "machdep.cpu.brand_string"],
