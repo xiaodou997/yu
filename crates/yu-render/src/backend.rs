@@ -68,6 +68,8 @@ pub const DRAW_IMAGE: u32 = 2;
 /// rect_width / rect_height；u0..v1 恒为 0,0,1,1，fragment 用 uv 在整 quad
 /// 上定位。u0..v1 与 shadow_* 槽位语义按 kind 区分，见各字段注释。
 pub const DRAW_ROUNDED_FILL_RECT: u32 = 3;
+/// Three local points occupy rect_offset, rect_size, shadow_offset; radius is stroke width.
+pub const DRAW_STROKE_POLYLINE: u32 = 4;
 pub const IMAGE_KIND_REGULAR: u32 = 0;
 const IMAGE_KIND_EMBEDDED_SVG_BASE: u32 = 1;
 
@@ -390,6 +392,62 @@ pub fn build_draw_commands_at_viewport(
                     rect_height: 0.0,
                     shadow_offset_x: 0.0,
                     shadow_offset_y: 0.0,
+                    shadow_blur: 0.0,
+                    shadow_color: 0,
+                });
+            }
+            RenderCommand::StrokePolyline {
+                bounds,
+                points,
+                width,
+                color,
+            } => {
+                if !width.is_finite()
+                    || width <= 0.0
+                    || points.iter().any(|p| {
+                        !p.x().is_finite()
+                            || !p.y().is_finite()
+                            || p.x() < width / 2.0
+                            || p.y() < width / 2.0
+                            || p.x() > bounds.width() - width / 2.0
+                            || p.y() > bounds.height() - width / 2.0
+                    })
+                {
+                    return Err(BackendError::InvalidRenderCommand(
+                        "invalid polyline stroke",
+                    ));
+                }
+                let x = bounds.x() - viewport.x();
+                let y = bounds.y() - viewport.y();
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(BackendError::InvalidRenderCommand(
+                        "polyline position is not finite",
+                    ));
+                }
+                commands.push(DrawCommand {
+                    kind: DRAW_STROKE_POLYLINE,
+                    x,
+                    y,
+                    width: bounds.width(),
+                    height: bounds.height(),
+                    u0: 0.0,
+                    v0: 0.0,
+                    u1: 1.0,
+                    v1: 1.0,
+                    red: normalized_channel(color.red()),
+                    green: normalized_channel(color.green()),
+                    blue: normalized_channel(color.blue()),
+                    alpha: normalized_channel(color.alpha()),
+                    page: u32::MAX,
+                    resource: 0,
+                    image_kind: IMAGE_KIND_REGULAR,
+                    radius: width,
+                    rect_offset_x: points[0].x(),
+                    rect_offset_y: points[0].y(),
+                    rect_width: points[1].x(),
+                    rect_height: points[1].y(),
+                    shadow_offset_x: points[2].x(),
+                    shadow_offset_y: points[2].y(),
                     shadow_blur: 0.0,
                     shadow_color: 0,
                 });
@@ -739,7 +797,13 @@ pub fn build_draw_commands_at_viewport(
 }
 
 pub fn build_damage_rects(plan: &RenderPlan) -> Result<Vec<DamageRect>, BackendError> {
-    let viewport = plan.viewport();
+    build_damage_rects_at_viewport(plan, plan.viewport())
+}
+
+pub fn build_damage_rects_at_viewport(
+    plan: &RenderPlan,
+    viewport: yu_scene::Rect,
+) -> Result<Vec<DamageRect>, BackendError> {
     if !viewport.x().is_finite()
         || !viewport.y().is_finite()
         || !viewport.width().is_finite()
@@ -970,6 +1034,72 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].x, 12.0);
         assert_eq!(commands[0].y, 20.0);
+    }
+
+    #[test]
+    fn source_backed_polyline_preserves_points_stroke_and_viewport_translation() {
+        use yu_core::{ByteOffset, Revision, TextRange};
+        use yu_scene::{OrnamentPrimitive, OrnamentRole, OrnamentShape, Point, Rect, SceneBuilder};
+        let viewport = Rect::new(0.0, 50.0, 120.0, 80.0).expect("viewport");
+        let bounds = Rect::new(14.0, 66.0, 12.0, 12.0).expect("bounds");
+        let source = TextRange::new(ByteOffset::new(4), ByteOffset::new(7)).expect("source");
+        let points = [
+            Point::new(3.0, 6.0),
+            Point::new(5.0, 9.0),
+            Point::new(9.0, 3.0),
+        ];
+        let mut scene = SceneBuilder::new(Revision::INITIAL, viewport).expect("scene");
+        scene
+            .ornament(
+                OrnamentPrimitive::new(source, bounds, Rgba8::white(), OrnamentRole::Mark)
+                    .with_shape(OrnamentShape::Polyline { points, width: 1.5 }),
+            )
+            .expect("stroke");
+        let scene = scene.finish();
+        assert_eq!(scene.primitives()[0].bounds(), bounds);
+        assert!(
+            matches!(scene.primitives()[0], yu_scene::Primitive::Ornament(ornament) if ornament.source()==source)
+        );
+        let atlas =
+            yu_font::GlyphAtlas::new(yu_font::GlyphAtlasConfig::new(16, 16, 1).expect("atlas"));
+        let plan = RenderPlanBuilder::new()
+            .build(&scene, &atlas)
+            .expect("plan");
+        let commands = build_draw_commands_at_viewport(
+            &plan,
+            viewport,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("commands");
+        assert_eq!(commands.len(), 1);
+        let c = commands[0];
+        assert_eq!(c.kind, DRAW_STROKE_POLYLINE);
+        assert_eq!((c.x, c.y, c.width, c.height), (14.0, 16.0, 12.0, 12.0));
+        assert_eq!(
+            (
+                c.rect_offset_x,
+                c.rect_offset_y,
+                c.rect_width,
+                c.rect_height,
+                c.shadow_offset_x,
+                c.shadow_offset_y
+            ),
+            (3.0, 6.0, 5.0, 9.0, 9.0, 3.0)
+        );
+        assert_eq!(c.radius, 1.5);
+        for width in [0.0, f32::NAN, 20.0] {
+            let mut invalid = SceneBuilder::new(Revision::INITIAL, viewport).expect("scene");
+            assert!(
+                invalid
+                    .ornament(
+                        OrnamentPrimitive::new(source, bounds, Rgba8::white(), OrnamentRole::Mark)
+                            .with_shape(OrnamentShape::Polyline { points, width })
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]

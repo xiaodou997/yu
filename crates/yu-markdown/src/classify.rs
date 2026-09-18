@@ -1,64 +1,9 @@
-//! 块是什么，由语法树说。
+//! Source-backed identities for semantic layout leaves.
 //!
-//! # 这一层要回答的问题
-//!
-//! `block_sequence` 是一个按行走的扁平扫描器，它一个人干两件事：**块从哪到
-//! 哪**（边界），以及**块是什么**（`BlockKind`）。第二件事语法树也在做，于是
-//! 同一句 Markdown 语法在两处各有一个实现——`# ` 的判断在 `Line::
-//! atx_heading_level` 与 `yu-syntax` 的 ATX 解析器里各写了一遍，`[x]` 在
-//! `task::parse_task_marker` 与 GFM 的 `TaskList` extension 里各写了一遍。
-//!
-//! 两份实现不一致的地方就是产品上的缺陷：`标题\n===` 树里是
-//! `SetextHeading1`，行扫描器里是一个普通段落，于是 Setext 标题既不放大也不
-//! 加粗；`foo\n[a]: /x` 的第二行在 CommonMark 里是段落的延续，行扫描器却把它
-//! 登记成一条引用定义。
-//!
-//! 这个模块把第二件事整个交给树。**边界仍然归行扫描器**——块是编辑器的缓存
-//! 与布局单位，换成树的嵌套粒度意味着改嵌套列表里的一个字要重排整个外层项，
-//! 那是另一刀的事（见 overview 的「块结构合并：调查结论」）。
-//!
-//! # 树给变体，行扫描器给负载
-//!
-//! `BlockKind` 的每一个变体现在都由树的节点类型决定。变体上挂的那些字段
-//! （列表标记是 `-` 还是 `*`、序号从几起、围栏闭没闭合）不是分类，是**从源码
-//! 字节里读出来的负载**，行扫描器扫边界的时候顺手就读到了，树反而说不出
-//! 「这个围栏没有收尾」。所以负载仍然由 [`BlockShape`] 带过来。
-//!
-//! 判据是「这一句话是不是 Markdown 语法的分类」：是的归树，不是的归谁读到
-//! 归谁。
-//!
-//! # 一个块只是节点的一个片段时，谁也不是
-//!
-//! 行扫描器的边界与树的块边界不保证对齐，于是**一个树节点可能横跨两个块**。
-//! 这时要分两种情况：
-//!
-//! - **容器节点**（`Blockquote` / `ListItem`）横跨是正常的：块就是容器里的
-//!   一组行，`  - 内` 那一块是外层列表项的一部分，说它是一个列表项没有错。
-//! - **叶子节点**横跨说明这个块只拿到了它的一半。`foo\n-` 是一个二级 Setext
-//!   标题，而行扫描器在 `-` 那一行另起了一块（它看上去像一个列表标记）——
-//!   两块都说自己是二级标题的话，画面上会出现两个放大的行，其中一个只有一个
-//!   `-`。这种块退回 `Paragraph`：它确实不是任何一种完整的块。
-//!
-//! 判据是 [`NodeKind::is_block_context`]，不是「节点比块大还是小」。
-//!
-//! # 树说不是那种块的时候以树为准
-//!
-//! `2. bar` 跟在一个段落后面时，行扫描器认得那个 `2.` 并开一个新块，而
-//! CommonMark 说序号不是 1 的有序列表**不能打断段落**——树给的是一个跨两行的
-//! `Paragraph`。这时 kind 取 `Paragraph`：行扫描器在边界上仍然有发言权（那一
-//! 行确实另起了一个缓存单位），在「它是什么」上没有。
-//!
-//! 块**横跨好几个树块**时同理，只是这回连一个候选节点都没有——查询一路退到
-//! `Document`。`- a\n<div>\nx` 就是一个：行扫描器把 `<div>` 当成列表项的惰性
-//! 延续收进同一个块，树把它拆成 `ListItem` 与一个 `HTMLBlock`。这种块按源码
-//! 原样画（不变量 I5「未支持的语法按普通段落源码绘制」）。
-//!
-//! # 树不在的时候
-//!
-//! `MarkdownDocument::tree` 只有一种成因会是 `None`：源码超过 4 GiB。那种文档
-//! 一条装饰都产不出来，所以这里退化成 [`BlockShape`] 自己的结构形状——`# 标题`
-//! 会变成一个普通段落。**这是登记在案的降级**，不是兜底：那份文档本来就是
-//! 按纯文本画的。
+//! `presentation_kind` combines a syntax leaf with its list/quote ancestry.
+//! The normal parser uses this hierarchy for both block identity and boundaries.
+//! Lexical `BlockShape` classification below is retained only for source sizes
+//! beyond the syntax parser's 32-bit range; such source has no native preview.
 
 use yu_core::TextRange;
 use yu_syntax::{NodeKind, Tree};
@@ -67,6 +12,96 @@ use yu_text::TextSnapshot;
 use crate::block_sequence::{BlockKind, TaskState};
 use crate::extension::{SyntaxNode, block_node};
 use crate::reference::read_range;
+
+/// Semantic leaves determine boundaries; their ancestors supply container
+/// meaning. Byte ranges remain source backed, including editable prefixes.
+pub(crate) fn presentation_kind(
+    path: &[SyntaxNode<'_>],
+    source: &TextSnapshot,
+    range: TextRange,
+) -> BlockKind {
+    let leaf = path.last().expect("flow includes root");
+    if let Some(level) = heading_level(leaf.kind()) {
+        return BlockKind::Heading { level };
+    }
+    match leaf.kind() {
+        NodeKind::FencedCode => {
+            let marks: Vec<_> = leaf
+                .children()
+                .filter(|child| child.kind() == NodeKind::CodeMark)
+                .collect();
+            let marker = marks
+                .first()
+                .and_then(|mark| read_range(source, mark.range()))
+                .and_then(|text| text.first().copied())
+                .unwrap_or(b'`') as char;
+            return BlockKind::FencedCodeBlock {
+                marker,
+                closed: marks.len() > 1,
+            };
+        }
+        NodeKind::CodeBlock => return BlockKind::IndentedCode,
+        NodeKind::HorizontalRule => return BlockKind::ThematicBreak,
+        NodeKind::LinkReference => return BlockKind::ReferenceDefinition,
+        NodeKind::HtmlBlock | NodeKind::CommentBlock | NodeKind::ProcessingInstructionBlock => {
+            return BlockKind::HtmlBlock;
+        }
+        _ => {}
+    }
+    if let Some(item) = path
+        .iter()
+        .rev()
+        .find(|node| node.kind() == NodeKind::ListItem)
+        && let Some(mark) = item
+            .children()
+            .find(|node| node.kind() == NodeKind::ListMark)
+        && range.start() <= mark.range().start()
+        && mark.range().end() <= range.end()
+    {
+        let text = read_range(source, mark.range()).unwrap_or_default();
+        let ordered = text.first().is_some_and(u8::is_ascii_digit);
+        let marker = text.last().copied().unwrap_or(b'-') as char;
+        let start = if ordered {
+            std::str::from_utf8(&text[..text.len().saturating_sub(1)])
+                .ok()
+                .and_then(|text| text.parse().ok())
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let depth = path
+            .iter()
+            .filter(|node| node.kind() == NodeKind::ListItem)
+            .count()
+            .saturating_sub(1)
+            .min(255) as u8;
+        return match task_state(*item, source) {
+            Some(state) => BlockKind::TaskListItem {
+                ordered,
+                depth,
+                marker,
+                start,
+                state,
+            },
+            None => BlockKind::ListItem {
+                ordered,
+                depth,
+                marker,
+                start,
+            },
+        };
+    }
+    let depth = path
+        .iter()
+        .filter(|node| node.kind() == NodeKind::Blockquote)
+        .count()
+        .min(255) as u8;
+    if depth > 0 {
+        BlockKind::BlockQuote { depth }
+    } else {
+        BlockKind::Paragraph
+    }
+}
 
 /// 行扫描器认出的块结构：它定边界，也带着树表示不了的那部分负载。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

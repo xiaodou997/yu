@@ -109,7 +109,7 @@ impl OutlineSnapshot {
         // 祖先链：(序号, 级别)，级别自底向上严格递减。
         let mut ancestors: Vec<(usize, u8)> = Vec::new();
 
-        for (block, markdown_block) in markdown.blocks().into_iter().enumerate() {
+        for (block, markdown_block) in markdown.semantic_blocks().into_iter().enumerate() {
             let BlockKind::Heading { level } = markdown_block.kind() else {
                 continue;
             };

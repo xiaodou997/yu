@@ -38,6 +38,14 @@ pub fn notify_resource_completion() {
 static RESOURCE_COMPLETION_GENERATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Notify a waiting native host without invalidating resource/layout identity.
+pub fn notify_frame_work_ready() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        native::yu_metal_notify_frame_work_ready()
+    };
+}
+
 pub fn resource_completion_generation() -> u64 {
     RESOURCE_COMPLETION_GENERATION.load(Ordering::Acquire)
 }
@@ -49,8 +57,8 @@ use yu_assets::{
 use yu_core::Revision;
 use yu_render::{
     AtlasPageUpload, BackendError, EmbeddedSvgUpload, FrameConsumer, RenderPlan, RenderUploader,
-    SurfaceConfig, build_damage_rects, build_draw_commands_at_viewport, cull_draw_commands,
-    requires_full_clear, scroll_exposed_damage,
+    SurfaceConfig, build_damage_rects_at_viewport, build_draw_commands_at_viewport,
+    cull_draw_commands, requires_full_clear, scroll_exposed_damage,
 };
 #[cfg(target_os = "macos")]
 use yu_render::{DamageRect, DrawCommand, IMAGE_KIND_REGULAR, embedded_image_kind};
@@ -72,7 +80,11 @@ mod native {
     use super::{DamageRect, DrawCommand, NativeImageTextureBinding, NativeTextureBinding};
 
     unsafe extern "C" {
+        pub fn yu_metal_layer_presentation_time(layer: *mut c_void) -> f64;
+        #[cfg(test)]
+        pub fn yu_metal_presentation_serial_self_check() -> i32;
         pub fn yu_metal_notify_resource_completion();
+        pub fn yu_metal_notify_frame_work_ready();
         pub fn yu_metal_create_device(
             out_device: *mut *mut c_void,
             out_registry_id: *mut u64,
@@ -114,14 +126,6 @@ mod native {
         ) -> i32;
         #[cfg(test)]
         pub fn yu_metal_nonblocking_acquisition_probe() -> i32;
-        pub fn yu_metal_upload_alpha_texture(
-            device: *mut c_void,
-            width: u32,
-            height: u32,
-            pixels: *const u8,
-            pixel_length: usize,
-            out_texture: *mut *mut c_void,
-        ) -> i32;
         pub fn yu_metal_upload_rgba_texture(
             device: *mut c_void,
             width: u32,
@@ -133,6 +137,9 @@ mod native {
         pub fn yu_macos_image_decode_file(
             path_bytes: *const u8,
             path_length: usize,
+            max_pixel_dimension: u32,
+            intrinsic_width: *mut u32,
+            intrinsic_height: *mut u32,
             out_width: *mut u32,
             out_height: *mut u32,
             out_pixels: *mut *mut c_void,
@@ -168,9 +175,15 @@ mod native {
         ) -> i32;
         pub fn yu_metal_create_pipeline(
             device: *mut c_void,
-            source: *const std::ffi::c_char,
-            source_length: usize,
+            library: *const u8,
+            library_length: usize,
             out_pipeline: *mut *mut c_void,
+        ) -> i32;
+        #[cfg(test)]
+        pub fn yu_metal_rounded_pixel_probe(
+            device: *mut c_void,
+            pipeline: *mut c_void,
+            rgba: *mut u8,
         ) -> i32;
         pub fn yu_metal_render_plan(
             queue: *mut c_void,
@@ -507,13 +520,22 @@ impl MacosImageDecoder {
         document_path: impl AsRef<Path>,
     ) -> Result<DecodedImage, MacosImageDecodeError> {
         let location = ImageLocation::resolve(document_path, request.key().destination())?;
-        self.decode_file(location.path())
+        self.decode_file_sized(location.path(), request.max_pixel_dimension())
     }
 
     pub fn decode_file(&self, path: &Path) -> Result<DecodedImage, MacosImageDecodeError> {
+        self.decode_file_sized(path, 4096)
+    }
+    fn decode_file_sized(
+        &self,
+        path: &Path,
+        max_pixel_dimension: u32,
+    ) -> Result<DecodedImage, MacosImageDecodeError> {
         #[cfg(target_os = "macos")]
         {
             let path = path.to_str().ok_or(MacosImageDecodeError::InvalidPath)?;
+            let mut intrinsic_width = 0_u32;
+            let mut intrinsic_height = 0_u32;
             let mut width = 0_u32;
             let mut height = 0_u32;
             let mut raw_pixels = std::ptr::null_mut();
@@ -522,6 +544,9 @@ impl MacosImageDecoder {
                 native::yu_macos_image_decode_file(
                     path.as_bytes().as_ptr(),
                     path.len(),
+                    max_pixel_dimension,
+                    &mut intrinsic_width,
+                    &mut intrinsic_height,
                     &mut width,
                     &mut height,
                     &mut raw_pixels,
@@ -540,12 +565,16 @@ impl MacosImageDecoder {
             if decoded == 0 {
                 return Err(MacosImageDecodeError::NativeDecodeFailed);
             }
-            return DecodedImage::new(width, height, pixels).map_err(Into::into);
+            let dimensions = yu_assets::ImageDimensions::new(intrinsic_width, intrinsic_height)
+                .ok_or(MacosImageDecodeError::NativeDecodeFailed)?;
+            return DecodedImage::new(width, height, pixels)
+                .map(|image| image.with_intrinsic(dimensions))
+                .map_err(Into::into);
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = path;
+            let _ = (path, max_pixel_dimension);
             Err(MacosImageDecodeError::UnsupportedPlatform)
         }
     }
@@ -675,7 +704,7 @@ impl Drop for MacosImageDecodeWorker {
 }
 
 #[cfg(target_os = "macos")]
-const METAL_SHADER_SOURCE: &str = include_str!("../native/yu_shaders.metal");
+const METAL_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/yu_shaders.metallib"));
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -953,6 +982,15 @@ impl fmt::Debug for MetalSurface {
 }
 
 impl MetalSurface {
+    /// Monotonic CoreAnimation time of the latest submitted drawable, or zero
+    /// until that exact submission has actually been presented.
+    pub fn latest_presentation_time(&self) -> f64 {
+        #[cfg(target_os = "macos")]
+        return unsafe { native::yu_metal_layer_presentation_time(self.raw_layer.as_ptr()) };
+        #[cfg(not(target_os = "macos"))]
+        0.0
+    }
+
     pub fn new(device: MetalDevice, config: SurfaceConfig) -> Result<Self, MetalRenderError> {
         #[cfg(target_os = "macos")]
         {
@@ -1246,13 +1284,13 @@ impl RenderUploader for MetalUploader {
     type Texture = MetalTexture;
     type Error = MetalRenderError;
 
-    fn upload_alpha_page(&mut self, page: &AtlasPageUpload) -> Result<Self::Texture, Self::Error> {
+    fn upload_glyph_page(&mut self, page: &AtlasPageUpload) -> Result<Self::Texture, Self::Error> {
         let expected = usize::try_from(page.width())
             .ok()
             .and_then(|width| {
                 usize::try_from(page.height())
                     .ok()
-                    .and_then(|height| width.checked_mul(height))
+                    .and_then(|height| width.checked_mul(height)?.checked_mul(4))
             })
             .ok_or(MetalRenderError::InvalidPixelBuffer {
                 expected: usize::MAX,
@@ -1269,7 +1307,7 @@ impl RenderUploader for MetalUploader {
         {
             let mut raw = std::ptr::null_mut();
             let uploaded = unsafe {
-                native::yu_metal_upload_alpha_texture(
+                native::yu_metal_upload_rgba_texture(
                     self.device.raw(),
                     page.width(),
                     page.height(),
@@ -1351,7 +1389,7 @@ impl MetalAtlas {
             {
                 continue;
             }
-            let texture = uploader.upload_alpha_page(page)?;
+            let texture = uploader.upload_glyph_page(page)?;
             staged.push((page.page(), identity, texture));
         }
         let uploaded = staged.len();
@@ -1641,7 +1679,7 @@ impl MetalCommandQueue {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = device;
+            let _ = (device, library);
             Err(MetalRenderError::UnsupportedPlatform)
         }
     }
@@ -1686,16 +1724,23 @@ impl MetalPipeline {
     pub fn new(device: MetalDevice) -> Result<Self, MetalRenderError> {
         #[cfg(target_os = "macos")]
         {
-            let source = METAL_SHADER_SOURCE.as_bytes();
-            let source = std::ffi::CString::new(source).map_err(|_| {
-                MetalRenderError::InvalidRenderCommand("Metal shader source contains NUL")
-            })?;
+            Self::with_library(device, METAL_LIBRARY)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::with_library(device, &[])
+        }
+    }
+
+    pub fn with_library(device: MetalDevice, library: &[u8]) -> Result<Self, MetalRenderError> {
+        #[cfg(target_os = "macos")]
+        {
             let mut raw = std::ptr::null_mut();
             let created = unsafe {
                 native::yu_metal_create_pipeline(
                     device.raw(),
-                    source.as_ptr(),
-                    METAL_SHADER_SOURCE.len(),
+                    library.as_ptr(),
+                    library.len(),
                     &mut raw,
                 )
             };
@@ -2274,6 +2319,18 @@ impl fmt::Debug for MetalFrameRenderer {
 impl MetalFrameRenderer {
     pub fn new(device: MetalDevice) -> Result<Self, MetalRenderError> {
         let pipeline = MetalPipeline::new(device.clone())?;
+        Self::with_pipeline(device, pipeline)
+    }
+
+    pub fn with_library(device: MetalDevice, library: &[u8]) -> Result<Self, MetalRenderError> {
+        let pipeline = MetalPipeline::with_library(device.clone(), library)?;
+        Self::with_pipeline(device, pipeline)
+    }
+
+    fn with_pipeline(
+        device: MetalDevice,
+        pipeline: MetalPipeline,
+    ) -> Result<Self, MetalRenderError> {
         Ok(Self {
             queue: MetalCommandQueue::new(device)?,
             pipeline,
@@ -2441,7 +2498,7 @@ impl MetalFrameRenderer {
         let damage = if scroll_pixels.is_some() {
             scroll_exposed_damage(self.last_viewport.expect("retained viewport"), viewport)?
         } else {
-            build_damage_rects(plan)?
+            build_damage_rects_at_viewport(plan, viewport)?
         };
         let full_clear = scroll_pixels.is_none()
             && (requires_full_clear(
@@ -2645,6 +2702,9 @@ impl MetalFrameRenderer {
 
     /// Uploads and presents a retained frame at an alternate viewport.  The
     /// frame remains revision-bound; only the camera origin changes.
+    // The presentation camera is explicit alongside the independently owned
+    // surface/frame/images so drawing cannot silently reuse content coordinates.
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_viewport_frame_with_images_at(
         &mut self,
         surface: &MetalSurface,
@@ -2705,31 +2765,35 @@ mod tests {
         let worker_calls = Arc::clone(&calls);
         let worker = MacosImageDecodeWorker::with_decoder(move |_| {
             worker_calls.fetch_add(1, Ordering::SeqCst);
-            entered_tx.send(()).unwrap();
-            resume_rx.recv().unwrap();
+            entered_tx.send(()).expect("valid native renderer fixture");
+            resume_rx.recv().expect("valid native renderer fixture");
             Err(MacosImageDecodeError::NativeDecodeFailed)
         })
-        .unwrap();
+        .expect("valid native renderer fixture");
         let request = ImageRequest::new(
             Revision::INITIAL,
             yu_core::TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(1))
-                .unwrap(),
+                .expect("valid native renderer fixture"),
             "test.png".to_owned(),
         )
-        .unwrap();
-        worker.submit(request.clone(), "/tmp/test.md").unwrap();
+        .expect("valid native renderer fixture");
+        worker
+            .submit(request.clone(), "/tmp/test.md")
+            .expect("valid native renderer fixture");
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap();
-        worker.submit(request, "/tmp/test.md").unwrap();
+            .expect("valid native renderer fixture");
+        worker
+            .submit(request, "/tmp/test.md")
+            .expect("valid native renderer fixture");
         let owner = thread::spawn(move || {
             drop(worker);
-            finished_tx.send(()).unwrap();
+            finished_tx.send(()).expect("valid native renderer fixture");
         });
         let dropped = finished_rx.recv_timeout(std::time::Duration::from_secs(2));
         // Always release the fake decoder, including when Drop regresses to join.
-        resume_tx.send(()).unwrap();
-        owner.join().unwrap();
+        resume_tx.send(()).expect("valid native renderer fixture");
+        owner.join().expect("valid native renderer fixture");
         assert!(dropped.is_ok(), "closing the owner waited for decoding");
         assert!(
             matches!(
@@ -2750,7 +2814,11 @@ mod tests {
             ready: std::cell::RefCell::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
         };
-        assert!(!worker.has_completed().unwrap());
+        assert!(
+            !worker
+                .has_completed()
+                .expect("valid native renderer fixture")
+        );
         for destination in ["first.png", "second.png"] {
             sender
                 .send(MacosImageDecodeResult {
@@ -2760,21 +2828,29 @@ mod tests {
                             yu_core::ByteOffset::ZERO,
                             yu_core::ByteOffset::new(1),
                         )
-                        .unwrap(),
+                        .expect("valid native renderer fixture"),
                         destination.to_owned(),
                     )
-                    .unwrap(),
+                    .expect("valid native renderer fixture"),
                     result: Err(MacosImageDecodeError::NativeDecodeFailed),
                 })
-                .unwrap();
+                .expect("valid native renderer fixture");
         }
-        assert!(worker.has_completed().unwrap());
-        assert!(worker.has_completed().unwrap());
+        assert!(
+            worker
+                .has_completed()
+                .expect("valid native renderer fixture")
+        );
+        assert!(
+            worker
+                .has_completed()
+                .expect("valid native renderer fixture")
+        );
         assert_eq!(
             worker
                 .try_recv()
-                .unwrap()
-                .unwrap()
+                .expect("valid native renderer fixture")
+                .expect("valid native renderer fixture")
                 .request()
                 .key()
                 .destination(),
@@ -2783,20 +2859,33 @@ mod tests {
         assert_eq!(
             worker
                 .try_recv()
-                .unwrap()
-                .unwrap()
+                .expect("valid native renderer fixture")
+                .expect("valid native renderer fixture")
                 .request()
                 .key()
                 .destination(),
             "second.png"
         );
-        assert!(!worker.has_completed().unwrap());
+        assert!(
+            !worker
+                .has_completed()
+                .expect("valid native renderer fixture")
+        );
         drop(sender);
         assert!(matches!(
             worker.has_completed(),
             Err(MacosImageDecodeError::WorkerClosed)
         ));
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn presentation_identity_rejects_pending_and_out_of_order_callbacks() {
+        assert_eq!(
+            unsafe { native::yu_metal_presentation_serial_self_check() },
+            1
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn blocked_drawable_acquisition_does_not_block_requests_or_detach() {
@@ -2835,7 +2924,7 @@ mod tests {
     #[test]
     fn retained_scroll_requires_pixel_alignment_and_overlap() {
         use yu_scene::Rect;
-        let original = Rect::new(0.0, 0.0, 100.0, 200.0).unwrap();
+        let original = Rect::new(0.0, 0.0, 100.0, 200.0).expect("valid native renderer fixture");
         for (y, scale, expected) in [
             (20.0, 1.0, Some(20)),
             (-20.0, 2.0, Some(-40)),
@@ -2848,16 +2937,28 @@ mod tests {
             (1.0, f64::NAN, None),
         ] {
             assert_eq!(
-                retained_scroll_pixels(original, Rect::new(0.0, y, 100.0, 200.0).unwrap(), scale),
+                retained_scroll_pixels(
+                    original,
+                    Rect::new(0.0, y, 100.0, 200.0).expect("valid native renderer fixture"),
+                    scale
+                ),
                 expected
             );
         }
         assert_eq!(
-            retained_scroll_pixels(original, Rect::new(1.0, 1.0, 100.0, 200.0).unwrap(), 1.0),
+            retained_scroll_pixels(
+                original,
+                Rect::new(1.0, 1.0, 100.0, 200.0).expect("valid native renderer fixture"),
+                1.0
+            ),
             None
         );
         assert_eq!(
-            retained_scroll_pixels(original, Rect::new(0.0, 1.0, 100.0, 201.0).unwrap(), 1.0),
+            retained_scroll_pixels(
+                original,
+                Rect::new(0.0, 1.0, 100.0, 201.0).expect("valid native renderer fixture"),
+                1.0
+            ),
             None
         );
     }
@@ -2904,6 +3005,27 @@ mod tests {
                 current: 8,
                 actual: 7,
             })
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_rounded_background_preserves_all_rgba_channels() {
+        let device = MetalDevice::system_default().expect("Metal device");
+        let pipeline = MetalPipeline::new(device.clone()).expect("Metal pipeline");
+        let mut pixel = [0_u8; 4];
+        let result = unsafe {
+            native::yu_metal_rounded_pixel_probe(
+                device.raw(),
+                pipeline.inner.raw.as_ptr(),
+                pixel.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 1, "GPU probe must execute");
+        assert_eq!(
+            pixel,
+            [49, 127, 185, 255],
+            "C/MSL layout must preserve color"
         );
     }
 
@@ -2985,7 +3107,7 @@ mod tests {
         assert_eq!((image.width(), image.height()), (4, 3));
         assert_eq!(image.pixels().len(), 4 * 3 * 4);
         assert!(
-            image.pixels().chunks_exact(4).any(|pixel| {
+            image.pixels().as_chunks::<4>().0.iter().any(|pixel| {
                 pixel[0] > 200 && pixel[1] < 32 && pixel[2] < 32 && pixel[3] > 200
             })
         );
@@ -3184,7 +3306,8 @@ mod tests {
                 plan,
                 &gpu_atlas,
                 &MetalImageAtlas::new(),
-                Rect::new(viewport.x(), y, viewport.width(), viewport.height()).unwrap(),
+                Rect::new(viewport.x(), y, viewport.width(), viewport.height())
+                    .expect("valid native renderer fixture"),
                 Rgba8::new(0, 0, 0, 0),
             );
             assert!(matches!(

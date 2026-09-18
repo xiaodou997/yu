@@ -36,17 +36,22 @@ pub use accessibility::{
 };
 pub use blockinput::{
     BlockLayoutInput, BlockLineStyleTable, BlockOrnaments, BlockQuoteOrnament, BlockStyleTable,
-    HeadingOrnament, MarkerOrnament, ThematicBreakOrnament,
+    HeadingOrnament, MarkerOrnament, MarkerShape, MarkerShapeKind, ThematicBreakOrnament,
 };
 pub use blockview::{BlockCaret, BlockCluster, BlockGlyph, BlockHit, BlockLine, BlockView};
-pub use command::{CommandResult, EditorCommand, KeyRouteResult, SourceChange, SourceSync};
+pub use command::{
+    CommandResult, EditorCommand, KeyRouteResult, SourceChange, SourceSync, TableEdit,
+};
 pub use decorations::{DecorationCache, DecorationCacheStats, DecorationError};
-pub use document::{EditorDocument, EditorDocumentError, EditorRenderLayout, EditorRenderSnapshot};
+pub use document::{
+    EditorDocument, EditorDocumentError, EditorRenderSnapshot, EditorState, LayoutContext,
+    LayoutQuery, LayoutSnapshot, SnapshotBlock, SnapshotContainer, TableColumnWidthRecord,
+};
 pub use image::{CheckboxPlacement, ImagePlacement, PlacedWidget};
 pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
 pub use layout::{BlockLayoutSource, LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use outline::{OutlineItem, OutlineSnapshot};
-pub use panel::{OutlineRow, OutlineTree, PanelError, SearchResults, SearchRow};
+pub use panel::{OutlineLabelRun, OutlineRow, OutlineTree, PanelError, SearchResults, SearchRow};
 pub use search::SearchState;
 pub use table::{
     TableCellLayout, TableLayout, TableLayoutHit, TableResizeCommit, TableResizeGesture,

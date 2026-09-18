@@ -19,14 +19,11 @@
 //!   源码减去被隐藏的字节、每个 id 都查得到。它压不住「隐藏错了字节」，
 //!   那件事的 oracle 现在是 CommonMark 官方用例（`yu-syntax`）加
 //!   `yu-markdown/tests/extension_decorations.rs`。
-//! - **正面钉住的规则。** 标题的字号倍率盖在整张样式表上、链接正文不继承
+//! - **正面钉住的规则。** 标题的字号倍率盖在整张样式表上、链接正文继承
 //!   外层加粗——这两条差分时期就是单独写的，因为「两边一起错」也会绿。
 
 use yu_core::{ClusterMetrics, StyleId, TextAttrs, TextRole, TextStyle};
-use yu_editor::layout_tokens::{
-    CODE_BLOCK_PADDING_X, LINE_HEIGHT_BODY, LINE_HEIGHT_CODE, LINE_HEIGHT_HEADING_1_2,
-    LINE_HEIGHT_HEADING_3_6, QUOTE_BLOCK_PADDING_X,
-};
+use yu_editor::layout_tokens::LINE_HEIGHT_BODY;
 use yu_editor::{BlockLayoutInput, BlockOrnaments, ThematicBreakOrnament, VisualText};
 use yu_layout::{LayoutConfig, LineStyleTable, StyleTable};
 use yu_markdown::{ExtensionSet, parse};
@@ -44,6 +41,15 @@ impl ClusterMetrics for StyleSensitive {
             TextStyle::Emphasis => 2.0,
             TextStyle::Strong => 4.0,
             TextStyle::Code => 8.0,
+            style => {
+                if style.is_code() {
+                    8.0
+                } else if style.is_strong() {
+                    4.0
+                } else {
+                    2.0
+                }
+            }
         }
     }
 }
@@ -116,7 +122,15 @@ fn describe(input: &BlockLayoutInput) -> Derived {
 
 /// 第 `index` 个块的装饰、视觉文本与派生出来的布局输入。
 fn derive(source: &str, index: usize) -> Option<(Derived, BlockLayoutInput, String)> {
-    let config = LayoutConfig::new(400.0, 10.0);
+    derive_with_theme(source, index, yu_core::ThemeId::Github)
+}
+
+fn derive_with_theme(
+    source: &str,
+    index: usize,
+    theme: yu_core::ThemeId,
+) -> Option<(Derived, BlockLayoutInput, String)> {
+    let config = LayoutConfig::new(400.0, 10.0).with_theme(theme);
     let buffer = TextBuffer::new(source.to_owned());
     let snapshot = buffer.snapshot();
     let document = parse(&snapshot);
@@ -128,6 +142,7 @@ fn derive(source: &str, index: usize) -> Option<(Derived, BlockLayoutInput, Stri
             &snapshot,
             &tree,
             document.reference_definitions(),
+            document.presentation(),
             block,
             None,
         )
@@ -294,11 +309,14 @@ fn a_heading_scales_every_style_in_the_table() {
     assert!(!layout.runs().is_empty(), "标题里有三段不同字型的文字");
     for run in layout.runs() {
         let attrs = input.styles().attrs(run.style()).expect("查得到");
-        assert_eq!(attrs.style(), TextStyle::Strong, "标题一律排粗体");
+        assert!(
+            attrs.style().is_strong(),
+            "all heading runs inherit heading weight"
+        );
         assert_eq!(
             attrs.size_scale(),
             yu_editor::layout_tokens::HEADING_FONT_SCALE[1],
-            "二级标题的字号倍率"
+            "heading scale with inline-code ratio"
         );
     }
     assert_eq!(input.ornaments().heading().map(|h| h.level()), Some(2));
@@ -329,10 +347,9 @@ fn a_nested_task_item_is_indented_like_a_nested_list_item() {
     );
     assert!(nested_task.marker.is_none(), "任务项不该有替代标记");
 
-    let (_, bullet_x, _) = nested_item.marker.expect("嵌套列表项该有标记");
-    assert_eq!(
-        nested_task.indent, bullet_x,
-        "任务项的正文从普通列表项画 `•` 的那一列起，同一层看上去才对齐"
+    assert!(
+        nested_task.indent < nested_item.indent,
+        "checkbox occupies space before the aligned list text"
     );
 }
 
@@ -382,29 +399,26 @@ fn code_and_quote_blocks_shrink_the_wrap_width_by_their_padding() {
     let (code, input, _) = derive("```rust\nlet x = 1;\n```", 0).expect("代码块");
     assert_eq!(
         input.layout_config().max_width(),
-        400.0 - 2.0 * CODE_BLOCK_PADDING_X,
-        "代码块断行宽度收窄两个水平内边距"
+        400.0 - 5.625,
+        "右侧边距收窄布局右边界；左边距只由缩进扣除"
     );
-    assert_eq!(code.indent, CODE_BLOCK_PADDING_X, "代码内容右移一个内边距");
-    assert_eq!(code.line_height_scale, LINE_HEIGHT_CODE);
+    assert_eq!(code.indent, 8.125, "代码内容右移一个内边距");
+    assert!((code.line_height_scale - 1.44).abs() < 0.00001);
 
     // 缩进代码与围栏是同一种盒模型待遇。
     let (indented, input, _) = derive("    let x = 1;\n", 0).expect("缩进代码块");
-    assert_eq!(
-        input.layout_config().max_width(),
-        400.0 - 2.0 * CODE_BLOCK_PADDING_X
-    );
-    assert_eq!(indented.indent, CODE_BLOCK_PADDING_X);
-    assert_eq!(indented.line_height_scale, LINE_HEIGHT_CODE);
+    assert_eq!(input.layout_config().max_width(), 400.0 - 5.625);
+    assert_eq!(indented.indent, 8.125);
+    assert!((indented.line_height_scale - 1.44).abs() < 0.00001);
 
     let (quote, input, _) = derive("> quoted\n", 0).expect("引用块");
     assert_eq!(
         input.layout_config().max_width(),
-        400.0 - 2.0 * QUOTE_BLOCK_PADDING_X,
+        400.0 - 15.0 * 10.0 / 16.0,
         "引用块断行宽度收窄两个水平内边距"
     );
     assert!(
-        quote.indent > QUOTE_BLOCK_PADDING_X,
+        quote.indent > 0.0,
         "引用内容的缩进 = 内边距 + 竖条 gutter：{}",
         quote.indent
     );
@@ -423,14 +437,14 @@ fn code_and_quote_blocks_shrink_the_wrap_width_by_their_padding() {
     );
 
     let (h1, _, _) = derive("# h1\n", 0).expect("h1");
-    assert_eq!(h1.line_height_scale, LINE_HEIGHT_HEADING_1_2);
+    assert_eq!(h1.line_height_scale, 2.7);
     let (h2, _, _) = derive("## h2\n", 0).expect("h2");
-    assert_eq!(h2.line_height_scale, LINE_HEIGHT_HEADING_1_2);
+    assert!((h2.line_height_scale - 2.14375).abs() < 0.00001);
     for level in 3..=6 {
         let marks = "#".repeat(level);
         let (heading, _, _) = derive(&format!("{marks} h{level}\n"), 0).expect("h3–h6");
-        assert_eq!(
-            heading.line_height_scale, LINE_HEIGHT_HEADING_3_6,
+        assert!(
+            (heading.line_height_scale - [2.145, 1.75, 1.4, 1.4][level - 3]).abs() < 0.00001,
             "h{level} 的行高倍率"
         );
     }
@@ -456,6 +470,7 @@ fn a_focused_thematic_break_carries_no_rule() {
             &snapshot,
             &tree,
             document.reference_definitions(),
+            document.presentation(),
             block,
             Some(active),
         )
@@ -505,15 +520,11 @@ fn a_paragraph_keeps_every_style_at_its_own_face() {
         .collect();
     assert!(faces.contains(&(TextStyle::Plain, 1.0)));
     assert!(faces.contains(&(TextStyle::Emphasis, 1.0)));
-    assert!(faces.contains(&(TextStyle::Code, 1.0)));
+    assert!(faces.contains(&(TextStyle::Code, 0.9)));
 }
 
-/// 嵌套时窄的赢：`**[文字](目标)**` 里链接正文排正文字型，不继承外层加粗。
-///
-/// 链接正文同时带着 `TextRole::Link`（颜色与下划线由 `yu-workspace` 的
-/// Theme 解释）——「正文字型」说的是 `TextStyle`，角色是另一维，两样都要钉。
 #[test]
-fn link_text_inside_bold_is_not_bold() {
+fn link_text_inside_bold_inherits_weight_and_preserves_link_role() {
     let (derived, _, _) = derive("**[文字](目标)**", 0).expect("派生");
     assert_eq!(derived.text, "文字");
     assert_eq!(
@@ -521,9 +532,11 @@ fn link_text_inside_bold_is_not_bold() {
         vec![(
             0,
             6,
-            TextAttrs::new(TextStyle::Plain).with_role(TextRole::Link)
+            TextAttrs::new(TextStyle::Strong)
+                .with_role(TextRole::Link)
+                .with_font(yu_core::ThemeFont::OpenSans)
         )],
-        "整段链接正文都是正文字型 + 链接角色"
+        "链接正文保留加粗字型 + 链接角色"
     );
 }
 
@@ -535,5 +548,168 @@ fn link_text_inside_bold_is_not_bold() {
 #[test]
 fn overlapping_hidden_ranges_are_not_counted_twice() {
     let (derived, _, _) = derive("- [x] 完成", 0).expect("派生");
-    assert_eq!(derived.text, "-  完成", "`- ` 留着，`[x]` 整个消失");
+    assert_eq!(
+        derived.text, "完成",
+        "task prefix is replaced by a checkbox"
+    );
+}
+
+#[test]
+fn native_list_markers_follow_theme_and_container_depth_without_changing_source() {
+    let source = "- root\n  - child\n    - grandchild\n1. ordered\n";
+    for (theme, expected) in [
+        (yu_core::ThemeId::Github, ["•", "◦", "▪", "1."]),
+        (yu_core::ThemeId::Night, ["▪", "▪", "▪", "1."]),
+    ] {
+        for (index, expected) in expected.into_iter().enumerate() {
+            let (derived, _input, visible) =
+                derive_with_theme(source, index, theme).expect("list block");
+            assert_eq!(derived.marker.expect("marker").0, expected);
+            assert_eq!(
+                derived.text, visible,
+                "marker styling must preserve projection"
+            );
+        }
+    }
+}
+
+#[test]
+fn inline_code_boxes_survive_markdown_projection_with_distinct_identity() {
+    let source = "`a`*`b`*";
+    for theme in [yu_core::ThemeId::Github, yu_core::ThemeId::Night] {
+        let (_, input, visible) = derive_with_theme(source, 0, theme).expect("paragraph");
+        assert_eq!(visible, "ab");
+        assert_eq!(input.text(), "ab");
+        let layout = yu_layout::BlockLayout::build_all(
+            input.layout_input(),
+            input.layout_config(),
+            input.styles(),
+            &yu_layout::NoWidgets,
+            input.line_styles(),
+            &StyleSensitive,
+        )
+        .expect("layout");
+        let boxes = layout.inline_boxes();
+        assert_eq!(
+            boxes.len(),
+            2,
+            "adjacent projected code spans stay separate"
+        );
+        assert_ne!(boxes[0].id, boxes[1].id);
+        for fragment in boxes {
+            assert!(fragment.left_edge && fragment.right_edge);
+            let cluster = layout
+                .clusters()
+                .iter()
+                .find(|cluster| cluster.visual() == fragment.range)
+                .expect("source cluster");
+            assert!(fragment.bounds.x() < cluster.x());
+            assert!(fragment.bounds.x() + fragment.bounds.width() > cluster.x() + cluster.width());
+        }
+    }
+}
+
+#[test]
+fn quote_right_padding_applies_once_to_mixed_container_leaves() {
+    for source in ["> - word\n", "- > word\n", "> > word\n", "> ## heading\n"] {
+        let (_, github, _) = derive_with_theme(source, 0, yu_core::ThemeId::Github).expect("quote");
+        assert_eq!(github.layout_config().max_width(), 390.625, "{source:?}");
+        let (_, night, _) = derive_with_theme(source, 0, yu_core::ThemeId::Night).expect("quote");
+        assert_eq!(night.layout_config().max_width(), 400.0, "{source:?}");
+    }
+}
+
+#[test]
+fn alternating_list_quote_prefixes_are_all_projected_out() {
+    let source = "- > - > first word\n";
+    let (derived, _, _) = derive(source, 0).expect("nested item");
+    assert_eq!(derived.text.trim_end(), "first word");
+}
+
+#[test]
+fn nested_font_traits_compose_without_changing_visual_text() {
+    for (source, word, expected) in [
+        ("***both***", "both", TextStyle::StrongEmphasis),
+        ("**a *both* c**", "both", TextStyle::StrongEmphasis),
+        ("*a **both** c*", "both", TextStyle::StrongEmphasis),
+        ("## *both*", "both", TextStyle::StrongEmphasis),
+        ("## `code`", "code", TextStyle::CodeStrong),
+        ("## *`code`*", "code", TextStyle::CodeStrongEmphasis),
+        ("**`code`**", "code", TextStyle::CodeStrong),
+        ("*[**both**](target)*", "both", TextStyle::StrongEmphasis),
+    ] {
+        let (derived, _, _) = derive(source, 0).expect("derive nested traits");
+        let start = derived.text.find(word).expect("visible text remains");
+        let relevant: Vec<_> = derived
+            .runs
+            .iter()
+            .filter(|(a, b, _)| *a < (start + word.len()) as u64 && *b > start as u64)
+            .collect();
+        assert!(!relevant.is_empty());
+        assert!(
+            relevant
+                .iter()
+                .all(|(_, _, attrs)| attrs.style() == expected),
+            "{source}: {:?}",
+            derived.runs
+        );
+        if source.contains("target") {
+            assert!(
+                relevant
+                    .iter()
+                    .all(|(_, _, attrs)| attrs.role() == TextRole::Link)
+            );
+        }
+        if expected.is_code() {
+            assert!(
+                relevant
+                    .iter()
+                    .all(|(_, _, attrs)| attrs.inline_box_id().is_some())
+            );
+        }
+    }
+}
+
+#[test]
+fn heading_code_inherits_theme_weight_and_keeps_explicit_traits() {
+    for (theme, weights) in [
+        (yu_core::ThemeId::Github, [true; 6]),
+        (
+            yu_core::ThemeId::Night,
+            [false, true, true, false, true, false],
+        ),
+    ] {
+        for (index, bold) in weights.into_iter().enumerate() {
+            for (markup, explicit_bold, italic) in [
+                ("`code`", false, false),
+                ("*`code`*", false, true),
+                ("**`code`**", true, false),
+            ] {
+                let source = format!("{} {markup}", "#".repeat(index + 1));
+                let (derived, _, _) = derive_with_theme(&source, 0, theme).expect("heading");
+                assert_eq!(derived.text, "code");
+                for (_, _, attrs) in derived.runs {
+                    assert!(attrs.style().is_code());
+                    assert_eq!(
+                        attrs.style().is_strong(),
+                        bold || explicit_bold,
+                        "{source} {theme:?}"
+                    );
+                    assert_eq!(attrs.style().is_emphasis(), italic);
+                    assert_eq!(attrs.font(), theme.spec().code_font);
+                    let code_scale = match theme {
+                        yu_core::ThemeId::Github
+                        | yu_core::ThemeId::YuLight
+                        | yu_core::ThemeId::YuDark => 1.0,
+                        yu_core::ThemeId::Night => 0.875,
+                    };
+                    assert_eq!(
+                        attrs.size_scale(),
+                        theme.spec().heading_sizes[index] * code_scale
+                    );
+                    assert!(attrs.inline_box_id().is_some());
+                }
+            }
+        }
+    }
 }

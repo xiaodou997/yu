@@ -3,13 +3,15 @@
 //! Stable foundational types shared by Yu Editor's core crates.
 
 mod geometry;
+mod paragraph;
 mod position;
 mod shaping;
+pub use paragraph::*;
 pub mod shaping_conformance;
 mod style;
 
 pub use geometry::{
-    Block, CoordinateSpace, Device, Document, GeometryError, Point, Rect, Scale, Size,
+    Block, BlockInk, CoordinateSpace, Device, Document, GeometryError, Point, Rect, Scale, Size,
 };
 pub use position::{
     Affinity, ByteOffset, CaretAffinity, LineIndex, NativeCaretPosition, Revision,
@@ -20,3 +22,6 @@ pub use shaping::{
     TextDirection,
 };
 pub use style::{LineStyleId, StyleId, TextAttrs, TextRole, TextStyle, WidgetId, WidgetSide};
+
+mod theme;
+pub use theme::{ReadingGeometry, TaskCheckboxStyle, ThemeFont, ThemeId, ThemeSpec};

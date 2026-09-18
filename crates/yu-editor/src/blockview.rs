@@ -56,6 +56,7 @@ pub struct BlockCluster {
     line: usize,
     x: f32,
     y: f32,
+    baseline_y: f32,
     width: f32,
     style: TextStyle,
     line_break: bool,
@@ -91,6 +92,12 @@ impl BlockCluster {
     #[must_use]
     pub const fn y(self) -> f32 {
         self.y
+    }
+
+    /// Actual paragraph line baseline in block coordinates, including cell padding.
+    #[must_use]
+    pub const fn baseline_y(self) -> f32 {
+        self.baseline_y
     }
 
     #[must_use]
@@ -343,6 +350,7 @@ impl BlockHit {
 #[derive(Clone, Debug)]
 pub struct BlockView {
     visual: VisualText,
+    image_sizes: Vec<ImageSize>,
     decorations: BlockDecorations,
     config: LayoutConfig,
     input: BlockLayoutInput,
@@ -387,7 +395,12 @@ impl BlockView {
     ) -> Result<Self, LayoutError> {
         let input = BlockLayoutInput::from_decorations(kind, decorations, visual, config, metrics)?;
         let layout_config = input.layout_config();
-        let widgets = BlockWidgets::new(decorations.widgets(), sizes);
+        let widgets = BlockWidgets::new(
+            decorations.widgets(),
+            sizes,
+            input.available_width(),
+            config.theme(),
+        );
         let layout = BlockLayout::build_all(
             input.layout_input(),
             layout_config,
@@ -408,7 +421,15 @@ impl BlockView {
                 )
             })
             .transpose()?;
-        Self::assemble(visual, decorations, layout_config, input, layout, table)
+        Self::assemble(
+            visual,
+            decorations,
+            layout_config,
+            input,
+            layout,
+            table,
+            sizes,
+        )
     }
 
     /// 按 shaping 后端排，图片一律画 placeholder。
@@ -434,7 +455,12 @@ impl BlockView {
         let input =
             BlockLayoutInput::from_decorations_shaped(kind, decorations, visual, config, shaper)?;
         let layout_config = input.layout_config();
-        let widgets = BlockWidgets::new(decorations.widgets(), sizes);
+        let widgets = BlockWidgets::new(
+            decorations.widgets(),
+            sizes,
+            input.available_width(),
+            config.theme(),
+        );
         let layout = BlockLayout::build_shaped(
             input.layout_input(),
             layout_config,
@@ -455,7 +481,15 @@ impl BlockView {
                 )
             })
             .transpose()?;
-        Self::assemble(visual, decorations, layout_config, input, layout, table)
+        Self::assemble(
+            visual,
+            decorations,
+            layout_config,
+            input,
+            layout,
+            table,
+            sizes,
+        )
     }
 
     fn assemble(
@@ -465,12 +499,14 @@ impl BlockView {
         input: BlockLayoutInput,
         layout: BlockLayout,
         table: Option<TableLayout>,
+        sizes: &[ImageSize],
     ) -> Result<Self, LayoutError> {
         let clusters = source_backed_clusters(visual, &layout, input.styles())?;
         let glyphs = source_backed_glyphs(&layout, &clusters, input.ornaments(), input.styles())?;
         let lines = flow_lines(visual, &layout)?;
         let mut view = Self {
             visual: visual.clone(),
+            image_sizes: sizes.to_vec(),
             decorations: decorations.clone(),
             config,
             input,
@@ -514,7 +550,11 @@ impl BlockView {
         &self.layout
     }
 
-    /// 这个块的视觉字节流与它到源码的映射。
+    /// Update selection metadata without reshaping an identical preedit string.
+    pub(crate) fn update_composition_selection(&mut self, visual: &VisualText) {
+        self.visual = visual.clone();
+    }
+
     #[must_use]
     pub const fn visual(&self) -> &VisualText {
         &self.visual
@@ -546,6 +586,72 @@ impl BlockView {
         &self.widgets.images
     }
 
+    /// Paragraph-owned inline geometry; table cells only translate it.
+    /// Native list geometry shares the first content line's baseline.
+    pub fn marker_bounds(&self) -> Result<Option<LayoutRect>, LayoutError> {
+        let Some(marker) = self.ornaments().marker() else {
+            return Ok(None);
+        };
+        self.marker_bounds_for(marker)
+    }
+
+    pub fn marker_bounds_for(
+        &self,
+        marker: &crate::MarkerOrnament,
+    ) -> Result<Option<LayoutRect>, LayoutError> {
+        let Some(shape) = marker.shape() else {
+            return Ok(None);
+        };
+        let Some(line) = self.lines().first() else {
+            return Ok(None);
+        };
+        // The circle's stroke is centered on its path; bounds include ink
+        // outside the nominal marker box so painting and queries agree.
+        let outset = if shape.kind == crate::MarkerShapeKind::Circle {
+            shape.stroke * 0.5
+        } else {
+            0.0
+        };
+        Ok(Some(LayoutRect::new(
+            marker.x() - outset,
+            line.y() + line.baseline() + shape.baseline_offset - outset,
+            shape.size + 2.0 * outset,
+            shape.size + 2.0 * outset,
+        )?))
+    }
+
+    pub fn inline_boxes(&self) -> Result<Vec<yu_core::InlineBoxFragment>, LayoutError> {
+        let Some(table) = &self.table else {
+            return Ok(self.layout.inline_boxes().to_vec());
+        };
+        let mut result = Vec::new();
+        for (cell, layout) in table.cells().iter().zip(table.cell_layouts()) {
+            for fragment in layout.inline_boxes() {
+                let mut fragment = *fragment;
+                fragment.bounds = yu_core::Rect::new(
+                    fragment.bounds.x() + cell.content_x(),
+                    fragment.bounds.y() + cell.content_y(),
+                    fragment.bounds.width(),
+                    fragment.bounds.height(),
+                )?;
+                let base = cell.visual().start().get();
+                fragment.range = VisualRange::new(
+                    VisualOffset::new(
+                        base.checked_add(fragment.range.start().get())
+                            .ok_or(LayoutError::OffsetOverflow)?,
+                    ),
+                    VisualOffset::new(
+                        base.checked_add(fragment.range.end().get())
+                            .ok_or(LayoutError::OffsetOverflow)?,
+                    ),
+                )
+                .ok_or(LayoutError::OffsetOverflow)?;
+                result.push(fragment);
+            }
+        }
+        Ok(result)
+    }
+
     /// 排好的任务项复选框。画它的人按这里的 `bounds` 画，不自己算几何。
     #[must_use]
     pub fn checkboxes(&self) -> &[CheckboxPlacement] {
@@ -558,6 +664,11 @@ impl BlockView {
     }
 
     /// 「长什么样」那部分装饰：标题级别、列表标记、引用竖条。
+    #[must_use]
+    pub const fn container_left(&self) -> f32 {
+        self.input.container_left()
+    }
+
     #[must_use]
     pub const fn ornaments(&self) -> &BlockOrnaments {
         self.input.ornaments()
@@ -574,6 +685,34 @@ impl BlockView {
     /// （`BlockLayout::height`）。此前图片是排完之后另贴上去的盒子，行不
     /// 知道它有多高，可滚动范围因此要在这里补一次 max——那个补丁随
     /// widget 化一起没了。
+    /// Height of the actual native text line, not the base paragraph strut.
+    pub fn caret_line_height(&self, caret: BlockCaret) -> f32 {
+        if let Some((cell, layout)) = self.table().and_then(|table| {
+            table
+                .cell_for_source(caret.source())
+                .or_else(|| table.cell_for_visual(caret.visual(), caret.bias()))
+        }) {
+            let local = VisualOffset::new(
+                caret
+                    .visual()
+                    .get()
+                    .saturating_sub(cell.visual().start().get())
+                    .min(layout.visual_len().get()),
+            );
+            let affinity = if caret.bias() == Bias::Before {
+                CaretAffinity::Upstream
+            } else {
+                CaretAffinity::Downstream
+            };
+            if let Ok(native) = layout.caret(local, affinity) {
+                return layout.lines()[native.line()].height();
+            }
+        }
+        self.lines()
+            .get(caret.line())
+            .map_or(self.config.line_height(), |line| line.height())
+    }
+
     #[must_use]
     pub fn height(&self) -> f32 {
         self.table
@@ -617,6 +756,11 @@ impl BlockView {
             decorations,
             ..self.clone()
         };
+        view.image_sizes = self
+            .image_sizes
+            .iter()
+            .map(|(range, size)| Ok((shift_range(*range, delta)?, *size)))
+            .collect::<Result<_, LayoutError>>()?;
         view.table = view
             .table
             .as_ref()
@@ -684,6 +828,34 @@ impl BlockView {
             .visual
             .source_to_visual(source, bias)
             .map_err(upstream)?;
+        if let Some((cell, layout)) = self
+            .table
+            .as_ref()
+            .and_then(|table| table.cell_for_source(source))
+        {
+            let local = VisualOffset::new(
+                visual
+                    .get()
+                    .saturating_sub(cell.visual().start().get())
+                    .min(layout.visual_len().get()),
+            );
+            let affinity = if bias == Bias::Before {
+                CaretAffinity::Upstream
+            } else {
+                CaretAffinity::Downstream
+            };
+            let caret = layout.caret(local, affinity)?;
+            return Ok(BlockCaret {
+                source,
+                visual,
+                line: cell.row(),
+                point: LayoutPoint::new(
+                    cell.content_x() + caret.point().x(),
+                    cell.content_y() + caret.point().y(),
+                ),
+                bias,
+            });
+        }
         self.caret_for_visual(visual, bias)
     }
 
@@ -758,11 +930,40 @@ impl BlockView {
             Some(table) => self.table_visual_for_point(table, point)?,
             None => {
                 let hit = self.layout.hit(point)?;
-                (hit.visual(), widget_bias(hit.widget_affinity()))
+                (hit.visual(), boundary_bias(hit.boundary_affinity()))
             }
         };
         let bias = forced.unwrap_or_else(|| self.hit_bias(line_index, visual));
-        let caret = self.caret_for_visual(visual, bias)?;
+        if let Some((cell, _)) = self.table.as_ref().and_then(|table| table.cell_at(point)) {
+            let source = if visual == cell.visual().start() {
+                cell.source().start()
+            } else if visual == cell.visual().end() {
+                cell.source().end()
+            } else {
+                self.visual
+                    .visual_to_source(visual, bias)
+                    .map_err(upstream)?
+                    .max(cell.source().start())
+                    .min(cell.source().end())
+            };
+            return Ok(BlockHit {
+                caret: self.caret_for_source(source, bias)?,
+                image: None,
+            });
+        }
+        let mut caret = self.caret_for_visual(visual, bias)?;
+        if forced.is_some()
+            && let Some(checkbox) = self
+                .checkboxes()
+                .iter()
+                .find(|checkbox| checkbox.placed().visual().start() == visual)
+        {
+            caret.source = if bias == Bias::Before {
+                checkbox.source().start()
+            } else {
+                checkbox.source().end()
+            };
+        }
         Ok(BlockHit { caret, image: None })
     }
 
@@ -782,9 +983,29 @@ impl BlockView {
         };
         let local = LayoutPoint::new(
             point.x() - cell.content_x(),
-            (point.y() - cell.bounds().y()).max(0.0),
+            (point.y() - cell.content_y()).max(0.0),
         );
-        let hit = layout.hit(local)?;
+        let mut hit = layout.hit(local)?;
+        let distance = |candidate: &yu_layout::CaretBox| {
+            (candidate.point().x() - local.x()).powi(2)
+                + (candidate.point().y() - local.y()).powi(2)
+        };
+        let mut best = distance(&hit);
+        // A table cell is a two-dimensional hit region, not one text line.
+        // Ask the same layout for nearby line candidates; vertical distance
+        // alone rules out every line that cannot improve the current hit.
+        for line in layout.lines() {
+            let y = line.bounds().y();
+            if (y - local.y()).powi(2) > best {
+                continue;
+            }
+            let candidate = layout.hit(LayoutPoint::new(local.x(), y))?;
+            let candidate_distance = distance(&candidate);
+            if candidate_distance < best {
+                best = candidate_distance;
+                hit = candidate;
+            }
+        }
         let visual = VisualOffset::new(
             hit.visual()
                 .get()
@@ -802,7 +1023,7 @@ impl BlockView {
         // 格**内**的软换行是另一回事：那两个位置属于同一格，由格子自己的
         // 布局说了算（不变量 H5）。这里一律 `Before` 的话，点在第二行会把
         // 光标画到第一行的末尾去。
-        let bias = widget_bias(hit.widget_affinity()).unwrap_or_else(|| {
+        let bias = boundary_bias(hit.boundary_affinity()).unwrap_or_else(|| {
             if hit.visual() == VisualOffset::ZERO {
                 Bias::After
             } else if hit.visual() == layout.visual_len() {
@@ -846,14 +1067,108 @@ impl BlockView {
         index: usize,
         delta: f32,
     ) -> Result<(), LayoutError> {
-        let table = self
+        self.resize_table_with_backend(
+            index,
+            delta,
+            &crate::table::MetricsCells(&yu_layout::MonospaceMetrics::new(
+                self.config.default_advance(),
+            )),
+        )
+    }
+
+    fn resize_table_with_backend<B: crate::table::CellBackend>(
+        &mut self,
+        index: usize,
+        delta: f32,
+        backend: &B,
+    ) -> Result<(), LayoutError> {
+        let resized = self
             .table
             .as_ref()
             .ok_or(LayoutError::Upstream("block is not a table".into()))?
-            .resized_columns(index, delta)?;
+            .column_widths_for_resize(index, delta)?;
+        self.set_table_widths_with_backend(&resized, backend)
+    }
+
+    pub(crate) fn set_table_widths(&mut self, widths: &[f32]) -> Result<(), LayoutError> {
+        self.set_table_widths_with_backend(
+            widths,
+            &crate::table::MetricsCells(&yu_layout::MonospaceMetrics::new(
+                self.config.default_advance(),
+            )),
+        )
+    }
+
+    pub(crate) fn set_table_widths_with_shaper<S: ShapingProvider>(
+        &mut self,
+        widths: &[f32],
+        shaper: &S,
+    ) -> Result<(), LayoutError> {
+        self.set_table_widths_with_backend(widths, &crate::table::ShapedCells(shaper))
+    }
+
+    fn set_table_widths_with_backend<B: crate::table::CellBackend>(
+        &mut self,
+        widths: &[f32],
+        backend: &B,
+    ) -> Result<(), LayoutError> {
+        let source_table = table_of(&self.decorations)
+            .ok_or(LayoutError::Upstream("missing table semantics".into()))?;
+        let widgets = BlockWidgets::new(
+            self.decorations.widgets(),
+            &self.image_sizes,
+            self.input.available_width(),
+            self.config.theme(),
+        );
+        let table = TableLayout::from_table_with_widths(
+            source_table,
+            &self.visual,
+            &self.input,
+            &widgets,
+            self.config,
+            backend,
+            Some(widths),
+        )?;
         self.apply_table_geometry(&table)?;
         self.table = Some(table);
         Ok(())
+    }
+
+    // A commit stores a destination, not an operation to accumulate. The
+    // same commit may be applied to a rebuilt layout or to its live preview.
+    fn table_divider_delta(&self, index: usize, destination: f32) -> Result<f32, LayoutError> {
+        let table = self
+            .table
+            .as_ref()
+            .ok_or_else(|| LayoutError::Upstream("table resize requires a table".into()))?;
+        let widths = table.column_widths();
+        if index >= widths.len().saturating_sub(1) || !destination.is_finite() {
+            return Err(LayoutError::Upstream(
+                "invalid table divider destination".into(),
+            ));
+        }
+        let current = table.bounds().x() + widths[..=index].iter().sum::<f32>();
+        Ok(destination - current)
+    }
+
+    pub fn apply_table_resize_with_shaper<S: ShapingProvider>(
+        &mut self,
+        commit: TableResizeCommit,
+        shaper: &S,
+    ) -> Result<(), LayoutError> {
+        if commit.revision() != self.revision() {
+            return Err(LayoutError::Upstream(
+                "table resize commit is bound to another revision".into(),
+            ));
+        }
+        match commit.target() {
+            crate::table::TableResizeTarget::Column { index } => self.resize_table_with_backend(
+                index,
+                self.table_divider_delta(index, commit.final_position())?,
+                &crate::table::ShapedCells(shaper),
+            ),
+            crate::table::TableResizeTarget::Row { .. } => Ok(()),
+        }
     }
 
     /// 应用一次表格拖拽的提交结果。
@@ -864,9 +1179,10 @@ impl BlockView {
             ));
         }
         match commit.target() {
-            crate::table::TableResizeTarget::Column { index } => {
-                self.apply_table_column_resize(index, commit.delta())
-            }
+            crate::table::TableResizeTarget::Column { index } => self.apply_table_column_resize(
+                index,
+                self.table_divider_delta(index, commit.final_position())?,
+            ),
             crate::table::TableResizeTarget::Row { .. } => Ok(()),
         }
     }
@@ -879,8 +1195,16 @@ impl BlockView {
     /// 尺寸的那一份挤掉。
     #[must_use]
     pub fn needs_widget_rebuild(&self, sizes: &[ImageSize]) -> bool {
+        if sizes.iter().any(|size| !self.image_sizes.contains(size)) {
+            return true;
+        }
         let constraints = constraints_of(self.config);
-        let widgets = BlockWidgets::new(self.decorations.widgets(), sizes);
+        let widgets = BlockWidgets::new(
+            self.decorations.widgets(),
+            sizes,
+            self.input.available_width(),
+            self.config.theme(),
+        );
         self.layout
             .pending_widgets()
             .into_iter()
@@ -956,7 +1280,7 @@ impl BlockView {
             cell.row(),
             LayoutPoint::new(
                 cell.content_x() + caret.point().x(),
-                cell.bounds().y() + caret.point().y(),
+                cell.content_y() + caret.point().y(),
             ),
         ))
     }
@@ -1008,7 +1332,7 @@ impl BlockView {
                 }
                 current_row = Some(cell.row());
             }
-            let origin = LayoutPoint::new(cell.content_x(), cell.bounds().y());
+            let origin = LayoutPoint::new(cell.content_x(), cell.content_y());
             let base = cell.visual().start();
             let first_cluster = clusters.len();
             for cluster in layout.clusters() {
@@ -1019,25 +1343,18 @@ impl BlockView {
                         "table cell cluster has no line".into(),
                     ))?;
                 let visual = shift_visual(cluster.visual(), base)?;
-                let start = self
-                    .visual
-                    .visual_to_source(visual.start(), Bias::After)
-                    .map_err(upstream)?;
-                let end = self
-                    .visual
-                    .visual_to_source(visual.end(), Bias::Before)
-                    .map_err(upstream)?;
+                let source = self.visual.source_coverage(visual).map_err(upstream)?;
                 let style = styles
                     .attrs(cluster.style())
                     .ok_or(LayoutError::UnknownStyle(cluster.style()))?
                     .style();
                 clusters.push(BlockCluster {
-                    source: TextRange::new(start, end.max(start))
-                        .ok_or(LayoutError::OffsetOverflow)?,
+                    source,
                     visual,
                     line: cell.row(),
                     x: origin.x() + cluster.x(),
                     y: origin.y() + line.bounds().y(),
+                    baseline_y: origin.y() + line.bounds().y() + line.baseline(),
                     width: cluster.width(),
                     style,
                     line_break: cluster.is_line_break(),
@@ -1139,13 +1456,7 @@ fn source_backed_clusters(
 ) -> Result<Vec<BlockCluster>, LayoutError> {
     let mut clusters = Vec::with_capacity(layout.clusters().len());
     for cluster in layout.clusters() {
-        let start = visual
-            .visual_to_source(cluster.visual().start(), Bias::After)
-            .map_err(upstream)?;
-        let end = visual
-            .visual_to_source(cluster.visual().end(), Bias::Before)
-            .map_err(upstream)?;
-        let source = TextRange::new(start, end.max(start)).ok_or(LayoutError::OffsetOverflow)?;
+        let source = visual.source_coverage(cluster.visual()).map_err(upstream)?;
         // 字型取**解释之后**的那个，不是 run 自己声明的那个：标题把每一段
         // 都排成粗体，栅格化必须按实际用的字面来，否则字画得比量出来的窄。
         let style = styles
@@ -1162,6 +1473,10 @@ fn source_backed_clusters(
             line: cluster.line(),
             x: cluster.x(),
             y,
+            baseline_y: y + layout
+                .lines()
+                .get(cluster.line())
+                .map_or(0.0, |line| line.baseline()),
             width: cluster.width(),
             style,
             line_break: cluster.is_line_break(),
@@ -1180,9 +1495,10 @@ fn source_backed_glyphs(
     styles: &crate::blockinput::BlockStyleTable,
 ) -> Result<Vec<BlockGlyph>, LayoutError> {
     let mut glyphs = Vec::with_capacity(layout.glyphs().len());
-    if let Some(marker) = ornaments.marker()
-        && let Some(shaped) = marker.shaped()
-    {
+    for marker in ornaments.markers() {
+        let Some(shaped) = marker.shaped() else {
+            continue;
+        };
         let baseline = layout
             .lines()
             .first()
@@ -1212,16 +1528,27 @@ fn source_backed_glyphs(
         }
     }
     for glyph in layout.glyphs() {
-        let cluster = clusters
-            .iter()
-            .find(|cluster| cluster.visual == glyph.visual())
-            .ok_or(LayoutError::Shaping(
-                "a shaped glyph has no visual cluster".into(),
-            ))?;
+        let line = layout
+            .lines()
+            .get(glyph.line())
+            .ok_or(LayoutError::OffsetOverflow)?;
+        let line_clusters = clusters
+            .get(line.cluster_range())
+            .ok_or(LayoutError::OffsetOverflow)?;
+        let mut covered = line_clusters.iter().filter(|cluster| {
+            cluster.visual.start() < glyph.visual().end()
+                && glyph.visual().start() < cluster.visual.end()
+        });
+        let cluster = covered.next().ok_or(LayoutError::Shaping(
+            "a shaped glyph has no visual cluster".into(),
+        ))?;
+        let last = covered.next_back().unwrap_or(cluster);
+        let source = TextRange::new(cluster.source.start(), last.source.end())
+            .ok_or(LayoutError::OffsetOverflow)?;
         glyphs.push(BlockGlyph {
             face: glyph.face(),
             glyph: glyph.glyph(),
-            source: cluster.source,
+            source,
             visual: glyph.visual(),
             line: glyph.line(),
             origin: glyph.origin(),
@@ -1284,7 +1611,7 @@ fn table_of(decorations: &BlockDecorations) -> Option<&yu_markdown::TableBlock> 
 }
 
 /// widget 的哪一沿翻成 bias。没有 widget 参与就是 `None`。
-const fn widget_bias(affinity: Option<CaretAffinity>) -> Option<Bias> {
+const fn boundary_bias(affinity: Option<CaretAffinity>) -> Option<Bias> {
     match affinity {
         Some(CaretAffinity::Upstream) => Some(Bias::Before),
         Some(CaretAffinity::Downstream) => Some(Bias::After),

@@ -35,6 +35,18 @@ void yu_metal_notify_resource_completion(void) {
     });
 }
 
+// Work readiness does not change resource geometry or document identity.
+// Wake pending hosts once; settled windows ignore this notification.
+void yu_metal_notify_frame_work_ready(void) {
+    static atomic_bool pending = false;
+    if (atomic_exchange(&pending, true)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        atomic_store(&pending, false);
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"YuRenderWorkReady" object:nil];
+    });
+}
+
 // Only the acquisition worker may wait in CAMetalLayer. The main thread
 // exchanges owned drawables under a short lock that never encloses Metal calls.
 @interface YuMetalLayer : CAMetalLayer {
@@ -42,13 +54,54 @@ void yu_metal_notify_resource_completion(void) {
     BOOL acquisitionPending;
     BOOL acquisitionEnabled;
     uint64_t acquisitionGeneration;
+    uint64_t submittedSerial;
+    uint64_t presentedSerial;
+    CFTimeInterval latestPresentedTime;
 }
 - (id<CAMetalDrawable>)takeReadyDrawable;
+- (void)trackPresentation:(id<CAMetalDrawable>)drawable;
+- (uint64_t)beginPresentation;
+- (void)didPresentSerial:(uint64_t)serial atTime:(CFTimeInterval)time;
+- (BOOL)hasPresentedLatest;
+- (CFTimeInterval)latestPresentationTime;
 - (void)setAcquisitionEnabled:(BOOL)enabled;
 - (void)invalidateReadyDrawable;
 @end
 
 @implementation YuMetalLayer
+- (void)trackPresentation:(id<CAMetalDrawable>)drawable {
+    uint64_t serial = [self beginPresentation];
+    if (serial == 1 && yu_render_timing_enabled()) {
+        fprintf(stdout, "yu-render-metric event=presentation_policy surface=%p vsync=%d transaction=%d drawable_count=%lu\n",
+            self, self.displaySyncEnabled, self.presentsWithTransaction,
+            (unsigned long)self.maximumDrawableCount);
+        fflush(stdout);
+    }
+    [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+        if (presented.presentedTime <= 0) return;
+        [self didPresentSerial:serial atTime:presented.presentedTime];
+    }];
+}
+- (uint64_t)beginPresentation {
+    @synchronized (self) { return ++submittedSerial; }
+}
+- (void)didPresentSerial:(uint64_t)serial atTime:(CFTimeInterval)time {
+    if (!isfinite(time) || time <= 0) return;
+    @synchronized (self) {
+        if (serial > presentedSerial) {
+            presentedSerial = serial;
+            latestPresentedTime = time;
+        }
+    }
+}
+- (BOOL)hasPresentedLatest {
+    return [self latestPresentationTime] > 0;
+}
+- (CFTimeInterval)latestPresentationTime {
+    @synchronized (self) {
+        return submittedSerial != 0 && presentedSerial == submittedSerial ? latestPresentedTime : 0;
+    }
+}
 - (id<CAMetalDrawable>)acquireDrawable {
     return [super nextDrawable];
 }
@@ -93,6 +146,7 @@ void yu_metal_notify_resource_completion(void) {
                 }
             }
             [drawable release];
+            yu_metal_notify_frame_work_ready();
         }
     });
     return nil;
@@ -231,12 +285,14 @@ typedef struct {
     id<MTLRenderPipelineState> glyph_pipeline;
     id<MTLRenderPipelineState> image_pipeline;
     id<MTLRenderPipelineState> rounded_pipeline;
+    id<MTLRenderPipelineState> polyline_pipeline;
     id<MTLSamplerState> sampler;
 } YuMetalPipeline;
 
 typedef struct {
     id<MTLTexture> texture;
     id<MTLTexture> scroll_scratch;
+    NSMutableArray<id<MTLBuffer>> *vertex_pool;
     // At most two render command buffers may be waiting for the GPU.  The
     // render host is called from AppKit's main thread, so this gate must be
     // checked with DISPATCH_TIME_NOW: a scroll burst drops a stale frame
@@ -280,6 +336,8 @@ typedef struct {
     float shadow_blur;
     float shadow_offset_x;
     float shadow_offset_y;
+    // MSL float4 is 16-byte aligned: the colors start at 48, not 40.
+    float color_alignment_padding[2];
     float shadow_red;
     float shadow_green;
     float shadow_blue;
@@ -313,8 +371,12 @@ _Static_assert(offsetof(YuMetalDrawCommand, radius) == 68,
     "DrawCommand field order drifted");
 _Static_assert(offsetof(YuMetalDrawCommand, shadow_color) == 100,
     "DrawCommand field order drifted");
-_Static_assert(sizeof(YuMetalRoundedUniforms) == 72,
+_Static_assert(sizeof(YuMetalRoundedUniforms) == 80,
     "YuMetalRoundedUniforms must match yu_shaders.metal");
+_Static_assert(offsetof(YuMetalRoundedUniforms, shadow_red) == 48,
+    "Metal shadow float4 must start at byte 48");
+_Static_assert(offsetof(YuMetalRoundedUniforms, fill_red) == 64,
+    "Metal fill float4 must start at byte 64");
 _Static_assert(sizeof(YuMetalImageUniforms) == 32,
     "YuMetalImageUniforms must match yu_shaders.metal");
 
@@ -352,14 +414,13 @@ int yu_metal_create_layer(
     layer.framebufferOnly = NO;
     // Bound drawable acquisition waits. This timeout is not a non-blocking API.
     layer.allowsNextDrawableTimeout = YES;
-    // Limit GPU queue pressure separately below. GPU completion does not imply
-    // that the compositor has released a drawable; nextDrawable may still wait.
-    layer.maximumDrawableCount = 3;
-    // The product keeps a TextKit source mirror underneath this projection.
-    // Transparent untouched pixels let that mirror remain the input and
-    // accessibility fallback while Rust contributes only its glyph coverage.
-    layer.opaque = NO;
-    layer.backgroundColor = NSColor.clearColor.CGColor;
+    // Two drawables reduce compositor queue latency for interactive writing.
+    // Acquisition still runs off the main thread and vertical sync stays on.
+    // GPU completion does not imply that the compositor released a drawable.
+    layer.maximumDrawableCount = 2;
+    // The document surface owns every pixel. Glass is provided by AppKit chrome.
+    layer.opaque = YES;
+    layer.backgroundColor = NSColor.textBackgroundColor.CGColor;
     layer.contentsScale = scale;
     layer.drawableSize = CGSizeMake(pixel_width, pixel_height);
     *out_layer = (void *)layer;
@@ -488,6 +549,32 @@ void yu_metal_run_appkit_on_main(YuMetalAppKitCallback callback, void *context) 
     });
 }
 
+int yu_metal_presentation_serial_self_check(void) {
+    @autoreleasepool {
+        YuMetalLayer *layer = [YuMetalLayer layer];
+        if ([layer hasPresentedLatest]) return 0;
+        uint64_t first = [layer beginPresentation];
+        if ([layer hasPresentedLatest]) return 0;
+        uint64_t second = [layer beginPresentation];
+        [layer didPresentSerial:first atTime:1.25];
+        if ([layer hasPresentedLatest]) return 0;
+        [layer didPresentSerial:second atTime:0];
+        if ([layer hasPresentedLatest]) return 0;
+        [layer didPresentSerial:second atTime:2.5];
+        if (![layer hasPresentedLatest]) return 0;
+        if ([layer latestPresentationTime] != 2.5) return 0;
+        [layer didPresentSerial:first atTime:3.0];
+        if (![layer hasPresentedLatest]) return 0;
+        if ([layer latestPresentationTime] != 2.5) return 0;
+        [layer beginPresentation];
+        return ![layer hasPresentedLatest];
+    }
+}
+
+double yu_metal_layer_presentation_time(void *layer_ptr) {
+    return layer_ptr != NULL ? [(YuMetalLayer *)layer_ptr latestPresentationTime] : 0;
+}
+
 int yu_metal_resize_layer(
     void *layer_ptr,
     double pixel_width,
@@ -501,42 +588,6 @@ int yu_metal_resize_layer(
     layer.contentsScale = scale;
     layer.drawableSize = CGSizeMake(pixel_width, pixel_height);
     [(YuMetalLayer *)layer invalidateReadyDrawable];
-    return 1;
-}
-
-int yu_metal_upload_alpha_texture(
-    void *device_ptr,
-    uint32_t width,
-    uint32_t height,
-    const uint8_t *pixels,
-    size_t pixel_length,
-    void **out_texture
-) {
-    if (device_ptr == NULL || pixels == NULL || out_texture == NULL || width == 0 || height == 0) {
-        return 0;
-    }
-    size_t expected = (size_t)width * (size_t)height;
-    if (expected != pixel_length) {
-        return 0;
-    }
-    id<MTLDevice> device = (id<MTLDevice>)device_ptr;
-    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
-                                      width:width
-                                     height:height
-                                  mipmapped:NO];
-    if (descriptor == nil) {
-        return 0;
-    }
-    descriptor.storageMode = MTLStorageModeShared;
-    descriptor.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
-    if (texture == nil) {
-        return 0;
-    }
-    MTLRegion region = MTLRegionMake2D(0, 0, width, height);
-    [texture replaceRegion:region mipmapLevel:0 withBytes:pixels bytesPerRow:width];
-    *out_texture = (void *)texture;
     return 1;
 }
 
@@ -614,6 +665,7 @@ int yu_metal_create_render_target(
         free(target);
         return 0;
     }
+    target->vertex_pool = [[NSMutableArray alloc] init];
     target->width = width;
     target->height = height;
     *out_target = (void *)target;
@@ -627,6 +679,7 @@ void yu_metal_release_render_target(void *target_ptr) {
     YuMetalRenderTarget *target = (YuMetalRenderTarget *)target_ptr;
     [target->texture release];
     [target->scroll_scratch release];
+    [target->vertex_pool release];
     dispatch_release(target->in_flight);
     free(target);
 }
@@ -677,6 +730,7 @@ int yu_metal_clear_and_present(
         return 4;
     }
     [encoder endEncoding];
+    [(YuMetalLayer *)layer_ptr trackPresentation:drawable];
     [command_buffer presentDrawable:drawable];
     [command_buffer commit];
     return 1;
@@ -684,26 +738,21 @@ int yu_metal_clear_and_present(
 
 int yu_metal_create_pipeline(
     void *device_ptr,
-    const char *source,
-    size_t source_length,
+    const uint8_t *library_bytes,
+    size_t library_length,
     void **out_pipeline
 ) {
-    if (device_ptr == NULL || source == NULL || source_length == 0 || out_pipeline == NULL) {
-        return 0;
-    }
-
+    if (device_ptr == NULL || library_bytes == NULL || library_length == 0 || out_pipeline == NULL) return 0;
     id<MTLDevice> device = (id<MTLDevice>)device_ptr;
-    NSString *shader_source = [[NSString alloc]
-        initWithBytes:source
-               length:source_length
-             encoding:NSUTF8StringEncoding];
-    if (shader_source == nil) {
-        return 0;
-    }
-
+    void *owned = malloc(library_length);
+    if (owned == NULL) return 0;
+    memcpy(owned, library_bytes, library_length);
+    dispatch_data_t data = dispatch_data_create(owned, library_length,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), DISPATCH_DATA_DESTRUCTOR_FREE);
     NSError *library_error = nil;
-    id<MTLLibrary> library = [device newLibraryWithSource:shader_source options:nil error:&library_error];
-    [shader_source release];
+    id<MTLLibrary> library = [device newLibraryWithData:data error:&library_error];
+    dispatch_release(data);
+    if (library_error != nil) NSLog(@"Yu Metal library: %@", library_error.localizedDescription);
     if (library == nil) {
         return 0;
     }
@@ -713,12 +762,14 @@ int yu_metal_create_pipeline(
     id<MTLFunction> glyph = [library newFunctionWithName:@"yu_glyph_fragment"];
     id<MTLFunction> image = [library newFunctionWithName:@"yu_image_fragment"];
     id<MTLFunction> rounded = [library newFunctionWithName:@"yu_rounded_fragment"];
-    if (vertex == nil || solid == nil || glyph == nil || image == nil || rounded == nil) {
+    id<MTLFunction> polyline = [library newFunctionWithName:@"yu_polyline_fragment"];
+    if (vertex == nil || solid == nil || glyph == nil || image == nil || rounded == nil || polyline == nil) {
         [vertex release];
         [solid release];
         [glyph release];
         [image release];
         [rounded release];
+        [polyline release];
         [library release];
         return 0;
     }
@@ -752,6 +803,8 @@ int yu_metal_create_pipeline(
     image_descriptor.fragmentFunction = image;
     MTLRenderPipelineDescriptor *rounded_descriptor = [solid_descriptor copy];
     rounded_descriptor.fragmentFunction = rounded;
+    MTLRenderPipelineDescriptor *polyline_descriptor = [solid_descriptor copy];
+    polyline_descriptor.fragmentFunction = polyline;
     MTLRenderPipelineDescriptor *clear_descriptor = [solid_descriptor copy];
     clear_descriptor.colorAttachments[0].blendingEnabled = NO;
 
@@ -766,6 +819,8 @@ int yu_metal_create_pipeline(
         [device newRenderPipelineStateWithDescriptor:image_descriptor error:&pipeline_error];
     id<MTLRenderPipelineState> rounded_pipeline =
         [device newRenderPipelineStateWithDescriptor:rounded_descriptor error:&pipeline_error];
+    id<MTLRenderPipelineState> polyline_pipeline =
+        [device newRenderPipelineStateWithDescriptor:polyline_descriptor error:&pipeline_error];
 
     MTLSamplerDescriptor *sampler_descriptor = [[MTLSamplerDescriptor alloc] init];
     sampler_descriptor.minFilter = MTLSamplerMinMagFilterLinear;
@@ -778,6 +833,7 @@ int yu_metal_create_pipeline(
     [clear_descriptor release];
     [image_descriptor release];
     [rounded_descriptor release];
+    [polyline_descriptor release];
     [glyph_descriptor release];
     [solid_descriptor release];
     [vertex_descriptor release];
@@ -786,15 +842,17 @@ int yu_metal_create_pipeline(
     [glyph release];
     [image release];
     [rounded release];
+    [polyline release];
     [library release];
 
     if (clear_pipeline == nil || solid_pipeline == nil || glyph_pipeline == nil
-        || image_pipeline == nil || rounded_pipeline == nil || sampler == nil) {
+        || image_pipeline == nil || rounded_pipeline == nil || polyline_pipeline == nil || sampler == nil) {
         [clear_pipeline release];
         [solid_pipeline release];
         [glyph_pipeline release];
         [image_pipeline release];
         [rounded_pipeline release];
+        [polyline_pipeline release];
         [sampler release];
         return 0;
     }
@@ -806,6 +864,7 @@ int yu_metal_create_pipeline(
         [glyph_pipeline release];
         [image_pipeline release];
         [rounded_pipeline release];
+        [polyline_pipeline release];
         [sampler release];
         return 0;
     }
@@ -814,6 +873,7 @@ int yu_metal_create_pipeline(
     pipeline->glyph_pipeline = glyph_pipeline;
     pipeline->image_pipeline = image_pipeline;
     pipeline->rounded_pipeline = rounded_pipeline;
+    pipeline->polyline_pipeline = polyline_pipeline;
     pipeline->sampler = sampler;
     *out_pipeline = (void *)pipeline;
     return 1;
@@ -861,7 +921,8 @@ static int yu_metal_encode_command(
     const YuMetalTextureBinding *textures,
     size_t texture_count,
     const YuMetalImageTextureBinding *image_textures,
-    size_t image_texture_count
+    size_t image_texture_count,
+    id<MTLBuffer> vertex_buffer, NSUInteger vertex_offset, NSUInteger vertex_count
 ) {
     YuMetalVertex vertices[6] = {
         {command.x, command.y, command.u0, command.v0},
@@ -902,6 +963,8 @@ static int yu_metal_encode_command(
         [encoder setRenderPipelineState:pipeline->image_pipeline];
         [encoder setFragmentTexture:(id<MTLTexture>)texture_ptr atIndex:0];
         [encoder setFragmentSamplerState:pipeline->sampler atIndex:0];
+    } else if (command.kind == 4) {
+        [encoder setRenderPipelineState:pipeline->polyline_pipeline];
     } else if (command.kind == 3) {
         // 圆角矩形：纯着色器绘制，无纹理；quad 外扩与几何偏移已随命令带来。
         [encoder setRenderPipelineState:pipeline->rounded_pipeline];
@@ -909,10 +972,25 @@ static int yu_metal_encode_command(
         return 0;
     }
 
-    [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
+    if (vertex_buffer != nil) {
+        [encoder setVertexBuffer:vertex_buffer offset:vertex_offset atIndex:0];
+    } else {
+        [encoder setVertexBytes:vertices length:sizeof(vertices) atIndex:0];
+    }
     // fragment uniform 按 kind 区分布局：solid/glyph 是颜色四元组，image 多
     // 带 quad 尺寸与裁剪圆角，rounded 是填充 + 阴影的完整参数块。
-    if (command.kind == 3) {
+    if (command.kind == 4) {
+        // Matches YuPolylineUniforms: local points and width, no textures.
+        float polyline[16] = {
+            command.width, command.height,
+            command.rect_offset_x, command.rect_offset_y,
+            command.rect_width, command.rect_height,
+            command.shadow_offset_x, command.shadow_offset_y,
+            command.radius, 0.0f, 0.0f, 0.0f,
+            command.red, command.green, command.blue, command.alpha
+        };
+        [encoder setFragmentBytes:polyline length:sizeof(polyline) atIndex:0];
+    } else if (command.kind == 3) {
         // shadow_color 是打包 RGBA8（大端 [r,g,b,a]），在此归一化。
         YuMetalRoundedUniforms rounded = {
             command.width,
@@ -925,6 +1003,7 @@ static int yu_metal_encode_command(
             command.shadow_blur,
             command.shadow_offset_x,
             command.shadow_offset_y,
+            {0.0f, 0.0f},
             (float)((command.shadow_color >> 24) & 0xffu) / 255.0f,
             (float)((command.shadow_color >> 16) & 0xffu) / 255.0f,
             (float)((command.shadow_color >> 8) & 0xffu) / 255.0f,
@@ -956,8 +1035,23 @@ static int yu_metal_encode_command(
         };
         [encoder setFragmentBytes:&primitive length:sizeof(primitive) atIndex:0];
     }
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:vertex_count];
     return 1;
+}
+
+// Merge adjacent primitives only. Color, atlas and scissor order are preserved.
+static size_t yu_metal_batch_end(const YuMetalDrawCommand *commands, size_t start, size_t count) {
+    YuMetalDrawCommand first = commands[start];
+    size_t end = start + 1;
+    if (first.kind != 0 && first.kind != 1) return end;
+    while (end < count) {
+        YuMetalDrawCommand next = commands[end];
+        if (next.kind != first.kind || (first.kind == 1 && next.page != first.page)
+            || next.red != first.red || next.green != first.green
+            || next.blue != first.blue || next.alpha != first.alpha) break;
+        end++;
+    }
+    return end;
 }
 
 static void yu_metal_encode_clear_rect(
@@ -1104,6 +1198,39 @@ int yu_metal_render_plan(
     };
     [encoder setVertexBytes:&frame length:sizeof(frame) atIndex:1];
 
+    if (command_count > NSUIntegerMax / (6 * sizeof(YuMetalVertex))) {
+        [encoder endEncoding];
+        dispatch_semaphore_signal(target->in_flight);
+        return 5;
+    }
+    NSUInteger vertex_bytes = MAX(1, command_count * 6 * sizeof(YuMetalVertex));
+    NSMutableArray<id<MTLBuffer>> *pool = target->vertex_pool;
+    id<MTLBuffer> vertex_buffer = nil;
+    @synchronized(pool) {
+        if (pool.count > 0) {
+            vertex_buffer = [[[pool lastObject] retain] autorelease];
+            [pool removeLastObject];
+        }
+    }
+    if (vertex_buffer == nil || vertex_buffer.length < vertex_bytes) {
+        vertex_buffer = [[target->texture.device newBufferWithLength:vertex_bytes
+            options:MTLResourceStorageModeShared] autorelease];
+    }
+    if (vertex_buffer == nil) {
+        [encoder endEncoding];
+        dispatch_semaphore_signal(target->in_flight);
+        return 5;
+    }
+    YuMetalVertex *vertices = vertex_buffer.contents;
+    for (size_t i = 0; i < command_count; i++) {
+        YuMetalDrawCommand c = commands[i];
+        YuMetalVertex quad[6] = {
+            {c.x, c.y, c.u0, c.v0}, {c.x+c.width, c.y, c.u1, c.v0},
+            {c.x, c.y+c.height, c.u0, c.v1}, {c.x+c.width, c.y, c.u1, c.v0},
+            {c.x+c.width, c.y+c.height, c.u1, c.v1}, {c.x, c.y+c.height, c.u0, c.v1}
+        };
+        memcpy(vertices + i * 6, quad, sizeof(quad));
+    }
     if (full_clear) {
         MTLScissorRect full_scissor = {
             0,
@@ -1112,7 +1239,8 @@ int yu_metal_render_plan(
             drawable.texture.height,
         };
         [encoder setScissorRect:full_scissor];
-        for (size_t index = 0; index < command_count; index += 1) {
+        for (size_t index = 0, end = 0; index < command_count; index = end) {
+            end = yu_metal_batch_end(commands, index, command_count);
             if (!yu_metal_encode_command(
                     encoder,
                     pipeline,
@@ -1120,7 +1248,7 @@ int yu_metal_render_plan(
                     textures,
                     texture_count,
                     image_textures,
-                    image_texture_count)) {
+                    image_texture_count, vertex_buffer, index * 6 * sizeof(YuMetalVertex), (end - index) * 6)) {
                 [encoder endEncoding];
                 dispatch_semaphore_signal(target->in_flight);
                 return 5;
@@ -1141,15 +1269,16 @@ int yu_metal_render_plan(
             [encoder setScissorRect:scissor];
             YuMetalPrimitiveUniforms background = {clear_red, clear_green, clear_blue, clear_alpha};
             yu_metal_encode_clear_rect(encoder, pipeline, damage_rect, background);
-            for (size_t index = 0; index < command_count; index += 1) {
-                if (!yu_metal_encode_command(
+            for (size_t index = 0, end = 0; index < command_count; index = end) {
+                end = yu_metal_batch_end(commands, index, command_count);
+            if (!yu_metal_encode_command(
                         encoder,
                         pipeline,
                         commands[index],
                         textures,
                         texture_count,
                         image_textures,
-                        image_texture_count)) {
+                        image_texture_count, vertex_buffer, index * 6 * sizeof(YuMetalVertex), (end - index) * 6)) {
                     [encoder endEncoding];
                     dispatch_semaphore_signal(target->in_flight);
                     return 5;
@@ -1182,6 +1311,7 @@ int yu_metal_render_plan(
             fflush(stdout);
         }];
     }
+    [(YuMetalLayer *)layer_ptr trackPresentation:drawable];
     [command_buffer presentDrawable:drawable];
     dispatch_semaphore_t in_flight = target->in_flight;
     // The semaphore is captured independently of `target`; this keeps the
@@ -1190,7 +1320,9 @@ int yu_metal_render_plan(
     dispatch_retain(in_flight);
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull _) {
         yu_render_metric("gpu_complete", layer_ptr, 0);
+        @synchronized(pool) { if (pool.count < 2) [pool addObject:vertex_buffer]; }
         dispatch_semaphore_signal(in_flight);
+        yu_metal_notify_frame_work_ready();
         dispatch_release(in_flight);
     }];
     yu_render_metric("gpu_submit", layer_ptr, 0);
@@ -1209,6 +1341,7 @@ void yu_metal_release_pipeline(void *pipeline_ptr) {
     [pipeline->glyph_pipeline release];
     [pipeline->image_pipeline release];
     [pipeline->rounded_pipeline release];
+    [pipeline->polyline_pipeline release];
     [pipeline->sampler release];
     free(pipeline);
 }
@@ -1216,5 +1349,49 @@ void yu_metal_release_pipeline(void *pipeline_ptr) {
 void yu_metal_release(void *object) {
     if (object != NULL) {
         [(id)object release];
+    }
+}
+
+// Real GPU pixel oracle for the C/MSL uniform contract. Test-only callers use
+// an offscreen target; no window or screen-recording permission is involved.
+int yu_metal_rounded_pixel_probe(void *device_ptr, void *pipeline_ptr, uint8_t *rgba) {
+    if (!device_ptr || !pipeline_ptr || !rgba) return 0;
+    @autoreleasepool {
+        id<MTLDevice> device = (id<MTLDevice>)device_ptr;
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:32 height:32 mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageRenderTarget;
+        id<MTLTexture> target = [device newTextureWithDescriptor:descriptor];
+        if (!queue || !target) { [queue release]; [target release]; return 0; }
+        id<MTLCommandBuffer> buffer = [queue commandBuffer];
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = target;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        id<MTLRenderCommandEncoder> encoder = [buffer renderCommandEncoderWithDescriptor:pass];
+        YuMetalFrameUniforms frame = {32, 32, 1, 0};
+        [encoder setVertexBytes:&frame length:sizeof(frame) atIndex:1];
+        YuMetalDrawCommand command = {0};
+        command.kind = 3;
+        command.x = 4; command.y = 4; command.width = 24; command.height = 24;
+        command.u1 = 1; command.v1 = 1;
+        command.rect_width = 24; command.rect_height = 24; command.radius = 4;
+        command.red = 49.0f/255; command.green = 127.0f/255; command.blue = 185.0f/255;
+        command.alpha = 1;
+        int encoded = yu_metal_encode_command(encoder, (YuMetalPipeline *)pipeline_ptr,
+            command, NULL, 0, NULL, 0, nil, 0, 6);
+        [encoder endEncoding];
+        [buffer commit];
+        [buffer waitUntilCompleted];
+        uint8_t pixel[4] = {0};
+        [target getBytes:pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(16,16,1,1) mipmapLevel:0];
+        rgba[0] = pixel[2]; rgba[1] = pixel[1]; rgba[2] = pixel[0]; rgba[3] = pixel[3];
+        int ok = encoded && buffer.status == MTLCommandBufferStatusCompleted;
+        [queue release]; [target release];
+        return ok;
     }
 }

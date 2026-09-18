@@ -19,7 +19,7 @@
 //! 76 份真实 Markdown × 每个偏移 × 两种 bias），S6 换完消费者之后它连同那条
 //! 差分一起删掉了。
 //!
-//! **留下的是什么。** 「O(log n) 的树下降」由 `hidden.rs` 里的线性参照实现
+//! **留下的是什么。** 「O(log n) 的区间二分查询」由 `hidden.rs` 里的线性参照实现
 //! 逐点压着——两份独立的推理互相校验，比 round-trip 那种自证性质强。
 //! 「哪些字节该被隐藏」现在由 `yu-markdown` 的 extension 回答，它的 oracle
 //! 是 CommonMark 的官方用例（不变量 C7）。
@@ -28,6 +28,8 @@ mod decoration;
 mod hidden;
 mod set;
 
-pub use decoration::{Decoration, DecorationRange, LineStyleId, StyleId, WidgetId, WidgetSide};
+pub use decoration::{
+    Decoration, DecorationRange, LineStyleId, ReplacementText, StyleId, WidgetId, WidgetSide,
+};
 pub use hidden::Bias;
-pub use set::{DecorationSet, MapError, MergeError};
+pub use set::{DecorationSet, MapError, MergeError, ProjectionSpan};

@@ -13,10 +13,9 @@
 //! 层」）。这一层与 `yu-layout` 拿到的仍然只有「等宽、1.0 倍、Keyword 角
 //! 色」，拿不到「这是 Rust 的 `fn`」。
 //!
-//! 为什么颜色必须与字型挤在**同一个** [`StyleId`] 上：`yu-editor::marks` 的
-//! `winner_over` 是「最窄的 Mark 赢，而且只赢一个」，Mark 不叠加。代码块整段
-//! 有一条 `Code` 的 Mark，token 的 Mark 更窄会把它整个盖掉——token 那份属性
-//! 不自带 `Code` 的话，高亮的字会掉出等宽字体，不报错。
+//! 字型与配色角色是独立维度；编辑器在重叠标记之间组合字体 traits，
+//! 同优先级取最具体的非 Plain 角色。语法高亮仍携带 Code 属性，
+//! 使单条高亮标记也能独立描述等宽文本。
 //!
 //! 它们最初定义在 `yu-decoration`。挪过来的理由与 S3 的 `VisualOffset`、
 //! S4 的 `SourceCaretPosition` 相同：纯类型归 `yu-core`，逻辑留在原处。
@@ -70,6 +69,58 @@ pub enum TextStyle {
     Emphasis,
     Strong,
     Code,
+    StrongEmphasis,
+    CodeStrong,
+    CodeEmphasis,
+    CodeStrongEmphasis,
+}
+
+impl TextStyle {
+    #[must_use]
+    pub const fn is_strong(self) -> bool {
+        matches!(
+            self,
+            Self::Strong | Self::StrongEmphasis | Self::CodeStrong | Self::CodeStrongEmphasis
+        )
+    }
+    #[must_use]
+    pub const fn is_emphasis(self) -> bool {
+        matches!(
+            self,
+            Self::Emphasis | Self::StrongEmphasis | Self::CodeEmphasis | Self::CodeStrongEmphasis
+        )
+    }
+    #[must_use]
+    pub const fn is_code(self) -> bool {
+        matches!(
+            self,
+            Self::Code | Self::CodeStrong | Self::CodeEmphasis | Self::CodeStrongEmphasis
+        )
+    }
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self::from_traits(
+            self.is_strong() || other.is_strong(),
+            self.is_emphasis() || other.is_emphasis(),
+            self.is_code() || other.is_code(),
+        )
+    }
+    #[must_use]
+    pub const fn without_code(self) -> Self {
+        Self::from_traits(self.is_strong(), self.is_emphasis(), false)
+    }
+    const fn from_traits(strong: bool, emphasis: bool, code: bool) -> Self {
+        match (strong, emphasis, code) {
+            (false, false, false) => Self::Plain,
+            (true, false, false) => Self::Strong,
+            (false, true, false) => Self::Emphasis,
+            (true, true, false) => Self::StrongEmphasis,
+            (false, false, true) => Self::Code,
+            (true, false, true) => Self::CodeStrong,
+            (false, true, true) => Self::CodeEmphasis,
+            (true, true, true) => Self::CodeStrongEmphasis,
+        }
+    }
 }
 
 /// 一段文字在配色里扮演的角色。
@@ -94,6 +145,8 @@ pub enum TextRole {
     Comment,
     /// 函数名与宏名。
     Function,
+    /// A declared binding name, distinct from later variable references.
+    Definition,
     /// 类型名。
     Type,
     /// 常量与内置值（`true` / `None` / `nil`）。
@@ -103,6 +156,8 @@ pub enum TextRole {
     Operator,
     /// 括号、分号、逗号。
     Punctuation,
+    /// Visible placeholder for a nonprinting character in a code block.
+    ControlCharacter,
     /// 链接文字。颜色与下划线住在 `yu-workspace` 的 Theme，不由语法高亮调色板
     /// 供色——它不是代码角色，链接在段落、标题、引用里都有。
     Link,
@@ -117,6 +172,11 @@ pub struct TextAttrs {
     style: TextStyle,
     size_scale: f32,
     role: TextRole,
+    font: crate::ThemeFont,
+    letter_spacing: f32,
+    inline_box_id: Option<u64>,
+    inline_inset: f32,
+    inline_inset_y: f32,
 }
 
 impl TextAttrs {
@@ -127,7 +187,79 @@ impl TextAttrs {
             style,
             size_scale: 1.0,
             role: TextRole::Plain,
+            font: crate::ThemeFont::Inherit,
+            letter_spacing: 0.0,
+            inline_box_id: None,
+            inline_inset: 0.0,
+            inline_inset_y: 0.0,
         }
+    }
+
+    #[must_use]
+    pub const fn with_style(mut self, style: TextStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_font(mut self, font: crate::ThemeFont) -> Self {
+        self.font = font;
+        self
+    }
+
+    #[must_use]
+    pub const fn font(self) -> crate::ThemeFont {
+        self.font
+    }
+
+    #[must_use]
+    pub const fn with_inline_box_id(mut self, id: Option<u64>) -> Self {
+        self.inline_box_id = id;
+        self
+    }
+    #[must_use]
+    pub const fn inline_box_id(self) -> Option<u64> {
+        self.inline_box_id
+    }
+    #[must_use]
+    pub fn with_inline_inset(mut self, value: f32) -> Option<Self> {
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        self.inline_inset = value;
+        Some(self)
+    }
+    #[must_use]
+    pub const fn inline_inset(self) -> f32 {
+        self.inline_inset
+    }
+
+    #[must_use]
+    pub fn with_inline_inset_y(mut self, value: f32) -> Option<Self> {
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        self.inline_inset_y = value;
+        Some(self)
+    }
+    #[must_use]
+    pub const fn inline_inset_y(self) -> f32 {
+        self.inline_inset_y
+    }
+
+    /// Additional advance in logical points, applied by the paragraph provider.
+    #[must_use]
+    pub fn with_letter_spacing(mut self, value: f32) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        self.letter_spacing = value;
+        Some(self)
+    }
+
+    #[must_use]
+    pub const fn letter_spacing(self) -> f32 {
+        self.letter_spacing
     }
 
     /// 带字号倍率。非有限或非正的倍率被拒绝——布局里一个 NaN 宽度会一路传播

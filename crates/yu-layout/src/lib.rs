@@ -17,9 +17,9 @@ use yu_core::{
 mod block;
 
 pub use block::{
-    BlockLayout, CaretBox, ClusterBox, GlyphBox, LayoutInput, LineAttrs, LineBox, LineSpan,
-    LineStyleTable, NoLineStyles, NoWidgets, StyleTable, StyledRun, UniformStyleTable, WidgetBox,
-    WidgetConstraints, WidgetMeasure, WidgetMeasurement, WidgetMetrics, WidgetSpan,
+    BlockLayout, CaretBox, ClusterBox, GlyphBox, LayoutInput, LineAlignment, LineAttrs, LineBox,
+    LineSpan, LineStyleTable, NoLineStyles, NoWidgets, StyleTable, StyledRun, UniformStyleTable,
+    WidgetBox, WidgetConstraints, WidgetMeasure, WidgetMeasurement, WidgetMetrics, WidgetSpan,
 };
 
 /// Layout dimensions and wrapping policy independent of any font backend.
@@ -29,19 +29,10 @@ pub struct LayoutConfig {
     line_height: f32,
     default_advance: f32,
     base_direction: BaseDirection,
+    theme: yu_core::ThemeId,
 }
 
-/// 段落的基准方向（UAX #9 的 P2/P3）。
-///
-/// 只有 [`BlockLayout`] 读它。`LayoutSnapshot`（v1）没有 bidi，忽略这个字段。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum BaseDirection {
-    /// 按 UAX #9 的 P2/P3 从内容推断：取第一个强方向字符。
-    #[default]
-    Auto,
-    Ltr,
-    Rtl,
-}
+pub use yu_core::BaseDirection;
 
 impl LayoutConfig {
     #[must_use]
@@ -51,7 +42,19 @@ impl LayoutConfig {
             line_height,
             default_advance: 1.0,
             base_direction: BaseDirection::Auto,
+            theme: yu_core::ThemeId::Github,
         }
+    }
+
+    #[must_use]
+    pub const fn with_theme(mut self, theme: yu_core::ThemeId) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    #[must_use]
+    pub const fn theme(self) -> yu_core::ThemeId {
+        self.theme
     }
 
     /// 覆盖段落基准方向。默认按内容推断。
@@ -235,7 +238,7 @@ impl Error for HeightIndexError {}
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeightIndex {
     values: Vec<f32>,
-    tree: Vec<f32>,
+    tree: Vec<f64>,
 }
 
 impl Default for HeightIndex {
@@ -259,11 +262,13 @@ impl HeightIndex {
         };
         let values = index.values.clone();
         for (position, height) in values.into_iter().enumerate() {
-            index.add(position, height);
+            index.add(position, f64::from(height));
         }
         Ok(index)
     }
 
+    // f64 accumulation is essential for zero-height source separators: adding
+    // and removing estimates in f32 can make adjacent prefix positions reverse.
     pub fn uniform(count: usize, height: f32) -> Result<Self, HeightIndexError> {
         Self::new(std::iter::repeat_n(height, count))
     }
@@ -290,6 +295,10 @@ impl HeightIndex {
 
     #[must_use]
     pub fn prefix_height(&self, end: usize) -> f32 {
+        self.prefix_height_precise(end) as f32
+    }
+
+    fn prefix_height_precise(&self, end: usize) -> f64 {
         let mut position = end.min(self.values.len());
         let mut total = 0.0;
         while position > 0 {
@@ -307,7 +316,7 @@ impl HeightIndex {
             });
         };
         validate_height(height)?;
-        let delta = height - *previous;
+        let delta = f64::from(height) - f64::from(*previous);
         *previous = height;
         self.add(index, delta);
         Ok(())
@@ -317,11 +326,11 @@ impl HeightIndex {
         validate_height(height)?;
         let index = self.values.len();
         let position = index.saturating_add(1);
-        let low_bit = position & position.wrapping_neg();
-        let existing =
-            self.prefix_height(index) - self.prefix_height(position.saturating_sub(low_bit));
+        let low_bit = position.isolate_lowest_one();
+        let existing = self.prefix_height_precise(index)
+            - self.prefix_height_precise(position.saturating_sub(low_bit));
         self.values.push(height);
-        self.tree.push(existing + height);
+        self.tree.push(existing + f64::from(height));
         Ok(())
     }
 
@@ -339,14 +348,15 @@ impl HeightIndex {
         }
 
         let mut position = 0_usize;
-        let mut accumulated = 0.0_f32;
+        let mut accumulated = 0.0_f64;
         let mut step = 1_usize;
         while step < self.values.len() {
             step <<= 1;
         }
         while step > 0 {
             let candidate = position.saturating_add(step);
-            if candidate <= self.values.len() && accumulated + self.tree[candidate] <= y {
+            if candidate <= self.values.len() && accumulated + self.tree[candidate] <= f64::from(y)
+            {
                 accumulated += self.tree[candidate];
                 position = candidate;
             }
@@ -355,11 +365,11 @@ impl HeightIndex {
         Some(position.min(self.values.len().saturating_sub(1)))
     }
 
-    fn add(&mut self, index: usize, delta: f32) {
+    fn add(&mut self, index: usize, delta: f64) {
         let mut position = index.saturating_add(1);
         while position < self.tree.len() {
             self.tree[position] += delta;
-            position = position.saturating_add(position & position.wrapping_neg());
+            position = position.saturating_add(position.isolate_lowest_one());
         }
     }
 }

@@ -24,7 +24,10 @@
 
 use std::collections::HashMap;
 
-use yu_core::{LineIndex, Revision, TextRange};
+use crate::VisualText;
+use crate::marks::{Mark, flatten_composed};
+use yu_core::{LineIndex, Revision, TextRange, TextStyle};
+use yu_decoration::Decoration;
 use yu_text::{TextPositionError, TextSnapshot};
 
 use crate::document::{EditorDocument, EditorDocumentError};
@@ -85,6 +88,14 @@ impl From<VisualTextError> for PanelError {
     }
 }
 
+/// A font-style run in the displayed label, using UTF-8 byte offsets.
+/// These offsets do not refer to the Markdown source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutlineLabelRun {
+    pub range: std::ops::Range<usize>,
+    pub style: TextStyle,
+}
+
 /// 大纲面板上的一行。
 ///
 /// `child_count` 是**直接**孩子的条数。这份表按文档顺序排，而层级规则
@@ -95,6 +106,7 @@ impl From<VisualTextError> for PanelError {
 pub struct OutlineRow {
     item: OutlineItem,
     label: String,
+    label_runs: Vec<OutlineLabelRun>,
     identity: String,
     child_count: usize,
 }
@@ -109,6 +121,11 @@ impl OutlineRow {
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    #[must_use]
+    pub fn label_runs(&self) -> &[OutlineLabelRun] {
+        &self.label_runs
     }
 
     /// 跨刷新的身份：从根到自己的 label 链，同一个父亲下的同名兄弟按出现
@@ -149,12 +166,7 @@ impl OutlineTree {
         // key 是「父亲的身份 + label」，值是这个 label 在该父亲下出现过几次。
         let mut occurrences: HashMap<String, usize> = HashMap::new();
         for item in outline.items() {
-            let label = fold_lines(&visible_source(
-                document,
-                &snapshot,
-                item.block(),
-                item.label_range(),
-            )?);
+            let (label, label_runs) = styled_outline_label(document, &snapshot, *item)?;
             let parent_identity = item
                 .parent()
                 .and_then(|parent| rows.get(parent))
@@ -172,6 +184,7 @@ impl OutlineTree {
             rows.push(OutlineRow {
                 item: *item,
                 label,
+                label_runs,
                 identity,
                 child_count: 0,
             });
@@ -348,11 +361,74 @@ fn fold_lines(raw: &str) -> String {
     if !raw.contains(is_line_break) {
         return raw.to_owned();
     }
-    raw.split(is_line_break)
-        .map(str::trim)
-        .filter(|piece| !piece.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    fold_styled_lines(raw.chars().map(|c| (c, TextStyle::Plain)).collect())
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect()
+}
+
+fn fold_styled_lines(chars: Vec<(char, TextStyle)>) -> Vec<(char, TextStyle)> {
+    if !chars.iter().any(|(c, _)| is_line_break(*c)) {
+        return chars;
+    }
+    let mut output = Vec::new();
+    for line in chars.split(|(c, _)| is_line_break(*c)) {
+        let start = line.iter().position(|(c, _)| !c.is_whitespace());
+        let end = line.iter().rposition(|(c, _)| !c.is_whitespace());
+        if let (Some(start), Some(end)) = (start, end) {
+            if !output.is_empty() {
+                output.push((' ', TextStyle::Plain));
+            }
+            output.extend_from_slice(&line[start..=end]);
+        }
+    }
+    output
+}
+
+fn styled_outline_label(
+    document: &mut EditorDocument,
+    snapshot: &TextSnapshot,
+    item: OutlineItem,
+) -> Result<(String, Vec<OutlineLabelRun>), PanelError> {
+    let decorations = document.semantic_block_decorations(item.block())?;
+    let bounds = item.label_range();
+    let visual = VisualText::new(snapshot, bounds, decorations.set().clone())?;
+    let marks: Vec<_> = decorations
+        .set()
+        .all()
+        .iter()
+        .filter_map(|entry| match entry.decoration {
+            Decoration::Mark { style } => Some(Mark {
+                range: entry.range,
+                style,
+                priority: entry.priority,
+            }),
+            _ => None,
+        })
+        .collect();
+    let mut styles = decorations.styles().to_vec();
+    let mut chars = Vec::new();
+    for (range, style) in flatten_composed(bounds, &marks, &mut styles) {
+        let start = visual.canonical_source_to_visual(range.start()).get() as usize;
+        let end = visual.canonical_source_to_visual(range.end()).get() as usize;
+        let style = style.map_or(TextStyle::Plain, |id| styles[id.0 as usize].style());
+        chars.extend(visual.text()[start..end].chars().map(|c| (c, style)));
+    }
+    let mut label = String::new();
+    let mut runs: Vec<OutlineLabelRun> = Vec::new();
+    for (c, style) in fold_styled_lines(chars) {
+        let start = label.len();
+        label.push(c);
+        if let Some(last) = runs.last_mut().filter(|last| last.style == style) {
+            last.range.end = label.len();
+        } else {
+            runs.push(OutlineLabelRun {
+                range: start..label.len(),
+                style,
+            });
+        }
+    }
+    Ok((label, runs))
 }
 
 /// Unicode 的换行字符，与 Swift `Character.isNewline` 同一组。

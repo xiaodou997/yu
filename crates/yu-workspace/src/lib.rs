@@ -15,15 +15,15 @@ use yu_assets::{
     EmbeddedRenderPayload, EmbeddedRenderPublication, ImageIntrinsicPublication, ImageKey,
     ImagePublication,
 };
-use yu_core::{Revision, TextRange, TextRole, TextStyle, VisualRange};
+use yu_core::{Revision, TextRange, TextRole, VisualRange};
 use yu_editor::{
     Bias, BlockCluster, BlockKind, BlockView, BlockWidget, CaretAffinity, CheckboxPlacement,
-    EditorDocument, EditorDocumentError, ImageSpan, LayoutError, Selections, ShapingProvider,
-    TableLayout, TableResizeCommit, TableResizeTarget, TaskState, ViewportSpan,
-    layout_tokens::{
-        code_block_background_rect, content_origin_y, is_code_block, quote_block_background_rect,
-    },
+    EditorDocumentError, ImageSpan, LayoutContext, LayoutError, LayoutSnapshot, Selections,
+    ShapingProvider, TableLayout, TableResizeCommit, TableResizeTarget, TaskState, ViewportSpan,
+    layout_tokens::{code_block_background_rect, is_code_block, quote_block_background_rect},
 };
+#[cfg(test)]
+use yu_editor::{EditorDocument, layout_tokens::content_origin_y};
 use yu_font::GlyphAtlas;
 use yu_layout::{ImageIntrinsicSize, LayoutPoint, LayoutRect};
 use yu_render::{RenderError, RenderPlan, RenderPlanBuilder};
@@ -220,9 +220,21 @@ pub enum Appearance {
     #[default]
     Light,
     Dark,
+    YuLight,
+    YuDark,
 }
 
 impl Appearance {
+    #[must_use]
+    pub const fn theme_id(self) -> yu_core::ThemeId {
+        match self {
+            Self::Light => yu_core::ThemeId::Github,
+            Self::Dark => yu_core::ThemeId::Night,
+            Self::YuLight => yu_core::ThemeId::YuLight,
+            Self::YuDark => yu_core::ThemeId::YuDark,
+        }
+    }
+
     /// 这一外观对应的整张主题表。
     ///
     /// 「一个事实进来、一整套颜色出去」的门开在这里，且只在这里：
@@ -235,6 +247,8 @@ impl Appearance {
         match self {
             Self::Light => Theme::light(),
             Self::Dark => Theme::dark(),
+            Self::YuLight => Theme::yu(false),
+            Self::YuDark => Theme::yu(true),
         }
     }
 
@@ -333,12 +347,7 @@ pub struct Theme {
     broken_image: Rgba8,
     /// 已排进版面的图片在像素就绪前落在 primitive 上的 fallback 色。
     image_fallback: Rgba8,
-    /// 任务框「待办」态的边框。两种外观共用同一个中性灰。
-    task_todo_border: Rgba8,
-    /// 任务框「完成」态的边框。两种外观共用同一个产品蓝。
-    task_done_border: Rgba8,
-    /// 任务框里的白：待办态的框心、完成态的对勾。压在两种底上都还认得出来。
-    task_checkbox_fill: Rgba8,
+    task_checkbox: yu_core::TaskCheckboxStyle,
     /// 链接文字的颜色。下划线取它的 80% alpha，不再单开 token——两处要一起
     /// 换色，分两个 token 只会漂开。
     link_color: Rgba8,
@@ -350,13 +359,9 @@ pub struct Theme {
     //
     // 数值的纪律见结构体文档；消费者只有本 crate（`yu-editor` 不依赖这一层）。
     /// 正文字号。
-    body_font_size: f32,
     /// 行高倍率。现状的行高由平台经 viewport config 给绝对值。
-    line_height_ratio: f32,
     /// 标题字号倍率。现状的分级倍率住在 `yu-editor` 的 `BlockStyleTable`。
-    heading_scale: f32,
     /// 块间额外间距。0.0 = 现状块与块之间不加任何额外间距。
-    block_spacing: f32,
     /// 圆角半径按用途拆实：块背景最显眼，取 8；行内 chip 小，取 5；图片与块
     /// 背景同档，取 8。一个 token 一个用途常量——三处换角各自独立，不共享
     /// 「那个圆角」。
@@ -365,18 +370,43 @@ pub struct Theme {
     inline_chip_corner_radius: f32,
     /// 图片圆角半径。
     image_corner_radius: f32,
-    /// 内容列宽上限。
-    content_column_limit: f32,
+}
+
+const fn theme_color(value: u32) -> Rgba8 {
+    let [r, g, b, a] = value.to_be_bytes();
+    Rgba8::new(r, g, b, a)
 }
 
 impl Theme {
+    pub const fn yu(dark: bool) -> Self {
+        let spec = if dark {
+            yu_core::ThemeSpec::YU_DARK
+        } else {
+            yu_core::ThemeSpec::YU_LIGHT
+        };
+        let mut theme = if dark { Self::dark() } else { Self::light() };
+        theme.background = theme_color(spec.background);
+        theme.text = theme_color(spec.text);
+        theme.code_block_background = theme_color(spec.code_background);
+        theme.quote_block_background = theme_color(spec.background);
+        theme.quote_bar = theme_color(spec.quote_border_color);
+        theme.table.border_color = theme_color(spec.table_border);
+        theme.table.header_fill = Some(theme_color(spec.table_header));
+        theme.table.stripe_fill = theme_color(spec.table_stripe);
+        theme.link_color = theme_color(spec.link);
+        theme.inline_code_background = theme_color(spec.inline_background);
+        theme.block_corner_radius = spec.block_radius;
+        theme.inline_chip_corner_radius = spec.inline_radius;
+        theme
+    }
     /// 浅色表。数值即 M1 之前的现状，逐一点名在
     /// `theme_tables_pin_every_product_color` 用例里。
     #[must_use]
     pub const fn light() -> Self {
+        let spec = yu_core::ThemeSpec::GITHUB;
         Self {
-            background: Rgba8::new(248, 249, 251, 255),
-            text: Rgba8::new(32, 36, 43, 255),
+            background: theme_color(spec.background),
+            text: theme_color(spec.text),
             editor_decorations: EditorDecorationStyle::new(
                 Rgba8::new(0, 122, 255, 97),
                 Rgba8::black(),
@@ -384,32 +414,25 @@ impl Theme {
                 1.0,
             )
             .with_search(Rgba8::new(255, 214, 10, 120), Rgba8::new(255, 149, 0, 140)),
-            code_block_background: Rgba8::new(241, 244, 248, 255),
-            quote_block_background: Rgba8::new(239, 246, 255, 255),
-            quote_bar: Rgba8::new(176, 181, 190, 255),
+            code_block_background: theme_color(spec.code_background),
+            quote_block_background: theme_color(spec.background),
+            quote_bar: theme_color(spec.quote_border_color),
             table: TableSceneStyle {
-                border_width: 1.0,
-                border_color: Rgba8::new(190, 195, 205, 255),
-                header_fill: Some(Rgba8::new(248, 249, 251, 255)),
+                border_color: theme_color(spec.table_border),
+                header_fill: Some(theme_color(spec.table_header)),
+                stripe_fill: theme_color(spec.table_stripe),
                 selection_fill: Some(Rgba8::new(210, 225, 255, 255)),
             },
             code_palette: CodeRolePalette::light(),
             thematic_break: Rgba8::new(214, 218, 224, 255),
             broken_image: Rgba8::new(198, 203, 212, 255),
             image_fallback: Rgba8::new(232, 234, 238, 255),
-            task_todo_border: Rgba8::new(118, 124, 134, 255),
-            task_done_border: Rgba8::new(38, 111, 219, 255),
-            task_checkbox_fill: Rgba8::white(),
-            link_color: Rgba8::new(40, 120, 212, 255),
-            inline_code_background: Rgba8::new(241, 244, 247, 255),
-            body_font_size: 17.0,
-            line_height_ratio: 1.0,
-            heading_scale: 1.0,
-            block_spacing: 0.0,
-            block_corner_radius: 8.0,
-            inline_chip_corner_radius: 5.0,
-            image_corner_radius: 8.0,
-            content_column_limit: 860.0,
+            task_checkbox: yu_core::ThemeId::Github.task_checkbox_style(),
+            link_color: theme_color(spec.link),
+            inline_code_background: theme_color(spec.inline_background),
+            block_corner_radius: spec.block_radius,
+            inline_chip_corner_radius: spec.inline_radius,
+            image_corner_radius: 0.0,
         }
     }
 
@@ -417,9 +440,10 @@ impl Theme {
     /// [`CodeRolePalette::dark`] 与 `editor_decorations` 字段的文档里。
     #[must_use]
     pub const fn dark() -> Self {
+        let spec = yu_core::ThemeSpec::NIGHT;
         Self {
-            background: Rgba8::new(30, 30, 32, 255),
-            text: Rgba8::new(233, 233, 236, 255),
+            background: theme_color(spec.background),
+            text: theme_color(spec.text),
             editor_decorations: EditorDecorationStyle::new(
                 Rgba8::new(10, 132, 255, 130),
                 Rgba8::new(233, 233, 236, 255),
@@ -427,32 +451,25 @@ impl Theme {
                 1.0,
             )
             .with_search(Rgba8::new(255, 214, 10, 90), Rgba8::new(255, 159, 10, 130)),
-            code_block_background: Rgba8::new(34, 38, 45, 255),
-            quote_block_background: Rgba8::new(36, 45, 58, 255),
-            quote_bar: Rgba8::new(90, 97, 108, 255),
+            code_block_background: theme_color(spec.code_background),
+            quote_block_background: theme_color(spec.background),
+            quote_bar: theme_color(spec.quote_border_color),
             table: TableSceneStyle {
-                border_width: 1.0,
-                border_color: Rgba8::new(75, 81, 92, 255),
-                header_fill: Some(Rgba8::new(40, 44, 52, 255)),
+                border_color: theme_color(spec.table_border),
+                header_fill: Some(theme_color(spec.table_header)),
+                stripe_fill: theme_color(spec.table_stripe),
                 selection_fill: Some(Rgba8::new(38, 66, 110, 255)),
             },
             code_palette: CodeRolePalette::dark(),
             thematic_break: Rgba8::new(70, 76, 86, 255),
             broken_image: Rgba8::new(72, 78, 88, 255),
             image_fallback: Rgba8::new(232, 234, 238, 255),
-            task_todo_border: Rgba8::new(118, 124, 134, 255),
-            task_done_border: Rgba8::new(38, 111, 219, 255),
-            task_checkbox_fill: Rgba8::white(),
-            link_color: Rgba8::new(106, 176, 255, 255),
-            inline_code_background: Rgba8::new(42, 46, 53, 255),
-            body_font_size: 17.0,
-            line_height_ratio: 1.0,
-            heading_scale: 1.0,
-            block_spacing: 0.0,
-            block_corner_radius: 8.0,
-            inline_chip_corner_radius: 5.0,
-            image_corner_radius: 8.0,
-            content_column_limit: 860.0,
+            task_checkbox: yu_core::ThemeId::Night.task_checkbox_style(),
+            link_color: theme_color(spec.link),
+            inline_code_background: theme_color(spec.inline_background),
+            block_corner_radius: spec.block_radius,
+            inline_chip_corner_radius: spec.inline_radius,
+            image_corner_radius: 0.0,
         }
     }
 
@@ -537,19 +554,19 @@ impl Theme {
     /// 任务框「待办」态的边框。
     #[must_use]
     pub const fn task_todo_border(self) -> Rgba8 {
-        self.task_todo_border
+        theme_color(self.task_checkbox.border)
     }
 
     /// 任务框「完成」态的边框。
     #[must_use]
     pub const fn task_done_border(self) -> Rgba8 {
-        self.task_done_border
+        theme_color(self.task_checkbox.checked_fill)
     }
 
-    /// 任务框的框心/对勾白。
+    /// 任务框的主题底色；完成态的对勾颜色独立解析。
     #[must_use]
     pub const fn task_checkbox_fill(self) -> Rgba8 {
-        self.task_checkbox_fill
+        theme_color(self.task_checkbox.fill)
     }
 
     /// 链接文字的颜色。下划线取它的 80% alpha（
@@ -563,30 +580,6 @@ impl Theme {
     #[must_use]
     pub const fn inline_code_background(self) -> Rgba8 {
         self.inline_code_background
-    }
-
-    /// 正文字号（预留位，当前无调用点）。
-    #[must_use]
-    pub const fn body_font_size(self) -> f32 {
-        self.body_font_size
-    }
-
-    /// 行高倍率（预留位，当前无调用点）。
-    #[must_use]
-    pub const fn line_height_ratio(self) -> f32 {
-        self.line_height_ratio
-    }
-
-    /// 标题字号倍率（预留位，当前无调用点）。
-    #[must_use]
-    pub const fn heading_scale(self) -> f32 {
-        self.heading_scale
-    }
-
-    /// 块间额外间距（预留位，当前无调用点）。
-    #[must_use]
-    pub const fn block_spacing(self) -> f32 {
-        self.block_spacing
     }
 
     /// 块背景（代码块/引用块）的圆角半径。
@@ -605,12 +598,6 @@ impl Theme {
     #[must_use]
     pub const fn image_corner_radius(self) -> f32 {
         self.image_corner_radius
-    }
-
-    /// 内容列宽上限（预留位，当前无调用点）。
-    #[must_use]
-    pub const fn content_column_limit(self) -> f32 {
-        self.content_column_limit
     }
 }
 
@@ -648,37 +635,28 @@ pub struct CodeRolePalette {
 }
 
 impl CodeRolePalette {
-    /// 浅色那一份，按浅底 `(241,244,248)` 挑对比度。
+    /// Native role colors resolved from the shared Github theme.
     #[must_use]
     pub const fn light() -> Self {
-        Self {
-            keyword: Rgba8::new(207, 34, 46, 255),
-            literal: Rgba8::new(10, 48, 105, 255),
-            number: Rgba8::new(5, 80, 174, 255),
-            comment: Rgba8::new(110, 119, 129, 255),
-            function: Rgba8::new(130, 80, 223, 255),
-            type_name: Rgba8::new(149, 63, 25, 255),
-            constant: Rgba8::new(5, 80, 174, 255),
-            operator: Rgba8::new(5, 80, 174, 255),
-        }
+        Self::from_colors(yu_core::ThemeId::Github.code_colors())
     }
 
-    /// 深色那一份**不是把浅色那份反相**。
-    ///
-    /// 反相出来的颜色在深底上要么发糊（低明度的红蓝）要么刺眼（高饱和的紫）。
-    /// 这一份按深色底 `(34,38,45)` 重新挑，取舍与浅色那份一样：正文色由这一帧
-    /// 给（不覆盖），括号与分号不着色。
+    /// Native role colors resolved from the shared Night theme.
     #[must_use]
     pub const fn dark() -> Self {
+        Self::from_colors(yu_core::ThemeId::Night.code_colors())
+    }
+
+    const fn from_colors(colors: [u32; 8]) -> Self {
         Self {
-            keyword: Rgba8::new(255, 123, 114, 255),
-            literal: Rgba8::new(165, 214, 255, 255),
-            number: Rgba8::new(121, 192, 255, 255),
-            comment: Rgba8::new(139, 148, 158, 255),
-            function: Rgba8::new(210, 168, 255, 255),
-            type_name: Rgba8::new(255, 166, 87, 255),
-            constant: Rgba8::new(121, 192, 255, 255),
-            operator: Rgba8::new(121, 192, 255, 255),
+            keyword: theme_color(colors[0]),
+            literal: theme_color(colors[1]),
+            number: theme_color(colors[2]),
+            comment: theme_color(colors[3]),
+            function: theme_color(colors[4]),
+            type_name: theme_color(colors[5]),
+            constant: theme_color(colors[6]),
+            operator: theme_color(colors[7]),
         }
     }
 
@@ -746,10 +724,11 @@ impl CodeRolePalette {
             TextRole::Literal => Some(self.literal),
             TextRole::Number => Some(self.number),
             TextRole::Comment => Some(self.comment),
-            TextRole::Function => Some(self.function),
+            TextRole::Function | TextRole::Definition => Some(self.function),
             TextRole::Type => Some(self.type_name),
             TextRole::Constant => Some(self.constant),
             TextRole::Operator => Some(self.operator),
+            TextRole::ControlCharacter => Some(Rgba8::new(255, 0, 0, 255)),
         }
     }
 }
@@ -758,19 +737,13 @@ impl CodeRolePalette {
 /// 收了两份，这个 struct 是那两张表共用的形状。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TableSceneStyle {
-    border_width: f32,
     border_color: Rgba8,
     header_fill: Option<Rgba8>,
+    stripe_fill: Rgba8,
     selection_fill: Option<Rgba8>,
 }
 
 impl TableSceneStyle {
-    /// 网格线宽。线宽与颜色分开存：几何归线宽，选色归颜色。
-    #[must_use]
-    pub const fn border_width(self) -> f32 {
-        self.border_width
-    }
-
     /// 网格线颜色。
     #[must_use]
     pub const fn border_color(self) -> Rgba8 {
@@ -868,6 +841,20 @@ fn append_table_ornaments(
             ));
         }
     }
+    // tbody's nth-child(2n) excludes the header row.
+    for cell in table
+        .cells()
+        .iter()
+        .copied()
+        .filter(|cell| style.stripe_fill.alpha() != 0 && cell.row() > 0 && cell.row() % 2 == 0)
+    {
+        ornaments.push(OrnamentPrimitive::new(
+            cell.source(),
+            translate_block_rect(cell.bounds(), origin)?,
+            style.stripe_fill,
+            OrnamentRole::Background,
+        ));
+    }
     if let Some(color) = style.selection_fill {
         for cell in table.cells().iter().copied() {
             if selection.is_some_and(|range| ranges_intersect_or_caret(range, cell.source())) {
@@ -882,18 +869,26 @@ fn append_table_ornaments(
     }
 
     let bounds = table.bounds();
-    let thickness_x = style.border_width.min(bounds.width());
-    let thickness_y = style.border_width.min(bounds.height());
+    let thickness_x = table.border_width().min(bounds.width());
+    let thickness_y = table.border_width().min(bounds.height());
     if thickness_x <= 0.0 || thickness_y <= 0.0 {
         return Ok(());
     }
     let total_width = bounds.width();
     let total_height = bounds.height();
-    let mut x = 0.0_f32;
-    for column_width in table.column_widths() {
+    let mut x = bounds.x();
+    for (column, column_width) in table.column_widths().iter().enumerate() {
         ornaments.push(OrnamentPrimitive::new(
             table_source,
-            translate_block_rect(LayoutRect::new(x, 0.0, thickness_x, total_height)?, origin)?,
+            translate_block_rect(
+                LayoutRect::new(
+                    x - if column == 0 { 0.0 } else { thickness_x * 0.5 },
+                    0.0,
+                    thickness_x,
+                    total_height,
+                )?,
+                origin,
+            )?,
             style.border_color,
             OrnamentRole::Border,
         ));
@@ -903,7 +898,7 @@ fn append_table_ornaments(
         table_source,
         translate_block_rect(
             LayoutRect::new(
-                (total_width - thickness_x).max(0.0),
+                bounds.x() + (total_width - thickness_x).max(0.0),
                 0.0,
                 thickness_x,
                 total_height,
@@ -916,11 +911,21 @@ fn append_table_ornaments(
 
     // 行高不是常数：一格里的内容换行之后那一行更高，横线要按每一行自己的
     // 上沿画。按 `行号 × 常数行高` 画的话，越往下越对不上格子。
-    for row in table.rows() {
+    for (row_index, row) in table.rows().iter().enumerate() {
         ornaments.push(OrnamentPrimitive::new(
             table_source,
             translate_block_rect(
-                LayoutRect::new(0.0, row.y(), total_width, thickness_y)?,
+                LayoutRect::new(
+                    bounds.x(),
+                    row.y()
+                        - if row_index == 0 {
+                            0.0
+                        } else {
+                            thickness_y * 0.5
+                        },
+                    total_width,
+                    thickness_y,
+                )?,
                 origin,
             )?,
             style.border_color,
@@ -931,7 +936,7 @@ fn append_table_ornaments(
         table_source,
         translate_block_rect(
             LayoutRect::new(
-                0.0,
+                bounds.x(),
                 (total_height - thickness_y).max(0.0),
                 total_width,
                 thickness_y,
@@ -962,64 +967,69 @@ fn ranges_intersect_or_caret(selection: TextRange, cell: TextRange) -> bool {
 /// 塌成一个点，点上没有宽度可用——代价是方框压在正文的第一个字上。复选框
 /// 成为 widget 之后盒子在排版里占位，画的人不需要、也不许再算第二遍。
 ///
-/// 颜色来自 [`Theme`]：边框两态各一个 token，框心/对勾是同一个白。三种颜色
-/// 两种外观共用——现状如此，M1 不替深色另挑一套。
+/// Shape and colors resolve from the shared native theme. The semantic border
+/// retains the exact checkbox hit bounds, including when the mark is a stroke.
 fn append_task_checkbox(
     ornaments: &mut Vec<OrnamentPrimitive>,
     origin: Point,
     appearance: Appearance,
     placement: CheckboxPlacement,
 ) -> Result<(), ViewportSceneError> {
-    let theme = appearance.theme();
-    let state = placement.state();
+    let theme_id = appearance.theme_id();
+    let style = theme_id.task_checkbox_style();
+    let done = placement.state() == TaskState::Done;
     let source = placement.source();
     let bounds = placement.bounds();
     let size = bounds.width().min(bounds.height());
-    let x = bounds.x();
-    let y = bounds.y();
-    let border = match state {
-        TaskState::Todo => theme.task_todo_border(),
-        TaskState::Done => theme.task_done_border(),
-    };
-    ornaments.push(OrnamentPrimitive::new(
-        source,
-        translate_block_rect(LayoutRect::new(x, y, size, size)?, origin)?,
-        border,
-        OrnamentRole::Border,
-    ));
-
-    match state {
-        TaskState::Todo => {
-            let inset = (size * 0.14).max(0.5).min(size * 0.3);
-            ornaments.push(OrnamentPrimitive::new(
+    let zoom = size / theme_id.task_checkbox_size();
+    let radius = style.radius * zoom;
+    let rect = translate_block_rect(bounds, origin)?;
+    ornaments.push(
+        OrnamentPrimitive::new(
+            source,
+            rect,
+            theme_color(if done {
+                style.checked_fill
+            } else {
+                style.border
+            }),
+            OrnamentRole::Border,
+        )
+        .with_shape(yu_scene::OrnamentShape::Rounded { radius }),
+    );
+    if !done || theme_id == yu_core::ThemeId::Night {
+        let inset = style.border_width * zoom;
+        ornaments.push(
+            OrnamentPrimitive::new(
                 source,
                 translate_block_rect(
-                    LayoutRect::new(x + inset, y + inset, size - inset * 2.0, size - inset * 2.0)?,
+                    LayoutRect::new(
+                        bounds.x() + inset,
+                        bounds.y() + inset,
+                        size - 2.0 * inset,
+                        size - 2.0 * inset,
+                    )?,
                     origin,
                 )?,
-                theme.task_checkbox_fill(),
+                theme_color(style.fill),
                 OrnamentRole::Background,
-            ));
-        }
-        TaskState::Done => {
-            let unit = size / 5.0;
-            for (column, row) in [(1.0, 2.4), (1.8, 3.1), (2.7, 2.4), (3.6, 1.5)] {
-                ornaments.push(OrnamentPrimitive::new(
-                    source,
-                    translate_block_rect(
-                        LayoutRect::new(
-                            x + unit * column,
-                            y + unit * row,
-                            unit * 0.85,
-                            unit * 0.85,
-                        )?,
-                        origin,
-                    )?,
-                    theme.task_checkbox_fill(),
-                    OrnamentRole::Mark,
-                ));
-            }
-        }
+            )
+            .with_shape(yu_scene::OrnamentShape::Rounded {
+                radius: (radius - inset).max(0.0),
+            }),
+        );
+    }
+    if done {
+        let points = style
+            .mark_points
+            .map(|(x, y)| Point::new(x * size, y * size));
+        ornaments.push(
+            OrnamentPrimitive::new(source, rect, theme_color(style.mark), OrnamentRole::Mark)
+                .with_shape(yu_scene::OrnamentShape::Polyline {
+                    points,
+                    width: style.mark_width * zoom,
+                }),
+        );
     }
     Ok(())
 }
@@ -1068,17 +1078,6 @@ impl EditorDecorationStyle {
     }
 }
 
-/// caret 那一行有多高。
-///
-/// v1 拿的是 `config.line_height()`——标题把行高塞进了 config，所以那个值
-/// 恰好对。v2 的行高住在行盒里（widget 会撑高行），所以要按行问。
-fn caret_line_height(layout: &BlockView, line: usize) -> f32 {
-    layout
-        .lines()
-        .get(line)
-        .map_or_else(|| layout.config().line_height(), |line| line.height())
-}
-
 /// 一段视觉区间在一个块里覆盖的那几行矩形。
 ///
 /// 选区与搜索命中是这件事的**两个消费者**，形状完全一样：一段源码 → 视觉
@@ -1088,7 +1087,7 @@ fn caret_line_height(layout: &BlockView, line: usize) -> f32 {
 /// 高度取**行盒自己的**高度，不是 `config().line_height()`。
 ///
 /// 那个基准值只在 v1 里恰好对：标题把行高塞进了 config。v2 的行高住在行盒
-/// 里（`caret_line_height` 的文档写了这件事，caret 一直是对的），于是选区
+/// 里（光标读取同一条已排版的行），于是选区
 /// 与搜索底色在标题、在带 widget 的行上都会画得又矮又靠上——**不报错，只是
 /// 画在文字上方**。这是真实窗口截图抓出来的；在那之前没有任何断言压着它。
 ///
@@ -1145,38 +1144,39 @@ fn append_visual_span_rects(
     Ok(())
 }
 
-/// 行内代码 chip 的水平/垂直外扩（pt）。垂直外扩 3pt、水平 7pt：chip 比
-/// 行盒矮一截、比文字宽一圈，Typora 那一路的行内代码衬底比例。
-const INLINE_CODE_CHIP_PADDING_X: f32 = 7.0;
-const INLINE_CODE_CHIP_PADDING_Y: f32 = 3.0;
-
 /// 链接下划线的粗细（pt）。压在基线下面 1pt 处——再往下就离开字了。
 const LINK_UNDERLINE_THICKNESS: f32 = 1.0;
 
-/// 行内 chip 与链接下划线共用的簇分组：把块里满足 `keep` 的簇按「同一行盒 +
-/// x 首尾相接」分组，每组给出 `(行下标, 左缘, 右缘)`。
-///
-/// 与 `append_visual_span_rects` 同为「逐行矩形」思路，但那里按一段源码区间
-/// 收簇，这里按**样式/角色**收：行内代码与链接不是源码区间说了算——嵌套里
-/// 最内层赢家才带着那个样式，同一段源码可能一半在行内代码里、一半不在。
-/// 行盒换行或 x 出现空隙（两段独立的行内代码之间）就断开；空隙容差给半个点，
-/// 同 run 相邻簇的坐标是累加浮点，零头容不下第二个分组。
+/// Group selected clusters by their actual paragraph baseline and adjacent x.
+/// A table row may contain many independent text lines; its synthetic BlockLine
+/// is never used for underline placement. Visual sorting also handles RTL runs.
 fn grouped_cluster_spans(
     layout: &BlockView,
     keep: impl Fn(BlockCluster) -> bool,
-) -> Vec<(usize, f32, f32)> {
+) -> Vec<(f32, f32, f32)> {
     const GAP_TOLERANCE: f32 = 0.5;
-    let mut spans: Vec<(usize, f32, f32)> = Vec::new();
-    for cluster in layout.clusters().iter().copied() {
-        if cluster.is_line_break() || !keep(cluster) {
-            continue;
-        }
+    let mut clusters: Vec<_> = layout
+        .clusters()
+        .iter()
+        .copied()
+        .filter(|cluster| !cluster.is_line_break() && keep(*cluster))
+        .collect();
+    clusters.sort_by(|a, b| {
+        a.baseline_y()
+            .total_cmp(&b.baseline_y())
+            .then(a.x().total_cmp(&b.x()))
+    });
+    let mut spans: Vec<(f32, f32, f32)> = Vec::new();
+    for cluster in clusters {
         let right = cluster.x() + cluster.width();
         match spans.last_mut() {
-            Some(span) if span.0 == cluster.line() && cluster.x() <= span.2 + GAP_TOLERANCE => {
+            Some(span)
+                if (span.0 - cluster.baseline_y()).abs() < 0.01
+                    && cluster.x() <= span.2 + GAP_TOLERANCE =>
+            {
                 span.2 = span.2.max(right);
             }
-            _ => spans.push((cluster.line(), cluster.x(), right)),
+            _ => spans.push((cluster.baseline_y(), cluster.x(), right)),
         }
     }
     spans
@@ -1197,24 +1197,55 @@ fn append_inline_code_chips(
     if is_code_block(kind) {
         return Ok(());
     }
+    let theme_id = appearance.theme_id();
     let theme = appearance.theme();
-    for (line_index, left, right) in
-        grouped_cluster_spans(layout, |cluster| cluster.style() == TextStyle::Code)
-    {
-        let Some(line) = layout.lines().get(line_index) else {
-            continue;
+    let zoom = layout.config().line_height() / theme_id.spec().body_size;
+    let border = theme_id.inline_border() * zoom;
+    let radius = theme.inline_chip_corner_radius() * zoom;
+    for fragment in layout.inline_boxes().map_err(EditorDocumentError::Layout)? {
+        let b = fragment.bounds;
+        let bounds = Rect::new(b.x(), block_y + origin_y + b.y(), b.width(), b.height())?;
+        let square_ends = |builder: &mut SceneBuilder,
+                           rect: Rect,
+                           radius: f32,
+                           color|
+         -> Result<(), SceneError> {
+            let width = radius.min(rect.width() * 0.5).min(rect.height() * 0.5);
+            if width > 0.0 && !fragment.left_edge {
+                builder.fill_rect(Rect::new(rect.x(), rect.y(), width, rect.height())?, color)?;
+            }
+            if width > 0.0 && !fragment.right_edge {
+                builder.fill_rect(
+                    Rect::new(
+                        rect.x() + rect.width() - width,
+                        rect.y(),
+                        width,
+                        rect.height(),
+                    )?,
+                    color,
+                )?;
+            }
+            Ok(())
         };
-        builder.rounded_fill_rect(
-            Rect::new(
-                left - INLINE_CODE_CHIP_PADDING_X,
-                block_y + origin_y + line.y() - INLINE_CODE_CHIP_PADDING_Y,
-                right - left + 2.0 * INLINE_CODE_CHIP_PADDING_X,
-                line.height() + 2.0 * INLINE_CODE_CHIP_PADDING_Y,
-            )?,
-            theme.inline_chip_corner_radius(),
-            theme.inline_code_background(),
-            None,
-        )?;
+        if border > 0.0 {
+            let color = theme_color(theme_id.spec().border);
+            builder.rounded_fill_rect(bounds, radius, color, None)?;
+            square_ends(builder, bounds, radius, color)?;
+            let left = if fragment.left_edge { border } else { 0.0 };
+            let right = if fragment.right_edge { border } else { 0.0 };
+            let inner = Rect::new(
+                bounds.x() + left,
+                bounds.y() + border,
+                (bounds.width() - left - right).max(0.0),
+                (bounds.height() - border * 2.0).max(0.0),
+            )?;
+            let inner_radius = (radius - border).max(0.0);
+            builder.rounded_fill_rect(inner, inner_radius, theme.inline_code_background(), None)?;
+            square_ends(builder, inner, inner_radius, theme.inline_code_background())?;
+        } else {
+            builder.rounded_fill_rect(bounds, radius, theme.inline_code_background(), None)?;
+            square_ends(builder, bounds, radius, theme.inline_code_background())?;
+        }
     }
     Ok(())
 }
@@ -1245,16 +1276,15 @@ fn append_link_underlines(
         return Ok(());
     }
     let color = link_underline_color(appearance.theme().link_color());
-    for (line_index, left, right) in
-        grouped_cluster_spans(layout, |cluster| link_visuals.contains(&cluster.visual()))
-    {
-        let Some(line) = layout.lines().get(line_index) else {
-            continue;
-        };
+    for (baseline_y, left, right) in grouped_cluster_spans(layout, |cluster| {
+        link_visuals.iter().any(|visual| {
+            visual.start() < cluster.visual().end() && cluster.visual().start() < visual.end()
+        })
+    }) {
         builder.fill_rect(
             Rect::new(
                 left,
-                block_y + origin_y + line.y() + line.baseline() + 1.0,
+                block_y + origin_y + baseline_y + 1.0,
                 right - left,
                 LINK_UNDERLINE_THICKNESS,
             )?,
@@ -1264,7 +1294,7 @@ fn append_link_underlines(
     Ok(())
 }
 
-/// 块背景（代码灰底、引用蓝底）：内容列宽 ×（内容高 + 2×垂直内边距），块空间
+/// 块背景：内容列宽 ×（内容高 + 上内边距 + 下内边距），块空间
 /// x 从 0（列左缘）起——水平内边距已由断行收窄 + 内容右移让出来（
 /// `layout_tokens::box_layout_config`），按 M3 的 helper 原样画就是「文字离
 /// 背景边正好一个内边距」。圆角、无阴影；色经 [`viewport_block_background`]
@@ -1286,10 +1316,13 @@ fn append_block_background(
     let Some(color) = viewport_block_background(appearance, kind) else {
         return Ok(());
     };
-    // 引用块没有垂直内边距、代码块上下各 5pt——两个 helper 同一刀交付，
-    // 几何口径见 `layout_tokens`。
+    // 背景与内容原点使用同一主题及缩放的四边盒模型。
     let background = if is_code_block(kind) {
-        code_block_background_rect(column_width, layout.height())
+        code_block_background_rect(
+            (column_width - layout.container_left()).max(1.0),
+            layout.height(),
+            layout.config(),
+        )
     } else {
         quote_block_background_rect(column_width, layout.height())
     }
@@ -1299,12 +1332,39 @@ fn append_block_background(
     if background.height() <= 0.0 {
         return Ok(());
     }
-    builder.rounded_fill_rect(
-        translate_block_rect(background, origin)?,
-        appearance.theme().block_corner_radius(),
-        color,
-        None,
+    let bounds = translate_block_rect(
+        background,
+        Point::new(
+            origin.x()
+                + if is_code_block(kind) {
+                    layout.container_left()
+                } else {
+                    0.0
+                },
+            origin.y(),
+        ),
     )?;
+    let radius = appearance.theme().block_corner_radius();
+    let spec = layout.config().theme().spec();
+    let border = if is_code_block(kind) {
+        spec.code_border_width * layout.config().line_height() / spec.body_size
+    } else {
+        0.0
+    };
+    if border > 0.0 {
+        builder.rounded_fill_rect(bounds, radius, theme_color(spec.code_border_color), None)?;
+        if bounds.width() > 2.0 * border && bounds.height() > 2.0 * border {
+            let inner = Rect::new(
+                bounds.x() + border,
+                bounds.y() + border,
+                bounds.width() - 2.0 * border,
+                bounds.height() - 2.0 * border,
+            )?;
+            builder.rounded_fill_rect(inner, (radius - border).max(0.0), color, None)?;
+        }
+    } else {
+        builder.rounded_fill_rect(bounds, radius, color, None)?;
+    }
     Ok(())
 }
 
@@ -1363,9 +1423,9 @@ fn covered_by_a_selection(selections: &Selections, source: TextRange) -> bool {
 
 fn append_search_highlights(
     builder: &mut SceneBuilder,
-    document: &EditorDocument,
+    document: &LayoutContext,
     input: &ViewportSceneInput,
-    layouts: &[BlockView],
+    layouts: &[Arc<BlockView>],
     content_origins: &[f32],
     style: EditorDecorationStyle,
     layer: SearchHighlightLayer,
@@ -1474,11 +1534,50 @@ struct PendingCaret {
     line_height: f32,
 }
 
+fn append_table_cell_selection(
+    builder: &mut SceneBuilder,
+    layout: &BlockView,
+    content_y: f32,
+    selections: &Selections,
+    style: EditorDecorationStyle,
+) -> Result<(), SceneError> {
+    if selections.table_columns().is_none() {
+        return Ok(());
+    }
+    let Some(table) = layout.table() else {
+        return Ok(());
+    };
+    for cell in table.cells() {
+        if selections
+            .as_slice()
+            .binary_search_by_key(&cell.source().start(), |selection| {
+                selection.ordered_range().start()
+            })
+            .ok()
+            .is_some_and(|index| selections.as_slice()[index].ordered_range() == cell.source())
+        {
+            let bounds = cell.bounds();
+            builder.editor_decoration(EditorDecorationPrimitive::new(
+                cell.source(),
+                Rect::new(
+                    bounds.x(),
+                    content_y + bounds.y(),
+                    bounds.width(),
+                    bounds.height(),
+                )?,
+                style.selection,
+                EditorDecorationPrimitiveRole::Selection,
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 fn append_editor_decorations(
     builder: &mut SceneBuilder,
-    document: &EditorDocument,
+    document: &LayoutContext,
     input: &ViewportSceneInput,
-    layouts: &[BlockView],
+    layouts: &[Arc<BlockView>],
     content_origins: &[f32],
     style: EditorDecorationStyle,
 ) -> Result<(), ViewportSceneError> {
@@ -1546,7 +1645,7 @@ fn append_editor_decorations(
                         caret: layout_caret,
                         role: EditorDecorationPrimitiveRole::CompositionCaret,
                         block_y: geometry.y() + origin_y,
-                        line_height: layout.config().line_height(),
+                        line_height: layout.caret_line_height(layout_caret),
                     });
                 }
                 continue;
@@ -1560,7 +1659,7 @@ fn append_editor_decorations(
                     caret: layout_caret,
                     role: EditorDecorationPrimitiveRole::CompositionCaret,
                     block_y: geometry.y() + origin_y,
-                    line_height: caret_line_height(layout, layout_caret.line()),
+                    line_height: layout.caret_line_height(layout_caret),
                 });
             }
             if let Some(visual) = VisualRange::new(visual.start(), visual.end()) {
@@ -1575,6 +1674,11 @@ fn append_editor_decorations(
                     EditorDecorationPrimitiveRole::Selection,
                 )?;
             }
+            continue;
+        }
+
+        if selections.table_columns().is_some() {
+            // Whole-cell selection was painted below the glyphs and borders.
             continue;
         }
 
@@ -1595,7 +1699,7 @@ fn append_editor_decorations(
                     caret: layout_caret,
                     role: EditorDecorationPrimitiveRole::Caret,
                     block_y: geometry.y() + origin_y,
-                    line_height: caret_line_height(layout, layout_caret.line()),
+                    line_height: layout.caret_line_height(layout_caret),
                 });
             }
             if selection.is_empty() {
@@ -2113,12 +2217,16 @@ impl From<ViewportFrameError> for ViewportSceneError {
 /// with metadata from another build.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewportFramePublication {
+    layout: Arc<LayoutSnapshot>,
     revision: Revision,
     serial: u64,
     frame: Arc<ViewportRenderFrame>,
 }
 
 impl ViewportFramePublication {
+    pub fn layout_snapshot(&self) -> Arc<LayoutSnapshot> {
+        Arc::clone(&self.layout)
+    }
     #[must_use]
     pub const fn revision(&self) -> Revision {
         self.revision
@@ -2246,7 +2354,7 @@ impl ViewportFramePublisher {
     /// next serial have both been validated.
     pub fn publish<S: ShapingProvider>(
         &mut self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
         config: ViewportRenderConfig,
         shaper: &S,
         atlas: &GlyphAtlas,
@@ -2259,7 +2367,7 @@ impl ViewportFramePublisher {
     /// image publications. Missing images keep the normal placeholder layout.
     pub fn publish_with_images<S: ShapingProvider>(
         &mut self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
         config: ViewportRenderConfig,
         shaper: &S,
         atlas: &GlyphAtlas,
@@ -2282,7 +2390,7 @@ impl ViewportFramePublisher {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_with_images_and_intrinsics<S: ShapingProvider>(
         &mut self,
-        document: &mut EditorDocument,
+        document: &mut LayoutContext,
         config: ViewportRenderConfig,
         shaper: &S,
         atlas: &GlyphAtlas,
@@ -2316,6 +2424,11 @@ impl ViewportFramePublisher {
             .next_serial
             .checked_add(1)
             .ok_or(ViewportPublishError::SerialOverflow)?;
+        let layout = document.current_layout_snapshot().ok_or_else(|| {
+            ViewportPublishError::Scene(ViewportSceneError::Document(EditorDocumentError::Layout(
+                LayoutError::Upstream("scene has no matching layout snapshot".into()),
+            )))
+        })?;
         let frame = Arc::new(frame);
         self.cache
             .publish_shared_if_current(revision, Arc::clone(&frame))
@@ -2323,6 +2436,7 @@ impl ViewportFramePublisher {
 
         *render_plans = staged_render_plans;
         let publication = ViewportFramePublication {
+            layout,
             revision,
             serial,
             frame,
@@ -2333,11 +2447,101 @@ impl ViewportFramePublisher {
     }
 }
 
+/// Prepare the exact document geometry once, before either rasterizing or
+/// querying it. Ready pixels and retained image dimensions share this path.
+pub fn prepare_layout_snapshot_with_resources<S: ShapingProvider>(
+    document: &mut LayoutContext,
+    query: impl Into<yu_editor::LayoutQuery>,
+    shaper: &S,
+    images: &[ImagePublication],
+    intrinsics: &[ImageIntrinsicPublication],
+    table_resize: Option<TableResizeCommit>,
+) -> Result<Arc<LayoutSnapshot>, EditorDocumentError> {
+    prepare_layout_snapshot_with_resources_cancelable(
+        document,
+        query,
+        shaper,
+        images,
+        intrinsics,
+        table_resize,
+        &mut || false,
+    )
+}
+
+pub fn prepare_layout_snapshot_with_resources_cancelable<S: ShapingProvider, C: FnMut() -> bool>(
+    document: &mut LayoutContext,
+    query: impl Into<yu_editor::LayoutQuery>,
+    shaper: &S,
+    images: &[ImagePublication],
+    intrinsics: &[ImageIntrinsicPublication],
+    table_resize: Option<TableResizeCommit>,
+    should_cancel: &mut C,
+) -> Result<Arc<LayoutSnapshot>, EditorDocumentError> {
+    let resolver = layout_image_resolver(document, images, intrinsics);
+    document.prepare_query_layout_snapshot_with_images_cancelable(
+        query.into(),
+        shaper,
+        &resolver,
+        table_resize,
+        should_cancel,
+    )
+}
+
+fn layout_image_resolver<'a>(
+    document: &LayoutContext,
+    images: &'a [ImagePublication],
+    intrinsics: &'a [ImageIntrinsicPublication],
+) -> impl Fn(ImageSpan) -> Option<ImageIntrinsicSize> + 'a {
+    let source = document.snapshot();
+    let revision = document.revision();
+    let definitions = document.markdown().reference_definitions().clone();
+    move |image: ImageSpan| {
+        let destination = image.destination().or_else(|| {
+            image
+                .reference()
+                .and_then(|reference| definitions.lookup(&source, reference))
+                .map(|definition| definition.destination())
+        })?;
+        let destination = source
+            .as_str()
+            .get(destination.start().get() as usize..destination.end().get() as usize)?;
+        let key = ImageKey::new(destination.to_owned()).ok()?;
+        if let Some(publication) = images.iter().find(|image| {
+            image.revision() == revision && image.key().fingerprint() == key.fingerprint()
+        }) {
+            return ImageIntrinsicSize::new(
+                publication.image().width(),
+                publication.image().height(),
+            )
+            .ok();
+        }
+        let dimensions = intrinsics
+            .iter()
+            .find(|image| {
+                image.revision() == revision && image.key().fingerprint() == key.fingerprint()
+            })?
+            .dimensions();
+        ImageIntrinsicSize::new(dimensions.width(), dimensions.height()).ok()
+    }
+}
+
+pub fn measure_background_paragraphs_with_resources<S: ShapingProvider, C: FnMut() -> bool>(
+    document: &mut LayoutContext,
+    shaper: &S,
+    images: &[ImagePublication],
+    intrinsics: &[ImageIntrinsicPublication],
+    table_resize: Option<TableResizeCommit>,
+    should_cancel: &mut C,
+) -> Result<usize, EditorDocumentError> {
+    let resolver = layout_image_resolver(document, images, intrinsics);
+    document.measure_background_paragraphs(shaper, &resolver, table_resize, should_cancel)
+}
+
 /// Measures the current editor viewport, converts its block metadata into the
 /// scene boundary, materializes matching shaped block layouts, and appends
 /// them atomically through `SceneBuilder::append_viewport`.
 pub fn assemble_viewport_scene<S: ShapingProvider>(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
@@ -2363,7 +2567,7 @@ pub fn assemble_viewport_scene<S: ShapingProvider>(
 /// unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_scene_with_table_resize<S: ShapingProvider>(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
@@ -2391,7 +2595,7 @@ pub fn assemble_viewport_scene_with_table_resize<S: ShapingProvider>(
 /// destination fingerprint used by the image primitive.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
@@ -2418,7 +2622,7 @@ pub fn assemble_viewport_scene_with_images<S: ShapingProvider>(
 /// pixels so CPU/GPU cache eviction cannot make document geometry jump.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
@@ -2447,7 +2651,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics<S: ShapingProvider>(
 /// when stale or when it targets the deferred variable-row path.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: ShapingProvider>(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
@@ -2486,7 +2690,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_table_resize<S: Sh
 pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table_resize<
     S: ShapingProvider,
 >(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     shaper: &S,
     font_size: f32,
@@ -2518,7 +2722,11 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
             .into());
         }
     }
-    let selection = Some(document.selection().ordered_range());
+    let selection = document
+        .selections()
+        .table_columns()
+        .is_none()
+        .then(|| document.selection().ordered_range());
     let image_key = |image: ImageSpan| {
         let destination = image.destination().or_else(|| {
             image
@@ -2531,31 +2739,15 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         let destination = source.as_str().get(start..end)?;
         ImageKey::new(destination.to_owned()).ok()
     };
-    let intrinsic_size = |image: ImageSpan| {
-        let key = image_key(image)?;
-        if let Some(publication) = image_publications.iter().find(|publication| {
-            publication.revision() == document_revision
-                && publication.key().fingerprint() == key.fingerprint()
-        }) {
-            return ImageIntrinsicSize::new(
-                publication.image().width(),
-                publication.image().height(),
-            )
-            .ok();
-        }
-        let intrinsic = image_intrinsics.iter().find(|intrinsic| {
-            intrinsic.revision() == document_revision
-                && intrinsic.key().fingerprint() == key.fingerprint()
-        })?;
-        let dimensions = intrinsic.dimensions();
-        ImageIntrinsicSize::new(dimensions.width(), dimensions.height()).ok()
-    };
-    let viewport_snapshot = document
-        .visible_blocks_with_visual_state_and_shaper_and_image_resolver(
-            viewport,
-            shaper,
-            intrinsic_size,
-        )?;
+    let layout_snapshot = prepare_layout_snapshot_with_resources(
+        document,
+        viewport,
+        shaper,
+        image_publications,
+        image_intrinsics,
+        table_resize,
+    )?;
+    let viewport_snapshot = layout_snapshot.viewport();
     let revision = viewport_snapshot.revision();
     let config = document.viewport_config().layout();
     let geometries = viewport_snapshot
@@ -2589,22 +2781,11 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         geometries,
     )?;
 
-    let mut layouts = Vec::with_capacity(viewport_snapshot.blocks().len());
-    for block in viewport_snapshot.blocks() {
-        let sizes = document.block_image_sizes(block.index(), &intrinsic_size)?;
-        let mut layout = document.block_layout_for_visual_state_with_shaper_and_images(
-            block.index(),
-            config,
-            shaper,
-            &sizes,
-        )?;
-        if let Some(resize) = table_resize.filter(|resize| resize.block_index() == block.index()) {
-            layout
-                .apply_table_resize(resize)
-                .map_err(EditorDocumentError::from)?;
-        }
-        layouts.push(layout);
-    }
+    let layouts = layout_snapshot
+        .blocks()
+        .iter()
+        .map(|block| block.layout_handle())
+        .collect::<Vec<_>>();
     let mut builder = SceneBuilder::new(revision, scene_viewport)?;
     // 背景必须是这一帧的第一个 primitive：Metal layer 透明，未触及的像素会
     // 露出下层视图，而 TextKit fallback 删除后下层已不再绘制任何东西
@@ -2614,10 +2795,10 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
     // 边距起排，glyph/caret/选区/搜索高亮把块局部坐标折进文档坐标时都要补这
     // 同一个数——与 `EditorDocument::block_box_height` 折块高时加在内容上方
     // 的那 5pt 互为反向。
-    let content_origins = viewport_snapshot
+    let content_origins = layout_snapshot
         .blocks()
         .iter()
-        .map(|block| content_origin_y(block.kind()))
+        .map(|block| block.content_y() - block.metadata().y())
         .collect::<Vec<_>>();
     // 每个可见块的装饰、字形与图片，全部搬到文档坐标之后交给场景层。
     // 「这些装饰是什么语法」到这里为止：场景层只看见矩形与角色。
@@ -2644,6 +2825,76 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
             origin,
             appearance,
         )?;
+        for marker in layout.ornaments().markers() {
+            let Some(shape) = marker.shape() else {
+                continue;
+            };
+            let Some(local) = layout
+                .marker_bounds_for(marker)
+                .map_err(EditorDocumentError::Layout)?
+            else {
+                continue;
+            };
+            let bounds = Rect::new(
+                local.x(),
+                block.y() + content_origin + local.y(),
+                local.width(),
+                local.height(),
+            )?;
+            let marker_color = if marker.is_quoted() {
+                theme_color(config.theme().quote_text_color())
+            } else {
+                color
+            };
+            match shape.kind {
+                yu_editor::MarkerShapeKind::Square => {
+                    builder.fill_rect(bounds, marker_color)?;
+                }
+                yu_editor::MarkerShapeKind::Disc | yu_editor::MarkerShapeKind::Circle => {
+                    builder.rounded_fill_rect(bounds, bounds.width() * 0.5, marker_color, None)?;
+                    if shape.kind == yu_editor::MarkerShapeKind::Circle {
+                        let stroke = shape.stroke.min(shape.size * 0.5);
+                        let inner = Rect::new(
+                            bounds.x() + stroke,
+                            bounds.y() + stroke,
+                            (bounds.width() - 2.0 * stroke).max(0.0),
+                            (bounds.width() - 2.0 * stroke).max(0.0),
+                        )?;
+                        builder.rounded_fill_rect(
+                            inner,
+                            inner.width() * 0.5,
+                            appearance.theme().background(),
+                            None,
+                        )?;
+                    }
+                }
+            }
+        }
+        if let Some(table) = layout.table() {
+            tables.push(ViewportTableGeometry::from_layout(
+                block.index(),
+                block.y() + content_origin,
+                table,
+            )?);
+            let mut table_ornaments = Vec::new();
+            append_table_ornaments(
+                &mut table_ornaments,
+                table,
+                Point::new(0.0, block.y() + content_origin),
+                viewport_table_style(appearance),
+                selection,
+            )?;
+            // Cell fills share the block-background pass. Deferred ornaments
+            // are appended after inline chips, so an opaque header/stripe
+            // there would erase code backgrounds and link underlines.
+            for ornament in table_ornaments {
+                if ornament.role() == OrnamentRole::Background {
+                    builder.ornament(ornament)?;
+                } else {
+                    block_ornaments.push(ornament);
+                }
+            }
+        }
         // 行内代码 chip 与链接下划线同样衬在字形底下；chip 必须在代码块背景
         // 之上（引用块里的行内代码压在引用蓝底上），所以排在块背景之后。
         append_inline_code_chips(
@@ -2655,30 +2906,33 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
             appearance,
         )?;
         append_link_underlines(&mut builder, layout, block.y(), content_origin, appearance)?;
-        if let Some(table) = layout.table() {
-            tables.push(ViewportTableGeometry::from_layout(
-                block.index(),
-                block.y(),
-                table,
-            )?);
-            append_table_ornaments(
-                &mut block_ornaments,
-                table,
-                origin,
-                viewport_table_style(appearance),
-                selection,
+        // Tint cell/chip backgrounds, then draw crisp grid lines and untouched
+        // theme glyph colors above the selection rather than tinting the text.
+        if let Some(style) = editor_decorations
+            && document.composition().is_none()
+        {
+            append_table_cell_selection(
+                &mut builder,
+                layout,
+                block.y() + content_origin,
+                document.selections(),
+                style,
             )?;
         }
-        if let Some(quote) = layout.ornaments().quote() {
-            for bounds in quote
-                .bars(layout.height())
-                .map_err(EditorDocumentError::from)?
-            {
+        if let Some(heading) = layout.ornaments().heading() {
+            let (width, color) = config.theme().heading_border(heading.level());
+            let width = width * config.line_height() / config.theme().spec().body_size;
+            if width > 0.0 {
                 block_ornaments.push(OrnamentPrimitive::new(
-                    quote.source(),
-                    translate_block_rect(bounds, origin)?,
-                    viewport_block_quote_color(appearance),
-                    OrnamentRole::Bar,
+                    heading.source(),
+                    Rect::new(
+                        layout.container_left(),
+                        block.y() + content_origin + layout.height(),
+                        (config.max_width() - layout.container_left()).max(1.0),
+                        width,
+                    )?,
+                    theme_color(color),
+                    OrnamentRole::Border,
                 ));
             }
         }
@@ -2761,6 +3015,14 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
         ornaments.push(block_ornaments);
         images.push(block_images);
 
+        let theme_id = appearance.theme_id();
+        let semantic_color = if let Some(heading) = layout.ornaments().heading() {
+            Some(theme_color(theme_id.heading_color(heading.level())))
+        } else if layout.ornaments().quote().is_some() && !is_code_block(block.kind()) {
+            Some(theme_color(theme_id.quote_text_color()))
+        } else {
+            None
+        };
         glyphs.push(
             layout
                 .glyphs()
@@ -2777,15 +3039,59 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
                         LayoutPoint::new(glyph.origin().x(), glyph.origin().y() + content_origin),
                         glyph.size_scale(),
                     );
+                    // A source-backed marker inherits its own ancestors, not
+                    // the deeper paragraph's heading or quote style.
+                    let semantic_color = if glyph.visual().is_empty() {
+                        layout
+                            .ornaments()
+                            .markers()
+                            .find(|marker| marker.source() == glyph.source())
+                            .map(|marker| {
+                                if marker.is_quoted() {
+                                    theme_color(theme_id.quote_text_color())
+                                } else {
+                                    color
+                                }
+                            })
+                            .or(semantic_color)
+                    } else {
+                        semantic_color
+                    };
+                    // Night assigns an explicit color to strong text (including
+                    // table headers); Github inherits the enclosing quote/body.
+                    // Headings retain their own semantic color and code/link
+                    // roles below still take precedence.
+                    let semantic_color =
+                        if glyph.style().is_strong() && layout.ornaments().heading().is_none() {
+                            let strong = theme_id.spec().strong_text;
+                            (strong != 0)
+                                .then(|| theme_color(strong))
+                                .or(semantic_color)
+                        } else {
+                            semantic_color
+                        };
                     // 「这个字什么颜色」到这里为止：场景层拿到的是 RGBA，
                     // 不是 `TextRole`。
                     match viewport_code_role_color(appearance, glyph.role()) {
                         Some(color) => scene_glyph.with_color(color),
-                        None => scene_glyph,
+                        None => semantic_color
+                            .map_or(scene_glyph, |color| scene_glyph.with_color(color)),
                     }
                 })
                 .collect::<Vec<_>>(),
         );
+    }
+    // Container borders use the measured semantic span, including internal
+    // paragraph gaps. Emit after all backgrounds, before paragraph glyphs.
+    for container in layout_snapshot.containers() {
+        if let Some(bar) = container.quote_bar.filter(|bar| bar.height() > 0.0) {
+            builder.ornament(OrnamentPrimitive::new(
+                container.source,
+                Rect::new(bar.x(), bar.y(), bar.width(), bar.height())?,
+                viewport_block_quote_color(appearance),
+                OrnamentRole::Bar,
+            ))?;
+        }
     }
     let contents = viewport_snapshot
         .blocks()
@@ -2851,7 +3157,7 @@ pub fn assemble_viewport_scene_with_images_and_intrinsics_and_embedded_and_table
 /// succeeds; callers can then publish the returned pair through
 /// `ViewportFrameCache::publish_if_current`.
 pub fn assemble_viewport_render_frame<S: ShapingProvider>(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     config: ViewportRenderConfig,
     shaper: &S,
     atlas: &GlyphAtlas,
@@ -2870,7 +3176,7 @@ pub fn assemble_viewport_render_frame<S: ShapingProvider>(
 
 /// Builds a render frame while applying ready image intrinsic dimensions.
 pub fn assemble_viewport_render_frame_with_images<S: ShapingProvider>(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     config: ViewportRenderConfig,
     shaper: &S,
@@ -2894,7 +3200,7 @@ pub fn assemble_viewport_render_frame_with_images<S: ShapingProvider>(
 /// intrinsic dimensions.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvider>(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     config: ViewportRenderConfig,
     shaper: &S,
@@ -2924,7 +3230,7 @@ pub fn assemble_viewport_render_frame_with_images_and_intrinsics<S: ShapingProvi
 pub fn assemble_viewport_render_frame_with_images_and_intrinsics_and_embedded<
     S: ShapingProvider,
 >(
-    document: &mut EditorDocument,
+    document: &mut LayoutContext,
     viewport: ViewportSpan,
     config: ViewportRenderConfig,
     shaper: &S,
@@ -3074,13 +3380,13 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, yu_render::RenderCommand::Glyph { .. }))
         );
-        // 首个 primitive 是整帧背景，其余都应是字形。
+        // The title contributes a border; all other content primitives are glyphs.
         let primitives = frame.scene().primitives();
         assert!(matches!(primitives[0], Primitive::FillRect { .. }));
         assert!(
             primitives[1..]
                 .iter()
-                .all(|primitive| matches!(primitive, Primitive::Glyph(_)))
+                .all(|primitive| matches!(primitive, Primitive::Glyph(_) | Primitive::Ornament(_)))
         );
     }
 
@@ -3125,13 +3431,18 @@ mod tests {
         };
         assert_eq!(
             quote.source(),
-            TextRange::new(ByteOffset::ZERO, ByteOffset::new(source.len() as u64))
-                .expect("source range")
+            TextRange::new(
+                ByteOffset::ZERO,
+                ByteOffset::new(source.trim_end().len() as u64)
+            )
+            .expect("source range")
         );
         assert_eq!(quote.color(), viewport_block_quote_color(Appearance::Light));
+        // Both outer 0.8em margins occupy document height, not border ink.
+        assert_eq!(quote.bounds().y(), 16.0);
         assert_eq!(
             quote.bounds().height(),
-            frame.scene().input().blocks()[0].height()
+            frame.scene().input().blocks()[0].height() - 32.0
         );
         assert!(quote.bounds().right() < 7.0);
 
@@ -3248,8 +3559,8 @@ mod tests {
     #[test]
     fn theme_tables_pin_every_product_color() {
         let light = Theme::light();
-        assert_eq!(light.background(), Rgba8::new(248, 249, 251, 255));
-        assert_eq!(light.text(), Rgba8::new(32, 36, 43, 255));
+        assert_eq!(light.background(), Rgba8::new(255, 255, 255, 255));
+        assert_eq!(light.text(), Rgba8::new(51, 51, 51, 255));
         assert_eq!(
             light.editor_decorations(),
             EditorDecorationStyle::new(
@@ -3262,18 +3573,17 @@ mod tests {
         );
         assert_eq!(
             light.code_block_background(),
-            Rgba8::new(241, 244, 248, 255)
+            Rgba8::new(248, 248, 248, 255)
         );
         assert_eq!(
             light.quote_block_background(),
-            Rgba8::new(239, 246, 255, 255)
+            Rgba8::new(255, 255, 255, 255)
         );
-        assert_eq!(light.quote_bar(), Rgba8::new(176, 181, 190, 255));
-        assert_eq!(light.table().border_width(), 1.0);
-        assert_eq!(light.table().border_color(), Rgba8::new(190, 195, 205, 255));
+        assert_eq!(light.quote_bar(), Rgba8::new(223, 226, 229, 255));
+        assert_eq!(light.table().border_color(), Rgba8::new(223, 226, 229, 255));
         assert_eq!(
             light.table().header_fill(),
-            Some(Rgba8::new(248, 249, 251, 255))
+            Some(Rgba8::new(248, 248, 248, 255))
         );
         assert_eq!(
             light.table().selection_fill(),
@@ -3281,35 +3591,39 @@ mod tests {
         );
         assert_eq!(
             light.code_role_color(TextRole::Keyword),
-            Some(Rgba8::new(207, 34, 46, 255))
+            Some(Rgba8::new(119, 0, 136, 255))
         );
         assert_eq!(
             light.code_role_color(TextRole::Literal),
-            Some(Rgba8::new(10, 48, 105, 255))
+            Some(Rgba8::new(170, 17, 17, 255))
         );
         assert_eq!(
             light.code_role_color(TextRole::Number),
-            Some(Rgba8::new(5, 80, 174, 255))
+            Some(Rgba8::new(17, 102, 68, 255))
         );
         assert_eq!(
             light.code_role_color(TextRole::Comment),
-            Some(Rgba8::new(110, 119, 129, 255))
+            Some(Rgba8::new(170, 85, 0, 255))
         );
         assert_eq!(
             light.code_role_color(TextRole::Function),
-            Some(Rgba8::new(130, 80, 223, 255))
+            Some(Rgba8::new(0, 0, 255, 255))
         );
         assert_eq!(
             light.code_role_color(TextRole::Type),
-            Some(Rgba8::new(149, 63, 25, 255))
+            Some(Rgba8::new(0, 136, 85, 255))
         );
         assert_eq!(
             light.code_role_color(TextRole::Constant),
-            Some(Rgba8::new(5, 80, 174, 255))
+            Some(Rgba8::new(34, 17, 153, 255))
         );
         assert_eq!(
             light.code_role_color(TextRole::Operator),
-            Some(Rgba8::new(5, 80, 174, 255))
+            Some(Rgba8::new(152, 26, 26, 255))
+        );
+        assert_eq!(
+            light.code_role_color(TextRole::Definition),
+            light.code_role_color(TextRole::Function)
         );
         assert_eq!(light.code_role_color(TextRole::Plain), None);
         assert_eq!(light.code_role_color(TextRole::Variable), None);
@@ -3317,23 +3631,23 @@ mod tests {
         // 链接色在调色板之前由 Theme 拦截，不经代码高亮那份表。
         assert_eq!(
             light.code_role_color(TextRole::Link),
-            Some(Rgba8::new(40, 120, 212, 255))
+            Some(Rgba8::new(65, 131, 196, 255))
         );
         assert_eq!(light.thematic_break(), Rgba8::new(214, 218, 224, 255));
         assert_eq!(light.broken_image(), Rgba8::new(198, 203, 212, 255));
         assert_eq!(light.image_fallback(), Rgba8::new(232, 234, 238, 255));
-        assert_eq!(light.task_todo_border(), Rgba8::new(118, 124, 134, 255));
-        assert_eq!(light.task_done_border(), Rgba8::new(38, 111, 219, 255));
+        assert_eq!(light.task_todo_border(), Rgba8::new(128, 128, 128, 255));
+        assert_eq!(light.task_done_border(), Rgba8::new(0, 122, 255, 255));
         assert_eq!(light.task_checkbox_fill(), Rgba8::white());
-        assert_eq!(light.link_color(), Rgba8::new(40, 120, 212, 255));
+        assert_eq!(light.link_color(), Rgba8::new(65, 131, 196, 255));
         assert_eq!(
             light.inline_code_background(),
-            Rgba8::new(241, 244, 247, 255)
+            Rgba8::new(243, 244, 244, 255)
         );
 
         let dark = Theme::dark();
-        assert_eq!(dark.background(), Rgba8::new(30, 30, 32, 255));
-        assert_eq!(dark.text(), Rgba8::new(233, 233, 236, 255));
+        assert_eq!(dark.background(), Rgba8::new(54, 59, 64, 255));
+        assert_eq!(dark.text(), Rgba8::new(184, 191, 198, 255));
         assert_eq!(
             dark.editor_decorations(),
             EditorDecorationStyle::new(
@@ -3344,14 +3658,13 @@ mod tests {
             )
             .with_search(Rgba8::new(255, 214, 10, 90), Rgba8::new(255, 159, 10, 130))
         );
-        assert_eq!(dark.code_block_background(), Rgba8::new(34, 38, 45, 255));
-        assert_eq!(dark.quote_block_background(), Rgba8::new(36, 45, 58, 255));
-        assert_eq!(dark.quote_bar(), Rgba8::new(90, 97, 108, 255));
-        assert_eq!(dark.table().border_width(), 1.0);
-        assert_eq!(dark.table().border_color(), Rgba8::new(75, 81, 92, 255));
+        assert_eq!(dark.code_block_background(), Rgba8::new(51, 51, 51, 255));
+        assert_eq!(dark.quote_block_background(), Rgba8::new(54, 59, 64, 255));
+        assert_eq!(dark.quote_bar(), Rgba8::new(71, 77, 84, 255));
+        assert_eq!(dark.table().border_color(), Rgba8::new(71, 77, 84, 255));
         assert_eq!(
             dark.table().header_fill(),
-            Some(Rgba8::new(40, 44, 52, 255))
+            Some(Rgba8::new(54, 59, 64, 255))
         );
         assert_eq!(
             dark.table().selection_fill(),
@@ -3359,67 +3672,67 @@ mod tests {
         );
         assert_eq!(
             dark.code_role_color(TextRole::Keyword),
-            Some(Rgba8::new(255, 123, 114, 255))
+            Some(Rgba8::new(200, 143, 208, 255))
         );
         assert_eq!(
             dark.code_role_color(TextRole::Literal),
-            Some(Rgba8::new(165, 214, 255, 255))
+            Some(Rgba8::new(210, 107, 107, 255))
         );
         assert_eq!(
             dark.code_role_color(TextRole::Number),
-            Some(Rgba8::new(121, 192, 255, 255))
+            Some(Rgba8::new(100, 171, 143, 255))
         );
         assert_eq!(
             dark.code_role_color(TextRole::Comment),
-            Some(Rgba8::new(139, 148, 158, 255))
+            Some(Rgba8::new(218, 146, 74, 255))
         );
         assert_eq!(
             dark.code_role_color(TextRole::Function),
-            Some(Rgba8::new(210, 168, 255, 255))
+            Some(Rgba8::new(141, 141, 240, 255))
         );
         assert_eq!(
             dark.code_role_color(TextRole::Type),
-            Some(Rgba8::new(255, 166, 87, 255))
+            Some(Rgba8::new(28, 198, 133, 255))
         );
         assert_eq!(
             dark.code_role_color(TextRole::Constant),
-            Some(Rgba8::new(121, 192, 255, 255))
+            Some(Rgba8::new(132, 182, 203, 255))
         );
         assert_eq!(
             dark.code_role_color(TextRole::Operator),
-            Some(Rgba8::new(121, 192, 255, 255))
+            Some(Rgba8::new(184, 191, 198, 255))
+        );
+        assert_eq!(
+            dark.code_role_color(TextRole::Definition),
+            dark.code_role_color(TextRole::Function)
         );
         assert_eq!(dark.code_role_color(TextRole::Plain), None);
         assert_eq!(dark.code_role_color(TextRole::Variable), None);
         assert_eq!(dark.code_role_color(TextRole::Punctuation), None);
         assert_eq!(
             dark.code_role_color(TextRole::Link),
-            Some(Rgba8::new(106, 176, 255, 255))
+            Some(Rgba8::new(224, 224, 224, 255))
         );
         assert_eq!(dark.thematic_break(), Rgba8::new(70, 76, 86, 255));
         assert_eq!(dark.broken_image(), Rgba8::new(72, 78, 88, 255));
         assert_eq!(dark.image_fallback(), Rgba8::new(232, 234, 238, 255));
-        assert_eq!(dark.task_todo_border(), Rgba8::new(118, 124, 134, 255));
-        assert_eq!(dark.task_done_border(), Rgba8::new(38, 111, 219, 255));
-        assert_eq!(dark.task_checkbox_fill(), Rgba8::white());
-        assert_eq!(dark.link_color(), Rgba8::new(106, 176, 255, 255));
-        assert_eq!(dark.inline_code_background(), Rgba8::new(42, 46, 53, 255));
+        assert_eq!(dark.task_todo_border(), Rgba8::new(184, 191, 198, 255));
+        assert_eq!(dark.task_done_border(), Rgba8::new(184, 191, 198, 255));
+        assert_eq!(dark.task_checkbox_fill(), Rgba8::new(54, 59, 64, 255));
+        assert_eq!(dark.link_color(), Rgba8::new(224, 224, 224, 255));
+        assert_eq!(dark.inline_code_background(), Rgba8::new(0, 0, 0, 13));
 
         // 跨 ABI 进来的事实与表之间只隔 theme() 这一道门，门必须选对表。
         assert_eq!(Appearance::Light.theme(), light);
         assert_eq!(Appearance::Dark.theme(), dark);
 
-        // 圆角 token（M4）已拆实接线：块背景、行内 chip、图片各一个用途常量，
-        // 两种外观共用同一份。其余排版字段仍是「不改变现状」的中性预留位。
+        // 两个主题分别定义行内背景圆角。
+        assert_eq!(light.inline_chip_corner_radius(), 3.0);
+        assert_eq!(dark.inline_chip_corner_radius(), 0.0);
+        assert_eq!(light.block_corner_radius(), 3.0);
+        assert_eq!(dark.block_corner_radius(), 0.0);
         for theme in [light, dark] {
-            assert_eq!(theme.body_font_size(), 17.0);
-            assert_eq!(theme.line_height_ratio(), 1.0);
-            assert_eq!(theme.heading_scale(), 1.0);
-            assert_eq!(theme.block_spacing(), 0.0);
-            assert_eq!(theme.block_corner_radius(), 8.0);
-            assert_eq!(theme.inline_chip_corner_radius(), 5.0);
-            assert_eq!(theme.image_corner_radius(), 8.0);
-            assert_eq!(theme.content_column_limit(), 860.0);
+            assert_eq!(theme.image_corner_radius(), 0.0);
         }
     }
 
@@ -3483,10 +3796,114 @@ mod tests {
             frame.scene().primitives().iter().any(|primitive| matches!(
                 primitive,
                 Primitive::RoundedFillRect { color, radius, shadow: None, .. }
-                    if *color == background && *radius == Theme::light().block_corner_radius()
+                    if *color == background && *radius == Theme::light().block_corner_radius() - 1.25
             )),
             "缩进代码块的底色必须真的进了这一帧"
         );
+    }
+
+    #[test]
+    fn nested_table_borders_follow_cell_bounds() {
+        let font_size = 16.0;
+        let shaper = shaper(font_size);
+        let mut document = EditorDocument::new(
+            "intro\n\n> | a | b |\n> | --- | --- |\n> | c | d |\n> | e | f |\n",
+        );
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("config");
+        let snapshot = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 400.0), &shaper)
+            .expect("snapshot");
+        let table = snapshot
+            .blocks()
+            .iter()
+            .find_map(|block| block.layout().table())
+            .expect("table");
+        let mut ornaments = Vec::new();
+        append_table_ornaments(
+            &mut ornaments,
+            table,
+            Point::new(0.0, 0.0),
+            viewport_table_style(Appearance::Light),
+            None,
+        )
+        .expect("ornaments");
+        assert_eq!(
+            ornaments
+                .iter()
+                .filter(|o| o.role() == OrnamentRole::Background)
+                .count(),
+            4,
+            "header and second body row receive Github backgrounds"
+        );
+        let mut night = Vec::new();
+        append_table_ornaments(
+            &mut night,
+            table,
+            Point::new(0.0, 0.0),
+            viewport_table_style(Appearance::Dark),
+            None,
+        )
+        .expect("night ornaments");
+        assert_eq!(
+            night
+                .iter()
+                .filter(|o| o.role() == OrnamentRole::Background)
+                .count(),
+            2,
+            "Night does not add Github body stripes"
+        );
+        for ornament in ornaments {
+            assert!(ornament.bounds().x() >= table.bounds().x());
+            assert!(
+                ornament.bounds().x() + ornament.bounds().width() <= table.bounds().right() + 0.01
+            );
+        }
+    }
+
+    #[test]
+    fn nested_code_background_starts_at_its_container() {
+        let font_size = 16.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 400.0);
+        let mut document = EditorDocument::new("intro\n\n> ```rust\n> let value = 1;\n> ```\n");
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(240.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("nested code fixture");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 240.0, 400.0).expect("nested code fixture"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("nested code fixture");
+        let background = theme_color(yu_core::ThemeSpec::GITHUB.code_border_color);
+        let bounds = frame
+            .scene()
+            .primitives()
+            .iter()
+            .find_map(|primitive| match primitive {
+                Primitive::RoundedFillRect { color, bounds, .. } if *color == background => {
+                    Some(*bounds)
+                }
+                _ => None,
+            })
+            .expect("code background");
+        assert_eq!(bounds.x(), 19.0);
+        assert_eq!(bounds.width(), 221.0);
     }
 
     #[test]
@@ -3526,7 +3943,7 @@ mod tests {
             .collect::<Vec<_>>();
         let heading = glyph_sizes
             .iter()
-            .position(|size| *size == 28.0)
+            .position(|size| *size == 31.5)
             .expect("H1 raster size");
         let body = glyph_sizes
             .iter()
@@ -4017,7 +4434,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(layers.len(), 7);
+        assert_eq!(layers.len(), 4);
         let snapshot = document.snapshot();
         let todo = task_marker(
             &snapshot,
@@ -4037,7 +4454,7 @@ mod tests {
         );
         assert_eq!(
             layers.iter().filter(|layer| layer.source() == done).count(),
-            5
+            2
         );
         assert!(
             layers.iter().any(|layer| {
@@ -4053,6 +4470,15 @@ mod tests {
             layers
                 .iter()
                 .all(|layer| { layer.bounds().width() > 0.0 && layer.bounds().height() > 0.0 })
+        );
+
+        assert!(layers.iter().filter(|layer| layer.role()==OrnamentRole::Border).all(|layer| matches!(layer.shape(), yu_scene::OrnamentShape::Rounded { radius } if radius > 0.0)));
+        let mark = layers
+            .iter()
+            .find(|layer| layer.role() == OrnamentRole::Mark)
+            .expect("continuous mark");
+        assert!(
+            matches!(mark.shape(), yu_scene::OrnamentShape::Polyline { width, .. } if width > 0.0)
         );
 
         let initial_revision = document.revision();
@@ -4083,7 +4509,7 @@ mod tests {
                     )
                 })
                 .count(),
-            5
+            2
         );
     }
 
@@ -4291,9 +4717,15 @@ mod tests {
         tops.sort_by(f32::total_cmp);
         tops.dedup_by(|a, b| (*a - *b).abs() < 0.001);
 
-        for (y, _) in &rows {
+        for (index, (y, _)) in rows.iter().enumerate() {
+            let expected_top = frame.tables()[0].bounds().y() + y
+                - if index == 0 {
+                    0.0
+                } else {
+                    table.border_width() * 0.5
+                };
             assert!(
-                tops.iter().any(|top| (top - y).abs() < 0.001),
+                tops.iter().any(|top| (top - expected_top).abs() < 0.001),
                 "第 {y} 行的上沿没有横线，横线在 {tops:?}，行是 {rows:?}"
             );
         }
@@ -4482,6 +4914,165 @@ mod tests {
         );
     }
 
+    #[test]
+    fn swift_fixture_emits_colored_glyphs_without_changing_geometry() {
+        let body = "// 中文注释\nlet greeting = \"Hello, 世界 👨‍👩‍👧‍👦\"\nprint(greeting)\n";
+        let highlighted = scene_glyph_colors(&format!("```swift\n{body}```\n"));
+        let plain = scene_glyph_colors(&format!("```\n{body}```\n"));
+        assert_eq!(highlighted.len(), plain.len());
+        assert_eq!(
+            distinct(&plain),
+            2,
+            "plain code also displays control markers"
+        );
+        let control = Rgba8::new(255, 0, 0, 255);
+        assert_eq!(plain.iter().filter(|color| **color == control).count(), 3);
+        assert_eq!(
+            highlighted
+                .iter()
+                .filter(|color| **color == control)
+                .count(),
+            3
+        );
+        assert!(
+            distinct(&highlighted) >= 3,
+            "Swift comment, keyword and string must reach painting"
+        );
+    }
+
+    #[test]
+    fn heading_border_follows_content_origin_and_reserves_scaled_height() {
+        for zoom in [0.75, 1.0, 1.5] {
+            for level in [1, 2] {
+                let font_size = 16.0 * zoom;
+                let shaper = shaper(font_size);
+                let source = format!(
+                    "{} A long heading that wraps across lines\n",
+                    "#".repeat(level)
+                );
+                let mut document = EditorDocument::new(&source);
+                let viewport = ViewportSpan::new(0.0, 600.0);
+                document
+                    .set_viewport_config(ViewportConfig::new(
+                        LayoutConfig::new(200.0, font_size),
+                        font_size,
+                        0.0,
+                    ))
+                    .expect("config");
+                let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+                let frame = assemble_viewport_scene(
+                    &mut document,
+                    viewport,
+                    &shaper,
+                    font_size,
+                    Rect::new(0.0, 0.0, 200.0, 600.0).expect("viewport"),
+                    &atlas,
+                    Rgba8::black(),
+                )
+                .expect("scene");
+                let snapshot = document.current_layout_snapshot().expect("snapshot");
+                let block = &snapshot.blocks()[0];
+                let expected_y = block.content_y() + block.layout().height();
+                assert!(
+                    block.content_y() > block.metadata().y(),
+                    "first heading has top margin"
+                );
+                let borders: Vec<_> = frame
+                    .scene()
+                    .primitives()
+                    .iter()
+                    .filter_map(|p| match p {
+                        Primitive::Ornament(ornament)
+                            if ornament.color() == Rgba8::new(238, 238, 238, 255) =>
+                        {
+                            Some(ornament.bounds())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(borders.len(), 1);
+                assert!((borders[0].y() - expected_y).abs() < 0.001);
+                assert!((borders[0].height() - zoom).abs() < 0.001);
+                assert!(
+                    (block.metadata().y() + block.metadata().height()
+                        - expected_y
+                        - zoom
+                        - font_size)
+                        .abs()
+                        < 0.001,
+                    "document extent contains the border once and the final heading margin"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_ancestor_markers_inherit_their_own_quote_color() {
+        for (appearance, theme) in [
+            (Appearance::Light, yu_core::ThemeId::Github),
+            (Appearance::Dark, yu_core::ThemeId::Night),
+        ] {
+            let colors = scene_glyph_colors_with_focus("3. > 7. nested\n\nend", appearance, true);
+            assert!(colors.len() > 4);
+            assert_eq!(&colors[..2], &[theme_color(theme.spec().text); 2]);
+            assert!(
+                colors[2..10]
+                    .iter()
+                    .all(|color| *color == theme_color(theme.quote_text_color()))
+            );
+        }
+    }
+
+    #[test]
+    fn heading_and_quote_colors_reach_glyphs_and_links_keep_their_own_color() {
+        for (appearance, heading, quote) in [
+            (
+                Appearance::Light,
+                Rgba8::new(51, 51, 51, 255),
+                Rgba8::new(119, 119, 119, 255),
+            ),
+            (
+                Appearance::Dark,
+                Rgba8::new(222, 222, 222, 255),
+                Rgba8::new(157, 162, 166, 255),
+            ),
+        ] {
+            let colors = scene_glyph_colors_with_appearance("# Heading\n", appearance);
+            assert!(!colors.is_empty());
+            assert!(colors.iter().all(|color| *color == heading));
+            let colors = scene_glyph_colors_with_appearance(
+                "> quoted [link](https://example.com)\n",
+                appearance,
+            );
+            assert!(colors.contains(&quote));
+            assert!(colors.contains(&appearance.theme().link_color()));
+        }
+    }
+
+    #[test]
+    fn strong_text_and_table_headers_follow_theme_without_recoloring_plain_quotes() {
+        let strong = Rgba8::new(222, 222, 222, 255);
+        let quote = Rgba8::new(157, 162, 166, 255);
+        for source in ["**bold**\n", "| Header |\n| --- |\n| **bold** |\n"] {
+            let colors = scene_glyph_colors_with_appearance(source, Appearance::Dark);
+            assert!(!colors.is_empty());
+            assert!(colors.iter().all(|color| *color == strong));
+        }
+        let quoted = scene_glyph_colors_with_appearance(
+            "> plain **bold** [link](https://example.com)\n",
+            Appearance::Dark,
+        );
+        assert!(quoted.contains(&strong));
+        assert!(quoted.contains(&quote));
+        assert!(quoted.contains(&Appearance::Dark.theme().link_color()));
+        let light = scene_glyph_colors_with_appearance("> plain **bold**\n", Appearance::Light);
+        assert!(
+            light
+                .iter()
+                .all(|color| *color == Rgba8::new(119, 119, 119, 255))
+        );
+    }
+
     fn distinct(colors: &[Rgba8]) -> usize {
         colors
             .iter()
@@ -4612,10 +5203,32 @@ mod tests {
     }
 
     fn scene_glyph_colors(source: &str) -> Vec<Rgba8> {
+        scene_glyph_colors_with_appearance(source, Appearance::Light)
+    }
+
+    fn scene_glyph_colors_with_appearance(source: &str, appearance: Appearance) -> Vec<Rgba8> {
+        scene_glyph_colors_with_focus(source, appearance, false)
+    }
+
+    fn scene_glyph_colors_with_focus(
+        source: &str,
+        appearance: Appearance,
+        inactive: bool,
+    ) -> Vec<Rgba8> {
         let font_size = 14.0;
         let shaper = shaper(font_size);
         let viewport = ViewportSpan::new(0.0, 200.0);
         let mut document = EditorDocument::new(source);
+        if inactive {
+            let snapshot = document.snapshot();
+            let end = ByteOffset::new(source.len() as u64);
+            document
+                .set_selection(
+                    EditorSelection::range(&snapshot, end, end, CaretAffinity::Downstream)
+                        .expect("caret"),
+                )
+                .expect("selection");
+        }
         document
             .set_viewport_config(ViewportConfig::new(
                 LayoutConfig::new(400.0, 20.0),
@@ -4630,8 +5243,13 @@ mod tests {
                 viewport,
                 font_size,
                 Rect::new(0.0, 0.0, 400.0, 200.0).expect("scene viewport"),
-                Rgba8::black(),
-            ),
+                if inactive {
+                    theme_color(appearance.theme_id().spec().text)
+                } else {
+                    Rgba8::black()
+                },
+            )
+            .with_appearance(appearance),
             &shaper,
             &atlas,
             &mut RenderPlanBuilder::new(),
@@ -4696,7 +5314,7 @@ mod tests {
                 shadow,
             } => {
                 assert!(shadow.is_none(), "块背景不带阴影");
-                assert_eq!(*color, Rgba8::new(241, 244, 248, 255));
+                assert_eq!(*color, Rgba8::new(231, 234, 237, 255));
                 assert_eq!(bounds.x(), 0.0);
                 assert_eq!(bounds.y(), 0.0);
                 assert_eq!(bounds.width(), 240.0);
@@ -4712,6 +5330,24 @@ mod tests {
                 panic!("code block background must precede glyphs")
             }
         }
+        let Primitive::RoundedFillRect { bounds: outer, .. } = first else {
+            unreachable!()
+        };
+        let Some(Primitive::RoundedFillRect {
+            bounds: inner,
+            color,
+            radius,
+            ..
+        }) = rest.first()
+        else {
+            panic!("border must be followed by inset fill");
+        };
+        assert_eq!(*color, Rgba8::new(248, 248, 248, 255));
+        assert_eq!(inner.x() - outer.x(), 1.25);
+        assert_eq!(inner.y() - outer.y(), 1.25);
+        assert_eq!(outer.width() - inner.width(), 2.5);
+        assert!((outer.height() - inner.height() - 2.5).abs() < 0.001);
+        assert_eq!(*radius, 1.75);
         // 内容原点折进了字形位置：代码块第一行的基线比块顶低一个上内边距。
         let first_glyph = rest
             .iter()
@@ -4721,7 +5357,8 @@ mod tests {
             })
             .expect("code block scene carries glyphs");
         assert!(
-            first_glyph.origin().y() >= content_origin_y(BlockKind::IndentedCode),
+            first_glyph.origin().y()
+                >= content_origin_y(BlockKind::IndentedCode, document.viewport_config().layout()),
             "代码块字形必须下移内容原点，实际 y = {}",
             first_glyph.origin().y()
         );
@@ -4738,9 +5375,163 @@ mod tests {
         );
     }
 
-    /// 行内代码 chip：连续 `Code` 簇垫一块圆角矩形（外扩 3pt 垂直 / 7pt 水平、
-    /// radius 5、Theme 的 chip 色），衬在字形底下；两块不相邻的行内代码是两块
-    /// chip；代码块里**不**画 chip。
+    #[test]
+    fn cell_selection_paints_complete_empty_cells_without_insertion_carets() {
+        let source = "| A | B |\n| --- | --- |\n|  | 🪶 |\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .execute(EditorCommand::SelectTableCells {
+                anchor: ByteOffset::new(2),
+                focus: ByteOffset::new(source.find('🪶').expect("cell") as u64),
+            })
+            .expect("select cells");
+        let font_size = 16.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 500.0);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(400.0, font_size),
+                20.0,
+                0.0,
+            ))
+            .expect("config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let config = ViewportRenderConfig::new(
+            viewport,
+            font_size,
+            Rect::new(0.0, 0.0, 400.0, 500.0).expect("viewport"),
+            Rgba8::black(),
+        )
+        .with_editor_decorations(EditorDecorationStyle::new(
+            Rgba8::new(0, 122, 255, 97),
+            Rgba8::black(),
+            Rgba8::new(0, 122, 255, 255),
+            1.0,
+        ));
+        let mut plans = RenderPlanBuilder::new();
+        let rendered =
+            assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
+                .expect("frame");
+        let frame = rendered.scene();
+        let selected: Vec<_> = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|p| match p {
+                Primitive::EditorDecoration(d)
+                    if d.role() == EditorDecorationPrimitiveRole::Selection =>
+                {
+                    Some(*d)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selected.len(), 4);
+        let primitives = frame.scene().primitives();
+        let last_selection = primitives.iter().rposition(|p| matches!(p, Primitive::EditorDecoration(d) if d.role() == EditorDecorationPrimitiveRole::Selection)).expect("selection");
+        let first_glyph = primitives
+            .iter()
+            .position(|p| matches!(p, Primitive::Glyph(_)))
+            .expect("glyphs");
+        assert!(
+            last_selection < first_glyph,
+            "cell selection must not tint glyph foregrounds"
+        );
+        assert!(
+            primitives
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| match p {
+                    Primitive::Ornament(o) if o.role() == OrnamentRole::Border => Some(i),
+                    _ => None,
+                })
+                .all(|i| i > last_selection),
+            "grid borders must remain above the highlight"
+        );
+        assert_eq!(selected.iter().filter(|d| d.source().is_empty()).count(), 1);
+        assert!(
+            selected
+                .iter()
+                .all(|d| d.bounds().width() > 100.0 && d.bounds().height() > font_size)
+        );
+        assert!(frame.scene().primitives().iter().all(|p| !matches!(p, Primitive::EditorDecoration(d) if d.role() == EditorDecorationPrimitiveRole::Caret)));
+        assert!((selected[0].bounds().y() - frame.tables()[0].bounds().y()).abs() < 0.001);
+    }
+
+    #[test]
+    fn table_backgrounds_never_cover_inline_code_chips() {
+        let font_size = 16.0;
+        let shaper = shaper(font_size);
+        let viewport = ViewportSpan::new(0.0, 500.0);
+        let mut document = EditorDocument::new(
+            "| `head` | B |\n| --- | --- |\n| `first` | one |\n| `striped` | two |\n",
+        );
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(400.0, font_size),
+                20.0,
+                0.0,
+            ))
+            .expect("config");
+        let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+        let frame = assemble_viewport_scene(
+            &mut document,
+            viewport,
+            &shaper,
+            font_size,
+            Rect::new(0.0, 0.0, 400.0, 500.0).expect("viewport"),
+            &atlas,
+            Rgba8::black(),
+        )
+        .expect("frame");
+        assert!(
+            (frame.tables()[0].bounds().y() - yu_core::ThemeSpec::TABLE_MARGIN_EM * font_size)
+                .abs()
+                < 0.001
+        );
+        let primitives = frame.scene().primitives();
+        let backgrounds = primitives
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| match p {
+                Primitive::Ornament(o) if o.role() == OrnamentRole::Background => {
+                    Some((i, o.bounds()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backgrounds.len(), 4, "two header and two striped cells");
+        let chips = primitives
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| match p {
+                Primitive::RoundedFillRect { bounds, color, .. }
+                    if *color == Theme::light().inline_code_background() =>
+                {
+                    Some((i, *bounds))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chips.len(), 3);
+        for (chip_index, chip) in chips {
+            for (background_index, background) in &backgrounds {
+                if chip.x() < background.x() + background.width()
+                    && background.x() < chip.x() + chip.width()
+                    && chip.y() < background.y() + background.height()
+                    && background.y() < chip.y() + chip.height()
+                {
+                    assert!(
+                        *background_index < chip_index,
+                        "cell background paints over inline code"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 行内代码背景消费排版片段及主题边框，不重新扩张字形几何。
+    /// 独立代码片段各自绘制，代码块不产生行内背景。
     #[test]
     fn inline_code_spans_become_rounded_chips_under_glyphs() {
         let font_size = 14.0;
@@ -4783,11 +5574,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(chips.len(), 2, "两段行内代码 = 两块 chip：{chips:?}");
         for (bounds, radius) in chips {
-            assert_eq!(radius, theme.inline_chip_corner_radius());
-            // mock shaper 每个 grapheme 7pt 宽：3 字 + 2×7pt 水平外扩 = 35。
-            assert_eq!(bounds.width(), 3.0 * 7.0 + 2.0 * INLINE_CODE_CHIP_PADDING_X);
-            // 行盒 32pt（20 × 1.6）+ 2×3pt 垂直外扩。
-            assert_eq!(bounds.height(), 32.0 + 2.0 * INLINE_CODE_CHIP_PADDING_Y);
+            assert_eq!(radius, 2.5);
+            // 三个代码字形加上按缩放后的主题内边距，边框单独绘制。
+            assert!((bounds.width() - (3.0 * 7.0 * 0.9 + 2.0 * 2.0 * (20.0 / 16.0))).abs() < 0.001);
+            // 背景使用文字高度，不占满段落行盒。
+            assert!(bounds.height() >= font_size * 0.9 && bounds.height() < 32.0);
         }
         // chip 衬在字形底下：第一个 chip 的位置在第一个 glyph 之前。
         let first_chip = frame
@@ -4830,14 +5621,26 @@ mod tests {
             Rgba8::black(),
         )
         .expect("code frame");
-        assert!(
-            frame.scene().primitives().iter().all(|primitive| !matches!(
-                primitive,
-                Primitive::RoundedFillRect { color, .. }
-                    if *color == theme.inline_code_background()
-            )),
-            "代码块里不该有行内代码 chip"
+        let fills = frame
+            .scene()
+            .primitives()
+            .iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::RoundedFillRect { bounds, .. } => Some(bounds),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fills.len(),
+            2,
+            "code border and inset background, no inline chips"
         );
+        assert_eq!(fills[0].width(), 240.0);
+        assert_eq!(fills[1].width(), 237.5);
+        assert!(!frame.scene().primitives().iter().any(|primitive| matches!(
+            primitive, Primitive::RoundedFillRect { color, .. }
+                if *color == Theme::light().inline_code_background()
+        )));
     }
 
     /// 链接文字：`TextRole::Link` 着 Theme 的链接色，run 下方压一条 1pt、
@@ -4921,6 +5724,81 @@ mod tests {
             })
             .expect("link glyph");
         assert!(underline_index < first_link_glyph);
+    }
+
+    #[test]
+    fn table_link_underlines_follow_each_cell_text_baseline() {
+        for width in [160.0, 320.0] {
+            let font_size = 14.0;
+            let shaper = shaper(font_size);
+            let viewport = ViewportSpan::new(0.0, 1000.0);
+            let source = "> | [Header](url) | B |\n> | --- | --- |\n> | [long linked text wraps across several lines](url) | [first](url)<br>[second](url) |\n";
+            let mut document = EditorDocument::new(source);
+            document
+                .set_viewport_config(ViewportConfig::new(
+                    LayoutConfig::new(width, 20.0),
+                    20.0,
+                    0.0,
+                ))
+                .expect("config");
+            let atlas = atlas_for_document(&mut document, viewport, &shaper, font_size);
+            let frame = assemble_viewport_scene(
+                &mut document,
+                viewport,
+                &shaper,
+                font_size,
+                Rect::new(0.0, 0.0, width, 1000.0).expect("viewport"),
+                &atlas,
+                Rgba8::black(),
+            )
+            .expect("frame");
+            let link = Theme::light().link_color();
+            let lines: Vec<_> = frame
+                .scene()
+                .primitives()
+                .iter()
+                .filter_map(|p| match p {
+                    Primitive::FillRect { bounds, color }
+                        if *color == link_underline_color(link) =>
+                    {
+                        Some(*bounds)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let glyphs: Vec<_> = frame
+                .scene()
+                .primitives()
+                .iter()
+                .filter_map(|p| match p {
+                    Primitive::Glyph(g) if g.color() == link => Some(*g),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                lines.len() >= 4,
+                "wrapped cells require separate underlines: {lines:?}"
+            );
+            assert!(!glyphs.is_empty());
+            for glyph in &glyphs {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| (line.y() - glyph.origin().y() - 1.0).abs() < 0.01
+                            && glyph.origin().x() >= line.x() - 0.01
+                            && glyph.origin().x() <= line.x() + line.width() + 0.01),
+                    "link glyph missing baseline underline: {glyph:?}, {lines:?}"
+                );
+            }
+            for line in &lines {
+                assert!(
+                    glyphs
+                        .iter()
+                        .any(|g| (line.y() - g.origin().y() - 1.0).abs() < 0.01),
+                    "underline has no matching text baseline"
+                );
+            }
+        }
     }
 
     /// 引用块背景：列宽圆角矩形，**高就是内容高**——折进块高贡献的段间距不属于
@@ -5046,7 +5924,7 @@ mod tests {
         // 块 y（0）+ 内容原点（5）+ 行内偏移（0）。
         assert_eq!(
             caret.bounds().y(),
-            content_origin_y(BlockKind::IndentedCode)
+            content_origin_y(BlockKind::IndentedCode, document.viewport_config().layout())
         );
     }
 
@@ -5218,14 +6096,14 @@ mod tests {
                 primitive,
                 Primitive::Ornament(table)
                     if table.role() == OrnamentRole::Border
-                        && (table.bounds().x() - expected_divider).abs() < 0.001
+                        && (table.bounds().x() + table.bounds().width() * 0.5 - expected_divider).abs() < 0.001
             )
         }));
         assert!(frame.plan().commands().iter().any(|command| {
             matches!(
                 command,
                 yu_render::RenderCommand::FillRect { bounds, .. }
-                    if (bounds.x() - expected_divider).abs() < 0.001
+                    if (bounds.x() + bounds.width() * 0.5 - expected_divider).abs() < 0.001
             )
         }));
         assert_eq!(document.snapshot().as_str(), source);
@@ -5963,12 +6841,9 @@ mod tests {
         let frame =
             assemble_viewport_render_frame(&mut document, config, &shaper, &atlas, &mut plans)
                 .expect("frame");
+        let layout_config = document.viewport_config().layout();
         let heading_line_height = document
-            .block_layout_for_visual_state_with_shaper(
-                0,
-                document.viewport_config().layout(),
-                &shaper,
-            )
+            .block_layout_for_visual_state_with_shaper(0, layout_config, &shaper)
             .expect("heading layout")
             .lines()
             .first()

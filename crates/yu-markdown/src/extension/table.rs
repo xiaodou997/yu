@@ -18,11 +18,11 @@
 //! 要尺寸（§5.3），而 `BlockLayout` 现在拿的是 `NoWidgets`。在那之前，
 //! 表格的几何仍然由 `yu-editor::TableLayout` 按这里给出的网格算。
 
-use yu_core::{ByteOffset, TextRange};
+use yu_core::{ByteOffset, TextAttrs, TextRange, TextStyle};
 
 use super::{BlockContext, BlockOrnament, Extension, ExtensionOutput};
 use crate::block_sequence::BlockKind;
-use crate::table::{TableBlock, TableCellRange, parse_table_in_snapshot};
+use crate::table::{TableBlock, TableCellRange, parse_table, parse_table_in_snapshot};
 
 pub struct Table;
 
@@ -35,18 +35,80 @@ impl Extension for Table {
         // 表格在块序列里就是一个段落——`BlockKind` 没有 `Table`。语法树也
         // 认不出来（`yu-syntax` 没有 GFM 的表格 extension），所以这一种语法
         // 的结构只能来自 `parse_table_in_snapshot`。
-        if cx.block().kind() != BlockKind::Paragraph {
+        if !matches!(
+            cx.block().kind(),
+            BlockKind::Paragraph | BlockKind::BlockQuote { .. } | BlockKind::ListItem { .. }
+        ) {
             return;
         }
-        let Some(table) = parse_table_in_snapshot(cx.source(), cx.range()) else {
+        let Some(table) = container_table(cx) else {
             return;
         };
         for range in hidden_ranges(&table) {
             out.replace(range);
         }
+        // Typora 1.10.8 preserves code-span backslashes, unlike the GFM table
+        // escape example. Match the fixed reference; ordinary escapes hide
+        // only their quoting backslash and keep the original source bytes.
+        for escaped in escape_ranges(cx, &table) {
+            if let Some(range) =
+                TextRange::new(escaped.start(), ByteOffset::new(escaped.start().get() + 1))
+            {
+                out.replace(range);
+            }
+        }
+        let header_style = out.style(TextAttrs::new(TextStyle::Strong));
+        for cell in table.header() {
+            if let Some(range) = text_range(*cell) {
+                out.mark(range, header_style);
+            }
+        }
         let style = out.line_style(BlockOrnament::Table(table));
         out.line(cx.range(), style);
     }
+}
+
+/// Source atoms represented by a single visible escaped character in a cell.
+/// Inline code has no Escape nodes, so its backslashes remain ordinary text.
+pub(crate) fn escape_ranges(cx: &BlockContext<'_>, table: &TableBlock) -> Vec<TextRange> {
+    cx.nodes()
+        .filter(|node| node.kind() == yu_syntax::NodeKind::Escape)
+        .map(|node| node.range())
+        .filter(|escaped| {
+            table
+                .header()
+                .iter()
+                .chain(table.rows().iter().flatten())
+                .any(|cell| {
+                    cell.start() as u64 <= escaped.start().get()
+                        && escaped.end().get() <= cell.end() as u64
+                })
+        })
+        .collect()
+}
+
+/// Mask only parser-identified container markers with equal-length spaces.
+/// Cell ranges remain offsets into the original source; no saved text changes.
+pub(crate) fn container_table(cx: &BlockContext<'_>) -> Option<TableBlock> {
+    if cx.quote_depth() == 0 && cx.list_depth() == 0 {
+        return parse_table_in_snapshot(cx.source(), cx.range());
+    }
+    let start = cx.range().start().get() as usize;
+    let end = cx.range().end().get() as usize;
+    let mut candidate = cx.source().as_str().get(start..end)?.as_bytes().to_vec();
+    for node in cx.nodes().filter(|node| {
+        matches!(
+            node.kind(),
+            yu_syntax::NodeKind::QuoteMark | yu_syntax::NodeKind::ListMark
+        )
+    }) {
+        let from = (node.range().start().get() as usize).max(start);
+        let to = (node.range().end().get() as usize).min(end);
+        if from < to {
+            candidate.get_mut(from - start..to - start)?.fill(b' ');
+        }
+    }
+    parse_table(std::str::from_utf8(&candidate).ok()?).map(|table| table.translated(start))
 }
 
 /// 单元格内容之外的一切：竖线、单元格周围的空白、行尾的换行符，以及整行

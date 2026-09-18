@@ -11,7 +11,7 @@
 use yu_core::TextRange;
 use yu_syntax::NodeKind;
 
-use super::{BlockContext, BlockOrnament, Extension, ExtensionOutput, SyntaxNode};
+use super::{BlockContext, BlockOrnament, Extension, ExtensionOutput};
 
 pub struct Quote;
 
@@ -21,41 +21,48 @@ impl Extension for Quote {
     }
 
     fn decorate(&self, cx: &BlockContext<'_>, out: &mut ExtensionOutput) {
-        let Some(node) = cx.block_node(|kind| kind == NodeKind::Blockquote) else {
-            return;
-        };
-        let depth = nesting_depth(node);
+        let depth = cx.quote_depth();
         if depth == 0 {
             return;
         }
 
         if !cx.is_focus() {
+            let mut cursor = cx.range().start();
             for mark in cx.nodes().filter(|node| node.kind() == NodeKind::QuoteMark) {
+                // Whitespace before an explicit quote marker belongs to the
+                // enclosing container, including continuation lines. Inspect
+                // each source slice once; never scan the whole prefix per line.
+                if let Some(prefix) = cx
+                    .source()
+                    .as_str()
+                    .get(cursor.get() as usize..mark.range().start().get() as usize)
+                {
+                    let start = prefix.rfind('\n').map_or(0, |index| index + 1);
+                    if prefix[start..]
+                        .bytes()
+                        .all(|byte| matches!(byte, b' ' | b'\t'))
+                    {
+                        let start = yu_core::ByteOffset::new(cursor.get() + start as u64);
+                        if start < mark.range().start() {
+                            out.replace(
+                                TextRange::new(start, mark.range().start())
+                                    .expect("ordered prefix"),
+                            );
+                        }
+                    }
+                }
                 let content_start = cx.skip_spaces(mark.range().end());
+                cursor = content_start;
                 if let Some(prefix) = TextRange::new(mark.range().start(), content_start) {
                     out.replace(prefix);
                 }
             }
         }
 
-        let style = out.line_style(BlockOrnament::QuoteBar { depth });
+        let style = out.line_style(BlockOrnament::QuoteBar {
+            depth,
+            outside_list: cx.quote_depth_outside_lists(),
+        });
         out.line(cx.range(), style);
     }
-}
-
-/// 一路往里数连续嵌套的 `Blockquote`。
-fn nesting_depth(node: SyntaxNode<'_>) -> u8 {
-    let mut depth = 0_u8;
-    let mut current = node;
-    while current.kind() == NodeKind::Blockquote {
-        depth = depth.saturating_add(1);
-        let Some(inner) = current
-            .children()
-            .find(|child| child.kind() == NodeKind::Blockquote)
-        else {
-            break;
-        };
-        current = inner;
-    }
-    depth
 }

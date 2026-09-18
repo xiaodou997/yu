@@ -350,6 +350,22 @@ impl VisualText {
         Ok(self.canonical_visual_to_source(canonical, bias))
     }
 
+    /// Source coverage of a visual cluster: exclude adjacent hidden syntax,
+    /// but include the whole replacement atom when a boundary is inside it.
+    pub(crate) fn source_coverage(&self, range: VisualRange) -> Result<TextRange, VisualTextError> {
+        let mut start = self.visual_to_source(range.start(), Bias::After)?;
+        let mut end = self.visual_to_source(range.end(), Bias::Before)?;
+        if !range.is_empty() && self.composition.is_none() {
+            if self.source_to_visual(start, Bias::After)? > range.start() {
+                start = self.visual_to_source(range.start(), Bias::Before)?;
+            }
+            if self.source_to_visual(end, Bias::Before)? < range.end() {
+                end = self.visual_to_source(range.end(), Bias::After)?;
+            }
+        }
+        Ok(TextRange::new(start, end.max(start)).expect("ordered cluster coverage"))
+    }
+
     /// 不含 preedit 的那一份 source → visual 映射。
     ///
     /// 装配样式段要用它：段落是 canonical 源码上的区间，得先在 canonical
@@ -553,8 +569,8 @@ fn validate_selection(text: &str, selection: TextRange) -> Result<(), VisualText
 
 /// `range` 里没被隐藏的那些字节，按源码顺序拼起来。
 ///
-/// 隐藏区间**从装饰集合要**（[`DecorationSet::hidden_spans`]），不自己遍历
-/// 一遍装饰去数。那份数据正是 `source_to_visual` 那棵树的原料，所以「哪些
+/// 投影原子**从装饰集合要**（[`DecorationSet::projection_spans`]），不自己遍历
+/// 一遍装饰去数。那份数据正是 `source_to_visual` 索引的原料，所以「哪些
 /// 字节被藏了」在这条路上仍然只有一个答案（不变量 D4）。自己再数一遍会得到
 /// 第二个实现——哪怕今天结果一样，它会在下一次改动时分叉，而分叉的表现是
 /// 画面比光标少几个字。
@@ -565,7 +581,8 @@ pub(crate) fn read_visible(
 ) -> Result<String, VisualTextError> {
     let mut text = String::new();
     let mut cursor = range.start();
-    for &(from, to) in set.hidden_spans() {
+    for span in set.projection_spans() {
+        let (from, to) = (span.range.start(), span.range.end());
         if to <= cursor {
             continue;
         }
@@ -576,6 +593,11 @@ pub(crate) fn read_visible(
             && let Some(visible) = TextRange::new(cursor, from.min(range.end()))
         {
             push_source(source, visible, &mut text)?;
+        }
+        if to <= range.end()
+            && let Some(character) = span.replacement
+        {
+            character.append_to(&mut text);
         }
         cursor = cursor.max(to);
         if cursor >= range.end() {

@@ -302,3 +302,50 @@ fn no_query_and_no_hit_both_mean_no_rows() {
     let (_, missed) = results(SEARCH_SOURCE, "这四个字一定不在里面");
     assert!(missed.rows().is_empty());
 }
+
+#[test]
+fn outline_label_runs_preserve_composed_styles_and_unicode_offsets() {
+    use yu_core::TextStyle::{Code, Emphasis, Plain, Strong, StrongEmphasis};
+    for (source, expected) in [
+        (
+            "# *甲😀* and **乙**",
+            vec![("甲😀", Emphasis), (" and ", Plain), ("乙", Strong)],
+        ),
+        (
+            "# ***both*** [**link**](target) `code`",
+            vec![
+                ("both", StrongEmphasis),
+                (" ", Plain),
+                ("link", Strong),
+                (" ", Plain),
+                ("code", Code),
+            ],
+        ),
+        (
+            "**甲**\n*😀乙*\n===\n",
+            vec![("甲", Strong), (" ", Plain), ("😀乙", Emphasis)],
+        ),
+        ("# **A &amp; B**", vec![("A & B", Strong)]),
+        (
+            "# *&NotEqualTilde;* &#x1f600;",
+            vec![("≂\u{338}", Emphasis), (" 😀", Plain)],
+        ),
+    ] {
+        let (document, tree) = outline_of(source);
+        let row = &tree.rows()[0];
+        let actual: Vec<_> = row
+            .label_runs()
+            .iter()
+            .map(|run| (&row.label()[run.range.clone()], run.style))
+            .collect();
+        assert_eq!(actual, expected, "{source}");
+        let mut cursor = 0;
+        for run in row.label_runs() {
+            assert_eq!(run.range.start, cursor);
+            assert!(run.range.end > run.range.start);
+            cursor = run.range.end;
+        }
+        assert_eq!(cursor, row.label().len());
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+}

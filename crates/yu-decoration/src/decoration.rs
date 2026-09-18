@@ -15,6 +15,37 @@
 use yu_core::TextRange;
 pub use yu_core::{LineStyleId, StyleId, WidgetId, WidgetSide};
 
+/// Immutable replacement atom. Static text supports multi-scalar literals while
+/// scalar replacements avoid allocating dynamic numeric references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReplacementText {
+    Scalar(char),
+    Literal(&'static str),
+}
+
+impl ReplacementText {
+    #[must_use]
+    pub fn len_utf8(self) -> usize {
+        match self {
+            Self::Scalar(character) => character.len_utf8(),
+            Self::Literal(text) => text.len(),
+        }
+    }
+
+    pub fn append_to(self, output: &mut String) {
+        match self {
+            Self::Scalar(character) => output.push(character),
+            Self::Literal(text) => output.push_str(text),
+        }
+    }
+}
+
+impl From<char> for ReplacementText {
+    fn from(character: char) -> Self {
+        Self::Scalar(character)
+    }
+}
+
 /// 一条装饰。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Decoration {
@@ -23,6 +54,8 @@ pub enum Decoration {
     /// 从视觉上移除这段 source 字符。source 不变、长度不变、可被光标穿越
     /// 与选中（不变量 D5）。这是「隐藏未聚焦的 Markdown 语法」的唯一机制。
     Replace,
+    /// Replace a nonempty source atom with literal text in the visual stream.
+    Substitute { text: ReplacementText },
     /// 在该 range 位置放置一个视觉物件。range 为空则是插入，
     /// 非空则同时隐藏被覆盖的 source。
     Widget { widget: WidgetId, side: WidgetSide },
@@ -38,7 +71,10 @@ impl Decoration {
     /// 在字节流里就是不占位。宽度是 layout 的事。
     #[must_use]
     pub const fn hides_source(self) -> bool {
-        matches!(self, Self::Replace | Self::Widget { .. })
+        matches!(
+            self,
+            Self::Replace | Self::Substitute { .. } | Self::Widget { .. }
+        )
     }
 }
 

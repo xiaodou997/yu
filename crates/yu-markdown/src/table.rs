@@ -366,7 +366,7 @@ pub fn parse_table(source: &str) -> Option<TableBlock> {
 
     let header = parse_row(lines[0].0, lines[0].1)?;
     let delimiter = parse_row(lines[1].0, lines[1].1)?;
-    if header.len() < 2 || delimiter.len() != header.len() {
+    if header.is_empty() || delimiter.len() != header.len() {
         return None;
     }
 
@@ -483,6 +483,72 @@ fn source_lines(source: &str) -> Vec<(usize, &str)> {
     lines
 }
 
+/// Exact inline code ranges shared by table splitting and contextual input.
+/// A plain prefix keeps cell text in paragraph context during syntax parsing.
+fn inline_code_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    if !text.contains('`') {
+        return Vec::new();
+    }
+    let candidate = format!("x {text}");
+    let Ok(parsed) = yu_syntax::parse(candidate.as_str()) else {
+        return Vec::new();
+    };
+    crate::extension::SyntaxNode::new(parsed.tree(), 0)
+        .descendants()
+        .filter(|node| node.kind() == yu_syntax::NodeKind::InlineCode)
+        .map(|node| {
+            (node.start() as usize).saturating_sub(2)..(node.end() as usize).saturating_sub(2)
+        })
+        .collect()
+}
+
+fn in_code(ranges: &[std::ops::Range<usize>], offset: usize) -> bool {
+    let index = ranges.partition_point(|range| range.end <= offset);
+    ranges
+        .get(index)
+        .is_some_and(|range| range.contains(&offset))
+}
+
+/// Protect new cell pipes while retaining already escaped source and native
+/// reference code-span behavior. Only the inserted text is returned/changed.
+#[must_use]
+pub fn quote_table_cell_input(
+    cell: &str,
+    replaced: std::ops::Range<usize>,
+    input: &str,
+    separator_follows: bool,
+) -> Option<String> {
+    let before = cell.get(..replaced.start)?;
+    let after = cell.get(replaced.end..)?;
+    if replaced.start > replaced.end {
+        return None;
+    }
+    let candidate = format!("{before}{input}{after}");
+    let codes = inline_code_ranges(&candidate);
+    let mut escaped = before
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        != 0;
+    let mut result = String::with_capacity(input.len());
+    for (offset, ch) in input.char_indices() {
+        if ch == '|' && !escaped && !in_code(&codes, before.len() + offset) {
+            result.push('\\');
+        }
+        result.push(ch);
+        escaped = ch == '\\' && !escaped;
+    }
+    // Do not let a final odd backslash consume the structural delimiter of
+    // a compact row such as |x|y|. The extra source slash represents the same
+    // single visible character; existing row bytes remain untouched.
+    if separator_follows && after.is_empty() && escaped {
+        result.push('\\');
+    }
+    Some(result)
+}
+
 fn parse_row(line_start: usize, line: &str) -> Option<Vec<TableCellRange>> {
     if !line.contains('|') {
         return None;
@@ -505,7 +571,7 @@ fn parse_row(line_start: usize, line: &str) -> Option<Vec<TableCellRange>> {
     let mut cells = Vec::new();
     let mut cell_start = start;
     let mut escaped = false;
-    let mut in_code = false;
+    let codes = inline_code_ranges(line);
     for (offset, character) in line[start..end].char_indices() {
         let absolute = start + offset;
         if escaped {
@@ -516,11 +582,7 @@ fn parse_row(line_start: usize, line: &str) -> Option<Vec<TableCellRange>> {
             escaped = true;
             continue;
         }
-        if character == '`' {
-            in_code = !in_code;
-            continue;
-        }
-        if character == '|' && !in_code {
+        if character == '|' && !in_code(&codes, absolute) {
             cells.push(trimmed_cell(line_start, line, cell_start, absolute));
             cell_start = absolute + character.len_utf8();
         }

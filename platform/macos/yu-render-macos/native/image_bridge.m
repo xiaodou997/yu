@@ -14,13 +14,17 @@
 int yu_macos_image_decode_file(
     const uint8_t *path_bytes,
     size_t path_length,
+    uint32_t max_pixel_dimension,
+    uint32_t *out_intrinsic_width,
+    uint32_t *out_intrinsic_height,
     uint32_t *out_width,
     uint32_t *out_height,
     void **out_pixels,
     size_t *out_pixel_length
 ) {
     if (path_bytes == NULL || path_length == 0 || out_width == NULL || out_height == NULL
-        || out_pixels == NULL || out_pixel_length == NULL) {
+        || out_pixels == NULL || out_pixel_length == NULL
+        || out_intrinsic_width == NULL || out_intrinsic_height == NULL) {
         return 0;
     }
 
@@ -41,7 +45,20 @@ int yu_macos_image_decode_file(
     if (source == NULL) {
         return 0;
     }
-    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    NSDictionary *properties = [(NSDictionary *)CGImageSourceCopyPropertiesAtIndex(source, 0, NULL) autorelease];
+    uint32_t intrinsic_width = [properties[(id)kCGImagePropertyPixelWidth] unsignedIntValue];
+    uint32_t intrinsic_height = [properties[(id)kCGImagePropertyPixelHeight] unsignedIntValue];
+    NSInteger orientation = [properties[(id)kCGImagePropertyOrientation] integerValue];
+    if (orientation >= 5 && orientation <= 8) {
+        uint32_t swap = intrinsic_width; intrinsic_width = intrinsic_height; intrinsic_height = swap;
+    }
+    NSDictionary *options = @{
+        (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+        (id)kCGImageSourceCreateThumbnailWithTransform: @YES,
+        (id)kCGImageSourceThumbnailMaxPixelSize: @(MAX(1, MIN(4096, max_pixel_dimension))),
+        (id)kCGImageSourceShouldCacheImmediately: @YES
+    };
+    CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, (CFDictionaryRef)options);
     CFRelease(source);
     if (image == NULL) {
         return 0;
@@ -84,6 +101,8 @@ int yu_macos_image_decode_file(
     CGContextRelease(context);
     CGImageRelease(image);
 
+    *out_intrinsic_width = intrinsic_width ?: (uint32_t)width;
+    *out_intrinsic_height = intrinsic_height ?: (uint32_t)height;
     *out_width = (uint32_t)width;
     *out_height = (uint32_t)height;
     *out_pixels = pixels;

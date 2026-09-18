@@ -26,8 +26,8 @@ use yu_scene::{Point, Primitive, Rect, Rgba8, Scene};
 pub use backend::{
     BackendError, DRAW_FILL_RECT, DRAW_GLYPH, DRAW_IMAGE, DRAW_ROUNDED_FILL_RECT, DamageRect,
     DrawCommand, FrameConsumer, IMAGE_KIND_REGULAR, SurfaceConfig, build_damage_rects,
-    build_draw_commands, build_draw_commands_at_viewport, cull_draw_commands, embedded_image_kind,
-    requires_full_clear, scroll_exposed_damage,
+    build_damage_rects_at_viewport, build_draw_commands, build_draw_commands_at_viewport,
+    cull_draw_commands, embedded_image_kind, requires_full_clear, scroll_exposed_damage,
 };
 
 /// A page upload containing owned alpha pixels ready for a backend texture.
@@ -121,6 +121,12 @@ impl AtlasPageUpload {
 /// Backend-independent draw commands in painter order.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RenderCommand {
+    StrokePolyline {
+        bounds: Rect,
+        points: [Point; 3],
+        width: f32,
+        color: Rgba8,
+    },
     FillRect {
         bounds: Rect,
         color: Rgba8,
@@ -309,7 +315,7 @@ struct PageFingerprint {
 #[derive(Clone, Debug, Default)]
 pub struct RenderPlanBuilder {
     #[cfg(test)]
-    last_hashed_pages: usize,
+    last_checked_pages: usize,
     uploaded_pages: HashMap<u32, PageFingerprint>,
     uploaded_embedded: HashMap<(u64, u64), u64>,
     raster_scale: Option<f32>,
@@ -358,7 +364,7 @@ impl RenderPlanBuilder {
         let mut checked_pages = HashSet::new();
         #[cfg(test)]
         {
-            self.last_hashed_pages = 0;
+            self.last_checked_pages = 0;
         }
 
         for primitive in scene.primitives().iter().copied() {
@@ -396,12 +402,12 @@ impl RenderPlanBuilder {
                         let pixels = atlas.page_pixels(page).map_err(RenderError::Atlas)?;
                         #[cfg(test)]
                         {
-                            self.last_hashed_pages += 1;
+                            self.last_checked_pages += 1;
                         }
                         let fingerprint = PageFingerprint {
                             width,
                             height,
-                            hash: hash_page(page, width, height, pixels),
+                            hash: atlas.page_fingerprint(page).map_err(RenderError::Atlas)?,
                         };
                         if next_pages.get(&page).copied() != Some(fingerprint) {
                             uploads.push(AtlasPageUpload {
@@ -419,7 +425,11 @@ impl RenderPlanBuilder {
                         rect: entry.rect(),
                         origin: glyph.origin(),
                         metrics: entry.metrics(),
-                        color: glyph.color(),
+                        color: if entry.is_color() {
+                            Rgba8::new(255, 255, 255, glyph.color().alpha())
+                        } else {
+                            glyph.color()
+                        },
                     });
                 }
                 Primitive::Image(image) => {
@@ -484,12 +494,28 @@ impl RenderPlanBuilder {
                     });
                 }
                 Primitive::Ornament(ornament) => {
-                    // 装饰的角色留在 retained scene 里给原生的选中与
-                    // Accessibility 用。后端中立的这一层把每一层都落成一个
-                    // 实心矩形——不变量 E3 冻结了指令集，新语法不新增指令。
-                    commands.push(RenderCommand::FillRect {
-                        bounds: ornament.bounds(),
-                        color: ornament.color(),
+                    let bounds = ornament.bounds();
+                    let color = ornament.color();
+                    commands.push(match ornament.shape() {
+                        yu_scene::OrnamentShape::Rectangle => {
+                            RenderCommand::FillRect { bounds, color }
+                        }
+                        yu_scene::OrnamentShape::Rounded { radius } => {
+                            RenderCommand::RoundedFillRect {
+                                bounds,
+                                radius,
+                                color,
+                                shadow: None,
+                            }
+                        }
+                        yu_scene::OrnamentShape::Polyline { points, width } => {
+                            RenderCommand::StrokePolyline {
+                                bounds,
+                                points,
+                                width,
+                                color,
+                            }
+                        }
                     });
                 }
                 Primitive::EditorDecoration(decoration) => {
@@ -544,23 +570,7 @@ pub trait RenderUploader {
     type Texture;
     type Error: fmt::Display;
 
-    fn upload_alpha_page(&mut self, page: &AtlasPageUpload) -> Result<Self::Texture, Self::Error>;
-}
-
-fn hash_page(page: u32, width: u32, height: u32, pixels: &[u8]) -> u64 {
-    let mut hash = 1_469_598_103_934_665_603_u64;
-    hash = hash.wrapping_mul(1_099_511_628_211_u64) ^ u64::from(page);
-    hash = hash
-        .wrapping_mul(1_099_511_628_211_u64)
-        .wrapping_add(u64::from(width));
-    hash = hash
-        .wrapping_mul(1_099_511_628_211_u64)
-        .wrapping_add(u64::from(height));
-    for byte in pixels {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(1_099_511_628_211_u64);
-    }
-    hash
+    fn upload_glyph_page(&mut self, page: &AtlasPageUpload) -> Result<Self::Texture, Self::Error>;
 }
 
 #[cfg(test)]
@@ -613,7 +623,7 @@ mod tests {
         type Texture = u32;
         type Error = FakeUploadError;
 
-        fn upload_alpha_page(
+        fn upload_glyph_page(
             &mut self,
             page: &AtlasPageUpload,
         ) -> Result<Self::Texture, Self::Error> {
@@ -775,7 +785,7 @@ mod tests {
         let mut plans = RenderPlanBuilder::new();
         let first_plan = plans.build(&scene, &atlas).expect("first plan");
         assert_eq!(
-            plans.last_hashed_pages, 1,
+            plans.last_checked_pages, 1,
             "shared page must be hashed only once"
         );
         assert_eq!(first_plan.revision(), Revision::new(4));
@@ -785,7 +795,7 @@ mod tests {
         assert_eq!(plans.uploaded_page_count(), 1);
         let second_plan = plans.build(&scene, &atlas).expect("second plan");
         assert_eq!(
-            plans.last_hashed_pages, 1,
+            plans.last_checked_pages, 1,
             "warm builds still validate page mutations once"
         );
         assert!(second_plan.uploads().is_empty());
@@ -861,7 +871,7 @@ mod tests {
             let plan = plans.build(&scene, &atlas).expect("build render plan");
             assert_eq!(plan.commands().len(), 256);
             assert_eq!(plan.uploads().len(), expected_uploads);
-            assert_eq!(plans.last_hashed_pages, 1);
+            assert_eq!(plans.last_checked_pages, 1);
         }
     }
 
@@ -922,7 +932,7 @@ mod tests {
         let mut uploader = FakeUploader::default();
         for upload in first.uploads() {
             uploader
-                .upload_alpha_page(upload)
+                .upload_glyph_page(upload)
                 .expect("fake page upload");
         }
         assert_eq!(uploader.pages.len(), 1);
@@ -938,6 +948,7 @@ mod tests {
             }
             RenderCommand::FillRect { .. }
             | RenderCommand::RoundedFillRect { .. }
+            | RenderCommand::StrokePolyline { .. }
             | RenderCommand::Image { .. }
             | RenderCommand::EmbeddedSvg { .. } => {
                 panic!("expected glyph command")

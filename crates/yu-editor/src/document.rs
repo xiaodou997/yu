@@ -7,10 +7,10 @@ use yu_core::{ByteOffset, LineIndex, Revision, ShapingProvider, TextRange, Utf16
 use yu_layout::{ImageIntrinsicSize, LayoutConfig, LayoutError};
 
 use crate::blockview::BlockView;
-use crate::layout_tokens::{LINE_HEIGHT_BODY, collapsed_block_gap, content_origin_y};
+use crate::layout_tokens::{collapsed_block_gap, content_bottom_inset, content_origin_y};
 use crate::table::TableResizeCommit;
 use yu_markdown::{BlockKind, IncrementalParseError, MarkdownDocument, TaskState};
-use yu_state::{EditorHistory, HistoryEntry, HistoryGroup, HistoryStats, Selections};
+use yu_state::{EditorHistory, HistoryGroup, HistoryStats, Selections};
 use yu_text::{
     AppliedTransaction, EditError, TextBuffer, TextPositionError, TextSnapshot, Transaction,
 };
@@ -33,106 +33,86 @@ use crate::{
 use yu_decoration::Bias;
 use yu_markdown::{BlockDecorations, BlockWidget, ImageSpan};
 
-/// The canonical source and transient composition state owned by one editor.
-///
-/// `TextBuffer` remains the only persistent source of truth. The optional
-/// `CompositionOverlay` is deliberately kept beside it so platform adapters
-/// cannot accidentally commit preedit text through a separate shadow buffer.
+mod layout_context;
+mod layout_snapshot;
+mod table_edit;
+mod table_paste;
+mod table_widths;
+pub use table_widths::TableColumnWidthRecord;
+mod table_words;
+mod tabular_text;
+use layout_context::LayoutMeasurements;
+pub use layout_context::{EditorRenderSnapshot, LayoutContext};
+pub use layout_snapshot::{LayoutQuery, LayoutSnapshot, SnapshotBlock, SnapshotContainer};
+
+/// Mutable transaction state. It is never captured by a layout worker.
 #[derive(Debug)]
-pub struct EditorDocument {
-    render_identity: Arc<()>,
+pub struct EditorState {
     buffer: TextBuffer,
-    markdown: MarkdownDocument,
-    composition: Option<CompositionOverlay>,
-    selections: Selections,
+    history: EditorHistory,
+    width_history: table_widths::WidthHistory,
     preferred_x: Option<PreferredCaretX>,
     last_source_change: Option<SourceChange>,
-    history: EditorHistory,
-    decorations: DecorationCache,
-    layouts: LayoutCache,
-    viewport: ViewportLayout,
-    /// 当前查询在这一版源码上的全部匹配，没有搜索时是 `None`。
-    ///
-    /// 与 `decorations` / `layouts` / `viewport` 同一堆：都是「视图与缓存」，
-    /// 不是文档状态。抽 `EditorState` 时要挪走的那几个从三个变成四个——
-    /// **但这一刀仍然不抽**，理由与那三个一样：它跟着走，抽不抽都一样。真正
-    /// 逼出 `EditorState` 的是多光标那一刀，那动的是 `selection`。
-    search: Option<SearchState>,
-    /// 查询换过几次。**帧身份要用它**：改查询不推进 Revision、不改几何、
-    /// 不改选区，少了这一项，在搜索框里打字画面会一动不动——不报错。
-    search_generation: u64,
 }
 
-/// Immutable render input. Capturing it neither flattens source storage nor
-/// parses Markdown, lays out blocks, or copies edit history. Reconstitution
-/// belongs to the preparation worker.
-#[derive(Clone, Debug)]
-pub struct EditorRenderSnapshot {
-    identity: Arc<()>,
-    source: TextSnapshot,
-    viewport: ViewportLayout,
-    selections: Selections,
-    composition: Option<CompositionOverlay>,
-    search_query: Option<String>,
-    search_generation: u64,
+/// A live editor owns mutation rights and one foreground layout context.
+/// Source snapshots share immutable storage with the canonical buffer.
+#[derive(Debug)]
+pub struct EditorDocument {
+    state: EditorState,
+    presentation: LayoutContext,
 }
 
-/// Owned block heights used by one prepared frame, with no shaper or mutable
-/// editor attached. Only the originating document/visual state may adopt it.
-#[derive(Clone, Debug)]
-pub struct EditorRenderLayout {
-    identity: Arc<()>,
-    revision: Revision,
-    viewport: ViewportLayout,
-    selections: Selections,
-    composition: Option<CompositionOverlay>,
-}
-
-impl EditorRenderSnapshot {
-    #[must_use]
-    pub fn revision(&self) -> Revision {
-        self.source.revision()
+impl std::ops::Deref for EditorDocument {
+    type Target = LayoutContext;
+    fn deref(&self) -> &Self::Target {
+        &self.presentation
     }
+}
 
-    pub fn into_document(self) -> Result<EditorDocument, EditorDocumentError> {
-        let mut document = EditorDocument::new_with_buffer(TextBuffer::from_text_at_revision(
-            self.source.as_str(),
-            self.source.revision(),
-        ));
-        document.render_identity = self.identity;
-        document.viewport = self.viewport;
-        document.selections = self.selections;
-        document.composition = self.composition;
-        if let Some(query) = self.search_query {
-            document.set_search_query(&query);
-        }
-        document.search_generation = self.search_generation;
-        Ok(document)
-    }
-
-    /// Returns whether a worker-owned document can keep its parsed Markdown,
-    /// decorations and shaped block layout cache for this snapshot. Viewport
-    /// scroll/height measurements may differ; the worker updates those while
-    /// retaining the expensive source layout state.
-    #[must_use]
-    pub fn can_reuse_worker_document(&self, document: &EditorDocument) -> bool {
-        Arc::ptr_eq(&self.identity, &document.render_identity)
-            && self.revision() == document.revision()
-            && self.viewport.config() == document.viewport_config()
-            && self.selections == document.selections
-            && self.composition == document.composition
-            && self.search_query.as_deref() == document.search.as_ref().map(|search| search.query())
-            && self.search_generation == document.search_generation
+impl std::ops::DerefMut for EditorDocument {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.presentation
     }
 }
 
 impl EditorDocument {
+    pub fn source_mode(&self) -> bool {
+        self.markdown.source_mode()
+    }
+
+    /// Presentation changes never mutate source, selections or undo history.
+    pub fn set_source_mode(&mut self, enabled: bool) -> Result<(), EditorDocumentError> {
+        if self.composition.is_some() {
+            return Err(EditorDocumentError::CompositionActive);
+        }
+        if self.source_mode() == enabled {
+            return Ok(());
+        }
+        if enabled && self.selections.table_columns().is_some() {
+            // The same source ranges become text selections in literal mode.
+            // Keeping the cell-grid flag would route Delete/Paste to table edits.
+            self.presentation.selections = Selections::new(
+                &self.snapshot(),
+                self.selections.as_slice().iter().copied(),
+                self.selections.primary_index(),
+            )?;
+        }
+        Arc::make_mut(&mut self.presentation.markdown).set_source_mode(enabled);
+        self.presentation.render_identity = Arc::new(());
+        self.presentation.layout_snapshot = None;
+        self.presentation.decorations.clear();
+        self.presentation.layouts.clear();
+        self.presentation.viewport.clear();
+        self.state.preferred_x = None;
+        Ok(())
+    }
     /// Creates a document at the initial revision.
     #[must_use]
     pub fn new(source: impl Into<String>) -> Self {
         let buffer = TextBuffer::new(source);
         let snapshot = buffer.snapshot();
-        let markdown = yu_markdown::parse(&snapshot);
+        let markdown = Arc::new(yu_markdown::parse(&snapshot));
         let selection = EditorSelection::cursor(
             &snapshot,
             yu_core::ByteOffset::ZERO,
@@ -140,153 +120,30 @@ impl EditorDocument {
         )
         .expect("offset zero is always a valid caret");
         Self {
-            render_identity: Arc::new(()),
-            buffer,
-            markdown,
-            composition: None,
-            selections: Selections::single(selection),
-            preferred_x: None,
-            last_source_change: None,
-            history: EditorHistory::default(),
-            decorations: DecorationCache::default(),
-            layouts: LayoutCache::default(),
-            viewport: ViewportLayout::default(),
-            search: None,
-            search_generation: 0,
+            state: EditorState {
+                buffer,
+                history: EditorHistory::default(),
+                width_history: table_widths::WidthHistory::default(),
+                preferred_x: None,
+                last_source_change: None,
+            },
+            presentation: LayoutContext {
+                table_width_generation: 0,
+                table_widths: Arc::new(Vec::new()),
+                layout_snapshot: None,
+                resource_geometry_version: 0,
+                render_identity: Arc::new(()),
+                source: snapshot,
+                markdown,
+                composition: None,
+                selections: Selections::single(selection),
+                decorations: DecorationCache::default(),
+                layouts: LayoutCache::default(),
+                viewport: ViewportLayout::default(),
+                search: None,
+                search_generation: 0,
+            },
         }
-    }
-
-    /// Returns the current canonical source revision.
-    #[must_use]
-    pub fn revision(&self) -> Revision {
-        self.buffer.revision()
-    }
-
-    /// Returns an immutable source snapshot for parser/layout/platform work.
-    #[must_use]
-    pub fn snapshot(&self) -> TextSnapshot {
-        self.buffer.snapshot()
-    }
-
-    /// Captures only owned source storage and revision-bound visual state.
-    #[must_use]
-    pub fn capture_render_snapshot(&self) -> EditorRenderSnapshot {
-        EditorRenderSnapshot {
-            identity: Arc::clone(&self.render_identity),
-            source: self.snapshot(),
-            viewport: self.viewport.clone(),
-            selections: self.selections.clone(),
-            composition: self.composition.clone(),
-            search_query: self.search().map(|search| search.query().to_owned()),
-            search_generation: self.search_generation,
-        }
-    }
-
-    /// Synchronous convenience for diagnostic callers. The render worker uses
-    /// `capture_render_snapshot` and reconstructs the document off-thread.
-    pub fn clone_for_render(&self) -> Result<Self, EditorDocumentError> {
-        self.capture_render_snapshot().into_document()
-    }
-
-    /// Called on the preparation worker after the final scene is built.
-    #[must_use]
-    pub fn into_render_layout(self) -> EditorRenderLayout {
-        EditorRenderLayout {
-            identity: self.render_identity,
-            revision: self.buffer.revision(),
-            viewport: self.viewport,
-            selections: self.selections,
-            composition: self.composition,
-        }
-    }
-
-    /// Copies only the numerical layout state for a publication while keeping
-    /// this worker-owned document alive for the next scroll request.
-    #[must_use]
-    pub fn render_layout(&self) -> EditorRenderLayout {
-        EditorRenderLayout {
-            identity: Arc::clone(&self.render_identity),
-            revision: self.buffer.revision(),
-            viewport: self.viewport.clone(),
-            selections: self.selections.clone(),
-            composition: self.composition.clone(),
-        }
-    }
-
-    /// The host also validates request/surface/resource generations. This local
-    /// check prevents cross-document, stale-revision and changed-view adoption.
-    #[must_use]
-    pub fn accepts_render_layout(&self, layout: &EditorRenderLayout) -> bool {
-        Arc::ptr_eq(&self.render_identity, &layout.identity)
-            && self.revision() == layout.revision
-            && self.viewport_config() == layout.viewport.config()
-            && self.selections == layout.selections
-            && self.composition == layout.composition
-    }
-
-    /// Adopt only numerical viewport measurements, never worker layout caches
-    /// containing shaper-owned face identifiers, source, selection or history.
-    #[must_use]
-    pub fn adopt_render_layout(&mut self, layout: EditorRenderLayout) -> bool {
-        if !self.accepts_render_layout(&layout) {
-            return false;
-        }
-        self.viewport = layout.viewport;
-        true
-    }
-
-    fn new_with_buffer(buffer: TextBuffer) -> Self {
-        let snapshot = buffer.snapshot();
-        let selection = EditorSelection::cursor(
-            &snapshot,
-            yu_core::ByteOffset::ZERO,
-            crate::CaretAffinity::Downstream,
-        )
-        .expect("offset zero is always a valid caret");
-        Self {
-            render_identity: Arc::new(()),
-            buffer,
-            markdown: yu_markdown::parse(&snapshot),
-            composition: None,
-            selections: Selections::single(selection),
-            preferred_x: None,
-            last_source_change: None,
-            history: EditorHistory::default(),
-            decorations: DecorationCache::default(),
-            layouts: LayoutCache::default(),
-            viewport: ViewportLayout::default(),
-            search: None,
-            search_generation: 0,
-        }
-    }
-
-    /// Returns the incremental Markdown block document for the current
-    /// source revision.
-    #[must_use]
-    pub fn markdown(&self) -> &MarkdownDocument {
-        &self.markdown
-    }
-
-    /// Returns the active composition without exposing mutable editor state.
-    #[must_use]
-    pub fn composition(&self) -> Option<&CompositionOverlay> {
-        self.composition.as_ref()
-    }
-
-    /// 主选区的端点。
-    ///
-    /// **多光标之后这个方法的语义是「primary」。** 保留它是刻意的：凡是仍然
-    /// 调用它的地方，就是显式选了 primary 降级那条路，`grep` 一遍就数得出来。
-    /// 要全部选区用 [`Self::selections`]。
-    #[must_use]
-    pub fn selection(&self) -> EditorSelection {
-        self.selections.primary()
-    }
-
-    /// 全部选区，按文档顺序，互不重叠，至少一条。
-    #[must_use]
-    pub fn selections(&self) -> &Selections {
-        &self.selections
     }
 
     /// 塌回一条选区。
@@ -294,1290 +151,22 @@ impl EditorDocument {
     /// 命令层的绝大多数路径走这里：左右移动、列表编辑、composition 提交之后
     /// 的落点，它们的答案本来就只有一个位置。
     fn set_single_selection(&mut self, selection: EditorSelection) {
-        self.selections = Selections::single(selection);
+        let previous = self.presentation.selection_reveal_block_index();
+        self.presentation.selections = Selections::single(selection);
+        let next = self.presentation.selection_reveal_block_index();
+        if previous != next {
+            for index in previous.into_iter().chain(next) {
+                self.presentation
+                    .viewport
+                    .invalidate_block_measurement(index);
+            }
+        }
     }
 
     /// Returns the bounded undo/redo depth for the current editor session.
     #[must_use]
     pub fn history_stats(&self) -> HistoryStats {
-        self.history.stats()
-    }
-
-    /// 整篇文档的视觉字节流：装饰应用之后长什么样，以及它到源码的映射。
-    ///
-    /// 这是 v2 里「一份文档一份 `DecorationSet`」那个东西的兑现处。原生
-    /// 镜像与 IME 用它把源码坐标换成视觉坐标。
-    ///
-    /// # Errors
-    ///
-    /// 解析或装饰产出失败。
-    pub fn visual_text(&mut self) -> Result<VisualText, EditorDocumentError> {
-        self.visual_text_with_reveal(None)
-    }
-
-    /// 带「光标碰到语法就露出来」的那一份。
-    ///
-    /// 选区变化不推进 Revision，所以这份产出有意绕过规范缓存。
-    /// composition 期间不露出——preedit 已经占着这一段的视觉状态了。
-    ///
-    /// # Errors
-    ///
-    /// 解析或装饰产出失败。
-    pub fn visual_text_for_visual_state(&mut self) -> Result<VisualText, EditorDocumentError> {
-        if self.composition.is_some() {
-            return self.visual_text_with_reveal(None);
-        }
-        let active = self.selection_reveal_range();
-        self.visual_text_with_reveal(Some(active))
-    }
-
-    fn visual_text_with_reveal(
-        &mut self,
-        active: Option<TextRange>,
-    ) -> Result<VisualText, EditorDocumentError> {
-        let snapshot = self.snapshot();
-        let range = TextRange::new(ByteOffset::ZERO, snapshot.len_bytes())
-            .ok_or(EditorDocumentError::Visual(VisualTextError::OffsetOverflow))?;
-        // 先把块序列取成一个 `Vec<Block>`：`document_set` 要
-        // `&mut self.decorations`，同时要读 `self.markdown`，而方法调用借的
-        // 是整个 `self`。`Block` 是 `Copy` 的小结构，这一份拷贝比克隆整个
-        // `MarkdownDocument` 便宜得多——后者每次查询都要复制一遍块存储。
-        let blocks: Vec<_> = self.markdown.blocks().iter().collect();
-        let set = self
-            .decorations
-            .document_set(&self.markdown, &blocks, active)?;
-        Ok(VisualText::new(&snapshot, range, set)?)
-    }
-
-    #[must_use]
-    pub fn decoration_cache_stats(&self) -> DecorationCacheStats {
-        self.decorations.stats()
-    }
-
-    /// 一个块的规范装饰（无光标露出）。
-    ///
-    /// # Errors
-    ///
-    /// 块下标越界，或装饰产出失败。
-    pub fn block_decorations(
-        &mut self,
-        index: usize,
-    ) -> Result<&BlockDecorations, EditorDocumentError> {
-        let block = self.block_at(index)?;
-        Ok(self.decorations.get_or_build_block(&self.markdown, block)?)
-    }
-
-    /// 换一份查询，立刻在这一版源码上扫出全部匹配。
-    ///
-    /// 空查询也留下一份状态（0 个匹配），面板要靠它显示「没有结果」；要连
-    /// 高亮一起收掉用 [`Self::clear_search`]。
-    pub fn set_search_query(&mut self, query: &str) {
-        let snapshot = self.snapshot();
-        self.search = Some(SearchState::new(&snapshot, query));
-        self.search_generation = self.search_generation.wrapping_add(1);
-    }
-
-    /// 收掉搜索：不再有匹配，也不再有高亮。
-    pub fn clear_search(&mut self) {
-        if self.search.is_none() {
-            return;
-        }
-        self.search = None;
-        self.search_generation = self.search_generation.wrapping_add(1);
-    }
-
-    /// 当前查询的匹配，没有搜索时是 `None`。
-    #[must_use]
-    pub const fn search(&self) -> Option<&SearchState> {
-        self.search.as_ref()
-    }
-
-    /// 查询换过几次。
-    ///
-    /// **帧身份必须带上它。** 改查询不推进 Revision、不改几何、也不改选区，
-    /// 少了这一项，在搜索框里打字画面一动不动——不报错、不 panic，正是这个
-    /// 项目最危险的失败模式。
-    #[must_use]
-    pub const fn search_generation(&self) -> u64 {
-        self.search_generation
-    }
-
-    /// 焦点块那一份：光标碰到的行内语法露出来。
-    ///
-    /// 有意**不**进缓存——移动光标不推进 Revision，进了缓存别的块也会看见
-    /// 一份只对焦点块成立的产出。
-    ///
-    /// # Errors
-    ///
-    /// 块下标越界，或装饰产出失败。
-    pub fn block_decorations_with_selection_reveal(
-        &mut self,
-        index: usize,
-    ) -> Result<BlockDecorations, EditorDocumentError> {
-        let block = self.block_at(index)?;
-        let active = self.selection().ordered_range();
-        Ok(self
-            .decorations
-            .decorate(&self.markdown, block, Some(active))?)
-    }
-
-    /// 一个块的视觉字节流。
-    ///
-    /// # Errors
-    ///
-    /// 块下标越界，或装饰产出失败。
-    pub fn block_visual_text(&mut self, index: usize) -> Result<VisualText, EditorDocumentError> {
-        let snapshot = self.snapshot();
-        let decorations = self.block_decorations(index)?.clone();
-        Ok(VisualText::new(
-            &snapshot,
-            decorations.range(),
-            decorations.set().clone(),
-        )?)
-    }
-
-    fn block_at(&self, index: usize) -> Result<yu_markdown::Block, EditorDocumentError> {
-        self.markdown
-            .blocks()
-            .get(index)
-            .ok_or(EditorDocumentError::BlockOutOfBounds {
-                index,
-                blocks: self.markdown.blocks().len(),
-            })
-    }
-
-    /// 当前光标可能让哪个块露出行内语法。
-    ///
-    /// 判据是**露出来的那份藏得更少**。composition 期间没有露出：preedit
-    /// 已经占着这一段的视觉状态。
-    #[must_use]
-    pub fn selection_reveal_block_index(&mut self) -> Option<usize> {
-        if self.composition.is_some() {
-            return None;
-        }
-        let index = self.block_index_for_source(self.selection().focus())?;
-        let block = self.markdown.blocks().get(index)?;
-        let active = self.selection().ordered_range();
-        let canonical = hidden_bytes(
-            self.decorations
-                .get_or_build_block(&self.markdown, block)
-                .ok()?,
-        );
-        let revealed = hidden_bytes(
-            &self
-                .decorations
-                .decorate(&self.markdown, block, Some(active))
-                .ok()?,
-        );
-        (revealed < canonical).then_some(index)
-    }
-
-    fn selection_reveal_range(&mut self) -> TextRange {
-        let selection = self.selection().ordered_range();
-        let Some(index) = self.selection_reveal_block_index() else {
-            return TextRange::empty(self.selection().focus());
-        };
-        let Some(block) = self.markdown.blocks().get(index) else {
-            return TextRange::empty(self.selection().focus());
-        };
-        if selection.is_empty() {
-            return selection;
-        }
-        TextRange::new(
-            selection.start().max(block.range().start()),
-            selection.end().min(block.range().end()),
-        )
-        .unwrap_or_else(|| TextRange::empty(self.selection().focus()))
-    }
-
-    /// Returns the parser-owned block containing a canonical source offset.
-    ///
-    /// The boundary rule matches vertical caret movement: an offset at the
-    /// end of a block stays with that block unless a later block contains the
-    /// same offset. Native adapters can use this to select a block-local
-    /// projection without duplicating Markdown range traversal.
-    #[must_use]
-    pub fn block_index_for_source(&self, offset: ByteOffset) -> Option<usize> {
-        self.markdown.blocks().block_index_for_offset(offset)
-    }
-
-    /// Returns the parser block that can host the active composition without
-    /// crossing a block boundary.  Composition layout is intentionally
-    /// block-local: a marked-text replacement spanning multiple Markdown
-    /// blocks has no single block-local index and must use the span-aware
-    /// transient viewport path.
-    #[must_use]
-    pub fn composition_block_index(&self) -> Option<usize> {
-        let span = self.composition_block_range()?;
-        (span.len() == 1).then_some(span.start)
-    }
-
-    /// Returns the half-open parser block-index span touched by the active
-    /// composition replacement. The span is source-range based and includes
-    /// blank/container blocks crossed by the native selection. A caller can
-    /// therefore build one transient projection per affected block without
-    /// rescanning Markdown or inventing a second block traversal.
-    #[must_use]
-    pub fn composition_block_range(&self) -> Option<Range<usize>> {
-        let composition = self.composition.as_ref()?;
-        self.markdown
-            .blocks()
-            .block_index_range_for_source_range(composition.replacement_range())
-    }
-
-    /// Returns a revision-bound block layout snapshot from the current
-    /// projection. The snapshot is owned by a cache keyed by block range,
-    /// block kind and layout configuration; source edits remap unaffected
-    /// entries and invalidate entries whose projection was touched.
-    pub fn block_layout(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-    ) -> Result<&BlockView, EditorDocumentError> {
-        self.block_layout_with_images(index, config, &[])
-    }
-
-    /// [`Self::block_layout`] 加上已经解码到位的图片尺寸。
-    ///
-    /// 没列进来的图片画 placeholder（不变量 D7），所以不关心图片的调用方
-    /// 传一张空表即可——那不会把缓存里带尺寸的那一份挤掉，判据见
-    /// [`BlockView::needs_widget_rebuild`]。
-    pub fn block_layout_with_images(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        sizes: &[ImageSize],
-    ) -> Result<&BlockView, EditorDocumentError> {
-        let block = self.block_at(index)?;
-        let snapshot = self.snapshot();
-        let decorations = self
-            .decorations
-            .get_or_build_block(&self.markdown, block)?
-            .clone();
-        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
-        self.layouts
-            .get_or_build_block(
-                &snapshot,
-                block,
-                config,
-                BlockLayoutSource::new(&visual, &decorations, sizes),
-            )
-            .map_err(EditorDocumentError::Layout)
-    }
-
-    /// Returns a revision-bound block layout using a caller-provided shaper.
-    ///
-    /// Shaped and metrics layouts use separate cache keys. The provider itself
-    /// is not stored in the document, so callers can keep platform font state
-    /// outside the canonical editor model.
-    pub fn block_layout_with_shaper<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-    ) -> Result<&BlockView, EditorDocumentError> {
-        self.block_layout_with_shaper_and_images(index, config, shaper, &[])
-    }
-
-    /// 一个块上已经解码到位的图片。
-    ///
-    /// 装饰先建出来才知道这个块上有哪几张图，所以它与排版是两步。只看这个
-    /// 块，不扫整篇文档——viewport 查询不该因为要问图片而变成一次全文扫描。
-    pub fn block_image_sizes<F>(
-        &mut self,
-        index: usize,
-        image_resolver: &F,
-    ) -> Result<Vec<ImageSize>, EditorDocumentError>
-    where
-        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
-    {
-        let block = self.block_at(index)?;
-        let decorations = self.decorations.get_or_build_block(&self.markdown, block)?;
-        Ok(image_sizes(decorations, image_resolver))
-    }
-
-    /// [`Self::block_layout_with_shaper`] 加上已经解码到位的图片尺寸。
-    pub fn block_layout_with_shaper_and_images<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-        sizes: &[ImageSize],
-    ) -> Result<&BlockView, EditorDocumentError> {
-        let block = self.block_at(index)?;
-        let snapshot = self.snapshot();
-        let decorations = self
-            .decorations
-            .get_or_build_block(&self.markdown, block)?
-            .clone();
-        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
-        self.layouts
-            .get_or_build_block_with_shaper(
-                &snapshot,
-                block,
-                config,
-                BlockLayoutSource::new(&visual, &decorations, sizes),
-                shaper,
-            )
-            .map_err(EditorDocumentError::Layout)
-    }
-
-    /// Builds a transient metrics layout for the focus block's currently
-    /// revealed inline syntax.
-    pub fn block_layout_with_selection_reveal(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-    ) -> Result<BlockView, EditorDocumentError> {
-        let kind = self.block_at(index)?.kind();
-        let snapshot = self.snapshot();
-        let decorations = self.block_decorations_with_selection_reveal(index)?;
-        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
-        BlockView::build(
-            kind,
-            &visual,
-            &decorations,
-            config,
-            &yu_layout::MonospaceMetrics::new(config.default_advance()),
-        )
-        .map_err(EditorDocumentError::Layout)
-    }
-
-    /// [`Self::block_layout_with_selection_reveal_and_shaper`] 加上图片尺寸。
-    pub fn block_layout_with_selection_reveal_and_shaper_and_images<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-        sizes: &[ImageSize],
-    ) -> Result<BlockView, EditorDocumentError> {
-        let kind = self.block_at(index)?.kind();
-        let snapshot = self.snapshot();
-        let decorations = self.block_decorations_with_selection_reveal(index)?;
-        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
-        BlockView::build_shaped_with_images(kind, &visual, &decorations, config, shaper, sizes)
-            .map_err(EditorDocumentError::Layout)
-    }
-
-    /// Shaping-aware selection reveal layout. The result is intentionally
-    /// transient because moving a caret does not change source Revision.
-    pub fn block_layout_with_selection_reveal_and_shaper<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-    ) -> Result<BlockView, EditorDocumentError> {
-        self.block_layout_with_selection_reveal_and_shaper_and_images(index, config, shaper, &[])
-    }
-
-    /// Returns an owned layout for the current transient visual state.
-    /// Composition takes priority, selection reveal applies only to its focus
-    /// block, and unaffected blocks clone the canonical cached layout.
-    pub fn block_layout_for_visual_state_with_shaper<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-    ) -> Result<BlockView, EditorDocumentError> {
-        self.block_layout_for_visual_state_with_shaper_and_images(index, config, shaper, &[])
-    }
-
-    /// [`Self::block_layout_for_visual_state_with_shaper`] 加上图片尺寸。
-    pub fn block_layout_for_visual_state_with_shaper_and_images<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-        sizes: &[ImageSize],
-    ) -> Result<BlockView, EditorDocumentError> {
-        if self
-            .composition_block_range()
-            .as_ref()
-            .is_some_and(|span| span.contains(&index))
-        {
-            self.block_layout_with_composition_and_shaper_and_images(index, config, shaper, sizes)
-        } else if self.selection_reveal_block_index() == Some(index) {
-            self.block_layout_with_selection_reveal_and_shaper_and_images(
-                index, config, shaper, sizes,
-            )
-        } else {
-            self.block_layout_with_shaper_and_images(index, config, shaper, sizes)
-                .cloned()
-        }
-    }
-
-    /// Metrics counterpart of
-    /// [`Self::block_layout_for_visual_state_with_shaper`].
-    pub fn block_layout_for_visual_state(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-    ) -> Result<BlockView, EditorDocumentError> {
-        if self
-            .composition_block_range()
-            .as_ref()
-            .is_some_and(|span| span.contains(&index))
-        {
-            self.block_layout_with_composition(index, config)
-        } else if self.selection_reveal_block_index() == Some(index) {
-            self.block_layout_with_selection_reveal(index, config)
-        } else {
-            self.block_layout(index, config).cloned()
-        }
-    }
-
-    /// Builds a transient metrics layout with a session-only table column
-    /// resize. The normal layout cache remains canonical and the Markdown
-    /// source is not changed; callers should discard the returned snapshot
-    /// when the visual override ends or the document Revision changes.
-    pub fn block_layout_with_table_resize(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        commit: TableResizeCommit,
-    ) -> Result<BlockView, EditorDocumentError> {
-        self.validate_table_resize_commit(index, commit)?;
-        let mut layout = self.block_layout(index, config)?.clone();
-        layout
-            .apply_table_resize(commit)
-            .map_err(EditorDocumentError::Layout)?;
-        Ok(layout)
-    }
-
-    /// Builds a transient shaped layout with a session-only table column
-    /// resize. Shaping state stays owned by the caller and the override is
-    /// never inserted into the document's layout cache.
-    pub fn block_layout_with_table_resize_and_shaper<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-        commit: TableResizeCommit,
-    ) -> Result<BlockView, EditorDocumentError> {
-        self.validate_table_resize_commit(index, commit)?;
-        let mut layout = self
-            .block_layout_with_shaper(index, config, shaper)?
-            .clone();
-        layout
-            .apply_table_resize(commit)
-            .map_err(EditorDocumentError::Layout)?;
-        Ok(layout)
-    }
-
-    fn validate_table_resize_commit(
-        &self,
-        index: usize,
-        commit: TableResizeCommit,
-    ) -> Result<(), EditorDocumentError> {
-        if commit.block_index() != index {
-            return Err(EditorDocumentError::Layout(LayoutError::Upstream(
-                "table resize commit and block index differ".into(),
-            )));
-        }
-        if commit.revision() != self.revision() {
-            return Err(EditorDocumentError::Layout(LayoutError::Upstream(
-                "table resize commit and document revisions differ".into(),
-            )));
-        }
-        Ok(())
-    }
-
-    /// Builds a transient metrics layout with the active IME preedit
-    /// projected over this block. The result is intentionally not inserted in
-    /// `LayoutCache`: composition updates do not advance the canonical
-    /// Revision, so caching them would make stale preedit geometry observable.
-    pub fn block_layout_with_composition(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-    ) -> Result<BlockView, EditorDocumentError> {
-        let kind = self.block_at(index)?.kind();
-        let (visual, decorations) = self.block_visual_for_composition(index)?;
-        BlockView::build(
-            kind,
-            &visual,
-            &decorations,
-            config,
-            &yu_layout::MonospaceMetrics::new(config.default_advance()),
-        )
-        .map_err(EditorDocumentError::Layout)
-    }
-
-    /// Builds a transient shaped layout with the active IME preedit projected
-    /// over this block. Font/shaping state remains owned by the caller.
-    pub fn block_layout_with_composition_and_shaper<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-    ) -> Result<BlockView, EditorDocumentError> {
-        self.block_layout_with_composition_and_shaper_and_images(index, config, shaper, &[])
-    }
-
-    /// [`Self::block_layout_with_composition_and_shaper`] 加上图片尺寸。
-    pub fn block_layout_with_composition_and_shaper_and_images<S: ShapingProvider>(
-        &mut self,
-        index: usize,
-        config: LayoutConfig,
-        shaper: &S,
-        sizes: &[ImageSize],
-    ) -> Result<BlockView, EditorDocumentError> {
-        let kind = self.block_at(index)?.kind();
-        let (visual, decorations) = self.block_visual_for_composition(index)?;
-        BlockView::build_shaped_with_images(kind, &visual, &decorations, config, shaper, sizes)
-            .map_err(EditorDocumentError::Layout)
-    }
-
-    /// 把 preedit 叠在这个块的规范投影上。
-    ///
-    /// 一段 marked text 可能横跨几个块。跨块时第一个块吃掉 preedit 的全部
-    /// 文字（从替换起点到块末），后面的块只是「这一段没了」——它们的替换
-    /// 文本是空的。装饰本身不动：preedit 不是装饰（不变量 H1）。
-    fn block_visual_for_composition(
-        &mut self,
-        index: usize,
-    ) -> Result<(VisualText, BlockDecorations), EditorDocumentError> {
-        let composition = self
-            .composition
-            .as_ref()
-            .ok_or(EditorDocumentError::CompositionNotActive)?;
-        let block = self.block_at(index)?;
-        let span = self
-            .composition_block_range()
-            .ok_or(EditorDocumentError::CompositionNotActive)?;
-        let (replacement, text, selection) = if span.len() == 1 {
-            (
-                composition.replacement_range(),
-                Arc::from(composition.text()),
-                composition.selection_bytes(),
-            )
-        } else if index == span.start {
-            let replacement = TextRange::new(
-                composition
-                    .replacement_range()
-                    .start()
-                    .max(block.range().start()),
-                block.range().end(),
-            )
-            .ok_or(EditorDocumentError::CompositionNotActive)?;
-            (
-                replacement,
-                Arc::from(composition.text()),
-                composition.selection_bytes(),
-            )
-        } else if span.contains(&index) {
-            let replacement = TextRange::new(
-                block.range().start(),
-                composition
-                    .replacement_range()
-                    .end()
-                    .min(block.range().end()),
-            )
-            .ok_or(EditorDocumentError::CompositionNotActive)?;
-            (
-                replacement,
-                Arc::<str>::from(""),
-                TextRange::empty(ByteOffset::ZERO),
-            )
-        } else {
-            return Err(EditorDocumentError::CompositionNotActive);
-        };
-        let snapshot = self.snapshot();
-        let decorations = self
-            .decorations
-            .get_or_build_block(&self.markdown, block)?
-            .clone();
-        let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?
-            .with_composition(replacement, text, selection)?;
-        Ok((visual, decorations))
-    }
-
-    #[must_use]
-    pub fn layout_cache_stats(&self) -> LayoutCacheStats {
-        self.layouts.stats()
-    }
-
-    /// Drops all revision-bound layouts and viewport measurements.
-    ///
-    /// Callers should use this when replacing the font/shaping configuration
-    /// behind an existing `LayoutBackend::Shaped` provider. The canonical
-    /// source, Markdown document, projections and selection remain intact.
-    pub fn clear_layout_state(&mut self) {
-        self.layouts.clear();
-        self.viewport.clear();
-    }
-
-    /// Replaces the pure Rust viewport policy and drops its block estimates.
-    pub fn set_viewport_config(&mut self, config: ViewportConfig) -> Result<(), ViewportError> {
-        self.viewport = ViewportLayout::new(config)?;
-        Ok(())
-    }
-
-    /// Overscan changes which blocks are requested, not their measured heights.
-    pub fn set_viewport_overscan(&mut self, overscan: f32) -> Result<(), ViewportError> {
-        self.viewport.set_overscan(overscan)
-    }
-
-    #[must_use]
-    pub fn viewport_config(&self) -> ViewportConfig {
-        self.viewport.config()
-    }
-
-    #[must_use]
-    pub fn viewport_stats(&self) -> ViewportStats {
-        self.viewport.stats()
-    }
-
-    /// Measures only the estimated/visible block window and returns block
-    /// metadata for a future scene or renderer.
-    pub fn visible_blocks(
-        &mut self,
-        viewport: ViewportSpan,
-    ) -> Result<ViewportSnapshot, EditorDocumentError> {
-        let mut layout = std::mem::take(&mut self.viewport);
-        let result = self.measure_visible_blocks(&mut layout, viewport);
-        self.viewport = layout;
-        result
-    }
-
-    /// Measures the visible block window with a caller-provided shaping
-    /// provider. The viewport resets previously measured metrics heights when
-    /// switching backend, while estimates for off-screen blocks remain cheap.
-    pub fn visible_blocks_with_shaper<S: ShapingProvider>(
-        &mut self,
-        viewport: ViewportSpan,
-        shaper: &S,
-    ) -> Result<ViewportSnapshot, EditorDocumentError> {
-        self.visible_blocks_with_shaper_and_image_resolver(viewport, shaper, |_| None)
-    }
-
-    /// Measures the visible window with ready image dimensions supplied by a
-    /// caller-owned resolver. Only selected blocks are inspected, so the
-    /// resolver does not turn a viewport query into a full-document image
-    /// scan. Image geometry remains transient to the layout snapshot while
-    /// the resulting block height is retained in the viewport HeightIndex.
-    pub fn visible_blocks_with_shaper_and_image_resolver<S, F>(
-        &mut self,
-        viewport: ViewportSpan,
-        shaper: &S,
-        image_resolver: F,
-    ) -> Result<ViewportSnapshot, EditorDocumentError>
-    where
-        S: ShapingProvider,
-        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
-    {
-        let mut layout = std::mem::take(&mut self.viewport);
-        let result = self.measure_visible_blocks_with_shaper_and_images(
-            &mut layout,
-            viewport,
-            shaper,
-            &image_resolver,
-        );
-        self.viewport = layout;
-        result
-    }
-
-    /// Measures the visible window with the active IME overlay projected into
-    /// every affected Markdown block. Canonical viewport heights remain the
-    /// cache/HeightIndex source when no composition is active; transient
-    /// composition heights are applied only to the working viewport state and
-    /// are never inserted into `LayoutCache`.
-    pub fn visible_blocks_with_composition_and_shaper<S: ShapingProvider>(
-        &mut self,
-        viewport: ViewportSpan,
-        shaper: &S,
-    ) -> Result<ViewportSnapshot, EditorDocumentError> {
-        self.visible_blocks_with_composition_and_shaper_and_image_resolver(viewport, shaper, |_| {
-            None
-        })
-    }
-
-    /// Composition-aware variant of
-    /// [`Self::visible_blocks_with_shaper_and_image_resolver`]. Ready image
-    /// dimensions are applied to transient composition layouts as well, while
-    /// the canonical source and layout cache remain untouched.
-    pub fn visible_blocks_with_composition_and_shaper_and_image_resolver<S, F>(
-        &mut self,
-        viewport: ViewportSpan,
-        shaper: &S,
-        image_resolver: F,
-    ) -> Result<ViewportSnapshot, EditorDocumentError>
-    where
-        S: ShapingProvider,
-        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
-    {
-        if self.composition.is_none() {
-            return self.visible_blocks_with_shaper_and_image_resolver(
-                viewport,
-                shaper,
-                image_resolver,
-            );
-        }
-        let mut layout = std::mem::take(&mut self.viewport);
-        let result = self.measure_visible_blocks_with_composition_and_images(
-            &mut layout,
-            viewport,
-            shaper,
-            &image_resolver,
-        );
-        self.viewport = layout;
-        result
-    }
-
-    /// Measures the viewport using the document's complete transient visual
-    /// state. IME composition wins while active; otherwise the focus block is
-    /// measured with selection-driven inline syntax reveal.
-    pub fn visible_blocks_with_visual_state_and_shaper<S: ShapingProvider>(
-        &mut self,
-        viewport: ViewportSpan,
-        shaper: &S,
-    ) -> Result<ViewportSnapshot, EditorDocumentError> {
-        self.visible_blocks_with_visual_state_and_shaper_and_image_resolver(
-            viewport,
-            shaper,
-            |_| None,
-        )
-    }
-
-    /// Cancellable worker variant for ordinary shaped viewport preparation.
-    /// Cancellation is checked between block layouts and never mutates the
-    /// canonical document; composition/selection-reveal paths retain their
-    /// existing atomic measurement behavior.
-    pub fn visible_blocks_with_visual_state_and_shaper_cancelable<S, C>(
-        &mut self,
-        viewport: ViewportSpan,
-        shaper: &S,
-        mut should_cancel: C,
-    ) -> Result<ViewportSnapshot, EditorDocumentError>
-    where
-        S: ShapingProvider,
-        C: FnMut() -> bool,
-    {
-        if should_cancel() {
-            return Err(EditorDocumentError::Cancelled);
-        }
-        if self.composition.is_some() || self.selection_reveal_block_index().is_some() {
-            return self.visible_blocks_with_visual_state_and_shaper(viewport, shaper);
-        }
-        let mut layout = std::mem::take(&mut self.viewport);
-        let result = self.measure_visible_blocks_with_shaper_and_images_cancelable(
-            &mut layout,
-            viewport,
-            shaper,
-            &|_| None,
-            &mut should_cancel,
-        );
-        self.viewport = layout;
-        result
-    }
-
-    /// Image-aware variant of
-    /// [`Self::visible_blocks_with_visual_state_and_shaper`].
-    pub fn visible_blocks_with_visual_state_and_shaper_and_image_resolver<S, F>(
-        &mut self,
-        viewport: ViewportSpan,
-        shaper: &S,
-        image_resolver: F,
-    ) -> Result<ViewportSnapshot, EditorDocumentError>
-    where
-        S: ShapingProvider,
-        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
-    {
-        if self.composition.is_some() {
-            return self.visible_blocks_with_composition_and_shaper_and_image_resolver(
-                viewport,
-                shaper,
-                image_resolver,
-            );
-        }
-        if self.selection_reveal_block_index().is_none() {
-            return self.visible_blocks_with_shaper_and_image_resolver(
-                viewport,
-                shaper,
-                image_resolver,
-            );
-        }
-        let mut layout = std::mem::take(&mut self.viewport);
-        let result = self.measure_visible_blocks_with_selection_reveal_and_images(
-            &mut layout,
-            viewport,
-            shaper,
-            &image_resolver,
-        );
-        self.viewport = layout;
-        result
-    }
-
-    /// Resolves the current focus caret into a revision-bound scroll request.
-    ///
-    /// The returned target is document-space `scroll_y`; the platform only
-    /// needs to apply it to its native viewport when `needs_scroll()` is true.
-    /// Unmeasured blocks keep their configured estimate, while the caret's
-    /// block is measured before its document-space y is calculated.
-    pub fn caret_scroll_request(
-        &mut self,
-        viewport: ViewportSpan,
-        margin: f32,
-    ) -> Result<CaretScrollRequest, EditorDocumentError> {
-        let mut layout = std::mem::take(&mut self.viewport);
-        let result = self.measure_caret_scroll_request_metrics(&mut layout, viewport, margin);
-        self.viewport = layout;
-        result
-    }
-
-    /// Shaping-aware variant of [`Self::caret_scroll_request`]. Its measured
-    /// block height uses the same provider as the caller's visible viewport.
-    pub fn caret_scroll_request_with_shaper<S: ShapingProvider>(
-        &mut self,
-        viewport: ViewportSpan,
-        margin: f32,
-        shaper: &S,
-    ) -> Result<CaretScrollRequest, EditorDocumentError> {
-        let mut layout = std::mem::take(&mut self.viewport);
-        let result =
-            self.measure_caret_scroll_request_shaped(&mut layout, viewport, margin, shaper);
-        self.viewport = layout;
-        result
-    }
-
-    /// 把块级盒模型折进这一块的高度贡献：上内边距 + 内容高 + 下内边距 + 折给
-    /// 下一块的间距。
-    ///
-    /// 间距按 `collapsed_block_gap` 取 `max(after(本块), before(下一块))`，
-    /// **整条缝折在本块（缝的上块）的贡献里**，而不是上下各一半：折一半需要
-    /// 每个消费方都按块给内容加一个原点偏移，而这条路的约定是「高度索引的
-    /// 结构不动、调用方零感知」——折在上块，下一块的内容正好顶到自己的盒顶，
-    /// 前缀和自动把缝算进每一块的原点，光标、滚动、AX、绘制的数学全部照旧
-    /// 一致（Revision 也不推进）。
-    ///
-    /// 代码块的垂直内边距（上下各 `CODE_BLOCK_PADDING_Y`，共 10pt）对称地排
-    /// 在内容两侧：内容在盒里的起点是 `content_origin_y(kind)`，消费内容局部
-    /// 坐标（caret、选中、hit）换算文档坐标时加上同一个数；背景矩形由
-    /// `code_block_background_rect` 从盒顶画到内容高 + 10pt。
-    ///
-    /// 文档首块的段前、文档末块的段后都不计入：没有相邻块就没有缝，页面顶/底
-    /// 的留白是视口 padding 的事。段前间距经由「上块的 after」仍然生效——缝取
-    /// 两半的 max，本来就是较大那一侧的值。
-    fn block_box_height(&self, index: usize, content_height: f32, config: LayoutConfig) -> f32 {
-        let blocks = self.markdown.blocks();
-        let Some(kind) = blocks.get(index).map(|block| block.kind()) else {
-            return content_height;
-        };
-        let gap_below = blocks
-            .get(index + 1)
-            .map_or(0.0, |next| collapsed_block_gap(kind, next.kind()));
-        let origin = content_origin_y(kind);
-        // 间距表以「一行正文高」（line_height × 正文行高倍率）为单位，乘回
-        // 实际行高得到这份配置下的间距。
-        content_height + 2.0 * origin + gap_below * LINE_HEIGHT_BODY * config.line_height()
-    }
-
-    fn measure_visible_blocks(
-        &mut self,
-        layout: &mut ViewportLayout,
-        viewport: ViewportSpan,
-    ) -> Result<ViewportSnapshot, EditorDocumentError> {
-        layout
-            .set_backend(LayoutBackend::Metrics)
-            .map_err(EditorDocumentError::Viewport)?;
-        let mut range = layout
-            .visible_range(&self.markdown, viewport)
-            .map_err(EditorDocumentError::Viewport)?;
-        let config = layout.config().layout();
-        for _ in 0..8 {
-            let mut changed = false;
-            for index in range.start()..range.end() {
-                let line_count = self.block_layout(index, config)?.lines().len();
-                let height = self.block_box_height(
-                    index,
-                    config.line_height() * (line_count as f32),
-                    config,
-                );
-                changed |= layout
-                    .set_block_height(index, height)
-                    .map_err(EditorDocumentError::Viewport)?;
-            }
-            let next = layout
-                .visible_range(&self.markdown, viewport)
-                .map_err(EditorDocumentError::Viewport)?;
-            if next == range || !changed {
-                break;
-            }
-            range = next;
-        }
-        layout
-            .snapshot(&self.markdown, range)
-            .map_err(EditorDocumentError::Viewport)
-    }
-
-    fn measure_visible_blocks_with_shaper_and_images<S, F>(
-        &mut self,
-        layout: &mut ViewportLayout,
-        viewport: ViewportSpan,
-        shaper: &S,
-        image_resolver: &F,
-    ) -> Result<ViewportSnapshot, EditorDocumentError>
-    where
-        S: ShapingProvider,
-        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
-    {
-        self.measure_visible_blocks_with_shaper_and_images_cancelable(
-            layout,
-            viewport,
-            shaper,
-            image_resolver,
-            &mut || false,
-        )
-    }
-
-    fn measure_visible_blocks_with_shaper_and_images_cancelable<S, F, C>(
-        &mut self,
-        layout: &mut ViewportLayout,
-        viewport: ViewportSpan,
-        shaper: &S,
-        image_resolver: &F,
-        should_cancel: &mut C,
-    ) -> Result<ViewportSnapshot, EditorDocumentError>
-    where
-        S: ShapingProvider,
-        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
-        C: FnMut() -> bool,
-    {
-        layout
-            .set_backend(LayoutBackend::Shaped)
-            .map_err(EditorDocumentError::Viewport)?;
-        let mut range = layout
-            .visible_range(&self.markdown, viewport)
-            .map_err(EditorDocumentError::Viewport)?;
-        let config = layout.config().layout();
-        for _ in 0..8 {
-            let mut changed = false;
-            for index in range.start()..range.end() {
-                if should_cancel() {
-                    return Err(EditorDocumentError::Cancelled);
-                }
-                let sizes = self.block_image_sizes(index, image_resolver)?;
-                let content_height = self
-                    .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
-                    .height();
-                let height = self.block_box_height(index, content_height, config);
-                changed |= layout
-                    .set_block_height(index, height)
-                    .map_err(EditorDocumentError::Viewport)?;
-            }
-            let next = layout
-                .visible_range(&self.markdown, viewport)
-                .map_err(EditorDocumentError::Viewport)?;
-            if next == range || !changed {
-                break;
-            }
-            range = next;
-        }
-        layout
-            .snapshot(&self.markdown, range)
-            .map_err(EditorDocumentError::Viewport)
-    }
-
-    fn measure_visible_blocks_with_selection_reveal_and_images<S, F>(
-        &mut self,
-        layout: &mut ViewportLayout,
-        viewport: ViewportSpan,
-        shaper: &S,
-        image_resolver: &F,
-    ) -> Result<ViewportSnapshot, EditorDocumentError>
-    where
-        S: ShapingProvider,
-        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
-    {
-        layout
-            .set_backend(LayoutBackend::Shaped)
-            .map_err(EditorDocumentError::Viewport)?;
-        let mut range = layout
-            .visible_range(&self.markdown, viewport)
-            .map_err(EditorDocumentError::Viewport)?;
-        let config = layout.config().layout();
-        let reveal_block = self.selection_reveal_block_index();
-        for _ in 0..8 {
-            let mut changed = false;
-
-            // The focus block can sit above the visible window. Its revealed
-            // syntax may rewrap, so measure it first to keep every later block
-            // y-coordinate consistent with the retained scene.
-            if let Some(index) = reveal_block {
-                let sizes = self.block_image_sizes(index, image_resolver)?;
-                let block_layout = self.block_layout_with_selection_reveal_and_shaper_and_images(
-                    index, config, shaper, &sizes,
-                )?;
-                let height = self.block_box_height(index, block_layout.height(), config);
-                changed |= layout
-                    .set_block_height(index, height)
-                    .map_err(EditorDocumentError::Viewport)?;
-            }
-
-            for index in range.start()..range.end() {
-                if reveal_block == Some(index) {
-                    continue;
-                }
-                let sizes = self.block_image_sizes(index, image_resolver)?;
-                let content_height = self
-                    .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
-                    .height();
-                let height = self.block_box_height(index, content_height, config);
-                changed |= layout
-                    .set_block_height(index, height)
-                    .map_err(EditorDocumentError::Viewport)?;
-            }
-            let next = layout
-                .visible_range(&self.markdown, viewport)
-                .map_err(EditorDocumentError::Viewport)?;
-            if next == range || !changed {
-                break;
-            }
-            range = next;
-        }
-        layout
-            .snapshot(&self.markdown, range)
-            .map_err(EditorDocumentError::Viewport)
-    }
-
-    fn measure_visible_blocks_with_composition_and_images<S, F>(
-        &mut self,
-        layout: &mut ViewportLayout,
-        viewport: ViewportSpan,
-        shaper: &S,
-        image_resolver: &F,
-    ) -> Result<ViewportSnapshot, EditorDocumentError>
-    where
-        S: ShapingProvider,
-        F: Fn(ImageSpan) -> Option<ImageIntrinsicSize>,
-    {
-        layout
-            .set_backend(LayoutBackend::Shaped)
-            .map_err(EditorDocumentError::Viewport)?;
-        let mut range = layout
-            .visible_range(&self.markdown, viewport)
-            .map_err(EditorDocumentError::Viewport)?;
-        let config = layout.config().layout();
-        let composition_span = self.composition_block_range();
-        for _ in 0..8 {
-            let mut changed = false;
-
-            // A transient block may be above the current scroll window. Its
-            // height still contributes to every later document-space y, so
-            // measure the affected span before measuring the visible window.
-            if let Some(span) = composition_span.as_ref() {
-                for index in span.clone() {
-                    let sizes = self.block_image_sizes(index, image_resolver)?;
-                    let content_height = self
-                        .block_layout_with_composition_and_shaper_and_images(
-                            index, config, shaper, &sizes,
-                        )?
-                        .height();
-                    let height = self.block_box_height(index, content_height, config);
-                    changed |= layout
-                        .set_block_height(index, height)
-                        .map_err(EditorDocumentError::Viewport)?;
-                }
-            }
-
-            for index in range.start()..range.end() {
-                if composition_span
-                    .as_ref()
-                    .is_some_and(|span| span.contains(&index))
-                {
-                    continue;
-                }
-                let sizes = self.block_image_sizes(index, image_resolver)?;
-                let content_height = self
-                    .block_layout_with_shaper_and_images(index, config, shaper, &sizes)?
-                    .height();
-                let height = self.block_box_height(index, content_height, config);
-                changed |= layout
-                    .set_block_height(index, height)
-                    .map_err(EditorDocumentError::Viewport)?;
-            }
-            let next = layout
-                .visible_range(&self.markdown, viewport)
-                .map_err(EditorDocumentError::Viewport)?;
-            if next == range || !changed {
-                break;
-            }
-            range = next;
-        }
-        layout
-            .snapshot(&self.markdown, range)
-            .map_err(EditorDocumentError::Viewport)
-    }
-
-    fn measure_caret_scroll_request_metrics(
-        &mut self,
-        layout: &mut ViewportLayout,
-        viewport: ViewportSpan,
-        margin: f32,
-    ) -> Result<CaretScrollRequest, EditorDocumentError> {
-        viewport.validate().map_err(EditorDocumentError::Viewport)?;
-        validate_caret_margin(margin).map_err(EditorDocumentError::Viewport)?;
-        layout
-            .set_backend(LayoutBackend::Metrics)
-            .map_err(EditorDocumentError::Viewport)?;
-        layout
-            .sync(&self.markdown)
-            .map_err(EditorDocumentError::Viewport)?;
-        let focus = self.selection().focus();
-        let Some(block_index) = self.block_index_for_offset(focus) else {
-            return Ok(self.empty_caret_scroll_request(viewport, margin));
-        };
-        let config = layout.config().layout();
-        let projection_bias = self.selection_projection_bias();
-        let (caret_x, caret_y, line_count) = {
-            let block_layout = self.block_layout_for_visual_state(block_index, config)?;
-            let caret = block_layout.caret_for_source(focus, projection_bias)?;
-            (
-                caret.point().x(),
-                caret.point().y(),
-                block_layout.lines().len(),
-            )
-        };
-        let height = self.block_box_height(
-            block_index,
-            config.line_height() * line_count.max(1) as f32,
-            config,
-        );
-        layout
-            .set_block_height(block_index, height)
-            .map_err(EditorDocumentError::Viewport)?;
-        self.finish_caret_scroll_request(
-            layout,
-            viewport,
-            margin,
-            CaretLayoutPosition {
-                source: focus,
-                block: block_index,
-                x: caret_x,
-                y: caret_y,
-                height: config.line_height(),
-            },
-        )
-    }
-
-    fn measure_caret_scroll_request_shaped<S: ShapingProvider>(
-        &mut self,
-        layout: &mut ViewportLayout,
-        viewport: ViewportSpan,
-        margin: f32,
-        shaper: &S,
-    ) -> Result<CaretScrollRequest, EditorDocumentError> {
-        viewport.validate().map_err(EditorDocumentError::Viewport)?;
-        validate_caret_margin(margin).map_err(EditorDocumentError::Viewport)?;
-        layout
-            .set_backend(LayoutBackend::Shaped)
-            .map_err(EditorDocumentError::Viewport)?;
-        layout
-            .sync(&self.markdown)
-            .map_err(EditorDocumentError::Viewport)?;
-        let focus = self.selection().focus();
-        let Some(block_index) = self.block_index_for_offset(focus) else {
-            return Ok(self.empty_caret_scroll_request(viewport, margin));
-        };
-        let config = layout.config().layout();
-        let projection_bias = self.selection_projection_bias();
-        let (caret_x, caret_y, line_count) = {
-            let block_layout =
-                self.block_layout_for_visual_state_with_shaper(block_index, config, shaper)?;
-            let caret = block_layout.caret_for_source(focus, projection_bias)?;
-            (
-                caret.point().x(),
-                caret.point().y(),
-                block_layout.lines().len(),
-            )
-        };
-        let height = self.block_box_height(
-            block_index,
-            config.line_height() * line_count.max(1) as f32,
-            config,
-        );
-        layout
-            .set_block_height(block_index, height)
-            .map_err(EditorDocumentError::Viewport)?;
-        self.finish_caret_scroll_request(
-            layout,
-            viewport,
-            margin,
-            CaretLayoutPosition {
-                source: focus,
-                block: block_index,
-                x: caret_x,
-                y: caret_y,
-                height: config.line_height(),
-            },
-        )
-    }
-
-    fn finish_caret_scroll_request(
-        &self,
-        layout: &ViewportLayout,
-        viewport: ViewportSpan,
-        margin: f32,
-        position: CaretLayoutPosition,
-    ) -> Result<CaretScrollRequest, EditorDocumentError> {
-        let effective_margin = margin.min(viewport.height() / 2.0);
-        // `position.y` 是内容局部坐标；代码块的内容在盒里从上内边距起排
-        // （`block_box_height` 折块高时把那 5pt 加在了内容上方），换算成文档
-        // 坐标要补回同一个起点，否则代码块里的光标/滚动目标整体上移 5pt。
-        let origin = self
-            .markdown
-            .blocks()
-            .get(position.block)
-            .map_or(0.0, |block| content_origin_y(block.kind()));
-        let document_y = layout.height_index().prefix_height(position.block) + origin + position.y;
-        let caret_bottom = document_y + position.height;
-        let visible_top = viewport.scroll_y() + effective_margin;
-        let visible_bottom = viewport.scroll_y() + viewport.height() - effective_margin;
-        let mut target = viewport.scroll_y();
-        if document_y < visible_top {
-            target = document_y - effective_margin;
-        } else if caret_bottom > visible_bottom {
-            target = caret_bottom + effective_margin - viewport.height();
-        }
-        let max_scroll = (layout.height_index().total_height() - viewport.height()).max(0.0);
-        target = target.clamp(0.0, max_scroll);
-        let needs_scroll = (target - viewport.scroll_y()).abs() > f32::EPSILON;
-        let caret = ViewportCaret::new(
-            position.source,
-            position.block,
-            position.x,
-            document_y,
-            0.0,
-            position.height,
-        )?;
-        Ok(CaretScrollRequest::new(
-            self.revision(),
-            caret,
-            viewport.scroll_y(),
-            if needs_scroll {
-                target
-            } else {
-                viewport.scroll_y()
-            },
-            effective_margin,
-            needs_scroll,
-        ))
-    }
-
-    fn empty_caret_scroll_request(
-        &self,
-        viewport: ViewportSpan,
-        margin: f32,
-    ) -> CaretScrollRequest {
-        CaretScrollRequest::new(
-            self.revision(),
-            ViewportCaret::new(ByteOffset::ZERO, 0, 0.0, 0.0, 0.0, 0.0)
-                .expect("an all-zero caret box is always valid"),
-            viewport.scroll_y(),
-            viewport.scroll_y(),
-            margin.min(viewport.height() / 2.0),
-            false,
-        )
+        self.state.history.stats()
     }
 
     /// 换一条选区（其余的丢掉）。
@@ -1587,8 +176,8 @@ impl EditorDocument {
     pub fn set_selection(&mut self, selection: EditorSelection) -> Result<(), SelectionError> {
         selection.utf16_range(&self.snapshot())?;
         self.set_single_selection(selection);
-        self.preferred_x = None;
-        self.history.break_group();
+        self.state.preferred_x = None;
+        self.state.history.break_group();
         Ok(())
     }
 
@@ -1608,9 +197,18 @@ impl EditorDocument {
     ) -> Result<(), SelectionError> {
         let snapshot = self.snapshot();
         let selections = Selections::new(&snapshot, ranges, primary)?;
-        self.selections = selections;
-        self.preferred_x = None;
-        self.history.break_group();
+        let previous = self.presentation.selection_reveal_block_index();
+        self.presentation.selections = selections;
+        let next = self.presentation.selection_reveal_block_index();
+        if previous != next {
+            for index in previous.into_iter().chain(next) {
+                self.presentation
+                    .viewport
+                    .invalidate_block_measurement(index);
+            }
+        }
+        self.state.preferred_x = None;
+        self.state.history.break_group();
         Ok(())
     }
 
@@ -1631,8 +229,16 @@ impl EditorDocument {
         transaction: &Transaction,
         group: HistoryGroup,
     ) -> Result<AppliedTransaction, EditorDocumentError> {
+        let before = self.presentation.selections.clone();
+        let widths = self.presentation.table_widths.clone();
         let applied = self.apply_transaction_core(transaction)?;
-        self.history.record(&applied, group);
+        let token = self.state.width_history.capture(widths);
+        self.state.history.record(&applied, group);
+        self.state.history.record_presentation(token);
+        self.prune_width_history();
+        self.state
+            .history
+            .record_selections(before, self.presentation.selections.clone());
         Ok(applied)
     }
 
@@ -1640,14 +246,15 @@ impl EditorDocument {
         &mut self,
         transaction: &Transaction,
     ) -> Result<AppliedTransaction, EditorDocumentError> {
-        self.preferred_x = None;
+        self.state.preferred_x = None;
         let before_snapshot = self.snapshot();
-        let applied = self.buffer.apply(transaction)?;
+        let applied = self.state.buffer.apply(transaction)?;
+        self.presentation.source = applied.result_snapshot().clone();
         if before_snapshot.revision() != applied.result_snapshot().revision() {
-            self.render_identity = Arc::new(());
+            self.presentation.render_identity = Arc::new(());
         }
         let incremental = yu_markdown::parse_incremental(
-            &self.markdown,
+            &self.presentation.markdown,
             applied.result_snapshot(),
             applied.change_set(),
         )?;
@@ -1655,36 +262,48 @@ impl EditorDocument {
         // 偏移（删掉它们之间的文字），不合并就会留下一对重叠的选区，而下一次
         // 插入会被 `validate_edits` 拒掉——用户看到的是「打字突然没反应」。
         // 收敛点只有 `Selections::map_through` 一个。
-        self.selections = self
+        self.presentation.selections = self
+            .presentation
             .selections
             .map_through(applied.change_set(), applied.result_snapshot())?;
         // 改一条 reference definition 曾经要把所有缓存整表作废：v1 的投影
         // 先查表才知道 `[id]` 是不是一个链接。换成语法树之后 `[id]` 的
         // `LinkLabel` 是树给的结构，隐藏区间不再依赖索引（不变量 C6 说的
         // 「解析目标」才需要），所以没有东西要作废了。
-        self.decorations
+        self.presentation
+            .decorations
             .shift_through(applied.change_set(), applied.result_snapshot());
-        self.layouts
+        self.presentation
+            .layouts
             .map_through(applied.change_set(), applied.result_snapshot())
             .map_err(EditorDocumentError::Layout)?;
-        self.viewport
+        self.presentation
+            .viewport
             .map_through(
                 applied.change_set(),
                 applied.result_snapshot(),
                 incremental.document(),
             )
             .map_err(EditorDocumentError::Viewport)?;
-        self.decorations.retain_blocks(incremental.document());
-        self.layouts.retain_blocks(incremental.document());
-        self.markdown = incremental.into_document();
+        self.presentation
+            .decorations
+            .retain_blocks(incremental.document());
+        self.presentation
+            .layouts
+            .retain_blocks(incremental.document());
+        self.presentation.map_table_widths(applied.change_set());
+        self.presentation.markdown = Arc::new(incremental.into_document());
         // 匹配是 `(TextSnapshot, query)` 的纯函数，源码变了就得重扫。没有人
         // 在搜索时这里一分钱不花；有人在搜索时，代价是一次全文子串扫描——
         // 装饰与布局是增量的，这一个不是，因为一次编辑可以让任意远处的匹配
         // 出现或消失（`ab` 中间插一个字符）。
-        if let Some(state) = self.search.as_ref() {
-            self.search = Some(SearchState::new(applied.result_snapshot(), state.query()));
+        if let Some(state) = self.presentation.search.as_ref() {
+            self.presentation.search = Some(Arc::new(SearchState::new(
+                applied.result_snapshot(),
+                state.query(),
+            )));
         }
-        self.last_source_change = source_change_from_applied(&before_snapshot, &applied)?;
+        self.state.last_source_change = source_change_from_applied(&before_snapshot, &applied)?;
         Ok(applied)
     }
 
@@ -1713,12 +332,12 @@ impl EditorDocument {
         selection_utf16: Utf16Range,
     ) -> Result<(), EditorDocumentError> {
         self.validate_source_range(replacement_range)?;
-        self.history.break_group();
-        self.preferred_x = None;
-        if self.selections.is_multiple() {
-            self.selections = self.selections.collapsed_to_primary();
+        self.state.history.break_group();
+        self.state.preferred_x = None;
+        if self.presentation.selections.is_multiple() {
+            self.presentation.selections = self.presentation.selections.collapsed_to_primary();
         }
-        self.composition = Some(CompositionOverlay::new(
+        self.presentation.composition = Some(CompositionOverlay::new(
             self.revision(),
             replacement_range,
             text,
@@ -1741,6 +360,7 @@ impl EditorDocument {
         selection_utf16: Utf16Range,
     ) -> Result<(), EditorDocumentError> {
         let composition = self
+            .presentation
             .composition
             .as_mut()
             .ok_or(EditorDocumentError::CompositionNotActive)?;
@@ -1758,11 +378,13 @@ impl EditorDocument {
         committed_text: impl Into<Arc<str>>,
     ) -> Result<AppliedTransaction, EditorDocumentError> {
         let composition = self
+            .presentation
             .composition
             .as_ref()
             .ok_or(EditorDocumentError::CompositionNotActive)?;
         let replacement_range = composition.replacement_range();
         let committed_text: Arc<str> = committed_text.into();
+        let committed_text = self.table_cell_input(replacement_range, committed_text);
         let transaction = composition.clone().commit(Arc::clone(&committed_text));
         let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::Composition)?;
         let cursor_offset = replacement_range
@@ -1772,44 +394,54 @@ impl EditorDocument {
                     .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
             )
             .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
-        self.set_single_selection(EditorSelection::cursor(
+        self.set_edit_selection(EditorSelection::cursor(
             applied.result_snapshot(),
             cursor_offset,
             crate::CaretAffinity::Downstream,
         )?);
-        self.composition = None;
-        self.preferred_x = None;
-        self.last_source_change = None;
-        self.history.break_group();
+        self.presentation.composition = None;
+        self.state.preferred_x = None;
+        self.state.last_source_change = None;
+        self.state.history.break_group();
         Ok(applied)
     }
 
     /// Drops the active overlay without changing source or revision.
     #[must_use]
     pub fn cancel_composition(&mut self) -> bool {
-        let cancelled = self.composition.take().is_some();
+        let cancelled = self.presentation.composition.take().is_some();
         if cancelled {
-            self.preferred_x = None;
-            self.history.break_group();
+            self.state.preferred_x = None;
+            self.state.history.break_group();
         }
         cancelled
     }
 
     /// Replaces the source for a newly opened document and resets its revision.
     pub fn reset_source(&mut self, source: impl Into<String>) -> Result<(), EditorDocumentError> {
-        if self.composition.is_some() {
+        if self.presentation.composition.is_some() {
             return Err(EditorDocumentError::CompositionActive);
         }
-        self.render_identity = Arc::new(());
-        self.buffer = TextBuffer::new(source);
-        self.markdown = yu_markdown::parse(&self.buffer.snapshot());
-        self.decorations.clear();
-        self.layouts.clear();
-        self.viewport.clear();
-        self.history.clear();
-        self.preferred_x = None;
-        self.last_source_change = None;
+        self.presentation.render_identity = Arc::new(());
+        self.state.buffer = TextBuffer::new(source);
+        self.presentation.source = self.state.buffer.snapshot();
+        let source_mode = self.source_mode();
+        let mut markdown = yu_markdown::parse(&self.state.buffer.snapshot());
+        markdown.set_source_mode(source_mode);
+        self.presentation.markdown = Arc::new(markdown);
+        self.presentation.decorations.clear();
+        self.presentation.layouts.clear();
+        self.presentation.viewport.clear();
+        self.state.history.clear();
+        self.state.width_history = table_widths::WidthHistory::default();
+        self.presentation.table_widths = Arc::new(Vec::new());
+        self.presentation.table_width_generation = self.table_width_generation.wrapping_add(1);
+        self.state.preferred_x = None;
+        self.state.last_source_change = None;
         let snapshot = self.snapshot();
+        if let Some(search) = self.presentation.search.as_ref() {
+            self.presentation.search = Some(Arc::new(SearchState::new(&snapshot, search.query())));
+        }
         self.set_single_selection(
             EditorSelection::cursor(
                 &snapshot,
@@ -1826,13 +458,13 @@ impl EditorDocument {
         &mut self,
         command: EditorCommand,
     ) -> Result<CommandResult, EditorDocumentError> {
-        self.last_source_change = None;
+        self.state.last_source_change = None;
         // A native text input client owns the transient marked-text lifecycle
         // while a composition is active.  Keep the same invariant at the
         // platform-independent editor boundary so a caller cannot bypass the
         // FFI/menu availability guard and accidentally create a permanent
         // transaction over the composition's fixed replacement range.
-        if self.composition.is_some() {
+        if self.presentation.composition.is_some() {
             return Err(EditorDocumentError::CompositionActive);
         }
         if !matches!(
@@ -1842,16 +474,52 @@ impl EditorDocument {
                 | EditorCommand::MoveUpExtend
                 | EditorCommand::MoveDownExtend
         ) {
-            self.preferred_x = None;
+            self.state.preferred_x = None;
         }
         match command {
             EditorCommand::InsertText(text) => self.insert_text(text),
+            EditorCommand::PasteFragments(fragments) => self.paste_fragments(fragments),
+            EditorCommand::PasteTsv(text) => self.paste_tsv(text),
+            EditorCommand::PasteClipboardText { text, tabular } => {
+                self.paste_clipboard_text(text, tabular)
+            }
+            EditorCommand::PasteTableGrid { columns, cells } => {
+                self.paste_table_grid(columns, cells)
+            }
+            EditorCommand::SelectTableCells { anchor, focus } => {
+                self.select_table_cells(anchor, focus)
+            }
+            EditorCommand::EditTable(edit) => self.edit_table(edit),
             EditorCommand::DeleteBackward => self.delete_backward(),
             EditorCommand::DeleteForward => self.delete_forward(),
+            EditorCommand::DeleteWordBackward => self.delete_word(false),
+            EditorCommand::DeleteWordForward => self.delete_word(true),
+            EditorCommand::DeleteSelections => {
+                if self.presentation.selections.table_columns().is_some() {
+                    return self.clear_table_cells();
+                }
+                self.state.history.break_group();
+                let ranges = self
+                    .presentation
+                    .selections
+                    .as_slice()
+                    .iter()
+                    .map(|s| s.ordered_range())
+                    .collect();
+                let result = self.delete_ranges(ranges, HistoryGroup::Deletion);
+                self.state.history.break_group();
+                result
+            }
             EditorCommand::MoveLeft => self.move_left(),
             EditorCommand::MoveRight => self.move_right(),
             EditorCommand::MoveWordLeft => self.move_word_left(),
             EditorCommand::MoveWordRight => self.move_word_right(),
+            EditorCommand::ExtendHorizontal { forward, word } => {
+                self.extend_horizontal(forward, word)
+            }
+            EditorCommand::MoveDocumentBoundary { end, extend } => {
+                self.move_document_boundary(end, extend)
+            }
             EditorCommand::MoveUp => self.move_up(false),
             EditorCommand::MoveDown => self.move_down(false),
             EditorCommand::MoveUpExtend => self.move_up(true),
@@ -1872,40 +540,82 @@ impl EditorDocument {
     /// validation; executing a command remains the authoritative operation.
     #[must_use]
     pub fn command_available(&self, command: &EditorCommand) -> bool {
-        if self.composition.is_some() {
+        if self.presentation.composition.is_some() {
             return false;
         }
         let snapshot = self.snapshot();
         match command {
             EditorCommand::InsertText(text) => !text.is_empty(),
+            EditorCommand::PasteFragments(fragments) => !fragments.is_empty(),
+            EditorCommand::PasteClipboardText { text, .. } => !text.is_empty(),
+            EditorCommand::PasteTsv(text) => Self::tsv_grid(text).is_ok_and(|(columns, cells)| {
+                self.command_available(&EditorCommand::PasteTableGrid { columns, cells })
+            }),
+            EditorCommand::PasteTableGrid { columns, cells } => {
+                if self.grid_paste_is_outside_table() {
+                    Self::serialize_grid(*columns, cells).is_ok()
+                } else {
+                    self.table_grid_plan(*columns, cells).is_ok()
+                }
+            }
+            EditorCommand::SelectTableCells { anchor, focus } => {
+                self.table_cell_selection(*anchor, *focus).is_some()
+            }
+            EditorCommand::EditTable(edit) => self.table_edit_plan(*edit).is_some(),
+            EditorCommand::DeleteWordBackward | EditorCommand::DeleteWordForward => {
+                let forward = matches!(command, EditorCommand::DeleteWordForward);
+                self.presentation
+                    .selections
+                    .as_slice()
+                    .iter()
+                    .any(|selection| {
+                        !selection.is_empty()
+                            || self
+                                .word_target(&snapshot, selection.focus(), forward)
+                                .is_ok_and(|target| target != selection.focus())
+                    })
+            }
+            EditorCommand::DeleteSelections => self
+                .presentation
+                .selections
+                .as_slice()
+                .iter()
+                .any(|s| !s.is_empty()),
             // **判据是「有没有哪一条动得了」，不是 primary 动不动得了。**
             // 按 primary 判会让「primary 停在文档开头、别的光标在中间」这一
             // 局面下整条退格菜单项变灰——另外几个光标明明删得动。
             EditorCommand::DeleteBackward
             | EditorCommand::MoveLeft
             | EditorCommand::MoveWordLeft => self
+                .presentation
                 .selections
                 .as_slice()
                 .iter()
                 .any(|selection| !selection.is_empty() || selection.focus() > ByteOffset::ZERO),
             EditorCommand::DeleteForward
             | EditorCommand::MoveRight
-            | EditorCommand::MoveWordRight => {
-                self.selections.as_slice().iter().any(|selection| {
-                    !selection.is_empty() || selection.focus() < snapshot.len_bytes()
-                })
-            }
+            | EditorCommand::MoveWordRight => self
+                .presentation
+                .selections
+                .as_slice()
+                .iter()
+                .any(|selection| !selection.is_empty() || selection.focus() < snapshot.len_bytes()),
             EditorCommand::MoveUp | EditorCommand::MoveUpExtend => {
                 self.vertical_command_available(VerticalDirection::Up)
             }
             EditorCommand::MoveDown | EditorCommand::MoveDownExtend => {
                 self.vertical_command_available(VerticalDirection::Down)
             }
-            EditorCommand::MoveTableCellNext => self.table_cell_navigation_target(false).is_some(),
+            EditorCommand::MoveTableCellNext => {
+                self.table_cell_navigation_target(false).is_some()
+                    || self.table_append_at_focus().is_some()
+            }
             EditorCommand::MoveTableCellPrevious => {
                 self.table_cell_navigation_target(true).is_some()
             }
-            EditorCommand::InsertNewline => true,
+            EditorCommand::InsertNewline
+            | EditorCommand::ExtendHorizontal { .. }
+            | EditorCommand::MoveDocumentBoundary { .. } => true,
             EditorCommand::IndentList => self
                 .current_list_line()
                 .is_some_and(|line| self.list_prefix(&line).is_some()),
@@ -1919,9 +629,10 @@ impl EditorDocument {
                         .is_some()
                 })
             }),
-            EditorCommand::Undo => self.history.stats().undo_entries() > 0,
-            EditorCommand::Redo => self.history.stats().redo_entries() > 0,
+            EditorCommand::Undo => self.state.history.stats().undo_entries() > 0,
+            EditorCommand::Redo => self.state.history.stats().redo_entries() > 0,
             EditorCommand::ToggleTask { block } => self
+                .presentation
                 .markdown
                 .blocks()
                 .get(*block)
@@ -1937,7 +648,7 @@ impl EditorDocument {
         let Some(command) = self.command_for_key(event) else {
             return Ok(KeyRouteResult::Unhandled);
         };
-        if self.composition.is_some() {
+        if self.presentation.composition.is_some() {
             return Err(EditorDocumentError::CompositionActive);
         }
         let list_command = matches!(
@@ -1952,10 +663,19 @@ impl EditorDocument {
     }
 
     fn command_for_key(&mut self, event: KeyEvent) -> Option<EditorCommand> {
+        if self.source_mode()
+            && event.key() == crate::EditorKey::Tab
+            && event.modifiers() == crate::KeyModifiers::NONE
+        {
+            return Some(EditorCommand::insert_text("\t"));
+        }
         if event.key() == crate::EditorKey::Tab {
             let previous = event.modifiers() == crate::KeyModifiers::SHIFT;
             let plain = event.modifiers() == crate::KeyModifiers::NONE;
-            if (plain || previous) && self.table_cell_navigation_target(previous).is_some() {
+            if (plain || previous)
+                && (self.table_cell_navigation_target(previous).is_some()
+                    || (!previous && self.table_append_at_focus().is_some()))
+            {
                 return Some(if previous {
                     EditorCommand::move_table_cell_previous()
                 } else {
@@ -1970,14 +690,12 @@ impl EditorDocument {
     /// The edit is a normal transaction, so undo/history and projection cache
     /// invalidation follow the same path as keyboard input.
     pub fn toggle_task(&mut self, index: usize) -> Result<CommandResult, EditorDocumentError> {
-        let block =
-            self.markdown
-                .blocks()
-                .get(index)
-                .ok_or(EditorDocumentError::BlockOutOfBounds {
-                    index,
-                    blocks: self.markdown.blocks().len(),
-                })?;
+        let block = self.presentation.markdown.blocks().get(index).ok_or(
+            EditorDocumentError::BlockOutOfBounds {
+                index,
+                blocks: self.presentation.markdown.blocks().len(),
+            },
+        )?;
         let state = match block.kind() {
             BlockKind::TaskListItem { state, .. } => state,
             _ => return Err(EditorDocumentError::BlockNotTaskList { index }),
@@ -2008,33 +726,82 @@ impl EditorDocument {
         Ok(self.command_result(true))
     }
 
+    fn restore_history_selections(
+        &mut self,
+        saved: &Selections,
+    ) -> Result<(), EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let ranges = saved
+            .as_slice()
+            .iter()
+            .map(|selection| {
+                EditorSelection::range(
+                    &snapshot,
+                    selection.anchor(),
+                    selection.focus(),
+                    selection.affinity(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.set_selections(ranges, saved.primary_index())?;
+        if let Some(columns) = saved.table_columns().filter(|_| !self.source_mode()) {
+            self.presentation.selections = self
+                .presentation
+                .selections
+                .clone()
+                .with_table_columns(columns)?;
+        }
+        Ok(())
+    }
+
+    fn set_edit_selection(&mut self, selection: EditorSelection) {
+        self.set_single_selection(selection);
+        self.state
+            .history
+            .finish_selection(self.presentation.selections.clone());
+    }
+
     /// Replays one grouped set of inverse transactions without recording the
     /// replay itself as a new edit. The inverse of each replay becomes the
     /// corresponding redo transaction.
     pub fn undo(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        let Some(entries) = self.history.pop_undo_group() else {
-            self.history.break_group();
+        let Some(entries) = self.state.history.pop_undo_group() else {
+            self.state.history.break_group();
             return Ok(self.command_result(false));
         };
         let mut redo = Vec::with_capacity(entries.len());
         let mut rollback = Vec::with_capacity(entries.len());
+        let original_widths = self.presentation.table_widths.clone();
         for entry in &entries {
+            let widths = self.presentation.table_widths.clone();
             let transaction = entry.transaction_for(self.revision());
             match self.apply_transaction_core(&transaction) {
                 Ok(applied) => {
+                    if let Some(target) = entry.target_selections() {
+                        self.restore_history_selections(target)?;
+                    }
                     rollback.push(applied.inverse().clone());
-                    redo.push(HistoryEntry::new(applied.inverse().clone(), entry.group()));
+                    self.restore_width_history(entry.target_presentation());
+                    let token = self.state.width_history.capture(widths);
+                    redo.push(
+                        entry
+                            .inverse(applied.inverse().clone())
+                            .with_presentation(token),
+                    );
                 }
                 Err(error) => {
                     for transaction in rollback.iter().rev() {
                         let _ = self.apply_transaction_core(transaction);
                     }
-                    self.history.restore_undo_group(&entries);
+                    self.presentation.table_widths = original_widths;
+                    self.state.history.restore_undo_group(&entries);
+                    self.prune_width_history();
                     return Err(error);
                 }
             }
         }
-        self.history.push_redo_group(redo);
+        self.state.history.push_redo_group(redo);
+        self.prune_width_history();
         Ok(self.command_result(true).requiring_full_source_sync())
     }
 
@@ -2042,29 +809,43 @@ impl EditorDocument {
     /// replay itself as a new edit. The inverse of each replay is restored to
     /// the undo stack in the original stack order.
     pub fn redo(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        let Some(entries) = self.history.pop_redo_group() else {
-            self.history.break_group();
+        let Some(entries) = self.state.history.pop_redo_group() else {
+            self.state.history.break_group();
             return Ok(self.command_result(false));
         };
         let mut undo = Vec::with_capacity(entries.len());
         let mut rollback = Vec::with_capacity(entries.len());
+        let original_widths = self.presentation.table_widths.clone();
         for entry in &entries {
+            let widths = self.presentation.table_widths.clone();
             let transaction = entry.transaction_for(self.revision());
             match self.apply_transaction_core(&transaction) {
                 Ok(applied) => {
+                    if let Some(target) = entry.target_selections() {
+                        self.restore_history_selections(target)?;
+                    }
                     rollback.push(applied.inverse().clone());
-                    undo.push(HistoryEntry::new(applied.inverse().clone(), entry.group()));
+                    self.restore_width_history(entry.target_presentation());
+                    let token = self.state.width_history.capture(widths);
+                    undo.push(
+                        entry
+                            .inverse(applied.inverse().clone())
+                            .with_presentation(token),
+                    );
                 }
                 Err(error) => {
                     for transaction in rollback.iter().rev() {
                         let _ = self.apply_transaction_core(transaction);
                     }
-                    self.history.restore_redo_group(&entries);
+                    self.presentation.table_widths = original_widths;
+                    self.state.history.restore_redo_group(&entries);
+                    self.prune_width_history();
                     return Err(error);
                 }
             }
         }
-        self.history.push_undo_group(undo);
+        self.state.history.push_undo_group(undo);
+        self.prune_width_history();
         Ok(self.command_result(true).requiring_full_source_sync())
     }
 
@@ -2073,7 +854,7 @@ impl EditorDocument {
     /// unchecked. Pressing Enter on an empty list item exits the list by
     /// removing that line's prefix while preserving its line ending.
     pub fn insert_newline(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        if self.selections.is_multiple() {
+        if self.presentation.selections.is_multiple() {
             return self.insert_plain_newlines();
         }
         let snapshot = self.snapshot();
@@ -2098,7 +879,7 @@ impl EditorDocument {
                     );
                     let applied =
                         self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-                    self.set_single_selection(EditorSelection::cursor(
+                    self.set_edit_selection(EditorSelection::cursor(
                         applied.result_snapshot(),
                         line.start,
                         crate::CaretAffinity::Downstream,
@@ -2122,7 +903,7 @@ impl EditorDocument {
                 );
                 let applied =
                     self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-                self.set_single_selection(EditorSelection::cursor(
+                self.set_edit_selection(EditorSelection::cursor(
                     applied.result_snapshot(),
                     offset,
                     crate::CaretAffinity::Downstream,
@@ -2144,7 +925,7 @@ impl EditorDocument {
             [yu_text::Edit::new(selection_range, insertion.as_str())],
         );
         let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-        self.set_single_selection(EditorSelection::cursor(
+        self.set_edit_selection(EditorSelection::cursor(
             applied.result_snapshot(),
             offset,
             crate::CaretAffinity::Downstream,
@@ -2179,8 +960,8 @@ impl EditorDocument {
     /// CRLF。
     fn insert_plain_newlines(&mut self) -> Result<CommandResult, EditorDocumentError> {
         let snapshot = self.snapshot();
-        let mut edits = Vec::with_capacity(self.selections.len());
-        for selection in self.selections.as_slice() {
+        let mut edits = Vec::with_capacity(self.presentation.selections.len());
+        for selection in self.presentation.selections.as_slice() {
             let range = selection.ordered_range();
             let line = source_line(&snapshot, range.start())?;
             edits.push((range, Arc::<str>::from(line.insertion_terminator())));
@@ -2250,12 +1031,99 @@ impl EditorDocument {
             return Ok(self.command_result(false));
         }
         let edits: Vec<_> = self
+            .presentation
             .selections
             .as_slice()
             .iter()
-            .map(|selection| (selection.ordered_range(), Arc::clone(&text)))
+            .map(|selection| {
+                let range = selection.ordered_range();
+                (range, self.table_cell_input(range, Arc::clone(&text)))
+            })
             .collect();
         self.apply_selection_edits(edits, HistoryGroup::Typing, CollapseTo::End)
+    }
+
+    /// Equal-sized source fragment and target sets distribute one-to-one.
+    /// Otherwise paste the combined payload at each target, as plain copy does.
+    /// A paste is always one undo step, isolated from typing and other pastes.
+    fn paste_fragments(
+        &mut self,
+        fragments: Vec<Arc<str>>,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        if fragments.is_empty() {
+            return Ok(self.command_result(false));
+        }
+        if fragments.len() == 1
+            && !self.grid_paste_is_outside_table()
+            && let Some((columns, cells)) = Self::markdown_table_grid(&fragments[0])
+        {
+            return self.paste_table_grid(columns, cells);
+        }
+        let replacements = if fragments.len() == self.presentation.selections.len() {
+            fragments
+        } else {
+            let joined: Arc<str> = fragments.join("\n").into();
+            vec![joined; self.presentation.selections.len()]
+        };
+        let edits = self
+            .presentation
+            .selections
+            .as_slice()
+            .iter()
+            .zip(replacements)
+            .map(|(selection, text)| {
+                let range = selection.ordered_range();
+                (range, self.table_cell_input(range, text))
+            })
+            .collect();
+        self.state.history.break_group();
+        let result = self.apply_selection_edits(edits, HistoryGroup::Typing, CollapseTo::End);
+        self.state.history.break_group();
+        result
+    }
+
+    /// Literal pipes inside one visible cell must not become column separators.
+    /// Preserve already escaped Markdown and the backslash parity at the edit
+    /// boundary. Cross-cell edits remain separate from this single-cell policy.
+    fn table_cell_input(&self, range: TextRange, text: Arc<str>) -> Arc<str> {
+        if !text.contains('|') && !text.contains('\\') {
+            return text;
+        }
+        let Some(block) = self
+            .block_index_for_offset(range.start())
+            .and_then(|index| self.presentation.markdown.blocks().get(index))
+        else {
+            return text;
+        };
+        let Some(table) = yu_markdown::table_for_block(&self.presentation.markdown, block) else {
+            return text;
+        };
+        let Some(cell) = table
+            .visible_cell_for_source(range.start().get() as usize)
+            .and_then(|address| table.visible_cell(address))
+        else {
+            return text;
+        };
+        if range.end().get() as usize > cell.end() {
+            return text;
+        }
+        let snapshot = self.snapshot();
+        let source = snapshot.as_str();
+        let Some(encoded) = yu_markdown::quote_table_cell_input(
+            &source[cell.start()..cell.end()],
+            (range.start().get() as usize - cell.start())
+                ..(range.end().get() as usize - cell.start()),
+            &text,
+            range.end().get() as usize == cell.end()
+                && source.as_bytes().get(cell.end()) == Some(&b'|'),
+        ) else {
+            return text;
+        };
+        if encoded == text.as_ref() {
+            text
+        } else {
+            Arc::from(encoded)
+        }
     }
 
     /// 应用一组「一条选区一个替换」的编辑，并把每一条选区落到它自己那一处。
@@ -2285,7 +1153,7 @@ impl EditorDocument {
     ) -> Result<CommandResult, EditorDocumentError> {
         debug_assert_eq!(
             edits.len(),
-            self.selections.len(),
+            self.presentation.selections.len(),
             "每一条选区必须恰好产出一个替换"
         );
         let mut targets = Vec::with_capacity(edits.len());
@@ -2310,7 +1178,7 @@ impl EditorDocument {
             return Ok(self.command_result(false));
         }
 
-        let primary = self.selections.primary_index();
+        let primary = self.presentation.selections.primary_index();
         let transaction = Transaction::new(self.revision(), applied);
         self.apply_transaction_with_group(&transaction, group)?;
 
@@ -2325,32 +1193,87 @@ impl EditorDocument {
                 crate::CaretAffinity::Downstream,
             )?);
         }
-        self.selections = Selections::new(&snapshot, collapsed, primary)?;
+        self.presentation.selections = Selections::new(&snapshot, collapsed, primary)?;
+        self.state
+            .history
+            .finish_selection(self.presentation.selections.clone());
         Ok(self.command_result(true))
     }
 
     fn delete_backward(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        if self.presentation.selections.table_columns().is_some() {
+            return self.execute(EditorCommand::DeleteSelections);
+        }
+
         // 空列表项的退格（删掉整条标记）**只在单光标下走**，见
         // `insert_plain_newlines` 上那段说明：它删的是整行的内容，两个
         // 光标停在同一行上会产出一对重叠的 edit，整条命令因此失败。
-        if !self.selections.is_multiple()
+        if !self.presentation.selections.is_multiple()
             && self.selection().is_empty()
             && let Some(result) = self.delete_empty_list_prefix()?
         {
             return Ok(result);
         }
         let snapshot = self.snapshot();
-        let mut ranges = Vec::with_capacity(self.selections.len());
-        for selection in self.selections.as_slice() {
+        let mut ranges = Vec::with_capacity(self.presentation.selections.len());
+        for selection in self.presentation.selections.as_slice() {
             ranges.push(if selection.is_empty() {
                 let start = previous_grapheme_boundary(&snapshot, selection.focus())?;
-                TextRange::new(start, selection.focus())
-                    .expect("previous grapheme boundary must precede caret")
+                self.table_atom_deletion_range(
+                    TextRange::new(start, selection.focus())
+                        .expect("previous grapheme boundary must precede caret"),
+                    false,
+                )?
             } else {
                 selection.ordered_range()
             });
         }
         self.delete_ranges(ranges, HistoryGroup::Deletion)
+    }
+
+    fn table_atom_deletion_range(
+        &self,
+        range: TextRange,
+        forward: bool,
+    ) -> Result<TextRange, EditorDocumentError> {
+        use unicode_segmentation::UnicodeSegmentation;
+        let markdown = &self.presentation.markdown;
+        let Some(block) = self
+            .block_index_for_offset(range.start())
+            .and_then(|index| markdown.blocks().get(index))
+        else {
+            return Ok(range);
+        };
+        let atom = yu_markdown::table_atom_deletion_range(markdown, block, range);
+        if atom == range {
+            return Ok(range);
+        }
+        let from = if forward { range.start() } else { range.end() };
+        let Some(visual) = self.projected_table_cell(from)? else {
+            return Ok(range);
+        };
+        let position = visual.source_to_visual(from, Bias::After)?.get() as usize;
+        let mut graphemes = visual.text().grapheme_indices(true);
+        let cluster = if forward {
+            graphemes.find(|(start, text)| start + text.len() > position)
+        } else {
+            graphemes.rev().find(|(start, _)| *start < position)
+        };
+        let Some((start, text)) = cluster else {
+            return Ok(atom);
+        };
+        // Use the same atom coverage as painted clusters. This keeps multi-
+        // scalar literals whole without swallowing a preceding hard break.
+        let projected = visual.source_coverage(
+            yu_core::VisualRange::new(
+                yu_core::VisualOffset::new(start as u64),
+                yu_core::VisualOffset::new((start + text.len()) as u64),
+            )
+            .expect("ordered projected grapheme"),
+        )?;
+        Ok(yu_markdown::table_atom_deletion_range(
+            markdown, block, projected,
+        ))
     }
 
     fn delete_empty_list_prefix(&mut self) -> Result<Option<CommandResult>, EditorDocumentError> {
@@ -2374,7 +1297,7 @@ impl EditorDocument {
             [yu_text::Edit::new(line.content_range(), "")],
         );
         let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-        self.set_single_selection(EditorSelection::cursor(
+        self.set_edit_selection(EditorSelection::cursor(
             applied.result_snapshot(),
             line.start,
             crate::CaretAffinity::Downstream,
@@ -2382,14 +1305,74 @@ impl EditorDocument {
         Ok(Some(self.command_result(true)))
     }
 
-    fn delete_forward(&mut self) -> Result<CommandResult, EditorDocumentError> {
+    fn delete_word(&mut self, forward: bool) -> Result<CommandResult, EditorDocumentError> {
+        if self.presentation.selections.table_columns().is_some() {
+            return self.execute(EditorCommand::DeleteSelections);
+        }
         let snapshot = self.snapshot();
-        let mut ranges = Vec::with_capacity(self.selections.len());
-        for selection in self.selections.as_slice() {
+        let mut ranges = self
+            .presentation
+            .selections
+            .as_slice()
+            .iter()
+            .map(|selection| {
+                if !selection.is_empty() {
+                    return Ok(selection.ordered_range());
+                }
+                let from = selection.focus();
+                let target = self.word_target(&snapshot, from, forward)?;
+                Ok(TextRange::new(from.min(target), from.max(target))
+                    .expect("ordered word deletion"))
+            })
+            .collect::<Result<Vec<_>, EditorDocumentError>>()?;
+        ranges.retain(|range| !range.is_empty());
+        if ranges.is_empty() {
+            return Ok(self.command_result(false));
+        }
+        // A later caret can reach behind an earlier selected range. Merge the
+        // source union before editing; caret order alone does not sort these ranges.
+        ranges.sort_by_key(|range| range.start());
+        let mut merged: Vec<TextRange> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut()
+                && range.start() <= last.end()
+            {
+                *last = TextRange::new(last.start(), last.end().max(range.end())).expect("union");
+            } else {
+                merged.push(range);
+            }
+        }
+        let transaction = Transaction::new(
+            snapshot.revision(),
+            merged
+                .into_iter()
+                .map(|range| yu_text::Edit::new(range, "")),
+        );
+        self.state.history.break_group();
+        // Pure deletions map all original selections/carets to their surviving
+        // boundaries. History records the original set, not the merged edit union.
+        let result = self
+            .apply_transaction_with_group(&transaction, HistoryGroup::Deletion)
+            .map(|_| self.command_result(true));
+        self.state.history.break_group();
+        result
+    }
+
+    fn delete_forward(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        if self.presentation.selections.table_columns().is_some() {
+            return self.execute(EditorCommand::DeleteSelections);
+        }
+
+        let snapshot = self.snapshot();
+        let mut ranges = Vec::with_capacity(self.presentation.selections.len());
+        for selection in self.presentation.selections.as_slice() {
             ranges.push(if selection.is_empty() {
                 let end = next_grapheme_boundary(&snapshot, selection.focus())?;
-                TextRange::new(selection.focus(), end)
-                    .expect("next grapheme boundary must follow caret")
+                self.table_atom_deletion_range(
+                    TextRange::new(selection.focus(), end)
+                        .expect("next grapheme boundary must follow caret"),
+                    true,
+                )?
             } else {
                 selection.ordered_range()
             });
@@ -2408,15 +1391,97 @@ impl EditorDocument {
         ranges: Vec<TextRange>,
         group: HistoryGroup,
     ) -> Result<CommandResult, EditorDocumentError> {
+        // Two source carets can address the same projected escape atom.
+        // Delete its bytes once, retaining one mapped target per selection.
+        let mut previous_end = ByteOffset::ZERO;
         let edits = ranges
             .into_iter()
-            .map(|range| (range, Arc::<str>::from("")))
+            .map(|range| {
+                let start = range.start().max(previous_end);
+                let end = range.end().max(start);
+                previous_end = end;
+                (
+                    TextRange::new(start, end).expect("ordered deletion"),
+                    Arc::<str>::from(""),
+                )
+            })
             .collect();
         self.apply_selection_edits(edits, group, CollapseTo::Start)
     }
 
+    fn horizontal_grapheme_target(
+        &self,
+        snapshot: &TextSnapshot,
+        from: ByteOffset,
+        forward: bool,
+    ) -> Result<ByteOffset, EditorDocumentError> {
+        let target = if forward {
+            next_grapheme_boundary(snapshot, from)?
+        } else {
+            previous_grapheme_boundary(snapshot, from)?
+        };
+        let range = TextRange::new(from.min(target), from.max(target)).expect("ordered step");
+        let atom = self.table_atom_deletion_range(range, forward)?;
+        Ok(if forward { atom.end() } else { atom.start() })
+    }
+
+    fn extend_horizontal(
+        &mut self,
+        forward: bool,
+        word: bool,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let mut targets = Vec::with_capacity(self.presentation.selections.len());
+        for selection in self.presentation.selections.as_slice() {
+            let focus = if word {
+                self.word_target(&snapshot, selection.focus(), forward)?
+            } else {
+                self.horizontal_grapheme_target(&snapshot, selection.focus(), forward)?
+            };
+            targets.push(EditorSelection::range(
+                &snapshot,
+                selection.anchor(),
+                focus,
+                crate::CaretAffinity::Downstream,
+            )?);
+        }
+        self.state.history.break_group();
+        self.presentation.selections = Selections::new(
+            &snapshot,
+            targets,
+            self.presentation.selections.primary_index(),
+        )?;
+        Ok(self.command_result(false))
+    }
+
+    fn move_document_boundary(
+        &mut self,
+        end: bool,
+        extend: bool,
+    ) -> Result<CommandResult, EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let focus = if end {
+            snapshot.len_bytes()
+        } else {
+            ByteOffset::ZERO
+        };
+        let anchor = if extend {
+            self.selection().anchor()
+        } else {
+            focus
+        };
+        self.set_single_selection(EditorSelection::range(
+            &snapshot,
+            anchor,
+            focus,
+            crate::CaretAffinity::Downstream,
+        )?);
+        self.state.history.break_group();
+        Ok(self.command_result(false))
+    }
+
     fn move_left(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        self.history.break_group();
+        self.state.history.break_group();
         self.move_horizontal(false)
     }
 
@@ -2426,15 +1491,11 @@ impl EditorDocument {
     /// 插入会被 `validate_edits` 拒掉。收敛点仍然只有 `Selections` 一个。
     fn move_horizontal(&mut self, forward: bool) -> Result<CommandResult, EditorDocumentError> {
         let snapshot = self.snapshot();
-        let primary = self.selections.primary_index();
-        let mut targets = Vec::with_capacity(self.selections.len());
-        for selection in self.selections.as_slice() {
+        let primary = self.presentation.selections.primary_index();
+        let mut targets = Vec::with_capacity(self.presentation.selections.len());
+        for selection in self.presentation.selections.as_slice() {
             let target = if selection.is_empty() {
-                if forward {
-                    next_grapheme_boundary(&snapshot, selection.focus())?
-                } else {
-                    previous_grapheme_boundary(&snapshot, selection.focus())?
-                }
+                self.horizontal_grapheme_target(&snapshot, selection.focus(), forward)?
             } else if forward {
                 selection.ordered_range().end()
             } else {
@@ -2446,7 +1507,7 @@ impl EditorDocument {
                 crate::CaretAffinity::Downstream,
             )?);
         }
-        self.selections = Selections::new(&snapshot, targets, primary)?;
+        self.presentation.selections = Selections::new(&snapshot, targets, primary)?;
         Ok(self.command_result(false))
     }
 
@@ -2456,8 +1517,23 @@ impl EditorDocument {
     /// 不同的表里就没有第二个答案可选。落点是一个光标，所以这条命令顺带把
     /// 选区塌回一条——那正是该有的行为。
     fn move_table_cell(&mut self, previous: bool) -> Result<CommandResult, EditorDocumentError> {
-        self.history.break_group();
+        self.state.history.break_group();
         let Some(target) = self.table_cell_navigation_target(previous) else {
+            if !previous && let Some((at, insertion, focus)) = self.table_append_at_focus() {
+                let transaction = Transaction::new(
+                    self.revision(),
+                    [yu_text::Edit::new(TextRange::empty(at), insertion)],
+                );
+                let applied =
+                    self.apply_transaction_with_group(&transaction, HistoryGroup::TableEditing)?;
+                self.set_edit_selection(EditorSelection::cursor(
+                    applied.result_snapshot(),
+                    focus,
+                    crate::CaretAffinity::Downstream,
+                )?);
+                self.state.history.break_group();
+                return Ok(self.command_result(true));
+            }
             return Ok(self.command_result(false));
         };
         self.set_single_selection(EditorSelection::cursor(
@@ -2465,16 +1541,15 @@ impl EditorDocument {
             target,
             crate::CaretAffinity::Downstream,
         )?);
-        self.preferred_x = None;
+        self.state.preferred_x = None;
         Ok(self.command_result(false))
     }
 
     fn table_cell_navigation_target(&self, previous: bool) -> Option<ByteOffset> {
         let focus = self.selection().focus();
         let block_index = self.block_index_for_offset(focus)?;
-        let block = self.markdown.blocks().get(block_index)?;
-        let snapshot = self.snapshot();
-        let table = yu_markdown::parse_table_in_snapshot(&snapshot, block.range())?;
+        let block = self.presentation.markdown.blocks().get(block_index)?;
+        let table = yu_markdown::table_for_block(&self.presentation.markdown, block)?;
         let offset = usize::try_from(focus.get()).ok()?;
         let current = table.visible_cell_for_source(offset)?;
         let (_, target) = if previous {
@@ -2485,18 +1560,69 @@ impl EditorDocument {
         ByteOffset::try_from(target.start()).ok()
     }
 
+    /// Appends only new source bytes; existing row spelling and alignment stay intact.
+    /// Use the final physical row's container prefix (the delimiter for an empty
+    /// table), so a list's opening marker is never duplicated on continuation.
+    fn table_append_at_focus(&self) -> Option<(ByteOffset, String, ByteOffset)> {
+        let block = self
+            .presentation
+            .markdown
+            .blocks()
+            .get(self.block_index_for_offset(self.selection().focus())?)?;
+        let table = yu_markdown::table_for_block(&self.presentation.markdown, block)?;
+        let current = table.visible_cell_for_source(self.selection().focus().get() as usize)?;
+        if current.row() + 1 != table.visible_row_count()
+            || current.column() + 1 != table.column_count()
+        {
+            return None;
+        }
+        let snapshot = self.snapshot();
+        let source = snapshot.as_str();
+        let row = table.row_ranges().last()?;
+        let first = table
+            .rows()
+            .last()
+            .map_or(table.delimiter(), Vec::as_slice)
+            .first()?;
+        let prefix = source.get(row.start()..first.start())?.split('|').next()?;
+        let end = table.source_range().end();
+        let tail = source.get(row.end()..end)?;
+        let newline = if source
+            .get(table.source_range().start()..end)?
+            .contains("\r\n")
+        {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let mut insertion = String::new();
+        if tail.is_empty() {
+            insertion.push_str(newline);
+        }
+        insertion.push_str(prefix);
+        insertion.push('|');
+        let focus = ByteOffset::try_from(end.checked_add(insertion.len())?).ok()?;
+        for _ in 0..table.column_count() {
+            insertion.push_str("  |");
+        }
+        if !tail.is_empty() {
+            insertion.push_str(newline);
+        }
+        Some((ByteOffset::try_from(end).ok()?, insertion, focus))
+    }
+
     fn move_right(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        self.history.break_group();
+        self.state.history.break_group();
         self.move_horizontal(true)
     }
 
     fn move_word_left(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        self.history.break_group();
+        self.state.history.break_group();
         self.move_word(false)
     }
 
     fn move_word_right(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        self.history.break_group();
+        self.state.history.break_group();
         self.move_word(true)
     }
 
@@ -2506,14 +1632,14 @@ impl EditorDocument {
     /// [`Self::word_target`] 一家算，两个方向共用同一份行/词边界处理。
     fn move_word(&mut self, forward: bool) -> Result<CommandResult, EditorDocumentError> {
         let snapshot = self.snapshot();
-        let primary = self.selections.primary_index();
-        let mut targets = Vec::with_capacity(self.selections.len());
-        for selection in self.selections.as_slice() {
+        let primary = self.presentation.selections.primary_index();
+        let mut targets = Vec::with_capacity(self.presentation.selections.len());
+        for selection in self.presentation.selections.as_slice() {
             let target = if !selection.is_empty() {
                 let range = selection.ordered_range();
                 if forward { range.end() } else { range.start() }
             } else {
-                Self::word_target(&snapshot, selection.focus(), forward)?
+                self.word_target(&snapshot, selection.focus(), forward)?
             };
             targets.push(EditorSelection::cursor(
                 &snapshot,
@@ -2521,16 +1647,20 @@ impl EditorDocument {
                 crate::CaretAffinity::Downstream,
             )?);
         }
-        self.selections = Selections::new(&snapshot, targets, primary)?;
+        self.presentation.selections = Selections::new(&snapshot, targets, primary)?;
         Ok(self.command_result(false))
     }
 
     /// 一个光标按词移动的落点：先在本行里找，找不到就跨到相邻那一行。
     fn word_target(
+        &self,
         snapshot: &TextSnapshot,
         focus: ByteOffset,
         forward: bool,
     ) -> Result<ByteOffset, EditorDocumentError> {
+        if let Some(target) = self.table_word_target(focus, forward)? {
+            return Ok(target);
+        }
         let line_index = snapshot.line_index(focus)?;
         let line = source_line(snapshot, focus)?;
         let relative = byte_distance(line.start, focus)?.min(line.content.len());
@@ -2601,7 +1731,7 @@ impl EditorDocument {
         config: LayoutConfig,
         shaper: &S,
     ) -> Result<CommandResult, EditorDocumentError> {
-        self.last_source_change = None;
+        self.state.last_source_change = None;
         let direction = if up {
             VerticalDirection::Up
         } else {
@@ -2622,14 +1752,21 @@ impl EditorDocument {
     where
         F: FnMut(&mut Self, usize, LayoutConfig) -> Result<BlockView, EditorDocumentError>,
     {
-        self.history.break_group();
+        self.state.history.break_group();
 
         // 不扩展时，非空选区先塌到那一头——每一条各塌各的。
-        if !extend && self.selections.as_slice().iter().any(|s| !s.is_empty()) {
+        if !extend
+            && self
+                .presentation
+                .selections
+                .as_slice()
+                .iter()
+                .any(|s| !s.is_empty())
+        {
             let snapshot = self.snapshot();
-            let primary = self.selections.primary_index();
-            let mut collapsed = Vec::with_capacity(self.selections.len());
-            for selection in self.selections.as_slice() {
+            let primary = self.presentation.selections.primary_index();
+            let mut collapsed = Vec::with_capacity(self.presentation.selections.len());
+            for selection in self.presentation.selections.as_slice() {
                 let range = selection.ordered_range();
                 let target = match direction {
                     VerticalDirection::Up => range.start(),
@@ -2641,8 +1778,8 @@ impl EditorDocument {
                     crate::CaretAffinity::Downstream,
                 )?);
             }
-            self.selections = Selections::new(&snapshot, collapsed, primary)?;
-            self.preferred_x = None;
+            self.presentation.selections = Selections::new(&snapshot, collapsed, primary)?;
+            self.state.preferred_x = None;
             return Ok(self.command_result(false));
         }
 
@@ -2654,16 +1791,16 @@ impl EditorDocument {
         //
         // 还债条件：做「⌥⌘↑ 在上方加一个光标」时本来就要按光标存列，那时把
         // `Cursor { selection, preferred_x }` 建起来，这一段跟着删。
-        let multiple = self.selections.is_multiple();
+        let multiple = self.presentation.selections.is_multiple();
         let sticky = if multiple {
             None
         } else {
-            self.preferred_x.map(PreferredCaretX::value)
+            self.state.preferred_x.map(PreferredCaretX::value)
         };
 
         let source = self.snapshot();
-        let primary = self.selections.primary_index();
-        let selections: Vec<_> = self.selections.as_slice().to_vec();
+        let primary = self.presentation.selections.primary_index();
+        let selections: Vec<_> = self.presentation.selections.as_slice().to_vec();
         let mut moved = Vec::with_capacity(selections.len());
         let mut primary_x = None;
         let mut any_moved = false;
@@ -2695,8 +1832,8 @@ impl EditorDocument {
         if !any_moved {
             return Ok(self.command_result(false));
         }
-        self.selections = Selections::new(&source, moved, primary)?;
-        self.preferred_x = if multiple {
+        self.presentation.selections = Selections::new(&source, moved, primary)?;
+        self.state.preferred_x = if multiple {
             None
         } else {
             primary_x.map(PreferredCaretX::new)
@@ -2730,7 +1867,7 @@ impl EditorDocument {
             crate::CaretAffinity::Upstream => Bias::Before,
             crate::CaretAffinity::Downstream => Bias::After,
         };
-        let block_count = self.markdown.blocks().len();
+        let block_count = self.presentation.markdown.blocks().len();
         let (current_x, target_block) = {
             let layout = load_layout(self, block_index, config)?;
             let caret = layout.caret_for_source(focus, projection_bias)?;
@@ -2777,34 +1914,11 @@ impl EditorDocument {
         Ok(Some((next, desired_x)))
     }
 
-    fn block_index_for_offset(&self, offset: ByteOffset) -> Option<usize> {
-        let mut ending_at_offset = None;
-        for (index, block) in self.markdown.blocks().iter().enumerate() {
-            let range = block.range();
-            if range.contains(offset) {
-                return Some(index);
-            }
-            if range.end() == offset {
-                ending_at_offset = Some(index);
-            }
-            if range.is_empty() && range.start() == offset {
-                return Some(index);
-            }
-        }
-        ending_at_offset
-    }
-
-    fn selection_projection_bias(&self) -> Bias {
-        match self.selection().affinity() {
-            crate::CaretAffinity::Upstream => Bias::Before,
-            crate::CaretAffinity::Downstream => Bias::After,
-        }
-    }
-
     /// 有没有哪一条选区在这个方向上动得了。判据与 [`Self::command_available`]
     /// 的横向那几条同形。
     fn vertical_command_available(&self, direction: VerticalDirection) -> bool {
-        self.selections
+        self.presentation
+            .selections
             .as_slice()
             .iter()
             .any(|selection| self.vertical_available_for(*selection, direction))
@@ -2821,13 +1935,13 @@ impl EditorDocument {
         let Some(block_index) = self.block_index_for_offset(selection.focus()) else {
             return false;
         };
-        let Some(block) = self.markdown.blocks().get(block_index) else {
+        let Some(block) = self.presentation.markdown.blocks().get(block_index) else {
             return false;
         };
         match direction {
             VerticalDirection::Up => block_index > 0 || selection.focus() > block.range().start(),
             VerticalDirection::Down => {
-                block_index.saturating_add(1) < self.markdown.blocks().len()
+                block_index.saturating_add(1) < self.presentation.markdown.blocks().len()
                     || selection.focus() < block.range().end()
             }
         }
@@ -2838,12 +1952,12 @@ impl EditorDocument {
             self.revision(),
             self.selection(),
             changed,
-            self.last_source_change,
+            self.state.last_source_change,
         )
     }
 
     fn list_prefix(&self, line: &SourceLine) -> Option<ListLinePrefix> {
-        let blocks = self.markdown.blocks();
+        let blocks = self.presentation.markdown.blocks();
         let mut low = 0_usize;
         let mut high = blocks.len();
         while low < high {
@@ -3103,6 +2217,7 @@ fn byte_distance(
 pub enum EditorDocumentError {
     /// A worker request was superseded during viewport measurement.
     Cancelled,
+    InvalidTablePaste,
     Composition(CompositionError),
     Edit(EditError),
     Layout(LayoutError),
@@ -3129,6 +2244,9 @@ impl fmt::Display for EditorDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => formatter.write_str("viewport preparation cancelled"),
+            Self::InvalidTablePaste => {
+                formatter.write_str("invalid table paste shape, target, or cell source")
+            }
             Self::Composition(error) => error.fmt(formatter),
             Self::Edit(error) => error.fmt(formatter),
             Self::Layout(error) => error.fmt(formatter),
@@ -3172,7 +2290,8 @@ impl Error for EditorDocumentError {
             | Self::BlockNotTaskList { .. }
             | Self::CompositionNotActive
             | Self::CompositionActive
-            | Self::Cancelled => None,
+            | Self::Cancelled
+            | Self::InvalidTablePaste => None,
         }
     }
 }
@@ -3234,16 +2353,34 @@ impl From<SelectionError> for EditorDocumentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout_tokens::LINE_HEIGHT_BODY;
+
+    #[test]
+    fn paragraph_cache_does_not_reuse_a_different_theme_or_direction() {
+        let mut document = EditorDocument::new("Theme paragraph");
+        let config = LayoutConfig::new(320.0, 16.0);
+        document.block_layout(0, config).expect("Github layout");
+        let builds = document.layout_cache_stats().builds();
+        document
+            .block_layout(0, config.with_theme(yu_core::ThemeId::Night))
+            .expect("Night layout");
+        assert_eq!(document.layout_cache_stats().builds(), builds + 1);
+        document
+            .block_layout(0, config.with_base_direction(yu_layout::BaseDirection::Rtl))
+            .expect("RTL layout");
+        assert_eq!(document.layout_cache_stats().builds(), builds + 2);
+        document
+            .block_layout(0, config)
+            .expect("retained Github layout");
+        assert_eq!(document.layout_cache_stats().builds(), builds + 2);
+    }
 
     #[test]
     fn render_snapshot_reuse_is_bound_to_worker_document_identity_and_revision() {
         let document = EditorDocument::new("worker cache");
         let snapshot = document.capture_render_snapshot();
-        let worker = snapshot
-            .clone()
-            .into_document()
-            .expect("snapshot should reconstruct a worker document");
-        assert!(snapshot.can_reuse_worker_document(&worker));
+        let worker = snapshot.clone().into_layout_context();
+        assert!(snapshot.can_reuse_layout_context(&worker));
 
         let mut edited = document;
         edited
@@ -3253,8 +2390,8 @@ mod tests {
             ))
             .expect("edit should apply");
         let edited_snapshot = edited.capture_render_snapshot();
-        assert!(!snapshot.can_reuse_worker_document(&edited));
-        assert!(!edited_snapshot.can_reuse_worker_document(&worker));
+        assert!(!snapshot.can_reuse_layout_context(&edited));
+        assert!(!edited_snapshot.can_reuse_layout_context(&worker));
     }
     use crate::table::{TableResizeGesture, TableResizeTarget};
     use crate::{EditorKey, KeyModifiers, SourceSync};
@@ -3313,15 +2450,318 @@ mod tests {
         );
 
         set_caret(&mut document, source.rfind('2').expect("last cell"));
-        assert_eq!(
-            document
-                .route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE))
-                .expect("last-cell tab route"),
-            KeyRouteResult::Unhandled
+        assert!(
+            matches!(document.route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE))
+            .expect("last-cell tab route"), KeyRouteResult::Executed(result) if result.changed())
         );
+        assert_eq!(document.snapshot().as_str(), format!("{source}|  |  |\n"));
         assert_eq!(
             document.selection().focus(),
-            ByteOffset::new(source.rfind('2').expect("last cell") as u64)
+            ByteOffset::new(source.len() as u64 + 1)
+        );
+        document
+            .execute(EditorCommand::undo())
+            .expect("undo new row");
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+
+    #[test]
+    fn nested_table_navigation_uses_the_same_cells_as_presentation() {
+        for (intro, prefix) in [
+            ("", "> "),
+            ("", "> > "),
+            ("- intro\n\n", "  "),
+            ("- intro\n\n", "  > "),
+        ] {
+            let source = format!(
+                "{intro}{prefix}| A | B |\n{prefix}| --- | --- |\n{prefix}| 中 | 😀 |\n\nafter\n"
+            );
+            let mut document = EditorDocument::new(source.clone());
+            let cells: Vec<_> = ["A", "B", "中", "😀"]
+                .iter()
+                .map(|label| source.find(label).expect("cell"))
+                .collect();
+            set_caret(&mut document, cells[0]);
+            for &offset in cells.iter().skip(1) {
+                assert!(
+                    matches!(
+                        document
+                            .route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::NONE))
+                            .expect("tab"),
+                        KeyRouteResult::Executed(_)
+                    ),
+                    "{prefix:?}"
+                );
+                assert_eq!(
+                    document.selection().focus().get() as usize,
+                    offset,
+                    "{prefix:?}"
+                );
+            }
+            for &offset in cells.iter().rev().skip(1) {
+                assert!(
+                    matches!(
+                        document
+                            .route_key(KeyEvent::new(EditorKey::Tab, KeyModifiers::SHIFT))
+                            .expect("shift tab"),
+                        KeyRouteResult::Executed(_)
+                    ),
+                    "{prefix:?}"
+                );
+                assert_eq!(
+                    document.selection().focus().get() as usize,
+                    offset,
+                    "{prefix:?}"
+                );
+            }
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+    }
+
+    #[test]
+    fn table_cell_pipe_input_remains_literal_and_undoable() {
+        for prefix in ["", "> ", "> > "] {
+            let source = format!("{prefix}| A | B |\n{prefix}| --- | --- |\n{prefix}| x | y |\n");
+            let mut document = EditorDocument::new(source.clone());
+            let at = source.find('x').expect("cell") + 1;
+            set_caret(&mut document, at);
+            document
+                .execute(EditorCommand::insert_text("|羽"))
+                .expect("input");
+            let expected = source.replacen("x |", "x\\|羽 |", 1);
+            assert_eq!(document.snapshot().as_str(), expected);
+            let layout = document
+                .block_layout(0, LayoutConfig::new(320.0, 16.0))
+                .expect("layout");
+            assert_eq!(
+                layout
+                    .table()
+                    .expect("table survives pipe input")
+                    .column_widths()
+                    .len(),
+                2
+            );
+            assert!(layout.visual().text().contains("x|羽"));
+            assert!(!layout.visual().text().contains("\\|"));
+            document.execute(EditorCommand::undo()).expect("undo");
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+    }
+
+    #[test]
+    fn table_pipe_composition_commit_and_cancel_preserve_source() {
+        let source = "> | A | B |
+> | --- | --- |
+> | x | y |
+";
+        let mut document = EditorDocument::new(source);
+        let at = ByteOffset::new((source.find('x').expect("cell") + 1) as u64);
+        set_caret(&mut document, at.get() as usize);
+        document
+            .begin_composition(
+                TextRange::empty(at),
+                "|中",
+                Utf16Range::empty(yu_core::Utf16Offset::new(2)),
+            )
+            .expect("preedit");
+        assert_eq!(document.snapshot().as_str(), source);
+        assert!(document.cancel_composition());
+        assert_eq!(document.snapshot().as_str(), source);
+        document
+            .begin_composition(
+                TextRange::empty(at),
+                "|中",
+                Utf16Range::empty(yu_core::Utf16Offset::new(2)),
+            )
+            .expect("preedit");
+        document.commit_composition("|中").expect("commit");
+        assert_eq!(
+            document.snapshot().as_str(),
+            source.replace("x |", r"x\|中 |")
+        );
+        assert_eq!(
+            document.selection().focus().get(),
+            at.get() + r"\|中".len() as u64
+        );
+        document.execute(EditorCommand::undo()).expect("undo");
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+
+    #[test]
+    fn table_pipe_encoding_is_per_selection_and_preserves_existing_escapes() {
+        let source = "| A | B |
+| --- | --- |
+| x | y |
+
+outside
+";
+        for (input, encoded) in [
+            ("|e", r"\|e"),
+            (r"\|e", r"\|e"),
+            ("`a|b`", "`a|b`"),
+            ("``a`|b``", "``a`|b``"),
+            (r"`a\|b`", r"`a\|b`"),
+        ] {
+            let mut document = EditorDocument::new(source);
+            let snapshot = document.snapshot();
+            let offsets = [
+                source.find('x').expect("cell") + 1,
+                source.find("outside").expect("prose"),
+            ];
+            let selections = offsets.map(|offset| {
+                EditorSelection::cursor(
+                    &snapshot,
+                    ByteOffset::new(offset as u64),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("caret")
+            });
+            document.set_selections(selections, 1).expect("selections");
+            document
+                .execute(EditorCommand::insert_text(input))
+                .expect("input");
+            assert_eq!(
+                document.snapshot().as_str(),
+                source
+                    .replacen("x |", &format!("x{encoded} |"), 1)
+                    .replacen("outside", &format!("{input}outside"), 1)
+            );
+            let layout = document
+                .block_layout(0, LayoutConfig::new(320.0, 16.0))
+                .expect("layout");
+            assert_eq!(layout.table().expect("table").column_widths().len(), 2);
+            assert_eq!(
+                layout.visual().text().contains('\\'),
+                input.starts_with('`') && input.contains('\\')
+            );
+            document.execute(EditorCommand::undo()).expect("undo");
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+    }
+
+    #[test]
+    fn table_backslash_before_separator_stays_in_its_cell() {
+        for prefix in ["", "> ", "> > "] {
+            for newline in ["\n", "\r\n"] {
+                let source = format!(
+                    "{prefix}|A|B|{newline}{prefix}|---|---|{newline}{prefix}|x|y|{newline}"
+                );
+                let mut document = EditorDocument::new(source.clone());
+                let at = source.find('x').expect("cell") + 1;
+                set_caret(&mut document, at);
+                for (encoded, visible) in [(r"x\\|", "x\\y"), (r"x\\\\|", "x\\\\y")] {
+                    document
+                        .execute(EditorCommand::insert_text("\\"))
+                        .expect("input");
+                    assert_eq!(document.snapshot().as_str(), source.replace("x|", encoded));
+                    let layout = document
+                        .block_layout(0, LayoutConfig::new(320.0, 16.0))
+                        .expect("layout");
+                    assert_eq!(
+                        layout
+                            .table()
+                            .expect("table survives")
+                            .column_widths()
+                            .len(),
+                        2
+                    );
+                    assert!(layout.visual().text().contains(visible));
+                }
+                let current = document.snapshot().as_str().to_string();
+                document
+                    .execute(EditorCommand::move_table_cell_next())
+                    .expect("next cell");
+                assert_eq!(
+                    document.selection().focus().get() as usize,
+                    current.find('y').expect("next cell")
+                );
+                document
+                    .execute(EditorCommand::undo())
+                    .expect("undo typing group");
+                assert_eq!(document.snapshot().as_str(), source);
+            }
+        }
+    }
+
+    #[test]
+    fn table_escape_deletion_is_one_visible_character_and_undoable() {
+        for prefix in ["", "> ", "> > "] {
+            for escaped in [r"\|", r"\\", r"\*"] {
+                for forward in [false, true] {
+                    let source =
+                        format!("{prefix}|A|B|\n{prefix}|---|---|\n{prefix}|x{escaped}|y|\n");
+                    let mut document = EditorDocument::new(source.clone());
+                    let start = source.find('x').expect("cell") + 1;
+                    set_caret(
+                        &mut document,
+                        if forward {
+                            start
+                        } else {
+                            start + escaped.len()
+                        },
+                    );
+                    document
+                        .execute(if forward {
+                            EditorCommand::DeleteForward
+                        } else {
+                            EditorCommand::DeleteBackward
+                        })
+                        .expect("delete escape");
+                    assert_eq!(document.snapshot().as_str(), source.replace(escaped, ""));
+                    assert_eq!(document.selection().focus().get() as usize, start);
+                    assert_eq!(
+                        document
+                            .block_layout(0, LayoutConfig::new(320.0, 16.0))
+                            .expect("layout")
+                            .table()
+                            .expect("table")
+                            .column_widths()
+                            .len(),
+                        2
+                    );
+                    document.execute(EditorCommand::undo()).expect("undo");
+                    assert_eq!(document.snapshot().as_str(), source);
+                    document.execute(EditorCommand::redo()).expect("redo");
+                    assert_eq!(document.snapshot().as_str(), source.replace(escaped, ""));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_escape_deletion_preserves_code_and_merges_duplicate_targets() {
+        let source = "|A|B|\n|---|---|\n|x\\|z|`c\\|d`|\n";
+        let mut document = EditorDocument::new(source);
+        let start = source.find("\\|").expect("escape");
+        let snapshot = document.snapshot();
+        let selections = [start, start + 1].map(|offset| {
+            EditorSelection::cursor(
+                &snapshot,
+                ByteOffset::new(offset as u64),
+                crate::CaretAffinity::Downstream,
+            )
+            .expect("caret")
+        });
+        document.set_selections(selections, 1).expect("selections");
+        document
+            .execute(EditorCommand::DeleteForward)
+            .expect("delete shared atom");
+        assert_eq!(document.snapshot().as_str(), source.replacen("\\|", "", 1));
+        assert_eq!(document.selections().len(), 1);
+        assert_eq!(document.selection().focus().get() as usize, start);
+        document.execute(EditorCommand::undo()).expect("undo");
+        assert_eq!(document.snapshot().as_str(), source);
+        assert_eq!(document.selections().len(), 2);
+        assert_eq!(document.selections().primary_index(), 1);
+        let code_pipe = source.rfind('|').expect("last separator");
+        let code_escape = source[..code_pipe].rfind("\\|").expect("code escape");
+        set_caret(&mut document, code_escape);
+        document
+            .execute(EditorCommand::DeleteForward)
+            .expect("code slash");
+        assert_eq!(
+            document.snapshot().as_str(),
+            source.replacen("`c\\|d`", "`c|d`", 1)
         );
     }
 
@@ -3335,7 +2775,7 @@ mod tests {
             .expect("table layout")
             .table()
             .expect("table metadata")
-            .resize_hit_test(LayoutPoint::new(3.0, 0.5), 0.0)
+            .resize_hit_test(LayoutPoint::new(10.0, 0.5), 0.0)
             .expect("resize hit-test")
             .expect("column divider");
         assert_eq!(hit.target(), TableResizeTarget::Column { index: 0 });
@@ -3349,13 +2789,13 @@ mod tests {
 
         assert_eq!(
             resized.table().expect("resized table").column_widths(),
-            &[4.0, 2.0]
+            &[11.0, 9.0]
         );
         assert_eq!(
             resized.table().expect("resized table").cells()[1]
                 .bounds()
                 .x(),
-            4.0
+            11.0
         );
         assert_eq!(document.snapshot().as_str(), source);
         assert_eq!(document.revision(), revision);
@@ -3367,7 +2807,7 @@ mod tests {
                 .table()
                 .expect("canonical table metadata")
                 .column_widths(),
-            &[3.0, 3.0]
+            &[10.0, 10.0]
         );
 
         document
@@ -3427,6 +2867,227 @@ mod tests {
                 )],
             ))
         }
+    }
+
+    #[test]
+    fn long_document_evicts_geometry_without_losing_heights_or_publications() {
+        let source = (0..700)
+            .map(|i| format!("paragraph {i} 中文 text\n\n"))
+            .collect::<String>();
+        let mut owner = EditorDocument::new(source.as_str());
+        owner
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(300.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("config");
+        let top = ViewportSpan::new(0.0, 100.0);
+        let original = owner
+            .prepare_layout_snapshot(top, &WideShaper)
+            .expect("first frame");
+        let first_lines = original
+            .block(0)
+            .expect("first paragraph")
+            .layout()
+            .lines()
+            .to_vec();
+        let mut worker = owner.capture_render_snapshot().into_layout_context();
+        for _ in 0..5000 {
+            if worker.viewport_stats().measured() == worker.viewport_stats().entries() {
+                break;
+            }
+            worker
+                .measure_background_paragraphs(&WideShaper, &|_| None, None, &mut || false)
+                .expect("batch");
+            let published = worker
+                .prepare_layout_snapshot(top, &WideShaper)
+                .expect("publish");
+            assert!(owner.adopt_layout_snapshot(published));
+            owner
+                .capture_render_snapshot()
+                .merge_into_layout_context(&mut worker);
+            assert!(owner.layout_cache_stats().entries() <= 256);
+            assert!(worker.layout_cache_stats().entries() <= 256);
+        }
+        assert_eq!(
+            worker.viewport_stats().measured(),
+            worker.viewport_stats().entries()
+        );
+        assert!(worker.layout_cache_stats().evicted() > 0);
+        let complete = worker
+            .prepare_layout_snapshot(top, &WideShaper)
+            .expect("complete");
+        let height = complete.content_height();
+        let tail = worker
+            .prepare_layout_snapshot(
+                ViewportSpan::new((height - 100.0).max(0.0), 100.0),
+                &WideShaper,
+            )
+            .expect("scroll to evicted paragraph");
+        assert_eq!(tail.content_height(), height);
+        assert_eq!(
+            worker
+                .prepare_layout_snapshot(top, &WideShaper)
+                .expect("return")
+                .content_height(),
+            height
+        );
+        assert_eq!(
+            original.block(0).expect("retained frame").layout().lines(),
+            first_lines
+        );
+        assert_eq!(worker.snapshot().as_str(), source);
+        assert_eq!(owner.snapshot().as_str(), source);
+    }
+
+    #[test]
+    fn published_geometry_survives_edits_and_rejects_changed_inputs() {
+        let mut owner = EditorDocument::new("# Heading\n\nparagraph\n\n```\ncode\n```\n");
+        owner
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(300.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("config");
+        let geometry = owner
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 500.0), &WideShaper)
+            .expect("snapshot");
+        let heading = geometry.block(0).expect("heading");
+        let caret = heading
+            .layout()
+            .caret_for_source(ByteOffset::ZERO, Bias::After)
+            .expect("caret");
+        let request = owner
+            .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 500.0), 4.0, &WideShaper)
+            .expect("scroll request");
+        assert_eq!(request.caret().height(), heading.caret_height(caret));
+        assert!(request.caret().height() > 16.0);
+        assert_eq!(
+            request.caret().y(),
+            heading.document_point(caret.point()).y()
+        );
+        let original = geometry.source().as_str().to_owned();
+        owner.set_resource_geometry_version(1);
+        assert!(!owner.adopt_layout_snapshot(Arc::clone(&geometry)));
+        owner.set_resource_geometry_version(0);
+        assert!(owner.adopt_layout_snapshot(Arc::clone(&geometry)));
+        owner
+            .execute(EditorCommand::insert_text("edit"))
+            .expect("edit");
+        assert!(!owner.adopt_layout_snapshot(Arc::clone(&geometry)));
+        assert_eq!(geometry.source().as_str(), original);
+        assert_eq!(geometry.revision(), Revision::INITIAL);
+        assert!(owner.current_layout_snapshot().is_none());
+    }
+
+    #[test]
+    fn cancelled_projection_never_replaces_a_completed_snapshot() {
+        for mode in 0..3 {
+            let source = if mode == 1 {
+                "# **Heading**\n\nsecond paragraph\n\nthird paragraph"
+            } else {
+                "first paragraph\n\nsecond paragraph\n\nthird paragraph"
+            };
+            let mut owner = EditorDocument::new(source);
+            owner
+                .set_viewport_config(ViewportConfig::new(
+                    LayoutConfig::new(300.0, 16.0),
+                    16.0,
+                    0.0,
+                ))
+                .expect("config");
+            if mode == 2 {
+                owner
+                    .begin_composition(
+                        TextRange::empty(ByteOffset::ZERO),
+                        "中文",
+                        utf16_range(2, 2),
+                    )
+                    .expect("composition");
+            }
+            let viewport = ViewportSpan::new(0.0, 500.0);
+            let completed = owner
+                .prepare_layout_snapshot(viewport, &WideShaper)
+                .expect("completed geometry");
+            let height = completed.content_height();
+            owner.set_resource_geometry_version(1);
+            let mut checks = 0;
+            let result = owner.prepare_layout_snapshot_with_images_cancelable(
+                viewport,
+                &WideShaper,
+                &|_| None,
+                None,
+                &mut || {
+                    checks += 1;
+                    checks >= 5
+                },
+            );
+            assert!(
+                matches!(result, Err(EditorDocumentError::Cancelled)),
+                "mode {mode}"
+            );
+            assert_eq!(checks, 5);
+            assert!(owner.current_layout_snapshot().is_none());
+            assert_eq!(completed.content_height(), height);
+            assert_eq!(completed.source().as_str(), source);
+            assert_eq!(owner.snapshot().as_str(), source);
+            let next = owner
+                .prepare_layout_snapshot(viewport, &WideShaper)
+                .expect("resume after cancellation");
+            assert_eq!(next.resource_geometry_version(), 1);
+            assert!(!Arc::ptr_eq(&completed, &next));
+        }
+    }
+
+    #[test]
+    fn ready_image_size_changes_replace_snapshot_and_move_following_paragraph() {
+        let mut owner = EditorDocument::new("![image](a.png)\n\nfollowing paragraph");
+        owner
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(300.0, 10.0),
+                10.0,
+                0.0,
+            ))
+            .expect("config");
+        let viewport = ViewportSpan::new(0.0, 500.0);
+        let first = owner
+            .prepare_layout_snapshot_with_images(
+                viewport,
+                &WideShaper,
+                &|_| ImageIntrinsicSize::new(40, 40).ok(),
+                None,
+            )
+            .expect("first image");
+        let source =
+            ByteOffset::new(owner.snapshot().as_str().find("following").expect("text") as u64);
+        let old_y = first
+            .block_for_source(source)
+            .expect("following block")
+            .content_y();
+        let next = owner
+            .prepare_layout_snapshot_with_images(
+                viewport,
+                &WideShaper,
+                &|_| ImageIntrinsicSize::new(40, 120).ok(),
+                None,
+            )
+            .expect("replacement image");
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert!(
+            next.block_for_source(source)
+                .expect("following block")
+                .content_y()
+                >= old_y + 79.0
+        );
+        assert_eq!(
+            first
+                .block_for_source(source)
+                .expect("retained block")
+                .content_y(),
+            old_y
+        );
     }
 
     #[test]
@@ -3640,13 +3301,13 @@ mod tests {
             .execute(EditorCommand::move_down())
             .expect("first vertical move should succeed");
         assert_eq!(document.selection().focus().get(), 13);
-        assert_eq!(document.preferred_x, Some(PreferredCaretX::new(10.0)));
+        assert_eq!(document.state.preferred_x, Some(PreferredCaretX::new(10.0)));
 
         document
             .execute(EditorCommand::move_down())
             .expect("second vertical move should preserve preferred x");
         assert_eq!(document.selection().focus().get(), 24);
-        assert_eq!(document.preferred_x, Some(PreferredCaretX::new(10.0)));
+        assert_eq!(document.state.preferred_x, Some(PreferredCaretX::new(10.0)));
         assert_eq!(document.revision(), revision);
         assert_eq!(document.snapshot().as_str(), source);
 
@@ -3657,7 +3318,7 @@ mod tests {
         document
             .execute(EditorCommand::MoveLeft)
             .expect("horizontal movement should clear preferred x");
-        assert_eq!(document.preferred_x, None);
+        assert_eq!(document.state.preferred_x, None);
     }
 
     #[test]
@@ -3672,13 +3333,13 @@ mod tests {
             .move_vertical_with_shaper(false, false, config, &WideShaper)
             .expect("shaped down should succeed");
         assert_eq!(document.selection().focus().get(), 13);
-        assert_eq!(document.preferred_x, Some(PreferredCaretX::new(20.0)));
+        assert_eq!(document.state.preferred_x, Some(PreferredCaretX::new(20.0)));
 
         document
             .move_vertical_with_shaper(false, false, config, &WideShaper)
             .expect("second shaped down should preserve preferred x");
         assert_eq!(document.selection().focus().get(), 24);
-        assert_eq!(document.preferred_x, Some(PreferredCaretX::new(20.0)));
+        assert_eq!(document.state.preferred_x, Some(PreferredCaretX::new(20.0)));
         assert_eq!(document.revision(), revision);
         assert_eq!(document.snapshot().as_str(), source);
     }
@@ -3879,6 +3540,207 @@ mod tests {
     }
 
     #[test]
+    fn fragment_paste_distributes_table_cells_and_isolates_history() {
+        for prefix in ["", "> ", "> > "] {
+            for eol in ["\n", "\r\n"] {
+                let source = format!(
+                    "{prefix}| A | B |{eol}{prefix}| --- | --- |{eol}{prefix}| x | y |{eol}"
+                );
+                let mut document = EditorDocument::new(source.clone());
+                let snapshot = document.snapshot();
+                let ranges = ['x', 'y'].map(|ch| {
+                    let start = source.find(ch).expect("cell") as u64;
+                    EditorSelection::range(
+                        &snapshot,
+                        ByteOffset::new(start + 1),
+                        ByteOffset::new(start),
+                        crate::CaretAffinity::Upstream,
+                    )
+                    .expect("reverse cell")
+                });
+                document.set_selections(ranges, 1).expect("targets");
+                document
+                    .execute(EditorCommand::PasteFragments(vec![
+                        "中文|羽".into(),
+                        "👨‍👩‍👧‍👦".into(),
+                    ]))
+                    .expect("paste");
+                let expected = source.replace('x', "中文\\|羽").replace('y', "👨‍👩‍👧‍👦");
+                assert_eq!(document.snapshot().as_str(), expected);
+                assert_eq!(document.selections().primary_index(), 1);
+                let layout = document
+                    .block_layout(0, LayoutConfig::new(320.0, 16.0))
+                    .expect("layout");
+                assert_eq!(
+                    layout
+                        .table()
+                        .expect("table preserved")
+                        .column_widths()
+                        .len(),
+                    2
+                );
+                assert!(layout.visual().text().contains("中文|羽"));
+                document
+                    .execute(EditorCommand::insert_text("!"))
+                    .expect("typing");
+                document
+                    .execute(EditorCommand::undo())
+                    .expect("undo typing only");
+                assert_eq!(document.snapshot().as_str(), expected);
+                document.execute(EditorCommand::undo()).expect("undo paste");
+                assert_eq!(document.snapshot().as_str(), source);
+                for (actual, original) in document.selections().as_slice().iter().zip(ranges) {
+                    assert_eq!(
+                        (actual.anchor(), actual.focus(), actual.affinity()),
+                        (original.anchor(), original.focus(), original.affinity())
+                    );
+                }
+                document.execute(EditorCommand::redo()).expect("redo paste");
+                assert_eq!(document.snapshot().as_str(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn fragment_paste_preserves_embedded_newlines_and_mismatch_fallback() {
+        let mut document = EditorDocument::new("x y");
+        let snapshot = document.snapshot();
+        let ranges = [(0, 1), (2, 3)].map(|(a, f)| {
+            EditorSelection::range(
+                &snapshot,
+                ByteOffset::new(a),
+                ByteOffset::new(f),
+                crate::CaretAffinity::Downstream,
+            )
+            .expect("range")
+        });
+        document.set_selections(ranges, 0).expect("targets");
+        document
+            .execute(EditorCommand::PasteFragments(vec![
+                "first\nsecond".into(),
+                "🪶\0tail".into(),
+            ]))
+            .expect("fragments");
+        assert_eq!(document.snapshot().as_str(), "first\nsecond 🪶\0tail");
+        document.execute(EditorCommand::undo()).expect("undo");
+        document
+            .execute(EditorCommand::PasteFragments(vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+            ]))
+            .expect("mismatch");
+        assert_eq!(document.snapshot().as_str(), "a\nb\nc a\nb\nc");
+        document.execute(EditorCommand::undo()).expect("undo");
+        document
+            .execute(EditorCommand::PasteFragments(Vec::new()))
+            .expect("empty payload");
+        assert_eq!(document.snapshot().as_str(), "x y");
+        document
+            .execute(EditorCommand::PasteFragments(vec!["".into(), "q".into()]))
+            .expect("empty fragment replaces only its target");
+        assert_eq!(document.snapshot().as_str(), " q");
+    }
+
+    #[test]
+    fn cut_selection_deletion_never_backspaces_empty_carets() {
+        let mut document = EditorDocument::new("ab cd ef");
+        let snapshot = document.snapshot();
+        let ranges = [(0, 2), (4, 4), (6, 8)].map(|(a, f)| {
+            EditorSelection::range(
+                &snapshot,
+                ByteOffset::new(a),
+                ByteOffset::new(f),
+                crate::CaretAffinity::Downstream,
+            )
+            .expect("selection")
+        });
+        document.set_selections(ranges, 1).expect("ranges");
+        assert!(document.command_available(&EditorCommand::DeleteSelections));
+        document
+            .execute(EditorCommand::DeleteSelections)
+            .expect("cut");
+        assert_eq!(document.snapshot().as_str(), " cd ");
+        assert_eq!(document.selection().focus().get(), 2);
+        document.execute(EditorCommand::undo()).expect("undo");
+        assert_eq!(document.snapshot().as_str(), "ab cd ef");
+        assert_eq!(
+            document.selections().as_slice(),
+            &ranges.map(|s| EditorSelection::range(
+                &document.snapshot(),
+                s.anchor(),
+                s.focus(),
+                s.affinity()
+            )
+            .expect("restored"))
+        );
+        document.execute(EditorCommand::redo()).expect("redo");
+        assert_eq!(document.snapshot().as_str(), " cd ");
+        assert!(!document.command_available(&EditorCommand::DeleteSelections));
+        let revision = document.revision();
+        document
+            .execute(EditorCommand::DeleteSelections)
+            .expect("empty cut");
+        assert_eq!(document.revision(), revision);
+    }
+
+    #[test]
+    fn grouped_history_restores_oriented_selections_and_edit_endpoints() {
+        fn endpoints(
+            document: &EditorDocument,
+        ) -> Vec<(ByteOffset, ByteOffset, crate::CaretAffinity)> {
+            document
+                .selections()
+                .as_slice()
+                .iter()
+                .map(|s| (s.anchor(), s.focus(), s.affinity()))
+                .collect()
+        }
+        let mut document = EditorDocument::new("ab cd");
+        let source = document.snapshot();
+        let ranges = [
+            EditorSelection::range(
+                &source,
+                ByteOffset::new(2),
+                ByteOffset::ZERO,
+                crate::CaretAffinity::Upstream,
+            )
+            .expect("reverse"),
+            EditorSelection::range(
+                &source,
+                ByteOffset::new(3),
+                ByteOffset::new(5),
+                crate::CaretAffinity::Downstream,
+            )
+            .expect("forward"),
+        ];
+        document.set_selections(ranges, 0).expect("selections");
+        let before = endpoints(&document);
+        document
+            .execute(EditorCommand::insert_text("羽"))
+            .expect("replace");
+        document
+            .execute(EditorCommand::insert_text("🪶"))
+            .expect("grouped insert");
+        let after = endpoints(&document);
+        let edited = document.snapshot().as_str().to_owned();
+        for _ in 0..3 {
+            set_caret(&mut document, 0);
+            document.execute(EditorCommand::undo()).expect("undo");
+            assert_eq!(document.snapshot().as_str(), "ab cd");
+            assert_eq!(endpoints(&document), before);
+            assert_eq!(document.selections().primary_index(), 0);
+            assert_eq!(document.selections().revision(), document.revision());
+            set_caret(&mut document, 5);
+            document.execute(EditorCommand::redo()).expect("redo");
+            assert_eq!(document.snapshot().as_str(), edited);
+            assert_eq!(endpoints(&document), after);
+            assert_eq!(document.selections().primary_index(), 0);
+            assert_eq!(document.selections().revision(), document.revision());
+        }
+    }
+
+    #[test]
     fn undo_groups_typing_and_redoes_in_forward_order() {
         let mut document = EditorDocument::new("");
         document
@@ -4035,6 +3897,71 @@ mod tests {
     }
 
     #[test]
+    fn preedit_in_a_source_separator_keeps_the_committed_paragraph_origin() {
+        for source in ["正文\n\n", "正文\n\n\n\n"] {
+            let mut document = EditorDocument::new(source);
+            let config = LayoutConfig::new(320.0, 16.0);
+            document
+                .set_viewport_config(ViewportConfig::new(config, 25.6, 0.0))
+                .expect("viewport");
+            set_caret(&mut document, source.len());
+            document
+                .begin_composition(
+                    TextRange::empty(ByteOffset::new(source.len() as u64)),
+                    "中文",
+                    utf16_range(2, 2),
+                )
+                .expect("preedit");
+            let index = document
+                .composition_block_index()
+                .expect("composition block");
+            let view = document
+                .visible_blocks_with_composition_and_shaper(
+                    ViewportSpan::new(0.0, 600.0),
+                    &WideShaper,
+                )
+                .expect("preedit viewport");
+            let before = view
+                .blocks()
+                .iter()
+                .find(|block| block.index() == index)
+                .expect("visible composition")
+                .y();
+            let paragraph = document
+                .block_layout_with_composition_and_shaper(index, config, &WideShaper)
+                .expect("preedit paragraph");
+            assert_eq!(paragraph.visual().text(), "中文");
+            assert_eq!(
+                paragraph.lines().len(),
+                1,
+                "source blanks must not prefix marked text with display lines"
+            );
+            assert_eq!(document.snapshot().as_str(), source);
+            document.commit_composition("中文").expect("commit");
+            let index = document
+                .block_index_for_offset(document.selection().focus())
+                .expect("committed block");
+            let view = document
+                .visible_blocks_with_visual_state_and_shaper(
+                    ViewportSpan::new(0.0, 600.0),
+                    &WideShaper,
+                )
+                .expect("committed viewport");
+            let after = view
+                .blocks()
+                .iter()
+                .find(|block| block.index() == index)
+                .expect("visible commit")
+                .y();
+            assert!(
+                (before - after).abs() < 0.01,
+                "composition moved vertically: {before} -> {after}"
+            );
+            assert_eq!(document.snapshot().as_str(), format!("{source}中文"));
+        }
+    }
+
+    #[test]
     fn composition_shaped_layout_uses_temporary_shape_coordinates() {
         let mut document = EditorDocument::new("hello");
         document
@@ -4116,7 +4043,11 @@ mod tests {
                 .blocks()
                 .iter()
                 .filter(|block| span.contains(&block.index()))
-                .all(|block| block.height() > 0.0)
+                .all(|block| if block.index() == span.start {
+                    block.height() > 0.0
+                } else {
+                    block.height() == 0.0
+                })
         );
         assert_eq!(document.snapshot().as_str(), source);
         assert_eq!(document.revision(), Revision::INITIAL);
@@ -4431,7 +4362,11 @@ prefix **羽🙂** suffix
     fn toggle_task_is_a_source_transaction_and_rebuilds_task_decorations() {
         let mut document = EditorDocument::new("- [ ] todo\n");
         let decorations = document.block_decorations(0).expect("任务项的装饰");
-        assert_eq!(hidden_spans(decorations), vec![(2, 5)], "`[ ]` 整个隐藏");
+        assert_eq!(
+            hidden_spans(decorations),
+            vec![(0, 6)],
+            "task prefix is replaced by a checkbox"
+        );
         assert_eq!(document.decoration_cache_stats().builds(), 1);
 
         let result = document
@@ -4697,6 +4632,23 @@ prefix **羽🙂** suffix
     }
 
     #[test]
+    fn code_control_placeholders_do_not_rewrite_source_or_prose() {
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        let source =
+            format!("{family}\n\n`{family}`\n\n```swift\nlet x = \"{family}\"\n\tend\n```\n");
+        let mut document = EditorDocument::new(&source);
+        let projected = document.visual_text().expect("projection");
+        assert_eq!(
+            projected.text().matches(family).count(),
+            2,
+            "prose and inline code stay joined"
+        );
+        assert!(projected.text().contains("👨•👩•👧•👦"));
+        assert!(projected.text().contains("\tend"), "tab remains a tab");
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+
+    #[test]
     fn cached_code_decorations_remap_when_a_prefix_edit_shifts_the_block() {
         let mut document = EditorDocument::new("intro\n\n```rust\n**code**\n```\n");
         let old_hidden = hidden_spans(document.block_decorations(2).expect("围栏代码块的装饰"));
@@ -4887,21 +4839,20 @@ prefix **羽🙂** suffix
         let metrics = document
             .visible_blocks(ViewportSpan::new(0.0, 2.0))
             .expect("metrics viewport should measure");
-        assert_eq!(metrics.blocks()[0].height(), 1.0);
+        assert_eq!(metrics.blocks()[0].height(), 1.8);
 
         let shaped = document
             .visible_blocks_with_shaper(ViewportSpan::new(0.0, 2.0), &WideShaper)
             .expect("shaped viewport should measure");
-        // 正文行高倍率 1.6（layout_tokens::LINE_HEIGHT_BODY）：两行各
-        // 1.0 × 1.6 = 3.2。metrics 路径的行数估算不含行高倍率，那是已知且
-        // 有意的——估计值只用于未测量的块，可见块总会被 shaped 路径覆盖。
-        assert_eq!(shaped.blocks()[0].height(), 3.2);
-        assert_eq!(shaped.content_height(), 3.2);
+        // Two 1.6pt shaped lines plus the final paragraph's 0.8pt margin.
+        // Measurement replaces the one-line metrics estimate without losing it.
+        assert_eq!(shaped.blocks()[0].height(), 4.0);
+        assert_eq!(shaped.content_height(), 4.0);
 
         let metrics_again = document
             .visible_blocks(ViewportSpan::new(0.0, 2.0))
             .expect("metrics viewport should remeasure after backend switch");
-        assert_eq!(metrics_again.blocks()[0].height(), 1.0);
+        assert_eq!(metrics_again.blocks()[0].height(), 1.8);
     }
 
     /// 块间距折进块高贡献：缝 = max(after(上块), before(下块))，整条折在缝
@@ -4925,23 +4876,603 @@ prefix **羽🙂** suffix
         assert_eq!(blocks.len(), 3, "标题、空行、段落三块");
         assert_eq!(blocks[0].kind(), BlockKind::Heading { level: 1 });
 
-        // h1 段后 0.45 行，空行段前 0：缝取 0.45 行 × 正文行高。
-        // 标题内容 2 行（"title" + 尾部换行那一行）。
-        let gap = 0.45 * LINE_HEIGHT_BODY;
-        assert_eq!(blocks[0].height(), 2.0 + gap, "标题内容 2 行 + 折进来的缝");
+        // Github headings use one rem; source separators add no height.
+        let gap = 1.0;
+        assert_eq!(
+            blocks[0].height(),
+            3.0 + gap + 1.0 / 16.0,
+            "首标题段前距 + 内容 2 行 + 缩放后的边框 + 折进来的缝"
+        );
         // 空行块自己 2 行（换行符自己占一行，与段落块的尾行同理）；它到下一段
         // 没有缝（两边都是 0）。
-        assert_eq!(blocks[1].height(), 2.0);
+        assert_eq!(
+            blocks[1].height(),
+            0.0,
+            "source separator has no reading height"
+        );
         // 前缀和衔接：每块的原点就是上块的底。
         assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
         assert_eq!(blocks[2].y(), blocks[1].y() + blocks[1].height());
-        // 文档末块的段后不进高——页面底的留白是视口 padding 的事。
-        assert_eq!(blocks[2].height(), 2.0, "段落内容 2 行");
+        // The final paragraph keeps its own margin inside the page padding.
+        assert_eq!(
+            blocks[2].height(),
+            2.8,
+            "two content lines plus trailing margin"
+        );
     }
 
     /// 列表内连续 item 之间间距为 0；item 的段前段后只在列表边界上起作用。
     #[test]
-    fn list_item_spacing_only_applies_at_list_boundaries() {
+    fn quoted_lists_have_independent_paragraphs_and_source_backed_markers() {
+        let source = "> opening\n>\n> - first\n>   - child\n> - last\n\nend\n";
+        let mut document = EditorDocument::new(source);
+        assert!(document.markdown.blocks().len() >= 6);
+        let rendered = document.visual_text().expect("projection");
+        assert!(!rendered.text().contains('>'), "{}", rendered.text());
+        assert!(!rendered.text().contains("- first"), "{}", rendered.text());
+        assert!(!rendered.text().contains("- child"), "{}", rendered.text());
+        assert!(rendered.text().contains("first"));
+        assert!(rendered.text().contains("child"));
+        assert_eq!(document.snapshot().as_str(), source);
+        let mut markers = 0;
+        for index in 0..document.markdown.blocks().len() {
+            let decorations = document.block_decorations(index).expect("decorations");
+            if decorations
+                .line_ornaments()
+                .into_iter()
+                .any(|(_, ornament)| matches!(ornament, yu_markdown::BlockOrnament::Marker(_)))
+            {
+                markers += 1;
+            }
+        }
+        assert_eq!(markers, 3);
+    }
+
+    #[test]
+    fn ordered_list_cache_updates_after_renumbering_and_undo_without_rebuilding_unrelated_text() {
+        let source = "1. first\n1. second\n\noutside\n";
+        let mut document = EditorDocument::new(source);
+        let config = LayoutConfig::new(400.0, 16.0);
+        let second = document
+            .block_index_for_source(ByteOffset::new(source.find("second").expect("text") as u64))
+            .expect("second");
+        let outside = document
+            .block_index_for_source(ByteOffset::new(source.find("outside").expect("text") as u64))
+            .expect("outside");
+        let number = |document: &mut EditorDocument| {
+            document
+                .block_layout_with_shaper(second, config, &WideShaper)
+                .expect("layout")
+                .ornaments()
+                .marker()
+                .expect("number")
+                .text()
+                .to_owned()
+        };
+        assert_eq!(number(&mut document), "2.");
+        document
+            .block_layout_with_shaper(outside, config, &WideShaper)
+            .expect("cached unrelated paragraph");
+        document
+            .set_selection(
+                EditorSelection::range(
+                    &document.snapshot(),
+                    ByteOffset::ZERO,
+                    ByteOffset::new(1),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("selection"),
+            )
+            .expect("select number");
+        document
+            .execute(EditorCommand::insert_text("7"))
+            .expect("replace starting number");
+        assert_eq!(
+            document.snapshot().as_str(),
+            "7. first\n1. second\n\noutside\n"
+        );
+        let before = document.layout_cache_stats().builds();
+        document
+            .block_layout_with_shaper(outside, config, &WideShaper)
+            .expect("unchanged paragraph");
+        assert_eq!(document.layout_cache_stats().builds(), before);
+        assert_eq!(
+            number(&mut document),
+            "8.",
+            "source spelling of the second item stays 1."
+        );
+        document.execute(EditorCommand::undo()).expect("undo");
+        assert_eq!(document.snapshot().as_str(), source);
+        assert_eq!(number(&mut document), "2.");
+        document.execute(EditorCommand::redo()).expect("redo");
+        assert_eq!(number(&mut document), "8.");
+        set_caret(&mut document, 0);
+        document
+            .execute(EditorCommand::insert_text("intro\n\n"))
+            .expect("unrelated prefix");
+        let target = document
+            .snapshot()
+            .as_str()
+            .find("second")
+            .expect("second after prefix");
+        let target = document
+            .block_index_for_source(ByteOffset::new(target as u64))
+            .expect("block");
+        let before = document.layout_cache_stats().builds();
+        assert_eq!(
+            document
+                .block_layout_with_shaper(target, config, &WideShaper)
+                .expect("shifted cached layout")
+                .ornaments()
+                .marker()
+                .expect("number")
+                .text(),
+            "8."
+        );
+        assert_eq!(
+            document.layout_cache_stats().builds(),
+            before,
+            "source shifts alone preserve shaping"
+        );
+        let before_insert = document.snapshot().as_str().to_owned();
+        let position = before_insert.find("1. second").expect("item prefix");
+        set_caret(&mut document, position);
+        document
+            .execute(EditorCommand::insert_text("1. middle\n"))
+            .expect("insert sibling");
+        assert_eq!(
+            document.snapshot().as_str(),
+            before_insert.replace("1. second", "1. middle\n1. second")
+        );
+        let offset = document.snapshot().as_str().find("second").expect("second");
+        let index = document
+            .block_index_for_source(ByteOffset::new(offset as u64))
+            .expect("block");
+        assert_eq!(
+            document
+                .block_layout_with_shaper(index, config, &WideShaper)
+                .expect("renumbered sibling")
+                .ornaments()
+                .marker()
+                .expect("number")
+                .text(),
+            "9."
+        );
+        document
+            .execute(EditorCommand::undo())
+            .expect("undo inserted item");
+        assert_eq!(document.snapshot().as_str(), before_insert);
+    }
+
+    #[test]
+    fn nested_list_transitions_follow_container_tightness() {
+        for (source, pairs) in [
+            (
+                "> intro\n>\n> - first\n> - last\n>\n> outro\n",
+                vec![("first", "last", 8.0), ("last", "outro", 12.8)],
+            ),
+            (
+                "- parent\n  - child\n- last\n\n1. separate\n1. final\n",
+                vec![
+                    ("parent", "child", 8.0),
+                    ("child", "last", 8.0),
+                    ("last", "separate", 12.8),
+                    ("separate", "final", 8.0),
+                ],
+            ),
+            (
+                "- first\n\n  continuation\n\n- next\n",
+                vec![
+                    ("first", "continuation", 8.0),
+                    ("continuation", "next", 8.0),
+                ],
+            ),
+            (
+                "- parent\n  > quoted\n  >\n  > second\n- last\n",
+                vec![("quoted", "second", 12.8)],
+            ),
+        ] {
+            let mut document = EditorDocument::new(source);
+            document
+                .set_viewport_config(ViewportConfig::new(
+                    LayoutConfig::new(400.0, 16.0),
+                    16.0,
+                    0.0,
+                ))
+                .expect("config");
+            let geometry = document
+                .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &WideShaper)
+                .expect("geometry");
+            for (upper, lower, expected_gap) in pairs {
+                let block = |text| {
+                    geometry
+                        .block_for_source(
+                            ByteOffset::new(source.find(text).expect("source") as u64),
+                        )
+                        .expect("block")
+                };
+                let upper = block(upper);
+                let lower = block(lower);
+                let gap = lower.content_y() - upper.content_y() - upper.layout().height();
+                assert!(
+                    (gap - expected_gap).abs() < 0.01,
+                    "{source:?}: gap {gap}, expected {expected_gap}"
+                );
+            }
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+    }
+
+    #[test]
+    fn quote_containers_cover_internal_gaps_and_follow_parent_indentation() {
+        use yu_markdown::PresentationKind;
+        let source = "> first\n>\n> second\n\n- item\n\n  > inner\n  >\n  > end\n\noutside\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(400.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("config");
+        let geometry = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &WideShaper)
+            .expect("geometry");
+        let quotes: Vec<_> = geometry
+            .containers()
+            .iter()
+            .filter(|node| node.kind == PresentationKind::Quote)
+            .collect();
+        assert_eq!(quotes.len(), 2);
+        let block = |text| {
+            geometry
+                .block_for_source(ByteOffset::new(source.find(text).expect("source") as u64))
+                .expect("block")
+        };
+        for (quote, first, last, x) in [
+            (quotes[0], "first", "second", 0.0),
+            (quotes[1], "inner", "end", 30.0),
+        ] {
+            let bar = quote.quote_bar.expect("quote bar");
+            assert_eq!(bar.x(), x);
+            assert!((bar.y() - block(first).content_y()).abs() < 0.01);
+            let bottom = block(last).content_y() + block(last).layout().height();
+            assert!((bar.bottom() - bottom).abs() < 0.01);
+            assert!(!quote.clipped_start && !quote.clipped_end);
+            assert!(bar.height() > block(first).layout().height() + block(last).layout().height());
+        }
+        let outside_y = block("outside").content_y();
+        assert!(
+            quotes[1].bounds.bottom() < outside_y,
+            "outside margin must not extend the quote bar"
+        );
+        let first_y = quotes[0].bounds.y();
+        document
+            .execute(EditorCommand::insert_text("prefix\n\n"))
+            .expect("edit");
+        assert_eq!(
+            quotes[0].bounds.y(),
+            first_y,
+            "published containers stay immutable"
+        );
+        assert!(!document.accepts_layout_snapshot(&geometry));
+    }
+
+    #[test]
+    fn mixed_quote_and_list_order_controls_markers_and_continuation_alignment() {
+        for (source, marker_before_bar) in [
+            ("- > first\n  > second\n", true),
+            ("> - first\n>   second\n", false),
+        ] {
+            let mut document = EditorDocument::new(source);
+            let config = LayoutConfig::new(400.0, 16.0);
+            document
+                .set_viewport_config(ViewportConfig::new(config, 16.0, 0.0))
+                .expect("config");
+            let geometry = document
+                .prepare_layout_snapshot(ViewportSpan::new(0.0, 400.0), &WideShaper)
+                .expect("geometry");
+            let bar = geometry
+                .containers()
+                .iter()
+                .find_map(|node| node.quote_bar)
+                .expect("quote bar");
+            let layout = document
+                .block_layout_with_shaper(0, config, &WideShaper)
+                .expect("paragraph");
+            let marker = layout.ornaments().marker().expect("list marker");
+            if marker_before_bar {
+                assert!(marker.x() + marker.advance() < bar.x());
+            } else {
+                assert!(marker.x() > bar.right());
+            }
+            for text in ["first", "second"] {
+                let caret = layout
+                    .caret_for_source(
+                        ByteOffset::new(source.find(text).expect("text") as u64),
+                        Bias::After,
+                    )
+                    .expect("caret");
+                assert!(
+                    (caret.point().x() - 49.0).abs() < 0.01,
+                    "{source:?}: {text} x={}",
+                    caret.point().x()
+                );
+            }
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+        let source = "- intro\n\n  > first\n  > second\n";
+        let mut document = EditorDocument::new(source);
+        let index = document
+            .block_index_for_source(ByteOffset::new(source.find("first").expect("text") as u64))
+            .expect("quote paragraph");
+        let layout = document
+            .block_layout_with_shaper(index, LayoutConfig::new(400.0, 16.0), &WideShaper)
+            .expect("continued quote");
+        for text in ["first", "second"] {
+            let caret = layout
+                .caret_for_source(
+                    ByteOffset::new(source.find(text).expect("text") as u64),
+                    Bias::After,
+                )
+                .expect("caret");
+            assert!(
+                (caret.point().x() - 49.0).abs() < 0.01,
+                "{text} x={}",
+                caret.point().x()
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_list_separator_has_height_only_when_it_contains_the_caret() {
+        let source = "> - first\n> - last\n>\n> after\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(400.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("config");
+        let offset = source.rfind("\n>\n").expect("separator") + 2;
+        let index = document
+            .block_index_for_source(ByteOffset::new(offset as u64))
+            .expect("separator block");
+        let full = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 1000.0), &WideShaper)
+            .expect("geometry");
+        let blank = full.block(index).expect("separator");
+        assert_eq!(blank.metadata().kind(), BlockKind::BlankLine);
+        assert_eq!(blank.metadata().height(), 0.0);
+        let list = full
+            .containers()
+            .iter()
+            .find(|node| matches!(node.kind, yu_markdown::PresentationKind::List { .. }))
+            .expect("list container");
+        assert!(
+            !list.clipped_start && !list.clipped_end,
+            "trailing marker is covered by the snapshot"
+        );
+        let last = full
+            .block_for_source(ByteOffset::new(source.find("last").expect("text") as u64))
+            .expect("last item");
+        assert!(
+            (list.bounds.bottom() - last.content_y() - last.layout().height()).abs() < 0.01,
+            "list box excludes the external margin"
+        );
+        set_caret(&mut document, offset);
+        let active = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 1000.0), &WideShaper)
+            .expect("active geometry");
+        assert!(
+            active
+                .block(index)
+                .expect("active empty paragraph")
+                .metadata()
+                .height()
+                >= 25.6
+        );
+        assert_eq!(
+            full.block(index)
+                .expect("retained geometry")
+                .metadata()
+                .height(),
+            0.0
+        );
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+
+    #[test]
+    fn selecting_through_a_separator_does_not_insert_a_caret_paragraph() {
+        for source in ["first\r\n\r\nsecond\r\n", "> first\n>\n> second\n"] {
+            let mut document = EditorDocument::new(source);
+            document
+                .set_viewport_config(ViewportConfig::new(
+                    LayoutConfig::new(400.0, 16.0),
+                    16.0,
+                    0.0,
+                ))
+                .expect("config");
+            let separator = document
+                .markdown
+                .blocks()
+                .iter()
+                .position(|block| block.kind() == BlockKind::BlankLine)
+                .expect("separator");
+            let blank_offset = document
+                .markdown
+                .blocks()
+                .get(separator)
+                .expect("blank")
+                .range()
+                .start();
+            let text_offset = ByteOffset::new(source.find("first").expect("text") as u64);
+            let baseline = document
+                .prepare_layout_snapshot(ViewportSpan::new(0.0, 1000.0), &WideShaper)
+                .expect("baseline");
+            assert_eq!(
+                baseline
+                    .block(separator)
+                    .expect("blank")
+                    .metadata()
+                    .height(),
+                0.0
+            );
+            set_caret(&mut document, blank_offset.get() as usize);
+            let caret = document
+                .prepare_layout_snapshot(ViewportSpan::new(0.0, 1000.0), &WideShaper)
+                .expect("caret");
+            assert!(caret.block(separator).expect("blank").metadata().height() > 0.0);
+            for (anchor, focus) in [(text_offset, blank_offset), (blank_offset, text_offset)] {
+                document
+                    .set_selection(
+                        EditorSelection::range(
+                            &document.snapshot(),
+                            anchor,
+                            focus,
+                            crate::CaretAffinity::Downstream,
+                        )
+                        .expect("range"),
+                    )
+                    .expect("selection");
+                let selected = document
+                    .prepare_layout_snapshot(ViewportSpan::new(0.0, 1000.0), &WideShaper)
+                    .expect("selected");
+                assert_eq!(
+                    selected
+                        .block(separator)
+                        .expect("blank")
+                        .metadata()
+                        .height(),
+                    0.0,
+                    "nonempty selection must not create an editing paragraph"
+                );
+                assert_eq!(
+                    selected
+                        .block(separator + 1)
+                        .expect("following")
+                        .content_y(),
+                    baseline
+                        .block(separator + 1)
+                        .expect("following")
+                        .content_y()
+                );
+            }
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+    }
+
+    #[test]
+    fn final_block_retains_its_margin_and_closing_container_margin() {
+        for (source, expected_margin) in [
+            ("last\n", 12.8),
+            ("last\n\n", 12.8),
+            ("- last\n", 12.8),
+            ("> last\n", 12.8),
+            ("# last\n", 16.0),
+            ("```\nlast\n```\n", 15.0),
+        ] {
+            let document = EditorDocument::new(source);
+            let config = LayoutConfig::new(400.0, 16.0);
+            let index = document
+                .markdown
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| {
+                    (block.kind() != BlockKind::BlankLine).then_some(index)
+                })
+                .last()
+                .expect("content");
+            let kind = document.markdown.blocks().get(index).expect("block").kind();
+            let height = document.block_box_height(index, 25.6, config);
+            let without_margin = 25.6
+                + document.block_content_origin(index, config)
+                + content_bottom_inset(kind, config);
+            assert!(
+                (height - without_margin - expected_margin).abs() < 0.001,
+                "{source:?}: trailing margin {}",
+                height - without_margin
+            );
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+    }
+
+    #[test]
+    fn intentional_empty_paragraphs_add_paragraph_advance_without_rewriting_source() {
+        let mut baseline = None;
+        for breaks in 2..=8 {
+            let source = format!("before{}after\n", "\n".repeat(breaks));
+            let mut document = EditorDocument::new(&source);
+            document
+                .set_viewport_config(ViewportConfig::new(
+                    LayoutConfig::new(400.0, 16.0),
+                    16.0,
+                    0.0,
+                ))
+                .expect("config");
+            let snapshot = document
+                .prepare_layout_snapshot(ViewportSpan::new(0.0, 1000.0), &WideShaper)
+                .expect("snapshot");
+            let after = snapshot
+                .block_for_source(ByteOffset::new(source.find("after").expect("text") as u64))
+                .expect("after paragraph")
+                .content_y();
+            let first = *baseline.get_or_insert(after);
+            let expected = first + (breaks / 2 - 1) as f32 * 38.4;
+            assert!(
+                (after - expected).abs() < 0.01,
+                "{breaks} newlines: {after} != {expected}"
+            );
+            assert_eq!(document.snapshot().as_str(), source);
+        }
+    }
+
+    #[test]
+    fn partial_container_bounds_are_marked_and_stay_with_their_snapshot() {
+        use yu_markdown::PresentationKind;
+        let source = "> first\n>\n> middle\n>\n> third\n>\n> last\n";
+        let mut document = EditorDocument::new(source);
+        document
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(400.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("config");
+        let full = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 2000.0), &WideShaper)
+            .expect("full geometry");
+        let middle = full
+            .block_for_source(ByteOffset::new(source.find("middle").expect("text") as u64))
+            .expect("middle");
+        document.set_resource_geometry_version(1);
+        let part = document
+            .prepare_layout_snapshot(
+                ViewportSpan::new(middle.content_y() + 2.0, 1.0),
+                &WideShaper,
+            )
+            .expect("partial geometry");
+        let quote = part
+            .containers()
+            .iter()
+            .find(|node| node.kind == PresentationKind::Quote)
+            .expect("partial quote");
+        assert!(quote.clipped_start && quote.clipped_end);
+        let full_quote = full
+            .containers()
+            .iter()
+            .find(|node| node.kind == PresentationKind::Quote)
+            .expect("full quote");
+        assert!(!full_quote.clipped_start && !full_quote.clipped_end);
+        assert_eq!(quote.source, full_quote.source);
+        assert!(quote.bounds.height() < full_quote.bounds.height());
+        assert_eq!(quote.bounds.y(), middle.metadata().y());
+    }
+
+    #[test]
+    fn list_item_spacing_preserves_inner_and_outer_margins() {
         let mut document = EditorDocument::new("- one\n- two\n\nafter\n");
         document
             .set_viewport_config(ViewportConfig::new(LayoutConfig::new(80.0, 1.0), 1.0, 0.0))
@@ -4953,18 +5484,21 @@ prefix **羽🙂** suffix
         let blocks = snapshot.blocks();
         assert_eq!(blocks.len(), 4, "两个 item、空行、段落");
 
-        // 紧凑列表：item 挨着 item，没有缝。内容各 2 行。
-        assert_eq!(blocks[0].height(), 2.0);
+        // List paragraphs retain the theme half-rem margin. Content is two lines.
+        assert_eq!(blocks[0].height(), 2.5);
         assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
         // 列表边界：第二个 item 下面是空行，缝 = after(item) = 0.4 行。
-        let boundary = 0.4 * LINE_HEIGHT_BODY;
+        let boundary = 0.5 * LINE_HEIGHT_BODY;
         assert_eq!(blocks[1].height(), 2.0 + boundary);
         assert_eq!(blocks[2].y(), blocks[1].y() + blocks[1].height());
-        assert_eq!(blocks[2].height(), 2.0, "空行块 2 行（换行符占一行）");
+        assert_eq!(
+            blocks[2].height(),
+            0.0,
+            "source separator has no reading height"
+        );
     }
 
-    /// 代码块的垂直内边距（上下各 `CODE_BLOCK_PADDING_Y`，共 10pt）对称地折
-    /// 进块高：5pt + 内容 + 5pt + 到下一块的间距。内容在盒里的起点是
+    /// 代码块的不同上、下内边距按字号缩放后折进块高，内容在盒里的起点是
     /// `content_origin_y`——caret/选中换算文档坐标时补同一个数。
     #[test]
     fn code_block_vertical_padding_folds_into_viewport_heights() {
@@ -4981,14 +5515,14 @@ prefix **羽🙂** suffix
             blocks[0].kind(),
             BlockKind::FencedCodeBlock { .. }
         ));
-        let origin = content_origin_y(blocks[0].kind());
-        assert_eq!(origin, 5.0);
-        // 上内边距 + 内容 2 行 + 下内边距 + 到空行的缝（after(代码) 0.6 行）。
-        let gap = 0.6 * LINE_HEIGHT_BODY;
+        let origin = content_origin_y(blocks[0].kind(), LayoutConfig::new(80.0, 1.0));
+        assert_eq!(origin, 9.0 / 16.0);
+        // The 15pt code margin wins over the 12.8pt paragraph margin.
+        let gap = 15.0 / 16.0;
         assert_eq!(
             blocks[0].height(),
-            origin + 2.0 + origin + gap,
-            "5pt + 2 行内容 + 5pt + 折进来的缝"
+            origin + 2.0 + 7.0 / 16.0 + gap,
+            "缩放后的上内边距 + 内容 + 下内边距 + 段间距"
         );
         assert_eq!(blocks[1].y(), blocks[0].y() + blocks[0].height());
 
@@ -5074,7 +5608,7 @@ prefix **羽🙂** suffix
             .visible_blocks_with_shaper(ViewportSpan::new(0.0, 100.0), &WideShaper)
             .expect("placeholder viewport should measure");
         // 16 = 占位那一行（行高 10 × 正文倍率 1.6），块尾换行符一行同高。
-        assert_eq!(placeholder.blocks()[0].height(), 32.0);
+        assert_eq!(placeholder.blocks()[0].height(), 40.0);
 
         let intrinsic = ImageIntrinsicSize::new(200, 100).expect("image dimensions");
         let ready = document
@@ -5088,8 +5622,8 @@ prefix **羽🙂** suffix
         // 是块尾那个换行符自己的行（10 × 正文行高倍率 1.6）。图片 widget 化
         // 之前这里是 50：图片是排完之后另贴上去的盒子，行不知道它有多高，块
         // 高只能取 `max(行盒累加, 图片下沿)`——于是图片压在块尾那一行上面。
-        assert_eq!(ready.blocks()[0].height(), 56.0);
-        assert_eq!(ready.blocks()[1].y(), 56.0);
+        assert_eq!(ready.blocks()[0].height(), 64.0);
+        assert_eq!(ready.blocks()[1].y(), 64.0);
         assert!(ready.content_height() > placeholder.content_height());
         assert!(ready.content_height() >= ready.blocks()[1].y() + ready.blocks()[1].height());
     }
@@ -5283,13 +5817,15 @@ prefix **羽🙂** suffix
                 10.0,
                 0.0,
             ))
-            .unwrap();
+            .expect("valid render snapshot fixture");
         document
             .visible_blocks_with_shaper(ViewportSpan::new(0.0, 60.0), &WideShaper)
-            .unwrap();
+            .expect("valid render snapshot fixture");
         let heights = document.viewport.height_index().clone();
         let stats = document.viewport_stats();
-        document.set_viewport_overscan(120.0).unwrap();
+        document
+            .set_viewport_overscan(120.0)
+            .expect("valid render snapshot fixture");
         assert_eq!(document.viewport.height_index(), &heights);
         assert_eq!(document.viewport_stats(), stats);
         assert_eq!(document.viewport_config().overscan(), 120.0);
@@ -5311,24 +5847,24 @@ prefix **羽🙂** suffix
                 10.0,
                 0.0,
             ))
-            .unwrap();
+            .expect("valid render snapshot fixture");
         owner
             .visible_blocks_with_shaper(ViewportSpan::new(0.0, 60.0), &WideShaper)
-            .unwrap();
+            .expect("valid render snapshot fixture");
         let tail = ByteOffset::new((source.len() - 4) as u64);
         owner
             .set_selection(
                 EditorSelection::cursor(&owner.snapshot(), tail, crate::CaretAffinity::Downstream)
-                    .unwrap(),
+                    .expect("valid render snapshot fixture"),
             )
-            .unwrap();
+            .expect("valid render snapshot fixture");
         let expected = owner
             .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 60.0), 0.0, &WideShaper)
-            .unwrap();
-        let mut worker = owner.capture_render_snapshot().into_document().unwrap();
+            .expect("valid render snapshot fixture");
+        let mut worker = owner.capture_render_snapshot().into_layout_context();
         let copied = worker
             .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 60.0), 0.0, &WideShaper)
-            .unwrap();
+            .expect("valid render snapshot fixture");
         assert_eq!(
             copied.caret().y(),
             expected.caret().y(),
@@ -5339,13 +5875,13 @@ prefix **羽🙂** suffix
                 ViewportSpan::new(expected.caret().y() - 30.0, 60.0),
                 &WideShaper,
             )
-            .unwrap();
+            .expect("valid render snapshot fixture");
         let measured = worker
             .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 60.0), 0.0, &WideShaper)
-            .unwrap();
+            .expect("valid render snapshot fixture");
         assert!(measured.caret().y() > expected.caret().y());
         let owner_builds = owner.layout_cache_stats().builds();
-        assert!(owner.adopt_render_layout(worker.into_render_layout()));
+        assert!(owner.adopt_measurements(worker.measurements()));
         assert_eq!(
             owner.layout_cache_stats().builds(),
             owner_builds,
@@ -5353,8 +5889,132 @@ prefix **羽🙂** suffix
         );
         let adopted = owner
             .caret_scroll_request_with_shaper(ViewportSpan::new(0.0, 60.0), 0.0, &WideShaper)
-            .unwrap();
+            .expect("valid render snapshot fixture");
         assert_eq!(adopted.caret().y(), measured.caret().y());
+    }
+
+    #[test]
+    fn preedit_selection_updates_mapping_without_reshaping() {
+        let mut document = EditorDocument::new("text");
+        document
+            .begin_composition(source_range(0, 0), "中文", utf16_range(0, 0))
+            .expect("composition");
+        let first = document
+            .layout_snapshot_for_source(ByteOffset::ZERO, &WideShaper)
+            .expect("first");
+        let builds = document.layout_cache_stats().builds();
+        document
+            .update_composition("中文", utf16_range(2, 2))
+            .expect("move preedit selection");
+        let second = document
+            .layout_snapshot_for_source(ByteOffset::ZERO, &WideShaper)
+            .expect("second");
+        assert_eq!(document.layout_cache_stats().builds(), builds);
+        assert_ne!(
+            first.blocks()[0]
+                .layout()
+                .visual()
+                .composition_selection_bytes(),
+            second.blocks()[0]
+                .layout()
+                .visual()
+                .composition_selection_bytes()
+        );
+        assert_eq!(document.snapshot().as_str(), "text");
+    }
+
+    #[test]
+    fn source_query_prioritizes_one_paragraph_and_projection_cache_reuses_it() {
+        let source = format!("{}\n# active heading\n", "paragraph\n\n".repeat(200));
+        let mut document = EditorDocument::new(&source);
+        let focus = ByteOffset::new(source.find("active").expect("heading") as u64);
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &document.snapshot(),
+                    focus,
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("selection"),
+            )
+            .expect("selection");
+        document
+            .layout_snapshot_for_source(focus, &WideShaper)
+            .expect("active geometry");
+        assert_eq!(
+            document.viewport_stats().measured(),
+            1,
+            "no overscan before synchronous active query"
+        );
+        let builds = document.layout_cache_stats().builds();
+        document
+            .set_selection(
+                EditorSelection::cursor(
+                    &document.snapshot(),
+                    ByteOffset::new(focus.get() + 1),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("selection"),
+            )
+            .expect("selection");
+        document
+            .layout_snapshot_for_source(focus, &WideShaper)
+            .expect("active geometry");
+        assert_eq!(
+            document.layout_cache_stats().builds(),
+            builds,
+            "same projection only moves caret"
+        );
+    }
+
+    #[test]
+    fn independent_measurements_merge_and_resize_preserves_prefix_estimates() {
+        let source = "first paragraph with wrapping\n\nsecond paragraph\n\nlast paragraph\n";
+        let mut owner = EditorDocument::new(source);
+        owner
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(80.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("config");
+        // Establish shaped backend before forking independent preparation.
+        owner
+            .layout_snapshot_for_source(ByteOffset::ZERO, &WideShaper)
+            .expect("first");
+        let mut worker = owner.capture_render_snapshot().into_layout_context();
+        let last = ByteOffset::new(source.find("last").expect("last") as u64);
+        worker
+            .layout_snapshot_for_source(last, &WideShaper)
+            .expect("worker last");
+        let second = ByteOffset::new(source.find("second").expect("second") as u64);
+        owner
+            .layout_snapshot_for_source(second, &WideShaper)
+            .expect("owner second");
+        assert!(owner.adopt_measurements(worker.measurements()));
+        assert_eq!(
+            owner.viewport_stats().measured(),
+            3,
+            "neither participant loses measured paragraphs"
+        );
+        let old_height = owner.viewport.height_index().total_height();
+        owner
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(160.0, 16.0),
+                16.0,
+                0.0,
+            ))
+            .expect("resize");
+        assert_eq!(owner.viewport_stats().measured(), 0);
+        assert_eq!(
+            owner.viewport.height_index().total_height(),
+            old_height,
+            "resize keeps geometry as estimates"
+        );
+        owner
+            .layout_snapshot_for_source(last, &WideShaper)
+            .expect("viewport target");
+        assert_eq!(owner.viewport_stats().measured(), 1);
     }
 
     #[test]
@@ -5362,15 +6022,17 @@ prefix **羽🙂** suffix
         let mut owner = EditorDocument::new("alpha beta");
         owner
             .visible_blocks_with_shaper(ViewportSpan::new(0.0, 60.0), &WideShaper)
-            .unwrap();
+            .expect("valid render snapshot fixture");
         let layout = owner
             .capture_render_snapshot()
-            .into_document()
-            .unwrap()
-            .into_render_layout();
+            .into_layout_context()
+            .measurements();
         let before = owner.viewport_stats();
-        let foreign = EditorDocument::new("alpha beta").into_render_layout();
-        assert!(!owner.adopt_render_layout(foreign));
+        let foreign = EditorDocument::new("alpha beta")
+            .capture_render_snapshot()
+            .into_layout_context()
+            .measurements();
+        assert!(!owner.adopt_measurements(foreign));
         assert_eq!(owner.viewport_stats(), before);
         let original_selection = owner.selection();
         owner
@@ -5380,15 +6042,17 @@ prefix **羽🙂** suffix
                     ByteOffset::new(3),
                     crate::CaretAffinity::Downstream,
                 )
-                .unwrap(),
+                .expect("valid render snapshot fixture"),
             )
-            .unwrap();
-        assert!(!owner.adopt_render_layout(layout.clone()));
-        owner.set_selection(original_selection).unwrap();
+            .expect("valid render snapshot fixture");
+        assert!(!owner.adopt_measurements(layout.clone()));
+        owner
+            .set_selection(original_selection)
+            .expect("valid render snapshot fixture");
         owner
             .begin_composition(source_range(0, 0), "preedit", utf16_range(0, 0))
-            .unwrap();
-        assert!(!owner.adopt_render_layout(layout.clone()));
+            .expect("valid render snapshot fixture");
+        assert!(!owner.adopt_measurements(layout.clone()));
         assert!(owner.cancel_composition());
         let config = owner.viewport_config();
         owner
@@ -5397,17 +6061,23 @@ prefix **羽🙂** suffix
                 10.0,
                 0.0,
             ))
-            .unwrap();
-        assert!(!owner.adopt_render_layout(layout.clone()));
-        owner.set_viewport_config(config).unwrap();
+            .expect("valid render snapshot fixture");
+        assert!(!owner.adopt_measurements(layout.clone()));
+        owner
+            .set_viewport_config(config)
+            .expect("valid render snapshot fixture");
         owner
             .execute(EditorCommand::insert_text("changed"))
-            .unwrap();
-        assert!(!owner.adopt_render_layout(layout.clone()));
-        owner.reset_source("alpha beta").unwrap();
-        owner.set_selection(original_selection).unwrap();
+            .expect("valid render snapshot fixture");
+        assert!(!owner.adopt_measurements(layout.clone()));
+        owner
+            .reset_source("alpha beta")
+            .expect("valid render snapshot fixture");
+        owner
+            .set_selection(original_selection)
+            .expect("valid render snapshot fixture");
         assert!(
-            !owner.adopt_render_layout(layout),
+            !owner.adopt_measurements(layout),
             "reset to Revision::INITIAL must invalidate old source identity"
         );
     }
@@ -5419,7 +6089,7 @@ prefix **羽🙂** suffix
         document.set_search_query("beta");
         document
             .begin_composition(source_range(0, 5), "日本🙂", utf16_range(2, 2))
-            .unwrap();
+            .expect("valid render snapshot fixture");
         let expected_source = document.snapshot().as_str().to_owned();
         let expected_selections = document.selections().clone();
         let expected_composition = document.composition().cloned();
@@ -5432,26 +6102,55 @@ prefix **羽🙂** suffix
         assert!(document.cancel_composition());
         document
             .execute(EditorCommand::insert_text("changed"))
-            .unwrap();
+            .expect("valid render snapshot fixture");
         drop(document);
         let owner_thread = std::thread::current().id();
         let rebuilt = std::thread::spawn(move || {
             assert_ne!(std::thread::current().id(), owner_thread);
-            input.into_document().unwrap()
+            input.into_layout_context()
         })
         .join()
-        .unwrap();
+        .expect("valid render snapshot fixture");
         assert_eq!(rebuilt.snapshot().as_str(), expected_source);
         assert_eq!(rebuilt.revision(), Revision::INITIAL);
         assert_eq!(rebuilt.selections(), &expected_selections);
         assert_eq!(rebuilt.composition(), expected_composition.as_ref());
         assert_eq!(rebuilt.search_generation, expected_search_generation);
-        assert_eq!(rebuilt.search().unwrap().query(), "beta");
-        assert_eq!(rebuilt.history_stats().undo_entries(), 0);
+        assert_eq!(
+            rebuilt
+                .search()
+                .expect("valid render snapshot fixture")
+                .query(),
+            "beta"
+        );
     }
 
     #[test]
-    fn render_clone_preserves_revision_visual_state_without_history() {
+    fn replacing_source_rebuilds_search_and_keeps_published_input_immutable() {
+        let mut document = EditorDocument::new("old needle");
+        document.set_search_query("needle");
+        let input = document.capture_render_snapshot();
+        document
+            .reset_source("needle new needle")
+            .expect("replace source");
+        let current = document.search().expect("active search");
+        assert_eq!(
+            current.matches(),
+            &[source_range(0, 6), source_range(11, 17)]
+        );
+        let old = input.into_layout_context();
+        assert_eq!(old.snapshot().as_str(), "old needle");
+        assert_eq!(
+            old.search().expect("old search").matches(),
+            &[source_range(4, 10)]
+        );
+        assert!(!document.adopt_measurements(old.measurements()));
+        assert_eq!(document.snapshot().as_str(), "needle new needle");
+        assert_eq!(document.history_stats().undo_entries(), 0);
+    }
+
+    #[test]
+    fn layout_context_preserves_revision_and_shares_search_without_editor_state() {
         let mut document = EditorDocument::new("alpha beta");
         document
             .execute(EditorCommand::insert_text("!"))
@@ -5467,11 +6166,15 @@ prefix **羽🙂** suffix
         document.set_selection(selection).expect("selection update");
         document.set_search_query("alpha");
 
-        let clone = document.clone_for_render().expect("render clone");
+        let clone = document.capture_render_snapshot().into_layout_context();
         assert_eq!(clone.snapshot().as_str(), document.snapshot().as_str());
         assert_eq!(clone.revision(), document.revision());
         assert_eq!(clone.selections(), document.selections());
         assert_eq!(clone.search().map(|search| search.query()), Some("alpha"));
-        assert_eq!(clone.history_stats().undo_entries(), 0);
+        assert!(Arc::ptr_eq(
+            clone.search.as_ref().expect("search"),
+            document.search.as_ref().expect("search")
+        ));
+        assert_eq!(document.history_stats().undo_entries(), 1);
     }
 }

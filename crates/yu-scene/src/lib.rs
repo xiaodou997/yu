@@ -401,11 +401,25 @@ pub enum OrnamentRole {
 /// `[x]` 标记。几何与颜色都由调用方给：这一层只负责把它们留在场景里并
 /// 参与 damage 计算。
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OrnamentShape {
+    Rectangle,
+    Rounded {
+        radius: f32,
+    },
+    /// Three vertices relative to bounds; stroke and caps stay inside bounds.
+    Polyline {
+        points: [Point; 3],
+        width: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OrnamentPrimitive {
     source: TextRange,
     bounds: Rect,
     color: Rgba8,
     role: OrnamentRole,
+    shape: OrnamentShape,
 }
 
 impl OrnamentPrimitive {
@@ -416,7 +430,18 @@ impl OrnamentPrimitive {
             bounds,
             color,
             role,
+            shape: OrnamentShape::Rectangle,
         }
+    }
+
+    #[must_use]
+    pub const fn with_shape(mut self, shape: OrnamentShape) -> Self {
+        self.shape = shape;
+        self
+    }
+    #[must_use]
+    pub const fn shape(self) -> OrnamentShape {
+        self.shape
     }
 
     #[must_use]
@@ -697,6 +722,32 @@ impl Primitive {
                 shadow: Some(shadow),
                 ..
             } => shadow.expand_bounds(bounds),
+            Self::Ornament(ornament) => {
+                match ornament.shape() {
+                    OrnamentShape::Rounded { radius } if !radius.is_finite() || radius < 0.0 => {
+                        return Err(SceneError::InvalidGeometry("invalid ornament radius"));
+                    }
+                    OrnamentShape::Polyline { points, width }
+                        if !width.is_finite()
+                            || width <= 0.0
+                            || points.iter().any(|p| {
+                                !p.x().is_finite()
+                                    || !p.y().is_finite()
+                                    || p.x() < width / 2.0
+                                    || p.y() < width / 2.0
+                                    || p.x() > ornament.bounds().width() - width / 2.0
+                                    || p.y() > ornament.bounds().height() - width / 2.0
+                            }) =>
+                    {
+                        return Err(SceneError::InvalidGeometry(
+                            "stroke must stay inside ornament bounds",
+                        ));
+                    }
+
+                    _ => {}
+                }
+                Ok(ornament.bounds())
+            }
             _ => Ok(self.bounds()),
         }
     }

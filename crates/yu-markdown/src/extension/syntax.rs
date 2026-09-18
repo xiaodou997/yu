@@ -62,7 +62,34 @@ impl<'a> SyntaxNode<'a> {
     /// 前序遍历自己与全部后代。
     #[must_use]
     pub fn descendants(self) -> Descendants<'a> {
-        Descendants { stack: vec![self] }
+        Descendants {
+            stack: vec![self],
+            bounds: None,
+        }
+    }
+
+    pub(crate) fn descendants_in(self, range: TextRange) -> Descendants<'a> {
+        Descendants {
+            stack: vec![self],
+            bounds: Some(range),
+        }
+    }
+
+    /// Container ancestry and the first semantic leaf touching this source
+    /// line. Prefix markers belong to their containers, not to the paragraph.
+    /// Sibling lookup is logarithmic; only the enclosing path is visited.
+    pub(crate) fn flow_path(self, offset: u32) -> Vec<Self> {
+        let mut cursor = self.tree.cursor(self.from);
+        let mut path = vec![self];
+        while cursor.kind().is_block_context() && cursor.child_ending_after(offset) {
+            while !cursor.kind().is_block() {
+                if !cursor.next_sibling() {
+                    return path;
+                }
+            }
+            path.push(Self::new(cursor.tree(), cursor.from()));
+        }
+        path
     }
 
     /// 完整包含 `range` 的最深**块级**节点。
@@ -117,6 +144,7 @@ impl<'a> SyntaxNode<'a> {
 /// [`SyntaxNode::descendants`] 的迭代器。
 pub struct Descendants<'a> {
     stack: Vec<SyntaxNode<'a>>,
+    bounds: Option<TextRange>,
 }
 
 impl<'a> Iterator for Descendants<'a> {
@@ -125,7 +153,24 @@ impl<'a> Iterator for Descendants<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.stack.pop()?;
         // 压栈顺序反过来，弹出来才是源码顺序。
-        let mut children: Vec<_> = node.children().collect();
+        let mut children: Vec<_> = if let Some(bounds) = self.bounds {
+            let mut children = Vec::new();
+            let mut cursor = node.tree.cursor(node.from);
+            if cursor.child_ending_after(bounds.start().get() as u32) {
+                loop {
+                    if cursor.from() as u64 >= bounds.end().get() {
+                        break;
+                    }
+                    children.push(SyntaxNode::new(cursor.tree(), cursor.from()));
+                    if !cursor.next_sibling() {
+                        break;
+                    }
+                }
+            }
+            children
+        } else {
+            node.children().collect()
+        };
         children.reverse();
         self.stack.extend(children);
         Some(node)

@@ -63,6 +63,18 @@ impl CoordinateSpace for Block {
     }
 }
 
+/// Painted text fragments share the block origin, but may overhang it.
+/// Native RTL trailing whitespace and font ink can extend left or above zero;
+/// this must not weaken the stricter contract for block layout boxes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct BlockInk;
+impl CoordinateSpace for BlockInk {
+    const NAME: &'static str = "block ink";
+    fn accepts_rect(_x: f32, _y: f32, _width: f32, height: f32) -> bool {
+        height > 0.0
+    }
+}
+
 /// 文档坐标：原点是文档内容的左上角，单位是逻辑像素。
 ///
 /// 这是 scene 与 RenderPlan 使用的空间。它**不含**滚动位移——滚动是渲染时
@@ -513,6 +525,18 @@ impl<From: CoordinateSpace, To: CoordinateSpace> fmt::Debug for Scale<From, To> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_ink_can_overhang_without_weakening_layout_boxes() {
+        let ink = Rect::<BlockInk>::new(-4.1875, -1.0, 20.0, 19.0).expect("native overhang");
+        let placed: Rect<Document> = ink
+            .translate_into(Point::new(30.0, 80.0))
+            .expect("reading origin");
+        assert_eq!((placed.x(), placed.y()), (25.8125, 79.0));
+        assert!(Rect::<Block>::new(-4.1875, -1.0, 20.0, 19.0).is_err());
+        assert!(Rect::<BlockInk>::new(0.0, 0.0, 20.0, 0.0).is_err());
+        assert!(Rect::<BlockInk>::new(f32::NAN, 0.0, 20.0, 19.0).is_err());
+    }
 
     #[test]
     fn rect_rejects_non_finite_and_negative_extent() {

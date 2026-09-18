@@ -5,6 +5,8 @@
 //! CoreText objects on the platform side while exporting owned glyph runs.
 
 use std::error::Error;
+#[cfg(target_os = "macos")]
+mod paragraph;
 use std::fmt;
 #[cfg(target_os = "macos")]
 use std::ptr::NonNull;
@@ -16,19 +18,15 @@ use std::sync::OnceLock;
 
 #[cfg(target_os = "macos")]
 use unicode_segmentation::UnicodeSegmentation;
-#[cfg(target_os = "macos")]
-use yu_core::ByteOffset;
 use yu_core::TextRange;
 use yu_core::TextStyle;
 use yu_font::FontFaceId;
 use yu_font::{
-    AtlasEntry, FontMetricKey, FontMetricsSnapshot, GlyphRasterKey, GlyphRasterizer,
-    RasterizedGlyph,
+    FontMetricKey, FontMetricsSnapshot, GlyphRasterKey, GlyphRasterizer, RasterizedGlyph,
 };
 #[cfg(target_os = "macos")]
 use yu_font::{
-    AtlasError, FontMetricsCache, FontSlant, FontWeight, Glyph, GlyphAtlas, GlyphAtlasConfig,
-    GlyphBitmap, GlyphId, GlyphMetrics, GlyphRun,
+    FontMetricsCache, FontSlant, FontWeight, Glyph, GlyphBitmap, GlyphId, GlyphMetrics, GlyphRun,
 };
 use yu_font::{FontRequest, ShapeError, ShapeRequest, ShapedText, ShapingProvider, TextDirection};
 #[cfg(target_os = "macos")]
@@ -41,8 +39,8 @@ use objc2_core_foundation::{
 };
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGBitmapContextGetBytesPerRow, CGBitmapContextGetData, CGContext,
-    CGGlyph, CGImageAlphaInfo,
+    CGBitmapContextCreate, CGBitmapContextGetBytesPerRow, CGBitmapContextGetData, CGColorSpace,
+    CGContext, CGGlyph, CGImageAlphaInfo, CGImageByteOrderInfo,
 };
 #[cfg(target_os = "macos")]
 use objc2_core_text::{
@@ -140,12 +138,10 @@ pub enum CoreTextRasterError {
     FaceTablePoisoned,
     FontUnavailable,
     MetricsCachePoisoned,
-    AtlasPoisoned,
     BitmapUnavailable,
     InvalidNativeMetrics,
     InvalidNativeBitmap,
     InvalidRasterData(Arc<str>),
-    Atlas(Arc<str>),
     /// 重建 face 得到的字体与 shaping 时选中的不是同一个。宁可失败也不能
     /// 用错误的字体解释 glyph id——那会画出无关字形而不报任何错。
     FaceMismatch {
@@ -177,7 +173,6 @@ impl fmt::Display for CoreTextRasterError {
             Self::MetricsCachePoisoned => {
                 formatter.write_str("CoreText metrics cache was poisoned")
             }
-            Self::AtlasPoisoned => formatter.write_str("CoreText glyph atlas was poisoned"),
             Self::BitmapUnavailable => {
                 formatter.write_str("CoreGraphics could not create a bitmap context")
             }
@@ -188,9 +183,6 @@ impl fmt::Display for CoreTextRasterError {
                 formatter.write_str("CoreGraphics returned invalid bitmap data")
             }
             Self::InvalidRasterData(message) => write!(formatter, "invalid raster data: {message}"),
-            Self::Atlas(message) => {
-                write!(formatter, "glyph atlas rejected raster data: {message}")
-            }
         }
     }
 }
@@ -379,37 +371,26 @@ impl CoreTextFontResolver {
     }
 }
 
-/// 一个 face 的身份，以及重建它所需的信息。
-///
-/// 只记 PostScript 名是不够的：CoreText 为系统 UI 字体做 cascade fallback 时
-/// 会选中私有字体（`.SFNS-Regular`、`.PingFangUITextSC-Regular`、
-/// `.AppleColorEmojiUI`），这些名字**无法**通过 `CTFontCreateWithName` 重建
-/// ——该函数在名字不可解析时不返回 null，而是静默回退到默认字体。用回退后的
-/// 字体去解释原字体的 glyph id，画出来就是完全无关的字形。
-///
-/// 因此这里额外记住触发该 face 的样本文本，栅格化时用与 shaping 完全相同的
-/// fallback 机制（`CTFontCreateForString`）重新选中同一个字体。
-///
-/// 还要记住 base font 的**族与字号倍率**：M4 起 `Code` 样式换成等宽族 +
-/// 0.92 倍字号（`style_font_request`），而 raster key 里的 size 是不带这个
-/// 倍率的基准字号——重建时先乘回来，族不对则 cascade 从错的 base 出发，
-/// PostScript 校验会把整帧判成 `FaceMismatch`。
+/// Retain the actual face selected by CoreText. Replaying fallback using one
+/// sample is not deterministic (e.g. SC versus TC language fallback).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct NativeFont(CFRetained<CTFont>);
+// SAFETY: CTFont is immutable and Apple explicitly permits simultaneous use
+// across threads. No CTLine, CTRun or typesetter crosses a thread boundary.
+// https://developer.apple.com/documentation/coretext
+#[cfg(target_os = "macos")]
+unsafe impl Send for NativeFont {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for NativeFont {}
+
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug)]
 struct FaceEntry {
     postscript_name: String,
-    /// 触发该 face 的样本文本。base font 自身对应空串。
-    sample: String,
-    /// base font 的族。Plain 是请求的族，Code 是等宽族。
-    family: Arc<str>,
-    /// base font 字号相对请求字号的倍率（Code 是 0.92，其余 1.0）。raster key
-    /// 的 size 乘它才是 shaping 时那个字号。
+    font: NativeFont,
     size_factor: f32,
-    /// base font 的字重与斜体。face 身份也取决于它们：同一个样本字符在
-    /// Bold 与 Regular 的 base 下会 cascade 到不同的 face
-    /// （`.PingFangUIDisplaySC-Bold` 与 `-Regular`）。
-    weight: FontWeight,
-    slant: FontSlant,
+    synthetic_bold: bool,
 }
 
 /// 这个进程里唯一的那张 face 表。
@@ -444,6 +425,7 @@ pub struct CoreTextShaper {
 enum CoreTextFontSource {
     RequestedFamily,
     SystemUi,
+    SystemMono,
 }
 
 /// Owned font metrics used to configure the native viewport before a full
@@ -504,6 +486,16 @@ impl CoreTextShaper {
         Ok(shaper)
     }
 
+    /// Change point size while retaining this host's font catalog and stable
+    /// fallback identities. No system font enumeration is needed for zoom.
+    pub fn resized(&self, size: f32) -> Result<Self, yu_font::FontError> {
+        let mut resized = self.clone();
+        resized.request = FontRequest::new(self.request.family(), size)?
+            .with_weight(self.request.weight())
+            .with_slant(self.request.slant());
+        Ok(resized)
+    }
+
     #[must_use]
     pub fn catalog(&self) -> &CoreTextFontCatalog {
         &self.catalog
@@ -527,32 +519,36 @@ impl CoreTextShaper {
             if sample.is_empty() {
                 return Err(CoreTextShapeError::InvalidViewportMetrics);
             }
-            let source = TextRange::new(
-                ByteOffset::ZERO,
-                ByteOffset::new(
-                    u64::try_from(sample.len())
-                        .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?,
-                ),
+            let visual = yu_core::VisualRange::new(
+                yu_core::VisualOffset::ZERO,
+                yu_core::VisualOffset::new(sample.len() as u64),
             )
             .ok_or(CoreTextShapeError::InvalidViewportMetrics)?;
-            let request = ShapeRequest::new(sample, source, TextStyle::Plain, self.request.clone())
-                .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
-            let shaped = self.shape_native(&request)?;
-            let grapheme_count = sample.graphemes(true).count();
-            let Some(run) = shaped.runs().first() else {
-                return Err(CoreTextShapeError::InvalidViewportMetrics);
-            };
-            if grapheme_count == 0 {
-                return Err(CoreTextShapeError::InvalidViewportMetrics);
-            }
-            let rasterizer = self.rasterizer();
-            let key = FontMetricKey::new(run.face(), self.request.size())
-                .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
-            let font_metrics = rasterizer
-                .font_metrics(key)
-                .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
-            let line_height = font_metrics.line_height();
-            let default_advance = shaped.advance() / grapheme_count as f32;
+            let paragraph = yu_core::ParagraphLayoutProvider::layout(
+                self,
+                &yu_core::ParagraphInput {
+                    font_strut_mode: yu_core::FontStrutMode::RunMetrics,
+                    text: sample,
+                    base_direction: yu_core::BaseDirection::Auto,
+                    runs: vec![yu_core::ParagraphRun {
+                        range: visual,
+                        style: yu_core::StyleId(0),
+                        attrs: yu_core::TextAttrs::default(),
+                    }],
+                    objects: Vec::new(),
+                    width: 1_000_000.0,
+                    indent: 0.0,
+                    line_height: self.request.size(),
+                },
+            )
+            .map_err(|_| CoreTextShapeError::InvalidViewportMetrics)?;
+            let line_height = self.request.size();
+            let default_advance = paragraph
+                .lines
+                .iter()
+                .map(|line| line.bounds.width())
+                .sum::<f32>()
+                / sample.graphemes(true).count().max(1) as f32;
             if !line_height.is_finite()
                 || line_height <= 0.0
                 || !default_advance.is_finite()
@@ -590,29 +586,56 @@ impl CoreTextShaper {
         }
     }
 
+    #[cfg(all(target_os = "macos", test))]
+    fn face_id(&self, font: &CTFont, request_size: f32) -> Result<FontFaceId, CoreTextShapeError> {
+        self.face_id_with_weight(font, request_size, false)
+    }
+
     #[cfg(target_os = "macos")]
-    fn face_id(
+    fn face_id_with_weight(
         &self,
-        postscript_name: &str,
-        sample: &str,
-        styled: &FontRequest,
+        font: &CTFont,
         request_size: f32,
+        wants_bold: bool,
     ) -> Result<FontFaceId, CoreTextShapeError> {
-        self.faces
-            .id_for(postscript_name, || FaceEntry {
-                postscript_name: postscript_name.to_owned(),
-                sample: sample.to_owned(),
-                family: Arc::from(styled.family()),
-                // raster key 的 size 是不带样式倍率的请求字号，乘回 shaping 时
-                // 的那个（Code 是 0.92 倍）两边才一致。
-                size_factor: styled.size() / request_size,
-                weight: styled.weight(),
-                slant: styled.slant(),
-            })
-            .map_err(|error| match error {
-                yu_font::FaceTableError::IdOverflow => CoreTextShapeError::FaceIdOverflow,
-                yu_font::FaceTableError::Poisoned => CoreTextShapeError::FaceTablePoisoned,
-            })
+        let synthetic_bold = synthetic_bold_offset(font, wants_bold) > 0.0;
+        let name = unsafe { font.post_script_name() }.to_string();
+        let factor = unsafe { font.size() } as f32 / request_size;
+        // CoreText equality includes native descriptor attributes, variations,
+        // point size and matrix. PostScript names alone alias optical variants.
+        // A hash chooses a bucket only; equality resolves collisions before an
+        // existing face id can be reused by another worker or rasterizer.
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(font, &mut hash);
+        let bucket = std::hash::Hasher::finish(&hash);
+        let map_error = |error| match error {
+            yu_font::FaceTableError::IdOverflow => CoreTextShapeError::FaceIdOverflow,
+            yu_font::FaceTableError::Poisoned => CoreTextShapeError::FaceTablePoisoned,
+        };
+        for collision in 0..u32::MAX {
+            let identity = format!("{bucket}:{}:{synthetic_bold}:{collision}", factor.to_bits());
+            let face = self
+                .faces
+                .id_for(&identity, || FaceEntry {
+                    postscript_name: name.clone(),
+                    font: NativeFont(unsafe { CFRetained::retain(NonNull::from(font)) }),
+                    size_factor: factor,
+                    synthetic_bold,
+                })
+                .map_err(map_error)?;
+            let equal = self
+                .faces
+                .with_entry(face, |entry| {
+                    let retained: &CTFont = &entry.font.0;
+                    retained == font && entry.synthetic_bold == synthetic_bold
+                })
+                .map_err(map_error)?
+                .ok_or(CoreTextShapeError::MissingRunFont)?;
+            if equal {
+                return Ok(face);
+            }
+        }
+        Err(CoreTextShapeError::FaceIdOverflow)
     }
 
     /// 排一个完整的 `ShapeRequest`（调用方自己指定 font 与 style）。
@@ -643,74 +666,28 @@ impl CoreTextShaper {
     }
 }
 
-/// CoreText-backed metrics and CPU glyph rasterization.
-///
-/// This is deliberately a preparation-layer object: it returns owned
-/// single-channel pixels and atlas placements, not a platform texture or a
-/// `CTFontRef`. The future renderer can upload atlas pages without changing
-/// the editor/source model.
-#[derive(Debug)]
+/// Returns native glyph pixels. The frame builder owns the only glyph atlas;
+/// the font adapter retains metric values, never a duplicate packed atlas.
+#[derive(Clone, Debug)]
 pub struct CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
     faces: SharedFaceTable<FaceEntry>,
-    font_source: CoreTextFontSource,
     #[cfg(target_os = "macos")]
     metrics: Arc<Mutex<FontMetricsCache>>,
-    #[cfg(target_os = "macos")]
-    atlas: Arc<Mutex<GlyphAtlas>>,
-}
-
-impl Clone for CoreTextGlyphRasterizer {
-    fn clone(&self) -> Self {
-        Self {
-            #[cfg(target_os = "macos")]
-            faces: self.faces.clone(),
-            font_source: self.font_source,
-            #[cfg(target_os = "macos")]
-            metrics: Arc::clone(&self.metrics),
-            #[cfg(target_os = "macos")]
-            atlas: Arc::clone(&self.atlas),
-        }
-    }
 }
 
 impl CoreTextGlyphRasterizer {
     #[cfg(target_os = "macos")]
-    fn with_faces(faces: &SharedFaceTable<FaceEntry>, font_source: CoreTextFontSource) -> Self {
+    fn with_faces(faces: &SharedFaceTable<FaceEntry>, _font_source: CoreTextFontSource) -> Self {
         Self {
             faces: faces.clone(),
-            font_source,
             metrics: Arc::new(Mutex::new(FontMetricsCache::new())),
-            atlas: Arc::new(Mutex::new(GlyphAtlas::new(GlyphAtlasConfig::default()))),
         }
     }
 
     #[cfg(not(target_os = "macos"))]
     fn unsupported() -> Self {
-        Self {
-            font_source: CoreTextFontSource::RequestedFamily,
-        }
-    }
-
-    /// Returns the cached atlas placement, if this glyph has already been
-    /// rasterized by this provider.
-    #[cfg(target_os = "macos")]
-    pub fn atlas_entry(
-        &self,
-        key: GlyphRasterKey,
-    ) -> Result<Option<AtlasEntry>, CoreTextRasterError> {
-        self.atlas
-            .lock()
-            .map_err(|_| CoreTextRasterError::AtlasPoisoned)
-            .map(|atlas| atlas.entry(key))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn atlas_entry(
-        &self,
-        _key: GlyphRasterKey,
-    ) -> Result<Option<AtlasEntry>, CoreTextRasterError> {
-        Err(CoreTextRasterError::UnsupportedPlatform)
+        Self {}
     }
 
     #[cfg(target_os = "macos")]
@@ -723,19 +700,6 @@ impl CoreTextGlyphRasterizer {
 
     #[cfg(not(target_os = "macos"))]
     pub fn metrics_cache_len(&self) -> Result<usize, CoreTextRasterError> {
-        Err(CoreTextRasterError::UnsupportedPlatform)
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn atlas_page_count(&self) -> Result<usize, CoreTextRasterError> {
-        self.atlas
-            .lock()
-            .map_err(|_| CoreTextRasterError::AtlasPoisoned)
-            .map(|atlas| atlas.page_count())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn atlas_page_count(&self) -> Result<usize, CoreTextRasterError> {
         Err(CoreTextRasterError::UnsupportedPlatform)
     }
 }
@@ -771,33 +735,33 @@ impl GlyphRasterizer for CoreTextGlyphRasterizer {
     }
 
     fn rasterize(&self, key: GlyphRasterKey) -> Result<RasterizedGlyph, Self::Error> {
-        if let Some(glyph) = self
-            .atlas
-            .lock()
-            .map_err(|_| CoreTextRasterError::AtlasPoisoned)?
-            .get(key)
-        {
-            return Ok(glyph.as_ref().clone());
-        }
-
         let glyph = u16::try_from(key.glyph().get())
             .map_err(|_| CoreTextRasterError::InvalidGlyphId(key.glyph().get()))?;
-        let font = self.font_for_face(key.face(), key.size(), key.raster_scale())?;
-        let (bounds, advance) = native_glyph_geometry(&font, glyph)?;
-        let (bitmap, bearing_x, bearing_y) = rasterize_glyph(&font, glyph, bounds)?;
-        let metrics = GlyphMetrics::new(bearing_x, bearing_y, advance)
-            .map_err(|_| CoreTextRasterError::InvalidNativeMetrics)?;
+        let font = self.font_for_face(key.face(), key.size(), 1.0)?;
+        let (mut bounds, advance) = native_glyph_geometry(&font, glyph)?;
+        let wants_bold = self
+            .faces
+            .with_entry(key.face(), |entry| entry.synthetic_bold)
+            .map_err(|_| CoreTextRasterError::FaceTablePoisoned)?
+            .ok_or(CoreTextRasterError::UnknownFace(key.face()))?;
+        let bold_offset = synthetic_bold_offset(&font, wants_bold);
+        if bounds.size.width > 0.0 {
+            bounds.size.width += bold_offset;
+        }
+        let scale = f64::from(key.raster_scale());
+        bounds.origin.x *= scale;
+        bounds.origin.y *= scale;
+        bounds.size.width *= scale;
+        bounds.size.height *= scale;
+        let (bitmap, bearing_x, bearing_y) =
+            rasterize_glyph(&font, glyph, bounds, scale, bold_offset)?;
+        let metrics = GlyphMetrics::new(
+            bearing_x,
+            bearing_y,
+            (advance + bold_offset as f32) * key.raster_scale(),
+        )
+        .map_err(|_| CoreTextRasterError::InvalidNativeMetrics)?;
         let rasterized = RasterizedGlyph::new(key, metrics, bitmap);
-        self.atlas
-            .lock()
-            .map_err(|_| CoreTextRasterError::AtlasPoisoned)?
-            .insert(rasterized.clone())
-            .map_err(|error| match error {
-                AtlasError::InvalidBitmap(error) => {
-                    CoreTextRasterError::InvalidRasterData(Arc::from(error.to_string()))
-                }
-                other => CoreTextRasterError::Atlas(Arc::from(other.to_string())),
-            })?;
         Ok(rasterized)
     }
 }
@@ -825,9 +789,8 @@ impl CoreTextGlyphRasterizer {
     /// 不失败，而是静默返回默认字体。用它去解释原字体的 glyph id，画出来就是
     /// 完全无关的字形——中文和 emoji 会变成拉丁/西里尔符号。
     ///
-    /// 因此这里重放 shaping 时的选择过程：先取 base font，再用记录下来的样本
-    /// 字符触发同一次 `CTFontCreateForString` fallback，最后校验结果确实是同
-    /// 一个 face。校验失败宁可报错，也不画出错误字形。
+    /// Retain the actual immutable CTFont selected by CoreText and copy it at
+    /// the requested logical size and raster transform. No sample-based replay.
     fn font_for_face(
         &self,
         face: FontFaceId,
@@ -840,29 +803,23 @@ impl CoreTextGlyphRasterizer {
             .map_err(|_| CoreTextRasterError::FaceTablePoisoned)?
             .ok_or(CoreTextRasterError::UnknownFace(face))?;
 
-        // 复用 shaping 侧构造 base font 的同一个函数：两条路径各写一遍迟早
-        // 会分叉，而分叉的表现就是画出错误字形。
-        //
-        // size 必须是**逻辑**尺寸，栅格倍率只进变换矩阵——否则会选到另一个
-        // optical size 变体（PingFang UI Text ↔ Display），glyph id 随之失配。
-        // 族与字号倍率取 face 自己的那一份（Code 是等宽族 + 0.92）：raster key
-        // 的 size 是不带倍率的基准字号。
-        let request = FontRequest::new(&*entry.family, size * entry.size_factor)
-            .map_err(|_| CoreTextRasterError::FontUnavailable)?
-            .with_weight(entry.weight)
-            .with_slant(entry.slant);
-        let base = create_core_text_font_scaled(&request, self.font_source, raster_scale)
-            .map_err(|_| CoreTextRasterError::FontUnavailable)?;
-
-        let font = if entry.sample.is_empty() {
-            base
-        } else {
-            let sample = CFString::from_str(&entry.sample);
-            let range = CFRange {
-                location: 0,
-                length: sample.length(),
-            };
-            unsafe { base.for_string(&sample, range) }
+        // Replay the shaping font's transform as well as the backing scale.
+        // Replacing it with a pure scale erases synthesized oblique faces.
+        let original = unsafe { entry.font.0.matrix() };
+        let scale = f64::from(raster_scale);
+        let matrix = CGAffineTransform {
+            a: original.a * scale,
+            b: original.b * scale,
+            c: original.c * scale,
+            d: original.d * scale,
+            tx: original.tx * scale,
+            ty: original.ty * scale,
+        };
+        let font = unsafe {
+            entry
+                .font
+                .0
+                .copy_with_attributes((size * entry.size_factor) as f64, &matrix, None)
         };
 
         let actual = unsafe { font.post_script_name() }.to_string();
@@ -918,10 +875,25 @@ fn native_glyph_geometry(
 }
 
 #[cfg(target_os = "macos")]
+fn synthetic_bold_offset(font: &CTFont, wants_bold: bool) -> f64 {
+    let traits = unsafe { font.symbolic_traits() };
+    if wants_bold
+        && !traits
+            .intersects(CTFontSymbolicTraits::TraitBold | CTFontSymbolicTraits::TraitColorGlyphs)
+    {
+        (unsafe { font.size() }) / 36.0
+    } else {
+        0.0
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn rasterize_glyph(
     font: &CTFont,
     glyph: CGGlyph,
     bounds: CGRect,
+    raster_scale: f64,
+    bold_offset: f64,
 ) -> Result<(GlyphBitmap, f32, f32), CoreTextRasterError> {
     let min_x = bounds.origin.x;
     let min_y = bounds.origin.y;
@@ -944,24 +916,38 @@ fn rasterize_glyph(
         usize::try_from(width).map_err(|_| CoreTextRasterError::InvalidNativeBitmap)?;
     let height_usize =
         usize::try_from(height).map_err(|_| CoreTextRasterError::InvalidNativeBitmap)?;
+    let color = unsafe { font.symbolic_traits() }.contains(CTFontSymbolicTraits::TraitColorGlyphs);
+    let channels = if color { 4 } else { 1 };
+    let color_space = if color {
+        CGColorSpace::new_device_rgb()
+    } else {
+        None
+    };
     let context = unsafe {
         CGBitmapContextCreate(
             std::ptr::null_mut(),
             width_usize,
             height_usize,
             8,
-            width_usize,
-            None,
-            CGImageAlphaInfo::Only.0,
+            width_usize * channels,
+            color_space.as_deref(),
+            if color {
+                CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0
+            } else {
+                CGImageAlphaInfo::Only.0
+            },
         )
     }
     .ok_or(CoreTextRasterError::BitmapUnavailable)?;
     CGContext::set_gray_fill_color(Some(context.as_ref()), 0.0, 1.0);
 
+    // Bitmap color fonts do not reliably apply a CTFont matrix. Scale the
+    // drawing context while retaining the logical font/optical variant.
+    CGContext::scale_ctm(Some(context.as_ref()), raster_scale, raster_scale);
     let mut glyph = glyph;
     let mut position = CGPoint {
-        x: (-left) as _,
-        y: (-bottom) as _,
+        x: (-left / raster_scale) as _,
+        y: (-bottom / raster_scale) as _,
     };
     unsafe {
         font.draw_glyphs(
@@ -971,39 +957,39 @@ fn rasterize_glyph(
             context.as_ref(),
         );
     }
+    if bold_offset > 0.0 {
+        position.x += bold_offset;
+        unsafe {
+            font.draw_glyphs(
+                NonNull::from(&mut glyph),
+                NonNull::from(&mut position),
+                1,
+                context.as_ref(),
+            );
+        }
+    }
     let stride = CGBitmapContextGetBytesPerRow(Some(context.as_ref()));
     let data = CGBitmapContextGetData(Some(context.as_ref()));
-    if data.is_null() || stride < width_usize {
+    let row_bytes = width_usize
+        .checked_mul(channels)
+        .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
+    if data.is_null() || stride < row_bytes {
         return Err(CoreTextRasterError::InvalidNativeBitmap);
     }
     let source_len = stride
         .checked_mul(height_usize)
         .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
     let source = unsafe { std::slice::from_raw_parts(data.cast_const().cast::<u8>(), source_len) };
-    let pixel_len = width_usize
-        .checked_mul(height_usize)
-        .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
-    let mut pixels = vec![0_u8; pixel_len];
+    let mut pixels = Vec::with_capacity(row_bytes * height_usize);
     for row in 0..height_usize {
-        let source_start = row
-            .checked_mul(stride)
-            .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
-        // CGBitmapContext 的绘制坐标原点在左下，但内存布局是 top-down：
-        // 扫描线 0 就是图像顶部。因此这里直接按行拷贝——额外翻转会让每个
-        // 字形上下颠倒，而拉丁字母颠倒后不易察觉，中文一眼可见。
-        let target_start = row
-            .checked_mul(width_usize)
-            .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
-        let source_row = source
-            .get(source_start..source_start + width_usize)
-            .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
-        let target_row = pixels
-            .get_mut(target_start..target_start + width_usize)
-            .ok_or(CoreTextRasterError::InvalidNativeBitmap)?;
-        target_row.copy_from_slice(source_row);
+        pixels.extend_from_slice(&source[row * stride..row * stride + row_bytes]);
     }
-    let bitmap = GlyphBitmap::new(width, height, width, pixels)
-        .map_err(|error| CoreTextRasterError::InvalidRasterData(Arc::from(error.to_string())))?;
+    let bitmap = if color {
+        GlyphBitmap::new_rgba(width, height, row_bytes as u32, pixels)
+    } else {
+        GlyphBitmap::new(width, height, width, pixels)
+    }
+    .map_err(|error| CoreTextRasterError::InvalidRasterData(Arc::from(error.to_string())))?;
     Ok((bitmap, left as f32, top as f32))
 }
 
@@ -1016,6 +1002,16 @@ fn raster_dimension(value: f64) -> Result<u32, CoreTextRasterError> {
 }
 
 impl ShapingProvider for CoreTextShaper {
+    fn paragraph_provider(&self) -> Option<&dyn yu_core::ParagraphLayoutProvider> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(self)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
     type Error = ShapeError;
 
     fn shape(
@@ -1064,7 +1060,7 @@ impl yu_font::RasterizingShaper for CoreTextShaper {
 #[cfg(target_os = "macos")]
 /// 代码字面量的字号倍率：等宽字面偏宽，0.92 让行内代码不显比正文大——
 /// Typora 系主题的同一条取舍。行内 chip 与代码块同待遇。
-const CODE_FONT_SIZE_SCALE: f32 = 0.92;
+const CODE_FONT_SIZE_SCALE: f32 = 1.0;
 
 #[cfg(target_os = "macos")]
 /// 代码字面量的等宽族：SF Mono 优先，缺失时落 Menlo（系统自带）。
@@ -1092,20 +1088,23 @@ fn family_available(family: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn style_font_request(request: &FontRequest, style: TextStyle) -> FontRequest {
-    match style {
-        TextStyle::Strong => request.clone().with_weight(FontWeight::Bold),
-        TextStyle::Emphasis => request.clone().with_slant(FontSlant::Italic),
-        TextStyle::Plain => request.clone(),
-        // 等宽族 + 0.92 倍字号。family 是探测出的非空常量、size 来自已校验的
-        // 请求——构造不会失败；万一走了不可能路径，落回原体请求比 panic 掉
-        // 整段 shaping 便宜，画面只会在代码字面处露馅。
-        TextStyle::Code => FontRequest::new(mono_family(), request.size() * CODE_FONT_SIZE_SCALE)
+    let mut styled = if style.is_code() {
+        FontRequest::new(mono_family(), request.size() * CODE_FONT_SIZE_SCALE)
             .map(|mono| {
                 mono.with_weight(request.weight())
                     .with_slant(request.slant())
             })
-            .unwrap_or_else(|_| request.clone()),
+            .unwrap_or_else(|_| request.clone())
+    } else {
+        request.clone()
+    };
+    if style.is_strong() {
+        styled = styled.with_weight(FontWeight::Bold);
     }
+    if style.is_emphasis() {
+        styled = styled.with_slant(FontSlant::Italic);
+    }
+    styled
 }
 
 #[cfg(target_os = "macos")]
@@ -1124,6 +1123,14 @@ fn create_core_text_font_scaled(
             let family = CFString::from_str(request.family());
             unsafe { CTFont::with_name(&family, request.size() as _, std::ptr::null()) }
         }
+        CoreTextFontSource::SystemMono => unsafe {
+            CTFont::new_ui_font_for_language(
+                CTFontUIFontType::UserFixedPitch,
+                request.size() as _,
+                None,
+            )
+        }
+        .ok_or(CoreTextShapeError::FontUnavailable)?,
         CoreTextFontSource::SystemUi => unsafe {
             CTFont::new_ui_font_for_language(CTFontUIFontType::System, request.size() as _, None)
         }
@@ -1150,10 +1157,24 @@ fn create_core_text_font_scaled(
     } else {
         std::ptr::from_ref(&matrix)
     };
-    Ok(unsafe {
-        base.copy_with_symbolic_traits(request.size() as _, matrix_ptr, value, mask)
+    if let Some(native) =
+        unsafe { base.copy_with_symbolic_traits(request.size() as _, matrix_ptr, value, mask) }
+    {
+        return Ok(native);
+    }
+    // Preserve a real bold face even when the family has no italic variant.
+    let weight = value & CTFontSymbolicTraits::TraitBold;
+    let upright = unsafe {
+        base.copy_with_symbolic_traits(request.size() as _, std::ptr::null(), weight, mask)
             .unwrap_or(base)
-    })
+    };
+    let mut fallback_matrix = matrix;
+    if request.slant() != FontSlant::Upright {
+        // WebKit's default synthetic oblique angle; reference screenshots
+        // remain the acceptance oracle for the installed engine version.
+        fallback_matrix.c = 14.0_f64.to_radians().tan() * f64::from(raster_scale);
+    }
+    Ok(unsafe { upright.copy_with_attributes(request.size() as _, &fallback_matrix, None) })
 }
 
 #[cfg(target_os = "macos")]
@@ -1188,7 +1209,25 @@ fn shape_with_core_text(
     let attributed =
         unsafe { CFAttributedString::new(None, Some(&string), Some(attributes.as_ref())) }
             .ok_or(CoreTextShapeError::AttributedStringUnavailable)?;
-    let line = unsafe { CTLine::with_attributed_string(&attributed) };
+    let mutable =
+        objc2_core_foundation::CFMutableAttributedString::new_copy(None, 0, Some(&attributed))
+            .ok_or(CoreTextShapeError::AttributedStringUnavailable)?;
+    let bold_offset = synthetic_bold_offset(&font, font_request.weight() == FontWeight::Bold);
+    if bold_offset > 0.0 {
+        let kern = objc2_core_foundation::CFNumber::new_f64(bold_offset);
+        unsafe {
+            objc2_core_foundation::CFMutableAttributedString::set_attribute(
+                Some(&mutable),
+                CFRange {
+                    location: 0,
+                    length: string.length(),
+                },
+                Some(objc2_core_text::kCTKernAttributeName),
+                Some(kern.as_ref()),
+            );
+        }
+    }
+    let line = unsafe { CTLine::with_attributed_string(&mutable) };
     let runs = unsafe { line.glyph_runs() };
     let runs: CFRetained<CFArray<CTRun>> = unsafe { CFRetained::cast_unchecked(runs) };
     let map = Utf16Map::new(request.text());
@@ -1200,27 +1239,6 @@ fn shape_with_core_text(
         return Err(CoreTextShapeError::InvalidGlyphRun);
     }
     Ok(ShapedText::new(request.source(), glyph_runs))
-}
-
-#[cfg(target_os = "macos")]
-/// 该 run 的首个字符，用作重建其 fallback 字体的样本。
-///
-/// CoreText 的 cascade 是按字符决定的，首字符足以重新选中同一个 face。
-#[cfg(target_os = "macos")]
-fn run_sample(request: &ShapeRequest<'_>, source: TextRange) -> String {
-    let base = request.source().start().get();
-    let Some(start) = source.start().get().checked_sub(base) else {
-        return String::new();
-    };
-    let Ok(start) = usize::try_from(start) else {
-        return String::new();
-    };
-    request
-        .text()
-        .get(start..)
-        .and_then(|tail| tail.chars().next())
-        .map(String::from)
-        .unwrap_or_default()
 }
 
 #[cfg(target_os = "macos")]
@@ -1259,9 +1277,11 @@ fn shape_run(
     }
     // 记住触发这个 face 的字符：栅格化时要用同样的 fallback 机制重建它，
     // 私有 UI 字体的名字无法反过来创建字体。
-    let sample = run_sample(request, source);
-    let styled = style_font_request(request.font(), request.style());
-    let face_id = shaper.face_id(&postscript_name, &sample, &styled, request.font().size())?;
+    let face_id = shaper.face_id_with_weight(
+        &face,
+        request.font().size(),
+        request.style().is_strong() || request.font().weight() == FontWeight::Bold,
+    )?;
 
     let cf_range = CFRange {
         location: 0,
@@ -1428,6 +1448,29 @@ mod tests {
     use yu_core::{ByteOffset, TextRange};
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn composed_styles_preserve_both_font_traits() {
+        let request = FontRequest::new("Helvetica Neue", 16.0).expect("request");
+        for style in [TextStyle::StrongEmphasis, TextStyle::CodeStrongEmphasis] {
+            let styled = style_font_request(&request, style);
+            assert_eq!(styled.weight(), FontWeight::Bold);
+            assert_eq!(styled.slant(), FontSlant::Italic);
+            let font = create_core_text_font(&styled, CoreTextFontSource::RequestedFamily)
+                .expect("native font");
+            let traits = unsafe { font.symbolic_traits() };
+            assert!(
+                traits.contains(CTFontSymbolicTraits::TraitBold),
+                "{style:?} lost native bold"
+            );
+            assert!(
+                traits.contains(CTFontSymbolicTraits::TraitItalic),
+                "{style:?} lost native italic"
+            );
+            assert!(unsafe { font.ascent() } > 0.0);
+        }
+    }
+
+    #[test]
     fn catalog_normalizes_names() {
         let catalog = CoreTextFontCatalog::from_families(["Zed", "Yu", "Yu", ""]);
         assert_eq!(
@@ -1528,6 +1571,30 @@ mod tests {
     /// 断言分两层：字体身份一致（由 font_for_face 的自校验保证），以及
     /// CJK/emoji 的字形尺寸确实大于拉丁字母——身份校验万一被绕过，尺寸也能
     /// 暴露出「用拉丁字体画中文」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resized_system_font_reuses_catalog_and_scales_mixed_text() {
+        let original =
+            CoreTextShaper::from_system_ui(FontRequest::new("System UI", 16.0).expect("request"))
+                .expect("system font");
+        let resized = original.resized(24.0).expect("larger font");
+        assert!(Arc::ptr_eq(
+            &original.catalog.families,
+            &resized.catalog.families
+        ));
+        assert_eq!(original.font_source, resized.font_source);
+        assert_eq!(original.request.size(), 16.0);
+        assert_eq!(resized.request.size(), 24.0);
+        let a = original.viewport_metrics("M中🙂e\u{301}").expect("metrics");
+        let b = resized
+            .viewport_metrics("M中🙂e\u{301}")
+            .expect("larger metrics");
+        assert!(b.line_height() > a.line_height());
+        assert!(b.default_advance() > a.default_advance());
+        assert!(original.resized(f32::NAN).is_err());
+        assert!(original.resized(0.0).is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn rasterized_font_matches_shaped_face_across_scripts() {
@@ -1864,7 +1931,7 @@ mod tests {
     /// 一个不拒的后端也会让它绿。
     #[cfg(target_os = "macos")]
     #[test]
-    fn scripts_core_text_refuses_still_produce_glyphs() {
+    fn native_paragraphs_render_complex_scripts_without_substitution() {
         let request = FontRequest::new("System UI", 16.0).expect("request should be valid");
         let shaper =
             CoreTextShaper::from_system_ui(request.clone()).expect("CoreText should initialize");
@@ -1873,13 +1940,6 @@ mod tests {
             "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627}",
             "\u{0939}\u{093f}\u{0928}\u{094d}\u{0926}\u{0940}",
         ] {
-            let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(text.len() as u64))
-                .expect("source range should be valid");
-            assert!(
-                ShapingProvider::shape(&shaper, text, source, TextStyle::Plain).is_err(),
-                "CoreText 本来就拒 {text:?}——它不拒的话这条用例什么都没证明"
-            );
-
             let visual = yu_core::VisualRange::new(
                 yu_core::VisualOffset::ZERO,
                 yu_core::VisualOffset::new(text.len() as u64),
@@ -1897,20 +1957,13 @@ mod tests {
             .expect("排不出来的脚本不该让整个块失败");
 
             assert!(!layout.clusters().is_empty());
+            assert!(!layout.glyphs().is_empty());
             assert_eq!(
-                layout.glyphs().len(),
-                layout.clusters().len(),
-                "{text:?} 的每一个簇都要画得出来"
-            );
-            assert!(
-                layout.substituted_clusters() > 0,
-                "{text:?} 应该有簇被替换，否则这条用例走的不是降级那条路"
+                layout.substituted_clusters(),
+                0,
+                "native shaping must preserve the script"
             );
 
-            // 「画得出来」要一直验到栅格化。替代字形的 face 是 CoreText 为
-            // U+FFFD 选的那一个——铸 id 的是 shaper，消费 id 的是 rasterizer，
-            // 两者共用一张表（`yu_font::SharedFaceTable`）。这一步失败的表现
-            // 是「布局有字形而屏幕上仍然什么都没有」。
             let rasterizer = shaper.rasterizer();
             for glyph in layout.glyphs() {
                 let key = GlyphRasterKey::new(glyph.face(), glyph.glyph(), 16.0)
@@ -1964,7 +2017,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn core_text_rasterizer_returns_owned_pixels_and_reuses_caches() {
+    fn core_text_rasterizer_returns_owned_pixels_and_reuses_metric_cache() {
         let catalog = CoreTextFontCatalog::system().expect("CoreText should expose families");
         let family = catalog.families()[0].clone();
         let request = FontRequest::new(family.as_ref(), 18.0).expect("request should be valid");
@@ -2000,13 +2053,267 @@ mod tests {
             .rasterize(key)
             .expect("cached glyph should rasterize");
         assert_eq!(first, second);
-        let entry = rasterizer
-            .atlas_entry(key)
-            .expect("atlas query")
-            .expect("glyph should have an atlas entry");
-        assert!(entry.page().is_some());
-        assert_eq!(entry.rect().width(), first.bitmap().width());
-        assert_eq!(rasterizer.atlas_page_count().expect("atlas"), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_emoji_rasterization_retains_color() {
+        let shaper =
+            CoreTextShaper::from_system_ui(FontRequest::new("System UI", 16.0).expect("font"))
+                .expect("CoreText");
+        let text = "👨‍👩‍👧‍👦 🇦🇺 🙂";
+        let range = yu_core::VisualRange::new(
+            yu_core::VisualOffset::ZERO,
+            yu_core::VisualOffset::new(text.len() as u64),
+        )
+        .expect("range");
+        let paragraph = yu_core::ParagraphLayoutProvider::layout(
+            &shaper,
+            &yu_core::ParagraphInput {
+                font_strut_mode: yu_core::FontStrutMode::RunMetrics,
+                text,
+                base_direction: yu_core::BaseDirection::Auto,
+                runs: vec![yu_core::ParagraphRun {
+                    range,
+                    style: yu_core::StyleId(0),
+                    attrs: yu_core::TextAttrs::default(),
+                }],
+                objects: Vec::new(),
+                width: 500.0,
+                indent: 0.0,
+                line_height: 25.6,
+            },
+        )
+        .expect("paragraph");
+        let rasterizer = shaper.rasterizer();
+        let mut colorful = 0;
+        for glyph in &paragraph.glyphs {
+            let key = GlyphRasterKey::new(glyph.face, glyph.glyph, 16.0 * glyph.size_scale)
+                .expect("glyph");
+            let raster = rasterizer.rasterize(key).expect("raster");
+            let bitmap = raster.bitmap();
+            let retina = rasterizer
+                .rasterize(key.with_raster_scale(2.0).expect("Retina key"))
+                .expect("Retina glyph");
+            if bitmap.is_color() {
+                let ink_extent = |bitmap: &GlyphBitmap| {
+                    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+                        (bitmap.width(), bitmap.height(), 0, 0);
+                    for y in 0..bitmap.height() {
+                        for x in 0..bitmap.width() {
+                            let alpha = bitmap.pixels()[(y * bitmap.stride() + x * 4 + 3) as usize];
+                            if alpha > 32 {
+                                min_x = min_x.min(x);
+                                min_y = min_y.min(y);
+                                max_x = max_x.max(x);
+                                max_y = max_y.max(y);
+                            }
+                        }
+                    }
+                    (
+                        max_x.saturating_sub(min_x) + 1,
+                        max_y.saturating_sub(min_y) + 1,
+                    )
+                };
+                let one = ink_extent(bitmap);
+                let two = ink_extent(retina.bitmap());
+                assert!(
+                    two.0 + 3 >= one.0 * 2 && two.1 + 3 >= one.1 * 2,
+                    "Retina color ink must scale, not only its bitmap canvas: {one:?} -> {two:?}"
+                );
+                assert!(
+                    retina.bitmap().width() >= bitmap.width() * 2 - 4,
+                    "Retina emoji width collapsed"
+                );
+                assert!(
+                    retina.bitmap().height() >= bitmap.height() * 2 - 4,
+                    "Retina emoji height collapsed"
+                );
+                assert!(
+                    (retina.metrics().advance_x() / 2.0 - raster.metrics().advance_x()).abs()
+                        < 0.01
+                );
+            }
+            if bitmap.is_color()
+                && bitmap
+                    .pixels()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] > 0 && (pixel[0] != pixel[1] || pixel[1] != pixel[2]))
+            {
+                colorful += 1;
+            }
+        }
+        assert!(
+            colorful >= 3,
+            "family, flag and smile should have native color pixels; got {colorful}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synthesized_oblique_survives_face_identity_and_retina_replay() {
+        for family in ["Lucida Grande", "Monaco"] {
+            let request = FontRequest::new(family, 16.0).expect("font");
+            let shaper = CoreTextShaper::from_system(request.clone()).expect("shaper");
+            let upright = create_core_text_font(&request, CoreTextFontSource::RequestedFamily)
+                .expect("upright");
+            let italic_request = request.clone().with_slant(FontSlant::Italic);
+            let italic =
+                create_core_text_font(&italic_request, CoreTextFontSource::RequestedFamily)
+                    .expect("italic");
+            let shear = 14.0_f64.to_radians().tan();
+            assert!((unsafe { italic.matrix() }.c - shear).abs() < 1e-6);
+            let upright_id = shaper.face_id(&upright, 16.0).expect("upright id");
+            let italic_id = shaper.face_id(&italic, 16.0).expect("italic id");
+            assert_ne!(
+                upright_id, italic_id,
+                "synthetic face must not alias upright"
+            );
+            for scale in [1.0, 2.0] {
+                let replay = shaper
+                    .rasterizer()
+                    .font_for_face(italic_id, 16.0, scale)
+                    .expect("replay");
+                let matrix = unsafe { replay.matrix() };
+                assert!((matrix.c - shear * f64::from(scale)).abs() < 1e-6);
+                assert!((matrix.a - f64::from(scale)).abs() < 1e-6);
+            }
+        }
+        let request = FontRequest::new("Lucida Grande", 16.0)
+            .expect("font")
+            .with_weight(FontWeight::Bold)
+            .with_slant(FontSlant::Italic);
+        let font = create_core_text_font(&request, CoreTextFontSource::RequestedFamily)
+            .expect("bold oblique");
+        assert!(unsafe { font.symbolic_traits() }.contains(CTFontSymbolicTraits::TraitBold));
+        assert!(unsafe { font.matrix() }.c > 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn synthetic_oblique_reaches_glyph_pixels_at_both_backing_scales() {
+        for family in ["Lucida Grande", "Monaco"] {
+            let shaper = CoreTextShaper::from_system(FontRequest::new(family, 32.0).expect("font"))
+                .expect("shaper");
+            let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(1)).expect("range");
+            let upright =
+                ShapingProvider::shape(&shaper, "H", source, TextStyle::Plain).expect("upright");
+            let italic =
+                ShapingProvider::shape(&shaper, "H", source, TextStyle::Emphasis).expect("italic");
+            let a = &upright.runs()[0];
+            let b = &italic.runs()[0];
+            assert_ne!(a.face(), b.face());
+            for scale in [1.0, 2.0] {
+                let key_a = GlyphRasterKey::new(a.face(), a.glyphs()[0].id(), 32.0)
+                    .expect("key")
+                    .with_raster_scale(scale)
+                    .expect("scale");
+                let key_b = GlyphRasterKey::new(b.face(), b.glyphs()[0].id(), 32.0)
+                    .expect("key")
+                    .with_raster_scale(scale)
+                    .expect("scale");
+                let normal = shaper.rasterizer().rasterize(key_a).expect("normal bitmap");
+                let oblique = shaper
+                    .rasterizer()
+                    .rasterize(key_b)
+                    .expect("oblique bitmap");
+                assert!(
+                    oblique.bitmap().width() > normal.bitmap().width(),
+                    "{family} synthetic ink bounds must include overhang"
+                );
+                assert!(oblique.bitmap().pixels().iter().any(|alpha| *alpha > 0));
+                assert_ne!(normal.bitmap().pixels(), oblique.bitmap().pixels());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn monaco_synthetic_bold_has_distinct_identity_advance_and_ink() {
+        let shaper = CoreTextShaper::from_system(FontRequest::new("Monaco", 32.0).expect("font"))
+            .expect("shaper");
+        let source = TextRange::new(ByteOffset::ZERO, ByteOffset::new(2)).expect("range");
+        let plain = ShapingProvider::shape(&shaper, "HH", source, TextStyle::Plain).expect("plain");
+        let bold = ShapingProvider::shape(&shaper, "HH", source, TextStyle::Strong).expect("bold");
+        let a = &plain.runs()[0];
+        let b = &bold.runs()[0];
+        assert_ne!(a.face(), b.face());
+        assert!(
+            bold.advance() > plain.advance(),
+            "synthetic weight must participate in text geometry"
+        );
+        assert!(
+            shaper
+                .faces
+                .with_entry(b.face(), |entry| entry.synthetic_bold
+                    && entry.postscript_name == "Monaco")
+                .expect("face table")
+                .expect("entry")
+        );
+        for scale in [1.0, 2.0] {
+            let rasterizer = shaper.rasterizer();
+            let raster = |run: &GlyphRun| {
+                rasterizer
+                    .rasterize(
+                        GlyphRasterKey::new(run.face(), run.glyphs()[0].id(), 32.0)
+                            .expect("key")
+                            .with_raster_scale(scale)
+                            .expect("scale"),
+                    )
+                    .expect("bitmap")
+            };
+            let normal = raster(a);
+            let heavy = raster(b);
+            let ink =
+                |bitmap: &GlyphBitmap| bitmap.pixels().iter().map(|v| u64::from(*v)).sum::<u64>();
+            assert!(ink(heavy.bitmap()) > ink(normal.bitmap()));
+            assert!(heavy.bitmap().width() >= normal.bitmap().width());
+            assert!(heavy.metrics().advance_x() > normal.metrics().advance_x());
+        }
+        let font = create_core_text_font(
+            &FontRequest::new("Helvetica Neue", 32.0)
+                .expect("font")
+                .with_weight(FontWeight::Bold),
+            CoreTextFontSource::RequestedFamily,
+        )
+        .expect("real bold");
+        let id = shaper.face_id_with_weight(&font, 32.0, true).expect("face");
+        assert!(
+            !shaper
+                .faces
+                .with_entry(id, |entry| entry.synthetic_bold)
+                .expect("table")
+                .expect("entry"),
+            "real bold must not be synthesized twice"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_font_identity_includes_descriptor_and_point_size() {
+        let shaper =
+            CoreTextShaper::from_system(FontRequest::new("Helvetica Neue", 16.0).expect("font"))
+                .expect("CoreText");
+        let first = create_core_text_font(shaper.request(), CoreTextFontSource::RequestedFamily)
+            .expect("first font");
+        let same = create_core_text_font(shaper.request(), CoreTextFontSource::RequestedFamily)
+            .expect("equal font");
+        let larger = create_core_text_font(
+            &FontRequest::new("Helvetica Neue", 32.0).expect("large request"),
+            CoreTextFontSource::RequestedFamily,
+        )
+        .expect("large font");
+        assert_eq!(unsafe { first.post_script_name() }, unsafe {
+            larger.post_script_name()
+        });
+        let id = shaper.face_id(&first, 16.0).expect("face");
+        assert_eq!(id, shaper.face_id(&same, 16.0).expect("same face"));
+        assert_ne!(
+            id,
+            shaper.face_id(&larger, 32.0).expect("different descriptor")
+        );
     }
 
     #[cfg(target_os = "macos")]

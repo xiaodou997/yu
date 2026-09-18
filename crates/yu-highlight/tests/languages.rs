@@ -53,6 +53,13 @@ fn assert_well_formed(code: &str, spans: &[RoleSpan]) {
 fn every_registered_language_highlights_its_own_marker() {
     let fixtures: &[(Language, &str, &str, TextRole, &str)] = &[
         (
+            Language::Swift,
+            "swift",
+            "// 中文注释\nlet greeting = \"Hello\"\nprint(greeting)\n",
+            TextRole::Keyword,
+            "let",
+        ),
+        (
             Language::Bash,
             "bash",
             "# c\nfor i in 1 2; do echo x; done\n",
@@ -285,4 +292,36 @@ fn the_memo_keys_on_the_language_too() {
     assert_ne!(as_json, as_rust, "同一段文本两种语言不该是同一个答案");
     // 再问一遍 JSON：memo 现在装着 Rust 那一份。
     assert_eq!(highlighter.spans(Language::Json, code), as_json);
+}
+
+#[test]
+fn swift_comment_and_string_keep_their_semantic_roles() {
+    let code = "// 中文注释\nlet greeting = \"Hello, 世界\"\n";
+    let spans = Highlighter::new().spans(Language::Swift, code);
+    assert_well_formed(code, &spans);
+    assert!(texts_with_role(code, &spans, TextRole::Comment).contains(&"// 中文注释"));
+    assert!(texts_with_role(code, &spans, TextRole::Keyword).contains(&"let"));
+    assert!(
+        texts_with_role(code, &spans, TextRole::Literal)
+            .iter()
+            .any(|text| text.contains("Hello"))
+    );
+}
+
+#[test]
+fn swift_binding_definitions_are_distinct_from_references_and_calls() {
+    let code = "let greeting = \"Hello\"\nvar 标题 = greeting\nfunc render() { print(greeting); object.update(标题) }\n";
+    let spans = Highlighter::new().spans(Language::Swift, code);
+    assert_well_formed(code, &spans);
+    assert_eq!(
+        texts_with_role(code, &spans, TextRole::Definition),
+        vec!["greeting", "标题"]
+    );
+    assert_eq!(
+        texts_with_role(code, &spans, TextRole::Function),
+        vec!["render"]
+    );
+    for name in ["print", "update"] {
+        assert!(texts_with_role(code, &spans, TextRole::Variable).contains(&name));
+    }
 }

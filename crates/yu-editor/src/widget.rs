@@ -25,13 +25,6 @@ use yu_markdown::{BlockWidget, ImageSpan};
 /// 资源没就绪时盒子有几个行高宽。
 const PLACEHOLDER_WIDTH_IN_LINES: f32 = 4.0;
 
-/// 复选框的边长占行高的几成。
-///
-/// 这个数**只有这一处**。它此前住在 `yu-workspace` 的画法里，而盒子多宽是
-/// 排版的事——画的人自己算一遍，等于「同一个几何两套实现」（不变量 E6 说的
-/// 那件事的小号版本）。现在排版按它占位，画的人按排出来的 `bounds` 画。
-const CHECKBOX_SIZE_IN_LINES: f32 = 0.68;
-
 /// 一张已经解码到位的图片：它那段 Markdown，以及解码出来的像素尺寸。
 ///
 /// 按**源码区间**索引而不是按目标 URL：同一个 URL 在一篇文档里可以出现
@@ -46,11 +39,23 @@ pub type ImageSize = (TextRange, ImageIntrinsicSize);
 pub(crate) struct BlockWidgets<'a> {
     widgets: &'a [BlockWidget],
     sizes: &'a [ImageSize],
+    available_width: f32,
+    theme: yu_core::ThemeId,
 }
 
 impl<'a> BlockWidgets<'a> {
-    pub(crate) const fn new(widgets: &'a [BlockWidget], sizes: &'a [ImageSize]) -> Self {
-        Self { widgets, sizes }
+    pub(crate) const fn new(
+        widgets: &'a [BlockWidget],
+        sizes: &'a [ImageSize],
+        available_width: f32,
+        theme: yu_core::ThemeId,
+    ) -> Self {
+        Self {
+            widgets,
+            sizes,
+            available_width,
+            theme,
+        }
     }
 
     fn widget(&self, widget: WidgetId) -> Option<BlockWidget> {
@@ -74,6 +79,10 @@ impl WidgetMeasure for BlockWidgets<'_> {
         widget: WidgetId,
         constraints: WidgetConstraints,
     ) -> Option<WidgetMeasurement> {
+        let constraints = WidgetConstraints::new(
+            constraints.available_width().min(self.available_width),
+            constraints.line_height(),
+        );
         match self.widget(widget)? {
             BlockWidget::Image(image) => match self.size_of(image) {
                 Some(size) => intrinsic_metrics(size, constraints).map(WidgetMeasurement::Ready),
@@ -82,7 +91,9 @@ impl WidgetMeasure for BlockWidgets<'_> {
             // 复选框没有要等的资源，永远是 `Ready`：它的尺寸只依赖行高。
             // 报成 `Placeholder` 会让 `pending_widgets` 永远不空，而
             // `LayoutCache` 用那个判断「还欠着谁」，于是每一帧都重排一次。
-            BlockWidget::Checkbox(_) => checkbox_metrics(constraints).map(WidgetMeasurement::Ready),
+            BlockWidget::Checkbox(_) => {
+                checkbox_metrics(constraints, self.theme).map(WidgetMeasurement::Ready)
+            }
         }
     }
 }
@@ -109,11 +120,18 @@ fn intrinsic_metrics(
 /// 此前它是按行盒竖直居中画的（`y + (行高 - 边长) / 2`）。换成坐基线是因为
 /// 它现在**在行里占位**：占位的东西按基线对齐，才不会在行高变化时相对文字
 /// 上下漂。
-fn checkbox_metrics(constraints: WidgetConstraints) -> Option<WidgetMetrics> {
-    let side = (constraints.line_height() * CHECKBOX_SIZE_IN_LINES)
+fn checkbox_metrics(
+    constraints: WidgetConstraints,
+    theme: yu_core::ThemeId,
+) -> Option<WidgetMetrics> {
+    let zoom = constraints.line_height() / theme.spec().body_size;
+    let side = (theme.task_checkbox_size() * zoom)
         .min(constraints.available_width())
         .max(1.0);
-    WidgetMetrics::sitting_on_baseline(Size::new(side, side).ok()?).ok()
+    let advance = (constraints.line_height() * yu_core::ThemeSpec::TASK_MARKER_ADVANCE_EM)
+        .min(constraints.available_width())
+        .max(side);
+    WidgetMetrics::sitting_on_baseline(Size::new(advance, side).ok()?).ok()
 }
 
 fn placeholder_metrics(constraints: WidgetConstraints) -> Option<WidgetMetrics> {

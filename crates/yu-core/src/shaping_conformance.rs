@@ -164,11 +164,15 @@ pub fn cases() -> &'static [ConformanceCase] {
 
 /// 契约要在这几种 style 上都成立——style 是请求的一部分，后端换字重换斜体
 /// 时 fallback 会走到别的 face 上。
-const STYLES: [TextStyle; 4] = [
+const STYLES: [TextStyle; 8] = [
     TextStyle::Plain,
     TextStyle::Strong,
     TextStyle::Emphasis,
     TextStyle::Code,
+    TextStyle::StrongEmphasis,
+    TextStyle::CodeStrong,
+    TextStyle::CodeEmphasis,
+    TextStyle::CodeStrongEmphasis,
 ];
 
 /// 第二次请求用的基址。**不是 0**：`ShapingProvider` 的 range 参数今天由

@@ -82,8 +82,9 @@ fragment float4 yu_glyph_fragment(
     sampler atlas_sampler [[sampler(0)]],
     constant YuPrimitiveUniforms& primitive [[buffer(0)]]
 ) {
-    float coverage = atlas.sample(atlas_sampler, input.uv).r;
-    return float4(primitive.color.rgb, primitive.color.a * coverage);
+    float4 sampled = atlas.sample(atlas_sampler, input.uv);
+    float3 color = sampled.a > 0.0 ? sampled.rgb / sampled.a : float3(0.0);
+    return float4(primitive.color.rgb * color, primitive.color.a * sampled.a);
 }
 
 fragment float4 yu_image_fragment(
@@ -142,4 +143,27 @@ fragment float4 yu_rounded_fragment(
     float3 premultiplied = fill.rgb * fill.a + shadow.rgb * shadow.a * (1.0 - fill.a);
     float3 rgb = alpha > 0.0 ? premultiplied / alpha : float3(0.0);
     return float4(rgb, alpha);
+}
+
+// Round-capped three-point stroke. Evaluate the union once so the join does
+// not darken from overlapping alpha; derivatives follow the backing scale.
+struct YuPolylineUniforms {
+    float2 size;
+    float2 a;
+    float2 b;
+    float2 c;
+    float width;
+    float pad0, pad1, pad2;
+    float4 color;
+};
+static float yu_segment_distance(float2 p, float2 a, float2 b) {
+    float2 d = b-a;
+    float t = clamp(dot(p-a,d)/max(dot(d,d), 1e-8), 0.0, 1.0);
+    return length(p-a-t*d);
+}
+fragment float4 yu_polyline_fragment(YuVertexOut input [[stage_in]], constant YuPolylineUniforms& primitive [[buffer(0)]]) {
+    float2 p = input.uv * primitive.size;
+    float sd = min(yu_segment_distance(p, primitive.a, primitive.b), yu_segment_distance(p, primitive.b, primitive.c)) - primitive.width * 0.5;
+    float coverage = clamp(0.5-sd/max(fwidth(sd),1e-4),0.0,1.0);
+    return float4(primitive.color.rgb, primitive.color.a*coverage);
 }
