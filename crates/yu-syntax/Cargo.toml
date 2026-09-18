@@ -23,6 +23,6 @@ workspace = true
 # 个答案，所以版本走 workspace，不在这里单独写。
 caseless = { workspace = true }
 comrak = { workspace = true }
-entities = "1.0"
-percent-encoding = "2.3"
-serde_json = "1"
+entities = "1.0.1"
+percent-encoding = "2.3.2"
+serde_json = "1.0.151"

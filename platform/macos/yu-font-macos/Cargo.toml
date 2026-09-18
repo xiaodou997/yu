@@ -9,7 +9,8 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-unicode-segmentation = "1.13"
+unicode-segmentation = "1.13.3"
+unicode-linebreak = "0.1.5"
 yu-core = { path = "../../../crates/yu-core" }
 yu-font = { path = "../../../crates/yu-font" }
 
@@ -43,7 +44,10 @@ objc2-core-text = { version = "0.3.2", default-features = false, features = [
     "CTFontManager",
     "CTFontTraits",
     "CTLine",
+    "CTParagraphStyle",
+    "CTTypesetter",
     "CTRun",
+    "CTRunDelegate",
     "CTStringAttributes",
     "objc2-core-graphics",
 ] }

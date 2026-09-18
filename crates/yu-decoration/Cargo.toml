@@ -17,4 +17,4 @@ yu-text = { path = "../yu-text" }
 workspace = true
 
 [dev-dependencies]
-proptest = "1"
+proptest = "1.11.0"

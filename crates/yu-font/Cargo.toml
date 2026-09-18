@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 yu-core = { path = "../yu-core" }
-unicode-segmentation = "1.13"
+unicode-segmentation = "1.13.3"
 
 
 [lints]

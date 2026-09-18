@@ -331,7 +331,7 @@ fn compute(
     };
     // 内嵌语言（Rust 文档注释里的 ```rust、JS 模板串里的 SQL）不下钻：回调
     // 一律给 `None`。少的是内嵌那一段的颜色，不是正确性。
-    let Ok(events) = engine.highlight(config, code.as_bytes(), None, |_| None) else {
+    let Ok(events) = engine.highlight(config, code.as_bytes(), None, None, |_| None) else {
         return Vec::new();
     };
     let mut spans: Vec<RoleSpan> = Vec::new();

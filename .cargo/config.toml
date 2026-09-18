@@ -1,0 +1,7 @@
+# Keep Rust checks, tests and the Swift bundle on the same minimum deployment
+# target. cc ignores this variable when compiling non-Apple targets.
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "26.0", force = false }
+
+[target.'cfg(target_os = "macos")']
+runner = "tools/run-rust-test-macos.sh"
