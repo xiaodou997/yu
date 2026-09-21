@@ -14,12 +14,15 @@ import YuStorageFFI
 /// layout manager or text container. All visible geometry comes from Rust's
 /// CoreText paragraph layouts, also consumed by the Metal surface.
 final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
-    var font: NSFont? = NSFont(name: "Open Sans", size: CGFloat(NativeTheme.spec().body_size))
+    var font: NSFont? = NativeTheme.font(identity: NativeTheme.spec().body_font, size: CGFloat(NativeWritingPreferences.shared.fontSize))
     var isEditable = true
     var isSelectable = true
     var contentInsets = NSSize(width: 30, height: 30)
     var contentOrigin: NSPoint { NSPoint(x: contentInsets.width, y: contentInsets.height) }
     private(set) var string = ""
+    private lazy var spellingService = NativeSpellingService()
+    private lazy var spellingCoordinator = NativeSpellingCoordinator(bridge: bridge) { [weak self] in self?.onSpellingChange?() }
+    private var imagePropertiesPanel: ImagePropertiesPanel?
     private var nativeSelection = NSRange(location: 0, length: 0)
     private var discardingComposition = false
     private(set) var selectedRanges: [NSValue] = []
@@ -28,7 +31,8 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     override var undoManager: UndoManager? { nil }
     func selectedRange() -> NSRange { nativeSelection }
     private static let traceNativeEvents = ProcessInfo.processInfo.environment["YU_NATIVE_INPUT_TRACE"] == "1"
-        && Bundle.main.bundleIdentifier?.hasPrefix("io.github.xiaodou997.yu.editing-check.") == true
+        && ["io.github.xiaodou997.yu.editing-check.", "io.github.xiaodou997.yu.writing-check.", "io.github.xiaodou997.yu.embedded-check."]
+            .contains { Bundle.main.bundleIdentifier?.hasPrefix($0) == true }
 
     private func traceNativeEvent(_ kind: String, _ fields: [String: Any] = [:]) {
         guard Self.traceNativeEvents else { return }
@@ -49,9 +53,10 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         // Handle cancellation before an input source consumes Escape and leaves
         // an empty/unmarked Rust overlay that would disable the undo menu.
         if event.keyCode == 53, bridge.composition.active {
-            cancelInputComposition()
+            cancelInputComposition(cancelEvent: event)
             return
         }
+        if routeListShortcut(event) { return }
         let handled = inputContext?.handleEvent(event) == true
         traceNativeEvent("inputContext", ["key_code": event.keyCode, "handled": handled])
         if handled { return }
@@ -107,6 +112,9 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     private var tableResizeTrackingArea: NSTrackingArea?
     private var tableResizeCursorActive = false
     private var taskCheckboxPointerConsumed = false
+    var onImageImport: (([NativeImageResources.Input], NativeSelectionEndpoints?) throws -> Bool)?
+    var onSpellingChange: (() -> Void)?
+    var onResourceChange: (() -> Void)?
     var onDocumentChange: (() -> Void)?
     var onCaretChange: (() -> Void)?
     var onError: ((Error) -> Void)?
@@ -128,6 +136,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         canonicalSource = bridge.source
         canonicalRevision = bridge.revision
         super.init(frame: .zero)
+        registerForDraggedTypes([.fileURL, .png, .tiff])
         setAccessibilityElement(true)
         setAccessibilityRole(.textArea)
         setAccessibilityLabel("Yu Markdown 文档")
@@ -245,7 +254,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     /// visual 长度做上界校验——那等于用第二套布局系统验证第一套，
     /// 而第二套布局系统本身就是要消除的对象（不变量 I5、E1）。
     /// Rust 返回的 visualUTF16 已绑定同一 Revision，越界由 Rust 侧拒绝。
-    private func shapedVisualHit(at point: NSPoint) -> (offset: Int, source: Int, affinity: UInt8)? {
+    private func shapedVisualHit(at point: NSPoint) -> (offset: Int, source: Int, affinity: UInt8, image: NSRange?, content: NSRange?, target: NSRange?)? {
         guard point.x.isFinite,
               point.y.isFinite,
               let (size, width) = visualLayoutMetrics(),
@@ -263,7 +272,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
               visualOffset >= 0 else {
             return nil
         }
-        return (visualOffset, sourceOffset, hit.affinity)
+        return (visualOffset, sourceOffset, hit.affinity, hit.imageSourceRange, hit.contentSourceRange, hit.navigationTarget)
     }
 
     @discardableResult
@@ -504,6 +513,23 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         return toggleTask(block: block, revision: node.revision)
     }
 
+    @discardableResult
+    func toggleDisclosure(at source: Int, revision: UInt64) -> Bool {
+        guard revision == bridge.revision, !bridge.composition.active else { return false }
+        do {
+            let result = try bridge.toggleDisclosure(at: source, expectedRevision: revision)
+            guard result.changed else { return false }
+            apply(result)
+            synchronizeProjection()
+            postAccessibilityRefresh()
+            onDocumentChange?()
+            return true
+        } catch {
+            onError?(error)
+            return false
+        }
+    }
+
     private func toggleTask(block: UInt64, revision: UInt64) -> Bool {
         guard revision == bridge.revision,
               !bridge.composition.active,
@@ -542,6 +568,12 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     override func accessibilityAttributedString(for range: NSRange) -> NSAttributedString? {
         guard let text = accessibilityString(for: range) else { return nil }
         return NSAttributedString(string: text)
+    }
+
+    override func accessibilityFrame(for range: NSRange) -> NSRect {
+        guard let snapshot = bridge.accessibilitySnapshotIfAvailable,
+              let valid = accessibilitySourceRange(range, snapshot: snapshot) else { return .zero }
+        return accessibilityFrameForSemanticRange(valid)
     }
 
     override func accessibilityRange(forLine line: Int) -> NSRange {
@@ -617,6 +649,23 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         syncNativeSelectionsToRust(clamped, primary: primary)
     }
 
+    func makeDisclosureMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "展开／折叠当前摘要", action: #selector(toggleDisclosureFromMenu(_:)), keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    @objc func toggleDisclosureFromMenu(_ sender: NSMenuItem) {
+        let source = Int(bridge.selectionEndpoints.focusUTF16)
+        let available = validateMenuItem(sender)
+        let before = try? bridge.disclosureHeader(at: source, expectedRevision: bridge.revision)
+        guard available else { traceNativeEvent("disclosureMenu", ["available": false, "source": source]); return }
+        let handled = toggleDisclosure(at: source, revision: bridge.revision)
+        let after = try? bridge.disclosureHeader(at: source, expectedRevision: bridge.revision)
+        traceNativeEvent("disclosureMenu", ["available": available, "source": source, "handled": handled,
+            "before": before?.open ?? false, "after": after?.open ?? false])
+    }
+
     func makeTableMenu() -> NSMenu {
         let menu = NSMenu(title: "表格")
         let items: [(String, Int)] = [
@@ -642,24 +691,281 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         return menu
     }
 
+    @objc func editListFromMenu(_ sender: NSMenuItem) {
+        guard validateMenuItem(sender) else { return }
+        _ = routeCommand(UInt8(sender.tag))
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        // A settings window or native find field must not expose mutations of
+        // the table selection retained in a background document.
+        guard NSApp.keyWindow == nil || NSApp.keyWindow === window,
+              !(window?.firstResponder is NSTextView) else { return false }
+        if menuItem.action == #selector(editListFromMenu(_:)) {
+            return isEditable && !bridge.composition.active &&
+                (menuItem.tag == Int(Command.indentList) || menuItem.tag == Int(Command.outdentList)) &&
+                bridge.commandAvailable(UInt8(menuItem.tag))
+        }
+        if menuItem.action == #selector(toggleDisclosureFromMenu(_:)) {
+            return isEditable && !bridge.composition.active &&
+                (try? bridge.disclosureHeader(at: Int(bridge.selectionEndpoints.focusUTF16), expectedRevision: bridge.revision)) != nil
+        }
+        if menuItem.action == #selector(openDocumentLinkFromMenu(_:)) || menuItem.action == #selector(copyDocumentLinkFromMenu(_:)) {
+            guard !bridge.sourceMode, !bridge.composition.active,
+                  let target = menuItem.representedObject as? DocumentLinkMenuTarget,
+                  target.revision == bridge.revision else { return false }
+            if menuItem.action == #selector(openDocumentLinkFromMenu(_:)) {
+                return documentLinkURL(at: target.source, revision: target.revision) != nil
+                    || (try? bridge.documentReferenceTarget(at: target.source)) != nil
+            }
+            return (try? bridge.linkDestination(at: target.source, expectedRevision: target.revision)) != nil
+        }
+        if menuItem.action == #selector(jumpToDocumentReferenceFromMenu(_:)) {
+            guard !bridge.composition.active else { return false }
+            if let target = menuItem.representedObject as? DocumentNavigationTarget {
+                return target.revision == bridge.revision
+            }
+            guard let source = (menuItem.representedObject as? NSNumber)?.intValue else { return false }
+            return (try? bridge.documentReferenceTarget(at: source)) != nil
+        }
+        if menuItem.action == #selector(showDocumentDiagnostic(_:)) {
+            guard let source = (menuItem.representedObject as? NSNumber)?.intValue else { return false }
+            return (try? bridge.documentDiagnostic(at: source).isEmpty) == false
+        }
+        if menuItem.action == #selector(undo(_:)) { return isEditable && canUndo() }
+        if menuItem.action == #selector(redo(_:)) { return isEditable && canRedo() }
+        if menuItem.action == #selector(copy(_:)) { return hasSourceSelection }
+        if menuItem.action == #selector(cut(_:)) { return isEditable && hasSourceSelection }
+        if menuItem.action == #selector(paste(_:)) { return isEditable && hasSourceOnPasteboard }
+        if menuItem.action == #selector(selectAll(_:)) { return isSelectable && !string.isEmpty }
+        if menuItem.action == #selector(replaceSpellingFromMenu(_:)) {
+            guard let suggestion = menuItem.representedObject as? NativeSpellingService.Suggestion else { return false }
+            return isEditable && NativeWritingPreferences.shared.spellingEnabled && !bridge.composition.active && suggestion.revision == bridge.revision
+        }
+        if menuItem.action == #selector(editImagePropertiesFromMenu(_:)) {
+            return canEditImage(at: (menuItem.representedObject as? NSNumber)?.intValue)
+        }
+        if menuItem.action == #selector(retryImageFromMenu(_:)) {
+            guard isEditable, !bridge.composition.active,
+                  let properties = menuItem.representedObject as? NativeImageProperties else { return false }
+            return (try? bridge.imageResourceStatus(properties)) == UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED)
+        }
         guard menuItem.action == #selector(editTableFromMenu(_:)),
               let command = UInt8(exactly: menuItem.tag) else { return false }
         return isEditable && bridge.commandAvailable(command)
     }
 
     @objc func editTableFromMenu(_ sender: NSMenuItem) {
-        guard isEditable, let command = UInt8(exactly: sender.tag) else { return }
-        _ = routeCommand(command)
+        let available = validateMenuItem(sender)
+        traceNativeEvent("tableMenu", ["command": sender.tag, "available": available,
+            "key_window_matches": NSApp.keyWindow === window,
+            "native_field_focused": window?.firstResponder is NSTextView])
+        guard available, let command = UInt8(exactly: sender.tag) else { return }
+        let handled = routeCommand(command)
+        traceNativeEvent("tableMenuResult", ["command": sender.tag, "handled": handled])
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         window?.makeFirstResponder(self)
+        let initialHit = shapedVisualHit(at: visualPoint(for: event))
+        let imageSource = initialHit?.image?.location
         guard applyVisualPointerSelection(at: visualPoint(for: event), extending: false) else {
             return super.menu(for: event)
         }
-        let menu = makeTableMenu()
+        let tableMenu = makeTableMenu()
+        // Keep disabled boundary actions while editing a table, but do not
+        // fill image/prose context menus with unrelated table commands.
+        let menu = tableMenu.items.contains(where: { validateMenuItem($0) }) ? tableMenu : NSMenu()
+        for (title, command) in [("增加列表缩进", Command.indentList), ("减少列表缩进", Command.outdentList)] {
+            let item = NSMenuItem(title: title, action: #selector(editListFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = Int(command)
+            if validateMenuItem(item) { menu.addItem(item) }
+        }
+        let disclosure = makeDisclosureMenuItem()
+        if validateMenuItem(disclosure) { menu.addItem(disclosure) }
+        if NativeWritingPreferences.shared.spellingEnabled, !bridge.composition.active, isEditable {
+            let revision = bridge.revision
+            let source = canonicalSource
+            let location = Int(bridge.selectionEndpoints.focusUTF16)
+            let paragraph = (source as NSString).paragraphRange(for: NSRange(location: min(location, (source as NSString).length), length: 0))
+            if let allowed = try? bridge.spellingRanges(in: paragraph, revision: revision) {
+                let suggestions = spellingService.suggestions(source: source, allowed: allowed, at: location, revision: revision)
+                for suggestion in suggestions.reversed() {
+                    let item = NSMenuItem(title: suggestion.replacement, action: #selector(replaceSpellingFromMenu(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = suggestion
+                    menu.insertItem(item, at: 0)
+                }
+            }
+        }
+        let diagnosticSource = initialHit?.content?.location ?? Int(bridge.selectionEndpoints.focusUTF16)
+        let documentLinkItems = linkMenuItems(at: diagnosticSource)
+        for item in documentLinkItems.reversed() { menu.insertItem(item, at: 0) }
+        if let target = initialHit?.target {
+            let item = NSMenuItem(title: "跳转到标题", action: #selector(jumpToDocumentReferenceFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = DocumentNavigationTarget(revision: bridge.revision, range: target)
+            menu.insertItem(item, at: 0)
+        } else if documentLinkItems.isEmpty, (try? bridge.documentReferenceTarget(at: diagnosticSource)) != nil {
+            let item = NSMenuItem(title: "跳转到引用位置", action: #selector(jumpToDocumentReferenceFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: diagnosticSource)
+            menu.insertItem(item, at: 0)
+        }
+        if let diagnostic = try? bridge.documentDiagnostic(at: diagnosticSource), !diagnostic.isEmpty {
+            let item = NSMenuItem(title: "查看文档诊断…", action: #selector(showDocumentDiagnostic(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: diagnosticSource)
+            menu.insertItem(item, at: 0)
+        }
+        if let imageSource, canEditImage(at: imageSource) {
+            let item = NSMenuItem(title: "图片属性…", action: #selector(editImagePropertiesFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: imageSource)
+            menu.insertItem(item, at: 0)
+            if let resourceItem = imageResourceMenuItem(at: imageSource) { menu.insertItem(resourceItem, at: 0) }
+        }
         return menu.items.contains(where: { validateMenuItem($0) }) ? menu : super.menu(for: event)
+    }
+
+    private struct DocumentNavigationTarget {
+        let revision: UInt64
+        let range: NSRange
+    }
+
+    private struct DocumentLinkMenuTarget {
+        let revision: UInt64
+        let source: Int
+    }
+
+    func linkMenuItems(at source: Int) -> [NSMenuItem] {
+        guard !bridge.sourceMode, !bridge.composition.active,
+              (try? bridge.linkDestination(at: source, expectedRevision: bridge.revision)) != nil else { return [] }
+        let target = DocumentLinkMenuTarget(revision: bridge.revision, source: source)
+        return [("打开链接", #selector(openDocumentLinkFromMenu(_:))),
+                ("复制链接地址", #selector(copyDocumentLinkFromMenu(_:)))].map { title, action in
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = target
+            return item
+        }
+    }
+
+    @objc private func openDocumentLinkFromMenu(_ sender: NSMenuItem) {
+        guard validateMenuItem(sender), let target = sender.representedObject as? DocumentLinkMenuTarget else { return }
+        openDocumentLink(at: target.source, revision: target.revision)
+    }
+
+    @objc private func copyDocumentLinkFromMenu(_ sender: NSMenuItem) {
+        guard validateMenuItem(sender), let target = sender.representedObject as? DocumentLinkMenuTarget,
+              let destination = try? bridge.linkDestination(at: target.source, expectedRevision: target.revision) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(destination, forType: .string)
+    }
+
+    var linkURLOpener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
+
+    func documentLinkURL(at source: Int, revision: UInt64) -> URL? {
+        guard !bridge.sourceMode, !bridge.composition.active,
+              let destination = try? bridge.linkDestination(at: source, expectedRevision: revision),
+              !destination.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+        if destination.hasPrefix("#") {
+            guard (try? bridge.documentReferenceTarget(at: source)) != nil,
+                  let fragment = String(destination.dropFirst()).removingPercentEncoding,
+                  var components = URLComponents(url: URL(fileURLWithPath: bridge.path), resolvingAgainstBaseURL: false) else { return nil }
+            components.fragment = fragment
+            return components.url
+        }
+        let base = URL(fileURLWithPath: bridge.path).deletingLastPathComponent().appendingPathComponent("")
+        guard let url = URL(string: destination, relativeTo: base)?.absoluteURL,
+              let scheme = url.scheme?.lowercased(),
+              ["https", "http", "mailto", "file"].contains(scheme) else { return nil }
+        return url
+    }
+
+    @discardableResult func openDocumentLink(at source: Int, revision: UInt64) -> Bool {
+        guard revision == bridge.revision, !bridge.sourceMode, !bridge.composition.active else { return false }
+        if let destination = try? bridge.linkDestination(at: source, expectedRevision: revision), destination.hasPrefix("#") {
+            return jumpToDocumentReference(at: source)
+        }
+        guard let url = documentLinkURL(at: source, revision: revision) else { return false }
+        return linkURLOpener(url)
+    }
+
+    @discardableResult private func jumpToDocumentReference(at source: Int) -> Bool {
+        guard let target = try? bridge.documentReferenceTarget(at: source) else { return false }
+        return jumpToDocumentTarget(target)
+    }
+
+    @discardableResult private func jumpToDocumentTarget(_ target: NSRange) -> Bool {
+        guard !bridge.composition.active else { return false }
+        do {
+            if try bridge.revealSourceRange(target) { postAccessibilityRefresh() }
+            try bridge.setSelection(NSRange(location: target.location, length: 0))
+            visualSelectionAnchor = nil
+            synchronizeProjection()
+            postSelectionChanged()
+            return true
+        } catch { onError?(error); return false }
+    }
+
+    @objc private func jumpToDocumentReferenceFromMenu(_ sender: NSMenuItem) {
+        if let target = sender.representedObject as? DocumentNavigationTarget {
+            guard target.revision == bridge.revision else { return }
+            jumpToDocumentTarget(target.range)
+            return
+        }
+        guard let source = (sender.representedObject as? NSNumber)?.intValue else { return }
+        jumpToDocumentReference(at: source)
+    }
+
+    @objc private func showDocumentDiagnostic(_ sender: NSMenuItem) {
+        guard let source = (sender.representedObject as? NSNumber)?.intValue,
+              let message = try? bridge.documentDiagnostic(at: source), !message.isEmpty,
+              let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "文档内容需要修正"
+        alert.informativeText = message + "\n\n原始源码已保留，可直接修改。"
+        alert.addButton(withTitle: "继续编辑")
+        alert.beginSheetModal(for: window) { [weak self] _ in
+            guard let self else { return }
+            self.window?.makeFirstResponder(self)
+        }
+    }
+
+    func imageResourceMenuItem(at source: Int) -> NSMenuItem? {
+        guard let properties = try? bridge.imageProperties(at: source),
+              let status = try? bridge.imageResourceStatus(properties) else { return nil }
+        if status == UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED) {
+            let retry = NSMenuItem(title: "图片加载失败，重试", action: #selector(retryImageFromMenu(_:)), keyEquivalent: "")
+            retry.target = self
+            retry.representedObject = properties
+            return retry
+        }
+        if status == UInt8(YU_STORAGE_IMAGE_RESOURCE_PENDING) {
+            return NSMenuItem(title: "图片加载中…", action: nil, keyEquivalent: "")
+        }
+        return nil
+    }
+
+    @objc private func retryImageFromMenu(_ sender: NSMenuItem) {
+        guard validateMenuItem(sender), let properties = sender.representedObject as? NativeImageProperties else { return }
+        do {
+            try bridge.retryImage(properties)
+            onResourceChange?()
+        } catch { onError?(error) }
+    }
+
+    @objc private func replaceSpellingFromMenu(_ sender: NSMenuItem) {
+        guard validateMenuItem(sender), let suggestion = sender.representedObject as? NativeSpellingService.Suggestion else { return }
+        do {
+            apply(try bridge.replaceSpelling(in: suggestion.range, revision: suggestion.revision, with: suggestion.replacement))
+            synchronizeProjection()
+            postAccessibilityRefresh()
+            onDocumentChange?()
+            onCaretChange?()
+        } catch { onError?(error) }
     }
 
     /// Option-Shift drag selects whole cells. Source coordinates come from the
@@ -739,6 +1045,26 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         window?.makeFirstResponder(self)
         tableSelectionAnchor = nil
         pointerUnitAnchor = nil
+        if event.buttonNumber == 0, event.clickCount == 1,
+           event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty,
+           let hit = shapedVisualHit(at: visualPoint(for: event)),
+           let content = hit.content,
+           let header = try? bridge.disclosureHeader(at: content.location, expectedRevision: bridge.revision),
+           header.range.location == content.location {
+            if toggleDisclosure(at: content.location, revision: bridge.revision) {
+                visualSelectionAnchor = nil
+                taskCheckboxPointerConsumed = true
+                return
+            }
+        }
+        if event.buttonNumber == 0, event.clickCount == 1,
+           event.modifierFlags.contains(.command),
+           event.modifierFlags.intersection([.shift, .option]).isEmpty,
+           let hit = shapedVisualHit(at: visualPoint(for: event)) {
+            if let target = hit.target, jumpToDocumentTarget(target) { return }
+            if jumpToDocumentReference(at: hit.content?.location ?? hit.source) { return }
+            if openDocumentLink(at: hit.content?.location ?? hit.source, revision: bridge.revision) { return }
+        }
         if event.buttonNumber == 0, event.clickCount >= 2,
            !event.modifierFlags.contains(.option),
            selectPointerUnit(at: visualPoint(for: event), clickCount: event.clickCount) { return }
@@ -950,16 +1276,93 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         try cutToPasteboard(pasteboard)
     }
 
-    @objc func paste(_ sender: Any?) {
+    func canEditImage(at source: Int? = nil) -> Bool {
+        guard isEditable, !bridge.composition.active, imagePropertiesPanel == nil,
+              window?.attachedSheet == nil,
+              NSApp.keyWindow == nil || NSApp.keyWindow === window,
+              !(window?.firstResponder is NSTextView) else { return false }
+        return (try? bridge.imageProperties(at: source ?? bridge.selection.range.location)) != nil
+    }
+
+    @objc func editImagePropertiesFromMenu(_ sender: NSMenuItem?) {
+        let source = (sender?.representedObject as? NSNumber)?.intValue ?? bridge.selection.range.location
+        guard canEditImage(at: source), let parent = window,
+              let properties = try? bridge.imageProperties(at: source) else { return }
+        let panel = ImagePropertiesPanel(properties: properties, document: URL(fileURLWithPath: bridge.path),
+            apply: { [weak self] properties in
+                guard let self else { return }
+                self.apply(try self.bridge.updateImageProperties(properties))
+                self.synchronizeProjection()
+                self.postAccessibilityRefresh()
+                self.onDocumentChange?()
+                self.onCaretChange?()
+            }, finished: { [weak self] in
+                self?.imagePropertiesPanel = nil
+                if let self { self.window?.makeFirstResponder(self) }
+            })
+        imagePropertiesPanel = panel
+        panel.present(on: parent)
+    }
+
+    func insertImportedImages(_ images: [NativeImageResources.Prepared], at dropTarget: NativeSelectionEndpoints? = nil) throws {
+        try finishCompositionForClipboard()
+        apply(try bridge.insertLocalImages(images, at: dropTarget))
+        synchronizeProjection()
+        postAccessibilityRefresh()
+        onDocumentChange?()
+        onCaretChange?()
+    }
+
+    private func importImages(from pasteboard: NSPasteboard, at dropTarget: NativeSelectionEndpoints? = nil) throws -> Bool? {
+        guard let onImageImport else { return nil }
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+            return try onImageImport(urls.map { .file($0) }, dropTarget)
+        }
+        if let type = pasteboard.availableType(from: [.png, .tiff]),
+           let bytes = pasteboard.data(forType: type) {
+            return try onImageImport([.data(bytes)], dropTarget)
+        }
+        return nil
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard isEditable, onImageImport != nil,
+              sender.draggingPasteboard.availableType(from: [.fileURL, .png, .tiff]) != nil else { return [] }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard isEditable else { return false }
         do {
             try finishCompositionForClipboard()
-            guard try pasteSourceFromPasteboard(.general) else { return }
-            synchronizeProjection()
-            postAccessibilityRefresh()
-            onDocumentChange?()
-        } catch {
-            onError?(error)
-        }
+            let local = convert(sender.draggingLocation, from: nil)
+            guard let hit = shapedVisualHit(at: NSPoint(x: local.x - contentOrigin.x,
+                y: local.y - contentOrigin.y)) else { return false }
+            let target = NativeSelectionEndpoints(YuStorageSelectionEndpoints(revision: bridge.revision,
+                anchor_utf16: UInt64(hit.source), focus_utf16: UInt64(hit.source), affinity: hit.affinity))
+            // Keep the user's complete selection until preparation and any
+            // first-save panel succeed. Rust inserts at the captured caret in
+            // one transaction, rejecting a stale target without moving it.
+            return try importImages(from: sender.draggingPasteboard, at: target) ?? false
+        } catch { onError?(error); return false }
+    }
+
+    @objc func paste(_ sender: Any?) {
+        do { try pasteFromPasteboard(.general) }
+        catch { onError?(error) }
+    }
+
+    private func pasteFromPasteboard(_ pasteboard: NSPasteboard) throws {
+        try finishCompositionForClipboard()
+        // A recognised image payload consumes Paste even when first-save was
+        // cancelled; its text/plain alternative must not leak into the document.
+        if pasteboard.data(forType: .yuFragments) == nil,
+           try importImages(from: pasteboard) != nil { return }
+        guard try pasteSourceFromPasteboard(pasteboard) else { return }
+        synchronizeProjection()
+        postAccessibilityRefresh()
+        onDocumentChange?()
     }
 
     var hasSourceSelection: Bool {
@@ -968,7 +1371,8 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
 
     var hasSourceOnPasteboard: Bool {
         let pasteboard = NSPasteboard.general
-        return pasteboard.data(forType: .yuFragments) != nil
+        return (onImageImport != nil && pasteboard.availableType(from: [.fileURL, .png, .tiff]) != nil)
+            || pasteboard.data(forType: .yuFragments) != nil
             || pasteboard.string(forType: .yuMarkdown) != nil
             || pasteboard.string(forType: .string) != nil
             || pasteboard.string(forType: .yuHTML) != nil
@@ -997,9 +1401,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     /// The same Rust selection/insert path is used; AppKit notifications are
     /// intentionally omitted because this is a headless check.
     func pasteFromPasteboardForSelfCheck(_ pasteboard: NSPasteboard) throws {
-        try finishCompositionForClipboard()
-        guard try pasteSourceFromPasteboard(pasteboard) else { return }
-        synchronizeProjection()
+        try pasteFromPasteboard(pasteboard)
     }
 
     override func selectAll(_ sender: Any?) {
@@ -1091,10 +1493,13 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         [.font, .foregroundColor, .underlineStyle]
     }
 
-    private func cancelInputComposition() {
+    private func cancelInputComposition(cancelEvent: NSEvent? = nil) {
         guard bridge.composition.active else { return }
         discardingComposition = true
         defer { discardingComposition = false }
+        // The input source must receive Escape to dismiss its candidate panel.
+        // Ignore its text callbacks while cancelling the canonical overlay.
+        if let cancelEvent { _ = inputContext?.handleEvent(cancelEvent) }
         do {
             try bridge.cancelComposition()
             nativeMarkedRange = NSRange(location: NSNotFound, length: 0)
@@ -1109,6 +1514,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     override func doCommand(by selector: Selector) {
         let name = NSStringFromSelector(selector)
         if name == "cancel:" || name == "cancelOperation:" {
+            if discardingComposition { return }
             if onTableResizeCancel?() == true {
                 setTableResizeCursor(active: false)
                 return
@@ -1176,6 +1582,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         // must only receive shortcuts from the active document input host.
         guard window?.firstResponder === self else { return false }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if routeListShortcut(event) { return true }
         let isCommandZ = modifiers.contains(.command)
             && !modifiers.contains(.option)
             && !modifiers.contains(.control)
@@ -1185,6 +1592,19 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         }
         let command = modifiers.contains(.shift) ? Command.redo : Command.undo
         return routeCommand(command)
+    }
+
+    // Some input sources consume Command-bracket in keyDown without invoking
+    // performKeyEquivalent. Both native paths must reach the same command.
+    private func routeListShortcut(_ event: NSEvent) -> Bool {
+        guard window?.firstResponder === self, isEditable else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        // Chinese input sources can report full-width punctuation in
+        // charactersIgnoringModifiers but an ASCII Command equivalent in characters.
+        guard modifiers == .command,
+              let key = [event.charactersIgnoringModifiers, event.characters]
+                .compactMap({ $0 }).first(where: { $0 == "[" || $0 == "]" }) else { return false }
+        return routeCommand(key == "]" ? Command.indentList : Command.outdentList)
     }
 
     @discardableResult
@@ -1303,6 +1723,15 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
               range.location + range.length <= length else {
             return
         }
+        do {
+            if try bridge.revealSourceRange(range) {
+                synchronizeProjection()
+                postAccessibilityRefresh()
+            }
+        } catch {
+            onError?(error)
+            return
+        }
         setSelectedRange(range)
     }
 
@@ -1324,6 +1753,19 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
                   range.location + range.length <= length else {
                 return
             }
+        }
+        do {
+            var revealed = false
+            for range in ranges {
+                if try bridge.revealSourceRange(range) { revealed = true }
+            }
+            if revealed {
+                synchronizeProjection()
+                postAccessibilityRefresh()
+            }
+        } catch {
+            onError?(error)
+            return
         }
         // **primary 直接送给 Rust，不经 AppKit 转手。**
         //
@@ -1374,6 +1816,11 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         _ = routeCommand(Command.redo)
     }
 
+    // The standard responder-chain selectors let system panels/fields own
+    // their editing while this view keeps canonical history in Rust.
+    @objc func undo(_ sender: Any?) { performUndo() }
+    @objc func redo(_ sender: Any?) { performRedo() }
+
     func canUndo() -> Bool {
         !bridge.composition.active && bridge.commandAvailable(Command.undo)
     }
@@ -1413,8 +1860,8 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         to pasteboard: NSPasteboard = .general
     ) throws {
         let markdown = try bridge.copySelectionMarkdown(revision: bridge.revision)
-        let fragments = try bridge.copySelectionFragments(revision: bridge.revision)
-        let payload = try JSONEncoder().encode(SourceFragments(version: 1, fragments: fragments, columns: bridge.tableSelectionColumns))
+        let fragments = try bridge.copySelectionPayload(revision: bridge.revision)
+        let payload = try JSONEncoder().encode(SourceFragments(version: 2, fragments: fragments.fragments, columns: bridge.tableSelectionColumns, format: fragments.format, tableSource: fragments.tableSource))
         pasteboard.clearContents()
         if bridge.tableSelectionColumns > 0 {
             guard pasteboard.setString(source, forType: .tabularText) else { throw BridgeError.clipboard }
@@ -1431,6 +1878,8 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         let version: Int
         let fragments: [String]
         let columns: Int?
+        let format: UInt8
+        let tableSource: String?
     }
 
     /// Preserve clipboard representation. Rust owns grid recognition, TSV
@@ -1438,10 +1887,14 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
     private func pasteSourceFromPasteboard(_ pasteboard: NSPasteboard) throws -> Bool {
         if let data = pasteboard.data(forType: .yuFragments),
            let payload = try? JSONDecoder().decode(SourceFragments.self, from: data),
-           payload.version == 1, !payload.fragments.isEmpty {
+           payload.version == 2, !payload.fragments.isEmpty {
+            if let table = payload.tableSource {
+                apply(try bridge.pasteFragments([table], format: UInt8(YU_STORAGE_FRAGMENT_HTML_TABLE)))
+                return true
+            }
             let columns = payload.columns ?? 0
             guard columns >= 0 else { throw BridgeError.operation(24) }
-            apply(try bridge.pasteFragments(payload.fragments, columns: columns))
+            apply(try bridge.pasteFragments(payload.fragments, columns: columns, format: payload.format))
             return true
         }
         if let markdown = pasteboard.string(forType: .yuMarkdown) {
@@ -1545,6 +1998,22 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         nativeSelection = clampedRange(selection, length: (string as NSString).length)
         synchronizingSelection = false
         needsDisplay = true
+        scheduleSpellingCheck()
+    }
+
+    func scheduleSpellingCheck() {
+        var visible: NSRange?
+        if NativeWritingPreferences.shared.spellingEnabled, window != nil, !bridge.composition.active, visibleRect.height > 0 {
+            let top = NSPoint(x: 0, y: max(0, visibleRect.minY - contentOrigin.y))
+            let bottom = NSPoint(x: max(1, bounds.width - 2 * contentOrigin.x), y: max(0, visibleRect.maxY - contentOrigin.y))
+            if let first = shapedVisualHit(at: top)?.source, let last = shapedVisualHit(at: bottom)?.source {
+                let start = max(0, min(first, last) - 256)
+                let end = min(canonicalSource.utf16.count, max(first, last) + 256)
+                visible = NSRange(location: start, length: max(0, end - start))
+            }
+        }
+        spellingCoordinator.update(source: canonicalSource, visible: visible,
+            focus: Int(bridge.selectionEndpoints.focusUTF16), enabled: NativeWritingPreferences.shared.spellingEnabled)
     }
 
     private func stringValue(_ value: Any) -> String {

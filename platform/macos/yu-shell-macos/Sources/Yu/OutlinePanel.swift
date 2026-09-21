@@ -149,7 +149,7 @@ private enum OutlineTypography {
         paragraph.maximumLineHeight = lineHeight(dark: dark)
         let result = NSMutableAttributedString(string: text, attributes: [
             .font: NativeTheme.font(identity: NativeTheme.spec(dark: dark).body_font, size: 14),
-            .foregroundColor: NativeTheme.color(\.text),
+            .foregroundColor: NSColor.labelColor,
             .paragraphStyle: paragraph,
         ])
         let theme = NativeTheme.spec(dark: dark)

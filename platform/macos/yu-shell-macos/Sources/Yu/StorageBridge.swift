@@ -17,6 +17,7 @@ extension NSPasteboard.PasteboardType {
     static let yuHTML = NSPasteboard.PasteboardType(UTType.html.identifier)
 }
 enum StorageStatus {
+    static let editorError: Int32 = 7;
     static let ok: Int32 = 0
     static let staleRevision: Int32 = 13
     static let externalChange: Int32 = 4
@@ -141,6 +142,8 @@ struct NativeProjectionHit {
     let visualUTF16: UInt64
     let roundTripSourceUTF16: UInt64
     let imageSourceRange: NSRange?
+    let contentSourceRange: NSRange?
+    let navigationTarget: NSRange?
     let line: UInt64
     let point: CGPoint
     let affinity: UInt8
@@ -158,6 +161,20 @@ struct NativeProjectionHit {
                 location: Int(value.image_source_start_utf16),
                 length: Int(value.image_source_end_utf16 - value.image_source_start_utf16)
             )
+        }
+        if value.content_source_start_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE
+            || value.content_source_end_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE {
+            contentSourceRange = nil
+        } else {
+            contentSourceRange = NSRange(location: Int(value.content_source_start_utf16),
+                length: Int(value.content_source_end_utf16 - value.content_source_start_utf16))
+        }
+        if value.navigation_target_start_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE
+            || value.navigation_target_end_utf16 == YU_STORAGE_IMAGE_DESTINATION_NONE {
+            navigationTarget = nil
+        } else {
+            navigationTarget = NSRange(location: Int(value.navigation_target_start_utf16),
+                length: Int(value.navigation_target_end_utf16 - value.navigation_target_start_utf16))
         }
         line = value.line
         point = CGPoint(x: CGFloat(value.x), y: CGFloat(value.y))
@@ -736,6 +753,9 @@ struct NativeCommandResult {
     }
 }
 final class StorageBridge {
+    private var renderCalendarInterval: DateInterval?
+    private var renderCalendarZone: String?
+    private var renderCalendarDay: Int32?
     private var handle: OpaquePointer
     private var openedPath: String
     private var cachedSource: String
@@ -1095,6 +1115,39 @@ final class StorageBridge {
 
 
 
+    static func referenceDay(at date: Date, timeZone: TimeZone) -> Int32? {
+        var local = Calendar(identifier: .gregorian)
+        local.timeZone = timeZone
+        let components = local.dateComponents([.year, .month, .day], from: date)
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        guard let midnight = utc.date(from: components) else { return nil }
+        let days = floor(midnight.timeIntervalSince1970 / 86400)
+        guard days >= -719162, days <= 2932896 else { return nil }
+        return Int32(days)
+    }
+
+    @discardableResult
+    func updateRenderCalendar(at now: Date = Date(), timeZone zone: TimeZone = .current) throws -> Bool {
+        if renderCalendarZone == zone.identifier,
+           let interval = renderCalendarInterval,
+           now >= interval.start, now < interval.end { return false }
+        guard let day = Self.referenceDay(at: now, timeZone: zone) else {
+            throw BridgeError.operation(StorageStatus.editorError)
+        }
+        let changed = renderCalendarDay != day
+        if changed {
+            let status = yu_storage_session_macos_set_reference_day(handle, day)
+            guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+            renderCalendarDay = day
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        renderCalendarZone = zone.identifier
+        renderCalendarInterval = calendar.dateInterval(of: .day, for: now)
+        return changed
+    }
+
     func macosRenderHostFrame(
         revision: UInt64,
         size: Float,
@@ -1104,6 +1157,7 @@ final class StorageBridge {
         surfaceGeneration: UInt64,
         appearance: UInt8
     ) throws -> NativeMacosRenderHostSnapshot {
+        try updateRenderCalendar()
         var value = YuStorageMacosRenderHostSnapshot()
         let status = yu_storage_session_macos_render_host_frame(
             handle,
@@ -1134,6 +1188,7 @@ final class StorageBridge {
         appearance: UInt8,
         view: UnsafeMutableRawPointer
     ) throws -> NativeMacosRenderHostSurfaceSnapshot {
+        try updateRenderCalendar()
         var value = YuStorageMacosRenderHostSurfaceSnapshot()
         let status = yu_storage_session_macos_render_host_surface_submit(
             handle,
@@ -1208,6 +1263,11 @@ final class StorageBridge {
 
     func trimRenderCaches() throws {
         let status = yu_storage_session_trim_render_caches(handle)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    func setFocusMode(_ enabled: Bool) throws {
+        let status = yu_storage_session_set_focus_mode(handle, enabled ? 1 : 0)
         guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
     }
 
@@ -1598,6 +1658,178 @@ final class StorageBridge {
         return NativeCommandResult(result)
     }
 
+    static func imageURI(forLocalPath path: String) throws -> String {
+        let bytes = Array(path.utf8)
+        return try bytes.withUnsafeBufferPointer { input in
+            var count = 0
+            var status = yu_storage_encode_local_image_path(input.baseAddress, input.count, nil, 0, &count)
+            guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+            var result = [UInt8](repeating: 0, count: count)
+            status = result.withUnsafeMutableBufferPointer { output in
+                yu_storage_encode_local_image_path(input.baseAddress, input.count, output.baseAddress, output.count, &count)
+            }
+            guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+            return String(decoding: result.prefix(count), as: UTF8.self)
+        }
+    }
+
+    func imageProperties(at source: Int) throws -> NativeImageProperties {
+        guard source >= 0 else { throw BridgeError.operation(Int32(YU_STORAGE_INVALID_SELECTION)) }
+        var info = YuStorageImageProperties()
+        let status = yu_storage_session_image_properties(handle, revision, UInt64(source), &info)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        let destination = try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_image_property(handle, &info, 0, output, capacity, written)
+        }
+        let alternative = try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_image_property(handle, &info, 1, output, capacity, written)
+        }
+        return NativeImageProperties(identity: info, destination: destination, alternative: alternative)
+    }
+
+    func documentReferenceTarget(at source: Int) throws -> NSRange? {
+        guard source >= 0 else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        var target = YuStorageAccessibilityRange()
+        let status = yu_storage_session_document_reference_target(handle, revision, UInt64(source), &target)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        guard target.end_utf16 > target.start_utf16 else { return nil }
+        return NSRange(location: Int(target.start_utf16), length: Int(target.end_utf16 - target.start_utf16))
+    }
+
+    func revealSourceRange(_ range: NSRange) throws -> Bool {
+        guard range.location >= 0, range.length >= 0,
+              range.location <= Int.max - range.length else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        var changed: UInt8 = 0
+        let status = yu_storage_session_reveal_source_range(handle, revision, UInt64(range.location), UInt64(range.location + range.length), &changed)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return changed != 0
+    }
+
+    func disclosureHeader(at source: Int, expectedRevision: UInt64) throws -> (range: NSRange, open: Bool)? {
+        guard source >= 0 else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        var target = YuStorageAccessibilityRange()
+        var expanded: UInt8 = 0
+        let status = yu_storage_session_disclosure_header(handle, expectedRevision, UInt64(source), &target, &expanded)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        guard target.end_utf16 > target.start_utf16 else { return nil }
+        return (NSRange(location: Int(target.start_utf16), length: Int(target.end_utf16-target.start_utf16)), expanded != 0)
+    }
+
+    func toggleDisclosure(at source: Int, expectedRevision: UInt64) throws -> NativeCommandResult {
+        guard source >= 0 else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        var result = YuStorageCommandResult()
+        let status = yu_storage_session_toggle_disclosure(handle, expectedRevision, UInt64(source), &result)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return NativeCommandResult(result)
+    }
+
+    func linkDestination(at source: Int, expectedRevision: UInt64) throws -> String? {
+        guard source >= 0 else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        let destination = try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_link_destination(handle, expectedRevision, UInt64(source), output, capacity, written)
+        }
+        return destination.isEmpty ? nil : destination
+    }
+
+    func documentDiagnostic(at source: Int) throws -> String {
+        guard source >= 0 else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        return try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_document_diagnostic(handle, revision, UInt64(source), output, capacity, written)
+        }
+    }
+
+    func spellingRanges(in range: NSRange, revision: UInt64) throws -> [NSRange] {
+        guard range.location >= 0, range.length >= 0, range.location <= Int.max - range.length else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        var count = 0
+        var status = yu_storage_session_spelling_ranges(handle, revision, UInt64(range.location), UInt64(NSMaxRange(range)), nil, 0, &count)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        var records = Array(repeating: YuStorageAccessibilityRange(), count: count)
+        status = records.withUnsafeMutableBufferPointer {
+            yu_storage_session_spelling_ranges(handle, revision, UInt64(range.location), UInt64(NSMaxRange(range)), $0.baseAddress, $0.count, &count)
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return records.prefix(count).map { NSRange(location: Int($0.start_utf16), length: Int($0.end_utf16 - $0.start_utf16)) }
+    }
+
+    func setSpellingDiagnostics(_ ranges: [NSRange], revision: UInt64) throws {
+        guard ranges.count <= 4096, ranges.allSatisfy({ $0.location >= 0 && $0.length > 0 && $0.location <= Int.max - $0.length }) else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        let records = ranges.map { YuStorageAccessibilityRange(revision: revision, start_utf16: UInt64($0.location), end_utf16: UInt64(NSMaxRange($0))) }
+        let status = records.withUnsafeBufferPointer {
+            yu_storage_session_set_spelling_diagnostics(handle, revision, $0.baseAddress, $0.count)
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    func replaceSpelling(in range: NSRange, revision: UInt64, with text: String) throws -> NativeCommandResult {
+        guard range.location >= 0, range.length > 0, range.location <= Int.max - range.length else { throw BridgeError.operation(StorageStatus.invalidSelection) }
+        var info = YuStorageAccessibilityRange(revision: revision, start_utf16: UInt64(range.location), end_utf16: UInt64(NSMaxRange(range)))
+        let bytes = Array(text.utf8)
+        var result = YuStorageCommandResult()
+        let status = bytes.withUnsafeBufferPointer {
+            yu_storage_session_replace_spelling(handle, &info, $0.baseAddress, $0.count, &result)
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return NativeCommandResult(result)
+    }
+
+    func imageResourceStatus(_ properties: NativeImageProperties) throws -> UInt8 {
+        var info = properties.identity
+        var resourceStatus: UInt8 = 0
+        let status = yu_storage_session_image_resource_status(handle, &info, &resourceStatus)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return resourceStatus
+    }
+
+    func retryImage(_ properties: NativeImageProperties) throws {
+        var info = properties.identity
+        let status = yu_storage_session_retry_image(handle, &info)
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+    }
+
+    func updateImageProperties(_ properties: NativeImageProperties) throws -> NativeCommandResult {
+        var info = properties.identity
+        let destination = Array(properties.destination.utf8)
+        let alternative = Array(properties.alternative.utf8)
+        var result = YuStorageCommandResult()
+        let status = destination.withUnsafeBufferPointer { path in
+            alternative.withUnsafeBufferPointer { label in
+                yu_storage_session_update_image_properties(handle, &info,
+                    path.baseAddress, path.count, label.baseAddress, label.count, &result)
+            }
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return NativeCommandResult(result)
+    }
+
+    func insertLocalImages(_ images: [NativeImageResources.Prepared], at dropTarget: NativeSelectionEndpoints? = nil) throws -> NativeCommandResult {
+        var bytes: [UInt8] = []
+        var items: [YuStorageImageInput] = []
+        for item in images {
+            let pathStart = bytes.count
+            bytes.append(contentsOf: item.image.destination.utf8)
+            let pathEnd = bytes.count
+            bytes.append(contentsOf: item.alternative.utf8)
+            items.append(YuStorageImageInput(path_start: pathStart, path_end: pathEnd,
+                alternative_start: pathEnd, alternative_end: bytes.count))
+        }
+        var result = YuStorageCommandResult()
+        var target = YuStorageSelectionEndpoints()
+        if let dropTarget {
+            target = YuStorageSelectionEndpoints(revision: dropTarget.revision,
+                anchor_utf16: dropTarget.anchorUTF16, focus_utf16: dropTarget.focusUTF16, affinity: dropTarget.affinity)
+        }
+        let status = withUnsafePointer(to: &target) { targetPointer in
+            bytes.withUnsafeBufferPointer { text in
+                items.withUnsafeBufferPointer { entries in
+                    yu_storage_session_insert_local_images(handle, dropTarget?.revision ?? revision, text.baseAddress, text.count,
+                        entries.baseAddress, entries.count, dropTarget == nil ? nil : targetPointer, &result)
+                }
+            }
+        }
+        guard status == StorageStatus.ok else { throw BridgeError.operation(status) }
+        return NativeCommandResult(result)
+    }
+
     func pasteClipboardText(_ text: String, tabular: Bool) throws -> NativeCommandResult {
         let bytes = Array(text.utf8)
         var result = YuStorageCommandResult()
@@ -1609,7 +1841,7 @@ final class StorageBridge {
         return NativeCommandResult(result)
     }
 
-    func pasteFragments(_ fragments: [String], columns: Int = 0) throws -> NativeCommandResult {
+    func pasteFragments(_ fragments: [String], columns: Int = 0, format: UInt8 = UInt8(YU_STORAGE_FRAGMENT_TEXT)) throws -> NativeCommandResult {
         var bytes: [UInt8] = []
         var ends: [Int] = []
         for fragment in fragments {
@@ -1621,7 +1853,7 @@ final class StorageBridge {
             ends.withUnsafeBufferPointer { offsets in
                 yu_storage_session_paste_fragments(
                     handle, revision, text.baseAddress, text.count,
-                    offsets.baseAddress, offsets.count, columns, &result
+                    offsets.baseAddress, offsets.count, columns, format, &result
                 )
             }
         }
@@ -1647,16 +1879,21 @@ final class StorageBridge {
         }
     }
 
-    func copySelectionFragments(revision: UInt64) throws -> [String] {
-        guard let selections = selectionsIfAvailable else { throw BridgeError.clipboard }
-        let cells = tableSelectionColumns > 0
-        return try selections.ranges.filter { cells || $0.range.length > 0 }.map { selection in
-            guard selection.revision == revision,
-                  let source = copySourceRangeIfAvailable(selection.range, revision: revision) else {
-                throw BridgeError.clipboard
-            }
-            return source
+    struct FragmentPayload: Decodable {
+        let fragments: [String]
+        let format: UInt8
+        let tableSource: String?
+    }
+
+    func copySelectionPayload(revision: UInt64) throws -> FragmentPayload {
+        let json = try copyBytesThrowing { output, capacity, written in
+            yu_storage_session_copy_selection(handle, revision, UInt8(YU_STORAGE_CLIPBOARD_FRAGMENTS), output, capacity, written)
         }
+        return try JSONDecoder().decode(FragmentPayload.self, from: Data(json.utf8))
+    }
+
+    func copySelectionFragments(revision: UInt64) throws -> [String] {
+        try copySelectionPayload(revision: revision).fragments
     }
 
     func executeCommand(_ command: UInt8, block: UInt64 = 0) throws -> NativeCommandResult {
@@ -1828,6 +2065,15 @@ final class StorageBridge {
                 output,
                 capacity,
                 written
+            )
+        }
+    }
+
+    func copyAccessibilityLabel(_ range: NSRange, revision: UInt64) -> String? {
+        copyBytesIfAvailable { output, capacity, written in
+            yu_storage_session_copy_accessibility_label(
+                handle, revision, UInt64(range.location), UInt64(range.location + range.length),
+                output, capacity, written
             )
         }
     }
@@ -2090,4 +2336,10 @@ enum BridgeError: LocalizedError {
             return "无法监听文档所在目录（\(reason)）"
         }
     }
+}
+
+struct NativeImageProperties {
+    var identity: YuStorageImageProperties
+    var destination: String
+    var alternative: String
 }

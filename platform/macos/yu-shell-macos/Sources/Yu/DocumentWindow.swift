@@ -48,6 +48,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     func withFileInputForSelfCheck(_ action: (DocumentTextView) -> Void) { action(textView) }
     private lazy var textView = DocumentTextView(bridge: bridge)
     func makeTableMenu() -> NSMenu { textView.makeTableMenu() }
+    @objc fileprivate func editImagePropertiesFromMenu(_ sender: NSMenuItem?) { textView.editImagePropertiesFromMenu(sender) }
     private let surfaceHostView = MacosSurfaceHostView()
     private let surfaceCoordinator: MacosSurfaceHostCoordinator
     private let statusLabel = NSTextField(labelWithString: "")
@@ -159,8 +160,12 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         surfaceHostView.setAccessibilityElement(false)
         documentScrollView = scrollView
 
+        do { try bridge.setFocusMode(NativeWritingPreferences.shared.focusMode) } catch { show(error) }
+        textView.onImageImport = { [weak self] inputs, target in try self?.importImages(inputs, at: target) ?? false }
         textView.isEditable = true
         textView.isSelectable = true
+        textView.onSpellingChange = { [weak self] in self?.scheduleVisualSubmit() }
+        textView.onResourceChange = { [weak self] in self?.scheduleVisualSubmit() }
         textView.onDocumentChange = { [weak self] in
             guard let self else { return }
             self.view.window?.invalidateRestorableState()
@@ -174,6 +179,14 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             self.refreshSearch()
             self.syncSourceGlyphVisibility()
             self.scheduleVisualSubmit()
+            if NativeWritingPreferences.shared.typewriterMode {
+                let generation = self.surfaceCoordinator.caretRevealGeneration
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.visualEnhancementsReady,
+                          !self.isCapturingVisualAcceptance else { return }
+                    self.surfaceCoordinator.revealCaretIfNeeded(typewriter: true, generation: generation)
+                }
+            }
         }
         textView.onCaretChange = { [weak self] in
             guard let self else { return }
@@ -189,9 +202,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             // inside its event callback. Defer the scroll mutation until the
             // same main-thread turn has finished, while retaining the Rust
             // Revision captured by the coordinator's query.
+            let generation = self.surfaceCoordinator.caretRevealGeneration
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.visualEnhancementsReady, !self.isCapturingVisualAcceptance else { return }
-                self.surfaceCoordinator.revealCaretIfNeeded()
+                self.surfaceCoordinator.revealCaretIfNeeded(generation: generation)
             }
         }
         textView.onError = { [weak self] error in self?.show(error) }
@@ -278,6 +292,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         ) { [weak self] _ in
             self?.syncSurfaceGeometry()
             self?.surfaceCoordinator.noteBoundsEvent()
+            self?.textView.scheduleSpellingCheck()
             self?.textView.inputContext?.invalidateCharacterCoordinates()
             self?.scheduleVisualSubmit()
             self?.syncSourceGlyphVisibility()
@@ -321,13 +336,13 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         statusLabel.setAccessibilityLabel("文档状态")
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = NSFont.systemFont(ofSize: YuVisualTokens.statusBarFontSize)
-        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.textColor = NativeTheme.color(\.text).withAlphaComponent(0.65)
 
         statusDetailLabel.font = NSFont.monospacedDigitSystemFont(
             ofSize: YuVisualTokens.statusBarFontSize,
             weight: .regular
         )
-        statusDetailLabel.textColor = .secondaryLabelColor
+        statusDetailLabel.textColor = NativeTheme.color(\.text).withAlphaComponent(0.65)
         statusDetailLabel.alignment = .right
         statusDetailLabel.translatesAutoresizingMaskIntoConstraints = false
         statusDetailLabel.setAccessibilityElement(true)
@@ -488,6 +503,18 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
             forName: NativeTheme.didChange, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self else { return }
+            self.textView.scheduleSpellingCheck()
+            do { try self.bridge.setFocusMode(NativeWritingPreferences.shared.focusMode) } catch { self.show(error) }
+            self.surfaceCoordinator.retainPositionForPresentationChange()
+            let theme = NativeTheme.spec(dark: self.view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+            let size = CGFloat(NativeWritingPreferences.shared.fontSize) * self.readingZoom
+            self.textView.font = NativeTheme.font(identity: theme.body_font, size: size)
+            self.surfaceCoordinator.setFontSize(size)
+            self.textView.refreshTableResizeAccessibility()
+            // These labels sit on the document canvas, so their contrast must
+            // follow the reading theme even when AppKit uses another appearance.
+            self.statusLabel.textColor = NativeTheme.color(\.text).withAlphaComponent(0.65)
+            self.statusDetailLabel.textColor = NativeTheme.color(\.text).withAlphaComponent(0.65)
             self.documentScrollView?.backgroundColor = YuVisualTokens.canvas
             self.documentScrollView?.contentView.backgroundColor = YuVisualTokens.canvas
             self.view.needsLayout = true
@@ -822,7 +849,7 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         surfaceCoordinator.retainPositionForPresentationChange()
         readingZoom = next
         let theme = NativeTheme.spec(dark: view.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
-        let size = CGFloat(theme.body_size) * next
+        let size = CGFloat(NativeWritingPreferences.shared.fontSize) * next
         textView.font = NativeTheme.font(identity: theme.body_font, size: size)
         surfaceCoordinator.setFontSize(size)
         textView.refreshTableResizeAccessibility()
@@ -926,6 +953,32 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 
     @objc private func save() { _ = saveDocument() }
 
+    @objc fileprivate func insertImageFromMenu(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.title = "插入图片"
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        do { _ = try importImages(panel.urls.map { .file($0) }) } catch { show(error) }
+    }
+
+    private func importImages(_ inputs: [NativeImageResources.Input], at dropTarget: NativeSelectionEndpoints? = nil) throws -> Bool {
+        guard !inputs.isEmpty else { return false }
+        try NativeImageResources.validate(inputs)
+        try textView.finishCompositionForFileOperation()
+        // A cancelled first save consumes the clipboard command but does not
+        // publish source, copy resources or report a successful drag.
+        if persistence.isUntitled, !saveDocument() { return false }
+        try NativeImageResources.withImports(inputs, document: documentURL,
+            directory: NativeWritingPreferences.shared.imageDirectory,
+            reference: NativeWritingPreferences.shared.imagePolicy == .reference) { images in
+                try textView.insertImportedImages(images, at: dropTarget)
+            }
+        focusDocument()
+        return true
+    }
+
     @objc fileprivate func saveAsFromMenu(_ sender: Any?) {
         do { try textView.finishCompositionForFileOperation() }
         catch { show(error); return }
@@ -984,38 +1037,10 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
         reload()
     }
 
+    private var settingsWindowIsKey: Bool { NSApp.keyWindow?.identifier?.rawValue == "yu-settings" }
+
     @objc fileprivate func closeFromMenu(_ sender: Any?) {
-        view.window?.performClose(sender)
-    }
-
-    @objc fileprivate func copyFromMenu(_ sender: Any?) {
-        if let field = view.window?.firstResponder as? NSTextView { field.copy(sender) }
-        else { textView.copy(sender) }
-    }
-
-    @objc fileprivate func cutFromMenu(_ sender: Any?) {
-        if let field = view.window?.firstResponder as? NSTextView { field.cut(sender) }
-        else { textView.cut(sender) }
-    }
-
-    @objc fileprivate func undoFromMenu(_ sender: Any?) {
-        if let field = view.window?.firstResponder as? NSTextView { field.undoManager?.undo() }
-        else { textView.performUndo() }
-    }
-
-    @objc fileprivate func redoFromMenu(_ sender: Any?) {
-        if let field = view.window?.firstResponder as? NSTextView { field.undoManager?.redo() }
-        else { textView.performRedo() }
-    }
-
-    @objc fileprivate func pasteFromMenu(_ sender: Any?) {
-        if let field = view.window?.firstResponder as? NSTextView { field.paste(sender) }
-        else { textView.paste(sender) }
-    }
-
-    @objc fileprivate func selectAllFromMenu(_ sender: Any?) {
-        if let field = view.window?.firstResponder as? NSTextView { field.selectAll(sender) }
-        else { textView.selectAll(sender) }
+        (settingsWindowIsKey ? NSApp.keyWindow : view.window)?.performClose(sender)
     }
 
     func focusDocument() {
@@ -2666,40 +2691,15 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if let field = view.window?.firstResponder as? NSTextView {
-            if menuItem.action == #selector(undoFromMenu(_:)) { return field.undoManager?.canUndo ?? false }
-            if menuItem.action == #selector(redoFromMenu(_:)) { return field.undoManager?.canRedo ?? false }
-            let nativeActions: [Selector: String] = [
-                #selector(copyFromMenu(_:)): "copy:", #selector(cutFromMenu(_:)): "cut:",
-                #selector(pasteFromMenu(_:)): "paste:", #selector(selectAllFromMenu(_:)): "selectAll:"
-            ]
-            if let action = menuItem.action.flatMap({ nativeActions[$0] }) {
-                let nativeItem = NSMenuItem(title: menuItem.title, action: NSSelectorFromString(action), keyEquivalent: "")
-                return field.validateUserInterfaceItem(nativeItem)
-            }
-        }
+        if settingsWindowIsKey { return menuItem.action == #selector(closeFromMenu(_:)) }
+        if menuItem.action == #selector(editImagePropertiesFromMenu(_:)) { return textView.canEditImage() }
+        if menuItem.action == #selector(insertImageFromMenu(_:)) { return textView.isEditable }
         let state = bridge.state
         if menuItem.action == #selector(saveFromMenu(_:)) {
             return state.dirty || persistence.isUntitled || bridge.composition.active
         }
         if menuItem.action == #selector(reloadFromMenu(_:)) {
             return !state.dirty && state.disk != .unchanged
-        }
-        if menuItem.action == #selector(undoFromMenu(_:)) {
-            return textView.canUndo()
-        }
-        if menuItem.action == #selector(redoFromMenu(_:)) {
-            return textView.canRedo()
-        }
-        if menuItem.action == #selector(copyFromMenu(_:)) ||
-            menuItem.action == #selector(cutFromMenu(_:)) {
-            return textView.hasSourceSelection
-        }
-        if menuItem.action == #selector(pasteFromMenu(_:)) {
-            return textView.hasSourceOnPasteboard
-        }
-        if menuItem.action == #selector(selectAllFromMenu(_:)) {
-            return textView.string.utf16.count > 0
         }
         if menuItem.action == #selector(zoomInFromMenu(_:)) { return readingZoom < 3 }
         if menuItem.action == #selector(zoomOutFromMenu(_:)) { return readingZoom > 0.5 }
@@ -2870,6 +2870,23 @@ final class DocumentViewController: NSViewController, NSMenuItemValidation, NSTo
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private var settingsController: NativeSettingsWindowController?
+
+    @objc private func showSettings(_ sender: Any?) {
+        if settingsController == nil {
+            let settings = NativeSettingsWindowController()
+            if forceDarkMode || darkModeSelfCheck { settings.window?.appearance = NSAppearance(named: .darkAqua) }
+            settings.onChange = { [weak self] in
+                guard let self else { return }
+                for document in self.documents.values { document.persistence.documentChanged() }
+                self.installMainMenu(for: self.controller)
+            }
+            settingsController = settings
+        }
+        settingsController?.showWindow(sender)
+        settingsController?.window?.makeKeyAndOrderFront(sender)
+        NSApp.activate(ignoringOtherApps: true)
+    }
     private var window: NSWindow?
     private var controller: DocumentViewController?
     private var launchSelfCheck = false
@@ -3064,9 +3081,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.title = controller.persistence.isUntitled ? "未命名" : controller.documentURL.lastPathComponent
         window.representedURL = controller.persistence.isUntitled ? nil : controller.documentURL
         window.toolbarStyle = .unified
-        window.titlebarAppearsTransparent = true
+        // AppKit owns chrome appearance independently from Github/Night.
+        // A transparent titlebar over a dark reading canvas otherwise leaves
+        // system light-appearance titles and controls without readable contrast.
+        window.titlebarAppearsTransparent = false
         window.titlebarSeparatorStyle = .none
-        window.backgroundColor = YuVisualTokens.canvas
+        window.backgroundColor = .windowBackgroundColor
         if darkModeSelfCheck || forceDarkMode { window.appearance = NSAppearance(named: .darkAqua) }
         window.delegate = self
         window.isReleasedWhenClosed = false
@@ -3343,6 +3363,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: ""
         )
+        let settings = NSMenuItem(title: "设置…", action: #selector(showSettings(_:)), keyEquivalent: ",")
+        settings.target = self
+        appMenu.addItem(settings)
         appMenu.addItem(.separator())
         let quit = NSMenuItem(
             title: "退出 Yu",
@@ -3369,6 +3392,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         saveAs.keyEquivalentModifierMask = [.command, .shift]
         saveAs.target = controller
         fileMenu.addItem(saveAs)
+        let insertImage = NSMenuItem(title: "插入图片…", action: #selector(DocumentViewController.insertImageFromMenu(_:)), keyEquivalent: "")
+        insertImage.target = controller
+        fileMenu.addItem(insertImage)
+        let imageProperties = NSMenuItem(title: "图片属性…", action: #selector(DocumentViewController.editImagePropertiesFromMenu(_:)), keyEquivalent: "")
+        imageProperties.target = controller
+        fileMenu.addItem(imageProperties)
         let recent = NSMenu(title: "最近打开")
         for url in NSDocumentController.shared.recentDocumentURLs {
             let item = NSMenuItem(title: url.lastPathComponent, action: #selector(openRecentDocument(_:)), keyEquivalent: "")
@@ -3397,33 +3426,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fileMenu.addItem(.separator())
         let close = NSMenuItem(
             title: "关闭窗口",
-            action: #selector(DocumentViewController.closeFromMenu(_:)),
+            action: #selector(NSWindow.performClose(_:)),
             keyEquivalent: "w"
         )
-        close.target = controller
+        close.target = nil
         fileMenu.addItem(close)
         fileMenuItem.submenu = fileMenu
         mainMenu.addItem(fileMenuItem)
 
         let editMenuItem = NSMenuItem()
         let editMenu = NSMenu(title: "编辑")
+        // Standard nil-target actions follow the current native responder,
+        // including remote file panels, search fields and settings. Yu's own
+        // NSTextInputClient handles the same selectors through Rust below.
         let editItems: [(String, Selector, String)] = [
-            ("撤销", #selector(DocumentViewController.undoFromMenu(_:)), "z"),
-            ("重做", #selector(DocumentViewController.redoFromMenu(_:)), "Z"),
-            ("剪切", #selector(DocumentViewController.cutFromMenu(_:)), "x"),
-            ("复制", #selector(DocumentViewController.copyFromMenu(_:)), "c"),
-            ("粘贴", #selector(DocumentViewController.pasteFromMenu(_:)), "v"),
-            ("全选", #selector(DocumentViewController.selectAllFromMenu(_:)), "a"),
+            ("撤销", NSSelectorFromString("undo:"), "z"),
+            ("重做", NSSelectorFromString("redo:"), "Z"),
+            ("剪切", #selector(DocumentTextView.cut(_:)), "x"),
+            ("复制", #selector(DocumentTextView.copy(_:)), "c"),
+            ("粘贴", #selector(DocumentTextView.paste(_:)), "v"),
+            ("全选", #selector(DocumentTextView.selectAll(_:)), "a"),
         ]
         for (title, action, keyEquivalent) in editItems.prefix(2) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
-            item.target = controller
+            item.target = nil
             editMenu.addItem(item)
         }
         editMenu.addItem(.separator())
         for (title, action, keyEquivalent) in editItems.dropFirst(2) {
             let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
-            item.target = controller
+            item.target = nil
             editMenu.addItem(item)
         }
         editMenu.addItem(.separator())
@@ -3462,6 +3494,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sourceMode.keyEquivalentModifierMask = [.command, .shift]
         sourceMode.target = controller
         viewMenu.addItem(sourceMode)
+        let disclosure = NSMenuItem(title: "展开／折叠当前摘要", action: #selector(DocumentTextView.toggleDisclosureFromMenu(_:)), keyEquivalent: "d")
+        disclosure.keyEquivalentModifierMask = [.command, .option, .control]
+        viewMenu.addItem(disclosure)
         let outline = NSMenuItem(
             title: "大纲",
             action: #selector(DocumentViewController.toggleOutlineFromMenu(_:)),
