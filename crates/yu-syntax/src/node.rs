@@ -14,9 +14,9 @@
 ///
 /// 变体分三段，段内顺序不可调整：
 ///
-/// 1. `Document` 与块级节点（`Document` ..= `Task`）；
-/// 2. 行内节点（`Escape` ..= `Autolink`）；
-/// 3. 标记节点（`HeaderMark` ..= `TaskMarker`），语法字符本身。
+/// 1. `Document` 与块级节点（`Document` ..= `FootnoteDefinition`）；
+/// 2. 行内节点（`Escape` ..= `FootnoteReference`）；
+/// 3. 标记节点（`HeaderMark` ..= `MathText`），语法字符本身。
 ///
 /// 第 3 段是不变量 C2「lossless」得以成立的关键：`#`、`>`、`*` 这些字符都有
 /// 自己的节点，装饰阶段据此隐藏语法而不触碰 source。
@@ -53,6 +53,10 @@ pub enum NodeKind {
     /// 它是 `ListItem` 的内容节点，站在普通列表项里 `Paragraph` 的位置上；
     /// `- ` 本身仍然是 `ListMark`。
     Task,
+    /// Opaque dollar-delimited display formula.
+    MathBlock,
+    FrontMatter,
+    FootnoteDefinition,
 
     // 行内。
     Escape,
@@ -67,6 +71,13 @@ pub enum NodeKind {
     Comment,
     ProcessingInstruction,
     Autolink,
+    /// Opaque single-dollar inline formula.
+    InlineMath,
+    EquationReference,
+    Highlight,
+    Superscript,
+    Subscript,
+    FootnoteReference,
 
     // 标记。
     HeaderMark,
@@ -82,6 +93,14 @@ pub enum NodeKind {
     Url,
     /// GFM 任务项的 `[x]` / `[ ]`，三个字节。
     TaskMarker,
+    MathMark,
+    MathText,
+    HighlightMark,
+    ScriptMark,
+    MetadataMark,
+    MetadataText,
+    FootnoteMark,
+    FootnoteIndent,
 }
 
 impl NodeKind {
@@ -111,6 +130,23 @@ impl NodeKind {
             Self::CommentBlock => "CommentBlock",
             Self::ProcessingInstructionBlock => "ProcessingInstructionBlock",
             Self::Task => "Task",
+            Self::MathBlock => "MathBlock",
+            Self::FrontMatter => "FrontMatter",
+            Self::FootnoteDefinition => "FootnoteDefinition",
+            Self::FootnoteReference => "FootnoteReference",
+            Self::FootnoteMark => "FootnoteMark",
+            Self::FootnoteIndent => "FootnoteIndent",
+            Self::MetadataMark => "MetadataMark",
+            Self::MetadataText => "MetadataText",
+            Self::InlineMath => "InlineMath",
+            Self::EquationReference => "EquationReference",
+            Self::Highlight => "Highlight",
+            Self::Superscript => "Superscript",
+            Self::Subscript => "Subscript",
+            Self::HighlightMark => "HighlightMark",
+            Self::ScriptMark => "ScriptMark",
+            Self::MathMark => "MathMark",
+            Self::MathText => "MathText",
             Self::Escape => "Escape",
             Self::Entity => "Entity",
             Self::HardBreak => "HardBreak",
@@ -138,13 +174,13 @@ impl NodeKind {
         }
     }
 
-    /// 块级节点：`Document` 与它到 `Task` 之间的全部。
+    /// 块级节点：`Document` 与它到 `FrontMatter` 之间的全部。
     ///
     /// 增量复用只在块边界上发生（`FragmentCursor::take_nodes`），这个判断决定
     /// 哪些节点可以充当边界。
     #[must_use]
     pub const fn is_block(self) -> bool {
-        (self as u8) <= (Self::Task as u8)
+        (self as u8) <= (Self::FootnoteDefinition as u8)
     }
 
     /// 容器块：可以嵌套其他块，并在每行开头需要跳过自己的标记。
@@ -153,6 +189,7 @@ impl NodeKind {
         matches!(
             self,
             Self::Document
+                | Self::FootnoteDefinition
                 | Self::Blockquote
                 | Self::ListItem
                 | Self::OrderedList
@@ -166,7 +203,11 @@ impl NodeKind {
     pub const fn spans_blank_lines(self) -> bool {
         matches!(
             self,
-            Self::CodeBlock | Self::ListItem | Self::OrderedList | Self::BulletList
+            Self::CodeBlock
+                | Self::ListItem
+                | Self::OrderedList
+                | Self::BulletList
+                | Self::FootnoteDefinition
         )
     }
 

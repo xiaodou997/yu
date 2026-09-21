@@ -6,6 +6,11 @@
 //! can run work on any executor or native worker without making the document
 //! thread wait for rendering.
 
+/// Shared limits for helper output, transport validation and native rasterization.
+pub const EMBEDDED_SVG_MAX_DIMENSION: u32 = 4096;
+pub const EMBEDDED_SVG_MAX_MARKUP_BYTES: usize = 4 * 1024 * 1024;
+pub const EMBEDDED_SVG_MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -61,9 +66,65 @@ impl Error for EmbeddedResourceKeyError {}
 /// The source is kept because a renderer needs the actual content, while the
 /// fingerprint is a cheap diagnostic/native handoff value. Kind is part of
 /// the identity: the same source must not share Math and Mermaid output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EmbeddedStyle {
+    font_milli: u32,
+    foreground: u32,
+    dark: bool,
+    display: bool,
+    reference_day: Option<i32>,
+}
+impl Default for EmbeddedStyle {
+    fn default() -> Self {
+        Self {
+            font_milli: 24_000,
+            foreground: 0x000000ff,
+            dark: false,
+            display: true,
+            reference_day: None,
+        }
+    }
+}
+impl EmbeddedStyle {
+    pub fn new(font_size: f32, foreground: u32, dark: bool) -> Option<Self> {
+        (font_size.is_finite() && (1.0..=256.0).contains(&font_size)).then(|| Self {
+            font_milli: (font_size * 1000.0).round() as u32,
+            foreground,
+            dark,
+            display: true,
+            reference_day: None,
+        })
+    }
+    pub const fn with_display(mut self, display: bool) -> Self {
+        self.display = display;
+        self
+    }
+    /// Local Gregorian day, counted from 1970-01-01, supplied by the host.
+    pub const fn with_reference_day(mut self, day: Option<i32>) -> Self {
+        self.reference_day = day;
+        self
+    }
+    pub const fn reference_day(self) -> Option<i32> {
+        self.reference_day
+    }
+    pub const fn display(self) -> bool {
+        self.display
+    }
+    pub const fn font_milli(self) -> u32 {
+        self.font_milli
+    }
+    pub const fn foreground(self) -> u32 {
+        self.foreground
+    }
+    pub const fn dark(self) -> bool {
+        self.dark
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EmbeddedResourceKey {
     kind: EmbeddedResourceKind,
+    style: EmbeddedStyle,
     source: Arc<str>,
     fingerprint: u64,
 }
@@ -79,9 +140,19 @@ impl EmbeddedResourceKey {
         }
         Ok(Self {
             kind,
-            fingerprint: fingerprint(kind, &source),
+            style: EmbeddedStyle::default(),
+            fingerprint: styled_fingerprint(kind, &source, EmbeddedStyle::default()),
             source,
         })
+    }
+
+    pub fn with_style(mut self, style: EmbeddedStyle) -> Self {
+        self.style = style;
+        self.fingerprint = styled_fingerprint(self.kind, &self.source, style);
+        self
+    }
+    pub const fn style(&self) -> EmbeddedStyle {
+        self.style
     }
 
     #[must_use]
@@ -109,6 +180,21 @@ fn fingerprint(kind: EmbeddedResourceKind, source: &str) -> u64 {
     hash
 }
 
+fn styled_fingerprint(kind: EmbeddedResourceKind, source: &str, style: EmbeddedStyle) -> u64 {
+    let mut hash = fingerprint(kind, source);
+    for byte in style
+        .font_milli
+        .to_le_bytes()
+        .into_iter()
+        .chain(style.foreground.to_le_bytes())
+        .chain([u8::from(style.dark), u8::from(style.display)])
+        .chain(style.reference_day.unwrap_or(i32::MIN).to_le_bytes())
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(1_099_511_628_211);
+    }
+    hash
+}
+
 /// A source-backed request handed to an embedded renderer worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddedRenderRequest {
@@ -129,6 +215,14 @@ impl EmbeddedRenderRequest {
             source_range,
             key: EmbeddedResourceKey::new(kind, source)?,
         })
+    }
+
+    pub fn with_style(mut self, style: EmbeddedStyle) -> Self {
+        self.key = self.key.with_style(style);
+        self
+    }
+    pub const fn style(&self) -> EmbeddedStyle {
+        self.key.style()
     }
 
     #[must_use]
@@ -206,6 +300,7 @@ pub enum EmbeddedRenderPayload {
     Svg {
         dimensions: EmbeddedDimensions,
         markup: Arc<str>,
+        baseline_milli: Option<u32>,
     },
 }
 
@@ -247,7 +342,32 @@ impl EmbeddedRenderPayload {
         if markup.trim().is_empty() {
             return Err(EmbeddedPayloadError::EmptySvg);
         }
-        Ok(Self::Svg { dimensions, markup })
+        Ok(Self::Svg {
+            dimensions,
+            markup,
+            baseline_milli: None,
+        })
+    }
+
+    pub fn with_baseline(mut self, baseline_milli: u32) -> Result<Self, EmbeddedPayloadError> {
+        if u64::from(baseline_milli) > u64::from(self.dimensions().height()) * 1000 {
+            return Err(EmbeddedPayloadError::InvalidDimensions);
+        }
+        if let Self::Svg {
+            baseline_milli: baseline,
+            ..
+        } = &mut self
+        {
+            *baseline = Some(baseline_milli);
+        }
+        Ok(self)
+    }
+
+    pub const fn baseline_milli(&self) -> Option<u32> {
+        match self {
+            Self::Svg { baseline_milli, .. } => *baseline_milli,
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -882,6 +1002,41 @@ mod tests {
 
     fn raster(byte: u8) -> EmbeddedRenderPayload {
         EmbeddedRenderPayload::rgba8(1, 1, [byte, byte, byte, 255]).expect("payload")
+    }
+
+    #[test]
+    fn calendar_day_changes_diagram_identity_without_changing_source() {
+        let base = EmbeddedResourceKey::new(EmbeddedResourceKind::Mermaid, "gantt\nTask :1d")
+            .expect("key");
+        let today = base
+            .clone()
+            .with_style(EmbeddedStyle::default().with_reference_day(Some(20454)));
+        let tomorrow = base
+            .clone()
+            .with_style(EmbeddedStyle::default().with_reference_day(Some(20455)));
+        assert_ne!(today, tomorrow);
+        assert_ne!(today.fingerprint(), tomorrow.fingerprint());
+        assert_ne!(base.fingerprint(), today.fingerprint());
+        assert_eq!(today.source(), tomorrow.source());
+    }
+
+    #[test]
+    fn presentation_style_is_part_of_resource_and_cache_identity() {
+        let source = "x^2";
+        let base = EmbeddedResourceKey::new(EmbeddedResourceKind::Math, source).expect("key");
+        let dark = base
+            .clone()
+            .with_style(EmbeddedStyle::new(24.0, 0xf2f2f2ff, true).expect("style"));
+        let large = base
+            .clone()
+            .with_style(EmbeddedStyle::new(32.0, 0x000000ff, false).expect("style"));
+        assert_ne!(base, dark);
+        assert_ne!(base.fingerprint(), dark.fingerprint());
+        assert_ne!(base, large);
+        assert_ne!(base.fingerprint(), large.fingerprint());
+        assert_eq!(base.source(), dark.source());
+        assert!(EmbeddedStyle::new(f32::NAN, 0, false).is_none());
+        assert!(EmbeddedStyle::new(0.0, 0, false).is_none());
     }
 
     struct TestRenderer;

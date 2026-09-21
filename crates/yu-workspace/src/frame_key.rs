@@ -224,6 +224,9 @@ impl FrameTableResize {
 pub struct FrameBuildKey {
     revision: u64,
     source_mode: bool,
+    focus_mode: bool,
+    spelling_generation: u64,
+    disclosure_fingerprint: u64,
     composition_generation: u64,
     selections: Vec<EditorSelection>,
     table_columns: Option<usize>,
@@ -284,6 +287,9 @@ impl FrameBuildKey {
         Self {
             revision,
             source_mode: false,
+            focus_mode: false,
+            spelling_generation: 0,
+            disclosure_fingerprint: 0,
             composition_generation,
             selections,
             table_columns: None,
@@ -309,6 +315,23 @@ pub struct FrameKey {
 }
 
 impl FrameKey {
+    #[must_use]
+    pub fn with_disclosure_fingerprint(mut self, fingerprint: u64) -> Self {
+        self.build.disclosure_fingerprint = fingerprint;
+        self
+    }
+
+    pub fn with_spelling_generation(mut self, generation: u64) -> Self {
+        self.build.spelling_generation = generation;
+        self
+    }
+
+    #[must_use]
+    pub fn with_focus_mode(mut self, enabled: bool) -> Self {
+        self.build.focus_mode = enabled;
+        self
+    }
+
     #[must_use]
     pub fn with_source_mode(mut self, enabled: bool) -> Self {
         self.build.source_mode = enabled;
@@ -522,6 +545,34 @@ mod tests {
         let request = FrameBuildRequest::new(old.build().clone(), 4);
         assert!(!request.accepts(new.build(), 4));
         assert_eq!(old.presentation(), new.presentation());
+    }
+
+    #[test]
+    fn focus_mode_rejects_old_background_results_without_geometry_changes() {
+        let old = FrameKey::new(7, 0, Vec::new(), 0, None, Appearance::Light, geometry());
+        let focused = old.clone().with_focus_mode(true);
+        assert_ne!(old.build(), focused.build());
+        assert_eq!(old.presentation(), focused.presentation());
+        assert!(!FrameBuildRequest::new(old.build().clone(), 1).accepts(focused.build(), 1));
+        assert_eq!(old, focused.with_focus_mode(false));
+    }
+
+    #[test]
+    fn disclosure_state_invalidates_same_revision_background_frames() {
+        let old = FrameKey::new(7, 0, Vec::new(), 0, None, Appearance::Light, geometry());
+        let new = old.clone().with_disclosure_fingerprint(1);
+        assert_ne!(old.build(), new.build());
+        assert_eq!(old.presentation(), new.presentation());
+        assert!(!FrameBuildRequest::new(old.build().clone(), 9).accepts(new.build(), 9));
+    }
+
+    #[test]
+    fn spelling_publication_invalidates_frames_without_geometry_change() {
+        let old = FrameKey::new(7, 0, Vec::new(), 0, None, Appearance::Light, geometry());
+        let new = old.clone().with_spelling_generation(1);
+        assert_ne!(old.build(), new.build());
+        assert_eq!(old.presentation(), new.presentation());
+        assert!(!FrameBuildRequest::new(old.build().clone(), 9).accepts(new.build(), 9));
     }
 
     #[test]

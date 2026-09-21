@@ -70,6 +70,7 @@ pub enum AccessibilitySemanticKind {
     Autolink,
     ReferenceLink,
     ReferenceImage,
+    Disclosure,
 }
 
 impl AccessibilitySemanticKind {
@@ -92,6 +93,7 @@ impl AccessibilitySemanticKind {
             Self::Autolink => 13,
             Self::ReferenceLink => 14,
             Self::ReferenceImage => 15,
+            Self::Disclosure => 16,
         }
     }
 }
@@ -99,6 +101,7 @@ impl AccessibilitySemanticKind {
 /// Flags carried by [`AccessibilitySemanticNode`].
 pub const ACCESSIBILITY_SEMANTIC_FLAG_ORDERED: u8 = 1 << 0;
 pub const ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE: u8 = 1 << 1;
+pub const ACCESSIBILITY_SEMANTIC_FLAG_EXPANDED: u8 = 1 << 2;
 
 /// One source-backed semantic node in document order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,11 +201,34 @@ impl AccessibilitySemanticSnapshot {
         )?;
 
         for (block_index, block) in document.markdown().blocks().into_iter().enumerate() {
-            let Some((kind, flags, level)) = semantic_block_kind(block.kind()) else {
+            let Some((mut kind, mut flags, level)) = semantic_block_kind(block.kind()) else {
                 continue;
             };
-            let source_range = block.range();
-            let label_range = semantic_block_label_range(document.markdown(), block);
+            let mut source_range = block.range();
+            let mut label_range = semantic_block_label_range(document.markdown(), block);
+            let semantic_start = document
+                .markdown()
+                .html_regions()
+                .partition_for(source_range)
+                .map_or(source_range.start(), |part| part.content.source.start());
+            if let Some(disclosure) = document.html_disclosure_header_at(semantic_start) {
+                kind = AccessibilitySemanticKind::Disclosure;
+                flags = if disclosure.open {
+                    ACCESSIBILITY_SEMANTIC_FLAG_EXPANDED
+                } else {
+                    0
+                };
+                source_range = TextRange::new(
+                    disclosure.opening.start(),
+                    disclosure
+                        .summary
+                        .map_or(disclosure.opening.end(), |range| range.end()),
+                )
+                .expect("ordered disclosure header");
+                label_range = disclosure
+                    .summary_content
+                    .unwrap_or(TextRange::empty(disclosure.opening.end()));
+            }
             let parent = Some(0);
             let semantic_block_node_index = u32::try_from(nodes.len())
                 .map_err(|_| AccessibilityTextError::SemanticNodeOverflow)?;
@@ -223,6 +249,55 @@ impl AccessibilitySemanticSnapshot {
             )?;
 
             if matches!(kind, AccessibilitySemanticKind::CodeBlock) {
+                continue;
+            }
+            let inline_start = nodes.len();
+            let html_region = document.markdown().html_regions().region_for(source_range);
+            let html_links: Vec<_> = if let Some(region) = html_region {
+                region
+                    .model
+                    .as_ref()
+                    .ok()
+                    .into_iter()
+                    .flat_map(|model| model.links())
+                    .map(|link| (link.source, link.label, Some(link.destination)))
+                    .collect()
+            } else {
+                document
+                    .markdown()
+                    .inline_html_elements(block)
+                    .into_iter()
+                    .filter(|element| {
+                        element.kind == yu_markdown::html::HtmlElementKind::Link
+                            && element
+                                .attributes
+                                .destination
+                                .as_ref()
+                                .is_some_and(|url| !url.is_empty())
+                    })
+                    .map(|element| (element.source, element.label, None))
+                    .collect()
+            };
+            for (range, label, destination) in html_links {
+                if range.start() < source_range.start() || range.end() > source_range.end() {
+                    continue;
+                }
+                push_semantic_node(
+                    &source,
+                    &mut nodes,
+                    SemanticNodeSpec {
+                        parent: Some(semantic_block_node_index),
+                        kind: AccessibilitySemanticKind::Link,
+                        flags: 0,
+                        level: 0,
+                        source_range: range,
+                        label_range: label,
+                        destination_range: destination,
+                        action_block: None,
+                    },
+                )?;
+            }
+            if html_region.is_some() {
                 continue;
             }
             let inline = parse_inline_with_definitions(
@@ -259,6 +334,11 @@ impl AccessibilitySemanticSnapshot {
                         action_block: None,
                     },
                 )?;
+            }
+            nodes[inline_start..].sort_by_key(|node| node.source_range.range().start());
+            for (offset, node) in nodes[inline_start..].iter_mut().enumerate() {
+                node.index = u32::try_from(inline_start + offset)
+                    .map_err(|_| AccessibilityTextError::SemanticNodeOverflow)?;
             }
         }
 
@@ -449,7 +529,9 @@ fn semantic_block_kind(kind: BlockKind) -> Option<(AccessibilitySemanticKind, u8
         }
         // 缩进代码块**就是**代码块，与围栏在语义上没有区别——区别只在拼法上，
         // 而拼法不进语义树，与 Setext 不进 `Heading` 是同一条规矩。
-        BlockKind::IndentedCode => (AccessibilitySemanticKind::CodeBlock, 0, 0),
+        BlockKind::IndentedCode | BlockKind::FrontMatter => {
+            (AccessibilitySemanticKind::CodeBlock, 0, 0)
+        }
         BlockKind::Paragraph => (AccessibilitySemanticKind::Paragraph, 0, 0),
         BlockKind::Heading { level } => (AccessibilitySemanticKind::Heading, 0, level),
         BlockKind::FencedCodeBlock { .. } => (AccessibilitySemanticKind::CodeBlock, 0, 0),

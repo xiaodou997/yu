@@ -258,6 +258,13 @@ enum BlockResult {
 // ---------------------------------------------------------------------------
 
 /// 围栏代码块的围栏结束位置，不是围栏则 `None`。
+fn is_math_fence(line: &Line) -> bool {
+    line.indent < line.base_indent + 4 && {
+        let text = line.text[line.pos..].trim_end();
+        text == "$$" || (text.starts_with("$$") && text.len() > 4 && text.ends_with("$$"))
+    }
+}
+
 fn is_fenced_code(line: &Line) -> Option<usize> {
     let next = line.next?;
     if next != b'`' && next != b'~' {
@@ -582,7 +589,11 @@ fn html_block_ends(end: HtmlBlockEnd, text: &str) -> bool {
         HtmlBlockEnd::ProcessingInstructionClose => text.contains("?>"),
         HtmlBlockEnd::AngleClose => text.contains('>'),
         HtmlBlockEnd::CdataClose => text.contains("]]>"),
-        HtmlBlockEnd::BlankLine => text.bytes().all(|byte| byte == b' ' || byte == b'\t'),
+        HtmlBlockEnd::BlankLine => text
+            .strip_suffix('\r')
+            .unwrap_or(text)
+            .bytes()
+            .all(|byte| byte == b' ' || byte == b'\t'),
     }
 }
 
@@ -771,6 +782,23 @@ impl<'a, I: Input + ?Sized> BlockContext<'a, I> {
                 self.line.move_base(pos + if after_space { 2 } else { 1 });
                 self.stack[depth].end =
                     self.line_start + u32::try_from(self.line.len()).unwrap_or(0);
+                true
+            }
+            NodeKind::FootnoteDefinition => {
+                let base = self.line.base_indent + 4;
+                if self.line.next.is_some() && self.line.indent < base {
+                    return false;
+                }
+                let from = self.line.base_pos;
+                self.line.move_base_column(base);
+                let to = self.line.base_pos.min(self.line.len());
+                if to > from {
+                    self.line.markers.push(Element::leaf(
+                        NodeKind::FootnoteIndent,
+                        self.line_start + from as u32,
+                        self.line_start + to as u32,
+                    ));
+                }
                 true
             }
             NodeKind::ListItem => {
@@ -1049,6 +1077,14 @@ impl<'a, I: Input + ?Sized> BlockContext<'a, I> {
             if self.line.pos == self.line.len() {
                 break;
             }
+            if self
+                .stack
+                .iter()
+                .skip(self.line.depth)
+                .any(|block| block.kind == NodeKind::FootnoteDefinition)
+            {
+                break;
+            }
             if self.line.indent < self.line.base_indent + 4 && self.ends_leaf_block() {
                 break;
             }
@@ -1093,7 +1129,7 @@ impl<'a, I: Input + ?Sized> BlockContext<'a, I> {
 }
 
 /// 块解析器的个数，见 [`BlockContext::run_block_parser`]。
-const BLOCK_PARSER_COUNT: usize = 8;
+const BLOCK_PARSER_COUNT: usize = 11;
 
 /// leaf block 的观察者。段落在被完全读入之前，有可能变成别的东西。
 enum LeafParser {
@@ -1113,7 +1149,13 @@ impl<I: Input + ?Sized> BlockContext<'_, I> {
     /// 那套机制是给扩展用的，S6 落地 `yu-markdown` 的 extension 时再建；
     /// 现在建它只会得到一份没有使用者、也没有测试的抽象。
     fn run_block_parser(&mut self, index: usize) -> BlockResult {
-        match index {
+        if index == 0 {
+            return self.parse_front_matter();
+        }
+        if index == 1 {
+            return self.parse_footnote_definition();
+        }
+        match index - 2 {
             0 => self.parse_indented_code(),
             1 => self.parse_fenced_code(),
             2 => self.parse_blockquote(),
@@ -1122,14 +1164,17 @@ impl<I: Input + ?Sized> BlockContext<'_, I> {
             5 => self.parse_ordered_list(),
             6 => self.parse_atx_heading(),
             7 => self.parse_html_block(),
+            8 => self.parse_math_block(),
             _ => BlockResult::NotApplicable,
         }
     }
 
     /// 能打断段落的构造。对应上游的 `DefaultEndLeaf`。
     fn ends_leaf_block(&self) -> bool {
-        is_atx_heading(&self.line).is_some()
+        self.footnote_definition_end().is_some()
+            || is_atx_heading(&self.line).is_some()
             || is_fenced_code(&self.line).is_some()
+            || is_math_fence(&self.line)
             || is_blockquote(&self.line).is_some()
             || is_bullet_list(&self.line, &self.stack, true).is_some()
             || is_ordered_list(&self.line, &self.stack, true).is_some()
@@ -1183,6 +1228,114 @@ impl<I: Input + ?Sized> BlockContext<'_, I> {
 
         let tree = wrap(NodeKind::CodeBlock, from, to, marks, 0);
         self.add_tree(tree, from);
+        BlockResult::Consumed
+    }
+
+    fn footnote_definition_end(&self) -> Option<usize> {
+        if self.line.indent >= self.line.base_indent + 4 {
+            return None;
+        }
+        let end = crate::inline::footnote_label_end(&self.line.text, self.line.pos)?;
+        (self.line.text.as_bytes().get(end) == Some(&b':')).then_some(end + 1)
+    }
+
+    fn parse_footnote_definition(&mut self) -> BlockResult {
+        let Some(end) = self.footnote_definition_end() else {
+            return BlockResult::NotApplicable;
+        };
+        let from = self.line_start + self.line.pos as u32;
+        self.start_context(NodeKind::FootnoteDefinition, self.line.pos, 4);
+        self.add_leaf_node(NodeKind::FootnoteMark, from, self.line_start + end as u32);
+        self.line.move_base(skip_space(&self.line.text, end));
+        BlockResult::Opened
+    }
+
+    pub(crate) fn front_matter_opening(&self) -> Option<u32> {
+        if self.line_start != 0 || self.stack.len() != 1 {
+            return None;
+        }
+        let opening = self
+            .line
+            .text
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&self.line.text);
+        (opening.trim_end_matches([' ', '\t', '\r']) == "---")
+            .then(|| u32::from(self.line.text.starts_with('\u{feff}')) * 3)
+    }
+
+    fn parse_front_matter(&mut self) -> BlockResult {
+        let Some(mark_start) = self.front_matter_opening() else {
+            return BlockResult::NotApplicable;
+        };
+        let mut marks = vec![Element::leaf(
+            NodeKind::MetadataMark,
+            mark_start,
+            mark_start + 3,
+        )];
+        while self.next_line() {
+            let end = self.line_start + self.line.len() as u32;
+            let line = self.line.text.trim_end_matches([' ', '\t', '\r']);
+            if matches!(line, "---" | "...") {
+                marks.push(Element::leaf(
+                    NodeKind::MetadataMark,
+                    self.line_start,
+                    self.line_start + 3,
+                ));
+                self.next_line();
+                break;
+            }
+            if self.line_start < end {
+                marks.push(Element::leaf(NodeKind::MetadataText, self.line_start, end));
+            }
+        }
+        self.add_tree(
+            wrap(NodeKind::FrontMatter, 0, self.prev_line_end(), marks, 0),
+            0,
+        );
+        BlockResult::Consumed
+    }
+
+    fn parse_math_block(&mut self) -> BlockResult {
+        if !is_math_fence(&self.line) {
+            return BlockResult::NotApplicable;
+        }
+        let from = self.line_start + self.line.pos as u32;
+        let mut marks = vec![Element::leaf(NodeKind::MathMark, from, from + 2)];
+        let trimmed = self.line.text[self.line.pos..].trim_end();
+        if trimmed.len() > 4 {
+            let close = from + trimmed.len() as u32 - 2;
+            marks.push(Element::leaf(NodeKind::MathText, from + 2, close));
+            marks.push(Element::leaf(NodeKind::MathMark, close, close + 2));
+            self.next_line();
+            let to = self.prev_line_end();
+            self.add_tree(wrap(NodeKind::MathBlock, from, to, marks, 0), from);
+            return BlockResult::Consumed;
+        }
+        let mut first = true;
+        while self.next_line() && self.line.depth >= self.stack.len() {
+            if !first {
+                marks.push(Element::leaf(
+                    NodeKind::MathText,
+                    self.line_start - 1,
+                    self.line_start,
+                ));
+            }
+            marks.extend(self.line.markers.iter().cloned());
+            if self.line.text[self.line.pos..].trim() == "$$" {
+                let start = self.line_start + self.line.pos as u32;
+                marks.push(Element::leaf(NodeKind::MathMark, start, start + 2));
+                self.next_line();
+                break;
+            }
+            let start = self.line_start + self.line.base_pos as u32;
+            let end = self.line_start + self.line.len() as u32;
+            if start < end {
+                marks.push(Element::leaf(NodeKind::MathText, start, end));
+            }
+            first = false;
+        }
+        let to = self.prev_line_end();
+        self.add_tree(wrap(NodeKind::MathBlock, from, to, marks, 0), from);
         BlockResult::Consumed
     }
 

@@ -57,12 +57,19 @@ pub struct BlockCluster {
     x: f32,
     y: f32,
     baseline_y: f32,
+    line_height: f32,
     width: f32,
     style: TextStyle,
     line_break: bool,
 }
 
 impl BlockCluster {
+    /// Height of this cluster's actual text line, including a table cell line.
+    #[must_use]
+    pub const fn line_height(self) -> f32 {
+        self.line_height
+    }
+
     #[must_use]
     pub const fn source(self) -> TextRange {
         self.source
@@ -127,10 +134,27 @@ pub struct BlockGlyph {
     origin: LayoutPoint,
     style: TextStyle,
     role: TextRole,
+    highlighted: bool,
+    underlined: bool,
+    struck: bool,
     size_scale: f32,
 }
 
 impl BlockGlyph {
+    #[must_use]
+    pub const fn underlined(self) -> bool {
+        self.underlined
+    }
+    #[must_use]
+    pub const fn struck(self) -> bool {
+        self.struck
+    }
+
+    #[must_use]
+    pub const fn highlighted(self) -> bool {
+        self.highlighted
+    }
+
     #[must_use]
     pub const fn face(self) -> FontFaceId {
         self.face
@@ -291,6 +315,8 @@ impl BlockCaret {
 pub struct BlockHit {
     caret: BlockCaret,
     image: Option<TextRange>,
+    content_source: Option<TextRange>,
+    content_visual: Option<VisualOffset>,
 }
 
 impl BlockHit {
@@ -325,6 +351,15 @@ impl BlockHit {
         self.image
     }
 
+    /// The hit object's identity is independent of nearest-edge caret affinity.
+    pub const fn content_source(self) -> Option<TextRange> {
+        self.content_source
+    }
+
+    pub const fn content_visual(self) -> Option<VisualOffset> {
+        self.content_visual
+    }
+
     pub(crate) const fn image_hit(
         source: ByteOffset,
         visual: VisualOffset,
@@ -342,6 +377,8 @@ impl BlockHit {
                 bias,
             },
             image: Some(image),
+            content_source: None,
+            content_visual: None,
         }
     }
 }
@@ -409,6 +446,7 @@ impl BlockView {
             input.line_styles(),
             metrics,
         )?;
+        let layout = align_paragraph(layout, decorations, visual.text())?;
         let table = table_of(decorations)
             .map(|table| {
                 TableLayout::from_table(
@@ -469,6 +507,7 @@ impl BlockView {
             input.line_styles(),
             shaper,
         )?;
+        let layout = align_paragraph(layout, decorations, visual.text())?;
         let table = table_of(decorations)
             .map(|table| {
                 TableLayout::from_table(
@@ -582,6 +621,10 @@ impl BlockView {
     }
 
     #[must_use]
+    pub fn embedded(&self) -> &[(yu_markdown::EmbeddedSpan, crate::image::PlacedWidget)] {
+        &self.widgets.embedded
+    }
+
     pub fn images(&self) -> &[ImagePlacement] {
         &self.widgets.images
     }
@@ -800,6 +843,21 @@ impl BlockView {
             })
             .collect::<Result<Vec<_>, LayoutError>>()?;
         view.widgets = WidgetPlacements {
+            embedded: view
+                .widgets
+                .embedded
+                .iter()
+                .map(|(span, placed)| {
+                    Ok((
+                        yu_markdown::EmbeddedSpan {
+                            source: shift(span.source)?,
+                            content: shift(span.content)?,
+                            ..*span
+                        },
+                        placed.shifted(delta)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, LayoutError>>()?,
             images: view
                 .widgets
                 .images
@@ -868,11 +926,24 @@ impl BlockView {
         visual: VisualOffset,
         bias: Bias,
     ) -> Result<BlockCaret, LayoutError> {
-        let source = match self
-            .table
-            .as_ref()
-            .and_then(|table| table.source_for_visual_hit(&self.visual, visual))
-        {
+        // Hidden list wrappers share visual offset zero with the item body.
+        // Prefer its first content cluster, or the position after the marker
+        // for an empty item, so clicks never insert outside the list tags.
+        let list_start = (visual == VisualOffset::ZERO
+            && self.visual.composition_range().is_none())
+        .then(|| self.ornaments().marker())
+        .flatten()
+        .map(|marker| {
+            self.clusters
+                .iter()
+                .find(|cluster| cluster.visual().start() == visual && !cluster.is_line_break())
+                .map_or(marker.source().end(), |cluster| cluster.source().start())
+        });
+        let source = match list_start.or_else(|| {
+            self.table
+                .as_ref()
+                .and_then(|table| table.source_for_visual_hit(&self.visual, visual))
+        }) {
             Some(source) => source,
             None => self
                 .visual
@@ -921,7 +992,33 @@ impl BlockView {
         {
             return Ok(placed.hit(point));
         }
+        if let Some((resource, placed)) = self
+            .widgets
+            .embedded
+            .iter()
+            .find(|(_, placed)| placed.bounds().contains(point))
+        {
+            let mut hit = placed.hit(point);
+            hit.image = None;
+            hit.content_source = Some(resource.source);
+            return Ok(hit);
+        }
         let line_index = self.line_for_y(point.y());
+        let content_cluster = self
+            .lines
+            .get(line_index)
+            .and_then(|line| self.clusters.get(line.clusters.clone()))
+            .unwrap_or_default()
+            .iter()
+            .find(|cluster| {
+                !cluster.is_line_break()
+                    && point.x() >= cluster.x()
+                    && point.x() < cluster.x() + cluster.width()
+                    && point.y() >= cluster.y()
+                    && point.y() < cluster.y() + cluster.line_height()
+            });
+        let content_source = content_cluster.map(|cluster| cluster.source());
+        let content_visual = content_cluster.map(|cluster| cluster.visual().start());
         // 有两处的「落在哪一侧」行的规则（不变量 H5）分不出来，因为那两处
         // 的两个位置**不在同一个 x 上**，而 H5 管的是软换行的两侧（同一个
         // x）：widget 的左右两沿差着整个盒子的宽度，相邻两格的交界差着一整
@@ -935,7 +1032,11 @@ impl BlockView {
         };
         let bias = forced.unwrap_or_else(|| self.hit_bias(line_index, visual));
         if let Some((cell, _)) = self.table.as_ref().and_then(|table| table.cell_at(point)) {
-            let source = if visual == cell.visual().start() {
+            let source = if let Some(source) = self.table.as_ref().and_then(|table| {
+                table.paragraph_boundary_source(&self.visual, cell, point, visual)
+            }) {
+                source
+            } else if visual == cell.visual().start() {
                 cell.source().start()
             } else if visual == cell.visual().end() {
                 cell.source().end()
@@ -949,6 +1050,8 @@ impl BlockView {
             return Ok(BlockHit {
                 caret: self.caret_for_source(source, bias)?,
                 image: None,
+                content_source,
+                content_visual,
             });
         }
         let mut caret = self.caret_for_visual(visual, bias)?;
@@ -964,7 +1067,12 @@ impl BlockView {
                 checkbox.source().end()
             };
         }
-        Ok(BlockHit { caret, image: None })
+        Ok(BlockHit {
+            caret,
+            image: None,
+            content_source,
+            content_visual,
+        })
     }
 
     /// 表格里的点落在哪个视觉偏移上：找到格子，再问那一格自己的布局。
@@ -1355,6 +1463,7 @@ impl BlockView {
                     x: origin.x() + cluster.x(),
                     y: origin.y() + line.bounds().y(),
                     baseline_y: origin.y() + line.bounds().y() + line.baseline(),
+                    line_height: line.bounds().height(),
                     width: cluster.width(),
                     style,
                     line_break: cluster.is_line_break(),
@@ -1364,7 +1473,10 @@ impl BlockView {
                 let visual = shift_visual(glyph.visual(), base)?;
                 let cluster = clusters[first_cluster..]
                     .iter()
-                    .find(|cluster| cluster.visual == visual)
+                    .find(|cluster| {
+                        cluster.visual.start() < visual.end()
+                            && visual.start() < cluster.visual.end()
+                    })
                     .ok_or(LayoutError::Shaping(
                         "a shaped table glyph has no visual cluster".into(),
                     ))?;
@@ -1378,7 +1490,9 @@ impl BlockView {
                 glyphs.push(BlockGlyph {
                     face: glyph.face(),
                     glyph: glyph.glyph(),
-                    source: cluster.source,
+                    // A ligature can cover several graphemes. Keep its full
+                    // source coverage instead of requiring a one-to-one match.
+                    source: self.visual.source_coverage(visual).map_err(upstream)?,
                     visual,
                     line: cell.row(),
                     origin: point,
@@ -1387,6 +1501,18 @@ impl BlockView {
                         .attrs(glyph.style())
                         .ok_or(LayoutError::UnknownStyle(glyph.style()))?
                         .role(),
+                    highlighted: styles
+                        .attrs(glyph.style())
+                        .ok_or(LayoutError::UnknownStyle(glyph.style()))?
+                        .highlighted(),
+                    underlined: styles
+                        .attrs(glyph.style())
+                        .ok_or(LayoutError::UnknownStyle(glyph.style()))?
+                        .underlined(),
+                    struck: styles
+                        .attrs(glyph.style())
+                        .ok_or(LayoutError::UnknownStyle(glyph.style()))?
+                        .struck(),
                     size_scale: glyph.size_scale(),
                 });
             }
@@ -1395,6 +1521,37 @@ impl BlockView {
             lines.push(self.table_line(table, row, row_start..clusters.len())?);
         }
 
+        for marker in &table.markers {
+            let Some(shaped) = &marker.shaped else {
+                continue;
+            };
+            if marker.scale <= 0.0 {
+                continue;
+            }
+            let mut x = marker.origin.x();
+            for run in shaped.runs() {
+                for glyph in run.glyphs() {
+                    glyphs.push(BlockGlyph {
+                        face: run.face(),
+                        glyph: glyph.id(),
+                        source: marker.source,
+                        visual: VisualRange::empty(marker.visual),
+                        line: marker.row,
+                        origin: LayoutPoint::new(
+                            x + glyph.x_offset(),
+                            marker.origin.y() + glyph.y_offset(),
+                        ),
+                        style: TextStyle::Plain,
+                        role: TextRole::Plain,
+                        highlighted: false,
+                        underlined: false,
+                        struck: false,
+                        size_scale: marker.scale,
+                    });
+                    x += glyph.advance();
+                }
+            }
+        }
         self.clusters = clusters;
         self.glyphs = glyphs;
         self.lines = lines;
@@ -1477,6 +1634,12 @@ fn source_backed_clusters(
                 .lines()
                 .get(cluster.line())
                 .map_or(0.0, |line| line.baseline()),
+            line_height: layout
+                .lines()
+                .get(cluster.line())
+                .ok_or(LayoutError::OffsetOverflow)?
+                .bounds()
+                .height(),
             width: cluster.width(),
             style,
             line_break: cluster.is_line_break(),
@@ -1521,6 +1684,9 @@ fn source_backed_glyphs(
                     // 列表标记的 `•` 不在 source 里，也没有任何 Mark 盖着它，
                     // 所以它没有角色可查：用正文颜色。
                     role: TextRole::Plain,
+                    highlighted: false,
+                    underlined: false,
+                    struck: false,
                     size_scale: 1.0,
                 });
                 x += glyph.advance();
@@ -1559,6 +1725,18 @@ fn source_backed_glyphs(
                 .attrs(glyph.style())
                 .ok_or(LayoutError::UnknownStyle(glyph.style()))?
                 .role(),
+            highlighted: styles
+                .attrs(glyph.style())
+                .ok_or(LayoutError::UnknownStyle(glyph.style()))?
+                .highlighted(),
+            underlined: styles
+                .attrs(glyph.style())
+                .ok_or(LayoutError::UnknownStyle(glyph.style()))?
+                .underlined(),
+            struck: styles
+                .attrs(glyph.style())
+                .ok_or(LayoutError::UnknownStyle(glyph.style()))?
+                .struck(),
             size_scale: glyph.size_scale(),
         });
     }
@@ -1641,4 +1819,29 @@ pub(crate) fn shift_range(range: TextRange, delta: i64) -> Result<TextRange, Lay
         .zip(shift(range.end()))
         .and_then(|(start, end)| TextRange::new(start, end))
         .ok_or(LayoutError::OffsetOverflow)
+}
+
+fn align_paragraph(
+    layout: BlockLayout,
+    decorations: &BlockDecorations,
+    text: &str,
+) -> Result<BlockLayout, LayoutError> {
+    let alignment = decorations
+        .line_ornaments()
+        .into_iter()
+        .find_map(|(_, ornament)| {
+            let yu_markdown::BlockOrnament::Alignment { alignment } = ornament else {
+                return None;
+            };
+            Some(match alignment {
+                yu_markdown::html::HtmlAlignment::Left => yu_layout::LineAlignment::Left,
+                yu_markdown::html::HtmlAlignment::Center => yu_layout::LineAlignment::Center,
+                yu_markdown::html::HtmlAlignment::Right => yu_layout::LineAlignment::Right,
+                yu_markdown::html::HtmlAlignment::Justify => return None,
+            })
+        });
+    match alignment {
+        Some(alignment) => layout.align_lines(alignment, text),
+        None => Ok(layout),
+    }
 }

@@ -317,7 +317,7 @@ pub struct RenderPlanBuilder {
     #[cfg(test)]
     last_checked_pages: usize,
     uploaded_pages: HashMap<u32, PageFingerprint>,
-    uploaded_embedded: HashMap<(u64, u64), u64>,
+    uploaded_embedded: HashMap<(u64, u64), (u64, u32, u32)>,
     raster_scale: Option<f32>,
 }
 
@@ -453,7 +453,9 @@ impl RenderPlanBuilder {
                             resource: svg.resource(),
                             generation: svg.generation(),
                         })?;
-                    let EmbeddedRenderPayload::Svg { dimensions, markup } = publication.payload()
+                    let EmbeddedRenderPayload::Svg {
+                        dimensions, markup, ..
+                    } = publication.payload()
                     else {
                         return Err(RenderError::NonSvgEmbeddedPublication {
                             resource: svg.resource(),
@@ -469,19 +471,27 @@ impl RenderPlanBuilder {
                         });
                     }
                     let upload_key = (svg.resource(), svg.generation());
-                    if next_embedded.get(&upload_key).copied()
-                        != Some(publication.key().fingerprint())
-                    {
+                    let scale = self.raster_scale.unwrap_or(1.0);
+                    // Retina/zoom changes sampling, not source geometry. Cap
+                    // the bitmap uniformly so a valid vector cannot fail an
+                    // entire frame merely by moving to a higher-scale screen.
+                    let maximum = yu_assets::EMBEDDED_SVG_MAX_DIMENSION as f32;
+                    let longest = svg.bounds().width().max(svg.bounds().height());
+                    let scale = scale.min(maximum / longest.max(1.0));
+                    let width = (svg.bounds().width() * scale).ceil().clamp(1.0, maximum) as u32;
+                    let height = (svg.bounds().height() * scale).ceil().clamp(1.0, maximum) as u32;
+                    let identity = (publication.key().fingerprint(), width, height);
+                    if next_embedded.get(&upload_key).copied() != Some(identity) {
                         embedded_uploads.push(EmbeddedSvgUpload {
                             resource: svg.resource(),
                             generation: svg.generation(),
                             kind: svg.kind(),
                             source: svg.source(),
-                            width: dimensions.width(),
-                            height: dimensions.height(),
+                            width,
+                            height,
                             markup: Arc::clone(markup),
                         });
-                        next_embedded.insert(upload_key, publication.key().fingerprint());
+                        next_embedded.insert(upload_key, identity);
                     }
                     commands.push(RenderCommand::EmbeddedSvg {
                         resource: svg.resource(),
@@ -1074,6 +1084,37 @@ mod tests {
             .expect("second plan");
         assert!(second.embedded_uploads().is_empty());
         assert_eq!(plans.uploaded_embedded_count(), 1);
+        assert_eq!(
+            (
+                first.embedded_uploads()[0].width(),
+                first.embedded_uploads()[0].height()
+            ),
+            (160, 80)
+        );
+        plans.set_raster_scale(2.0).expect("Retina");
+        let retina = plans
+            .build_with_embedded(&scene, &atlas, std::slice::from_ref(&publication))
+            .expect("Retina plan");
+        assert_eq!(
+            (
+                retina.embedded_uploads()[0].width(),
+                retina.embedded_uploads()[0].height()
+            ),
+            (320, 160)
+        );
+        assert_eq!(retina.commands(), first.commands());
+        plans.set_raster_scale(100.0).expect("high scale");
+        let capped = plans
+            .build_with_embedded(&scene, &atlas, std::slice::from_ref(&publication))
+            .expect("bounded upload");
+        assert_eq!(
+            (
+                capped.embedded_uploads()[0].width(),
+                capped.embedded_uploads()[0].height()
+            ),
+            (4096, 2048)
+        );
+        assert_eq!(capped.commands(), first.commands());
     }
 
     #[test]

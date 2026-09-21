@@ -13,7 +13,10 @@ impl EditorDocument {
         else {
             return Ok(None);
         };
-        let Some(table) = yu_markdown::table_for_block(markdown, block) else {
+        let Some(table) = self
+            .html_table_grid(block)
+            .or_else(|| yu_markdown::table_for_block(markdown, block))
+        else {
             return Ok(None);
         };
         let Some(cell) = table
@@ -27,6 +30,15 @@ impl EditorDocument {
             ByteOffset::new(cell.end() as u64),
         )
         .expect("ordered cell");
+        if table.is_html() {
+            return self
+                .html_table_decorations(block)
+                .map(|decorations| {
+                    VisualText::new(markdown.source(), range, decorations.set().clone())
+                        .map_err(EditorDocumentError::from)
+                })
+                .transpose();
+        }
         let Some(tree) = markdown.tree() else {
             return Ok(None);
         };

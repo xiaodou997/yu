@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/mermaid-rs-renderer"]
 members = [
     "crates/yu-core",
     "crates/yu-editor",
@@ -8,6 +9,7 @@ members = [
     "crates/yu-text",
     "crates/yu-markdown",
     "crates/yu-syntax",
+    "crates/yu-tex",
     "crates/yu-decoration",
     "crates/yu-state",
     "crates/yu-export",
@@ -15,7 +17,7 @@ members = [
     "crates/yu-scene",
     "crates/yu-render",
     "crates/yu-assets",
-    "crates/yu-embedded-math",
+    "crates/yu-embedded-client",
     "crates/yu-highlight",
     "crates/yu-storage",
     "crates/yu-workspace",
@@ -24,6 +26,7 @@ members = [
     "platform/windows/yu-font-windows",
     "tools/yu-bench",
     "tools/yu-inspect",
+    "tools/yu-document-renderer",
 ]
 
 # 外部依赖里需要**两个 crate 用同一个版本**的那些放在这里。
@@ -59,3 +62,7 @@ unwrap_used = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Fixed upstream renderer with consumption checks in the strict parser.
+[patch.crates-io]
+mermaid-rs-renderer = { path = "vendor/mermaid-rs-renderer" }

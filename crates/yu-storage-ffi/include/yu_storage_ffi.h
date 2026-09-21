@@ -105,6 +105,7 @@ enum {
     YU_STORAGE_PROJECTION_BLOCK_THEMATIC_BREAK = 8,
     YU_STORAGE_PROJECTION_BLOCK_INDENTED_CODE = 9,
     YU_STORAGE_PROJECTION_BLOCK_HTML_BLOCK = 10,
+    YU_STORAGE_PROJECTION_BLOCK_FRONT_MATTER = 11,
 };
 
 enum {
@@ -142,6 +143,11 @@ enum {
     YU_STORAGE_CLIPBOARD_TEXT = 0,
     YU_STORAGE_CLIPBOARD_HTML = 1,
     YU_STORAGE_CLIPBOARD_MARKDOWN = 2,
+    YU_STORAGE_CLIPBOARD_FRAGMENTS = 3,
+    YU_STORAGE_FRAGMENT_TEXT = 0,
+    YU_STORAGE_FRAGMENT_MARKDOWN = 1,
+    YU_STORAGE_FRAGMENT_HTML = 2,
+    YU_STORAGE_FRAGMENT_HTML_TABLE = 3,
 };
 
 /* Which axis a table divider belongs to. */
@@ -202,6 +208,7 @@ enum {
     YU_STORAGE_OUTLINE_PARENT_NONE = UINT32_MAX,
     YU_STORAGE_ACCESSIBILITY_FLAG_ORDERED = 1 << 0,
     YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE = 1 << 1,
+    YU_STORAGE_ACCESSIBILITY_FLAG_EXPANDED = 1 << 2,
     YU_STORAGE_ACCESSIBILITY_KIND_DOCUMENT = 1,
     YU_STORAGE_ACCESSIBILITY_KIND_HEADING = 2,
     YU_STORAGE_ACCESSIBILITY_KIND_PARAGRAPH = 3,
@@ -217,6 +224,7 @@ enum {
     YU_STORAGE_ACCESSIBILITY_KIND_AUTOLINK = 13,
     YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_LINK = 14,
     YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_IMAGE = 15,
+    YU_STORAGE_ACCESSIBILITY_KIND_DISCLOSURE = 16,
 };
 
 #define YU_STORAGE_ACCESSIBILITY_NO_RANGE UINT64_MAX
@@ -283,6 +291,10 @@ typedef struct YuStorageProjectionHit {
      * YU_STORAGE_IMAGE_DESTINATION_NONE for a regular text hit. */
     uint64_t image_source_start_utf16;
     uint64_t image_source_end_utf16;
+    uint64_t content_source_start_utf16;
+    uint64_t content_source_end_utf16;
+    uint64_t navigation_target_start_utf16;
+    uint64_t navigation_target_end_utf16;
     uint64_t line;
     float x;
     float y;
@@ -652,6 +664,20 @@ typedef struct YuStorageCompositionState {
 /* Configure the compiled Metal library before a surface is attached. */
 int32_t yu_storage_session_trim_render_caches(YuStorageSession *session);
 int32_t yu_storage_session_set_shader_library(YuStorageSession *session, const uint8_t *path, size_t length);
+int32_t yu_storage_session_spelling_ranges(const YuStorageSession *session, uint64_t expected_revision, uint64_t start_utf16, uint64_t end_utf16, YuStorageAccessibilityRange *output, size_t capacity, size_t *written);
+int32_t yu_storage_session_disclosure_header(const YuStorageSession *session, uint64_t expected_revision, uint64_t source_utf16, YuStorageAccessibilityRange *output, uint8_t *open);
+int32_t yu_storage_session_reveal_source_range(YuStorageSession *session, uint64_t expected_revision, uint64_t start_utf16, uint64_t end_utf16, uint8_t *changed);
+int32_t yu_storage_session_toggle_disclosure(YuStorageSession *session, uint64_t expected_revision, uint64_t source_utf16, YuStorageCommandResult *output);
+int32_t yu_storage_session_document_reference_target(const YuStorageSession *session, uint64_t expected_revision, uint64_t source_utf16, YuStorageAccessibilityRange *output);
+
+/* Decoded UTF-8 link destination at a current UTF-16 label position; empty if absent. */
+int32_t yu_storage_session_copy_link_destination(const YuStorageSession *session, uint64_t expected_revision, uint64_t source_utf16, uint8_t *output, size_t capacity, size_t *written);
+int32_t yu_storage_session_copy_document_diagnostic(const YuStorageSession *session, uint64_t expected_revision, uint64_t source_utf16, uint8_t *output, size_t capacity, size_t *written);
+
+int32_t yu_storage_session_set_spelling_diagnostics(YuStorageSession *session, uint64_t expected_revision, const YuStorageAccessibilityRange *records, size_t count);
+int32_t yu_storage_session_replace_spelling(YuStorageSession *session, const YuStorageAccessibilityRange *info, const uint8_t *replacement, size_t length, YuStorageCommandResult *output);
+int32_t yu_storage_session_set_focus_mode(YuStorageSession *session, uint8_t enabled);
+int32_t yu_storage_session_macos_set_reference_day(YuStorageSession *session, int32_t day);
 int32_t yu_storage_session_set_source_mode(YuStorageSession *session, uint8_t enabled);
 
 /* Document lifecycle: create does not write a file; recovery restores the original disk baseline. */
@@ -792,6 +818,13 @@ int32_t yu_storage_session_copy_source_range(const YuStorageSession *session,
                                              uint64_t end_utf16,
                                              uint8_t *output, size_t capacity,
                                              size_t *written);
+/* Copies a revision-bound label using resolved finite HTML text. */
+int32_t yu_storage_session_copy_accessibility_label(const YuStorageSession *session,
+                                                   uint64_t expected_revision,
+                                                   uint64_t start_utf16,
+                                                   uint64_t end_utf16,
+                                                   uint8_t *output, size_t capacity,
+                                                   size_t *written);
 /* Copies the current selection in the requested format. Plain text and the
  * HTML fragment were two entry points with identical parameters differing only
  * in output format; the clipboard is one selection in several
@@ -801,6 +834,38 @@ int32_t yu_storage_session_copy_selection(const YuStorageSession *session,
                                           uint8_t format,
                                           uint8_t *output, size_t capacity,
                                           size_t *written);
+int32_t yu_storage_encode_local_image_path(const uint8_t *path, size_t length,
+    uint8_t *output, size_t capacity, size_t *written);
+/* Revision-bound image identity. Zero dimension means intrinsic sizing. */
+typedef struct {
+    uint64_t revision, start_utf16, end_utf16;
+    uint32_t width, height;
+} YuStorageImageProperties;
+int32_t yu_storage_session_image_properties(const YuStorageSession *session,
+    uint64_t expected_revision, uint64_t source_utf16, YuStorageImageProperties *output);
+/* Query YU_STORAGE_IMAGE_RESOURCE_* for the exact revision-bound image. */
+int32_t yu_storage_session_image_resource_status(const YuStorageSession *session,
+    const YuStorageImageProperties *info, uint8_t *output);
+/* Retry a failed image without changing source, revision, selection or undo. */
+int32_t yu_storage_session_retry_image(YuStorageSession *session,
+    const YuStorageImageProperties *info);
+/* field 0 = destination URI, 1 = alternative text; supports length query. */
+int32_t yu_storage_session_copy_image_property(const YuStorageSession *session,
+    const YuStorageImageProperties *info, uint8_t field,
+    uint8_t *output, size_t capacity, size_t *written);
+int32_t yu_storage_session_update_image_properties(YuStorageSession *session,
+    const YuStorageImageProperties *info, const uint8_t *destination, size_t destination_length,
+    const uint8_t *alternative, size_t alternative_length, YuStorageCommandResult *output);
+typedef struct {
+    size_t path_start, path_end, alternative_start, alternative_end;
+} YuStorageImageInput;
+/* Insert all prepared images through one Rust transaction and undo step.
+ * Optional drop_target is a revision-bound caret; NULL pastes at selections. */
+int32_t yu_storage_session_insert_local_images(
+    YuStorageSession *session, uint64_t expected_revision,
+    const uint8_t *text, size_t text_length,
+    const YuStorageImageInput *items, size_t count,
+    const YuStorageSelectionEndpoints *drop_target, YuStorageCommandResult *output);
 /* Converts allowlisted HTML to Markdown; policy rejection must fall back to
  * the caller's text/plain payload. This function does not access a session. */
 int32_t yu_storage_import_html_fragment(const uint8_t *html, size_t html_length,
@@ -894,10 +959,12 @@ int32_t yu_storage_session_paste_text(
     YuStorageCommandResult *output);
 /* Concatenated UTF-8 with cumulative fragment end offsets, including the
  * final text_length. columns=0 distributes source fragments; columns>0 pastes
- * a row-major table grid. All offsets are validated before the atomic paste. */
+ * a row-major table grid. format identifies text, Markdown, or finite HTML
+ * cell source. Typed markup requires columns>0. All offsets and HTML cell
+ * boundaries are validated before the atomic paste. */
 int32_t yu_storage_session_paste_fragments(
     YuStorageSession *session, uint64_t expected_revision,
-    const uint8_t *text, size_t text_length, const size_t *ends, size_t count, size_t columns,
+    const uint8_t *text, size_t text_length, const size_t *ends, size_t count, size_t columns, uint8_t format,
     YuStorageCommandResult *output);
 int32_t yu_storage_session_composition(
     const YuStorageSession *session, YuStorageCompositionState *output);
@@ -966,12 +1033,12 @@ typedef struct {
     float quote_border_width, list_indent;
     float gutter, top, bottom, column_width, sidebar_width;
     float block_radius, inline_radius;
-    uint32_t background, text, strong_text, sidebar, code_background, inline_background, border, table_border, table_header, table_stripe, link;
+    uint32_t background, text, strong_text, sidebar, code_background, inline_background, highlight_background, border, table_border, table_header, table_stripe, link;
 } YuStorageThemeSpec;
 typedef struct {
     float origin_x, origin_y, content_width, camera_x, camera_y, bottom;
 } YuStorageReadingGeometry;
 int32_t yu_storage_theme_spec(uint8_t appearance, YuStorageThemeSpec *output);
-int32_t yu_storage_reading_geometry(uint8_t appearance, float width, float window_width, float scroll_y, YuStorageReadingGeometry *output);
+int32_t yu_storage_reading_geometry(uint8_t appearance, float width, float window_width, float scroll_y, float column_width, YuStorageReadingGeometry *output);
 
 #endif

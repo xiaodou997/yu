@@ -364,7 +364,7 @@ fn a_nested_task_item_is_indented_like_a_nested_list_item() {
 /// `clamp(10 × 0.06, 1, 2) = 1`。
 #[test]
 fn a_thematic_break_draws_a_centered_rule_across_the_text_column() {
-    let (derived, _, _) = derive("---\n", 0).expect("派生");
+    let (derived, _, _) = derive("***\n", 0).expect("派生");
     let rule = derived.rule.expect("分隔线块要带上那条横线");
     assert_eq!(rule.thickness(), 1.0);
 
@@ -382,8 +382,8 @@ fn a_thematic_break_draws_a_centered_rule_across_the_text_column() {
 /// 位置。
 #[test]
 fn a_thematic_break_lays_out_as_a_blank_line() {
-    let (derived, input, _) = derive("---\n", 0).expect("派生");
-    assert_eq!(derived.text, "\n", "三个减号不进视觉文本，换行符留着");
+    let (derived, input, _) = derive("***\n", 0).expect("派生");
+    assert_eq!(derived.text, "\n", "三个星号不进视觉文本，换行符留着");
     assert_eq!(derived.indent, 0.0);
     assert!(input.layout_input().widgets().is_empty());
 }
@@ -458,7 +458,7 @@ fn code_and_quote_blocks_shrink_the_wrap_width_by_their_padding() {
 #[test]
 fn a_focused_thematic_break_carries_no_rule() {
     let config = LayoutConfig::new(400.0, 10.0);
-    let buffer = TextBuffer::new("---\n".to_owned());
+    let buffer = TextBuffer::new("***\n".to_owned());
     let snapshot = buffer.snapshot();
     let document = parse(&snapshot);
     let tree = parse_syntax(&snapshot).expect("测试文档很短").into_tree();
@@ -485,7 +485,7 @@ fn a_focused_thematic_break_carries_no_rule() {
         &StyleSensitive,
     )
     .expect("从装饰派生");
-    assert_eq!(input.text(), "---\n", "焦点块按源码排");
+    assert_eq!(input.text(), "***\n", "焦点块按源码排");
     assert!(input.ornaments().rule().is_none(), "露着源码就不画线");
 }
 

@@ -918,7 +918,7 @@ fn images(
                 image.destination(),
                 image.reference(),
             )),
-            BlockWidget::Checkbox(_) => None,
+            BlockWidget::Checkbox(_) | BlockWidget::Embedded(_) => None,
         })
         .collect()
 }
@@ -1236,7 +1236,7 @@ fn a_table_does_not_reveal_its_pipes_under_the_caret() {
 /// 文本就是 `"\n"`），高度是一行，线画在那一行的正中。
 #[test]
 fn a_thematic_break_hides_its_characters_and_carries_a_rule() {
-    let decorations = decorate("---\n", None);
+    let decorations = decorate("***\n", None);
     assert_eq!(hidden(&decorations), vec![(0, 3)]);
     assert!(has_rule(&decorations), "分隔线块必须带上那条横线");
 }
@@ -1248,9 +1248,13 @@ fn a_thematic_break_hides_its_characters_and_carries_a_rule() {
 /// 三种照样画得出线，只是下游多了两个它不关心的分支。
 #[test]
 fn three_spellings_of_a_thematic_break_produce_the_same_ornament() {
-    for source in ["---\n", "***\n", "___\n"] {
+    for source in ["- - -\n", "***\n", "___\n"] {
         let decorations = decorate(source, None);
-        assert_eq!(hidden(&decorations), vec![(0, 3)], "{source:?}");
+        assert_eq!(
+            hidden(&decorations),
+            vec![(0, source.trim_end().len() as u64)],
+            "{source:?}"
+        );
         assert_eq!(
             decorations.line_styles(),
             [BlockOrnament::ThematicBreak],
@@ -1266,7 +1270,7 @@ fn three_spellings_of_a_thematic_break_produce_the_same_ornament() {
 /// `heading.rs` 露出 `#` 同一条理由）。所以两样由同一个条件带着走。
 #[test]
 fn a_focused_thematic_break_shows_its_source_and_draws_no_rule() {
-    let decorations = decorate("---\n", Some(range(1, 1)));
+    let decorations = decorate("***\n", Some(range(1, 1)));
     assert!(hidden(&decorations).is_empty(), "焦点块要露出那三个减号");
     assert!(!has_rule(&decorations), "露着源码就不该再画线");
 }
@@ -1490,6 +1494,7 @@ fn no_ornament_payload_leaves_its_block_across_the_corpus() {
                         payloads.push(*content);
                     }
                     BlockOrnament::Heading { .. }
+                    | BlockOrnament::Alignment { .. }
                     | BlockOrnament::QuoteBar { .. }
                     | BlockOrnament::Indent { .. }
                     | BlockOrnament::ThematicBreak
@@ -1500,6 +1505,10 @@ fn no_ornament_payload_leaves_its_block_across_the_corpus() {
                 match widget {
                     BlockWidget::Image(image) => payloads.push(image.source()),
                     BlockWidget::Checkbox(checkbox) => payloads.push(checkbox.source()),
+                    BlockWidget::Embedded(resource) => {
+                        payloads.push(resource.source);
+                        payloads.push(resource.content);
+                    }
                 }
             }
             for payload in payloads {
@@ -1576,4 +1585,158 @@ fn the_visual_length_matches_the_hidden_bytes_across_the_corpus() {
             );
         }
     }
+}
+
+#[test]
+fn dollar_math_is_opaque_source_bound_and_locally_revealed() {
+    assert_eq!(decorate("$x$$y$", None).widgets().len(), 2);
+    let source = r"中文 $x_1 + \frac{a}{b}$ and $y^2$ end";
+    let decorations = decorate(source, None);
+    let spans: Vec<_> = decorations
+        .widgets()
+        .iter()
+        .filter_map(|w| match w {
+            BlockWidget::Embedded(span) => Some(*span),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(spans.len(), 2);
+    assert!(spans.iter().all(|s| !s.display));
+    assert_eq!(
+        &source[spans[0].content.start().get() as usize..spans[0].content.end().get() as usize],
+        r"x_1 + \frac{a}{b}"
+    );
+    let active = TextRange::empty(spans[0].content.start());
+    let editing = decorate(source, Some(active));
+    assert_eq!(
+        editing
+            .widgets()
+            .iter()
+            .filter(|w| matches!(w, BlockWidget::Embedded(_)))
+            .count(),
+        1
+    );
+    for literal in [
+        r"`$x$`",
+        r"\$5 and \$10",
+        "$5 and $10",
+        "$ x $",
+        "$unclosed",
+        "```text\n$x$\n```",
+    ] {
+        assert!(
+            decorate(literal, None).widgets().is_empty(),
+            "literal: {literal}"
+        );
+    }
+}
+
+#[test]
+fn dollar_display_math_handles_multiline_single_line_and_unclosed_source() {
+    for source in [
+        "$$\n\\frac{a}{b}\n\n+x\n$$\n",
+        "$$x^2$$\n",
+        "$$\r\n x_2 \r\n$$\r\n",
+    ] {
+        let decorations = decorate(source, None);
+        let spans: Vec<_> = decorations
+            .widgets()
+            .iter()
+            .filter_map(|w| match w {
+                BlockWidget::Embedded(span) => Some(*span),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spans.len(), 1, "{source}");
+        assert!(spans[0].display);
+        assert_eq!(spans[0].source.start(), ByteOffset::ZERO);
+        assert!(
+            decorate(source, Some(TextRange::empty(spans[0].content.start())))
+                .widgets()
+                .is_empty()
+        );
+    }
+    assert!(decorate("$$\nx_2\n", None).widgets().is_empty());
+}
+
+#[test]
+fn renderer_content_removes_only_syntax_owned_container_marks() {
+    for source in [
+        "> $$\n> x > y\n> + z\n> $$\n",
+        "> ```math\n> x > y\n> + z\n> ```\n",
+    ] {
+        let decorations = decorate(source, None);
+        let span = decorations
+            .widgets()
+            .iter()
+            .find_map(|widget| match widget {
+                BlockWidget::Embedded(span) => Some(*span),
+                _ => None,
+            })
+            .expect("native resource in quote");
+        let buffer = TextBuffer::new(source);
+        let document = parse(&buffer.snapshot());
+        let content = document.embedded_source(span).expect("content");
+        assert!(
+            content.contains("x > y"),
+            "literal greater-than must remain: {content:?}"
+        );
+        assert!(
+            content.contains("+ z"),
+            "all source lines must remain: {content:?}"
+        );
+        assert_eq!(
+            content.matches('>').count(),
+            1,
+            "quote syntax must not enter TeX: {content:?}"
+        );
+        assert_eq!(document.source().as_str(), source);
+    }
+}
+
+#[test]
+fn writing_highlight_reveals_only_the_active_markers() {
+    let source = "==one== and ==two==";
+    assert_eq!(
+        hidden(&decorate(source, None)),
+        [(0, 2), (5, 7), (12, 14), (17, 19)]
+    );
+    assert_eq!(
+        hidden(&decorate(source, Some(range(3, 3)))),
+        [(12, 14), (17, 19)]
+    );
+    assert_eq!(hidden(&decorate(source, Some(range(0, 19)))), []);
+    assert!(
+        decorate("==unclosed", None)
+            .styles()
+            .iter()
+            .all(|attrs| !attrs.highlighted())
+    );
+}
+
+#[test]
+fn script_editing_reveals_full_size_source_locally() {
+    let source = "x^2^ H~2~O";
+    let preview = decorate(source, None);
+    assert_eq!(hidden(&preview), [(1, 2), (3, 4), (6, 7), (8, 9)]);
+    assert!(
+        preview
+            .styles()
+            .iter()
+            .any(|attrs| attrs.script() == yu_core::TextScript::Superscript)
+    );
+    let editing = decorate(source, Some(range(2, 2)));
+    assert_eq!(hidden(&editing), [(6, 7), (8, 9)]);
+    assert!(
+        editing
+            .styles()
+            .iter()
+            .all(|attrs| attrs.script() != yu_core::TextScript::Superscript)
+    );
+    assert!(
+        editing
+            .styles()
+            .iter()
+            .any(|attrs| attrs.script() == yu_core::TextScript::Subscript)
+    );
 }

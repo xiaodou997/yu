@@ -364,6 +364,7 @@ pub struct LineAttrs {
     indent: f32,
     line_height_scale: f32,
     font_strut_mode: yu_core::FontStrutMode,
+    justify: bool,
 }
 
 impl LineAttrs {
@@ -380,12 +381,19 @@ impl LineAttrs {
             indent,
             line_height_scale,
             font_strut_mode: yu_core::FontStrutMode::RunMetrics,
+            justify: false,
         })
     }
 
     #[must_use]
     pub const fn with_font_struts(mut self, mode: yu_core::FontStrutMode) -> Self {
         self.font_strut_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_justification(mut self, justify: bool) -> Self {
+        self.justify = justify;
         self
     }
 
@@ -408,6 +416,7 @@ impl Default for LineAttrs {
             indent: 0.0,
             line_height_scale: 1.0,
             font_strut_mode: yu_core::FontStrutMode::RunMetrics,
+            justify: false,
         }
     }
 }
@@ -857,9 +866,143 @@ pub enum LineAlignment {
 }
 
 impl BlockLayout {
+    /// Compose independently laid-out paragraphs in one visual coordinate space.
+    /// No shaping or line breaking occurs here; all consumers receive the same
+    /// translated lines, glyphs, widgets, inline boxes and caret geometry.
+    pub fn stack_paragraphs(
+        parts: Vec<(VisualOffset, f32, Self)>,
+        visual_len: VisualOffset,
+        config: LayoutConfig,
+    ) -> Result<Self, LayoutError> {
+        config.validate()?;
+        let mut result = Self {
+            inline_boxes: Vec::new(),
+            config,
+            visual_len,
+            lines: Vec::new(),
+            clusters: Vec::new(),
+            widgets: Vec::new(),
+            glyphs: Vec::new(),
+            line_attrs: Vec::new(),
+            substituted: 0,
+        };
+        let mut previous_end = 0;
+        for (offset, y, mut part) in parts {
+            let end = offset
+                .get()
+                .checked_add(part.visual_len.get())
+                .ok_or(LayoutError::OffsetOverflow)?;
+            if !y.is_finite()
+                || y < result.height()
+                || offset.get() < previous_end
+                || end > visual_len.get()
+            {
+                return Err(LayoutError::InvalidConfig(
+                    "overlapping paragraph composition",
+                ));
+            }
+            if let Some(previous) = result.lines.last_mut()
+                && offset.get() > previous_end
+            {
+                // Structural paragraph separators belong to the previous line,
+                // so its end caret stays there until the next paragraph starts.
+                previous.visual = VisualRange::new(previous.visual.start(), offset)
+                    .ok_or(LayoutError::OffsetOverflow)?;
+            }
+            previous_end = end;
+            let shift = |range: VisualRange| -> Result<VisualRange, LayoutError> {
+                let start = range
+                    .start()
+                    .get()
+                    .checked_add(offset.get())
+                    .ok_or(LayoutError::OffsetOverflow)?;
+                let end = range
+                    .end()
+                    .get()
+                    .checked_add(offset.get())
+                    .ok_or(LayoutError::OffsetOverflow)?;
+                VisualRange::new(VisualOffset::new(start), VisualOffset::new(end))
+                    .ok_or(LayoutError::OffsetOverflow)
+            };
+            let line_base = result.lines.len();
+            let cluster_base = result.clusters.len();
+            let widget_base = result.widgets.len();
+            for line in &mut part.lines {
+                line.index += line_base;
+                line.visual = shift(line.visual)?;
+                line.bounds = LayoutRect::new(
+                    line.bounds.x(),
+                    line.bounds.y() + y,
+                    line.bounds.width(),
+                    line.bounds.height(),
+                )?;
+                line.clusters =
+                    (line.clusters.start + cluster_base)..(line.clusters.end + cluster_base);
+                line.widgets = (line.widgets.start + widget_base)..(line.widgets.end + widget_base);
+            }
+            for cluster in &mut part.clusters {
+                cluster.line += line_base;
+                cluster.visual = shift(cluster.visual)?;
+            }
+            for glyph in &mut part.glyphs {
+                glyph.line += line_base;
+                glyph.visual = shift(glyph.visual)?;
+                glyph.origin = LayoutPoint::new(glyph.origin.x(), glyph.origin.y() + y);
+            }
+            for widget in &mut part.widgets {
+                widget.line += line_base;
+                widget.visual = VisualOffset::new(
+                    widget
+                        .visual
+                        .get()
+                        .checked_add(offset.get())
+                        .ok_or(LayoutError::OffsetOverflow)?,
+                );
+                widget.bounds = LayoutRect::new(
+                    widget.bounds.x(),
+                    widget.bounds.y() + y,
+                    widget.bounds.width(),
+                    widget.bounds.height(),
+                )?;
+            }
+            for fragment in &mut part.inline_boxes {
+                fragment.range = shift(fragment.range)?;
+                fragment.bounds = yu_core::Rect::new(
+                    fragment.bounds.x(),
+                    fragment.bounds.y() + y,
+                    fragment.bounds.width(),
+                    fragment.bounds.height(),
+                )?;
+            }
+            for (range, _, _) in &mut part.line_attrs {
+                *range = shift(*range)?;
+            }
+            result.substituted = result.substituted.saturating_add(part.substituted);
+            result.lines.extend(part.lines);
+            result.clusters.extend(part.clusters);
+            result.widgets.extend(part.widgets);
+            result.glyphs.extend(part.glyphs);
+            result.inline_boxes.extend(part.inline_boxes);
+            result.line_attrs.extend(part.line_attrs);
+        }
+        if result.lines.is_empty() {
+            return Err(LayoutError::InvalidConfig("empty paragraph composition"));
+        }
+        Ok(result)
+    }
+
     /// Translate final line geometry together: glyphs, clusters, inline boxes,
     /// objects and caret origins. Does not reshape or independently rewrap text.
-    pub fn align_lines(mut self, alignment: LineAlignment) -> Result<Self, LayoutError> {
+    pub fn align_lines(
+        mut self,
+        alignment: LineAlignment,
+        text: &str,
+    ) -> Result<Self, LayoutError> {
+        if text.len() as u64 != self.visual_len.get() {
+            return Err(LayoutError::InvalidConfig(
+                "alignment text length differs from layout",
+            ));
+        }
         let factor = match alignment {
             LineAlignment::Left => 0.0,
             LineAlignment::Center => 0.5,
@@ -872,11 +1015,35 @@ impl BlockLayout {
             .lines
             .iter()
             .map(|line| {
-                (self.config.max_width() - (line.bounds.width() - line.alignment_offset)).max(0.0)
-                    * factor
-                    - line.alignment_offset
+                let start = line.visual.start().get() as usize;
+                let end = line.visual.end().get() as usize;
+                let raw = text.get(start..end).ok_or(LayoutError::InvalidConfig(
+                    "alignment line is not UTF-8 bounded",
+                ))?;
+                let visible_end =
+                    (start + raw.trim_end_matches([' ', '\t', '\r', '\n']).len()) as u64;
+                let mut left = f32::INFINITY;
+                let mut right = f32::NEG_INFINITY;
+                for cluster in &self.clusters[line.clusters.clone()] {
+                    if cluster.line_break || cluster.visual.start().get() >= visible_end {
+                        continue;
+                    }
+                    left = left.min(cluster.x);
+                    right = right.max(cluster.x + cluster.width);
+                }
+                for widget in &self.widgets[line.widgets.clone()] {
+                    left = left.min(widget.bounds.x());
+                    right = right.max(widget.bounds.x() + widget.bounds.width());
+                }
+                let base_indent = line.indent - line.alignment_offset;
+                if !left.is_finite() {
+                    left = line.indent;
+                    right = left;
+                }
+                let free = (self.config.max_width() - base_indent - (right - left)).max(0.0);
+                Ok(base_indent + free * factor - left)
             })
-            .collect();
+            .collect::<Result<_, LayoutError>>()?;
         for cluster in &mut self.clusters {
             cluster.x += shifts[cluster.line];
         }
@@ -1030,6 +1197,7 @@ impl BlockLayout {
             .map_or(LineAttrs::default(), |entry| entry.2);
         let sizes = measure_widgets(input, config, widgets)?;
         let request = yu_core::ParagraphInput {
+            justify: attrs.justify,
             font_strut_mode: attrs.font_strut_mode,
             text: input.text,
             base_direction: config.base_direction(),
@@ -1344,7 +1512,10 @@ impl BlockLayout {
             let font_height = self.config.line_height() * attrs.size_scale();
             let bounds = yu_core::Rect::new(
                 cluster.x - left,
-                line.bounds.y() + line.baseline - font_height * 0.8 - attrs.inline_inset_y(),
+                line.bounds.y() + line.baseline
+                    - font_height * 0.8
+                    - attrs.inline_inset_y()
+                    - attrs.baseline_offset(),
                 cluster.width + left + right,
                 font_height + 2.0 * attrs.inline_inset_y(),
             )?;
@@ -2148,7 +2319,7 @@ fn measured_from_shaped(
                     face: glyph_run.face(),
                     glyph: glyph.id(),
                     x_offset: glyph.x_offset(),
-                    y_offset: glyph.y_offset(),
+                    y_offset: glyph.y_offset() - attrs.baseline_offset(),
                     size_scale: attrs.size_scale(),
                 }),
                 inline_before: 0.0,
@@ -2233,7 +2404,7 @@ fn substitute_run<S: ShapingProvider>(
                 face: replacement.face,
                 glyph: replacement.glyph,
                 x_offset: 0.0,
-                y_offset: 0.0,
+                y_offset: -attrs.baseline_offset(),
                 size_scale: attrs.size_scale(),
             }),
             inline_before: 0.0,
@@ -4170,7 +4341,7 @@ mod tests {
         let base = build(text, &plain(text), 10.0).expect("layout");
         let right = base
             .clone()
-            .align_lines(LineAlignment::Right)
+            .align_lines(LineAlignment::Right, text)
             .expect("align");
         let first = right
             .caret(VisualOffset::new(0), CaretAffinity::Downstream)
@@ -4187,7 +4358,9 @@ mod tests {
                 .visual(),
             VisualOffset::new(0)
         );
-        let centered = right.align_lines(LineAlignment::Center).expect("center");
+        let centered = right
+            .align_lines(LineAlignment::Center, text)
+            .expect("center");
         assert_eq!(
             centered
                 .caret(VisualOffset::new(0), CaretAffinity::Downstream)
@@ -4198,10 +4371,10 @@ mod tests {
         );
         let twice = centered
             .clone()
-            .align_lines(LineAlignment::Center)
+            .align_lines(LineAlignment::Center, text)
             .expect("center twice");
         assert_eq!(centered.clusters(), twice.clusters());
-        let reset = twice.align_lines(LineAlignment::Left).expect("left");
+        let reset = twice.align_lines(LineAlignment::Left, text).expect("left");
         assert_eq!(base.clusters(), reset.clusters());
         assert_eq!(base.lines(), reset.lines());
     }

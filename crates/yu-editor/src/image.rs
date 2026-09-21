@@ -104,7 +104,7 @@ impl PlacedWidget {
         )
     }
 
-    fn shifted(self, delta: i64) -> Result<Self, LayoutError> {
+    pub(crate) fn shifted(self, delta: i64) -> Result<Self, LayoutError> {
         Ok(Self {
             source: shift_range(self.source, delta)?,
             ..self
@@ -217,6 +217,7 @@ impl CheckboxPlacement {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WidgetPlacements {
     pub images: Vec<ImagePlacement>,
+    pub embedded: Vec<(yu_markdown::EmbeddedSpan, PlacedWidget)>,
     pub checkboxes: Vec<CheckboxPlacement>,
 }
 
@@ -265,6 +266,13 @@ pub(crate) fn build_widget_placements(view: &BlockView) -> Result<WidgetPlacemen
                 },
                 label: image.label(),
             }),
+            Some(BlockWidget::Embedded(resource)) => placements.embedded.push((
+                resource,
+                PlacedWidget {
+                    source: resource.source,
+                    ..box_geometry
+                },
+            )),
             Some(BlockWidget::Checkbox(checkbox)) => {
                 placements.checkboxes.push(CheckboxPlacement {
                     placed: PlacedWidget {
@@ -324,6 +332,13 @@ pub(crate) fn build_table_widget_placements(
                 // 格子里不会有复选框——表格块的 `BlockKind` 是表格，task
                 // extension 的定义域进不来。真出现了也要按同一套几何排，
                 // 不能悄悄丢掉。
+                Some(BlockWidget::Embedded(resource)) => placements.embedded.push((
+                    resource,
+                    PlacedWidget {
+                        source: resource.source,
+                        ..box_geometry
+                    },
+                )),
                 Some(BlockWidget::Checkbox(checkbox)) => {
                     placements.checkboxes.push(CheckboxPlacement {
                         placed: PlacedWidget {
@@ -338,4 +353,93 @@ pub(crate) fn build_table_widget_placements(
         }
     }
     Ok(placements)
+}
+
+/// Serialize a local filesystem image without interpreting native paths as
+/// Markdown. URI escaping is decoded by the resource loader, not by Swift.
+/// Callers paste this fragment through the ordinary isolated undo transaction.
+#[must_use]
+pub fn local_image_markdown(path: &str, alternative: &str) -> Option<String> {
+    let destination = local_image_uri(path)?;
+    let mut label = String::new();
+    for ch in alternative.chars() {
+        if ch.is_control() {
+            label.push(' ');
+        } else {
+            if ch.is_ascii_punctuation() {
+                label.push('\\');
+            }
+            label.push(ch);
+        }
+    }
+    Some(format!("![{label}]({destination})"))
+}
+
+/// Encode a filesystem path as a URI without interpreting literal percent
+/// signs, punctuation or Unicode as pre-existing URL syntax.
+#[must_use]
+pub fn local_image_uri(path: &str) -> Option<String> {
+    if path.is_empty() || path.contains('\0') {
+        return None;
+    }
+    let mut destination = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            destination.push(char::from(byte));
+        } else {
+            destination.push('%');
+            destination.push(char::from(HEX[usize::from(byte >> 4)]));
+            destination.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    Some(destination)
+}
+
+/// Source-backed image references, independent of preview/source mode and caret
+/// reveal. Hosts use this catalog rather than interpreting Markdown themselves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageReference {
+    pub source: TextRange,
+    pub label: TextRange,
+    pub destination: TextRange,
+    pub destination_text: String,
+}
+
+impl crate::EditorDocument {
+    pub fn image_references(&self) -> Result<Vec<ImageReference>, crate::EditorDocumentError> {
+        self.image_references_in(None)
+    }
+
+    pub(crate) fn image_references_in(
+        &self,
+        range: Option<TextRange>,
+    ) -> Result<Vec<ImageReference>, crate::EditorDocumentError> {
+        let snapshot = self.snapshot();
+        let definitions = self.markdown().reference_definitions();
+        let mut images = Vec::new();
+        for image in yu_markdown::image_spans(self.markdown(), &snapshot, range) {
+            let Some(destination) = image.destination().or_else(|| {
+                image
+                    .reference()
+                    .and_then(|label| definitions.lookup(&snapshot, label))
+                    .map(|definition| definition.destination())
+            }) else {
+                continue;
+            };
+            let Some(text) = yu_markdown::image_destination_text(&snapshot, image, definitions)
+            else {
+                continue;
+            };
+            images.push(ImageReference {
+                source: image.source(),
+                label: image.label(),
+                destination,
+                destination_text: text,
+            });
+        }
+        images.sort_by_key(|image| image.source.start());
+        images.dedup_by_key(|image| image.source);
+        Ok(images)
+    }
 }

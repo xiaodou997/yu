@@ -28,6 +28,8 @@ ROOT = Path(__file__).resolve().parent.parent
 ALLOWED: dict[str, set[str]] = {
     # 0 层：不依赖任何东西。
     "yu-core": set(),
+    # TeX metadata is shared by document resolution and strict helper validation.
+    "yu-tex": set(),
     # 1 层：只依赖 yu-core。
     #
     # yu-font 在这一层，不在 overview-v2 第 4.2 节那条链的末尾——那条链把它
@@ -49,8 +51,11 @@ ALLOWED: dict[str, set[str]] = {
     # 由 `extension/fenced_code.rs` 算出来（`BlockOrnament::FencedCode`），
     # 着色是同一个 extension 的第二件事——分成两个 extension 就得把这两段区间
     # 再算一遍，而不变量 D6 不许 extension 互相感知。
-    "yu-markdown": {"yu-core", "yu-decoration", "yu-highlight", "yu-syntax", "yu-text"},
-    "yu-embedded-math": {"yu-assets"},
+    "yu-markdown": {"yu-tex", "yu-core", "yu-decoration", "yu-highlight", "yu-syntax", "yu-text"},
+    "yu-embedded-client": {"yu-assets"},
+    # Heavy native document rendering is isolated in the bundled helper.
+    # Helper shares resource bounds/contracts; no editor/platform dependency.
+    "yu-document-renderer": {"yu-assets", "yu-tex"},
     # yu-highlight 是全仓唯一认识 tree-sitter 的地方（overview-v2 第 6.2 节：
     # tree-sitter 只用于 fenced code 内部）。它只依赖 yu-core 的 `TextRole`，
     # 拿不到 Markdown 也拿不到装饰——「(语言名, 代码文本) → 带角色的区间」是
@@ -84,6 +89,8 @@ ALLOWED: dict[str, set[str]] = {
     "yu-editor": {
         "yu-core",
         "yu-decoration",
+        # Structural paste promotes a pipe table using the shared semantic exporter.
+        "yu-export",
         "yu-layout",
         "yu-markdown",
         "yu-state",
@@ -94,7 +101,8 @@ ALLOWED: dict[str, set[str]] = {
         "yu-text",
     },
     "yu-export": {"yu-core", "yu-markdown", "yu-text"},
-    "yu-storage": {"yu-core", "yu-editor", "yu-text"},
+    # Resource path decoding is shared with the renderer for portable Save As.
+    "yu-storage": {"yu-assets", "yu-core", "yu-editor", "yu-text"},
     "yu-workspace": {
         "yu-assets",
         "yu-core",
@@ -126,7 +134,7 @@ ALLOWED: dict[str, set[str]] = {
         "yu-assets",
         "yu-core",
         "yu-editor",
-        "yu-embedded-math",
+        "yu-embedded-client",
         "yu-export",
         "yu-font",
         "yu-font-macos",
@@ -168,7 +176,8 @@ ALLOWED_DEV: dict[str, set[str]] = {
     # snapshot 拿 revision。两条都不碰 Markdown——S5 之后场景层的输入是
     # `SceneGlyph`，不是投影。
     "yu-render": {"yu-layout", "yu-text"},
-    "yu-embedded-math": {"yu-core"},
+    # Real helper/client transport contract uses canonical versioned requests.
+    "yu-document-renderer": {"yu-core", "yu-assets", "yu-embedded-client"},
 }
 
 

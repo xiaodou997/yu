@@ -357,7 +357,7 @@ fn visible_source(
 /// 唯一会撞上多行的是 **Setext 标题**（`多行\n标题\n===` 的正文是
 /// `"多行\n标题"`）与块边界还没合并时的上下文。折行只动空白：按 Unicode 的
 /// 换行切开，各段收掉首尾空白，空段丢掉，用一个空格接起来。
-fn fold_lines(raw: &str) -> String {
+pub(crate) fn fold_lines(raw: &str) -> String {
     if !raw.contains(is_line_break) {
         return raw.to_owned();
     }

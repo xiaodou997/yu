@@ -255,9 +255,9 @@ impl Error for MacosImageDecodeError {
 /// Upper bounds for the native SVG rasterization handoff. Embedded markup is
 /// untrusted document content, so a renderer cannot request an unbounded
 /// bitmap or make the AppKit decoder retain arbitrarily large source data.
-pub const MACOS_EMBEDDED_SVG_MAX_DIMENSION: u32 = 4096;
-pub const MACOS_EMBEDDED_SVG_MAX_MARKUP_BYTES: usize = 4 * 1024 * 1024;
-pub const MACOS_EMBEDDED_SVG_MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
+pub const MACOS_EMBEDDED_SVG_MAX_DIMENSION: u32 = yu_assets::EMBEDDED_SVG_MAX_DIMENSION;
+pub const MACOS_EMBEDDED_SVG_MAX_MARKUP_BYTES: usize = yu_assets::EMBEDDED_SVG_MAX_MARKUP_BYTES;
+pub const MACOS_EMBEDDED_SVG_MAX_PIXEL_BYTES: usize = yu_assets::EMBEDDED_SVG_MAX_PIXEL_BYTES;
 
 /// Errors raised while converting a bounded embedded SVG to RGBA8 pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]

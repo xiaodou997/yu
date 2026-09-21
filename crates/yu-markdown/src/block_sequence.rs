@@ -67,6 +67,8 @@ pub enum BlockKind {
     /// 它进 `BlockKind` **不等于 Yu 要渲染 HTML**——恰恰相反，认出它才能明确
     /// 地按源码画（不变量 I5），而不是让它混在段落里被行内语法解析一遍。
     HtmlBlock,
+    /// Source-backed YAML metadata at the start of a document.
+    FrontMatter,
 }
 
 impl BlockKind {
@@ -86,6 +88,7 @@ impl BlockKind {
             Self::ThematicBreak => 8,
             Self::IndentedCode => 9,
             Self::HtmlBlock => 10,
+            Self::FrontMatter => 11,
         }
     }
 }
@@ -401,6 +404,38 @@ impl BlockSequence {
             );
         }
         suffix.0.append_slice(&mut segments, suffix.1, suffix.2);
+        let len = segments.iter().map(BlockSegment::len).sum();
+        Self {
+            segments: segments.into(),
+            len,
+        }
+    }
+
+    /// Replace selected raw parser records with presentation leaves while
+    /// retaining shared storage for all untouched records.
+    pub(crate) fn expand_records(&self, replacements: Vec<(usize, Vec<BlockRecord>)>) -> Self {
+        if replacements.is_empty() {
+            return self.clone();
+        }
+        let mut segments = Vec::new();
+        let mut cursor = 0;
+        for (index, records) in replacements {
+            assert!(index >= cursor && index < self.len);
+            self.append_slice(&mut segments, cursor..index, 0);
+            let len = records.len();
+            if len > 0 {
+                push_segment(
+                    &mut segments,
+                    BlockSegment {
+                        allocation: records.into(),
+                        records: 0..len,
+                        byte_delta: 0,
+                    },
+                );
+            }
+            cursor = index + 1;
+        }
+        self.append_slice(&mut segments, cursor..self.len, 0);
         let len = segments.iter().map(BlockSegment::len).sum();
         Self {
             segments: segments.into(),

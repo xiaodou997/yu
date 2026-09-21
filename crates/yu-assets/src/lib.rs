@@ -78,7 +78,28 @@ impl ImageLocation {
         if destination.contains("://") || destination.starts_with("data:") {
             return Err(ImageLocationError::UnsupportedScheme);
         }
-        let path = Path::new(destination);
+        // Markdown destinations are URIs. Decode exactly once: a literal
+        // filename containing "%20" is encoded as "%2520" by the inserter.
+        let mut decoded = Vec::with_capacity(destination.len());
+        let mut bytes = destination.as_bytes().iter().copied();
+        while let Some(byte) = bytes.next() {
+            if byte == b'%' {
+                let high = bytes.next().and_then(|v| char::from(v).to_digit(16));
+                let low = bytes.next().and_then(|v| char::from(v).to_digit(16));
+                let (Some(high), Some(low)) = (high, low) else {
+                    return Err(ImageLocationError::InvalidEncoding);
+                };
+                decoded.push((high * 16 + low) as u8);
+            } else {
+                decoded.push(byte);
+            }
+        }
+        let decoded =
+            String::from_utf8(decoded).map_err(|_| ImageLocationError::InvalidEncoding)?;
+        if decoded.contains('\0') {
+            return Err(ImageLocationError::InvalidEncoding);
+        }
+        let path = Path::new(&decoded);
         if path.is_absolute() {
             return Ok(Self(path.to_path_buf()));
         }
@@ -98,6 +119,7 @@ impl ImageLocation {
 /// Errors raised while resolving an image destination for a local decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageLocationError {
+    InvalidEncoding,
     EmptyDestination,
     UnsupportedScheme,
     MissingDocumentParent,
@@ -106,6 +128,9 @@ pub enum ImageLocationError {
 impl fmt::Display for ImageLocationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidEncoding => {
+                formatter.write_str("invalid UTF-8 image destination encoding")
+            }
             Self::EmptyDestination => formatter.write_str("image destination must not be empty"),
             Self::UnsupportedScheme => {
                 formatter.write_str("remote and data image destinations are unsupported")
@@ -994,6 +1019,22 @@ impl ImageCache {
         self.failures.get(key)
     }
 
+    /// Explicit user retry of one failed resource. This only resets the
+    /// matching revision's failure budget; successful pixels, other failures
+    /// and the document's edit history are unrelated to this operation.
+    pub fn retry_failure(&mut self, key: &ImageKey, revision: Revision) -> bool {
+        if self
+            .failures
+            .get(key)
+            .is_some_and(|failure| failure.revision == revision)
+        {
+            self.failures.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
     #[must_use]
     pub fn eviction_count(&self) -> u64 {
         self.evictions
@@ -1157,6 +1198,20 @@ mod tests {
             cache.request(image),
             ImageRequestResult::Failed(_)
         ));
+    }
+
+    #[test]
+    fn local_uri_paths_decode_unicode_spaces_and_literal_percent_once() {
+        let image =
+            ImageLocation::resolve("/notes/readme.md", "assets/%E5%9B%BE%20%2520%23%5Bx%5D.png")
+                .expect("encoded local image");
+        assert_eq!(image.path(), Path::new("/notes/assets/图 %20#[x].png"));
+        for path in ["bad%", "bad%0", "bad%GG", "bad%FF", "bad%00.png"] {
+            assert_eq!(
+                ImageLocation::resolve("/notes/readme.md", path),
+                Err(ImageLocationError::InvalidEncoding)
+            );
+        }
     }
 
     #[test]
@@ -1432,6 +1487,42 @@ mod tests {
             panic!("exhausted retries must remain failed");
         };
         assert_eq!(exhausted.attempts(), 2);
+    }
+
+    #[test]
+    fn explicit_retry_resets_only_the_selected_current_failure() {
+        let source = TextRange::new(yu_core::ByteOffset::ZERO, yu_core::ByteOffset::new(4))
+            .expect("image retry fixture");
+        let mut cache = ImageCache::new();
+        cache.set_retry_policy(ImageRetryPolicy::new(1, 60, 60));
+        let first = request(0, source, "missing.png");
+        let other = request(0, source, "other.png");
+        for request in [&first, &other] {
+            cache
+                .record_failure(request.clone(), Revision::INITIAL, ImageFailureKind::Io)
+                .expect("image retry fixture");
+        }
+        assert!(!cache.retry_failure(first.key(), Revision::new(1)));
+        assert_eq!(cache.failure_count(), 2);
+        assert!(cache.retry_failure(first.key(), Revision::INITIAL));
+        assert!(!cache.retry_failure(first.key(), Revision::INITIAL));
+        assert_eq!(cache.failure_count(), 1);
+        assert!(matches!(
+            cache.request(other),
+            ImageRequestResult::Failed(_)
+        ));
+        assert!(matches!(
+            cache.request(first.clone()),
+            ImageRequestResult::Pending
+        ));
+        let pending = cache
+            .pending()
+            .expect("explicit retry is queued without waiting for the old backoff");
+        assert_eq!(pending.key(), first.key());
+        let failed = cache
+            .record_failure(pending, Revision::INITIAL, ImageFailureKind::Io)
+            .expect("image retry fixture");
+        assert_eq!(failed.attempts(), 1);
     }
 
     #[test]

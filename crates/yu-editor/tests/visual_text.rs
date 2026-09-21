@@ -28,6 +28,37 @@ fn range(from: u64, to: u64) -> TextRange {
     TextRange::new(offset(from), offset(to)).expect("测试区间是升序的")
 }
 
+#[test]
+fn generated_multiline_text_keeps_one_canonical_source_atom() {
+    use yu_core::VisualOffset;
+    use yu_decoration::{Decoration, DecorationRange, DecorationSet, ReplacementText};
+    let source = TextBuffer::new("before\n[toc]\nafter").snapshot();
+    let text: std::sync::Arc<str> = "中文🙂\n  Child\nשלום".into();
+    let set = DecorationSet::new(
+        source.revision(),
+        source.len_bytes(),
+        [DecorationRange::new(
+            range(7, 12),
+            Decoration::Substitute {
+                text: ReplacementText::Shared(text.clone()),
+            },
+        )],
+    );
+    let visual = VisualText::new(&source, range(7, 13), set.clone()).expect("projection");
+    assert_eq!(visual.text(), format!("{text}\n"));
+    for byte in 1..text.len() {
+        let at = VisualOffset::new(7 + byte as u64);
+        assert_eq!(set.visual_to_source(at, Bias::Before), offset(7));
+        assert_eq!(set.visual_to_source(at, Bias::After), offset(12));
+    }
+    let cloned = set.clone();
+    let Some(ReplacementText::Shared(retained)) = &cloned.projection_spans()[0].replacement else {
+        panic!("shared generated text");
+    };
+    assert!(std::sync::Arc::ptr_eq(retained, &text));
+    assert_eq!(source.as_str(), "before\n[toc]\nafter");
+}
+
 /// 第 `index` 个块的装饰与它的视觉文本。
 fn block(snapshot: &TextSnapshot, index: usize) -> (BlockDecorations, VisualText) {
     let markdown = yu_markdown::parse(snapshot);

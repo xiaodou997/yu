@@ -309,6 +309,27 @@ impl VisualText {
         self.shifted(source, composition)
     }
 
+    /// Visual content owned by a source-backed container, including preedit
+    /// inserted at either boundary. Caret bias alone intentionally excludes
+    /// boundary insertions and therefore cannot define a cell/paragraph slice.
+    pub(crate) fn content_visual_range(
+        &self,
+        source: TextRange,
+    ) -> Result<VisualRange, VisualTextError> {
+        let mut start = self.source_to_visual(source.start(), Bias::After)?;
+        let mut end = self
+            .source_to_visual(source.end(), Bias::Before)?
+            .max(start);
+        if let Some(composition) = &self.composition
+            && source.start() <= composition.replacement.start()
+            && composition.replacement.end() <= source.end()
+        {
+            start = start.min(composition.visual.start());
+            end = end.max(composition.visual.end());
+        }
+        Ok(VisualRange::new(start, end).expect("ordered content range"))
+    }
+
     /// 视觉边界 → 源码边界。
     ///
     /// # Errors
@@ -595,7 +616,7 @@ pub(crate) fn read_visible(
             push_source(source, visible, &mut text)?;
         }
         if to <= range.end()
-            && let Some(character) = span.replacement
+            && let Some(character) = &span.replacement
         {
             character.append_to(&mut text);
         }

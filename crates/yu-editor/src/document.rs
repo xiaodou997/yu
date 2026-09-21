@@ -33,9 +33,15 @@ use crate::{
 use yu_decoration::Bias;
 use yu_markdown::{BlockDecorations, BlockWidget, ImageSpan};
 
+mod image_edit;
+mod spelling;
+pub use image_edit::ImageProperties;
+mod html_disclosure;
+mod html_list;
 mod layout_context;
 mod layout_snapshot;
 mod table_edit;
+mod table_html;
 mod table_paste;
 mod table_widths;
 pub use table_widths::TableColumnWidthRecord;
@@ -53,6 +59,7 @@ pub struct EditorState {
     width_history: table_widths::WidthHistory,
     preferred_x: Option<PreferredCaretX>,
     last_source_change: Option<SourceChange>,
+    retained_image_destinations: std::collections::BTreeSet<String>,
 }
 
 /// A live editor owns mutation rights and one foreground layout context.
@@ -99,6 +106,17 @@ impl EditorDocument {
             )?;
         }
         Arc::make_mut(&mut self.presentation.markdown).set_source_mode(enabled);
+        if !enabled {
+            let positions = self
+                .selections()
+                .as_slice()
+                .iter()
+                .flat_map(|selection| [selection.anchor(), selection.focus()])
+                .collect::<Vec<_>>();
+            for position in positions {
+                self.reveal_html_range(TextRange::empty(position))?;
+            }
+        }
         self.presentation.render_identity = Arc::new(());
         self.presentation.layout_snapshot = None;
         self.presentation.decorations.clear();
@@ -119,19 +137,21 @@ impl EditorDocument {
             crate::CaretAffinity::Downstream,
         )
         .expect("offset zero is always a valid caret");
-        Self {
+        let mut document = Self {
             state: EditorState {
                 buffer,
                 history: EditorHistory::default(),
                 width_history: table_widths::WidthHistory::default(),
                 preferred_x: None,
                 last_source_change: None,
+                retained_image_destinations: Default::default(),
             },
             presentation: LayoutContext {
                 table_width_generation: 0,
                 table_widths: Arc::new(Vec::new()),
                 layout_snapshot: None,
                 resource_geometry_version: 0,
+                embedded_sizes: None,
                 render_identity: Arc::new(()),
                 source: snapshot,
                 markdown,
@@ -142,7 +162,31 @@ impl EditorDocument {
                 viewport: ViewportLayout::default(),
                 search: None,
                 search_generation: 0,
+                spelling: None,
+                spelling_generation: 0,
             },
+        };
+        let revision = document.revision();
+        document.presentation.decorations.toc.bind(revision);
+        document.remember_image_destinations(None);
+        document
+    }
+
+    /// Resource identities remain available for undo/redo after Save As.
+    /// Only reparsed image syntax is visited during ordinary edits; no source
+    /// document or layout cache is cloned into history.
+    pub fn retained_image_destinations(&self) -> impl Iterator<Item = &str> {
+        self.state
+            .retained_image_destinations
+            .iter()
+            .map(String::as_str)
+    }
+
+    fn remember_image_destinations(&mut self, range: Option<TextRange>) {
+        if let Ok(images) = self.image_references_in(range) {
+            self.state
+                .retained_image_destinations
+                .extend(images.into_iter().map(|image| image.destination_text));
         }
     }
 
@@ -292,7 +336,15 @@ impl EditorDocument {
             .layouts
             .retain_blocks(incremental.document());
         self.presentation.map_table_widths(applied.change_set());
+        let image_range = (self
+            .presentation
+            .markdown
+            .reference_definitions()
+            .fingerprint()
+            == incremental.document().reference_definitions().fingerprint())
+        .then_some(incremental.reparsed_range());
         self.presentation.markdown = Arc::new(incremental.into_document());
+        self.remember_image_destinations(image_range);
         // 匹配是 `(TextSnapshot, query)` 的纯函数，源码变了就得重扫。没有人
         // 在搜索时这里一分钱不花；有人在搜索时，代价是一次全文子串扫描——
         // 装饰与布局是增量的，这一个不是，因为一次编辑可以让任意远处的匹配
@@ -385,12 +437,15 @@ impl EditorDocument {
         let replacement_range = composition.replacement_range();
         let committed_text: Arc<str> = committed_text.into();
         let committed_text = self.table_cell_input(replacement_range, committed_text);
+        let committed_cursor = self
+            .html_table_input_cursor(replacement_range, committed_text.len())
+            .unwrap_or(committed_text.len());
         let transaction = composition.clone().commit(Arc::clone(&committed_text));
         let applied = self.apply_transaction_with_group(&transaction, HistoryGroup::Composition)?;
         let cursor_offset = replacement_range
             .start()
             .checked_add(
-                u64::try_from(committed_text.len())
+                u64::try_from(committed_cursor)
                     .map_err(|_| EditorDocumentError::Selection(SelectionError::InvalidRange))?,
             )
             .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
@@ -433,6 +488,8 @@ impl EditorDocument {
         self.presentation.layouts.clear();
         self.presentation.viewport.clear();
         self.state.history.clear();
+        self.state.retained_image_destinations.clear();
+        self.remember_image_destinations(None);
         self.state.width_history = table_widths::WidthHistory::default();
         self.presentation.table_widths = Arc::new(Vec::new());
         self.presentation.table_width_generation = self.table_width_generation.wrapping_add(1);
@@ -486,6 +543,10 @@ impl EditorDocument {
             EditorCommand::PasteTableGrid { columns, cells } => {
                 self.paste_table_grid(columns, cells)
             }
+            EditorCommand::PasteHtmlTableGrid { columns, cells } => {
+                self.paste_html_table_grid(columns, cells)
+            }
+            EditorCommand::PasteHtmlTableSource(source) => self.paste_html_table_source(source),
             EditorCommand::SelectTableCells { anchor, focus } => {
                 self.select_table_cells(anchor, focus)
             }
@@ -531,6 +592,7 @@ impl EditorDocument {
             EditorCommand::OutdentList => self.outdent_list(),
             EditorCommand::Undo => self.undo(),
             EditorCommand::Redo => self.redo(),
+            EditorCommand::ToggleHtmlDetails { source } => self.toggle_html_details(source),
             EditorCommand::ToggleTask { block } => self.toggle_task(block),
         }
     }
@@ -548,9 +610,12 @@ impl EditorDocument {
             EditorCommand::InsertText(text) => !text.is_empty(),
             EditorCommand::PasteFragments(fragments) => !fragments.is_empty(),
             EditorCommand::PasteClipboardText { text, .. } => !text.is_empty(),
-            EditorCommand::PasteTsv(text) => Self::tsv_grid(text).is_ok_and(|(columns, cells)| {
-                self.command_available(&EditorCommand::PasteTableGrid { columns, cells })
-            }),
+            EditorCommand::PasteTsv(text) => {
+                self.tsv_grid_for_target(text)
+                    .is_ok_and(|(columns, cells)| {
+                        self.command_available(&EditorCommand::PasteTableGrid { columns, cells })
+                    })
+            }
             EditorCommand::PasteTableGrid { columns, cells } => {
                 if self.grid_paste_is_outside_table() {
                     Self::serialize_grid(*columns, cells).is_ok()
@@ -558,10 +623,20 @@ impl EditorDocument {
                     self.table_grid_plan(*columns, cells).is_ok()
                 }
             }
+            EditorCommand::PasteHtmlTableGrid { columns, cells } => {
+                self.html_grid_source(*columns, cells).is_ok()
+                    && self.table_target_is_html() != Some(false)
+            }
+            EditorCommand::PasteHtmlTableSource(source) => {
+                self.html_table_source_plan(source).is_ok()
+            }
             EditorCommand::SelectTableCells { anchor, focus } => {
                 self.table_cell_selection(*anchor, *focus).is_some()
             }
             EditorCommand::EditTable(edit) => self.table_edit_plan(*edit).is_some(),
+            EditorCommand::ToggleHtmlDetails { source } => {
+                self.html_disclosure_header_at(*source).is_some()
+            }
             EditorCommand::DeleteWordBackward | EditorCommand::DeleteWordForward => {
                 let forward = matches!(command, EditorCommand::DeleteWordForward);
                 self.presentation
@@ -616,19 +691,28 @@ impl EditorDocument {
             EditorCommand::InsertNewline
             | EditorCommand::ExtendHorizontal { .. }
             | EditorCommand::MoveDocumentBoundary { .. } => true,
-            EditorCommand::IndentList => self
-                .current_list_line()
-                .is_some_and(|line| self.list_prefix(&line).is_some()),
-            EditorCommand::OutdentList => self.current_list_line().is_some_and(|line| {
-                self.list_prefix(&line).is_some_and(|_| {
-                    line.content
-                        .as_bytes()
-                        .iter()
-                        .take_while(|byte| **byte == b' ')
-                        .next()
-                        .is_some()
-                })
-            }),
+            EditorCommand::IndentList => {
+                self.multiple_html_indent_plan().is_some()
+                    || self.html_list_indent_plan().is_some()
+                    || self
+                        .current_list_line()
+                        .is_some_and(|line| self.list_prefix(&line).is_some())
+            }
+            EditorCommand::OutdentList => {
+                self.multiple_html_outdent_plan().is_some()
+                    || self.root_html_list_outdent_plan().is_some()
+                    || self.html_list_outdent_plan(false).is_some()
+                    || self.current_list_line().is_some_and(|line| {
+                        self.list_prefix(&line).is_some_and(|_| {
+                            line.content
+                                .as_bytes()
+                                .iter()
+                                .take_while(|byte| **byte == b' ')
+                                .next()
+                                .is_some()
+                        })
+                    })
+            }
             EditorCommand::Undo => self.state.history.stats().undo_entries() > 0,
             EditorCommand::Redo => self.state.history.stats().redo_entries() > 0,
             EditorCommand::ToggleTask { block } => self
@@ -743,13 +827,26 @@ impl EditorDocument {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // History restores source positions, so expose the corresponding HTML
+        // content just as navigation does. This is presentation-only and must
+        // not create a new edit or replace the saved selection.
+        if self.composition().is_none() {
+            for range in &ranges {
+                self.reveal_html_range(TextRange::empty(range.anchor()))?;
+                if range.focus() != range.anchor() {
+                    self.reveal_html_range(TextRange::empty(range.focus()))?;
+                }
+            }
+        }
         self.set_selections(ranges, saved.primary_index())?;
         if let Some(columns) = saved.table_columns().filter(|_| !self.source_mode()) {
-            self.presentation.selections = self
-                .presentation
-                .selections
-                .clone()
-                .with_table_columns(columns)?;
+            self.presentation.selections = self.presentation.selections.clone().with_table_slots(
+                columns,
+                saved
+                    .table_slots()
+                    .ok_or(SelectionError::InvalidRange)?
+                    .to_vec(),
+            )?;
         }
         Ok(())
     }
@@ -854,7 +951,14 @@ impl EditorDocument {
     /// unchecked. Pressing Enter on an empty list item exits the list by
     /// removing that line's prefix while preserving its line ending.
     pub fn insert_newline(&mut self) -> Result<CommandResult, EditorDocumentError> {
-        if self.presentation.selections.is_multiple() {
+        if let Some(result) = self.split_html_list_item()? {
+            return Ok(result);
+        }
+        if self.presentation.selections.is_multiple()
+            || self
+                .html_table_cell_input(self.selection().ordered_range(), "\n")
+                .is_some()
+        {
             return self.insert_plain_newlines();
         }
         let snapshot = self.snapshot();
@@ -964,7 +1068,10 @@ impl EditorDocument {
         for selection in self.presentation.selections.as_slice() {
             let range = selection.ordered_range();
             let line = source_line(&snapshot, range.start())?;
-            edits.push((range, Arc::<str>::from(line.insertion_terminator())));
+            let text = self
+                .html_table_cell_input(range, line.insertion_terminator())
+                .map_or_else(|| Arc::<str>::from(line.insertion_terminator()), Arc::from);
+            edits.push((range, text));
         }
         self.apply_selection_edits(edits, HistoryGroup::ListEditing, CollapseTo::End)
     }
@@ -973,6 +1080,9 @@ impl EditorDocument {
     ///
     /// **primary 那一行。** 理由见 [`Self::insert_plain_newlines`] 上那段说明。
     pub fn indent_list(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        if let Some(result) = self.change_html_list_indent(true)? {
+            return Ok(result);
+        }
         let snapshot = self.snapshot();
         let line = source_line(&snapshot, self.selection().focus())?;
         if self.list_prefix(&line).is_none() {
@@ -990,6 +1100,9 @@ impl EditorDocument {
     ///
     /// **primary 那一行。** 理由见 [`Self::insert_plain_newlines`] 上那段说明。
     pub fn outdent_list(&mut self) -> Result<CommandResult, EditorDocumentError> {
+        if let Some(result) = self.change_html_list_indent(false)? {
+            return Ok(result);
+        }
         let snapshot = self.snapshot();
         let line = source_line(&snapshot, self.selection().focus())?;
         if self.list_prefix(&line).is_none() {
@@ -1086,6 +1199,13 @@ impl EditorDocument {
     /// Preserve already escaped Markdown and the backslash parity at the edit
     /// boundary. Cross-cell edits remain separate from this single-cell policy.
     fn table_cell_input(&self, range: TextRange, text: Arc<str>) -> Arc<str> {
+        if let Some(encoded) = self.html_table_cell_input(range, &text) {
+            return Arc::from(encoded);
+        }
+        self.table_source_input(range, text)
+    }
+
+    fn table_source_input(&self, range: TextRange, text: Arc<str>) -> Arc<str> {
         if !text.contains('|') && !text.contains('\\') {
             return text;
         }
@@ -1165,7 +1285,12 @@ impl EditorDocument {
             delta += inserted - i128::from(range.len());
             targets.push(match to {
                 CollapseTo::Start => start,
-                CollapseTo::End => start + inserted,
+                CollapseTo::End => {
+                    start
+                        + self
+                            .html_table_input_cursor(*range, replacement.len())
+                            .map_or(inserted, |position| position as i128)
+                }
             });
         }
 
@@ -1203,6 +1328,10 @@ impl EditorDocument {
     fn delete_backward(&mut self) -> Result<CommandResult, EditorDocumentError> {
         if self.presentation.selections.table_columns().is_some() {
             return self.execute(EditorCommand::DeleteSelections);
+        }
+
+        if let Some(result) = self.backspace_html_list_start()? {
+            return Ok(result);
         }
 
         // 空列表项的退格（删掉整条标记）**只在单光标下走**，见
@@ -1244,6 +1373,9 @@ impl EditorDocument {
         else {
             return Ok(range);
         };
+        if let Some(range) = self.html_table_grapheme_deletion(range, forward)? {
+            return Ok(range);
+        }
         let atom = yu_markdown::table_atom_deletion_range(markdown, block, range);
         if atom == range {
             return Ok(range);
@@ -1344,9 +1476,10 @@ impl EditorDocument {
         }
         let transaction = Transaction::new(
             snapshot.revision(),
-            merged
-                .into_iter()
-                .map(|range| yu_text::Edit::new(range, "")),
+            merged.into_iter().map(|range| {
+                let replacement = self.html_table_deletion_text(range);
+                yu_text::Edit::new(range, replacement.unwrap_or_else(|| Arc::from("")))
+            }),
         );
         self.state.history.break_group();
         // Pure deletions map all original selections/carets to their surviving
@@ -1391,19 +1524,29 @@ impl EditorDocument {
         ranges: Vec<TextRange>,
         group: HistoryGroup,
     ) -> Result<CommandResult, EditorDocumentError> {
+        if let Some(result) = self.delete_html_paragraph_boundaries(&ranges, group)? {
+            return Ok(result);
+        }
         // Two source carets can address the same projected escape atom.
         // Delete its bytes once, retaining one mapped target per selection.
         let mut previous_end = ByteOffset::ZERO;
         let edits = ranges
             .into_iter()
-            .map(|range| {
+            .enumerate()
+            .map(|(index, range)| {
                 let start = range.start().max(previous_end);
                 let end = range.end().max(start);
                 previous_end = end;
-                (
-                    TextRange::new(start, end).expect("ordered deletion"),
-                    Arc::<str>::from(""),
-                )
+                let range = TextRange::new(start, end).expect("ordered deletion");
+                let replacement = if self.selections().as_slice()[index].is_empty()
+                    || self.selections().table_columns().is_none()
+                {
+                    self.html_table_deletion_text(range)
+                        .unwrap_or_else(|| Arc::from(""))
+                } else {
+                    Arc::from("")
+                };
+                (range, replacement)
             })
             .collect();
         self.apply_selection_edits(edits, group, CollapseTo::Start)
@@ -1546,10 +1689,15 @@ impl EditorDocument {
     }
 
     fn table_cell_navigation_target(&self, previous: bool) -> Option<ByteOffset> {
+        if self.source_mode() {
+            return None;
+        }
         let focus = self.selection().focus();
         let block_index = self.block_index_for_offset(focus)?;
         let block = self.presentation.markdown.blocks().get(block_index)?;
-        let table = yu_markdown::table_for_block(&self.presentation.markdown, block)?;
+        let table = self
+            .html_table_grid(block)
+            .or_else(|| yu_markdown::table_for_block(&self.presentation.markdown, block))?;
         let offset = usize::try_from(focus.get()).ok()?;
         let current = table.visible_cell_for_source(offset)?;
         let (_, target) = if previous {
@@ -1569,6 +1717,26 @@ impl EditorDocument {
             .markdown
             .blocks()
             .get(self.block_index_for_offset(self.selection().focus())?)?;
+        if self.source_mode() {
+            return None;
+        }
+        if let Some(grid) = self.html_table_grid(block) {
+            let current = grid.visible_cell_for_source(self.selection().focus().get() as usize)?;
+            if current.row() + 1 != grid.visible_row_count()
+                || current.column() + 1 != grid.column_count()
+            {
+                return None;
+            }
+            let plan = self.html_table_edit_plan(block, crate::TableEdit::InsertRowAfter)?;
+            let edit = plan.edits.first()?;
+            let insertion = edit.inserted_text().to_owned();
+            // The row builder emits only empty th/td tags; target the first
+            // cell's content, inside the new row and its existing section.
+            let content = insertion.find("</t")?;
+            let at = edit.range().start();
+            let focus = ByteOffset::new(at.get().checked_add(content as u64)?);
+            return Some((at, insertion, focus));
+        }
         let table = yu_markdown::table_for_block(&self.presentation.markdown, block)?;
         let current = table.visible_cell_for_source(self.selection().focus().get() as usize)?;
         if current.row() + 1 != table.visible_row_count()
@@ -2001,7 +2169,7 @@ where
         .copied()
         .filter_map(|widget| match widget {
             BlockWidget::Image(image) => Some(image),
-            BlockWidget::Checkbox(_) => None,
+            BlockWidget::Checkbox(_) | BlockWidget::Embedded(_) => None,
         })
         .filter_map(|image| image_resolver(image).map(|size| (image.source(), size)))
         .collect()
@@ -2218,6 +2386,7 @@ pub enum EditorDocumentError {
     /// A worker request was superseded during viewport measurement.
     Cancelled,
     InvalidTablePaste,
+    InvalidImageProperties,
     Composition(CompositionError),
     Edit(EditError),
     Layout(LayoutError),
@@ -2244,6 +2413,9 @@ impl fmt::Display for EditorDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => formatter.write_str("viewport preparation cancelled"),
+            Self::InvalidImageProperties => {
+                formatter.write_str("invalid or stale image properties")
+            }
             Self::InvalidTablePaste => {
                 formatter.write_str("invalid table paste shape, target, or cell source")
             }
@@ -2291,7 +2463,8 @@ impl Error for EditorDocumentError {
             | Self::CompositionNotActive
             | Self::CompositionActive
             | Self::Cancelled
-            | Self::InvalidTablePaste => None,
+            | Self::InvalidTablePaste
+            | Self::InvalidImageProperties => None,
         }
     }
 }
@@ -3088,6 +3261,400 @@ outside
                 .content_y(),
             old_y
         );
+    }
+
+    #[test]
+    fn failed_resource_reveals_source_and_rejects_stale_geometry() {
+        let source = "```math\n\\unknownYuCommand{x}\n```\n\nfollowing";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.find("following").expect("paragraph"));
+        let revision = document.revision();
+        let range = document.block_decorations(0).expect("block").range();
+        let viewport = ViewportSpan::new(0.0, 600.0);
+        let before = document
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("preview");
+        let worker = document.capture_render_snapshot();
+        document
+            .set_failed_resource_ranges(revision, vec![range])
+            .expect("diagnostic");
+        assert!(!document.accepts_layout_snapshot(&before));
+        assert!(!worker.can_reuse_layout_context(&document));
+        let failed = document
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("source");
+        assert!(failed.blocks()[0].layout().embedded().is_empty());
+        assert!(
+            failed.blocks()[0]
+                .layout()
+                .visual()
+                .text()
+                .contains("```math")
+        );
+        assert!(
+            failed.blocks()[0]
+                .layout()
+                .visual()
+                .text()
+                .contains("unknownYuCommand")
+        );
+        let mut background = document.capture_render_snapshot().into_layout_context();
+        assert_eq!(
+            background.block_visual_text(0).expect("worker text").text(),
+            document.block_visual_text(0).expect("live text").text()
+        );
+        assert_eq!(document.snapshot().as_str(), source);
+        assert_eq!(document.revision(), revision);
+        document
+            .execute(EditorCommand::insert_text("!"))
+            .expect("edit outside failed block");
+        assert!(
+            document
+                .set_failed_resource_ranges(revision, vec![range])
+                .is_err()
+        );
+        // An unaffected block must not retain a raw projection shifted from
+        // an old diagnostic. The new revision gets a new render request.
+        let edited = document
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("edited");
+        assert!(!edited.blocks()[0].layout().embedded().is_empty());
+    }
+
+    #[test]
+    fn toc_projection_updates_layout_without_rewriting_marker_source() {
+        let source = "[toc]\n\n# **中文🙂**\n\n### Child\n\nTail";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.len());
+        let projection = crate::TocProjection::build(document.markdown()).expect("TOC");
+        assert_eq!(&*projection.text, "中文🙂\n  Child");
+        for link in projection.links.iter() {
+            for offset in link.visual.clone() {
+                assert_eq!(projection.target_at(offset), Some(link.target));
+            }
+        }
+        let viewport = ViewportSpan::new(0.0, 600.0);
+        let before = document
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("before");
+        assert_eq!(
+            before.blocks()[0].layout().visual().text(),
+            "中文🙂\n  Child\n"
+        );
+        let at = source.find("Child").expect("heading") + "Child".len();
+        set_caret(&mut document, at);
+        document
+            .execute(EditorCommand::insert_text(" updated"))
+            .expect("edit heading");
+        let changed = document
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("changed");
+        assert_eq!(
+            changed.blocks()[0].layout().visual().text(),
+            "中文🙂\n  Child updated\n"
+        );
+        let mut worker = document.capture_render_snapshot().into_layout_context();
+        assert_eq!(
+            worker.block_visual_text(0).expect("background").text(),
+            changed.blocks()[0].layout().visual().text()
+        );
+        document.undo().expect("undo");
+        assert_eq!(document.snapshot().as_str(), source);
+        let restored = document
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("restored");
+        assert_eq!(
+            restored.blocks()[0].layout().visual().text(),
+            before.blocks()[0].layout().visual().text()
+        );
+        set_caret(&mut document, 2);
+        assert!(
+            document
+                .visual_text_for_visual_state()
+                .expect("editing marker")
+                .text()
+                .contains("[toc]")
+        );
+        document.set_source_mode(true).expect("source mode");
+        assert!(
+            document
+                .block_visual_text(0)
+                .expect("raw")
+                .text()
+                .contains("[toc]")
+        );
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+
+    #[test]
+    fn adjacent_footnote_references_keep_identity_on_both_caret_edges() {
+        let source = "正文[^a][^b]\n\n[^a]: first\n\n[^b]: second\n";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.len());
+        let references = document.markdown().footnotes().references().to_vec();
+        let layout = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 600.0), &WideShaper)
+            .expect("layout");
+        let block = layout.blocks()[0].layout();
+        assert_eq!(block.visual().text(), "正文12\n");
+        for reference in &references {
+            let cluster = block
+                .clusters()
+                .iter()
+                .find(|cluster| cluster.source() == reference.source)
+                .expect("numeric reference cluster");
+            for fraction in [0.25, 0.75] {
+                let hit = block
+                    .hit_test(LayoutPoint::new(
+                        cluster.x() + cluster.width() * fraction,
+                        cluster.y() + cluster.line_height() / 2.0,
+                    ))
+                    .expect("hit");
+                assert_eq!(hit.content_source(), Some(reference.source));
+                assert_eq!(
+                    document
+                        .markdown()
+                        .footnotes()
+                        .navigation_target(hit.content_source().expect("reference").start()),
+                    document
+                        .markdown()
+                        .footnotes()
+                        .navigation_target(reference.source.start())
+                );
+            }
+        }
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+
+    #[test]
+    fn adjacent_equation_references_keep_object_identity_on_both_caret_edges() {
+        let source = "\\eqref{a}\\eqref{b}\n\n$$x\\label{a}$$\n\n$$y\\label{b}$$";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.len());
+        let spans: Vec<_> = document
+            .block_decorations(0)
+            .expect("references")
+            .widgets()
+            .iter()
+            .filter_map(|widget| match widget {
+                yu_markdown::BlockWidget::Embedded(span) => Some(*span),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spans.len(), 2);
+        let revision = document.revision();
+        document
+            .set_embedded_sizes(
+                revision,
+                spans
+                    .iter()
+                    .map(|span| {
+                        (
+                            span.source,
+                            ImageIntrinsicSize::new(40, 20)
+                                .expect("size")
+                                .with_baseline(Some(15_000))
+                                .expect("baseline"),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("sizes");
+        let layout = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 600.0), &WideShaper)
+            .expect("layout");
+        let block = layout.blocks()[0].layout();
+        for (i, (span, placed)) in block.embedded().iter().enumerate() {
+            let bounds = placed.bounds();
+            for fraction in [0.25, 0.75] {
+                let hit = block
+                    .hit_test(LayoutPoint::new(
+                        bounds.x() + bounds.width() * fraction,
+                        bounds.y() + bounds.height() / 2.0,
+                    ))
+                    .expect("hit");
+                assert_eq!(hit.content_source(), Some(span.source));
+                let target = document
+                    .markdown()
+                    .equation_reference_target(hit.content_source().expect("object").start())
+                    .expect("target");
+                assert_eq!(
+                    target.start().get() as usize,
+                    source
+                        .find(if i == 0 { "$$x" } else { "$$y" })
+                        .expect("definition")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_inline_formula_preserves_neighbor_styles_and_widgets() {
+        let source = "**bold** $\\bad$ and $x$ ![image](a.png)\n\nend";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.len());
+        let decorations = document.block_decorations(0).expect("block").clone();
+        let failed = decorations
+            .widgets()
+            .iter()
+            .find_map(|widget| match widget {
+                yu_markdown::BlockWidget::Embedded(span) => Some(span.source),
+                _ => None,
+            })
+            .expect("formula");
+        let revision = document.revision();
+        document
+            .set_failed_resource_ranges(revision, vec![failed])
+            .expect("failure");
+        let decorations = document.block_decorations(0).expect("projection").clone();
+        assert_eq!(
+            decorations.widgets().len(),
+            2,
+            "healthy math and image remain"
+        );
+        let text = document.block_visual_text(0).expect("visual");
+        assert!(text.text().contains("$\\bad$"));
+        assert!(!text.text().contains("**"));
+        assert!(!text.text().contains("$x$"));
+        let layout = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 600.0), &WideShaper)
+            .expect("remapped widget identities");
+        assert_eq!(layout.blocks()[0].layout().embedded().len(), 1);
+        assert_eq!(layout.blocks()[0].layout().images().len(), 1);
+        assert_eq!(document.snapshot().as_str(), source);
+        assert_eq!(document.revision(), revision);
+    }
+
+    #[test]
+    fn inline_math_uses_native_baseline_in_shared_line_geometry() {
+        let source = "before $x_2$ after\n\nend";
+        let mut document = EditorDocument::new(source);
+        set_caret(&mut document, source.len());
+        let resource = document
+            .block_decorations(0)
+            .expect("block")
+            .widgets()
+            .iter()
+            .find_map(|w| match w {
+                yu_markdown::BlockWidget::Embedded(span) => Some(*span),
+                _ => None,
+            })
+            .expect("math");
+        let size = ImageIntrinsicSize::new(40, 30)
+            .expect("size")
+            .with_baseline(Some(22_000))
+            .expect("baseline");
+        let revision = document.revision();
+        document
+            .set_embedded_sizes(revision, vec![(resource.source, size)])
+            .expect("dimensions");
+        let layout = document
+            .prepare_layout_snapshot(ViewportSpan::new(0.0, 600.0), &WideShaper)
+            .expect("layout");
+        let block = layout.blocks()[0].layout();
+        let object = block.embedded()[0].1.bounds();
+        assert_eq!(object.height(), 30.0);
+        let line = &block.lines()[block.embedded()[0].1.line()];
+        assert!(
+            (object.y() + 22.0 - line.y() - line.baseline()).abs() < 0.01,
+            "formula baseline must coincide with the shared text line"
+        );
+        assert!(block.visual().text().contains("before "));
+        assert!(block.visual().text().contains(" after"));
+        assert!(!block.visual().text().contains("x_2"));
+        let hit = block
+            .hit_test(LayoutPoint::new(object.x() + 2.0, object.y() + 2.0))
+            .expect("hit");
+        assert_eq!(hit.source(), resource.source.start());
+        assert_eq!(document.snapshot().as_str(), source);
+        let worker = document.capture_render_snapshot().into_layout_context();
+        assert_eq!(worker.revision(), document.revision());
+    }
+
+    #[test]
+    fn native_resource_dimensions_move_text_and_share_hit_geometry() {
+        let source = "```math\nx^2\n```\n\nfollowing paragraph";
+        let mut owner = EditorDocument::new(source);
+        let following = source.find("following").expect("text");
+        set_caret(&mut owner, following);
+        owner
+            .set_viewport_config(ViewportConfig::new(
+                LayoutConfig::new(300.0, 10.0),
+                10.0,
+                0.0,
+            ))
+            .expect("config");
+        let viewport = ViewportSpan::new(0.0, 600.0);
+        let before = owner
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("placeholder");
+        let range = before.blocks()[0].layout().embedded()[0].0.source;
+        let old_y = before
+            .block_for_source(ByteOffset::new(following as u64))
+            .expect("following")
+            .content_y();
+        let revision = owner.revision();
+        owner
+            .set_embedded_sizes(
+                revision,
+                vec![(range, ImageIntrinsicSize::new(200, 180).expect("size"))],
+            )
+            .expect("ready");
+        assert!(
+            !owner.accepts_layout_snapshot(&before),
+            "old resource geometry must not be adopted"
+        );
+        let ready = owner
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("ready layout");
+        let resource = ready.blocks()[0].layout();
+        let bounds = resource.embedded()[0].1.bounds();
+        assert!((bounds.width() - 200.0).abs() < 0.01);
+        assert!((bounds.height() - 180.0).abs() < 0.01);
+        assert!(
+            ready
+                .block_for_source(ByteOffset::new(following as u64))
+                .expect("following")
+                .content_y()
+                > old_y + 100.0
+        );
+        let hit = resource
+            .hit_test(LayoutPoint::new(
+                bounds.x() + 1.0,
+                bounds.y() + bounds.height() - 1.0,
+            ))
+            .expect("hit at bottom");
+        assert_eq!(hit.source(), range.start());
+        assert!(
+            hit.image().is_none(),
+            "formula must not open image properties"
+        );
+        assert_eq!(owner.snapshot().as_str(), source);
+        assert_eq!(owner.revision(), revision);
+        owner
+            .set_embedded_sizes(revision, vec![])
+            .expect("remove resource");
+        let cleared = owner
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("placeholder again");
+        assert!(
+            cleared.blocks()[0].layout().embedded()[0]
+                .1
+                .bounds()
+                .height()
+                < 180.0
+        );
+        assert!(
+            owner
+                .set_embedded_sizes(Revision::new(999), vec![])
+                .is_err()
+        );
+        set_caret(&mut owner, source.find("x^2").expect("formula"));
+        let editing = owner
+            .prepare_layout_snapshot(viewport, &WideShaper)
+            .expect("source reveal");
+        assert!(editing.blocks()[0].layout().embedded().is_empty());
+        assert!(editing.blocks()[0].layout().visual().text().contains("x^2"));
     }
 
     #[test]

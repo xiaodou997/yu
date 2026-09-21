@@ -28,6 +28,7 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 mod close;
 mod document_lifecycle;
+mod image_relocation;
 mod recovery;
 mod table_width_store;
 mod watch;

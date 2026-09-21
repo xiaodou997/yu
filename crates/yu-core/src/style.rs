@@ -163,6 +163,16 @@ pub enum TextRole {
     Link,
 }
 
+/// Semantic writing position, resolved to font scale and a logical-point
+/// baseline offset by the document layout assembler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TextScript {
+    #[default]
+    Normal,
+    Superscript,
+    Subscript,
+}
+
 /// 一个 [`StyleId`] 解释之后的排版属性。
 ///
 /// `size_scale` 是相对 [`crate::ClusterMetrics`] 基准字号的倍率。标题靠它变大，
@@ -177,9 +187,70 @@ pub struct TextAttrs {
     inline_box_id: Option<u64>,
     inline_inset: f32,
     inline_inset_y: f32,
+    highlighted: bool,
+    underlined: bool,
+    struck: bool,
+    script: TextScript,
+    baseline_offset: f32,
 }
 
 impl TextAttrs {
+    #[must_use]
+    pub const fn with_script(mut self, script: TextScript) -> Self {
+        self.script = script;
+        self
+    }
+
+    #[must_use]
+    pub const fn script(self) -> TextScript {
+        self.script
+    }
+
+    /// Logical points above the normal baseline; negative values lower text.
+    #[must_use]
+    pub fn with_baseline_offset(mut self, offset: f32) -> Option<Self> {
+        if !offset.is_finite() {
+            return None;
+        }
+        self.baseline_offset = offset;
+        Some(self)
+    }
+
+    #[must_use]
+    pub const fn baseline_offset(self) -> f32 {
+        self.baseline_offset
+    }
+
+    #[must_use]
+    pub const fn with_highlighted(mut self, highlighted: bool) -> Self {
+        self.highlighted = highlighted;
+        self
+    }
+
+    #[must_use]
+    pub const fn highlighted(self) -> bool {
+        self.highlighted
+    }
+
+    #[must_use]
+    pub const fn with_underlined(mut self, value: bool) -> Self {
+        self.underlined = value;
+        self
+    }
+    #[must_use]
+    pub const fn underlined(self) -> bool {
+        self.underlined
+    }
+    #[must_use]
+    pub const fn with_struck(mut self, value: bool) -> Self {
+        self.struck = value;
+        self
+    }
+    #[must_use]
+    pub const fn struck(self) -> bool {
+        self.struck
+    }
+
     /// 基准字号下的一种字型。
     #[must_use]
     pub const fn new(style: TextStyle) -> Self {
@@ -192,6 +263,11 @@ impl TextAttrs {
             inline_box_id: None,
             inline_inset: 0.0,
             inline_inset_y: 0.0,
+            highlighted: false,
+            underlined: false,
+            struck: false,
+            script: TextScript::Normal,
+            baseline_offset: 0.0,
         }
     }
 
@@ -308,6 +384,15 @@ impl Default for TextAttrs {
 #[cfg(test)]
 mod tests {
     use super::{TextAttrs, TextRole, TextStyle};
+
+    #[test]
+    fn baseline_offsets_are_finite_and_part_of_style_identity() {
+        let plain = TextAttrs::default();
+        assert!(plain.with_baseline_offset(f32::NAN).is_none());
+        assert!(plain.with_baseline_offset(f32::INFINITY).is_none());
+        assert_ne!(plain, plain.with_baseline_offset(-3.2).expect("subscript"));
+        assert_ne!(plain, plain.with_script(super::TextScript::Superscript));
+    }
 
     #[test]
     fn size_scale_rejects_non_finite_and_non_positive() {

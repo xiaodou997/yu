@@ -31,13 +31,14 @@ const SPEC_SHA256: &str = "d431b29d97b6f73e69d547109cf5081578fac931e72afe95639eb
 /// 悄悄调松，而一个具体的用例数一旦下降，就必须在提交里显式改掉它并说明是
 /// 哪几条退化了。
 ///
-/// 为什么不是 652：见 [`deviations`]，剩下的 8 条是架构决定的偏差，
+/// 为什么不是 652：见 [`deviations`]，剩下的 10 条是架构与产品扩展决定的偏差，
 /// 逐条登记在 `docs/specs/invariants.md` 第 F 节。
 ///
 /// 643 → 644 是 S7 第六刀调的，而且**只可能**是那一刀里 F3 那一半调的：
 /// 这条棘轮走 [`render`] → `html.rs`，同一刀把导出换成 comrak 的那一半在
 /// `yu-export` 里，动不到这条路上的任何一个字节。两件事因此分在两个 commit。
-const RAW_PASS_BASELINE: usize = 644;
+// Front matter intentionally reinterprets document-start rules in #96/#98.
+const RAW_PASS_BASELINE: usize = 642;
 
 struct Example {
     number: usize,
@@ -210,6 +211,9 @@ fn deviations() -> BTreeMap<usize, &'static str> {
     // F2：制表符不展开。
     for number in [5, 6, 7] {
         registry.insert(number, "F2");
+    }
+    for number in [96, 98] {
+        registry.insert(number, "F4");
     }
     // F3 曾经在这里（540：`[ẞ]` 配 `[SS]:`）。S7 第六刀接了 `caseless`，
     // 产品链路与参考渲染一起换成 full case folding，它变绿了，登记随之删掉

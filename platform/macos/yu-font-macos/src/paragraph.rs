@@ -385,6 +385,20 @@ fn layout(
                 Some(font.as_ref()),
             );
         }
+        if unit.attrs.baseline_offset() != 0.0 {
+            let offset = objc2_core_foundation::CFNumber::new_f32(unit.attrs.baseline_offset());
+            unsafe {
+                CFMutableAttributedString::set_attribute(
+                    Some(&attributed),
+                    CFRange {
+                        location: unit.start as _,
+                        length: (units[end - 1].end - unit.start) as _,
+                    },
+                    Some(objc2_core_text::kCTBaselineOffsetAttributeName),
+                    Some(offset.as_ref()),
+                );
+            }
+        }
         let spacing = unit.attrs.letter_spacing()
             + super::synthetic_bold_offset(&font, unit.attrs.style().is_strong()) as f32;
         if spacing != 0.0 {
@@ -517,6 +531,16 @@ fn layout(
                 length: (end - start) as _,
             })
         };
+        let hard_break = units
+            .iter()
+            .any(|unit| unit.line_break && unit.start >= start && unit.start < end);
+        let line = if input.justify && end < utf16 && !hard_break {
+            // Geometry, glyphs and caret offsets below all read the same CTLine.
+            // CoreText may return None when no justification is possible.
+            unsafe { line.justified_line(1.0, width) }.unwrap_or(line)
+        } else {
+            line
+        };
         let advance = unsafe {
             line.typographic_bounds(
                 std::ptr::null_mut(),
@@ -527,6 +551,7 @@ fn layout(
         let runs = unsafe { line.glyph_runs() };
         let runs: CFRetained<CFArray<CTRun>> = unsafe { CFRetained::cast_unchecked(runs) };
         let (mut font_ascent, mut font_descent) = (0.0_f32, 0.0_f32);
+        let mut shifted_extents = Vec::new();
         for run in runs.iter() {
             let attributes = unsafe { run.attributes() };
             let attributes: &CFDictionary<CFString, CTFont> =
@@ -536,6 +561,17 @@ fn layout(
                 .ok_or(CoreTextShapeError::MissingRunFont)?;
             font_ascent = font_ascent.max(unsafe { font.ascent() } as f32);
             font_descent = font_descent.max(unsafe { font.descent() } as f32);
+            let native_start = cf_index_to_usize(unsafe { run.string_range() }.location)?;
+            if let Some(unit) = units.get(units.partition_point(|unit| unit.end <= native_start))
+                && unit.attrs.baseline_offset() != 0.0
+                && unit.object.is_none()
+                && unit.spacer.is_none()
+            {
+                shifted_extents.push((
+                    unsafe { font.ascent() } as f32 + unit.attrs.baseline_offset(),
+                    unsafe { font.descent() } as f32 - unit.attrs.baseline_offset(),
+                ));
+            }
         }
         // Font ink may extend outside an explicit line-height. Position the
         // baseline with half-leading; by default only inline objects enlarge the
@@ -581,6 +617,13 @@ fn layout(
         {
             baseline = baseline.max(object.baseline);
             below = below.max(object.size.height() - object.baseline);
+        }
+        // Shifted text ink may exceed the normal strut (especially a line
+        // consisting entirely of superscripts). Include those extents so the
+        // viewport, scroll range and selection never clip visible glyphs.
+        for (above, under) in shifted_extents {
+            baseline = baseline.max(above);
+            below = below.max(under);
         }
         let height = baseline + below;
         let range = VisualRange::new(
@@ -745,8 +788,8 @@ fn layout(
                 start + cf_index_to_usize(range.length)?,
                 if rtl { left + width } else { left },
                 if rtl { left } else { left + width },
-                ascent,
-                descent,
+                ascent + units[first_unit].attrs.baseline_offset(),
+                descent - units[first_unit].attrs.baseline_offset(),
                 units[first_unit..last_unit]
                     .iter()
                     .find(|unit| unit.spacer != Some(0.0))
@@ -825,8 +868,8 @@ fn layout(
                 right,
                 text_left: f32::INFINITY,
                 text_right: f32::NEG_INFINITY,
-                ascent: 0.0,
-                descent: 0.0,
+                ascent: f32::NEG_INFINITY,
+                descent: f32::NEG_INFINITY,
                 inset_y: unit.attrs.inline_inset_y(),
                 has_text: false,
             };
@@ -1006,6 +1049,7 @@ mod tests {
 
     fn request(text: &str, width: f32) -> ParagraphInput<'_> {
         ParagraphInput {
+            justify: false,
             font_strut_mode: yu_core::FontStrutMode::RunMetrics,
             text,
             base_direction: yu_core::BaseDirection::Auto,
@@ -1018,6 +1062,94 @@ mod tests {
                 attrs: TextAttrs::default(),
             }],
             objects: vec![],
+        }
+    }
+
+    #[test]
+    fn native_script_baselines_and_font_scale_survive_bidi_and_zoom() {
+        for zoom in [0.75, 1.0, 2.0] {
+            let shaper = CoreTextShaper::from_system_ui(
+                FontRequest::new("System UI", 16.0 * zoom).expect("font"),
+            )
+            .expect("shaper");
+            for text in ["a2b3c", "中2文3字", "א2ב3ג"] {
+                let mut input = request(text, 500.0);
+                input.line_height *= zoom;
+                input.runs = text
+                    .char_indices()
+                    .map(|(index, ch)| {
+                        let offset = match ch {
+                            '2' => 6.4 * zoom,
+                            '3' => -3.2 * zoom,
+                            _ => 0.0,
+                        };
+                        yu_core::ParagraphRun {
+                            range: visual_range(index, index + ch.len_utf8()).expect("range"),
+                            style: StyleId(index as u32),
+                            attrs: TextAttrs::default()
+                                .with_size_scale(if offset == 0.0 { 1.0 } else { 0.75 })
+                                .expect("size")
+                                .with_baseline_offset(offset)
+                                .expect("offset"),
+                        }
+                    })
+                    .collect();
+                let result = shaper.layout(&input).expect("native script paragraph");
+                assert_eq!(result.lines.len(), 1);
+                assert_eq!(result.clusters.len(), 5);
+                let baseline = result.lines[0].baseline;
+                for ch in ['2', '3'] {
+                    let at = text.find(ch).expect("script character") as u64;
+                    let glyph = result
+                        .glyphs
+                        .iter()
+                        .find(|g| g.range.start().get() == at)
+                        .expect("script glyph");
+                    let offset = if ch == '2' { 6.4 * zoom } else { -3.2 * zoom };
+                    assert!(
+                        (glyph.y - (baseline - offset)).abs() < 0.01,
+                        "{text} {ch}: {} vs {}",
+                        glyph.y,
+                        baseline - offset
+                    );
+                    assert_eq!(glyph.size_scale, 0.75);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn script_inline_code_background_moves_with_its_glyphs() {
+        let shaper =
+            CoreTextShaper::from_system_ui(FontRequest::new("System UI", 16.0).expect("font"))
+                .expect("shaper");
+        let mut input = request("code", 500.0);
+        input.runs[0].attrs = TextAttrs::new(TextStyle::Code)
+            .with_size_scale(0.75)
+            .expect("size")
+            .with_inline_box_id(Some(9))
+            .with_inline_inset(2.0)
+            .expect("inset");
+        let plain = shaper.layout(&input).expect("plain code");
+        for shift in [-3.2, 6.4] {
+            input.runs[0].attrs = input.runs[0]
+                .attrs
+                .with_baseline_offset(shift)
+                .expect("offset");
+            let moved = shaper.layout(&input).expect("shifted code");
+            assert_eq!(plain.inline_boxes.len(), 1);
+            assert_eq!(moved.inline_boxes.len(), 1);
+            let original = plain.inline_boxes[0].bounds;
+            let actual = moved.inline_boxes[0].bounds;
+            let baseline_delta = moved.lines[0].baseline - plain.lines[0].baseline;
+            assert!((original.y() - actual.y() + baseline_delta - shift).abs() < 0.01);
+            assert!((original.height() - actual.height()).abs() < 0.01);
+            assert!((plain.glyphs[0].y - moved.glyphs[0].y + baseline_delta - shift).abs() < 0.01);
+            assert!(
+                actual.y() >= -0.01,
+                "script-only line must not clip its top"
+            );
+            assert!(actual.y() + actual.height() <= moved.lines[0].bounds.height() + 0.01);
         }
     }
 
@@ -1801,6 +1933,7 @@ mod tests {
         let text = "English العربية more עברית end";
         let layout = shaper
             .layout(&ParagraphInput {
+                justify: false,
                 font_strut_mode: yu_core::FontStrutMode::RunMetrics,
                 text,
                 base_direction: yu_core::BaseDirection::Auto,
@@ -1822,6 +1955,62 @@ mod tests {
             assert!(
                 (cluster.trailing - cluster.leading).abs() < 32.0,
                 "a grapheme cannot span another bidi run: {cluster:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn justified_native_lines_expand_glyphs_and_carets_but_not_paragraph_endings() {
+        let shaper =
+            CoreTextShaper::from_system_ui(FontRequest::new("System UI", 16.0).expect("font"))
+                .expect("CoreText");
+        for text in [
+            "one two three four five six seven eight nine ten eleven twelve",
+            "中文混合文字用于测试两端对齐中文混合文字用于测试两端对齐末行",
+            "English עברית العربية mixed words in a paragraph more words to wrap",
+            "one two three four five six\nshort\nmore words to make another wrapped line here",
+        ] {
+            let mut input = request(text, 180.0);
+            input.indent = 12.0;
+            let natural = shaper.layout(&input).expect("natural");
+            input.justify = true;
+            let expanded = shaper.layout(&input).expect("justified");
+            assert_eq!(natural.lines.len(), expanded.lines.len());
+            let mut changed = false;
+            for (index, (before, after)) in natural.lines.iter().zip(&expanded.lines).enumerate() {
+                assert_eq!(before.range, after.range);
+                let ending =
+                    &text[after.range.start().get() as usize..after.range.end().get() as usize];
+                if index + 1 == expanded.lines.len() || ending.ends_with('\n') {
+                    assert_eq!(before, after, "hard/final line changed: {ending:?}");
+                } else {
+                    assert!(
+                        (after.bounds.width() - input.width).abs() < 0.01,
+                        "{text:?} line {index}: {after:?}"
+                    );
+                    changed |= after.bounds.width() > before.bounds.width() + 0.1;
+                }
+            }
+            assert!(changed, "no line expanded: {text}");
+            assert!(
+                expanded
+                    .glyphs
+                    .iter()
+                    .zip(&natural.glyphs)
+                    .any(|(a, b)| (a.x - b.x).abs() > 0.1)
+            );
+            assert!(
+                expanded
+                    .clusters
+                    .iter()
+                    .zip(&natural.clusters)
+                    .any(|(a, b)| (a.trailing - b.trailing).abs() > 0.1)
+            );
+            assert!(
+                expanded
+                    .clusters
+                    .iter()
+                    .all(|cluster| cluster.leading.is_finite() && cluster.trailing.is_finite())
             );
         }
     }

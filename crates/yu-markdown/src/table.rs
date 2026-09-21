@@ -8,13 +8,15 @@
 use yu_core::TextRange;
 use yu_text::TextSnapshot;
 
-/// Alignment requested by a GFM table delimiter cell.
+/// Alignment requested by a GFM delimiter or HTML cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TableAlignment {
     Default,
     Left,
     Center,
     Right,
+    /// HTML-only; GFM delimiter syntax cannot represent justification.
+    Justify,
 }
 
 /// A source-relative byte range for one table cell.
@@ -106,11 +108,33 @@ impl TableRowRange {
     }
 }
 
+/// A source-backed paragraph inside an HTML cell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableCellParagraph {
+    pub source: TableCellRange,
+    pub alignment: TableAlignment,
+    pub heading: Option<u8>,
+    pub disclosure_content: Option<TableCellRange>,
+    pub list: Vec<TableCellListItem>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableCellListItem {
+    pub container: TableCellRange,
+    pub opening: Option<TableCellRange>,
+    pub number: Option<u64>,
+    pub tight: bool,
+}
+
 /// A recognized table whose cells refer to the supplied source string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableBlock {
+    html: bool,
+    html_grid: Option<std::sync::Arc<crate::html::HtmlTableGrid>>,
+    cell_styles: Vec<Vec<(bool, TableAlignment)>>,
+    cell_paragraphs: Vec<Vec<Vec<TableCellParagraph>>>,
     source_range: TableCellRange,
-    header: Vec<TableCellRange>,
+    first_row: Vec<TableCellRange>,
     delimiter: Vec<TableCellRange>,
     alignments: Vec<TableAlignment>,
     rows: Vec<Vec<TableCellRange>>,
@@ -118,14 +142,228 @@ pub struct TableBlock {
 }
 
 impl TableBlock {
+    pub fn is_html(&self) -> bool {
+        self.html
+    }
+
+    /// Logical span and source owner for an HTML slot, including covered slots.
+    pub fn html_cell_owner(&self, address: TableCellAddress) -> Option<crate::html::HtmlGridCell> {
+        let grid = self.html_grid.as_ref()?;
+        if address.row() >= grid.rows || address.column() >= grid.columns {
+            return None;
+        }
+        let owner = grid.slots[address.row() * grid.columns + address.column()]?;
+        grid.cells.get(owner).copied()
+    }
+
+    fn source_cell_address(&self, address: TableCellAddress) -> Option<TableCellAddress> {
+        if self.html {
+            let owner = self.html_cell_owner(address)?;
+            Some(TableCellAddress::new(owner.source_row, owner.source_cell))
+        } else {
+            Some(address)
+        }
+    }
+
+    /// Canonical visual origin. Covered slots return the same origin.
+    pub fn cell_origin(&self, address: TableCellAddress) -> Option<TableCellAddress> {
+        if self.html {
+            let owner = self.html_cell_owner(address)?;
+            Some(TableCellAddress::new(owner.source_row, owner.column))
+        } else {
+            self.visible_cell(address).map(|_| address)
+        }
+    }
+
+    /// Expand a rectangular selection until every intersected merged cell is whole.
+    pub fn selection_bounds(
+        &self,
+        start: TableCellAddress,
+        end: TableCellAddress,
+    ) -> Option<(TableCellAddress, TableCellAddress)> {
+        self.visible_cell(start)?;
+        self.visible_cell(end)?;
+        let (mut top, mut bottom) = (start.row().min(end.row()), start.row().max(end.row()));
+        let (mut left, mut right) = (
+            start.column().min(end.column()),
+            start.column().max(end.column()),
+        );
+        if let Some(grid) = &self.html_grid {
+            loop {
+                let previous = (top, bottom, left, right);
+                for cell in &grid.cells {
+                    let cell_bottom = cell.source_row + cell.rows - 1;
+                    let cell_right = cell.column + cell.columns - 1;
+                    if cell.source_row <= bottom
+                        && cell_bottom >= top
+                        && cell.column <= right
+                        && cell_right >= left
+                    {
+                        top = top.min(cell.source_row);
+                        bottom = bottom.max(cell_bottom);
+                        left = left.min(cell.column);
+                        right = right.max(cell_right);
+                    }
+                }
+                if previous == (top, bottom, left, right) {
+                    break;
+                }
+            }
+        }
+        Some((
+            TableCellAddress::new(top, left),
+            TableCellAddress::new(bottom, right),
+        ))
+    }
+
+    pub fn cell_is_header(&self, address: TableCellAddress) -> bool {
+        if !self.html {
+            return address.row() == 0 && self.visible_cell(address).is_some();
+        }
+        let Some(address) = self.source_cell_address(address) else {
+            return false;
+        };
+        self.cell_styles
+            .get(address.row())
+            .and_then(|row| row.get(address.column()))
+            .is_some_and(|style| style.0)
+    }
+
+    pub fn cell_paragraphs(&self, address: TableCellAddress) -> &[TableCellParagraph] {
+        let Some(address) = self.source_cell_address(address) else {
+            return &[];
+        };
+        self.cell_paragraphs
+            .get(address.row())
+            .and_then(|row| row.get(address.column()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub fn cell_alignment(&self, address: TableCellAddress) -> TableAlignment {
+        let Some(address) = self.source_cell_address(address) else {
+            return TableAlignment::Default;
+        };
+        self.cell_styles
+            .get(address.row())
+            .and_then(|row| row.get(address.column()))
+            .map_or_else(
+                || {
+                    self.alignments
+                        .get(address.column())
+                        .copied()
+                        .unwrap_or(TableAlignment::Default)
+                },
+                |style| style.1,
+            )
+    }
+
+    /// Preserve only real HTML cells. Missing trailing cells have no source
+    /// range and are not synthesized by rendering.
+    pub fn from_html(table: &crate::html::HtmlTable) -> Option<Self> {
+        if table.columns == 0 || table.rows.is_empty() {
+            return None;
+        }
+        let range =
+            |r: TextRange| TableCellRange::new(r.start().get() as usize, r.end().get() as usize);
+        let cell_styles = table
+            .rows
+            .iter()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| {
+                        let alignment = match cell.alignment {
+                            None => TableAlignment::Default,
+                            Some(crate::html::HtmlAlignment::Left) => TableAlignment::Left,
+                            Some(crate::html::HtmlAlignment::Center) => TableAlignment::Center,
+                            Some(crate::html::HtmlAlignment::Right) => TableAlignment::Right,
+                            Some(crate::html::HtmlAlignment::Justify) => TableAlignment::Justify,
+                        };
+                        Some((cell.header, alignment))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            html: true,
+            html_grid: Some(std::sync::Arc::new(table.grid.clone())),
+            cell_styles,
+            cell_paragraphs: table
+                .rows
+                .iter()
+                .map(|row| {
+                    row.cells
+                        .iter()
+                        .map(|cell| {
+                            cell.paragraphs
+                                .iter()
+                                .map(|part| TableCellParagraph {
+                                    source: range(part.source),
+                                    heading: part.heading,
+                                    disclosure_content: part.disclosure_content.map(range),
+                                    list: part
+                                        .list
+                                        .iter()
+                                        .map(|item| TableCellListItem {
+                                            container: range(item.container),
+                                            opening: item.opening.map(range),
+                                            number: item.number,
+                                            tight: item.tight,
+                                        })
+                                        .collect(),
+                                    alignment: match part.alignment {
+                                        Some(crate::html::HtmlAlignment::Left) => {
+                                            TableAlignment::Left
+                                        }
+                                        Some(crate::html::HtmlAlignment::Center) => {
+                                            TableAlignment::Center
+                                        }
+                                        Some(crate::html::HtmlAlignment::Right) => {
+                                            TableAlignment::Right
+                                        }
+                                        Some(crate::html::HtmlAlignment::Justify) => {
+                                            TableAlignment::Justify
+                                        }
+                                        None => TableAlignment::Default,
+                                    },
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect(),
+            source_range: range(table.source),
+            first_row: table.rows[0]
+                .cells
+                .iter()
+                .map(|cell| range(cell.content))
+                .collect(),
+            delimiter: Vec::new(),
+            alignments: vec![TableAlignment::Default; table.columns],
+            rows: table.rows[1..]
+                .iter()
+                .map(|row| row.cells.iter().map(|cell| range(cell.content)).collect())
+                .collect(),
+            row_ranges: table
+                .rows
+                .iter()
+                .map(|row| {
+                    TableRowRange::new(
+                        row.source.start().get() as usize,
+                        row.source.end().get() as usize,
+                    )
+                })
+                .collect(),
+        })
+    }
     #[must_use]
     pub const fn source_range(&self) -> TableCellRange {
         self.source_range
     }
 
     #[must_use]
-    pub fn header(&self) -> &[TableCellRange] {
-        &self.header
+    pub fn first_row(&self) -> &[TableCellRange] {
+        &self.first_row
     }
 
     /// Returns the parser-owned delimiter row. Delimiter cells remain in the
@@ -159,6 +397,9 @@ impl TableBlock {
     #[must_use]
     pub fn row_source_range(&self, row: usize) -> Option<TableCellRange> {
         let current = *self.row_ranges.get(row)?;
+        if self.html {
+            return Some(TableCellRange::new(current.start(), current.end()));
+        }
         let end = self
             .row_ranges
             .get(row.saturating_add(1))
@@ -168,12 +409,33 @@ impl TableBlock {
 
     #[must_use]
     pub fn delimiter_source_range(&self) -> Option<TableCellRange> {
-        self.row_source_range(1)
+        if self.html {
+            None
+        } else {
+            self.row_source_range(1)
+        }
+    }
+
+    /// Stable structural source for column proportions. HTML has no delimiter
+    /// row, so use its opening table/section prefix before the first row.
+    #[must_use]
+    pub fn width_anchor_source_range(&self) -> Option<TableCellRange> {
+        if self.html {
+            let end = self.row_ranges.first()?.start();
+            (end > self.source_range.start())
+                .then(|| TableCellRange::new(self.source_range.start(), end))
+        } else {
+            self.delimiter_source_range()
+        }
     }
 
     #[must_use]
     pub fn column_count(&self) -> usize {
-        self.header.len()
+        if self.html {
+            self.alignments.len()
+        } else {
+            self.first_row.len()
+        }
     }
 
     #[must_use]
@@ -185,17 +447,18 @@ impl TableBlock {
     /// not part of this coordinate space.
     #[must_use]
     pub fn visible_row_count(&self) -> usize {
-        usize::from(!self.header.is_empty()).saturating_add(self.rows.len())
+        usize::from(self.html || !self.first_row.is_empty()).saturating_add(self.rows.len())
     }
 
     /// Returns a source-backed visible cell for a row/column address.
     #[must_use]
     pub fn visible_cell(&self, address: TableCellAddress) -> Option<TableCellRange> {
+        let address = self.source_cell_address(address)?;
         if address.column >= self.column_count() {
             return None;
         }
         if address.row == 0 {
-            return self.header.get(address.column).copied();
+            return self.first_row.get(address.column).copied();
         }
         self.rows
             .get(address.row.saturating_sub(1))
@@ -209,12 +472,19 @@ impl TableBlock {
     #[must_use]
     pub fn visible_cell_for_source(&self, offset: usize) -> Option<TableCellAddress> {
         let mut address = TableCellAddress::new(0, 0);
-        for row in std::iter::once(&self.header).chain(self.rows.iter()) {
+        for row in std::iter::once(&self.first_row).chain(self.rows.iter()) {
             for (column, cell) in row.iter().copied().enumerate() {
                 if (cell.start() == cell.end() && offset == cell.start())
                     || (cell.start() <= offset && offset <= cell.end())
                 {
-                    return Some(address);
+                    return if let Some(grid) = &self.html_grid {
+                        let owner = grid.cells.iter().find(|cell| {
+                            cell.source_row == address.row() && cell.source_cell == column
+                        })?;
+                        Some(TableCellAddress::new(owner.source_row, owner.column))
+                    } else {
+                        Some(address)
+                    };
                 }
                 address = TableCellAddress::new(address.row(), column.saturating_add(1));
             }
@@ -229,38 +499,62 @@ impl TableBlock {
         &self,
         address: TableCellAddress,
     ) -> Option<(TableCellAddress, TableCellRange)> {
-        let next_column = address.column.saturating_add(1);
-        let next = if next_column < self.column_count() {
-            TableCellAddress::new(address.row(), next_column)
-        } else {
-            TableCellAddress::new(address.row().saturating_add(1), 0)
-        };
-        self.visible_cell(next).map(|cell| (next, cell))
+        let address = self.cell_origin(address).unwrap_or(address);
+        for row in address.row()..self.visible_row_count() {
+            let first = if row == address.row() {
+                address.column().saturating_add(1)
+            } else {
+                0
+            };
+            for column in first..self.column_count() {
+                let next = TableCellAddress::new(row, column);
+                if self.cell_origin(next) != Some(next) {
+                    continue;
+                }
+                if let Some(cell) = self.visible_cell(next) {
+                    return Some((next, cell));
+                }
+            }
+        }
+        None
     }
 
-    /// Returns the previous visible cell in row-major order.
+    /// Returns the previous source-backed cell, skipping absent HTML slots.
     #[must_use]
     pub fn previous_visible_cell(
         &self,
         address: TableCellAddress,
     ) -> Option<(TableCellAddress, TableCellRange)> {
-        let previous = if address.column > 0 {
-            TableCellAddress::new(address.row(), address.column - 1)
-        } else {
-            address
-                .row()
-                .checked_sub(1)
-                .map(|row| TableCellAddress::new(row, self.column_count().saturating_sub(1)))?
-        };
-        self.visible_cell(previous).map(|cell| (previous, cell))
+        let address = self.cell_origin(address).unwrap_or(address);
+        for row in (0..=address
+            .row()
+            .min(self.visible_row_count().saturating_sub(1)))
+            .rev()
+        {
+            let end = if row == address.row() {
+                address.column().min(self.column_count())
+            } else {
+                self.column_count()
+            };
+            for column in (0..end).rev() {
+                let previous = TableCellAddress::new(row, column);
+                if self.cell_origin(previous) != Some(previous) {
+                    continue;
+                }
+                if let Some(cell) = self.visible_cell(previous) {
+                    return Some((previous, cell));
+                }
+            }
+        }
+        None
     }
 
     #[must_use]
     pub(crate) fn translated(self, offset: usize) -> Self {
         Self {
             source_range: self.source_range.translated(offset),
-            header: self
-                .header
+            first_row: self
+                .first_row
                 .into_iter()
                 .map(|range| range.translated(offset))
                 .collect(),
@@ -268,6 +562,38 @@ impl TableBlock {
                 .delimiter
                 .into_iter()
                 .map(|range| range.translated(offset))
+                .collect(),
+            html: self.html,
+            html_grid: self.html_grid,
+            cell_styles: self.cell_styles,
+            cell_paragraphs: self
+                .cell_paragraphs
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|parts| {
+                            parts
+                                .into_iter()
+                                .map(|part| TableCellParagraph {
+                                    source: part.source.translated(offset),
+                                    disclosure_content: part
+                                        .disclosure_content
+                                        .map(|range| range.translated(offset)),
+                                    list: part
+                                        .list
+                                        .iter()
+                                        .map(|item| TableCellListItem {
+                                            container: item.container.translated(offset),
+                                            opening: item.opening.map(|r| r.translated(offset)),
+                                            ..*item
+                                        })
+                                        .collect(),
+                                    ..part
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
                 .collect(),
             alignments: self.alignments,
             rows: self
@@ -306,8 +632,48 @@ impl TableBlock {
         };
         Some(Self {
             source_range: cell(self.source_range)?,
-            header: cells(&self.header)?,
+            first_row: cells(&self.first_row)?,
             delimiter: cells(&self.delimiter)?,
+            html: self.html,
+            html_grid: self.html_grid,
+            cell_styles: self.cell_styles,
+            cell_paragraphs: self
+                .cell_paragraphs
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .map(|part| {
+                                    Some(TableCellParagraph {
+                                        source: cell(part.source)?,
+                                        disclosure_content: match part.disclosure_content {
+                                            Some(range) => Some(cell(range)?),
+                                            None => None,
+                                        },
+                                        list: part
+                                            .list
+                                            .iter()
+                                            .map(|item| {
+                                                Some(TableCellListItem {
+                                                    container: cell(item.container)?,
+                                                    opening: match item.opening {
+                                                        Some(range) => Some(cell(range)?),
+                                                        None => None,
+                                                    },
+                                                    ..*item
+                                                })
+                                            })
+                                            .collect::<Option<Vec<_>>>()?,
+                                        ..part.clone()
+                                    })
+                                })
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .collect::<Option<Vec<_>>>()?,
             alignments: self.alignments,
             rows: self
                 .rows
@@ -334,15 +700,19 @@ impl TableBlock {
     #[must_use]
     pub fn from_mapped_ranges(
         source_range: TableCellRange,
-        header: Vec<TableCellRange>,
+        first_row: Vec<TableCellRange>,
         delimiter: Vec<TableCellRange>,
         alignments: Vec<TableAlignment>,
         rows: Vec<Vec<TableCellRange>>,
         row_ranges: Vec<TableRowRange>,
     ) -> Self {
         Self {
+            html: false,
+            html_grid: None,
+            cell_styles: Vec::new(),
+            cell_paragraphs: Vec::new(),
             source_range,
-            header,
+            first_row,
             delimiter,
             alignments,
             rows,
@@ -389,8 +759,12 @@ pub fn parse_table(source: &str) -> Option<TableBlock> {
         .map(|(start, line)| TableRowRange::new(*start, start.saturating_add(line.len())))
         .collect();
     Some(TableBlock {
+        html: false,
+        html_grid: None,
+        cell_styles: Vec::new(),
+        cell_paragraphs: Vec::new(),
         source_range: TableCellRange::new(0, source.len()),
-        header,
+        first_row: header,
         delimiter,
         alignments,
         rows,
@@ -643,7 +1017,7 @@ mod tests {
         let source = "| A | `x|y` | C\\|D |\n| :--- | :---: | ---: |\n| 1 | **2** | 3 |\n";
         let table = parse_table(source).expect("table should parse");
 
-        assert_eq!(table.header().len(), 3);
+        assert_eq!(table.first_row().len(), 3);
         assert_eq!(
             table.alignments(),
             &[
@@ -654,7 +1028,7 @@ mod tests {
         );
         assert_eq!(table.rows().len(), 1);
         let header = table
-            .header()
+            .first_row()
             .iter()
             .map(|range| &source[range.start()..range.end()])
             .collect::<Vec<_>>();
@@ -693,7 +1067,10 @@ mod tests {
 
         assert_eq!(table.source_range(), TableCellRange::new(start, end));
         assert_eq!(table.row_ranges().len(), 3);
-        assert_eq!(table.header()[0], TableCellRange::new(start + 2, start + 3));
+        assert_eq!(
+            table.first_row()[0],
+            TableCellRange::new(start + 2, start + 3)
+        );
         assert_eq!(
             table.delimiter()[1],
             TableCellRange::new(start + 18, start + 23)

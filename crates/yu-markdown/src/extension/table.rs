@@ -58,7 +58,7 @@ impl Extension for Table {
             }
         }
         let header_style = out.style(TextAttrs::new(TextStyle::Strong));
-        for cell in table.header() {
+        for cell in table.first_row() {
             if let Some(range) = text_range(*cell) {
                 out.mark(range, header_style);
             }
@@ -76,7 +76,7 @@ pub(crate) fn escape_ranges(cx: &BlockContext<'_>, table: &TableBlock) -> Vec<Te
         .map(|node| node.range())
         .filter(|escaped| {
             table
-                .header()
+                .first_row()
                 .iter()
                 .chain(table.rows().iter().flatten())
                 .any(|cell| {
@@ -120,7 +120,7 @@ pub(crate) fn container_table(cx: &BlockContext<'_>) -> Option<TableBlock> {
 fn hidden_ranges(table: &TableBlock) -> Vec<TextRange> {
     let mut hidden = Vec::new();
     if let Some(row) = table.row_source_range(0) {
-        append_row(row, table.header(), &mut hidden);
+        append_row(row, table.first_row(), &mut hidden);
     }
     if let Some(delimiter) = table.delimiter_source_range()
         && let Some(range) = text_range(delimiter)

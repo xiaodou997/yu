@@ -229,6 +229,60 @@ pub fn export_html_fragment(source: &str) -> String {
     comrak::markdown_to_html(source, &options())
 }
 
+/// Render one pipe table in its document context, retaining resolved references.
+/// Rows share one group so an editing operation can merge across the header.
+/// The caller must validate the generated HTML against its supported native model.
+#[must_use]
+pub fn export_table_html(source: &str, range: std::ops::Range<usize>) -> Option<String> {
+    source.get(range.clone())?;
+    let arena = comrak::Arena::new();
+    let mut options = options();
+    // The editing model also supports these source extensions. Materialize their
+    // semantics rather than turning visible formatting back into literal marks.
+    options.extension.superscript = true;
+    options.extension.subscript = true;
+    options.extension.highlight = true;
+    options.extension.footnotes = true;
+    options.extension.math_dollars = true;
+    let root = comrak::parse_document(&arena, source, &options);
+    let mut line_starts = vec![0];
+    for (offset, byte) in source.bytes().enumerate() {
+        if byte == b'\n' || (byte == b'\r' && source.as_bytes().get(offset + 1) != Some(&b'\n')) {
+            line_starts.push(offset + 1);
+        }
+    }
+    let table = root.descendants().find(|node| {
+        let data = node.data();
+        if !matches!(data.value, comrak::nodes::NodeValue::Table(_)) {
+            return false;
+        }
+        let start = data.sourcepos.start;
+        let Some(line) = start.line.checked_sub(1).and_then(|i| line_starts.get(i)) else {
+            return false;
+        };
+        let offset = line + start.column.saturating_sub(1);
+        let end = data.sourcepos.end;
+        let Some(end_line) = end.line.checked_sub(1).and_then(|i| line_starts.get(i)) else {
+            return false;
+        };
+        range.contains(&offset)
+            && end_line + end.column <= range.end
+            && source
+                .get(range.start..offset)
+                .is_some_and(|prefix| prefix.trim().is_empty())
+    })?;
+    let mut html = String::from("<table>");
+    for row in table.children() {
+        html.push_str("<tr>");
+        for cell in row.children() {
+            comrak::format_html(cell, &options, &mut html).ok()?;
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</table>");
+    Some(html)
+}
+
 /// comrak 的选项。**它必须与 Yu 自己认得的语法集合一致，不多不少。**
 ///
 /// - `tasklist`：`yu-syntax` 无条件解析 GFM 任务项（`block.rs::is_task_marker`）。
@@ -261,6 +315,25 @@ mod tests {
 
     fn whole_range(snapshot: &TextSnapshot) -> TextRange {
         TextRange::new(ByteOffset::ZERO, snapshot.len_bytes()).expect("whole range")
+    }
+
+    #[test]
+    fn table_promotion_resolves_document_references_and_requires_complete_range() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let prefix = format!("Before{ending}{ending}");
+            let table =
+                format!("| A | B |{ending}| :--- | ---: |{ending}| [中文][ref] | `a&b` |{ending}");
+            let source = format!("{prefix}{table}{ending}[ref]: https://example.com{ending}");
+            let range = prefix.len()..prefix.len() + table.len();
+            let html = export_table_html(&source, range.clone()).expect("table conversion");
+            assert!(html.contains("<a href=\"https://example.com\">中文</a>"));
+            assert!(html.contains("<code>a&amp;b</code>"));
+            assert!(html.contains("align=\"right\""));
+            assert!(!html.contains("<thead>"));
+            assert!(!html.contains("<tbody>"));
+            assert!(export_table_html(&source, range.start..range.start + 5).is_none());
+            assert!(export_table_html(&source, 0..source.len()).is_none());
+        }
     }
 
     /// **这里没有「导出的 HTML 逐字节等于某个字面量」这种断言，是有意的。**

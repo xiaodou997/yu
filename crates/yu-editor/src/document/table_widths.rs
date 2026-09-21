@@ -13,6 +13,7 @@ pub(super) struct SavedTableWidths {
 /// to the exact saved document identity and source fingerprint before restoring.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableColumnWidthRecord {
+    /// Structural width anchor: a Markdown delimiter row or HTML table prefix.
     pub delimiter: TextRange,
     pub proportions: Vec<f32>,
 }
@@ -23,10 +24,10 @@ impl LayoutContext {
         blocks
             .block_index_for_offset(delimiter.start())
             .and_then(|index| blocks.get(index))
-            .and_then(|block| yu_markdown::table_for_block(&self.markdown, block))
+            .and_then(|block| yu_markdown::native_table_for_block(&self.markdown, block))
             .is_some_and(|table| {
                 table.column_count() == columns
-                    && table.delimiter_source_range().is_some_and(|range| {
+                    && table.width_anchor_source_range().is_some_and(|range| {
                         range.start() as u64 == delimiter.start().get()
                             && range.end() as u64 == delimiter.end().get()
                     })
@@ -124,19 +125,19 @@ impl LayoutContext {
         table: &crate::TableLayout,
     ) -> Result<(), EditorDocumentError> {
         let block = self.block_at(index)?;
-        let source_table = yu_markdown::table_for_block(&self.markdown, block)
+        let source_table = yu_markdown::native_table_for_block(&self.markdown, block)
             .ok_or_else(|| LayoutError::Upstream("missing table".into()))?;
         let delimiter = source_table
-            .delimiter_source_range()
+            .width_anchor_source_range()
             .and_then(|r| {
                 TextRange::new(
                     ByteOffset::new(r.start() as u64),
                     ByteOffset::new(r.end() as u64),
                 )
             })
-            .ok_or_else(|| LayoutError::Upstream("missing table delimiter".into()))?;
+            .ok_or_else(|| LayoutError::Upstream("missing table width anchor".into()))?;
         if table.revision() != self.revision()
-            || table.delimiter_source() != Some(delimiter)
+            || table.width_anchor_source() != Some(delimiter)
             || table.column_widths().len() != source_table.column_count()
         {
             return Err(LayoutError::Upstream("stale table width geometry".into()).into());
@@ -197,7 +198,7 @@ impl LayoutContext {
 
     pub(super) fn saved_table_widths(&self, _index: usize, layout: &BlockView) -> Option<Vec<f32>> {
         let table = layout.table()?;
-        let delimiter = table.delimiter_source()?;
+        let delimiter = table.width_anchor_source()?;
         let saved = self
             .table_widths
             .iter()
@@ -339,12 +340,12 @@ impl EditorDocument {
             };
             let Some(table) = blocks
                 .get(index)
-                .and_then(|block| yu_markdown::table_for_block(&self.markdown, block))
+                .and_then(|block| yu_markdown::native_table_for_block(&self.markdown, block))
             else {
                 continue;
             };
             let valid = table.column_count() == entry.proportions.len()
-                && table.delimiter_source_range().is_some_and(|range| {
+                && table.width_anchor_source_range().is_some_and(|range| {
                     range.start() as u64 == entry.delimiter.start().get()
                         && range.end() as u64 == entry.delimiter.end().get()
                 });
@@ -384,7 +385,7 @@ mod tests {
         document
             .table_widths
             .iter()
-            .find(|w| Some(w.delimiter) == layout.table().expect("table").delimiter_source())
+            .find(|w| Some(w.delimiter) == layout.table().expect("table").width_anchor_source())
             .expect("saved")
             .proportions
             .to_vec()
@@ -398,7 +399,9 @@ mod tests {
             .markdown
             .blocks()
             .iter()
-            .position(|block| yu_markdown::table_for_block(&document.markdown, block).is_some())
+            .position(|block| {
+                yu_markdown::native_table_for_block(&document.markdown, block).is_some()
+            })
             .expect("table block");
         let markdown = document.markdown.clone();
         document.viewport.sync(&markdown).expect("sync");
@@ -440,7 +443,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(index, block)| {
-                yu_markdown::table_for_block(&document.markdown, block).map(|_| index)
+                yu_markdown::native_table_for_block(&document.markdown, block).map(|_| index)
             })
             .collect::<Vec<_>>();
         resize(&mut document, tables[0], 10.0);
@@ -467,7 +470,9 @@ mod tests {
             .markdown
             .blocks()
             .iter()
-            .position(|block| yu_markdown::table_for_block(&document.markdown, block).is_some())
+            .position(|block| {
+                yu_markdown::native_table_for_block(&document.markdown, block).is_some()
+            })
             .expect("table");
         resize(&mut document, table, 10.0);
         let widths = document.table_widths.clone();

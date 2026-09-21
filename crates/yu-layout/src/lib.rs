@@ -495,14 +495,32 @@ pub type LayoutRect = yu_core::Rect<yu_core::Block>;
 pub struct ImageIntrinsicSize {
     width: u32,
     height: u32,
+    baseline_milli: Option<u32>,
 }
 
 impl ImageIntrinsicSize {
+    /// Native vector objects can supply a source-independent baseline. Images
+    /// without one keep their existing bottom-aligned behavior.
+    pub fn with_baseline(mut self, baseline_milli: Option<u32>) -> Result<Self, LayoutError> {
+        if baseline_milli.is_some_and(|b| u64::from(b) > u64::from(self.height) * 1000) {
+            return Err(LayoutError::InvalidImageBounds);
+        }
+        self.baseline_milli = baseline_milli;
+        Ok(self)
+    }
+    pub const fn baseline_milli(self) -> Option<u32> {
+        self.baseline_milli
+    }
+
     pub fn new(width: u32, height: u32) -> Result<Self, LayoutError> {
         if width == 0 || height == 0 {
             return Err(LayoutError::InvalidImageBounds);
         }
-        Ok(Self { width, height })
+        Ok(Self {
+            width,
+            height,
+            baseline_milli: None,
+        })
     }
 
     #[must_use]

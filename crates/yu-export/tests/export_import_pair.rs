@@ -110,9 +110,9 @@ fn export_import_export_is_a_fixed_point() {
 /// 删掉用户自己写的内容）；导入拒绝（那是别人的 HTML）。所以带原始 HTML 的
 /// 文档**走不完这一圈**，而这是对的。
 #[test]
-fn semantic_raw_html_deliberately_does_not_round_trip() {
+fn unsupported_raw_html_deliberately_does_not_round_trip() {
     for source in [
-        "段落里有 <b>标签</b>\n",
+        "段落里有 <video>标签</video>\n",
         "<article>整块</article>\n",
         "<iframe src=\"https://example.com\"></iframe>\n",
     ] {
@@ -185,5 +185,17 @@ fn a_real_browser_clipboard_payload_imports_to_markdown() {
         "## 网页里的标题\n\n\
          一段带\u{a0}**粗体**\u{a0}与\u{a0}[链接 A](https://example.com/a)\u{a0}的文字。\n\n\
          - 第一项\n- 第二项\u{a0}*斜体*"
+    );
+}
+
+#[test]
+fn formatting_aliases_roundtrip_as_canonical_markdown_semantics() {
+    let source = "<b>bold</b> <i>italic</i> <s>deleted</s>";
+    let markdown = import_html_fragment(&export_html_fragment(source)).expect("supported aliases");
+    assert_eq!(markdown, "**bold** *italic* <del>deleted</del>");
+    let html = export_html_fragment(&markdown);
+    assert_eq!(
+        import_html_fragment(&html).expect("canonical roundtrip"),
+        markdown
     );
 }

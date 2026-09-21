@@ -2,11 +2,11 @@ use super::*;
 use yu_markdown::TableCellAddress;
 
 pub(super) struct TableGridPlan {
-    range: TextRange,
-    source: String,
-    edits: Vec<yu_text::Edit>,
-    anchor: usize,
-    focus: usize,
+    pub(super) range: TextRange,
+    pub(super) source: String,
+    pub(super) edits: Vec<yu_text::Edit>,
+    pub(super) anchor: usize,
+    pub(super) focus: usize,
 }
 
 impl EditorDocument {
@@ -15,7 +15,7 @@ impl EditorDocument {
     pub(super) fn markdown_table_grid(source: &str) -> Option<(usize, Vec<Arc<str>>)> {
         let source = source.trim_matches(['\r', '\n']);
         let table = yu_markdown::parse_table(source)?;
-        let cells = std::iter::once(table.header())
+        let cells = std::iter::once(table.first_row())
             .chain(table.rows().iter().map(Vec::as_slice))
             .flat_map(|row| row.iter())
             .map(|cell| Arc::from(&source[cell.start()..cell.end()]))
@@ -34,7 +34,9 @@ impl EditorDocument {
                     self.block_index_for_offset(selection.ordered_range().start())
                         .and_then(|index| self.presentation.markdown.blocks().get(index))
                         .and_then(|block| {
-                            yu_markdown::table_for_block(&self.presentation.markdown, block)
+                            self.html_table_grid(block).or_else(|| {
+                                yu_markdown::table_for_block(&self.presentation.markdown, block)
+                            })
                         })
                         .is_none()
                 })
@@ -84,11 +86,6 @@ impl EditorDocument {
         if columns == 0 || cells.is_empty() || !cells.len().is_multiple_of(columns) {
             return Err(invalid());
         }
-        // Physical newlines cannot be inserted into a Markdown pipe-table cell.
-        // Reject before mutation; the plain-text importer must encode line breaks.
-        if cells.iter().any(|cell| cell.contains(['\n', '\r'])) {
-            return Err(invalid());
-        }
         let selections = &self.presentation.selections;
         if selections.is_multiple() && selections.table_columns().is_none() {
             return Err(invalid());
@@ -103,6 +100,14 @@ impl EditorDocument {
                     .ok_or_else(invalid)?,
             )
             .ok_or_else(invalid)?;
+        if self.html_table_grid(block).is_some() {
+            return self.html_table_grid_plan(block, columns, cells, false);
+        }
+        // Physical newlines cannot be inserted into a Markdown pipe-table cell.
+        // Reject before mutation; the plain-text importer must encode line breaks.
+        if cells.iter().any(|cell| cell.contains(['\n', '\r'])) {
+            return Err(invalid());
+        }
         let table =
             yu_markdown::table_for_block(&self.presentation.markdown, block).ok_or_else(invalid)?;
         let start = table
@@ -152,7 +157,7 @@ impl EditorDocument {
             yu_markdown::quote_table_cell_input("", 0..0, text, separator).ok_or_else(invalid)
         };
         let mut patches = Vec::new();
-        for (physical_index, row) in std::iter::once(table.header())
+        for (physical_index, row) in std::iter::once(table.first_row())
             .chain(std::iter::once(table.delimiter()))
             .chain(table.rows().iter().map(Vec::as_slice))
             .enumerate()
@@ -305,6 +310,13 @@ impl EditorDocument {
             return self.paste_fragments(vec![Self::serialize_grid(columns, &cells)?.into()]);
         }
         let plan = self.table_grid_plan(columns, &cells)?;
+        self.apply_table_grid_plan(plan)
+    }
+
+    pub(super) fn apply_table_grid_plan(
+        &mut self,
+        plan: TableGridPlan,
+    ) -> Result<CommandResult, EditorDocumentError> {
         if self.snapshot().as_str()
             [plan.range.start().get() as usize..plan.range.end().get() as usize]
             == plan.source

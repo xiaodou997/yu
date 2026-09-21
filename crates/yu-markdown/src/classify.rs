@@ -41,6 +41,7 @@ pub(crate) fn presentation_kind(
             };
         }
         NodeKind::CodeBlock => return BlockKind::IndentedCode,
+        NodeKind::FrontMatter => return BlockKind::FrontMatter,
         NodeKind::HorizontalRule => return BlockKind::ThematicBreak,
         NodeKind::LinkReference => return BlockKind::ReferenceDefinition,
         NodeKind::HtmlBlock | NodeKind::CommentBlock | NodeKind::ProcessingInstructionBlock => {
@@ -202,6 +203,7 @@ pub(crate) fn classify(
         (NodeKind::HorizontalRule, BlockShape::Plain) => BlockKind::ThematicBreak,
         // `NodeKind::CodeBlock` 是缩进代码；围栏是 `FencedCode`，在上面。
         (NodeKind::CodeBlock, BlockShape::Plain) => BlockKind::IndentedCode,
+        (NodeKind::FrontMatter, BlockShape::Plain) => BlockKind::FrontMatter,
         (NodeKind::HtmlBlock, BlockShape::Plain) => BlockKind::HtmlBlock,
         // 块横跨了好几个树块，树说不出它是什么。`- a\n<div>\nx` 就是一个：
         // 行扫描器把 `<div>` 当成列表项的惰性延续收进同一个块，树把它拆成
@@ -290,7 +292,7 @@ mod tests {
     #[test]
     fn the_tree_tells_the_three_shapes_that_have_no_line_prefix_apart() {
         for (source, expected) in [
-            ("---\n", BlockKind::ThematicBreak),
+            ("---\n", BlockKind::FrontMatter),
             ("***\n", BlockKind::ThematicBreak),
             ("___\n", BlockKind::ThematicBreak),
             ("    code\n", BlockKind::IndentedCode),

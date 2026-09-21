@@ -12,6 +12,7 @@ repository.workspace = true
 crate-type = ["staticlib"]
 
 [dependencies]
+serde_json = "1"
 yu-core = { path = "../yu-core" }
 yu-assets = { path = "../yu-assets" }
 yu-editor = { path = "../yu-editor" }
@@ -27,7 +28,7 @@ yu-render = { path = "../yu-render" }
 yu-render-macos = { path = "../../platform/macos/yu-render-macos" }
 yu-workspace = { path = "../yu-workspace" }
 yu-markdown = { path = "../yu-markdown" }
-yu-embedded-math = { path = "../yu-embedded-math" }
+yu-embedded-client = { path = "../yu-embedded-client" }
 
 [lints]
 workspace = true

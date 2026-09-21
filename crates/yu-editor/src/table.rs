@@ -59,6 +59,7 @@ use crate::visual::VisualText;
 /// delimiter row is intentionally not a visible cell row.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TableCellLayout {
+    header: bool,
     row: usize,
     column: usize,
     source: TextRange,
@@ -71,6 +72,9 @@ pub struct TableCellLayout {
 }
 
 impl TableCellLayout {
+    pub const fn is_header(self) -> bool {
+        self.header
+    }
     #[must_use]
     pub const fn row(self) -> usize {
         self.row
@@ -407,7 +411,7 @@ fn validate_pointer(pointer: f32) -> Result<(), TableResizeGestureError> {
 pub struct TableLayout {
     revision: Revision,
     source_range: TextRange,
-    delimiter_source: Option<TextRange>,
+    width_anchor_source: Option<TextRange>,
     column_widths: Vec<f32>,
     padding: f32,
     border_width: f32,
@@ -419,6 +423,36 @@ pub struct TableLayout {
     /// 每一格自己那一份布局，与 `cells` 同序、等长。零基视觉空间。
     cell_layouts: Vec<BlockLayout>,
     row_sources: Vec<TextRange>,
+    pub(crate) markers: Vec<TableListMarker>,
+    paragraphs: Vec<TableParagraphGeometry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TableParagraphGeometry {
+    row: usize,
+    column: usize,
+    source: TextRange,
+    visual: VisualRange,
+    top: f32,
+    bottom: f32,
+    disclosure_content: Option<(TextRange, VisualRange)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TableListMarker {
+    pub source: TextRange,
+    pub visual: VisualOffset,
+    pub row: usize,
+    pub origin: LayoutPoint,
+    pub shaped: Option<yu_core::ShapedText>,
+    pub scale: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CellParagraphStyle {
+    justify: bool,
+    heading: Option<u8>,
+    indent: f32,
 }
 
 /// 一行在表格局部坐标里的位置与高度。
@@ -446,22 +480,45 @@ impl TableRowGeometry {
 /// 摆放全部由 [`BlockLayout`] 一份代码做——共用代码路径的差分是自证的，
 /// 所以这里只留一个可替换的点。
 pub(crate) trait CellBackend {
+    fn marker(&self, text: &str, scale: f32)
+    -> Result<crate::blockinput::MarkerDraft, LayoutError>;
     fn layout(
         &self,
         input: LayoutInput<'_>,
         config: LayoutConfig,
         styles: &BlockStyleTable,
         widgets: &BlockWidgets<'_>,
+        style: CellParagraphStyle,
     ) -> Result<BlockLayout, LayoutError>;
 }
 
-struct CellLineStyles(f32, yu_core::FontStrutMode);
+struct CellLineStyles(f32, yu_core::FontStrutMode, bool, f32);
 impl LineStyleTable for CellLineStyles {
     fn attrs(&self, _: yu_core::LineStyleId) -> Option<LineAttrs> {
-        LineAttrs::new(0.0, self.0)
+        LineAttrs::new(self.3, self.0)
             .ok()
-            .map(|attrs| attrs.with_font_struts(self.1))
+            .map(|attrs| attrs.with_font_struts(self.1).with_justification(self.2))
     }
+}
+
+fn cell_line_style(config: LayoutConfig, style: CellParagraphStyle) -> CellLineStyles {
+    let theme = config.theme().spec();
+    let (height, struts) = style.heading.map_or(
+        (theme.body_line_ratio, config.theme().body_font_struts()),
+        |level| {
+            let index = usize::from(level - 1);
+            (
+                theme.heading_sizes[index] * theme.heading_lines[index],
+                yu_core::FontStrutMode::DeclaredFonts,
+            )
+        },
+    );
+    CellLineStyles(
+        crate::layout_tokens::resolved_line_height(config, height) / config.line_height(),
+        struts,
+        style.justify,
+        style.indent,
+    )
 }
 
 fn cell_lines(input: LayoutInput<'_>) -> Result<[LineSpan; 1], LayoutError> {
@@ -475,12 +532,27 @@ fn cell_lines(input: LayoutInput<'_>) -> Result<[LineSpan; 1], LayoutError> {
 pub(crate) struct MetricsCells<'a, M>(pub(crate) &'a M);
 
 impl<M: ClusterMetrics> CellBackend for MetricsCells<'_, M> {
+    fn marker(
+        &self,
+        text: &str,
+        scale: f32,
+    ) -> Result<crate::blockinput::MarkerDraft, LayoutError> {
+        let mut result = crate::blockinput::measure_marker_parts(
+            TextRange::empty(ByteOffset::ZERO),
+            text,
+            self.0,
+        )?;
+        result.advance *= scale;
+        result.gap *= scale;
+        Ok(result)
+    }
     fn layout(
         &self,
         input: LayoutInput<'_>,
         config: LayoutConfig,
         styles: &BlockStyleTable,
         widgets: &BlockWidgets<'_>,
+        style: CellParagraphStyle,
     ) -> Result<BlockLayout, LayoutError> {
         let lines = cell_lines(input)?;
         BlockLayout::build_all(
@@ -489,10 +561,7 @@ impl<M: ClusterMetrics> CellBackend for MetricsCells<'_, M> {
             styles,
             widgets,
             // Cells and body paragraphs share the theme's font-strut policy.
-            &CellLineStyles(
-                config.theme().spec().body_line_ratio,
-                config.theme().body_font_struts(),
-            ),
+            &cell_line_style(config, style),
             self.0,
         )
     }
@@ -502,12 +571,25 @@ impl<M: ClusterMetrics> CellBackend for MetricsCells<'_, M> {
 pub(crate) struct ShapedCells<'a, S>(pub(crate) &'a S);
 
 impl<S: ShapingProvider> CellBackend for ShapedCells<'_, S> {
+    fn marker(
+        &self,
+        text: &str,
+        scale: f32,
+    ) -> Result<crate::blockinput::MarkerDraft, LayoutError> {
+        crate::blockinput::shape_marker_parts_at_scale(
+            TextRange::empty(ByteOffset::ZERO),
+            text,
+            self.0,
+            scale,
+        )
+    }
     fn layout(
         &self,
         input: LayoutInput<'_>,
         config: LayoutConfig,
         styles: &BlockStyleTable,
         widgets: &BlockWidgets<'_>,
+        style: CellParagraphStyle,
     ) -> Result<BlockLayout, LayoutError> {
         let lines = cell_lines(input)?;
         BlockLayout::build_shaped(
@@ -516,10 +598,7 @@ impl<S: ShapingProvider> CellBackend for ShapedCells<'_, S> {
             styles,
             widgets,
             // Cells and body paragraphs share the theme's font-strut policy.
-            &CellLineStyles(
-                config.theme().spec().body_line_ratio,
-                config.theme().body_font_struts(),
-            ),
+            &cell_line_style(config, style),
             self.0,
         )
     }
@@ -565,16 +644,19 @@ impl TableLayout {
         let config = config.with_max_width(input.available_width());
         config.validate()?;
         let column_count = table.column_count();
-        if column_count == 0 || table.delimiter().len() != column_count {
+        if column_count == 0 || (!table.is_html() && table.delimiter().len() != column_count) {
             return Err(LayoutError::Upstream(
                 "table columns are inconsistent".into(),
             ));
         }
 
         let mut rows = Vec::with_capacity(table.body_row_count().saturating_add(1));
-        rows.push(table.header().to_vec());
+        rows.push(table.first_row().to_vec());
         rows.extend(table.rows().iter().cloned());
-        if rows.iter().any(|row| row.len() != column_count) {
+        if rows
+            .iter()
+            .any(|row| row.len() > column_count || (!table.is_html() && row.len() != column_count))
+        {
             return Err(LayoutError::Upstream(
                 "table body row is inconsistent".into(),
             ));
@@ -586,28 +668,99 @@ impl TableLayout {
         let padding = theme.table_padding_x * zoom;
         let padding_y = theme.table_padding_y * zoom;
         let border_width = yu_core::ThemeSpec::TABLE_BORDER_WIDTH * zoom;
+        let mut marker_cache = std::collections::HashMap::new();
+        let mut list_gutters = std::collections::HashMap::<_, f32>::new();
+        let marker_text = |item: &yu_markdown::TableCellListItem, depth: usize| {
+            item.number.map_or_else(
+                || {
+                    config
+                        .theme()
+                        .unordered_marker((depth + 1).min(255) as u8)
+                        .to_owned()
+                },
+                |number| format!("{number}."),
+            )
+        };
+        for row in 0..table.visible_row_count() {
+            for column in 0..column_count {
+                for paragraph in
+                    table.cell_paragraphs(yu_markdown::TableCellAddress::new(row, column))
+                {
+                    for (depth, item) in paragraph.list.iter().enumerate() {
+                        let text = marker_text(item, depth);
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            marker_cache.entry(text.clone())
+                        {
+                            entry.insert(backend.marker(&text, 1.0)?);
+                        }
+                        let marker = &marker_cache[&text];
+                        let width = (marker.advance + marker.gap).max(theme.list_indent * zoom);
+                        list_gutters
+                            .entry(item.container)
+                            .and_modify(|value| *value = value.max(width))
+                            .or_insert(width);
+                    }
+                }
+            }
+        }
+        let gutter_width = |paragraph: &yu_markdown::TableCellParagraph| -> f32 {
+            paragraph
+                .list
+                .iter()
+                .map(|item| list_gutters[&item.container])
+                .sum()
+        };
         let mut natural_widths = vec![padding * 2.0; column_count];
         let mut measured_rows = Vec::with_capacity(rows.len());
-        for row in &rows {
+        for (row_index, row) in rows.iter().enumerate() {
             let mut measured_row = Vec::with_capacity(column_count);
             for (column, cell) in row.iter().copied().enumerate() {
+                let column = table
+                    .visible_cell_for_source(cell.start())
+                    .map_or(column, |address| address.column());
+                let span = table
+                    .html_cell_owner(yu_markdown::TableCellAddress::new(row_index, column))
+                    .map_or(1, |owner| owner.columns);
                 let source_range = table_cell_range(cell)?;
-                let (cell_visual, content_width) =
+                let (cell_visual, mut content_width) =
                     measure_cell_content(visual, input, widgets, config, source_range, backend)?;
+                let paragraphs =
+                    table.cell_paragraphs(yu_markdown::TableCellAddress::new(row_index, column));
+                if !paragraphs.is_empty() {
+                    content_width = 0.0;
+                    for paragraph in paragraphs {
+                        content_width = content_width.max(
+                            measure_cell_content(
+                                visual,
+                                input,
+                                widgets,
+                                config,
+                                table_cell_range(paragraph.source)?,
+                                backend,
+                            )?
+                            .1 + gutter_width(paragraph),
+                        );
+                    }
+                }
                 if !content_width.is_finite() || content_width < 0.0 {
                     return Err(LayoutError::InvalidMetrics(content_width.to_bits()));
                 }
-                natural_widths[column] = natural_widths[column]
-                    .max(
-                        content_width
-                            + padding * 2.0
-                            + border_width
-                                * (1.0
-                                    + if column == 0 { 0.5 } else { 0.0 }
-                                    + if column + 1 == column_count { 0.5 } else { 0.0 }),
-                    )
-                    .max(padding * 2.0);
-                measured_row.push((source_range, cell_visual, content_width));
+                let required = content_width
+                    + padding * 2.0
+                    + border_width
+                        * (1.0
+                            + if column == 0 { 0.5 } else { 0.0 }
+                            + if column + span == column_count {
+                                0.5
+                            } else {
+                                0.0
+                            });
+                let current: f32 = natural_widths[column..column + span].iter().sum();
+                let extra = ((required - current) / span as f32).max(0.0);
+                for width in &mut natural_widths[column..column + span] {
+                    *width += extra;
+                }
+                measured_row.push((column, span, source_range, cell_visual, content_width));
             }
             measured_rows.push(measured_row);
         }
@@ -633,62 +786,239 @@ impl TableLayout {
 
         // 第二步：每一格按**自己那一列**的最终宽度排一次。压缩过的列在这里
         // 断行，所以内容不会铺出格子外面去。
-        let alignments = table.alignments();
         let row_count = rows.len();
         let mut cells = Vec::with_capacity(row_count.saturating_mul(column_count));
         let mut cell_layouts = Vec::with_capacity(cells.capacity());
+        let mut markers = Vec::new();
+        let mut paragraph_geometry = Vec::new();
         let mut geometry = Vec::with_capacity(row_count);
         let mut y = 0.0_f32;
+        let mut height_constraints = Vec::new();
         for (row_index, measured_cells) in measured_rows.iter().enumerate() {
             let border_top = border_width * if row_index == 0 { 1.0 } else { 0.5 };
-            let border_bottom = border_width * if row_index + 1 == row_count { 1.0 } else { 0.5 };
-            let mut x = origin_x;
             let mut height = config.line_height();
             let first_cell = cells.len();
-            for (column, (source, cell_visual, content_width)) in
-                measured_cells.iter().copied().enumerate()
+            for (column, span, source, cell_visual, content_width) in measured_cells.iter().copied()
             {
-                let width = column_widths[column];
+                let width = column_widths[column..column + span].iter().sum::<f32>();
+                let x = origin_x + column_widths[..column].iter().sum::<f32>();
+                let row_span = table
+                    .html_cell_owner(yu_markdown::TableCellAddress::new(row_index, column))
+                    .map_or(1, |owner| owner.rows);
+                let border_bottom = border_width
+                    * if row_index + row_span == row_count {
+                        1.0
+                    } else {
+                        0.5
+                    };
                 // In very narrow containers preserve a usable text box before
                 // padding; padding must never place text outside its column.
                 let border_left = border_width * if column == 0 { 1.0 } else { 0.5 };
-                let border_right =
-                    border_width * if column + 1 == column_count { 1.0 } else { 0.5 };
+                let border_right = border_width
+                    * if column + span == column_count {
+                        1.0
+                    } else {
+                        0.5
+                    };
                 let inner_width = (width - border_left - border_right).max(f32::EPSILON);
                 let cell_padding =
                     padding.min(((inner_width - config.default_advance()) * 0.5).max(0.0));
                 let available = (inner_width - cell_padding * 2.0).max(f32::EPSILON);
-                let alignment = match alignments[column] {
+                let cell_alignment =
+                    table.cell_alignment(yu_markdown::TableCellAddress::new(row_index, column));
+                let alignment = match cell_alignment {
                     TableAlignment::Center => yu_layout::LineAlignment::Center,
                     TableAlignment::Right => yu_layout::LineAlignment::Right,
-                    TableAlignment::Default | TableAlignment::Left => {
+                    TableAlignment::Default | TableAlignment::Left | TableAlignment::Justify => {
                         yu_layout::LineAlignment::Left
                     }
                 };
-                let slice = input.slice(cell_visual, source)?;
-                let layout = backend
-                    .layout(
-                        slice.layout_input(),
+                let paragraphs =
+                    table.cell_paragraphs(yu_markdown::TableCellAddress::new(row_index, column));
+                let cell_origin = LayoutPoint::new(
+                    x + border_left.min(width * 0.5) + cell_padding,
+                    y + border_top + padding_y,
+                );
+                let layout = if paragraphs.is_empty() {
+                    let slice = input.slice(cell_visual, source)?;
+                    backend
+                        .layout(
+                            slice.layout_input(),
+                            config.with_max_width(available),
+                            input.styles(),
+                            widgets,
+                            CellParagraphStyle {
+                                justify: cell_alignment == TableAlignment::Justify,
+                                ..Default::default()
+                            },
+                        )?
+                        .align_lines(alignment, slice.layout_input().text())?
+                } else {
+                    let mut parts = Vec::with_capacity(paragraphs.len());
+                    let mut y = 0.0;
+                    for (index, paragraph) in paragraphs.iter().enumerate() {
+                        let range = table_cell_range(paragraph.source)?;
+                        let range_visual = visual.content_visual_range(range).map_err(upstream)?;
+                        let start = range_visual.start();
+                        let slice = input.slice(range_visual, range)?;
+                        let align = if paragraph.alignment == TableAlignment::Default {
+                            cell_alignment
+                        } else {
+                            paragraph.alignment
+                        };
+                        let alignment = match align {
+                            TableAlignment::Center => yu_layout::LineAlignment::Center,
+                            TableAlignment::Right => yu_layout::LineAlignment::Right,
+                            _ => yu_layout::LineAlignment::Left,
+                        };
+                        let natural_indent = gutter_width(paragraph);
+                        let indent =
+                            natural_indent.min((available - config.line_height()).max(0.0));
+                        let gutter_scale = if natural_indent > 0.0 {
+                            indent / natural_indent
+                        } else {
+                            1.0
+                        };
+                        let part = backend
+                            .layout(
+                                slice.layout_input(),
+                                config.with_max_width(available),
+                                input.styles(),
+                                widgets,
+                                CellParagraphStyle {
+                                    justify: align == TableAlignment::Justify,
+                                    heading: paragraph.heading,
+                                    indent,
+                                },
+                            )?
+                            .align_lines(alignment, slice.layout_input().text())?;
+                        if index > 0 {
+                            let before = paragraph
+                                .heading
+                                .map_or(theme.paragraph_margin_before, |level| {
+                                    theme.heading_margin_before[usize::from(level - 1)]
+                                });
+                            let after = paragraphs[index - 1]
+                                .heading
+                                .map_or(theme.paragraph_margin, |level| {
+                                    theme.heading_margin_after[usize::from(level - 1)]
+                                });
+                            let shared_list = paragraph.list.iter().any(|item| {
+                                paragraphs[index - 1]
+                                    .list
+                                    .iter()
+                                    .any(|previous| previous.container == item.container)
+                            });
+                            let tight = shared_list
+                                && paragraph.list.last().is_some_and(|item| item.tight)
+                                && paragraphs[index - 1]
+                                    .list
+                                    .last()
+                                    .is_some_and(|item| item.tight)
+                                && paragraph.heading.is_none()
+                                && paragraphs[index - 1].heading.is_none();
+                            if !tight {
+                                y += before.max(after) * config.line_height();
+                            }
+                        }
+                        let baseline = part
+                            .lines()
+                            .first()
+                            .map_or(0.0, |line| line.y() + line.baseline());
+                        let mut gutter_end = 0.0;
+                        for (depth, item) in paragraph.list.iter().enumerate() {
+                            let measured = &marker_cache[&marker_text(item, depth)];
+                            let unit = list_gutters[&item.container] * gutter_scale;
+                            gutter_end += unit;
+                            if let Some(opening) = item.opening {
+                                let scale = if measured.advance > 0.0 {
+                                    ((unit - measured.gap * gutter_scale).max(0.0)
+                                        / measured.advance)
+                                        .min(1.0)
+                                } else {
+                                    1.0
+                                };
+                                let scaled;
+                                let rendered = if scale > 0.0 && scale < 1.0 {
+                                    scaled = backend.marker(&marker_text(item, depth), scale)?;
+                                    &scaled
+                                } else {
+                                    measured
+                                };
+                                markers.push(TableListMarker {
+                                    source: table_cell_range(opening)?,
+                                    visual: start,
+                                    row: row_index,
+                                    origin: LayoutPoint::new(
+                                        cell_origin.x() + gutter_end
+                                            - measured.gap * gutter_scale
+                                            - rendered.advance,
+                                        cell_origin.y() + y + baseline,
+                                    ),
+                                    shaped: rendered.shaped.clone(),
+                                    scale,
+                                });
+                            }
+                        }
+                        let end_y = y + part.height();
+                        paragraph_geometry.push(TableParagraphGeometry {
+                            row: row_index,
+                            column,
+                            source: range,
+                            disclosure_content: paragraph
+                                .disclosure_content
+                                .map(|source| {
+                                    let source = table_cell_range(source)?;
+                                    Ok::<_, LayoutError>((
+                                        source,
+                                        visual.content_visual_range(source).map_err(upstream)?,
+                                    ))
+                                })
+                                .transpose()?,
+                            visual: range_visual,
+                            top: cell_origin.y() + y,
+                            bottom: cell_origin.y() + end_y,
+                        });
+                        parts.push((
+                            VisualOffset::new(
+                                start
+                                    .get()
+                                    .checked_sub(cell_visual.start().get())
+                                    .ok_or(LayoutError::OffsetOverflow)?,
+                            ),
+                            y,
+                            part,
+                        ));
+                        y = end_y;
+                    }
+                    BlockLayout::stack_paragraphs(
+                        parts,
+                        VisualOffset::new(cell_visual.end().get() - cell_visual.start().get()),
                         config.with_max_width(available),
-                        input.styles(),
-                        widgets,
                     )?
-                    .align_lines(alignment)?;
-                height = height.max(layout.height() + padding_y * 2.0 + border_top + border_bottom);
+                };
+                let required_height =
+                    layout.height() + padding_y * 2.0 + border_top + border_bottom;
+                if row_span == 1 {
+                    height = height.max(required_height);
+                } else {
+                    height_constraints.push((row_index, row_span, required_height));
+                }
                 cells.push(TableCellLayout {
+                    header: table
+                        .cell_is_header(yu_markdown::TableCellAddress::new(row_index, column)),
                     row: geometry.len(),
                     column,
                     source,
                     visual: cell_visual,
                     // 高度先记这一行的下限，整行量完再统一补齐。
                     bounds: LayoutRect::new(x, y, width, config.line_height())?,
-                    alignment: alignments[column],
+                    alignment: cell_alignment,
                     content_x: x + border_left.min(width * 0.5) + cell_padding,
                     content_y: y + border_top + padding_y,
                     content_width,
                 });
                 cell_layouts.push(layout);
-                x += width;
             }
             if !height.is_finite() {
                 return Err(LayoutError::InvalidMetrics(height.to_bits()));
@@ -699,11 +1029,50 @@ impl TableLayout {
             geometry.push(TableRowGeometry { y, height });
             y += height;
         }
+        let old_tops: Vec<_> = geometry.iter().map(|row| row.y).collect();
+        for (first, span, required) in height_constraints {
+            let available: f32 = geometry[first..first + span]
+                .iter()
+                .map(|row| row.height)
+                .sum();
+            let extra = ((required - available) / span as f32).max(0.0);
+            for row in &mut geometry[first..first + span] {
+                row.height += extra;
+            }
+        }
+        y = 0.0;
+        for row in &mut geometry {
+            row.y = y;
+            y += row.height;
+        }
+        for cell in &mut cells {
+            let span = table
+                .html_cell_owner(yu_markdown::TableCellAddress::new(cell.row, cell.column))
+                .map_or(1, |owner| owner.rows);
+            let top = geometry[cell.row].y;
+            let height = geometry[cell.row..cell.row + span]
+                .iter()
+                .map(|row| row.height)
+                .sum();
+            cell.content_y += top - old_tops[cell.row];
+            cell.bounds = LayoutRect::new(cell.bounds.x(), top, cell.bounds.width(), height)?;
+        }
+        for paragraph in &mut paragraph_geometry {
+            let shift = geometry[paragraph.row].y - old_tops[paragraph.row];
+            paragraph.top += shift;
+            paragraph.bottom += shift;
+        }
+        for marker in &mut markers {
+            marker.origin = LayoutPoint::new(
+                marker.origin.x(),
+                marker.origin.y() + geometry[marker.row].y - old_tops[marker.row],
+            );
+        }
         let bounds = LayoutRect::new(origin_x, 0.0, total_width, y)?;
 
         let row_sources = (0..row_count)
             .map(|row| {
-                let physical_row = row.saturating_add(usize::from(row > 0));
+                let physical_row = row.saturating_add(usize::from(row > 0 && !table.is_html()));
                 table
                     .row_source_range(physical_row)
                     .ok_or(LayoutError::OffsetOverflow)
@@ -714,8 +1083,8 @@ impl TableLayout {
         Ok(Self {
             revision: visual.revision(),
             source_range: visual.source_range(),
-            delimiter_source: table
-                .delimiter_source_range()
+            width_anchor_source: table
+                .width_anchor_source_range()
                 .map(table_cell_range)
                 .transpose()?,
             column_widths,
@@ -725,6 +1094,8 @@ impl TableLayout {
             bounds,
             cells,
             cell_layouts,
+            markers,
+            paragraphs: paragraph_geometry,
             row_sources,
         })
     }
@@ -740,8 +1111,8 @@ impl TableLayout {
     }
 
     #[must_use]
-    pub const fn delimiter_source(&self) -> Option<TextRange> {
-        self.delimiter_source
+    pub const fn width_anchor_source(&self) -> Option<TextRange> {
+        self.width_anchor_source
     }
 
     #[must_use]
@@ -795,7 +1166,24 @@ impl TableLayout {
     /// 落空的话光标会跳到整块的末尾去。
     #[must_use]
     pub(crate) fn cell_at(&self, point: LayoutPoint) -> Option<(TableCellLayout, &BlockLayout)> {
-        let row = self.row_at(point.y() - self.bounds.y());
+        if let Some((index, cell)) = self.cells.iter().enumerate().find(|(_, cell)| {
+            point.x() >= cell.bounds.x()
+                && point.x() < cell.bounds.x() + cell.bounds.width()
+                && point.y() >= cell.bounds.y()
+                && point.y() < cell.bounds.y() + cell.bounds.height()
+        }) {
+            return Some((*cell, &self.cell_layouts[index]));
+        }
+        let mut row = self.row_at(point.y() - self.bounds.y());
+        if !self.cells.iter().any(|cell| cell.row == row) {
+            // Empty HTML rows have geometry but no editable source cell.
+            // Anchor clicks to the nearest real row instead of hidden tags.
+            row = self
+                .cells
+                .iter()
+                .min_by_key(|cell| cell.row.abs_diff(row))?
+                .row;
+        }
         let mut best: Option<usize> = None;
         for (index, cell) in self.cells.iter().enumerate() {
             if cell.row != row {
@@ -814,6 +1202,44 @@ impl TableLayout {
         }
         let index = best?;
         Some((self.cells[index], self.cell_layouts.get(index)?))
+    }
+
+    pub(crate) fn paragraph_boundary_source(
+        &self,
+        text: &VisualText,
+        cell: TableCellLayout,
+        point: LayoutPoint,
+        visual: VisualOffset,
+    ) -> Option<ByteOffset> {
+        let distance = |part: &TableParagraphGeometry| {
+            (part.top - point.y()).max(0.0).max(point.y() - part.bottom)
+        };
+        let paragraph = self
+            .paragraphs
+            .iter()
+            .filter(|part| part.row == cell.row && part.column == cell.column)
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)))?;
+        if let Some((source, content)) = paragraph.disclosure_content {
+            if visual == content.start() {
+                return Some(source.start());
+            }
+            if visual == content.end() {
+                return Some(source.end());
+            }
+        }
+        let bias = if visual == paragraph.visual.start() {
+            Bias::After
+        } else if visual == paragraph.visual.end() {
+            Bias::Before
+        } else {
+            return None;
+        };
+        Some(
+            text.visual_to_source(visual, bias)
+                .ok()?
+                .max(paragraph.source.start())
+                .min(paragraph.source.end()),
+        )
     }
 
     /// Source offsets retain the owning cell even when several empty cells
@@ -953,20 +1379,14 @@ impl TableLayout {
         {
             return Ok(None);
         }
-        let row = self.row_at(point.y() - self.bounds.y());
-        let column = self
-            .cells
-            .iter()
-            .find(|cell| {
-                cell.row == row
-                    && point.x() >= cell.bounds.x()
-                    && point.x() < cell.bounds.x() + cell.bounds.width()
-            })
-            .or_else(|| {
-                self.cells.iter().rev().find(|cell| {
-                    cell.row == row && point.x() == self.bounds.x() + self.bounds.width()
-                })
-            });
+        let column = self.cells.iter().find(|cell| {
+            point.y() >= cell.bounds.y()
+                && point.y() < cell.bounds.y() + cell.bounds.height()
+                && point.x() >= cell.bounds.x()
+                && (point.x() < cell.bounds.x() + cell.bounds.width()
+                    || (point.x() == self.bounds.x() + self.bounds.width()
+                        && point.x() == cell.bounds.x() + cell.bounds.width()))
+        });
         Ok(column.map(|cell| TableLayoutHit {
             row: cell.row,
             column: cell.column,
@@ -974,6 +1394,100 @@ impl TableLayout {
             bounds: cell.bounds,
             point,
         }))
+    }
+
+    /// Visible portions of a logical divider, excluding merged-cell interiors.
+    pub fn divider_segments(&self, target: TableResizeTarget) -> Vec<(f32, f32)> {
+        let (position, start, end, vertical) = match target {
+            TableResizeTarget::Column { index }
+                if index < self.column_widths.len().saturating_sub(1) =>
+            {
+                (
+                    self.bounds.x() + self.column_widths[..=index].iter().sum::<f32>(),
+                    self.bounds.y(),
+                    self.bounds.y() + self.bounds.height(),
+                    true,
+                )
+            }
+            TableResizeTarget::Row { index } if index < self.rows.len().saturating_sub(1) => (
+                self.bounds.y() + self.rows[index].y + self.rows[index].height,
+                self.bounds.x(),
+                self.bounds.x() + self.bounds.width(),
+                false,
+            ),
+            _ => return Vec::new(),
+        };
+        let mut covered = Vec::new();
+        for cell in &self.cells {
+            let bounds = cell.bounds;
+            let (low, high, from, to) = if vertical {
+                (
+                    bounds.x(),
+                    bounds.x() + bounds.width(),
+                    bounds.y(),
+                    bounds.y() + bounds.height(),
+                )
+            } else {
+                (
+                    bounds.y(),
+                    bounds.y() + bounds.height(),
+                    bounds.x(),
+                    bounds.x() + bounds.width(),
+                )
+            };
+            // Small roundoff at adjacent cell edges is not a merged interior.
+            if position > low + 0.001 && position < high - 0.001 {
+                covered.push((from, to));
+            }
+        }
+        covered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut cursor = start;
+        let mut result = Vec::new();
+        for (from, to) in covered {
+            if from > cursor {
+                result.push((cursor, from.min(end)));
+            }
+            cursor = cursor.max(to);
+        }
+        if cursor < end {
+            result.push((cursor, end));
+        }
+        result
+    }
+
+    /// Border geometry shared by painting and merged-divider hit testing.
+    pub fn border_rects(&self) -> Result<Vec<LayoutRect>, yu_core::GeometryError> {
+        let b = self.bounds;
+        let tx = self.border_width.min(b.width());
+        let ty = self.border_width.min(b.height());
+        if tx <= 0.0 || ty <= 0.0 {
+            return Ok(Vec::new());
+        }
+        let mut result = vec![
+            LayoutRect::new(b.x(), b.y(), tx, b.height())?,
+            LayoutRect::new(b.x() + b.width() - tx, b.y(), tx, b.height())?,
+            LayoutRect::new(b.x(), b.y(), b.width(), ty)?,
+            LayoutRect::new(b.x(), b.y() + b.height() - ty, b.width(), ty)?,
+        ];
+        let mut x = b.x();
+        for (index, width) in self
+            .column_widths
+            .iter()
+            .enumerate()
+            .take(self.column_widths.len().saturating_sub(1))
+        {
+            x += width;
+            for (from, to) in self.divider_segments(TableResizeTarget::Column { index }) {
+                result.push(LayoutRect::new(x - tx * 0.5, from, tx, to - from)?);
+            }
+        }
+        for index in 0..self.rows.len().saturating_sub(1) {
+            let y = b.y() + self.rows[index].y + self.rows[index].height;
+            for (from, to) in self.divider_segments(TableResizeTarget::Row { index }) {
+                result.push(LayoutRect::new(from, y - ty * 0.5, to - from, ty)?);
+            }
+        }
+        Ok(result)
     }
 
     /// Finds an internal column or row divider within `tolerance` logical
@@ -1010,6 +1524,10 @@ impl TableLayout {
         {
             x += width;
             if (point.x() - x).abs() <= tolerance
+                && self
+                    .divider_segments(TableResizeTarget::Column { index })
+                    .iter()
+                    .any(|(from, to)| point.y() >= *from && point.y() <= *to)
                 && point.y() >= self.bounds.y()
                 && point.y() <= self.bounds.y() + self.bounds.height()
             {
@@ -1024,6 +1542,10 @@ impl TableLayout {
             let geometry = self.rows[row];
             let y = self.bounds.y() + geometry.y + geometry.height;
             if (point.y() - y).abs() <= tolerance
+                && self
+                    .divider_segments(TableResizeTarget::Row { index: row })
+                    .iter()
+                    .any(|(from, to)| point.x() >= *from && point.x() <= *to)
                 && point.x() >= self.bounds.x()
                 && point.x() <= self.bounds.x() + self.bounds.width()
             {
@@ -1043,8 +1565,8 @@ impl TableLayout {
         Ok(Self {
             revision: self.revision,
             source_range: shift_range(self.source_range, delta)?,
-            delimiter_source: self
-                .delimiter_source
+            width_anchor_source: self
+                .width_anchor_source
                 .map(|range| shift_range(range, delta))
                 .transpose()?,
             column_widths: self.column_widths.clone(),
@@ -1053,6 +1575,32 @@ impl TableLayout {
             rows: self.rows.clone(),
             bounds: self.bounds,
             cell_layouts: self.cell_layouts.clone(),
+            paragraphs: self
+                .paragraphs
+                .iter()
+                .map(|part| {
+                    Ok(TableParagraphGeometry {
+                        source: shift_range(part.source, delta)?,
+                        disclosure_content: part
+                            .disclosure_content
+                            .map(|(source, visual)| {
+                                Ok::<_, LayoutError>((shift_range(source, delta)?, visual))
+                            })
+                            .transpose()?,
+                        ..part.clone()
+                    })
+                })
+                .collect::<Result<Vec<_>, LayoutError>>()?,
+            markers: self
+                .markers
+                .iter()
+                .map(|marker| {
+                    Ok(TableListMarker {
+                        source: shift_range(marker.source, delta)?,
+                        ..marker.clone()
+                    })
+                })
+                .collect::<Result<Vec<_>, LayoutError>>()?,
             cells: self
                 .cells
                 .iter()
@@ -1095,14 +1643,7 @@ fn measure_cell_content<B: CellBackend>(
     source: TextRange,
     backend: &B,
 ) -> Result<(VisualRange, f32), LayoutError> {
-    let visual_start = text
-        .source_to_visual(source.start(), Bias::After)
-        .map_err(upstream)?;
-    let visual_end = text
-        .source_to_visual(source.end(), Bias::Before)
-        .map_err(upstream)?;
-    let visual = VisualRange::new(visual_start, visual_end.max(visual_start))
-        .ok_or(LayoutError::OffsetOverflow)?;
+    let visual = text.content_visual_range(source).map_err(upstream)?;
     // Natural width uses the same resolved fonts, inline sizes and shaping as
     // constrained layout; style-only measurement can disagree with CoreText.
     let slice = input.slice(visual, source)?;
@@ -1111,6 +1652,7 @@ fn measure_cell_content<B: CellBackend>(
         config.with_max_width(1_000_000.0),
         input.styles(),
         widgets,
+        CellParagraphStyle::default(),
     )?;
     let width = layout
         .lines()

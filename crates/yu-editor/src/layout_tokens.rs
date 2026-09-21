@@ -96,14 +96,14 @@ pub fn heading_line_height_scale(level: u8) -> Option<f32> {
     Some(yu_core::ThemeSpec::GITHUB.heading_lines[usize::from(level - 1)])
 }
 
-/// 这一块是不是代码块（围栏或缩进）。两种拼法是同一种东西——盒模型的
+/// 是否使用等宽源码盒模型（围栏、缩进代码或 front matter）。其
 /// 内边距、行高、底色都走同一份待遇（与 `yu-workspace` 的
 /// `viewport_block_background` 同一张表）。
 #[must_use]
 pub const fn is_code_block(kind: BlockKind) -> bool {
     matches!(
         kind,
-        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode
+        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode | BlockKind::FrontMatter
     )
 }
 
@@ -161,10 +161,12 @@ pub fn block_spacing(kind: BlockKind, theme: yu_core::ThemeId) -> BlockSpacing {
                 spec.heading_margin_after[index] / body,
             )
         }
-        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode => spacing(
-            spec.code_margin_before / spec.body_size / body,
-            spec.code_margin_after / spec.body_size / body,
-        ),
+        BlockKind::FencedCodeBlock { .. } | BlockKind::IndentedCode | BlockKind::FrontMatter => {
+            spacing(
+                spec.code_margin_before / spec.body_size / body,
+                spec.code_margin_after / spec.body_size / body,
+            )
+        }
         BlockKind::BlankLine | BlockKind::ReferenceDefinition | BlockKind::HtmlBlock => {
             spacing(0.0, 0.0)
         }

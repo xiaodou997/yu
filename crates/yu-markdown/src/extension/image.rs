@@ -30,35 +30,17 @@ impl Extension for Image {
     }
 
     fn decorate(&self, cx: &BlockContext<'_>, out: &mut ExtensionOutput) {
-        for node in cx.nodes() {
-            if node.kind() != NodeKind::Image {
-                continue;
-            }
-            let Some(span) = DelimitedSpan::of(node, |kind| kind == NodeKind::LinkMark) else {
-                continue;
-            };
-            if reveals(cx.active(), node.range()) {
-                // 与链接同一个理由：替代文字按正文字型排，不继承外层。
+        for image in collect_node_images(cx.nodes(), cx.source, false) {
+            if reveals(cx.active(), image.source()) {
                 let style = out.style(TextAttrs::new(TextStyle::Plain));
-                out.mark(span.content, style);
+                out.mark(image.label(), style);
                 continue;
             }
-            // 引用式的候选查不到定义就不是图片（不变量 C6：parser 只产出
-            // 候选）。此前不查表，于是一段解析不出目标的 `![替代][没定义]`
-            // 也占一个 widget，画面上是一个空框——第七刀登记的那条行为变化。
-            let reference = span.reference_label(node);
-            if reference.is_some_and(|label| !cx.resolves(label)) {
+            if image.reference().is_some_and(|label| !cx.resolves(label)) {
                 continue;
             }
-            let destination = child_range(node, NodeKind::Url);
-            let widget = out.widget(BlockWidget::Image(ImageSpan::new(
-                node.range(),
-                span.content,
-                destination,
-                reference,
-            )));
-            // 非空 range 的 widget 覆盖并隐藏这一段，`side` 没有歧义。
-            out.place_widget(node.range(), widget, WidgetSide::Before);
+            let widget = out.widget(BlockWidget::Image(image));
+            out.place_widget(image.source(), widget, WidgetSide::Before);
         }
     }
 }
@@ -67,4 +49,227 @@ fn child_range(node: SyntaxNode<'_>, kind: NodeKind) -> Option<TextRange> {
     node.children()
         .find(|child| child.kind() == kind)
         .map(SyntaxNode::range)
+}
+
+/// The semantic image catalog uses the same delimiter interpretation as the
+/// decoration extension, without populating layout or decoration caches.
+pub fn image_spans(
+    document: &crate::MarkdownDocument,
+    source: &yu_text::TextSnapshot,
+    range: Option<TextRange>,
+) -> Vec<ImageSpan> {
+    let Some(tree) = document.tree() else {
+        return Vec::new();
+    };
+    let root = SyntaxNode::new(tree, 0);
+    let nodes = match range {
+        Some(range) => root.descendants_in(range),
+        None => root.descendants(),
+    };
+    let mut images = collect_node_images(nodes, source, true);
+    for region in &document.html_regions().regions {
+        if range.is_some_and(|range| {
+            region.source.end() <= range.start() || region.source.start() >= range.end()
+        }) {
+            continue;
+        }
+        if let Ok(model) = &region.model {
+            images.extend(
+                model
+                    .image_spans(source.as_str())
+                    .into_iter()
+                    .filter(|image| {
+                        range.is_none_or(|range| {
+                            image.source().start() >= range.start()
+                                && image.source().end() <= range.end()
+                        })
+                    }),
+            );
+        }
+    }
+    images.sort_by_key(|image| image.source().start());
+    images
+}
+
+fn collect_node_images<'a>(
+    nodes: impl Iterator<Item = SyntaxNode<'a>>,
+    source: &yu_text::TextSnapshot,
+    skip_blocks: bool,
+) -> Vec<ImageSpan> {
+    let mut images = Vec::new();
+    let mut stack: Vec<(String, bool)> = Vec::new();
+    for node in nodes {
+        if node.kind() == NodeKind::HtmlBlock && skip_blocks {
+            continue;
+        }
+        if node.kind() == NodeKind::HtmlTag {
+            let Some(raw) = source
+                .as_str()
+                .get(node.start() as usize..node.end() as usize)
+            else {
+                continue;
+            };
+            let Ok(tag) =
+                crate::html::HtmlTag::parse(raw, yu_core::ByteOffset::new(u64::from(node.start())))
+            else {
+                continue;
+            };
+            if tag.closing {
+                if stack.pop().is_some_and(|(name, _)| name != tag.name) {
+                    stack.clear();
+                }
+                continue;
+            }
+            let allowed = stack.last().is_none_or(|(_, allowed)| *allowed)
+                && tag.resolve_attributes(source.as_str()).is_ok();
+            if !tag.self_closing && !tag.is_void() {
+                stack.push((tag.name.clone(), allowed));
+            }
+            if !allowed {
+                continue;
+            }
+        } else if stack.last().is_some_and(|(_, allowed)| !allowed) {
+            continue;
+        }
+        images.extend(node_images(node, source));
+    }
+    images
+}
+
+fn image_span(node: SyntaxNode<'_>) -> Option<ImageSpan> {
+    if node.kind() != NodeKind::Image {
+        return None;
+    }
+    let span = DelimitedSpan::of(node, |kind| kind == NodeKind::LinkMark)?;
+    Some(ImageSpan::new(
+        node.range(),
+        span.content,
+        child_range(node, NodeKind::Url),
+        span.reference_label(node),
+    ))
+}
+
+fn node_images(node: SyntaxNode<'_>, source: &yu_text::TextSnapshot) -> Vec<ImageSpan> {
+    if let Some(image) = image_span(node) {
+        return vec![image];
+    }
+    if !matches!(node.kind(), NodeKind::HtmlTag | NodeKind::HtmlBlock) {
+        return Vec::new();
+    }
+    let Some(raw) = source
+        .as_str()
+        .get(node.start() as usize..node.end() as usize)
+    else {
+        return Vec::new();
+    };
+    let mut images = Vec::new();
+    let mut cursor = 0;
+    // Only consecutive img tags at a syntax-owned HTML span. In particular,
+    // never scan strings inside script, comments, attributes or fenced code.
+    loop {
+        while raw
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        let rest = &raw[cursor..];
+        let Some(image) = html_image_span(rest, u64::from(node.start()) + cursor as u64) else {
+            break;
+        };
+        cursor += image.source().len() as usize;
+        images.push(image);
+        if cursor >= raw.len() {
+            break;
+        }
+    }
+    images
+}
+
+/// Shared source-preserving img interpretation for inline and block HTML.
+pub(crate) fn html_image_span(raw: &str, base: u64) -> Option<ImageSpan> {
+    let tag = crate::image_markup::parse_image_tag(raw)?;
+    let destination = tag.attribute("src")?.value.clone()?;
+    if destination.is_empty() {
+        return None;
+    }
+    let width = tag.dimension(raw, "width").ok()?;
+    let height = tag.dimension(raw, "height").ok()?;
+    let range = |range: std::ops::Range<usize>| {
+        TextRange::new(
+            yu_core::ByteOffset::new(base + range.start as u64),
+            yu_core::ByteOffset::new(base + range.end as u64),
+        )
+        .expect("validated tag range")
+    };
+    let label = tag
+        .attribute("alt")
+        .and_then(|a| a.value.clone())
+        .unwrap_or(0..0);
+    Some(
+        ImageSpan::new(
+            range(0..tag.length),
+            range(label),
+            Some(range(destination)),
+            None,
+        )
+        .with_html_dimensions(width, height),
+    )
+}
+
+/// Resolve source syntax before the resource layer decodes the URI.
+pub fn image_destination_text(
+    source: &yu_text::TextSnapshot,
+    image: ImageSpan,
+    definitions: &crate::ReferenceDefinitionIndex,
+) -> Option<String> {
+    let destination = image.destination().or_else(|| {
+        image
+            .reference()
+            .and_then(|label| definitions.lookup(source, label))
+            .map(|definition| definition.destination())
+    })?;
+    let raw = source
+        .as_str()
+        .get(destination.start().get() as usize..destination.end().get() as usize)?;
+    let raw = if image.is_html() {
+        raw
+    } else {
+        raw.strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .unwrap_or(raw)
+    };
+    Some(crate::image_markup::decode_image_text(raw, image.is_html()))
+}
+
+/// The title belongs to the image or its resolved definition, never another
+/// adjacent link. Callers use this when serializing an individual image edit.
+pub fn image_title_text(
+    document: &crate::MarkdownDocument,
+    source: &yu_text::TextSnapshot,
+    image: ImageSpan,
+) -> Option<String> {
+    if image.is_html() {
+        let raw = source
+            .as_str()
+            .get(image.source().start().get() as usize..image.source().end().get() as usize)?;
+        let tag = crate::image_markup::parse_image_tag(raw)?;
+        return tag
+            .value(raw, "title")
+            .map(|value| crate::image_markup::decode_image_text(value, true));
+    }
+    let range = image
+        .reference()
+        .and_then(|label| document.reference_definitions().lookup(source, label))
+        .map_or(image.source(), |definition| definition.source());
+    SyntaxNode::new(document.tree()?, 0)
+        .descendants_in(range)
+        .find(|node| node.kind() == NodeKind::LinkTitle)
+        .and_then(|node| {
+            source
+                .as_str()
+                .get(node.start() as usize + 1..node.end() as usize - 1)
+        })
+        .map(|value| crate::image_markup::decode_image_text(value, false))
 }

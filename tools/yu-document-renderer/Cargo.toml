@@ -1,0 +1,26 @@
+[package]
+name = "yu-document-renderer"
+description = "Native math and diagram rendering helper for Yu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yu-tex = { path = "../../crates/yu-tex" }
+yu-assets = { path = "../../crates/yu-assets" }
+mitex = "=0.2.4"
+typst = "=0.15.1"
+typst-svg = "=0.15.1"
+typst-layout = "=0.15.1"
+typst-assets = { version = "=0.15.1", features = ["fonts"] }
+mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+yu-embedded-client = { path = "../../crates/yu-embedded-client" }
+yu-core = { path = "../../crates/yu-core" }
