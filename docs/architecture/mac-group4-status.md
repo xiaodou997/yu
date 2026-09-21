@@ -78,4 +78,6 @@ python3 platform/macos/yu-shell-macos/run-embedded-checks.py --html-blocks --mer
 4. `83c5b49e`：自动化脚本、原生测试与固定综合语料。
 5. 本页所在文档提交：当前状态、验收缺口、测试入口及架构说明。
 
-目标分支：`codex/mac-native-v3`。截图、隔离测试应用、构建产物不入库；随包必需的字体及其许可证已纳入依赖提交。GitHub推送结果以实际远端检查为准。
+以上提交已于2026-09-21快进合入并推送 `main`（代码提交 `9053612d`）。合并前核实：开发分支包含全部本地和远端分支的历史，无遗漏的独立提交。已删除本地 `codex/mac-native-v3`、`archive/v1-source-projection`、`s7-search`、`s7-multicursor`，以及远端同名开发/归档分支；历史提交仍完整保留在 `main`。
+
+截图、隔离测试应用、构建产物不入库；随包必需的字体及其许可证已纳入依赖提交。合并不代表第四组已经完成，剩余验收任务不变。
