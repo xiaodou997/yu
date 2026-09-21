@@ -175,6 +175,8 @@ v2:  每种 Markdown 语法 →  一组 Decoration（数据），进入同一个
 
 ### 4.2 依赖方向
 
+结构化粘贴允许 `yu-editor → yu-export → yu-markdown`：将 Markdown 表格升级为支持合并格的 HTML 表格时，复用同一语义导出器，并在完整文档上下文解析引用。`yu-export` 不依赖编辑器、布局或平台；编辑器验证原生 HTML 模型后才提交单次事务。Swift 不做语法转换。
+
 严格 DAG，箭头不允许反向，由 CI 强制：
 
 ```text
@@ -402,7 +404,7 @@ ropey 2.x 是全字节索引的重写。`insert` / `remove` / `slice` /
 | `yu-render` | 1,356 | **保留**：`RenderCommand` 已足够干净，收敛 `EmbeddedSvg` 为通用 Texture |
 | `yu-font` | 1,650 | **保留**：修正反向依赖，只依赖 `yu-core` |
 | `yu-assets` | 2,385 | **保留**：接入 WidgetRegistry |
-| `yu-embedded-math` | 694 | **保留**：改造为 Widget extension |
+| `yu-embedded-math` | 694 | **已删除**：Mac第四组已由 `yu-document-renderer` 原生辅助进程替换；见 `mac-extended-document.md` |
 | `yu-storage` | 2,807 | **保留**：`DocumentSession` 是高质量资产，原子保存/冲突检测继续有效 |
 | `yu-workspace` | 3,313 | **精简**：保留 tab/session 生命周期，移除 publication 拼装逻辑 |
 | `yu-export` | 1,849 | **改造**：HTML 生成改用 comrak，保留 Revision-bound 剪贴板契约。**S7 第六刀做完**，`src/lib.rs` 902 → 375 |
@@ -881,7 +883,9 @@ TaskList 进 `yu-syntax`；复选框成为 widget；语法树跟着 `MarkdownDoc
 真的加了一种（`==高亮==`）来压这句话——**它只在测试文件里**，`yu-markdown`
 本体一行没动。
 
-S6 列的八种语法都在。math 走的是围栏那条路：```` ```math ```` 由
+以下为 S6 当时的实现记录；当前 math 已改用 `yu-document-renderer`（MiTeX＋Typst）和 `yu-embedded-client`，旧简化渲染 crate 已删除，详见 Mac 第四组验收文档。
+
+S6 列的八种语法都在。当时 math 走的是围栏那条路：```` ```math ```` 由
 `BlockOrnament::FencedCode { info, content }` 把语言名与正文带给
 `yu-embedded-math`，端到端有用例
 （`yu-workspace::published_math_is_consumed_by_viewport_scene_and_render_plan`）。
@@ -3051,7 +3055,7 @@ S7 最大的一件，也是第 9 节那两条约束（「不追求一份代码�
 **2. 「85 处 cfg」不是散落的分支，是半个 crate。**
 
 `crates/yu-storage-ffi/Cargo.toml` 把 `yu-font` / `yu-font-macos` / `yu-render` /
-`yu-render-macos` / `yu-workspace` / `yu-markdown` / `yu-embedded-math`
+`yu-render-macos` / `yu-workspace` / `yu-markdown` / `yu-embedded-client`
 **整个**放在 `[target.'cfg(target_os = "macos")'.dependencies]` 下。Windows 上
 这个 crate 连 `RenderPlan`、`ViewportRenderConfig`、`Rgba8` 这些类型都拿不到。
 不是「加几个 cfg」的活，是依赖图要改。
