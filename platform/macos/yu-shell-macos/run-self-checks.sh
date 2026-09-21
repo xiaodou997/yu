@@ -25,6 +25,17 @@ swiftc -module-cache-path /tmp/yu-scroll-swift-cache \
     -o /tmp/yu-frame-wake-checks
 /tmp/yu-frame-wake-checks >/dev/null
 
+swiftc Sources/Yu/TypewriterGeometry.swift Tests/TypewriterGeometryChecks.swift -o /tmp/yu-typewriter-geometry-checks
+/tmp/yu-typewriter-geometry-checks
+
+# Uses the installed system dictionary, with explicit English fixture language.
+swiftc Sources/Yu/NativeSpelling.swift Tests/NativeSpellingChecks.swift -o /tmp/yu-native-spelling-check
+/tmp/yu-native-spelling-check
+
+# Filesystem import checks use private temporary resources and remove them.
+swiftc Sources/Yu/ImageResources.swift Sources/Yu/WritingPreferences.swift Tests/ImageResourceChecks.swift -o /tmp/yu-image-resource-checks
+/tmp/yu-image-resource-checks
+
 # --build 是增量构建。删除一个 C 类型或 FFI 函数后，SwiftPM 可能不会重编引用
 # 它的文件，本地因此看到「构建通过」而 CI 的干净检出会失败。改动 FFI 边界后
 # 用 --clean-build 验证。
@@ -44,6 +55,11 @@ fi
 # self-check 名 -> fixture。fixture 必须真正含有该检查断言的语法结构，
 # 否则 precondition 会以「缺少某某 block」失败，看起来像回归。
 typeset -A checks=(
+    calendar                            Fixtures/sample.md
+    spelling-coordinator              Fixtures/block-projection.md
+    reading-preferences                 Fixtures/block-projection.md
+    image-batch                         Fixtures/assets/yu-mark.png
+    image-properties                    Fixtures/assets/yu-mark.png
     accessibility                       Fixtures/block-projection.md
     clipboard                           Fixtures/block-projection.md
     code-highlight                      Fixtures/render-code.md
