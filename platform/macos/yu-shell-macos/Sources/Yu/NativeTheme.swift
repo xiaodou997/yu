@@ -31,7 +31,7 @@ enum NativeTheme {
 
     static func reading(width: CGFloat, windowWidth: CGFloat, scrollY: CGFloat = 0, dark: Bool = false) -> YuStorageReadingGeometry {
         var result = YuStorageReadingGeometry()
-        precondition(yu_storage_reading_geometry(resolved(dark: dark), Float(max(width, 1)), Float(max(windowWidth, 1)), Float(scrollY), &result) == YU_STORAGE_OK)
+        precondition(yu_storage_reading_geometry(resolved(dark: dark), Float(max(width, 1)), Float(max(windowWidth, 1)), Float(scrollY), Float(NativeWritingPreferences.shared.columnWidth), &result) == YU_STORAGE_OK)
         return result
     }
 

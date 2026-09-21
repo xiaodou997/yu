@@ -23,8 +23,10 @@ enum SemanticAccessibilityKind: UInt8 {
     case autolink = 13
     case referenceLink = 14
     case referenceImage = 15
+    case disclosure = 16
 }
 enum SemanticAccessibilityFlag {
+    static let expanded: UInt8 = 1 << 2
     static let taskDone: UInt8 = 1 << 1
 }
 /// A lightweight AppKit AX element backed by one Rust semantic node. It owns
@@ -58,6 +60,8 @@ final class YuAccessibilitySemanticElement: NSObject,
 
     @objc var accessibilityRole: NSAccessibility.Role {
         switch SemanticAccessibilityKind(rawValue: node.kind) {
+        case .disclosure:
+            return .disclosureTriangle
         case .taskListItem:
             return .checkBox
         case .link, .autolink, .referenceLink:
@@ -73,6 +77,8 @@ final class YuAccessibilitySemanticElement: NSObject,
 
     @objc var accessibilityRoleDescription: String? {
         switch SemanticAccessibilityKind(rawValue: node.kind) {
+        case .disclosure:
+            return "折叠内容"
         case .heading:
             return "标题（级别 \(node.level)）"
         case .codeBlock, .codeSpan:
@@ -97,12 +103,16 @@ final class YuAccessibilitySemanticElement: NSObject,
     }
 
     @objc var accessibilityLabel: String? {
-        bridge.copySourceRangeIfAvailable(node.labelRange, revision: node.revision)
+        guard let label = bridge.copyAccessibilityLabel(node.labelRange, revision: node.revision) else { return nil }
+        return label.isEmpty && SemanticAccessibilityKind(rawValue: node.kind) == .disclosure ? "Details" : label
     }
 
     @objc var accessibilityTitle: String? { accessibilityLabel }
 
     @objc var accessibilityValue: Any? {
+        if SemanticAccessibilityKind(rawValue: node.kind) == .disclosure {
+            return NSNumber(value: node.flags & SemanticAccessibilityFlag.expanded != 0)
+        }
         guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem else {
             return accessibilityLabel
         }
@@ -114,31 +124,23 @@ final class YuAccessibilitySemanticElement: NSObject,
     /// retains a destination string outside the current Revision.
     @objc var accessibilityURL: URL? {
         guard let kind = SemanticAccessibilityKind(rawValue: node.kind),
-              kind == .link || kind == .autolink || kind == .referenceLink,
-              let destinationRange = node.destinationRange,
-              let destination = bridge.copySourceRangeIfAvailable(
-                  destinationRange,
-                  revision: node.revision
-              ),
-              !destination.isEmpty else {
-            return nil
-        }
-        if kind == .autolink,
-           destination.contains("@"),
-           !destination.contains(":") {
-            return URL(string: "mailto:\(destination)")
-        }
-        return URL(string: destination)
+              kind == .link || kind == .autolink || kind == .referenceLink else { return nil }
+        return frameOwner?.documentLinkURL(at: node.labelRange.location, revision: node.revision)
     }
 
-    /// VoiceOver can press a task checkbox, but the operation remains a
-    /// Revision-bound Rust command. Links deliberately have no press action
-    /// yet; opening external content needs a separate product policy.
+    /// Both actions use revision-bound Rust source queries; stale AX elements
+    /// cannot open a destination from a newer document revision.
     @objc func accessibilityPerformPress() -> Bool {
-        guard SemanticAccessibilityKind(rawValue: node.kind) == .taskListItem else {
+        switch SemanticAccessibilityKind(rawValue: node.kind) {
+        case .disclosure:
+            return frameOwner?.toggleDisclosure(at: node.sourceRange.location, revision: node.revision) ?? false
+        case .taskListItem:
+            return frameOwner?.toggleTaskAccessibilityNode(node) ?? false
+        case .link, .autolink, .referenceLink:
+            return frameOwner?.openDocumentLink(at: node.labelRange.location, revision: node.revision) ?? false
+        default:
             return false
         }
-        return frameOwner?.toggleTaskAccessibilityNode(node) ?? false
     }
 
     @objc func accessibilityIdentifier() -> String {

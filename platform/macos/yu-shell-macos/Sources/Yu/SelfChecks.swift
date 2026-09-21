@@ -39,7 +39,633 @@ private func checkTableProjectedGrapheme() throws {
     print("Yu projected table grapheme self-check: escape/entity combining sequences, BR boundary, both arrows/deletion directions and undo passed")
 }
 
+private func checkMergedHTMLSelectionClipboard() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-merged-table-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let source = "<table><tr><td id='a' colspan='2' rowspan='2'>中文🙂</td><td>B</td></tr><tr><td>C</td></tr></table>\r\n"
+    let bom = Data([0xef, 0xbb, 0xbf])
+    try (bom + Data(source.utf8)).write(to: path)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    let text = source as NSString
+    try bridge.selectTableCells(anchor: text.range(of: "中文").location, focus: text.range(of: "C</td>").location, revision: bridge.revision)
+    precondition(bridge.tableSelectionColumns == 3)
+    precondition(bridge.selectionsIfAvailable?.ranges.count == 3)
+    precondition(bridge.selectionsIfAvailable?.primary == 2)
+    let fragments = try bridge.copySelectionFragments(revision: bridge.revision)
+    precondition(fragments == ["中文🙂", "", "B", "", "", "C"])
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .string) == "中文🙂\t\tB\n\t\tC")
+    let mergedHTML = board.string(forType: .yuHTML) ?? ""
+    precondition(mergedHTML == "<table><tr><td id='a' colspan=\"2\" rowspan=\"2\">中文🙂</td><td>B</td></tr><tr><td>C</td></tr></table>")
+    let copied = try bridge.copySelectionPayload(revision: bridge.revision)
+    guard let tableSource = copied.tableSource else { preconditionFailure("missing merged table structure") }
+    let targetPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-merged-paste-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: targetPath) }
+    try Data().write(to: targetPath)
+    let targetBridge = try StorageBridge(path: targetPath.path)
+    let targetView = DocumentTextView(bridge: targetBridge)
+    try targetView.pasteFromPasteboardForSelfCheck(board)
+    precondition(targetBridge.source == tableSource)
+    precondition(tableSource.contains("id='a'"))
+    precondition(tableSource.contains("colspan=\"2\" rowspan=\"2\""))
+    targetView.performUndo()
+    precondition(targetBridge.source.isEmpty)
+    targetView.performRedo()
+    precondition(targetBridge.source == tableSource)
+    try targetBridge.save()
+    let targetReopened = try StorageBridge(path: targetPath.path)
+    precondition(targetReopened.source == tableSource)
+    for partialSource in [
+        "<table><tr><td>LEFT</td><td>TARGET</td><td>OLD</td></tr><tr><td>LEFT2</td><td>E</td><td>F</td></tr><tr><td>BOTTOM</td><td>H</td><td>I</td></tr></table>\r\n",
+        "| LEFT | TARGET | OLD |\r\n| --- | --- | --- |\r\n| LEFT2 | E | F |\r\n| BOTTOM | H | I |\r\n"
+    ] {
+        let partialPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-merged-overlay-\(UUID().uuidString).md")
+        defer { try? FileManager.default.removeItem(at: partialPath) }
+        try partialSource.write(to: partialPath, atomically: true, encoding: .utf8)
+        let partialBridge = try StorageBridge(path: partialPath.path)
+        let partialView = DocumentTextView(bridge: partialBridge)
+        partialView.navigate(toSource: NSRange(location: (partialSource as NSString).range(of: "TARGET").location, length: 0))
+        try partialView.pasteFromPasteboardForSelfCheck(board)
+        let overlaid = partialBridge.source
+        let leftHeader = partialSource.hasPrefix("|") ? "<th>LEFT</th>" : "<td>LEFT</td>"
+        precondition(overlaid.contains(leftHeader) && overlaid.contains("<td>LEFT2</td>") && overlaid.contains("<td>BOTTOM</td>"))
+        let partialCopied = try partialBridge.copySelectionPayload(revision: partialBridge.revision)
+        precondition(partialCopied.tableSource == tableSource)
+        partialView.performUndo()
+        precondition(partialBridge.source == partialSource)
+        partialView.performRedo()
+        precondition(partialBridge.source == overlaid)
+        try partialBridge.save()
+        let partialBytes = try Data(contentsOf: partialPath)
+        precondition(partialBytes == Data(overlaid.utf8))
+        let partialReopened = try StorageBridge(path: partialPath.path)
+        precondition(partialReopened.source == overlaid)
+    }
+    view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+    let cleared = source.replacingOccurrences(of: "中文🙂", with: "").replacingOccurrences(of: ">B<", with: "><").replacingOccurrences(of: ">C<", with: "><")
+    precondition(bridge.source == cleared)
+    precondition(bridge.selectionsIfAvailable?.ranges.count == 3)
+    view.performUndo()
+    precondition(bridge.source == source)
+    precondition(bridge.selectionsIfAvailable?.primary == 2)
+    board.clearContents()
+    board.setString("1\t2\t3\n4\t5\t6", forType: .string)
+    try view.pasteFromPasteboardForSelfCheck(board)
+    let pasted = bridge.source
+    precondition(!pasted.contains("colspan") && !pasted.contains("rowspan"))
+    precondition(pasted.components(separatedBy: "id='a'").count == 2)
+    precondition(bridge.selectionsIfAvailable?.ranges.count == 6)
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .string) == "1\t2\t3\n4\t5\t6")
+    view.performUndo()
+    precondition(bridge.source == source)
+    precondition(bridge.selectionsIfAvailable?.ranges.count == 3)
+    view.performRedo()
+    precondition(bridge.source == pasted)
+    try bridge.save()
+    let saved = try Data(contentsOf: path)
+    precondition(saved == bom + Data(pasted.utf8))
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == pasted)
+    print("Yu merged HTML: native UTF16 selection, clipboard text, clear, split paste, undo/redo and BOM/CRLF save/reopen passed")
+}
+
+private func checkSparseHTMLSelectionClipboard() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-sparse-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let source = "<table><tr><td>A</td><td>B</td></tr><tr></tr><tr><td>C</td></tr></table>\r\n"
+    try source.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    let ns = source as NSString
+    try bridge.selectTableCells(anchor: ns.range(of: "B</td>").location, focus: ns.range(of: "C</td>").location, revision: bridge.revision)
+    let fragments = try bridge.copySelectionFragments(revision: bridge.revision)
+    precondition(fragments == ["A", "B", "", "", "C", ""])
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .string) == "A\tB\n\t\nC\t")
+    let html = board.string(forType: .yuHTML) ?? ""
+    precondition(html.components(separatedBy: "<td>").count == 7)
+    view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+    precondition(bridge.source == source.replacingOccurrences(of: ">A<", with: "><").replacingOccurrences(of: ">B<", with: "><").replacingOccurrences(of: ">C<", with: "><"))
+    view.performUndo()
+    precondition(bridge.source == source)
+    try view.pasteFromPasteboardForSelfCheck(board)
+    let padded = source.replacingOccurrences(of: "<tr></tr>", with: "<tr><td></td><td></td></tr>").replacingOccurrences(of: "<td>C</td></tr>", with: "<td>C</td><td></td></tr>")
+    precondition(bridge.source == padded)
+    view.performUndo()
+    precondition(bridge.source == source)
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == source)
+    print("Yu sparse HTML clipboard: absent slots, native clipboard roundtrip, clear, undo and exact save/reopen passed")
+}
+
+private func checkHTMLCellParagraphs() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-cell-paragraphs-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let source = "<table><tr><td><p>one</p><p align='right'>中文 two</p></td><td>KEEP</td></tr></table>\r\n"
+    try source.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    let ns = source as NSString
+    try bridge.selectTableCells(anchor: ns.range(of: "one</p>").location, focus: ns.range(of: "KEEP").location, revision: bridge.revision)
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .string) == "\"one\n中文 two\"\tKEEP")
+    try view.pasteFromPasteboardForSelfCheck(board)
+    precondition(bridge.source == source, "HTML format tags escaped during private clipboard roundtrip")
+    view.navigate(toSource: NSRange(location: ns.range(of: "中文 two").location, length: 0))
+    view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+    let joined = source.replacingOccurrences(of: "</p><p align='right'>", with: "")
+    precondition(bridge.source == joined)
+    view.performUndo()
+    precondition(bridge.source == source)
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == source)
+    print("Yu HTML cell paragraphs: clipboard line breaks, native paragraph join/undo and exact save/reopen passed")
+}
+
+private func checkHTMLCellHeadings() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-cell-headings-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let source = "<table><tr><td><h2 align='center'>中文 heading</h2><p>body</p></td><td>KEEP</td></tr></table>\r\n"
+    try source.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    let ns = source as NSString
+    try bridge.selectTableCells(anchor: ns.range(of: "中文 heading").location, focus: ns.range(of: "KEEP").location, revision: bridge.revision)
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .string) == "\"中文 heading\nbody\"\tKEEP")
+    try view.pasteFromPasteboardForSelfCheck(board)
+    precondition(bridge.source == source)
+    view.navigate(toSource: NSRange(location: ns.range(of: "中文 heading").location, length: 0))
+    view.insertText("新<&", replacementRange: NSRange(location: NSNotFound, length: 0))
+    let edited = source.replacingOccurrences(of: "中文 heading", with: "新&lt;&amp;中文 heading")
+    precondition(bridge.source == edited)
+    view.performUndo()
+    precondition(bridge.source == source)
+    view.performRedo()
+    precondition(bridge.source == edited)
+    view.navigate(toSource: NSRange(location: (edited as NSString).range(of: "body</p>").location, length: 0))
+    view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+    let joined = edited.replacingOccurrences(of: "</h2><p>", with: "").replacingOccurrences(of: "body</p>", with: "body</h2>")
+    precondition(bridge.source == joined)
+    view.performUndo()
+    precondition(bridge.source == edited)
+    view.performRedo()
+    precondition(bridge.source == joined)
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == joined)
+    print("Yu HTML cell headings: clipboard, input, mixed paragraph merge, undo/redo and exact save/reopen passed")
+}
+
+private func checkHTMLCellLists() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-cell-lists-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let original = "<table><tr><td><ol start='3'><li>one<ul><li>nested</li></ul></li><li>two</li></ol></td><td>KEEP</td></tr></table>\r\n"
+    try original.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    try bridge.selectTableCells(anchor: (original as NSString).range(of: "one").location, focus: (original as NSString).range(of: "KEEP").location, revision: bridge.revision)
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .string) == "\"3. one\n  • nested\n4. two\"\tKEEP")
+    try view.pasteFromPasteboardForSelfCheck(board)
+    precondition(bridge.source == original)
+    view.navigate(toSource: NSRange(location: (original as NSString).range(of: "nested").location, length: 0))
+    view.insertText("中文<&", replacementRange: NSRange(location: NSNotFound, length: 0))
+    let edited = original.replacingOccurrences(of: "nested", with: "中文&lt;&amp;nested")
+    precondition(bridge.source == edited)
+    view.performUndo()
+    precondition(bridge.source == original)
+    view.performRedo()
+    precondition(bridge.source == edited)
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == edited)
+    view.performUndo()
+    precondition(bridge.source == original)
+    let nestedStart = (original as NSString).range(of: "nested").location
+    view.navigate(toSource: NSRange(location: nestedStart + 3, length: 0))
+    view.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+    let split = original.replacingOccurrences(of: "nested", with: "nes</li><li>ted")
+    precondition(bridge.source == split)
+    view.insertText("中", replacementRange: NSRange(location: NSNotFound, length: 0))
+    let typedSplit = split.replacingOccurrences(of: "<li>ted", with: "<li>中ted")
+    precondition(bridge.source == typedSplit)
+    view.performUndo()
+    precondition(bridge.source == split)
+    view.performUndo()
+    precondition(bridge.source == original)
+    view.performRedo()
+    precondition(bridge.source == split)
+    try bridge.save()
+    let splitReopened = try StorageBridge(path: path.path)
+    precondition(splitReopened.source == split)
+    print("Yu HTML cell lists: clipboard, typing, native Enter split, undo/redo and exact save/reopen passed")
+}
+
+private func checkHTMLListIndent() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-list-indent-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let original = "<table><tr><td><ul><li>First</li><li>Second</li></ul></td><td>KEEP</td></tr></table>\r\n"
+    try original.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    view.navigate(toSource: NSRange(location: (original as NSString).range(of: "Second").location, length: 0))
+    let item = NSMenuItem(title: "Indent", action: #selector(DocumentTextView.editListFromMenu(_:)), keyEquivalent: "")
+    item.tag = Int(YU_STORAGE_COMMAND_INDENT_LIST)
+    precondition(view.validateMenuItem(item))
+    view.editListFromMenu(item)
+    let nested = original.replacingOccurrences(of: "</li><li>Second</li>", with: "<ul><li>Second</li></ul></li>")
+    precondition(bridge.source == nested)
+    item.tag = Int(YU_STORAGE_COMMAND_OUTDENT_LIST)
+    precondition(view.validateMenuItem(item))
+    view.editListFromMenu(item)
+    precondition(bridge.source == original)
+    view.performUndo()
+    precondition(bridge.source == nested)
+    view.performUndo()
+    precondition(bridge.source == original)
+    view.performRedo()
+    precondition(bridge.source == nested)
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == nested)
+    view.performUndo()
+    precondition(bridge.source == original)
+    view.navigate(toSource: NSRange(location: (original as NSString).range(of: "Second").location, length: 0))
+    view.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+    let exited = original.replacingOccurrences(of: "<li>Second</li></ul>", with: "</ul><p>Second</p>")
+    precondition(bridge.source == exited)
+    view.insertText("中", replacementRange: NSRange(location: NSNotFound, length: 0))
+    precondition(bridge.source == exited.replacingOccurrences(of: "Second", with: "中Second"))
+    view.performUndo()
+    precondition(bridge.source == exited)
+    view.performUndo()
+    precondition(bridge.source == original)
+    view.performRedo()
+    precondition(bridge.source == exited)
+    try bridge.save()
+    let exitedReopened = try StorageBridge(path: path.path)
+    precondition(exitedReopened.source == exited)
+    print("Yu HTML list menu indent/outdent, Backspace, history and save/reopen passed")
+}
+
+private func checkHTMLListSelections() throws {
+    let cases: [(String, String, UInt8)] = [
+        ("<ul><li>A</li><li>中文</li><!--gap--><li>C🙂</li></ul>",
+         "<ul><li>A<ul><li>中文</li><!--gap--><li>C🙂</li></ul></li></ul>", UInt8(YU_STORAGE_COMMAND_INDENT_LIST)),
+        ("<ol start='3'><li>A</li><li id='b'><b>中文</b></li><!--gap--><li><p>C🙂</p></li><li>D</li></ol>",
+         "<ol start='3'><li>A</li></ol><p id='b'><b>中文</b></p><!--gap--><div><p>C🙂</p></div><ol start='6'><li>D</li></ol>", UInt8(YU_STORAGE_COMMAND_OUTDENT_LIST)),
+        ("<ul><li>P<div align='right'><ol start='3'><li>A</li><li>中文</li><!--gap--><li>C🙂</li><li>D</li></ol>tail</div></li></ul>",
+         "<ul><li>P<div align='right'><ol start='3'><li>A</li></ol></div></li><li>中文</li><!--gap--><li>C🙂<div align='right'><ol start='6'><li>D</li></ol>tail</div></li></ul>", UInt8(YU_STORAGE_COMMAND_OUTDENT_LIST)),
+    ]
+    for (before, after, command) in cases {
+        for backward in [false, true] {
+            let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-list-selection-\(UUID().uuidString).md")
+            defer { try? FileManager.default.removeItem(at: path) }
+            let original = "<table><tr><td>" + before + "</td><td>KEEP</td></tr></table>\r\n"
+            let expected = "<table><tr><td>" + after + "</td><td>KEEP</td></tr></table>\r\n"
+            let bom = Data([0xef, 0xbb, 0xbf])
+            try (bom + Data(original.utf8)).write(to: path)
+            let bridge = try StorageBridge(path: path.path)
+            let view = DocumentTextView(bridge: bridge)
+            func endpoints(_ source: String) -> (UInt64, UInt64) {
+                let text = source as NSString
+                let start = UInt64(text.range(of: "中文").location)
+                let end = UInt64(NSMaxRange(text.range(of: "🙂")))
+                return backward ? (end, start) : (start, end)
+            }
+            let initial = endpoints(original)
+            let final = endpoints(expected)
+            try bridge.setSelectionEndpoints(anchorUTF16: initial.0, focusUTF16: initial.1)
+            let item = NSMenuItem(title: "List", action: #selector(DocumentTextView.editListFromMenu(_:)), keyEquivalent: "")
+            item.tag = Int(command)
+            precondition(view.validateMenuItem(item))
+            view.editListFromMenu(item)
+            precondition(bridge.source == expected)
+            precondition(bridge.selectionEndpoints.anchorUTF16 == final.0)
+            precondition(bridge.selectionEndpoints.focusUTF16 == final.1)
+            view.performUndo()
+            precondition(bridge.source == original)
+            precondition(bridge.selectionEndpoints.anchorUTF16 == initial.0)
+            precondition(bridge.selectionEndpoints.focusUTF16 == initial.1)
+            view.performRedo()
+            precondition(bridge.source == expected)
+            precondition(bridge.selectionEndpoints.anchorUTF16 == final.0)
+            precondition(bridge.selectionEndpoints.focusUTF16 == final.1)
+            try bridge.save()
+            let saved = try Data(contentsOf: path)
+            precondition(saved == bom + Data(expected.utf8))
+            let reopened = try StorageBridge(path: path.path)
+            precondition(reopened.source == expected)
+        }
+    }
+    let multiPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-list-multi-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: multiPath) }
+    let multiSource = "<table><tr><td><ul><li><b>中文🙂末</b></li><li>XY</li></ul></td><td>CD</td></tr></table>\r\n\r\n正文尾\r\n"
+    let multiExpected = "<table><tr><td><ul><li><b>中文</b></li><li><b>🙂</b></li><li><b>末</b></li><li>X</li><li>Y</li></ul></td><td>C<br>D</td></tr></table>\r\n\r\n正文\r\n尾\r\n"
+    try multiSource.write(to: multiPath, atomically: true, encoding: .utf8)
+    let multiBridge = try StorageBridge(path: multiPath.path)
+    let multiView = DocumentTextView(bridge: multiBridge)
+    let needles = ["🙂", "末", "Y</li>", "D</td>", "尾"]
+    let cursors = needles.map { NSRange(location: (multiSource as NSString).range(of: $0).location, length: 0) }
+    try multiBridge.setSelections(cursors, primary: 1)
+    multiView.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+    precondition(multiBridge.source == multiExpected)
+    multiView.performUndo()
+    precondition(multiBridge.source == multiSource)
+    multiView.performRedo()
+    precondition(multiBridge.source == multiExpected)
+    try multiBridge.save()
+    let multiSaved = try Data(contentsOf: multiPath)
+    precondition(multiSaved == Data(multiExpected.utf8))
+    let multiReopened = try StorageBridge(path: multiPath.path)
+    precondition(multiReopened.source == multiExpected)
+    let indentPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-multi-indent-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: indentPath) }
+    let indentSource = "<table><tr><td><ul><li>首</li><li>中文🙂</li><li>末</li></ul></td></tr></table>\r\n\r\n正文尾\r\n"
+    let indentExpected = "<table><tr><td><ul><li>首<ul><li>中文🙂</li><li>末</li></ul></li></ul></td></tr></table>\r\n\r\n正文尾\r\n"
+    try indentSource.write(to: indentPath, atomically: true, encoding: .utf8)
+    let indentBridge = try StorageBridge(path: indentPath.path)
+    let indentView = DocumentTextView(bridge: indentBridge)
+    let indentNeedles = ["首", "中文", "🙂", "末", "尾"]
+    try indentBridge.setSelections(indentNeedles.map { NSRange(location: (indentSource as NSString).range(of: $0).location, length: 0) }, primary: 0)
+    let indentItem = NSMenuItem(title: "Indent", action: #selector(DocumentTextView.editListFromMenu(_:)), keyEquivalent: "")
+    indentItem.tag = Int(YU_STORAGE_COMMAND_INDENT_LIST)
+    precondition(indentView.validateMenuItem(indentItem))
+    indentView.editListFromMenu(indentItem)
+    precondition(indentBridge.source == indentExpected)
+    indentView.performUndo()
+    precondition(indentBridge.source == indentSource)
+    indentView.performRedo()
+    precondition(indentBridge.source == indentExpected)
+    try indentBridge.save()
+    let indentSaved = try Data(contentsOf: indentPath)
+    precondition(indentSaved == Data(indentExpected.utf8))
+    let indentReopened = try StorageBridge(path: indentPath.path)
+    precondition(indentReopened.source == indentExpected)
+    let outdentPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-multi-outdent-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: outdentPath) }
+    let outdentSource = "<table><tr><td><ul><li>A</li><li>中文🙂</li><li>尾</li></ul></td></tr></table>\r\n"
+    let outdentExpected = "<table><tr><td><ul><li>A</li></ul><p>中文🙂</p><p>尾</p></td></tr></table>\r\n"
+    try outdentSource.write(to: outdentPath, atomically: true, encoding: .utf8)
+    let outdentBridge = try StorageBridge(path: outdentPath.path)
+    let outdentView = DocumentTextView(bridge: outdentBridge)
+    try outdentBridge.setSelections(["中文🙂", "尾"].map { (outdentSource as NSString).range(of: $0) }, primary: 1)
+    let outdentItem = NSMenuItem(title: "Outdent", action: #selector(DocumentTextView.editListFromMenu(_:)), keyEquivalent: "")
+    outdentItem.tag = Int(YU_STORAGE_COMMAND_OUTDENT_LIST)
+    precondition(outdentView.validateMenuItem(outdentItem))
+    outdentView.editListFromMenu(outdentItem)
+    precondition(outdentBridge.source == outdentExpected)
+    outdentView.performUndo()
+    precondition(outdentBridge.source == outdentSource)
+    outdentView.performRedo()
+    precondition(outdentBridge.source == outdentExpected)
+    try outdentBridge.save()
+    let outdentSaved = try Data(contentsOf: outdentPath)
+    precondition(outdentSaved == Data(outdentExpected.utf8))
+    let outdentReopened = try StorageBridge(path: outdentPath.path)
+    precondition(outdentReopened.source == outdentExpected)
+    let crossPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-cross-outdent-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: crossPath) }
+    let crossSource = "<table><tr><td><ul><li><b>中文🙂</b></li><li><p>End</p></li></ul></td><td><ul><li>Parent<ul><li>Second</li><li>Third</li></ul></li></ul></td></tr></table>\r\n"
+    let crossExpected = "<table><tr><td><p><b>中文🙂</b></p><div><p>End</p></div></td><td><ul><li>Parent</li><li>Second</li><li>Third</li></ul></td></tr></table>\r\n"
+    try crossSource.write(to: crossPath, atomically: true, encoding: .utf8)
+    let crossBridge = try StorageBridge(path: crossPath.path)
+    let crossView = DocumentTextView(bridge: crossBridge)
+    func crossRanges(_ text: String) -> [NSRange] {
+        let source = text as NSString
+        return [("中文", "End"), ("Second", "Third")].map { first, last in
+            let start = source.range(of: first).location
+            return NSRange(location: start, length: NSMaxRange(source.range(of: last)) - start)
+        }
+    }
+    try crossBridge.setSelections(crossRanges(crossSource), primary: 1)
+    precondition(crossView.validateMenuItem(outdentItem))
+    crossView.editListFromMenu(outdentItem)
+    precondition(crossBridge.source == crossExpected)
+    precondition(crossBridge.selectionsIfAvailable?.ranges.map { $0.range } == crossRanges(crossExpected))
+    precondition(crossBridge.selectionsIfAvailable?.primary == 1)
+    crossView.performUndo()
+    precondition(crossBridge.source == crossSource)
+    precondition(crossBridge.selectionsIfAvailable?.ranges.map { $0.range } == crossRanges(crossSource))
+    crossView.performRedo()
+    precondition(crossBridge.source == crossExpected)
+    precondition(crossBridge.selectionsIfAvailable?.ranges.map { $0.range } == crossRanges(crossExpected))
+    precondition(crossBridge.selectionsIfAvailable?.primary == 1)
+    try crossBridge.save()
+    let crossSaved = try Data(contentsOf: crossPath)
+    precondition(crossSaved == Data(crossExpected.utf8))
+    let crossReopened = try StorageBridge(path: crossPath.path)
+    precondition(crossReopened.source == crossExpected)
+    let nestedPath = FileManager.default.temporaryDirectory.appendingPathComponent("yu-nested-multi-outdent-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: nestedPath) }
+    let nestedSource = "<table><tr><td><ul><li>Parent<div id='wrap'><ol start='4'><li>A</li><li id='b'>中文🙂</li><!--keep--><li>Second</li><li>Third</li><li>Z</li></ol></div>Tail</li></ul></td></tr></table>\r\n"
+    let nestedExpected = "<table><tr><td><ul><li>Parent<div id='wrap'><ol start='4'><li>A</li></ol></div></li><li id='b'>中文🙂</li><!--keep--><li>Second</li><li>Third<div ><ol start='8'><li>Z</li></ol></div>Tail</li></ul></td></tr></table>\r\n"
+    let nestedBOM = Data([0xef, 0xbb, 0xbf])
+    try (nestedBOM + Data(nestedSource.utf8)).write(to: nestedPath)
+    let nestedBridge = try StorageBridge(path: nestedPath.path)
+    let nestedView = DocumentTextView(bridge: nestedBridge)
+    func nestedRanges(_ text: String) -> [NSRange] {
+        let source = text as NSString
+        let second = source.range(of: "Second").location
+        return [source.range(of: "中文🙂"), NSRange(location: second, length: NSMaxRange(source.range(of: "Third")) - second)]
+    }
+    func verifyNested(_ text: String) {
+        precondition(nestedBridge.source == text)
+        precondition(nestedBridge.selectionsIfAvailable?.primary == 1)
+        precondition(nestedBridge.selectionsIfAvailable?.ranges.map { $0.range } == nestedRanges(text))
+    }
+    try nestedBridge.setSelections(nestedRanges(nestedSource), primary: 1)
+    precondition(nestedView.validateMenuItem(outdentItem))
+    nestedView.editListFromMenu(outdentItem)
+    verifyNested(nestedExpected)
+    nestedView.performUndo()
+    verifyNested(nestedSource)
+    nestedView.performRedo()
+    verifyNested(nestedExpected)
+    try nestedBridge.save()
+    let nestedSaved = try Data(contentsOf: nestedPath)
+    precondition(nestedSaved == nestedBOM + Data(nestedExpected.utf8))
+    let nestedReopened = try StorageBridge(path: nestedPath.path)
+    precondition(nestedReopened.source == nestedExpected)
+    print("Yu HTML list selections: native menu, directed UTF16 ranges, history and exact save/reopen passed")
+}
+
+private func checkMissingFootnoteRecovery() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-footnote-recovery-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let original = "中文🙂 reference[^missing].\r\n"
+    let addition = "\r\n[^missing]: Definition **保留**.\r\n"
+    let bom = Data([0xef, 0xbb, 0xbf])
+    try (bom + Data(original.utf8)).write(to: path)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    let reference = (original as NSString).range(of: "[^missing]").location
+    func verifyMissing(_ session: StorageBridge) throws {
+        let diagnostic = try session.documentDiagnostic(at: reference)
+        let target = try session.documentReferenceTarget(at: reference)
+        precondition(!diagnostic.isEmpty)
+        precondition(target == nil)
+        precondition(session.source == original)
+    }
+    try verifyMissing(bridge)
+    try bridge.save()
+    let missingBytes = try Data(contentsOf: path)
+    precondition(missingBytes == bom + Data(original.utf8))
+    let missingReopened = try StorageBridge(path: path.path)
+    try verifyMissing(missingReopened)
+    view.navigate(toSource: NSRange(location: (original as NSString).length, length: 0))
+    view.insertText(addition, replacementRange: NSRange(location: NSNotFound, length: 0))
+    let corrected = original + addition
+    precondition(bridge.source == corrected)
+    let diagnostic = try bridge.documentDiagnostic(at: reference)
+    let target = try bridge.documentReferenceTarget(at: reference)
+    precondition(diagnostic.isEmpty)
+    precondition(target?.location == (original as NSString).length + 2)
+    view.performUndo()
+    try verifyMissing(bridge)
+    view.performRedo()
+    precondition(bridge.source == corrected)
+    let redoDiagnostic = try bridge.documentDiagnostic(at: reference)
+    precondition(redoDiagnostic.isEmpty)
+    try bridge.save()
+    let correctedBytes = try Data(contentsOf: path)
+    precondition(correctedBytes == bom + Data(corrected.utf8))
+    let reopened = try StorageBridge(path: path.path)
+    let reopenedDiagnostic = try reopened.documentDiagnostic(at: reference)
+    let reopenedTarget = try reopened.documentReferenceTarget(at: reference)
+    precondition(reopened.source == corrected && reopenedDiagnostic.isEmpty)
+    precondition(reopenedTarget == target)
+    print("Yu missing footnote: diagnostic, repair, history and exact save/reopen passed")
+}
+
+private func checkHTMLEmptyListExit() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-list-exit-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let original = "<table><tr><td><ul><li>parent<ul><li></li></ul></li></ul></td><td>KEEP</td></tr></table>\r\n"
+    try original.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    view.navigate(toSource: NSRange(location: (original as NSString).range(of: "<li></li>").location + 4, length: 0))
+    view.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+    let outdented = "<table><tr><td><ul><li>parent</li><li></li></ul></td><td>KEEP</td></tr></table>\r\n"
+    precondition(bridge.source == outdented)
+    view.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+    let exited = "<table><tr><td><ul><li>parent</li></ul><p></p></td><td>KEEP</td></tr></table>\r\n"
+    precondition(bridge.source == exited)
+    view.insertText("中文<&", replacementRange: NSRange(location: NSNotFound, length: 0))
+    let typed = exited.replacingOccurrences(of: "<p></p>", with: "<p>中文&lt;&amp;</p>")
+    precondition(bridge.source == typed)
+    for expected in [exited, outdented, original] {
+        view.performUndo()
+        precondition(bridge.source == expected)
+    }
+    for expected in [outdented, exited, typed] {
+        view.performRedo()
+        precondition(bridge.source == expected)
+    }
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == typed)
+    print("Yu empty HTML list: nested outdent, exit, typing, undo/redo and exact save/reopen passed")
+}
+
+private func checkHTMLCellDetails() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-cell-details-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let original = "<table><tr><td><details><summary>标题</summary><p>Hidden body</p></details></td><td>KEEP</td></tr></table>\r\n"
+    try original.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    let board = NSPasteboard.withUniqueName()
+    defer { board.releaseGlobally() }
+    let title = (original as NSString).range(of: "标题").location
+    let header = try bridge.disclosureHeader(at: title, expectedRevision: bridge.revision)
+    precondition(header != nil && header?.open == false)
+    try bridge.selectTableCells(anchor: title, focus: (original as NSString).range(of: "KEEP").location, revision: bridge.revision)
+    try view.copyToPasteboardForSelfCheck(board)
+    precondition(board.string(forType: .string) == "标题\tKEEP")
+    try view.pasteFromPasteboardForSelfCheck(board)
+    precondition(bridge.source == original, "closed details clipboard lost hidden content")
+    precondition(view.toggleDisclosure(at: title, revision: bridge.revision))
+    let opened = original.replacingOccurrences(of: "<details>", with: "<details open>")
+    precondition(bridge.source == opened)
+    let visible = try bridge.disclosureHeader(at: (opened as NSString).range(of: "标题").location, expectedRevision: bridge.revision)
+    precondition(visible?.open == true)
+    view.performUndo()
+    precondition(bridge.source == original)
+    view.performRedo()
+    precondition(bridge.source == opened)
+    view.navigate(toSource: NSRange(location: (opened as NSString).range(of: "Hidden body").location, length: 0))
+    view.insertText("中文<&", replacementRange: NSRange(location: NSNotFound, length: 0))
+    let edited = opened.replacingOccurrences(of: "Hidden body", with: "中文&lt;&amp;Hidden body")
+    precondition(bridge.source == edited)
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == edited)
+    view.performUndo()
+    precondition(bridge.source == opened)
+    print("Yu HTML cell details: header query, hidden-source clipboard, native toggle/undo, body edit and exact save/reopen passed")
+}
+
+private func checkTypedTableClipboard() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("yu-typed-clipboard-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    for htmlDestination in [false, true] {
+        let original = htmlDestination ? "<table><tr><td>KEEP</td></tr></table>\r\n" : "| KEEP |\n| --- |\n"
+        let path = directory.appendingPathComponent(htmlDestination ? "html.md" : "markdown.md")
+        try original.write(to: path, atomically: true, encoding: .utf8)
+        let bridge = try StorageBridge(path: path.path)
+        let view = DocumentTextView(bridge: bridge)
+        view.navigate(toSource: NSRange(location: (original as NSString).range(of: "KEEP").location, length: 0))
+        let format = htmlDestination ? UInt8(YU_STORAGE_FRAGMENT_MARKDOWN) : UInt8(YU_STORAGE_FRAGMENT_HTML)
+        let cells = htmlDestination ? ["**中文 bold** [link](https://example.com)"] : ["<p><b>中文 bold</b> <a href='https://example.com'>link</a></p>"]
+        _ = try bridge.pasteFragments(cells, columns: 1, format: format)
+        let edited = bridge.source
+        if htmlDestination {
+            precondition(edited.contains("<strong>中文 bold</strong>") && edited.contains("href=\"https://example.com\""))
+            precondition(!edited.contains("&lt;p&gt;"))
+        } else {
+            precondition(edited.contains("**中文 bold**") && edited.contains("[link](https://example.com)"))
+        }
+        try bridge.save()
+        let reopened = try StorageBridge(path: path.path)
+        precondition(reopened.source == edited)
+        view.performUndo()
+        precondition(bridge.source == original)
+        view.performRedo()
+        precondition(bridge.source == edited)
+    }
+    print("Yu typed table clipboard: Markdown/HTML format conversion, exact saved bytes and native undo/redo passed")
+}
+
 private func checkCellSelectionClipboard() throws {
+    try checkTypedTableClipboard()
+    try checkHTMLCellParagraphs()
+    try checkHTMLCellHeadings()
+    try checkHTMLCellLists()
+    try checkHTMLEmptyListExit()
+    try checkHTMLListIndent()
+    try checkHTMLListSelections()
+    try checkMissingFootnoteRecovery()
+    try checkHTMLCellDetails()
+    try checkMergedHTMLSelectionClipboard()
+    try checkSparseHTMLSelectionClipboard()
     try checkTableProjectedGrapheme()
     let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-cell-selection-\(UUID().uuidString).md")
     defer { try? FileManager.default.removeItem(at: path) }
@@ -424,8 +1050,35 @@ func runSelectionSelfCheck(path: String) -> Never {
     }
 }
 
+private func checkEmptyHTMLListInput() throws {
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-empty-html-list-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: path) }
+    let original = "<ol start='8'><li></li><li><!--keep--></li><li>尾</li></ol>\r\n"
+    try original.write(to: path, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: path.path)
+    let view = DocumentTextView(bridge: bridge)
+    view.navigate(toSource: NSRange(location: (original as NSString).range(of: "</li>").location, length: 0))
+    view.setMarkedText("中文", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+    precondition(bridge.composition.active && bridge.source == original)
+    view.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+    precondition(!bridge.composition.active && bridge.source == original)
+    view.setMarkedText("中文", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+    view.insertText("中文", replacementRange: NSRange(location: NSNotFound, length: 0))
+    let edited = original.replacingOccurrences(of: "<li></li>", with: "<li>中文</li>")
+    precondition(!bridge.composition.active && bridge.source == edited)
+    view.performUndo()
+    precondition(bridge.source == original)
+    view.performRedo()
+    precondition(bridge.source == edited)
+    try bridge.save()
+    let reopened = try StorageBridge(path: path.path)
+    precondition(reopened.source == edited)
+    print("Yu empty HTML list: native preedit cancel/commit, undo/redo and exact save/reopen passed")
+}
+
 func runUndoSelfCheck(path: String) -> Never {
     do {
+        try checkEmptyHTMLListInput()
         let bridge = try StorageBridge(path: path)
         let textView = DocumentTextView(bridge: bridge)
         let original = bridge.source
@@ -1495,8 +2148,112 @@ private func allLabelsForSelfCheck(_ node: OutlineNode) -> [String] {
     [node.label] + node.children.flatMap(allLabelsForSelfCheck)
 }
 
+private func checkHiddenContentNavigation() throws {
+    let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("yu-hidden-navigation-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let source = "[Jump](#target)\n\n<details><summary>First</summary><p id='target'>First hidden</p></details>\n\n<details><summary>Second</summary><p>Second hidden</p></details>"
+    try source.write(to: temporary, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: temporary.path)
+    let view = DocumentTextView(bridge: bridge)
+    let revision = bridge.revision
+    let first = (source as NSString).range(of: "First hidden")
+    let second = (source as NSString).range(of: "Second hidden")
+    let firstHeader = (source as NSString).range(of: "First</summary>").location
+    let secondHeader = (source as NSString).range(of: "Second</summary>").location
+    view.navigate(toSources: [first, second], primary: 1)
+    precondition((try? bridge.disclosureHeader(at: firstHeader, expectedRevision: revision))?.open == true)
+    precondition((try? bridge.disclosureHeader(at: secondHeader, expectedRevision: revision))?.open == true)
+    precondition(bridge.selectionsIfAvailable?.ranges.count == 2)
+    precondition(view.toggleDisclosure(at: firstHeader, revision: revision))
+    precondition((try? bridge.disclosureHeader(at: firstHeader, expectedRevision: revision))?.open == false)
+    let link = (source as NSString).range(of: "Jump").location
+    precondition(view.openDocumentLink(at: link, revision: revision))
+    precondition((try? bridge.disclosureHeader(at: firstHeader, expectedRevision: revision))?.open == true)
+    precondition(view.selectedRange().location == (source as NSString).range(of: "<p id='target'>").location)
+    precondition(bridge.revision == revision && view.string == source)
+}
+
+private func checkDisclosureAccessibility() throws {
+    let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("yu-disclosure-ax-\(UUID().uuidString).md")
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    let original = "<details><summary><strong>摘要中文</strong> &amp; <em>内容</em></summary><p>Hidden body</p></details>"
+    try original.write(to: temporary, atomically: true, encoding: .utf8)
+    let bridge = try StorageBridge(path: temporary.path)
+    let view = DocumentTextView(bridge: bridge)
+    func disclosure() -> YuAccessibilitySemanticElement? {
+        func find(_ elements: [Any]) -> YuAccessibilitySemanticElement? {
+            for case let element as YuAccessibilitySemanticElement in elements {
+                if element.node.kind == SemanticAccessibilityKind.disclosure.rawValue { return element }
+                if let result = find(element.semanticChildren) { return result }
+            }
+            return nil
+        }
+        return find(view.accessibilityChildren ?? [])
+    }
+    guard let closed = disclosure() else { preconditionFailure("Missing disclosure AX element") }
+    precondition(closed.accessibilityRole == .disclosureTriangle)
+    precondition(closed.accessibilityLabel == "摘要中文 & 内容")
+    precondition((closed.accessibilityValue as? NSNumber)?.boolValue == false)
+    precondition(closed.accessibilityPerformPress())
+    precondition(!closed.accessibilityPerformPress(), "Stale AX action must be rejected")
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    let summary = (view.string as NSString).range(of: "摘要中文")
+    view.setSelectedRanges([NSValue(range: NSRange(location: summary.location, length: 0))], affinity: .downstream, stillSelecting: false)
+    let item = view.makeDisclosureMenuItem()
+    precondition(view.validateMenuItem(item))
+    view.toggleDisclosureFromMenu(item)
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == false)
+    view.undo(nil)
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    view.undo(nil)
+    precondition(view.string == original)
+    let revision = bridge.revision
+    let hidden = (original as NSString).range(of: "Hidden body")
+    view.navigate(toSource: hidden)
+    precondition(view.selectedRange() == hidden)
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition(bridge.revision == revision && view.string == original)
+    precondition(disclosure()?.accessibilityPerformPress() == true)
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == false)
+    precondition(bridge.revision == revision && view.string == original)
+    let visibleCaret = (original as NSString).range(of: "</summary>").location
+    precondition(view.selectedRange() == NSRange(location: visibleCaret, length: 0))
+    _ = try bridge.insertText("!")
+    view.refreshFromRust()
+    precondition(view.string == original.replacingOccurrences(of: "</summary>", with: "!</summary>"))
+    view.undo(nil)
+    precondition(view.string == original)
+
+    try bridge.setSourceMode(true)
+    view.refreshFromRust()
+    try bridge.setSelection(NSRange(location: hidden.location, length: 0))
+    let modeRevision = bridge.revision
+    try bridge.setSourceMode(false)
+    view.refreshFromRust()
+    precondition(view.selectedRange() == NSRange(location: hidden.location, length: 0))
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition(bridge.revision == modeRevision && view.string == original)
+    _ = try bridge.insertText("X")
+    view.refreshFromRust()
+    precondition(disclosure()?.accessibilityPerformPress() == true)
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == false)
+    view.undo(nil)
+    precondition(view.string == original)
+    precondition(view.selectedRange() == NSRange(location: hidden.location, length: 0))
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    precondition(disclosure()?.accessibilityPerformPress() == true)
+    view.redo(nil)
+    precondition(view.string == original.replacingOccurrences(of: "Hidden body", with: "XHidden body"))
+    precondition((disclosure()?.accessibilityValue as? NSNumber)?.boolValue == true)
+    view.undo(nil)
+    precondition(view.string == original)
+
+}
+
 func runAccessibilitySelfCheck(path: String) -> Never {
     do {
+        try checkDisclosureAccessibility()
+        try checkHiddenContentNavigation()
         let bridge = try StorageBridge(path: path)
         let textView = DocumentTextView(bridge: bridge)
         let initialRevision = bridge.revision
@@ -1558,9 +2315,27 @@ func runAccessibilitySelfCheck(path: String) -> Never {
             precondition(tasks.allSatisfy { $0.accessibilityRole == .checkBox })
             precondition(tasks.allSatisfy { $0.accessibilityValue is NSNumber })
         }
+        var openedLinkURLs: [URL] = []
+        textView.linkURLOpener = { url in openedLinkURLs.append(url); return true }
+        for link in links {
+            let expected = link.accessibilityURL
+            precondition(expected != nil)
+            precondition(link.accessibilityPerformPress())
+            precondition(openedLinkURLs.last == expected)
+        }
+        precondition(openedLinkURLs.count == links.count)
+        let linkMenus = links.map { textView.linkMenuItems(at: $0.node.labelRange.location) }
+        for (link, items) in zip(links, linkMenus) {
+            precondition(items.map(\.title) == ["打开链接", "复制链接地址"])
+            precondition(items.allSatisfy { textView.validateMenuItem($0) })
+            precondition(NSApp.sendAction(items[0].action!, to: textView, from: items[0]))
+            precondition(openedLinkURLs.last == link.accessibilityURL)
+            precondition(NSApp.sendAction(items[1].action!, to: textView, from: items[1]))
+            precondition(NSPasteboard.general.string(forType: .string) == (try? bridge.linkDestination(at: link.node.labelRange.location, expectedRevision: initialRevision)))
+        }
         precondition(
             allInitial
-                .filter { $0.node.kind != SemanticAccessibilityKind.taskListItem.rawValue }
+                .filter { $0.node.kind != SemanticAccessibilityKind.taskListItem.rawValue && !links.contains($0) }
                 .allSatisfy { !$0.accessibilityPerformPress() }
         )
 
@@ -1629,6 +2404,15 @@ func runAccessibilitySelfCheck(path: String) -> Never {
         } else {
             actionRevision = initialRevision
             actionChildren = initialChildren
+        }
+
+        if bridge.revision != initialRevision {
+            let before = openedLinkURLs.count
+            for item in linkMenus.flatMap({ $0 }) {
+                precondition(!textView.validateMenuItem(item))
+                if let action = item.action { _ = NSApp.sendAction(action, to: textView, from: item) }
+            }
+            precondition(openedLinkURLs.count == before)
         }
 
         // Headless splitter contract: the real coordinator supplies these
@@ -2041,4 +2825,405 @@ func runMultiCursorSelfCheck(path: String) -> Never {
         fputs("Yu multi-cursor self-check failed: \(error)\n", stderr)
         exit(EXIT_FAILURE)
     }
+}
+
+/// Control/FFI contract check; deliberately not a real sheet interaction claim.
+func runImagePropertiesSelfCheck(path: String) -> Never {
+    do {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("yu-image-properties-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let document = root.appendingPathComponent("note.md")
+        let imageName = "图 100%.png"
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: root.appendingPathComponent(imageName))
+        let uri = try StorageBridge.imageURI(forLocalPath: imageName)
+        precondition(uri == "%E5%9B%BE%20100%25.png")
+        let source = "# 保留\r\n\r\n![图](\(uri))\r\n"
+        let bytes = Data([0xef, 0xbb, 0xbf]) + Data(source.utf8)
+        try bytes.write(to: document)
+        let bridge = try StorageBridge(path: document.path)
+        let offset = (source as NSString).range(of: "![图]").location
+        let properties = try bridge.imageProperties(at: offset)
+        precondition(properties.alternative == "图" && properties.destination == uri)
+        var finished = false
+        let panel = ImagePropertiesPanel(properties: properties, document: document,
+            apply: { _ = try bridge.updateImageProperties($0) }, finished: { finished = true })
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let views = descendants(panel.window!.contentView!)
+        func field(_ name: String) -> NSTextField {
+            views.first { $0.identifier?.rawValue == "yu-image-" + name } as! NSTextField
+        }
+        func button(_ title: String) -> NSButton { views.compactMap { $0 as? NSButton }.first { $0.title == title }! }
+        func change(_ name: String, _ value: String) {
+            let target = field(name)
+            target.stringValue = value
+            let event = Notification(name: Notification.Name("control-check"), object: target)
+            panel.controlTextDidChange(event)
+            panel.controlTextDidEndEditing(event)
+        }
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            panel.window?.appearance = NSAppearance(named: appearance)
+            let content = panel.window!.contentView!
+            content.layoutSubtreeIfNeeded()
+            let right = button("应用").convert(button("应用").bounds, to: content).maxX
+            precondition(abs(right - (content.bounds.maxX - 24)) < 1, "sheet actions must align to the trailing inset")
+            precondition(field("destination").cell?.usesSingleLineMode == true)
+        }
+        precondition(field("destination").stringValue == imageName)
+        let replacementName = "副本 %.png"
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: root.appendingPathComponent(replacementName))
+        change("destination", replacementName)
+        change("width", "0")
+        button("应用").performClick(nil)
+        precondition(bridge.source == source && !finished)
+        change("width", "128")
+        precondition(field("height").stringValue == "128")
+        change("alternative", "羽 <图>")
+        button("应用").performClick(nil)
+        let changed = bridge.source
+        precondition(finished && changed.contains("width=\"128\" height=\"128\""))
+        precondition(changed.contains("alt=\"羽 &lt;图&gt;\""))
+        do { _ = try bridge.updateImageProperties(properties); preconditionFailure("stale property edit accepted") }
+        catch {}
+        _ = try bridge.executeCommand(8)
+        precondition(bridge.source == source)
+        _ = try bridge.executeCommand(9)
+        precondition(bridge.source == changed)
+        try bridge.save()
+        let reopened = try StorageBridge(path: document.path)
+        let restored = try reopened.imageProperties(at: offset)
+        precondition(restored.identity.width == 128 && restored.identity.height == 128)
+        precondition(restored.alternative == "羽 <图>" && reopened.source == changed)
+        let replacementURI = try StorageBridge.imageURI(forLocalPath: replacementName)
+        precondition(restored.destination == replacementURI)
+        let saved = try Data(contentsOf: document)
+        precondition(saved == Data([0xef, 0xbb, 0xbf]) + Data(changed.utf8))
+        let cancelled = ImagePropertiesPanel(properties: restored, document: document,
+            apply: { _ in preconditionFailure("cancel applied properties") }, finished: {})
+        let cancel = descendants(cancelled.window!.contentView!).compactMap { $0 as? NSButton }.first { $0.title == "取消" }!
+        cancel.performClick(nil)
+        precondition(reopened.source == changed)
+        // Actual ImageIO failures and AppKit target/action, without posting
+        // system mouse events or claiming right-click window acceptance.
+        let retryDocument = root.appendingPathComponent("retry.md")
+        let retrySource = "![missing](restored.png)\r\n"
+        let retryBytes = Data([0xef, 0xbb, 0xbf]) + Data(retrySource.utf8)
+        try retryBytes.write(to: retryDocument)
+        let retryBridge = try StorageBridge(path: retryDocument.path)
+        let retryView = DocumentTextView(bridge: retryBridge)
+        retryView.isEditable = true
+        var refreshes = 0
+        retryView.onResourceChange = { refreshes += 1 }
+        let retryProperties = try retryBridge.imageProperties(at: 0)
+        func settleImage() throws -> NativeMacosRenderHostSnapshot {
+            let deadline = Date().addingTimeInterval(5)
+            repeat {
+                let frame = try retryBridge.macosRenderHostFrame(revision: retryBridge.revision,
+                    size: 16, maxWidth: 500, scrollY: 0, viewportHeight: 240,
+                    surfaceGeneration: 0, appearance: UInt8(YU_STORAGE_APPEARANCE_LIGHT))
+                if !frame.resourceRefreshPending { return frame }
+                Thread.sleep(forTimeInterval: 0.005)
+            } while Date() < deadline
+            throw CocoaError(.coderInvalidValue)
+        }
+        let failedFrame = try settleImage()
+        let failedStatus = try retryBridge.imageResourceStatus(retryProperties)
+        precondition(failedStatus == UInt8(YU_STORAGE_IMAGE_RESOURCE_FAILED) && !failedFrame.resourceRetryPending)
+        let retryItem = retryView.imageResourceMenuItem(at: 0)!
+        precondition(retryItem.title == "图片加载失败，重试" && retryView.validateMenuItem(retryItem))
+        try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: root.appendingPathComponent("restored.png"))
+        let retryMenu = NSMenu()
+        retryMenu.addItem(retryItem)
+        retryMenu.performActionForItem(at: 0)
+        precondition(refreshes == 1)
+        let readyFrame = try settleImage()
+        precondition(!readyFrame.resourceRetryPending)
+        let readyStatus = try retryBridge.imageResourceStatus(retryProperties)
+        precondition(readyStatus == UInt8(YU_STORAGE_IMAGE_RESOURCE_READY))
+        precondition(retryView.imageResourceMenuItem(at: 0) == nil && !retryView.validateMenuItem(retryItem))
+        precondition(retryBridge.source == retrySource && retryBridge.revision == 0 && !retryBridge.commandAvailable(8))
+        let retrySaved = try Data(contentsOf: retryDocument)
+        precondition(retrySaved == retryBytes)
+        try FileManager.default.removeItem(at: root)
+        print("Yu image properties self-check: native controls, ratio, invalid dimensions, revision-bound FFI, undo/redo, BOM/CRLF save/reopen and failed-image menu target/action retry passed; real sheet/right-click events require window acceptance")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu image properties self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+/// Tests shared settings notifications against multiple native document hosts.
+/// Window geometry/scrolling still requires the external event suite.
+func runReadingPreferencesSelfCheck(path: String) -> Never {
+    do {
+        try { () throws -> Void in
+            let defaults = UserDefaults.standard
+            let saved = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+            defer { defaults.setVolatileDomain(saved, forName: UserDefaults.argumentDomain) }
+            func preferences(_ size: Double, _ column: Double) {
+                defaults.setVolatileDomain(["Yu.bodyFontSize": size, "Yu.readingColumnWidth": column,
+                    "Yu.readingTheme": 0, "Yu.focusMode": size > 16], forName: UserDefaults.argumentDomain)
+                NotificationCenter.default.post(name: NativeTheme.didChange, object: nil)
+            }
+            preferences(16, 0)
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("yu-reading-preferences-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let original = try Data(contentsOf: URL(fileURLWithPath: path))
+            var bridges: [StorageBridge] = []
+            var controllers: [DocumentViewController] = []
+            for index in 0..<2 {
+                let file = root.appendingPathComponent("note-\(index).md")
+                try original.write(to: file)
+                let bridge = try StorageBridge(path: file.path)
+                let controller = DocumentViewController(bridge: bridge)
+                _ = controller.view
+                controller.withFileInputForSelfCheck { precondition($0.font?.pointSize == 16) }
+                bridges.append(bridge)
+                controllers.append(controller)
+            }
+            let revealCoordinator = MacosSurfaceHostCoordinator(bridge: bridges[0])
+            revealCoordinator.verifyDeferredCaretRevealForSelfCheck()
+            withExtendedLifetime(revealCoordinator) {}
+            let sources = bridges.map { $0.source }
+            let revisions = bridges.map { $0.revision }
+            preferences(20, 600)
+            for controller in controllers {
+                controller.withFileInputForSelfCheck { precondition($0.font?.pointSize == 20) }
+            }
+            let geometry = NativeTheme.reading(width: 1200, windowWidth: 1600)
+            precondition(geometry.content_width == 600 && geometry.origin_x == 300)
+            precondition(bridges.map { $0.source } == sources && bridges.map { $0.revision } == revisions)
+            let future = DocumentViewController(bridge: try StorageBridge(path: root.appendingPathComponent("note-0.md").path))
+            _ = future.view
+            future.withFileInputForSelfCheck { precondition($0.font?.pointSize == 20) }
+            preferences(16, 0)
+            for controller in controllers + [future] {
+                controller.withFileInputForSelfCheck { precondition($0.font?.pointSize == 16) }
+            }
+            precondition(NativeTheme.reading(width: 1200, windowWidth: 1600).content_width == 760)
+            for index in 0..<2 {
+                let bytes = try Data(contentsOf: root.appendingPathComponent("note-\(index).md"))
+                precondition(bytes == original)
+            }
+        }()
+        print("Yu reading preferences self-check: existing/future native hosts share font settings, Rust owns custom/default columns, source/revision/file bytes unchanged; visible window acceptance pending")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu reading preferences self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+func runImageBatchSelfCheck(path: String) -> Never {
+    do {
+        try { () throws -> Void in
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("yu-image-batch-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let defaults = UserDefaults.standard
+            let old = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+            defaults.setVolatileDomain(["Yu.imagePolicy": "copy", "Yu.imageDirectory": "assets"], forName: UserDefaults.argumentDomain)
+            defer { defaults.setVolatileDomain(old, forName: UserDefaults.argumentDomain) }
+            let image = root.appendingPathComponent("图 %.png")
+            let bytes = try Data(contentsOf: URL(fileURLWithPath: path))
+            try bytes.write(to: image)
+            let draft = try NativeDocumentLocations.current.newDraftURL()
+            defer { try? FileManager.default.removeItem(at: draft) }
+            let bridge = try StorageBridge(path: draft.path, mode: .untitled)
+            let controller = DocumentViewController(bridge: bridge)
+            _ = controller.view
+            var textView: DocumentTextView!
+            controller.withFileInputForSelfCheck { textView = $0 }
+            controller.savePanelDecision = { _ in nil }
+            let board = NSPasteboard.withUniqueName()
+            defer { board.releaseGlobally() }
+            board.setData(bytes, forType: .png)
+            board.setString("DO NOT INSERT FALLBACK", forType: .string)
+            try textView.pasteFromPasteboardForSelfCheck(board)
+            precondition(bridge.source.isEmpty && bridge.revision == 0 && controller.persistence.isUntitled)
+            precondition(!FileManager.default.fileExists(atPath: draft.deletingLastPathComponent().appendingPathComponent("assets").path))
+            let destination = root.appendingPathComponent("saved.md")
+            controller.savePanelDecision = { _ in destination }
+            let imported = try textView.onImageImport!([.file(image), .data(bytes)], nil)
+            precondition(imported && !controller.persistence.isUntitled && bridge.path == destination.path)
+            let source = bridge.source
+            precondition(source.components(separatedBy: "![").count == 3)
+            let assets = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("assets"), includingPropertiesForKeys: nil)
+            precondition(assets.count == 2 && assets[0] != assets[1])
+            for asset in assets { let data = try Data(contentsOf: asset); precondition(data == bytes) }
+            _ = try bridge.executeCommand(8)
+            precondition(bridge.source.isEmpty)
+            _ = try bridge.executeCommand(9)
+            precondition(bridge.source == source)
+            try bridge.save()
+            let reopened = try StorageBridge(path: destination.path)
+            precondition(reopened.source == source)
+            let revision = bridge.revision
+            do {
+                _ = try textView.onImageImport!([.file(image), .data(Data("broken".utf8))], nil)
+                preconditionFailure("invalid second image imported")
+            } catch NativeImageResources.Failure.invalidImage {}
+            precondition(bridge.source == source && bridge.revision == revision)
+            let after = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("assets"), includingPropertiesForKeys: nil)
+            precondition(Set(after) == Set(assets))
+        }()
+        print("Yu image batch self-check: cancelled first save consumes image paste without text fallback; successful first save, atomic multi-image undo/redo, reopen and failure without side effects passed")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu image batch self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+
+func runSpellingCoordinatorSelfCheck(path: String) -> Never {
+    do {
+        try { () throws -> Void in
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("yu-spelling-coordinator-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let file = root.appendingPathComponent("note.md")
+            let source = "speling and `codde` <https://exampel.com>\r\n"
+            let original = Data(source.utf8)
+            try original.write(to: file)
+            let bridge = try StorageBridge(path: file.path)
+            var publications = 0
+            let coordinator = NativeSpellingCoordinator(bridge: bridge) { publications += 1 }
+            func wait(_ predicate: () -> Bool) {
+                let deadline = Date().addingTimeInterval(10)
+                while !predicate() && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+                precondition(predicate(), "Spelling publication timed out")
+            }
+            coordinator.update(source: source, visible: NSRange(location: 0, length: source.utf16.count), focus: 0, enabled: true)
+            wait { publications > 0 }
+            precondition(coordinator.publishedDiagnosticCount == 1)
+            precondition(bridge.source == source && bridge.revision == 0)
+            coordinator.update(source: source, visible: nil, focus: 0, enabled: false)
+            precondition(coordinator.publishedDiagnosticCount == 0)
+            let disabledPublications = publications
+            coordinator.update(source: source, visible: nil, focus: 0, enabled: true)
+            coordinator.update(source: source, visible: nil, focus: 0, enabled: false)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+            precondition(publications == disabledPublications + 1 && coordinator.publishedDiagnosticCount == 0, "Cancelled work republished diagnostics")
+            let bytes = try Data(contentsOf: file)
+            precondition(bytes == original && bridge.source == source && bridge.revision == 0)
+            withExtendedLifetime(coordinator) {}
+
+            let sentence = "This is a good sentence. "
+            let target = 4094
+            let prefix = String(repeating: sentence, count: target / sentence.utf16.count)
+                + String(repeating: " ", count: target % sentence.utf16.count)
+            let longSource = prefix + "speling " + String(repeating: sentence, count: 200)
+            let longFile = root.appendingPathComponent("boundary.md")
+            try Data(longSource.utf8).write(to: longFile)
+            let longBridge = try StorageBridge(path: longFile.path)
+            var chunkPublications = 0
+            let bounded = NativeSpellingCoordinator(bridge: longBridge) { chunkPublications += 1 }
+            bounded.update(source: longSource, visible: NSRange(location: 4090, length: 30), focus: 0, enabled: true)
+            wait { chunkPublications >= 2 }
+            precondition(bounded.publishedDiagnosticCount == 1, "Overlap must preserve one complete diagnostic across a chunk boundary")
+            precondition(longBridge.source == longSource && longBridge.revision == 0)
+            withExtendedLifetime(bounded) {}
+
+            // A distant caret and viewport must not schedule every intervening
+            // chunk in a long document. The OS still checks real prose here.
+            let sparseSource = String(repeating: sentence + "\n\n", count: 42_000) + "This sentence contains a speling mistake.\n"
+            let sparseFile = root.appendingPathComponent("sparse-long.md")
+            let sparseBytes = Data(sparseSource.utf8)
+            try sparseBytes.write(to: sparseFile)
+            let sparseBridge = try StorageBridge(path: sparseFile.path)
+            var sparsePublications = 0
+            let sparse = NativeSpellingCoordinator(bridge: sparseBridge) { sparsePublications += 1 }
+            sparse.update(source: sparseSource, visible: NSRange(location: 0, length: 100),
+                focus: sparseSource.utf16.count - 3, enabled: true)
+            wait { sparsePublications >= 2 }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+            guard sparsePublications == 2 && sparse.publishedDiagnosticCount == 1 else {
+                throw NSError(domain: "Yu.SpellingSelfCheck", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                    "Distant viewport/caret: expected 2 publications and 1 diagnostic; got \(sparsePublications) and \(sparse.publishedDiagnosticCount)"])
+            }
+            precondition(sparseBridge.source == sparseSource && sparseBridge.revision == 0)
+            let sparseSaved = try Data(contentsOf: sparseFile)
+            precondition(sparseSaved == sparseBytes)
+            withExtendedLifetime(sparse) {}
+
+            let clippedSource = String(repeating: "x", count: 9_000) + " This sentence contains a speling mistake."
+            let clippedFile = root.appendingPathComponent("clipped-word.md")
+            try Data(clippedSource.utf8).write(to: clippedFile)
+            let clippedBridge = try StorageBridge(path: clippedFile.path)
+            var clippedPublications = 0
+            let clipped = NativeSpellingCoordinator(bridge: clippedBridge) { clippedPublications += 1 }
+            clipped.update(source: clippedSource, visible: NSRange(location: 0, length: 20),
+                focus: clippedSource.utf16.count - 2, enabled: true)
+            wait { clippedPublications >= 2 }
+            precondition(clipped.publishedDiagnosticCount == 1,
+                "An oversized word clipped at a chunk boundary must not publish partial-word errors")
+            withExtendedLifetime(clipped) {}
+
+            // Exercise generation cancellation across the actual Rust IME
+            // bridge. This is a contract test, not real keyboard/IME evidence.
+            let beforeIME = publications
+            coordinator.update(source: source, visible: nil, focus: 0, enabled: true)
+            try bridge.beginComposition(replacementRange: NSRange(location: 0, length: 0),
+                preedit: "pin", selection: NSRange(location: 3, length: 0))
+            coordinator.update(source: source, visible: nil, focus: 0, enabled: true)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+            precondition(publications == beforeIME && bridge.source == source,
+                "A queued check must not publish into active composition")
+            try bridge.cancelComposition()
+            coordinator.update(source: source, visible: nil, focus: 0, enabled: true)
+            wait { publications > beforeIME }
+            precondition(coordinator.publishedDiagnosticCount == 1 && bridge.source == source)
+            coordinator.update(source: source, visible: nil, focus: 0, enabled: false)
+            coordinator.update(source: source, visible: nil, focus: 0, enabled: true)
+            try bridge.setSelection(NSRange(location: 0, length: 7))
+            _ = try bridge.insertText("spelling")
+            let edited = bridge.source
+            let beforeEditPublication = publications
+            coordinator.update(source: edited, visible: nil, focus: 0, enabled: true)
+            wait { publications > beforeEditPublication }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+            precondition(publications == beforeEditPublication + 1 && coordinator.publishedDiagnosticCount == 0,
+                "Stale source requests must not restore corrected diagnostics")
+            precondition(bridge.source == source.replacingOccurrences(of: "speling", with: "spelling"))
+            let unchangedSaved = try Data(contentsOf: file)
+            precondition(unchangedSaved == original)
+        }()
+        print("Yu spelling coordinator self-check: bounded async publication, code/URL exclusion, disable and cancellation, unchanged source/revision/file bytes")
+        exit(EXIT_SUCCESS)
+    } catch {
+        fputs("Yu spelling coordinator self-check failed: \(error)\n", stderr)
+        exit(EXIT_FAILURE)
+    }
+}
+
+
+func runCalendarSelfCheck() {
+    let parser = ISO8601DateFormatter()
+    let midnight = parser.date(from: "2026-01-01T00:00:00Z")!
+    let utc = TimeZone(secondsFromGMT: 0)!
+    let perth = TimeZone(identifier: "Australia/Perth")!
+    let losAngeles = TimeZone(identifier: "America/Los_Angeles")!
+    let base = StorageBridge.referenceDay(at: midnight, timeZone: utc)!
+    precondition(StorageBridge.referenceDay(at: midnight, timeZone: perth) == base)
+    precondition(StorageBridge.referenceDay(at: midnight, timeZone: losAngeles) == base - 1)
+    let evening = parser.date(from: "2026-01-01T20:00:00Z")!
+    precondition(StorageBridge.referenceDay(at: evening, timeZone: perth) == base + 1)
+    let springBefore = parser.date(from: "2026-03-08T09:59:00Z")!
+    let springAfter = parser.date(from: "2026-03-08T10:01:00Z")!
+    precondition(StorageBridge.referenceDay(at: springBefore, timeZone: losAngeles) == StorageBridge.referenceDay(at: springAfter, timeZone: losAngeles))
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("yu-calendar-\(UUID().uuidString).md")
+    let source = "# 日期测试\n"
+    try! source.write(to: path, atomically: true, encoding: .utf8)
+    defer { try? FileManager.default.removeItem(at: path) }
+    let bridge = try! StorageBridge(path: path.path)
+    precondition(try! bridge.updateRenderCalendar(at: midnight, timeZone: utc))
+    precondition(!(try! bridge.updateRenderCalendar(at: midnight.addingTimeInterval(3600), timeZone: utc)))
+    precondition(try! bridge.updateRenderCalendar(at: evening, timeZone: perth))
+    precondition(!(try! bridge.updateRenderCalendar(at: evening.addingTimeInterval(30), timeZone: perth)))
+    precondition(try! bridge.updateRenderCalendar(at: midnight, timeZone: losAngeles))
+    precondition(bridge.source == source)
+    print("Yu calendar self-check: local day, timezone, DST and cached FFI updates passed")
 }

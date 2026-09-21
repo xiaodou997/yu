@@ -133,6 +133,7 @@ struct TableResizePointerState {
 /// the view leaves its window.
 final class MacosSurfaceHostCoordinator {
     private static let timingEnabled = ProcessInfo.processInfo.environment["YU_RENDER_TIMING"] != nil
+    private(set) var caretRevealGeneration: UInt64 = 0
     private var pendingBoundsEventTime: CFTimeInterval?
 
     private func recordMetric(_ event: String, fields: String = "") {
@@ -146,6 +147,7 @@ final class MacosSurfaceHostCoordinator {
 
     func noteBoundsEvent() {
         if !isApplyingCaretReveal && !isApplyingContentExtent {
+            caretRevealGeneration &+= 1
             pendingCaretReveal = nil
         }
         guard Self.timingEnabled else { return }
@@ -264,6 +266,7 @@ final class MacosSurfaceHostCoordinator {
     private var presentationRetry: DispatchWorkItem?
     private var layoutRefinement: DispatchWorkItem?
     private var frameWorkReadyObserver: NSObjectProtocol?
+    private var calendarObservers: [(NotificationCenter, NSObjectProtocol)] = []
     private var occlusionObserver: NSObjectProtocol?
     private var resourceCompletionObserver: NSObjectProtocol?
     private var scheduleToken: UInt64 = 0
@@ -290,6 +293,7 @@ final class MacosSurfaceHostCoordinator {
     private var liveSubmitDurationsMilliseconds: [Double] = []
     private var appliedContentHeight: CGFloat?
     private var isApplyingContentExtent = false
+    private var pendingTypewriterReveal = false
     private var pendingCaretReveal: NativeSelectionEndpoints?
     private var isApplyingCaretReveal = false
     private(set) var lastSubmitDurationMilliseconds: Double = 0.0
@@ -302,6 +306,21 @@ final class MacosSurfaceHostCoordinator {
     init(bridge: StorageBridge, fontSize: CGFloat = 16.0) {
         self.bridge = bridge
         self.fontSize = max(fontSize, 1.0)
+        let calendarEvents: [(NotificationCenter, Notification.Name)] = [
+            (.default, .NSCalendarDayChanged),
+            (.default, .NSSystemTimeZoneDidChange),
+            (.default, .NSSystemClockDidChange),
+            (.default, NSApplication.didBecomeActiveNotification),
+            (NSWorkspace.shared.notificationCenter, NSWorkspace.didWakeNotification),
+        ]
+        for (center, name) in calendarEvents {
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.isAttached, NSApplication.shared.isActive,
+                      self.surfaceView?.window?.occlusionState.contains(.visible) == true else { return }
+                self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: true)
+            }
+            calendarObservers.append((center, observer))
+        }
         occlusionObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeOcclusionStateNotification, object: nil, queue: .main
         ) { [weak self] notification in
@@ -309,9 +328,8 @@ final class MacosSurfaceHostCoordinator {
                   window === self.surfaceView?.window else { return }
             self.layoutRefinement?.cancel()
             self.layoutRefinement = nil
-            if self.isAttached, window.occlusionState.contains(.visible),
-               self.lastSnapshot?.layoutPending == true {
-                self.scheduleSubmit()
+            if self.isAttached, window.occlusionState.contains(.visible) {
+                self.enqueueSubmit(immediate: false, force: true, resetRefreshBudget: true)
             }
         }
         frameWorkReadyObserver = NotificationCenter.default.addObserver(
@@ -334,6 +352,7 @@ final class MacosSurfaceHostCoordinator {
     }
 
     deinit {
+        for (center, observer) in calendarObservers { center.removeObserver(observer) }
         if let occlusionObserver {
             NotificationCenter.default.removeObserver(occlusionObserver)
         }
@@ -381,6 +400,7 @@ final class MacosSurfaceHostCoordinator {
     /// state explicit so the scheduler can use a frame-paced, latest-only path
     /// during the gesture without changing caret or edit submission semantics.
     func beginLiveScroll() {
+        caretRevealGeneration &+= 1
         readingAnchor = nil
         pendingCaretReveal = nil
         if liveScrollDepth == 0 {
@@ -1007,10 +1027,37 @@ final class MacosSurfaceHostCoordinator {
     /// scroll-only adapter: it never asks TextKit for a caret and never lets
     /// AppKit invent document geometry. A stale or unavailable request is
     /// ignored so a transient surface race cannot interrupt editing.
-    func revealCaretIfNeeded() {
-        guard !isLiveScrolling else { return }
-        pendingCaretReveal = bridge.selectionEndpoints
+    func revealCaretIfNeeded(typewriter: Bool = false, generation: UInt64? = nil) {
+        guard !isLiveScrolling, generation == nil || generation == caretRevealGeneration else { return }
+        let selection = bridge.selectionEndpoints
+        let sameTarget = pendingCaretReveal.map {
+            $0.revision == selection.revision && $0.focusUTF16 == selection.focusUTF16
+                && $0.anchorUTF16 == selection.anchorUTF16 && $0.affinity == selection.affinity
+        } ?? false
+        pendingTypewriterReveal = NativeWritingPreferences.shared.typewriterMode
+            && (typewriter || (sameTarget && pendingTypewriterReveal))
+        pendingCaretReveal = selection
         _ = continueCaretReveal()
+    }
+
+    /// Deterministic event-order regression: an edit queues a main-thread
+    /// reveal, then the user scrolls before that closure is delivered.
+    func verifyDeferredCaretRevealForSelfCheck() {
+        let queued = caretRevealGeneration
+        noteBoundsEvent()
+        revealCaretIfNeeded(typewriter: true, generation: queued)
+        precondition(pendingCaretReveal == nil, "Deferred editing must not undo a newer user scroll")
+        revealCaretIfNeeded(typewriter: true, generation: caretRevealGeneration)
+        precondition(pendingCaretReveal != nil, "A current edit must retain its layout intent")
+        beginLiveScroll()
+        precondition(pendingCaretReveal == nil)
+        revealCaretIfNeeded(typewriter: true, generation: caretRevealGeneration)
+        precondition(pendingCaretReveal == nil, "Live scrolling must not acquire a caret-follow intent")
+        endLiveScroll()
+        let beforeDetach = caretRevealGeneration
+        detach()
+        revealCaretIfNeeded(typewriter: true, generation: beforeDetach)
+        precondition(pendingCaretReveal == nil, "Detached views must reject queued navigation")
     }
 
     func refineCaretRevealIfNeeded() {
@@ -1061,7 +1108,8 @@ final class MacosSurfaceHostCoordinator {
                 pendingCaretReveal = nil
                 return false
             }
-            if !request.needsScroll {
+            let centerForTyping = pendingTypewriterReveal && NativeWritingPreferences.shared.typewriterMode
+            if !centerForTyping && !request.needsScroll {
                 if hasCurrentFrame(), (lastSnapshot?.caretDecorationCount ?? 0) > 0 {
                     pendingCaretReveal = nil
                 }
@@ -1071,7 +1119,11 @@ final class MacosSurfaceHostCoordinator {
                 (scrollView.documentView?.bounds.height ?? 0.0) - viewportHeight,
                 0.0
             )
-            let targetScrollY = min(max(request.targetScrollY + CGFloat(NativeTheme.spec(resolved: currentAppearance).top), 0.0), nativeMaxScrollY)
+            let top = CGFloat(NativeTheme.spec(resolved: currentAppearance).top)
+            let desiredScrollY = centerForTyping
+                ? NativeTypewriterGeometry.scrollTarget(caretY: request.caretPoint.y, caretHeight: request.caretHeight, top: top, viewportHeight: viewportHeight, maximumScroll: nativeMaxScrollY)
+                : request.targetScrollY + top
+            let targetScrollY = min(max(desiredScrollY, 0.0), nativeMaxScrollY)
             guard abs(targetScrollY - currentScrollY) > 0.5 else {
                 // AppKit rounds clip origins to backing pixels. A subpixel
                 // difference is settled once this frame contains the caret.
@@ -1113,7 +1165,12 @@ final class MacosSurfaceHostCoordinator {
         }
         // 内容比视口短时仍然占满视口，否则 clip view 会露出背景。
         let theme = NativeTheme.spec(resolved: currentAppearance)
-        let target = max(contentHeight + CGFloat(theme.top + theme.bottom), scrollView.contentView.bounds.height)
+        // Extra trailing space allows the last line to reach the writing position.
+        // It is viewport padding, not source text or independent layout geometry.
+        let trailingSpace = NativeWritingPreferences.shared.typewriterMode
+            ? max(CGFloat(theme.bottom), scrollView.contentView.bounds.height / 2)
+            : CGFloat(theme.bottom)
+        let target = max(contentHeight + CGFloat(theme.top) + trailingSpace, scrollView.contentView.bounds.height)
         let extentChanged = appliedContentHeight.map {
             abs($0 - target) > 0.5
         } ?? true
@@ -1311,6 +1368,7 @@ final class MacosSurfaceHostCoordinator {
     }
 
     func detach() {
+        caretRevealGeneration &+= 1
         layoutRefinement?.cancel()
         layoutRefinement = nil
         readingAnchor = nil

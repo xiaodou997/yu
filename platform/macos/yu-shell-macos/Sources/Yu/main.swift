@@ -19,6 +19,11 @@ if CommandLine.arguments.contains("--presentation-latency-self-check") || Comman
     UserDefaults.standard.setVolatileDomain(["Yu.readingTheme": 0], forName: UserDefaults.argumentDomain)
 }
 NativeTheme.registerFonts()
+if CommandLine.arguments.contains("--calendar-self-check") {
+    runCalendarSelfCheck()
+    exit(0)
+}
+
 if let flag = CommandLine.arguments.firstIndex(of: "--selection-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runSelectionSelfCheck(path: CommandLine.arguments[flag + 1])
@@ -74,6 +79,21 @@ if let flag = CommandLine.arguments.firstIndex(of: "--code-highlight-self-check"
 if let flag = CommandLine.arguments.firstIndex(of: "--accessibility-self-check"),
    CommandLine.arguments.indices.contains(flag + 1) {
     runAccessibilitySelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--image-properties-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runImagePropertiesSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--reading-preferences-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runReadingPreferencesSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--spelling-coordinator-self-check"), CommandLine.arguments.count > flag + 1 {
+    runSpellingCoordinatorSelfCheck(path: CommandLine.arguments[flag + 1])
+}
+if let flag = CommandLine.arguments.firstIndex(of: "--image-batch-self-check"),
+   CommandLine.arguments.indices.contains(flag + 1) {
+    runImageBatchSelfCheck(path: CommandLine.arguments[flag + 1])
 }
 let delegate = AppDelegate()
 app.setActivationPolicy(.regular)

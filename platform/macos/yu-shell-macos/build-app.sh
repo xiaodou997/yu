@@ -14,7 +14,19 @@ done
 "$shell_dir/build-rust-ffi.sh" "$@" >&2
 app_dir="$shell_dir/.build/Yu.app"
 contents_dir="$app_dir/Contents"
-mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources"
+mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources" "$contents_dir/Helpers"
+typeset -a helper_profile_args
+[[ "$profile" == "release" ]] && helper_profile_args+=(--release)
+cargo build --locked --manifest-path "$shell_dir/../../../Cargo.toml" \
+    -p yu-document-renderer --target aarch64-apple-darwin "${helper_profile_args[@]}" >&2
+cp "$shell_dir/../../../target/aarch64-apple-darwin/$profile/yu-document-renderer" "$contents_dir/Helpers/.yu-document-renderer.next"
+mv -f "$contents_dir/Helpers/.yu-document-renderer.next" "$contents_dir/Helpers/yu-document-renderer"
+codesign --force --sign - "$contents_dir/Helpers/yu-document-renderer" >&2
+mkdir -p "$contents_dir/Resources/NativeRendererLicenses"
+cp "$shell_dir/../../../tools/yu-document-renderer/licenses/"*.txt "$contents_dir/Resources/NativeRendererLicenses/"
+cp "$shell_dir/../../../tools/yu-document-renderer/vendor/mitex/LICENSE" "$contents_dir/Resources/NativeRendererLicenses/MiTeX.txt"
+cp "$shell_dir/../../../tools/yu-document-renderer/vendor/xarrow/LICENSE" "$contents_dir/Resources/NativeRendererLicenses/xarrow.txt"
+
 swift build --package-path "$shell_dir" --triple arm64-apple-macosx26.0 -c "$profile" >&2
 binary_dir="$(swift build --package-path "$shell_dir" --triple arm64-apple-macosx26.0 -c "$profile" --show-bin-path)"
 # Replace the executable inode instead of overwriting a previously signed,
