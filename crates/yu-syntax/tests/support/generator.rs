@@ -99,7 +99,8 @@ fn inline(rng: &mut Rng, out: &mut String) {
 /// - **不出制表符**（F2）。缩进一律用空格。
 /// - **链接里不嵌套方括号**（F1）。行内链接的文字里没有 `[`，
 ///   引用式链接的标签与定义严格配对，于是每一个 `[` 都会成立。
-/// - **引用标签只用 ASCII 小写**（F3）。
+/// - **首行不使用 `---`**（F4），改用等价水平线 `***`，避免 front matter。
+///   引用标签继续只用 ASCII 小写。
 pub fn deviation_free_document(seed: u64) -> String {
     let mut rng = Rng::new(seed);
     let mut out = String::new();
@@ -210,6 +211,9 @@ pub fn deviation_free_document(seed: u64) -> String {
             }
         }
         out.push('\n');
+    }
+    if out.starts_with("---\n") {
+        out.replace_range(..3, "***");
     }
     out
 }
@@ -322,6 +326,7 @@ mod tests {
     fn deviation_free_documents_avoid_the_registered_deviations() {
         for seed in 0..500_u64 {
             let document = deviation_free_document(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            assert!(!document.starts_with("---\n"), "F4: metadata opening");
             assert!(!document.contains('\t'), "F2：不该出现制表符\n{document}");
             for line in document.lines() {
                 // F1：任何**未转义**的 `[` 都必须在同一行闭合，且中间不再有

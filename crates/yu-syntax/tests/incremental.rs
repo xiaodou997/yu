@@ -409,3 +409,148 @@ fn spec_inputs() -> Vec<(usize, String)> {
         })
         .collect()
 }
+
+#[test]
+fn dollar_math_incremental_edits_match_full_tree() {
+    for source in [
+        "before $x_1$ after\n",
+        "$x$$y$\n",
+        "\\eqref{a} and \\ref{b}\n",
+        "before\n\n$$\nx^2\n\n+y\n$$\n\nafter\n",
+        "> $$\n> x_2\n> $$\n",
+        "$$x^2$$\nnext\n",
+        "$$\nunclosed\n",
+    ] {
+        for position in source
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(source.len()))
+        {
+            for insertion in ["$", "\n", "\\", "羽"] {
+                let mut buffer = TextBuffer::new(source);
+                let original = parse(&buffer.snapshot()).expect("original").into_tree();
+                let step = apply(
+                    &mut buffer,
+                    &TreeFragment::from_tree(&original),
+                    range_of(position, position),
+                    insertion,
+                );
+                let full = parse(&buffer.snapshot()).expect("full").into_tree();
+                assert_trees_equal(&step.incremental, &full, &step.text, position);
+            }
+        }
+    }
+}
+
+#[test]
+fn writing_marks_incremental_edits_match_full_tree() {
+    for source in [
+        "==中文 **strong**== H~2~O x^2^\n",
+        "> ==highlight== and x^n^\n",
+        "==open\nnext\n",
+        "`==code==` $x^2$ [==link==](target)\n",
+    ] {
+        for position in source
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(source.len()))
+        {
+            for insertion in ["=", "^", "~", "\n", "\\", "羽"] {
+                let mut buffer = TextBuffer::new(source);
+                let original = parse(&buffer.snapshot()).expect("original").into_tree();
+                let step = apply(
+                    &mut buffer,
+                    &TreeFragment::from_tree(&original),
+                    range_of(position, position),
+                    insertion,
+                );
+                let full = parse(&buffer.snapshot()).expect("full").into_tree();
+                assert_trees_equal(&step.incremental, &full, &step.text, position);
+            }
+        }
+    }
+}
+
+#[test]
+fn footnote_incremental_edits_match_full_tree() {
+    for source in [
+        "正文[^羽🙂]\r\n\r\n[^羽🙂]: first\r\n    continued\r\n\r\n    second\r\n\r\nOutside\r\n",
+        "> quote[^a]\n>\n> [^a]: note\n>     continued\n",
+        "- body[^a]\n\n  [^a]: note\n      - nested\n\nNext\n",
+        "[^empty]:\n\nBody[^empty]\n",
+    ] {
+        let boundaries = char_boundaries(source);
+        for (index, &position) in boundaries.iter().enumerate() {
+            for insertion in ["", "^", "]:", "\n", "    ", "羽🙂"] {
+                let mut buffer = TextBuffer::new(source);
+                let original = parse(&buffer.snapshot()).expect("original").into_tree();
+                let end = if insertion.is_empty() {
+                    boundaries.get(index + 1).copied().unwrap_or(position)
+                } else {
+                    position
+                };
+                let step = apply(
+                    &mut buffer,
+                    &TreeFragment::from_tree(&original),
+                    range_of(position, end),
+                    insertion,
+                );
+                let full = parse(&buffer.snapshot()).expect("full").into_tree();
+                assert_trees_equal(&step.incremental, &full, &step.text, position);
+            }
+        }
+    }
+}
+
+#[test]
+fn front_matter_incremental_edits_match_full_tree() {
+    for source in [
+        "---\ntitle: 中文\n---\n\n# Body\n",
+        "---\nkey: value\n",
+        "\u{feff}---\r\nkey: [one, two]\r\n...\r\nBody",
+        "before\n\n---\nkey: value\n---\n",
+    ] {
+        for position in source
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(source.len()))
+        {
+            for insertion in ["-", "\n", "#", "羽"] {
+                let mut buffer = TextBuffer::new(source);
+                let original = parse(&buffer.snapshot()).expect("original").into_tree();
+                let step = apply(
+                    &mut buffer,
+                    &TreeFragment::from_tree(&original),
+                    range_of(position, position),
+                    insertion,
+                );
+                let full = parse(&buffer.snapshot()).expect("full").into_tree();
+                assert_trees_equal(&step.incremental, &full, &step.text, position);
+            }
+        }
+    }
+}
+
+#[test]
+fn moving_metadata_to_and_from_document_start_invalidates_reused_identity() {
+    let metadata = format!(
+        "---\ntitle: {}\n---\n\n# Body\n",
+        "long metadata value ".repeat(30)
+    );
+    for prefix in ["before\n\n", "\n"] {
+        let source = format!("{prefix}{metadata}");
+        let mut buffer = TextBuffer::new(source);
+        let original = parse(&buffer.snapshot()).expect("original").into_tree();
+        let removed = apply(
+            &mut buffer,
+            &TreeFragment::from_tree(&original),
+            range_of(0, prefix.len()),
+            "",
+        );
+        let full = parse(&buffer.snapshot()).expect("full").into_tree();
+        assert_trees_equal(&removed.incremental, &full, &removed.text, 0);
+        let restored = apply(&mut buffer, &removed.fragments, range_of(0, 0), prefix);
+        let full = parse(&buffer.snapshot()).expect("full").into_tree();
+        assert_trees_equal(&restored.incremental, &full, &restored.text, 0);
+    }
+}

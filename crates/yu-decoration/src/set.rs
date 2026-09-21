@@ -71,7 +71,7 @@ impl core::error::Error for MergeError {}
 ///
 /// 不可变、可克隆（克隆是 `Arc` 克隆）、可安全并发读取——不变量 D2。
 /// One normalized source atom, shared by the mapper and visual text reader.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionSpan {
     pub range: yu_core::TextRange,
     pub replacement: Option<crate::ReplacementText>,
@@ -115,6 +115,7 @@ impl DecorationSet {
                     span.range.start().get(),
                     span.range.end().get(),
                     span.replacement
+                        .as_ref()
                         .map_or(0, |character| character.len_utf8() as u64),
                 )
             }),
@@ -249,7 +250,7 @@ impl DecorationSet {
         self.ranges[..upper]
             .iter()
             .filter(|entry| entry.range.end() >= from)
-            .copied()
+            .cloned()
             .collect()
     }
 
@@ -344,7 +345,7 @@ impl DecorationSet {
             }
             mapped.push(DecorationRange {
                 range,
-                decoration: entry.decoration,
+                decoration: entry.decoration.clone(),
                 priority: entry.priority,
             });
         }
@@ -410,12 +411,12 @@ fn normalized_projection(ranges: &[DecorationRange], hidden: &[(u64, u64)]) -> V
         {
             continue;
         }
-        if let Decoration::Substitute { text } = entry.decoration {
+        if let Decoration::Substitute { ref text } = entry.decoration {
             atoms.insert(
                 from,
                 ProjectionSpan {
                     range: entry.range,
-                    replacement: Some(text),
+                    replacement: Some(text.clone()),
                 },
             );
         }
@@ -433,7 +434,7 @@ fn mapped_source_len(before: ByteOffset, changes: &ChangeSet) -> ByteOffset {
 }
 
 /// 让 `Decoration` 在本模块可见（`merge_hidden` 通过 `hides_source` 用到）。
-const _: fn(Decoration) -> bool = Decoration::hides_source;
+const _: fn(&Decoration) -> bool = Decoration::hides_source;
 
 /// 不变量 D2：装饰集合不可变、与 Revision 绑定，**可安全并发读取**。
 ///
@@ -498,7 +499,7 @@ mod tests {
     #[test]
     fn merging_extensions_equals_building_in_one_go() {
         let mark = DecorationRange::new(range(2, 6), Decoration::Mark { style: StyleId(1) });
-        let one = set(12, vec![replace(0, 2), mark]);
+        let one = set(12, vec![replace(0, 2), mark.clone()]);
         let two = set(12, vec![replace(7, 9)]);
         let merged = DecorationSet::merge(Revision::INITIAL, ByteOffset::new(12), [&one, &two])
             .expect("同一个 revision 与长度");
@@ -805,7 +806,7 @@ mod tests {
                 text: '🪶'.into()
             },
         );
-        let entries = vec![newline, emoji, replace(7, 9)];
+        let entries = vec![newline.clone(), emoji, replace(7, 9)];
         let forward = set(10, entries.clone());
         let backward = set(10, entries.into_iter().rev().collect());
         assert_eq!(forward.projection_spans(), backward.projection_spans());
@@ -813,7 +814,7 @@ mod tests {
         assert_eq!(forward.source_to_visual(ByteOffset::new(5)).get(), 2);
         assert_eq!(forward.visual_to_source(visual(6), Bias::Before).get(), 7);
         assert_eq!(forward.visual_to_source(visual(6), Bias::After).get(), 9);
-        let suppressed = set(10, vec![newline, replace(0, 6)]);
+        let suppressed = set(10, vec![newline.clone(), replace(0, 6)]);
         assert!(
             suppressed
                 .projection_spans()
@@ -822,7 +823,7 @@ mod tests {
         );
         let high = DecorationRange::new(range(2, 4), Decoration::Substitute { text: 'x'.into() })
             .with_priority(10);
-        for entries in [vec![newline, high], vec![high, newline]] {
+        for entries in [vec![newline.clone(), high.clone()], vec![high, newline]] {
             let resolved = set(10, entries);
             assert_eq!(resolved.projection_spans().len(), 1);
             assert_eq!(resolved.projection_spans()[0].replacement, Some('x'.into()));

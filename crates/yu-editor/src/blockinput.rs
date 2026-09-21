@@ -502,12 +502,13 @@ impl BlockLayoutSlice {
     }
 }
 
-struct MarkerDraft {
-    gap: f32,
+#[derive(Clone)]
+pub(crate) struct MarkerDraft {
+    pub(crate) gap: f32,
     source: TextRange,
     text: String,
-    advance: f32,
-    shaped: Option<ShapedText>,
+    pub(crate) advance: f32,
+    pub(crate) shaped: Option<ShapedText>,
     shape: Option<MarkerShape>,
 }
 
@@ -518,7 +519,7 @@ fn measure_marker_text<M: ClusterMetrics>(
     measure_marker_parts(marker.source, &marker.text, metrics)
 }
 
-fn measure_marker_parts<M: ClusterMetrics>(
+pub(crate) fn measure_marker_parts<M: ClusterMetrics>(
     source: TextRange,
     text: &str,
     metrics: &M,
@@ -561,6 +562,7 @@ fn shape_marker_text<S: ShapingProvider>(
     if let (Some(kind), Some(provider)) = (kind, shaper.paragraph_provider()) {
         let paragraph = provider
             .layout(&yu_core::ParagraphInput {
+                justify: false,
                 font_strut_mode: yu_core::FontStrutMode::RunMetrics,
                 text: "M",
                 base_direction: config.base_direction(),
@@ -609,10 +611,19 @@ fn shape_marker_text<S: ShapingProvider>(
     shape_marker_parts(marker.source, &marker.text, shaper)
 }
 
-fn shape_marker_parts<S: ShapingProvider>(
+pub(crate) fn shape_marker_parts<S: ShapingProvider>(
     source: TextRange,
     text: &str,
     shaper: &S,
+) -> Result<MarkerDraft, LayoutError> {
+    shape_marker_parts_at_scale(source, text, shaper, 1.0)
+}
+
+pub(crate) fn shape_marker_parts_at_scale<S: ShapingProvider>(
+    source: TextRange,
+    text: &str,
+    shaper: &S,
+    scale: f32,
 ) -> Result<MarkerDraft, LayoutError> {
     let len = u64::try_from(text.len()).map_err(|_| LayoutError::OffsetOverflow)?;
     // 标记文本是合成的，不在 source 里。它的 shaping 空间是零基的局部空间，
@@ -620,7 +631,7 @@ fn shape_marker_parts<S: ShapingProvider>(
     let local = TextRange::new(ByteOffset::ZERO, ByteOffset::new(len))
         .ok_or(LayoutError::OffsetOverflow)?;
     let shaped = shaper
-        .shape(text, local, TextStyle::Plain)
+        .shape_scaled(text, local, TextStyle::Plain, scale)
         .map_err(|error| LayoutError::Shaping(error.to_string()))?;
     if shaped.source() != local {
         return Err(LayoutError::Shaping(
@@ -632,11 +643,12 @@ fn shape_marker_parts<S: ShapingProvider>(
         return Err(LayoutError::InvalidMetrics(advance.to_bits()));
     }
     let gap = shaper
-        .shape(
+        .shape_scaled(
             " ",
             TextRange::new(ByteOffset::ZERO, ByteOffset::new(1))
                 .ok_or(LayoutError::OffsetOverflow)?,
             TextStyle::Plain,
+            scale,
         )
         .map_err(|error| LayoutError::Shaping(error.to_string()))?
         .advance();
@@ -751,6 +763,7 @@ struct DecorationDraft {
     widgets: Vec<WidgetSpan>,
     widget_sources: Vec<TextRange>,
     styles: Vec<TextAttrs>,
+    style_headings: Vec<Option<u8>>,
     source_range: TextRange,
     heading: Option<u8>,
     quote: Option<(u8, u8)>,
@@ -761,6 +774,7 @@ struct DecorationDraft {
     /// 这一块要画一条分隔线。**没有负载**：`BlockOrnament::ThematicBreak`
     /// 不带拼法也不带几何，画在哪由 [`DecorationDraft::assemble`] 现算。
     rule: bool,
+    justify: bool,
 }
 
 /// 列表标记的语义值，还没量过宽度。
@@ -842,12 +856,92 @@ impl DecorationDraft {
             None => (runs, widgets),
         };
 
+        // Cell headings share this style table with glyph painting. Split runs
+        // at paragraph boundaries instead of scaling an independently shaped copy.
+        let mut style_headings = vec![None; styles.len()];
+        let mut scoped = Vec::new();
+        for (_, ornament) in decorations.line_ornaments() {
+            if let BlockOrnament::Table(table) = ornament {
+                for row in 0..table.visible_row_count() {
+                    for column in 0..table.column_count() {
+                        for part in
+                            table.cell_paragraphs(yu_markdown::TableCellAddress::new(row, column))
+                        {
+                            if let Some(level) = part.heading {
+                                let source = TextRange::new(
+                                    ByteOffset::new(part.source.start() as u64),
+                                    ByteOffset::new(part.source.end() as u64),
+                                )
+                                .ok_or(LayoutError::OffsetOverflow)?;
+                                let range = visual
+                                    .content_visual_range(source)
+                                    .map_err(|e| LayoutError::Upstream(e.to_string()))?;
+                                scoped.push((range.start(), range.end(), level));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        scoped.sort_unstable_by_key(|(start, _, _)| *start);
+        let runs = if scoped.is_empty() {
+            runs
+        } else {
+            let mut contextual_runs = Vec::new();
+            let mut contextual_styles = std::collections::BTreeMap::new();
+            for run in runs {
+                let mut boundaries = vec![run.visual().start(), run.visual().end()];
+                let first = scoped.partition_point(|(_, end, _)| *end <= run.visual().start());
+                for (start, end, _) in scoped[first..]
+                    .iter()
+                    .take_while(|(start, _, _)| *start < run.visual().end())
+                {
+                    if *start > run.visual().start() && *start < run.visual().end() {
+                        boundaries.push(*start);
+                    }
+                    if *end > run.visual().start() && *end < run.visual().end() {
+                        boundaries.push(*end);
+                    }
+                }
+                boundaries.sort_unstable();
+                boundaries.dedup();
+                for pair in boundaries.windows(2) {
+                    let candidate = scoped.partition_point(|(_, end, _)| *end <= pair[0]);
+                    let level = scoped
+                        .get(candidate)
+                        .filter(|(start, end, _)| *start <= pair[0] && pair[1] <= *end)
+                        .map(|(_, _, level)| *level);
+                    let style = if let Some(level) = level {
+                        let key = (run.style().0, level);
+                        if let Some(style) = contextual_styles.get(&key) {
+                            *style
+                        } else {
+                            let base = styles[run.style().0 as usize];
+                            let style = StyleId(
+                                u32::try_from(styles.len())
+                                    .map_err(|_| LayoutError::OffsetOverflow)?,
+                            );
+                            styles.push(base);
+                            style_headings.push(Some(level));
+                            contextual_styles.insert(key, style);
+                            style
+                        }
+                    } else {
+                        run.style()
+                    };
+                    push_run(&mut contextual_runs, pair[0], pair[1], style)?;
+                }
+            }
+            contextual_runs
+        };
+
         let mut heading = None;
         let mut quote = None;
         let mut indent_columns = 0_u8;
         let mut marker = None;
         let mut ancestors = Vec::new();
         let mut rule = false;
+        let mut justify = false;
         for (_, ornament) in decorations.line_ornaments() {
             match ornament {
                 BlockOrnament::Heading { level } => heading = Some(*level),
@@ -882,6 +976,9 @@ impl DecorationDraft {
                 // 几何，再把排好的簇搬进单元格。围栏代码块的语言名与正文
                 // 也不进：它们是给嵌入渲染（KaTeX / Mermaid）看的语义，
                 // 排版上代码块就是一段等宽文字。
+                BlockOrnament::Alignment { alignment } => {
+                    justify = *alignment == yu_markdown::html::HtmlAlignment::Justify;
+                }
                 BlockOrnament::Table(_) | BlockOrnament::FencedCode { .. } => {}
             }
         }
@@ -901,6 +998,7 @@ impl DecorationDraft {
             widgets,
             widget_sources,
             styles,
+            style_headings,
             source_range: bounds,
             heading,
             quote,
@@ -908,6 +1006,7 @@ impl DecorationDraft {
             marker,
             ancestors,
             rule,
+            justify,
         })
     }
 
@@ -978,13 +1077,17 @@ impl DecorationDraft {
         // 每加一样属性都必须在这里显式带过来。配色角色（S7 第五刀）就是这么
         // 掉过一次的——`assemble` 把它归零，代码块里一个字都不着色，而
         // `yu-markdown` 那一侧的断言全绿：装饰产出是对的，丢在下一层。
-        let font_scale = heading.map_or(1.0, |heading| heading.font_scale);
         let literal_monospace = self
             .styles
             .iter()
             .any(|style| style.font() == yu_core::ThemeFont::SystemMono);
         let mut attrs = Vec::with_capacity(self.styles.len());
-        for base in self.styles {
+        for (base, cell_heading) in self.styles.into_iter().zip(self.style_headings) {
+            let heading = cell_heading
+                .map(|level| heading_metrics(level, theme))
+                .transpose()?
+                .or(heading);
+            let font_scale = heading.map_or(1.0, |heading| heading.font_scale);
             let style = if let Some(heading) = heading {
                 if theme.heading_bold[usize::from(heading.level - 1)] != 0 {
                     base.style().union(TextStyle::Strong)
@@ -1003,8 +1106,25 @@ impl DecorationDraft {
             } else {
                 theme.body_font
             };
+            let (script_scale, script_rise) = match base.script() {
+                yu_core::TextScript::Normal => (1.0, 0.0),
+                yu_core::TextScript::Superscript => (
+                    yu_core::ThemeSpec::SCRIPT_SIZE_RATIO,
+                    yu_core::ThemeSpec::SUPERSCRIPT_RISE_EM,
+                ),
+                yu_core::TextScript::Subscript => (
+                    yu_core::ThemeSpec::SCRIPT_SIZE_RATIO,
+                    yu_core::ThemeSpec::SUBSCRIPT_RISE_EM,
+                ),
+            };
             attrs.push(
                 TextAttrs::new(style)
+                    .with_highlighted(base.highlighted())
+                    .with_underlined(base.underlined())
+                    .with_struck(base.struck())
+                    .with_script(base.script())
+                    .with_baseline_offset(script_rise * config.line_height() * font_scale)
+                    .ok_or(LayoutError::InvalidMetrics(config.line_height().to_bits()))?
                     .with_inline_box_id(base.inline_box_id())
                     .with_inline_inset(if base.inline_box_id().is_some() && !is_code_block(kind) {
                         (config.theme().inline_padding().0 + config.theme().inline_border())
@@ -1033,6 +1153,7 @@ impl DecorationDraft {
                     .ok_or(LayoutError::InvalidMetrics(config.line_height().to_bits()))?
                     .with_size_scale(
                         font_scale
+                            * script_scale
                             * if is_code_block(kind) && base.style().is_code() {
                                 theme.code_block_size_ratio
                             } else if base.style().is_code() {
@@ -1105,8 +1226,9 @@ impl DecorationDraft {
             lines: vec![LineSpan::new(visual, BLOCK_LINE_STYLE)],
             styles: BlockStyleTable { attrs },
             line_styles: BlockLineStyleTable {
-                attrs: LineAttrs::new(indent, line_height_scale)?.with_font_struts(
-                    if literal_monospace {
+                attrs: LineAttrs::new(indent, line_height_scale)?
+                    .with_justification(self.justify)
+                    .with_font_struts(if literal_monospace {
                         yu_core::FontStrutMode::BaseFont
                     } else if heading.is_some() {
                         yu_core::FontStrutMode::DeclaredFonts
@@ -1116,8 +1238,7 @@ impl DecorationDraft {
                         config.theme().body_font_struts()
                     } else {
                         config.theme().code_font_struts()
-                    },
-                ),
+                    }),
             },
             ornaments: BlockOrnaments {
                 heading: heading.map(|heading| HeadingOrnament {

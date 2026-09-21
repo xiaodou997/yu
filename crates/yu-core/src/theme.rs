@@ -234,6 +234,7 @@ pub struct ThemeSpec {
     pub sidebar: u32,
     pub code_background: u32,
     pub inline_background: u32,
+    pub highlight_background: u32,
     pub border: u32,
     pub table_border: u32,
     pub table_header: u32,
@@ -242,6 +243,10 @@ pub struct ThemeSpec {
 }
 
 impl ThemeSpec {
+    pub const SCRIPT_SIZE_RATIO: f32 = 0.75;
+    pub const SUPERSCRIPT_RISE_EM: f32 = 0.4;
+    pub const SUBSCRIPT_RISE_EM: f32 = -0.2;
+
     /// Both reference themes position task inputs 1.3em before the list text.
     pub const TASK_MARKER_ADVANCE_EM: f32 = 1.3;
 
@@ -300,6 +305,7 @@ impl ThemeSpec {
         sidebar: 0xfafafaff,
         code_background: 0xf8f8f8ff,
         inline_background: 0xf3f4f4ff,
+        highlight_background: 0xffe780ff,
         border: 0xe7eaedff,
         table_border: 0xdfe2e5ff,
         table_header: 0xf8f8f8ff,
@@ -326,6 +332,7 @@ impl ThemeSpec {
         text: 0xe6e6e8ff,
         code_background: 0x2a2a2dff,
         inline_background: 0x303034ff,
+        highlight_background: 0x665522ff,
         code_border_color: 0x424247ff,
         border: 0x424247ff,
         table_border: 0x424247ff,
@@ -390,6 +397,7 @@ impl ThemeSpec {
         sidebar: 0x2e3033ff,
         code_background: 0x333333ff,
         inline_background: 0x0000000d,
+        highlight_background: 0x665522ff,
         inline_radius: 0.0,
         border: 0x52575cff,
         link: 0xe0e0e0ff,
@@ -398,16 +406,32 @@ impl ThemeSpec {
 
     #[must_use]
     pub fn reading_geometry(self, width: f32, window_width: f32, scroll_y: f32) -> ReadingGeometry {
+        self.reading_geometry_with_column(width, window_width, scroll_y, None)
+    }
+
+    /// A user-selected text width overrides theme breakpoints while retaining
+    /// the theme gutters and the same geometry for rendering and native input.
+    #[must_use]
+    pub fn reading_geometry_with_column(
+        self,
+        width: f32,
+        window_width: f32,
+        scroll_y: f32,
+        column: Option<f32>,
+    ) -> ReadingGeometry {
         let width = width.max(1.0);
-        let outer_limit = if self.body_font == ThemeFont::SystemUi {
-            self.column_width
-        } else if window_width >= 1800.0 {
-            1200.0
-        } else if window_width >= 1400.0 {
-            1024.0
-        } else {
-            self.column_width
-        };
+        let outer_limit =
+            if let Some(column) = column.filter(|value| value.is_finite() && *value > 0.0) {
+                column + self.gutter * 2.0
+            } else if self.body_font == ThemeFont::SystemUi {
+                self.column_width
+            } else if window_width >= 1800.0 {
+                1200.0
+            } else if window_width >= 1400.0 {
+                1024.0
+            } else {
+                self.column_width
+            };
         // The theme's max-width includes the two #write paddings (border-box).
         let outer_width = width.min(outer_limit);
         let origin_x = ((width - outer_width) * 0.5 + self.gutter).min((width - 1.0) * 0.5);
@@ -436,6 +460,24 @@ pub struct ReadingGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_reading_column_uses_shared_geometry_and_narrow_window_gutters() {
+        for theme in [ThemeSpec::YU_LIGHT, ThemeSpec::GITHUB, ThemeSpec::NIGHT] {
+            let wide = theme.reading_geometry_with_column(1600.0, 1800.0, 125.0, Some(600.0));
+            assert_eq!(wide.content_width, 600.0);
+            assert_eq!(wide.origin_x, 500.0);
+            assert_eq!(wide.camera_x, -wide.origin_x);
+            assert_eq!(wide.camera_y, 125.0 - theme.top);
+            let narrow = theme.reading_geometry_with_column(400.0, 1800.0, 0.0, Some(600.0));
+            assert_eq!(narrow.content_width, 400.0 - theme.gutter * 2.0);
+            assert_eq!(narrow.origin_x, theme.gutter);
+            assert_eq!(
+                theme.reading_geometry_with_column(1600.0, 1800.0, 0.0, None),
+                theme.reading_geometry(1600.0, 1800.0, 0.0)
+            );
+        }
+    }
 
     #[test]
     fn yu_theme_keeps_one_reading_geometry_across_appearance_and_wide_windows() {

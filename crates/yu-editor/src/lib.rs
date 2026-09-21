@@ -8,6 +8,8 @@
 //! 理由见 `docs/architecture/overview-v2.md` 第 8 节 S4。
 
 mod accessibility;
+mod anchor;
+pub use anchor::document_anchor_target;
 mod blockinput;
 mod blockview;
 mod command;
@@ -24,15 +26,17 @@ mod outline;
 mod panel;
 mod search;
 mod table;
+mod toc;
+pub use toc::{TocLink, TocProjection};
 mod viewport;
 mod visual;
 mod widget;
 
 pub use accessibility::{
-    ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
-    AccessibilitySemanticKind, AccessibilitySemanticNode, AccessibilitySemanticSnapshot,
-    AccessibilityTextError, AccessibilityTextPosition, AccessibilityTextRange,
-    AccessibilityTextSnapshot,
+    ACCESSIBILITY_SEMANTIC_FLAG_EXPANDED, ACCESSIBILITY_SEMANTIC_FLAG_ORDERED,
+    ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE, AccessibilitySemanticKind, AccessibilitySemanticNode,
+    AccessibilitySemanticSnapshot, AccessibilityTextError, AccessibilityTextPosition,
+    AccessibilityTextRange, AccessibilityTextSnapshot,
 };
 pub use blockinput::{
     BlockLayoutInput, BlockLineStyleTable, BlockOrnaments, BlockQuoteOrnament, BlockStyleTable,
@@ -44,10 +48,14 @@ pub use command::{
 };
 pub use decorations::{DecorationCache, DecorationCacheStats, DecorationError};
 pub use document::{
-    EditorDocument, EditorDocumentError, EditorRenderSnapshot, EditorState, LayoutContext,
-    LayoutQuery, LayoutSnapshot, SnapshotBlock, SnapshotContainer, TableColumnWidthRecord,
+    EditorDocument, EditorDocumentError, EditorRenderSnapshot, EditorState, ImageProperties,
+    LayoutContext, LayoutQuery, LayoutSnapshot, SnapshotBlock, SnapshotContainer,
+    TableColumnWidthRecord,
 };
-pub use image::{CheckboxPlacement, ImagePlacement, PlacedWidget};
+pub use image::{
+    CheckboxPlacement, ImagePlacement, ImageReference, PlacedWidget, local_image_markdown,
+    local_image_uri,
+};
 pub use keymap::{EditorKey, KeyEvent, KeyModifiers, command_for_key};
 pub use layout::{BlockLayoutSource, LayoutBackend, LayoutCache, LayoutCacheStats};
 pub use outline::{OutlineItem, OutlineSnapshot};
@@ -74,6 +82,7 @@ pub use yu_layout::{
     BlockLayout, GlyphBox, HeightIndex, HeightIndexError, ImageIntrinsicSize, LayoutConfig,
     LayoutError, LayoutPoint, LayoutRect, MonospaceMetrics,
 };
+pub use yu_markdown::image_destination_text;
 pub use yu_markdown::{
     Block, BlockDecorations, BlockKind, BlockOrnament, BlockWidget, ImageSpan, ListMarker,
     MarkdownDocument, TableAlignment, TableBlock, TaskMarker, TaskState, list_marker, task_marker,

@@ -3,9 +3,16 @@ use crate::TableEdit;
 use yu_markdown::TableCellAddress;
 
 pub(super) struct TableEditPlan {
-    edits: Vec<yu_text::Edit>,
-    table_start: ByteOffset,
-    target: TableCellAddress,
+    pub(super) edits: Vec<yu_text::Edit>,
+    pub(super) table_start: ByteOffset,
+    pub(super) target: TableCellAddress,
+}
+
+pub(super) struct TableCellSelection {
+    ranges: Vec<EditorSelection>,
+    primary: usize,
+    columns: usize,
+    slots: Vec<Option<usize>>,
 }
 
 impl EditorDocument {
@@ -13,28 +20,54 @@ impl EditorDocument {
         &self,
         anchor: ByteOffset,
         focus: ByteOffset,
-    ) -> Option<(Vec<EditorSelection>, usize, usize)> {
+    ) -> Option<TableCellSelection> {
+        if self.source_mode() {
+            return None;
+        }
         let block = self
             .presentation
             .markdown
             .blocks()
             .get(self.block_index_for_offset(anchor)?)?;
-        let table = yu_markdown::table_for_block(&self.presentation.markdown, block)?;
+        let table = self
+            .html_table_grid(block)
+            .or_else(|| yu_markdown::table_for_block(&self.presentation.markdown, block))?;
         let start = table.visible_cell_for_source(anchor.get() as usize)?;
         let end = table.visible_cell_for_source(focus.get() as usize)?;
-        let first_row = start.row().min(end.row());
-        let last_row = start.row().max(end.row());
-        let first_column = start.column().min(end.column());
-        let last_column = start.column().max(end.column());
+        self.table_cell_selection_in_grid(&table, start, end)
+    }
+
+    fn table_cell_selection_in_grid(
+        &self,
+        table: &yu_markdown::TableBlock,
+        start: TableCellAddress,
+        end: TableCellAddress,
+    ) -> Option<TableCellSelection> {
+        let (first, last) = table.selection_bounds(start, end)?;
+        let (first_row, last_row) = (first.row(), last.row());
+        let (first_column, last_column) = (first.column(), last.column());
+        let end = table.cell_origin(end)?;
         let columns = last_column - first_column + 1;
         let snapshot = self.snapshot();
         let mut ranges = Vec::new();
         let mut primary = 0;
+        let mut slots = Vec::new();
+        let mut owners = std::collections::HashMap::new();
         for row in first_row..=last_row {
             for column in first_column..=last_column {
                 let address = TableCellAddress::new(row, column);
-                let cell = table.visible_cell(address)?;
-                if address == end {
+                let Some(cell) = table.visible_cell(address) else {
+                    slots.push(None);
+                    continue;
+                };
+                let origin = table.cell_origin(address)?;
+                if let Some(owner) = owners.get(&(origin.row(), origin.column())) {
+                    slots.push(Some(*owner));
+                    continue;
+                }
+                owners.insert((origin.row(), origin.column()), ranges.len());
+                slots.push(Some(ranges.len()));
+                if origin == end {
                     primary = ranges.len();
                 }
                 ranges.push(
@@ -48,7 +81,12 @@ impl EditorDocument {
                 );
             }
         }
-        Some((ranges, primary, columns))
+        Some(TableCellSelection {
+            ranges,
+            primary,
+            columns,
+            slots,
+        })
     }
 
     pub(super) fn select_table_cells(
@@ -56,7 +94,12 @@ impl EditorDocument {
         anchor: ByteOffset,
         focus: ByteOffset,
     ) -> Result<CommandResult, EditorDocumentError> {
-        let (ranges, primary, columns) = self
+        let TableCellSelection {
+            ranges,
+            primary,
+            columns,
+            slots,
+        } = self
             .table_cell_selection(anchor, focus)
             .ok_or(EditorDocumentError::Selection(SelectionError::InvalidRange))?;
         let previously_revealed = self.presentation.selection_reveal_block_index();
@@ -70,15 +113,29 @@ impl EditorDocument {
             .presentation
             .selections
             .clone()
-            .with_table_columns(columns)?;
+            .with_table_slots(columns, slots)?;
         Ok(self.command_result(false))
     }
 
     pub(super) fn clear_table_cells(&mut self) -> Result<CommandResult, EditorDocumentError> {
         let ranges = self.presentation.selections.as_slice();
         let primary = self.presentation.selections.primary_index();
-        let anchor = ranges[ranges.len() - 1 - primary].ordered_range().start();
-        let focus = ranges[primary].ordered_range().start();
+        let slots = self
+            .presentation
+            .selections
+            .table_slots()
+            .ok_or(EditorDocumentError::InvalidTablePaste)?
+            .to_vec();
+        let columns = self
+            .presentation
+            .selections
+            .table_columns()
+            .ok_or(EditorDocumentError::InvalidTablePaste)?;
+        let anchor = ranges
+            .first()
+            .ok_or(EditorDocumentError::InvalidTablePaste)?
+            .ordered_range()
+            .start();
         let invalid = || EditorDocumentError::Selection(SelectionError::InvalidRange);
         let block = self
             .presentation
@@ -86,14 +143,18 @@ impl EditorDocument {
             .blocks()
             .get(self.block_index_for_offset(anchor).ok_or_else(invalid)?)
             .ok_or_else(invalid)?;
-        let table =
-            yu_markdown::table_for_block(&self.presentation.markdown, block).ok_or_else(invalid)?;
-        let from = table
-            .visible_cell_for_source(anchor.get() as usize)
+        let table = self
+            .html_table_grid(block)
+            .or_else(|| yu_markdown::table_for_block(&self.presentation.markdown, block))
             .ok_or_else(invalid)?;
-        let to = table
-            .visible_cell_for_source(focus.get() as usize)
-            .ok_or_else(invalid)?;
+        let addresses = ranges
+            .iter()
+            .map(|selection| {
+                table
+                    .visible_cell_for_source(selection.ordered_range().start().get() as usize)
+                    .ok_or_else(invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let table_start = ByteOffset::new(table.source_range().start() as u64);
         let ranges = ranges.iter().map(|s| s.ordered_range()).collect();
         self.state.history.break_group();
@@ -108,12 +169,30 @@ impl EditorDocument {
                         .ok_or_else(invalid)?,
                 )
                 .ok_or_else(invalid)?;
-            let table = yu_markdown::table_for_block(&self.presentation.markdown, block)
+            let table = self
+                .html_table_grid(block)
+                .or_else(|| yu_markdown::table_for_block(&self.presentation.markdown, block))
                 .ok_or_else(invalid)?;
-            let anchor =
-                ByteOffset::new(table.visible_cell(from).ok_or_else(invalid)?.start() as u64);
-            let focus = ByteOffset::new(table.visible_cell(to).ok_or_else(invalid)?.start() as u64);
-            self.select_table_cells(anchor, focus)?;
+            let snapshot = self.snapshot();
+            let ranges = addresses
+                .into_iter()
+                .map(|address| {
+                    let cell = table.visible_cell(address).ok_or_else(invalid)?;
+                    EditorSelection::range(
+                        &snapshot,
+                        ByteOffset::new(cell.start() as u64),
+                        ByteOffset::new(cell.end() as u64),
+                        crate::CaretAffinity::Downstream,
+                    )
+                    .map_err(EditorDocumentError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.set_selections(ranges, primary)?;
+            self.presentation.selections = self
+                .presentation
+                .selections
+                .clone()
+                .with_table_slots(columns, slots)?;
             self.state
                 .history
                 .finish_selection(self.presentation.selections.clone());
@@ -137,7 +216,10 @@ impl EditorDocument {
         let cell = self
             .block_index_for_offset(anchor)
             .and_then(|index| self.presentation.markdown.blocks().get(index))
-            .and_then(|block| yu_markdown::table_for_block(&self.presentation.markdown, block))
+            .and_then(|block| {
+                self.html_table_grid(block)
+                    .or_else(|| yu_markdown::table_for_block(&self.presentation.markdown, block))
+            })
             .and_then(|table| table.visible_cell(plan.target));
         let focus = cell.map_or(anchor, |cell| ByteOffset::new(cell.start() as u64));
         self.set_edit_selection(EditorSelection::cursor(
@@ -160,6 +242,14 @@ impl EditorDocument {
             .markdown
             .blocks()
             .get(self.block_index_for_offset(self.selection().focus())?)?;
+        if self
+            .markdown
+            .html_regions()
+            .region_for(block.range())
+            .is_some()
+        {
+            return self.html_table_edit_plan(block, edit);
+        }
         let table = yu_markdown::table_for_block(&self.presentation.markdown, block)?;
         let current = table.visible_cell_for_source(self.selection().focus().get() as usize)?;
         let owner = table.visible_cell(current)?;
@@ -208,7 +298,7 @@ impl EditorDocument {
                         String::new(),
                     )?);
                 } else {
-                    for (row_index, row) in std::iter::once(table.header())
+                    for (row_index, row) in std::iter::once(table.first_row())
                         .chain(std::iter::once(table.delimiter()))
                         .chain(table.rows().iter().map(Vec::as_slice))
                         .enumerate()
@@ -327,6 +417,112 @@ impl EditorDocument {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clear_table_retains_sparse_slots_and_noncorner_primary_through_history() {
+        let source = "<table><tr><td>中文🙂</td><td>B</td></tr><tr><td>C</td></tr></table>\r\n";
+        let expected = "<table><tr><td></td><td></td></tr><tr><td></td></tr></table>\r\n";
+        for primary in 0..3 {
+            let mut document = EditorDocument::new(source);
+            let ranges = ["中文🙂", "B", "C"].map(|text| {
+                let start = source.find(text).expect("content");
+                EditorSelection::range(
+                    &document.snapshot(),
+                    ByteOffset::new(start as u64),
+                    ByteOffset::new((start + text.len()) as u64),
+                    crate::CaretAffinity::Downstream,
+                )
+                .expect("range")
+            });
+            document.set_selections(ranges, primary).expect("select");
+            let slots = vec![Some(0), Some(1), Some(2), None];
+            document.presentation.selections = document
+                .presentation
+                .selections
+                .clone()
+                .with_table_slots(2, slots.clone())
+                .expect("sparse selection");
+            let original = document.selections().clone();
+            document.clear_table_cells().expect("clear");
+            assert_eq!(document.snapshot().as_str(), expected);
+            assert_eq!(document.selections().primary_index(), primary);
+            assert_eq!(document.selections().table_slots(), Some(slots.as_slice()));
+            assert_eq!(document.selections().as_slice().len(), 3);
+            assert!(
+                document
+                    .selections()
+                    .as_slice()
+                    .iter()
+                    .all(|selection| selection.is_empty())
+            );
+            document.undo().expect("undo");
+            assert_eq!(document.snapshot().as_str(), source);
+            assert_eq!(
+                document.selections().primary_index(),
+                original.primary_index()
+            );
+            assert_eq!(document.selections().table_slots(), original.table_slots());
+            for (actual, expected) in document
+                .selections()
+                .as_slice()
+                .iter()
+                .zip(original.as_slice())
+            {
+                assert_eq!(actual.anchor(), expected.anchor());
+                assert_eq!(actual.focus(), expected.focus());
+            }
+            document.redo().expect("redo");
+            assert_eq!(document.snapshot().as_str(), expected);
+            assert_eq!(document.selections().primary_index(), primary);
+            assert_eq!(document.selections().table_slots(), Some(slots.as_slice()));
+        }
+    }
+
+    #[test]
+    fn merged_rectangle_expands_transitively_and_keeps_unique_ranges() {
+        let source = "<table><tr><td rowspan='2'>中文🙂</td><td colspan='2'>B</td></tr><tr><td>C</td><td rowspan='2'>D</td></tr><tr><td>E</td><td>F</td></tr></table>\r\n";
+        let document = EditorDocument::new(source);
+        let index = document.markdown.html_regions();
+        let model = index.regions[0].model.as_ref().expect("model");
+        let table = model
+            .table(model.partitions[0].content.owner.expect("owner"))
+            .expect("table");
+        let grid = yu_markdown::TableBlock::from_html(&table).expect("adapter");
+        let covered = TableCellAddress::new(1, 0);
+        let other = TableCellAddress::new(1, 1);
+        assert_eq!(
+            grid.selection_bounds(covered, other),
+            Some((TableCellAddress::new(0, 0), TableCellAddress::new(2, 2)))
+        );
+        for (start, end, primary) in [(covered, other, 2), (other, covered, 0)] {
+            let selected = document
+                .table_cell_selection_in_grid(&grid, start, end)
+                .expect("selection");
+            assert_eq!(selected.columns, 3);
+            assert_eq!(selected.primary, primary);
+            assert_eq!(selected.ranges.len(), 6);
+            assert_eq!(
+                selected.slots,
+                vec![
+                    Some(0),
+                    Some(1),
+                    Some(1),
+                    Some(0),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    Some(3)
+                ]
+            );
+            let state = Selections::new(&document.snapshot(), selected.ranges, selected.primary)
+                .expect("unique ranges")
+                .with_table_slots(selected.columns, selected.slots)
+                .expect("rectangular owners");
+            assert_eq!(state.primary_index(), primary);
+        }
+        assert_eq!(document.snapshot().as_str(), source);
+    }
+
     use super::*;
 
     fn focus(document: &mut EditorDocument, text: &str) {

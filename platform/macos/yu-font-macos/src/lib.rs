@@ -527,6 +527,7 @@ impl CoreTextShaper {
             let paragraph = yu_core::ParagraphLayoutProvider::layout(
                 self,
                 &yu_core::ParagraphInput {
+                    justify: false,
                     font_strut_mode: yu_core::FontStrutMode::RunMetrics,
                     text: sample,
                     base_direction: yu_core::BaseDirection::Auto,
@@ -2070,6 +2071,7 @@ mod tests {
         let paragraph = yu_core::ParagraphLayoutProvider::layout(
             &shaper,
             &yu_core::ParagraphInput {
+                justify: false,
                 font_strut_mode: yu_core::FontStrutMode::RunMetrics,
                 text,
                 base_direction: yu_core::BaseDirection::Auto,

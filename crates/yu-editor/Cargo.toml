@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 yu-core = { path = "../yu-core" }
 yu-decoration = { path = "../yu-decoration" }
+yu-export = { path = "../yu-export" }
 yu-layout = { path = "../yu-layout" }
 yu-markdown = { path = "../yu-markdown" }
 yu-state = { path = "../yu-state" }

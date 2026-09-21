@@ -15,27 +15,38 @@
 use yu_core::TextRange;
 pub use yu_core::{LineStyleId, StyleId, WidgetId, WidgetSide};
 
-/// Immutable replacement atom. Static text supports multi-scalar literals while
-/// scalar replacements avoid allocating dynamic numeric references.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Immutable replacement atom. Characters, literals and numeric references
+/// need no allocation; generated document text is shared across snapshots.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReplacementText {
     Scalar(char),
     Literal(&'static str),
+    Number(u32),
+    Shared(std::sync::Arc<str>),
 }
 
 impl ReplacementText {
     #[must_use]
-    pub fn len_utf8(self) -> usize {
+    pub fn len_utf8(&self) -> usize {
         match self {
             Self::Scalar(character) => character.len_utf8(),
             Self::Literal(text) => text.len(),
+            Self::Shared(text) => text.len(),
+            Self::Number(number) => number
+                .checked_ilog10()
+                .map_or(1, |power| power as usize + 1),
         }
     }
 
-    pub fn append_to(self, output: &mut String) {
+    pub fn append_to(&self, output: &mut String) {
         match self {
-            Self::Scalar(character) => output.push(character),
+            Self::Scalar(character) => output.push(*character),
             Self::Literal(text) => output.push_str(text),
+            Self::Shared(text) => output.push_str(text),
+            Self::Number(number) => {
+                use std::fmt::Write;
+                write!(output, "{number}").expect("String formatting");
+            }
         }
     }
 }
@@ -47,7 +58,7 @@ impl From<char> for ReplacementText {
 }
 
 /// 一条装饰。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Decoration {
     /// 不改变字符数量，只改变呈现样式。可叠加。
     Mark { style: StyleId },
@@ -70,7 +81,7 @@ impl Decoration {
     /// 「widget 有多宽」在这一层没有意义——widget 不是文本，它的 source
     /// 在字节流里就是不占位。宽度是 layout 的事。
     #[must_use]
-    pub const fn hides_source(self) -> bool {
+    pub const fn hides_source(&self) -> bool {
         matches!(
             self,
             Self::Replace | Self::Substitute { .. } | Self::Widget { .. }
@@ -79,7 +90,7 @@ impl Decoration {
 }
 
 /// 一条装饰及其覆盖的 source range。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecorationRange {
     pub range: TextRange,
     pub decoration: Decoration,
@@ -128,7 +139,7 @@ impl DecorationRange {
             self.range.end().get(),
             side,
             self.priority,
-            self.decoration,
+            self.decoration.clone(),
         )
     }
 }
@@ -170,7 +181,7 @@ mod tests {
         let c = DecorationRange::new(range(1, 5), Decoration::Replace).with_priority(3);
         let d = DecorationRange::new(range(0, 2), Decoration::Replace).with_priority(9);
 
-        let mut forward = vec![a, b, c, d];
+        let mut forward = vec![a.clone(), b.clone(), c.clone(), d.clone()];
         let mut backward = vec![d, c, b, a];
         forward.sort_by_key(DecorationRange::order_key);
         backward.sort_by_key(DecorationRange::order_key);
@@ -198,7 +209,7 @@ mod tests {
                 side: WidgetSide::After,
             },
         );
-        let mut set = vec![after, before];
+        let mut set = vec![after.clone(), before.clone()];
         set.sort_by_key(DecorationRange::order_key);
         assert_eq!(set, vec![before, after]);
     }

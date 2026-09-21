@@ -11,7 +11,9 @@
 use std::error::Error;
 use std::fmt;
 
-use yu_assets::{ImageIntrinsicPublication, ImagePublication, ImageRequestPriority};
+use yu_assets::{
+    EmbeddedRenderPublication, ImageIntrinsicPublication, ImagePublication, ImageRequestPriority,
+};
 #[cfg(test)]
 use yu_editor::EditorDocument;
 use yu_editor::{EditorDocumentError, EditorRenderSnapshot, LayoutContext, LayoutSnapshot};
@@ -34,6 +36,7 @@ pub struct ViewportFrameBuildInput {
     pub document: EditorRenderSnapshot,
     pub image_publications: Vec<ImagePublication>,
     pub image_intrinsics: Vec<ImageIntrinsicPublication>,
+    pub embedded_publications: Vec<EmbeddedRenderPublication>,
 }
 
 /// Result returned by a background preparation job.  The request is carried
@@ -53,6 +56,7 @@ pub struct ViewportFrameBuildOutput {
     /// Resource payloads used by this exact publication, for owner validation.
     pub image_publications: Vec<ImagePublication>,
     pub image_intrinsics: Vec<ImageIntrinsicPublication>,
+    pub embedded_publications: Vec<EmbeddedRenderPublication>,
 }
 
 /// 准备一帧时可能出现的错误。
@@ -126,6 +130,7 @@ pub struct ViewportFrameBuilder<S> {
     render_plans: RenderPlanBuilder,
     publisher: ViewportFramePublisher,
     config: ViewportRenderConfig,
+    embedded_publications: Vec<EmbeddedRenderPublication>,
 }
 
 type BuildError<S> =
@@ -163,8 +168,13 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             atlas: GlyphAtlas::new(atlas_config).with_raster_scale(config.raster_scale()),
             render_plans,
             publisher: ViewportFramePublisher::with_next_serial(initial_serial),
+            embedded_publications: Vec::new(),
             config,
         })
+    }
+
+    pub fn set_embedded_publications(&mut self, publications: Vec<EmbeddedRenderPublication>) {
+        self.embedded_publications = publications;
     }
 
     /// 准备并发布当前文档的视口。
@@ -210,6 +220,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
     where
         C: FnMut() -> bool,
     {
+        crate::prepare_embedded_geometry(document, &self.embedded_publications)?;
         let raster_start = std::time::Instant::now();
         self.rasterize_visible_glyphs_cancelable(
             document,
@@ -225,7 +236,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
         }
         let publish_start = std::time::Instant::now();
         self.publisher
-            .publish_with_images_and_intrinsics(
+            .publish_with_resources(
                 document,
                 self.config,
                 &self.shaper,
@@ -233,6 +244,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
                 &mut self.render_plans,
                 image_publications,
                 image_intrinsics,
+                &self.embedded_publications,
             )
             .map_err(ViewportFrameBuildError::Publish)
             .inspect(|_| {
@@ -255,7 +267,9 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             document,
             image_publications,
             image_intrinsics,
+            embedded_publications,
         } = input;
+        self.set_embedded_publications(embedded_publications);
         let mut document = document.into_layout_context();
         self.publish_owned_document(request, &mut document, image_publications, image_intrinsics)
     }
@@ -326,6 +340,7 @@ impl<S: RasterizingShaper> ViewportFrameBuilder<S> {
             viewport_blocks,
             image_publications,
             image_intrinsics,
+            embedded_publications: self.embedded_publications.clone(),
         })
     }
 
@@ -768,6 +783,75 @@ mod tests {
     }
 
     #[test]
+    fn owned_frame_keeps_native_vector_geometry_and_payload_together() {
+        let mut owner = document("```math\nx\n```\n\nfollowing");
+        let selection = yu_editor::EditorSelection::cursor(
+            &owner.snapshot(),
+            owner.snapshot().len_bytes(),
+            yu_core::CaretAffinity::Downstream,
+        )
+        .expect("caret");
+        owner.set_selection(selection).expect("selection");
+        let source = owner.block_decorations(0).expect("decorations").range();
+        let request = yu_assets::EmbeddedRenderRequest::new(
+            owner.revision(),
+            source,
+            yu_assets::EmbeddedResourceKind::Math,
+            "x",
+        )
+        .expect("request");
+        let mut cache = yu_assets::EmbeddedResourceCache::new();
+        let resource = cache
+            .publish(
+                request,
+                owner.revision(),
+                yu_assets::EmbeddedRenderPayload::svg(
+                    100,
+                    180,
+                    "<svg width=\"100\" height=\"180\"/>",
+                )
+                .expect("svg"),
+            )
+            .expect("publish");
+        let key = crate::FrameBuildKey::new(
+            owner.revision().get(),
+            0,
+            vec![owner.selection()],
+            0,
+            None,
+            crate::Appearance::Light,
+            crate::FrameGeometry::new(14.0, 240.0, 0.0, 200.0, 240.0, 200.0, 1.0)
+                .expect("geometry"),
+        );
+        let input = ViewportFrameBuildInput {
+            request: FrameBuildRequest::new(key, 1),
+            document: owner.capture_render_snapshot(),
+            image_publications: vec![],
+            image_intrinsics: vec![],
+            embedded_publications: vec![resource],
+        };
+        let mut builder = ViewportFrameBuilder::with_shaper(
+            CountingShaper::new(14.0, false),
+            config(14.0),
+            GlyphAtlasConfig::default(),
+        )
+        .expect("builder");
+        let output = builder.publish_owned(input).expect("frame");
+        assert_eq!(output.embedded_publications.len(), 1);
+        assert_eq!(
+            output.publication.frame().plan().embedded_uploads().len(),
+            1
+        );
+        let block = output
+            .layout
+            .block_for_source(source.start())
+            .expect("block");
+        assert!((block.layout().embedded()[0].1.bounds().height() - 180.0).abs() < 0.01);
+        assert!(output.layout.content_height() >= 180.0);
+        assert_eq!(owner.snapshot().as_str(), "```math\nx\n```\n\nfollowing");
+    }
+
+    #[test]
     fn dropped_owned_publication_does_not_consume_gpu_uploads() {
         let shaper = CountingShaper::new(14.0, false);
         let counter = Arc::clone(&shaper.calls);
@@ -794,6 +878,7 @@ mod tests {
                 document: document.capture_render_snapshot(),
                 image_publications: vec![],
                 image_intrinsics: vec![],
+                embedded_publications: vec![],
             }
         };
         let dropped = builder

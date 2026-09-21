@@ -225,7 +225,7 @@ fn scan_definition(source: &TextSnapshot, range: TextRange) -> Option<Definition
 ///
 /// 见下面循环里的注释。comrak 在同一处用的是 `char::is_whitespace`
 /// （`comrak::strings::normalize_label`），那是一处已知的、比规范宽的取法。
-fn normalized_label(source: &TextSnapshot, range: TextRange) -> Option<Vec<u8>> {
+pub(crate) fn normalized_label(source: &TextSnapshot, range: TextRange) -> Option<Vec<u8>> {
     let text = String::from_utf8(read_range(source, range)?).ok()?;
     let mut collapsed = String::new();
     let mut pending_space = false;

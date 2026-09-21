@@ -237,6 +237,7 @@ impl<'a> Html<'a> {
                 self.cr();
                 self.out.push_str("<hr />\n");
             }
+            NodeKind::FrontMatter => {}
             NodeKind::CodeBlock => {
                 self.cr();
                 self.out.push_str("<pre><code>");

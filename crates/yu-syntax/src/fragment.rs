@@ -321,6 +321,15 @@ impl<'a> FragmentCursor<'a> {
             let Ok(node_from) = u32::try_from(i64::from(cursor.from()) - offset) else {
                 break;
             };
+            // Prefix edits can move metadata away from document start or turn
+            // an ordinary rule into metadata. Never reuse across that boundary.
+            if (cursor.kind() == crate::NodeKind::FrontMatter && node_from != 0)
+                || (node_from == 0
+                    && cx.front_matter_opening().is_some()
+                    && cursor.kind() != crate::NodeKind::FrontMatter)
+            {
+                break;
+            }
             cx.reuse_tree(cursor.tree().clone(), node_from);
 
             if cursor.kind().is_block() {

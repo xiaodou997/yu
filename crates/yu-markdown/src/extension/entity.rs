@@ -42,7 +42,7 @@ pub(crate) fn atoms(cx: &BlockContext<'_>) -> Vec<(TextRange, ReplacementText)> 
         .collect()
 }
 
-fn decode(source: &str) -> Option<ReplacementText> {
+pub(crate) fn decode(source: &str) -> Option<ReplacementText> {
     let inner = source.strip_prefix("&#").and_then(|s| s.strip_suffix(';'));
     if let Some(inner) = inner {
         let value = if let Some(hex) = inner.strip_prefix('x').or_else(|| inner.strip_prefix('X')) {

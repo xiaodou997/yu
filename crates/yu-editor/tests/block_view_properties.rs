@@ -1924,3 +1924,76 @@ fn night_block_code_and_inline_code_keep_distinct_font_sizes() {
         }
     }
 }
+
+#[test]
+fn writing_highlight_survives_nested_traits_and_source_projection() {
+    let source = "outside ==plain **bold** [link](target) 中文== after";
+    let view = shaped_view(source, 80.0).expect("highlight layout");
+    let text_of = |glyph: &yu_editor::BlockGlyph| {
+        &source[glyph.source().start().get() as usize..glyph.source().end().get() as usize]
+    };
+    let highlighted: String = view
+        .glyphs()
+        .iter()
+        .filter(|glyph| glyph.highlighted())
+        .map(text_of)
+        .collect();
+    assert_eq!(highlighted, "plain bold link 中文");
+    for glyph in view.glyphs().iter().filter(|glyph| glyph.highlighted()) {
+        let at = glyph.source().start().get() as usize;
+        if (source.find("bold").expect("valid highlight fixture")
+            ..source.find("bold").expect("valid highlight fixture") + 4)
+            .contains(&at)
+        {
+            assert!(glyph.style().is_strong());
+        }
+        if (source.find("link").expect("valid highlight fixture")
+            ..source.find("link").expect("valid highlight fixture") + 4)
+            .contains(&at)
+        {
+            assert_eq!(glyph.role(), yu_core::TextRole::Link);
+        }
+    }
+    assert!(!view.visual().text().contains("=="));
+}
+
+#[test]
+fn script_preview_uses_smaller_shifted_glyphs_and_composes_traits() {
+    for prefix in ["", "# ", "> "] {
+        let source = format!("{prefix}a^**2**^ H~2~O ==x^n^==");
+        let view = shaped_view(&source, 400.0).expect("script layout");
+        assert!(!view.visual().text().contains('^'));
+        assert!(!view.visual().text().contains('~'));
+        let glyph_at = |at: usize| {
+            view.glyphs()
+                .iter()
+                .find(|g| g.source().start().get() == at as u64)
+                .expect("glyph")
+        };
+        let plain = glyph_at(source.find('a').expect("a"));
+        let sup = glyph_at(source.find("2**").expect("sup"));
+        let sub = glyph_at(source.find("2~").expect("sub"));
+        assert!((sup.size_scale() / plain.size_scale() - 0.75).abs() < 0.001);
+        assert!((sub.size_scale() / plain.size_scale() - 0.75).abs() < 0.001);
+        assert!(sup.origin().y() < plain.origin().y());
+        assert!(sub.origin().y() > plain.origin().y());
+        assert!(sup.style().is_strong());
+        assert!(glyph_at(source.find("n^").expect("highlighted script")).highlighted());
+    }
+}
+
+#[test]
+fn front_matter_has_one_opaque_editable_code_layout() {
+    let source = "---\r\ntitle: 中文\r\nvalue: '**bold** ==marked== $x^2$'\r\n\r\n# metadata comment\r\n---\r\n\r\n# Body\r\n";
+    let view = shaped_view(source, 240.0).expect("metadata layout");
+    assert_eq!(
+        view.visual().text(),
+        &source[..source.find("\r\n\r\n# Body").expect("body boundary") + 2]
+    );
+    assert!(
+        view.glyphs()
+            .iter()
+            .all(|glyph| glyph.style().is_code() && !glyph.highlighted())
+    );
+    assert!(view.embedded().is_empty());
+}

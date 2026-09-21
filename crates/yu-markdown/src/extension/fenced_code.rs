@@ -16,7 +16,7 @@
 //! 着色本身在 `yu-highlight`：这里只知道「(语言名, 正文) → 一串带角色的
 //! 区间」，不知道 tree-sitter 的存在。
 
-use yu_core::{ByteOffset, TextAttrs, TextRange, TextStyle};
+use yu_core::{ByteOffset, TextAttrs, TextRange, TextStyle, WidgetSide};
 use yu_syntax::NodeKind;
 
 use super::{BlockContext, BlockOrnament, Extension, ExtensionOutput};
@@ -35,6 +35,55 @@ impl Extension for FencedCode {
         let Some(node) = cx.block_node(|kind| kind == NodeKind::FencedCode) else {
             return;
         };
+        let native_info = node
+            .children()
+            .find(|child| child.kind() == NodeKind::CodeInfo);
+        let text_nodes: Vec<_> = node
+            .children()
+            .filter(|child| child.kind() == NodeKind::CodeText)
+            .collect();
+        let native_content = text_nodes
+            .first()
+            .zip(text_nodes.last())
+            .and_then(|(first, last)| TextRange::new(first.range().start(), last.range().end()))
+            .or_else(|| {
+                node.children()
+                    .filter(|child| child.kind() == NodeKind::CodeMark)
+                    .last()
+                    .map(|closing| TextRange::empty(closing.range().start()))
+            });
+        let closed = node
+            .children()
+            .filter(|child| child.kind() == NodeKind::CodeMark)
+            .count()
+            == 2;
+        if closed
+            && !super::reveals(cx.active(), cx.range())
+            && let (Some(info), Some(content)) = (native_info, native_content)
+            && let Some(language) = cx
+                .source
+                .as_str()
+                .get(info.start() as usize..info.end() as usize)
+            && let Some(kind) = match language.trim().to_ascii_lowercase().as_str() {
+                "math" | "latex" | "tex" => Some(super::EmbeddedKind::Math),
+                "mermaid" => Some(super::EmbeddedKind::Mermaid),
+                _ => None,
+            }
+        {
+            let style = out.line_style(BlockOrnament::FencedCode {
+                info: info.range(),
+                content,
+            });
+            out.line(cx.range(), style);
+            let widget = out.widget(super::BlockWidget::Embedded(super::EmbeddedSpan {
+                source: cx.range(),
+                content,
+                kind,
+                display: true,
+            }));
+            out.place_widget(cx.range(), widget, WidgetSide::Before);
+            return;
+        }
         let style = out.style(TextAttrs::new(TextStyle::Code));
         out.mark(cx.range(), style);
 

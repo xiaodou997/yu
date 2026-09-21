@@ -85,12 +85,46 @@ impl WidgetMeasure for BlockWidgets<'_> {
         );
         match self.widget(widget)? {
             BlockWidget::Image(image) => match self.size_of(image) {
-                Some(size) => intrinsic_metrics(size, constraints).map(WidgetMeasurement::Ready),
-                None => placeholder_metrics(constraints).map(WidgetMeasurement::Placeholder),
+                Some(size) => intrinsic_metrics(size, constraints, image, self.theme)
+                    .map(WidgetMeasurement::Ready),
+                None => {
+                    if let (Some(width), Some(height)) = (image.width(), image.height()) {
+                        ImageIntrinsicSize::new(width, height)
+                            .ok()
+                            .and_then(|size| {
+                                intrinsic_metrics(size, constraints, image, self.theme)
+                            })
+                            .map(WidgetMeasurement::Placeholder)
+                    } else {
+                        placeholder_metrics(constraints).map(WidgetMeasurement::Placeholder)
+                    }
+                }
             },
             // 复选框没有要等的资源，永远是 `Ready`：它的尺寸只依赖行高。
             // 报成 `Placeholder` 会让 `pending_widgets` 永远不空，而
             // `LayoutCache` 用那个判断「还欠着谁」，于是每一帧都重排一次。
+            BlockWidget::Embedded(resource) => {
+                let Some((_, size)) = self
+                    .sizes
+                    .iter()
+                    .find(|(range, _)| *range == resource.source)
+                else {
+                    return placeholder_metrics(constraints).map(WidgetMeasurement::Placeholder);
+                };
+                let scale = (constraints.available_width() / size.width() as f32).min(1.0);
+                let baseline = if resource.display {
+                    size.height() as f32
+                } else {
+                    size.baseline_milli()
+                        .map_or(size.height() as f32, |b| b as f32 / 1000.0)
+                };
+                WidgetMetrics::new(
+                    Size::new(size.width() as f32 * scale, size.height() as f32 * scale).ok()?,
+                    baseline * scale,
+                )
+                .ok()
+                .map(WidgetMeasurement::Ready)
+            }
             BlockWidget::Checkbox(_) => {
                 checkbox_metrics(constraints, self.theme).map(WidgetMeasurement::Ready)
             }
@@ -105,13 +139,45 @@ impl WidgetMeasure for BlockWidgets<'_> {
 fn intrinsic_metrics(
     size: ImageIntrinsicSize,
     constraints: WidgetConstraints,
+    image: ImageSpan,
+    theme: yu_core::ThemeId,
 ) -> Option<WidgetMetrics> {
-    let intrinsic_width = size.width() as f32;
-    let intrinsic_height = size.height() as f32;
+    let natural_width = size.width() as f32;
+    let natural_height = size.height() as f32;
+    let explicit = image.width().is_some() || image.height().is_some();
+    let zoom = if explicit {
+        constraints.line_height() / theme.spec().body_size
+    } else {
+        1.0
+    };
+    let intrinsic_width = image
+        .width()
+        .map(|v| v as f32)
+        .or_else(|| {
+            image
+                .height()
+                .map(|v| v as f32 * natural_width / natural_height)
+        })
+        .unwrap_or(natural_width)
+        * zoom;
+    let intrinsic_height = image
+        .height()
+        .map(|v| v as f32)
+        .or_else(|| {
+            image
+                .width()
+                .map(|v| v as f32 * natural_height / natural_width)
+        })
+        .unwrap_or(natural_height)
+        * zoom;
     let available = constraints.available_width().max(1.0);
     let scale = (available / intrinsic_width).min(1.0);
     let width = (intrinsic_width * scale).max(1.0);
-    let height = (intrinsic_height * scale).max(constraints.line_height());
+    let height = (intrinsic_height * scale).max(if explicit {
+        1.0
+    } else {
+        constraints.line_height()
+    });
     WidgetMetrics::sitting_on_baseline(Size::new(width, height).ok()?).ok()
 }
 

@@ -18,6 +18,7 @@ pub struct LayoutContext {
     pub(super) table_widths: Arc<Vec<super::table_widths::SavedTableWidths>>,
     pub(super) layout_snapshot: Option<Arc<LayoutSnapshot>>,
     pub(super) resource_geometry_version: u64,
+    pub(super) embedded_sizes: Option<Arc<(Revision, Vec<ImageSize>)>>,
     pub(super) render_identity: Arc<()>,
     pub(super) source: TextSnapshot,
     pub(super) markdown: Arc<MarkdownDocument>,
@@ -28,6 +29,8 @@ pub struct LayoutContext {
     pub(super) viewport: ViewportLayout,
     pub(super) search: Option<Arc<SearchState>>,
     pub(super) search_generation: u64,
+    pub(super) spelling: Option<Arc<(Revision, Vec<TextRange>)>>,
+    pub(super) spelling_generation: u64,
 }
 
 /// Immutable render input. Capturing it neither flattens source storage nor
@@ -35,10 +38,13 @@ pub struct LayoutContext {
 /// belongs to the preparation worker.
 #[derive(Clone, Debug)]
 pub struct EditorRenderSnapshot {
+    toc: crate::toc::TocCache,
     table_width_generation: u64,
     table_widths: Arc<Vec<super::table_widths::SavedTableWidths>>,
     layout_snapshot: Option<Arc<LayoutSnapshot>>,
     resource_geometry_version: u64,
+    embedded_sizes: Option<Arc<(Revision, Vec<ImageSize>)>>,
+    forced_sources: Option<Arc<(Revision, Vec<TextRange>)>>,
     identity: Arc<()>,
     source: TextSnapshot,
     markdown: Arc<MarkdownDocument>,
@@ -48,12 +54,16 @@ pub struct EditorRenderSnapshot {
     composition: Option<CompositionOverlay>,
     search: Option<Arc<SearchState>>,
     search_generation: u64,
+    spelling: Option<Arc<(Revision, Vec<TextRange>)>>,
+    spelling_generation: u64,
 }
 
 /// Owned block heights used by one prepared frame, with no shaper or mutable
 /// editor attached. Only the originating document/visual state may adopt it.
 #[derive(Clone, Debug)]
 pub(super) struct LayoutMeasurements {
+    embedded_sizes: Option<Arc<(Revision, Vec<ImageSize>)>>,
+    forced_sources: Option<Arc<(Revision, Vec<TextRange>)>>,
     identity: Arc<()>,
     revision: Revision,
     pub(super) viewport: ViewportLayout,
@@ -75,21 +85,31 @@ impl EditorRenderSnapshot {
             table_widths: self.table_widths,
             layout_snapshot: self.layout_snapshot,
             resource_geometry_version: self.resource_geometry_version,
+            embedded_sizes: self.embedded_sizes.clone(),
             render_identity: self.identity,
             source: self.source,
             markdown: self.markdown,
             viewport: self.viewport,
             selections: self.selections,
             composition: self.composition,
-            decorations: DecorationCache::default(),
+            decorations: {
+                let mut decorations = DecorationCache::default();
+                decorations.set_forced_sources(self.forced_sources.clone());
+                decorations.toc = self.toc;
+                decorations
+            },
             layouts: self.layouts,
             search: self.search,
             search_generation: self.search_generation,
+            spelling: self.spelling.clone(),
+            spelling_generation: self.spelling_generation,
         }
     }
 
     pub fn merge_into_layout_context(&self, document: &mut LayoutContext) {
         if self.can_reuse_layout_context(document) {
+            document.spelling = self.spelling.clone();
+            document.spelling_generation = self.spelling_generation;
             document.layouts.adopt_snapshot(self.layouts.clone());
             let mut merged = self.viewport.clone();
             if merged.merge_missing(&document.viewport).is_ok() {
@@ -113,17 +133,154 @@ impl EditorRenderSnapshot {
             && self.search == document.search
             && self.search_generation == document.search_generation
             && self.resource_geometry_version == document.resource_geometry_version
+            && self.embedded_sizes == document.embedded_sizes
+            && self.forced_sources == document.decorations.forced_sources()
     }
 }
 
 impl LayoutContext {
+    /// Failed native resources expose their original block source. This is a
+    /// revision-bound projection, never an edit or another saved document.
+    pub fn set_failed_resource_ranges(
+        &mut self,
+        revision: Revision,
+        mut ranges: Vec<TextRange>,
+    ) -> Result<(), EditorDocumentError> {
+        if revision != self.revision()
+            || ranges
+                .iter()
+                .any(|range| range.is_empty() || range.end() > self.source.len_bytes())
+        {
+            return Err(EditorDocumentError::Selection(SelectionError::InvalidRange));
+        }
+        ranges.sort_unstable_by_key(|range| (range.start(), range.end()));
+        ranges.dedup();
+        let next = (!ranges.is_empty()).then(|| Arc::new((revision, ranges)));
+        let previous = self.decorations.forced_sources();
+        if previous == next {
+            return Ok(());
+        }
+        let affected: Vec<_> = previous
+            .iter()
+            .chain(next.iter())
+            .flat_map(|entry| entry.1.iter().copied())
+            .collect();
+        self.layouts.invalidate_resource_ranges(&affected);
+        for range in affected {
+            if let Some(index) = self.block_index_for_source(range.start()) {
+                self.viewport.invalidate_block_measurement(index);
+            }
+        }
+        self.decorations.set_forced_sources(next);
+        self.resource_geometry_version = self.resource_geometry_version.wrapping_add(1);
+        self.layout_snapshot = None;
+        Ok(())
+    }
+
+    /// Resource dimensions are versioned presentation state, not document edits.
+    pub fn set_embedded_sizes(
+        &mut self,
+        revision: Revision,
+        sizes: Vec<ImageSize>,
+    ) -> Result<(), EditorDocumentError> {
+        if revision != self.revision()
+            || sizes
+                .iter()
+                .any(|(range, _)| range.is_empty() || range.end() > self.source.len_bytes())
+        {
+            return Err(EditorDocumentError::Selection(SelectionError::InvalidRange));
+        }
+        let next = (!sizes.is_empty()).then(|| Arc::new((revision, sizes)));
+        if self.embedded_sizes == next {
+            return Ok(());
+        }
+        let affected: Vec<_> = self
+            .embedded_sizes
+            .iter()
+            .chain(next.iter())
+            .flat_map(|entry| entry.1.iter().map(|(range, _)| *range))
+            .collect();
+        self.layouts.invalidate_resource_ranges(&affected);
+        for range in &affected {
+            if let Some(index) = self.block_index_for_source(range.start()) {
+                self.viewport.invalidate_block_measurement(index);
+            }
+        }
+        self.embedded_sizes = next;
+        self.layout_snapshot = None;
+        Ok(())
+    }
+
+    fn resource_sizes(&self, range: TextRange, images: &[ImageSize]) -> Vec<ImageSize> {
+        let mut result = images.to_vec();
+        if let Some(entries) = self.embedded_sizes.as_deref()
+            && entries.0 == self.revision()
+        {
+            for entry in &entries.1 {
+                if entry.0.start() >= range.start()
+                    && entry.0.end() <= range.end()
+                    && !result.contains(entry)
+                {
+                    result.push(*entry);
+                }
+            }
+        }
+        result
+    }
+
+    /// Diagnostics are presentation state, never transactions or history.
+    /// Old revisions and preedit must never publish source-based markers.
+    pub fn set_spelling_diagnostics(
+        &mut self,
+        revision: Revision,
+        mut ranges: Vec<TextRange>,
+    ) -> Result<(), EditorDocumentError> {
+        if revision != self.revision() {
+            return Err(EditorDocumentError::Selection(SelectionError::InvalidRange));
+        }
+        if self.composition().is_some() {
+            return Err(EditorDocumentError::CompositionActive);
+        }
+        ranges.sort_unstable_by_key(|range| (range.start(), range.end()));
+        ranges.dedup();
+        if ranges
+            .iter()
+            .any(|range| range.is_empty() || !self.markdown.spelling_ranges(*range).contains(range))
+            || ranges
+                .windows(2)
+                .any(|pair| pair[0].end() > pair[1].start())
+        {
+            return Err(EditorDocumentError::Selection(SelectionError::InvalidRange));
+        }
+        let next = (!ranges.is_empty()).then(|| Arc::new((revision, ranges)));
+        if self.spelling != next {
+            self.spelling = next;
+            self.spelling_generation = self.spelling_generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn spelling_diagnostics(&self) -> &[TextRange] {
+        match self.spelling.as_deref() {
+            Some((revision, ranges))
+                if *revision == self.revision() && self.composition().is_none() =>
+            {
+                ranges
+            }
+            _ => &[],
+        }
+    }
+
+    #[must_use]
+    pub const fn spelling_generation(&self) -> u64 {
+        self.spelling_generation
+    }
+
     pub fn semantic_block_decorations(
         &mut self,
         index: usize,
     ) -> Result<BlockDecorations, EditorDocumentError> {
-        if !self.markdown.source_mode() {
-            return self.block_decorations(index).cloned();
-        }
         let block = self.markdown.semantic_blocks().get(index).ok_or(
             EditorDocumentError::BlockOutOfBounds {
                 index,
@@ -132,7 +289,7 @@ impl LayoutContext {
         )?;
         Ok(self
             .decorations
-            .decorate_semantic(&self.markdown, block, None)?)
+            .decorate_navigation(&self.markdown, block)?)
     }
     /// Bounded progressive work list; the visible/active paragraphs are measured
     /// first by normal frame preparation. No whole-document shaping task exists.
@@ -152,14 +309,21 @@ impl LayoutContext {
         self.source.clone()
     }
 
+    pub fn toc_projection(&mut self) -> Result<Arc<crate::TocProjection>, DecorationError> {
+        self.decorations.toc.get(&self.markdown)
+    }
+
     /// Captures only owned source storage and revision-bound visual state.
     #[must_use]
     pub fn capture_render_snapshot(&self) -> EditorRenderSnapshot {
         EditorRenderSnapshot {
+            toc: self.decorations.toc.clone(),
             table_width_generation: self.table_width_generation,
             table_widths: Arc::clone(&self.table_widths),
             layout_snapshot: self.layout_snapshot.clone(),
             resource_geometry_version: self.resource_geometry_version,
+            embedded_sizes: self.embedded_sizes.clone(),
+            forced_sources: self.decorations.forced_sources(),
             identity: Arc::clone(&self.render_identity),
             source: self.snapshot(),
             markdown: Arc::clone(&self.markdown),
@@ -169,6 +333,8 @@ impl LayoutContext {
             composition: self.composition.clone(),
             search: self.search.clone(),
             search_generation: self.search_generation,
+            spelling: self.spelling.clone(),
+            spelling_generation: self.spelling_generation,
         }
     }
 
@@ -177,6 +343,8 @@ impl LayoutContext {
     #[must_use]
     pub(super) fn measurements(&self) -> LayoutMeasurements {
         LayoutMeasurements {
+            embedded_sizes: self.embedded_sizes.clone(),
+            forced_sources: self.decorations.forced_sources(),
             identity: Arc::clone(&self.render_identity),
             revision: self.source.revision(),
             viewport: self.viewport.clone(),
@@ -195,6 +363,8 @@ impl LayoutContext {
             && self.viewport_config() == layout.viewport.config()
             && self.selections == layout.selections
             && self.composition == layout.composition
+            && self.embedded_sizes == layout.embedded_sizes
+            && self.decorations.forced_sources() == layout.forced_sources
     }
 
     /// Adopt revision-bound native paragraph geometry and numerical block heights.
@@ -497,12 +667,13 @@ impl LayoutContext {
             .get_or_build_block(&self.markdown, block)?
             .clone();
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
+        let sizes = self.resource_sizes(decorations.range(), sizes);
         self.layouts
             .get_or_build_block(
                 &self.markdown,
                 block,
                 config,
-                BlockLayoutSource::new(&visual, &decorations, sizes),
+                BlockLayoutSource::new(&visual, &decorations, &sizes),
             )
             .map_err(EditorDocumentError::Layout)
     }
@@ -535,7 +706,8 @@ impl LayoutContext {
     {
         let block = self.block_at(index)?;
         let decorations = self.decorations.get_or_build_block(&self.markdown, block)?;
-        Ok(image_sizes(decorations, image_resolver))
+        let images = image_sizes(decorations, image_resolver);
+        Ok(self.resource_sizes(block.range(), &images))
     }
 
     /// [`Self::block_layout_with_shaper`] 加上已经解码到位的图片尺寸。
@@ -553,12 +725,13 @@ impl LayoutContext {
             .get_or_build_block(&self.markdown, block)?
             .clone();
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
+        let sizes = self.resource_sizes(decorations.range(), sizes);
         self.layouts
             .get_or_build_block_with_shaper(
                 &self.markdown,
                 block,
                 config,
-                BlockLayoutSource::new(&visual, &decorations, sizes),
+                BlockLayoutSource::new(&visual, &decorations, &sizes),
                 shaper,
             )
             .map_err(EditorDocumentError::Layout)
@@ -597,12 +770,13 @@ impl LayoutContext {
         let snapshot = self.snapshot();
         let decorations = self.block_decorations_with_selection_reveal(index)?;
         let visual = VisualText::new(&snapshot, decorations.range(), decorations.set().clone())?;
+        let sizes = self.resource_sizes(decorations.range(), sizes);
         self.layouts
             .get_or_build_block_with_shaper(
                 &self.markdown,
                 block,
                 config,
-                crate::layout::BlockLayoutSource::new(&visual, &decorations, sizes),
+                crate::layout::BlockLayoutSource::new(&visual, &decorations, &sizes),
                 shaper,
             )
             .cloned()
@@ -782,12 +956,13 @@ impl LayoutContext {
     ) -> Result<BlockView, EditorDocumentError> {
         let block = self.block_at(index)?;
         let (visual, decorations) = self.block_visual_for_composition(index)?;
+        let sizes = self.resource_sizes(decorations.range(), sizes);
         self.layouts
             .get_or_build_block_with_shaper(
                 &self.markdown,
                 block,
                 config,
-                crate::layout::BlockLayoutSource::new(&visual, &decorations, sizes),
+                crate::layout::BlockLayoutSource::new(&visual, &decorations, &sizes),
                 shaper,
             )
             .cloned()
@@ -1186,7 +1361,7 @@ impl LayoutContext {
         if let Some(margin) = quote_margin {
             return base + margin * config.line_height() / config.theme().spec().body_size;
         }
-        let is_table = yu_markdown::table_for_block(&self.markdown, block).is_some();
+        let is_table = yu_markdown::native_table_for_block(&self.markdown, block).is_some();
         if !matches!(block.kind(), BlockKind::Heading { .. }) && !is_table {
             return base;
         }
@@ -1331,7 +1506,7 @@ impl LayoutContext {
             .count();
         let spec = config.theme().spec();
         let margin = |path: &[usize], block: yu_markdown::Block, after: bool| {
-            let is_table = yu_markdown::table_for_block(&self.markdown, block).is_some();
+            let is_table = yu_markdown::native_table_for_block(&self.markdown, block).is_some();
             let leaf = *path.last().expect("nonempty path");
             let node = &tree.nodes()[leaf];
             let kind = if node.kind == PresentationKind::EmptyParagraph {

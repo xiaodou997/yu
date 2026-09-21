@@ -44,8 +44,17 @@ impl DocumentSession {
                 state: ExternalFileState::Changed,
             });
         }
+        let images = self.editor.image_references()?;
+        let mut resources = super::image_relocation::ImageRelocation::prepare(
+            &self.path,
+            &path,
+            &images,
+            self.editor.retained_image_destinations(),
+        )?;
         let bytes = serialize_source(self.editor.snapshot().as_str(), self.bom);
+        resources.validate_before_publish()?;
         atomic_replace(&storage_path, &bytes, expected.as_ref())?;
+        resources.commit();
         let metadata = fs::metadata(&storage_path)
             .map_err(|error| StorageError::io("stat saved destination", &storage_path, error))?;
         self.path = path;

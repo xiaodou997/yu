@@ -19,6 +19,7 @@ pub enum PresentationKind {
         start: u64,
     },
     ListItem,
+    FootnoteDefinition,
     Quote,
     Code,
     Rule,
@@ -40,15 +41,198 @@ pub struct PresentationNode {
 pub struct PresentationTree {
     nodes: Vec<PresentationNode>,
     leaves: Vec<usize>,
+    footnotes: crate::FootnoteIndex,
 }
 
 impl PresentationTree {
     pub fn from_syntax(tree: Option<&Tree>, source: &TextSnapshot) -> Self {
         let mut result = Self::default();
         if let Some(tree) = tree {
+            result.footnotes = crate::FootnoteIndex::from_syntax(tree, source);
             result.append(tree, 0, None, source);
             result.append_empty_paragraphs(source);
         }
+        result
+    }
+
+    /// Replace parser HTML leaves with source-backed flow leaves and list
+    /// ancestry. This tree is paired with HtmlIndex's projected block sequence.
+    pub(crate) fn with_html_regions(&self, regions: &[crate::html::HtmlRegion]) -> Self {
+        use crate::html::{HtmlElementKind as H, HtmlFlowKind};
+        use std::hash::{Hash, Hasher};
+        let mut result = self.clone();
+        let mut replaced = std::collections::HashSet::new();
+        for region in regions {
+            let Ok(model) = &region.model else { continue };
+            let Some(old) = result.leaves.iter().copied().find(|&id| {
+                result.nodes[id].kind == PresentationKind::Html
+                    && result.nodes[id].source.start() >= region.source.start()
+                    && result.nodes[id].source.end() <= region.source.end()
+            }) else {
+                continue;
+            };
+            let Some(parent) = result.nodes[old].parent else {
+                continue;
+            };
+            let mut semantic_hash = std::collections::hash_map::DefaultHasher::new();
+            for element in &model.resolution.elements {
+                element
+                    .as_ref()
+                    .map(|e| format!("{:?}:{:?}", e.kind, e.attributes))
+                    .hash(&mut semantic_hash);
+            }
+            let semantic_key = semantic_hash.finish();
+            let mut roots = Vec::new();
+            let mut containers = std::collections::HashMap::new();
+            for part in &model.partitions {
+                let mut ancestry = Vec::new();
+                let mut owner = part.content.owner;
+                while let Some(id) = owner {
+                    ancestry.push(id);
+                    owner = model.fragment.nodes[id].parent;
+                }
+                ancestry.reverse();
+                let mut current = parent;
+                for html_id in ancestry {
+                    let Some(element) = &model.resolution.elements[html_id] else {
+                        continue;
+                    };
+                    let tight = !model.fragment.nodes[html_id].children.iter().any(|&item| {
+                        model.fragment.nodes[item].children.iter().any(|&child| {
+                            model.resolution.elements[child]
+                                .as_ref()
+                                .is_some_and(|e| e.kind == H::Paragraph)
+                        })
+                    });
+                    let kind = match element.kind {
+                        H::UnorderedList => PresentationKind::List {
+                            ordered: false,
+                            tight,
+                            start: 1,
+                        },
+                        H::OrderedList => PresentationKind::List {
+                            ordered: true,
+                            tight,
+                            start: element.attributes.start.unwrap_or(1),
+                        },
+                        H::ListItem => PresentationKind::ListItem,
+                        _ => continue,
+                    };
+                    if let Some(&existing) = containers.get(&html_id) {
+                        current = existing;
+                        continue;
+                    }
+                    let item_number = match (kind, result.nodes[current].kind) {
+                        (
+                            PresentationKind::ListItem,
+                            PresentationKind::List {
+                                ordered: true,
+                                start,
+                                ..
+                            },
+                        ) => {
+                            Some(start.saturating_add(result.nodes[current].children.len() as u64))
+                        }
+                        _ => None,
+                    };
+                    let id = result.nodes.len();
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    result.nodes[current].context_key.hash(&mut hash);
+                    kind.hash(&mut hash);
+                    item_number.hash(&mut hash);
+                    result.nodes.push(PresentationNode {
+                        kind,
+                        source: model.fragment.nodes[html_id].source,
+                        parent: Some(current),
+                        children: Vec::new(),
+                        item_number,
+                        context_key: hash.finish(),
+                    });
+                    if current == parent {
+                        roots.push(id);
+                    } else {
+                        result.nodes[current].children.push(id);
+                    }
+                    containers.insert(html_id, id);
+                    current = id;
+                }
+                let kind = match part.content.kind {
+                    HtmlFlowKind::Paragraph => PresentationKind::Paragraph,
+                    HtmlFlowKind::Heading(level) => PresentationKind::Heading(level),
+                    HtmlFlowKind::Table | HtmlFlowKind::Source => PresentationKind::Html,
+                };
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                result.nodes[current].context_key.hash(&mut hash);
+                kind.hash(&mut hash);
+                if matches!(kind, PresentationKind::Heading(_)) {
+                    (current == parent
+                        && result.nodes[parent].kind == PresentationKind::Document
+                        && roots.is_empty()
+                        && result.nodes[parent].children.first() == Some(&old))
+                    .hash(&mut hash);
+                }
+                // Include ancestor attributes and diagnostics: changing a tag
+                // outside the leaf changes its projection even at the same text.
+                semantic_key.hash(&mut hash);
+                let id = result.nodes.len();
+                result.nodes.push(PresentationNode {
+                    kind,
+                    source: part.source,
+                    parent: Some(current),
+                    children: Vec::new(),
+                    item_number: None,
+                    context_key: hash.finish(),
+                });
+                if current == parent {
+                    roots.push(id);
+                } else {
+                    result.nodes[current].children.push(id);
+                }
+                result.leaves.push(id);
+            }
+            result.leaves.retain(|&id| id != old);
+            replaced.insert(old);
+            if let Some(position) = result.nodes[parent]
+                .children
+                .iter()
+                .position(|&id| id == old)
+            {
+                result.nodes[parent]
+                    .children
+                    .splice(position..=position, roots);
+            }
+        }
+        if !replaced.is_empty() {
+            let mut mapping = vec![0; result.nodes.len()];
+            let mut next = 0;
+            for (id, mapped) in mapping.iter_mut().enumerate() {
+                if !replaced.contains(&id) {
+                    *mapped = next;
+                    next += 1;
+                }
+            }
+            result.nodes = result
+                .nodes
+                .into_iter()
+                .enumerate()
+                .filter_map(|(id, mut node)| {
+                    if replaced.contains(&id) {
+                        return None;
+                    }
+                    node.parent = node.parent.map(|parent| mapping[parent]);
+                    for child in &mut node.children {
+                        *child = mapping[*child];
+                    }
+                    Some(node)
+                })
+                .collect();
+            for leaf in &mut result.leaves {
+                *leaf = mapping[*leaf];
+            }
+        }
+        result
+            .leaves
+            .sort_by_key(|&id| result.nodes[id].source.start());
         result
     }
 
@@ -120,6 +304,10 @@ impl PresentationTree {
         self.leaves.sort_by_key(|id| self.nodes[*id].source.start());
     }
 
+    pub fn footnotes(&self) -> &crate::FootnoteIndex {
+        &self.footnotes
+    }
+
     pub fn nodes(&self) -> &[PresentationNode] {
         &self.nodes
     }
@@ -134,8 +322,13 @@ impl PresentationTree {
                 start: ordered_start(tree, start, source),
             },
             NodeKind::ListItem => PresentationKind::ListItem,
-            NodeKind::Paragraph | NodeKind::Task => PresentationKind::Paragraph,
-            NodeKind::CodeBlock | NodeKind::FencedCode => PresentationKind::Code,
+            NodeKind::FootnoteDefinition => PresentationKind::FootnoteDefinition,
+            NodeKind::Paragraph | NodeKind::Task | NodeKind::MathBlock => {
+                PresentationKind::Paragraph
+            }
+            NodeKind::CodeBlock | NodeKind::FencedCode | NodeKind::FrontMatter => {
+                PresentationKind::Code
+            }
             NodeKind::HorizontalRule => PresentationKind::Rule,
             NodeKind::LinkReference => PresentationKind::Reference,
             NodeKind::HtmlBlock | NodeKind::CommentBlock | NodeKind::ProcessingInstructionBlock => {
@@ -174,6 +367,11 @@ impl PresentationTree {
         parent.map(|id| self.nodes[id].context_key).hash(&mut hash);
         kind.hash(&mut hash);
         item_number.hash(&mut hash);
+        if tree.kind() == NodeKind::FootnoteDefinition
+            || (!tree.kind().is_block_context() && self.footnotes.has_reference(range))
+        {
+            self.footnotes.fingerprint().hash(&mut hash);
+        }
         // A top-level heading changes its leading box margin when another
         // semantic block is inserted ahead of it. Invalidate only that node.
         if matches!(kind, PresentationKind::Heading(_)) {

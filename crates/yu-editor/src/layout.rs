@@ -173,7 +173,7 @@ impl LayoutCache {
             block,
             config,
             LayoutBackend::Metrics,
-            markdown.presentation().context_key(block.range()),
+            markdown.presentation_context_key(block.range()),
         );
         self.prepare(snapshot);
         if let Some(index) = self.reusable(key, &source) {
@@ -206,7 +206,7 @@ impl LayoutCache {
             block,
             config,
             LayoutBackend::Shaped,
-            markdown.presentation().context_key(block.range()),
+            markdown.presentation_context_key(block.range()),
         );
         self.prepare(snapshot);
         if let Some(index) = self.reusable(key, &source) {
@@ -363,8 +363,7 @@ impl LayoutCache {
                 .is_some_and(|block| {
                     block.range() == entry.key.range
                         && block.kind() == entry.key.kind
-                        && entry.key.context_key
-                            == markdown.presentation().context_key(block.range())
+                        && entry.key.context_key == markdown.presentation_context_key(block.range())
                 })
         });
         let dropped = before.saturating_sub(self.entries.len());
@@ -372,6 +371,19 @@ impl LayoutCache {
     }
 
     /// Drops every cached layout, for example when a document is reset.
+    pub(crate) fn invalidate_resource_ranges(&mut self, ranges: &[yu_core::TextRange]) {
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            !ranges.iter().any(|range| {
+                range.start() < entry.key.range.end() && entry.key.range.start() < range.end()
+            })
+        });
+        self.stats.invalidated = self
+            .stats
+            .invalidated
+            .saturating_add((before - self.entries.len()) as u64);
+    }
+
     pub fn clear(&mut self) {
         let dropped = self.entries.len();
         self.entries.clear();

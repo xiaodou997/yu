@@ -24,6 +24,13 @@ pub enum EditorCommand {
         columns: usize,
         cells: Vec<Arc<str>>,
     },
+    /// Validated finite HTML cell contents, retained as markup in HTML grids.
+    PasteHtmlTableGrid {
+        columns: usize,
+        cells: Vec<Arc<str>>,
+    },
+    /// A complete finite HTML table with merged-cell structure.
+    PasteHtmlTableSource(Arc<str>),
     DeleteBackward,
     DeleteForward,
     DeleteWordBackward,
@@ -58,6 +65,9 @@ pub enum EditorCommand {
     OutdentList,
     Undo,
     Redo,
+    ToggleHtmlDetails {
+        source: ByteOffset,
+    },
     ToggleTask {
         block: usize,
     },

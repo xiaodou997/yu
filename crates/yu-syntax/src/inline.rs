@@ -32,6 +32,9 @@ const ESCAPABLE: &[u8] = b"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
 pub(crate) enum DelimiterId {
     EmphasisUnderscore,
     EmphasisAsterisk,
+    Highlight,
+    Superscript,
+    Subscript,
     LinkStart,
     ImageStart,
 }
@@ -42,13 +45,15 @@ impl DelimiterId {
     /// `LinkStart` / `ImageStart` 返回 `false`：它们由 `LinkEnd` 在遇到 `]`
     /// 时急切匹配，不参与 [`InlineContext::resolve_markers`] 的自动配对。
     const fn resolves(self) -> bool {
-        matches!(self, Self::EmphasisUnderscore | Self::EmphasisAsterisk)
+        !matches!(self, Self::LinkStart | Self::ImageStart)
     }
 
     /// 分隔符字符本身要成为的节点类型。
     const fn mark(self) -> Option<NodeKind> {
         match self {
             Self::EmphasisUnderscore | Self::EmphasisAsterisk => Some(NodeKind::EmphasisMark),
+            Self::Highlight => Some(NodeKind::HighlightMark),
+            Self::Superscript | Self::Subscript => Some(NodeKind::ScriptMark),
             Self::LinkStart | Self::ImageStart => None,
         }
     }
@@ -184,6 +189,20 @@ impl<'a> InlineContext<'a> {
                 if open.side & MARK_OPEN == 0 || open.id != close.id {
                     continue;
                 }
+                // Script notation is a single word; prose such as "a ~ b ~ c"
+                // remains literal. Markers still use the normal inline stack,
+                // so code, math, escaped punctuation and links stay opaque.
+                if matches!(close.id, DelimiterId::Superscript | DelimiterId::Subscript)
+                    && self
+                        .slice(open.to, close.from)
+                        .chars()
+                        .any(char::is_whitespace)
+                {
+                    continue;
+                }
+                if open.to == close.from {
+                    continue;
+                }
                 let open_size = open.to - open.from;
                 // CommonMark 的「rule of three」：当一个分隔符既能开又能闭时，
                 // 两段长度之和是 3 的倍数、且各自不是 3 的倍数的配对被排除。
@@ -282,6 +301,9 @@ impl DelimiterId {
     const fn resolve_kind(self) -> NodeKind {
         match self {
             Self::EmphasisUnderscore | Self::EmphasisAsterisk => NodeKind::Emphasis,
+            Self::Highlight => NodeKind::Highlight,
+            Self::Superscript => NodeKind::Superscript,
+            Self::Subscript => NodeKind::Subscript,
             Self::LinkStart => NodeKind::Link,
             Self::ImageStart => NodeKind::Image,
         }
@@ -333,11 +355,15 @@ type InlineParser = fn(&mut InlineContext<'_>, u8, u32) -> Option<u32>;
 /// 而开标记要先被放进去。
 const INLINE_PARSERS: &[InlineParser] = &[
     parse_escape,
+    parse_equation_reference,
     parse_entity,
     parse_inline_code,
+    parse_inline_math,
     parse_html_tag,
     parse_emphasis,
+    parse_writing_delimiter,
     parse_hard_break,
+    parse_footnote_reference,
     parse_link_start,
     parse_image_start,
     parse_link_end,
@@ -406,6 +432,102 @@ fn match_entity(rest: &str) -> Option<usize> {
         word
     };
     (bytes.get(index) == Some(&b';')).then_some(index + 1)
+}
+
+/// Shared scanner for GFM-style footnote labels. Return the byte after `]`.
+pub(crate) fn footnote_label_end(text: &str, start: usize) -> Option<usize> {
+    let rest = text.get(start..)?;
+    if !rest.starts_with("[^") {
+        return None;
+    }
+    let close = rest[2..].find(']')? + 2;
+    if close == 2
+        || rest[2..close]
+            .bytes()
+            .any(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        return None;
+    }
+    Some(start + close + 1)
+}
+
+fn parse_footnote_reference(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u32> {
+    if next != b'[' {
+        return None;
+    }
+    let end = footnote_label_end(cx.text, (start - cx.offset) as usize)?;
+    Some(cx.append_element(Element::leaf(
+        NodeKind::FootnoteReference,
+        start,
+        cx.offset + end as u32,
+    )))
+}
+
+fn parse_equation_reference(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u32> {
+    if next != b'\\' {
+        return None;
+    }
+    let rest = cx.slice(start, cx.end());
+    let prefix = if rest.starts_with("\\eqref{") {
+        7
+    } else if rest.starts_with("\\ref{") {
+        5
+    } else {
+        return None;
+    };
+    let end = rest[prefix..].find('}')? + prefix + 1;
+    if rest[..end].contains(['\n', '\r', '\t']) {
+        return None;
+    }
+    Some(cx.append_element(Element::new(
+        NodeKind::EquationReference,
+        start,
+        start + end as u32,
+        vec![],
+    )))
+}
+
+/// Dollar math is opaque: TeX underscores, escapes and brackets must not
+/// acquire competing Markdown decorations. Whitespace/currency-like delimiters
+/// and unclosed input remain ordinary source.
+fn parse_inline_math(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u32> {
+    let adjacent = matches!(cx.parts.last(), Some(Some(Part::Element(element)))
+        if element.kind == NodeKind::InlineMath && element.to == start);
+    if next != b'$'
+        || cx.byte(start + 1) == Some(b'$')
+        || (start > cx.offset && cx.byte(start - 1) == Some(b'$') && !adjacent)
+        || cx.byte(start + 1).is_none_or(|b| b.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let mut pos = start + 1;
+    while pos < cx.end() {
+        match cx.byte(pos)? {
+            b'\n' | b'\r' => return None,
+            b'\\' => {
+                pos += 2;
+                continue;
+            }
+            b'$' if pos > start + 1
+                && cx.byte(pos - 1).is_some_and(|b| !b.is_ascii_whitespace())
+                && !cx.byte(pos + 1).is_some_and(|b| b.is_ascii_digit()) =>
+            {
+                return Some(cx.append_element(Element::new(
+                    NodeKind::InlineMath,
+                    start,
+                    pos + 1,
+                    vec![
+                        Element::leaf(NodeKind::MathMark, start, start + 1),
+                        Element::leaf(NodeKind::MathText, start + 1, pos),
+                        Element::leaf(NodeKind::MathMark, pos, pos + 1),
+                    ],
+                )));
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+    None
 }
 
 fn parse_inline_code(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u32> {
@@ -512,6 +634,33 @@ fn parse_emphasis(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u3
         from: start,
         to: pos,
         side: (u8::from(can_open) * MARK_OPEN) | (u8::from(can_close) * MARK_CLOSE),
+    }))
+}
+
+/// Writing extensions share the delimiter stack, rather than re-scanning raw
+/// text in presentation. Long runs remain literal (notably GFM strike `~~`).
+fn parse_writing_delimiter(cx: &mut InlineContext<'_>, next: u8, start: u32) -> Option<u32> {
+    let (id, width) = match next {
+        b'=' => (DelimiterId::Highlight, 2),
+        b'^' => (DelimiterId::Superscript, 1),
+        b'~' => (DelimiterId::Subscript, 1),
+        _ => return None,
+    };
+    let mut end = start + 1;
+    while cx.byte(end) == Some(next) {
+        end += 1;
+    }
+    if end - start != width || (start > cx.offset && cx.byte(start - 1) == Some(next)) {
+        return Some(end);
+    }
+    let before = char_before(cx.text, (start - cx.offset) as usize);
+    let after = char_at(cx.text, (end - cx.offset) as usize);
+    Some(cx.append_delimiter(InlineDelimiter {
+        id,
+        from: start,
+        to: end,
+        side: (u8::from(after.is_some_and(|ch| !ch.is_whitespace())) * MARK_OPEN)
+            | (u8::from(before.is_some_and(|ch| !ch.is_whitespace())) * MARK_CLOSE),
     }))
 }
 

@@ -76,37 +76,101 @@ impl EditorDocument {
             .block_index_for_offset(first.ordered_range().start())
             .and_then(|index| self.presentation.markdown.blocks().get(index))
             .ok_or(EditorDocumentError::InvalidTablePaste)?;
+        let grid = self.html_table_grid(block);
         let markdown = &self.presentation.markdown;
-        let tree = markdown
-            .tree()
-            .ok_or(EditorDocumentError::InvalidTablePaste)?;
-        let decorations = yu_markdown::ExtensionSet::markdown()
-            .decorate(
-                markdown.source(),
-                tree,
-                markdown.reference_definitions(),
-                markdown.presentation(),
-                block,
-                None,
-            )
-            .map_err(DecorationError::from)?;
+        let html_decorations = self.html_table_decorations(block);
+        let decorations = if let Some(decorations) = html_decorations {
+            decorations
+        } else {
+            let tree = markdown
+                .tree()
+                .ok_or(EditorDocumentError::InvalidTablePaste)?;
+            yu_markdown::ExtensionSet::markdown()
+                .decorate(
+                    markdown.source(),
+                    tree,
+                    markdown.reference_definitions(),
+                    markdown.presentation(),
+                    block,
+                    None,
+                )
+                .map_err(DecorationError::from)?
+        };
         let mut output = String::new();
-        for (index, selection) in selections.iter().enumerate() {
+        let slots = self
+            .selections()
+            .table_slots()
+            .ok_or(EditorDocumentError::InvalidTablePaste)?;
+        let mut emitted = vec![false; selections.len()];
+        for (index, slot) in slots.iter().enumerate() {
+            if index > 0 {
+                output.push(if index % columns == 0 { '\n' } else { '\t' });
+            }
+            let Some(owner) = *slot else {
+                continue;
+            };
+            let Some(selection) = selections.get(owner) else {
+                return Err(EditorDocumentError::InvalidTablePaste);
+            };
+            if std::mem::replace(&mut emitted[owner], true) {
+                continue;
+            }
             let range = selection.ordered_range();
             if range.start() < block.range().start() || range.end() > block.range().end() {
                 return Err(EditorDocumentError::InvalidTablePaste);
             }
-            if index > 0 {
-                output.push(if index % columns == 0 { '\n' } else { '\t' });
-            }
-            let visual = VisualText::new(markdown.source(), range, decorations.set().clone())?;
-            let text = visual.text();
+            let paragraphs = grid
+                .as_ref()
+                .and_then(|grid| {
+                    grid.visible_cell_for_source(range.start().get() as usize)
+                        .map(|address| grid.cell_paragraphs(address))
+                })
+                .unwrap_or(&[]);
+            let text = if paragraphs.is_empty() {
+                VisualText::new(markdown.source(), range, decorations.set().clone())?
+                    .text()
+                    .to_owned()
+            } else {
+                paragraphs
+                    .iter()
+                    .map(|paragraph| {
+                        let part = paragraph.disclosure_content.unwrap_or(paragraph.source);
+                        let range = TextRange::new(
+                            ByteOffset::new(part.start() as u64),
+                            ByteOffset::new(part.end() as u64),
+                        )
+                        .ok_or(EditorDocumentError::InvalidTablePaste)?;
+                        let mut text = String::new();
+                        for (depth, item) in paragraph.list.iter().enumerate() {
+                            if item.opening.is_some() {
+                                text.push_str(&"  ".repeat(depth));
+                                text.push_str(
+                                    &item.number.map_or_else(
+                                        || "•".to_owned(),
+                                        |number| format!("{number}."),
+                                    ),
+                                );
+                                text.push(' ');
+                            }
+                        }
+                        if text.is_empty() && !paragraph.list.is_empty() {
+                            text.push_str(&"  ".repeat(paragraph.list.len()));
+                        }
+                        text.push_str(
+                            VisualText::new(markdown.source(), range, decorations.set().clone())?
+                                .text(),
+                        );
+                        Ok(text)
+                    })
+                    .collect::<Result<Vec<_>, EditorDocumentError>>()?
+                    .join("\n")
+            };
             if text.contains(['\t', '\r', '\n', '"']) {
                 output.push('"');
                 output.push_str(&text.replace('"', "\"\""));
                 output.push('"');
             } else {
-                output.push_str(text);
+                output.push_str(&text);
             }
         }
         Ok(Some(output))
@@ -158,11 +222,34 @@ impl EditorDocument {
         }
     }
 
+    pub(super) fn tsv_grid_for_target(
+        &self,
+        source: &str,
+    ) -> Result<(usize, Vec<Arc<str>>), EditorDocumentError> {
+        let html = !self.source_mode()
+            && self
+                .selections()
+                .as_slice()
+                .first()
+                .and_then(|selection| {
+                    self.block_index_for_offset(selection.ordered_range().start())
+                })
+                .and_then(|index| self.markdown.blocks().get(index))
+                .and_then(|block| self.html_table_grid(block))
+                .is_some();
+        if html {
+            let (columns, cells) = parse_tsv(source)?;
+            Ok((columns, cells.into_iter().map(Arc::from).collect()))
+        } else {
+            Self::tsv_grid(source)
+        }
+    }
+
     pub(super) fn paste_tsv(
         &mut self,
         source: Arc<str>,
     ) -> Result<CommandResult, EditorDocumentError> {
-        let (columns, cells) = Self::tsv_grid(&source)?;
+        let (columns, cells) = self.tsv_grid_for_target(&source)?;
         self.paste_table_grid(columns, cells)
     }
 }
@@ -361,5 +448,25 @@ mod tests {
             })
             .expect("contextual grid");
         assert_eq!(table.snapshot().as_str(), "| a | b |\n| --- | --- |");
+    }
+    #[test]
+    fn merged_slot_tsv_emits_content_only_at_owner_origin() {
+        let source = "<table><tr><td>中文🙂</td><td>B</td></tr></table>\n";
+        let mut document = EditorDocument::new(source);
+        let start = ByteOffset::new(source.find("中文").expect("first") as u64);
+        let end = ByteOffset::new(source.find(">B<").expect("second") as u64 + 1);
+        document.select_table_cells(start, end).expect("cells");
+        document.presentation.selections = document
+            .presentation
+            .selections
+            .clone()
+            .with_table_slots(3, vec![Some(0), Some(0), Some(1)])
+            .expect("merged owner mapping");
+        assert_eq!(
+            document.copy_table_tsv().expect("tsv"),
+            Some("中文🙂\t\tB".into())
+        );
+        assert_eq!(document.selections().as_slice().len(), 2);
+        assert_eq!(document.snapshot().as_str(), source);
     }
 }

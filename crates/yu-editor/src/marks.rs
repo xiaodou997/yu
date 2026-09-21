@@ -102,15 +102,31 @@ pub(crate) fn flatten_composed(
                 candidates.sort_by_key(|m| (m.range.len(), m.style.0));
                 let mut style = base.style();
                 let mut role = TextRole::Plain;
+                let mut highlighted = false;
+                let mut underlined = false;
+                let mut struck = false;
+                let mut script = yu_core::TextScript::Normal;
                 for mark in candidates {
                     if let Some(attrs) = styles.get(mark.style.0 as usize) {
                         style = style.union(attrs.style());
+                        highlighted |= attrs.highlighted();
+                        underlined |= attrs.underlined();
+                        struck |= attrs.struck();
+                        if script == yu_core::TextScript::Normal {
+                            script = attrs.script();
+                        }
                         if role == TextRole::Plain {
                             role = attrs.role();
                         }
                     }
                 }
-                let attrs = base.with_style(style).with_role(role);
+                let attrs = base
+                    .with_style(style)
+                    .with_role(role)
+                    .with_highlighted(highlighted)
+                    .with_underlined(underlined)
+                    .with_struck(struck)
+                    .with_script(script);
                 let index = styles
                     .iter()
                     .position(|entry| *entry == attrs)

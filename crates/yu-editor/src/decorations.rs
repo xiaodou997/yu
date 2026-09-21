@@ -20,6 +20,7 @@
 //!
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use yu_core::{Revision, TextRange};
 use yu_decoration::DecorationSet;
@@ -38,6 +39,7 @@ pub enum DecorationError {
     Parse(ParseError),
     /// extension 集合产出失败。
     Extension(ExtensionError),
+    Visual(crate::VisualTextError),
 }
 
 impl fmt::Display for DecorationError {
@@ -45,6 +47,7 @@ impl fmt::Display for DecorationError {
         match self {
             Self::Parse(error) => write!(formatter, "解析失败：{error}"),
             Self::Extension(error) => error.fmt(formatter),
+            Self::Visual(error) => error.fmt(formatter),
         }
     }
 }
@@ -54,6 +57,12 @@ impl Error for DecorationError {}
 impl From<ParseError> for DecorationError {
     fn from(error: ParseError) -> Self {
         Self::Parse(error)
+    }
+}
+
+impl From<crate::VisualTextError> for DecorationError {
+    fn from(error: crate::VisualTextError) -> Self {
+        Self::Visual(error)
     }
 }
 
@@ -122,7 +131,9 @@ struct Entry {
 /// **树不在这里了。** 它跟着 `MarkdownDocument` 走（那边的类型文档写了理由），
 /// 这一层只管装饰的缓存与复用。
 pub struct DecorationCache {
+    pub(crate) toc: crate::toc::TocCache,
     extensions: ExtensionSet,
+    forced_sources: Option<Arc<(Revision, Vec<TextRange>)>>,
     entries: Vec<Entry>,
     /// 上一次产出装饰时那份引用表的指纹。
     ///
@@ -143,7 +154,9 @@ pub struct DecorationCache {
 impl Default for DecorationCache {
     fn default() -> Self {
         Self {
+            toc: crate::toc::TocCache::default(),
             extensions: ExtensionSet::markdown(),
+            forced_sources: None,
             entries: Vec::new(),
             references: None,
             stats: DecorationCacheStats::default(),
@@ -162,6 +175,28 @@ impl fmt::Debug for DecorationCache {
 }
 
 impl DecorationCache {
+    pub(crate) fn forced_sources(&self) -> Option<Arc<(Revision, Vec<TextRange>)>> {
+        self.forced_sources.clone()
+    }
+
+    pub(crate) fn set_forced_sources(&mut self, next: Option<Arc<(Revision, Vec<TextRange>)>>) {
+        if self.forced_sources != next {
+            self.clear();
+            self.forced_sources = next;
+        }
+    }
+
+    fn forces_source(&self, revision: Revision, range: TextRange) -> bool {
+        self.forced_sources
+            .as_deref()
+            .is_some_and(|(version, ranges)| {
+                *version == revision
+                    && ranges
+                        .iter()
+                        .any(|failed| failed.start() < range.end() && range.start() < failed.end())
+            })
+    }
+
     /// 一个块的规范装饰（无光标露出），第一次问的时候产出。
     ///
     /// # Errors
@@ -174,7 +209,7 @@ impl DecorationCache {
     ) -> Result<&BlockDecorations, DecorationError> {
         self.retire_stale(markdown.revision());
         self.retire_stale_references(markdown);
-        let context_key = markdown.presentation().context_key(block.range());
+        let context_key = markdown.presentation_context_key(block.range());
         if let Some(index) = self.entries.iter().position(|entry| {
             entry.range == block.range()
                 && entry.kind == block.kind()
@@ -212,7 +247,27 @@ impl DecorationCache {
         if markdown.source_mode() {
             return Ok(BlockDecorations::source(markdown.source(), block));
         }
-        self.decorate_semantic(markdown, block, active)
+        let decorations = self.decorate_semantic(markdown, block, active)?;
+        Ok(match self.forced_sources.as_deref() {
+            Some((revision, ranges)) if *revision == markdown.revision() => {
+                decorations.reveal_failed_resources(markdown.source(), block, ranges)
+            }
+            _ => decorations,
+        })
+    }
+
+    pub fn decorate_navigation(
+        &mut self,
+        markdown: &MarkdownDocument,
+        block: Block,
+    ) -> Result<BlockDecorations, DecorationError> {
+        if let Some(decorations) = markdown
+            .semantic_html_regions()
+            .decorate(markdown, block, None)
+        {
+            return Ok(decorations);
+        }
+        self.decorate_semantic(markdown, block, None)
     }
 
     pub fn decorate_semantic(
@@ -221,18 +276,33 @@ impl DecorationCache {
         block: Block,
         active: Option<TextRange>,
     ) -> Result<BlockDecorations, DecorationError> {
+        if let Some(decorations) = markdown.html_regions().decorate(markdown, block, active) {
+            self.stats.parses = self.stats.parses.saturating_add(1);
+            return Ok(decorations);
+        }
         let tree = markdown
             .tree()
             .ok_or(DecorationError::Parse(ParseError::SourceTooLarge))?;
         self.stats.parses = self.stats.parses.saturating_add(1);
-        Ok(self.extensions.decorate(
+        let decorations = self.extensions.decorate(
             markdown.source(),
             tree,
             markdown.reference_definitions(),
             markdown.semantic_presentation(),
             block,
             active,
-        )?)
+        )?;
+        if let Some(marker) = markdown.toc_marker_in(block.range())
+            && !yu_markdown::reveals(active, marker)
+        {
+            let projection = self.toc.get(markdown)?;
+            return Ok(decorations.with_generated_text(
+                markdown.source(),
+                marker,
+                projection.text.clone(),
+            ));
+        }
+        Ok(decorations)
     }
 
     /// 整篇文档的装饰集合：每个块的产出合并成一份。
@@ -280,6 +350,12 @@ impl DecorationCache {
         let mut remapped = 0_u64;
         let mut invalidated = 0_u64;
         for entry in &self.entries {
+            // A diagnostic belongs to the old source revision. Never remap its
+            // raw-source projection into the edited document as a cache hit.
+            if self.forces_source(entry.decorations.revision(), entry.range) {
+                invalidated = invalidated.saturating_add(1);
+                continue;
+            }
             let shifted = shift_for(entry.range, changes)
                 .ok()
                 .flatten()
@@ -327,6 +403,7 @@ impl DecorationCache {
     /// 只留下仍然对得上一个已解析块的条目。
     pub fn retain_blocks(&mut self, markdown: &MarkdownDocument) {
         self.retire_stale_references(markdown);
+        self.toc.bind(markdown.revision());
         let before = self.entries.len();
         let blocks = markdown.blocks();
         self.entries.retain(|entry| {
@@ -336,7 +413,7 @@ impl DecorationCache {
                 .is_some_and(|block| {
                     block.range() == entry.range
                         && block.kind() == entry.kind
-                        && entry.context_key == markdown.presentation().context_key(block.range())
+                        && entry.context_key == markdown.presentation_context_key(block.range())
                 })
         });
         let dropped = before.saturating_sub(self.entries.len());
@@ -345,6 +422,7 @@ impl DecorationCache {
 
     /// 丢掉全部装饰。
     pub fn clear(&mut self) {
+        self.toc = crate::toc::TocCache::default();
         let dropped = self.entries.len();
         self.entries.clear();
         // Revision 是每个 `TextBuffer` 自己从头数的，不是全局唯一的——换一份

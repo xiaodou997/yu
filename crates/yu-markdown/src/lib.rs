@@ -19,13 +19,24 @@ use yu_text::{
 
 mod block_sequence;
 mod classify;
+mod embedded_source;
+mod equations;
+mod footnotes;
+mod links;
+pub use links::{DocumentLink, InlineHtmlElement};
+pub mod html;
+pub use footnotes::{FootnoteDefinition, FootnoteDiagnostic, FootnoteIndex, FootnoteReference};
 mod extension;
+pub mod image_markup;
 mod inline;
 mod presentation;
 mod reference;
+mod spelling;
 mod table;
 mod task;
+mod toc;
 pub use presentation::{PresentationKind, PresentationNode, PresentationTree};
+pub use toc::{TocHeading, TocIndex};
 
 pub use block_sequence::{
     Block, BlockCompactionPolicy, BlockKind, BlockSequence, BlockState, BlockStorageStats,
@@ -35,17 +46,18 @@ use block_sequence::{BlockRecord, ResolvedBlockRecord, SourceHash, retained_bloc
 use classify::BlockShape;
 pub use extension::{
     BlockContext, BlockDecorations, BlockOrnament, BlockWidget, CheckboxSpan, DelimitedSpan,
-    Extension, ExtensionError, ExtensionOutput, ExtensionSet, ImageSpan, MarkerOrnament,
-    SyntaxNode, reveals,
+    EmbeddedKind, EmbeddedSpan, Extension, ExtensionError, ExtensionOutput, ExtensionSet,
+    ImageSpan, MarkerOrnament, SyntaxNode, reveals,
 };
+pub use extension::{image_destination_text, image_spans, image_title_text};
 pub use inline::{
     InlineDelimiter, InlineDocument, InlineNode, InlineNodeKind, InlineParseError,
     InlinePunctuation, InlineSpan, InlineSpanKind, parse_inline, parse_inline_with_definitions,
 };
 pub use reference::{ReferenceDefinition, ReferenceDefinitionIndex};
 pub use table::{
-    TableAlignment, TableBlock, TableCellAddress, TableCellRange, TableRowRange, parse_table,
-    parse_table_in_snapshot, quote_table_cell_input,
+    TableAlignment, TableBlock, TableCellAddress, TableCellListItem, TableCellParagraph,
+    TableCellRange, TableRowRange, parse_table, parse_table_in_snapshot, quote_table_cell_input,
 };
 pub use task::TaskMarker;
 
@@ -120,6 +132,10 @@ pub struct MarkdownDocument {
     source_blocks: Option<BlockSequence>,
     source_presentation: PresentationTree,
     references: ReferenceDefinitionIndex,
+    equations: std::sync::OnceLock<std::sync::Arc<equations::EquationIndex>>,
+    toc: std::sync::OnceLock<std::sync::Arc<TocIndex>>,
+    html: std::sync::OnceLock<std::sync::Arc<html::HtmlIndex>>,
+    semantic_html: std::sync::OnceLock<std::sync::Arc<html::HtmlIndex>>,
     /// 语法树。`None` **只有一种成因**：源码超过 4 GiB，`yu-syntax` 明确
     /// 拒绝（`ParseError::SourceTooLarge`，位置是 32 位的）。那种文档今天
     /// 也一样什么都渲染不出来——装饰这一步就失败了——所以这里不为它另建一
@@ -138,7 +154,7 @@ impl MarkdownDocument {
         if self.source_mode() {
             &self.source_presentation
         } else {
-            &self.presentation
+            self.html_regions().presentation()
         }
     }
 
@@ -147,12 +163,12 @@ impl MarkdownDocument {
     }
 
     pub fn semantic_presentation(&self) -> &PresentationTree {
-        &self.presentation
+        self.semantic_html_regions().presentation()
     }
 
     /// Canonical semantic blocks remain available for parsing and the outline.
     pub fn semantic_blocks(&self) -> &BlockSequence {
-        &self.blocks
+        self.semantic_html_regions().projected_blocks()
     }
 
     pub fn set_source_mode(&mut self, enabled: bool) {
@@ -209,7 +225,9 @@ impl MarkdownDocument {
 
     #[must_use]
     pub fn blocks(&self) -> &BlockSequence {
-        self.source_blocks.as_ref().unwrap_or(&self.blocks)
+        self.source_blocks
+            .as_ref()
+            .unwrap_or_else(|| self.html_regions().projected_blocks())
     }
 
     /// Returns the source-backed link definitions for this document revision.
@@ -631,6 +649,10 @@ pub fn parse(snapshot: &TextSnapshot) -> MarkdownDocument {
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
         source: snapshot.clone(),
+        equations: std::sync::OnceLock::new(),
+        toc: std::sync::OnceLock::new(),
+        html: std::sync::OnceLock::new(),
+        semantic_html: std::sync::OnceLock::new(),
         references: ReferenceDefinitionIndex::from_blocks(snapshot, &blocks),
         presentation: std::sync::Arc::new(PresentationTree::from_syntax(tree.as_ref(), snapshot)),
         blocks,
@@ -661,6 +683,7 @@ pub fn parse_incremental(
     changes: &ChangeSet,
 ) -> Result<IncrementalParse, IncrementalParseError> {
     let mut parsed = parse_incremental_semantic(previous, snapshot, changes)?;
+    parsed.document.inherit_html_reveals(previous, changes);
     parsed.document.set_source_mode(previous.source_mode());
     Ok(parsed)
 }
@@ -691,6 +714,10 @@ fn parse_incremental_semantic(
             blocks: previous.blocks.clone(),
             source_blocks: None,
             source_presentation: PresentationTree::default(),
+            equations: previous.equations.clone(),
+            toc: previous.toc.clone(),
+            html: previous.html.clone(),
+            semantic_html: previous.semantic_html.clone(),
             references: ReferenceDefinitionIndex::from_blocks(snapshot, &previous.blocks),
             // 一个字节都没改，树整棵搬过来，一次都不重扫。
             tree: previous.tree.clone(),
@@ -806,6 +833,10 @@ fn parse_incremental_semantic(
         revision: snapshot.revision(),
         source_len: snapshot.len_bytes(),
         source: snapshot.clone(),
+        equations: std::sync::OnceLock::new(),
+        toc: std::sync::OnceLock::new(),
+        html: std::sync::OnceLock::new(),
+        semantic_html: std::sync::OnceLock::new(),
         references: ReferenceDefinitionIndex::from_blocks(snapshot, &blocks),
         presentation: std::sync::Arc::new(PresentationTree::from_syntax(tree.as_ref(), snapshot)),
         blocks,
@@ -1191,7 +1222,7 @@ pub fn list_marker(source: &TextSnapshot, block: Block) -> Option<ListMarker> {
     })
 }
 
-/// Returns the same source-backed table metadata used by visual presentation,
+/// Returns source-backed Markdown pipe-table metadata used by visual presentation,
 /// including parser-owned quote/list prefixes. Consumers must not independently
 /// reparse the raw block: container syntax is outside the table's cells.
 #[must_use]
@@ -1214,6 +1245,22 @@ pub fn table_for_block(markdown: &MarkdownDocument, block: Block) -> Option<Tabl
         block,
     );
     extension::table::container_table(&cx)
+}
+
+/// Read-only grid metadata for native geometry, including finite HTML tables.
+/// Source serializers must still dispatch by table syntax.
+#[must_use]
+pub fn native_table_for_block(markdown: &MarkdownDocument, block: Block) -> Option<TableBlock> {
+    if markdown.source_mode() {
+        return None;
+    }
+    let index = markdown.html_regions();
+    if let Some(region) = index.region_for(block.range()) {
+        let model = region.model.as_ref().ok()?;
+        let owner = index.partition_for(block.range())?.content.owner?;
+        return TableBlock::from_html(&model.native_table(owner).ok()?);
+    }
+    table_for_block(markdown, block)
 }
 
 /// Expand a single-character deletion to the source atom hidden by table
@@ -1272,6 +1319,27 @@ pub fn heading_content_range(markdown: &MarkdownDocument, block: Block) -> TextR
     if !matches!(block.kind(), BlockKind::Heading { .. }) {
         return block.range();
     }
+    let index = if markdown
+        .semantic_html_regions()
+        .partition_for(block.range())
+        .is_some()
+    {
+        markdown.semantic_html_regions()
+    } else {
+        markdown.html_regions()
+    };
+    if let Some(region) = index.region_for(block.range())
+        && let Ok(model) = &region.model
+        && let Some(part) = index.partition_for(block.range())
+        && let Some(owner) = part.content.owner
+        && let html::HtmlNodeKind::Element {
+            opening,
+            closing: Some(closing),
+        } = &model.fragment.nodes[owner].kind
+    {
+        return TextRange::new(opening.source.end(), closing.source.start())
+            .unwrap_or(block.range());
+    }
     let Some(tree) = markdown.tree() else {
         return block.range();
     };
@@ -1317,6 +1385,7 @@ pub fn block_syntax_hidden_ranges(source: &TextSnapshot, block: Block) -> Vec<Te
         BlockKind::ThematicBreak
         | BlockKind::IndentedCode
         | BlockKind::HtmlBlock
+        | BlockKind::FrontMatter
         | BlockKind::BlankLine
         | BlockKind::ReferenceDefinition
         | BlockKind::Paragraph

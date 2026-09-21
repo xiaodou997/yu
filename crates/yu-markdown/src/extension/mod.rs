@@ -55,13 +55,20 @@ mod emphasis;
 pub(crate) mod entity;
 mod escape;
 mod fenced_code;
+mod footnote;
+mod front_matter;
 pub(crate) mod heading;
-mod image;
+mod highlight;
+mod html_format;
+pub(crate) mod image;
+pub use image::{image_destination_text, image_spans, image_title_text};
 mod indented_code;
 pub(crate) mod line_break;
 mod link;
 mod list;
+mod math;
 mod quote;
+mod script;
 mod syntax;
 pub(crate) mod table;
 mod task;
@@ -392,6 +399,9 @@ impl<'a> BlockContext<'a> {
 /// 翻译成几何是 `yu-editor` 的事——那一层才有 `LayoutConfig`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockOrnament {
+    Alignment {
+        alignment: crate::html::HtmlAlignment,
+    },
     /// ATX 标题，1..=6 级。
     Heading { level: u8 },
     /// 引用，`depth` 层竖条。
@@ -447,6 +457,7 @@ impl BlockOrnament {
     #[must_use]
     fn shifted(self, delta: i64) -> Option<Self> {
         Some(match self {
+            Self::Alignment { alignment } => Self::Alignment { alignment },
             Self::Heading { level } => Self::Heading { level },
             Self::Indent { columns } => Self::Indent { columns },
             Self::QuoteBar {
@@ -541,8 +552,25 @@ impl MarkerOrnament {
 pub enum BlockWidget {
     /// 一张图片。它替代掉整段 `![替代](目标)`。
     Image(ImageSpan),
+    /// A source-backed native formula or diagram.
+    Embedded(EmbeddedSpan),
     /// 任务项的复选框。它替代掉 `[x]` / `[ ]` 三个字节。
     Checkbox(CheckboxSpan),
+}
+
+/// The semantic kind does not know about processes, caches or rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EmbeddedKind {
+    Math,
+    Mermaid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EmbeddedSpan {
+    pub source: TextRange,
+    pub content: TextRange,
+    pub kind: EmbeddedKind,
+    pub display: bool,
 }
 
 /// 一张图片在源码里的四段区间。
@@ -555,6 +583,9 @@ pub struct ImageSpan {
     label: TextRange,
     destination: Option<TextRange>,
     reference: Option<TextRange>,
+    width: Option<u32>,
+    height: Option<u32>,
+    html: bool,
 }
 
 impl ImageSpan {
@@ -570,7 +601,30 @@ impl ImageSpan {
             label,
             destination,
             reference,
+            width: None,
+            height: None,
+            html: false,
         }
+    }
+
+    #[must_use]
+    pub const fn with_html_dimensions(mut self, width: Option<u32>, height: Option<u32>) -> Self {
+        self.html = true;
+        self.width = width;
+        self.height = height;
+        self
+    }
+    #[must_use]
+    pub const fn width(self) -> Option<u32> {
+        self.width
+    }
+    #[must_use]
+    pub const fn height(self) -> Option<u32> {
+        self.height
+    }
+    #[must_use]
+    pub const fn is_html(self) -> bool {
+        self.html
     }
 
     /// 整段 `![替代](目标)`。
@@ -611,6 +665,9 @@ impl ImageSpan {
             label: shift_range(self.label, delta)?,
             destination: shift_optional(self.destination, delta)?,
             reference: shift_optional(self.reference, delta)?,
+            width: self.width,
+            height: self.height,
+            html: self.html,
         })
     }
 }
@@ -621,6 +678,11 @@ impl BlockWidget {
     fn shifted(self, delta: i64) -> Option<Self> {
         match self {
             Self::Image(image) => image.shifted(delta).map(Self::Image),
+            Self::Embedded(resource) => Some(Self::Embedded(EmbeddedSpan {
+                source: shift_range(resource.source, delta)?,
+                content: shift_range(resource.content, delta)?,
+                ..resource
+            })),
             Self::Checkbox(checkbox) => checkbox.shifted(delta).map(Self::Checkbox),
         }
     }
@@ -853,6 +915,49 @@ pub struct BlockDecorations {
 }
 
 impl BlockDecorations {
+    /// Assemble one semantic producer using the same style and source-map tables.
+    pub fn from_output(snapshot: &TextSnapshot, range: TextRange, output: ExtensionOutput) -> Self {
+        Self {
+            range,
+            set: DecorationSet::new(snapshot.revision(), snapshot.len_bytes(), output.ranges),
+            styles: output.styles,
+            line_styles: output.line_styles,
+            widgets: output.widgets,
+        }
+    }
+
+    /// Add semantic generated text without changing the canonical document.
+    pub fn with_generated_text(
+        mut self,
+        snapshot: &TextSnapshot,
+        source: TextRange,
+        text: std::sync::Arc<str>,
+    ) -> Self {
+        let style = StyleId(self.styles.len() as u32);
+        self.styles
+            .push(TextAttrs::new(yu_core::TextStyle::Plain).with_role(yu_core::TextRole::Link));
+        let mut entries: Vec<_> = self
+            .set
+            .all()
+            .iter()
+            .filter(|entry| {
+                entry.range.end() <= source.start()
+                    || entry.range.start() >= source.end()
+                    || matches!(entry.decoration, Decoration::Line { .. })
+            })
+            .cloned()
+            .collect();
+        entries.push(DecorationRange::new(
+            source,
+            Decoration::Substitute {
+                text: yu_decoration::ReplacementText::Shared(text),
+            },
+        ));
+        entries.push(DecorationRange::new(source, Decoration::Mark { style }));
+        self.set = DecorationSet::new(snapshot.revision(), snapshot.len_bytes(), entries);
+        self
+    }
+
     /// Literal projection: no Markdown substitutions, widgets or ornaments.
     pub fn source(snapshot: &TextSnapshot, block: Block) -> Self {
         Self {
@@ -874,6 +979,51 @@ impl BlockDecorations {
             widgets: Vec::new(),
         }
     }
+    /// Reveal only failed inline objects. Other widgets and Markdown styles
+    /// retain their original source mapping. Display failures expose the block.
+    pub fn reveal_failed_resources(
+        mut self,
+        snapshot: &TextSnapshot,
+        block: Block,
+        failed: &[TextRange],
+    ) -> Self {
+        if failed.contains(&block.range()) {
+            return Self::source(snapshot, block);
+        }
+        let failed_widget = |widget: &BlockWidget| {
+            matches!(widget,
+            BlockWidget::Embedded(span) if failed.contains(&span.source))
+        };
+        if self.widgets.iter().any(|widget| {
+            matches!(widget,
+            BlockWidget::Embedded(span) if span.display && failed.contains(&span.source))
+        }) {
+            return Self::source(snapshot, block);
+        }
+        let mut remap = Vec::with_capacity(self.widgets.len());
+        let mut retained = Vec::new();
+        for widget in &self.widgets {
+            if failed_widget(widget) {
+                remap.push(None);
+            } else {
+                remap.push(Some(WidgetId(retained.len() as u32)));
+                retained.push(*widget);
+            }
+        }
+        let ranges = self.set.all().iter().cloned().filter_map(|mut range| {
+            if let Decoration::Widget { widget, side } = range.decoration {
+                range.decoration = Decoration::Widget {
+                    widget: *remap.get(widget.0 as usize)?.as_ref()?,
+                    side,
+                };
+            }
+            Some(range)
+        });
+        self.set = DecorationSet::new(snapshot.revision(), snapshot.len_bytes(), ranges);
+        self.widgets = retained;
+        self
+    }
+
     /// 这份装饰覆盖的块。
     #[must_use]
     pub const fn range(&self) -> TextRange {
@@ -962,7 +1112,7 @@ impl BlockDecorations {
             .map(|entry| {
                 Some(DecorationRange {
                     range: shift_range(entry.range, delta)?,
-                    decoration: entry.decoration,
+                    decoration: entry.decoration.clone(),
                     priority: entry.priority,
                 })
             })
@@ -1068,12 +1218,18 @@ impl ExtensionSet {
                 Box::new(list::List),
                 Box::new(task::Task),
                 Box::new(fenced_code::FencedCode::default()),
+                Box::new(front_matter::FrontMatter),
+                Box::new(footnote::Footnote),
                 Box::new(indented_code::IndentedCode),
                 Box::new(code_controls::CodeControls),
                 Box::new(thematic_break::ThematicBreak),
                 Box::new(table::Table),
                 Box::new(emphasis::Emphasis),
+                Box::new(highlight::Highlight),
+                Box::new(html_format::HtmlFormat),
+                Box::new(script::Script),
                 Box::new(code_span::CodeSpan),
+                Box::new(math::Math),
                 Box::new(link::Link),
                 Box::new(image::Image),
                 Box::new(line_break::LineBreak),

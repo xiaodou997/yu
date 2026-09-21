@@ -26,16 +26,15 @@ use yu_assets::ImageKey;
 use yu_core::Revision;
 use yu_core::{LineIndex, TextRange, Utf16Offset, Utf16Range};
 use yu_editor::{
-    ACCESSIBILITY_SEMANTIC_FLAG_ORDERED, ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE,
-    AccessibilitySemanticNode, AccessibilitySemanticSnapshot, AccessibilityTextError,
-    AccessibilityTextSnapshot, Bias, CaretAffinity, CommandResult, EditorCommand,
-    EditorDocumentError, OutlineTree, SearchResults, SelectionError, SourceSync, TableResizeCommit,
-    TableResizeGesture, TableResizeGestureError, TableResizeTarget, VisualOffset, VisualText,
+    ACCESSIBILITY_SEMANTIC_FLAG_EXPANDED, ACCESSIBILITY_SEMANTIC_FLAG_ORDERED,
+    ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE, AccessibilitySemanticNode,
+    AccessibilitySemanticSnapshot, AccessibilityTextError, AccessibilityTextSnapshot, Bias,
+    CaretAffinity, CommandResult, EditorCommand, EditorDocumentError, OutlineTree, SearchResults,
+    SelectionError, SourceSync, TableResizeCommit, TableResizeGesture, TableResizeGestureError,
+    TableResizeTarget, VisualOffset, VisualText,
 };
 #[cfg(target_os = "macos")]
-use yu_editor::{
-    BlockOrnament, BlockView, CaretScrollRequest, ImageSpan, ViewportConfig, ViewportSpan,
-};
+use yu_editor::{BlockView, CaretScrollRequest, ImageSpan, ViewportConfig, ViewportSpan};
 // `begin_table_resize_for_test` 在非 macOS 上也跑（表格排版是中立的），所以这两个
 // 类型在 test 构建里到处都要。**`cfg(macos)` 是错的**：clippy 看 lib target 说
 // 它们 unused，看不见 lib test target。
@@ -59,13 +58,13 @@ use yu_workspace::{
 
 #[cfg(target_os = "macos")]
 use yu_assets::{
-    EmbeddedFailureKind, EmbeddedRenderRequest, EmbeddedRenderer, EmbeddedRequestResult,
-    EmbeddedResourceCache, EmbeddedResourceKind, ImageCache, ImageFailureKind,
-    ImageIntrinsicPublication, ImagePublication, ImageRequest, ImageRequestCandidate,
-    ImageRequestPlan, ImageRequestPriority, ImageRequestResult,
+    EmbeddedFailureKind, EmbeddedRenderRequest, EmbeddedRequestResult, EmbeddedResourceCache,
+    EmbeddedResourceKind, ImageCache, ImageFailureKind, ImageIntrinsicPublication,
+    ImagePublication, ImageRequest, ImageRequestCandidate, ImageRequestPlan, ImageRequestPriority,
+    ImageRequestResult,
 };
 #[cfg(target_os = "macos")]
-use yu_embedded_math::MathRenderer;
+use yu_embedded_client::{NativeRendererClient, RenderControl, RenderFailure};
 #[cfg(target_os = "macos")]
 use yu_font::FontRequest;
 #[cfg(target_os = "macos")]
@@ -167,6 +166,11 @@ pub const YU_STORAGE_THEME_YU_DARK: u8 = 3;
 pub const YU_STORAGE_CLIPBOARD_TEXT: u8 = 0;
 pub const YU_STORAGE_CLIPBOARD_HTML: u8 = 1;
 pub const YU_STORAGE_CLIPBOARD_MARKDOWN: u8 = 2;
+pub const YU_STORAGE_CLIPBOARD_FRAGMENTS: u8 = 3;
+pub const YU_STORAGE_FRAGMENT_TEXT: u8 = 0;
+pub const YU_STORAGE_FRAGMENT_MARKDOWN: u8 = 1;
+pub const YU_STORAGE_FRAGMENT_HTML: u8 = 2;
+pub const YU_STORAGE_FRAGMENT_HTML_TABLE: u8 = 3;
 
 pub const YU_STORAGE_TABLE_RESIZE_COLUMN: u8 = 1;
 pub const YU_STORAGE_TABLE_RESIZE_ROW: u8 = 2;
@@ -272,6 +276,7 @@ pub const YU_STORAGE_OUTLINE_PARENT_NONE: u32 = u32::MAX;
 pub const YU_STORAGE_ACCESSIBILITY_NO_RANGE: u64 = u64::MAX;
 pub const YU_STORAGE_ACCESSIBILITY_NO_ACTION_BLOCK: u64 = u64::MAX;
 pub const YU_STORAGE_ACCESSIBILITY_FLAG_ORDERED: u8 = ACCESSIBILITY_SEMANTIC_FLAG_ORDERED;
+pub const YU_STORAGE_ACCESSIBILITY_FLAG_EXPANDED: u8 = ACCESSIBILITY_SEMANTIC_FLAG_EXPANDED;
 pub const YU_STORAGE_ACCESSIBILITY_FLAG_TASK_DONE: u8 = ACCESSIBILITY_SEMANTIC_FLAG_TASK_DONE;
 pub const YU_STORAGE_ACCESSIBILITY_KIND_DOCUMENT: u8 = 1;
 pub const YU_STORAGE_ACCESSIBILITY_KIND_HEADING: u8 = 2;
@@ -288,6 +293,7 @@ pub const YU_STORAGE_ACCESSIBILITY_KIND_IMAGE: u8 = 12;
 pub const YU_STORAGE_ACCESSIBILITY_KIND_AUTOLINK: u8 = 13;
 pub const YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_LINK: u8 = 14;
 pub const YU_STORAGE_ACCESSIBILITY_KIND_REFERENCE_IMAGE: u8 = 15;
+pub const YU_STORAGE_ACCESSIBILITY_KIND_DISCLOSURE: u8 = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -363,6 +369,11 @@ pub struct YuStorageProjectionHit {
     /// regular text hit.
     pub image_source_start_utf16: u64,
     pub image_source_end_utf16: u64,
+    /// Exact formula/diagram object hit; independent of its caret edge.
+    pub content_source_start_utf16: u64,
+    pub content_source_end_utf16: u64,
+    pub navigation_target_start_utf16: u64,
+    pub navigation_target_end_utf16: u64,
     pub line: u64,
     pub x: f32,
     pub y: f32,
@@ -835,12 +846,17 @@ struct MacosEmbeddedResourceState {
     cache: EmbeddedResourceCache,
     jobs: std::sync::mpsc::Sender<EmbeddedRenderRequest>,
     results: std::sync::mpsc::Receiver<EmbeddedWorkerResult>,
+    control: RenderControl,
+    style: yu_assets::EmbeddedStyle,
+    theme: yu_core::ThemeId,
+    diagnostics: Vec<(Revision, TextRange, String)>,
+    publications: Vec<yu_assets::EmbeddedRenderPublication>,
 }
 
 #[cfg(target_os = "macos")]
 type EmbeddedWorkerResult = (
     EmbeddedRenderRequest,
-    Result<yu_assets::EmbeddedRenderPayload, yu_assets::EmbeddedRenderError>,
+    Result<yu_assets::EmbeddedRenderPayload, RenderFailure>,
 );
 
 #[cfg(target_os = "macos")]
@@ -848,25 +864,43 @@ impl MacosEmbeddedResourceState {
     fn new() -> Self {
         let (jobs, receiver) = std::sync::mpsc::channel::<EmbeddedRenderRequest>();
         let (sender, results) = std::sync::mpsc::channel();
-        // Failure to spawn disconnects the channel; requests then fail through
-        // the cache's normal worker-error path. Dropping the owner never joins
-        // a potentially slow render on the AppKit thread.
+        let control = RenderControl::default();
+        let worker_control = control.clone();
+        static DOCUMENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let document_id = DOCUMENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let helper = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                exe.parent()
+                    .map(|dir| dir.join("../Helpers/yu-document-renderer"))
+            })
+            .unwrap_or_default();
+        #[cfg(test)]
+        let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/yu-document-renderer");
         let _ = std::thread::Builder::new()
-            .name("yu-math".into())
+            .name("yu-native-resources".into())
             .spawn(move || {
-                let renderer = MathRenderer::default();
+                let mut renderer = NativeRendererClient::new(helper, document_id);
                 while let Ok(request) = receiver.recv() {
                     #[cfg(debug_assertions)]
-                    if let Some(delay) = std::env::var("YU_TEST_MATH_DELAY_MS")
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .filter(|delay| *delay > 0 && *delay <= 30_000)
-                        && request.kind() == EmbeddedResourceKind::Math
+                    if request.kind() == EmbeddedResourceKind::Math
+                        && let Some(delay) = std::env::var("YU_TEST_MATH_DELAY_MS")
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .filter(|delay| *delay > 0 && *delay <= 30_000)
                     {
                         println!("yu-render-test resource=math delay_ms={delay}");
-                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                        let until =
+                            std::time::Instant::now() + std::time::Duration::from_millis(delay);
+                        while std::time::Instant::now() < until
+                            && worker_control.is_current(request.revision().get())
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
                     }
-                    let result = renderer.render(&request);
+                    let result = renderer.render(&request, &worker_control);
                     if sender.send((request, result)).is_err() {
                         break;
                     }
@@ -877,7 +911,76 @@ impl MacosEmbeddedResourceState {
             cache: EmbeddedResourceCache::new(),
             jobs,
             results,
+            control,
+            style: yu_assets::EmbeddedStyle::default(),
+            theme: yu_core::ThemeId::Github,
+            diagnostics: Vec::new(),
+            publications: Vec::new(),
         }
+    }
+
+    fn set_style(&mut self, style: yu_assets::EmbeddedStyle, theme: yu_core::ThemeId) {
+        if self.style != style || self.theme != theme {
+            // Drop closes the old worker. Its in-flight response cannot enter
+            // the replacement presentation even when the source revision is unchanged.
+            *self = Self::new();
+            self.style = style;
+            self.theme = theme;
+        }
+    }
+
+    fn retain_publication(&mut self, publication: yu_assets::EmbeddedRenderPublication) {
+        if self.publications.iter().any(|old| {
+            old.source_range() == publication.source_range()
+                && old.revision() == publication.revision()
+                && old.generation() == publication.generation()
+        }) {
+            return;
+        }
+        self.publications
+            .retain(|old| old.source_range() != publication.source_range());
+        self.publications.push(publication);
+        yu_render_macos::notify_resource_completion();
+    }
+
+    fn advance(&mut self, revision: Revision) -> Result<(), i32> {
+        self.control.set_revision(revision.get());
+        self.publications
+            .retain(|publication| publication.revision() == revision);
+        self.diagnostics
+            .retain(|(version, _, _)| *version == revision);
+        while let Ok((completed, result)) = self.results.try_recv() {
+            if completed.revision() == revision {
+                self.diagnostics
+                    .retain(|(_, range, _)| *range != completed.source_range());
+                let diagnostic = match &result {
+                    Err(RenderFailure::InvalidSource(message) | RenderFailure::Worker(message)) => {
+                        Some(message.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(message) = diagnostic {
+                    self.diagnostics
+                        .push((revision, completed.source_range(), message));
+                    self.publications
+                        .retain(|old| old.source_range() != completed.source_range());
+                }
+            }
+            let result = result.map_err(|error| match error {
+                RenderFailure::InvalidSource(_) => yu_assets::EmbeddedRenderError::InvalidSource,
+                RenderFailure::Cancelled | RenderFailure::Worker(_) => {
+                    yu_assets::EmbeddedRenderError::Worker
+                }
+            });
+            match self.cache.complete(completed, revision, result) {
+                Ok(EmbeddedRequestResult::Ready(publication)) => {
+                    self.retain_publication(publication)
+                }
+                Ok(_) | Err(yu_assets::EmbeddedCacheError::StaleRevision { .. }) => {}
+                Err(_) => return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE),
+            }
+        }
+        Ok(())
     }
 
     fn request_result(
@@ -885,12 +988,7 @@ impl MacosEmbeddedResourceState {
         request: EmbeddedRenderRequest,
         revision: Revision,
     ) -> Result<EmbeddedRequestResult, i32> {
-        while let Ok((completed, result)) = self.results.try_recv() {
-            match self.cache.complete(completed, revision, result) {
-                Ok(_) | Err(yu_assets::EmbeddedCacheError::StaleRevision { .. }) => {}
-                Err(_) => return Err(YU_STORAGE_RENDER_HOST_UNAVAILABLE),
-            }
-        }
+        self.advance(revision)?;
         let _ = self.cache.request(request.clone());
         while let Some(job) = self.cache.pending() {
             if let Err(error) = self.jobs.send(job) {
@@ -901,7 +999,11 @@ impl MacosEmbeddedResourceState {
                 );
             }
         }
-        Ok(self.cache.request(request))
+        let result = self.cache.request(request);
+        if let EmbeddedRequestResult::Ready(publication) = &result {
+            self.retain_publication(publication.clone());
+        }
+        Ok(result)
     }
 
     fn status_for(
@@ -925,6 +1027,13 @@ impl MacosEmbeddedResourceState {
             EmbeddedRequestResult::Ready(publication) => Ok(Some(publication)),
             EmbeddedRequestResult::Pending | EmbeddedRequestResult::Failed(_) => Ok(None),
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosEmbeddedResourceState {
+    fn drop(&mut self) {
+        self.control.close();
     }
 }
 
@@ -1142,6 +1251,7 @@ fn macos_new_frame_worker(initial_serial: u64) -> Option<MacosFrameBuildWorker> 
                     document: snapshot,
                     image_publications,
                     image_intrinsics,
+                    embedded_publications,
                 },
             config,
             ticket,
@@ -1171,6 +1281,7 @@ fn macos_new_frame_worker(initial_serial: u64) -> Option<MacosFrameBuildWorker> 
                 );
             }
             let builder = builder.as_mut().ok_or(YU_STORAGE_RENDER_HOST_UNAVAILABLE)?;
+            builder.set_embedded_publications(embedded_publications);
             // Cancellation can occur after raising the local serial floor but before
             // replacing the builder. Enforce the accepted floor on every job.
             builder.ensure_publication_serial(minimum_serial);
@@ -1354,6 +1465,87 @@ fn frame_key(
     .with_table_columns(session.session.selections().table_columns())
     .with_table_width_generation(session.session.document().editor().table_width_generation())
     .with_source_mode(session.session.document().editor().source_mode())
+    .with_disclosure_fingerprint(
+        session
+            .session
+            .document()
+            .editor()
+            .markdown()
+            .html_disclosure_fingerprint(),
+    )
+    .with_focus_mode(session.focus_mode)
+    .with_spelling_generation(session.session.document().editor().spelling_generation())
+}
+
+/// Toggle focus decoration without touching source, history or layout.
+/// # Safety
+/// A live session, used on its owning thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_focus_mode(
+    session: *mut YuStorageSession,
+    enabled: u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if enabled > 1 {
+        return YU_STORAGE_EDITOR_ERROR;
+    }
+    if session.focus_mode == (enabled != 0) {
+        return YU_STORAGE_OK;
+    }
+    session.focus_mode = enabled != 0;
+    #[cfg(target_os = "macos")]
+    if let Some(state) = session.macos_render_host.as_mut() {
+        if let Some(worker) = state.frame_worker.as_ref() {
+            worker.invalidate();
+        }
+        state.frame_worker_request = None;
+        state.last_frame_key = None;
+        state.prepared_build = None;
+    }
+    YU_STORAGE_OK
+}
+
+/// Update local calendar context without editing source or history.
+/// # Safety
+/// A live session, called on the AppKit main thread when attached to a surface.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_macos_set_reference_day(
+    session: *mut YuStorageSession,
+    day: i32,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if !(-719162..=2932896).contains(&day) {
+        return YU_STORAGE_EDITOR_ERROR;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let resources = &mut session.macos_embedded_resources;
+        if resources.style.reference_day() == Some(day) {
+            return YU_STORAGE_OK;
+        }
+        resources.set_style(
+            resources.style.with_reference_day(Some(day)),
+            resources.theme,
+        );
+        if let Some(state) = session.macos_render_host.as_mut() {
+            if let Some(worker) = state.frame_worker.as_ref() {
+                worker.invalidate();
+            }
+            state.frame_worker_request = None;
+            state.last_frame_key = None;
+            state.prepared_build = None;
+        }
+        YU_STORAGE_OK
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = session;
+        YU_STORAGE_EDITOR_ERROR
+    }
 }
 
 /// Switch the canonical editor's projection without editing the source.
@@ -1435,6 +1627,7 @@ impl Drop for MacosPersistentSurfaceState {
 
 #[repr(C)]
 pub struct YuStorageSession {
+    focus_mode: bool,
     session: DocumentEditorSession,
     table_resize_gesture: Option<TableResizeGesture>,
     table_resize_override: Option<TableResizeCommit>,
@@ -3380,6 +3573,796 @@ pub unsafe extern "C" fn yu_storage_session_insert_text(
     command_result_output(&session.session, result, output)
 }
 
+/// UTF-8 byte ranges in the batch's shared input buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct YuStorageImageInput {
+    pub path_start: usize,
+    pub path_end: usize,
+    pub alternative_start: usize,
+    pub alternative_end: usize,
+}
+
+/// Insert an entire imported batch in one source/undo transaction. The native
+/// host stages resources first and discards unpublished copies on failure.
+/// # Safety
+/// Session must be live, text/items readable for their lengths, output writable.
+/// A non-null drop_target must point to a readable revision-bound caret.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn yu_storage_session_insert_local_images(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    text: *const u8,
+    text_length: usize,
+    items: *const YuStorageImageInput,
+    count: usize,
+    drop_target: *const YuStorageSelectionEndpoints,
+    output: *mut YuStorageCommandResult,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() || items.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if count == 0 || count > isize::MAX as usize / std::mem::size_of::<YuStorageImageInput>() {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let drop_offset = if let Some(target) = unsafe { drop_target.as_ref() } {
+        if target.revision != expected_revision {
+            return YU_STORAGE_STALE_REVISION;
+        }
+        if target.anchor_utf16 != target.focus_utf16 {
+            return YU_STORAGE_INVALID_SELECTION;
+        }
+        match selection_endpoints_from_ffi(
+            &session.session,
+            target.anchor_utf16,
+            target.focus_utf16,
+            target.affinity,
+        ) {
+            Ok(selection) => Some(selection.focus()),
+            Err(status) => return status,
+        }
+    } else {
+        None
+    };
+    let text = match read_utf8(text, text_length) {
+        Ok(text) => text,
+        Err(status) => return status,
+    };
+    // SAFETY: count/nonnull checked above; caller supplies readable records.
+    let items = unsafe { std::slice::from_raw_parts(items, count) };
+    let mut images = Vec::with_capacity(count);
+    for item in items {
+        let (Some(path), Some(alternative)) = (
+            text.get(item.path_start..item.path_end),
+            text.get(item.alternative_start..item.alternative_end),
+        ) else {
+            return YU_STORAGE_INVALID_SELECTION;
+        };
+        if yu_editor::local_image_uri(path).is_none() {
+            return YU_STORAGE_INVALID_PATH;
+        }
+        images.push((path, alternative));
+    }
+    match session
+        .session
+        .document_mut()
+        .editor_mut()
+        .insert_local_images(&images, drop_offset)
+    {
+        Ok(result) => command_result_output(&session.session, result, output),
+        Err(error) => status_from_editor_error(error),
+    }
+}
+
+/// Encode a local path for an editable image URI field.
+/// # Safety
+/// Path must be readable for length bytes; output and written follow the
+/// ordinary UTF-8 two-call copy contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_encode_local_image_path(
+    path: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let path = match read_utf8(path, length) {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let Some(uri) = yu_editor::local_image_uri(path) else {
+        return YU_STORAGE_INVALID_PATH;
+    };
+    write_bytes(uri.as_bytes(), output, capacity, written)
+}
+
+/// Source identity and declared dimensions. Zero means intrinsic dimension.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct YuStorageImageProperties {
+    pub revision: u64,
+    pub start_utf16: u64,
+    pub end_utf16: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn image_properties_from_ffi(
+    session: &DocumentEditorSession,
+    info: &YuStorageImageProperties,
+) -> Result<yu_editor::ImageProperties, i32> {
+    validate_revision(session, info.revision)?;
+    let range = source_range_from_ffi(session, info.start_utf16, info.end_utf16)?;
+    session
+        .document()
+        .editor()
+        .image_properties(range)
+        .ok_or(YU_STORAGE_INVALID_SELECTION)
+}
+
+/// Inspect the image containing a source caret. At an adjacent boundary the
+/// image starting at that boundary wins. Hosts can use the exact image-hit start.
+/// # Safety
+/// Session must be live and output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_image_properties(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    output: *mut YuStorageImageProperties,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let snapshot = session.session.snapshot();
+    let offset = match snapshot.byte_offset_for_utf16(Utf16Offset::new(source_utf16)) {
+        Ok(offset) => offset,
+        Err(_) => return YU_STORAGE_INVALID_SELECTION,
+    };
+    let editor = session.session.document().editor();
+    let images = match editor.image_references() {
+        Ok(images) => images,
+        Err(error) => return status_from_editor_error(error),
+    };
+    let image = images
+        .iter()
+        .find(|image| image.source.start() <= offset && offset < image.source.end())
+        .or_else(|| images.iter().find(|image| image.source.end() == offset));
+    let Some(properties) = image.and_then(|image| editor.image_properties(image.source)) else {
+        return YU_STORAGE_INVALID_SELECTION;
+    };
+    let (start_utf16, end_utf16) = match source_utf16_range(&snapshot, properties.source) {
+        Ok(range) => range,
+        Err(status) => return status,
+    };
+    unsafe {
+        *output = YuStorageImageProperties {
+            revision: expected_revision,
+            start_utf16,
+            end_utf16,
+            width: properties.width.unwrap_or(0),
+            height: properties.height.unwrap_or(0),
+        };
+    }
+    YU_STORAGE_OK
+}
+
+/// Query the resource state of an exact, revision-bound image identity.
+/// # Safety
+/// Session and info must be live; output must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_image_resource_status(
+    session: *const YuStorageSession,
+    info: *const YuStorageImageProperties,
+    output: *mut u8,
+) -> i32 {
+    let (Some(session), Some(info)) = (unsafe { session.as_ref() }, unsafe { info.as_ref() })
+    else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let properties = match image_properties_from_ffi(&session.session, info) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let key = ImageKey::new(properties.destination).ok();
+        unsafe {
+            *output = macos_image_resource_status(
+                session.macos_render_host.as_ref(),
+                key.as_ref(),
+                info.revision,
+            );
+        }
+        YU_STORAGE_OK
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = properties;
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
+/// Reset a failed image's retry budget without editing source or history.
+/// The next surface submission schedules decoding. A running request is not
+/// duplicated, and a stale identity cannot reset another document's failure.
+/// # Safety
+/// Session and info must be live, used on the session's owning thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_retry_image(
+    session: *mut YuStorageSession,
+    info: *const YuStorageImageProperties,
+) -> i32 {
+    let (Some(session), Some(info)) = (unsafe { session.as_mut() }, unsafe { info.as_ref() })
+    else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let properties = match image_properties_from_ffi(&session.session, info) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    if session.session.composition().is_some() {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let key = match ImageKey::new(properties.destination) {
+            Ok(key) => key,
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        };
+        let Some(state) = session.macos_render_host.as_mut() else {
+            return YU_STORAGE_RENDER_HOST_UNAVAILABLE;
+        };
+        if !state.image_resources.in_flight.contains(&key)
+            && state
+                .image_resources
+                .cache
+                .retry_failure(&key, session.session.revision())
+        {
+            if let Some(worker) = state.frame_worker.as_ref() {
+                worker.invalidate();
+            }
+            state.frame_worker_request = None;
+            state.last_frame_key = None;
+            state.prepared_build = None;
+        }
+        YU_STORAGE_OK
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = properties;
+        YU_STORAGE_RENDER_HOST_UNAVAILABLE
+    }
+}
+
+/// Copy source-backed prose intervals for native spelling. Null output queries count.
+/// # Safety
+/// Session must be live; written writable; output writable for capacity records.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_spelling_ranges(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    start_utf16: u64,
+    end_utf16: u64,
+    output: *mut YuStorageAccessibilityRange,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if written.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let range = match source_range_from_ffi(&session.session, start_utf16, end_utf16) {
+        Ok(v) => v,
+        Err(s) => return s,
+    };
+    let snapshot = session.session.snapshot();
+    let ranges = if session.session.composition().is_some() {
+        Vec::new()
+    } else {
+        session
+            .session
+            .document()
+            .editor()
+            .markdown()
+            .spelling_ranges(range)
+    };
+    let mut records = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let (start_utf16, end_utf16) = match source_utf16_range(&snapshot, range) {
+            Ok(v) => v,
+            Err(s) => return s,
+        };
+        records.push(YuStorageAccessibilityRange {
+            revision: expected_revision,
+            start_utf16,
+            end_utf16,
+        });
+    }
+    unsafe {
+        *written = records.len();
+    }
+    if output.is_null() {
+        return YU_STORAGE_OK;
+    }
+    if capacity < records.len() {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(records.as_ptr(), output, records.len());
+    }
+    YU_STORAGE_OK
+}
+
+/// Query a visible details header. An empty range means no disclosure target.
+/// # Safety
+/// Session must be live and both outputs writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_disclosure_header(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    output: *mut YuStorageAccessibilityRange,
+    open: *mut u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() || open.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let at = match source_range_from_ffi(&session.session, source_utf16, source_utf16) {
+        Ok(range) => range.start(),
+        Err(status) => return status,
+    };
+    let details = session
+        .session
+        .document()
+        .editor()
+        .html_disclosure_header_at(at);
+    let (start_utf16, end_utf16, expanded) = if let Some(details) = details {
+        let header = TextRange::new(
+            details.opening.start(),
+            details
+                .summary
+                .map_or(details.opening.end(), |summary| summary.end()),
+        )
+        .expect("ordered disclosure header");
+        match source_utf16_range(&session.session.snapshot(), header) {
+            Ok((start, end)) => (start, end, u8::from(details.open)),
+            Err(status) => return status,
+        }
+    } else {
+        (0, 0, 0)
+    };
+    unsafe {
+        *output = YuStorageAccessibilityRange {
+            revision: expected_revision,
+            start_utf16,
+            end_utf16,
+        };
+        *open = expanded;
+    }
+    YU_STORAGE_OK
+}
+
+/// Reveal a navigation target without modifying source or undo history.
+/// # Safety
+/// Session must be live; changed must be writable. Ranges are canonical UTF-16.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_reveal_source_range(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    start_utf16: u64,
+    end_utf16: u64,
+    changed: *mut u8,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if changed.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let range = match source_range_from_ffi(&session.session, start_utf16, end_utf16) {
+        Ok(range) => range,
+        Err(status) => return status,
+    };
+    match session
+        .session
+        .document_mut()
+        .editor_mut()
+        .reveal_html_range(range)
+    {
+        Ok(revealed) => {
+            unsafe {
+                *changed = u8::from(revealed);
+            }
+            if revealed {
+                invalidate_disclosure_frame(session);
+            }
+            YU_STORAGE_OK
+        }
+        Err(_) => YU_STORAGE_EDITOR_ERROR,
+    }
+}
+
+fn invalidate_disclosure_frame(_session: &mut YuStorageSession) {
+    #[cfg(target_os = "macos")]
+    if let Some(state) = _session.macos_render_host.as_mut() {
+        if let Some(worker) = state.frame_worker.as_ref() {
+            worker.invalidate();
+        }
+        state.frame_worker_request = None;
+        state.last_frame_key = None;
+        state.prepared_build = None;
+        // Collapsing changes block indices without changing source revision.
+        // Never feed the previous visible block indices into resource planning.
+        state.visibility_revision = None;
+        state.visible_blocks.clear();
+    }
+}
+
+/// Toggle a visible details header through the canonical session/history path.
+/// # Safety
+/// Session must be live and output writable. Position is canonical UTF-16.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_toggle_disclosure(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    output: *mut YuStorageCommandResult,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let source = match source_range_from_ffi(&session.session, source_utf16, source_utf16) {
+        Ok(range) => range.start(),
+        Err(status) => return status,
+    };
+    match session
+        .session
+        .execute(EditorCommand::ToggleHtmlDetails { source })
+    {
+        Ok(result) => {
+            invalidate_disclosure_frame(session);
+            command_result_output(&session.session, result, output)
+        }
+        Err(error) => storage_status(error),
+    }
+}
+
+/// Copy the decoded link destination at a canonical UTF-16 label position.
+/// Empty output means no link. This function never opens a URL.
+/// # Safety
+/// Session must be live; output/written follow the standard copy contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_link_destination(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let at = match source_range_from_ffi(&session.session, source_utf16, source_utf16) {
+        Ok(range) => range.start(),
+        Err(status) => return status,
+    };
+    let link = session.session.document().editor().markdown().link_at(at);
+    let destination = link.as_ref().map_or("", |link| link.destination.as_str());
+    write_bytes(destination.as_bytes(), output, capacity, written)
+}
+
+/// Query an equation or footnote reference/backlink target in canonical UTF-16 coordinates.
+/// An empty output range means no valid target exists.
+/// # Safety
+/// Session must be live and output writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_document_reference_target(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    output: *mut YuStorageAccessibilityRange,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let at = match source_range_from_ffi(&session.session, source_utf16, source_utf16) {
+        Ok(range) => range.start(),
+        Err(status) => return status,
+    };
+    let markdown = session.session.document().editor().markdown();
+    let target = markdown
+        .footnotes()
+        .navigation_target(at)
+        .or_else(|| markdown.equation_reference_target(at))
+        .or_else(|| {
+            markdown.link_at(at).and_then(|link| {
+                yu_editor::document_anchor_target(markdown, &link.destination)
+                    .ok()
+                    .flatten()
+            })
+        });
+    let (start_utf16, end_utf16) = match target {
+        Some(target) => match source_utf16_range(&session.session.snapshot(), target) {
+            Ok(range) => range,
+            Err(status) => return status,
+        },
+        None => (0, 0),
+    };
+    unsafe {
+        *output = YuStorageAccessibilityRange {
+            revision: expected_revision,
+            start_utf16,
+            end_utf16,
+        };
+    }
+    YU_STORAGE_OK
+}
+
+/// Read a current document diagnostic at a UTF-16 source position.
+/// An empty string means there is no diagnostic at that position.
+/// # Safety
+/// Session must be live; output/written must follow the standard copy contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_document_diagnostic(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    source_utf16: u64,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let position = match source_range_from_ffi(&session.session, source_utf16, source_utf16) {
+        Ok(range) => range.start(),
+        Err(status) => return status,
+    };
+    #[cfg(target_os = "macos")]
+    let message = session
+        .macos_embedded_resources
+        .diagnostics
+        .iter()
+        .find(|(revision, range, _)| {
+            revision.get() == expected_revision
+                && range.start() <= position
+                && position < range.end()
+        })
+        .map_or("", |(_, _, message)| message.as_str());
+    #[cfg(not(target_os = "macos"))]
+    let message = {
+        let _ = position;
+        ""
+    };
+    let message = if message.is_empty() {
+        session
+            .session
+            .document()
+            .editor()
+            .markdown()
+            .footnotes()
+            .diagnostic_at(position)
+            .unwrap_or("")
+    } else {
+        message
+    };
+    write_bytes(message.as_bytes(), output, capacity, written)
+}
+
+/// Publish one complete current diagnostic set. Empty input clears decorations.
+/// # Safety
+/// Session must be live; records readable for count elements when nonzero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_set_spelling_diagnostics(
+    session: *mut YuStorageSession,
+    expected_revision: u64,
+    records: *const YuStorageAccessibilityRange,
+    count: usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_mut() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    if count > 4096 {
+        return YU_STORAGE_BUFFER_TOO_SMALL;
+    }
+    if count > 0 && records.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let records = if count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(records, count) }
+    };
+    let mut ranges = Vec::with_capacity(count);
+    for record in records {
+        if record.revision != expected_revision {
+            return YU_STORAGE_STALE_REVISION;
+        }
+        match source_range_from_ffi(&session.session, record.start_utf16, record.end_utf16) {
+            Ok(range) => ranges.push(range),
+            Err(status) => return status,
+        }
+    }
+    let revision = session.session.revision();
+    match session
+        .session
+        .document_mut()
+        .editor_mut()
+        .set_spelling_diagnostics(revision, ranges)
+    {
+        Ok(()) => YU_STORAGE_OK,
+        Err(error) => status_from_editor_error(error),
+    }
+}
+
+/// Replace one current prose diagnostic with a separate undo step.
+/// # Safety
+/// Session/info and replacement must be readable; output writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_replace_spelling(
+    session: *mut YuStorageSession,
+    info: *const YuStorageAccessibilityRange,
+    replacement: *const u8,
+    length: usize,
+    output: *mut YuStorageCommandResult,
+) -> i32 {
+    let (Some(session), Some(info)) = (unsafe { session.as_mut() }, unsafe { info.as_ref() })
+    else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    if let Err(status) = validate_revision(&session.session, info.revision) {
+        return status;
+    }
+    let range = match source_range_from_ffi(&session.session, info.start_utf16, info.end_utf16) {
+        Ok(v) => v,
+        Err(s) => return s,
+    };
+    let text = match read_utf8(replacement, length) {
+        Ok(v) => v,
+        Err(s) => return s,
+    };
+    match session
+        .session
+        .document_mut()
+        .editor_mut()
+        .replace_spelling(range, text)
+    {
+        Ok(result) => command_result_output(&session.session, result, output),
+        Err(error) => status_from_editor_error(error),
+    }
+}
+
+/// Copy destination URI (field 0) or alternative text (field 1).
+/// # Safety
+/// Session/info must be readable, written writable, output writable for capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_image_property(
+    session: *const YuStorageSession,
+    info: *const YuStorageImageProperties,
+    field: u8,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let (Some(session), Some(info)) = (unsafe { session.as_ref() }, unsafe { info.as_ref() })
+    else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    let properties = match image_properties_from_ffi(&session.session, info) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let value = match field {
+        0 => properties.destination,
+        1 => properties.alternative,
+        _ => return YU_STORAGE_INVALID_COMMAND,
+    };
+    write_bytes(value.as_bytes(), output, capacity, written)
+}
+
+/// Update an exact image in one isolated undo transaction. Width/height are
+/// declared dimensions; zero removes that dimension. Destination is a URI.
+/// # Safety
+/// Session must be live, info/buffers readable, output writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn yu_storage_session_update_image_properties(
+    session: *mut YuStorageSession,
+    info: *const YuStorageImageProperties,
+    destination: *const u8,
+    destination_length: usize,
+    alternative: *const u8,
+    alternative_length: usize,
+    output: *mut YuStorageCommandResult,
+) -> i32 {
+    let (Some(session), Some(info)) = (unsafe { session.as_mut() }, unsafe { info.as_ref() })
+    else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if output.is_null() {
+        return YU_STORAGE_NULL_POINTER;
+    }
+    let mut properties = match image_properties_from_ffi(&session.session, info) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    properties.destination = match read_utf8(destination, destination_length) {
+        Ok(value) => value.into(),
+        Err(status) => return status,
+    };
+    properties.alternative = match read_utf8(alternative, alternative_length) {
+        Ok(value) => value.into(),
+        Err(status) => return status,
+    };
+    properties.width = (info.width != 0).then_some(info.width);
+    properties.height = (info.height != 0).then_some(info.height);
+    match session
+        .session
+        .document_mut()
+        .editor_mut()
+        .update_image_properties(&properties)
+    {
+        Ok(result) => command_result_output(&session.session, result, output),
+        Err(error) => status_from_editor_error(error),
+    }
+}
+
 pub const YU_STORAGE_PASTE_PLAIN_TEXT: u8 = 0;
 pub const YU_STORAGE_PASTE_TABULAR_TEXT: u8 = 1;
 
@@ -3442,6 +4425,7 @@ pub unsafe extern "C" fn yu_storage_session_paste_fragments(
     ends: *const usize,
     count: usize,
     columns: usize,
+    format: u8,
     output: *mut YuStorageCommandResult,
 ) -> i32 {
     let Some(session) = (unsafe { session.as_mut() }) else {
@@ -3455,6 +4439,15 @@ pub unsafe extern "C" fn yu_storage_session_paste_fragments(
     }
     if let Err(status) = validate_revision(&session.session, expected_revision) {
         return status;
+    }
+    if format > YU_STORAGE_FRAGMENT_HTML_TABLE
+        || (matches!(
+            format,
+            YU_STORAGE_FRAGMENT_MARKDOWN | YU_STORAGE_FRAGMENT_HTML
+        ) && columns == 0)
+        || (format == YU_STORAGE_FRAGMENT_HTML_TABLE && (columns != 0 || count != 1))
+    {
+        return YU_STORAGE_INVALID_COMMAND;
     }
     let text = match read_utf8(text, text_length) {
         Ok(text) => text,
@@ -3479,7 +4472,51 @@ pub unsafe extern "C" fn yu_storage_session_paste_fragments(
     if start != text.len() {
         return YU_STORAGE_INVALID_SELECTION;
     }
-    let command = if columns == 0 {
+    if format == YU_STORAGE_FRAGMENT_HTML
+        && session
+            .session
+            .document()
+            .editor()
+            .html_grid_source(columns, &fragments)
+            .is_err()
+    {
+        return YU_STORAGE_INVALID_SELECTION;
+    }
+    let destination = session.session.document().editor().table_target_is_html();
+    let html_grid = columns > 0
+        && ((format == YU_STORAGE_FRAGMENT_HTML && destination != Some(false))
+            || (format == YU_STORAGE_FRAGMENT_MARKDOWN && destination == Some(true)));
+    if format == YU_STORAGE_FRAGMENT_MARKDOWN && destination == Some(true) {
+        fragments = fragments
+            .iter()
+            .map(|cell| std::sync::Arc::from(yu_export::export_html_fragment(cell)))
+            .collect();
+    } else if format == YU_STORAGE_FRAGMENT_HTML && destination == Some(false) {
+        let converted = fragments
+            .iter()
+            .map(|cell| {
+                yu_export::import_html_fragment(cell).map(|text| {
+                    std::sync::Arc::from(
+                        text.trim_end_matches(['\r', '\n'])
+                            .replace("\r\n", "\n")
+                            .replace('\n', "<br>"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>();
+        fragments = match converted {
+            Ok(cells) => cells,
+            Err(_) => return YU_STORAGE_INVALID_COMMAND,
+        };
+    }
+    let command = if format == YU_STORAGE_FRAGMENT_HTML_TABLE {
+        EditorCommand::PasteHtmlTableSource(fragments[0].clone())
+    } else if html_grid {
+        EditorCommand::PasteHtmlTableGrid {
+            columns,
+            cells: fragments,
+        }
+    } else if columns == 0 {
         EditorCommand::PasteFragments(fragments)
     } else {
         EditorCommand::PasteTableGrid {
@@ -3766,6 +4803,7 @@ pub unsafe extern "C" fn yu_storage_session_open(
 
 fn new_storage_session(session: DocumentEditorSession) -> Box<YuStorageSession> {
     Box::new(YuStorageSession {
+        focus_mode: false,
         session,
         table_resize_gesture: None,
         table_resize_override: None,
@@ -4379,6 +5417,31 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
                 Ok(range) => range,
                 Err(status) => return status,
             };
+        let (content_source_start_utf16, content_source_end_utf16) =
+            match image_utf16_range(&source, hit.content_source()) {
+                Ok(range) => range,
+                Err(status) => return status,
+            };
+        let markdown = session.session.document().editor().markdown();
+        let marker = (!markdown.source_mode())
+            .then(|| markdown.toc_marker_in(placed.layout().source_range()))
+            .flatten();
+        let navigation_target = marker
+            .filter(|marker| hit.content_source() == Some(*marker))
+            .and_then(|marker| {
+                session
+                    .session
+                    .document_mut()
+                    .editor_mut()
+                    .toc_projection()
+                    .ok()?
+                    .target_for_hit(marker, placed.layout(), hit)
+            });
+        let (navigation_target_start_utf16, navigation_target_end_utf16) =
+            match image_utf16_range(&source, navigation_target) {
+                Ok(range) => range,
+                Err(status) => return status,
+            };
         let point = hit.point();
         // 折回文档坐标要补回内容原点：local_y 进 hit_test 时减过它（代码块的
         // 内容在盒里从上内边距起排），这里不补，返回的 caret y 比画出来的
@@ -4397,6 +5460,10 @@ pub unsafe extern "C" fn yu_storage_session_projection_hit_test(
                 round_trip_source_utf16,
                 image_source_start_utf16,
                 image_source_end_utf16,
+                content_source_start_utf16,
+                content_source_end_utf16,
+                navigation_target_start_utf16,
+                navigation_target_end_utf16,
                 line: line_base.saturating_add(hit.line() as u64),
                 x: point.x(),
                 y: document_y,
@@ -5451,37 +6518,9 @@ fn block_images(decorations: &yu_editor::BlockDecorations) -> Vec<ImageSpan> {
         .copied()
         .filter_map(|widget| match widget {
             yu_editor::BlockWidget::Image(image) => Some(image),
-            yu_editor::BlockWidget::Checkbox(_) => None,
+            yu_editor::BlockWidget::Checkbox(_) | yu_editor::BlockWidget::Embedded(_) => None,
         })
         .collect()
-}
-
-/// 围栏代码块的语言名与正文区间。不是围栏代码块就是 `None`。
-#[cfg(target_os = "macos")]
-fn fenced_code_of(
-    decorations: &yu_editor::BlockDecorations,
-) -> Option<(yu_core::TextRange, yu_core::TextRange)> {
-    decorations
-        .line_styles()
-        .iter()
-        .find_map(|ornament| match ornament {
-            BlockOrnament::FencedCode { info, content } => Some((*info, *content)),
-            _ => None,
-        })
-}
-
-#[cfg(target_os = "macos")]
-fn image_destination(
-    source: &TextSnapshot,
-    image: ImageSpan,
-    definitions: &yu_markdown::ReferenceDefinitionIndex,
-) -> Option<TextRange> {
-    image.destination().or_else(|| {
-        image
-            .reference()
-            .and_then(|reference| definitions.lookup(source, reference))
-            .map(|definition| definition.destination())
-    })
 }
 
 #[cfg(target_os = "macos")]
@@ -5490,11 +6529,12 @@ fn image_resource_key(
     image: ImageSpan,
     definitions: &yu_markdown::ReferenceDefinitionIndex,
 ) -> Option<ImageKey> {
-    let destination = image_destination(source, image, definitions)?;
-    let start = usize::try_from(destination.start().get()).ok()?;
-    let end = usize::try_from(destination.end().get()).ok()?;
-    let destination = source.as_str().get(start..end)?;
-    ImageKey::new(destination.to_owned()).ok()
+    ImageKey::new(yu_markdown::image_destination_text(
+        source,
+        image,
+        definitions,
+    )?)
+    .ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -5511,6 +6551,9 @@ fn macos_image_resource_status(
     if resources.publications.contains_key(&fingerprint) {
         return YU_STORAGE_IMAGE_RESOURCE_READY;
     }
+    if resources.in_flight.contains(key) {
+        return YU_STORAGE_IMAGE_RESOURCE_PENDING;
+    }
     if resources
         .cache
         .failure(key)
@@ -5518,7 +6561,7 @@ fn macos_image_resource_status(
     {
         return YU_STORAGE_IMAGE_RESOURCE_FAILED;
     }
-    if resources.in_flight.contains(key) || resources.intrinsics.contains_key(&fingerprint) {
+    if resources.intrinsics.contains_key(&fingerprint) {
         return YU_STORAGE_IMAGE_RESOURCE_PENDING;
     }
     YU_STORAGE_IMAGE_RESOURCE_UNKNOWN
@@ -5557,33 +6600,6 @@ fn macos_image_requests(
 }
 
 #[cfg(target_os = "macos")]
-fn embedded_resource_kind(source: &TextSnapshot, info: TextRange) -> Option<u8> {
-    let start = usize::try_from(info.start().get()).ok()?;
-    let end = usize::try_from(info.end().get()).ok()?;
-    let language = source.as_str().get(start..end)?.split_whitespace().next()?;
-    if language.eq_ignore_ascii_case("mermaid") {
-        Some(YU_STORAGE_EMBEDDED_MERMAID)
-    } else if language.eq_ignore_ascii_case("math")
-        || language.eq_ignore_ascii_case("latex")
-        || language.eq_ignore_ascii_case("tex")
-        || language.eq_ignore_ascii_case("katex")
-    {
-        Some(YU_STORAGE_EMBEDDED_MATH)
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn embedded_resource_kind_from_ffi(kind: u8) -> Option<EmbeddedResourceKind> {
-    match kind {
-        YU_STORAGE_EMBEDDED_MATH => Some(EmbeddedResourceKind::Math),
-        YU_STORAGE_EMBEDDED_MERMAID => Some(EmbeddedResourceKind::Mermaid),
-        _ => None,
-    }
-}
-
-#[cfg(target_os = "macos")]
 fn macos_embedded_resource_status(result: EmbeddedRequestResult) -> u8 {
     match result {
         EmbeddedRequestResult::Ready(_) => YU_STORAGE_EMBEDDED_RESOURCE_READY,
@@ -5595,34 +6611,6 @@ fn macos_embedded_resource_status(result: EmbeddedRequestResult) -> u8 {
             | EmbeddedFailureKind::Worker => YU_STORAGE_EMBEDDED_RESOURCE_FAILED,
         },
     }
-}
-
-#[cfg(target_os = "macos")]
-fn embedded_resource_content(source: &TextSnapshot, content: TextRange) -> Result<String, i32> {
-    let start = usize::try_from(content.start().get()).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-    let end = usize::try_from(content.end().get()).map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-    source
-        .as_str()
-        .get(start..end)
-        .map(str::to_owned)
-        .ok_or(YU_STORAGE_EDITOR_ERROR)
-}
-
-#[cfg(target_os = "macos")]
-fn embedded_resource_fingerprint(source: &TextSnapshot, source_range: TextRange, kind: u8) -> u64 {
-    let start = usize::try_from(source_range.start().get()).ok();
-    let end = usize::try_from(source_range.end().get()).ok();
-    let bytes = start
-        .zip(end)
-        .and_then(|(start, end)| source.as_str().as_bytes().get(start..end));
-    let mut hash = 1_469_598_103_934_665_603_u64 ^ u64::from(kind);
-    if let Some(bytes) = bytes {
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(1_099_511_628_211_u64);
-        }
-    }
-    hash
 }
 
 #[cfg(target_os = "macos")]
@@ -5824,6 +6812,48 @@ fn macos_render_host_frame(
         appearance,
     } = request;
     validate_revision(&session.session, expected_revision)?;
+    let color = appearance.theme().text();
+    let foreground = u32::from_be_bytes([color.red(), color.green(), color.blue(), color.alpha()]);
+    let style = yu_assets::EmbeddedStyle::new(
+        size,
+        foreground,
+        matches!(appearance, Appearance::Dark | Appearance::YuDark),
+    )
+    .ok_or(YU_STORAGE_EDITOR_ERROR)?
+    .with_reference_day(session.macos_embedded_resources.style.reference_day());
+    session
+        .macos_embedded_resources
+        .set_style(style, appearance.theme_id());
+
+    session
+        .macos_embedded_resources
+        .advance(session.session.snapshot().revision())?;
+    let resources = session.macos_embedded_resources.publications.clone();
+    let failed_ranges = session
+        .macos_embedded_resources
+        .diagnostics
+        .iter()
+        .map(|(_, range, _)| *range)
+        .collect();
+    let editor = session.session.document_mut().editor_mut();
+    let sizes = resources
+        .iter()
+        .filter_map(|publication| {
+            let dimensions = publication.payload().dimensions();
+            yu_editor::ImageIntrinsicSize::new(dimensions.width(), dimensions.height())
+                .and_then(|size| size.with_baseline(publication.payload().baseline_milli()))
+                .ok()
+                .map(|size| (publication.source_range(), size))
+        })
+        .collect();
+    let resource_revision = editor.revision();
+    editor
+        .set_failed_resource_ranges(resource_revision, failed_ranges)
+        .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+    editor
+        .set_embedded_sizes(resource_revision, sizes)
+        .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
+
     if !size.is_finite()
         || size <= 0.0
         || !max_width.is_finite()
@@ -5889,6 +6919,11 @@ fn macos_render_host_frame(
         raster_scale,
         appearance,
     )?;
+    let config = config.with_editor_decorations(
+        appearance
+            .editor_decorations()
+            .with_focus_mode(session.focus_mode),
+    );
     let config = table_resize.map_or(config, |commit| config.with_table_resize(commit));
     if session
         .macos_render_host
@@ -6047,6 +7082,9 @@ fn macos_render_host_frame(
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    state
+        .builder
+        .set_embedded_publications(session.macos_embedded_resources.publications.clone());
     let publish_timing_start = std::time::Instant::now();
     let publication = {
         let document = session.session.document_mut().editor_mut();
@@ -6190,6 +7228,7 @@ fn macos_render_host_background_frame(
                 .cloned()
                 .collect(),
             image_intrinsics: state.image_resources.intrinsics.values().cloned().collect(),
+            embedded_publications: session.macos_embedded_resources.publications.clone(),
         };
         state.frame_worker_request = Some(ticket.clone());
         if std::env::var_os("YU_RENDER_TIMING").is_some() {
@@ -6386,6 +7425,41 @@ fn macos_render_host_background_frame(
 /// `status_for` 同时会推进渲染流水线，因此这里也是 Math/Mermaid 真正被驱动的
 /// 地方——此前靠平台的轮询查询顺带驱动，那是个不该由平台承担的职责。
 #[cfg(target_os = "macos")]
+fn embedded_style_for_block(
+    base: yu_assets::EmbeddedStyle,
+    theme: yu_core::ThemeId,
+    decorations: &yu_editor::BlockDecorations,
+) -> Option<yu_assets::EmbeddedStyle> {
+    let heading = decorations
+        .line_styles()
+        .iter()
+        .find_map(|ornament| match ornament {
+            yu_markdown::BlockOrnament::Heading { level } => Some(*level),
+            _ => None,
+        });
+    let quoted = decorations
+        .line_styles()
+        .iter()
+        .any(|ornament| matches!(ornament, yu_markdown::BlockOrnament::QuoteBar { .. }));
+    let (scale, foreground) = if let Some(level) = heading {
+        (
+            theme.spec().heading_sizes[usize::from(level - 1)],
+            theme.heading_color(level),
+        )
+    } else if quoted {
+        (1.0, theme.quote_text_color())
+    } else {
+        (1.0, base.foreground())
+    };
+    yu_assets::EmbeddedStyle::new(
+        base.font_milli() as f32 / 1000.0 * scale,
+        foreground,
+        base.dark(),
+    )
+    .map(|style| style.with_reference_day(base.reference_day()))
+}
+
+#[cfg(target_os = "macos")]
 fn macos_frame_needs_resource_refresh(
     session: &mut YuStorageSession,
     visible_blocks: &[usize],
@@ -6414,36 +7488,98 @@ fn macos_frame_needs_resource_refresh(
                 key.as_ref(),
                 revision.get(),
             );
+            // Exhausted failures are settled until an explicit retry or a
+            // source revision change. Do not keep waking the renderer for a
+            // request that the cache will permanently refuse at this revision.
+            if status == YU_STORAGE_IMAGE_RESOURCE_FAILED
+                && session.macos_render_host.as_ref().is_some_and(|host| {
+                    key.as_ref()
+                        .and_then(|key| host.image_resources.cache.failure(key))
+                        .is_some_and(|failure| {
+                            failure.is_exhausted(host.image_resources.cache.retry_policy())
+                        })
+                })
+            {
+                continue;
+            }
             if macos_resource_status_needs_refresh(status, fingerprint) {
                 pending = true;
                 retry |= macos_resource_status_needs_retry(status, fingerprint);
             }
         }
-        let Some((info, content_range)) = fenced_code_of(&decorations) else {
-            continue;
-        };
-        let Some(kind) = embedded_resource_kind(&source, info) else {
-            continue;
-        };
-        let embedded_kind = embedded_resource_kind_from_ffi(kind).ok_or(YU_STORAGE_EDITOR_ERROR)?;
-        let content = embedded_resource_content(&source, content_range)?;
-        // 空的 fenced body 仍然是合法的源码资源，用一个 trim 中性的哨兵保持它
-        // 走同一条缓存路径，与 `macos_visual_embedded_resources` 一致。
-        let content = if content.is_empty() {
-            "\n".to_owned()
-        } else {
-            content
-        };
-        let request =
-            EmbeddedRenderRequest::new(revision, decorations.range(), embedded_kind, content)
-                .map_err(|_| YU_STORAGE_EDITOR_ERROR)?;
-        let status = session
-            .macos_embedded_resources
-            .status_for(request, revision)?;
-        let fingerprint = embedded_resource_fingerprint(&source, decorations.range(), kind);
-        if macos_resource_status_needs_refresh(status, fingerprint) {
-            pending = true;
-            retry |= macos_resource_status_needs_retry(status, fingerprint);
+        for resource in decorations
+            .widgets()
+            .iter()
+            .filter_map(|widget| match widget {
+                yu_markdown::BlockWidget::Embedded(resource) => Some(*resource),
+                _ => None,
+            })
+        {
+            let embedded_kind = match resource.kind {
+                yu_markdown::EmbeddedKind::Math => EmbeddedResourceKind::Math,
+                yu_markdown::EmbeddedKind::Mermaid => EmbeddedResourceKind::Mermaid,
+            };
+            let markdown = session.session.document().editor().markdown();
+            let content = if resource.kind == yu_markdown::EmbeddedKind::Math {
+                match markdown.equation_source(resource) {
+                    Ok(content) => content,
+                    Err(message) => {
+                        let state = &mut session.macos_embedded_resources;
+                        if !state.diagnostics.iter().any(|(version, range, old)| {
+                            *version == revision && *range == resource.source && *old == message
+                        }) {
+                            state
+                                .diagnostics
+                                .retain(|(_, range, _)| *range != resource.source);
+                            state.diagnostics.push((revision, resource.source, message));
+                            state
+                                .publications
+                                .retain(|old| old.source_range() != resource.source);
+                            yu_render_macos::notify_resource_completion();
+                        }
+                        pending = true;
+                        continue;
+                    }
+                }
+            } else {
+                markdown
+                    .embedded_source(resource)
+                    .ok_or(YU_STORAGE_EDITOR_ERROR)?
+            };
+            let content = if content.is_empty() {
+                "\n".to_owned()
+            } else {
+                content
+            };
+            let request =
+                EmbeddedRenderRequest::new(revision, resource.source, embedded_kind, content)
+                    .map_err(|_| YU_STORAGE_EDITOR_ERROR)?
+                    .with_style(
+                        embedded_style_for_block(
+                            session.macos_embedded_resources.style,
+                            session.macos_embedded_resources.theme,
+                            &decorations,
+                        )
+                        .ok_or(YU_STORAGE_EDITOR_ERROR)?
+                        .with_display(resource.display),
+                    );
+            let status = session
+                .macos_embedded_resources
+                .status_for(request.clone(), revision)?;
+            if session
+                .macos_embedded_resources
+                .cache
+                .failure(request.key())
+                .is_some_and(|failure| {
+                    failure.is_exhausted(session.macos_embedded_resources.cache.retry_policy())
+                })
+            {
+                continue;
+            }
+            if macos_resource_status_needs_refresh(status, request.key().fingerprint()) {
+                pending = true;
+                retry |= macos_resource_status_needs_retry(status, request.key().fingerprint());
+            }
         }
     }
     Ok((pending, retry))
@@ -7280,6 +8416,49 @@ pub unsafe extern "C" fn yu_storage_session_copy_source_range(
     write_snapshot_range(&snapshot, range, output, capacity, written)
 }
 
+/// Copies a revision-bound semantic label, interpreting only already-resolved
+/// finite HTML. Unsupported markup remains source text.
+///
+/// # Safety
+/// `session` must be a live handle. `written` must be writable; `output` must
+/// provide `capacity` writable bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yu_storage_session_copy_accessibility_label(
+    session: *const YuStorageSession,
+    expected_revision: u64,
+    start_utf16: u64,
+    end_utf16: u64,
+    output: *mut u8,
+    capacity: usize,
+    written: *mut usize,
+) -> i32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return YU_STORAGE_NULL_POINTER;
+    };
+    if let Err(status) = validate_revision(&session.session, expected_revision) {
+        return status;
+    }
+    let range = match source_range_from_ffi(&session.session, start_utf16, end_utf16) {
+        Ok(range) => range,
+        Err(status) => return status,
+    };
+    let snapshot = session.session.snapshot();
+    let label = session
+        .session
+        .document()
+        .editor()
+        .markdown()
+        .html_regions()
+        .region_for(range)
+        .and_then(|region| region.model.as_ref().ok())
+        .and_then(|model| model.accessible_text(snapshot.as_str(), range));
+    if let Some(label) = label {
+        write_bytes(label.as_bytes(), output, capacity, written)
+    } else {
+        write_snapshot_range(&snapshot, range, output, capacity, written)
+    }
+}
+
 /// 按指定格式取出当前选区。
 ///
 /// 纯文本与 HTML 片段此前是两个 FFI，参数完全相同，只在输出格式上不同——
@@ -7303,7 +8482,10 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
     };
     if !matches!(
         format,
-        YU_STORAGE_CLIPBOARD_TEXT | YU_STORAGE_CLIPBOARD_HTML | YU_STORAGE_CLIPBOARD_MARKDOWN
+        YU_STORAGE_CLIPBOARD_TEXT
+            | YU_STORAGE_CLIPBOARD_HTML
+            | YU_STORAGE_CLIPBOARD_MARKDOWN
+            | YU_STORAGE_CLIPBOARD_FRAGMENTS
     ) {
         if !written.is_null() {
             // SAFETY: `written` was checked above and belongs to the caller.
@@ -7324,12 +8506,39 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
             Err(_) => YU_STORAGE_INVALID_SELECTION,
         };
     }
-    if session.session.selections().is_multiple() || columns.is_some() {
+    if columns.is_some() && format == YU_STORAGE_CLIPBOARD_HTML {
+        match session.session.document().editor().copy_html_table_source() {
+            Ok(Some(html)) => return write_bytes(html.as_bytes(), output, capacity, written),
+            Ok(None) => {}
+            Err(_) => return YU_STORAGE_INVALID_SELECTION,
+        }
+    }
+    if session.session.selections().is_multiple()
+        || columns.is_some()
+        || format == YU_STORAGE_CLIPBOARD_FRAGMENTS
+    {
         // Copy and cut operate on the same normalized selection set. Empty
         // carets contribute no text; fragments retain source order, regardless
         // of which selection is primary. Newlines separate disjoint fragments.
         let mut fragments = Vec::new();
-        for selection in session.session.selections().as_slice() {
+        let selections = session.session.selections();
+        let slots: Vec<_> = selections
+            .table_slots()
+            .map_or_else(|| (0..selections.len()).map(Some).collect(), <[_]>::to_vec);
+        let mut emitted = vec![false; selections.len()];
+        for slot in slots.iter().copied() {
+            let selection = slot.and_then(|index| {
+                let selection = selections.as_slice().get(index)?;
+                if std::mem::replace(&mut emitted[index], true) {
+                    None
+                } else {
+                    Some(selection)
+                }
+            });
+            let Some(selection) = selection else {
+                fragments.push(String::new());
+                continue;
+            };
             let range = selection.ordered_range();
             if range.is_empty() && columns.is_none() {
                 continue;
@@ -7357,20 +8566,36 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
                 }
             }
         }
+        if format == YU_STORAGE_CLIPBOARD_FRAGMENTS {
+            let source_format = if columns.is_none() {
+                YU_STORAGE_FRAGMENT_TEXT
+            } else if session.session.document().editor().table_target_is_html() == Some(true) {
+                YU_STORAGE_FRAGMENT_HTML
+            } else {
+                YU_STORAGE_FRAGMENT_MARKDOWN
+            };
+            let table_source = if columns.is_some()
+                && source_format == YU_STORAGE_FRAGMENT_HTML
+                && slots.iter().flatten().count() > selections.len()
+            {
+                match session.session.document().editor().copy_html_table_source() {
+                    Ok(source) => source,
+                    Err(_) => return YU_STORAGE_INVALID_SELECTION,
+                }
+            } else {
+                None
+            };
+            let Ok(payload) = serde_json::to_vec(
+                &serde_json::json!({"fragments": fragments, "format": source_format, "tableSource": table_source}),
+            ) else {
+                return YU_STORAGE_INVALID_SELECTION;
+            };
+            return write_bytes(&payload, output, capacity, written);
+        }
         if let Some(columns) = columns {
             let rows: Vec<_> = fragments.chunks(columns).collect();
             let payload = match format {
-                YU_STORAGE_CLIPBOARD_HTML => format!(
-                    "<table>{}</table>",
-                    rows.iter()
-                        .map(|row| format!(
-                            "<tr>{}</tr>",
-                            row.iter()
-                                .map(|cell| format!("<td>{cell}</td>"))
-                                .collect::<String>()
-                        ))
-                        .collect::<String>()
-                ),
+                YU_STORAGE_CLIPBOARD_HTML => clipboard_table_html(columns, &slots, &fragments),
                 YU_STORAGE_CLIPBOARD_MARKDOWN => {
                     let mut lines: Vec<String> = rows
                         .iter()
@@ -7397,6 +8622,46 @@ pub unsafe extern "C" fn yu_storage_session_copy_selection(
         Err(error) => return status_from_export_error(error),
     };
     write_bytes(payload.html().as_bytes(), output, capacity, written)
+}
+
+fn clipboard_table_html(columns: usize, slots: &[Option<usize>], fragments: &[String]) -> String {
+    let mut html = String::from("<table>");
+    let mut seen = vec![false; slots.len()];
+    for (row, cells) in slots.chunks(columns).enumerate() {
+        html.push_str("<tr>");
+        for (column, owner) in cells.iter().enumerate() {
+            let at = row * columns + column;
+            let Some(owner) = *owner else {
+                html.push_str("<td></td>");
+                continue;
+            };
+            if std::mem::replace(&mut seen[owner], true) {
+                continue;
+            }
+            let width = cells[column..]
+                .iter()
+                .take_while(|slot| **slot == Some(owner))
+                .count();
+            let height = slots[at..]
+                .iter()
+                .step_by(columns)
+                .take_while(|slot| **slot == Some(owner))
+                .count();
+            html.push_str("<td");
+            if width > 1 {
+                html.push_str(&format!(" colspan=\"{width}\""));
+            }
+            if height > 1 {
+                html.push_str(&format!(" rowspan=\"{height}\""));
+            }
+            html.push('>');
+            html.push_str(&fragments[at]);
+            html.push_str("</td>");
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</table>");
+    html
 }
 
 /// Converts a trusted-size native `text/html` fragment to Markdown using Yu's
@@ -7931,6 +9196,7 @@ pub unsafe extern "C" fn yu_storage_reading_geometry(
     width: f32,
     window_width: f32,
     scroll_y: f32,
+    column_width: f32,
     output: *mut YuStorageReadingGeometry,
 ) -> i32 {
     if output.is_null() {
@@ -7941,12 +9207,19 @@ pub unsafe extern "C" fn yu_storage_reading_geometry(
         || !window_width.is_finite()
         || window_width <= 0.0
         || !scroll_y.is_finite()
+        || !column_width.is_finite()
+        || column_width < 0.0
     {
         return YU_STORAGE_INVALID_VIEWPORT_CONFIG;
     }
     unsafe {
         let theme = resolved_theme_spec(appearance);
-        *output = theme.reading_geometry(width, window_width, scroll_y);
+        *output = theme.reading_geometry_with_column(
+            width,
+            window_width,
+            scroll_y,
+            (column_width > 0.0).then_some(column_width),
+        );
     }
     YU_STORAGE_OK
 }
@@ -7961,6 +9234,545 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disclosure_image_requests_follow_visible_nested_content_without_losing_inventory() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "yu-disclosure-images-{}-{id}.md",
+            std::process::id()
+        ));
+        let source = "<details><summary>Outer<img src='summary.png'></summary><p><img src='outer.png'></p><details><summary>Inner</summary><p><img src='inner.png'></p></details></details>";
+        fs::write(&path, source).expect("fixture");
+        let mut session = new_storage_session(DocumentEditorSession::open(&path).expect("open"));
+        fn requests(session: &mut YuStorageSession) -> Vec<String> {
+            let blocks = (0..session
+                .session
+                .document()
+                .editor()
+                .markdown()
+                .blocks()
+                .len())
+                .map(|index| (index, ImageRequestPriority::Visible))
+                .collect::<Vec<_>>();
+            macos_image_requests(session, &blocks)
+                .expect("plan")
+                .requests()
+                .iter()
+                .map(|request| request.key().destination().to_owned())
+                .collect()
+        }
+        fn toggle(session: &mut YuStorageSession, label: &str) {
+            let at = session
+                .session
+                .snapshot()
+                .as_str()
+                .find(label)
+                .expect("summary");
+            session
+                .session
+                .execute(EditorCommand::ToggleHtmlDetails {
+                    source: ByteOffset::new(at as u64),
+                })
+                .expect("toggle");
+        }
+        assert_eq!(
+            session
+                .session
+                .document()
+                .editor()
+                .image_references()
+                .expect("inventory")
+                .len(),
+            3
+        );
+        assert_eq!(requests(&mut session), ["summary.png"]);
+        toggle(&mut session, "Outer");
+        let open = requests(&mut session);
+        assert_eq!(open.len(), 2);
+        assert!(open.contains(&"summary.png".to_owned()));
+        assert!(open.contains(&"outer.png".to_owned()));
+        toggle(&mut session, "Inner");
+        assert_eq!(requests(&mut session).len(), 3);
+        toggle(&mut session, "Outer");
+        assert_eq!(requests(&mut session), ["summary.png"]);
+        assert_eq!(
+            session
+                .session
+                .document()
+                .editor()
+                .image_references()
+                .expect("inventory")
+                .len(),
+            3
+        );
+        session
+            .session
+            .execute(EditorCommand::Undo)
+            .expect("undo close");
+        assert_eq!(requests(&mut session).len(), 3);
+        session
+            .session
+            .execute(EditorCommand::Undo)
+            .expect("undo inner");
+        assert_eq!(requests(&mut session).len(), 2);
+        session
+            .session
+            .execute(EditorCommand::Undo)
+            .expect("undo outer");
+        assert_eq!(requests(&mut session), ["summary.png"]);
+        assert_eq!(session.session.snapshot().as_str(), source);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn navigation_reveal_ffi_preserves_source_revision_and_rejects_invalid_queries() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-reveal-{}-{id}.md", std::process::id()));
+        let source = "<details><summary>Summary</summary><p>🙂Target</p></details>";
+        fs::write(&path, source).expect("fixture");
+        let mut session = new_storage_session(DocumentEditorSession::open(&path).expect("open"));
+        let raw = session.as_mut() as *mut YuStorageSession;
+        let revision = session.session.revision().get();
+        let at = source[..source.find("🙂").expect("emoji")]
+            .encode_utf16()
+            .count() as u64;
+        let mut changed = 0;
+        assert_ne!(
+            unsafe {
+                yu_storage_session_reveal_source_range(raw, revision + 1, at, at, &mut changed)
+            },
+            YU_STORAGE_OK
+        );
+        assert_ne!(
+            unsafe {
+                yu_storage_session_reveal_source_range(raw, revision, at + 1, at + 1, &mut changed)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_reveal_source_range(raw, revision, at, at, std::ptr::null_mut())
+            },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_reveal_source_range(raw, revision, at, at, &mut changed) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(changed, 1);
+        assert_eq!(session.session.revision().get(), revision);
+        assert_eq!(session.session.snapshot().as_str(), source);
+        assert_eq!(
+            session
+                .session
+                .document()
+                .editor()
+                .history_stats()
+                .undo_entries(),
+            0
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_reveal_source_range(raw, revision, at, at, &mut changed) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(changed, 0);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn disclosure_ffi_binds_visible_headers_to_revision_and_preserves_source_on_errors() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("yu-disclosure-{}-{id}.md", std::process::id()));
+        let source = "羽🙂\r\n\r\n<details><summary>Title</summary><p>Body</p></details>\r\n";
+        fs::write(&path, source).expect("fixture");
+        let mut session = new_storage_session(DocumentEditorSession::open(&path).expect("open"));
+        let raw = session.as_mut() as *mut YuStorageSession;
+        let revision = session.session.revision().get();
+        let at = source[..source.find("Title").expect("title")]
+            .encode_utf16()
+            .count() as u64;
+        let mut header = YuStorageAccessibilityRange::default();
+        let mut open = 9;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_disclosure_header(raw, revision, at, &mut header, &mut open)
+            },
+            YU_STORAGE_OK
+        );
+        assert!(header.start_utf16 < header.end_utf16);
+        assert_eq!(open, 0);
+        let mut output = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_toggle_disclosure(raw, revision, at, std::ptr::null_mut())
+            },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_ne!(
+            unsafe { yu_storage_session_toggle_disclosure(raw, revision, 2, &mut output) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(session.session.snapshot().as_str(), source);
+        assert_eq!(
+            unsafe { yu_storage_session_toggle_disclosure(raw, revision, at, &mut output) },
+            YU_STORAGE_OK
+        );
+        let expected = source.replace("<details>", "<details open>");
+        assert_eq!(session.session.snapshot().as_str(), expected);
+        assert_ne!(
+            unsafe { yu_storage_session_toggle_disclosure(raw, revision, at, &mut output) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(session.session.snapshot().as_str(), expected);
+        let current = session.session.revision().get();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_disclosure_header(
+                    raw,
+                    current,
+                    header.start_utf16,
+                    &mut header,
+                    &mut open,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(open, 1);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_execute_command(raw, YU_STORAGE_COMMAND_UNDO, 0, &mut output)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(session.session.snapshot().as_str(), source);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn link_destination_ffi_validates_revision_utf16_and_buffer_contract() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-links-{}-{id}.md", std::process::id()));
+        let source = "羽🙂 [文档](https://example.com/?a=1&amp;b=2)\r\n\r\n<div><a href='#part'>章节</a><p id='part'>Target</p></div>\r\n";
+        fs::write(&path, source).expect("fixture");
+        let mut session = new_storage_session(DocumentEditorSession::open(&path).expect("open"));
+        let raw = session.as_mut() as *mut YuStorageSession;
+        let revision = session.session.revision().get();
+        for (label, expected) in [("文档", "https://example.com/?a=1&b=2"), ("章节", "#part")] {
+            let at = source[..source.find(label).expect("label")]
+                .encode_utf16()
+                .count() as u64;
+            let mut written = 0;
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_copy_link_destination(
+                        raw,
+                        revision,
+                        at,
+                        std::ptr::null_mut(),
+                        0,
+                        &mut written,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            assert_eq!(written, expected.len());
+            let mut output = vec![0; written];
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_copy_link_destination(
+                        raw,
+                        revision,
+                        at,
+                        output.as_mut_ptr(),
+                        output.len() - 1,
+                        &mut written,
+                    )
+                },
+                YU_STORAGE_BUFFER_TOO_SMALL
+            );
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_copy_link_destination(
+                        raw,
+                        revision,
+                        at,
+                        output.as_mut_ptr(),
+                        output.len(),
+                        &mut written,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            assert_eq!(&output[..written], expected.as_bytes());
+            assert_ne!(
+                unsafe {
+                    yu_storage_session_copy_link_destination(
+                        raw,
+                        revision + 1,
+                        at,
+                        output.as_mut_ptr(),
+                        output.len(),
+                        &mut written,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+        }
+        let mut written = 99;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_link_destination(
+                    raw,
+                    revision,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(written, 0);
+        // UTF-16 offset 2 falls between the two surrogate units of the emoji.
+        assert_ne!(
+            unsafe {
+                yu_storage_session_copy_link_destination(
+                    raw,
+                    revision,
+                    2,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let at = source[..source.find("章节").expect("label")]
+            .encode_utf16()
+            .count() as u64;
+        let expected = source[..source.find("<p id='part'>").expect("id")]
+            .encode_utf16()
+            .count() as u64;
+        let mut target = YuStorageAccessibilityRange::default();
+        assert_eq!(
+            unsafe { yu_storage_session_document_reference_target(raw, revision, at, &mut target) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(target.start_utf16, expected);
+        assert!(target.end_utf16 > target.start_utf16);
+        assert_eq!(target.revision, revision);
+        drop(session);
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn footnote_ffi_navigation_and_diagnostics_use_current_utf16_source() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-footnote-{}-{id}.md", std::process::id()));
+        let source = "羽🙂[^注] [^missing]\r\n\r\n[^注]: definition\r\n";
+        fs::write(&path, source).expect("fixture");
+        let mut session = new_storage_session(DocumentEditorSession::open(&path).expect("open"));
+        let raw = session.as_mut() as *mut YuStorageSession;
+        let revision = session.session.revision().get();
+        let utf16 = |byte| source[..byte].encode_utf16().count() as u64;
+        let reference = source.find("[^注]").expect("reference");
+        let definition = source.rfind("[^注]").expect("definition");
+        let mut target = YuStorageAccessibilityRange::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_document_reference_target(
+                    raw,
+                    revision,
+                    utf16(reference),
+                    &mut target,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(target.start_utf16, utf16(definition));
+        assert_eq!(target.revision, revision);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_document_reference_target(
+                    raw,
+                    revision,
+                    utf16(definition),
+                    &mut target,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            (target.start_utf16, target.end_utf16),
+            (utf16(reference), utf16(reference + "[^注]".len()))
+        );
+        assert_ne!(
+            unsafe {
+                yu_storage_session_document_reference_target(
+                    raw,
+                    revision + 1,
+                    utf16(reference),
+                    &mut target,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let missing = utf16(source.find("[^missing]").expect("missing"));
+        let mut bytes = vec![0; 256];
+        let mut written = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_document_diagnostic(
+                    raw,
+                    revision,
+                    missing,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    &mut written,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert!(
+            std::str::from_utf8(&bytes[..written])
+                .expect("UTF-8")
+                .contains("找不到")
+        );
+        assert_eq!(session.session.snapshot().as_str(), source);
+        drop(session);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn spelling_ffi_binds_ranges_and_replacements_to_revision() {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("yu-spelling-{}-{id}.md", std::process::id()));
+        fs::write(&path, "中文 wrld `codde`\r\n").expect("fixture");
+        let mut session = new_storage_session(DocumentEditorSession::open(&path).expect("open"));
+        let raw = session.as_mut() as *mut YuStorageSession;
+        let revision = session.session.revision().get();
+        let mut count = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_spelling_ranges(
+                    raw,
+                    revision,
+                    0,
+                    17,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(count, 1);
+        let mut records = vec![YuStorageAccessibilityRange::default(); count];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_spelling_ranges(
+                    raw,
+                    revision,
+                    0,
+                    17,
+                    records.as_mut_ptr(),
+                    count,
+                    &mut count,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(records[0].start_utf16, 0);
+        assert!(records[0].end_utf16 <= 8);
+        let info = YuStorageAccessibilityRange {
+            revision,
+            start_utf16: 3,
+            end_utf16: 7,
+        };
+        assert_eq!(
+            unsafe { yu_storage_session_set_spelling_diagnostics(raw, revision, &info, 1) },
+            YU_STORAGE_OK
+        );
+        let before = session.session.document().editor().spelling_generation();
+        assert_eq!(
+            unsafe { yu_storage_session_set_spelling_diagnostics(raw, revision, ptr::null(), 1) },
+            YU_STORAGE_NULL_POINTER
+        );
+        let invalid = YuStorageAccessibilityRange {
+            revision,
+            start_utf16: 9,
+            end_utf16: 14,
+        };
+        assert_ne!(
+            unsafe { yu_storage_session_set_spelling_diagnostics(raw, revision, &invalid, 1) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            session.session.document().editor().spelling_generation(),
+            before
+        );
+        let mut output = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_replace_spelling(
+                    raw,
+                    &info,
+                    b"world".as_ptr(),
+                    5,
+                    ptr::null_mut(),
+                )
+            },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(session.session.revision().get(), revision);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_replace_spelling(raw, &info, b"world".as_ptr(), 5, &mut output)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            session.session.snapshot().as_str(),
+            "中文 world `codde`\r\n"
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_replace_spelling(raw, &info, b"wrong".as_ptr(), 5, &mut output)
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_spelling_ranges(
+                    raw,
+                    revision,
+                    0,
+                    17,
+                    ptr::null_mut(),
+                    0,
+                    &mut count,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_set_spelling_diagnostics(raw, revision, &info, 1) },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert!(
+            session
+                .session
+                .document()
+                .editor()
+                .spelling_diagnostics()
+                .is_empty()
+        );
+        drop(session);
+        fs::remove_file(path).expect("cleanup");
+    }
 
     /// 临时文件名里的那一段。
     ///
@@ -8195,6 +10007,52 @@ mod tests {
         fs::remove_dir_all(directory).expect("cleanup");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reference_day_cancels_old_resources_without_editing_document() {
+        let path = std::env::temp_dir().join(format!("yu-calendar-{}.md", temp_id()));
+        let source = "# 日期\n\n```mermaid\ngantt\nTask :1d\n```\n";
+        fs::write(&path, source).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let old = unsafe { &*raw }.macos_embedded_resources.control.clone();
+        assert!(old.is_current(0));
+        assert_eq!(
+            unsafe { yu_storage_session_macos_set_reference_day(raw, 20454) },
+            YU_STORAGE_OK
+        );
+        assert!(!old.is_current(0));
+        let current = unsafe { &*raw }.macos_embedded_resources.control.clone();
+        assert_eq!(
+            unsafe { yu_storage_session_macos_set_reference_day(raw, 20454) },
+            YU_STORAGE_OK
+        );
+        assert!(current.is_current(0), "same day must retain resource jobs");
+        assert_eq!(
+            unsafe { yu_storage_session_macos_set_reference_day(raw, 20455) },
+            YU_STORAGE_OK
+        );
+        assert!(!current.is_current(0));
+        assert_eq!(
+            unsafe { yu_storage_session_macos_set_reference_day(raw, i32::MAX) },
+            YU_STORAGE_EDITOR_ERROR
+        );
+        let session = unsafe { &*raw };
+        assert_eq!(
+            session.macos_embedded_resources.style.reference_day(),
+            Some(20455)
+        );
+        assert_eq!(session.session.snapshot().as_str(), source);
+        assert_eq!(session.session.snapshot().revision(), Revision::INITIAL);
+        assert!(!session.session.document().is_dirty());
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
     #[test]
     fn status_and_state_contracts_are_stable() {
         let id = temp_id();
@@ -8202,6 +10060,7 @@ mod tests {
         fs::write(&path, "羽 日本語 🙂\n").expect("fixture");
         let editor_session = DocumentEditorSession::open(&path).expect("open");
         let session = YuStorageSession {
+            focus_mode: false,
             session: editor_session,
             table_resize_gesture: None,
             table_resize_override: None,
@@ -8233,6 +10092,11 @@ mod tests {
             cache: EmbeddedResourceCache::new(),
             jobs,
             results,
+            control: RenderControl::default(),
+            style: yu_assets::EmbeddedStyle::default(),
+            theme: yu_core::ThemeId::Github,
+            diagnostics: Vec::new(),
+            publications: Vec::new(),
         };
         let request = EmbeddedRenderRequest::new(
             Revision::INITIAL,
@@ -8256,7 +10120,12 @@ mod tests {
             YU_STORAGE_EMBEDDED_RESOURCE_PENDING
         );
         assert!(queued.try_recv().is_err(), "duplicate job while in flight");
-        let payload = MathRenderer::default().render(&job);
+        let payload = Ok(yu_assets::EmbeddedRenderPayload::svg(
+            20,
+            20,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\"/>",
+        )
+        .expect("fixture"));
         completed
             .send((job, payload))
             .expect("valid FFI session fixture");
@@ -8270,7 +10139,157 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_embedded_state_defaults_to_math_and_keeps_mermaid_unsupported() {
+    fn formula_style_inherits_heading_size_and_quote_color() {
+        for theme in [
+            yu_core::ThemeId::Github,
+            yu_core::ThemeId::Night,
+            yu_core::ThemeId::YuLight,
+            yu_core::ThemeId::YuDark,
+        ] {
+            let base = yu_assets::EmbeddedStyle::new(16.0, theme.spec().text, false)
+                .expect("base")
+                .with_reference_day(Some(20454));
+            let mut heading = yu_editor::EditorDocument::new("# Title $x$\n");
+            let style = embedded_style_for_block(
+                base,
+                theme,
+                heading.block_decorations(0).expect("heading"),
+            )
+            .expect("style");
+            assert_eq!(style.reference_day(), base.reference_day());
+            assert_eq!(
+                style.font_milli(),
+                (16_000.0 * theme.spec().heading_sizes[0]).round() as u32
+            );
+            assert_eq!(style.foreground(), theme.heading_color(1));
+            let mut quote = yu_editor::EditorDocument::new("> text $x$\n");
+            let style =
+                embedded_style_for_block(base, theme, quote.block_decorations(0).expect("quote"))
+                    .expect("style");
+            assert_eq!(style.font_milli(), 16_000);
+            assert_eq!(style.foreground(), theme.quote_text_color());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn embedded_failures_keep_diagnostics_only_for_current_revision() {
+        let (jobs, queued) = std::sync::mpsc::channel();
+        let (completed, results) = std::sync::mpsc::channel();
+        let mut state = MacosEmbeddedResourceState {
+            cache: EmbeddedResourceCache::new(),
+            jobs,
+            results,
+            control: RenderControl::default(),
+            style: yu_assets::EmbeddedStyle::default(),
+            theme: yu_core::ThemeId::Github,
+            diagnostics: Vec::new(),
+            publications: Vec::new(),
+        };
+        let range = TextRange::new(ByteOffset::ZERO, ByteOffset::new(3)).expect("range");
+        let request =
+            EmbeddedRenderRequest::new(Revision::INITIAL, range, EmbeddedResourceKind::Math, "bad")
+                .expect("request");
+        state
+            .status_for(request, Revision::INITIAL)
+            .expect("schedule");
+        let job = queued.try_recv().expect("job");
+        completed
+            .send((
+                job.clone(),
+                Err(RenderFailure::InvalidSource("unknown command".into())),
+            ))
+            .expect("failure");
+        state.advance(Revision::INITIAL).expect("completion");
+        assert_eq!(
+            state.diagnostics,
+            vec![(Revision::INITIAL, range, "unknown command".into())]
+        );
+        assert!(state.publications.is_empty());
+        let next = Revision::new(Revision::INITIAL.get() + 1);
+        state.advance(next).expect("revision advance");
+        assert!(state.diagnostics.is_empty());
+        completed
+            .send((
+                job,
+                Err(RenderFailure::Worker("late worker failure".into())),
+            ))
+            .expect("late");
+        state.advance(next).expect("discard stale");
+        assert!(state.diagnostics.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn late_successful_embedded_result_cannot_replace_current_publication() {
+        let (jobs, queued) = std::sync::mpsc::channel();
+        let (completed, results) = std::sync::mpsc::channel();
+        let mut state = MacosEmbeddedResourceState {
+            cache: EmbeddedResourceCache::new(),
+            jobs,
+            results,
+            control: RenderControl::default(),
+            style: yu_assets::EmbeddedStyle::default(),
+            theme: yu_core::ThemeId::Github,
+            diagnostics: Vec::new(),
+            publications: Vec::new(),
+        };
+        let range = TextRange::new(ByteOffset::ZERO, ByteOffset::new(3)).expect("range");
+        let old =
+            EmbeddedRenderRequest::new(Revision::INITIAL, range, EmbeddedResourceKind::Math, "x^2")
+                .expect("old");
+        let current_revision = Revision::new(1);
+        let current =
+            EmbeddedRenderRequest::new(current_revision, range, EmbeddedResourceKind::Math, "y^2")
+                .expect("current");
+        state
+            .status_for(old, Revision::INITIAL)
+            .expect("schedule old");
+        let old_job = queued.try_recv().expect("old job");
+        state
+            .status_for(current.clone(), current_revision)
+            .expect("schedule current");
+        let current_job = queued.try_recv().expect("current job");
+        let payload = |width| {
+            yu_assets::EmbeddedRenderPayload::svg(
+                width,
+                20,
+                format!(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"20\"/>"
+                ),
+            )
+            .expect("payload")
+        };
+        completed
+            .send((old_job.clone(), Ok(payload(99))))
+            .expect("late old success");
+        state.advance(current_revision).expect("discard old");
+        assert!(state.publications.is_empty());
+        assert!(state.diagnostics.is_empty());
+        completed
+            .send((current_job, Ok(payload(20))))
+            .expect("current success");
+        state.advance(current_revision).expect("accept current");
+        assert_eq!(state.publications.len(), 1);
+        let accepted = state.publications[0].clone();
+        completed
+            .send((old_job, Ok(payload(99))))
+            .expect("old duplicate success");
+        state.advance(current_revision).expect("discard duplicate");
+        assert_eq!(state.publications.len(), 1);
+        assert_eq!(state.publications[0].revision(), current_revision);
+        assert_eq!(state.publications[0].payload(), accepted.payload());
+        assert_eq!(
+            state
+                .status_for(current, current_revision)
+                .expect("current cache"),
+            YU_STORAGE_EMBEDDED_RESOURCE_READY
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_embedded_state_uses_native_math_and_mermaid_helper() {
         fn settled(state: &mut MacosEmbeddedResourceState, request: EmbeddedRenderRequest) -> u8 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -8303,7 +10322,9 @@ mod tests {
             .publication_for(request, Revision::INITIAL)
             .expect("publication")
             .expect("ready math publication");
-        let yu_assets::EmbeddedRenderPayload::Svg { dimensions, markup } = publication.payload()
+        let yu_assets::EmbeddedRenderPayload::Svg {
+            dimensions, markup, ..
+        } = publication.payload()
         else {
             panic!("Math renderer must publish SVG");
         };
@@ -8318,12 +10339,30 @@ mod tests {
             Revision::INITIAL,
             TextRange::new(ByteOffset::new(4), ByteOffset::new(12)).expect("range"),
             EmbeddedResourceKind::Mermaid,
-            "flowchart TD",
+            "flowchart TD\nA-->B",
         )
         .expect("request");
         assert_eq!(
-            settled(&mut state, mermaid),
-            YU_STORAGE_EMBEDDED_RESOURCE_UNSUPPORTED
+            settled(&mut state, mermaid.clone()),
+            YU_STORAGE_EMBEDDED_RESOURCE_READY
+        );
+        let publication = state
+            .publication_for(mermaid, Revision::INITIAL)
+            .expect("query")
+            .expect("ready diagram");
+        let payload = publication.payload();
+        let dimensions = payload.dimensions();
+        let pixels = MacosEmbeddedSvgRasterizer::new()
+            .rasterize(
+                payload.markup().expect("svg"),
+                dimensions.width(),
+                dimensions.height(),
+            )
+            .expect("native diagram raster");
+        assert_eq!(
+            pixels.pixels()[3],
+            0,
+            "diagram canvas must be transparent on the native rasterizer"
         );
     }
 
@@ -9412,6 +11451,84 @@ mod tests {
     /// 纯文本与 HTML 合成一个入口后，传错 format 会静默地把另一种表示放进剪贴板
     /// ——粘贴出来是 HTML 标签或反过来，没有任何报错。
     #[test]
+    fn ffi_typed_table_clipboard_converts_both_directions() {
+        for html in [false, true] {
+            let original = if html {
+                "<table><tr><td>KEEP</td></tr></table>\r\n"
+            } else {
+                "| KEEP |\n| --- |\n"
+            };
+            let path =
+                std::env::temp_dir().join(format!("yu-typed-clipboard-{}-{html}.md", temp_id()));
+            fs::write(&path, original).expect("fixture");
+            let bytes = path.to_string_lossy().as_bytes().to_vec();
+            let mut raw = ptr::null_mut();
+            assert_eq!(
+                unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+                YU_STORAGE_OK
+            );
+            let at = original.find("KEEP").expect("cell") as u64;
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_set_selection_endpoints(
+                        raw,
+                        0,
+                        at,
+                        at,
+                        YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            let cell = if html {
+                "**中文 bold** [link](https://example.com)"
+            } else {
+                "<p><b>中文 bold</b> <a href='https://example.com'>link</a></p>"
+            };
+            if !html {
+                yu_export::import_html_fragment(cell).expect("HTML import");
+            }
+            let mut result = YuStorageCommandResult::default();
+            let format = if html {
+                YU_STORAGE_FRAGMENT_MARKDOWN
+            } else {
+                YU_STORAGE_FRAGMENT_HTML
+            };
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_paste_fragments(
+                        raw,
+                        0,
+                        cell.as_ptr(),
+                        cell.len(),
+                        [cell.len()].as_ptr(),
+                        1,
+                        1,
+                        format,
+                        &mut result,
+                    )
+                },
+                YU_STORAGE_OK,
+                "destination HTML={html}"
+            );
+            let actual = unsafe { &*raw }.session.snapshot();
+            assert!(
+                actual.as_str().contains(if html {
+                    "<strong>中文 bold</strong>"
+                } else {
+                    "**中文 bold**"
+                }),
+                "{}",
+                actual.as_str()
+            );
+            unsafe {
+                yu_storage_session_destroy(raw);
+            }
+            fs::remove_file(path).expect("cleanup");
+        }
+    }
+
+    #[test]
     fn ffi_copy_selection_rejects_unknown_formats() {
         let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-clipboard-format-{id}.md"));
@@ -9466,7 +11583,7 @@ mod tests {
         );
         assert!(text_len > 0 && html_len > text_len, "两种表示必须不同");
 
-        for unknown in [3_u8, 255] {
+        for unknown in [4_u8, 255] {
             let mut written = 99;
             assert_eq!(
                 unsafe {
@@ -9975,7 +12092,7 @@ mod tests {
         );
         assert_eq!(preview.final_position, 11.0);
 
-        for unknown in [3_u8, 255] {
+        for unknown in [4_u8, 255] {
             let mut out = preview;
             assert_eq!(
                 unsafe { yu_storage_session_table_resize_action(raw, 0, unknown, 9.9, &mut out) },
@@ -11459,6 +13576,136 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_failed_image_settles_then_explicit_retry_loads_restored_file_without_editing() {
+        let directory = std::env::temp_dir().join(format!("yu-image-retry-{}", temp_id()));
+        fs::create_dir(&directory).expect("image retry fixture");
+        let path = directory.join("document.md");
+        let source = "![missing](restored.png)\r\n\r\n原文不变\r\n";
+        let original = [b"\xef\xbb\xbf".as_slice(), source.as_bytes()].concat();
+        fs::write(&path, &original).expect("image retry fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let mut info = YuStorageImageProperties::default();
+        assert_eq!(
+            unsafe { yu_storage_session_image_properties(raw, 0, 0, &mut info) },
+            YU_STORAGE_OK
+        );
+        let mut status = 255;
+        assert_eq!(
+            unsafe { yu_storage_session_image_resource_status(raw, &info, &mut status) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(status, YU_STORAGE_IMAGE_RESOURCE_UNKNOWN);
+        let frame = |raw| {
+            let mut frame = YuStorageMacosRenderHostSnapshot::default();
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_macos_render_host_frame(
+                        raw,
+                        0,
+                        16.0,
+                        500.0,
+                        0.0,
+                        240.0,
+                        0,
+                        YU_STORAGE_APPEARANCE_LIGHT,
+                        &mut frame,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            frame
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let next = frame(raw);
+            assert_eq!(
+                unsafe { yu_storage_session_image_resource_status(raw, &info, &mut status) },
+                YU_STORAGE_OK
+            );
+            if status == YU_STORAGE_IMAGE_RESOURCE_FAILED && next.resource_refresh_pending == 0 {
+                assert_eq!(next.resource_retry_pending, 0);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed image must stop requesting frames after retry budget"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut stale = info;
+        stale.revision = 1;
+        assert_eq!(
+            unsafe { yu_storage_session_retry_image(raw, &stale) },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_image_resource_status(raw, &info, ptr::null_mut()) },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(
+            frame(raw).resource_refresh_pending,
+            0,
+            "stale retry did not clear failure"
+        );
+        let png: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15,
+            0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        fs::write(directory.join("restored.png"), png).expect("image retry fixture");
+        assert_eq!(
+            unsafe { yu_storage_session_retry_image(raw, &info) },
+            YU_STORAGE_OK
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let next = frame(raw);
+            assert_eq!(
+                unsafe { yu_storage_session_image_resource_status(raw, &info, &mut status) },
+                YU_STORAGE_OK
+            );
+            if status == YU_STORAGE_IMAGE_RESOURCE_READY {
+                assert_eq!(next.resource_refresh_pending, 0);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restored file should load through the actual ImageIO worker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let session = unsafe { &*raw };
+        assert_eq!(session.session.snapshot().as_str(), source);
+        assert_eq!(session.session.revision(), yu_core::Revision::INITIAL);
+        assert!(!session.session.command_available(&EditorCommand::Undo));
+        assert_eq!(
+            session.session.selections().primary().focus(),
+            yu_core::ByteOffset::ZERO
+        );
+        assert_eq!(fs::read(&path).expect("image retry fixture"), original);
+        assert_eq!(
+            unsafe { yu_storage_session_retry_image(raw, &info) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { yu_storage_session_image_resource_status(raw, &info, &mut status) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            status, YU_STORAGE_IMAGE_RESOURCE_READY,
+            "repeat retry must retain successful decoded pixels"
+        );
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_dir_all(directory).expect("image retry fixture");
+    }
+
     /// viewport 配置由 Rust 自己发布，且已经对齐时不得重建。
     ///
     /// 这条路径此前靠十份重复校验守着：平台没送对值就整个调用失败。现在校验
@@ -12845,6 +15092,128 @@ mod tests {
     }
 
     #[test]
+    fn ffi_accessibility_labels_resolve_html_without_mutating_source() {
+        let source = "<details><summary>Hi <em>中文</em> &amp; <strong>friends</strong><br><img src='x.png' alt='图 &amp; 字'> 😀</summary><p>Secret</p></details>\n\n<widget>Keep &amp;</widget>";
+        let path = std::env::temp_dir().join(format!("yu-ax-label-{}.md", temp_id()));
+        fs::write(&path, source).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let start = source.find("Hi ").expect("summary");
+        let end = source.find("</summary>").expect("summary end");
+        let start_utf16 = source[..start].encode_utf16().count() as u64;
+        let end_utf16 = source[..end].encode_utf16().count() as u64;
+        let initial_selection = unsafe { &*raw }.session.selection();
+        let mut needed = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_accessibility_label(
+                    raw,
+                    0,
+                    start_utf16,
+                    end_utf16,
+                    ptr::null_mut(),
+                    0,
+                    &mut needed,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut output = vec![0; needed];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_accessibility_label(
+                    raw,
+                    0,
+                    start_utf16,
+                    end_utf16,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &mut needed,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            String::from_utf8(output).expect("UTF8"),
+            "Hi 中文 & friends 图 & 字 😀"
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_accessibility_label(
+                    raw,
+                    1,
+                    start_utf16,
+                    end_utf16,
+                    ptr::null_mut(),
+                    0,
+                    &mut needed,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        let emoji = source[..source.find('😀').expect("emoji")]
+            .encode_utf16()
+            .count() as u64;
+        assert_ne!(
+            unsafe {
+                yu_storage_session_copy_accessibility_label(
+                    raw,
+                    0,
+                    emoji + 1,
+                    emoji + 2,
+                    ptr::null_mut(),
+                    0,
+                    &mut needed,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let alternate = source.find("图 &amp; 字").expect("alternate text");
+        let alternate_start = source[..alternate].encode_utf16().count() as u64;
+        let mut attribute = vec![0; 64];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_accessibility_label(
+                    raw,
+                    0,
+                    alternate_start,
+                    alternate_start + "图 &amp; 字".encode_utf16().count() as u64,
+                    attribute.as_mut_ptr(),
+                    attribute.len(),
+                    &mut needed,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(&attribute[..needed], "图 &amp; 字".as_bytes());
+        let unknown = source.find("<widget>").expect("unknown");
+        let mut output = vec![0; 128];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_accessibility_label(
+                    raw,
+                    0,
+                    source[..unknown].encode_utf16().count() as u64,
+                    source.encode_utf16().count() as u64,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &mut needed,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(&output[..needed], b"<widget>Keep &amp;</widget>");
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), source);
+        assert_eq!(unsafe { &*raw }.session.selection(), initial_selection);
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
     fn ffi_accessibility_semantic_nodes_are_revision_bound_and_source_backed() {
         let id = temp_id();
         let path = std::env::temp_dir().join(format!("yu-storage-ffi-semantic-ax-{id}.md"));
@@ -13764,6 +16133,7 @@ mod tests {
                         ends.as_ptr(),
                         ends.len(),
                         0,
+                        YU_STORAGE_FRAGMENT_TEXT,
                         &mut result,
                     )
                 },
@@ -13782,6 +16152,7 @@ mod tests {
                     ends.as_ptr(),
                     2,
                     0,
+                    YU_STORAGE_FRAGMENT_TEXT,
                     &mut result,
                 )
             },
@@ -13797,6 +16168,7 @@ mod tests {
                     ends.as_ptr(),
                     2,
                     0,
+                    YU_STORAGE_FRAGMENT_TEXT,
                     ptr::null_mut(),
                 )
             },
@@ -13812,6 +16184,7 @@ mod tests {
                     ptr::null(),
                     2,
                     0,
+                    YU_STORAGE_FRAGMENT_TEXT,
                     &mut result,
                 )
             },
@@ -13827,6 +16200,7 @@ mod tests {
                     ends.as_ptr(),
                     2,
                     0,
+                    YU_STORAGE_FRAGMENT_TEXT,
                     &mut result,
                 )
             },
@@ -13849,6 +16223,7 @@ mod tests {
                         ends.as_ptr(),
                         2,
                         columns,
+                        YU_STORAGE_FRAGMENT_TEXT,
                         &mut result,
                     )
                 },
@@ -13867,6 +16242,7 @@ mod tests {
                     ends.as_ptr(),
                     2,
                     2,
+                    YU_STORAGE_FRAGMENT_TEXT,
                     &mut result,
                 )
             },
@@ -13878,6 +16254,959 @@ mod tests {
                 .snapshot()
                 .as_str()
                 .contains("| 羽 | a |\n| --- | --- |")
+        );
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn image_property_ffi_validates_identity_and_copies_owned_utf8() {
+        let path = std::env::temp_dir().join(format!("yu-image-properties-{}.md", temp_id()));
+        let original = "🙂 ![羽](<a&amp;b.png>)\r\n";
+        fs::write(&path, original).expect("image property FFI fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let mut info = YuStorageImageProperties::default();
+        assert_eq!(
+            unsafe { yu_storage_session_image_properties(raw, 0, 3, &mut info) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(info.start_utf16, 3);
+        assert_eq!(
+            unsafe { yu_storage_session_image_properties(raw, 0, 1, &mut info) },
+            YU_STORAGE_INVALID_SELECTION
+        );
+        let mut required = 0;
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_image_property(
+                    raw,
+                    &info,
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let mut destination = vec![0; required];
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_image_property(
+                    raw,
+                    &info,
+                    0,
+                    destination.as_mut_ptr(),
+                    destination.len(),
+                    &mut required,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(destination, b"a&b.png");
+        info.width = 200;
+        let alt = "新图";
+        let mut result = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_update_image_properties(
+                    raw,
+                    &info,
+                    destination.as_ptr(),
+                    destination.len(),
+                    alt.as_ptr(),
+                    alt.len(),
+                    ptr::null_mut(),
+                )
+            },
+            YU_STORAGE_NULL_POINTER
+        );
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), original);
+        assert_eq!(
+            unsafe {
+                yu_storage_session_update_image_properties(
+                    raw,
+                    &info,
+                    destination.as_ptr(),
+                    destination.len(),
+                    alt.as_ptr(),
+                    alt.len(),
+                    &mut result,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe { &*raw }.session.snapshot().as_str(),
+            "🙂 <img src=\"a&amp;b.png\" alt=\"新图\" width=\"200\">\r\n"
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_update_image_properties(
+                    raw,
+                    &info,
+                    destination.as_ptr(),
+                    destination.len(),
+                    alt.as_ptr(),
+                    alt.len(),
+                    &mut result,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_copy_image_property(
+                    raw,
+                    &info,
+                    1,
+                    ptr::null_mut(),
+                    0,
+                    &mut required,
+                )
+            },
+            YU_STORAGE_STALE_REVISION
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_execute_command(raw, YU_STORAGE_COMMAND_UNDO, 0, &mut result)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), original);
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("image property FFI fixture");
+    }
+
+    #[test]
+    fn local_image_batch_ffi_is_atomic_and_one_undo_step() {
+        let path = std::env::temp_dir().join(format!("yu-image-batch-{}.md", temp_id()));
+        fs::write(&path, "原文\r\n").expect("fixture");
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        let text = "assets/图 %.png甲other.png乙";
+        let first_end = "assets/图 %.png".len();
+        let second_start = first_end + "甲".len();
+        let second_end = second_start + "other.png".len();
+        let mut items = [
+            YuStorageImageInput {
+                path_start: 0,
+                path_end: first_end,
+                alternative_start: first_end,
+                alternative_end: second_start,
+            },
+            YuStorageImageInput {
+                path_start: second_start,
+                path_end: second_end,
+                alternative_start: second_end,
+                alternative_end: text.len(),
+            },
+        ];
+        let mut output = YuStorageCommandResult::default();
+        let insert =
+            |revision, items: &[YuStorageImageInput], output: *mut YuStorageCommandResult| unsafe {
+                yu_storage_session_insert_local_images(
+                    raw,
+                    revision,
+                    text.as_ptr(),
+                    text.len(),
+                    items.as_ptr(),
+                    items.len(),
+                    ptr::null(),
+                    output,
+                )
+            };
+        assert_eq!(insert(99, &items, &mut output), YU_STORAGE_STALE_REVISION);
+        assert_eq!(insert(0, &items, ptr::null_mut()), YU_STORAGE_NULL_POINTER);
+        items[1].path_end = second_start; // invalid later image must not publish the first
+        assert_eq!(insert(0, &items, &mut output), YU_STORAGE_INVALID_PATH);
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), "原文\r\n");
+        items[1].path_end = second_end;
+        items[1].alternative_end = text.len() - 1; // splits the Chinese scalar
+        assert_eq!(insert(0, &items, &mut output), YU_STORAGE_INVALID_SELECTION);
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), "原文\r\n");
+        items[1].alternative_end = text.len();
+        assert_eq!(insert(0, &items, &mut output), YU_STORAGE_OK);
+        assert_eq!(
+            unsafe { &*raw }.session.snapshot().as_str(),
+            "![甲](assets/%E5%9B%BE%20%25.png) ![乙](other.png)原文\r\n"
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_execute_command(raw, YU_STORAGE_COMMAND_UNDO, 0, &mut output)
+            },
+            YU_STORAGE_OK
+        );
+        assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), "原文\r\n");
+        unsafe { yu_storage_session_destroy(raw) };
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn html_cell_paragraphs_keep_coretext_geometry_and_source_ranges() {
+        let source = "<table><tr><td><p>第一段 office</p><div align='right'><p>second שלום</p><p><code>third</code></p></div></td><td>KEEP</td></tr></table>";
+        let snapshot = yu_text::TextBuffer::new(source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table");
+        let decorations = yu_editor::DecorationCache::default()
+            .decorate(&markdown, block, None)
+            .expect("projection");
+        let visual =
+            yu_editor::VisualText::new(&snapshot, block.range(), decorations.set().clone())
+                .expect("visual");
+        let shaper = CoreTextShaper::from_system_ui(
+            yu_font::FontRequest::new("System UI", 16.0).expect("font"),
+        )
+        .expect("CoreText");
+        for width in [240.0, 500.0] {
+            let view = yu_editor::BlockView::build_shaped(
+                block.kind(),
+                &visual,
+                &decorations,
+                LayoutConfig::new(width, 16.0),
+                &shaper,
+            )
+            .expect("paragraph table");
+            let table = view.table().expect("table");
+            assert!(table.cell_layouts()[0].lines().len() >= 3);
+            for cluster in view.clusters() {
+                if cluster.width() < 0.1 {
+                    continue;
+                }
+                let caret = view
+                    .caret_for_source(cluster.source().start(), yu_editor::Bias::After)
+                    .expect("caret");
+                assert!((caret.point().y() - cluster.y()).abs() < 0.01);
+                let hit = view
+                    .hit_test(LayoutPoint::new(
+                        cluster.x() + cluster.width() * 0.25,
+                        cluster.y() + cluster.line_height() * 0.5,
+                    ))
+                    .expect("hit");
+                assert_eq!(hit.content_source(), Some(cluster.source()));
+            }
+            for glyph in view.glyphs() {
+                assert_eq!(
+                    &source[glyph.source().start().get() as usize
+                        ..glyph.source().end().get() as usize],
+                    &visual.text()[glyph.visual().start().get() as usize
+                        ..glyph.visual().end().get() as usize]
+                );
+            }
+        }
+        assert_eq!(snapshot.as_str(), source);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn html_cell_details_coretext_draws_headers_and_hits_empty_summaries() {
+        let shaper = CoreTextShaper::from_system_ui(
+            yu_font::FontRequest::new("System UI", 16.0).expect("font"),
+        )
+        .expect("CoreText");
+        for summary in [
+            "<summary>标题 office שלום</summary>",
+            "<summary></summary>",
+            "",
+        ] {
+            let source = format!(
+                "<table><tr><td><details>{summary}<p>Hidden body</p></details></td><td>KEEP</td></tr></table>"
+            );
+            for (width, theme) in [240.0, 500.0].into_iter().flat_map(|width| {
+                [
+                    yu_core::ThemeId::YuLight,
+                    yu_core::ThemeId::YuDark,
+                    yu_core::ThemeId::Github,
+                    yu_core::ThemeId::Night,
+                ]
+                .into_iter()
+                .map(move |theme| (width, theme))
+            }) {
+                let mut doc = yu_editor::EditorDocument::new(&source);
+                let config = LayoutConfig::new(width, 16.0).with_theme(theme);
+                let view = doc
+                    .block_layout_with_shaper(0, config, &shaper)
+                    .expect("closed");
+                let closed_height = view.table().expect("table").bounds().height();
+                assert!(
+                    view.glyphs()
+                        .iter()
+                        .any(|glyph| &source[glyph.source().start().get() as usize
+                            ..glyph.source().end().get() as usize]
+                            == "<details>"),
+                    "disclosure arrow must be an actual glyph"
+                );
+                assert!(!view.visual().text().contains("Hidden body"));
+                if !summary.is_empty() {
+                    let at = ByteOffset::new(source.find("<summary>").expect("summary") as u64 + 9);
+                    let caret = view
+                        .caret_for_source(at, yu_editor::Bias::After)
+                        .expect("summary caret");
+                    assert_eq!(
+                        view.hit_test(LayoutPoint::new(caret.point().x(), caret.point().y() + 1.0))
+                            .expect("summary hit")
+                            .source(),
+                        at
+                    );
+                }
+                let at = ByteOffset::new(source.find("<details>").expect("details") as u64);
+                doc.toggle_html_details(at).expect("expand");
+                let open = doc
+                    .block_layout_with_shaper(0, config, &shaper)
+                    .expect("open");
+                assert!(
+                    open.visual().text().contains("▾ ")
+                        && open.visual().text().contains("Hidden body")
+                );
+                assert!(open.table().expect("open table").bounds().height() > closed_height);
+                doc.undo().expect("undo");
+                assert_eq!(doc.snapshot().as_str(), source);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn html_cell_lists_use_coretext_markers_wrapping_and_empty_item_geometry() {
+        let source = "<table><tr><td><ol start='9999'><li>outer 中文 office words words words<ul><li>nested שלום words words words</li><li></li></ul></li><li>second</li></ol></td><td>KEEP</td></tr></table>";
+        let shaper = CoreTextShaper::from_system_ui(
+            yu_font::FontRequest::new("System UI", 16.0).expect("font"),
+        )
+        .expect("CoreText");
+        for theme in [
+            yu_core::ThemeId::YuLight,
+            yu_core::ThemeId::YuDark,
+            yu_core::ThemeId::Github,
+            yu_core::ThemeId::Night,
+        ] {
+            for width in [120.0, 240.0, 500.0] {
+                let mut doc = yu_editor::EditorDocument::new(source);
+                let config = LayoutConfig::new(width, 16.0).with_theme(theme);
+                let view = doc
+                    .block_layout_with_shaper(0, config, &shaper)
+                    .expect("native lists");
+                let table = view.table().expect("table");
+                let marker_glyphs: Vec<_> = view
+                    .glyphs()
+                    .iter()
+                    .filter(|glyph| glyph.visual().is_empty())
+                    .collect();
+                assert!(
+                    marker_glyphs.len() >= 11,
+                    "missing ordered/empty item markers"
+                );
+                for glyph in marker_glyphs {
+                    assert_eq!(
+                        &source[glyph.source().start().get() as usize
+                            ..glyph.source().end().get() as usize],
+                        "<li>"
+                    );
+                    assert!(glyph.size_scale() > 0.0 && glyph.size_scale() <= 1.0);
+                    assert!(
+                        table.cells()[0].bounds().contains(glyph.origin()),
+                        "marker escaped cell: {:?}",
+                        glyph.origin()
+                    );
+                    assert!(table.cell_layouts()[0].lines().iter().any(|line| {
+                        (table.cells()[0].content_y() + line.y() + line.baseline()
+                            - glyph.origin().y())
+                        .abs()
+                            < 0.1
+                    }));
+                }
+                for label in ["outer", "nested", "second", "KEEP"] {
+                    let at = ByteOffset::new(source.find(label).expect("label") as u64);
+                    let caret = view
+                        .caret_for_source(at, yu_editor::Bias::After)
+                        .expect("caret");
+                    let hit = view
+                        .hit_test(LayoutPoint::new(caret.point().x(), caret.point().y() + 1.0))
+                        .expect("hit");
+                    assert_eq!(hit.source(), at, "{theme:?} {width} {label}");
+                }
+                let at = ByteOffset::new(source.find("<li></li>").expect("empty") as u64 + 4);
+                let caret = view
+                    .caret_for_source(at, yu_editor::Bias::After)
+                    .expect("empty caret");
+                assert_eq!(
+                    view.hit_test(LayoutPoint::new(caret.point().x(), caret.point().y() + 1.0))
+                        .expect("empty hit")
+                        .source(),
+                    at
+                );
+                doc.begin_composition(
+                    yu_core::TextRange::empty(at),
+                    "中文",
+                    yu_core::Utf16Range::empty(Utf16Offset::new(2)),
+                )
+                .expect("preedit");
+                let marked = doc
+                    .block_layout_for_visual_state_with_shaper(0, config, &shaper)
+                    .expect("marked list");
+                assert!(
+                    marked
+                        .glyphs()
+                        .iter()
+                        .any(|glyph| !glyph.visual().is_empty() && glyph.source().is_empty())
+                );
+                assert_eq!(doc.snapshot().as_str(), source);
+                assert!(doc.cancel_composition());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn empty_html_list_items_have_coretext_markers_carets_and_editable_source() {
+        let source = "<ol start='8'><li></li><li><!--keep--></li><li>尾</li></ol>";
+        let shaper = CoreTextShaper::from_system_ui(
+            yu_font::FontRequest::new("System UI", 16.0).expect("font"),
+        )
+        .expect("CoreText");
+        let mut doc = yu_editor::EditorDocument::new(source);
+        assert_eq!(doc.markdown().blocks().len(), 3);
+        for (index, expected) in ["8.", "9.", "10."].into_iter().enumerate() {
+            let view = doc
+                .block_layout_with_shaper(index, LayoutConfig::new(400.0, 16.0), &shaper)
+                .expect("empty list layout");
+            assert_eq!(view.ornaments().marker().expect("marker").text(), expected);
+            assert!(
+                !view.glyphs().is_empty(),
+                "empty item must still render its number"
+            );
+            assert!(view.lines()[0].height() > 0.0);
+            let at =
+                ByteOffset::new(source.match_indices("<li>").nth(index).expect("li").0 as u64 + 4);
+            let caret = view
+                .caret_for_source(at, yu_editor::Bias::After)
+                .expect("empty caret");
+            let hit = view
+                .hit_test(LayoutPoint::new(caret.point().x(), caret.point().y() + 1.0))
+                .expect("hit");
+            assert_eq!(hit.source(), at, "click must insert inside the list item");
+        }
+        let at = ByteOffset::new(source.find("</li>").expect("empty item") as u64);
+        doc.begin_composition(
+            yu_core::TextRange::empty(at),
+            "中文",
+            yu_core::Utf16Range::empty(Utf16Offset::new(2)),
+        )
+        .expect("preedit");
+        let view = doc
+            .block_layout_for_visual_state_with_shaper(0, LayoutConfig::new(400.0, 16.0), &shaper)
+            .expect("preedit layout");
+        assert!(view.visual().text().contains("中文"));
+        assert_eq!(doc.snapshot().as_str(), source);
+        assert!(doc.cancel_composition());
+        doc.begin_composition(
+            yu_core::TextRange::empty(at),
+            "中文",
+            yu_core::Utf16Range::empty(Utf16Offset::new(2)),
+        )
+        .expect("preedit again");
+        doc.commit_composition("中文").expect("commit");
+        assert_eq!(
+            doc.snapshot().as_str(),
+            source.replacen("<li></li>", "<li>中文</li>", 1)
+        );
+        doc.undo().expect("undo");
+        assert_eq!(doc.snapshot().as_str(), source);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn html_cell_heading_preedit_renders_at_both_boundaries_and_empty_heading() {
+        let shaper = CoreTextShaper::from_system_ui(
+            yu_font::FontRequest::new("System UI", 16.0).expect("font"),
+        )
+        .expect("CoreText");
+        for body in ["", "body"] {
+            let source = format!("<table><tr><td><h1>{body}</h1></td><td>KEEP</td></tr></table>");
+            for at in [
+                source.find("<h1>").expect("heading") + 4,
+                source.find("</h1>").expect("end"),
+            ] {
+                let mut doc = yu_editor::EditorDocument::new(&source);
+                doc.begin_composition(
+                    yu_core::TextRange::empty(ByteOffset::new(at as u64)),
+                    "中文",
+                    yu_core::Utf16Range::empty(Utf16Offset::new(2)),
+                )
+                .expect("preedit");
+                let view = doc
+                    .block_layout_for_visual_state_with_shaper(
+                        0,
+                        LayoutConfig::new(500.0, 16.0),
+                        &shaper,
+                    )
+                    .expect("marked heading");
+                let start = view.visual().text().find("中文").expect("visual preedit") as u64;
+                let glyphs: Vec<_> = view
+                    .glyphs()
+                    .iter()
+                    .filter(|g| {
+                        g.visual().start().get() >= start
+                            && g.visual().end().get() <= start + "中文".len() as u64
+                    })
+                    .collect();
+                assert!(
+                    !glyphs.is_empty(),
+                    "preedit has no visible glyphs: body={body:?} at={at}"
+                );
+                for glyph in glyphs {
+                    assert!(
+                        (glyph.size_scale() - yu_core::ThemeId::Github.spec().heading_sizes[0])
+                            .abs()
+                            < 0.001
+                    );
+                }
+                assert_eq!(doc.snapshot().as_str(), source);
+                assert!(doc.cancel_composition());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn html_cell_headings_use_coretext_theme_styles_and_shared_geometry() {
+        let shaper = CoreTextShaper::from_system_ui(
+            yu_font::FontRequest::new("System UI", 16.0).expect("font"),
+        )
+        .expect("CoreText");
+        for theme in [
+            yu_core::ThemeId::YuLight,
+            yu_core::ThemeId::YuDark,
+            yu_core::ThemeId::Github,
+            yu_core::ThemeId::Night,
+        ] {
+            for level in 1..=6 {
+                let source = format!(
+                    "<table><tr><td><h{level}>标题 <em>office</em> <code>code</code></h{level}><p>body שלום</p></td><td>KEEP</td></tr></table>"
+                );
+                let snapshot = yu_text::TextBuffer::new(&source).snapshot();
+                let markdown = yu_markdown::parse(&snapshot);
+                let block = markdown.blocks().get(0).expect("table");
+                let decorations = yu_editor::DecorationCache::default()
+                    .decorate(&markdown, block, None)
+                    .expect("projection");
+                let visual =
+                    yu_editor::VisualText::new(&snapshot, block.range(), decorations.set().clone())
+                        .expect("visual");
+                for width in [240.0, 500.0] {
+                    let view = yu_editor::BlockView::build_shaped(
+                        block.kind(),
+                        &visual,
+                        &decorations,
+                        LayoutConfig::new(width, 16.0).with_theme(theme),
+                        &shaper,
+                    )
+                    .expect("heading table");
+                    assert!(view.table().is_some());
+                    for glyph in view.glyphs() {
+                        let raw = &source[glyph.source().start().get() as usize
+                            ..glyph.source().end().get() as usize];
+                        assert_eq!(
+                            raw,
+                            &visual.text()[glyph.visual().start().get() as usize
+                                ..glyph.visual().end().get() as usize]
+                        );
+                        let offset = glyph.source().start().get() as usize;
+                        let in_heading = offset < source.find("</h").expect("heading end");
+                        let in_code = offset > source.find("<code>").expect("code")
+                            && offset < source.find("</code>").expect("code end");
+                        let expected = if in_heading {
+                            theme.spec().heading_sizes[level as usize - 1]
+                                * if in_code {
+                                    theme.inline_code_size_ratio(true)
+                                } else {
+                                    1.0
+                                }
+                        } else {
+                            1.0
+                        };
+                        assert!(
+                            (glyph.size_scale() - expected).abs() < 0.001,
+                            "{theme:?} h{level} {raw}: {} != {expected}",
+                            glyph.size_scale()
+                        );
+                        if in_heading && theme.spec().heading_bold[level as usize - 1] != 0 {
+                            assert!(glyph.style().is_strong());
+                        }
+                    }
+                    for cluster in view.clusters() {
+                        if cluster.width() < 0.1 {
+                            continue;
+                        }
+                        let caret = view
+                            .caret_for_source(cluster.source().start(), yu_editor::Bias::After)
+                            .expect("caret");
+                        assert!((caret.point().y() - cluster.y()).abs() < 0.01);
+                        let hit = view
+                            .hit_test(LayoutPoint::new(
+                                cluster.x() + cluster.width() * 0.25,
+                                cluster.y() + cluster.line_height() * 0.5,
+                            ))
+                            .expect("hit");
+                        assert_eq!(hit.content_source(), Some(cluster.source()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn html_table_justification_uses_each_cells_native_width_and_hit_geometry() {
+        let text = "one two 中文 three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen";
+        let source = format!(
+            "<table align='justify'><tr><td>{text}</td><td align='right'>KEEP</td></tr></table>"
+        );
+        let snapshot = yu_text::TextBuffer::new(&source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("table");
+        let decorations = yu_editor::DecorationCache::default()
+            .decorate(&markdown, block, None)
+            .expect("projection");
+        let visual =
+            yu_editor::VisualText::new(&snapshot, block.range(), decorations.set().clone())
+                .expect("visual");
+        assert_eq!(visual.text(), format!("{text}KEEP"));
+        let shaper = CoreTextShaper::from_system_ui(
+            yu_font::FontRequest::new("System UI", 16.0).expect("font"),
+        )
+        .expect("CoreText");
+        let mut widths = Vec::new();
+        for width in [220.0, 400.0] {
+            let view = yu_editor::BlockView::build_shaped(
+                block.kind(),
+                &visual,
+                &decorations,
+                LayoutConfig::new(width, 16.0),
+                &shaper,
+            )
+            .expect("native table");
+            assert!(
+                view.glyphs().iter().any(|glyph| {
+                    source
+                        [glyph.source().start().get() as usize..glyph.source().end().get() as usize]
+                        .chars()
+                        .count()
+                        > 1
+                }),
+                "fixture must contain a native multi-grapheme glyph"
+            );
+            for glyph in view.glyphs() {
+                let original = &source
+                    [glyph.source().start().get() as usize..glyph.source().end().get() as usize];
+                let projected = &visual.text()
+                    [glyph.visual().start().get() as usize..glyph.visual().end().get() as usize];
+                assert_eq!(original, projected, "ligature source coverage");
+            }
+            let table = view.table().expect("projected grid");
+            assert_eq!(
+                table.cells()[0].alignment(),
+                yu_markdown::TableAlignment::Justify
+            );
+            assert_eq!(
+                table.cells()[1].alignment(),
+                yu_markdown::TableAlignment::Right
+            );
+            let cell = &table.cell_layouts()[0];
+            let available = cell.config().max_width();
+            widths.push(available);
+            assert!(cell.lines().len() > 1);
+            for line in &cell.lines()[..cell.lines().len() - 1] {
+                assert!((line.width() - available).abs() < 0.01, "{width}: {line:?}");
+            }
+            assert!(cell.lines().last().expect("last").width() < available);
+            for cluster in view.clusters() {
+                if cluster.width() < 0.1 {
+                    continue;
+                }
+                let caret = view
+                    .caret_for_source(cluster.source().start(), yu_editor::Bias::After)
+                    .expect("caret");
+                assert!((caret.point().x() - cluster.x()).abs() < 0.01);
+                let hit = view
+                    .hit_test(LayoutPoint::new(
+                        cluster.x() + cluster.width() * 0.25,
+                        cluster.y() + cluster.line_height() * 0.5,
+                    ))
+                    .expect("hit");
+                assert_eq!(hit.content_source(), Some(cluster.source()));
+            }
+        }
+        assert!(widths[1] > widths[0]);
+        assert_eq!(snapshot.as_str(), source);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn html_justification_reaches_coretext_and_shared_hit_geometry() {
+        let text = "one two 中文 three four five six seven eight nine ten eleven twelve";
+        let source = format!("<div align='justify'><p>{text}</p></div>");
+        let snapshot = yu_text::TextBuffer::new(&source).snapshot();
+        let markdown = yu_markdown::parse(&snapshot);
+        let block = markdown.blocks().get(0).expect("HTML paragraph");
+        let decorations = yu_editor::DecorationCache::default()
+            .decorate(&markdown, block, None)
+            .expect("projection");
+        let visual =
+            yu_editor::VisualText::new(&snapshot, block.range(), decorations.set().clone())
+                .expect("visual");
+        assert_eq!(visual.text(), text);
+        let shaper = CoreTextShaper::from_system_ui(
+            yu_font::FontRequest::new("System UI", 16.0).expect("font"),
+        )
+        .expect("CoreText");
+        let view = yu_editor::BlockView::build_shaped(
+            block.kind(),
+            &visual,
+            &decorations,
+            LayoutConfig::new(180.0, 16.0),
+            &shaper,
+        )
+        .expect("native layout");
+        assert!(view.lines().len() > 1);
+        for line in &view.lines()[..view.lines().len() - 1] {
+            assert!((line.width() - 180.0).abs() < 0.01, "{line:?}");
+        }
+        assert!(view.lines().last().expect("last").width() < 180.0);
+        for cluster in view.clusters() {
+            if cluster.width() < 0.1 {
+                continue;
+            }
+            let caret = view
+                .caret_for_source(cluster.source().start(), yu_editor::Bias::After)
+                .expect("caret");
+            assert!((caret.point().x() - cluster.x()).abs() < 0.01);
+            let hit = view
+                .hit_test(LayoutPoint::new(
+                    cluster.x() + cluster.width() * 0.25,
+                    cluster.y() + cluster.line_height() * 0.5,
+                ))
+                .expect("hit");
+            assert_eq!(hit.content_source(), Some(cluster.source()));
+        }
+        assert_eq!(snapshot.as_str(), source);
+    }
+
+    #[test]
+    fn html_cell_image_import_ffi_saves_elements_and_reopens_exactly() {
+        for drop in [false, true] {
+            let path = std::env::temp_dir().join(format!("yu-html-image-{}.md", temp_id()));
+            let original = "\u{feff}<table><tr><td>中文</td><td>KEEP</td></tr></table>\r\n";
+            fs::write(&path, original).expect("HTML image FFI fixture");
+            let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+            let mut raw = ptr::null_mut();
+            assert_eq!(
+                unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+                YU_STORAGE_OK
+            );
+            // Storage removes only the BOM from its canonical editor source.
+            let source = unsafe { &*raw }.session.snapshot().as_str().to_owned();
+            let at = source[..source.find("中文").expect("HTML image FFI fixture")]
+                .encode_utf16()
+                .count() as u64;
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_set_selection_endpoints(
+                        raw,
+                        0,
+                        at,
+                        at,
+                        YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            let text = "assets/图.png替代";
+            let split = "assets/图.png".len();
+            let item = YuStorageImageInput {
+                path_start: 0,
+                path_end: split,
+                alternative_start: split,
+                alternative_end: text.len(),
+            };
+            let target = YuStorageSelectionEndpoints {
+                revision: 0,
+                anchor_utf16: at,
+                focus_utf16: at,
+                affinity: YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+            };
+            let mut output = YuStorageCommandResult::default();
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_insert_local_images(
+                        raw,
+                        0,
+                        text.as_ptr(),
+                        text.len(),
+                        &item,
+                        1,
+                        if drop { &target } else { ptr::null() },
+                        &mut output,
+                    )
+                },
+                YU_STORAGE_OK
+            );
+            let changed = unsafe { &*raw }.session.snapshot().as_str().to_owned();
+            assert!(changed.contains("<img "), "{changed}");
+            assert!(!changed.contains("!["));
+            assert!(unsafe { &*raw }.session.document().is_dirty());
+            let (mut revision, mut written, mut saved) = (0, 0, 0);
+            assert_eq!(
+                unsafe { yu_storage_session_save(raw, &mut revision, &mut written, &mut saved) },
+                YU_STORAGE_OK
+            );
+            let bytes = fs::read(&path).expect("HTML image FFI fixture");
+            assert_eq!(
+                bytes,
+                [b"\xef\xbb\xbf".as_slice(), changed.as_bytes()].concat()
+            );
+            assert_eq!(
+                unsafe {
+                    yu_storage_session_execute_command(raw, YU_STORAGE_COMMAND_UNDO, 0, &mut output)
+                },
+                YU_STORAGE_OK
+            );
+            assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), source);
+            unsafe { yu_storage_session_destroy(raw) };
+            assert_eq!(
+                unsafe { yu_storage_session_open(path_bytes.as_ptr(), path_bytes.len(), &mut raw) },
+                YU_STORAGE_OK
+            );
+            assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), changed);
+            unsafe { yu_storage_session_destroy(raw) };
+            fs::remove_file(path).expect("HTML image FFI fixture");
+        }
+    }
+
+    #[test]
+    fn image_drop_ffi_validates_target_before_any_selection_or_history_change() {
+        let path = std::env::temp_dir().join(format!("yu-image-drop-{}.md", temp_id()));
+        let original = "🙂 unchanged\r\n";
+        fs::write(&path, original).expect("fixture");
+        let bytes = path.to_string_lossy().as_bytes().to_vec();
+        let mut raw = ptr::null_mut();
+        assert_eq!(
+            unsafe { yu_storage_session_open(bytes.as_ptr(), bytes.len(), &mut raw) },
+            YU_STORAGE_OK
+        );
+        assert_eq!(
+            unsafe {
+                yu_storage_session_set_selection_endpoints(
+                    raw,
+                    0,
+                    original.encode_utf16().count() as u64,
+                    0,
+                    YU_STORAGE_CARET_AFFINITY_UPSTREAM,
+                )
+            },
+            YU_STORAGE_OK
+        );
+        let before = unsafe { &*raw }.session.selections().clone();
+        let text = "a.pngimage";
+        let mut item = YuStorageImageInput {
+            path_start: 0,
+            path_end: 5,
+            alternative_start: 5,
+            alternative_end: text.len(),
+        };
+        let target = YuStorageSelectionEndpoints {
+            revision: 0,
+            anchor_utf16: 3,
+            focus_utf16: 3,
+            affinity: YU_STORAGE_CARET_AFFINITY_DOWNSTREAM,
+        };
+        let insert = |target: &YuStorageSelectionEndpoints, item: &YuStorageImageInput| {
+            let mut output = YuStorageCommandResult::default();
+            unsafe {
+                yu_storage_session_insert_local_images(
+                    raw,
+                    0,
+                    text.as_ptr(),
+                    text.len(),
+                    item,
+                    1,
+                    target,
+                    &mut output,
+                )
+            }
+        };
+        for (bad, expected) in [
+            (
+                YuStorageSelectionEndpoints {
+                    revision: 9,
+                    ..target
+                },
+                YU_STORAGE_STALE_REVISION,
+            ),
+            (
+                YuStorageSelectionEndpoints {
+                    anchor_utf16: 1,
+                    focus_utf16: 1,
+                    ..target
+                },
+                YU_STORAGE_INVALID_SELECTION,
+            ),
+            (
+                YuStorageSelectionEndpoints {
+                    focus_utf16: 4,
+                    ..target
+                },
+                YU_STORAGE_INVALID_SELECTION,
+            ),
+        ] {
+            assert_eq!(insert(&bad, &item), expected);
+            assert_eq!(unsafe { &*raw }.session.selections(), &before);
+            assert_eq!(unsafe { &*raw }.session.snapshot().as_str(), original);
+        }
+        item.path_end = 0;
+        assert_eq!(insert(&target, &item), YU_STORAGE_INVALID_PATH);
+        assert_eq!(unsafe { &*raw }.session.selections(), &before);
+        item.path_end = 5;
+        assert_eq!(insert(&target, &item), YU_STORAGE_OK);
+        assert_eq!(
+            unsafe { &*raw }.session.snapshot().as_str(),
+            "🙂 ![image](a.png)unchanged\r\n"
+        );
+        assert_eq!(insert(&target, &item), YU_STORAGE_STALE_REVISION);
+        let mut output = YuStorageCommandResult::default();
+        assert_eq!(
+            unsafe {
+                yu_storage_session_execute_command(raw, YU_STORAGE_COMMAND_UNDO, 0, &mut output)
+            },
+            YU_STORAGE_OK
+        );
+        let session = unsafe { &*raw };
+        assert_eq!(session.session.snapshot().as_str(), original);
+        assert_eq!(
+            session.session.selections().primary().anchor().get(),
+            original.len() as u64
+        );
+        assert_eq!(
+            session.session.selections().primary().focus(),
+            ByteOffset::ZERO
+        );
+        assert_eq!(
+            session.session.selections().primary().affinity(),
+            CaretAffinity::Upstream
+        );
+        assert!(!session.session.command_available(&EditorCommand::Undo));
+        assert_eq!(
+            fs::read(&path).expect("unchanged disk"),
+            original.as_bytes()
         );
         unsafe { yu_storage_session_destroy(raw) };
         fs::remove_file(path).expect("cleanup");

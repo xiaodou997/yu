@@ -56,6 +56,8 @@ pub struct ParagraphObject {
 pub struct ParagraphInput<'a> {
     pub text: &'a str,
     pub base_direction: BaseDirection,
+    /// Expand soft-wrapped lines to the available width; final/hard-break lines stay natural.
+    pub justify: bool,
     pub runs: Vec<ParagraphRun>,
     pub objects: Vec<ParagraphObject>,
     pub width: f32,

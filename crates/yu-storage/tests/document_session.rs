@@ -997,3 +997,54 @@ fn cancelled_multi_window_quit_reopens_clean_and_discarded_sessions() {
     ));
     assert!(!draft.as_path().exists());
 }
+
+#[test]
+fn extended_writing_save_reopen_keeps_metadata_scripts_and_unedited_bytes() {
+    let body = "---\r\ntitle: 中文\r\nopaque: '**literal** $x$'\r\n---\r\n\r\nBody x^2^ H~2~O ==高亮==\r\n\r\nInline <b>HTML</b> <sup>2</sup> <unknown class='original'>保留</unknown>.\r\n";
+    for source_mode in [false, true] {
+        for needle in ["中文", "2^", "高亮", "HTML", "class="] {
+            let path = TestPath::new("extended-writing");
+            let original = format!("\u{feff}{body}");
+            fs::write(path.as_path(), original.as_bytes()).expect("fixture");
+            let mut session = DocumentSession::open(path.as_path()).expect("open");
+            session
+                .editor_mut()
+                .set_source_mode(source_mode)
+                .expect("mode");
+            session.save().expect("unchanged save");
+            assert_eq!(
+                fs::read(path.as_path()).expect("unchanged bytes"),
+                original.as_bytes()
+            );
+            let at = body.find(needle).expect("edit target");
+            let snapshot = session.editor().snapshot();
+            let caret = EditorSelection::cursor(
+                &snapshot,
+                yu_core::ByteOffset::new(at as u64),
+                CaretAffinity::Downstream,
+            )
+            .expect("source caret");
+            session.set_selection(caret).expect("select");
+            session
+                .execute(EditorCommand::insert_text("新"))
+                .expect("insert");
+            let changed = format!("{}新{}", &body[..at], &body[at..]);
+            session.editor_mut().undo().expect("undo");
+            assert_eq!(session.editor().snapshot().as_str(), body);
+            session.editor_mut().redo().expect("redo");
+            session.save().expect("save edit");
+            assert_eq!(
+                fs::read(path.as_path()).expect("saved bytes"),
+                format!("\u{feff}{changed}").as_bytes()
+            );
+            let reopened = DocumentSession::open(path.as_path()).expect("reopen");
+            assert_eq!(reopened.editor().snapshot().as_str(), changed);
+            session.editor_mut().undo().expect("undo after save");
+            session.save().expect("save undo");
+            assert_eq!(
+                fs::read(path.as_path()).expect("restored bytes"),
+                original.as_bytes()
+            );
+        }
+    }
+}

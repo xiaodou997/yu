@@ -24,7 +24,7 @@
 //! 2. **信封与纯呈现**（`html` / `body` / `div` / `span`）**穿透**，
 //!    `head` 连同内容整个丢掉（里面是 `<title>` / `<style>` / `<link>`，
 //!    那些文本不是正文）；
-//! 3. **其余标签继续拒**——带语义的（`<b>`、`<article>`）与带行为的
+//! 3. **其余标签继续拒**——带语义的（`<article>`、`<video>`）与带行为的
 //!    （`<script>`、`<iframe>`）都在这一档，「那是别人的 HTML」这条没有变。
 //!
 //! 属性同理：**默认忽略**，因为输出是 Markdown——一个被忽略的属性**没有地方
@@ -386,7 +386,12 @@ fn ensure_allowed_tag(name: &str) -> Result<(), HtmlImportError> {
             | "h5"
             | "h6"
             | "strong"
+            | "b"
             | "em"
+            | "i"
+            | "del"
+            | "s"
+            | "strike"
             | "code"
             | "a"
             | "img"
@@ -646,11 +651,65 @@ fn render_block(element: &Element) -> Result<String, HtmlImportError> {
         // 标题**，所以这里只发标记本身，块与块之间的那个空行由
         // `render_roots` 统一插——`join("\n\n")`，那个空行正是把两者分开的
         // 东西。少了它不报错，只是一条分隔线变成了上一段的下划线。
-        "hr" => Ok("---".to_owned()),
+        // A leading --- would start YAML metadata in the native editor.
+        "hr" => Ok("***".to_owned()),
         _ => Err(HtmlImportError::InvalidStructure(
             "unsupported block structure",
         )),
     }
+}
+
+fn retain_inline_html(nodes: &[Node]) -> Result<String, HtmlImportError> {
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let mut output = String::new();
+    for node in nodes {
+        match node {
+            Node::Text(text) => output.push_str(&escape(text)),
+            Node::Element(element) => {
+                let tag = match element.name.as_str() {
+                    "b" | "strong" => "strong",
+                    "i" | "em" => "em",
+                    "s" | "strike" | "del" => "del",
+                    "a" => "a",
+                    "img" => "img",
+                    "br" => "br",
+                    "code" => "code",
+                    _ => {
+                        return Err(HtmlImportError::InvalidStructure(
+                            "block element is not valid inline content",
+                        ));
+                    }
+                };
+                output.push('<');
+                output.push_str(tag);
+                for attr in &element.attributes {
+                    if matches!(
+                        (tag, attr.name.as_str()),
+                        ("a", "href" | "title") | ("img", "src" | "alt" | "title")
+                    ) {
+                        output.push(' ');
+                        output.push_str(&attr.name);
+                        output.push_str("=\"");
+                        output.push_str(&escape(&attr.value));
+                        output.push('"');
+                    }
+                }
+                output.push('>');
+                if !matches!(tag, "img" | "br") {
+                    output.push_str(&retain_inline_html(&element.children)?);
+                    output.push_str("</");
+                    output.push_str(tag);
+                    output.push('>');
+                }
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn render_inline_nodes(nodes: &[Node]) -> Result<String, HtmlImportError> {
@@ -678,15 +737,22 @@ fn render_inline_content(nodes: &[Node], table_cell: bool) -> Result<String, Htm
                 escape_markdown_text(text, &mut output);
             }
             Node::Element(element) => match element.name.as_str() {
-                "strong" => {
+                "strong" | "b" => {
                     output.push_str("**");
                     output.push_str(&render_inline_content(&element.children, table_cell)?);
                     output.push_str("**");
                 }
-                "em" => {
+                "em" | "i" => {
                     output.push('*');
                     output.push_str(&render_inline_content(&element.children, table_cell)?);
                     output.push('*');
+                }
+                "del" | "s" | "strike" => {
+                    // Yu treats ~~ literally; retain semantic inline HTML
+                    // instead of inventing an unsupported Markdown extension.
+                    output.push_str("<del>");
+                    output.push_str(&retain_inline_html(&element.children)?);
+                    output.push_str("</del>");
                 }
                 "code" => {
                     let text = text_only(&element.children)?;
@@ -917,7 +983,7 @@ fn render_table(element: &Element) -> Result<String, HtmlImportError> {
         header[0]
             .iter()
             .map(|cell| table_alignment_marker(cell.alignment))
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()?
             .join(" | "),
     );
     output.extend(rows.iter().map(|row| render_table_row(row)));
@@ -1061,13 +1127,19 @@ fn table_cell_alignment(element: &Element) -> Result<TableAlignment, HtmlImportE
     Ok(TableAlignment::Default)
 }
 
-fn table_alignment_marker(alignment: TableAlignment) -> String {
-    match alignment {
-        TableAlignment::Default => "---".to_owned(),
-        TableAlignment::Left => ":---".to_owned(),
-        TableAlignment::Center => ":---:".to_owned(),
-        TableAlignment::Right => "---:".to_owned(),
+fn table_alignment_marker(alignment: TableAlignment) -> Result<String, HtmlImportError> {
+    Ok(match alignment {
+        TableAlignment::Default => "---",
+        TableAlignment::Left => ":---",
+        TableAlignment::Center => ":---:",
+        TableAlignment::Right => "---:",
+        TableAlignment::Justify => {
+            return Err(HtmlImportError::InvalidStructure(
+                "GFM table syntax cannot represent justified cells",
+            ));
+        }
     }
+    .to_owned())
 }
 
 fn text_only(nodes: &[Node]) -> Result<String, HtmlImportError> {
@@ -1167,7 +1239,7 @@ mod tests {
     fn a_thematic_break_is_not_a_heading() {
         assert_eq!(
             import_html_fragment("<p>上</p><hr /><p>下</p>").expect("hr 在白名单里"),
-            "上\n\n---\n\n下"
+            "上\n\n***\n\n下"
         );
         // 真正的标题仍然要认得，六级到头。
         assert_eq!(
@@ -1205,6 +1277,25 @@ mod tests {
     /// 是 Yu 自研渲染器发过的那一种。只认一种的表现是自己拷出来的表格粘回来
     /// **丢掉对齐**——表格还在，不报错。
     #[test]
+    fn justified_html_import_does_not_silently_serialize_left_aligned_gfm() {
+        for attribute in ["align='justify'", "style='text-align:justify'"] {
+            let html = format!(
+                "<table><thead><tr><th {attribute}>A</th></tr></thead><tbody><tr><td {attribute}>B</td></tr></tbody></table>"
+            );
+            assert!(
+                import_html_fragment(&html).is_err(),
+                "unsupported GFM alignment must remain an error"
+            );
+        }
+        assert_eq!(
+            table_alignment_marker(TableAlignment::Justify),
+            Err(HtmlImportError::InvalidStructure(
+                "GFM table syntax cannot represent justified cells",
+            ))
+        );
+    }
+
+    #[test]
     fn table_alignment_is_read_from_both_gfm_and_inline_style() {
         for cell_attribute in [r#"align="right""#, r#"style="text-align: right""#] {
             let html = format!(
@@ -1217,6 +1308,17 @@ mod tests {
                 "{cell_attribute} 的右对齐丢了：{markdown}"
             );
         }
+    }
+
+    #[test]
+    fn imports_native_formatting_aliases_without_literal_markup() {
+        assert_eq!(
+            import_html_fragment(
+                "<p><b>B</b> <i>I</i> <s>S</s> <strike>T</strike> <del>D</del></p>"
+            )
+            .expect("native aliases"),
+            "**B** *I* <del>S</del> <del>T</del> <del>D</del>"
+        );
     }
 
     #[test]
@@ -1272,8 +1374,8 @@ mod tests {
         // **带语义的未知标签继续拒**——「那是别人的 HTML」这条没有变，变的
         // 只是「信封不算别人的 HTML」。
         assert!(matches!(
-            import_html_fragment("<p>段落里有 <b>标签</b></p>"),
-            Err(HtmlImportError::UnsupportedTag(tag)) if tag == "b"
+            import_html_fragment("<p>段落里有 <video>标签</video></p>"),
+            Err(HtmlImportError::UnsupportedTag(tag)) if tag == "video"
         ));
         // 纯呈现的属性忽略：输出是 Markdown，被忽略的属性没有地方可去。
         assert_eq!(

@@ -21,7 +21,9 @@ pub use shaping::{
     ClusterMetrics, FontFaceId, Glyph, GlyphId, GlyphRun, Script, ShapedText, ShapingProvider,
     TextDirection,
 };
-pub use style::{LineStyleId, StyleId, TextAttrs, TextRole, TextStyle, WidgetId, WidgetSide};
+pub use style::{
+    LineStyleId, StyleId, TextAttrs, TextRole, TextScript, TextStyle, WidgetId, WidgetSide,
+};
 
 mod theme;
 pub use theme::{ReadingGeometry, TaskCheckboxStyle, ThemeFont, ThemeId, ThemeSpec};

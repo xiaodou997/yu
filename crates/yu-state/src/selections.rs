@@ -52,6 +52,7 @@ pub struct Selections {
     ranges: Vec<EditorSelection>,
     primary: usize,
     table_columns: Option<usize>,
+    table_slots: Option<Vec<Option<usize>>>,
 }
 
 impl Selections {
@@ -62,11 +63,81 @@ impl Selections {
         self.table_columns
     }
 
-    pub fn with_table_columns(mut self, columns: usize) -> Result<Self, SelectionError> {
-        if columns == 0 || !self.ranges.len().is_multiple_of(columns) {
+    /// Row-major source owners. Repeated indices cover one rectangular merged cell.
+    /// `None` is an absent HTML cell, never a source range.
+    #[must_use]
+    pub fn table_slots(&self) -> Option<&[Option<usize>]> {
+        self.table_slots.as_deref()
+    }
+
+    pub fn with_table_columns(self, columns: usize) -> Result<Self, SelectionError> {
+        let slots = (0..self.ranges.len()).map(Some).collect();
+        self.with_table_slots(columns, slots)
+    }
+
+    pub fn with_table_slots(
+        mut self,
+        columns: usize,
+        slots: Vec<Option<usize>>,
+    ) -> Result<Self, SelectionError> {
+        if columns == 0 || slots.is_empty() || !slots.len().is_multiple_of(columns) {
+            return Err(SelectionError::InvalidRange);
+        }
+        // Keep source selections unique. A merged cell owns several visual slots,
+        // but must still be changed only once by a transaction.
+        #[derive(Clone, Copy)]
+        struct OwnerBounds {
+            top: usize,
+            left: usize,
+            bottom: usize,
+            right: usize,
+            count: usize,
+        }
+        let mut bounds: Vec<Option<OwnerBounds>> = vec![None; self.ranges.len()];
+        let mut next_owner = 0;
+        for (index, owner) in slots.iter().enumerate() {
+            let Some(owner) = *owner else {
+                continue;
+            };
+            let Some(entry) = bounds.get_mut(owner) else {
+                return Err(SelectionError::InvalidRange);
+            };
+            let (row, column) = (index / columns, index % columns);
+            match entry {
+                Some(bounds) => {
+                    bounds.left = bounds.left.min(column);
+                    bounds.bottom = row;
+                    bounds.right = bounds.right.max(column);
+                    bounds.count += 1;
+                }
+                None => {
+                    if owner != next_owner {
+                        return Err(SelectionError::InvalidRange);
+                    }
+                    next_owner += 1;
+                    *entry = Some(OwnerBounds {
+                        top: row,
+                        left: column,
+                        bottom: row,
+                        right: column,
+                        count: 1,
+                    });
+                }
+            }
+        }
+        if next_owner != self.ranges.len()
+            || bounds.iter().any(|entry| {
+                let Some(bounds) = *entry else {
+                    return true;
+                };
+                (bounds.bottom - bounds.top + 1).checked_mul(bounds.right - bounds.left + 1)
+                    != Some(bounds.count)
+            })
+        {
             return Err(SelectionError::InvalidRange);
         }
         self.table_columns = Some(columns);
+        self.table_slots = Some(slots);
         Ok(self)
     }
 
@@ -78,6 +149,7 @@ impl Selections {
             ranges: vec![selection],
             primary: 0,
             table_columns: None,
+            table_slots: None,
         }
     }
 
@@ -156,6 +228,7 @@ impl Selections {
             ranges: merged.into_iter().map(|(selection, _)| selection).collect(),
             primary,
             table_columns: None,
+            table_slots: None,
         })
     }
 
@@ -553,5 +626,69 @@ mod tests {
         // `caret(5)` 停在 `1..5` 的末尾上，要并进去；`6..10` 与它不相接。
         assert_eq!(starts(&selections), vec![(1, 5), (6, 10)]);
         assert_invariants(&selections);
+    }
+    #[test]
+    fn sparse_table_slots_validate_order_completeness_and_shape() {
+        let snapshot = TextBuffer::new("a b").snapshot();
+        let selections =
+            Selections::new(&snapshot, [span(&snapshot, 0, 1), span(&snapshot, 2, 3)], 0)
+                .expect("ranges");
+        let slots = vec![Some(0), None, Some(1), None];
+        assert_eq!(
+            selections
+                .clone()
+                .with_table_slots(2, slots.clone())
+                .expect("sparse grid")
+                .table_slots(),
+            Some(slots.as_slice())
+        );
+        for (columns, slots) in [
+            (0, vec![Some(0), Some(1)]),
+            (2, vec![Some(0)]),
+            (1, vec![Some(1), Some(0)]),
+            (2, vec![Some(0), Some(0)]),
+            (2, vec![Some(0), Some(2)]),
+            (1, vec![None]),
+        ] {
+            assert!(selections.clone().with_table_slots(columns, slots).is_err());
+        }
+    }
+    #[test]
+    fn merged_slots_keep_unique_source_selections_and_primary() {
+        let snapshot = TextBuffer::new("中文🙂 b c").snapshot();
+        let selections = Selections::new(
+            &snapshot,
+            [
+                span(&snapshot, 0, 10),
+                span(&snapshot, 11, 12),
+                span(&snapshot, 13, 14),
+            ],
+            2,
+        )
+        .expect("unique source ranges");
+        let slots = vec![Some(0), Some(0), Some(1), Some(0), Some(0), Some(2)];
+        let merged = selections
+            .with_table_slots(3, slots.clone())
+            .expect("rectangles");
+        assert_eq!(merged.as_slice().len(), 3);
+        assert_eq!(merged.primary_index(), 2);
+        assert_eq!(merged.table_slots(), Some(slots.as_slice()));
+        assert_eq!(merged.as_slice()[0].ordered_range().len(), 10);
+    }
+
+    #[test]
+    fn merged_slots_reject_holes_disconnected_owners_and_wrong_source_order() {
+        let snapshot = TextBuffer::new("a b").snapshot();
+        let selections =
+            Selections::new(&snapshot, [span(&snapshot, 0, 1), span(&snapshot, 2, 3)], 0)
+                .expect("ranges");
+        for (columns, slots) in [
+            (2, vec![Some(0), Some(0), Some(0), Some(1)]),
+            (3, vec![Some(0), Some(1), Some(0)]),
+            (2, vec![Some(0), None, Some(0), Some(0), Some(1), None]),
+            (2, vec![Some(1), Some(0), Some(1), Some(0)]),
+        ] {
+            assert!(selections.clone().with_table_slots(columns, slots).is_err());
+        }
     }
 }

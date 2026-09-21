@@ -162,3 +162,36 @@ fn vertical_shift_selection_preserves_anchor_and_caret_direction() {
         .shift_up()
         .expect_state("|one\ntwo\nthree");
 }
+
+#[test]
+fn writing_marks_edit_undo_and_composition_preserve_source_bytes() {
+    let mut scenario = EditorScenario::new("\u{feff}before ==中|文== after\r\n");
+    scenario
+        .insert("新")
+        .expect_state("\u{feff}before ==中新|文== after\r\n")
+        .undo()
+        .expect_state("\u{feff}before ==中|文== after\r\n")
+        .redo()
+        .expect_state("\u{feff}before ==中新|文== after\r\n")
+        .begin_composition("拼音")
+        .cancel_composition()
+        .expect_state("\u{feff}before ==中新|文== after\r\n");
+}
+
+#[test]
+fn metadata_and_script_edits_preserve_source_and_undo() {
+    let mut metadata = EditorScenario::new("\u{feff}---\r\ntitle: 中|文\r\n---\r\n\r\n# Body\r\n");
+    metadata
+        .insert("新")
+        .expect_state("\u{feff}---\r\ntitle: 中新|文\r\n---\r\n\r\n# Body\r\n")
+        .undo()
+        .expect_state("\u{feff}---\r\ntitle: 中|文\r\n---\r\n\r\n# Body\r\n");
+    let mut script = EditorScenario::new("x^⟦2⟧^ H~2~O\r\n");
+    script
+        .insert("3")
+        .expect_state("x^3|^ H~2~O\r\n")
+        .undo()
+        .expect_state("x^⟦2⟧^ H~2~O\r\n")
+        .redo()
+        .expect_state("x^3|^ H~2~O\r\n");
+}

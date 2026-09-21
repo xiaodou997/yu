@@ -5,7 +5,7 @@
 //! 那棵语义树里也有 Heading 节点与 label 区间，看上去大纲当它的第二个消费者
 //! 就行。**不这么做**，理由是三者共享的「唯一实现」（D4）本来就不在语义树
 //! 里，而在更下面一层：「哪些块是标题、几级、正文在哪」由
-//! [`BlockKind::Heading`] 与 [`yu_markdown::heading_content_range`] 定义，
+//! [`yu_markdown::BlockKind::Heading`] 与 [`yu_markdown::heading_content_range`] 定义，
 //! 语义树自己是它的第一个消费者，`yu-export` 是第二个，大纲是第三个。三份
 //! 派生视图共用同一份定义，D4 要的唯一性已经满足；再把大纲叠在语义树上，
 //! 唯一性一点没多，耦合多了一层。
@@ -28,7 +28,6 @@
 //! 反对的那件事。
 
 use yu_core::{Revision, TextRange};
-use yu_markdown::BlockKind;
 
 use crate::EditorDocument;
 
@@ -105,33 +104,20 @@ impl OutlineSnapshot {
     pub fn from_document(document: &EditorDocument) -> Self {
         let markdown = document.markdown();
         let revision = markdown.revision();
-        let mut items: Vec<OutlineItem> = Vec::new();
-        // 祖先链：(序号, 级别)，级别自底向上严格递减。
-        let mut ancestors: Vec<(usize, u8)> = Vec::new();
-
-        for (block, markdown_block) in markdown.semantic_blocks().into_iter().enumerate() {
-            let BlockKind::Heading { level } = markdown_block.kind() else {
-                continue;
-            };
-            while ancestors
-                .last()
-                .is_some_and(|(_, ancestor_level)| *ancestor_level >= level)
-            {
-                ancestors.pop();
-            }
-            let index = items.len();
-            items.push(OutlineItem {
+        let items = markdown
+            .table_of_contents()
+            .headings()
+            .iter()
+            .enumerate()
+            .map(|(index, heading)| OutlineItem {
                 index,
-                parent: ancestors.last().map(|(ancestor, _)| *ancestor),
-                level,
-                block,
-                source_range: markdown_block.range(),
-                // 「正文在哪」只有一个答案，由语法树给：ATX 的 `#` 前缀与收尾
-                // 的 ` ##`、Setext 的下划线都不在里面。
-                label_range: yu_markdown::heading_content_range(markdown, markdown_block),
-            });
-            ancestors.push((index, level));
-        }
+                parent: heading.parent,
+                level: heading.level,
+                block: heading.block,
+                source_range: heading.source,
+                label_range: heading.label,
+            })
+            .collect();
 
         Self { revision, items }
     }
