@@ -22,3 +22,8 @@
 *.otf binary
 *.woff binary
 *.woff2 binary
+
+# Preserve upstream license/source text, including its original trailing spaces.
+tools/yu-document-renderer/licenses/FontNotices.txt whitespace=-blank-at-eol,-blank-at-eof
+tools/yu-document-renderer/licenses/LPPL-1.3c.txt whitespace=-blank-at-eol,-blank-at-eof
+tools/yu-document-renderer/vendor/xarrow/lib.typ whitespace=-blank-at-eol,-blank-at-eof
