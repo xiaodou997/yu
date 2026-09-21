@@ -44,12 +44,25 @@ def insert(source, offset, text):
 
 
 def main():
+    global BASE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
     parser.add_argument('--dark', action='store_true')
+    parser.add_argument('--table-widths', action='store_true', help='Also verify HTML divider dragging, cancellation and reopen')
+    parser.add_argument('--html-tables', action='store_true', help='Check screenshot-located HTML table mouse and real Pinyin input')
+    parser.add_argument('--image-geometry', action='store_true', help='Check real image loading, pixel-located mouse/Pinyin and zoom geometry')
+    parser.add_argument('--writing-modes', action='store_true', help='Run real Pinyin, scrolling and window/zoom combinations with focus/typewriter/spelling enabled')
     parser.add_argument('--inspect', action='store_true', help='Launch a private app for independent manual/driver diagnosis; does not mark checks passed')
     parser.add_argument('--keep-open-on-failure', action='store_true', help='Keep only the failed private app alive for diagnosis')
     args = parser.parse_args()
+    if args.table_widths and not args.html_tables: parser.error('--table-widths requires --html-tables')
+    if sum([args.image_geometry,args.writing_modes,args.html_tables]) > 1: parser.error('Choose one scenario')
+    if args.image_geometry:
+        BASE = '![delayed](delayed.png)\r\n\r\nAFTER IMAGE ANCHOR\r\n\r\n中文与 emoji 🙂 原文不变。\r\n'
+
+    if args.html_tables:
+        BASE = '# HTML table input\r\n\r\n<table><tr><th>Heading one</th><th>Heading two</th></tr><tr><td>Cell alpha</td><td>Cell beta</td></tr></table>\r\n\r\nTail unchanged 中文🙂.\r\n'
+
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     build = json.loads((HERE / '.build/build-manifest.json').read_text())
@@ -70,15 +83,21 @@ def main():
     info['CFBundleIdentifier'] = 'io.github.xiaodou997.yu.editing-check.' + uuid.uuid4().hex
     info_path.write_bytes(plistlib.dumps(info))
     subprocess.run(['codesign', '--force', '--sign', '-', '--identifier', info['CFBundleIdentifier'], str(app)], check=True)
+    if args.writing_modes:
+        for setting in ['Yu.focusMode','Yu.typewriterMode','Yu.spellingEnabled']:
+            subprocess.run(['defaults','write',info['CFBundleIdentifier'],setting,'-bool','true'],check=True)
     fixture = out / 'input.md'
     fixture.write_bytes(b'\xef\xbb\xbf' + BASE.encode())
     env = {k: v for k, v in os.environ.items() if not k.startswith('YU_')}
     env.update(YU_DOCUMENT_STATE_DIR=str(out / 'state'), YU_PRESENTATION_STATE_DIR=str(out / 'columns'), YU_NATIVE_INPUT_TRACE='1')
     events, checks = [], []
     result = {'passed': False, 'build': build, 'test_app_sha256': digest(app / 'Contents/MacOS/Yu'),
-              'fixture_original_sha256': digest(fixture), 'checks': checks}
+              'fixture_original_sha256': digest(fixture), 'checks': checks, 'writing_modes_enabled': args.writing_modes,'html_tables':args.html_tables,'table_widths':args.table_widths}
     process = None
     original_input = None
+    if args.image_geometry or args.html_tables:
+        locator = out/'locate-native-text'
+        subprocess.run(['swiftc',str(ROOT/'tools/locate-native-text.swift'),'-o',str(locator)],check=True)
 
     def run(*arguments):
         command = [str(driver), str(process.pid), *map(str, arguments)]
@@ -148,6 +167,164 @@ def main():
             result['inspection_ready'] = True
             print('Inspection PID:', process.pid, flush=True)
             return 0
+        if args.html_tables:
+            def locate_cell(label, name):
+                # Move the blinking caret off the OCR label before measuring pixels.
+                select(len(BASE.encode('utf-16-le'))//2)
+                time.sleep(.15)
+                captured = capture(name)
+                window = next(w for w in captured['windows'] if w['kCGWindowLayer']==0 and w['kCGWindowBounds']['Width']>=400)
+                png = out/f'{name}-{window["kCGWindowNumber"]}.png'
+                measurement = json.loads(subprocess.check_output([str(locator),str(png),label],text=True))
+                (out/f'{name}-ocr.json').write_text(json.dumps(measurement,indent=2))
+                assert len(measurement['matches'])==1, 'Expected one visible table label'
+                box = measurement['matches'][0]; bounds = window['kCGWindowBounds']
+                return (bounds['X']+(box['x']+box['width']/2)*bounds['Width']/measurement['image_width'],
+                        bounds['Y']+(box['y']+box['height']/2)*bounds['Height']/measurement['image_height'])
+            for width,height,zoom,name in [(900,620,0,'narrow'),(1200,800,2,'zoomed')]:
+                run('resize',width,height); key(29,'cmd')
+                for _ in range(zoom): key(24,'cmd+shift')
+                time.sleep(.4)
+                point = locate_cell('Cell alpha',name+'-cell')
+                run('click',*point)
+                offset = snap(name+'-clicked')['AXSelectedTextRange']['location']
+                assert u16index(BASE,'Cell alpha') <= offset <= u16index(BASE,'Cell alpha')+len('Cell alpha')
+                run('source',PINYIN); type_pinyin()
+                candidate = capture(name+'-candidate')
+                panels = [w['kCGWindowBounds'] for w in candidate['windows'] if w['kCGWindowLayer']==20]
+                assert panels and any(abs(b['Y']-point[1])<90 and abs(b['X']-point[0])<180 for b in panels), 'Candidate detached from table cell'
+                assert snap(name+'-preedit')['AXValue']==BASE
+                key(49)
+                expected = insert(BASE,offset,'中文')
+                assert snap(name+'-committed')['AXValue']==expected
+                undo(); assert snap(name+'-undo')['AXValue']==BASE
+                redo(); assert snap(name+'-redo')['AXValue']==expected
+                undo(); assert snap(name+'-restored')['AXValue']==BASE
+                type_pinyin(); key(53)
+                assert snap(name+'-cancel')['AXValue']==BASE
+                cancelled = capture(name+'-cancelled')
+                assert not any(w['kCGWindowLayer']==20 for w in cancelled['windows']), 'Cancelled input left a candidate panel visible'
+                run('source',ABC)
+                a = locate_cell('Cell alpha',name+'-drag-start')
+                b = locate_cell('Cell beta',name+'-drag-end')
+                run('drag',*a,*b,'alt+shift')
+                copied=json.loads(run('copy-read'))
+                (out/f'{name}-clipboard.json').write_text(json.dumps(copied,ensure_ascii=False,indent=2))
+                assert copied['text'].strip()=='Cell alpha\tCell beta',copied
+                key(51)
+                assert snap(name+'-cleared')['AXValue']==BASE.replace('Cell alpha','').replace('Cell beta','')
+                undo(); assert snap(name+'-clear-undo')['AXValue']==BASE
+                check(name+' HTML table: pixel-located click, real Pinyin candidate/commit/cancel, undo/redo, rectangular mouse selection/copy/clear preserve tags')
+            key(1,'cmd'); time.sleep(.3)
+            assert fixture.read_bytes()==b'\xef\xbb\xbf'+BASE.encode()
+            check('HTML table mouse and IME checks save exact BOM/CRLF source')
+            if args.table_widths:
+                def html_rules(name):
+                    point = locate_cell('Cell alpha',name)
+                    windows = json.loads((out/f'{name}-windows.json').read_text())['windows']
+                    window = next(w for w in windows if w['kCGWindowLayer']==0 and w['kCGWindowBounds']['Width']>=400)
+                    bounds=window['kCGWindowBounds']
+                    ocr=json.loads((out/f'{name}-ocr.json').read_text()); box=ocr['matches'][0]
+                    png=out/f'{name}-{window["kCGWindowNumber"]}.png'
+                    measured=json.loads(subprocess.check_output([str(rule_measure),str(png),str(int(box['x']-60)),str(int(box['y']-15)),str(ocr['image_width']-5),str(int(box['y']+box['height']+15))],text=True))
+                    (out/f'{name}-rules.json').write_text(json.dumps(measured,indent=2))
+                    rules=measured['vertical_rules']; assert len(rules)==3, measured
+                    scale=bounds['Width']/ocr['image_width']
+                    return [bounds['X']+v*scale for v in rules],point
+                before,point=html_rules('html-width-before')
+                run('drag',before[1],point[1],before[1]-40,point[1])
+                assert snap('html-width-changed')['AXValue']==BASE
+                after,_=html_rules('html-width-after')
+                assert abs(after[1]-before[1]+40)<=1, (before,after)
+                files=list((out/'columns').glob('*.yucolumns')); assert len(files)==1
+                persisted=files[0].read_bytes(); assert persisted[:8]==b'YUCOLW01'
+                run('drag-cancel',after[1],point[1],after[1]+25,point[1])
+                cancelled,_=html_rules('html-width-cancelled')
+                assert abs(cancelled[1]-after[1])<=1
+                assert files[0].read_bytes()==persisted
+                assert snap('html-width-cancel-source')['AXValue']==BASE
+                check('real HTML divider drag moves the visible rule by 40pt; Escape restores geometry and leaves saved width metadata unchanged')
+                run('source',original_input); key(1,'cmd'); key(12,'cmd'); process.wait(timeout=10)
+                process=subprocess.Popen(command,env=env,stdout=(out/'reopen.log').open('w'),stderr=subprocess.STDOUT,start_new_session=True)
+                deadline=time.monotonic()+12
+                while True:
+                    try: reopened=json.loads(run('activate')); break
+                    except RuntimeError:
+                        if process.poll() is not None or time.monotonic()>=deadline: raise
+                        time.sleep(.2)
+                assert reopened['AXValue']==BASE
+                run('resize',1200,800); key(29,'cmd'); key(24,'cmd+shift'); key(24,'cmd+shift'); time.sleep(.4)
+                restored,_=html_rules('html-width-reopened')
+                ratio=lambda rules:(rules[1]-rules[0])/(rules[2]-rules[0])
+                assert abs(ratio(restored)-ratio(after))<.003, (after,restored)
+                assert fixture.read_bytes()==b'\xef\xbb\xbf'+BASE.encode()
+                check('fresh process restores HTML column proportions in actual pixels with exact saved BOM/CRLF source')
+            result['passed']=True
+            return 0
+        if args.image_geometry:
+            def locate(label):
+                captured = capture(label)
+                window = next(w for w in captured['windows'] if w['kCGWindowLayer']==0 and w['kCGWindowBounds']['Width']>=400)
+                png = out/f'{label}-{window["kCGWindowNumber"]}.png'
+                measurement = json.loads(subprocess.check_output([str(locator),str(png),'AFTER IMAGE ANCHOR'],text=True))
+                (out/f'{label}-ocr.json').write_text(json.dumps(measurement,indent=2))
+                assert len(measurement['matches'])==1, 'Expected one visible image-following anchor'
+                box = measurement['matches'][0]; bounds = window['kCGWindowBounds']
+                sx = bounds['Width']/measurement['image_width']; sy = bounds['Height']/measurement['image_height']
+                return (bounds['X']+(box['x']+box['width']/2)*sx,
+                        bounds['Y']+(box['y']+box['height']/2)*sy),box,bounds
+            run('resize',900,620)
+            before_point,before_box,bounds = locate('image-missing')
+            state = snap('image-missing-source')
+            pos,size = state['AXPosition'],state['AXSize']
+            run('right-click',pos['x']+max(24,(size['width']-760)/2)+12,pos['y']+43)
+            # Restore the actual resource, then choose the native retry command.
+            shutil.copyfile(HERE/'Fixtures/assets/yu-mark.png',out/'delayed.png')
+            key(125); key(36); time.sleep(1)
+            assert snap('image-restored-source')['AXValue']==BASE
+            after_point,after_box,bounds = locate('image-restored')
+            assert after_point[1]-before_point[1]>20, 'Async intrinsic size did not move the rendered following paragraph'
+            check('missing image retry loads actual pixels and changes following paragraph geometry without editing source')
+            for width,height,zoom_steps,label in [(900,620,0,'narrow'),(1200,800,2,'zoomed')]:
+                run('resize',width,height); key(29,'cmd')
+                for _ in range(zoom_steps): key(24,'cmd+shift')
+                time.sleep(.4)
+                point,box,bounds = locate(label+'-image-before-click')
+                run('click',*point)
+                clicked = snap(label+'-image-click')['AXSelectedTextRange']['location']
+                start = u16index(BASE,'AFTER IMAGE ANCHOR')
+                assert start<=clicked<=start+len('AFTER IMAGE ANCHOR'), 'Pixel-located click missed the visible paragraph'
+                run('source',PINYIN); type_pinyin()
+                candidate = capture(label+'-image-candidate')
+                panels = [w['kCGWindowBounds'] for w in candidate['windows'] if w['kCGWindowLayer']==20]
+                assert panels and any(abs(b['Y']-point[1])<90 and abs(b['X']-point[0])<180 for b in panels), 'Candidate detached from image-following clicked text'
+                assert snap(label+'-image-preedit')['AXValue']==BASE
+                key(49)
+                expected = insert(BASE,clicked,'中文')
+                assert snap(label+'-image-commit')['AXValue']==expected
+                undo(); assert snap(label+'-image-undo')['AXValue']==BASE
+                redo(); assert snap(label+'-image-redo')['AXValue']==expected
+                undo(); assert snap(label+'-image-restored')['AXValue']==BASE
+                type_pinyin(); key(53)
+                assert snap(label+'-image-cancel')['AXValue']==BASE
+                key(1,'cmd'); time.sleep(.2)
+                assert fixture.read_bytes()==b'\xef\xbb\xbf'+BASE.encode()
+                check(label+' image layout: screenshot OCR click, real Pinyin candidate/commit/cancel and independent undo/redo preserve exact source')
+            assert (out/'delayed.png').read_bytes()==(HERE/'Fixtures/assets/yu-mark.png').read_bytes()
+            run('source',original_input); key(12,'cmd'); process.wait(timeout=10)
+            process = subprocess.Popen(command,env=env,stdout=(out/'reopen.log').open('w'),stderr=subprocess.STDOUT,start_new_session=True)
+            deadline=time.monotonic()+12
+            while True:
+                try: reopened=json.loads(run('activate')); break
+                except RuntimeError:
+                    if process.poll() is not None or time.monotonic()>=deadline: raise
+                    time.sleep(.2)
+            assert reopened['AXValue']==BASE
+            time.sleep(.5); locate('image-reopened')
+            key(12,'cmd'); process.wait(timeout=10)
+            check('image and unchanged BOM/CRLF document reopen after geometry and input checks')
+            result['passed']=True
+            return 0
         run('source', PINYIN)
         anchor = u16index(BASE, 'START')
         select(anchor)
@@ -168,6 +345,69 @@ def main():
         undo(); assert snap('pinyin-backspace-undo')['AXValue'] == BASE
         redo(); assert snap('pinyin-backspace-redo')['AXValue'] == expected
         check('system Pinyin commit, candidate window, undo/redo, Escape and final-preedit Backspace cancellation')
+
+        if args.writing_modes:
+            for width,height,zoom_steps,label in [(900,620,0,'narrow'),(1200,800,2,'zoomed'),(1600,1000,0,'wide')]:
+                run('resize',width,height)
+                key(29,'cmd')
+                for _ in range(zoom_steps): key(24,'cmd+shift')
+                time.sleep(.4)
+                for term in ['Paragraph 10:', 'Paragraph 19:']:
+                    anchor = u16index(expected,term)
+                    select(anchor)
+                    type_pinyin(); preedit = snap(f'{label}-{term}-preedit')
+                    assert preedit['AXValue']==expected
+                    key(49)
+                    edited = insert(expected,anchor,'中文')
+                    assert snap(f'{label}-{term}-commit')['AXValue']==edited
+                    # A second genuine composition exposes the system candidate
+                    # at the caret after the committed edit has centered it.
+                    type_pinyin()
+                    candidate = capture(f'{label}-{term}-centered')
+                    window = next(w['kCGWindowBounds'] for w in candidate['windows'] if w['kCGWindowLayer']==0 and w['kCGWindowBounds']['Width']>=400)
+                    panels = [w['kCGWindowBounds'] for w in candidate['windows'] if w['kCGWindowLayer']==20]
+                    result.setdefault('window_scenarios',[]).append({
+                        'scene':label,'anchor':term,'requested_size':[width,height],
+                        'actual_size':[window['Width'],window['Height']],
+                        'zoom_shortcut_steps':zoom_steps,'candidate_bounds':panels})
+                    center_y = window['Y']+(window['Height']+60)/2
+                    assert panels and any(abs(b['Y']-center_y)<90 for b in panels), 'Candidate did not follow centered typing caret'
+                    key(53)
+                    assert snap(f'{label}-{term}-cancel')['AXValue']==edited
+                    undo(); assert snap(f'{label}-{term}-undo')['AXValue']==expected
+                    redo(); assert snap(f'{label}-{term}-redo')['AXValue']==edited
+                    expected = edited
+                before = snap(label+'-before-manual-scroll')
+                w = next(w['kCGWindowBounds'] for w in before['windows'] if w['kCGWindowLayer']==0 and w['kCGWindowBounds']['Width']>=400)
+                point=(w['X']+w['Width']*.6,w['Y']+w['Height']*.5)
+                run('scroll-at',*point,260)
+                scrolled = snap(label+'-manual-scroll')
+                assert scrolled['AXValue']==expected and scrolled['AXSelectedTextRange']==before['AXSelectedTextRange']
+                assert abs(scrolled['AXPosition']['y']-before['AXPosition']['y'])>40, 'Manual scroll did not move document'
+                time.sleep(.7)
+                stable = snap(label+'-manual-scroll-stable')
+                assert abs(stable['AXPosition']['y']-scrolled['AXPosition']['y'])<2, 'Typewriter mode stole manual scrolling'
+                capture(label+'-manual-scroll')
+                check(label+' focus/typewriter/spelling: middle/end Pinyin commit/cancel, centered candidate, isolated undo/redo and stable manual scrolling')
+            key(1,'cmd'); time.sleep(.4)
+            assert fixture.read_bytes()==b'\xef\xbb\xbf'+expected.encode()
+            run('source',original_input)
+            key(12,'cmd'); process.wait(timeout=10)
+            process = subprocess.Popen(command,env=env,stdout=(out/'reopen.log').open('w'),stderr=subprocess.STDOUT,start_new_session=True)
+            deadline=time.monotonic()+12
+            while True:
+                try:
+                    reopened=json.loads(run('activate')); break
+                except RuntimeError:
+                    if process.poll() is not None or time.monotonic()>=deadline: raise
+                    time.sleep(.2)
+            assert reopened['AXValue']==expected
+            assert fixture.read_bytes()==b'\xef\xbb\xbf'+expected.encode()
+            capture('writing-modes-reopened')
+            check('writing-mode Pinyin combinations save and reopen exact BOM/CRLF source')
+            key(12,'cmd'); process.wait(timeout=10)
+            result['passed']=True
+            return 0
 
         # Editing shortcuts must apply to the field editor, never the document.
         key(3, 'cmd'); assert snap('find-open')['focused_role'] == 'AXTextField'
@@ -419,6 +659,9 @@ def main():
                 process.wait(timeout=5)
             except Exception:
                 process.kill(); process.wait(timeout=5)
+        if process is None or process.poll() is not None:
+            shutil.rmtree(app)
+            if args.writing_modes: subprocess.run(['defaults','delete',info['CFBundleIdentifier']],capture_output=True,check=False)
         assert digest(production / 'Contents/MacOS/Yu') == build['app_sha256'], 'Production changed during tests'
     return 0
 
