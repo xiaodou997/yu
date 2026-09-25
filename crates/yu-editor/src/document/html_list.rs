@@ -2,6 +2,8 @@
 use super::*;
 use yu_markdown::html::{HtmlNodeKind, HtmlTag};
 
+mod selection;
+
 fn opening_without_id(source: &str, tag: &HtmlTag) -> String {
     let mut result = String::new();
     let mut cursor = tag.source.start().get() as usize;
@@ -107,11 +109,11 @@ fn compact_list_exits(source: &str, plans: &mut [(TextRange, String, usize)], ex
 
 pub(super) struct HtmlIndentGroup {
     range: TextRange,
+    merge_range: TextRange,
     text: String,
-    target: usize,
-    anchor_adjustment: i128,
-    origin: EditorSelection,
-    members: Vec<EditorSelection>,
+    members: Vec<(usize, EditorSelection)>,
+    // Each endpoint is relative to this replacement, not to the primary caret.
+    offsets: Vec<(usize, usize)>,
 }
 
 impl EditorDocument {
@@ -239,334 +241,34 @@ impl EditorDocument {
         &mut self,
         indent: bool,
     ) -> Result<Option<CommandResult>, EditorDocumentError> {
-        if self.presentation.selections.is_multiple() {
-            return self.change_multiple_html_lists(indent);
-        }
-        if !indent
-            && let Some((range, replacement, anchor, focus)) = self.root_html_list_outdent_plan()
-        {
-            let affinity = self.selection().affinity();
-            self.apply_html_list_plan(range, replacement, focus)?;
-            self.set_edit_selection(EditorSelection::range(
-                &self.snapshot(),
-                ByteOffset::new(range.start().get() + anchor as u64),
-                ByteOffset::new(range.start().get() + focus as u64),
-                affinity,
-            )?);
-            return Ok(Some(self.command_result(true)));
-        }
-        let plan = if indent {
-            self.html_list_indent_plan()
+        let groups = if self.presentation.selections.is_multiple() {
+            self.combined_html_list_groups(indent)
         } else {
-            self.html_list_outdent_plan(false)
+            self.single_html_list_group(indent).map(|group| vec![group])
         };
-        let Some((range, replacement, caret)) = plan else {
-            return Ok(None);
-        };
-        let previous = self.selection();
-        self.apply_html_list_plan(range, replacement, caret)?;
-        if !previous.is_empty() {
-            let focus = range.start().get() + caret as u64;
-            let anchor = (focus as i128 + previous.anchor().get() as i128
-                - previous.focus().get() as i128) as u64;
-            self.set_edit_selection(EditorSelection::range(
-                &self.snapshot(),
-                ByteOffset::new(anchor),
-                ByteOffset::new(focus),
-                previous.affinity(),
-            )?);
+        match groups {
+            Some(groups) => self.apply_html_indent_groups(groups).map(Some),
+            // A recognized but unsupported HTML selection must not fall through
+            // to a partial primary-only Markdown edit.
+            None if self.has_html_list_selection() => Ok(Some(self.command_result(false))),
+            None => Ok(None),
         }
-        Ok(Some(self.command_result(true)))
     }
 
     pub(super) fn multiple_html_indent_plan(&self) -> Option<Vec<HtmlIndentGroup>> {
-        if !self.presentation.selections.is_multiple() {
-            return None;
-        }
-        let mut groups: Vec<HtmlIndentGroup> = Vec::new();
-        for selection in self.presentation.selections.as_slice() {
-            let (range, text, target) = self
-                .html_list_indent_for(*selection)
-                .unwrap_or_else(|| (TextRange::empty(selection.focus()), String::new(), 0));
-            if let Some(previous) = groups.last_mut()
-                && range.start() < previous.range.end()
-            {
-                let start = previous
-                    .origin
-                    .ordered_range()
-                    .start()
-                    .min(selection.ordered_range().start());
-                let end = previous
-                    .origin
-                    .ordered_range()
-                    .end()
-                    .max(selection.ordered_range().end());
-                let origin = EditorSelection::range(
-                    &self.snapshot(),
-                    start,
-                    end,
-                    crate::CaretAffinity::Downstream,
-                )
-                .ok()?;
-                let (range, text, target) = self.html_list_indent_for(origin)?;
-                previous.range = range;
-                previous.text = text;
-                previous.target = target;
-                previous.origin = origin;
-                previous.members.push(*selection);
-            } else {
-                groups.push(HtmlIndentGroup {
-                    range,
-                    text,
-                    target,
-                    anchor_adjustment: 0,
-                    origin: *selection,
-                    members: vec![*selection],
-                });
-            }
-        }
-        groups
-            .iter()
-            .any(|group| !group.text.is_empty())
-            .then_some(groups)
-    }
-
-    fn html_selection_inside_one_item(&self, selection: EditorSelection) -> bool {
-        if selection.is_empty() {
-            return true;
-        }
-        let Some(block) = self
-            .block_index_for_offset(selection.focus())
-            .and_then(|i| self.markdown.blocks().get(i))
-        else {
-            return false;
-        };
-        let index = self.markdown.html_regions();
-        let Some(model) = index
-            .region_for(block.range())
-            .and_then(|r| r.model.as_ref().ok())
-        else {
-            return false;
-        };
-        let item_at = |at: ByteOffset| {
-            model
-                .fragment
-                .nodes
-                .iter()
-                .filter(|node| {
-                    element_tags(node).is_some_and(|(open, close)| {
-                        open.name == "li" && open.source.end() <= at && at <= close.source.start()
-                    })
-                })
-                .min_by_key(|node| node.source.len())
-                .map(|node| node.source)
-        };
-        let anchor = item_at(selection.anchor());
-        anchor.is_some() && anchor == item_at(selection.focus())
-    }
-
-    fn html_list_ranges_touch(&self, left: EditorSelection, right: EditorSelection) -> bool {
-        let Some(block) = self
-            .block_index_for_offset(left.focus())
-            .and_then(|i| self.markdown.blocks().get(i))
-        else {
-            return false;
-        };
-        let index = self.markdown.html_regions();
-        let Some(model) = index
-            .region_for(block.range())
-            .and_then(|r| r.model.as_ref().ok())
-        else {
-            return false;
-        };
-        let nodes = &model.fragment.nodes;
-        let item_at = |at: ByteOffset| {
-            nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, node)| {
-                    element_tags(node).is_some_and(|(open, close)| {
-                        open.name == "li" && open.source.end() <= at && at <= close.source.start()
-                    })
-                })
-                .min_by_key(|(_, node)| node.source.len())
-        };
-        let Some((a, first)) = item_at(left.ordered_range().end()) else {
-            return false;
-        };
-        let Some((b, last)) = item_at(right.ordered_range().start()) else {
-            return false;
-        };
-        if first.parent != last.parent {
-            return false;
-        }
-        let Some(parent) = first.parent else {
-            return false;
-        };
-        let siblings: Vec<_> = nodes[parent]
-            .children
-            .iter()
-            .copied()
-            .filter(|id| element_tags(&nodes[*id]).is_some_and(|(tag, _)| tag.name == "li"))
-            .collect();
-        let Some(a) = siblings.iter().position(|id| *id == a) else {
-            return false;
-        };
-        let Some(b) = siblings.iter().position(|id| *id == b) else {
-            return false;
-        };
-        b <= a + 1
+        self.presentation
+            .selections
+            .is_multiple()
+            .then(|| self.combined_html_list_groups(true))
+            .flatten()
     }
 
     pub(super) fn multiple_html_outdent_plan(&self) -> Option<Vec<HtmlIndentGroup>> {
-        if !self.presentation.selections.is_multiple() {
-            return None;
-        }
-        let snapshot = self.snapshot();
-        let mut groups: Vec<HtmlIndentGroup> = Vec::new();
-        for selection in self.presentation.selections.as_slice() {
-            let same_item = self.html_selection_inside_one_item(*selection);
-            let (range, text, target, anchor_adjustment) = if same_item {
-                let (range, text, target) = self
-                    .html_list_outdent_at(selection.focus(), false)
-                    .map(|plan| trim_list_plan(snapshot.as_str(), plan))
-                    .unwrap_or_else(|| (TextRange::empty(selection.focus()), String::new(), 0));
-                (range, text, target, 0)
-            } else if let Some((range, text, anchor, focus)) =
-                self.root_html_list_outdent_for(*selection)
-            {
-                // Root item wrappers can change length between the two endpoints.
-                let adjustment = anchor as i128
-                    - focus as i128
-                    - (i128::from(selection.anchor().get()) - i128::from(selection.focus().get()));
-                (range, text, focus, adjustment)
-            } else if let Some((range, text, focus)) =
-                self.selected_html_list_outdent_for(*selection)
-            {
-                (range, text, focus, 0)
-            } else {
-                (TextRange::empty(selection.focus()), String::new(), 0, 0)
-            };
-            if let Some(previous) = groups.last_mut()
-                && range.start() < previous.range.end()
-            {
-                if same_item
-                    && self.html_selection_inside_one_item(previous.origin)
-                    && range == previous.range
-                    && text == previous.text
-                {
-                    previous.members.push(*selection);
-                } else {
-                    if !self.html_list_ranges_touch(previous.origin, *selection) {
-                        return None;
-                    }
-                    let origin = EditorSelection::range(
-                        &snapshot,
-                        previous
-                            .origin
-                            .ordered_range()
-                            .start()
-                            .min(selection.ordered_range().start()),
-                        previous
-                            .origin
-                            .ordered_range()
-                            .end()
-                            .max(selection.ordered_range().end()),
-                        crate::CaretAffinity::Downstream,
-                    )
-                    .ok()?;
-                    // Nested promotion moves all selected sibling bodies unchanged.
-                    // Do not include unselected siblings between separate ranges.
-                    let (range, text, target) = self.selected_html_list_outdent_for(origin)?;
-                    previous.range = range;
-                    previous.text = text;
-                    previous.target = target;
-                    previous.anchor_adjustment = 0;
-                    previous.origin = origin;
-                    previous.members.push(*selection);
-                }
-            } else {
-                groups.push(HtmlIndentGroup {
-                    range,
-                    text,
-                    target,
-                    anchor_adjustment,
-                    origin: *selection,
-                    members: vec![*selection],
-                });
-            }
-        }
-        if groups.iter().all(|g| g.text.is_empty()) {
-            return None;
-        }
-        let exits: Vec<_> = groups.iter().map(|g| !g.text.is_empty()).collect();
-        let mut plans: Vec<_> = groups
-            .iter_mut()
-            .map(|g| (g.range, std::mem::take(&mut g.text), g.target))
-            .collect();
-        compact_list_exits(snapshot.as_str(), &mut plans, &exits);
-        for (group, (range, text, target)) in groups.iter_mut().zip(plans) {
-            group.range = range;
-            group.text = text;
-            group.target = target;
-        }
-        Some(groups)
-    }
-
-    fn change_multiple_html_lists(
-        &mut self,
-        indent: bool,
-    ) -> Result<Option<CommandResult>, EditorDocumentError> {
-        let planned = if indent {
-            self.multiple_html_indent_plan()
-        } else {
-            self.multiple_html_outdent_plan()
-        };
-        let Some(groups) = planned else {
-            return Ok(None);
-        };
-        let primary = self.presentation.selections.primary_index();
-        let mut delta = 0_i128;
-        let mut endpoints = Vec::new();
-        for group in &groups {
-            let target = i128::from(group.range.start().get()) + delta + group.target as i128;
-            let shift = target - i128::from(group.origin.focus().get());
-            for member in &group.members {
-                endpoints.push((
-                    (i128::from(member.anchor().get()) + shift + group.anchor_adjustment) as u64,
-                    (i128::from(member.focus().get()) + shift) as u64,
-                    member.affinity(),
-                ));
-            }
-            delta += group.text.len() as i128 - i128::from(group.range.len());
-        }
-        let transaction = Transaction::new(
-            self.revision(),
-            groups
-                .into_iter()
-                .filter(|group| !group.text.is_empty())
-                .map(|group| yu_text::Edit::new(group.range, group.text)),
-        );
-        self.state.history.break_group();
-        self.apply_transaction_with_group(&transaction, HistoryGroup::ListEditing)?;
-        let snapshot = self.snapshot();
-        let selections = endpoints
-            .into_iter()
-            .map(|(anchor, focus, affinity)| {
-                EditorSelection::range(
-                    &snapshot,
-                    ByteOffset::new(anchor),
-                    ByteOffset::new(focus),
-                    affinity,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.presentation.selections = Selections::new(&snapshot, selections, primary)?;
-        self.state
-            .history
-            .finish_selection(self.presentation.selections.clone());
-        self.state.history.break_group();
-        Ok(Some(self.command_result(true)))
+        self.presentation
+            .selections
+            .is_multiple()
+            .then(|| self.combined_html_list_groups(false))
+            .flatten()
     }
 
     pub(super) fn html_list_indent_plan(&self) -> Option<(TextRange, String, usize)> {
@@ -581,31 +283,12 @@ impl EditorDocument {
         selection: EditorSelection,
     ) -> Option<(TextRange, String, usize)> {
         let caret = selection.focus();
-        let block = self
-            .block_index_for_offset(caret)
-            .and_then(|i| self.markdown.blocks().get(i))?;
-        self.html_table_grid(block)?;
-        let index = self.markdown.html_regions();
-        let model = index.region_for(block.range())?.model.as_ref().ok()?;
-        let nodes = &model.fragment.nodes;
-        let selected = selection.ordered_range();
-        let containing_item = |at: ByteOffset| {
-            nodes
-                .iter()
-                .enumerate()
-                .filter(move |(_, node)| {
-                    element_tags(node).is_some_and(|(open, close)| {
-                        open.name == "li" && open.source.end() <= at && at <= close.source.start()
-                    })
-                })
-                .min_by_key(|(_, node)| node.source.len())
-        };
-        let (id, item) = containing_item(selected.start())?;
-        let (_, last) = containing_item(selected.end())?;
-        if item.parent != last.parent {
-            return None;
-        }
-        let list = &nodes[item.parent?];
+        let span = self.list_selection_span(selection)?;
+        let nodes = &span.model.fragment.nodes;
+        let id = span.first;
+        let item = &nodes[id];
+        let last = &nodes[span.last];
+        let list = &nodes[span.list];
         let (list_open, _) = element_tags(list)?;
         let previous_id = list
             .children
@@ -814,40 +497,32 @@ impl EditorDocument {
         &self,
         selection: EditorSelection,
     ) -> Option<(TextRange, String, usize, usize)> {
+        let (range, text, points) = self.root_html_list_outdent_with_points(
+            selection,
+            &[selection.anchor(), selection.focus()],
+        )?;
+        Some((range, text, points[0], points[1]))
+    }
+
+    fn root_html_list_outdent_with_points(
+        &self,
+        selection: EditorSelection,
+        points: &[ByteOffset],
+    ) -> Option<(TextRange, String, Vec<usize>)> {
         if selection.is_empty() {
             return None;
         }
-        let selected = selection.ordered_range();
-        let block = self
-            .block_index_for_offset(selected.start())
-            .and_then(|i| self.markdown.blocks().get(i))?;
-        self.html_table_grid(block)?;
-        let index = self.markdown.html_regions();
-        let model = index.region_for(block.range())?.model.as_ref().ok()?;
+        let span = self.list_selection_span(selection)?;
+        let model = span.model;
         let nodes = &model.fragment.nodes;
-        let containing = |at: ByteOffset| {
-            nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, n)| {
-                    element_tags(n).is_some_and(|(o, c)| {
-                        o.name == "li" && o.source.end() <= at && at <= c.source.start()
-                    })
-                })
-                .min_by_key(|(_, n)| n.source.len())
-        };
-        let (first_id, first) = containing(selected.start())?;
-        let (last_id, last) = containing(selected.end())?;
-        if first.parent != last.parent {
-            return None;
-        }
-        let list_id = first.parent?;
+        let first_id = span.first;
+        let last_id = span.last;
+        let first = &nodes[first_id];
+        let last = &nodes[last_id];
+        let list_id = span.list;
         let list = &nodes[list_id];
         let (open, close) = element_tags(list)?;
-        if !matches!(open.name.as_str(), "ul" | "ol") {
-            return None;
-        }
-        // Nested lists use the structural promotion path instead.
+        // A list behind a disclosure boundary is not a root list either.
         let mut ancestor = list.parent;
         while let Some(id) = ancestor {
             if element_tags(&nodes[id]).is_some_and(|(tag, _)| tag.name == "li") {
@@ -873,8 +548,7 @@ impl EditorDocument {
         if a > 0 {
             output.push_str(slice(close.source.start(), close.source.end()));
         }
-        let mut mapped_start = 0;
-        let mut mapped_end = 0;
+        let mut mapped = vec![None; points.len()];
         let mut previous = first.source.start();
         for id in &siblings[a..=b] {
             let item = &nodes[*id];
@@ -901,13 +575,11 @@ impl EditorDocument {
             let mut opening = slice(tag.source.start(), tag.source.end()).to_owned();
             opening.replace_range(1..3, wrapper);
             output.push_str(&opening);
-            if *id == first_id {
-                mapped_start =
-                    output.len() + (selected.start().get() - tag.source.end().get()) as usize;
-            }
-            if *id == last_id {
-                mapped_end =
-                    output.len() + (selected.end().get() - tag.source.end().get()) as usize;
+            for (index, point) in points.iter().enumerate() {
+                if tag.source.end() <= *point && *point <= end.source.start() {
+                    mapped[index] =
+                        Some(output.len() + (point.get() - tag.source.end().get()) as usize);
+                }
             }
             output.push_str(slice(tag.source.end(), end.source.start()));
             output.push_str(&format!("</{wrapper}>"));
@@ -927,12 +599,11 @@ impl EditorDocument {
         if b + 1 < siblings.len() {
             output.push_str(slice(close.source.start(), close.source.end()));
         }
-        let (anchor, focus) = if selection.anchor() <= selection.focus() {
-            (mapped_start, mapped_end)
-        } else {
-            (mapped_end, mapped_start)
-        };
-        Some((list.source, output, anchor, focus))
+        Some((
+            list.source,
+            output,
+            mapped.into_iter().collect::<Option<Vec<_>>>()?,
+        ))
     }
 
     fn selected_html_list_outdent_plan(&self) -> Option<(TextRange, String, usize)> {
@@ -943,31 +614,14 @@ impl EditorDocument {
         &self,
         selection: EditorSelection,
     ) -> Option<(TextRange, String, usize)> {
-        let selected = selection.ordered_range();
-        let block = self
-            .block_index_for_offset(selected.start())
-            .and_then(|i| self.markdown.blocks().get(i))?;
-        self.html_table_grid(block)?;
-        let index = self.markdown.html_regions();
-        let model = index.region_for(block.range())?.model.as_ref().ok()?;
+        let span = self.list_selection_span(selection)?;
+        let model = span.model;
         let nodes = &model.fragment.nodes;
-        let containing = |at: ByteOffset| {
-            nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, node)| {
-                    element_tags(node).is_some_and(|(open, close)| {
-                        open.name == "li" && open.source.end() <= at && at <= close.source.start()
-                    })
-                })
-                .min_by_key(|(_, node)| node.source.len())
-        };
-        let (first_id, first) = containing(selected.start())?;
-        let (last_id, last) = containing(selected.end())?;
-        if first.parent != last.parent {
-            return None;
-        }
-        let list_id = first.parent?;
+        let first_id = span.first;
+        let last_id = span.last;
+        let first = &nodes[first_id];
+        let last = &nodes[last_id];
+        let list_id = span.list;
         let list = &nodes[list_id];
         let (open, close) = element_tags(list)?;
         let (parent_id, wrappers) = list_parent_through_divs(nodes, list_id)?;
@@ -1048,12 +702,20 @@ impl EditorDocument {
         caret: ByteOffset,
         require_empty: bool,
     ) -> Option<(TextRange, String, usize)> {
-        let block = self
-            .block_index_for_offset(caret)
-            .and_then(|i| self.markdown.blocks().get(i))?;
-        self.html_table_grid(block)?;
-        let index = self.markdown.html_regions();
-        let model = index.region_for(block.range())?.model.as_ref().ok()?;
+        let model = if require_empty {
+            let block = self
+                .block_index_for_offset(caret)
+                .and_then(|i| self.markdown.blocks().get(i))?;
+            self.html_table_grid(block)?;
+            self.markdown
+                .html_regions()
+                .region_for(block.range())?
+                .model
+                .as_ref()
+                .ok()?
+        } else {
+            self.native_list_model(caret)?
+        };
         let nodes = &model.fragment.nodes;
         let (item_id, item) = nodes
             .iter()
@@ -1189,7 +851,12 @@ impl EditorDocument {
         let mut replacement = left;
         // Transfer the item's attributes to its replacement paragraph/container.
         let wrapper = if block_body { "div" } else { "p" };
-        let wrap = !block_body || !item_open.attributes.is_empty();
+        let in_table = nodes.iter().any(|node| {
+            element_tags(node).is_some_and(|(open, _)| open.name == "table")
+                && node.source.start() <= caret
+                && caret <= node.source.end()
+        });
+        let wrap = !block_body || !item_open.attributes.is_empty() || !in_table;
         if wrap {
             let mut opening = slice(item_open.source.start(), item_open.source.end()).to_owned();
             opening.replace_range(1..3, wrapper);

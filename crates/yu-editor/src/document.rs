@@ -692,6 +692,9 @@ impl EditorDocument {
             | EditorCommand::ExtendHorizontal { .. }
             | EditorCommand::MoveDocumentBoundary { .. } => true,
             EditorCommand::IndentList => {
+                if self.has_html_list_selection() {
+                    return self.html_list_command_available(true);
+                }
                 self.multiple_html_indent_plan().is_some()
                     || self.html_list_indent_plan().is_some()
                     || self
@@ -699,6 +702,9 @@ impl EditorDocument {
                         .is_some_and(|line| self.list_prefix(&line).is_some())
             }
             EditorCommand::OutdentList => {
+                if self.has_html_list_selection() {
+                    return self.html_list_command_available(false);
+                }
                 self.multiple_html_outdent_plan().is_some()
                     || self.root_html_list_outdent_plan().is_some()
                     || self.html_list_outdent_plan(false).is_some()
