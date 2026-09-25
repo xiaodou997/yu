@@ -301,8 +301,11 @@ impl EditorDocument {
             return Err(invalid());
         }
         let document = self.markdown.source().as_str();
-        let converted =
-            yu_export::export_table_html(document, original_range.clone()).ok_or_else(invalid)?;
+        // Reconcile each cell's formula leaves with the canonical parser before
+        // accepting any conversion. TeX escapes must not be normalized away.
+        let converted = yu_export::export_table_html(document, original_range.clone())
+            .and_then(|html| self.markdown.preserve_table_math_source(&html, &target))
+            .ok_or_else(invalid)?;
         let parsed = yu_markdown::parse(&TextBuffer::new(&converted).snapshot());
         let index = parsed.html_regions();
         let model = index
@@ -457,12 +460,20 @@ impl EditorDocument {
     }
 
     pub(super) fn html_table_decorations(&self, block: Block) -> Option<BlockDecorations> {
+        self.html_table_decorations_active(block, Some(self.selection().ordered_range()))
+    }
+
+    fn html_table_decorations_active(
+        &self,
+        block: Block,
+        active: Option<TextRange>,
+    ) -> Option<BlockDecorations> {
         let index = self.markdown.html_regions();
         let model = index.region_for(block.range())?.model.as_ref().ok()?;
         let part = index.partition_for(block.range())?;
         let mut output = yu_markdown::ExtensionOutput::default();
         model
-            .decorate_table(self.markdown.source().as_str(), part, &mut output)
+            .decorate_table_active(self.markdown.source().as_str(), part, active, &mut output)
             .then(|| BlockDecorations::from_output(self.markdown.source(), block.range(), output))
     }
 
@@ -721,7 +732,7 @@ impl EditorDocument {
         else {
             return Ok(None);
         };
-        let Some(decorations) = self.html_table_decorations(block) else {
+        let Some(decorations) = self.html_table_decorations_active(block, Some(range)) else {
             return Ok(None);
         };
         let content = TextRange::new(
@@ -731,33 +742,37 @@ impl EditorDocument {
         .expect("ordered HTML cell range");
         let visual = VisualText::new(self.markdown.source(), content, decorations.set().clone())?;
         let position = visual.source_to_visual(from, Bias::After)?.get() as usize;
-        // Images occupy geometry but no visual text bytes. Treat an adjacent
-        // image as one editing unit before asking Unicode for a text grapheme.
-        let mut adjacent_images =
+        // Images and inactive formulas occupy geometry but no visual text bytes.
+        // Active formulas were revealed above and use normal grapheme deletion.
+        let mut adjacent_objects =
             yu_markdown::image_spans(self.markdown(), self.markdown.source(), Some(content))
                 .into_iter()
                 .map(|image| image.source())
-                .filter(|image| image.start() >= content.start() && image.end() <= content.end())
-                .filter(|image| {
+                .chain(decorations.widgets().iter().filter_map(|widget| match widget {
+                    yu_markdown::BlockWidget::Embedded(span) => Some(span.source),
+                    _ => None,
+                }))
+                .filter(|object| object.start() >= content.start() && object.end() <= content.end())
+                .filter(|object| {
                     if forward {
-                        from < image.end()
+                        from < object.end()
                     } else {
-                        from > image.start()
+                        from > object.start()
                     }
                 })
-                .filter(|image| {
+                .filter(|object| {
                     visual
-                        .source_to_visual(image.start(), Bias::After)
+                        .source_to_visual(object.start(), Bias::After)
                         .is_ok_and(|at| at.get() as usize == position)
                 })
                 .collect::<Vec<_>>();
-        adjacent_images.sort_by_key(|image| image.start());
-        if let Some(image) = if forward {
-            adjacent_images.first()
+        adjacent_objects.sort_by_key(|object| object.start());
+        if let Some(object) = if forward {
+            adjacent_objects.first()
         } else {
-            adjacent_images.last()
+            adjacent_objects.last()
         } {
-            return Ok(Some(*image));
+            return Ok(Some(*object));
         }
         let mut graphemes = visual.text().grapheme_indices(true);
         let cluster = if forward {
@@ -768,13 +783,29 @@ impl EditorDocument {
         let Some((start, text)) = cluster else {
             return Ok(Some(TextRange::empty(from)));
         };
-        let coverage = visual.source_coverage(
+        let mut coverage = visual.source_coverage(
             yu_core::VisualRange::new(
                 yu_core::VisualOffset::new(start as u64),
                 yu_core::VisualOffset::new((start + text.len()) as u64),
             )
             .expect("ordered HTML grapheme"),
         )?;
+        // A collapsed tag can share a visual boundary with the first/last
+        // TeX grapheme. Body editing must not delete the formula's identity.
+        if let Some(span) = self.markdown.html_regions()
+            .region_for(block.range())
+            .and_then(|region| region.model.as_ref().ok())
+            .and_then(|model| model.inline_math_spans().into_iter().find(|span| {
+                span.content.start() <= from && from <= span.content.end()
+                    && if forward { from < span.content.end() } else { from > span.content.start() }
+            }))
+            && let Some(body) = TextRange::new(
+                coverage.start().max(span.content.start()),
+                coverage.end().min(span.content.end()),
+            )
+        {
+            coverage = body;
+        }
         if text == "\n"
             && let Some(join) = self.html_paragraph_join(coverage)
         {
@@ -987,15 +1018,31 @@ impl EditorDocument {
         let index = self.markdown.html_regions();
         let model = index.region_for(block.range())?.model.as_ref().ok()?;
         let source = self.markdown.source().as_str();
+        let whole_math: Vec<_> = model
+            .inline_math_spans()
+            .into_iter()
+            .map(|span| span.source)
+            .filter(|span| range.start() <= span.start() && span.end() <= range.end())
+            .collect();
         let mut removed = model
             .fragment
             .nodes
             .iter()
             .filter_map(|node| {
+                // Remove a selected formula including its identity tags once.
+                // Body-only edits retain those tags, even for an empty body.
+                if whole_math.iter().any(|span| {
+                    *span != node.source
+                        && span.start() <= node.source.start()
+                        && node.source.end() <= span.end()
+                }) {
+                    return None;
+                }
                 let removable = match &node.kind {
                     HtmlNodeKind::Text => true,
                     HtmlNodeKind::Element { opening, .. } => {
-                        opening.name == "br"
+                        whole_math.contains(&node.source)
+                            || opening.name == "br"
                             || (opening.name == "img"
                                 && node.source.start() >= range.start()
                                 && node.source.end() <= range.end())

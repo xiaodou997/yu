@@ -435,7 +435,7 @@ impl HtmlIndex {
         }
         let mut out = crate::ExtensionOutput::default();
         if part.content.kind == super::HtmlFlowKind::Table {
-            return Some(if model.decorate_table(snapshot.as_str(), part, &mut out) {
+            return Some(if model.decorate_table_active(snapshot.as_str(), part, active, &mut out) {
                 crate::BlockDecorations::from_output(snapshot, part.source, out)
             } else {
                 crate::BlockDecorations::source(snapshot, block)

@@ -1,4 +1,4 @@
-//! Rejected structured pastes must preserve a live undo/redo branch, not just text.
+//! Structured pastes must preserve complete history and selections.
 //! The same fixtures are prepared for native checks by tools/prepare-group4-paste-checks.py.
 use yu_core::ByteOffset;
 use yu_editor::{
@@ -281,8 +281,72 @@ fn cross_head_body_span_rejection_preserves_history_and_complete_selections() {
 }
 
 #[test]
-fn math_promotion_rejection_preserves_history_and_complete_selections() {
-    rejection_matrix(MATH);
+fn math_promotion_preserves_content_history_and_complete_selections() {
+    for source in source_variants(MATH) {
+        for kind in SelectionKind::ALL {
+            let (mut document, frames) = seeded_history(&source);
+            select_target(&mut document, kind);
+            let command = EditorCommand::PasteHtmlTableSource(PAYLOAD.into());
+            if matches!(kind, SelectionKind::Multiple) {
+                // Formula support does not turn arbitrary multicaret input
+                // into an implicitly inferred table rectangle.
+                assert_rejected(&mut document, &command);
+                replay_history(&mut document, &frames);
+                continue;
+            }
+            let before = Frame::capture(&document);
+            let revision = document.revision();
+            let history = document.history_stats();
+            for _ in 0..3 {
+                assert!(document.command_available(&command));
+                assert_eq!(document.revision(), revision);
+                assert_eq!(document.history_stats(), history);
+                assert_eq!(document.selections(), &before.selections);
+                assert_eq!(document.snapshot().as_str(), before.source);
+            }
+            assert!(document.execute(command).expect("inline math promotion").changed());
+            let after = Frame::capture(&document);
+            assert_eq!(document.table_target_is_html(), Some(true));
+            assert!(after.source.contains("colspan='2' rowspan='2'>传入中文🙂</td>"));
+            let spans: Vec<_> = document.markdown().html_regions().regions.iter()
+                .filter_map(|region| region.model.as_ref().ok())
+                .flat_map(|model| model.inline_math_spans())
+                .collect();
+            assert_eq!(spans.len(), 1, "unselected math cell retains its identity");
+            assert_eq!(document.markdown().embedded_source(spans[0]).as_deref(), Some("x^2"));
+            let table_start = before.source.find("| H |").expect("table start");
+            let table_end = before.source.find("| end |").expect("table end") + "| end |".len();
+            assert!(after.source.starts_with(&before.source[..table_start]));
+            assert!(after.source.ends_with(&before.source[table_end..]));
+            history_depth(&document, 2, 0); // Only success discards the old redo branch.
+            assert!(document.undo().expect("one undo of conversion plus paste").changed());
+            before.assert_replayed(&document);
+            history_depth(&document, 1, 1);
+            assert!(document.redo().expect("redo conversion plus paste").changed());
+            after.assert_replayed(&document);
+            history_depth(&document, 2, 0);
+            assert!(document.undo().expect("undo conversion again").changed());
+            before.assert_replayed(&document);
+            assert!(document.undo().expect("undo earlier typing").changed());
+            frames[0].assert_replayed(&document);
+            history_depth(&document, 0, 2);
+            document.redo().expect("redo earlier typing");
+            assert_eq!(document.snapshot().as_str(), frames[1].source);
+            document.redo().expect("redo conversion again");
+            after.assert_replayed(&document);
+        }
+    }
+}
+
+#[test]
+fn unsupported_math_promotion_preserves_history_and_complete_selections() {
+    for unsupported in [
+        "<span data-math-style='display'>x^2</span>",
+        "<span data-math-style='inline'><em>x</em></span>",
+        "<span data-math-style='inline' data-math-style='inline'>x</span>",
+    ] {
+        rejection_matrix(&MATH.replace("$x^2$", unsupported));
+    }
 }
 
 #[test]

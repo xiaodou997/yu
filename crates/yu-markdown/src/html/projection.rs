@@ -6,6 +6,49 @@ use crate::extension::{ExtensionOutput, entity, reveals};
 use yu_core::{ByteOffset, TextAttrs, TextRange, TextRole, TextScript, TextStyle};
 
 impl HtmlBlockModel {
+    /// Only resolved, text-only math leaves can become native resources.
+    /// Both ranges address canonical HTML bytes, never a decoded buffer.
+    pub fn inline_math_span(&self, id: usize) -> Option<crate::EmbeddedSpan> {
+        if !self.resolution.elements.get(id)?.as_ref()?.attributes.inline_math {
+            return None;
+        }
+        let node = self.fragment.nodes.get(id)?;
+        let HtmlNodeKind::Element {
+            opening,
+            closing: Some(closing),
+        } = &node.kind else {
+            return None;
+        };
+        Some(crate::EmbeddedSpan {
+            source: node.source,
+            content: TextRange::new(opening.source.end(), closing.source.start())?,
+            kind: crate::EmbeddedKind::Math,
+            display: false,
+        })
+    }
+
+    pub fn inline_math_spans(&self) -> Vec<crate::EmbeddedSpan> {
+        (0..self.fragment.nodes.len())
+            .filter_map(|id| self.inline_math_span(id))
+            .collect()
+    }
+
+    /// Presentation and cell editing must expose the same active TeX bytes.
+    /// The canonical decorator remains useful for resource discovery/navigation.
+    pub fn decorate_table_active(
+        &self,
+        source: &str,
+        part: &HtmlFlowPartition,
+        active: Option<TextRange>,
+        out: &mut ExtensionOutput,
+    ) -> bool {
+        if !self.decorate_table(source, part, out) {
+            return false;
+        }
+        out.reveal_html_math(source, &self.inline_math_spans(), active);
+        true
+    }
+
     /// Produce decorations for one model-owned paragraph. Tables and raw leaves
     /// need their own layout; active paragraphs expose their original markup.
     /// The caller supplies the canonical document, never a reserialized DOM.
@@ -88,6 +131,13 @@ impl HtmlBlockModel {
                     // consumes them, preserve the complete element as source.
                     if resolved.is_none_or(|element| matches!(element.kind, Kind::Image)) {
                         text.visible(out);
+                        opaque_end = node.source.end();
+                        continue;
+                    }
+                    if let Some(span) = self.inline_math_span(id) {
+                        text.visible(out);
+                        let widget = out.widget(crate::BlockWidget::Embedded(span));
+                        out.place_widget(span.source, widget, yu_core::WidgetSide::Before);
                         opaque_end = node.source.end();
                         continue;
                     }

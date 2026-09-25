@@ -49,3 +49,86 @@ impl Extension for Math {
         }
     }
 }
+
+impl ExtensionOutput {
+    /// Reveal the editable TeX body of active HTML formulas, not the table or
+    /// their identity tags. Entity substitutions retain canonical byte ranges.
+    /// Inactive formulas keep their ordinary EmbeddedSpan resource/geometry path.
+    pub(crate) fn reveal_html_math(
+        &mut self,
+        source: &str,
+        owned: &[EmbeddedSpan],
+        active: Option<TextRange>,
+    ) {
+        use yu_core::{ByteOffset, TextAttrs, TextStyle, WidgetId};
+        use yu_decoration::Decoration;
+
+        let revealed: Vec<_> = self
+            .widgets
+            .iter()
+            .filter_map(|widget| match widget {
+                BlockWidget::Embedded(span)
+                    if owned.contains(span) && super::reveals(active, span.source) =>
+                {
+                    Some(*span)
+                }
+                _ => None,
+            })
+            .collect();
+        if revealed.is_empty() {
+            return;
+        }
+        let mut remap = Vec::with_capacity(self.widgets.len());
+        let mut retained = Vec::new();
+        for widget in &self.widgets {
+            if matches!(widget, BlockWidget::Embedded(span) if revealed.contains(span)) {
+                remap.push(None);
+            } else {
+                remap.push(Some(WidgetId(retained.len() as u32)));
+                retained.push(*widget);
+            }
+        }
+        self.ranges.retain_mut(|entry| {
+            if let Decoration::Widget { widget, side } = entry.decoration {
+                let Some(Some(mapped)) = remap.get(widget.0 as usize) else {
+                    return false;
+                };
+                entry.decoration = Decoration::Widget {
+                    widget: *mapped,
+                    side,
+                };
+            }
+            true
+        });
+        self.widgets = retained;
+        let style = self.style(TextAttrs::new(TextStyle::Code));
+        for span in revealed {
+            self.replace(TextRange::new(span.source.start(), span.content.start()).expect("math opening"));
+            self.replace(TextRange::new(span.content.end(), span.source.end()).expect("math closing"));
+            self.mark(span.content, style);
+            let mut cursor = span.content.start().get() as usize;
+            let end = span.content.end().get() as usize;
+            while cursor < end {
+                let Some(tail) = source.get(cursor..end) else {
+                    break;
+                };
+                if tail.starts_with('&')
+                    && let Some(stop) = tail.as_bytes().iter().take(34).position(|&byte| byte == b';')
+                    && let Some(decoded) = super::entity::decode(&tail[..=stop])
+                {
+                    self.substitute_text(
+                        TextRange::new(
+                            ByteOffset::new(cursor as u64),
+                            ByteOffset::new((cursor + stop + 1) as u64),
+                        )
+                        .expect("HTML entity"),
+                        decoded,
+                    );
+                    cursor += stop + 1;
+                } else {
+                    cursor += tail.chars().next().expect("nonempty TeX").len_utf8();
+                }
+            }
+        }
+    }
+}
