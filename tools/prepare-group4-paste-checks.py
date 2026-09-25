@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "crates/yu-editor/tests/fixtures/group4-paste"
 HISTORY_A = " HISTORY-A-中文🙂"
 HISTORY_B = " HISTORY-B-中文🙂"
-NAMES = ("cross-groups", "math-target", "footnote-target", "merged-payload")
+NAMES = ("cross-groups", "math-target", "footnote-target", "merged-payload", "math-mixed-target")
 
 
 def digest(data: bytes) -> str:
@@ -32,14 +32,19 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
     for name, value in text.items():
         if "\r" in value or value.startswith("\ufeff"):
             raise ValueError(f"Canonical fixture must have no BOM or bare CR: {name}")
-    cases = [(name, text[name], "reject") for name in NAMES[:3]]
-    cases.extend([
+    cases = [
+        ("cross-groups", text["cross-groups"], "reject"),
+        ("math-target", text["math-target"], "accept"),
+        ("footnote-target", text["footnote-target"], "reject"),
         ("cross-head-body", text["cross-groups"].replace("<tbody>", "<thead>", 1)
          .replace("</tbody>", "</thead>", 1), "reject"),
         ("same-group-control", text["cross-groups"].replace("</tbody><tbody>", "", 1), "accept"),
         ("math-control", text["math-target"].replace("$x^2$", "**保留中文🙂**", 1), "accept"),
         ("footnote-control", text["footnote-target"].replace("[^note]", "**保留中文🙂**", 1), "accept"),
-    ])
+        ("math-mixed-target", text["math-mixed-target"], "accept"),
+        ("math-invalid-target", text["math-target"].replace(
+            "$x^2$", "<span data-math-style='inline'><em>x</em></span>", 1), "reject"),
+    ]
     for _, source, _ in cases:
         for label in ("目标中文🙂", "矩形终点🙂"):
             if source.count(label) != 1:
@@ -52,13 +57,14 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
         "<table><tr><td colspan='2'>传入中文🙂</td></tr></table>\n".encode("utf-8")
     )
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "native_test_status": "not_run",
         "visual_review_required": True,
         "fixture_sha256": {name: digest(data) for name, data in raw.items()},
         "history_a": HISTORY_A,
         "history_b": HISTORY_B,
         "selection_offset_unit": "UTF-16 code units in canonical source, excluding file BOM",
+        "selection_scope": "caret, forward/backward text selection, or table rectangle; arbitrary multiple selections still reject",
         "cases": [],
     }
     for name, source, expected in cases:
@@ -80,6 +86,10 @@ def prepare(output: Path, fixtures: Path = FIXTURES) -> dict:
                 manifest["cases"].append({
                     "id": case_id,
                     "expected_paste_result": expected,
+                    "expected_inline_math_tex": {
+                        "math-target": ["x^2"],
+                        "math-mixed-target": ["h", "x^2", "a+b", "z"],
+                    }.get(name),
                     "newline": newline_name,
                     "bom": bom,
                     "input": f"{case_id}/input.md",

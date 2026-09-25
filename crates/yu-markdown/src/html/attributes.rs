@@ -27,6 +27,8 @@ pub struct HtmlAttributes {
     pub column_span: Option<usize>,
     pub row_span: Option<usize>,
     pub open: bool,
+    /// A source-backed TeX leaf, not a generic permission to hide data-* markup.
+    pub inline_math: bool,
     /// Inert image metadata retained for property editing and round trips.
     pub image_data: std::collections::BTreeMap<String, Option<String>>,
 }
@@ -69,6 +71,12 @@ impl HtmlTag {
                 .transpose()?;
             let invalid = || HtmlAttributeError::InvalidValue(attribute.name.clone());
             match attribute.name.as_str() {
+                "data-math-style" if self.name == "span" => {
+                    if value.as_deref() != Some("inline") || self.self_closing {
+                        return Err(invalid());
+                    }
+                    result.inline_math = true;
+                }
                 "colspan" | "rowspan" if matches!(kind, HeaderCell | DataCell) => {
                     let raw = value.as_deref().ok_or_else(invalid)?.trim();
                     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {

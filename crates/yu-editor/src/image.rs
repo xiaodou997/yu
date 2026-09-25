@@ -39,6 +39,9 @@ use crate::table::TableLayout;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlacedWidget {
     source: TextRange,
+    /// An HTML formula keeps its full source identity but clicks enter its
+    /// editable body, not the hidden opening/closing tags.
+    hit_source: Option<TextRange>,
     visual: VisualRange,
     line: usize,
     bounds: LayoutRect,
@@ -79,11 +82,12 @@ impl PlacedWidget {
     pub(crate) fn hit(self, point: LayoutPoint) -> BlockHit {
         let midpoint = self.bounds.x() + self.bounds.width() * 0.5;
         let before = point.x() < midpoint;
+        let editable = self.hit_source.unwrap_or(self.source);
         BlockHit::image_hit(
             if before {
-                self.source.start()
+                editable.start()
             } else {
-                self.source.end()
+                editable.end()
             },
             if before {
                 self.visual.start()
@@ -107,6 +111,7 @@ impl PlacedWidget {
     pub(crate) fn shifted(self, delta: i64) -> Result<Self, LayoutError> {
         Ok(Self {
             source: shift_range(self.source, delta)?,
+            hit_source: self.hit_source.map(|range| shift_range(range, delta)).transpose()?,
             ..self
         })
     }
@@ -164,7 +169,7 @@ impl ImagePlacement {
 ///
 /// 它此前不占位：`[x]` 是 `Decoration::Replace`，塌成一个点，方框由
 /// `yu-workspace` 事后贴在那个点上——于是压住正文的第一个字。现在它在排版
-/// 里占一个盒子，画的人按 [`PlacedWidget::bounds`] 画，不再自己算几何。
+/// 里占了盒子，画的人按 [`PlacedWidget::bounds`] 画，不再自己算几何。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CheckboxPlacement {
     placed: PlacedWidget,
@@ -254,6 +259,7 @@ pub(crate) fn build_widget_placements(view: &BlockView) -> Result<WidgetPlacemen
     for placed in view.layout().widgets() {
         let box_geometry = PlacedWidget {
             source: TextRange::empty(yu_core::ByteOffset::ZERO),
+            hit_source: None,
             visual: VisualRange::empty(placed.visual()),
             line: placed.line(),
             bounds: placed.bounds(),
@@ -298,6 +304,9 @@ pub(crate) fn build_table_widget_placements(
     table: &TableLayout,
 ) -> Result<WidgetPlacements, LayoutError> {
     let decorations = view.decorations();
+    let html_table = decorations.line_styles().iter().any(|ornament| {
+        matches!(ornament, yu_markdown::BlockOrnament::Table(grid) if grid.is_html())
+    });
     let mut placements = WidgetPlacements::default();
     for (index, cell) in table.cells().iter().copied().enumerate() {
         let Some(layout) = table.cell_layouts().get(index) else {
@@ -312,6 +321,7 @@ pub(crate) fn build_table_widget_placements(
             );
             let box_geometry = PlacedWidget {
                 source: TextRange::empty(yu_core::ByteOffset::ZERO),
+                hit_source: None,
                 visual: VisualRange::empty(visual),
                 line: cell.row(),
                 bounds: LayoutRect::new(
@@ -336,6 +346,10 @@ pub(crate) fn build_table_widget_placements(
                     resource,
                     PlacedWidget {
                         source: resource.source,
+                        hit_source: (html_table
+                            && resource.kind == yu_markdown::EmbeddedKind::Math
+                            && !resource.display)
+                            .then_some(resource.content),
                         ..box_geometry
                     },
                 )),

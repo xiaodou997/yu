@@ -22,7 +22,8 @@ class PreparePasteChecksTests(unittest.TestCase):
 
     def test_all_cases_have_exact_history_bytes_hashes_and_utf16_ranges(self):
         manifest = PREPARE.prepare(self.output)
-        self.assertEqual(len(manifest["cases"]), 28)
+        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(len(manifest["cases"]), 36)
         self.assertEqual(sum(c["expected_paste_result"] == "reject" for c in manifest["cases"]), 16)
         for case in manifest["cases"]:
             with self.subTest(case=case["id"]):
@@ -50,6 +51,20 @@ class PreparePasteChecksTests(unittest.TestCase):
                 for filename, expected in case["sha256"].items():
                     self.assertEqual(hashlib.sha256((directory / filename).read_bytes()).hexdigest(), expected)
         self.assertEqual(json.loads((self.output / "manifest.json").read_text(encoding="utf-8")), manifest)
+
+    def test_math_expectations_evolve_without_weakening_unsupported_rejections(self):
+        manifest = PREPARE.prepare(self.output)
+        for case in manifest["cases"]:
+            with self.subTest(case=case["id"]):
+                if case["id"].startswith("math-target-"):
+                    self.assertEqual(case["expected_paste_result"], "accept")
+                    self.assertEqual(case["expected_inline_math_tex"], ["x^2"])
+                elif case["id"].startswith("math-mixed-target-"):
+                    self.assertEqual(case["expected_paste_result"], "accept")
+                    self.assertEqual(case["expected_inline_math_tex"], ["h", "x^2", "a+b", "z"])
+                elif case["id"].startswith(("math-invalid-target-", "footnote-target-", "cross-")):
+                    self.assertEqual(case["expected_paste_result"], "reject")
+        self.assertIn("arbitrary multiple selections still reject", manifest["selection_scope"])
 
     def test_preparation_never_claims_native_or_visual_pass(self):
         manifest = PREPARE.prepare(self.output)
