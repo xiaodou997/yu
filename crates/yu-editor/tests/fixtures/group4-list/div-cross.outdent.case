@@ -1,0 +1,3 @@
+<ul><li>总<div id='wrap' align='right'><ol start='4'><li>前</li><li id='parent'>«A0»父<div><ul><li>子🙂«F0»</li></ul></div></li><li>后</li></ol>尾段</div>末段</li></ul>
+@@AFTER@@
+<ul><li>总<div id='wrap' align='right'><ol start='4'><li>前</li></ol></div></li><li id='parent'>«A0»父<div><ul><li>子🙂«F0»</li></ul></div><div  align='right'><ol start='6'><li>后</li></ol>尾段</div>末段</li></ul>

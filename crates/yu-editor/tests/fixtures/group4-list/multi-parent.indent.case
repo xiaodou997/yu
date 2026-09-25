@@ -1,0 +1,3 @@
+<ul><li>前</li><li id='parent'>«A0»父«F0»<ul><li>«F1»子🙂«A1»</li><li>后子</li></ul></li><li>尾</li></ul><p>正文«A2»«F2»</p>
+@@AFTER@@
+<ul><li>前<ul><li id='parent'>«A0»父«F0»<ul><li>«F1»子🙂«A1»</li><li>后子</li></ul></li></ul></li><li>尾</li></ul><p>正文«A2»«F2»</p>

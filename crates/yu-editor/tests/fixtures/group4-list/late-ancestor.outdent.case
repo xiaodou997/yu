@@ -1,0 +1,3 @@
+<ul><li>前</li><li id='parent'>父<ul><li>«A0»重复«F0»</li><li>«F1»重复«A1»</li></ul>«A2»父尾«F2»</li><li>后</li></ul>
+@@AFTER@@
+<ul><li>前</li></ul><div id='parent'>父<ul><li>«A0»重复«F0»</li><li>«F1»重复«A1»</li></ul>«A2»父尾«F2»</div><ul><li>后</li></ul>
