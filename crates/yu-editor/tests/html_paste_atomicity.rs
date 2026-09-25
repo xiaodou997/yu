@@ -140,7 +140,10 @@ fn select_target(document: &mut EditorDocument, kind: SelectionKind) {
     let snapshot = document.snapshot();
     let start = snapshot.as_str().find(TARGET).expect("target label");
     let end = start + TARGET.len();
-    let other = snapshot.as_str().find(RECT_END).expect("rectangle endpoint");
+    let other = snapshot
+        .as_str()
+        .find(RECT_END)
+        .expect("rectangle endpoint");
     let range = |anchor: usize, focus: usize, affinity| {
         EditorSelection::range(
             &snapshot,
@@ -255,7 +258,10 @@ fn rejection_matrix(source: &str) {
             let (mut document, frames) = seeded_history(source);
             select_target(&mut document, kind);
             history_depth(&document, 1, 1);
-            assert_rejected(&mut document, &EditorCommand::PasteHtmlTableSource(PAYLOAD.into()));
+            assert_rejected(
+                &mut document,
+                &EditorCommand::PasteHtmlTableSource(PAYLOAD.into()),
+            );
             replay_history(&mut document, &frames);
         }
     }
@@ -290,7 +296,10 @@ fn rejected_span_does_not_poison_a_later_legal_paste() {
     for source in source_variants(CROSS_GROUPS) {
         let (mut document, _) = seeded_history(&source);
         select_target(&mut document, SelectionKind::RectangleBackward);
-        assert_rejected(&mut document, &EditorCommand::PasteHtmlTableSource(PAYLOAD.into()));
+        assert_rejected(
+            &mut document,
+            &EditorCommand::PasteHtmlTableSource(PAYLOAD.into()),
+        );
         let before = Frame::capture(&document);
         let command = EditorCommand::PasteHtmlTableSource(legal.into());
         assert!(document.command_available(&command));
@@ -333,7 +342,11 @@ fn promotion_controls_accept_the_same_payload_without_unsupported_embeds() {
             let after = Frame::capture(&document);
             assert_eq!(document.table_target_is_html(), Some(true));
             assert!(after.source.contains("<strong>保留中文🙂</strong>"));
-            assert!(after.source.contains("colspan='2' rowspan='2'>传入中文🙂</td>"));
+            assert!(
+                after
+                    .source
+                    .contains("colspan='2' rowspan='2'>传入中文🙂</td>")
+            );
             let table_start = before.source.find("| H |").expect("table start");
             let table_end = before.source.find("| end |").expect("table end") + "| end |".len();
             assert!(after.source.starts_with(&before.source[..table_start]));
