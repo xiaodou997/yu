@@ -56,7 +56,7 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
             cancelInputComposition(cancelEvent: event)
             return
         }
-        if routeListShortcut(event) { return }
+        if routeListShortcut(event) || routeHistoryShortcut(event) { return }
         let handled = inputContext?.handleEvent(event) == true
         traceNativeEvent("inputContext", ["key_code": event.keyCode, "handled": handled])
         if handled { return }
@@ -1581,17 +1581,20 @@ final class DocumentTextView: NSView, NSTextInputClient, NSMenuItemValidation {
         // this surface while a search field owns the keyboard. Rust history
         // must only receive shortcuts from the active document input host.
         guard window?.firstResponder === self else { return false }
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if routeListShortcut(event) { return true }
-        let isCommandZ = modifiers.contains(.command)
-            && !modifiers.contains(.option)
-            && !modifiers.contains(.control)
-            && event.charactersIgnoringModifiers?.lowercased() == "z"
-        guard isCommandZ else {
-            return super.performKeyEquivalent(with: event)
-        }
-        let command = modifiers.contains(.shift) ? Command.redo : Command.undo
-        return routeCommand(command)
+        if routeListShortcut(event) || routeHistoryShortcut(event) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    /// A key-down can reach the input host without a key-equivalent probe.
+    /// Consume it before an input source swallows it, using the same Rust history
+    /// route as menu actions. Never identify Z by its physical QWERTY key code.
+    private func routeHistoryShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, window?.firstResponder === self, isEditable else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard modifiers == .command || modifiers == [.command, .shift],
+              [event.charactersIgnoringModifiers, event.characters]
+                .compactMap({ $0 }).contains(where: { $0.lowercased() == "z" }) else { return false }
+        return routeCommand(modifiers.contains(.shift) ? Command.redo : Command.undo)
     }
 
     // Some input sources consume Command-bracket in keyDown without invoking
